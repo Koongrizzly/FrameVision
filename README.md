@@ -14,7 +14,7 @@
 3. Starts the background worker.
 
 ### Installer Menu Options
-- **Sytem check:** check diskspace, Cpu/cpu, python, creates venv etc and gives advice on what to use in the installer
+- **Sytem check:** check diskspace, Cpu/Gpu, basic system info, python, creates venv etc and gives advice on what to use in the installer
 - **Core Install:** App only (minimal).
 - **Full CPU Install:** Torch CPU + models/binaries.This installer will not ask to install Qwen, smaller model is on roadmap
 - **Full CUDA Install:** Torch CUDA + models/binaries.+ asks to install Qwen TXT 2 IMG (only allows install from 12 gig vram and up)
@@ -24,8 +24,9 @@
 ## 💡 User-Friendly
 - Easy installer with **requirements check**.
 - Fully automated setup paths (Core, Full CPU, Full CUDA). User can drink coffee, script will deliver out of the box use
-- Helpful tooltips everywhere.
-- Resizable layout with draggable splitters. Fit the player or the tabs to the size you want, even full screen
+- easy to use tabs,everything in collapsible boxes so you see only what you need and without seatching
+- Helpful tooltips everywhere. Q&A and knowledge base (info menu)
+- Resizable layout with draggable splitters. Fit the player or the tabs to the size you want.
 - Clear messages and graceful fallbacks (e.g., CPU fallback when GPU is unavailable, streaming for low mem use etc).
 
 ---
@@ -80,6 +81,13 @@ Both updaters:
 
 ---
 
+## 🌐 Platforms
+- **Windows**: Primary target
+- **Linux / WSL2**: Supported (experimental)
+
+---
+---
+
 ## 🖥 Workspace
 - **Left:** Multi Media Player
   - easy slider for fast forward
@@ -93,13 +101,14 @@ Both updaters:
   - scroll to zoom in/out & pan (on roadmap)
   
 - **Right:** Modular tabs:
-  - Multii model Upscaler
-  - RIFE 
+  - Multi model Upscaler
+  - RIFE interpollator
   - Describer/prompt creator
   - TXT2IMG (work in progress, offline)
   - Multi-Tools
-  - Advanced Queue
+  - Advanced Queue 
   - Settings
+---
 ---
 
 
@@ -173,7 +182,6 @@ WORK IN PROGRESS CURRENTLY OFFLINE
 - Add or replace audio tracks in video.
 - Multi rename tools
 ...
----
 
 ### ⚙️ Settings
 - random intro with easter egg (click the intro 4x) default download has 3 intros (day evening and night)
@@ -213,15 +221,11 @@ Planned features for future updates:
 - **Built-in Compare Panel (A/B):** Side-by-side, swipe, zoom/pan, and much more
 - **Installer upgrades:** Unified progress bars and resume support. app might get it's own windows installer one day
 - **Better integration with queue for the upscalers:** At the moment it is not using the queue until i have more time for this
+- zip with over **100 intros**
+- low weight **txt 2 img** model
 - polishing and bugfixing for the rest of my life i think
 - a low weight txt/img to video would be nice but let's get the rest working 100% first
 - **Easter eggs** for extra fun surprises! Don't forget to click the intro 4x befor it ends ;-)
-
----
-
-## 🌐 Platforms
-- **Windows**: Primary target
-- **Linux / WSL2**: Supported (experimental)
 
 ---
 
