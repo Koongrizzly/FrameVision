@@ -8,7 +8,7 @@
 
 ## 🛠 Installation
 **One file for everything:** start.bat (first time use needs permission to run a bat file on windows pc)
-Run **`start.bat`** — it automatically:
+- Run **`start.bat`** — it automatically:
 1. Opens the installer menu if setup is incomplete.
 2. Repairs missing components (like `psutil`).
 3. Starts the background worker.
