@@ -2,7 +2,7 @@
 # 🌟 FrameVision
 **All-in-one Video & Photo Upscaler/Editor**  
 ✨ *Upscale, convert, edit, describe, and create — in one streamlined app.*
-
+BETA, WORK IN PROGRESS, features can come and go
 ---
 
 ## 🖥 Workspace
