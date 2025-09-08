@@ -2,11 +2,86 @@
 # 🌟 FrameVision
 **All-in-one Video & Photo Upscaler/Editor**  
 ✨ *Upscale, convert, edit, describe, and create — in one streamlined app.*
-BETA, WORK IN PROGRESS, features can come and go
+- BETA, WORK IN PROGRESS, features can come and go
+
+---
+
+## 🛠 Installation
+**One file for everything:** start.bat (first time use needs permission to run a bat file on windows pc)
+Run **`start.bat`** — it automatically:
+1. Opens the installer menu if setup is incomplete.
+2. Repairs missing components (like `psutil`).
+3. Starts the background worker.
+
+### Installer Menu Options
+- **Sytem check:** check diskspace, Cpu/cpu, python, creates venv etc and gives advice on what to use in the installer
+- **Core Install:** App only (minimal).
+- **Full CPU Install:** Torch CPU + models/binaries.This installer will not ask to install Qwen, smaller model is on roadmap
+- **Full CUDA Install:** Torch CUDA + models/binaries.+ asks to install Qwen TXT 2 IMG (only allows install from 12 gig vram and up)
+
+---
+
+## 💡 User-Friendly
+- Easy installer with **requirements check**.
+- Fully automated setup paths (Core, Full CPU, Full CUDA). User can drink coffee, script will deliver out of the box use
+- Helpful tooltips everywhere.
+- Resizable layout with draggable splitters. Fit the player or the tabs to the size you want, even full screen
+- Clear messages and graceful fallbacks (e.g., CPU fallback when GPU is unavailable, streaming for low mem use etc).
+
+---
+
+## 🔄 How to Update FrameVision
+
+Keeping FrameVision up to date is **super easy** — just use one of the included updater tools!  
+Choose the updater based on whether you want to **keep personal files** or **fully reset** to the latest version.
+
+---
+
+### 🟢 Soft Update — `update_soft.bat`
+**Safe & Non-Destructive**  
+- ✅ Adds **new files**  
+- ✅ Updates **changed files**  
+- 🚫 **Never deletes** anything in your folder  
+
+**Best for:**  
+- Regular updates when you don’t want to risk losing personal changes or test files.
+
+**How to use:**
+1. Make sure `update_soft.bat` is in the **FrameVision root folder** (next to `start.bat`).
+2. Double-click the file to run it.
+3. Watch the progress window or check `update.log` for details.
+
+---
+
+### 🔴 Hard Update — `update_hard.bat`
+**Strict Sync (Advanced)**  
+- ✅ Adds **new files**  
+- ✅ Updates **changed files**  
+- ⚠️ **Restores deleted files**  
+- ⚠️ **Removes local files** that are not part of the official GitHub repo  
+  *(Safe exclusions: `.venv`, `models`, `.hf_cache`, `outputs`, etc.)*
+
+**Best for:**  
+- Repairing a broken install.  
+- Resetting to a **clean, exact copy** of the latest GitHub version.  
+- Preparing a **clean environment** for release or bug reporting.
+
+**How to use:**
+1. Back up any personal files or custom scripts you don’t want deleted.
+2. Place `update_hard.bat` in the **FrameVision root folder**.
+3. Double-click to run.
+4. When finished, your folder will **exactly match GitHub**.
+
+### 💡 How It Works
+Both updaters:
+- Try to use **Git** if available (fastest & safest).
+- If Git isn’t installed, they **auto-download a ZIP** of the latest version and update from that.
+- Write progress to `update.log`.
+
 ---
 
 ## 🖥 Workspace
-- **Left:** Media Player
+- **Left:** Multi Media Player
   - easy slider for fast forward
   - default buttons play pause stop
   - Multi format (img/sound/video)
@@ -15,6 +90,7 @@ BETA, WORK IN PROGRESS, features can come and go
   - Ratio : fill, fit, full, center
   - Fullscreen on off (double click and esc shortcuts)
   - Upscale button that works from everywhere in the app (roadmap has other plans)
+  - scroll to zoom in/out & pan (on roadmap)
   
 - **Right:** Modular tabs:
   - Multii model Upscaler
@@ -110,10 +186,13 @@ WORK IN PROGRESS CURRENTLY OFFLINE
   - 3 day themes, 10 dark themes, 2 colorful themes 
 - Bug reporting and maintenance tools.
   - User can send email directly from the app with bug report
+    (needs software installed to send an email)
   - multiple logging options with 'dump to cmd' button
 - cleanup (clear cache, temp folder etc)
 - Temperature unit toggle °C / °F.
-- System Monitor with second little colorized hud that shows up everywhere. (can be on/off)
+- System Monitor with checks for models etc
+  comes with second little colorized hud (anything above above 90% changes colors, gpu above 60celcius vhanges colors)
+  mini hud shows up everywhere. (can be on/off)
 - Advanced File Menu with converter + save video as mp3, screenshot, open multi format, last 10, favorites,....
 - Info menu with Html Features list & extensive Q&A + knowledge base
 ---
@@ -126,38 +205,17 @@ WORK IN PROGRESS CURRENTLY OFFLINE
   - remove non working jobs,
   - move running job to failed
   - move running job back to pensing
-  - live 'led' with colors show status of the queue
+  - live 'led' shows status of the queue
 
----
-
-## 🛠 Installation
-Run **`start.bat`** — it automatically:
-1. Opens the installer menu if setup is incomplete.
-2. Repairs missing components (like `psutil`).
-3. Starts the background worker.
-
-### Installer Menu Options
-- **Core Install:** App only (minimal).
-- **Full CPU Install:** Torch CPU + models/binaries.This installer will not ask to install Qwen, smaller model is on roadmap
-- **Full CUDA Install:** Torch CUDA + models/binaries.+ asks to install Qwen TXT 2 IMG (only allows install from 10 gig vram and up)
-
----
-
-## 💡 User-Friendly
-- Easy installer with **requirements check**.
-- Fully automated setup paths (Core, Full CPU, Full CUDA).
-- Helpful tooltips everywhere.
-- Resizable layout with draggable splitters.
-- Clear messages and graceful fallbacks (e.g., CPU fallback when GPU is unavailable).
-
----
 
 ## 🗺 Roadmap
 Planned features for future updates:
-- **Built-in Compare Panel (A/B):** Side-by-side, swipe, overlay, zoom/pan, and composite export.
-- **Installer upgrades:** Unified progress bars and resume support.
+- **Built-in Compare Panel (A/B):** Side-by-side, swipe, zoom/pan, and much more
+- **Installer upgrades:** Unified progress bars and resume support. app might get it's own windows installer one day
 - **Better integration with queue for the upscalers:** At the moment it is not using the queue until i have more time for this
-- **Easter eggs** for extra fun surprises!
+- polishing and bugfixing for the rest of my life i think
+- a low weight txt/img to video would be nice but let's get the rest working 100% first
+- **Easter eggs** for extra fun surprises! Don't forget to click the intro 4x befor it ends ;-)
 
 ---
 
@@ -178,7 +236,7 @@ If you encounter bugs, please open an issue or use the **Bug Report** button in 
 
 ---
 
-> Built by **Contrinsan**  
-> Feature writing & installer help by **ChatGPT (assistant)**  
-> *This project is a living work — details evolve with releases.*
+> Built by **Contrinsan (KoonGrizzly)**  
+> Feature development & bugfixing (over 3000 so far) help by **ChatGPT 5 **  
+> *This project is a living work and features may come or go.*
 
