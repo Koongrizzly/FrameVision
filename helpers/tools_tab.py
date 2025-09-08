@@ -560,37 +560,8 @@ class InstantToolsPane(QWidget):
             lay_gif.addRow("GIF fps (type)", self.spin_gif_fps)
         except Exception:
             pass
-        # --- Advanced GIF options ---
-        try:
-            self.gif_fmt = QComboBox(); self.gif_fmt.addItems(["GIF","WebP","APNG"]); self.gif_fmt.setCurrentText("GIF")
-            self.gif_two_pass = QCheckBox("Two-pass palette (best)"); self.gif_two_pass.setChecked(True)
-            self.gif_boomer = QCheckBox("Boomerang"); self.gif_loop = QSpinBox(); self.gif_loop.setRange(0, 1000); self.gif_loop.setValue(0)
-            self.gif_colors = QSpinBox(); self.gif_colors.setRange(2,256); self.gif_colors.setValue(256)
-            self.gif_dither = QComboBox(); self.gif_dither.addItems(["sierra2_4a","sierra2","bayer","none"]); self.gif_bayer = QSpinBox(); self.gif_bayer.setRange(0,5); self.gif_bayer.setValue(3)
-            self.gif_keep_ar = QCheckBox("Keep aspect"); self.gif_keep_ar.setChecked(True)
-            self.gif_w = QSpinBox(); self.gif_w.setRange(0,8192); self.gif_w.setValue(0)
-            self.gif_h = QSpinBox(); self.gif_h.setRange(0,8192); self.gif_h.setValue(0)
-            # Enable bayer scale only when dither == bayer
-            self.gif_dither.currentTextChanged.connect(lambda t: self.gif_bayer.setEnabled(t=="bayer"))
-            self.gif_bayer.setEnabled(False)
-            # Boomerang disables two-pass
-            self.gif_boomer.toggled.connect(lambda on: self.gif_two_pass.setEnabled(not on))
-            # Layout
-            row_fmt = QHBoxLayout(); row_fmt.addWidget(QLabel("Format")); row_fmt.addWidget(self.gif_fmt); row_fmt.addStretch(1)
-            row_pal = QHBoxLayout(); row_pal.addWidget(self.gif_two_pass); row_pal.addWidget(self.gif_boomer); row_pal.addStretch(1)
-            row_loop = QHBoxLayout(); row_loop.addWidget(QLabel("Loop (0=∞)")); row_loop.addWidget(self.gif_loop); row_loop.addStretch(1)
-            row_col = QHBoxLayout(); row_col.addWidget(QLabel("Colors")); row_col.addWidget(self.gif_colors); row_col.addStretch(1)
-            row_dith = QHBoxLayout(); row_dith.addWidget(QLabel("Dither")); row_dith.addWidget(self.gif_dither); row_dith.addWidget(QLabel("Bayer scale")); row_dith.addWidget(self.gif_bayer); row_dith.addStretch(1)
-            row_sz = QHBoxLayout(); row_sz.addWidget(QLabel("W")); row_sz.addWidget(self.gif_w); row_sz.addWidget(QLabel("H")); row_sz.addWidget(self.gif_h); row_sz.addWidget(self.gif_keep_ar); row_sz.addStretch(1)
-            lay_gif.addRow(row_fmt)
-            lay_gif.addRow(row_pal)
-            lay_gif.addRow(row_loop)
-            lay_gif.addRow(row_col)
-            lay_gif.addRow(row_dith)
-            lay_gif.addRow(row_sz)
-        except Exception:
-            pass
-    
+                # --- Advanced GIF options ---
+        gif_backend.install_ui(self, lay_gif, sec_gif)
         sec_gif.setContentLayout(lay_gif)
         # Audio
         sec_audio = CollapsibleSection("Audio", expanded=False)
@@ -836,7 +807,13 @@ class InstantToolsPane(QWidget):
         self.btn_last.clicked.connect(self.run_last)
         self.btn_all.clicked.connect(self.run_all)
         self.btn_trim.clicked.connect(self.run_trim)
-        self.btn_trim_batch.clicked.connect(self.run_trim_batch)
+        if hasattr(self, 'run_trim_batch'):
+            self.btn_trim_batch.clicked.connect(self.run_trim_batch)
+        else:
+            try:
+                self.btn_trim_batch.setEnabled(False)
+            except Exception:
+                pass
         self.btn_crop.clicked.connect(self.run_crop)
         self.btn_crop_batch.clicked.connect(self.run_crop_batch)
 
@@ -971,133 +948,23 @@ class InstantToolsPane(QWidget):
                 QMessageBox.critical(self, "Resize error", str(e))
             except Exception:
                 pass
-
     def run_gif(self):
-
-
         inp = self._ensure_input()
-
         if not inp:
-
             return
-
-        # Determine FPS
-
-        fps = None
-
+        fmt = self.gif_fmt.currentText().strip().lower() if hasattr(self, "gif_fmt") else "gif"
+        opts = gif_backend.options_from_ui(self, inp, self.gif_same.isChecked(), int(self.gif_fps.value()) if hasattr(self, "gif_fps") else 0, batch=False)
+        out = OUT_VIDEOS / gif_backend.output_name_for(inp.stem, fmt, batch=False)
+        # Progress + ETA like interp.py
         try:
-
-            fps = int(self.gif_fps.value())
-
+            gif_backend.encode_with_progress(self, inp, out, opts, ffmpeg=ffmpeg_path(), work_dir=OUT_TEMP)
         except Exception:
-
+            gif_backend.encode(inp, out, opts, ffmpeg=ffmpeg_path(), work_dir=OUT_TEMP)
+        # Remember output to enable "Play last" button in the GIF UI
+        try:
+            self._gif_last_out = out
+        except Exception:
             pass
-
-        try:
-
-            if self.gif_same.isChecked():
-
-                info = probe_media(inp)
-
-                if info and "fps" in info and info["fps"]:
-
-                    fps = int(round(float(info["fps"])))
-
-        except Exception:
-
-            pass
-
-        # Advanced options (safe defaults if controls absent)
-
-        def _get(name, default=None):
-
-            try: return getattr(self, name)
-
-            except Exception: return default
-
-        fmt = "gif"
-
-        try:
-
-            w = _get('gif_w'); h = _get('gif_h'); keep_ar = True
-
-            fmt_widget = _get('gif_fmt'); fmt = fmt_widget.currentText().lower() if fmt_widget else "gif"
-
-            two_pass = bool(_get('gif_two_pass').isChecked()) if _get('gif_two_pass') else True
-
-            boomer = bool(_get('gif_boomer').isChecked()) if _get('gif_boomer') else False
-
-            if boomer: two_pass = False
-
-            loop = int(_get('gif_loop').value()) if _get('gif_loop') else 0
-
-            colors = int(_get('gif_colors').value()) if _get('gif_colors') else 256
-
-            dither = _get('gif_dither').currentText() if _get('gif_dither') else "sierra2_4a"
-
-            bayer_scale = int(_get('gif_bayer').value()) if _get('gif_bayer') else 3
-
-            keep_ar = bool(_get('gif_keep_ar').isChecked()) if _get('gif_keep_ar') else True
-
-            width = int(w.value()) if w and int(w.value())>0 else None
-
-            height = int(h.value()) if h and int(h.value())>0 else None
-
-        except Exception:
-
-            two_pass = True; boomer = False; loop = 0; colors = 256; dither = "sierra2_4a"; bayer_scale = 3; keep_ar = True; width = None; height = None
-
-        out_ext = "gif" if fmt not in ("webp","apng") else fmt
-
-        out = OUT_VIDEOS / f"{inp.stem}_anim.{out_ext}"
-
-        try:
-
-            # Build commands with options and execute
-
-            opts = gif_backend.GifOptions.from_dict({
-
-                "format": fmt,
-
-                "fps": fps,
-
-                "two_pass": two_pass,
-
-                "max_colors": colors,
-
-                "dither": dither,
-
-                "bayer_scale": bayer_scale,
-
-                "loop": loop,
-
-                "width": width,
-
-                "height": height,
-
-                "keep_aspect": keep_ar,
-
-                "boomerang": boomer
-
-            })
-
-            cmds = gif_backend.build_gif_cmds(inp, out, opts, ffmpeg=ffmpeg_path(), work_dir=OUT_TEMP)
-
-            for cmd in cmds:
-
-                try:
-
-                    subprocess.check_call(cmd, creationflags=0 if os.name!="nt" else 0x08000000)
-
-                except Exception:
-
-                    subprocess.check_call(cmd)  # fallback
-
-            QMessageBox.information(self, "Done", "Saved: " + str(out))
-
-        except Exception as e:
-
-            QMessageBox.critical(self, "FFmpeg error", str(e))
     def run_last(self):
         inp = self._ensure_input();
         if not inp: return
@@ -1229,31 +1096,38 @@ class InstantToolsPane(QWidget):
 
     # ---- GIF ----
     def _save_preset_gif(self):
-        if self.gif_same.isChecked():
-            fps = None; name = "gif_samefps_preset.json"
-        else:
-            fps = int(self.gif_fps.value()); name = f"gif_{fps}fps_preset.json"
+        inp = self._ensure_input(silent=True)
+        if not inp:
+            # we can still save UI-only presets without an input
+            inp = Path('dummy.mp4')
+        name = 'gif_preset.json'
         p = self._choose_save_path(name)
-        if not p: return
-        data = {"tool":"gif","same_as_video": self.gif_same.isChecked()}
-        if fps is not None: data["fps"]=fps
-        p.write_text(json.dumps(data, indent=2), encoding="utf-8")
-        QMessageBox.information(self, "Preset saved", str(p))
+        if not p:
+            return
+        data = gif_backend.preset_from_ui(self, inp, self.gif_same.isChecked(), int(self.gif_fps.value()) if hasattr(self,'gif_fps') else 0)
+        p.write_text(json.dumps(data, indent=2), encoding='utf-8')
+        try:
+            QMessageBox.information(self, 'Preset saved', str(p))
+        except Exception:
+            pass
 
     def _load_preset_gif(self):
         p = self._choose_open_path()
-        if not p: return
+        if not p:
+            return
         try:
-            data = json.loads(p.read_text(encoding="utf-8"))
-            if data.get("tool")!="gif": raise ValueError("Wrong preset type")
-            same = bool(data.get("same_as_video", False))
-            self.gif_same.setChecked(same)
-            if not same and "fps" in data:
-                self.gif_fps.setValue(int(data["fps"]))
+            data = json.loads(p.read_text(encoding='utf-8'))
+            gif_backend.apply_preset(self, data)
+            try:
+                QMessageBox.information(self, 'Preset loaded', str(p))
+            except Exception:
+                pass
         except Exception as e:
-            QMessageBox.critical(self, "Preset error", str(e))
+            try:
+                QMessageBox.critical(self, 'Preset error', str(e))
+            except Exception:
+                pass
 
-    # ---- Extract (no parameters, placeholder) ----
     def _save_preset_extract(self):
         name = "extract_preset.json"
         p = self._choose_save_path(name)
@@ -1848,76 +1722,18 @@ class InstantToolsPane(QWidget):
             QMessageBox.information(self, "Batch Resize", f"Queued {len(paths)} item(s).")
         except Exception:
             pass
-
     def run_gif_batch(self):
-
-        paths = self._batch_paths_prompt(True, "Batch")
+        paths = self._pick_batch_files(for_videos=True)
         if not paths:
             return
-        try:
-            if QMessageBox.question(self, "Batch GIF", f"Add {len(paths)} file(s) with current GIF settings to the queue?") != QMessageBox.Yes:
-                return
-        except Exception:
-            pass
+        fmt = self.gif_fmt.currentText().strip().lower() if hasattr(self, "gif_fmt") else "gif"
         for p in paths:
-            try:
-                from pathlib import Path as _P
-                inp = _P(p)
-                # fps logic
-                fps = None
-                try:
-                    fps = int(self.gif_fps.value())
-                except Exception:
-                    pass
-                try:
-                    if self.gif_same.isChecked():
-                        info = probe_media(inp)
-                        if info and "fps" in info:
-                            try:
-                                fps = int(round(float(info.get("fps"))))
-                            except Exception:
-                                pass
-                except Exception:
-                    pass
-                out = OUT_VIDEOS / f"{inp.stem}.gif"
-                cmd = gif_backend.build_batch_gif_cmd(inp, out, fps=fps, ffmpeg=ffmpeg_path())
-                self._enqueue_cmd_for_input(inp, cmd, out)
-            except Exception:
-                continue
-        try:
-            QMessageBox.information(self, "Batch GIF", f"Queued {len(paths)} item(s).")
-        except Exception:
-            pass
-    def run_trim_batch(self):
-        paths = self._batch_paths_prompt(True, "Batch")
-        if not paths:
-            return
-        try:
-            if QMessageBox.question(self, "Batch Trim", f"Add {len(paths)} file(s) with current Trim settings to the queue?") != QMessageBox.Yes:
-                return
-        except Exception:
-            pass
-        for p in paths:
-            try:
-                from pathlib import Path as _P
-                inp=_P(p)
-                mode = self.trim_mode.currentIndex() if hasattr(self,'trim_mode') else 0
-                start = self.trim_start.text().strip() if hasattr(self,'trim_start') else ""
-                end = self.trim_end.text().strip() if hasattr(self,'trim_end') else ""
-                suf = "copy" if mode==0 else "re"
-                out = OUT_VIDEOS / f"{inp.stem}_trim_{suf}.mp4"
-                if mode == 0:
-                    cmd=[ffmpeg_path(),"-y","-ss",start,"-to",end,"-i",str(inp),"-c:v","copy","-c:a","copy",str(out)]
-                else:
-                    cmd=[ffmpeg_path(),"-y","-ss",start,"-to",end,"-i",str(inp),"-c:v","libx264","-preset","veryfast","-c:a","aac",str(out)]
-                self._enqueue_cmd_for_input(inp, cmd, out)
-            except Exception:
-                continue
-        try:
-            QMessageBox.information(self, "Batch Trim", f"Queued {len(paths)} item(s).")
-        except Exception:
-            pass
-
+            inp = Path(p)
+            opts = gif_backend.options_from_ui(self, inp, self.gif_same.isChecked(), int(self.gif_fps.value()) if hasattr(self, "gif_fps") else 0, batch=True)
+            out = OUT_VIDEOS / gif_backend.output_name_for(inp.stem, fmt, batch=True)
+            cmds = gif_backend.build_commands(inp, out, opts, ffmpeg=ffmpeg_path(), work_dir=OUT_TEMP)
+            # enqueue only the first command per spec
+            self._enqueue_cmd_for_input(inp, cmds[0], out)
     def run_crop_batch(self):
         paths = self._batch_paths_prompt(True, "Batch")
         if not paths:

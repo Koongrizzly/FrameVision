@@ -867,41 +867,71 @@ class VideoPane(QWidget):
 
 
     def _open_via_dialog(self): self.parent().parent().parent().open_file()
+    
     def open(self, path: Path):
+        # Unified open: images -> QPixmap (GIF -> QMovie), audio -> QMediaPlayer, video -> QMediaPlayer
         try:
             p = Path(path)
         except Exception:
             from pathlib import Path as _P
             p = _P(str(path))
         ext = p.suffix.lower()
-        if ext in IMAGE_EXTS:
-            # Show still image using QPixmap (with Pillow fallback)
-            # Hard stop video pipeline and clear sink so we don't need a manual Stop.
-            try:
-                self._autoplay_request = False
-                self._mode = 'image'
-                self.currentFrame = None
-            except Exception:
-                pass
-            try:
-                self.player.stop()
-            except Exception:
-                pass
-            try:
 
-                self.player.setSource(QUrl())
-            except Exception:
-                pass
-            # Temporarily block sink signals and clear the last frame
+        # Animated GIF -> QMovie on label
+        if ext == '.gif':
+            try: self._autoplay_request = False; self._mode = 'image'; self.currentFrame = None
+            except Exception: pass
+            try: self.player.stop()
+            except Exception: pass
+            try: self.player.setSource(QUrl())
+            except Exception: pass
+            # Clear video sink
             try:
                 self.sink.blockSignals(True)
                 try:
                     from PySide6.QtMultimedia import QVideoFrame
                     self.sink.setVideoFrame(QVideoFrame())
-                except Exception:
-                    pass
+                except Exception: pass
+            except Exception: pass
+            try:
+                from PySide6.QtGui import QMovie
+                self._gif_movie = QMovie(str(p))
+                try: self._gif_movie.setCacheMode(QMovie.CacheAll)
+                except Exception: pass
+                try: self.label.setScaledContents(False)
+                except Exception: pass
+                self.label.setMovie(self._gif_movie)
+                self._gif_movie.start()
             except Exception:
-                pass
+                # Fallback: first frame as still image
+                pm = load_pixmap(p)
+                if pm and not pm.isNull():
+                    self.label.setPixmap(pm)
+                    try: self._refresh_label_pixmap()
+                    except Exception: pass
+                else:
+                    self.label.setText(f"Cannot display: {p.name}")
+            try: self.slider.setEnabled(False)
+            except Exception: pass
+            try: self.sink.blockSignals(False)
+            except Exception: pass
+            return
+
+        # Still images (non-animated)
+        if ext in IMAGE_EXTS:
+            try: self._autoplay_request = False; self._mode = 'image'; self.currentFrame = None
+            except Exception: pass
+            try: self.player.stop()
+            except Exception: pass
+            try: self.player.setSource(QUrl())
+            except Exception: pass
+            try:
+                self.sink.blockSignals(True)
+                try:
+                    from PySide6.QtMultimedia import QVideoFrame
+                    self.sink.setVideoFrame(QVideoFrame())
+                except Exception: pass
+            except Exception: pass
             pm = load_pixmap(p)
             if pm and not pm.isNull():
                 self._image_pm_orig = pm
@@ -910,74 +940,35 @@ class VideoPane(QWidget):
                 try: self.label.setAlignment(Qt.AlignCenter)
                 except Exception: pass
                 self.label.setPixmap(pm)
-                self._refresh_label_pixmap()
+                try: self._refresh_label_pixmap()
+                except Exception: pass
             else:
                 self.label.setText(f"Cannot display: {p.name}")
             try: self.slider.setEnabled(False)
             except Exception: pass
-            # Unblock sink signals now that we are in image mode
-            try:
-                self.sink.blockSignals(False)
-            except Exception:
-                pass
-
+            try: self.sink.blockSignals(False)
             except Exception: pass
-            # Unblock sink signals now that we are in image mode
-            try:
-                self.sink.blockSignals(False)
-            except Exception:
-                pass
-
             return
-        elif ext in AUDIO_EXTS:
-            # Audio-only: allow playback and show a simple label
-            try:
-                self.slider.setEnabled(True)
-            except Exception:
-                pass
+
+        # Audio
+        if ext in AUDIO_EXTS:
+            try: self.slider.setEnabled(True)
+            except Exception: pass
             self.player.setSource(QUrl.fromLocalFile(str(p)))
-            try:
-                self.player.play()
-            except Exception:
-                pass
-            try:
-                self.label.setText(f"Playing audio: {p.name}")
-            except Exception:
-                pass
+            try: self.player.play()
+            except Exception: pass
+            try: self.label.setText(p.name)
+            except Exception: pass
             return
 
-        # Otherwise treat as video
+        # Video
         try: self.slider.setEnabled(True)
         except Exception: pass
-        try:
-            self._mode = 'video'
-            self._autoplay_request = True
-            self.currentFrame = None
-            try: self.player.stop()
-            except Exception: pass
-            try: self.label.clear()
-            except Exception: pass
-            try: self.player.setPosition(0)
-            except Exception: pass
-        except Exception:
-            pass
-        try:
-            self._mode = 'video'
-        except Exception:
-            pass
-        # Ensure sink signals are active for video playback
-        try:
-            self.sink.blockSignals(False)
-        except Exception:
-            pass
-
-        try:
-            self._image_pm_orig = None
-        except Exception:
-            pass
-
+        try: self._image_pm_orig = None
+        except Exception: pass
         self.player.setSource(QUrl.fromLocalFile(str(p)))
-        self.player.play()
+        try: self.player.play()
+        except Exception: pass
 
     def pause(self):
         self.player.pause()
