@@ -218,7 +218,7 @@ class InterpPane(QWidget):
         # Row 2: toggles on their own line
         row2 = QHBoxLayout(); row2.setSpacing(8)
         self.cb_stream = QCheckBox("Streaming (low memory)"); row2.addWidget(self.cb_stream)
-        self.cb_autoplay = QCheckBox(\"Auto-play when finished\"); row2.addWidget(self.cb_autoplay)
+        self.cb_autoplay = QCheckBox("Auto-play when finished"); row2.addWidget(self.cb_autoplay)
         self.cb_autoplay.toggled.connect(lambda _on: self._persist_state())
         row2.addStretch(1); lay.addLayout(row2)
 
@@ -429,7 +429,7 @@ class InterpPane(QWidget):
         self._kv_write("rife/speed_idx", int(self.combo_speed.currentIndex()))
         self._kv_write("rife/speed_default", int(self.cb_speed_default.isChecked()))
         self._kv_write("rife/model_key", self.combo_model.currentData())
-def _set_result_state(self, state: str, text: str | None = None):
+    def _set_result_state(self, state: str, text: str | None = None):
         # States: idle, working, ok, err
         colors = {
             'idle': '#9aa0a6',
