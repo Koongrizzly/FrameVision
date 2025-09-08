@@ -6,13 +6,23 @@ BETA, WORK IN PROGRESS, features can come and go
 ---
 
 ## 🖥 Workspace
-- **Left:** Media viewer with playback controls.
+- **Left:** Media Player
+  - easy slider for fast forward
+  - default buttons play pause stop
+  - Multi format (img/sound/video)
+  - Info button with popup window
+  - Compare side by side with pan & 25x zoom (work in progress, html version for now)
+  - Ratio : fill, fit, full, center
+  - Fullscreen on off (double click and esc shortcuts)
+  - Upscale button that works from everywhere in the app (roadmap has other plans)
+  
 - **Right:** Modular tabs:
-  - Upscaler
-  - RIFE
-  - Describe
-  - Tools
-  - Queue
+  - Multii model Upscaler
+  - RIFE 
+  - Describer/prompt creator
+  - TXT2IMG (work in progress, offline)
+  - Multi-Tools
+  - Advanced Queue
   - Settings
 ---
 
@@ -35,7 +45,7 @@ BETA, WORK IN PROGRESS, features can come and go
 ---
 
 ### 🖼️ Thumbnail / Meme Creator
-- Capture the current frame or load any image.
+- Capture the current frame from a video or load any image.
 - Multiple text layers: fonts, outline width, shadows, ALL CAPS.
 - Rotate, tilt/skew, glow, letter spacing and **arc curvature** controls.
 - **Interactive crop overlay** (16:9, 9:16, or free crop).
@@ -56,7 +66,8 @@ BETA, WORK IN PROGRESS, features can come and go
 ### 📝 Describe (AI)
 - **Engine:** Qwen2-VL (2B Instruct)
 - Generate rich captions, OCR-style text, and multi-turn Q&A.
-- Describe files, folders, or the current video frame.
+- Describe files, folders, objects, current video frame with adjustable details
+- Promtify included
 - Export results as `.txt` or `.json`.
 - Fine-tune behavior with advanced parameters:
   - Negative prompts
@@ -75,26 +86,36 @@ WORK IN PROGRESS CURRENTLY OFFLINE
   
 ---
 
-### 🧰 Tools
+### 🧰 Multi Tools
 - Change speed for videos (with audio sync).
 - Resize with aspect-ratio preservation.
-- Export GIFs using two-pass palette generation.
+- Advanced Gif creator with lot's of saving options
 - Extract frames to images. (one/last/all)
 - **Trim videos** with advanced preview.
 - Crop video 
 - Quality/Size/convert for video & images:
-- Add or replace audio tracks on videos.
+- Add or replace audio tracks in video.
 - Multi rename tools
-
+...
 ---
 
 ### ⚙️ Settings
-- Paths for models, FFmpeg, and outputs.
-- Theme system:10+ themes, Follow tie of day, random at every start
-  - Day 🌞, Evening 🌆, Night 🌙, Cyberpunk, Neon, Ocean, Solarized Light, CRT and many more
+- random intro with easter egg (click the intro 4x) default download has 3 intros (day evening and night)
+  - optional download has over 100 (roadmap feature)
+  - user can add their own backgrounds and app will start with their own random backgrounds
+  - overlay matrix rain and other animations (roadmap feature)
+- Theme system:10+ themes, Follow time of day, random at every start
+  - Day 🌞, Evening 🌆, Night 🌙
+  - Cyberpunk, Neon, Ocean, Solarized Light, CRTn Mardi grass, Tropical and many more
+  - 3 day themes, 10 dark themes, 2 colorful themes 
 - Bug reporting and maintenance tools.
+  - User can send email directly from the app with bug report
+  - multiple logging options with 'dump to cmd' button
+- cleanup (clear cache, temp folder etc)
 - Temperature unit toggle °C / °F.
-- Advanced system Monitor
+- System Monitor with second little colorized hud that shows up everywhere. (can be on/off)
+- Advanced File Menu with converter + save video as mp3, screenshot, open multi format, last 10, favorites,....
+- Info menu with Html Features list & extensive Q&A + knowledge base
 ---
 
 ### 📋 Queue
@@ -118,12 +139,9 @@ Run **`start.bat`** — it automatically:
 ### Installer Menu Options
 - **Core Install:** App only (minimal).
 - **Full CPU Install:** Torch CPU + models/binaries.This installer will not ask to install Qwen, smaller model is on roadmap
-- **Full CUDA Install:** Torch CUDA + models/binaries.+ asks to install Qwen TXT 2 IMG
+- **Full CUDA Install:** Torch CUDA + models/binaries.+ asks to install Qwen TXT 2 IMG (only allows install from 10 gig vram and up)
 
 ---
-
-## 📦 Lean Models
-- One time download of everything, full local offline use after that
 
 ## 💡 User-Friendly
 - Easy installer with **requirements check**.
@@ -136,9 +154,9 @@ Run **`start.bat`** — it automatically:
 
 ## 🗺 Roadmap
 Planned features for future updates:
-- **Compare Panel (A/B):** Side-by-side, swipe, overlay, zoom/pan, and composite export.
+- **Built-in Compare Panel (A/B):** Side-by-side, swipe, overlay, zoom/pan, and composite export.
 - **Installer upgrades:** Unified progress bars and resume support.
-- **Btter integration with queue for the upscalers:** At the moment it is not using the queue until i have more time for this
+- **Better integration with queue for the upscalers:** At the moment it is not using the queue until i have more time for this
 - **Easter eggs** for extra fun surprises!
 
 ---
