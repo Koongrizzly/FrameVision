@@ -1,0 +1,117 @@
+{
+  "RealESR-general-x4v3": {
+    "exe": "realesrgan/realesrgan-ncnn-vulkan.exe",
+    "url": "",
+    "checksum": ""
+  },
+  "RealESRGAN-x4plus": {
+    "exe": "realesrgan/realesrgan-ncnn-vulkan.exe",
+    "url": "",
+    "checksum": ""
+  },
+  "RealESRGAN-x4plus-anime": {
+    "exe": "realesrgan/realesrgan-ncnn-vulkan.exe",
+    "url": "",
+    "checksum": ""
+  },
+  "RealESR-animevideov3-x2": {
+    "exe": "realesrgan/realesrgan-ncnn-vulkan.exe",
+    "url": "",
+    "checksum": ""
+  },
+  "RealESR-animevideov3-x3": {
+    "exe": "realesrgan/realesrgan-ncnn-vulkan.exe",
+    "url": "",
+    "checksum": ""
+  },
+  "RealESR-animevideov3-x4": {
+    "exe": "realesrgan/realesrgan-ncnn-vulkan.exe",
+    "url": "",
+    "checksum": ""
+  },
+  "SwinIR-x4": {
+    "exe": "swinir/swinir-ncnn-vulkan.exe",
+    "url": "",
+    "checksum": ""
+  },
+  "LapSRN-x4": {
+    "exe": "lapsrn/lapsrn-ncnn-vulkan.exe",
+    "url": "",
+    "checksum": ""
+  },
+  "qwen_image": {
+    "root": "./models/qwen_image",
+    "files": [
+      "qwen_image_q3km.gguf OR qwen_image_q4km.gguf OR subfiles"
+    ],
+    "type": "txt2img",
+    "notes": "GGUF Qwen-Image; Q3_K_M for 6/8 GB; Q4_K_M for 12/24 GB"
+  },
+  "rife-ncnn-vulkan": {
+    "root": "./models/rife-ncnn-vulkan",
+    "exe": "rife-ncnn-vulkan.exe",
+    "models": {
+      "rife": {
+        "files": [
+          "contextnet.bin",
+          "contextnet.param",
+          "flownet.bin",
+          "flownet.param",
+          "fusionnet.bin",
+          "fusionnet.param"
+        ]
+      },
+      "rife-v4": {
+        "files": [
+          "contextnet.bin",
+          "contextnet.param",
+          "flownet.bin",
+          "flownet.param",
+          "fusionnet.bin",
+          "fusionnet.param"
+        ]
+      },
+      "rife-v4.6": {
+        "files": [
+          "contextnet.bin",
+          "contextnet.param",
+          "flownet.bin",
+          "flownet.param",
+          "fusionnet.bin",
+          "fusionnet.param"
+        ]
+      },
+      "rife-HD": {
+        "files": [
+          "contextnet.bin",
+          "contextnet.param",
+          "flownet.bin",
+          "flownet.param",
+          "fusionnet.bin",
+          "fusionnet.param"
+        ]
+      },
+      "rife-UHD": {
+        "files": [
+          "contextnet.bin",
+          "contextnet.param",
+          "flownet.bin",
+          "flownet.param",
+          "fusionnet.bin",
+          "fusionnet.param"
+        ]
+      },
+      "rife-anime": {
+        "files": [
+          "contextnet.bin",
+          "contextnet.param",
+          "flownet.bin",
+          "flownet.param",
+          "fusionnet.bin",
+          "fusionnet.param"
+        ]
+      }
+    },
+    "notes": "NCNN RIFE engine + model folders. Preferred model is rife-v4.6; fallbacks include rife-v4 and rife."
+  }
+}
