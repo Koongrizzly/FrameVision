@@ -1,0 +1,40 @@
+{
+  "remember": true,
+  "scale": 2.0,
+  "engine_index": 0,
+  "model_realsr": "realesr-animevideov3-x2",
+  "model_w2x": "models-cunet",
+  "outdir": "D:\\framevision0709\\output\\video",
+  "play_internal": true,
+  "replace_in_player": true,
+  "vcodec": "libx264",
+  "use_crf": false,
+  "crf": 18,
+  "use_bitrate": false,
+  "bitrate": 8000,
+  "preset": "veryfast",
+  "keyint": 0,
+  "audio": "copy",
+  "acodec": "aac",
+  "abitrate": 192,
+  "tile": 0,
+  "overlap": 0,
+  "deinterlace": false,
+  "range": "Auto",
+  "deblock": false,
+  "denoise": false,
+  "deband": false,
+  "sharpen": 0,
+  "sections": {
+    "models": true,
+    "encoder": true,
+    "advanced": false,
+    "recents": true
+  },
+  "batch_max": 5,
+  "video_thumbs": false,
+  "streaming_lowmem": true,
+  "recents": [
+    "D:\\framevision0709\\output\\video\\short 32_x2.mp4"
+  ]
+}
