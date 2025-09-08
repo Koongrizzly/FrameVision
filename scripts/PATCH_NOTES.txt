@@ -1,0 +1,2 @@
+Moved robocopy consolidation into Python; added --launch-app flag; removed stray BAT tail.
+Placement: finalize_move_to_models() is called at the end of main(); start.bat is launched only if --launch-app is passed.

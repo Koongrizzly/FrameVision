@@ -1,0 +1,57 @@
+{
+  "bin": [
+    {
+      "kind":"github_zip",
+      "name":"ffmpeg_win64",
+      "url":"https://github.com/BtbN/FFmpeg-Builds/releases/latest/download/ffmpeg-master-latest-win64-gpl.zip",
+      "fallback_urls":[],
+      "target_dir":"BIN/ffmpeg",
+      "extract": true,
+      "strip_top_dir": true
+    },
+    {
+      "kind":"github_zip",
+      "name":"rife_ncnn_vulkan_win",
+      "url":"https://github.com/nihui/rife-ncnn-vulkan/releases/latest/download/rife-ncnn-vulkan-20220728-windows.zip",
+      "fallback_urls":[
+        "https://github.com/nihui/rife-ncnn-vulkan/releases/latest/download/rife-ncnn-vulkan-20221030-windows.zip",
+        "https://github.com/nihui/rife-ncnn-vulkan/releases/latest/download/rife-ncnn-vulkan-20230107-windows.zip"
+      ],
+      "target_dir":"BIN/rife-ncnn-vulkan",
+      "extract": true,
+      "strip_top_dir": true
+    }
+  ],
+  "models": [
+    {
+      "kind":"hf",
+      "name":"blip_base",
+      "repo_id":"Salesforce/blip-image-captioning-base",
+      "target_dir":"MODELS/blip_base"
+    },
+    {
+      "kind":"hf",
+      "name":"blip_large",
+      "repo_id":"Salesforce/blip-image-captioning-large",
+      "target_dir":"MODELS/blip_large"
+    },
+    {
+      "kind":"github_files",
+      "name":"realesrgan_x4plus",
+      "target_dir":"MODELS/realesrgan",
+      "files":[
+        {
+          "filename":"RealESRGAN_x4plus.pth",
+          "url":"https://github.com/xinntao/Real-ESRGAN/releases/download/v0.3.0/RealESRGAN_x4plus.pth"
+        }
+      ]
+    },
+    {
+      "kind":"hf",
+      "name":"florence2_base",
+      "repo_id":"microsoft/Florence-2-base",
+      "target_dir":"MODELS/florence2_base",
+      "optional": true
+    }
+  ]
+}
