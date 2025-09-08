@@ -5,16 +5,32 @@
 
 ---
 
+## 🖥 Workspace
+- **Left:** Media viewer with playback controls.
+- **Right:** Modular tabs:
+  - Upscaler
+  - RIFE
+  - Describe
+  - Tools
+  - Queue
+  - Settings
+---
+
+
 ## 🚀 Features
 
 ### 🧪 Upscaler
 - Real-ESRGAN family & friends — **auto-downloads**, lean models.
-- Falls back to FFmpeg scaling when models are missing.
 - **Models included:**
-  - `realesrgan-x4plus`, `realesrgan-x4plus-anime`
-  - `realesr-general-x4v3`, `realesr-general-wdn-x4v3`
-  - Waifu2x: `models-cunet`, `models-upconv_7_photo`, `models-upconv_7_anime_style_art_rgb`
-- Per-job options with full **queue integration**.
+  - **Real-ESRGAN:** `realesrgan-x4plus`, `realesrgan-x4plus-anime`,
+    `realesr-general-x4v3`, `realesr-general-wdn-x4v3`
+  - **Waifu2x:** `models-cunet`, `models-upconv_7_photo`, `models-upconv_7_anime_style_art_rgb`
+  - **Upscayl:** `digital-art-4x`, `high-fidelity-4x`, `remacri-4x`,
+    `ultramix-balanced-4x`, `ultrasharp-4x`, `upscayl-lite-4x`, `upscayl-standard-4x`
+- preview last 10 upscales, live progress bar with ETA
+- change video codec,bitrate, sound quality etc
+- advanced settings for some models
+- works both on GPU or CPU
 
 ---
 
@@ -28,10 +44,12 @@
 ---
 
 ### ⏱️ RIFE Interpolation
-- One-click **frame interpolation** (2× default), queue-native.
+- One-click **frame interpolation** 
+- show last results preview pane
+- multiple versions and models (from v4 to UHD)
 - Slow-motion **0.15×–1.0×**, or smooth FPS boosts up to **4.0×**.
-- Superfast mode with Vulkan NCNN backend.
-- **Zero setup** — bundled models auto-extract on first run.
+- Supports both CPU and GPU, GPU is superfast
+- With live progress bar and ETA
 
 ---
 
@@ -48,7 +66,7 @@
 ---
 
 ### 🖌️ TXT → IMG (Qwen)
-WORK IN PROGRESS CURRENTLY ODDLINE
+WORK IN PROGRESS CURRENTLY OFFLINE
 - no cloud required.
 - Prompt & negative prompt support with quick style presets.
 - Seed policies: Fixed / Random / Increment.
@@ -61,46 +79,33 @@ WORK IN PROGRESS CURRENTLY ODDLINE
 - Change speed for videos (with audio sync).
 - Resize with aspect-ratio preservation.
 - Export GIFs using two-pass palette generation.
-- Extract frames to images.
-- **Trim videos** with precise start/end markers.
-- Crop video regions.
-- Quality/Size controls for video & images:
-  - H.264, H.265, AV1, NVENC
-  - JPG, PNG, WEBP
+- Extract frames to images. (one/last/all)
+- **Trim videos** with advanced preview.
+- Crop video 
+- Quality/Size/convert for video & images:
 - Add or replace audio tracks on videos.
-- Batch tools for large workflows.
+- Multi rename tools
 
 ---
 
 ### ⚙️ Settings
 - Paths for models, FFmpeg, and outputs.
-- GPU/CPU/DirectML toggles and performance tuning.
-- Theme system:
-  - Day 🌞, Evening 🌆, Night 🌙, Cyberpunk, Neon, Ocean, Solarized Light, CRT
+- Theme system:10+ themes, Follow tie of day, random at every start
+  - Day 🌞, Evening 🌆, Night 🌙, Cyberpunk, Neon, Ocean, Solarized Light, CRT and many more
 - Bug reporting and maintenance tools.
 - Temperature unit toggle °C / °F.
-
+- Advanced system Monitor
 ---
 
 ### 📋 Queue
-- **Advanced queue system:**
   - Reorder jobs
-  - Pause/resume
-  - ETA tracking
-  - Detailed logs
-
----
-
-## 🖥 Workspace
-- **Left:** Media viewer with playback controls.
-- **Right:** Modular tabs:
-  - Upscaler
-  - RIFE
-  - Describe
-  - Tools
-  - Queue
-  - Settings
-- Clean, organized cache and binaries inside the app folder.
+  - ETA tracking / time done / time added /time finished
+  - open finished jobs
+  - remove jobs from queue,
+  - remove non working jobs,
+  - move running job to failed
+  - move running job back to pensing
+  - live 'led' with colors show status of the queue
 
 ---
 
@@ -112,19 +117,15 @@ Run **`start.bat`** — it automatically:
 
 ### Installer Menu Options
 - **Core Install:** App only (minimal).
-- **Full CPU Install:** Torch CPU + models/binaries.
-- **Full CUDA Install:** Torch CUDA + models/binaries.
+- **Full CPU Install:** Torch CPU + models/binaries.This installer will not ask to install Qwen, smaller model is on roadmap
+- **Full CUDA Install:** Torch CUDA + models/binaries.+ asks to install Qwen TXT 2 IMG
 
 ---
 
 ## 📦 Lean Models
-- Only essential configs and tokenizers are downloaded.
-- No redundant TensorFlow files.
-- Caches are neatly stored inside `./.hf_cache`.
+- One time download of everything, full local offline use after that
 
----
-
-## 💡 Why FrameVision is User-Friendly
+## 💡 User-Friendly
 - Easy installer with **requirements check**.
 - Fully automated setup paths (Core, Full CPU, Full CUDA).
 - Helpful tooltips everywhere.
@@ -136,9 +137,8 @@ Run **`start.bat`** — it automatically:
 ## 🗺 Roadmap
 Planned features for future updates:
 - **Compare Panel (A/B):** Side-by-side, swipe, overlay, zoom/pan, and composite export.
-- **Queue polish:** Persistent jobs after restart, better ETA & logs.
 - **Installer upgrades:** Unified progress bars and resume support.
-- **TXT → IMG improvements:** VRAM-based defaults and refined hi-res helper.
+- **Btter integration with queue for the upscalers:** At the moment it is not using the queue until i have more time for this
 - **Easter eggs** for extra fun surprises!
 
 ---
