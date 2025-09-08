@@ -1,7 +1,7 @@
 [README.md](https://github.com/user-attachments/files/22204351/README.md)
 # 🌟 FrameVision
 **All-in-one Video & Photo Upscaler/Editor**  
-✨ *Upscale, edit, describe, and create — in one streamlined app.*
+✨ *Upscale, convert, edit, describe, and create — in one streamlined app.*
 
 ---
 
@@ -37,7 +37,7 @@
 ### 🖼️ Thumbnail / Meme Creator
 - Capture the current frame or load any image.
 - Multiple text layers: fonts, outline width, shadows, ALL CAPS.
-- Rotate, tilt/skew, and **arc curvature** controls.
+- Rotate, tilt/skew, glow, letter spacing and **arc curvature** controls.
 - **Interactive crop overlay** (16:9, 9:16, or free crop).
 - Export to PNG/JPG, with or without EXIF data.
 
