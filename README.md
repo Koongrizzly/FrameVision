@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="assets/framevision.gif" alt="FrameVision Demo" width="600">
+  <img src="assets/Framevision.gif" alt="FrameVision Demo" width="720">
 </p>
 
 [README.md](https://github.com/user-attachments/files/22204351/README.md)
@@ -254,5 +254,5 @@ If you encounter bugs, please open an issue or use the **Bug Report** button in 
 > Feature development & bugfixing (over 3000 fixes so far) help by **ChatGPT 5**  
 > *This project is a living work and features may come or go.*
 
-![FrameVision Demo](assets/framevision.gif)
+![FrameVision Demo](assets/Framevision.gif)
 
