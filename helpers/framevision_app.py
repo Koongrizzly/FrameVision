@@ -631,13 +631,13 @@ class VideoPane(QWidget):
             pass
         self.player.positionChanged.connect(self.on_pos); self.player.durationChanged.connect(self.on_dur)
         bar = QHBoxLayout()
-        self.btn_open=QPushButton("Open"); self.btn_play=QPushButton("Play"); self.btn_pause=QPushButton("Pause")
-        self.btn_stop=QPushButton("Stop"); self.btn_info=QPushButton("Info"); self.btn_fs=QPushButton("FULL")
-        self.btn_ratio=QPushButton("Center")
+        self.btn_open=QPushButton("📂"); self.btn_open.setToolTip("Open"); self.btn_play=QPushButton("▶"); self.btn_play.setToolTip("Play"); self.btn_pause=QPushButton("⏸"); self.btn_pause.setToolTip("Pause")
+        self.btn_stop=QPushButton("⏹"); self.btn_stop.setToolTip("Stop"); self.btn_info=QPushButton("ℹ"); self.btn_info.setToolTip("Info"); self.btn_fs=QPushButton("⛶"); self.btn_fs.setToolTip("Fullscreen")
+        self.btn_ratio=QPushButton("◻"); self.btn_ratio.setToolTip("Aspect: Center (click to cycle)")
         for b in [self.btn_open,self.btn_play,self.btn_pause,self.btn_stop,self.btn_info,self.btn_ratio,self.btn_fs]: bar.addWidget(b)
-        self.btn_compare = QPushButton("compare"); bar.addWidget(self.btn_compare)
+        self.btn_compare = QPushButton("▷│◁"); self.btn_compare.setToolTip("Compare view"); bar.addWidget(self.btn_compare)
         # Quick Upscale button
-        self.btn_upscale = QPushButton("Upscale")
+        self.btn_upscale = QPushButton("Upscale"); self.btn_upscale.setToolTip("Upscale")
         self.btn_upscale.setObjectName("btn_upscale_quick")
         try:
             self.btn_upscale.setStyleSheet(
@@ -734,8 +734,20 @@ class VideoPane(QWidget):
 
     def _update_ratio_button(self):
         try:
-            names = {0: 'Center', 1: 'Fit', 2: 'Fill', 3: 'Full'}
-            self.btn_ratio.setText(names.get(int(self.ratio_mode), 'Center'))
+            # icon + tooltip per mode
+            m = int(self.ratio_mode)
+            mapping = {
+                0: ("◻", "Center"),
+                1: ("▣", "Fit"),
+                2: ("◼", "Fill"),
+                3: ("⛶", "Full"),
+            }
+            txt, tip = mapping.get(m, ("◻", "Center"))
+            self.btn_ratio.setText(txt)
+            try:
+                self.btn_ratio.setToolTip(f"Aspect: {tip} (click to cycle)")
+            except Exception:
+                pass
         except Exception:
             pass
 
