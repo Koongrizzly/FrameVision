@@ -251,7 +251,7 @@ If you encounter bugs, please open an issue or use the **Bug Report** button in 
 ---
 
 > Built by **Contrinsan (KoonGrizzly)**  
-> Feature development & bugfixing (over 3000 fixes so far) help by **ChatGPT 5**  
+> Feature development & bugfixing help by **ChatGPT 5**  
 > *This project is a living work and features may come or go.*
 
 ![FrameVision Demo](assets/Framevision.gif)
