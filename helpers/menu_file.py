@@ -547,64 +547,6 @@ def _trigger_open(main_window):
     # If we get here, we don't know how to load into the app. Tell the user.
     QMessageBox.information(main_window, "Open", "Loaded path selected, but app video widget integration wasn't found.")
 
-# ------------------------------- Sessions -------------------------------
-
-SESSION_KEY="last_session"
-AUTO_REOPEN_KEY="reopen_last_session_on_startup"
-SESSION_LOADED_FLAG="session_loaded_this_run"
-
-def _save_session(main_window):
-    path=_current_input_path(main_window)
-    pos=None
-    # Best-effort: pull a millisecond position if the player exposes it
-    for attr in ("position","pos_ms","current_ms","tell"):
-        try:
-            obj=getattr(main_window, "video", None) or main_window
-            fn=getattr(obj, attr, None)
-            if callable(fn):
-                v=fn()
-            else:
-                v=fn
-            if isinstance(v, int):
-                pos=v; break
-        except Exception:
-            pass
-    data={"path": path or "", "position_ms": pos}
-    try:
-        s=QSettings(ORG,APP); s.setValue(SESSION_KEY, json.dumps(data))
-        QMessageBox.information(main_window,"Save Session","Session saved.")
-    except Exception:
-        pass
-
-def _load_session(main_window, silent: bool=False):
-    try:
-        s=QSettings(ORG,APP); raw=s.value(SESSION_KEY,"")
-        if not raw: 
-            if not silent: QMessageBox.information(main_window,"Load Session","No saved session."); 
-            return
-        data=json.loads(raw) if isinstance(raw,str) else raw
-        path=data.get("path") or ""
-        if path and os.path.exists(path):
-            _open_in_player(main_window, path)
-            _remember_recent(path)
-            if not silent: QMessageBox.information(main_window,"Load Session","Session restored.")
-        elif not silent:
-            QMessageBox.information(main_window,"Load Session","Saved file not found.")
-    except Exception:
-        if not silent:
-            QMessageBox.information(main_window,"Load Session","Failed to load session.")
-
-def _toggle_auto_reopen(action: QAction):
-    s=QSettings(ORG,APP); s.setValue(AUTO_REOPEN_KEY, action.isChecked())
-
-def _maybe_auto_reopen(main_window):
-    s=QSettings(ORG,APP)
-    if s.value(SESSION_LOADED_FLAG, False): 
-        return
-    if str(s.value(AUTO_REOPEN_KEY, "false")).lower() in ("1","true","yes"):
-        _load_session(main_window, silent=True)
-        s.setValue(SESSION_LOADED_FLAG, True)
-
 # ------------------------------- Menu builders -------------------------------
 
 def _add(menu: QMenu, text: str, slot, shortcut: str | None = None, checkable: bool=False):
@@ -723,16 +665,7 @@ def install_file_menu(main_window):
         _add(batch_menu,"Image Convert (folder)…", lambda: _batch_image_convert(main_window))
         _add(batch_menu,"Export ALL Audio Tracks (1 file)…", lambda: _export_all_audio_tracks(main_window))
 
-        # Session / Project
         file_menu.addSeparator()
-        _add(file_menu,"Save Session", lambda: _save_session(main_window))
-        _add(file_menu,"Load Session", lambda: _load_session(main_window))
-        auto=_add(file_menu,"Reopen Last Session on Startup", lambda checked=False: _toggle_auto_reopen(auto), checkable=True)
-        try:
-            s=QSettings(ORG,APP); auto.setChecked(bool(s.value(AUTO_REOPEN_KEY, False)))
-        except Exception:
-            pass
-
         # Utilities
         file_menu.addSeparator()
         _add(file_menu,"Open Containing Folder", lambda: _open_containing_folder(main_window))
@@ -744,8 +677,6 @@ def install_file_menu(main_window):
         _add(file_menu,"Exit (close process)", lambda: os._exit(0))
 
         # Maybe auto reopen last session once at startup
-        _maybe_auto_reopen(main_window)
-
     except Exception as e:
         # fail silently for end-users
         # print(e)  # Uncomment for debugging
