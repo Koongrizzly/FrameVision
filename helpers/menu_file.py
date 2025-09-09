@@ -509,45 +509,34 @@ def _open_in_player(main_window, path: str) -> bool:
     return False
 
 def _trigger_open(main_window):
-    # Remember currently open path as "last closed", then open a new file.
+    # Remember currently open path as "last closed", then open a new file via Qt dialog only.
     prev = _current_input_path(main_window)
-    if prev: _set_last_closed(prev)
+    if prev:
+        _set_last_closed(prev)
 
-    # Preferred: call the app's own open_file() method
-    try:
-        fn = getattr(main_window, 'open_file', None)
-        if callable(fn):
-            fn()
-            # Best effort: read back current path and remember
-            newp=_current_input_path(main_window)
-            if newp: _remember_recent(newp)
-            return
-    except Exception:
-        pass
-    # Fallback 1: click any button labeled "Open"
-    btn = _find_button(main_window, ("open",))
-    if btn:
-        btn.click()
-        newp=_current_input_path(main_window)
-        if newp: _remember_recent(newp)
-        return
-    # Fallback 2: generic file dialog -> open in player if possible
+    # Always use a QFileDialog here to avoid side-effects (like opening Windows Explorer).
     filters = "Videos (*.mp4 *.mkv *.mov *.avi *.webm *.m4v);;Images (*.png *.jpg *.jpeg *.bmp *.webp);;All files (*.*)"
-    d = QSettings(ORG, APP).value("last_open_dir", str(Path.home()))
+    try:
+        d = QSettings(ORG, APP).value("last_open_dir", str(Path.home()))
+    except Exception:
+        d = str(Path.home())
     fn, _ = QFileDialog.getOpenFileName(main_window, "Open media", d, filters)
     if not fn:
         return
+
     p = Path(fn)
     try:
         s = QSettings(ORG, APP); s.setValue("last_open_dir", str(p.parent))
     except Exception:
         pass
+
     if _open_in_player(main_window, str(p)):
-        _remember_recent(str(p)); return
+        _remember_recent(str(p))
+        return
+
     # If we get here, we don't know how to load into the app. Tell the user.
     QMessageBox.information(main_window, "Open", "Loaded path selected, but app video widget integration wasn't found.")
 
-# ------------------------------- Menu builders -------------------------------
 
 def _add(menu: QMenu, text: str, slot, shortcut: str | None = None, checkable: bool=False):
     act = QAction(text, menu)
