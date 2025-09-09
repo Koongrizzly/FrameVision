@@ -25,7 +25,7 @@
 ## 💡 User-Friendly
 - Easy installer with **requirements check**.
 - Fully **automated** setup paths (Core, Full CPU, Full CUDA). User can drink coffee, script will deliver out of the box use
-- easy to use tabs,everything in collapsible boxes so you see only what you need and without seatching
+- easy to use tabs, everything in collapsible boxes so you see only what you need and without searching
 - Helpful **tooltips** everywhere. **Q&A** and knowledge base (info menu)
 - Resizable layout with draggable splitters. Fit the player or the tabs to the size you want.
 - Clear messages and graceful fallbacks (e.g. CPU fallback when GPU is unavailable, streaming for low mem use etc).
@@ -210,14 +210,15 @@ WORK IN PROGRESS CURRENTLY OFFLINE
 
 ## 🗺 Roadmap
 Planned features for future updates:
-- **Built-in Compare Panel (A/B):** Side-by-side, swipe, zoom/pan, and much more
+- **Built-in Compare Panel (A/B):**, not the html version that i use now. Side-by-side, swipe, zoom/pan, and much more.
+- Global & per tab save settings after (re)start.
 - **Installer upgrades:** Unified progress bars and resume support. app might get it's own windows installer one day
 - **Better integration with queue for the upscalers:** At the moment it is not using the queue until i have more time for this
 - zip with over **100 intros**
-- low weight **txt 2 img** model
+- low weight **txt 2 img** model, 
 - polishing and bugfixing for the rest of my life i think
 - a low weight txt/img to video would be nice but let's get the rest working 100% first
-- **Easter eggs** for extra fun surprises! Don't forget to click the intro 4x befor it ends ;-)
+- **Easter eggs** for extra fun surprises! Don't forget to click the intro 4x before it ends ;-)
 
 ---
 
@@ -233,6 +234,6 @@ If you encounter bugs, please open an issue or use the **Bug Report** button in 
 ---
 
 > Built by **Contrinsan (KoonGrizzly)**  
-> Feature development & bugfixing (over 3000 so far) help by **ChatGPT 5 **  
+> Feature development & bugfixing (over 3000 fixes so far) help by **ChatGPT 5 **  
 > *This project is a living work and features may come or go.*
 
