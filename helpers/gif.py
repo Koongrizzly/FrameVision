@@ -78,6 +78,8 @@ class GifOptions:
     compression_webp: int = 6
 
     palette_cache_key: Optional[str] = None
+    # Per-image duration for images→animation builds (seconds); overrides Images FPS when set
+    img_duration_sec: Optional[float] = None
 
     def to_dict(self) -> Dict[str, Any]: return asdict(self)
     @classmethod
@@ -248,7 +250,8 @@ def build_apng_cmd(input_path: Path, out_path: Path, opts: GifOptions, ffmpeg: s
     vf = _gif_filters(opts)
     cmd = [ffmpeg, "-y", *_input_trim_args(opts), "-i", str(input_path)]
     if vf: cmd += ["-vf", vf]
-    if opts.fps: cmd += ["-r", str(opts.fps)]
+    if (getattr(opts, 'img_duration_sec', None) in (None, 0)) and opts.fps:
+            cmd += ["-r", str(opts.fps)]
     cmd += [str(out_path)]
     return cmd
 
@@ -386,6 +389,8 @@ def apply_preset(pane, data: Dict[str, Any]) -> None:
 def install_ui(pane, lay_gif, sec_gif) -> None:
     """Build the advanced controls and a tiny result/progress line."""
     try:
+        from PySide6.QtGui import QDesktopServices
+        from PySide6.QtCore import QUrl
         from PySide6.QtWidgets import (QComboBox, QCheckBox, QSpinBox, QDoubleSpinBox, QLineEdit, QLabel, QHBoxLayout, QProgressBar, QPushButton)
     except Exception:
         # PySide6 not available; skip UI build to avoid import-time crash
@@ -444,19 +449,81 @@ def install_ui(pane, lay_gif, sec_gif) -> None:
     row_loop = QHBoxLayout(); row_loop.addWidget(QLabel("Loop (0=∞)")); row_loop.addWidget(pane.gif_loop); row_loop.addStretch(1)
     row_cols = QHBoxLayout(); row_cols.addWidget(QLabel("Max colors")); row_cols.addWidget(pane.gif_colors); row_cols.addWidget(QLabel("Stats")); row_cols.addWidget(pane.gif_stats); row_cols.addStretch(1)
     row_dith = QHBoxLayout(); row_dith.addWidget(QLabel("Dither")); row_dith.addWidget(pane.gif_dither); row_dith.addWidget(QLabel("Bayer 1–5")); row_dith.addWidget(pane.gif_bayer); row_dith.addStretch(1)
-    row_sz = QHBoxLayout(); row_sz.addWidget(QLabel("W")); row_sz.addWidget(pane.gif_w); row_sz.addWidget(QLabel("H")); row_sz.addWidget(pane.gif_h); row_sz.addWidget(pane.gif_keep_ar); row_sz.addStretch(1)
+
+    # New compact top row: Format + Loop + Frame step + FPS (compact)
+    row_top = QHBoxLayout()
+    row_top.addWidget(QLabel("Format")); row_top.addWidget(pane.gif_fmt)
+    row_top.addSpacing(12); row_top.addWidget(QLabel("Loop (0=∞)")); row_top.addWidget(pane.gif_loop)
+    row_top.addSpacing(12); row_top.addWidget(QLabel("Frame step")); row_top.addWidget(pane.gif_frame_step)
+    # Move the existing FPS spin from the host row into here; make it compact
+    try:
+        # Hide the original FPS row's label and spin (keep them for backend reads)
+        lbl_fps = lay_gif.labelForField(pane.spin_gif_fps)
+        if lbl_fps:
+            lbl_fps.hide()
+        try:
+            pane.spin_gif_fps.setVisible(False)
+        except Exception:
+            pass
+        # Compact inline FPS spin that mirrors the original
+        pane.spin_gif_fps_inline = QSpinBox()
+        try:
+            pane.spin_gif_fps_inline.setRange(pane.spin_gif_fps.minimum(), pane.spin_gif_fps.maximum())
+            pane.spin_gif_fps_inline.setValue(pane.spin_gif_fps.value())
+        except Exception:
+            pane.spin_gif_fps_inline.setRange(1, 120); pane.spin_gif_fps_inline.setValue(12)
+        pane.spin_gif_fps_inline.setMaximumWidth(60)
+        # Two-way sync without loops
+        def _sync_inline_to_orig(v):
+            try:
+                if pane.spin_gif_fps.value() != int(v):
+                    old = pane.spin_gif_fps.blockSignals(True)
+                    pane.spin_gif_fps.setValue(int(v))
+                    pane.spin_gif_fps.blockSignals(old)
+            except Exception:
+                pass
+        def _sync_orig_to_inline(v):
+            try:
+                if pane.spin_gif_fps_inline.value() != int(v):
+                    old = pane.spin_gif_fps_inline.blockSignals(True)
+                    pane.spin_gif_fps_inline.setValue(int(v))
+                    pane.spin_gif_fps_inline.blockSignals(old)
+            except Exception:
+                pass
+        try:
+            pane.spin_gif_fps_inline.valueChanged.connect(_sync_inline_to_orig)
+            pane.spin_gif_fps.valueChanged.connect(_sync_orig_to_inline)
+        except Exception:
+            pass
+        row_top.addSpacing(12); row_top.addWidget(QLabel("FPS")); row_top.addWidget(pane.spin_gif_fps_inline)
+    except Exception:
+        pass
+        row_sz = QHBoxLayout(); row_sz.addWidget(QLabel("W")); row_sz.addWidget(pane.gif_w); row_sz.addWidget(QLabel("H")); row_sz.addWidget(pane.gif_h); row_sz.addWidget(pane.gif_keep_ar); row_sz.addStretch(1)
     row_fit = QHBoxLayout(); row_fit.addWidget(QLabel("Mode")); row_fit.addWidget(pane.gif_fitmode); row_fit.addWidget(QLabel("AR")); row_fit.addWidget(pane.gif_ar); row_fit.addStretch(1)
+    # Combined size + mode row
+    row_sizefit = QHBoxLayout()
+    row_sizefit.addWidget(QLabel("W")); row_sizefit.addWidget(pane.gif_w)
+    row_sizefit.addWidget(QLabel("H")); row_sizefit.addWidget(pane.gif_h)
+    row_sizefit.addWidget(pane.gif_keep_ar)
+    row_sizefit.addSpacing(12); row_sizefit.addWidget(QLabel("Mode")); row_sizefit.addWidget(pane.gif_fitmode)
+    row_sizefit.addSpacing(12); pane.lbl_gif_ar = QLabel("AR"); row_sizefit.addWidget(pane.lbl_gif_ar); row_sizefit.addWidget(pane.gif_ar)
+    row_sizefit.addStretch(1)
     row_trim = QHBoxLayout(); row_trim.addWidget(QLabel("Trim start (s)")); row_trim.addWidget(pane.gif_trim_start); row_trim.addWidget(QLabel("Trim end (s)")); row_trim.addWidget(pane.gif_trim_end); row_trim.addStretch(1)
     row_step = QHBoxLayout(); row_step.addWidget(QLabel("Frame step")); row_step.addWidget(pane.gif_frame_step); row_step.addStretch(1)
 
-    lay_gif.addRow(row_fmt); lay_gif.addRow(row_pal); lay_gif.addRow(row_loop); lay_gif.addRow(row_cols)
-    lay_gif.addRow(row_dith); lay_gif.addRow(row_sz); lay_gif.addRow(row_fit); lay_gif.addRow(row_trim); lay_gif.addRow(row_step)
+    lay_gif.addRow(row_top)
+    pane._gif_adv_rows = getattr(pane, '_gif_adv_rows', [])
+    pane._gif_adv_rows.append(row_pal)
+    pane._gif_adv_rows.append(row_cols)
+    pane._gif_adv_rows.append(row_dith)
+    lay_gif.addRow(row_sizefit)
+    lay_gif.addRow(row_trim)
 
     # WebP/APNG line
     row_w = QHBoxLayout(); row_w.addWidget(pane.gif_keep_alpha); row_w.addWidget(pane.gif_webp_lossless)
     row_w.addWidget(QLabel("quality")); row_w.addWidget(pane.gif_webp_quality)
     row_w.addWidget(QLabel("compression")); row_w.addWidget(pane.gif_webp_comp); row_w.addStretch(1)
-    lay_gif.addRow(row_w)
+    pane._gif_adv_rows = getattr(pane, '_gif_adv_rows', []); pane._gif_adv_rows.append(row_w)
 
     # Progress + result
     pane.gif_pb = QProgressBar(); pane.gif_pb.setRange(0,100); pane.gif_pb.setVisible(False)
@@ -473,7 +540,291 @@ def install_ui(pane, lay_gif, sec_gif) -> None:
     row_res = QHBoxLayout(); row_res.addWidget(pane.gif_pb); row_res.addWidget(pane.gif_eta); row_res.addWidget(pane.gif_btn_play); row_res.addStretch(1)
     lay_gif.addRow(row_res)
 
-# ---- Progress encode (GUI) ----
+
+    # --- Create new from images (single animation) ---
+    try:
+        from PySide6.QtWidgets import (QGroupBox, QFormLayout, QFileDialog, QLineEdit, QSpinBox, QLabel, QHBoxLayout, QPushButton, QCheckBox, QToolButton, QWidget, QVBoxLayout, QMessageBox, QTableWidget, QTableWidgetItem, QAbstractItemView)
+        from PySide6.QtCore import QSettings, Qt
+    except Exception:
+        QGroupBox = None
+    if QGroupBox is not None:
+        grp_imgs = QGroupBox("Create new from images")
+        lay_imgs = QFormLayout(grp_imgs)
+
+        
+        # Header row with 'Include subfolders' next to the title
+        header_row = QHBoxLayout()
+        pane.gif_imgs_subdirs = QCheckBox("Include subfolders")
+        header_row.addStretch(1)
+        header_row.addWidget(pane.gif_imgs_subdirs)
+        lay_imgs.addRow(header_row)
+        pane.gif_imgs_dir = QLineEdit(); pane.gif_imgs_dir.setReadOnly(True)
+        pane.gif_imgs_browse = QPushButton("Choose folder…")
+        pane.gif_imgs_fps = QSpinBox(); pane.gif_imgs_fps.setRange(1, 120); pane.gif_imgs_fps.setValue(12)
+
+        row_i1 = QHBoxLayout()
+        row_i1.addWidget(QLabel("Folder")); row_i1.addWidget(pane.gif_imgs_dir); row_i1.addWidget(pane.gif_imgs_browse)
+        row_i2 = QHBoxLayout()
+        row_i2.addWidget(QLabel("Images FPS")); row_i2.addWidget(pane.gif_imgs_fps)
+        pane.gif_img_sec = QDoubleSpinBox(); pane.gif_img_sec.setRange(0.1, 10.0); pane.gif_img_sec.setSingleStep(0.1); pane.gif_img_sec.setValue(1.0)
+        row_i2.addSpacing(12); row_i2.addWidget(QLabel("Seconds/image")); row_i2.addWidget(pane.gif_img_sec); row_i2.addStretch(1)
+        def _sync_img_fps_enable(val):
+            try:
+                pane.gif_imgs_fps.setEnabled(False if float(val) > 0 else True)
+            except Exception:
+                pass
+        try:
+            pane.gif_img_sec.valueChanged.connect(_sync_img_fps_enable)
+        except Exception:
+            pass
+        _sync_img_fps_enable(pane.gif_img_sec.value())
+
+        try:
+            pane.gif_imgs_preview = QTableWidget(0, 3)
+            pane.gif_imgs_preview.setHorizontalHeaderLabels(["Name", "Size", "Resolution"])
+            pane.gif_imgs_preview.verticalHeader().setVisible(False)
+            from PySide6.QtWidgets import QAbstractItemView
+            pane.gif_imgs_preview.setSelectionBehavior(QAbstractItemView.SelectRows)
+            pane.gif_imgs_preview.setEditTriggers(QAbstractItemView.NoEditTriggers)
+            hh = pane.gif_imgs_preview.horizontalHeader(); hh.setStretchLastSection(True)
+            pane.gif_imgs_preview.setMinimumHeight(110)
+            pane.gif_imgs_preview.setMaximumHeight(140)
+            try:
+                pane.gif_imgs_preview.setAlternatingRowColors(True)
+                _qss = (
+                    "QTableWidget { background-color: #20242a; color: #e6e6e6; gridline-color: #3a3f44; }"
+                    " QHeaderView::section { background-color: #2a2f36; color: #e6e6e6; padding: 4px; border: none; }"
+                    " QTableWidget::item:selected { background-color: #3b82f6; color: #ffffff; }"
+                )
+                pane.gif_imgs_preview.setStyleSheet(_qss)
+            except Exception:
+                pass
+        except Exception:
+            pass
+
+        pane.gif_imgs_create = QPushButton("New")
+
+        lay_imgs.addRow(row_i1)
+        lay_imgs.addRow(row_i2)
+        try:
+            lay_imgs.addRow(pane.gif_imgs_preview)
+        except Exception:
+            pass
+        pane.gif_open_after = QCheckBox("Open when done"); pane.gif_open_after.setChecked(True)
+        lay_imgs.addRow(pane.gif_open_after)
+        lay_imgs.addRow(pane.gif_imgs_create)
+        lay_gif.addRow(grp_imgs)
+
+        # --- Advanced (images) — collapsed by default with tiny toggle ---
+        # We implement a small toggle button that shows/hides the inner layout.
+        adv_wrap = QWidget(); adv_v = QVBoxLayout(adv_wrap); adv_v.setContentsMargins(0,0,0,0); adv_v.setSpacing(6)
+        pane.gif_adv_toggle = QToolButton(); pane.gif_adv_toggle.setText("Advanced settings"); pane.gif_adv_toggle.setCheckable(True); pane.gif_adv_toggle.setChecked(False)
+        pane.gif_adv_toggle.setToolButtonStyle(Qt.ToolButtonTextBesideIcon)
+        pane.gif_adv_toggle.setArrowType(Qt.RightArrow)
+
+        adv_inner = QWidget(); adv_lay = QFormLayout(adv_inner)
+        pane.gif_imgs_patterns = QLineEdit("*.png;*.jpg;*.jpeg;*.webp")
+
+        adv_lay.addRow(QLabel("File patterns (;-separated)"), pane.gif_imgs_patterns)
+        adv_inner.setVisible(False)
+
+        def _adv_toggled(on):
+            pane.gif_adv_toggle.setArrowType(Qt.DownArrow if on else Qt.RightArrow)
+            adv_inner.setVisible(bool(on))
+        pane.gif_adv_toggle.toggled.connect(_adv_toggled)
+
+        adv_v.addWidget(pane.gif_adv_toggle); adv_v.addWidget(adv_inner)
+        # Move advanced rows (palette/dither/webp options) into this group
+        try:
+            for r in getattr(pane, '_gif_adv_rows', []):
+                adv_lay.addRow(r)
+            pane._gif_adv_rows = []
+        except Exception:
+            pass
+        lay_gif.addRow(adv_wrap)
+
+        # Remember last-used folder
+        def _choose_source():
+            try:
+                settings = QSettings("FrameVision", "FrameVision")
+                start = settings.value("tools/export_gif/images_last_dir", "")
+            except Exception:
+                settings = None; start = ""
+            msg = QMessageBox(pane)
+            msg.setWindowTitle("Create from images")
+            msg.setText("Select image source:")
+            b_files = msg.addButton("Choose files", QMessageBox.AcceptRole)
+            b_folder = msg.addButton("Choose folder", QMessageBox.ActionRole)
+            msg.addButton("Cancel", QMessageBox.RejectRole)
+            msg.exec()
+            if msg.clickedButton() == b_files:
+                pats = pane.gif_imgs_patterns.text().strip() if hasattr(pane, 'gif_imgs_patterns') else "*.png;*.jpg;*.jpeg;*.webp"
+                exts = ' '.join([p.strip() for p in pats.split(';') if p.strip()])
+                flt = f"Images ({exts})"
+                files, _ = QFileDialog.getOpenFileNames(pane, "Choose images", start or str(Path.home()), flt)
+                if files:
+                    pane.gif_imgs_files = [Path(f) for f in files]
+                    try:
+                        common = os.path.commonpath(files)
+                    except Exception:
+                        common = str(Path(files[0]).parent)
+                    pane.gif_imgs_dir.setText(common)
+                    try:
+                        if settings: settings.setValue("tools/export_gif/images_last_dir", common)
+                    except Exception:
+                        pass
+                    _update_preview()
+                return
+            elif msg.clickedButton() == b_folder:
+                folder = QFileDialog.getExistingDirectory(pane, "Choose images folder", start or str(Path.home()))
+                if folder:
+                    try:
+                        pane.gif_imgs_files = []
+                    except Exception:
+                        pass
+                    pane.gif_imgs_dir.setText(folder)
+                    try:
+                        if settings: settings.setValue("tools/export_gif/images_last_dir", folder)
+                    except Exception:
+                        pass
+                    _update_preview()
+                return
+            else:
+                return
+        pane.gif_imgs_browse.clicked.connect(_choose_source)
+
+        def _update_preview():
+            try:
+                table = getattr(pane, 'gif_imgs_preview', None)
+                if table is None:
+                    return
+                explicit = getattr(pane, 'gif_imgs_files', [])
+                if explicit:
+                    imgs = [Path(f) for f in explicit]
+                else:
+                    folder_txt = pane.gif_imgs_dir.text().strip()
+                    if folder_txt:
+                        folder = Path(folder_txt)
+                    else:
+                        folder = None
+                    if folder and folder.exists():
+                        imgs = _gather_images(folder, pane.gif_imgs_patterns.text().strip(), bool(pane.gif_imgs_subdirs.isChecked()))
+                    else:
+                        imgs = []
+                table.setRowCount(len(imgs))
+                ffprobe = _ffprobe_from_ffmpeg(getattr(pane, 'ffmpeg_path', lambda: 'ffmpeg')())
+                for i, p in enumerate(imgs):
+                    try:
+                        name = p.name
+                        try:
+                            size = _human_size(p.stat().st_size)
+                        except Exception:
+                            size = "-"
+                        res = _fast_image_resolution(p, ffprobe)
+                        res_txt = (f"{res[0]}×{res[1]}" if res else "—×—")
+                        table.setItem(i, 0, QTableWidgetItem(name))
+                        table.setItem(i, 1, QTableWidgetItem(size))
+                        table.setItem(i, 2, QTableWidgetItem(res_txt))
+                    except Exception:
+                        pass
+            except Exception:
+                pass
+        try:
+            pane.gif_imgs_subdirs.toggled.connect(lambda _=None: _update_preview())
+            pane.gif_imgs_patterns.textChanged.connect(lambda _=None: _update_preview())
+        except Exception:
+            pass
+
+        # Action: build one animation from the selected folder
+        def _do_create():
+            folder = pane.gif_imgs_dir.text().strip()
+            if not folder:
+                try:
+                    from PySide6.QtWidgets import QMessageBox
+                    QMessageBox.warning(pane, "No folder", "Please choose an images folder first.")
+                except Exception:
+                    pass
+                return
+            fmt = pane.gif_fmt.currentText().strip().lower()
+            # Build options from current UI (palette, resize, etc), FPS = images FPS
+            dummy = Path(folder)
+            opts = options_from_ui(pane, dummy, same_as_video=False, spinner_val=int(pane.gif_imgs_fps.value()), batch=False)
+            try:
+                dur = float(pane.gif_img_sec.value())
+                if dur > 0:
+                    opts.img_duration_sec = dur
+            except Exception:
+                pass
+            # Build default name based on selected folder or explicit files
+            explicit = getattr(pane, 'gif_imgs_files', [])
+            base_name = Path(folder).name
+            if explicit:
+                try:
+                    common = str(Path(explicit[0]).parent)
+                    base_name = Path(common).name
+                except Exception:
+                    pass
+            # Determine extension from format
+            ext = 'gif' if fmt == 'gif' else ('webp' if fmt == 'webp' else 'png')
+            # Default directory
+            try:
+                out_dir_default = Path(getattr(pane, 'OUT_VIDEOS', getattr(pane, 'out_dir', Path.cwd())))
+            except Exception:
+                out_dir_default = Path.cwd()
+            # Show Save dialog
+            suggested = str(out_dir_default / f"{base_name}.{ext}")
+            filt = f"Animation (*.{ext})"
+            save_path, _ = QFileDialog.getSaveFileName(pane, 'Save animation', suggested, filt)
+            if not save_path:
+                try:
+                    pane.gif_imgs_create.setEnabled(True)
+                except Exception:
+                    pass
+                return
+            # Ensure extension
+            sp = Path(save_path)
+            if sp.suffix.lower() != f'.{ext}':
+                sp = sp.with_suffix(f'.{ext}')
+            try:
+                sp.parent.mkdir(parents=True, exist_ok=True)
+            except Exception:
+                pass
+            # Remember last save dir
+            try:
+                settings = QSettings('FrameVision', 'FrameVision')
+                settings.setValue('tools/export_gif/last_save_dir', str(sp.parent))
+            except Exception:
+                pass
+            out = sp
+
+            encode_images_with_progress(
+                pane,
+                Path(folder),
+                out,
+                opts,
+                patterns=pane.gif_imgs_patterns.text().strip(),
+                include_subdirs=bool(pane.gif_imgs_subdirs.isChecked()),
+                ffmpeg=getattr(pane, 'ffmpeg_path', lambda: 'ffmpeg')(),
+                work_dir=Path(getattr(pane, 'OUT_TEMP', out.parent)),
+                explicit_imgs=list(explicit) if explicit else None,
+            )
+            # Open folder after export
+            try:
+                (
+                QDesktopServices.openUrl(QUrl.fromLocalFile(str(out.parent)))
+                if (getattr(pane, 'gif_open_after', None) is not None and bool(pane.gif_open_after.isChecked()))
+                else None
+            )
+            except Exception:
+                pass
+            try:
+                pane._gif_last_out = out
+                pane.gif_btn_play.setEnabled(True)
+            except Exception:
+                pass
+
+        pane.gif_imgs_create.clicked.connect(_do_create)
+    # ---- Progress encode (GUI) ----
 def encode_with_progress(pane, input_path: Path, out_path: Path, opts: GifOptions, ffmpeg: str = "ffmpeg", work_dir: Optional[Path] = None) -> None:
     """Spawn ffmpeg with -progress and show ETA like interp.py. Falls back to encode() on error."""
     try:
@@ -579,3 +930,227 @@ def encode_with_progress(pane, input_path: Path, out_path: Path, opts: GifOption
 def output_ext_for(fmt: str) -> str:
     f = fmt.lower()
     return { "gif":".gif", "webp":".webp", "apng":".png" }.get(f, ".gif")
+
+
+
+
+# ---- File/metadata helpers ----
+def _human_size(num_bytes: int) -> str:
+    try:
+        num = float(num_bytes)
+    except Exception:
+        return "-"
+    units = ["B","KB","MB","GB","TB"]
+    i = 0
+    while num >= 1024 and i < len(units)-1:
+        num /= 1024.0
+        i += 1
+    return f"{num:.1f} {units[i]}" if i>0 else f"{int(num)} {units[i]}"
+
+def _fast_image_resolution(path: Path, ffprobe: str):
+    # Try PIL (fast header read); fallback to ffprobe; else None
+    try:
+        from PIL import Image
+        try:
+            with Image.open(str(path)) as im:
+                w, h = im.size
+                return (int(w), int(h))
+        except Exception:
+            pass
+    except Exception:
+        pass
+    try:
+        out = subprocess.check_output([ffprobe, "-v","error","-select_streams","v:0",
+                                       "-show_entries","stream=width,height",
+                                       "-of","csv=s=x:p=0", str(path)],
+                                      universal_newlines=True)
+        line = out.strip().splitlines()[0] if out.strip() else ""
+        if "x" in line:
+            w,h = line.split("x",1)
+            return (int(w), int(h))
+    except Exception:
+        pass
+    return None
+
+# ---- Image-sequence helpers ----
+def _nat_key(s: str):
+    import re
+    return [int(t) if t.isdigit() else t.lower() for t in re.split(r"(\d+)", s)]
+
+def _gather_images(folder: Path, patterns: str, include_subdirs: bool) -> List[Path]:
+    pats = [p.strip() for p in patterns.split(";") if p.strip()]
+    files: List[Path] = []
+    for pat in pats:
+        it = folder.rglob(pat) if include_subdirs else folder.glob(pat)
+        files.extend(it)
+    files = [Path(f) for f in files if Path(f).is_file()]
+    files.sort(key=lambda x: _nat_key(str(x)))
+    return files
+
+def _write_concat_list(imgs: List[Path], fps: float, boomerang: bool, work_dir: Path, img_duration_sec: Optional[float] = None) -> Path:
+    work_dir.mkdir(parents=True, exist_ok=True)
+    lst = work_dir / "img_sequence.txt"
+    dur = (float(img_duration_sec) if (img_duration_sec is not None and float(img_duration_sec) > 0) else (1.0 / max(0.1, float(fps))))
+    seq = list(imgs)
+    if boomerang and len(imgs) > 1:
+        seq = imgs + imgs[-2:0:-1]  # forward + reverse (no duplicate ends)
+    with lst.open("w", encoding="utf-8") as f:
+        for p in seq:
+            sp = str(p).replace('\\','/')
+            sp = sp.replace("'", "'\\''")
+            f.write("file '" + sp + "'\n")
+            f.write(f"duration {dur}\n")
+        if seq:
+            sp2 = str(seq[-1]).replace('\\','/')
+            sp2 = sp2.replace("'", "'\\''")
+            f.write("file '" + sp2 + "'\n")  # concat quirk
+    return lst
+
+def build_commands_from_images(
+    folder: Path,
+    out_path: Path,
+    opts: GifOptions,
+    patterns: str,
+    include_subdirs: bool,
+    ffmpeg: str = "ffmpeg",
+    work_dir: Optional[Path] = None,
+    explicit_imgs: list[Path] | None = None,
+) -> List[List[str]]:
+    folder = Path(folder)
+    work_dir = Path(work_dir) if work_dir else out_path.parent
+    imgs = list(explicit_imgs) if explicit_imgs else _gather_images(folder, patterns, include_subdirs)
+    try:
+        imgs.sort(key=lambda x: _nat_key(str(x)))
+    except Exception:
+        pass
+    if not imgs:
+        raise GifError("No images found in the selected folder.")
+    lst = _write_concat_list(imgs, float(opts.fps or 12), (opts.boomerang if opts.format == "gif" else False), work_dir, img_duration_sec=getattr(opts, 'img_duration_sec', None))
+    filters = _gif_filters(opts)
+
+    if opts.format == "gif":
+        if not opts.use_palette:
+            cmd = [ffmpeg, "-y", "-f", "concat", "-safe", "0", "-i", str(lst)]
+            if filters: cmd += ["-vf", filters]
+            if (getattr(opts, 'img_duration_sec', None) in (None, 0)) and opts.fps:
+                cmd += ["-r", str(opts.fps)]
+            cmd += ["-loop", "0" if opts.loop == 0 else str(opts.loop), str(out_path)]
+            return [cmd]
+
+        if opts.two_pass:
+            pal = work_dir / (out_path.stem + "_pal.png")
+            cmd1 = [ffmpeg, "-y", "-f", "concat", "-safe", "0", "-i", str(lst),
+                    "-vf", f"{filters},{_palettegen(opts)}", str(pal)]
+            dither = "bayer:bayer_scale=" + str(max(1, min(5, opts.bayer_scale))) if opts.dither == "bayer" else opts.dither
+            paluse = f"paletteuse=dither={dither}"
+            cmd2 = [ffmpeg, "-y", "-f", "concat", "-safe", "0", "-i", str(lst), "-i", str(pal),
+                    "-lavfi", f"{filters} [x]; [x][1:v] {paluse}"]
+            if opts.fps: cmd2 += ["-r", str(opts.fps)]
+            cmd2 += ["-loop", "0" if opts.loop == 0 else str(opts.loop), str(out_path)]
+            return [cmd1, cmd2]
+
+        dither = "bayer:bayer_scale=" + str(max(1, min(5, opts.bayer_scale))) if opts.dither == "bayer" else opts.dither
+        paluse = f"paletteuse=dither={dither}"
+        vf = f"{filters},split [a][b]; [a] {_palettegen(opts)} [p]; [b][p] {paluse}"
+        cmd = [ffmpeg, "-y", "-f", "concat", "-safe", "0", "-i", str(lst), "-vf", vf]
+        if (getattr(opts, 'img_duration_sec', None) in (None, 0)) and opts.fps:
+            cmd += ["-r", str(opts.fps)]
+        cmd += ["-loop", "0" if opts.loop == 0 else str(opts.loop), str(out_path)]
+        return [cmd]
+
+    if opts.format == "webp":
+        cmd = [ffmpeg, "-y", "-f", "concat", "-safe", "0", "-i", str(lst)]
+        if filters: cmd += ["-vf", filters]
+        if opts.lossless_webp: cmd += ["-lossless", "1"]
+        else: cmd += ["-q:v", str(max(0, min(100, opts.quality_webp)))]
+        cmd += ["-compression_level", str(max(0, min(9, opts.compression_webp)))]
+        if (getattr(opts, 'img_duration_sec', None) in (None, 0)) and opts.fps:
+            cmd += ["-r", str(opts.fps)]
+        cmd += [str(out_path)]
+        return [cmd]
+
+    if opts.format == "apng":
+        cmd = [ffmpeg, "-y", "-f", "concat", "-safe", "0", "-i", str(lst)]
+        if filters: cmd += ["-vf", filters]
+        if (getattr(opts, 'img_duration_sec', None) in (None, 0)) and opts.fps:
+            cmd += ["-r", str(opts.fps)]
+        cmd += [str(out_path)]
+        return [cmd]
+
+    raise GifError("Unknown format")
+
+
+
+def encode_images_with_progress(
+    pane,
+    folder: Path,
+    out_path: Path,
+    opts: GifOptions,
+    patterns: str,
+    include_subdirs: bool,
+    ffmpeg: str = "ffmpeg",
+    work_dir: Optional[Path] = None,
+    explicit_imgs: list[Path] | None = None,
+) -> None:
+    # GUI path: show progress + ETA; fallback = run commands directly
+    try:
+        from PySide6.QtWidgets import QMessageBox
+    except Exception:
+        for c in build_commands_from_images(folder, out_path, opts, patterns, include_subdirs, ffmpeg=ffmpeg, work_dir=work_dir):
+            _ffmpeg_exec(c)
+        return
+
+    cmds = build_commands_from_images(folder, out_path, opts, patterns, include_subdirs, ffmpeg=ffmpeg, work_dir=work_dir, explicit_imgs=explicit_imgs)
+
+    imgs = (list(explicit_imgs) if explicit_imgs else _gather_images(Path(folder), patterns, include_subdirs))
+    est_frames = max(1, len(imgs))
+    if opts.boomerang and opts.format == "gif" and len(imgs) > 1:
+        est_frames = len(imgs) * 2 - 2
+
+    progress_file = Path(work_dir or out_path.parent) / "_gif_progress.txt"
+    try: progress_file.unlink(missing_ok=True)
+    except Exception: pass
+
+    def _inject(cmd: List[str]) -> List[str]:
+        return [cmd[0], "-hide_banner", "-nostats", "-progress", str(progress_file)] + cmd[1:]
+
+    try:
+        pane.gif_pb.setVisible(True); pane.gif_eta.setVisible(True)
+        pane.gif_pb.setValue(0); pane.gif_eta.setText("Starting…")
+    except Exception: pass
+
+    import subprocess, time
+    start = time.time()
+
+    def _parse_done():
+        try:
+            txt = progress_file.read_text("utf-8", errors="ignore")
+        except Exception:
+            return 0
+        for ln in reversed(txt.splitlines()):
+            if ln.startswith("frame="):
+                try: return int(ln.split("=",1)[1].strip())
+                except Exception: return 0
+        return 0
+
+    while cmds:
+        c = cmds.pop(0)
+        p = subprocess.Popen(_inject(c), stdout=subprocess.PIPE, stderr=subprocess.STDOUT, universal_newlines=True)
+        while True:
+            done = _parse_done()
+            pct = int(round(100.0 * done / max(1, est_frames)))
+            try:
+                pane.gif_pb.setValue(pct)
+                pane.gif_eta.setText(f"{pct}%")
+            except Exception:
+                pass
+            if p.poll() is not None:
+                break
+            time.sleep(0.1)
+        if p.returncode != 0:
+            break
+
+    try: progress_file.unlink(missing_ok=True)
+    except Exception: pass
+    try: pane.gif_pb.setVisible(False); pane.gif_eta.setVisible(False)
+    except Exception: pass

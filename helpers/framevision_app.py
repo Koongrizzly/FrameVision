@@ -1,6 +1,14 @@
 import os as _os
-if not _os.environ.get("QT_LOGGING_RULES"):
-    _os.environ["QT_LOGGING_RULES"] = "qt.fonts.warning=false;qt.fonts.debug=false"
+_rules = _os.environ.get("QT_LOGGING_RULES","")
+_append = "qt.qpa.fonts=false;qt.fonts.warning=false;qt.fonts.debug=false"
+if not _rules:
+    _os.environ["QT_LOGGING_RULES"] = _append
+else:
+    parts = {x.strip() for x in _rules.split(";") if x.strip()}
+    for piece in _append.split(";"):
+        if piece and piece not in parts:
+            parts.add(piece)
+    _os.environ["QT_LOGGING_RULES"] = ";".join(sorted(parts))
 
 # --- compare page opener (module-level) ---
 def _open_compare_page():
@@ -30,16 +38,15 @@ from pathlib import Path
 # ---- Begin: Quiet specific Qt warnings ----
 _prev_qt_handler = None
 def _fv_qt_msg_filter(mode, ctx, msg):
-    # Silence noisy DirectWrite font warnings & harmless font fallback chatter
     s = str(msg)
     if ("CreateFontFaceFromHDC" in s) or ("MS Sans Serif" in s):
         return
     if _prev_qt_handler:
         _prev_qt_handler(mode, ctx, msg)
 
-# Install early
 try:
-    _prev_qt_handler = QtCore.qInstallMessageHandler(_fv_qt_msg_filter)
+    from PySide6 import QtCore as _QtCore
+    _prev_qt_handler = _QtCore.qInstallMessageHandler(_fv_qt_msg_filter)
 except Exception:
     pass
 # ---- End: Quiet specific Qt warnings ----

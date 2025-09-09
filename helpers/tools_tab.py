@@ -6,6 +6,8 @@ from pathlib import Path
 from helpers.meme_tool import MemeToolPane
 from helpers.trim_tool import install_trim_tool
 
+from helpers.renam import RenamPane
+
 import re
 
 def _slug_title(t:str)->str:
@@ -323,132 +325,17 @@ class InstantToolsPane(QWidget):
             _meme = MemeToolPane(None, self)
         _memel.addWidget(_meme)
         sec_meme.setContentLayout(_memel)
-        # ---- Multi Rename ----
+        
+        # ---- Multi Rename (moved to helpers/renam.py) ----
         sec_rename = CollapsibleSection("Multi Rename", expanded=False)
-        _rn = QWidget(); _rn_l = QVBoxLayout(_rn); _rn_l.setContentsMargins(0,0,0,0)
-        # pickers
-        self.btn_pick_folder = QPushButton("Choose folder…"); self.btn_pick_files = QPushButton("Choose files…")
-        row_pick = QHBoxLayout(); row_pick.addWidget(self.btn_pick_folder); row_pick.addWidget(self.btn_pick_files); row_pick.addStretch(1)
-        _rn_l.addLayout(row_pick)
-        # preview list
-        from PySide6.QtWidgets import QListWidget, QListWidgetItem, QLabel
-        self.rename_preview = QListWidget(); self.rename_preview.setMinimumHeight(120)
-        _rn_l.addWidget(self.rename_preview)
-        # options
-        self.rm_start = QSpinBox(); self.rm_start.setRange(0,99); self.rm_end = QSpinBox(); self.rm_end.setRange(0,99)
-        self.cb_remove_leading_nums = QCheckBox("Remove numbers from start")
-        self.ed_prefix = QLineEdit(); self.ed_suffix = QLineEdit()
-        self.cb_add_date = QCheckBox("Add date"); self.cmb_date_fmt = QComboBox(); self.cmb_date_fmt.addItems(["YYYYMMDD","YYYY-MM-DD","YYMMDD"])
-        lay_opts = QFormLayout()
-        lay_opts.addRow("Remove first N chars", self.rm_start)
-        lay_opts.addRow("Remove last N chars", self.rm_end)
-        lay_opts.addRow(self.cb_remove_leading_nums)
-        lay_opts.addRow("Add prefix", self.ed_prefix)
-        lay_opts.addRow("Add suffix", self.ed_suffix)
-        row_date = QHBoxLayout(); row_date.addWidget(self.cb_add_date); row_date.addWidget(self.cmb_date_fmt); row_date.addStretch(1)
-        lay_opts.addRow("Date format", row_date)
-        _rn_l.addLayout(lay_opts)
-        # action buttons
-        self.btn_preview_rename = QPushButton("Preview"); self.btn_apply_rename = QPushButton("Rename")
-        row_act = QHBoxLayout(); row_act.addWidget(self.btn_preview_rename); row_act.addWidget(self.btn_apply_rename); row_act.addStretch(1)
-        _rn_l.addLayout(row_act)
-        sec_rename.setContentLayout(_rn_l)
-        # Internal storage for paths to rename
-        self._rename_paths = []
+        _rn_wrap = QWidget(); _rn_layout = QVBoxLayout(_rn_wrap); _rn_layout.setContentsMargins(0,0,0,0)
+        try:
+            _rn_widget = RenamPane(self.main, self)
+        except Exception:
+            _rn_widget = RenamPane(None, self)
+        _rn_layout.addWidget(_rn_widget)
+        sec_rename.setContentLayout(_rn_layout)
 
-        def _pick_folder():
-            from PySide6.QtWidgets import QFileDialog
-            fn = QFileDialog.getExistingDirectory(self, "Choose folder", str(getattr(self.main,'current_path', ROOT)))
-            if not fn: return
-            import os
-            try:
-                self._rename_paths = [str((Path(fn)/f)) for f in os.listdir(fn) if os.path.isfile(str(Path(fn)/f))]
-            except Exception:
-                self._rename_paths = []
-            _refresh_preview()
-
-        def _pick_files():
-            from PySide6.QtWidgets import QFileDialog
-            fns, _ = QFileDialog.getOpenFileNames(self, "Choose files", str(getattr(self.main,'current_path', ROOT)), "All files (*.*)")
-            if fns:
-                self._rename_paths = [str(Path(p)) for p in fns]
-                _refresh_preview()
-
-        def _refresh_preview():
-            try:
-                self.rename_preview.clear()
-                for i,p in enumerate(self._rename_paths[:100]):
-                    self.rename_preview.addItem(os.path.basename(p))
-            except Exception:
-                pass
-
-        def _make_new_name(name: str) -> str:
-            stem, ext = os.path.splitext(name)
-            s = stem
-            try:
-                # remove from start/end
-                n1 = int(self.rm_start.value())
-                n2 = int(self.rm_end.value())
-                if n1>0: s = s[n1:]
-                if n2>0: s = s[:-n2] if n2 < len(s) else ""
-                if self.cb_remove_leading_nums.isChecked():
-                    import re as _re
-                    s = _re.sub(r'^\d+', '', s)
-                # add date
-                pref = self.ed_prefix.text().strip()
-                suf = self.ed_suffix.text().strip()
-                if self.cb_add_date.isChecked():
-                    from datetime import datetime as _dt
-                    fmt = self.cmb_date_fmt.currentText()
-                    if fmt=="YYYYMMDD": d=_dt.now().strftime("%Y%m%d")
-                    elif fmt=="YYYY-MM-DD": d=_dt.now().strftime("%Y-%m-%d")
-                    else: d=_dt.now().strftime("%y%m%d")
-                    if pref: pref = d + "_" + pref
-                    else: pref = d + "_"
-                new = f"{pref}{s}{suf}{ext}"
-                return new
-            except Exception:
-                return name
-
-        def _preview_rename():
-            try:
-                self.rename_preview.clear()
-                for p in self._rename_paths[:200]:
-                    old = os.path.basename(p); new = _make_new_name(old)
-                    self.rename_preview.addItem(f"{old}  →  {new}")
-            except Exception:
-                pass
-
-        def _apply_rename():
-            if not self._rename_paths:
-                QMessageBox.information(self, "Multi Rename", "Pick files or a folder first."); return
-            ok = QMessageBox.question(self, "Confirm rename", f"Rename {len(self._rename_paths)} item(s)?")
-            if ok != QMessageBox.StandardButton.Yes: 
-                return
-            count=0
-            for p in self._rename_paths:
-                try:
-                    base = os.path.dirname(p); old = os.path.basename(p)
-                    new = _make_new_name(old)
-                    src = Path(base)/old; dst = Path(base)/new
-                    if src==dst: continue
-                    if dst.exists():
-                        # find unique name
-                        i=1
-                        while (Path(base)/f"{Path(new).stem}_{i}{Path(new).suffix}").exists(): i+=1
-                        dst = Path(base)/f"{Path(new).stem}_{i}{Path(new).suffix}"
-                    os.rename(str(src), str(dst)); count+=1
-                except Exception:
-                    continue
-            QMessageBox.information(self, "Multi Rename", f"Renamed {count} item(s).")
-            _refresh_preview()
-
-        self.btn_pick_folder.clicked.connect(_pick_folder)
-        self.btn_pick_files.clicked.connect(_pick_files)
-        self.btn_preview_rename.clicked.connect(_preview_rename)
-        self.btn_apply_rename.clicked.connect(_apply_rename)
-    
-    
 
         def _img_mode_update():
             tgt = (self.img_mode.currentIndex()==1)
