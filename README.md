@@ -17,17 +17,18 @@
 - **Sytem check:** check diskspace, Cpu/Gpu, basic system info, python, creates venv etc and gives advice on what to use in the installer
 - **Core Install:** App only (minimal).
 - **Full CPU Install:** Torch CPU + models/binaries.This installer will not ask to install Qwen, smaller model is on roadmap
-- **Full CUDA Install:** Torch CUDA + models/binaries.+ asks to install Qwen TXT 2 IMG (only allows install from 12 gig vram and up)
+- **Full CUDA Install:** Torch CUDA + models/binaries.
+  + install Qwen TXT2IMG (only allows install for 12 gig vram and up, download not included yet -> roadmap)
 
 ---
 
 ## 💡 User-Friendly
 - Easy installer with **requirements check**.
-- Fully automated setup paths (Core, Full CPU, Full CUDA). User can drink coffee, script will deliver out of the box use
+- Fully **automated** setup paths (Core, Full CPU, Full CUDA). User can drink coffee, script will deliver out of the box use
 - easy to use tabs,everything in collapsible boxes so you see only what you need and without seatching
-- Helpful tooltips everywhere. Q&A and knowledge base (info menu)
+- Helpful **tooltips** everywhere. **Q&A** and knowledge base (info menu)
 - Resizable layout with draggable splitters. Fit the player or the tabs to the size you want.
-- Clear messages and graceful fallbacks (e.g., CPU fallback when GPU is unavailable, streaming for low mem use etc).
+- Clear messages and graceful fallbacks (e.g. CPU fallback when GPU is unavailable, streaming for low mem use etc).
 
 ---
 
@@ -35,6 +36,10 @@
 
 Keeping FrameVision up to date is **super easy** — just use one of the included updater tools!  
 Choose the updater based on whether you want to **keep personal files** or **fully reset** to the latest version.
+**How to use:**
+1. Back up any personal files, edits or custom scripts you don’t want deleted.
+2. Place the updaters in the **FrameVision root folder**.
+3. Double-click to run.
 
 ---
 
@@ -43,14 +48,8 @@ Choose the updater based on whether you want to **keep personal files** or **ful
 - ✅ Adds **new files**  
 - ✅ Updates **changed files**  
 - 🚫 **Never deletes** anything in your folder  
-
 **Best for:**  
 - Regular updates when you don’t want to risk losing personal changes or test files.
-
-**How to use:**
-1. Make sure `update_soft.bat` is in the **FrameVision root folder** (next to `start.bat`).
-2. Double-click the file to run it.
-3. Watch the progress window or check `update.log` for details.
 
 ---
 
@@ -61,23 +60,16 @@ Choose the updater based on whether you want to **keep personal files** or **ful
 - ⚠️ **Restores deleted files**  
 - ⚠️ **Removes local files** that are not part of the official GitHub repo  
   *(Safe exclusions: `.venv`, `models`, `.hf_cache`, `outputs`, etc.)*
-
 **Best for:**  
 - Repairing a broken install.  
 - Resetting to a **clean, exact copy** of the latest GitHub version.  
 - Preparing a **clean environment** for release or bug reporting.
 
-**How to use:**
-1. Back up any personal files or custom scripts you don’t want deleted.
-2. Place `update_hard.bat` in the **FrameVision root folder**.
-3. Double-click to run.
-4. When finished, your folder will **exactly match GitHub**.
-
 ### 💡 How It Works
 Both updaters:
 - Try to use **Git** if available (fastest & safest).
 - If Git isn’t installed, they **auto-download a ZIP** of the latest version and update from that.
-- Write progress to `update.log`.
+- Writes progress to `update.log`.
 
 ---
 
