@@ -1,8 +1,19 @@
 [README.md](https://github.com/user-attachments/files/22204351/README.md)
-# 🌟 FrameVision
+# 🌟 FrameVision V1.0.0
 **All-in-one Video & Photo Upscaler/Editor**  
 ✨ *Upscale, convert, edit, describe, and create — in one streamlined app.*
 - BETA, WORK IN PROGRESS, features can come and go
+
+---
+## Quickstart
+
+```bat
+:: open a console in the project root
+.\.venv\Scriptsctivate 2>nul || py -3.10 -m venv .venv && .\.venv\Scriptsctivate
+python -m pip install -U pip
+start.bat
+```
+*Runs the installer menu when needed, repairs missing bits, then launches FrameVision.*
 
 ---
 
@@ -215,7 +226,9 @@ Planned features for future updates:
 - **Installer upgrades:** Unified progress bars and resume support. app might get it's own windows installer one day
 - **Better integration with queue for the upscalers:** At the moment it is not using the queue until i have more time for this
 - zip with over **100 intros**
-- low weight **txt 2 img** model, 
+- low weight **txt 2 img** model
+- Global action buttons (a button action changes depending on the tab you are
+- Multi job where user can select more then one tool and do them all at once (for example upscale->rife->add sound...)
 - polishing and bugfixing for the rest of my life i think
 - a low weight txt/img to video would be nice but let's get the rest working 100% first
 - **Easter eggs** for extra fun surprises! Don't forget to click the intro 4x before it ends ;-)
@@ -234,6 +247,6 @@ If you encounter bugs, please open an issue or use the **Bug Report** button in 
 ---
 
 > Built by **Contrinsan (KoonGrizzly)**  
-> Feature development & bugfixing (over 3000 fixes so far) help by **ChatGPT 5 **  
+> Feature development & bugfixing (over 3000 fixes so far) help by **ChatGPT 5**  
 > *This project is a living work and features may come or go.*
 
