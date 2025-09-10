@@ -940,7 +940,11 @@ class MemeToolPane(QWidget):
     def _apply_arc_to_selection(self):
         try:
             arc = float(self.sl_arc.value())
-            for it in getattr(self, "_items", []):
+            items = list(getattr(self, "_items", []))
+            sel = [it for it in items if getattr(it, "isSelected", lambda: False)()]
+            if not sel:
+                return  # only change selected text
+            for it in sel:
                 try:
                     st = getattr(it, "_style", None)
                     if st is None:
@@ -952,8 +956,7 @@ class MemeToolPane(QWidget):
         except Exception:
             pass
 
-    # Helpers
-    
+
     def _on_rot_changed(self, val):
         try: QToolTip.showText(QCursor.pos(), f"{int(val)}°")
         except Exception: pass
@@ -979,12 +982,14 @@ class MemeToolPane(QWidget):
             self.def_glow = int(val); self.settings.setValue("meme/glow", int(val))
             items = list(getattr(self, "_items", []))
             sel = [it for it in items if getattr(it, "isSelected", lambda: False)()]
-            targets = sel if sel else items
-            for it in targets:
+            if not sel:
+                return  # only change selected text; leave others alone
+            for it in sel:
                 st = getattr(it, "_style", None)
                 if st is None: continue
                 st.glow = int(val); it.setStyle(st); it.update()
         except Exception: pass
+
 
     def _on_track_changed(self, val):
         try: QToolTip.showText(QCursor.pos(), f"{int(val)} px")
@@ -1190,24 +1195,38 @@ class MemeToolPane(QWidget):
 
     # Actions
     def _use_current(self):
-        try:
-            if self._try_grab_player_into_scene():
-                return
-        except Exception:
-            pass
         path = self._current_path()
         if not path:
-            QMessageBox.information(self,"Meme","No current image available."); return
+            QMessageBox.information(self, "Meme", "No current image available."); return
         low = str(path).lower()
-        if low.endswith((".mp4",".mkv",".mov",".webm",".avi",".m4v",".mpg",".mpeg",".ts",".m2ts")):
+        is_video = low.endswith((".mp4",".mkv",".mov",".webm",".avi",".m4v",".mpg",".mpeg",".ts",".m2ts",".wmv"))
+        if is_video:
             try:
-                vp = getattr(self.main, "video", None)
-                if vp and hasattr(vp, "screenshot"):
-                    path = str(vp.screenshot())
+                vid = getattr(self.main, "video", None)
+                from PySide6.QtGui import QPixmap
+                tmp_path = None
+                qimg = getattr(vid, "currentFrame", None) if vid is not None else None
+                if qimg is not None and (not hasattr(qimg, "isNull") or not qimg.isNull()):
+                    pm = QPixmap.fromImage(qimg)
+                    if pm is not None and (not hasattr(pm, "isNull") or not pm.isNull()):
+                        import tempfile
+                        f = tempfile.NamedTemporaryFile(prefix="meme_frame_", suffix=".png", delete=False)
+                        tmp_path = f.name; f.close(); pm.save(tmp_path, "PNG")
+                if tmp_path is None and vid is not None and hasattr(vid, "label") and hasattr(vid.label, "pixmap"):
+                    pm = vid.label.pixmap()
+                    if pm is not None and (not hasattr(pm, "isNull") or not pm.isNull()):
+                        import tempfile
+                        f = tempfile.NamedTemporaryFile(prefix="meme_frame_", suffix=".png", delete=False)
+                        tmp_path = f.name; f.close(); pm.save(tmp_path, "PNG")
+                if tmp_path is None:
+                    QMessageBox.warning(self, "Meme", "Could not open image."); return
+                self._load_image_to_scene(tmp_path)
+                try: self._tmp_last_path = tmp_path
+                except Exception: pass
+                return
             except Exception:
-                pass
+                QMessageBox.warning(self, "Meme", "Could not open image."); return
         self._load_image_to_scene(path)
-
     def _open_image(self):
         exts = "Images (*.png *.jpg *.jpeg *.webp)"
         d = self._last_dir or ""
