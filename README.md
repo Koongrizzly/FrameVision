@@ -13,7 +13,7 @@
 
 ```bat
 :: open a console in the project root
-.\.venv\Scriptsctivate 2>nul || py -3.10 -m venv .venv && .\.venv\Scriptsctivate
+.\.venv\Scripts\activate 2>nul || py -3.10 -m venv .venv && .\.venv\Scriptsctivate
 python -m pip install -U pip
 start.bat
 ```
