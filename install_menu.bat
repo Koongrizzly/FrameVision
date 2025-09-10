@@ -920,7 +920,7 @@ if exist ".venv\Scripts\python.exe"   call ".venv\Scripts\python.exe" -m pip ins
 rem === Download tools & models for CPU (non-CUDA) ===
 if errorlevel 1 echo( (warning) tool download had issues; continuing...
 rem Ensure transformers for Qwen on CPU
-if exist ".venv\Scripts\python.exe" call ".venv\Scripts\python.exe" -m pip install --no-cache-dir --upgrade transformers>=4.44,<5 "safetensors>=0.4.3"
+if exist ".venv\Scripts\python.exe" call ".venv\Scripts\python.exe" -m pip install --no-cache-dir --upgrade transformers>=4.51.3,<5 "safetensors>=0.4.3"
 call ".venv\Scripts\python.exe" -u scripts\download_externals.py --all
 
 IF %ERRORLEVEL% NEQ 0 (
@@ -974,7 +974,7 @@ if exist ".venv\Scripts\python.exe"   call ".venv\Scripts\python.exe" -m pip ins
   if errorlevel 1 goto pip_fail
 )
 echo Installing Diffusers & friends for TXT->IMG...
-if exist ".venv\Scripts\python.exe" call ".venv\Scripts\python.exe" -m pip install --no-cache-dir --upgrade "diffusers==0.35.1" "transformers==4.45.2" "huggingface_hub==0.34.4" "safetensors>=0.4.3" "pillow==11.3.0"
+if exist ".venv\Scripts\python.exe" call ".venv\Scripts\python.exe" -m pip install --no-cache-dir --upgrade "diffusers==0.35.1" "transformers>=4.51.3,<5" "huggingface_hub==0.34.4" "safetensors>=0.4.3" "pillow==11.3.0"
 if errorlevel 1 goto pip_fail
 if exist requirements-gpu.txt (
 if exist ".venv\Scripts\python.exe"   call ".venv\Scripts\python.exe" -m pip install --no-cache-dir --upgrade diffusers>=0.30.0
@@ -986,7 +986,7 @@ if exist ".venv\Scripts\python.exe"   call ".venv\Scripts\python.exe" -m pip ins
 rem === Download tools & models for GPU (CUDA) ===
 if errorlevel 1 echo( (warning) tool download had issues; continuing...
 rem Ensure Transformers for Qwen
-if exist ".venv\Scripts\python.exe" call ".venv\Scripts\python.exe" -m pip install --no-cache-dir --upgrade transformers>=4.44,<5 "safetensors>=0.4.3"
+if exist ".venv\Scripts\python.exe" call ".venv\Scripts\python.exe" -m pip install --no-cache-dir --upgrade transformers>=4.51.3,<5 "safetensors>=0.4.3"
 call ".venv\Scripts\python.exe" -u scripts\download_externals.py --all
 if errorlevel 1 echo( (warning) model download had issues; continuing...
 rem Validate local Qwen20B model if present
@@ -1011,7 +1011,7 @@ call :ensure_python || goto :after_qwen_t2i_post
 call :ensure_venv   || goto :after_qwen_t2i_post
 call :pip_upgrade
 if exist ".venv\Scripts\python.exe" call ".venv\Scripts\python.exe" -m pip install --no-cache-dir --upgrade pip
-call ".venv\Scripts\python.exe" -m pip install --no-cache-dir --upgrade "huggingface_hub>=0.34.4" "diffusers==0.35.1" "transformers==4.45.2" "safetensors>=0.4.4" "pillow==10.4.0"
+call ".venv\Scripts\python.exe" -m pip install --no-cache-dir --upgrade "huggingface_hub>=0.34.4" "diffusers==0.35.1" "transformers>=4.51.3,<5" "safetensors>=0.4.4" "pillow==10.4.0"
 if exist scripts\external_downloader.py (
   echo [info] Fetching Qwen T2I 20B assets via external_downloader.py
   call ".venv\Scripts\python.exe" scripts\external_downloader.py --component qwen_t2i_20b || echo [warning] downloader returned a non-zero code
