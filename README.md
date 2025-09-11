@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="https://github.com/user-attachments/assets/56a1c424-b723-4f12-9837-e3c21507005e" alt="FrameVision Demo" width="800">
+</p>
+
 [README.md](https://github.com/user-attachments/files/22204351/README.md)
 # 🌟 FrameVision V1.0.0
 **All-in-one Video & Photo Upscaler/Editor**  
@@ -250,5 +254,4 @@ If you encounter bugs, please open an issue or use the **Bug Report** button in 
 > Feature development & bugfixing help by **ChatGPT 5**  
 > *This project is a living work and features may come or go.*
 
-![FrameVision Demo](assets/Framevision.gif)
 
