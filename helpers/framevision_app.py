@@ -862,12 +862,19 @@ class VideoPane(QWidget):
 
 
 
+    def set_info_text(self, text):
+        try:
+            self.info_label.setText(str(text))
+        except Exception:
+            pass
+
     def _update_time_label(self):
         try:
             pos = self.player.position() or 0
             dur = self.player.duration() or 0
             left = max(0, dur - pos)
-            text = f"{self._fmt_time(pos)} / {self._fmt_time(left)} left"
+            pct = int(round((pos / dur) * 100)) if dur else 0
+            text = f"{self._fmt_time(pos)} / {self._fmt_time(left)} left" + (f" • {pct}%" if dur else "")
             try:
                 self.info_label.setText(text)
             except Exception:
@@ -879,6 +886,8 @@ class VideoPane(QWidget):
                     self._fs_slider.setRange(0, dur)
                     if not self._fs_slider.isSliderDown():
                         self._fs_slider.setValue(pos)
+                if getattr(self, '_fs_btn_pp', None) is not None:
+                    self._fs_btn_pp.setText("⏸" if self.player.playbackState()==QMediaPlayer.PlayingState else "▶")
             except Exception:
                 pass
         except Exception:
@@ -1099,6 +1108,7 @@ class VideoPane(QWidget):
                     self._fs_win = None
                     self._fs_slider = None
                     self._fs_time_lbl = None
+                    self._fs_btn_pp = None
                     self.is_fullscreen = False
                 # ----- Re-center/rescale after exiting fullscreen -----
                 try:
@@ -1144,6 +1154,41 @@ class VideoPane(QWidget):
             sl = QSlider(Qt.Horizontal, bar)
             sl.setRange(0, self.player.duration() or 0)
             lbl = QLabel("0:00 / 0:00 left", bar)
+            # --- FS play/pause button ---
+            try:
+                from PySide6.QtWidgets import QPushButton
+                pp = QPushButton("⏸" if self.player.playbackState()==QMediaPlayer.PlayingState else "▶", bar)
+                pp.setToolTip("Play/Pause")
+                h.insertWidget(0, pp, 0)
+                self._fs_btn_pp = pp
+                def _fs_sync_pp():
+                    try:
+                        if getattr(self, '_fs_btn_pp', None) is not None:
+                            self._fs_btn_pp.setText("⏸" if self.player.playbackState()==QMediaPlayer.PlayingState else "▶")
+                    except Exception:
+                        pass
+                def _fs_toggle():
+                    try:
+                        if self.player.playbackState()==QMediaPlayer.PlayingState:
+                            self.pause()
+                        else:
+                            self.player.play()
+                        _fs_sync_pp()
+                    except Exception:
+                        pass
+                try:
+                    pp.clicked.connect(_fs_toggle)
+                except Exception:
+                    pass
+                try:
+                    self.player.playbackStateChanged.connect(lambda *_: _fs_sync_pp())
+                except Exception:
+                    pass
+            except Exception:
+                try:
+                    self._fs_btn_pp = None
+                except Exception:
+                    pass
             h.addWidget(sl, 1); h.addWidget(lbl, 0)
             vbox.addWidget(bar, 0)
             self._fs_slider = sl; self._fs_time_lbl = lbl
@@ -1156,6 +1201,12 @@ class VideoPane(QWidget):
                 try:
                     if e.key() == Qt.Key_Escape:
                         self.toggle_fullscreen()
+                        return
+                    if e.key() == Qt.Key_Space:
+                        if self.player.playbackState()==QMediaPlayer.PlayingState:
+                            self.pause()
+                        else:
+                            self.player.play()
                         return
                 except Exception:
                     pass
@@ -2186,9 +2237,4 @@ def main():
 
 if __name__ == "__main__":
     main()
-    def set_info_text(self, text):
-        try:
-            if hasattr(self, 'info_label') and self.info_label is not None:
-                self.info_label.setText(str(text))
-        except Exception:
-            pass
+            

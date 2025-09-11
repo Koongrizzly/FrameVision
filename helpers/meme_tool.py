@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-import os, io, json
+import os, io, json, copy
 import math
 import pathlib
 from dataclasses import dataclass
@@ -104,7 +104,7 @@ class MemeTextItem(QGraphicsPathItem):
         self.setFlags(QGraphicsItem.ItemIsMovable | QGraphicsItem.ItemIsSelectable | QGraphicsItem.ItemSendsGeometryChanges)
         self._rect = QRectF(rect)
         self._text = text
-        self._style = style
+        self._style = copy.deepcopy(style)
         if style.shadow:
             eff = QGraphicsDropShadowEffect()
             eff.setBlurRadius(6)
@@ -138,7 +138,7 @@ class MemeTextItem(QGraphicsPathItem):
         self.setCursor(Qt.OpenHandCursor)
 
     def setStyle(self, style: TextStyle):
-        self._style = style
+        self._style = copy.deepcopy(style)
         if style.shadow and not self.graphicsEffect():
             eff = QGraphicsDropShadowEffect(); eff.setBlurRadius(6); eff.setOffset(1,1); eff.setColor(QColor(0,0,0,160))
             self.setGraphicsEffect(eff)
@@ -782,18 +782,42 @@ class MemeToolPane(QWidget):
         self.sp_rot = QSpinBox(); self.sp_rot.setRange(0,360); self.sp_rot.setFixedWidth(64)
         _rot_row_lay.addWidget(self.sl_rot, 1); _rot_row_lay.addWidget(self.sp_rot)
         form_xform.addRow("Rotate", self._rot_row_widget)
+        # Place number + Reset to the left for Rotate
+        _rot_row_lay.insertWidget(0, self.sp_rot)
+        self.btn_rot_reset = QPushButton('Reset'); self.btn_rot_reset.setFixedWidth(56)
+        _rot_row_lay.insertWidget(0, self.btn_rot_reset)
+        self.btn_rot_reset.clicked.connect(lambda: self.sl_rot.setValue(0))
+
         self._shear_row_widget = QWidget(); _shear_row_lay = QHBoxLayout(self._shear_row_widget); _shear_row_lay.setContentsMargins(0,0,0,0); _shear_row_lay.setSpacing(8)
         self.sp_shear = QSpinBox(); self.sp_shear.setRange(-40,40); self.sp_shear.setFixedWidth(64)
         _shear_row_lay.addWidget(self.sl_shear, 1); _shear_row_lay.addWidget(self.sp_shear)
         form_xform.addRow("Tilt/Skew", self._shear_row_widget)
+        # Place number + Reset to the left for Tilt/Skew
+        _shear_row_lay.insertWidget(0, self.sp_shear)
+        self.btn_shear_reset = QPushButton('Reset'); self.btn_shear_reset.setFixedWidth(56)
+        _shear_row_lay.insertWidget(0, self.btn_shear_reset)
+        self.btn_shear_reset.clicked.connect(lambda: self.sl_shear.setValue(0))
+
         self._glow_row_widget = QWidget(); _glow_row_lay = QHBoxLayout(self._glow_row_widget); _glow_row_lay.setContentsMargins(0,0,0,0); _glow_row_lay.setSpacing(8)
         self.sp_glow = QSpinBox(); self.sp_glow.setRange(0,40); self.sp_glow.setFixedWidth(64)
         _glow_row_lay.addWidget(self.sl_glow, 1); _glow_row_lay.addWidget(self.sp_glow)
         form_xform.addRow("Outer glow", self._glow_row_widget)
+        # Place number + Reset to the left for Outer glow
+        _glow_row_lay.insertWidget(0, self.sp_glow)
+        self.btn_glow_reset = QPushButton('Reset'); self.btn_glow_reset.setFixedWidth(56)
+        _glow_row_lay.insertWidget(0, self.btn_glow_reset)
+        self.btn_glow_reset.clicked.connect(lambda: self.sl_glow.setValue(0))
+
         self._track_row_widget = QWidget(); _track_row_lay = QHBoxLayout(self._track_row_widget); _track_row_lay.setContentsMargins(0,0,0,0); _track_row_lay.setSpacing(8)
         self.sp_track = QSpinBox(); self.sp_track.setRange(-30,60); self.sp_track.setFixedWidth(64)
         _track_row_lay.addWidget(self.sl_track, 1); _track_row_lay.addWidget(self.sp_track)
         form_xform.addRow("Letter spacing", self._track_row_widget)
+        # Place number + Reset to the left for Letter spacing
+        _track_row_lay.insertWidget(0, self.sp_track)
+        self.btn_track_reset = QPushButton('Reset'); self.btn_track_reset.setFixedWidth(56)
+        _track_row_lay.insertWidget(0, self.btn_track_reset)
+        self.btn_track_reset.clicked.connect(lambda: self.sl_track.setValue(0))
+
         self._arc_row_widget = QWidget(self)
 
         _arc_row_lay = QHBoxLayout(self._arc_row_widget)
@@ -815,6 +839,12 @@ class MemeToolPane(QWidget):
         _arc_row_lay.addWidget(self.sp_arc, 0)
 
         form_xform.addRow("Arc curvature", self._arc_row_widget)
+        # Place number + Reset to the left for Arc curvature
+        _arc_row_lay.insertWidget(0, self.sp_arc)
+        self.btn_arc_reset = QPushButton('Reset'); self.btn_arc_reset.setFixedWidth(56)
+        _arc_row_lay.insertWidget(0, self.btn_arc_reset)
+        self.btn_arc_reset.clicked.connect(lambda: self.sl_arc.setValue(0))
+
         lay.addLayout(form_xform)
 # Form
         form = QFormLayout()
@@ -943,7 +973,7 @@ class MemeToolPane(QWidget):
             items = list(getattr(self, "_items", []))
             sel = [it for it in items if getattr(it, "isSelected", lambda: False)()]
             if not sel:
-                return  # only change selected text
+                return  # change nothing if no selection
             for it in sel:
                 try:
                     st = getattr(it, "_style", None)
@@ -955,8 +985,6 @@ class MemeToolPane(QWidget):
                     pass
         except Exception:
             pass
-
-
     def _on_rot_changed(self, val):
         try: QToolTip.showText(QCursor.pos(), f"{int(val)}°")
         except Exception: pass
@@ -976,21 +1004,23 @@ class MemeToolPane(QWidget):
             pass
 
     def _on_glow_changed(self, val):
-        try: QToolTip.showText(QCursor.pos(), f"{int(val)} px")
-        except Exception: pass
+        try:
+            QToolTip.showText(QCursor.pos(), f"{int(val)} px")
+        except Exception:
+            pass
         try:
             self.def_glow = int(val); self.settings.setValue("meme/glow", int(val))
             items = list(getattr(self, "_items", []))
             sel = [it for it in items if getattr(it, "isSelected", lambda: False)()]
             if not sel:
-                return  # only change selected text; leave others alone
+                return  # change nothing if no selection
             for it in sel:
                 st = getattr(it, "_style", None)
-                if st is None: continue
+                if st is None:
+                    continue
                 st.glow = int(val); it.setStyle(st); it.update()
-        except Exception: pass
-
-
+        except Exception:
+            pass
     def _on_track_changed(self, val):
         try: QToolTip.showText(QCursor.pos(), f"{int(val)} px")
         except Exception: pass
@@ -1202,9 +1232,10 @@ class MemeToolPane(QWidget):
         is_video = low.endswith((".mp4",".mkv",".mov",".webm",".avi",".m4v",".mpg",".mpeg",".ts",".m2ts",".wmv"))
         if is_video:
             try:
-                vid = getattr(self.main, "video", None)
                 from PySide6.QtGui import QPixmap
+                vid = getattr(self.main, "video", None)
                 tmp_path = None
+                # Prefer full-res currentFrame (QImage)
                 qimg = getattr(vid, "currentFrame", None) if vid is not None else None
                 if qimg is not None and (not hasattr(qimg, "isNull") or not qimg.isNull()):
                     pm = QPixmap.fromImage(qimg)
@@ -1212,6 +1243,7 @@ class MemeToolPane(QWidget):
                         import tempfile
                         f = tempfile.NamedTemporaryFile(prefix="meme_frame_", suffix=".png", delete=False)
                         tmp_path = f.name; f.close(); pm.save(tmp_path, "PNG")
+                # Fallback: whatever is on the label (QPixmap)
                 if tmp_path is None and vid is not None and hasattr(vid, "label") and hasattr(vid.label, "pixmap"):
                     pm = vid.label.pixmap()
                     if pm is not None and (not hasattr(pm, "isNull") or not pm.isNull()):
@@ -1221,11 +1253,14 @@ class MemeToolPane(QWidget):
                 if tmp_path is None:
                     QMessageBox.warning(self, "Meme", "Could not open image."); return
                 self._load_image_to_scene(tmp_path)
-                try: self._tmp_last_path = tmp_path
-                except Exception: pass
+                try:
+                    self._tmp_last_path = tmp_path
+                except Exception:
+                    pass
                 return
             except Exception:
                 QMessageBox.warning(self, "Meme", "Could not open image."); return
+        # Not a video -> open image path directly
         self._load_image_to_scene(path)
     def _open_image(self):
         exts = "Images (*.png *.jpg *.jpeg *.webp)"
