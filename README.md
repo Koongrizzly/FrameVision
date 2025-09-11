@@ -1,7 +1,3 @@
-<p align="center">
-  <img src="https://jumpshare.com/s/vrcF6uqk60EgxlVPc99j" alt="FrameVision Demo" width="720">
-</p>
-
 [README.md](https://github.com/user-attachments/files/22204351/README.md)
 # 🌟 FrameVision V1.0.0
 **All-in-one Video & Photo Upscaler/Editor**  
