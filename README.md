@@ -27,10 +27,9 @@ start.bat
 ### Installer Menu Options
 - **Sytem check:** check diskspace, Cpu/Gpu, basic system info, python, creates venv etc and gives advice on what to use in the installer
 - **Core Install:** App only (minimal).
-- **Full CPU Install:** Torch CPU + models/binaries.This installer will not ask to install Qwen, smaller model is on roadmap
+- **Full CPU Install:** Torch CPU + models/binaries.
 - **Full CUDA Install:** Torch CUDA + models/binaries.
-  + install Qwen TXT2IMG (only allows install for 12 gig vram and up, download not included yet -> roadmap)
-
+  
 ---
 
 ## 💡 User-Friendly
