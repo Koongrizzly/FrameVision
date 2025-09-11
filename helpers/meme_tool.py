@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-import os, io, json, copy
+import os, io, json
 import math
 import pathlib
 from dataclasses import dataclass
@@ -104,7 +104,7 @@ class MemeTextItem(QGraphicsPathItem):
         self.setFlags(QGraphicsItem.ItemIsMovable | QGraphicsItem.ItemIsSelectable | QGraphicsItem.ItemSendsGeometryChanges)
         self._rect = QRectF(rect)
         self._text = text
-        self._style = copy.deepcopy(style)
+        self._style = style
         if style.shadow:
             eff = QGraphicsDropShadowEffect()
             eff.setBlurRadius(6)
@@ -138,7 +138,7 @@ class MemeTextItem(QGraphicsPathItem):
         self.setCursor(Qt.OpenHandCursor)
 
     def setStyle(self, style: TextStyle):
-        self._style = copy.deepcopy(style)
+        self._style = style
         if style.shadow and not self.graphicsEffect():
             eff = QGraphicsDropShadowEffect(); eff.setBlurRadius(6); eff.setOffset(1,1); eff.setColor(QColor(0,0,0,160))
             self.setGraphicsEffect(eff)
@@ -637,6 +637,20 @@ class CollapsibleBox(QWidget):
         self._content.setLayout(layout)
 class MemeToolPane(QWidget):
     """Meme / Caption tool widget."""
+    def showEvent(self, e):
+        super().showEvent(e)
+        try:
+            lay = self.layout()
+            if lay:
+                lay.activate()
+        except Exception:
+            pass
+        try:
+            if hasattr(self, 'view') and self.view is not None:
+                self.view.fitInView(self.view.sceneRect(), Qt.KeepAspectRatio)
+        except Exception:
+            pass
+
     def __init__(self, main=None, parent=None):
         super().__init__(parent)
         self.main = main
@@ -652,7 +666,9 @@ class MemeToolPane(QWidget):
     def _init_defaults(self):
         g = self.settings
         self.def_family = g.value("meme/font_family","Impact")
-        self.def_size = int(g.value("meme/font_size", 48))
+        self.def_size = int(g.value("meme/font_size", 32))
+        if self.def_size < 32:
+            self.def_size = 32
         self.def_fill = QColor(g.value("meme/fill","#ffffff"))
         self.def_stroke = QColor(g.value("meme/stroke","#000000"))
         self.def_stroke_w = int(g.value("meme/stroke_w", 4))
@@ -734,24 +750,14 @@ class MemeToolPane(QWidget):
         crop_row.addWidget(self.btn_crop_169); crop_row.addWidget(self.btn_crop_916); crop_row.addWidget(self.btn_crop_reset);
         self.btn_crop_apply = QPushButton("Apply crop")
         crop_row.addWidget(self.btn_crop_apply); crop_row.addStretch(1)
-
-        crop_set_box = CollapsibleBox("Crop overlay")
-        lay.addWidget(crop_set_box)
-        crop_set_form = QFormLayout(); crop_set_box.setContentLayout(crop_set_form)
-        self.sl_handle = QSlider(Qt.Horizontal); self.sl_handle.setRange(8, 40); self.sl_handle.setValue(int(self.settings.value('meme/crop_handle', 18)))
-        self.sl_opacity = QSlider(Qt.Horizontal); self.sl_opacity.setRange(0, 255); self.sl_opacity.setValue(int(self.settings.value('meme/crop_opacity', 120)))
-        crop_set_form.addRow("Handle size", self.sl_handle)
-        crop_set_form.addRow("Overlay opacity", self.sl_opacity)
         lay.addLayout(crop_row)
 
         # Output (moved to top)
         out = QHBoxLayout()
         self.cmb_fmt = QComboBox(); self.cmb_fmt.addItems(["png","jpg","webp"]); self.cmb_fmt.setCurrentText(self.out_fmt)
-        self.sp_quality = QSpinBox(); self.sp_quality.setRange(1,100); self.sp_quality.setValue(self.out_quality)
         self.chk_keepmeta = QCheckBox("Keep metadata (EXIF)"); self.chk_keepmeta.setChecked(self.keep_meta)
         self.btn_export = QPushButton("Export → Save as…"); self.btn_batch = QPushButton("Batch…")
         out.addWidget(QLabel("Format")); out.addWidget(self.cmb_fmt)
-        out.addWidget(QLabel("Quality")); out.addWidget(self.sp_quality)
         out.addWidget(self.chk_keepmeta); out.addStretch(1); out.addWidget(self.btn_export); out.addWidget(self.btn_batch)
         lay.addLayout(out)
 
@@ -850,26 +856,96 @@ class MemeToolPane(QWidget):
         form = QFormLayout()
 
         self.font_combo = QFontComboBox()
+        # Compact + bounded popup for font combo
         try:
-            self.font_combo.setStyleSheet('QFontComboBox{background:#0e2036;color:#cfe9ff;border:1px solid #1c4a76;border-radius:8px;padding:4px 6px}')
+            from PySide6.QtCore import QPoint
+            v = self.font_combo.view()
+            # keep list compact
+            try:
+                self.font_combo.setMaxVisibleItems(10)
+            except Exception:
+                pass
+            try:
+                v.setTextElideMode(Qt.ElideRight)
+                v.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+                v.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+            except Exception:
+                pass
+            # Patch showPopup to size + position container nicely
+            _orig_show = self.font_combo.showPopup
+            def _show_and_fix():
+                _orig_show()
+                try:
+                    cont = v.window()
+                    # desired width near combo width but capped
+                    try:
+                        w = max(self.font_combo.width() + 40, 360)
+                    except Exception:
+                        w = 400
+                    w = min(w, 520)
+                    v.setFixedWidth(w)
+                    try:
+                        cont.setFixedWidth(w)
+                    except Exception:
+                        pass
+                    # align left under the combo
+                    gp = self.font_combo.mapToGlobal(QPoint(0, self.font_combo.height()))
+                    cont.move(gp)
+                    # clamp within window bounds
+                    try:
+                        win = self.window()
+                        cg = cont.frameGeometry(); wg = win.frameGeometry()
+                        nx = cg.x(); ny = cg.y()
+                        if cg.right() > wg.right():
+                            nx -= (cg.right() - wg.right())
+                        if cg.left() < wg.left():
+                            nx += (wg.left() - cg.left())
+                        cont.move(nx, ny)
+                    except Exception:
+                        pass
+                except Exception:
+                    pass
+            self.font_combo.showPopup = _show_and_fix
+        except Exception:
+            pass
+
+        # Keep popup compact so it doesn't overflow the tab
+        try:
+            self.font_combo.setMaxVisibleItems(10)
+            self.font_combo.view().setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+        except Exception:
+            pass
+        # ## THEME_FIX_FONT_COMBO: clear styles so theme controls colors
+        try:
+            self.font_combo.setStyleSheet("")
+            try:
+                self.font_combo.view().setStyleSheet("")
+            except Exception:
+                pass
+        except Exception:
+            pass
+        try:
+            # Clear any hardcoded styles so the theme controls colors
+            self.font_combo.setStyleSheet("")
+            try:
+                self.font_combo.view().setStyleSheet("")
+            except Exception:
+                pass
         except Exception:
             pass
         try: self.font_combo.setCurrentFont(QFont(self.def_family))
         except Exception: pass
-        self.btn_font_add = QPushButton("Add fonts…")
-        self.btn_font_folder = QPushButton("Load folder…")
-        self.btn_font_dialog = QPushButton("Font…")
-        row_font = QHBoxLayout(); row_font.addWidget(self.font_combo); row_font.addWidget(self.btn_font_add); row_font.addWidget(self.btn_font_folder); row_font.addWidget(self.btn_font_dialog)
+        row_font = QHBoxLayout(); row_font.addWidget(self.font_combo)
         form.addRow("Font", row_font)
 
-        self.cmb_align = QComboBox(); self.cmb_align.addItems(["left","center","right"]); self.cmb_align.setCurrentText(self.def_align)
+        self.cmb_align = None  # align feature removed; self.cmb_align.addItems(["left","center","right"]); self.cmb_align.setCurrentText(self.def_align)
         self.sp_size = QSpinBox(); self.sp_size.setRange(8, 400); self.sp_size.setValue(self.def_size)
         self.sp_stroke = QSpinBox(); self.sp_stroke.setRange(0, 20); self.sp_stroke.setValue(self.def_stroke_w)
         self.chk_auto = QCheckBox("Auto-fit"); self.chk_auto.setChecked(self.def_auto)
         self.chk_shadow = QCheckBox("Shadow"); self.chk_shadow.setChecked(self.def_shadow)
         self.chk_allcaps = QCheckBox("ALL CAPS"); self.chk_allcaps.setChecked(self.def_allcaps)
         self.btn_fill = QPushButton("Text color…"); self.btn_stroke = QPushButton("Outline color…")
-        form.addRow("Align", self.cmb_align)
+        # align row removed
         form.addRow("Font size", self.sp_size)
         form.addRow("Outline width", self.sp_stroke)
         
@@ -880,8 +956,6 @@ class MemeToolPane(QWidget):
         # state
         self._img_item: Optional[QGraphicsPixmapItem] = None
         self._items: List[MemeTextItem] = []
-
-        self._update_quality_enabled()
 
     def _connect(self):
 
@@ -910,7 +984,6 @@ class MemeToolPane(QWidget):
         self.btn_edit.clicked.connect(self._edit_selected_text)
         self.btn_remove.clicked.connect(self._remove_selected)
         self.btn_reset.clicked.connect(self._reset_positions)
-        self.cmb_align.currentTextChanged.connect(self._apply_to_selected)
         self.sp_size.valueChanged.connect(self._apply_to_selected)
         self.sp_stroke.valueChanged.connect(self._apply_to_selected)
         self.chk_auto.toggled.connect(self._apply_to_selected)
@@ -918,19 +991,13 @@ class MemeToolPane(QWidget):
         self.chk_allcaps.toggled.connect(self._apply_to_selected)
         self.btn_fill.clicked.connect(lambda: self._pick_color(True))
         self.btn_stroke.clicked.connect(lambda: self._pick_color(False))
-        self.cmb_fmt.currentTextChanged.connect(lambda _: self._update_quality_enabled())
         self.btn_export.clicked.connect(self._export_single)
         self.btn_batch.clicked.connect(self._export_batch)
         self.font_combo.currentFontChanged.connect(self._on_font_changed)
-        self.btn_font_add.clicked.connect(self._on_add_fonts)
-        self.btn_font_folder.clicked.connect(self._on_add_font_folder)
-        self.btn_font_dialog.clicked.connect(self._on_font_dialog)
         self.btn_crop_169.clicked.connect(lambda: self._begin_crop(16,9))
         self.btn_crop_916.clicked.connect(lambda: self._begin_crop(9,16))
         self.btn_crop_reset.clicked.connect(self._reset_crop)
         self.btn_crop_apply.clicked.connect(self._apply_crop)
-        self.sl_handle.valueChanged.connect(self._on_crop_ui_changed)
-        self.sl_opacity.valueChanged.connect(self._on_crop_ui_changed)
 
     def _apply_transform_to_selection(self):
         try:
@@ -1004,23 +1071,36 @@ class MemeToolPane(QWidget):
             pass
 
     def _on_glow_changed(self, val):
+        # Only change selected items if any are selected; else change all
         try:
-            QToolTip.showText(QCursor.pos(), f"{int(val)} px")
-        except Exception:
-            pass
-        try:
-            self.def_glow = int(val); self.settings.setValue("meme/glow", int(val))
+            v = int(val)
+            self.def_glow = v
+            try:
+                self.settings.setValue("meme/glow", v)
+            except Exception:
+                pass
             items = list(getattr(self, "_items", []))
-            sel = [it for it in items if getattr(it, "isSelected", lambda: False)()]
-            if not sel:
-                return  # change nothing if no selection
-            for it in sel:
+            # collect selected text items
+            selected = [it for it in items if getattr(it, "isSelected", lambda: False)()]
+            targets = selected if selected else items
+            for it in targets:
                 st = getattr(it, "_style", None)
                 if st is None:
                     continue
-                st.glow = int(val); it.setStyle(st); it.update()
+                st.glow = v
+                try:
+                    it.setStyle(st)
+                except Exception:
+                    pass
+                try:
+                    it.update()
+                except Exception:
+                    pass
         except Exception:
             pass
+
+
+
     def _on_track_changed(self, val):
         try: QToolTip.showText(QCursor.pos(), f"{int(val)} px")
         except Exception: pass
@@ -1306,7 +1386,7 @@ class MemeToolPane(QWidget):
         st.auto_fit = self.chk_auto.isChecked()
         st.shadow = self.chk_shadow.isChecked()
         st.all_caps = self.chk_allcaps.isChecked()
-        st.align = self.cmb_align.currentText()
+        st.align = "center"
         st.color_hex = self.def_fill.name()
         st.stroke_hex = self.def_stroke.name()
         for it in self._items:
@@ -1497,7 +1577,7 @@ class MemeToolPane(QWidget):
 
     def _write_qimage(self, qimg: QImage, out_path: str, fmt: str):
         fmt = (fmt or "png").lower()
-        q = int(self.sp_quality.value())
+        q = 95
         if PIL_OK:
             try:
                 buf = io.BytesIO(); qimg.save(buf, "PNG"); buf.seek(0)
@@ -1513,7 +1593,7 @@ class MemeToolPane(QWidget):
                 elif fmt == "webp":
                     params.update(dict(quality=q, method=4))
                 elif fmt == "png":
-                    params.update(dict(compress_level=max(0,min(9,int(round((100-q)/100.0*9))))))
+                    params.update(dict(compress_level=2))
                 if self.chk_keepmeta.isChecked() and hasattr(im, "info") and "exif" in im.info:
                     params["exif"] = im.info["exif"]
                 im.save(out_path, format=fmt.upper(), **params)
