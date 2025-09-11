@@ -6,7 +6,7 @@ title FrameVision - STRICT UPDATE (Hard, Color)
 REM ====== CONFIG ======
 set "BRANCH=main"
 set "REPO_URL=https://github.com/Koongrizzly/FrameVision.git"
-set "SELF_DELETE=1"
+set "SELF_DELETE=0"
 REM ====================
 set "SCRIPT_DIR=%~dp0"
 pushd "%SCRIPT_DIR%" >nul
