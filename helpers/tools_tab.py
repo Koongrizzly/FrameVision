@@ -5,6 +5,7 @@ import os, re, subprocess
 from pathlib import Path
 from helpers.meme_tool import MemeToolPane
 from helpers.trim_tool import install_trim_tool
+from helpers.audiotool import install_audio_tool
 
 from helpers.renam import RenamPane
 
@@ -450,29 +451,23 @@ class InstantToolsPane(QWidget):
                 # --- Advanced GIF options ---
         gif_backend.install_ui(self, lay_gif, sec_gif)
         sec_gif.setContentLayout(lay_gif)
-        # Audio
+        # Audio (moved to helpers/audiotool.py)
         sec_audio = CollapsibleSection("Audio", expanded=False)
-        self.edit_audio = QLineEdit(); self.btn_pick_audio = QToolButton(); self.btn_pick_audio.setText("…")
-        self.cb_mix = QCheckBox("Mix with original audio (instead of replacing)"); self.cb_mix.setToolTip("Enable to mix the external audio with the original, instead of replacing it.")
-        self.btn_audio = QPushButton("Add Audio to Video"); self.btn_audio.setToolTip("Replace or mix an external audio track into the video.")
-        lay_audio = QFormLayout()
-        row_a = QHBoxLayout(); row_a.addWidget(self.edit_audio); row_a.addWidget(self.btn_pick_audio)
-        lay_audio.addRow("Audio file", row_a)
-        lay_audio.addRow(self.cb_mix)
-        lay_audio.addRow(self.btn_audio)
-        sec_audio.setContentLayout(lay_audio)
+        try:
+            install_audio_tool(self, sec_audio)
+        except Exception:
+            pass
+
+
         # moved below to reorder; see tuple later
         # root.addWidget(sec_audio)
-        self.btn_pick_audio.clicked.connect(self._pick_audio_file)
-        self.btn_audio.clicked.connect(self.run_add_audio)
-    
         row = QHBoxLayout(); btn_sg = QPushButton("Save preset"); btn_lg = QPushButton("Load preset"); row.addWidget(btn_sg); row.addWidget(btn_lg)
         lay_gif.addRow(row)
         btn_sg.clicked.connect(lambda: self._save_preset_gif())
         btn_lg.clicked.connect(lambda: self._load_preset_gif())
 
         # Extract
-        self.btn_last = QPushButton("Extract Last Frame"); self.btn_last.setToolTip("Save the last frame as an image."); self.btn_all = QPushButton("Extract All Frames"); self.btn_all.setToolTip("Export every frame to images. Large output!")
+        self.btn_last = QPushButton("Extract Last Frame"); self.btn_all = QPushButton("Extract All Frames"); self.btn_all.setToolTip("Export every frame to images. Large output!")
         lay_ext = QVBoxLayout(); lay_ext.addWidget(self.btn_last); lay_ext.addWidget(self.btn_all)
         sec_extract.setContentLayout(lay_ext)
         row = QHBoxLayout(); btn_se = QPushButton("Save preset"); btn_le = QPushButton("Load preset"); row.addWidget(btn_se); row.addWidget(btn_le)
@@ -1079,67 +1074,6 @@ class InstantToolsPane(QWidget):
         except Exception as e:
             QMessageBox.critical(self, "Preset error", str(e))
 
-    def _pick_audio_file(self):
-        from PySide6.QtWidgets import QFileDialog
-        path, _ = QFileDialog.getOpenFileName(self, "Choose audio file...", "", "Audio files (*.mp3 *.wav *.m4a *.aac *.flac);;All files (*)")
-        if path:
-            try:
-                self.edit_audio.setText(path)
-            except Exception:
-                pass
-
-    def run_add_audio(self):
-        inp = self._ensure_input()
-        if not inp:
-            return
-        audio = None
-        try:
-            audio = self.edit_audio.text().strip()
-        except Exception:
-            pass
-        if not audio or not os.path.isfile(audio):
-            try:
-                QMessageBox.warning(self, "Add Audio", "Please choose a valid audio file.")
-            except Exception:
-                pass
-            return
-        try:
-            out_dir = OUT_VIDEOS
-        except Exception:
-            from pathlib import Path as _Path
-            out_dir = _Path(".")
-        out = out_dir / f"{inp.stem}_withaudio.mp4"
-        replace = True
-        try:
-            replace = not bool(self.cb_mix.isChecked())
-        except Exception:
-            pass
-        if replace:
-            # Replace original audio with external audio
-            cmd = [ffmpeg_path(), "-y", "-i", str(inp), "-i", str(audio),
-                   "-map", "0:v:0", "-map", "1:a:0", "-c:v", "copy", "-c:a", "aac", "-shortest", str(out)]
-        else:
-            # Mix original audio with external audio
-            cmd = [ffmpeg_path(), "-y", "-i", str(inp), "-i", str(audio),
-                   "-filter_complex", "[0:a]volume=1.0[a0];[1:a]volume=1.0[a1];[a0][a1]amix=inputs=2:duration=shortest[aout]",
-                   "-map", "0:v:0", "-map", "[aout]", "-c:v", "copy", "-c:a", "aac", "-shortest", str(out)]
-        self._run(cmd, out)
-
-
-    
-
-    # --- Quality / Size actions ---
-    def _codec_selected(self):
-        txt = (self.q_codec.currentText() if hasattr(self, 'q_codec') else "H.264 (x264)").lower()
-        if "nvenc" in txt:
-            if "av1" in txt: return "av1_nvenc", "av1"
-            if "265" in txt or "hevc" in txt: return "hevc_nvenc", "hevc"
-            return "h264_nvenc", "h264"
-        if "svt" in txt or "av1" in txt:
-            return "libsvtav1", "av1"
-        if "265" in txt or "hevc" in txt:
-            return "libx265", "h265"
-        return "libx264", "h264"
 
     def _map_preset(self, enc: str, preset_txt: str) -> list[str]:
         # Map generic preset to encoder-specific flags

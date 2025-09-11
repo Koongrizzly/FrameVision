@@ -380,59 +380,10 @@ class UpscPane(QtWidgets.QWidget):
             _w = QtWidgets.QWidget(); _w.setLayout(lay_enc); enc_box.addWidget(_w)
         v.addWidget(enc_box)
 
-        # Advanced block
-        adv_box = CollapsibleSection("Advanced", expanded=False, parent=self)
-        self.box_advanced = adv_box
-        lay_adv = QtWidgets.QGridLayout(); lay_adv.setContentsMargins(6,2,6,6)
-        # VRAM-aware tiling
-        lay_adv.addWidget(QtWidgets.QLabel("Tile size:", self), 0, 0)
-        self.spin_tile = QtWidgets.QSpinBox(self); self.spin_tile.setRange(0, 1024); self.spin_tile.setValue(0)
-        self.spin_tile.setToolTip("0 = engine default; higher uses more VRAM but is faster.")
-        lay_adv.addWidget(self.spin_tile, 0, 1)
-        lay_adv.addWidget(QtWidgets.QLabel("Overlap (px):", self), 1, 0)
-        self.spin_overlap = QtWidgets.QSpinBox(self); self.spin_overlap.setRange(0, 64); self.spin_overlap.setValue(0)
-        lay_adv.addWidget(self.spin_overlap, 1, 1)
-        self.btn_auto_tile = QtWidgets.QPushButton("Auto tile size", self)
-        self.lbl_tile_result = QtWidgets.QLabel("", self); self.lbl_tile_result.setStyleSheet("color:#9fb3c8;")
-        rowt = QtWidgets.QHBoxLayout(); rowt.addWidget(self.btn_auto_tile); rowt.addWidget(self.lbl_tile_result); rowt.addStretch(1)
-        lay_adv.addLayout(rowt, 2, 0, 1, 2)
-
-        # Quality / prefilters
-        self.chk_deinterlace = QtWidgets.QCheckBox("Deinterlace (yadif)", self)
-        self.combo_range = QtWidgets.QComboBox(self); self.combo_range.addItems(["Auto","Full→Limited","Limited→Full"])
-        lay_adv.addWidget(self.chk_deinterlace, 3, 0)
-        lay_adv.addWidget(QtWidgets.QLabel("Color range fix:", self), 3, 1)
-        lay_adv.addWidget(self.combo_range, 3, 1, alignment=QtCore.Qt.AlignRight)
-
-        self.chk_deblock = QtWidgets.QCheckBox("Deblock", self)
-        self.chk_denoise = QtWidgets.QCheckBox("Denoise (hqdn3d)", self)
-        self.chk_deband = QtWidgets.QCheckBox("Deband (gradfun)", self)
-        lay_adv.addWidget(self.chk_deblock, 4, 0)
-        lay_adv.addWidget(self.chk_denoise, 4, 1)
-        lay_adv.addWidget(self.chk_deband, 5, 0)
-
-        lay_adv.addWidget(QtWidgets.QLabel("Sharpen:", self), 6, 0)
-        self.sld_sharpen = QtWidgets.QSlider(QtCore.Qt.Horizontal, self); self.sld_sharpen.setRange(0, 100); self.sld_sharpen.setValue(0)
-        lay_adv.addWidget(self.sld_sharpen, 6, 1)
-
-        # Face fixers (placeholder until installed)
-        lay_adv.addWidget(QtWidgets.QLabel("Face fix (GFPGAN):", self), 7, 0)
-        self.sld_gfpgan = QtWidgets.QSlider(QtCore.Qt.Horizontal, self); self.sld_gfpgan.setRange(0,100); self.sld_gfpgan.setValue(0); self.sld_gfpgan.setEnabled(False)
-        self.sld_gfpgan.setToolTip("GFPGAN not installed; slider disabled.")
-        lay_adv.addWidget(self.sld_gfpgan, 7, 1)
-        lay_adv.addWidget(QtWidgets.QLabel("Face fix (CodeFormer):", self), 8, 0)
-        self.sld_codeformer = QtWidgets.QSlider(QtCore.Qt.Horizontal, self); self.sld_codeformer.setRange(0,100); self.sld_codeformer.setValue(0); self.sld_codeformer.setEnabled(False)
-        self.sld_codeformer.setToolTip("CodeFormer not installed; slider disabled.")
-        lay_adv.addWidget(self.sld_codeformer, 8, 1)
-
-        try:
-            adv_box.setContentLayout(lay_adv)
-        except Exception:
-            _aw = QtWidgets.QWidget(); _aw.setLayout(lay_adv); adv_box.addWidget(_aw)
-        v.addWidget(adv_box)
         self.log = QtWidgets.QPlainTextEdit(self)
         self.log.setReadOnly(True)
         self.log.setFixedHeight(180)
+        self.log.setMaximumBlockCount(500)
         v.addWidget(self.log)
 
         # ----- Fixed bottom action bar (does not scroll) -----
@@ -552,51 +503,73 @@ class UpscPane(QtWidgets.QWidget):
             return Path("presets/setsave/upsc_settings.json").resolve()
 
     def _connect_auto_save(self):
-        """Connect many change signals to auto-save when remember is ON."""
-        sigs = []
+        """Connect change signals to auto-save, safely and individually, so a missing widget won't break others."""
+        def _connect(obj, sig_name):
+            try:
+                if obj is None:
+                    return False
+                sig = getattr(obj, sig_name, None)
+                if sig is None:
+                    return False
+                sig.connect(self._auto_save_if_enabled)
+                return True
+            except Exception:
+                return False
+
+        # Standard widgets
+        pairs = [
+            ("chk_remember", "toggled"),
+            ("spin_scale", "valueChanged"),
+            ("slider_scale", "valueChanged"),
+            ("combo_engine", "currentIndexChanged"),
+            ("combo_model_realsr", "currentTextChanged"),
+            ("combo_model_w2x", "currentTextChanged"),
+            ("edit_outdir", "textChanged"),
+            ("chk_play_internal", "toggled"),
+            ("chk_replace_in_player", "toggled"),
+            ("combo_vcodec", "currentTextChanged"),
+            ("rad_crf", "toggled"),
+            ("spin_crf", "valueChanged"),
+            ("rad_bitrate", "toggled"),
+            ("spin_bitrate", "valueChanged"),
+            ("combo_preset", "currentTextChanged"),
+            ("spin_keyint", "valueChanged"),
+            ("radio_a_copy", "toggled"),
+            ("radio_a_encode", "toggled"),
+            ("radio_a_mute", "toggled"),
+            ("combo_acodec", "currentTextChanged"),
+            ("spin_abitrate", "valueChanged"),
+            ("spin_tile", "valueChanged"),
+            ("spin_overlap", "valueChanged"),
+            ("chk_deinterlace", "toggled"),
+            ("combo_range", "currentTextChanged"),
+            ("chk_deblock", "toggled"),
+            ("chk_denoise", "toggled"),
+            ("chk_deband", "toggled"),
+            ("sld_sharpen", "valueChanged"),
+            ("spin_batch_max", "valueChanged"),
+        ]
+
+        connected = 0
+        for name, sig_name in pairs:
+            obj = getattr(self, name, None)
+            if _connect(obj, sig_name):
+                connected += 1
+
+        # Collapsible sections (their .toggle has a .toggled signal)
+        for box_name in ("box_models", "box_encoder", "box_advanced", "recents_box"):
+            box = getattr(self, box_name, None)
+            toggle = getattr(box, "toggle", None) if box is not None else None
+            if _connect(toggle, "toggled"):
+                connected += 1
+
         try:
-            sigs += [
-                (self.chk_remember.toggled, None),
-                (self.spin_scale.valueChanged, None),
-                (self.slider_scale.valueChanged, None),
-                (self.combo_engine.currentIndexChanged, None),
-                (self.combo_model_realsr.currentTextChanged, None),
-                (self.combo_model_w2x.currentTextChanged, None),
-                (self.edit_outdir.textChanged, None),
-                (self.chk_play_internal.toggled, None),
-                (self.chk_replace_in_player.toggled, None),
-                (self.combo_vcodec.currentTextChanged, None),
-                (self.rad_crf.toggled, None),
-                (self.spin_crf.valueChanged, None),
-                (self.rad_bitrate.toggled, None),
-                (self.spin_bitrate.valueChanged, None),
-                (self.combo_preset.currentTextChanged, None),
-                (self.spin_keyint.valueChanged, None),
-                (self.radio_a_copy.toggled, None),
-                (self.radio_a_encode.toggled, None),
-                (self.radio_a_mute.toggled, None),
-                (self.combo_acodec.currentTextChanged, None),
-                (self.spin_abitrate.valueChanged, None),
-                (self.spin_tile.valueChanged, None),
-                (self.spin_overlap.valueChanged, None),
-                (self.chk_deinterlace.toggled, None),
-                (self.combo_range.currentTextChanged, None),
-                (self.chk_deblock.toggled, None),
-                (self.chk_denoise.toggled, None),
-                (self.chk_deband.toggled, None),
-                (self.sld_sharpen.valueChanged, None),
-                (self.spin_batch_max.valueChanged, None),
-                (self.box_models.toggle.toggled, None),
-                (self.box_encoder.toggle.toggled, None),
-                (self.box_advanced.toggle.toggled, None),
-            ]
+            self._append_log(f"[settings] Auto-save wired to {connected} UI change signal(s).")
         except Exception:
             pass
-        for sig, _ in sigs:
-            try:
-                sig.connect(self._auto_save_if_enabled)
-            except Exception:
-                pass
+
+
+# UI helpers
 
     def _auto_save_if_enabled(self, *args, **kwargs):
         try:
@@ -993,7 +966,7 @@ class UpscPane(QtWidgets.QWidget):
                     td.mkdir(parents=True, exist_ok=True)
                     outp = td / (p.stem + "_thumb.jpg")
                     if not outp.exists() or (time.time() - outp.stat().st_mtime > 24*3600):
-                        cmd = [FFMPEG, "-y", "-hwaccel", "none", "-threads", "1", "-v", "error",
+                        cmd = [FFMPEG, "-hide_banner", "-loglevel", "warning", "-y", "-hwaccel", "none", "-threads", "1", "-v", "error",
                                "-i", str(p), "-vf", "thumbnail,scale=320:-1", "-frames:v", "1", str(outp)]
                         try:
                             cmd = self._apply_streaming_lowmem(cmd)
@@ -1168,12 +1141,12 @@ class UpscPane(QtWidgets.QWidget):
                 seq_out = out_dir / "f_%08d.png"
     
                 pre = self._build_pre_filters()
-                cmd_extract = [FFMPEG, "-y", "-i", str(src), "-map", "0:v:0"]
+                cmd_extract = [FFMPEG, "-hide_banner", "-loglevel", "warning", "-y", "-i", str(src), "-map", "0:v:0"]
                 if pre: cmd_extract += ["-vf", pre]
                 cmd_extract += ["-fps_mode", "vfr", str(seq_in)]
                 cmd_upscale = self._realsr_cmd_dir(engine_exe, in_dir, out_dir, model, scale)
                 post = self._build_post_filters()
-                cmd_encode = [FFMPEG, "-y", "-framerate", fps, "-i", str(seq_out), "-i", str(src), "-map", "0:v:0"]
+                cmd_encode = [FFMPEG, "-hide_banner", "-loglevel", "warning", "-y", "-framerate", fps, "-i", str(seq_out), "-i", str(src), "-map", "0:v:0"]
                 if self.radio_a_mute.isChecked():
                     pass
                 else:
@@ -1281,16 +1254,20 @@ class UpscPane(QtWidgets.QWidget):
 
     @QtCore.Slot(str)
     def _append_log(self, line: str):
-
         try:
-            cur = self.log.textCursor()
-            cur.movePosition(cur.Start)
-            cur.insertText(line + "\n")
-            self.log.setTextCursor(cur)
+            # Fast append at end; avoids O(n) inserts at start
+            self.log.appendPlainText(line)
             self.log.ensureCursorVisible()
         except Exception:
-            # Fallback
-            self.log.setPlainText((line + "\n") + self.log.toPlainText())
+            try:
+                cur = self.log.textCursor()
+                cur.movePosition(cur.End)
+                cur.insertText(line + "\n")
+                self.log.setTextCursor(cur)
+                self.log.ensureCursorVisible()
+            except Exception:
+                # Last-resort fallback (avoid expensive full setPlainText on large logs)
+                pass
 # Build pre-extract filters (applied on input video before frame extraction)
     def _build_pre_filters(self) -> str:
         fs = []
@@ -1380,7 +1357,7 @@ class UpscPane(QtWidgets.QWidget):
         tmp = Path(tempfile.mkdtemp(prefix="tileprobe_"))
         try:
             test_in = tmp / "in.png"; test_out = tmp / "out.png"
-            subprocess.run([FFMPEG, "-y", "-f", "lavfi", "-i", "color=c=gray:s=256x256", str(test_in)], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            subprocess.run([FFMPEG, "-hide_banner", "-loglevel", "warning", "-y", "-f", "lavfi", "-i", "color=c=gray:s=256x256", str(test_in)], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
             model = self.combo_model_realsr.currentText(); scale = int(round(self.spin_scale.value()))
             candidates = [800, 600, 400, 300, 200, 100]
             ok = None

@@ -631,11 +631,21 @@ class VideoPane(QWidget):
             pass
         self.player.positionChanged.connect(self.on_pos); self.player.durationChanged.connect(self.on_dur)
         bar = QHBoxLayout()
-        self.btn_open=QPushButton("📂"); self.btn_open.setToolTip("Open"); self.btn_play=QPushButton("▶"); self.btn_play.setToolTip("Play"); self.btn_pause=QPushButton("⏸"); self.btn_pause.setToolTip("Pause")
-        self.btn_stop=QPushButton("⏹"); self.btn_stop.setToolTip("Stop"); self.btn_info=QPushButton("ℹ"); self.btn_info.setToolTip("Info"); self.btn_fs=QPushButton("⛶"); self.btn_fs.setToolTip("Fullscreen")
+        self.btn_open=QPushButton("📂"); self.btn_open.setToolTip("Open"); self.btn_play=QPushButton("▶"); self.btn_play.setToolTip("Play"); self.btn_pause=QPushButton("❚❚"); self.btn_pause.setToolTip("Pause")
+        self.btn_stop=QPushButton("■"); self.btn_stop.setToolTip("Stop"); self.btn_info=QPushButton("ℹ"); self.btn_info.setToolTip("Info"); self.btn_fs=QPushButton("⛶"); self.btn_fs.setToolTip("Fullscreen")
         self.btn_ratio=QPushButton("◻"); self.btn_ratio.setToolTip("Aspect: Center (click to cycle)")
         for b in [self.btn_open,self.btn_play,self.btn_pause,self.btn_stop,self.btn_info,self.btn_ratio,self.btn_fs]: bar.addWidget(b)
         self.btn_compare = QPushButton("▷│◁"); self.btn_compare.setToolTip("Compare view"); bar.addWidget(self.btn_compare)
+        
+        # --- Slightly enlarge ONLY the Play button ---
+        try:
+            # Keep same visual height as other buttons, ensure width not tiny
+            self.btn_play.setFixedHeight(48)            # match others' height
+            self.btn_play.setMinimumWidth(56)           # don't let it collapse skinny
+            self.btn_play.setStyleSheet("font-size: 30px; padding: 0px;")
+        except Exception:
+            pass
+
         # Quick Upscale button
         self.btn_upscale = QPushButton("Upscale"); self.btn_upscale.setToolTip("Upscale")
         self.btn_upscale.setObjectName("btn_upscale_quick")
