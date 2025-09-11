@@ -1,19 +1,8 @@
-<h2 align="center">🖼 Screenshots Preview</h2>
-
-<p align="center">
-  <img src="https://github.com/user-attachments/assets/56a1c424-b723-4f12-9837-e3c21507005e"
-       alt="FrameVision Screenshots (animated preview)"
-       width="800">
-</p>
-
-<p align="center"><em>A quick look at the UI and core tools.</em></p>
-
-
 [README.md](https://github.com/user-attachments/files/22204351/README.md)
 # 🌟 FrameVision V1.0.0
 **All-in-one Video & Photo Upscaler/Editor**  
 ✨ *Upscale, convert, edit, describe, and create — in one streamlined app.*
-- BETA, WORK IN PROGRESS, features can come and go
+- WORK IN PROGRESS, features can come and go
 
 ---
 ## Quickstart
@@ -243,6 +232,16 @@ Planned features for future updates:
 - polishing and bugfixing for the rest of my life i think
 - a low weight txt/img to video would be nice but let's get the rest working 100% first
 - **Easter eggs** for extra fun surprises! Don't forget to click the intro 4x before it ends ;-)
+
+---
+
+## 🖼 Screenshots 
+
+<p align="center">
+  <img src="https://github.com/user-attachments/assets/56a1c424-b723-4f12-9837-e3c21507005e"
+       alt="FrameVision Screenshots (animated preview)"
+       width="800">
+</p>
 
 ---
 
