@@ -1037,9 +1037,21 @@ class UpscPane(QtWidgets.QWidget):
 
     # Core
     def _do_single(self):
-        src = Path(self.edit_input.text().strip())
+        raw = (self.edit_input.text() or '').strip()
+        src = Path(raw)
+        if raw in ('.','./','..',''):
+            # Try to fall back to player path if available
+            try:
+                p = _fv_get_input(self)
+                if p:
+                    src = Path(p)
+            except Exception:
+                pass
         if not src.exists():
             QtWidgets.QMessageBox.warning(self, "No input", "Please choose an image or video.")
+            return
+        if src.is_dir():
+            self._run_batch_from_folder(src)
             return
         self._run_one(src)
 
@@ -1455,8 +1467,10 @@ def _fv_get_input(self):
         w = getattr(self, attr, None)
         try:
             if w and hasattr(w, "text"):
-                t = w.text()
-                if _fv_is_valid_file(t):
+                t = (w.text() or '').strip()
+                if t in ('.','./','..',''):
+                    pass
+                elif _fv_is_valid_file(t):
                     return t
         except Exception:
             pass
@@ -1540,32 +1554,49 @@ def _fv_call_enqueue(self, enq, where_label, cmds, open_on_success):
     input_path = _fv_get_input(self)
     out_dir = ""
     try:
-        out_dir = getattr(self, "edit_output", None).text()
+        out_dir = (getattr(self, 'edit_outdir', None).text() if getattr(self, 'edit_outdir', None) else '') or (getattr(self, 'edit_output', None).text() if getattr(self, 'edit_output', None) else '')
     except Exception:
         pass
     # factor: try to read from UI or model name
     factor = 2
     try:
-        txt = getattr(self, "combo_model", None).currentText()
-        if isinstance(txt, str) and "x4" in txt: factor = 4
-        elif isinstance(txt, str) and "x3" in txt: factor = 3
-        elif isinstance(txt, str) and "x2" in txt: factor = 2
+        factor = int(round(float(getattr(self, 'spin_scale', None).value())))
     except Exception:
-        pass
-    model_name = ""
+        try:
+            txt = getattr(self, 'combo_model', None).currentText()
+            if isinstance(txt, str) and 'x4' in txt: factor = 4
+            elif isinstance(txt, str) and 'x3' in txt: factor = 3
+            elif isinstance(txt, str) and 'x2' in txt: factor = 2
+        except Exception:
+            pass
+    model_name = ''
     try:
-        model_name = getattr(self, "combo_model", None).currentText()
+        eng_label = getattr(self, 'combo_engine', None).currentText()
     except Exception:
-        pass
+        eng_label = ''
+    try:
+        if isinstance(eng_label, str) and 'Waifu2x' in eng_label:
+            cmw = getattr(self, 'combo_model_w2x', None)
+            if cmw and hasattr(cmw, 'currentText'):
+                model_name = cmw.currentText()
+        else:
+            cmr = getattr(self, 'combo_model_realsr', None)
+            if cmr and hasattr(cmr, 'currentText'):
+                model_name = cmr.currentText()
+    except Exception:
+        try:
+            model_name = getattr(self, 'combo_model', None).currentText()
+        except Exception:
+            pass
 
     # If signature wants plain args, call with those
     if sig:
         params = list(sig.parameters.keys())
         if params[:4] == ["input_path", "out_dir", "factor", "model"] or set(("input_path","out_dir","factor","model")).issubset(set(params)):
             try:
-                enq(input_path, out_dir, factor, model_name)
+                enq(input_path=input_path, out_dir=out_dir, factor=factor, model=model_name)
                 try:
-                    self._append_log(f"Queued via {where_label} (args).")
+                    self._append_log(f"Queued via {where_label} (kwargs).")
                 except Exception: pass
                 return True
             except Exception as e:
