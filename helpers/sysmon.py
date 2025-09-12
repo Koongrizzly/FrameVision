@@ -286,16 +286,36 @@ def _tool_ready_status(models_dir: str) -> Dict[str, Optional[str]]:
             if not waifu:
                 waifu = _exists_any([os.path.join(base, n)])
 
-    # UpScayl(er) — info-only
+
+    # UpScayl(er) — info-only (accept exe OR models folder)
     upscayl = None
-    for base in [
+    upscayl_bases = [
+        os.path.join(models_dir, "upscayl"),
         os.path.join(models_dir, "upscayler"),
         os.path.join(models_dir, "upscaler"),
         os.path.join(ROOT, "externals", "upscayl"),
-    ]:
+    ]
+    for base in upscayl_bases:
+        if upscayl:
+            break
+        # 1) Prefer an executable in common places
         for n in upscayl_names:
             if not upscayl:
                 upscayl = _exists_any([os.path.join(base, n)])
+        # 2) Otherwise, treat a populated models folder as "present"
+        if not upscayl and os.path.isdir(base):
+            has_models = False
+            # Typical structure: .../upscayl/models/*
+            check_path = os.path.join(base, "models") if os.path.isdir(os.path.join(base, "models")) else base
+            try:
+                for _r, _d, _f in os.walk(check_path):
+                    if _f:
+                        has_models = True
+                        break
+            except Exception:
+                pass
+            if has_models:
+                upscayl = base
 
     return {"FFmpeg": ff, "Qwen2-VL 2B": qwen, "RIFE": rife, "Real-ESRGAN": realsr, "Waifu2x": waifu, "UpScayl": upscayl}
 

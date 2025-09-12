@@ -1,7 +1,7 @@
 
-# helpers/settings_tab.py — canonical Settings builder for FrameVision (v0.7.6+overlay-row)
+# helpers/settings_tab.py — Settings page builder (overlay row + cache defaults + extra temp dirs)
 from __future__ import annotations
-from typing import Optional
+from typing import Optional, Iterable
 from PySide6 import QtCore, QtGui, QtWidgets
 from PySide6.QtCore import Qt, QSettings, QTimer
 from PySide6.QtWidgets import (
@@ -13,6 +13,53 @@ try:
     from helpers.framevision_app import apply_theme, config, save_config
 except Exception:
     apply_theme=None; config={}
+
+# ---- small filesystem helpers ------------------------------------------------------------
+def _clean_directory_contents(path: str) -> None:
+    """Delete files/folders inside *path* without deleting *path* itself."""
+    try:
+        if not path:
+            return
+        p = QtCore.QDir.toNativeSeparators(path)
+        if not os.path.isdir(path):
+            return
+        for name in os.listdir(path):
+            fp = os.path.join(path, name)
+            try:
+                if os.path.isdir(fp) and not os.path.islink(fp):
+                    shutil.rmtree(fp, ignore_errors=True)
+                else:
+                    try:
+                        os.remove(fp)
+                    except PermissionError:
+                        # read-only on Windows; try chmod then remove
+                        try:
+                            os.chmod(fp, 0o666)
+                            os.remove(fp)
+                        except Exception:
+                            pass
+            except Exception:
+                pass
+    except Exception:
+        pass
+
+def _project_root() -> str:
+    try:
+        # heuristic: helpers/ is under project root
+        here = os.path.abspath(os.path.dirname(__file__))
+        return os.path.abspath(os.path.join(here, ".."))
+    except Exception:
+        return os.getcwd()
+
+def _extra_temp_cleanup() -> None:
+    """Clean temp directories requested by user: output/_temp and work."""
+    root = _project_root()
+    targets = [
+        os.path.join(root, "output", "_temp"),
+        os.path.join(root, "work"),
+    ]
+    for t in targets:
+        _clean_directory_contents(t)
 
 # ---- helpers to locate the Settings page -------------------------------------------------
 def _locate_settings_container(root: QWidget) -> QWidget | None:
@@ -178,14 +225,47 @@ def _buttons_row(page: QWidget) -> QWidget:
     # Clear cache
     btn_cache = QPushButton("Clear program cache…")
     def do_cache():
+        # Prefer the app dialog if present so users can fine-tune;
+        # but pre-check "temp" and "__pycache__" options by default.
         try:
             from helpers.settings_boost import _make_cache_dialog
-            _make_cache_dialog(page).exec()
-        except Exception:
+            dlg = _make_cache_dialog(page)
             try:
-                from helpers.cleanup_cache import run_cleanup
-                run_cleanup(project_root=".", clean_pyc=True, clean_logs=True, clean_thumbs=True, clean_qt_cache=True, clean_hf_cache=False)
-            except Exception: pass
+                # Heuristically find relevant checkboxes by text and enable them.
+                for cb in dlg.findChildren(QtWidgets.QCheckBox):
+                    txt = (cb.text() or "").lower()
+                    if "temp" in txt or "temporary" in txt:
+                        cb.setChecked(True)
+                    if "__pycache__" in txt or "pycache" in txt or "cache py" in txt:
+                        cb.setChecked(True)
+            except Exception:
+                pass
+            # Run dialog; if accepted, do our extra folders cleanup as well.
+            res = dlg.exec()
+            if res == QtWidgets.QDialog.Accepted:
+                _extra_temp_cleanup()
+            return
+        except Exception:
+            pass
+
+        # Fallback: do a safe default cleanup with our own routine.
+        try:
+            from helpers.cleanup_cache import run_cleanup
+            # Ensure temp + pycache are ON by default
+            run_cleanup(
+                project_root=_project_root(),
+                clean_pyc=True,
+                clean_logs=True,
+                clean_thumbs=True,
+                clean_qt_cache=True,
+                clean_hf_cache=False,
+                clean_temp=True
+            )
+        except Exception:
+            pass
+        # Our additional folders, regardless of run_cleanup outcome
+        _extra_temp_cleanup()
+
     btn_cache.clicked.connect(do_cache)
 
     # Restart
