@@ -48,7 +48,7 @@ def _name(w: QWidget, fallback_prefix: str) -> str:
         pass
     return n.replace(' ', '_').replace('/', '_').lower()
 def restore_all(root: QWidget) -> None:
-    s = QSettings()
+    s = QSettings("FrameVision","FrameVision")
     if not s.value("keep_settings_after_restart", True, type=bool):
         return
 
@@ -220,7 +220,7 @@ def restore_all(root: QWidget) -> None:
             pass
 
 def save_all(root: QWidget) -> None:
-    s = QSettings()
+    s = QSettings("FrameVision","FrameVision")
     if not s.value("keep_settings_after_restart", True, type=bool):
         # If disabled, do nothing (we intentionally don't clear keys automatically)
         return

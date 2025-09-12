@@ -45,39 +45,7 @@ def _wrap_video_open(main):
 
 
 def _apply_profile_preferences(inner):
-    """Read Settings->Performance Profile and apply sensible defaults to inner widgets."""
-    try:
-        from PySide6.QtCore import QSettings
-        prof = QSettings("FrameVision","FrameVision").value("perf_profile","auto")
-        # Describer hints
-        try:
-            chk_cpu = getattr(inner, "chk_cpu", None)
-            chk_dml = getattr(inner, "chk_directml", None)
-            combo_prec = getattr(inner, "combo_precision", None)
-            if prof in ("cpu_only",):
-                if chk_cpu: chk_cpu.setChecked(False)  # default removed; will restore via UI
-                if chk_dml: chk_dml.setChecked(False)  # default removed; will restore via UI
-                if combo_prec and combo_prec.findText("INT4 (recommended)")>=0:
-                    combo_prec.setCurrentText("INT4 (recommended)")
-            elif prof in ("vram_6",):
-                if chk_cpu: chk_cpu.setChecked(False)  # default removed; will restore via UI
-                if chk_dml: chk_dml.setChecked(False)  # default removed; will restore via UI
-                if combo_prec and combo_prec.findText("INT4 (recommended)")>=0:
-                    combo_prec.setCurrentText("INT4 (recommended)")
-            elif prof in ("vram_16_or_less",):
-                if chk_cpu: chk_cpu.setChecked(False)  # default removed; will restore via UI
-                if chk_dml: chk_dml.setChecked(False)  # default removed; will restore via UI
-                if combo_prec and combo_prec.findText("INT8")>=0:
-                    combo_prec.setCurrentText("INT8")
-            elif prof in ("vram_16_plus",):
-                if chk_cpu: chk_cpu.setChecked(False)  # default removed; will restore via UI
-                if chk_dml: chk_dml.setChecked(False)  # default removed; will restore via UI
-                if combo_prec and combo_prec.findText("FP16")>=0:
-                    combo_prec.setCurrentText("FP16")
-        except Exception:
-            pass
-    except Exception:
-        pass
+    return
 
 def _sync_from_main_path(main):
     """Copy the player's current file path into Upscaler/Describer input fields."""

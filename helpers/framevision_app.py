@@ -705,21 +705,71 @@ class VideoPane(QWidget):
         self._mode = 'video'
     
     def _on_frame(self, frame):
+        # Lightweight: store the image and schedule a coalesced present (zoom untouched)
         try:
-            if getattr(self, '_mode', 'video') != 'video':
+            if not self.isVisible() or not self.label.isVisible():
                 return
         except Exception:
             pass
-        img = frame.toImage()
-        self.currentFrame = img
-        if not img.isNull():
+
+        # Lazy-init presenter flags to avoid __init__ edits
+        if not hasattr(self, '_present_pending'):
+            self._present_pending = False
+        if not hasattr(self, '_present_busy'):
+            self._present_busy = False
+
+        # Use existing render timer if present for FPS cap
+        try:
+            allow = True
+            if getattr(self, '_render_timer', None) is not None:
+                elapsed = self._render_timer.elapsed()  # ms
+                min_interval = int(1000 / max(1, int(getattr(self, '_target_fps', 30))))
+                if elapsed < min_interval:
+                    allow = False
+                else:
+                    self._render_timer.restart()
+            if not allow:
+                return
+        except Exception:
+            pass
+
+        # Convert to QImage quickly and release frame
+        try:
+            img = frame.toImage()
+            if img and not img.isNull():
+                self.currentFrame = img
+        except Exception:
+            return
+
+        # Coalesce UI updates
+        if self._present_pending:
+            return
+        self._present_pending = True
+        try:
+            from PySide6.QtCore import QTimer
+            QTimer.singleShot(0, self._present_current_frame)
+        except Exception:
             try:
-                self._refresh_label_pixmap()
+                self._present_current_frame()
             except Exception:
-                try:
-                    self.label.setPixmap(QPixmap.fromImage(img))
-                except Exception:
-                    pass
+                pass
+
+    def _present_current_frame(self):
+        # Present the current frame; keep zoom logic intact
+        if not hasattr(self, '_present_pending'):
+            self._present_pending = False
+        if not hasattr(self, '_present_busy'):
+            self._present_busy = False
+        self._present_pending = False
+        if self._present_busy:
+            return
+        self._present_busy = True
+        try:
+            self._refresh_label_pixmap()
+        except Exception:
+            pass
+        finally:
+            self._present_busy = False
 
     def mousePressEvent(self, ev):
         if self.player.playbackState()==QMediaPlayer.PlayingState:

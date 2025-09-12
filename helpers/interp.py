@@ -107,11 +107,6 @@ def _atempo_chain(mult: float) -> str:
 # --------- UI helpers ---------
 
 class Collapsible(QWidget):
-    def set_open(self, open: bool):
-        self._open = bool(open)
-        self.header.setChecked(self._open)
-        self._sync()
-
     def __init__(self, title: str, parent=None, start_open=True):
         super().__init__(parent)
         self._open = start_open
@@ -203,8 +198,8 @@ class InterpPane(QWidget):
         root = QVBoxLayout(content); root.setContentsMargins(0,0,0,0); root.setSpacing(4)
 
         # ---- Options ----
-        self.opt = Collapsible("Options", start_open=True)
-        root.addWidget(self.opt); lay = self.opt.body_layout()
+        opt = Collapsible("Options", start_open=True)
+        root.addWidget(opt); lay = opt.body_layout()
 
         # Row 1: multiplier + slider + quick-set buttons
         row = QHBoxLayout(); row.setSpacing(8)
@@ -258,7 +253,7 @@ class InterpPane(QWidget):
         lay.addLayout(play_row)
 
         # ---- Recent results gallery (NEW) ----
-        self.recent = Collapsible("Recent results", start_open=True)
+        self.recent = Collapsible("Recent results", start_open=False)
         root.addWidget(self.recent)
         rlay = self.recent.body_layout()
         self.recent_area = QScrollArea(); self.recent_area.setWidgetResizable(True); self.recent_area.setFrameShape(QFrame.NoFrame); self.recent_area.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff); self.recent_area.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
@@ -267,8 +262,8 @@ class InterpPane(QWidget):
         rlay.addWidget(self.recent_area)
 
         # ---- Advanced ----
-        self.adv = Collapsible("Advanced", start_open=True)
-        root.addWidget(self.adv); advl = self.adv.body_layout()
+        adv = Collapsible("Advanced", start_open=True)
+        root.addWidget(adv); advl = adv.body_layout()
 
         # Load profile
         sp = QHBoxLayout(); sp.setSpacing(8)
@@ -278,9 +273,9 @@ class InterpPane(QWidget):
             "2 — Fast",
             "3 — Balanced",
             "4 — High quality (heavier)",
-            "5 — Superfast",
+            "5 — Superfast (default)",
         ])
-        self.combo_speed.setCurrentIndex(2)
+        self.combo_speed.setCurrentIndex(4)
         sp.addWidget(QLabel("Load profile:")); sp.addWidget(self.combo_speed)
         self.cb_speed_default = QCheckBox("Default"); self.cb_speed_default.setChecked(False)
         sp.addStretch(1); advl.addLayout(sp)
@@ -407,7 +402,7 @@ class InterpPane(QWidget):
     
     # ---- simple JSON store (robust persistence) ----
     def _store_path(self) -> Path:
-        sp = self.ROOT / "presets" / "setsave"
+        sp = self.ROOT / "settings"
         sp.mkdir(parents=True, exist_ok=True)
         return sp / "interp.json"
 
@@ -434,14 +429,6 @@ class InterpPane(QWidget):
         self._kv_write("rife/speed_idx", int(self.combo_speed.currentIndex()))
         self._kv_write("rife/speed_default", int(self.cb_speed_default.isChecked()))
         self._kv_write("rife/model_key", self.combo_model.currentData())
-        # UI section open/closed states
-        try:
-            self._kv_write("ui/options_open", int(getattr(self, 'opt')._open))
-            self._kv_write("ui/recent_open", int(getattr(self, 'recent')._open))
-            self._kv_write("ui/advanced_open", int(getattr(self, 'adv')._open))
-        except Exception:
-            pass
-
     def _set_result_state(self, state: str, text: str | None = None):
         # States: idle, working, ok, err
         colors = {
@@ -479,65 +466,60 @@ class InterpPane(QWidget):
         self.warn_lbl.setText("⚠️ Superfast may peg your machine and freeze UI until done." if idx==4 else "")
         if self.cb_speed_default.isChecked(): self.cb_speed_default.setChecked(False)
         self._persist_state()
-
+        self._persist_state()
 
     def _on_speed_default(self, on: bool):
         if on: self.combo_speed.setCurrentIndex(3-1); self.warn_lbl.setText("")  # set to "Balanced"
         self._persist_state()
 
-    
     def _restore_state(self):
         # Block signals during restore to avoid handlers overwriting values
         self.combo_speed.blockSignals(True)
         self.cb_speed_default.blockSignals(True)
         self.combo_model.blockSignals(True)
-    
-        # Defaults
-        self.slider.setValue(int(self._kv_read('rife/multiplier', 200)))
-        self.cb_stream.setChecked(bool(int(self._kv_read('rife/streaming', 0))))
-        self.cb_autoplay.setChecked(bool(int(self._kv_read('rife/autoplay', 1))))
-        self.combo_speed.setCurrentIndex(int(self._kv_read('rife/speed_idx', 2)))
-        self.cb_speed_default.setChecked(bool(int(self._kv_read('rife/speed_default', 0))))
-        model_key = self._kv_read('rife/model_key', 'rife-HD')
-        if self.combo_model.findData(model_key) < 0:
-            model_key = 'rife-HD'
+        s=self.settings
+        self.slider.setValue(int(s.value("rife/multiplier", 200)))
+        self.cb_stream.setChecked(bool(int(s.value("rife/streaming", 0))))
+        self.cb_autoplay.setChecked(bool(int(s.value("rife/autoplay", 1))))
+        self.combo_speed.setCurrentIndex(int(s.value("rife/speed_idx", 4)))
+        self.cb_speed_default.setChecked(bool(int(s.value("rife/speed_default", 0))))
+        model_key = s.value("rife/model_key", "rife-UHD")
         self._set_model_ui(model_key)
-    
-        # Restore UI open states (default to open)
+        # Migration block removed: no longer force overwrite of saved speed/model        # One-time corrective migration v3: force Superfast + UHD if previous bug left bad values
+        migrated_v3 = int(self.settings.value("rife/migrated_superfast_default_v3", 0))
         try:
-            if hasattr(self, 'opt'): self.opt.set_open(bool(int(self._kv_read('ui/options_open', 1))))
-            if hasattr(self, 'recent'): self.recent.set_open(bool(int(self._kv_read('ui/recent_open', 1))))
-            if hasattr(self, 'adv'): self.adv.set_open(bool(int(self._kv_read('ui/advanced_open', 1))))
+            cur_idx = int(s.value("rife/speed_idx", -1))
         except Exception:
-            pass
-    
+            cur_idx = -1
+        model_key_cur = s.value("rife/model_key", "")
+        if not migrated_v3 and (cur_idx in (-1, 0) or model_key_cur in ("", "rife", "rife-v4")):
+            self.combo_speed.setCurrentIndex(4)
+            s.setValue("rife/speed_idx", 4)
+            s.setValue("rife/model_key", "rife-UHD")
+            self._set_model_ui("rife-UHD")
+            s.setValue("rife/migrated_superfast_default_v3", 1)
         # Unblock signals
         self.combo_speed.blockSignals(False)
         self.cb_speed_default.blockSignals(False)
         self.combo_model.blockSignals(False)
-    
+
+
+
     def _persist_state(self):
-            s = self.settings
-            s.setValue('rife/multiplier', int(self.slider.value()))
-            s.setValue('rife/streaming', int(self.cb_stream.isChecked()))
-            s.setValue('rife/autoplay', int(self.cb_autoplay.isChecked()))
-            s.setValue('rife/speed_idx', int(self.combo_speed.currentIndex()))
-            s.setValue('rife/speed_default', int(self.cb_speed_default.isChecked()))
-            s.setValue('rife/model_key', self.combo_model.currentData())
-            try:
-                s.sync()
-            except Exception:
-                pass
-            # JSON store as truth
-            self._kv_sync_all_from_runtime()
-            # Also persist the collapsible states explicitly
-            try:
-                self._kv_write('ui/options_open', int(getattr(self, 'opt')._open))
-                self._kv_write('ui/recent_open', int(getattr(self, 'recent')._open))
-                self._kv_write('ui/advanced_open', int(getattr(self, 'adv')._open))
-            except Exception:
-                pass
-    
+        s=self.settings
+        s.setValue('rife/multiplier', int(self.slider.value()))
+        s.setValue('rife/streaming', int(self.cb_stream.isChecked()))
+        s.setValue('rife/autoplay', int(self.cb_autoplay.isChecked()))
+        s.setValue('rife/speed_idx', int(self.combo_speed.currentIndex()))
+        s.setValue('rife/speed_default', int(self.cb_speed_default.isChecked()))
+        s.setValue('rife/model_key', self.combo_model.currentData())
+        try:
+            s.sync()
+        except Exception:
+            pass
+        # JSON store as truth
+        self._kv_sync_all_from_runtime()
+
 # ---- model handling ----
     def _set_model_ui(self, key: str):
         # select in combo and update blurbs
@@ -933,3 +915,160 @@ class InterpPane(QWidget):
             lbl.mousePressEvent = (lambda p=v: (lambda evt: QDesktopServices.openUrl(QUrl.fromLocalFile(str(p)))) )()
             self.recent_h.addWidget(lbl)
         self.recent_h.addStretch(1)
+
+
+# ---- Interp persistence hooks (appended) ----
+try:
+    from PySide6.QtCore import QTimer, QSettings
+    import json as _json
+    from pathlib import Path as _Path
+except Exception:
+    pass
+
+def _interp_store_path(self):
+    try:
+        root = getattr(self, 'ROOT', None)
+        base = _Path(root) if root else _Path.cwd()
+        p = base / 'presets' / 'setsave'
+        p.mkdir(parents=True, exist_ok=True)
+        return p / 'interp.json'
+    except Exception:
+        return _Path.cwd() / 'presets' / 'setsave' / 'interp.json'
+
+def _interp_read_kv(self):
+    path = _interp_store_path(self)
+    try:
+        if path.exists():
+            return _json.loads(path.read_text(encoding='utf-8') or '{}')
+    except Exception:
+        pass
+    return {}
+
+def _interp_write_kv(self, data: dict):
+    path = _interp_store_path(self)
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(_json.dumps(data, indent=2), encoding='utf-8')
+    except Exception:
+        pass
+
+def _interp_persist(self):
+    try:
+        s = getattr(self, 'settings', QSettings('FrameVision', 'FrameVision'))
+    except Exception:
+        s = None
+    data = _interp_read_kv(self)
+
+    def _set(k, v):
+        if s is not None:
+            s.setValue(k, v)
+        data[k] = v
+
+    try:
+        if hasattr(self, 'slider') and self.slider is not None:
+            _set('rife/multiplier', int(self.slider.value()))
+        if hasattr(self, 'cb_stream') and self.cb_stream is not None:
+            v = int(self.cb_stream.isChecked())
+            _set('rife/streaming', v); 
+            if s is not None: s.setValue('check/interp_stream', bool(v))
+        if hasattr(self, 'cb_autoplay') and self.cb_autoplay is not None:
+            v = int(self.cb_autoplay.isChecked())
+            _set('rife/autoplay', v);
+            if s is not None: s.setValue('check/interp_autoplay', bool(v))
+        if hasattr(self, 'combo_speed') and self.combo_speed is not None:
+            idx = int(self.combo_speed.currentIndex())
+            _set('rife/speed_idx', idx);
+            if s is not None: s.setValue('combo/interp_speed_profile', idx)
+        if hasattr(self, 'cb_speed_default') and self.cb_speed_default is not None:
+            v = int(self.cb_speed_default.isChecked())
+            _set('rife/speed_default', v);
+            if s is not None: s.setValue('check/interp_speed_default', bool(v))
+        if hasattr(self, 'combo_model') and self.combo_model is not None:
+            mk = self.combo_model.currentData()
+            _set('rife/model_key', mk);
+            if s is not None: s.setValue('combo/interp_model', int(self.combo_model.currentIndex()))
+        if s is not None:
+            try: s.sync()
+            except Exception: pass
+    except Exception:
+        pass
+
+    _interp_write_kv(self, data)
+
+def _interp_restore(self):
+    try:
+        s = getattr(self, 'settings', QSettings('FrameVision', 'FrameVision'))
+    except Exception:
+        s = None
+    data = _interp_read_kv(self)
+    def _get(k, qval, uival):
+        return data.get(k, qval if qval is not None else uival)
+
+    try:
+        if hasattr(self, 'slider') and self.slider is not None:
+            v = int(_get('rife/multiplier', s.value('rife/multiplier', self.slider.value(), int) if s is not None else None, int(self.slider.value())))
+            self.slider.setValue(v)
+        if hasattr(self, 'cb_stream') and self.cb_stream is not None:
+            v = int(_get('rife/streaming', s.value('rife/streaming', int(self.cb_stream.isChecked()), int) if s is not None else None, int(self.cb_stream.isChecked())))
+            self.cb_stream.setChecked(bool(v))
+        if hasattr(self, 'cb_autoplay') and self.cb_autoplay is not None:
+            v = int(_get('rife/autoplay', s.value('rife/autoplay', int(self.cb_autoplay.isChecked()), int) if s is not None else None, int(self.cb_autoplay.isChecked())))
+            self.cb_autoplay.setChecked(bool(v))
+        if hasattr(self, 'combo_speed') and self.combo_speed is not None:
+            idx = int(_get('rife/speed_idx', s.value('rife/speed_idx', int(self.combo_speed.currentIndex()), int) if s is not None else None, int(self.combo_speed.currentIndex())))
+            self.combo_speed.setCurrentIndex(idx)
+        if hasattr(self, 'cb_speed_default') and self.cb_speed_default is not None:
+            v = int(_get('rife/speed_default', s.value('rife/speed_default', int(self.cb_speed_default.isChecked()), int) if s is not None else None, int(self.cb_speed_default.isChecked())))
+            self.cb_speed_default.setChecked(bool(v))
+        if hasattr(self, 'combo_model') and self.combo_model is not None:
+            mk = _get('rife/model_key', s.value('rife/model_key', self.combo_model.currentData(), str) if s is not None else None, self.combo_model.currentData())
+            j = self.combo_model.findData(mk)
+            if j >= 0: self.combo_model.setCurrentIndex(j)
+
+        # Give global restorer stable names
+        try:
+            self.cb_stream.setObjectName('interp_stream')
+            self.cb_autoplay.setObjectName('interp_autoplay')
+            self.cb_speed_default.setObjectName('interp_speed_default')
+            self.combo_speed.setObjectName('interp_speed_profile')
+            self.combo_model.setObjectName('interp_model')
+        except Exception:
+            pass
+    except Exception:
+        pass
+
+    _interp_persist(self)
+
+def _interp_connect(self):
+    # Persist on changes
+    try:
+        if hasattr(self, 'slider') and self.slider is not None:
+            self.slider.valueChanged.connect(lambda *_: _interp_persist(self))
+        for name in ('cb_stream','cb_autoplay','cb_speed_default'):
+            if hasattr(self, name):
+                getattr(self, name).toggled.connect(lambda *_: _interp_persist(self))
+        for name in ('combo_speed','combo_model'):
+            if hasattr(self,name):
+                getattr(self, name).currentIndexChanged.connect(lambda *_: _interp_persist(self))
+    except Exception:
+        pass
+
+def _interp_post_init(self):
+    try:
+        QTimer.singleShot(0, lambda: (_interp_restore(self), _interp_connect(self)))
+    except Exception:
+        pass
+
+# Monkey patch InterpPane.__init__ to install hooks after UI is built
+try:
+    _InterpPane = InterpPane
+    _orig_init = _InterpPane.__init__
+    def _new_init(self, *a, **kw):
+        _orig_init(self, *a, **kw)
+        try:
+            _interp_post_init(self)
+        except Exception:
+            pass
+    _InterpPane.__init__ = _new_init
+except Exception:
+    pass

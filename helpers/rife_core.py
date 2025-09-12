@@ -26,6 +26,7 @@ def ensure_bootstrap(root: Path | str):
         from PySide6.QtCore import QSettings
         s = QSettings("FrameVision","FrameVision")
         if mdir and str(mdir):
+            if s.value("rife/models_dir", "", str) in ("", None):
             s.setValue("rife/models_dir", str(mdir))
     except Exception:
         pass
@@ -47,7 +48,8 @@ def ensure_bootstrap(root: Path | str):
     try:
         from PySide6.QtCore import QSettings
         s = QSettings("FrameVision","FrameVision")
-        s.setValue("rife/device_label", label)
+        if s.value("rife/device_label", "", str) in ("", None):
+            s.setValue("rife/device_label", label)
     except Exception:
         pass
 
