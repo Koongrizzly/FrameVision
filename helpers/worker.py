@@ -1,8 +1,7 @@
 
-# FrameVision worker V1.0.0 — NCNN wiring
+# FrameVision worker v0.2.5 — NCNN wiring
 import json, time, subprocess, os
 from pathlib import Path
-from typing import Optional
 try:
     from PIL import Image
 except Exception:
@@ -28,15 +27,83 @@ def is_video_path(p: Path) -> bool:
         return False
 
 # ---- Executable resolution (sanity-filtered) ----
-
 def resolve_upscaler_exe(cfg: dict, mani: dict, model_name: str):
-    """
-    Return (canonical_model_name, exe_path) for upscalers only (NO RIFE).
-    Delegates to _resolve_model_exe so we support both old and new manifest shapes
-    and auto-detection under the models folder.
-    """
-    return _resolve_model_exe(cfg, mani, model_name)
+    """Return (canonical_model_name, exe_path) for upscalers only (NO RIFE)."""
+    # 1) Manifest-relative exe path
+    try:
+        root = Path(mani.get("root")) if mani.get("root") else ROOT
+    except Exception:
+        root = ROOT
+    entry = (mani.get("models") or {}).get("upscalers", {}).get(model_name) if mani else None
+    if entry and isinstance(entry, dict):
+        exe_rel = (entry or {}).get('exe') or ''
+        if exe_rel:
+            exe_path = (root / exe_rel)
+            if exe_path.exists() and exe_path.is_file():
+                return (model_name, exe_path)
 
+    # 2) Search models folder for known upscaler executables
+    models_dir = _resolve_models_folder(cfg)
+    if models_dir and models_dir.exists():
+        candidates = [
+            "realesrgan-ncnn-vulkan.exe", "realesrgan-ncnn-vulkan",
+            "swinir-ncnn-vulkan.exe",     "swinir-ncnn-vulkan",
+            "waifu2x-ncnn-vulkan.exe",    "waifu2x-ncnn-vulkan",
+            "lapsrn-ncnn-vulkan.exe",     "lapsrn-ncnn-vulkan",
+        ]
+        try:
+            for name in candidates:
+                for p in models_dir.rglob(name):
+                    if p.is_file():
+                        return (model_name, p)
+        except Exception:
+            pass
+    return (model_name, None)
+
+def resolve_rife_exe(cfg: dict, mani: dict):
+    """Locate rife executable for interpolation jobs only."""
+    models_dir = _resolve_models_folder(cfg)
+    if models_dir and models_dir.exists():
+        for name in ["rife-ncnn-vulkan.exe","rife-ncnn-vulkan"]:
+            try:
+                for p in models_dir.rglob(name):
+                    if p.is_file():
+                        return p
+            except Exception:
+                pass
+    # Fallback to manifest exe if provided
+    try:
+        root = Path(mani.get("root")) if mani.get("root") else ROOT
+        entry = (mani.get("models") or {}).get("interpolators", {}).get("rife") if mani else None
+        if entry and isinstance(entry, dict):
+            exe_rel = (entry or {}).get('exe') or ''
+            if exe_rel:
+                exe_path = (root / exe_rel)
+                if exe_path.exists() and exe_path.is_file():
+                    return exe_path
+    except Exception:
+        pass
+    return None
+def _resolve_models_folder(cfg: dict) -> Path:
+    # Prefer config if valid; otherwise fall back to typical locations.
+    try:
+        cand = Path(cfg.get("models_folder", "")).expanduser()
+        if str(cand).strip() and cand.exists():
+            return cand
+    except Exception:
+        pass
+    # Common fallbacks
+    for p in [BASE/'models', Path('.')/'FrameVision'/'models', Path('.')/'models']:
+        try:
+            if p.exists():
+                return p
+        except Exception:
+            continue
+    return BASE/'models'
+
+
+LEGACY_BASES = [ROOT / "FrameVision", ROOT / "framevision", ROOT / "FrameLab"]
+def _migrate_legacy_tree():
     base = BASE
     for p in ["output/video","output/trims","output/screenshots","output/descriptions","output/_temp",
               "jobs/pending","jobs/running","jobs/done","jobs/failed","logs"]:
@@ -227,17 +294,6 @@ def build_lapsrn_cmd(exe, inp, out, factor):
     s = int(factor); return [exe, "-i", str(inp), "-o", str(out), "-s", str(s)]
 
 
-
-def build_waifu2x_cmd(exe, inp, out, factor, model_name=None):
-    """
-    Minimal waifu2x-ncnn-vulkan invocation.
-    We pass -s <scale> and -n 0 (no denoise). If a specific model folder is desired,
-    the worker will still locate the executable next to the models; we omit -m to use its default.
-    """
-    s = int(factor)
-    return [exe, "-i", str(inp), "-o", str(out), "-s", str(s), "-n", "0"]
-
-
 def upscale_video(job, cfg, mani):
     print("[worker] upscale_video: start", job.get("input"))
     inp = Path(job["input"]); out_dir = Path(job["out_dir"]); out_dir.mkdir(parents=True, exist_ok=True)
@@ -246,7 +302,7 @@ def upscale_video(job, cfg, mani):
     model_name, exe_path = resolve_upscaler_exe(cfg, mani, model_name)
     out = out_dir / f"{inp.stem}_x{factor}.mp4"
 
-    # frames -> batch up (single process when possible) -> encode
+    # frames -> per-frame up (with progress) -> encode
     if exe_path and exe_path.exists() and exe_path.is_file():
         print(f"[worker] Using model '{model_name}' at {exe_path}")
         # 1) Extract frames
@@ -257,49 +313,28 @@ def upscale_video(job, cfg, mani):
             total = len(list(frames.glob("*.png")))
         except Exception:
             total = 0
-        try: _progress_set(5)
-        except Exception: pass
-
-        # 2) Upscale frames (prefer single batch call when supported)
+        # 2) Per-frame upscale
         up = out_dir / f"{inp.stem}_x{factor}_up"; up.mkdir(parents=True, exist_ok=True)
-        exe_name = exe_path.name.lower()
-        batch_supported = any(k in exe_name for k in ("realesr", "waifu2x", "swinir", "lapsrn"))
-        if batch_supported:
-            # Many *-ncnn-vulkan tools accept folder -> folder directly.
-            if "realesr" in exe_name:
-                cmd = build_realesrgan_cmd(str(exe_path), str(frames), str(up), factor, model_name)
-            elif "waifu2x" in exe_name:
-                cmd = build_waifu2x_cmd(str(exe_path), str(frames), str(up), factor)
-            elif "swinir" in exe_name:
-                cmd = build_swinir_cmd(str(exe_path), str(frames), str(up), factor)
-            else:  # lapsrn
-                cmd = build_lapsrn_cmd(str(exe_path), str(frames), str(up), factor)
+        m = str(model_name).lower()
+        done = 0
+        for png in sorted(frames.glob("*.png")):
+            if "realesr" in m:
+                cmd = build_realesrgan_cmd(str(exe_path), png, up/png.name, factor, model_name)
+            elif "swinir" in m:
+                cmd = build_swinir_cmd(str(exe_path), png, up/png.name, factor)
+            elif "lapsrn" in m:
+                cmd = build_lapsrn_cmd(str(exe_path), png, up/png.name, factor)
+            else:
+                cmd = [FFMPEG,"-y","-i",str(png),"-vf",f"scale=iw*{factor}:ih*{factor}:flags=lanczos","-frames:v","1",str(up/png.name)]
             if run(cmd)!=0:
                 return 1
-            try: _progress_set(95)
-            except Exception: pass
-        else:
-            # Fallback: per-frame (slower)
-            done = 0
-            for png in sorted(frames.glob("*.png")):
-                m = str(model_name).lower()
-                if "realesr" in m:
-                    cmd = build_realesrgan_cmd(str(exe_path), str(png), str(up/p.png.name), factor, model_name)
-                elif "swinir" in m:
-                    cmd = build_swinir_cmd(str(exe_path), str(png), str(up/p.png.name), factor)
-                elif "lapsrn" in m:
-                    cmd = build_lapsrn_cmd(str(exe_path), str(png), str(up/p.png.name), factor)
-                else:
-                    cmd = [FFMPEG,"-y","-i",str(png),"-vf",f"scale=iw*{factor}:ih*{factor}:flags=lanczos","-frames:v","1",str(up/p.png.name)]
-                if run(cmd)!=0:
-                    return 1
-                done += 1
-                try:
-                    pct = 5 + int(90 * (done / max(1,total)))
-                    _progress_set(pct)
-                except Exception:
-                    pass
-
+            done += 1
+            try:
+                # map frames progress to 5..95%
+                pct = 5 + int(90 * (done / max(1,total)))
+                _progress_set(pct)
+            except Exception:
+                pass
         # 3) Re-encode
         enc = [FFMPEG,"-y","-r","30","-i",str(up/"%06d.png"),
                "-c:v","libx264","-preset","veryfast","-pix_fmt","yuv420p","-movflags","+faststart",str(out)]
@@ -316,6 +351,94 @@ def upscale_video(job, cfg, mani):
         except Exception: pass
         return code
 
+
+    # If we have a usable model exe → frames -> up -> encode
+    if exe_path and exe_path.exists() and exe_path.is_file():
+        print(f"[worker] Using model '{model_name}' at {exe_path}")
+        # 1) Extract frames
+        frames = out_dir / f"{inp.stem}_x{factor}_frames"; frames.mkdir(parents=True, exist_ok=True)
+        if run([FFMPEG,"-y","-i",str(inp), str(frames/"%06d.png")])!=0:
+            return 1
+        # 2) Upscale frames (batch for RealESR family)
+        up = out_dir / f"{inp.stem}_x{factor}_up"; up.mkdir(parents=True, exist_ok=True)
+        m = str(model_name).lower()
+        if ("realesr" in m) or ("realesrgan" in m):
+            cmd = build_realesrgan_cmd(str(exe_path), frames, up, factor, model_name)
+            if run(cmd)!=0:
+                return 1
+        else:
+            for png in sorted(frames.glob("*.png")):
+                if "swinir" in m:
+                    cmd = build_swinir_cmd(str(exe_path), png, up/png.name, factor)
+                elif "lapsrn" in m:
+                    cmd = build_lapsrn_cmd(str(exe_path), png, up/png.name, factor)
+                else:
+                    cmd = [FFMPEG,"-y","-i",str(png),"-vf",f"scale=iw*{factor}:ih*{factor}:flags=lanczos","-frames:v","1",str(up/png.name)]
+                if run(cmd)!=0:
+                    return 1
+        # 3) Re-encode
+        enc = [FFMPEG,"-y","-r","30","-i",str(up/"%06d.png"),
+               "-c:v","libx264","-preset","veryfast","-pix_fmt","yuv420p","-movflags","+faststart",str(out)]
+        if run(enc)!=0:
+            return 1
+        return 0
+
+    # No model exe → direct whole-video scale (fast fallback)
+    print(f"[worker] Falling back to direct scale for {inp} with factor {factor}; model='{model_name}'")
+    cmd = [FFMPEG,"-y","-i",str(inp),
+           "-vf",f"scale=iw*{factor}:ih*{factor}:flags=lanczos",
+           "-c:v","libx264","-preset","veryfast","-pix_fmt","yuv420p","-movflags","+faststart",str(out)]
+    return run(cmd)
+
+def tools_ffmpeg(job, cfg, mani):
+
+    try:
+        import shlex
+        import pathlib  # ensure available even if not imported at module level
+        args = job.get("args", {}) or {}
+        cmd = args.get("ffmpeg_cmd") or args.get("cmd") or job.get("cmd")
+        # Normalize to list
+        if isinstance(cmd, str):
+            try:
+                cmd = shlex.split(cmd)
+            except Exception:
+                cmd = cmd.strip().split()
+        if not isinstance(cmd, (list, tuple)) or len(cmd) == 0:
+            try:
+                job['error'] = "No ffmpeg command provided (expected args.ffmpeg_cmd, args.cmd, or job.cmd)."
+            except Exception:
+                pass
+            return 1
+
+        # Ensure output directory exists if job provides one
+        try:
+            out_dir = job.get("out_dir")
+            if out_dir:
+                pathlib.Path(out_dir).mkdir(parents=True, exist_ok=True)
+        except Exception:
+            pass
+
+        # If args['outfile'] is set, create its parent
+        try:
+            outfile = args.get("outfile")
+            if outfile:
+                pathlib.Path(outfile).parent.mkdir(parents=True, exist_ok=True)
+        except Exception:
+            pass
+
+        # Record the normalized command for visibility
+        try:
+            job['cmd'] = " ".join(str(x) for x in cmd)
+        except Exception:
+            pass
+
+        return run([str(x) for x in cmd])
+    except Exception as e:
+        try:
+            job['error'] = f"tools_ffmpeg exception: {e}"
+        except Exception:
+            pass
+        return 1
 def upscale_photo(job, cfg, mani):
     print("[worker] upscale_photo: start", job.get("input"))
     inp = Path(job["input"]); out_dir = Path(job["out_dir"]); out_dir.mkdir(parents=True, exist_ok=True)
@@ -358,8 +481,6 @@ def upscale_photo(job, cfg, mani):
             cmd = build_realesrgan_cmd(str(exe_path), src_in, out, factor, model_name)
         elif "swinir" in m:
             cmd = build_swinir_cmd(str(exe_path), src_in, out, factor)
-        elif "waifu2x" in m:
-            cmd = build_waifu2x_cmd(str(exe_path), src_in, out, factor)
         elif "lapsrn" in m:
             cmd = build_lapsrn_cmd(str(exe_path), src_in, out, factor)
         else:
@@ -455,7 +576,7 @@ def handle_job(jpath: Path):
         return 1
 
 def main():
-    print("FrameVision Worker V1.0.0. Watching jobs/pending in", JOBS["pending"])
+    print("FrameVision Worker v0.2.5. Watching jobs/pending in", JOBS["pending"])
     while True:
         try:
             HEARTBEAT.write_text(time.strftime("%Y-%m-%d %H:%M:%S"), encoding="utf-8")
@@ -506,7 +627,7 @@ def build_rife_cmd(exe: str, inp: Path, out: Path, args: dict):
 
 
 
-def _build_rife_cmd_fallback(exe: str, inp: Path, outp: Path, args: dict, models_dir: Optional[str]) -> list:
+def _build_rife_cmd_fallback(exe: str, inp: Path, outp: Path, args: dict, models_dir: str | None) -> list:
     cmd = [exe, "-i", str(inp), "-o", str(outp)]
     net = (args.get("network") or "").strip()
     if net: cmd += ["-n", net]
@@ -525,7 +646,7 @@ def _build_rife_cmd_fallback(exe: str, inp: Path, outp: Path, args: dict, models
         cmd += ["-m", str(models_dir)]
     return cmd
 
-def _deep_find_models_dir(root: Path, exe: Optional[str]) -> Optional[str]:
+def _deep_find_models_dir(root: Path, exe: str | None) -> str | None:
     # Look for a folder that contains rife-v4*/uhd/anime subfolders.
     allowed = ("rife-v4.6","rife-v4","rife-uhd","rife-anime")
     def contains_models(d: Path) -> bool:
@@ -547,7 +668,7 @@ def _deep_find_models_dir(root: Path, exe: Optional[str]) -> Optional[str]:
         for cand in [exedir / "models"] + [p for p in (exedir).rglob("*") if p.is_dir()]:
             if contains_models(cand): return str(cand)
     return None
-def _resolve_rife_exe(exe_override, cfg_root: Path) -> Optional[Path]:
+def _resolve_rife_exe(exe_override, cfg_root: Path) -> Path | None:
     # Try explicit override
     if exe_override:
         p = Path(exe_override)
