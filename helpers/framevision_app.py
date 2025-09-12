@@ -631,32 +631,35 @@ class VideoPane(QWidget):
             pass
         self.player.positionChanged.connect(self.on_pos); self.player.durationChanged.connect(self.on_dur)
         bar = QHBoxLayout()
-        self.btn_open=QPushButton("📂"); self.btn_open.setToolTip("Open"); self.btn_play=QPushButton("▶"); self.btn_play.setToolTip("Play"); self.btn_pause=QPushButton("❚❚"); self.btn_pause.setToolTip("Pause")
-        self.btn_stop=QPushButton("■"); self.btn_stop.setToolTip("Stop"); self.btn_info=QPushButton("ℹ"); self.btn_info.setToolTip("Info"); self.btn_fs=QPushButton("⛶"); self.btn_fs.setToolTip("Fullscreen")
+        self.btn_open=QPushButton("📂"); self.btn_open.setToolTip("Open"); self.btn_play=QPushButton("▶"); self.btn_play.setToolTip("Play"); self.btn_pause=QPushButton("⏸"); self.btn_pause.setToolTip("Pause")
+        self.btn_stop=QPushButton("⏹"); self.btn_stop.setToolTip("Stop"); self.btn_info=QPushButton("ℹ"); self.btn_info.setToolTip("Info"); self.btn_fs=QPushButton("⛶"); self.btn_fs.setToolTip("Fullscreen")
         self.btn_ratio=QPushButton("◻"); self.btn_ratio.setToolTip("Aspect: Center (click to cycle)")
         for b in [self.btn_open,self.btn_play,self.btn_pause,self.btn_stop,self.btn_info,self.btn_ratio,self.btn_fs]: bar.addWidget(b)
         self.btn_compare = QPushButton("▷│◁"); self.btn_compare.setToolTip("Compare view"); bar.addWidget(self.btn_compare)
-        
-        # --- Slightly enlarge ONLY the Play button ---
-        try:
-            # Keep same visual height as other buttons, ensure width not tiny
-            self.btn_play.setFixedHeight(48)            # match others' height
-            self.btn_play.setMinimumWidth(56)           # don't let it collapse skinny
-            self.btn_play.setStyleSheet("font-size: 30px; padding: 0px;")
-        except Exception:
-            pass
-
         # Quick Upscale button
         self.btn_upscale = QPushButton("Upscale"); self.btn_upscale.setToolTip("Upscale")
         self.btn_upscale.setObjectName("btn_upscale_quick")
         try:
             self.btn_upscale.setStyleSheet(
-                "QPushButton#btn_upscale_quick { padding:6px 14px; background:#3b82f6; color:white; border-radius:8px; font-weight:600; }"
+                "QPushButton#btn_upscale_quick { padding:4px 14px; background:#3b82f6; color:white; border-radius:8px; font-weight:600; }"
                 "QPushButton#btn_upscale_quick:hover { background:#2563eb; }"
             )
         except Exception:
             pass
         bar.addWidget(self.btn_upscale)
+        # --- Uniform control sizing: keep all buttons the same height ---
+        try:
+            _all_ctrls = [self.btn_open, self.btn_play, self.btn_pause, self.btn_stop, self.btn_info, self.btn_ratio, self.btn_fs, self.btn_compare, self.btn_upscale]
+            for _b in _all_ctrls:
+                _b.setFixedHeight(48)
+            # Keep play glyph larger but do NOT change height
+            self.btn_play.setStyleSheet("font-size: 30px; padding: 0;")
+            # Match Upscale to the raster/row height
+            self.btn_upscale.setMinimumHeight(48)
+            self.btn_upscale.setMaximumHeight(48)
+        except Exception:
+            pass
+
 
         bar.addStretch(1)
         lay = QVBoxLayout(self); lay.addWidget(self.label,1); self.info_label=QLabel("—"); self.info_label.setObjectName("videoInfo"); f=self.info_label.font(); f.setPointSize(max(10, f.pointSize())); self.info_label.setFont(f); lay.addWidget(self.info_label); lay.addWidget(self.slider); lay.addLayout(bar)

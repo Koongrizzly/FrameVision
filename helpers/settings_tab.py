@@ -1,5 +1,5 @@
 
-# helpers/settings_tab.py — canonical Settings builder for FrameVision (v0.7.6)
+# helpers/settings_tab.py — canonical Settings builder for FrameVision (v0.7.6+overlay-row)
 from __future__ import annotations
 from typing import Optional
 from PySide6 import QtCore, QtGui, QtWidgets
@@ -47,13 +47,25 @@ def _wipe_layout(lay: QVBoxLayout) -> None:
 
 # ---- component builders ------------------------------------------------------------------
 def _theme_row(page: QWidget) -> QWidget:
-    row = QWidget(page)
-    h = QHBoxLayout(row); h.setContentsMargins(0,0,0,0); h.setSpacing(8)
+    """Top section with (1) Theme controls and (2) Intro overlay controls on a NEW LINE."""
+    container = QWidget(page)
+    v = QVBoxLayout(container)
+    v.setContentsMargins(0,0,0,0)
+    v.setSpacing(6)
+
+    # --- Row 1: Theme selection + apply ---------------------------------------------------
+    top = QWidget(container)
+    h = QHBoxLayout(top); h.setContentsMargins(0,0,0,0); h.setSpacing(8)
     lab = QLabel("Theme:")
-    box = QComboBox(); box.addItems(["Day","Solarized Light","Sunburst","Evening","Night","Slate","High Contrast","Cyberpunk","Neon","Ocean","CRT","Aurora","Mardi Gras","Tropical Fiesta","Color Mix","Random","Auto"])
+    box = QComboBox(); box.addItems([
+        "Day","Solarized Light","Sunburst","Evening","Night","Slate","High Contrast",
+        "Cyberpunk","Neon","Ocean","CRT","Aurora","Mardi Gras","Tropical Fiesta",
+        "Color Mix","Random","Auto"
+    ])
     try:
         cur = (config.get("theme") or "Auto"); idx = box.findText(cur); box.setCurrentIndex(max(0, idx))
-    except Exception: pass
+    except Exception:
+        pass
     btn = QPushButton("Apply theme")
     def do_apply():
         try:
@@ -69,7 +81,42 @@ def _theme_row(page: QWidget) -> QWidget:
             pass
     btn.clicked.connect(do_apply); box.currentIndexChanged.connect(lambda _i: do_apply())
     h.addWidget(lab); h.addWidget(box); h.addWidget(btn); h.addStretch(1)
-    return row
+    v.addWidget(top)
+
+    # --- Row 2: Intro overlay controls (moved to NEW LINE) -------------------------------
+    bottom = QWidget(container)
+    h2 = QHBoxLayout(bottom); h2.setContentsMargins(0,0,0,0); h2.setSpacing(8)
+
+    ov_toggle = QCheckBox("Intro overlay")
+    ov_toggle.setToolTip("Enable a visual overlay during the startup intro image (e.g., Matrix rain).")
+
+    ov_combo = QComboBox()
+    ov_combo.addItems(["Random","Matrix (Green)","Matrix (Blue)","Bokeh"])
+
+    ov_preview = QCheckBox("Preview in Settings")
+    ov_preview.setToolTip("If enabled, shows the intro overlay briefly in the Settings preview.")
+
+    # Persist/restore via QSettings
+    _s = QSettings("FrameVision", "FrameVision")
+    ov_toggle.setChecked(_s.value("intro_overlay_enabled", False, type=bool))
+    mode = _s.value("intro_overlay_mode", "Random", type=str) or "Random"
+    idx = ov_combo.findText(mode); ov_combo.setCurrentIndex(max(0, idx))
+    ov_preview.setChecked(_s.value("intro_overlay_preview_enabled", True, type=bool))
+
+    ov_toggle.toggled.connect(lambda b: _s.setValue("intro_overlay_enabled", bool(b)))
+    ov_combo.currentTextChanged.connect(lambda t: _s.setValue("intro_overlay_mode", t))
+    ov_preview.toggled.connect(lambda b: _s.setValue("intro_overlay_preview_enabled", bool(b)))
+
+    for w in (ov_combo, ov_toggle, ov_preview):
+        w.setSizePolicy(QSizePolicy(QSizePolicy.Fixed, QSizePolicy.Fixed))
+
+    h2.addWidget(ov_toggle)
+    h2.addWidget(ov_combo)
+    h2.addWidget(ov_preview)
+    h2.addStretch(1)
+    v.addWidget(bottom)
+
+    return container
 
 def _options_group(page: QWidget) -> QGroupBox:
     g = QGroupBox("Options", page)
@@ -99,7 +146,7 @@ def _options_group(page: QWidget) -> QGroupBox:
     v.addWidget(cb_clear_pyc)
     v.addWidget(cb_keep_settings)
 
-            # Temperature units (C/F)
+    # Temperature units (C/F)
     row = QtWidgets.QWidget(g)
     h2 = QtWidgets.QHBoxLayout(row); h2.setContentsMargins(0,4,0,0); h2.setSpacing(8)
     h2.addWidget(QtWidgets.QLabel("Temperature units:"))
@@ -121,7 +168,6 @@ def _options_group(page: QWidget) -> QGroupBox:
     combo.currentIndexChanged.connect(lambda _i: _apply_units())
     h2.addWidget(combo); h2.addStretch(1)
     v.addWidget(row)
-    # (folder picker omitted in this build)
     v.addStretch(0)
     return g
 
@@ -188,7 +234,6 @@ def _logo_group(page: QWidget) -> QWidget:
         try:
             from helpers.intro_data import get_logo_sources
             from helpers.intro_screen import _load_pixmap
-            
             urls = get_logo_sources(theme=None)
             pm = QtGui.QPixmap()
             if urls:
@@ -203,6 +248,74 @@ def _logo_group(page: QWidget) -> QWidget:
     lab.resizeEvent = lambda _e: refresh()
     QTimer.singleShot(0, refresh)
     tm = QTimer(g); tm.setInterval(3500); tm.timeout.connect(refresh); tm.start()  # slideshow in settings preview
+
+    # --- Overlay preview on the Settings logo block ---
+    try:
+        from helpers.overlay_animations import apply_intro_overlay_from_settings, stop_overlay
+    except Exception:
+        apply_intro_overlay_from_settings = None; stop_overlay = None
+
+    def _sync_overlay_preview():
+        try:
+            s = QSettings('FrameVision','FrameVision')
+            en = s.value('intro_overlay_enabled', False, type=bool)
+            prev_ok = s.value('intro_overlay_preview_enabled', True, type=bool)
+            theme = s.value('theme','Auto')
+            st = getattr(lab, "_fv_overlay_state", None)
+            if st is None:
+                st = {"applied": False, "last_en": None, "last_theme": None}
+                setattr(lab, "_fv_overlay_state", st)
+            if not en or not prev_ok:
+                if stop_overlay:
+                    try:
+                        stop_overlay(lab, 0)
+                    except TypeError:
+                        try:
+                            stop_overlay(lab)
+                        except Exception:
+                            pass
+                st["applied"] = False
+                st["last_en"] = en; st["last_theme"] = theme
+                return
+            changed = (st["last_en"] != en) or (st["last_theme"] != theme) or (not st["applied"])
+            if changed and apply_intro_overlay_from_settings:
+                if stop_overlay:
+                    try:
+                        stop_overlay(lab, 0)
+                    except TypeError:
+                        try:
+                            stop_overlay(lab)
+                        except Exception:
+                            pass
+                apply_intro_overlay_from_settings(lab, theme, force_topmost=False)
+                st["applied"] = True; st["last_en"] = en; st["last_theme"] = theme
+                try:
+                    t_prev = getattr(lab, "_fv_overlay_kill", None)
+                    if t_prev is not None:
+                        t_prev.stop(); t_prev.deleteLater()
+                    kill = QtCore.QTimer(lab); kill.setSingleShot(True); kill.setInterval(4000)
+                    def _kill_now():
+                        try:
+                            try:
+                                stop_overlay(lab, 600)
+                            except TypeError:
+                                stop_overlay(lab)
+                        except Exception:
+                            pass
+                        st["applied"] = False
+                    kill.timeout.connect(_kill_now); kill.start()
+                    setattr(lab, "_fv_overlay_kill", kill)
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
+    # Start a lightweight poll timer
+    try:
+        _prev_tm = QTimer(g); _prev_tm.setInterval(1500); _prev_tm.timeout.connect(_sync_overlay_preview); _prev_tm.start()
+    except Exception:
+        pass
+
     return g
 
 # ---- public installer --------------------------------------------------------------------
@@ -233,7 +346,6 @@ def install_settings_tab(main_window: QWidget) -> None:
             lay.addWidget(hr)
         except Exception:
             pass
-        # Optional developer block could be placed here if needed
         lay.addWidget(_logo_group(page))
         lay.addStretch(1)
 

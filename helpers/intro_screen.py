@@ -6,6 +6,15 @@ from urllib.request import urlopen, Request
 from PySide6.QtCore import Qt, QSettings, QTimer, QEventLoop, QRect, QSize
 from PySide6.QtGui import QPixmap
 from PySide6.QtWidgets import QApplication, QSplashScreen, QWidget, QDialog, QVBoxLayout, QLabel, QPushButton, QHBoxLayout
+# --- Boot overlay animation support ---
+try:
+    from .overlay_animations import apply_intro_overlay_from_settings, stop_overlay  # type: ignore
+except Exception:
+    try:
+        from helpers.overlay_animations import apply_intro_overlay_from_settings, stop_overlay  # type: ignore
+    except Exception:
+        apply_intro_overlay_from_settings = None
+        stop_overlay = None
 
 # startup cleanup
 try:
@@ -192,6 +201,13 @@ def show_intro_if_enabled(main_window: QWidget | None = None):
         sz: QSize = sp.pixmap().size(); x = geo.center().x() - sz.width()//2; y = geo.center().y() - sz.height()//2
         sp.move(max(geo.left(), x), max(geo.top(), y))
         sp.show(); QApplication.processEvents()
+        # Start overlay on splash according to settings (safe try)
+        if apply_intro_overlay_from_settings:
+            try:
+                theme_name = (s.value('theme','') or 'Auto')
+                apply_intro_overlay_from_settings(sp, theme_name, force_topmost=False)
+            except Exception:
+                pass
         return sp
     except Exception:
         return None
