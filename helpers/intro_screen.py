@@ -115,7 +115,7 @@ def _show_joke_dialog_modeless(text: str, lifetime_ms:int=2800):
         scr = QApplication.primaryScreen(); geo = scr.availableGeometry() if scr else QRect(0,0,1280,720)
         x = geo.center().x() - dlg.width()//2; y = geo.center().y() - dlg.height()//2
         dlg.move(max(geo.left(), x), max(geo.top(), y))
-        QTimer.singleShot(max(1500, lifetime_ms), dlg.close)
+        # Auto-close disabled: wait for user to click the button to dismiss
         dlg.show()
         return dlg
     except Exception:

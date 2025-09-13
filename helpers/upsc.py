@@ -2276,3 +2276,15 @@ except Exception:
     pass
 # --- end r11 ---
 
+
+# ---- Safe-Scale (modular) ----
+try:
+    from . import safe_scale as _fv_safe_scale
+    if hasattr(_fv_safe_scale, "install"):
+        _fv_safe_scale.install(globals())
+except Exception as _e:
+    try:
+        print("[safe-scale] non-fatal:", _e)
+    except Exception:
+        pass
+# ---- /Safe-Scale (modular) ----
