@@ -1608,8 +1608,8 @@ class QueuePane(QWidget):
         from PySide6.QtCore import QFileSystemWatcher
 
         # Timers (keep internal refresh cadence intact)
-        self.auto_timer = QTimer(self); self.auto_timer.setInterval(2000); self.auto_timer.timeout.connect(self.refresh)
-        self.watch_timer = QTimer(self); self.watch_timer.setInterval(1200); self.watch_timer.timeout.connect(self._watch_tick)
+        self.auto_timer = QTimer(self); self.auto_timer.setInterval(2000); self.auto_timer.timeout.connect(self.request_refresh)
+        self.watch_timer = QTimer(self); self.watch_timer.setInterval(1200); self.watch_timer.timeout.connect(self.request_refresh)
         self.worker_timer = QTimer(self); self.worker_timer.setInterval(1000); self.worker_timer.timeout.connect(self._update_worker_led)
 
         # Queue system and paths
@@ -1655,11 +1655,17 @@ class QueuePane(QWidget):
 
         # Lists (5-row viewport, vertical only)
         self.lst_running = QListWidget(); self._apply_policies(self.lst_running)
+        try:
+            _h3 = 56*3 + 8
+            self.lst_running.setMinimumHeight(_h3)
+            self.lst_running.setMaximumHeight(_h3)
+        except Exception:
+            pass
         self.lst_pending = QListWidget(); self._apply_policies(self.lst_pending)
         self.lst_done = QListWidget(); self._apply_policies(self.lst_done)
         self.lst_failed = QListWidget(); self._apply_policies(self.lst_failed)
 
-        sec_running = ToolsCollapsibleSection("Running", expanded=False)
+        sec_running = ToolsCollapsibleSection("Running", expanded=True)
         lay_sec_running = QVBoxLayout(); lay_sec_running.setContentsMargins(0,0,0,0); lay_sec_running.setSpacing(6)
         lay_sec_running.addWidget(self.lst_running)
         try:
@@ -1742,8 +1748,52 @@ class QueuePane(QWidget):
 
     def _populate(self, folder: Path, widget: QListWidget, status: str):
         from helpers.queue_widgets import JobRowWidget
-        widget.clear()
+        # In-place diff to minimize flicker
+        try:
+            from PySide6.QtCore import Qt
+        except Exception:
+            pass
+        existing_keys = {}
+        try:
+            for i in range(widget.count()):
+                it = widget.item(i)
+                key = it.data(Qt.UserRole) if 'Qt' in globals() else None
+                w = widget.itemWidget(it) if key is None else None
+                if not key and w is not None:
+                    key = getattr(w, 'path', None) or getattr(w, 'job_path', None) or getattr(w, 'json_path', None)
+                if key:
+                    existing_keys[str(key)] = i
+        except Exception:
+            existing_keys = {}
+        # We'll build desired file list below; we'll remove missing keys after we know them
+    
         files = []
+        files_paths = [p for (p, _) in files]
+
+        # Remove items not in the target set to keep list accurate
+        try:
+            from PySide6.QtCore import Qt
+            target = set(str(p) for p in files_paths) if 'files_paths' in locals() else set(str(p) for p, _ in files)
+        except Exception:
+            target = set(str(p) for p, _ in files)
+        try:
+            i = widget.count() - 1
+            while i >= 0:
+                it = widget.item(i)
+                key = None
+                try:
+                    key = it.data(Qt.UserRole)
+                except Exception:
+                    key = None
+                if key is None:
+                    w = widget.itemWidget(it)
+                    key = getattr(w, 'path', None) if w is not None else None
+                if (key is None) or (str(key) not in target):
+                    widget.takeItem(i)
+                i -= 1
+        except Exception:
+            pass
+  # will hold (path, sort_key)
         try:
             for p in folder.glob('*.json'):
                 name = p.name
@@ -1777,8 +1827,31 @@ class QueuePane(QWidget):
                     pass
                 files.append((sort_ts, p))
         except Exception:
-            files = []
+            files = []  # will hold (path, sort_key)
         for _ts, p in sorted(files, key=lambda t_p: t_p[0], reverse=True):
+            # Skip add if item for this path already exists
+            try:
+                from PySide6.QtCore import Qt
+                found = False
+                for _i in range(widget.count()):
+                    _it = widget.item(_i)
+                    _key = _it.data(Qt.UserRole)
+                    if _key is None:
+                        _w = widget.itemWidget(_it)
+                        _key = getattr(_w, 'path', None) if _w is not None else None
+                    if str(_key) == str(p):
+                        found = True; break
+                if found:
+                    # Optionally call a light refresh on existing widget if available
+                    _w = widget.itemWidget(_it)
+                    try:
+                        if hasattr(_w, 'refresh'):
+                            _w.refresh()
+                    except Exception:
+                        pass
+                    continue
+            except Exception:
+                pass
             it = QListWidgetItem("")
             w = JobRowWidget(str(p), status)
             try:
@@ -1791,6 +1864,49 @@ class QueuePane(QWidget):
                 it.setSizeHint(w.sizeHint())
             widget.addItem(it)
             widget.setItemWidget(it, w)
+            try:
+                from PySide6.QtCore import Qt
+                it.setData(Qt.UserRole, str(p))
+            except Exception:
+                pass
+
+    def request_refresh(self):
+
+        try:
+
+            # Debounce/coalesce refresh calls
+
+            if not hasattr(self, '_refresh_coalesce'):
+
+                from PySide6.QtCore import QTimer
+
+                self._refresh_coalesce = QTimer(self)
+
+                self._refresh_coalesce.setSingleShot(True)
+
+                self._refresh_coalesce.setInterval(350)
+
+                self._refresh_coalesce.timeout.connect(self._do_refresh)
+
+            self._refresh_coalesce.start()
+
+        except Exception:
+
+            # Fallback: direct refresh
+
+            self.refresh()
+
+
+    def _do_refresh(self):
+
+        try:
+
+            self.refresh()
+
+        except Exception:
+
+            pass
+
 
     def refresh(self):
         self._populate(JOBS_DIRS['running'], self.lst_running, 'running')

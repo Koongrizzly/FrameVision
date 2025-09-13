@@ -141,6 +141,7 @@ LOGS_DIR = BASE / "logs"
 LOGS_DIR.mkdir(parents=True, exist_ok=True)
 HEARTBEAT = LOGS_DIR / "worker_heartbeat.txt"
 PROGRESS_FILE = None
+RUNNING_JSON_FILE = None
 for p in JOBS.values(): p.mkdir(parents=True, exist_ok=True)
 
 CONFIG_PATH = BASE / "config.json"
@@ -256,22 +257,42 @@ def run(cmd):
 
 
 def _progress_set(pct: int):
+
     try:
-        global PROGRESS_FILE
-        if not PROGRESS_FILE:
-            return
-        p = Path(PROGRESS_FILE)
-        p.parent.mkdir(parents=True, exist_ok=True)
-        tmp = p.with_suffix(p.suffix + ".tmp")
-        data = json.dumps({"pct": int(max(0, min(100, pct)))}, ensure_ascii=False)
-        tmp.write_text(data, encoding="utf-8")
-        try:
-            tmp.replace(p)
-        except Exception:
-            # fallback write directly
-            p.write_text(data, encoding="utf-8")
+        global PROGRESS_FILE, RUNNING_JSON_FILE
+        if PROGRESS_FILE:
+            p = Path(PROGRESS_FILE)
+            p.parent.mkdir(parents=True, exist_ok=True)
+            tmp = p.with_suffix(p.suffix + ".tmp")
+            data = json.dumps({"pct": int(max(0, min(100, pct)))}, ensure_ascii=False)
+            tmp.write_text(data, encoding="utf-8")
+            try:
+                tmp.replace(p)
+            except Exception:
+                # fallback write directly
+                p.write_text(data, encoding="utf-8")
+        # Also patch running job JSON so UI can display determinate %
+        if RUNNING_JSON_FILE and int(pct) >= 0:
+            try:
+                rj = Path(RUNNING_JSON_FILE)
+                if rj.exists():
+                    j = json.loads(rj.read_text(encoding="utf-8"))
+                else:
+                    j = {}
+                ipct = int(max(0, min(100, pct)))
+                if j.get("pct") != ipct:
+                    j["pct"] = ipct
+                    tmpj = rj.with_suffix(rj.suffix + ".tmp")
+                    tmpj.write_text(json.dumps(j, indent=2), encoding="utf-8")
+                    try:
+                        tmpj.replace(rj)
+                    except Exception:
+                        rj.write_text(json.dumps(j, indent=2), encoding="utf-8")
+            except Exception:
+                pass
     except Exception:
         pass
+
 def ffmpeg_path():
     cand = [ROOT/"bin"/("ffmpeg.exe" if os.name=="nt" else "ffmpeg"), ROOT/"presets"/"bin"/("ffmpeg.exe" if os.name=="nt" else "ffmpeg"), "ffmpeg"]
     for c in cand:
@@ -342,6 +363,37 @@ def upscale_video(job, cfg, mani):
             return 1
         # 2) Upscale frames (batch dir-mode for RealESRGAN; per-frame for others)
         up = out_dir / f"{inp.stem}_x{factor}_up"; up.mkdir(parents=True, exist_ok=True)
+        # --- progress heartbeat: monitor upscaled frames ---
+        try:
+            total_frames = len(list(frames.glob("*.png")))
+        except Exception:
+            total_frames = 0
+        # mark after extract
+        try:
+            _progress_set(10)
+        except Exception:
+            pass
+        import threading as _th, time as _time
+        _hb_stop = {"run": True}
+        _hb_state = {"last": -1}
+        def _hb_loop():
+            while _hb_stop.get("run", False):
+                try:
+                    done = len(list(up.glob("*.png")))
+                    if total_frames > 0:
+                        pct = 10.0 + min(85.0, (done / total_frames) * 85.0)
+                        ipct = int(pct)
+                        if ipct != _hb_state["last"]:
+                            _progress_set(ipct)
+                            _hb_state["last"] = ipct
+                except Exception:
+                    pass
+                _time.sleep(1.0)
+        _hb_thr = _th.Thread(target=_hb_loop, daemon=True)
+        try:
+            _hb_thr.start()
+        except Exception:
+            pass
         m = str(model_name).lower()
         if ("realesr" in m) or ("realesrgan" in m):
             cmd = build_realesrgan_cmd(str(exe_path), frames, up, factor, model_name, models_dir=Path(exe_path).parent, is_dir=True)
@@ -358,6 +410,17 @@ def upscale_video(job, cfg, mani):
                 if run(cmd)!=0:
                     return 1
         # 3) Re-encode (preserve input FPS when possible)
+        # stop heartbeat and move to encode stage
+    try:
+        _hb_stop["run"] = False
+        _hb_thr.join(timeout=0.1)
+    except Exception:
+        pass
+    try:
+        _progress_set(90)
+    except Exception:
+        pass
+
         enc = [FFMPEG,"-y","-i",str(up/"%06d.png"),"-c:v","libx264","-preset","veryfast","-pix_fmt","yuv420p","-movflags","+faststart",str(out)]
         if run(enc)!=0:
             return 1
@@ -521,6 +584,8 @@ def handle_job(jpath: Path):
     # progress sidecar path
     try:
         global PROGRESS_FILE
+        global RUNNING_JSON_FILE
+        RUNNING_JSON_FILE = str(running)
         PROGRESS_FILE = str(running.with_suffix(".progress.json"))
     except Exception:
         pass
@@ -886,113 +951,3 @@ def _mark_error(job, msg):
         job['error'] = str(msg)
     except Exception:
         pass
-
-
-
-# === GPU helpers (NCNN Vulkan preferred) ===
-def _bin_exists(p):
-    try:
-        from pathlib import Path as _P
-        return _P(p).exists()
-    except Exception:
-        return False
-
-def _pref_bin(names):
-    for n in names:
-        if _bin_exists(n):
-            return n
-    return None
-
-def _find_realsr_bin():
-    # Prefer NCNN Vulkan variants (portable, GPU). Fallback to CPU/py binaries.
-    candidates = [
-        "bin/realesrgan-ncnn-vulkan.exe",
-        "bin/realsr-ncnn-vulkan.exe",
-        "realesrgan-ncnn-vulkan.exe",
-        "realsr-ncnn-vulkan.exe",
-    ]
-    return _pref_bin(candidates)
-
-def _find_waifu2x_bin():
-    candidates = [
-        "bin/waifu2x-ncnn-vulkan.exe",
-        "waifu2x-ncnn-vulkan.exe",
-    ]
-    return _pref_bin(candidates)
-
-def _gpu_arg_for(binpath):
-    # Map binary to its GPU flag signature.
-    name = (binpath or "").lower()
-    if "realesrgan-ncnn-vulkan" in name or "realsr-ncnn-vulkan" in name or "waifu2x-ncnn-vulkan" in name:
-        return ["-g", "0"]
-    # Unknown -> no GPU flag
-    return []
-
-
-
-def build_realsr_dir_cmd(in_dir, out_dir, model, scale):
-    binp = _find_realsr_bin()
-    if binp is None:
-        # Fallback: indicate CPU or missing
-        raise FileNotFoundError("RealESRGAN/RealSR NCNN Vulkan binary not found.")
-    cmd = [binp, "-i", str(in_dir), "-o", str(out_dir), "-n", str(model), "-s", str(int(scale)), "-f", "png"]
-    cmd += _gpu_arg_for(binp)
-    return cmd
-
-def build_realsr_file_cmd(input_path, output_path, model, scale):
-    binp = _find_realsr_bin()
-    if binp is None:
-        raise FileNotFoundError("RealESRGAN/RealSR NCNN Vulkan binary not found.")
-    cmd = [binp, "-i", str(input_path), "-o", str(output_path), "-n", str(model), "-s", str(int(scale))]
-    cmd += _gpu_arg_for(binp)
-    return cmd
-
-def build_waifu2x_file_cmd(input_path, output_path, model, scale):
-    binp = _find_waifu2x_bin()
-    if binp is None:
-        raise FileNotFoundError("waifu2x-ncnn-vulkan binary not found.")
-    # map common UI model names to waifu2x-ncnn-vulkan flags
-    # model param in waifu2x is '-m' which can be 'models-cunet', 'models-upconv_7', etc.
-    # assume UI passes a short name; try to keep as-is.
-    cmd = [binp, "-i", str(input_path), "-o", str(output_path), "-s", str(int(scale))]
-    if model:
-        cmd += ["-m", str(model)]
-    cmd += _gpu_arg_for(binp)
-    return cmd
-
-
-
-
-def handle_job(job):
-    # GPU-enabled job dispatcher
-    t = str(job.get("type", ""))
-    args = job.get("args", {}) or {}
-    engine = (args.get("engine") or "").lower()
-    model = args.get("model") or job.get("model") or ""
-    scale = int(args.get("factor") or args.get("scale") or 2)
-
-    if t == "upscale_photo":
-        from pathlib import Path
-        inp = Path(job["input"])
-        out_dir = Path(job.get("out_dir") or inp.parent)
-        out_dir.mkdir(parents=True, exist_ok=True)
-        outfile = out_dir / f"{inp.stem}_x{scale}{inp.suffix}"
-        try:
-            if engine == "waifu2x":
-                cmd = build_waifu2x_file_cmd(inp, outfile, model, scale)
-            else:
-                cmd = build_realsr_file_cmd(inp, outfile, model, scale)
-        except FileNotFoundError:
-            # Fallback to the other engine if the preferred one is missing
-            if engine == "waifu2x":
-                cmd = build_realsr_file_cmd(inp, outfile, model, scale)
-            else:
-                cmd = build_waifu2x_file_cmd(inp, outfile, model, scale)
-        return _run(cmd, job)
-
-    if t == "upscale_video":
-        return process_video_job(job)
-
-    raise ValueError(f"Unknown job type: {t}")
-
-    
