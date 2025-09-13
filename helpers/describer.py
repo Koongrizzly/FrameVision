@@ -1177,3 +1177,170 @@ else:
         th.start()
 
     DescriberWidget._refresh_engine_labels = _fv_refresh_with_size_strict  # type: ignore[attr-defined]
+# -------- KB (beta) injection --------
+def _fv_kb_path(self):
+    try:
+        root = find_project_root()
+    except Exception:
+        from pathlib import Path
+        root = Path(".").resolve()
+    return (root / "presets" / "info" / "framevision_knowledge_base.json")
+
+def _fv_kb_load(self):
+    if hasattr(self, "_fv_kb_cache"):
+        return getattr(self, "_fv_kb_cache")
+    p = _fv_kb_path(self)
+    items = []
+    try:
+        if p.exists():
+            import json
+            data = json.loads(p.read_text(encoding="utf-8"))
+            # normalize
+            def _norm_list(lst):
+                out=[]
+                for it in lst:
+                    if isinstance(it, dict):
+                        q = it.get("question") or it.get("q") or it.get("prompt") or it.get("ask")
+                        a = it.get("answer") or it.get("a") or it.get("response")
+                        s = it.get("section") or it.get("title") or it.get("topic") or ""
+                        if q and a:
+                            out.append({"q": str(q), "a": str(a), "section": str(s)})
+                return out
+            if isinstance(data, list):
+                items = _norm_list(data)
+            elif isinstance(data, dict):
+                # try common containers
+                for key in ("items","qa","data","entries"):
+                    if key in data and isinstance(data[key], list):
+                        items = _norm_list(data[key])
+                        break
+                if not items:
+                    # dict mapping questions->answers
+                    for k, v in data.items():
+                        if isinstance(v, str):
+                            items.append({"q": str(k), "a": str(v), "section": ""})
+        else:
+            items = []
+    except Exception as e:
+        try:
+            import traceback; traceback.print_exc()
+        except Exception:
+            pass
+        items = []
+    setattr(self, "_fv_kb_cache", items)
+    return items
+
+_FV_STOPWORDS = set("a an the and or to of for in on with from into up down by is are was were be been being this that these those it its as at your you me my we our can will should could how do i".split())
+
+def _fv_tok(s):
+    try:
+        import re
+        toks = re.findall(r"[a-z0-9]+", (s or "").lower())
+        return [t for t in toks if t and t not in _FV_STOPWORDS]
+    except Exception:
+        return (s or "").lower().split()
+
+def _fv_kb_search(self, query, top_k=3):
+    toks = _fv_tok(query)
+    kb = _fv_kb_load(self)
+    scored = []
+    import difflib
+    for it in kb:
+        text = (it.get("q","") + " " + it.get("a","")).lower()
+        # term overlap
+        overlap = sum(1 for t in set(toks) if t and t in text)
+        # fuzzy match bonus against question
+        fuzz = difflib.SequenceMatcher(None, query.lower(), it.get("q","").lower()).ratio()
+        score = overlap*2 + fuzz
+        scored.append((score, it))
+    scored.sort(key=lambda x: x[0], reverse=True)
+    return [dict(it[1], **{"_score": it[0]}) for it in scored[:max(1, int(top_k))]]
+
+def _fv_kb_format_answer(q, hits):
+    if not hits:
+        return "I couldn't find anything relevant in the knowledge base."
+    best = hits[0]
+    title = best.get("section") or best.get("q","KB")
+    ans = best.get("a","").strip()
+    tail = f"\n\n— Source: {title}"
+    return ans + tail
+
+def _fv_show_info(self, title, text):
+    try:
+        from PySide6.QtWidgets import QMessageBox
+        box = QMessageBox(self)
+        box.setIcon(QMessageBox.Information)
+        box.setWindowTitle(title)
+        box.setText(text if len(text) < 800 else text[:800] + "\n\n(See output for full text)")
+        if len(text) >= 800:
+            box.setDetailedText(text)
+        box.exec()
+    except Exception:
+        try:
+            print("[fv][KB]", title, text[:2000])
+        except Exception:
+            pass
+
+def _fv_kb_ask(self):
+    try:
+        from PySide6.QtWidgets import QInputDialog
+        q, ok = QInputDialog.getText(self, "Ask Knowledge Base (beta)", "What do you need help with?")
+        if not ok or not str(q).strip():
+            return
+        q = str(q).strip()
+        hits = _fv_kb_search(self, q, top_k=3)
+        answer = _fv_kb_format_answer(q, hits)
+        # Write to output if available
+        try:
+            if hasattr(self, "output") and self.output is not None:
+                self.output.appendPlainText(f"[KB]\nQ: {q}\n\n{answer}\n")
+        except Exception:
+            pass
+        _fv_show_info(self, "KB answer", answer)
+    except Exception as e:
+        _fv_show_info(self, "KB error", f"{type(e).__name__}: {e}")
+
+def _fv_add_kb_button(self):
+    try:
+        # find the actions row via existing Describe button
+        act = getattr(self, "btn_describe", None)
+        if act is None:
+            return
+        row = act.parentWidget()
+        if row is None:
+            return
+        lay = row.layout()
+        if lay is None:
+            return
+        if not hasattr(self, "btn_kb_beta"):
+            from PySide6.QtWidgets import QPushButton
+            self.btn_kb_beta = QPushButton("Ask KB (beta)", self)
+            self.btn_kb_beta.setToolTip("Ask the FrameVision knowledge base for help using the app.")
+            try:
+                # Insert after Use current frame
+                lay.addWidget(self.btn_kb_beta)
+            except Exception:
+                pass
+            try:
+                self.btn_kb_beta.clicked.connect(lambda: _fv_kb_ask(self))
+            except Exception:
+                pass
+    except Exception:
+        try:
+            import traceback; traceback.print_exc()
+        except Exception:
+            pass
+
+# Wrap _ensure_ready_async to inject the button once the UI exists
+try:
+    _fv_orig_ensure = DescriberWidget._ensure_ready_async
+    def _fv_wrapped_ensure(self, *a, **kw):
+        try:
+            _fv_add_kb_button(self)
+        except Exception:
+            pass
+        return _fv_orig_ensure(self, *a, **kw)
+    DescriberWidget._ensure_ready_async = _fv_wrapped_ensure  # type: ignore[attr-defined]
+except Exception:
+    pass
+# -------- end KB injection --------

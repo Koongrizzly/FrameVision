@@ -194,6 +194,88 @@ class UpscPane(QtWidgets.QWidget):
 
 
 
+    
+        # === Quick path: use same queue path as single Upscale for each file ===
+    
+        try:
+    
+            enq, where = _fv_find_enqueue(self)
+    
+        except Exception:
+    
+            enq, where = (None, "")
+    
+        if callable(enq):
+    
+            _qq_total = 0
+    
+            _qq_sent = 0
+    
+            for _qq_p in files:
+    
+                try:
+    
+                    _qq_p = Path(_qq_p)
+    
+                except Exception:
+    
+                    continue
+    
+                _qq_total += 1
+    
+                try:
+    
+                    _qq_cmds, _qq_out = self._build_cmds_for_path(_qq_p, outd_override=out_dir_override)
+    
+                except Exception:
+    
+                    _qq_cmds, _qq_out = [], None
+    
+                if not _qq_cmds:
+    
+                    continue
+    
+                try:
+    
+                    _fv_push_input_to_tab(self, _qq_p)
+    
+                except Exception:
+    
+                    try:
+    
+                        if hasattr(self, "edit_input"):
+    
+                            self.edit_input.setText(str(_qq_p))
+    
+                    except Exception:
+    
+                        pass
+    
+                try:
+    
+                    _qq_ok = bool(_fv_call_enqueue(self, enq, where, _qq_cmds, open_on_success=bool(_qq_out)))
+    
+                except Exception:
+    
+                    _qq_ok = False
+    
+                if _qq_ok:
+    
+                    _qq_sent += 1
+    
+            if _qq_sent > 0:
+    
+                try:
+    
+                    self._append_log(f"→ Sent {_qq_sent}/{_qq_total} batch item(s) to the queue via {where} (single-path).")
+    
+                except Exception:
+    
+                    pass
+    
+                return True
+    
+        # === End quick path; fall through to original logic if nothing queued ===
         # Prefer module-level queue_adapter first (strongest signal)
         enq = None
         where = ""

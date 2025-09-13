@@ -1,6 +1,6 @@
 
 # FrameVision worker V1.0 — NCNN wiring
-import json, time, subprocess, os, re
+import json, time, subprocess, os, re, shutil
 from pathlib import Path
 try:
     from PIL import Image
@@ -9,6 +9,23 @@ except Exception:
 
 ROOT = Path(".").resolve()
 BASE = ROOT
+
+def _safe_unlink(p):
+    try:
+        Path(p).unlink(missing_ok=True)
+    except Exception:
+        try:
+            if Path(p).exists():
+                Path(p).unlink()
+        except Exception:
+            pass
+
+def _safe_rmtree(p):
+    try:
+        shutil.rmtree(p, ignore_errors=True)
+    except Exception:
+        pass
+
 
 # ---- Media type helpers ----
 IMAGE_EXTS = {".png",".jpg",".jpeg",".bmp",".webp",".tif",".tiff",".gif"}
@@ -355,98 +372,123 @@ def upscale_video(job, cfg, mani):
     model_name, exe_path = resolve_upscaler_exe(cfg, mani, model_name)
     out = out_dir / f"{inp.stem}_x{factor}.mp4"
 
-    if exe_path and exe_path.exists() and exe_path.is_file():
-        print(f"[worker] Using model '{model_name}' at {exe_path}")
-        # 1) Extract frames
-        frames = out_dir / f"{inp.stem}_x{factor}_frames"; frames.mkdir(parents=True, exist_ok=True)
-        if run([FFMPEG,"-y","-i",str(inp), str(frames/"%06d.png")])!=0:
-            return 1
-        # 2) Upscale frames (batch dir-mode for RealESRGAN; per-frame for others)
-        up = out_dir / f"{inp.stem}_x{factor}_up"; up.mkdir(parents=True, exist_ok=True)
-        # --- progress heartbeat: monitor upscaled frames ---
+    # Prepare potential temp dirs (some may not be used; we'll still try to delete them in finally)
+    frames = out_dir / f"{inp.stem}_x{factor}_frames"
+    up = out_dir / f"{inp.stem}_x{factor}_up"
+    work = out_dir / f"{inp.stem}_x{factor}_work"  # also clean UI-created temp dirs if present
+
+    _hb_thr = None
+    _hb_stop = {"run": False}
+
+    def _stop_hb():
         try:
-            total_frames = len(list(frames.glob("*.png")))
-        except Exception:
-            total_frames = 0
-        # mark after extract
-        try:
-            _progress_set(10)
+            _hb_stop["run"] = False
+            if _hb_thr is not None:
+                _hb_thr.join(timeout=0.2)
         except Exception:
             pass
-        import threading as _th, time as _time
-        _hb_stop = {"run": True}
-        _hb_state = {"last": -1}
-        def _hb_loop():
-            while _hb_stop.get("run", False):
-                try:
-                    done = len(list(up.glob("*.png")))
-                    if total_frames > 0:
-                        pct = 10.0 + min(85.0, (done / total_frames) * 85.0)
-                        ipct = int(pct)
-                        if ipct != _hb_state["last"]:
-                            _progress_set(ipct)
-                            _hb_state["last"] = ipct
-                except Exception:
-                    pass
-                _time.sleep(1.0)
-        _hb_thr = _th.Thread(target=_hb_loop, daemon=True)
-        try:
-            _hb_thr.start()
-        except Exception:
-            pass
-        m = str(model_name).lower()
-        if ("realesr" in m) or ("realesrgan" in m):
-            cmd = build_realesrgan_cmd(str(exe_path), frames, up, factor, model_name, models_dir=Path(exe_path).parent, is_dir=True)
-            if run(cmd)!=0:
+
+    try:
+        if exe_path and exe_path.exists() and exe_path.is_file():
+            print(f"[worker] Using model '{model_name}' at {exe_path}")
+            # 1) Extract frames
+            frames.mkdir(parents=True, exist_ok=True)
+            code = run([FFMPEG,"-y","-i",str(inp), str(frames/"%06d.png")])
+            if code != 0:
                 return 1
-        else:
-            for png in sorted(frames.glob("*.png")):
-                if "swinir" in m:
-                    cmd = build_swinir_cmd(str(exe_path), png, up/png.name, factor)
-                elif "lapsrn" in m:
-                    cmd = build_lapsrn_cmd(str(exe_path), png, up/png.name, factor)
-                else:
-                    cmd = [FFMPEG,"-y","-i",str(png),"-vf",f"scale=iw*{factor}:ih*{factor}:flags=lanczos","-frames:v","1",str(up/png.name)]
+
+            # 2) Upscale frames (batch dir-mode for RealESRGAN; per-frame for others)
+            up.mkdir(parents=True, exist_ok=True)
+            try:
+                total_frames = len(list(frames.glob("*.png")))
+            except Exception:
+                total_frames = 0
+            try:
+                _progress_set(10)
+            except Exception:
+                pass
+
+            import threading as _th, time as _time
+            _hb_stop["run"] = True
+            _hb_state = {"last": -1}
+            def _hb_loop():
+                while _hb_stop.get("run", False):
+                    try:
+                        done = len(list(up.glob("*.png")))
+                        if total_frames > 0:
+                            pct = 10.0 + min(85.0, (done / total_frames) * 85.0)
+                            ipct = int(pct)
+                            if ipct != _hb_state["last"]:
+                                _progress_set(ipct)
+                                _hb_state["last"] = ipct
+                    except Exception:
+                        pass
+                    _time.sleep(1.0)
+            _hb_thr = _th.Thread(target=_hb_loop, daemon=True)
+            try:
+                _hb_thr.start()
+            except Exception:
+                pass
+
+            m = str(model_name).lower()
+            if ("realesr" in m) or ("realesrgan" in m):
+                cmd = build_realesrgan_cmd(str(exe_path), frames, up, factor, model_name, models_dir=Path(exe_path).parent, is_dir=True)
                 if run(cmd)!=0:
                     return 1
-        # 3) Re-encode (preserve input FPS when possible)
-        # stop heartbeat and move to encode stage
-    try:
-        _hb_stop["run"] = False
-        _hb_thr.join(timeout=0.1)
-    except Exception:
-        pass
-    try:
-        _progress_set(90)
-    except Exception:
-        pass
+            else:
+                for png in sorted(frames.glob("*.png")):
+                    if "swinir" in m:
+                        cmd = build_swinir_cmd(str(exe_path), png, up/png.name, factor)
+                    elif "lapsrn" in m:
+                        cmd = build_lapsrn_cmd(str(exe_path), png, up/png.name, factor)
+                    else:
+                        cmd = [FFMPEG,"-y","-i",str(png),"-vf",f"scale=iw*{factor}:ih*{factor}:flags=lanczos","-frames:v","1",str(up/png.name)]
+                    if run(cmd)!=0:
+                        return 1
 
-        enc = [FFMPEG,"-y","-i",str(up/"%06d.png"),"-c:v","libx264","-preset","veryfast","-pix_fmt","yuv420p","-movflags","+faststart",str(out)]
-        if run(enc)!=0:
-            return 1
-        try:
-            _progress_set(100)
-        except Exception:
-            pass
-        try:
-            job['produced'] = str(out)
-        except Exception:
-            pass
-        return 0
-    else:
-        # Fallback: ffmpeg scale (no model)
-        print("[worker] No model exe found, using ffmpeg scale fallback")
-        code = run([FFMPEG,"-y","-i",str(inp),"-vf",f"scale=iw*{factor}:ih*{factor}:flags=lanczos", str(out)])
-        try:
-            _progress_set(100)
-        except Exception:
-            pass
-        if code == 0:
+            # 3) Re-encode
+            _stop_hb()
+            try:
+                _progress_set(90)
+            except Exception:
+                pass
+
+            enc = [FFMPEG,"-y","-i",str(up/"%06d.png"),"-c:v","libx264","-preset","veryfast","-pix_fmt","yuv420p","-movflags","+faststart",str(out)]
+            if run(enc)!=0:
+                return 1
+            try:
+                _progress_set(100)
+            except Exception:
+                pass
             try:
                 job['produced'] = str(out)
             except Exception:
                 pass
-        return code
+            return 0
+        else:
+            # Fallback: ffmpeg scale (no model)
+            print("[worker] No model exe found, using ffmpeg scale fallback")
+            code = run([FFMPEG,"-y","-i",str(inp),"-vf",f"scale=iw*{factor}:ih*{factor}:flags=lanczos", str(out)])
+            try:
+                _progress_set(100)
+            except Exception:
+                pass
+            if code == 0:
+                try:
+                    job['produced'] = str(out)
+                except Exception:
+                    pass
+            return code
+    finally:
+        # Always try to clean temp dirs; ignore errors
+        _stop_hb()
+        for d in (frames, up, work / "in", work / "out", work):
+            try:
+                if d.exists():
+                    _safe_rmtree(d)
+            except Exception:
+                pass
+
 def tools_ffmpeg(job, cfg, mani):
 
     try:
@@ -510,6 +552,7 @@ def upscale_photo(job, cfg, mani):
 
     # Decode-prep still images to a temp RGB PNG to avoid alpha/codec quirks
     src_in = inp
+    tmp_rgb = None
     try:
         ext = inp.suffix.lower()
         if Image is not None and ext in IMAGE_EXTS:
@@ -532,37 +575,55 @@ def upscale_photo(job, cfg, mani):
     except Exception:
         pass
 
-    if exe_path and exe_path.exists() and exe_path.is_file():
-        m = str(model_name).lower()
-        if ("realesr" in m) or ("realesrgan" in m):
-            models_dir_guess = None
-            try:
-                models_dir_guess = Path(exe_path).parent
-            except Exception:
+    try:
+        if exe_path and exe_path.exists() and exe_path.is_file():
+            m = str(model_name).lower()
+            if ("realesr" in m) or ("realesrgan" in m):
                 models_dir_guess = None
+                try:
+                    models_dir_guess = Path(exe_path).parent
+                except Exception:
+                    models_dir_guess = None
+                try:
+                    # If not clearly in a realsr folder, fall back to models/realesrgan under the configured models folder
+                    if not models_dir_guess or all(tag not in str(models_dir_guess).lower() for tag in ("realesr", "realesrgan")):
+                        models_dir_guess = _resolve_models_folder(cfg) / "realesrgan"
+                except Exception:
+                    pass
+                cmd = build_realesrgan_cmd(str(exe_path), src_in, out, factor, model_name, models_dir=models_dir_guess)
+            elif "swinir" in m:
+                cmd = build_swinir_cmd(str(exe_path), src_in, out, factor)
+            elif "lapsrn" in m:
+                cmd = build_lapsrn_cmd(str(exe_path), src_in, out, factor)
+            else:
+                # Unknown model tag, fallback to ffmpeg scaling
+                cmd = [FFMPEG,"-y","-i",str(src_in),"-vf",f"scale=iw*{factor}:ih*{factor}:flags=lanczos","-frames:v","1",str(out)]
+            code = run(cmd)
             try:
-                # If not clearly in a realsr folder, fall back to models/realesrgan under the configured models folder
-                if not models_dir_guess or all(tag not in str(models_dir_guess).lower() for tag in ("realesr", "realesrgan")):
-                    models_dir_guess = _resolve_models_folder(cfg) / "realesrgan"
+                job['cmd'] = ' '.join([str(x) for x in cmd])
             except Exception:
                 pass
-            cmd = build_realesrgan_cmd(str(exe_path), src_in, out, factor, model_name, models_dir=models_dir_guess)
-        elif "swinir" in m:
-            cmd = build_swinir_cmd(str(exe_path), src_in, out, factor)
-        elif "lapsrn" in m:
-            cmd = build_lapsrn_cmd(str(exe_path), src_in, out, factor)
-        else:
-            # Unknown model tag, fallback to ffmpeg scaling
-            cmd = [FFMPEG,"-y","-i",str(src_in),"-vf",f"scale=iw*{factor}:ih*{factor}:flags=lanczos","-frames:v","1",str(out)]
+            if code == 0 and not out.exists():
+                _mark_error(job, 'Upscale finished but output file missing.')
+                return 2
+            return code
+
+        # No model exe -> fallback upscale with ffmpeg
+        cmd = [FFMPEG,"-y","-i",str(src_in),"-vf",f"scale=iw*{factor}:ih*{factor}:flags=lanczos","-frames:v","1",str(out)]
         code = run(cmd)
         try:
-            job['cmd'] = ' '.join([str(x) for x in cmd])
+            job['cmd'] = ' '.join(str(x) for x in cmd)
         except Exception:
             pass
-        if code == 0 and not out.exists():
-            _mark_error(job, 'Upscale finished but output file missing.')
-            return 2
+        if code == 0:
+            try: job['produced'] = str(out)
+            except Exception: pass
         return code
+    finally:
+        # Remove temp RGB probe image if we created one
+        if tmp_rgb:
+            _safe_unlink(tmp_rgb)
+
 
     # No model exe -> fallback upscale with ffmpeg
     cmd = [FFMPEG,"-y","-i",str(src_in),"-vf",f"scale=iw*{factor}:ih*{factor}:flags=lanczos","-frames:v","1",str(out)]
