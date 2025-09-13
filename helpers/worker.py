@@ -1,6 +1,6 @@
 
-# FrameVision worker v0.2.5 — NCNN wiring
-import json, time, subprocess, os
+# FrameVision worker V1.0 — NCNN wiring
+import json, time, subprocess, os, re
 from pathlib import Path
 try:
     from PIL import Image
@@ -282,10 +282,42 @@ def ffmpeg_path():
 
 FFMPEG = ffmpeg_path()
 
-def build_realesrgan_cmd(exe, inp, out, factor, model_name):
-    name_map = {"RealESRGAN-x4plus":"realesrgan-x4plus","RealESR-general-x4v3":"realesr-general-x4v3"}
-    n = name_map.get(model_name, "realesrgan-x4plus"); s = int(factor)
-    return [exe, "-i", str(inp), "-o", str(out), "-s", str(s), "-n", n]
+
+def _normalize_realesr_model(model_name: str, factor: int|float|str):
+    """
+    Accepts names like:
+      - "realesrgan-x4plus", "realesrgan-x4plus-anime"
+      - "realesr-general-x4v3", "realesr-general-wdn-x4v3"
+      - "realesr-animevideov3-x2", "realesr-animevideov3-x3", "realesr-animevideov3-x4"
+    Returns (base_name_without_scale_suffix, scale_int)
+    """
+    try:
+        name = (model_name or "").strip()
+    except Exception:
+        name = ""
+    # Pull trailing -xN if present
+    m = re.search(r"(?i)(.*?)(?:-x(\d+))?$", name)
+    base = (m.group(1) if m else name) or ""
+    scale = int(m.group(2)) if (m and m.group(2)) else int(float(factor or 4))
+    # Canonicalization for some common aliases
+    aliases = {
+        "RealESRGAN-x4plus": "realesrgan-x4plus",
+        "RealESRGAN-anime-x4plus": "realesrgan-x4plus-anime",
+        "RealESR-general-x4v3": "realesr-general-x4v3",
+        "RealESR-general-wdn-x4v3": "realesr-general-wdn-x4v3",
+    }
+    base = aliases.get(base, base).lower()
+    return base, int(scale)
+
+def build_realesrgan_cmd(exe, inp, out, factor, model_name, models_dir=None, is_dir=False):
+    base, s = _normalize_realesr_model(model_name, factor)
+    cmd = [exe, "-i", str(inp), "-o", str(out), "-s", str(int(s)), "-n", base]
+    if models_dir:
+        cmd += ["-m", str(models_dir)]
+    if is_dir:
+        cmd += ["-f", "png"]
+    return cmd
+
 
 def build_swinir_cmd(exe, inp, out, factor):
     s = int(factor); return [exe, "-i", str(inp), "-o", str(out), "-s", str(s)]
@@ -302,68 +334,17 @@ def upscale_video(job, cfg, mani):
     model_name, exe_path = resolve_upscaler_exe(cfg, mani, model_name)
     out = out_dir / f"{inp.stem}_x{factor}.mp4"
 
-    # frames -> per-frame up (with progress) -> encode
     if exe_path and exe_path.exists() and exe_path.is_file():
         print(f"[worker] Using model '{model_name}' at {exe_path}")
         # 1) Extract frames
         frames = out_dir / f"{inp.stem}_x{factor}_frames"; frames.mkdir(parents=True, exist_ok=True)
         if run([FFMPEG,"-y","-i",str(inp), str(frames/"%06d.png")])!=0:
             return 1
-        try:
-            total = len(list(frames.glob("*.png")))
-        except Exception:
-            total = 0
-        # 2) Per-frame upscale
-        up = out_dir / f"{inp.stem}_x{factor}_up"; up.mkdir(parents=True, exist_ok=True)
-        m = str(model_name).lower()
-        done = 0
-        for png in sorted(frames.glob("*.png")):
-            if "realesr" in m:
-                cmd = build_realesrgan_cmd(str(exe_path), png, up/png.name, factor, model_name)
-            elif "swinir" in m:
-                cmd = build_swinir_cmd(str(exe_path), png, up/png.name, factor)
-            elif "lapsrn" in m:
-                cmd = build_lapsrn_cmd(str(exe_path), png, up/png.name, factor)
-            else:
-                cmd = [FFMPEG,"-y","-i",str(png),"-vf",f"scale=iw*{factor}:ih*{factor}:flags=lanczos","-frames:v","1",str(up/png.name)]
-            if run(cmd)!=0:
-                return 1
-            done += 1
-            try:
-                # map frames progress to 5..95%
-                pct = 5 + int(90 * (done / max(1,total)))
-                _progress_set(pct)
-            except Exception:
-                pass
-        # 3) Re-encode
-        enc = [FFMPEG,"-y","-r","30","-i",str(up/"%06d.png"),
-               "-c:v","libx264","-preset","veryfast","-pix_fmt","yuv420p","-movflags","+faststart",str(out)]
-        if run(enc)!=0:
-            return 1
-        try: _progress_set(100)
-        except Exception: pass
-        return 0
-    else:
-        # Fallback: ffmpeg scale (no model)
-        print("[worker] No model exe found, using ffmpeg scale fallback")
-        code = run([FFMPEG,"-y","-i",str(inp),"-vf",f"scale=iw*{factor}:ih*{factor}:flags=lanczos", str(out)])
-        try: _progress_set(100)
-        except Exception: pass
-        return code
-
-
-    # If we have a usable model exe → frames -> up -> encode
-    if exe_path and exe_path.exists() and exe_path.is_file():
-        print(f"[worker] Using model '{model_name}' at {exe_path}")
-        # 1) Extract frames
-        frames = out_dir / f"{inp.stem}_x{factor}_frames"; frames.mkdir(parents=True, exist_ok=True)
-        if run([FFMPEG,"-y","-i",str(inp), str(frames/"%06d.png")])!=0:
-            return 1
-        # 2) Upscale frames (batch for RealESR family)
+        # 2) Upscale frames (batch dir-mode for RealESRGAN; per-frame for others)
         up = out_dir / f"{inp.stem}_x{factor}_up"; up.mkdir(parents=True, exist_ok=True)
         m = str(model_name).lower()
         if ("realesr" in m) or ("realesrgan" in m):
-            cmd = build_realesrgan_cmd(str(exe_path), frames, up, factor, model_name)
+            cmd = build_realesrgan_cmd(str(exe_path), frames, up, factor, model_name, models_dir=Path(exe_path).parent, is_dir=True)
             if run(cmd)!=0:
                 return 1
         else:
@@ -376,20 +357,33 @@ def upscale_video(job, cfg, mani):
                     cmd = [FFMPEG,"-y","-i",str(png),"-vf",f"scale=iw*{factor}:ih*{factor}:flags=lanczos","-frames:v","1",str(up/png.name)]
                 if run(cmd)!=0:
                     return 1
-        # 3) Re-encode
-        enc = [FFMPEG,"-y","-r","30","-i",str(up/"%06d.png"),
-               "-c:v","libx264","-preset","veryfast","-pix_fmt","yuv420p","-movflags","+faststart",str(out)]
+        # 3) Re-encode (preserve input FPS when possible)
+        enc = [FFMPEG,"-y","-i",str(up/"%06d.png"),"-c:v","libx264","-preset","veryfast","-pix_fmt","yuv420p","-movflags","+faststart",str(out)]
         if run(enc)!=0:
             return 1
+        try:
+            _progress_set(100)
+        except Exception:
+            pass
+        try:
+            job['produced'] = str(out)
+        except Exception:
+            pass
         return 0
-
-    # No model exe → direct whole-video scale (fast fallback)
-    print(f"[worker] Falling back to direct scale for {inp} with factor {factor}; model='{model_name}'")
-    cmd = [FFMPEG,"-y","-i",str(inp),
-           "-vf",f"scale=iw*{factor}:ih*{factor}:flags=lanczos",
-           "-c:v","libx264","-preset","veryfast","-pix_fmt","yuv420p","-movflags","+faststart",str(out)]
-    return run(cmd)
-
+    else:
+        # Fallback: ffmpeg scale (no model)
+        print("[worker] No model exe found, using ffmpeg scale fallback")
+        code = run([FFMPEG,"-y","-i",str(inp),"-vf",f"scale=iw*{factor}:ih*{factor}:flags=lanczos", str(out)])
+        try:
+            _progress_set(100)
+        except Exception:
+            pass
+        if code == 0:
+            try:
+                job['produced'] = str(out)
+            except Exception:
+                pass
+        return code
 def tools_ffmpeg(job, cfg, mani):
 
     try:
@@ -447,7 +441,7 @@ def upscale_photo(job, cfg, mani):
     model_name, exe_path = resolve_upscaler_exe(cfg, mani, model_name)
     out = out_dir / f"{inp.stem}_x{factor}.{fmt}"
     try:
-        _progress_set(100)
+        _progress_set(5)
     except Exception:
         pass
 
@@ -478,7 +472,18 @@ def upscale_photo(job, cfg, mani):
     if exe_path and exe_path.exists() and exe_path.is_file():
         m = str(model_name).lower()
         if ("realesr" in m) or ("realesrgan" in m):
-            cmd = build_realesrgan_cmd(str(exe_path), src_in, out, factor, model_name)
+            models_dir_guess = None
+            try:
+                models_dir_guess = Path(exe_path).parent
+            except Exception:
+                models_dir_guess = None
+            try:
+                # If not clearly in a realsr folder, fall back to models/realesrgan under the configured models folder
+                if not models_dir_guess or all(tag not in str(models_dir_guess).lower() for tag in ("realesr", "realesrgan")):
+                    models_dir_guess = _resolve_models_folder(cfg) / "realesrgan"
+            except Exception:
+                pass
+            cmd = build_realesrgan_cmd(str(exe_path), src_in, out, factor, model_name, models_dir=models_dir_guess)
         elif "swinir" in m:
             cmd = build_swinir_cmd(str(exe_path), src_in, out, factor)
         elif "lapsrn" in m:
@@ -491,14 +496,22 @@ def upscale_photo(job, cfg, mani):
             job['cmd'] = ' '.join([str(x) for x in cmd])
         except Exception:
             pass
-        if code == 0 and not out_path.exists():
-            _mark_error(job, 'RIFE finished but output file missing.')
+        if code == 0 and not out.exists():
+            _mark_error(job, 'Upscale finished but output file missing.')
             return 2
         return code
 
     # No model exe -> fallback upscale with ffmpeg
     cmd = [FFMPEG,"-y","-i",str(src_in),"-vf",f"scale=iw*{factor}:ih*{factor}:flags=lanczos","-frames:v","1",str(out)]
-    return run(cmd)
+    code = run(cmd)
+    try:
+        job['cmd'] = ' '.join(str(x) for x in cmd)
+    except Exception:
+        pass
+    if code == 0:
+        try: job['produced'] = str(out)
+        except Exception: pass
+    return code
 
 def handle_job(jpath: Path):
     job = json.loads(jpath.read_text(encoding="utf-8"))
@@ -576,7 +589,7 @@ def handle_job(jpath: Path):
         return 1
 
 def main():
-    print("FrameVision Worker v0.2.5. Watching jobs/pending in", JOBS["pending"])
+    print("FrameVision Worker V1.0. Watching jobs/pending in", JOBS["pending"])
     while True:
         try:
             HEARTBEAT.write_text(time.strftime("%Y-%m-%d %H:%M:%S"), encoding="utf-8")

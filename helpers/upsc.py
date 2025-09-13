@@ -887,8 +887,7 @@ class UpscPane(QtWidgets.QWidget):
                 if cmd and isinstance(cmd, list) and len(cmd) > 1 and cmd[0] == FFMPEG:
                     inject = ["-fflags", "nobuffer", "-probesize", "64k", "-analyzeduration", "0"]
                     # add -threads 1 only if not already specified
-                    if "-threads" not in cmd:
-                        inject += ["-threads", "1"]
+                    # do not force -threads 1 here; leave threading to FFmpeg defaults
                     # rebuild: FFMPEG + inject + rest (excluding the first FFMPEG element)
                     cmd = [cmd[0]] + inject + cmd[1:]
         except Exception:
@@ -1594,7 +1593,7 @@ def _fv_call_enqueue(self, enq, where_label, cmds, open_on_success):
         params = list(sig.parameters.keys())
         if params[:4] == ["input_path", "out_dir", "factor", "model"] or set(("input_path","out_dir","factor","model")).issubset(set(params)):
             try:
-                enq(input_path=input_path, out_dir=out_dir, factor=factor, model=model_name)
+                enq(job_type=('upscale_photo' if str(Path(input_path)).lower().endswith(tuple(_IMAGE_EXTS)) else 'upscale_video'), input_path=input_path, out_dir=out_dir, factor=factor, model=model_name)
                 try:
                     self._append_log(f"Queued via {where_label} (kwargs).")
                 except Exception: pass

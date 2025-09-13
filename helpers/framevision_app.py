@@ -21,7 +21,7 @@ def _open_compare_page():
 
 
 
-# FrameVision v0.2.5 — Full-classic UI + NCNN upscalers + branding
+# FrameVision V1.0 — Full-classic UI + NCNN upscalers + branding
 # Classic layout (big player, control bar, seek slider, fullscreen) + click-to-play/pause
 # Auto Theme (Day/Evening/Night), Session Restore, Instant Tools, Presets, Describe-on-Pause,
 # Queue + Worker, Models Manager, Upscale Video/Photo buttons (queue) wired to NCNN CLIs.
@@ -109,8 +109,7 @@ from helpers.interp import InterpPane
 import psutil
 
 APP_NAME = "FrameVision"
-TAGLINE  = "AI Photo & Video Upscaler"
-
+TAGLINE  = "All-in-one Video & Photo Upscaler/Editor"
 ROOT = Path(".").resolve()
 
 
@@ -2060,7 +2059,7 @@ class MainWindow(QMainWindow):
 
     def __init__(self):
         super().__init__()
-        self.setWindowTitle(APP_NAME + " v0.2.5 — " + TAGLINE)
+        self.setWindowTitle(APP_NAME + " V1.0 " + TAGLINE)
         self.resize(1280, 800)
         self.setMinimumSize(900, 580)
         self.current_path = None

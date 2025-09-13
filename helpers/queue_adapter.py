@@ -132,4 +132,38 @@ def enqueue_txt2img_qwen(job_args: dict):
     except Exception as e:
         print("[queue] enqueue_txt2img_qwen failed:", e)
         return False
+
+
+# --- FrameVision: queue helpers for Upsc & external commands ---
+
+def _is_video_path(p: str) -> bool:
+    try:
+        ext = str(p).lower().rsplit('.', 1)[-1]
+    except Exception:
+        return False
+    return ('.' + ext) in {".mp4", ".mov", ".mkv", ".avi", ".webm", ".m4v"}
+
+def enqueue_job(input_path: str, out_dir: str, factor: int, model: str):
+    """Convenience wrapper so callers can enqueue without knowing job_type."""
+    is_video = _is_video_path(input_path)
+    if not out_dir:
+        out_dir = default_outdir(is_video, 'upscale')
+    jt = 'upscale_video' if is_video else 'upscale_photo'
+    return enqueue(jt, input_path, out_dir, factor, model, fmt='png')
+
+# Back-compat aliases so generic code finds us
+def add_job(input_path: str, out_dir: str, factor: int, model: str):
+    return enqueue_job(input_path, out_dir, factor, model)
+
+def enqueue_external(job: dict):
+    """Enqueue a single external command job via tools_ffmpeg.
+    Expects job like { 'cmd': [...], 'out_dir': optional }.
+    """
+    import os as _os
+    out_dir = job.get('out_dir') or default_outdir(False, 'tools')
+    args = {'cmd': job.get('cmd')}
+    if not args['cmd']:
+        raise RuntimeError('enqueue_external: missing job["cmd"]')
+    # input_path not required for tools job
+    return enqueue_tool_job('tools_ffmpeg', '', out_dir, args, priority=550)
 # <<< FRAMEVISION_QWEN_END
