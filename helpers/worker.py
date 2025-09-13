@@ -886,3 +886,113 @@ def _mark_error(job, msg):
         job['error'] = str(msg)
     except Exception:
         pass
+
+
+
+# === GPU helpers (NCNN Vulkan preferred) ===
+def _bin_exists(p):
+    try:
+        from pathlib import Path as _P
+        return _P(p).exists()
+    except Exception:
+        return False
+
+def _pref_bin(names):
+    for n in names:
+        if _bin_exists(n):
+            return n
+    return None
+
+def _find_realsr_bin():
+    # Prefer NCNN Vulkan variants (portable, GPU). Fallback to CPU/py binaries.
+    candidates = [
+        "bin/realesrgan-ncnn-vulkan.exe",
+        "bin/realsr-ncnn-vulkan.exe",
+        "realesrgan-ncnn-vulkan.exe",
+        "realsr-ncnn-vulkan.exe",
+    ]
+    return _pref_bin(candidates)
+
+def _find_waifu2x_bin():
+    candidates = [
+        "bin/waifu2x-ncnn-vulkan.exe",
+        "waifu2x-ncnn-vulkan.exe",
+    ]
+    return _pref_bin(candidates)
+
+def _gpu_arg_for(binpath):
+    # Map binary to its GPU flag signature.
+    name = (binpath or "").lower()
+    if "realesrgan-ncnn-vulkan" in name or "realsr-ncnn-vulkan" in name or "waifu2x-ncnn-vulkan" in name:
+        return ["-g", "0"]
+    # Unknown -> no GPU flag
+    return []
+
+
+
+def build_realsr_dir_cmd(in_dir, out_dir, model, scale):
+    binp = _find_realsr_bin()
+    if binp is None:
+        # Fallback: indicate CPU or missing
+        raise FileNotFoundError("RealESRGAN/RealSR NCNN Vulkan binary not found.")
+    cmd = [binp, "-i", str(in_dir), "-o", str(out_dir), "-n", str(model), "-s", str(int(scale)), "-f", "png"]
+    cmd += _gpu_arg_for(binp)
+    return cmd
+
+def build_realsr_file_cmd(input_path, output_path, model, scale):
+    binp = _find_realsr_bin()
+    if binp is None:
+        raise FileNotFoundError("RealESRGAN/RealSR NCNN Vulkan binary not found.")
+    cmd = [binp, "-i", str(input_path), "-o", str(output_path), "-n", str(model), "-s", str(int(scale))]
+    cmd += _gpu_arg_for(binp)
+    return cmd
+
+def build_waifu2x_file_cmd(input_path, output_path, model, scale):
+    binp = _find_waifu2x_bin()
+    if binp is None:
+        raise FileNotFoundError("waifu2x-ncnn-vulkan binary not found.")
+    # map common UI model names to waifu2x-ncnn-vulkan flags
+    # model param in waifu2x is '-m' which can be 'models-cunet', 'models-upconv_7', etc.
+    # assume UI passes a short name; try to keep as-is.
+    cmd = [binp, "-i", str(input_path), "-o", str(output_path), "-s", str(int(scale))]
+    if model:
+        cmd += ["-m", str(model)]
+    cmd += _gpu_arg_for(binp)
+    return cmd
+
+
+
+
+def handle_job(job):
+    # GPU-enabled job dispatcher
+    t = str(job.get("type", ""))
+    args = job.get("args", {}) or {}
+    engine = (args.get("engine") or "").lower()
+    model = args.get("model") or job.get("model") or ""
+    scale = int(args.get("factor") or args.get("scale") or 2)
+
+    if t == "upscale_photo":
+        from pathlib import Path
+        inp = Path(job["input"])
+        out_dir = Path(job.get("out_dir") or inp.parent)
+        out_dir.mkdir(parents=True, exist_ok=True)
+        outfile = out_dir / f"{inp.stem}_x{scale}{inp.suffix}"
+        try:
+            if engine == "waifu2x":
+                cmd = build_waifu2x_file_cmd(inp, outfile, model, scale)
+            else:
+                cmd = build_realsr_file_cmd(inp, outfile, model, scale)
+        except FileNotFoundError:
+            # Fallback to the other engine if the preferred one is missing
+            if engine == "waifu2x":
+                cmd = build_realsr_file_cmd(inp, outfile, model, scale)
+            else:
+                cmd = build_waifu2x_file_cmd(inp, outfile, model, scale)
+        return _run(cmd, job)
+
+    if t == "upscale_video":
+        return process_video_job(job)
+
+    raise ValueError(f"Unknown job type: {t}")
+
+    

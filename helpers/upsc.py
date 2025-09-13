@@ -151,6 +151,359 @@ class _RunThread(QtCore.QThread):
 
 
 class UpscPane(QtWidgets.QWidget):
+
+
+    def _confirm_batch_outdir(self, files, proposed_outdir: Path):
+        """
+        Show a modal confirming how many files will be added and to which output folder.
+        Lets the user: Ok (proceed), Change folder (pick a different folder), or Cancel.
+        Returns a Path for the chosen outdir, or None if canceled.
+        """
+        outdir = Path(proposed_outdir) if proposed_outdir else Path.home()
+        while True:
+            try:
+                count = len(files)
+            except Exception:
+                count = 0
+            msg = QtWidgets.QMessageBox(self)
+            msg.setWindowTitle("Add to queue")
+            msg.setIcon(QtWidgets.QMessageBox.Question)
+            msg.setText(f"Adding {count} files to the queue,\noutput folder: '{str(outdir)}'")
+            ok_btn = msg.addButton(QtWidgets.QMessageBox.Ok)
+            change_btn = msg.addButton("Change folder", QtWidgets.QMessageBox.ActionRole)
+            cancel_btn = msg.addButton(QtWidgets.QMessageBox.Cancel)
+            msg.exec_()
+            clicked = msg.clickedButton()
+            if clicked == ok_btn:
+                # Reflect into UI for consistency
+                try:
+                    self.edit_outdir.setText(str(outdir))
+                except Exception:
+                    pass
+                return outdir
+            if clicked == cancel_btn:
+                return None
+            if clicked == change_btn:
+                new_dir = QtWidgets.QFileDialog.getExistingDirectory(self, "Choose output folder", str(outdir))
+                if new_dir:
+                    outdir = Path(new_dir)
+                # Loop to reconfirm
+                continue
+    
+    def _enqueue_or_sequential(self, files, out_dir_override: Path = None):
+
+
+
+        # Prefer module-level queue_adapter first (strongest signal)
+        enq = None
+        where = ""
+        try:
+            import helpers.queue_adapter as _qa  # type: ignore
+            for _name in ("enqueue", "add", "put", "add_job"):
+                _fn = getattr(_qa, _name, None)
+                if callable(_fn):
+                    enq, where = _fn, f"helpers.queue_adapter.{_name}"
+                    break
+        except Exception:
+            enq = None
+            where = ""
+        if enq is None:
+            # Fall back to discovering on self.main/_main
+            try:
+                enq, where = _fv_find_enqueue(self)
+            except Exception:
+                enq, where = (None, "")
+        """
+        Enqueue all supported files to the worker queue (GPU preferred). If no queue is available,
+        run locally in a single sequential run to avoid multi-EXE spawns.
+        For videos we pass full encode settings so the worker can extract→upscale→encode.
+        If out_dir_override is provided, use it for all items.
+        """
+        # Read UI context
+        try:
+            eng_label = self.combo_engine.currentText()
+        except Exception:
+            eng_label = ""
+        engine_key = "waifu2x" if (isinstance(eng_label, str) and "Waifu2x" in eng_label) else "realsr"
+
+        try:
+            factor = int(round(float(self.spin_scale.value())))
+        except Exception:
+            factor = 2
+        factor = max(1, min(4, factor))
+
+        # Output dir base
+        try:
+            out_ui = (self.edit_outdir.text() or "").strip()
+        except Exception:
+            out_ui = ""
+
+        # Gather encode/audio/filter options for videos
+        try:
+            vcodec = self.combo_vcodec.currentText()
+        except Exception:
+            vcodec = "libx264"
+        try:
+            preset = self.combo_preset.currentText()
+        except Exception:
+            preset = ""
+        try:
+            use_crf = self.rad_crf.isChecked()
+        except Exception:
+            use_crf = True
+        try:
+            crf_val = int(self.spin_crf.value())
+        except Exception:
+            crf_val = 18
+        try:
+            bitrate_k = int(self.spin_bitrate.value())
+        except Exception:
+            bitrate_k = 8000
+        try:
+            keyint = int(self.spin_keyint.value() or 0)
+        except Exception:
+            keyint = 0
+        # Audio
+        try:
+            if self.radio_a_mute.isChecked():
+                audio_mode = "mute"
+            elif self.radio_a_copy.isChecked():
+                audio_mode = "copy"
+            else:
+                audio_mode = "encode"
+        except Exception:
+            audio_mode = "copy"
+        try:
+            acodec = self.combo_acodec.currentText()
+        except Exception:
+            acodec = "aac"
+        try:
+            abitrate_k = int(self.spin_abitrate.value())
+        except Exception:
+            abitrate_k = 192
+        # Filters
+        try:
+            pre_filters = self._build_pre_filters()
+        except Exception:
+            pre_filters = ""
+        try:
+            post_filters = self._build_post_filters()
+        except Exception:
+            post_filters = ""
+
+        # Models
+        try:
+            model_img = self.combo_model_w2x.currentText() if engine_key == "waifu2x" else self.combo_model_realsr.currentText()
+        except Exception:
+            model_img = ""
+
+        queued = 0
+        enqueued_any = False
+
+        if callable(enq):
+            for p in files:
+                try:
+                    is_video = p.suffix.lower() in _VIDEO_EXTS
+                    # Out dir: override > UI > default type-based
+                    if out_dir_override:
+                        out_dir = Path(out_dir_override)
+                    else:
+                        out_dir = Path(out_ui) if out_ui else (OUT_VIDEOS if is_video else OUT_SHOTS)
+
+                    if is_video:
+                        # For videos force engine to 'realsr' (dir mode); waifu2x dir is uncommon
+                        model_vid = self.combo_model_realsr.currentText() if hasattr(self, "combo_model_realsr") else ""
+                        args = {
+                            "engine": "realsr",
+                            "factor": int(factor),
+                            "model": str(model_vid),
+                            "vcodec": str(vcodec),
+                            "preset": str(preset),
+                            "mode": "crf" if use_crf else "bitrate",
+                            "crf": int(crf_val),
+                            "bitrate_k": int(bitrate_k),
+                            "keyint": int(keyint),
+                            "audio_mode": str(audio_mode),
+                            "acodec": str(acodec),
+                            "abitrate_k": int(abitrate_k),
+                            "pre_filters": str(pre_filters or ""),
+                            "post_filters": str(post_filters or ""),
+                        }
+                        # Try kwargs signature
+                        try:
+                            enq(job_type="upscale_video", input_path=str(p), out_dir=str(out_dir), **args)
+                            queued += 1
+                            enqueued_any = True
+                            try:
+                                self._append_log(f"Queued VIDEO: {p.name} → {out_dir}  (via {where})")
+                            except Exception:
+                                pass
+                            continue
+                        except TypeError:
+                            try:
+                                job = {"type": "upscale_video", "input": str(p), "out_dir": str(out_dir), "args": args}
+                                enq(job)
+                                queued += 1
+                                enqueued_any = True
+                                try:
+                                    self._append_log(f"Queued VIDEO: {p.name} → {out_dir}  (via {where} [job])")
+                                except Exception:
+                                    pass
+                                continue
+                            except Exception:
+                                pass
+                    else:
+                        # Image
+                        args = {"engine": engine_key, "factor": int(factor), "model": str(model_img)}
+                        try:
+                            enq(job_type="upscale_photo", input_path=str(p), out_dir=str(out_dir), **args)
+                            queued += 1
+                            enqueued_any = True
+                            try:
+                                self._append_log(f"Queued: {p.name} → {out_dir}  (engine={engine_key}, via {where})")
+                            except Exception:
+                                pass
+                            continue
+                        except TypeError:
+                            try:
+                                job = {"type": "upscale_photo", "input": str(p), "out_dir": str(out_dir), "args": args}
+                                enq(job)
+                                queued += 1
+                                enqueued_any = True
+                                try:
+                                    self._append_log(f"Queued: {p.name} → {out_dir}  (engine={engine_key}, via {where} [job])")
+                                except Exception:
+                                    pass
+                                continue
+                            except Exception:
+                                pass
+                except Exception:
+                    pass
+
+            if queued > 0:
+                try:
+                    self._append_log(f"→ Sent {queued} item(s) to the queue. Open the Queue tab to run with GPU.")
+                except Exception:
+                    pass
+            if enqueued_any:
+                return True  # handled by queue
+
+        if not callable(enq):
+            try:
+                self._append_log("No queue detected — running locally (sequential).")
+            except Exception:
+                pass
+
+        # ---- Fallback: local sequential run if no queue available ----
+        all_cmds = []
+        last_out = None
+        for p in files:
+            try:
+                cmds, outp = self._build_cmds_for_path(p, outd_override=out_dir_override)
+                if cmds:
+                    all_cmds.extend(cmds)
+                    last_out = outp or last_out
+            except Exception:
+                continue
+        if all_cmds:
+            self._last_outfile = last_out
+            self._run_cmd(all_cmds, open_on_success=bool(last_out))
+            return True
+
+        return False
+    def _build_cmds_for_path(self, src: Path, outd_override: Path = None):
+        """
+        Build the command list (1+ commands) for a single input path without executing.
+        Returns (cmds, last_output_path).
+        """
+        ext = src.suffix.lower()
+        is_video = ext in _VIDEO_EXTS
+        is_image = ext in _IMAGE_EXTS
+
+        engine_label = self.combo_engine.currentText()
+        engine_exe = self.combo_engine.currentData()
+        if (not engine_exe) or (not _exists(engine_exe)):
+            try:
+                self._append_log(f"✖ Engine missing: {engine_exe}")
+            except Exception:
+                pass
+            return [], None
+
+        scale = int(round(float(self.spin_scale.value())))
+        scale = max(1, min(4, scale))
+        # Outdir override > UI > per-type default
+        if outd_override:
+            outd = Path(outd_override)
+        else:
+            ui_txt = ""
+            try:
+                ui_txt = (self.edit_outdir.text() or "").strip()
+            except Exception:
+                pass
+            outd = Path(ui_txt) if ui_txt else (OUT_VIDEOS if is_video else OUT_SHOTS)
+
+        outfile = self._build_outfile(src, outd, scale)
+
+        # Video pipeline -> 3 commands
+        if is_video:
+            if "Waifu2x" in engine_label:
+                try:
+                    self._append_log("Waifu2x selected for a video — blocked (images only).")
+                except Exception:
+                    pass
+                return [], None
+
+            model = self.combo_model_realsr.currentText()
+            fps = _parse_fps(src) or "30"
+            work = outd / f"{src.stem}_x{scale}_work"
+            in_dir = work / "in"
+            out_dir = work / "out"
+            in_dir.mkdir(parents=True, exist_ok=True)
+            out_dir.mkdir(parents=True, exist_ok=True)
+            seq_in = in_dir / "f_%08d.png"
+            seq_out = out_dir / "f_%08d.png"
+
+            pre = self._build_pre_filters()
+            cmd_extract = [FFMPEG, "-hide_banner", "-loglevel", "warning", "-y", "-i", str(src), "-map", "0:v:0"]
+            if pre: cmd_extract += ["-vf", pre]
+            cmd_extract += ["-fps_mode", "vfr", str(seq_in)]
+            cmd_upscale = self._realsr_cmd_dir(engine_exe, in_dir, out_dir, model, scale)
+            post = self._build_post_filters()
+            cmd_encode = [FFMPEG, "-hide_banner", "-loglevel", "warning", "-y", "-framerate", fps, "-i", str(seq_out), "-i", str(src), "-map", "0:v:0"]
+            if self.radio_a_mute.isChecked():
+                pass
+            else:
+                cmd_encode += ["-map", "1:a?"]
+            vcodec = self.combo_vcodec.currentText()
+            cmd_encode += ["-c:v", vcodec, "-pix_fmt", "yuv420p"]
+            if self.rad_crf.isChecked():
+                cmd_encode += ["-crf", str(self.spin_crf.value())]
+            else:
+                cmd_encode += ["-b:v", f"{self.spin_bitrate.value()}k"]
+            preset = self.combo_preset.currentText()
+            if preset:
+                cmd_encode += ["-preset", preset]
+            if int(self.spin_keyint.value() or 0) > 0:
+                cmd_encode += ["-g", str(int(self.spin_keyint.value()))]
+            if post:
+                cmd_encode += ["-vf", post]
+            if self.radio_a_mute.isChecked():
+                cmd_encode += ["-an"]
+            elif self.radio_a_copy.isChecked():
+                cmd_encode += ["-c:a", "copy"]
+            else:
+                cmd_encode += ["-c:a", self.combo_acodec.currentText(), "-b:a", f"{self.spin_abitrate.value()}k"]
+            cmd_encode += ["-shortest", str(outfile)]
+            return [cmd_extract, cmd_upscale, cmd_encode], outfile
+
+        # Image -> 1 command
+        if "Waifu2x" in engine_label:
+            model = self.combo_model_w2x.currentText()
+            cmd = self._waifu_cmd_file(engine_exe, src, outfile, model, scale)
+        else:
+            model = self.combo_model_realsr.currentText()
+            cmd = self._realsr_cmd_file(engine_exe, src, outfile, model, scale)
+        return [cmd], outfile
     def __init__(self, parent=None):
         super().__init__(parent)
         self._engines = detect_engines()
@@ -180,12 +533,6 @@ class UpscPane(QtWidgets.QWidget):
         self.chk_remember = QtWidgets.QCheckBox("Remember settings", self)
         self.chk_remember.setToolTip("When ON, your Upscaler settings and section positions are saved and restored.")
         prefs_grid.addWidget(self.chk_remember, 0, 0, 1, 2)
-
-        lbl_max = QtWidgets.QLabel("Max at once:", self)
-        self.spin_batch_max = QtWidgets.QSpinBox(self); self.spin_batch_max.setRange(1, 9); self.spin_batch_max.setValue(5)
-        self.spin_batch_max.setToolTip("Limit how many items are processed per Batch run.")
-        prefs_grid.addWidget(lbl_max, 1, 0)
-        prefs_grid.addWidget(self.spin_batch_max, 1, 1)
 
         self.chk_video_thumbs = QtWidgets.QCheckBox("Video thumbnails (heavier)", self)
         self.chk_video_thumbs.setChecked(False)
@@ -382,8 +729,13 @@ class UpscPane(QtWidgets.QWidget):
 
         self.log = QtWidgets.QPlainTextEdit(self)
         self.log.setReadOnly(True)
-        self.log.setFixedHeight(180)
-        self.log.setMaximumBlockCount(500)
+        self.log.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+        try:
+            fm = self.log.fontMetrics()
+            self.log.setFixedHeight(int(fm.height() * 6.5))  # ~5 lines visible
+        except Exception:
+            self.log.setFixedHeight(100)
+        self.log.setMaximumBlockCount(1000)
         v.addWidget(self.log)
 
         # ----- Fixed bottom action bar (does not scroll) -----
@@ -518,6 +870,8 @@ class UpscPane(QtWidgets.QWidget):
 
         # Standard widgets
         pairs = [
+            ("chk_streaming_lowmem", "toggled"),
+            ("chk_video_thumbs", "toggled"),
             ("chk_remember", "toggled"),
             ("spin_scale", "valueChanged"),
             ("slider_scale", "valueChanged"),
@@ -547,8 +901,7 @@ class UpscPane(QtWidgets.QWidget):
             ("chk_denoise", "toggled"),
             ("chk_deband", "toggled"),
             ("sld_sharpen", "valueChanged"),
-            ("spin_batch_max", "valueChanged"),
-        ]
+                    ]
 
         connected = 0
         for name, sig_name in pairs:
@@ -564,7 +917,7 @@ class UpscPane(QtWidgets.QWidget):
                 connected += 1
 
         try:
-            self._append_log(f"[settings] Auto-save wired to {connected} UI change signal(s).")
+            self._append_log(f"[settings] Auto-save wired to {connected} UI change signal(s) + 2 path pickers = {connected + 2} total triggers.")
         except Exception:
             pass
 
@@ -671,8 +1024,6 @@ class UpscPane(QtWidgets.QWidget):
         except Exception:
             d["sections"]["recents"] = True
         # Batch / gallery options
-        try: d["batch_max"] = int(self.spin_batch_max.value())
-        except Exception: pass
         try: d["video_thumbs"] = bool(self.chk_video_thumbs.isChecked())
         except Exception: d["video_thumbs"] = False
         try: d["streaming_lowmem"] = bool(self.chk_streaming_lowmem.isChecked())
@@ -794,11 +1145,6 @@ class UpscPane(QtWidgets.QWidget):
         except Exception:
             pass
         try:
-            bm = int(d.get("batch_max", 5))
-            self.spin_batch_max.setValue(bm)
-        except Exception:
-            pass
-        try:
             self.chk_video_thumbs.setChecked(bool(d.get("video_thumbs", False)))
         except Exception:
             pass
@@ -866,19 +1212,8 @@ class UpscPane(QtWidgets.QWidget):
                 pass
 
     def _update_batch_limit(self):
-        try:
-            sc = int(round(float(self.spin_scale.value())))
-        except Exception:
-            sc = 2
-        maxv = 9 if sc <= 2 else 5
-        try:
-            self.spin_batch_max.setMaximum(maxv)
-            if self.spin_batch_max.value() > maxv:
-                self.spin_batch_max.setValue(maxv)
-            # Visual cue
-            self.spin_batch_max.setSuffix(f"  (max {maxv})")
-        except Exception:
-            pass
+        """Batch limit control removed; keeping method as no-op for compatibility."""
+        return
 
     def _apply_streaming_lowmem(self, cmd: list) -> list:
         """Inject low-memory streaming flags into FFmpeg commands when the toggle is ON."""
@@ -887,7 +1222,8 @@ class UpscPane(QtWidgets.QWidget):
                 if cmd and isinstance(cmd, list) and len(cmd) > 1 and cmd[0] == FFMPEG:
                     inject = ["-fflags", "nobuffer", "-probesize", "64k", "-analyzeduration", "0"]
                     # add -threads 1 only if not already specified
-                    # do not force -threads 1 here; leave threading to FFmpeg defaults
+                    if "-threads" not in cmd:
+                        inject += ["-threads", "1"]
                     # rebuild: FFMPEG + inject + rest (excluding the first FFMPEG element)
                     cmd = [cmd[0]] + inject + cmd[1:]
         except Exception:
@@ -1060,28 +1396,40 @@ class UpscPane(QtWidgets.QWidget):
         if not files:
             QtWidgets.QMessageBox.information(self, "No media", "That folder has no supported images or videos.")
             return
-        # Enforce batch max-at-once
+        # Propose current UI outdir (or default by content)
         try:
-            max_n = int(self.spin_batch_max.value())
+            out_ui = (self.edit_outdir.text() or "").strip()
         except Exception:
-            max_n = 5
-        if len(files) > max_n:
-            self._append_log(f"Batch limited to first {max_n} items (of {len(files)}) by Max-at-once setting.")
-            files = files[:max_n]
-        for p in files:
-            self._run_one(p)
+            out_ui = ""
+        if out_ui:
+            proposed = Path(out_ui)
+        else:
+            has_video = any(p.suffix.lower() in _VIDEO_EXTS for p in files)
+            proposed = OUT_VIDEOS if has_video else OUT_SHOTS
+        chosen = self._confirm_batch_outdir(files, proposed)
+        if chosen is None:
+            return  # canceled
+        self._enqueue_or_sequential(files, out_dir_override=chosen)
 
     def _run_batch_files(self, files: List[Path]):
-        # Enforce batch max-at-once
+        files = [p for p in files if p and p.exists() and p.suffix.lower() in (_IMAGE_EXTS | _VIDEO_EXTS)]
+        if not files:
+            QtWidgets.QMessageBox.information(self, "No media", "No supported images or videos were selected.")
+            return
+        # Propose current UI outdir (or default by content)
         try:
-            max_n = int(self.spin_batch_max.value())
+            out_ui = (self.edit_outdir.text() or "").strip()
         except Exception:
-            max_n = 5
-        if len(files) > max_n:
-            self._append_log(f"Batch limited to first {max_n} items (of {len(files)}) by Max-at-once setting.")
-            files = files[:max_n]
-        for p in files:
-            self._run_one(p)
+            out_ui = ""
+        if out_ui:
+            proposed = Path(out_ui)
+        else:
+            has_video = any(p.suffix.lower() in _VIDEO_EXTS for p in files)
+            proposed = OUT_VIDEOS if has_video else OUT_SHOTS
+        chosen = self._confirm_batch_outdir(files, proposed)
+        if chosen is None:
+            return  # canceled
+        self._enqueue_or_sequential(files, out_dir_override=chosen)
 
     def _build_outfile(self, src: Path, outd: Path, scale: int) -> Path:
         outd.mkdir(parents=True, exist_ok=True)
