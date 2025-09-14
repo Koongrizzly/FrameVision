@@ -1,8 +1,24 @@
-# GPU requirements for describer/LLM/VL stack (no torch here; installed earlier by Option 4)
-transformers>=4.51.3,<5
-accelerate==0.33.0
-safetensors==0.4.4
-sentencepiece==0.2.0
-einops==0.8.0
-# Optional / if used elsewhere
-bitsandbytes==0.43.3 ; platform_system != "Windows"
+# FrameVision — CUDA (GPU) requirements for SDXL + Describer (Vision) — clean, compatible pins
+# Torch/TorchVision/Torchaudio are installed separately with CUDA wheels. Do NOT add them here.
+
+# Core inference stack
+diffusers==0.30.0
+transformers>=4.56.1,<5
+tokenizers>=0.22,<0.24
+accelerate>=0.33.0,<1.0
+safetensors>=0.4.4
+
+# HF + utilities
+huggingface_hub>=0.23,<0.35
+pillow==10.4.0
+tqdm>=4.66.4
+pyyaml>=6.0.1
+numpy>=1.26,<2.0
+# Optional but helpful for some loaders
+sentencepiece>=0.2.0; platform_system != "Windows"  # (Windows often skips; keep optional)
+protobuf>=4.25.3
+
+# NOTE:
+# - transformers 4.56.x pairs with tokenizers 0.22–0.23.x
+# - pillow 11.x can be fine, but 10.4.0 is broadly compatible with py3.10/3.11 + many wheels
+# - adjust pins here (not inline in the .bat) to avoid batch escaping issues
