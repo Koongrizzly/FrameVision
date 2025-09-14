@@ -27,8 +27,8 @@ start.bat
 ### Installer Menu Options
 - **Sytem check:** check diskspace, Cpu/Gpu, basic system info, python, creates venv etc and gives advice on what to use in the installer
 - **Core Install:** App only (minimal).
-- **Full CPU Install:** Torch CPU + models/binaries.
-- **Full CUDA Install:** Torch CUDA + models/binaries.
+- **Full CPU Install:** Torch CPU + models/binaries.+ option for SD15 txt2img
+- **Full CUDA Install:** Torch CUDA + models/binaries.option for SDXL txt2img
   
 ---
 
@@ -105,8 +105,8 @@ Both updaters:
 - **Right:** Modular tabs:
   - Multi model Upscaler
   - RIFE interpollator
-  - Describer/prompt creator
-  - TXT2IMG (work in progress, offline)
+  - Describer
+  - TXT2IMG 
   - Multi-Tools
   - Advanced Queue 
   - Settings
@@ -163,24 +163,30 @@ Both updaters:
 
 ---
 
-### 🖌️ TXT → IMG (Qwen)
-WORK IN PROGRESS CURRENTLY OFFLINE
+### 🖌️ TXT → IMG (SD15+SDXL)
+WORK IN PROGRESS CURRENTLY IN BETA
 - no cloud required.
 - Prompt & negative prompt support with quick style presets.
 - Seed policies: Fixed / Random / Increment.
-- Style Builder: control **Art style**, **Shape**, and more.
-- Direct preview in player, queue support included.
+- Mutiple presets
+- Multi model selector
+  Comes with default model to work out of the box
+  download your favorite model (juggernaut etc) and use it directly in the app
+- many settings and tweaks can be done
+- Direct preview of results in internal player, queue support coming soon
   
 ---
 
 ### 🧰 Multi Tools
 - Change speed for videos (with audio sync).
 - Resize with aspect-ratio preservation.
-- Advanced Gif creator with lot's of saving options
-- Extract frames to images. (one/last/all)
+- Prompt enhancer
+- Sound Lab (add/mix multiple sound sources with video)
+- Advanced Gif/animation creator 
+- Extract frames to images. (last/all)
 - **Trim videos** with advanced preview.
 - Crop video 
-- Quality/Size/convert for video & images:
+- Quality/Size/convert for video & images.
 - Add or replace audio tracks in video.
 - Multi rename tools
 ...
@@ -189,14 +195,14 @@ WORK IN PROGRESS CURRENTLY OFFLINE
 - random intro with easter egg (click the intro 4x) default download has 3 intros (day evening and night)
   - optional download has over 100 (roadmap feature)
   - user can add their own backgrounds and app will start with their own random backgrounds
-  - overlay matrix rain and other animations (roadmap feature)
-- Theme system:10+ themes, Follow time of day, random at every start
+  - overlay matrix rain and other animations 
+- Theme system:15 themes, Follow time of day, random at every start
   - Day 🌞, Evening 🌆, Night 🌙
   - Cyberpunk, Neon, Ocean, Solarized Light, CRTn Mardi grass, Tropical and many more
   - 3 day themes, 10 dark themes, 2 colorful themes 
 - Bug reporting and maintenance tools.
   - User can send email directly from the app with bug report
-    (needs software installed to send an email)
+    (needs email software installed to send an email)
   - multiple logging options with 'dump to cmd' button
 - cleanup (clear cache, temp folder etc)
 - Temperature unit toggle °C / °F.
