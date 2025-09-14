@@ -782,7 +782,8 @@ class UpscPane(QtWidgets.QWidget):
             self.combo_preset.addItem(p)
         self.combo_preset.setCurrentText("veryfast")
         lay_enc.addWidget(self.combo_preset, 3, 1)
-        lay_enc.addWidget(QtWidgets.QLabel("Keyint (GOP):", self), 4, 0)
+        self.lbl_keyint = QtWidgets.QLabel("Keyint (GOP):", self)
+        lay_enc.addWidget(self.lbl_keyint, 4, 0)
         self.spin_keyint = QtWidgets.QSpinBox(self); self.spin_keyint.setRange(0, 1000); self.spin_keyint.setValue(0)
         self.spin_keyint.setToolTip("0 = let encoder decide; otherwise sets -g keyint")
         lay_enc.addWidget(self.spin_keyint, 4, 1)
@@ -800,8 +801,27 @@ class UpscPane(QtWidgets.QWidget):
             self.combo_acodec.addItem(ac)
         lay_enc.addWidget(self.combo_acodec, 6, 1)
         lay_enc.addWidget(QtWidgets.QLabel("Audio bitrate (kbps):", self), 7, 0)
-        self.spin_abitrate = QtWidgets.QSpinBox(self); self.spin_abitrate.setRange(32, 1024); self.spin_abitrate.setValue(192)
-        lay_enc.addWidget(self.spin_abitrate, 7, 1)
+        self.combo_abitrate = QtWidgets.QComboBox(self)
+        self.combo_abitrate.addItem("Use source", None)
+        for _v in (32, 64, 128, 160, 192, 256, 320):
+            self.combo_abitrate.addItem(str(_v), _v)
+        lay_enc.addWidget(self.combo_abitrate, 7, 1)
+        # Image format (for image inputs)
+        self.lbl_imgfmt = QtWidgets.QLabel("Image format:", self)
+        self.combo_imgfmt = QtWidgets.QComboBox(self)
+        self.combo_imgfmt.addItem("Same as input", None)
+        self.combo_imgfmt.addItem("PNG", ".png")
+        self.combo_imgfmt.addItem("JPG", ".jpg")
+        self.combo_imgfmt.addItem("WEBP", ".webp")
+        lay_enc.addWidget(self.lbl_imgfmt, 8, 0)
+        lay_enc.addWidget(self.combo_imgfmt, 8, 1)
+
+
+                # Hide CRF + Keyint per user request
+        try:
+            self.rad_crf.hide(); self.spin_crf.hide(); self.lbl_keyint.hide(); self.spin_keyint.hide()
+        except Exception:
+            pass
 
         try:
             enc_box.setContentLayout(lay_enc)
@@ -838,6 +858,10 @@ class UpscPane(QtWidgets.QWidget):
         self.slider_scale.valueChanged.connect(self._sync_scale_from_slider)
         self.combo_engine.currentIndexChanged.connect(self._update_engine_ui)
         self._update_engine_ui()
+        try:
+            self._enc_refresh_by_source()
+        except Exception:
+            pass
 
     
         try:
@@ -848,6 +872,29 @@ class UpscPane(QtWidgets.QWidget):
             self.btn_auto_tile.clicked.connect(self._auto_tile_size)
         except Exception:
             pass
+    def _enc_refresh_by_source(self):
+        """Grey-out audio when current source is an image; enable Image format for images."""
+        from pathlib import Path as _P
+        raw = ""
+        try:
+            raw = (self.edit_input.text() or "").strip()
+        except Exception:
+            pass
+        ext = _P(raw).suffix.lower() if raw else ""
+        try:
+            cur = _fv_get_input(self)
+            if (not ext) and cur:
+                ext = _P(cur).suffix.lower()
+        except Exception:
+            pass
+        is_img = ext in {".png",".jpg",".jpeg",".bmp",".tif",".tiff",".webp"}
+        for _name in ("radio_a_copy", "radio_a_encode", "radio_a_mute", "combo_acodec", "combo_abitrate"):
+            obj = getattr(self, _name, None)
+            if obj is not None:
+                obj.setEnabled(not is_img)
+        if hasattr(self, "combo_imgfmt"): self.combo_imgfmt.setEnabled(is_img)
+        if hasattr(self, "lbl_imgfmt"): self.lbl_imgfmt.setEnabled(is_img)
+
         self._update_model_hint()
 
         # Logger buffering to avoid UI stalls when many lines arrive quickly
@@ -2199,7 +2246,15 @@ def _fv_r11_wrap_file(orig):
                 return [engine_exe, "-i", str(in_p), "-o", str(out_p), "-s", str(sc), "-n", base, "-m", dstr]
             if (not out_p.suffix) or (out_p.exists() and out_p.is_dir()):
                 out_p.mkdir(parents=True, exist_ok=True)
-                out_p = out_p / (in_p.stem + ".png")
+                ext = None
+                try:
+                    ext = self.combo_imgfmt.currentData()
+                except Exception:
+                    ext = None
+                if not ext:
+                    e = in_p.suffix.lower()
+                    ext = e if e in {".png",".jpg",".jpeg",".bmp",".tif",".tiff",".webp"} else ".png"
+                out_p = out_p / (in_p.stem + ext)
             return [engine_exe, "-i", str(in_p), "-o", str(out_p), "-s", str(sc), "-n", base, "-m", dstr]
         return orig(self, engine_exe, src, outfile, model, scale)
     return _wrapped

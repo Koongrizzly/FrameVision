@@ -76,7 +76,7 @@ import os
 from datetime import datetime
 from PySide6.QtCore import Qt, QTimer, QUrl, Signal, QRect, QEasingCurve, QPropertyAnimation, QByteArray, QEvent
 from PySide6.QtCore import QSettings
-from PySide6.QtGui import QAction, QPixmap, QImage, QKeySequence, QColor, QDesktopServices
+from PySide6.QtGui import QAction, QPixmap, QImage, QKeySequence, QColor, QDesktopServices, QShortcut
 from PySide6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QGridLayout, QLabel, QPushButton, QFileDialog, QTabWidget, QSplitter, QListWidget, QListWidgetItem, QLineEdit, QFormLayout, QMessageBox, QComboBox, QSpinBox, QDoubleSpinBox, QTextEdit, QCheckBox, QTreeWidget, QTreeWidgetItem, QHeaderView, QStyle, QSlider, QToolButton, QSizePolicy, QScrollArea, QFrame, QGroupBox, QScrollArea, QFrame)
 from PySide6.QtMultimedia import QMediaPlayer, QAudioOutput, QVideoSink
 from helpers.tools_tab import InstantToolsPane
@@ -629,11 +629,16 @@ class VideoPane(QWidget):
         except Exception:
             pass
         self.player.positionChanged.connect(self.on_pos); self.player.durationChanged.connect(self.on_dur)
+        try:
+            self.player.playbackStateChanged.connect(lambda *_: self._sync_play_button())
+            self._sync_play_button()
+        except Exception:
+            pass
         bar = QHBoxLayout()
-        self.btn_open=QPushButton("📂"); self.btn_open.setToolTip("Open"); self.btn_play=QPushButton("▶"); self.btn_play.setToolTip("Play"); self.btn_pause=QPushButton("⏸"); self.btn_pause.setToolTip("Pause")
-        self.btn_stop=QPushButton("⏹"); self.btn_stop.setToolTip("Stop"); self.btn_info=QPushButton("ℹ"); self.btn_info.setToolTip("Info"); self.btn_fs=QPushButton("⛶"); self.btn_fs.setToolTip("Fullscreen")
-        self.btn_ratio=QPushButton("◻"); self.btn_ratio.setToolTip("Aspect: Center (click to cycle)")
-        for b in [self.btn_open,self.btn_play,self.btn_pause,self.btn_stop,self.btn_info,self.btn_ratio,self.btn_fs]: bar.addWidget(b)
+        self.btn_open=QPushButton("📂"); self.btn_open.setToolTip("Open"); self.btn_play=QPushButton("▶︎"); self.btn_play.setToolTip("Play"); self.btn_pause=QPushButton("⏸"); self.btn_pause.setToolTip("Pause"); self.btn_pause.setVisible(False); self.btn_pause.setEnabled(False); self.btn_pause.setStyleSheet("background: transparent; border: none; padding: 0;")
+        self.btn_stop=QPushButton("■"); self.btn_stop.setToolTip("Stop"); self.btn_info=QPushButton("ℹ"); self.btn_info.setToolTip("Info"); self.btn_fs=QPushButton("⛶"); self.btn_fs.setToolTip("Fullscreen")
+        self.btn_ratio = None  # removed; # ratio button removed
+        for b in [self.btn_open, self.btn_play, self.btn_stop, self.btn_info, self.btn_fs]: bar.addWidget(b)
         self.btn_compare = QPushButton("▷│◁"); self.btn_compare.setToolTip("Compare view"); bar.addWidget(self.btn_compare)
         # Quick Upscale button
         self.btn_upscale = QPushButton("Upscale"); self.btn_upscale.setToolTip("Upscale")
@@ -646,6 +651,26 @@ class VideoPane(QWidget):
         except Exception:
             pass
         bar.addWidget(self.btn_upscale)
+
+        # --- Toolbar styling: uniform height, transparent, larger glyphs ---
+        try:
+            _all_ctrls = [self.btn_open, self.btn_play, self.btn_stop, self.btn_info, self.btn_fs, self.btn_compare]
+            for _b in _all_ctrls:
+                _b.setFixedHeight(48)
+                _b.setFlat(True)
+                _b.setAutoDefault(False)
+                try: _b.setDefault(False)
+                except Exception: pass
+            # Sizes: play/pause larger
+            self.btn_play.setStyleSheet("font-size: 34px; padding: 0; background: transparent; border: none;")
+            for _b in [self.btn_open, self.btn_stop, self.btn_info, self.btn_fs, self.btn_compare]:
+                _b.setStyleSheet("font-size: 24px; padding: 0; background: transparent; border: none;")
+            # Keep Play/Pause compact so bars don't look like multiple stops
+            try: self.btn_play.setFixedWidth(48)
+            except Exception: pass
+        except Exception:
+            pass
+
         # --- Uniform control sizing: keep all buttons the same height ---
         try:
             _all_ctrls = [self.btn_open, self.btn_play, self.btn_pause, self.btn_stop, self.btn_info, self.btn_ratio, self.btn_fs, self.btn_compare, self.btn_upscale]
@@ -662,18 +687,18 @@ class VideoPane(QWidget):
 
         bar.addStretch(1)
         lay = QVBoxLayout(self); lay.addWidget(self.label,1); self.info_label=QLabel("—"); self.info_label.setObjectName("videoInfo"); f=self.info_label.font(); f.setPointSize(max(10, f.pointSize())); self.info_label.setFont(f); lay.addWidget(self.info_label); lay.addWidget(self.slider); lay.addLayout(bar)
-        self.btn_open.clicked.connect(self._open_via_dialog, Qt.ConnectionType.UniqueConnection); self.btn_play.clicked.connect(self.player.play, Qt.ConnectionType.UniqueConnection)
-        self.btn_pause.clicked.connect(self.pause, Qt.ConnectionType.UniqueConnection); self.btn_stop.clicked.connect(self.player.stop, Qt.ConnectionType.UniqueConnection)
+        self.btn_open.clicked.connect(self._open_via_dialog, Qt.ConnectionType.UniqueConnection); self.btn_play.clicked.connect(self._toggle_play_pause, Qt.ConnectionType.UniqueConnection)
+        # pause button hidden; no click
+        self.btn_stop.clicked.connect(self.player.stop, Qt.ConnectionType.UniqueConnection)
         self.btn_info.clicked.connect(self._show_info_popup, Qt.ConnectionType.UniqueConnection)
-        self.btn_ratio.clicked.connect(self._cycle_ratio_mode, Qt.ConnectionType.UniqueConnection)
+        # ratio button removed
         self.btn_compare.clicked.connect(_open_compare_page, Qt.ConnectionType.UniqueConnection)
         self.btn_upscale.clicked.connect(self.quick_upscale, Qt.ConnectionType.UniqueConnection); self.btn_fs.clicked.connect(self.toggle_fullscreen, Qt.ConnectionType.UniqueConnection)
         self.is_fullscreen=False
         # Ratio modes: 0=Center, 1=Fit, 2=Fill, 3=Full(stretch)
-        self.ratio_mode = 0
-        self._update_ratio_button()
-        
-        # --- injected: zoom overlay button ---
+        self.ratio_mode = 1  # force FIT
+        # _update_ratio_button removed
+# --- injected: zoom overlay button ---
         try:
             from PySide6.QtWidgets import QToolButton
             self._zoomOverlayBtn = QToolButton(self.label)
@@ -805,9 +830,9 @@ class VideoPane(QWidget):
                 3: ("⛶", "Full"),
             }
             txt, tip = mapping.get(m, ("◻", "Center"))
-            self.btn_ratio.setText(txt)
+            # ratio button removed
             try:
-                self.btn_ratio.setToolTip(f"Aspect: {tip} (click to cycle)")
+                pass
             except Exception:
                 pass
         except Exception:
@@ -817,9 +842,9 @@ class VideoPane(QWidget):
         try:
             self.ratio_mode = (int(self.ratio_mode) + 1) % 4
         except Exception:
-            self.ratio_mode = 0
-        self._update_ratio_button()
-        # --- zoom/pan state + mode flag ---
+            self.ratio_mode = 1  # force FIT
+        # _update_ratio_button removed
+# --- zoom/pan state + mode flag ---
         self._zoom = 1.0
         self._max_zoom = 10.0
         self._zoom_step = 0.50
@@ -835,6 +860,9 @@ class VideoPane(QWidget):
         try:
             if pm is None or pm.isNull():
                 return pm
+            return pm.scaled(target_size, Qt.KeepAspectRatio, Qt.SmoothTransformation)
+        except Exception:
+            return pm
             tw, th = int(target_size.width()), int(target_size.height())
             if tw <= 0 or th <= 0:
                 return pm
@@ -1063,6 +1091,28 @@ class VideoPane(QWidget):
     def pause(self):
         self.player.pause()
         if self.currentFrame is not None: self.frameCaptured.emit(self.currentFrame)
+
+    def _sync_play_button(self):
+        try:
+            icon_play = "▶︎"
+            icon_pause = "⏸︎"
+            if self.player.playbackState() == QMediaPlayer.PlayingState:
+                self.btn_play.setText(icon_pause)
+            else:
+                self.btn_play.setText(icon_play)
+        except Exception:
+            pass
+
+    def _toggle_play_pause(self):
+        try:
+            if self.player.playbackState() == QMediaPlayer.PlayingState:
+                self.pause()
+            else:
+                self.player.play()
+            self._sync_play_button()
+        except Exception:
+            pass
+
 
 
     def _show_info_popup(self):
@@ -1319,8 +1369,7 @@ class VideoPane(QWidget):
                 if t == QEvent.MouseButtonPress:
                     try:
                         if ev.button() == Qt.RightButton:
-                            self._cycle_ratio_mode()
-                            return True
+                            return False  # ratio cycling disabled
                         if ev.button() == Qt.LeftButton and getattr(self, '_zoom', 1.0) > 1.0:
                             self._dragging = True
                             self._last_pos = ev.position().toPoint() if hasattr(ev, 'position') else ev.pos()
@@ -2266,6 +2315,24 @@ class MainWindow(QMainWindow):
         except Exception:
             pass
         self.setCentralWidget(splitter)
+
+        # --- Shortcut: ESC exits fullscreen (video overlay or window) ---
+        try:
+            esc_shortcut = QShortcut(QKeySequence(Qt.Key_Escape), self)
+            def _exit_fullscreen():
+                try:
+                    # If video overlay fullscreen is active, exit that
+                    if getattr(self.video, 'is_fullscreen', False) or getattr(self.video, '_fs_win', None) is not None:
+                        self.video.toggle_fullscreen()
+                        return
+                    # Else if the main window itself is fullscreen, exit to normal
+                    if self.isFullScreen():
+                        self.showNormal()
+                except Exception:
+                    pass
+            esc_shortcut.activated.connect(_exit_fullscreen)
+        except Exception:
+            pass
         # Restore saved UI state (tabs, splitters, geometry, etc.)
         try:
             state_persist.restore_all(self)

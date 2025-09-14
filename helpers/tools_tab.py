@@ -6,6 +6,7 @@ from pathlib import Path
 from helpers.meme_tool import MemeToolPane
 from helpers.trim_tool import install_trim_tool
 from helpers.audiotool import install_audio_tool
+from helpers.prompt import install_prompt_tool
 
 from helpers.renam import RenamPane
 
@@ -327,7 +328,18 @@ class InstantToolsPane(QWidget):
         _memel.addWidget(_meme)
         sec_meme.setContentLayout(_memel)
         
-        # ---- Multi Rename (moved to helpers/renam.py) ----
+        
+        # ---- Prompt Generator ----
+        sec_prompt = CollapsibleSection("Prompt Generator", expanded=False)
+        try:
+            install_prompt_tool(self, sec_prompt)
+        except Exception:
+            try:
+                _p = QWidget(); _pl = QVBoxLayout(_p); _pl.setContentsMargins(0,0,0,0); _pl.addWidget(QLabel("Prompt tool failed to load."))
+                sec_prompt.setContentLayout(_pl)
+            except Exception:
+                pass
+# ---- Multi Rename (moved to helpers/renam.py) ----
         sec_rename = CollapsibleSection("Multi Rename", expanded=False)
         _rn_wrap = QWidget(); _rn_layout = QVBoxLayout(_rn_wrap); _rn_layout.setContentsMargins(0,0,0,0)
         try:
@@ -510,7 +522,7 @@ class InstantToolsPane(QWidget):
         btn_sc.clicked.connect(lambda: self._save_preset_crop())
         btn_lc.clicked.connect(lambda: self._load_preset_crop())
 
-        for sec in (sec_meme, sec_audio, sec_speed, sec_resize, sec_gif, sec_extract, sec_trim, sec_crop, sec_quality, sec_img, sec_rename):
+        for sec in (sec_meme, sec_prompt, sec_audio, sec_speed, sec_resize, sec_gif, sec_extract, sec_trim, sec_crop, sec_quality, sec_img, sec_rename):
             root.addWidget(sec)
         root.addStretch(1)
         # --- Remember settings (per-tool + global) ---
@@ -526,6 +538,7 @@ class InstantToolsPane(QWidget):
                 "Quality / Size Video": sec_quality,
                 "Image Quality / Convert": sec_img,
                 "Thumbnail / Meme Creator": sec_meme,
+                "Prompt Generator": sec_prompt,
                 "Multi Rename": sec_rename
             }
         self._sections_map = _sec_name_map()

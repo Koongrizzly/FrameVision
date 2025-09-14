@@ -214,9 +214,72 @@ def show_intro_if_enabled(main_window: QWidget | None = None):
 
 def run_intro_if_enabled(main_window: QWidget | None = None):
     sp = show_intro_if_enabled(main_window)
-    if sp is None: return None
+    if sp is None:
+        return None
+
+    # Pre-show the main window shortly before the splash ends to avoid any flicker.
+    def _fv_preschedule_main_show():
+        try:
+            if main_window is not None and not main_window.isVisible():
+                main_window.show()
+        except Exception:
+            pass
+
+    # Start a brief dim animation INSIDE the splash (no transparency), so it's gentle on the eyes.
+    def _fv_start_dim(duration_ms: int = 500):
+        try:
+            if sp is None or not sp.isVisible():
+                return
+            if not hasattr(sp, "_fv_black_cover") or sp._fv_black_cover is None:
+                cover = QWidget(sp)
+                cover.setObjectName("_fv_black_cover")
+                cover.setAttribute(Qt.WA_TransparentForMouseEvents, True)
+                cover.setGeometry(0, 0, sp.width(), sp.height())
+                cover.show()
+                cover.raise_()
+                sp._fv_black_cover = cover
+            # Animate to black by increasing alpha over time using a timer
+            steps = max(5, int(duration_ms / 16))  # ~60 fps target
+            # Reset any prior dimmer
+            if hasattr(sp, "_fv_dim_timer") and sp._fv_dim_timer:
+                try: sp._fv_dim_timer.stop()
+                except Exception: pass
+            sp._fv_dim_step = 0
+            sp._fv_dim_timer = QTimer(sp)
+            def _tick():
+                try:
+                    sp._fv_dim_step += 1
+                    t = min(1.0, sp._fv_dim_step / float(steps))
+                    a = max(0, min(255, int(t * 255)))
+                    sp._fv_black_cover.setStyleSheet(f"background: rgba(0,0,0,{a});")
+                    if sp._fv_dim_step >= steps:
+                        sp._fv_dim_timer.stop()
+                except Exception:
+                    try: sp._fv_dim_timer.stop()
+                    except Exception: pass
+            sp._fv_dim_timer.timeout.connect(_tick)
+            sp._fv_dim_timer.start(max(10, int(duration_ms / max(1, steps))))
+        except Exception:
+            pass
+
     try:
-        loop = QEventLoop(); sp._timer.timeout.connect(loop.quit); sp._timer.start(); loop.exec()
+        try:
+            interval = int(sp._timer.interval())
+        except Exception:
+            interval = 2000  # reasonable default
+        dim_duration = 500  # lengthen the transition a little
+        pre_ms = 250        # show main ~250ms before the splash ends
+        dim_at = max(0, interval - dim_duration)
+        pre_at = max(0, interval - pre_ms)
+
+        QTimer.singleShot(dim_at, lambda: _fv_start_dim(dim_duration))
+        QTimer.singleShot(pre_at, _fv_preschedule_main_show)
+
+        # Drive the splash lifetime (unchanged)
+        loop = QEventLoop()
+        sp._timer.timeout.connect(loop.quit)
+        sp._timer.start()
+        loop.exec()
     except Exception:
         pass
     return sp

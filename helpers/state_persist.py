@@ -1,5 +1,5 @@
 
-from PySide6.QtCore import QSettings, QByteArray
+from PySide6.QtCore import QSettings, QByteArray, Qt
 from PySide6.QtWidgets import QMainWindow, QTabWidget, QSplitter, QGroupBox, QWidget, QTreeView, QTableView
 import json
 
@@ -48,6 +48,44 @@ def _name(w: QWidget, fallback_prefix: str) -> str:
         pass
     return n.replace(' ', '_').replace('/', '_').lower()
 def restore_all(root: QWidget) -> None:
+
+    if isinstance(root, QMainWindow):
+        # Force start mode: 'fullscreen' (default) or 'maximized'
+        # Change via QSettings("FrameVision","FrameVision").setValue("startup/force_mode", "maximized")
+        s = QSettings("FrameVision","FrameVision")
+        mode = s.value("startup/force_mode", "fullscreen")
+        mode = (str(mode).strip().lower() if mode is not None else "fullscreen")
+        # Decide desired flag but DO NOT call show* here (prevents flashing main before intro)
+        try:
+            if mode in ("fullscreen", "full", "fs"):
+                try:
+                    desired_flag = Qt.WindowFullScreen
+                    root.setWindowState(root.windowState() | desired_flag)
+                except Exception:
+                    pass
+            elif mode in ("maximized", "max", "maximise", "maximize"):
+                try:
+                    desired_flag = Qt.WindowMaximized
+                    root.setWindowState(root.windowState() | desired_flag)
+                except Exception:
+                    pass
+            else:
+                raise ValueError("no forced mode")  # fall through to legacy restore below
+            # We applied a forced mode; do NOT restore geometry/state (prevents snap-back)
+        except Exception:
+            # Legacy behavior if no forced mode is set or something went wrong
+            geom = s.value(KEY_GEOM, None)
+            if isinstance(geom, QByteArray):
+                try:
+                    root.restoreGeometry(geom)
+                except Exception:
+                    pass
+            st = s.value(KEY_STATE, None)
+            if isinstance(st, QByteArray):
+                try:
+                    root.restoreState(st)
+                except Exception:
+                    pass
     s = QSettings("FrameVision","FrameVision")
     if not s.value("keep_settings_after_restart", True, type=bool):
         return

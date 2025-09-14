@@ -493,7 +493,7 @@ class SysMonPanel(QWidget):
         # Tools ready line
         paths = _settings_paths()
         self._tools_status = _tool_ready_status(paths["models"])
-        self.lbl_tools = QLabel("Tools: " + _tools_line(self._tools_status))
+        self.lbl_tools = QLabel(" " + _tools_line(self._tools_status))
         self.lbl_tools.setTextFormat(Qt.PlainText)
         self.lbl_tools.setToolTip("Checks FFmpeg, Qwen2-VL (describe), RIFE, Real-ESRGAN, Waifu2x, UpScayl(er)")
 
@@ -627,7 +627,7 @@ class SysMonPanel(QWidget):
     def _refresh_tools(self):
         models_dir = _settings_paths()["models"]
         self._tools_status = _tool_ready_status(models_dir)
-        self.lbl_tools.setText("Tools: " + _tools_line(self._tools_status))
+        self.lbl_tools.setText(" " + _tools_line(self._tools_status))
 
     def _refresh_disk(self):
         free_d, total_d = _disk_free_total(ROOT)
