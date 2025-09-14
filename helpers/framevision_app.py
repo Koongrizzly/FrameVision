@@ -84,14 +84,14 @@ from helpers.themes import QSS_DAY, QSS_EVENING, QSS_NIGHT
 from helpers.mediainfo import AUDIO_EXTS, probe_media_all, show_info_popup
 
 
-# >>> FRAMEVISION_QWEN_BEGIN
-# Safe import of the Qwen TXT->IMG pane; never crash app on failure.
+# >>> FRAMEVISION_TXT2IMG_BEGIN
+# Safe import of the txt2img pane; never crash app on failure.
 try:
-    from helpers.txt2img_qwen import Txt2ImgPane
+    from helpers.txt2img import Txt2ImgPane
 except Exception as _e:
-    print("[framevision] Qwen tab import failed:", _e)
+    print("[framevision] txt2img tab import failed:", _e)
     Txt2ImgPane = None
-# <<< FRAMEVISION_QWEN_END
+# <<< FRAMEVISION_TXT2IMG_END
 
 try:
     # Replace None placeholders with imported QSS constants
@@ -2240,8 +2240,8 @@ class MainWindow(QMainWindow):
             pass
 
 
-        # >>> FRAMEVISION_QWEN_BEGIN
-        # Insert Qwen tab as the leftmost tab; label exactly "TXT to IMG".
+        # >>> FRAMEVISION_TXT2IMG_BEGIN
+        # Insert txt2img tab as the leftmost tab; label exactly "TXT to IMG".
         try:
             if 'Txt2ImgPane' in globals() and Txt2ImgPane is not None:
                 self._txt2img_qwen = Txt2ImgPane(self)
@@ -2252,8 +2252,8 @@ class MainWindow(QMainWindow):
                 except Exception:
                     pass
         except Exception as _e:
-            print("[framevision] Qwen tab insert failed:", _e)
-        # <<< FRAMEVISION_QWEN_END
+            print("[framevision] txt2img tab insert failed:", _e)
+        # <<< FRAMEVISION_TXT2IMG_END
         # GAB (QuickActionDriver) removed cleanly
         # The analyzer integration was disabled to avoid runtime errors.
         # (Previously initialized QuickActionDriver and installed it here.)
