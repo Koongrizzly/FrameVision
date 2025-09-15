@@ -446,6 +446,155 @@ class Txt2ImgPane(QWidget):
         self.model_refresh.clicked.connect(_populate_models)
         self.model_browse.clicked.connect(_browse_model)
 
+        # --- LoRA picker (SDXL) ---
+        self.lora_combo = QComboBox()
+        self.lora_refresh = QPushButton("Reload")
+        rowl = QHBoxLayout()
+        rowl.addWidget(self.lora_combo, 1)
+        rowl.addWidget(self.lora_refresh, 0)
+        mdl_form.addRow("LoRA (SDXL)", rowl)
+        # LoRA 1 Strength (scale)
+        self.lora_strength_slider = QSlider(Qt.Horizontal)
+        self.lora_strength_slider.setMinimum(0)
+        self.lora_strength_slider.setMaximum(150)
+        self.lora_strength_slider.setValue(100)
+        self.lora_strength = QDoubleSpinBox(); self.lora_strength.setRange(0.0, 1.5); self.lora_strength.setSingleStep(0.05); self.lora_strength.setDecimals(2); self.lora_strength.setValue(1.0)
+        rowls = QHBoxLayout()
+        rowls.addWidget(QLabel("LoRA 1 Strength:"))
+        rowls.addWidget(self.lora_strength_slider, 1)
+        rowls.addWidget(self.lora_strength, 0)
+        mdl_form.addRow(rowls)
+
+        def _sync_lora1_strength_from_slider(v):
+            try:
+                self.lora_strength.blockSignals(True)
+                self.lora_strength.setValue(v/100.0)
+                self.lora_strength.blockSignals(False)
+            except Exception:
+                pass
+
+        def _sync_lora1_slider_from_spin(v):
+            try:
+                self.lora_strength_slider.blockSignals(True)
+                self.lora_strength_slider.setValue(int(round(v*100)))
+                self.lora_strength_slider.blockSignals(False)
+            except Exception:
+                pass
+
+        self.lora_strength_slider.valueChanged.connect(_sync_lora1_strength_from_slider)
+        self.lora_strength.valueChanged.connect(_sync_lora1_slider_from_spin)
+
+        self.lora2_combo = QComboBox()
+        self.lora2_refresh = QPushButton("Reload")
+        rowl2 = QHBoxLayout()
+        rowl2.addWidget(self.lora2_combo, 1)
+        rowl2.addWidget(self.lora2_refresh, 0)
+        mdl_form.addRow("LoRA 2 (SDXL)", rowl2)
+
+        def _populate_loras2():
+            try:
+                from pathlib import Path as _P
+                base = _P("./models") / "Loras" / "SDXL"
+                self.lora2_combo.blockSignals(True)
+                self.lora2_combo.clear()
+                self.lora2_combo.addItem("None", "")
+                if base.exists():
+                    for f in sorted(base.glob("*.safetensors")):
+                        self.lora2_combo.addItem(f.name, str(f.resolve()))
+                self.lora2_combo.blockSignals(False)
+            except Exception as e:
+                print("[txt2img] lora2 scan failed:", e)
+
+        
+        _populate_loras2()
+        # Both reloads refresh both dropdowns for convenience. Guard duplicate connections.
+        def _reload_all_loras():
+            try:
+                _populate_loras()
+            except Exception:
+                pass
+            try:
+                _populate_loras2()
+            except Exception:
+                pass
+        if not hasattr(self, "_loras_reload_wired"):
+            self._loras_reload_wired = True
+            try:
+                self.lora_refresh.clicked.connect(_reload_all_loras)
+            except Exception:
+                pass
+            try:
+                self.lora2_refresh.clicked.connect(_reload_all_loras)
+            except Exception:
+                pass
+
+        
+# Both reloads refresh both dropdowns for convenience
+        def _reload_all_loras():
+            try:
+                _populate_loras()
+            except Exception:
+                pass
+            try:
+                _populate_loras2()
+            except Exception:
+                pass
+        self.lora2_refresh.clicked.connect(_reload_all_loras)
+        try:
+            self.lora_refresh.clicked.disconnect()
+        except Exception:
+            pass
+        self.lora_refresh.clicked.connect(_reload_all_loras)
+
+        # LoRA 2 strength (scale)
+        self.lora2_strength_slider = QSlider(Qt.Horizontal)
+        self.lora2_strength_slider.setMinimum(0)
+        self.lora2_strength_slider.setMaximum(150)
+        self.lora2_strength_slider.setValue(100)
+        self.lora2_strength = QDoubleSpinBox(); self.lora2_strength.setRange(0.0, 1.5); self.lora2_strength.setSingleStep(0.05); self.lora2_strength.setDecimals(2); self.lora2_strength.setValue(1.0)
+        rowls2 = QHBoxLayout()
+        rowls2.addWidget(QLabel("LoRA 2 Strength:"))
+        rowls2.addWidget(self.lora2_strength_slider, 1)
+        rowls2.addWidget(self.lora2_strength, 0)
+        mdl_form.addRow(rowls2)
+
+        def _sync_lora2_strength_from_slider(v):
+            try:
+                self.lora2_strength.blockSignals(True)
+                self.lora2_strength.setValue(v/100.0)
+                self.lora2_strength.blockSignals(False)
+            except Exception:
+                pass
+
+        def _sync_lora2_slider_from_spin(v):
+            try:
+                self.lora2_strength_slider.blockSignals(True)
+                self.lora2_strength_slider.setValue(int(round(v*100)))
+                self.lora2_strength_slider.blockSignals(False)
+            except Exception:
+                pass
+
+        (_sync_lora2_strength_from_slider)
+        self.lora2_strength.valueChanged.connect(_sync_lora2_slider_from_spin)
+
+
+        def _populate_loras():
+            try:
+                from pathlib import Path as _P
+                base = _P("./models") / "Loras" / "SDXL"
+                self.lora_combo.blockSignals(True)
+                self.lora_combo.clear()
+                self.lora_combo.addItem("None", "")
+                if base.exists():
+                    for f in sorted(base.glob("*.safetensors")):
+                        self.lora_combo.addItem(f.name, str(f.resolve()))
+                self.lora_combo.blockSignals(False)
+            except Exception as e:
+                print("[txt2img] lora scan failed:", e)
+
+        _populate_loras()
+        self.lora_refresh.clicked.connect(_populate_loras)
+
         self._model_picker = _Disclosure("Model", mdl_body, start_open=False, parent=self)
         root.addWidget(self._model_picker)
 
@@ -522,6 +671,13 @@ class Txt2ImgPane(QWidget):
             "vram_profile": self.vram_profile.currentText(),
             "sampler": self.sampler.currentText(),
             "model_path": (self.model_combo.currentData() if hasattr(self, "model_combo") else "auto"),
+            "lora_path": (self.lora_combo.currentData() if hasattr(self, "lora_combo") else ""),
+            "lora_a_scale": (self.lora_a_strength.value() if hasattr(self, "lora_a_strength") else 1.0),
+            "lora_b_scale": (self.lora_b_strength.value() if hasattr(self, "lora_b_strength") else 1.0),
+
+            "lora_scale": (self.lora_strength.value() if hasattr(self, "lora_strength") else 1.0),
+            "lora2_path": (self.lora2_combo.currentData() if hasattr(self, "lora2_combo") else ""),
+            "lora2_scale": (self.lora2_strength.value() if hasattr(self, "lora2_strength") else 1.0),
             "attn_slicing": self.attn_slicing.isChecked(),
             "vae_device": self.vae_device.currentText(),
             "gpu_index": int(self.gpu_index.value()),
@@ -760,6 +916,63 @@ def _gen_via_diffusers(job: dict, out_dir: Path, progress_cb=None):
         else:
             pipe = StableDiffusionPipeline.from_single_file(model_path, torch_dtype=dtype, local_files_only=True)
         pipe = pipe.to(device)
+
+        
+        # Optionally load up to two LoRAs for SDXL (from UI slots 1 & 2)
+        try:
+            lora1 = str(job.get("lora_path") or "").strip()
+            lora2 = str(job.get("lora2_path") or "").strip()
+            s1 = float(job.get("lora_scale", 1.0) or 1.0)
+            s2 = float(job.get("lora2_scale", 1.0) or 1.0)
+            loras_to_load = []
+            scales = []
+            if lora1 and Path(lora1).exists():
+                loras_to_load.append(lora1); scales.append(s1)
+            if lora2 and Path(lora2).exists():
+                loras_to_load.append(lora2); scales.append(s2)
+            if loras_to_load and is_sdxl:
+                try:
+                    names = [f"lora_{i}" for i in range(len(loras_to_load))]
+                    for path, name in zip(loras_to_load, names):
+                        pipe.load_lora_weights(path)
+                    if hasattr(pipe, "set_adapters"):
+                        pipe.set_adapters(names, scales)
+                except Exception as e:
+                    print("[txt2img] adapter set failed, fallback fuse", e)
+                    for path in loras_to_load:
+                        try:
+                            pipe.load_lora_weights(path)
+                        except Exception as inner_e:
+                            print("[txt2img] fallback load error:", inner_e)
+                    try:
+                        if hasattr(pipe, "fuse_lora"):
+                            # best-effort: fuse once with first scale, then reload second and fuse again
+                            if len(scales) >= 1:
+                                pipe.fuse_lora(lora_scale=scales[0])
+                            if len(scales) >= 2:
+                                try:
+                                    pipe.load_lora_weights(loras_to_load[1])
+                                    pipe.fuse_lora(lora_scale=scales[1])
+                                except Exception:
+                                    pass
+                    except Exception:
+                        pass
+        except Exception as _e:
+            try:
+                print("[txt2img] LoRA load failed:", _e)
+            except Exception:
+                pass
+
+            try:
+                print("[txt2img] LoRA load failed:", _e)
+            except Exception:
+                pass
+
+            try:
+                print("[txt2img] LoRA load failed:", _e)
+            except Exception:
+                pass
+
         # apply selected sampler if not auto
         try:
             name = (job.get("sampler") or "auto").lower()

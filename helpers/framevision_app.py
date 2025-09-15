@@ -30,6 +30,7 @@ def _open_compare_page():
 
 import os, sys, json, subprocess, re, hashlib
 from helpers.collapsible_compat import CollapsibleSection
+from helpers.ask_popup import AskPopup
 from helpers import state_persist
 from helpers.img_fallback import load_pixmap
 from helpers.worker_led import WorkerStatusWidget
@@ -485,6 +486,17 @@ class Toast(QWidget):
 IMAGE_EXTS = {'.png','.jpg','.jpeg','.bmp','.webp','.tif','.tiff','.gif'}
 
 class VideoPane(QWidget):
+
+    def _open_ask_popup(self):
+        """Open the Ask chat popup (lazy-create)."""
+        if not hasattr(self, "_ask_popup") or self._ask_popup is None:
+            self._ask_popup = AskPopup(parent=self.window())
+        self._ask_popup.show()
+        try:
+            self._ask_popup.raise_()
+            self._ask_popup.activateWindow()
+        except Exception:
+            pass
     frameCaptured = Signal(QImage)
     # --- zoom/pan helpers ---
     def _set_zoom(self, new_zoom: float):
@@ -651,6 +663,15 @@ class VideoPane(QWidget):
         except Exception:
             pass
         bar.addWidget(self.btn_upscale)
+        # --- Ask button (opens chat popup) ---  # ASK_INSERTED
+        self.btn_ask = QPushButton("Ask")
+        self.btn_ask.setObjectName("btn_ask_chat")
+        self.btn_ask.setStyleSheet(
+            "QPushButton#btn_ask_chat { padding:4px 14px; background:#f59e0b; color:black; border-radius:8px; font-weight:600; }"
+            "QPushButton#btn_ask_chat:hover { background:#d97706; }"
+        )
+        bar.addWidget(self.btn_ask)
+        self.btn_ask.clicked.connect(self._open_ask_popup, Qt.ConnectionType.UniqueConnection)
 
         # --- Toolbar styling: uniform height, transparent, larger glyphs ---
         try:
