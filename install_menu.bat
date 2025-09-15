@@ -68,7 +68,7 @@ setlocal EnableExtensions EnableDelayedExpansion
 
 echo(
 echo ===============================
-echo(  Requirements ^^& Disk Report
+echo(  Requirements ^& Disk Report
 echo ===============================
 echo(
 
@@ -125,6 +125,7 @@ if exist "%_FV_SITEPKG%" (
 
 echo  wait a second
 
+
 rem --- Single dxdiag pass for OS/BIOS/CPU/RAM + GPU details ---
 set "DXTXT=%TEMP%\dxdiag_framevision.txt"
 dxdiag /whql:off /t "%DXTXT%" >nul 2>nul
@@ -151,9 +152,9 @@ if defined VRAM_GB echo( VRAM: !VRAM_GB! GiB
 
 rem CUDA flag based on vendor in GPU_NAME or Manufacturer
 set "CUDA_CAPABLE=NO"
-echo(!GPU_NAME!| find /I "NVIDIA" >nul ^&^& set "CUDA_CAPABLE=YES"
+echo(!GPU_NAME!| find /I "NVIDIA" >nul && set "CUDA_CAPABLE=YES"
 for /f "tokens=1* delims=:" %%A in ('findstr /R /C:"^ *Manufacturer:" "%DXTXT%"') do (
-  echo(%%B| find /I "NVIDIA" >nul ^&^& set "CUDA_CAPABLE=YES"
+  echo(%%B| find /I "NVIDIA" >nul && set "CUDA_CAPABLE=YES"
 )
 echo( CUDA-capable: !CUDA_CAPABLE!
 
@@ -282,12 +283,16 @@ set "GPU_VRAM_GB="
 
 set "GPU_VRAM_RAW="
 
+
   set "GPU_NAME=%%~A"
 
   set "GPU_VRAM_RAW=%%~B"
 
+)
 
 if defined GPU_NAME (
+
+
 
   rem Convert e.g. "8192 MiB" -> GiB via PowerShell
 
@@ -509,12 +514,16 @@ set "GPU_VRAM_GB="
 
 set "GPU_VRAM_RAW="
 
+
   set "GPU_NAME=%%~A"
 
   set "GPU_VRAM_RAW=%%~B"
 
+)
 
 if defined GPU_NAME (
+
+
 
   rem Convert e.g. "8192 MiB" -> GiB via PowerShell
 
@@ -734,12 +743,14 @@ set "GPU_DRV="
 
 set "GPU_VRAM_GB="
 
+
   set "GPU_NAME=%%~A"
 
   set "GPU_DRV=%%~B"
 
   set "GPU_VRAM_RAW=%%~C"
 
+)
 
 if defined GPU_NAME (
 
@@ -908,8 +919,6 @@ if exist ".venv\Scripts\python.exe"   call ".venv\Scripts\python.exe" -m pip ins
 )
 rem === Download tools & models for CPU (non-CUDA) ===
 if errorlevel 1 echo( (warning) tool download had issues; continuing...
-rem Ensure Transformers on CPU
-if exist ".venv\Scripts\python.exe" call ".venv\Scripts\python.exe" -m pip install --no-cache-dir --upgrade transformers>=4.51.3,<5 "safetensors>=0.4.3"
 call ".venv\Scripts\python.exe" -u scripts\download_externals.py --all
 
 IF %ERRORLEVEL% NEQ 0 (
@@ -918,13 +927,7 @@ IF %ERRORLEVEL% NEQ 0 (
   pause >nul
   goto :eof
 )
-if errorlevel 1 echo( (warning) model download had issues; continuing...
-  if errorlevel 1 (
-    echo [Validation failed] — see messages above.
-    pause
-  ) else (
-    echo [Validation OK]
-  )
+
 echo === VERSION SUMMARY ===
 call ".venv\Scripts\python.exe" -c "import sys;import pkgutil;import importlib;mods=[\'diffusers\',\'transformers\',\'huggingface_hub\',\'torch\'];print(\'Python:\',sys.version.split()[0]);print(\'CUDA torch:\',__import__(\'torch\').version.cuda);print(\'\'.join([m+\' \'+__import__(m).__version__+\'\n\' for m in mods if pkgutil.find_loader(m)]))"
 if errorlevel 1 echo( (warning) model download had issues; continuing...
@@ -946,11 +949,8 @@ if exist "framevision_run.py" (
 call :ensure_python
 call :ensure_venv
 call :pip_upgrade
-echo Ensuring compatible Transformers/Tokenizers...
-if exist ".venv\Scripts\python.exe" call ".venv\Scripts\python.exe" -m pip install --no-cache-dir --upgrade "transformers>=4.56.1,<5" "tokenizers>=0.22,<0.24"
-
 if exist scripts\external_downloader.py (
-  rem noop
+  call ".venv\Scripts\python.exe" scripts\external_downloader.py >nul 2>nul
 )
 echo Installing CUDA stack...
 if exist ".venv\Scripts\python.exe" call ".venv\Scripts\python.exe" -m pip install --no-cache-dir --force-reinstall torch==2.3.1+cu121 --index-url https://download.pytorch.org/whl/cu121
@@ -960,33 +960,37 @@ if exist requirements-core.txt (
 if exist ".venv\Scripts\python.exe"   call ".venv\Scripts\python.exe" -m pip install --no-cache-dir --upgrade -r requirements-core.txt
   if errorlevel 1 goto pip_fail
 )
-echo Installing Diffusers ^& friends for TXT->IMG...
-if exist ".venv\Scripts\python.exe" call ".venv\Scripts\python.exe" -m pip install --no-cache-dir --upgrade "diffusers==0.35.1" "transformers>=4.51.3,<5" "huggingface_hub==0.34.4" "safetensors>=0.4.3" "pillow==11.3.0"
+echo Installing Diffusers for TXT->IMG...
 if errorlevel 1 goto pip_fail
 if exist requirements-gpu.txt (
 if exist ".venv\Scripts\python.exe"   call ".venv\Scripts\python.exe" -m pip install --no-cache-dir --upgrade diffusers>=0.30.0
+rem call :maybe_install_qwen_t2i
 
 if exist ".venv\Scripts\python.exe"   call ".venv\Scripts\python.exe" -m pip install --no-cache-dir --upgrade -r requirements-gpu.txt
   if errorlevel 1 goto pip_fail
 )
 rem === Download tools & models for GPU (CUDA) ===
 if errorlevel 1 echo( (warning) tool download had issues; continuing...
-rem Ensure Transformers
-if exist ".venv\Scripts\python.exe" call ".venv\Scripts\python.exe" -m pip install --no-cache-dir --upgrade transformers>=4.51.3,<5 "safetensors>=0.4.3"
+rem Ensure Transformers for Qwen
 call ".venv\Scripts\python.exe" -u scripts\download_externals.py --all
 if errorlevel 1 echo( (warning) model download had issues; continuing...
+rem Validate local Qwen20B model if present
+  call ".venv\Scripts\python.exe" -u scripts\qwen20b_validate.py ".\models\Qwen20B"
+)
 if errorlevel 1 echo( (warning) model download had issues; continuing...
 
-  pause
-call :pip_upgrade
-if exist ".venv\Scripts\python.exe" call ".venv\Scripts\python.exe" -m pip install --no-cache-dir --upgrade pip
-call ".venv\Scripts\python.exe" -m pip install --no-cache-dir --upgrade "huggingface_hub>=0.34.4" "diffusers==0.35.1" "transformers>=4.51.3,<5" "safetensors>=0.4.4" "pillow==10.4.0"
-if exist scripts\external_downloader.py (
-  rem noop
+
+echo > ".installed_gpu"
+if exist "framevision_run.py" (
+  echo CUDA install complete. Launching FrameVision...
+  start "" "start.bat"
+  goto end
 ) else (
-  echo [info] external_downloader.py not found. Assuming models are pre-copied.
+  echo CUDA install complete, but framevision_run.py is missing; returning to menu.
+  pause
+  goto menu
 )
-pause
+
 :pip_fail
 echo.
 echo One or more install steps failed.
@@ -994,38 +998,10 @@ echo Close all Python apps and retry if DLLs were locked.
 pause
 goto menu
 
-:t2i_enable
-:t2i_skip
-:t2i_yes
 
-rem Detect pre-copied model files
-set "T2I_FOUND="
-
-if defined T2I_FOUND (
-  rem noop
-) else (
-  if exist "scripts\external_downloader.py" if exist ".\.venv\Scripts\python.exe" (
-    echo [info] Attempting model fetch via scripts\external_downloader.py (guarded).
-    echo [info] If your downloader expects args, it may be a no-op; this call is non-fatal.
-  ) else (
-    echo [warn] Skipping auto-download (downloader or venv not present).
-  )
-)
-
-rem Validate again after possible download
-set "T2I_READY="
-
-if defined T2I_READY (
-  rem noop
-) else (
-  rem noop
-)
-goto :eof
-
-:t2i_skip
-goto :eof
 :end
 exit /b 0
 
-REM >>> FRAMEVISION_QWEN_BEGIN
 
+
+call start.bat
