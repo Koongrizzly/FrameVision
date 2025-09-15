@@ -25,10 +25,10 @@ start.bat
 3. Starts the background worker.
 
 ### Installer Menu Options
-- **Sytem check:** check diskspace, Cpu/Gpu, basic system info, python, creates venv etc and gives advice on what to use in the installer
+- **Sytem check:** check diskspace, Cpu/Gpu, basic system info, python, venv etc and gives advice on what to use in the installer
 - **Core Install:** App only (minimal).
-- **Full CPU Install:** Torch CPU + models/binaries.+ option for SD15 txt2img
-- **Full CUDA Install:** Torch CUDA + models/binaries.option for SDXL txt2img
+- **Full CPU Install:** Torch CPU + models/binaries.+ (roadmap for) SD15 txt2img model loader
+- **Full CUDA Install:** Torch CUDA + models/binaries + SDXL txt2img model loader
   
 ---
 
@@ -169,6 +169,7 @@ WORK IN PROGRESS CURRENTLY IN BETA
 - Prompt & negative prompt support with quick style presets.
 - Seed policies: Fixed / Random / Increment.
 - Mutiple presets
+- Lora support
 - Multi model selector
   Comes with default model to work out of the box
   download your favorite model (juggernaut etc) and use it directly in the app
