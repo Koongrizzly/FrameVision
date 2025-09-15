@@ -647,13 +647,13 @@ class VideoPane(QWidget):
         except Exception:
             pass
         bar = QHBoxLayout()
-        self.btn_open=QPushButton("📂"); self.btn_open.setToolTip("Open"); self.btn_play=QPushButton("▶︎"); self.btn_play.setToolTip("Play"); self.btn_pause=QPushButton("⏸"); self.btn_pause.setToolTip("Pause"); self.btn_pause.setVisible(False); self.btn_pause.setEnabled(False); self.btn_pause.setStyleSheet("background: transparent; border: none; padding: 0;")
-        self.btn_stop=QPushButton("■"); self.btn_stop.setToolTip("Stop"); self.btn_info=QPushButton("ℹ"); self.btn_info.setToolTip("Info"); self.btn_fs=QPushButton("⛶"); self.btn_fs.setToolTip("Fullscreen")
+        self.btn_open=QPushButton("📂"); self.btn_open.setToolTip(""); self.btn_play=QPushButton("▶"); self.btn_play.setToolTip(""); self.btn_pause=QPushButton("▮▮"); self.btn_pause.setToolTip(""); self.btn_pause.setVisible(False); self.btn_pause.setEnabled(False); self.btn_pause.setStyleSheet("background: transparent; border: none; padding: 0;")
+        self.btn_stop=QPushButton("■"); self.btn_stop.setToolTip(""); self.btn_info=QPushButton("ℹ"); self.btn_info.setToolTip(""); self.btn_fs=QPushButton("⛶"); self.btn_fs.setToolTip("")
         self.btn_ratio = None  # removed; # ratio button removed
         for b in [self.btn_open, self.btn_play, self.btn_stop, self.btn_info, self.btn_fs]: bar.addWidget(b)
-        self.btn_compare = QPushButton("▷│◁"); self.btn_compare.setToolTip("Compare view"); bar.addWidget(self.btn_compare)
+        self.btn_compare = QPushButton("▷│◁"); self.btn_compare.setToolTip(""); bar.addWidget(self.btn_compare)
         # Quick Upscale button
-        self.btn_upscale = QPushButton("Upscale"); self.btn_upscale.setToolTip("Upscale")
+        self.btn_upscale = QPushButton("Upscale"); self.btn_upscale.setToolTip("")
         self.btn_upscale.setObjectName("btn_upscale_quick")
         try:
             self.btn_upscale.setStyleSheet(
@@ -1115,8 +1115,8 @@ class VideoPane(QWidget):
 
     def _sync_play_button(self):
         try:
-            icon_play = "▶︎"
-            icon_pause = "⏸︎"
+            icon_play = "▶"
+            icon_pause = "▮▮"
             if self.player.playbackState() == QMediaPlayer.PlayingState:
                 self.btn_play.setText(icon_pause)
             else:
@@ -1291,7 +1291,7 @@ class VideoPane(QWidget):
             try:
                 from PySide6.QtWidgets import QPushButton
                 pp = QPushButton("⏸" if self.player.playbackState()==QMediaPlayer.PlayingState else "▶", bar)
-                pp.setToolTip("Play/Pause")
+                pp.setToolTip("")
                 h.insertWidget(0, pp, 0)
                 self._fs_btn_pp = pp
                 def _fs_sync_pp():
@@ -1835,35 +1835,9 @@ class QueuePane(QWidget):
                     existing_keys[str(key)] = i
         except Exception:
             existing_keys = {}
-        # We'll build desired file list below; we'll remove missing keys after we know them
-    
+        
+        # Build desired file list first (path + sort key)
         files = []
-        files_paths = [p for (p, _) in files]
-
-        # Remove items not in the target set to keep list accurate
-        try:
-            from PySide6.QtCore import Qt
-            target = set(str(p) for p in files_paths) if 'files_paths' in locals() else set(str(p) for p, _ in files)
-        except Exception:
-            target = set(str(p) for p, _ in files)
-        try:
-            i = widget.count() - 1
-            while i >= 0:
-                it = widget.item(i)
-                key = None
-                try:
-                    key = it.data(Qt.UserRole)
-                except Exception:
-                    key = None
-                if key is None:
-                    w = widget.itemWidget(it)
-                    key = getattr(w, 'path', None) if w is not None else None
-                if (key is None) or (str(key) not in target):
-                    widget.takeItem(i)
-                i -= 1
-        except Exception:
-            pass
-  # will hold (path, sort_key)
         try:
             for p in folder.glob('*.json'):
                 name = p.name
@@ -1897,12 +1871,34 @@ class QueuePane(QWidget):
                     pass
                 files.append((sort_ts, p))
         except Exception:
-            files = []  # will hold (path, sort_key)
+            files = []
+
+        # Remove stale items not in target set (in-place, from bottom)
+        try:
+            from PySide6.QtCore import Qt
+            target = {str(p) for _, p in files}
+            i = widget.count() - 1
+            while i >= 0:
+                it = widget.item(i)
+                key = None
+                try:
+                    key = it.data(Qt.UserRole)
+                except Exception:
+                    key = None
+                if key is None:
+                    w = widget.itemWidget(it)
+                    key = getattr(w, 'path', None) if w is not None else None
+                if (key is None) or (str(key) not in target):
+                    widget.takeItem(i)
+                i -= 1
+        except Exception:
+            pass
+
+        # Add or refresh rows (preserve order by newest first)
         for _ts, p in sorted(files, key=lambda t_p: t_p[0], reverse=True):
-            # Skip add if item for this path already exists
             try:
                 from PySide6.QtCore import Qt
-                found = False
+                found = False; found_item = None
                 for _i in range(widget.count()):
                     _it = widget.item(_i)
                     _key = _it.data(Qt.UserRole)
@@ -1910,10 +1906,9 @@ class QueuePane(QWidget):
                         _w = widget.itemWidget(_it)
                         _key = getattr(_w, 'path', None) if _w is not None else None
                     if str(_key) == str(p):
-                        found = True; break
+                        found = True; found_item = _it; break
                 if found:
-                    # Optionally call a light refresh on existing widget if available
-                    _w = widget.itemWidget(_it)
+                    _w = widget.itemWidget(found_item)
                     try:
                         if hasattr(_w, 'refresh'):
                             _w.refresh()
@@ -1939,7 +1934,6 @@ class QueuePane(QWidget):
                 it.setData(Qt.UserRole, str(p))
             except Exception:
                 pass
-
     def request_refresh(self):
 
         try:
@@ -1985,6 +1979,12 @@ class QueuePane(QWidget):
         self._populate(JOBS_DIRS['failed'], self.lst_failed, 'failed')
         self._update_counts_label()
         self._update_worker_led()
+        try:
+            from datetime import datetime as _dt
+            if hasattr(self, 'last_updated'):
+                self.last_updated.setText(_dt.now().strftime("%H:%M:%S"))
+        except Exception:
+            pass
 
     def _update_counts_label(self):
         try:
@@ -2003,7 +2003,8 @@ class QueuePane(QWidget):
             pass
 
     def _on_queue_changed(self):
-        self.refresh()
+        # Use debounced refresh to avoid thrash
+        self.request_refresh()
 
     # --- Queue actions (filesystem-based; minimal and safe) ---
     def _selected_job_path(self):
@@ -2179,6 +2180,37 @@ class QueuePane(QWidget):
             self.auto_timer.stop()
         except Exception:
             pass
+        try:
+            self.watch_timer.stop()
+        except Exception:
+            pass
+        try:
+            self.worker_timer.stop()
+        except Exception:
+            pass
+
+    def start_auto(self):
+        # Start/Restart timers safely and schedule a debounced refresh
+        try:
+            self.auto_timer.start()
+        except Exception:
+            pass
+        try:
+            self.watch_timer.start()
+        except Exception:
+            pass
+        try:
+            self.worker_timer.start()
+        except Exception:
+            pass
+        try:
+            self.request_refresh()
+        except Exception:
+            try:
+                self.refresh()
+            except Exception:
+                pass
+
 
     def closeEvent(self, e):
         try:

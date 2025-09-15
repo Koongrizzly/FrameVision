@@ -34,6 +34,25 @@ class JobRowWidget(QWidget):
             self.data = {}
         self._build()
 
+    
+    def refresh(self):
+        """Lightweight in-place update: reload JSON and refresh meta/progress."""
+        try:
+            self.data = json.loads(self.job_path.read_text(encoding='utf-8') or '{}')
+        except Exception:
+            self.data = self.data or {}
+        try:
+            self.meta.setText(self._build_meta())
+            # Update Open button visibility if status changed to terminal by external move
+            try:
+                # infer status from parent folder name if possible
+                parent = self.job_path.parent.name.lower()
+                term = parent in ('done','failed')
+                self.btn_open.setVisible(term)
+            except Exception:
+                pass
+        except Exception:
+            pass
     def _build(self):
         d = self.data or {}
         # Title: filename + type
