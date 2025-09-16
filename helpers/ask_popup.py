@@ -35,18 +35,50 @@ def _choose_device():
     except Exception:
         return "cpu", None
 
+
 def _qimage_to_pil(img: QImage):
+    """
+    Robust QImage -> PIL conversion that works with PySide6/PyQt5 memoryview/sip.voidptr,
+    handles stride (bytesPerLine), and falls back to a copy without requiring NumPy.
+    """
     try:
         from PIL import Image
     except Exception:
+        try:
+            _GLOBAL["pillow_missing"] = True
+        except Exception:
+            pass
         return None
     if img is None or img.isNull():
         return None
-    img = img.convertToFormat(QImage.Format_RGBA8888)
-    w, h = img.width(), img.height()
-    ptr = img.bits(); ptr.setsize(img.sizeInBytes())
-    pil = Image.frombuffer("RGBA", (w, h), bytes(ptr), "raw", "RGBA", 0, 1).convert("RGB")
-    return pil
+
+    qimg = img.convertToFormat(QImage.Format_RGBA8888)
+    w, h = qimg.width(), qimg.height()
+    bpl = qimg.bytesPerLine()
+
+    ptr = qimg.bits()  # memoryview (PySide6) or sip.voidptr (PyQt5)
+    try:
+        # PyQt5 path
+        ptr.setsize(qimg.sizeInBytes())
+    except Exception:
+        # PySide6 memoryview: size is already known
+        pass
+
+    buf = ptr.tobytes()
+
+    # Try zero-copy path that understands stride
+    try:
+        pil = Image.frombuffer("RGBA", (w, h), buf, "raw", "RGBA", bpl, 1)
+        return pil.convert("RGB")
+    except Exception:
+        # Fallback: build a contiguous RGBA buffer row by row (no stride)
+        row = w * 4
+        contiguous = bytearray(row * h)
+        for y in range(h):
+            start = y * bpl
+            contiguous[y*row:(y+1)*row] = buf[start:start+row]
+        pil = Image.frombuffer("RGBA", (w, h), bytes(contiguous), "raw", "RGBA", 0, 1)
+        return pil.convert("RGB")
 
 
 def _ensure_model_loaded():
@@ -54,25 +86,26 @@ def _ensure_model_loaded():
         return
     device, dtype = _choose_device()
     _GLOBAL["device"], _GLOBAL["dtype"] = device, dtype
-    from transformers import AutoProcessor, AutoModelForCausalLM
+    from transformers import AutoProcessor, Qwen2VLForConditionalGeneration
     if not (MODELS_FOLDER.exists() and any(MODELS_FOLDER.iterdir())):
         raise RuntimeError(f"Model not found at {MODELS_FOLDER}")
     _GLOBAL["processor"] = AutoProcessor.from_pretrained(
         str(MODELS_FOLDER), trust_remote_code=True, local_files_only=True, use_fast=True
     )
-    _GLOBAL["model"] = AutoModelForCausalLM.from_pretrained(
+    _GLOBAL["model"] = Qwen2VLForConditionalGeneration.from_pretrained(
         str(MODELS_FOLDER),
         trust_remote_code=True,
         local_files_only=True,
         torch_dtype=dtype
     ).to(device)
-    # Console debug
+    # Debug: show model class and vision capability
     try:
         _cls = type(_GLOBAL['model']).__name__
         has_vision = hasattr(_GLOBAL['model'], 'vision_tower') or hasattr(getattr(_GLOBAL['model'], 'config', object()), 'vision_config')
         print(f"[DEBUG] model_class={_cls} has_vision={has_vision}")
     except Exception as e:
         print(f"[DEBUG] model_class_check_error: {e}")
+
 
 @dataclass
 class GenConfig:
@@ -182,13 +215,14 @@ class ChatWorker(QThread):
     def run(self):
         try:
             _ensure_model_loaded()
+            # Show model class + vision capability in the chat transcript
             try:
                 m = _GLOBAL.get('model')
                 _cls = type(m).__name__ if m is not None else 'None'
                 has_vision = (hasattr(m, 'vision_tower') or hasattr(getattr(m, 'config', object()), 'vision_config')) if m is not None else False
                 self.chunk.emit(f"[DEBUG] model_class={_cls} has_vision={has_vision}\n")
-            except Exception:
-                pass
+            except Exception as e:
+                self.chunk.emit(f"[DEBUG] model_class_check_error: {e}\n")
             from transformers import TextIteratorStreamer
             import torch
 
@@ -262,7 +296,7 @@ class ChatWorker(QThread):
                         return_dict_in_generate=True
                     )
                 sequences = out.sequences if hasattr(out, "sequences") else out[0]
-                text = processor.batch_decode(sequences if isinstance(sequences, list) else [sequences], skip_special_tokens=True)[0]
+                text = processor.batch_decode(sequences[0] if isinstance(sequences[0], list) else [sequences[0]], skip_special_tokens=True)[0]
                 if text:
                     self.chunk.emit(text)
 
