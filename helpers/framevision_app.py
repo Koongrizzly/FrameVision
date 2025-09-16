@@ -1016,6 +1016,28 @@ class VideoPane(QWidget):
             p = _P(str(path))
         ext = p.suffix.lower()
 
+        # --- Keep app state in sync when media is opened programmatically ---
+        try:
+            main = self.window()
+            if main is not None:
+                try:
+                    main.current_path = p  # update source-of-truth path
+                except Exception:
+                    pass
+                try:
+                    if hasattr(main, 'hud') and hasattr(main.hud, 'set_info'):
+                        main.hud.set_info(p)  # refresh HUD
+                except Exception:
+                    pass
+                try:
+                    if hasattr(self, 'set_info_text'):
+                        self.set_info_text(compose_video_info_text(p))  # refresh info label
+                except Exception:
+                    pass
+        except Exception:
+            pass
+        # --- end state sync ---
+
         # Animated GIF -> QMovie on label
         if ext == '.gif':
             try: self._autoplay_request = False; self._mode = 'image'; self.currentFrame = None
