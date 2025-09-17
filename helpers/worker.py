@@ -273,10 +273,11 @@ def run(cmd):
         return subprocess.call(cmd)
 
 
-def _progress_set(pct: int):
 
+def _progress_set(pct: int):
     try:
         global PROGRESS_FILE, RUNNING_JSON_FILE
+        # Write sidecar progress file (optional consumer)
         if PROGRESS_FILE:
             p = Path(PROGRESS_FILE)
             p.parent.mkdir(parents=True, exist_ok=True)
@@ -288,17 +289,50 @@ def _progress_set(pct: int):
             except Exception:
                 # fallback write directly
                 p.write_text(data, encoding="utf-8")
-        # Also patch running job JSON so UI can display determinate %
+
+        # Patch running job JSON for UI (pct + elapsed + eta)
         if RUNNING_JSON_FILE and int(pct) >= 0:
             try:
                 rj = Path(RUNNING_JSON_FILE)
-                if rj.exists():
-                    j = json.loads(rj.read_text(encoding="utf-8"))
-                else:
-                    j = {}
+                j = json.loads(rj.read_text(encoding="utf-8")) if rj.exists() else {}
                 ipct = int(max(0, min(100, pct)))
-                if j.get("pct") != ipct:
-                    j["pct"] = ipct
+                changed = (j.get("pct") != ipct)
+                j["pct"] = ipct
+
+                # Compute timing fields from started_at
+                start = j.get("started_at")
+                if start:
+                    # Parse "YYYY-mm-dd HH:MM:SS"
+                    import time as _t
+                    try:
+                        t0 = _t.mktime(_t.strptime(str(start), "%Y-%m-%d %H:%M:%S"))
+                    except Exception:
+                        # Try ISO format fallback
+                        try:
+                            from datetime import datetime as _dt
+                            t0 = _dt.fromisoformat(str(start)).timestamp()
+                        except Exception:
+                            t0 = None
+                    if t0:
+                        elapsed = int(max(0, _t.time() - t0))
+                        if j.get("elapsed_sec") != elapsed:
+                            changed = True
+                        j["elapsed_sec"] = elapsed
+                        if 0 < ipct < 100:
+                            try:
+                                total_est = elapsed / (ipct / 100.0)
+                                eta = int(max(1, total_est - elapsed))
+                            except Exception:
+                                eta = None
+                            if eta is not None and j.get("eta_sec") != eta:
+                                changed = True
+                            j["eta_sec"] = eta
+                        else:
+                            if "eta_sec" in j:
+                                changed = True
+                            j["eta_sec"] = 0 if ipct >= 100 else None
+
+                if changed:
                     tmpj = rj.with_suffix(rj.suffix + ".tmp")
                     tmpj.write_text(json.dumps(j, indent=2), encoding="utf-8")
                     try:
@@ -309,6 +343,7 @@ def _progress_set(pct: int):
                 pass
     except Exception:
         pass
+
 
 def ffmpeg_path():
     cand = [ROOT/"bin"/("ffmpeg.exe" if os.name=="nt" else "ffmpeg"), ROOT/"presets"/"bin"/("ffmpeg.exe" if os.name=="nt" else "ffmpeg"), "ffmpeg"]

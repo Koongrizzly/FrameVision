@@ -1,14 +1,14 @@
 from __future__ import annotations
-import os, time, threading, random, re
+import os, time, threading, random, re, ctypes
 from dataclasses import dataclass
 from pathlib import Path
 from typing import List, Dict, Any, Optional
 
-from PySide6.QtCore import Qt, QThread, Signal, QEvent
-from PySide6.QtGui import QTextCursor, QImage, QKeyEvent
+from PySide6.QtCore import Qt, QThread, Signal, QEvent, QEventLoop, QRect, QPoint, QTimer, QEventLoop, QRect, QTimer, QEventLoop, QRect, QTimer, QProcess
+from PySide6.QtGui import QTextCursor, QImage, QKeyEvent, QGuiApplication, QPainter, QPainter, QGuiApplication, QPainter, QClipboard
 from PySide6.QtWidgets import (
     QDialog, QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton, QPlainTextEdit,
-    QCheckBox, QSpinBox, QDoubleSpinBox, QLabel as _QLabel, QApplication
+    QCheckBox, QSpinBox, QDoubleSpinBox, QLabel as _QLabel, QApplication, QInputDialog, QRubberBand, QInputDialog, QRubberBand
 )
 
 # === Model path (offline) ===
@@ -316,6 +316,205 @@ DEFAULT_SYSTEM = (
     "When a frame is attached, ground your answer in it."
 )
 
+
+
+# === In-app region overlay (child of main window) ===
+class _LocalRegionOverlay(QWidget):
+    selected = Signal(QRect)
+    cancelled = Signal()
+
+    def __init__(self, parent: QWidget):
+        super().__init__(parent)
+        self.setAttribute(Qt.WA_TransparentForMouseEvents, False)
+        self.setAttribute(Qt.WA_NoSystemBackground, True)
+        self.setAttribute(Qt.WA_TranslucentBackground, True)
+        self.setMouseTracking(True)
+        self.setCursor(Qt.CrossCursor)
+        self._rubber = QRubberBand(QRubberBand.Rectangle, self)
+        self._origin = None
+
+        # Fill entire parent area
+        self.setGeometry(parent.rect())
+        self.raise_()
+        self.show()
+
+    def paintEvent(self, ev):
+        # Dim only the app content, not the entire desktop
+        painter = QPainter(self)
+        painter.setOpacity(0.15)
+        painter.fillRect(self.rect(), Qt.black)
+        painter.end()
+
+    def keyPressEvent(self, ev):
+        if ev.key() == Qt.Key_Escape:
+            self._rubber.hide()
+            self.cancelled.emit()
+            self.close()
+
+    def mousePressEvent(self, ev):
+        if ev.button() == Qt.LeftButton:
+            self._origin = ev.pos()
+            self._rubber.setGeometry(QRect(self._origin, self._origin))
+            self._rubber.show()
+
+    def mouseMoveEvent(self, ev):
+        if self._rubber.isVisible() and self._origin is not None:
+            rect = QRect(self._origin, ev.pos()).normalized()
+            self._rubber.setGeometry(rect)
+
+    def mouseReleaseEvent(self, ev):
+        if ev.button() == Qt.LeftButton and self._rubber.isVisible():
+            rect = self._rubber.geometry().normalized()
+            self._rubber.hide()
+            self.selected.emit(rect)
+            self.close()
+
+    @staticmethod
+    def pick_in_parent(parent: QWidget) -> QRect:
+        # Modal mini-loop like in your menu approach
+        loop = QEventLoop()
+        result = {"rect": QRect()}
+        ov = _LocalRegionOverlay(parent)
+
+        ov.selected.connect(lambda r: (result.update(rect=r), loop.quit()))
+        ov.cancelled.connect(lambda: loop.quit())
+
+        # Ensure it's on top of the parent content
+        QTimer.singleShot(0, ov.raise_)
+        loop.exec()
+        return result["rect"]
+
+
+def _wait_ms(ms: int):
+    loop = QEventLoop()
+    QTimer.singleShot(ms, loop.quit)
+    loop.exec()
+
+# --- Windows BitBlt screen capture (avoids black screens) ---
+def _win_grab_rect_to_pil(x: int, y: int, w: int, h: int):
+    try:
+        from PIL import Image
+    except Exception:
+        return None
+    try:
+        if os.name != "nt":
+            return None
+        user32 = ctypes.windll.user32
+        gdi32 = ctypes.windll.gdi32
+
+        hdc_screen = user32.GetDC(0)
+        if not hdc_screen:
+            return None
+        hdc_mem = gdi32.CreateCompatibleDC(hdc_screen)
+        hbm = gdi32.CreateCompatibleBitmap(hdc_screen, w, h)
+        gdi32.SelectObject(hdc_mem, hbm)
+
+        SRCCOPY = 0x00CC0020
+        CAPTUREBLT = 0x40000000  # capture layered windows too
+        gdi32.BitBlt(hdc_mem, 0, 0, w, h, hdc_screen, x, y, SRCCOPY | CAPTUREBLT)
+
+        # Prepare BITMAPINFO for 32-bit BGRA
+        class BITMAPINFOHEADER(ctypes.Structure):
+            _fields_ = [
+                ("biSize", ctypes.c_uint32),
+                ("biWidth", ctypes.c_int32),
+                ("biHeight", ctypes.c_int32),
+                ("biPlanes", ctypes.c_uint16),
+                ("biBitCount", ctypes.c_uint16),
+                ("biCompression", ctypes.c_uint32),
+                ("biSizeImage", ctypes.c_uint32),
+                ("biXPelsPerMeter", ctypes.c_int32),
+                ("biYPelsPerMeter", ctypes.c_int32),
+                ("biClrUsed", ctypes.c_uint32),
+                ("biClrImportant", ctypes.c_uint32),
+            ]
+
+        class BITMAPINFO(ctypes.Structure):
+            _fields_ = [("bmiHeader", BITMAPINFOHEADER), ("bmiColors", ctypes.c_uint32 * 3)]
+
+        bi = BITMAPINFO()
+        ctypes.memset(ctypes.byref(bi), 0, ctypes.sizeof(bi))
+        bi.bmiHeader.biSize = ctypes.sizeof(BITMAPINFOHEADER)
+        bi.bmiHeader.biWidth = w
+        bi.bmiHeader.biHeight = -h  # top-down
+        bi.bmiHeader.biPlanes = 1
+        bi.bmiHeader.biBitCount = 32
+        bi.bmiHeader.biCompression = 0  # BI_RGB
+
+        buflen = w * h * 4
+        buffer = (ctypes.c_ubyte * buflen)()
+        got = gdi32.GetDIBits(hdc_mem, hbm, 0, h, ctypes.byref(buffer), ctypes.byref(bi), 0)
+        # Cleanup
+        gdi32.DeleteObject(hbm)
+        gdi32.DeleteDC(hdc_mem)
+        user32.ReleaseDC(0, hdc_screen)
+        if got == 0:
+            return None
+
+        # Build PIL image from BGRA buffer
+        img = Image.frombuffer("RGBA", (w, h), bytes(buffer), "raw", "BGRA", 0, 1).convert("RGB")
+        return img
+    except Exception:
+        return None
+
+# === Windows global snip helpers (use native Snipping Tool / Screen Snipping) ===
+def _win_launch_screenclip() -> bool:
+    """Try to start the native region snipping UI. Returns True if started."""
+    try:
+        if os.name != "nt":
+            return False
+        # Prefer the URI handler via explorer (Windows 10/11)
+        try:
+            ok = QProcess.startDetached("explorer.exe", ["ms-screenclip:"])
+            if ok:
+                return True
+        except Exception:
+            pass
+        # Fallbacks
+        try:
+            snip = os.path.join(os.environ.get("WINDIR","C:\\Windows"), "System32", "ScreenSnipping.exe")
+            if os.path.exists(snip):
+                return QProcess.startDetached(snip, [])
+        except Exception:
+            pass
+        try:
+            snip2 = os.path.join(os.environ.get("WINDIR","C:\\Windows"), "System32", "SnippingTool.exe")
+            if os.path.exists(snip2):
+                return QProcess.startDetached(snip2, ["/clip"])
+        except Exception:
+            pass
+    except Exception:
+        return False
+    return False
+
+def _wait_clipboard_qimage(timeout_ms: int = 15000):
+    """Wait until an image appears on the clipboard or timeout. Returns QImage or None."""
+    cb = QGuiApplication.clipboard()  # type: QClipboard
+    try:
+        cb.clear()
+    except Exception:
+        pass
+
+    elapsed = 0
+    step = 50
+    while elapsed < timeout_ms:
+        QGuiApplication.processEvents()
+        img = cb.image()
+        if img is not None and not img.isNull() and img.width() > 0 and img.height() > 0:
+            return img
+        QTimer.singleShot(step, lambda: None)
+        loop = QEventLoop(); QTimer.singleShot(step, loop.quit); loop.exec()
+        elapsed += step
+    return None
+
+def _win_global_snip_to_qimage(max_wait_ms: int = 15000):
+    """Launch native snip, wait for user region selection, and return clipboard image as QImage."""
+    if os.name != "nt":
+        return None
+    started = _win_launch_screenclip()
+    if not started:
+        return None
+    return _wait_clipboard_qimage(timeout_ms=max_wait_ms)
 class AskPopup(QDialog):
     def __init__(self, parent: QWidget | None = None):
         super().__init__(parent)
@@ -345,12 +544,15 @@ class AskPopup(QDialog):
         self.chk_attach = QCheckBox("Attach current frame"); row.addWidget(self.chk_attach)
         self.chk_stream = QCheckBox("Stream"); self.chk_stream.setChecked(True); row.addWidget(self.chk_stream)
         row.addStretch(1)
+        self.btn_screenshot = QPushButton("Screenshot")
+        row.addWidget(self.btn_screenshot)
         self.btn_reset = QPushButton("Reset"); self.btn_close = QPushButton("Close"); self.btn_send = QPushButton("Send")
         row.addWidget(self.btn_reset); row.addWidget(self.btn_close); row.addWidget(self.btn_send); root.addLayout(row)
 
         self.btn_close.clicked.connect(self.close)
         self.btn_reset.clicked.connect(self._on_reset)
         self.btn_send.clicked.connect(self._on_send)
+        self.btn_screenshot.clicked.connect(self._on_screenshot)
 
     def _append(self, who: str, text: str = ""):
         if who: self.transcript.appendPlainText(f"{who}: {text}")
@@ -431,6 +633,82 @@ class AskPopup(QDialog):
 
     def _on_reset(self):
         self.transcript.clear(); self.input.clear(); self._history.clear(); self.status.setText("")
+
+    def _on_screenshot(self):
+        # Ask for delay in seconds
+        sec, ok = QInputDialog.getInt(self, "Screenshot", "How long before I take the screenshot (seconds)?", 3, 0, 300, 1)
+        if not ok:
+            return
+        self.status.setText(f"Waiting {sec}s…")
+        def _do_capture():
+            # Delay
+            if sec > 0:
+                _wait_ms(int(sec*1000))
+
+            # On Windows: Use native global snip so user can select ANYWHERE on screen
+            if os.name == "nt":
+                self.hide(); QGuiApplication.processEvents()
+                qimg = _win_global_snip_to_qimage(max_wait_ms=20000)
+                self.show(); QGuiApplication.processEvents()
+                if qimg is not None and not qimg.isNull():
+                    self._send_image_question(qimg)
+                    return
+                # If it failed, fall back to in-app overlay
+                self.status.setText("Global snip unavailable or cancelled. Falling back to app-window capture…")
+
+            # Fallback: in-app overlay (select inside this app window)
+            main = self.window()
+            if main is None or not isinstance(main, QWidget):
+                self.status.setText("No main window to capture."); return
+
+            rect = _LocalRegionOverlay.pick_in_parent(main)
+            if rect.isNull() or rect.width() == 0 or rect.height() == 0:
+                self.status.setText("Screenshot cancelled."); return
+
+            pm = main.grab(rect)
+            if pm.isNull():
+                self.status.setText("Grab failed."); return
+            self._send_image_question(pm.toImage())
+        QTimer.singleShot(0, _do_capture)
+
+    def _send_image_question(self, img):
+        # Convert and send as: 'what do you see'
+        from PIL import Image
+        pil = None
+        try:
+            if isinstance(img, Image.Image):
+                pil = img
+            else:
+                pil = _qimage_to_pil(img)
+        except Exception:
+            pil = _qimage_to_pil(img)
+        if pil is None:
+            self._debug("Failed to convert screenshot to PIL."); return
+
+        # Heuristic: avoid sending all-black/empty captures
+        try:
+            extrema = pil.convert("L").getextrema()
+            if extrema and extrema[0] == extrema[1] and extrema[0] in (0, 1):
+                self._debug("Screenshot appears black; not sending."); return
+        except Exception:
+            pass
+
+        q = "what do you see"
+
+        self._append("You", q + "  [screenshot attached]")
+        self._append("Assistant", "")
+
+        extra_sys = self.system.toPlainText()
+        gen = GenConfig(temperature=float(self.spin_temp.value()), max_new_tokens=int(self.spin_max.value()), repetition_penalty=1.05)
+        msgs = _build_messages(extra_sys, self._history, q, pil)
+
+        self.btn_send.setEnabled(False)
+        self.worker = ChatWorker(msgs, pil, gen, stream=self.chk_stream.isChecked(), parent=self)
+        self.worker.chunk.connect(self._append_inline)
+        self.worker.done.connect(self._on_done)
+        self.worker.error.connect(self._on_error)
+        self.worker.start()
+        self.status.setText("Sending screenshot…")
 
     def _on_send(self):
         q = (self.input.toPlainText() or "").strip()
