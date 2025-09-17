@@ -750,6 +750,8 @@ class VideoPane(QWidget):
         self._mode = 'video'
     
     def _on_frame(self, frame):
+        if getattr(self, '_mode', None) != 'video':
+            return
         # Lightweight: store the image and schedule a coalesced present (zoom untouched)
         try:
             if not self.isVisible() or not self.label.isVisible():
@@ -1016,27 +1018,23 @@ class VideoPane(QWidget):
             p = _P(str(path))
         ext = p.suffix.lower()
 
-        # --- Keep app state in sync when media is opened programmatically ---
+
         try:
-            main = self.window()
-            if main is not None:
+            _w = self.window() if hasattr(self, 'window') else None
+            if _w is not None and hasattr(_w, 'current_path'):
+                _w.current_path = p
+                if hasattr(_w, 'hud') and hasattr(_w.hud, 'set_info'):
+                    try: _w.hud.set_info(p)
+                    except Exception: pass
                 try:
-                    main.current_path = p  # update source-of-truth path
-                except Exception:
-                    pass
-                try:
-                    if hasattr(main, 'hud') and hasattr(main.hud, 'set_info'):
-                        main.hud.set_info(p)  # refresh HUD
-                except Exception:
-                    pass
-                try:
-                    if hasattr(self, 'set_info_text'):
-                        self.set_info_text(compose_video_info_text(p))  # refresh info label
-                except Exception:
-                    pass
-        except Exception:
-            pass
-        # --- end state sync ---
+                    if 'compose_video_info_text' in globals():
+                        self.set_info_text(compose_video_info_text(p))
+                    elif 'compose_image_info_text' in globals():
+                        self.set_info_text(compose_image_info_text(p))
+                    else:
+                        self.set_info_text(str(p))
+                except Exception: pass
+        except Exception: pass
 
         # Animated GIF -> QMovie on label
         if ext == '.gif':
@@ -1067,6 +1065,7 @@ class VideoPane(QWidget):
                 # Fallback: first frame as still image
                 pm = load_pixmap(p)
                 if pm and not pm.isNull():
+                    self.label.setMovie(None)
                     self.label.setPixmap(pm)
                     try: self._refresh_label_pixmap()
                     except Exception: pass
@@ -1115,9 +1114,13 @@ class VideoPane(QWidget):
         if ext in AUDIO_EXTS:
             try: self.slider.setEnabled(True)
             except Exception: pass
+            self._mode = 'video'
+            self.label.setMovie(None)
             self.player.setSource(QUrl.fromLocalFile(str(p)))
-            try: self.player.play()
-            except Exception: pass
+            try:
+                self.player.play()
+            except Exception:
+                pass
             try: self.label.setText(p.name)
             except Exception: pass
             return
@@ -1126,6 +1129,17 @@ class VideoPane(QWidget):
         try: self.slider.setEnabled(True)
         except Exception: pass
         try: self._image_pm_orig = None
+        except Exception: pass
+        
+        try: self._mode = 'video'
+        except Exception: pass
+        try:
+            # Ensure label is not stuck on a previous still/GIF overlay
+            self.label.setMovie(None)
+        except Exception: pass
+        try:
+            from PySide6.QtGui import QPixmap as _QPM
+            self.label.setPixmap(_QPM())  # clear old still image
         except Exception: pass
         self.player.setSource(QUrl.fromLocalFile(str(p)))
         try: self.player.play()

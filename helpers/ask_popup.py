@@ -516,6 +516,21 @@ def _win_global_snip_to_qimage(max_wait_ms: int = 15000):
         return None
     return _wait_clipboard_qimage(timeout_ms=max_wait_ms)
 class AskPopup(QDialog):
+
+    def _sanitize_text(self, text: str) -> str:
+        if not text:
+            return text
+        lines = []
+        for line in str(text).splitlines():
+            if line.startswith("[DEBUG]"):
+                continue
+            if line.strip().lower() in {"system", "user", "assistant"}:
+                continue
+            lines.append(line)
+        cleaned = "\n".join(lines)
+        cleaned = cleaned.replace("", "")
+        return cleaned
+
     def __init__(self, parent: QWidget | None = None):
         super().__init__(parent)
         self.setWindowTitle("Ask")
@@ -555,11 +570,13 @@ class AskPopup(QDialog):
         self.btn_screenshot.clicked.connect(self._on_screenshot)
 
     def _append(self, who: str, text: str = ""):
+        text = self._sanitize_text(text)
         if who: self.transcript.appendPlainText(f"{who}: {text}")
         else: self.transcript.appendPlainText(text)
         self.transcript.moveCursor(QTextCursor.End)
 
     def _append_inline(self, text: str):
+        text = self._sanitize_text(text)
         c = self.transcript.textCursor(); c.movePosition(QTextCursor.End); c.insertText(text); self.transcript.setTextCursor(c); self.transcript.ensureCursorVisible()
 
     def _debug(self, msg: str):
