@@ -617,6 +617,10 @@ class VideoPane(QWidget):
             pass
 
     def __init__(self,parent=None):
+        # TODO: Future: audio visualizer / track info / thumbnail for audio-only playback
+        # FPS throttle stripped — keep inert placeholders
+        self._render_timer = None
+        self._target_fps = None
         super().__init__(parent)
         self.player = QMediaPlayer(self); self.audio = QAudioOutput(self); self.player.setAudioOutput(self.audio)
         self.sink = QVideoSink(self); self.player.setVideoSink(self.sink); self.sink.videoFrameChanged.connect(self._on_frame)
@@ -1141,6 +1145,14 @@ class VideoPane(QWidget):
             from PySide6.QtGui import QPixmap as _QPM
             self.label.setPixmap(_QPM())  # clear old still image
         except Exception: pass
+        # Stop any active GIF/QMovie to prevent an overlay from sticking
+        try:
+            if hasattr(self, "_gif_movie") and self._gif_movie:
+                self._gif_movie.stop()
+                self._gif_movie = None
+        except Exception:
+            pass
+
         self.player.setSource(QUrl.fromLocalFile(str(p)))
         try: self.player.play()
         except Exception: pass

@@ -50,11 +50,11 @@ def _name(w: QWidget, fallback_prefix: str) -> str:
 def restore_all(root: QWidget) -> None:
 
     if isinstance(root, QMainWindow):
-        # Force start mode: 'fullscreen' (default) or 'maximized'
+        # Force start mode: 'maximized' (default) or 'fullscreen'
         # Change via QSettings("FrameVision","FrameVision").setValue("startup/force_mode", "maximized")
         s = QSettings("FrameVision","FrameVision")
-        mode = s.value("startup/force_mode", "fullscreen")
-        mode = (str(mode).strip().lower() if mode is not None else "fullscreen")
+        mode = s.value("startup/force_mode", "maximized")
+        mode = (str(mode).strip().lower() if mode is not None else "maximized")
         # Decide desired flag but DO NOT call show* here (prevents flashing main before intro)
         try:
             if mode in ("fullscreen", "full", "fs"):

@@ -10,6 +10,10 @@ from typing import List, Tuple, Optional
 from helpers.mediainfo import refresh_info_now
 
 from PySide6 import QtCore, QtWidgets
+try:
+    from helpers.queue_adapter import jobs_dirs
+except Exception:
+    jobs_dirs = None  # type: ignore
 from PySide6.QtCore import Qt, Signal, QSize, QTimer
 from PySide6.QtGui import QTextCursor, QPixmap, QIcon
 
@@ -151,6 +155,116 @@ class _RunThread(QtCore.QThread):
 
 
 class UpscPane(QtWidgets.QWidget):
+    
+    # --- queue result watcher (mirrors logic from Interp tab) ---
+    def _ensure_watch_timer(self):
+        try:
+            if getattr(self, "_watch_timer", None) is None:
+                self._watch_timer = QtCore.QTimer(self)
+                self._watch_timer.setInterval(800)
+                try:
+                    self._watch_timer.timeout.disconnect()
+                except Exception:
+                    pass
+                self._watch_timer.timeout.connect(self._check_job_done)
+        except Exception:
+            pass
+    
+    def _start_watch(self, job_ret=None):
+        # Capture job id from the enqueuer's return (usually a job file path), if available
+        try:
+            from pathlib import Path as _P
+            if job_ret:
+                jid = None
+                try:
+                    jid = _P(str(job_ret)).stem.split("_", 1)[0]
+                except Exception:
+                    jid = None
+                if jid:
+                    self._last_job_id = jid
+        except Exception:
+            pass
+        # Ensure expected output is tracked (prefer _last_outfile set by build logic)
+        try:
+            if getattr(self, "_last_outfile", None):
+                self._last_expected_output = str(self._last_outfile)
+        except Exception:
+            pass
+        # Start polling for job completion
+        try:
+            self._ensure_watch_timer()
+            if getattr(self, "_watch_timer", None) is not None:
+                self._watch_timer.start()
+        except Exception:
+            pass
+    
+    def _check_job_done(self):
+        # Stop if we don't have a job id or queue dirs
+        jid = getattr(self, "_last_job_id", None)
+        if not jid or jobs_dirs is None:
+            try:
+                self._watch_timer.stop()
+            except Exception:
+                pass
+            return
+        try:
+            from pathlib import Path as _P
+            d = jobs_dirs()
+            done_dir = _P(d.get("done", ""))
+            if not done_dir.exists():
+                self._watch_timer.stop(); return
+            # Find completion JSON for this job id
+            for j in sorted(done_dir.glob(f"{jid}_*.json")):
+                try:
+                    self._watch_timer.stop()
+                except Exception:
+                    pass
+    
+                # Determine output path
+                outp = getattr(self, "_last_expected_output", None) or ""
+                if not outp:
+                    try:
+                        data = json.loads(_P(j).read_text(encoding="utf-8", errors="ignore"))
+                        outp = data.get("produced", "") or data.get("output", "") or ""
+                    except Exception:
+                        outp = ""
+    
+                if outp:
+                    try:
+                        self._add_recent(_P(outp))
+                    except Exception:
+                        pass
+                    try:
+                        self._refresh_recents_gallery()
+                    except Exception:
+                        pass
+                    # Honor the 'play in player' toggle
+                    use_player = False
+                    try:
+                        use_player = bool(getattr(self, "chk_play_internal", None) and self.chk_play_internal.isChecked())
+                    except Exception:
+                        use_player = False
+                    if use_player:
+                        try:
+                            self._play_in_player(_P(outp))
+                        except Exception:
+                            try:
+                                self._open_file(_P(outp))
+                            except Exception:
+                                pass
+                    else:
+                        try:
+                            self._open_file(_P(outp))
+                        except Exception:
+                            pass
+                break  # handled this job id; exit
+        except Exception:
+            try:
+                self._watch_timer.stop()
+            except Exception:
+                pass
+            return
+    
 
 
     def _confirm_batch_outdir(self, files, proposed_outdir: Path):
@@ -253,6 +367,7 @@ class UpscPane(QtWidgets.QWidget):
     
                 try:
     
+                    self._last_outfile = _qq_out
                     _qq_ok = bool(_fv_call_enqueue(self, enq, where, _qq_cmds, open_on_success=bool(_qq_out)))
     
                 except Exception:
@@ -2019,6 +2134,7 @@ def _fv_find_enqueue(self):
     return candidates[0] if candidates else (None, "")
 
 def _fv_call_enqueue(self, enq, where_label, cmds, open_on_success):
+    _ret = None
     """Try to call enqueue either with a job dict, or with signature (input_path, out_dir, factor, model)."""
     sig = None
     try:
@@ -2070,10 +2186,18 @@ def _fv_call_enqueue(self, enq, where_label, cmds, open_on_success):
         params = list(sig.parameters.keys())
         if params[:4] == ["input_path", "out_dir", "factor", "model"] or set(("input_path","out_dir","factor","model")).issubset(set(params)):
             try:
-                enq(job_type=('upscale_photo' if str(Path(input_path)).lower().endswith(tuple(_IMAGE_EXTS)) else 'upscale_video'), input_path=input_path, out_dir=out_dir, factor=factor, model=model_name)
+                _ret = enq(job_type=('upscale_photo' if str(Path(input_path)).lower().endswith(tuple(_IMAGE_EXTS)) else 'upscale_video'), input_path=input_path, out_dir=out_dir, factor=factor, model=model_name)
                 try:
                     self._append_log(f"Queued via {where_label} (kwargs).")
                 except Exception: pass
+                try:
+
+                    self._start_watch(_ret)
+
+                except Exception:
+
+                    pass
+
                 return True
             except Exception as e:
                 try: self._append_log(f"Queue error via {where_label}: {e}")
@@ -2091,7 +2215,7 @@ def _fv_call_enqueue(self, enq, where_label, cmds, open_on_success):
             "output": str(getattr(self, "_last_outfile", "")),
         }
         try:
-            enq(job)
+            _ret = enq(job)
         except Exception as e:
             try: self._append_log(f"Queue error via {where_label}: {e}")
             except Exception: pass
@@ -2100,6 +2224,14 @@ def _fv_call_enqueue(self, enq, where_label, cmds, open_on_success):
         self._append_log(f"Queued {len(cmds)} job(s) via {where_label}")
     except Exception:
         pass
+    try:
+
+        self._start_watch(_ret)
+
+    except Exception:
+
+        pass
+
     return True
 
 try:
