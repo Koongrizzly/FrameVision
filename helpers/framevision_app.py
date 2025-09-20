@@ -75,8 +75,8 @@ except Exception:
 from pathlib import Path
 import os
 from datetime import datetime
-from PySide6.QtCore import Qt, QTimer, QUrl, Signal, QRect, QEasingCurve, QPropertyAnimation, QByteArray, QEvent
-from PySide6.QtCore import QSettings
+from PySide6.QtCore import QUrl, Qt, QTimer, QUrl, Signal, QRect, QEasingCurve, QPropertyAnimation, QByteArray, QEvent
+from PySide6.QtCore import QUrl, QSettings
 from PySide6.QtGui import QAction, QPixmap, QImage, QKeySequence, QColor, QDesktopServices, QShortcut
 from PySide6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QGridLayout, QLabel, QPushButton, QFileDialog, QTabWidget, QSplitter, QListWidget, QListWidgetItem, QLineEdit, QFormLayout, QMessageBox, QComboBox, QSpinBox, QDoubleSpinBox, QTextEdit, QCheckBox, QTreeWidget, QTreeWidgetItem, QHeaderView, QStyle, QSlider, QToolButton, QSizePolicy, QScrollArea, QFrame, QGroupBox, QScrollArea, QFrame)
 from PySide6.QtMultimedia import QMediaPlayer, QAudioOutput, QVideoSink
@@ -117,7 +117,7 @@ ROOT = Path(".").resolve()
 # --- Grabbable Splitter with themed hover/arrow & cursor ----------------------
 from PySide6.QtWidgets import QSplitter, QSplitterHandle
 from PySide6.QtGui import QPainter, QPen, QBrush, QPixmap, QCursor
-from PySide6.QtCore import QPoint
+from PySide6.QtCore import QUrl, QPoint
 
 def _format_temp_units(celsius_int: int) -> str:
     try:
@@ -566,7 +566,7 @@ class VideoPane(QWidget):
             if pm is None or pm.isNull():
                 return pm
             z = float(getattr(self, '_zoom', 1.0) or 1.0)
-            from PySide6.QtCore import QSize
+            from PySide6.QtCore import QUrl, QSize
             if z < 1.0:
                 sw = max(1, int(round(pm.width() * z)))
                 sh = max(1, int(round(pm.height() * z)))
@@ -797,7 +797,7 @@ class VideoPane(QWidget):
             return
         self._present_pending = True
         try:
-            from PySide6.QtCore import QTimer
+            from PySide6.QtCore import QUrl, QTimer
             QTimer.singleShot(0, self._present_current_frame)
         except Exception:
             try:
@@ -940,7 +940,7 @@ class VideoPane(QWidget):
             if mode == 0:  # Center
                 if z < 1.0:
                     # Scale down only, keep centered
-                    from PySide6.QtCore import QSize
+                    from PySide6.QtCore import QUrl, QSize
                     sw = max(1, int(round(pm.width() * z)))
                     sh = max(1, int(round(pm.height() * z)))
                     spm = pm.scaled(QSize(sw, sh), Qt.KeepAspectRatio, Qt.SmoothTransformation)
@@ -948,7 +948,7 @@ class VideoPane(QWidget):
                     spm = pm
                 else:
                     # Scale up then crop to the label viewport based on pan
-                    from PySide6.QtCore import QSize
+                    from PySide6.QtCore import QUrl, QSize
                     sw = max(1, int(round(pm.width() * z)))
                     sh = max(1, int(round(pm.height() * z)))
                     spm_big = pm.scaled(QSize(sw, sh), Qt.KeepAspectRatio, Qt.SmoothTransformation)
@@ -1399,7 +1399,7 @@ class VideoPane(QWidget):
 
             fsw.showFullScreen()
             try:
-                from PySide6.QtCore import QTimer
+                from PySide6.QtCore import QUrl, QTimer
                 QTimer.singleShot(0, self._refresh_label_pixmap)
             except Exception:
                 pass
@@ -1545,7 +1545,7 @@ class HUD(QWidget):
         safe = False
         try:
             import os
-            from PySide6.QtCore import QSettings
+            from PySide6.QtCore import QUrl, QSettings
             env = os.environ.get('FRAMEVISION_SAFE','0').lower() in ('1','true','on','yes')
             ini = str(QSettings('FrameVision','FrameVision').value('perf_safe','0')).lower() in ('1','true','on','yes')
             safe = bool(env or ini)
@@ -1599,7 +1599,7 @@ class HUD(QWidget):
             pass
         # Defer HUD timer start ~1.5s after show
         try:
-            from PySide6.QtCore import QTimer
+            from PySide6.QtCore import QUrl, QTimer
             QTimer.singleShot(1500, lambda: self.timer.start(self.timer.interval()))
         except Exception:
             pass
@@ -1723,7 +1723,7 @@ class QueuePane(QWidget):
     """
     def __init__(self, main, parent=None):
         super().__init__(parent); self.main = main
-        from PySide6.QtCore import QFileSystemWatcher
+        from PySide6.QtCore import QUrl, QFileSystemWatcher
 
         # Timers (keep internal refresh cadence intact)
         self.auto_timer = QTimer(self); self.auto_timer.setInterval(2000); self.auto_timer.timeout.connect(self.request_refresh)
@@ -1868,7 +1868,7 @@ class QueuePane(QWidget):
         from helpers.queue_widgets import JobRowWidget
         # In-place diff to minimize flicker
         try:
-            from PySide6.QtCore import Qt
+            from PySide6.QtCore import QUrl, Qt
         except Exception:
             pass
         existing_keys = {}
@@ -1923,7 +1923,7 @@ class QueuePane(QWidget):
 
         # Remove stale items not in target set (in-place, from bottom)
         try:
-            from PySide6.QtCore import Qt
+            from PySide6.QtCore import QUrl, Qt
             target = {str(p) for _, p in files}
             i = widget.count() - 1
             while i >= 0:
@@ -1945,7 +1945,7 @@ class QueuePane(QWidget):
         # Add or refresh rows (preserve order by newest first)
         for _ts, p in sorted(files, key=lambda t_p: t_p[0], reverse=True):
             try:
-                from PySide6.QtCore import Qt
+                from PySide6.QtCore import QUrl, Qt
                 found = False; found_item = None
                 for _i in range(widget.count()):
                     _it = widget.item(_i)
@@ -1970,7 +1970,7 @@ class QueuePane(QWidget):
             try:
                 hint = w.sizeHint()
                 if hint.height() < 56:
-                    from PySide6.QtCore import QSize
+                    from PySide6.QtCore import QUrl, QSize
                     hint.setHeight(56)
                 it.setSizeHint(hint)
             except Exception:
@@ -1978,7 +1978,7 @@ class QueuePane(QWidget):
             widget.addItem(it)
             widget.setItemWidget(it, w)
             try:
-                from PySide6.QtCore import Qt
+                from PySide6.QtCore import QUrl, Qt
                 it.setData(Qt.UserRole, str(p))
             except Exception:
                 pass
@@ -1990,7 +1990,7 @@ class QueuePane(QWidget):
 
             if not hasattr(self, '_refresh_coalesce'):
 
-                from PySide6.QtCore import QTimer
+                from PySide6.QtCore import QUrl, QTimer
 
                 self._refresh_coalesce = QTimer(self)
 
@@ -2291,11 +2291,15 @@ class SettingsPane(QWidget):
         v.addWidget(about)
 
 # --- Main Window
+
+# --- Music wiring (audio visuals + playlist) ---
+from helpers.music import wire_to_videopane as _fv_wire_music
+_fv_wire_music(VideoPane)
 class MainWindow(QMainWindow):
 
     def _ensure_scrollbar_on_tabs(self, names):
         from PySide6.QtWidgets import QScrollArea, QFrame
-        from PySide6.QtCore import Qt
+        from PySide6.QtCore import QUrl, Qt
         # wrap each matching tab in a vertical-only QScrollArea (Describe-style)
         current = self.tabs.currentIndex()
         for i in range(self.tabs.count()):
@@ -2400,7 +2404,7 @@ class MainWindow(QMainWindow):
         except Exception:
             ss = {}
         if not ss.get("splitter_state_b64"):
-            from PySide6.QtCore import QTimer
+            from PySide6.QtCore import QUrl, QTimer
             def _apply_default_sizes():
                 try:
                     tot = max(1000, self.width())
@@ -2479,7 +2483,7 @@ class MainWindow(QMainWindow):
             pass
     def restore_session(self):
         from PySide6.QtGui import QGuiApplication
-        from PySide6.QtCore import QRect
+        from PySide6.QtCore import QUrl, QRect
         def _clamp_visible(win):
             st = win.windowState()
             if st & (Qt.WindowFullScreen | Qt.WindowMaximized):
