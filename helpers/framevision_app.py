@@ -1,3 +1,100 @@
+# --- BEGIN: FrameVision log silencer (auto-injected) ---
+# Hide harmless multimedia/FFmpeg + thread shutdown warnings.
+# Scope:
+#   1) Tighten QT_LOGGING_RULES to silence qt.multimedia + ffmpeg categories.
+#   2) Install a Qt message handler that ignores known-noisy messages.
+#   3) Wrap sys.stderr so raw FFmpeg lines like "[mp3 @ ...]" are filtered out.
+try:
+    import os as __fv_os, sys as __fv_sys, re as __fv_re
+    # 1) Expand QT_LOGGING_RULES
+    __rules = __fv_os.environ.get("QT_LOGGING_RULES","")
+    __extra = "qt.multimedia.*=false;qt.multimedia.warning=false;qt.multimedia.debug=false;qt.multimedia.ffmpeg.*=false"
+    if __rules:
+        __parts = {x.strip() for x in __rules.split(";") if x.strip()}
+    else:
+        __parts = set()
+    for __piece in __extra.split(";"):
+        if __piece and __piece not in __parts:
+            __parts.add(__piece)
+    __fv_os.environ["QT_LOGGING_RULES"] = ";".join(sorted(__parts))
+
+    # 2) Qt message filter (if PySide6 available)
+    try:
+        from PySide6 import QtCore as __fv_QtCore
+        __prev = __fv_QtCore.qInstallMessageHandler(None)  # grab current (if any) then clear
+        __silence_substrings = (
+            "CreateFontFaceFromHDC",      # font noise on some Windows setups
+            "MS Sans Serif",
+            "QThread: Destroyed while thread is still running",  # harmless during shutdown
+            "Could not update timestamps for skipped samples",   # FFmpeg mp3float notice
+            "Could not find codec parameters for stream",        # cover-art streams in mp3
+            "analyzeduration", "probesize"
+        )
+        def __fv_qt_msg_filter(mode, ctx, msg):
+            try:
+                __s = str(msg)
+                if any(sub in __s for sub in __silence_substrings):
+                    return
+            except Exception:
+                pass
+            if __prev:
+                try:
+                    __prev(mode, ctx, msg)
+                except Exception:
+                    pass
+        __fv_QtCore.qInstallMessageHandler(__fv_qt_msg_filter)
+    except Exception:
+        pass
+
+    # 3) stderr wrapper to hide raw FFmpeg lines not routed via Qt logging
+    class __FVFilteredStderr:
+        __slots__ = ("_orig", "_subs")
+        def __init__(self, orig, subs):
+            self._orig = orig
+            self._subs = tuple(subs)
+        def write(self, data):
+            try:
+                s = str(data)
+                if any(sub in s for sub in self._subs):
+                    return
+                self._orig.write(data)
+            except Exception:
+                try:
+                    self._orig.write(data)
+                except Exception:
+                    pass
+        def flush(self):
+            try:
+                self._orig.flush()
+            except Exception:
+                pass
+        def fileno(self):
+            try:
+                return self._orig.fileno()
+            except Exception:
+                raise
+        def isatty(self):
+            try:
+                return self._orig.isatty()
+            except Exception:
+                return False
+        def __getattr__(self, name):
+            return getattr(self._orig, name)
+
+    try:
+        __patterns = (
+            "[mp3 @", "[mp3float @", "Could not update timestamps for skipped samples",
+            "Could not find codec parameters for stream", "analyzeduration", "probesize",
+            "QThread: Destroyed while thread is still running"
+        )
+        __fv_sys.stderr = __FVFilteredStderr(__fv_sys.stderr, __patterns)
+    except Exception:
+        pass
+
+except Exception:
+    pass
+# --- END: FrameVision log silencer (auto-injected) ---
+
 import os as _os
 _rules = _os.environ.get("QT_LOGGING_RULES","")
 _append = "qt.qpa.fonts=false;qt.fonts.warning=false;qt.fonts.debug=false"

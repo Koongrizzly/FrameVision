@@ -147,6 +147,86 @@ class _Disclosure(QWidget):
         self.toggled.emit(checked)
 class Txt2ImgPane(QWidget):
 
+    def _apply_settings_from_dict(self, s: dict):
+            """Apply saved settings dict to the UI (best-effort) without triggering autosave."""
+            try:
+                func = globals().get('_t2i_apply_from_dict')
+                if callable(func):
+                    func(self, s)
+                    return
+            except Exception:
+                pass
+            # Minimal built-in mapper
+            try:
+                if hasattr(self, 'prompt') and 'prompt' in s:
+                    self.prompt.setPlainText(s.get('prompt') or '')
+                if hasattr(self, 'negative') and 'negative' in s:
+                    self.negative.setPlainText(s.get('negative') or '')
+            except Exception:
+                pass
+            try:
+                if hasattr(self, 'seed') and 'seed' in s:
+                    self.seed.setValue(int(s.get('seed') or 0))
+                sp = (s.get('seed_policy') or '').lower()
+                if hasattr(self, 'seed_policy') and sp:
+                    try: self.seed_policy.setCurrentText('Random' if 'random' in sp else 'Fixed')
+                    except Exception:
+                        idx = -1
+                        for _i in range(self.seed_policy.count()):
+                            if ('random' in sp and 'Random' in (self.seed_policy.itemText(_i) or '')) or ('fixed' in sp and 'Fixed' in (self.seed_policy.itemText(_i) or '')):
+                                idx = _i; break
+                        if idx >= 0:
+                            self.seed_policy.setCurrentIndex(idx)
+            except Exception:
+                pass
+            try:
+                if hasattr(self,'batch') and 'batch' in s:
+                    self.batch.setValue(int(s.get('batch') or 1))
+            except Exception:
+                pass
+            try:
+                w = int(s.get('width', 0)); h = int(s.get('height', 0))
+                if w and h:
+                    if hasattr(self,'size_combo') and getattr(self,'_size_presets', None):
+                        idx = -1
+                        for i,(label,wv,hv) in enumerate(getattr(self,'_size_presets', [])):
+                            if wv==w and hv==h:
+                                idx = i; break
+                        if idx>=0:
+                            try: self.size_combo.setCurrentIndex(idx)
+                            except Exception: pass
+                    if hasattr(self,'size_manual_w'): self.size_manual_w.setValue(w)
+                    if hasattr(self,'size_manual_h'): self.size_manual_h.setValue(h)
+            except Exception:
+                pass
+            try:
+                if hasattr(self,'steps_slider') and 'steps' in s:
+                    self.steps_slider.setValue(int(s.get('steps') or 30))
+                if hasattr(self,'cfg_scale') and 'cfg_scale' in s:
+                    self.cfg_scale.setValue(float(s.get('cfg_scale') or 7.5))
+            except Exception:
+                pass
+            try:
+                if hasattr(self,'vram_profile') and 'vram_profile' in s:
+                    self.vram_profile.setCurrentText(s.get('vram_profile'))
+                if hasattr(self,'sampler') and 'sampler' in s:
+                    self.sampler.setCurrentText(s.get('sampler'))
+                if hasattr(self,'attn_slicing') and 'attn_slicing' in s:
+                    self.attn_slicing.setChecked(bool(s.get('attn_slicing')))
+                if hasattr(self,'vae_device') and 'vae_device' in s:
+                    self.vae_device.setCurrentText(str(s.get('vae_device')))
+            except Exception:
+                pass
+            try:
+                if hasattr(self,'output_path') and 'output' in s:
+                    self.output_path.setText(s.get('output') or self.output_path.text())
+                if hasattr(self,'show_in_player') and 'show_in_player' in s:
+                    self.show_in_player.setChecked(bool(s.get('show_in_player')))
+                if hasattr(self,'use_queue') and 'use_queue' in s:
+                    self.use_queue.setChecked(bool(s.get('use_queue')))
+            except Exception:
+                pass
+    
     def _get_settings_path(self):
         """Return Path to presets/setsave/txt2img.json under the app root."""
         from pathlib import Path as _P
@@ -889,7 +969,7 @@ class Txt2ImgPane(QWidget):
             "width": int(w_ui),
             "height": int(h_ui),
 
-            "a1111_url": self._a1111_url_removed.text().strip() if hasattr(self, "a1111_url") else "http://127.0.0.1:7860",
+            "a1111_url": self._a1111_url_removed.text().strip() if hasattr(self, "_a1111_url_removed") else "http://127.0.0.1:7860",
                     }
         # Persist settings
         try:
