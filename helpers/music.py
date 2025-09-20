@@ -1178,6 +1178,7 @@ class MusicRuntime(QObject):
         try:
             self.visual.set_enabled(self.overlay.visuals_enabled())
             self.overlay.btn_visuals.toggled.connect(self.visual.set_enabled)
+            self.overlay.btn_visuals.toggled.connect(lambda _c: self._persist_state())
             # update button label text
             self.overlay.btn_visuals.toggled.connect(lambda c: self.overlay.btn_visuals.setText('Visuals off' if c else 'Visuals on'))
         except Exception:
@@ -1185,9 +1186,9 @@ class MusicRuntime(QObject):
         # load state
         st = _load_state()
         try:
-            if 'visuals_on' in st:
-                self.overlay.btn_visuals.setChecked(False)
-                self.visual.set_enabled(False)
+            vis_on = bool(st.get('visuals_on', False))
+            self.overlay.btn_visuals.setChecked(vis_on)
+            self.visual.set_enabled(vis_on)
             last_mode = st.get('visual_mode_name')
             if last_mode:
                 # find index
