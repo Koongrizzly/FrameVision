@@ -1,4 +1,40 @@
 from __future__ import annotations
+
+# --- Quiet mode: suppress harmless logs/warnings for end users ---
+import os, warnings
+# Progress bars & banners
+os.environ.setdefault("HF_HUB_DISABLE_PROGRESS_BARS", "1")
+os.environ.setdefault("BITSANDBYTES_NOWELCOME", "1")
+os.environ.setdefault("HF_HUB_DISABLE_TELEMETRY", "1")
+# Transformers / Diffusers logger levels
+try:
+    from transformers.utils import logging as _hf_logging
+    _hf_logging.set_verbosity_error()
+except Exception:
+    pass
+try:
+    from diffusers.utils import logging as _df_logging
+    _df_logging.set_verbosity_error()
+    try:
+        _df_logging.disable_progress_bar()
+    except Exception:
+        pass
+except Exception:
+    pass
+# Accelerate logger (used by pipelines)
+try:
+    import logging as _pylogging
+    from accelerate.logging import get_logger as _acc_get_logger
+    _acc_get_logger("accelerate").setLevel(_pylogging.ERROR)
+except Exception:
+    pass
+# Specific harmless warning from CLIPTextModel init (position_ids)
+warnings.filterwarnings(
+    "ignore",
+    message=r".*Some weights of the model checkpoint were not used when initializing CLIPTextModel:.*position_ids.*",
+    category=UserWarning,
+)
+# -----------------------------------------------------------------
 # >>> FRAMEVISION_QWEN_BEGIN
 # Text->Image tab and generator (Diffusers-first)
 import json, time, random, threading
@@ -110,7 +146,43 @@ class _Disclosure(QWidget):
         self._btn.setArrowType(Qt.DownArrow if checked else Qt.RightArrow)
         self.toggled.emit(checked)
 class Txt2ImgPane(QWidget):
+
+    def _get_settings_path(self):
+        """Return Path to presets/setsave/txt2img.json under the app root."""
+        from pathlib import Path as _P
+        # Try several roots: app root (helpers/..), script dir, then CWD
+        roots = []
+        try:
+            roots.append(_P(__file__).resolve().parent.parent)  # likely app root above helpers/
+        except Exception:
+            pass
+        try:
+            roots.append(_P(__file__).resolve().parent)  # script dir
+        except Exception:
+            pass
+        roots.append(_P.cwd())
+        for r in roots:
+            try:
+                target = (r / "presets" / "setsave")
+                target.mkdir(parents=True, exist_ok=True)
+                return target / "txt2img.json"
+            except Exception:
+                continue
+        # Fallback to CWD without mkdir (last resort)
+        return _P("./presets/setsave/txt2img.json")
+
     fileReady = Signal(str)
+
+    def _settings_path(self):
+        """Return Path to presets/setsave/txt2img.json; ensure parent exists."""
+        from pathlib import Path as _P
+        p = _P("presets")/"setsave"/"txt2img.json"
+        try:
+            p.parent.mkdir(parents=True, exist_ok=True)
+        except Exception:
+            pass
+        return p
+
 
     def __init__(self, app_window):
         super().__init__(parent=app_window)
@@ -124,14 +196,80 @@ class Txt2ImgPane(QWidget):
         self.generate_now.clicked.connect(self._on_generate_clicked)
 
 
+        # Load saved settings last to override other managers
+        try:
+            self._load_settings()
+        except Exception as e:
+            print('[txt2img] load at init error:', e)
+
+        # Load saved settings last so other managers can't overwrite them
+        try:
+            self._load_settings()
+        except Exception as e:
+            print('[txt2img] load at init error:', e)
+
+
+
         # Defaults
         self.use_queue.setChecked(False)  # default removed; will restore via UI
-        self.show_in_player.setChecked(False)  # default removed; will restore via UI
-        self.nsfw_toggle.setChecked(False)  # default removed; will restore via UI
-        self.preset_combo.addItems(["Photoreal / Daylight","Portrait / Soft","Cinematic / Moody","Product / Clean","Landscape / Golden Hour","Neon Cyberpunk","Anime Clean","Isometric 3D","Macro / Shallow DOF","Illustration / Watercolor"])
+        self.show_in_player.setChecked(True)
+        self.size_manual_w.setValue(768)
+        self.size_manual_h.setValue(768)
+        try:
+            self.sampler.setCurrentText("DPM++ 2M (Karras)")
+        except Exception:
+            pass  # default removed; will restore via UI
+        self.preset_combo.addItems(["Street Photography","Fantasy Realism","Cinematic / Moody","Product / Clean","Landscape / Golden Hour","Neon Cyberpunk","Anime Clean","Isometric 3D","Macro / Shallow DOF","Illustration / Watercolor","Realistic Portrait Pro","Outdoor Documentary","Food Styling / Clean","Architectural Interior","Fashion Illustration","Portrait / Soft"])
         self.preset_combo.setCurrentIndex(0)
         try:
             self.preset_combo.currentTextChanged.connect(self._apply_preset)
+        except Exception:
+            pass
+        # FrameVision hard defaults
+        try:
+            if hasattr(self, 'sampler'):
+                self.sampler.setCurrentText("DPM++ 2M (Karras)")
+        except Exception:
+            pass
+        try:
+            if hasattr(self, 'size_combo') and self.size_combo.count() > 0:
+                _idx = -1
+                for _i in range(self.size_combo.count()):
+                    _label = self.size_combo.itemText(_i) or ''
+                    if '768x768' in _label:
+                        _idx = _i; break
+                if _idx >= 0:
+                    self.size_combo.setCurrentIndex(_idx)
+        except Exception:
+            pass
+        try:
+            if hasattr(self, 'size_manual_w'): self.size_manual_w.setValue(768)
+            if hasattr(self, 'size_manual_h'): self.size_manual_h.setValue(768)
+        except Exception:
+            pass
+        try:
+            if hasattr(self, 'seed_policy'):
+                # Prefer setCurrentText, fall back to search
+                try:
+                    self.seed_policy.setCurrentText('Random')
+                except Exception:
+                    _rid=-1
+                    for _i in range(self.seed_policy.count()):
+                        if 'Random' in (self.seed_policy.itemText(_i) or ''):
+                            _rid = _i; break
+                    if _rid >= 0:
+                        self.seed_policy.setCurrentIndex(_rid)
+        except Exception:
+            pass
+
+
+        # Load saved settings last, then wire autosave
+        try:
+            self._load_settings()
+        except Exception:
+            pass
+        try:
+            self._connect_autosave()
         except Exception:
             pass
 
@@ -143,10 +281,52 @@ class Txt2ImgPane(QWidget):
             pass
 
 
+        # --- Enforce FrameVision defaults every launch (user can still change) ---
+        try:
+            if hasattr(self, "show_in_player"):
+                self.show_in_player.setChecked(True)
+        except Exception:
+            pass
+        try:
+            if hasattr(self, "sampler"):
+                self.sampler.setCurrentText("DPM++ 2M (Karras)")
+        except Exception:
+            pass
+        try:
+            # Prefer combo 768x768 if present; also set manual fields.
+            if hasattr(self, "size_combo") and self.size_combo.count() > 0:
+                idx = -1
+                for i in range(self.size_combo.count()):
+                    label = self.size_combo.itemText(i) or ""
+                    if "768x768" in label:
+                        idx = i; break
+                if idx >= 0:
+                    self.size_combo.setCurrentIndex(idx)
+            if hasattr(self, "size_manual_w"):
+                self.size_manual_w.setValue(768)
+            if hasattr(self, "size_manual_h"):
+                self.size_manual_h.setValue(768)
+        except Exception:
+            pass
+        try:
+            # Seed policy default -> Random
+            if hasattr(self, "seed_policy"):
+                try:
+                    self.seed_policy.setCurrentText("Random")
+                except Exception:
+                    idx = -1
+                    for i in range(self.seed_policy.count()):
+                        if "Random" in (self.seed_policy.itemText(i) or ""):
+                            idx = i; break
+                    if idx >= 0:
+                        self.seed_policy.setCurrentIndex(idx)
+        except Exception:
+            pass
+
     def _apply_preset(self, name: str):
         presets = {
-            "Photoreal / Daylight": {"sampler":"DPM++ 2M (Karras)","steps":32,"cfg":5.5,"size":(1024,1024),
-                                     "neg":"blurry, watermark, logo, text"},
+            "Fashion Illustration": {"sampler":"DPM++ 2M (Karras)","steps":32,"cfg":5.5,"size":(768,768),
+                                  "neg":"blurry, watermark, logo, text"},
             "Portrait / Soft": {"sampler":"DPM++ 2M (Karras)","steps":34,"cfg":5.0,"size":(1024,1536),
                                 "neg":"harsh shadows, waxy skin, low-detail"},
             "Cinematic / Moody": {"sampler":"Heun","steps":30,"cfg":5.5,"size":(1536,864),
@@ -165,6 +345,18 @@ class Txt2ImgPane(QWidget):
                                     "neg":"motion blur"},
             "Illustration / Watercolor": {"sampler":"DDIM","steps":28,"cfg":5.0,"size":(1024,1536),
                                           "neg":"harsh contrast"},
+            "Realistic Portrait Pro": {"sampler":"DPM++ 2M (Karras)","steps":36,"cfg":5.0,"size":(896,1152),
+                                       "neg":"overexposed skin, plastic texture"},
+            "Outdoor Documentary": {"sampler":"Heun","steps":28,"cfg":5.0,"size":(1536,864),
+                                    "neg":"over-processed, HDR halos"},
+            "Food Styling / Clean": {"sampler":"UniPC","steps":30,"cfg":6.0,"size":(1024,1024),
+                                     "neg":"grease, messy crumbs, dull color"},
+            "Architectural Interior": {"sampler":"DPM++ 2M (Karras)","steps":32,"cfg":5.5,"size":(1280,720),
+                                       "neg":"distorted lines, crooked walls"},
+            "Fantasy Realism": {"sampler":"Euler a","steps":32,"cfg":6.5,"size":(1024,1024),
+                                "neg":"cartoonish, low-detail"},
+            "Street Photography": {"sampler":"Heun","steps":30,"cfg":5.0,"size":(1152,768),
+                                   "neg":"motion smear, excessive noise"}
         }
         cfg = presets.get(name)
         if not cfg:
@@ -242,6 +434,7 @@ class Txt2ImgPane(QWidget):
             ("320x320 (1:1)", 320, 320),
             ("480x480 (1:1)", 480, 480),
             ("640x640 (1:1)", 640, 640),
+            ("768x768 (1:1)", 768, 768),
             ("960x960 (1:1)", 960, 960),
             ("1024x1024 (1:1)", 1024, 1024),
             # 16:9
@@ -269,12 +462,12 @@ class Txt2ImgPane(QWidget):
         for label, w, h in self._size_presets:
             self.size_combo.addItem(label, (w, h))
         # default selection
-        idx_default = next((i for i,(lbl,_,__) in enumerate(self._size_presets) if "1280x720" in lbl), 0)  # 1280x720 default
+        idx_default = next((i for i,(lbl,_,__) in enumerate(self._size_presets) if "768x768" in lbl), 0)  # 1280x720 default
         if 0 <= idx_default < self.size_combo.count():
             self.size_combo.setCurrentIndex(idx_default)
         # Optional manual override (advanced later; present but small)
-        self.size_manual_w = QSpinBox(); self.size_manual_w.setRange(256, 4096)  # allow manual width(256, 4096); self.siself.size_manual_w.setSingleStep(64); self.size_manual_w.setValue(1280)
-        self.size_manual_h = QSpinBox(); self.size_manual_h.setRange(256, 4096)  # allow manual height(256, 4096); self.sself.size_manual_h.setSingleStep(64); self.size_manual_h.setValue(720)
+        self.size_manual_w = QSpinBox(); self.size_manual_w = QSpinBox(); self.size_manual_w.setRange(256, 4096)
+        self.size_manual_h = QSpinBox(); self.size_manual_h.setRange(256, 4096)  # allow manual height(256, 4096); self.sself.size_manual_h.setSingleStep(64); ~8)
         self.size_lock = QCheckBox("Lock aspect")
         self.size_lock.setChecked(False)  # default removed; will restore via UI
         def _on_size_combo_changed(i):
@@ -285,6 +478,14 @@ class Txt2ImgPane(QWidget):
                 self.size_manual_w.setValue(int(w)); self.size_manual_h.setValue(int(h))
                 self.size_manual_w.blockSignals(False); self.size_manual_h.blockSignals(False)
         self.size_combo.currentIndexChanged.connect(_on_size_combo_changed)
+        # Ensure manual boxes reflect default 768x768 on startup
+        try:
+            di = idx_default
+            data = self.size_combo.itemData(di)
+            if data:
+                self.size_manual_w.setValue(int(data[0])); self.size_manual_h.setValue(int(data[1]))
+        except Exception:
+            pass
         def _sync_manual_w(v):
             if not self.size_lock.isChecked(): return
             # keep aspect from current combo data
@@ -315,7 +516,7 @@ class Txt2ImgPane(QWidget):
         # Steps slider (right behind seed section)
         steps_row = QHBoxLayout()
         self.steps_slider = QSlider(Qt.Horizontal)
-        self.steps_slider.setRange(10, 150)
+        self.steps_slider.setRange(10, 100)
         self.steps_slider.setValue(30)
         try:
             self.steps_slider.setTickPosition(QSlider.TicksBelow)
@@ -394,7 +595,7 @@ class Txt2ImgPane(QWidget):
                 self._persist_settings.setValue("qwen_cli_template", self._qwen_cli_template_removed.text().strip())
             except Exception:
                 pass
-                self._a1111_url_removed.textChanged.connect(lambda *_: _save_backend())
+        self._a1111_url_removed.textChanged.connect(lambda *_: _save_backend())
         self._qwen_cli_template_removed.textChanged.connect(lambda *_: _save_backend())
 
 
@@ -417,7 +618,6 @@ class Txt2ImgPane(QWidget):
                 base = _P("./models")
                 self.model_combo.blockSignals(True)
                 self.model_combo.clear()
-                self.model_combo.addItem("Auto (prefer SDXL)", "auto")
                 for sub in ["SDXL","SD15"]:
                     d = base / sub
                     if d.exists():
@@ -606,7 +806,6 @@ class Txt2ImgPane(QWidget):
         self.vae_device = QComboBox(); self.vae_device.addItems(["auto","cpu","gpu"])
         self.gpu_index = QSpinBox(); self.gpu_index.setRange(0,8)
         self.threads = QSpinBox(); self.threads.setRange(1,256); self.threads.setValue(8)
-        self.nsfw_toggle = QCheckBox("Allow NSFW")
         self.format_combo = QComboBox(); self.format_combo.addItems(["png","jpg","webp"])
         self.filename_template = QLineEdit("sd_{seed}_{idx:03d}.png")
         self.reset_fname = QPushButton("Reset"); self.reset_fname.clicked.connect(lambda: self.filename_template.setText("sd_{seed}_{idx:03d}.png"))
@@ -617,7 +816,6 @@ class Txt2ImgPane(QWidget):
         adv_form.addRow("VAE device", self.vae_device)
         adv_form.addRow("GPU index", self.gpu_index)
         adv_form.addRow("Threads", self.threads)
-        adv_form.addRow(self.nsfw_toggle)
         adv_form.addRow("File format", self.format_combo)
         rowf = QHBoxLayout(); rowf.addWidget(self.filename_template, 1); rowf.addWidget(self.reset_fname)
         adv_form.addRow("Filename", rowf)
@@ -682,8 +880,7 @@ class Txt2ImgPane(QWidget):
             "vae_device": self.vae_device.currentText(),
             "gpu_index": int(self.gpu_index.value()),
             "threads": int(self.threads.value()),
-            "nsfw": self.nsfw_toggle.isChecked(),
-            "format": self.format_combo.currentText(),
+                        "format": self.format_combo.currentText(),
             "filename_template": self.filename_template.text().strip() or "sd_{seed}_{idx:03d}.png",
             "hires_helper": self.hires_helper.isChecked(),
             "fit_check": self.fit_check.isChecked(),
@@ -699,97 +896,280 @@ class Txt2ImgPane(QWidget):
             self._save_settings(job)
         except Exception as e:
             print("[txt2img] warn: could not save settings:", e)
+        try:
+            self._save_settings(job)
+        except Exception as e:
+            print('[txt2img] warn: could not save settings:', e)
         return job
 
         # Compute per-image seeds deterministically (unchanged)...
 
+    
+    
     def _save_settings(self, job: dict):
+        """Write the given dict to presets/setsave/txt2img.json."""
         try:
-            from pathlib import Path as _P, json as _json  # type: ignore
-        except Exception:
-            pass
-        return job
+            p = self._settings_path()
+            with open(p, "w", encoding="utf-8") as f:
+                json.dump(job, f, ensure_ascii=False, indent=2)
+            return True
+        except Exception as e:
+            try: print("[txt2img] save settings error:", e)
+            except Exception: pass
+            return False
 
     def _load_settings(self):
+        """Load JSON from presets/setsave/txt2img.json and apply to UI."""
         try:
+            p = self._settings_path()
+            if not p.exists():
+                return False
+            with open(p, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            self._apply_settings_from_dict(data)
+            return True
+        except Exception as e:
+            try: print("[txt2img] load settings error:", e)
+            except Exception: pass
+            return False
+            s = json.loads(pth.read_text(encoding='utf-8') or '{}')
+        except Exception as e:
+            try:
+                print('[txt2img] load settings error:', e)
+            except Exception:
+                pass
             return
+        # fill UI (best-effort)
+        try:
+            self.prompt.setPlainText(s.get('prompt','') or '')
+            self.negative.setPlainText(s.get('negative','') or '')
         except Exception:
-            return
-
-    def _enqueue(self):
+            pass
         try:
-            if not self._settings_path.exists():
-                return
-            with open(self._settings_path, "r", encoding="utf-8") as f:
-                s = json.load(f)
-            # fill UI
-            self.prompt.setPlainText(s.get("prompt",""))
-            self.negative.setPlainText(s.get("negative",""))
-            self.seed.setValue(int(s.get("seed", 0)))
-            sp = s.get("seed_policy","fixed")
-            self.seed_policy.setCurrentIndex(["fixed","random","increment"].index(sp) if sp in ["fixed","random","increment"] else 0)
-            self.batch.setValue(int(s.get("batch",1)))
-            self.output_path.setText(s.get("output", str(Path("./output/images").resolve())))
-            self.show_in_player.setChecked(bool(s.get("show_in_player", True)))
-            self.use_queue.setChecked(bool(s.get("use_queue", False)))
-            # size
-            w = int(s.get("width", 1280)); h = int(s.get("height", 720))
-            # try to select matching preset
+            self.seed.setValue(int(s.get('seed', 0)))
+            sp = str(s.get('seed_policy','fixed')).lower()
+            idx = {'fixed':0,'random':1,'increment':2}.get(sp,0)
+            self.seed_policy.setCurrentIndex(idx)
+            self.batch.setValue(int(s.get('batch',1)))
+        except Exception:
+            pass
+        try:
+            self.output_path.setText(s.get('output', self.output_path.text()))
+            self.show_in_player.setChecked(bool(s.get('show_in_player', True)))
+            if hasattr(self, 'use_queue'):
+                self.use_queue.setChecked(bool(s.get('use_queue', False)))
+        except Exception:
+            pass
+        try:
+            w = int(s.get('width', 1024)); h = int(s.get('height', 1024))
             idx = -1
             for i,(label,wv,hv) in enumerate(self._size_presets):
                 if wv==w and hv==h:
                     idx = i; break
-            if idx>=0:
+            if idx>=0 and hasattr(self, 'size_combo'):
                 self.size_combo.setCurrentIndex(idx)
             else:
-                self.size_manual_w.setValue(w); self.size_manual_h.setValue(h)
-            # steps & cfg
-            self.steps_slider.setValue(int(s.get("steps", 30)))
-            if hasattr(self, "cfg_scale"):
-                self.cfg_scale.setValue(float(s.get("cfg_scale", 7.5)))
-            # advanced
-            self.vram_profile.setCurrentText(s.get("vram_profile","Auto"))
-            self.sampler.setCurrentText(s.get("sampler","Euler a"))
-            self.attn_slicing.setChecked(bool(s.get("attn_slicing", True)))
-            self.vae_device.setCurrentText(s.get("vae_device","Auto"))
-            self.gpu_index.setValue(int(s.get("gpu_index",0)))
-            self.threads.setValue(int(s.get("threads",0)))
-            self.nsfw_toggle.setChecked(bool(s.get("nsfw", False)))
-            self.format_combo.setCurrentText(s.get("format","PNG"))
-            self.filename_template.setText(s.get("filename_template","sd_{seed}_{idx:03d}.png"))
-            self.hires_helper.setChecked(bool(s.get("hires_helper", False)))
-            self.fit_check.setChecked(bool(s.get("fit_check", True)))
+                if hasattr(self, 'size_manual_w'): self.size_manual_w.setValue(w)
+                if hasattr(self, 'size_manual_h'): self.size_manual_h.setValue(h)
+        except Exception:
+            pass
+        try:
+            if hasattr(self, 'steps_slider'): self.steps_slider.setValue(int(s.get('steps', 30)))
+            if hasattr(self, 'cfg_scale'): self.cfg_scale.setValue(float(s.get('cfg_scale', 7.5)))
+        except Exception:
+            pass
+        try:
+            if hasattr(self, 'vram_profile'): self.vram_profile.setCurrentText(s.get('vram_profile','Auto'))
+            if hasattr(self, 'sampler'): self.sampler.setCurrentText(s.get('sampler','DPM++ 2M (Karras)'))
+            if hasattr(self, 'attn_slicing'): self.attn_slicing.setChecked(bool(s.get('attn_slicing', True)))
+            if hasattr(self, 'vae_device'): self.vae_device.setCurrentText(str(s.get('vae_device','Auto')))
+            if hasattr(self, 'gpu_index'): self.gpu_index.setValue(int(s.get('gpu_index',0)))
+            if hasattr(self, 'threads'): self.threads.setValue(int(s.get('threads',0)))
+            if hasattr(self, 'format_combo'): self.format_combo.setCurrentText(str(s.get('format','PNG')))
+            if hasattr(self, 'filename_template'): self.filename_template.setText(s.get('filename_template','sd_{seed}_{idx:03d}.png'))
+            if hasattr(self, 'hires_helper'): self.hires_helper.setChecked(bool(s.get('hires_helper', False)))
+            if hasattr(self, 'fit_check'): self.fit_check.setChecked(bool(s.get('fit_check', True)))
+        except Exception:
+            pass
+        try:
+            if hasattr(self, 'model_combo'):
+                mp = s.get('model_path','')
+                if mp:
+                    i = self.model_combo.findData(mp)
+                    if i >= 0: self.model_combo.setCurrentIndex(i)
+            if hasattr(self, 'lora_combo'):
+                lp = s.get('lora_path','')
+                if lp:
+                    i = self.lora_combo.findData(lp)
+                    if i >= 0: self.lora_combo.setCurrentIndex(i)
+            if hasattr(self, 'lora_strength'):
+                try: self.lora_strength.setValue(float(s.get('lora_scale', 1.0)))
+                except Exception: pass
+            if hasattr(self, 'lora2_combo'):
+                lp2 = s.get('lora2_path','')
+                if lp2:
+                    i2 = self.lora2_combo.findData(lp2)
+                    if i2 >= 0: self.lora2_combo.setCurrentIndex(i2)
+            if hasattr(self, 'lora2_strength'):
+                try: self.lora2_strength.setValue(float(s.get('lora2_scale', 1.0)))
+                except Exception: pass
+        except Exception:
+            pass
+        return
+    def _snapshot_ui(self) -> dict:
+        d = {}
+        try: d["prompt"] = self.prompt.toPlainText().strip()
+        except Exception: pass
+        try: d["negative"] = self.negative.toPlainText().strip()
+        except Exception: pass
+        try: d["seed"] = int(self.seed.value())
+        except Exception: pass
+        try:
+            idx = int(self.seed_policy.currentIndex())
+            d["seed_policy"] = ["fixed","random","increment"][idx if 0 <= idx < 3 else 0]
+        except Exception: pass
+        try: d["batch"] = int(self.batch.value())
+        except Exception: pass
+        try:
+            if hasattr(self,'size_combo') and self.size_combo.currentIndex() >= 0:
+                _, w, h = self._size_presets[self.size_combo.currentIndex()]
+                d["width"] = int(w); d["height"] = int(h)
+            else:
+                if hasattr(self,'size_manual_w'): d["width"] = int(self.size_manual_w.value())
+                if hasattr(self,'size_manual_h'): d["height"] = int(self.size_manual_h.value())
+        except Exception: pass
+        try: d["steps"] = int(self.steps_slider.value())
+        except Exception: pass
+        try: d["cfg_scale"] = float(self.cfg_scale.value())
+        except Exception: pass
+        try: d["sampler"] = self.sampler.currentText()
+        except Exception: pass
+        try:
+            if hasattr(self,'model_combo'): d["model_path"] = self.model_combo.currentData()
+        except Exception: pass
+        try:
+            if hasattr(self,'lora_combo'): d["lora_path"] = self.lora_combo.currentData()
+        except Exception: pass
+        try:
+            if hasattr(self,'lora_strength'): d["lora_scale"] = float(self.lora_strength.value())
+        except Exception: pass
+        try:
+            if hasattr(self,'lora2_combo'): d["lora2_path"] = self.lora2_combo.currentData()
+        except Exception: pass
+        try:
+            if hasattr(self,'lora2_strength'): d["lora2_scale"] = float(self.lora2_strength.value())
+        except Exception: pass
+        try: d["attn_slicing"] = bool(self.attn_slicing.isChecked())
+        except Exception: pass
+        try: d["vae_device"] = self.vae_device.currentText()
+        except Exception: pass
+        try: d["gpu_index"] = int(self.gpu_index.value())
+        except Exception: pass
+        try: d["threads"] = int(self.threads.value())
+        except Exception: pass
+        except Exception: pass
+        try: d["format"] = self.format_combo.currentText()
+        except Exception: pass
+        try: d["filename_template"] = self.filename_template.text().strip()
+        except Exception: pass
+        try: d["hires_helper"] = bool(self.hires_helper.isChecked())
+        except Exception: pass
+        try: d["fit_check"] = bool(self.fit_check.isChecked())
+        except Exception: pass
+        try: d["use_queue"] = bool(self.use_queue.isChecked())
+        except Exception: pass
+        try: d["show_in_player"] = bool(self.show_in_player.isChecked())
+        except Exception: pass
+        try: d["vram_profile"] = self.vram_profile.currentText()
+        except Exception: pass
+        try: d["output"] = self.output_path.text().strip()
+        except Exception: pass
+        try: d["a1111_url"] = self._a1111_url_removed.text().strip()
+        except Exception: pass
+        try: d["qwen_cli_template"] = self._qwen_cli_template_removed.text().strip()
+        except Exception: pass
+        return d
+
+    def _autosave_now(self):
+        try:
+            self._save_settings(self._snapshot_ui())
         except Exception as e:
-            print("[txt2img] load settings error:", e)
+            try: print("[txt2img] autosave error:", e)
+            except Exception: pass
+
+    def _connect_autosave(self):
+        def connect_sig(obj, sig):
+            try:
+                getattr(obj, sig).connect(lambda *a, **k: self._autosave_now())
+            except Exception:
+                pass
+        connect_sig(self.prompt, 'textChanged')
+        connect_sig(self.negative, 'textChanged')
+        for obj, sig in [
+            (self.seed, 'valueChanged'),
+            (self.seed_policy, 'currentIndexChanged'),
+            (self.batch, 'valueChanged'),
+            (self.size_combo, 'currentIndexChanged'),
+            (getattr(self,'size_manual_w', None), 'valueChanged'),
+            (getattr(self,'size_manual_h', None), 'valueChanged'),
+            (self.steps_slider, 'valueChanged'),
+            (self.cfg_scale, 'valueChanged'),
+            (self.sampler, 'currentIndexChanged'),
+            (getattr(self,'model_combo', None), 'currentIndexChanged'),
+            (getattr(self,'lora_combo', None), 'currentIndexChanged'),
+            (getattr(self,'lora_strength', None), 'valueChanged'),
+            (getattr(self,'lora2_combo', None), 'currentIndexChanged'),
+            (getattr(self,'lora2_strength', None), 'valueChanged'),
+            (self.attn_slicing, 'toggled'),
+            (self.vae_device, 'currentIndexChanged'),
+            (self.gpu_index, 'valueChanged'),
+            (self.threads, 'valueChanged'),
+            (self.format_combo, 'currentIndexChanged'),
+            (self.filename_template, 'textChanged'),
+            (self.hires_helper, 'toggled'),
+            (self.fit_check, 'toggled'),
+            (self.use_queue, 'toggled'),
+            (self.show_in_player, 'toggled'),
+            (self.vram_profile, 'currentIndexChanged'),
+            (self.output_path, 'textChanged'),
+            (getattr(self, '_a1111_url_removed', None), 'textChanged'),
+            (getattr(self, '_qwen_cli_template_removed', None), 'textChanged'),
+        ]:
+            if obj is None: 
+                continue
+            connect_sig(obj, sig)
+        try: print("[txt2img] autosave wired")
+        except Exception: pass
+
 
 
     def _enqueue(self, run_now: bool):
-        try:
-            from helpers.queue_adapter import enqueue_txt2img
-        except Exception:
-            enqueue_txt2img = None
-        job = self._collect_job()
-        if not job or not job.get('prompt'):
             try:
-                self.status.setText('Please enter a prompt')
+                from helpers.queue_adapter import enqueue_txt2img
             except Exception:
-                pass
-            return
-        if not job or not job.get('prompt'):
-            self.status.setText("Prompt is empty")
-            return
-        if not self.use_queue.isChecked():
-            self._run_direct(job); return
-        ok = False
-        if enqueue_txt2img:
-            ok = bool(enqueue_txt2img(job | {"run_now": bool(run_now)}))
-        if ok:
-            seeds = job.get("seeds") or []
-            seed_info = (f" | seed {seeds[0]}" if seeds else "")
-            size_info = f" | {job.get('width',1024)}x{job.get('height',1024)}"
-            self.status.setText("Enqueued" + (" and running…" if run_now else "") + seed_info + size_info)
-        else:
-            self.status.setText("Enqueue failed")
+                enqueue_txt2img = None
+            job = self._collect_job()
+            if not job or not job.get('prompt'):
+                try:
+                    self.status.setText('Please enter a prompt')
+                except Exception:
+                    pass
+                return
+            if not job or not job.get('prompt'):
+                self.status.setText("Prompt is empty")
+                return
+            if not self.use_queue.isChecked():
+                self._run_direct(job); return
+            ok = False
+            if enqueue_txt2img:
+                ok = bool(enqueue_txt2img(job | {"run_now": bool(run_now)}))
+            if ok:
+                seeds = job.get("seeds") or []
+                seed_info = (f" | seed {seeds[0]}" if seeds else "")
+                size_info = f" | {job.get('width',1024)}x{job.get('height',1024)}"
+                self.status.setText("Enqueued" + (" and running…" if run_now else "") + seed_info + size_info)
+            else:
+                self.status.setText("Enqueue failed")
 
     def _on_generate_clicked(self):
         job = self._collect_job()
@@ -799,8 +1179,6 @@ class Txt2ImgPane(QWidget):
             except Exception:
                 pass
             return
-        if not job or not job.get('prompt'):
-            self.status.setText('Prompt is empty'); return
         self._enqueue(run_now=True)
 
     def _run_direct(self, job: dict):
@@ -1173,3 +1551,134 @@ def generate_qwen_images(job: dict, progress_cb: Optional[Callable[[float], None
         pass
     return meta
 # <<< FRAMEVISION_QWEN_END
+
+
+# === Tiny Txt2Img deferred-load patch (minimal & safe) ===
+try:
+    from PySide6.QtCore import QTimer  # type: ignore
+except Exception:
+    QTimer = None  # type: ignore
+
+def _t2i_store_path(self):
+    # presets/setsave/txt2img.json under app root; fallback to CWD
+    try:
+        from pathlib import Path as _P
+        app_root = _P(__file__).resolve().parent.parent
+        p = app_root / 'presets' / 'setsave' / 'txt2img.json'
+        p.parent.mkdir(parents=True, exist_ok=True)
+        return p
+    except Exception:
+        pass
+    try:
+        p = _P.cwd() / 'presets' / 'setsave' / 'txt2img.json'
+        p.parent.mkdir(parents=True, exist_ok=True)
+        return p
+    except Exception:
+        return None
+
+def _t2i_apply_from_dict(self, s: dict):
+    # Block signals while applying so handlers don't overwrite loaded values
+    widgets = [
+        'prompt','negative','seed','seed_policy','batch','size_manual_w','size_manual_h',
+        'steps_slider','cfg_scale','sampler','model_combo','lora_combo','lora_strength',
+        'lora2_combo','lora2_strength','attn_slicing','vae_device','gpu_index','threads',
+        'format_combo','filename_template','hires_helper','fit_check',
+        'use_queue','show_in_player','vram_profile','output_path'
+    ]
+    blocked = []
+    for name in widgets:
+        w = getattr(self, name, None)
+        try:
+            if w is not None and hasattr(w, 'blockSignals'):
+                w.blockSignals(True); blocked.append(w)
+        except Exception:
+            pass
+    try:
+        # Text fields
+        if hasattr(self, 'prompt') and 'prompt' in s: self.prompt.setPlainText(s.get('prompt') or '')
+        if hasattr(self, 'negative') and 'negative' in s: self.negative.setPlainText(s.get('negative') or '')
+        # Basic nums
+        if hasattr(self, 'seed') and 'seed' in s: self.seed.setValue(int(s.get('seed') or 0))
+        if hasattr(self, 'seed_policy') and 'seed_policy' in s:
+            sp = str(s.get('seed_policy','fixed')).lower()
+            idx = {'fixed':0,'random':1,'increment':2}.get(sp,0)
+            self.seed_policy.setCurrentIndex(idx)
+        if hasattr(self, 'batch') and 'batch' in s: self.batch.setValue(int(s.get('batch') or 1))
+        # Size
+        w = s.get('width'); h = s.get('height')
+        if hasattr(self,'size_manual_w') and w is not None: self.size_manual_w.setValue(int(w))
+        if hasattr(self,'size_manual_h') and h is not None: self.size_manual_h.setValue(int(h))
+        # Sampler/steps/cfg
+        if hasattr(self, 'sampler') and 'sampler' in s and s.get('sampler'): self.sampler.setCurrentText(str(s.get('sampler')))
+        if hasattr(self, 'steps_slider') and 'steps' in s: self.steps_slider.setValue(int(s.get('steps') or 0))
+        if hasattr(self, 'cfg_scale') and 'cfg_scale' in s: self.cfg_scale.setValue(float(s.get('cfg_scale') or 0))
+        # Paths & toggles
+        if hasattr(self, 'output_path') and 'output' in s and s.get('output'): self.output_path.setText(str(s.get('output')))
+        if hasattr(self, 'show_in_player') and 'show_in_player' in s: self.show_in_player.setChecked(bool(s.get('show_in_player')))
+        if hasattr(self, 'use_queue') and 'use_queue' in s: self.use_queue.setChecked(bool(s.get('use_queue')))
+    except Exception as e:
+        try: print('[txt2img] apply settings warn:', e)
+        except Exception: pass
+    finally:
+        for w in blocked:
+            try: w.blockSignals(False)
+            except Exception: pass
+
+def _t2i_load_settings(self):
+    self._t2i_loading = True
+    try:
+        p = _t2i_store_path(self)
+        if p is None or not p.exists():
+            return False
+        import json
+        with open(p, 'r', encoding='utf-8') as f:
+            data = json.load(f) or {}
+        if isinstance(data, dict):
+            _t2i_apply_from_dict(self, data)
+            return True
+        return False
+    except Exception as e:
+        try: print('[txt2img] load settings error:', e)
+        except Exception: pass
+        return False
+    finally:
+        self._t2i_loading = False
+
+def _t2i_post_init(self):
+    # Defer restore until after the UI & other managers have initialized
+    if QTimer is None:
+        try: _t2i_load_settings(self)
+        except Exception: pass
+        return
+    try:
+        QTimer.singleShot(300, lambda: _t2i_load_settings(self))
+    except Exception as e:
+        try: print('[txt2img] deferred load warn:', e)
+        except Exception: pass
+        try: _t2i_load_settings(self)
+        except Exception: pass
+
+# Monkey-patch: wrap __init__ and autosave handler to guard while loading
+try:
+    _Txt2ImgPane = Txt2ImgPane  # type: ignore[name-defined]
+    if not hasattr(_Txt2ImgPane, '_t2i_patched'):
+        _orig_init = _Txt2ImgPane.__init__
+        def _init_patch(self, *a, **k):
+            _orig_init(self, *a, **k)
+            _t2i_post_init(self)
+        _Txt2ImgPane.__init__ = _init_patch  # type: ignore[assignment]
+
+        # Guard autosave during load (if method exists)
+        if hasattr(_Txt2ImgPane, '_autosave_now'):
+            _orig_auto = _Txt2ImgPane._autosave_now
+            def _auto_patch(self, *a, **k):
+                if getattr(self, '_t2i_loading', False):
+                    return
+                return _orig_auto(self, *a, **k)
+            _Txt2ImgPane._autosave_now = _auto_patch  # type: ignore[assignment]
+
+        _Txt2ImgPane._t2i_patched = True
+except Exception as _e:
+    try: print('[txt2img] minimal patch failed to apply:', _e)
+    except Exception: pass
+# === End tiny patch ===
