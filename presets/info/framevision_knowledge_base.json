@@ -2606,6 +2606,145 @@
           "TxtToImgQwen"
         ]
       }
+    },
+    "Visual_music_play": {
+      "description": "- **Purpose:** Play audio inside FrameVision with an overlaid info card and beat‑reactive visuals.\n- **Default at launch:**\n  - The **info header** (cover art, title, artist, album) is shown immediately.\n  - **Visuals are OFF** by default so audio can pre‑analyze in the background. Turn them on with the **Visuals** toggle.\n  - The floating **FAB** (♪ button) is visible; the control card opens by default.\n- **Beat‑sync:** Visuals can switch exactly every **8 / 16 / 32 / 64 beats** when the visuals mode is **all** or **random**.\n\n---",
+      "key_terms": [
+        "Album art & tags",
+        "BPM/TBPM tag",
+        "Beats per switch (8/16/32/64)",
+        "Beat‑reactive visuals",
+        "Beat‑sync engine",
+        "FAB (♪)",
+        "FAB (♪) control button",
+        "FFmpeg/Qt audio stack",
+        "FFmpeg/Qt backend",
+        "Info header (art/title/artist/album)",
+        "Keyboard shortcuts (V/P/N)",
+        "Kick/low‑band detector",
+        "Music Player overlay",
+        "Persistence defaults",
+        "Playlist navigation",
+        "Repeat (all/1)",
+        "TBPM / BPM tag",
+        "Tempo lock",
+        "Visuals modes: random/all/1"
+      ],
+      "overview": "- **Purpose:** Play audio inside FrameVision with an overlaid info card and beat‑reactive visuals.\n- **Default at launch:**\n  - The **info header** (cover art, title, artist, album) is shown immediately.\n  - **Visuals are OFF** by default so audio can pre‑analyze in the background. Turn them on with the **Visuals** toggle.\n  - The floating **FAB** (♪ button) is visible; the control card opens by default.\n- **Beat‑sync:** Visuals can switch exactly every **8 / 16 / 32 / 64 beats** when the visuals mode is **all** or **random**.\n\n---",
+      "features": [
+        "Info header (cover art, title, artist, album) shows immediately on open.",
+        "Visuals are OFF by default to allow pre-analysis; toggle with the Visuals switch.",
+        "Beat-sync switching exactly every 8 / 16 / 32 / 64 beats in ‘random’ or ‘all’ modes.",
+        "Mode button cycles: random → all → 1 (no switching).",
+        "Beats button cycles: 8 → 16 → 32 → 64 (beats per switch).",
+        "Primary tempo source: embedded BPM/TBPM tag; fallback kick/low-band detector estimates ms per beat.",
+        "FAB (♪) opens/closes the controls card; positioned near header with fixed offset.",
+        "Playlist & transport: Add…, Clear, Prev/Next, Repeat (all/1), double‑click to play.",
+        "Persistence: remembers last visual, mode, and beat interval between sessions; visuals start OFF on launch.",
+        "Keyboard shortcuts: V (Visuals), P (Previous), N (Next); OS media keys may work."
+      ],
+      "controls": [
+        "Floating Action Button (♪): opens/closes music controls card (anchored near header).",
+        "Info Header: glass panel showing cover art, title, artist, album; visible even when visuals are OFF.",
+        "Playlist & Transport: Add…, Clear, Prev, Next, Repeat (all/1), double‑click to play track.",
+        "Visuals toggle: enable/disable visual rendering (defaults OFF on launch).",
+        "Mode button: random → all → 1.",
+        "Visual selector: widened dropdown of visuals.",
+        "Beats button: 8 → 16 → 32 → 64 beats per switch."
+      ],
+      "_controls_meta": {
+        "order": "top‑to‑bottom"
+      },
+      "install": [
+        "Uses bundled FFmpeg/Qt backend for audio decoding; no separate install required.",
+        "If media backends are missing, see InstallUpdates → Install."
+      ],
+      "troubleshoot": [
+        "If visuals don’t change on the beat: ensure Visuals ON and mode (random/all); fallback BPM detection may need a few seconds; try 16/32 beats.",
+        "Header shows but no visual: expected when Visuals are OFF.",
+        "Visuals start OFF each launch by design; toggle ON after playback starts.",
+        "Difference between random vs all: random picks a new visual; all walks the list.",
+        "Repeat affects playlist only; visuals switching is mode + beats.",
+        "If visuals list feels cramped: widen the window or reduce UI scale.",
+        "FAB overlaps UI: can be anchored to header bottom‑right or offset; ask for a small patch."
+      ],
+      "hints_tips": [
+        "For variable‑energy tracks, try 16 or 32 beats for more musical switching.",
+        "Prefer a steady look? Set mode = ‘1’ — Beats button remains but switching is disabled."
+      ],
+      "qa_pairs": [
+        {
+          "question": "Overview",
+          "answer": "- **Purpose:** Play audio inside FrameVision with an overlaid info card and beat‑reactive visuals.\n- **Default at launch:**\n  - The **info header** (cover art, title, artist, album) is shown immediately.\n  - **Visuals are OFF** by default so audio can pre‑analyze in the background. Turn them on with the **Visuals** toggle.\n  - The floating **FAB** (♪ button) is visible; the control card opens by default.\n- **Beat‑sync:** Visuals can switch exactly every **8 / 16 / 32 / 64 beats** when the visuals mode is **all** or **random**.\n\n---"
+        },
+        {
+          "question": "Quick start",
+          "answer": "1. Open an **audio file** (e.g., MP3). The header appears at the top of the video area.\n2. Use the **Visuals** toggle to turn visuals on/off.\n3. Choose a visual from the dropdown, pick a **mode** (`random`, `all`, or `1`), and set the **beats** (e.g., `8 beats`).\n4. Use **Repeat** (`all` or `1`) and the **prev/next** buttons to navigate the playlist.\n\n---"
+        },
+        {
+          "question": "Persistence & defaults",
+          "answer": "- The player remembers your **last visual**, **mode**, and **beat interval** between sessions.\n- **Exception:** Visuals always start **OFF** on launch (even if they were on last session) to ensure clean analysis.\n\n---"
+        },
+        {
+          "question": "Keyboard shortcuts",
+          "answer": "- **V** — toggle *Visuals on/off*.\n- **P** — *Previous* track.\n- **N** — *Next* track.\n\n*(Standard media keys from your OS/keyboard may also work depending on your setup.)*\n\n---"
+        },
+        {
+          "question": "File support & metadata",
+          "answer": "- Uses your local multimedia stack (FFmpeg/Qt) beneath the UI, so common audio formats typically work (e.g., MP3, WAV, FLAC, etc.).\n- Album art and tags (title/artist/album/BPM) are read when available; BPM helps the beat‑switcher lock to tempo.\n\n---"
+        },
+        {
+          "question": "Tips",
+          "answer": "- For tracks with variable energy, try **16** or **32 beats** for more musical switches.\n- If you prefer a steady look, set **mode = `1`**; the Beats button still shows but switching is disabled by design.\n\n---"
+        },
+        {
+          "question": "Visuals don’t change on the beat.",
+          "answer": "Ensure Visuals are ON and mode is ‘random’ or ‘all’. If no BPM tag, the fallback detector estimates tempo after a few seconds. Quiet intros can delay estimation. Try 16 or 32 beats."
+        },
+        {
+          "question": "Header shows but no background visual.",
+          "answer": "That’s expected when Visuals are OFF — only the header renders so you can browse without the visual layer."
+        },
+        {
+          "question": "Previous session had Visuals ON but they’re OFF now.",
+          "answer": "By design, Visuals start OFF each launch to allow pre‑analysis. Turn them ON once playback begins."
+        },
+        {
+          "question": "Difference between ‘random’ and ‘all’?",
+          "answer": "‘random’ picks a new visual at each interval (excluding the current one). ‘all’ walks the visuals list in order."
+        },
+        {
+          "question": "Do Repeat controls affect visuals?",
+          "answer": "No — Repeat (‘all’/‘1’) controls the playlist only. Visual switching is controlled by mode + beats."
+        },
+        {
+          "question": "Visuals list is short / names truncated.",
+          "answer": "The dropdown is widened in this build. If still cramped, widen the app window or reduce UI scale."
+        },
+        {
+          "question": "Can I move the FAB (♪)?",
+          "answer": "Yes. It can be anchored to the header’s bottom‑right or offset slightly. We can ship a tiny patch."
+        }
+      ],
+      "_layout": "overview/features/install/troubleshoot",
+      "article_md": "# FrameVision Music Player — Features & FAQ\n\nThis article documents the music player overlay that appears on the Video pane. It covers defaults, all controls, beat‑synced visuals, persistence, and troubleshooting.\n\n---\n\n## Overview\n- **Purpose:** Play audio inside FrameVision with an overlaid info card and beat‑reactive visuals.\n- **Default at launch:**\n  - The **info header** (cover art, title, artist, album) is shown immediately.\n  - **Visuals are OFF** by default so audio can pre‑analyze in the background. Turn them on with the **Visuals** toggle.\n  - The floating **FAB** (♪ button) is visible; the control card opens by default.\n- **Beat‑sync:** Visuals can switch exactly every **8 / 16 / 32 / 64 beats** when the visuals mode is **all** or **random**.\n\n---\n\n## Quick start\n1. Open an **audio file** (e.g., MP3). The header appears at the top of the video area.\n2. Use the **Visuals** toggle to turn visuals on/off.\n3. Choose a visual from the dropdown, pick a **mode** (`random`, `all`, or `1`), and set the **beats** (e.g., `8 beats`).\n4. Use **Repeat** (`all` or `1`) and the **prev/next** buttons to navigate the playlist.\n\n---\n\n## Controls (top‑to‑bottom)\n\n### Floating Action Button (FAB)\n- **♪** button anchored near the header; opens/closes the music controls card.\n- Current build positions it with a fixed offset (75px right, 25px down from the header anchor).\n\n### Info Header\n- Glass panel with **cover art**, **title**, **artist**, and **album**.\n- Header shows even when visuals are **OFF**, so you always see track info.\n\n### Playlist & Transport\n- **Add…**: add tracks.\n- **Clear**: clear playlist.\n- **Prev / Next**: navigate.\n- **Repeat:** `all` or `1`.\n- Double‑click a track in the list to play.\n\n### Visuals Row\n- **Visuals toggle**: turns visual rendering on/off (defaults **OFF** on launch).\n- **Mode button** (no prefix text): cycles **`random` → `all` → `1`**\n  - `random`: switch to a different visual at each interval.\n  - `all`: iterate through the list in order at each interval.\n  - `1`: stay on the currently selected visual (no switching).\n- **Visual selector**: dropdown of available visuals (wider to display long names).\n- **Beats button**: cycles **`8 beats` → `16 beats` → `32 beats` → `64 beats`** and controls the switch interval used by `random`/`all`.\n\n---\n\n## Beat‑sync engine (how timing works)\n- **Primary tempo source:** embedded BPM/`TBPM` tag if present.\n- **Fallback:** a lightweight kick/low‑band detector estimates **ms per beat** when metadata BPM is missing.\n- **Switch rule:** when visuals mode is **`random`** or **`all`**, the player checks the current beat index and switches visuals **exactly on the boundary** of every **N beats** (N set by the Beats button). Mode **`1`** disables switching.\n- **Why visuals start OFF:** keeping visuals off at launch allows the analyzer to “warm up” so the first switch occurs on‑grid.\n\n---\n\n## Persistence & defaults\n- The player remembers your **last visual**, **mode**, and **beat interval** between sessions.\n- **Exception:** Visuals always start **OFF** on launch (even if they were on last session) to ensure clean analysis.\n\n---\n\n## Keyboard shortcuts\n- **V** — toggle *Visuals on/off*.\n- **P** — *Previous* track.\n- **N** — *Next* track.\n\n*(Standard media keys from your OS/keyboard may also work depending on your setup.)*\n\n---\n\n## File support & metadata\n- Uses your local multimedia stack (FFmpeg/Qt) beneath the UI, so common audio formats typically work (e.g., MP3, WAV, FLAC, etc.).\n- Album art and tags (title/artist/album/BPM) are read when available; BPM helps the beat‑switcher lock to tempo.\n\n---\n\n## Troubleshooting / FAQ\n\n**Q: Visuals don’t change on the beat.**  \nA: Ensure visuals are **ON** and **mode** is **`random`** or **`all`** (mode **`1`** never switches). If the track has no BPM tag, the fallback detector estimates tempo after a few seconds—give it a moment. Extremely quiet or very sparse intros can delay estimation; try switching to **16** or **32 beats** for a visible change.\n\n**Q: Header shows but no background visual.**  \nA: That’s intended when **Visuals** are **OFF**—the header is rendered by itself so you can browse without the visual layer.\n\n**Q: My previous session had visuals ON but they’re OFF now.**  \nA: Visuals intentionally start OFF each launch to allow clean pre‑analysis. Turn them ON once playback begins.\n\n**Q: What’s the difference between `random` and `all`?**  \nA: `random` picks a new visual at each interval (excluding the current one). `all` walks through the visuals list in order.\n\n**Q: Do the Repeat controls affect visuals?**  \nA: No—Repeat (`all`/`1`) controls the **playlist**, not visuals. Visual switching is controlled by **mode** + **beats**.\n\n**Q: My visuals list is short / long names are truncated.**  \nA: The dropdown is widened in this build. If you still need more space, reduce UI scale or widen the app window.\n\n**Q: FAB overlaps something on my screen. Can I move it?**  \nA: Yes; we can anchor it to the header’s bottom‑right or adjust offsets. Ask and we’ll ship a tiny patch.\n\n---\n\n## Tips\n- For tracks with variable energy, try **16** or **32 beats** for more musical switches.\n- If you prefer a steady look, set **mode = `1`**; the Beats button still shows but switching is disabled by design.\n\n---\n\n",
+      "_meta": {
+        "added_or_updated": "2025-09-20 05:19:12",
+        "source": "User-supplied Markdown (verbatim)",
+        "updated": "2025-09-20 05:29:34"
+      },
+      "quick_start_md": "1. Open an **audio file** (e.g., MP3). The header appears at the top of the video area.\n2. Use the **Visuals** toggle to turn visuals on/off.\n3. Choose a visual from the dropdown, pick a **mode** (`random`, `all`, or `1`), and set the **beats** (e.g., `8 beats`).\n4. Use **Repeat** (`all` or `1`) and the **prev/next** buttons to navigate the playlist.\n\n---",
+      "quick_start_steps": [
+        "Open an **audio file** (e.g., MP3). The header appears at the top of the video area.",
+        "Use the **Visuals** toggle to turn visuals on/off.",
+        "Choose a visual from the dropdown, pick a **mode** (`random`, `all`, or `1`), and set the **beats** (e.g., `8 beats`).",
+        "Use **Repeat** (`all` or `1`) and the **prev/next** buttons to navigate the playlist."
+      ],
+      "shortcuts": [
+        "V — toggle *Visuals on/off*.",
+        "P — Previous* track.",
+        "N — Next* track."
+      ]
     }
   }
 }
