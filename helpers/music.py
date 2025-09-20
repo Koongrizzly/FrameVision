@@ -615,7 +615,7 @@ class MusicOverlay(QWidget):
 
         self.card = Collapser(self)
         self.card.move(0, 0)
-        self.card.setCollapsed(False)  # start open per user preference
+        self.card.setCollapsed(False)  # start collapsed to keep visuals clean
 
         # floating FAB
         self.fab = QPushButton('♪', self)
@@ -647,12 +647,22 @@ class MusicOverlay(QWidget):
 
         # visuals controls
         self.cmb_visual = QComboBox()
-        self.btn_vis_prev = QPushButton('◀')
+        # try to widen the dropdown; fall back if QSizePolicy isn't available
         try:
-            self.btn_vis_prev.hide(); self.btn_vis_next.hide()
+            from PySide6.QtWidgets import QSizePolicy as _QSP
+        except Exception:
+            _QSP = None
+        try:
+            if _QSP:
+                self.cmb_visual.setSizePolicy(_QSP.Expanding, _QSP.Fixed)
         except Exception:
             pass
-        self.btn_vis_next = QPushButton('▶')
+        try:
+            self.cmb_visual.setMinimumWidth(240)
+        except Exception:
+            pass
+        self.btn_vis_prev = QPushButton('◀'); self.btn_vis_prev.hide()
+        self.btn_vis_next = QPushButton('▶'); self.btn_vis_next.hide()
         self.btn_visuals = QPushButton('Visuals on')
         self.btn_visuals.setCheckable(True)
         self.btn_visuals.setChecked(False)
@@ -662,42 +672,28 @@ class MusicOverlay(QWidget):
         self.cmb_beats = QComboBox()
         self.cmb_beats.addItems(['8', '16', '32', '64'])
         self.cmb_beats.setCurrentIndex(2)
-
-        # new duration button that cycles 8/16/32/64 beats
-        self.btn_dur = QPushButton('Duration: 32 beats')
+        # Duration button cycles 8/16/32/64 beats
+        self.btn_dur = QPushButton('32 beats')
         self.btn_dur.setToolTip('Change how long each visual stays (in beats)')
         def _cycle_dur():
             lst = ['8','16','32','64']
-            try:
-                cur = self.cmb_beats.currentText()
-                idx = lst.index(cur) if cur in lst else 2
-            except Exception:
-                idx = 2
+            cur = self.cmb_beats.currentText()
+            idx = lst.index(cur) if cur in lst else 2
             idx = (idx + 1) % len(lst)
+            self.cmb_beats.setCurrentIndex(idx)
             try:
-                self.cmb_beats.setCurrentIndex(idx)
+                self.btn_dur.setText(f'{lst[idx]} beats')
             except Exception:
                 pass
-            try:
-                self.btn_dur.setText(f'Duration: {lst[idx]} beats')
-            except Exception:
-                pass
-            # persist when changed via button
             try:
                 if getattr(self.parent(), '_music_runtime', None):
                     self.parent()._music_runtime._persist_state()
             except Exception:
                 pass
-        try:
-            self.btn_dur.clicked.connect(_cycle_dur)
-            # keep label in sync when combo changes via other means
-            self.cmb_beats.currentIndexChanged.connect(lambda _i: self.btn_dur.setText(f'Duration: {self.cmb_beats.currentText()} beats'))
-            # initialize text
-            self.btn_dur.setText(f'Duration: {self.cmb_beats.currentText()} beats')
-        except Exception:
-            pass
-
-        self.btn_vizmode = QPushButton('Mode: random')
+        self.btn_dur.clicked.connect(_cycle_dur)
+        self.cmb_beats.currentIndexChanged.connect(lambda _i: self.btn_dur.setText(f'{self.cmb_beats.currentText()} beats'))
+        self.btn_dur.setText(f'{self.cmb_beats.currentText()} beats')
+        self.btn_vizmode = QPushButton('random')
 
         row_vis1 = QHBoxLayout()
         row_vis1.addWidget(self.btn_visuals)
@@ -708,6 +704,7 @@ class MusicOverlay(QWidget):
                 
         row_vis2 = QHBoxLayout()
         row_vis2.addWidget(self.chk_auto)
+        row_vis2.addWidget(self.btn_vizmode)
         row_vis2.addSpacing(8)
         row_vis2.addWidget(QLabel('Every'))
         row_vis2.addWidget(self.cmb_beats)
@@ -806,7 +803,7 @@ class MusicOverlay(QWidget):
         header_y = 18
         header_w = min(520, int(w * 0.7))
         fx = header_x + header_w - self.fab.width() - 8 + 75
-        fy = header_y + 78 + 25
+        fy = header_y + 8 + 25
         fx = min(max(6, fx), max(6, w - self.fab.width() - 6))
         fy = min(max(6, fy), max(6, h - self.fab.height() - 6))
         self.fab.move(fx, fy)
@@ -939,20 +936,19 @@ class MusicOverlay(QWidget):
             return False
 
     def current_viz_mode(self) -> str:
-        txt = self.btn_vizmode.text().lower()
-        if 'all' in txt: return 'all'
-        if ' 1' in txt or txt.endswith(': 1'): return 'one'
+        txt = self.btn_vizmode.text().lower().strip()
+        if txt in ('all','loop'): return 'all'
+        if txt in ('1','one'): return 'one'
         return 'random'
 
     def _toggle_vizmode(self):
         m = self.current_viz_mode()
         if m == 'random':
-            self.btn_vizmode.setText('Mode: all')
+            self.btn_vizmode.setText('all')
         elif m == 'all':
-            self.btn_vizmode.setText('Mode: 1')
+            self.btn_vizmode.setText('1')
         else:
-            self.btn_vizmode.setText('Mode: random')
-
+            self.btn_vizmode.setText('random')
 # ---------------- State helpers ----------------
 
 def _load_state() -> dict:
@@ -1018,7 +1014,6 @@ class MusicRuntime(QObject):
             base.fill(QColor(5, 5, 7, 255))
             p = QPainter(base)
             try:
-                # glass panel for meta header
                 p.fillRect(QRect(18, 18, min(520, int(w * 0.7)), 148), QColor(0, 0, 0, 150))
                 if self.cover and not self.cover.isNull():
                     cpm = self.cover.scaled(QSize(110, 110), Qt.KeepAspectRatio, Qt.SmoothTransformation)
@@ -1038,9 +1033,6 @@ class MusicRuntime(QObject):
             pass
 
     def _on_visual_frame(self, img: QImage):
-        if self.overlay and (not self.overlay.visuals_enabled()):
-            return
-
         w = max(64, self.video.label.width())
         h = max(64, self.video.label.height())
         base = QImage(w, h, QImage.Format_RGBA8888)
@@ -1048,7 +1040,7 @@ class MusicRuntime(QObject):
         p = QPainter(base)
         try:
             pm = None
-            if not (self.overlay and (not self.overlay.visuals_enabled())):
+            if self.overlay is None or self.overlay.visuals_enabled():
                 pm = QPixmap.fromImage(img)
                 pm = pm.scaled(QSize(w, h), Qt.KeepAspectRatio, Qt.SmoothTransformation)
                 p.drawPixmap((w - pm.width()) // 2, (h - pm.height()) // 2, pm)
@@ -1112,7 +1104,7 @@ class MusicRuntime(QObject):
         except Exception:
             pos = 0
         beat_index = pos // ms_per_beat
-        if self.overlay and self.overlay.visuals_enabled() and self.overlay.is_auto():
+        if self.overlay and self.overlay.visuals_enabled() and (self.overlay.current_viz_mode() in ('all','random') or self.overlay.is_auto()):
             N = max(1, self.overlay.current_auto_beats())
             if beat_index != self._last_beat_index and (beat_index % N) == 0 and beat_index > 0:
                 self._cycle_visual()
@@ -1174,7 +1166,7 @@ class MusicRuntime(QObject):
             choices = [i for i in range(count) if i != cur]
             if choices:
                 self.overlay._visual_index = random.choice(choices)
-        else:  # all
+        else:  # all/loop
             self.overlay._visual_index = (self.overlay.cmb_visual.currentIndex() + 1) % count
         self.overlay.cmb_visual.setCurrentIndex(self.overlay._visual_index)
         self._persist_state()
@@ -1186,13 +1178,6 @@ class MusicRuntime(QObject):
         try:
             self.visual.set_enabled(self.overlay.visuals_enabled())
             self.overlay.btn_visuals.toggled.connect(self.visual.set_enabled)
-            # always start with visuals OFF so analysis can pre-process
-            try:
-                self.overlay.btn_visuals.setChecked(False)
-                self.visual.set_enabled(False)
-            except Exception:
-                pass
-
             # update button label text
             self.overlay.btn_visuals.toggled.connect(lambda c: self.overlay.btn_visuals.setText('Visuals off' if c else 'Visuals on'))
         except Exception:
@@ -1201,7 +1186,6 @@ class MusicRuntime(QObject):
         st = _load_state()
         try:
             if 'visuals_on' in st:
-                # ignored at startup (we start OFF); state persists on user toggle
                 self.overlay.btn_visuals.setChecked(False)
                 self.visual.set_enabled(False)
             last_mode = st.get('visual_mode_name')
@@ -1224,15 +1208,12 @@ class MusicRuntime(QObject):
                 idx = ['8','16','32','64'].index(str(beats))
                 self.overlay.cmb_beats.setCurrentIndex(idx)
             mode = st.get('auto_mode')
-            
-
             if mode in ('loop', 'all'):
-                self.overlay.btn_vizmode.setText('Mode: all')
+                self.overlay.btn_vizmode.setText('all')
             elif mode == 'one':
-                self.overlay.btn_vizmode.setText('Mode: 1')
+                self.overlay.btn_vizmode.setText('1')
             else:
-                self.overlay.btn_vizmode.setText('Mode: random')
-
+                self.overlay.btn_vizmode.setText('random')
         except Exception:
             pass
 
