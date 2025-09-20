@@ -47,32 +47,24 @@ def music_env(bands,rms):
     _gate=0.78*_gate+0.22*g
     return max(0.0,min(1.0,_env)), max(0.0,min(1.0,_gate))
 
+_pts=[(_rng.random(), _rng.random(), 2*pi*_rng.random()) for _ in range(220)]
 @register_visualizer
-class BezierWaves(BaseVisualizer):
-    display_name = "Bézier Waves"
+class SparkleSwerve(BaseVisualizer):
+    display_name = "Sparkle Swerve"
     def paint(self,p:QPainter,r,bands,rms,t):
         w,h=int(r.width()),int(r.height())
         if w<=0 or h<=0: return
-        p.fillRect(r,QBrush(QColor(5,6,12)))
+        p.fillRect(r,QBrush(QColor(6,6,12)))
         env,gate=music_env(bands,rms)
-        rows=10
-        for iy in range(rows):
-            hue=int((t*40+iy*35)%360)
-            val=220 if gate>0.6 and iy%2==0 else 200
-            p.setPen(QPen(QColor.fromHsv(hue,220,val,220), 2+int(1.5*env)))
-            y=r.top()+(iy+0.5)*h/rows
-            x1=r.left(); x2=r.right()
-            ctrlx=(x1+x2)/2
-            amp=(0.06*h)*(1+2.4*env)  # stronger
-            v=bands[iy%len(bands)] if bands else 0.0
-            c1=QPointF(ctrlx, y - amp*(sin(t*1.2+iy*0.7)+2.0*v))
-            c2=QPointF(ctrlx, y + amp*(cos(t*1.1+iy*0.6)+2.0*v))
-            path=QPainterPath(QPointF(x1,y))
-            path.cubicTo(c1,c2,QPointF(x2,y))
-            p.drawPath(path)
-            # subtle RGB mis-register on peaks
-            if gate>0.55:
-                p.setPen(QPen(QColor.fromHsv((hue+120)%360,220,200,140),1))
-                p.drawPath(path.translated(2,-1))
-                p.setPen(QPen(QColor.fromHsv((hue+240)%360,220,200,140),1))
-                p.drawPath(path.translated(-2,1))
+        speed=0.05+0.25*env + (0.08 if gate>0.6 else 0.0)
+        for i,(ux,uy,ph) in enumerate(_pts):
+            x=r.left()+((ux + speed*sin(t*0.9+ph))%1.0)*w
+            y=r.top() +((uy + speed*cos(t*0.8+ph))%1.0)*h
+            hue=int((i*3 + t*90) % 360)
+            val=170 + int(60*(0.5+0.5*sin(t*4+ph))) + int(60*env) + (40 if gate>0.6 else 0)
+            g=QRadialGradient(QPointF(x,y), 8+8*env+(4 if gate>0.6 else 0))
+            g.setColorAt(0.0, QColor.fromHsv(hue,220,min(255,val), 220))
+            g.setColorAt(1.0, QColor.fromHsv(hue,220,0,0))
+            p.setBrush(QBrush(g))
+            p.setPen(QPen(QColor(255,255,255,10),1))
+            p.drawEllipse(QPointF(x,y), 2.2+1.6*env, 2.2+1.6*env)

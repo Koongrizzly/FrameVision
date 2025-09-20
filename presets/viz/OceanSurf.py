@@ -1,53 +1,73 @@
 from math import sin, cos, pi, sqrt
 from random import Random
-from PySide6.QtGui import QPainter, QPen, QColor, QBrush, QRadialGradient, QLinearGradient, QConicalGradient, QPainterPath
+from PySide6.QtGui import QPainter, QPen, QColor, QBrush, QRadialGradient, QLinearGradient, QPainterPath, QFont
 from PySide6.QtCore import QPointF, QRectF
 from helpers.music import register_visualizer, BaseVisualizer
 
-# Smoothed bass emphasis to keep idle motion while popping on bass
-_s_bass = 0.0
-def bass_level(bands, rms):
-    global _s_bass
-    if bands:
-        n = len(bands)
-        lo = max(1, n//6)
-        bass = sum(bands[:lo]) / lo
-    else:
-        bass = 0.0
-    lvl = 0.22 + 0.78 * min(1.0, 0.9*bass + 0.35*rms)
-    _s_bass = 0.82*_s_bass + 0.18*lvl
-    return _s_bass
+# Aggressive mid/high + spectral flux env with onset gate
+_rng = Random(13579)
+_prev = []
+_env = 0.0
+_gate = 0.0
+
+def _midhi(bands):
+    if not bands: return 0.0
+    n=len(bands); cut=max(1,n//6)
+    s=0.0; c=0
+    for i in range(cut,n):
+        w=0.4+0.6*((i-cut)/max(1,n-cut))
+        s += w*bands[i]; c += 1
+    return s/max(1,c)
+
+def _flux(bands):
+    global _prev
+    if not bands:
+        _prev=[]; return 0.0
+    n=len(bands)
+    if not _prev or len(_prev)!=n:
+        _prev=[0.0]*n
+    cut=max(1,n//6); f=0.0; c=0
+    for i in range(cut,n):
+        d=bands[i]-_prev[i]
+        if d>0: f += (0.3+0.7*((i-cut)/max(1,n-cut)))*d
+        c+=1
+    _prev=[0.85*_prev[i]+0.15*bands[i] for i in range(n)]
+    return f/max(1,c)
+
+def music_env(bands,rms):
+    global _env,_gate
+    target=0.55*_midhi(bands)+1.35*_flux(bands)+0.2*rms
+    target=target/(1+0.7*target)
+    if target>_env: _env=0.65*_env+0.35*target
+    else: _env=0.90*_env+0.10*target
+    # onset gate with hysteresis
+    f=_flux(bands)
+    hi=0.30; lo=0.18
+    g=1.0 if f>hi else (0.0 if f<lo else _gate)
+    _gate=0.78*_gate+0.22*g
+    return max(0.0,min(1.0,_env)), max(0.0,min(1.0,_gate))
 
 @register_visualizer
 class OceanSurf(BaseVisualizer):
     display_name = "Ocean Surf"
-    def paint(self, p: QPainter, r, bands, rms, t):
-        w, h = int(r.width()), int(r.height())
-        if w <= 0 or h <= 0: return
-        # dusk gradient
-        bg = QLinearGradient(r.left(), r.top(), r.right(), r.bottom())
-        bg.setColorAt(0.0, QColor(8, 14, 28))
-        bg.setColorAt(1.0, QColor(20, 30, 60))
-        p.fillRect(r, QBrush(bg))
-
-        lvl = bass_level(bands, rms)
-        layers = 6
+    def paint(self,p:QPainter,r,bands,rms,t):
+        w,h=int(r.width()),int(r.height())
+        if w<=0 or h<=0: return
+        bg=QLinearGradient(r.left(),r.top(),r.right(),r.bottom())
+        bg.setColorAt(0.0,QColor(8,14,28))
+        bg.setColorAt(1.0,QColor(20,30,60))
+        p.fillRect(r,QBrush(bg))
+        env,gate=music_env(bands,rms)
+        layers=7
         for k in range(layers):
-            phase = t*0.45 + k*0.5
-            amp = (0.05 + 0.03*k) * h * (0.7 + 0.7*lvl)
-            hue = int((200 + k*18 + t*10) % 360)
-            p.setPen(QPen(QColor.fromHsv(hue, 180, 240, 200), 2))
-            prev = None
-            step = max(4, w//240*4)
-            for i in range(0, w+step, step):
-                x = r.left() + i
-                # sample mid bands for detail
-                v = 0.0
-                if bands:
-                    idx = int((i/w) * len(bands))
-                    idx = max(0, min(len(bands)-1, idx))
-                    v = bands[idx]
-                y = r.center().y() + amp*sin(i*0.012 + phase) + (h*0.02)*sin(i*0.05 + t*0.7) - v*14
-                if prev:
-                    p.drawLine(QPointF(prev[0], prev[1]), QPointF(x,y))
-                prev = (x,y)
+            phase=t*(0.6+1.6*env)+k*0.55
+            amp=(0.06+0.035*k)*h*(0.9+1.6*env + (0.4 if gate>0.6 else 0.0))
+            hue=int((200+k*18+t*20)%360)
+            p.setPen(QPen(QColor.fromHsv(hue,200,245,220), 2))
+            prev=None; step=max(3,w//260*3)
+            for i in range(0,w+step, step):
+                x=r.left()+i
+                v=bands[int(i/max(1,w)*len(bands))] if bands else 0.0
+                y=r.center().y() + amp*sin(i*0.014+phase) + (h*0.02)*sin(i*0.05+t) - v*18
+                if prev: p.drawLine(QPointF(prev[0],prev[1]), QPointF(x,y))
+                prev=(x,y)

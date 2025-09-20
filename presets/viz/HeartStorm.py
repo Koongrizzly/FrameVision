@@ -47,32 +47,35 @@ def music_env(bands,rms):
     _gate=0.78*_gate+0.22*g
     return max(0.0,min(1.0,_env)), max(0.0,min(1.0,_gate))
 
+def _heart_path(cx, cy, s):
+    path=QPainterPath()
+    x0,y0=cx, cy-0.3*s
+    path.moveTo(x0,y0)
+    path.cubicTo(cx-0.5*s, cy-0.9*s, cx-1.2*s, cy+0.2*s, cx, cy+0.9*s)
+    path.cubicTo(cx+1.2*s, cy+0.2*s, cx+0.5*s, cy-0.9*s, x0, y0)
+    return path
+
 @register_visualizer
-class BezierWaves(BaseVisualizer):
-    display_name = "Bézier Waves"
+class HeartStorm(BaseVisualizer):
+    display_name = "Heart Storm"
     def paint(self,p:QPainter,r,bands,rms,t):
         w,h=int(r.width()),int(r.height())
         if w<=0 or h<=0: return
-        p.fillRect(r,QBrush(QColor(5,6,12)))
         env,gate=music_env(bands,rms)
-        rows=10
-        for iy in range(rows):
-            hue=int((t*40+iy*35)%360)
-            val=220 if gate>0.6 and iy%2==0 else 200
-            p.setPen(QPen(QColor.fromHsv(hue,220,val,220), 2+int(1.5*env)))
-            y=r.top()+(iy+0.5)*h/rows
-            x1=r.left(); x2=r.right()
-            ctrlx=(x1+x2)/2
-            amp=(0.06*h)*(1+2.4*env)  # stronger
-            v=bands[iy%len(bands)] if bands else 0.0
-            c1=QPointF(ctrlx, y - amp*(sin(t*1.2+iy*0.7)+2.0*v))
-            c2=QPointF(ctrlx, y + amp*(cos(t*1.1+iy*0.6)+2.0*v))
-            path=QPainterPath(QPointF(x1,y))
-            path.cubicTo(c1,c2,QPointF(x2,y))
-            p.drawPath(path)
-            # subtle RGB mis-register on peaks
-            if gate>0.55:
-                p.setPen(QPen(QColor.fromHsv((hue+120)%360,220,200,140),1))
-                p.drawPath(path.translated(2,-1))
-                p.setPen(QPen(QColor.fromHsv((hue+240)%360,220,200,140),1))
-                p.drawPath(path.translated(-2,1))
+        p.fillRect(r,QBrush(QColor(8,8,14)))
+        cx,cy=r.center().x(), r.center().y()
+        s=32*(1+0.9*env + (0.25 if gate>0.6 else 0.0))
+        p.setPen(QPen(QColor(255,150,180,230), 3))
+        p.setBrush(QBrush(QColor(255,80,120,90)))
+        p.drawPath(_heart_path(cx,cy,s))
+        # outer ring pumps harder with env^1.3 + gate kick
+        pump=(env**1.3)*1.0 + (0.6 if gate>0.6 else 0.0)
+        count=28
+        for i in range(count):
+            ang=2*pi*i/count + t*0.7
+            L=(60 + 220*pump)
+            x=cx+L*cos(ang); y=cy+L*sin(ang)
+            hue=int((340 + i*7 + t*50) % 360)
+            p.setPen(QPen(QColor.fromHsv(hue,220,255,220), 2))
+            p.setBrush(QBrush(QColor.fromHsv(hue,180,230,80)))
+            p.drawPath(_heart_path(x,y, 12+8*sin(t*2+i)))

@@ -48,31 +48,26 @@ def music_env(bands,rms):
     return max(0.0,min(1.0,_env)), max(0.0,min(1.0,_gate))
 
 @register_visualizer
-class BezierWaves(BaseVisualizer):
-    display_name = "Bézier Waves"
+class NeonLissajous(BaseVisualizer):
+    display_name = "Neon Lissajous (Color+)"
     def paint(self,p:QPainter,r,bands,rms,t):
         w,h=int(r.width()),int(r.height())
         if w<=0 or h<=0: return
-        p.fillRect(r,QBrush(QColor(5,6,12)))
         env,gate=music_env(bands,rms)
-        rows=10
-        for iy in range(rows):
-            hue=int((t*40+iy*35)%360)
-            val=220 if gate>0.6 and iy%2==0 else 200
-            p.setPen(QPen(QColor.fromHsv(hue,220,val,220), 2+int(1.5*env)))
-            y=r.top()+(iy+0.5)*h/rows
-            x1=r.left(); x2=r.right()
-            ctrlx=(x1+x2)/2
-            amp=(0.06*h)*(1+2.4*env)  # stronger
-            v=bands[iy%len(bands)] if bands else 0.0
-            c1=QPointF(ctrlx, y - amp*(sin(t*1.2+iy*0.7)+2.0*v))
-            c2=QPointF(ctrlx, y + amp*(cos(t*1.1+iy*0.6)+2.0*v))
-            path=QPainterPath(QPointF(x1,y))
-            path.cubicTo(c1,c2,QPointF(x2,y))
-            p.drawPath(path)
-            # subtle RGB mis-register on peaks
-            if gate>0.55:
-                p.setPen(QPen(QColor.fromHsv((hue+120)%360,220,200,140),1))
-                p.drawPath(path.translated(2,-1))
-                p.setPen(QPen(QColor.fromHsv((hue+240)%360,220,200,140),1))
-                p.drawPath(path.translated(-2,1))
+        cx,cy=r.center().x(), r.center().y()
+        a=0.40*min(w,h)*(0.9+0.7*env)
+        b=0.30*min(w,h)*(0.9+0.7*env)
+        kx=3; ky=2
+        steps=900
+        hue0=int((t*80) % 360)
+        prev=None
+        for i in range(steps):
+            u=2*pi*i/steps
+            x=cx + a*sin(kx*u + t*(1.2+2.0*env))
+            y=cy + b*sin(ky*u + t*(1.0+1.6*env)+pi/3)
+            hue=(hue0 + int(360*i/steps))%360
+            alpha=200
+            width=2 + (2 if gate>0.6 else 0)
+            p.setPen(QPen(QColor.fromHsv(hue, 230, 255, alpha), width))
+            if prev: p.drawLine(QPointF(prev[0],prev[1]), QPointF(x,y))
+            prev=(x,y)

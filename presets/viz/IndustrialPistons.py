@@ -48,31 +48,27 @@ def music_env(bands,rms):
     return max(0.0,min(1.0,_env)), max(0.0,min(1.0,_gate))
 
 @register_visualizer
-class BezierWaves(BaseVisualizer):
-    display_name = "Bézier Waves"
+class IndustrialPistons(BaseVisualizer):
+    display_name = "Industrial Pistons"
     def paint(self,p:QPainter,r,bands,rms,t):
         w,h=int(r.width()),int(r.height())
         if w<=0 or h<=0: return
-        p.fillRect(r,QBrush(QColor(5,6,12)))
         env,gate=music_env(bands,rms)
-        rows=10
-        for iy in range(rows):
-            hue=int((t*40+iy*35)%360)
-            val=220 if gate>0.6 and iy%2==0 else 200
-            p.setPen(QPen(QColor.fromHsv(hue,220,val,220), 2+int(1.5*env)))
-            y=r.top()+(iy+0.5)*h/rows
-            x1=r.left(); x2=r.right()
-            ctrlx=(x1+x2)/2
-            amp=(0.06*h)*(1+2.4*env)  # stronger
-            v=bands[iy%len(bands)] if bands else 0.0
-            c1=QPointF(ctrlx, y - amp*(sin(t*1.2+iy*0.7)+2.0*v))
-            c2=QPointF(ctrlx, y + amp*(cos(t*1.1+iy*0.6)+2.0*v))
-            path=QPainterPath(QPointF(x1,y))
-            path.cubicTo(c1,c2,QPointF(x2,y))
-            p.drawPath(path)
-            # subtle RGB mis-register on peaks
+        p.fillRect(r,QBrush(QColor(10,10,12)))
+        lanes=4
+        for i in range(lanes):
+            y=r.top()+(i+0.5)*h/lanes
+            hue=int((t*20+i*40)%360)
+            stroke=(w*0.35)*(0.6+1.4*env)
+            speed=1.0+0.8*env + (0.6 if i%2==0 else 0.0)
+            x=r.center().x()+stroke*sin(t*speed + i)
+            p.setPen(QPen(QColor.fromHsv(hue,220,255,200), 4+int(1.5*env)))
+            p.drawLine(QPointF(x-90,y), QPointF(x+90,y))
+            p.setPen(QPen(QColor.fromHsv(hue,220,200,150), 6))
+            p.drawLine(QPointF(x,y-22), QPointF(x,y+22))
             if gate>0.55:
-                p.setPen(QPen(QColor.fromHsv((hue+120)%360,220,200,140),1))
-                p.drawPath(path.translated(2,-1))
-                p.setPen(QPen(QColor.fromHsv((hue+240)%360,220,200,140),1))
-                p.drawPath(path.translated(-2,1))
+                for k in range(8):
+                    ang=2*pi*_rng.random(); L=25+70*_rng.random()
+                    col=QColor.fromHsv(int(_rng.random()*360),220,255,220)
+                    p.setPen(QPen(col,2))
+                    p.drawLine(QPointF(x,y), QPointF(x+L*cos(ang), y+L*sin(ang)))
