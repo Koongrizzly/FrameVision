@@ -36,6 +36,13 @@ warnings.filterwarnings(
 )
 # -----------------------------------------------------------------
 # >>> FRAMEVISION_QWEN_BEGIN
+
+# Settings persistence toggle (shared with app Settings tab)
+def _keep_settings_enabled() -> bool:
+    try:
+        return bool(QSettings('FrameVision','FrameVision').value('keep_settings_after_restart', True, type=bool))
+    except Exception:
+        return True
 # Text->Image tab and generator (Diffusers-first)
 import json, time, random, threading
 import subprocess
@@ -176,7 +183,7 @@ class Txt2ImgPane(QWidget):
                             if ('random' in sp and 'Random' in (self.seed_policy.itemText(_i) or '')) or ('fixed' in sp and 'Fixed' in (self.seed_policy.itemText(_i) or '')):
                                 idx = _i; break
                         if idx >= 0:
-                            self.seed_policy.setCurrentIndex(idx)
+                            self.seed_policy.setCurrentIndex(idx) if sp is not None else None
             except Exception:
                 pass
             try:
@@ -277,12 +284,6 @@ class Txt2ImgPane(QWidget):
 
 
         # Load saved settings last to override other managers
-        try:
-            self._load_settings()
-        except Exception as e:
-            print('[txt2img] load at init error:', e)
-
-        # Load saved settings last so other managers can't overwrite them
         try:
             self._load_settings()
         except Exception as e:
@@ -399,7 +400,7 @@ class Txt2ImgPane(QWidget):
                         if "Random" in (self.seed_policy.itemText(i) or ""):
                             idx = i; break
                     if idx >= 0:
-                        self.seed_policy.setCurrentIndex(idx)
+                        self.seed_policy.setCurrentIndex(idx) if sp is not None else None
         except Exception:
             pass
 
@@ -558,12 +559,13 @@ class Txt2ImgPane(QWidget):
                 self.size_manual_w.setValue(int(w)); self.size_manual_h.setValue(int(h))
                 self.size_manual_w.blockSignals(False); self.size_manual_h.blockSignals(False)
         self.size_combo.currentIndexChanged.connect(_on_size_combo_changed)
-        # Ensure manual boxes reflect default 768x768 on startup
+        # Ensure manual boxes reflect default only if persistence is OFF
         try:
-            di = idx_default
-            data = self.size_combo.itemData(di)
-            if data:
-                self.size_manual_w.setValue(int(data[0])); self.size_manual_h.setValue(int(data[1]))
+            if not _keep_settings_enabled():
+                di = idx_default
+                data = self.size_combo.itemData(di)
+                if data:
+                    self.size_manual_w.setValue(int(data[0])); self.size_manual_h.setValue(int(data[1]))
         except Exception:
             pass
         def _sync_manual_w(v):
@@ -966,6 +968,8 @@ class Txt2ImgPane(QWidget):
             "fit_check": self.fit_check.isChecked(),
             "steps": int(self.steps_slider.value()),
             "created_at": time.time(),
+            "size_preset_index": int(self.size_combo.currentIndex()) if hasattr(self,"size_combo") else -1,
+            "size_preset_label": str(self.size_combo.currentText()) if hasattr(self,"size_combo") else "",
             "width": int(w_ui),
             "height": int(h_ui),
 
@@ -1026,48 +1030,48 @@ class Txt2ImgPane(QWidget):
         except Exception:
             pass
         try:
-            self.seed.setValue(int(s.get('seed', 0)))
-            sp = str(s.get('seed_policy','fixed')).lower()
+            self.seed.setValue(int(s['seed'])) if 'seed' in s else None
+            sp = str(s['seed_policy']).lower() if 'seed_policy' in s else None
             idx = {'fixed':0,'random':1,'increment':2}.get(sp,0)
-            self.seed_policy.setCurrentIndex(idx)
-            self.batch.setValue(int(s.get('batch',1)))
+            self.seed_policy.setCurrentIndex(idx) if sp is not None else None
+            self.batch.setValue(int(s['batch'])) if 'batch' in s else None
         except Exception:
             pass
         try:
-            self.output_path.setText(s.get('output', self.output_path.text()))
-            self.show_in_player.setChecked(bool(s.get('show_in_player', True)))
+            self.output_path.setText(s['output']) if 'output' in s else None
+            self.show_in_player.setChecked(bool(s['show_in_player'])) if 'show_in_player' in s else None
             if hasattr(self, 'use_queue'):
-                self.use_queue.setChecked(bool(s.get('use_queue', False)))
+                self.use_queue.setChecked(bool(s['use_queue'])) if 'use_queue' in s else None
         except Exception:
             pass
         try:
-            w = int(s.get('width', 1024)); h = int(s.get('height', 1024))
+            w = int(s['width']) if 'width' in s else None; h = int(s['height']) if 'height' in s else None
             idx = -1
             for i,(label,wv,hv) in enumerate(self._size_presets):
                 if wv==w and hv==h:
                     idx = i; break
-            if idx>=0 and hasattr(self, 'size_combo'):
+            if (w is not None and h is not None) and idx>=0 and hasattr(self, 'size_combo'):
                 self.size_combo.setCurrentIndex(idx)
-            else:
+            elif (w is not None and h is not None):
                 if hasattr(self, 'size_manual_w'): self.size_manual_w.setValue(w)
                 if hasattr(self, 'size_manual_h'): self.size_manual_h.setValue(h)
         except Exception:
             pass
         try:
-            if hasattr(self, 'steps_slider'): self.steps_slider.setValue(int(s.get('steps', 30)))
-            if hasattr(self, 'cfg_scale'): self.cfg_scale.setValue(float(s.get('cfg_scale', 7.5)))
+            self.steps_slider.setValue(int(s['steps'])) if 'steps' in s and hasattr(self,'steps_slider') else None
+            self.cfg_scale.setValue(float(s['cfg_scale'])) if 'cfg_scale' in s and hasattr(self,'cfg_scale') else None
         except Exception:
             pass
         try:
-            if hasattr(self, 'vram_profile'): self.vram_profile.setCurrentText(s.get('vram_profile','Auto'))
-            if hasattr(self, 'sampler'): self.sampler.setCurrentText(s.get('sampler','DPM++ 2M (Karras)'))
-            if hasattr(self, 'attn_slicing'): self.attn_slicing.setChecked(bool(s.get('attn_slicing', True)))
-            if hasattr(self, 'vae_device'): self.vae_device.setCurrentText(str(s.get('vae_device','Auto')))
-            if hasattr(self, 'gpu_index'): self.gpu_index.setValue(int(s.get('gpu_index',0)))
-            if hasattr(self, 'threads'): self.threads.setValue(int(s.get('threads',0)))
-            if hasattr(self, 'format_combo'): self.format_combo.setCurrentText(str(s.get('format','PNG')))
-            if hasattr(self, 'filename_template'): self.filename_template.setText(s.get('filename_template','sd_{seed}_{idx:03d}.png'))
-            if hasattr(self, 'hires_helper'): self.hires_helper.setChecked(bool(s.get('hires_helper', False)))
+            if hasattr(self, 'vram_profile'): self.vram_profile.setCurrentText(s['vram_profile']) if 'vram_profile' in s else None
+            if hasattr(self, 'sampler'): self.sampler.setCurrentText(s['sampler']) if 'sampler' in s else None
+            if hasattr(self, 'attn_slicing'): self.attn_slicing.setChecked(bool(s['attn_slicing'])) if 'attn_slicing' in s else None
+            if hasattr(self, 'vae_device'): self.vae_device.setCurrentText(str(s['vae_device'])) if 'vae_device' in s else None
+            if hasattr(self, 'gpu_index'): self.gpu_index.setValue(int(s['gpu_index'])) if 'gpu_index' in s else None
+            if hasattr(self, 'threads'): self.threads.setValue(int(s['threads'])) if 'threads' in s else None
+            if hasattr(self, 'format_combo'): self.format_combo.setCurrentText(str(s['format'])) if 'format' in s else None
+            if hasattr(self, 'filename_template'): self.filename_template.setText(s['filename_template']) if 'filename_template' in s else None
+            if hasattr(self, 'hires_helper'): self.hires_helper.setChecked(bool(s['hires_helper'])) if 'hires_helper' in s else None
             if hasattr(self, 'fit_check'): self.fit_check.setChecked(bool(s.get('fit_check', True)))
         except Exception:
             pass
@@ -1680,12 +1684,36 @@ def _t2i_apply_from_dict(self, s: dict):
         # Basic nums
         if hasattr(self, 'seed') and 'seed' in s: self.seed.setValue(int(s.get('seed') or 0))
         if hasattr(self, 'seed_policy') and 'seed_policy' in s:
-            sp = str(s.get('seed_policy','fixed')).lower()
+            sp = str(s['seed_policy']).lower() if 'seed_policy' in s else None
             idx = {'fixed':0,'random':1,'increment':2}.get(sp,0)
-            self.seed_policy.setCurrentIndex(idx)
+            self.seed_policy.setCurrentIndex(idx) if sp is not None else None
         if hasattr(self, 'batch') and 'batch' in s: self.batch.setValue(int(s.get('batch') or 1))
         # Size
+        # Prefer explicit preset index if present
+        if 'size_preset_index' in s and hasattr(self,'size_combo'):
+            try:
+                idx = int(s['size_preset_index'])
+                if 0 <= idx < self.size_combo.count():
+                    self.size_combo.blockSignals(True)
+                    self.size_combo.setCurrentIndex(idx)
+                    self.size_combo.blockSignals(False)
+            except Exception:
+                pass
+        # Fallback: match width/height to a preset
         w = s.get('width'); h = s.get('height')
+        if w is not None and h is not None and hasattr(self,'size_combo'):
+            try:
+                idx = -1
+                for i,(label,wv,hv) in enumerate(self._size_presets):
+                    if int(w)==wv and int(h)==hv:
+                        idx = i; break
+                if idx >= 0:
+                    self.size_combo.blockSignals(True)
+                    self.size_combo.setCurrentIndex(idx)
+                    self.size_combo.blockSignals(False)
+            except Exception:
+                pass
+        # Always set manual boxes too (kept in sync by combo change handler)
         if hasattr(self,'size_manual_w') and w is not None: self.size_manual_w.setValue(int(w))
         if hasattr(self,'size_manual_h') and h is not None: self.size_manual_h.setValue(int(h))
         # Sampler/steps/cfg
@@ -1744,6 +1772,9 @@ try:
     if not hasattr(_Txt2ImgPane, '_t2i_patched'):
         _orig_init = _Txt2ImgPane.__init__
         def _init_patch(self, *a, **k):
+            # Block autosave during initial build
+            try: self._t2i_loading = True
+            except Exception: pass
             _orig_init(self, *a, **k)
             _t2i_post_init(self)
         _Txt2ImgPane.__init__ = _init_patch  # type: ignore[assignment]
