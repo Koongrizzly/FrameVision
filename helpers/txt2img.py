@@ -1,5 +1,15 @@
 from __future__ import annotations
 
+# === QImageIO maxalloc disabled by patch ===
+import os as _qt_img_os
+_qt_img_os.environ["QT_IMAGEIO_MAXALLOC"] = "0"  # Disable env-based cap (0 = no limit)
+try:
+    from PySide6.QtGui import QImageReader as _QIR
+    _QIR.setAllocationLimit(0)  # Disable runtime cap as well
+except Exception as _e:
+    pass
+# === end patch ===
+
 # --- Quiet mode: suppress harmless logs/warnings for end users ---
 import os, warnings
 # Progress bars & banners

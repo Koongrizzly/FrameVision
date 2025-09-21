@@ -55,6 +55,14 @@ MUSIC_STATE_PATH = OUT_TEMP / 'music_state.json'
 
 AUDIO_EXTS = {'.mp3', '.wav', '.flac', '.m4a', '.aac', '.ogg', '.opus', '.wma', '.aif', '.aiff'}
 
+# ---------------- initial one-time scroll hack ----------------
+# Workaround: on app start, the first audio track will seek forward by 100ms
+# right after starting at 00:00. This mitigates a freeze when loading another
+# track/video before any user scroll occurs.
+_INITIAL_SCROLL_ARMED = False
+_INITIAL_SCROLL_DONE = False
+
+
 # ---------------- ffmpeg helpers ----------------
 
 def ffmpeg_path() -> str:
@@ -126,7 +134,7 @@ def _read_tags_with_mutagen(path: Path) -> dict:
 def _read_tags_with_ffprobe(path: Path) -> dict:
     try:
         out = subprocess.check_output(
-            [ffprobe_path(), '-v', 'error', '-show_format', '-show_streams', '-of', 'json', str(path)],
+            [ffprobe_path(), '-hide_banner', '-v', 'error', '-show_format', '-show_streams', '-of', 'json', str(path)],
             text=True
         )
         data = json.loads(out)
@@ -153,7 +161,7 @@ def _extract_cover(path: Path) -> Optional[QPixmap]:
     # ffprobe/ffmpeg attached pic
     try:
         out = subprocess.check_output(
-            [ffprobe_path(), '-v', 'error', '-select_streams', 'v', '-show_entries', 'stream=disposition,codec_type', '-of', 'json', str(path)],
+            [ffprobe_path(), '-hide_banner', '-v', 'error', '-select_streams', 'v', '-show_entries', 'stream=disposition,codec_type', '-of', 'json', str(path)],
             text=True
         )
         data = json.loads(out)
@@ -165,7 +173,7 @@ def _extract_cover(path: Path) -> Optional[QPixmap]:
                 break
         if ok:
             target = OUT_TEMP / f'{path.stem}_cover.jpg'
-            subprocess.check_output([ffmpeg_path(), '-y', '-i', str(path), '-an', '-vcodec', 'copy', str(target)],
+            subprocess.check_output([ffmpeg_path(), '-hide_banner', '-nostats', '-v', 'error', '-y', '-i', str(path), '-an', '-vcodec', 'copy', str(target)],
                                     stderr=subprocess.STDOUT, text=True)
             if target.exists() and target.stat().st_size > 0:
                 return QPixmap(str(target))
@@ -241,7 +249,7 @@ class PreAnalyzer(QThread):
 
     def run(self):
         ff = ffmpeg_path()
-        cmd = [ff, '-v', 'error', '-i', str(self.path), '-vn', '-ac', '1', '-ar', str(self.sr), '-f', 'f32le', 'pipe:1']
+        cmd = [ff, '-hide_banner', '-nostats', '-v', 'error', '-i', str(self.path), '-vn', '-ac', '1', '-ar', str(self.sr), '-f', 'f32le', 'pipe:1']
         try:
             p = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
         except Exception:
@@ -631,8 +639,8 @@ class MusicOverlay(QWidget):
         self.playlist = QListWidget()
         try:
             self.playlist.setMinimumWidth(260)
-            self.playlist.setAlternatingRowColors(True)
-            self.playlist.setStyleSheet('QListWidget::item{padding:6px 8px; margin:2px;}')
+            self.playlist.setAlternatingRowColors(False)
+            self.playlist.setStyleSheet('QListWidget { color: palette(text); } QListWidget::item{padding:6px 8px; margin:2px;} QListWidget::item:selected{ color: palette(highlighted-text); }')
         except Exception:
             pass
         self.btn_add = QPushButton('Add…')
@@ -747,6 +755,39 @@ class MusicOverlay(QWidget):
             self.video.label.installEventFilter(self)
         self._reposition()
         self.show()
+        # ----- inactivity auto-hide (UI fades out after 5s; shows on activity) -----
+        self._inactive_ms = 5000
+        self._hidden = False
+        self._anims = []
+        self._hide_timer = QTimer(self)
+        self._hide_timer.setSingleShot(True)
+        self._hide_timer.setInterval(self._inactive_ms)
+        self._hide_timer.timeout.connect(self._go_inactive)
+
+        # ensure mouse move events arrive even without buttons pressed
+        try:
+            self.setMouseTracking(True)
+            self.video.setMouseTracking(True)
+            if hasattr(self.video, 'label') and self.video.label:
+                self.video.label.setMouseTracking(True)
+        except Exception:
+            pass
+
+        def _hook_window():
+            try:
+                w = self.window()
+                if w:
+                    w.installEventFilter(self)
+                    try:
+                        w.setMouseTracking(True)
+                    except Exception:
+                        pass
+            except Exception:
+                pass
+        QTimer.singleShot(0, _hook_window)
+
+        # start the inactivity timer immediately
+        QTimer.singleShot(0, lambda: self._activity())
 
     # ----- helpers / UI integration -----
     def _update_fab_color(self):
@@ -762,6 +803,12 @@ class MusicOverlay(QWidget):
             self.fab.setStyleSheet('QPushButton {background: rgba(231,76,60,200); color:white; border-radius: 20px;} QPushButton:hover {background: rgba(231,76,60,230);}')
 
     def eventFilter(self, obj, ev):
+        # Any user activity resets timer and shows UI
+        if ev.type() in (QEvent.MouseMove, QEvent.MouseButtonPress, QEvent.MouseButtonRelease, QEvent.Wheel, QEvent.KeyPress, QEvent.KeyRelease):
+            try:
+                self._activity()
+            except Exception:
+                pass
         if ev.type() in (QEvent.Resize, QEvent.Show, QEvent.WindowStateChange):
             QTimer.singleShot(0, self._reposition)
             QTimer.singleShot(0, self.raise_)
@@ -812,6 +859,91 @@ class MusicOverlay(QWidget):
         self.fab.raise_()
         self._update_fab_color()
         self.raise_()
+
+    def _fade_widget(self, w, show: bool):
+        try:
+            eff = getattr(w, '_auto_fx', None)
+            if eff is None:
+                eff = QGraphicsOpacityEffect(w)
+                try:
+                    w.setGraphicsEffect(eff)
+                except Exception:
+                    pass
+                w._auto_fx = eff  # type: ignore[attr-defined]
+            anim = QPropertyAnimation(eff, b'opacity', self)
+            anim.setDuration(220)
+            try:
+                start = 0.0 if show else 1.0
+                end = 1.0 if show else 0.0
+                if show:
+                    try:
+                        eff.setOpacity(0.0)
+                        w.setVisible(True)
+                    except Exception:
+                        pass
+                else:
+                    try:
+                        eff.setOpacity(1.0)
+                    except Exception:
+                        pass
+                anim.setStartValue(start)
+                anim.setEndValue(end)
+                if not show:
+                    def _after():
+                        try:
+                            w.setVisible(False)
+                        except Exception:
+                            pass
+                    anim.finished.connect(_after)
+                anim.start()
+                if not hasattr(self, '_anims'):
+                    self._anims = []
+                self._anims.append(anim)
+            except Exception:
+                w.setVisible(show)
+        except Exception:
+            try:
+                w.setVisible(show)
+            except Exception:
+                pass
+
+    def _set_hidden(self, hidden: bool):
+        self._hidden = bool(hidden)
+        try:
+            if getattr(self.parent(), '_music_runtime', None):
+                self.parent()._music_runtime._ui_hidden = self._hidden
+        except Exception:
+            pass
+
+    def _go_inactive(self):
+        if self._hidden:
+            return
+        self._set_hidden(True)
+        try:
+            self._fade_widget(self.card, False)
+            self._fade_widget(self.fab, False)
+        except Exception:
+            try:
+                self.card.hide(); self.fab.hide()
+            except Exception:
+                pass
+
+    def _activity(self):
+        try:
+            self._hide_timer.start(self._inactive_ms)
+        except Exception:
+            pass
+        if self._hidden:
+            self._set_hidden(False)
+            try:
+                self._fade_widget(self.card, True)
+                self._fade_widget(self.fab, True)
+            except Exception:
+                try:
+                    self.card.show(); self.fab.show()
+                except Exception:
+                    pass
+
 
     # ----- playlist helpers -----
     def _add_files(self):
@@ -971,6 +1103,7 @@ class MusicRuntime(QObject):
     def __init__(self, video_pane):
         super().__init__(video_pane)
         self.video = video_pane
+        self._ui_hidden = False
         self.overlay: Optional[MusicOverlay] = None
         self.visual = VisualEngine(self, bars=48)
         self.visual.frameReady.connect(self._on_visual_frame)
@@ -986,7 +1119,7 @@ class MusicRuntime(QObject):
         # responsive visuals: track label size
         self._last_label_size = QSize(0, 0)
         # kick/beat estimate
-        self._ms_per_beat_est = 500
+        self._ms_per_beat_est = 200
         self._kick_avg = 0.0
         self._kick_last = 0
 
@@ -1044,24 +1177,24 @@ class MusicRuntime(QObject):
                 pm = QPixmap.fromImage(img)
                 pm = pm.scaled(QSize(w, h), Qt.KeepAspectRatio, Qt.SmoothTransformation)
                 p.drawPixmap((w - pm.width()) // 2, (h - pm.height()) // 2, pm)
-            # glass panel for meta header
-            p.fillRect(QRect(18, 18, min(520, int(w * 0.7)), 148), QColor(0, 0, 0, 150))
-            if self.cover and not self.cover.isNull():
-                cpm = self.cover.scaled(QSize(110, 110), Qt.KeepAspectRatio, Qt.SmoothTransformation)
-                p.drawPixmap(26, 26, cpm)
-            p.setPen(QColor(255, 255, 255))
-            font = QFont()
-            font.setPointSize(14)
-            font.setBold(True)
-            p.setFont(font)
-            p.drawText(QRect(160, 28, w - 180, 28), Qt.AlignLeft | Qt.AlignVCenter, self.meta.title or self.meta.path.name)
-            font = QFont()
-            font.setPointSize(11)
-            p.setFont(font)
-            if self.meta.artist:
-                p.drawText(QRect(160, 60, w - 180, 24), Qt.AlignLeft | Qt.AlignVCenter, self.meta.artist)
-            if self.meta.album:
-                p.drawText(QRect(160, 86, w - 180, 24), Qt.AlignLeft | Qt.AlignVCenter, self.meta.album)
+            if not getattr(self, '_ui_hidden', False):
+                p.fillRect(QRect(18, 18, min(520, int(w * 0.7)), 148), QColor(0, 0, 0, 150))
+                if self.cover and not self.cover.isNull():
+                    cpm = self.cover.scaled(QSize(110, 110), Qt.KeepAspectRatio, Qt.SmoothTransformation)
+                    p.drawPixmap(26, 26, cpm)
+                p.setPen(QColor(255, 255, 255))
+                font = QFont()
+                font.setPointSize(14)
+                font.setBold(True)
+                p.setFont(font)
+                p.drawText(QRect(160, 28, w - 180, 28), Qt.AlignLeft | Qt.AlignVCenter, self.meta.title or self.meta.path.name)
+                font = QFont()
+                font.setPointSize(11)
+                p.setFont(font)
+                if self.meta.artist:
+                    p.drawText(QRect(160, 60, w - 180, 24), Qt.AlignLeft | Qt.AlignVCenter, self.meta.artist)
+                if self.meta.album:
+                    p.drawText(QRect(160, 86, w - 180, 24), Qt.AlignLeft | Qt.AlignVCenter, self.meta.album)
         finally:
             p.end()
         self.video.label.setPixmap(QPixmap.fromImage(base))
@@ -1098,7 +1231,7 @@ class MusicRuntime(QObject):
         if bpm > 0:
             ms_per_beat = 60000 // max(1, bpm)
         else:
-            ms_per_beat = max(250, min(1500, int(self._ms_per_beat_est or 500)))
+            ms_per_beat = max(250, min(1200, int(self._ms_per_beat_est or 200)))
         try:
             pos = int(self.video.player.position())
         except Exception:
@@ -1239,6 +1372,146 @@ class MusicRuntime(QObject):
         except Exception:
             pass
 
+# ---------------- Music teardown helper ----------------
+
+def _teardown_music(video_pane):
+    """Fully dispose the music runtime and overlay so they never pop back up."""
+    try:
+        rt = getattr(video_pane, '_music_runtime', None)
+        if rt:
+            # Stop periodic updates
+            try:
+                rt.stop()
+            except Exception:
+                pass
+            # Stop visual engine and delete
+            try:
+                if getattr(rt, 'visual', None):
+                    try:
+                        rt.visual.stop()
+                    except Exception:
+                        pass
+                    try:
+                        rt.visual.deleteLater()
+                    except Exception:
+                        pass
+            except Exception:
+                pass
+            # Stop analyzer, detach probe, kill worker thread
+            try:
+                if getattr(rt, 'an', None):
+                    an = rt.an
+                    try:
+                        an.stop()
+                    except Exception:
+                        pass
+                    try:
+                        if getattr(an, '_probe', None):
+                            try:
+                                an._probe.setSource(None)
+                            except Exception:
+                                pass
+                            try:
+                                an._probe.deleteLater()
+                            except Exception:
+                                pass
+                    except Exception:
+                        pass
+                    try:
+                        if getattr(an, '_worker', None):
+                            try:
+                                an._worker.requestInterruption()
+                            except Exception:
+                                pass
+                            try:
+                                an._worker.quit()
+                            except Exception:
+                                pass
+                            try:
+                                an._worker.wait(150)
+                            except Exception:
+                                pass
+                            try:
+                                an._worker.deleteLater()
+                            except Exception:
+                                pass
+                    except Exception:
+                        pass
+                    try:
+                        an.deleteLater()
+                    except Exception:
+                        pass
+            except Exception:
+                pass
+            # Stop and delete runtime timer
+            try:
+                if getattr(rt, 'timer', None):
+                    try:
+                        rt.timer.stop()
+                    except Exception:
+                        pass
+                    try:
+                        rt.timer.deleteLater()
+                    except Exception:
+                        pass
+            except Exception:
+                pass
+            # Finally delete runtime object
+            try:
+                rt.deleteLater()
+            except Exception:
+                pass
+    except Exception:
+        pass
+
+    # Overlay teardown
+    try:
+        ov = getattr(video_pane, '_music_overlay', None)
+        if ov:
+            try:
+                # Remove event filters so resize/show won't revive it
+                try:
+                    video_pane.removeEventFilter(ov)
+                except Exception:
+                    pass
+                try:
+                    if hasattr(video_pane, 'label') and getattr(video_pane, 'label'):
+                        video_pane.label.removeEventFilter(ov)
+                except Exception:
+                    pass
+                try:
+                    if getattr(ov, 'video', None):
+                        ov.video.removeEventFilter(ov)
+                except Exception:
+                    pass
+                try:
+                    ov.removeEventFilter(ov)
+                except Exception:
+                    pass
+            except Exception:
+                pass
+            try:
+                ov.hide()
+            except Exception:
+                pass
+            try:
+                ov.deleteLater()
+            except Exception:
+                pass
+    except Exception:
+        pass
+
+    # Drop references
+    try:
+        video_pane._music_runtime = None
+    except Exception:
+        pass
+    try:
+        video_pane._music_overlay = None
+    except Exception:
+        pass
+
+
 # ---------------- Wiring ----------------
 
 def wire_to_videopane(VideoPaneClass):
@@ -1294,16 +1567,50 @@ def wire_to_videopane(VideoPaneClass):
             except Exception:
                 pass
             rt.start(path_for_analysis=p)  # kick off hybrid preanalysis
-            return result
-        else:
+            # one-time 100ms forward scroll on the very first audio after app opens
             try:
-                if hasattr(self, '_music_runtime') and self._music_runtime:
-                    self._music_runtime.stop()
+                from PySide6.QtCore import QTimer
+                global _INITIAL_SCROLL_ARMED, _INITIAL_SCROLL_DONE
+                if not _INITIAL_SCROLL_DONE and not _INITIAL_SCROLL_ARMED:
+                    _INITIAL_SCROLL_ARMED = True
+                    def _arm_scroll():
+                        # wait until duration is known to avoid a no-op seek
+                        try:
+                            pl = getattr(self, 'player', None)
+                            dur = int(pl.duration()) if pl else 0
+                        except Exception:
+                            dur = 0
+                        if dur <= 0:
+                            QTimer.singleShot(120, _arm_scroll)
+                            return
+                        # start at zero then nudge forward a tiny bit later
+                        try:
+                            pl.setPosition(0)
+                        except Exception:
+                            pass
+                        def _nudge():
+                            try:
+                                d = int(pl.duration()) if pl else 0
+                            except Exception:
+                                d = 0
+                            tgt = 100
+                            if d > 0:
+                                tgt = min(100, max(0, d - 2))
+                            try:
+                                pl.setPosition(tgt)
+                            except Exception:
+                                pass
+                            # mark done so we never do this again
+                            globals()['_INITIAL_SCROLL_DONE'] = True
+                        QTimer.singleShot(120, _nudge)
+                    QTimer.singleShot(60, _arm_scroll)
             except Exception:
                 pass
+            return result
+        else:
+            # HARD TEARDOWN when opening non-audio (image/video/gif/etc)
             try:
-                if hasattr(self, '_music_overlay') and self._music_overlay:
-                    self._music_overlay.hide()
+                _teardown_music(self)
             except Exception:
                 pass
             return orig_open(self, path)
