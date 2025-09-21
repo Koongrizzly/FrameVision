@@ -500,110 +500,218 @@ class JobRowWidget(QWidget):
                 QDesktopServices.openUrl(QUrl.fromLocalFile(str(folder)))
 
     
+    
     def _resolve_output_file(self) -> Optional[Path]:
         d = self.data or {}
         args = d.get("args") or {}
-
-        # Source (avoid deleting/playing it)
+    
+        # Identify source (never return this)
         src_path = None
         try:
             src = d.get("input") or args.get("infile") or args.get("input")
             src_path = Path(src).expanduser() if src else None
         except Exception:
             src_path = None
-
-        # 0) Prefer explicit 'produced' if present
-        try:
-            produced = d.get("produced")
-            if produced:
-                p = Path(produced).expanduser()
-                if p.exists() and p.is_file() and (not src_path or p.resolve() != src_path.resolve()):
-                    return p
-        except Exception:
-            pass
-
-        # 1) Prefer explicit outfile
-        try:
-            out = args.get("outfile") or d.get("outfile")
-            if out:
-                p = Path(out).expanduser()
-                if p.exists() and p.is_file() and (not src_path or p.resolve() != src_path.resolve()):
-                    return p
-        except Exception:
-            pass
-
-        # 2) Fallback: search in out_dir for the most relevant file
-        try:
-            out_dir = d.get("out_dir") or args.get("out_dir")
-            if out_dir:
-                folder = Path(out_dir).expanduser()
-                if folder.is_dir():
-                    media_exts = {
-                        '.mp4','.mov','.mkv','.avi','.webm',
-                        '.mp3','.wav','.flac','.m4a','.aac','.ogg',
-                        '.gif','.png','.jpg','.jpeg','.bmp','.tif','.tiff'
-                    }
-                    cand = None
-                    newest = -1.0
-
-                    # Try to bias selection by stem similarity to input/outfile if available
-                    ref_stems = set()
+    
+        # Helper to normalize a value into a Path (respect out_dir when relative)
+        def _as_path(val) -> Optional[Path]:
+            if not val:
+                return None
+            try:
+                p = Path(str(val)).expanduser()
+                if not p.is_absolute():
+                    out_dir = d.get("out_dir") or args.get("out_dir")
+                    if out_dir:
+                        p = Path(out_dir).expanduser() / p
+                return p
+            except Exception:
+                return None
+    
+        # Media extensions we care about
+        media_exts = {
+            '.mp4','.mov','.mkv','.avi','.webm',
+            '.mp3','.wav','.flac','.m4a','.aac','.ogg',
+            '.gif','.png','.jpg','.jpeg','.bmp','.tif','.tiff'
+        }
+    
+        def _valid_file(p: Optional[Path]) -> Optional[Path]:
+            try:
+                if not p:
+                    return None
+                p = p.expanduser()
+                if not p.exists() or not p.is_file():
+                    return None
+                if p.suffix.lower() not in media_exts:
+                    return None
+                if src_path and p.resolve() == src_path.resolve():
+                    return None
+                return p
+            except Exception:
+                return None
+    
+        # 0) Prefer explicit single-file fields in common schemas
+        single_keys = ("produced","outfile","output","result","file","path")
+        for k in single_keys:
+            p = _valid_file(_as_path((d.get(k) if k in d else args.get(k))))
+            if p:
+                return p
+    
+        # 0b) Prefer list fields if present
+        list_keys = ("outputs","produced_files","results","files","artifacts","saved")
+        for k in list_keys:
+            seq = d.get(k) or args.get(k)
+            if isinstance(seq, (list, tuple)):
+                for item in seq:
+                    p = _valid_file(_as_path(item))
+                    if p:
+                        return p
+    
+        # 1) If explicit outfile exists but is a directory, look inside that
+        out = args.get("outfile") or d.get("outfile")
+        out_path = _as_path(out)
+        if out_path and out_path.is_dir():
+            out_dir = out_path
+        else:
+            out_dir = _as_path(d.get("out_dir") or args.get("out_dir"))
+    
+        # 2) Scoring-based selection inside out_dir instead of always picking the newest
+        if out_dir and out_dir.is_dir():
+            # Reference stems to match against
+            ref_stems = set()
+            try:
+                if src_path:
+                    ref_stems.add(src_path.stem)
+            except Exception:
+                pass
+            try:
+                if out_path and out_path.is_file():
+                    ref_stems.add(out_path.stem)
+            except Exception:
+                pass
+            for ref_key in ("label","title","outname","name","basename"):
+                v = (args.get(ref_key) if isinstance(args, dict) else None) or d.get(ref_key)
+                if v:
                     try:
-                        if src_path: ref_stems.add(src_path.stem)
+                        ref_stems.add(Path(str(v)).stem)
                     except Exception:
                         pass
+            for id_key in ("job_id","id","jobid"):
+                v = (args.get(id_key) if isinstance(args, dict) else None) or d.get(id_key)
+                if v:
                     try:
-                        if out: ref_stems.add(Path(out).stem)
+                        ref_stems.add(str(v))
                     except Exception:
                         pass
-
-                    for p in folder.iterdir():
-                        try:
-                            if not p.is_file():
-                                continue
-                            if p.suffix.lower() not in media_exts:
-                                continue
-                            if src_path and p.resolve() == src_path.resolve():
-                                continue
-                            score = p.stat().st_mtime
-                            # Slight boost if stem matches reference stems
-                            try:
-                                if p.stem in ref_stems:
-                                    score += 0.5
-                            except Exception:
-                                pass
-                            if score > newest:
-                                newest = score
-                                cand = p
-                        except Exception:
-                            continue
-                    if cand:
-                        return cand
-        except Exception:
-            pass
-        return None
-
-
-    def _play_output(self) -> None:
-        try:
-            p = self._resolve_output_file()
-            if p and p.exists():
-                path_str = str(p)
-                # 1) Try internal player like RIFE tab (main.video.open / *.player.open)
-                if self._try_internal_player(path_str):
-                    return
-                # 2) If signal is connected, let app handle it
+    
+            # Reference times
+            def _as_epoch(val):
+                if val is None:
+                    return None
                 try:
-                    if self.receivers(self.playRequested) > 0:
-                        self.playRequested.emit(path_str)
-                        return
+                    return float(val)
                 except Exception:
                     pass
-                # 3) Fallback to OS default player
-                QDesktopServices.openUrl(QUrl.fromLocalFile(path_str))
-        except Exception:
-            pass
-
+                import datetime as _dt
+                for fmt in ("%Y-%m-%d %H:%M:%S",):
+                    try:
+                        return _dt.datetime.strptime(str(val), fmt).timestamp()
+                    except Exception:
+                        continue
+                try:
+                    return _dt.datetime.fromisoformat(str(val)).timestamp()
+                except Exception:
+                    return None
+    
+            started = _as_epoch(d.get("started_at"))
+            finished = _as_epoch(d.get("finished_at"))
+            # Fall back to JSON mtime if finished is unknown
+            if finished is None:
+                try:
+                    finished = Path(self.job_path).stat().st_mtime
+                except Exception:
+                    finished = None
+    
+            candidates = []
+            for p in out_dir.iterdir():
+                try:
+                    if not p.is_file():
+                        continue
+                    if p.suffix.lower() not in media_exts:
+                        continue
+                    if src_path and p.resolve() == src_path.resolve():
+                        continue
+                    st = p.stat()
+                    mtime = st.st_mtime
+    
+                    # Scoring
+                    score = 0.0
+    
+                    # Strong match: exactly matches declared outfile
+                    if out_path and out_path.is_file():
+                        if p.resolve() == out_path.resolve():
+                            score += 100.0
+    
+                    # Name similarity
+                    try:
+                        for rs in ref_stems:
+                            if not rs:
+                                continue
+                            if p.stem == rs:
+                                score += 50.0
+                            elif rs in p.stem:
+                                score += 30.0
+                    except Exception:
+                        pass
+    
+                    # Time proximity (prefer files finished near the job's finish time)
+                    ref_time = finished or started
+                    if ref_time is not None:
+                        try:
+                            minutes = abs(mtime - ref_time) / 60.0
+                            # up to +10 when within 0–1 min, tapering to 0 by 10 min
+                            time_score = max(0.0, 10.0 - min(10.0, minutes))
+                            score += time_score
+                        except Exception:
+                            pass
+    
+                    # As a very weak tie-breaker, prefer larger (likely final) files
+                    try:
+                        size_mb = st.st_size / (1024 * 1024.0)
+                        score += min(2.0, size_mb / 512.0)  # +2 at 1GB, tiny otherwise
+                    except Exception:
+                        pass
+    
+                    candidates.append((score, mtime, p))
+                except Exception:
+                    continue
+    
+            if candidates:
+                # sort by score desc, then by mtime desc
+                candidates.sort(key=lambda t: (t[0], t[1]), reverse=True)
+                best = candidates[0][2]
+                return best
+    
+        return None
+    def _play_output(self) -> None:
+            try:
+                p = self._resolve_output_file()
+                if p and p.exists():
+                    path_str = str(p)
+                    # 1) Try internal player like RIFE tab (main.video.open / *.player.open)
+                    if self._try_internal_player(path_str):
+                        return
+                    # 2) If signal is connected, let app handle it
+                    try:
+                        if self.receivers(self.playRequested) > 0:
+                            self.playRequested.emit(path_str)
+                            return
+                    except Exception:
+                        pass
+                    # 3) Fallback to OS default player
+                    QDesktopServices.openUrl(QUrl.fromLocalFile(path_str))
+            except Exception:
+                pass
+    
     def _view_json(self) -> None:
         try:
             if self.job_path and Path(self.job_path).exists():
