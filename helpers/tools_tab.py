@@ -20,7 +20,10 @@ def _slug_title(t:str)->str:
 # Ensure widget classes are imported for use below
 from PySide6.QtWidgets import QSpinBox, QSlider, QHBoxLayout, QMessageBox
 from PySide6.QtCore import Qt, QPropertyAnimation, QEasingCurve, QSettings, QTimer
+from PySide6.QtCore import QDate, QTime, QDateTime
 from PySide6.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QLabel, QSlider, QPushButton, QFormLayout, QSizePolicy, QToolButton, QGroupBox, QLineEdit, QComboBox, QCheckBox, QMessageBox, QFileDialog)
+
+from PySide6.QtWidgets import QPlainTextEdit, QTextEdit, QRadioButton, QDateEdit, QTimeEdit, QDateTimeEdit, QMessageBox
 from helpers import gif as gif_backend
 
 # --- Safe imports for shared paths/constants ---
@@ -210,6 +213,39 @@ class CollapsibleSection(QWidget):
             self.content.setMaximumHeight(16777215)
         else:
             self.content.setMaximumHeight(0)
+
+
+# --- Add safe helpers to expose expanded state for saving/restoring
+def _cs_isChecked(self):
+    try:
+        return bool(self._expanded)
+    except Exception:
+        return False
+
+def _cs_setChecked(self, on: bool):
+    try:
+        on = bool(on)
+        # Drive via the toggle so animation/state stays consistent
+        if getattr(self, '_expanded', None) is None:
+            self._expanded = on
+        if getattr(self, 'toggle', None) is not None:
+            if self._expanded != on:
+                self.toggle.setChecked(on)
+            else:
+                # ensure visuals are correct
+                self.content.setVisible(on)
+                self.toggle.setArrowType(Qt.DownArrow if on else Qt.RightArrow)
+        else:
+            # Fallback: directly set
+            self._expanded = on
+    except Exception:
+        pass
+
+try:
+    CollapsibleSection.isChecked = _cs_isChecked
+    CollapsibleSection.setChecked = _cs_setChecked
+except Exception:
+    pass
 
 
 class InstantToolsPane(QWidget):
@@ -564,66 +600,118 @@ class InstantToolsPane(QWidget):
             pass
 
         def _widget_snapshot(w):
-            from PySide6.QtWidgets import QLineEdit, QSpinBox, QDoubleSpinBox, QComboBox, QCheckBox, QSlider
-            snap=[]
-            idx=0
-            for cls in (QLineEdit, QSpinBox, QDoubleSpinBox, QComboBox, QCheckBox, QSlider):
-                for child in w.findChildren(cls):
-                    key = child.objectName() or f"{cls.__name__}:{idx}"; idx+=1
-                    try:
-                        if isinstance(child, QLineEdit): val = child.text()
-                        elif isinstance(child, QSpinBox): val = child.value()
-                        elif isinstance(child, QDoubleSpinBox): val = float(child.value())
-                        elif isinstance(child, QComboBox): val = child.currentIndex()
-                        elif isinstance(child, QCheckBox): val = child.isChecked()
-                        elif isinstance(child, QSlider): val = child.value()
-                        else: continue
-                        snap.append((cls.__name__, key, val))
-                    except Exception:
-                        continue
+            from PySide6.QtWidgets import (QLineEdit, QPlainTextEdit, QTextEdit,
+                                           QSpinBox, QDoubleSpinBox, QComboBox,
+                                           QCheckBox, QRadioButton, QSlider,
+                                           QDateEdit, QTimeEdit, QDateTimeEdit)
+            from PySide6.QtCore import Qt
+            classes = (QLineEdit, QPlainTextEdit, QTextEdit,
+                       QSpinBox, QDoubleSpinBox, QSlider, QComboBox,
+                       QCheckBox, QRadioButton, QDateEdit, QTimeEdit, QDateTimeEdit)
+            snap = []
+            try:
+                for cls in classes:
+                    children = w.findChildren(cls)
+                    for idx, child in enumerate(children):
+                        name = child.objectName() or ""
+                        try:
+                            if isinstance(child, QLineEdit):
+                                val = child.text()
+                            elif isinstance(child, (QPlainTextEdit, QTextEdit)):
+                                val = child.toPlainText()
+                            elif isinstance(child, (QSpinBox, QSlider)):
+                                val = int(child.value())
+                            elif isinstance(child, QDoubleSpinBox):
+                                val = float(child.value())
+                            elif isinstance(child, QComboBox):
+                                val = int(child.currentIndex())
+                            elif isinstance(child, (QCheckBox, QRadioButton)):
+                                val = bool(child.isChecked())
+                            elif isinstance(child, QDateEdit):
+                                val = child.date().toString(Qt.ISODate)
+                            elif isinstance(child, QTimeEdit):
+                                val = child.time().toString(Qt.ISODate)
+                            elif isinstance(child, QDateTimeEdit):
+                                val = child.dateTime().toString(Qt.ISODate)
+                            else:
+                                continue
+                            snap.append((cls.__name__, idx, name, val))
+                        except Exception:
+                            continue
+            except Exception:
+                pass
             return snap
 
         def _widget_restore(w, snap):
             try:
-                for cls_name, key, val in snap:
-                    # find children of this class; match by order if objectName missing
-                    from PySide6.QtWidgets import QLineEdit, QSpinBox, QDoubleSpinBox, QComboBox, QCheckBox, QSlider
-                    cls = {"QLineEdit":QLineEdit, "QSpinBox":QSpinBox, "QDoubleSpinBox":QDoubleSpinBox, "QComboBox":QComboBox, "QCheckBox":QCheckBox, "QSlider":QSlider}.get(cls_name)
-                    if not cls: continue
-                    candidates = [c for c in w.findChildren(cls) if (c.objectName()==key or not c.objectName())]
-                    if not candidates:
-                        continue
-                    target = candidates[0]
-                    try:
-                        if isinstance(target, QLineEdit): target.setText(str(val))
-                        elif isinstance(target, QSpinBox): target.setValue(int(val))
-                        elif isinstance(target, QDoubleSpinBox): target.setValue(float(val))
-                        elif isinstance(target, QComboBox): target.setCurrentIndex(int(val))
-                        elif isinstance(target, QCheckBox): target.setChecked(bool(val))
-                        elif isinstance(target, QSlider): target.setValue(int(val))
-                    except Exception:
-                        pass
+                from PySide6.QtWidgets import (QLineEdit, QPlainTextEdit, QTextEdit,
+                                               QSpinBox, QDoubleSpinBox, QComboBox,
+                                               QCheckBox, QRadioButton, QSlider,
+                                               QDateEdit, QTimeEdit, QDateTimeEdit)
+                from PySide6.QtCore import Qt, QDate, QTime, QDateTime
             except Exception:
-                pass
+                return
+            cls_map = {"QLineEdit":QLineEdit, "QPlainTextEdit":QPlainTextEdit, "QTextEdit":QTextEdit,
+                       "QSpinBox":QSpinBox, "QDoubleSpinBox":QDoubleSpinBox, "QSlider":QSlider,
+                       "QComboBox":QComboBox, "QCheckBox":QCheckBox, "QRadioButton":QRadioButton,
+                       "QDateEdit":QDateEdit, "QTimeEdit":QTimeEdit, "QDateTimeEdit":QDateTimeEdit}
+            for item in (snap or []):
+                try:
+                    cls_name, idx, name, val = item
+                except Exception:
+                    continue
+                cls = cls_map.get(str(cls_name))
+                if not cls:
+                    continue
+                target = None
+                if name:
+                    target = w.findChild(cls, name)
+                if target is None:
+                    children = w.findChildren(cls)
+                    try:
+                        idx_i = int(idx)
+                    except Exception:
+                        idx_i = -1
+                    if 0 <= idx_i < len(children):
+                        target = children[idx_i]
+                if target is None:
+                    continue
+                try:
+                    if isinstance(target, QLineEdit):
+                        target.setText(str(val))
+                    elif isinstance(target, (QPlainTextEdit, QTextEdit)):
+                        target.setPlainText(str(val))
+                    elif isinstance(target, (QSpinBox, QSlider)):
+                        target.setValue(int(val))
+                    elif isinstance(target, QDoubleSpinBox):
+                        target.setValue(float(val))
+                    elif isinstance(target, QComboBox):
+                        target.setCurrentIndex(int(val))
+                    elif isinstance(target, (QCheckBox, QRadioButton)):
+                        target.setChecked(bool(val))
+                    elif isinstance(target, QDateEdit):
+                        d = QDate.fromString(str(val), Qt.ISODate)
+                        if d.isValid(): target.setDate(d)
+                    elif isinstance(target, QTimeEdit):
+                        t = QTime.fromString(str(val), Qt.ISODate)
+                        if t.isValid(): target.setTime(t)
+                    elif isinstance(target, QDateTimeEdit):
+                        dt = QDateTime.fromString(str(val), Qt.ISODate)
+                        if dt.isValid(): target.setDateTime(dt)
+                except Exception:
+                    continue
 
         def _save_all_tools():
             try:
-                if not self.cb_remember.isChecked():
-                    return
-            except Exception:
-                # global checkbox may be missing
-                pass
-            try:
                 import json as _json
-                data={"sections":{}}
+                data = {"sections": {}}
                 for name, sec in self._sections_map.items():
-                    if name not in self._remember_whitelist: 
-                        continue
                     try:
-                        expanded = getattr(sec, "isChecked", lambda: True)()
+                        expanded = bool(getattr(sec, "isChecked", lambda: True)())
                     except Exception:
                         expanded = True
-                    data["sections"][name] = {"expanded": bool(expanded), "snap": _widget_snapshot(sec)}
+                    content = getattr(sec, "content", sec)
+                    data["sections"][name] = {"expanded": bool(expanded), "snap": _widget_snapshot(content)}
                 self._qs.setValue("ToolsPane/saved_json", _json.dumps(data))
             except Exception:
                 pass
@@ -631,41 +719,63 @@ class InstantToolsPane(QWidget):
         def _apply_saved():
             try:
                 import json as _json
-                txt = self._qs.value("ToolsPane/saved_json","", type=str) or ""
+                txt = self._qs.value("ToolsPane/saved_json", "", type=str) or ""
                 if not txt:
                     return
                 data = _json.loads(txt)
                 for name, sec in self._sections_map.items():
-                    try:
-                        entry = data["sections"].get(name)
-                        if not entry: 
-                            continue
-                        snap = entry.get("snap")
-                        if snap:
-                            _widget_restore(sec, snap)
-                        if "expanded" in entry:
-                            try: sec.setChecked(bool(entry["expanded"]))
-                            except Exception: pass
-                    except Exception:
+                    entry = (data.get("sections") or {}).get(name)
+                    if not entry:
                         continue
+                    snap = entry.get("snap")
+                    if snap:
+                        content = getattr(sec, "content", sec)
+                        _widget_restore(content, snap)
+                    if "expanded" in entry:
+                        try:
+                            sec.setChecked(bool(entry["expanded"]))
+                        except Exception:
+                            pass
             except Exception:
                 pass
 
         def _autosave():
             _save_all_tools()
-        self._autosave = _autosave
-        try:
-            self.cb_remember.toggled.connect(lambda _: _save_all_tools())
-        except Exception:
-            pass
-        try:
-            self._autosave_timer = QTimer(self); self._autosave_timer.setInterval(3000)
+            self._autosave_timer = QTimer(self)
+            self._autosave_timer.setInterval(1500)
+            self._autosave_timer.setSingleShot(False)
             self._autosave_timer.timeout.connect(_autosave)
-            if remember_enabled:
-                self._autosave_timer.start()
-        except Exception:
-            pass
+            self._autosave_timer.start()
 
+        def _wire_watchers():
+            try:
+                from PySide6.QtWidgets import (QLineEdit, QPlainTextEdit, QTextEdit,
+                    QSpinBox, QDoubleSpinBox, QComboBox, QCheckBox, QRadioButton,
+                    QSlider, QDateEdit, QTimeEdit, QDateTimeEdit)
+            except Exception:
+                return
+            def _wire(root):
+                try:
+                    for w in root.findChildren(QLineEdit): w.textChanged.connect(_autosave)
+                    for w in root.findChildren(QPlainTextEdit): w.textChanged.connect(_autosave)
+                    for w in root.findChildren(QTextEdit): w.textChanged.connect(_autosave)
+                    for w in root.findChildren(QSpinBox): w.valueChanged.connect(lambda *_: _autosave())
+                    for w in root.findChildren(QDoubleSpinBox): w.valueChanged.connect(lambda *_: _autosave())
+                    for w in root.findChildren(QComboBox): w.currentIndexChanged.connect(lambda *_: _autosave())
+                    for w in root.findChildren(QCheckBox): w.toggled.connect(lambda *_: _autosave())
+                    for w in root.findChildren(QRadioButton): w.toggled.connect(lambda *_: _autosave())
+                    for w in root.findChildren(QSlider): w.valueChanged.connect(lambda *_: _autosave())
+                    for w in root.findChildren(QDateEdit): w.dateChanged.connect(lambda *_: _autosave())
+                    for w in root.findChildren(QTimeEdit): w.timeChanged.connect(lambda *_: _autosave())
+                    for w in root.findChildren(QDateTimeEdit): w.dateTimeChanged.connect(lambda *_: _autosave())
+                except Exception:
+                    pass
+            try:
+                for _name, _sec in self._sections_map.items():
+                    _root = getattr(_sec, 'content', _sec)
+                    _wire(_root)
+            except Exception:
+                pass
         def _toggle_remember_tool(name, on):
             try:
                 if on: self._remember_whitelist.add(name)
@@ -679,10 +789,16 @@ class InstantToolsPane(QWidget):
 
         # Apply saved settings on init
         try:
-            if remember_enabled:
-                _apply_saved()
+            _apply_saved()
         except Exception:
             pass
+
+        try:
+            _wire_watchers()
+            _save_all_tools()
+        except Exception:
+            pass
+
     
 
         
