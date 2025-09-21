@@ -9,10 +9,21 @@ from PySide6.QtCore import Qt, QSettings, QSize
 from PySide6.QtGui import QAction, QDragEnterEvent, QDropEvent, QIcon
 from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton, QPlainTextEdit,
-    QLineEdit, QFileDialog, QGroupBox, QGridLayout, QComboBox, QCheckBox,
-    QSpinBox, QDoubleSpinBox, QProgressBar
+    QLineEdit, QFileDialog, QGroupBox, QGridLayout, QComboBox, QSpinBox, QDoubleSpinBox, QProgressBar, QToolButton
 )
 
+
+
+# --- Robust import guard for QCheckBox (may be used by warm-on-load option) ---
+if 'QCheckBox' not in globals():
+    try:
+        from PySide6.QtWidgets import QCheckBox  # type: ignore
+    except Exception:
+        try:
+            from PyQt5.QtWidgets import QCheckBox  # type: ignore
+        except Exception:
+            pass
+# --- end guard ---
 # ------------------------- Utilities -------------------------
 
 APP_ORG = "FrameVision"
@@ -122,9 +133,6 @@ class DescriberWidget(QWidget):
         self.decode_style = s.value("decode_style", "Deterministic", type=str)
         if self.decode_style not in ("Deterministic","Creative"):
             self.decode_style = "Deterministic"
-
-        self.promptify_enabled = s.value("promptify_enabled", True, type=bool)
-
         lay = QVBoxLayout(self)
         lay.setContentsMargins(8,8,8,8)
         lay.setSpacing(10)
@@ -154,7 +162,6 @@ class DescriberWidget(QWidget):
         self.prep_progress = QProgressBar(); self.prep_progress.setVisible(False)
         lay.addWidget(eng_widget)
 
-
         # --- Actions ---
         act_box = QGroupBox("Actions")
         act_row = QHBoxLayout(act_box)
@@ -176,14 +183,15 @@ class DescriberWidget(QWidget):
         self.btn_save_json = QPushButton("Save .json")
         row2.addWidget(self.btn_copy); row2.addWidget(self.btn_copy_prompt); row2.addWidget(self.btn_save_txt); row2.addWidget(self.btn_save_json)
 
-        # Promptify controls
-        self.chk_promptify = QCheckBox("Promptify output"); self.chk_promptify.setChecked(self.promptify_enabled)
-        row3 = QHBoxLayout(); out_v.addLayout(row3)
-        row3.addWidget(self.chk_promptify)
-        row3.addWidget(QLabel("Detail level:")); self.combo_detail = QComboBox(); self.combo_detail.addItems(["Short","Medium","Long"]); self.combo_detail.setCurrentText(self.detail_level); row3.addWidget(self.combo_detail)
-        row3.addWidget(QLabel("Decode style:")); self.combo_decode = QComboBox(); self.combo_decode.addItems(["Deterministic","Creative"]); self.combo_decode.setCurrentText(self.decode_style); row3.addWidget(self.combo_decode)
-        row3.addStretch(1)
+        # Output options 
 
+        row3 = QHBoxLayout(); out_v.addLayout(row3)
+
+        row3.addWidget(QLabel("Detail level:")); self.combo_detail = QComboBox(); self.combo_detail.addItems(["Short","Medium","Long"]); self.combo_detail.setCurrentText(self.detail_level); row3.addWidget(self.combo_detail)
+
+        row3.addWidget(QLabel("Decode style:")); self.combo_decode = QComboBox(); self.combo_decode.addItems(["Deterministic","Creative"]); self.combo_decode.setCurrentText(self.decode_style); row3.addWidget(self.combo_decode)
+
+        row3.addStretch(1)
         self.negative = QLineEdit(); self.negative.setPlaceholderText("Negative prompt (optional)..."); out_v.addWidget(self.negative)
         lay.addWidget(out_box)
 
@@ -196,9 +204,18 @@ class DescriberWidget(QWidget):
         self.lbl_player = QLabel("Player frame not available."); g.addWidget(self.lbl_player, 1, 0, 1, 3)
         lay.addWidget(path_box)
 
-        # --- Advanced (collapsed look via style) ---
-        adv = QGroupBox("Advanced settings")
-        adv.setCheckable(True); adv.setChecked(False)  # default removed; will restore via UI
+        # --- Advanced (collapsible) ---
+        open_state = _settings().value("advanced_open", True, bool)
+        self.btn_adv = QToolButton()
+        self.btn_adv.setText("Advanced settings")
+        self.btn_adv.setCheckable(True)
+        self.btn_adv.setToolButtonStyle(Qt.ToolButtonTextBesideIcon)
+        self.btn_adv.setArrowType(Qt.DownArrow if open_state else Qt.RightArrow)
+        self.btn_adv.setChecked(bool(open_state))
+        adv = QGroupBox()
+        adv.setTitle("")
+        adv.setFlat(False)
+        adv.setVisible(bool(open_state))
         gg = QGridLayout(adv)
         r = 0
         gg.addWidget(QLabel("max_new_tokens"), r,0); self.sp_max = QSpinBox(); self.sp_max.setRange(16,2048); self.sp_max.setValue(_settings().value("max_new_tokens", 160, int)); gg.addWidget(self.sp_max, r,1); r+=1
@@ -210,6 +227,7 @@ class DescriberWidget(QWidget):
         gg.addWidget(QLabel("repetition_penalty"), r,0); self.sp_rep = QDoubleSpinBox(); self.sp_rep.setRange(0.0, 4.0); self.sp_rep.setValue(_settings().value("repetition_penalty", 1.1, float)); gg.addWidget(self.sp_rep, r,1); r+=1
         self.chk_warm = QCheckBox("Warm model on load"); self.chk_warm.setChecked(_settings().value("warm_on_load", True, bool)); gg.addWidget(self.chk_warm, r,0,1,2); r+=1
         self.chk_keep = QCheckBox("Keep in memory"); self.chk_keep.setChecked(_settings().value("keep_in_memory", True, bool)); gg.addWidget(self.chk_keep, r,0,1,2); r+=1
+        lay.addWidget(self.btn_adv)
         lay.addWidget(adv)
 
         # Signals
@@ -220,10 +238,9 @@ class DescriberWidget(QWidget):
         self.btn_copy_prompt.clicked.connect(self._copy_prompt)
         self.btn_save_txt.clicked.connect(self._save_txt)
         self.btn_save_json.clicked.connect(self._save_json)
-        self.chk_promptify.toggled.connect(lambda v: _settings().setValue("promptify_enabled", bool(v)))
         self.combo_detail.currentTextChanged.connect(lambda v: _settings().setValue("detail_level", v))
         self.combo_decode.currentTextChanged.connect(lambda v: _settings().setValue("decode_style", v))
-        adv.toggled.connect(lambda v: _settings().setValue("advanced_open", bool(v)))
+        self.btn_adv.toggled.connect(lambda v: (adv.setVisible(bool(v)), self.btn_adv.setArrowType(Qt.DownArrow if v else Qt.RightArrow), _settings().setValue("advanced_open", bool(v))))
 
         # Initialize labels + autoload models
         self._refresh_engine_labels()
@@ -280,11 +297,8 @@ class DescriberWidget(QWidget):
         desc = self.output.toPlainText().strip()
         if not desc:
             return
-        neg = self.negative.text().strip()
-        prompt = self._promptify(desc, neg) if self.chk_promptify.isChecked() else desc
-        self._copy(prompt)
-
-    def _promptify(self, desc: str, negative: str) -> str:
+        self._copy(desc)
+    def _(self, desc: str, negative: str) -> str:
         bits = [
             "Describe the scene precisely with subjects, materials, colors and spatial relationships.",
             "Write in multi-sentence prose; avoid hallucinations; do not invent objects.",
@@ -376,7 +390,6 @@ class DescriberWidget(QWidget):
         if self.combo_detail.currentText() == "Long" and len(text.split()) < 40:
             text = text + " " + "(expand: focus on subjects, materials, colors, lighting, composition, background and spatial relationships.)"
         return text
-
 
 # === FrameVision: Describer ALL-IN-ONE v8 ===
 try:
@@ -995,7 +1008,6 @@ else:
 
     DescriberWidget._run_inference = _run_inference  # type: ignore[attr-defined]
 
-
 # === FrameVision: dynamic model size on disk (engine Size label) ===
 try:
     DescriberWidget  # type: ignore[name-defined]
@@ -1079,7 +1091,6 @@ else:
         th.start()
 
     DescriberWidget._refresh_engine_labels = _fv_refresh_with_size  # type: ignore[attr-defined]
-
 
 # === FrameVision: Size on disk (models folder only, strict) ===
 try:
@@ -1177,170 +1188,3 @@ else:
         th.start()
 
     DescriberWidget._refresh_engine_labels = _fv_refresh_with_size_strict  # type: ignore[attr-defined]
-# -------- KB (beta) injection --------
-def _fv_kb_path(self):
-    try:
-        root = find_project_root()
-    except Exception:
-        from pathlib import Path
-        root = Path(".").resolve()
-    return (root / "presets" / "info" / "framevision_knowledge_base.json")
-
-def _fv_kb_load(self):
-    if hasattr(self, "_fv_kb_cache"):
-        return getattr(self, "_fv_kb_cache")
-    p = _fv_kb_path(self)
-    items = []
-    try:
-        if p.exists():
-            import json
-            data = json.loads(p.read_text(encoding="utf-8"))
-            # normalize
-            def _norm_list(lst):
-                out=[]
-                for it in lst:
-                    if isinstance(it, dict):
-                        q = it.get("question") or it.get("q") or it.get("prompt") or it.get("ask")
-                        a = it.get("answer") or it.get("a") or it.get("response")
-                        s = it.get("section") or it.get("title") or it.get("topic") or ""
-                        if q and a:
-                            out.append({"q": str(q), "a": str(a), "section": str(s)})
-                return out
-            if isinstance(data, list):
-                items = _norm_list(data)
-            elif isinstance(data, dict):
-                # try common containers
-                for key in ("items","qa","data","entries"):
-                    if key in data and isinstance(data[key], list):
-                        items = _norm_list(data[key])
-                        break
-                if not items:
-                    # dict mapping questions->answers
-                    for k, v in data.items():
-                        if isinstance(v, str):
-                            items.append({"q": str(k), "a": str(v), "section": ""})
-        else:
-            items = []
-    except Exception as e:
-        try:
-            import traceback; traceback.print_exc()
-        except Exception:
-            pass
-        items = []
-    setattr(self, "_fv_kb_cache", items)
-    return items
-
-_FV_STOPWORDS = set("a an the and or to of for in on with from into up down by is are was were be been being this that these those it its as at your you me my we our can will should could how do i".split())
-
-def _fv_tok(s):
-    try:
-        import re
-        toks = re.findall(r"[a-z0-9]+", (s or "").lower())
-        return [t for t in toks if t and t not in _FV_STOPWORDS]
-    except Exception:
-        return (s or "").lower().split()
-
-def _fv_kb_search(self, query, top_k=3):
-    toks = _fv_tok(query)
-    kb = _fv_kb_load(self)
-    scored = []
-    import difflib
-    for it in kb:
-        text = (it.get("q","") + " " + it.get("a","")).lower()
-        # term overlap
-        overlap = sum(1 for t in set(toks) if t and t in text)
-        # fuzzy match bonus against question
-        fuzz = difflib.SequenceMatcher(None, query.lower(), it.get("q","").lower()).ratio()
-        score = overlap*2 + fuzz
-        scored.append((score, it))
-    scored.sort(key=lambda x: x[0], reverse=True)
-    return [dict(it[1], **{"_score": it[0]}) for it in scored[:max(1, int(top_k))]]
-
-def _fv_kb_format_answer(q, hits):
-    if not hits:
-        return "I couldn't find anything relevant in the knowledge base."
-    best = hits[0]
-    title = best.get("section") or best.get("q","KB")
-    ans = best.get("a","").strip()
-    tail = f"\n\n— Source: {title}"
-    return ans + tail
-
-def _fv_show_info(self, title, text):
-    try:
-        from PySide6.QtWidgets import QMessageBox
-        box = QMessageBox(self)
-        box.setIcon(QMessageBox.Information)
-        box.setWindowTitle(title)
-        box.setText(text if len(text) < 800 else text[:800] + "\n\n(See output for full text)")
-        if len(text) >= 800:
-            box.setDetailedText(text)
-        box.exec()
-    except Exception:
-        try:
-            print("[fv][KB]", title, text[:2000])
-        except Exception:
-            pass
-
-def _fv_kb_ask(self):
-    try:
-        from PySide6.QtWidgets import QInputDialog
-        q, ok = QInputDialog.getText(self, "Ask Knowledge Base (beta)", "What do you need help with?")
-        if not ok or not str(q).strip():
-            return
-        q = str(q).strip()
-        hits = _fv_kb_search(self, q, top_k=3)
-        answer = _fv_kb_format_answer(q, hits)
-        # Write to output if available
-        try:
-            if hasattr(self, "output") and self.output is not None:
-                self.output.appendPlainText(f"[KB]\nQ: {q}\n\n{answer}\n")
-        except Exception:
-            pass
-        _fv_show_info(self, "KB answer", answer)
-    except Exception as e:
-        _fv_show_info(self, "KB error", f"{type(e).__name__}: {e}")
-
-def _fv_add_kb_button(self):
-    try:
-        # find the actions row via existing Describe button
-        act = getattr(self, "btn_describe", None)
-        if act is None:
-            return
-        row = act.parentWidget()
-        if row is None:
-            return
-        lay = row.layout()
-        if lay is None:
-            return
-        if not hasattr(self, "btn_kb_beta"):
-            from PySide6.QtWidgets import QPushButton
-            self.btn_kb_beta = QPushButton("Ask KB (beta)", self)
-            self.btn_kb_beta.setToolTip("Ask the FrameVision knowledge base for help using the app.")
-            try:
-                # Insert after Use current frame
-                lay.addWidget(self.btn_kb_beta)
-            except Exception:
-                pass
-            try:
-                self.btn_kb_beta.clicked.connect(lambda: _fv_kb_ask(self))
-            except Exception:
-                pass
-    except Exception:
-        try:
-            import traceback; traceback.print_exc()
-        except Exception:
-            pass
-
-# Wrap _ensure_ready_async to inject the button once the UI exists
-try:
-    _fv_orig_ensure = DescriberWidget._ensure_ready_async
-    def _fv_wrapped_ensure(self, *a, **kw):
-        try:
-            _fv_add_kb_button(self)
-        except Exception:
-            pass
-        return _fv_orig_ensure(self, *a, **kw)
-    DescriberWidget._ensure_ready_async = _fv_wrapped_ensure  # type: ignore[attr-defined]
-except Exception:
-    pass
-# -------- end KB injection --------

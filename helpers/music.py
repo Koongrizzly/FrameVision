@@ -756,7 +756,7 @@ class MusicOverlay(QWidget):
         self._reposition()
         self.show()
         # ----- inactivity auto-hide (UI fades out after 5s; shows on activity) -----
-        self._inactive_ms = 5000
+        self._inactive_ms = 7500
         self._hidden = False
         self._anims = []
         self._hide_timer = QTimer(self)
@@ -871,7 +871,7 @@ class MusicOverlay(QWidget):
                     pass
                 w._auto_fx = eff  # type: ignore[attr-defined]
             anim = QPropertyAnimation(eff, b'opacity', self)
-            anim.setDuration(220)
+            anim.setDuration(320)
             try:
                 start = 0.0 if show else 1.0
                 end = 1.0 if show else 0.0

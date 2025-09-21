@@ -397,29 +397,9 @@ CONFIG_PATH   = BASE / "config.json"
 PRESETS_PATH  = BASE / "presets.json"
 MANIFEST_PATH = ROOT / "models_manifest.json"  # keep shared at root
 
-# --- Settings control helpers ---
-def _keep_settings_enabled() -> bool:
-    """Return True if the user wants settings to persist across restarts.
-    Reads QSettings("FrameVision","FrameVision")["keep_settings_after_restart"].
-    Defaults to True to preserve existing behavior when the setting isn't present."""
-    try:
-        return bool(QSettings('FrameVision','FrameVision').value('keep_settings_after_restart', True, type=bool))
-    except Exception:
-        return True
-
-def _session_restore():
-    """Safe accessor for session_restore that respects the keep-settings toggle."""
-    if not _keep_settings_enabled():
-        return {}
-    try:
-        return config.get('session_restore', {}) or {}
-    except Exception:
-        return {}
-
-def load_json(path: Path, default, allow_create=True):
+def load_json(path: Path, default):
     if not path.exists():
-        if allow_create:
-            path.write_text(json.dumps(default, indent=2), encoding="utf-8")
+        path.write_text(json.dumps(default, indent=2), encoding="utf-8")
         return default
     try:
         return json.loads(path.read_text(encoding="utf-8"))
@@ -437,14 +417,7 @@ config = load_json(CONFIG_PATH, {
     "theme": "Auto",
     "session_restore": { "last_file": "", "last_position_ms": 0, "active_tab": 0,
                          "win_geometry_b64":"", "splitter_state_b64":"" }
-}, allow_create=_keep_settings_enabled()
-)
-# If persistence is disabled, ignore any default session_restore values
-if not _keep_settings_enabled():
-    try:
-        config['session_restore'] = {}
-    except Exception:
-        pass
+})
 presets = load_json(PRESETS_PATH, {"crop": {}, "resize": {}, "export": {}})
 
 # Default manifest if missing (at project root so it persists across brand folders)
@@ -457,15 +430,7 @@ if not MANIFEST_PATH.exists():
         "RIFE": {"exe":"rife-ncnn-vulkan.exe","url":"", "checksum":""}
     }, indent=2), encoding="utf-8")
 
-def save_config():
-    if not _keep_settings_enabled():
-        try:
-            if CONFIG_PATH.exists():
-                CONFIG_PATH.unlink()
-        except Exception:
-            pass
-        return
-    CONFIG_PATH.write_text(json.dumps(config, indent=2), encoding="utf-8")
+def save_config(): CONFIG_PATH.write_text(json.dumps(config, indent=2), encoding="utf-8")
 def save_presets(): PRESETS_PATH.write_text(json.dumps(presets, indent=2), encoding="utf-8")
 
 def now_stamp(): return datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -2532,7 +2497,7 @@ class MainWindow(QMainWindow):
 
         # Default ratio favoring the right pane (tabs) unless a saved state exists
         try:
-            ss = _session_restore()
+            ss = config.get("session_restore", {})
         except Exception:
             ss = {}
         if not ss.get("splitter_state_b64"):
@@ -2637,7 +2602,7 @@ class MainWindow(QMainWindow):
                 new_y = max(union.y(), min(geo.y(), union.bottom() - new_h + 1))
                 win.setGeometry(new_x, new_y, new_w, new_h)
 
-        ss = _session_restore()
+        ss = config.get("session_restore", {})
         geo = ss.get("win_geometry_b64","");
         if geo:
             try: self.restoreGeometry(QByteArray.fromBase64(geo.encode("ascii")))
@@ -2670,8 +2635,6 @@ class MainWindow(QMainWindow):
 
 
     def save_session(self):
-        if not _keep_settings_enabled():
-            return
         ss = config.setdefault("session_restore", {})
         try:
             if not (self.windowState() & (Qt.WindowMaximized | Qt.WindowFullScreen)):

@@ -1,7 +1,22 @@
+# FrameVision — state_persist.py (v3 stable-keys + live-splitter-save)
+# Fixes:
+# - Use **stable widget keys** (derived from the widget's path in the parent/child tree)
+#   instead of object IDs, so settings persist across restarts even if objectName is unset.
+# - Add live saving for QSplitter via splitterMoved so the side pane width sticks immediately.
+# - Tabs + collapsibles still save on change; restore only applies when a value exists.
+#
+from __future__ import annotations
 
 from PySide6.QtCore import QSettings, QByteArray, Qt
-from PySide6.QtWidgets import QMainWindow, QTabWidget, QSplitter, QGroupBox, QWidget, QTreeView, QTableView
+from PySide6.QtWidgets import (
+    QWidget, QMainWindow, QTabWidget, QSplitter, QGroupBox,
+    QTreeView, QTableView, QToolButton
+)
 import json
+import typing as _t
+
+ORG = "FrameVision"
+APP = "FrameVision"
 
 KEY_GEOM = "ui/geometry"
 KEY_STATE = "ui/window_state"
@@ -9,213 +24,117 @@ KEY_TABS  = "tabs/{name}/index"
 KEY_SPLIT = "splitter/{name}/state"
 KEY_GBOX  = "collapsible/{name}/checked"
 KEY_HDR   = "header/{name}/state"
+KEY_KEEP  = "keep_settings_after_restart"   # bool, default True
+KEY_START_FORCE = "startup/force_mode"      # "maximized" or "fullscreen"
 
+def _qs() -> QSettings:
+    return QSettings(ORG, APP)
+
+def _keep_enabled() -> bool:
+    try:
+        val = _qs().value(KEY_KEEP, True, type=bool)
+        return True if val is None else bool(val)
+    except Exception:
+        return True
+
+def _sanitize(s: str) -> str:
+    return (s or "").replace(" ", "_").replace("/", "_").replace("\\", "_").lower()
+
+def _class_name(w: QWidget) -> str:
+    try:
+        return w.metaObject().className() or w.__class__.__name__
+    except Exception:
+        return w.__class__.__name__
+
+def _stable_path_name(w: QWidget, prefix: str) -> str:
+    """Build a deterministic name based on the widget's position in the tree.
+    Format: prefix + "__MainWindow:0__QSplitter:1__QTabWidget:0" (sanitized lowercase).
+    """
+    parts = []
+    cur: QWidget | None = w
+    while cur is not None and isinstance(cur, QWidget):
+        cls = _class_name(cur)
+        parent = cur.parentWidget()
+        idx = 0
+        if parent is not None:
+            # index among parent's QWidget children with same class
+            siblings = [c for c in parent.children() if isinstance(c, QWidget) and _class_name(c) == cls]
+            try:
+                idx = siblings.index(cur)
+            except ValueError:
+                idx = 0
+        parts.append(f"{cls}:{idx}")
+        cur = parent
+    parts.reverse()
+    name = prefix + "__" + "__".join(parts)
+    return _sanitize(name)
 
 def _name(w: QWidget, fallback_prefix: str) -> str:
-    n = w.objectName()
-    if not n:
-        # Try user-facing label text first for stability
-        try:
-            t = getattr(w, "text", None)
-            if callable(t):
-                txt = t().strip()
-                if txt:
-                    n = f"{fallback_prefix}_{txt}"
-        except Exception:
-            pass
-    if not n:
-        try:
-            an = w.accessibleName().strip()
-            if an:
-                n = f"{fallback_prefix}_{an}"
-        except Exception:
-            pass
-    if not n:
-        try:
-            wt = w.windowTitle().strip()
-            if wt:
-                n = f"{fallback_prefix}_{wt}"
-        except Exception:
-            pass
-    if not n:
-        # Give anonymous widgets stable-ish names based on class name
-        n = f"{fallback_prefix}_{w.__class__.__name__}"
-    # Stabilize for future runs
-    try:
-        if not w.objectName():
-            w.setObjectName(n)
-    except Exception:
-        pass
-    return n.replace(' ', '_').replace('/', '_').lower()
-def restore_all(root: QWidget) -> None:
+    n = (w.objectName() or "").strip()
+    if n:
+        return _sanitize(n)
+    # No objectName -> use stable path
+    return _stable_path_name(w, fallback_prefix)
 
+def restore_all(root: QWidget) -> None:
+    if not _keep_enabled():
+        return
+    s = _qs()
+
+    # Main window geometry/state (with optional forced mode)
     if isinstance(root, QMainWindow):
-        # Force start mode: 'maximized' (default) or 'fullscreen'
-        # Change via QSettings("FrameVision","FrameVision").setValue("startup/force_mode", "maximized")
-        s = QSettings("FrameVision","FrameVision")
-        mode = s.value("startup/force_mode", "maximized")
+        mode = s.value(KEY_START_FORCE, "maximized")
         mode = (str(mode).strip().lower() if mode is not None else "maximized")
-        # Decide desired flag but DO NOT call show* here (prevents flashing main before intro)
+        forced = False
         try:
             if mode in ("fullscreen", "full", "fs"):
-                try:
-                    desired_flag = Qt.WindowFullScreen
-                    root.setWindowState(root.windowState() | desired_flag)
-                except Exception:
-                    pass
-            elif mode in ("maximized", "max", "maximise", "maximize"):
-                try:
-                    desired_flag = Qt.WindowMaximized
-                    root.setWindowState(root.windowState() | desired_flag)
-                except Exception:
-                    pass
-            else:
-                raise ValueError("no forced mode")  # fall through to legacy restore below
-            # We applied a forced mode; do NOT restore geometry/state (prevents snap-back)
+                root.setWindowState(root.windowState() | Qt.WindowFullScreen)
+                forced = True
+            elif mode in ("maximized", "max"):
+                root.setWindowState(root.windowState() | Qt.WindowMaximized)
+                forced = True
         except Exception:
-            # Legacy behavior if no forced mode is set or something went wrong
+            pass
+        if not forced:
             geom = s.value(KEY_GEOM, None)
             if isinstance(geom, QByteArray):
-                try:
-                    root.restoreGeometry(geom)
-                except Exception:
-                    pass
+                try: root.restoreGeometry(geom)
+                except Exception: pass
             st = s.value(KEY_STATE, None)
             if isinstance(st, QByteArray):
-                try:
-                    root.restoreState(st)
-                except Exception:
-                    pass
-    s = QSettings("FrameVision","FrameVision")
-    if not s.value("keep_settings_after_restart", True, type=bool):
-        return
+                try: root.restoreState(st)
+                except Exception: pass
 
-    # Window geometry/state
-    if isinstance(root, QMainWindow):
-        geom = s.value(KEY_GEOM, None)
-        if isinstance(geom, QByteArray):
-            try:
-                root.restoreGeometry(geom)
-            except Exception:
-                pass
-        st = s.value(KEY_STATE, None)
-        if isinstance(st, QByteArray):
-            try:
-                root.restoreState(st)
-            except Exception:
-                pass
-
-    # Tabs
+    # Tabs — restore saved index only; then save on change
     for tabw in root.findChildren(QTabWidget):
         try:
             key = KEY_TABS.format(name=_name(tabw, "tab"))
             idx = s.value(key, None, type=int)
             if idx is not None and 0 <= idx < tabw.count():
                 tabw.setCurrentIndex(idx)
+            def _on_tab_changed(i, _key=key):
+                qs = _qs()
+                qs.setValue(_key, int(i))
+                qs.sync()
+            tabw.currentChanged.connect(_on_tab_changed)
         except Exception:
             pass
 
-
-
-    # Common input widgets
-    from PySide6.QtWidgets import QCheckBox, QRadioButton, QComboBox, QSpinBox, QDoubleSpinBox, QLineEdit
-    for w in root.findChildren(QCheckBox):
-        try:
-            key = f"check/{{name}}".format(name=_name(w, "check"))
-            val = s.value(key, None, type=bool)
-            if val is not None:
-                w.setChecked(bool(val))
-        except Exception:
-            pass
-    for w in root.findChildren(QRadioButton):
-        try:
-            key = f"radio/{{name}}".format(name=_name(w, "radio"))
-            val = s.value(key, None, type=bool)
-            if val is not None:
-                w.setChecked(bool(val))
-        except Exception:
-            pass
-    for w in root.findChildren(QComboBox):
-        try:
-            key = f"combo/{{name}}".format(name=_name(w, "combo"))
-            idx = s.value(key, None, type=int)
-            if idx is not None and 0 <= idx < w.count():
-                w.setCurrentIndex(idx)
-        except Exception:
-            pass
-    for w in root.findChildren(QSpinBox):
-        try:
-            key = f"spin/{{name}}".format(name=_name(w, "spin"))
-            val = s.value(key, None, type=int)
-            if val is not None:
-                w.setValue(int(val))
-        except Exception:
-            pass
-    for w in root.findChildren(QDoubleSpinBox):
-        try:
-            key = f"dspin/{{name}}".format(name=_name(w, "dspin"))
-            val = s.value(key, None, type=float)
-            if val is not None:
-                w.setValue(float(val))
-        except Exception:
-            pass
-    for w in root.findChildren(QLineEdit):
-        try:
-            key = f"line/{{name}}".format(name=_name(w, "line"))
-            val = s.value(key, None, type=str)
-            if val is not None:
-                w.setText(val)
-        except Exception:
-            pass
-
-
-
-    # Common input widgets
-    from PySide6.QtWidgets import QCheckBox, QRadioButton, QComboBox, QSpinBox, QDoubleSpinBox, QLineEdit
-    for w in root.findChildren(QCheckBox):
-        try:
-            key = f"check/{{name}}".format(name=_name(w, "check"))
-            s.setValue(key, bool(w.isChecked()))
-        except Exception:
-            pass
-    for w in root.findChildren(QRadioButton):
-        try:
-            key = f"radio/{{name}}".format(name=_name(w, "radio"))
-            s.setValue(key, bool(w.isChecked()))
-        except Exception:
-            pass
-    for w in root.findChildren(QComboBox):
-        try:
-            key = f"combo/{{name}}".format(name=_name(w, "combo"))
-            s.setValue(key, w.currentIndex())
-        except Exception:
-            pass
-    for w in root.findChildren(QSpinBox):
-        try:
-            key = f"spin/{{name}}".format(name=_name(w, "spin"))
-            s.setValue(key, int(w.value()))
-        except Exception:
-            pass
-    for w in root.findChildren(QDoubleSpinBox):
-        try:
-            key = f"dspin/{{name}}".format(name=_name(w, "dspin"))
-            s.setValue(key, float(w.value()))
-        except Exception:
-            pass
-    for w in root.findChildren(QLineEdit):
-        try:
-            key = f"line/{{name}}".format(name=_name(w, "line"))
-            s.setValue(key, w.text())
-        except Exception:
-            pass
-
-    # Splitters
+    # Splitters — restore + live-save when moved
     for spl in root.findChildren(QSplitter):
         try:
             key = KEY_SPLIT.format(name=_name(spl, "split"))
             ba = s.value(key, None)
             if isinstance(ba, QByteArray):
                 spl.restoreState(ba)
+            def _on_splitter_moved(*_args, _spl=spl, _key=key):
+                qs = _qs()
+                try:
+                    qs.setValue(_key, _spl.saveState())
+                    qs.sync()
+                except Exception:
+                    pass
+            spl.splitterMoved.connect(_on_splitter_moved)
         except Exception:
             pass
 
@@ -227,26 +146,32 @@ def restore_all(root: QWidget) -> None:
                 val = s.value(key, None, type=bool)
                 if val is not None:
                     gb.setChecked(bool(val))
+                def _on_gb_toggled(v, _key=key):
+                    qs = _qs()
+                    qs.setValue(_key, bool(v))
+                    qs.sync()
+                gb.toggled.connect(_on_gb_toggled)
         except Exception:
             pass
 
-    # Custom collapsible sections (QWidget with a checkable QToolButton child)
-    try:
-        from PySide6.QtWidgets import QToolButton
-        for sec in root.findChildren(QWidget):
-            try:
-                tb = sec.findChild(QToolButton)
-                if tb and tb.isCheckable():
-                    key = KEY_GBOX.format(name=_name(sec, "gbox"))
-                    val = s.value(key, None, type=bool)
-                    if val is not None:
-                        tb.setChecked(bool(val))
-            except Exception:
-                pass
-    except Exception:
-        pass
+    # Custom collapsible sections (any widget containing a checkable QToolButton)
+    for sec in root.findChildren(QWidget):
+        try:
+            tb = sec.findChild(QToolButton)
+            if tb and tb.isCheckable():
+                key = KEY_GBOX.format(name=_name(sec, "gbox"))
+                val = s.value(key, None, type=bool)
+                if val is not None:
+                    tb.setChecked(bool(val))
+                def _on_tb_toggled(v, _key=key):
+                    qs = _qs()
+                    qs.setValue(_key, bool(v))
+                    qs.sync()
+                tb.toggled.connect(_on_tb_toggled)
+        except Exception:
+            pass
 
-    # Headers for trees/tables
+    # Header state
     for view in list(root.findChildren(QTreeView)) + list(root.findChildren(QTableView)):
         try:
             hdr = view.header()
@@ -258,65 +183,21 @@ def restore_all(root: QWidget) -> None:
             pass
 
 def save_all(root: QWidget) -> None:
-    s = QSettings("FrameVision","FrameVision")
-    if not s.value("keep_settings_after_restart", True, type=bool):
-        # If disabled, do nothing (we intentionally don't clear keys automatically)
+    if not _keep_enabled():
         return
+    s = _qs()
 
-    # Window geometry/state
     if isinstance(root, QMainWindow):
-        try:
-            s.setValue(KEY_GEOM, root.saveGeometry())
-            s.setValue(KEY_STATE, root.saveState())
-        except Exception:
-            pass
+        try: s.setValue(KEY_GEOM, root.saveGeometry())
+        except Exception: pass
+        try: s.setValue(KEY_STATE, root.saveState())
+        except Exception: pass
 
     # Tabs
     for tabw in root.findChildren(QTabWidget):
         try:
             key = KEY_TABS.format(name=_name(tabw, "tab"))
-            s.setValue(key, tabw.currentIndex())
-        except Exception:
-            pass
-
-
-
-    # Common input widgets
-    from PySide6.QtWidgets import QCheckBox, QRadioButton, QComboBox, QSpinBox, QDoubleSpinBox, QLineEdit
-    for w in root.findChildren(QCheckBox):
-        try:
-            key = f"check/{{name}}".format(name=_name(w, "check"))
-            s.setValue(key, bool(w.isChecked()))
-        except Exception:
-            pass
-    for w in root.findChildren(QRadioButton):
-        try:
-            key = f"radio/{{name}}".format(name=_name(w, "radio"))
-            s.setValue(key, bool(w.isChecked()))
-        except Exception:
-            pass
-    for w in root.findChildren(QComboBox):
-        try:
-            key = f"combo/{{name}}".format(name=_name(w, "combo"))
-            s.setValue(key, w.currentIndex())
-        except Exception:
-            pass
-    for w in root.findChildren(QSpinBox):
-        try:
-            key = f"spin/{{name}}".format(name=_name(w, "spin"))
-            s.setValue(key, int(w.value()))
-        except Exception:
-            pass
-    for w in root.findChildren(QDoubleSpinBox):
-        try:
-            key = f"dspin/{{name}}".format(name=_name(w, "dspin"))
-            s.setValue(key, float(w.value()))
-        except Exception:
-            pass
-    for w in root.findChildren(QLineEdit):
-        try:
-            key = f"line/{{name}}".format(name=_name(w, "line"))
-            s.setValue(key, w.text())
+            s.setValue(key, int(tabw.currentIndex()))
         except Exception:
             pass
 
@@ -328,30 +209,26 @@ def save_all(root: QWidget) -> None:
         except Exception:
             pass
 
-    # Collapsible GroupBoxes (checkable)
+    # Collapsible GroupBoxes
     for gb in root.findChildren(QGroupBox):
         try:
             if gb.isCheckable():
                 key = KEY_GBOX.format(name=_name(gb, "gbox"))
-                s.setValue(key, gb.isChecked())
+                s.setValue(key, bool(gb.isChecked()))
         except Exception:
             pass
 
-    # Custom collapsible sections (QWidget with a checkable QToolButton child)
-    try:
-        from PySide6.QtWidgets import QToolButton
-        for sec in root.findChildren(QWidget):
-            try:
-                tb = sec.findChild(QToolButton)
-                if tb and tb.isCheckable():
-                    key = KEY_GBOX.format(name=_name(sec, "gbox"))
-                    s.setValue(key, bool(tb.isChecked()))
-            except Exception:
-                pass
-    except Exception:
-        pass
+    # Custom collapsible sections
+    for sec in root.findChildren(QWidget):
+        try:
+            tb = sec.findChild(QToolButton)
+            if tb and tb.isCheckable():
+                key = KEY_GBOX.format(name=_name(sec, "gbox"))
+                s.setValue(key, bool(tb.isChecked()))
+        except Exception:
+            pass
 
-    # Headers for trees/tables
+    # Headers
     for view in list(root.findChildren(QTreeView)) + list(root.findChildren(QTableView)):
         try:
             hdr = view.header()
@@ -359,84 +236,25 @@ def save_all(root: QWidget) -> None:
             s.setValue(key, hdr.saveState())
         except Exception:
             pass
+    try: s.sync()
+    except Exception: pass
 
-
-# --- Lightweight QSettings-backed config shim (no global hardcoding) ---------
-
-class ConfigShim(dict):
-    """Dict-like wrapper around QSettings that:
-    - reads from QSettings on demand
-    - uses provided defaults only when a key is missing (first-use)
-    - never forces defaults on subsequent runs
-    """
-    def __init__(self, defaults: dict | None = None, org: str = "FrameVision", app: str = "FrameVision"):
-        super().__init__()
-        from PySide6.QtCore import QSettings
-        self._qs = QSettings(org, app)
-        self._defaults = defaults or {}
-
-    # helpers
-    def _read(self, key, fallback=None):
-        from PySide6.QtCore import QSettings
-        v = self._qs.value(key, None)
-        if v is None:
-            return self._defaults.get(key, fallback)
-        # try json decode if it looks like JSON
-        if isinstance(v, str):
-            s = v.strip()
-            if (s.startswith('{') and s.endswith('}')) or (s.startswith('[') and s.endswith(']')):
-                try:
-                    return json.loads(s)
-                except Exception:
-                    pass
-        return v
-
-    def _write(self, key, value):
-        # store complex types as JSON, simple as-is
-        if isinstance(value, (dict, list, tuple)):
-            self._qs.setValue(key, json.dumps(value))
-        else:
-            self._qs.setValue(key, value)
-
-    # dict API
-    def get(self, key, default=None):
-        return self._read(key, default)
-
-    def __getitem__(self, key):
-        v = self._read(key)
-        if v is None:
-            raise KeyError(key)
-        return v
-
-    def __setitem__(self, key, value):
-        self._write(key, value)
-
-    def update(self, other=None, **kw):
-        if other:
-            for k, v in dict(other).items():
-                self._write(k, v)
-        for k, v in kw.items():
-            self._write(k, v)
-
-    def setdefault(self, key, default=None):
-        existing = self._qs.value(key, None)
-        if existing is None:
-            self._write(key, default)
-            return default
-        # decode if json
-        if isinstance(existing, str):
-            s = existing.strip()
-            if (s.startswith('{') and s.endswith('}')) or (s.startswith('[') and s.endswith(']')):
-                try:
-                    return json.loads(s)
-                except Exception:
-                    pass
-        return existing
-
-    def sync(self):
-        # Ensure values are flushed to disk
+class SettingsHelper:
+    def __init__(self, settings: QSettings | None = None) -> None:
+        self._qs = settings or _qs()
+    def set_json(self, key: str, value: _t.Any) -> None:
         try:
-            self._qs.sync()
-        except Exception:
-            pass
-
+            self._qs.setValue(key, json.dumps(value)); self._qs.sync()
+        except Exception: pass
+    def get_json(self, key: str, default: _t.Any = None) -> _t.Any:
+        existing = self._qs.value(key, None)
+        if existing is None: return default
+        try:
+            s = str(existing)
+            if (s.startswith('{') and s.endswith('}')) or (s.startswith('[') and s.endswith(']')):
+                return json.loads(s)
+        except Exception: pass
+        return default
+    def sync(self) -> None:
+        try: self._qs.sync()
+        except Exception: pass
