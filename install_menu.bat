@@ -27,7 +27,19 @@ if "%CHOICE%"=="3" goto cpu
 if "%CHOICE%"=="4" goto cuda
 goto end
 :ensure_python
-rem Robust Python resolver: prefer py -3.11, then py -3.10, then python on PATH
+rem Ensure Python is available; auto-install if missing (3.11, added PATH), based on system arch.
+set "PYTHON="
+for %%V in (3.12 3.11 3.10) do if not defined PYTHON (
+  py -%%V -V >nul 2>nul && set "PYTHON=py -%%V"
+)
+if not defined PYTHON (
+  where python >nul 2>nul && set "PYTHON=python"
+)
+if defined PYTHON exit /b 0
+
+echo Python not found. Attempting automatic install of Python 3.11...
+call :_install_python_311
+rem Re-detect after install
 set "PYTHON="
 for %%V in (3.11 3.10) do if not defined PYTHON (
   py -%%V -V >nul 2>nul && set "PYTHON=py -%%V"
@@ -35,10 +47,48 @@ for %%V in (3.11 3.10) do if not defined PYTHON (
 if not defined PYTHON (
   where python >nul 2>nul && set "PYTHON=python"
 )
-if not defined PYTHON (
-  echo Python was not found. Please install Python 3.10 or 3.11.
+if defined PYTHON (
+  echo Python is now available.
+  exit /b 0
+) else (
+  echo Failed to install Python automatically. Please install Python 3.11 and re-run.
   exit /b 1
 )
+
+:_install_python_311
+rem Decide arch: AMD64, ARM64, or x86
+set "ARCH=%PROCESSOR_ARCHITECTURE%"
+if /I "%ARCH%"=="AMD64" (set "PY_FILE=python-3.11.9-amd64.exe") ^
+else if /I "%ARCH%"=="ARM64" (set "PY_FILE=python-3.11.9-arm64.exe") ^
+else (set "PY_FILE=python-3.11.9.exe")
+set "PY_URL=https://www.python.org/ftp/python/3.11.9/%PY_FILE%"
+set "PY_TMP=%TEMP%\%PY_FILE%"
+
+rem Try winget first
+winget --version >nul 2>nul
+if not errorlevel 1 (
+  echo Installing via winget...
+  winget install -e --id Python.Python.3.11 --silent --accept-source-agreements --accept-package-agreements
+  if not errorlevel 1 (
+    echo winget install initiated.
+    rem Give a moment then return
+    timeout /t 3 >nul
+    exit /b 0
+  )
+)
+
+rem Fallback: download from python.org and run silent installer (requires elevation for AllUsers)
+echo Downloading %PY_FILE% from python.org ...
+powershell -NoProfile -Command "try{Invoke-WebRequest -UseBasicParsing '%PY_URL%' -OutFile '%PY_TMP%';exit 0}catch{Write-Host 'Download failed';exit 1}"
+if errorlevel 1 (
+  echo Download failed.
+  exit /b 1
+)
+
+echo Running Python installer (silent)...
+set "PY_ARGS=/quiet InstallAllUsers=1 PrependPath=1 Include_test=0 Include_launcher=1 SimpleInstall=1"
+powershell -NoProfile -Command "Start-Process -FilePath '%PY_TMP%' -ArgumentList '%PY_ARGS%' -Verb runAs -Wait"
+del /q "%PY_TMP%" >nul 2>nul
 exit /b 0
 
 :ensure_venv
@@ -61,6 +111,10 @@ exit /b 0
 
 :install_psutil
 if exist ".venv\Scripts\python.exe" call ".venv\Scripts\python.exe" -m pip install --no-cache-dir --upgrade "psutil>=5.9"
+rem ignore failures
+exit /b 0
+:install_mutagen
+if exist ".venv\Scripts\python.exe" call ".venv\Scripts\python.exe" -m pip install --no-cache-dir --upgrade mutagen
 rem ignore failures
 exit /b 0
 :check
@@ -933,6 +987,7 @@ call ".venv\Scripts\python.exe" -c "import sys;import pkgutil;import importlib;m
 if errorlevel 1 echo( (warning) model download had issues; continuing...
 
 call :install_psutil
+call :install_mutagen
 
 echo > ".installed_cpu"
 if exist "framevision_run.py" (
@@ -980,6 +1035,7 @@ rem Validate local Qwen20B model if present
 if errorlevel 1 echo( (warning) model download had issues; continuing...
 
 
+call :install_mutagen
 echo > ".installed_gpu"
 if exist "framevision_run.py" (
   echo CUDA install complete. Launching FrameVision...

@@ -2,50 +2,56 @@
   "RealESR-general-x4v3": {
     "exe": "realesrgan/realesrgan-ncnn-vulkan.exe",
     "url": "",
-    "checksum": ""
+    "checksum": "",
+    "name": "RealESR-general-x4v3",
+    "cli_name": "realesr-general-x4v3"
   },
   "RealESRGAN-x4plus": {
     "exe": "realesrgan/realesrgan-ncnn-vulkan.exe",
     "url": "",
-    "checksum": ""
+    "checksum": "",
+    "name": "RealESRGAN-x4plus",
+    "cli_name": "realesrgan-x4plus"
   },
   "RealESRGAN-x4plus-anime": {
     "exe": "realesrgan/realesrgan-ncnn-vulkan.exe",
     "url": "",
-    "checksum": ""
+    "checksum": "",
+    "name": "RealESRGAN-x4plus-anime",
+    "cli_name": "realesrgan-x4plus"
   },
   "RealESR-animevideov3-x2": {
     "exe": "realesrgan/realesrgan-ncnn-vulkan.exe",
     "url": "",
-    "checksum": ""
+    "checksum": "",
+    "name": "RealESR-animevideov3-x2",
+    "cli_name": "realesr-animevideov3"
   },
   "RealESR-animevideov3-x3": {
     "exe": "realesrgan/realesrgan-ncnn-vulkan.exe",
     "url": "",
-    "checksum": ""
+    "checksum": "",
+    "name": "RealESR-animevideov3-x3",
+    "cli_name": "realesr-animevideov3"
   },
   "RealESR-animevideov3-x4": {
     "exe": "realesrgan/realesrgan-ncnn-vulkan.exe",
     "url": "",
-    "checksum": ""
+    "checksum": "",
+    "name": "RealESR-animevideov3-x4",
+    "cli_name": "realesr-animevideov3"
   },
   "SwinIR-x4": {
     "exe": "swinir/swinir-ncnn-vulkan.exe",
     "url": "",
-    "checksum": ""
+    "checksum": "",
+    "name": "SwinIR-x4"
   },
   "LapSRN-x4": {
     "exe": "lapsrn/lapsrn-ncnn-vulkan.exe",
     "url": "",
-    "checksum": ""
-  },
-  "qwen_image": {
-    "root": "./models/qwen_image",
-    "files": [
-      "qwen_image_q3km.gguf OR qwen_image_q4km.gguf OR subfiles"
-    ],
-    "type": "txt2img",
-    "notes": "GGUF Qwen-Image; Q3_K_M for 6/8 GB; Q4_K_M for 12/24 GB"
+    "checksum": "",
+    "name": "LapSRN-x4"
   },
   "rife-ncnn-vulkan": {
     "root": "./models/rife-ncnn-vulkan",
@@ -112,6 +118,7 @@
         ]
       }
     },
-    "notes": "NCNN RIFE engine + model folders. Preferred model is rife-v4.6; fallbacks include rife-v4 and rife."
+    "notes": "NCNN RIFE engine + model folders. Preferred model is rife-v4.6; fallbacks include rife-v4 and rife.",
+    "name": "rife-ncnn-vulkan"
   }
 }
