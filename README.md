@@ -139,6 +139,18 @@ WORK IN PROGRESS CURRENTLY IN BETA
   
 ---
 
+  ### 🎞️ TXT/IMG → VIDEO (WAN 2.2 — TI2V‑5B)
+
+- **Engine:** WAN 2.2 (TI2V‑5B) — high‑quality text‑to‑video and image‑to‑video.
+- **Modes:** `text2video` (prompt → clip) and `image2video` (first frame conditioning).
+- **Offline:** Runs fully offline from the app (no ComfyUI). Uses local weights and cache.
+- **Presets:** 480p (854×480) and 720p (1280×720). Width/height overrides supported.
+- **Timing:** Default **48 frames @ 24 fps** (tweakable).
+- **Performance:** `fp16`/`bf16`/`fp32`, CUDA or CPU, optional model offload, chunked generation, SDPA/FlashAttention (auto‑fallback).
+- **Muxing:** FFmpeg H.264 (`yuv420p`, CRF 18). Fallback to pure‑Python writer if FFmpeg is unavailable.
+- **Integration:** Works with the app's queue & output folders so you can render, preview, and iterate quickly.
+---
+
 ### 🧰 Multi Tools
 - Change speed for videos (with audio sync).
 - Resize with aspect-ratio preservation.
@@ -152,6 +164,22 @@ WORK IN PROGRESS CURRENTLY IN BETA
 - Add or replace audio tracks in video.
 - Multi rename tools
 ...
+
+
+
+### 🔊 TXT → SPEECH (VibeVoice 1.5B)
+
+- **Engine:** VibeVoice 1.5B — fast, natural TTS. Runs fully offline in the app (no ComfyUI).
+- **Modes:** `tts` (single speaker) and `multitts` (JSON timeline with per‑segment pauses).
+- **Prosody:** control **speed**, **pitch** (semitones), and **energy** for expressive output.
+- **References:** optional **voice reference** per speaker to guide timbre (segment‑level in multitts).
+- **Sample rates:** 22050 / **24000 (default)** / 44100 / 48000. Mono output for clean mixes.
+- **Performance:** `fp16` / `bf16` / `fp32`, **CUDA or CPU**, SDPA/FlashAttention (auto‑fallback).
+- **Output:** 16‑bit WAV with robust fallbacks (soundfile → torchaudio → wave).
+- **Post‑FX (optional):** FFmpeg **normalize**, **EBU R128 loudnorm**, and light **denoise** (arnndn model if provided).
+- **Integration:** persistent settings (device/dtype/SR/attn/refs), probe/dry‑run, rotating logs & crash reports.
+- **Paths:** uses `./models/vibevoice/1.5B` if present, `./presets/bin/ffmpeg(.exe)`, and `./presets/setsave/vibevoice.json`.
+---
 
 ### ⚙️ Settings
 - random intro with easter egg (click the intro 4x) default download has 3 intros (day evening and night)
