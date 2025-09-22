@@ -117,11 +117,14 @@ class JobRowWidget(QWidget):
         f.setBold(True)
         self.title.setFont(f)
         self.title.setStyleSheet("font-family: Consolas, 'Courier New', monospace;")
+        self.title.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
 
         # --- Subtitle (smaller/secondary color) ---
         self.subtitle = QLabel(self._subtitle_text())
         self.subtitle.setTextInteractionFlags(Qt.TextSelectableByMouse)
         self.subtitle.setStyleSheet("color: palette(mid); font-size: 11px;")
+        self.subtitle.setWordWrap(False)
+        self.subtitle.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
 
         # --- Progress bar ---
         self.bar = QProgressBar()
@@ -278,26 +281,80 @@ class JobRowWidget(QWidget):
         except Exception:
             return self.status
 
+    def _shorten_basename(self, name: str, max_chars: int = 42) -> str:
+        """Return a shortened file name keeping the extension, using middle ellipsis."""
+        try:
+            if not name:
+                return ""
+            if len(name) <= max_chars:
+                return name
+            p = Path(name)
+            stem = p.stem
+            ext = p.suffix or ""
+            avail = max(3, max_chars - len(ext) - 3)
+            left = max(1, avail // 2)
+            right = max(1, avail - left)
+            if len(stem) > avail:
+                stem = f"{stem[:left]}...{stem[-right:]}"
+            return f"{stem}{ext}"
+        except Exception:
+            if len(name) <= max_chars:
+                return name
+            half = max_chars // 2
+            return name[:half] + "..." + name[-(max_chars - half - 3):]
+
     def _title_text(self) -> str:
         d = self.data or {}
+        status = (self._status_from_fs() or self.status).lower()
+
+        # When finished: first line shows OUTPUT filename + model
+        if status in ("done",):
+            try:
+                outp = self._resolve_output_file()
+            except Exception:
+                outp = None
+            out_name = self._shorten_basename(outp.name) if outp else None
+
+            args = d.get("args") or {}
+            model = d.get("model") or d.get("model_name") or args.get("model") or args.get("ai_model")
+            if out_name and model:
+                return f"{out_name}  |  {model}"
+            if out_name:
+                return str(out_name)
+
+        # Fallback for running/pending/failed
         title = d.get("title")
         if not title:
             title = (d.get("args") or {}).get("label") or self.job_path.stem
         return str(title)
-
-    # Build a compact, informative subtitle
     def _subtitle_text(self) -> str:
         d = self.data or {}
         args = d.get("args") or {}
 
+        status = (self._status_from_fs() or self.status).lower()
+        if status in ("done",):
+            jobname = self.job_path.stem
+            started = d.get("started_at")
+            finished = d.get("finished_at")
+            dur = d.get("duration_sec") or self._compute_elapsed(d)
+
+            s_txt = self._fmt_clock(started) if started else ""
+            e_txt = self._fmt_clock(finished) if finished else ""
+            dur_txt = self._fmt_dur(dur) if dur is not None else ""
+
+            timings = " ".join([p for p in [s_txt, f"({dur_txt})" if dur_txt else "", e_txt] if p])
+            if timings:
+                return f"{jobname}  |  {timings}"
+            return str(jobname)
+
+        # Informative subtitle for other states
         parts = []
 
-        # Input filename
         src = d.get("input") or args.get("infile") or args.get("input")
         if src:
-            parts.append(Path(str(src)).name)
+            base = Path(str(src)).name
+            parts.append(self._shorten_basename(base))
 
-        # Resolution or transform
         res = self._extract_resolution(d, args)
         if res:
             if parts:
@@ -305,13 +362,10 @@ class JobRowWidget(QWidget):
             else:
                 parts.append(res)
 
-        # Model used
         model = d.get("model") or d.get("model_name") or args.get("model") or args.get("ai_model")
         if model:
             parts.append(str(model))
 
-        # Timing info
-        status = (self._status_from_fs() or self.status).lower()
         started = d.get("started_at")
         finished = d.get("finished_at")
         eta_sec_raw = d.get("eta_sec")
@@ -323,7 +377,6 @@ class JobRowWidget(QWidget):
                 time_frag.append(f"Started {self._fmt_clock(started)}")
             if elapsed_sec is not None:
                 time_frag.append(f"Elapsed {self._fmt_dur(elapsed_sec)}")
-            # Show ETA immediately after Elapsed when available
             if eta_sec_raw is not None:
                 try:
                     eta_display = int(float(eta_sec_raw)) + int(ETA_FUDGE_SEC)
@@ -331,7 +384,7 @@ class JobRowWidget(QWidget):
                     eta_display = None
                 if eta_display and eta_display > 0:
                     time_frag.append(f"ETA {self._fmt_dur(eta_display)}")
-        elif status in ("done", "failed"):
+        elif status in ("failed",):
             if finished:
                 time_frag.append(f"Finished {self._fmt_clock(finished)}")
             if elapsed_sec is not None:
