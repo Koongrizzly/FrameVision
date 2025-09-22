@@ -86,9 +86,8 @@ start.bat
   - **Waifu2x:** `models-cunet`, `models-upconv_7_photo`, `models-upconv_7_anime_style_art_rgb`
   - **Upscayl:** `digital-art-4x`, `high-fidelity-4x`, `remacri-4x`,
     `ultramix-balanced-4x`, `ultrasharp-4x`, `upscayl-lite-4x`, `upscayl-standard-4x`
-- preview last 10 upscales, live progress bar with ETA
+- preview last 10 upscales, batch, queue
 - change video codec,bitrate, sound quality etc
-- advanced settings for some models
 - works both on GPU or CPU
 
 ---
