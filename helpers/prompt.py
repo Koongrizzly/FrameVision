@@ -1,11 +1,10 @@
-
 from __future__ import annotations
 
-import os, json, traceback, inspect, datetime
+import os, json, traceback, inspect, datetime, threading
 from pathlib import Path
-from typing import Any, Dict, Callable, List, Tuple
+from typing import Any, Dict, Callable, List, Tuple, Optional
 
-from PySide6.QtCore import Qt, QTimer
+from PySide6.QtCore import Qt, QTimer, QObject, QThread, Signal
 from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton,
     QTextEdit, QFormLayout, QDoubleSpinBox, QSpinBox, QLineEdit,
@@ -21,19 +20,25 @@ except Exception:
 SET_PATH = ROOT / "presets" / "setsave" / "prompt.json"
 SET_PATH.parent.mkdir(parents=True, exist_ok=True)
 
-DEFAULT_STYLE = "3D-rendered Pixar-style"
+DEFAULT_STYLE = ""
 DEFAULT_TEMPLATE_BASE = (
     "Expand the seed into one vivid, {length_words} single-sentence prompt for text-to-{target}. "
     "Include subject, environment, time of day, lighting, camera/lens, composition, action, textures, mood, and color palette. "
     "Return only the final prompt, no lists or markup."
 )
-DEFAULT_NEG = "text, watermark, vending machines, rubber ducks, disco balls, flamingos"
+DEFAULT_NEG = ""
+OLD_DEFAULT_NEG = "text, watermark, vending machines, rubber ducks, disco balls, flamingos"
+NEW_DEFAULT_NEG = "bad eyes, deformed body parts, bad teeth"
 
 LENGTH_PRESETS = {
     "Short (40–60 words)": ( "40–60 words", 160 ),
     "Medium (80–120 words)": ( "80–120 words", 280 ),
     "Long (140–200 words)": ( "140–200 words", 420 ),
 }
+
+# ---------- Lightweight caching for model + processor ----------
+_MODEL_CACHE: Dict[str, Any] = {}
+_MODEL_LOCK = threading.Lock()
 
 def _lines_to_px(widget, lines:int)->int:
     fm = widget.fontMetrics()
@@ -42,7 +47,27 @@ def _lines_to_px(widget, lines:int)->int:
 def _load_settings()->Dict[str, Any]:
     try:
         if SET_PATH.exists():
-            return json.loads(SET_PATH.read_text(encoding="utf-8"))
+            data = json.loads(SET_PATH.read_text(encoding="utf-8"))
+            try:
+                neg = (data.get("negatives") or "").strip()
+                # Map the legacy noisy default list to the new cleaner set
+                # Accept either exact match or the same items in any order.
+                legacy = OLD_DEFAULT_NEG.lower()
+                cur = neg.lower()
+                def _norm_set(s):
+                    return {x.strip() for x in s.split(",") if x.strip()}
+                if cur == legacy or _norm_set(cur) == _norm_set(legacy):
+                    data["negatives"] = NEW_DEFAULT_NEG
+            except Exception:
+                pass
+                        # Normalize legacy forced styles: drop "" defaults
+            try:
+                st = (data.get("style") or "").strip()
+                if st and "pixar" in st.lower():
+                    data["style"] = ""
+            except Exception:
+                pass
+            return data
     except Exception:
         pass
     return {
@@ -125,12 +150,16 @@ def _choose_device():
     except Exception:
         return "cpu", None
 
-def _generate_with_qwen_text(model_path: Path, system_prompt:str, user_prompt:str, temperature:float, max_new_tokens:int)->str:
+def _get_qwen_text_model(model_path: Path):
     """
-    Text-only generation for Qwen2-VL like models using Transformers, at the given model folder.
+    Load (or reuse cached) processor+model for text-only use.
+    Returns (processor, model, device, dtype).
     """
-    if model_path is None or not (model_path.exists() and any(model_path.iterdir())):
-        raise RuntimeError("Model folder not found")
+    key = str(model_path.resolve())
+    with _MODEL_LOCK:
+        if key in _MODEL_CACHE:
+            return _MODEL_CACHE[key]
+    # Load lazily outside the lock to avoid long hold
     device, dtype = _choose_device()
     try:
         from transformers import AutoProcessor
@@ -146,8 +175,46 @@ def _generate_with_qwen_text(model_path: Path, system_prompt:str, user_prompt:st
     except Exception as e:
         raise RuntimeError(f"Transformers unavailable: {e}")
 
-    processor = AutoProcessor.from_pretrained(str(model_path), trust_remote_code=True, local_files_only=True, use_fast=True)
-    model = _VLMModel.from_pretrained(str(model_path), trust_remote_code=True, local_files_only=True, torch_dtype=dtype).to(device)
+    processor = AutoProcessor.from_pretrained(
+        str(model_path),
+        trust_remote_code=True,
+        local_files_only=True,
+        use_fast=True
+    )
+    # Keep memory usage modest; let HF handle placement
+    model = _VLMModel.from_pretrained(
+        str(model_path),
+        trust_remote_code=True,
+        local_files_only=True,
+        torch_dtype=dtype
+    ).to(device)
+    try:
+        model.eval()
+    except Exception:
+        pass
+
+    with _MODEL_LOCK:
+        _MODEL_CACHE[key] = (processor, model, device, dtype)
+    return processor, model, device, dtype
+
+def _generate_with_qwen_text(
+    model_path: Path,
+    system_prompt:str,
+    user_prompt:str,
+    temperature:float,
+    max_new_tokens:int,
+    cancel_check: Optional[Callable[[], bool]] = None
+)->str:
+    """
+    Text-only generation for Qwen2-VL like models using Transformers, at the given model folder.
+    Runs in a worker thread; supports cooperative cancel via stopping criteria.
+    """
+    if model_path is None or not (model_path.exists() and any(model_path.iterdir())):
+        raise RuntimeError("Model folder not found")
+    try:
+        processor, model, device, dtype = _get_qwen_text_model(model_path)
+    except Exception as e:
+        raise
 
     messages = []
     if system_prompt:
@@ -162,6 +229,21 @@ def _generate_with_qwen_text(model_path: Path, system_prompt:str, user_prompt:st
     except Exception:
         pass
 
+    # Optional cooperative cancel
+    stopping_criteria = None
+    try:
+        if cancel_check is not None:
+            from transformers import StoppingCriteria, StoppingCriteriaList
+            class _CancelStopper(StoppingCriteria):
+                def __call__(self, input_ids, scores, **kwargs):
+                    try:
+                        return bool(cancel_check())
+                    except Exception:
+                        return False
+            stopping_criteria = StoppingCriteriaList([_CancelStopper()])
+    except Exception:
+        stopping_criteria = None
+
     import torch
     with torch.inference_mode():
         out = model.generate(
@@ -171,12 +253,47 @@ def _generate_with_qwen_text(model_path: Path, system_prompt:str, user_prompt:st
             top_p=0.9,
             max_new_tokens=int(max_new_tokens or 200),
             repetition_penalty=1.1,
-            return_dict_in_generate=True
+            return_dict_in_generate=True,
+            stopping_criteria=stopping_criteria
         )
     seq = out.sequences if hasattr(out, "sequences") else out
     new_ids = seq[:, prompt_len:]
     text = processor.batch_decode(new_ids, skip_special_tokens=True)[0].strip()
     return text
+
+# ---------- Worker (non-blocking) ----------
+class _PromptGenWorker(QObject):
+    finished = Signal(str)
+    failed = Signal(str)
+
+    def __init__(self, model_folder: Path, system_prompt: str, user_prompt: str, temperature: float, max_new_tokens: int):
+        super().__init__()
+        self._model_folder = model_folder
+        self._system_prompt = system_prompt
+        self._user_prompt = user_prompt
+        self._temperature = temperature
+        self._max_new_tokens = max_new_tokens
+        self._cancel = False
+
+    def cancel(self):
+        self._cancel = True
+
+    def run(self):
+        try:
+            result = _generate_with_qwen_text(
+                self._model_folder,
+                self._system_prompt,
+                self._user_prompt,
+                self._temperature,
+                self._max_new_tokens,
+                cancel_check=lambda: self._cancel
+            )
+            if self._cancel:
+                self.failed.emit("Cancelled")
+                return
+            self.finished.emit(result)
+        except Exception as e:
+            self.failed.emit(f"{type(e).__name__}: {e}")
 
 # ---------- UI ----------
 class PromptToolPane(QWidget):
@@ -185,6 +302,7 @@ class PromptToolPane(QWidget):
     - Saves settings to presets/setsave/prompt.json
     - Lets you choose Length, Target (image/video), and Model (Qwen2-VL engines discovered)
     - Can save outputs as .json (and .txt)
+    - Now runs generation in a background thread with Cancel support and a small model cache.
     """
     def __init__(self, main=None, parent=None):
         super().__init__(parent)
@@ -192,7 +310,15 @@ class PromptToolPane(QWidget):
         self._saving_timer = QTimer(self); self._saving_timer.setInterval(600); self._saving_timer.setSingleShot(True)
         self._saving_timer.timeout.connect(self._save_now)
 
+        self._thread: Optional[QThread] = None
+        self._worker: Optional[_PromptGenWorker] = None
+
         self.state = _load_settings()
+        # Ensure full cleanup when the widget is destroyed (prevents hidden windows / timers leaks)
+        try:
+            self.destroyed.connect(self._teardown)
+        except Exception:
+            pass
 
         root = QVBoxLayout(self); root.setContentsMargins(0,0,0,0); root.setSpacing(8)
 
@@ -226,7 +352,7 @@ class PromptToolPane(QWidget):
 
         # Style/negatives and generation params
         self.style = QLineEdit(self.state.get("style", DEFAULT_STYLE)); self.style.setPlaceholderText("Style tags (Cinematic, Photoreal, Anime)…")
-        self.neg = QLineEdit(self.state.get("negatives", DEFAULT_NEG)); self.neg.setPlaceholderText("Extra negatives")
+        self.neg = QLineEdit(self.state.get("negatives", DEFAULT_NEG)); self.neg.setPlaceholderText("Negatives (optional; leave empty if not needed)")
         self.temp = QDoubleSpinBox(); self.temp.setRange(0.0, 2.0); self.temp.setSingleStep(0.05); self.temp.setValue(float(self.state.get("temperature", 0.85)))
         self.max_new = QSpinBox(); self.max_new.setRange(64, 4096); self.max_new.setValue(int(self.state.get("max_new_tokens", 280)))
 
@@ -251,11 +377,13 @@ class PromptToolPane(QWidget):
 
         btns = QHBoxLayout()
         self.btn_gen = QPushButton("Generate")
+        self.btn_cancel = QPushButton("Cancel")
+        self.btn_cancel.setVisible(False)
         self.btn_copy = QPushButton("Copy result")
         self.btn_clear = QPushButton("Clear")
         self.btn_save_txt = QPushButton("Save .txt")
         self.btn_save_json = QPushButton("Save .json")
-        for b in (self.btn_gen, self.btn_copy, self.btn_clear, self.btn_save_txt, self.btn_save_json):
+        for b in (self.btn_gen, self.btn_cancel, self.btn_copy, self.btn_clear, self.btn_save_txt, self.btn_save_json):
             btns.addWidget(b)
         btns.addStretch(1)
         root.addLayout(btns)
@@ -270,6 +398,7 @@ class PromptToolPane(QWidget):
 
         # ---- hooks ----
         self.btn_gen.clicked.connect(self._on_generate)
+        self.btn_cancel.clicked.connect(self._on_cancel)
         self.btn_copy.clicked.connect(lambda: self._copy_to_clipboard())
         self.btn_clear.clicked.connect(lambda: self.out.clear())
         self.btn_save_txt.clicked.connect(self._save_txt)
@@ -332,12 +461,32 @@ class PromptToolPane(QWidget):
         user = (
             f"{template} "
             f"Use the style: {style}. "
-            f"Add a short negative list at the end like: 'negative: {negatives}'. "
+            f"If and only if negatives are provided, append at the end: 'negative: {negatives}'. "
             f"Seed: {seed}"
         )
         return sys, user
 
+    def _set_busy(self, busy: bool):
+        self.btn_gen.setEnabled(not busy)
+        self.btn_cancel.setVisible(busy)
+        self.btn_copy.setEnabled(not busy)
+        self.btn_clear.setEnabled(not busy)
+        self.btn_save_txt.setEnabled(not busy)
+        self.btn_save_json.setEnabled(not busy)
+        self.combo_model.setEnabled(not busy)
+        self.combo_target.setEnabled(not busy)
+        self.combo_len.setEnabled(not busy)
+        self.style.setEnabled(not busy)
+        self.neg.setEnabled(not busy)
+        self.temp.setEnabled(not busy)
+        self.max_new.setEnabled(not busy)
+        self.seed.setEnabled(not busy)
+        self.btn_gen.setText("Generating…" if busy else "Generate")
+
     def _on_generate(self):
+        if self._thread is not None:
+            # already running
+            return
         seed = (self.seed.toPlainText() or "").strip()
         if not seed:
             QMessageBox.warning(self, "Prompt", "Please enter a seed (e.g., 'a cat').")
@@ -350,20 +499,69 @@ class PromptToolPane(QWidget):
             models = _list_qwen_vl_models()
             if models:
                 folder = _folder_for_model_key(models[0][0])
-        try:
-            if folder is None:
-                raise RuntimeError("No Qwen2-VL model available")
-            out = _generate_with_qwen_text(folder, sys, usr, float(self.temp.value()), int(self.max_new.value()))
-        except Exception as e:
-            err = f"{type(e).__name__}: {e}"
-            try:
-                QMessageBox.critical(self, "Prompt generator error", err + "\n\nFalling back to local expand.")
-            except Exception:
-                pass
+        if folder is None:
+            # No model available — produce local expand quickly
             style = self.style.text().strip() or DEFAULT_STYLE
-            out = f"{seed.strip().capitalize()} in {style}; rich lighting, camera details, textures, mood, palette; negative: {self.neg.text().strip() or DEFAULT_NEG}."
+            neg = (self.neg.text().strip() or DEFAULT_NEG)
+            tail = (f" negative: {neg}." if neg else "")
+            out = f"{seed.strip().capitalize()}" + (f" in {style};" if style else ";") + " rich lighting, camera details, textures, mood, palette." + (tail or "")
+            self.out.setPlainText(str(out).strip())
+            return
+
+        # Spin up background worker
+        self._thread = QThread(self)
+        self._worker = _PromptGenWorker(folder, sys, usr, float(self.temp.value()), int(self.max_new.value()))
+        self._worker.moveToThread(self._thread)
+        self._thread.started.connect(self._worker.run)
+        self._worker.finished.connect(self._on_worker_finished)
+        self._worker.failed.connect(self._on_worker_failed)
+        # Ensure cleanup
+        self._worker.finished.connect(self._cleanup_worker)
+        self._worker.failed.connect(self._cleanup_worker)
+
+        self._set_busy(True)
+        self._thread.start()
+
+    def _on_worker_finished(self, text: str):
+        self.out.setPlainText(str(text).strip())
+        self._schedule_save()
+
+    def _on_worker_failed(self, err: str):
+        try:
+            QMessageBox.critical(self, "Prompt generator", f"{err}\n\nFalling back to local expand.")
+        except Exception:
+            pass
+        seed = (self.seed.toPlainText() or "").strip()
+        style = self.style.text().strip() or DEFAULT_STYLE
+        neg = (self.neg.text().strip() or DEFAULT_NEG)
+        tail = (f" negative: {neg}." if neg else "")
+        out = f"{seed.strip().capitalize()}" + (f" in {style};" if style else ";") + " rich lighting, camera details, textures, mood, palette." + (tail or "")
         self.out.setPlainText(str(out).strip())
         self._schedule_save()
+
+    def _cleanup_worker(self):
+        # Reset busy UI and teardown thread/worker
+        self._set_busy(False)
+        try:
+            if self._worker is not None:
+                self._worker.deleteLater()
+        except Exception:
+            pass
+        try:
+            if self._thread is not None:
+                self._thread.quit()
+                self._thread.wait(2000)
+                self._thread.deleteLater()
+        except Exception:
+            pass
+        self._thread = None
+        self._worker = None
+
+    def _on_cancel(self):
+        if self._worker is not None:
+            self._worker.cancel()
+            self.btn_cancel.setEnabled(False)
+            self.btn_gen.setText("Cancelling…")
 
     def _copy_to_clipboard(self):
         try:
@@ -408,6 +606,36 @@ class PromptToolPane(QWidget):
             Path(fn).write_text(json.dumps(meta, indent=2, ensure_ascii=False), encoding="utf-8")
         except Exception as e:
             QMessageBox.critical(self, "Save .json", f"Failed: {e}")
+
+    def _teardown(self, *args, **kwargs):
+        # Stop debounce timer
+        try:
+            self._saving_timer.stop()
+        except Exception:
+            pass
+        # Cancel running worker (if any)
+        try:
+            if self._worker is not None:
+                self._worker.cancel()
+        except Exception:
+            pass
+        # Ensure background thread is fully terminated
+        try:
+            if self._thread is not None:
+                try:
+                    self._thread.quit()
+                except Exception:
+                    pass
+                self._thread.wait(2000)
+                try:
+                    self._thread.terminate()  # last resort on Windows to avoid leaked hidden msg windows
+                except Exception:
+                    pass
+        except Exception:
+            pass
+        # Clear refs
+        self._thread = None
+        self._worker = None
 
 
 def install_prompt_tool(owner, section_widget):

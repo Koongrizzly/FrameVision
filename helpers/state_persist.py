@@ -79,6 +79,13 @@ def _name(w: QWidget, fallback_prefix: str) -> str:
 def restore_all(root: QWidget) -> None:
     if not _keep_enabled():
         return
+    # One-time wiring guard: prevents re-connecting signals if restore_all is called multiple times
+    try:
+        if bool(root.property('_sp_wired')):
+            return
+        root.setProperty('_sp_wired', True)
+    except Exception:
+        pass
     s = _qs()
 
     # Main window geometry/state (with optional forced mode)
@@ -112,10 +119,12 @@ def restore_all(root: QWidget) -> None:
             idx = s.value(key, None, type=int)
             if idx is not None and 0 <= idx < tabw.count():
                 tabw.setCurrentIndex(idx)
-            def _on_tab_changed(i, _key=key):
-                qs = _qs()
-                qs.setValue(_key, int(i))
-                qs.sync()
+            def _on_tab_changed(i, _key=key, _s=s):
+                try:
+                    _s.setValue(_key, int(i))
+                    _s.sync()
+                except Exception:
+                    pass
             tabw.currentChanged.connect(_on_tab_changed)
         except Exception:
             pass
@@ -127,11 +136,10 @@ def restore_all(root: QWidget) -> None:
             ba = s.value(key, None)
             if isinstance(ba, QByteArray):
                 spl.restoreState(ba)
-            def _on_splitter_moved(*_args, _spl=spl, _key=key):
-                qs = _qs()
+            def _on_splitter_moved(*_args, _spl=spl, _key=key, _s=s):
                 try:
-                    qs.setValue(_key, _spl.saveState())
-                    qs.sync()
+                    _s.setValue(_key, _spl.saveState())
+                    _s.sync()
                 except Exception:
                     pass
             spl.splitterMoved.connect(_on_splitter_moved)
@@ -146,10 +154,12 @@ def restore_all(root: QWidget) -> None:
                 val = s.value(key, None, type=bool)
                 if val is not None:
                     gb.setChecked(bool(val))
-                def _on_gb_toggled(v, _key=key):
-                    qs = _qs()
-                    qs.setValue(_key, bool(v))
-                    qs.sync()
+                def _on_gb_toggled(v, _key=key, _s=s):
+                    try:
+                        _s.setValue(_key, bool(v))
+                        _s.sync()
+                    except Exception:
+                        pass
                 gb.toggled.connect(_on_gb_toggled)
         except Exception:
             pass

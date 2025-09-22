@@ -1,14 +1,14 @@
-# helpers/diagnostics.py — post-start dump + hard QPainter suppress
+# helpers/diagnostics.py — diagnostics with timer/handle probe (drop-in)
 from __future__ import annotations
-import os, sys, time, platform, subprocess, json
-from typing import Optional
+import os, sys, time, platform, subprocess, json, threading, traceback, weakref, ctypes
+from typing import Optional, Dict
 from PySide6 import QtCore
 from PySide6.QtCore import QSettings, QTimer, Qt
 from PySide6.QtWidgets import QApplication
 
 APP_ORG = "FrameVision"; APP_NAME = "FrameVision"
 LOG_DIR = os.path.join(os.getcwd(), "logs")
-LOG_FILE = os.path.join(LOG_DIR, "framevision.log")
+LOG_FILE = os.path.join(LOG_DIR, "framevision.log")  # keep existing path for compatibility
 
 # ----------------- logging core -----------------
 def _ensure_logfile() -> None:
@@ -44,36 +44,132 @@ def log(*args) -> None:
         with open(LOG_FILE, "a", encoding="utf-8") as f: f.write(line + "\n")
     except Exception: pass
 
-# ----------------- Qt message hook (install ASAP, fully suppress QPainter) -----------------
+# ----------------- Windows handle helpers -----------------
+try:
+    _user32 = ctypes.windll.user32
+    _kernel32 = ctypes.windll.kernel32
+    _GetGuiResources = _user32.GetGuiResources
+    _GetCurrentProcess = _kernel32.GetCurrentProcess
+    def _get_handle_counts():
+        h = _GetCurrentProcess()
+        gdi = int(_GetGuiResources(h, 0))  # 0=GDI
+        usr = int(_GetGuiResources(h, 1))  # 1=USER
+        return gdi, usr
+except Exception:
+    def _get_handle_counts():
+        return -1, -1
+
+# ----------------- timer guard (optional) -----------------
+_GUARD_INSTALLED = False
+_LIVE_TIMERS = weakref.WeakSet()
+_TIMER_ORIGINS: Dict[int, str] = {}
+_TIMER_LOCK = threading.Lock()
+
+def _origin_from_stack()->str:
+    try:
+        for fr in traceback.extract_stack(limit=80)[:-2]:
+            fn = str(fr.filename).replace("\\", "/")
+            if "PySide6" in fn or "site-packages" in fn:
+                continue
+            return f"{fr.filename}:{fr.lineno} in {fr.name}"
+    except Exception:
+        pass
+    return "<unknown origin>"
+
+def _install_timer_guard(threshold:int=4000):
+    global _GUARD_INSTALLED
+    if _GUARD_INSTALLED:
+        return
+    QTimerCls = QtCore.QTimer
+    orig_init = QTimerCls.__init__
+
+    def wrapped_init(self, *a, **kw):
+        orig_init(self, *a, **kw)
+        try:
+            with _TIMER_LOCK:
+                _LIVE_TIMERS.add(self)
+                _TIMER_ORIGINS[id(self)] = _origin_from_stack()
+                n = len(_LIVE_TIMERS)
+                if n % 500 == 0 or n > threshold:
+                    counts: Dict[str,int] = {}
+                    for t in list(_LIVE_TIMERS):
+                        o = _TIMER_ORIGINS.get(id(t), "?")
+                        counts[o] = counts.get(o, 0) + 1
+                    top = sorted(counts.items(), key=lambda x: x[1], reverse=True)[:5]
+                    log(f"[timer_guard] Live QTimers={n}  top={top}")
+        except Exception as e:
+            log("[timer_guard] wrap error:", e)
+
+    QTimerCls.__init__ = wrapped_init  # type: ignore[assignment]
+    _GUARD_INSTALLED = True
+    log(f"[timer_guard] Installed; threshold={threshold}")
+
+# ----------------- handle logger (optional; no Qt timers used) -----------------
+_HANDLE_THREAD = None
+_HANDLE_STOP = threading.Event()
+
+def _handle_loop(period_ms:int):
+    while not _HANDLE_STOP.is_set():
+        g,u = _get_handle_counts()
+        log(f"[handles] GDI={g} USER={u}")
+        _HANDLE_STOP.wait(max(0.2, period_ms/1000.0))
+
+def _start_handle_logger(period_ms:int=1000):
+    global _HANDLE_THREAD
+    if _HANDLE_THREAD and _HANDLE_THREAD.is_alive():
+        return
+    _HANDLE_THREAD = threading.Thread(target=_handle_loop, name="fv_handle_logger", args=(period_ms,), daemon=True)
+    _HANDLE_THREAD.start()
+    log(f"[handles] logger started @{period_ms}ms")
+
+# ----------------- Qt message hook (stack dump on registerTimer; suppress QPainter spam) -----------------
 _prev_qt_handler = None
 _logged_qpainter_once = False
 def _qt_message_handler(mode, context, message):
     try: m = str(message)
     except Exception: m = message
+
+    # Suppress noisy QPainter spew entirely (configurable to log once)
     if isinstance(m, str) and "QPainter::" in m:
-        # fallthrough handled below
-        pass
-        # Fully suppress. If ever needed, set diagnostics_log_qpainter=true to log first occurrence only.
         try:
             s = QSettings(APP_ORG, APP_NAME)
-            if (str(s.value("diagnostics_log_qpainter","false")).lower() in ("1","true","yes","on")):
+            if str(s.value("diagnostics_log_qpainter","false")).lower() in ("1","true","yes","on"):
                 global _logged_qpainter_once
                 if not _logged_qpainter_once:
-                    log(f"Qt(QPainter suppressed): {m}"); _logged_qpainter_once = True
+                    log(f"Qt(QPainter suppressed): {m}")
+                    _logged_qpainter_once = True
         except Exception: pass
         return
-    # Suppress a couple of known-harmless messages
+
+    # Suppress specific harmless messages
     try:
         if isinstance(m, str):
             if "Could not parse stylesheet of object" in m and "FvSettingsContent" in m:
                 return
             if "QObject::startTimer: Timers can only be used with threads started with QThread" in m:
                 return
-        
-        if _prev_qt_handler is not None: _prev_qt_handler(mode, context, message)
-        else: print(m)
-    except Exception: pass
+    except Exception:
+        pass
 
+    # Mirror to previous handler/stdout for normal flow
+    try:
+        if _prev_qt_handler is not None: _prev_qt_handler(mode, context, message)
+        else: 
+            try: print(m)
+            except Exception: pass
+    except Exception:
+        pass
+
+    # When timer creation fails, dump stack + handle counts
+    try:
+        if isinstance(m, str) and ("registerTimer" in m or "Failed to create a timer" in m):
+            stack = "".join(traceback.format_stack(limit=80))
+            gdi, usr = _get_handle_counts()
+            log(f"[QtTimer] registerTimer warning; USER={usr} GDI={gdi}\n{stack}\n{'-'*70}")
+    except Exception as e:
+        log("registerTimer diagnostic failed:", e)
+
+# Install the message handler ASAP (module import time), but it's cheap
 try:
     _prev_qt_handler = QtCore.qInstallMessageHandler(_qt_message_handler)
 except Exception:
@@ -131,10 +227,24 @@ def log_ffmpeg() -> None:
     except FileNotFoundError: log("ffmpeg: not found on PATH")
     except Exception as e: log("ffmpeg: error probing:", e)
 
-# ----------------- installer (post-start dumps) -----------------
+# ----------------- installer (post-start dumps + optional probes) -----------------
+def _flag_true(x) -> bool:
+    return str(x).lower() in ("1","true","yes","on")
+
 def install_all(main_window=None) -> None:
     try:
-        # Delay all visible dumps to avoid flashing the console before intro appears
+        # Optional probes (controlled by env or QSettings)
+        s = QSettings(APP_ORG, APP_NAME)
+        want_guard = _flag_true(os.environ.get("PROBE_QT_TIMERS", "0")) or _flag_true(s.value("diagnostics_timer_guard","false"))
+        want_handles = _flag_true(os.environ.get("PROBE_QT_HANDLES", "0")) or _flag_true(s.value("diagnostics_handle_log","false"))
+        thr = int(os.environ.get("PROBE_QT_TIMERS_THRESHOLD", s.value("diagnostics_probe_threshold", 4000)))
+        period = int(os.environ.get("PROBE_QT_HANDLES_MS", s.value("diagnostics_handle_log_ms", 1000)))
+        if want_guard:
+            _install_timer_guard(threshold=thr)
+        if want_handles:
+            _start_handle_logger(period)
+
+        # Delay dumps a bit to avoid flashing intro
         QTimer.singleShot(1500, log_environment)
         QTimer.singleShot(2000, log_packages)
         QTimer.singleShot(2300, log_ffmpeg)
@@ -143,6 +253,7 @@ def install_all(main_window=None) -> None:
     except Exception as e:
         log("Diagnostics install failed:", e)
 
+# Kick installer once after import
 try:
     QTimer.singleShot(300, install_all)
 except Exception:

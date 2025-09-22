@@ -58,6 +58,42 @@ class JobRowWidget(QWidget):
     playRequested = Signal(str)
     openRequested = Signal(str)
 
+    
+    def _notify_recent(self, p) -> None:
+        # Best-effort: find any widget exposing _add_recent and call it.
+        try:
+            from pathlib import Path as _P
+            from PySide6.QtWidgets import QApplication
+            path = _P(p) if p else None
+            if not path or not path.exists():
+                return
+            app = QApplication.instance()
+            if not app:
+                return
+            for w in app.allWidgets():
+                try:
+                    fn = getattr(w, "_add_recent", None)
+                    if callable(fn):
+                        fn(path)
+                        return
+                except Exception:
+                    continue
+        except Exception:
+            pass
+
+    def _maybe_notify_recent_initial(self) -> None:
+        # If this row is already 'done' when created, push it to Recents once.
+        try:
+            if getattr(self, "_recent_notified", False):
+                return
+            status = (self._status_from_fs() or self.status).lower()
+            if status == "done":
+                p = self._resolve_output_file()
+                if p and p.exists():
+                    self._notify_recent(p)
+                    self._recent_notified = True
+        except Exception:
+            pass
     def __init__(self, job_path: Path, status: str, parent: Optional[QWidget] = None):
         super().__init__(parent)
         self.setObjectName("JobRowWidget")

@@ -1,14 +1,7 @@
 from __future__ import annotations
 
-# === QImageIO maxalloc disabled by patch ===
-import os as _qt_img_os
-_qt_img_os.environ["QT_IMAGEIO_MAXALLOC"] = "0"  # Disable env-based cap (0 = no limit)
-try:
-    from PySide6.QtGui import QImageReader as _QIR
-    _QIR.setAllocationLimit(0)  # Disable runtime cap as well
-except Exception as _e:
-    pass
-# === end patch ===
+# (safeguard) Using Qt's default image allocation caps to avoid exhausting memory.
+
 
 # --- Quiet mode: suppress harmless logs/warnings for end users ---
 import os, warnings
@@ -64,7 +57,8 @@ def _safe_snap_size(w:int, h:int, presets=None):
     try:
         presets = presets or [
             # 1:1
-            (320,320),(480,480),(640,640),(960,960),(1024,1024),
+            (320,320),(480,480),(640,640),(960,960),(1024,1024),(1440,1440),
+
             # 16:9 landscape
             (854,480),(1280,720),(1536,864),(1920,1080),(2560,1440),
             # 9:16 portrait
@@ -73,9 +67,21 @@ def _safe_snap_size(w:int, h:int, presets=None):
             (1136,640),(640,1136),
             # Cinematic + their portrait
             (1280,544),(544,1280),
-            # 4:3 and 3:4
-            (1104,832),(832,1104)
-        ]# round to multiples of 64
+
+            # 4:3 landscape
+            (640,480),(800,600),(1024,768),
+            # 3:4 portrait
+            (480,640),(600,800),(768,1024),
+
+            # 3:2 & 2:3
+            (1152,768),(1536,1024),(768,1152),(1024,1536),
+
+            # 7:9 & 9:7
+            (1152,896),(896,1152),
+
+            # Existing UI sizes seen in project
+            (1104,832),(832,1104),
+        ]
         def r64(x):
             return max(256, int(round(x/64))*64)
         w64, h64 = r64(w), r64(h)
@@ -312,6 +318,17 @@ class Txt2ImgPane(QWidget):
             pass  # default removed; will restore via UI
         self.preset_combo.addItems(["Street Photography","Fantasy Realism","Cinematic / Moody","Product / Clean","Landscape / Golden Hour","Neon Cyberpunk","Anime Clean","Isometric 3D","Macro / Shallow DOF","Illustration / Watercolor","Realistic Portrait Pro","Outdoor Documentary","Food Styling / Clean","Architectural Interior","Fashion Illustration","Portrait / Soft"])
         self.preset_combo.setCurrentIndex(0)
+
+        # Added custom film/era/3D plush presets (SDXL-oriented)
+        self.preset_combo.addItems([
+            "Old Film (B&W)",
+            "Old Film (Sepia/Vintage Color)",
+            "1960s Style",
+            "1980s Style",
+            "Feature Animation (3D)",
+            "Fluffy / Plush Dreamy"
+        ])
+
         try:
             self.preset_combo.currentTextChanged.connect(self._apply_preset)
         except Exception:
@@ -447,7 +464,61 @@ class Txt2ImgPane(QWidget):
             "Fantasy Realism": {"sampler":"Euler a","steps":32,"cfg":6.5,"size":(1024,1024),
                                 "neg":"cartoonish, low-detail"},
             "Street Photography": {"sampler":"Heun","steps":30,"cfg":5.0,"size":(1152,768),
-                                   "neg":"motion smear, excessive noise"}
+                                   "neg":"motion smear, excessive noise"}                                       , "Old Film (B&W)": {
+                                           "sampler": "DPM++ 2M (Karras)",
+                                           "steps": 32,
+                                           "cfg": 5.7,
+                                           "size": (1104, 832),
+                                           "neg": "color, neon tones, HDR, oversharpened, CGI, modern digital look",
+                                           "prompt_add": "black-and-white, 1950s film photo, silver-gelatin print, deep shadows, pronounced film grain, soft halation, subtle vignette, classic lens rendering",
+                                           "force_neg_append": True
+                                       },
+                                       "Old Film (Sepia/Vintage Color)": {
+                                           "sampler": "DPM++ 2M (Karras)",
+                                           "steps": 32,
+                                           "cfg": 5.7,
+                                           "size": (1104, 832),
+                                           "neg": "neon tones, HDR, oversharpened, CGI, modern digital look",
+                                           "prompt_add": "faded sepia, aged print, muted vintage colors, slight color shift, soft halation, subtle vignette, classic lens rendering",
+                                           "force_neg_append": True
+                                       },
+                                       "1960s Style": {
+                                           "sampler": "DPM++ 2M (Karras)",
+                                           "steps": 30,
+                                           "cfg": 5.5,
+                                           "size": (1536, 864),
+                                           "neg": "washed-out faces, neon cyberpunk, heavy bloom, modern cinematic teal-and-orange, CGI",
+                                           "prompt_add": "1960s retro color photo, Kodachrome-inspired palette, soft halation, gentle film grain, pastel primaries, period styling, natural skin tones, slight vignette, studio flash bounce",
+                                           "force_neg_append": True
+                                       },
+                                       "1980s Style": {
+                                           "sampler": "DPM++ 2M (Karras)",
+                                           "steps": 34,
+                                           "cfg": 6.0,
+                                           "size": (1280, 720),
+                                           "neg": "washed colors, muddy blacks, modern flat grading, gritty realism",
+                                           "prompt_add": "1980s retro aesthetic, neon glow, chrome accents, magenta-cyan palette, soft bloom, light film grain, subtle VHS scanlines, grid horizon, lens flare highlights, slight chromatic aberration",
+                                           "force_neg_append": True
+                                       },
+                                       "Feature Animation (3D)": {
+                                           "sampler": "DPM++ 2M (Karras)",
+                                           "steps": 30,
+                                           "cfg": 5.5,
+                                           "size": (1024, 1024),
+                                           "neg": "photorealistic pores, gritty realism, harsh noise, grim mood, over-textured skin",
+                                           "prompt_add": "stylized 3D character render, expressive large eyes, soft global illumination, subsurface scattering, smooth plasticine textures, soft rim light, shallow depth of field, bright friendly palette, clean topology",
+                                           "force_neg_append": True
+                                       },
+                                       "Fluffy / Plush Dreamy": {
+                                           "sampler": "DPM++ 2M (Karras)",
+                                           "steps": 36,
+                                           "cfg": 5.5,
+                                           "size": (1024, 1536),
+                                           "neg": "hard specular highlights, gritty sharpness, harsh shadows, wet/glossy fur",
+                                           "prompt_add": "soft plush texture, velvety fur fibers, dreamy pastel palette, creamy bokeh, gentle bloom, airy lighting, cozy mood, soft focus falloff",
+                                           "force_neg_append": True
+                                       }
+
         }
         cfg = presets.get(name)
         if not cfg:
@@ -477,6 +548,27 @@ class Txt2ImgPane(QWidget):
                 self.negative.setPlainText(cfg["neg"])
         except Exception:
             pass
+            try:
+                add = cfg.get("prompt_add")
+                if add:
+                    cur = (self.prompt.toPlainText() or "").strip()
+                    if cur:
+                        if add.lower() not in cur.lower():
+                            sep = ", " if not cur.endswith((",", " ")) else ""
+                            self.prompt.setPlainText(cur + sep + add)
+                    else:
+                        self.prompt.setPlainText(add)
+            except Exception:
+                pass
+            try:
+                if cfg.get("force_neg_append"):
+                    neg_add = cfg.get("neg") or ""
+                    curneg = (self.negative.toPlainText() or "").strip()
+                    if neg_add and neg_add.lower() not in curneg.lower():
+                        sep = ", " if curneg and not curneg.endswith((",", " ")) else ""
+                        self.negative.setPlainText((curneg + sep + neg_add).strip(", ").strip())
+            except Exception:
+                pass
     def _build_ui(self):
         outer = QVBoxLayout(self)
         outer.setContentsMargins(10,10,10,10)
@@ -493,6 +585,7 @@ class Txt2ImgPane(QWidget):
         top = QHBoxLayout()
         self.preset_combo = QComboBox()
         self.style_builder_btn = QPushButton("Style Builder")
+        self.style_builder_btn.hide()
         top.addWidget(QLabel("Preset:"))
         top.addWidget(self.preset_combo, 1)
         top.addWidget(self.style_builder_btn, 0)
@@ -528,6 +621,7 @@ class Txt2ImgPane(QWidget):
             ("768x768 (1:1)", 768, 768),
             ("960x960 (1:1)", 960, 960),
             ("1024x1024 (1:1)", 1024, 1024),
+            ("1440x1440 (1:1)", 1440, 1440),
             # 16:9
             ("854x480 (16:9)", 854, 480),
             ("1280x720 (16:9)", 1280, 720),
@@ -540,13 +634,31 @@ class Txt2ImgPane(QWidget):
             ("864x1536 (9:16)", 864, 1536),
             ("1080x1920 (9:16)", 1080, 1920),
             ("1440x2560 (9:16)", 1440, 2560),
-            # Alt 640p-ish
+            
+            # 3:2 & 2:3
+
+("1152x768 (3:2)", 1152, 768),
+("1536x1024 (3:2)", 1536, 1024),
+("768x1152 (2:3)", 768, 1152),
+("1024x1536 (2:3)", 1024, 1536),
+# Alt 640p-ish
             ("1136x640 (16:9)", 1136, 640),
             ("640x1136 (9:16)", 640, 1136),
             # 21:9 and 9:21
             ("1280x544 (21:9)", 1280, 544),
             ("544x1280 (9:21)", 544, 1280),
             # 4:3
+
+# 7:9 & 9:7
+("1152x896 (7:9)", 1152, 896),
+("896x1152 (9:7)", 896, 1152),
+
+("640x480 (4:3)", 640, 480),
+("800x600 (4:3)", 800, 600),
+("1024x768 (4:3)", 1024, 768),
+("480x640 (3:4)", 480, 640),
+("600x800 (3:4)", 600, 800),
+("768x1024 (3:4)", 768, 1024),
             ("1104x832 (4:3)", 1104, 832),
             ("832x1104 (3:4)", 832, 1104),
         ]
@@ -595,8 +707,46 @@ class Txt2ImgPane(QWidget):
             aspect = w0 / h0 if h0 else 1.0
             new_w = max(256, int(round(v * aspect / 64) * 64))
             self.size_manual_w.blockSignals(True); self.size_manual_w.setValue(new_w); self.size_manual_w.blockSignals(False)
+        
+        def _pick_preset_index_for(w:int, h:int) -> int:
+            """Return index in size_combo for exact (w,h) match if present;
+            otherwise pick nearest by aspect+area using _safe_snap_size."""
+            try:
+                # Try exact match first
+                for i in range(self.size_combo.count()):
+                    data = self.size_combo.itemData(i)
+                    if data and int(data[0]) == int(w) and int(data[1]) == int(h):
+                        return i
+                # Fallback: nearest preset
+                pw, ph = _safe_snap_size(w, h)
+                for i in range(self.size_combo.count()):
+                    data = self.size_combo.itemData(i)
+                    if data and data[0] == pw and data[1] == ph:
+                        return i
+            except Exception:
+                pass
+            return max(0, self.size_combo.currentIndex())
+        def _sync_combo_from_manual():
+            try:
+                w = int(self.size_manual_w.value())
+                h = int(self.size_manual_h.value())
+                # Choose matching preset
+                idx = _pick_preset_index_for(w, h)
+                if 0 <= idx < self.size_combo.count() and idx != self.size_combo.currentIndex():
+                    self.size_combo.blockSignals(True)
+                    self.size_combo.setCurrentIndex(idx)
+                    self.size_combo.blockSignals(False)
+            except Exception:
+                pass
         self.size_manual_w.valueChanged.connect(_sync_manual_w)
         self.size_manual_h.valueChanged.connect(_sync_manual_h)
+        self.size_manual_h.valueChanged.connect(_sync_manual_h)
+        self.size_manual_w.valueChanged.connect(lambda _v: _sync_combo_from_manual())
+        self.size_manual_h.valueChanged.connect(lambda _v: _sync_combo_from_manual())
+        self.size_manual_h.valueChanged.connect(lambda _v: _sync_combo_from_manual())
+        self.size_manual_w.valueChanged.connect(lambda _v: _sync_combo_from_manual())
+        self.size_manual_h.valueChanged.connect(lambda _v: _sync_combo_from_manual())
+
         size_row.addWidget(self.size_combo, 2)
         size_row.addWidget(QLabel("W:"), 0)
         size_row.addWidget(self.size_manual_w, 0)
@@ -646,6 +796,7 @@ class Txt2ImgPane(QWidget):
         self.browse_btn = QPushButton("Browse…"); self.browse_btn.clicked.connect(self._on_browse)
         self.show_in_player = QCheckBox("Show in Player")
         self.use_queue = QCheckBox("Use queue (Add/Run)")
+        self.use_queue.hide()
         out_row.addWidget(QLabel("Output:")); out_row.addWidget(self.output_path, 1); out_row.addWidget(self.browse_btn)
         out_row.addWidget(self.show_in_player); out_row.addWidget(self.use_queue)
         form.addRow(out_row)
@@ -653,7 +804,8 @@ class Txt2ImgPane(QWidget):
         # VRAM profile override
         vram_row = QHBoxLayout()
         self.vram_profile = QComboBox(); self.vram_profile.addItems(["Auto", "6 GB", "8 GB", "12 GB", "24 GB"])
-        self.restore_auto = QPushButton("Restore Auto"); self.restore_auto.clicked.connect(lambda: self.vram_profile.setCurrentIndex(0))
+        self.restore_auto = QPushButton("Restore Auto")
+        self.restore_auto.hide(); self.restore_auto.clicked.connect(lambda: self.vram_profile.setCurrentIndex(0))
         vram_row.addWidget(QLabel("VRAM profile:")); vram_row.addWidget(self.vram_profile); vram_row.addWidget(self.restore_auto)
         form.addRow(vram_row)
         # Ensure hidden CLI fields exist before persistence restore
@@ -928,6 +1080,7 @@ class Txt2ImgPane(QWidget):
         btns = QHBoxLayout()
         self.add_to_queue = QPushButton("Add to Queue")
         self.add_and_run = QPushButton("Add & Run")
+        self.add_and_run.hide()
         self.generate_now = QPushButton("Generate")
         btns.addWidget(self.add_to_queue)
         btns.addWidget(self.add_and_run)
@@ -1282,12 +1435,32 @@ class Txt2ImgPane(QWidget):
 
         self.status.setText("Generating…")
         self.progress.setValue(0)
+        steps = int(job.get("steps", 30)); batch = int(job.get("batch", 1))
+        total_steps = max(1, steps * batch)
+        try:
+            self.progress.setRange(0, total_steps)
+            self.progress.setValue(0)
+            self.progress.setTextVisible(True)
+            self.progress.setFormat("%v / %m steps (%p%)")
+        except Exception:
+            pass
         cancel_flag = threading.Event()
 
         def progress_cb(p):
             try:
-                val = int(p*100) if isinstance(p, (float,)) and p <= 1.0 else int(p)
-                self.progress.setValue(max(0, min(100, val)))
+                # Accept dict step updates or numeric fraction/percent
+                if isinstance(p, dict) and "step" in p:
+                    tot = int(p.get("total") or total_steps)
+                    cur = int(p.get("step") or 0)
+                    if self.progress.maximum() != tot:
+                        self.progress.setRange(0, tot)
+                    self.progress.setValue(max(0, min(tot, cur)))
+                else:
+                    if isinstance(p, (float,)) and p <= 1.0:
+                        cur = int(round(p * total_steps))
+                    else:
+                        cur = int(round((float(p)/100.0) * total_steps))
+                    self.progress.setValue(max(0, min(total_steps, cur)))
             except Exception:
                 pass
 
@@ -1306,25 +1479,34 @@ class Txt2ImgPane(QWidget):
         threading.Thread(target=worker, daemon=True).start()
 
 def _draw_text_image(text: str, size=(1024,1024), seed: int = 0) -> QImage:
-    """CPU fallback placeholder: checkerboard + centered prompt text."""
+    """CPU fallback placeholder: checkerboard + centered prompt text (exception-safe)."""
     w, h = size
+    if w <= 0 or h <= 0:
+        w, h = 1024, 1024
     img = QImage(w, h, QImage.Format_RGB32)
-    p = QPainter(img)
-    tile = 32
-    for y in range(0, h, tile):
-        for x in range(0, w, tile):
-            color = Qt.lightGray if ((x//tile + y//tile) % 2) else Qt.gray
-            p.fillRect(x, y, tile, tile, color)
-    p.setRenderHint(QPainter.Antialiasing, True)
-    rect = QRect(40, 40, w-80, h-80) if 'QRect' in globals() else None
+    p = QPainter()
     try:
-        from PySide6.QtCore import QRect as _QRect
-        rect = _QRect(40, 40, w-80, h-80)
-        font = p.font(); font.setPointSize(22); font.setBold(True); p.setFont(font)
-        p.setPen(Qt.white); p.drawText(rect, Qt.AlignCenter | Qt.TextWordWrap, text or "No prompt")
-    except Exception:
-        pass
-    p.end()
+        if not p.begin(img):
+            return img
+        tile = 32
+        for y in range(0, h, tile):
+            for x in range(0, w, tile):
+                color = Qt.lightGray if ((x//tile + y//tile) % 2) else Qt.gray
+                p.fillRect(x, y, tile, tile, color)
+        p.setRenderHint(QPainter.Antialiasing, True)
+        try:
+            from PySide6.QtCore import QRect as _QRect
+            rect = _QRect(40, 40, max(1, w-80), max(1, h-80))
+            font = p.font(); font.setPointSize(22); font.setBold(True); p.setFont(font)
+            p.setPen(Qt.white)
+            p.drawText(rect, Qt.AlignCenter | Qt.TextWordWrap, text or "No prompt")
+        except Exception:
+            pass
+    finally:
+        try:
+            p.end()
+        except Exception:
+            pass
     return img
 
 
@@ -1374,6 +1556,10 @@ def _gen_via_diffusers(job: dict, out_dir: Path, progress_cb=None):
     batch    = int(job.get("batch", 1))
     width    = int(job.get("width", 1024))
     height   = int(job.get("height", 1024))
+    try:
+        width, height = _safe_snap_size(width, height)
+    except Exception:
+        pass
 
     try:
         # Load single-file SD1.5 checkpoint
@@ -1388,8 +1574,52 @@ def _gen_via_diffusers(job: dict, out_dir: Path, progress_cb=None):
         else:
             pipe = StableDiffusionPipeline.from_single_file(model_path, torch_dtype=dtype, local_files_only=True)
         pipe = pipe.to(device)
+        try:
+            if hasattr(pipe, 'enable_xformers_memory_efficient_attention'):
+                pipe.enable_xformers_memory_efficient_attention()
+        except Exception:
+            pass
 
-        
+        # Memory-friendly toggles (configurable: FV_LOW_MEM=on/off/auto). Auto = enable on low VRAM or large sizes.
+        try:
+            import os
+            _env = (os.environ.get("FV_LOW_MEM", "off") or "auto").strip().lower()
+        except Exception:
+            _env = "auto"
+        _enable_low_mem = None
+        if _env in ("0","off","no","false"):
+            _enable_low_mem = False
+        elif _env in ("1","on","yes","true"):
+            _enable_low_mem = True
+        if _enable_low_mem is None:
+            _enable_low_mem = True
+            try:
+                if device == "cuda":
+                    import torch as _torch
+                    props = _torch.cuda.get_device_properties(0)
+                    _vram = int(getattr(props, "total_memory", 0) or 0)
+                    # Heuristic: if plenty of VRAM (>=10GB) and target <= 1024x1024, skip low-mem for speed.
+                    if _vram >= 10_000_000_000 and (width * height) <= (1024 * 1024):
+                        _enable_low_mem = False
+            except Exception:
+                pass
+        if _enable_low_mem:
+            try:
+                pipe.enable_attention_slicing()
+            except Exception:
+                pass
+            try:
+                if hasattr(pipe, "enable_sequential_cpu_offload"):
+                    pipe.enable_sequential_cpu_offload()
+            except Exception:
+                pass
+            try:
+                if hasattr(pipe, "enable_vae_slicing"):
+                    pipe.enable_vae_slicing()
+            except Exception:
+                pass
+
+        # Optionally load up to two LoRAs
         # Optionally load up to two LoRAs for SDXL (from UI slots 1 & 2)
         try:
             lora1 = str(job.get("lora_path") or "").strip()
@@ -1485,15 +1715,31 @@ def _gen_via_diffusers(job: dict, out_dir: Path, progress_cb=None):
             gen = gen.manual_seed(seed)
 
         files = []
+        
         for i in range(batch):
-            if progress_cb: progress_cb(i / max(1, batch))
+            # Initialize step progress at the start of each image
+            try:
+                if progress_cb:
+                    progress_cb({"step": i * max(1, steps), "total": max(1, steps*batch)})
+            except Exception:
+                pass
+            _cb = None
+            if progress_cb:
+                def _cb(step, timestep, latents, _i=i, _steps=steps, _batch=batch):
+                    try:
+                        base = _i * max(1, _steps)
+                        cur = base + (step + 1)
+                        progress_cb({"step": cur, "total": max(1, _steps*_batch)})
+                    except Exception:
+                        pass
             result = pipe(
                 prompt=prompt,
                 negative_prompt=negative or None,
                 num_inference_steps=max(1, steps),
                 guidance_scale=float(job.get("cfg_scale", 7.5)),
                 width=width, height=height,
-                generator=gen
+                generator=gen,
+                callback=_cb, callback_steps=1
             )
             img = result.images[0]
             fn_tmpl = job.get("filename_template") or "sd_{seed}_{idx:03d}.png"
@@ -1503,8 +1749,11 @@ def _gen_via_diffusers(job: dict, out_dir: Path, progress_cb=None):
             fpath = out_dir / fname
             img.save(str(fpath))
             files.append(str(fpath))
-            if progress_cb: progress_cb((i+1)/max(1, batch))
-
+            try:
+                if progress_cb:
+                    progress_cb({"step": (i+1)*max(1, steps), "total": max(1, steps*batch)})
+            except Exception:
+                pass
         return {"files": files, "backend": "diffusers", "model": model_path, "actual_size": [width, height]}
     except Exception as e:
         import traceback
@@ -1559,7 +1808,12 @@ def _gen_via_a1111(job: dict, out_dir: Path, base_url: str, progress_cb=None):
     except Exception:
         return None
     prompt = job.get("prompt",""); neg = job.get("negative","")
-    w = int(job.get("width", 1024)); h = int(job.get("height", 1024))
+    w = int(job.get("width", 1024))
+    h = int(job.get("height", 1024))
+    try:
+        w, h = _safe_snap_size(w, h)
+    except Exception:
+        pass
     steps = int(job.get("steps", 30)); seed = int(job.get("seed", 0))
     batch = int(job.get("batch", 1))
     payload = {"prompt": prompt, "negative_prompt": neg, "width": w, "height": h, "steps": steps, "seed": seed, "batch_size": batch}
@@ -1579,7 +1833,7 @@ def _gen_via_a1111(job: dict, out_dir: Path, base_url: str, progress_cb=None):
             fpath = out_dir / fname
             img.save(str(fpath))
             files.append(str(fpath))
-            if progress_cb: progress_cb((i+1)/max(1,len(images_b64)))
+            if progress_cb: progress_cb({"step": (i+1)*max(1, steps), "total": max(1, steps*batch)})
         return {"files": files, "backend": "a1111"}
     except Exception:
         return None
@@ -1627,6 +1881,13 @@ def generate_qwen_images(job: dict, progress_cb: Optional[Callable[[float], None
     for i in range(batch):
         if cancel_event and cancel_event.is_set(): break
         s = seeds_list[i] if i < len(seeds_list) else seed
+        # Simulate per-step progress for fallback
+        for _step in range(max(1, steps)):
+            try:
+                if progress_cb:
+                    progress_cb({"step": i*max(1, steps) + (_step+1), "total": max(1, steps*batch)})
+            except Exception:
+                pass
         img = _draw_text_image(prompt, size=(safe_w, safe_h), seed=s)
         fname = fname_tmpl.format(seed=s, idx=i)
         if not fname.lower().endswith(("png","jpg","jpeg","webp")): fname += "." + fmt

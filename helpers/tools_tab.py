@@ -740,12 +740,30 @@ class InstantToolsPane(QWidget):
                 pass
 
         def _autosave():
-            _save_all_tools()
-            self._autosave_timer = QTimer(self)
-            self._autosave_timer.setInterval(1500)
-            self._autosave_timer.setSingleShot(False)
-            self._autosave_timer.timeout.connect(_autosave)
-            self._autosave_timer.start()
+            """Debounced autosave.
+            Creates a single QTimer once and restarts it on every call.
+            When the timer fires, it performs one _save_all_tools() and stops.
+            This avoids spawning/connecting new timers repeatedly.
+            """
+            try:
+                if getattr(self, '_autosave_timer', None) is None:
+                    self._autosave_timer = QTimer(self)
+                    try:
+                        # Use a coarse timer on Windows to reduce WndProc load
+                        self._autosave_timer.setTimerType(Qt.TimerType.VeryCoarseTimer)
+                    except Exception:
+                        pass
+                    self._autosave_timer.setSingleShot(True)
+                    self._autosave_timer.setInterval(1500)
+                    self._autosave_timer.timeout.connect(lambda: _save_all_tools())
+                # debounce restart
+                self._autosave_timer.start()
+            except Exception:
+                # Fallback: save immediately if timer can't start
+                try:
+                    _save_all_tools()
+                except Exception:
+                    pass
 
         def _wire_watchers():
             try:
