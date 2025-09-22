@@ -54,9 +54,10 @@ start.bat
   - easy slider for fast forward
   - default buttons play pause stop
   - Multi format (img/sound/video)
+  - Music plalist & visualizer (100+)
   - Info button with popup window
   - Compare side by side with pan & 25x zoom (work in progress, html version for now)
-  - Ratio : fill, fit, full, center
+  - Ask Framie (little offline chatbot with screenshot describer etc)
   - Fullscreen on off (double click and esc shortcuts)
   - Upscale button that works from everywhere in the app (roadmap has other plans)
   - scroll to zoom in/out & pan (on roadmap)
