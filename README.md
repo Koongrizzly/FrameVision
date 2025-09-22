@@ -1,6 +1,6 @@
 [README.md](https://github.com/user-attachments/files/22204351/README.md)
 # 🌟 FrameVision V1.0.0
-**All-in-one Video & Photo Upscaler/Editor**  
+**All-in-one Video & Photo Upscaler/Editor/Creator**  
 ✨ *Upscale, convert, edit, describe, and create — in one streamlined app.*
 - WORK IN PROGRESS, features can come and go
 
@@ -26,9 +26,10 @@ start.bat
 
 ### Installer Menu Options
 - **Sytem check:** check diskspace, Cpu/Gpu, basic system info, python, venv etc and gives advice on what to use in the installer
-- **Core Install:** App only (minimal).
-- **Full CPU Install:** Torch CPU + models/binaries.+ (roadmap for) SD15 txt2img model loader
-- **Full CUDA Install:** Torch CUDA + models/binaries + SDXL txt2img model loader
+                   When not found it installs correct python (on path) and venv environment
+- **Core Install:** App only (minimal). also does simple repairs
+- **Full CPU Install:** Torch CPU + limited edition models/binaries.
+- **Full CUDA Install:** Torch CUDA + models/binaries 
   
 ---
 
@@ -42,52 +43,10 @@ start.bat
 
 ---
 
-## 🔄 How to Update FrameVision
-
-Keeping FrameVision up to date is **super easy** — just use one of the included updater tools!  
-Choose the updater based on whether you want to **keep personal files** or **fully reset** to the latest version.
-**How to use:**
-1. Back up any personal files, edits or custom scripts you don’t want deleted.
-2. Place the updaters in the **FrameVision root folder**.
-3. Double-click to run.
-
----
-
-### 🟢 Soft Update — `update_soft.bat`
-**Safe & Non-Destructive**  
-- ✅ Adds **new files**  
-- ✅ Updates **changed files**  
-- 🚫 **Never deletes** anything in your folder  
-**Best for:**  
-- Regular updates when you don’t want to risk losing personal changes or test files.
-
----
-
-### 🔴 Hard Update — `update_hard.bat`
-**Strict Sync (Advanced)**  
-- ✅ Adds **new files**  
-- ✅ Updates **changed files**  
-- ⚠️ **Restores deleted files**  
-- ⚠️ **Removes local files** that are not part of the official GitHub repo  
-  *(Safe exclusions: `.venv`, `models`, `.hf_cache`, `outputs`, etc.)*
-**Best for:**  
-- Repairing a broken install.  
-- Resetting to a **clean, exact copy** of the latest GitHub version.  
-- Preparing a **clean environment** for release or bug reporting.
-
-### 💡 How It Works
-Both updaters:
-- Try to use **Git** if available (fastest & safest).
-- If Git isn’t installed, they **auto-download a ZIP** of the latest version and update from that.
-- Writes progress to `update.log`.
-
----
-
 ## 🌐 Platforms
 - **Windows**: Primary target
 - **Linux / WSL2**: Supported (experimental)
 
----
 ---
 
 ## 🖥 Workspace
@@ -106,7 +65,9 @@ Both updaters:
   - Multi model Upscaler
   - RIFE interpollator
   - Describer
-  - TXT2IMG 
+  - TXT2IMG + Model loader SDXL
+  - TXT/IMG2VIDEO
+  - Text to speach/podcast
   - Multi-Tools
   - Advanced Queue 
   - Settings
@@ -196,7 +157,7 @@ WORK IN PROGRESS CURRENTLY IN BETA
 - random intro with easter egg (click the intro 4x) default download has 3 intros (day evening and night)
   - optional download has over 100 (roadmap feature)
   - user can add their own backgrounds and app will start with their own random backgrounds
-  - overlay matrix rain and other animations 
+  - overlay matrix rain and other animations (1 or random)
 - Theme system:15 themes, Follow time of day, random at every start
   - Day 🌞, Evening 🌆, Night 🌙
   - Cyberpunk, Neon, Ocean, Solarized Light, CRTn Mardi grass, Tropical and many more
@@ -248,6 +209,48 @@ Planned features for future updates:
        alt="FrameVision Screenshots (animated preview)"
        width="800">
 </p>
+
+---
+---
+
+## 🔄 How to Update FrameVision
+
+Keeping FrameVision up to date is **super easy** — just use one of the included updater tools!  
+Choose the updater based on whether you want to **keep personal files** or **fully reset** to the latest version.
+**How to use:**
+1. Back up any personal files, edits or custom scripts you don’t want deleted.
+2. Place the updaters in the **FrameVision root folder**.
+3. Double-click to run.
+
+---
+
+### 🟢 Soft Update — `update_soft.bat`
+**Safe & Non-Destructive**  
+- ✅ Adds **new files**  
+- ✅ Updates **changed files**  
+- 🚫 **Never deletes** anything in your folder  
+**Best for:**  
+- Regular updates when you don’t want to risk losing personal changes or test files.
+
+---
+
+### 🔴 Hard Update — `RESET_ALL.bat`
+**Strict Sync (Advanced)**  
+- ✅ Adds **new files**  
+- ✅ Updates **changed files**  
+- ⚠️ **Restores deleted files**  
+- ⚠️ **Removes local files** that are not part of the official GitHub repo  
+  *(Safe exclusions: `.venv`, `models`, `.hf_cache`, `outputs`, etc.)*
+**Best for:**  
+- Repairing a broken install.  
+- Resetting to a **clean, exact copy** of the latest GitHub version.  
+- Preparing a **clean environment** for release or bug reporting.
+
+### 💡 How It Works
+Both updaters:
+- Try to use **Git** if available (fastest & safest).
+- If Git isn’t installed, they **auto-download a ZIP** of the latest version and update from that.
+- Writes progress to `update.log`.
 
 ---
 
