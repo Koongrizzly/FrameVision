@@ -54,7 +54,7 @@ start.bat
   - easy slider for fast forward
   - default buttons play pause stop
   - Multi format (img/sound/video)
-  - Music plalist & visualizer (100+)
+  - Music playist & visualizer (100+)
   - Info button with popup window
   - Compare side by side with pan & 25x zoom (work in progress, html version for now)
   - Ask Framie (little offline chatbot with screenshot describer etc)
