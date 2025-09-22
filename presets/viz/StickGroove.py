@@ -60,35 +60,29 @@ def spring_to(key, target, t, k=28.0, c=6.5, lo=0.3, hi=3.0):
     return s
 
 @register_visualizer
-class SamuraiInkSlash(BaseVisualizer):
-    display_name = "Samurai Ink Slash"
+class StickGroove(BaseVisualizer):
+    display_name = "Stick Groove"
     def paint(self, p: QPainter, r, bands, rms, t):
         w,h=int(r.width()), int(r.height())
         if w<=0 or h<=0: return
+        p.fillRect(r, QBrush(QColor(8,9,16)))
         env, gate = music_env(bands, rms)
-        p.fillRect(r, QBrush(QColor(5,6,12)))
-        slashes = 8 + int(10*env)
-        for s in range(slashes):
-            ph = t*(0.9+1.0*env) + s*0.45
-            x1 = r.left() - 60 + (w+120)*( (s*0.19 + 0.25*sin(ph)) % 1.0 )
-            y1 = r.top()  + h*(0.15 + 0.7*( (s*0.33 + 0.35*cos(ph)) % 1.0 ))
-            ang = 0.8*sin(ph) + 1.1*cos(ph*1.3)
-            lenr = 160 + 360*env + (60 if gate>0.55 else 0)
-            hue = int((t*40 + s*37) % 360)
-            core = QColor.fromHsv(hue, 240, 255, 220)
-            trail = QColor.fromHsv((hue+40)%360, 230, 240, 150)
-            p.setPen(QPen(core, 5))
-            p.drawLine(QPointF(x1,y1), QPointF(x1+lenr*cos(ang), y1+lenr*sin(ang)))
-            p.setPen(QPen(trail, 2))
-            for k in range(1,6):
-                a2 = ang + 0.05*k
-                p.drawLine(QPointF(x1-12*k*cos(a2), y1-12*k*sin(a2)),
-                           QPointF(x1+(lenr-12*k)*cos(a2), y1+(lenr-12*k)*sin(a2)))
-        if gate > 0.5:
-            for i in range(22):
-                ang = 2*pi*_rng.random()
-                d = (40+140*_rng.random())*(0.6+0.8*env)
-                col = QColor.fromHsv(int(_rng.random()*360), 230, 255, 220)
-                p.setPen(QPen(col, 2))
-                x = r.center().x(); y = r.center().y()
-                p.drawLine(QPointF(x,y), QPointF(x+d*cos(ang), y+d*sin(ang)))
+        amp = spring_to("stick_amp", 1.0 + 0.8*env + (1.2 if gate>0.55 else 0.0), t, hi=2.6)
+        cx, cy = r.center().x(), r.center().y() + 12*sin(t*1.0*amp)
+        scale = 1.3 * amp
+        p.setPen(QPen(QColor(220,240,255,220), 6))
+        p.drawLine(QPointF(cx, cy-50*scale), QPointF(cx, cy+50*scale))
+        hr = 20*scale*(1+0.2*env)
+        p.setBrush(QBrush(QColor(255,220,150)))
+        p.setPen(QPen(QColor(255,255,255,200), 2))
+        p.drawEllipse(QPointF(cx, cy-70*scale), hr, hr)
+        p.setPen(QPen(QColor(255,180,200), 7))
+        ang = 1.4*sin(t*2.8*amp) + 1.6*env*sin(t*4.6)
+        L = 60*scale
+        p.drawLine(QPointF(cx,cy-24*scale), QPointF(cx-L*cos(ang), cy-24*scale - L*sin(ang)))
+        p.drawLine(QPointF(cx,cy-24*scale), QPointF(cx+L*cos(ang), cy-24*scale - L*sin(ang)))
+        p.setPen(QPen(QColor(180,255,200), 7))
+        spread = 34*scale
+        yfoot = cy+50*scale + (18*env + 14*(1 if gate>0.55 else 0))*sin(t*7.0*amp)
+        p.drawLine(QPointF(cx-spread, cy+50*scale), QPointF(cx-spread, yfoot))
+        p.drawLine(QPointF(cx+spread, cy+50*scale), QPointF(cx+spread, yfoot))

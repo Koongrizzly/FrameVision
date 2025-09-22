@@ -60,35 +60,30 @@ def spring_to(key, target, t, k=28.0, c=6.5, lo=0.3, hi=3.0):
     return s
 
 @register_visualizer
-class SamuraiInkSlash(BaseVisualizer):
-    display_name = "Samurai Ink Slash"
+class JellyDancer(BaseVisualizer):
+    display_name = "Jelly Dancer"
     def paint(self, p: QPainter, r, bands, rms, t):
-        w,h=int(r.width()), int(r.height())
+        w,h=int(r.width()),int(r.height())
         if w<=0 or h<=0: return
+        p.fillRect(r,QBrush(QColor(4,6,12)))
         env, gate = music_env(bands, rms)
-        p.fillRect(r, QBrush(QColor(5,6,12)))
-        slashes = 8 + int(10*env)
-        for s in range(slashes):
-            ph = t*(0.9+1.0*env) + s*0.45
-            x1 = r.left() - 60 + (w+120)*( (s*0.19 + 0.25*sin(ph)) % 1.0 )
-            y1 = r.top()  + h*(0.15 + 0.7*( (s*0.33 + 0.35*cos(ph)) % 1.0 ))
-            ang = 0.8*sin(ph) + 1.1*cos(ph*1.3)
-            lenr = 160 + 360*env + (60 if gate>0.55 else 0)
-            hue = int((t*40 + s*37) % 360)
-            core = QColor.fromHsv(hue, 240, 255, 220)
-            trail = QColor.fromHsv((hue+40)%360, 230, 240, 150)
-            p.setPen(QPen(core, 5))
-            p.drawLine(QPointF(x1,y1), QPointF(x1+lenr*cos(ang), y1+lenr*sin(ang)))
-            p.setPen(QPen(trail, 2))
-            for k in range(1,6):
-                a2 = ang + 0.05*k
-                p.drawLine(QPointF(x1-12*k*cos(a2), y1-12*k*sin(a2)),
-                           QPointF(x1+(lenr-12*k)*cos(a2), y1+(lenr-12*k)*sin(a2)))
-        if gate > 0.5:
-            for i in range(22):
-                ang = 2*pi*_rng.random()
-                d = (40+140*_rng.random())*(0.6+0.8*env)
-                col = QColor.fromHsv(int(_rng.random()*360), 230, 255, 220)
-                p.setPen(QPen(col, 2))
-                x = r.center().x(); y = r.center().y()
-                p.drawLine(QPointF(x,y), QPointF(x+d*cos(ang), y+d*sin(ang)))
+        cx, cy = r.center().x(), r.center().y()
+        rad = min(w,h)*0.20*(0.9+0.7*env)
+        hue = int((t*45 + 160*env)%360)
+        g = QRadialGradient(QPointF(cx, cy), rad*1.8)
+        g.setColorAt(0.0, QColor.fromHsv(hue,220,255,230))
+        g.setColorAt(1.0, QColor.fromHsv(hue,220,0,0))
+        p.setBrush(QBrush(g))
+        p.setPen(QPen(QColor(255,255,255,60),3))
+        p.drawEllipse(QPointF(cx,cy), rad, rad*0.75)
+        p.setPen(QPen(QColor.fromHsv(hue,220,255,210),3))
+        count = 12
+        for i in range(count):
+            phase = t*(0.9+1.8*env) + i*0.5
+            amp = 26*(1+0.8*env)
+            prev = QPointF(cx, cy+rad*0.6)
+            for s in range(1,14):
+                y = cy + rad*0.6 + s*12
+                x = cx + (i-6)*4 + amp*sin(0.16*y + phase)
+                p.drawLine(prev, QPointF(x,y))
+                prev = QPointF(x,y)
