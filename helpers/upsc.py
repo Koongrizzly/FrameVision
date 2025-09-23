@@ -1030,10 +1030,37 @@ class UpscPane(QtWidgets.QWidget):
         if not files:
             QtWidgets.QMessageBox.information(self, "No media", "That folder has no supported images or videos.")
             return
+        # Confirmation dialog before queuing
+        count = len(files)
+        resp = QtWidgets.QMessageBox.question(
+            self,
+            "Confirm queue",
+            f"Queue {count} files?",
+            QtWidgets.QMessageBox.Yes | QtWidgets.QMessageBox.Cancel,
+            QtWidgets.QMessageBox.Yes
+        )
+        if resp != QtWidgets.QMessageBox.Yes:
+            self._append_log("Batch canceled.")
+            return
         for p in files:
             self._run_one(p)
 
     def _run_batch_files(self, files: List[Path]):
+        # Confirmation dialog before queuing
+        count = len(files)
+        if count <= 0:
+            QtWidgets.QMessageBox.information(self, "No media", "No files selected.")
+            return
+        resp = QtWidgets.QMessageBox.question(
+            self,
+            "Confirm queue",
+            f"Queue {count} files?",
+            QtWidgets.QMessageBox.Yes | QtWidgets.QMessageBox.Cancel,
+            QtWidgets.QMessageBox.Yes
+        )
+        if resp != QtWidgets.QMessageBox.Yes:
+            self._append_log("Batch canceled.")
+            return
         for p in files:
             self._run_one(p)
 
@@ -1067,6 +1094,16 @@ class UpscPane(QtWidgets.QWidget):
         return [exe, "-i", str(infile), "-o", str(outfile), "-m", str(WAIFU2X_DIR / model_dirname), "-s", str(scale)]
 
     def _run_one(self, src: Path):
+        # Make current file visible to the queue shim during batch
+        try:
+            self._last_infile = src
+        except Exception:
+            pass
+        try:
+            if hasattr(self, 'edit_input') and hasattr(self.edit_input, 'setText'):
+                self.edit_input.setText(str(src))
+        except Exception:
+            pass
         self._job_running = True
         try:
             ext = src.suffix.lower()
