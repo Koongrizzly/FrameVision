@@ -786,6 +786,16 @@ class InterpPane(QWidget):
         dlg.setNameFilter("Videos (*.mp4 *.mkv *.mov *.webm *.avi)")
         if not dlg.exec(): return
         files=[Path(p) for p in dlg.selectedFiles() if p]
+        if not files:
+            QMessageBox.information(self, "Add Batch", "No files selected."); return
+        dlg2 = QMessageBox(self)
+        dlg2.setWindowTitle("Confirm Batch")
+        dlg2.setText(f"Queue {len(files)} file(s)?")
+        yes_btn = dlg2.addButton("Yes", QMessageBox.AcceptRole)
+        dlg2.addButton(QMessageBox.Cancel)
+        dlg2.exec()
+        if dlg2.clickedButton() is not yes_btn:
+            return
         ok=0; cache={}
         mult=max(0.15, min(4.0, self.slider.value()/100.0))
         for src in files:
