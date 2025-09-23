@@ -125,22 +125,20 @@ start.bat
 ---
 
 ### 🖌️ TXT → IMG (SD15+SDXL)
-WORK IN PROGRESS CURRENTLY IN BETA
 - no cloud required.
 - Prompt & negative prompt support with quick style presets.
 - Seed policies: Fixed / Random / Increment.
 - Mutiple presets
 - Lora support
 - Multi model selector
-  Comes with default model to work out of the box
-  download your favorite model (juggernaut etc) and use it directly in the app
+  Comes with juggernaut XL + model selector
 - many settings and tweaks can be done
 - Direct preview of results in internal player, queue support coming soon
   
 ---
 
   ### 🎞️ TXT/IMG → VIDEO (WAN 2.2 — TI2V‑5B)
-
+WORK IN PROGRESS CURRENTLY IN BETA
 - **Engine:** WAN 2.2 (TI2V‑5B) — high‑quality text‑to‑video and image‑to‑video.
 - **Modes:** `text2video` (prompt → clip) and `image2video` (first frame conditioning).
 - **Offline:** Runs fully offline from the app (no ComfyUI). Uses local weights and cache.
@@ -165,10 +163,8 @@ WORK IN PROGRESS CURRENTLY IN BETA
 - Multi rename tools
 ...
 
-
-
 ### 🔊 TXT → SPEECH (VibeVoice 1.5B)
-
+WORK IN PROGRESS CURRENTLY IN BETA / not workinf
 - **Engine:** VibeVoice 1.5B — fast, natural TTS. Runs fully offline in the app (no ComfyUI).
 - **Modes:** `tts` (single speaker) and `multitts` (JSON timeline with per‑segment pauses).
 - **Prosody:** control **speed**, **pitch** (semitones), and **energy** for expressive output.
