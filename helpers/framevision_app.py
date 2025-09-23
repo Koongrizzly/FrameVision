@@ -939,10 +939,12 @@ class VideoPane(QWidget):
             self._present_busy = False
 
     def mousePressEvent(self, ev):
-        if self.player.playbackState()==QMediaPlayer.PlayingState:
-            self.pause()
-        else:
-            self.player.play()
+        # Disable click-to-toggle playback; allow normal event propagation
+        try:
+            QWidget.mousePressEvent(self, ev)
+        except Exception:
+            pass
+
 
     def on_pos(self,pos): self.slider.setValue(pos); self._update_time_label()
     def on_dur(self,dur): self.slider.setRange(0,dur if dur>0 else 0); self._update_time_label()
