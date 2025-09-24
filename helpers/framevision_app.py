@@ -192,21 +192,13 @@ except Exception as _e:
 # <<< FRAMEVISION_TXT2IMG_END
 
 # >>> FRAMEVISION_WAN22_BEGIN
-# Safe import of the WAN 2.2 pane; never crash app on failure.
-try:
-    from helpers.wan22 import Wan22Pane
-except Exception as _e:
-    print("[framevision] wan22 tab import failed:", _e)
-    Wan22Pane = None
+# WAN22 tab disabled: do not import or add missing module.
+Wan22Pane = None
 # <<< FRAMEVISION_WAN22_END
 
 # >>> FRAMEVISION_VIBEVOICE_BEGIN
-# Safe import of the VibeVoice TTS pane; never crash app on failure.
-try:
-    from helpers.vibevoice import VibeVoicePane
-except Exception as _e:
-    print("[framevision] vibevoice tab import failed:", _e)
-    VibeVoicePane = None
+# VibeVoice tab disabled: do not import or add missing module.
+VibeVoicePane = None
 # <<< FRAMEVISION_VIBEVOICE_END
 
 
@@ -2478,28 +2470,8 @@ class MainWindow(QMainWindow):
             print("[framevision] txt2img tab insert failed:", _e)
         # <<< FRAMEVISION_TXT2IMG_END
         # >>> FRAMEVISION_WAN22_VIBEVOICE_TABS_BEGIN
-        # Insert TXT-IMG 2 Video (WAN 2.2) and VibeVoice TTS right after TXT to IMG
-        try:
-            if 'Wan22Pane' in globals() and Wan22Pane is not None:
-                self._wan22_pane = Wan22Pane(self)
-                try:
-                    self._wan22_pane.fileReady.connect(self.video.open)
-                except Exception:
-                    pass
-                self.tabs.insertTab(1, self._wan22_pane, "TXT-IMG 2 Video")
-        except Exception as _e:
-            print("[framevision] wan22 tab insert failed:", _e)
-        try:
-            if 'VibeVoicePane' in globals() and VibeVoicePane is not None:
-                self._vibevoice_pane = VibeVoicePane(self)
-                try:
-                    self._vibevoice_pane.fileReady.connect(self.video.open)
-                except Exception:
-                    pass
-                self.tabs.insertTab(2, self._vibevoice_pane, "VibeVoice TTS")
-        except Exception as _e:
-            print("[framevision] vibevoice tab insert failed:", _e)
-        # <<< FRAMEVISION_WAN22_VIBEVOICE_TABS_END
+# WAN22/VibeVoice tabs disabled: skip insertion.
+# <<< FRAMEVISION_WAN22_VIBEVOICE_TABS_END
         # GAB (QuickActionDriver) removed cleanly
         # The analyzer integration was disabled to avoid runtime errors.
         # (Previously initialized QuickActionDriver and installed it here.)
