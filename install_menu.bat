@@ -1057,7 +1057,79 @@ goto menu
 
 :end
 exit /b 0
+rem --- Extra: Install TeaCache and SageAttention ---
+if exist ".venv\Scripts\python.exe" (
+  rem Try possible package name variants for TeaCache
+  call ".venv\Scripts\python.exe" -m pip install --no-cache-dir --upgrade teacache ^
+    || call ".venv\Scripts\python.exe" -m pip install --no-cache-dir --upgrade tea-cache ^
+    || call ".venv\Scripts\python.exe" -m pip install --no-cache-dir --upgrade tea_cache
+  rem Try possible package name variants for SageAttention
+  call ".venv\Scripts\python.exe" -m pip install --no-cache-dir --upgrade sageattention ^
+    || call ".venv\Scripts\python.exe" -m pip install --no-cache-dir --upgrade sage-attention ^
+    || call ".venv\Scripts\python.exe" -m pip install --no-cache-dir --upgrade SageAttention
+) else (
+  echo( [skip] .venv not found; skipping TeaCache / SageAttention install
+)
 
+call :install_mutagen
+echo > ".installed_gpu"
+if exist "framevision_run.py" (
+  echo CUDA install complete. Launching FrameVision...
+  start "" "start.bat"
+  goto end
+) else (
+  echo CUDA install complete, but framevision_run.py is missing; returning to menu.
+  pause
+  goto menu
+)
+
+:pip_fail
+echo.
+echo One or more install steps failed.
+echo Close all Python apps and retry if DLLs were locked.
+pause
+goto menu
+
+
+:end
+exit /b 0
+
+
+
+call start.bat
+
+:accel_install_sage2
+REM === Optional: SageAttention v2/2++ from source (best-effort). Not called by default. ===
+setlocal
+set "ACCEL_DIR=%~dp0accel_pkgs"
+if not exist "%ACCEL_DIR%" mkdir "%ACCEL_DIR%"
+where git >nul 2>&1
+if errorlevel 1 (
+  echo [WARN] Git not found in PATH. Skipping SageAttention v2.
+  endlocal & goto :eof
+)
+
+if not exist "%ACCEL_DIR%\SageAttention" (
+  git clone --depth=1 https://github.com/thu-ml/SageAttention "%ACCEL_DIR%\SageAttention"
+) else (
+  pushd "%ACCEL_DIR%\SageAttention" && git pull && popd
+)
+if exist "%ACCEL_DIR%\SageAttention" (
+  pushd "%ACCEL_DIR%\SageAttention"
+  ".\.venv\Scripts\python" -m pip install -U ninja packaging setuptools wheel
+  ".\.venv\Scripts\python" -m pip install -U -r requirements.txt 2>nul
+  ".\.venv\Scripts\python" -m pip install -U .
+  if errorlevel 1 (
+    echo [WARN] SageAttention v2 build failed. Continuing...
+  ) else (
+    echo [OK] SageAttention v2 installed.
+  )
+  popd
+)
+
+echo.
+echo [PAUSE] SageAttention v2 step finished. Press any key to continue...
+pause >nu
 
 
 call start.bat
