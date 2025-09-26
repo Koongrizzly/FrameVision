@@ -830,17 +830,19 @@ def _txt2img_demo_try():
         # --- Primary: SDXL Base 1.0 single-file ---
         # Try multiple common repo/filename combos so we don't depend on a single naming scheme.
         sdxl_targets = [
-            ("stabilityai/stable-diffusion-xl-base-1.0", "sd_xl_base_1.0.safetensors"),
-            ("stabilityai/sdxl-1.0-base", "sd_xl_base_1.0.safetensors"),
-            ("SG161222/RealVisXL_V4.0", "RealVisXL_V4.0_B1_fp16-no-ema.safetensors"),  # popular SDXL derivative
-        ]
+        ("RunDiffusion/Juggernaut-XL-v9", "Juggernaut-XL_v9_RunDiffusionPhoto_v2.safetensors"),  # official photoreal build (RDPhoto2)
+        # Optional speed fallback (kept after v9 for quality-first): 4-step Lightning variant
+        ("RunDiffusion/Juggernaut-XL-Lightning", "Juggernaut_RunDiffusionPhoto2_Lightning_4Steps.safetensors"),
+        # Secondary photoreal fallback if HF is rate-limited or v9 unavailable
+        ("SG161222/RealVisXL_V4.0", "RealVisXL_V4.0_B1_fp16-no-ema.safetensors"),
+    ]
         for repo_id, filename in sdxl_targets:
             dst = sdxl_dir / filename
             if dst.exists():
                 print("[externals][txt2img] demo model ready at", dst)
                 return True
             try:
-                print(f"[externals][txt2img] fetching demo SDXL model: {repo_id}/{filename} …")
+                print(f"[externals][txt2img] fetching Juggernaut XL model: {repo_id}/{filename} …")
                 fp = hf_hub_download(repo_id=repo_id, filename=filename, local_dir=str(sdxl_dir), local_dir_use_symlinks=False)
                 import os, shutil as _sh
                 if os.path.isfile(fp) and not dst.exists():
@@ -900,17 +902,19 @@ def _txt2img_demo_try():
         # --- Primary: SDXL Base 1.0 single-file ---
         # Try multiple common repo/filename combos so we don't depend on a single naming scheme.
         sdxl_targets = [
-            ("stabilityai/stable-diffusion-xl-base-1.0", "sd_xl_base_1.0.safetensors"),
-            ("stabilityai/sdxl-1.0-base", "sd_xl_base_1.0.safetensors"),
-            ("SG161222/RealVisXL_V4.0", "RealVisXL_V4.0_B1_fp16-no-ema.safetensors"),  # popular SDXL derivative
-        ]
+        ("RunDiffusion/Juggernaut-XL-v9", "Juggernaut-XL_v9_RunDiffusionPhoto_v2.safetensors"),  # official photoreal build (RDPhoto2)
+        # Optional speed fallback (kept after v9 for quality-first): 4-step Lightning variant
+        ("RunDiffusion/Juggernaut-XL-Lightning", "Juggernaut_RunDiffusionPhoto2_Lightning_4Steps.safetensors"),
+        # Secondary photoreal fallback if HF is rate-limited or v9 unavailable
+        ("SG161222/RealVisXL_V4.0", "RealVisXL_V4.0_B1_fp16-no-ema.safetensors"),
+    ]
         for repo_id, filename in sdxl_targets:
             dst = sdxl_dir / filename
             if dst.exists():
                 print("[externals][txt2img] demo model ready at", dst)
                 return True
             try:
-                print(f"[externals][txt2img] fetching demo SDXL model: {repo_id}/{filename} …")
+                print(f"[externals][txt2img] fetching Juggernaut XL model: {repo_id}/{filename} …")
                 fp = hf_hub_download(repo_id=repo_id, filename=filename, local_dir=str(sdxl_dir), local_dir_use_symlinks=False)
                 import os, shutil as _sh
                 if os.path.isfile(fp) and not dst.exists():
@@ -977,17 +981,19 @@ def _txt2img_demo_try():
         # --- Primary: SDXL Base 1.0 single-file ---
         # Try multiple common repo/filename combos so we don't depend on a single naming scheme.
         sdxl_targets = [
-            ("stabilityai/stable-diffusion-xl-base-1.0", "sd_xl_base_1.0.safetensors"),
-            ("stabilityai/sdxl-1.0-base", "sd_xl_base_1.0.safetensors"),
-            ("SG161222/RealVisXL_V4.0", "RealVisXL_V4.0_B1_fp16-no-ema.safetensors"),  # popular SDXL derivative
-        ]
+        ("RunDiffusion/Juggernaut-XL-v9", "Juggernaut-XL_v9_RunDiffusionPhoto_v2.safetensors"),  # official photoreal build (RDPhoto2)
+        # Optional speed fallback (kept after v9 for quality-first): 4-step Lightning variant
+        ("RunDiffusion/Juggernaut-XL-Lightning", "Juggernaut_RunDiffusionPhoto2_Lightning_4Steps.safetensors"),
+        # Secondary photoreal fallback if HF is rate-limited or v9 unavailable
+        ("SG161222/RealVisXL_V4.0", "RealVisXL_V4.0_B1_fp16-no-ema.safetensors"),
+    ]
         for repo_id, filename in sdxl_targets:
             dst = sdxl_dir / filename
             if dst.exists():
                 print("[externals][txt2img] demo model ready at", dst)
                 return True
             try:
-                print(f"[externals][txt2img] fetching demo SDXL model: {repo_id}/{filename} …")
+                print(f"[externals][txt2img] fetching Juggernaut XL model: {repo_id}/{filename} …")
                 fp = hf_hub_download(repo_id=repo_id, filename=filename, local_dir=str(sdxl_dir), local_dir_use_symlinks=False)
                 import os, shutil as _sh
                 if os.path.isfile(fp) and not dst.exists():
