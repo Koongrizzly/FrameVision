@@ -124,13 +124,13 @@ def enqueue_txt2img_qwen(job_args: dict):
     """Insert-only wrapper to enqueue a Qwen txt2img job."""
     try:
         from helpers.job_helper import make_job_json
-        from helpers.queue_adapter import jobs_dirs, _base_root  # reuse existing helpers
+        from helpers.queue_adapter import jobs_dirs
         d = jobs_dirs()
-        out_dir = job_args.get("output") or str(_base_root() / "output" / "images")
-        args = {k:v for k,v in job_args.items() if k not in ("output","run_now")}
-        return make_job_json("txt2img_qwen", "", out_dir, args, str(d['pending']), priority=500)
+        out_dir = job_args.get('output') or default_txt2img_outdir()
+        args = {k:v for k,v in job_args.items() if k not in ('output','run_now')}
+        return make_job_json('txt2img_qwen', '', out_dir, args, str(d['pending']), priority=500)
     except Exception as e:
-        print("[queue] enqueue_txt2img_qwen failed:", e)
+        print('[queue] enqueue_txt2img_qwen failed:', e)
         return False
 
 
@@ -167,3 +167,41 @@ def enqueue_external(job: dict):
     # input_path not required for tools job
     return enqueue_tool_job('tools_ffmpeg', '', out_dir, args, priority=550)
 # <<< FRAMEVISION_QWEN_END
+
+
+def default_txt2img_outdir():
+    from pathlib import Path
+    base = Path('.').resolve()
+    d = base/'output'/'photo'/'txt2img'
+    d.mkdir(parents=True, exist_ok=True)
+    return str(d)
+
+def enqueue_txt2img(job: dict) -> bool:
+    """Convenience: enqueue a txt2img job via the standard queue (priority depends on run_now)."""
+    try:
+        from helpers.queue_adapter import enqueue_tool_job
+        preview = (job.get("prompt") or "")[:80] or "[txt2img]"
+        out_dir = job.get("output") or default_txt2img_outdir()
+        # Filter args to a safe subset for the worker
+        keys = [
+            "prompt","negative","seed","seed_policy","batch","cfg_scale",
+            "width","height","steps","sampler","model_path","lora_path",
+            "lora_scale","lora2_path","lora2_scale","attn_slicing","vae_device",
+            "gpu_index","threads","format","filename_template","hires_helper","fit_check",
+            "vram_profile","a1111_url","qwen_cli_template"
+        ]
+        args = {k: job.get(k) for k in keys if k in job}
+        prio = 550 if job.get("run_now") else 600
+        return bool(enqueue_tool_job("txt2img", preview, out_dir, args, priority=prio))
+    except Exception as e:
+        try:
+            print("[queue] enqueue_txt2img failed:", e)
+        except Exception:
+            pass
+        return False
+
+# Use type 'txt2img' for compatibility; worker handles both.
+        return make_job_json('txt2img', '', out_dir, args, str(d['pending']), priority=500)
+    except Exception as e:
+        print('[queue] enqueue_txt2img failed:', e)
+        return False

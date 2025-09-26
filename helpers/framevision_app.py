@@ -175,6 +175,25 @@ from datetime import datetime
 from PySide6.QtCore import QUrl, Qt, QTimer, QUrl, Signal, QRect, QEasingCurve, QPropertyAnimation, QByteArray, QEvent
 from PySide6.QtCore import QUrl, QSettings
 from PySide6.QtGui import QAction, QPixmap, QImage, QKeySequence, QColor, QDesktopServices, QShortcut
+
+# --- BEGIN: Image allocation limit bump ---
+try:
+    from PySide6.QtGui import QImageReader
+    # Raise per-image allocation limit to 1.5 GB (prevents 'Rejecting image ... 256 megabytes')
+    try:
+        QImageReader.setAllocationLimit(1536)  # megabytes
+    except Exception:
+        pass
+    try:
+        import os as __img_env_os
+        # Some plugins also read this env var; set as bytes for compatibility.
+        __img_env_os.environ.setdefault("QT_IMAGEIO_MAXALLOC", str(1536 * 1024 * 1024))
+    except Exception:
+        pass
+except Exception:
+    pass
+# --- END: Image allocation limit bump ---
+
 from PySide6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QGridLayout, QLabel, QPushButton, QFileDialog, QTabWidget, QSplitter, QListWidget, QListWidgetItem, QLineEdit, QFormLayout, QMessageBox, QComboBox, QSpinBox, QDoubleSpinBox, QTextEdit, QCheckBox, QTreeWidget, QTreeWidgetItem, QHeaderView, QStyle, QSlider, QToolButton, QSizePolicy, QScrollArea, QFrame, QGroupBox, QScrollArea, QFrame)
 from PySide6.QtMultimedia import QMediaPlayer, QAudioOutput, QVideoSink
 from helpers.tools_tab import InstantToolsPane

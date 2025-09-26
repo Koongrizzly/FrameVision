@@ -915,11 +915,35 @@ class UpscPane(QtWidgets.QWidget):
             # Skip work if a job is running
             if getattr(self, "_job_running", False):
                 return QPixmap()
-            # Images: load directly
+            # Images: load via QImageReader (scaled) to avoid huge allocations
             if ext in _IMAGE_EXTS:
-                pm = QPixmap(str(p))
-                if pm and not pm.isNull():
-                    return pm
+                try:
+                    from PySide6.QtGui import QImageReader, QPixmap
+                    from PySide6.QtCore import QSize
+                    reader = QImageReader(str(p))
+                    reader.setAutoTransform(True)
+                    # Decode to a thumbnail-sized image to keep memory low
+                    try:
+                        sz = reader.size()
+                        max_dim = 512
+                        if sz.isValid() and sz.width() > 0 and sz.height() > 0:
+                            w, h = sz.width(), sz.height()
+                            if w >= h:
+                                scaled = QSize(max_dim, max(1, int(h * max_dim / max(1, w))))
+                            else:
+                                scaled = QSize(max(1, int(w * max_dim / max(1, h))), max_dim)
+                        else:
+                            scaled = QSize(512, 512)
+                        reader.setScaledSize(scaled)
+                    except Exception:
+                        reader.setScaledSize(QSize(512, 512))
+                    img = reader.read()
+                    if img and not img.isNull():
+                        pm = QPixmap.fromImage(img)
+                        if pm and not pm.isNull():
+                            return pm
+                except Exception:
+                    pass
                 return QPixmap()
             # Videos: optional, heavier
             if ext in _VIDEO_EXTS:

@@ -293,21 +293,35 @@ class PreAnalyzer(QThread):
                 rms = (sm / max(1, n)) ** 0.5
 
                 # Bands
+                # Bands (robust log-spaced, with nearest-bin fallback + mean power)
                 if _np is not None:
                     import numpy as np
                     arr = np.frombuffer(window, dtype='<f4', count=n)
-                    spec = np.abs(np.fft.rfft(arr * np.hanning(arr.size)))
+                    win = np.hanning(arr.size)
+                    spec_c = np.fft.rfft(arr * win)
+                    spec = np.abs(spec_c)
+                    # Per-frame normalize to avoid clipping but keep dynamics
                     if spec.max() > 0:
                         spec = spec / spec.max()
                     if freqs is None:
                         freqs = np.linspace(0, self.sr / 2, spec.size)
-                        edges = np.geomspace(30, max(60, self.sr / 2), num=self.bands + 1)
+                        # start at >=20 Hz, end at Nyquist
+                        lo_start = max(20.0, float(freqs[1] if spec.size > 1 else 20.0))
+                        edges = np.geomspace(lo_start, max(60.0, self.sr / 2), num=self.bands + 1)
                     out = []
                     for i in range(self.bands):
-                        lo, hi = edges[i], edges[i + 1]
+                        lo, hi = float(edges[i]), float(edges[i + 1])
                         mask = (freqs >= lo) & (freqs < hi)
-                        val = float(spec[mask].max() if mask.any() else 0.0)
+                        if mask.any():
+                            # mean power within the band
+                            val = float(spec[mask].mean())
+                        else:
+                            # nearest-bin fallback so every band moves (helps for very low bass)
+                            center = (lo + hi) * 0.5
+                            idxn = int(np.argmin(np.abs(freqs - center)))
+                            val = float(spec[idxn]) if 0 <= idxn < spec.size else 0.0
                         out.append(val)
+
                 else:
                     # lightweight fallback (amplitude buckets)
                     step = max(1, n // (self.bands * 2))
@@ -1581,7 +1595,7 @@ def wire_to_videopane(VideoPaneClass):
                         except Exception:
                             dur = 0
                         if dur <= 0:
-                            QTimer.singleShot(120, _arm_scroll)
+                            QTimer.singleShot(20, _arm_scroll)
                             return
                         # start at zero then nudge forward a tiny bit later
                         try:
@@ -1593,16 +1607,16 @@ def wire_to_videopane(VideoPaneClass):
                                 d = int(pl.duration()) if pl else 0
                             except Exception:
                                 d = 0
-                            tgt = 100
+                            tgt = 150
                             if d > 0:
-                                tgt = min(100, max(0, d - 2))
+                                tgt = min(150, max(0, d - 2))
                             try:
                                 pl.setPosition(tgt)
                             except Exception:
                                 pass
                             # mark done so we never do this again
                             globals()['_INITIAL_SCROLL_DONE'] = True
-                        QTimer.singleShot(120, _nudge)
+                        QTimer.singleShot(50, _nudge)
                     QTimer.singleShot(60, _arm_scroll)
             except Exception:
                 pass
