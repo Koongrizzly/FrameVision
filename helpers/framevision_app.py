@@ -1,3 +1,5 @@
+from tools.diag_probe import init_diagnostics as _fv_diag_init
+_fv_diag_init()
 # --- BEGIN: FrameVision log silencer (auto-injected) ---
 # Hide harmless multimedia/FFmpeg + thread shutdown warnings.
 # Scope:
@@ -199,6 +201,7 @@ from PySide6.QtMultimedia import QMediaPlayer, QAudioOutput, QVideoSink
 from helpers.tools_tab import InstantToolsPane
 from helpers.themes import QSS_DAY, QSS_EVENING, QSS_NIGHT
 from helpers.mediainfo import AUDIO_EXTS, probe_media_all, show_info_popup
+from helpers.volume_new import add_new_volume_popup
 
 
 # >>> FRAMEVISION_TXT2IMG_BEGIN
@@ -802,6 +805,12 @@ class VideoPane(QWidget):
             "QPushButton#btn_ask_chat:hover { background:#d97706; }"
         )
         bar.addWidget(self.btn_ask)
+
+        # Volume/EQ popup button (new)
+        try:
+            add_new_volume_popup(self, bar)
+        except Exception:
+            pass
         self.btn_ask.clicked.connect(self._open_ask_popup, Qt.ConnectionType.UniqueConnection)
 
         # --- Toolbar styling: uniform height, transparent, larger glyphs ---
@@ -2422,6 +2431,10 @@ class SettingsPane(QWidget):
 
 # --- Music wiring (audio visuals + playlist) ---
 from helpers.music import wire_to_videopane as _fv_wire_music
+from tools.diag_probe import wire_to_videopane as _fv_wire_diag
+from tools.media_handoff_fix import wire as _fv_wire_handoff
+_fv_wire_handoff(VideoPane)
+_fv_wire_diag(VideoPane)
 _fv_wire_music(VideoPane)
 class MainWindow(QMainWindow):
 

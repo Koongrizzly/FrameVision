@@ -821,6 +821,7 @@ class MusicOverlay(QWidget):
 
         # playlist
         self.playlist = QListWidget()
+        self.playlist.setToolTip('Double-click a track to play it. In shuffle mode, sequence continues from the clicked track.')
         try:
             self.playlist.setMinimumWidth(260)
             self.playlist.setAlternatingRowColors(False)
@@ -828,10 +829,15 @@ class MusicOverlay(QWidget):
         except Exception:
             pass
         self.btn_add = QPushButton('Add…')
+        self.btn_add.setToolTip('Add audio files to the playlist.')
         self.btn_clear = QPushButton('Clear')
+        self.btn_clear.setToolTip('Clear playlist (also resets shuffle order).')
         self.btn_prev = QPushButton('⏮')
+        self.btn_prev.setToolTip('Previous track. In shuffle, goes back in the shuffle order.')
         self.btn_next = QPushButton('⏭')
+        self.btn_next.setToolTip('Next track. In shuffle, follows the current shuffle order.')
         self.btn_repeat = QPushButton('Repeat: all')
+        self._set_repeat_label_and_tooltip(self.repeat_mode())
         row_btns = QHBoxLayout()
         for b in (self.btn_add, self.btn_clear, self.btn_prev, self.btn_next, self.btn_repeat):
             row_btns.addWidget(b)
@@ -856,6 +862,7 @@ class MusicOverlay(QWidget):
         self.btn_vis_prev = QPushButton('◀'); self.btn_vis_prev.hide()
         self.btn_vis_next = QPushButton('▶'); self.btn_vis_next.hide()
         self.btn_visuals = QPushButton('Visuals on')
+        self.btn_visuals.setToolTip('Visuals change rate (beats): 1 / random / all. (Unaffected by playlist repeat.)')
         self.btn_visuals.setCheckable(True)
         self.btn_visuals.setChecked(False)
 
@@ -929,6 +936,9 @@ class MusicOverlay(QWidget):
 
         self._tracks: List[TrackInfo] = []
         self._current_idx = -1
+        # shuffle state (playlist only)
+        self._shuffle_order = []  # type: list[int]
+        self._shuffle_pos = -1
         self._visual_modes: List[str] = []
         self._visual_index = 0
 
@@ -1200,28 +1210,120 @@ class MusicOverlay(QWidget):
         idx = self.playlist.row(item)
         if 0 <= idx < len(self._tracks):
             self._current_idx = idx
+            if self.repeat_mode() == 'shuffle':
+                self._build_shuffle_order(idx)
             self.video.open(self._tracks[idx].path)
 
-    def _jump(self, delta: int):
-        if not self._tracks:
+    
+    # ----- shuffle helpers (playlist only) -----
+    def _build_shuffle_order(self, start_idx: int = 0):
+        """
+        Build a permutation of playlist indices with no repeats until all played.
+        Places start_idx first; the rest are shuffled.
+        """
+        n = len(self._tracks)
+        self._shuffle_order = []
+        self._shuffle_pos = -1
+        if n <= 0:
             return
-        if self._current_idx < 0:
-            self._current_idx = 0
+        import random
+        idxs = list(range(n))
+        if 0 <= start_idx < n:
+            idxs.remove(start_idx)
+            random.shuffle(idxs)
+            seq = [start_idx] + idxs
         else:
-            self._current_idx = (self._current_idx + delta) % len(self._tracks)
-        self.video.open(self._tracks[self._current_idx].path)
+            random.shuffle(idxs)
+            seq = idxs
+        self._shuffle_order = seq
+        self._shuffle_pos = 0
 
+    def _shuffle_next_index(self, delta: int) -> int:
+        """
+        Move delta steps along the shuffle order.
+        On completing a full pass, reshuffle and continue.
+        """
+        n = len(self._tracks)
+        if n == 0:
+            return -1
+        # Ensure order exists and is valid
+        if not self._shuffle_order or any(i >= n for i in self._shuffle_order):
+            base = self._current_idx if self._current_idx >= 0 else 0
+            self._build_shuffle_order(base)
+        # Sync shuffle position to current index if unknown
+        if self._shuffle_pos < 0 and self._current_idx >= 0:
+            try:
+                self._shuffle_pos = self._shuffle_order.index(self._current_idx)
+            except ValueError:
+                self._build_shuffle_order(self._current_idx)
+
+        if delta > 0:
+            self._shuffle_pos += 1
+            if self._shuffle_pos >= len(self._shuffle_order):
+                # Completed a pass: reshuffle from current
+                current = self._shuffle_order[-1] if self._shuffle_order else self._current_idx
+                self._build_shuffle_order(current)
+                self._shuffle_pos = 1 if len(self._shuffle_order) > 1 else 0
+        elif delta < 0:
+            self._shuffle_pos -= 1
+            if self._shuffle_pos < 0:
+                current = self._shuffle_order[0] if self._shuffle_order else self._current_idx
+                self._build_shuffle_order(current)
+                self._shuffle_pos = len(self._shuffle_order) - 1 if self._shuffle_order else -1
+
+        if 0 <= self._shuffle_pos < len(self._shuffle_order):
+            return self._shuffle_order[self._shuffle_pos]
+        return -1
+
+    def _jump(self, delta: int):
+            if not self._tracks:
+                return
+            if self.repeat_mode() == 'shuffle':
+                if self._current_idx < 0:
+                    self._current_idx = 0
+                    self._build_shuffle_order(self._current_idx)
+                idx = self._shuffle_next_index(delta)
+                if idx >= 0:
+                    self._current_idx = idx
+            else:
+                if self._current_idx < 0:
+                    self._current_idx = 0
+                else:
+                    self._current_idx = (self._current_idx + delta) % len(self._tracks)
+            self.video.open(self._tracks[self._current_idx].path)
+
+    def _set_repeat_label_and_tooltip(self, mode: str):
+        # Normalize
+        mode = (mode or 'all').lower()
+        if mode == 'one':
+            self.btn_repeat.setText('Repeat: 1')
+            self.btn_repeat.setToolTip('Repeats the current track continuously.')
+        elif mode == 'random':
+            self.btn_repeat.setText('Repeat: random')
+            self.btn_repeat.setToolTip('Pure random pick each time; repeats possible.')
+        elif mode == 'shuffle':
+            self.btn_repeat.setText('Repeat: shuffle')
+            self.btn_repeat.setToolTip('No repeat until all are played; reshuffles after a full pass. Next/Prev follow this order.')
+        else:
+            self.btn_repeat.setText('Repeat: all')
+            self.btn_repeat.setToolTip('Repeats the entire playlist and starts again after the last track.')
+
+    
     def _toggle_repeat(self):
         cur = self.repeat_mode()
         if cur == 'all':
-            self.btn_repeat.setText('Repeat: 1')
+            nxt = 'one'
         elif cur == 'one':
-            self.btn_repeat.setText('Repeat: random')
+            nxt = 'random'
+        elif cur == 'random':
+            nxt = 'shuffle'
         else:
-            self.btn_repeat.setText('Repeat: all')
+            nxt = 'all'
+        self._set_repeat_label_and_tooltip(nxt)
 
     def repeat_mode(self) -> str:
         text = self.btn_repeat.text().lower()
+        if 'shuffle' in text: return 'shuffle'
         if 'random' in text: return 'random'
         if '1' in text: return 'one'
         return 'all'
@@ -1828,11 +1930,21 @@ def wire_to_videopane(VideoPaneClass):
                 pass
             return result
         else:
-            # HARD TEARDOWN when opening non-audio (image/video/gif/etc)
+            # Soft teardown when opening non-audio (image/video/gif/etc)
             try:
-                _teardown_music(self)
+                if getattr(self, "_music_runtime", None):
+                    try:
+                        self._music_runtime.stop()
+                    except Exception:
+                        pass
+                if getattr(self, "_music_overlay", None):
+                    try:
+                        self._music_overlay.hide()
+                    except Exception:
+                        pass
             except Exception:
                 pass
             return orig_open(self, path)
+
 
     VideoPaneClass.open = open_wrapper
