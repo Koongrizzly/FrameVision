@@ -1,4 +1,46 @@
 @echo off
+title DANGEROUS: FULL RESET (with confirmation)
+setlocal ENABLEEXTENSIONS ENABLEDELAYEDEXPANSION
+
+rem Prevent double-entry if the script calls itself or jumps around
+if "%__RESET_CONFIRM_DONE__%"=="1" goto :PROCEED_WITH_RESET
+
+echo.
+echo #############################################################
+echo   W A R N I N G   -   T H I S   W I L L   D E L E T E   E V E R Y T H I N G
+echo #############################################################
+echo This will DELETE all app settings, caches, models, and local changes,
+echo and restore the project to a clean GitHub state (fresh user install).
+echo.
+echo Before continuing, BACK UP the following if you want to keep them:
+echo   - Your user edits (custom code/assets)
+echo   - The ^"models^" folder
+echo   - The ^"output^" folder
+echo   - The ^"\presets\setsave^" folder (to preserve settings)
+echo.
+set "CHOICE="
+set /P CHOICE=Proceed with FULL RESET? (Y/N): 
+
+if /I NOT "%CHOICE%"=="Y" (
+  echo.
+  echo Cancelled by user. Nothing was changed.
+  exit /B 0
+)
+
+set "__RESET_CONFIRM_DONE__=1"
+echo.
+echo You chose YES. Starting full reset...
+echo.
+
+rem Optional: minimal admin rights check (non-fatal)
+>nul 2>&1 "%SYSTEMROOT%\system32\cacls.exe" "%SYSTEMROOT%\system32\config\system"
+if NOT "%ERRORLEVEL%"=="0" (
+  echo Note: You may need to run this as Administrator if permission errors occur.
+)
+
+:PROCEED_WITH_RESET
+rem ================== BEGIN ORIGINAL RESET SCRIPT ==================
+@echo off
 setlocal EnableExtensions EnableDelayedExpansion
 chcp 65001 >nul
 title FrameVision - STRICT UPDATE (Hard, Color)
@@ -198,3 +240,6 @@ call :_note "Press any key to close..."
 pause >nul
 popd >nul
 exit /b 1
+
+rem =================== END ORIGINAL RESET SCRIPT ===================
+endlocal
