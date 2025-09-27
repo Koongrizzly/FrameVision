@@ -1670,7 +1670,7 @@ try:
                             try: _btn.clicked.disconnect()
                             except Exception: pass
                             def _call():
-                                p = _fv_get_input(self) or _fv_guess_player_path(self)
+                                p = _fv_guess_player_path(self) or _fv_get_input(self)
                                 if not _fv_is_valid_file(p):
                                     try: self._append_log("Player Upscale: no valid file path available.")
                                     except Exception: pass

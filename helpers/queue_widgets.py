@@ -14,6 +14,131 @@ from PySide6.QtWidgets import (
 ETA_FUDGE_SEC = 3  # small cushion for cleanup (temp deletion, final writes)
 
 
+
+
+# ---- Queue Autoplay (Play last result) --------------------------------------
+from PySide6.QtCore import QObject, QTimer
+from PySide6.QtWidgets import QCheckBox
+
+class _AutoPlayLastController(QObject):
+    def __init__(self, host_widget, checkbox: QCheckBox, done_dir: Path):
+        super().__init__(host_widget)
+        self.host = host_widget
+        self.chk = checkbox
+        self.done_dir = Path(done_dir) if done_dir else None
+        self.seen: set[str] = set()
+        try:
+            if self.done_dir and self.done_dir.exists():
+                self.seen = {str(p) for p in self.done_dir.glob("*.json")}
+        except Exception:
+            self.seen = set()
+        self.poll = QTimer(self)
+        self.poll.setInterval(900)
+        self.poll.timeout.connect(self._tick)
+        self.poll.start()
+
+    def _tick(self):
+        # Only act when toggle is on
+        try:
+            if not (self.chk and self.chk.isChecked() and self.done_dir and self.done_dir.exists()):
+                return
+            latest = None; latest_ts = -1.0
+            for p in self.done_dir.glob("*.json"):
+                try:
+                    ts = p.stat().st_mtime
+                    if ts > latest_ts:
+                        latest = p; latest_ts = ts
+                except Exception:
+                    continue
+            if not latest:
+                return
+            key = str(latest)
+            if key in self.seen:
+                return
+            # mark seen and schedule open with 2s delay
+            self.seen.add(key)
+            QTimer.singleShot(2000, lambda: self._open_job(latest))
+        except Exception:
+            pass
+
+    
+    def _open_job(self, job_json: Path):
+        try:
+            # Resolve media using JobRowWidget logic
+            w = JobRowWidget(job_json, "done")
+            media = w._resolve_output_file()
+            if not (media and media.exists()):
+                return
+            path_obj = Path(media)
+
+            # Prefer internal player on the real app host
+            hosts = [self.host, getattr(self.host, "main", None), self.host.window() if hasattr(self.host, "window") else None]
+            for h in hosts:
+                if not h:
+                    continue
+                # Direct attributes used throughout the app
+                for attr in ("video", "player"):
+                    try:
+                        v = getattr(h, attr, None)
+                        if v and hasattr(v, "open"):
+                            v.open(path_obj)
+                            # Optional HUD/info if present; best-effort
+                            try:
+                                if hasattr(h, "hud"):
+                                    h.hud.set_info(path_obj)
+                                if hasattr(h, "video") and hasattr(h.video, "set_info_text"):
+                                    # compose_video_info_text is defined in the app; best-effort import
+                                    try:
+                                        from helpers.framevision_app import compose_video_info_text  # type: ignore
+                                        h.video.set_info_text(compose_video_info_text(path_obj))
+                                    except Exception:
+                                        pass
+                            except Exception:
+                                pass
+                            return
+                    except Exception:
+                        pass
+            # If we couldn't find an internal player, do nothing to avoid launching external apps.
+        except Exception:
+            pass
+
+
+
+def install_queue_toggle_play_last(pane_widget, grid_layout, config: dict, save_config_callable, done_dir: Path):
+    """Add 'Play last result' toggle to the Queue header and run an autoplay controller.
+    This function is made to be called from QueuePane in framevision_app with ONE line.
+    """
+    try:
+        cb = QCheckBox("Play last result")
+        cb.setToolTip("Auto-open the newest Finished item in the internal player (waits 2s).")
+        cb.setChecked(bool(config.get("queue_play_last", False)))
+        def _on_toggle(v):
+            try:
+                config["queue_play_last"] = bool(v)
+                if callable(save_config_callable):
+                    save_config_callable()
+            except Exception:
+                pass
+        cb.toggled.connect(_on_toggle)
+        # place right below counts row (row 4, col 0) like other controls
+        try:
+            from PySide6.QtCore import Qt
+            grid_layout.addWidget(cb, 4, 0, 1, 1, Qt.AlignLeft)
+        except Exception:
+            try:
+                grid_layout.addWidget(cb, 4, 0, 1, 1)
+            except Exception:
+                pass
+        # Start controller that polls done_dir and plays via internal player
+        ctl = _AutoPlayLastController(pane_widget, cb, done_dir)
+        # Keep a reference on the pane to avoid GC
+        try:
+            setattr(pane_widget, "_autoplay_last_ctl", ctl)
+        except Exception:
+            pass
+    except Exception:
+        pass
+
 class JobRowWidget(QWidget):
     def _themed_icon(self, theme_names: list[str], fallback_std) -> QIcon:
         try:

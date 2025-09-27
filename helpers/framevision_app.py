@@ -1885,15 +1885,15 @@ class QueuePane(QWidget):
 
         # Row 3: Mark running → failed · Clear finished + failed · Recover running → pending
         self.btn_mark_running_failed = QPushButton("Mark Running → Failed")
-        self.btn_clear_all = QPushButton("Clear Finished + Failed")
         self.btn_reset_running = QPushButton("Recover Running → Pending")
-        grid.addWidget(self.btn_mark_running_failed, 2, 0); grid.addWidget(self.btn_clear_all, 2, 1); grid.addWidget(self.btn_reset_running, 2, 2)
+        grid.addWidget(self.btn_mark_running_failed, 2, 0); grid.addWidget(self.btn_reset_running, 2, 1)
 
         # Counters row
         self.counts = QLabel("Running 0 | Pending 0 | Done 0 | Failed 0")
         self.last_updated = QLabel("--:--:--")
         grid.addWidget(self.counts, 3, 0, 1, 2, Qt.AlignLeft)
         grid.addWidget(self.last_updated, 3, 2, 1, 1, Qt.AlignRight)
+        __import__("helpers.queue_widgets", fromlist=["install_queue_toggle_play_last"]).install_queue_toggle_play_last(self, grid, config, save_config, JOBS_DIRS["done"])
         root.addWidget(topw)
 
         # Scroll area with sections
@@ -1962,7 +1962,6 @@ class QueuePane(QWidget):
         self.btn_refresh.clicked.connect(self.refresh)
         self.btn_remove_done.clicked.connect(self.clear_done)
         self.btn_remove_failed.clicked.connect(self.clear_failed)
-        self.btn_clear_all.clicked.connect(self.clear_done_failed)
         self.btn_move_up.clicked.connect(self.move_up)
         self.btn_move_down.clicked.connect(self.move_down)
         self.btn_delete_sel.clicked.connect(self.delete_selected)
