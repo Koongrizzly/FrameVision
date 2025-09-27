@@ -218,8 +218,6 @@ class InterpPane(QWidget):
         # Row 2: toggles on their own line
         row2 = QHBoxLayout(); row2.setSpacing(8)
         self.cb_stream = QCheckBox("Streaming (low memory)"); row2.addWidget(self.cb_stream)
-        self.cb_autoplay = QCheckBox("Auto-play when finished"); row2.addWidget(self.cb_autoplay)
-        self.cb_autoplay.toggled.connect(lambda _on: self._persist_state())
         row2.addStretch(1); lay.addLayout(row2)
 
         # Result info (icon + text)
@@ -243,14 +241,6 @@ class InterpPane(QWidget):
         self.pb_cancel = QPushButton("Cancel"); self.pb_cancel.setVisible(False)
         self.pb_wrap.addWidget(self.pb_label); self.pb_wrap.addWidget(self.pb, 1); self.pb_wrap.addWidget(self.pb_eta); self.pb_wrap.addWidget(self.pb_cancel)
         lay.addLayout(self.pb_wrap)
-
-        # Row 3: Play buttons
-        lay.addSpacing(6)
-        play_row = QHBoxLayout(); play_row.setSpacing(8)
-        self.btn_play_last = QPushButton("Play last result (internal)")
-        self.btn_play_last_ext = QPushButton("Result in external player")
-        play_row.addWidget(self.btn_play_last); play_row.addWidget(self.btn_play_last_ext); play_row.addStretch(1)
-        lay.addLayout(play_row)
 
         # ---- Recent results gallery (NEW) ----
         self.recent = Collapsible("Recent results", start_open=False)
@@ -311,13 +301,10 @@ class InterpPane(QWidget):
         self.lbl_mult.setToolTip("Current multiplier applied to input FPS.")
         self.btn_2x.setToolTip("Set multiplier to 2×."); self.btn_4x.setToolTip("Set multiplier to 4×.")
         self.cb_stream.setToolTip("Low‑memory streaming path (for the ONNX backend).")
-        self.cb_autoplay.setToolTip("Play result in the internal player when the job finishes.")
         self.combo_speed.setToolTip("Processing profile for FFmpeg path. Select 'Superfast' to use the NCNN engine in the foreground with real progress.")
         self.cb_speed_default.setToolTip("Reset to a safe default (Balanced).")
         self.combo_model.setToolTip("RIFE model (used by the Superfast NCNN path).")
         self.btn_model_install.setToolTip("Extract engine & models from assets/rife.zip if needed.")
-        self.btn_play_last.setToolTip("Open the most recent result in the internal player.")
-        self.btn_play_last_ext.setToolTip("Open the most recent result in your system player.")
         self.btn_start.setToolTip("Add to Queue (or run Superfast immediately if profile 5 is selected).")
         self.btn_batch.setToolTip("Select multiple files and enqueue with current settings.")
         self.btn_open_folder.setToolTip("Open the folder where RIFE outputs are saved.")
@@ -328,8 +315,6 @@ class InterpPane(QWidget):
         self.slider.valueChanged.connect(self._on_slider_changed)
         self.btn_start.clicked.connect(self._on_start_clicked)
         self.btn_batch.clicked.connect(self._on_batch_clicked)
-        self.btn_play_last.clicked.connect(self._on_play_last_internal)
-        self.btn_play_last_ext.clicked.connect(self._on_play_last_external)
         self.btn_open_folder.clicked.connect(self._on_open_folder)
         self.combo_speed.currentIndexChanged.connect(self._on_speed_changed)
         self.cb_speed_default.toggled.connect(self._on_speed_default)
@@ -425,7 +410,6 @@ class InterpPane(QWidget):
     def _kv_sync_all_from_runtime(self):
         self._kv_write("rife/multiplier", int(self.slider.value()))
         self._kv_write("rife/streaming", int(self.cb_stream.isChecked()))
-        self._kv_write("rife/autoplay", int(self.cb_autoplay.isChecked()))
         self._kv_write("rife/speed_idx", int(self.combo_speed.currentIndex()))
         self._kv_write("rife/speed_default", int(self.cb_speed_default.isChecked()))
         self._kv_write("rife/model_key", self.combo_model.currentData())
@@ -480,7 +464,6 @@ class InterpPane(QWidget):
         s=self.settings
         self.slider.setValue(int(s.value("rife/multiplier", 200)))
         self.cb_stream.setChecked(bool(int(s.value("rife/streaming", 0))))
-        self.cb_autoplay.setChecked(bool(int(s.value("rife/autoplay", 1))))
         self.combo_speed.setCurrentIndex(int(s.value("rife/speed_idx", 4)))
         self.cb_speed_default.setChecked(bool(int(s.value("rife/speed_default", 0))))
         model_key = s.value("rife/model_key", "rife-UHD")
@@ -509,7 +492,6 @@ class InterpPane(QWidget):
         s=self.settings
         s.setValue('rife/multiplier', int(self.slider.value()))
         s.setValue('rife/streaming', int(self.cb_stream.isChecked()))
-        s.setValue('rife/autoplay', int(self.cb_autoplay.isChecked()))
         s.setValue('rife/speed_idx', int(self.combo_speed.currentIndex()))
         s.setValue('rife/speed_default', int(self.cb_speed_default.isChecked()))
         s.setValue('rife/model_key', self.combo_model.currentData())
@@ -728,10 +710,6 @@ class InterpPane(QWidget):
         self._set_ok("Result: ready")
         self.settings.setValue("rife/last_output", str(out_path))
         self._refresh_recent()
-        if self.cb_autoplay.isChecked():
-            player = getattr(self.main,"video",None)
-            if player and hasattr(player,"open"):
-                player.open(str(out_path))
 
     # ---- actions ----
 
@@ -806,19 +784,9 @@ class InterpPane(QWidget):
         try:
             if QueueSystem: QueueSystem(self.ROOT).nudge_pending()
         except Exception: pass
-
-    def _on_play_last_internal(self):
-        self._set_ok('Result: opened')
-        p = self._last_expected_output or str(self.settings.value("rife/last_output",""))
-        if not p: QMessageBox.information(self, "Play last", "No recent result yet."); return
         player = getattr(self.main, "video", None)
         if player and hasattr(player, "open"): player.open(p); self.main.current_path = _P_INT(str(p)); refresh_info_now(p); return
         QDesktopServices.openUrl(QUrl.fromLocalFile(p))
-
-    def _on_play_last_external(self):
-        self._set_ok('Result: opened (external)')
-        p = self._last_expected_output or str(self.settings.value("rife/last_output",""))
-        if not p: QMessageBox.information(self, "External player", "No recent result yet."); return
         QDesktopServices.openUrl(QUrl.fromLocalFile(p))
 
     def _on_slider_changed(self, v: int):
@@ -883,20 +851,44 @@ class InterpPane(QWidget):
                 except Exception:
                     pass
                 if outp:
-                    player = getattr(self.main, "video", None)
-                    if player and hasattr(player, "open"):
-                        player.open(outp); self.settings.setValue("rife/last_output", outp); self._refresh_recent(); return
+                    self.settings.setValue("rife/last_output", outp)
+                    self._refresh_recent()
+                    return
                 try:
                     data = json.loads(Path(j).read_text(encoding="utf-8")); prod = data.get("produced","")
                     if prod:
-                        player = getattr(self.main, "video", None)
-                        if player and hasattr(player, "open"):
-                            player.open(prod); self.settings.setValue("rife/last_output", prod); self._refresh_recent(); return
+                        self.settings.setValue("rife/last_output", prod)
+                        self._refresh_recent()
+                        return
                 except Exception:
                     pass
                 break
         except Exception:
             self._watch_timer.stop(); return
+
+
+    def _open_in_player(self, p: Path) -> bool:
+        """Try to open a video in the app's internal player. Return True on success, else False."""
+        try:
+            player = getattr(self.main, "video", None)
+            if player and hasattr(player, "open"):
+                try:
+                    player.open(p)
+                except TypeError:
+                    # some builds expect string path
+                    player.open(str(p))
+                try:
+                    self.main.current_path = _P_INT(str(p))
+                except Exception:
+                    pass
+                try:
+                    refresh_info_now(p)
+                except Exception:
+                    pass
+                return True
+        except Exception:
+            pass
+        return False
 
     # ---- recent gallery ----
     def _refresh_recent(self):
@@ -922,7 +914,7 @@ class InterpPane(QWidget):
                 lbl.setText(v.stem)
             lbl.setToolTip(v.name)
             lbl.setCursor(Qt.PointingHandCursor)
-            lbl.mousePressEvent = (lambda p=v: (lambda evt: QDesktopServices.openUrl(QUrl.fromLocalFile(str(p)))) )()
+            lbl.mousePressEvent = (lambda p=v: (lambda evt: (self._open_in_player(p) or QDesktopServices.openUrl(QUrl.fromLocalFile(str(p))))))()
             self.recent_h.addWidget(lbl)
         self.recent_h.addStretch(1)
 
@@ -981,10 +973,6 @@ def _interp_persist(self):
             v = int(self.cb_stream.isChecked())
             _set('rife/streaming', v); 
             if s is not None: s.setValue('check/interp_stream', bool(v))
-        if hasattr(self, 'cb_autoplay') and self.cb_autoplay is not None:
-            v = int(self.cb_autoplay.isChecked())
-            _set('rife/autoplay', v);
-            if s is not None: s.setValue('check/interp_autoplay', bool(v))
         if hasattr(self, 'combo_speed') and self.combo_speed is not None:
             idx = int(self.combo_speed.currentIndex())
             _set('rife/speed_idx', idx);
@@ -1021,9 +1009,6 @@ def _interp_restore(self):
         if hasattr(self, 'cb_stream') and self.cb_stream is not None:
             v = int(_get('rife/streaming', s.value('rife/streaming', int(self.cb_stream.isChecked()), int) if s is not None else None, int(self.cb_stream.isChecked())))
             self.cb_stream.setChecked(bool(v))
-        if hasattr(self, 'cb_autoplay') and self.cb_autoplay is not None:
-            v = int(_get('rife/autoplay', s.value('rife/autoplay', int(self.cb_autoplay.isChecked()), int) if s is not None else None, int(self.cb_autoplay.isChecked())))
-            self.cb_autoplay.setChecked(bool(v))
         if hasattr(self, 'combo_speed') and self.combo_speed is not None:
             idx = int(_get('rife/speed_idx', s.value('rife/speed_idx', int(self.combo_speed.currentIndex()), int) if s is not None else None, int(self.combo_speed.currentIndex())))
             self.combo_speed.setCurrentIndex(idx)
@@ -1038,7 +1023,6 @@ def _interp_restore(self):
         # Give global restorer stable names
         try:
             self.cb_stream.setObjectName('interp_stream')
-            self.cb_autoplay.setObjectName('interp_autoplay')
             self.cb_speed_default.setObjectName('interp_speed_default')
             self.combo_speed.setObjectName('interp_speed_profile')
             self.combo_model.setObjectName('interp_model')
@@ -1054,7 +1038,7 @@ def _interp_connect(self):
     try:
         if hasattr(self, 'slider') and self.slider is not None:
             self.slider.valueChanged.connect(lambda *_: _interp_persist(self))
-        for name in ('cb_stream','cb_autoplay','cb_speed_default'):
+        for name in ('cb_stream','cb_speed_default'):
             if hasattr(self, name):
                 getattr(self, name).toggled.connect(lambda *_: _interp_persist(self))
         for name in ('combo_speed','combo_model'):
