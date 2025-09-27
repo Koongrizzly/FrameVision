@@ -134,7 +134,7 @@ def _read_tags_with_mutagen(path: Path) -> dict:
 def _read_tags_with_ffprobe(path: Path) -> dict:
     try:
         out = subprocess.check_output(
-            [ffprobe_path(), '-hide_banner', '-v', 'error', '-show_format', '-show_streams', '-of', 'json', str(path)],
+            [ffprobe_path(), '-hide_banner', '-loglevel', 'error', '-show_format', '-show_streams', '-of', 'json', str(path)],
             text=True
         )
         data = json.loads(out)
@@ -161,7 +161,7 @@ def _extract_cover(path: Path) -> Optional[QPixmap]:
     # ffprobe/ffmpeg attached pic
     try:
         out = subprocess.check_output(
-            [ffprobe_path(), '-hide_banner', '-v', 'error', '-select_streams', 'v', '-show_entries', 'stream=disposition,codec_type', '-of', 'json', str(path)],
+            [ffprobe_path(), '-hide_banner', '-loglevel', 'error', '-select_streams', 'v', '-show_entries', 'stream=disposition,codec_type', '-of', 'json', str(path)],
             text=True
         )
         data = json.loads(out)
@@ -173,7 +173,7 @@ def _extract_cover(path: Path) -> Optional[QPixmap]:
                 break
         if ok:
             target = OUT_TEMP / f'{path.stem}_cover.jpg'
-            subprocess.check_output([ffmpeg_path(), '-hide_banner', '-nostats', '-v', 'error', '-y', '-i', str(path), '-an', '-vcodec', 'copy', str(target)],
+            subprocess.check_output([ffmpeg_path(), '-hide_banner', '-nostats', '-loglevel', 'error', '-y', '-i', str(path), '-an', '-vcodec', 'copy', str(target)],
                                     stderr=subprocess.STDOUT, text=True)
             if target.exists() and target.stat().st_size > 0:
                 return QPixmap(str(target))
@@ -249,94 +249,125 @@ class PreAnalyzer(QThread):
 
     def run(self):
         ff = ffmpeg_path()
-        cmd = [ff, '-hide_banner', '-nostats', '-v', 'error', '-i', str(self.path), '-vn', '-ac', '1', '-ar', str(self.sr), '-f', 'f32le', 'pipe:1']
+        cmd = [ff, '-hide_banner', '-nostats', '-loglevel', 'error', '-i', str(self.path), '-vn', '-ac', '1', '-ar', str(self.sr), '-f', 'f32le', 'pipe:1']
         try:
-            p = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            p = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
         except Exception:
             self.ready.emit([], [], [])
             return
 
         hop = max(1, int(self.sr * self.hop_ms / 1000))
+        # Use a larger FFT for better bass resolution
+        n_fft = 1
+        while n_fft < max(hop * 2, 2048):
+            n_fft *= 2
+
         buf = b''
         times_ms: List[int] = []
         bands_mat: List[List[float]] = []
         rms_list: List[float] = []
         read = p.stdout.read  # type: ignore[attr-defined]
         idx = 0
+        emitted_initial = False
+        last_emit_ms = 0
+        INITIAL_MS = 2500  # first partial emit ~2.5s
+        PERIODIC_MS = 2000  # then every ~2s
 
         freqs = None
         edges = None
+        centers = None
 
         while True:
             chunk = read(8192)
             if not chunk:
                 break
             buf += chunk
-            while len(buf) >= hop * 4:
-                window = buf[:hop * 4]
+
+            while len(buf) >= max(hop, n_fft) * 4:
+                if len(buf) < n_fft * 4:
+                    break
+                window = buf[:n_fft * 4]
                 buf = buf[hop * 4:]
-                n = hop
+
                 try:
-                    vals = struct.unpack('<' + 'f' * n, window[:n * 4])
-                except Exception:
-                    self.ready.emit([], [], [])
-                    try:
-                        p.kill()
-                    except Exception:
-                        pass
-                    return
-
-                # RMS
-                sm = 0.0
-                for v in vals:
-                    sm += v * v
-                rms = (sm / max(1, n)) ** 0.5
-
-                # Bands
-                # Bands (robust log-spaced, with nearest-bin fallback + mean power)
-                if _np is not None:
+                    if _np is None:
+                        raise RuntimeError('numpy required for high-quality analysis')
                     import numpy as np
-                    arr = np.frombuffer(window, dtype='<f4', count=n)
+                    arr = np.frombuffer(window, dtype='<f4', count=n_fft)
                     win = np.hanning(arr.size)
-                    spec_c = np.fft.rfft(arr * win)
-                    spec = np.abs(spec_c)
-                    # Per-frame normalize to avoid clipping but keep dynamics
-                    if spec.max() > 0:
-                        spec = spec / spec.max()
+                    spec_c = np.fft.rfft(arr * win, n=n_fft)
+                    mag = np.abs(spec_c)
+                    if mag.max() > 0:
+                        mag = mag / mag.max()
+
+                    # RMS over hop-sized slice
+                    hop_samples = hop
+                    td_chunk = arr[:hop_samples] if hop_samples <= arr.size else arr
+                    rms = float(np.sqrt(np.mean(td_chunk**2))) if td_chunk.size else 0.0
+
                     if freqs is None:
-                        freqs = np.linspace(0, self.sr / 2, spec.size)
-                        # start at >=20 Hz, end at Nyquist
-                        lo_start = max(20.0, float(freqs[1] if spec.size > 1 else 20.0))
-                        edges = np.geomspace(lo_start, max(60.0, self.sr / 2), num=self.bands + 1)
+                        freqs = np.linspace(0, self.sr / 2.0, mag.size)
+                        lo_start = 20.0
+                        edges = np.geomspace(lo_start, self.sr / 2.0, num=self.bands + 1)
+                        centers = np.sqrt(edges[:-1] * edges[1:])
+
                     out = []
                     for i in range(self.bands):
-                        lo, hi = float(edges[i]), float(edges[i + 1])
-                        mask = (freqs >= lo) & (freqs < hi)
-                        if mask.any():
-                            # mean power within the band
-                            val = float(spec[mask].mean())
-                        else:
-                            # nearest-bin fallback so every band moves (helps for very low bass)
-                            center = (lo + hi) * 0.5
-                            idxn = int(np.argmin(np.abs(freqs - center)))
-                            val = float(spec[idxn]) if 0 <= idxn < spec.size else 0.0
+                        lo = float(edges[i]); hi = float(edges[i + 1]); c = float(centers[i])
+                        mask = (freqs >= lo) & (freqs <= hi)
+                        if not mask.any():
+                            val = float(np.interp(c, freqs, mag))
+                            out.append(val)
+                            continue
+                        fsel = freqs[mask]; msel = mag[mask]
+                        w = np.where(fsel <= c,
+                                      (fsel - lo) / max(1e-9, (c - lo)),
+                                      (hi - fsel) / max(1e-9, (hi - c)))
+                        w = np.clip(w, 0.0, 1.0)
+                        sw = np.sum(w)
+                        val = float(np.sum(msel * w) / sw) if sw > 1e-9 else float(msel.mean())
                         out.append(val)
 
-                else:
-                    # lightweight fallback (amplitude buckets)
+                except Exception:
+                    # Fallback if numpy path fails
+                    n = n_fft
+                    try:
+                        vals = struct.unpack('<' + 'f' * n, window[:n * 4])
+                    except Exception:
+                        self.ready.emit([], [], [])
+                        try:
+                            p.kill()
+                        except Exception:
+                            pass
+                        return
                     step = max(1, n // (self.bands * 2))
                     out = []
+                    sm = 0.0
                     for i in range(self.bands):
                         seg = vals[i * step:(i + 1) * step]
                         mvv = 0.0
                         for x in seg:
                             mvv = max(mvv, abs(x))
+                            sm += x*x
                         out.append(min(1.0, mvv * 2.0))
+                    rms = (sm / max(1, n)) ** 0.5
 
                 bands_mat.append(out)
                 rms_list.append(min(1.0, rms * 2.2))
-                times_ms.append(idx * self.hop_ms)
+                t_ms = idx * self.hop_ms
+                times_ms.append(t_ms)
                 idx += 1
+                # Incremental partial results
+                try:
+                    if (not emitted_initial) and (t_ms >= INITIAL_MS):
+                        self.ready.emit(list(times_ms), list(bands_mat), list(rms_list))
+                        emitted_initial = True
+                        last_emit_ms = t_ms
+                    elif emitted_initial and (t_ms - last_emit_ms) >= PERIODIC_MS:
+                        self.ready.emit(list(times_ms), list(bands_mat), list(rms_list))
+                        last_emit_ms = t_ms
+                except Exception:
+                    pass
 
         try:
             p.kill()
@@ -360,6 +391,13 @@ class HybridAnalyzer(QObject):
         self._timer = QTimer(self)
         self._timer.timeout.connect(self._tick)
 
+        self._seg_cache = {}
+        self._seg_window_ms = 12000  # keep ~12s around last seeks
+        try:
+            if hasattr(self.player, 'positionChanged'):
+                self.player.positionChanged.connect(self._on_pos_changed)
+        except Exception:
+            pass
         self._probe_ok = False
         self._probe_levels: Optional[List[float]] = None
         self._probe_rms: float = 0.0
@@ -435,36 +473,95 @@ class HybridAnalyzer(QObject):
             pass
 
     def _tick(self):
-        # Prefer position-synced preanalysis
+
+
+        # Prefer cached segment data around current position
+        try:
+            pos = int(getattr(self.player, 'position', lambda: 0)())
+        except Exception:
+            pos = 0
+        # look for exact/nearest t_ms within one hop
+        near = None
+        if getattr(self, '_seg_cache', None):
+            ks = list(self._seg_cache.keys())
+            if ks:
+                near = min(ks, key=lambda k: abs(k - pos))
+                if abs(near - pos) > max(1, self._hop_ms):
+                    near = None
+        if near is not None:
+            b, r = self._seg_cache.get(near, (None, None))
+            if b is not None:
+                self.levelsReady.emit(b)
+                self.rmsReady.emit(float(r or 0.0))
+                return
+        # Fall back to position-synced preanalysis if available
         if self._times and self._bands:
             try:
-                pos = int(self.player.position())
+                idx = int(round(pos / max(1, self._hop_ms)))
             except Exception:
-                pos = 0
-            idx = int(round(pos / max(1, self._hop_ms)))
-            if idx < 0:
                 idx = 0
-            if idx >= len(self._bands):
-                idx = len(self._bands) - 1
-            bands = self._bands[idx] if self._bands else [0.0] * self.bands
-            rms = self._rms[idx] if idx < len(self._rms) else 0.0
-            self.levelsReady.emit(bands)
-            self.rmsReady.emit(rms)
-            return
-
-        # Probe fallback
-        if self._probe_levels is not None:
+            if 0 <= idx < len(self._bands):
+                bands = self._bands[idx]
+                rms = self._rms[idx] if idx < len(self._rms) else 0.0
+                self.levelsReady.emit(bands)
+                self.rmsReady.emit(rms)
+                return
+            if getattr(self, '_probe_levels', None) is not None:
+                self.levelsReady.emit(self._probe_levels)
+                self.rmsReady.emit(self._probe_rms)
+                return
+        # Probe fallback when no preanalysis yet
+        if getattr(self, '_probe_levels', None) is not None:
             self.levelsReady.emit(self._probe_levels)
             self.rmsReady.emit(self._probe_rms)
             return
 
-        # Gentle breathing fallback
-        t = _time.time()
-        out = [0.5 + 0.5 * math.sin(t * 1.6 + i * 0.35) for i in range(self.bands)]
-        self.levelsReady.emit(out)
-        self.rmsReady.emit(0.5)
-
-# ---------------- Visuals ----------------
+    def run(self):
+        try:
+            ff = ffmpeg_path()
+            preroll = 200  # ms preroll to stabilize decoder
+            ss = max(0, self.start_ms - preroll)
+            t = self.dur_ms + preroll
+            cmd = [
+                ff, '-hide_banner', '-nostats', '-loglevel', 'error',
+                '-ss', f'{ss/1000:.3f}', '-t', f'{t/1000:.3f}',
+                '-i', str(self.path), '-vn',
+                '-f', 'f32le', '-ac', '1', '-ar', '24000', 'pipe:1'
+            ]
+            p = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+            import struct, math
+            hop = int(round(0.001 * self.hop_ms * 24000))
+            if hop <= 0: hop = 480
+            win = hop * 2
+            data = p.stdout.read()
+            mv = memoryview(data)
+            step = 4  # float32
+            total = len(mv)//step
+            frames = total // hop
+            bands_mat, rms_list, times_ms = [], [], []
+            for i in range(frames):
+                base = i*hop
+                end = min(total, base+win)
+                if end <= base: continue
+                peak = 0.0
+                off = base*step
+                for j in range(base, end):
+                    v = struct.unpack_from('<f', mv, j*step)[0]
+                    if abs(v) > peak: peak = abs(v)
+                # simple peak-to-bands distribution (flat) to stay fast
+                level = min(1.0, peak*2.0)
+                out = [level for _ in range(self.bands)]
+                bands_mat.append(out)
+                rms_list.append(min(1.0, level*1.1))
+                t_ms = self.start_ms + (i*self.hop_ms)
+                times_ms.append(t_ms)
+            try:
+                p.kill()
+            except Exception:
+                pass
+            self.ready_segment.emit(self.start_ms, times_ms, bands_mat, rms_list)
+        except Exception:
+            pass
 
 class VisualEngine(QObject):
     frameReady = Signal(QImage)
@@ -480,6 +577,8 @@ class VisualEngine(QObject):
         self._levels = [0.0] * bars
         self._rms = 0.0
         self._bars = bars
+        # High-shelf visual tilt (0.0–0.5). 0.18 ≈ +1.5dB at top band
+        self._high_tilt = 0.18
         self._plugin = None
         _load_visual_plugins()
 
@@ -507,10 +606,81 @@ class VisualEngine(QObject):
         self._plugin = None
         self.mode = mode
 
+    
+    
+    
+    
     def inject_levels(self, levels: List[float]):
-        if levels and len(levels) >= self._bars:
-            self._levels = levels[:self._bars]
+        """Ultra-responsive bass: instant attack + fast release for lowest bands.
+        - Bass bands: no attack lag (direct passthrough on rise), fast controlled decay.
+        - Other bands: mild asymmetric EMA for smoothness.
+        """
+        if not levels:
+            return
+        if len(levels) < self._bars:
+            vals = levels + [0.0] * (self._bars - len(levels))
+        else:
+            vals = levels[:self._bars]
 
+        # Init buffers
+        if not hasattr(self, "_levels_smooth") or not self._levels_smooth or len(self._levels_smooth) != self._bars:
+            self._levels_smooth = list(vals)
+            self._levels = list(vals)
+            return
+
+        out = [0.0] * self._bars
+
+        # Define bass region size (captures kick fundamentals + first harmonics)
+        bass_k = max(8, self._bars // 6)
+
+        for i, v in enumerate(vals):
+            prev = self._levels_smooth[i]
+            v = float(v)
+
+            if i < bass_k:
+                # === Bass bands: zero-lag attack ===
+                if v >= prev:
+                    s = v  # immediate rise, no EMA
+                else:
+                    # Fast release per frame at ~30fps
+                    decay = 0.40
+                    s = max(v, prev - decay)
+                out[i] = s
+            else:
+                # === Other bands: gentle asymmetry ===
+                rising = v >= prev
+                if i < max(16, self._bars // 4):        # low-mids
+                    alpha_up, alpha_down = 0.34, 0.18
+                elif i < max(24, self._bars // 2):      # mids
+                    alpha_up, alpha_down = 0.30, 0.20
+                else:                                    # highs
+                    alpha_up, alpha_down = 0.36, 0.26
+                a = alpha_up if rising else alpha_down
+                out[i] = prev * (1.0 - a) + v * a
+
+        # Minimal neighbor blend on the first few bins to avoid isolated spikes
+        tiny = min(3, max(2, self._bars // 20))
+        for i in range(tiny):
+            left  = out[i - 1] if i - 1 >= 0 else out[i]
+            right = out[i + 1] if i + 1 < self._bars else out[i]
+            out[i] = 0.92 * out[i] + 0.04 * (left + right)
+
+        # Apply gentle high-shelf tilt: progressively boost higher bands a little
+        try:
+            hb = float(getattr(self, '_high_tilt', 0.18))
+        except Exception:
+            hb = 0.18
+        if hb > 0.0 and self._bars > 1:
+            top = self._bars - 1
+            for i in range(self._bars):
+                t = i / top
+                # perceptual-ish curve; raise highs up to ~+hb
+                gain = 1.0 + hb * (t ** 0.9)
+                out[i] = min(1.0, out[i] * gain)
+        self._levels_smooth = out
+        self._levels = out
+
+    
     def inject_rms(self, rms: float):
         self._rms = float(max(0.0, min(1.0, rms)))
 
@@ -726,7 +896,6 @@ class MusicOverlay(QWidget):
                 
         row_vis2 = QHBoxLayout()
         row_vis2.addWidget(self.chk_auto)
-        row_vis2.addWidget(self.btn_vizmode)
         row_vis2.addSpacing(8)
         row_vis2.addWidget(QLabel('Every'))
         row_vis2.addWidget(self.cmb_beats)
@@ -799,6 +968,14 @@ class MusicOverlay(QWidget):
             except Exception:
                 pass
         QTimer.singleShot(0, _hook_window)
+
+        # Also install event filter on the combo popup view (for wheel/scroll)
+        try:
+            v = self.cmb_visual.view()
+            if v:
+                v.installEventFilter(self)
+        except Exception:
+            pass
 
         # start the inactivity timer immediately
         QTimer.singleShot(0, lambda: self._activity())
@@ -962,8 +1139,24 @@ class MusicOverlay(QWidget):
     # ----- playlist helpers -----
     def _add_files(self):
         mw = self.video.window()
-        paths, _ = QFileDialog.getOpenFileNames(mw, 'Add audio files', str(ROOT),
-                                                'Audio files (*.mp3 *.wav *.flac *.m4a *.aac *.ogg *.opus *.wma *.aif *.aiff)')
+        # Load last directory from state (falls back to ROOT)
+        try:
+            st = _load_state()
+            start_dir = st.get('last_add_dir', str(ROOT))
+        except Exception:
+            start_dir = str(ROOT)
+        paths, _ = QFileDialog.getOpenFileNames(
+            mw, 'Add audio files', start_dir,
+            'Audio files (*.mp3 *.wav *.flac *.m4a *.aac *.ogg *.opus *.wma *.aif *.aiff)')
+        if paths:
+            # Save the directory for next time
+            try:
+                st = _load_state()
+                from pathlib import Path as _P
+                st['last_add_dir'] = str(_P(paths[0]).parent)
+                _save_state(st)
+            except Exception:
+                pass
         for p in paths:
             self.add_track(Path(p))
 
@@ -1330,12 +1523,18 @@ class MusicRuntime(QObject):
             self.overlay.btn_visuals.toggled.connect(lambda c: self.overlay.btn_visuals.setText('Visuals off' if c else 'Visuals on'))
         except Exception:
             pass
+        # Persist current viz mode (1/all/random) when user toggles the mode button
+        try:
+            self.overlay.btn_vizmode.clicked.connect(lambda: self._persist_state())
+        except Exception:
+            pass
         # load state
         st = _load_state()
         try:
             vis_on = bool(st.get('visuals_on', False))
-            self.overlay.btn_visuals.setChecked(vis_on)
-            self.visual.set_enabled(vis_on)
+            # OVERRIDE: always start OFF on app launch (analysis still runs when playback starts)
+            self.overlay.btn_visuals.setChecked(False)
+            self.visual.set_enabled(False)
             last_mode = st.get('visual_mode_name')
             if last_mode:
                 # find index
@@ -1538,21 +1737,28 @@ def wire_to_videopane(VideoPaneClass):
         p = Path(str(path))
         ext = p.suffix.lower()
         if ext in AUDIO_EXTS:
+            # Remember the folder of the opened track for next Add…
+            try:
+                st = _load_state()
+                st['last_add_dir'] = str(p.parent)
+                _save_state(st)
+            except Exception:
+                pass
             result = orig_open(self, path)  # keep existing player logic
             # runtime
             if not hasattr(self, '_music_runtime') or self._music_runtime is None:
                 self._music_runtime = MusicRuntime(self)
             rt = self._music_runtime
-            # overlay
+            # overlay (wire once; don't reset visuals each track)
             if (not hasattr(self, '_music_overlay')) or self._music_overlay is None:
                 self._music_overlay = MusicOverlay(self, parent=self)
+                rt.set_overlay(self._music_overlay)
             else:
                 if self._music_overlay.parent() is not self:
                     self._music_overlay.setParent(self)
                 self._music_overlay.show()
                 self._music_overlay._reposition()
                 self._music_overlay.raise_()
-            rt.set_overlay(self._music_overlay)
 
             # tags/cover
             tags = _read_all_tags(p)

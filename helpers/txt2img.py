@@ -1,7 +1,14 @@
 from __future__ import annotations
 
-# (safeguard) Using Qt's default image allocation caps to avoid exhausting memory.
-
+# === QImageIO maxalloc disabled by patch ===
+import os as _qt_img_os
+_qt_img_os.environ["QT_IMAGEIO_MAXALLOC"] = "0"  # Disable env-based cap (0 = no limit)
+try:
+    from PySide6.QtGui import QImageReader as _QIR
+    _QIR.setAllocationLimit(0)  # Disable runtime cap as well
+except Exception as _e:
+    pass
+# === end patch ===
 
 # --- Quiet mode: suppress harmless logs/warnings for end users ---
 import os, warnings
@@ -57,31 +64,26 @@ def _safe_snap_size(w:int, h:int, presets=None):
     try:
         presets = presets or [
             # 1:1
-            (320,320),(480,480),(640,640),(960,960),(1024,1024),(1440,1440),
 
+
+            ("896x896 (1:1)", 896, 896),
+            ("512x512 (1:1)", 512, 512),
+            (320,320),(480,480),(640,640),(960,960),(1024,1024),(1440,1440),
             # 16:9 landscape
-            (854,480),(1280,720),(1536,864),(1920,1080),(2560,1440),
+            (1280,720),(1536,864),(1920,1080),(2560,1440),
             # 9:16 portrait
-            (480,854),(720,1280),(864,1536),(1080,1920),(1440,2560),
+            (720,1280),(864,1536),(1080,1920),(1440,2560),
             # 640p-ish 16:9 (Apple-ish) + portrait
             (1136,640),(640,1136),
             # Cinematic + their portrait
             (1280,544),(544,1280),
-
-            # 4:3 landscape
-            (640,480),(800,600),(1024,768),
-            # 3:4 portrait
-            (480,640),(600,800),(768,1024),
-
-            # 3:2 & 2:3
+            # 3:2 and 2:3
             (1152,768),(1536,1024),(768,1152),(1024,1536),
-
-            # 7:9 & 9:7
+            # 7:9 and 9:7
             (1152,896),(896,1152),
-
-            # Existing UI sizes seen in project
-            (1104,832),(832,1104),
-        ]
+            # 4:3 and 3:4
+            (640,480),(800,600),(1024,768),(1104,832),(480,640),(600,800),(768,1024),(832,1104)
+        ]# round to multiples of 64
         def r64(x):
             return max(256, int(round(x/64))*64)
         w64, h64 = r64(w), r64(h)
@@ -318,17 +320,6 @@ class Txt2ImgPane(QWidget):
             pass  # default removed; will restore via UI
         self.preset_combo.addItems(["Street Photography","Fantasy Realism","Cinematic / Moody","Product / Clean","Landscape / Golden Hour","Neon Cyberpunk","Anime Clean","Isometric 3D","Macro / Shallow DOF","Illustration / Watercolor","Realistic Portrait Pro","Outdoor Documentary","Food Styling / Clean","Architectural Interior","Fashion Illustration","Portrait / Soft"])
         self.preset_combo.setCurrentIndex(0)
-
-        # Added custom film/era/3D plush presets (SDXL-oriented)
-        self.preset_combo.addItems([
-            "Old Film (B&W)",
-            "Old Film (Sepia/Vintage Color)",
-            "1960s Style",
-            "1980s Style",
-            "Feature Animation (3D)",
-            "Fluffy / Plush Dreamy"
-        ])
-
         try:
             self.preset_combo.currentTextChanged.connect(self._apply_preset)
         except Exception:
@@ -464,61 +455,7 @@ class Txt2ImgPane(QWidget):
             "Fantasy Realism": {"sampler":"Euler a","steps":32,"cfg":6.5,"size":(1024,1024),
                                 "neg":"cartoonish, low-detail"},
             "Street Photography": {"sampler":"Heun","steps":30,"cfg":5.0,"size":(1152,768),
-                                   "neg":"motion smear, excessive noise"}                                       , "Old Film (B&W)": {
-                                           "sampler": "DPM++ 2M (Karras)",
-                                           "steps": 32,
-                                           "cfg": 5.7,
-                                           "size": (1104, 832),
-                                           "neg": "color, neon tones, HDR, oversharpened, CGI, modern digital look",
-                                           "prompt_add": "black-and-white, 1950s film photo, silver-gelatin print, deep shadows, pronounced film grain, soft halation, subtle vignette, classic lens rendering",
-                                           "force_neg_append": True
-                                       },
-                                       "Old Film (Sepia/Vintage Color)": {
-                                           "sampler": "DPM++ 2M (Karras)",
-                                           "steps": 32,
-                                           "cfg": 5.7,
-                                           "size": (1104, 832),
-                                           "neg": "neon tones, HDR, oversharpened, CGI, modern digital look",
-                                           "prompt_add": "faded sepia, aged print, muted vintage colors, slight color shift, soft halation, subtle vignette, classic lens rendering",
-                                           "force_neg_append": True
-                                       },
-                                       "1960s Style": {
-                                           "sampler": "DPM++ 2M (Karras)",
-                                           "steps": 30,
-                                           "cfg": 5.5,
-                                           "size": (1536, 864),
-                                           "neg": "washed-out faces, neon cyberpunk, heavy bloom, modern cinematic teal-and-orange, CGI",
-                                           "prompt_add": "1960s retro color photo, Kodachrome-inspired palette, soft halation, gentle film grain, pastel primaries, period styling, natural skin tones, slight vignette, studio flash bounce",
-                                           "force_neg_append": True
-                                       },
-                                       "1980s Style": {
-                                           "sampler": "DPM++ 2M (Karras)",
-                                           "steps": 34,
-                                           "cfg": 6.0,
-                                           "size": (1280, 720),
-                                           "neg": "washed colors, muddy blacks, modern flat grading, gritty realism",
-                                           "prompt_add": "1980s retro aesthetic, neon glow, chrome accents, magenta-cyan palette, soft bloom, light film grain, subtle VHS scanlines, grid horizon, lens flare highlights, slight chromatic aberration",
-                                           "force_neg_append": True
-                                       },
-                                       "Feature Animation (3D)": {
-                                           "sampler": "DPM++ 2M (Karras)",
-                                           "steps": 30,
-                                           "cfg": 5.5,
-                                           "size": (1024, 1024),
-                                           "neg": "photorealistic pores, gritty realism, harsh noise, grim mood, over-textured skin",
-                                           "prompt_add": "stylized 3D character render, expressive large eyes, soft global illumination, subsurface scattering, smooth plasticine textures, soft rim light, shallow depth of field, bright friendly palette, clean topology",
-                                           "force_neg_append": True
-                                       },
-                                       "Fluffy / Plush Dreamy": {
-                                           "sampler": "DPM++ 2M (Karras)",
-                                           "steps": 36,
-                                           "cfg": 5.5,
-                                           "size": (1024, 1536),
-                                           "neg": "hard specular highlights, gritty sharpness, harsh shadows, wet/glossy fur",
-                                           "prompt_add": "soft plush texture, velvety fur fibers, dreamy pastel palette, creamy bokeh, gentle bloom, airy lighting, cozy mood, soft focus falloff",
-                                           "force_neg_append": True
-                                       }
-
+                                   "neg":"motion smear, excessive noise"}
         }
         cfg = presets.get(name)
         if not cfg:
@@ -538,7 +475,35 @@ class Txt2ImgPane(QWidget):
         try:
             w,h = cfg["size"]
             if hasattr(self, "size_combo"):
-                self.size_combo.setCurrentText(f"{w}x{h} (1:1)" if w==h else f"{w}x{h}")
+                try:
+
+                    idx = -1
+
+                    for i in range(self.size_combo.count()):
+
+                        d = self.size_combo.itemData(i)
+
+                        if d and int(d[0]) == int(w) and int(d[1]) == int(h):
+
+                            idx = i
+
+                            break
+
+                    if idx >= 0:
+
+                        self.size_combo.blockSignals(True)
+
+                        self.size_combo.setCurrentIndex(idx)
+
+                        self.size_combo.blockSignals(False)
+
+                    else:
+
+                        self.size_combo.setCurrentText(f"{w}x{h} (1:1)" if w==h else f"{w}x{h}")
+
+                except Exception:
+
+                    pass
             if hasattr(self, "size_manual_w"): self.size_manual_w.setValue(w)
             if hasattr(self, "size_manual_h"): self.size_manual_h.setValue(h)
         except Exception:
@@ -548,27 +513,6 @@ class Txt2ImgPane(QWidget):
                 self.negative.setPlainText(cfg["neg"])
         except Exception:
             pass
-            try:
-                add = cfg.get("prompt_add")
-                if add:
-                    cur = (self.prompt.toPlainText() or "").strip()
-                    if cur:
-                        if add.lower() not in cur.lower():
-                            sep = ", " if not cur.endswith((",", " ")) else ""
-                            self.prompt.setPlainText(cur + sep + add)
-                    else:
-                        self.prompt.setPlainText(add)
-            except Exception:
-                pass
-            try:
-                if cfg.get("force_neg_append"):
-                    neg_add = cfg.get("neg") or ""
-                    curneg = (self.negative.toPlainText() or "").strip()
-                    if neg_add and neg_add.lower() not in curneg.lower():
-                        sep = ", " if curneg and not curneg.endswith((",", " ")) else ""
-                        self.negative.setPlainText((curneg + sep + neg_add).strip(", ").strip())
-            except Exception:
-                pass
     def _build_ui(self):
         outer = QVBoxLayout(self)
         outer.setContentsMargins(10,10,10,10)
@@ -604,7 +548,7 @@ class Txt2ImgPane(QWidget):
         self.seed_policy = QComboBox(); self.seed_policy.addItems(["Fixed (use seed)", "Random", "Increment"]); self.seed_policy.setCurrentIndex(1)
         self.batch = QSpinBox(); self.batch.setRange(1, 64); self.batch.setValue(1)
         row.addWidget(QLabel("Seed:")); row.addWidget(self.seed)
-        row.addWidget(QLabel("Policy:")); row.addWidget(self.seed_policy)
+        row.addWidget(QLabel("")); row.addWidget(self.seed_policy)
         row.addWidget(QLabel("Batch:")); row.addWidget(self.batch)
         form.addRow(row)
 
@@ -617,51 +561,51 @@ class Txt2ImgPane(QWidget):
             # 1:1
             ("320x320 (1:1)", 320, 320),
             ("480x480 (1:1)", 480, 480),
+            ("512x512 (1:1)", 512, 512),
             ("640x640 (1:1)", 640, 640),
             ("768x768 (1:1)", 768, 768),
+            ("896x896 (1:1)", 896, 896),
             ("960x960 (1:1)", 960, 960),
             ("1024x1024 (1:1)", 1024, 1024),
-            ("1440x1440 (1:1)", 1440, 1440),
-            # 16:9
-            ("854x480 (16:9)", 854, 480),
-            ("1280x720 (16:9)", 1280, 720),
-            ("1536x864 (16:9)", 1536, 864),
-            ("1920x1080 (16:9)", 1920, 1080),
-            ("2560x1440 (16:9)", 2560, 1440),
-            # 9:16
-            ("480x854 (9:16)", 480, 854),
-            ("720x1280 (9:16)", 720, 1280),
-            ("864x1536 (9:16)", 864, 1536),
-            ("1080x1920 (9:16)", 1080, 1920),
-            ("1440x2560 (9:16)", 1440, 2560),
-            
-            # 3:2 & 2:3
-
-("1152x768 (3:2)", 1152, 768),
-("1536x1024 (3:2)", 1536, 1024),
-("768x1152 (2:3)", 768, 1152),
-("1024x1536 (2:3)", 1024, 1536),
-# Alt 640p-ish
-            ("1136x640 (16:9)", 1136, 640),
+            # 16:9/9:16
+            ("576x1024 (9:16)", 576, 1024),
+            ("1024x576 (16:9)", 1024, 576),
             ("640x1136 (9:16)", 640, 1136),
-            # 21:9 and 9:21
-            ("1280x544 (21:9)", 1280, 544),
+            ("1136x640 (16:9)", 1136, 640),
+            ("720x1280 (9:16)", 720, 1280),
+            ("1280x720 (16:9)", 1280, 720),
+            ("864x1536 (9:16)", 864, 1536),
+            ("1536x864 (16:9)", 1536, 864),
+            # 21:9/9:21
             ("544x1280 (9:21)", 544, 1280),
-            # 4:3
-
-# 7:9 & 9:7
-("1152x896 (7:9)", 1152, 896),
-("896x1152 (9:7)", 896, 1152),
-
-("640x480 (4:3)", 640, 480),
-("800x600 (4:3)", 800, 600),
-("1024x768 (4:3)", 1024, 768),
-("480x640 (3:4)", 480, 640),
-("600x800 (3:4)", 600, 800),
-("768x1024 (3:4)", 768, 1024),
-            ("1104x832 (4:3)", 1104, 832),
+            ("1280x544 (21:9)", 1280, 544),
+            ("576x1344 (9:21)", 576, 1344),
+            ("1344x576 (21:9)", 1344, 576),
+            # 9:7/7:9
+            ("896x1152 (7:9)", 896, 1152),
+            ("1152x896 (9:7)", 1152, 896),
+            # 4:3/3:4
+            ("480x640 (3:4)", 480, 640),
+            ("640x480 (4:3)", 640, 480),
+            ("600x800 (3:4)", 600, 800),
+            ("800x600 (4:3)", 800, 600),
+            ("896x672 (4:3)", 896, 672),
+            ("768x1024 (3:4)", 768, 1024),
+            ("1024x768 (4:3)", 1024, 768),
             ("832x1104 (3:4)", 832, 1104),
+            ("1104x832 (4:3)", 1104, 832),
+            ("1152x864 (4:3)", 1152, 864),
+            # 3:2/2:3
+            ("960x640 (3:2)", 960, 640),
+            ("768x1152 (2:3)", 768, 1152),
+            ("1152x768 (3:2)", 1152, 768),
+            ("1024x1536 (2:3)", 1024, 1536),
+            ("1536x1024 (3:2)", 1536, 1024),
+            # 2:1/1:2
+            ("1024x512 (2:1)", 1024, 512),
+            ("1280x640 (2:1)", 1280, 640),
         ]
+
         for label, w, h in self._size_presets:
             self.size_combo.addItem(label, (w, h))
         # default selection
@@ -669,8 +613,8 @@ class Txt2ImgPane(QWidget):
         if 0 <= idx_default < self.size_combo.count():
             self.size_combo.setCurrentIndex(idx_default)
         # Optional manual override (advanced later; present but small)
-        self.size_manual_w = QSpinBox(); self.size_manual_w = QSpinBox(); self.size_manual_w.setRange(256, 4096)
-        self.size_manual_h = QSpinBox(); self.size_manual_h.setRange(256, 4096)  # allow manual height(256, 4096); self.sself.size_manual_h.setSingleStep(64); ~8)
+        self.size_manual_w = QSpinBox(); self.size_manual_w = QSpinBox(); self.size_manual_w.setRange(256, 1536)
+        self.size_manual_h = QSpinBox(); self.size_manual_h.setRange(256, 1536)  # allow manual height(256, 4096); self.sself.size_manual_h.setSingleStep(64); ~8)
         self.size_lock = QCheckBox("Lock aspect")
         self.size_lock.setChecked(False)  # default removed; will restore via UI
         def _on_size_combo_changed(i):
@@ -698,6 +642,17 @@ class Txt2ImgPane(QWidget):
             w0, h0 = data
             aspect = h0 / w0 if w0 else 1.0
             new_h = max(256, int(round(v * aspect / 64) * 64))
+            # Clamp by category maxima
+            try:
+                if w0 == h0:
+                    v = min(int(v), 1024); new_h = min(int(new_h), 1024)
+                elif w0 > h0:
+                    v = min(int(v), 1536); new_h = min(int(new_h), 864)
+                else:
+                    v = min(int(v), 864); new_h = min(int(new_h), 1536)
+            except Exception:
+                pass
+            self.size_manual_w.blockSignals(True); self.size_manual_w.setValue(int(v)); self.size_manual_w.blockSignals(False)
             self.size_manual_h.blockSignals(True); self.size_manual_h.setValue(new_h); self.size_manual_h.blockSignals(False)
         def _sync_manual_h(v):
             if not self.size_lock.isChecked(): return
@@ -706,47 +661,20 @@ class Txt2ImgPane(QWidget):
             w0, h0 = data
             aspect = w0 / h0 if h0 else 1.0
             new_w = max(256, int(round(v * aspect / 64) * 64))
+            # Clamp by category maxima
+            try:
+                if w0 == h0:
+                    v = min(int(v), 1024); new_w = min(int(new_w), 1024)
+                elif h0 > w0:
+                    v = min(int(v), 1536); new_w = min(int(new_w), 864)
+                else:
+                    v = min(int(v), 864); new_w = min(int(new_w), 1536)
+            except Exception:
+                pass
+            self.size_manual_h.blockSignals(True); self.size_manual_h.setValue(int(v)); self.size_manual_h.blockSignals(False)
             self.size_manual_w.blockSignals(True); self.size_manual_w.setValue(new_w); self.size_manual_w.blockSignals(False)
-        
-        def _pick_preset_index_for(w:int, h:int) -> int:
-            """Return index in size_combo for exact (w,h) match if present;
-            otherwise pick nearest by aspect+area using _safe_snap_size."""
-            try:
-                # Try exact match first
-                for i in range(self.size_combo.count()):
-                    data = self.size_combo.itemData(i)
-                    if data and int(data[0]) == int(w) and int(data[1]) == int(h):
-                        return i
-                # Fallback: nearest preset
-                pw, ph = _safe_snap_size(w, h)
-                for i in range(self.size_combo.count()):
-                    data = self.size_combo.itemData(i)
-                    if data and data[0] == pw and data[1] == ph:
-                        return i
-            except Exception:
-                pass
-            return max(0, self.size_combo.currentIndex())
-        def _sync_combo_from_manual():
-            try:
-                w = int(self.size_manual_w.value())
-                h = int(self.size_manual_h.value())
-                # Choose matching preset
-                idx = _pick_preset_index_for(w, h)
-                if 0 <= idx < self.size_combo.count() and idx != self.size_combo.currentIndex():
-                    self.size_combo.blockSignals(True)
-                    self.size_combo.setCurrentIndex(idx)
-                    self.size_combo.blockSignals(False)
-            except Exception:
-                pass
         self.size_manual_w.valueChanged.connect(_sync_manual_w)
         self.size_manual_h.valueChanged.connect(_sync_manual_h)
-        self.size_manual_h.valueChanged.connect(_sync_manual_h)
-        self.size_manual_w.valueChanged.connect(lambda _v: _sync_combo_from_manual())
-        self.size_manual_h.valueChanged.connect(lambda _v: _sync_combo_from_manual())
-        self.size_manual_h.valueChanged.connect(lambda _v: _sync_combo_from_manual())
-        self.size_manual_w.valueChanged.connect(lambda _v: _sync_combo_from_manual())
-        self.size_manual_h.valueChanged.connect(lambda _v: _sync_combo_from_manual())
-
         size_row.addWidget(self.size_combo, 2)
         size_row.addWidget(QLabel("W:"), 0)
         size_row.addWidget(self.size_manual_w, 0)
@@ -1479,34 +1407,25 @@ class Txt2ImgPane(QWidget):
         threading.Thread(target=worker, daemon=True).start()
 
 def _draw_text_image(text: str, size=(1024,1024), seed: int = 0) -> QImage:
-    """CPU fallback placeholder: checkerboard + centered prompt text (exception-safe)."""
+    """CPU fallback placeholder: checkerboard + centered prompt text."""
     w, h = size
-    if w <= 0 or h <= 0:
-        w, h = 1024, 1024
     img = QImage(w, h, QImage.Format_RGB32)
-    p = QPainter()
+    p = QPainter(img)
+    tile = 32
+    for y in range(0, h, tile):
+        for x in range(0, w, tile):
+            color = Qt.lightGray if ((x//tile + y//tile) % 2) else Qt.gray
+            p.fillRect(x, y, tile, tile, color)
+    p.setRenderHint(QPainter.Antialiasing, True)
+    rect = QRect(40, 40, w-80, h-80) if 'QRect' in globals() else None
     try:
-        if not p.begin(img):
-            return img
-        tile = 32
-        for y in range(0, h, tile):
-            for x in range(0, w, tile):
-                color = Qt.lightGray if ((x//tile + y//tile) % 2) else Qt.gray
-                p.fillRect(x, y, tile, tile, color)
-        p.setRenderHint(QPainter.Antialiasing, True)
-        try:
-            from PySide6.QtCore import QRect as _QRect
-            rect = _QRect(40, 40, max(1, w-80), max(1, h-80))
-            font = p.font(); font.setPointSize(22); font.setBold(True); p.setFont(font)
-            p.setPen(Qt.white)
-            p.drawText(rect, Qt.AlignCenter | Qt.TextWordWrap, text or "No prompt")
-        except Exception:
-            pass
-    finally:
-        try:
-            p.end()
-        except Exception:
-            pass
+        from PySide6.QtCore import QRect as _QRect
+        rect = _QRect(40, 40, w-80, h-80)
+        font = p.font(); font.setPointSize(22); font.setBold(True); p.setFont(font)
+        p.setPen(Qt.white); p.drawText(rect, Qt.AlignCenter | Qt.TextWordWrap, text or "No prompt")
+    except Exception:
+        pass
+    p.end()
     return img
 
 
@@ -1556,10 +1475,6 @@ def _gen_via_diffusers(job: dict, out_dir: Path, progress_cb=None):
     batch    = int(job.get("batch", 1))
     width    = int(job.get("width", 1024))
     height   = int(job.get("height", 1024))
-    try:
-        width, height = _safe_snap_size(width, height)
-    except Exception:
-        pass
 
     try:
         # Load single-file SD1.5 checkpoint
@@ -1574,52 +1489,8 @@ def _gen_via_diffusers(job: dict, out_dir: Path, progress_cb=None):
         else:
             pipe = StableDiffusionPipeline.from_single_file(model_path, torch_dtype=dtype, local_files_only=True)
         pipe = pipe.to(device)
-        try:
-            if hasattr(pipe, 'enable_xformers_memory_efficient_attention'):
-                pipe.enable_xformers_memory_efficient_attention()
-        except Exception:
-            pass
 
-        # Memory-friendly toggles (configurable: FV_LOW_MEM=on/off/auto). Auto = enable on low VRAM or large sizes.
-        try:
-            import os
-            _env = (os.environ.get("FV_LOW_MEM", "off") or "auto").strip().lower()
-        except Exception:
-            _env = "auto"
-        _enable_low_mem = None
-        if _env in ("0","off","no","false"):
-            _enable_low_mem = False
-        elif _env in ("1","on","yes","true"):
-            _enable_low_mem = True
-        if _enable_low_mem is None:
-            _enable_low_mem = True
-            try:
-                if device == "cuda":
-                    import torch as _torch
-                    props = _torch.cuda.get_device_properties(0)
-                    _vram = int(getattr(props, "total_memory", 0) or 0)
-                    # Heuristic: if plenty of VRAM (>=10GB) and target <= 1024x1024, skip low-mem for speed.
-                    if _vram >= 10_000_000_000 and (width * height) <= (1024 * 1024):
-                        _enable_low_mem = False
-            except Exception:
-                pass
-        if _enable_low_mem:
-            try:
-                pipe.enable_attention_slicing()
-            except Exception:
-                pass
-            try:
-                if hasattr(pipe, "enable_sequential_cpu_offload"):
-                    pipe.enable_sequential_cpu_offload()
-            except Exception:
-                pass
-            try:
-                if hasattr(pipe, "enable_vae_slicing"):
-                    pipe.enable_vae_slicing()
-            except Exception:
-                pass
-
-        # Optionally load up to two LoRAs
+        
         # Optionally load up to two LoRAs for SDXL (from UI slots 1 & 2)
         try:
             lora1 = str(job.get("lora_path") or "").strip()
@@ -1808,12 +1679,7 @@ def _gen_via_a1111(job: dict, out_dir: Path, base_url: str, progress_cb=None):
     except Exception:
         return None
     prompt = job.get("prompt",""); neg = job.get("negative","")
-    w = int(job.get("width", 1024))
-    h = int(job.get("height", 1024))
-    try:
-        w, h = _safe_snap_size(w, h)
-    except Exception:
-        pass
+    w = int(job.get("width", 1024)); h = int(job.get("height", 1024))
     steps = int(job.get("steps", 30)); seed = int(job.get("seed", 0))
     batch = int(job.get("batch", 1))
     payload = {"prompt": prompt, "negative_prompt": neg, "width": w, "height": h, "steps": steps, "seed": seed, "batch_size": batch}
