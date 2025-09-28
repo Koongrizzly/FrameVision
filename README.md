@@ -1,5 +1,5 @@
 [README.md](https://github.com/user-attachments/files/22204351/README.md)
-# 🌟 FrameVision V1.0.0
+# 🌟 FrameVision V1.0.5
 **All-in-one Video & Photo Upscaler/Editor/Creator**  
 ✨ *Upscale, convert, edit, describe, and create — in one streamlined app.*
 - WORK IN PROGRESS, features can come and go
@@ -36,9 +36,9 @@ start.bat
 ## 💡 User-Friendly
 - Easy installer with **requirements check**.
 - Fully **automated** setup paths (Core, Full CPU, Full CUDA). User can drink coffee, script will deliver out of the box use
-- easy to use tabs, everything in collapsible boxes so you see only what you need and without searching
+- easy to use **tabs**, many things in **collapsible** boxes so you see only what you need.
 - Helpful **tooltips** everywhere. **Q&A** and knowledge base (info menu)
-- Resizable layout with draggable splitters. Fit the player or the tabs to the size you want.
+- Resizable layout with draggable splitters. Fit the player or the tabs to the size **you** want.
 - Clear messages and graceful fallbacks (e.g. CPU fallback when GPU is unavailable, streaming for low mem use etc).
 
 ---
@@ -56,17 +56,18 @@ start.bat
   - Multi format (img/sound/video)
   - Music playlist & visualizer (100+)
   - Info button with popup window
+  - Volume with mute & equalizer
   - Compare side by side with pan & 25x zoom (work in progress, html version for now)
   - Ask Framie (little offline chatbot with screenshot describer etc)
   - Fullscreen on off (double click and esc shortcuts)
   - Upscale button that works from everywhere in the app (roadmap has other plans)
-  - scroll to zoom in/out & pan (on roadmap)
+  - scroll to zoom in/out 50x on upscaled images + panning 
   
 - **Right:** Modular tabs:
   - Multi model Upscaler
   - RIFE interpollator
   - Describer
-  - TXT2IMG + Model loader SDXL
+  - TXT2IMG + Model loader SD15/SDXL
   - Multi-Tools
   - Advanced Queue 
   - Settings
@@ -134,17 +135,16 @@ start.bat
 ---
 
 ### 🧰 Multi Tools
-- Change speed for videos (with audio sync).
+- Change speed for videos (with slow motiion up to 0.15 speed & audio sync).
 - Resize with aspect-ratio preservation.
-- Prompt enhancer
+- Prompt enhancer (uses Qwenvl2.5)
 - Sound Lab (add/mix multiple sound sources with video)
 - Advanced Gif/animation creator 
 - Extract frames to images. (last/all)
-- **Trim videos** with advanced preview.
-- Crop video 
+- Trim videos with advanced preview & crop selection
+- Cropping tool 
 - Quality/Size/convert for video & images.
-- Add or replace audio tracks in video.
-- Multi rename tools
+- Multi rename/replace tools
 ...
 
 ### ⚙️ Settings
@@ -159,39 +159,44 @@ start.bat
 - Bug reporting and maintenance tools.
   - User can send email directly from the app with bug report
     (needs email software installed to send an email)
-  - multiple logging options with 'dump to cmd' button
+  - multiple logging options with 'dump to cmd & \log\' button
 - cleanup (clear cache, temp folder etc)
 - Temperature unit toggle °C / °F.
 - System Monitor with checks for models etc
-  comes with second little colorized hud (anything above above 90% changes colors, gpu above 60celcius vhanges colors)
+  comes with second little colorized hud (anything above above 90% changes colors, gpu above 60celcius changes 
+  colors)
   mini hud shows up everywhere. (can be on/off)
-- Advanced File Menu with converter + save video as mp3, screenshot, open multi format, last 10, favorites,....
+- Advanced File Menu with converter + save video as mp3, screenshot, open multi format, last 10, favorites,...
 - Info menu with Html Features list & extensive Q&A + knowledge base
 ---
 
 ### 📋 Queue
   - Reorder jobs
   - ETA tracking / time done / time added /time finished
-  - open finished jobs
-  - remove jobs from queue,
-  - remove non working jobs,
-  - move running job to failed
-  - move running job back to pensing
+  - open/delete finished jobs, open folder of finished job
+  - auto play last result toggle
+  - remove jobs from queue
+  - remove non working jobs
+  - move running jobs to failed
+  - move running job back to pending
   - live 'led' shows status of the queue
 
 
 ## 🗺 Roadmap
 Planned features for future updates:
-- **Built-in Compare Panel (A/B):**, not the html version that i use now. Side-by-side, swipe, zoom/pan, and much more.
+- **Built-in Compare Panel (A/B):**, not the html version that i use now. Side-by-side, swipe, zoom/pan, and much 
+    more.
 - Global & per tab save settings after (re)start.
-- **Installer upgrades:** Unified progress bars and resume support. app might get it's own windows installer one day
-- **Better integration with queue for the upscalers:** At the moment it is not using the queue until i have more time for this
+- **Installer upgrades:** Unified progress bars and resume support. app might get it's own windows installer one 
+  day
+- **Better integration with queue for the TXT2IMG models:** 
+  At the moment it is not using the queue until i have more time for this
 - zip with over **100 intros**
-- low weight **txt 2 img** model
 - Global action buttons (a button action changes depending on the tab you are
 - Multi job where user can select more then one tool and do them all at once (for example upscale->rife->add sound...)
 - polishing and bugfixing for the rest of my life i think
 - a low weight txt/img to video would be nice but let's get the rest working 100% first
+  (many failed attempts so far)
 - **Easter eggs** for extra fun surprises! Don't forget to click the intro 4x before it ends ;-)
 
 ---
