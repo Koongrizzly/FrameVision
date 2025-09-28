@@ -20,6 +20,7 @@ Big update for queue, Now works everywhere in the app with every tool, eta, auto
 **New in V1.0.1 :**
 Qwen 2.5VL describe anything it can see, with options for short or long descriptions,
 now you can add an image, let it describe and create similar images with ease
+---
 
 **All-in-one Video & Photo Upscaler/Editor/Creator**  
 ✨ *Upscale, convert, edit, describe, and create — in one streamlined app.*
