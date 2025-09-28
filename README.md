@@ -7,7 +7,7 @@
 loading an mp3 or music track will open a new overlay with a playlist and options for visuals where you can set it as low as 8 beats to have non stop changing visuals that change with sound and beats (and some extra tuning to make it show even more after a break in the track) It comes with a little bug where it will skip first 0.1 seconds of very first track that is loaded, after that it works perfect. Sometimes you notice sometimes you don't.
 
 **New in V1.0.4 :**
-TXT 2 IMG with Model selector and Lora use for SD15 & SDXL, new mini chat bot with q&a for the app and 300 jokes etc. Prompt creator/enhancer. 10 presets for creeating images, download your favorite model and put it in the models folder to add it, comes with Juggernaut XL as a god allround model, 10+ visual presets and about 20 resolution presets (or manual selection) I tried Qwen first couldn't make it work so this was 2nd choice, still works great and best of all, this works 100% offline and is portable even after install.
+TXT 2 IMG with Model selector and Lora use for SD15 & SDXL, new mini chat bot with q&a for the app and 300 jokes etc. 10 presets for creeating images, download your favorite model and put it in the models folder to add it, comes with Juggernaut XL as a god allround model, 10+ visual presets and about 20 resolution presets (or manual selection) I tried Qwen first couldn't make it work so this was 2nd choice, still works great and best of all, this works 100% offline and is portable even after install. also installed a Prompt creator/enhancer in tools. 
 
 **New in V1.0.3 :**
 New Tools : Multi rename/replace, select file, folder and rename/replace letters with every detail possible
