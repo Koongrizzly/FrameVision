@@ -1,5 +1,25 @@
 [README.md](https://github.com/user-attachments/files/22204351/README.md)
 # 🌟 FrameVision V1.0.5
+
+**New in v1.0.5 :** 
+- BETA Tmeline editor, no more need to load capcut or open shot, we can now do it inside FrameVision (wel sort of, work in progress, more features will come or may fo)
+- Full blown music visualizer (100+ visuals) not moving by time but by **BEATS** 
+loading an mp3 or music track will open a new overlay with a playlist and options for visuals where you can set it as low as 8 beats to have non stop changing visuals that chgange with beats (and some extra tuning to make it show even more after a break in the track)
+**New in V1.0.4 :**
+TXT 2 IMG with Model selector and Lora use for SD15 & SDXL, new mini chat bot with q&a for the app and 300 jokes etc. Prompt creator/enhancer. 10 presets for creeating images, download your favorite model and put it in the models folder to add it, comes with Juggernaut XL as a god allround model, 10+ visual presets and about 20 resolution presets (or manual selection) I tried Qwen first couldn't make it work so this was 2nd choice, still works great
+
+**New in V1.0.3 :**
+New Tools : Multi rename/replace, select file, folder and rename/replace letters with every detail possible
+            Meme/thumbnail creator with font selector and effects etc
+            updated version of the cropper with resizable preview and user friendly selection
+
+**New in V1.0.2 :**
+Big update for queue, works everywhere in the app, auto show last results, move delete,...
+
+**New in V1.0.1 :**
+Qwen 2.5VL describe anything it can see, with options for short or long descriptions,
+now you can add an image, let it describe and create similar images with ease
+
 **All-in-one Video & Photo Upscaler/Editor/Creator**  
 ✨ *Upscale, convert, edit, describe, and create — in one streamlined app.*
 - WORK IN PROGRESS, features can come and go
