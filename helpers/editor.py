@@ -1,19 +1,27 @@
 
-# helpers/editor.py — stable build with selectable clips, robust DnD, right-click menus
+# helpers/editor.py — enhanced build with trim handles, ghost snap, markers, ripple delete, media preview
 from __future__ import annotations
 
 import os, sys, json, subprocess, time
 from dataclasses import dataclass, field, asdict
 from pathlib import Path
-from typing import List, Optional, Dict, Any, Tuple
+from typing import List, Optional, Dict, Any, Tuple, Set
 
-from PySide6.QtCore import Qt, QRectF, QPointF, QSize, QMimeData, QTimer, QEvent, Signal, QThread
+from PySide6.QtCore import Qt, QRectF, QPointF, QSize, QMimeData, QTimer, QEvent, Signal, QThread, QRect
 from PySide6.QtGui import (QAction, QKeySequence, QIcon, QPixmap, QDrag, QPainter, QPen, QColor, QBrush,
                            QStandardItemModel, QStandardItem, QCursor, QImage, QImageReader, QPolygonF)
 from PySide6.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QLabel, QFileDialog, QListWidget,
                                QListWidgetItem, QMenu, QToolButton, QComboBox, QSpinBox, QLineEdit,
                                QScrollArea, QFrame, QMessageBox, QSlider, QSizePolicy, QDialog,
-                               QDialogButtonBox, QFormLayout, QAbstractItemView, QApplication, QTabWidget, QInputDialog)
+                               QDialogButtonBox, QFormLayout, QAbstractItemView, QApplication, QTabWidget, QInputDialog, QColorDialog, QPushButton)
+
+# Optional multimedia preview imports (Qt6+)
+try:
+    from PySide6.QtMultimedia import QMediaPlayer, QAudioOutput
+    from PySide6.QtMultimediaWidgets import QVideoWidget
+    HAS_QTMULTI = True
+except Exception:
+    HAS_QTMULTI = False
 
 # ---------- utils ----------
 def _try_exec(c):
@@ -67,6 +75,7 @@ class Clip:
     muted: bool = False
     fade_in_ms: int = 0
     fade_out_ms: int = 0
+    group_id: Optional[int] = None  # for grouping
 
 @dataclass
 class Track:
@@ -74,6 +83,10 @@ class Track:
     type: str  # "video","image","text","audio","any"
     enabled: bool = True
     clips: List[Clip] = field(default_factory=list)
+    mute: bool = False
+    solo: bool = False
+    locked: bool = False
+    color: str = "#3c3c3c"  # label color
 
 @dataclass
 class Project:
@@ -91,6 +104,7 @@ class Project:
             "media": {k: {"id": v.id, "path": str(v.path), "kind": v.kind, "meta": v.meta} for k,v in self.media.items()},
             "tracks": [{
                 "name": tr.name, "type": tr.type, "enabled": tr.enabled,
+                "mute": tr.mute, "solo": tr.solo, "locked": tr.locked, "color": tr.color,
                 "clips": [asdict(c) for c in tr.clips]
             } for tr in self.tracks],
             "fps": self.fps, "width": self.width, "height": self.height, "sample_rate": self.sample_rate
@@ -107,7 +121,11 @@ class Project:
         p.tracks = []
         for tr in d.get("tracks", []):
             t = Track(tr.get("name","Track"), tr.get("type","video"), tr.get("enabled",True))
+            t.mute = bool(tr.get("mute", False)); t.solo = bool(tr.get("solo", False))
+            t.locked = bool(tr.get("locked", False)); t.color = tr.get("color", "#3c3c3c")
             for c in tr.get("clips", []):
+                # group_id might be missing in older saves
+                if "group_id" not in c: c["group_id"] = None
                 t.clips.append(Clip(**c))
             p.tracks.append(t)
         return p
@@ -165,9 +183,72 @@ def _placeholder_icon(kind: str, size: QSize) -> QPixmap:
         p.drawPolygon(QPolygonF(pts))
     p.end(); return pm
 
+# ---------- media preview dialog ----------
+class PreviewDialog(QDialog):
+    def __init__(self, media: MediaItem, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle(media.path.name)
+        self.setModal(False)
+        self.resize(540, 320)
+        lay = QVBoxLayout(self)
+        # content area
+        self.media = media
+        self.player = None
+        self.audio_out = None
+        if HAS_QTMULTI and media.kind in ("video","audio"):
+            self.player = QMediaPlayer(self)
+            self.audio_out = QAudioOutput(self)
+            self.player.setAudioOutput(self.audio_out)
+            if media.kind == "video":
+                vw = QVideoWidget(self); lay.addWidget(vw, 1); self.player.setVideoOutput(vw)
+        if self.player is None and media.kind == "image":
+            # static image preview
+            lab = QLabel("")
+            lab.setAlignment(Qt.AlignCenter)
+            pm = _gen_thumb(media, QSize(520, 300))
+            if pm: lab.setPixmap(pm.scaled(520,300,Qt.KeepAspectRatio,Qt.SmoothTransformation))
+            lay.addWidget(lab, 1)
+        ctrl = QHBoxLayout(); lay.addLayout(ctrl)
+        self.btn_play = QPushButton("Play")
+        self.btn_pause = QPushButton("Pause")
+        self.slider = QSlider(Qt.Horizontal); self.slider.setRange(0,1000)
+        ctrl.addWidget(self.btn_play); ctrl.addWidget(self.btn_pause); ctrl.addWidget(self.slider, 1)
+        self.btn_play.clicked.connect(self._play); self.btn_pause.clicked.connect(self._pause)
+        if self.player:
+            # file URL
+            from PySide6.QtCore import QUrl
+            self.player.setSource(QUrl.fromLocalFile(str(media.path)))
+            self.player.playbackStateChanged.connect(self._sync)
+            self.player.positionChanged.connect(self._pos_changed)
+            self.player.durationChanged.connect(self._dur_changed)
+            self.slider.sliderMoved.connect(self._seek)
+        else:
+            self.btn_play.setEnabled(False); self.btn_pause.setEnabled(False); self.slider.setEnabled(False)
+
+    def _play(self):
+        if self.player: self.player.play()
+
+    def _pause(self):
+        if self.player: self.player.pause()
+
+    def _sync(self, *_): pass
+    def _pos_changed(self, ms): 
+        if self.player and self.player.duration()>0 and not self.slider.isSliderDown():
+            self.slider.blockSignals(True)
+            self.slider.setValue(int(1000 * ms/max(1,self.player.duration())))
+            self.slider.blockSignals(False)
+    def _dur_changed(self, ms): pass
+    def _seek(self, val):
+        if not self.player: return
+        dur = max(1, self.player.duration()); pos = int((val/1000.0)*dur)
+        self.player.setPosition(pos)
+
 # ---------- UI: media strip ----------
 class MediaList(QListWidget):
     MIME = "application/x-framevision-media-id"
+    requestDelete = Signal(list)  # [media_ids]
+    requestPreview = Signal(str)  # media_id
+
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setViewMode(QListWidget.IconMode)
@@ -199,17 +280,38 @@ class MediaList(QListWidget):
             if it and it.data(Qt.UserRole) == media_id:
                 it.setIcon(QIcon(pm)); break
 
+    # delete selected thumbnails with Delete key
+    def keyPressEvent(self, ev):
+        if ev.key() in (Qt.Key_Delete, Qt.Key_Backspace):
+            ids = []
+            for it in self.selectedItems():
+                mid = it.data(Qt.UserRole)
+                if mid: ids.append(mid)
+            if ids: self.requestDelete.emit(ids)
+            ev.accept(); return
+        super().keyPressEvent(ev)
+
+    # double-click preview
+    def mouseDoubleClickEvent(self, ev):
+        it = self.itemAt(ev.pos())
+        if it:
+            mid = it.data(Qt.UserRole)
+            if mid: self.requestPreview.emit(mid)
+        super().mouseDoubleClickEvent(ev)
+
 # ---------- ruler ----------
 class TimeRuler(QWidget):
     positionPicked = Signal(int)  # ms
     def __init__(self, parent=None):
         super().__init__(parent)
         self.px_per_s = 100; self.duration_ms = 60000; self.playhead_ms = 0
-        self.setFixedHeight(24)
+        self.setFixedHeight(28)
+        self._markers: List[int] = []  # ms
 
-    def set_scale(self, px_s): self.px_per_s = max(5.0, float(px_s)); self.update()
+    def set_scale(self, px): self.px_per_s = max(5.0, float(px)); self.update()
     def set_duration(self, ms): self.duration_ms = max(1000, int(ms)); self.update()
     def set_playhead(self, ms): self.playhead_ms = max(0,int(ms)); self.update()
+    def set_markers(self, markers: List[int]): self._markers = list(sorted(set(int(m) for m in markers))); self.update()
 
     def paintEvent(self, ev):
         p = QPainter(self); p.fillRect(self.rect(), QColor(30,30,35))
@@ -228,8 +330,14 @@ class TimeRuler(QWidget):
             major = abs((t/tick) - round(t/tick)) < 1e-6
             p.setPen(QPen(QColor(220,220,220) if major else QColor(140,140,150), 1))
             p.drawLine(x, 0, x, 12 if major else 8)
-            if major: p.drawText(x+2, 20, f"{t:.2f}s" if tick<1 else f"{int(t)}s")
+            if major: p.drawText(x+2, 22, f"{t:.2f}s" if tick<1 else f"{int(t)}s")
             t += sub
+        # markers
+        for m in self._markers:
+            x = int((m/1000.0) * self.px_per_s)
+            p.setBrush(QColor(255,220,80)); p.setPen(Qt.NoPen)
+            p.drawPolygon(QPolygonF([QPointF(x-4, 14), QPointF(x+4, 14), QPointF(x, 4)]))
+            p.setPen(QPen(QColor(255,220,80),1)); p.drawLine(x, 14, x, self.height())
         p.end()
 
     def mouseDoubleClickEvent(self, ev):
@@ -238,9 +346,23 @@ class TimeRuler(QWidget):
         self.positionPicked.emit(ms)
         super().mouseDoubleClickEvent(ev)
 
+    # zoom with wheel over ruler
+    def wheelEvent(self, ev):
+        dy = ev.angleDelta().y()
+        parent = self.parent()
+        while parent and not isinstance(parent, EditorPane):
+            parent = parent.parent()
+        if parent and isinstance(parent, EditorPane):
+            if dy > 0: parent._set_zoom(parent.zoom*1.1)
+            else: parent._set_zoom(parent.zoom/1.1)
+            ev.accept(); return
+        super().wheelEvent(ev)
+
 # ---------- timeline widgets ----------
 class ClipWidget(QFrame):
     CLIP_MIME = "application/x-framevision-clip"
+    HANDLE_W = 6
+
     def __init__(self, clip: Clip, media: MediaItem, row: "TrackRow"):
         super().__init__(row)
         self.clip = clip; self.media = media; self.row = row
@@ -248,10 +370,12 @@ class ClipWidget(QFrame):
         self.setAutoFillBackground(True)
         self.setCursor(Qt.OpenHandCursor)
         self._press_pos = None; self._dragging = False
+        self._resizing = False; self._resize_edge = None  # "L" or "R"
+        self._orig_start = 0; self._orig_dur = 0
         self.setContextMenuPolicy(Qt.DefaultContextMenu)  # use contextMenuEvent for reliability
 
     def contextMenuEvent(self, ev):
-        self.row.editor._select_clip(self.clip)
+        self.row.editor._select_clip(self.clip, additive=False, toggle=False)
         self._show_ctx(ev.globalPos())
 
     def _show_ctx(self, global_pos):
@@ -295,26 +419,68 @@ class ClipWidget(QFrame):
 
     def paintEvent(self, ev):
         p = QPainter(self)
-        bg = QColor(50,90,160) if self.media.kind in ("video","image","text") else QColor(60,160,90)
+        # background tinted by track color
+        base = QColor(50,90,160) if self.media.kind in ("video","image","text") else QColor(60,160,90)
+        try:
+            tc = QColor(self.row.track.color)
+            bg = QColor((base.red()+tc.red())//2, (base.green()+tc.green())//2, (base.blue()+tc.blue())//2)
+        except Exception:
+            bg = base
         p.fillRect(self.rect(), bg)
         # selection border
         try:
-            if self.row.editor._selected is self.clip:
+            if self.row.editor._is_selected(self.clip):
                 p.setPen(QPen(QColor(255,220,80), 3)); p.drawRect(self.rect().adjusted(1,1,-2,-2))
         except Exception: pass
+        # trim handles
+        p.setPen(Qt.NoPen); p.setBrush(QColor(255,255,255,100))
+        p.drawRect(0,0,self.HANDLE_W,self.height())
+        p.drawRect(self.width()-self.HANDLE_W,0,self.HANDLE_W,self.height())
+        # text
         p.setPen(QPen(QColor(255,255,255),1))
         name = self.media.path.name if self.media.kind!="text" else (self.clip.text or "Text")
         p.drawText(6, int(self.rect().height()/2)+5, name)
         p.end()
 
+    def _edge_at_pos(self, posx: int) -> Optional[str]:
+        if posx <= self.HANDLE_W: return "L"
+        if posx >= self.width()-self.HANDLE_W: return "R"
+        return None
+
     def mousePressEvent(self, ev):
         if ev.button() == Qt.LeftButton:
-            self.row.editor._select_clip(self.clip)
-            self._press_pos = ev.position().toPoint(); self.setCursor(Qt.ClosedHandCursor)
+            add = (ev.modifiers() & Qt.ControlModifier) or (ev.modifiers() & Qt.ShiftModifier)
+            self.row.editor._select_clip(self.clip, additive=add, toggle=True if add else False)
+            ex = ev.position().toPoint().x()
+            edge = self._edge_at_pos(ex)
+            if edge and not self.row.track.locked:
+                self._resizing = True; self._resize_edge = edge
+                self._orig_start = int(self.clip.start_ms); self._orig_dur = int(self.clip.duration_ms)
+                self.setCursor(Qt.SizeHorCursor)
+            else:
+                self._press_pos = ev.position().toPoint(); self.setCursor(Qt.ClosedHandCursor)
         super().mousePressEvent(ev)
 
     def mouseMoveEvent(self, ev):
-        if self._press_pos and (ev.buttons() & Qt.LeftButton):
+        if self.row.track.locked: return
+        if self._resizing:
+            # trim with snapping
+            x = self.mapToParent(QPointF(ev.position()).toPoint()).x()
+            # convert x-in-row to ms
+            start_ms = int(max(0, (x / max(1.0, self.row.px_per_s))*1000.0))
+            start_ms = self.row.editor._snap_ms(start_ms)
+            if self._resize_edge == "L":
+                # new start cannot exceed old end-1
+                new_start = min(start_ms, self._orig_start + self._orig_dur - 1)
+                delta = new_start - self._orig_start
+                self.clip.start_ms = new_start
+                self.clip.duration_ms = max(1, self._orig_dur - delta)
+            else:
+                # right edge -> duration changes
+                end = max(start_ms, self._orig_start + 1)
+                self.clip.duration_ms = max(1, end - self._orig_start)
+            self.row.relayout(); self.row.editor._update_time_range(); self.row.update()
+        elif self._press_pos and (ev.buttons() & Qt.LeftButton):
             if not self._dragging and (ev.position().toPoint() - self._press_pos).manhattanLength() > 6:
                 # begin DnD for moving
                 src_ti = self.row.editor._track_index(self.row.track)
@@ -326,11 +492,54 @@ class ClipWidget(QFrame):
                 qp = QPainter(ghost); qp.fillRect(ghost.rect(), QColor(255,255,255,60)); qp.end()
                 d.setPixmap(ghost)
                 self._dragging = True; d.exec(Qt.MoveAction)
+        else:
+            # update cursor hover
+            ex = ev.position().toPoint().x()
+            edge = self._edge_at_pos(ex)
+            if edge: self.setCursor(Qt.SizeHorCursor)
+            else: self.setCursor(Qt.OpenHandCursor)
         super().mouseMoveEvent(ev)
 
     def mouseReleaseEvent(self, ev):
+        if self._resizing:
+            self._resizing = False; self._resize_edge = None; self.setCursor(Qt.OpenHandCursor)
+            self.row.editor._mark_dirty(); self.row.editor._push_undo()  # push after change
         self.setCursor(Qt.OpenHandCursor); self._press_pos = None; self._dragging = False
         super().mouseReleaseEvent(ev)
+
+class TrackHeader(QWidget):
+    def __init__(self, track: Track, editor: "EditorPane", parent=None):
+        super().__init__(parent); self.track=track; self.editor=editor
+        lay = QHBoxLayout(self); lay.setContentsMargins(4,0,4,0); lay.setSpacing(6)
+        self.swatch = QFrame(); self.swatch.setFixedSize(14,14); self._apply_color()
+        self.name = QLabel(self._label_text())
+        self.btn_m = QToolButton(); self.btn_m.setText("M"); self.btn_m.setCheckable(True); self.btn_m.setToolTip("Mute track")
+        self.btn_s = QToolButton(); self.btn_s.setText("S"); self.btn_s.setCheckable(True); self.btn_s.setToolTip("Solo track")
+        self.btn_l = QToolButton(); self.btn_l.setText("L"); self.btn_l.setCheckable(True); self.btn_l.setToolTip("Lock track")
+        self.btn_color = QToolButton(); self.btn_color.setText("🎨"); self.btn_color.setToolTip("Track color")
+        for b in (self.btn_m,self.btn_s,self.btn_l,self.btn_color):
+            b.setFixedHeight(20)
+        lay.addWidget(self.swatch); lay.addWidget(self.name,1); lay.addWidget(self.btn_m); lay.addWidget(self.btn_s); lay.addWidget(self.btn_l); lay.addWidget(self.btn_color)
+        self.btn_m.setChecked(track.mute); self.btn_s.setChecked(track.solo); self.btn_l.setChecked(track.locked)
+        self.btn_m.toggled.connect(self._set_mute); self.btn_s.toggled.connect(self._set_solo); self.btn_l.toggled.connect(self._set_lock); self.btn_color.clicked.connect(self._pick_color)
+
+    def _label_text(self):
+        return self.track.name if self.track.type=='any' else f"{self.track.name} ({self.track.type})"
+
+    def _apply_color(self):
+        try:
+            self.swatch.setStyleSheet(f"background:{self.track.color}; border:1px solid #666;")
+        except Exception:
+            self.swatch.setStyleSheet("background:#3c3c3c; border:1px solid #666;")
+
+    def _set_mute(self, on): self.track.mute = bool(on); self.editor._mark_dirty()
+    def _set_solo(self, on): self.track.solo = bool(on); self.editor._mark_dirty()
+    def _set_lock(self, on): self.track.locked = bool(on); self.editor._mark_dirty()
+    def _pick_color(self):
+        col = QColorDialog.getColor(QColor(self.track.color), self, "Track color")
+        if col.isValid():
+            self.track.color = col.name()
+            self._apply_color(); self.editor._refresh_tracks()
 
 class TrackRow(QWidget):
     def __init__(self, track: Track, project: Project, editor: "EditorPane", parent=None):
@@ -343,6 +552,7 @@ class TrackRow(QWidget):
         self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
         self._clip_widgets: List[ClipWidget] = []
         self._drag_hover = False; self._drag_can = False
+        self._ghost_rect: Optional[QRect] = None
         self.setContextMenuPolicy(Qt.CustomContextMenu)
         self.customContextMenuRequested.connect(self._on_ctx)
 
@@ -367,10 +577,16 @@ class TrackRow(QWidget):
         except Exception: pass
 
     def paintEvent(self, ev):
+        # locked overlay
+        if self.track.locked:
+            p0 = QPainter(self); p0.fillRect(self.rect(), QColor(40,40,40,60)); p0.end()
         # droppable highlight
         if self._drag_hover and self._drag_can:
             pbg = QPainter(self); pbg.fillRect(self.rect(), QColor(40, 90, 40, 80)); pbg.end()
         super().paintEvent(ev)
+        # ghost preview
+        if self._ghost_rect:
+            p = QPainter(self); p.fillRect(self._ghost_rect, QColor(255,255,255,80)); p.setPen(QPen(QColor(255,255,255),1)); p.drawRect(self._ghost_rect); p.end()
         # playhead
         try:
             ms = int(self.editor.seek_slider.value()) if self.editor else 0
@@ -383,9 +599,10 @@ class TrackRow(QWidget):
 
     # --- DnD ---
     def dragEnterEvent(self, ev):
+        if self.track.locked: ev.ignore(); return
         mime = ev.mimeData(); can = False
-        if mime and mime.hasFormat(MediaListWidget.MIME if False else "application/x-framevision-media-id"):
-            mid = bytes(mime.data("application/x-framevision-media-id")).decode("utf-8")
+        if mime and mime.hasFormat(MediaList.MIME):
+            mid = bytes(mime.data(MediaList.MIME)).decode("utf-8")
             kind = self._kind_from_mid(mid); can = (self.track.type in ("any", kind))
         elif mime and mime.hasFormat(ClipWidget.CLIP_MIME):
             try:
@@ -396,23 +613,48 @@ class TrackRow(QWidget):
         else: ev.ignore()
 
     def dragMoveEvent(self, ev):
+        if self.track.locked: ev.ignore(); return
         y = ev.position().y() if hasattr(ev,'position') else ev.pos().y()
         h = max(1,self.height()); band_ok = (h*0.10) <= y <= (h*0.90)
         self._drag_can = bool(band_ok) if self._drag_can else False
+        # ghost preview rectangle
+        x = ev.position().x() if hasattr(ev,'position') else ev.pos().x()
+        start_ms = int(max(0, (x / max(1.0, self.px_per_s)) * 1000.0))
+        try: start_ms = self.editor._snap_ms(start_ms)
+        except Exception: pass
+        width_ms = 1500
+        mime = ev.mimeData()
+        if mime.hasFormat(ClipWidget.CLIP_MIME):
+            src_ti, src_ci, kind = bytes(mime.data(ClipWidget.CLIP_MIME)).decode("utf-8").split(":")
+            src_ti = int(src_ti); src_ci = int(src_ci)
+            try:
+                clip = self.editor.project.tracks[src_ti].clips[src_ci]
+                width_ms = max(1, clip.duration_ms)
+            except Exception: pass
+        elif mime.hasFormat(MediaList.MIME):
+            mid = bytes(mime.data(MediaList.MIME)).decode("utf-8")
+            m = self.project.media.get(mid)
+            if m and m.meta.get("duration"):
+                try: width_ms = int(float(m.meta["duration"]) * 1000)
+                except: pass
+        rx = int((start_ms/1000.0)*self.px_per_s)
+        rw = int((width_ms/1000.0)*self.px_per_s)
+        self._ghost_rect = QRect(rx, 4, max(8,rw), 38)
         self.update(); ev.acceptProposedAction()
 
     def dragLeaveEvent(self, ev):
-        self._drag_hover = False; self._drag_can = False; self.update(); ev.accept()
+        self._drag_hover = False; self._drag_can = False; self._ghost_rect=None; self.update(); ev.accept()
 
     def dropEvent(self, ev):
+        if self.track.locked: ev.ignore(); return
         x = ev.position().x() if hasattr(ev,'position') else ev.pos().x()
         start_ms = int(max(0, (x / max(1.0, self.px_per_s)) * 1000.0))
         try:
             start_ms = self.editor._snap_ms(start_ms)
         except Exception: pass
         mime = ev.mimeData()
-        if mime.hasFormat("application/x-framevision-media-id"):
-            mid = bytes(mime.data("application/x-framevision-media-id")).decode("utf-8")
+        if mime.hasFormat(MediaList.MIME):
+            mid = bytes(mime.data(MediaList.MIME)).decode("utf-8")
             m = self.project.media.get(mid); 
             if not m: return
             if self.track.type == "any":
@@ -428,7 +670,7 @@ class TrackRow(QWidget):
                 except: pass
             self.track.clips.append(Clip(media_id=mid, start_ms=start_ms, duration_ms=dur))
             self.editor._refresh_tracks(); self.editor._update_time_range(); self.editor._mark_dirty()
-            self._drag_hover = False; self._drag_can = False; self.update()
+            self._drag_hover = False; self._drag_can = False; self._ghost_rect=None; self.update()
             ev.acceptProposedAction(); return
 
         if mime.hasFormat(ClipWidget.CLIP_MIME):
@@ -455,7 +697,7 @@ class TrackRow(QWidget):
                 else:
                     self.track.clips.append(clip)
                 self.editor._refresh_tracks(); self.editor._update_time_range(); self.editor._mark_dirty()
-                self._drag_hover = False; self._drag_can = False; self.update()
+                self._drag_hover = False; self._drag_can = False; self._ghost_rect=None; self.update()
                 ev.acceptProposedAction(); return
             else:
                 ev.ignore(); return
@@ -505,7 +747,16 @@ class TrackRow(QWidget):
         m.addAction("Remove timeline", remove_tl)
         m.exec(self.mapToGlobal(pos))
 
-# ---------- export dialog (kept) ----------
+    # zoom with wheel over timeline row
+    def wheelEvent(self, ev):
+        dy = ev.angleDelta().y()
+        if abs(dy) > 0:
+            if dy > 0: self.editor._set_zoom(self.editor.zoom*1.1)
+            else: self.editor._set_zoom(self.editor.zoom/1.1)
+            ev.accept(); return
+        super().wheelEvent(ev)
+
+# ---------- export dialog ----------
 class ExportDialog(QDialog):
     def __init__(self, parent=None, default_w=1280, default_h=720):
         super().__init__(parent); self.setWindowTitle("Export Video"); self.setModal(True)
@@ -541,8 +792,15 @@ class EditorPane(QWidget):
         self._redo_stack: List[Dict[str,Any]] = []
         self._clipboard: Optional[dict] = None
         self._selected: Optional[Clip] = None
+        self._selection: List[Clip] = []  # multi-select
+        self._next_group_id = 1
         self._last_open_dir: str = str(Path.cwd())
         self.glue_enabled = True
+        self.grid_enabled = False
+        self.grid_step_s = 0.5
+        self.snap_px_tol = 8
+        self.ripple_enabled = False
+        self.markers: List[int] = []
         self._init_ui()
         self._new_project()
         self._setup_autosave()
@@ -568,13 +826,20 @@ class EditorPane(QWidget):
         self.btn_redo=btn("Redo","Redo (Ctrl+Y)", self._redo)
         self.zoom_in=btn("+","Zoom In", lambda: self._set_zoom(self.zoom*1.25))
         self.zoom_out=btn("-","Zoom Out", lambda: self._set_zoom(self.zoom/1.25))
-        self.btn_glue=QToolButton(); self.btn_glue.setText("Glue"); self.btn_glue.setCheckable(True); self.btn_glue.setChecked(True)
-        self.btn_glue.toggled.connect(lambda on: setattr(self,'glue_enabled',bool(on)))
-        for w in [self.btn_new,self.btn_load,self.btn_save,self.btn_imp,self.btn_export,self.btn_undo,self.btn_redo,self.zoom_in,self.zoom_out,self.btn_glue]:
+        self.btn_fit=btn("Fit","Zoom to fit (Ctrl+F)", self._zoom_to_fit)
+        self.btn_sel=btn("Sel","Zoom to selection (Z)", self._zoom_to_selection)
+        self.btn_glue=QToolButton(); self.btn_glue.setText("Glue"); self.btn_glue.setCheckable(True); self.btn_glue.setChecked(True); self.btn_glue.toggled.connect(lambda on: setattr(self,'glue_enabled',bool(on)))
+        self.btn_grid=QToolButton(); self.btn_grid.setText("Grid"); self.btn_grid.setCheckable(True); self.btn_grid.toggled.connect(self._toggle_grid)
+        self.grid_step = QComboBox(); [self.grid_step.addItem(s, float(s)) for s in ["0.25","0.5","1","2","5"]]; self.grid_step.setCurrentIndex(1); self.grid_step.currentIndexChanged.connect(lambda *_: setattr(self,'grid_step_s',float(self.grid_step.currentData())))
+        self.snap_tol = QSpinBox(); self.snap_tol.setRange(1,32); self.snap_tol.setValue(self.snap_px_tol); self.snap_tol.valueChanged.connect(lambda v: setattr(self,'snap_px_tol',int(v)))
+        self.btn_ripple=QToolButton(); self.btn_ripple.setText("Ripple"); self.btn_ripple.setCheckable(True); self.btn_ripple.toggled.connect(lambda on: setattr(self,'ripple_enabled',bool(on)))
+        for w in [self.btn_new,self.btn_load,self.btn_save,self.btn_imp,self.btn_export,self.btn_undo,self.btn_redo,self.zoom_in,self.zoom_out,self.btn_fit,self.btn_sel,self.btn_glue,self.btn_grid,QLabel("Step"),self.grid_step,QLabel("Snap px"),self.snap_tol,self.btn_ripple]:
             tb.addWidget(w)
         tb.addStretch(1); root.addLayout(tb)
         # media strip
         self.media_list = MediaList(); root.addWidget(self.media_list)
+        self.media_list.requestDelete.connect(self._delete_media_ids)
+        self.media_list.requestPreview.connect(self._preview_media_id)
         # controls
         ctrl = QHBoxLayout()
         self.btn_add_track = QToolButton(); self.btn_add_track.setText("Add timeline"); self.btn_add_track.clicked.connect(self._add_track)
@@ -597,6 +862,9 @@ class EditorPane(QWidget):
         sc("Ctrl+N", self._new_project); sc("Ctrl+O", self._load_project); sc("Ctrl+S", self._save_project)
         sc("Ctrl+Z", self._undo); sc("Ctrl+Y", self._redo); sc("+", lambda: self._set_zoom(self.zoom*1.25)); sc("-", lambda: self._set_zoom(self.zoom/1.25))
         sc("Space", lambda: self.transport_request.emit("toggle"))
+        sc("Ctrl+F", self._zoom_to_fit); sc("Z", self._zoom_to_selection)
+        sc("M", self._add_marker_here); sc(".", self._goto_next_marker); sc(",", self._goto_prev_marker)
+        sc("Ctrl+G", self._group_selection); sc("Ctrl+Shift+G", self._ungroup_selection)
 
     # autosave
     def _setup_autosave(self):
@@ -670,6 +938,21 @@ class EditorPane(QWidget):
         if items:
             self._t = ThumbThread(items, self.media_list.iconSize(), self); self._t.ready.connect(lambda mid,pm: self.media_list.set_thumb(mid,pm)); self._t.start()
 
+    def _delete_media_ids(self, ids: List[str]):
+        if not ids: return
+        self._push_undo()
+        # remove any clips referencing these media
+        for mid in ids:
+            for tr in self.project.tracks:
+                tr.clips = [c for c in tr.clips if c.media_id != mid]
+            self.project.media.pop(mid, None)
+        self._refresh_ui(); self._update_time_range(); self._mark_dirty()
+
+    def _preview_media_id(self, mid: str):
+        m = self.project.media.get(mid)
+        if not m: return
+        dlg = PreviewDialog(m, self); dlg.show()
+
     # tracks/timeline rendering
     def _add_timeline_direct(self, kind, name): self.project.tracks.append(Track(name, kind)); self._refresh_tracks(); self._mark_dirty()
 
@@ -680,34 +963,32 @@ class EditorPane(QWidget):
         self._refresh_media_list(); self._refresh_tracks(); self._update_time_range()
 
     def _update_track_labels(self):
-        i=0
-        for idx in range(self.tracks_layout.count()):
-            w=self.tracks_layout.itemAt(idx).widget()
-            if isinstance(w, QLabel):
-                if i < len(self.project.tracks):
-                    tr=self.project.tracks[i]; w.setText(tr.name if tr.type=="any" else f"{tr.name} ({tr.type})"); i+=1
+        # handled by TrackHeader now
+        for i in range(self.tracks_layout.count()):
+            w=self.tracks_layout.itemAt(i).widget()
+            if isinstance(w, TrackHeader):
+                w.name.setText(w._label_text())
 
     def _refresh_tracks(self):
         while self.tracks_layout.count():
             w=self.tracks_layout.takeAt(0).widget()
             if w: w.setParent(None); w.deleteLater()
         for i,tr in enumerate(self.project.tracks):
-            row=TrackRow(tr, self.project, self); row.set_scale(self._px_per_s())
-            label = tr.name if tr.type=='any' else f"{tr.name} ({tr.type})"
-            self.tracks_layout.addWidget(QLabel(label)); self.tracks_layout.addWidget(row)
+            header=TrackHeader(tr, self); self.tracks_layout.addWidget(header)
+            row=TrackRow(tr, self.project, self); row.set_scale(self._px_per_s()); self.tracks_layout.addWidget(row)
             if i < len(self.project.tracks)-1:
                 div = QFrame(); div.setFrameShape(QFrame.HLine); div.setFrameShadow(QFrame.Sunken); div.setStyleSheet("color:#3c3c3c;"); self.tracks_layout.addWidget(div)
         self.tracks_layout.addStretch(1)
 
     def _update_time_range(self):
-        total = self.compute_project_duration(self.project); self.ruler.set_duration(total); self.seek_slider.setRange(0,int(total)); self._update_holder_width()
+        total = self.compute_project_duration(self.project); self.ruler.set_duration(total); self.ruler.set_markers(self.markers); self.seek_slider.setRange(0,int(total)); self._update_holder_width()
 
     def _set_zoom(self, z):
         self.zoom = max(0.1, min(20.0, float(z))); pxs=self._px_per_s(); self.ruler.set_scale(pxs)
         for i in range(self.tracks_layout.count()):
             w=self.tracks_layout.itemAt(i).widget()
             if isinstance(w, TrackRow): w.set_scale(pxs)
-        self._update_holder_width()
+        self._update_holder_width(); self.zoom_slider.blockSignals(True); self.zoom_slider.setValue(int(self.zoom*100)); self.zoom_slider.blockSignals(False)
 
     def _px_per_s(self) -> float: return 100.0 * self.zoom
 
@@ -727,9 +1008,23 @@ class EditorPane(QWidget):
     def _set_playhead_from_ruler(self, ms: int):
         self.seek_slider.blockSignals(True); self.seek_slider.setValue(int(ms)); self.seek_slider.blockSignals(False); self._seek_changed(int(ms))
 
-    # clipboard ops / ctx handlers
-    def _select_clip(self, clip: Optional[Clip]):
-        self._selected = clip
+    # selection helpers
+    def _is_selected(self, clip: Clip) -> bool:
+        return (clip in self._selection) or (self._selected is clip)
+
+    def _select_clip(self, clip: Optional[Clip], additive=False, toggle=False):
+        if clip is None:
+            self._selected=None; self._selection.clear()
+        else:
+            if additive:
+                if toggle and clip in self._selection:
+                    self._selection.remove(clip)
+                else:
+                    if clip not in self._selection: self._selection.append(clip)
+                self._selected = self._selection[-1] if self._selection else None
+            else:
+                self._selected = clip; self._selection = [clip]
+        # refresh visuals
         for i in range(self.tracks_layout.count()):
             w=self.tracks_layout.itemAt(i).widget()
             if isinstance(w, TrackRow): w.update()
@@ -793,6 +1088,18 @@ class EditorPane(QWidget):
         try: self._push_undo(); track.clips.remove(clip); self._refresh_tracks(); self._update_time_range(); self._mark_dirty()
         except Exception: pass
 
+    def _ripple_delete(self, track: Track, clip: Clip):
+        # remove and close gap on the same track
+        try:
+            self._push_undo()
+            idx = track.clips.index(clip)
+            start = clip.start_ms; dur = clip.duration_ms; track.clips.pop(idx)
+            for c in track.clips:
+                if c.start_ms >= start + dur:
+                    c.start_ms -= dur
+            self._refresh_tracks(); self._update_time_range(); self._mark_dirty()
+        except Exception: pass
+
     def _clip_remove_from_project(self, track: Track, clip: Clip):
         try:
             self._push_undo(); mid=clip.media_id
@@ -825,7 +1132,7 @@ class EditorPane(QWidget):
                 end=max(end, c.start_ms + max(1,c.duration_ms))
         return max(1000, end)
 
-    # export (stub from earlier build)
+    # export (stub)
     def _export(self):
         dlg = ExportDialog(self, self.project.width, self.project.height)
         if dlg.exec()!=QDialog.Accepted: return
@@ -834,13 +1141,22 @@ class EditorPane(QWidget):
         QMessageBox.information(self,"Export","(Stub) Export graph wiring will go here.")
 
     # snapping
+    def _toggle_grid(self, on): self.grid_enabled = bool(on); self._update_time_range()
+
     def _snap_ms(self, ms: int) -> int:
-        if not self.glue_enabled: return int(ms)
-        px_tol=8.0; tol=int(round((px_tol / max(1e-3, self._px_per_s())) * 1000.0))
+        if not self.glue_enabled and not self.grid_enabled: return int(ms)
+        px_tol=float(self.snap_px_tol); tol=int(round((px_tol / max(1e-3, self._px_per_s())) * 1000.0))
         cands=[0, int(self.seek_slider.value())]
         for tr in self.project.tracks:
             for c in tr.clips:
                 cands.extend([int(c.start_ms), int(c.start_ms + max(1,c.duration_ms))])
+        # grid points
+        if self.grid_enabled:
+            total_ms = self.compute_project_duration(self.project)
+            step_ms = int(self.grid_step_s * 1000)
+            g = 0
+            while g <= total_ms + step_ms:
+                cands.append(int(g)); g += step_ms
         best=int(ms); bestd=tol+1
         for c in cands:
             d=abs(int(ms)-int(c))
@@ -905,6 +1221,106 @@ class EditorPane(QWidget):
             ok=self._autoplace_try(); self._autoplace_attempts+=1
             if ok or self._autoplace_attempts>30: self._autoplace_timer.stop()
         self._autoplace_timer.timeout.connect(tick); self._autoplace_timer.start(); QTimer.singleShot(0, tick)
+
+    # ---- keyboard control ----
+    def keyPressEvent(self, ev):
+        key = ev.key()
+        mod = ev.modifiers()
+        # nudge left/right
+        if key in (Qt.Key_Left, Qt.Key_Right):
+            frames = 10 if (mod & Qt.ShiftModifier) else 1
+            step = int(round(1000.0 * frames / max(1,self.project.fps)))
+            delta = -step if key==Qt.Key_Left else step
+            targets = self._selection[:] if self._selection else ([self._selected] if self._selected else [])
+            if not targets: return
+            self._push_undo()
+            for c in targets:
+                c.start_ms = max(0, c.start_ms + delta)
+            self._refresh_tracks(); self._update_time_range(); self._mark_dirty(); ev.accept(); return
+        # move to prev/next compatible timeline
+        if key in (Qt.Key_Up, Qt.Key_Down):
+            up = (key==Qt.Key_Up)
+            targets = self._selection[:] if self._selection else ([self._selected] if self._selected else [])
+            if not targets: return
+            self._push_undo()
+            for c in targets:
+                # find current track
+                ti = None; ct=None
+                for i,tr in enumerate(self.project.tracks):
+                    if c in tr.clips: ti=i; ct=tr; break
+                if ti is None: continue
+                rng = range(ti-1, -1, -1) if up else range(ti+1, len(self.project.tracks))
+                m = self.project.media.get(c.media_id); kind = m.kind if m else None
+                for j in rng:
+                    tr = self.project.tracks[j]
+                    if tr.type in ("any", kind):
+                        # move
+                        try: ct.clips.remove(c)
+                        except Exception: pass
+                        if tr.type=="any": tr.type = kind or tr.type
+                        tr.clips.append(c)
+                        break
+            self._refresh_tracks(); self._update_time_range(); self._mark_dirty(); ev.accept(); return
+        # delete / ripple delete
+        if key in (Qt.Key_Delete, Qt.Key_Backspace):
+            targets = self._selection[:] if self._selection else ([self._selected] if self._selected else [])
+            if not targets: return
+            # find their track for ripple
+            if (mod & Qt.ControlModifier) or (mod & Qt.ShiftModifier):
+                for c in targets:
+                    for tr in self.project.tracks:
+                        if c in tr.clips:
+                            self._ripple_delete(tr, c); break
+            else:
+                for c in targets:
+                    for tr in self.project.tracks:
+                        if c in tr.clips:
+                            self._clip_remove_from_timeline(tr, c); break
+            ev.accept(); return
+        super().keyPressEvent(ev)
+
+    # ---- markers ----
+    def _add_marker_here(self):
+        ms = int(self.seek_slider.value())
+        self.markers.append(ms); self.markers = sorted(set(self.markers)); self._update_time_range(); self._mark_dirty()
+
+    def _goto_next_marker(self):
+        ms = int(self.seek_slider.value())
+        for m in self.markers:
+            if m > ms: self._set_playhead_from_ruler(m); return
+
+    def _goto_prev_marker(self):
+        ms = int(self.seek_slider.value())
+        for m in reversed(self.markers):
+            if m < ms: self._set_playhead_from_ruler(m); return
+
+    # ---- grouping ----
+    def _group_selection(self):
+        if len(self._selection) < 2: return
+        gid = self._next_group_id; self._next_group_id += 1
+        for c in self._selection: c.group_id = gid
+        self._mark_dirty()
+
+    def _ungroup_selection(self):
+        for c in self._selection: c.group_id = None
+        self._mark_dirty()
+
+    # ---- zoom helpers ----
+    def _zoom_to_fit(self):
+        total_ms = self.compute_project_duration(self.project)
+        if total_ms <= 0: return
+        # compute px_per_s to fit into current viewport width
+        vieww = max(1, self.tracks_area.viewport().width()-120)
+        pxs = max(20.0, vieww / max(0.001, total_ms/1000.0))
+        self._set_zoom(pxs/100.0)
+
+    def _zoom_to_selection(self):
+        target = self._selected or (self._selection[0] if self._selection else None)
+        if not target: return
+        dur = max(1, target.duration_ms)
+        vieww = max(1, self.tracks_area.viewport().width()-120)
+        pxs = max(20.0, vieww / max(0.001, dur/1000.0))
+        self._set_zoom(pxs/100.0)
 
 # Standalone test
 if __name__ == "__main__":
