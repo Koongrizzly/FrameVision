@@ -2,7 +2,7 @@
 # 🌟 FrameVision V1.0.5
 
 **New in v1.0.5 :** 
-- BETA Tmeline editor, no more need to load capcut or open shot, we can now do it inside FrameVision (wel sort of, work in progress, more features will come or may fo)
+- BETA Tmeline editor, no more need to load capcut or open shot, we can now do it inside FrameVision (wel sort of, work in progress, more features will come or may go) update often to get latest bugfixes
 - Full blown music visualizer (100+ visuals) not moving by time but by **BEATS** 
 loading an mp3 or music track will open a new overlay with a playlist and options for visuals where you can set it as low as 8 beats to have non stop changing visuals that change with sound and beats (and some extra tuning to make it show even more after a break in the track) It comes with a little bug where it will skip first 0.1 seconds of very first track that is loaded, after that it works perfect. Sometimes you notice sometimes you don't.
 
