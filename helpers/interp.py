@@ -13,6 +13,75 @@ from PySide6.QtWidgets import (
 )
 from PySide6.QtWidgets import QProgressBar
 
+
+# ---- FlowLayout (wrapping layout for thumbnails) ----
+from PySide6.QtWidgets import QLayout
+from PySide6.QtCore import QPoint, QRect, QSize
+class FlowLayout(QLayout):
+    def __init__(self, parent=None, margin=0, hSpacing=8, vSpacing=8):
+        super().__init__(parent)
+        self._items = []
+        self._h = hSpacing
+        self._v = vSpacing
+        self.setContentsMargins(margin, margin, margin, margin)
+
+    def addItem(self, item):
+        self._items.append(item)
+
+    def count(self):
+        return len(self._items)
+
+    def itemAt(self, index):
+        return self._items[index] if 0 <= index < len(self._items) else None
+
+    def takeAt(self, index):
+        return self._items.pop(index) if 0 <= index < len(self._items) else None
+
+    def expandingDirections(self):
+        return Qt.Orientations(Qt.Orientation(0))
+
+    def hasHeightForWidth(self):
+        return True
+
+    def heightForWidth(self, width):
+        return self._doLayout(QRect(0, 0, width, 0), True)
+
+    def setGeometry(self, rect):
+        super().setGeometry(rect)
+        self._doLayout(rect, False)
+
+    def sizeHint(self):
+        return self.minimumSize()
+
+    def minimumSize(self):
+        size = QSize()
+        for item in self._items:
+            size = size.expandedTo(item.minimumSize())
+        l, t, r, b = self.getContentsMargins()
+        size += QSize(l + r, t + b)
+        return size
+
+    def _doLayout(self, rect, testOnly):
+        x = rect.x()
+        y = rect.y()
+        line_h = 0
+        for item in self._items:
+            w = item.sizeHint().width()
+            h = item.sizeHint().height()
+            next_x = x + w + self._h
+            if next_x - self._h > rect.right() and line_h > 0:
+                x = rect.x()
+                y = y + line_h + self._v
+                next_x = x + w + self._h
+                line_h = 0
+            if not testOnly:
+                item.setGeometry(QRect(QPoint(x, y), item.sizeHint()))
+            x = next_x
+            if h > line_h:
+                line_h = h
+        return y + line_h - rect.y()
+
+
 from helpers.queue_adapter import enqueue_tool_job, default_outdir, jobs_dirs
 from helpers.mediainfo import refresh_info_now
 try:
@@ -242,16 +311,27 @@ class InterpPane(QWidget):
         self.pb_wrap.addWidget(self.pb_label); self.pb_wrap.addWidget(self.pb, 1); self.pb_wrap.addWidget(self.pb_eta); self.pb_wrap.addWidget(self.pb_cancel)
         lay.addLayout(self.pb_wrap)
 
-        # ---- Recent results gallery (NEW) ----
+                # ---- Recent results gallery (NEW) ----
         self.recent = Collapsible("Recent results", start_open=False)
         root.addWidget(self.recent)
         rlay = self.recent.body_layout()
-        self.recent_area = QScrollArea(); self.recent_area.setWidgetResizable(True); self.recent_area.setFrameShape(QFrame.NoFrame); self.recent_area.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff); self.recent_area.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
-        self.recent_container = QWidget(); self.recent_h = QHBoxLayout(self.recent_container); self.recent_h.setContentsMargins(0,0,0,0); self.recent_h.setSpacing(8)
+
+        self.recent_area = QScrollArea()
+        self.recent_area.setWidgetResizable(True)
+        self.recent_area.setFrameShape(QFrame.NoFrame)
+        self.recent_area.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        self.recent_area.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+        self.recent_area.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
+
+        self.recent_container = QWidget()
+        self.recent_container.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
+        self.recent_flow = FlowLayout(self.recent_container, hSpacing=8, vSpacing=8)
+        self.recent_container.setLayout(self.recent_flow)
+
         self.recent_area.setWidget(self.recent_container)
         rlay.addWidget(self.recent_area)
-
-        # ---- Advanced ----
+# ---- Advanced ----
+# ---- Advanced ----
         adv = Collapsible("Advanced", start_open=True)
         root.addWidget(adv); advl = adv.body_layout()
 
@@ -893,8 +973,8 @@ class InterpPane(QWidget):
     # ---- recent gallery ----
     def _refresh_recent(self):
         # Clear
-        while self.recent_h.count():
-            item = self.recent_h.takeAt(0)
+        while self.recent_flow.count():
+            item = self.recent_flow.takeAt(0)
             w = item.widget()
             if w: w.deleteLater()
 
@@ -908,18 +988,15 @@ class InterpPane(QWidget):
             pm = QPixmap(str(thumb)) if thumb.exists() else QPixmap()
             lbl = QLabel()
             if not pm.isNull():
-                pm2 = pm.scaled(QSize(180, 100), Qt.KeepAspectRatio, Qt.SmoothTransformation)
+                pm2 = pm.scaled(QSize(160, 90), Qt.KeepAspectRatio, Qt.SmoothTransformation)
                 lbl.setPixmap(pm2)
             else:
                 lbl.setText(v.stem)
             lbl.setToolTip(v.name)
             lbl.setCursor(Qt.PointingHandCursor)
             lbl.mousePressEvent = (lambda p=v: (lambda evt: (self._open_in_player(p) or QDesktopServices.openUrl(QUrl.fromLocalFile(str(p))))))()
-            self.recent_h.addWidget(lbl)
-        self.recent_h.addStretch(1)
-
-
-# ---- Interp persistence hooks (appended) ----
+            self.recent_flow.addWidget(lbl)
+        # ---- Interp persistence hooks (appended) ----
 try:
     from PySide6.QtCore import QTimer, QSettings
     import json as _json

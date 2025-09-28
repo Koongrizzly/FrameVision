@@ -881,7 +881,7 @@ class VideoPane(QWidget):
             self._zoomOverlayTimer = None
 # --- zoom/pan state + mode flag ---
         self._zoom = 1.0
-        self._max_zoom = 10.0
+        self._max_zoom =    50.0
         self._zoom_step = 0.50
         self._pan_cx = 0.5
         self._pan_cy = 0.5
@@ -945,6 +945,24 @@ class VideoPane(QWidget):
         # Present the current frame; keep zoom logic intact
         if not hasattr(self, '_present_pending'):
             self._present_pending = False
+        # --- FPS throttle ---
+        try:
+            from PySide6.QtCore import QTimer
+            import time as _t
+            if not hasattr(self, '_fps_target') or not self._fps_target:
+                self._fps_target = 30  # default cap
+            if not hasattr(self, '_last_present_ts'):
+                self._last_present_ts = 0.0
+            _now = _t.perf_counter()
+            _interval = max(0.001, 1.0 / float(self._fps_target))
+            _elapsed = _now - float(self._last_present_ts or 0.0)
+            if _elapsed < _interval:
+                _ms = int((_interval - _elapsed) * 1000)
+                QTimer.singleShot(max(0, _ms), self._present_current_frame)
+                return
+            self._last_present_ts = _now
+        except Exception:
+            pass
         if not hasattr(self, '_present_busy'):
             self._present_busy = False
         self._present_pending = False
@@ -1011,7 +1029,7 @@ class VideoPane(QWidget):
         # _update_ratio_button removed
 # --- zoom/pan state + mode flag ---
         self._zoom = 1.0
-        self._max_zoom = 10.0
+        self._max_zoom =    50.0
         self._zoom_step = 0.50
         self._pan_cx = 0.5
         self._pan_cy = 0.5
