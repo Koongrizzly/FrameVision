@@ -2,6 +2,37 @@
 import os, sys, subprocess, shlex, time
 from pathlib import Path
 
+
+# --- Shared visual state for the visualizer (volume/mute/EQ), no new files ---
+_visual_state = {
+    "volume": 1.0,          # 0..1
+    "mute": False,
+    "gains": [0, 0, 0, 0, 0],  # dB for 60,230,910,3600,14000
+    "eq_on": False,
+}
+
+def set_visual_from_ui(volume=None, mute=None, gains=None, eq_on=None):
+    try:
+        st = _visual_state
+        if volume is not None:
+            try: st["volume"] = float(max(0.0, min(1.0, volume)))
+            except Exception: pass
+        if mute is not None:
+            st["mute"] = bool(mute)
+        if gains is not None and hasattr(gains, '__iter__'):
+            gg = [int(x) for x in list(gains)[:5]]
+            while len(gg) < 5: gg.append(0)
+            st["gains"] = gg[:5]
+        if eq_on is not None:
+            st["eq_on"] = bool(eq_on)
+    except Exception:
+        pass
+
+def get_visual_state():
+    try:
+        return dict(_visual_state)
+    except Exception:
+        return {"volume":1.0,"mute":False,"gains":[0,0,0,0,0],"eq_on":False}
 # Global singleton per process (simple)
 _proc = None
 
@@ -60,6 +91,10 @@ def _pane_media_and_pos(pane):
 
 def stop():
     global _proc
+    try:
+        _visual_state['eq_on'] = False
+    except Exception:
+        pass
     if _proc and _proc.poll() is None:
         try:
             _proc.terminate()
@@ -72,6 +107,46 @@ def stop():
     _proc = None
 
 def apply_filter(pane, filter_str):
+
+    # Update shared visual state from filter string
+    try:
+        import re as _re
+        vol = None
+        gains = []
+        for f,g in _re.findall(r"equalizer=f=(\d+):t=q:w=1:g=(-?\d+)", filter_str):
+            gains.append(int(g))
+        mvol = _re.search(r"volume=([0-9]*\.?[0-9]+)", filter_str)
+        if mvol:
+            vol = float(mvol.group(1))
+        set_visual_from_ui(volume=vol, mute=(vol == 0.0), gains=gains if gains else None, eq_on=True)
+    except Exception:
+        pass
+
+    # parse gains/volume for visual state
+    """Mute Qt audio and start/replace an ffplay sidecar to play audio with -af filter."""
+    global _proc
+    path, pos_ms = _pane_media_and_pos(pane)
+    if not path or not os.path.exists(path):
+        return False
+
+    # Mute Qt audio if present
+    for name in ("audio", "audio_output", "audioOutput", "player_audio"):
+        a = getattr(pane, name, None)
+        try:
+            if a and hasattr(a, "setMuted"):
+                a.setMuted(True)
+        except Exception:
+            pass
+
+    # Build command
+    ffplay = _guess_ffplay_path()
+    # -nodisp: audio only; -autoexit at end; -ss seek; -af filter; -loglevel warning
+    args = [ffplay, "-nodisp", "-autoexit", "-loglevel", "warning"]
+    if pos_ms and pos_ms > 0:
+        args += ["-ss", f"{pos_ms/1000.0:.3f}"]
+    args += ["-af", filter_str, path]
+
+        # parse gains/volume for visual state
     """Mute Qt audio and start/replace an ffplay sidecar to play audio with -af filter."""
     global _proc
     path, pos_ms = _pane_media_and_pos(pane)

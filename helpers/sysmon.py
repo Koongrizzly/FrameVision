@@ -62,17 +62,16 @@ def _fmt_pair_gib(a_bytes: float, b_bytes: float) -> str:
     return f"{a:.1f}/{b:.0f} GiB"
 
 def _fmt_dur(secs: float) -> str:
-    try:
-        s = int(max(0, secs))
-    except Exception:
-        return "—"
+    try: s = int(max(0, secs))
+    except Exception: return "—"
     d, rem = divmod(s, 86400)
     h, rem = divmod(rem, 3600)
-    m, _ = divmod(rem, 60)
+    m, s   = divmod(rem, 60)
     parts = []
     if d: parts.append(f"{d}d")
     if h or d: parts.append(f"{h}h")
-    parts.append(f"{m}m")
+    if m or h or d: parts.append(f"{m:02d}m")
+    parts.append(f"{s:02d}s")
     return " ".join(parts)
 
 def _disk_free_total(path: str) -> Tuple[int,int]:
@@ -569,7 +568,13 @@ class SysMonPanel(QWidget):
         v.addWidget(self.lbl_sizes)
         v.addLayout(row2)
 
-        self.timer = QTimer(self); self.timer.timeout.connect(self._tick)
+        self.seconds_timer = QTimer(self)
+        self.seconds_timer.setTimerType(Qt.PreciseTimer)
+        self.seconds_timer.setInterval(1000)
+        self.seconds_timer.timeout.connect(self._tick_seconds)
+        self.seconds_timer.start()
+        self.timer = QTimer(self)
+        self.timer.setTimerType(Qt.PreciseTimer); self.timer.timeout.connect(self._tick)
         self._apply_interval()
         if self.enabled: self.timer.start()
 
@@ -637,6 +642,14 @@ class SysMonPanel(QWidget):
         self.session_start_ts = time.time()
         self.lbl_uptime_session.setText("Time online (this session): 0m")
 
+    def _tick_seconds(self):
+        if not self.enabled: return
+        now = time.time()
+        try: self.lbl_uptime_session.setText(f"Time online (this session): {_fmt_dur(now - self.session_start_ts)}")
+        except Exception: pass
+        try: self.lbl_uptime_total.setText(f"Time online (since first run): {_fmt_dur(now - self.first_run_ts)}")
+        except Exception: pass
+
     def _tick(self):
         if not self.enabled: return
         cpu = _get_cpu_percent(); self.lbl_cpu.setText(f"CPU load: {cpu:.0f}%")
@@ -673,9 +686,8 @@ class SysMonPanel(QWidget):
 
         # Uptimes
         now = time.time()
-        self.lbl_uptime_session.setText(f"Time online (this session): {_fmt_dur(now - self.session_start_ts)}")
-        self.lbl_uptime_total.setText(f"Time online (since first run): {_fmt_dur(now - self.first_run_ts)}")
 
+        self._tick_seconds()
 # ---------- Settings installer ----------
 def _find_settings_content() -> Optional[QWidget]:
     app = QApplication.instance()

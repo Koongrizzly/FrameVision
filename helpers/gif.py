@@ -549,6 +549,7 @@ def install_ui(pane, lay_gif, sec_gif) -> None:
         QGroupBox = None
     if QGroupBox is not None:
         grp_imgs = QGroupBox("Create new from images")
+        grp_imgs.setStyleSheet("QGroupBox{background: palette(base);} QGroupBox:title{subcontrol-origin: margin; left: 6px; padding: 2px 4px;}")
         lay_imgs = QFormLayout(grp_imgs)
 
         
@@ -590,12 +591,8 @@ def install_ui(pane, lay_gif, sec_gif) -> None:
             pane.gif_imgs_preview.setMinimumHeight(110)
             pane.gif_imgs_preview.setMaximumHeight(140)
             try:
-                pane.gif_imgs_preview.setAlternatingRowColors(True)
-                _qss = (
-                    "QTableWidget { background-color: #20242a; color: #e6e6e6; gridline-color: #3a3f44; }"
-                    " QHeaderView::section { background-color: #2a2f36; color: #e6e6e6; padding: 4px; border: none; }"
-                    " QTableWidget::item:selected { background-color: #3b82f6; color: #ffffff; }"
-                )
+                pane.gif_imgs_preview.setAlternatingRowColors(False)
+                _qss = ("QTableWidget { background-color: palette(base); color: palette(text); gridline-color: palette(mid); } QHeaderView::section { background-color: palette(window); color: palette(window-text); padding: 4px; border: 0px; } QTableWidget::item:selected { background: palette(highlight); color: palette(highlighted-text); } QTableWidget::item:selected:!active { background: palette(midlight); color: palette(window-text); }")
                 pane.gif_imgs_preview.setStyleSheet(_qss)
             except Exception:
                 pass
@@ -603,6 +600,8 @@ def install_ui(pane, lay_gif, sec_gif) -> None:
             pass
 
         pane.gif_imgs_create = QPushButton("New")
+        pane.gif_imgs_create.setStyleSheet("QPushButton{background: palette(button); color: palette(window-text); border: 1px solid palette(mid); border-radius: 8px; padding: 8px 14px;} QPushButton:hover{background: palette(mid);} QPushButton:pressed{background: palette(dark);}")
+
 
         lay_imgs.addRow(row_i1)
         lay_imgs.addRow(row_i2)

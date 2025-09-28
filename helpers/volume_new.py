@@ -65,7 +65,7 @@ class _MenuPopupWidget(QWidget):
         for i,(label,_freq) in enumerate(BANDS):
             sv = QSlider(Qt.Vertical); sv.setRange(-12,12); sv.setValue(0); self.eq.append(sv)
             grid.addWidget(sv,0,i,alignment=Qt.AlignHCenter|Qt.AlignBottom)
-            lb = QLabel(label); lb.setAlignment(Qt.AlignHCenter); grid.addWidget(lb,1,i,alignment=Qt.AlignHCenter)
+            lb = QLabel(label); lb.setObjectName('fv_freq_label'); lb.setAlignment(Qt.AlignHCenter); grid.addWidget(lb,1,i,alignment=Qt.AlignHCenter)
         v.addLayout(grid)
 
         # Bottom: Toggle EQ + Reset
@@ -90,17 +90,51 @@ class _MenuPopupWidget(QWidget):
         # init from audio
         self._sync_from_audio()
         self._apply_toggle_style(False)
+        self._update_visual_state()
 
         # style
         self.setStyleSheet(
-            "#fv_menu_volume_frame{background:rgba(22,24,28,245);border-radius:12px;}"
-            "QLabel,QCheckBox{color:white;}"
-            "QPushButton{padding:4px 10px;}"
+            "#fv_menu_volume_frame{background: palette(window);border: 1px solid palette(mid);border-radius: 12px;}QLabel,QCheckBox{color: palette(window-text); background: transparent;}QLabel#fv_freq_label{font-weight:600; font-size:13px;}QLabel#fv_vol_label{font-weight:700; font-size:13px;}QPushButton{background: palette(button);color: palette(window-text);border: 1px solid palette(mid);border-radius: 8px; padding: 6px 12px;}QPushButton:hover{background: palette(light);}QPushButton:pressed{background: palette(dark);}QPushButton:checked{background: palette(midlight); border-color: palette(highlight);}QToolTip{color: palette(toolTipText); background-color: palette(toolTipBase); border: 1px solid palette(mid);}"
+            ""
+            ""
             "QPushButton#fv_eq_toggle { border-radius: 8px; font-weight: 600; }"
             "QPushButton#fv_eq_toggle:checked { background: #16a34a; color: white; }"  # green when ON
         )
         self.setMinimumWidth(420)
 
+        # publish initial visual state
+        self._publish_visual_state()
+
+    def _update_visual_state(self):
+        """Push volume/mute/EQ to the visualizer shared state (eq_ffmpeg) if available."""
+        try:
+            vol = max(0.0, min(1.0, float(self.vol.value())/100.0))
+            mute = bool(self.mute.isChecked())
+            gains = [int(s.value()) for s in self.eq]
+            # EQ considered ON only when toggle is checked
+            eq_on = bool(self.toggle_btn.isChecked()) if hasattr(self, "toggle_btnQLabel{background: transparent;}") else False
+            self.eq_ffmpeg.set_visual_from_ui(volume=vol, mute=mute, gains=gains, eq_on=eq_on)
+        except Exception:
+            pass
+
+
+
+
+    def _publish_visual_state(self):
+        """Expose volume/mute/EQ to the visualizer via attributes on the pane.
+        - _fv_visual_gain: 0..1
+        - _fv_visual_mute: bool
+        - _fv_eq_freqs: list of Hz
+        - _fv_eq_gains_db: list of dB (match BANDS order)
+        """
+        try:
+            p = self.pane
+            p._fv_visual_gain = max(0.0, min(1.0, float(self.vol.value())/100.0)) if not self.mute.isChecked() else 0.0
+            p._fv_visual_mute = bool(self.mute.isChecked())
+            p._fv_eq_freqs = [f for (_label, f) in BANDS]
+            p._fv_eq_gains_db = [int(s.value()) for s in self.eq]
+        except Exception:
+            pass
     # ----- helpers -----
     def _audio(self):
         return _resolve_audio(self.pane)
@@ -148,8 +182,8 @@ class _MenuPopupWidget(QWidget):
             except Exception: pass
             self._eq_enabled = False
             self._apply_toggle_style(False)
+        self._update_visual_state()
 
-    # ----- live updates -----
     def _on_volume_changed(self, _):
         if self._eq_enabled:
             # reapply current filter chain
@@ -161,6 +195,12 @@ class _MenuPopupWidget(QWidget):
                     a.setVolume(float(self.vol.value())/100.0)
             except Exception: pass
 
+        try:
+            self._publish_visual_state()
+        except Exception:
+            pass
+        self._update_visual_state()
+
     def _on_mute_toggled(self, st):
         if self._eq_enabled:
             self.eq_ffmpeg.apply_filter(self.pane, self._filter_chain())
@@ -171,9 +211,21 @@ class _MenuPopupWidget(QWidget):
                     a.setMuted(bool(st))
             except Exception: pass
 
+        try:
+            self._publish_visual_state()
+        except Exception:
+            pass
+        self._update_visual_state()
+
     def _on_eq_changed(self):
         if self._eq_enabled:
             self.eq_ffmpeg.apply_filter(self.pane, self._filter_chain())
+
+        try:
+            self._publish_visual_state()
+        except Exception:
+            pass
+        self._update_visual_state()
 
     def _reset_eq(self):
         for s in self.eq:
@@ -181,6 +233,12 @@ class _MenuPopupWidget(QWidget):
         if self._eq_enabled:
             self.eq_ffmpeg.apply_filter(self.pane, self._filter_chain())
 
+
+        try:
+            self._publish_visual_state()
+        except Exception:
+            pass
+        self._update_visual_state()
 
 def _install_cleanup_strong(pane, btn):
     """Install robust cleanup hooks to stop the ffplay sidecar in all scenarios."""
@@ -273,7 +331,7 @@ def add_new_volume_popup(pane, bar_layout):
     menu.addAction(wa)
     btn.setMenu(menu)
     btn.setPopupMode(QToolButton.InstantPopup)
-    btn.setStyleSheet("QToolButton::menu-indicator{ image: none; width:0px; height:0px; }")
+    btn.setStyleSheet("QToolButton::menu-indicator{ image: none; width:0px; height:0px; } " " QMenu { background: transparent; border: 0px; }")
 
     bar_layout.addWidget(btn)
 
@@ -283,4 +341,15 @@ def add_new_volume_popup(pane, bar_layout):
     pane.btn_volume_new = btn
     pane.volume_popup_menu = menu
     pane.volume_popup_widget = w
+    try:
+        w._publish_visual_state()
+    except Exception:
+        pass
     return btn
+
+
+# Contrast patch: make QMenu background transparent
+try:
+    btn.setStyleSheet((btn.styleSheet() or "") + " QMenu { background: transparent; border: 0px; }")
+except Exception:
+    pass

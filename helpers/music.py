@@ -240,7 +240,8 @@ class PreAnalyzer(QThread):
     """
     ready = Signal(list, list, list)
 
-    def __init__(self, path: Path, sr: int = 24000, bands: int = 48, hop_ms: int = 20, parent=None):
+    def __init__(self, path: Path, sr: int = 24000, bands: int = 48, hop_ms: int = 80, parent=None):
+        self._ema_ref = None  # per-bin EMA reference for AGC
         super().__init__(parent)
         self.path = Path(path)
         self.sr = int(sr)
@@ -298,9 +299,15 @@ class PreAnalyzer(QThread):
                     spec_c = np.fft.rfft(arr * win, n=n_fft)
                     mag = np.abs(spec_c)
                     if mag.max() > 0:
-                        mag = mag / mag.max()
-
-                    # RMS over hop-sized slice
+                        # Per-bin EMA AGC + soft companding (replaces frame-wise max normalization)
+                        if self._ema_ref is None:
+                            self._ema_ref = mag.copy() + 1e-9
+                        else:
+                            self._ema_ref = 0.985 * self._ema_ref + 0.125 * mag
+                        mag = np.clip(mag / (self._ema_ref + 1e-9), 0.0, 1.0)
+                        # Soft companding keeps low-level motion visible without letting peaks dominate
+                        mag = np.power(mag, 0.78)
+# RMS over hop-sized slice
                     hop_samples = hop
                     td_chunk = arr[:hop_samples] if hop_samples <= arr.size else arr
                     rms = float(np.sqrt(np.mean(td_chunk**2))) if td_chunk.size else 0.0
@@ -387,7 +394,7 @@ class HybridAnalyzer(QObject):
         self._times: List[int] = []
         self._bands: List[List[float]] = []
         self._rms: List[float] = []
-        self._hop_ms = 20
+        self._hop_ms = 80
         self._timer = QTimer(self)
         self._timer.timeout.connect(self._tick)
 
@@ -401,6 +408,10 @@ class HybridAnalyzer(QObject):
         self._probe_ok = False
         self._probe_levels: Optional[List[float]] = None
         self._probe_rms: float = 0.0
+
+        # Lighten QAudioProbe processing: process 1 of every 4 buffers
+        self._probe_decim = 0
+        self._probe_decim_mod = 4
 
         if HAVE_AUDIO_PROBE and player is not None:
             try:
@@ -422,7 +433,7 @@ class HybridAnalyzer(QObject):
             pass
 
     def start(self):
-        self._timer.start(33)
+        self._timer.start(90)
 
     def stop(self):
         self._timer.stop()
@@ -434,6 +445,11 @@ class HybridAnalyzer(QObject):
 
     def _on_buf(self, buf):
         try:
+            
+            # Decimate probe buffers to reduce CPU
+            self._probe_decim = (self._probe_decim + 1) % max(1, self._probe_decim_mod)
+            if self._probe_decim != 0:
+                return
             fmt = buf.format()
             ch = getattr(fmt, 'channelCount', lambda: 1)()
             bps = getattr(fmt, 'bytesPerSample', lambda: 2)()
@@ -750,7 +766,7 @@ class Collapser(QWidget):
         self.setObjectName('fvMusicCard')
         self.setStyleSheet(
             '#fvMusicCard { background: rgba(0,0,0,110); border-radius: 14px; }'
-            '#fvMusicCard QLabel, #fvMusicCard QListWidget, #fvMusicCard QCheckBox, #fvMusicCard QComboBox { color: white; }'
+            '#fvMusicCard QLabel, #fvMusicCard QListWidget, #fvMusicCard QCheckBox, #fvMusicCard QComboBox { color: palette(text);  background: palette(base);  border: 1px solid palette(mid); border-radius: 6px; }'
             '#fvMusicCard QPushButton { background: rgba(255,255,255,28); border: none; padding: 6px 10px; border-radius: 9px;}'
             '#fvMusicCard QPushButton:hover { background: rgba(255,255,255,40); }'
         )
@@ -800,6 +816,7 @@ class Collapser(QWidget):
 class MusicOverlay(QWidget):
     def __init__(self, video_pane, parent=None):
         super().__init__(parent or video_pane)
+        self.suspended = False
         self.setAttribute(Qt.WA_TransparentForMouseEvents, False)
         self.setAutoFillBackground(False)
         self.setObjectName('musicOverlay')
@@ -825,7 +842,7 @@ class MusicOverlay(QWidget):
         try:
             self.playlist.setMinimumWidth(260)
             self.playlist.setAlternatingRowColors(False)
-            self.playlist.setStyleSheet('QListWidget { color: palette(text); } QListWidget::item{padding:6px 8px; margin:2px;} QListWidget::item:selected{ color: palette(highlighted-text); }')
+            self.playlist.setStyleSheet('QListWidget { color: #ffffff;  background: transparent;} QListWidget::item{padding:6px 8px; margin:2px;} QListWidget::item:selected{ color: palette(highlighted-text); }\nQComboBox { color: palette(text);  background: palette(base);  border: 1px solid palette(mid); border-radius: 6px; }\nQAbstractItemView { color: palette(window-text); background: palette(window); }\nQAbstractItemView::item:selected { background: palette(highlight); color: palette(highlighted-text); }')
         except Exception:
             pass
         self.btn_add = QPushButton('Add…')
@@ -1004,7 +1021,10 @@ class MusicOverlay(QWidget):
             self.fab.setStyleSheet('QPushButton {background: rgba(231,76,60,200); color:white; border-radius: 20px;} QPushButton:hover {background: rgba(231,76,60,230);}')
 
     def eventFilter(self, obj, ev):
-        # Any user activity resets timer and shows UI
+                # Ignore events while overlay is suspended (non-audio mode)
+        if getattr(self, 'suspended', False):
+            return False
+# Any user activity resets timer and shows UI
         if ev.type() in (QEvent.MouseMove, QEvent.MouseButtonPress, QEvent.MouseButtonRelease, QEvent.Wheel, QEvent.KeyPress, QEvent.KeyRelease):
             try:
                 self._activity()
@@ -1859,6 +1879,39 @@ def wire_to_videopane(VideoPaneClass):
                 if self._music_overlay.parent() is not self:
                     self._music_overlay.setParent(self)
                 self._music_overlay.show()
+                try:
+                    # Ensure overlay is active for audio
+                    self._music_overlay.suspended = False
+                except Exception:
+                    pass
+                # Reattach event filters so overlay can track parent/label events again
+                try:
+                    try:
+                        self.installEventFilter(self._music_overlay)
+                    except Exception:
+                        pass
+                    if hasattr(self, 'label') and getattr(self, 'label', None):
+                        try:
+                            self.label.installEventFilter(self._music_overlay)
+                        except Exception:
+                            pass
+                    try:
+                        self._music_overlay.installEventFilter(self._music_overlay)
+                    except Exception:
+                        pass
+                except Exception:
+                    pass
+                # Make sure it is visible and above content
+                try:
+                    from PySide6.QtCore import QTimer
+                    QTimer.singleShot(0, self._music_overlay.show)
+                    QTimer.singleShot(0, self._music_overlay.raise_)
+                except Exception:
+                    try:
+                        self._music_overlay.raise_()
+                    except Exception:
+                        pass
+
                 self._music_overlay._reposition()
                 self._music_overlay.raise_()
 
@@ -1930,7 +1983,7 @@ def wire_to_videopane(VideoPaneClass):
                 pass
             return result
         else:
-            # Soft teardown when opening non-audio (image/video/gif/etc)
+            # Soft suspend overlay/runtime when opening non-audio (image/video/gif/etc)
             try:
                 if getattr(self, "_music_runtime", None):
                     try:
@@ -1939,12 +1992,33 @@ def wire_to_videopane(VideoPaneClass):
                         pass
                 if getattr(self, "_music_overlay", None):
                     try:
+                        # Mark overlay as suspended so its eventFilter won't revive it
+                        try:
+                            self._music_overlay.suspended = True
+                        except Exception:
+                            pass
+                        # Remove event filters to prevent auto-raise/show on parent resize/show
+                        try:
+                            try:
+                                self.removeEventFilter(self._music_overlay)
+                            except Exception:
+                                pass
+                            if hasattr(self, 'label') and getattr(self, 'label', None):
+                                try:
+                                    self.label.removeEventFilter(self._music_overlay)
+                                except Exception:
+                                    pass
+                            try:
+                                self._music_overlay.removeEventFilter(self._music_overlay)
+                            except Exception:
+                                pass
+                        except Exception:
+                            pass
                         self._music_overlay.hide()
                     except Exception:
                         pass
             except Exception:
                 pass
             return orig_open(self, path)
-
 
     VideoPaneClass.open = open_wrapper
