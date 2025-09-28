@@ -1,0 +1,50 @@
+*** Begin Patch
+*** Update File: music.py
+@@
+         freqs = None
+         edges = None
+         centers = None
++        # --- Per-bin AGC state (prevents bass from flattening other bands) ---
++        ema_ref = None  # type: ignore
++        agc_alpha = 0.015  # smoothing for reference (≈ fast but stable)
++        agc_eps = 1e-9
+@@
+                     mag = np.abs(spec_c)
+-                    if mag.max() > 0:
+-                        mag = mag / mag.max()
++                    # Per-bin automatic gain control instead of per-frame max normalization
++                    if ema_ref is None:
++                        ema_ref = mag.copy()
++                    else:
++                        ema_ref = (1.0 - agc_alpha) * ema_ref + agc_alpha * mag
++                    ref = ema_ref + agc_eps
++                    mag = np.clip(mag / ref, 0.0, 1.0)
++                    # Soft companding to keep quiet details visible without blowing up loud hits
++                    mag = mag ** 0.6
+@@
+         # Apply gentle high-shelf tilt: progressively boost higher bands a little
+         try:
+             hb = float(getattr(self, '_high_tilt', 0.18))
+         except Exception:
+             hb = 0.18
+         if hb > 0.0 and self._bars > 1:
+             top = self._bars - 1
+             for i in range(self._bars):
+                 t = i / top
+                 # perceptual-ish curve; raise highs up to ~+hb
+                 gain = 1.0 + hb * (t ** 0.9)
+                 out[i] = min(1.0, out[i] * gain)
++        # Adaptive anti-ducking: when bass is very strong, give mids/highs a small, temporary lift
++        if self._bars > 1:
++            bass_k = max(8, self._bars // 6)
++            bass_avg = sum(out[:bass_k]) / float(bass_k)
++            # extra boost up to +0.15 when bass_avg is near 1.0; zero when bass is low
++            extra = min(0.15, max(0.0, bass_avg * 0.15))
++            if extra > 0.0:
++                top = self._bars - 1
++                for i in range(bass_k, self._bars):
++                    t = (i - bass_k) / max(1, top - bass_k)
++                    out[i] = min(1.0, out[i] * (1.0 + extra * (t ** 0.9)))
+         self._levels_smooth = out
+         self._levels = out
+*** End Patch

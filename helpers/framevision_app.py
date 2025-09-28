@@ -212,6 +212,15 @@ except Exception as _e:
     print("[framevision] txt2img tab import failed:", _e)
     Txt2ImgPane = None
 # <<< FRAMEVISION_TXT2IMG_END
+# >>> FRAMEVISION_EDITOR_BEGIN
+# Safe import of the Mini Editor pane; never crash app on failure.
+try:
+    from helpers.editor import EditorPane
+except Exception as _e:
+    print("[framevision] editor tab import failed:", _e)
+    EditorPane = None
+# <<< FRAMEVISION_EDITOR_END
+
 
 # >>> FRAMEVISION_WAN22_BEGIN
 # WAN22 tab disabled: do not import or add missing module.
@@ -466,6 +475,30 @@ if not MANIFEST_PATH.exists():
 def save_config(): CONFIG_PATH.write_text(json.dumps(config, indent=2), encoding="utf-8")
 def save_presets(): PRESETS_PATH.write_text(json.dumps(presets, indent=2), encoding="utf-8")
 
+# --- Startup logo rotation (presets/logo) ---
+def _fv_select_startup_logo():
+    try:
+        folder = ROOT / "presets" / "logo"
+        if not folder.exists():
+            return None
+        files = [p for p in folder.iterdir() if p.suffix.lower() in (".jpg",".jpeg",".png",".bmp",".webp")]
+        files.sort()
+        if not files:
+            return None
+        idx = int(config.get("logo_cycle_index", 0) or 0)
+        chosen = files[idx % len(files)]
+        # advance index once per app start
+        config["logo_cycle_index"] = (idx + 1) % len(files)
+        try:
+            save_config()
+        except Exception:
+            pass
+        return chosen
+    except Exception:
+        return None
+
+STARTUP_LOGO_PATH = _fv_select_startup_logo()
+
 def now_stamp(): return datetime.now().strftime("%Y%m%d_%H%M%S")
 def compose_video_info_text(path: Path) -> str:
     try:
@@ -673,6 +706,11 @@ class VideoPane(QWidget):
         # Crop for zoom>1 before scaling (used in Fit/Fill/Full modes)
         try:
             if pm is None or pm.isNull():
+                # draw background logo if empty
+                try:
+                    self._render_background_logo()
+                except Exception:
+                    pass
                 return pm
             z = float(getattr(self, '_zoom', 1.0) or 1.0)
             if z <= 1.0:
@@ -694,6 +732,11 @@ class VideoPane(QWidget):
         # Center mode: z<1 scales down (no crop); z>1 scales up then crops to label size
         try:
             if pm is None or pm.isNull():
+                # draw background logo if empty
+                try:
+                    self._render_background_logo()
+                except Exception:
+                    pass
                 return pm
             z = float(getattr(self, '_zoom', 1.0) or 1.0)
             from PySide6.QtCore import QUrl, QSize
@@ -763,6 +806,17 @@ class VideoPane(QWidget):
 
         self.currentFrame=None
         self.label=QLabel("FrameVision — Drop a video here or File → Open"); self.label.setAlignment(Qt.AlignCenter); self.label.setMinimumSize(1,1)
+        # background logo path selected at app start
+        try:
+            self._bg_logo_path = STARTUP_LOGO_PATH
+        except Exception:
+            self._bg_logo_path = None
+        # show empty background initially
+        try:
+            self._show_empty_background()
+        except Exception:
+            pass
+
         try:
             self.label.mouseDoubleClickEvent = lambda e: (self.toggle_fullscreen())
         except Exception:
@@ -777,6 +831,7 @@ class VideoPane(QWidget):
         self.player.positionChanged.connect(self.on_pos); self.player.durationChanged.connect(self.on_dur)
         try:
             self.player.playbackStateChanged.connect(lambda *_: self._sync_play_button())
+            self.player.playbackStateChanged.connect(self._on_playback_state)
             self._sync_play_button()
         except Exception:
             pass
@@ -851,6 +906,7 @@ class VideoPane(QWidget):
         self.btn_open.clicked.connect(self._open_via_dialog, Qt.ConnectionType.UniqueConnection); self.btn_play.clicked.connect(self._toggle_play_pause, Qt.ConnectionType.UniqueConnection)
         # pause button hidden; no click
         self.btn_stop.clicked.connect(self.player.stop, Qt.ConnectionType.UniqueConnection)
+        self.btn_stop.clicked.connect(self._handle_stop)
         self.btn_info.clicked.connect(self._show_info_popup, Qt.ConnectionType.UniqueConnection)
         # ratio button removed
         self.btn_compare.clicked.connect(_open_compare_page, Qt.ConnectionType.UniqueConnection)
@@ -888,6 +944,9 @@ class VideoPane(QWidget):
         self._dragging = False
         self._last_pos = None
         self._mode = 'video'
+        # Accept drops on the entire pane
+        self.setAcceptDrops(True)
+
     
     def _on_frame(self, frame):
         if getattr(self, '_mode', None) != 'video':
@@ -975,6 +1034,81 @@ class VideoPane(QWidget):
             pass
         finally:
             self._present_busy = False
+    # --- Background logo helpers ---
+    def _clear_video_sink(self):
+        try:
+            self.currentFrame = None
+        except Exception:
+            pass
+        try:
+            from PySide6.QtMultimedia import QVideoFrame
+            self.sink.blockSignals(True)
+            self.sink.setVideoFrame(QVideoFrame())
+            self.sink.blockSignals(False)
+        except Exception:
+            pass
+
+    def _render_background_logo(self):
+        try:
+            # only when no image/video is active
+            if getattr(self, '_mode', 'video') not in ('empty', None):
+                return
+            p = getattr(self, '_bg_logo_path', None)
+            if not p:
+                # still allow plain text fallback, do nothing
+                return
+            pm = load_pixmap(p)
+            if not pm or pm.isNull():
+                return
+            # stretch to fill label completely
+            target = self.label.contentsRect().size()
+            from PySide6.QtCore import QSize
+            spm = pm.scaled(QSize(max(1,target.width()), max(1,target.height())),
+                            Qt.IgnoreAspectRatio, Qt.SmoothTransformation)
+            # apply 50% opacity
+            from PySide6.QtGui import QPixmap as _QPixmap, QPainter as _QPainter
+            final = _QPixmap(spm.size())
+            final.fill(Qt.transparent)
+            _p = _QPainter(final)
+            try:
+                _p.setOpacity(0.85)
+                _p.drawPixmap(0,0,spm)
+            finally:
+                _p.end()
+            self.label.setPixmap(final)
+        except Exception:
+            pass
+
+    def _show_empty_background(self):
+        try:
+            self._mode = 'empty'
+            # clear any movie overlay
+            try:
+                self.label.setMovie(None)
+            except Exception:
+                pass
+            self._render_background_logo()
+        except Exception:
+            pass
+
+    def _handle_stop(self):
+        try:
+            self.player.stop()
+        except Exception:
+            pass
+        self._clear_video_sink()
+        self._show_empty_background()
+
+    def _on_media_status(self, status):
+        try:
+            from PySide6.QtMultimedia import QMediaPlayer as _QMediaPlayer
+            if status == _QMediaPlayer.EndOfMedia:
+                self._clear_video_sink()
+                self._show_empty_background()
+        except Exception:
+            # be permissive
+            pass
+
 
     def mousePressEvent(self, ev):
         # Disable click-to-toggle playback; allow normal event propagation
@@ -1027,21 +1161,16 @@ class VideoPane(QWidget):
         except Exception:
             self.ratio_mode = 1  # force FIT
         # _update_ratio_button removed
-# --- zoom/pan state + mode flag ---
-        self._zoom = 1.0
-        self._max_zoom =    50.0
-        self._zoom_step = 0.50
-        self._pan_cx = 0.5
-        self._pan_cy = 0.5
-        self._dragging = False
-        self._last_pos = None
-        self._mode = 'video'
-        self._refresh_label_pixmap()
 
     
     def _choose_scaled(self, pm: QPixmap, target_size):
         try:
             if pm is None or pm.isNull():
+                # draw background logo if empty
+                try:
+                    self._render_background_logo()
+                except Exception:
+                    pass
                 return pm
             return pm.scaled(target_size, Qt.KeepAspectRatio, Qt.SmoothTransformation)
         except Exception:
@@ -1087,6 +1216,11 @@ class VideoPane(QWidget):
                 if getattr(self, 'currentFrame', None) is not None and not self.currentFrame.isNull():
                     pm = QPixmap.fromImage(self.currentFrame)
             if pm is None or pm.isNull():
+                # draw background logo if empty
+                try:
+                    self._render_background_logo()
+                except Exception:
+                    pass
                 return
 
             target = self.label.contentsRect().size()
@@ -1317,6 +1451,27 @@ class VideoPane(QWidget):
         self.player.pause()
         if self.currentFrame is not None: self.frameCaptured.emit(self.currentFrame)
 
+    
+    def _on_playback_state(self, state):
+        """Ensure video frames show after resume; switch mode from background to video."""
+        try:
+            from PySide6.QtMultimedia import QMediaPlayer as _QMP
+            if state == _QMP.PlayingState:
+                try: self._mode = 'video'
+                except Exception: pass
+                # Make sure no GIF/movie or background pixmap is pinning the label
+                try: self.label.setMovie(None)
+                except Exception: pass
+                try:
+                    from PySide6.QtGui import QPixmap as _QPM
+                    if getattr(self, 'currentFrame', None) is not None and not self.currentFrame.isNull():
+                        self.label.setPixmap(_QPM.fromImage(self.currentFrame))
+                except Exception: pass
+                try: self._refresh_label_pixmap()
+                except Exception: pass
+        except Exception:
+            pass
+    
     def _sync_play_button(self):
         try:
             icon_play = "▶"
@@ -1334,6 +1489,10 @@ class VideoPane(QWidget):
                 self.pause()
             else:
                 self.player.play()
+            try: self._mode = 'video'
+            except Exception: pass
+            try: self.label.setMovie(None)
+            except Exception: pass
             self._sync_play_button()
         except Exception:
             pass
@@ -1644,6 +1803,58 @@ class VideoPane(QWidget):
         except Exception: pass
         try: return QWidget.resizeEvent(self, ev)
         except Exception: pass
+
+
+    # --- Drag & Drop on the entire pane ---
+    def dragEnterEvent(self, e):
+        try:
+            md = e.mimeData()
+            if md and (md.hasUrls() or md.hasText()):
+                e.acceptProposedAction()
+            else:
+                e.ignore()
+        except Exception:
+            e.ignore()
+
+    def dragMoveEvent(self, e):
+        try:
+            md = e.mimeData()
+            if md and (md.hasUrls() or md.hasText()):
+                e.acceptProposedAction()
+            else:
+                e.ignore()
+        except Exception:
+            e.ignore()
+
+    def dropEvent(self, e):
+        try:
+            md = e.mimeData()
+            paths = []
+            if md and md.hasUrls():
+                for u in md.urls():
+                    if u.isLocalFile():
+                        paths.append(u.toLocalFile())
+            if not paths and md and md.hasText():
+                for ln in md.text().splitlines():
+                    ln = ln.strip().strip('"')
+                    if ln:
+                        paths.append(ln)
+            if paths:
+                from pathlib import Path as _P
+                p = _P(paths[0])
+                try:
+                    self.open(p)
+                    w = self.window()
+                    if w is not None:
+                        setattr(w, 'current_path', p)
+                except Exception:
+                    pass
+                e.acceptProposedAction()
+            else:
+                e.ignore()
+        except Exception:
+            e.ignore()
+
 
 class HUD(QWidget):
     def _show_info_popup(self):
@@ -2488,7 +2699,7 @@ class MainWindow(QMainWindow):
 
     def __init__(self):
         super().__init__()
-        self.setWindowTitle(APP_NAME + " V1.0 " + TAGLINE)
+        self.setWindowTitle(APP_NAME + " V1.0.5 " + TAGLINE)
         self.resize(1280, 800)
         self.setMinimumSize(900, 580)
         self.current_path = None
@@ -2518,6 +2729,15 @@ class MainWindow(QMainWindow):
         except Exception as _e:
             print("[framevision] txt2img tab insert failed:", _e)
         # <<< FRAMEVISION_TXT2IMG_END
+        # >>> FRAMEVISION_EDITOR_BEGIN
+        # Safe import of the Mini Editor pane; never crash app on failure.
+        try:
+            from helpers.editor import EditorPane
+        except Exception as _e:
+            print("[framevision] editor tab import failed:", _e)
+            EditorPane = None
+        # <<< FRAMEVISION_EDITOR_END
+
         # >>> FRAMEVISION_WAN22_VIBEVOICE_TABS_BEGIN
 # WAN22/VibeVoice tabs disabled: skip insertion.
 # <<< FRAMEVISION_WAN22_VIBEVOICE_TABS_END
@@ -2542,11 +2762,63 @@ class MainWindow(QMainWindow):
         self.queue = QueuePane(self)
         self.presets_tab = PresetsPane(self)
         self.settings = SettingsPane(self)
+        # >>> FRAMEVISION_EDITOR_INIT_BEGIN
+        try:
+            if 'EditorPane' in globals() and EditorPane is not None:
+                self.mini_editor = EditorPane(self)
+                # Wire Mini Editor signals to the internal VideoPane player
+                try:
+                    def _preview_media(path, pos_ms):
+                        try:
+                            if path:
+                                self.video.open(path)
+                        except Exception:
+                            pass
+                        try:
+                            if pos_ms is not None:
+                                self.video.seek(int(pos_ms))
+                        except Exception:
+                            pass
+                    self.mini_editor.preview_media.connect(_preview_media)
+                except Exception:
+                    pass
+                try:
+                    def _transport(cmd: str):
+                        try:
+                            if cmd == "play":
+                                self.video.play()
+                            elif cmd == "pause":
+                                self.video.pause()
+                            elif cmd == "toggle":
+                                self.video.toggle()
+                            elif isinstance(cmd, str) and cmd.startswith("seek:"):
+                                ms = int(cmd.split(":",1)[1])
+                                self.video.seek(ms)
+                        except Exception:
+                            pass
+                    self.mini_editor.transport_request.connect(_transport)
+                except Exception:
+                    pass
+            else:
+                self.mini_editor = None
+        except Exception as _e:
+            print("[framevision] editor pane init failed:", _e)
+            self.mini_editor = None
+        # <<< FRAMEVISION_EDITOR_INIT_END
+
 
         self.video.frameCaptured.connect(self.describe.on_pause_capture)
 
         for name, w in [("Edit", self.edit),("Tools", self.tools),("Describe", self.describe),("Queue", self.queue),("Models", self.models),("Presets", self.presets_tab),("Settings", self.settings)]:
             self.tabs.addTab(w, name)
+        # >>> FRAMEVISION_EDITOR_ADDTAB_BEGIN
+        try:
+            if getattr(self, "mini_editor", None) is not None:
+                self.tabs.addTab(self.mini_editor, "Editor")
+        except Exception as _e:
+            print("[framevision] editor tab add failed:", _e)
+        # <<< FRAMEVISION_EDITOR_ADDTAB_END
+
 
         splitter = QSplitter(Qt.Horizontal, self)
         try:
@@ -2608,6 +2880,11 @@ class MainWindow(QMainWindow):
         # Enforce a real, visible vertical scrollbar on Tools
         try:
             self._ensure_scrollbar_on_tabs({"Tools","Upscaler","Upscale","Models","Queue"})
+            try:
+                self._ensure_scrollbar_on_tabs({"Editor"})
+            except Exception:
+                pass
+
         except Exception:
             pass
         # Remove legacy 'Presets' tab if present
@@ -2621,6 +2898,7 @@ class MainWindow(QMainWindow):
             t = (btn.text() or "").strip().lower()
             if t == "fix layout":
                 btn.hide(); btn.setEnabled(False)
+
 
 
         # Menu

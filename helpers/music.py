@@ -240,7 +240,7 @@ class PreAnalyzer(QThread):
     """
     ready = Signal(list, list, list)
 
-    def __init__(self, path: Path, sr: int = 24000, bands: int = 48, hop_ms: int = 80, parent=None):
+    def __init__(self, path: Path, sr: int = 24000, bands: int = 48, hop_ms: int = 70, parent=None):
         self._ema_ref = None  # per-bin EMA reference for AGC
         super().__init__(parent)
         self.path = Path(path)

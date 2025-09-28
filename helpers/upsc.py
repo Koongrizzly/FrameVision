@@ -20,6 +20,97 @@ except Exception:
     OUT_VIDEOS = ROOT / "output" / "video"
     OUT_SHOTS = ROOT / "output" / "photo"
 
+
+
+# --------- flow layout (wrap) ---------
+from PySide6.QtWidgets import QLayout, QSizePolicy
+from PySide6.QtCore import QPoint, QRect, QSize, Qt
+
+class FlowLayout(QLayout):
+    def __init__(self, parent=None, margin=0, hSpacing=8, vSpacing=8):
+        super().__init__(parent)
+        self._itemList = []
+        self._hSpace = hSpacing
+        self._vSpace = vSpacing
+        self.setContentsMargins(margin, margin, margin, margin)
+
+    def __del__(self):
+        item = self.takeAt(0)
+        while item:
+            item = self.takeAt(0)
+
+    def addItem(self, item):
+        self._itemList.append(item)
+
+    def count(self):
+        return len(self._itemList)
+
+    def itemAt(self, index):
+        if 0 <= index < len(self._itemList):
+            return self._itemList[index]
+        return None
+
+    def takeAt(self, index):
+        if 0 <= index < len(self._itemList):
+            return self._itemList.pop(index)
+        return None
+
+    def expandingDirections(self):
+        return Qt.Orientations(Qt.Orientation(0))
+
+    def hasHeightForWidth(self):
+        return True
+
+    def heightForWidth(self, width):
+        return self.doLayout(QRect(0, 0, width, 0), True)
+
+    def setGeometry(self, rect):
+        super().setGeometry(rect)
+        self.doLayout(rect, False)
+
+    def sizeHint(self):
+        return self.minimumSize()
+
+    def minimumSize(self):
+        size = QSize()
+        for item in self._itemList:
+            size = size.expandedTo(item.minimumSize())
+        m_left, m_top, m_right, m_bottom = self.getContentsMargins()
+        size += QSize(m_left + m_right, m_top + m_bottom)
+        return size
+
+    def horizontalSpacing(self):
+        return self._hSpace
+
+    def verticalSpacing(self):
+        return self._vSpace
+
+    def doLayout(self, rect, testOnly):
+        x = rect.x()
+        y = rect.y()
+        lineHeight = 0
+        spaceX = self.horizontalSpacing()
+        spaceY = self.verticalSpacing()
+
+        for item in self._itemList:
+            wid = item.widget()
+            if wid and not wid.isVisible():
+                continue
+            nextX = x + item.sizeHint().width() + spaceX
+            if nextX - spaceX > rect.right() and lineHeight > 0:
+                x = rect.x()
+                y = y + lineHeight + spaceY
+                nextX = x + item.sizeHint().width() + spaceX
+                lineHeight = 0
+
+            if not testOnly:
+                item.setGeometry(QRect(QPoint(x, y), item.sizeHint()))
+
+            x = nextX
+            lineHeight = max(lineHeight, item.sizeHint().height())
+
+        return y + lineHeight - rect.y()
+
 PRESETS_BIN = ROOT / "presets" / "bin"
 BIN_DIR = ROOT / "bin"
 MODELS_DIR = ROOT / "models"
@@ -48,6 +139,9 @@ def _which_ffmpeg(name: str) -> str:
 
 FFMPEG = _which_ffmpeg("ffmpeg")
 FFPROBE = _which_ffmpeg("ffprobe")
+
+# UI switches
+SHOW_UPSCALE_LOG = False  # hide the big log window; logging remains internal
 
 
 def detect_engines() -> List[Tuple[str, str]]:
@@ -177,12 +271,12 @@ class UpscPane(QtWidgets.QWidget):
         prefs_grid.setHorizontalSpacing(12)
         prefs_grid.setVerticalSpacing(6)
 
-        self.chk_remember = QtWidgets.QCheckBox("Remember settings", self)
-        self.chk_remember.setToolTip("When ON, your Upscaler settings and section positions are saved and restored.")
-        prefs_grid.addWidget(self.chk_remember, 0, 0, 1, 2)
-
+        self.chk_remember = QtWidgets.QCheckBox('Remember settings', self)
+        self.chk_remember.setChecked(True)
+        self.chk_remember.hide()  # hidden; always on
         self.chk_video_thumbs = QtWidgets.QCheckBox("Video thumbnails (heavier)", self)
-        self.chk_video_thumbs.setChecked(False)
+        self.chk_video_thumbs.setChecked(True)
+        self.chk_video_thumbs.hide()
         self.chk_video_thumbs.setToolTip("Generate first-frame thumbnails for videos. Uses more CPU/RAM. Disabled while jobs run.")
         prefs_grid.addWidget(self.chk_video_thumbs, 0, 2, 1, 2)
 
@@ -227,11 +321,10 @@ class UpscPane(QtWidgets.QWidget):
         v.addLayout(scale_lay)
 
         from helpers.collapsible_compat import CollapsibleSection
-        box = CollapsibleSection("Models", expanded=True, parent=self)
-        self.box_models = box
-        inner = QtWidgets.QVBoxLayout()
+        # Models (inline, no collapsible)
+        self.box_models = QtWidgets.QWidget(self)
+        inner = QtWidgets.QVBoxLayout(self.box_models)
         inner.setContentsMargins(6, 2, 6, 6)
-
         hl = QtWidgets.QHBoxLayout()
         hl.addWidget(QtWidgets.QLabel("Engine:", self))
         self.combo_engine = QtWidgets.QComboBox(self)
@@ -254,9 +347,8 @@ class UpscPane(QtWidgets.QWidget):
         lay_r.addWidget(self.combo_model_realsr, 1)
         # Badge for model category
         self.lbl_model_badge = QtWidgets.QLabel("—", self)
-        self.lbl_model_badge.setStyleSheet("QLabel{padding:2px 6px;border-radius:8px;background:#394b70;color:#cfe3ff;font-weight:600;}")
-        lay_r.addWidget(self.lbl_model_badge)
-
+        self.lbl_model_badge.setStyleSheet("QLabel{padding:2px 6px;border-radius:8px;background:#394b70;color:#cfe3ff;font-size:12px;font-weight:600;}")
+        
         self.stk_models.addWidget(pg_r)
 
         # Waifu2x
@@ -271,11 +363,14 @@ class UpscPane(QtWidgets.QWidget):
 
         inner.addWidget(self.stk_models)
 
-        # Model hint
+        # Model hint row (hint + badge on the same line)
         self.lbl_model_hint = QtWidgets.QLabel("", self)
         self.lbl_model_hint.setWordWrap(True)
         self.lbl_model_hint.setStyleSheet("color:#9fb3c8;font-size:12px;")
-        inner.addWidget(self.lbl_model_hint)
+        hl_hint = QtWidgets.QHBoxLayout()
+        hl_hint.addWidget(self.lbl_model_hint, 1)
+        hl_hint.addWidget(self.lbl_model_badge)
+        inner.addLayout(hl_hint)
 
         hl_out = QtWidgets.QHBoxLayout()
         hl_out.addWidget(QtWidgets.QLabel("Output:", self))
@@ -284,37 +379,72 @@ class UpscPane(QtWidgets.QWidget):
         hl_out.addWidget(self.edit_outdir, 1)
         hl_out.addWidget(btn_out)
         inner.addLayout(hl_out)
-        try:
-            box.setContentLayout(inner)
-        except Exception:
-            w = QtWidgets.QWidget()
-            w.setLayout(inner)
-            box.addWidget(w)
-        v.addWidget(box)
+        v.addWidget(self.box_models)
 
-        # Recent results gallery under Models
+        # --- Recent results (rebuilt) ---
         rec_box = CollapsibleSection("Recent results", expanded=True, parent=self)
         self.recents_box = rec_box
-        lay_rec = QtWidgets.QVBoxLayout(); lay_rec.setContentsMargins(6,2,6,6)
-        self.list_recents = QtWidgets.QListWidget(self)
-        self.list_recents.setViewMode(QtWidgets.QListView.IconMode)
-        self.list_recents.setResizeMode(QtWidgets.QListView.Adjust)
-        self.list_recents.setMovement(QtWidgets.QListView.Static)
-        self.list_recents.setIconSize(QSize(96,96))
-        self.list_recents.setSpacing(8)
-        self.list_recents.setUniformItemSizes(True)
-        lay_rec.addWidget(self.list_recents)
-        try:
-            rec_box.setContentLayout(lay_rec)
-        except Exception:
-            _rw = QtWidgets.QWidget(); _rw.setLayout(lay_rec); rec_box.addWidget(_rw)
-        v.addWidget(rec_box)
 
-        
-        # Encoder block
-        enc_box = CollapsibleSection("Encoder", expanded=True, parent=self)
-        self.box_encoder = enc_box
-        lay_enc = QtWidgets.QGridLayout(); lay_enc.setContentsMargins(6,2,6,6)
+        rec_wrap = QtWidgets.QVBoxLayout(); rec_wrap.setContentsMargins(6,2,6,6); rec_wrap.setSpacing(6)
+
+        # Size slider
+        size_row = QtWidgets.QHBoxLayout()
+        size_row.addWidget(QtWidgets.QLabel("Thumb size:", self))
+        self.sld_recent_size = QtWidgets.QSlider(Qt.Horizontal, self)
+        self.sld_recent_size.setMinimum(32)
+        self.sld_recent_size.setMaximum(120)
+        self.sld_recent_size.setSingleStep(4)
+        self.sld_recent_size.setPageStep(8)
+        self.sld_recent_size.setValue(96)
+        size_row.addWidget(self.sld_recent_size, 1)
+        self.lbl_recent_size = QtWidgets.QLabel("96 px", self)
+        size_row.addWidget(self.lbl_recent_size)
+        rec_wrap.addLayout(size_row)
+
+        # Horizontal scroller with items in a row
+        self.recents_scroll = QtWidgets.QScrollArea(self)
+        self.recents_scroll.setWidgetResizable(True)
+        self.recents_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+        self.recents_scroll.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+
+        self._recents_inner = QtWidgets.QWidget(self)
+        self._recents_row = QtWidgets.QHBoxLayout(self._recents_inner)
+        self._recents_row.setContentsMargins(0,0,0,0)
+        self._recents_row.setSpacing(8)
+        self._recents_row.addStretch(0)  # keep tight packing
+        self.recents_scroll.setWidget(self._recents_inner)
+        rec_wrap.addWidget(self.recents_scroll)
+
+        try:
+            self.recents_box.setContentLayout(rec_wrap)
+        except Exception:
+            _rw = QtWidgets.QWidget(); _rw.setLayout(rec_wrap); self.recents_box.addWidget(_rw)
+        v.addWidget(rec_box)
+        # start recents poller
+        try:
+            self._install_recents_poller()
+        except Exception:
+            pass
+
+        # Wires for size slider
+        def _on_recent_size(val):
+            try:
+                self.lbl_recent_size.setText(f"{val} px")
+            except Exception:
+                pass
+            try:
+                self._rebuild_recents()
+            except Exception:
+                pass
+
+        try:
+            self.sld_recent_size.valueChanged.connect(_on_recent_size)
+        except Exception:
+            pass
+
+        # Encoder (inline)
+        self.box_encoder = QtWidgets.QWidget(self)
+        lay_enc = QtWidgets.QGridLayout(self.box_encoder); lay_enc.setContentsMargins(6,2,6,6)
         # Video codec
         lay_enc.addWidget(QtWidgets.QLabel("Video codec:", self), 0, 0)
         self.combo_vcodec = QtWidgets.QComboBox(self)
@@ -356,23 +486,23 @@ class UpscPane(QtWidgets.QWidget):
         lay_enc.addWidget(QtWidgets.QLabel("Audio bitrate (kbps):", self), 7, 0)
         self.spin_abitrate = QtWidgets.QSpinBox(self); self.spin_abitrate.setRange(32, 1024); self.spin_abitrate.setValue(192)
         lay_enc.addWidget(self.spin_abitrate, 7, 1)
-
-        try:
-            enc_box.setContentLayout(lay_enc)
-        except Exception:
-            _w = QtWidgets.QWidget(); _w.setLayout(lay_enc); enc_box.addWidget(_w)
-        v.addWidget(enc_box)
+        # Encoder inline: layout already attached to self.box_encoder
+        # (removed collapsible content setters)
+        v.addWidget(self.box_encoder)
 
         self.log = QtWidgets.QPlainTextEdit(self)
         self.log.setReadOnly(True)
         self.log.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
         try:
             fm = self.log.fontMetrics()
-            self.log.setFixedHeight(int(fm.height() * 6.5))  # ~5 lines visible
+            self.log.setFixedHeight(int(fm.height() * 6.5))
         except Exception:
             self.log.setFixedHeight(100)
         self.log.setMaximumBlockCount(1000)
-        v.addWidget(self.log)
+        if SHOW_UPSCALE_LOG:
+            v.addWidget(self.log)
+        else:
+            self.log.hide()
 
         # ----- Fixed bottom action bar (does not scroll) -----
         bottom = QtWidgets.QHBoxLayout()
@@ -440,12 +570,7 @@ class UpscPane(QtWidgets.QWidget):
         except Exception:
             pass
 
-        # Immediate save when Remember toggled
-        try:
-            self.chk_remember.toggled.connect(lambda _: self._save_settings())
-        except Exception:
-            pass
-
+        
         # Save on application exit too (best-effort)
         try:
             app = QtWidgets.QApplication.instance()
@@ -506,7 +631,6 @@ class UpscPane(QtWidgets.QWidget):
 
         # Standard widgets
         pairs = [
-            ("chk_remember", "toggled"),
             ("spin_scale", "valueChanged"),
             ("slider_scale", "valueChanged"),
             ("combo_engine", "currentIndexChanged"),
@@ -560,8 +684,7 @@ class UpscPane(QtWidgets.QWidget):
 
     def _auto_save_if_enabled(self, *args, **kwargs):
         try:
-            if self.chk_remember.isChecked():
-                self._save_settings()
+            self._save_settings()
         except Exception:
             pass
 
@@ -569,7 +692,7 @@ class UpscPane(QtWidgets.QWidget):
     def _gather_settings(self) -> dict:
         d = {}
         # Core toggles / basics
-        try: d["remember"] = bool(self.chk_remember.isChecked())
+        try: d['remember'] = True
         except Exception: pass
         try: d["scale"] = float(self.spin_scale.value())
         except Exception: pass
@@ -669,7 +792,8 @@ class UpscPane(QtWidgets.QWidget):
 
     def _apply_settings(self, d: dict):
         try:
-            self.chk_remember.setChecked(bool(d.get("remember", False)))
+            # remember toggle removed from UI; always on
+            self.chk_remember.setChecked(True)
         except Exception:
             pass
         try:
@@ -797,7 +921,7 @@ class UpscPane(QtWidgets.QWidget):
                 if pp.exists():
                     recs.append(pp)
             self._recents = recs[:10]
-            self._refresh_recents_gallery()
+            self._rebuild_recents()
         except Exception:
             pass
 
@@ -826,12 +950,12 @@ class UpscPane(QtWidgets.QWidget):
                     self._append_log(f"[settings] Loaded from: {p}")
                 except Exception:
                     pass
-                # Set remember first so subsequent changes can autosave
+                # Apply settings, then ensure remember is True (hidden)
+                self._apply_settings(d)
                 try:
-                    self.chk_remember.setChecked(bool(d.get("remember", False)))
+                    self.chk_remember.setChecked(True)
                 except Exception:
                     pass
-                self._apply_settings(d)
             else:
                 try:
                     self._append_log(f"[settings] No file yet at: {p}")
@@ -885,9 +1009,8 @@ class UpscPane(QtWidgets.QWidget):
             self._recents = [x for x in self._recents if _P(x) != p]
             self._recents.insert(0, p)
             self._recents = self._recents[:10]
-            self._refresh_recents_gallery()
-            if self.chk_remember.isChecked():
-                self._save_settings()
+            self._rebuild_recents()
+            self._save_settings()
         except Exception:
             pass
 
@@ -975,6 +1098,49 @@ class UpscPane(QtWidgets.QWidget):
         except Exception:
             return QPixmap()
 
+            files = self._list_last_results()
+            if not files:
+                lab = QtWidgets.QLabel("No results yet.", self)
+                lab.setStyleSheet("color:#9fb3c8;")
+                layout.addWidget(lab)
+                return
+
+            for p in files:
+                # ensure tiny thumb exists
+                tp = self._thumb_for(p, size)
+                btn = QtWidgets.QToolButton(self)
+                btn.setToolButtonStyle(Qt.ToolButtonTextUnderIcon)
+                btn.setText(p.name)
+                btn.setCursor(Qt.PointingHandCursor)
+                btn.setAutoRaise(True)
+                if tp:
+                    btn.setIcon(QIcon(str(tp)))
+                btn.setIconSize(QSize(size, size))
+                btn.setFixedSize(int(size*1.25), int(size*1.25)+28)
+
+                def _mk_open(path: Path):
+                    def _open():
+                        try:
+                            if not self._play_in_player(path):
+                                _open_file(self, path)
+                        except Exception:
+                            _open_file(self, path)
+                    return _open
+                btn.clicked.connect(_mk_open(p))
+                layout.addWidget(btn)
+
+            # ensure the scroll area can expand vertically if needed
+            try:
+                self._recents_inner.setMinimumHeight(int(size*1.25)+36)
+            except Exception:
+                pass
+
+        except Exception as e:
+            try:
+                self._append_log(f"[recents] rebuild error: {e}")
+            except Exception:
+                pass
+
     def _update_engine_ui(self):
         self.stk_models.setCurrentIndex(0 if self.combo_engine.currentIndex() == 0 else 1)
 
@@ -986,6 +1152,214 @@ class UpscPane(QtWidgets.QWidget):
             self._update_batch_limit()
         except Exception:
             pass
+
+    # ===== Recents (interp) — driven by finished jobs =====
+    def _jobs_done_dir(self) -> Path:
+        try:
+            base = ROOT
+        except Exception:
+            base = Path(__file__).resolve().parent.parent
+        return base / "jobs" / "done"
+
+    def _recents_dir(self) -> Path:
+        try:
+            base = ROOT
+        except Exception:
+            base = Path(__file__).resolve().parent.parent
+        # Thumbs only live here
+        return base / "output" / "last results" / "interp"
+
+    def _list_recent_jobs(self) -> list[Path]:
+        d = self._jobs_done_dir()
+        try:
+            if not d.exists():
+                return []
+            items = [p for p in d.iterdir() if p.suffix.lower()==".json" and p.is_file()]
+            items.sort(key=lambda p: p.stat().st_mtime, reverse=True)
+            return items[:7]
+        except Exception:
+            return []
+
+    def _resolve_output_from_job(self, job_json: Path) -> tuple[Path|None, dict]:
+        """Return (media_path, job_data) for a finished job JSON."""
+        try:
+            j = json.loads(job_json.read_text(encoding="utf-8"))
+        except Exception:
+            j = {}
+        def _as_path(val):
+            if not val: return None
+            try:
+                p = Path(str(val)).expanduser()
+                if not p.is_absolute():
+                    out_dir = j.get("out_dir") or (j.get("args") or {}).get("out_dir")
+                    if out_dir:
+                        p = Path(out_dir).expanduser() / p
+                return p
+            except Exception:
+                return None
+        # Priority fields
+        for k in ("produced","outfile","output","result","file","path"):
+            v = j.get(k) or (j.get("args") or {}).get(k)
+            p = _as_path(v)
+            if p and p.exists() and p.is_file():
+                return p, j
+        # List fields
+        for k in ("outputs","produced_files","results","files","artifacts","saved"):
+            seq = j.get(k) or (j.get("args") or {}).get(k)
+            if isinstance(seq, (list, tuple)):
+                for v in seq:
+                    p = _as_path(v)
+                    if p and p.exists() and p.is_file():
+                        return p, j
+        # Fallback: scan out_dir for newest media
+        media_exts = {'.mp4','.mov','.mkv','.avi','.webm','.gif','.png','.jpg','.jpeg','.bmp','.tif','.tiff'}
+        out_dir = _as_path(j.get("out_dir") or (j.get("args") or {}).get("out_dir"))
+        try:
+            if out_dir and out_dir.exists():
+                cand = [p for p in out_dir.iterdir() if p.is_file() and p.suffix.lower() in media_exts]
+                cand.sort(key=lambda p: p.stat().st_mtime, reverse=True)
+                if cand:
+                    return cand[0], j
+        except Exception:
+            pass
+        return None, j
+
+    def _thumb_path_for_job(self, job_json: Path, media_path: Path, max_side: int) -> Path:
+        d = self._recents_dir(); d.mkdir(parents=True, exist_ok=True)
+        name = f"{media_path.stem}.__thumb.jpg"
+        return d / name
+
+    def _thumb_from_media(self, media_path: Path, target_jpg: Path, max_side: int) -> None:
+        try:
+            if max_side < 32: max_side = 32
+            if max_side > 120: max_side = 120
+            # if media is video -> ffmpeg first frame; else use Qt decode
+            vext = {'.mp4','.mov','.mkv','.avi','.webm'}
+            if media_path.suffix.lower() in vext:
+                cmd = [FFMPEG, "-hide_banner", "-loglevel", "quiet", "-y",
+                       "-fflags", "nobuffer", "-probesize", "64k", "-analyzeduration", "0",
+                       "-i", str(media_path),
+                       "-vf", f"thumbnail,scale={int(max_side)}:-1",
+                       "-frames:v", "1", str(target_jpg)]
+                try:
+                    subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                except Exception:
+                    pass
+            else:
+                from PySide6.QtGui import QImageReader
+                reader = QImageReader(str(media_path))
+                reader.setAutoTransform(True)
+                sz = reader.size()
+                if sz.isValid() and sz.width() > 0 and sz.height() > 0:
+                    w, h = sz.width(), sz.height()
+                    if w >= h:
+                        reader.setScaledSize(QSize(int(max_side), max(1, int(h * max_side / max(1, w)))))
+                    else:
+                        reader.setScaledSize(QSize(max(1, int(w * max_side / max(1, h))), int(max_side)))
+                img = reader.read()
+                if not img.isNull():
+                    img.save(str(target_jpg), "JPG", 70)
+        except Exception:
+            pass
+
+    def _ensure_recent_thumb(self, job_json: Path, media: Path, max_side: int) -> Path|None:
+        try:
+            t = self._thumb_path_for_job(job_json, media, max_side)
+            if (not t.exists()) or (t.stat().st_mtime < media.stat().st_mtime):
+                self._thumb_from_media(media, t, max_side)
+            return t if t.exists() else None
+        except Exception:
+            return None
+
+    def _install_recents_poller(self):
+        # Lightweight: poll jobs/done timestamps every second and rebuild only on change
+        try:
+            if getattr(self, "_recents_poller", None):
+                return
+            from PySide6.QtCore import QTimer
+            self._recents_seen_ts = 0.0
+            def _tick():
+                try:
+                    d = self._jobs_done_dir()
+                    if not d.exists():
+                        return
+                    latest = 0.0
+                    for p in d.glob("*.json"):
+                        ts = p.stat().st_mtime
+                        if ts > latest:
+                            latest = ts
+                    if latest > getattr(self, "_recents_seen_ts", 0.0):
+                        self._recents_seen_ts = latest
+                        self._rebuild_recents()
+                except Exception:
+                    pass
+            t = QTimer(self)
+            t.setInterval(1000)
+            t.timeout.connect(_tick)
+            t.start()
+            self._recents_poller = t
+        except Exception:
+            pass
+
+    def _rebuild_recents(self):
+        """Rebuild the horizontal recents row from jobs/done JSONs. Low-resource, no heavy loading."""
+        try:
+            layout = getattr(self, "_recents_row", None)
+            if layout is None:
+                return
+            while layout.count():
+                item = layout.takeAt(0)
+                w = item.widget()
+                if w is not None:
+                    w.deleteLater()
+
+            size = 96
+            try: size = int(self.sld_recent_size.value())
+            except Exception: pass
+
+            jobs = self._list_recent_jobs()
+            if not jobs:
+                lab = QtWidgets.QLabel("No results yet.", self)
+                lab.setStyleSheet("color:#9fb3c8;")
+                layout.addWidget(lab)
+                return
+
+            for jpath in jobs:
+                media, j = self._resolve_output_from_job(jpath)
+                if not (media and media.exists() and media.is_file()):
+                    continue
+                tp = self._ensure_recent_thumb(jpath, media, size)
+
+                btn = QtWidgets.QToolButton(self)
+                btn.setToolButtonStyle(Qt.ToolButtonTextUnderIcon)
+                btn.setText(Path(media).name)
+                btn.setCursor(Qt.PointingHandCursor)
+                btn.setAutoRaise(True)
+                if tp:
+                    btn.setIcon(QIcon(str(tp)))
+                btn.setIconSize(QSize(size, size))
+                btn.setFixedSize(int(size*1.25), int(size*1.25)+28)
+
+                def _mk_open(path: Path):
+                    def _open():
+                        try:
+                            if not self._play_in_player(path):
+                                _open_file(self, path)
+                        except Exception:
+                            _open_file(self, path)
+                    return _open
+                btn.clicked.connect(_mk_open(media))
+                layout.addWidget(btn)
+
+            try:
+                self._recents_inner.setMinimumHeight(int(size*1.25)+36)
+            except Exception:
+                pass
+
+        except Exception as e:
+            try: self._append_log(f"[recents] rebuild error: {e}")
+            except Exception: pass
+
 
     def _sync_scale_from_slider(self, v: int):
         self.spin_scale.blockSignals(True)
@@ -1230,7 +1604,7 @@ class UpscPane(QtWidgets.QWidget):
         finally:
             self._job_running = False
             try:
-                self._refresh_recents_gallery()
+                self._rebuild_recents()
             except Exception:
                 pass
 
@@ -1255,7 +1629,7 @@ class UpscPane(QtWidgets.QWidget):
                         finally:
                             self._job_running = False
                             try:
-                                self._refresh_recents_gallery()
+                                self._rebuild_recents()
                             except Exception:
                                 pass
                     if cleanup_dirs:
@@ -1852,4 +2226,3 @@ try:
 except Exception:
     pass
 # --- end r11 ---
-
