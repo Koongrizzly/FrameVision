@@ -13,7 +13,7 @@ from PySide6.QtGui import (QAction, QKeySequence, QIcon, QPixmap, QDrag, QPainte
 from PySide6.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QLabel, QFileDialog, QListWidget,
                                QListWidgetItem, QMenu, QToolButton, QComboBox, QSpinBox, QLineEdit,
                                QScrollArea, QFrame, QMessageBox, QSlider, QSizePolicy, QDialog,
-                               QDialogButtonBox, QFormLayout, QAbstractItemView, QApplication, QTabWidget, QInputDialog, QColorDialog, QPushButton)
+                               QDialogButtonBox, QFormLayout, QAbstractItemView, QApplication, QTabWidget, QInputDialog, QColorDialog, QPushButton, QSplitter)
 
 # Optional multimedia preview imports (Qt6+)
 try:
@@ -153,6 +153,9 @@ def _gen_thumb(media: MediaItem, size: QSize) -> Optional[QPixmap]:
             if not im.isNull():
                 im = im.scaled(w,h, Qt.KeepAspectRatio, Qt.SmoothTransformation)
                 pm = canvas(); p = QPainter(pm); p.drawImage((w-im.width())//2, (h-im.height())//2, im); p.end(); return pm
+
+        except Exception: pass
+
         except Exception: pass
     if media.kind == "video" and media.path.exists():
         try:
@@ -165,22 +168,38 @@ def _gen_thumb(media: MediaItem, size: QSize) -> Optional[QPixmap]:
     return _placeholder_icon(media.kind, size)
 
 def _placeholder_icon(kind: str, size: QSize) -> QPixmap:
+
     w,h = size.width(), size.height()
-    pm = QPixmap(w,h); pm.fill(QColor(60,60,60))
+    pm = QPixmap(w,h)
+    pm.fill(QColor(0,0,0,0))  # transparent background so audio looks compact
     p = QPainter(pm); p.setPen(Qt.NoPen)
-    p.setBrush(QColor(70,120,200) if kind in ("video","image","text") else QColor(70,200,120))
-    p.drawRect(0,0,w,h)
-    p.setPen(QPen(QColor(255,255,255,220),2))
-    if kind=="audio":
-        p.drawEllipse(int(w*0.25), int(h*0.2), int(w*0.18), int(w*0.18))
-        p.drawLine(int(w*0.32), int(h*0.2), int(w*0.7), int(h*0.15))
-        p.drawLine(int(w*0.7), int(h*0.15), int(w*0.7), int(h*0.7))
-    elif kind=="text":
-        p.drawLine(int(w*0.2), int(h*0.25), int(w*0.8), int(h*0.25))
-        p.drawLine(int(w*0.5), int(h*0.25), int(w*0.5), int(h*0.75))
-    else:
-        pts = [QPointF(w*0.35,h*0.25), QPointF(w*0.75,h*0.5), QPointF(w*0.35,h*0.75)]
-        p.drawPolygon(QPolygonF(pts))
+    # base tile for non-audio kinds
+    if kind != "audio":
+        p.setBrush(QColor(70,120,200) if kind in ("video","image","text") else QColor(70,200,120))
+        p.drawRoundedRect(0,0,w,h,6,6)
+        p.setPen(QPen(QColor(255,255,255,220),2))
+        if kind=="text":
+            p.drawLine(int(w*0.2), int(h*0.25), int(w*0.8), int(h*0.25))
+            p.drawLine(int(w*0.5), int(h*0.25), int(w*0.5), int(h*0.75))
+        else:
+            pts = [QPointF(w*0.35,h*0.25), QPointF(w*0.75,h*0.5), QPointF(w*0.35,h*0.75)]
+            p.drawPolygon(QPolygonF(pts))
+        p.end(); return pm
+    # audio: draw a compact waveform band
+    band_h = max(10, int(h*0.30))
+    y = int((h-band_h)/2)
+    p.setBrush(QColor(70,200,120))
+    p.drawRoundedRect(4, y, w-8, band_h, 4,4)
+    p.setPen(QPen(QColor(255,255,255,230), 2))
+    # stylized 'note' + few bars
+    p.drawLine(10, y+band_h-6, 10, y+4)
+    p.drawLine(10, y+4, 28, y+2)
+    p.drawLine(28, y+2, 28, y+band_h-8)
+    for i in range(5):
+        bx = int(w*0.45) + i*8
+        bh = 6 + (i%3)*4
+        p.drawLine(bx, y+band_h-4, bx, y+band_h-4-bh)
+    p.end(); return pm
     p.end(); return pm
 
 # ---------- media preview dialog ----------
@@ -189,6 +208,11 @@ class PreviewDialog(QDialog):
         super().__init__(parent)
         self.setWindowTitle(media.path.name)
         self.setModal(False)
+        try:
+            from PySide6.QtCore import Qt as _Qt
+            self.setAttribute(_Qt.WA_DeleteOnClose, True)
+        except Exception:
+            pass
         self.resize(540, 320)
         lay = QVBoxLayout(self)
         # content area
@@ -243,6 +267,25 @@ class PreviewDialog(QDialog):
         dur = max(1, self.player.duration()); pos = int((val/1000.0)*dur)
         self.player.setPosition(pos)
 
+    def closeEvent(self, ev):
+        try:
+            if self.player:
+                self.player.stop()
+                # Detach source to release handles
+                from PySide6.QtCore import QUrl
+                self.player.setSource(QUrl())
+        except Exception:
+            pass
+        try:
+            if self.player: self.player.deleteLater()
+            if self.audio_out: self.audio_out.deleteLater()
+        except Exception:
+            pass
+        super().closeEvent(ev)
+        if not self.player: return
+        dur = max(1, self.player.duration()); pos = int((val/1000.0)*dur)
+        self.player.setPosition(pos)
+
 # ---------- UI: media strip ----------
 class MediaList(QListWidget):
     MIME = "application/x-framevision-media-id"
@@ -256,13 +299,18 @@ class MediaList(QListWidget):
         self.setWrapping(True)
         self.setResizeMode(QListWidget.Adjust)
         self.setMovement(QListWidget.Static)
-        self.setIconSize(QSize(120,68))
-        self.setMaximumHeight(148)
-        self.setSpacing(8)
+        self.setIconSize(QSize(120,64))
+        self.setMaximumHeight(120)
+        self.setSpacing(4)
         self.setSelectionMode(QAbstractItemView.ExtendedSelection)
         self.setDragEnabled(True)
         self.setDragDropMode(QAbstractItemView.DragOnly)
         self.setDefaultDropAction(Qt.CopyAction)
+        try:
+            self.setWordWrap(False)
+            self.setUniformItemSizes(True)
+        except Exception:
+            pass
 
     def startDrag(self, actions):
         it = self.currentItem()
@@ -361,7 +409,8 @@ class TimeRuler(QWidget):
 # ---------- timeline widgets ----------
 class ClipWidget(QFrame):
     CLIP_MIME = "application/x-framevision-clip"
-    HANDLE_W = 6
+    HANDLE_W = 12
+    HANDLE_HIT_W = 18
 
     def __init__(self, clip: Clip, media: MediaItem, row: "TrackRow"):
         super().__init__(row)
@@ -372,6 +421,8 @@ class ClipWidget(QFrame):
         self._press_pos = None; self._dragging = False
         self._resizing = False; self._resize_edge = None  # "L" or "R"
         self._orig_start = 0; self._orig_dur = 0
+        self._hover_edge = None
+        self.setMouseTracking(True)
         self.setContextMenuPolicy(Qt.DefaultContextMenu)  # use contextMenuEvent for reliability
 
     def contextMenuEvent(self, ev):
@@ -389,7 +440,13 @@ class ClipWidget(QFrame):
         cut.addAction("Keep left side",  lambda: ed._clip_cut(self.row.track, self.clip, "left"))
         cut.addAction("Keep right side", lambda: ed._clip_cut(self.row.track, self.clip, "right"))
         cut.addAction("Keep both sides (split)", lambda: ed._clip_cut(self.row.track, self.clip, "both"))
-        # Fade
+        
+        # Trim to playhead
+        trim = m.addMenu("Trim to playhead")
+        trim.addAction("Front → Playhead", lambda: (ed._push_undo(), ed._clip_trim_to_playhead(self.clip, 'L'), ed._refresh_tracks(), ed._update_time_range()))
+        trim.addAction("End → Playhead",   lambda: (ed._push_undo(), ed._clip_trim_to_playhead(self.clip, 'R'), ed._refresh_tracks(), ed._update_time_range()))
+        trim.addAction("Reset to maximum size", lambda: (ed._push_undo(), ed._clip_reset_to_max(self.clip), ed._refresh_tracks(), ed._update_time_range()))
+# Fade
         fade = m.addMenu("Fade"); fi = fade.addMenu("Start"); fo = fade.addMenu("End")
         for label, ms in [("Short (1s)",1000),("Medium (2s)",2000),("Long (3s)",3000)]:
             fi.addAction(label, lambda ms=ms: ed._clip_set_fade(self.clip, start_ms=ms))
@@ -432,10 +489,15 @@ class ClipWidget(QFrame):
             if self.row.editor._is_selected(self.clip):
                 p.setPen(QPen(QColor(255,220,80), 3)); p.drawRect(self.rect().adjusted(1,1,-2,-2))
         except Exception: pass
-        # trim handles
-        p.setPen(Qt.NoPen); p.setBrush(QColor(255,255,255,100))
+        # trim handles (visible area)
+        p.setPen(Qt.NoPen); p.setBrush(QColor(255,255,255,110))
         p.drawRect(0,0,self.HANDLE_W,self.height())
         p.drawRect(self.width()-self.HANDLE_W,0,self.HANDLE_W,self.height())
+        # hover cue (slightly wider + brighter)
+        if getattr(self, '_hover_edge', None) == 'L':
+            p.setBrush(QColor(255,255,255,150)); p.drawRect(0,0,self.HANDLE_W+4,self.height())
+        elif getattr(self, '_hover_edge', None) == 'R':
+            p.setBrush(QColor(255,255,255,150)); p.drawRect(self.width()-self.HANDLE_W-4,0,self.HANDLE_W+4,self.height())
         # text
         p.setPen(QPen(QColor(255,255,255),1))
         name = self.media.path.name if self.media.kind!="text" else (self.clip.text or "Text")
@@ -443,8 +505,8 @@ class ClipWidget(QFrame):
         p.end()
 
     def _edge_at_pos(self, posx: int) -> Optional[str]:
-        if posx <= self.HANDLE_W: return "L"
-        if posx >= self.width()-self.HANDLE_W: return "R"
+        if posx <= int(self.HANDLE_HIT_W): return "L"
+        if posx >= int(self.width()-int(self.HANDLE_HIT_W)): return "R"
         return None
 
     def mousePressEvent(self, ev):
@@ -479,7 +541,11 @@ class ClipWidget(QFrame):
                 # right edge -> duration changes
                 end = max(start_ms, self._orig_start + 1)
                 self.clip.duration_ms = max(1, end - self._orig_start)
-            self.row.relayout(); self.row.editor._update_time_range(); self.row.update()
+            try:
+                self.row._update_clip_widget_geometry(self)
+            except Exception:
+                pass
+            self.row.editor._update_time_range(); self.row.update()
         elif self._press_pos and (ev.buttons() & Qt.LeftButton):
             if not self._dragging and (ev.position().toPoint() - self._press_pos).manhattanLength() > 6:
                 # begin DnD for moving
@@ -496,30 +562,53 @@ class ClipWidget(QFrame):
             # update cursor hover
             ex = ev.position().toPoint().x()
             edge = self._edge_at_pos(ex)
+            self._hover_edge = edge
             if edge: self.setCursor(Qt.SizeHorCursor)
             else: self.setCursor(Qt.OpenHandCursor)
+            self.update()
         super().mouseMoveEvent(ev)
 
     def mouseReleaseEvent(self, ev):
         if self._resizing:
             self._resizing = False; self._resize_edge = None; self.setCursor(Qt.OpenHandCursor)
-            self.row.editor._mark_dirty(); self.row.editor._push_undo()  # push after change
+            # finalize geometry with one relayout and snapshot for undo
+            self.row.relayout(); self.row.editor._mark_dirty(); self.row.editor._push_undo()  # push after change
         self.setCursor(Qt.OpenHandCursor); self._press_pos = None; self._dragging = False
         super().mouseReleaseEvent(ev)
+
+
+    def enterEvent(self, ev):
+        try:
+            pos = self.mapFromGlobal(QCursor.pos())
+            self._hover_edge = self._edge_at_pos(pos.x())
+            if self._hover_edge: self.setCursor(Qt.SizeHorCursor)
+            else: self.setCursor(Qt.OpenHandCursor)
+            self.update()
+        except Exception:
+            pass
+        super().enterEvent(ev)
+
+    def leaveEvent(self, ev):
+        self._hover_edge = None
+        try: self.setCursor(Qt.OpenHandCursor)
+        except Exception: pass
+        self.update()
+        super().leaveEvent(ev)
 
 class TrackHeader(QWidget):
     def __init__(self, track: Track, editor: "EditorPane", parent=None):
         super().__init__(parent); self.track=track; self.editor=editor
-        lay = QHBoxLayout(self); lay.setContentsMargins(4,0,4,0); lay.setSpacing(6)
+        lay = QHBoxLayout(self); lay.setContentsMargins(6,2,6,2); lay.setSpacing(4)
         self.swatch = QFrame(); self.swatch.setFixedSize(14,14); self._apply_color()
         self.name = QLabel(self._label_text())
         self.btn_m = QToolButton(); self.btn_m.setText("M"); self.btn_m.setCheckable(True); self.btn_m.setToolTip("Mute track")
         self.btn_s = QToolButton(); self.btn_s.setText("S"); self.btn_s.setCheckable(True); self.btn_s.setToolTip("Solo track")
         self.btn_l = QToolButton(); self.btn_l.setText("L"); self.btn_l.setCheckable(True); self.btn_l.setToolTip("Lock track")
-        self.btn_color = QToolButton(); self.btn_color.setText("🎨"); self.btn_color.setToolTip("Track color")
-        for b in (self.btn_m,self.btn_s,self.btn_l,self.btn_color):
-            b.setFixedHeight(20)
-        lay.addWidget(self.swatch); lay.addWidget(self.name,1); lay.addWidget(self.btn_m); lay.addWidget(self.btn_s); lay.addWidget(self.btn_l); lay.addWidget(self.btn_color)
+        self.btn_color = QToolButton(); self.btn_color.setToolTip("Track color"); self.btn_color.setIcon(_palette_icon(16)); self.btn_color.setIconSize(QSize(16,16))
+        for b in (self.btn_m,self.btn_s,self.btn_l):
+            b.setFixedSize(24,20)
+        self.btn_color.setFixedSize(28,22)
+        lay.addWidget(self.swatch); lay.addWidget(self.name); lay.addWidget(self.btn_m); lay.addWidget(self.btn_s); lay.addWidget(self.btn_l); lay.addWidget(self.btn_color)
         self.btn_m.setChecked(track.mute); self.btn_s.setChecked(track.solo); self.btn_l.setChecked(track.locked)
         self.btn_m.toggled.connect(self._set_mute); self.btn_s.toggled.connect(self._set_solo); self.btn_l.toggled.connect(self._set_lock); self.btn_color.clicked.connect(self._pick_color)
 
@@ -570,11 +659,23 @@ class TrackRow(QWidget):
             if not m: continue
             w = ClipWidget(c, m, self)
             x = int((c.start_ms/1000.0)*self.px_per_s); width = int((max(1,c.duration_ms)/1000.0)*self.px_per_s)
-            w.setGeometry(x, 4, max(8,width), 38); w.show(); self._clip_widgets.append(w)
+            w.setGeometry(x, 4, max(36,width), 38); w.show(); self._clip_widgets.append(w)
         total_ms = EditorPane.compute_project_duration(self.project)
         self.setMinimumWidth(int((total_ms/1000.0)*self.px_per_s)+80)
         try: self.editor._update_holder_width()
         except Exception: pass
+
+    def _update_clip_widget_geometry(self, w: ClipWidget):
+        """Update a single clip widget geometry without rebuilding all widgets."""
+        try:
+            c = w.clip
+            x = int((c.start_ms/1000.0)*self.px_per_s)
+            width = int((max(1,c.duration_ms)/1000.0)*self.px_per_s)
+            w.setGeometry(x, 4, max(36,width), 38)
+            w.update()
+        except Exception:
+            pass
+
 
     def paintEvent(self, ev):
         # locked overlay
@@ -603,10 +704,10 @@ class TrackRow(QWidget):
         mime = ev.mimeData(); can = False
         if mime and mime.hasFormat(MediaList.MIME):
             mid = bytes(mime.data(MediaList.MIME)).decode("utf-8")
-            kind = self._kind_from_mid(mid); can = (self.track.type in ("any", kind))
+            kind = self._kind_from_mid(mid); can = True  # allow; we'll auto-route to a compatible track on drop
         elif mime and mime.hasFormat(ClipWidget.CLIP_MIME):
             try:
-                _,_, kind = bytes(mime.data(ClipWidget.CLIP_MIME)).decode("utf-8").split(":"); can = (self.track.type in ("any", kind))
+                _,_, kind = bytes(mime.data(ClipWidget.CLIP_MIME)).decode("utf-8").split(":"); can = True  # allow; we'll auto-route to a compatible track on drop
             except Exception: can = False
         self._drag_hover = True; self._drag_can = bool(can); self.update()
         if can: ev.acceptProposedAction()
@@ -657,19 +758,17 @@ class TrackRow(QWidget):
             mid = bytes(mime.data(MediaList.MIME)).decode("utf-8")
             m = self.project.media.get(mid); 
             if not m: return
-            if self.track.type == "any":
-                self.track.type = m.kind
-                try: self.editor._update_track_labels()
-                except Exception: pass
-            if self.track.type != m.kind:
-                QMessageBox.information(self, "Type mismatch", f"This track is locked to {self.track.type}."); return
+            # If this track can't accept it, find or create a compatible track
+            target_tr = self.track
+            if self.track.type not in ("any", m.kind):
+                # find this row index in project to insert near it
+                try:
+                    near_idx = self.editor.project.tracks.index(self.track)
+                except Exception:
+                    near_idx = None
+                target_tr = self.editor._ensure_track_for_kind(m.kind, near_idx)
             self.editor._push_undo()
-            dur = 3000
-            if m.meta.get("duration"):
-                try: dur = int(float(m.meta["duration"]) * 1000)
-                except: pass
-            self.track.clips.append(Clip(media_id=mid, start_ms=start_ms, duration_ms=dur))
-            self.editor._refresh_tracks(); self.editor._update_time_range(); self.editor._mark_dirty()
+            self.editor._add_media_clip(target_tr, mid, start_ms)
             self._drag_hover = False; self._drag_can = False; self._ghost_rect=None; self.update()
             ev.acceptProposedAction(); return
 
@@ -801,6 +900,7 @@ class EditorPane(QWidget):
         self.snap_px_tol = 8
         self.ripple_enabled = False
         self.markers: List[int] = []
+        self.header_col_w = 180
         self._init_ui()
         self._new_project()
         self._setup_autosave()
@@ -824,8 +924,6 @@ class EditorPane(QWidget):
         self.btn_export=btn("Export","Export MP4", self._export)
         self.btn_undo=btn("Undo","Undo (Ctrl+Z)", self._undo)
         self.btn_redo=btn("Redo","Redo (Ctrl+Y)", self._redo)
-        self.zoom_in=btn("+","Zoom In", lambda: self._set_zoom(self.zoom*1.25))
-        self.zoom_out=btn("-","Zoom Out", lambda: self._set_zoom(self.zoom/1.25))
         self.btn_fit=btn("Fit","Zoom to fit (Ctrl+F)", self._zoom_to_fit)
         self.btn_sel=btn("Sel","Zoom to selection (Z)", self._zoom_to_selection)
         self.btn_glue=QToolButton(); self.btn_glue.setText("Glue"); self.btn_glue.setCheckable(True); self.btn_glue.setChecked(True); self.btn_glue.toggled.connect(lambda on: setattr(self,'glue_enabled',bool(on)))
@@ -833,13 +931,42 @@ class EditorPane(QWidget):
         self.grid_step = QComboBox(); [self.grid_step.addItem(s, float(s)) for s in ["0.25","0.5","1","2","5"]]; self.grid_step.setCurrentIndex(1); self.grid_step.currentIndexChanged.connect(lambda *_: setattr(self,'grid_step_s',float(self.grid_step.currentData())))
         self.snap_tol = QSpinBox(); self.snap_tol.setRange(1,32); self.snap_tol.setValue(self.snap_px_tol); self.snap_tol.valueChanged.connect(lambda v: setattr(self,'snap_px_tol',int(v)))
         self.btn_ripple=QToolButton(); self.btn_ripple.setText("Ripple"); self.btn_ripple.setCheckable(True); self.btn_ripple.toggled.connect(lambda on: setattr(self,'ripple_enabled',bool(on)))
-        for w in [self.btn_new,self.btn_load,self.btn_save,self.btn_imp,self.btn_export,self.btn_undo,self.btn_redo,self.zoom_in,self.zoom_out,self.btn_fit,self.btn_sel,self.btn_glue,self.btn_grid,QLabel("Step"),self.grid_step,QLabel("Snap px"),self.snap_tol,self.btn_ripple]:
+        for w in [self.btn_new,self.btn_load,self.btn_save,self.btn_imp,self.btn_export,self.btn_undo,self.btn_redo]:
             tb.addWidget(w)
         tb.addStretch(1); root.addLayout(tb)
-        # media strip
-        self.media_list = MediaList(); root.addWidget(self.media_list)
+        # Splitter to resize between preview strip and timeline
+        self.vsplit = QSplitter(Qt.Vertical, self)
+        self.vsplit.setChildrenCollapsible(False)
+        self.vsplit.setHandleWidth(8)
+        root.addWidget(self.vsplit, 1)
+
+        # --- top: media strip container ---
+        top = QWidget(); top_v = QVBoxLayout(top); top_v.setContentsMargins(0,0,0,0); top_v.setSpacing(2)
+        self.media_list = MediaList(); top_v.addWidget(self.media_list)
         self.media_list.requestDelete.connect(self._delete_media_ids)
         self.media_list.requestPreview.connect(self._preview_media_id)
+        top_div = QFrame(); top_div.setFrameShape(QFrame.HLine); top_div.setFrameShadow(QFrame.Sunken); top_v.addWidget(top_div)
+        self.vsplit.addWidget(top)
+
+        # --- bottom: timeline container ---
+        bottom = QWidget(); bot_v = QVBoxLayout(bottom); bot_v.setContentsMargins(0,0,0,0); bot_v.setSpacing(4)
+        # Top controls row (spreads UI so the lower row isn't crowded)
+        ctrl_top = QHBoxLayout()
+        ctrl_top.setSpacing(6)
+        try:
+            ctrl_top.addWidget(self.btn_fit)
+            ctrl_top.addWidget(self.btn_sel)
+            ctrl_top.addWidget(QLabel("Step"))
+            ctrl_top.addWidget(self.grid_step)
+            ctrl_top.addWidget(QLabel("Snap px"))
+            ctrl_top.addWidget(self.snap_tol)
+            ctrl_top.addWidget(self.btn_grid)
+            ctrl_top.addWidget(self.btn_ripple)
+        except Exception:
+            pass
+        ctrl_top.addStretch(1)
+        bot_v.addLayout(ctrl_top)
+
         # controls
         ctrl = QHBoxLayout()
         self.btn_add_track = QToolButton(); self.btn_add_track.setText("Add timeline"); self.btn_add_track.clicked.connect(self._add_track)
@@ -847,15 +974,50 @@ class EditorPane(QWidget):
         self.seek_slider = QSlider(Qt.Horizontal); self.seek_slider.setRange(0,60000); self.seek_slider.sliderMoved.connect(self._seek_changed)
         for w in [self.btn_add_track, QLabel("Zoom"), self.zoom_slider, QLabel("Seek"), self.seek_slider]:
             ctrl.addWidget(w)
-        ctrl.addStretch(1); root.addLayout(ctrl)
-        # ruler + tracks
-        self.ruler = TimeRuler(); root.addWidget(self.ruler); self.ruler.positionPicked.connect(self._set_playhead_from_ruler)
+
+        # Add 'Start'/'End' buttons close together (kept from previous patch)
+        self.btn_go_start = QToolButton(); self.btn_go_start.setObjectName("btn_go_start"); self.btn_go_start.setText("Start"); self.btn_go_start.setToolTip("Go to start (selection or timeline)")
+        self.btn_go_end = QToolButton(); self.btn_go_end.setObjectName("btn_go_end"); self.btn_go_end.setText("End"); self.btn_go_end.setToolTip("Go to end (selection or timeline)")
+        self.btn_go_start.setFixedWidth(58); self.btn_go_end.setFixedWidth(58)
+        self.btn_go_start.clicked.connect(lambda: self._goto_edge('start'))
+        self.btn_go_end.clicked.connect(lambda: self._goto_edge('end'))
+        ctrl.setSpacing(6)
+        ctrl.addWidget(self.btn_go_start); ctrl.addWidget(self.btn_go_end)
+        # Move Glue/Grid/Ripple here, after Start/End
+        try:
+            ctrl.addWidget(self.btn_glue)
+        except Exception:
+            pass
+        ctrl.addStretch(1); bot_v.addLayout(ctrl)
+
+        # ruler + tracks (align ruler zero after header column)
+        self.ruler = TimeRuler()
+        ruler_row = QWidget(); rh = QHBoxLayout(ruler_row); rh.setContentsMargins(0,0,0,0); rh.setSpacing(0)
+        left_spacer = QWidget(); left_spacer.setFixedWidth(int(self.header_col_w))
+        vdiv_r = QFrame(); vdiv_r.setFrameShape(QFrame.VLine); vdiv_r.setFrameShadow(QFrame.Sunken)
+        rh.addWidget(left_spacer); rh.addWidget(vdiv_r); rh.addWidget(self.ruler, 1)
+        bot_v.addWidget(ruler_row)
+        self.ruler.positionPicked.connect(self._set_playhead_from_ruler)
+
         self.tracks_area = QScrollArea(); self.tracks_area.setWidgetResizable(True); self.tracks_area.setHorizontalScrollBarPolicy(Qt.ScrollBarAsNeeded)
         holder = QWidget(); self.tracks_holder = holder
         self.tracks_layout = QVBoxLayout(holder); self.tracks_layout.setContentsMargins(0,0,0,0); self.tracks_layout.setSpacing(6)
         holder.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.MinimumExpanding)
-        self.tracks_area.setWidget(holder); root.addWidget(self.tracks_area, 1)
+        self.tracks_area.setWidget(holder); bot_v.addWidget(self.tracks_area, 1)
+        self.vsplit.addWidget(bottom)
+        # default sizes
+        try:
+            self.vsplit.setStretchFactor(0, 0)
+            self.vsplit.setStretchFactor(1, 1)
+            # Keep the top (media strip) compact
+            top.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Maximum)
+            top.setMaximumHeight(self.media_list.maximumHeight() + 24)
+        except Exception:
+            pass
+
         self._add_shortcuts()
+        # Apply unified styles for buttons and toggles
+        self._apply_styles()
 
     def _add_shortcuts(self):
         def sc(seq, cb): a=QAction(self); a.setShortcut(QKeySequence(seq)); a.triggered.connect(cb); self.addAction(a)
@@ -929,11 +1091,22 @@ class EditorPane(QWidget):
         except Exception: pass
         return meta
 
+
+    def _short_media_label(self, path: Path) -> str:
+        base = path.stem
+        ext = path.suffix[1:] if path.suffix.startswith('.') else path.suffix
+        if len(base) > 20:
+            # Truncate base to 20 characters, then append ...ext (without the dot)
+            return base[:20] + ('...' + ext if ext else '...')
+        else:
+            return base + (('.' + ext) if ext else '')
+
+
     def _refresh_media_list(self, new_items=None):
         self.media_list.clear()
         items=[]
         for m in self.project.media.values():
-            li=QListWidgetItem(m.path.name); li.setData(Qt.UserRole, m.id); li.setIcon(QIcon(_placeholder_icon(m.kind, self.media_list.iconSize()))); self.media_list.addItem(li); items.append((m.id,m))
+            li=QListWidgetItem(self._short_media_label(m.path)); li.setToolTip(m.path.name); li.setData(Qt.UserRole, m.id); li.setIcon(QIcon(_placeholder_icon(m.kind, self.media_list.iconSize()))); self.media_list.addItem(li); items.append((m.id,m))
         if new_items: items = new_items
         if items:
             self._t = ThumbThread(items, self.media_list.iconSize(), self); self._t.ready.connect(lambda mid,pm: self.media_list.set_thumb(mid,pm)); self._t.start()
@@ -963,47 +1136,71 @@ class EditorPane(QWidget):
         self._refresh_media_list(); self._refresh_tracks(); self._update_time_range()
 
     def _update_track_labels(self):
-        # handled by TrackHeader now
-        for i in range(self.tracks_layout.count()):
-            w=self.tracks_layout.itemAt(i).widget()
-            if isinstance(w, TrackHeader):
-                w.name.setText(w._label_text())
+        for w in self.tracks_holder.findChildren(TrackHeader):
+            w.name.setText(w._label_text())
 
+    
     def _refresh_tracks(self):
+        # clear existing
         while self.tracks_layout.count():
-            w=self.tracks_layout.takeAt(0).widget()
-            if w: w.setParent(None); w.deleteLater()
-        for i,tr in enumerate(self.project.tracks):
-            header=TrackHeader(tr, self); self.tracks_layout.addWidget(header)
-            row=TrackRow(tr, self.project, self); row.set_scale(self._px_per_s()); self.tracks_layout.addWidget(row)
-            if i < len(self.project.tracks)-1:
-                div = QFrame(); div.setFrameShape(QFrame.HLine); div.setFrameShadow(QFrame.Sunken); div.setStyleSheet("color:#3c3c3c;"); self.tracks_layout.addWidget(div)
+            w = self.tracks_layout.takeAt(0).widget()
+            if w:
+                w.setParent(None); w.deleteLater()
+        # rebuild rows with header column on the left
+        for i, tr in enumerate(self.project.tracks):
+            row_container = QWidget()
+            h = QHBoxLayout(row_container); h.setContentsMargins(0,0,0,0); h.setSpacing(0)
+            header = TrackHeader(tr, self, row_container)
+            header.setFixedWidth(int(self.header_col_w))
+            header.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Fixed)
+            vdiv = QFrame(); vdiv.setFrameShape(QFrame.VLine); vdiv.setFrameShadow(QFrame.Sunken)
+            row = TrackRow(tr, self.project, self, row_container); row.set_scale(self._px_per_s())
+            h.addWidget(header); h.addWidget(vdiv); h.addWidget(row, 1)
+            self.tracks_layout.addWidget(row_container)
+            if i < len(self.project.tracks) - 1:
+                divider = QFrame(); divider.setFrameShape(QFrame.HLine); divider.setFrameShadow(QFrame.Sunken)
+                divider.setStyleSheet("color:#2c2c2c;")
+                self.tracks_layout.addWidget(divider)
         self.tracks_layout.addStretch(1)
+
 
     def _update_time_range(self):
         total = self.compute_project_duration(self.project); self.ruler.set_duration(total); self.ruler.set_markers(self.markers); self.seek_slider.setRange(0,int(total)); self._update_holder_width()
 
     def _set_zoom(self, z):
         self.zoom = max(0.1, min(20.0, float(z))); pxs=self._px_per_s(); self.ruler.set_scale(pxs)
-        for i in range(self.tracks_layout.count()):
-            w=self.tracks_layout.itemAt(i).widget()
-            if isinstance(w, TrackRow): w.set_scale(pxs)
+        for row in self.tracks_holder.findChildren(TrackRow):
+            row.set_scale(pxs)
         self._update_holder_width(); self.zoom_slider.blockSignals(True); self.zoom_slider.setValue(int(self.zoom*100)); self.zoom_slider.blockSignals(False)
 
     def _px_per_s(self) -> float: return 100.0 * self.zoom
 
     def _update_holder_width(self):
-        total_ms = self.compute_project_duration(self.project); need = int((total_ms/1000.0)*self._px_per_s())+120
+        total_ms = self.compute_project_duration(self.project); need = int(self.header_col_w) + int((total_ms/1000.0)*self._px_per_s()) + 120
         if getattr(self,'tracks_holder',None) is not None: self.tracks_holder.setMinimumWidth(need)
 
     def _seek_changed(self, pos_ms: int):
         self.preview_media.emit(None, int(pos_ms)); self.transport_request.emit(f"seek:{int(pos_ms)}")
         try:
             self.ruler.set_playhead(int(pos_ms))
-            for i in range(self.tracks_layout.count()):
-                w=self.tracks_layout.itemAt(i).widget()
-                if isinstance(w, TrackRow): w.update()
+            for row in self.tracks_holder.findChildren(TrackRow):
+                row.update()
         except Exception: pass
+    def _goto_edge(self, which: str):
+        """Jump playhead to start/end of selection if any, else timeline."""
+        # Determine selection bounds
+        sels = self._selection[:] if self._selection else ([self._selected] if self._selected else [])
+        if sels:
+            start = min(c.start_ms for c in sels)
+            end = max(c.start_ms + max(1, c.duration_ms) for c in sels)
+            target = start if which == 'start' else end
+        else:
+            target = 0 if which == 'start' else self.compute_project_duration(self.project)
+        self.seek_slider.blockSignals(True)
+        self.seek_slider.setValue(int(target))
+        self.seek_slider.blockSignals(False)
+        self._seek_changed(int(target))
+
 
     def _set_playhead_from_ruler(self, ms: int):
         self.seek_slider.blockSignals(True); self.seek_slider.setValue(int(ms)); self.seek_slider.blockSignals(False); self._seek_changed(int(ms))
@@ -1108,6 +1305,39 @@ class EditorPane(QWidget):
             for tr in self.project.tracks: tr.clips = [c for c in tr.clips if c.media_id != mid]
             self.project.media.pop(mid, None); self._refresh_ui(); self._update_time_range(); self._mark_dirty()
         except Exception: pass
+    def _clip_trim_to_playhead(self, clip: Clip, side: str):
+        """Trim front ('L') or end ('R') of clip to current playhead position."""
+        cut_ms = int(self.seek_slider.value())
+        c_start = int(clip.start_ms)
+        c_end = int(clip.start_ms + max(1, clip.duration_ms))
+        if side == 'L':
+            # keep right side
+            if cut_ms <= c_start: return
+            if cut_ms >= c_end: 
+                clip.duration_ms = 1
+                return
+            clip.duration_ms = max(1, c_end - cut_ms)
+            clip.start_ms = cut_ms
+        else:
+            # side == 'R', keep left side
+            if cut_ms >= c_end: return
+            if cut_ms <= c_start:
+                clip.duration_ms = 1
+                return
+            clip.duration_ms = max(1, cut_ms - c_start)
+        self._mark_dirty()
+
+    def _clip_reset_to_max(self, clip: Clip):
+        """Reset clip duration to media's maximum known duration (if available)."""
+        m = self.project.media.get(clip.media_id)
+        if m and m.meta.get('duration'):
+            try:
+                max_ms = max(1, int(float(m.meta['duration']) * 1000))
+                clip.duration_ms = max_ms
+                self._mark_dirty()
+            except Exception:
+                pass
+
 
     # undo/redo
     def _snapshot(self) -> Dict[str,Any]: return self.project.to_json()
@@ -1133,6 +1363,41 @@ class EditorPane(QWidget):
         return max(1000, end)
 
     # export (stub)
+
+    # --- helpers for adding media ---
+    def _ensure_track_for_kind(self, kind: str, near_index: int | None = None) -> Track:
+        """Return a track that accepts 'kind' (video/image/audio/text). Create one if needed."""
+        # prefer an existing compatible, unlocked track
+        for i, tr in enumerate(self.project.tracks):
+            if (tr.type in ("any", kind)) and not tr.locked:
+                return tr
+        # create new track near the drop location
+        name = kind.capitalize()
+        tr = Track(name, kind)
+        if near_index is not None and 0 <= near_index <= len(self.project.tracks):
+            self.project.tracks.insert(near_index+1, tr)
+        else:
+            self.project.tracks.append(tr)
+        self._refresh_tracks()
+        return tr
+
+    def _add_media_clip(self, target_track: Track, media_id: str, start_ms: int):
+        m = self.project.media.get(media_id)
+        if not m:
+            return
+        # If target track is flexible, adopt the kind
+        if target_track.type == "any":
+            target_track.type = m.kind
+            try: self._update_track_labels()
+            except Exception: pass
+        # duration from probe if available, else default 3s
+        dur = 3000
+        md = m.meta or {}
+        if md.get("duration"):
+            try: dur = int(float(md["duration"]) * 1000)
+            except Exception: pass
+        target_track.clips.append(Clip(media_id=media_id, start_ms=int(max(0, start_ms)), duration_ms=dur))
+        self._refresh_tracks(); self._update_time_range(); self._mark_dirty()
     def _export(self):
         dlg = ExportDialog(self, self.project.width, self.project.height)
         if dlg.exec()!=QDialog.Accepted: return
@@ -1222,7 +1487,74 @@ class EditorPane(QWidget):
             if ok or self._autoplace_attempts>30: self._autoplace_timer.stop()
         self._autoplace_timer.timeout.connect(tick); self._autoplace_timer.start(); QTimer.singleShot(0, tick)
 
-    # ---- keyboard control ----
+
+    
+    def _apply_styles(self):
+        # Theme-aware greys so buttons look good on dark and light themes
+        pal = self.palette()
+        bg = pal.window().color()
+        # Compute luminance
+        def lum(qc):
+            r,g,b = qc.redF(), qc.greenF(), qc.blueF()
+            return 0.2126*r + 0.7152*g + 0.0722*b
+        L = lum(bg)
+        # Neutral greys blended from the current theme
+        def mix_hex(qc, target=(60,65,72), alpha=0.35):
+            tr,tg,tb = target
+            r = int((1-alpha)*qc.red()   + alpha*tr)
+            g = int((1-alpha)*qc.green() + alpha*tg)
+            b = int((1-alpha)*qc.blue()  + alpha*tb)
+            return f"#{r:02x}{g:02x}{b:02x}"
+        def lighten_hex(qc, amt=0.15):
+            r = min(255, int(qc.red()*(1-amt) + 255*amt))
+            g = min(255, int(qc.green()*(1-amt) + 255*amt))
+            b = min(255, int(qc.blue()*(1-amt) + 255*amt))
+            return f"#{r:02x}{g:02x}{b:02x}"
+        def darken_hex(qc, amt=0.20):
+            r = max(0, int(qc.red()*(1-amt)))
+            g = max(0, int(qc.green()*(1-amt)))
+            b = max(0, int(qc.blue()*(1-amt)))
+            return f"#{r:02x}{g:02x}{b:02x}"
+        # Base shades
+        btn_bg   = mix_hex(bg, target=(62,68,76), alpha=0.50)   # neutral grey
+        btn_brd  = mix_hex(bg, target=(86,96,110), alpha=0.55)  # slightly brighter border
+        btn_hov  = mix_hex(bg, target=(96,108,124), alpha=0.60)
+        inp_bg   = mix_hex(bg, target=(64,70,78), alpha=0.35)
+        text_col = "#0f172a" if L > 0.6 else "#e5e7eb"  # dark text on light themes
+        green    = "#2ecc71"
+        green_b  = "#25b864"
+        green_t  = "#0b1a0f"
+        self.setStyleSheet(f"""    QToolButton {{
+            background: {btn_bg};
+            border: 1px solid {btn_brd};
+            padding: 4px 8px;
+            border-radius: 8px;
+            color: {text_col};
+        }}
+        QToolButton:hover {{
+            border-color: {btn_hov};
+        }}
+        QToolButton:checked {{
+            background: {green};
+            border: 1px solid {green_b};
+            color: {green_t};
+        }}
+        QToolButton:pressed {{
+            background: {green};
+        }}
+        /* Start/End outline to remain visible on light themes */
+        #btn_go_start, #btn_go_end {{
+            border-color: {green_b};
+        }}
+        QComboBox, QSpinBox, QLineEdit {{
+            background: {inp_bg};
+            color: {text_col};
+            border: 1px solid {btn_brd};
+            border-radius: 8px;
+            padding: 2px 6px;
+        }}
+        """)
+
     def keyPressEvent(self, ev):
         key = ev.key()
         mod = ev.modifiers()
@@ -1328,3 +1660,20 @@ if __name__ == "__main__":
     app = QApplication(sys.argv)
     w = EditorPane(); w.resize(1200, 700); w.show()
     sys.exit(app.exec())
+
+def _palette_icon(size:int=16) -> QIcon:
+    pm = QPixmap(size, size)
+    pm.fill(QColor(0,0,0,0))
+    p = QPainter(pm)
+    p.setRenderHint(QPainter.Antialiasing, True)
+    p.setBrush(QColor(244, 208, 63))
+    p.setPen(QPen(QColor(120, 90, 20), 1))
+    p.drawEllipse(1, 1, size-2, size-2)
+    dots = [QColor(231,76,60), QColor(46,204,113), QColor(52,152,219), QColor(155,89,182)]
+    centers = [(int(size*0.35), int(size*0.35)), (int(size*0.60), int(size*0.30)), (int(size*0.65), int(size*0.60)), (int(size*0.35), int(size*0.65))]
+    r = max(2, size//7)
+    for c,(cx,cy) in zip(dots, centers):
+        p.setBrush(c); p.setPen(Qt.NoPen)
+        p.drawEllipse(cx-r, cy-r, r*2, r*2)
+    p.end()
+    return QIcon(pm)
