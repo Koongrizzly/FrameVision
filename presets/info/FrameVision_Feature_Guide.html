@@ -134,20 +134,23 @@
 <h3>📝 Describe (AI)</h3>
 <ul><li>Engine: Qwen2‑VL (2B Instruct) — rich captions, OCR‑ish text, and multi‑turn Q&amp;A; GPU/CUDA recommended (CPU works but slower).</li><li>Quick actions: Describe file(s), whole folder, or the current video frame; Cancel stops a running job.</li><li>Presets &amp; controls: preset menu (e.g., “General — detail‑based”), Promptify output toggle, Detail level (Short/Long), and Decode style.</li><li>Outputs &amp; export: inline viewer with Copy, Copy as Prompt, Save .txt, and Save .json (sidecar).</li><li>Advanced: optional negative prompt, Test image path, CPU threads, model root/status. “Advanced settings” exposes tokens/length, no‑repeat n‑gram, temperature, top‑p/k, repetition penalty, Warm model on load, Keep in memory.</li></ul>
 <button class="btn-more" data-modal="m-describe">Details</button></div><div class="card" style="animation-delay:.22s">
-<h3>🖌️ TXT→IMG (Qwen)</h3>
-<ul>
-<li>Local <b>GGUF</b> backend (Qwen-Image) — no cloud required.</li>
-<li>Prompt &amp; Negative with chips and quick presets.</li>
-<li>Seed policy: <b>Fixed</b> / <b>Random</b> / <b>Increment</b>; Batch 1–N.</li>
-<li><b>Style Builder</b>: Art style, Shape, and “How many?” helpers.</li>
-<li><b>Show in Player</b> (on) and <b>Use queue</b> (Add/Run).</li>
-</ul>
-<button class="btn-more" data-modal="m-txt2img">Details</button>
+<h3>🖌️ TXT→IMG</h3><ul><li>SDXL & SD1.5 single‑file <code>.safetensors</code> loader; auto CUDA/CPU dtype; default to DreamShaper if unset.</li><li>Model picker + refresh/browse; output size presets (square/portrait/landscape) with manual W×H and ‘Lock aspect’.</li><li>Two SDXL LoRA slots with adjustable strength; adapter or fuse fallback when needed.</li><li>Samplers: DPM++ 2M (Karras), Euler a, Euler, Heun, UniPC, DDIM.</li><li>Seed policies: <b>Fixed</b> / <b>Random</b> / <b>Increment</b>; deterministic per‑image seeds; Batch 1–64.</li><li>Controls: Steps, CFG scale, attention slicing, VAE device (auto/cpu/gpu), GPU index & threads.</li><li>Output: folder picker; PNG/JPG/WEBP; filename template <code>sd_{seed}_{idx:03d}.png</code>.</li><li>Progress bar + per‑run JSON sidecar; direct run or queue‑native; optional player auto‑open.</li></ul><button class="btn-more" data-modal="m-txt2img">Details</button>
 </div>
 <div class="card" style="animation-delay:.25s">
 <h3>🧰 Tools</h3>
 <ul><li>Speed change for videos; audio retime handled; batch‑ready.</li><li>Resize to target width/height with keep‑aspect; presets &amp; batch.</li><li>Export GIF using palettegen/paletteuse; FPS &amp; scale controls.</li><li>Extract frames to images for thumbnails or analysis.</li><li>Trim by start/end timecodes; queue &amp; batch operations.</li><li>Crop video region; fast workflow with queue integration.</li><li>Quality / Size Video: CRF or bitrate modes; presets; popular codecs.</li><li>Image Quality / Convert: JPG/WEBP/PNG, quality %, max size; keep EXIF; target size (KB/MB).</li><li>Add/replace audio track on a video (mux).</li><li>Batch tools for files/folders; sensible defaults with clear error messages.</li></ul>
 <button class="btn-more" data-modal="m-tools">Details</button></div>
+
+<div class="card" style="animation-delay:.28s">
+<h3>🎬 Editor</h3>
+<ul>
+<li>Drag‑drop media (video, image, audio) into timelines — auto‑creates/chooses a compatible track.</li>
+<li>Trim handles with snap/grid; ghost preview while dragging; ripple &amp; glue options.</li>
+<li>Keyboard: ←/→ nudge (±1/±10 frames), ↑/↓ move track, Delete &amp; Ripple delete, multiselect + Group/Ungroup.</li>
+<li>Markers with next/prev, Start/End jump, zoom to selection/fit, mouse‑wheel zoom &amp; horizontal scroll.</li>
+</ul>
+<button class="btn-more" data-modal="m-editor">Details</button>
+</div>
 <div class="card" style="animation-delay:.35s">
 <h3>⚙️ Settings</h3>
 <ul>
@@ -165,10 +168,8 @@
 </div>
 <div class="card" style="animation-delay:.3s">
 <h3>📋 Queue</h3>
-<ul>
-<li>Advanced queue with reorder (move), remove, pause/resume.</li>
-<li>Per‑task progress, ETA, and logs; safe cancel/cleanup.</li>
-</ul>
+<ul><li>Reorder: Move Up/Down; drag optional.</li><li>Pause/Resume, Recover Running → Pending.</li><li>Mark Running → Failed; Clear Finished/Failed.</li><li>Groups: Running, Pending, Finished (collapsible).</li><li>Per-job title + subtitle with model, size, timings.</li><li>Left status strip: blue running, green done, red failed, yellow pending.</li><li>Progress bar with ETA; indeterminate when unknown.</li><li>Auto‑play newest result (toggle; remembers setting).</li><li>Play via internal player first; OS fallback.</li><li>Open output folder, Play, Delete buttons + context menu.</li><li>Recents integration; sets current video/path when available.</li><li>Live refresh while running; palette/style change aware.</li></ul>
+<button class="btn-more" data-modal="m-queue">Details</button>
 </div>
 </div><div class="sep"></div><h2>Overview</h2>
 <div class="grid">
@@ -242,22 +243,6 @@
 <div class="sep"></div>
 <h2>Models &amp; Footprint</h2>
 <div class="grid">
-<div class="card">
-<h3>📦 Lean downloads</h3>
-<ul>
-<li>Allow‑lists: configs + tokenizer + one weight format.</li>
-<li>No TensorFlow <code>.h5</code>, no duplicate formats.</li>
-<li>Caches stay inside the app (<code>./.hf_cache</code>).</li>
-</ul>
-</div>
-<div class="card">
-<h3>🧹 One‑click pruner</h3>
-<ul>
-<li>Removes TF weights and nested <code>models--*</code> mirrors.</li>
-<li>Optionally keep only Qwen2‑VL base or large.</li>
-<li>Typical combined size: ~3–3.5 GB.</li>
-</ul>
-</div>
 </div>
 <div class="sep"></div>
 <h2>Performance, Reliability &amp; Platform</h2>
@@ -287,23 +272,48 @@
 </div>
 </div>
 <div class="sep"></div>
-<h2>To‑Do / Roadmap</h2>
-<div class="grid">
-<div class="card" style="animation-delay:.12s">
-<h3>🗺️ To‑Do / Roadmap</h3>
-<ul>
-<li><b>Compare panel (A/B):</b> Side‑by‑side, swipe, overlay; synced play/pause/seek; frame‑step; loop in/out; linked or independent zoom/pan; 1:1 / Fit; loupe; export composite image/clip.</li>
-<li><b>Polish &amp; bug‑fixing:</b> solid installer/downloader progress with checksum &amp; resume, queue persistence &amp; clearer ETA/logs, TXT→IMG defaults per tier, sampler presets, refined hi‑res helper.</li>
-<li><b>Presets &amp; filenames:</b> preset confirm‑overwrite + import/export touches; filename template preview and <code>{prompt_short}</code> token.</li>
-<li><b>Docs &amp; UX:</b> updated Feature Guide screenshots; troubleshooting &amp; Q&amp;A refresh; subtle UI polish (spacing, icons, animations).</li>
-<li><b>Easter eggs:</b> more delightful surprises.</li>
+
+<!-- To-Do card -->
+<div class="card">
+  <h3 class="card-title">📌 To-Do</h3>
+  <div class="card-body">
+    <ul>
+<ul>	
+      <li><b>1.</b> Check why txt2img randomly makes the app exit</li>
+      <li><b>2.</b> Show popup when file already exists: Overwrite / Rename / Cancel</li>
+      <li><b>3.</b> Remove Settings tab save toggle</li>
+      <li><b>4.</b> Check Dump Log button & reconfigure with popup window</li>
+      <li><b>5.</b> Double-click opens full screen (currently only exits)</li>
+      <li><b>6.</b> Create URL download list for SDXL & SD1.5 with selection menu in installer</li>
+      <li><b>7.</b> Create more visual layer intros</li>
+      <li><b>8.</b> Right-click context menu: play next/previous, convert to…, edit tag</li>
+      <li><b>9.</b> Check “Clean” button for temp files, etc.</li>
+      <li><b>10.</b> Add more features, bugfixing and polishing (mini video editor base)</li>
+      <li><b>11.</b> Update acknowledge base & Q&A</li>
+    </ul>
+  </div>
+</div>
 </ul>
+
+<!-- Roadmap card -->
+<div class="card">
+  <h3 class="card-title">🗺️ Roadmap</h3>
+  <div class="card-body">
+    <ul>
+      <li><b>Compare panel (A/B):</b> Side-by-side, swipe, overlay; synced play/pause/seek; frame-step; loop in/out; linked or independent zoom/pan; 1:1 / Fit; loupe; export composite image/clip.</li>
+      <li><b>Easter eggs:</b> more delightful surprises.</li>
+      <li><b>R2.</b> Text and image to video</li>
+      <li><b>R3.</b> Sound AI that can “watch a video” and add the correct sound</li>
+    </ul>
+  </div>
+</div>
+
 <button class="btn-more" data-modal="m-roadmap-single">Details</button>
 </div>
 </div>
 <div class="sep"></div>
 <div class="footer">
-    Built by <b>Contrinsan</b>. Feature writing &amp; installer/bug‑fix help by <b>ChatGPT (assistant)</b>.<br/>
+    Built by <b>Contrinsan</b>. Feature writing &amp;/bug‑fix help by <b>ChatGPT 5 </b>.<br/>
 <span style="opacity:.7">This document is a living guide; details may evolve with releases.</span>
 </div>
 <dialog class="modal" id="m-meme"><div class="pop">
@@ -326,6 +336,26 @@
 <li>Rainbow/arc text slider for curved baselines &amp; path‑follow.</li>
 <li>Bulk rename: add date, strip N chars start/end, normalize.</li>
 </ul></div></dialog>
+
+<dialog class="modal" id="m-editor">
+<div class="pop">
+<button class="x" data-close="">Close</button>
+<h3>Editor — timelines &amp; shortcuts</h3>
+<div class="meta">CapCut/OpenShot‑style editing • Snapping • Ripple • Markers</div>
+<ul>
+<li><b>Media panel:</b> thumbnails with quick preview (double‑click), delete key to remove; drag to timeline; truncates long names (full name on hover).</li>
+<li><b>Tracks:</b> per‑track <b>Mute / Solo / Lock</b> and color labels; header on the left stays aligned with the ruler.</li>
+<li><b>Trim &amp; move:</b> draggable left/right handles with snap grid (adjustable step and tolerance); ghost preview shows where a clip will land before drop.</li>
+<li><b>Ripple / Glue:</b> ripple delete closes gaps; glue snapping keeps adjacent clips tight.</li>
+<li><b>Keyboard:</b> ←/→ = ±1 frame (Shift = ±10), ↑/↓ move to prev/next compatible track, Delete remove, Ctrl+Delete ripple delete, Ctrl+G group, Ctrl+Shift+G ungroup.</li>
+<li><b>Markers &amp; nav:</b> M add marker; , / . go to prev/next; <b>Start/End</b> buttons jump to project or selection edges.</li>
+<li><b>Zoom &amp; scroll:</b> mouse‑wheel timeline zoom, zoom to <b>selection</b> / <b>fit</b>, horizontal scrollbar.</li>
+<li><b>Preview:</b> resizable popup for images/video/audio with play/pause &amp; scrub; stops playback on close.</li>
+<li><b>Layout:</b> draggable divider between media panel and timeline to allocate space.</li>
+</ul>
+</div>
+</dialog>
+
 </main>
 <!-- Popups -->
 <dialog class="modal" id="m-core">
@@ -375,8 +405,8 @@
 </dialog><dialog class="modal" id="m-tools"><div class="pop"><button class="x" data-close="">Close</button><h3>Tools — full list</h3><ul><li>Speed: slow down or speed up; enqueues jobs; batch for many files.</li><li>Resize: set width/height (keeps aspect if desired). Save/load presets.</li><li>Export GIF: 2‑pass palette (palettegen → paletteuse) with dithering for high quality.</li><li>Extract frames: export frames from a video to JPG/PNG for quick picking or analysis.</li><li><b>Trim</b>: cut a time range by start/end (flexible HH:MM:SS.mmm). <i>Generate preview</i> builds a thumbnail grid (6–60) with a Size slider (24–140px). Left‑click a thumb sets <b>Start</b>, right‑click sets <b>End</b>. A draggable range bar mirrors Start/End and dims thumbnails outside the kept region. Manual generation (no auto‑regen) keeps things responsive. Batch and queue supported; modes: Fast copy (keyframe) or Precise re‑encode.</li><li>Crop: crop a region (e.g., top/bottom band removal) and save as a new video.</li><li>Quality / Size Video: choose CRF (quality) or Bitrate; presets ultrafast → veryslow; codecs H.264/H.265/AV1 (CPU) and NVENC (GPU); audio copy/AAC/Opus; containers MP4/MKV/MOV.</li><li>Image Quality / Convert: convert to JPG/WEBP/PNG with quality slider (1–100), optional max width/height, and EXIF keep/remove. Target size mode (KB/MB) available.</li><li>Add Audio: mux/replace an external audio track onto a video.</li><li>Batch tools: quick prompts for multi‑file/folder runs across Speed, Resize, GIF, Trim, Crop, Quality, and Image Convert.</li></ul></div></dialog><dialog class="modal" id="m-describe"><div class="pop"><button class="x" data-close="">Close</button><h3>Qwen Describer — full feature list</h3><div class="meta">Engine: Qwen2‑VL (2B Instruct)</div><ul><li>Actions: Describe, Describe folder…, Use current frame; Cancel.</li><li>Presets: dropdown with ready‑made styles (e.g., “General — detail‑based”).</li><li>Detail controls: Promptify output; Detail level (Short/Long); Decode style (Deterministic, others).</li><li>Paths: Test image path picker; can use current player frame when available.</li><li>Output area: live description preview; buttons: Copy, Copy as Prompt, Save .txt, Save .json (sidecar file).</li><li>Model management: shows Models root and status (e.g., Ready).</li><li>Performance: CPU threads spinner; backend shown when available.</li><li>Advanced settings panel: max_new_tokens, min_length, no_repeat_ngram_size, temperature, top_p, top_k, repetition_penalty.</li><li>Warm model on load and Keep in memory toggles for faster reruns.</li><li>First‑run: downloads model automatically to models/describe/default/qwen2‑vl‑2b‑instruct.</li></ul></div></dialog><dialog class="modal" id="m-txt2img">
 <div class="pop">
 <button class="x" data-close="">Close</button>
-<h3>TXT→IMG (Qwen) — full feature list</h3>
-<div class="meta">Local GGUF · Queue‑native · Player preview</div>
+<h3>TXT→IMG — full feature list</h3>
+<div class="meta">SDXL/SD1.5 · Diffusers backend · Queue-native · Player preview</div>
 <ul>
 <li><b>Presets &amp; chips:</b> quick styles, favorites, and history. Import/export JSON.</li>
 <li><b>Prompt fields:</b> main prompt + negative; token count indicator; paste‑as‑prompt from Describe tab.</li>
@@ -395,20 +425,7 @@
 <dialog class="modal" id="m-roadmap-single">
 <div class="pop">
 <button class="x" data-close="">Close</button>
-<h3>Roadmap — details</h3>
-<div class="meta">Focus: Compare panel, polish &amp; stability</div>
-<ul>
-<li><b>Compare panel (A/B)</b>: side‑by‑side, swipe slider, overlay opacity; hotkeys; gridlines/crosshair; metadata overlay; quick left/right swap.</li>
-<li><b>Sync controls</b>: play/pause/stop together; linked scrub; frame‑step; loop in/out markers.</li>
-<li><b>Zoom/Pan</b>: linked or independent; 1:1 toggle; Fit/Fit‑width/Fit‑height; hover loupe; smooth wheel zoom.</li>
-<li><b>Export</b>: save side‑by‑side image; short compare clips.</li>
-<li><b>Queue/Player polish</b>: persistent queue after restart; clearer per‑job progress/ETA; graceful cancel edge‑cases; auto‑refresh/auto‑fit on new outputs.</li>
-<li><b>Installer/Downloader</b>: unified progress bars; checksum verify; resume <code>.part</code> downloads; single callable model fetch for tools.</li>
-<li><b>TXT→IMG</b>: better defaults per VRAM tier; sampler presets; refined hi‑res helper; attention‑slicing guidance.</li>
-<li><b>Presets manager</b>: import/export tweaks; confirm‑overwrite; thumbnail preview.</li>
-<li><b>Filename template</b>: add <code>{prompt_short}</code>; live validation; quick reset.</li>
-<li><b>Docs</b>: Feature Guide screenshots, Q&amp;A troubleshooting for TXT→IMG, installer tips.</li>
-</ul>
+
 </div>
 </dialog><script>
   // modal wiring
@@ -432,6 +449,30 @@
     });
   });
 </script>
+
+
+<div class="modal" id="m-queue">
+  <div class="modal-content">
+    <span class="modal-close" data-close>&times;</span>
+    <h2>Queue — full feature list</h2>
+    <p>Advanced, resilient processing queue with rich job rows and player integration.</p>
+    <ul><li>Safe delete/cleanup with guarded file ops.</li>
+<li>Theme‑aware icons and compact, hoverable row cards.</li>
+<li>Never returns the source file by mistake.</li>
+<li>Robust output resolver: single file, lists, or dir with scoring.</li>
+
+      <li>Reorder, delete, pause/resume, recover running → pending.</li>
+      <li>Groups for Running/Pending/Finished; compact rows with status strip and progress.</li>
+      <li>ETA calculation with small fudge to avoid early zero.</li>
+      <li>Context menu and toolbuttons: Play, Open folder, Delete, View JSON.</li>
+      <li>Auto‑play latest finished output (config‑persisted toggle).</li>
+      <li>Deterministic output resolver with name/time/size scoring.</li>
+      <li>Internal player preferred; OS fallback; Recents list update.</li>
+      <li>Theme‑aware icons, hover effects, and live updates while running.</li>
+      <li>Paranoid file safety: refuses to delete source; errors handled gracefully.</li>
+    </ul>
+  </div>
+</div>
 
 </body>
 </html>
