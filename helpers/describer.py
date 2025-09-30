@@ -5,7 +5,7 @@ import os, json, zipfile, traceback
 from pathlib import Path
 from typing import Optional, Dict, Any
 
-from PySide6.QtCore import Qt, QSettings, QSize
+from PySide6.QtCore import QSettings, QSize, QTimer, Qt
 from PySide6.QtGui import QAction, QDragEnterEvent, QDropEvent, QIcon
 from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton, QPlainTextEdit,
@@ -136,10 +136,31 @@ class DescriberWidget(QWidget):
         lay = QVBoxLayout(self)
         lay.setContentsMargins(8,8,8,8)
         lay.setSpacing(10)
+        # Hide host-injected "Loaded: helpers.describer..." footer label
+        def __hide_loader_blurb():
+            try:
+                w = self.window()
+                if not w:
+                    return
+                from PySide6.QtWidgets import QLabel as _QLabel
+                for _lbl in w.findChildren(_QLabel):
+                    try:
+                        if _lbl.text().strip().startswith("Loaded:"):
+                            _lbl.setVisible(False)
+                    except Exception:
+                        pass
+            except Exception:
+                pass
+        QTimer.singleShot(0, __hide_loader_blurb)
+
 
         
         # --- Engine info (Qwen-only) ---
         eng_widget = QWidget()
+        # Hide engine panel entirely per user request
+        eng_widget.setVisible(False)
+        eng_widget.setMaximumHeight(0)
+        eng_widget.setMinimumHeight(0)
         eng_grid = QGridLayout(eng_widget)
         row = 0
 
@@ -174,7 +195,7 @@ class DescriberWidget(QWidget):
         # --- Output ---
         out_box = QGroupBox("Generated description")
         out_v = QVBoxLayout(out_box)
-        self.output = QPlainTextEdit(); self.output.setReadOnly(True); self.output.setMinimumHeight(180)
+        self.output = QPlainTextEdit(); self.output.setReadOnly(True); self.output.setMinimumHeight(360)
         out_v.addWidget(self.output)
         row2 = QHBoxLayout(); out_v.addLayout(row2)
         self.btn_copy = QPushButton("Copy")
@@ -201,7 +222,7 @@ class DescriberWidget(QWidget):
         g.addWidget(QLabel("Test image path:"), 0, 0)
         self.txt_image = QLineEdit(); g.addWidget(self.txt_image, 0, 1)
         self.btn_browse = QPushButton("Browse..."); g.addWidget(self.btn_browse, 0, 2)
-        self.lbl_player = QLabel("Player frame not available."); g.addWidget(self.lbl_player, 1, 0, 1, 3)
+        self.lbl_player = QLabel(""); self.lbl_player.setVisible(False); self.lbl_player.setMaximumHeight(0)  # hidden
         lay.addWidget(path_box)
 
         # --- Advanced (collapsible) ---
@@ -218,6 +239,15 @@ class DescriberWidget(QWidget):
         adv.setVisible(bool(open_state))
         gg = QGridLayout(adv)
         r = 0
+        # --- Settings persistence controls (top of Advanced) ---
+        row_save = QWidget(self); hsave = QHBoxLayout(row_save); hsave.setContentsMargins(0,0,0,0)
+        self.chk_save_settings = QCheckBox("Save settings")
+        self.chk_save_settings.setToolTip("When ON, any change updates presets\\setsave\\describer.json and will be restored on next launch.")
+        self.btn_defaults = QPushButton("Default settings")
+        self.btn_defaults.setToolTip("Restore all Advanced options to built-in defaults.")
+        hsave.addWidget(self.chk_save_settings); hsave.addStretch(1); hsave.addWidget(self.btn_defaults)
+        gg.addWidget(row_save, r, 0, 1, 2); r+=1
+
         gg.addWidget(QLabel("max_new_tokens"), r,0); self.sp_max = QSpinBox(); self.sp_max.setRange(16,2048); self.sp_max.setValue(_settings().value("max_new_tokens", 160, int)); gg.addWidget(self.sp_max, r,1); r+=1
         gg.addWidget(QLabel("min_length"), r,0); self.sp_min = QSpinBox(); self.sp_min.setRange(0,1024); self.sp_min.setValue(_settings().value("min_length", 60, int)); gg.addWidget(self.sp_min, r,1); r+=1
         gg.addWidget(QLabel("no_repeat_ngram_size"), r,0); self.sp_ngram = QSpinBox(); self.sp_ngram.setRange(0,10); self.sp_ngram.setValue(_settings().value("no_repeat_ngram_size", 3, int)); gg.addWidget(self.sp_ngram, r,1); r+=1
@@ -238,6 +268,120 @@ class DescriberWidget(QWidget):
         self.btn_copy_prompt.clicked.connect(self._copy_prompt)
         self.btn_save_txt.clicked.connect(self._save_txt)
         self.btn_save_json.clicked.connect(self._save_json)
+        # --- Settings persistence: helpers (scoped in __init__) ---
+        def _setsave_path():
+            root = Path(__file__).resolve().parent.parent
+            pdir = root / "presets" / "setsave"
+            try: pdir.mkdir(parents=True, exist_ok=True)
+            except Exception: pass
+            return pdir / "describer.json"
+        def _gather():
+            d = {}
+            try:
+                if hasattr(self, "spin_cpu"): d["spin_cpu"] = int(self.spin_cpu.value())
+            except Exception: pass
+            for name in ("sp_max","sp_min","sp_ngram","sp_temp","sp_topp","sp_topk","sp_rep"):
+                try:
+                    if hasattr(self,name):
+                        w = getattr(self,name)
+                        d[name] = float(w.value()) if "Double" in type(w).__name__ else int(w.value())
+                except Exception: pass
+            for name in ("chk_warm","chk_keep"):
+                try:
+                    if hasattr(self,name): d[name] = bool(getattr(self,name).isChecked())
+                except Exception: pass
+            for name in ("combo_detail","combo_decode"):
+                try:
+                    if hasattr(self,name): d[name] = str(getattr(self,name).currentText())
+                except Exception: pass
+            for name in ("negative","txt_image"):
+                try:
+                    if hasattr(self,name): d[name] = str(getattr(self,name).text())
+                except Exception: pass
+            try: d["save_settings"] = bool(self.chk_save_settings.isChecked())
+            except Exception: pass
+            return d
+        def _apply(d):
+            try:
+                if "spin_cpu" in d and hasattr(self,"spin_cpu"): self.spin_cpu.setValue(int(d["spin_cpu"]))
+            except Exception: pass
+            for name in ("sp_max","sp_min","sp_ngram","sp_temp","sp_topp","sp_topk","sp_rep"):
+                try:
+                    if name in d and hasattr(self,name):
+                        w = getattr(self,name)
+                        val = d[name]
+                        w.setValue(float(val) if "Double" in type(w).__name__ else int(val))
+                except Exception: pass
+            for name in ("chk_warm","chk_keep"):
+                try:
+                    if name in d and hasattr(self,name): getattr(self,name).setChecked(bool(d[name]))
+                except Exception: pass
+            for name in ("combo_detail","combo_decode"):
+                try:
+                    if name in d and hasattr(self,name): getattr(self,name).setCurrentText(str(d[name]))
+                except Exception: pass
+            for name in ("negative","txt_image"):
+                try:
+                    if name in d and hasattr(self,name): getattr(self,name).setText(str(d[name]))
+                except Exception: pass
+            try:
+                if "save_settings" in d and hasattr(self,"chk_save_settings"): self.chk_save_settings.setChecked(bool(d["save_settings"]))
+            except Exception: pass
+        def _save_now():
+            try:
+                if hasattr(self,"chk_save_settings") and not self.chk_save_settings.isChecked(): return
+                pp = _setsave_path(); data = _gather()
+                pp.write_text(json.dumps(data, indent=2), encoding="utf-8")
+            except Exception: pass
+        def _load_now():
+            try:
+                pp = _setsave_path()
+                if pp.exists():
+                    data = json.loads(pp.read_text(encoding="utf-8"))
+                    _apply(data)
+                    try: self.chk_save_settings.setChecked(bool(data.get("save_settings", True)))
+                    except Exception: pass
+                else:
+                    try: self.chk_save_settings.setChecked(False)
+                    except Exception: pass
+            except Exception: pass
+        def _restore_defaults():
+            defaults = {"sp_max":160, "sp_min":60, "sp_ngram":3, "sp_temp":0.7, "sp_topp":0.9, "sp_topk":50, "sp_rep":1.1, "chk_warm":True, "chk_keep":True}
+            for k,v in defaults.items():
+                try:
+                    if hasattr(self,k):
+                        w = getattr(self,k)
+                        (w.setChecked(bool(v)) if k.startswith("chk_") else w.setValue(float(v) if "Double" in type(w).__name__ else int(v)))
+                except Exception: pass
+            _save_now()
+        def _hook_autosave(w):
+            try:
+                if hasattr(w, "valueChanged"): w.valueChanged.connect(_save_now)
+            except Exception: pass
+            try:
+                if hasattr(w, "textChanged"): w.textChanged.connect(_save_now)
+            except Exception: pass
+            try:
+                if hasattr(w, "currentTextChanged"): w.currentTextChanged.connect(_save_now)
+            except Exception: pass
+            try:
+                if hasattr(w, "toggled"): w.toggled.connect(_save_now)
+            except Exception: pass
+        try:
+            self.btn_defaults.clicked.connect(_restore_defaults)
+            self.chk_save_settings.toggled.connect(lambda _v: _save_now())
+        except Exception: pass
+        for nm in ("spin_cpu","sp_max","sp_min","sp_ngram","sp_temp","sp_topp","sp_topk","sp_rep","chk_warm","chk_keep","combo_detail","combo_decode","negative","txt_image"):
+            try:
+                if hasattr(self, nm): _hook_autosave(getattr(self, nm))
+            except Exception: pass
+        _tips = {"sp_max":"Upper bound on generated tokens.","sp_min":"Minimum generated length.","sp_ngram":"Blocks repeats of this n-gram length.","sp_temp":"Randomness: higher = more creative.","sp_topp":"Nucleus sampling cut-off.","sp_topk":"Top-K sampling cut-off.","sp_rep":"Penalty for repeated tokens.","chk_warm":"Warm up the model at startup.","chk_keep":"Keep model in memory between runs.","spin_cpu":"Threads for CPU inference (if used).","combo_detail":"Verbosity of output text.","combo_decode":"Decoding strategy for generation.","negative":"Negative prompt tokens to avoid.","txt_image":"Path of test image to describe."}
+        for k,v in _tips.items():
+            try:
+                if hasattr(self,k): getattr(self,k).setToolTip(v)
+            except Exception: pass
+        _load_now()
+
         self.combo_detail.currentTextChanged.connect(lambda v: _settings().setValue("detail_level", v))
         self.combo_decode.currentTextChanged.connect(lambda v: _settings().setValue("decode_style", v))
         self.btn_adv.toggled.connect(lambda v: (adv.setVisible(bool(v)), self.btn_adv.setArrowType(Qt.DownArrow if v else Qt.RightArrow), _settings().setValue("advanced_open", bool(v))))
@@ -728,6 +872,19 @@ else:
                 self.spin_cpu.setRange(1, mx); self.spin_cpu.setValue(min(mx, max(1, cap)))
                 self.spin_cpu.valueChanged.connect(lambda v: QSettings("FrameVision","FrameVision").setValue("describe_cpu_threads", int(v)))
             h2.addWidget(self.spin_cpu)
+            # Move toggles from Advanced to top row, after CPU threads spinner
+            try:
+                if hasattr(self, "chk_warm"):
+                    self.chk_warm.setParent(row2)
+                    h2.addSpacing(12)
+                    h2.addWidget(self.chk_warm)
+                if hasattr(self, "chk_keep"):
+                    self.chk_keep.setParent(row2)
+                    h2.addSpacing(12)
+                    h2.addWidget(self.chk_keep)
+            except Exception:
+                pass
+
             h2.addStretch(1)
             h2.addWidget(QLabel("Backend:"))
             if not hasattr(self, "lbl_backend"):

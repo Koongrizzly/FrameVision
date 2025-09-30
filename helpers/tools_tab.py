@@ -450,37 +450,25 @@ class InstantToolsPane(QWidget):
         btn_ss.clicked.connect(lambda: self._save_preset_speed())
         btn_ls.clicked.connect(lambda: self._load_preset_speed())
 
-        # Resize
-        self.resize_w = QSlider(Qt.Horizontal); self.resize_w.setRange(16,8192); self.resize_w.setValue(1280)
-        self.resize_h = QSlider(Qt.Horizontal); self.resize_h.setRange(16,8192); self.resize_h.setValue(720)
-        self.lbl_resize_w = QLabel("1280"); self.lbl_resize_h = QLabel("720")
-        self.spin_resize_w = QSpinBox(); self.spin_resize_w.setRange(16,8192); self.spin_resize_w.setValue(1280)
-        self.spin_resize_h = QSpinBox(); self.spin_resize_h.setRange(16,8192); self.spin_resize_h.setValue(720)
-        # sync both ways
-        self.resize_w.valueChanged.connect(lambda v: (self.lbl_resize_w.setText(str(v)), self.spin_resize_w.setValue(int(v))))
-        self.resize_h.valueChanged.connect(lambda v: (self.lbl_resize_h.setText(str(v)), self.spin_resize_h.setValue(int(v))))
-        self.spin_resize_w.valueChanged.connect(lambda val: self.resize_w.setValue(int(val)))
-        self.spin_resize_h.valueChanged.connect(lambda val: self.resize_h.setValue(int(val)))
-        self.btn_resize = QPushButton("Resize"); self.btn_resize.setToolTip("Resize video to the chosen width/height (re-encode)."); self.btn_resize_batch = QPushButton("Batch…"); self.btn_resize_batch.setToolTip("Batch with current Resize settings."); self.btn_resize_batch.setToolTip("Batch Resize using the width/height above.")
-        self.btn_resize.setToolTip("Resize without upscaling algorithms (fast). Use the Upscaler tab for AI upscaling.")
-        lay_resize = QFormLayout()
-        row_rw = QHBoxLayout(); row_rw.addWidget(self.resize_w); row_rw.addWidget(self.spin_resize_w); lay_resize.addRow("Resize W", row_rw)
-        row_rh = QHBoxLayout(); row_rh.addWidget(self.resize_h); row_rh.addWidget(self.spin_resize_h); lay_resize.addRow("Resize H", row_rh)
-        lay_resize.addRow("", QLabel("NOTE: this does not upscale, only resizes"))
-        row_rb = QHBoxLayout(); row_rb.addWidget(self.btn_resize); row_rb.addWidget(self.btn_resize_batch); lay_resize.addRow(row_rb)
         
-        try:
-            lay_resize.addRow("Width (type)", self.spin_resize_w)
-            lay_resize.addRow("Height (type)", self.spin_resize_h)
-        except Exception:
-            pass
-        sec_resize.setContentLayout(lay_resize)
-        row = QHBoxLayout(); btn_sr = QPushButton("Save preset"); btn_lr = QPushButton("Load preset"); row.addWidget(btn_sr); row.addWidget(btn_lr)
-        lay_resize.addRow(row)
-        btn_sr.clicked.connect(lambda: self._save_preset_resize())
-        btn_lr.clicked.connect(lambda: self._load_preset_resize())
+        # Resize (moved to helpers/resize.py)
 
-        # GIF
+        try:
+
+            from helpers.resize import install_resize_tool
+
+            install_resize_tool(self, sec_resize)
+
+        except Exception as e:
+
+            try:
+
+                QMessageBox.critical(self, 'Resize init failed', str(e))
+
+            except Exception:
+
+                pass
+# GIF
         self.gif_fps = QSlider(Qt.Horizontal); self.gif_fps.setRange(5,30); self.gif_fps.setValue(12)
         self.lbl_gif_fps = QLabel("12"); self.gif_fps.valueChanged.connect(lambda v: self.lbl_gif_fps.setText(str(v)))
         self.spin_gif_fps = QSpinBox(); self.spin_gif_fps.setRange(5,30); self.spin_gif_fps.setValue(12)
@@ -829,8 +817,6 @@ class InstantToolsPane(QWidget):
 # Wire
         self.btn_speed.clicked.connect(self.run_speed)
         self.btn_speed_batch.clicked.connect(self.run_speed_batch)
-        self.btn_resize.clicked.connect(self.run_resize)
-        self.btn_resize_batch.clicked.connect(self.run_resize_batch)
         self.btn_gif.clicked.connect(self.run_gif)
         self.btn_gif_batch.clicked.connect(self.run_gif_batch)
         self.btn_last.clicked.connect(self.run_last)
@@ -949,34 +935,6 @@ class InstantToolsPane(QWidget):
         self._run(cmd, out)
 
     
-    def run_resize(self):
-        inp = self._ensure_input()
-        if not inp:
-            return
-        w = int(self.resize_w.value()); h = int(self.resize_h.value())
-        ext = inp.suffix.lower()
-        img_exts = {".png",".jpg",".jpeg",".bmp",".tif",".tiff",".webp"}
-        try:
-            out_base = OUT_VIDEOS.parent / "photo" / "resized" if ext in img_exts else OUT_VIDEOS
-            if ext in img_exts:
-                out = out_base / f"{inp.stem}_res_{w}x{h}{ext}"
-                out.parent.mkdir(parents=True, exist_ok=True)
-                cmd = [ffmpeg_path(), "-y", "-i", str(inp),
-                       "-vf", f"scale={w}:{h}:flags=lanczos"]
-                if ext in {".jpg",".jpeg"}:
-                    cmd += ["-q:v", "2"]
-                cmd.append(str(out))
-            else:
-                out = out_base / f"{inp.stem}_res_{w}x{h}.mp4"
-                cmd = [ffmpeg_path(), "-y", "-i", str(inp),
-                       "-vf", f"scale={w}:{h}:flags=lanczos",
-                       "-c:v", "libx264", "-preset", "veryfast", "-movflags", "+faststart", str(out)]
-            self._run(cmd, out)
-        except Exception as e:
-            try:
-                QMessageBox.critical(self, "Resize error", str(e))
-            except Exception:
-                pass
     def run_gif(self):
         inp = self._ensure_input()
         if not inp:
@@ -1103,27 +1061,6 @@ class InstantToolsPane(QWidget):
             QMessageBox.critical(self, "Preset error", str(e))
 
     # ---- Resize ----
-    def _save_preset_resize(self):
-        w = int(self.resize_w.value()); h = int(self.resize_h.value())
-        name = f"resize_{w}x{h}_preset.json"
-        p = self._choose_save_path(name)
-        if not p: return
-        data = {"tool":"resize","w":w,"h":h}
-        p.write_text(json.dumps(data, indent=2), encoding="utf-8")
-        QMessageBox.information(self, "Preset saved", str(p))
-
-    def _load_preset_resize(self):
-        p = self._choose_open_path()
-        if not p: return
-        try:
-            data = json.loads(p.read_text(encoding="utf-8"))
-            if data.get("tool")!="resize": raise ValueError("Wrong preset type")
-            self.resize_w.setValue(int(data.get("w", self.resize_w.value())))
-            self.resize_h.setValue(int(data.get("h", self.resize_h.value())))
-        except Exception as e:
-            QMessageBox.critical(self, "Preset error", str(e))
-
-    # ---- GIF ----
     def _save_preset_gif(self):
         inp = self._ensure_input(silent=True)
         if not inp:
@@ -1654,42 +1591,6 @@ class InstantToolsPane(QWidget):
             pass
 
     
-    def run_resize_batch(self):
-        paths = self._batch_paths_prompt("both", "Batch")
-        if not paths:
-            return
-        try:
-            if QMessageBox.question(self, "Batch Resize", f"Add {len(paths)} file(s) with current Resize settings to the queue?") != QMessageBox.Yes:
-                return
-        except Exception:
-            pass
-        for p in paths:
-            try:
-                inp = Path(p)
-                w = int(self.resize_w.value()); h = int(self.resize_h.value())
-                ext = inp.suffix.lower()
-                img_exts = {".png",".jpg",".jpeg",".bmp",".tif",".tiff",".webp"}
-                out_base = OUT_VIDEOS.parent / "photo" / "resized" if ext in img_exts else OUT_VIDEOS
-                if ext in img_exts:
-                    out = out_base / f"{inp.stem}_res_{w}x{h}{ext}"
-                    out.parent.mkdir(parents=True, exist_ok=True)
-                    cmd = [ffmpeg_path(), "-y", "-i", str(inp),
-                           "-vf", f"scale={w}:{h}:flags=lanczos"]
-                    if ext in {".jpg",".jpeg"}:
-                        cmd += ["-q:v","2"]
-                    cmd.append(str(out))
-                else:
-                    out = out_base / f"{inp.stem}_res_{w}x{h}.mp4"
-                    cmd = [ffmpeg_path(), "-y", "-i", str(inp),
-                           "-vf", f"scale={w}:{h}:flags=lanczos",
-                           "-c:v","libx264","-preset","veryfast","-movflags","+faststart", str(out)]
-                self._enqueue_cmd_for_input(inp, cmd, out)
-            except Exception:
-                continue
-        try:
-            QMessageBox.information(self, "Batch Resize", f"Queued {len(paths)} item(s).")
-        except Exception:
-            pass
     def run_gif_batch(self):
         paths = self._pick_batch_files(for_videos=True)
         if not paths:

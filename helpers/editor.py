@@ -2339,7 +2339,7 @@ class EditorPane(QWidget):
         except Exception: pass
         self._ext_playing_clip = clip
         try:
-            self.preview_media.emit(media, int(g))
+            self.preview_media.emit(media.path, int(g))
         except Exception:
             pass
         try:
