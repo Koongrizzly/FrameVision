@@ -13,6 +13,8 @@ from PySide6.QtGui import (QAction, QKeySequence, QIcon, QPixmap, QDrag, QPainte
 from PySide6.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QLabel, QFileDialog, QListWidget,
                                QListWidgetItem, QMenu, QToolButton, QComboBox, QSpinBox, QLineEdit,
                                QScrollArea, QFrame, QMessageBox, QSlider, QSizePolicy, QDialog,
+                               QScrollBar,
+                               QStyle,
                                QDialogButtonBox, QFormLayout, QAbstractItemView, QApplication, QTabWidget, QInputDialog, QColorDialog, QPushButton, QSplitter)
 
 # Optional multimedia preview imports (Qt6+)
@@ -156,7 +158,6 @@ def _gen_thumb(media: MediaItem, size: QSize) -> Optional[QPixmap]:
 
         except Exception: pass
 
-        except Exception: pass
     if media.kind == "video" and media.path.exists():
         try:
             data = subprocess.check_output([ffmpeg_path(), "-ss","1","-i",str(media.path), "-frames:v","1","-f","image2pipe","-vcodec","png","pipe:1"], stderr=subprocess.DEVNULL)
@@ -199,7 +200,6 @@ def _placeholder_icon(kind: str, size: QSize) -> QPixmap:
         bx = int(w*0.45) + i*8
         bh = 6 + (i%3)*4
         p.drawLine(bx, y+band_h-4, bx, y+band_h-4-bh)
-    p.end(); return pm
     p.end(); return pm
 
 # ---------- media preview dialog ----------
@@ -282,8 +282,6 @@ class PreviewDialog(QDialog):
         except Exception:
             pass
         super().closeEvent(ev)
-        if not self.player: return
-        dur = max(1, self.player.duration()); pos = int((val/1000.0)*dur)
         self.player.setPosition(pos)
 
 # ---------- UI: media strip ----------
@@ -348,64 +346,170 @@ class MediaList(QListWidget):
         super().mouseDoubleClickEvent(ev)
 
 # ---------- ruler ----------
+
 class TimeRuler(QWidget):
     positionPicked = Signal(int)  # ms
     def __init__(self, parent=None):
         super().__init__(parent)
-        self.px_per_s = 100; self.duration_ms = 60000; self.playhead_ms = 0
-        self.setFixedHeight(28)
+        self.px_per_s = 100.0
+        self.duration_ms = 60000
+        self.playhead_ms = 0
+        self.fps = 30
         self._markers: List[int] = []  # ms
+        self._in_ms: Optional[int] = None
+        self._out_ms: Optional[int] = None
+        self.setFixedHeight(28)
+        self.setMouseTracking(True)
+        self._dragging = False
+        self._offset_ms = 0
 
-    def set_scale(self, px): self.px_per_s = max(5.0, float(px)); self.update()
-    def set_duration(self, ms): self.duration_ms = max(1000, int(ms)); self.update()
-    def set_playhead(self, ms): self.playhead_ms = max(0,int(ms)); self.update()
-    def set_markers(self, markers: List[int]): self._markers = list(sorted(set(int(m) for m in markers))); self.update()
+    # --- configuration ---
+    def set_scale(self, px: float):
+        self.px_per_s = max(0.01, float(px)); self.update()
 
+    def set_duration(self, ms: int):
+        self.duration_ms = max(1000, int(ms))
+        try: self.update()
+        except Exception: pass
+
+    def set_offset(self, ms: int):
+        self._offset_ms = max(0, int(ms))
+        try: self.update()
+        except Exception: pass
+
+    def set_playhead(self, ms: int):
+        self.playhead_ms = max(0, int(ms)); self.update()
+
+    def set_markers(self, markers: List[int]):
+        self._markers = list(sorted(set(int(m) for m in markers))); self.update()
+
+    def set_fps(self, fps: int):
+        self.fps = max(1, int(fps)); self.update()
+
+    def set_in_out(self, in_ms: Optional[int], out_ms: Optional[int]):
+        self._in_ms = int(in_ms) if in_ms is not None else None
+        self._out_ms = int(out_ms) if out_ms is not None else None
+        self.update()
+
+    # --- helpers ---
+    def _fmt_tc(self, ms: int) -> str:
+        fps = max(1, int(self.fps))
+        total_sec = max(0, int(ms)) / 1000.0
+        hh = int(total_sec // 3600)
+        mm = int((total_sec % 3600) // 60)
+        ss = int(total_sec % 60)
+        # frames from remainder
+        frac = total_sec - int(total_sec)
+        ff = int(round(frac * fps)) % fps
+        return f"{hh:02d}:{mm:02d}:{ss:02d}:{ff:02d}"
+
+    # --- event handling ---
+    
     def paintEvent(self, ev):
-        p = QPainter(self); p.fillRect(self.rect(), QColor(30,30,35))
+        p = QPainter(self)
+        p.fillRect(self.rect(), QColor(30,30,35))
+
+        # visible offset in seconds
+        off_s = float(self._offset_ms) / 1000.0
+
+        # selection (in/out) shading
+        if (self._in_ms is not None) and (self._out_ms is not None) and (self._out_ms > self._in_ms):
+            x1 = int(((self._in_ms/1000.0) - off_s) * self.px_per_s)
+            x2 = int(((self._out_ms/1000.0) - off_s) * self.px_per_s)
+            sel_rect = QRect(min(x1,x2), 0, abs(x2-x1), self.rect().height())
+            p.fillRect(sel_rect, QColor(70,120,200,60))
+
         # playhead
-        x = int((self.playhead_ms/1000.0) * self.px_per_s)
-        p.setPen(QPen(QColor(230,80,80), 2)); p.drawLine(x, 0, x, self.rect().height())
+        xph = int(((self.playhead_ms/1000.0) - off_s) * self.px_per_s)
+        p.setPen(QPen(QColor(230,80,80), 2))
+        p.drawLine(xph, 0, xph, self.rect().height())
+
         # ticks
-        w = self.rect().width(); target = 80.0
+        w = self.rect().width()
+        # desired px per major tick ~80
+        target = 80.0
         step = max(0.1, target / max(1.0, self.px_per_s))
         stops = [0.1,0.2,0.5,1,2,5,10,15,30,60]
         tick = next((s for s in stops if s >= step), 60)
-        sub = tick/5.0; t = 0.0
-        while True:
-            x = int(t * self.px_per_s)
-            if x > w: break
-            major = abs((t/tick) - round(t/tick)) < 1e-6
+        sub = tick/5.0
+
+        # start at the first sub-tick <= off_s
+        import math
+        start_sub_idx = int(math.floor(off_s / sub))  # integer index
+        max_sub = int(math.ceil((off_s + (w / max(1.0, self.px_per_s))) / sub)) + 2  # draw slightly past right edge
+
+        for i in range(start_sub_idx, max_sub+1):
+            t = i * sub
+            x = int((t - off_s) * self.px_per_s)
+            if x > w:
+                break
+            if x < -2:
+                continue
+            # major every 'tick'
+            major = (abs((t / tick) - round(t / tick)) < 1e-9)
             p.setPen(QPen(QColor(220,220,220) if major else QColor(140,140,150), 1))
-            p.drawLine(x, 0, x, 12 if major else 8)
-            if major: p.drawText(x+2, 22, f"{t:.2f}s" if tick<1 else f"{int(t)}s")
-            t += sub
+            p.drawLine(x, 0 if major else 12, x, self.rect().height())
+            if major:
+                label = self._fmt_tc(int(t*1000))
+                p.drawText(x+4, 18, label)
+
         # markers
+        p.setPen(QPen(QColor(255,215,0), 2))
         for m in self._markers:
-            x = int((m/1000.0) * self.px_per_s)
-            p.setBrush(QColor(255,220,80)); p.setPen(Qt.NoPen)
-            p.drawPolygon(QPolygonF([QPointF(x-4, 14), QPointF(x+4, 14), QPointF(x, 4)]))
-            p.setPen(QPen(QColor(255,220,80),1)); p.drawLine(x, 14, x, self.height())
+            x = int(((m/1000.0) - off_s) * self.px_per_s)
+            p.drawLine(x, 0, x, self.rect().height())
+
         p.end()
 
+    def mousePressEvent(self, ev):
+        if ev.button() == Qt.LeftButton:
+            self._dragging = True
+            ms = int(max(0, (ev.position().x() / max(1e-6, self.px_per_s)) * 1000.0))
+            # notify scrub start
+            parent = self._find_editor()
+            if parent is not None:
+                parent.transport_request.emit("scrub:start")
+            self.positionPicked.emit(ms)
+            ev.accept(); return
+        super().mousePressEvent(ev)
+
+    def mouseMoveEvent(self, ev):
+        if self._dragging:
+            ms = int(max(0, (ev.position().x() / max(1e-6, self.px_per_s)) * 1000.0))
+            self.positionPicked.emit(ms)
+            ev.accept(); return
+        super().mouseMoveEvent(ev)
+
+    def mouseReleaseEvent(self, ev):
+        if self._dragging and ev.button() == Qt.LeftButton:
+            self._dragging = False
+            parent = self._find_editor()
+            if parent is not None:
+                parent.transport_request.emit("scrub:end")
+            ev.accept(); return
+        super().mouseReleaseEvent(ev)
+
     def mouseDoubleClickEvent(self, ev):
-        x = ev.position().x() if hasattr(ev,'position') else ev.pos().x()
-        ms = int(max(0, (x / max(1.0, self.px_per_s))*1000.0))
-        self.positionPicked.emit(ms)
+        if ev.button() == Qt.LeftButton:
+            ms = int(max(0, (ev.position().x() / max(1e-6, self.px_per_s)) * 1000.0))
+            self.positionPicked.emit(ms); ev.accept(); return
         super().mouseDoubleClickEvent(ev)
 
     # zoom with wheel over ruler
     def wheelEvent(self, ev):
         dy = ev.angleDelta().y()
-        parent = self.parent()
-        while parent and not isinstance(parent, EditorPane):
-            parent = parent.parent()
-        if parent and isinstance(parent, EditorPane):
+        parent = self._find_editor()
+        if parent is not None:
             if dy > 0: parent._set_zoom(parent.zoom*1.1)
             else: parent._set_zoom(parent.zoom/1.1)
             ev.accept(); return
         super().wheelEvent(ev)
 
+    def _find_editor(self):
+        parent = self.parent()
+        while parent and not isinstance(parent, EditorPane):
+            parent = parent.parent()
+        return parent if isinstance(parent, EditorPane) else None
 # ---------- timeline widgets ----------
 class ClipWidget(QFrame):
     CLIP_MIME = "application/x-framevision-clip"
@@ -431,11 +535,22 @@ class ClipWidget(QFrame):
 
     def _show_ctx(self, global_pos):
         ed = self.row.editor; m = QMenu(self)
+        # Default Delete: remove clip instance *from timeline* only
+        try:
+            act_del = m.addAction("Delete", lambda: ed._clip_remove_from_timeline(self.row.track, self.clip))
+            try:
+                from PySide6.QtGui import QKeySequence
+                act_del.setShortcut(QKeySequence.Delete)
+            except Exception:
+                pass
+        except Exception:
+            pass
         # Copy/Paste
         m.addAction("Copy", lambda: ed._clip_copy(self.row.track, self.clip))
         act_paste = m.addAction("Paste", lambda: ed._clip_paste(self.row.track, self.mapToParent(self.rect().center()).x(), self.media.kind))
         act_paste.setEnabled(ed._clipboard is not None)
         # Cut
+        m.addAction("Play", lambda: self.row.editor._play_clip_from_ruler(self))
         cut = m.addMenu("Cut")
         cut.addAction("Keep left side",  lambda: ed._clip_cut(self.row.track, self.clip, "left"))
         cut.addAction("Keep right side", lambda: ed._clip_cut(self.row.track, self.clip, "right"))
@@ -473,6 +588,34 @@ class ClipWidget(QFrame):
         rm.addAction("From timeline", lambda: ed._clip_remove_from_timeline(self.row.track, self.clip))
         rm.addAction("From project", lambda: ed._clip_remove_from_project(self.row.track, self.clip))
         m.exec(global_pos)
+
+
+    def _play_from_ruler(self):
+        ed = self.row.editor
+        try:
+            dlg = PreviewDialog(self.media, ed)
+            ed._playback_preview = dlg
+            dlg.show()
+            start_ms = int(getattr(ed.seek_slider, "value", lambda:0)())
+            rel = max(0, start_ms - int(self.clip.start_ms))
+            if dlg.player:
+                try: dlg.player.setPosition(int(rel))
+                except Exception: pass
+                try: dlg.player.play()
+                except Exception: pass
+                def _sync(ms):
+                    try:
+                        g = int(self.clip.start_ms) + int(ms)
+                        ed.seek_slider.blockSignals(True)
+                        ed.seek_slider.setValue(int(g))
+                        ed.seek_slider.blockSignals(False)
+                        ed._ensure_playhead_visible()
+                    except Exception:
+                        pass
+                try: dlg.player.positionChanged.connect(_sync)
+                except Exception: pass
+        except Exception:
+            pass
 
     def paintEvent(self, ev):
         p = QPainter(self)
@@ -530,17 +673,36 @@ class ClipWidget(QFrame):
             x = self.mapToParent(QPointF(ev.position()).toPoint()).x()
             # convert x-in-row to ms
             start_ms = int(max(0, (x / max(1.0, self.row.px_per_s))*1000.0))
-            start_ms = self.row.editor._snap_ms(start_ms)
+            try: start_ms = self.row.editor._snap_ms(start_ms)
+            except Exception: pass
+            # Determine max allowed duration for this media type
+            max_ms = None
+            try:
+                if self.media.kind in ("audio","video"):
+                    d = self.media.meta.get("duration")
+                    if d is not None:
+                        max_ms = max(1, int(float(d) * 1000 / max(0.001, float(getattr(self.clip,"speed",1.0)))))
+                    else:
+                        max_ms = max(1, int(self._orig_dur))  # unknown duration -> don't extend
+            except Exception:
+                max_ms = None
             if self._resize_edge == "L":
-                # new start cannot exceed old end-1
-                new_start = min(start_ms, self._orig_start + self._orig_dur - 1)
-                delta = new_start - self._orig_start
-                self.clip.start_ms = new_start
-                self.clip.duration_ms = max(1, self._orig_dur - delta)
+                # new start cannot exceed old end-1; clamp final duration to media length if applicable
+                end_t = int(self._orig_start + self._orig_dur)
+                new_start = min(start_ms, end_t - 1)
+                new_dur = int(end_t - new_start)
+                if max_ms is not None and new_dur > max_ms:
+                    new_start = int(end_t - max_ms)
+                    new_dur = int(max_ms)
+                self.clip.start_ms = int(new_start)
+                self.clip.duration_ms = max(1, int(new_dur))
             else:
-                # right edge -> duration changes
-                end = max(start_ms, self._orig_start + 1)
-                self.clip.duration_ms = max(1, end - self._orig_start)
+                # right edge -> duration changes; clamp to max allowed duration
+                end_t = max(start_ms, self._orig_start + 1)
+                new_dur = int(end_t - self._orig_start)
+                if max_ms is not None and new_dur > max_ms:
+                    new_dur = int(max_ms)
+                self.clip.duration_ms = max(1, int(new_dur))
             try:
                 self.row._update_clip_widget_geometry(self)
             except Exception:
@@ -577,6 +739,30 @@ class ClipWidget(QFrame):
         super().mouseReleaseEvent(ev)
 
 
+        # If this clip is currently playing, clamp background player to new end
+        try:
+            ed = self.row.editor
+            if getattr(ed, "_playing_clip", None) is self and getattr(ed, "_bg_player", None):
+                rel = int(ed._bg_player.position())
+                if rel >= int(self.clip.duration_ms):
+                    new_rel = int(self.clip.duration_ms) - 1
+                    if new_rel < 0: new_rel = 0
+                    try: ed._bg_player.setPosition(new_rel)
+                    except Exception: pass
+                    try: ed._bg_player.pause()
+                    except Exception: pass
+                    ed._is_playing = False
+                    g = int(self.clip.start_ms) + new_rel
+                    ed.seek_slider.blockSignals(True)
+                    ed.seek_slider.setValue(int(g))
+                    ed.seek_slider.blockSignals(False)
+                    try: ed.ruler.set_playhead(int(g))
+                    except Exception: pass
+                    try: ed._ensure_playhead_visible()
+                    except Exception: pass
+        except Exception:
+            pass
+
     def enterEvent(self, ev):
         try:
             pos = self.mapFromGlobal(QCursor.pos())
@@ -599,7 +785,6 @@ class TrackHeader(QWidget):
     def __init__(self, track: Track, editor: "EditorPane", parent=None):
         super().__init__(parent); self.track=track; self.editor=editor
         lay = QHBoxLayout(self); lay.setContentsMargins(6,2,6,2); lay.setSpacing(4)
-        self.swatch = QFrame(); self.swatch.setFixedSize(14,14); self._apply_color()
         self.name = QLabel(self._label_text())
         self.btn_m = QToolButton(); self.btn_m.setText("M"); self.btn_m.setCheckable(True); self.btn_m.setToolTip("Mute track")
         self.btn_s = QToolButton(); self.btn_s.setText("S"); self.btn_s.setCheckable(True); self.btn_s.setToolTip("Solo track")
@@ -608,18 +793,23 @@ class TrackHeader(QWidget):
         for b in (self.btn_m,self.btn_s,self.btn_l):
             b.setFixedSize(24,20)
         self.btn_color.setFixedSize(28,22)
-        lay.addWidget(self.swatch); lay.addWidget(self.name); lay.addWidget(self.btn_m); lay.addWidget(self.btn_s); lay.addWidget(self.btn_l); lay.addWidget(self.btn_color)
-        self.btn_m.setChecked(track.mute); self.btn_s.setChecked(track.solo); self.btn_l.setChecked(track.locked)
-        self.btn_m.toggled.connect(self._set_mute); self.btn_s.toggled.connect(self._set_solo); self.btn_l.toggled.connect(self._set_lock); self.btn_color.clicked.connect(self._pick_color)
+        self.btn_m.hide(); self.btn_s.hide()
+        lay.addWidget(self.name); lay.addWidget(self.btn_l); lay.addWidget(self.btn_color)
+        self.btn_l.setChecked(track.locked)
+        self.btn_l.toggled.connect(self._set_lock); self.btn_color.clicked.connect(self._pick_color)
 
     def _label_text(self):
-        return self.track.name if self.track.type=='any' else f"{self.track.name} ({self.track.type})"
+        nm = (getattr(self.track, "name", "") or "").strip()
+        typ = (getattr(self.track, "type", "") or "").strip()
+        if nm:
+            return nm
+        return typ.capitalize() if typ else "Track"
 
     def _apply_color(self):
         try:
-            self.swatch.setStyleSheet(f"background:{self.track.color}; border:1px solid #666;")
+            None.setStyleSheet(f"background:{self.track.color}; border:1px solid #666;")
         except Exception:
-            self.swatch.setStyleSheet("background:#3c3c3c; border:1px solid #666;")
+            None.setStyleSheet("background:#3c3c3c; border:1px solid #666;")
 
     def _set_mute(self, on): self.track.mute = bool(on); self.editor._mark_dirty()
     def _set_solo(self, on): self.track.solo = bool(on); self.editor._mark_dirty()
@@ -644,6 +834,14 @@ class TrackRow(QWidget):
         self._ghost_rect: Optional[QRect] = None
         self.setContextMenuPolicy(Qt.CustomContextMenu)
         self.customContextMenuRequested.connect(self._on_ctx)
+
+    def mousePressEvent(self, ev):
+        try:
+            if ev.button() == Qt.LeftButton:
+                self.editor._set_selected_track(self)
+        except Exception:
+            pass
+        super().mousePressEvent(ev)
 
     def index_of(self, clip: Clip) -> Optional[int]:
         try: return self.track.clips.index(clip)
@@ -685,7 +883,18 @@ class TrackRow(QWidget):
         if self._drag_hover and self._drag_can:
             pbg = QPainter(self); pbg.fillRect(self.rect(), QColor(40, 90, 40, 80)); pbg.end()
         super().paintEvent(ev)
-        # ghost preview
+        
+        # selection border (always, even when empty)
+        try:
+            if getattr(self.editor, "_selected_track_row", None) is self:
+                psel = QPainter(self)
+                psel.setPen(QPen(QColor(255, 200, 80), 2))
+                rect = self.rect().adjusted(1, 1, -1, -1)
+                psel.drawRect(rect)
+                psel.end()
+        except Exception:
+            pass
+# ghost preview
         if self._ghost_rect:
             p = QPainter(self); p.fillRect(self._ghost_rect, QColor(255,255,255,80)); p.setPen(QPen(QColor(255,255,255),1)); p.drawRect(self._ghost_rect); p.end()
         # playhead
@@ -882,6 +1091,132 @@ class EditorPane(QWidget):
     preview_media = Signal(object, int)
     transport_request = Signal(str)
 
+
+
+
+
+    # currently selected track row (for border highlight)
+    _selected_track_row = None
+
+    def _set_selected_track(self, row):
+        try:
+            self._selected_track_row = row
+            for r in self.tracks_holder.findChildren(TrackRow):
+                r.update()
+        except Exception:
+            pass
+    def _step_ms(self) -> int:
+        """Return step size in milliseconds based on the UI 'Step' control."""
+        try:
+            val = float(getattr(self.grid_step, "currentText", lambda: "1")())
+            return max(1, int(val * 1000))
+        except Exception:
+            return 1000
+    def _clipwidget_under_playhead(self):
+        """Return the ClipWidget under the current playhead, preferring video when overlapping."""
+        try:
+            g = int(self.seek_slider.value())
+        except Exception:
+            g = 0
+        best = None
+        best_kind = None
+        try:
+            for cw in self.tracks_holder.findChildren(ClipWidget):
+                try:
+                    start = int(getattr(cw.clip, "start_ms", 0))
+                    dur = int(getattr(cw.clip, "duration_ms", 0))
+                    if start <= g < start + max(1, dur):
+                        kind = getattr(cw.row.track, "kind", getattr(cw.media, "kind", "video"))
+                        if best is None or (kind == "video" and best_kind != "video"):
+                            best = cw; best_kind = kind
+                except Exception:
+                    pass
+        except Exception:
+            pass
+        return best
+
+    def _play_timeline_under_ruler_background(self):
+        """Always playable fallback: find the data Clip under the ruler and play it via _bg_player."""
+        try:
+            g = int(self.seek_slider.value())
+        except Exception:
+            g = 0
+        # Find a clip by data (prefer video kind tracks)
+        best_clip = None
+        best_kind = None
+        try:
+            for tr in getattr(self.project, "tracks", []):
+                for cl in getattr(tr, "clips", []):
+                    try:
+                        st = int(getattr(cl, "start_ms", 0))
+                        du = int(getattr(cl, "duration_ms", 0))
+                        if st <= g < st + max(1, du):
+                            kind = getattr(tr, "kind", "video")
+                            if best_clip is None or (kind == "video" and best_kind != "video"):
+                                best_clip = cl; best_kind = kind
+                    except Exception:
+                        pass
+        except Exception:
+            pass
+        if not best_clip or not getattr(self, "_bg_player", None):
+            return False
+        # Resolve media
+        try:
+            media_id = getattr(best_clip, "media_id", "")
+            media = self.project.media.get(media_id, None)
+        except Exception:
+            media = None
+        if not media or getattr(media, "kind", "") not in ("audio","video"):
+            return False
+        try:
+            from PySide6.QtCore import QUrl
+            url = QUrl.fromLocalFile(str(media.path))
+            self._bg_player.setSource(url)
+        except Exception:
+            return False
+        # Compute relative seek
+        rel = max(0, g - int(getattr(best_clip, "start_ms", 0)))
+        try:
+            dur = int(getattr(best_clip, "duration_ms", 0))
+            rel = min(rel, max(0, dur-1))
+        except Exception:
+            pass
+        try:
+            self._bg_player.setPosition(int(rel))
+            self._bg_player.play()
+            # Small holder with .clip so _on_bg_pos logic works
+            try:
+                from types import SimpleNamespace
+                self._playing_clip = SimpleNamespace(clip=best_clip)
+            except Exception:
+                self._playing_clip = type("X", (), {"clip": best_clip})()
+            self._is_playing = True
+            return True
+        except Exception:
+            return False
+    def _clip_under_playhead(self):
+        """Return the Clip under the current global playhead; prefer video over audio."""
+        try:
+            g = int(self.seek_slider.value())
+        except Exception:
+            g = 0
+        best = None
+        best_kind = None
+        try:
+            for tr in getattr(self.project, "tracks", []):
+                for cl in getattr(tr, "clips", []):
+                    try:
+                        start = int(getattr(cl, "start_ms", 0))
+                        dur = int(getattr(cl, "duration_ms", 0))
+                        if start <= g < start + max(1, dur):
+                            kind = getattr(tr, "kind", "video")
+                            if best is None or (kind == "video" and best_kind != "video"):
+                                best = cl; best_kind = kind
+                    except Exception:
+                        pass
+        except Exception:
+            pass
+        return best
     def __init__(self, parent=None):
         super().__init__(parent)
         self.project = Project()
@@ -893,6 +1228,9 @@ class EditorPane(QWidget):
         self._selected: Optional[Clip] = None
         self._selection: List[Clip] = []  # multi-select
         self._next_group_id = 1
+        self.in_ms: Optional[int] = None
+        self.out_ms: Optional[int] = None
+        self._shuttle_rate: int = 0
         self._last_open_dir: str = str(Path.cwd())
         self.glue_enabled = True
         self.grid_enabled = False
@@ -962,6 +1300,7 @@ class EditorPane(QWidget):
             ctrl_top.addWidget(self.snap_tol)
             ctrl_top.addWidget(self.btn_grid)
             ctrl_top.addWidget(self.btn_ripple)
+            ctrl_top.addWidget(self.btn_glue)
         except Exception:
             pass
         ctrl_top.addStretch(1)
@@ -969,11 +1308,80 @@ class EditorPane(QWidget):
 
         # controls
         ctrl = QHBoxLayout()
+        # Zoom Fit button
+        self.btn_zoom_fit = QToolButton(); self.btn_zoom_fit.setText("Fit"); self.btn_zoom_fit.setToolTip("Fit entire project")
+        try: self.btn_zoom_fit.clicked.connect(self._zoom_fit_all)
+        except Exception: pass
         self.btn_add_track = QToolButton(); self.btn_add_track.setText("Add timeline"); self.btn_add_track.clicked.connect(self._add_track)
-        self.zoom_slider = QSlider(Qt.Horizontal); self.zoom_slider.setRange(10,500); self.zoom_slider.setValue(100); self.zoom_slider.valueChanged.connect(lambda v: self._set_zoom(v/100.0))
-        self.seek_slider = QSlider(Qt.Horizontal); self.seek_slider.setRange(0,60000); self.seek_slider.sliderMoved.connect(self._seek_changed)
+        self.zoom_slider = QSlider(Qt.Horizontal); self.zoom_slider.setRange(10,500); self.zoom_slider.setValue(100); self.zoom_slider.valueChanged.connect(lambda v: self._set_zoom(v/10000.0))
+        try:
+            self.zoom_slider.setRange(1, 20000)
+            self.zoom_slider.setValue(max(1, int(getattr(self, "zoom", 1.0)*10000)))
+        except Exception:
+            pass
+        try:
+            self.zoom_slider.setRange(1, 20000)  # allows zoom down to 0.0001
+            self.zoom_slider.setValue(int(max(1, int(getattr(self, "zoom", 1.0)*10000))))
+        except Exception:
+            ctrl.addWidget(self.btn_zoom_fit)
+            pass
+        self.seek_slider = QSlider(Qt.Horizontal); self.seek_slider.setRange(0,60000); self.seek_slider.sliderMoved.connect(self._seek_changed); self.seek_slider.valueChanged.connect(self._seek_changed)
+        # transport buttons (icons only; not wired yet)
+        self.btn_to_start = QToolButton(); self.btn_to_start.setObjectName("btn_to_start")
+        self.btn_back = QToolButton(); self.btn_back.setObjectName("btn_back")
+        self.btn_play_pause = QToolButton(); self.btn_play_pause.setObjectName("btn_play_pause")
+        self.btn_stop = QToolButton(); self.btn_stop.setObjectName("btn_stop")
+        self.btn_forward = QToolButton(); self.btn_forward.setObjectName("btn_forward")
+        self.btn_to_end = QToolButton(); self.btn_to_end.setObjectName("btn_to_end")
+        try:
+            st = self.style()
+            self.btn_to_start.setIcon(st.standardIcon(QStyle.SP_MediaSkipBackward))
+            self.btn_back.setIcon(st.standardIcon(QStyle.SP_MediaSeekBackward))
+            self.btn_play_pause.setIcon(st.standardIcon(QStyle.SP_MediaPlay))
+            self.btn_stop.setIcon(st.standardIcon(QStyle.SP_MediaStop))
+            self.btn_forward.setIcon(st.standardIcon(QStyle.SP_MediaSeekForward))
+            self.btn_to_end.setIcon(st.standardIcon(QStyle.SP_MediaSkipForward))
+        except Exception:
+            pass
+        # tooltips for clarity
+        self.btn_to_start.setToolTip("Go to start")
+        self.btn_back.setToolTip("Step backward")
+        self.btn_play_pause.setToolTip("Play/Pause")
+        self.btn_stop.setToolTip("Stop")
+        self.btn_forward.setToolTip("Step forward")
+        self.btn_to_end.setToolTip("Go to end")
+        # --- background player (no popup) ---
+        self._bg_player = QMediaPlayer(self) if HAS_QTMULTI else None
+        self._bg_audio = QAudioOutput(self) if HAS_QTMULTI else None
+        if self._bg_player and self._bg_audio:
+            self._bg_player.setAudioOutput(self._bg_audio)
+            try: self._bg_player.positionChanged.connect(self._on_bg_pos)
+            except Exception: pass
+        self._playing_clip = None  # ClipWidget currently driving playback
+        self._is_playing = False
+        self.transport_request.connect(self._on_transport)
         for w in [self.btn_add_track, QLabel("Zoom"), self.zoom_slider, QLabel("Seek"), self.seek_slider]:
             ctrl.addWidget(w)
+        # timecode + in/out controls row (compact)
+        tc_row = QHBoxLayout()
+        self.tc_edit = QLineEdit("00:00:00:00"); self.tc_edit.setFixedWidth(110); self.tc_edit.setPlaceholderText("HH:MM:SS:FF")
+        tc_row.addWidget(self.tc_edit)
+        self.btn_set_in = QToolButton(); self.btn_set_in.setText("I"); self.btn_set_in.setToolTip("Set In (I)")
+        self.btn_set_out = QToolButton(); self.btn_set_out.setText("O"); self.btn_set_out.setToolTip("Set Out (O)")
+        self.btn_clear_io = QToolButton(); self.btn_clear_io.setText("Clear I/O"); self.btn_clear_io.setToolTip("Clear In/Out")
+        self.lbl_io = QLabel("—"); 
+        for w in [self.btn_set_in, self.btn_set_out, self.btn_clear_io, self.lbl_io]: tc_row.addWidget(w)
+        bot_v.addLayout(tc_row)
+        self.tc_edit.editingFinished.connect(self._jump_to_timecode)
+        try:
+            self.seek_slider.sliderPressed.connect(lambda: self.transport_request.emit("scrub:start"))
+            self.seek_slider.sliderReleased.connect(lambda: self.transport_request.emit("scrub:end"))
+        except Exception:
+            pass
+        self.btn_set_in.clicked.connect(self._set_in_here)
+        self.btn_set_out.clicked.connect(self._set_out_here)
+        self.btn_clear_io.clicked.connect(self._clear_in_out)
+
 
         # Add 'Start'/'End' buttons close together (kept from previous patch)
         self.btn_go_start = QToolButton(); self.btn_go_start.setObjectName("btn_go_start"); self.btn_go_start.setText("Start"); self.btn_go_start.setToolTip("Go to start (selection or timeline)")
@@ -982,12 +1390,19 @@ class EditorPane(QWidget):
         self.btn_go_start.clicked.connect(lambda: self._goto_edge('start'))
         self.btn_go_end.clicked.connect(lambda: self._goto_edge('end'))
         ctrl.setSpacing(6)
-        ctrl.addWidget(self.btn_go_start); ctrl.addWidget(self.btn_go_end)
-        # Move Glue/Grid/Ripple here, after Start/End
+        ctrl.addWidget(self.btn_to_start); ctrl.addWidget(self.btn_back); ctrl.addWidget(self.btn_play_pause); ctrl.addWidget(self.btn_stop); ctrl.addWidget(self.btn_forward); ctrl.addWidget(self.btn_to_end)
+        # wire transport buttons to internal player
         try:
-            ctrl.addWidget(self.btn_glue)
+            self.btn_play_pause.clicked.connect(self._tr_toggle)
+            self.btn_stop.clicked.connect(self._tr_stop)
+            self.btn_to_start.clicked.connect(self._tr_start)
+            self.btn_to_end.clicked.connect(self._tr_end)
+            self.btn_back.clicked.connect(lambda: self._tr_step(-1000))
+            self.btn_forward.clicked.connect(lambda: self._tr_step(+1000))
+            QTimer.singleShot(0, self._hook_player_signals)
         except Exception:
             pass
+        # Move Glue/Grid/Ripple here, after Start/End
         ctrl.addStretch(1); bot_v.addLayout(ctrl)
 
         # ruler + tracks (align ruler zero after header column)
@@ -996,14 +1411,53 @@ class EditorPane(QWidget):
         left_spacer = QWidget(); left_spacer.setFixedWidth(int(self.header_col_w))
         vdiv_r = QFrame(); vdiv_r.setFrameShape(QFrame.VLine); vdiv_r.setFrameShadow(QFrame.Sunken)
         rh.addWidget(left_spacer); rh.addWidget(vdiv_r); rh.addWidget(self.ruler, 1)
+        # keep ruler start pinned to header width
+        self._ruler_left_spacer = left_spacer
+        def _sync_ruler_header_width():
+            try:
+                self._ruler_left_spacer.setFixedWidth(int(self.header_col_w))
+            except Exception:
+                pass
+        self._sync_ruler_header_width = _sync_ruler_header_width
         bot_v.addWidget(ruler_row)
         self.ruler.positionPicked.connect(self._set_playhead_from_ruler)
+        self.ruler.set_fps(int(self.project.fps))
+        self.ruler.set_in_out(self.in_ms, self.out_ms)
+        self.ruler.set_markers(self.markers)
 
         self.tracks_area = QScrollArea(); self.tracks_area.setWidgetResizable(True); self.tracks_area.setHorizontalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+        try:
+            self.tracks_area.setWidgetResizable(False)
+            self.tracks_area.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOn)
+        except Exception:
+            pass
         holder = QWidget(); self.tracks_holder = holder
         self.tracks_layout = QVBoxLayout(holder); self.tracks_layout.setContentsMargins(0,0,0,0); self.tracks_layout.setSpacing(6)
         holder.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.MinimumExpanding)
         self.tracks_area.setWidget(holder); bot_v.addWidget(self.tracks_area, 1)
+        # External horizontal scrollbar under the timelines
+        try: self.tracks_area.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        except Exception: pass
+        self.hbar = QScrollBar(Qt.Horizontal)
+        bot_v.addWidget(self.hbar)
+        try:
+            self.tracks_area.horizontalScrollBar().valueChanged.connect(self._on_hscroll_changed)
+            try:
+                sb = self.tracks_area.horizontalScrollBar()
+                sb.rangeChanged.connect(lambda *_: self._sync_hbar_from_inner())
+                sb.valueChanged.connect(lambda v: self._sync_hbar_from_inner())
+                self.hbar.valueChanged.connect(lambda v: self._sync_inner_from_hbar(v))
+            except Exception:
+                pass
+            try:
+                sb = self.tracks_area.horizontalScrollBar()
+                sb.rangeChanged.connect(lambda *_: self._sync_hbar_from_inner())
+                sb.valueChanged.connect(lambda v: self._sync_hbar_from_inner())
+                self.hbar.valueChanged.connect(lambda v: self._sync_inner_from_hbar(v))
+            except Exception:
+                pass
+        except Exception:
+            pass
         self.vsplit.addWidget(bottom)
         # default sizes
         try:
@@ -1025,7 +1479,16 @@ class EditorPane(QWidget):
         sc("Ctrl+Z", self._undo); sc("Ctrl+Y", self._redo); sc("+", lambda: self._set_zoom(self.zoom*1.25)); sc("-", lambda: self._set_zoom(self.zoom/1.25))
         sc("Space", lambda: self.transport_request.emit("toggle"))
         sc("Ctrl+F", self._zoom_to_fit); sc("Z", self._zoom_to_selection)
-        sc("M", self._add_marker_here); sc(".", self._goto_next_marker); sc(",", self._goto_prev_marker)
+        sc("M", self._add_marker_here);
+        sc("J", lambda: self._shuttle("J"))
+        sc("K", lambda: self._shuttle("K"))
+        sc("L", lambda: self._shuttle("L"))
+        sc("I", self._set_in_here)
+        sc("O", self._set_out_here)
+        sc("Ctrl+Shift+X", lambda: self._remove_range(ripple=True))  # Extract
+        sc("Ctrl+L", lambda: self._remove_range(ripple=False))      # Lift
+        sc("T", self._trim_to_range)
+        sc(".", self._goto_next_marker); sc(",", self._goto_prev_marker)
         sc("Ctrl+G", self._group_selection); sc("Ctrl+Shift+G", self._ungroup_selection)
 
     # autosave
@@ -1033,27 +1496,36 @@ class EditorPane(QWidget):
         self._autosave_path = Path.cwd()/"presets"/"setsave"/"editor_temp.json"
         self._autosave_path.parent.mkdir(parents=True, exist_ok=True)
         self._dirty=False; self._last_change_ts=0.0; self._last_save_ts=0.0
-        self._autosave_timer = QTimer(self); self._autosave_timer.setInterval(60_000); self._autosave_timer.timeout.connect(self._autosave_tick); self._autosave_timer.start()
+        self._autosave_timer = QTimer(self); self._autosave_timer.timeout.connect(self._autosave_tick); self._autosave_timer.start()
 
     # project ops
     def _new_project(self):
-        self.project = Project(); self.project.tracks=[Track("Timeline 1","any"), Track("Timeline 2","any"), Track("Timeline 3","any")]
+        self.project = Project(); self.project.tracks=[
+            Track("Video","video"),
+            Track("Video","video"),
+            Track("Text","text"),
+            Track("Audio","audio")
+        ]
         self._undo_stack.clear(); self._redo_stack.clear(); self._refresh_ui(); self._mark_dirty()
 
     def _load_project(self):
         fn,_=QFileDialog.getOpenFileName(self,"Load Project",str(Path.cwd()/ "output"),"FrameVision Edit (*.fvedit)")
         if not fn: return
         try:
-            self.project = Project.from_json(json.loads(Path(fn).read_text(encoding="utf-8"))); self._undo_stack.clear(); self._redo_stack.clear(); self._refresh_ui(); self._mark_dirty()
-        except Exception as e: QMessageBox.critical(self,"Error",f"Failed to load: {e}")
+            self.project = Project.from_json(json.loads(Path(fn).read_text(encoding="utf-8")))
+            self._undo_stack.clear(); self._redo_stack.clear(); self._refresh_ui(); self._mark_dirty()
+        except Exception as e: 
+            QMessageBox.critical(self,"Error",f"Failed to load: {e}")
 
     def _save_project(self):
         fn,_=QFileDialog.getSaveFileName(self,"Save Project",str(Path.cwd()/ "output"/"project.fvedit"),"FrameVision Edit (*.fvedit)")
         if not fn: return
         try:
-            Path(fn).parent.mkdir(parents=True, exist_ok=True); Path(fn).write_text(json.dumps(self.project.to_json(), indent=2), encoding="utf-8")
+            Path(fn).parent.mkdir(parents=True, exist_ok=True)
+            Path(fn).write_text(json.dumps(self.project.to_json(), indent=2), encoding="utf-8")
             QMessageBox.information(self,"Saved",f"Saved: {fn}")
-        except Exception as e: QMessageBox.critical(self,"Error",f"Failed to save: {e}")
+        except Exception as e:
+            QMessageBox.critical(self,"Error",f"Failed to save: {e}")
 
     # media importing & thumbs
     def _import_media(self):
@@ -1075,7 +1547,7 @@ class EditorPane(QWidget):
     def _probe(self, path: Path) -> Dict[str,Any]:
         meta={"duration":None,"width":None,"height":None,"fps":None}
         try:
-            out = subprocess.check_output([ffprobe_path(),"-v","error","-select_streams","v:0","-show_entries","stream=width,height,avg_frame_rate","-show_entries","format=duration","-of","default=noprint_wrappers=1:nokey=1",str(path)], stderr=subprocess.STDOUT, universal_newlines=True)
+            out = subprocess.check_output([ffprobe_path(), "-v","error","-select_streams","v:0","-show_entries","stream=width,height,avg_frame_rate","-show_entries","format=duration","-of","default=noprint_wrappers=1:nokey=1", str(path)], stderr=subprocess.STDOUT, universal_newlines=True)
             ls=[x.strip() for x in out.splitlines() if x.strip()]
             for x in ls:
                 if meta["width"] is None and x.isdigit(): meta["width"]=int(x); continue
@@ -1167,18 +1639,100 @@ class EditorPane(QWidget):
     def _update_time_range(self):
         total = self.compute_project_duration(self.project); self.ruler.set_duration(total); self.ruler.set_markers(self.markers); self.seek_slider.setRange(0,int(total)); self._update_holder_width()
 
+    
+    def _on_hscroll_changed(self, value: int):
+        # Sync ruler offset to scroll
+        try:
+            pxs = getattr(self, "_px_per_s", lambda: 100.0)()
+            offset_x = max(0, int(value) - int(getattr(self, "header_col_w", 0)))
+            ms = int(max(0, (offset_x / max(1.0, pxs)) * 1000.0))
+            self.ruler.set_offset(ms)
+        except Exception:
+            pass
+
+
+    def _sync_hbar_from_inner(self):
+        try:
+            sb = self.tracks_area.horizontalScrollBar()
+            if getattr(self, "_hbar_syncing", False): return
+            self._hbar_syncing = True
+            try:
+                vpw = max(1, self.tracks_area.viewport().width())
+                # Mirror inner scroll range
+                self.hbar.setRange(sb.minimum(), sb.maximum())
+                self.hbar.setPageStep(sb.pageStep() or vpw)
+                self.hbar.setSingleStep(max(20, vpw//10))
+                self.hbar.setValue(sb.value())
+            finally:
+                self._hbar_syncing = False
+        except Exception:
+            pass
+
+    def _sync_inner_from_hbar(self, v: int):
+        try:
+            if getattr(self, "_hbar_syncing", False): return
+            self._hbar_syncing = True
+            try: self.tracks_area.horizontalScrollBar().setValue(int(v))
+            finally: self._hbar_syncing = False
+        except Exception:
+            pass
+
+    def _ensure_playhead_visible(self, margin_px: int = 80, center: bool = False):
+        try:
+            sb = self.tracks_area.horizontalScrollBar()
+            vpw = max(1, self.tracks_area.viewport().width())
+            pxs = getattr(self, "_px_per_s", lambda: 100.0)()
+            ms = int(self.seek_slider.value())
+            x = int((ms/1000.0) * pxs)
+            target_x = int(getattr(self, "header_col_w", 0) + x)
+            left = sb.value()
+            right = left + vpw
+            if center:
+                sb.setValue(max(0, target_x - vpw//2)); return
+            if target_x < left + margin_px:
+                sb.setValue(max(0, target_x - margin_px))
+            elif target_x > right - margin_px:
+                sb.setValue(max(0, target_x - vpw + margin_px))
+        except Exception:
+            pass
     def _set_zoom(self, z):
-        self.zoom = max(0.1, min(20.0, float(z))); pxs=self._px_per_s(); self.ruler.set_scale(pxs)
-        for row in self.tracks_holder.findChildren(TrackRow):
-            row.set_scale(pxs)
-        self._update_holder_width(); self.zoom_slider.blockSignals(True); self.zoom_slider.setValue(int(self.zoom*100)); self.zoom_slider.blockSignals(False)
+        floor = self._min_zoom_fit(1.10)
+        self.zoom = max(floor, min(50.0, float(z)))
+        pxs=self._px_per_s()
+        try: self.ruler.set_scale(pxs)
+        except Exception: pass
+        try:
+            for row in self.tracks_holder.findChildren(TrackRow):
+                row.set_scale(pxs)
+        except Exception: pass
+        self._update_holder_width(); self.zoom_slider.blockSignals(True); self.zoom_slider.setValue(int(self.zoom*10000)); self.zoom_slider.blockSignals(False)
+        try: self.zoom_slider.setMinimum(int(max(1, floor*10000)))
+        except Exception: pass
 
     def _px_per_s(self) -> float: return 100.0 * self.zoom
+
+    def _min_zoom_fit(self, extra: float = 1.10) -> float:
+        try:
+            total_ms = int(self.compute_project_duration(self.project))
+            total_s = max(0.001, total_ms/1000.0)
+            vieww = max(1, self.tracks_area.viewport().width() - 120)
+            pxs_fit = max(0.001, vieww / total_s)
+            pxs_min = pxs_fit / max(1.01, float(extra))
+            return max(1e-6, pxs_min/100.0)
+        except Exception:
+            return 1e-6
+
 
     def _update_holder_width(self):
         total_ms = self.compute_project_duration(self.project); need = int(self.header_col_w) + int((total_ms/1000.0)*self._px_per_s()) + 120
         if getattr(self,'tracks_holder',None) is not None: self.tracks_holder.setMinimumWidth(need)
+        try: self._sync_hbar_from_inner()
+        except Exception: pass
 
+        try:
+            f = self._min_zoom_fit(1.10)
+            if self.zoom < f: self._set_zoom(f)
+        except Exception: pass
     def _seek_changed(self, pos_ms: int):
         self.preview_media.emit(None, int(pos_ms)); self.transport_request.emit(f"seek:{int(pos_ms)}")
         try:
@@ -1186,6 +1740,13 @@ class EditorPane(QWidget):
             for row in self.tracks_holder.findChildren(TrackRow):
                 row.update()
         except Exception: pass
+        try:
+            self.tc_edit.setText(self._format_tc(int(pos_ms)))
+        except Exception: pass
+            # auto-follow
+        try: self._ensure_playhead_visible()
+        except Exception: pass
+
     def _goto_edge(self, which: str):
         """Jump playhead to start/end of selection if any, else timeline."""
         # Determine selection bounds
@@ -1277,10 +1838,192 @@ class EditorPane(QWidget):
         tgt=None
         for tr in self.project.tracks:
             if tr.type=="audio": tgt=tr; break
-        if tgt is None: tgt=Track("Audio","audio"); self.project.tracks.append(tgt)
-        tgt.clips.append(Clip(media_id=clip.media_id, start_ms=clip.start_ms, duration_ms=clip.duration_ms))
-        self._refresh_tracks(); self._update_time_range(); self._mark_dirty()
 
+    # ======= Internal media player wiring =======
+    def _get_internal_player(self):
+        """Try to find the app's main QMediaPlayer (video/audio) instance."""
+        p = getattr(self, "_ext_player", None)
+        try:
+            if p and hasattr(p, "play") and hasattr(p, "position"):
+                return p
+        except Exception:
+            pass
+        try_objs = []
+        try:
+            w = self.window()
+            if w: try_objs.append(w)
+        except Exception:
+            w = None
+        candidates = []
+        for obj in [self, w, getattr(self, "parent", lambda: None)()]:
+            if obj: candidates += [obj, getattr(obj, "player", None), getattr(obj, "video", None),
+                                   getattr(obj, "media_player", None), getattr(obj, "preview", None)]
+        try_objs.extend([c for c in candidates if c])
+        for obj in list(dict.fromkeys(try_objs)):
+            try:
+                if hasattr(obj, "play") and hasattr(obj, "position") and hasattr(obj, "setPosition"):
+                    self._ext_player = obj
+                    return obj
+                pl = getattr(obj, "player", None)
+                if pl and hasattr(pl, "play") and hasattr(pl, "position"):
+                    self._ext_player = pl
+                    return pl
+            except Exception:
+                pass
+        try:
+            from PySide6.QtCore import QObject
+            queue = []
+            if w and isinstance(w, QObject):
+                queue = [w]
+            seen = set()
+            while queue:
+                cur = queue.pop(0)
+                if id(cur) in seen:
+                    continue
+                seen.add(id(cur))
+                try:
+                    for cand in [cur, getattr(cur, "player", None), getattr(cur, "media_player", None)]:
+                        if cand and hasattr(cand, "play") and hasattr(cand, "position") and hasattr(cand, "setPosition"):
+                            self._ext_player = cand
+                            return cand
+                    for ch in cur.children():
+                        queue.append(ch)
+                except Exception:
+                    pass
+        except Exception:
+            pass
+        return None
+
+    def _refresh_play_icon(self):
+        try:
+            st = self.style()
+            p = self._get_internal_player()
+            if p and hasattr(p, "playbackState"):
+                state = int(getattr(p, "playbackState")())
+                if state == 1:
+                    self.btn_play_pause.setIcon(st.standardIcon(QStyle.SP_MediaPause))
+                else:
+                    self.btn_play_pause.setIcon(st.standardIcon(QStyle.SP_MediaPlay))
+            else:
+                self.btn_play_pause.setIcon(st.standardIcon(QStyle.SP_MediaPlay))
+        except Exception:
+            pass
+
+    def _hook_player_signals(self):
+        p = self._get_internal_player()
+        if not p:
+            return
+        try:
+            if hasattr(p, "playbackStateChanged"):
+                p.playbackStateChanged.connect(lambda _s: self._refresh_play_icon());
+                getattr(p, 'positionChanged', lambda *_: None).connect(self._on_ext_pos)
+        except Exception:
+            pass
+        self._refresh_play_icon()
+
+    def _tr_toggle(self):
+        """Play/Pause timeline from the ruler. Guarantees playback via internal player or background."""
+        started_ext = False
+        started_bg = False
+        p = self._get_internal_player()
+        # If either player is currently playing, pause both (toggle behavior)
+        try:
+            if p and hasattr(p, "playbackState") and int(p.playbackState()) == 1:
+                p.pause()
+                try: self.transport_request.emit("pause")
+                except Exception: pass
+                try:
+                    if getattr(self, "_bg_player", None): self._bg_player.pause()
+                except Exception:
+                    pass
+                self._refresh_play_icon()
+                return
+        except Exception:
+            pass
+        # Try internal player first
+        try:
+            cw = getattr(self, '_clipwidget_under_playhead', lambda: None)()
+            if p and self._ensure_ext_player_for_clip(cw):
+                p.play(); started_ext = True
+                try: self.transport_request.emit("play")
+                except Exception: pass
+        except Exception:
+            pass
+        # If internal failed, ensure background playback
+        if not started_ext:
+            try:
+                started_bg = self._play_timeline_under_ruler_background()
+                if not started_bg and cw:
+                    self._play_clip_from_ruler(cw); started_bg = True
+            except Exception:
+                pass
+        # If both started, prefer internal and stop background to avoid double audio
+        if started_ext and getattr(self, "_bg_player", None):
+            try: self._bg_player.stop()
+            except Exception: pass
+        self._refresh_play_icon()
+
+    def _tr_stop(self):
+        p = self._get_internal_player()
+        if p is not None:
+            try:
+                p.stop()
+            except Exception:
+                pass
+        try:
+            if getattr(self, "_bg_player", None):
+                self._bg_player.stop()
+        except Exception:
+            pass
+        self._ext_playing_clip = None
+        try: self.transport_request.emit("stop")
+        except Exception: pass
+        try: self._refresh_play_icon()
+        except Exception: pass
+    def _tr_seek(self, ms: int):
+        try:
+            ms = max(0, int(ms))
+        except Exception:
+            ms = 0
+        try:
+            self.seek_slider.blockSignals(True)
+            self.seek_slider.setValue(ms)
+            self.seek_slider.blockSignals(False)
+        except Exception:
+            pass
+        try: self.ruler.set_playhead(int(ms))
+        except Exception: pass
+        try:
+            for row in self.tracks_holder.findChildren(TrackRow):
+                row.update()
+        except Exception: pass
+        try: self._ensure_playhead_visible()
+        except Exception: pass
+        try:
+            if hasattr(self, "_ext_playing_clip") and self._ext_playing_clip:
+                p = self._get_internal_player()
+                if p:
+                    rel = int(ms) - int(getattr(self._ext_playing_clip, "start_ms", 0))
+                    if rel >= 0:
+                        p.setPosition(int(rel))
+        except Exception:
+            pass
+    def _tr_start(self):
+        self._tr_seek(0)
+
+    def _tr_end(self):
+        try:
+            total_ms = int(self.compute_project_duration(self.project))
+        except Exception:
+            total_ms = 0
+        if total_ms > 0:
+            self._tr_seek(max(0, total_ms - 1))
+    def _tr_step(self, delta_ms: int = 1000):
+        try:
+            pos = int(self.seek_slider.value())
+        except Exception:
+            pos = 0
+        self._tr_seek(max(0, pos + int(delta_ms)))
     def _clip_remove_from_timeline(self, track: Track, clip: Clip):
         try: self._push_undo(); track.clips.remove(clip); self._refresh_tracks(); self._update_time_range(); self._mark_dirty()
         except Exception: pass
@@ -1403,7 +2146,7 @@ class EditorPane(QWidget):
         if dlg.exec()!=QDialog.Accepted: return
         opts=dlg.values(); self.project.width=opts["width"]; self.project.height=opts["height"]; self.project.fps=opts["fps"]
         out=Path(opts["output"]); out.parent.mkdir(parents=True, exist_ok=True)
-        QMessageBox.information(self,"Export","(Stub) Export graph wiring will go here.")
+        QMessageBox.information(self,"Export",f"(Stub) Export graph wiring will go here. Range: " + ("IN-OUT" if (self.in_ms is not None and self.out_ms is not None and self.out_ms>self.in_ms) else "ALL"))
 
     # snapping
     def _toggle_grid(self, on): self.grid_enabled = bool(on); self._update_time_range()
@@ -1411,7 +2154,7 @@ class EditorPane(QWidget):
     def _snap_ms(self, ms: int) -> int:
         if not self.glue_enabled and not self.grid_enabled: return int(ms)
         px_tol=float(self.snap_px_tol); tol=int(round((px_tol / max(1e-3, self._px_per_s())) * 1000.0))
-        cands=[0, int(self.seek_slider.value())]
+        cands=[0, int(self.seek_slider.value())] + [int(m) for m in getattr(self,'markers',[])]
         for tr in self.project.tracks:
             for c in tr.clips:
                 cands.extend([int(c.start_ms), int(c.start_ms + max(1,c.duration_ms))])
@@ -1489,6 +2232,204 @@ class EditorPane(QWidget):
 
 
     
+
+    # --- background playback ---
+    def _play_clip_from_ruler(self, clipw):
+        """Play a clip using the background player starting from the current ruler position."""
+        if not HAS_QTMULTI: return
+        try:
+            from PySide6.QtCore import QUrl
+            media = clipw.media
+            if media.kind not in ("audio","video"):
+                return
+            # source
+            self._bg_player.setSource(QUrl.fromLocalFile(str(media.path)))
+            self._playing_clip = clipw
+            # compute relative start from global playhead
+            g = int(self.seek_slider.value())
+            rel = max(0, g - int(clipw.clip.start_ms))
+            # cap within clip duration
+            rel = min(rel, max(0, int(clipw.clip.duration_ms)-1))
+            try: self._bg_player.setPosition(int(rel))
+            except Exception: pass
+            try: self._bg_player.play()
+            except Exception: pass
+            self._is_playing = True
+        except Exception:
+            pass
+
+    def _on_bg_pos(self, ms):
+        """Sync playhead/ruler to background player position and clamp to clip end."""
+        try:
+            if not self._is_playing or not self._playing_clip: return
+            clip = self._playing_clip.clip
+            # Stop at end of clip
+            if int(ms) >= int(clip.duration_ms):
+                try: self._bg_player.pause()
+                except Exception: pass
+                self._is_playing = False
+                ms = int(clip.duration_ms) - 1
+            g = int(clip.start_ms) + int(ms)
+            # update seek slider without feedback loops
+            self.seek_slider.blockSignals(True)
+            self.seek_slider.setValue(int(g))
+            self.seek_slider.blockSignals(False)
+            # update ruler + rows
+            try: self.ruler.set_playhead(int(g))
+            except Exception: pass
+            try:
+                for row in self.tracks_holder.findChildren(TrackRow):
+                    row.update()
+            except Exception: pass
+            try: self._ensure_playhead_visible()
+            except Exception: pass
+        except Exception:
+            pass
+
+
+    def _ensure_ext_player_for_clip(self, clipw=None):
+        """Prepare the internal player to play the clip under the ruler and seek appropriately."""
+        try:
+            from PySide6.QtCore import QUrl
+        except Exception:
+            QUrl = None
+        p = self._get_internal_player()
+        if not p:
+            return False
+        clip = clipw.clip if hasattr(clipw, "clip") else clipw
+        if clip is None:
+            clip = self._clip_under_playhead()
+            if clip is None:
+                return False
+        try:
+            media_id = getattr(clip, "media_id", "")
+            media = self.project.media.get(media_id, None)
+        except Exception:
+            media = None
+        if not media or not hasattr(media, "path"):
+            return False
+        url = None
+        try:
+            if QUrl is not None:
+                url = QUrl.fromLocalFile(str(media.path))
+        except Exception:
+            url = None
+        try:
+            if hasattr(p, "setSource") and url is not None:
+                p.setSource(url)
+            elif hasattr(p, "setMedia"):
+                try:
+                    from PySide6.QtMultimedia import QMediaContent
+                    p.setMedia(QMediaContent(url))
+                except Exception:
+                    p.setMedia(url)
+        except Exception:
+            pass
+        try:
+            g = int(self.seek_slider.value())
+        except Exception:
+            g = 0
+        rel = max(0, g - int(getattr(clip, "start_ms", 0)))
+        try:
+            dur = int(getattr(clip, "duration_ms", 0))
+            rel = min(rel, max(0, dur-1))
+        except Exception:
+            pass
+        try: p.setPosition(int(rel))
+        except Exception: pass
+        self._ext_playing_clip = clip
+        try:
+            self.preview_media.emit(media, int(g))
+        except Exception:
+            pass
+        try:
+            if hasattr(p, "positionChanged"):
+                p.positionChanged.connect(self._on_ext_pos)
+        except Exception:
+            pass
+        return True
+
+    def _on_ext_pos(self, ms):
+        """Sync timeline UI to internal player position while previewing a clip."""
+        try:
+            clip = getattr(self, "_ext_playing_clip", None)
+            if clip is None:
+                return
+            p = self._get_internal_player()
+            if not p:
+                return
+            dur = int(getattr(clip, "duration_ms", 0))
+            rel = int(ms)
+            if dur and rel >= dur:
+                try: p.pause()
+                except Exception: pass
+                rel = max(0, dur-1)
+            g = int(getattr(clip, "start_ms", 0)) + int(rel)
+            self.seek_slider.blockSignals(True); self.seek_slider.setValue(int(g)); self.seek_slider.blockSignals(False)
+            try: self.ruler.set_playhead(int(g))
+            except Exception: pass
+            try:
+                for row in self.tracks_holder.findChildren(TrackRow):
+                    row.update()
+            except Exception: pass
+            try: self._ensure_playhead_visible()
+            except Exception: pass
+        except Exception:
+            pass
+
+    def _set_global_time(self, ms: int):
+        """Set global playhead and, if a clip is active, keep player in sync."""
+        try:
+            ms = max(0, int(ms))
+            self.seek_slider.blockSignals(True)
+            self.seek_slider.setValue(ms)
+            self.seek_slider.blockSignals(False)
+            if self._playing_clip and self._bg_player:
+                rel = ms - int(self._playing_clip.clip.start_ms)
+                if 0 <= rel < int(self._playing_clip.clip.duration_ms):
+                    if abs(int(self._bg_player.position()) - int(rel)) > 60:
+                        try: self._bg_player.setPosition(int(rel))
+                        except Exception: pass
+                    if not self._is_playing:
+                        try: self._bg_player.play()
+                        except Exception: pass
+                        self._is_playing = True
+                else:
+                    try: self._bg_player.pause()
+                    except Exception: pass
+                    self._is_playing = False
+            try: self._ensure_playhead_visible()
+            except Exception: pass
+        except Exception:
+            pass
+
+    def _on_transport(self, cmd: str):
+        """Minimal transport handling for background player."""
+        try:
+            if cmd.startswith("seek:"):
+                self._set_global_time(int(cmd.split(":")[1]))
+                return
+            if cmd == "toggle":
+                if not self._bg_player: return
+                if self._is_playing:
+                    try: self._bg_player.pause()
+                    except Exception: pass
+                    self._is_playing = False
+                else:
+                    if self._playing_clip:
+                        try: self._bg_player.play()
+                        except Exception: pass
+                        self._is_playing = True
+                return
+            if cmd == "pause":
+                if self._bg_player:
+                    try: self._bg_player.pause()
+                    except Exception: pass
+                    self._is_playing = False
+                return
+        except Exception:
+            pass
+
     def _apply_styles(self):
         # Theme-aware greys so buttons look good on dark and light themes
         pal = self.palette()
@@ -1611,7 +2552,153 @@ class EditorPane(QWidget):
             ev.accept(); return
         super().keyPressEvent(ev)
 
-    # ---- markers ----
+    
+    # ---- timecode helpers ----
+    def _format_tc(self, ms: int) -> str:
+        fps = max(1, int(self.project.fps))
+        total = max(0, int(ms))
+        sec = total // 1000
+        hh = sec // 3600
+        mm = (sec % 3600) // 60
+        ss = sec % 60
+        ff = int(round(((total % 1000) / 1000.0) * fps)) % fps
+        return f"{hh:02d}:{mm:02d}:{ss:02d}:{ff:02d}"
+
+    def _parse_tc(self, s: str) -> Optional[int]:
+        try:
+            parts = s.strip().split(":")
+            if len(parts) != 4: return None
+            hh,mm,ss,ff = [int(x) for x in parts]
+            fps = max(1, int(self.project.fps))
+            total_ms = ((hh*3600 + mm*60 + ss) * 1000) + int(round((ff / float(fps)) * 1000.0))
+            return max(0, total_ms)
+        except Exception:
+            return None
+
+    def _jump_to_timecode(self):
+        ms = self._parse_tc(self.tc_edit.text())
+        if ms is None: return
+        self._set_playhead_from_ruler(int(ms))
+
+    # ---- in/out range ----
+    def _set_in_here(self):
+        self.in_ms = int(self.seek_slider.value()); self._update_io_ui()
+
+    def _set_out_here(self):
+        self.out_ms = int(self.seek_slider.value()); self._update_io_ui()
+
+    def _clear_in_out(self):
+        self.in_ms = None; self.out_ms = None; self._update_io_ui()
+
+    def _update_io_ui(self):
+        # normalize order
+        if self.in_ms is not None and self.out_ms is not None and self.out_ms < self.in_ms:
+            self.in_ms, self.out_ms = self.out_ms, self.in_ms
+        try:
+            if hasattr(self, "lbl_io"):
+                if self.in_ms is not None or self.out_ms is not None:
+                    t_in = self._format_tc(self.in_ms or 0)
+                    t_out = self._format_tc(self.out_ms or 0)
+                    self.lbl_io.setText(f"[{t_in} ➜ {t_out}]")
+                else:
+                    self.lbl_io.setText("—")
+        except Exception: pass
+        try:
+            self.ruler.set_in_out(self.in_ms, self.out_ms)
+            self.ruler.set_fps(self.project.fps)
+        except Exception: pass
+
+    def _remove_range(self, ripple: bool):
+        if self.in_ms is None or self.out_ms is None: return
+        a, b = int(self.in_ms), int(self.out_ms)
+        if b <= a: return
+        self._push_undo()
+        delta = b - a
+        for tr in self.project.tracks:
+            new_clips = []
+            for c in tr.clips:
+                s = int(c.start_ms); e = int(c.start_ms + max(1, c.duration_ms))
+                if e <= a:
+                    new_clips.append(c)
+                elif s >= b:
+                    # after range
+                    if ripple: c.start_ms -= delta
+                    new_clips.append(c)
+                else:
+                    # overlaps
+                    if s < a and e > b:
+                        # split into two; keep both
+                        left = Clip(media_id=c.media_id, start_ms=s, duration_ms=max(1, a - s),
+                                    speed=c.speed, rotation_deg=c.rotation_deg, muted=c.muted,
+                                    fade_in_ms=c.fade_in_ms, fade_out_ms=0, opacity=c.opacity, gain_db=c.gain_db, group_id=c.group_id)
+                        right = Clip(media_id=c.media_id, start_ms=b, duration_ms=max(1, e - b),
+                                     speed=c.speed, rotation_deg=c.rotation_deg, muted=c.muted,
+                                     fade_in_ms=0, fade_out_ms=c.fade_out_ms, opacity=c.opacity, gain_db=c.gain_db, group_id=c.group_id)
+                        if ripple: right.start_ms -= delta
+                        new_clips.append(left); new_clips.append(right)
+                    elif s < a < e <= b:
+                        # keep left side only
+                        c.duration_ms = max(1, a - s)
+                        new_clips.append(c)
+                    elif a <= s < b < e:
+                        # keep right side only
+                        c.start_ms = b
+                        if ripple: c.start_ms -= delta
+                        c.duration_ms = max(1, e - b)
+                        new_clips.append(c)
+                    else:
+                        # fully inside: drop
+                        pass
+            tr.clips = sorted(new_clips, key=lambda x: x.start_ms)
+        self._refresh_tracks(); self._update_time_range(); self._mark_dirty()
+
+    def _trim_to_range(self):
+        if self.in_ms is None or self.out_ms is None: return
+        a, b = int(self.in_ms), int(self.out_ms)
+        if b <= a: return
+        self._push_undo()
+        targets = self._selection[:] if self._selection else None
+        for tr in self.project.tracks:
+            new_clips = []
+            for c in tr.clips:
+                if targets is not None and c not in targets:
+                    new_clips.append(c); continue
+                s = int(c.start_ms); e = int(c.start_ms + max(1,c.duration_ms))
+                # intersection
+                ns = max(s, a); ne = min(e, b)
+                if ne <= ns:
+                    # no overlap => drop (if targeting all, remove; if selection-only and no overlap, keep?)
+                    if targets is None:
+                        pass
+                    else:
+                        new_clips.append(c)
+                    continue
+                c.start_ms = ns; c.duration_ms = max(1, ne - ns)
+                new_clips.append(c)
+            tr.clips = sorted(new_clips, key=lambda x: x.start_ms)
+        self._refresh_tracks(); self._update_time_range(); self._mark_dirty()
+
+    # ---- shuttle (J K L) ----
+    def _shuttle(self, key: str):
+        rates = [1,2,4,8]
+        if key == "K":
+            self._shuttle_rate = 0
+            self.transport_request.emit("pause")
+            return
+        if key in ("J","L"):
+            sign = -1 if key == "J" else 1
+            if self._shuttle_rate == 0 or (self._shuttle_rate * sign) < 0:
+                self._shuttle_rate = sign * rates[0]
+            else:
+                # increase magnitude
+                mag = abs(self._shuttle_rate)
+                try:
+                    idx = rates.index(mag); idx = min(idx+1, len(rates)-1)
+                except ValueError:
+                    idx = 0
+                self._shuttle_rate = sign * rates[idx]
+            self.transport_request.emit(f"rate:{self._shuttle_rate}")
+# ---- markers ----
     def _add_marker_here(self):
         ms = int(self.seek_slider.value())
         self.markers.append(ms); self.markers = sorted(set(self.markers)); self._update_time_range(); self._mark_dirty()
@@ -1647,6 +2734,27 @@ class EditorPane(QWidget):
         self._set_zoom(pxs/100.0)
 
     def _zoom_to_selection(self):
+        target = self._selected or (self._selection[0] if self._selection else None)
+        if not target: return
+        dur = max(1, getattr(target, "duration_ms", 0) or 1)
+        vieww = max(1, self.tracks_area.viewport().width()-120)
+        pxs = max(20.0, vieww / max(0.001, dur/1000.0))
+        self._set_zoom(pxs/100.0)
+
+
+    def _zoom_fit_all(self):
+        """Zoom out to fit the entire project into the visible viewport."""
+        try:
+            total_ms = int(self.compute_project_duration(self.project))
+            total_s = max(0.001, total_ms/1000.0)
+            vieww = max(1, self.tracks_area.viewport().width() - 120)
+            pxs = max(0.001, vieww / total_s)
+            self._set_zoom(pxs/100.0)
+            try: self._ensure_playhead_visible(center=True)
+            except Exception: pass
+        except Exception:
+            pass
+
         target = self._selected or (self._selection[0] if self._selection else None)
         if not target: return
         dur = max(1, target.duration_ms)
