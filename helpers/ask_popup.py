@@ -569,6 +569,9 @@ class AskPopup(QDialog):
         self.btn_send.clicked.connect(self._on_send)
         self.btn_screenshot.clicked.connect(self._on_screenshot)
 
+        # Start with a friendly intro from Framie
+        self._append("Assistant", "Hi! I\'m Framie — your FrameVision assistant. How can I help?")
+
     def _append(self, who: str, text: str = ""):
         text = self._sanitize_text(text)
         if who: self.transcript.appendPlainText(f"{who}: {text}")
