@@ -7,6 +7,7 @@ import subprocess
 import json, tempfile, time
 from pathlib import Path
 from typing import List, Tuple, Optional
+from collections import OrderedDict
 from helpers.mediainfo import refresh_info_now
 
 from PySide6 import QtCore, QtWidgets
@@ -251,6 +252,9 @@ class UpscPane(QtWidgets.QWidget):
         self._realsr_models = scan_realsr_models()
         self._waifu_models = scan_waifu2x_models()
         self._last_outfile: Optional[Path] = None
+        # LRU cache for thumbnails (path+size+radius)
+        self._pm_cache = OrderedDict()
+        self._pm_cache_cap = 128
         self._build_ui()
 
     def set_main(self, main):  # optional hook
@@ -395,9 +399,9 @@ class UpscPane(QtWidgets.QWidget):
         self.sld_recent_size.setMaximum(120)
         self.sld_recent_size.setSingleStep(4)
         self.sld_recent_size.setPageStep(8)
-        self.sld_recent_size.setValue(96)
+        self.sld_recent_size.setValue(75)
         size_row.addWidget(self.sld_recent_size, 1)
-        self.lbl_recent_size = QtWidgets.QLabel("96 px", self)
+        self.lbl_recent_size = QtWidgets.QLabel("75 px", self)
         size_row.addWidget(self.lbl_recent_size)
         rec_wrap.addLayout(size_row)
 
@@ -406,6 +410,13 @@ class UpscPane(QtWidgets.QWidget):
         self.recents_scroll.setWidgetResizable(True)
         self.recents_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
         self.recents_scroll.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+
+        
+        try:
+            # Fix '1-per-row' by triggering rebuilds on width changes
+            self.recents_scroll.viewport().installEventFilter(self)
+        except Exception:
+            pass
 
         self._recents_inner = QtWidgets.QWidget(self)
         self._recents_row = QtWidgets.QGridLayout(self._recents_inner)  # wrapped grid
@@ -419,7 +430,13 @@ class UpscPane(QtWidgets.QWidget):
         except Exception:
             _rw = QtWidgets.QWidget(); _rw.setLayout(rec_wrap); self.recents_box.addWidget(_rw)
         v.addWidget(rec_box)
-        # start recents poller
+        
+        try:
+            QTimer.singleShot(0, self._rebuild_recents)
+        except Exception:
+            pass
+
+# start recents poller
         try:
             self._install_recents_poller()
         except Exception:
@@ -618,6 +635,26 @@ class UpscPane(QtWidgets.QWidget):
             return (ROOT / "presets" / "setsave" / "upsc_settings.json")
         except Exception:
             return Path("presets/setsave/upsc_settings.json").resolve()
+    def eventFilter(self, obj, ev):
+        try:
+            from PySide6.QtCore import QEvent
+            if hasattr(self, "recents_scroll") and obj is self.recents_scroll.viewport():
+                if ev.type() == QEvent.Resize:
+                    w = ev.size().width()
+                    if w != getattr(self, "_recents_last_w", 0):
+                        self._recents_last_w = w
+                        try:
+                            self._rebuild_recents()
+                        except Exception:
+                            pass
+        except Exception:
+            pass
+        try:
+            return super().eventFilter(obj, ev)
+        except Exception:
+            return False
+
+
 
     def _connect_auto_save(self):
         """Connect change signals to auto-save, safely and individually, so a missing widget won't break others."""
@@ -924,7 +961,7 @@ class UpscPane(QtWidgets.QWidget):
                 pp = _P(p)
                 if pp.exists():
                     recs.append(pp)
-            self._recents = recs[:10]
+            self._recents = recs[:15]
             self._rebuild_recents()
         except Exception:
             pass
@@ -1213,7 +1250,7 @@ class UpscPane(QtWidgets.QWidget):
                 return []
             items = [p for p in d.iterdir() if p.suffix.lower()==".json" and p.is_file()]
             items.sort(key=lambda p: p.stat().st_mtime, reverse=True)
-            return items[:7]
+            return items[:15]
         except Exception:
             return []
 
@@ -1326,6 +1363,52 @@ class UpscPane(QtWidgets.QWidget):
         except Exception:
             return None
 
+
+    def _load_pixmap_cached(self, path: "Path", size: int, rounded: bool = False, radius: int | None = None):
+        """Load and scale a QPixmap with LRU(128) caching; optionally return a rounded pixmap."""
+        try:
+            key = f"{str(path)}|{int(size)}|r{int(radius) if (rounded and radius is not None) else 0}"
+            if hasattr(self, "_pm_cache") and key in self._pm_cache:
+                pm = self._pm_cache.pop(key)
+                self._pm_cache[key] = pm  # refresh LRU
+                return pm
+            from PySide6.QtGui import QPixmap, QPainter, QPainterPath
+            from PySide6.QtCore import QRectF, Qt
+            pm = QPixmap(str(path))
+            if pm and not pm.isNull():
+                pm2 = pm.scaled(int(size), int(size), Qt.KeepAspectRatio, Qt.SmoothTransformation)
+                if rounded:
+                    try:
+                        R = int(radius) if radius is not None else max(6, int(size*0.18))
+                        out = QPixmap(int(size), int(size))
+                        out.fill(Qt.transparent)
+                        painter = QPainter(out)
+                        painter.setRenderHint(QPainter.Antialiasing, True)
+                        x = max(0, (int(size) - pm2.width()) // 2)
+                        y = max(0, (int(size) - pm2.height()) // 2)
+                        path = QPainterPath()
+                        path.addRoundedRect(QRectF(x, y, pm2.width(), pm2.height()), R, R)
+                        painter.setClipPath(path)
+                        painter.drawPixmap(x, y, pm2)
+                        painter.end()
+                        pm2 = out
+                    except Exception:
+                        pass
+                try:
+                    self._pm_cache[key] = pm2
+                    while len(self._pm_cache) > getattr(self, "_pm_cache_cap", 128):
+                        self._pm_cache.popitem(last=False)
+                except Exception:
+                    pass
+                return pm2
+        except Exception:
+            pass
+        try:
+            from PySide6.QtGui import QPixmap as _QPM
+            return _QPM()
+        except Exception:
+            return None
+
     def _install_recents_poller(self):
         # Lightweight: poll jobs/done timestamps every second and rebuild only on change
         try:
@@ -1391,8 +1474,19 @@ class UpscPane(QtWidgets.QWidget):
                 btn.setText(Path(media).name)
                 btn.setCursor(Qt.PointingHandCursor)
                 btn.setAutoRaise(True)
+                try:
+                    btn.setStyleSheet("QToolButton{border:1px solid rgba(255,255,255,0.12);border-radius:12px;padding:6px 6px 10px 6px;background:rgba(255,255,255,0.03);}QToolButton:hover{background:rgba(255,255,255,0.06);}")
+                except Exception:
+                    pass
                 if tp:
-                    btn.setIcon(QIcon(str(tp)))
+                    try:
+                        pm = self._load_pixmap_cached(tp, size, rounded=True, radius=12)
+                        if pm:
+                            btn.setIcon(QIcon(pm))
+                        else:
+                            btn.setIcon(QIcon(str(tp)))
+                    except Exception:
+                        btn.setIcon(QIcon(str(tp)))
                 btn.setIconSize(QSize(size, size))
                 btn.setFixedSize(int(size*1.25), int(size*1.25)+28)
 
@@ -1410,9 +1504,17 @@ class UpscPane(QtWidgets.QWidget):
                     vpw = self.recents_scroll.viewport().width()
                 except Exception:
                     vpw = self._recents_inner.width()
+                try:
+                    if not vpw or vpw <= 1:
+                        vpw = max(self.recents_scroll.width(), self.width(), 600)
+                except Exception:
+                    vpw = 600
                 spacing = getattr(layout, "spacing", lambda: 8)()
                 item_w = int(size*1.25)
-                cols = max(1, int((vpw + spacing) // (item_w + spacing)))
+                if vpw <= item_w + spacing and len(jobs) > 1:
+                    cols = min(len(jobs), 4)
+                else:
+                    cols = max(1, int((vpw + spacing) // (item_w + spacing)))
                 idx = getattr(self, "_recents_idx", 0)
                 row = idx // cols
                 col = idx % cols
