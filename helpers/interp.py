@@ -5,8 +5,9 @@ import os, json, datetime, shutil, zipfile, time, re
 from pathlib import Path
 from pathlib import Path as _P_INT
 
+from collections import OrderedDict
 from PySide6.QtCore import Qt, QSettings, QTimer, QUrl, QProcess, QCoreApplication, QThread, QSize
-from PySide6.QtGui import QDesktopServices, QPixmap
+from PySide6.QtGui import QDesktopServices, QPixmap, QPainter, QPainterPath, QPen, QColor
 from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton, QSlider,
     QCheckBox, QMessageBox, QFileDialog, QComboBox, QSizePolicy, QScrollArea, QFrame
@@ -231,6 +232,10 @@ class InterpPane(QWidget):
         self._ffmpeg_timer = QTimer(self); self._ffmpeg_timer.setInterval(400); self._ffmpeg_timer.timeout.connect(self._poll_ffmpeg_progress)
         self._ffmpeg_progress_file = None
 
+
+        # Thumbnail cache (LRU)
+        self._thumb_cache = OrderedDict()
+        self._thumb_cache_cap = 128
         # live progress sampling
         self._progress_timer = QTimer(self); self._progress_timer.setInterval(300); self._progress_timer.timeout.connect(self._update_time_left)
         self._progress_started_at = None
@@ -262,7 +267,7 @@ class InterpPane(QWidget):
         scroll = QScrollArea(); scroll.setWidgetResizable(True); scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff); scroll.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
         scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
         scroll.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
-        outer.addWidget(scroll)
+        outer.addWidget(scroll, 1)
         content = QWidget(); scroll.setWidget(content)
         root = QVBoxLayout(content); root.setContentsMargins(0,0,0,0); root.setSpacing(4)
 
@@ -370,13 +375,18 @@ class InterpPane(QWidget):
         self.recent_area.setWidget(self.recent_container)
         rlay.addWidget(self.recent_area)
 
-# ---- Buttons (2 rows) ----
+# ---- Buttons (sticky footer) ----
         btns = QVBoxLayout(); btns.setSpacing(6)
         r2 = QHBoxLayout(); r2.setSpacing(8)
         self.btn_start = QPushButton("Add to Queue") 
         self.btn_batch = QPushButton("Add Batch"); self.btn_open_folder = QPushButton("Open RIFE folder")
-        r2.addWidget(self.btn_start); r2.addWidget(self.btn_batch); r2.addWidget(self.btn_open_folder); r2.addStretch(1); btns.addLayout(r2)
-        root.addLayout(btns)
+        r2.addWidget(self.btn_start); r2.addWidget(self.btn_batch); r2.addWidget(self.btn_open_folder); r2.addStretch(1)
+        btns.addLayout(r2)
+        footer = QWidget(); footer.setObjectName("stickyFooter"); footer.setLayout(btns)
+        footer.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+        footer.setStyleSheet("#stickyFooter{border-top:1px solid rgba(0,0,0,40); padding:8px 0 4px 0;}")
+        outer.addWidget(footer)
+
 
         # tooltips
         self.slider.setToolTip("FPS multiplier (0.15×–4.00×). ≥1.0× raises FPS. <1.0× makes slow motion.")
@@ -1049,6 +1059,66 @@ class InterpPane(QWidget):
         except Exception:
             pass
         return False
+    # ---- thumbnail helpers (rounded + LRU cache) ----
+    def _thumb_cache_get(self, key: str):
+        try:
+            pm = self._thumb_cache.pop(key)
+            self._thumb_cache[key] = pm
+            return pm
+        except Exception:
+            return None
+
+    def _thumb_cache_put(self, key: str, pm):
+        try:
+            if key in self._thumb_cache:
+                self._thumb_cache.pop(key)
+            self._thumb_cache[key] = pm
+            while len(self._thumb_cache) > self._thumb_cache_cap:
+                self._thumb_cache.popitem(last=False)
+        except Exception:
+            pass
+
+    def _rounded_with_border(self, pm, size, radius: int = 8, border_width: int = 1):
+        if pm.isNull():
+            return pm
+        # Scale first to target within aspect, with smoothing
+        scaled = pm.scaled(size, Qt.KeepAspectRatio, Qt.SmoothTransformation)
+        w, h = int(scaled.width()), int(scaled.height())
+        out = QPixmap(w, h)
+        out.fill(Qt.transparent)
+        painter = QPainter(out)
+        painter.setRenderHints(QPainter.Antialiasing | QPainter.SmoothPixmapTransform, True)
+        path = QPainterPath()
+        # Inset by 0.5 to keep the 1px stroke crisp
+        path.addRoundedRect(0.5, 0.5, w - 1.0, h - 1.0, float(radius), float(radius))
+        painter.setClipPath(path)
+        painter.drawPixmap(0, 0, scaled)
+        # Light 1px border
+        pen = QPen(QColor(0, 0, 0, 40))
+        pen.setWidth(max(1, int(border_width)))
+        painter.setPen(pen)
+        painter.setBrush(Qt.NoBrush)
+        painter.drawPath(path)
+        painter.end()
+        return out
+
+    def _get_thumb_pixmap(self, thumb_path, size):
+        try:
+            mtime = thumb_path.stat().st_mtime_ns if thumb_path.exists() else 0
+            key = f"{thumb_path}|{mtime}|{size.width()}x{size.height()}"
+        except Exception:
+            key = f"{thumb_path}|{size.width()}x{size.height()}"
+        pm = self._thumb_cache_get(key)
+        if pm is not None and not pm.isNull():
+            return pm
+        raw = QPixmap(str(thumb_path)) if thumb_path.exists() else QPixmap()
+        if raw.isNull():
+            # still cache the miss to avoid repeated disk hits
+            self._thumb_cache_put(key, raw)
+            return raw
+        rounded = self._rounded_with_border(raw, size, radius=8, border_width=1)
+        self._thumb_cache_put(key, rounded)
+        return rounded
 
     # ---- recent gallery ----
     def _refresh_recent(self):
@@ -1059,19 +1129,22 @@ class InterpPane(QWidget):
             if w: w.deleteLater()
 
         out_dir = _outputs_dir(self.ROOT)
-        vids = sorted(out_dir.glob("*_interp_*.mp4"), key=lambda p: p.stat().st_mtime, reverse=True)[:7]
+        vids = sorted(out_dir.glob("*_interp_*.mp4"), key=lambda p: p.stat().st_mtime, reverse=True)[:15]
         thumbs_dir = self.ROOT / "logs" / "rife" / "thumbs"
         for v in vids:
             thumb = thumbs_dir / (v.stem + ".jpg")
             if not thumb.exists():
                 _extract_first_frame(v, thumb)
-            pm = QPixmap(str(thumb)) if thumb.exists() else QPixmap()
             lbl = QLabel()
-            if not pm.isNull():
-                pm2 = pm.scaled(QSize(160, 90), Qt.KeepAspectRatio, Qt.SmoothTransformation)
-                lbl.setPixmap(pm2)
+            if thumb.exists():
+                pm_final = self._get_thumb_pixmap(thumb, QSize(160, 90))
+                if not pm_final.isNull():
+                    lbl.setPixmap(pm_final)
+                else:
+                    lbl.setText(v.stem)
             else:
                 lbl.setText(v.stem)
+            lbl.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Fixed)
             lbl.setToolTip(v.name)
             lbl.setCursor(Qt.PointingHandCursor)
             lbl.mousePressEvent = (lambda p=v: (lambda evt: (self._open_in_player(p) or QDesktopServices.openUrl(QUrl.fromLocalFile(str(p))))))()
