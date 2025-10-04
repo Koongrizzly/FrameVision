@@ -1381,6 +1381,7 @@ class EditorPane(QWidget):
         self.btn_to_start = QToolButton(); self.btn_to_start.setObjectName("btn_to_start")
         self.btn_back = QToolButton(); self.btn_back.setObjectName("btn_back")
         self.btn_play_pause = QToolButton(); self.btn_play_pause.setObjectName("btn_play_pause")
+        self.btn_pause = QToolButton(); self.btn_pause.setObjectName("btn_pause")
         self.btn_stop = QToolButton(); self.btn_stop.setObjectName("btn_stop")
         self.btn_forward = QToolButton(); self.btn_forward.setObjectName("btn_forward")
         self.btn_to_end = QToolButton(); self.btn_to_end.setObjectName("btn_to_end")
@@ -1389,6 +1390,7 @@ class EditorPane(QWidget):
             self.btn_to_start.setIcon(st.standardIcon(QStyle.SP_MediaSkipBackward))
             self.btn_back.setIcon(st.standardIcon(QStyle.SP_MediaSeekBackward))
             self.btn_play_pause.setIcon(st.standardIcon(QStyle.SP_MediaPlay))
+            self.btn_pause.setIcon(st.standardIcon(QStyle.SP_MediaPause))
             self.btn_stop.setIcon(st.standardIcon(QStyle.SP_MediaStop))
             self.btn_forward.setIcon(st.standardIcon(QStyle.SP_MediaSeekForward))
             self.btn_to_end.setIcon(st.standardIcon(QStyle.SP_MediaSkipForward))
@@ -1398,6 +1400,7 @@ class EditorPane(QWidget):
         self.btn_to_start.setToolTip("Go to start")
         self.btn_back.setToolTip("Step backward")
         self.btn_play_pause.setToolTip("Play/Pause")
+        self.btn_pause.setToolTip("Pause")
         self.btn_stop.setToolTip("Stop")
         self.btn_forward.setToolTip("Step forward")
         self.btn_to_end.setToolTip("Go to end")
@@ -1450,10 +1453,11 @@ class EditorPane(QWidget):
         self.btn_go_start.clicked.connect(lambda: self._goto_edge('start'))
         self.btn_go_end.clicked.connect(lambda: self._goto_edge('end'))
         ctrl.setSpacing(6)
-        ctrl.addWidget(self.btn_to_start); ctrl.addWidget(self.btn_back); ctrl.addWidget(self.btn_play_pause); ctrl.addWidget(self.btn_stop); ctrl.addWidget(self.btn_forward); ctrl.addWidget(self.btn_to_end)
+        ctrl.addWidget(self.btn_to_start); ctrl.addWidget(self.btn_back); ctrl.addWidget(self.btn_play_pause); ctrl.addWidget(self.btn_pause); ctrl.addWidget(self.btn_stop); ctrl.addWidget(self.btn_forward); ctrl.addWidget(self.btn_to_end)
         # wire transport buttons to internal player
         try:
             self.btn_play_pause.clicked.connect(self._tr_toggle)
+            self.btn_pause.clicked.connect(self._tr_pause)
             self.btn_stop.clicked.connect(self._tr_stop)
             self.btn_to_start.clicked.connect(self._tr_start)
             self.btn_to_end.clicked.connect(self._tr_end)
@@ -2137,6 +2141,39 @@ class EditorPane(QWidget):
             try: self._bg_player.stop()
             except Exception: pass
         self._refresh_play_icon()
+    def _tr_pause(self):
+        """Pause playback without moving the playhead."""
+        try:
+            p = self._get_internal_player()
+        except Exception:
+            p = None
+        # Pause internal player
+        try:
+            if p is not None and hasattr(p, "pause"):
+                p.pause()
+        except Exception:
+            pass
+        # Pause background player (if it was driving audio)
+        try:
+            if getattr(self, "_bg_player", None):
+                self._bg_player.pause()
+        except Exception:
+            pass
+        # Stop any "gap" playback timers
+        try:
+            self._stop_gap_playback()
+        except Exception:
+            pass
+        # Update UI state and notify listeners
+        try:
+            self.transport_request.emit("pause")
+        except Exception:
+            pass
+        try:
+            self._refresh_play_icon()
+        except Exception:
+            pass
+
 
     def _tr_stop(self):
         p = self._get_internal_player()

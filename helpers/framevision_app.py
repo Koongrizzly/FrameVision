@@ -2326,11 +2326,21 @@ class QueuePane(QWidget):
         except Exception:
             pass
 
-        # Add or refresh rows (preserve order by newest first)
-        for _ts, p in sorted(files, key=lambda t_p: t_p[0], reverse=True):
+        
+        # Add or refresh rows (preserve order by newest first) — and **reposition** to keep newest on top live.
+        for idx, (_ts, p) in enumerate(sorted(files, key=lambda t_p: t_p[0], reverse=True)):
             try:
                 from PySide6.QtCore import QUrl, Qt
-                found = False; found_item = None
+            except Exception:
+                pass
+
+            found = False
+            found_item = None
+            found_widget = None
+            found_row = None
+
+            # Locate existing row for this path (if any)
+            try:
                 for _i in range(widget.count()):
                     _it = widget.item(_i)
                     _key = _it.data(Qt.UserRole)
@@ -2338,17 +2348,38 @@ class QueuePane(QWidget):
                         _w = widget.itemWidget(_it)
                         _key = getattr(_w, 'path', None) if _w is not None else None
                     if str(_key) == str(p):
-                        found = True; found_item = _it; break
-                if found:
-                    _w = widget.itemWidget(found_item)
-                    try:
-                        if hasattr(_w, 'refresh'):
-                            _w.refresh()
-                    except Exception:
-                        pass
-                    continue
+                        found = True
+                        found_item = _it
+                        found_widget = widget.itemWidget(_it)
+                        found_row = _i
+                        break
             except Exception:
-                pass
+                found = False
+
+            if found:
+                # Refresh existing row's contents
+                try:
+                    if hasattr(found_widget, 'refresh'):
+                        found_widget.refresh()
+                except Exception:
+                    pass
+                # Reposition item if order changed
+                try:
+                    if found_row is not None and found_row != idx:
+                        it_take = widget.takeItem(found_row)
+                        # Reinsert at the correct index and reattach the widget
+                        widget.insertItem(idx, it_take)
+                        if found_widget is not None:
+                            widget.setItemWidget(it_take, found_widget)
+                        try:
+                            it_take.setData(Qt.UserRole, str(p))
+                        except Exception:
+                            pass
+                except Exception:
+                    pass
+                continue
+
+            # If not found, create a new row and insert at the correct position
             it = QListWidgetItem("")
             w = JobRowWidget(str(p), status)
             try:
@@ -2359,15 +2390,18 @@ class QueuePane(QWidget):
                 it.setSizeHint(hint)
             except Exception:
                 it.setSizeHint(w.sizeHint())
-            widget.addItem(it)
+            try:
+                widget.insertItem(idx, it)
+            except Exception:
+                widget.addItem(it)  # fallback
             widget.setItemWidget(it, w)
             try:
                 from PySide6.QtCore import QUrl, Qt
                 it.setData(Qt.UserRole, str(p))
             except Exception:
                 pass
-    def request_refresh(self):
 
+    def request_refresh(self):
         try:
 
             # Debounce/coalesce refresh calls
