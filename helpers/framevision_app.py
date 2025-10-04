@@ -850,7 +850,7 @@ class VideoPane(QWidget):
             pass
         bar.addWidget(self.btn_upscale)
         # --- Ask button (opens chat popup) ---  # ASK_INSERTED
-        self.btn_ask = QPushButton("Ask")
+        self.btn_ask = QPushButton("Ask Framie")
         self.btn_ask.setObjectName("btn_ask_chat")
         self.btn_ask.setStyleSheet(
             "QPushButton#btn_ask_chat { padding:4px 14px; background:#f59e0b; color:black; border-radius:8px; font-weight:600; }"
