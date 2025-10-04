@@ -158,13 +158,15 @@ start.bat
 ---
 
 ### 🖌️ TXT → IMG (SD15+SDXL)
-- no cloud required.
+- no cloud requiredn full offline once app is installed
+- **queue don't work properly yet so don't use more then 10 umages in batch yet**
 - Prompt & negative prompt support with quick style presets.
 - Seed policies: Fixed / Random / Increment.
 - Mutiple presets
 - Lora support
 - Multi model selector
   Comes with juggernaut XL + model selector
+  
 
 ---
 
@@ -205,12 +207,11 @@ start.bat
 ---
 
 ### 📋 Queue
-  - Reorder jobs
-  - ETA tracking / time done / time added /time finished
+  - ETA tracking / time done / time added / time finished
   - open/delete finished jobs, open folder of finished job
+  - thumbnails for pending/running.finished jobs
   - auto play last result toggle
   - remove jobs from queue
-  - remove non working jobs
   - move running jobs to failed
   - move running job back to pending
   - live 'led' shows status of the queue
