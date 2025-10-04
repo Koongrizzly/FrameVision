@@ -7,6 +7,7 @@ from helpers.meme_tool import MemeToolPane
 from helpers.trim_tool import install_trim_tool
 from helpers.audiotool import install_audio_tool
 from helpers.prompt import install_prompt_tool
+from helpers.background import install_background_tool
 
 from helpers.renam import RenamPane
 
@@ -282,6 +283,8 @@ class InstantToolsPane(QWidget):
 
         # Sections
         sec_speed = CollapsibleSection("Speed", expanded=False)
+        
+        sec_bg = CollapsibleSection("Background / Object Removal", expanded=False)
         sec_resize = CollapsibleSection("Resize", expanded=False)
         sec_gif = CollapsibleSection("Export GIF", expanded=False)
         sec_extract = CollapsibleSection("Extract frames", expanded=False)
@@ -489,6 +492,13 @@ class InstantToolsPane(QWidget):
         sec_gif.setContentLayout(lay_gif)
         # Audio (moved to helpers/audiotool.py)
         sec_audio = CollapsibleSection("Audio", expanded=False)
+        # Background / Object Removal (helpers/background.py)
+        try:
+            install_background_tool(self, sec_bg)
+        except Exception:
+            pass
+
+
         try:
             install_audio_tool(self, sec_audio)
         except Exception:
@@ -546,7 +556,7 @@ class InstantToolsPane(QWidget):
         btn_sc.clicked.connect(lambda: self._save_preset_crop())
         btn_lc.clicked.connect(lambda: self._load_preset_crop())
 
-        for sec in (sec_meme, sec_prompt, sec_audio, sec_speed, sec_resize, sec_gif, sec_extract, sec_trim, sec_crop, sec_quality, sec_img, sec_rename):
+        for sec in (sec_meme, sec_prompt, sec_audio, sec_speed, sec_bg, sec_resize, sec_gif, sec_extract, sec_trim, sec_crop, sec_quality, sec_img, sec_rename):
             root.addWidget(sec)
         root.addStretch(1)
         # --- Remember settings (per-tool + global) ---
@@ -554,6 +564,7 @@ class InstantToolsPane(QWidget):
             return {
                 "Audio": sec_audio,
                 "Speed": sec_speed,
+                "Background / Object Removal": sec_bg,
                 "Resize": sec_resize,
                 "Export GIF": sec_gif,
                 "Extract frames": sec_extract,
