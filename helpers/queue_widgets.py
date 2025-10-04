@@ -3,9 +3,11 @@ from __future__ import annotations
 import json
 from pathlib import Path
 from typing import Optional, Any, Union
+import subprocess
+from functools import lru_cache
 
 from PySide6.QtCore import QUrl, Qt, QTimer, Signal, QEvent
-from PySide6.QtGui import QDesktopServices, QAction, QFont, QIcon
+from PySide6.QtGui import QAction, QColor, QDesktopServices, QFont, QIcon, QPainter, QPainterPath, QPen, QPixmap
 from PySide6.QtWidgets import (
     QWidget, QLabel, QToolButton, QProgressBar,
     QHBoxLayout, QVBoxLayout, QSizePolicy, QMenu, QStyle, QFrame
@@ -15,6 +17,101 @@ ETA_FUDGE_SEC = 3  # small cushion for cleanup (temp deletion, final writes)
 
 
 
+
+
+# ---- Thumbnail helpers (video preview, rounded pixmaps, cache) --------------
+VIDEO_EXTS = {'.mp4','.mov','.avi','.mkv','.webm','.m4v','.mpg','.mpeg'}
+
+def _bin_dir() -> Path:
+    try:
+        return Path.cwd() / "presets" / "bin"
+    except Exception:
+        return Path("presets") / "bin"
+
+def _ffmpeg_candidates() -> list[Path]:
+    names = ["ffmpeg.exe","ffmpeg","mmpeg.exe","mmpeg"]
+    out = []
+    b = _bin_dir()
+    try:
+        for n in names:
+            p = b / n
+            if p.exists() and p.is_file():
+                out.append(p)
+    except Exception:
+        pass
+    return out
+
+def _rounded_with_border(pm: QPixmap, radius: int = 8) -> QPixmap:
+    try:
+        if pm.isNull():
+            return pm
+        w, h = pm.width(), pm.height()
+        out = QPixmap(w, h)
+        out.fill(Qt.transparent)
+        from PySide6.QtGui import QPainterPath
+        from PySide6.QtCore import QRectF
+        p = QPainter(out)
+        p.setRenderHint(QPainter.Antialiasing, True)
+        p.setRenderHint(QPainter.SmoothPixmapTransform, True)
+        path = QPainterPath()
+        rect = QRectF(0.5, 0.5, w-1.0, h-1.0)
+        path.addRoundedRect(rect, radius, radius)
+        p.setClipPath(path)
+        p.drawPixmap(0, 0, pm)
+        pen = QPen(QColor(0,0,0,40))
+        pen.setWidthF(1.0)
+        p.setPen(pen)
+        p.setBrush(Qt.NoBrush)
+        p.drawRoundedRect(rect, radius, radius)
+        p.end()
+        return out
+    except Exception:
+        return pm
+
+@lru_cache(maxsize=128)
+def _cached_scaled_rounded_pixmap(path_str: str, w: int, h: int, mtime_key: float, radius: int = 8) -> QPixmap:
+    try:
+        pm = QPixmap(path_str)
+        if pm.isNull():
+            return QPixmap()
+        pm = pm.scaled(w, h, Qt.KeepAspectRatio, Qt.SmoothTransformation)
+        return _rounded_with_border(pm, radius)
+    except Exception:
+        return QPixmap()
+
+def _ensure_video_preview(video_path: Path, thumbs_dir: Path, scale_width: int = 256, suffix: str = "_preview") -> Path | None:
+    try:
+        thumbs_dir.mkdir(parents=True, exist_ok=True)
+    except Exception:
+        pass
+    try:
+        out_png = thumbs_dir / f"{video_path.stem}{suffix}.png"
+        # Up-to-date?
+        try:
+            if out_png.exists() and out_png.stat().st_mtime >= video_path.stat().st_mtime:
+                return out_png
+        except Exception:
+            pass
+        # Find ffmpeg-like binary in presets/bin
+        ffmpegs = _ffmpeg_candidates()
+        if not ffmpegs:
+            return out_png if out_png.exists() else None
+        exe = str(ffmpegs[0])
+        cmd = [
+            exe, "-y", "-hide_banner", "-loglevel", "error",
+            "-i", str(video_path),
+            "-frames:v", "1",
+            "-vf", f"thumbnail,scale={scale_width}:-1",
+            str(out_png)
+        ]
+        try:
+            import subprocess as _sp
+            _sp.run(cmd, check=False, stdout=_sp.DEVNULL, stderr=_sp.DEVNULL, timeout=15)
+        except Exception:
+            pass
+        return out_png if out_png.exists() else None
+    except Exception:
+        return None
 
 # ---- Queue Autoplay (Play last result) --------------------------------------
 from PySide6.QtCore import QObject, QTimer
@@ -235,6 +332,13 @@ class JobRowWidget(QWidget):
         self.status_strip.setFixedWidth(6)
         self.status_strip.setFrameShape(QFrame.NoFrame)
 
+        # --- Thumbnail (left) ---
+        self.thumb = QLabel()
+        self.thumb.setFixedSize(48, 48)
+        self.thumb.setScaledContents(True)
+        self._set_thumbnail()
+
+
         # --- Title (bold/monospace) ---
         self.title = QLabel(self._title_text())
         self.title.setTextInteractionFlags(Qt.TextSelectableByMouse)
@@ -302,6 +406,7 @@ class JobRowWidget(QWidget):
         top.setContentsMargins(0, 0, 0, 0)
         top.setSpacing(8)
         top.addWidget(self.status_strip, 0)
+        top.addWidget(self.thumb, 0)
         top.addLayout(text_col, 1)
         top.addLayout(actions, 0)
 
@@ -366,6 +471,7 @@ class JobRowWidget(QWidget):
         self._update_progressbar()
         self._update_button_visibility()
         self._apply_status_style()
+        self._set_thumbnail()
 
     # ---------- Context menu ----------
     def contextMenuEvent(self, event) -> None:
@@ -428,6 +534,156 @@ class JobRowWidget(QWidget):
             half = max_chars // 2
             return name[:half] + "..." + name[-(max_chars - half - 3):]
 
+    def _shorten_finished_display(self, name: str, limit: int = 16, space_before_ext: bool = True) -> str:
+        """
+        Finished-row name style: first `limit` chars of the stem, then '...' and the extension.
+        Example: 'a_very_long_photo_name.jpg' -> 'a_very_long_ph... .jpg'
+        """
+        try:
+            if not name:
+                return ""
+            p = Path(name)
+            stem, ext = p.stem, p.suffix or ""
+            if len(stem) <= limit:
+                return stem + ext
+            sep = " " if space_before_ext else ""
+            return f"{stem[:limit]}...{sep}{ext}"
+        except Exception:
+            # naive fallback
+            dot = name.rfind(".")
+            if dot > 0:
+                stem = name[:dot]; ext = name[dot:]
+            else:
+                stem, ext = name, ""
+            sep = " " if space_before_ext else ""
+            if len(stem) <= limit:
+                return stem + ext
+            return stem[:limit] + "..." + sep + ext
+
+
+    def _thumbs_dir(self) -> Path:
+        # Root: ./output/last results/queue
+        try:
+            return Path.cwd() / "output" / "last results" / "queue"
+        except Exception:
+            return Path("output") / "last results" / "queue"
+
+    def _find_thumbnail_for_job(self) -> Optional[Path]:
+        # Prefer explicit thumbnail path in job data if present
+        d = self.data or {}
+        args = d.get("args") or {}
+        thumb = d.get("thumbnail") or args.get("thumbnail")
+        if thumb:
+            p = Path(str(thumb)).expanduser()
+            if p.exists():
+                return p
+
+        # Derive from output stem
+        stem = None
+        try:
+            outp = self._resolve_output_file()
+            stem = outp.stem if outp else None
+        except Exception:
+            stem = None
+
+        td = self._thumbs_dir()
+        if not stem or not td.exists():
+            return None
+
+        try:
+            candidates = []
+            for ext in (".png", ".jpg", ".jpeg", ".webp"):
+                candidates.extend(td.glob(stem + "*" + ext))
+            if not candidates:
+                return None
+            # pick most recent
+            best = max(candidates, key=lambda p: p.stat().st_mtime)
+            return best
+        except Exception:
+            return None
+
+    
+    
+    def _set_thumbnail(self) -> None:
+        """
+        Running/Pending: show INPUT preview (video first frame via ffmpeg, else image) or any explicit thumbnail.
+        Done/Failed: show OUTPUT preview (video first frame via ffmpeg, else image) or explicit thumbnail.
+        All thumbnails are rounded (8px) with a subtle border and cached (LRU 128).
+        """
+        try:
+            w, h = self.thumb.width(), self.thumb.height()
+            status = (self._status_from_fs() or self.status).lower()
+
+            # 0) Try explicit/derived thumbnail first
+            try:
+                p = self._find_thumbnail_for_job()
+                if p and p.exists():
+                    mt = p.stat().st_mtime
+                    pm = _cached_scaled_rounded_pixmap(str(p), w, h, mt, 8)
+                    if not pm.isNull():
+                        self.thumb.setPixmap(pm)
+                        self.thumb.setToolTip(str(p))
+                        return
+            except Exception:
+                pass
+
+            def _show_from_path(path: Path, is_input: bool = False) -> bool:
+                try:
+                    if not path or not path.exists():
+                        return False
+                    suf = path.suffix.lower()
+                    # If video -> generate/get preview
+                    if suf in VIDEO_EXTS:
+                        thumbs = self._thumbs_dir()
+                        suffix = "_preview_input" if is_input else "_preview"
+                        prev = _ensure_video_preview(path, thumbs, 256, suffix)
+                        if prev and prev.exists():
+                            mt = prev.stat().st_mtime
+                            pm = _cached_scaled_rounded_pixmap(str(prev), w, h, mt, 8)
+                            if not pm.isNull():
+                                self.thumb.setPixmap(pm)
+                                self.thumb.setToolTip(str(prev))
+                                return True
+                        return False
+                    # If image -> show directly
+                    if suf in (".png",".jpg",".jpeg",".webp",".bmp",".gif",".tif",".tiff"):
+                        mt = path.stat().st_mtime
+                        pm = _cached_scaled_rounded_pixmap(str(path), w, h, mt, 8)
+                        if not pm.isNull():
+                            self.thumb.setPixmap(pm)
+                            self.thumb.setToolTip(str(path))
+                            return True
+                except Exception:
+                    return False
+                return False
+
+            if status in ("running","queued","pending"):
+                # Prefer INPUT while the job is not done
+                src = self._resolve_input_file()
+                if _show_from_path(src, is_input=True):
+                    return
+                # Fallback to whatever output we can guess (useful if a preview already exists)
+                outp = self._resolve_output_file()
+                if _show_from_path(outp):
+                    return
+            else:
+                # Done/failed -> prefer OUTPUT
+                outp = self._resolve_output_file()
+                if _show_from_path(outp):
+                    return
+                # fallback to input (maybe job produced no media)
+                src = self._resolve_input_file()
+                if _show_from_path(src, is_input=True):
+                    return
+
+            # Final fallback: clear
+            self.thumb.clear()
+        except Exception:
+            try:
+                self.thumb.clear()
+            except Exception:
+                pass
+
     def _title_text(self) -> str:
         d = self.data or {}
         status = (self._status_from_fs() or self.status).lower()
@@ -438,7 +694,7 @@ class JobRowWidget(QWidget):
                 outp = self._resolve_output_file()
             except Exception:
                 outp = None
-            out_name = self._shorten_basename(outp.name) if outp else None
+            out_name = self._shorten_finished_display(outp.name, 16, True) if outp else None
 
             args = d.get("args") or {}
             model = d.get("model") or d.get("model_name") or args.get("model") or args.get("ai_model")
@@ -715,6 +971,30 @@ class JobRowWidget(QWidget):
 
     
     
+    
+    def _resolve_input_file(self) -> Optional[Path]:
+        d = self.data or {}
+        args = d.get("args") or {}
+        try:
+            src = d.get("input") or args.get("infile") or args.get("input") or args.get("source") or d.get("source")
+            if src:
+                p = Path(str(src)).expanduser()
+                if p.exists() and p.is_file():
+                    return p
+        except Exception:
+            pass
+        # Try a few common alt keys
+        for k in ("file","path","src","media","input_path","in_path","source_path","filepath","filename"):
+            try:
+                v = (args.get(k) if isinstance(args, dict) else None) or d.get(k)
+                if v:
+                    p = Path(str(v)).expanduser()
+                    if p.exists() and p.is_file():
+                        return p
+            except Exception:
+                pass
+        return None
+
     def _resolve_output_file(self) -> Optional[Path]:
         d = self.data or {}
         args = d.get("args") or {}
