@@ -138,7 +138,7 @@ start.bat
 - One-click **frame interpolation** 
 - show last results preview pane
 - multiple versions and models (from v4 to UHD)
-- Slow-motion **0.15×–1.0×**, or smooth FPS boosts up to **4.0×**.(temporaly offline)
+- Slow-motion **0.15×–1.0×**, or smooth FPS boosts up to **4.0×**.
 - Supports both CPU and GPU,
 - With live progress bar and ETA
 
