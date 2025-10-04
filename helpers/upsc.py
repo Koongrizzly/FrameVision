@@ -404,14 +404,13 @@ class UpscPane(QtWidgets.QWidget):
         # Horizontal scroller with items in a row
         self.recents_scroll = QtWidgets.QScrollArea(self)
         self.recents_scroll.setWidgetResizable(True)
-        self.recents_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAsNeeded)
-        self.recents_scroll.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        self.recents_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        self.recents_scroll.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
 
         self._recents_inner = QtWidgets.QWidget(self)
-        self._recents_row = QtWidgets.QHBoxLayout(self._recents_inner)
+        self._recents_row = QtWidgets.QGridLayout(self._recents_inner)  # wrapped grid
         self._recents_row.setContentsMargins(0,0,0,0)
         self._recents_row.setSpacing(8)
-        self._recents_row.addStretch(0)  # keep tight packing
         self.recents_scroll.setWidget(self._recents_inner)
         rec_wrap.addWidget(self.recents_scroll)
 
@@ -522,6 +521,11 @@ class UpscPane(QtWidgets.QWidget):
         self.slider_scale.valueChanged.connect(self._sync_scale_from_slider)
         self.combo_engine.currentIndexChanged.connect(self._update_engine_ui)
         self._update_engine_ui()
+        try:
+            self.combo_model_realsr.currentTextChanged.connect(self._update_engine_ui)
+        except Exception:
+            pass
+
 
     
         try:
@@ -1107,7 +1111,7 @@ class UpscPane(QtWidgets.QWidget):
 
             for p in files:
                 # ensure tiny thumb exists
-                tp = self._thumb_for(p, size)
+                tp = self._thumb_for(p, 120)
                 btn = QtWidgets.QToolButton(self)
                 btn.setToolButtonStyle(Qt.ToolButtonTextUnderIcon)
                 btn.setText(p.name)
@@ -1132,6 +1136,15 @@ class UpscPane(QtWidgets.QWidget):
             # ensure the scroll area can expand vertically if needed
             try:
                 self._recents_inner.setMinimumHeight(int(size*1.25)+36)
+                try:
+                    vpw = self.recents_scroll.viewport().width()
+                except Exception:
+                    vpw = self._recents_inner.width()
+                spacing = getattr(layout, "spacing", lambda: 8)()
+                item_w = int(size*1.25)
+                cols = max(1, int((vpw + spacing) // (item_w + spacing)))
+                rows = max(1, (getattr(self, "_recents_idx", 0)+cols-1)//cols)
+                self._recents_inner.setMinimumHeight(rows * (int(size*1.25)+28) + 12)
             except Exception:
                 pass
 
@@ -1142,6 +1155,30 @@ class UpscPane(QtWidgets.QWidget):
                 pass
 
     def _update_engine_ui(self):
+        # Keep model stack in sync with engine
+        self.stk_models.setCurrentIndex(0 if self.combo_engine.currentIndex() == 0 else 1)
+        # Auto-guide scale to the model's native when using Real-ESRGAN
+        try:
+            eng = (self.combo_engine.currentText() or '').lower()
+        except Exception:
+            eng = ''
+        if ('realesrgan' in eng) or ('real-esrgan' in eng):
+            try:
+                model = self.combo_model_realsr.currentText()
+                t = (model or '').lower()
+                native = 4 if ('-x4' in t or 'x4' in t) else (3 if ('-x3' in t or 'x3' in t) else (2 if ('-x2' in t or 'x2' in t) else 2))
+                self.spin_scale.blockSignals(True); self.spin_scale.setValue(float(native)); self.spin_scale.blockSignals(False)
+                self.slider_scale.blockSignals(True); self.slider_scale.setValue(int(native*10)); self.slider_scale.blockSignals(False)
+                for name, want in (('rad_x2', 2), ('rad_x3', 3), ('rad_x4', 4)):
+                    try:
+                        w = getattr(self, name, None)
+                        if w is not None:
+                            w.blockSignals(True); w.setChecked(native == want); w.blockSignals(False)
+                    except Exception:
+                        pass
+            except Exception:
+                pass
+
         self.stk_models.setCurrentIndex(0 if self.combo_engine.currentIndex() == 0 else 1)
 
     def _sync_scale_from_spin(self, v: float):
@@ -1211,6 +1248,22 @@ class UpscPane(QtWidgets.QWidget):
                     p = _as_path(v)
                     if p and p.exists() and p.is_file():
                         return p, j
+
+        # ## PATCH derive expected media from input/factor/format
+        try:
+            args = (j.get("args") or {})
+            inp = (j.get("input") or args.get("input") or "").strip()
+            fac = int(args.get("factor") or 0)
+            fmt = (args.get("format") or "png").lower()
+            out_dir_val = j.get("out_dir") or args.get("out_dir")
+            from pathlib import Path as _P
+            if inp and fac and out_dir_val:
+                cand = _P(str(out_dir_val)).expanduser() / f"{_P(inp).stem}_x{fac}.{fmt}"
+                if cand.exists() and cand.is_file():
+                    return cand, j
+        except Exception:
+            pass
+
         # Fallback: scan out_dir for newest media
         media_exts = {'.mp4','.mov','.mkv','.avi','.webm','.gif','.png','.jpg','.jpeg','.bmp','.tif','.tiff'}
         out_dir = _as_path(j.get("out_dir") or (j.get("args") or {}).get("out_dir"))
@@ -1226,7 +1279,9 @@ class UpscPane(QtWidgets.QWidget):
 
     def _thumb_path_for_job(self, job_json: Path, media_path: Path, max_side: int) -> Path:
         d = self._recents_dir(); d.mkdir(parents=True, exist_ok=True)
-        name = f"{media_path.stem}.__thumb.jpg"
+        # ## PATCH unique thumb per job
+
+        name = f"{job_json.stem}__{media_path.stem}.__thumb.jpg"
         return d / name
 
     def _thumb_from_media(self, media_path: Path, target_jpg: Path, max_side: int) -> None:
@@ -1307,6 +1362,7 @@ class UpscPane(QtWidgets.QWidget):
             layout = getattr(self, "_recents_row", None)
             if layout is None:
                 return
+            self._recents_idx = 0
             while layout.count():
                 item = layout.takeAt(0)
                 w = item.widget()
@@ -1328,7 +1384,7 @@ class UpscPane(QtWidgets.QWidget):
                 media, j = self._resolve_output_from_job(jpath)
                 if not (media and media.exists() and media.is_file()):
                     continue
-                tp = self._ensure_recent_thumb(jpath, media, size)
+                tp = self._ensure_recent_thumb(jpath, media, 120)
 
                 btn = QtWidgets.QToolButton(self)
                 btn.setToolButtonStyle(Qt.ToolButtonTextUnderIcon)
@@ -1349,7 +1405,19 @@ class UpscPane(QtWidgets.QWidget):
                             _open_file(self, path)
                     return _open
                 btn.clicked.connect(_mk_open(media))
-                layout.addWidget(btn)
+                # grid placement with wrapping
+                try:
+                    vpw = self.recents_scroll.viewport().width()
+                except Exception:
+                    vpw = self._recents_inner.width()
+                spacing = getattr(layout, "spacing", lambda: 8)()
+                item_w = int(size*1.25)
+                cols = max(1, int((vpw + spacing) // (item_w + spacing)))
+                idx = getattr(self, "_recents_idx", 0)
+                row = idx // cols
+                col = idx % cols
+                setattr(self, "_recents_idx", idx+1)
+                layout.addWidget(btn, row, col)
 
             try:
                 self._recents_inner.setMinimumHeight(int(size*1.25)+36)
@@ -2226,3 +2294,126 @@ try:
 except Exception:
     pass
 # --- end r11 ---
+
+
+# --- FRAMEVISION_INPUT_SYNC_AND_SCALE_TOGGLE_PATCH ---
+try:
+    _Pane = UpscPane  # type: ignore  # noqa: F821
+    if not hasattr(_Pane, "_fv_patched_input_and_scale"):
+        _Pane._fv_patched_input_and_scale = True
+
+        # ---------- Wrap _do_single to sync input from player ----------
+        if not hasattr(_Pane, "_fv_orig_do_single"):
+            _Pane._fv_orig_do_single = _Pane._do_single
+            def _fv_wrapped_do_single(self, *a, **k):
+                try:
+                    p = _fv_guess_player_path(self)  # type: ignore  # noqa: F821
+                    if p and _fv_is_valid_file(p):   # type: ignore  # noqa: F821
+                        try:
+                            cur = (self.edit_input.text() or '').strip()
+                        except Exception:
+                            cur = ''
+                        if str(p) != cur:
+                            try:
+                                _fv_push_input_to_tab(self, str(p))  # type: ignore  # noqa: F821
+                            except Exception:
+                                try:
+                                    self.edit_input.setText(str(p))
+                                except Exception:
+                                    pass
+                except Exception:
+                    pass
+                return _Pane._fv_orig_do_single(self, *a, **k)
+            _Pane._do_single = _fv_wrapped_do_single
+
+        # ---------- Helpers for scale UI toggle ----------
+        from PySide6 import QtWidgets  # type: ignore
+
+        def _fv_is_realsr_engine(self) -> bool:
+            try:
+                t = (self.combo_engine.currentText() or '').lower()
+                return ('realesrgan' in t) or ('real-esrgan' in t)
+            except Exception:
+                return False
+
+        def _fv_native_scale(self) -> int:
+            try:
+                t = (self.combo_model_realsr.currentText() or '').lower()
+                if ('-x4' in t) or ('x4' in t): return 4
+                if ('-x3' in t) or ('x3' in t): return 3
+                return 2
+            except Exception:
+                return 2
+
+        def _fv_find_scale_label(self):
+            try:
+                for lab in self.findChildren(QtWidgets.QLabel):
+                    if (lab.text() or '').strip().lower() == 'scale:':
+                        return lab
+            except Exception:
+                pass
+            return None
+
+        def _fv_apply_scale_ui(self):
+            # Show/hide and sync scale value depending on engine
+            isr = _fv_is_realsr_engine(self)
+            lbl = getattr(self, '_fv_lbl_scale', None)
+            if lbl is None:
+                lbl = _fv_find_scale_label(self)
+                if lbl is not None:
+                    self._fv_lbl_scale = lbl
+            try:
+                if isr:
+                    native = _fv_native_scale(self)
+                    try:
+                        self.spin_scale.blockSignals(True)
+                        self.spin_scale.setValue(float(native))
+                        self.spin_scale.blockSignals(False)
+                    except Exception:
+                        pass
+                    try:
+                        self.slider_scale.blockSignals(True)
+                        self.slider_scale.setValue(int(native * 10))
+                        self.slider_scale.blockSignals(False)
+                    except Exception:
+                        pass
+                # Visibility
+                vis = not isr
+                try:
+                    self.spin_scale.setVisible(vis)
+                except Exception:
+                    pass
+                try:
+                    self.slider_scale.setVisible(vis)
+                except Exception:
+                    pass
+                try:
+                    if lbl is not None:
+                        lbl.setVisible(vis)
+                except Exception:
+                    pass
+            except Exception:
+                pass
+
+        # ---------- Wrap __init__ to connect signals and apply on startup ----------
+        if not hasattr(_Pane, "_fv_orig_init"):
+            _Pane._fv_orig_init = _Pane.__init__
+            def _fv_init(self, *a, **k):
+                _Pane._fv_orig_init(self, *a, **k)
+                try:
+                    # Cache label and connect to updates
+                    self._fv_lbl_scale = _fv_find_scale_label(self)
+                    try:
+                        self.combo_engine.currentIndexChanged.connect(lambda *_: _fv_apply_scale_ui(self))
+                    except Exception:
+                        pass
+                    try:
+                        self.combo_model_realsr.currentIndexChanged.connect(lambda *_: _fv_apply_scale_ui(self))
+                    except Exception:
+                        pass
+                    _fv_apply_scale_ui(self)
+                except Exception:
+                    pass
+            _Pane.__init__ = _fv_init
+except Exception:
+    pass

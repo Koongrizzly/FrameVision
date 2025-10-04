@@ -461,7 +461,7 @@ class SysMonPanel(QWidget):
 
         self.low = QCheckBox("Low-impact refresh")
         self.low.setChecked(self.low_impact)
-        self.low.setToolTip("<b>Low-impact refresh</b><br/>Refresh every ≈5s to reduce overhead.")
+        self.low.setToolTip("<b>Low-impact refresh</b><br/>Refresh every ≈2.5s to reduce overhead.")
         self.low.toggled.connect(self._on_low)
 
         self.hud = QCheckBox("HUD on/off")
@@ -586,7 +586,7 @@ class SysMonPanel(QWidget):
         QTimer.singleShot(0, _load_hud_setting_and_apply)
 
     def _apply_interval(self):
-        self.timer.setInterval(5000 if self.low_impact else 1000)
+        self.timer.setInterval(2500 if self.low_impact else  1000)
 
     def _on_low(self, b: bool):
         self.low_impact = bool(b)

@@ -8,7 +8,7 @@ from PySide6.QtGui import QPainter, QPixmap
 from PySide6.QtWidgets import (
     QFormLayout, QHBoxLayout, QLabel, QLineEdit, QComboBox, QPushButton, QSlider,
     QScrollArea, QWidget, QMessageBox, QSpinBox, QGridLayout, QGraphicsOpacityEffect
-)
+, QDialog, QVBoxLayout, QListWidget, QFileDialog, QDialogButtonBox, QGroupBox, QRadioButton, QListWidgetItem)
 
 # ---- paths ----
 def ffmpeg_path():
@@ -368,5 +368,149 @@ def install_trim_tool(pane, section_widget):
     pane.trim_start.editingFinished.connect(_update_from_edits)
     pane.trim_end.editingFinished.connect(_update_from_edits)
     pane.range_bar.changed.connect(_on_bar_changed)
+
+
+    # ---- batch dialog ----
+    def _open_batch_dialog():
+        dlg = QDialog(pane)
+        dlg.setWindowTitle("Batch trim")
+        v = QVBoxLayout(dlg)
+
+        # File list
+        files_list = QListWidget(dlg)
+        files_list.setSelectionMode(QListWidget.ExtendedSelection)
+        v.addWidget(QLabel("Files to process:"))
+        v.addWidget(files_list)
+
+        # Conflict handling
+        grp = QGroupBox("If output file already exists:")
+        vbox = QVBoxLayout(grp)
+        rb_skip = QRadioButton("Skip existing")
+        rb_over = QRadioButton("Overwrite")
+        rb_ver = QRadioButton("Auto rename (Versioned filename)")
+        rb_ver.setChecked(True)
+        vbox.addWidget(rb_skip)
+        vbox.addWidget(rb_over)
+        vbox.addWidget(rb_ver)
+        v.addWidget(grp)
+
+        # Add buttons
+        row = QHBoxLayout()
+        btn_add_files = QPushButton("Add files…")
+        btn_add_folder = QPushButton("Add folder…")
+        row.addWidget(btn_add_files)
+        row.addWidget(btn_add_folder)
+        v.addLayout(row)
+
+        # Removal controls
+        row2 = QHBoxLayout()
+        btn_remove_sel = QPushButton("Remove selected")
+        btn_clear = QPushButton("Clear list")
+        row2.addWidget(btn_remove_sel)
+        row2.addWidget(btn_clear)
+        v.addLayout(row2)
+
+        # OK/Cancel
+        box = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel, parent=dlg)
+        v.addWidget(box)
+
+        VIDEO_EXTS = {".mp4",".mov",".mkv",".avi",".m4v",".webm",".ts",".m2ts",".wmv",".flv",".mpg",".mpeg",".3gp",".3g2",".ogv"}
+
+        def _delete_selected():
+            try:
+                for it in list(files_list.selectedItems()):
+                    row = files_list.row(it)
+                    files_list.takeItem(row)
+            except Exception:
+                pass
+
+        # Allow Delete key to remove selected items
+        old_key_press = getattr(files_list, 'keyPressEvent', None)
+        def _keyPressEvent(ev):
+            try:
+                if ev.key() in (Qt.Key_Delete, Qt.Key_Backspace):
+                    _delete_selected()
+                    return
+            except Exception:
+                pass
+            if old_key_press:
+                old_key_press(ev)
+        files_list.keyPressEvent = _keyPressEvent
+
+        def add_files(paths):
+            existing = {files_list.item(i).data(Qt.UserRole) for i in range(files_list.count())}
+            for p in paths:
+                ext = os.path.splitext(p)[1].lower()
+                if ext in VIDEO_EXTS and p not in existing and os.path.isfile(p):
+                    it = QListWidgetItem(os.path.basename(p))
+                    it.setToolTip(p)
+                    it.setData(Qt.UserRole, p)
+                    files_list.addItem(it)
+
+        def on_add_files():
+            filt = "Video files (*.mp4 *.mov *.mkv *.avi *.m4v *.webm *.ts *.m2ts *.wmv *.flv *.mpg *.mpeg *.3gp *.3g2 *.ogv);;All files (*)"
+            paths, _ = QFileDialog.getOpenFileNames(dlg, "Select videos", "", filt)
+            add_files(paths)
+
+        def on_add_folder():
+            dirp = QFileDialog.getExistingDirectory(dlg, "Select folder with videos", "")
+            if not dirp:
+                return
+            to_add = []
+            for root, dirs, files in os.walk(dirp):
+                for f in files:
+                    fp = os.path.join(root, f)
+                    ext = os.path.splitext(fp)[1].lower()
+                    if ext in VIDEO_EXTS:
+                        to_add.append(fp)
+            add_files(sorted(to_add))
+
+        btn_add_files.clicked.connect(on_add_files)
+        btn_add_folder.clicked.connect(on_add_folder)
+        btn_remove_sel.clicked.connect(_delete_selected)
+        btn_clear.clicked.connect(lambda: files_list.clear())
+        box.accepted.connect(dlg.accept)
+        box.rejected.connect(dlg.reject)
+
+        if dlg.exec() != QDialog.Accepted:
+            return
+
+        selected = [files_list.item(i).data(Qt.UserRole) for i in range(files_list.count())]
+        if not selected:
+            QMessageBox.information(pane, "Batch trim", "No files selected.")
+            return
+
+        conflict = "version" if rb_ver.isChecked() else ("overwrite" if rb_over.isChecked() else "skip")
+
+        s_ms = _parse_time(pane.trim_start.text())
+        e_ms = _parse_time(pane.trim_end.text())
+        mode = "copy" if pane.trim_mode.currentIndex() == 0 else "reencode"
+
+        handled = False
+        try:
+            if hasattr(pane, "enqueue_trim_batch") and callable(getattr(pane, "enqueue_trim_batch")):
+                pane.enqueue_trim_batch(selected, s_ms, e_ms, mode, conflict); handled = True
+            elif hasattr(pane, "on_trim_batch") and callable(getattr(pane, "on_trim_batch")):
+                pane.on_trim_batch(selected, s_ms, e_ms, mode, conflict); handled = True
+            elif hasattr(pane, "main") and hasattr(pane.main, "enqueue_job"):
+                for fp in selected:
+                    job = {"tool":"trim","input":fp,"start_ms":int(s_ms),"end_ms":int(e_ms),"mode":mode,"conflict":conflict}
+                    try:
+                        pane.main.enqueue_job(job)
+                        handled = True
+                    except Exception:
+                        pass
+        except Exception:
+            pass
+
+        if not handled:
+            msg = f"Selected {len(selected)} file(s).\nMode: {mode}\nConflict: {conflict}\nStart: {s_ms} ms\nEnd: {e_ms} ms"
+            QMessageBox.information(pane, "Batch trim", msg)
+
+    # wire up the Batch button
+    try:
+        pane.btn_trim_batch.clicked.connect(_open_batch_dialog)
+    except Exception:
+        pass
 
     return section_widget

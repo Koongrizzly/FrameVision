@@ -1051,7 +1051,16 @@ class VideoPane(QWidget):
     def _render_background_logo(self):
         try:
             # only when no image/video is active
-            if getattr(self, '_mode', 'video') not in ('empty', None):
+            # PATCH 2025-10-03: allow background to render whenever there is NO active image frame or video frame,
+            # even if _mode was left as 'video' (matches behavior after pressing Stop).
+            active_image = (getattr(self, '_mode', None) == 'image' and getattr(self, '_image_pm_orig', None) is not None)
+            active_video = False
+            try:
+                cf = getattr(self, 'currentFrame', None)
+                active_video = (cf is not None and not cf.isNull())
+            except Exception:
+                active_video = False
+            if active_image or active_video:
                 return
             p = getattr(self, '_bg_logo_path', None)
             if not p:
@@ -1799,10 +1808,19 @@ class VideoPane(QWidget):
 
 
     def resizeEvent(self, ev):
-        try: self._refresh_label_pixmap()
-        except Exception: pass
-        try: return QWidget.resizeEvent(self, ev)
-        except Exception: pass
+        try:
+            self._refresh_label_pixmap()
+        except Exception:
+            pass
+        # PATCH 2025-10-03: also refresh the idle background logo on resize
+        try:
+            self._render_background_logo()
+        except Exception:
+            pass
+        try:
+            return QWidget.resizeEvent(self, ev)
+        except Exception:
+            pass
 
 
     # --- Drag & Drop on the entire pane ---
@@ -1951,7 +1969,7 @@ class HUD(QWidget):
             ddr_str = f"DDR {ddr_used_gb:.1f}/{ddr_total_gb:.0f} {ddr_pct}%"
             cpu_str = f"CPU {cpu}%"
             now = datetime.now()
-            time_str = f"{now.strftime('%a')}. {now.strftime('%d %b %H:%M.%S')}"
+            time_str = f"{now.strftime('%a')}. {now.strftime('%d %b %H:%M')}"
 
             hud = f"{gpu_str}  {ddr_str}  {cpu_str}  {time_str}"
             self.hud.setText(hud)

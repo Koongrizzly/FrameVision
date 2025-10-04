@@ -78,6 +78,7 @@ class Clip:
     fade_in_ms: int = 0
     fade_out_ms: int = 0
     group_id: Optional[int] = None  # for grouping
+    label_color: Optional[str] = None  # per-clip color label
 
 @dataclass
 class Track:
@@ -619,10 +620,11 @@ class ClipWidget(QFrame):
 
     def paintEvent(self, ev):
         p = QPainter(self)
-        # background tinted by track color
+        # background tinted by per-clip color if set, else track color
         base = QColor(50,90,160) if self.media.kind in ("video","image","text") else QColor(60,160,90)
         try:
-            tc = QColor(self.row.track.color)
+            tint_hex = getattr(self.clip, "label_color", None) or self.row.track.color
+            tc = QColor(tint_hex)
             bg = QColor((base.red()+tc.red())//2, (base.green()+tc.green())//2, (base.blue()+tc.blue())//2)
         except Exception:
             bg = base
@@ -789,7 +791,7 @@ class TrackHeader(QWidget):
         self.btn_m = QToolButton(); self.btn_m.setText("M"); self.btn_m.setCheckable(True); self.btn_m.setToolTip("Mute track")
         self.btn_s = QToolButton(); self.btn_s.setText("S"); self.btn_s.setCheckable(True); self.btn_s.setToolTip("Solo track")
         self.btn_l = QToolButton(); self.btn_l.setText("L"); self.btn_l.setCheckable(True); self.btn_l.setToolTip("Lock track")
-        self.btn_color = QToolButton(); self.btn_color.setToolTip("Track color"); self.btn_color.setIcon(_palette_icon(16)); self.btn_color.setIconSize(QSize(16,16))
+        self.btn_color = QToolButton(); self.btn_color.setToolTip("Change selected clip color"); self.btn_color.setIcon(_palette_icon(16)); self.btn_color.setIconSize(QSize(16,16))
         for b in (self.btn_m,self.btn_s,self.btn_l):
             b.setFixedSize(24,20)
         self.btn_color.setFixedSize(28,22)
@@ -797,6 +799,50 @@ class TrackHeader(QWidget):
         lay.addWidget(self.name); lay.addWidget(self.btn_l); lay.addWidget(self.btn_color)
         self.btn_l.setChecked(track.locked)
         self.btn_l.toggled.connect(self._set_lock); self.btn_color.clicked.connect(self._pick_color)
+        try:
+            self._apply_color()
+        except Exception:
+            pass
+    def contextMenuEvent(self, ev):
+        m = QMenu(self)
+        m.addAction("Add new timeline above", lambda: self.editor._add_timeline_relative(self.track, where='above'))
+        m.addAction("Add new timeline below", lambda: self.editor._add_timeline_relative(self.track, where='below'))
+        m.addAction("Rename", self._rename_track)
+        m.addSeparator()
+        m.addAction("Clear timeline", lambda: self.editor._clear_timeline(self.track))
+        m.addAction("Delete timeline from project", lambda: self.editor._delete_timeline(self.track))
+        m.exec(ev.globalPos())
+    def _rename_track(self):
+        """Prompt to rename this timeline (max 16 characters)."""
+        try:
+            from PySide6.QtWidgets import QInputDialog
+        except Exception:
+            QInputDialog = None
+        new_name = None
+        if QInputDialog is not None:
+            try:
+                current = (getattr(self.track, "name", "") or "").strip()
+                txt, ok = QInputDialog.getText(self, "Rename timeline", "New name (max 16):", text=current)
+                if ok:
+                    new_name = (str(txt) if txt is not None else "").strip()
+            except Exception:
+                new_name = None
+        if not new_name:
+            return  # cancelled or empty
+        new_name = new_name[:16]
+        try:
+            self.track.name = new_name
+        except Exception:
+            pass
+        try:
+            self.name.setText(self._label_text())
+        except Exception:
+            pass
+        try:
+            self.editor._mark_dirty()
+        except Exception:
+            pass
+
 
     def _label_text(self):
         nm = (getattr(self.track, "name", "") or "").strip()
@@ -807,18 +853,23 @@ class TrackHeader(QWidget):
 
     def _apply_color(self):
         try:
-            None.setStyleSheet(f"background:{self.track.color}; border:1px solid #666;")
+            self.setStyleSheet("")
         except Exception:
-            None.setStyleSheet("background:#3c3c3c; border:1px solid #666;")
+            pass
 
     def _set_mute(self, on): self.track.mute = bool(on); self.editor._mark_dirty()
     def _set_solo(self, on): self.track.solo = bool(on); self.editor._mark_dirty()
     def _set_lock(self, on): self.track.locked = bool(on); self.editor._mark_dirty()
     def _pick_color(self):
-        col = QColorDialog.getColor(QColor(self.track.color), self, "Track color")
+        col = QColorDialog.getColor(QColor(self.track.color), self, "Clip color")
         if col.isValid():
-            self.track.color = col.name()
-            self._apply_color(); self.editor._refresh_tracks()
+            try:
+                self.editor._apply_color_to_selection_on_track(self.track, col.name())
+            except Exception:
+                try:
+                    self.editor._apply_color_to_selection(col.name())
+                except Exception:
+                    pass
 
 class TrackRow(QWidget):
     def __init__(self, track: Track, project: Project, editor: "EditorPane", parent=None):
@@ -1357,6 +1408,15 @@ class EditorPane(QWidget):
             self._bg_player.setAudioOutput(self._bg_audio)
             try: self._bg_player.positionChanged.connect(self._on_bg_pos)
             except Exception: pass
+            # --- gap playback (black during empty timeline) ---
+            self._gap_timer = QTimer(self)
+            try: self._gap_timer.setInterval(33)
+            except Exception: pass
+            try: self._gap_timer.timeout.connect(self._gap_tick)
+            except Exception: pass
+            self._gap_playing = False
+            self._play_continuous = False
+
         self._playing_clip = None  # ClipWidget currently driving playback
         self._is_playing = False
         self.transport_request.connect(self._on_transport)
@@ -1408,39 +1468,58 @@ class EditorPane(QWidget):
         # ruler + tracks (align ruler zero after header column)
         self.ruler = TimeRuler()
         ruler_row = QWidget(); rh = QHBoxLayout(ruler_row); rh.setContentsMargins(0,0,0,0); rh.setSpacing(0)
-        left_spacer = QWidget(); left_spacer.setFixedWidth(int(self.header_col_w))
+        left_spacer = QWidget(); left_spacer.setFixedWidth(int(self.header_col_w)+1)
+        rh.addWidget(left_spacer)
         vdiv_r = QFrame(); vdiv_r.setFrameShape(QFrame.VLine); vdiv_r.setFrameShadow(QFrame.Sunken)
-        rh.addWidget(left_spacer); rh.addWidget(vdiv_r); rh.addWidget(self.ruler, 1)
-        # keep ruler start pinned to header width
+        rh.addWidget(vdiv_r)
+        rh.addWidget(self.ruler, 1)
+        # keep the spacer matching the headers width
         self._ruler_left_spacer = left_spacer
-        def _sync_ruler_header_width():
-            try:
-                self._ruler_left_spacer.setFixedWidth(int(self.header_col_w))
-            except Exception:
-                pass
-        self._sync_ruler_header_width = _sync_ruler_header_width
         bot_v.addWidget(ruler_row)
         self.ruler.positionPicked.connect(self._set_playhead_from_ruler)
         self.ruler.set_fps(int(self.project.fps))
         self.ruler.set_in_out(self.in_ms, self.out_ms)
         self.ruler.set_markers(self.markers)
 
-        self.tracks_area = QScrollArea(); self.tracks_area.setWidgetResizable(True); self.tracks_area.setHorizontalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+        
+        # --- Split view: left fixed headers column, right scrollable rows column ---
+        self.headers_area = QScrollArea(); self.headers_area.setWidgetResizable(True); self.headers_area.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOff); self.headers_area.setFrameShape(QFrame.NoFrame)
         try:
-            self.tracks_area.setWidgetResizable(False)
+            self.headers_area.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        except Exception: pass
+        self.headers_holder = QWidget(); self.headers_layout = QVBoxLayout(self.headers_holder)
+        self.headers_layout.setContentsMargins(0,0,0,0); self.headers_layout.setSpacing(6)
+        self.headers_holder.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.MinimumExpanding)
+        self.headers_area.setWidget(self.headers_holder)
+        self.tracks_area = QScrollArea(); self.tracks_area.setWidgetResizable(True)
+        try:
             self.tracks_area.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOn)
         except Exception:
             pass
         holder = QWidget(); self.tracks_holder = holder
         self.tracks_layout = QVBoxLayout(holder); self.tracks_layout.setContentsMargins(0,0,0,0); self.tracks_layout.setSpacing(6)
         holder.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.MinimumExpanding)
-        self.tracks_area.setWidget(holder); bot_v.addWidget(self.tracks_area, 1)
+        self.tracks_area.setWidget(holder)
+        # Place headers_area and tracks_area side-by-side
+        tracks_row = QWidget(); tracks_row_h = QHBoxLayout(tracks_row); tracks_row_h.setContentsMargins(0,0,0,0); tracks_row_h.setSpacing(0)
+        # keep headers column width in sync
+        try:
+            self.headers_area.setFixedWidth(int(self.header_col_w))
+            self._ruler_left_spacer.setFixedWidth(int(self.header_col_w)+1)
+        except Exception:
+            pass
+        tracks_row_h.addWidget(self.headers_area)
+        vdiv_main = QFrame(); vdiv_main.setFrameShape(QFrame.VLine); vdiv_main.setFrameShadow(QFrame.Sunken)
+        tracks_row_h.addWidget(vdiv_main)
+        tracks_row_h.addWidget(self.tracks_area, 1)
+        bot_v.addWidget(tracks_row, 1)
         # External horizontal scrollbar under the timelines
         try: self.tracks_area.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
         except Exception: pass
         self.hbar = QScrollBar(Qt.Horizontal)
         bot_v.addWidget(self.hbar)
         try:
+            # Mirror inner horizontal scroll to external hbar
             self.tracks_area.horizontalScrollBar().valueChanged.connect(self._on_hscroll_changed)
             try:
                 sb = self.tracks_area.horizontalScrollBar()
@@ -1449,11 +1528,23 @@ class EditorPane(QWidget):
                 self.hbar.valueChanged.connect(lambda v: self._sync_inner_from_hbar(v))
             except Exception:
                 pass
+            # Vertical scroll sync between headers and rows
             try:
-                sb = self.tracks_area.horizontalScrollBar()
-                sb.rangeChanged.connect(lambda *_: self._sync_hbar_from_inner())
-                sb.valueChanged.connect(lambda v: self._sync_hbar_from_inner())
-                self.hbar.valueChanged.connect(lambda v: self._sync_inner_from_hbar(v))
+                lv = self.headers_area.verticalScrollBar(); rv = self.tracks_area.verticalScrollBar()
+                def _sync_v_from_r(v):
+                    try:
+                        if getattr(self, '_v_syncing', False): return
+                        self._v_syncing = True; lv.setValue(v)
+                    finally:
+                        self._v_syncing = False
+                def _sync_v_from_l(v):
+                    try:
+                        if getattr(self, '_v_syncing', False): return
+                        self._v_syncing = True; rv.setValue(v)
+                    finally:
+                        self._v_syncing = False
+                rv.valueChanged.connect(_sync_v_from_r)
+                lv.valueChanged.connect(_sync_v_from_l)
             except Exception:
                 pass
         except Exception:
@@ -1477,7 +1568,7 @@ class EditorPane(QWidget):
         def sc(seq, cb): a=QAction(self); a.setShortcut(QKeySequence(seq)); a.triggered.connect(cb); self.addAction(a)
         sc("Ctrl+N", self._new_project); sc("Ctrl+O", self._load_project); sc("Ctrl+S", self._save_project)
         sc("Ctrl+Z", self._undo); sc("Ctrl+Y", self._redo); sc("+", lambda: self._set_zoom(self.zoom*1.25)); sc("-", lambda: self._set_zoom(self.zoom/1.25))
-        sc("Space", lambda: self.transport_request.emit("toggle"))
+        sc("Space", self._tr_toggle)
         sc("Ctrl+F", self._zoom_to_fit); sc("Z", self._zoom_to_selection)
         sc("M", self._add_marker_here);
         sc("J", lambda: self._shuttle("J"))
@@ -1612,41 +1703,104 @@ class EditorPane(QWidget):
             w.name.setText(w._label_text())
 
     
+        # --- header actions & clip color ---
+    def _apply_color_to_selection(self, color_hex: str):
+        try:
+            targets = self._selection[:] if self._selection else ([self._selected] if self._selected else [])
+            if not targets:
+                return
+            self._push_undo()
+            for c in targets:
+                try:
+                    c.label_color = color_hex
+                except Exception:
+                    pass
+            self._mark_dirty(); self._refresh_tracks()
+        except Exception:
+            pass
+
+    def _add_timeline_relative(self, track: Track, where: str = 'below'):
+        try:
+            idx = self._track_index(track)
+            if idx is None:
+                return
+            ttype = getattr(track, 'type', 'video') or 'video'
+            name = ''
+            new_tr = Track(name or ttype.capitalize(), ttype)
+            insert_at = idx if where == 'above' else idx + 1
+            self._push_undo()
+            self.project.tracks.insert(insert_at, new_tr)
+            self._refresh_tracks(); self._mark_dirty()
+        except Exception:
+            pass
+
+    def _clear_timeline(self, track: Track):
+        try:
+            self._push_undo()
+            track.clips.clear()
+            self._refresh_tracks(); self._update_time_range(); self._mark_dirty()
+        except Exception:
+            pass
+
+    def _delete_timeline(self, track: Track):
+        try:
+            idx = self._track_index(track)
+            if idx is None:
+                return
+            self._push_undo()
+            self.project.tracks.pop(idx)
+            self._refresh_tracks(); self._update_time_range(); self._mark_dirty()
+        except Exception:
+            pass
+
     def _refresh_tracks(self):
-        # clear existing
+        # clear existing (both rows and headers)
         while self.tracks_layout.count():
             w = self.tracks_layout.takeAt(0).widget()
             if w:
                 w.setParent(None); w.deleteLater()
+        while self.headers_layout.count():
+            w = self.headers_layout.takeAt(0).widget()
+            if w:
+                w.setParent(None); w.deleteLater()
+
         # rebuild rows with header column on the left
         for i, tr in enumerate(self.project.tracks):
-            row_container = QWidget()
-            h = QHBoxLayout(row_container); h.setContentsMargins(0,0,0,0); h.setSpacing(0)
-            header = TrackHeader(tr, self, row_container)
+            # Header (left column)
+            header = TrackHeader(tr, self, self.headers_holder)
             header.setFixedWidth(int(self.header_col_w))
+            try:
+                header.setFixedHeight(46)
+            except Exception:
+                pass
             header.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Fixed)
-            vdiv = QFrame(); vdiv.setFrameShape(QFrame.VLine); vdiv.setFrameShadow(QFrame.Sunken)
-            row = TrackRow(tr, self.project, self, row_container); row.set_scale(self._px_per_s())
-            h.addWidget(header); h.addWidget(vdiv); h.addWidget(row, 1)
-            self.tracks_layout.addWidget(row_container)
+            self.headers_layout.addWidget(header)
+            # Row (right column)
+            row = TrackRow(tr, self.project, self, self.tracks_holder); row.set_scale(self._px_per_s())
+            self.tracks_layout.addWidget(row)
             if i < len(self.project.tracks) - 1:
-                divider = QFrame(); divider.setFrameShape(QFrame.HLine); divider.setFrameShadow(QFrame.Sunken)
-                divider.setStyleSheet("color:#2c2c2c;")
-                self.tracks_layout.addWidget(divider)
+                div_r = QFrame(); div_r.setFrameShape(QFrame.HLine); div_r.setFrameShadow(QFrame.Sunken)
+                div_r.setStyleSheet("color:#2c2c2c;")
+                self.tracks_layout.addWidget(div_r)
+                div_l = QFrame(); div_l.setFrameShape(QFrame.HLine); div_l.setFrameShadow(QFrame.Sunken)
+                div_l.setStyleSheet("color:#2c2c2c;")
+                self.headers_layout.addWidget(div_l)
         self.tracks_layout.addStretch(1)
+        self.headers_layout.addStretch(1)
 
 
     def _update_time_range(self):
         total = self.compute_project_duration(self.project); self.ruler.set_duration(total); self.ruler.set_markers(self.markers); self.seek_slider.setRange(0,int(total)); self._update_holder_width()
 
     
+    # [scroll-sync] Bind ruler offset to track area's horizontal scroll
     def _on_hscroll_changed(self, value: int):
-        # Sync ruler offset to scroll
         try:
             pxs = getattr(self, "_px_per_s", lambda: 100.0)()
-            offset_x = max(0, int(value) - int(getattr(self, "header_col_w", 0)))
-            ms = int(max(0, (offset_x / max(1.0, pxs)) * 1000.0))
+            ms = int(max(0, (int(value) / max(1.0, pxs)) * 1000.0))
             self.ruler.set_offset(ms)
+        except Exception:
+            pass
         except Exception:
             pass
 
@@ -1923,6 +2077,12 @@ class EditorPane(QWidget):
 
     def _tr_toggle(self):
         """Play/Pause timeline from the ruler. Guarantees playback via internal player or background."""
+        # If gap playback is running, pause it first
+        try:
+            if getattr(self, '_gap_playing', False):
+                self._stop_gap_playback(); self._play_continuous = False
+                self._refresh_play_icon(); return
+        except Exception: pass
         started_ext = False
         started_bg = False
         p = self._get_internal_player()
@@ -1943,7 +2103,18 @@ class EditorPane(QWidget):
         # Try internal player first
         try:
             cw = getattr(self, '_clipwidget_under_playhead', lambda: None)()
-            if p and self._ensure_ext_player_for_clip(cw):
+            # If we already prepared this clip/source earlier, just resume without re-opening
+            try:
+                same = False
+                clip = cw.clip if hasattr(cw, 'clip') else cw
+                media_id = getattr(clip, 'media_id', '') if clip is not None else ''
+                media = self.project.media.get(media_id, None) if hasattr(self.project, 'media') else None
+                src = str(getattr(media, 'path', '')) if media else ''
+                if src and src == getattr(self, '_ext_source_path', None) and clip is getattr(self, '_ext_playing_clip', None):
+                    same = True
+            except Exception:
+                same = False
+            if p and (same or self._ensure_ext_player_for_clip(cw)):
                 p.play(); started_ext = True
                 try: self.transport_request.emit("play")
                 except Exception: pass
@@ -1957,6 +2128,10 @@ class EditorPane(QWidget):
                     self._play_clip_from_ruler(cw); started_bg = True
             except Exception:
                 pass
+        # If nothing started at all, begin gap playback (black screen)
+        if not started_ext and not started_bg:
+            try: self._start_gap_playback()
+            except Exception: pass
         # If both started, prefer internal and stop background to avoid double audio
         if started_ext and getattr(self, "_bg_player", None):
             try: self._bg_player.stop()
@@ -1976,6 +2151,10 @@ class EditorPane(QWidget):
         except Exception:
             pass
         self._ext_playing_clip = None
+        try: self._stop_gap_playback()
+        except Exception: pass
+        try: self.preview_media.emit(None, int(getattr(self.seek_slider, 'value', lambda:0)()))
+        except Exception: pass
         try: self.transport_request.emit("stop")
         except Exception: pass
         try: self._refresh_play_icon()
@@ -2267,6 +2446,12 @@ class EditorPane(QWidget):
             if int(ms) >= int(clip.duration_ms):
                 try: self._bg_player.pause()
                 except Exception: pass
+                try:
+                    if getattr(self, '_play_continuous', False):
+                        self._start_gap_playback()
+                except Exception: pass
+                # clamp and update
+                except Exception: pass
                 self._is_playing = False
                 ms = int(clip.duration_ms) - 1
             g = int(clip.start_ms) + int(ms)
@@ -2338,8 +2523,10 @@ class EditorPane(QWidget):
         try: p.setPosition(int(rel))
         except Exception: pass
         self._ext_playing_clip = clip
+        try: self._ext_source_path = str(media.path)
+        except Exception: self._ext_source_path = None
         try:
-            self.preview_media.emit(media.path, int(g))
+            self.preview_media.emit(getattr(media, "path", None), int(g))
         except Exception:
             pass
         try:
@@ -2427,6 +2614,65 @@ class EditorPane(QWidget):
                     except Exception: pass
                     self._is_playing = False
                 return
+        except Exception:
+            pass
+
+    # --- gap playback helpers ---
+    def _next_clip_start_after(self, g:int) -> int:
+        try: g = int(g)
+        except Exception: g = 0
+        nxt = None
+        try:
+            for tr in getattr(self.project, 'tracks', []):
+                for cl in getattr(tr, 'clips', []):
+                    try:
+                        st = int(getattr(cl, 'start_ms', 0))
+                        if st >= g and (nxt is None or st < nxt):
+                            nxt = st
+                    except Exception: pass
+        except Exception: pass
+        if nxt is None:
+            try: nxt = int(self.seek_slider.maximum())
+            except Exception: nxt = g + 3600000  # 1h horizon
+        return int(nxt)
+
+    def _start_gap_playback(self):
+        try: self.preview_media.emit(None, int(getattr(self.seek_slider, 'value', lambda:0)()))
+        except Exception: pass
+        self._gap_playing = True; self._play_continuous = True
+        try: self._gap_timer.start()
+        except Exception: pass
+
+    def _stop_gap_playback(self):
+        try:
+            if getattr(self, '_gap_timer', None): self._gap_timer.stop()
+        except Exception: pass
+        self._gap_playing = False
+
+    def _gap_tick(self):
+        try:
+            if not getattr(self, '_gap_playing', False): return
+            cur = int(getattr(self.seek_slider, 'value', lambda:0)())
+            end = int(self._next_clip_start_after(cur))
+            step = 33
+            new_g = cur + step
+            if new_g >= end:
+                new_g = end
+            try: self._set_global_time(int(new_g))
+            except Exception:
+                try:
+                    self.seek_slider.blockSignals(True); self.seek_slider.setValue(int(new_g)); self.seek_slider.blockSignals(False)
+                except Exception: pass
+            try: self.preview_media.emit(None, int(new_g))
+            except Exception: pass
+            if new_g >= end:
+                self._stop_gap_playback()
+                cw = None
+                try: cw = self._clipwidget_under_playhead()
+                except Exception: cw = None
+                if cw:
+                    try: self._play_timeline_under_ruler_background()
+                    except Exception: pass
         except Exception:
             pass
 

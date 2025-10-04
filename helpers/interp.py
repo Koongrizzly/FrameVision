@@ -1,7 +1,7 @@
 
 # -*- coding: utf-8 -*-
 from __future__ import annotations
-import os, json, datetime, shutil, zipfile, time
+import os, json, datetime, shutil, zipfile, time, re
 from pathlib import Path
 from pathlib import Path as _P_INT
 
@@ -267,8 +267,9 @@ class InterpPane(QWidget):
         root = QVBoxLayout(content); root.setContentsMargins(0,0,0,0); root.setSpacing(4)
 
         # ---- Options ----
-        opt = Collapsible("Options", start_open=True)
-        root.addWidget(opt); lay = opt.body_layout()
+        # Options shown inline (no collapsible)
+        lay = root
+
 
         # Row 1: multiplier + slider + quick-set buttons
         row = QHBoxLayout(); row.setSpacing(8)
@@ -309,7 +310,45 @@ class InterpPane(QWidget):
         self.pb_eta = QLabel(""); self.pb_eta.setVisible(False)
         self.pb_cancel = QPushButton("Cancel"); self.pb_cancel.setVisible(False)
         self.pb_wrap.addWidget(self.pb_label); self.pb_wrap.addWidget(self.pb, 1); self.pb_wrap.addWidget(self.pb_eta); self.pb_wrap.addWidget(self.pb_cancel)
-        lay.addLayout(self.pb_wrap)
+        lay.addLayout(self.pb_wrap)        # Advanced settings moved inline below
+        lay.addSpacing(8)
+
+        # Load profile
+        sp = QHBoxLayout(); sp.setSpacing(8)
+        self.combo_speed = QComboBox()
+        self.combo_speed.addItems([
+            "1 — Minimal load (responsive)",
+            "2 — Fast",
+            "3 — Balanced",
+            "4 — High quality (heavier)",
+            "5 — Superfast (default)",
+        ])
+        self.combo_speed.setCurrentIndex(4)
+        sp.addWidget(QLabel("Load profile:")); sp.addWidget(self.combo_speed)
+        self.cb_speed_default = QCheckBox("Default"); self.cb_speed_default.setChecked(False)
+        sp.addStretch(1); lay.addLayout(sp)
+        self.warn_lbl = QLabel(""); lay.addWidget(self.warn_lbl)
+
+        # Model selector (applies to internal NCNN path when Superfast selected)
+        mp = QHBoxLayout(); mp.setSpacing(8)
+        mp.addWidget(QLabel("Model:"))
+        self.combo_model = QComboBox()
+        for key, title in self._models:
+            self.combo_model.addItem(title, key)
+        mp.addWidget(self.combo_model)
+        self.btn_model_install = QPushButton("Install/Verify")
+        mp.addWidget(self.btn_model_install)
+        mp.addStretch(1); lay.addLayout(mp)
+
+        # Two info lines under the selector
+        self.model_info_1 = QLabel(""); self.model_info_1.setWordWrap(True)
+        self.model_info_2 = QLabel(""); self.model_info_2.setWordWrap(True)
+        lay.addWidget(self.model_info_1); lay.addWidget(self.model_info_2)
+        self.model_info_1.setVisible(False); self.model_info_2.setVisible(False)
+
+        
+        lay.addSpacing(8)
+
 
                 # ---- Recent results gallery (NEW) ----
         self.recent = Collapsible("Recent results", start_open=False)
@@ -330,45 +369,8 @@ class InterpPane(QWidget):
 
         self.recent_area.setWidget(self.recent_container)
         rlay.addWidget(self.recent_area)
-# ---- Advanced ----
-# ---- Advanced ----
-        adv = Collapsible("Advanced", start_open=True)
-        root.addWidget(adv); advl = adv.body_layout()
 
-        # Load profile
-        sp = QHBoxLayout(); sp.setSpacing(8)
-        self.combo_speed = QComboBox()
-        self.combo_speed.addItems([
-            "1 — Minimal load (responsive)",
-            "2 — Fast",
-            "3 — Balanced",
-            "4 — High quality (heavier)",
-            "5 — Superfast (default)",
-        ])
-        self.combo_speed.setCurrentIndex(4)
-        sp.addWidget(QLabel("Load profile:")); sp.addWidget(self.combo_speed)
-        self.cb_speed_default = QCheckBox("Default"); self.cb_speed_default.setChecked(False)
-        sp.addStretch(1); advl.addLayout(sp)
-        self.warn_lbl = QLabel(""); advl.addWidget(self.warn_lbl)
-
-        # Model selector (applies to internal NCNN path when Superfast selected)
-        mp = QHBoxLayout(); mp.setSpacing(8)
-        mp.addWidget(QLabel("Model:"))
-        self.combo_model = QComboBox()
-        for key, title in self._models:
-            self.combo_model.addItem(title, key)
-        mp.addWidget(self.combo_model)
-        self.btn_model_install = QPushButton("Install/Verify")
-        mp.addWidget(self.btn_model_install)
-        mp.addStretch(1); advl.addLayout(mp)
-
-        # Two info lines under the selector
-        self.model_info_1 = QLabel(""); self.model_info_1.setWordWrap(True)
-        self.model_info_2 = QLabel(""); self.model_info_2.setWordWrap(True)
-        advl.addWidget(self.model_info_1); advl.addWidget(self.model_info_2)
-        self.model_info_1.setVisible(False); self.model_info_2.setVisible(False)
-
-        # ---- Buttons (2 rows) ----
+# ---- Buttons (2 rows) ----
         btns = QVBoxLayout(); btns.setSpacing(6)
         r2 = QHBoxLayout(); r2.setSpacing(8)
         self.btn_start = QPushButton("Add to Queue") 
@@ -386,7 +388,7 @@ class InterpPane(QWidget):
         self.combo_model.setToolTip("RIFE model (used by the Superfast NCNN path).")
         self.btn_model_install.setToolTip("Extract engine & models from assets/rife.zip if needed.")
         self.btn_start.setToolTip("Add to Queue (or run Superfast immediately if profile 5 is selected).")
-        self.btn_batch.setToolTip("Select multiple files and enqueue with current settings.")
+        self.btn_batch.setToolTip("Batch: Add files or a folder. Duplicate handling: Skip / Overwrite / Auto rename.")
         self.btn_open_folder.setToolTip("Open the folder where RIFE outputs are saved.")
 
         # wiring
@@ -653,11 +655,44 @@ class InterpPane(QWidget):
             base = ["ffmpeg","-hide_banner","-y"] + (["-progress", str(progress_file)] if progress_file else []) + ["-i", str(src)]
             return base + ["-vf", vf, "-af", atempo, "-c:v","libx264", *preset, "-crf","18", str(out_path)]
 
-    def _enqueue_job(self, src: Path, mult: float, in_fps: float)->str|None:
+    
+    def _versioned_path(self, path: Path) -> Path:
+        """Return a non-colliding path by appending _v2, _v3, ... if needed."""
+        if not path.exists():
+            return path
+        stem = path.stem
+        suffix = path.suffix
+        m = re.match(r"^(.*)_v(\d+)$", stem)
+        base_stem = m.group(1) if m else stem
+        i = 2
+        while True:
+            candidate = path.with_name(f"{base_stem}_v{i}{suffix}")
+            if not candidate.exists():
+                return candidate
+            i += 1
+
+    def _get_video_files_in_dir(self, folder: Path) -> list[Path]:
+        exts = {'.mp4', '.mkv', '.mov', '.webm', '.avi'}
+        files = []
+        try:
+            for p in folder.rglob('*'):
+                if p.is_file() and p.suffix.lower() in exts:
+                    files.append(p)
+        except Exception:
+            pass
+        return files
+
+    def _enqueue_job(self, src: Path, mult: float, in_fps: float, dup_mode: str = 'overwrite')->str|None:
         try:
             out_dir = _outputs_dir(self.ROOT)
             suffix = f"{mult:.2f}x".rstrip("0").rstrip(".")
             out_path = out_dir / f"{src.stem}_interp_{suffix}.mp4"
+            # duplicate handling
+            if dup_mode == 'skip' and out_path.exists():
+                return None
+            if dup_mode == 'autorename':
+                out_path = self._versioned_path(out_path)
+
             progress_file = out_path.with_suffix(out_path.suffix + ".progress")
             ff = self._build_ffmpeg_cmd(src, mult, in_fps, out_path, progress_file)
             self._ffmpeg_progress_file = str(progress_file)
@@ -838,36 +873,81 @@ class InterpPane(QWidget):
         QMessageBox.information(self, "Queued", "Interpolation added to Queue.")
         self._watch_timer.start()
 
+    
     def _on_batch_clicked(self):
         self._persist_state()
-        dlg = QFileDialog(self, "Select videos for batch"); dlg.setFileMode(QFileDialog.ExistingFiles)
-        dlg.setNameFilter("Videos (*.mp4 *.mkv *.mov *.webm *.avi)")
-        if not dlg.exec(): return
-        files=[Path(p) for p in dlg.selectedFiles() if p]
-        if not files:
-            QMessageBox.information(self, "Add Batch", "No files selected."); return
-        dlg2 = QMessageBox(self)
-        dlg2.setWindowTitle("Confirm Batch")
-        dlg2.setText(f"Queue {len(files)} file(s)?")
-        yes_btn = dlg2.addButton("Yes", QMessageBox.AcceptRole)
-        dlg2.addButton(QMessageBox.Cancel)
-        dlg2.exec()
-        if dlg2.clickedButton() is not yes_btn:
+
+        # Popup with Add files / Add folder / Cancel and duplicate policy
+        from PySide6.QtWidgets import QDialog, QDialogButtonBox, QRadioButton, QGroupBox, QVBoxLayout, QHBoxLayout, QLabel
+
+        dlg = QDialog(self)
+        dlg.setWindowTitle("Add Batch")
+        v = QVBoxLayout(dlg)
+        v.addWidget(QLabel("Choose what to add and how to handle existing outputs."))
+
+        grp = QGroupBox("If output file already exists:")
+        gv = QVBoxLayout(grp)
+        rb_skip = QRadioButton("Skip existing")
+        rb_over = QRadioButton("Overwrite")
+        rb_auto = QRadioButton("Auto rename (versioned filename)")
+        rb_auto.setChecked(True)
+        gv.addWidget(rb_skip); gv.addWidget(rb_over); gv.addWidget(rb_auto)
+        v.addWidget(grp)
+
+        btns = QDialogButtonBox()
+        btn_files = btns.addButton("Add files", QDialogButtonBox.ActionRole)
+        btn_folder = btns.addButton("Add folder", QDialogButtonBox.ActionRole)
+        btn_cancel = btns.addButton(QDialogButtonBox.Cancel)
+        v.addWidget(btns)
+
+        choice = {"mode": None}
+        btn_files.clicked.connect(lambda: (choice.update(mode="files"), dlg.accept()))
+        btn_folder.clicked.connect(lambda: (choice.update(mode="folder"), dlg.accept()))
+        btn_cancel.clicked.connect(dlg.reject)
+
+        if dlg.exec() != QDialog.Accepted:
             return
-        ok=0; cache={}
-        mult=max(0.15, min(4.0, self.slider.value()/100.0))
+
+        dup_mode = 'autorename' if rb_auto.isChecked() else ('overwrite' if rb_over.isChecked() else 'skip')
+
+        files = []
+        if choice["mode"] == "files":
+            file_dlg = QFileDialog(self, "Select videos for batch")
+            file_dlg.setFileMode(QFileDialog.ExistingFiles)
+            file_dlg.setNameFilter("Videos (*.mp4 *.mkv *.mov *.webm *.avi)")
+            if not file_dlg.exec():
+                return
+            files = [Path(p) for p in file_dlg.selectedFiles() if p]
+        elif choice["mode"] == "folder":
+            folder = QFileDialog.getExistingDirectory(self, "Pick a folder")
+            if not folder:
+                return
+            files = self._get_video_files_in_dir(Path(folder))
+        else:
+            return
+
+        if not files:
+            QMessageBox.information(self, "Add Batch", "No files found."); return
+
+        mult = max(0.15, min(4.0, self.slider.value()/100.0))
+        ok = 0; skipped = 0; cache = {}
         for src in files:
-            if not src.exists(): continue
-            in_fps = cache.get(str(src)) or _probe_fps(src); cache[str(src)]=in_fps
-            if self._enqueue_job(src, mult, in_fps): ok+=1
-        QMessageBox.information(self, "Add Batch", f"Queued {ok} item(s).")
+            if not src.exists():
+                continue
+            in_fps = cache.get(str(src)) or _probe_fps(src); cache[str(src)] = in_fps
+            res = self._enqueue_job(src, mult, in_fps, dup_mode=dup_mode)
+            if res:
+                ok += 1
+            else:
+                if dup_mode == 'skip':
+                    skipped += 1
+
+        QMessageBox.information(self, "Add Batch", f"Queued {ok} item(s).{' Skipped ' + str(skipped) + ' existing.' if skipped else ''}")
         try:
             if QueueSystem: QueueSystem(self.ROOT).nudge_pending()
-        except Exception: pass
-        player = getattr(self.main, "video", None)
-        if player and hasattr(player, "open"): player.open(p); self.main.current_path = _P_INT(str(p)); refresh_info_now(p); return
-        QDesktopServices.openUrl(QUrl.fromLocalFile(p))
-        QDesktopServices.openUrl(QUrl.fromLocalFile(p))
+        except Exception:
+            pass
+        return
 
     def _on_slider_changed(self, v: int):
         mult = max(0.15, min(4.0, v/100.0))

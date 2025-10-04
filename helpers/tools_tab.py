@@ -821,14 +821,14 @@ class InstantToolsPane(QWidget):
         self.btn_gif_batch.clicked.connect(self.run_gif_batch)
         self.btn_last.clicked.connect(self.run_last)
         self.btn_all.clicked.connect(self.run_all)
+
         self.btn_trim.clicked.connect(self.run_trim)
-        if hasattr(self, 'run_trim_batch'):
-            self.btn_trim_batch.clicked.connect(self.run_trim_batch)
-        else:
-            try:
-                self.btn_trim_batch.setEnabled(False)
-            except Exception:
-                pass
+        # Let the Trim tool own the batch popup; wire here only if provided.
+        try:
+            if hasattr(self, 'run_trim_batch'):
+                self.btn_trim_batch.clicked.connect(self.run_trim_batch)
+        except Exception:
+            pass
         self.btn_crop.clicked.connect(self.run_crop)
         self.btn_crop_batch.clicked.connect(self.run_crop_batch)
 

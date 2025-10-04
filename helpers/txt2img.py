@@ -21,7 +21,7 @@ try:
     from transformers.utils import logging as _hf_logging
     _hf_logging.set_verbosity_error()
 except Exception:
-    pass
+        pass
 try:
     from diffusers.utils import logging as _df_logging
     _df_logging.set_verbosity_error()
@@ -30,14 +30,14 @@ try:
     except Exception:
         pass
 except Exception:
-    pass
+        pass
 # Accelerate logger (used by pipelines)
 try:
     import logging as _pylogging
     from accelerate.logging import get_logger as _acc_get_logger
     _acc_get_logger("accelerate").setLevel(_pylogging.ERROR)
 except Exception:
-    pass
+        pass
 # Specific harmless warning from CLIPTextModel init (position_ids)
 warnings.filterwarnings(
     "ignore",
@@ -138,7 +138,7 @@ try:
 except Exception:
     requests = None
 
-from PySide6.QtCore import Qt, Signal, QSettings
+from PySide6.QtCore import QSettings, QTimer, Qt, Signal
 from PySide6.QtWidgets import (
     QMessageBox,
     QWidget, QVBoxLayout, QHBoxLayout, QLabel, QLineEdit, QTextEdit, QPushButton, QSpinBox,
@@ -299,6 +299,23 @@ class Txt2ImgPane(QWidget):
         self.add_to_queue.clicked.connect(lambda: self._enqueue(run_now=False))
         self.add_and_run.clicked.connect(lambda: self._enqueue(run_now=True))
         self.generate_now.clicked.connect(self._on_generate_clicked)
+        
+        # Busy animation + FS watcher
+        try:
+            self._busy_timer = QTimer(self)
+            self._busy_timer.setInterval(120)
+            self._busy_timer.timeout.connect(self._on_busy_tick)
+            self._busy_frames = ['⠋','⠙','⠹','⠸','⠼','⠴','⠦','⠧','⠇','⠏']
+            self._busy_idx = 0
+            self._busy_active = False
+            self._busy_fs_timer = QTimer(self)
+            self._busy_fs_timer.setInterval(200)
+            self._busy_fs_timer.timeout.connect(self._on_busy_fs_tick)
+            self._busy_watch_dir = None
+            self._busy_watch_t0 = 0.0
+            self._busy_watch_single = False
+        except Exception:
+            pass
 
 
         # Load saved settings last to override other managers
@@ -378,6 +395,19 @@ class Txt2ImgPane(QWidget):
                 QShortcut(QKeySequence("Ctrl+Enter"), self, activated=self._on_generate_clicked)
         except Exception:
             pass
+
+        # --- Lightweight ETA timer (time-based, no per-step) ---
+        try:
+            self._eta_timer = QTimer(self)
+            self._eta_timer.setInterval(500)
+            self._eta_timer.timeout.connect(self._on_eta_tick)
+            self._eta_active = False
+            self._eta_done = False
+            self._eta_t0 = 0.0
+            self._eta_est_total = 0.0
+        except Exception:
+            pass
+
 
 
         # --- Enforce FrameVision defaults every launch (user can still change) ---
@@ -502,8 +532,7 @@ class Txt2ImgPane(QWidget):
                         self.size_combo.setCurrentText(f"{w}x{h} (1:1)" if w==h else f"{w}x{h}")
 
                 except Exception:
-
-                    pass
+                     pass
             if hasattr(self, "size_manual_w"): self.size_manual_w.setValue(w)
             if hasattr(self, "size_manual_h"): self.size_manual_h.setValue(h)
         except Exception:
@@ -994,6 +1023,44 @@ class Txt2ImgPane(QWidget):
         adv_form.addRow(self.hires_helper)
         adv_form.addRow(self.fit_check)
 
+
+        # --- Helpful tooltips for Advanced options ---
+        try:
+            self.sampler.setToolTip("Which sampler/scheduler the diffusion model uses. Affects look, speed and stability.\n• DPM++ 2M (Karras): balanced quality/speed\n• Euler a: fast, stylized (anime)\n• Heun: cinematic contrast\n• UniPC: stable across settings\n• DDIM: softer, fewer steps. Changing sampler can change the ideal step count.")
+        except Exception:
+            pass
+        try:
+            self.attn_slicing.setToolTip("Reduce VRAM usage by splitting attention layers into smaller chunks. Enable on low‑VRAM GPUs. Slightly slower when enabled.")
+        except Exception:
+            pass
+        try:
+            self.vae_device.setToolTip("Where to run the VAE (decoder/encoder).\n• Auto: choose GPU if memory allows\n• GPU: fastest, uses more VRAM\n• CPU: frees VRAM but slower.")
+        except Exception:
+            pass
+        try:
+            self.gpu_index.setToolTip("Select which GPU to use (0 = first device). Only relevant if you have multiple GPUs.")
+        except Exception:
+            pass
+        try:
+            self.threads.setToolTip("Max CPU threads for image I/O and any CPU-side steps (e.g., VAE on CPU). Higher can speed up saves/loads, but too high may reduce UI responsiveness.")
+        except Exception:
+            pass
+        try:
+            self.format_combo.setToolTip("Output image format.\n• PNG: lossless (largest files)\n• JPG: smallest, lossy (choose for web)\n• WEBP: modern balance; may be slower to save.")
+        except Exception:
+            pass
+        try:
+            self.filename_template.setToolTip("Filename pattern for saved images. You can use placeholders like {seed}, {idx}, {width}, {height}, {model}. Example: sd_{seed}_{idx:03d}.png")
+        except Exception:
+            pass
+        try:
+            self.hires_helper.setToolTip("Two‑stage generate→upscale pass to add detail. Slower but sharper—great for portraits, products, and typography.")
+        except Exception:
+            pass
+        try:
+            self.fit_check.setToolTip("Quick, lightweight preview to verify composition/aspect before a full render. Saves time when iterating.")
+        except Exception:
+            pass
         root.addLayout(form)
         self._advanced = _Disclosure("Advanced", adv_body, start_open=False, parent=self)
         root.addWidget(self._advanced)
@@ -1316,6 +1383,118 @@ class Txt2ImgPane(QWidget):
         try: print("[txt2img] autosave wired")
         except Exception: pass
 
+    # === Busy indicator (indeterminate; no ETA) ===
+    def _start_busy(self, watch_dir: str = None, watch_single: bool = False, label: str = "Generating…"):
+        try:
+            self._busy_active = True
+            self.progress.setRange(0, 0)  # indeterminate
+            self.progress.setTextVisible(False)
+        except Exception:
+            pass
+        try:
+            self.status.setText(label)
+        except Exception:
+            pass
+        try:
+            self._busy_idx = 0
+            self._busy_timer.start()
+        except Exception:
+            pass
+        # Optional: stop on first image if single-image run
+        try:
+            self._busy_watch_dir = watch_dir
+            self._busy_watch_single = bool(watch_single)
+            self._busy_watch_t0 = time.time()
+            if self._busy_watch_single and self._busy_watch_dir and self._busy_fs_timer:
+                self._busy_fs_timer.start()
+        except Exception:
+            pass
+
+    def _stop_busy(self, done: bool = False):
+        try:
+            self._busy_timer.stop()
+        except Exception:
+            pass
+        try:
+            if getattr(self, "_busy_fs_timer", None):
+                self._busy_fs_timer.stop()
+        except Exception:
+            pass
+        self._busy_active = False
+        try:
+            self.progress.setRange(0, 100)
+            self.progress.setValue(100 if done else 0)
+            self.progress.setTextVisible(True)
+            self.progress.setFormat("Done" if done else "Stopped")
+        except Exception:
+            pass
+        try:
+            self.status.setText("Ready" if done else "Stopped")
+        except Exception:
+            pass
+
+    
+    def _on_busy_tick(self):
+        # Stop immediately if something else already marked us done.
+        try:
+            if self.progress.minimum() == 0 and self.progress.maximum() != 0:
+                try:
+                    fmt = self.progress.format()
+                except Exception:
+                    fmt = ""
+                try:
+                    val = int(self.progress.value())
+                except Exception:
+                    val = 0
+                if val >= 100 or ("Done" in str(fmt)):
+                    self._stop_busy(done=True)
+                    try:
+                        self.status.setText("Ready")
+                    except Exception:
+                        pass
+                    return
+        except Exception:
+            pass
+        except Exception:
+            pass
+
+        if not getattr(self, "_busy_active", False):
+            return
+        try:
+            self._busy_idx = (self._busy_idx + 1) % len(self._busy_frames)
+            frame = self._busy_frames[self._busy_idx]
+            self.status.setText(f"{frame} Generating…")
+        except Exception:
+            pass
+
+    def _on_busy_fs_tick(self):
+        try:
+            if not self._busy_watch_single or not self._busy_watch_dir:
+                return
+            d = Path(self._busy_watch_dir)
+            if not d.exists():
+                return
+            t0 = float(self._busy_watch_t0 or 0.0)
+            for ext in ("*.png","*.jpg","*.jpeg","*.webp"):
+                for f in d.glob(ext):
+                    try:
+                        if f.stat().st_mtime >= t0:
+                            self._stop_busy(done=True)
+                            return
+                    except Exception:
+                        continue
+        except Exception:
+            pass
+
+    def _stop_busy(self, done: bool = False):
+        try:
+            # Return to determinate to show final state (0% or 100%)
+            self.progress.setRange(0, 100)
+            self.progress.setValue(100 if done else 0)
+            self.progress.setTextVisible(True)
+            self.progress.setFormat("Done" if done else "Stopped")
+        except Exception:
+            pass
 
 
     def _enqueue(self, run_now: bool):
@@ -1361,48 +1540,70 @@ class Txt2ImgPane(QWidget):
         if not job.get('filename_template'):
             job['filename_template'] = 'sd_{seed}_{idx:03d}.png'
 
-        self.status.setText("Generating…")
-        self.progress.setValue(0)
-        steps = int(job.get("steps", 30)); batch = int(job.get("batch", 1))
-        total_steps = max(1, steps * batch)
         try:
-            self.progress.setRange(0, total_steps)
-            self.progress.setValue(0)
-            self.progress.setTextVisible(True)
-            self.progress.setFormat("%v / %m steps (%p%)")
+            self.status.setText("Generating…")
         except Exception:
             pass
+        # Start indeterminate busy animation (watch output dir if single image)
+        try:
+            out_dir = None
+            try:
+                out_dir = str(Path(self.output_path.text()).resolve())
+            except Exception:
+                out_dir = None
+            watch_single = (int(job.get('batch',1)) == 1)
+            self._start_busy(watch_dir=out_dir, watch_single=watch_single)
+        except Exception:
+            try:
+                self._start_busy()
+            except Exception:
+                pass
+
         cancel_flag = threading.Event()
 
         def progress_cb(p):
-            try:
-                # Accept dict step updates or numeric fraction/percent
-                if isinstance(p, dict) and "step" in p:
-                    tot = int(p.get("total") or total_steps)
-                    cur = int(p.get("step") or 0)
-                    if self.progress.maximum() != tot:
-                        self.progress.setRange(0, tot)
-                    self.progress.setValue(max(0, min(tot, cur)))
-                else:
-                    if isinstance(p, (float,)) and p <= 1.0:
-                        cur = int(round(p * total_steps))
-                    else:
-                        cur = int(round((float(p)/100.0) * total_steps))
-                    self.progress.setValue(max(0, min(total_steps, cur)))
-            except Exception:
-                pass
+            return  # no per-step UI
 
         def worker():
             try:
                 res = generate_qwen_images(job, progress_cb=progress_cb, cancel_event=cancel_flag)
                 if res.get("ok"):
-                    self.status.setText("Done")
-                    if job.get("show_in_player") and res.get("files"):
-                        self.fileReady.emit(res["files"][-1])
+                    try:
+                        QTimer.singleShot(0, lambda: self._stop_busy(done=True))
+                    except Exception:
+                        self._stop_busy(done=True)
+                    try:
+                        if job.get("show_in_player") and res.get("files"):
+                            self.fileReady.emit(res["files"][-1])
+                    except Exception:
+                        pass
                 else:
-                    self.status.setText("Failed")
+                    try:
+                        QTimer.singleShot(0, lambda: self._stop_busy(done=False))
+                    except Exception:
+                        self._stop_busy(done=False)
+                    try:
+                        self.status.setText("Failed")
+                    except Exception:
+                        pass
             except Exception as e:
-                self.status.setText(f"Error: {e}")
+                try:
+                    QTimer.singleShot(0, lambda: self._stop_busy(done=False))
+                except Exception:
+                    self._stop_busy(done=False)
+                try:
+                    self.status.setText(f"Error: {e}")
+                except Exception:
+                    pass
+            finally:
+                # Safety: ensure busy stopped
+                def _finalize():
+                    if getattr(self, "_busy_active", False):
+                        self._stop_busy(done=False)
+                try:
+                    QTimer.singleShot(0, _finalize)
+                except Exception:
+                    _finalize()
 
         threading.Thread(target=worker, daemon=True).start()
 

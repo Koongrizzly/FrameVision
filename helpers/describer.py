@@ -5,12 +5,12 @@ import os, json, zipfile, traceback
 from pathlib import Path
 from typing import Optional, Dict, Any
 
-from PySide6.QtCore import QSettings, QSize, QTimer, Qt
+from PySide6.QtCore import QEvent, QSettings, QSize, QTimer, Qt
 from PySide6.QtGui import QAction, QDragEnterEvent, QDropEvent, QIcon
 from PySide6.QtWidgets import (
-    QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton, QPlainTextEdit,
-    QLineEdit, QFileDialog, QGroupBox, QGridLayout, QComboBox, QSpinBox, QDoubleSpinBox, QProgressBar, QToolButton
+    QComboBox, QDoubleSpinBox, QFileDialog, QGridLayout, QGroupBox, QHBoxLayout, QLabel, QLineEdit, QPlainTextEdit, QProgressBar, QPushButton, QSizePolicy, QSpinBox, QToolButton, QVBoxLayout, QWidget
 )
+
 
 
 
@@ -197,6 +197,75 @@ class DescriberWidget(QWidget):
         out_v = QVBoxLayout(out_box)
         self.output = QPlainTextEdit(); self.output.setReadOnly(True); self.output.setMinimumHeight(360)
         out_v.addWidget(self.output)
+        # Auto-size output to fully fit wrapped content; clamp 120–960; persist height when Save settings is ON
+        try:
+            self.output.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+            # keep width flexible but height controlled by our autosize
+            self.output.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+        except Exception:
+            pass
+        def _persist_output_height(h:int):
+            try:
+                # Only persist if user opted in
+                if hasattr(self, "chk_save_settings") and not self.chk_save_settings.isChecked():
+                    return
+                from pathlib import Path as _P; import json as _J
+                pdir = _P(__file__).resolve().parent.parent / "presets" / "setsave"; pdir.mkdir(parents=True, exist_ok=True)
+                pp = pdir / "describer.json"
+                data = {}
+                if pp.exists():
+                    try: data = _J.loads(pp.read_text(encoding="utf-8"))
+                    except Exception: data = {}
+                data["output_height"] = int(h)
+                pp.write_text(_J.dumps(data, indent=2), encoding="utf-8")
+            except Exception:
+                pass
+        def _autosize_output():
+            try:
+                doc = self.output.document()
+                # Make layout aware of current wrap width
+                try:
+                    vw = max(10, self.output.viewport().width() - 2)
+                    doc.setTextWidth(vw)
+                except Exception:
+                    pass
+                # Prefer layout-computed height (handles wrapped lines precisely)
+                try:
+                    h = int(doc.documentLayout().documentSize().toSize().height())
+                except Exception:
+                    fm = self.output.fontMetrics(); h = fm.lineSpacing() * max(1, doc.blockCount())
+                try:
+                    m = self.output.contentsMargins(); fw = getattr(self.output, "frameWidth", lambda: 0)()
+                    h += m.top() + m.bottom() + fw*2
+                except Exception:
+                    pass
+                h = max(120, min(960, h))
+                self.output.setFixedHeight(h)
+                _persist_output_height(h)
+            except Exception:
+                pass
+        # Expose as method so eventFilter can call it
+        self._auto_size_output = _autosize_output
+        try:
+            self.output.textChanged.connect(lambda: QTimer.singleShot(0, _autosize_output))
+            self.output.installEventFilter(self)
+        except Exception:
+            pass
+        try:
+            # Initial height: use saved height if present, then autosize to content
+            from pathlib import Path as _P; import json as _J
+            pp = _P(__file__).resolve().parent.parent / "presets" / "setsave" / "describer.json"
+            if pp.exists():
+                try:
+                    data = _J.loads(pp.read_text(encoding="utf-8"))
+                    if isinstance(data, dict) and "output_height" in data:
+                        h = max(120, min(960, int(data["output_height"]))); self.output.setFixedHeight(h)
+                except Exception:
+                    pass
+            QTimer.singleShot(0, _autosize_output)
+        except Exception:
+            pass
+
         row2 = QHBoxLayout(); out_v.addLayout(row2)
         self.btn_copy = QPushButton("Copy")
         self.btn_copy_prompt = QPushButton("Copy as Prompt")
@@ -248,7 +317,7 @@ class DescriberWidget(QWidget):
         hsave.addWidget(self.chk_save_settings); hsave.addStretch(1); hsave.addWidget(self.btn_defaults)
         gg.addWidget(row_save, r, 0, 1, 2); r+=1
 
-        gg.addWidget(QLabel("max_new_tokens"), r,0); self.sp_max = QSpinBox(); self.sp_max.setRange(16,2048); self.sp_max.setValue(_settings().value("max_new_tokens", 160, int)); gg.addWidget(self.sp_max, r,1); r+=1
+        gg.addWidget(QLabel("max_new_tokens"), r,0); self.sp_max = QSpinBox(); self.sp_max.setRange(16,2048); self.sp_max.setValue(_settings().value("max_new_tokens", 320, int)); gg.addWidget(self.sp_max, r,1); r+=1
         gg.addWidget(QLabel("min_length"), r,0); self.sp_min = QSpinBox(); self.sp_min.setRange(0,1024); self.sp_min.setValue(_settings().value("min_length", 60, int)); gg.addWidget(self.sp_min, r,1); r+=1
         gg.addWidget(QLabel("no_repeat_ngram_size"), r,0); self.sp_ngram = QSpinBox(); self.sp_ngram.setRange(0,10); self.sp_ngram.setValue(_settings().value("no_repeat_ngram_size", 3, int)); gg.addWidget(self.sp_ngram, r,1); r+=1
         gg.addWidget(QLabel("temperature"), r,0); self.sp_temp = QDoubleSpinBox(); self.sp_temp.setRange(0.0,2.0); self.sp_temp.setSingleStep(0.1); self.sp_temp.setValue(_settings().value("temperature", 0.7, float)); gg.addWidget(self.sp_temp, r,1); r+=1
@@ -298,8 +367,18 @@ class DescriberWidget(QWidget):
                 try:
                     if hasattr(self,name): d[name] = str(getattr(self,name).text())
                 except Exception: pass
+            try:
+                if "output_height" in d and hasattr(self, "output"):
+                    h = max(120, min(960, int(d["output_height"])))
+                    self.output.setFixedHeight(h)
+            except Exception:
+                pass
             try: d["save_settings"] = bool(self.chk_save_settings.isChecked())
             except Exception: pass
+            try:
+                if hasattr(self, "output"): d["output_height"] = int(max(120, min(960, self.output.height())))
+            except Exception:
+                pass
             return d
         def _apply(d):
             try:
@@ -346,7 +425,7 @@ class DescriberWidget(QWidget):
                     except Exception: pass
             except Exception: pass
         def _restore_defaults():
-            defaults = {"sp_max":160, "sp_min":60, "sp_ngram":3, "sp_temp":0.7, "sp_topp":0.9, "sp_topk":50, "sp_rep":1.1, "chk_warm":True, "chk_keep":True}
+            defaults = {"sp_max": 320, "sp_min":60, "sp_ngram":3, "sp_temp":0.7, "sp_topp":0.9, "sp_topk":50, "sp_rep":1.1, "chk_warm":True, "chk_keep":True}
             for k,v in defaults.items():
                 try:
                     if hasattr(self,k):
@@ -389,6 +468,20 @@ class DescriberWidget(QWidget):
         # Initialize labels + autoload models
         self._refresh_engine_labels()
         self._ensure_ready_async()
+
+    # Autosize support: recompute when output viewport resizes (wrap-aware)
+    def eventFilter(self, obj, ev):
+        try:
+            if hasattr(self, "output") and obj is self.output and ev.type() == QEvent.Resize:
+                fn = getattr(self, "_auto_size_output", None)
+                if callable(fn):
+                    QTimer.singleShot(0, fn)
+        except Exception:
+            pass
+        try:
+            return super().eventFilter(obj, ev)
+        except Exception:
+            return False
 
     # ----------------- Drag&drop -----------------
     def dragEnterEvent(self, e: QDragEnterEvent) -> None:
@@ -961,7 +1054,7 @@ else:
         self._fv_cancelled = True
         try:
             self.btn_cancel.setEnabled(False)
-            if hasattr(self,"output") and self.output.toPlainText().strip() == "Describing…":
+            if hasattr(self,"output") and self.output.toPlainText().strip() == "Creating the description, this could take a minute":
                 self.output.setPlainText("Cancelling…")
         except Exception: pass
 
@@ -998,7 +1091,7 @@ else:
         except Exception: pass
         try: QGuiApplication.setOverrideCursor(Qt.WaitCursor)
         except Exception: pass
-        try: self.output.setPlainText("Describing…")
+        try: self.output.setPlainText("Creating the description, this could take a minute")
         except Exception: pass
         try: self.prog.setVisible(True); self.prog.setRange(0,0); self.prog.setValue(0)
         except Exception: pass

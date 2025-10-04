@@ -638,6 +638,13 @@ def upscale_photo(job, cfg, mani):
                 job['cmd'] = ' '.join([str(x) for x in cmd])
             except Exception:
                 pass
+            # ## PATCH set produced after model-exe
+            try:
+                if code == 0:
+                    job['produced'] = str(out)
+            except Exception:
+                pass
+
             if code == 0 and not out.exists():
                 _mark_error(job, 'Upscale finished but output file missing.')
                 return 2
