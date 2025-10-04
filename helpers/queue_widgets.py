@@ -604,35 +604,59 @@ class JobRowWidget(QWidget):
 
     
     
+    
+    def _find_source_thumbnail_for_job(self) -> Optional[Path]:
+        # Source (input-based) thumbnail for this job.
+        # Priority:
+        #   1) explicit fields in job/args: source_thumbnail/src_thumbnail/input_thumbnail/source_thumb/thumb_input
+        #   2) derive from INPUT file stem and search thumbs dir
+        d = self.data or {}
+        args = d.get("args") or {}
+
+        # 1) explicit keys
+        for key in ("source_thumbnail","src_thumbnail","input_thumbnail","source_thumb","thumb_input"):
+            try:
+                val = d.get(key) or (args.get(key) if isinstance(args, dict) else None)
+                if val:
+                    pth = Path(str(val)).expanduser()
+                    if pth.exists():
+                        return pth
+            except Exception:
+                pass
+
+        # 2) derive from INPUT stem
+        stem = None
+        try:
+            inp = self._resolve_input_file()
+            stem = inp.stem if inp else None
+        except Exception:
+            stem = None
+        if not stem:
+            return None
+        td = self._thumbs_dir()
+        try:
+            candidates = []
+            for ext in (".png", ".jpg", ".jpeg", ".webp"):
+                candidates.extend(td.glob(stem + "*" + ext))
+            if not candidates:
+                return None
+            best = max(candidates, key=lambda p: p.stat().st_mtime)
+            return best
+        except Exception:
+            return None
+
+
     def _set_thumbnail(self) -> None:
-        """
-        Running/Pending: show INPUT preview (video first frame via ffmpeg, else image) or any explicit thumbnail.
-        Done/Failed: show OUTPUT preview (video first frame via ffmpeg, else image) or explicit thumbnail.
-        All thumbnails are rounded (8px) with a subtle border and cached (LRU 128).
-        """
+        """Render a thumbnail for this row.")"""
         try:
             w, h = self.thumb.width(), self.thumb.height()
             status = (self._status_from_fs() or self.status).lower()
-
-            # 0) Try explicit/derived thumbnail first
-            try:
-                p = self._find_thumbnail_for_job()
-                if p and p.exists():
-                    mt = p.stat().st_mtime
-                    pm = _cached_scaled_rounded_pixmap(str(p), w, h, mt, 8)
-                    if not pm.isNull():
-                        self.thumb.setPixmap(pm)
-                        self.thumb.setToolTip(str(p))
-                        return
-            except Exception:
-                pass
 
             def _show_from_path(path: Path, is_input: bool = False) -> bool:
                 try:
                     if not path or not path.exists():
                         return False
                     suf = path.suffix.lower()
-                    # If video -> generate/get preview
                     if suf in VIDEO_EXTS:
                         thumbs = self._thumbs_dir()
                         suffix = "_preview_input" if is_input else "_preview"
@@ -645,7 +669,6 @@ class JobRowWidget(QWidget):
                                 self.thumb.setToolTip(str(prev))
                                 return True
                         return False
-                    # If image -> show directly
                     if suf in (".png",".jpg",".jpeg",".webp",".bmp",".gif",".tif",".tiff"):
                         mt = path.stat().st_mtime
                         pm = _cached_scaled_rounded_pixmap(str(path), w, h, mt, 8)
@@ -658,22 +681,61 @@ class JobRowWidget(QWidget):
                 return False
 
             if status in ("running","queued","pending"):
-                # Prefer INPUT while the job is not done
-                src = self._resolve_input_file()
-                if _show_from_path(src, is_input=True):
+                # 1) Prefer source (input-based) job thumbnail
+                try:
+                    sp = self._find_source_thumbnail_for_job()
+                    if sp and sp.exists():
+                        mt = sp.stat().st_mtime
+                        pm = _cached_scaled_rounded_pixmap(str(sp), w, h, mt, 8)
+                        if not pm.isNull():
+                            self.thumb.setPixmap(pm)
+                            self.thumb.setToolTip(str(sp))
+                            return
+                except Exception:
+                    pass
+
+                # 2) Next, any explicit/derived generic thumbnail
+                try:
+                    pth = self._find_thumbnail_for_job()
+                    if pth and pth.exists():
+                        mt = pth.stat().st_mtime
+                        pm = _cached_scaled_rounded_pixmap(str(pth), w, h, mt, 8)
+                        if not pm.isNull():
+                            self.thumb.setPixmap(pm)
+                            self.thumb.setToolTip(str(pth))
+                            return
+                except Exception:
+                    pass
+
+                # 3) Then, show preview directly from INPUT
+                inp = self._resolve_input_file()
+                if _show_from_path(inp, is_input=True):
                     return
-                # Fallback to whatever output we can guess (useful if a preview already exists)
+
+                # 4) Fallback to OUTPUT if preview already exists
                 outp = self._resolve_output_file()
-                if _show_from_path(outp):
+                if _show_from_path(outp, is_input=False):
                     return
+
             else:
-                # Done/failed -> prefer OUTPUT
+                # Finished/failed
                 outp = self._resolve_output_file()
-                if _show_from_path(outp):
+                if _show_from_path(outp, is_input=False):
                     return
-                # fallback to input (maybe job produced no media)
-                src = self._resolve_input_file()
-                if _show_from_path(src, is_input=True):
+                # Fallbacks
+                try:
+                    pth = self._find_thumbnail_for_job()
+                    if pth and pth.exists():
+                        mt = pth.stat().st_mtime
+                        pm = _cached_scaled_rounded_pixmap(str(pth), w, h, mt, 8)
+                        if not pm.isNull():
+                            self.thumb.setPixmap(pm)
+                            self.thumb.setToolTip(str(pth))
+                            return
+                except Exception:
+                    pass
+                inp = self._resolve_input_file()
+                if _show_from_path(inp, is_input=True):
                     return
 
             # Final fallback: clear
