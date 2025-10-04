@@ -134,23 +134,13 @@
 <h3>📝 Describe (AI)</h3>
 <ul><li>Engine: Qwen2‑VL (2B Instruct) — rich captions, OCR‑ish text, and multi‑turn Q&amp;A; GPU/CUDA recommended (CPU works but slower).</li><li>Quick actions: Describe file(s), whole folder, or the current video frame; Cancel stops a running job.</li><li>Presets &amp; controls: preset menu (e.g., “General — detail‑based”), Promptify output toggle, Detail level (Short/Long), and Decode style.</li><li>Outputs &amp; export: inline viewer with Copy, Copy as Prompt, Save .txt, and Save .json (sidecar).</li><li>Advanced: optional negative prompt, Test image path, CPU threads, model root/status. “Advanced settings” exposes tokens/length, no‑repeat n‑gram, temperature, top‑p/k, repetition penalty, Warm model on load, Keep in memory.</li></ul>
 <button class="btn-more" data-modal="m-describe">Details</button></div><div class="card" style="animation-delay:.22s">
-<h3>🖌️ TXT→IMG</h3><ul><li>SDXL & SD1.5 single‑file <code>.safetensors</code> loader; auto CUDA/CPU dtype; default to DreamShaper if unset.</li><li>Model picker + refresh/browse; output size presets (square/portrait/landscape) with manual W×H and ‘Lock aspect’.</li><li>Two SDXL LoRA slots with adjustable strength; adapter or fuse fallback when needed.</li><li>Samplers: DPM++ 2M (Karras), Euler a, Euler, Heun, UniPC, DDIM.</li><li>Seed policies: <b>Fixed</b> / <b>Random</b> / <b>Increment</b>; deterministic per‑image seeds; Batch 1–64.</li><li>Controls: Steps, CFG scale, attention slicing, VAE device (auto/cpu/gpu), GPU index & threads.</li><li>Output: folder picker; PNG/JPG/WEBP; filename template <code>sd_{seed}_{idx:03d}.png</code>.</li><li>Progress bar + per‑run JSON sidecar; direct run or queue‑native; optional player auto‑open.</li></ul><button class="btn-more" data-modal="m-txt2img">Details</button>
+<h3>🖌️ TXT→IMG</h3><ul><li>SDXL &amp; SD1.5 single‑file <code>.safetensors</code> loader; auto CUDA/CPU dtype; default to DreamShaper if unset.</li><li>Model picker + refresh/browse; output size presets (square/portrait/landscape) with manual W×H and ‘Lock aspect’.</li><li>Two SDXL LoRA slots with adjustable strength; adapter or fuse fallback when needed.</li><li>Samplers: DPM++ 2M (Karras), Euler a, Euler, Heun, UniPC, DDIM.</li><li>Seed policies: <b>Fixed</b> / <b>Random</b> / <b>Increment</b>; deterministic per‑image seeds; Batch 1–64.</li><li>Controls: Steps, CFG scale, attention slicing, VAE device (auto/cpu/gpu), GPU index &amp; threads.</li><li>Output: folder picker; PNG/JPG/WEBP; filename template <code>sd_{seed}_{idx:03d}.png</code>.</li><li>Progress bar + per‑run JSON sidecar; direct run or queue‑native; optional player auto‑open.</li></ul><button class="btn-more" data-modal="m-txt2img">Details</button>
 </div>
 <div class="card" style="animation-delay:.25s">
 <h3>🧰 Tools</h3>
 <ul><li>Speed change for videos; audio retime handled; batch‑ready.</li><li>Resize to target width/height with keep‑aspect; presets &amp; batch.</li><li>Export GIF using palettegen/paletteuse; FPS &amp; scale controls.</li><li>Extract frames to images for thumbnails or analysis.</li><li>Trim by start/end timecodes; queue &amp; batch operations.</li><li>Crop video region; fast workflow with queue integration.</li><li>Quality / Size Video: CRF or bitrate modes; presets; popular codecs.</li><li>Image Quality / Convert: JPG/WEBP/PNG, quality %, max size; keep EXIF; target size (KB/MB).</li><li>Add/replace audio track on a video (mux).</li><li>Batch tools for files/folders; sensible defaults with clear error messages.</li></ul>
 <button class="btn-more" data-modal="m-tools">Details</button></div>
 
-<div class="card" style="animation-delay:.28s">
-<h3>🎬 Editor</h3>
-<ul>
-<li>Drag‑drop media (video, image, audio) into timelines — auto‑creates/chooses a compatible track.</li>
-<li>Trim handles with snap/grid; ghost preview while dragging; ripple &amp; glue options.</li>
-<li>Keyboard: ←/→ nudge (±1/±10 frames), ↑/↓ move track, Delete &amp; Ripple delete, multiselect + Group/Ungroup.</li>
-<li>Markers with next/prev, Start/End jump, zoom to selection/fit, mouse‑wheel zoom &amp; horizontal scroll.</li>
-</ul>
-<button class="btn-more" data-modal="m-editor">Details</button>
-</div>
 <div class="card" style="animation-delay:.35s">
 <h3>⚙️ Settings</h3>
 <ul>
@@ -272,45 +262,24 @@
 </div>
 </div>
 <div class="sep"></div>
-
 <!-- To-Do card -->
-<div class="card">
-  <h3 class="card-title">📌 To-Do</h3>
-  <div class="card-body">
-    <ul>
-<ul>	
-      <li><b>1.</b> Check why txt2img randomly makes the app exit</li>
-      <li><b>2.</b> Show popup when file already exists: Overwrite / Rename / Cancel</li>
-      <li><b>3.</b> Remove Settings tab save toggle</li>
-      <li><b>4.</b> Check Dump Log button & reconfigure with popup window</li>
-      <li><b>5.</b> Double-click opens full screen (currently only exits)</li>
-      <li><b>6.</b> Create URL download list for SDXL & SD1.5 with selection menu in installer</li>
-      <li><b>7.</b> Create more visual layer intros</li>
-      <li><b>8.</b> Right-click context menu: play next/previous, convert to…, edit tag</li>
-      <li><b>9.</b> Check “Clean” button for temp files, etc.</li>
-      <li><b>10.</b> Add more features, bugfixing and polishing (mini video editor base)</li>
-      <li><b>11.</b> Update acknowledge base & Q&A</li>
-    </ul>
-  </div>
-</div>
-</ul>
+
 
 <!-- Roadmap card -->
 <div class="card">
-  <h3 class="card-title">🗺️ Roadmap</h3>
-  <div class="card-body">
-    <ul>
-      <li><b>Compare panel (A/B):</b> Side-by-side, swipe, overlay; synced play/pause/seek; frame-step; loop in/out; linked or independent zoom/pan; 1:1 / Fit; loupe; export composite image/clip.</li>
-      <li><b>Easter eggs:</b> more delightful surprises.</li>
-      <li><b>R2.</b> Text and image to video</li>
-      <li><b>R3.</b> Sound AI that can “watch a video” and add the correct sound</li>
-    </ul>
-  </div>
+<h3 class="card-title">🗺️ Roadmap</h3>
+<div class="card-body">
+<ul>
+<li><b>Compare panel (A/B):</b> Side-by-side, swipe, overlay; synced play/pause/seek; frame-step; loop in/out; linked or independent zoom/pan; 1:1 / Fit; loupe; export composite image/clip.</li>
+<li><b>Easter eggs:</b> more delightful surprises.</li>
+<li><b>R2.</b> Text and image to video</li>
+<li><b>R3.</b> Sound AI that can “watch a video” and add the correct sound</li>
+</ul>
 </div>
-
+</div>
 <button class="btn-more" data-modal="m-roadmap-single">Details</button>
-</div>
-</div>
+
+
 <div class="sep"></div>
 <div class="footer">
     Built by <b>Contrinsan</b>. Feature writing &amp;/bug‑fix help by <b>ChatGPT 5 </b>.<br/>
@@ -327,34 +296,7 @@
 <li><b>Overlay settings:</b> handle size &amp; overlay opacity sliders (persist via QSettings).</li>
 <li><b>Better selection logic:</b> sliders act on selected items (or all if none selected); continuous tracking for smooth edits.</li>
 </ul></div></dialog>
-<dialog class="modal" id="m-todo"><div class="pop">
-<button class="x" data-close="">Close</button>
-<h3>Detailed To‑Do</h3>
-<ul>
-<li>Free‑range crop with draggable handles inside the creator.</li>
-<li>Movable 16:9 / 9:16 presets with pre‑position.</li>
-<li>Rainbow/arc text slider for curved baselines &amp; path‑follow.</li>
-<li>Bulk rename: add date, strip N chars start/end, normalize.</li>
-</ul></div></dialog>
 
-<dialog class="modal" id="m-editor">
-<div class="pop">
-<button class="x" data-close="">Close</button>
-<h3>Editor — timelines &amp; shortcuts</h3>
-<div class="meta">CapCut/OpenShot‑style editing • Snapping • Ripple • Markers</div>
-<ul>
-<li><b>Media panel:</b> thumbnails with quick preview (double‑click), delete key to remove; drag to timeline; truncates long names (full name on hover).</li>
-<li><b>Tracks:</b> per‑track <b>Mute / Solo / Lock</b> and color labels; header on the left stays aligned with the ruler.</li>
-<li><b>Trim &amp; move:</b> draggable left/right handles with snap grid (adjustable step and tolerance); ghost preview shows where a clip will land before drop.</li>
-<li><b>Ripple / Glue:</b> ripple delete closes gaps; glue snapping keeps adjacent clips tight.</li>
-<li><b>Keyboard:</b> ←/→ = ±1 frame (Shift = ±10), ↑/↓ move to prev/next compatible track, Delete remove, Ctrl+Delete ripple delete, Ctrl+G group, Ctrl+Shift+G ungroup.</li>
-<li><b>Markers &amp; nav:</b> M add marker; , / . go to prev/next; <b>Start/End</b> buttons jump to project or selection edges.</li>
-<li><b>Zoom &amp; scroll:</b> mouse‑wheel timeline zoom, zoom to <b>selection</b> / <b>fit</b>, horizontal scrollbar.</li>
-<li><b>Preview:</b> resizable popup for images/video/audio with play/pause &amp; scrub; stops playback on close.</li>
-<li><b>Layout:</b> draggable divider between media panel and timeline to allocate space.</li>
-</ul>
-</div>
-</dialog>
 
 </main>
 <!-- Popups -->
@@ -425,7 +367,6 @@
 <dialog class="modal" id="m-roadmap-single">
 <div class="pop">
 <button class="x" data-close="">Close</button>
-
 </div>
 </dialog><script>
   // modal wiring
@@ -449,30 +390,26 @@
     });
   });
 </script>
-
-
 <div class="modal" id="m-queue">
-  <div class="modal-content">
-    <span class="modal-close" data-close>&times;</span>
-    <h2>Queue — full feature list</h2>
-    <p>Advanced, resilient processing queue with rich job rows and player integration.</p>
-    <ul><li>Safe delete/cleanup with guarded file ops.</li>
+<div class="modal-content">
+<span class="modal-close" data-close="">×</span>
+<h2>Queue — full feature list</h2>
+<p>Advanced, resilient processing queue with rich job rows and player integration.</p>
+<ul><li>Safe delete/cleanup with guarded file ops.</li>
 <li>Theme‑aware icons and compact, hoverable row cards.</li>
 <li>Never returns the source file by mistake.</li>
 <li>Robust output resolver: single file, lists, or dir with scoring.</li>
-
-      <li>Reorder, delete, pause/resume, recover running → pending.</li>
-      <li>Groups for Running/Pending/Finished; compact rows with status strip and progress.</li>
-      <li>ETA calculation with small fudge to avoid early zero.</li>
-      <li>Context menu and toolbuttons: Play, Open folder, Delete, View JSON.</li>
-      <li>Auto‑play latest finished output (config‑persisted toggle).</li>
-      <li>Deterministic output resolver with name/time/size scoring.</li>
-      <li>Internal player preferred; OS fallback; Recents list update.</li>
-      <li>Theme‑aware icons, hover effects, and live updates while running.</li>
-      <li>Paranoid file safety: refuses to delete source; errors handled gracefully.</li>
-    </ul>
-  </div>
+<li>Reorder, delete, pause/resume, recover running → pending.</li>
+<li>Groups for Running/Pending/Finished; compact rows with status strip and progress.</li>
+<li>ETA calculation with small fudge to avoid early zero.</li>
+<li>Context menu and toolbuttons: Play, Open folder, Delete, View JSON.</li>
+<li>Auto‑play latest finished output (config‑persisted toggle).</li>
+<li>Deterministic output resolver with name/time/size scoring.</li>
+<li>Internal player preferred; OS fallback; Recents list update.</li>
+<li>Theme‑aware icons, hover effects, and live updates while running.</li>
+<li>Paranoid file safety: refuses to delete source; errors handled gracefully.</li>
+</ul>
 </div>
-
+</div>
 </body>
 </html>

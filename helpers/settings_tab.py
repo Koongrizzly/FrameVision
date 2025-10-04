@@ -13,6 +13,7 @@ try:
     from helpers.framevision_app import apply_theme, config, save_config
 except Exception:
     apply_theme=None; config={}
+import os, shutil
 
 # ---- small filesystem helpers ------------------------------------------------------------
 def _clean_directory_contents(path: str) -> None:
@@ -138,7 +139,7 @@ def _theme_row(page: QWidget) -> QWidget:
     ov_toggle.setToolTip("Enable a visual overlay during the startup intro image (e.g., Matrix rain).")
 
     ov_combo = QComboBox()
-    ov_combo.addItems(["Random","Matrix (Green)","Matrix (Blue)","Bokeh"])
+    ov_combo.addItems(["Random","Matrix (Green)","Matrix (Blue)","Bokeh","Rain","FirefliesParallax","StarfieldHyperjump","CometTrails","AuroraFlow"])
 
     ov_preview = QCheckBox("Preview in Settings")
     ov_preview.setToolTip("If enabled, shows the intro overlay briefly in the Settings preview.")
@@ -229,7 +230,34 @@ def _buttons_row(page: QWidget) -> QWidget:
         # but pre-check "temp" and "__pycache__" options by default.
         try:
             from helpers.settings_boost import _make_cache_dialog
+            
             dlg = _make_cache_dialog(page)
+            # --- Runtime UI tweaks without touching settings_boost.py ---
+            try:
+                # Hide HuggingFace cache option entirely
+                for cb in dlg.findChildren(QtWidgets.QCheckBox):
+                    t = (cb.text() or "").lower()
+                    if "huggingface" in t or "hugging face" in t:
+                        cb.setChecked(False)
+                        cb.setVisible(False)
+                    # Update thumbnails label and keep the checkbox available
+                    if "thumbnails" in t:
+                        try:
+                            cb.setText("Thumbnails (last results) — remove items older than 7 days")
+                        except Exception:
+                            pass
+                # Update the tip label
+                for lab in dlg.findChildren(QtWidgets.QLabel):
+                    txt = (lab.text() or "").strip().lower()
+                    if txt.startswith("tip:"):
+                        try:
+                            lab.setText("Tip: Do this every now and then to keep a clean running app")
+                        except Exception:
+                            pass
+                        break
+            except Exception:
+                pass
+
             try:
                 # Heuristically find relevant checkboxes by text and enable them.
                 for cb in dlg.findChildren(QtWidgets.QCheckBox):

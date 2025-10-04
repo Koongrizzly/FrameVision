@@ -213,12 +213,9 @@ except Exception as _e:
     Txt2ImgPane = None
 # <<< FRAMEVISION_TXT2IMG_END
 # >>> FRAMEVISION_EDITOR_BEGIN
-# Safe import of the Mini Editor pane; never crash app on failure.
-try:
-    from helpers.editor import EditorPane
-except Exception as _e:
-    print("[framevision] editor tab import failed:", _e)
-    EditorPane = None
+
+
+EditorPane = None  # Editor disabled
 # <<< FRAMEVISION_EDITOR_END
 
 
@@ -2719,6 +2716,51 @@ _fv_wire_diag(VideoPane)
 _fv_wire_music(VideoPane)
 class MainWindow(QMainWindow):
 
+
+    def _restore_active_tab_by_name(self):
+            try:
+                ss = config.get("session_restore", {})
+            except Exception:
+                ss = {}
+            try:
+                name_saved = str(ss.get("active_tab_name", "")).strip()
+            except Exception:
+                name_saved = ""
+            try:
+                idx_saved = int(ss.get("active_tab", 0) or 0)
+            except Exception:
+                idx_saved = 0
+            # Prefer name match (case-insensitive, normalized spaces)
+            def _norm(x: str) -> str:
+                try:
+                    return " ".join(str(x).split()).strip().lower()
+                except Exception:
+                    return str(x).strip().lower()
+            if name_saved:
+                target = _norm(name_saved)
+                found = -1
+                try:
+                    for _i in range(self.tabs.count()):
+                        if _norm(self.tabs.tabText(_i)) == target:
+                            found = _i
+                            break
+                except Exception:
+                    found = -1
+                if found >= 0:
+                    try:
+                        self.tabs.setCurrentIndex(found)
+                        return
+                    except Exception:
+                        pass
+            # Fallback to clamped saved index
+            try:
+                if idx_saved < 0 or idx_saved >= self.tabs.count():
+                    idx_saved = max(0, min(self.tabs.count()-1, idx_saved))
+                self.tabs.setCurrentIndex(idx_saved)
+            except Exception:
+                pass
+        
+
     def _ensure_scrollbar_on_tabs(self, names):
         from PySide6.QtWidgets import QScrollArea, QFrame
         from PySide6.QtCore import QUrl, Qt
@@ -2782,17 +2824,16 @@ class MainWindow(QMainWindow):
             print("[framevision] txt2img tab insert failed:", _e)
         # <<< FRAMEVISION_TXT2IMG_END
         # >>> FRAMEVISION_EDITOR_BEGIN
-        # Safe import of the Mini Editor pane; never crash app on failure.
-        try:
-            from helpers.editor import EditorPane
-        except Exception as _e:
-            print("[framevision] editor tab import failed:", _e)
-            EditorPane = None
-        # <<< FRAMEVISION_EDITOR_END
+
+        # Editor tab disabled by request — skip import entirely.
+        EditorPane = None
+# <<< FRAMEVISION_EDITOR_END
 
         # >>> FRAMEVISION_WAN22_VIBEVOICE_TABS_BEGIN
-# WAN22/VibeVoice tabs disabled: skip insertion.
-# <<< FRAMEVISION_WAN22_VIBEVOICE_TABS_END
+
+
+        # WAN22/VibeVoice tabs disabled: skip insertion.
+        # <<< FRAMEVISION_WAN22_VIBEVOICE_TABS_END
         # GAB (QuickActionDriver) removed cleanly
         # The analyzer integration was disabled to avoid runtime errors.
         # (Previously initialized QuickActionDriver and installed it here.)
@@ -2815,48 +2856,9 @@ class MainWindow(QMainWindow):
         self.presets_tab = PresetsPane(self)
         self.settings = SettingsPane(self)
         # >>> FRAMEVISION_EDITOR_INIT_BEGIN
-        try:
-            if 'EditorPane' in globals() and EditorPane is not None:
-                self.mini_editor = EditorPane(self)
-                # Wire Mini Editor signals to the internal VideoPane player
-                try:
-                    def _preview_media(path, pos_ms):
-                        try:
-                            if path:
-                                self.video.open(path)
-                        except Exception:
-                            pass
-                        try:
-                            if pos_ms is not None:
-                                self.video.seek(int(pos_ms))
-                        except Exception:
-                            pass
-                    self.mini_editor.preview_media.connect(_preview_media)
-                except Exception:
-                    pass
-                try:
-                    def _transport(cmd: str):
-                        try:
-                            if cmd == "play":
-                                self.video.play()
-                            elif cmd == "pause":
-                                self.video.pause()
-                            elif cmd == "toggle":
-                                self.video.toggle()
-                            elif isinstance(cmd, str) and cmd.startswith("seek:"):
-                                ms = int(cmd.split(":",1)[1])
-                                self.video.seek(ms)
-                        except Exception:
-                            pass
-                    self.mini_editor.transport_request.connect(_transport)
-                except Exception:
-                    pass
-            else:
-                self.mini_editor = None
-        except Exception as _e:
-            print("[framevision] editor pane init failed:", _e)
-            self.mini_editor = None
-        # <<< FRAMEVISION_EDITOR_INIT_END
+
+        self.mini_editor = None  # Editor disabled
+# <<< FRAMEVISION_EDITOR_INIT_END
 
 
         self.video.frameCaptured.connect(self.describe.on_pause_capture)
@@ -2864,12 +2866,9 @@ class MainWindow(QMainWindow):
         for name, w in [("Edit", self.edit),("Tools", self.tools),("Describe", self.describe),("Queue", self.queue),("Models", self.models),("Presets", self.presets_tab),("Settings", self.settings)]:
             self.tabs.addTab(w, name)
         # >>> FRAMEVISION_EDITOR_ADDTAB_BEGIN
-        try:
-            if getattr(self, "mini_editor", None) is not None:
-                self.tabs.addTab(self.mini_editor, "Editor")
-        except Exception as _e:
-            print("[framevision] editor tab add failed:", _e)
-        # <<< FRAMEVISION_EDITOR_ADDTAB_END
+
+        # Editor disabled: do not add tab.
+# <<< FRAMEVISION_EDITOR_ADDTAB_END
 
 
         splitter = QSplitter(Qt.Horizontal, self)
@@ -2927,6 +2926,27 @@ class MainWindow(QMainWindow):
         # Restore saved UI state (tabs, splitters, geometry, etc.)
         try:
             state_persist.restore_all(self)
+        except Exception:
+            pass
+        # Finalize tab selection after all inserts using a queued call
+        try:
+            from PySide6.QtCore import QTimer
+            QTimer.singleShot(0, self._restore_active_tab_by_name)
+        except Exception:
+            pass
+        # Ensure correct active tab after potential tab removals
+        try:
+            ss = config.get("session_restore", {})
+            name_saved = str(ss.get("active_tab_name", "")).strip()
+            idx = int(ss.get("active_tab", 0) or 0)
+            if name_saved:
+                for _i in range(self.tabs.count()):
+                    if str(self.tabs.tabText(_i)).strip() == name_saved:
+                        idx = _i
+                        break
+            if idx < 0 or idx >= self.tabs.count():
+                idx = 0
+            self.tabs.setCurrentIndex(idx)
         except Exception:
             pass
         # Enforce a real, visible vertical scrollbar on Tools
@@ -3043,6 +3063,8 @@ class MainWindow(QMainWindow):
         ss["is_maximized"] = bool(self.isMaximized())
         ss["is_fullscreen"] = bool(self.isFullScreen())
         ss["active_tab"] = int(self.tabs.currentIndex())
+        
+        ss["active_tab_name"] = str(self.tabs.tabText(self.tabs.currentIndex()))
         ss["last_file"] = str(self.current_path) if self.current_path else ""
         try: ss["last_position_ms"] = int(self.video.position_ms())
         except Exception: ss["last_position_ms"] = 0

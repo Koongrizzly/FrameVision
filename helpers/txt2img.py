@@ -1380,7 +1380,7 @@ class Txt2ImgPane(QWidget):
             if obj is None: 
                 continue
             connect_sig(obj, sig)
-        try: print("[txt2img] autosave wired")
+        try: print("Autosave wired")
         except Exception: pass
 
     # === Busy indicator (indeterminate; no ETA) ===
