@@ -249,13 +249,192 @@ def install_info_menu(main_window):
     # Actions
     act_kb = QAction("Knowledge && Q&A…", main_window)
     act_kb.triggered.connect(lambda: _open_kb_dialog(main_window))
-
+    
     act_html = QAction("Feature Guide (HTML)…", main_window)
     act_html.triggered.connect(_open_html_guide)
-
-    # Clear old duplicates, then add
+    
+    act_update = QAction("Updates…", main_window)
+    act_update.setToolTip("Update from GitHub (helpers/presets or full app)")
+    act_update.triggered.connect(lambda: _open_update_dialog(main_window))
+    
     existing = {a.text(): a for a in info_menu.actions()}
     if act_kb.text() not in existing:
         info_menu.addAction(act_kb)
     if act_html.text() not in existing:
         info_menu.addAction(act_html)
+    if act_update.text() not in existing:
+        info_menu.addAction(act_update)
+
+
+# ===== Update Dialog & GitHub updater helpers =====
+import shutil
+import tempfile
+import zipfile as _zipfile
+import traceback
+from datetime import datetime
+from urllib.request import Request, urlopen
+from PySide6.QtWidgets import (
+    QPushButton, QFileDialog, QPlainTextEdit, QSpacerItem, QSizePolicy
+)
+
+GITHUB_OWNER = "Koongrizzly"
+GITHUB_REPO = "FrameVision"
+
+def _http_get(url: str, headers: dict | None = None, timeout: int = 25) -> bytes:
+    req = Request(url, headers=headers or {})
+    with urlopen(req, timeout=timeout) as r:
+        return r.read()
+
+def _latest_release_zip_url(owner: str, repo: str) -> tuple[str, str]:
+    """Return (zipball_url, tag_name) for the newest release. Falls back to default branch zip if no releases."""
+    base = f"https://api.github.com/repos/{owner}/{repo}"
+    h = {"Accept": "application/vnd.github+json"}
+    # Try latest release
+    try:
+        data = json.loads(_http_get(f"{base}/releases/latest", headers=h).decode("utf-8"))
+        tag = (data.get("tag_name") or "").lstrip("v")
+        zip_url = data.get("zipball_url")
+        if zip_url:
+            return zip_url, tag or "latest"
+    except Exception:
+        pass
+    # Fallback: default branch
+    try:
+        repo_info = json.loads(_http_get(f"{base}", headers=h).decode("utf-8"))
+        default_branch = repo_info.get("default_branch", "main")
+        return f"{base}/zipball/{default_branch}", default_branch
+    except Exception as e:
+        raise RuntimeError(f"Unable to determine latest release or branch: {e}")
+
+def _download_latest_zip(owner: str, repo: str) -> tuple[Path, str]:
+    zip_url, tag = _latest_release_zip_url(owner, repo)
+    data = _http_get(zip_url, headers={"Accept": "application/vnd.github+json"})
+    tmpdir = Path(tempfile.mkdtemp(prefix="framevision_update_"))
+    zpath = tmpdir / f"{repo}_{tag}.zip"
+    zpath.write_bytes(data)
+    return zpath, tag
+
+def _extract_selected(zpath: Path, dest_root: Path, mode: str):
+    """mode: 'partial' (helpers + presets/viz) or 'full' (entire repo)."""
+    with _zipfile.ZipFile(zpath, "r") as zf:
+        for m in zf.infolist():
+            # Skip directories
+            if m.is_dir():
+                continue
+            # Zipball has root/… path; drop the first component
+            parts = Path(m.filename).parts
+            if len(parts) < 2:
+                continue
+            rel = Path(*parts[1:])  # path inside repo
+            if mode == "partial":
+                # Only helpers/* and presets/viz/*
+                if not (
+                    (len(rel.parts) >= 1 and rel.parts[0] == "helpers") or
+                    (len(rel.parts) >= 2 and rel.parts[0] == "presets" and rel.parts[1] == "viz")
+                ):
+                    continue
+            # Compute output path and ensure parent exists
+            out_path = dest_root / rel
+            out_path.parent.mkdir(parents=True, exist_ok=True)
+            with zf.open(m, "r") as src, open(out_path, "wb") as dst:
+                shutil.copyfileobj(src, dst)
+
+def _create_backup_zip(app_root: Path, target_dir: Path) -> Path:
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    name = f"{app_root.name}_backup_{ts}.zip"
+    out = target_dir / name
+    with zipfile.ZipFile(out, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+        for p in app_root.rglob("*"):
+            # Skip backup files and __pycache__
+            if "__pycache__" in p.parts:
+                continue
+            if p.is_file():
+                arc = str(p.relative_to(app_root))
+                zf.write(p, arcname=arc)
+    return out
+
+class UpdateDialog(QDialog):
+    def __init__(self, parent: QWidget | None = None):
+        super().__init__(parent)
+        self.setWindowTitle("FrameVision — Update from GitHub")
+        self.resize(560, 320)
+
+        info = QLabel(
+            "<b>Warning:</b> Updating will <b>overwrite</b> local files that you've modified "
+            "(e.g., in <code>helpers/</code> or <code>presets/viz/</code>).<br>"
+            "It's strongly recommended to create a backup ZIP first."
+        )
+        info.setWordWrap(True)
+
+        self.log = QPlainTextEdit(self)
+        self.log.setReadOnly(True)
+        self.log.setPlaceholderText("Update log will appear here…")
+        self.log.setMaximumBlockCount(2000)
+
+        btn_backup = QPushButton("Create backup ZIP…", self)
+        btn_partial = QPushButton("Update Python files only (helpers + presets/viz)", self)
+        btn_full = QPushButton("Update (entire app)", self)
+        btn_cancel = QPushButton("Cancel", self)
+
+        btn_backup.clicked.connect(self._do_backup)
+        btn_partial.clicked.connect(lambda: self._do_update("partial"))
+        btn_full.clicked.connect(lambda: self._do_update("full"))
+        btn_cancel.clicked.connect(self.reject)
+
+        # Layout
+        v = QVBoxLayout(self)
+        v.addWidget(info)
+        v.addSpacing(8)
+        v.addWidget(self.log, 1)
+
+        h = QHBoxLayout()
+        h.addWidget(btn_backup)
+        h.addItem(QSpacerItem(10, 10, QSizePolicy.Expanding, QSizePolicy.Minimum))
+        h.addWidget(btn_partial)
+        h.addWidget(btn_full)
+        h.addWidget(btn_cancel)
+        v.addLayout(h)
+
+    def _append(self, text: str):
+        self.log.appendPlainText(text)
+
+    def _do_backup(self):
+        folder = QFileDialog.getExistingDirectory(self, "Select folder to save backup ZIP")
+        if not folder:
+            return
+        try:
+            self.setEnabled(False)
+            self._append("Creating backup…")
+            out = _create_backup_zip(APP_ROOT, Path(folder))
+            self._append(f"Backup saved: {out}")
+            QMessageBox.information(self, "Backup created", f"Backup ZIP saved to:\n{out}")
+        except Exception as e:
+            self._append("Backup failed:\n" + traceback.format_exc())
+            QMessageBox.critical(self, "Backup failed", str(e))
+        finally:
+            self.setEnabled(True)
+
+    def _do_update(self, mode: str):
+        assert mode in ("partial", "full")
+        try:
+            self.setEnabled(False)
+            self._append("Fetching latest release…")
+            zpath, tag = _download_latest_zip(GITHUB_OWNER, GITHUB_REPO)
+            self._append(f"Downloaded release/branch zip: {zpath.name} (tag: {tag})")
+            self._append("Applying update… (this may take a moment)")
+            _extract_selected(zpath, APP_ROOT, "partial" if mode == "partial" else "full")
+            self._append("Update complete.")
+            QMessageBox.information(self, "Update complete",
+                                    f"Updated from GitHub ({tag}).\n"
+                                    f"Mode: {'Python files only' if mode=='partial' else 'Full app'}.\n\n"
+                                    "You may need to restart FrameVision.")
+        except Exception as e:
+            self._append("Update failed:\n" + traceback.format_exc())
+            QMessageBox.critical(self, "Update failed", str(e))
+        finally:
+            self.setEnabled(True)
+
+def _open_update_dialog(parent):
+    dlg = UpdateDialog(parent)
+    dlg.exec()
+# ===== End Update Dialog =====

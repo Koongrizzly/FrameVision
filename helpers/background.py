@@ -1,22 +1,25 @@
 
 """
-helpers/background.py — Background / Object Removal + Replacer (ONNX Runtime, offline)
+helpers/background.py — Background / Object Removal + Replacer with TOP PREVIEW (ONNX Runtime, offline)
 
-Enhanced build:
-- Engines: Auto / MODNet (portrait) / BiRefNet (general)
-- Robust output handling (NCHW/NHWC; 1/3 channels); pad-to-32 for dynamic models; crop-back
-- Engine-aware preprocessing (BiRefNet uses ImageNet mean/std)
-- Post: threshold, feather, invert, auto-level; optional edge de-spill & anti-halo
-- Background Replacer: Transparent / Color / Blur / Image
-- Drop shadow with opacity/blur/offset
-- NEW: Output folder chooser + Open button, remembered across restarts (ROOT/config/background_tool.json)
-- Simplified actions: one **Process current image** button (no batch UI)
+Changes in this build
+---------------------
+- Preview panel is **on top**, controls below (vertical). It grows/shrinks with the tab.
+- Added **Use current** button that grabs the image (or current video frame) already loaded in the app
+  via `pane.main.current_path` (same behavior you had before).
+- Still supports **Load external…** to pick an image/video from disk.
+- Live preview (instant recomposite), Undo/Reset/Save, Recompute mask (run ONNX again on demand).
+- Output folder Change/Open (remembers across restarts).
+
+Everything else kept: MODNet/BiRefNet, pad-to-32, ImageNet norm for BiRefNet, de-spill, anti-halo, background
+replacer (Transparent/Color/Blur/Image), drop shadow.
 """
 from __future__ import annotations
 
-import math, os, json, subprocess, sys
+import math, os, sys, json, subprocess, tempfile
 from pathlib import Path
-from typing import Optional, Tuple, List
+from typing import Optional, Tuple, List, Dict
+
 import numpy as np
 from PIL import Image, ImageFilter
 
@@ -397,7 +400,92 @@ def _compose_with_bg(
     else:
         return _pil_from_np(comp)
 
-# -------------------- Public processing API --------------------
+# -------------------- I/O helpers --------------------
+def _ffmpeg_path() -> Optional[str]:
+    cand = ROOT / "presets" / "tools" / ("ffmpeg.exe" if os.name == "nt" else "ffmpeg")
+    if cand.exists():
+        return str(cand)
+    return "ffmpeg"
+
+def load_image_or_frame(path: str, time_s: float = 0.0) -> Image.Image:
+    p = Path(path)
+    if p.suffix.lower() in {".png",".jpg",".jpeg",".bmp",".tif",".tiff",".webp"}:
+        return Image.open(p).convert("RGB")
+    out_png = Path(tempfile.gettempdir()) / f"bgtool_frame_{os.getpid()}.png"
+    cmd = [_ffmpeg_path(), "-y", "-ss", f"{max(0.0,time_s):.3f}", "-i", str(p), "-frames:v", "1", str(out_png)]
+    try:
+        subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True)
+        return Image.open(out_png).convert("RGB")
+    except Exception as e:
+        raise RuntimeError(f"ffmpeg failed to extract frame: {e}")
+
+# Try to read the current media path/time from the host app
+def _current_media_from_app(pane) -> tuple[Optional[Path], float]:
+    # Known attribute in your app from earlier: pane.main.current_path
+    candidates = [
+        getattr(pane, "current_path", None),
+        getattr(getattr(pane, "main", None), "current_path", None),
+    ]
+    for c in candidates:
+        if c:
+            p = Path(str(c))
+            if p.exists():
+                break
+    else:
+        return None, 0.0
+
+    # try to find a current time (seconds) for videos
+    time_keys = [
+        "current_time_s", "video_time_s", "playhead_seconds", "seek_seconds",
+        "current_frame_time", "frame_time_s"
+    ]
+    t = 0.0
+    for k in time_keys:
+        v = getattr(pane, k, None)
+        if isinstance(v, (int, float)):
+            t = float(v); break
+        v = getattr(getattr(pane, "main", None), k, None)
+        if isinstance(v, (int, float)):
+            t = float(v); break
+    return p, float(t)
+
+# -------------------- Preview renderer --------------------
+def remove_background_preview(
+    rgb: np.ndarray,
+    alpha_base: np.ndarray,
+    mode: str,
+    threshold: int,
+    feather: int,
+    spill: bool,
+    invert: bool,
+    auto_level: bool,
+    # Replacer:
+    repl_mode: str,
+    repl_color: Tuple[int,int,int],
+    repl_blur: int,
+    repl_image: Optional[str],
+    drop_shadow: bool,
+    shadow_alpha: int,
+    shadow_blur: int,
+    shadow_offx: int,
+    shadow_offy: int,
+    anti_halo: bool,
+) -> Image.Image:
+    alpha = alpha_base.copy().astype(np.float32)
+    if auto_level:
+        alpha = _auto_level_alpha(alpha)
+    if invert:
+        alpha = 1.0 - alpha
+    a8 = _apply_post(alpha, int(threshold), int(feather))
+    rgb2 = _spill_suppress(rgb, a8, 0.18) if (spill and mode != "alpha_only") else rgb
+    return _compose_with_bg(
+        rgb2, a8, mode,
+        repl_mode, repl_color, int(repl_blur), repl_image,
+        bool(drop_shadow), int(shadow_alpha), int(shadow_blur), int(shadow_offx), int(shadow_offy),
+        bool(anti_halo),
+    )
+
+# -------------------- One-shot API (unchanged) --------------------
 def remove_background_file(
     inp_path: str,
     engine: str = "auto",
@@ -420,7 +508,6 @@ def remove_background_file(
     shadow_offy: int = 10,
     anti_halo: bool = True,
 ) -> Path:
-    """Process one image file and return output path."""
     p = Path(inp_path)
     out_dir_p = Path(out_dir) if out_dir else _get_out_dir_pref()
     out_dir_p.mkdir(parents=True, exist_ok=True)
@@ -429,228 +516,382 @@ def remove_background_file(
     if model is None:
         raise FileNotFoundError("No ONNX model found in models/. Expected MODNet or BiRefNet.")
 
-    img = Image.open(p)
+    img = Image.open(p).convert("RGB")
     rgb = _np_from_pil(img)
     alpha = _infer_onnx_alpha(model, rgb, eng)
-    if auto_level:
-        alpha = _auto_level_alpha(alpha)
-    if invert:
-        alpha = 1.0 - alpha
-    a8 = _apply_post(alpha, int(threshold), int(feather))
-    if spill and mode != "alpha_only":
-        rgb = _spill_suppress(rgb, a8, 0.18)
-
-    out_img = _compose_with_bg(
-        rgb, a8, mode,
-        repl_mode, repl_color, int(repl_blur), repl_image,
-        bool(drop_shadow), int(shadow_alpha), int(shadow_blur), int(shadow_offx), int(shadow_offy),
-        bool(anti_halo),
+    out_img = remove_background_preview(
+        rgb, alpha, mode, threshold, feather, spill, invert, auto_level,
+        repl_mode, repl_color, repl_blur, repl_image,
+        drop_shadow, shadow_alpha, shadow_blur, shadow_offx, shadow_offy, anti_halo
     )
 
-    suffix = {
-        "transparent": "cutout",
-        "color": "colorbg",
-        "blur": "blurbg",
-        "image": "imagebg",
-    }.get(repl_mode, "cutout")
-    if mode == "alpha_only":
-        suffix = "alpha"
-    elif mode == "keep_bg":
-        suffix = "bgonly"
+    suffix = {"transparent":"cutout","color":"colorbg","blur":"blurbg","image":"imagebg"}.get(repl_mode, "cutout")
+    if mode == "alpha_only": suffix = "alpha"
+    elif mode == "keep_bg": suffix = "bgonly"
 
     out = out_dir_p / f"{p.stem}_{suffix}.png"
     out_img.save(out)
     return out
 
-# -------------------- Qt UI wiring --------------------
+# -------------------- Qt UI wiring (TOP Preview) --------------------
 def install_background_tool(pane, section_widget) -> None:
-    """
-    Build the UI under the provided CollapsibleSection.
-    """
     try:
         from PySide6.QtWidgets import (
-            QWidget, QFormLayout, QComboBox, QSpinBox, QHBoxLayout, QLineEdit,
-            QPushButton, QCheckBox, QFileDialog, QMessageBox, QLabel
+            QWidget, QFormLayout, QComboBox, QSpinBox, QHBoxLayout, QVBoxLayout, QDoubleSpinBox,
+            QPushButton, QCheckBox, QFileDialog, QMessageBox, QLabel, QLineEdit
         )
-        from PySide6.QtGui import QColor
+        from PySide6.QtCore import Qt, QTimer, QSize
+        from PySide6.QtGui import QPixmap, QImage, QColor
         from PySide6.QtWidgets import QColorDialog
     except Exception:
         return
 
-    w = QWidget()
-    lay = QFormLayout(w)
+    # --- Preview canvas at the TOP ---
+    class Preview(QWidget):
+        def __init__(self):
+            super().__init__()
+            self.setMinimumHeight(180)
+            self._pix = QPixmap()
+            self._bg = self._make_checker()
+        def _make_checker(self, s=8):
+            img = QImage(s*2, s*2, QImage.Format_RGB32)
+            c1 = QColor(50,50,50).rgb(); c2 = QColor(70,70,70).rgb()
+            for y in range(s*2):
+                for x in range(s*2):
+                    img.setPixel(x,y, c1 if (x//s + y//s)%2==0 else c2)
+            return QPixmap.fromImage(img)
+        def setPixmap(self, pm: QPixmap):
+            self._pix = pm; self.update()
+        def paintEvent(self, ev):
+            from PySide6.QtGui import QPainter
+            p = QPainter(self)
+            # checker
+            for y in range(0, self.height(), self._bg.height()):
+                for x in range(0, self.width(), self._bg.width()):
+                    p.drawPixmap(x,y,self._bg)
+            if not self._pix.isNull():
+                pm = self._pix.scaled(self.width(), self.height(), Qt.KeepAspectRatio, Qt.SmoothTransformation)
+                x = (self.width() - pm.width())//2; y = (self.height() - pm.height())//2
+                p.drawPixmap(x,y,pm)
+            p.end()
 
+    container = QWidget()
+    vbox = QVBoxLayout(container)
+
+    preview = Preview()
+    vbox.addWidget(preview, stretch=3)  # preview gets most of the space
+
+    # Controls panel below
+    panel = QWidget()
+    lay = QFormLayout(panel)
+    vbox.addWidget(panel, stretch=0)
+
+    # ---- Controls ----
     cmb_engine = QComboBox(); cmb_engine.addItems(["Auto", "MODNet (portrait)", "BiRefNet (general)"])
     cmb_mode   = QComboBox(); cmb_mode.addItems(["Keep subject (remove BG)", "Keep background (remove subject)", "Alpha only (mask)"])
 
-    # Replacer UI
-    cmb_repl   = QComboBox(); cmb_repl.addItems(["Transparent", "Color", "Blur", "Image"])
-    s_blurbg   = QSpinBox();  s_blurbg.setRange(0, 200); s_blurbg.setValue(15)
+    # Source row: Use current + Load external
+    btn_use_current = QPushButton("Use current")
+    cmb_source = QComboBox(); cmb_source.addItems(["Image", "Video"]); cmb_source.setCurrentIndex(0)
+    t_seek = QDoubleSpinBox(); t_seek.setRange(0, 36000); t_seek.setDecimals(3); t_seek.setSingleStep(0.5); t_seek.setValue(0.0)
+    btn_load = QPushButton("Load external…")
+    source_row = QHBoxLayout()
+    source_row.addWidget(btn_use_current); source_row.addWidget(QLabel("Type")); source_row.addWidget(cmb_source)
+    source_row.addWidget(QLabel("Seek (s)")); source_row.addWidget(t_seek); source_row.addWidget(btn_load)
 
-    # Color picker
-    color_preview = QLabel("●")
-    color_preview.setStyleSheet("font-size:18px;")
-    cho_color = QColor(255,255,255)
+    # Replacer
+    cmb_repl = QComboBox(); cmb_repl.addItems(["Transparent", "Color", "Blur", "Image"])
+    s_blurbg = QSpinBox(); s_blurbg.setRange(0, 200); s_blurbg.setValue(20)
+
+    color_preview = QLabel("●"); color_preview.setStyleSheet("font-size:18px;"); color_val = QColor(255,255,255)
     btn_color = QPushButton("Pick color…")
     def pick_color():
-        nonlocal cho_color
+        nonlocal color_val
         try:
-            c = QColorDialog.getColor(cho_color, w, "Background color")
+            c = QColorDialog.getColor(color_val, panel, "Background color")
+            if c.isValid():
+                color_val = c; color_preview.setStyleSheet(f"color: rgb({c.red()},{c.green()},{c.blue()}); font-size:18px;")
         except Exception:
-            c = cho_color
-        if c.isValid():
-            cho_color = c
-            color_preview.setStyleSheet(f"color: rgb({c.red()},{c.green()},{c.blue()}); font-size:18px;")
+            pass
     btn_color.clicked.connect(pick_color)
 
-    # Image picker
-    lbl_img = QLabel("(none)")
-    btn_img = QPushButton("Choose image…")
-    bg_img_path = {"path": None}
+    lbl_img = QLabel("(none)"); btn_img = QPushButton("Choose image…"); chosen_bg = {"path": None}
     def pick_img():
         try:
-            file, _ = QFileDialog.getOpenFileName(w, "Choose background image", "", "Images (*.png *.jpg *.jpeg *.bmp *.webp)")
+            file, _ = QFileDialog.getOpenFileName(panel, "Choose background image", "", "Images (*.png *.jpg *.jpeg *.bmp *.webp)")
         except Exception:
             file = ""
         if file:
-            bg_img_path["path"] = file
-            lbl_img.setText(Path(file).name)
+            chosen_bg["path"] = file; lbl_img.setText(Path(file).name); schedule_update()
     btn_img.clicked.connect(pick_img)
 
-    # Post options
-    s_thresh   = QSpinBox();  s_thresh.setRange(0,255); s_thresh.setValue(6)
-    s_feath    = QSpinBox();  s_feath.setRange(0,50);  s_feath.setValue(3)
-    cb_spill   = QCheckBox("Edge de-spill"); cb_spill.setChecked(True)
-    cb_auto    = QCheckBox("Auto-level mask"); cb_auto.setChecked(True)
-    cb_inv     = QCheckBox("Invert mask"); cb_inv.setChecked(False)
-    cb_ah      = QCheckBox("Edge anti-halo"); cb_ah.setChecked(True)
-    cb_shadow  = QCheckBox("Drop shadow"); cb_shadow.setChecked(False)
-    s_salpha   = QSpinBox(); s_salpha.setRange(0,255); s_salpha.setValue(120)
-    s_sblur    = QSpinBox(); s_sblur.setRange(0,200); s_sblur.setValue(20)
-    s_sox      = QSpinBox(); s_sox.setRange(-500,500); s_sox.setValue(10)
-    s_soy      = QSpinBox(); s_soy.setRange(-500,500); s_soy.setValue(10)
+    # Post
+    s_thresh = QSpinBox(); s_thresh.setRange(0,255); s_thresh.setValue(6)
+    s_feath  = QSpinBox(); s_feath.setRange(0,50);  s_feath.setValue(3)
+    cb_spill = QCheckBox("Edge de-spill"); cb_spill.setChecked(True)
+    cb_auto  = QCheckBox("Auto-level mask"); cb_auto.setChecked(True)
+    cb_inv   = QCheckBox("Invert mask"); cb_inv.setChecked(False)
+    cb_ah    = QCheckBox("Edge anti-halo"); cb_ah.setChecked(True)
 
-    # Output folder row with remember
+    # Shadow
+    cb_shadow= QCheckBox("Drop shadow"); cb_shadow.setChecked(False)
+    s_salpha= QSpinBox(); s_salpha.setRange(0,255); s_salpha.setValue(120)
+    s_sblur = QSpinBox(); s_sblur.setRange(0,200); s_sblur.setValue(20)
+    s_sox   = QSpinBox(); s_sox.setRange(-500,500); s_sox.setValue(10)
+    s_soy   = QSpinBox(); s_soy.setRange(-500,500); s_soy.setValue(10)
+    shadow_row = QHBoxLayout()
+    shadow_row.addWidget(QLabel("Opacity")); shadow_row.addWidget(s_salpha)
+    shadow_row.addWidget(QLabel("Blur"));    shadow_row.addWidget(s_sblur)
+    shadow_row.addWidget(QLabel("Offset X"));shadow_row.addWidget(s_sox)
+    shadow_row.addWidget(QLabel("Offset Y"));shadow_row.addWidget(s_soy)
+
+    # Output folder row
     out_dir = _get_out_dir_pref()
     le_out = QLineEdit(str(out_dir)); le_out.setReadOnly(True)
-    btn_out_change = QPushButton("Change…")
-    btn_out_open   = QPushButton("Open folder")
+    btn_out_change = QPushButton("Change…"); btn_out_open = QPushButton("Open folder")
     def change_out():
         try:
-            d = QFileDialog.getExistingDirectory(w, "Choose output folder", str(out_dir))
+            d = QFileDialog.getExistingDirectory(panel, "Choose output folder", str(le_out.text()))
         except Exception:
             d = ""
-        if d:
-            _set_out_dir_pref(Path(d))
-            le_out.setText(d)
+        if d: _set_out_dir_pref(Path(d)); le_out.setText(d)
     btn_out_change.clicked.connect(change_out)
-
     def open_out():
         path = le_out.text().strip()
         if not path: return
-        pth = Path(path)
-        try: pth.mkdir(parents=True, exist_ok=True)
-        except Exception: pass
+        pth = Path(path); pth.mkdir(parents=True, exist_ok=True)
         try:
-            if sys.platform.startswith("win"):
-                os.startfile(str(pth))  # type: ignore
-            elif sys.platform == "darwin":
-                subprocess.run(["open", str(pth)], check=False)
-            else:
-                subprocess.run(["xdg-open", str(pth)], check=False)
-        except Exception:
-            pass
+            if sys.platform.startswith("win"): os.startfile(str(pth))
+            elif sys.platform == "darwin": subprocess.run(["open", str(pth)], check=False)
+            else: subprocess.run(["xdg-open", str(pth)], check=False)
+        except Exception: pass
     btn_out_open.clicked.connect(open_out)
+    out_row = QHBoxLayout(); out_row.addWidget(le_out); out_row.addWidget(btn_out_change); out_row.addWidget(btn_out_open)
 
-    # Action button
-    btn_run    = QPushButton("Process current image")
+    # Actions
+    btn_recompute = QPushButton("Recompute mask")
+    btn_reset     = QPushButton("Reset")
+    btn_undo      = QPushButton("Undo")
+    btn_save      = QPushButton("Save")
+    btns_row = QHBoxLayout(); btns_row.addWidget(btn_recompute); btns_row.addWidget(btn_reset); btns_row.addWidget(btn_undo); btns_row.addWidget(btn_save)
 
-    # Layout
+    # Layout wire
     lay.addRow("Engine", cmb_engine)
-    lay.addRow("Mode", cmb_mode)
+    lay.addRow("Mode",   cmb_mode)
+    lay.addRow(source_row)
     lay.addRow("Background", cmb_repl)
     lay.addRow("Blur amount", s_blurbg)
-    lay.addRow("BG color", btn_color)
-    lay.addRow(" ", color_preview)
-    lay.addRow("BG image", btn_img)
-    lay.addRow(" ", lbl_img)
-    lay.addRow("Output to", le_out)
-    row_out = QHBoxLayout(); row_out.addWidget(btn_out_change); row_out.addWidget(btn_out_open)
-    lay.addRow(row_out)
+    lay.addRow("BG color", btn_color); lay.addRow(" ", color_preview)
+    lay.addRow("BG image", btn_img);   lay.addRow(" ", lbl_img)
+    lay.addRow("Output", out_row)
     lay.addRow("Hard threshold (0=off)", s_thresh)
     lay.addRow("Feather (px)", s_feath)
     lay.addRow(cb_spill); lay.addRow(cb_auto); lay.addRow(cb_inv); lay.addRow(cb_ah)
-    lay.addRow(cb_shadow)
-    row_shadow = QHBoxLayout()
-    row_shadow.addWidget(QLabel("Opacity")); row_shadow.addWidget(s_salpha)
-    row_shadow.addWidget(QLabel("Blur"));    row_shadow.addWidget(s_sblur)
-    row_shadow.addWidget(QLabel("Offset X"));row_shadow.addWidget(s_sox)
-    row_shadow.addWidget(QLabel("Offset Y"));row_shadow.addWidget(s_soy)
-    lay.addRow(row_shadow)
+    lay.addRow(cb_shadow); lay.addRow(shadow_row)
+    lay.addRow(btns_row)
 
-    # Add the action row
-    lay.addRow(btn_run)
-
+    # Mount into CollapsibleSection
     try:
-        section_widget.setContentLayout(lay)
+        section_widget.setContentLayout(vbox)
     except Exception:
         pass
 
-    def _engine_key() -> str:
-        i = cmb_engine.currentIndex()
-        return {0: "auto", 1: "modnet", 2: "birefnet"}.get(i, "auto")
+    # --- state ---
+    current_rgb: Optional[np.ndarray] = None
+    current_alpha: Optional[np.ndarray] = None
+    current_path: Optional[Path] = None
+    undo_stack: List[Dict] = []
 
-    def _mode_key() -> str:
-        i = cmb_mode.currentIndex()
-        return {0: "keep_subject", 1: "keep_bg", 2: "alpha_only"}.get(i, "keep_subject")
+    # --- helpers ---
+    def qimage_from_pil(im: Image.Image) -> QImage:
+        arr = np.array(im.convert("RGBA"))  # HWC uint8
+        h,w = arr.shape[:2]
+        return QImage(arr.data, w, h, 4*w, QImage.Format_RGBA8888).copy()
 
-    def _repl_key() -> str:
-        i = cmb_repl.currentIndex()
-        return {0:"transparent",1:"color",2:"blur",3:"image"}[i]
+    def update_preview_pix(pim: Image.Image):
+        pm = QPixmap.fromImage(qimage_from_pil(pim)); preview.setPixmap(pm)
 
-    def _ensure_image_input() -> Optional[Path]:
-        pth = getattr(pane.main, "current_path", None)
-        if pth and pth.exists() and pth.suffix.lower() in {".png",".jpg",".jpeg",".bmp",".tif",".tiff",".webp"}:
-            return pth
+    def get_params() -> Dict:
+        return dict(
+            engine={0:"auto",1:"modnet",2:"birefnet"}[cmb_engine.currentIndex()],
+            mode={0:"keep_subject",1:"keep_bg",2:"alpha_only"}[cmb_mode.currentIndex()],
+            threshold=int(s_thresh.value()), feather=int(s_feath.value()),
+            spill=bool(cb_spill.isChecked()), invert=bool(cb_inv.isChecked()), auto_level=bool(cb_auto.isChecked()),
+            repl_mode={0:"transparent",1:"color",2:"blur",3:"image"}[cmb_repl.currentIndex()],
+            repl_color=(color_val.red(), color_val.green(), color_val.blue()),
+            repl_blur=int(s_blurbg.value()), repl_image=chosen_bg["path"],
+            drop_shadow=bool(cb_shadow.isChecked()), shadow_alpha=int(s_salpha.value()), shadow_blur=int(s_sblur.value()),
+            shadow_offx=int(s_sox.value()), shadow_offy=int(s_soy.value()), anti_halo=bool(cb_ah.isChecked()),
+        )
+
+    def set_params(d: Dict):
+        nonlocal color_val
+        cmb_engine.setCurrentIndex({"auto":0,"modnet":1,"birefnet":2}[d["engine"]])
+        cmb_mode.setCurrentIndex({"keep_subject":0,"keep_bg":1,"alpha_only":2}[d["mode"]])
+        s_thresh.setValue(int(d["threshold"])); s_feath.setValue(int(d["feather"]))
+        cb_spill.setChecked(bool(d["spill"])); cb_inv.setChecked(bool(d["invert"])); cb_auto.setChecked(bool(d["auto_level"]))
+        cmb_repl.setCurrentIndex({"transparent":0,"color":1,"blur":2,"image":3}[d["repl_mode"]])
+        r,g,b = d["repl_color"]; color_val = QColor(r,g,b); color_preview.setStyleSheet(f"color: rgb({r},{g},{b}); font-size:18px;")
+        s_blurbg.setValue(int(d["repl_blur"]))
+        chosen_bg["path"] = d["repl_image"]; lbl_img.setText(Path(d["repl_image"]).name if d["repl_image"] else "(none)")
+        cb_shadow.setChecked(bool(d["drop_shadow"])); s_salpha.setValue(int(d["shadow_alpha"])); s_sblur.setValue(int(d["shadow_blur"]))
+        s_sox.setValue(int(d["shadow_offx"])); s_soy.setValue(int(d["shadow_offy"])); cb_ah.setChecked(bool(d["anti_halo"]))
+
+    def defaults() -> Dict:
+        return dict(engine="auto", mode="keep_subject", threshold=6, feather=3, spill=True, invert=False, auto_level=True,
+                    repl_mode="transparent", repl_color=(255,255,255), repl_blur=20, repl_image=None,
+                    drop_shadow=False, shadow_alpha=120, shadow_blur=20, shadow_offx=10, shadow_offy=10, anti_halo=True)
+
+    # --- recomposition (no ONNX run) ---
+    from PySide6.QtCore import QTimer
+    _debounce = QTimer(); _debounce.setSingleShot(True); _debounce.setInterval(200)
+    def schedule_update():
+        _debounce.stop(); _debounce.start()
+    def do_update():
+        if current_rgb is None or current_alpha is None: return
+        p = get_params()
         try:
-            files, _ = QFileDialog.getOpenFileNames(w, "Pick image", "", "Images (*.png *.jpg *.jpeg *.webp *.bmp *.tif *.tiff)")
+            pim = remove_background_preview(
+                current_rgb, current_alpha, p["mode"], p["threshold"], p["feather"], p["spill"],
+                p["invert"], p["auto_level"], p["repl_mode"], p["repl_color"], p["repl_blur"], p["repl_image"],
+                p["drop_shadow"], p["shadow_alpha"], p["shadow_blur"], p["shadow_offx"], p["shadow_offy"], p["anti_halo"]
+            )
+            update_preview_pix(pim)
+        except Exception as e:
+            try: QMessageBox.critical(panel, "Preview error", str(e))
+            except Exception: print("Preview error:", e)
+    _debounce.timeout.connect(do_update)
+
+    # Hook updates
+    for w in [cmb_mode, cmb_repl, s_blurbg, s_thresh, s_feath, cb_spill, cb_auto, cb_inv, cb_ah, cb_shadow, s_salpha, s_sblur, s_sox, s_soy]:
+        try:
+            if hasattr(w, "valueChanged"): w.valueChanged.connect(schedule_update)
+            if hasattr(w, "currentIndexChanged"): w.currentIndexChanged.connect(schedule_update)
+            if hasattr(w, "toggled"): w.toggled.connect(schedule_update)
+        except Exception: pass
+
+    # --- Use current (from app) ---
+    def on_use_current():
+        nonlocal current_rgb, current_alpha, current_path
+        media_path, time_s = _current_media_from_app(pane)
+        if media_path is None:
+            try: QMessageBox.information(panel, "No image", "Open an image in the app (left panel) first."); return
+            except Exception: return
+        current_path = media_path
+        try:
+            img = load_image_or_frame(str(media_path), float(time_s))
+        except Exception as e:
+            try: QMessageBox.critical(panel, "Load error", str(e)); return
+            except Exception: return
+        current_rgb = _np_from_pil(img)
+        eng, model = _pick_engine({0:"auto",1:"modnet",2:"birefnet"}[cmb_engine.currentIndex()])
+        if model is None:
+            try: QMessageBox.critical(panel, "Model", "No ONNX model found in models/."); return
+            except Exception: return
+        try:
+            current_alpha = _infer_onnx_alpha(model, current_rgb, eng)
+        except Exception as e:
+            try: QMessageBox.critical(panel, "ONNX error", str(e)); return
+            except Exception: return
+        undo_stack.clear(); set_params(defaults()); schedule_update()
+    btn_use_current.clicked.connect(on_use_current)
+
+    # --- Load external ---
+    def on_load_external():
+        nonlocal current_rgb, current_alpha, current_path
+        try:
+            if cmb_source.currentIndex()==0:
+                files, _ = QFileDialog.getOpenFileNames(panel, "Choose image", "", "Images (*.png *.jpg *.jpeg *.bmp *.webp *.tif *.tiff)")
+            else:
+                files, _ = QFileDialog.getOpenFileNames(panel, "Choose video", "", "Videos (*.mp4 *.mov *.mkv *.avi *.webm)")
         except Exception:
             files = []
-        if files: return Path(files[0])
-        return None
-
-    def on_run():
+        if not files: return
+        current_path = Path(files[0])
         try:
-            pth = _ensure_image_input()
-            if not pth:
-                try: QMessageBox.warning(w, "No image", "Open an image first or pick one.")
-                except Exception: pass
-                return
-            out = remove_background_file(
-                str(pth),
-                engine=_engine_key(),
-                mode=_mode_key(),
-                threshold=int(s_thresh.value()),
-                feather=int(s_feath.value()),
-                spill=bool(cb_spill.isChecked()),
-                invert=bool(cb_inv.isChecked()),
-                auto_level=bool(cb_auto.isChecked()),
-                out_dir=le_out.text().strip(),
-                repl_mode=_repl_key(),
-                repl_color=(cho_color.red(), cho_color.green(), cho_color.blue()),
-                repl_blur=int(s_blurbg.value()),
-                repl_image=bg_img_path["path"],
-                drop_shadow=bool(cb_shadow.isChecked()),
-                shadow_alpha=int(s_salpha.value()),
-                shadow_blur=int(s_sblur.value()),
-                shadow_offx=int(s_sox.value()),
-                shadow_offy=int(s_soy.value()),
-                anti_halo=bool(cb_ah.isChecked()),
+            img = load_image_or_frame(str(current_path), float(t_seek.value()))
+        except Exception as e:
+            try: QMessageBox.critical(panel, "Load error", str(e)); return
+            except Exception: return
+        current_rgb = _np_from_pil(img)
+        eng, model = _pick_engine({0:"auto",1:"modnet",2:"birefnet"}[cmb_engine.currentIndex()])
+        if model is None:
+            try: QMessageBox.critical(panel, "Model", "No ONNX model found in models/."); return
+            except Exception: return
+        try:
+            current_alpha = _infer_onnx_alpha(model, current_rgb, eng)
+        except Exception as e:
+            try: QMessageBox.critical(panel, "ONNX error", str(e)); return
+            except Exception: return
+        undo_stack.clear(); set_params(defaults()); schedule_update()
+    btn_load.clicked.connect(on_load_external)
+
+    # --- Recompute, Reset, Undo, Save ---
+    def on_recompute():
+        nonlocal current_alpha
+        if current_rgb is None:
+            try: QMessageBox.information(panel, "Info", "Load or use current image first."); return
+            except Exception: return
+        eng, model = _pick_engine({0:"auto",1:"modnet",2:"birefnet"}[cmb_engine.currentIndex()])
+        if model is None:
+            try: QMessageBox.critical(panel, "Model", "No ONNX model found in models/."); return
+            except Exception: return
+        try:
+            current_alpha = _infer_onnx_alpha(model, current_rgb, eng)
+        except Exception as e:
+            try: QMessageBox.critical(panel, "ONNX error", str(e)); return
+            except Exception: return
+        schedule_update()
+    btn_recompute.clicked.connect(on_recompute)
+
+    def on_reset():
+        if current_rgb is None: return
+        set_params(defaults()); schedule_update()
+    btn_reset.clicked.connect(on_reset)
+
+    def on_undo():
+        if not undo_stack: return
+        d = undo_stack.pop(); set_params(d); schedule_update()
+    btn_undo.clicked.connect(on_undo)
+
+    def snapshot():
+        d = get_params().copy(); undo_stack.append(d)
+        if len(undo_stack) > 20: undo_stack.pop(0)
+    for w in [cmb_mode, cmb_repl, s_blurbg, s_thresh, s_feath, cb_spill, cb_auto, cb_inv, cb_ah, cb_shadow, s_salpha, s_sblur, s_sox, s_soy]:
+        try:
+            if hasattr(w, "editingFinished"): w.editingFinished.connect(snapshot)
+        except Exception: pass
+        try:
+            if hasattr(w, "currentIndexChanged"): w.currentIndexChanged.connect(snapshot)
+            if hasattr(w, "toggled"): w.toggled.connect(snapshot)
+        except Exception: pass
+
+    def on_save():
+        if current_rgb is None or current_alpha is None:
+            try: QMessageBox.information(panel, "Info", "Nothing to save. Load or use current image first."); return
+            except Exception: return
+        p = get_params()
+        try:
+            pim = remove_background_preview(
+                current_rgb, current_alpha, p["mode"], p["threshold"], p["feather"], p["spill"],
+                p["invert"], p["auto_level"], p["repl_mode"], p["repl_color"], p["repl_blur"], p["repl_image"],
+                p["drop_shadow"], p["shadow_alpha"], p["shadow_blur"], p["shadow_offx"], p["shadow_offy"], p["anti_halo"]
             )
-            try: QMessageBox.information(w, "Done", f"Saved:\n{out}")
+            out_dir = Path(le_out.text().strip()) if le_out.text().strip() else _get_out_dir_pref()
+            out_dir.mkdir(parents=True, exist_ok=True)
+            stem = current_path.stem if current_path else "preview"
+            suffix = {"transparent":"cutout","color":"colorbg","blur":"blurbg","image":"imagebg"}[p["repl_mode"]]
+            if p["mode"] == "alpha_only": suffix = "alpha"
+            elif p["mode"] == "keep_bg": suffix = "bgonly"
+            out = out_dir / f"{stem}_{suffix}.png"
+            pim.save(out)
+            try: QMessageBox.information(panel, "Saved", f"Saved:\n{out}")
             except Exception: print("Saved:", out)
         except Exception as e:
-            try: QMessageBox.critical(w, "Background tool", str(e))
-            except Exception: print("Background tool error:", e)
+            try: QMessageBox.critical(panel, "Save error", str(e))
+            except Exception: print("Save error:", e)
+    btn_save.clicked.connect(on_save)
 
-    btn_run.clicked.connect(on_run)
+    # Hand layout back to section
+    # section_widget.setContentLayout(vbox) was called above.
+    return

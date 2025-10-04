@@ -8,10 +8,78 @@ from PySide6.QtCore import Qt, QThread, Signal, QEvent, QEventLoop, QRect, QPoin
 from PySide6.QtGui import QTextCursor, QImage, QKeyEvent, QGuiApplication, QPainter, QPainter, QGuiApplication, QPainter, QClipboard
 from PySide6.QtWidgets import (
     QDialog, QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton, QPlainTextEdit,
-    QCheckBox, QSpinBox, QDoubleSpinBox, QLabel as _QLabel, QApplication, QInputDialog, QRubberBand, QInputDialog, QRubberBand
+    QCheckBox, QSpinBox, QDoubleSpinBox, QLabel as _QLabel, QApplication, QInputDialog, QRubberBand, QInputDialog, QRubberBand, QComboBox, QMenu, QFileDialog
 )
 
 # === Model path (offline) ===
+
+# === Framie: helpers ===
+FRAMIE_DIR = Path.home() / ".framie"
+FRAMIE_DIR.mkdir(parents=True, exist_ok=True)
+PREFS_PATH = FRAMIE_DIR / "prefs.json"
+PINS_PATH = FRAMIE_DIR / "pins.json"
+
+def _prefs_load():
+    try:
+        import json
+        return json.loads(PREFS_PATH.read_text(encoding="utf-8"))
+    except Exception:
+        return {"greeting":"Professional","mode":"Coach","auto_frame":True,"backend":"Transformers (VL)","device":"auto","preset":"q5","gguf":"","llama_bin":""}
+
+def _prefs_save(p):
+    try:
+        import json
+        PREFS_PATH.write_text(json.dumps(p, indent=2), encoding="utf-8")
+    except Exception:
+        pass
+
+def _pins_load():
+    try:
+        import json
+        pins = json.loads(PINS_PATH.read_text(encoding="utf-8"))
+        return pins if isinstance(pins, list) else []
+    except Exception:
+        return []
+
+def _pins_save(pins):
+    try:
+        import json
+        PINS_PATH.write_text(json.dumps(pins, indent=2), encoding="utf-8")
+    except Exception:
+        pass
+
+def _qimage_sha1(img: QImage) -> str:
+    try:
+        from PySide6.QtCore import QByteArray, QBuffer, QIODevice
+        ba = QByteArray()
+        buff = QBuffer(ba); buff.open(QIODevice.WriteOnly)
+        img.save(buff, "PNG")
+        data = bytes(ba)
+        import hashlib
+        return hashlib.sha1(data).hexdigest()
+    except Exception:
+        return ""
+
+def _downscale_qimage(img: QImage, max_dim: int = 1024) -> QImage:
+    try:
+        w, h = img.width(), img.height()
+        if max(w,h) <= max_dim: return img
+        if w >= h:
+            new_w = max_dim; new_h = int(h * (max_dim / float(w)))
+        else:
+            new_h = max_dim; new_w = int(w * (max_dim / float(h)))
+        return img.scaled(new_w, new_h, Qt.KeepAspectRatio, Qt.SmoothTransformation)
+    except Exception:
+        return img
+
+def _gguf_ram_hint(path: str, ctx: int = 4096) -> str:
+    try:
+        sz = Path(path).stat().st_size
+        kv = ctx * 2 * 2 * 32 * 4096 / (1024*1024)  # rough MB
+        return f"{sz/1_073_741_824:.1f} GB model + KV≈{kv:.0f} MB"
+    except Exception:
+        return "unknown"
+
 MODELS_FOLDER = Path(".").resolve() / "models" / "describe" / "default" / "qwen2-vl-2b-instruct"
 
 # === Singletons to avoid VRAM growth ===
@@ -113,37 +181,39 @@ class GenConfig:
     max_new_tokens: int = 1024
     repetition_penalty: float = 1.05
 
-def _build_messages(system_prompt: str, history: List[Dict[str, Any]], user_text: str, pil_image) -> List[Dict[str, Any]]:
-    msgs: List[Dict[str, Any]] = []
-    sys = (system_prompt or "").strip()
-    if sys:
-        msgs.append({"role":"system","content":[{"type":"text","text": sys}]})
-    msgs.extend(history)
-    content: List[Dict[str, Any]] = []
+
+def _build_messages(extra_system: str, history: List[Dict[str, Any]], user_text: str, pil_image):
+    """
+    Build messages for a vision-capable chat model without leaking system text.
+    - System: DEFAULT_SYSTEM + optional extra_system (modes/app info)
+    - History: pass through as-is
+    - User: user_text (+ image placeholder only if present)
+    """
+    sys_txt = DEFAULT_SYSTEM.strip()
+    if extra_system and extra_system.strip():
+        sys_txt = (sys_txt + "\n\n" + extra_system.strip()).strip()
+
+    messages: List[Dict[str, Any]] = [
+        {"role": "system", "content": [{"type":"text","text": sys_txt}]}
+    ]
+
+    # Prior history (already role-tagged: user/assistant)
+    for m in history:
+        if m.get("role") in ("user","assistant"):
+            clean_parts = []
+            for c in m.get("content", []):
+                if c.get("type") == "text":
+                    clean_parts.append({"type":"text","text": c.get("text","")})
+            if clean_parts:
+                messages.append({"role": m.get("role"), "content": clean_parts})
+
+    # Current user turn
+    content = []
     if pil_image is not None:
-        # Use image placeholder only; actual PIL is passed to processor(images=[...])
         content.append({"type":"image"})
     content.append({"type":"text","text": user_text})
-    msgs.append({"role":"user","content": content})
-    return msgs
-
-# ---------------- Local knowledge helpers ----------------
-def _load_jokes():
-    if _LOCAL['jokes'] is not None:
-        return
-    jokes = []
-    try:
-        txt = JOKES_PATH.read_text(encoding='utf-8', errors='ignore')
-        for line in txt.splitlines():
-            s = line.strip()
-            if s:
-                jokes.append(s)
-    except Exception:
-        jokes = []
-    _LOCAL['jokes'] = jokes
-    _LOCAL['j_order'] = list(range(len(jokes)))
-    random.shuffle(_LOCAL['j_order'])
-    _LOCAL['j_idx'] = 0
+    messages.append({"role": "user", "content": content})
+    return messages
 
 def _next_joke() -> str:
     _load_jokes()
@@ -545,6 +615,55 @@ class AskPopup(QDialog):
         hdr.addWidget(QLabel("Max")); self.spin_max = QSpinBox(); self.spin_max.setRange(16,4096); self.spin_max.setValue(1024); hdr.addWidget(self.spin_max)
         root.addLayout(hdr)
 
+        # Framie toolbar
+        bar = QHBoxLayout()
+        bar.addWidget(QLabel("Greeting"))
+        self.combo_greet = QComboBox(); self.combo_greet.addItems(["Professional","Casual","Playful"])
+        bar.addWidget(self.combo_greet)
+        bar.addWidget(QLabel("Mode"))
+        self.combo_mode = QComboBox(); self.combo_mode.addItems(["Coach","Power User","ELI5","Bug hunt"])
+        bar.addWidget(self.combo_mode)
+        self.chk_auto_frame = QCheckBox("Auto ‘this frame’ image (≤1024px)"); self.chk_auto_frame.setChecked(True)
+        bar.addWidget(self.chk_auto_frame)
+        self.btn_pin = QPushButton("📌 Pin last"); self.btn_pin.clicked.connect(self._pin_last)
+        bar.addWidget(self.btn_pin)
+        self.btn_pins = QPushButton("📂 Pinned"); self.btn_pins.clicked.connect(self._show_pins)
+        bar.addWidget(self.btn_pins)
+        self.btn_tools = QPushButton("Tools")
+        _menu = QMenu(self.btn_tools)
+        _menu.addAction("Analyze Clip…", self._tool_analyze_clip)
+        _menu.addAction("Dry-run Export…", self._tool_dry_run)
+        _menu.addSeparator()
+        _menu.addAction("Apply last ffmpeg…", self._tool_apply_ffmpeg_from_last)
+        _menu.addSeparator()
+        _menu.addAction("Select llama binary…", self._select_llama_bin)
+        self.btn_tools.setMenu(_menu)
+        bar.addWidget(self.btn_tools)
+        bar.addStretch(1)
+        root.addLayout(bar)
+
+        # Models
+        mm = QHBoxLayout()
+        mm.addWidget(QLabel("Backend"))
+        self.combo_backend = QComboBox(); self.combo_backend.addItems(["Transformers (VL)","llama.cpp (GGUF)"])
+        mm.addWidget(self.combo_backend)
+        mm.addWidget(QLabel("Device")); self.combo_device = QComboBox(); self.combo_device.addItems(["auto","cpu","cuda"])
+        mm.addWidget(self.combo_device)
+        mm.addWidget(QLabel("Preset")); self.combo_preset = QComboBox(); self.combo_preset.addItems(["Tiny (Q4)","Balanced (Q5)","Quality (Q8)"])
+        mm.addWidget(self.combo_preset)
+        mm.addWidget(QLabel("GGUF"))
+        self.gguf_path = QPlainTextEdit(self); self.gguf_path.setMaximumHeight(28)
+        mm.addWidget(self.gguf_path)
+        self.btn_browse_gguf = QPushButton("…"); self.btn_browse_gguf.clicked.connect(self._browse_gguf)
+        mm.addWidget(self.btn_browse_gguf)
+        root.addLayout(mm)
+
+        # HUD
+        hud = QHBoxLayout()
+        self.hud = QLabel("ctx: –, out: –, tok/s: –, t: –"); hud.addWidget(self.hud); hud.addStretch(1)
+        root.addLayout(hud)
+
+
         self.system = QPlainTextEdit(self); self.system.setPlainText(DEFAULT_SYSTEM); self.system.setMaximumHeight(64); root.addWidget(self.system)
 
         self.transcript = QPlainTextEdit(self); self.transcript.setReadOnly(True); self.transcript.setPlaceholderText("Assistant responses will appear here..."); root.addWidget(self.transcript, 1)
@@ -569,18 +688,49 @@ class AskPopup(QDialog):
         self.btn_send.clicked.connect(self._on_send)
         self.btn_screenshot.clicked.connect(self._on_screenshot)
 
-        # Start with a friendly intro from Framie
-        self._append("Assistant", "Hi! I\'m Framie — your FrameVision assistant. How can I help?")
+        # Framie prefs/pins
+        self._prefs = _prefs_load()
+        self.combo_greet.setCurrentText(self._prefs.get("greeting","Professional"))
+        self.combo_mode.setCurrentText(self._prefs.get("mode","Coach"))
+        self.chk_auto_frame.setChecked(bool(self._prefs.get("auto_frame", True)))
+        self.combo_backend.setCurrentText(self._prefs.get("backend","Transformers (VL)"))
+        self.combo_device.setCurrentText(self._prefs.get("device","auto"))
+        self.combo_preset.setCurrentText({"q4":"Tiny (Q4)","q5":"Balanced (Q5)","q8":"Quality (Q8)"}.get(self._prefs.get("preset","q5"), "Balanced (Q5)"))
+        self.gguf_path.setPlainText(self._prefs.get("gguf",""))
+        self._pins = _pins_load()
+        self._last_img_hash = ""
+
+        # Greeting variants
+        g = self.combo_greet.currentText()
+        greet_map = {
+            "Professional": "Hi. I’m Framie — your FrameVision assistant. How can I help?",
+            "Casual": "Hi! I’m Framie — your FrameVision assistant. How can I help?",
+            "Playful": "hey, I’m Framie — your FrameVision sidekick. what are we fixing today?"
+        }
+        self._append("Assistant", greet_map.get(g, greet_map["Casual"]))
+
+        # Save-on-change
+        self.combo_greet.currentTextChanged.connect(lambda v: self._prefs.__setitem__("greeting", v) or _prefs_save(self._prefs))
+        self.combo_mode.currentTextChanged.connect(lambda v: self._prefs.__setitem__("mode", v) or _prefs_save(self._prefs))
+        self.chk_auto_frame.toggled.connect(lambda v: self._prefs.__setitem__("auto_frame", bool(v)) or _prefs_save(self._prefs))
+        self.combo_backend.currentTextChanged.connect(lambda v: self._prefs.__setitem__("backend", v) or _prefs_save(self._prefs))
+        self.combo_device.currentTextChanged.connect(lambda v: self._prefs.__setitem__("device", v) or _prefs_save(self._prefs))
+        self.combo_preset.currentTextChanged.connect(lambda v: self._prefs.__setitem__("preset", "q4" if v.startswith("Tiny") else "q8" if v.startswith("Quality") else "q5") or _prefs_save(self._prefs))
+
 
     def _append(self, who: str, text: str = ""):
         text = self._sanitize_text(text)
         if who: self.transcript.appendPlainText(f"{who}: {text}")
         else: self.transcript.appendPlainText(text)
         self.transcript.moveCursor(QTextCursor.End)
+        try: self._update_hud()
+        except Exception: pass
 
     def _append_inline(self, text: str):
         text = self._sanitize_text(text)
         c = self.transcript.textCursor(); c.movePosition(QTextCursor.End); c.insertText(text); self.transcript.setTextCursor(c); self.transcript.ensureCursorVisible()
+        try: self._update_hud()
+        except Exception: pass
 
     def _debug(self, msg: str):
         self.transcript.appendPlainText(f"[DEBUG] {msg}")
@@ -745,7 +895,18 @@ class AskPopup(QDialog):
         self._append("You", q + ("  [frame attached]" if self.chk_attach.isChecked() else ""))
         self._append("Assistant", "")
 
-        qimg = self._grab_qimage() if self.chk_attach.isChecked() else None
+        backend = self.combo_backend.currentText() if hasattr(self, "combo_backend") else "Transformers (VL)"
+
+        attach_needed = self.chk_attach.isChecked() or (getattr(self, "chk_auto_frame", None) and self.chk_auto_frame.isChecked() and any(k in q.lower() for k in ["this frame","current frame","this shot","this image"]))
+        qimg = self._grab_qimage() if attach_needed else None
+        if qimg is not None:
+            qimg = _downscale_qimage(qimg, 1024)
+            h = _qimage_sha1(qimg)
+            if h == getattr(self, "_last_img_hash", ""):
+                qimg = None
+            else:
+                self._last_img_hash = h
+
         pil = _qimage_to_pil(qimg) if qimg is not None else None
         if self.chk_attach.isChecked():
             if qimg is None:
@@ -755,6 +916,16 @@ class AskPopup(QDialog):
 
         # If asking about the app, include local info as extra system context
         extra_sys = self.system.toPlainText()
+        mode = getattr(self, "combo_mode", None).currentText() if hasattr(self, "combo_mode") else "Coach"
+        if mode == "Coach":
+            extra_sys = "Coach the user step-by-step, friendly and encouraging.\n" + extra_sys
+        elif mode == "Power User":
+            extra_sys = "Be terse, command-like, prefer concrete commands and code.\n" + extra_sys
+        elif mode == "ELI5":
+            extra_sys = "Explain like I am five: simple words and short sentences.\n" + extra_sys
+        elif mode == "Bug hunt":
+            extra_sys = "Proactively ask for logs, reproduction steps, and show a checklist to isolate the bug.\n" + extra_sys
+
         if 'framevision' in q.lower() or 'this app' in q.lower():
             _load_info_text()
             if _LOCAL['info_text']:
@@ -779,7 +950,141 @@ class AskPopup(QDialog):
     def _on_error(self, msg: str):
         self._append_inline(f"[error: {msg}]"); self._append("", ""); self.btn_send.setEnabled(True); self.status.setText(msg)
 
-    def eventFilter(self, obj, ev):
+    
+
+    def _browse_gguf(self):
+        path, _ = QFileDialog.getOpenFileName(self, "Select GGUF model", "", "GGUF (*.gguf)")
+        if path:
+            self.gguf_path.setPlainText(path)
+            self._prefs["gguf"] = path; _prefs_save(self._prefs)
+            self.status.setText(f"GGUF selected ({_gguf_ram_hint(path)})")
+
+    def _select_llama_bin(self):
+        path, _ = QFileDialog.getOpenFileName(self, "Select llama.cpp binary", "", "Executables (*)")
+        if path:
+            self._prefs["llama_bin"] = path; _prefs_save(self._prefs)
+            self.status.setText("llama.cpp binary set.")
+
+    def _pin_last(self):
+        lines = self.transcript.toPlainText().splitlines()
+        last = ""
+        for s in reversed(lines):
+            if s.startswith("Assistant: "):
+                last = s[len("Assistant: "):].strip(); break
+        if not last:
+            self.status.setText("Nothing to pin."); return
+        self._pins.append({"role":"assistant","text": last, "ts": time.time()})
+        _pins_save(self._pins); self.status.setText("Pinned.")
+
+    def _show_pins(self):
+        items = [f"{i+1}. {p['text'][:80]}…" if len(p['text'])>80 else f"{i+1}. {p['text']}" for i,p in enumerate(self._pins)]
+        if not items:
+            QInputDialog.getText(self, "Pinned", "No pins yet. (Use 📌 Pin last)")
+            return
+        idx, ok = QInputDialog.getInt(self, "Pinned", "Pick # to insert:", 1, 1, len(items), 1)
+        if ok:
+            pin = self._pins[idx-1]["text"]
+            self.input.insertPlainText(pin)
+
+    def _update_hud(self):
+        try:
+            tok = getattr(_GLOBAL.get("processor", None), "tokenizer", None)
+            ctx_tokens, out_tokens = 0, 0
+            if tok is not None:
+                ctx_txt = ""
+                for m in self._history:
+                    for c in m.get("content", []):
+                        if c.get("type") == "text":
+                            ctx_txt += c.get("text", "") + "\n"
+                last_asst = ""
+                lines = self.transcript.toPlainText().splitlines()
+                for s in reversed(lines):
+                    if s.startswith("Assistant: "):
+                        last_asst = s[len("Assistant: "):]; break
+                try:
+                    out_tokens = len(tok.encode(last_asst)) if hasattr(tok,"encode") else len(tok(last_asst)["input_ids"])
+                    ctx_tokens = len(tok.encode(ctx_txt)) if hasattr(tok,"encode") else len(tok(ctx_txt)["input_ids"])
+                except Exception:
+                    pass
+            elapsed = (time.time() - getattr(self, "_gen_start", time.time())) if hasattr(self, "_gen_start") else 0.0
+            rate = (out_tokens/elapsed) if elapsed>0 else 0.0
+            self.hud.setText(f"ctx≈{ctx_tokens} • out {out_tokens} • {rate:.1f} tok/s • {elapsed:.1f}s")
+        except Exception:
+            pass
+
+    def _tool_analyze_clip(self):
+        path, _ = QFileDialog.getOpenFileName(self, "Analyze clip (ffprobe)", "", "Video files (*.mp4 *.mov *.mkv *.avi *.mxf);;All files (*.*)")
+        if not path: return
+        args = ["ffprobe", "-v", "error", "-show_format", "-show_streams", "-of", "json", path]
+        try:
+            import subprocess
+            out = subprocess.run(args, capture_output=True, text=True, timeout=20)
+            rep = out.stdout.strip() or out.stderr.strip()
+            self._append("Assistant", "[ffprobe report]\n" + rep[:16000])
+            self._update_hud()
+        except Exception as e:
+            self._on_error(f"ffprobe error: {e}")
+
+    def _tool_dry_run(self):
+        path, _ = QFileDialog.getOpenFileName(self, "Dry-run export (ffmpeg null)", "", "Video files (*.mp4 *.mov *.mkv *.avi *.mxf);;All files (*.*)")
+        if not path: return
+        args = ["ffmpeg", "-v", "info", "-i", path, "-t", "1", "-f", "null", "-"]
+        try:
+            import subprocess
+            out = subprocess.run(args, capture_output=True, text=True, timeout=30)
+            log = (out.stdout + "\n" + out.stderr)[-16000:]
+            self._append("Assistant", "[ffmpeg dry-run log]\n" + log)
+            self._update_hud()
+        except Exception as e:
+            self._on_error(f"ffmpeg error: {e}")
+
+    def _tool_apply_ffmpeg_from_last(self):
+        last_block = ""
+        lines = self.transcript.toPlainText().splitlines()
+        collect = False
+        for s in lines:
+            if s.startswith("Assistant: "):
+                last_block = s[len("Assistant: "):] + "\n"; collect = True
+            elif collect:
+                last_block += s + "\n"
+        cmd = None
+        for ln in last_block.splitlines():
+            if ln.strip().startswith("ffmpeg "):
+                cmd = ln.strip(); break
+        if not cmd:
+            self.status.setText("No ffmpeg command found in last answer."); return
+        QApplication.clipboard().setText(cmd)
+        self.status.setText("ffmpeg command copied to clipboard.")
+
+class LlamaWorker(QThread):
+    chunk = Signal(str)
+    done = Signal()
+    error = Signal(str)
+
+    def __init__(self, prompt: str, gguf_path: str, max_new_tokens: int = 512, parent=None):
+        super().__init__(parent)
+        self.prompt = prompt
+        self.gguf = gguf_path
+        self.max_new_tokens = max_new_tokens
+
+    def run(self):
+        try:
+            # Resolve llama binary from prefs or PATH
+            import json, shutil, subprocess
+            prefs = json.loads(PREFS_PATH.read_text(encoding="utf-8")) if PREFS_PATH.exists() else {}
+            cand = prefs.get("llama_bin", "")
+            binpath = cand if (cand and Path(cand).exists()) else (shutil.which("llama") or shutil.which("llama-cli") or shutil.which("main"))
+            if not binpath:
+                self.error.emit("llama.cpp binary not found. Set it in Tools menu or PATH."); return
+            args = [binpath, "-m", self.gguf, "-p", self.prompt, "-n", str(int(self.max_new_tokens))]
+            proc = subprocess.Popen(args, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1)
+            for line in proc.stdout:
+                if line: self.chunk.emit(line.rstrip())
+            proc.wait()
+            self.done.emit()
+        except Exception as e:
+            self.error.emit(str(e))
+def eventFilter(self, obj, ev):
         if obj is self.input and ev.type() == QEvent.KeyPress:
             ke: QKeyEvent = ev  # type: ignore
             if ke.key() in (Qt.Key_Return, Qt.Key_Enter):
