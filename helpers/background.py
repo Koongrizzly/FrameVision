@@ -394,8 +394,9 @@ def _compose_with_bg(
     comp = np.clip(comp, 0, 255).astype(np.uint8)
 
     if repl_mode == "transparent":
+        # Use straight alpha (un-multiplied RGB) so the subject doesn't look dark
         out_alpha = np.maximum(out_alpha, a)
-        rgba = np.dstack([comp, out_alpha])
+        rgba = np.dstack([fg, out_alpha])
         return _pil_from_np(rgba)
     else:
         return _pil_from_np(comp)
@@ -539,8 +540,8 @@ def install_background_tool(pane, section_widget) -> None:
         from PySide6.QtWidgets import (
             QWidget, QFormLayout, QComboBox, QSpinBox, QHBoxLayout, QVBoxLayout, QDoubleSpinBox,
             QPushButton, QCheckBox, QFileDialog, QMessageBox, QLabel, QLineEdit
-        )
-        from PySide6.QtCore import Qt, QTimer, QSize
+        , QButtonGroup)
+        from PySide6.QtCore import Qt, QTimer, QSize, Signal
         from PySide6.QtGui import QPixmap, QImage, QColor
         from PySide6.QtWidgets import QColorDialog
     except Exception:
@@ -548,32 +549,222 @@ def install_background_tool(pane, section_widget) -> None:
 
     # --- Preview canvas at the TOP ---
     class Preview(QWidget):
+        maskChanged = Signal()
+        fileDropped = Signal(str)
         def __init__(self):
             super().__init__()
             self.setMinimumHeight(180)
             self._pix = QPixmap()
             self._bg = self._make_checker()
+            # Overlay tool state
+            self._tool = 'brush'  # 'brush' or 'zoom'
+            self._brush_radius = 20
+            self._zoom = 1.0
+            self._draw_rect = None  # last drawn image rect for mapping
+            # Mask image in widget coords
+            from PySide6.QtGui import QImage
+            self._mask = QImage(self.size(), QImage.Format_Grayscale8)
+            self._mask.fill(0)
+            # Additional keep mask (for restore brush)
+            self._mask_keep = QImage(self.size(), QImage.Format_Grayscale8)
+            self._mask_keep.fill(0)
+            # Overlay opacity (0..1)
+            self._overlay_opacity = 0.5
+            # Accept drag & drop for quick load
+            try: self.setAcceptDrops(True)
+            except Exception: pass
+
+            # Buttons
+            self._btn_brush = QPushButton('🖌', self)
+            self._btn_zoom  = QPushButton('🔍', self)
+            for b in (self._btn_brush, self._btn_zoom):
+                b.setFixedSize(36, 36)
+                b.setCheckable(True)
+                b.setCursor(Qt.PointingHandCursor)
+                b.setStyleSheet(
+                    'QPushButton { background: rgba(0,0,0,128); border-radius:8px; color:white; font-size:18px; }'
+                    'QPushButton:checked { outline:2px solid #5aa0ff; }'
+                )
+            self._btn_brush.move(8, 8)
+            self._btn_zoom.move(48, 8)
+            grp = QButtonGroup(self)
+            grp.setExclusive(True)
+            grp.addButton(self._btn_brush)
+            grp.addButton(self._btn_zoom)
+            self._btn_brush.setChecked(True)
+            self._btn_brush.clicked.connect(lambda: self._select_tool('brush'))
+            self._btn_zoom.clicked.connect(lambda: self._select_tool('zoom'))
+
         def _make_checker(self, s=8):
             img = QImage(s*2, s*2, QImage.Format_RGB32)
-            c1 = QColor(50,50,50).rgb(); c2 = QColor(70,70,70).rgb()
+            c1 = QColor(200,200,200).rgb(); c2 = QColor(230,230,230).rgb()
             for y in range(s*2):
                 for x in range(s*2):
                     img.setPixel(x,y, c1 if (x//s + y//s)%2==0 else c2)
             return QPixmap.fromImage(img)
+
         def setPixmap(self, pm: QPixmap):
             self._pix = pm; self.update()
+
+        def _select_tool(self, name: str):
+            self._tool = name if name in ('brush','zoom') else 'brush'
+            self.setCursor(Qt.CrossCursor if self._tool=='brush' else Qt.ArrowCursor)
+
+        def resizeEvent(self, ev):
+            # Keep mask image size with content
+            from PySide6.QtGui import QImage, QPainter
+            new_mask = QImage(self.size(), QImage.Format_Grayscale8)
+            new_mask.fill(0)
+            p = QPainter(new_mask)
+            p.drawImage(0, 0, self._mask)
+            p.end()
+            self._mask = new_mask
+            # keep-mask resize
+            try:
+                new_keep = QImage(self.size(), QImage.Format_Grayscale8)
+                new_keep.fill(0)
+                p2 = QPainter(new_keep)
+                p2.drawImage(0, 0, self._mask_keep)
+                p2.end()
+                self._mask_keep = new_keep
+            except Exception:
+                pass
+            return super().resizeEvent(ev)
+
+        def wheelEvent(self, e):
+            if self._tool == 'zoom':
+                delta = e.angleDelta().y()
+                factor = 1.0 + (0.0015 * delta)
+                self._zoom = max(0.1, min(10.0, self._zoom * factor))
+                self.update()
+            else:
+                step = 2 if e.angleDelta().y() > 0 else -2
+                self._brush_radius = max(1, self._brush_radius + step)
+                self.update()
+
+        def mousePressEvent(self, e):
+            if self._tool == 'brush' and e.button() == Qt.LeftButton:
+                self._paint_at(e.position())
+            elif self._tool == 'brush' and e.button() == Qt.RightButton:
+                self._paint_keep_at(e.position())
+        def mouseMoveEvent(self, e):
+            if self._tool == 'brush' and (e.buttons() & Qt.LeftButton):
+                self._paint_at(e.position())
+            if self._tool == 'brush' and (e.buttons() & Qt.RightButton):
+                self._paint_keep_at(e.position())
+
+        def _paint_at(self, pos):
+            from PySide6.QtGui import QPainter
+            p = QPainter(self._mask)
+            p.setRenderHint(QPainter.Antialiasing, True)
+            p.setPen(Qt.NoPen)
+            p.setBrush(Qt.white)
+            p.drawEllipse(pos, self._brush_radius, self._brush_radius)
+            p.end()
+            self.maskChanged.emit()
+            self.update()
+
+        def _paint_keep_at(self, pos):
+            from PySide6.QtGui import QPainter
+            p = QPainter(self._mask_keep)
+            p.setRenderHint(QPainter.Antialiasing, True)
+            p.setPen(Qt.NoPen)
+            p.setBrush(Qt.white)
+            p.drawEllipse(pos, self._brush_radius, self._brush_radius)
+            p.end()
+            self.maskChanged.emit()
+            self.update()
+
+        def clearMask(self):
+            self._mask.fill(0)
+            try: self._mask_keep.fill(0)
+            except Exception: pass
+            self.maskChanged.emit()
+            self.update()
+
+        def export_mask_to_image_size(self, target_w, target_h):
+            # Convert QImage->numpy and resize to target (w,h)
+            import numpy as _np
+            from PIL import Image as _PILImage
+            q = self._mask.convertToFormat(QImage.Format_Grayscale8)
+            w = q.width(); h = q.height()
+            if w <= 0 or h <= 0:
+                return None
+            bpl = q.bytesPerLine()
+            ptr = q.constBits()
+            ptr.setsize(h * bpl)
+            arr = _np.frombuffer(ptr, dtype=_np.uint8).reshape((h, bpl))[:, :w]
+            pil = _PILImage.fromarray(arr, mode='L')
+            if (w, h) != (target_w, target_h):
+                pil = pil.resize((target_w, target_h), _PILImage.BILINEAR)
+            out = _np.asarray(pil).astype(_np.float32) / 255.0
+            return out
+
+        def dragEnterEvent(self, e):
+            try:
+                if e.mimeData().hasUrls():
+                    e.acceptProposedAction(); return
+            except Exception:
+                pass
+            e.ignore()
+
+        def dropEvent(self, e):
+            try:
+                urls = e.mimeData().urls()
+                if urls:
+                    p = urls[0].toLocalFile()
+                    if p:
+                        self.fileDropped.emit(p)
+                        e.acceptProposedAction(); return
+            except Exception:
+                pass
+            e.ignore()
+
         def paintEvent(self, ev):
             from PySide6.QtGui import QPainter
             p = QPainter(self)
-            # checker
+            # draw checker
             for y in range(0, self.height(), self._bg.height()):
                 for x in range(0, self.width(), self._bg.width()):
-                    p.drawPixmap(x,y,self._bg)
+                    p.drawPixmap(x, y, self._bg)
+            # draw pixmap with zoom, centered
             if not self._pix.isNull():
-                pm = self._pix.scaled(self.width(), self.height(), Qt.KeepAspectRatio, Qt.SmoothTransformation)
-                x = (self.width() - pm.width())//2; y = (self.height() - pm.height())//2
-                p.drawPixmap(x,y,pm)
+                pm = self._pix
+                # base size to fit
+                pm_fit = pm.scaled(self.width(), self.height(), Qt.KeepAspectRatio, Qt.SmoothTransformation)
+                zw = int(pm_fit.width() * self._zoom)
+                zh = int(pm_fit.height() * self._zoom)
+                pm_zoom = pm_fit.scaled(zw, zh, Qt.KeepAspectRatio, Qt.SmoothTransformation)
+                x = (self.width() - pm_zoom.width()) // 2
+                y = (self.height() - pm_zoom.height()) // 2
+                self._draw_rect = (x, y, pm_zoom.width(), pm_zoom.height())
+                p.drawPixmap(x, y, pm_zoom)
+            # draw mask overlays
+            try:
+                p.setOpacity(self._overlay_opacity)
+            except Exception:
+                p.setOpacity(0.5)
+            p.setPen(Qt.NoPen)
+            # removal/keep mask using Screen mode (black = no change, white = lighten)
+            from PySide6.QtGui import QPainter as _QP
+            try:
+                old_mode = p.compositionMode()
+            except Exception:
+                old_mode = None
+            try:
+                p.setCompositionMode(_QP.CompositionMode_Screen)
+                p.drawImage(0, 0, self._mask)
+                try:
+                    p.drawImage(0, 0, self._mask_keep)
+                except Exception:
+                    pass
+            finally:
+                try:
+                    if old_mode is not None: p.setCompositionMode(old_mode)
+                except Exception:
+                    pass
             p.end()
+
 
     container = QWidget()
     vbox = QVBoxLayout(container)
@@ -633,6 +824,15 @@ def install_background_tool(pane, section_widget) -> None:
     cb_inv   = QCheckBox("Invert mask"); cb_inv.setChecked(False)
     cb_ah    = QCheckBox("Edge anti-halo"); cb_ah.setChecked(True)
 
+    # Mask overlay
+    s_moverlay = QSpinBox(); s_moverlay.setRange(0,100); s_moverlay.setValue(50)
+    try:
+        s_moverlay.valueChanged.connect(lambda v: preview.setOverlayOpacity(v/100.0))
+    except Exception:
+        pass
+
+    lay.addRow("Mask overlay", s_moverlay)
+
     # Shadow
     cb_shadow= QCheckBox("Drop shadow"); cb_shadow.setChecked(False)
     s_salpha= QSpinBox(); s_salpha.setRange(0,255); s_salpha.setValue(120)
@@ -678,6 +878,11 @@ def install_background_tool(pane, section_widget) -> None:
     # Layout wire
     lay.addRow("Engine", cmb_engine)
     lay.addRow("Mode",   cmb_mode)
+    # Presets row
+    cmb_presets = QComboBox(); btn_preset_save = QPushButton("Save preset"); btn_preset_del = QPushButton("Delete")
+    lay.addRow("Presets", cmb_presets)
+    row_presets = QHBoxLayout(); row_presets.addWidget(btn_preset_save); row_presets.addWidget(btn_preset_del)
+    lay.addRow("", row_presets)
     lay.addRow(source_row)
     lay.addRow("Background", cmb_repl)
     lay.addRow("Blur amount", s_blurbg)
@@ -742,6 +947,48 @@ def install_background_tool(pane, section_widget) -> None:
                     repl_mode="transparent", repl_color=(255,255,255), repl_blur=20, repl_image=None,
                     drop_shadow=False, shadow_alpha=120, shadow_blur=20, shadow_offx=10, shadow_offy=10, anti_halo=True)
 
+
+    # --- Presets ---
+    def _load_presets_list():
+        d = _load_prefs(); return d.get("bg_presets", [])
+    def _save_presets_list(lst):
+        d = _load_prefs(); d["bg_presets"] = lst; _save_prefs(d)
+    def _refresh_presets_ui():
+        try:
+            cmb_presets.blockSignals(True); cmb_presets.clear()
+            lst = _load_presets_list()
+            for item in lst:
+                cmb_presets.addItem(item.get("name","Preset"))
+        finally:
+            cmb_presets.blockSignals(False)
+    def on_preset_save():
+        lst = _load_presets_list()
+        name = f"Preset {len(lst)+1}"
+        try:
+            from PySide6.QtWidgets import QInputDialog
+            n, ok = QInputDialog.getText(panel, "Save preset", "Name:", text=name)
+            if ok and n: name = n
+        except Exception:
+            pass
+        lst.append({"name": name, "params": get_params()})
+        _save_presets_list(lst); _refresh_presets_ui()
+    def on_preset_apply(idx):
+        lst = _load_presets_list()
+        if 0 <= idx < len(lst):
+            set_params(lst[idx]["params"]); schedule_update()
+    def on_preset_delete():
+        lst = _load_presets_list()
+        idx = cmb_presets.currentIndex()
+        if 0 <= idx < len(lst):
+            del lst[idx]; _save_presets_list(lst); _refresh_presets_ui()
+    try:
+        btn_preset_save.clicked.connect(on_preset_save)
+        btn_preset_del.clicked.connect(on_preset_delete)
+        cmb_presets.currentIndexChanged.connect(on_preset_apply)
+        _refresh_presets_ui()
+    except Exception:
+        pass
+
     # --- recomposition (no ONNX run) ---
     from PySide6.QtCore import QTimer
     _debounce = QTimer(); _debounce.setSingleShot(True); _debounce.setInterval(200)
@@ -750,10 +997,27 @@ def install_background_tool(pane, section_widget) -> None:
     def do_update():
         if current_rgb is None or current_alpha is None: return
         p = get_params()
+        # Apply brush mask from preview to remove regions (set alpha=0 where painted)
+        a_eff = current_alpha.copy()
+        try:
+            h, w = a_eff.shape[:2]
+            rm, km = None, None
+            try:
+                rm, km = preview.export_masks_to_image_size(w, h)
+            except Exception:
+                rm = preview.export_mask_to_image_size(w, h)
+                km = None
+            if rm is not None:
+                a_eff = a_eff * (1.0 - (rm > 0.01).astype(a_eff.dtype))
+            if km is not None:
+                a_eff = np.clip(a_eff + (km > 0.01).astype(a_eff.dtype) * (1.0 - a_eff), 0.0, 1.0)
+        except Exception:
+            pass
         try:
             pim = remove_background_preview(
-                current_rgb, current_alpha, p["mode"], p["threshold"], p["feather"], p["spill"],
-                p["invert"], p["auto_level"], p["repl_mode"], p["repl_color"], p["repl_blur"], p["repl_image"],
+                current_rgb, a_eff, p["mode"], p["threshold"], p["feather"], p["spill"],
+                p["invert"], p["auto_level"],
+                p["repl_mode"], p["repl_color"], p["repl_blur"], p["repl_image"],
                 p["drop_shadow"], p["shadow_alpha"], p["shadow_blur"], p["shadow_offx"], p["shadow_offy"], p["anti_halo"]
             )
             update_preview_pix(pim)
@@ -761,6 +1025,12 @@ def install_background_tool(pane, section_widget) -> None:
             try: QMessageBox.critical(panel, "Preview error", str(e))
             except Exception: print("Preview error:", e)
     _debounce.timeout.connect(do_update)
+
+    # Mask change triggers a preview update
+    try:
+        preview.maskChanged.connect(schedule_update)
+    except Exception:
+        pass
 
     # Hook updates
     for w in [cmb_mode, cmb_repl, s_blurbg, s_thresh, s_feath, cb_spill, cb_auto, cb_inv, cb_ah, cb_shadow, s_salpha, s_sblur, s_sox, s_soy]:
@@ -826,6 +1096,33 @@ def install_background_tool(pane, section_widget) -> None:
         undo_stack.clear(); set_params(defaults()); schedule_update()
     btn_load.clicked.connect(on_load_external)
 
+    # Drag & drop from preview
+    def _on_drop_path(pathstr: str):
+        nonlocal current_rgb, current_alpha, current_path
+        try:
+            pth = Path(pathstr)
+            current_path = pth
+            # decide type by extension
+            ext = pth.suffix.lower()
+            is_video = ext in ['.mp4','.mov','.mkv','.avi','.webm']
+            img = load_image_or_frame(str(current_path), float(t_seek.value()) if is_video else 0.0)
+            current_rgb = _np_from_pil(img)
+            eng, model = _pick_engine({0:"auto",1:"modnet",2:"birefnet"}[cmb_engine.currentIndex()])
+            if model is None:
+                return
+            current_alpha = _infer_onnx_alpha(model, current_rgb, eng)
+            undo_stack.clear(); set_params(defaults()); schedule_update()
+        except Exception as e:
+            try:
+                from PySide6.QtWidgets import QMessageBox
+                QMessageBox.critical(panel, "Drop error", str(e))
+            except Exception:
+                pass
+    try:
+        preview.fileDropped.connect(_on_drop_path)
+    except Exception:
+        pass
+
     # --- Recompute, Reset, Undo, Save ---
     def on_recompute():
         nonlocal current_alpha
@@ -846,7 +1143,7 @@ def install_background_tool(pane, section_widget) -> None:
 
     def on_reset():
         if current_rgb is None: return
-        set_params(defaults()); schedule_update()
+        set_params(defaults()); preview.clearMask(); schedule_update()
     btn_reset.clicked.connect(on_reset)
 
     def on_undo():
