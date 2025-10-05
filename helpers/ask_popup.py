@@ -14,10 +14,11 @@ from PySide6.QtWidgets import (
 # === Model path (offline) ===
 
 # === Framie: helpers ===
-FRAMIE_DIR = Path.home() / ".framie"
-FRAMIE_DIR.mkdir(parents=True, exist_ok=True)
-PREFS_PATH = FRAMIE_DIR / "prefs.json"
-PINS_PATH = FRAMIE_DIR / "pins.json"
+BASE_DIR = Path(__file__).resolve().parent.parent
+SETSAVE_DIR = BASE_DIR / "presets" / "setsave"
+SETSAVE_DIR.mkdir(parents=True, exist_ok=True)
+PREFS_PATH = SETSAVE_DIR / "prefs.json"
+PINS_PATH = SETSAVE_DIR / "pins.json"
 
 def _prefs_load():
     try:
@@ -182,22 +183,28 @@ class GenConfig:
     repetition_penalty: float = 1.05
 
 
+
 def _build_messages(extra_system: str, history: List[Dict[str, Any]], user_text: str, pil_image):
     """
     Build messages for a vision-capable chat model without leaking system text.
-    - System: DEFAULT_SYSTEM + optional extra_system (modes/app info)
+    - System: DEFAULT_SYSTEM + optional extra_system (modes/app info, without duplicates)
     - History: pass through as-is
     - User: user_text (+ image placeholder only if present)
     """
-    sys_txt = DEFAULT_SYSTEM.strip()
-    if extra_system and extra_system.strip():
-        sys_txt = (sys_txt + "\n\n" + extra_system.strip()).strip()
+    base = DEFAULT_SYSTEM.strip()
+    extra = (extra_system or "").strip()
+    # Remove any copy of DEFAULT_SYSTEM from extra to avoid duplication
+    if extra.replace("\r", "").replace("\n", " ").strip() == base.replace("\r", "").replace("\n", " ").strip():
+        extra = ""
+    else:
+        extra = extra.replace(base, "").strip()
+
+    sys_txt = base if not extra else (base + "\n\n" + extra).strip()
 
     messages: List[Dict[str, Any]] = [
         {"role": "system", "content": [{"type":"text","text": sys_txt}]}
     ]
 
-    # Prior history (already role-tagged: user/assistant)
     for m in history:
         if m.get("role") in ("user","assistant"):
             clean_parts = []
@@ -207,13 +214,13 @@ def _build_messages(extra_system: str, history: List[Dict[str, Any]], user_text:
             if clean_parts:
                 messages.append({"role": m.get("role"), "content": clean_parts})
 
-    # Current user turn
     content = []
     if pil_image is not None:
         content.append({"type":"image"})
     content.append({"type":"text","text": user_text})
     messages.append({"role": "user", "content": content})
     return messages
+
 
 def _next_joke() -> str:
     _load_jokes()
@@ -612,24 +619,32 @@ class AskPopup(QDialog):
 
         hdr = QHBoxLayout(); hdr.addWidget(QLabel("Ask anything.")); hdr.addStretch(1)
         hdr.addWidget(QLabel("Temp")); self.spin_temp = QDoubleSpinBox(); self.spin_temp.setRange(0.0,2.0); self.spin_temp.setSingleStep(0.05); self.spin_temp.setValue(0.70); hdr.addWidget(self.spin_temp)
+        self.spin_temp.setToolTip("Sampling temperature: higher = more random, lower = more deterministic.")
         hdr.addWidget(QLabel("Max")); self.spin_max = QSpinBox(); self.spin_max.setRange(16,4096); self.spin_max.setValue(1024); hdr.addWidget(self.spin_max)
+        self.spin_max.setToolTip("Maximum number of tokens to generate in the reply.")
         root.addLayout(hdr)
 
         # Framie toolbar
         bar = QHBoxLayout()
         bar.addWidget(QLabel("Greeting"))
         self.combo_greet = QComboBox(); self.combo_greet.addItems(["Professional","Casual","Playful"])
+        self.combo_greet.setToolTip("Tone/style of assistant replies.")
         bar.addWidget(self.combo_greet)
         bar.addWidget(QLabel("Mode"))
         self.combo_mode = QComboBox(); self.combo_mode.addItems(["Coach","Power User","ELI5","Bug hunt"])
+        self.combo_mode.setToolTip("Operating mode: Coach, Power User, ELI5, or Bug hunt.")
         bar.addWidget(self.combo_mode)
         self.chk_auto_frame = QCheckBox("Auto ‘this frame’ image (≤1024px)"); self.chk_auto_frame.setChecked(True)
+        self.chk_auto_frame.setToolTip("Automatically attach a downscaled snapshot of the current frame (\u22641024px) to your message.")
         bar.addWidget(self.chk_auto_frame)
         self.btn_pin = QPushButton("📌 Pin last"); self.btn_pin.clicked.connect(self._pin_last)
+        self.btn_pin.setToolTip("Pin the last assistant reply for quick access later.")
         bar.addWidget(self.btn_pin)
         self.btn_pins = QPushButton("📂 Pinned"); self.btn_pins.clicked.connect(self._show_pins)
+        self.btn_pins.setToolTip("Open your pinned messages.")
         bar.addWidget(self.btn_pins)
         self.btn_tools = QPushButton("Tools")
+        self.btn_tools.setToolTip("Open quick tools and utilities.")
         _menu = QMenu(self.btn_tools)
         _menu.addAction("Analyze Clip…", self._tool_analyze_clip)
         _menu.addAction("Dry-run Export…", self._tool_dry_run)
@@ -646,15 +661,20 @@ class AskPopup(QDialog):
         mm = QHBoxLayout()
         mm.addWidget(QLabel("Backend"))
         self.combo_backend = QComboBox(); self.combo_backend.addItems(["Transformers (VL)","llama.cpp (GGUF)"])
+        self.combo_backend.setToolTip("Choose the inference backend (e.g., Transformers or local llama.cpp).")
         mm.addWidget(self.combo_backend)
         mm.addWidget(QLabel("Device")); self.combo_device = QComboBox(); self.combo_device.addItems(["auto","cpu","cuda"])
+        self.combo_device.setToolTip("Select the compute device (auto/CPU/CUDA).")
         mm.addWidget(self.combo_device)
         mm.addWidget(QLabel("Preset")); self.combo_preset = QComboBox(); self.combo_preset.addItems(["Tiny (Q4)","Balanced (Q5)","Quality (Q8)"])
+        self.combo_preset.setToolTip("Choose a quality/speed preset for responses.")
         mm.addWidget(self.combo_preset)
         mm.addWidget(QLabel("GGUF"))
         self.gguf_path = QPlainTextEdit(self); self.gguf_path.setMaximumHeight(28)
+        self.gguf_path.setToolTip("Path to your GGUF model file for llama.cpp.")
         mm.addWidget(self.gguf_path)
         self.btn_browse_gguf = QPushButton("…"); self.btn_browse_gguf.clicked.connect(self._browse_gguf)
+        self.btn_browse_gguf.setToolTip("Browse for a GGUF model file.")
         mm.addWidget(self.btn_browse_gguf)
         root.addLayout(mm)
 
@@ -676,11 +696,19 @@ class AskPopup(QDialog):
 
         row = QHBoxLayout()
         self.chk_attach = QCheckBox("Attach current frame"); row.addWidget(self.chk_attach)
+        self.chk_attach.setToolTip("Attach the current preview frame to your next message.")
         self.chk_stream = QCheckBox("Stream"); self.chk_stream.setChecked(True); row.addWidget(self.chk_stream)
+        self.chk_stream.setToolTip("Stream tokens as they generate for lower latency.")
+        self.chk_enter_send = QCheckBox("Enter sends message"); row.addWidget(self.chk_enter_send)
+        self.chk_enter_send.setToolTip("Press Enter to send; Shift+Enter for a newline.")
         row.addStretch(1)
         self.btn_screenshot = QPushButton("Screenshot")
+        self.btn_screenshot.setToolTip("Capture and attach a screenshot of the app window.")
         row.addWidget(self.btn_screenshot)
         self.btn_reset = QPushButton("Reset"); self.btn_close = QPushButton("Close"); self.btn_send = QPushButton("Send")
+        self.btn_close.setToolTip("Close the Ask window.")
+        self.btn_send.setToolTip("Send your message.")
+        self.btn_reset.setToolTip("Reset input/toggles to defaults.")
         row.addWidget(self.btn_reset); row.addWidget(self.btn_close); row.addWidget(self.btn_send); root.addLayout(row)
 
         self.btn_close.clicked.connect(self.close)
@@ -697,6 +725,14 @@ class AskPopup(QDialog):
         self.combo_device.setCurrentText(self._prefs.get("device","auto"))
         self.combo_preset.setCurrentText({"q4":"Tiny (Q4)","q5":"Balanced (Q5)","q8":"Quality (Q8)"}.get(self._prefs.get("preset","q5"), "Balanced (Q5)"))
         self.gguf_path.setPlainText(self._prefs.get("gguf",""))
+        
+        self.chk_stream.setChecked(bool(self._prefs.get("stream", True)))
+        self.chk_attach.setChecked(bool(self._prefs.get("attach", False)))# New: Enter sends message preference
+        try:
+            self.chk_enter_send.setChecked(bool(self._prefs.get("enter_send", True)))
+        except Exception:
+            pass
+
         self._pins = _pins_load()
         self._last_img_hash = ""
 
@@ -709,14 +745,22 @@ class AskPopup(QDialog):
         }
         self._append("Assistant", greet_map.get(g, greet_map["Casual"]))
 
+        self._update_input_placeholder()
+
         # Save-on-change
+        self.chk_stream.toggled.connect(lambda v: self._prefs.__setitem__("stream", bool(v)) or _prefs_save(self._prefs))
+        self.chk_attach.toggled.connect(lambda v: self._prefs.__setitem__("attach", bool(v)) or _prefs_save(self._prefs))
         self.combo_greet.currentTextChanged.connect(lambda v: self._prefs.__setitem__("greeting", v) or _prefs_save(self._prefs))
         self.combo_mode.currentTextChanged.connect(lambda v: self._prefs.__setitem__("mode", v) or _prefs_save(self._prefs))
         self.chk_auto_frame.toggled.connect(lambda v: self._prefs.__setitem__("auto_frame", bool(v)) or _prefs_save(self._prefs))
         self.combo_backend.currentTextChanged.connect(lambda v: self._prefs.__setitem__("backend", v) or _prefs_save(self._prefs))
         self.combo_device.currentTextChanged.connect(lambda v: self._prefs.__setitem__("device", v) or _prefs_save(self._prefs))
         self.combo_preset.currentTextChanged.connect(lambda v: self._prefs.__setitem__("preset", "q4" if v.startswith("Tiny") else "q8" if v.startswith("Quality") else "q5") or _prefs_save(self._prefs))
+        # New: enter sends toggle persistence + placeholder refresh
+        self.chk_enter_send.toggled.connect(lambda v: self._prefs.__setitem__("enter_send", bool(v)) or _prefs_save(self._prefs))
+        self.chk_enter_send.toggled.connect(lambda _: self._update_input_placeholder())
 
+        
 
     def _append(self, who: str, text: str = ""):
         text = self._sanitize_text(text)
@@ -726,8 +770,74 @@ class AskPopup(QDialog):
         try: self._update_hud()
         except Exception: pass
 
+    
+
+    def _current_asst_prefix(self) -> str:
+        try:
+            t = self.transcript.toPlainText().splitlines()
+            if t and t[-1].startswith("Assistant: "):
+                return t[-1][len("Assistant: "):]
+        except Exception:
+            pass
+        return ""
+
+    def _strip_system_leak(self, incoming: str) -> str:
+        try:
+            if not getattr(self, "_filter_active", False):
+                return incoming
+
+            existing = self._current_asst_prefix()
+            probe = (existing + incoming)
+
+            prefixes = []
+            try:
+                prefixes.append(DEFAULT_SYSTEM.strip())
+            except Exception:
+                pass
+            xsys = getattr(self, "_filter_extra_sys", "")
+            if xsys:
+                prefixes.append(xsys.strip())
+            prefixes += [
+                "Be terse, command-like, prefer concrete commands and code.",
+                "Coach the user step-by-step, friendly and encouraging.",
+                "Explain like I am five: simple words and short sentences.",
+                "Proactively ask for logs",
+            ]
+            q = getattr(self, "_last_user_q", "")
+            for pref in [q, f"You: {q}", f"User: {q}", f"Human: {q}"]:
+                if pref:
+                    prefixes.append(pref)
+
+            def strip_prefix(s, pref):
+                s2 = s.lstrip()
+                if s2.startswith(pref):
+                    lead = len(s) - len(s2)
+                    return s[:lead] + s2[len(pref):], True
+                return s, False
+
+            changed = False
+            for _ in range(3):
+                for pref in prefixes:
+                    if not pref: continue
+                    probe2, did = strip_prefix(probe, pref)
+                    if did:
+                        probe = probe2; changed = True
+
+            if probe.strip() == "":
+                return ""
+
+            if any(ch.isalnum() for ch in probe[:32]):
+                self._filter_active = False
+
+            tail = probe[len(existing):]
+            if changed and tail.startswith("\n"):
+                tail = tail[1:]
+            return tail
+        except Exception:
+            return incoming
     def _append_inline(self, text: str):
         text = self._sanitize_text(text)
+        text = self._strip_system_leak(text)
         c = self.transcript.textCursor(); c.movePosition(QTextCursor.End); c.insertText(text); self.transcript.setTextCursor(c); self.transcript.ensureCursorVisible()
         try: self._update_hud()
         except Exception: pass
@@ -916,6 +1026,15 @@ class AskPopup(QDialog):
 
         # If asking about the app, include local info as extra system context
         extra_sys = self.system.toPlainText()
+        # ##dedup_default: prevent DEFAULT_SYSTEM duplication
+        try:
+            ds = DEFAULT_SYSTEM.strip()
+            if extra_sys.strip().replace('\r','').replace('\n',' ') == ds.replace('\r','').replace('\n',' '):
+                extra_sys = ''
+            else:
+                extra_sys = extra_sys.replace(ds, '').strip()
+        except Exception:
+            pass
         mode = getattr(self, "combo_mode", None).currentText() if hasattr(self, "combo_mode") else "Coach"
         if mode == "Coach":
             extra_sys = "Coach the user step-by-step, friendly and encouraging.\n" + extra_sys
@@ -932,9 +1051,14 @@ class AskPopup(QDialog):
                 extra_sys = (extra_sys + '\\n\\n' + 'APP_INFO:\\n' + _LOCAL['info_text']).strip()
 
         gen = GenConfig(temperature=float(self.spin_temp.value()), max_new_tokens=int(self.spin_max.value()), repetition_penalty=1.05)
+        self._last_user_q = q
+        self._filter_extra_sys = extra_sys
+        self._filter_active = True
+        self._assist_chars = 0
         msgs = _build_messages(extra_sys, self._history, q, pil)
 
         self.btn_send.setEnabled(False)
+        self._gen_start = time.time()
         self.worker = ChatWorker(msgs, pil, gen, stream=self.chk_stream.isChecked(), parent=self)
         self.worker.chunk.connect(self._append_inline)
         self.worker.done.connect(self._on_done)
@@ -1056,6 +1180,43 @@ class AskPopup(QDialog):
         QApplication.clipboard().setText(cmd)
         self.status.setText("ffmpeg command copied to clipboard.")
 
+
+def _askpopup_update_input_placeholder(self):
+    try:
+        if getattr(self, "chk_enter_send", None) and self.chk_enter_send.isChecked():
+            self.input.setPlaceholderText("Type and press Enter to send (Shift+Enter for newline)")
+        else:
+            self.input.setPlaceholderText("Type and press Send… (Enter for newline)")
+    except Exception:
+        pass
+
+
+def eventFilter(self, obj, ev):
+    # Key handling for the chat input
+    if getattr(self, "input", None) is obj and getattr(ev, "type", lambda: None)() == QEvent.KeyPress:
+        ke = ev  # QKeyEvent
+        try:
+            key = ke.key()
+        except Exception:
+            key = None
+        if key in (Qt.Key_Return, Qt.Key_Enter):
+            # If "Enter sends message" is OFF, let Enter insert a newline
+            if not getattr(self, "chk_enter_send", None) or not self.chk_enter_send.isChecked():
+                return False
+            # Shift+Enter always makes a newline
+            if getattr(ke, "modifiers", lambda: 0)() & Qt.ShiftModifier:
+                return False
+            # Otherwise, send the message
+            try:
+                self._on_send()
+            except Exception:
+                pass
+            return True
+    # Fallback to default behavior
+    try:
+        return super(AskPopup, self).eventFilter(obj, ev)
+    except Exception:
+        return False
 class LlamaWorker(QThread):
     chunk = Signal(str)
     done = Signal()
@@ -1084,10 +1245,10 @@ class LlamaWorker(QThread):
             self.done.emit()
         except Exception as e:
             self.error.emit(str(e))
-def eventFilter(self, obj, ev):
-        if obj is self.input and ev.type() == QEvent.KeyPress:
-            ke: QKeyEvent = ev  # type: ignore
-            if ke.key() in (Qt.Key_Return, Qt.Key_Enter):
-                if ke.modifiers() & Qt.ShiftModifier: return False
-                self._on_send(); return True
-        return super().eventFilter(obj, ev)
+
+# Bind patched helpers onto AskPopup
+try:
+    AskPopup._update_input_placeholder = _askpopup_update_input_placeholder
+    AskPopup.eventFilter = eventFilter
+except Exception:
+    pass
