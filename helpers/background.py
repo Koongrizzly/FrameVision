@@ -478,11 +478,13 @@ def remove_background_preview(
         alpha = _auto_level_alpha(alpha)
     if invert:
         alpha = 1.0 - alpha
-        # Apply removal strength bias: 0..100 where 50 is neutral
+    # Apply removal strength: map 0..100 (50 neutral) to a gamma curve on alpha for smooth control
     try:
         b = max(0, min(100, int(bias)))
-        shift = (b - 50) / 100.0 * 0.35
-        alpha = np.clip(alpha + shift, 0.0, 1.0)
+        scale = (b - 50) / 50.0  # -1..1
+        # gamma in [~2.8 (weaker removal)..1..~0.35 (stronger removal)]
+        gamma = 2.0 ** (-1.5 * scale)
+        alpha = np.clip(alpha, 0.0, 1.0) ** float(gamma)
     except Exception:
         pass
     a8 = _apply_post(alpha, int(threshold), int(feather))
@@ -565,6 +567,9 @@ def install_background_tool(pane, section_widget) -> None:
             self.setMinimumHeight(270)
             self._pix = QPixmap()
             self._bg = self._make_checker()
+            # Image size in pixels (original content). We store masks in IMAGE coordinates.
+            self._img_w = 0
+            self._img_h = 0
             # Overlay tool state
             self._tool = 'brush'  # 'brush' or 'zoom'
             self._brush_radius = 20
@@ -574,13 +579,10 @@ def install_background_tool(pane, section_widget) -> None:
             self._pan = [0, 0]  # pan offset in pixels (widget coords)
             self._drag_origin = None  # for panning in zoom tool
             self._draw_rect = None  # last drawn image rect for mapping
-            # Mask image in widget coords
+            # Mask images in IMAGE coords (allocated after image is set)
             from PySide6.QtGui import QImage
-            self._mask = QImage(self.size(), QImage.Format_Grayscale8)
-            self._mask.fill(0)
-            # Additional keep mask (for restore brush)
-            self._mask_keep = QImage(self.size(), QImage.Format_Grayscale8)
-            self._mask_keep.fill(0)
+            self._mask = QImage()
+            self._mask_keep = QImage()
             # Overlay opacity (0..1)
             self._overlay_opacity = 0.5
             # Accept drag & drop for quick load
@@ -608,6 +610,28 @@ def install_background_tool(pane, section_widget) -> None:
             self._btn_brush.clicked.connect(lambda: self._select_tool('brush'))
             self._btn_zoom.clicked.connect(lambda: self._select_tool('zoom'))
 
+        def _widget_to_image(self, pos):
+            # Map widget position to image coordinates; return (x,y) or None if outside
+            if not self._draw_rect or self._img_w <= 0 or self._img_h <= 0:
+                return None
+            x0, y0, w, h = self._draw_rect
+            x = float(pos.x()) - float(x0)
+            y = float(pos.y()) - float(y0)
+            if x < 0 or y < 0 or x > w or y > h:
+                return None
+            ix = x * (self._img_w / float(w))
+            iy = y * (self._img_h / float(h))
+            return ix, iy, (self._img_w / float(w)), (self._img_h / float(h))
+
+        def setImageSize(self, w: int, h: int):
+            """Set the logical image size; allocate masks in image pixels."""
+            from PySide6.QtGui import QImage
+            w = int(max(1, w)); h = int(max(1, h))
+            self._img_w, self._img_h = w, h
+            self._mask = QImage(w, h, QImage.Format_Grayscale8); self._mask.fill(0)
+            self._mask_keep = QImage(w, h, QImage.Format_Grayscale8); self._mask_keep.fill(0)
+            self.update()
+
         def _make_checker(self, s=8):
             img = QImage(s*2, s*2, QImage.Format_RGB32)
             c1 = QColor(200,200,200).rgb(); c2 = QColor(230,230,230).rgb()
@@ -631,25 +655,10 @@ def install_background_tool(pane, section_widget) -> None:
             self.setCursor(Qt.CrossCursor if self._tool=='brush' else Qt.ArrowCursor)
 
         def resizeEvent(self, ev):
-            # Keep mask image size with content
-            from PySide6.QtGui import QImage, QPainter
-            new_mask = QImage(self.size(), QImage.Format_Grayscale8)
-            new_mask.fill(0)
-            p = QPainter(new_mask)
-            p.drawImage(0, 0, self._mask)
-            p.end()
-            self._mask = new_mask
-            # keep-mask resize
-            try:
-                new_keep = QImage(self.size(), QImage.Format_Grayscale8)
-                new_keep.fill(0)
-                p2 = QPainter(new_keep)
-                p2.drawImage(0, 0, self._mask_keep)
-                p2.end()
-                self._mask_keep = new_keep
-            except Exception:
-                pass
+            # Widget resized; background checker will be regenerated automatically.
+            # Masks are stored in image coordinates; no need to resize them here.
             return super().resizeEvent(ev)
+
 
         def wheelEvent(self, e):
             if self._tool == 'zoom':
@@ -710,90 +719,69 @@ def install_background_tool(pane, section_widget) -> None:
                 self.setCursor(Qt.ArrowCursor)
             return super().mouseReleaseEvent(e)
         def _paint_at(self, pos):
-            from PySide6.QtGui import QPainter
+            from PySide6.QtGui import QPainter, QPointF
+            mapped = self._widget_to_image(pos)
+            if mapped is None: return
+            ix, iy, sx, sy = mapped
+            rad = int(max(1, round(self._brush_radius * (self._img_w / max(1.0, self._draw_rect[2])))))
             p = QPainter(self._mask)
             p.setRenderHint(QPainter.Antialiasing, True)
-            p.setPen(Qt.NoPen)
-            p.setBrush(Qt.white)
-            p.drawEllipse(pos, self._brush_radius, self._brush_radius)
+            p.setPen(Qt.NoPen); p.setBrush(Qt.white)
+            p.drawEllipse(QPointF(ix, iy), rad, rad)
             p.end()
-            self.maskChanged.emit()
-            self.update()
+            self.maskChanged.emit(); self.update()
 
         def _paint_keep_at(self, pos):
-            from PySide6.QtGui import QPainter
+            from PySide6.QtGui import QPainter, QPointF
+            mapped = self._widget_to_image(pos)
+            if mapped is None: return
+            ix, iy, sx, sy = mapped
+            rad = int(max(1, round(self._brush_radius * (self._img_w / max(1.0, self._draw_rect[2])))))
             p = QPainter(self._mask_keep)
             p.setRenderHint(QPainter.Antialiasing, True)
-            p.setPen(Qt.NoPen)
-            p.setBrush(Qt.white)
-            p.drawEllipse(pos, self._brush_radius, self._brush_radius)
+            p.setPen(Qt.NoPen); p.setBrush(Qt.white)
+            p.drawEllipse(QPointF(ix, iy), rad, rad)
             p.end()
-            self.maskChanged.emit()
-            self.update()
+            self.maskChanged.emit(); self.update()
 
         def clearMask(self):
-            self._mask.fill(0)
-            try: self._mask_keep.fill(0)
-            except Exception: pass
-            self.maskChanged.emit()
-            self.update()
+            if not self._mask.isNull():
+                self._mask.fill(0)
+            if not self._mask_keep.isNull():
+                try: self._mask_keep.fill(0)
+                except Exception: pass
+            self.maskChanged.emit(); self.update()
 
         
         def export_masks_to_image_size(self, target_w, target_h):
             """Return (remove_mask, keep_mask) as float32 [0..1] arrays at image size.
-
-            Crops the widget-sized masks to the drawn image rect to avoid shrinking away when the image is letterboxed.
-
-            Returns (rm, km) where any missing mask returns None.
-
-            """
+            Masks are stored in image coordinates; resize if target differs."""
             import numpy as _np
+            from PySide6.QtGui import QImage
             from PIL import Image as _PILImage
-            # Determine image rect in widget coords
-            if not self._draw_rect:
-                # Fallback: no rect yet, export full mask
-                return self.export_mask_to_image_size(target_w, target_h), None
-            x, y, w, h = self._draw_rect
-            # Clamp to widget bounds
-            x = max(0, int(x)); y = max(0, int(y)); w = max(1, int(w)); h = max(1, int(h))
-            # Helper to convert a QImage to numpy resized to target
-            def _qimg_crop_resize(qimg):
-                if qimg is None: return None
+            def _qimg_to_np(qimg, tw, th):
+                if qimg is None or qimg.isNull(): return None
                 q = qimg.convertToFormat(QImage.Format_Grayscale8)
-                ww = q.width(); hh = q.height()
-                if ww <= 0 or hh <= 0: return None
-                # crop
-                try:
-                    qc = q.copy(x, y, w, h)
-                except Exception:
-                    qc = q
-                bpl = qc.bytesPerLine()
-                ptr = qc.constBits()
-                ptr.setsize(qc.height() * bpl)
-                arr = _np.frombuffer(ptr, dtype=_np.uint8).reshape((qc.height(), bpl))[:, :qc.width()]
+                w = q.width(); h = q.height()
+                bpl = q.bytesPerLine()
+                ptr = q.constBits(); ptr.setsize(h * bpl)
+                arr = _np.frombuffer(ptr, dtype=_np.uint8).reshape((h, bpl))[:, :w]
                 pil = _PILImage.fromarray(arr, mode='L')
-                if (w, h) != (target_w, target_h):
-                    pil = pil.resize((target_w, target_h), _PILImage.BILINEAR)
+                if (w, h) != (tw, th):
+                    pil = pil.resize((tw, th), _PILImage.BILINEAR)
                 out = _np.asarray(pil).astype(_np.float32) / 255.0
                 return out
-            rm = _qimg_crop_resize(self._mask)
-            km = None
-            try:
-                km = _qimg_crop_resize(self._mask_keep)
-            except Exception:
-                pass
+            rm = _qimg_to_np(self._mask, target_w, target_h)
+            km = _qimg_to_np(self._mask_keep, target_w, target_h)
             return rm, km
         def export_mask_to_image_size(self, target_w, target_h):
-                    # Convert QImage->numpy and resize to target (w,h)
+                    from PySide6.QtGui import QImage
                     import numpy as _np
                     from PIL import Image as _PILImage
                     q = self._mask.convertToFormat(QImage.Format_Grayscale8)
                     w = q.width(); h = q.height()
-                    if w <= 0 or h <= 0:
-                        return None
                     bpl = q.bytesPerLine()
-                    ptr = q.constBits()
-                    ptr.setsize(h * bpl)
+                    ptr = q.constBits(); ptr.setsize(h * bpl)
                     arr = _np.frombuffer(ptr, dtype=_np.uint8).reshape((h, bpl))[:, :w]
                     pil = _PILImage.fromarray(arr, mode='L')
                     if (w, h) != (target_w, target_h):
@@ -836,32 +824,35 @@ def install_background_tool(pane, section_widget) -> None:
                 zw = int(pm_fit.width() * self._zoom)
                 zh = int(pm_fit.height() * self._zoom)
                 pm_zoom = pm_fit.scaled(zw, zh, Qt.KeepAspectRatio, Qt.SmoothTransformation)
-                x = (self.width() - pm_zoom.width()) // 2 + int(self._pan[0]) + int(self._pan[0])
-                y = (self.height() - pm_zoom.height()) // 2 + int(self._pan[1]) + int(self._pan[1])
+                x = (self.width() - pm_zoom.width()) // 2 + int(self._pan[0])
+                y = (self.height() - pm_zoom.height()) // 2 + int(self._pan[1])
                 self._draw_rect = (x, y, pm_zoom.width(), pm_zoom.height())
                 p.drawPixmap(x, y, pm_zoom)
-            # draw mask overlays
+            # draw mask overlays anchored to the image rect
             try:
                 p.setOpacity(self._overlay_opacity)
             except Exception:
                 p.setOpacity(0.5)
             p.setPen(Qt.NoPen)
-            # removal/keep mask using Screen mode (black = no change, white = lighten)
             from PySide6.QtGui import QPainter as _QP
             try:
                 old_mode = p.compositionMode()
             except Exception:
                 old_mode = None
             try:
-                p.setCompositionMode(_QP.CompositionMode_Screen)
-                p.drawImage(0, 0, self._mask)
-                try:
-                    p.drawImage(0, 0, self._mask_keep)
-                except Exception:
-                    pass
+                if self._draw_rect and not self._mask.isNull():
+                    x, y, w, h = self._draw_rect
+                    m1 = self._mask.scaled(w, h)
+                    p.setCompositionMode(_QP.CompositionMode_Screen)
+                    p.drawImage(int(x), int(y), m1)
+                if self._draw_rect and not self._mask_keep.isNull():
+                    x, y, w, h = self._draw_rect
+                    m2 = self._mask_keep.scaled(w, h)
+                    p.drawImage(int(x), int(y), m2)
             finally:
                 try:
-                    if old_mode is not None: p.setCompositionMode(old_mode)
+                    if old_mode is not None:
+                        p.setCompositionMode(old_mode)
                 except Exception:
                     pass
             p.end()
@@ -871,6 +862,7 @@ def install_background_tool(pane, section_widget) -> None:
     vbox = QVBoxLayout(container)
 
     preview = Preview()
+
     vbox.addWidget(preview, stretch=3)  # preview gets most of the space
 
     # Controls panel below
@@ -888,7 +880,7 @@ def install_background_tool(pane, section_widget) -> None:
     t_seek = QDoubleSpinBox(); t_seek.setRange(0, 36000); t_seek.setDecimals(3); t_seek.setSingleStep(0.5); t_seek.setValue(0.0)
     btn_load = QPushButton("Load external…")
     source_row = QHBoxLayout()
-    source_row.addWidget(btn_use_current); source_row.addWidget(QLabel("Type")); source_row.addWidget(cmb_source)
+    source_row.addWidget(QLabel("Type")); source_row.addWidget(cmb_source)
     source_row.addWidget(QLabel("Seek (s)")); source_row.addWidget(t_seek); source_row.addWidget(btn_load)
 
     # Replacer
@@ -918,8 +910,23 @@ def install_background_tool(pane, section_widget) -> None:
     btn_img.clicked.connect(pick_img)
 
     # Post
-    s_thresh = QSpinBox(); s_thresh.setRange(0,255); s_thresh.setValue(6)
+    s_thresh = QSpinBox(); s_thresh.setRange(0,255); s_thresh.setValue(0)
     s_feath  = QSpinBox(); s_feath.setRange(0,50);  s_feath.setValue(3)
+    sl_aggr = QSlider(Qt.Horizontal); sl_aggr.setRange(0,100); sl_aggr.setValue(50)
+    # --- Fine controls at the TOP (above preview) ---
+    row_top1 = QHBoxLayout()
+    row_top1.addWidget(QLabel("Hard threshold (0=off)")); row_top1.addWidget(s_thresh)
+    row_top1.addSpacing(12)
+    row_top1.addWidget(QLabel("Feather (px)")); row_top1.addWidget(s_feath)
+
+    row_top2 = QHBoxLayout()
+    row_top2.addWidget(QLabel("Removal strength"))
+    row_top2.addWidget(sl_aggr)
+
+    top_controls = QVBoxLayout()
+    top_controls.addLayout(row_top1)
+    top_controls.addLayout(row_top2)
+    vbox.insertLayout(0, top_controls)
     cb_spill = QCheckBox("Edge de-spill"); cb_spill.setChecked(True)
     cb_auto  = QCheckBox("Auto-level mask"); cb_auto.setChecked(True)
     cb_inv   = QCheckBox("Invert mask"); cb_inv.setChecked(False)
@@ -933,7 +940,6 @@ def install_background_tool(pane, section_widget) -> None:
     except Exception:
         pass
 
-    lay.addRow("Mask overlay", s_moverlay)
 
     # Shadow
     cb_shadow= QCheckBox("Drop shadow"); cb_shadow.setChecked(False)
@@ -942,11 +948,10 @@ def install_background_tool(pane, section_widget) -> None:
     s_sox   = QSpinBox(); s_sox.setRange(-500,500); s_sox.setValue(10)
     s_soy   = QSpinBox(); s_soy.setRange(-500,500); s_soy.setValue(10)
     shadow_row = QHBoxLayout()
-    shadow_row.addWidget(QLabel("Opacity")); shadow_row.addWidget(s_salpha)
+    # Opacity moved next to 'Mask overlay' row above Engine
     shadow_row.addWidget(QLabel("Blur"));    shadow_row.addWidget(s_sblur)
     shadow_row.addWidget(QLabel("Offset X"));shadow_row.addWidget(s_sox)
     shadow_row.addWidget(QLabel("Offset Y"));shadow_row.addWidget(s_soy)
-
     # Output folder row
     out_dir = _get_out_dir_pref()
     le_out = QLineEdit(str(out_dir)); le_out.setReadOnly(True)
@@ -971,11 +976,16 @@ def install_background_tool(pane, section_widget) -> None:
     out_row = QHBoxLayout(); out_row.addWidget(le_out); out_row.addWidget(btn_out_change); out_row.addWidget(btn_out_open)
 
     # Actions
-    btn_recompute = QPushButton("Recompute mask")
+    btn_recompute = QPushButton("Recompute")
     btn_reset     = QPushButton("Reset")
     btn_undo      = QPushButton("Undo")
     btn_save      = QPushButton("Save")
-    btns_row = QHBoxLayout(); btns_row.addWidget(btn_recompute); btns_row.addWidget(btn_reset); btns_row.addWidget(btn_undo); btns_row.addWidget(btn_save)
+    btns_row = QHBoxLayout(); btns_row.addWidget(btn_use_current); btns_row.addWidget(btn_recompute); btns_row.addWidget(btn_undo); btns_row.addWidget(btn_reset); btns_row.addWidget(btn_save); btns_row.addStretch(1)    # Combined row: Mask overlay + Shadow Opacity (moved here per request)
+    row_overlay_opacity = QHBoxLayout()
+    row_overlay_opacity.addWidget(QLabel("Mask overlay")); row_overlay_opacity.addWidget(s_moverlay)
+    row_overlay_opacity.addSpacing(12)
+    row_overlay_opacity.addWidget(QLabel("Shadow opacity")); row_overlay_opacity.addWidget(s_salpha)
+    lay.addRow(row_overlay_opacity)
 
     # Layout wire
     lay.addRow("Engine", cmb_engine)
@@ -989,17 +999,21 @@ def install_background_tool(pane, section_widget) -> None:
     lay.addRow("Background", cmb_repl)
     lay.addRow("Blur amount", s_blurbg)
     lay.addRow("BG color", btn_color); lay.addRow(" ", color_preview)
-    lay.addRow("BG image", btn_img);   lay.addRow(" ", lbl_img)
-    lay.addRow("Output", out_row)
-    lay.addRow("Hard threshold (0=off)", s_thresh)
-    lay.addRow("Feather (px)", s_feath)
 
+
+        
+    lay.addRow("BG image", btn_img);   lay.addRow(" ", lbl_img)
     # Removal strength (bias)
-    sl_aggr = QSlider(Qt.Horizontal); sl_aggr.setRange(0,100); sl_aggr.setValue(50)
-    lay.addRow("Removal strength", sl_aggr)
-    lay.addRow(cb_spill); lay.addRow(cb_auto); lay.addRow(cb_inv); lay.addRow(cb_ah)
-    lay.addRow(cb_shadow); lay.addRow(shadow_row)
-    lay.addRow(btns_row)
+    row_tog1 = QHBoxLayout(); row_tog1.addWidget(cb_spill); row_tog1.addWidget(cb_inv); row_tog1.addWidget(cb_shadow)
+    row_tog2 = QHBoxLayout(); row_tog2.addWidget(cb_auto);  row_tog2.addWidget(cb_ah)
+    lay.addRow(row_tog1)
+    lay.addRow(row_tog2)
+    lay.addRow(shadow_row)
+    vbox.insertLayout(1, btns_row)
+    # Move Output path controls directly under the preview (before the main form panel)
+    out_line = QHBoxLayout(); out_line.addWidget(QLabel("Output")); out_line.addLayout(out_row)
+    vbox.insertLayout(3, out_line)
+
 
     # Mount into CollapsibleSection
     try:
@@ -1051,7 +1065,7 @@ def install_background_tool(pane, section_widget) -> None:
         except Exception: pass
 
     def defaults() -> Dict:
-        return dict(engine="auto", mode="keep_subject", threshold=6, feather=3, bias=50, spill=True, invert=False, auto_level=True,
+        return dict(engine="auto", mode="keep_subject", threshold=0, feather=3, bias=50, spill=True, invert=False, auto_level=True,
                     repl_mode="transparent", repl_color=(255,255,255), repl_blur=20, repl_image=None,
                     drop_shadow=False, shadow_alpha=120, shadow_blur=20, shadow_offx=10, shadow_offy=10, anti_halo=True)
 
@@ -1163,6 +1177,16 @@ def install_background_tool(pane, section_widget) -> None:
             except Exception: return
         current_rgb = _np_from_pil(img)
         eng, model = _pick_engine({0:"auto",1:"modnet",2:"birefnet"}[cmb_engine.currentIndex()])
+        try:
+            preview.setImageSize(current_rgb.shape[1], current_rgb.shape[0])
+        except Exception:
+            pass
+
+        try:
+            preview.setImageSize(current_rgb.shape[1], current_rgb.shape[0])
+        except Exception:
+            pass
+
         if model is None:
             try: QMessageBox.critical(panel, "Model", "No ONNX model found in models/."); return
             except Exception: return
@@ -1193,6 +1217,16 @@ def install_background_tool(pane, section_widget) -> None:
             except Exception: return
         current_rgb = _np_from_pil(img)
         eng, model = _pick_engine({0:"auto",1:"modnet",2:"birefnet"}[cmb_engine.currentIndex()])
+        try:
+            preview.setImageSize(current_rgb.shape[1], current_rgb.shape[0])
+        except Exception:
+            pass
+
+        try:
+            preview.setImageSize(current_rgb.shape[1], current_rgb.shape[0])
+        except Exception:
+            pass
+
         if model is None:
             try: QMessageBox.critical(panel, "Model", "No ONNX model found in models/."); return
             except Exception: return
@@ -1216,6 +1250,12 @@ def install_background_tool(pane, section_widget) -> None:
             img = load_image_or_frame(str(current_path), float(t_seek.value()) if is_video else 0.0)
             current_rgb = _np_from_pil(img)
             eng, model = _pick_engine({0:"auto",1:"modnet",2:"birefnet"}[cmb_engine.currentIndex()])
+            try:
+                preview.setImageSize(current_rgb.shape[1], current_rgb.shape[0])
+            except Exception:
+                pass
+
+
             if model is None:
                 return
             current_alpha = _infer_onnx_alpha(model, current_rgb, eng)
@@ -1279,7 +1319,8 @@ def install_background_tool(pane, section_widget) -> None:
         try:
             pim = remove_background_preview(
                 current_rgb, current_alpha, p["mode"], p["threshold"], p["feather"], p["spill"],
-                p["invert"], p["auto_level"], p["repl_mode"], p["repl_color"], p["repl_blur"], p["repl_image"],
+                p["invert"], p["auto_level"], p.get("bias",50),
+                p["repl_mode"], p["repl_color"], p["repl_blur"], p["repl_image"],
                 p["drop_shadow"], p["shadow_alpha"], p["shadow_blur"], p["shadow_offx"], p["shadow_offy"], p["anti_halo"]
             )
             out_dir = Path(le_out.text().strip()) if le_out.text().strip() else _get_out_dir_pref()
