@@ -282,14 +282,14 @@ class InstantToolsPane(QWidget):
     
 
         # Sections
-        sec_speed = CollapsibleSection("Speed", expanded=False)
+        sec_speed = CollapsibleSection("Slow motion - Speedup Video", expanded=False)
         
         sec_bg = CollapsibleSection("Background / Object Removal", expanded=False)
-        sec_resize = CollapsibleSection("Resize", expanded=False)
-        sec_gif = CollapsibleSection("Export GIF", expanded=False)
+        sec_resize = CollapsibleSection("Resize Images & Video", expanded=False)
+        sec_gif = CollapsibleSection("Animated Frames Lab", expanded=False)
         sec_extract = CollapsibleSection("Extract frames", expanded=False)
-        sec_trim = CollapsibleSection("Trim", expanded=False)
-        sec_crop = CollapsibleSection("Crop", expanded=False)
+        sec_trim = CollapsibleSection("Trim Lab", expanded=False)
+        sec_crop = CollapsibleSection("Cropping Tool", expanded=False)
 
         sec_quality = CollapsibleSection("Quality / Size Video", expanded=False)
 
@@ -369,7 +369,7 @@ class InstantToolsPane(QWidget):
         
         
         # ---- Prompt Generator ----
-        sec_prompt = CollapsibleSection("Prompt Generator", expanded=False)
+        sec_prompt = CollapsibleSection("Prompt Enhancement", expanded=False)
         try:
             install_prompt_tool(self, sec_prompt)
         except Exception:
@@ -491,7 +491,7 @@ class InstantToolsPane(QWidget):
         gif_backend.install_ui(self, lay_gif, sec_gif)
         sec_gif.setContentLayout(lay_gif)
         # Audio (moved to helpers/audiotool.py)
-        sec_audio = CollapsibleSection("Audio", expanded=False)
+        sec_audio = CollapsibleSection("Sound Lab", expanded=False)
         # Background / Object Removal (helpers/background.py)
         try:
             install_background_tool(self, sec_bg)
@@ -562,23 +562,23 @@ class InstantToolsPane(QWidget):
         # --- Remember settings (per-tool + global) ---
         def _sec_name_map():
             return {
-                "Audio": sec_audio,
-                "Speed": sec_speed,
+                "Sound Lab": sec_audio,
+                "Slow motion - Speedup Video": sec_speed,
                 "Background / Object Removal": sec_bg,
-                "Resize": sec_resize,
-                "Export GIF": sec_gif,
+                "Resize Images & Video": sec_resize,
+                "Animated Frames Lab": sec_gif,
                 "Extract frames": sec_extract,
-                "Trim": sec_trim,
-                "Crop": sec_crop,
+                "Trim Lab": sec_trim,
+                "Cropping Tool": sec_crop,
                 "Quality / Size Video": sec_quality,
                 "Image Quality / Convert": sec_img,
                 "Thumbnail / Meme Creator": sec_meme,
-                "Prompt Generator": sec_prompt,
+                "Prompt Enhancement": sec_prompt,
                 "Multi Rename": sec_rename
             }
         self._sections_map = _sec_name_map()
         # Build default whitelist (all except Trim and Audio)
-        default_whitelist = [k for k in self._sections_map.keys() if k not in ("Trim","Audio")]
+        default_whitelist = [k for k in self._sections_map.keys() if k not in ("Trim Lab","Sound Lab")]
         try:
             import json as _json
             wl_txt = self._qs.value("ToolsPane/remember_whitelist_json", "", type=str) or ""
@@ -590,7 +590,7 @@ class InstantToolsPane(QWidget):
             if self.remember_menu:
                 self.remember_menu.clear()
                 for name in self._sections_map.keys():
-                    if name in ("Trim","Audio"): 
+                    if name in ("Trim Lab","Sound Lab"): 
                         continue
                     act = self.remember_menu.addAction(name)
                     act.setCheckable(True); act.setChecked(name in self._remember_whitelist)

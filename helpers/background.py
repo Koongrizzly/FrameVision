@@ -460,6 +460,7 @@ def remove_background_preview(
     spill: bool,
     invert: bool,
     auto_level: bool,
+    bias: int,
     # Replacer:
     repl_mode: str,
     repl_color: Tuple[int,int,int],
@@ -477,6 +478,13 @@ def remove_background_preview(
         alpha = _auto_level_alpha(alpha)
     if invert:
         alpha = 1.0 - alpha
+        # Apply removal strength bias: 0..100 where 50 is neutral
+    try:
+        b = max(0, min(100, int(bias)))
+        shift = (b - 50) / 100.0 * 0.35
+        alpha = np.clip(alpha + shift, 0.0, 1.0)
+    except Exception:
+        pass
     a8 = _apply_post(alpha, int(threshold), int(feather))
     rgb2 = _spill_suppress(rgb, a8, 0.18) if (spill and mode != "alpha_only") else rgb
     return _compose_with_bg(
@@ -496,6 +504,7 @@ def remove_background_file(
     spill: bool = True,
     invert: bool = False,
     auto_level: bool = True,
+    bias: int = 50,
     out_dir: Optional[str] = None,
     # Replacer:
     repl_mode: str = "transparent",
@@ -538,7 +547,7 @@ def remove_background_file(
 def install_background_tool(pane, section_widget) -> None:
     try:
         from PySide6.QtWidgets import (
-            QWidget, QFormLayout, QComboBox, QSpinBox, QHBoxLayout, QVBoxLayout, QDoubleSpinBox,
+            QWidget, QFormLayout, QComboBox, QSpinBox, QSlider, QHBoxLayout, QVBoxLayout, QDoubleSpinBox,
             QPushButton, QCheckBox, QFileDialog, QMessageBox, QLabel, QLineEdit
         , QButtonGroup)
         from PySide6.QtCore import Qt, QTimer, QSize, Signal
@@ -553,13 +562,17 @@ def install_background_tool(pane, section_widget) -> None:
         fileDropped = Signal(str)
         def __init__(self):
             super().__init__()
-            self.setMinimumHeight(180)
+            self.setMinimumHeight(270)
             self._pix = QPixmap()
             self._bg = self._make_checker()
             # Overlay tool state
             self._tool = 'brush'  # 'brush' or 'zoom'
             self._brush_radius = 20
             self._zoom = 1.0
+            self._pan = [0, 0]
+            self._drag_origin = None
+            self._pan = [0, 0]  # pan offset in pixels (widget coords)
+            self._drag_origin = None  # for panning in zoom tool
             self._draw_rect = None  # last drawn image rect for mapping
             # Mask image in widget coords
             from PySide6.QtGui import QImage
@@ -606,6 +619,13 @@ def install_background_tool(pane, section_widget) -> None:
         def setPixmap(self, pm: QPixmap):
             self._pix = pm; self.update()
 
+        def setOverlayOpacity(self, v: float):
+            try:
+                self._overlay_opacity = max(0.0, min(1.0, float(v)))
+            except Exception:
+                self._overlay_opacity = 0.5
+            self.update()
+
         def _select_tool(self, name: str):
             self._tool = name if name in ('brush','zoom') else 'brush'
             self.setCursor(Qt.CrossCursor if self._tool=='brush' else Qt.ArrowCursor)
@@ -636,6 +656,19 @@ def install_background_tool(pane, section_widget) -> None:
                 delta = e.angleDelta().y()
                 factor = 1.0 + (0.0015 * delta)
                 self._zoom = max(0.1, min(10.0, self._zoom * factor))
+                # clamp pan so we don't lose the image completely
+                try:
+                    if not self._pix.isNull():
+                        pm = self._pix
+                        pm_fit = pm.scaled(self.width(), self.height(), Qt.KeepAspectRatio, Qt.SmoothTransformation)
+                        zw = int(pm_fit.width() * self._zoom)
+                        zh = int(pm_fit.height() * self._zoom)
+                        max_off_x = max(0, (zw - self.width()) // 2 + 50)
+                        max_off_y = max(0, (zh - self.height()) // 2 + 50)
+                        self._pan[0] = max(-max_off_x, min(max_off_x, self._pan[0]))
+                        self._pan[1] = max(-max_off_y, min(max_off_y, self._pan[1]))
+                except Exception:
+                    pass
                 self.update()
             else:
                 step = 2 if e.angleDelta().y() > 0 else -2
@@ -647,12 +680,35 @@ def install_background_tool(pane, section_widget) -> None:
                 self._paint_at(e.position())
             elif self._tool == 'brush' and e.button() == Qt.RightButton:
                 self._paint_keep_at(e.position())
+            elif self._tool == 'zoom' and e.button() == Qt.LeftButton:
+                self._drag_origin = (e.position().x(), e.position().y())
+                self.setCursor(Qt.ClosedHandCursor)
         def mouseMoveEvent(self, e):
             if self._tool == 'brush' and (e.buttons() & Qt.LeftButton):
                 self._paint_at(e.position())
             if self._tool == 'brush' and (e.buttons() & Qt.RightButton):
                 self._paint_keep_at(e.position())
+            if self._tool == 'zoom' and (e.buttons() & Qt.LeftButton) and self._drag_origin is not None:
+                dx = e.position().x() - self._drag_origin[0]
+                dy = e.position().y() - self._drag_origin[1]
+                self._pan[0] += int(dx)
+                self._pan[1] += int(dy)
+                self._drag_origin = (e.position().x(), e.position().y())
+                self.update()
+            if self._tool == 'zoom' and (e.buttons() & Qt.LeftButton) and self._drag_origin is not None:
+                dx = e.position().x() - self._drag_origin[0]
+                dy = e.position().y() - self._drag_origin[1]
+                self._pan[0] += int(dx)
+                self._pan[1] += int(dy)
+                self._drag_origin = (e.position().x(), e.position().y())
+                self.update()
 
+        
+        def mouseReleaseEvent(self, e):
+            if self._tool == 'zoom' and e.button() == Qt.LeftButton:
+                self._drag_origin = None
+                self.setCursor(Qt.ArrowCursor)
+            return super().mouseReleaseEvent(e)
         def _paint_at(self, pos):
             from PySide6.QtGui import QPainter
             p = QPainter(self._mask)
@@ -682,24 +738,69 @@ def install_background_tool(pane, section_widget) -> None:
             self.maskChanged.emit()
             self.update()
 
-        def export_mask_to_image_size(self, target_w, target_h):
-            # Convert QImage->numpy and resize to target (w,h)
+        
+        def export_masks_to_image_size(self, target_w, target_h):
+            """Return (remove_mask, keep_mask) as float32 [0..1] arrays at image size.
+
+            Crops the widget-sized masks to the drawn image rect to avoid shrinking away when the image is letterboxed.
+
+            Returns (rm, km) where any missing mask returns None.
+
+            """
             import numpy as _np
             from PIL import Image as _PILImage
-            q = self._mask.convertToFormat(QImage.Format_Grayscale8)
-            w = q.width(); h = q.height()
-            if w <= 0 or h <= 0:
-                return None
-            bpl = q.bytesPerLine()
-            ptr = q.constBits()
-            ptr.setsize(h * bpl)
-            arr = _np.frombuffer(ptr, dtype=_np.uint8).reshape((h, bpl))[:, :w]
-            pil = _PILImage.fromarray(arr, mode='L')
-            if (w, h) != (target_w, target_h):
-                pil = pil.resize((target_w, target_h), _PILImage.BILINEAR)
-            out = _np.asarray(pil).astype(_np.float32) / 255.0
-            return out
-
+            # Determine image rect in widget coords
+            if not self._draw_rect:
+                # Fallback: no rect yet, export full mask
+                return self.export_mask_to_image_size(target_w, target_h), None
+            x, y, w, h = self._draw_rect
+            # Clamp to widget bounds
+            x = max(0, int(x)); y = max(0, int(y)); w = max(1, int(w)); h = max(1, int(h))
+            # Helper to convert a QImage to numpy resized to target
+            def _qimg_crop_resize(qimg):
+                if qimg is None: return None
+                q = qimg.convertToFormat(QImage.Format_Grayscale8)
+                ww = q.width(); hh = q.height()
+                if ww <= 0 or hh <= 0: return None
+                # crop
+                try:
+                    qc = q.copy(x, y, w, h)
+                except Exception:
+                    qc = q
+                bpl = qc.bytesPerLine()
+                ptr = qc.constBits()
+                ptr.setsize(qc.height() * bpl)
+                arr = _np.frombuffer(ptr, dtype=_np.uint8).reshape((qc.height(), bpl))[:, :qc.width()]
+                pil = _PILImage.fromarray(arr, mode='L')
+                if (w, h) != (target_w, target_h):
+                    pil = pil.resize((target_w, target_h), _PILImage.BILINEAR)
+                out = _np.asarray(pil).astype(_np.float32) / 255.0
+                return out
+            rm = _qimg_crop_resize(self._mask)
+            km = None
+            try:
+                km = _qimg_crop_resize(self._mask_keep)
+            except Exception:
+                pass
+            return rm, km
+        def export_mask_to_image_size(self, target_w, target_h):
+                    # Convert QImage->numpy and resize to target (w,h)
+                    import numpy as _np
+                    from PIL import Image as _PILImage
+                    q = self._mask.convertToFormat(QImage.Format_Grayscale8)
+                    w = q.width(); h = q.height()
+                    if w <= 0 or h <= 0:
+                        return None
+                    bpl = q.bytesPerLine()
+                    ptr = q.constBits()
+                    ptr.setsize(h * bpl)
+                    arr = _np.frombuffer(ptr, dtype=_np.uint8).reshape((h, bpl))[:, :w]
+                    pil = _PILImage.fromarray(arr, mode='L')
+                    if (w, h) != (target_w, target_h):
+                        pil = pil.resize((target_w, target_h), _PILImage.BILINEAR)
+                    out = _np.asarray(pil).astype(_np.float32) / 255.0
+                    return out
+        
         def dragEnterEvent(self, e):
             try:
                 if e.mimeData().hasUrls():
@@ -735,8 +836,8 @@ def install_background_tool(pane, section_widget) -> None:
                 zw = int(pm_fit.width() * self._zoom)
                 zh = int(pm_fit.height() * self._zoom)
                 pm_zoom = pm_fit.scaled(zw, zh, Qt.KeepAspectRatio, Qt.SmoothTransformation)
-                x = (self.width() - pm_zoom.width()) // 2
-                y = (self.height() - pm_zoom.height()) // 2
+                x = (self.width() - pm_zoom.width()) // 2 + int(self._pan[0]) + int(self._pan[0])
+                y = (self.height() - pm_zoom.height()) // 2 + int(self._pan[1]) + int(self._pan[1])
                 self._draw_rect = (x, y, pm_zoom.width(), pm_zoom.height())
                 p.drawPixmap(x, y, pm_zoom)
             # draw mask overlays
@@ -828,6 +929,7 @@ def install_background_tool(pane, section_widget) -> None:
     s_moverlay = QSpinBox(); s_moverlay.setRange(0,100); s_moverlay.setValue(50)
     try:
         s_moverlay.valueChanged.connect(lambda v: preview.setOverlayOpacity(v/100.0))
+        sl_aggr.valueChanged.connect(lambda _: schedule_update())
     except Exception:
         pass
 
@@ -891,6 +993,10 @@ def install_background_tool(pane, section_widget) -> None:
     lay.addRow("Output", out_row)
     lay.addRow("Hard threshold (0=off)", s_thresh)
     lay.addRow("Feather (px)", s_feath)
+
+    # Removal strength (bias)
+    sl_aggr = QSlider(Qt.Horizontal); sl_aggr.setRange(0,100); sl_aggr.setValue(50)
+    lay.addRow("Removal strength", sl_aggr)
     lay.addRow(cb_spill); lay.addRow(cb_auto); lay.addRow(cb_inv); lay.addRow(cb_ah)
     lay.addRow(cb_shadow); lay.addRow(shadow_row)
     lay.addRow(btns_row)
@@ -920,7 +1026,7 @@ def install_background_tool(pane, section_widget) -> None:
         return dict(
             engine={0:"auto",1:"modnet",2:"birefnet"}[cmb_engine.currentIndex()],
             mode={0:"keep_subject",1:"keep_bg",2:"alpha_only"}[cmb_mode.currentIndex()],
-            threshold=int(s_thresh.value()), feather=int(s_feath.value()),
+            threshold=int(s_thresh.value()), feather=int(s_feath.value()), bias=int(sl_aggr.value()),
             spill=bool(cb_spill.isChecked()), invert=bool(cb_inv.isChecked()), auto_level=bool(cb_auto.isChecked()),
             repl_mode={0:"transparent",1:"color",2:"blur",3:"image"}[cmb_repl.currentIndex()],
             repl_color=(color_val.red(), color_val.green(), color_val.blue()),
@@ -941,9 +1047,11 @@ def install_background_tool(pane, section_widget) -> None:
         chosen_bg["path"] = d["repl_image"]; lbl_img.setText(Path(d["repl_image"]).name if d["repl_image"] else "(none)")
         cb_shadow.setChecked(bool(d["drop_shadow"])); s_salpha.setValue(int(d["shadow_alpha"])); s_sblur.setValue(int(d["shadow_blur"]))
         s_sox.setValue(int(d["shadow_offx"])); s_soy.setValue(int(d["shadow_offy"])); cb_ah.setChecked(bool(d["anti_halo"]))
+        try: sl_aggr.setValue(int(d.get("bias", 50)))
+        except Exception: pass
 
     def defaults() -> Dict:
-        return dict(engine="auto", mode="keep_subject", threshold=6, feather=3, spill=True, invert=False, auto_level=True,
+        return dict(engine="auto", mode="keep_subject", threshold=6, feather=3, bias=50, spill=True, invert=False, auto_level=True,
                     repl_mode="transparent", repl_color=(255,255,255), repl_blur=20, repl_image=None,
                     drop_shadow=False, shadow_alpha=120, shadow_blur=20, shadow_offx=10, shadow_offy=10, anti_halo=True)
 
@@ -1016,7 +1124,7 @@ def install_background_tool(pane, section_widget) -> None:
         try:
             pim = remove_background_preview(
                 current_rgb, a_eff, p["mode"], p["threshold"], p["feather"], p["spill"],
-                p["invert"], p["auto_level"],
+                p["invert"], p["auto_level"], p.get("bias", 50),
                 p["repl_mode"], p["repl_color"], p["repl_blur"], p["repl_image"],
                 p["drop_shadow"], p["shadow_alpha"], p["shadow_blur"], p["shadow_offx"], p["shadow_offy"], p["anti_halo"]
             )
