@@ -71,7 +71,7 @@ start.bat
 - Easy installer with **requirements check**.
 - Fully **automated** setup paths (Core, Full CPU, Full CUDA). User can drink coffee, script will deliver out of the box use
 - easy to use **tabs**, many things in **collapsible** boxes so you see only what you need.
-- Helpful **tooltips** everywhere. **Q&A** and knowledge base (info menu)
+- Helpful **tooltips** everywhere. mini chatbot, **Q&A** and knowledge base (info menu)
 - Resizable layout with draggable splitters. Fit the player or the tabs to the size **you** want.
 - Clear messages and graceful fallbacks (e.g. CPU fallback when GPU is unavailable, streaming for low mem use etc).
 
@@ -249,22 +249,18 @@ Planned features for future updates:
 
 ## 🔄 How to Update FrameVision
 
-Keeping FrameVision up to date is **super easy** — just use one of the included updater tools!  
-Choose the updater based on whether you want to **keep personal files** or **fully reset** to the latest version.
-**How to use:**
-1. Back up any personal files, edits or custom scripts you don’t want deleted.
-2. Place the updaters in the **FrameVision root folder**.
-3. Double-click to run.
-
+Keeping FrameVision up to date is **super easy** — 
+Inside the app go to the file menu that says 'info', in there you find update with 4 option :
+Stable : updates to the latest release, option for full update or puthon files only
+Beta : updates to the most recent files on the github page, these files can change every day and bring test features but also bugs and unfinished work. Also has option for full update or python file only
 ---
 
-### 🟢 Soft Update — `update_soft.bat`
+
+### 🟢 `update_all.bat`
 **Safe & Non-Destructive**  
-- ✅ Adds **new files**  
-- ✅ Updates **changed files**  
-- 🚫 **Never deletes** anything in your folder  
+If you can't get in the app anymore there is also an update_all.bat file, delete folder \helpers\ and if needed also the .venv directory before running this.
 **Best for:**  
-- Regular updates when you don’t want to risk losing personal changes or test files.
+- app don't start and option 2 from installer (quick fixer) didn't work either, this sets you back to official release.
 
 ---
 
@@ -273,18 +269,9 @@ Choose the updater based on whether you want to **keep personal files** or **ful
 - ✅ Adds **new files**  
 - ✅ Updates **changed files**  
 - ⚠️ **Restores deleted files**  
-- ⚠️ **Removes local files** that are not part of the official GitHub repo  
-  *(Safe exclusions: `.venv`, `models`, `.hf_cache`, `outputs`, etc.)*
+- ⚠️ **Removes all local files** 
 **Best for:**  
-- Repairing a broken install.  
 - Resetting to a **clean, exact copy** of the latest GitHub version.  
-- Preparing a **clean environment** for release or bug reporting.
-
-### 💡 How It Works
-Both updaters:
-- Try to use **Git** if available (fastest & safest).
-- If Git isn’t installed, they **auto-download a ZIP** of the latest version and update from that.
-- Writes progress to `update.log`.
 
 ---
 
@@ -299,6 +286,7 @@ If you encounter bugs, please open an issue or use the **Bug Report** button in 
 
 ---
 
+> Start Project : August 7th 2025
 > Built by **Contrinsan (KoonGrizzly)**  
 > Feature development & bugfixing help by **ChatGPT 5**  
 > *This project is a living work and features may come or go.*
