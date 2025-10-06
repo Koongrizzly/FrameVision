@@ -12,11 +12,15 @@ from PySide6.QtGui import QPainter, QPen, QColor, QBrush
 from PySide6.QtCore import QPointF, QRectF
 from helpers.music import register_visualizer, BaseVisualizer
 
+
 # ---- beat kit (same flavor as other viz) ----
 _prev = []
 _env=_gate=_punch=0.0
 _pt=None
-_beat_count=0
+_beat_count=2
+_since_bc = 0.0  # seconds since last beat (fallback)
+_FBK_BPM = 126.0  # fallback BPM for movement
+
 
 def _midhi(bands):
     if not bands: return 0.0
@@ -50,7 +54,7 @@ def _flux(bands):
     return f/max(1,c)
 
 def beat_drive(bands, rms, t):
-    global _env,_gate,_punch,_pt,_beat_count
+    global _env,_gate,_punch,_pt,_beat_count,_since_bc
     e=_midhi(bands); f=_flux(bands); lo=_low(bands)
     target=0.58*e + 1.30*f + 0.18*rms + 0.22*lo
     target=target/(1+0.7*target)
@@ -59,12 +63,22 @@ def beat_drive(bands, rms, t):
     hi,lo_thr=0.30,0.18
     g=1.0 if f>hi else (0.0 if f<lo_thr else _gate)
     rising = g>0.6 and _gate<=0.6
-    if rising: _beat_count+=1
     _gate=0.82*_gate+0.18*g
     boom=min(1.0, max(0.0, lo*1.25 + 0.42*rms))
     if _pt is None: _pt=t
     dt=max(0.0, min(0.033, t-_pt)); _pt=t
     decay=pow(0.78, dt/0.016) if dt>0 else 0.78
+    # Fallback beat synthesis to keep snake moving
+    _since_bc = max(0.0, _since_bc + dt)
+    beat_sec = 60.0 / _FBK_BPM if _FBK_BPM>0 else 0.5
+    if rising:
+        _beat_count += 1
+        _since_bc = 0.0
+    elif beat_sec>0 and _since_bc >= beat_sec:
+        add = int(_since_bc // beat_sec)
+        if add>0:
+            _beat_count += add
+            _since_bc -= add*beat_sec
     _punch=max(_punch*decay, 1.0 if rising else 0.0)
     return max(0.0,min(1.0,_env)), max(0.0,min(1.0,_gate)), boom, max(0.0,min(1.0,_punch)), _beat_count, dt
 
@@ -72,7 +86,7 @@ def beat_drive(bands, rms, t):
 _rng = Random(9090)
 GRID_W = 28
 GRID_H = 18
-STEP_PERIOD_BEATS = 2  # move once every 4 beats
+STEP_PERIOD_BEATS = 1  # move once every 2 beats
 
 snake = []
 dir_vec = (1,0)
@@ -150,9 +164,23 @@ class NokiaSnakeRhythm(BaseVisualizer):
         # burst apples on strong boom
         if boom>0.75 and _rng.random()<0.12:
             spawn_apple()
-
-        moved = step_snake(bc)
-
+        # --- Catch up snake steps if beat counter skipped multiples ---
+        prev_block = last_move_bc // STEP_PERIOD_BEATS if last_move_bc >= 0 else -1
+        curr_block = bc // STEP_PERIOD_BEATS
+        if curr_block > prev_block:
+            for _blk in range(prev_block + 1, curr_block + 1):
+                step_snake(_blk * STEP_PERIOD_BEATS)
+        # --- Time-based safety: ensure at least one step happens on a steady clock ---
+        global _move_accum
+        try:
+            _move_accum += dt
+        except NameError:
+            _move_accum = dt
+        secs_per_step = (60.0 / max(1e-3, _FBK_BPM)) * STEP_PERIOD_BEATS
+        if _move_accum >= secs_per_step:
+            _next_blk = (last_move_bc // STEP_PERIOD_BEATS + 1) if last_move_bc >= 0 else 1
+            step_snake(_next_blk * STEP_PERIOD_BEATS)
+            _move_accum -= secs_per_step
         # background
         p.fillRect(r, QBrush(QColor(8,10,12)))
         # subtle grid
