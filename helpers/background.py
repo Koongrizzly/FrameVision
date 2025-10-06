@@ -181,6 +181,36 @@ def _preprocess_for_engine(x_nchw01: np.ndarray, engine_id: str) -> np.ndarray:
         return (x_nchw01 - mean) / std
     return x_nchw01
 
+# --- ONNX session cache (avoid rebuilding the model each click) ---
+_ORT_SESSION_CACHE = {}
+
+def _get_ort_session(model_path: Path):
+    """Return cached onnxruntime.InferenceSession for model_path, creating it on first use.
+    Provider priority: CUDA -> DirectML -> CPU with safe fallback."""
+    _ensure_ort()
+    try:
+        avail = list(getattr(ort, "get_available_providers", lambda: [])())
+    except Exception:
+        avail = ["CPUExecutionProvider"]
+    providers = []
+    if "CUDAExecutionProvider" in avail:
+        providers.append("CUDAExecutionProvider")
+    elif "DmlExecutionProvider" in avail or "DMLExecutionProvider" in avail:
+        providers.append("DmlExecutionProvider")
+    providers.append("CPUExecutionProvider")
+    key = str(Path(model_path).resolve()) + "|" + "|".join(providers)
+    sess = _ORT_SESSION_CACHE.get(key)
+    if sess is None:
+        so = ort.SessionOptions()
+        try:
+            so.graph_optimization_level = getattr(ort, "GraphOptimizationLevel", None).ORT_ENABLE_ALL
+        except Exception:
+            pass
+        sess = ort.InferenceSession(str(model_path), sess_options=so, providers=providers)
+        _ORT_SESSION_CACHE[key] = sess
+    return sess
+
+
 def _auto_level_alpha(alpha01: np.ndarray, p_lo: float = 2.0, p_hi: float = 98.0) -> np.ndarray:
     """Contrast-stretch alpha via percentiles to expand dynamic range."""
     a = alpha01.astype(np.float32)
@@ -214,7 +244,7 @@ def _as_2d_alpha(arr: np.ndarray) -> np.ndarray:
 def _infer_onnx_alpha(model_path: Path, img_rgb: np.ndarray, engine_id: str) -> np.ndarray:
     """Return alpha in range [0,1], shape HxW (original size)."""
     _ensure_ort()
-    sess = ort.InferenceSession(str(model_path), providers=["CPUExecutionProvider"])
+    sess = _get_ort_session(model_path)
     inp = sess.get_inputs()[0]
     in_name = inp.name
     shape = [s if isinstance(s, int) else -1 for s in (inp.shape or [])]
@@ -552,7 +582,7 @@ def install_background_tool(pane, section_widget) -> None:
             QWidget, QFormLayout, QComboBox, QSpinBox, QSlider, QHBoxLayout, QVBoxLayout, QDoubleSpinBox,
             QPushButton, QCheckBox, QFileDialog, QMessageBox, QLabel, QLineEdit
         , QButtonGroup)
-        from PySide6.QtCore import Qt, QTimer, QSize, Signal
+        from PySide6.QtCore import Qt, QTimer, QSize, Signal, QThread
         from PySide6.QtGui import QPixmap, QImage, QColor
         from PySide6.QtWidgets import QColorDialog
     except Exception:
@@ -607,6 +637,8 @@ def install_background_tool(pane, section_widget) -> None:
             grp.addButton(self._btn_brush)
             grp.addButton(self._btn_zoom)
             self._btn_brush.setChecked(True)
+            self._select_tool('brush')
+            self._btn_brush.setChecked(True)
             self._btn_brush.clicked.connect(lambda: self._select_tool('brush'))
             self._btn_zoom.clicked.connect(lambda: self._select_tool('zoom'))
 
@@ -632,6 +664,20 @@ def install_background_tool(pane, section_widget) -> None:
             self._mask_keep = QImage(w, h, QImage.Format_Grayscale8); self._mask_keep.fill(0)
             self.update()
 
+        def _ensure_masks(self):
+            # Make sure we have image-sized masks allocated
+            try:
+                if (self._img_w <= 0 or self._img_h <= 0) and (not self._pix.isNull()):
+                    self.setImageSize(self._pix.width(), self._pix.height())
+                if self._mask.isNull() and self._img_w > 0 and self._img_h > 0:
+                    from PySide6.QtGui import QImage
+                    self._mask = QImage(self._img_w, self._img_h, QImage.Format_Grayscale8); self._mask.fill(0)
+                if self._mask_keep.isNull() and self._img_w > 0 and self._img_h > 0:
+                    from PySide6.QtGui import QImage
+                    self._mask_keep = QImage(self._img_w, self._img_h, QImage.Format_Grayscale8); self._mask_keep.fill(0)
+            except Exception:
+                pass
+
         def _make_checker(self, s=8):
             img = QImage(s*2, s*2, QImage.Format_RGB32)
             c1 = QColor(200,200,200).rgb(); c2 = QColor(230,230,230).rgb()
@@ -641,7 +687,12 @@ def install_background_tool(pane, section_widget) -> None:
             return QPixmap.fromImage(img)
 
         def setPixmap(self, pm: QPixmap):
-            self._pix = pm; self.update()
+            self._pix = pm
+            try:
+                self.setImageSize(pm.width(), pm.height())
+            except Exception:
+                pass
+            self.update()
 
         def setOverlayOpacity(self, v: float):
             try:
@@ -686,30 +737,30 @@ def install_background_tool(pane, section_widget) -> None:
 
         def mousePressEvent(self, e):
             if self._tool == 'brush' and e.button() == Qt.LeftButton:
-                self._paint_at(e.position())
+                self._paint_at(e.position() if hasattr(e, 'position') else e.pos())
             elif self._tool == 'brush' and e.button() == Qt.RightButton:
-                self._paint_keep_at(e.position())
+                self._paint_keep_at(e.position() if hasattr(e, 'position') else e.pos())
             elif self._tool == 'zoom' and e.button() == Qt.LeftButton:
-                self._drag_origin = (e.position().x(), e.position().y())
+                self._drag_origin = ((e.position().x() if hasattr(e, 'position') else e.x()), (e.position().y() if hasattr(e, 'position') else e.y()))
                 self.setCursor(Qt.ClosedHandCursor)
         def mouseMoveEvent(self, e):
             if self._tool == 'brush' and (e.buttons() & Qt.LeftButton):
-                self._paint_at(e.position())
+                self._paint_at(e.position() if hasattr(e, 'position') else e.pos())
             if self._tool == 'brush' and (e.buttons() & Qt.RightButton):
-                self._paint_keep_at(e.position())
+                self._paint_keep_at(e.position() if hasattr(e, 'position') else e.pos())
             if self._tool == 'zoom' and (e.buttons() & Qt.LeftButton) and self._drag_origin is not None:
-                dx = e.position().x() - self._drag_origin[0]
-                dy = e.position().y() - self._drag_origin[1]
+                dx = (e.position().x() if hasattr(e, 'position') else e.x()) - self._drag_origin[0]
+                dy = (e.position().y() if hasattr(e, 'position') else e.y()) - self._drag_origin[1]
                 self._pan[0] += int(dx)
                 self._pan[1] += int(dy)
-                self._drag_origin = (e.position().x(), e.position().y())
+                self._drag_origin = ((e.position().x() if hasattr(e, 'position') else e.x()), (e.position().y() if hasattr(e, 'position') else e.y()))
                 self.update()
             if self._tool == 'zoom' and (e.buttons() & Qt.LeftButton) and self._drag_origin is not None:
-                dx = e.position().x() - self._drag_origin[0]
-                dy = e.position().y() - self._drag_origin[1]
+                dx = (e.position().x() if hasattr(e, 'position') else e.x()) - self._drag_origin[0]
+                dy = (e.position().y() if hasattr(e, 'position') else e.y()) - self._drag_origin[1]
                 self._pan[0] += int(dx)
                 self._pan[1] += int(dy)
-                self._drag_origin = (e.position().x(), e.position().y())
+                self._drag_origin = ((e.position().x() if hasattr(e, 'position') else e.x()), (e.position().y() if hasattr(e, 'position') else e.y()))
                 self.update()
 
         
@@ -720,6 +771,7 @@ def install_background_tool(pane, section_widget) -> None:
             return super().mouseReleaseEvent(e)
         def _paint_at(self, pos):
             from PySide6.QtGui import QPainter, QPointF
+            self._ensure_masks()
             mapped = self._widget_to_image(pos)
             if mapped is None: return
             ix, iy, sx, sy = mapped
@@ -733,6 +785,7 @@ def install_background_tool(pane, section_widget) -> None:
 
         def _paint_keep_at(self, pos):
             from PySide6.QtGui import QPainter, QPointF
+            self._ensure_masks()
             mapped = self._widget_to_image(pos)
             if mapped is None: return
             ix, iy, sx, sy = mapped
@@ -1147,6 +1200,65 @@ def install_background_tool(pane, section_widget) -> None:
             try: QMessageBox.critical(panel, "Preview error", str(e))
             except Exception: print("Preview error:", e)
     _debounce.timeout.connect(do_update)
+    # --- Background inference worker to keep UI responsive ---
+    class _InferWorker(QThread):
+        done = Signal(object, object)  # (alpha ndarray or None, error str or None)
+        def __init__(self, model_path: Path, img_rgb: np.ndarray, engine_id: str):
+            super().__init__()
+            self._model_path = model_path
+            self._rgb = img_rgb
+            self._engine = engine_id
+        def run(self):
+            try:
+                alpha = _infer_onnx_alpha(self._model_path, self._rgb, self._engine)
+                self.done.emit(alpha, None)
+            except Exception as e:
+                self.done.emit(None, str(e))
+
+    _worker_ref = {'w': None}
+
+    def _set_busy(is_busy: bool):
+        try:
+            btn_recompute.setEnabled(not is_busy)
+            btn_use_current.setEnabled(not is_busy)
+            btn_load.setEnabled(not is_busy)
+        except Exception:
+            pass
+
+    def _start_infer(model_path: Path, reset_params: bool):
+        if current_rgb is None or model_path is None:
+            return
+        w = _worker_ref.get('w')
+        try:
+            if w is not None and w.isRunning():
+                return
+        except Exception:
+            pass
+        _set_busy(True)
+        eng_id = {0:"auto",1:"modnet",2:"birefnet"}[cmb_engine.currentIndex()]
+        worker = _InferWorker(model_path, current_rgb, eng_id)
+        _worker_ref['w'] = worker
+        def _on_done(alpha, err):
+            nonlocal current_alpha
+            _set_busy(False)
+            if err:
+                try: QMessageBox.critical(panel, "ONNX error", str(err))
+                except Exception: print("ONNX error:", err)
+                return
+            if alpha is not None:
+                current_alpha = alpha
+                if reset_params:
+                    try:
+                        undo_stack.clear(); set_params(defaults())
+                    except Exception:
+                        pass
+                schedule_update()
+        try:
+            worker.done.connect(_on_done)
+        except Exception:
+            pass
+        worker.start()
+
 
     # Mask change triggers a preview update
     try:
@@ -1191,11 +1303,10 @@ def install_background_tool(pane, section_widget) -> None:
             try: QMessageBox.critical(panel, "Model", "No ONNX model found in models/."); return
             except Exception: return
         try:
-            current_alpha = _infer_onnx_alpha(model, current_rgb, eng)
+            _start_infer(model, reset_params=True)
         except Exception as e:
             try: QMessageBox.critical(panel, "ONNX error", str(e)); return
             except Exception: return
-        undo_stack.clear(); set_params(defaults()); schedule_update()
     btn_use_current.clicked.connect(on_use_current)
 
     # --- Load external ---
@@ -1231,11 +1342,10 @@ def install_background_tool(pane, section_widget) -> None:
             try: QMessageBox.critical(panel, "Model", "No ONNX model found in models/."); return
             except Exception: return
         try:
-            current_alpha = _infer_onnx_alpha(model, current_rgb, eng)
+            _start_infer(model, reset_params=True)
         except Exception as e:
             try: QMessageBox.critical(panel, "ONNX error", str(e)); return
             except Exception: return
-        undo_stack.clear(); set_params(defaults()); schedule_update()
     btn_load.clicked.connect(on_load_external)
 
     # Drag & drop from preview
@@ -1282,11 +1392,10 @@ def install_background_tool(pane, section_widget) -> None:
             try: QMessageBox.critical(panel, "Model", "No ONNX model found in models/."); return
             except Exception: return
         try:
-            current_alpha = _infer_onnx_alpha(model, current_rgb, eng)
+            _start_infer(model, reset_params=False)
         except Exception as e:
             try: QMessageBox.critical(panel, "ONNX error", str(e)); return
             except Exception: return
-        schedule_update()
     btn_recompute.clicked.connect(on_recompute)
 
     def on_reset():

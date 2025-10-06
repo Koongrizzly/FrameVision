@@ -862,6 +862,17 @@ class MusicOverlay(QWidget):
 
         # visuals controls
         self.cmb_visual = QComboBox()
+        # Limit the visual selector width so it doesn't collide with the beats control
+        try:
+            self.cmb_visual.setMinimumWidth(160)
+            self.cmb_visual.setMaximumWidth(280)
+        except Exception:
+            pass
+        # Keep the visuals selector a stable width across show/hide
+        try:
+            self.cmb_visual.setFixedWidth(180)
+        except Exception:
+            pass
         # try to widen the dropdown; fall back if QSizePolicy isn't available
         try:
             from PySide6.QtWidgets import QSizePolicy as _QSP
@@ -869,13 +880,22 @@ class MusicOverlay(QWidget):
             _QSP = None
         try:
             if _QSP:
-                self.cmb_visual.setSizePolicy(_QSP.Expanding, _QSP.Fixed)
+                self.cmb_visual.setSizePolicy(_QSP.Fixed, _QSP.Fixed)
         except Exception:
             pass
+        # (removed) minimum width override
+# Persist a fixed width for the visuals selector across show/hide toggles
         try:
-            self.cmb_visual.setMinimumWidth(240)
+            self._cmb_visual_fixed_w = getattr(self, "_cmb_visual_fixed_w", 180)
+            self.cmb_visual.setFixedWidth(self._cmb_visual_fixed_w)
         except Exception:
             pass
+        # Re-apply the width whenever the card is collapsed/expanded (prevents width 'snapping back')
+        try:
+            self.card.toggled.connect(lambda _c: self.cmb_visual.setFixedWidth(self._cmb_visual_fixed_w))
+        except Exception:
+            pass
+
         self.btn_vis_prev = QPushButton('◀'); self.btn_vis_prev.hide()
         self.btn_vis_next = QPushButton('▶'); self.btn_vis_next.hide()
         self.btn_visuals = QPushButton('Visuals on')
@@ -913,9 +933,10 @@ class MusicOverlay(QWidget):
 
         row_vis1 = QHBoxLayout()
         row_vis1.addWidget(self.btn_visuals)
-        row_vis1.addSpacing(10)
+        row_vis1.addSpacing(20)
         row_vis1.addWidget(self.btn_vizmode)
-        row_vis1.addWidget(self.cmb_visual, 1)
+        row_vis1.addWidget(self.cmb_visual)
+        row_vis1.addSpacing(25)
         row_vis1.addWidget(self.btn_dur)
                 
         row_vis2 = QHBoxLayout()
@@ -1444,13 +1465,26 @@ class MusicRuntime(QObject):
         self.an = HybridAnalyzer(getattr(video_pane, 'player', None), bands=48, parent=self)
         self.an.levelsReady.connect(self.visual.inject_levels)
         self.an.levelsReady.connect(self._on_levels)
+        self.an.levelsReady.connect(self._on_levels_return_flip)
         self.an.rmsReady.connect(self.visual.inject_rms)
+        self.an.rmsReady.connect(self._on_rms)
         # responsive visuals: track label size
         self._last_label_size = QSize(0, 0)
         # kick/beat estimate
         self._ms_per_beat_est = 200
         self._kick_avg = 0.0
         self._kick_last = 0
+        # return-flip detector state (separate; don't interfere with existing beat logic)
+        self._kick_avg2 = 0.0
+        self._kick_last2 = 0
+        # silence/return detection state
+        self._quiet_since_ms = None  # type: Optional[int]
+        self._was_quiet = False
+        self._return_cooldown_until_ms = 0
+        # tunables (no UI): tweak if needed
+        self._silence_gate = 0.70  # RMS threshold for 'quiet'
+        self._silence_min_ms = 250  # how long it must stay below gate
+        self._return_cooldown_ms = 3700  # min gap between return-triggered switches
 
     def start(self, path_for_analysis: Optional[Path] = None):
         try:
@@ -1542,6 +1576,50 @@ class MusicRuntime(QObject):
                     if 250 <= ib <= 1500:
                         self._ms_per_beat_est = int(0.7 * self._ms_per_beat_est + 0.3 * ib)
                 self._kick_last = pos
+        except Exception:
+            pass
+
+    def _on_rms(self, rms: float):
+        try:
+            if hasattr(self.video, 'player') and hasattr(self.video.player, 'position'):
+                pos = int(self.video.player.position())
+            else:
+                import time as _time
+                pos = int(_time.time() * 1000)
+            gate = float(getattr(self, "_silence_gate", 0.05))
+            min_ms = int(getattr(self, "_silence_min_ms", 750))
+            if float(rms) < gate:
+                if getattr(self, "_quiet_since_ms", None) is None:
+                    self._quiet_since_ms = pos
+                else:
+                    if (pos - int(self._quiet_since_ms)) >= max(0, min_ms):
+                        self._was_quiet = True
+            else:
+                self._quiet_since_ms = None
+        except Exception:
+            pass
+
+    def _on_levels_return_flip(self, bands: list):
+        try:
+            if not bands:
+                return
+            take = max(3, min(6, len(bands) // 6))
+            low = sum(bands[:take]) / max(1, take)
+            # separate EMA/guard so we don't affect the main detector
+            self._kick_avg2 = 0.9 * getattr(self, "_kick_avg2", 0.0) + 0.1 * low
+            if hasattr(self.video, 'player') and hasattr(self.video.player, 'position'):
+                pos = int(self.video.player.position())
+            else:
+                import time as _time
+                pos = int(_time.time() * 1000)
+            if low > self._kick_avg2 * 1.8 and (pos - getattr(self, "_kick_last2", 0)) > 180:
+                self._kick_last2 = pos
+                now_ms = pos
+                cooldown_until = int(getattr(self, "_return_cooldown_until_ms", 0))
+                if getattr(self, "_was_quiet", False) and now_ms >= cooldown_until:
+                    self._cycle_visual()
+                    self._was_quiet = False
+                    self._return_cooldown_until_ms = now_ms + int(getattr(self, "_return_cooldown_ms", 1500))
         except Exception:
             pass
 
@@ -1936,6 +2014,11 @@ def wire_to_videopane(VideoPaneClass):
 
             rt.set_cover(cover_pm)
             rt.set_meta(meta)
+            try:
+                rt._cycle_visual()
+            except Exception:
+                pass
+
             # ensure the file appears in the playlist and is selected
             try:
                 self._music_overlay.ensure_in_playlist(p)
