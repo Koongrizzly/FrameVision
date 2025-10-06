@@ -1,19 +1,19 @@
 
-TUNE_KICK   = 1.2
-TUNE_BOOM   = 1.0
-SPR_K       = 30.0
-SPR_C       = 6.0
-SPR_MAX     = 4.2
+TUNE_KICK   = 1.8
+TUNE_BOOM   = 1.5
+SPR_K       = 40.0
+SPR_C       = 3.0
+SPR_MAX     = 6.2
 
-EYE_PERIOD_LEFT   = 3
+EYE_PERIOD_LEFT   = 1
 EYE_PERIOD_RIGHT  = 4
 MOUTH_PERIOD      = 2
 
 EYE_INTERVAL_LEFT_SEC  = 0.9
 EYE_INTERVAL_RIGHT_SEC = 1.0
-MOUTH_INTERVAL_SEC     = 0.55
+MOUTH_INTERVAL_SEC     = 0.85
 
-IDLE_TO_CENTER_SEC     = 2.0
+IDLE_TO_CENTER_SEC     = 60.0
 
 from math import sin, cos, pi
 from random import Random, choice
@@ -63,7 +63,7 @@ def beat_drive(bands, rms, t):
     target=target/(1+0.7*target)
     if target>_env: _env=0.72*_env+0.28*target
     else: _env=0.92*_env+0.08*target
-    hi,lo_thr=0.30,0.18
+    hi,lo_thr=0.06,0.08
     g=1.0 if f>hi else (0.0 if f<lo_thr else _gate)
     if g>0.6 and _gate<=0.6:
         _beat_count+=1
@@ -122,12 +122,14 @@ def tick_states(bc,t,idle):
         _eye_state_L=choice([0,1,2]); _eye_last_t_L=t
     if not idle and t-_eye_last_t_R> EYE_INTERVAL_RIGHT_SEC: 
         _eye_state_R=choice([0,1,2]); _eye_last_t_R=t
-    if t-_mouth_last_t> MOUTH_INTERVAL_SEC:
+    if not idle and t-_mouth_last_t> MOUTH_INTERVAL_SEC:
         _mouth_state=choice([0,1,2]); _mouth_last_t=t
     # idle force center eyes
     if idle:
         _eye_state_L=_eye_state_R=1
         _eye_last_t_L=_eye_last_t_R=t
+    _mouth_state=1
+    _mouth_last_t=t
 
 @register_visualizer
 class NeonOniMask(BaseVisualizer):

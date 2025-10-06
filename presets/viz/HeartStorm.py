@@ -36,7 +36,7 @@ def _flux(bands):
 
 def music_env(bands,rms):
     global _env,_gate
-    target=0.55*_midhi(bands)+1.35*_flux(bands)+0.2*rms
+    target=0.55*_midhi(bands)+1.35*_flux(bands)+0.3*rms
     target=target/(1+0.7*target)
     if target>_env: _env=0.65*_env+0.35*target
     else: _env=0.90*_env+0.10*target
@@ -69,7 +69,7 @@ class HeartStorm(BaseVisualizer):
         p.setBrush(QBrush(QColor(255,80,120,90)))
         p.drawPath(_heart_path(cx,cy,s))
         # outer ring pumps harder with env^1.3 + gate kick
-        pump=(env**1.3)*1.0 + (0.6 if gate>0.6 else 0.0)
+        pump=(env**1.8)*1.0 + (0.6 if gate>0.6 else 0.0)
         count=28
         for i in range(count):
             ang=2*pi*i/count + t*0.7

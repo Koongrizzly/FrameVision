@@ -68,7 +68,7 @@ class NeonPulseLogo(BaseVisualizer):
 
         p.fillRect(r, QBrush(QColor(4,7,10)))
         base = min(w,h)
-        size = int(base*(0.16 + 0.06*_warm) * (1.0 + 0.30*min(1.0, 0.35*norm + _pop)))
+        size = int(base*(0.11 + 0.06*_warm) * (0.7 + 0.30*min(1.0, 0.35*norm + _pop)))
         p.setFont(QFont("Arial", size, QFont.Bold))
 
         hue = int((t*18 + 260*_warm) % 360)

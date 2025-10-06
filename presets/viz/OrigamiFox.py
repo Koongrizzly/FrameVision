@@ -1,19 +1,19 @@
 
-TUNE_KICK   = 1.2
-TUNE_BOOM   = 1.0
-SPR_K       = 30.0
+TUNE_KICK   = 1.8
+TUNE_BOOM   = 1.4
+SPR_K       = 50.0
 SPR_C       = 6.0
 SPR_MAX     = 4.2
 
-EYE_PERIOD_LEFT   = 4
-EYE_PERIOD_RIGHT  = 4
+EYE_PERIOD_LEFT   = 3
+EYE_PERIOD_RIGHT  = 3
 MOUTH_PERIOD      = 1
 
 EYE_INTERVAL_LEFT_SEC  = 0.9
 EYE_INTERVAL_RIGHT_SEC = 1.0
-MOUTH_INTERVAL_SEC     = 0.55
+MOUTH_INTERVAL_SEC     = 1.55
 
-IDLE_TO_CENTER_SEC     = 2.0
+IDLE_TO_CENTER_SEC     = 52.0
 
 from math import sin, cos, pi
 from random import Random, choice
@@ -122,12 +122,14 @@ def tick_states(bc,t,idle):
         _eye_state_L=choice([0,1,2]); _eye_last_t_L=t
     if not idle and t-_eye_last_t_R> EYE_INTERVAL_RIGHT_SEC: 
         _eye_state_R=choice([0,1,2]); _eye_last_t_R=t
-    if t-_mouth_last_t> MOUTH_INTERVAL_SEC:
+    if not idle and t-_mouth_last_t> MOUTH_INTERVAL_SEC:
         _mouth_state=choice([0,1,2]); _mouth_last_t=t
     # idle force center eyes
     if idle:
         _eye_state_L=_eye_state_R=1
         _eye_last_t_L=_eye_last_t_R=t
+    _mouth_state=1
+    _mouth_last_t=t
 
 @register_visualizer
 class OrigamiFox(BaseVisualizer):

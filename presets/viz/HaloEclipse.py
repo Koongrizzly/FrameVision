@@ -1,10 +1,10 @@
 
 # --- common beat + spring kit (tweak here) ---
-TUNE_KICK = 1.3   # onset kick (bumped from 1.2 to 1.3)
-TUNE_BOOM = 1.0   # bass boom weight
-SPR_K = 30.0      # spring stiffness
-SPR_C = 6.0       # spring damping
-SPR_MAX = 4.2     # max scale
+TUNE_KICK = 1.9   # onset kick (bumped from 1.2 to 1.3)
+TUNE_BOOM = 1.5   # bass boom weight
+SPR_K = 80.0      # spring stiffness
+SPR_C = 3.0       # spring damping
+SPR_MAX = 2.2     # max scale
 
 from math import sin, cos, pi
 from random import Random
