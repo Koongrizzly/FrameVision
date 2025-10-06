@@ -116,6 +116,8 @@ exit /b 0
 :install_mutagen
 if exist ".venv\Scripts\python.exe" call ".venv\Scripts\python.exe" -m pip install --no-cache-dir --upgrade mutagen
 rem ignore failures
+pip install python-mpv
+pip install pyqtgraph PyQt5
 exit /b 0
 :check
 setlocal EnableExtensions EnableDelayedExpansion

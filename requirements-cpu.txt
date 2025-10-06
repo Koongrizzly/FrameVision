@@ -20,6 +20,9 @@ pillow==10.4.0
 numpy==1.26.4
 opencv-python==4.10.0.84
 
+# Background removal runtime (ONNX, CPU-only; safe with Torch CPU)
+onnxruntime==1.18.0
+
 # UI (only if not pinned elsewhere)
 PySide6==6.7.2
 
