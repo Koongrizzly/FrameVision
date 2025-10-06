@@ -4,20 +4,44 @@ set "ROOT=%~dp0"
 cd /d "%ROOT%"
 
 :menu
+rem --- initialize ANSI colors (works on Windows 10+ / Windows Terminal) ---
+for /F "delims=#" %%A in ('"prompt #$E# & for %%B in (1) do rem"') do set "ESC=%%A"
+set "RST=%ESC%[0m"
+set "BOLD=%ESC%[1m"
+set "DIM=%ESC%[2m"
+set "TITLE=%ESC%[95m"
+set "ITEM=%ESC%[96m"
+set "NOTE=%ESC%[93m"
+set "GRAY=%ESC%[90m"
+
 if defined _SKIPCLS (set "_SKIPCLS=") else (cls)
 echo.
-echo ===============================
-echo      FrameVision Installer
-echo ===============================
+echo %TITLE%==============================================%RST%
+echo %BOLD%            FrameVision Installer%RST%
+echo %TITLE%==============================================%RST%
 echo.
-echo 1^) Check requirements and disk space
-echo 2^) Core install  (app only, no ML deps/models)
-echo 3^) Full install  (CPU / non-CUDA)
-echo 4^) Full install  (CUDA GPU)
-echo 5^) Exit
+echo %ITEM% 1^)  Check requirements and disk space
+echo %GRAY%      Runs preflight checks (Python, Git, FFmpeg, GPU/driver)
+echo %GRAY%      and estimates storage needed. 
+echo %GRAY%      Can create Venv and installs Python on path
+echo.
+echo %ITEM% 2^)  Core install %GRAY%(app only)%RST%
+echo %GRAY%      Creates/updates .venv and installs FrameVision without
+echo %GRAY%      ML dependencies or model downloads — fastest setup.
+echo %GRAY%      Good for a quick repair when the app no longer starts.
+echo. 
+echo %ITEM% 3^)  Full install %GRAY%(CPU / non-CUDA)
+echo %GRAY%      Installs the app plus CPU-only ML dependencies.
+echo %GRAY%      Works on any machine; Adviced up to 6gig of Vram slower runtime.
+echo.
+echo %ITEM% 4^)  Full install %GRAY%(CUDA GPU)
+echo %GRAY%      Installs the app plus CUDA-enabled ML dependencies
+echo %GRAY%      for NVIDIA GPUs. 8 gig Vram or more is advised 
+echo.
+echo %ITEM% 5^)  Exit
 echo.
 
-choice /C 12345 /N /M "Choose an option [1-5]: "
+choice /C 12345 /N /M "Choose an option [1-5]: "%GRAY% 
 set "CHOICE=%ERRORLEVEL%"
 echo.
 
@@ -26,6 +50,7 @@ if "%CHOICE%"=="2" goto core
 if "%CHOICE%"=="3" goto cpu
 if "%CHOICE%"=="4" goto cuda
 goto end
+
 :ensure_python
 rem Ensure Python is available; auto-install if missing (3.11, added PATH), based on system arch.
 set "PYTHON="
@@ -124,7 +149,7 @@ setlocal EnableExtensions EnableDelayedExpansion
 
 echo(
 echo ===============================
-echo(  Requirements ^& Disk Report
+echo(  Requirements and Disk Report
 echo ===============================
 echo(
 
@@ -179,7 +204,7 @@ if exist "%_FV_SITEPKG%" (
   )
 )
 
-echo  wait a second
+echo %GREENB%  Loading system info, This can take a minute %WHITE% 
 
 
 rem --- Single dxdiag pass for OS/BIOS/CPU/RAM + GPU details ---
@@ -360,7 +385,7 @@ if defined GPU_NAME (
 
   echo( GPU: !GPU_VENDOR!  Name: !GPU_NAME!  Driver: !GPU_DRV!  VRAM: !GPU_VRAM_GB! GiB
 
-  echo( CUDA-capable: !CUDA_CAPABLE!
+  echo( %GREEN%  CUDA-capable: !CUDA_CAPABLE!%GRAY% 
 
 ) else (
 
