@@ -618,6 +618,116 @@ def pull_upscayl_v215(manual_url: str | None = None) -> None:
         print(f'[externals] upscayl: installed ({added} files) -> {EXTS}')
 # --- end FrameVision block ---
 # --------------------------- CLI ---------------------------
+
+# --- begin: Background remover models (MODNet, BiRefNet) ----------------------------------------
+def pull_bg_models(dest_folder: str | None = None, pro: bool = False, extra_urls: list[str] | None = None, manual_url: str | None = None) -> None:
+    """
+    Download background-removal models into root \\models\\ (default subfolder: 'bg').
+      - Always fetches: MODNet (ONNX) — good portrait matting.
+      - With --bg-pro: also fetches BiRefNet (ONNX) — large, high-quality general SOD.
+    Also accepts overrides via:
+      - CLI: --bg-url (can be repeated)
+      - ENV: BG_URL (single URL)   [handled via url_overrides_for("bg", manual_url)]
+      - .urls/bg.txt (first non-empty line)
+    If a downloaded file is a .zip, it is extracted to the destination and the .zip removed.
+    """
+    import os, shutil, zipfile
+    root = (globals().get("ROOT") or Path(__file__).resolve().parent.parent)
+    models_root = root / "models"
+
+    # Destination under models/
+    sub = (dest_folder or ".").strip("\\/")
+    if sub in (".", ""):
+        sub = ""
+    dest = models_root / sub if sub else models_root
+    dest.mkdir(parents=True, exist_ok=True)
+
+    # Default model URLs
+    urls: list[str] = []
+    # CLI/ENV/.urls overrides have priority
+    urls.extend(url_overrides_for("bg", manual_url))
+
+    # Built-in defaults (safe mirrors)
+    # MODNet ONNX (portrait matting) — ~100MB
+    
+    # Primary: DavG25 (correct path includes /models/)
+    urls.append("https://huggingface.co/DavG25/modnet-pretrained-models/resolve/main/models/modnet_photographic_portrait_matting.onnx")
+    # Fallback 1: gradio/Modnet
+    urls.append("https://huggingface.co/gradio/Modnet/resolve/main/modnet.onnx")
+    # Fallback 2: onnx-community/modnet-webnn
+    urls.append("https://huggingface.co/onnx-community/modnet-webnn/resolve/main/onnx/model.onnx")
+
+    # BiRefNet ONNX (large) — only when --bg-pro
+    if pro:
+        urls.append("https://github.com/ZhengPeng7/BiRefNet/releases/download/v1/BiRefNet-COD-epoch_125.onnx")
+
+    # Extra URLs from CLI
+    if extra_urls:
+        urls.extend([u for u in extra_urls if isinstance(u, str) and u.strip()])
+
+    # De-duplicate while preserving order
+    seen = set()
+    unique_urls = []
+    for u in urls:
+        key = u.split("?")[0]
+        if key not in seen:
+            seen.add(key); unique_urls.append(u)
+
+    added = 0; skipped = 0; failed = 0
+    for url in unique_urls:
+        # Resolve filename
+        base = url.split("?")[0].rstrip("/").split("/")[-1] or "download.bin"
+        out = dest / base
+        # Skip existing non-zip file
+        if out.exists() and not out.suffix.lower() == ".zip":
+            print(f"[bg] skip (exists): {out.name}")
+            skipped += 1
+            continue
+
+        # Download to cache first
+        cache_dir = (globals().get("CACHE") or (root / ".dl_cache"))
+        cache_dir.mkdir(parents=True, exist_ok=True)
+        tmp = cache_dir / base
+        try:
+            ok = _fv_dl(url, tmp)
+            if not ok:
+                print(f"[bg] fail: {url}")
+                failed += 1
+                continue
+        except Exception as e:
+            print(f"[bg] error downloading {url}: {e}")
+            failed += 1
+            continue
+
+        # If zip -> extract to destination, then delete zip
+        if tmp.suffix.lower() == ".zip":
+            try:
+                with zipfile.ZipFile(tmp, "r") as z:
+                    z.extractall(dest)
+                try: tmp.unlink()
+                except Exception: pass
+                print(f"[bg] extracted zip -> {dest}")
+                added += 1
+            except Exception as e:
+                print(f"[bg] zip error for {tmp.name}: {e}")
+                failed += 1
+        else:
+            # Normal file: move into dest (overwrite only if --bg-pro explicitly asked for a replacement)
+            if out.exists():
+                # keep existing; place as versioned copy
+                out_ver = dest / f"{tmp.stem}_new{tmp.suffix}"
+                shutil.move(str(tmp), str(out_ver))
+                print(f"[bg] kept existing {out.name}; saved new as {out_ver.name}")
+                skipped += 1
+            else:
+                shutil.move(str(tmp), str(out))
+                print(f"[bg] saved {out.name}")
+                added += 1
+
+    print(f"[bg] done: {added} added, {skipped} skipped, {failed} failed; dest={dest}")
+# --- end: Background remover models --------------------------------------------------------------
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser()
     ap.add_argument('--upscayl-v215-only', action='store_true')
@@ -632,9 +742,20 @@ def main(argv=None):
     # URL overrides
     ap.add_argument("--realesrgan-url", type=str)
     ap.add_argument("--waifu2x-url", type=str)
+
+    # New: background remover models
+    ap.add_argument("--bg-only", action="store_true", help="Download background-removal models (MODNet ONNX; unzip if needed) into models/bg")
+    ap.add_argument("--bg-pro", action="store_true", help="Also fetch BiRefNet ONNX (~900MB)")
+    ap.add_argument("--bg-url", action="append", help="Additional BG model URL(s); repeatable. Zips are extracted; zips deleted.")
+    ap.add_argument("--bg-dest", type=str, default="bg", help="Destination subfolder under models/ (default: bg)")
+
     args = ap.parse_args(argv)
 
-    do_all = args.all or not any([args.describe_only, args.realesrgan_only, args.waifu2x_only, args.lapsrn_only, args.upscayl_only])
+    # If no specific flags, behave like --all
+    do_all = args.all or not any([
+        args.describe_only, args.realesrgan_only, args.waifu2x_only, args.lapsrn_only, args.upscayl_only,
+        args.bg_only, args.bg_pro
+    ])
 
     if do_all or args.describe_only:
         try: pull_qwen2_vl_2b(MODELS)
@@ -650,6 +771,14 @@ def main(argv=None):
 
     if do_all or args.upscayl_only:
         pull_upscayl(args.upscayl_url)
+
+    # New: background remover models
+    if do_all or args.bg_only or args.bg_pro:
+        try:
+            pull_bg_models(dest_folder=args.bg_dest, pro=args.bg_pro, extra_urls=args.bg_url)
+        except Exception as e:
+            print("[externals] BG models error:", e)
+
     # FFmpeg & RIFE (minimal) — safe to skip if offline
     try:
         ensure_ffmpeg_bins()
@@ -662,8 +791,6 @@ def main(argv=None):
 
 if __name__ == "__main__":
     main()
-
-
 # --- begin: Move folders to models ---
 import subprocess
 
