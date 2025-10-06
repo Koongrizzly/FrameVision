@@ -1140,7 +1140,7 @@ def _txt2img_demo_try():
             if os.path.isfile(fp) and not ds_file.exists():
                 _sh.move(fp, ds_file)
         if ds_file.exists():
-            print("[externals][txt2img] Download TXT 2 IMG model ready at", ds_file)
+            print("[externals][txt2img] demo model ready at", ds_file)
             return True
 
         rv_file = sd15_dir / "Realistic_Vision_V5.1_fp16-no-ema.safetensors"
@@ -1166,14 +1166,5 @@ if __name__ == "__main__":
             _txt2img_demo_try()
     except Exception as e:
         print("[externals][txt2img] demo error:", e)
-# --- end: Go to BG download script --------------------------------------------------------------------
-# --- run background model downloader last ---
-import subprocess, sys
-from pathlib import Path
-
-project_root = Path(__file__).resolve().parent.parent   # …\FrameVision-main
-downloader = project_root / "scripts" / "downloadbg.py"
-
-subprocess.run([sys.executable, str(downloader), "--pro"], check=True, cwd=project_root)
-
+# --- end: TXT->IMG quick demo --------------------------------------------------------------------
 
