@@ -13,6 +13,8 @@ set "TITLE=%ESC%[95m"
 set "ITEM=%ESC%[96m"
 set "NOTE=%ESC%[93m"
 set "GRAY=%ESC%[90m"
+set "BLUE=%ESC%[34m"
+set "GREEN=%ESC%[32m"
 
 if defined _SKIPCLS (set "_SKIPCLS=") else (cls)
 echo.
@@ -21,27 +23,27 @@ echo %BOLD%            FrameVision Installer%RST%
 echo %TITLE%==============================================%RST%
 echo.
 echo %ITEM% 1^)  Check requirements and disk space
-echo %GRAY%      Runs preflight checks (Python, Git, FFmpeg, GPU/driver)
-echo %GRAY%      and estimates storage needed. 
-echo %GRAY%      Can create Venv and installs Python on path
+echo %RST%      Runs preflight checks (Python, Git, FFmpeg, GPU/driver)
+echo %RST%      and estimates storage needed. 
+echo %BLUE%      Can create Venv and installs Python on path
 echo.
 echo %ITEM% 2^)  Core install %GRAY%(app only)%RST%
-echo %GRAY%      Creates/updates .venv and installs FrameVision without
-echo %GRAY%      ML dependencies or model downloads — fastest setup.
-echo %GRAY%      Good for a quick repair when the app no longer starts.
+echo %RST%      Creates/updates .venv and installs FrameVision without
+echo %RST%      ML dependencies or model downloads — fastest setup.
+echo %BLUE%      Good for a quick repair when the app no longer starts.
 echo. 
 echo %ITEM% 3^)  Full install %GRAY%(CPU / non-CUDA)
-echo %GRAY%      Installs the app plus CPU-only ML dependencies.
-echo %GRAY%      Works on any machine; Adviced up to 6gig of Vram slower runtime.
+echo %RST%      Installs the app plus CPU-only ML dependencies.
+echo %BLUE%      Works on any machine; use this up to 6gig of Vram.
 echo.
 echo %ITEM% 4^)  Full install %GRAY%(CUDA GPU)
-echo %GRAY%      Installs the app plus CUDA-enabled ML dependencies
-echo %GRAY%      for NVIDIA GPUs. 8 gig Vram or more is advised 
+echo %RST%      Installs the app plus CUDA-enabled ML dependencies
+echo %BLUE%      for NVIDIA GPUs. 8 gig Vram or more is advised 
 echo.
 echo %ITEM% 5^)  Exit
-echo.
+echo. %RST%
 
-choice /C 12345 /N /M "Choose an option [1-5]: "%GRAY% 
+choice /C 12345 /N /M "Choose an option [1-5]: "%RST%
 set "CHOICE=%ERRORLEVEL%"
 echo.
 
@@ -148,9 +150,9 @@ exit /b 0
 setlocal EnableExtensions EnableDelayedExpansion
 
 echo(
-echo ===============================
+echo %TITLE% ===============================%RST%
 echo(  Requirements and Disk Report
-echo ===============================
+echo %TITLE% ===============================%RST%
 echo(
 
 rem --- Python ---
@@ -248,7 +250,7 @@ echo( Free space on drive %CD:~0,3% : !FREE_GB! GiB
 echo(
 rem --- Estimated required space (edit if needed) ---
 set "BASE_REQ_GB=5"
-set "MODELS_REQ_GB=10"
+set "MODELS_REQ_GB=20"
 for /f "usebackq delims=" %%R in (`powershell -NoProfile -Command "[math]::Round([double](%BASE_REQ_GB% + %MODELS_REQ_GB%),1).ToString([System.Globalization.CultureInfo]::InvariantCulture)"`) do set "REQ_GB=%%R"
 if not defined REQ_GB set "REQ_GB=%BASE_REQ_GB%"
 echo( Estimated required: ~!REQ_GB! GiB  ^(Base app+venv ~!BASE_REQ_GB! GiB  + Models/Zips ~!MODELS_REQ_GB! GiB^)
@@ -282,7 +284,7 @@ if defined PY_CMD (
 
 ) else (
 
-  echo( Python: NOT FOUND on PATH. Please install Python 3.10 or 3.11.
+ echo( Python: NOT FOUND on PATH. Please install Python 3.10 or 3.11.
 
 )
 
