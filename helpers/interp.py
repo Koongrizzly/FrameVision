@@ -313,7 +313,7 @@ class InterpPane(QWidget):
         self.pb_label = QLabel("Interpolating…"); self.pb_label.setVisible(False)
         self.pb = QProgressBar(); self.pb.setRange(0,100); self.pb.setValue(0); self.pb.setTextVisible(True); self.pb.setVisible(False)
         self.pb_eta = QLabel(""); self.pb_eta.setVisible(False)
-        self.pb_cancel = QPushButton("Cancel"); self.pb_cancel.setVisible(False)
+        self.pb_cancel = QPushButton("Cancel"); self.pb_cancel.setVisible(False); self.pb_cancel.setMaximumSize(0, 0); self.pb_cancel.setEnabled(False)
         self.pb_wrap.addWidget(self.pb_label); self.pb_wrap.addWidget(self.pb, 1); self.pb_wrap.addWidget(self.pb_eta); self.pb_wrap.addWidget(self.pb_cancel)
         lay.addLayout(self.pb_wrap)        # Advanced settings moved inline below
         lay.addSpacing(8)
@@ -442,7 +442,7 @@ class InterpPane(QWidget):
         # determinate (0-100) progress
         self.pb.setRange(0, 100)
         self.pb_label.setText(label)
-        self.pb_label.setVisible(True); self.pb.setVisible(True); self.pb_eta.setVisible(True); self.pb_cancel.setVisible(True)
+        self.pb_label.setVisible(True); self.pb.setVisible(True); self.pb_eta.setVisible(True); self.pb_cancel.setVisible(False)
         self.pb.setValue(0); self._cancel_flag = False
         try:
             self.pb_cancel.clicked.disconnect()
@@ -461,7 +461,7 @@ class InterpPane(QWidget):
         self.pb.setRange(0, 0)  # 0,0 = Qt marquee
         QCoreApplication.processEvents()
         self.pb_label.setText(label)
-        self.pb_label.setVisible(True); self.pb.setVisible(True); self.pb_eta.setVisible(True); self.pb_cancel.setVisible(True)
+        self.pb_label.setVisible(True); self.pb.setVisible(True); self.pb_eta.setVisible(True); self.pb_cancel.setVisible(False)
         self.pb.setValue(0); self._cancel_flag = False
         try:
             self.pb_cancel.clicked.disconnect()

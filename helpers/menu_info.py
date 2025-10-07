@@ -252,7 +252,7 @@ def install_info_menu(main_window):
     
     act_html = QAction("Feature Guide (HTML)…", main_window)
     act_html.triggered.connect(_open_html_guide)
-    
+
     act_update = QAction("Updates…", main_window)
     act_update.setToolTip("Update from GitHub (helpers/presets or full app)")
     act_update.triggered.connect(lambda: _open_update_dialog(main_window))
@@ -266,175 +266,220 @@ def install_info_menu(main_window):
         info_menu.addAction(act_update)
 
 
-# ===== Update Dialog & GitHub updater helpers =====
-import shutil
-import tempfile
-import zipfile as _zipfile
-import traceback
+
+
+
+# ===== Update Dialog: Stable (Release) vs Beta (Default Branch) =====
+import shutil, tempfile, traceback, zipfile as _zipfile
 from datetime import datetime
 from urllib.request import Request, urlopen
-from PySide6.QtWidgets import (
-    QPushButton, QFileDialog, QPlainTextEdit, QSpacerItem, QSizePolicy
-)
+from PySide6.QtWidgets import QPushButton, QFileDialog, QPlainTextEdit, QSpacerItem, QSizePolicy
 
 GITHUB_OWNER = "Koongrizzly"
 GITHUB_REPO = "FrameVision"
 
-def _http_get(url: str, headers: dict | None = None, timeout: int = 25) -> bytes:
+def _http_get_bytes(url: str, headers: dict | None = None, timeout: int = 30) -> bytes:
     req = Request(url, headers=headers or {})
     with urlopen(req, timeout=timeout) as r:
         return r.read()
 
-def _latest_release_zip_url(owner: str, repo: str) -> tuple[str, str]:
-    """Return (zipball_url, tag_name) for the newest release. Falls back to default branch zip if no releases."""
-    base = f"https://api.github.com/repos/{owner}/{repo}"
-    h = {"Accept": "application/vnd.github+json"}
-    # Try latest release
-    try:
-        data = json.loads(_http_get(f"{base}/releases/latest", headers=h).decode("utf-8"))
-        tag = (data.get("tag_name") or "").lstrip("v")
-        zip_url = data.get("zipball_url")
-        if zip_url:
-            return zip_url, tag or "latest"
-    except Exception:
-        pass
-    # Fallback: default branch
-    try:
-        repo_info = json.loads(_http_get(f"{base}", headers=h).decode("utf-8"))
-        default_branch = repo_info.get("default_branch", "main")
-        return f"{base}/zipball/{default_branch}", default_branch
-    except Exception as e:
-        raise RuntimeError(f"Unable to determine latest release or branch: {e}")
+def _http_get_json(url: str, headers: dict | None = None, timeout: int = 30) -> dict:
+    data = _http_get_bytes(url, headers=headers, timeout=timeout)
+    return json.loads(data.decode("utf-8"))
 
-def _download_latest_zip(owner: str, repo: str) -> tuple[Path, str]:
-    zip_url, tag = _latest_release_zip_url(owner, repo)
-    data = _http_get(zip_url, headers={"Accept": "application/vnd.github+json"})
-    tmpdir = Path(tempfile.mkdtemp(prefix="framevision_update_"))
-    zpath = tmpdir / f"{repo}_{tag}.zip"
+def _default_branch(owner: str, repo: str) -> str:
+    try:
+        info = _http_get_json(f"https://api.github.com/repos/{owner}/{repo}",
+                              headers={"Accept": "application/vnd.github+json"})
+        return info.get("default_branch") or "main"
+    except Exception:
+        return "main"
+
+def _download_latest_release_zip(owner: str, repo: str) -> tuple[Path, str]:
+    """Latest stable release ZIP (GitHub Releases). Falls back to default branch if no releases exist."""
+    try:
+        info = _http_get_json(f"https://api.github.com/repos/{owner}/{repo}/releases/latest",
+                              headers={"Accept": "application/vnd.github+json"})
+        zip_url = info.get("zipball_url")
+        tag = (info.get("tag_name") or "latest").lstrip("v")
+        if not zip_url:
+            raise RuntimeError("No stable release found")
+        data = _http_get_bytes(zip_url, headers={"Accept": "application/octet-stream"})
+        tmpdir = Path(tempfile.mkdtemp(prefix="framevision_rel_"))
+        zpath = tmpdir / f"{repo}_{tag}.zip"
+        zpath.write_bytes(data)
+        return zpath, tag
+    except Exception:
+        # Fallback: use default branch ZIP but clearly label as fallback
+        branch = _default_branch(owner, repo)
+        url = f"https://codeload.github.com/{owner}/{repo}/zip/refs/heads/{branch}"
+        data = _http_get_bytes(url, headers={"Accept": "application/octet-stream"})
+        tmpdir = Path(tempfile.mkdtemp(prefix="framevision_rel_fb_"))
+        zpath = tmpdir / f"{repo}_{branch}.zip"
+        zpath.write_bytes(data)
+        return zpath, f"{branch} (fallback)"
+
+def _download_latest_branch_zip(owner: str, repo: str) -> tuple[Path, str]:
+    """Latest beta ZIP (default branch HEAD)."""
+    branch = _default_branch(owner, repo)
+    url = f"https://codeload.github.com/{owner}/{repo}/zip/refs/heads/{branch}"
+    data = _http_get_bytes(url, headers={"Accept": "application/octet-stream"})
+    tmpdir = Path(tempfile.mkdtemp(prefix="framevision_beta_"))
+    zpath = tmpdir / f"{repo}_{branch}.zip"
     zpath.write_bytes(data)
-    return zpath, tag
+    return zpath, branch
 
 def _extract_selected(zpath: Path, dest_root: Path, mode: str):
     """mode: 'partial' (helpers + presets/viz) or 'full' (entire repo)."""
     with _zipfile.ZipFile(zpath, "r") as zf:
-        for m in zf.infolist():
-            # Skip directories
-            if m.is_dir():
+        for member in zf.infolist():
+            if member.is_dir():
                 continue
-            # Zipball has root/… path; drop the first component
-            parts = Path(m.filename).parts
+            parts = Path(member.filename).parts
             if len(parts) < 2:
                 continue
-            rel = Path(*parts[1:])  # path inside repo
+            rel = Path(*parts[1:])  # drop the top-level folder GitHub adds
             if mode == "partial":
-                # Only helpers/* and presets/viz/*
                 if not (
                     (len(rel.parts) >= 1 and rel.parts[0] == "helpers") or
                     (len(rel.parts) >= 2 and rel.parts[0] == "presets" and rel.parts[1] == "viz")
                 ):
                     continue
-            # Compute output path and ensure parent exists
             out_path = dest_root / rel
             out_path.parent.mkdir(parents=True, exist_ok=True)
-            with zf.open(m, "r") as src, open(out_path, "wb") as dst:
+            with zf.open(member, "r") as src, open(out_path, "wb") as dst:
                 shutil.copyfileobj(src, dst)
 
 def _create_backup_zip(app_root: Path, target_dir: Path) -> Path:
+    """
+    Create a backup ZIP of the app, but exclude heavy/generated folders:
+      tools/, models/, output/, presets/, .venv at the project root.
+    Also excludes __pycache__ folders.
+    """
+    EXCLUDE_TOP = {"tools", "models", "output", "presets", ".venv"}
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-    name = f"{app_root.name}_backup_{ts}.zip"
-    out = target_dir / name
-    with zipfile.ZipFile(out, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+    out = Path(target_dir) / f"{app_root.name}_backup_{ts}.zip"
+    with _zipfile.ZipFile(out, "w", compression=_zipfile.ZIP_DEFLATED) as zf:
         for p in app_root.rglob("*"):
-            # Skip backup files and __pycache__
             if "__pycache__" in p.parts:
                 continue
+            try:
+                rel = p.relative_to(app_root)
+            except ValueError:
+                continue
+            # Skip if the first path segment is in exclude list
+            if rel.parts and rel.parts[0] in EXCLUDE_TOP:
+                continue
             if p.is_file():
-                arc = str(p.relative_to(app_root))
-                zf.write(p, arcname=arc)
+                zf.write(p, arcname=str(rel))
     return out
 
 class UpdateDialog(QDialog):
     def __init__(self, parent: QWidget | None = None):
         super().__init__(parent)
         self.setWindowTitle("FrameVision — Update from GitHub")
-        self.resize(560, 320)
+        self.resize(640, 420)
 
-        info = QLabel(
-            "<b>Warning:</b> Updating will <b>overwrite</b> local files that you've modified "
-            "(e.g., in <code>helpers/</code> or <code>presets/viz/</code>).<br>"
-            "It's strongly recommended to create a backup ZIP first."
+        warn = QLabel(
+            "<b>Warning:</b> Updating will <b>overwrite</b> local changes (e.g., in <code>helpers/</code> "
+            "or <code>presets/viz/</code>).<br>Consider creating a backup ZIP first."
         )
-        info.setWordWrap(True)
+        warn.setWordWrap(True)
 
-        self.log = QPlainTextEdit(self)
-        self.log.setReadOnly(True)
-        self.log.setPlaceholderText("Update log will appear here…")
-        self.log.setMaximumBlockCount(2000)
+        stable_hdr = QLabel("<b>Latest Stable release</b>")
+        beta_hdr = QLabel("<b>Beta</b> <span style='color:#888'>(can have test releases and bugs)</span>")
+
+        self.log = QPlainTextEdit(self); self.log.setReadOnly(True)
+        self.log.setPlaceholderText("Update log…")
 
         btn_backup = QPushButton("Create backup ZIP…", self)
-        btn_partial = QPushButton("Update Python files only (helpers + presets/viz)", self)
-        btn_full = QPushButton("Update (entire app)", self)
-        btn_cancel = QPushButton("Cancel", self)
 
-        btn_backup.clicked.connect(self._do_backup)
-        btn_partial.clicked.connect(lambda: self._do_update("partial"))
-        btn_full.clicked.connect(lambda: self._do_update("full"))
+        btn_rel_partial = QPushButton("Replace python files only", self)
+        btn_rel_full    = QPushButton("Replace with release", self)
+        btn_beta_partial= QPushButton("Update python files only", self)
+        btn_beta_full   = QPushButton("Update all files", self)
+        btn_cancel      = QPushButton("Cancel", self)
+
+        btn_backup.clicked.connect(self._on_backup)
+        btn_rel_partial.clicked.connect(lambda: self._on_update('release','partial'))
+        btn_rel_full.clicked.connect(lambda: self._on_update('release','full'))
+        btn_beta_partial.clicked.connect(lambda: self._on_update('branch','partial'))
+        btn_beta_full.clicked.connect(lambda: self._on_update('branch','full'))
         btn_cancel.clicked.connect(self.reject)
 
-        # Layout
         v = QVBoxLayout(self)
-        v.addWidget(info)
+        v.addWidget(warn)
+        v.addSpacing(6)
+
+        v.addWidget(stable_hdr)
+        row1 = QHBoxLayout()
+        row1.addWidget(btn_rel_partial)
+        row1.addWidget(btn_rel_full)
+        v.addLayout(row1)
+
+        v.addSpacing(8)
+        v.addWidget(beta_hdr)
+        row2 = QHBoxLayout()
+        row2.addWidget(btn_beta_partial)
+        row2.addWidget(btn_beta_full)
+        v.addLayout(row2)
+
         v.addSpacing(8)
         v.addWidget(self.log, 1)
 
-        h = QHBoxLayout()
-        h.addWidget(btn_backup)
-        h.addItem(QSpacerItem(10, 10, QSizePolicy.Expanding, QSizePolicy.Minimum))
-        h.addWidget(btn_partial)
-        h.addWidget(btn_full)
-        h.addWidget(btn_cancel)
-        v.addLayout(h)
+        row3 = QHBoxLayout()
+        row3.addWidget(btn_backup)
+        row3.addItem(QSpacerItem(10, 10, QSizePolicy.Expanding, QSizePolicy.Minimum))
+        row3.addWidget(btn_cancel)
+        v.addLayout(row3)
 
-    def _append(self, text: str):
-        self.log.appendPlainText(text)
+    def _append(self, msg: str):
+        self.log.appendPlainText(msg)
 
-    def _do_backup(self):
+    def _on_backup(self):
         folder = QFileDialog.getExistingDirectory(self, "Select folder to save backup ZIP")
         if not folder:
             return
+        self.setEnabled(False)
         try:
-            self.setEnabled(False)
             self._append("Creating backup…")
             out = _create_backup_zip(APP_ROOT, Path(folder))
             self._append(f"Backup saved: {out}")
-            QMessageBox.information(self, "Backup created", f"Backup ZIP saved to:\n{out}")
+            QMessageBox.information(self, "Backup created", f"Saved to:\\n{out}")
         except Exception as e:
-            self._append("Backup failed:\n" + traceback.format_exc())
+            self._append("Backup failed:\\n" + traceback.format_exc())
             QMessageBox.critical(self, "Backup failed", str(e))
         finally:
             self.setEnabled(True)
 
-    def _do_update(self, mode: str):
+    def _on_update(self, source: str, mode: str):
+        assert source in ("release", "branch")
         assert mode in ("partial", "full")
+        self.setEnabled(False)
         try:
-            self.setEnabled(False)
-            self._append("Fetching latest release…")
-            zpath, tag = _download_latest_zip(GITHUB_OWNER, GITHUB_REPO)
-            self._append(f"Downloaded release/branch zip: {zpath.name} (tag: {tag})")
-            self._append("Applying update… (this may take a moment)")
-            _extract_selected(zpath, APP_ROOT, "partial" if mode == "partial" else "full")
+            if source == "release":
+                self._append("Fetching latest STABLE release ZIP…")
+                zpath, label = _download_latest_release_zip(GITHUB_OWNER, GITHUB_REPO)
+            else:
+                self._append("Fetching latest BETA (default-branch) ZIP…")
+                zpath, label = _download_latest_branch_zip(GITHUB_OWNER, GITHUB_REPO)
+            self._append(f"Downloaded: {zpath.name} [{label}]")
+            self._append(f"Applying update ({'helpers + presets/viz' if mode=='partial' else 'entire app'})…")
+            _extract_selected(zpath, APP_ROOT, mode)
             self._append("Update complete.")
-            QMessageBox.information(self, "Update complete",
-                                    f"Updated from GitHub ({tag}).\n"
-                                    f"Mode: {'Python files only' if mode=='partial' else 'Full app'}.\n\n"
-                                    "You may need to restart FrameVision.")
+            QMessageBox.information(
+                self, "Update complete",
+                f"{'Stable release' if source=='release' else 'Beta (branch)'} applied: {label}\\n"
+                f"Mode: {'Python files only' if mode=='partial' else 'All files'}.\\n\\n"
+                "Please restart FrameVision."
+            )
         except Exception as e:
-            self._append("Update failed:\n" + traceback.format_exc())
+            self._append("Update failed:\\n" + traceback.format_exc())
             QMessageBox.critical(self, "Update failed", str(e))
         finally:
             self.setEnabled(True)
 
-def _open_update_dialog(parent):
+def _open_update_dialog(parent: QWidget | None):
     dlg = UpdateDialog(parent)
     dlg.exec()
 # ===== End Update Dialog =====
