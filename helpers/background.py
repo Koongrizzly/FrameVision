@@ -1453,7 +1453,7 @@ def install_background_tool(pane, section_widget) -> None:
             mode={0:"keep_subject",1:"keep_bg",2:"alpha_only"}[cmb_mode.currentIndex()],
             threshold=int(s_thresh.value()), feather=int(s_feath.value()), bias=int(sl_aggr.value()),
             spill=bool(cb_spill.isChecked()), invert=bool(cb_inv.isChecked()), auto_level=bool(cb_auto.isChecked()),
-            repl_mode={0:"transparent",1:"color",2:"blur",3:"image"}[cmb_repl.currentIndex()],
+            repl_mode={0:"transparent",1:"color",2:"blur",3:"image"}.get(cmb_repl.currentIndex(), "transparent"),
             repl_color=(color_val.red(), color_val.green(), color_val.blue()),
             repl_blur=int(s_blurbg.value()), repl_image=chosen_bg["path"],
             drop_shadow=bool(cb_shadow.isChecked()), shadow_alpha=int(s_salpha.value()), shadow_blur=int(s_sblur.value()),
