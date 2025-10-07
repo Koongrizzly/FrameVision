@@ -8,24 +8,22 @@ from datetime import datetime, date
 from pathlib import Path
 from typing import List, Optional
 
-from PySide6.QtCore import Qt, QTimer, QThread, Signal
+from PySide6.QtCore import Qt, QTimer
 from PySide6.QtWidgets import (
     QDialog, QVBoxLayout, QHBoxLayout, QLabel, QPushButton, QListWidget,
     QListWidgetItem, QMessageBox, QCheckBox, QSpacerItem, QSizePolicy
 )
-from PySide6.QtGui import QDesktopServices
-from PySide6.QtCore import QUrl
 
 # ---------- App paths ----------
 APP_ROOT = Path(__file__).resolve().parents[1]
 INFO_DIR = APP_ROOT / "presets" / "info"
 STATE_PATH = INFO_DIR / "update_state.json"
 
-# ---------- Repo config ----------
+# ---------- Repo config (override if needed) ----------
 GITHUB_OWNER = "Koongrizzly"
 GITHUB_REPO = "FrameVision"
 
-# ---------- HTTP helpers (stdlib) ----------
+# ---------- HTTP helpers (stdlib only) ----------
 import urllib.parse
 from urllib.request import Request, urlopen
 
@@ -77,18 +75,6 @@ def _latest_commit_date_for_path(owner: str, repo: str, path: str, branch: str) 
         return None
     return arr[0]["commit"]["author"]["date"]  # ISO8601
 
-def _latest_commit_meta_for_prefix(owner: str, repo: str, branch: str, prefix: str) -> tuple[Optional[str], Optional[str]]:
-    """Return (sha, iso_date) for the latest commit that touched any path under prefix."""
-    try:
-        q = urllib.parse.quote(prefix)
-        url = f"https://api.github.com/repos/{owner}/{repo}/commits?path={q}&sha={branch}&per_page=1"
-        arr = _http_json(url)
-        if not arr:
-            return None, None
-        return arr[0].get("sha"), arr[0]["commit"]["author"]["date"]
-    except Exception:
-        return None, None
-
 def _download_raw(owner: str, repo: str, branch: str, path: str) -> bytes:
     q = urllib.parse.quote(path)
     url = f"https://raw.githubusercontent.com/{owner}/{repo}/{branch}/{q}"
@@ -107,23 +93,6 @@ def _save_state(d: dict) -> None:
     INFO_DIR.mkdir(parents=True, exist_ok=True)
     with open(STATE_PATH, "w", encoding="utf-8") as f:
         json.dump(d, f, indent=2)
-
-def get_auto_check_enabled() -> bool:
-    st = _load_state()
-    return bool(st.get("auto_check_enabled", True))
-
-def set_auto_check_enabled(enabled: bool) -> None:
-    st = _load_state()
-    st["auto_check_enabled"] = bool(enabled)
-    _save_state(st)
-
-def get_ack_release_tag() -> Optional[str]:
-    return _load_state().get("release_ack_tag")
-
-def ack_release(tag: Optional[str]) -> None:
-    st = _load_state()
-    st["release_ack_tag"] = tag
-    _save_state(st)
 
 # ---------- Beta check ----------
 
@@ -156,6 +125,7 @@ class BetaFile:
             return False
         if self.local_dt is None:
             return True
+        # consider remote newer if >= local + 2 seconds tolerance
         return self.remote_dt.timestamp() >= (self.local_dt.timestamp() + 2.0)
 
 
@@ -163,7 +133,11 @@ def _collect_beta_candidates(owner: str, repo: str, branch: str) -> List[BetaFil
     """
     Find files in helpers/ and presets/viz/ that are newer on GitHub than locally.
     """
-    all_paths = _list_tree_paths(owner, repo, branch)
+    try:
+        all_paths = _list_tree_paths(owner, repo, branch)
+    except Exception as e:
+        raise RuntimeError(f"Failed to list repo tree: {e}")
+
     targets = [p for p in all_paths if p.startswith("helpers/") or p.startswith("presets/viz/")]
     candidates: List[BetaFile] = []
     for p in targets:
@@ -177,56 +151,6 @@ def _collect_beta_candidates(owner: str, repo: str, branch: str) -> List[BetaFil
         if bf.is_remote_newer():
             candidates.append(bf)
     return candidates
-
-# ---------- Background workers (non-blocking UI) ----------
-
-class _ProbeWorker(QThread):
-    result = Signal(dict)
-
-    def __init__(self, parent_ui, owner: str, repo: str):
-        super().__init__(parent_ui)
-        self._owner = owner
-        self._repo = repo
-
-    def run(self):
-        out = {"release_tag": None, "release_published": None, "has_release": False,
-               "beta_hint": False, "beta_prefix_meta": {}}
-        try:
-            rel_tag, rel_pub = _latest_release(self._owner, self._repo)
-            out["release_tag"] = rel_tag
-            out["release_published"] = rel_pub
-            out["has_release"] = bool(rel_tag)
-        except Exception:
-            pass
-        try:
-            branch = _get_default_branch(self._owner, self._repo)
-        except Exception:
-            branch = "main"
-        for pref in ("helpers/", "presets/viz/"):
-            sha, iso = _latest_commit_meta_for_prefix(self._owner, self._repo, branch, pref)
-            out["beta_prefix_meta"][pref] = {"sha": sha, "iso": iso}
-            if sha:
-                out["beta_hint"] = True
-        out["branch"] = branch
-        self.result.emit(out)
-
-
-class _BetaListWorker(QThread):
-    result = Signal(list)
-    error = Signal(str)
-
-    def __init__(self, parent_ui, owner: str, repo: str, branch: str):
-        super().__init__(parent_ui)
-        self._owner = owner
-        self._repo = repo
-        self._branch = branch
-
-    def run(self):
-        try:
-            items = _collect_beta_candidates(self._owner, self._repo, self._branch)
-            self.result.emit(items)
-        except Exception as e:
-            self.error.emit(str(e))
 
 # ---------- UI ----------
 
@@ -275,37 +199,26 @@ class BetaDialog(QDialog):
 
     def _load(self):
         self.list.clear()
-        self.btn_apply.setEnabled(False)
-        self.list.addItem(QListWidgetItem("Loading newer files from GitHub…"))
         try:
             branch = self.branch or _get_default_branch(self.owner, self.repo)
-        except Exception:
-            branch = "main"
-        self._worker = _BetaListWorker(self, self.owner, self.repo, branch)
-        self._worker.result.connect(self._fill_list)
-        self._worker.error.connect(self._show_error)
-        self._worker.start()
-
-    def _fill_list(self, items):
-        self.list.clear()
-        if not items:
-            self.list.addItem(QListWidgetItem("No newer files on GitHub for helpers/ or presets/viz/."))
-            self.btn_apply.setEnabled(False)
-            return
-        self.btn_apply.setEnabled(True)
-        for bf in items:
-            remote_str = bf.remote_dt.isoformat(timespec="seconds") if bf.remote_dt else "unknown"
-            local_str = bf.local_dt.isoformat(timespec="seconds") if bf.local_dt else "missing locally"
-            text = f"{bf.path}\n  remote: {remote_str}   |   local: {local_str}"
-            it = QListWidgetItem(text)
-            it.setData(Qt.UserRole, bf.path)
-            it.setCheckState(Qt.Checked if bf.is_remote_newer() else Qt.Unchecked)
+            items = _collect_beta_candidates(self.owner, self.repo, branch)
+            if not items:
+                self.list.addItem(QListWidgetItem("No newer files on GitHub for helpers/ or presets/viz/."))
+                self.btn_apply.setEnabled(False)
+                return
+            self.btn_apply.setEnabled(True)
+            for bf in items:
+                remote_str = bf.remote_dt.isoformat(timespec="seconds") if bf.remote_dt else "unknown"
+                local_str = bf.local_dt.isoformat(timespec="seconds") if bf.local_dt else "missing locally"
+                text = f"{bf.path}\n  remote: {remote_str}   |   local: {local_str}"
+                it = QListWidgetItem(text)
+                it.setData(Qt.UserRole, bf.path)
+                it.setCheckState(Qt.Checked if bf.is_remote_newer() else Qt.Unchecked)
+                self.list.addItem(it)
+        except Exception as e:
+            it = QListWidgetItem(f"Error loading beta files:\n{e}")
             self.list.addItem(it)
-
-    def _show_error(self, msg):
-        self.list.clear()
-        self.list.addItem(QListWidgetItem(f"Error loading beta files:\n{msg}"))
-        self.btn_apply.setEnabled(False)
+            self.btn_apply.setEnabled(False)
 
     def _select_all(self):
         for i in range(self.list.count()):
@@ -329,9 +242,6 @@ class BetaDialog(QDialog):
             return
         try:
             branch = self.branch or _get_default_branch(self.owner, self.repo)
-        except Exception:
-            branch = "main"
-        try:
             for p in selected:
                 data = _download_raw(self.owner, self.repo, branch, p)
                 out = APP_ROOT / p
@@ -345,111 +255,83 @@ class BetaDialog(QDialog):
         except Exception as e:
             QMessageBox.critical(self, "Beta update failed", f"{e}\n\n{traceback.format_exc()}")
 
-# ---------- Startup check (non-blocking) ----------
+# ---------- Startup check ----------
 
 def _today_str() -> str:
     return date.today().isoformat()
 
-def _show_updates_popup(parent, result: dict):
-    has_release = bool(result.get("has_release"))
-    beta_hint = bool(result.get("beta_hint"))
-    if not (has_release or beta_hint):
+def check_on_startup(parent=None, owner: str = GITHUB_OWNER, repo: str = GITHUB_REPO):
+    """
+    Call this once during app startup (e.g., after main window shows).
+    Runs at most once per calendar day. Pops up if a release or beta updates exist.
+    """
+    st = _load_state()
+    last_day = st.get("last_check_day")
+    if last_day == _today_str():
+        return  # already checked today
+
+    # Mark checked day early to avoid repeat popups if network is slow/fails later
+    st["last_check_day"] = _today_str()
+    _save_state(st)
+
+    # Do the checks
+    release_tag, release_published = _latest_release(owner, repo)
+    try:
+        branch = _get_default_branch(owner, repo)
+    except Exception:
+        branch = "main"
+    try:
+        beta_candidates = _collect_beta_candidates(owner, repo, branch)
+    except Exception:
+        beta_candidates = []
+
+    has_release = bool(release_tag)
+    has_beta = len(beta_candidates) > 0
+
+    if not (has_release or has_beta):
         return
 
-    # Release ack logic: hide release if user acknowledged this tag already
-    tag = result.get("release_tag")
-    if has_release and tag and get_ack_release_tag() == tag:
-        has_release = False
-
-    if not (has_release or beta_hint):
-        return
-
+    # Build message
     lines = []
     if has_release:
-        lines.append(f"New release available: {tag} (published {result.get('release_published')})")
-    if beta_hint:
-        lines.append("Beta: possible newer file(s) in helpers/ or presets/viz/.")
-    msg = "\n".join(lines)
+        rel_dt = release_published or "unknown date"
+        lines.append(f"New release available: {release_tag} (published {rel_dt})")
+    if has_beta:
+        lines.append(f"Beta: {len(beta_candidates)} newer file(s) found in helpers/ or presets/viz/.")
 
+    msg = "\n".join(lines)
     box = QMessageBox(parent)
     box.setWindowTitle("Updates available on GitHub")
     box.setIcon(QMessageBox.Information)
     box.setText(msg)
-
-    # "don't remind me for this release" checkbox
-    if has_release and tag:
-        cb = QCheckBox(f"I've installed {tag}. Don't remind me again.")
-        box.setCheckBox(cb)
-
+    # Buttons
     btn_release = box.addButton("Open Release Updater…", QMessageBox.AcceptRole)
     btn_beta = box.addButton("Review Beta Files…", QMessageBox.ActionRole)
     box.addButton("Ignore", QMessageBox.RejectRole)
     box.exec()
 
     clicked = box.clickedButton()
-    if has_release and tag and box.checkBox() and box.checkBox().isChecked():
-        ack_release(tag)
-
     if clicked is btn_release:
         _open_release_updater(parent)
     elif clicked is btn_beta:
-        try:
-            branch = result.get("branch") or _get_default_branch(GITHUB_OWNER, GITHUB_REPO)
-        except Exception:
-            branch = "main"
-        dlg = BetaDialog(GITHUB_OWNER, GITHUB_REPO, branch, parent)
+        dlg = BetaDialog(owner, repo, branch, parent)
         dlg.exec()
 
-def check_on_startup(parent=None, owner: str = GITHUB_OWNER, repo: str = GITHUB_REPO):
-    """
-    Non-blocking daily check. Respects the 'auto_check_enabled' user setting.
-    """
-    if not get_auto_check_enabled():
-        return
-
-    st = _load_state()
-    last_day = st.get("last_check_day")
-    if last_day == _today_str():
-        return  # already checked today
-
-    st["last_check_day"] = _today_str()
-    _save_state(st)
-
-    worker = _ProbeWorker(parent, owner, repo)
-    # Avoid GC
-    if not hasattr(check_on_startup, "_workers"):
-        check_on_startup._workers = []
-    check_on_startup._workers.append(worker)
-
-    def _done(out):
-        # Persist diagnostics
-        st2 = _load_state()
-        st2["last_result"] = out
-        _save_state(st2)
-        _show_updates_popup(parent, out)
-        try:
-            check_on_startup._workers.remove(worker)
-        except Exception:
-            pass
-
-    worker.result.connect(_done)
-    worker.start()
-
 def force_check_now(parent=None, owner: str = GITHUB_OWNER, repo: str = GITHUB_REPO):
-    """Force-run regardless of last run day (useful for testing)."""
+    """Force-run the startup check regardless of last run day (useful for testing)."""
     st = _load_state()
     st["last_check_day"] = "1970-01-01"
     _save_state(st)
     check_on_startup(parent, owner, repo)
 
-# ---------- Release updater bridge / fallback ----------
+# ---------- Release updater bridge ----------
 
 def _open_release_updater(parent):
     """
-    If the app has 'Info → Updates…' (menu_info.UpdateDialog), open that.
-    Otherwise, open GitHub releases page as a fallback.
+    If the app has the 'Info → Updates…' dialog wired (menu_info.UpdateDialog),
+    open that. Otherwise, show a minimal message explaining where to update.
     """
-    # Try to import from app module
+    # Try to import from app module (no hard dependency)
     try:
         from menu_info import _open_update_dialog as _open_update_dialog_fn
     except Exception:
@@ -462,25 +344,25 @@ def _open_release_updater(parent):
         except Exception:
             pass
 
-    # Fallback: open releases URL
-    QDesktopServices.openUrl(QUrl("https://github.com/Koongrizzly/FrameVision/releases"))
+    QMessageBox.information(parent, "Release updater",
+                            "Couldn't locate the built-in updater dialog. "
+                            "Open 'Info → Updates…' manually to update from the latest release.")
 
-# ---------- Convenience installers ----------
+# ---------- Convenience installer ----------
 
 def install_startup_check(main_window, delay_ms: int = 800):
-    """Call once after the main window shows."""
-    if get_auto_check_enabled():
-        QTimer.singleShot(delay_ms, lambda: check_on_startup(main_window))
+    """
+    Call once after creating your main window (post-show). Example:
+        from helpers.update_checker import install_startup_check
+        install_startup_check(self)
+    """
+    QTimer.singleShot(delay_ms, lambda: check_on_startup(main_window))
 
-def schedule_check_no_parent(delay_ms: int = 800):
-    """Schedule the daily check without a parent window."""
-    if get_auto_check_enabled():
-        QTimer.singleShot(delay_ms, lambda: check_on_startup(None))
 
 # ---------- Menu helpers (optional) ----------
 
 def open_beta_dialog(parent=None, owner: str = GITHUB_OWNER, repo: str = GITHUB_REPO):
-    """Open the Beta dialog on demand."""
+    """Open the Beta dialog on demand (e.g., from your Info menu)."""
     try:
         branch = _get_default_branch(owner, repo)
     except Exception:
@@ -490,24 +372,22 @@ def open_beta_dialog(parent=None, owner: str = GITHUB_OWNER, repo: str = GITHUB_
 
 def add_updates_to_menu(info_menu, parent=None):
     """
-    Add handy menu entries:
-      - 'Check for Updates Now…' (runs probe immediately)
-      - 'Review Beta Files…' (opens beta picker)
-      - Checkable 'Auto check for updates at startup'
+    Given a QMenu (your 'Info' menu), add:
+      - 'Check for Updates Now…' (runs both release+beta checks immediately)
+      - 'Review Beta Files…' (opens the checkbox picker)
     """
     if info_menu is None:
-        return None, None, None
+        return None, None
     act_check = info_menu.addAction("Check for Updates Now…")
     act_beta  = info_menu.addAction("Review Beta Files…")
-    info_menu.addSeparator()
-    act_auto = info_menu.addAction("Auto check for updates at startup")
-    act_auto.setCheckable(True)
-    act_auto.setChecked(get_auto_check_enabled())
-
     act_check.triggered.connect(lambda: force_check_now(parent))
     act_beta.triggered.connect(lambda: open_beta_dialog(parent))
-    def _toggle_auto():
-        set_auto_check_enabled(act_auto.isChecked())
-    act_auto.toggled.connect(_toggle_auto)
+    return act_check, act_beta
 
-    return act_check, act_beta, act_auto
+def schedule_check_no_parent(delay_ms: int = 800):
+    """
+    Schedule the daily check without a parent window.
+    Useful if you're calling from modules that don't have access to the main window yet.
+    """
+    QTimer.singleShot(delay_ms, lambda: check_on_startup(None))
+

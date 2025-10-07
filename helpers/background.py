@@ -1677,34 +1677,41 @@ def install_background_tool(pane, section_widget) -> None:
         nonlocal current_rgb, current_alpha, current_path
         media_path, time_s = _current_media_from_app(pane)
         if media_path is None:
-            try: QMessageBox.information(panel, "No image", "Open an image in the app (left panel) first."); return
-            except Exception: return
+            try:
+                QMessageBox.information(panel, "No image", "Open an image in the app (left panel) first.")
+                return
+            except Exception:
+                return
         current_path = media_path
         try:
             img = load_image_or_frame(str(media_path), float(time_s))
         except Exception as e:
-            try: QMessageBox.critical(panel, "Load error", str(e)); return
-            except Exception: return
+            try:
+                QMessageBox.critical(panel, "Load error", str(e))
+                return
+            except Exception:
+                return
         current_rgb = _np_from_pil(img)
-        eng, model = _pick_engine({0:"auto",1:"modnet",2:"birefnet"}[cmb_engine.currentIndex()])
+        h, w = current_rgb.shape[:2]
         try:
-            preview.setImageSize(current_rgb.shape[1], current_rgb.shape[0])
+            import numpy as _np_local
+            current_alpha = _np_local.ones((h, w), dtype=_np_local.float32)
+        except Exception:
+            current_alpha = None
+        try:
+            preview.setImageSize(w, h)
+            preview.clearMask()
         except Exception:
             pass
-
         try:
-            preview.setImageSize(current_rgb.shape[1], current_rgb.shape[0])
+            update_preview_pix(_pil_from_np(current_rgb).convert("RGBA"))
         except Exception:
-            pass
-
-        if model is None:
-            try: QMessageBox.critical(panel, "Model", "No ONNX model found in models/."); return
-            except Exception: return
-        try:
-            _start_infer(model, reset_params=True)
-        except Exception as e:
-            try: QMessageBox.critical(panel, "ONNX error", str(e)); return
-            except Exception: return
+            try:
+                pm = QPixmap.fromImage(qimage_from_pil(_pil_from_np(current_rgb)))
+                preview.setPixmap(pm)
+            except Exception:
+                pass
+    
     btn_use_current.clicked.connect(on_use_current)
 
     # --- Load external ---
@@ -1717,33 +1724,38 @@ def install_background_tool(pane, section_widget) -> None:
                 files, _ = QFileDialog.getOpenFileNames(panel, "Choose video", "", "Videos (*.mp4 *.mov *.mkv *.avi *.webm)")
         except Exception:
             files = []
-        if not files: return
+        if not files:
+            return
         current_path = Path(files[0])
         try:
             img = load_image_or_frame(str(current_path), float(t_seek.value()))
         except Exception as e:
-            try: QMessageBox.critical(panel, "Load error", str(e)); return
-            except Exception: return
+            try:
+                QMessageBox.critical(panel, "Load error", str(e))
+                return
+            except Exception:
+                return
         current_rgb = _np_from_pil(img)
-        eng, model = _pick_engine({0:"auto",1:"modnet",2:"birefnet"}[cmb_engine.currentIndex()])
+        h, w = current_rgb.shape[:2]
         try:
-            preview.setImageSize(current_rgb.shape[1], current_rgb.shape[0])
+            import numpy as _np_local
+            current_alpha = _np_local.ones((h, w), dtype=_np_local.float32)
+        except Exception:
+            current_alpha = None
+        try:
+            preview.setImageSize(w, h)
+            preview.clearMask()
         except Exception:
             pass
-
         try:
-            preview.setImageSize(current_rgb.shape[1], current_rgb.shape[0])
+            update_preview_pix(_pil_from_np(current_rgb).convert("RGBA"))
         except Exception:
-            pass
-
-        if model is None:
-            try: QMessageBox.critical(panel, "Model", "No ONNX model found in models/."); return
-            except Exception: return
-        try:
-            _start_infer(model, reset_params=True)
-        except Exception as e:
-            try: QMessageBox.critical(panel, "ONNX error", str(e)); return
-            except Exception: return
+            try:
+                pm = QPixmap.fromImage(qimage_from_pil(_pil_from_np(current_rgb)))
+                preview.setPixmap(pm)
+            except Exception:
+                pass
+    
     btn_load.clicked.connect(on_load_external)
 
     # Drag & drop from preview
@@ -1752,33 +1764,27 @@ def install_background_tool(pane, section_widget) -> None:
         try:
             pth = Path(pathstr)
             current_path = pth
-            # decide type by extension
             ext = pth.suffix.lower()
             is_video = ext in ['.mp4','.mov','.mkv','.avi','.webm']
             img = load_image_or_frame(str(current_path), float(t_seek.value()) if is_video else 0.0)
             current_rgb = _np_from_pil(img)
-            eng, model = _pick_engine({0:"auto",1:"modnet",2:"birefnet"}[cmb_engine.currentIndex()])
-            try:
-                preview.setImageSize(current_rgb.shape[1], current_rgb.shape[0])
-            except Exception:
-                pass
-
-
-            if model is None:
-                return
-            current_alpha = _infer_onnx_alpha(model, current_rgb, eng)
-            undo_stack.clear(); set_params(defaults()); schedule_update()
+            h, w = current_rgb.shape[:2]
+            import numpy as _np_local
+            current_alpha = _np_local.ones((h, w), dtype=_np_local.float32)
+            preview.setImageSize(w, h)
+            preview.clearMask()
+            update_preview_pix(_pil_from_np(current_rgb).convert("RGBA"))
         except Exception as e:
             try:
                 from PySide6.QtWidgets import QMessageBox
                 QMessageBox.critical(panel, "Drop error", str(e))
             except Exception:
                 pass
+    
     try:
         preview.fileDropped.connect(_on_drop_path)
     except Exception:
         pass
-
     # --- Recompute, Reset, Undo, Save ---
     def on_recompute():
         nonlocal current_alpha
@@ -1846,32 +1852,41 @@ def install_background_tool(pane, section_widget) -> None:
     btn_save.clicked.connect(on_save)
     # --- Inpaint (SD 1.5) ---
     def on_inpaint_sd15():
-        nonlocal current_rgb
+        nonlocal current_rgb, current_alpha, current_path
         if current_rgb is None:
-            try: QMessageBox.information(panel, "Info", "Load or use current image first."); return
-            except Exception: return
+            try:
+                QMessageBox.information(panel, "Info", "Load or use current image first.")
+                return
+            except Exception:
+                return
         if not _sd15_inpaint_available():
-            try: QMessageBox.critical(panel, "SD Inpaint", "Missing deps: please install torch, diffusers, transformers, accelerate, safetensors."); return
-            except Exception: return
+            try:
+                QMessageBox.critical(panel, "SD Inpaint", "Missing deps: please install torch, diffusers, transformers, accelerate, safetensors.")
+                return
+            except Exception:
+                return
         try:
             h, w = current_rgb.shape[:2]
-            # build removal mask from preview (left-drawn 'remove' mask)
             rm, km = None, None
             try:
                 rm, km = preview.export_masks_to_image_size(w, h)
             except Exception:
-                rm = preview.export_mask_to_image_size(w, h); km = None
-            # Ensure masks match image size
+                rm = preview.export_mask_to_image_size(w, h)
+                km = None
             rm = _ensure_mask_hw(rm, h, w)
             km = _ensure_mask_hw(km, h, w)
             if rm is None or (rm <= 0.01).sum() == (rm.size):
                 if current_alpha is None:
-                    try: QMessageBox.information(panel, "Mask", "Paint an area to remove with the brush (left click)."); return
-                    except Exception: return
-                rm = (current_alpha < 0.5).astype(np.float32)
+                    try:
+                        QMessageBox.information(panel, "Mask", "Paint an area to remove with the brush (left click).")
+                        return
+                    except Exception:
+                        return
+                import numpy as _np_local
+                rm = (current_alpha < 0.5).astype(_np_local.float32)
             if km is not None:
-                rm = np.clip(rm - (km > 0.01).astype(np.float32), 0.0, 1.0)
-
+                import numpy as _np_local
+                rm = _np_local.clip(rm - (km > 0.01).astype(_np_local.float32), 0.0, 1.0)
             out_img = inpaint_sd15(
                 current_rgb,
                 remove_mask01=rm,
@@ -1883,33 +1898,25 @@ def install_background_tool(pane, section_widget) -> None:
                 seed=int(s_sd_seed.value()),
                 model_path=_resolve_inpaint_model_path(le_sd_model.text().strip()),
             )
+            current_rgb = _np_from_pil(out_img.convert("RGB"))
+            hh, ww = current_rgb.shape[:2]
+            import numpy as _np_local
+            current_alpha = _np_local.ones((hh, ww), dtype=_np_local.float32)
+            preview.setImageSize(ww, hh)
+            preview.clearMask()
             update_preview_pix(out_img.convert("RGBA"))
-            try:
-                tmp_path = OUT_TEMP / f"inpaint_bg_{os.getpid()}_{int(time.time())}.png"
-                out_img.save(tmp_path)
-                # Persist the path, update label
-                chosen_bg["path"] = str(tmp_path)
-                try:
-                    lbl_img.setText(tmp_path.name)
-                except Exception:
-                    pass
-                # Only auto-switch Replacer → Image if user opted in
-                try:
-                    if chk_sd_auto_bg.isChecked():
-                        cmb_repl.setCurrentIndex(3)
-                except Exception:
-                    pass
-            except Exception:
-                pass
             schedule_update()
         except Exception as e:
-            try: QMessageBox.critical(panel, "Inpaint error", str(e))
-            except Exception: print("Inpaint error:", e)
-
+            try:
+                QMessageBox.critical(panel, "Inpaint error", str(e))
+            except Exception:
+                print("Inpaint error:", e)
+    
     try:
         btn_sd_inpaint.clicked.connect(on_inpaint_sd15)
     except Exception:
         pass
+
 
 
     # Hand layout back to section
