@@ -881,13 +881,33 @@ def install_background_tool(pane, section_widget) -> None:
             return QPixmap.fromImage(img)
 
         def setPixmap(self, pm: QPixmap):
+            """Set the preview pixmap without nuking existing brush masks.
+            Only (re)allocate/resize masks when the underlying IMAGE size changes.
+            This fixes the bug where every recomposite wiped older strokes.
+            """
             self._pix = pm
             try:
-                self.setImageSize(pm.width(), pm.height())
+                w, h = int(pm.width()), int(pm.height())
+                # First time: allocate masks
+                if self._img_w <= 0 or self._img_h <= 0:
+                    self.setImageSize(w, h)  # allocates blank masks intentionally
+                else:
+                    # If size changed, resample masks to new size to preserve strokes
+                    if (w != self._img_w) or (h != self._img_h):
+                        from PySide6.QtCore import Qt as _Qt
+                        try:
+                            self._mask = self._mask.scaled(w, h, _Qt.IgnoreAspectRatio, _Qt.FastTransformation)
+                        except Exception:
+                            self._mask = self._mask.scaled(w, h)
+                        try:
+                            self._mask_keep = self._mask_keep.scaled(w, h, _Qt.IgnoreAspectRatio, _Qt.FastTransformation)
+                        except Exception:
+                            self._mask_keep = self._mask_keep.scaled(w, h)
+                        self._img_w, self._img_h = w, h
+                # Otherwise: same size -> keep masks as-is
             except Exception:
                 pass
             self.update()
-
         def setOverlayOpacity(self, v: float):
             try:
                 self._overlay_opacity = max(0.0, min(1.0, float(v)))
