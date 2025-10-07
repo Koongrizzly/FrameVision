@@ -1241,7 +1241,7 @@ class UpscPane(QtWidgets.QWidget):
         except Exception:
             base = Path(__file__).resolve().parent.parent
         # Thumbs only live here
-        return base / "output" / "last results" / "interp"
+        return base / "output" / "last results" / "upsc"
 
     def _list_recent_jobs(self) -> list[Path]:
         d = self._jobs_done_dir()
