@@ -8,7 +8,7 @@ from PySide6.QtCore import Qt, QUrl
 from PySide6.QtGui import QAction, QDesktopServices
 from PySide6.QtWidgets import (
     QDialog, QDialogButtonBox, QHBoxLayout, QLabel, QLineEdit, QListWidget,
-    QListWidgetItem, QMenu, QMessageBox, QTextBrowser, QVBoxLayout, QWidget
+    QListWidgetItem, QMenu, QMessageBox, QTextBrowser, QVBoxLayout, QWidget, QCheckBox
 )
 
 APP_ROOT = Path(__file__).resolve().parents[1]
@@ -356,8 +356,10 @@ def _create_backup_zip(app_root: Path, target_dir: Path) -> Path:
       tools/, models/, output/, presets/, .venv at the project root.
     Also excludes __pycache__ folders.
     """
+    import zipfile as _zipfile
+    from datetime import datetime as _dt
     EXCLUDE_TOP = {"tools", "models", "output", "presets", ".venv"}
-    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    ts = _dt.now().strftime("%Y%m%d_%H%M%S")
     out = Path(target_dir) / f"{app_root.name}_backup_{ts}.zip"
     with _zipfile.ZipFile(out, "w", compression=_zipfile.ZIP_DEFLATED) as zf:
         for p in app_root.rglob("*"):
@@ -367,7 +369,6 @@ def _create_backup_zip(app_root: Path, target_dir: Path) -> Path:
                 rel = p.relative_to(app_root)
             except ValueError:
                 continue
-            # Skip if the first path segment is in exclude list
             if rel.parts and rel.parts[0] in EXCLUDE_TOP:
                 continue
             if p.is_file():
@@ -418,6 +419,27 @@ class UpdateDialog(QDialog):
         v.addLayout(row1)
 
         v.addSpacing(8)
+
+        # Auto-check toggle (persists via helpers.update_checker)
+        try:
+            from helpers.update_checker import get_auto_check_enabled, set_auto_check_enabled
+            auto_on = get_auto_check_enabled()
+        except Exception:
+            auto_on = True
+            get_auto_check_enabled = None
+            set_auto_check_enabled = None
+
+        self.chk_auto = QCheckBox("Auto check for updates at startup", self)
+        self.chk_auto.setChecked(bool(auto_on))
+        def _on_auto(ticked):
+            if set_auto_check_enabled is not None:
+                try:
+                    set_auto_check_enabled(bool(ticked))
+                except Exception:
+                    pass
+        self.chk_auto.toggled.connect(_on_auto)
+        v.addWidget(self.chk_auto)
+
         v.addWidget(beta_hdr)
         row2 = QHBoxLayout()
         row2.addWidget(btn_beta_partial)
@@ -483,3 +505,10 @@ def _open_update_dialog(parent: QWidget | None):
     dlg = UpdateDialog(parent)
     dlg.exec()
 # ===== End Update Dialog =====
+
+# --- Auto-run daily GitHub check (safe if helper missing) ---
+try:
+    from helpers.update_checker import schedule_check_no_parent
+    schedule_check_no_parent()
+except Exception:
+    pass
