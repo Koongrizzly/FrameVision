@@ -16,7 +16,7 @@ replacer (Transparent/Color/Blur/Image), drop shadow.
 """
 from __future__ import annotations
 
-import math, os, sys, json, subprocess, tempfile
+import math, os, sys, json, subprocess, tempfile, time
 from pathlib import Path
 from typing import Optional, Tuple, List, Dict
 
@@ -44,6 +44,13 @@ try:
     import cv2
 except Exception:
     cv2 = None
+try:
+    import torch
+    from diffusers import StableDiffusionInpaintPipeline
+except Exception:
+    torch = None
+    StableDiffusionInpaintPipeline = None
+
 
 # -------------------- Preferences --------------------
 def _prefs_path() -> Path:
@@ -284,6 +291,112 @@ def _infer_onnx_alpha(model_path: Path, img_rgb: np.ndarray, engine_id: str) -> 
             ) / 255.0
     return np.clip(alpha, 0.0, 1.0)
 
+
+# -------------------- SD Inpainting (Stable Diffusion 1.5) --------------------
+_SD_PIPE_CACHE = {}
+
+def _sd15_inpaint_available() -> bool:
+    return ('torch' in globals() and torch is not None) and ('StableDiffusionInpaintPipeline' in globals() and StableDiffusionInpaintPipeline is not None)
+
+def _default_sd15_inpaint_model_path() -> Path:
+    # As provided by the user: root \models\bg\sd-v1-5-inpainting.safetensors
+    return _models_dir() / "bg" / "sd-v1-5-inpainting.safetensors"
+
+
+def _resolve_inpaint_model_path(user_text: Optional[str] = None) -> Path:
+    # Resolve a valid SD inpaint model path with fallbacks
+    import os
+    # 1) From UI
+    if user_text:
+        s = user_text.strip().strip('"').strip("'")
+        s = os.path.expanduser(os.path.expandvars(s))
+        pth = Path(s)
+        if pth.exists():
+            return pth
+    # 2) Preferred defaults under models/bg
+    candidates = [
+        _models_dir() / 'bg' / 'sd-v1-5-inpainting.safetensors',
+        _models_dir() / 'bg' / 'sd-v1-5-inpainting.fp16.safetensors',
+    ]
+    # 3) Any sd*inpaint*.safetensors under models/bg
+    try:
+        for g in ['sd*-inpaint*.safetensors', 'sd*inpaint*.safetensors', '*inpaint*.safetensors']:
+            for m in sorted((_models_dir() / 'bg').glob(g)):
+                candidates.append(m)
+    except Exception:
+        pass
+    for c in candidates:
+        try:
+            if Path(c).exists():
+                return Path(c)
+        except Exception:
+            continue
+    return Path(user_text) if user_text else _default_sd15_inpaint_model_path()
+
+def _get_sd15_inpaint_pipe(model_path: Path):
+    """Return a cached StableDiffusionInpaintPipeline from a single .safetensors file."""
+    if not _sd15_inpaint_available():
+        raise RuntimeError("diffusers/torch not installed. Please install: torch, diffusers, transformers, accelerate, safetensors.")
+    device = "cuda" if (hasattr(torch, "cuda") and torch.cuda.is_available()) else "cpu"
+    key = str(model_path.resolve()) + "|" + device
+    p = _SD_PIPE_CACHE.get(key)
+    if p is None:
+        p = StableDiffusionInpaintPipeline.from_single_file(
+            str(model_path),
+            local_files_only=True,
+            safety_checker=None,
+            torch_dtype=torch.float16 if device == "cuda" else torch.float32,
+        )
+        p = p.to(device)
+        try:
+            p.enable_attention_slicing()
+        except Exception:
+            pass
+        _SD_PIPE_CACHE[key] = p
+    return p
+
+def inpaint_sd15(
+    img_rgb: np.ndarray,
+    remove_mask01: np.ndarray,
+    prompt: str = "clean background, realistic",
+    negative_prompt: str = "blurry, artifacts, distortion, text, watermark",
+    steps: int = 30,
+    guidance: float = 7.0,
+    strength: float = 0.85,
+    seed: int = -1,
+    model_path: Optional[Path | str] = None,
+) -> Image.Image:
+    """Fill the masked (removed) regions using SD 1.5 inpainting."""
+    from pathlib import Path as _PathAlias
+    if model_path is None:
+        model_path = _default_sd15_inpaint_model_path()
+    model_path = _resolve_inpaint_model_path(str(model_path))
+    if not _PathAlias(model_path).exists():
+        raise FileNotFoundError(f"SD1.5 inpainting model not found at: {model_path}")
+    h, w = img_rgb.shape[:2]
+    m = np.clip(remove_mask01.astype(np.float32), 0.0, 1.0)
+    m_u8 = (m * 255.0).astype(np.uint8)
+    mask_pil = Image.fromarray(m_u8, mode="L").resize((w, h), Image.BILINEAR)
+    img_pil = _pil_from_np(img_rgb)
+
+    pipe = _get_sd15_inpaint_pipe(Path(model_path))
+    g = None
+    if isinstance(seed, int) and seed >= 0:
+        g = torch.Generator(device=getattr(pipe, "device", "cpu")).manual_seed(int(seed))
+
+    out = pipe(
+        prompt=prompt or "",
+        negative_prompt=negative_prompt or None,
+        image=img_pil,
+        mask_image=mask_pil,
+        num_inference_steps=int(steps),
+        guidance_scale=float(guidance),
+        strength=float(strength),
+        generator=g,
+    )
+    out_img = out.images[0].convert("RGB")
+    return out_img
+
 # -------------------- Post, composite --------------------
 def _apply_post(alpha: np.ndarray, thresh: int, feather: int) -> np.ndarray:
     """alpha 0..1 -> 0..255 uint8 with threshold + feather."""
@@ -349,6 +462,33 @@ def _resize_cover(img: np.ndarray, target_hw: Tuple[int,int]) -> np.ndarray:
     y0 = max(0, (nh - th) // 2); x0 = max(0, (nw - tw) // 2)
     return res[y0:y0+th, x0:x0+tw]
 
+def _ensure_mask_hw(mask: Optional[np.ndarray], h: int, w: int) -> Optional[np.ndarray]:
+    """Ensure a mask is HxW float32 in [0..1]. Returns None if mask is None."""
+    if mask is None:
+        return None
+    m = np.asarray(mask)
+    if m.ndim == 3:
+        m = m[..., 0]
+    # Normalize dtype
+    if m.dtype != np.float32 and m.dtype != np.float64:
+        m = m.astype(np.float32)
+        if m.max() > 1.0 + 1e-5:
+            m = m / 255.0
+    else:
+        m = m.astype(np.float32)
+    # Resize if needed
+    if m.shape != (h, w):
+        try:
+            if cv2 is not None:
+                m = cv2.resize(m, (w, h), interpolation=cv2.INTER_LINEAR)
+            else:
+                from PIL import Image as _PILImage
+                m = np.array(_PILImage.fromarray((np.clip(m,0.0,1.0)*255).astype(np.uint8)).resize((w, h), _PILImage.BILINEAR)).astype(np.float32) / 255.0
+        except Exception:
+            from PIL import Image as _PILImage
+            m = np.array(_PILImage.fromarray((np.clip(m,0.0,1.0)*255).astype(np.uint8)).resize((w, h), _PILImage.BILINEAR)).astype(np.float32) / 255.0
+    return np.clip(m, 0.0, 1.0)
+
 def _compose_with_bg(
     img_rgb: np.ndarray,
     a8: np.ndarray,
@@ -366,7 +506,22 @@ def _compose_with_bg(
 ) -> Image.Image:
     """Compose according to replacement settings. Returns PIL Image (RGBA when transparent)."""
     h, w = img_rgb.shape[:2]
-    a = a8.astype(np.uint8)
+    # Normalize mask to uint8 HxW
+    a = a8
+    if a.ndim == 3:
+        a = a[..., 0]
+    if a.shape != (h, w):
+        from PIL import Image as _PILImage
+        a = np.array(_PILImage.fromarray(a.astype(np.uint8)).resize((w, h), _PILImage.BILINEAR))
+    if a.dtype != np.uint8:
+        try:
+            vmax = float(a.max())
+        except Exception:
+            vmax = 255.0
+        if vmax <= 1.0 + 1e-5:
+            a = (np.clip(a, 0.0, 1.0) * 255).astype(np.uint8)
+        else:
+            a = np.clip(a, 0, 255).astype(np.uint8)
 
     fg = img_rgb
     if anti_halo and mode != "alpha_only":
@@ -415,6 +570,15 @@ def _compose_with_bg(
         return _pil_from_np(a)
 
     if mode == "keep_bg":
+        # If a background image is provided (e.g., SD inpaint result), show it directly.
+        if repl_mode == "image" and bg_img_path:
+            try:
+                im = Image.open(bg_img_path).convert("RGB")
+                bg_np = np.asarray(im)
+                bg = _resize_cover(bg_np, (h, w))
+                return _pil_from_np(bg)
+            except Exception:
+                pass
         inv = 255 - a
         rgb = (img_rgb.astype(np.float32) * (inv/255.0)[...,None]).astype(np.uint8)
         return _pil_from_np(rgb)
@@ -503,7 +667,30 @@ def remove_background_preview(
     shadow_offy: int,
     anti_halo: bool,
 ) -> Image.Image:
-    alpha = alpha_base.copy().astype(np.float32)
+    # Normalize alpha to 2D float [0..1] and match image size
+    h_img, w_img = rgb.shape[:2]
+    try:
+        alpha = _as_2d_alpha(alpha_base)
+    except Exception:
+        alpha = np.asarray(alpha_base).astype(np.float32)
+        if alpha.ndim == 3:
+            alpha = alpha[...,0]
+        if alpha.max() > 1.0 + 1e-5:
+            alpha = alpha / 255.0
+    # Merge live masks from preview canvas so brush strokes persist
+    try:
+        rm, km = preview.export_masks_to_image_size(w_img, h_img)
+        if rm is not None:
+            alpha = np.clip(np.maximum(alpha, rm.astype(np.float32)), 0.0, 1.0)
+        if km is not None:
+            alpha = np.clip(alpha - (km > 0.01).astype(np.float32), 0.0, 1.0)
+    except Exception:
+        pass
+    if alpha.shape != (h_img, w_img):
+        from PIL import Image as _PILImage
+        alpha = np.array(
+            _PILImage.fromarray((np.clip(alpha,0.0,1.0)*255).astype(np.uint8)).resize((w_img, h_img), _PILImage.BILINEAR)
+        ).astype(np.float32) / 255.0
     if auto_level:
         alpha = _auto_level_alpha(alpha)
     if invert:
@@ -641,6 +828,13 @@ def install_background_tool(pane, section_widget) -> None:
             self._btn_brush.setChecked(True)
             self._btn_brush.clicked.connect(lambda: self._select_tool('brush'))
             self._btn_zoom.clicked.connect(lambda: self._select_tool('zoom'))
+            # --- Tooltips for preview & tools ---
+            try:
+                self._btn_brush.setToolTip('Brush tool — left-drag = remove (make transparent), right-drag = keep. Mouse wheel changes brush size. Default radius: 20px.')
+                self._btn_zoom.setToolTip('Zoom/Pan tool — mouse wheel to zoom, left-drag to pan. Default zoom: 1.0.')
+                self.setToolTip('Preview — paint with 🖌 to remove/keep, or use 🔍 to zoom and pan. Overlay opacity is adjustable below.')
+            except Exception:
+                pass
 
         def _widget_to_image(self, pos):
             # Map widget position to image coordinates; return (x,y) or None if outside
@@ -737,9 +931,43 @@ def install_background_tool(pane, section_widget) -> None:
 
         def mousePressEvent(self, e):
             if self._tool == 'brush' and e.button() == Qt.LeftButton:
-                self._paint_at(e.position() if hasattr(e, 'position') else e.pos())
+                            try:
+                                pth = chosen_bg.get('path') if isinstance(chosen_bg, dict) else None
+                                from pathlib import Path as _P
+                                if pth and _P(pth).name.startswith('inpaint_bg_'):
+                                    chosen_bg['path'] = None
+                                    try:
+                                        lbl_img.setText('(none)')
+                                    except Exception:
+                                        pass
+                                    try:
+                                        # If replacer mode is Image, switch to Transparent
+                                        if cmb_repl.currentIndex() == 3:
+                                            cmb_repl.setCurrentIndex(0)
+                                    except Exception:
+                                        pass
+                            except Exception:
+                                pass
+                            self._paint_at(e.position() if hasattr(e, 'position') else e.pos())
             elif self._tool == 'brush' and e.button() == Qt.RightButton:
-                self._paint_keep_at(e.position() if hasattr(e, 'position') else e.pos())
+                            try:
+                                pth = chosen_bg.get('path') if isinstance(chosen_bg, dict) else None
+                                from pathlib import Path as _P
+                                if pth and _P(pth).name.startswith('inpaint_bg_'):
+                                    chosen_bg['path'] = None
+                                    try:
+                                        lbl_img.setText('(none)')
+                                    except Exception:
+                                        pass
+                                    try:
+                                        # If replacer mode is Image, switch to Transparent
+                                        if cmb_repl.currentIndex() == 3:
+                                            cmb_repl.setCurrentIndex(0)
+                                    except Exception:
+                                        pass
+                            except Exception:
+                                pass
+                            self._paint_keep_at(e.position() if hasattr(e, 'position') else e.pos())
             elif self._tool == 'zoom' and e.button() == Qt.LeftButton:
                 self._drag_origin = ((e.position().x() if hasattr(e, 'position') else e.x()), (e.position().y() if hasattr(e, 'position') else e.y()))
                 self.setCursor(Qt.ClosedHandCursor)
@@ -770,7 +998,8 @@ def install_background_tool(pane, section_widget) -> None:
                 self.setCursor(Qt.ArrowCursor)
             return super().mouseReleaseEvent(e)
         def _paint_at(self, pos):
-            from PySide6.QtGui import QPainter, QPointF
+            from PySide6.QtGui import QPainter
+            from PySide6.QtCore import QPointF
             self._ensure_masks()
             mapped = self._widget_to_image(pos)
             if mapped is None: return
@@ -784,7 +1013,8 @@ def install_background_tool(pane, section_widget) -> None:
             self.maskChanged.emit(); self.update()
 
         def _paint_keep_at(self, pos):
-            from PySide6.QtGui import QPainter, QPointF
+            from PySide6.QtGui import QPainter
+            from PySide6.QtCore import QPointF
             self._ensure_masks()
             mapped = self._widget_to_image(pos)
             if mapped is None: return
@@ -817,8 +1047,12 @@ def install_background_tool(pane, section_widget) -> None:
                 q = qimg.convertToFormat(QImage.Format_Grayscale8)
                 w = q.width(); h = q.height()
                 bpl = q.bytesPerLine()
-                ptr = q.constBits(); ptr.setsize(h * bpl)
-                arr = _np.frombuffer(ptr, dtype=_np.uint8).reshape((h, bpl))[:, :w]
+                ptr = q.constBits()
+                try:
+                    buf = ptr.tobytes()
+                except AttributeError:
+                    buf = bytes(ptr)
+                arr = _np.frombuffer(buf, dtype=_np.uint8).reshape((h, bpl))[:, :w]
                 pil = _PILImage.fromarray(arr, mode='L')
                 if (w, h) != (tw, th):
                     pil = pil.resize((tw, th), _PILImage.BILINEAR)
@@ -834,14 +1068,18 @@ def install_background_tool(pane, section_widget) -> None:
                     q = self._mask.convertToFormat(QImage.Format_Grayscale8)
                     w = q.width(); h = q.height()
                     bpl = q.bytesPerLine()
-                    ptr = q.constBits(); ptr.setsize(h * bpl)
-                    arr = _np.frombuffer(ptr, dtype=_np.uint8).reshape((h, bpl))[:, :w]
+                    ptr = q.constBits()
+                    try:
+                        buf = ptr.tobytes()
+                    except AttributeError:
+                        buf = bytes(ptr)
+                    arr = _np.frombuffer(buf, dtype=_np.uint8).reshape((h, bpl))[:, :w]
                     pil = _PILImage.fromarray(arr, mode='L')
                     if (w, h) != (target_w, target_h):
                         pil = pil.resize((target_w, target_h), _PILImage.BILINEAR)
                     out = _np.asarray(pil).astype(_np.float32) / 255.0
                     return out
-        
+
         def dragEnterEvent(self, e):
             try:
                 if e.mimeData().hasUrls():
@@ -933,8 +1171,10 @@ def install_background_tool(pane, section_widget) -> None:
     t_seek = QDoubleSpinBox(); t_seek.setRange(0, 36000); t_seek.setDecimals(3); t_seek.setSingleStep(0.5); t_seek.setValue(0.0)
     btn_load = QPushButton("Load external…")
     source_row = QHBoxLayout()
-    source_row.addWidget(QLabel("Type")); source_row.addWidget(cmb_source)
-    source_row.addWidget(QLabel("Seek (s)")); source_row.addWidget(t_seek); source_row.addWidget(btn_load)
+    try:
+        cmb_source.setVisible(False); t_seek.setVisible(False)
+    except Exception:
+        pass
 
     # Replacer
     cmb_repl = QComboBox(); cmb_repl.addItems(["Transparent", "Color", "Blur", "Image"])
@@ -953,6 +1193,7 @@ def install_background_tool(pane, section_widget) -> None:
     btn_color.clicked.connect(pick_color)
 
     lbl_img = QLabel("(none)"); btn_img = QPushButton("Choose image…"); chosen_bg = {"path": None}
+
     def pick_img():
         try:
             file, _ = QFileDialog.getOpenFileName(panel, "Choose background image", "", "Images (*.png *.jpg *.jpeg *.bmp *.webp)")
@@ -1033,22 +1274,136 @@ def install_background_tool(pane, section_widget) -> None:
     btn_reset     = QPushButton("Reset")
     btn_undo      = QPushButton("Undo")
     btn_save      = QPushButton("Save")
-    btns_row = QHBoxLayout(); btns_row.addWidget(btn_use_current); btns_row.addWidget(btn_recompute); btns_row.addWidget(btn_undo); btns_row.addWidget(btn_reset); btns_row.addWidget(btn_save); btns_row.addStretch(1)    # Combined row: Mask overlay + Shadow Opacity (moved here per request)
+    btns_row = QHBoxLayout(); btns_row.addWidget(btn_use_current); btns_row.addWidget(btn_load); btns_row.addWidget(btn_recompute); btns_row.addWidget(btn_undo); btns_row.addWidget(btn_reset); btns_row.addWidget(btn_save); btns_row.addStretch(1); btn_sd_inpaint = QPushButton("Inpaint (SD 1.5)"); btns_row.addWidget(btn_sd_inpaint);    # Combined row: Mask overlay + Shadow Opacity (moved here per request)
     row_overlay_opacity = QHBoxLayout()
     row_overlay_opacity.addWidget(QLabel("Mask overlay")); row_overlay_opacity.addWidget(s_moverlay)
     row_overlay_opacity.addSpacing(12)
     row_overlay_opacity.addWidget(QLabel("Shadow opacity")); row_overlay_opacity.addWidget(s_salpha)
     lay.addRow(row_overlay_opacity)
 
+    # --- Tooltips (defaults in parentheses) ---
+    try:
+        cmb_engine.setToolTip('Segmentation engine used to compute the mask. Auto picks a working model (default: Auto).')
+        cmb_mode.setToolTip('What to output: keep subject, keep background only, or show the alpha mask (default: Keep subject).')
+        btn_use_current.setToolTip('Grab the image or current video frame already loaded in the app and use it here.')
+        cmb_source.setToolTip('Input type for loading from disk (default: Image).')
+        t_seek.setToolTip('Video timestamp to grab a frame when loading a video (default: 0.000 s).')
+        btn_load.setToolTip('Load an external image or video from disk. If video, uses the Seek time.')
+
+        cmb_repl.setToolTip('Background replacement mode: Transparent, Color, Blur, or Image (default: Transparent).')
+        s_blurbg.setToolTip('Blur radius used when replacement mode is Blur (default: 20 px).')
+        btn_color.setToolTip('Pick background color used when mode is Color (default: white #FFFFFF).')
+        color_preview.setToolTip('Current background color (default: white #FFFFFF).')
+        btn_img.setToolTip('Choose an image file used as replacement background.')
+        lbl_img.setToolTip('Selected background image filename (default: none).')
+
+        s_thresh.setToolTip('Hard threshold on the alpha. 0 disables thresholding (default: 0).')
+        s_feath.setToolTip('Feather radius in pixels — softens edges (default: 3 px).')
+        sl_aggr.setToolTip('Removal strength — lower keeps more of the original, higher removes more (default: 50).')
+        cb_spill.setToolTip('Edge de-spill — reduces color contamination near edges (default: enabled).')
+        cb_auto.setToolTip('Auto-level mask — stretches mask contrast to improve edges (default: enabled).')
+        cb_inv.setToolTip('Invert the mask (default: off).')
+        cb_ah.setToolTip('Edge anti-halo — light color decontamination (default: enabled).')
+
+        s_moverlay.setToolTip('Mask overlay opacity on the preview (default: 50%).')
+        cb_shadow.setToolTip('Enable a simple drop shadow under the subject (default: off).')
+        s_salpha.setToolTip('Shadow opacity (default: 120 / 255).')
+        s_sblur.setToolTip('Shadow blur radius (default: 20 px).')
+        s_sox.setToolTip('Shadow X offset in pixels (default: 10). Negative moves left.')
+        s_soy.setToolTip('Shadow Y offset in pixels (default: 10). Negative moves up.')
+
+        le_out.setToolTip('Output folder for saved results.')
+        btn_out_change.setToolTip('Change the output folder and remember it for next time.')
+        btn_out_open.setToolTip('Open the output folder in your file manager.')
+
+        btn_recompute.setToolTip('Recompute the alpha mask using the selected engine.')
+        btn_reset.setToolTip('Reset controls and masks back to defaults.')
+        btn_undo.setToolTip('Undo the last brush stroke or change (where available).')
+        btn_save.setToolTip('Save the current result as a PNG into the output folder.')
+        btn_sd_inpaint.setToolTip('Run Stable Diffusion 1.5 Inpaint over removed areas to fill them realistically.')
+
+        cmb_presets.setToolTip('Saved presets of all controls. Select to apply.')
+        btn_preset_save.setToolTip('Save the current settings as a preset.')
+        btn_preset_del.setToolTip('Delete the selected preset.')
+
+        le_sd_prompt.setToolTip('Positive text prompt describing the desired fill (default: "clean background, realistic").')
+        le_sd_neg.setToolTip('Negative prompt to avoid unwanted artifacts (default: "blurry, artifacts, distortion, text, watermark").')
+        s_sd_steps.setToolTip('Number of diffusion steps (default: 30).')
+        ds_sd_guid.setToolTip('Classifier-free guidance scale — higher follows the prompt more strongly (default: 7.0).')
+        ds_sd_str.setToolTip('Inpaint strength — 0 keeps original, 1 replaces fully (default: 0.85).')
+        s_sd_seed.setToolTip('Random seed; -1 uses a new random seed each run (default: -1).')
+        le_sd_model.setToolTip('Path to sd-v1-5-inpainting model (.safetensors).')
+        btn_sd_browse.setToolTip('Browse for the SD 1.5 inpaint model file.')
+    except Exception:
+        pass
+        try:
+            sd_form.addRow("", chk_sd_auto_bg)
+        except Exception:
+            pass
+
     # Layout wire
-    lay.addRow("Engine", cmb_engine)
+    # moved below: combined Engine + Model row
     lay.addRow("Mode",   cmb_mode)
     # Presets row
     cmb_presets = QComboBox(); btn_preset_save = QPushButton("Save preset"); btn_preset_del = QPushButton("Delete")
-    lay.addRow("Presets", cmb_presets)
-    row_presets = QHBoxLayout(); row_presets.addWidget(btn_preset_save); row_presets.addWidget(btn_preset_del)
-    lay.addRow("", row_presets)
-    lay.addRow(source_row)
+    # (moved) presets row combined below steps/seed
+    # (moved) presets buttons now inline with combo
+    # --- SD Inpaint (SD 1.5) controls ---
+    sd_grp = QWidget(); sd_form = QFormLayout(sd_grp)
+    le_sd_prompt = QLineEdit("clean background, realistic")
+    chk_sd_auto_bg = QCheckBox("Auto apply as background")
+    le_sd_neg    = QLineEdit("blurry, artifacts, distortion, text, watermark")
+    s_sd_steps   = QSpinBox(); s_sd_steps.setRange(1,150); s_sd_steps.setValue(30)
+    ds_sd_guid   = QDoubleSpinBox(); ds_sd_guid.setRange(0.0,30.0); ds_sd_guid.setSingleStep(0.5); ds_sd_guid.setValue(7.0)
+    ds_sd_guid.setToolTip('Guidance (CFG): how strongly the fill follows your prompt. Lower = more natural; higher = more literal (default: 7.0).')
+    ds_sd_str    = QDoubleSpinBox(); ds_sd_str.setRange(0.0,1.0); ds_sd_str.setSingleStep(0.05); ds_sd_str.setValue(0.85)
+    ds_sd_str.setToolTip('Inpaint Strength: 0 keeps more original pixels, 1 replaces fully with generated content (default: 0.85).')
+    s_sd_seed    = QSpinBox(); s_sd_seed.setRange(-1, 2147483647); s_sd_seed.setValue(-1)
+    # Combine Steps+Seed on one line
+    row_steps_seed = QHBoxLayout()
+    row_steps_seed.addWidget(QLabel("Steps")); row_steps_seed.addWidget(s_sd_steps)
+    row_steps_seed.addSpacing(12)
+    row_steps_seed.addWidget(QLabel("Seed")); row_steps_seed.addWidget(s_sd_seed)
+    sd_form.addRow(row_steps_seed)
+
+    # Guidance+Strength combined row (moved above Output area)
+    row_guid_str = QHBoxLayout()
+    row_guid_str.addWidget(QLabel("Guidance")); row_guid_str.addWidget(ds_sd_guid)
+    row_guid_str.addSpacing(12)
+    row_guid_str.addWidget(QLabel("Strength")); row_guid_str.addWidget(ds_sd_str)
+    # We'll insert this container-level row before the Output row later.
+
+    le_sd_model  = QLineEdit(str(_default_sd15_inpaint_model_path())); btn_sd_browse = QPushButton("…")
+    def _browse_sd_model():
+        try:
+            f, _ = QFileDialog.getOpenFileName(panel, "Choose SD1.5 Inpaint model", str(le_sd_model.text()), "Safetensors (*.safetensors)")
+        except Exception:
+            f = ""
+        if f: le_sd_model.setText(f)
+    btn_sd_browse.clicked.connect(_browse_sd_model)
+
+    row_sd_model = QHBoxLayout(); row_sd_model.addWidget(le_sd_model); row_sd_model.addWidget(btn_sd_browse)
+    # Combined Engine + SD Inpaint Model on one line
+    row_engine_model = QHBoxLayout()
+    row_engine_model.addWidget(QLabel("Engine")); row_engine_model.addWidget(cmb_engine)
+    row_engine_model.addSpacing(12)
+    row_engine_model.addWidget(QLabel("Model")); row_engine_model.addLayout(row_sd_model)
+    lay.addRow(row_engine_model)
+
+    sd_form.addRow("Prompt", le_sd_prompt)
+    sd_form.addRow("Negative", le_sd_neg)
+    # moved: Steps sits next to Seed
+    # moved: Guidance sits with Strength above Output
+    # moved: Strength sits with Guidance above Output
+    # moved: Seed sits next to Steps
+    # moved: Model sits on the Engine row
+    lay.addRow(sd_grp)
+
+    # Presets combo + buttons on one line, placed below Steps/Seed
+    row_presets = QHBoxLayout(); row_presets.addWidget(cmb_presets); row_presets.addWidget(btn_preset_save); row_presets.addWidget(btn_preset_del)
+    lay.addRow("Presets", row_presets)
+
+    # hidden: source row (type/seek) removed from UI
     lay.addRow("Background", cmb_repl)
     lay.addRow("Blur amount", s_blurbg)
     lay.addRow("BG color", btn_color); lay.addRow(" ", color_preview)
@@ -1065,7 +1420,8 @@ def install_background_tool(pane, section_widget) -> None:
     vbox.insertLayout(1, btns_row)
     # Move Output path controls directly under the preview (before the main form panel)
     out_line = QHBoxLayout(); out_line.addWidget(QLabel("Output")); out_line.addLayout(out_row)
-    vbox.insertLayout(3, out_line)
+    vbox.insertLayout(3, row_guid_str)
+    vbox.insertLayout(4, out_line)
 
 
     # Mount into CollapsibleSection
@@ -1089,6 +1445,8 @@ def install_background_tool(pane, section_widget) -> None:
     def update_preview_pix(pim: Image.Image):
         pm = QPixmap.fromImage(qimage_from_pil(pim)); preview.setPixmap(pm)
 
+    
+
     def get_params() -> Dict:
         return dict(
             engine={0:"auto",1:"modnet",2:"birefnet"}[cmb_engine.currentIndex()],
@@ -1100,30 +1458,67 @@ def install_background_tool(pane, section_widget) -> None:
             repl_blur=int(s_blurbg.value()), repl_image=chosen_bg["path"],
             drop_shadow=bool(cb_shadow.isChecked()), shadow_alpha=int(s_salpha.value()), shadow_blur=int(s_sblur.value()),
             shadow_offx=int(s_sox.value()), shadow_offy=int(s_soy.value()), anti_halo=bool(cb_ah.isChecked()),
+            overlay=int(s_moverlay.value()),
+            out_dir=le_out.text().strip(),
+            sd_prompt=le_sd_prompt.text().strip(),
+            sd_negative=le_sd_neg.text().strip(),
+            sd_steps=int(s_sd_steps.value()),
+            sd_guidance=float(ds_sd_guid.value()),
+            sd_strength=float(ds_sd_str.value()),
+            sd_seed=int(s_sd_seed.value()),
+            sd_model=le_sd_model.text().strip(),
+            sd_auto_bg=bool(chk_sd_auto_bg.isChecked()),
         )
 
     def set_params(d: Dict):
         nonlocal color_val
-        cmb_engine.setCurrentIndex({"auto":0,"modnet":1,"birefnet":2}[d["engine"]])
-        cmb_mode.setCurrentIndex({"keep_subject":0,"keep_bg":1,"alpha_only":2}[d["mode"]])
-        s_thresh.setValue(int(d["threshold"])); s_feath.setValue(int(d["feather"]))
-        cb_spill.setChecked(bool(d["spill"])); cb_inv.setChecked(bool(d["invert"])); cb_auto.setChecked(bool(d["auto_level"]))
-        cmb_repl.setCurrentIndex({"transparent":0,"color":1,"blur":2,"image":3}[d["repl_mode"]])
-        r,g,b = d["repl_color"]; color_val = QColor(r,g,b); color_preview.setStyleSheet(f"color: rgb({r},{g},{b}); font-size:18px;")
-        s_blurbg.setValue(int(d["repl_blur"]))
-        chosen_bg["path"] = d["repl_image"]; lbl_img.setText(Path(d["repl_image"]).name if d["repl_image"] else "(none)")
-        cb_shadow.setChecked(bool(d["drop_shadow"])); s_salpha.setValue(int(d["shadow_alpha"])); s_sblur.setValue(int(d["shadow_blur"]))
-        s_sox.setValue(int(d["shadow_offx"])); s_soy.setValue(int(d["shadow_offy"])); cb_ah.setChecked(bool(d["anti_halo"]))
+        cmb_engine.setCurrentIndex({"auto":0,"modnet":1,"birefnet":2}.get(d.get("engine","auto"),0))
+        cmb_mode.setCurrentIndex({"keep_subject":0,"keep_bg":1,"alpha_only":2}.get(d.get("mode","keep_subject"),0))
+        s_thresh.setValue(int(d.get("threshold",0))); s_feath.setValue(int(d.get("feather",3)))
+        cb_spill.setChecked(bool(d.get("spill",True))); cb_inv.setChecked(bool(d.get("invert",False))); cb_auto.setChecked(bool(d.get("auto_level",True)))
+        cmb_repl.setCurrentIndex({"transparent":0,"color":1,"blur":2,"image":3}.get(d.get("repl_mode","transparent"),0))
+        r,g,b = d.get("repl_color",(255,255,255)); color_val = QColor(int(r),int(g),int(b)); color_preview.setStyleSheet(f"color: rgb({int(r)},{int(g)},{int(b)}); font-size:18px;")
+        s_blurbg.setValue(int(d.get("repl_blur",20)))
+        chosen_bg["path"] = d.get("repl_image"); lbl_img.setText(Path(d.get("repl_image")).name if d.get("repl_image") else "(none)")
+        cb_shadow.setChecked(bool(d.get("drop_shadow",False))); s_salpha.setValue(int(d.get("shadow_alpha",120))); s_sblur.setValue(int(d.get("shadow_blur",20)))
+        s_sox.setValue(int(d.get("shadow_offx",10))); s_soy.setValue(int(d.get("shadow_offy",10))); cb_ah.setChecked(bool(d.get("anti_halo",True)))
         try: sl_aggr.setValue(int(d.get("bias", 50)))
         except Exception: pass
+        try: s_moverlay.setValue(int(d.get("overlay", 50))); preview.setOverlayOpacity(s_moverlay.value()/100.0)
+        except Exception: pass
+        # SD fields
+        try: le_sd_prompt.setText(str(d.get("sd_prompt","clean background, realistic")))
+        except Exception: pass
+        try: le_sd_neg.setText(str(d.get("sd_negative","blurry, artifacts, distortion, text, watermark")))
+        except Exception: pass
+        try: s_sd_steps.setValue(int(d.get("sd_steps",30)))
+        except Exception: pass
+        try: ds_sd_guid.setValue(float(d.get("sd_guidance",7.0)))
+        except Exception: pass
+        try: ds_sd_str.setValue(float(d.get("sd_strength",0.85)))
+        except Exception: pass
+        try: s_sd_seed.setValue(int(d.get("sd_seed",-1)))
+        except Exception: pass
+        try: le_sd_model.setText(str(d.get("sd_model", le_sd_model.text())))
+        except Exception: pass
+        try: chk_sd_auto_bg.setChecked(bool(d.get("sd_auto_bg", False)))
+        except Exception: pass
+        # out dir
+        try:
+            txt = d.get("out_dir")
+            if txt:
+                le_out.setText(str(txt))
+        except Exception:
+            pass
 
     def defaults() -> Dict:
         return dict(engine="auto", mode="keep_subject", threshold=0, feather=3, bias=50, spill=True, invert=False, auto_level=True,
                     repl_mode="transparent", repl_color=(255,255,255), repl_blur=20, repl_image=None,
-                    drop_shadow=False, shadow_alpha=120, shadow_blur=20, shadow_offx=10, shadow_offy=10, anti_halo=True)
+                    drop_shadow=False, shadow_alpha=120, shadow_blur=20, shadow_offx=10, shadow_offy=10, anti_halo=True,
+                    sd_prompt="clean background, realistic", sd_negative="blurry, artifacts, distortion, text, watermark",
+                    sd_steps=30, sd_guidance=7.0, sd_strength=0.85, sd_seed=-1, sd_model=str(_default_sd15_inpaint_model_path()),
+                sd_auto_bg=False, overlay=50, out_dir=str(_get_out_dir_pref()))
 
-
-    # --- Presets ---
     def _load_presets_list():
         d = _load_prefs(); return d.get("bg_presets", [])
     def _save_presets_list(lst):
@@ -1182,6 +1577,9 @@ def install_background_tool(pane, section_widget) -> None:
             except Exception:
                 rm = preview.export_mask_to_image_size(w, h)
                 km = None
+            # Ensure masks match image size
+            rm = _ensure_mask_hw(rm, h, w)
+            km = _ensure_mask_hw(km, h, w)
             if rm is not None:
                 a_eff = a_eff * (1.0 - (rm > 0.01).astype(a_eff.dtype))
             if km is not None:
@@ -1446,6 +1844,73 @@ def install_background_tool(pane, section_widget) -> None:
             try: QMessageBox.critical(panel, "Save error", str(e))
             except Exception: print("Save error:", e)
     btn_save.clicked.connect(on_save)
+    # --- Inpaint (SD 1.5) ---
+    def on_inpaint_sd15():
+        nonlocal current_rgb
+        if current_rgb is None:
+            try: QMessageBox.information(panel, "Info", "Load or use current image first."); return
+            except Exception: return
+        if not _sd15_inpaint_available():
+            try: QMessageBox.critical(panel, "SD Inpaint", "Missing deps: please install torch, diffusers, transformers, accelerate, safetensors."); return
+            except Exception: return
+        try:
+            h, w = current_rgb.shape[:2]
+            # build removal mask from preview (left-drawn 'remove' mask)
+            rm, km = None, None
+            try:
+                rm, km = preview.export_masks_to_image_size(w, h)
+            except Exception:
+                rm = preview.export_mask_to_image_size(w, h); km = None
+            # Ensure masks match image size
+            rm = _ensure_mask_hw(rm, h, w)
+            km = _ensure_mask_hw(km, h, w)
+            if rm is None or (rm <= 0.01).sum() == (rm.size):
+                if current_alpha is None:
+                    try: QMessageBox.information(panel, "Mask", "Paint an area to remove with the brush (left click)."); return
+                    except Exception: return
+                rm = (current_alpha < 0.5).astype(np.float32)
+            if km is not None:
+                rm = np.clip(rm - (km > 0.01).astype(np.float32), 0.0, 1.0)
+
+            out_img = inpaint_sd15(
+                current_rgb,
+                remove_mask01=rm,
+                prompt=le_sd_prompt.text().strip(),
+                negative_prompt=le_sd_neg.text().strip(),
+                steps=int(s_sd_steps.value()),
+                guidance=float(ds_sd_guid.value()),
+                strength=float(ds_sd_str.value()),
+                seed=int(s_sd_seed.value()),
+                model_path=_resolve_inpaint_model_path(le_sd_model.text().strip()),
+            )
+            update_preview_pix(out_img.convert("RGBA"))
+            try:
+                tmp_path = OUT_TEMP / f"inpaint_bg_{os.getpid()}_{int(time.time())}.png"
+                out_img.save(tmp_path)
+                # Persist the path, update label
+                chosen_bg["path"] = str(tmp_path)
+                try:
+                    lbl_img.setText(tmp_path.name)
+                except Exception:
+                    pass
+                # Only auto-switch Replacer → Image if user opted in
+                try:
+                    if chk_sd_auto_bg.isChecked():
+                        cmb_repl.setCurrentIndex(3)
+                except Exception:
+                    pass
+            except Exception:
+                pass
+            schedule_update()
+        except Exception as e:
+            try: QMessageBox.critical(panel, "Inpaint error", str(e))
+            except Exception: print("Inpaint error:", e)
+
+    try:
+        btn_sd_inpaint.clicked.connect(on_inpaint_sd15)
+    except Exception:
+        pass
+
 
     # Hand layout back to section
     # section_widget.setContentLayout(vbox) was called above.
