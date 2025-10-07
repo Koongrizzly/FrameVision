@@ -328,7 +328,28 @@ class InterpPane(QWidget):
             "4 — High quality (heavier)",
             "5 — Superfast (default)",
         ])
-        self.combo_speed.setCurrentIndex(4)
+        # Hide the Superfast (default) option from the dropdown while keeping it in the model
+        try:
+            # Primary: hide via Qt.UserRole - 1 trick (removes from the popup list)
+            self.combo_speed.setItemData(4, 0, Qt.UserRole - 1)
+            # Fallback: also give it zero height so it won't appear in stubborn styles
+            from PySide6.QtCore import QSize as _QSize
+            self.combo_speed.setItemData(4, _QSize(0, 0), Qt.SizeHintRole)
+            # Safety: if model is QStandardItemModel, disable + unselectable
+            m = self.combo_speed.model()
+            if hasattr(m, "item"):
+                it = m.item(4)
+                if it is not None:
+                    it.setEnabled(False)
+                    it.setSelectable(False)
+        except Exception:
+            pass
+        # Hide the Superfast (default) option from the dropdown while keeping it in the model
+        try:
+            self.combo_speed.setItemData(4, 0, int(Qt.UserRole) - 1)
+        except Exception:
+            pass
+        self.combo_speed.setCurrentIndex(2)
         sp.addWidget(QLabel("Load profile:")); sp.addWidget(self.combo_speed)
         self.cb_speed_default = QCheckBox("Default"); self.cb_speed_default.setChecked(False)
         sp.addStretch(1); lay.addLayout(sp)
@@ -393,11 +414,11 @@ class InterpPane(QWidget):
         self.lbl_mult.setToolTip("Current multiplier applied to input FPS.")
         self.btn_2x.setToolTip("Set multiplier to 2×."); self.btn_4x.setToolTip("Set multiplier to 4×.")
         self.cb_stream.setToolTip("Low‑memory streaming path (for the ONNX backend).")
-        self.combo_speed.setToolTip("Processing profile for FFmpeg path. Select 'Superfast' to use the NCNN engine in the foreground with real progress.")
+        self.combo_speed.setToolTip("Processing profile for FFmpeg path.")
         self.cb_speed_default.setToolTip("Reset to a safe default (Balanced).")
-        self.combo_model.setToolTip("RIFE model (used by the Superfast NCNN path).")
+        self.combo_model.setToolTip("RIFE model (used by the NCNN path).")
         self.btn_model_install.setToolTip("Extract engine & models from assets/rife.zip if needed.")
-        self.btn_start.setToolTip("Add to Queue (or run Superfast immediately if profile 5 is selected).")
+        self.btn_start.setToolTip("Add to Queue.")
         self.btn_batch.setToolTip("Batch: Add files or a folder. Duplicate handling: Skip / Overwrite / Auto rename.")
         self.btn_open_folder.setToolTip("Open the folder where RIFE outputs are saved.")
 
@@ -556,7 +577,7 @@ class InterpPane(QWidget):
         s=self.settings
         self.slider.setValue(int(s.value("rife/multiplier", 200)))
         self.cb_stream.setChecked(bool(int(s.value("rife/streaming", 0))))
-        self.combo_speed.setCurrentIndex(int(s.value("rife/speed_idx", 4)))
+        self.combo_speed.setCurrentIndex(int(s.value("rife/speed_idx", 2)))
         self.cb_speed_default.setChecked(bool(int(s.value("rife/speed_default", 0))))
         model_key = s.value("rife/model_key", "rife-UHD")
         self._set_model_ui(model_key)
@@ -567,16 +588,16 @@ class InterpPane(QWidget):
         except Exception:
             cur_idx = -1
         model_key_cur = s.value("rife/model_key", "")
-        if not migrated_v3 and (cur_idx in (-1, 0) or model_key_cur in ("", "rife", "rife-v4")):
-            self.combo_speed.setCurrentIndex(4)
-            s.setValue("rife/speed_idx", 4)
-            s.setValue("rife/model_key", "rife-UHD")
-            self._set_model_ui("rife-UHD")
+        # Normalize any previous Superfast selection to Balanced since Superfast is now hidden
+        if not migrated_v3 and cur_idx == 4:
+            self.combo_speed.setCurrentIndex(2)
+            s.setValue("rife/speed_idx", 2)
             s.setValue("rife/migrated_superfast_default_v3", 1)
         # Unblock signals
         self.combo_speed.blockSignals(False)
         self.cb_speed_default.blockSignals(False)
         self.combo_model.blockSignals(False)
+
 
 
 
