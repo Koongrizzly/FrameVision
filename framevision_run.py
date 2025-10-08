@@ -26,6 +26,52 @@ except Exception:
 # --- end quiet block ---
 
 
+# --- FrameVision: global warnings/verbosity quiet patch ---
+# Set env + filters BEFORE importing torch/transformers/diffusers
+try:
+    import os as _os, warnings as _warnings
+    # Environment toggles
+    _os.environ.setdefault("PYTORCH_ENABLE_FLASH_SDP", "0")  # force non-flash SDPA globally
+    _os.environ.setdefault("HF_HUB_DISABLE_PROGRESS_BARS", "1")
+    _os.environ.setdefault("BITSANDBYTES_NOWELCOME", "1")
+    _os.environ.setdefault("HF_HUB_DISABLE_TELEMETRY", "1")
+    # Warning filters
+    _warnings.filterwarnings(
+        "ignore",
+        message=r".*not compiled with flash attention.*",
+        category=UserWarning,
+        module=r"transformers\.integrations\.sdpa_attention",
+    )
+    _warnings.filterwarnings(
+        "ignore",
+        message=r".*`callback`.*deprecated.*",
+        category=FutureWarning,
+        module=r"diffusers\..*",
+    )
+    _warnings.filterwarnings(
+        "ignore",
+        message=r".*`callback_steps`.*deprecated.*",
+        category=FutureWarning,
+        module=r"diffusers\..*",
+    )
+    # Quiet HF loggers
+    try:
+        from transformers.utils import logging as _hf_logging
+        _hf_logging.set_verbosity_error()
+    except Exception:
+        pass
+    try:
+        from diffusers.utils import logging as _df_logging
+        _df_logging.set_verbosity_error()
+    except Exception:
+        pass
+except Exception:
+    pass
+# --- end warnings quiet patch ---
+
+
+
+
 import sys
 from PySide6.QtWidgets import QApplication
 from PySide6 import QtCore
