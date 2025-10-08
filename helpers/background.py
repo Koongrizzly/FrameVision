@@ -777,10 +777,75 @@ def install_background_tool(pane, section_widget) -> None:
 
     # --- Preview canvas at the TOP ---
     class Preview(QWidget):
-        maskChanged = Signal()
-        fileDropped = Signal(str)
+        def setLockImageSize(self, on: bool):
+            """When enabled, masks keep their size even if the source image size changes."""
+            self._lock_image_size = bool(on)
+            try:
+                self.setFocus(Qt.OtherFocusReason)
+            except Exception:
+                pass
+
+        def _clone_qimage(self, qimg):
+            try:
+                return qimg.copy()
+            except Exception:
+                return qimg
+
+        def _push_undo_snapshot(self):
+            try:
+                if self._mask is None or self._mask.isNull():
+                    return
+                m1 = self._clone_qimage(self._mask)
+                m2 = self._clone_qimage(self._mask_keep)
+                self._undo_stack.append((m1, m2))
+                if len(self._undo_stack) > 50:
+                    self._undo_stack.pop(0)
+                self._redo_stack.clear()
+            except Exception:
+                pass
+
+        def undo(self):
+            try:
+                if not self._undo_stack:
+                    return
+                cur_m = self._clone_qimage(self._mask)
+                cur_k = self._clone_qimage(self._mask_keep)
+                m1, m2 = self._undo_stack.pop()
+                self._redo_stack.append((cur_m, cur_k))
+                self._mask = m1; self._mask_keep = m2
+                self.maskChanged.emit(); self.update()
+            except Exception:
+                pass
+
+        def redo(self):
+            try:
+                if not self._redo_stack:
+                    return
+                cur_m = self._clone_qimage(self._mask)
+                cur_k = self._clone_qimage(self._mask_keep)
+                m1, m2 = self._redo_stack.pop()
+                self._undo_stack.append((cur_m, cur_k))
+                self._mask = m1; self._mask_keep = m2
+                self.maskChanged.emit(); self.update()
+            except Exception:
+                pass
+
         def __init__(self):
             super().__init__()
+
+            # Enable keyboard focus (for Ctrl+Z / Ctrl+Y)
+            try:
+                self.setFocusPolicy(Qt.StrongFocus)
+            except Exception:
+                pass
+
+            # State
+            self._lock_image_size = False  # when True, masks don't resize if source image changes
+            self._undo_stack = []          # list of (mask, mask_keep) QImages
+            self._redo_stack = []
+            self._stroke_active = False    # true while drawing; snapshot taken at press
+            self._cursor_pos = None        # for brush outline
+
             self.setMinimumHeight(270)
             self._pix = QPixmap()
             self._bg = self._make_checker()
@@ -828,6 +893,30 @@ def install_background_tool(pane, section_widget) -> None:
             self._btn_brush.setChecked(True)
             self._btn_brush.clicked.connect(lambda: self._select_tool('brush'))
             self._btn_zoom.clicked.connect(lambda: self._select_tool('zoom'))
+
+            # Small Undo / Redo buttons near tool icons
+            self._btn_undo_small = QPushButton('↶', self)
+            self._btn_redo_small = QPushButton('↷', self)
+            for b in (self._btn_undo_small, self._btn_redo_small):
+                b.setFixedSize(36, 36)
+                b.setCursor(Qt.PointingHandCursor)
+                b.setStyleSheet(
+                    'QPushButton { background: rgba(0,0,0,128); border-radius:8px; color:white; font-size:18px; }'
+                    'QPushButton:pressed { background: rgba(0,0,0,160); }'
+                )
+            try:
+                self._btn_undo_small.move(88, 8)
+                self._btn_redo_small.move(128, 8)
+            except Exception:
+                pass
+            try:
+                self._btn_undo_small.setToolTip('Undo (Ctrl+Z)')
+                self._btn_redo_small.setToolTip('Redo (Ctrl+Y)')
+            except Exception:
+                pass
+            self._btn_undo_small.clicked.connect(lambda: self.undo())
+            self._btn_redo_small.clicked.connect(lambda: self.redo())
+
             # --- Tooltips for preview & tools ---
             try:
                 self._btn_brush.setToolTip('Brush tool — left-drag = remove (make transparent), right-drag = keep. Mouse wheel changes brush size. Default radius: 20px.')
@@ -893,17 +982,23 @@ def install_background_tool(pane, section_widget) -> None:
                     self.setImageSize(w, h)  # allocates blank masks intentionally
                 else:
                     # If size changed, resample masks to new size to preserve strokes
+                    
                     if (w != self._img_w) or (h != self._img_h):
-                        from PySide6.QtCore import Qt as _Qt
-                        try:
-                            self._mask = self._mask.scaled(w, h, _Qt.IgnoreAspectRatio, _Qt.FastTransformation)
-                        except Exception:
-                            self._mask = self._mask.scaled(w, h)
-                        try:
-                            self._mask_keep = self._mask_keep.scaled(w, h, _Qt.IgnoreAspectRatio, _Qt.FastTransformation)
-                        except Exception:
-                            self._mask_keep = self._mask_keep.scaled(w, h)
-                        self._img_w, self._img_h = w, h
+                        if not getattr(self, "_lock_image_size", False):
+                            from PySide6.QtCore import Qt as _Qt
+                            try:
+                                self._mask = self._mask.scaled(w, h, _Qt.IgnoreAspectRatio, _Qt.FastTransformation)
+                            except Exception:
+                                self._mask = self._mask.scaled(w, h)
+                            try:
+                                self._mask_keep = self._mask_keep.scaled(w, h, _Qt.IgnoreAspectRatio, _Qt.FastTransformation)
+                            except Exception:
+                                self._mask_keep = self._mask_keep.scaled(w, h)
+                            self._img_w, self._img_h = w, h
+                        else:
+                            # Lock enabled: keep existing mask size; do not change _img_w/_img_h
+                            pass
+
                 # Otherwise: same size -> keep masks as-is
             except Exception:
                 pass
@@ -950,6 +1045,9 @@ def install_background_tool(pane, section_widget) -> None:
                 self.update()
 
         def mousePressEvent(self, e):
+            try: self.setFocus(Qt.MouseFocusReason)
+            except Exception: pass
+
             if self._tool == 'brush' and e.button() == Qt.LeftButton:
                             try:
                                 pth = chosen_bg.get('path') if isinstance(chosen_bg, dict) else None
@@ -968,7 +1066,7 @@ def install_background_tool(pane, section_widget) -> None:
                                         pass
                             except Exception:
                                 pass
-                            self._paint_at(e.position() if hasattr(e, 'position') else e.pos())
+                            _tmp = (not self._stroke_active and self._push_undo_snapshot()); self._stroke_active = True; self._paint_at(e.position() if hasattr(e, 'position') else e.pos())
             elif self._tool == 'brush' and e.button() == Qt.RightButton:
                             try:
                                 pth = chosen_bg.get('path') if isinstance(chosen_bg, dict) else None
@@ -987,15 +1085,18 @@ def install_background_tool(pane, section_widget) -> None:
                                         pass
                             except Exception:
                                 pass
-                            self._paint_keep_at(e.position() if hasattr(e, 'position') else e.pos())
+                            _tmp = (not self._stroke_active and self._push_undo_snapshot()); self._stroke_active = True; self._paint_keep_at(e.position() if hasattr(e, 'position') else e.pos())
             elif self._tool == 'zoom' and e.button() == Qt.LeftButton:
                 self._drag_origin = ((e.position().x() if hasattr(e, 'position') else e.x()), (e.position().y() if hasattr(e, 'position') else e.y()))
                 self.setCursor(Qt.ClosedHandCursor)
         def mouseMoveEvent(self, e):
+            try: self._cursor_pos = (e.position().x() if hasattr(e,'position') else e.x(), e.position().y() if hasattr(e,'position') else e.y())
+            except Exception: pass
+
             if self._tool == 'brush' and (e.buttons() & Qt.LeftButton):
-                self._paint_at(e.position() if hasattr(e, 'position') else e.pos())
+                _tmp = (not self._stroke_active and self._push_undo_snapshot()); self._stroke_active = True; self._paint_at(e.position() if hasattr(e, 'position') else e.pos())
             if self._tool == 'brush' and (e.buttons() & Qt.RightButton):
-                self._paint_keep_at(e.position() if hasattr(e, 'position') else e.pos())
+                _tmp = (not self._stroke_active and self._push_undo_snapshot()); self._stroke_active = True; self._paint_keep_at(e.position() if hasattr(e, 'position') else e.pos())
             if self._tool == 'zoom' and (e.buttons() & Qt.LeftButton) and self._drag_origin is not None:
                 dx = (e.position().x() if hasattr(e, 'position') else e.x()) - self._drag_origin[0]
                 dy = (e.position().y() if hasattr(e, 'position') else e.y()) - self._drag_origin[1]
@@ -1013,10 +1114,31 @@ def install_background_tool(pane, section_widget) -> None:
 
         
         def mouseReleaseEvent(self, e):
-            if self._tool == 'zoom' and e.button() == Qt.LeftButton:
-                self._drag_origin = None
-                self.setCursor(Qt.ArrowCursor)
+            # End brush stroke and reset zoom drag
+            try:
+                if self._tool == 'brush' and e.button() in (Qt.LeftButton, Qt.RightButton):
+                    self._stroke_active = False
+            except Exception:
+                pass
+            try:
+                if self._tool == 'zoom' and e.button() == Qt.LeftButton:
+                    self._drag_origin = None
+                    self.setCursor(Qt.ArrowCursor)
+            except Exception:
+                pass
             return super().mouseReleaseEvent(e)
+        def keyPressEvent(self, e):
+            try:
+                if (e.modifiers() & Qt.ControlModifier) and getattr(e, 'key', lambda: None)() == Qt.Key_Z:
+                    self.undo(); return
+                if (e.modifiers() & Qt.ControlModifier) and getattr(e, 'key', lambda: None)() == Qt.Key_Y:
+                    self.redo(); return
+            except Exception:
+                pass
+            try:
+                super().keyPressEvent(e)
+            except Exception:
+                pass
         def _paint_at(self, pos):
             from PySide6.QtGui import QPainter
             from PySide6.QtCore import QPointF
@@ -1166,6 +1288,40 @@ def install_background_tool(pane, section_widget) -> None:
                         p.setCompositionMode(old_mode)
                 except Exception:
                     pass
+            
+            # --- Brush outline + live radius label ---
+            try:
+                if self._tool == 'brush' and self._draw_rect and self._cursor_pos is not None:
+                    cx, cy = int(self._cursor_pos[0]), int(self._cursor_pos[1])
+                    x0, y0, w, h = self._draw_rect
+                    if (x0 <= cx <= x0 + w) and (y0 <= cy <= y0 + h):
+                        r_disp = int(max(1, self._brush_radius))
+                        from PySide6.QtGui import QPen
+                        pen1 = QPen(QColor(0,0,0,160)); pen1.setWidth(3)
+                        pen2 = QPen(QColor(255,255,255,220)); pen2.setWidth(1)
+                        p.setPen(pen1); p.setBrush(Qt.NoBrush)
+                        p.drawEllipse(cx - r_disp, cy - r_disp, 2*r_disp, 2*r_disp)
+                        p.setPen(pen2)
+                        p.drawEllipse(cx - r_disp, cy - r_disp, 2*r_disp, 2*r_disp)
+                        # Label text
+                        try:
+                            rad_img = int(round(self._brush_radius * (self._img_w / max(1.0, float(w)))))
+                        except Exception:
+                            rad_img = r_disp
+                        txt = f"{rad_img} px"
+                        fm = p.fontMetrics()
+                        tw = fm.horizontalAdvance(txt) + 8
+                        th = fm.height() + 4
+                        tx = cx + r_disp + 8
+                        ty = cy - r_disp - th - 6
+                        tx = min(max(4, tx), self.width() - tw - 4)
+                        ty = min(max(4, ty), self.height() - th - 4)
+                        p.setBrush(QColor(0,0,0,160)); p.setPen(Qt.NoPen)
+                        p.drawRoundedRect(tx, ty, tw, th, 6, 6)
+                        p.setPen(QColor(255,255,255,230)); p.drawText(tx+4, ty+th-6, txt)
+            except Exception:
+                pass
+
             p.end()
 
 
@@ -1245,6 +1401,11 @@ def install_background_tool(pane, section_widget) -> None:
     cb_auto  = QCheckBox("Auto-level mask"); cb_auto.setChecked(True)
     cb_inv   = QCheckBox("Invert mask"); cb_inv.setChecked(False)
     cb_ah    = QCheckBox("Edge anti-halo"); cb_ah.setChecked(True)
+    cb_locksize = QCheckBox("Lock image size"); cb_locksize.setChecked(False)
+    try:
+        cb_locksize.toggled.connect(lambda v: preview.setLockImageSize(v))
+    except Exception:
+        pass
 
     # Mask overlay
     s_moverlay = QSpinBox(); s_moverlay.setRange(0,100); s_moverlay.setValue(50)
@@ -1293,6 +1454,10 @@ def install_background_tool(pane, section_widget) -> None:
     btn_recompute = QPushButton("Recompute")
     btn_reset     = QPushButton("Reset")
     btn_undo      = QPushButton("Undo")
+    try:
+        btn_undo.clicked.connect(lambda: preview.undo())
+    except Exception:
+        pass
     btn_save      = QPushButton("Save")
     btns_row = QHBoxLayout(); btns_row.addWidget(btn_use_current); btns_row.addWidget(btn_load); btns_row.addWidget(btn_recompute); btns_row.addWidget(btn_undo); btns_row.addWidget(btn_reset); btns_row.addWidget(btn_save); btns_row.addStretch(1); btn_sd_inpaint = QPushButton("Inpaint (SD 1.5)"); btns_row.addWidget(btn_sd_inpaint);    # Combined row: Mask overlay + Shadow Opacity (moved here per request)
     row_overlay_opacity = QHBoxLayout()
@@ -1300,6 +1465,7 @@ def install_background_tool(pane, section_widget) -> None:
     row_overlay_opacity.addSpacing(12)
     row_overlay_opacity.addWidget(QLabel("Shadow opacity")); row_overlay_opacity.addWidget(s_salpha)
     lay.addRow(row_overlay_opacity)
+    lay.addRow("Lock image size", cb_locksize)
 
     # --- Tooltips (defaults in parentheses) ---
     try:
