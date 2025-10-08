@@ -777,6 +777,9 @@ def install_background_tool(pane, section_widget) -> None:
 
     # --- Preview canvas at the TOP ---
     class Preview(QWidget):
+
+        maskChanged = Signal()
+        fileDropped = Signal(str)
         def setLockImageSize(self, on: bool):
             """When enabled, masks keep their size even if the source image size changes."""
             self._lock_image_size = bool(on)
