@@ -445,7 +445,7 @@ class _BackupWorker(QThread):
             with _zipfile.ZipFile(out, "w", compression=_zipfile.ZIP_STORED, allowZip64=True) as zf:
                 for i, (p, rel) in enumerate(files, start=1):
                     zf.write(p, arcname=str(rel))
-                    if i == total or (i % 200 == 0):
+                    if i == total or (i % 50 == 0):
                         self.prog.emit(i, total)
             self.ok.emit(str(out))
         except Exception:
