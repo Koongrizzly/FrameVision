@@ -1,4 +1,5 @@
 from __future__ import annotations
+import os
 
 import json
 from pathlib import Path
@@ -792,6 +793,23 @@ class JobRowWidget(QWidget):
 
         # Informative subtitle for other states
         parts = []
+        # sampler / steps / model (basename)
+        try:
+            smp = (args.get("sampler") or "").strip()
+            stp = args.get("steps")
+            mdl = (d.get("model") or d.get("model_name") or args.get("model") or args.get("ai_model") or args.get("model_path"))
+            mdl = os.path.basename(str(mdl)) if mdl else None
+            if smp:
+                parts.append(str(smp))
+            try:
+                if stp: parts.append(f"{int(stp)} steps")
+            except Exception:
+                pass
+            if mdl:
+                parts.append(str(mdl))
+        except Exception:
+            pass
+
 
         src = d.get("input") or args.get("infile") or args.get("input")
         if src:

@@ -681,40 +681,27 @@ def upscale_photo(job, cfg, mani):
 
 
 def txt2img_generate(job, cfg, mani):
-    print("[worker] txt2img (offline): start")
+    # Offline txt2img using local diffusers pipeline
     try:
-        from pathlib import Path as _P
-        import time, json, base64, importlib, io
-        out_dir = _P(job.get("out_dir","") or "."); out_dir.mkdir(parents=True, exist_ok=True)
+        import importlib, time
+        from pathlib import Path as P
+
         args = job.get("args") or {}
-
-        # Title for visibility
-        try: job['title'] = (args.get('label') or 'txt2img')
-        except Exception: pass
-
-        # Lazy imports for offline backend
         try:
-            torch = importlib.import_module("torch")
-            from diffusers import StableDiffusionPipeline, StableDiffusionXLPipeline, EulerAncestralDiscreteScheduler, DPMSolverMultistepScheduler, HeunDiscreteScheduler, UniPCMultistepScheduler, DDIMScheduler
-            from PIL import Image as _PIL_Image
-        except Exception as e:
-            _mark_error(job, f"Offline txt2img requires diffusers + torch: {e}")
-            return 2
-
-        # Resolve model path with defaults similar to UI
-        root = _P(__file__).resolve().parent.parent
-        default_model = root / "models" / "SD15" / "DreamShaper_8_pruned.safetensors"
-        cand = args.get("model_path") or os.environ.get("FRAMEVISION_DIFFUSERS_MODEL") or ""
-        _cand_norm = str(_P(cand)) if str(cand).strip() != "" else str(default_model)
-        try:
-            p = _P(_cand_norm)
-            if _cand_norm in ("", ".", "./") or (p.exists() and p.is_dir()) or (not p.exists()) or (p.exists() and not _cand_norm.lower().endswith(".safetensors")):
-                _cand_norm = str(default_model)
+            job["title"] = args.get("label") or (args.get("prompt","")[:80] or "txt2img")
         except Exception:
-            _cand_norm = str(default_model)
-        model_path = _cand_norm
+            pass
 
-        # Basic params
+        out_dir = P(job.get("out_dir") or "."); out_dir.mkdir(parents=True, exist_ok=True)
+
+        # Lazy import torch/diffusers so worker can start even if not installed
+        torch = importlib.import_module("torch")
+        from diffusers import (
+            StableDiffusionPipeline, StableDiffusionXLPipeline,
+            EulerAncestralDiscreteScheduler, DPMSolverMultistepScheduler,
+            HeunDiscreteScheduler, UniPCMultistepScheduler, DDIMScheduler
+        )
+
         prompt   = args.get("prompt","") or ""
         negative = args.get("negative","") or ""
         steps    = int(args.get("steps") or 30)
@@ -724,15 +711,20 @@ def txt2img_generate(job, cfg, mani):
         height   = int(args.get("height") or 1024)
         cfg_scale= float(args.get("cfg_scale") or 7.5)
         sampler  = (args.get("sampler") or "").strip().lower()
-        fmt      = (args.get("format") or "png").lower()
-        fname_tmpl = args.get("filename_template") or f"sd_{{seed}}_{{idx:03d}}.{fmt}"
         attn_slice = bool(args.get("attn_slicing"))
+        fmt      = (args.get("format") or "png").lower()
+        name_tmpl= args.get("filename_template") or f"sd_{{seed}}_{{idx:03d}}.{fmt}"
 
-        # Device / dtype
+        ROOT = P(__file__).resolve().parent.parent
+        default_model = ROOT / "models" / "SD15" / "DreamShaper_8_pruned.safetensors"
+        model_path = args.get("model_path") or str(default_model)
+        mp = P(model_path)
+        if not mp.exists():
+            model_path = str(default_model)
+
         device = "cuda" if getattr(torch.cuda, "is_available", lambda: False)() else "cpu"
         dtype  = torch.float16 if device == "cuda" else torch.float32
 
-        # Load pipeline (tries SDXL if name hints it; else SD1.5 single file)
         is_sdxl = ("sdxl" in model_path.lower()) or ("sd_xl" in model_path.lower())
         try:
             if is_sdxl:
@@ -743,54 +735,43 @@ def txt2img_generate(job, cfg, mani):
             else:
                 pipe = StableDiffusionPipeline.from_single_file(model_path, torch_dtype=dtype, local_files_only=True)
         except Exception as e:
-            _mark_error(job, f"Could not load model: {e}")
+            _mark_error(job, f"Model load failed: {e}")
             return 2
 
         try: pipe = pipe.to(device)
         except Exception: pass
 
-        # Scheduler mapping
         try:
-            name = (sampler or "").lower()
             sched_map = {
-                "euler a": lambda cfg: EulerAncestralDiscreteScheduler.from_config(cfg),
-                "dpm++ 2m": lambda cfg: DPMSolverMultistepScheduler.from_config(cfg),
-                "heun": lambda cfg: HeunDiscreteScheduler.from_config(cfg),
-                "unipc": lambda cfg: UniPCMultistepScheduler.from_config(cfg),
-                "ddim": lambda cfg: DDIMScheduler.from_config(cfg),
+                "euler a": EulerAncestralDiscreteScheduler,
+                "dpm++ 2m": DPMSolverMultistepScheduler,
+                "heun": HeunDiscreteScheduler,
+                "unipc": UniPCMultistepScheduler,
+                "ddim": DDIMScheduler,
             }
-            if name in sched_map:
-                pipe.scheduler = sched_map[name](pipe.scheduler.config)
+            if sampler in sched_map:
+                pipe.scheduler = sched_map[sampler].from_config(pipe.scheduler.config)
         except Exception:
             pass
 
-        # Disable safety checker for local/offline
         try:
             if hasattr(pipe, "safety_checker") and pipe.safety_checker is not None:
                 pipe.safety_checker = (lambda images, **kwargs: (images, [False]*len(images)))
-            if hasattr(pipe, "requires_safety_checker"):
-                pipe.requires_safety_checker = False
-        except Exception:
-            pass
-
-        # Memory / speed
-        try:
             if attn_slice and hasattr(pipe, "enable_attention_slicing"):
                 pipe.enable_attention_slicing()
         except Exception:
             pass
 
-        # Seeds
-        seed_policy = (args.get("seed_policy") or "fixed").lower()
-        if seed_policy == "increment":
-            seeds = [int(seed) + i for i in range(max(1,batch))]
-        elif seed_policy == "random":
-            import random as _random, time as _time
-            rng = _random.Random(seed if seed else int(_time.time()))
-            seeds = [rng.randint(0, 2_147_483_647) for _ in range(max(1,batch))]
+        sp = (args.get("seed_policy") or "fixed").lower()
+        if sp == "increment":
+            seeds = [seed + i for i in range(max(1, batch))]
+        elif sp == "random":
+            import random
+            rng = random.Random(seed if seed else int(time.time()))
+            seeds = [rng.randint(0, 2_147_483_647) for _ in range(max(1, batch))]
         else:
-            seeds = [int(seed) for _ in range(max(1,batch))]
-        try: job['seeds'] = seeds
+            seeds = [seed for _ in range(max(1, batch))]
+        try: job["seeds"] = seeds
         except Exception: pass
 
         files = []
@@ -801,16 +782,20 @@ def txt2img_generate(job, cfg, mani):
                     g = g.manual_seed(int(s))
             except Exception:
                 g = None
+
             try:
-                if is_sdxl and hasattr(pipe, "__call__"):
-                    out = pipe(prompt=prompt, negative_prompt=negative, width=width, height=height, num_inference_steps=steps, generator=g, guidance_scale=cfg_scale)
-                else:
-                    out = pipe(prompt=prompt, negative_prompt=negative, width=width, height=height, num_inference_steps=steps, generator=g, guidance_scale=cfg_scale)
+                out = pipe(
+                    prompt=prompt, negative_prompt=negative,
+                    width=width, height=height,
+                    num_inference_steps=steps, guidance_scale=cfg_scale,
+                    generator=g,
+                )
                 img = out.images[0]
             except Exception as e:
                 _mark_error(job, f"inference failed: {e}")
                 return 2
-            name = fname_tmpl.format(seed=s, idx=idx)
+
+            name = name_tmpl.format(seed=s, idx=idx)
             if not name.lower().endswith((".png",".jpg",".jpeg",".webp")):
                 name += ".png"
             outp = out_dir / name
@@ -819,21 +804,26 @@ def txt2img_generate(job, cfg, mani):
             except Exception as e:
                 _mark_error(job, f"save failed: {e}")
                 return 2
+
             files.append(str(outp))
-            try: job['files'] = files[:]
+            try: job["files"] = files[:]
             except Exception: pass
-            try: _progress_set(int(100 * (idx+1) / max(1,len(seeds))))
+            try: _progress_set(int(100 * (idx+1) / max(1, len(seeds))))
             except Exception: pass
 
         if files:
-            try: job['produced'] = files[-1]; job['backend'] = 'diffusers'
-            except Exception: pass
+            try:
+                job["produced"] = files[-1]
+                job["backend"] = "diffusers"
+            except Exception:
+                pass
             return 0
+
         _mark_error(job, "No images produced.")
         return 2
 
     except Exception as e:
-        try: _mark_error(job, str(e))
+        try: _mark_error(job, f"txt2img exception: {e}")
         except Exception: pass
         return 2
 

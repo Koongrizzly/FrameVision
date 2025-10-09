@@ -1240,8 +1240,12 @@ class UpscPane(QtWidgets.QWidget):
             base = ROOT
         except Exception:
             base = Path(__file__).resolve().parent.parent
-        # Thumbs only live here
-        return base / "output" / "last results" / "upsc"
+        d = base / "output" / "recent results" / "upsc"
+        try:
+            d.mkdir(parents=True, exist_ok=True)
+        except Exception:
+            pass
+        return d
 
     def _list_recent_jobs(self) -> list[Path]:
         d = self._jobs_done_dir()
@@ -1354,6 +1358,27 @@ class UpscPane(QtWidgets.QWidget):
         except Exception:
             pass
 
+
+    def _write_recent_thumb_for_media(self, media: Path, max_side: int = 120) -> "Path|None":
+        """Write a thumbnail and sidecar JSON for a finished output file to recents dir."""
+        try:
+            media = Path(media)
+            if not media.exists():
+                return None
+            d = self._recents_dir()
+            # unique-ish name
+            name = f"{int(time.time())}_{media.stem}.__thumb.jpg"
+            tp = d / name
+            self._thumb_from_media(media, tp, max_side)
+            # sidecar mapping back to original media
+            try:
+                meta = tp.with_suffix(".json")
+                meta.write_text(json.dumps({"media": str(media.resolve())}), encoding="utf-8")
+            except Exception:
+                pass
+            return tp if tp.exists() else None
+        except Exception:
+            return None
     def _ensure_recent_thumb(self, job_json: Path, media: Path, max_side: int) -> Path|None:
         try:
             t = self._thumb_path_for_job(job_json, media, max_side)
@@ -1439,54 +1464,78 @@ class UpscPane(QtWidgets.QWidget):
         except Exception:
             pass
 
+
     def _rebuild_recents(self):
-        """Rebuild the horizontal recents row from jobs/done JSONs. Low-resource, no heavy loading."""
+        """Rebuild the recents grid strictly from existing thumbnails in output/recent results/upsc.
+        If you delete thumbnails, the list stays empty until a new upscale run writes a fresh thumb.
+        """
         try:
             layout = getattr(self, "_recents_row", None)
             if layout is None:
                 return
+            # Clear existing buttons
             self._recents_idx = 0
             while layout.count():
                 item = layout.takeAt(0)
                 w = item.widget()
                 if w is not None:
                     w.deleteLater()
-
-            size = 96
-            try: size = int(self.sld_recent_size.value())
-            except Exception: pass
-
-            jobs = self._list_recent_jobs()
-            if not jobs:
+            # Size
+            try:
+                size = int(self.sld_recent_size.value())
+            except Exception:
+                size = 96
+            # Collect thumbs
+            thumbs = []
+            try:
+                d = self._recents_dir()
+                if d.exists():
+                    thumbs = list(d.glob("*.jpg"))
+            except Exception:
+                thumbs = []
+            if not thumbs:
                 lab = QtWidgets.QLabel("No results yet.", self)
                 lab.setStyleSheet("color:#9fb3c8;")
                 layout.addWidget(lab)
                 return
-
-            for jpath in jobs:
-                media, j = self._resolve_output_from_job(jpath)
-                if not (media and media.exists() and media.is_file()):
+            thumbs.sort(key=lambda p: p.stat().st_mtime, reverse=True)
+            # Build grid
+            for tp in thumbs:
+                # Resolve original media from sidecar
+                media_path = None
+                try:
+                    meta = tp.with_suffix(".json")
+                    if meta.exists():
+                        import json
+                        j = json.loads(meta.read_text(encoding="utf-8"))
+                        m = j.get("media")
+                        if m:
+                            mp = Path(m)
+                            if mp.exists():
+                                media_path = mp
+                except Exception:
+                    media_path = None
+                if not media_path:
+                    # orphan thumb; skip
                     continue
-                tp = self._ensure_recent_thumb(jpath, media, 120)
 
                 btn = QtWidgets.QToolButton(self)
                 btn.setToolButtonStyle(Qt.ToolButtonTextUnderIcon)
-                btn.setText(Path(media).name)
+                btn.setText(Path(media_path).name)
                 btn.setCursor(Qt.PointingHandCursor)
                 btn.setAutoRaise(True)
                 try:
                     btn.setStyleSheet("QToolButton{border:1px solid rgba(255,255,255,0.12);border-radius:12px;padding:6px 6px 10px 6px;background:rgba(255,255,255,0.03);}QToolButton:hover{background:rgba(255,255,255,0.06);}")
                 except Exception:
                     pass
-                if tp:
-                    try:
-                        pm = self._load_pixmap_cached(tp, size, rounded=True, radius=12)
-                        if pm:
-                            btn.setIcon(QIcon(pm))
-                        else:
-                            btn.setIcon(QIcon(str(tp)))
-                    except Exception:
+                try:
+                    pm = self._load_pixmap_cached(tp, size, rounded=True, radius=12)
+                    if pm:
+                        btn.setIcon(QIcon(pm))
+                    else:
                         btn.setIcon(QIcon(str(tp)))
+                except Exception:
+                    btn.setIcon(QIcon(str(tp)))
                 btn.setIconSize(QSize(size, size))
                 btn.setFixedSize(int(size*1.25), int(size*1.25)+28)
 
@@ -1498,8 +1547,9 @@ class UpscPane(QtWidgets.QWidget):
                         except Exception:
                             _open_file(self, path)
                     return _open
-                btn.clicked.connect(_mk_open(media))
-                # grid placement with wrapping
+                btn.clicked.connect(_mk_open(media_path))
+
+                # grid placement
                 try:
                     vpw = self.recents_scroll.viewport().width()
                 except Exception:
@@ -1511,8 +1561,8 @@ class UpscPane(QtWidgets.QWidget):
                     vpw = 600
                 spacing = getattr(layout, "spacing", lambda: 8)()
                 item_w = int(size*1.25)
-                if vpw <= item_w + spacing and len(jobs) > 1:
-                    cols = min(len(jobs), 4)
+                if vpw <= item_w + spacing and len(thumbs) > 1:
+                    cols = min(len(thumbs), 4)
                 else:
                     cols = max(1, int((vpw + spacing) // (item_w + spacing)))
                 idx = getattr(self, "_recents_idx", 0)
@@ -1525,11 +1575,11 @@ class UpscPane(QtWidgets.QWidget):
                 self._recents_inner.setMinimumHeight(int(size*1.25)+36)
             except Exception:
                 pass
-
         except Exception as e:
-            try: self._append_log(f"[recents] rebuild error: {e}")
-            except Exception: pass
-
+            try:
+                self._append_log(f"[recents] rebuild error: {e}")
+            except Exception:
+                pass
 
     def _sync_scale_from_slider(self, v: int):
         self.spin_scale.blockSignals(True)

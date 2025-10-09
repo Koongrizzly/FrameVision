@@ -2275,7 +2275,7 @@ class QueuePane(QWidget):
                     continue
                 try:
                     d = json.loads(p.read_text(encoding='utf-8') or '{}')
-                    if not isinstance(d, dict) or (not d.get('type')) or (not d.get('input') and not d.get('frames')):
+                    if not isinstance(d, dict) or (not d.get('type')) or ((not d.get('input') and not d.get('frames')) and d.get('type')!='txt2img'):
                         continue
                 except Exception:
                     continue

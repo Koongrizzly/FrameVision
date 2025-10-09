@@ -178,11 +178,17 @@ def default_txt2img_outdir():
 
 
 def enqueue_txt2img(job: dict) -> bool:
-    """Enqueue a txt2img job (offline/diffusers backend)."""
+    """Enqueue txt2img; fan-out one row per seed. Always queue for batch>1."""
     try:
-        from helpers.queue_adapter import enqueue_tool_job
-        label = ((job.get("prompt") or "").strip()[:80]) or "[txt2img]"
+        from helpers.job_helper import make_job_json
+        from helpers.queue_adapter import jobs_dirs, default_txt2img_outdir
+        import time as _time, random as _random
+        d = jobs_dirs()
         out_dir = job.get("output") or default_txt2img_outdir()
+        # first line title = first 30 chars of prompt
+        preview = ((job.get("prompt") or "").strip()[:30]) or "[txt2img]"
+
+        # Keys to pass to worker
         keys = [
             "prompt","negative","seed","seed_policy","batch","cfg_scale",
             "width","height","steps","sampler","model_path",
@@ -191,10 +197,36 @@ def enqueue_txt2img(job: dict) -> bool:
             "format","filename_template","hires_helper","fit_check",
             "vram_profile"
         ]
-        args = {k: job.get(k) for k in keys if k in job}
-        args["label"] = label
+        base = {k: job.get(k) for k in keys if k in job}
+        base["label"] = preview
+
+        # seeds fan-out
+        batch = int(job.get("batch") or 1)
+        seed0 = int(job.get("seed") or 0)
+        policy = (job.get("seed_policy") or "fixed").lower()
+
+        if batch <= 1:
+            items = [(seed0, base)]
+        else:
+            if policy == "increment":
+                seeds = [seed0 + i for i in range(batch)]
+            elif policy == "random":
+                rng = _random.Random(seed0 if seed0 else int(_time.time()))
+                seeds = [rng.randint(0, 2_147_483_647) for _ in range(batch)]
+            else:
+                seeds = [seed0 for _ in range(batch)]
+            items = [(s, base) for s in seeds]
+
         prio = 550 if job.get("run_now") else 600
-        return bool(enqueue_tool_job("txt2img", "", out_dir, args, priority=prio))
+        ok_all = True
+        for s, base_args in items:
+            args = dict(base_args)
+            args["seed"] = int(s)
+            args["batch"] = 1  # per-row
+            # enqueue with EMPTY input string (prompt is not a path)
+            ok = make_job_json("txt2img", "", out_dir, args, str(d["pending"]), priority=prio)
+            ok_all = bool(ok_all and ok)
+        return bool(ok_all)
     except Exception as e:
         try: print("[queue] enqueue_txt2img failed:", e)
         except Exception: pass
