@@ -753,7 +753,7 @@ class Txt2ImgPane(QWidget):
         self.browse_btn = QPushButton("Browse…"); self.browse_btn.clicked.connect(self._on_browse)
         self.show_in_player = QCheckBox("Show in Player")
         self.use_queue = QCheckBox("Use queue (Add/Run)")
-        self.use_queue.hide()
+        
         out_row.addWidget(QLabel("Output:")); out_row.addWidget(self.output_path, 1); out_row.addWidget(self.browse_btn)
         out_row.addWidget(self.show_in_player); out_row.addWidget(self.use_queue)
         form.addRow(out_row)
@@ -1078,6 +1078,7 @@ class Txt2ImgPane(QWidget):
         self.add_and_run.hide()
         self.generate_now = QPushButton("Generate")
         btns.addWidget(self.add_to_queue)
+        self.add_to_queue.hide()
         btns.addWidget(self.add_and_run)
         btns.addWidget(self.generate_now)
         outer.addLayout(btns)
@@ -1512,8 +1513,7 @@ class Txt2ImgPane(QWidget):
             if not job or not job.get('prompt'):
                 self.status.setText("Prompt is empty")
                 return
-            if not self.use_queue.isChecked():
-                self._run_direct(job); return
+            pass  # queue decision handled in _on_generate_clicked
             ok = False
             if enqueue_txt2img:
                 ok = bool(enqueue_txt2img(job | {"run_now": bool(run_now)}))
@@ -1528,12 +1528,26 @@ class Txt2ImgPane(QWidget):
     def _on_generate_clicked(self):
         job = self._collect_job()
         if not job or not job.get('prompt'):
-            try:
-                self.status.setText('Please enter a prompt')
-            except Exception:
-                pass
+            try: self.status.setText('Please enter a prompt')
+            except Exception: pass
             return
-        self._enqueue(run_now=True)
+        try:
+            use_q = bool(self.use_queue.isChecked())
+        except Exception:
+            use_q = False
+        if use_q:
+            try:
+                from helpers.queue_adapter import enqueue_txt2img
+            except Exception:
+                enqueue_txt2img = None
+            if enqueue_txt2img and enqueue_txt2img(job | {'run_now': True}):
+                try: self.status.setText('Enqueued and running…')
+                except Exception: pass
+            else:
+                try: self.status.setText('Enqueue failed')
+                except Exception: pass
+        else:
+            self._run_direct(job)
 
     def _run_direct(self, job: dict):
         # Ensure a sane default filename template for Diffusers runs
@@ -1635,6 +1649,17 @@ def _gen_via_diffusers(job: dict, out_dir: Path, progress_cb=None):
     """
     Diffusers backend with detailed error reporting and CPU fallback.
     """
+
+    # Ensure PyTorch uses non-Flash SDPA kernels on Windows builds (avoid 'not compiled with flash attention' warnings)
+    try:
+        import torch
+        if torch.cuda.is_available():
+            torch.backends.cuda.enable_flash_sdp(False)
+            torch.backends.cuda.enable_mem_efficient_sdp(True)
+            torch.backends.cuda.enable_math_sdp(True)
+    except Exception:
+        pass
+
     try:
         import os
         from pathlib import Path as _Path
@@ -1774,7 +1799,8 @@ def _gen_via_diffusers(job: dict, out_dir: Path, progress_cb=None):
 
         # Memory-friendly tweaks
         try:
-            pipe.enable_attention_slicing()
+            if job.get('attn_slicing'):
+                pipe.enable_attention_slicing()
         except Exception:
             pass
         try:

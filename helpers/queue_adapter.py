@@ -176,32 +176,26 @@ def default_txt2img_outdir():
     d.mkdir(parents=True, exist_ok=True)
     return str(d)
 
+
 def enqueue_txt2img(job: dict) -> bool:
-    """Convenience: enqueue a txt2img job via the standard queue (priority depends on run_now)."""
+    """Enqueue a txt2img job (offline/diffusers backend)."""
     try:
         from helpers.queue_adapter import enqueue_tool_job
-        preview = (job.get("prompt") or "")[:80] or "[txt2img]"
+        label = ((job.get("prompt") or "").strip()[:80]) or "[txt2img]"
         out_dir = job.get("output") or default_txt2img_outdir()
-        # Filter args to a safe subset for the worker
         keys = [
             "prompt","negative","seed","seed_policy","batch","cfg_scale",
-            "width","height","steps","sampler","model_path","lora_path",
-            "lora_scale","lora2_path","lora2_scale","attn_slicing","vae_device",
-            "gpu_index","threads","format","filename_template","hires_helper","fit_check",
-            "vram_profile","a1111_url","qwen_cli_template"
+            "width","height","steps","sampler","model_path",
+            "lora_path","lora_scale","lora2_path","lora2_scale",
+            "attn_slicing","vae_device","gpu_index","threads",
+            "format","filename_template","hires_helper","fit_check",
+            "vram_profile"
         ]
         args = {k: job.get(k) for k in keys if k in job}
+        args["label"] = label
         prio = 550 if job.get("run_now") else 600
-        return bool(enqueue_tool_job("txt2img", preview, out_dir, args, priority=prio))
+        return bool(enqueue_tool_job("txt2img", "", out_dir, args, priority=prio))
     except Exception as e:
-        try:
-            print("[queue] enqueue_txt2img failed:", e)
-        except Exception:
-            pass
-        return False
-
-# Use type 'txt2img' for compatibility; worker handles both.
-        return make_job_json('txt2img', '', out_dir, args, str(d['pending']), priority=500)
-    except Exception as e:
-        print('[queue] enqueue_txt2img failed:', e)
+        try: print("[queue] enqueue_txt2img failed:", e)
+        except Exception: pass
         return False
