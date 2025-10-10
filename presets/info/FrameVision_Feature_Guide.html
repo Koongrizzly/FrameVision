@@ -243,6 +243,22 @@
 <div class="sep"></div>
 <h2>Models &amp; Footprint</h2>
 <div class="grid">
+<div class="card">
+<h3>📦 Lean downloads</h3>
+<ul>
+<li>Allow‑lists: configs + tokenizer + one weight format.</li>
+<li>No TensorFlow <code>.h5</code>, no duplicate formats.</li>
+<li>Caches stay inside the app (<code>./.hf_cache</code>).</li>
+</ul>
+</div>
+<div class="card">
+<h3>🧹 One‑click pruner</h3>
+<ul>
+<li>Removes TF weights and nested <code>models--*</code> mirrors.</li>
+<li>Optionally keep only Qwen2‑VL base or large.</li>
+<li>Typical combined size: ~3–3.5 GB.</li>
+</ul>
+</div>
 </div>
 <div class="sep"></div>
 <h2>Performance, Reliability &amp; Platform</h2>
@@ -272,48 +288,23 @@
 </div>
 </div>
 <div class="sep"></div>
-
-<!-- To-Do card -->
-<div class="card">
-  <h3 class="card-title">📌 To-Do</h3>
-  <div class="card-body">
-    <ul>
-<ul>	
-      <li><b>1.</b> Check why txt2img randomly makes the app exit</li>
-      <li><b>2.</b> Show popup when file already exists: Overwrite / Rename / Cancel</li>
-      <li><b>3.</b> Remove Settings tab save toggle</li>
-      <li><b>4.</b> Check Dump Log button & reconfigure with popup window</li>
-      <li><b>5.</b> Double-click opens full screen (currently only exits)</li>
-      <li><b>6.</b> Create URL download list for SDXL & SD1.5 with selection menu in installer</li>
-      <li><b>7.</b> Create more visual layer intros</li>
-      <li><b>8.</b> Right-click context menu: play next/previous, convert to…, edit tag</li>
-      <li><b>9.</b> Check “Clean” button for temp files, etc.</li>
-      <li><b>10.</b> Add more features, bugfixing and polishing (mini video editor base)</li>
-      <li><b>11.</b> Update acknowledge base & Q&A</li>
-    </ul>
-  </div>
-</div>
+<h2>To‑Do / Roadmap</h2>
+<div class="grid">
+<div class="card" style="animation-delay:.12s">
+<h3>🗺️ To‑Do / Roadmap</h3>
+<ul>
+<li><b>Compare panel (A/B):</b> Side‑by‑side, swipe, overlay; synced play/pause/seek; frame‑step; loop in/out; linked or independent zoom/pan; 1:1 / Fit; loupe; export composite image/clip.</li>
+<li><b>Polish &amp; bug‑fixing:</b> solid installer/downloader progress with checksum &amp; resume, queue persistence &amp; clearer ETA/logs, TXT→IMG defaults per tier, sampler presets, refined hi‑res helper.</li>
+<li><b>Presets &amp; filenames:</b> preset confirm‑overwrite + import/export touches; filename template preview and <code>{prompt_short}</code> token.</li>
+<li><b>Docs &amp; UX:</b> updated Feature Guide screenshots; troubleshooting &amp; Q&amp;A refresh; subtle UI polish (spacing, icons, animations).</li>
+<li><b>Easter eggs:</b> more delightful surprises.</li>
 </ul>
-
-<!-- Roadmap card -->
-<div class="card">
-  <h3 class="card-title">🗺️ Roadmap</h3>
-  <div class="card-body">
-    <ul>
-      <li><b>Compare panel (A/B):</b> Side-by-side, swipe, overlay; synced play/pause/seek; frame-step; loop in/out; linked or independent zoom/pan; 1:1 / Fit; loupe; export composite image/clip.</li>
-      <li><b>Easter eggs:</b> more delightful surprises.</li>
-      <li><b>R2.</b> Text and image to video</li>
-      <li><b>R3.</b> Sound AI that can “watch a video” and add the correct sound</li>
-    </ul>
-  </div>
-</div>
-
 <button class="btn-more" data-modal="m-roadmap-single">Details</button>
 </div>
 </div>
 <div class="sep"></div>
 <div class="footer">
-    Built by <b>Contrinsan</b>. Feature writing &amp;/bug‑fix help by <b>ChatGPT 5 </b>.<br/>
+    Built by <b>Contrinsan</b>. Feature writing &amp; installer/bug‑fix help by <b>ChatGPT (assistant)</b>.<br/>
 <span style="opacity:.7">This document is a living guide; details may evolve with releases.</span>
 </div>
 <dialog class="modal" id="m-meme"><div class="pop">
@@ -425,7 +416,20 @@
 <dialog class="modal" id="m-roadmap-single">
 <div class="pop">
 <button class="x" data-close="">Close</button>
-
+<h3>Roadmap — details</h3>
+<div class="meta">Focus: Compare panel, polish &amp; stability</div>
+<ul>
+<li><b>Compare panel (A/B)</b>: side‑by‑side, swipe slider, overlay opacity; hotkeys; gridlines/crosshair; metadata overlay; quick left/right swap.</li>
+<li><b>Sync controls</b>: play/pause/stop together; linked scrub; frame‑step; loop in/out markers.</li>
+<li><b>Zoom/Pan</b>: linked or independent; 1:1 toggle; Fit/Fit‑width/Fit‑height; hover loupe; smooth wheel zoom.</li>
+<li><b>Export</b>: save side‑by‑side image; short compare clips.</li>
+<li><b>Queue/Player polish</b>: persistent queue after restart; clearer per‑job progress/ETA; graceful cancel edge‑cases; auto‑refresh/auto‑fit on new outputs.</li>
+<li><b>Installer/Downloader</b>: unified progress bars; checksum verify; resume <code>.part</code> downloads; single callable model fetch for tools.</li>
+<li><b>TXT→IMG</b>: better defaults per VRAM tier; sampler presets; refined hi‑res helper; attention‑slicing guidance.</li>
+<li><b>Presets manager</b>: import/export tweaks; confirm‑overwrite; thumbnail preview.</li>
+<li><b>Filename template</b>: add <code>{prompt_short}</code>; live validation; quick reset.</li>
+<li><b>Docs</b>: Feature Guide screenshots, Q&amp;A troubleshooting for TXT→IMG, installer tips.</li>
+</ul>
 </div>
 </dialog><script>
   // modal wiring
