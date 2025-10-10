@@ -1,4 +1,12 @@
 from tools.diag_probe import init_diagnostics as _fv_diag_init
+
+# --- Prefer FFmpeg backend to avoid WMF first-play stalls ---
+try:
+    import os
+    os.environ.setdefault('QT_MEDIA_BACKEND', 'ffmpeg')
+except Exception:
+    pass
+
 _fv_diag_init()
 # --- BEGIN: FrameVision log silencer (auto-injected) ---
 # Hide harmless multimedia/FFmpeg + thread shutdown warnings.
@@ -646,6 +654,55 @@ class Toast(QWidget):
 IMAGE_EXTS = {'.png','.jpg','.jpeg','.bmp','.webp','.tif','.tiff','.gif'}
 
 class VideoPane(QWidget):
+
+    # --- Rebuild player/sinks to avoid backend deadlocks (no-bump edition) ---
+    def _rebuild_player(self):
+        try:
+            try: self.player.stop()
+            except Exception: pass
+            try: self.sink.videoFrameChanged.disconnect(self._on_frame)
+            except Exception: pass
+            try: self.player.positionChanged.disconnect(self.on_pos)
+            except Exception: pass
+            try: self.player.durationChanged.disconnect(self.on_dur)
+            except Exception: pass
+            try: self.player.playbackStateChanged.disconnect(self._on_playback_state)
+            except Exception: pass
+            try: self.player.mediaStatusChanged.disconnect(self._on_media_status)
+            except Exception: pass
+            try: self.player.setVideoSink(None)
+            except Exception: pass
+            try: self.player.setAudioOutput(None)
+            except Exception: pass
+            try: self.audio.deleteLater()
+            except Exception: pass
+            try: self.sink.deleteLater()
+            except Exception: pass
+            try: self.player.deleteLater()
+            except Exception: pass
+        except Exception:
+            pass
+        try:
+            from PySide6.QtMultimedia import QMediaPlayer, QAudioOutput, QVideoSink
+            self.player = QMediaPlayer(self)
+            self.audio = QAudioOutput(self)
+            self.player.setAudioOutput(self.audio)
+            self.sink = QVideoSink(self)
+            self.player.setVideoSink(self.sink)
+            self.sink.videoFrameChanged.connect(self._on_frame)
+            self.player.positionChanged.connect(self.on_pos)
+            self.player.durationChanged.connect(self.on_dur)
+            try:
+                self.player.playbackStateChanged.connect(lambda *_: self._sync_play_button())
+                self.player.playbackStateChanged.connect(self._on_playback_state)
+            except Exception:
+                pass
+            try:
+                self.player.mediaStatusChanged.connect(self._on_media_status)
+            except Exception:
+                pass
+        except Exception:
+            pass
 
     def _open_ask_popup(self):
         """Open the Ask chat popup (lazy-create)."""
@@ -1416,6 +1473,7 @@ class VideoPane(QWidget):
             except Exception: pass
             self._mode = 'video'
             self.label.setMovie(None)
+            self._rebuild_player()
             self.player.setSource(QUrl.fromLocalFile(str(p)))
             try:
                 self.player.play()
@@ -1449,6 +1507,7 @@ class VideoPane(QWidget):
         except Exception:
             pass
 
+        self._rebuild_player()
         self.player.setSource(QUrl.fromLocalFile(str(p)))
         try: self.player.play()
         except Exception: pass

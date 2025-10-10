@@ -1723,7 +1723,7 @@ class UpscPane(QtWidgets.QWidget):
                     return
     
                 model = self.combo_model_realsr.currentText()
-                fps = _parse_fps(src) or "30"
+                fps = "30"
                 work = outd / f"{src.stem}_x{scale}_work"
                 in_dir = work / "in"
                 out_dir = work / "out"
@@ -1745,6 +1745,7 @@ class UpscPane(QtWidgets.QWidget):
                     cmd_encode += ["-map", "1:a?"]
                 vcodec = self.combo_vcodec.currentText()
                 cmd_encode += ["-c:v", vcodec, "-pix_fmt", "yuv420p"]
+                cmd_encode += ["-vsync", "cfr"]
                 if self.rad_crf.isChecked():
                     cmd_encode += ["-crf", str(self.spin_crf.value())]
                 else:
@@ -1755,14 +1756,16 @@ class UpscPane(QtWidgets.QWidget):
                 if int(self.spin_keyint.value() or 0) > 0:
                     cmd_encode += ["-g", str(int(self.spin_keyint.value()))]
                 if post:
-                    cmd_encode += ["-vf", post]
+                    cmd_encode += ["-vf", f"fps={fps}," + post]
+                else:
+                    cmd_encode += ["-vf", f"fps={fps}"]
                 if self.radio_a_mute.isChecked():
                     cmd_encode += ["-an"]
                 elif self.radio_a_copy.isChecked():
                     cmd_encode += ["-c:a", "copy"]
                 else:
                     cmd_encode += ["-c:a", self.combo_acodec.currentText(), "-b:a", f"{self.spin_abitrate.value()}k"]
-                cmd_encode += ["-shortest", str(outfile)]
+                cmd_encode += ["-r", fps, "-shortest", str(outfile)]
     
                 self._append_log(f"Engine: {engine_label}")
                 self._append_log(f"Executable: {engine_exe}")
