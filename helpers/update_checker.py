@@ -376,9 +376,7 @@ def _today_str() -> str:
 def _show_updates_popup(parent, result: dict):
     has_release = bool(result.get("has_release"))
     tag = result.get("release_tag")
-    if has_release and tag and get_ack_release_tag() == tag:
-        has_release = False
-
+    
     beta_hint = bool(result.get("beta_hint"))
 
     if not (has_release or beta_hint):
@@ -422,14 +420,7 @@ def check_on_startup(parent=None, owner: str = GITHUB_OWNER, repo: str = GITHUB_
     if not get_auto_check_enabled():
         return
 
-    st = _load_state()
-    last_day = st.get("last_check_day")
-    if last_day == _today_str():
-        return  # already checked today
-
-    st["last_check_day"] = _today_str()
-    _save_state(st)
-
+    
     worker = _ProbeWorker(parent, owner, repo)
     if not hasattr(check_on_startup, "_workers"):
         check_on_startup._workers = []
@@ -450,12 +441,7 @@ def check_on_startup(parent=None, owner: str = GITHUB_OWNER, repo: str = GITHUB_
     worker.start()
 
 def force_check_now(parent=None, owner: str = GITHUB_OWNER, repo: str = GITHUB_REPO):
-    st = _load_state()
-    st["last_check_day"] = "1970-01-01"
-    _save_state(st)
     check_on_startup(parent, owner, repo)
-
-# ---------- Release updater bridge / fallback ----------
 
 def _open_release_updater(parent):
     """
