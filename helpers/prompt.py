@@ -458,11 +458,13 @@ class PromptToolPane(QWidget):
             "Expand short seeds into a single richly detailed prompt. "
             "Follow the instruction template and style hints exactly."
         )
+        import re as _re
+        _neg_clean = negatives if _re.search(r"[A-Za-z0-9]", negatives) else ""
         user = (
-            f"{template} "
-            f"Use the style: {style}. "
-            f"If and only if negatives are provided, append at the end: 'negative: {negatives}'. "
-            f"Seed: {seed}"
+            (f"{template} ")
+            + (f"Use the style: {style}. ")
+            + (f"If and only if negatives are provided, append at the end: 'negative: {_neg_clean}'. " if _neg_clean else "")
+            + (f"Seed: {seed}")
         )
         return sys, user
 
@@ -502,7 +504,9 @@ class PromptToolPane(QWidget):
         if folder is None:
             # No model available — produce local expand quickly
             style = self.style.text().strip() or DEFAULT_STYLE
-            neg = (self.neg.text().strip() or DEFAULT_NEG)
+            import re as _re
+            _neg_raw = self.neg.text().strip()
+            neg = _neg_raw if _re.search(r"[A-Za-z0-9]", _neg_raw) else ""
             tail = (f" negative: {neg}." if neg else "")
             out = f"{seed.strip().capitalize()}" + (f" in {style};" if style else ";") + " rich lighting, camera details, textures, mood, palette." + (tail or "")
             self.out.setPlainText(str(out).strip())

@@ -5,6 +5,7 @@ import json
 from pathlib import Path
 
 from PySide6.QtCore import Qt, QUrl
+from PySide6.QtCore import QThread, Signal
 from PySide6.QtGui import QAction, QDesktopServices
 from PySide6.QtWidgets import (
     QDialog, QDialogButtonBox, QHBoxLayout, QLabel, QLineEdit, QListWidget,
@@ -357,52 +358,99 @@ def _extract_selected(zpath: Path, dest_root: Path, mode: str):
                 shutil.copyfileobj(src, dst)
 
 def _create_backup_zip(app_root: Path, target_dir: Path) -> Path:
-    """
-    Create a backup ZIP of the app using *no compression* (ZIP_STORED) to avoid UI freezes.
-    Exclude heavy/generated folders:
-      - tools/ (top-level)
-      - models/ (top-level)
-      - output/ (top-level)
-      - .venv (top-level)
-      - presets/bin/ (specific subfolder)
-    Also excludes __pycache__ directories anywhere.
-    """
-    import zipfile as _zipfile
+    import os, zipfile as _zipfile
     from datetime import datetime as _dt
 
-    # Top-level folders to exclude (do NOT exclude entire presets anymore)
     EXCLUDE_TOP = {"tools", "models", "output", ".venv"}
-    # Specific subfolder exclusion under presets/
-    EXCLUDE_PRESETS_SUB = ("bin",)
+    EXCLUDE_PRESETS_SUB = {"bin"}
+    EXCLUDE_EXTS = {".zip", ".7z", ".rar", ".tar", ".gz", ".bz2", ".xz"}
+    app_prefix = (app_root.name + "_backup_").lower()
 
     ts = _dt.now().strftime("%Y%m%d_%H%M%S")
     out = Path(target_dir) / f"{app_root.name}_backup_{ts}.zip"
 
-    # Open ZIP with ZIP_STORED => store files without compression
     with _zipfile.ZipFile(out, "w", compression=_zipfile.ZIP_STORED, allowZip64=True) as zf:
-        for p in app_root.rglob("*"):
-            # Skip pycache dirs
+        for root, dirs, files in os.walk(app_root):
+            rel_root = Path(root).relative_to(app_root)
+            parts = rel_root.parts
+            if parts:
+                top = parts[0]
+                if top in EXCLUDE_TOP:
+                    dirs[:] = []
+                    continue
+                if top == "presets" and len(parts) >= 2 and parts[1] in EXCLUDE_PRESETS_SUB:
+                    dirs[:] = []
+                    continue
+            dirs[:] = [d for d in dirs if d != "__pycache__"]
+            for fname in files:
+                p = Path(root) / fname
+                rel = p.relative_to(app_root)
+                if p.suffix.lower() in EXCLUDE_EXTS:
+                    continue
+                if rel.name.lower().startswith(app_prefix) and p.suffix.lower() == ".zip":
+                    continue
+                zf.write(p, arcname=str(rel))
+    return out
+
+
+class _BackupWorker(QThread):
+    prog = Signal(int, int)
+    msg  = Signal(str)
+    ok   = Signal(str)
+    err  = Signal(str)
+
+    def __init__(self, app_root: Path, target_dir: Path):
+        super().__init__()
+        self._app_root = app_root
+        self._target_dir = target_dir
+
+    def _gather_files(self):
+        EXCLUDE_TOP = {"tools", "models", "output", ".venv"}
+        EXCLUDE_PRESETS_SUB = {"bin"}
+        EXCLUDE_EXTS = {".zip", ".7z", ".rar", ".tar", ".gz", ".bz2", ".xz"}
+        app_prefix = (self._app_root.name + "_backup_").lower()
+        files = []
+        for p in self._app_root.rglob("*"):
             if "__pycache__" in p.parts:
                 continue
-            # Compute relative path
             try:
-                rel = p.relative_to(app_root)
+                rel = p.relative_to(self._app_root)
             except ValueError:
                 continue
-
-            # Skip top-level excluded folders
             if rel.parts:
                 top = rel.parts[0]
                 if top in EXCLUDE_TOP:
                     continue
-                # Skip presets/bin/*
                 if top == "presets" and len(rel.parts) >= 2 and rel.parts[1] in EXCLUDE_PRESETS_SUB:
                     continue
-
             if p.is_file():
-                zf.write(p, arcname=str(rel))
-    return out
+                if p.suffix.lower() in EXCLUDE_EXTS:
+                    continue
+                if rel.name.lower().startswith(app_prefix) and p.suffix.lower() == ".zip":
+                    continue
+                files.append((p, rel))
+        return files
 
+    def run(self):
+        try:
+            files = self._gather_files()
+            total = len(files)
+            if total == 0:
+                raise RuntimeError("Nothing to back up.")
+            self.msg.emit(f"Found {total} files. Writing ZIP…")
+            from datetime import datetime as _dt
+            import zipfile as _zipfile
+            ts = _dt.now().strftime("%Y%m%d_%H%M%S")
+            out = Path(self._target_dir) / f"{self._app_root.name}_backup_{ts}.zip"
+            with _zipfile.ZipFile(out, "w", compression=_zipfile.ZIP_STORED, allowZip64=True) as zf:
+                for i, (p, rel) in enumerate(files, start=1):
+                    zf.write(p, arcname=str(rel))
+                    if i == total or (i % 50 == 0):
+                        self.prog.emit(i, total)
+            self.ok.emit(str(out))
+        except Exception:
+            import traceback as _tb
+            self.err.emit(_tb.format_exc())
 class UpdateDialog(QDialog):
     def __init__(self, parent: QWidget | None = None):
         super().__init__(parent)
@@ -512,16 +560,24 @@ class UpdateDialog(QDialog):
         if not folder:
             return
         self.setEnabled(False)
-        try:
-            self._append("Creating backup…")
-            out = _create_backup_zip(APP_ROOT, Path(folder))
-            self._append(f"Backup saved: {out}")
-            QMessageBox.information(self, "Backup created", f"Saved to:\\n{out}")
-        except Exception as e:
-            self._append("Backup failed:\\n" + traceback.format_exc())
-            QMessageBox.critical(self, "Backup failed", str(e))
-        finally:
+        self._append("Creating backup (no compression)…")
+        self._backup_worker = _BackupWorker(APP_ROOT, Path(folder))
+        self._backup_worker.msg.connect(lambda s: self._append(s))
+        self._backup_worker.prog.connect(lambda d, t: self._append(f"Zipping {d}/{t} files…"))
+        def _ok(path_str: str):
+            self._append(f"Backup saved: {path_str}")
+            QMessageBox.information(self, "Backup created", f"Saved to:\n{path_str}")
             self.setEnabled(True)
+            self._backup_worker = None
+        def _err(msg: str):
+            self._append("Backup failed:\n" + msg)
+            QMessageBox.critical(self, "Backup failed", "See log for details.")
+            self.setEnabled(True)
+            self._backup_worker = None
+        self._backup_worker.ok.connect(_ok)
+        self._backup_worker.err.connect(_err)
+        self._backup_worker.start()
+
 
     def _on_update(self, source: str, mode: str):
         assert source in ("release", "branch")
@@ -554,10 +610,3 @@ def _open_update_dialog(parent: QWidget | None):
     dlg = UpdateDialog(parent)
     dlg.exec()
 # ===== End Update Dialog =====
-
-# --- Auto-run GitHub update check on startup (non-blocking) ---
-try:
-    from helpers.update_checker import schedule_check_no_parent
-    schedule_check_no_parent()
-except Exception:
-    pass

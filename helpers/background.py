@@ -54,9 +54,9 @@ except Exception:
 
 # -------------------- Preferences --------------------
 def _prefs_path() -> Path:
-    cfg = ROOT / "config"
+    cfg = ROOT / "presets" / "setsave" 
     cfg.mkdir(parents=True, exist_ok=True)
-    return cfg / "background_tool.json"
+    return cfg / "background.json"
 
 def _load_prefs() -> dict:
     p = _prefs_path()
@@ -1707,6 +1707,22 @@ def install_background_tool(pane, section_widget) -> None:
                     sd_prompt="clean background, realistic", sd_negative="blurry, artifacts, distortion, text, watermark",
                     sd_steps=30, sd_guidance=7.0, sd_strength=0.85, sd_seed=-1, sd_model=str(_default_sd15_inpaint_model_path()),
                 sd_auto_bg=False, overlay=50, out_dir=str(_get_out_dir_pref()))
+    def _settings_save_silent():
+        try:
+            d = _load_prefs()
+            d.update(get_params())
+            _save_prefs(d)
+        except Exception:
+            pass
+
+    def _settings_load_if_any():
+        try:
+            d = _load_prefs()
+            if d:
+                set_params({**defaults(), **d})
+        except Exception:
+            pass
+
 
     def _load_presets_list():
         d = _load_prefs(); return d.get("bg_presets", [])
@@ -1744,7 +1760,7 @@ def install_background_tool(pane, section_widget) -> None:
         btn_preset_save.clicked.connect(on_preset_save)
         btn_preset_del.clicked.connect(on_preset_delete)
         cmb_presets.currentIndexChanged.connect(on_preset_apply)
-        _refresh_presets_ui()
+        _refresh_presets_ui(); _settings_load_if_any(); _settings_save_silent()
     except Exception:
         pass
 
@@ -2003,7 +2019,7 @@ def install_background_tool(pane, section_widget) -> None:
 
     def snapshot():
         d = get_params().copy(); undo_stack.append(d)
-        if len(undo_stack) > 20: undo_stack.pop(0)
+        if len(undo_stack) > 20: undo_stack.pop(0); _settings_save_silent()
     for w in [cmb_mode, cmb_repl, s_blurbg, s_thresh, s_feath, cb_spill, cb_auto, cb_inv, cb_ah, cb_shadow, s_salpha, s_sblur, s_sox, s_soy]:
         try:
             if hasattr(w, "editingFinished"): w.editingFinished.connect(snapshot)
