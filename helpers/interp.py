@@ -500,9 +500,9 @@ class InterpPane(QWidget):
     
     # ---- simple JSON store (robust persistence) ----
     def _store_path(self) -> Path:
-        sp = self.ROOT / "settings"
+        sp = self.ROOT / "presets" / "setsave"
         sp.mkdir(parents=True, exist_ok=True)
-        return sp / "interp.json"
+        return sp / "interp_set.json"
 
     def _kv_read(self, key: str, default=None):
         try:
@@ -1151,7 +1151,7 @@ class InterpPane(QWidget):
 
         out_dir = _outputs_dir(self.ROOT)
         vids = sorted(out_dir.glob("*_interp_*.mp4"), key=lambda p: p.stat().st_mtime, reverse=True)[:15]
-        thumbs_dir = self.ROOT / "logs" / "rife" / "thumbs"
+        thumbs_dir = self.ROOT / "output" / "last results" / "interp"
         for v in vids:
             thumb = thumbs_dir / (v.stem + ".jpg")
             if not thumb.exists():
