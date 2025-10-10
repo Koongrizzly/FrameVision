@@ -172,6 +172,24 @@ class _Disclosure(QWidget):
         self.toggled.emit(checked)
 class Txt2ImgPane(QWidget):
 
+
+    def _apply_queue_visibility(self, checked: bool | None = None):
+        """Hide progress + status when queue mode is on."""
+        try:
+            if checked is None:
+                checked = bool(self.use_queue.isChecked())
+        except Exception:
+            checked = False
+        try:
+            self.progress.setVisible(not checked)
+        except Exception:
+            pass
+        try:
+            self.status.setVisible(not checked)
+        except Exception:
+            pass
+
+
     def _apply_settings_from_dict(self, s: dict):
             """Apply saved settings dict to the UI (best-effort) without triggering autosave."""
             try:
@@ -749,7 +767,7 @@ class Txt2ImgPane(QWidget):
         form.addRow(cfg_row)
 
         # Seed used (always visible)
-        self.seed_used_label = QLabel("Seed used: —")
+        self.seed_used_label = QLabel("Seed used: —"); self.seed_used_label.setVisible(False)
         form.addRow(self.seed_used_label)
 
         # Output path + show in player + queue toggle
@@ -763,6 +781,11 @@ class Txt2ImgPane(QWidget):
             self.use_queue.toggled.connect(lambda *_: self._autosave_now())
         except Exception:
             pass
+        try:
+            self.use_queue.toggled.connect(self._apply_queue_visibility)
+        except Exception:
+            pass
+
         out_row.addWidget(QLabel("Output:")); out_row.addWidget(self.output_path, 1); out_row.addWidget(self.browse_btn)
         out_row.addWidget(self.show_in_player); out_row.addWidget(self.use_queue)
         form.addRow(out_row)
@@ -1080,6 +1103,15 @@ class Txt2ImgPane(QWidget):
         self.status = QLabel("Ready")
         prog_row.addWidget(self.progress, 1); prog_row.addWidget(self.status, 0)
         outer.addLayout(prog_row)
+
+        try:
+            self._apply_queue_visibility(self.use_queue.isChecked())
+        except Exception:
+            pass
+        try:
+            QTimer.singleShot(0, lambda: self._apply_queue_visibility(self.use_queue.isChecked()))
+        except Exception:
+            pass
 
         btns = QHBoxLayout()
         self.add_to_queue = QPushButton("Add to Queue")
