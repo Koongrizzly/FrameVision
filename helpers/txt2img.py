@@ -299,6 +299,11 @@ class Txt2ImgPane(QWidget):
         self.add_to_queue.clicked.connect(lambda: self._enqueue(run_now=False))
         self.add_and_run.clicked.connect(lambda: self._enqueue(run_now=True))
         self.generate_now.clicked.connect(self._on_generate_clicked)
+        try:
+            self.add_to_queue.hide()
+            self.add_and_run.hide()
+        except Exception:
+            pass
         
         # Busy animation + FS watcher
         try:
@@ -754,6 +759,10 @@ class Txt2ImgPane(QWidget):
         self.show_in_player = QCheckBox("Show in Player")
         self.use_queue = QCheckBox("Use queue (Add/Run)")
         
+        try:
+            self.use_queue.toggled.connect(lambda *_: self._autosave_now())
+        except Exception:
+            pass
         out_row.addWidget(QLabel("Output:")); out_row.addWidget(self.output_path, 1); out_row.addWidget(self.browse_btn)
         out_row.addWidget(self.show_in_player); out_row.addWidget(self.use_queue)
         form.addRow(out_row)
@@ -1107,6 +1116,7 @@ class Txt2ImgPane(QWidget):
             "cfg_scale": float(self.cfg_scale.value()) if hasattr(self, "cfg_scale") else 7.5,
             "output": self.output_path.text().strip(),
             "show_in_player": self.show_in_player.isChecked(),
+            "use_queue": bool(self.use_queue.isChecked()),
             "vram_profile": self.vram_profile.currentText(),
             "sampler": self.sampler.currentText(),
             "model_path": (self.model_combo.currentData() if hasattr(self, "model_combo") else "auto"),
@@ -1535,7 +1545,7 @@ class Txt2ImgPane(QWidget):
             use_q = bool(self.use_queue.isChecked())
         except Exception:
             use_q = False
-        if use_q:
+        if (int(job.get('batch',1))>1) or use_q:
             try:
                 from helpers.queue_adapter import enqueue_txt2img
             except Exception:
