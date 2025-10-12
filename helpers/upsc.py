@@ -152,10 +152,13 @@ def detect_engines() -> List[Tuple[str, str]]:
     realsr = REALSR_DIR / ("realesrgan-ncnn-vulkan.exe" if os.name == "nt" else "realesrgan-ncnn-vulkan")
     if realsr.exists():
         engines.append(("Real-ESRGAN (ncnn)", str(realsr)))
+    engines.append(("UltraSharp (ncnn)", str(realsr)))
+    engines.append(("SRMD (ncnn via RealESRGAN)", str(realsr)))
     waifu = WAIFU2X_DIR / ("waifu2x-ncnn-vulkan.exe" if os.name == "nt" else "waifu2x-ncnn-vulkan")
     if waifu.exists():
         engines.append(("Waifu2x (ncnn)", str(waifu)))
     return engines
+
 
 
 def scan_realsr_models() -> List[str]:
@@ -163,7 +166,11 @@ def scan_realsr_models() -> List[str]:
     if REALSR_DIR.exists():
         for ext in ("*.bin", "*.param"):
             for p in sorted(REALSR_DIR.glob(ext)):
-                names.add(p.stem)
+                stem = p.stem
+                low = stem.lower()
+                if low.startswith("srmd") or low.startswith("srmdnf") or low.startswith("srdmnf") or low.startswith("4x-ultrasharp"):
+                    continue
+                names.add(stem)
     if names:
         return sorted(names)
     # Fallback suggestions if no models detected (first-run scenarios)
@@ -176,6 +183,31 @@ def scan_realsr_models() -> List[str]:
     ]
 
 
+
+
+def scan_ultrasharp_models() -> List[str]:
+    names: set[str] = set()
+    try:
+        if REALSR_DIR.exists():
+            for ext in ("*.bin","*.param"):
+                for p in sorted(REALSR_DIR.glob("4x-UltraSharp-*"+ext.split("*")[-1])):
+                    names.add(p.stem)
+    except Exception:
+        pass
+    return sorted(names) or ["4x-UltraSharp-fp16","4x-UltraSharp-fp32"]
+
+def scan_srmd_realesrgan_models() -> List[str]:
+    names: set[str] = set()
+    try:
+        if REALSR_DIR.exists():
+            for ext in ("*.bin","*.param"):
+                for p in sorted(REALSR_DIR.glob(ext)):
+                    s = p.stem.lower()
+                    if s.startswith("srmd") or s.startswith("srmdnf") or s.startswith("srdmnf"):
+                        names.add(p.stem)
+    except Exception:
+        pass
+    return sorted(names) or ["srmd_x2","srmd_x3","srmd_x4","srmdnf_x2","srmdnf_x3","srmdnf_x4"]
 
 def scan_waifu2x_models() -> List[str]:
     names: List[str] = []
@@ -280,6 +312,8 @@ class UpscPane(QtWidgets.QWidget):
         self._waifu_models = scan_waifu2x_models()
         self._srmd_models = scan_srmd_models()
         self._realsr_ncnn_models = scan_realsr_ncnn_models()
+        self._ultrasharp_models = scan_ultrasharp_models()
+        self._srmd_realsr_models = scan_srmd_realesrgan_models()
         self._last_outfile: Optional[Path] = None
         # LRU cache for thumbnails (path+size+radius)
         self._pm_cache = OrderedDict()
@@ -411,6 +445,26 @@ class UpscPane(QtWidgets.QWidget):
             self.combo_model_realsr_ncnn.addItem(m)
         lay_rs.addWidget(self.combo_model_realsr_ncnn, 1)
         self.stk_models.addWidget(pg_rs)
+        # UltraSharp (via Real-ESRGAN backend)
+        pg_ul = QtWidgets.QWidget()
+        lay_ul = QtWidgets.QHBoxLayout(pg_ul)
+        lay_ul.addWidget(QtWidgets.QLabel("Model:", self))
+        self.combo_model_ultrasharp = QtWidgets.QComboBox(self)
+        for m in self._ultrasharp_models:
+            self.combo_model_ultrasharp.addItem(m)
+        lay_ul.addWidget(self.combo_model_ultrasharp, 1)
+        self.stk_models.addWidget(pg_ul)
+
+        # SRMD (via Real-ESRGAN backend)
+        pg_srmd_rs = QtWidgets.QWidget()
+        lay_srmd_rs = QtWidgets.QHBoxLayout(pg_srmd_rs)
+        lay_srmd_rs.addWidget(QtWidgets.QLabel("Model:", self))
+        self.combo_model_srmd_realsr = QtWidgets.QComboBox(self)
+        for m in self._srmd_realsr_models:
+            self.combo_model_srmd_realsr.addItem(m)
+        lay_srmd_rs.addWidget(self.combo_model_srmd_realsr, 1)
+        self.stk_models.addWidget(pg_srmd_rs)
+
 
         inner.addWidget(self.stk_models)
 
@@ -1306,19 +1360,36 @@ class UpscPane(QtWidgets.QWidget):
             except Exception:
                 pass
 
+    
     def _update_engine_ui(self):
         # Keep model stack in sync with engine
         eng_txt = (self.combo_engine.currentText() or '').lower()
-        page = 0 if 'realesrgan' in eng_txt else (1 if 'waifu2x' in eng_txt else (2 if 'srmd' in eng_txt else (3 if 'realsr' in eng_txt else 0)))
+        page = 0
+        if 'waifu2x' in eng_txt:
+            page = 1
+        elif 'srmd (ncnn via realesrgan' in eng_txt:
+            page = 5
+        elif 'ultrasharp' in eng_txt:
+            page = 4
+        elif 'srmd' in eng_txt:
+            page = 2
+        elif 'realsr' in eng_txt:
+            page = 3
+        else:
+            page = 0
         self.stk_models.setCurrentIndex(page)
-        # Auto-guide scale to the model's native when using Real-ESRGAN
+        # Auto-guide scale to the model's native when using Real-ESRGAN-compatible backends
         try:
             eng = (self.combo_engine.currentText() or '').lower()
         except Exception:
             eng = ''
-        if ('realesrgan' in eng) or ('real-esrgan' in eng):
+        if ('realesrgan' in eng) or ('real-esrgan' in eng) or ('ultrasharp' in eng) or ('srmd (ncnn via realesrgan' in eng):
             try:
-                model = self.combo_model_realsr.currentText()
+                model = (self.combo_model_w2x.currentText() if "Waifu2x" in engine_label else (
+                    getattr(self, "combo_model_ultrasharp", self.combo_model_realsr).currentText() if "UltraSharp" in engine_label else (
+                    getattr(self, "combo_model_srmd_realsr", self.combo_model_realsr).currentText() if "SRMD (ncnn via RealESRGAN)" in engine_label else self.combo_model_realsr.currentText()))) if page==0 else (
+                        self.combo_model_ultrasharp.currentText() if page==4 else (
+                        self.combo_model_srmd_realsr.currentText() if page==5 else self.combo_model_realsr.currentText()))
                 t = (model or '').lower()
                 native = 4 if ('-x4' in t or 'x4' in t) else (3 if ('-x3' in t or 'x3' in t) else (2 if ('-x2' in t or 'x2' in t) else 2))
                 self.spin_scale.blockSignals(True); self.spin_scale.setValue(float(native)); self.spin_scale.blockSignals(False)
@@ -1332,11 +1403,8 @@ class UpscPane(QtWidgets.QWidget):
                         pass
             except Exception:
                 pass
-
-        eng_txt = (self.combo_engine.currentText() or '').lower()
-        page = 0 if 'realesrgan' in eng_txt else (1 if 'waifu2x' in eng_txt else (2 if 'srmd' in eng_txt else (3 if 'realsr' in eng_txt else 0)))
+        # Re-apply page
         self.stk_models.setCurrentIndex(page)
-
     def _sync_scale_from_spin(self, v: float):
         self.slider_scale.blockSignals(True)
         self.slider_scale.setValue(int(round(v * 10)))
@@ -1918,6 +1986,12 @@ class UpscPane(QtWidgets.QWidget):
             if "Waifu2x" in engine_label:
                 model = self.combo_model_w2x.currentText()
                 cmd = self._waifu_cmd_file(engine_exe, src, outfile, model, scale)
+            elif "UltraSharp" in engine_label:
+                model = getattr(self, "combo_model_ultrasharp", self.combo_model_realsr).currentText()
+                cmd = self._realsr_cmd_file(engine_exe, src, outfile, model, scale)
+            elif "SRMD (ncnn via RealESRGAN)" in engine_label:
+                model = getattr(self, "combo_model_srmd_realsr", self.combo_model_realsr).currentText()
+                cmd = self._realsr_cmd_file(engine_exe, src, outfile, model, scale)
             else:
                 model = self.combo_model_realsr.currentText()
                 cmd = self._realsr_cmd_file(engine_exe, src, outfile, model, scale)
@@ -2534,6 +2608,8 @@ def _fv_r11_detect_engines() -> List[Tuple[str, str]]:
         return _fv_r11_find(root, names)
     realsr = _find(models / "realesrgan", ["realesrgan-ncnn-vulkan.exe","realesrgan-ncnn-vulkan"])
     if realsr: engines.append(("Real-ESRGAN (ncnn)", str(realsr)))
+    if realsr: engines.append(("UltraSharp (ncnn)", str(realsr)))
+    if realsr: engines.append(("SRMD (ncnn via RealESRGAN)", str(realsr)))
     waifu = _find(models / "waifu2x", ["waifu2x-ncnn-vulkan.exe","waifu2x-ncnn-vulkan"])
     if waifu: engines.append(("Waifu2x (ncnn)", str(waifu)))
     srmd = _find(models / "srmd-ncnn-vulkan-master", ["srmd-ncnn-vulkan.exe","srmd-ncnn-vulkan"])
