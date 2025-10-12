@@ -1,4 +1,6 @@
-# helpers/audiotool.py — Enhanced Audio tool (visibility fix + robust enums)
+
+# helpers/audiotool.py — Audio tool with waveform preview.
+# Now with a smart fallback that auto-adds the base Python's site-packages if pyqtgraph import fails in a venv.
 import os, re, sys, subprocess, tempfile, wave
 from pathlib import Path
 
@@ -11,10 +13,43 @@ from PySide6.QtWidgets import (
 
 # --- Optional waveform visualization (pyqtgraph) ---
 _pg = None
+_pg_import_err = None
+_added_paths = []
+
+def _try_add_base_sitepackages():
+    """If we're inside a venv, add the *base* Python's site-packages to sys.path.
+    This lets us use a single global install (your Install Menu) without touching the venv.
+    """
+    try:
+        base = Path(getattr(sys, "base_prefix", sys.prefix) or sys.prefix)
+        pre = Path(sys.prefix)
+        if base and base != pre:
+            # Windows
+            cand1 = base / "Lib" / "site-packages"
+            # Fallbacks (Unix/WSL etc.)
+            ver = f"python{sys.version_info.major}.{sys.version_info.minor}"
+            cand2 = base / "lib" / ver / "site-packages"
+            for p in (cand1, cand2):
+                if p.exists() and str(p) not in sys.path:
+                    sys.path.append(str(p))
+                    _added_paths.append(str(p))
+    except Exception:
+        pass
+
 try:
-    import pyqtgraph as _pg
-except Exception:
+    import pyqtgraph as _pg  # noqa: F401
+except Exception as e:
     _pg = None
+    _pg_import_err = e
+    # Try again after adding base site-packages
+    _try_add_base_sitepackages()
+    if _pg is None:
+        try:
+            import pyqtgraph as _pg  # noqa: F401
+            _pg_import_err = None
+        except Exception as e2:
+            _pg = None
+            _pg_import_err = e2
 
 # --- Safe imports for shared paths/constants ---
 try:
@@ -85,7 +120,23 @@ class _Waveform(QWidget):
         super().__init__(parent)
         self._layout = QVBoxLayout(self)
         if _pg is None:
-            self._label = QLabel("Waveform preview (install 'pyqtgraph' to enable).")
+            # Show a detailed reason so users don't think it's "not installed" when it's an env/import issue.
+            reason = "pyqtgraph not available"
+            if _pg_import_err is not None:
+                reason = f"import failed: {type(_pg_import_err).__name__}: {_pg_import_err}"
+            details = ""
+            if _added_paths:
+                details = "\\nSearched additionally: " + "; ".join(_added_paths)
+            msg = (
+                "Waveform preview disabled — " + reason +
+                "\\nPython: " + sys.executable + details +
+                "\\nTip: use your Install Menu (global site-packages). This panel already attempts to import from base."
+            )
+            self._label = QLabel(msg)
+            try:
+                self._label.setWordWrap(True)
+            except Exception:
+                pass
             self._label.setAlignment(Qt.AlignCenter)
             self._layout.addWidget(self._label)
             self.plot = None
@@ -290,8 +341,8 @@ def install_audio_tool(pane, sec_audio):
     # File actions
     def _add_file():
         start_dir = settings.value("last_dir", "")
-        path, _ = QFileDialog.getOpenFileName(pane, "Choose audio file...", start_dir,
-                    "Audio files (*.mp3 *.wav *.m4a *.aac *.flac *.ogg *.opus);;All files (*)")
+        path, _ = QFileDialog.getOpenFileName(pane, "Choose audio file.", start_dir,
+                    "Audio files (*.mp3 *.wav *.m4a *.aac *.flac *.ogg *.opus);All files (*)")
         if path:
             settings.setValue("last_dir", str(Path(path).parent))
             audio_list.addItem(path)
@@ -333,8 +384,8 @@ def install_audio_tool(pane, sec_audio):
         except Exception:
             try:
                 QMessageBox.critical(pane, "FFmpeg not found",
-                    "Couldn't find FFmpeg. Set its path under 'Advanced' or place ffmpeg in:\n"
-                    f"{ROOT/'bin'}\n{ROOT/'presets'/'bin'}")
+                    "Couldn't find FFmpeg. Set its path under 'Advanced' or place ffmpeg in:\\n"
+                    f"{ROOT/'bin'}\\n{ROOT/'presets'/'bin'}")
             except Exception:
                 pass
             return
