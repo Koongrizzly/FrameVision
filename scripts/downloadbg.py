@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """
-downloadbg.py — v3.3
+downloadbg.py — v3.5
 - Clean, single‑line progress (ETA, speed, human sizes)
-- Moves finished files to models/bg, cleans stray models/*.zip
+- Moves finished files to models/bg, cleans stray models/*.zip, extracts zip models to models/, then deletes scripts/models
 - Hugging Face auth support (token or env)
 - **MODNet fallback mirrors**: tries each URL in order until one works
 - **Default = ALL models** when no flags are passed
@@ -12,9 +12,21 @@ Flags:
     --hf-token TOKEN
     --ignore-errors
 """
-import argparse, hashlib, os, sys, urllib.request, urllib.error, pathlib, shutil, time, math, shutil as _shutil
+import argparse, hashlib, os, sys, urllib.request, urllib.error, pathlib, shutil, time, math, shutil as _shutil, zipfile
 
-VERSION = "v3.3"
+VERSION = "v3.5"
+
+# Resolve project root so paths don't depend on CWD (works when run from /scripts).
+def _get_project_root() -> pathlib.Path:
+    this = pathlib.Path(__file__).resolve()
+    scripts_dir = this.parent
+    # If script lives in a 'scripts' folder, root is the parent of that folder; otherwise use current folder.
+    return scripts_dir.parent if scripts_dir.name.lower() == "scripts" else scripts_dir
+
+ROOT = _get_project_root()
+ROOT_MODELS = ROOT / "models"
+ROOT_BG = ROOT_MODELS / "bg"
+SCRIPTS_MODELS = pathlib.Path(__file__).resolve().parent / "models"
 
 # Some entries provide a list of URLs (mirrors). We'll try them in order.
 MODELS = {
@@ -46,6 +58,16 @@ MODELS = {
         "size_hint": "≈ 4.0 GB",
         "optional": True
     },
+
+    "realsr_ncnn_zip": {
+        "url": "https://github.com/nihui/realsr-ncnn-vulkan/releases/download/20220728/realsr-ncnn-vulkan-20220728-windows.zip",
+        "sha256": None,
+        "filename": "realsr-ncnn-vulkan-20220728-windows.zip",
+        "size_hint": "≈ 20 MB",
+        "optional": False,
+        "extract_to": "models",
+        "exists_path": "models/realsr-ncnn-vulkan-20220728-windows"
+    }
 }
 
 def _human(n_bytes: int) -> str:
@@ -63,6 +85,30 @@ def _eta_str(seconds: float) -> str:
     h, m = divmod(m, 60)
     return f"{h:d}:{m:02d}:{s:02d}" if h else f"{m:02d}:{s:02d}"
 
+
+def _extract_zip(zip_path: pathlib.Path, target_root: pathlib.Path) -> int:
+    """Extract a .zip into target_root and return number of entries extracted."""
+    target_root.mkdir(parents=True, exist_ok=True)
+    with zipfile.ZipFile(zip_path, 'r') as zf:
+        members = zf.namelist()
+        print(f"[unzip] {zip_path.name} -> {target_root.resolve()} ({len(members)} entries)")
+        zf.extractall(target_root)
+        return len(members)
+
+def cleanup_scripts_models_dir() -> int:
+    """Delete the entire scripts/models directory if it exists."""
+    target = pathlib.Path("scripts") / "models"
+    if target.exists():
+        try:
+            _shutil.rmtree(target)
+            print(f"[clean] Deleted folder {target}")
+            return 1
+        except Exception as e:
+            print(f"[warn] Could not delete {target}: {e}")
+            return 0
+    else:
+        print(f"[clean] scripts/models not present; nothing to delete")
+        return 0
 def sha256sum(path):
     h = hashlib.sha256()
     with open(path, "rb") as f:
@@ -153,7 +199,7 @@ def fetch_with_fallback(url_or_list, dest_path, expected_sha256=None, token: str
         raise last_err
 
 def move_all_to_root_models_bg(temp_dest: pathlib.Path) -> int:
-    final_root = pathlib.Path("models/bg")
+    final_root = ROOT_BG
     final_root.mkdir(parents=True, exist_ok=True)
     try:
         same_dir = temp_dest.resolve() == final_root.resolve()
@@ -187,7 +233,7 @@ def move_all_to_root_models_bg(temp_dest: pathlib.Path) -> int:
     return moved
 
 def cleanup_model_root_zips() -> int:
-    root = pathlib.Path("models")
+    root = ROOT_MODELS
     if not root.exists():
         return 0
     deleted = 0
@@ -206,11 +252,69 @@ def cleanup_model_root_zips() -> int:
             print(f"[warn] Could not delete {z.name}: {e}")
     return deleted
 
+
+def reconcile_scripts_models() -> None:
+    """Move legacy artifacts from scripts/models to project root paths, then delete the folder.
+    - Folders -> move to ROOT/models/
+    - realsr*.zip -> unzip to ROOT/models/ and delete the zip
+    - Other .zip -> move to ROOT/models/ (zip cleanup will handle removal)
+    - Any other files -> move to ROOT/models/bg
+    """
+    legacy = SCRIPTS_MODELS
+    if not legacy.exists():
+        return
+    ROOT_MODELS.mkdir(parents=True, exist_ok=True)
+    ROOT_BG.mkdir(parents=True, exist_ok=True)
+
+    for p in list(legacy.glob("*")):
+        try:
+            if p.is_dir():
+                dest = ROOT_MODELS / p.name
+                if not dest.exists():
+                    _shutil.move(str(p), str(dest))
+                    print(f"[move] {p} -> {dest}")
+                else:
+                    print(f"[skip] {dest} already present")
+                continue
+            # Files
+            if p.suffix.lower() == ".zip":
+                if p.name.lower().startswith("realsr"):
+                    # extract then delete
+                    _extract_zip(p, ROOT_MODELS)
+                    try:
+                        p.unlink()
+                        print(f"[clean] Deleted zip {p.name} after extraction")
+                    except Exception as e:
+                        print(f"[warn] Could not delete zip {p.name}: {e}")
+                else:
+                    dest = ROOT_MODELS / p.name
+                    if not dest.exists():
+                        _shutil.move(str(p), str(dest))
+                        print(f"[move] {p} -> {dest}")
+                    else:
+                        print(f"[skip] {dest} already present")
+            else:
+                dest = ROOT_BG / p.name
+                if not dest.exists():
+                    _shutil.move(str(p), str(dest))
+                    print(f"[move] {p} -> {dest}")
+                else:
+                    print(f"[skip] {dest} already present")
+        except Exception as e:
+            print(f"[warn] Could not reconcile {p}: {e}")
+    # finally nuke the now-empty legacy folder
+    try:
+        _shutil.rmtree(legacy)
+        print(f"[clean] Deleted folder {legacy}")
+    except Exception as e:
+        print(f"[warn] Could not delete {legacy}: {e}")
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--dest", default="models/bg", help="Temporary download folder (files will be moved to project-root models/bg at the end)")
     ap.add_argument("--pro", action="store_true", help="Include BiRefNet (≈900 MB) when not using --all/--only")
     ap.add_argument("--sd15-inpaint", action="store_true", help="Include SD 1.5 Inpainting (≈4.0 GB) when not using --all/--only")
+    ap.add_argument("--realsr", action="store_true", help="Include RealSR 2x/4x (realsr-ncnn-vulkan) zip")
     ap.add_argument("--all", action="store_true", help="Download ALL supported models")
     ap.add_argument("--only", nargs="+", choices=list(MODELS.keys()), help="Download only these model keys (space-separated)")
     ap.add_argument("--hf-token", default=None, help="Hugging Face access token (overrides HF_TOKEN/HUGGINGFACE_TOKEN env vars)")
@@ -239,14 +343,31 @@ def main():
             to_get.append("sd15_inpaint_fp16")
         reason = "--pro/--sd15-inpaint"
 
+    
+    # If explicitly requested, include RealSR
+    if args.realsr and "realsr_ncnn_zip" not in to_get:
+        to_get.append("realsr_ncnn_zip")
+        reason += "+realsr"
     print(f"[select] reason={reason} -> {to_get}")
     any_fail = False
     for key in to_get:
         m = MODELS[key]
         out = dest / m["filename"]
+        # Skip if file already exists in temp dest
         if out.exists():
             print(f"[skip] {out.name} already exists in {dest}")
             continue
+        # Skip if final file already exists in models/bg
+        final_check = ROOT_BG / m["filename"]
+        if final_check.exists():
+            print(f"[skip] {final_check.name} already exists in models/bg")
+            continue
+        # Skip if extracted folder already exists (for zip models)
+        if isinstance(m, dict) and m.get("exists_path"):
+            exists_path = (ROOT / m["exists_path"]) if not pathlib.Path(m["exists_path"]).is_absolute() else pathlib.Path(m["exists_path"])
+            if exists_path.exists():
+                print(f"[skip] {exists_path} already present")
+                continue
         print(f"[get ] {out.name}  {m['size_hint']}")
         try:
             fetch_with_fallback(m["url"], out, m["sha256"], token=token)
@@ -255,19 +376,36 @@ def main():
             print(f"[fail] {out.name}: {e}")
         else:
             print(f"[ ok ] Saved to {out}")
+        # If this model specifies an extraction target and we saved a .zip, unzip and delete zip
+        if isinstance(m, dict) and m.get("extract_to") and out.suffix.lower() == ".zip":
+            try:
+                target_root = (ROOT / m["extract_to"]) if not pathlib.Path(m["extract_to"]).is_absolute() else pathlib.Path(m["extract_to"])
+                _extract_zip(out, target_root)
+                try:
+                    out.unlink()
+                    print(f"[clean] Deleted zip {out.name} after extraction")
+                except Exception as e:
+                    print(f"[warn] Could not delete zip {out.name}: {e}")
+            except Exception as e:
+                any_fail = True
+                print(f"[fail] Extract {out.name}: {e}")
 
     moved = move_all_to_root_models_bg(dest)
-    final_root = pathlib.Path("models/bg").resolve()
+    final_root = ROOT_BG.resolve()
     if moved:
         print(f"[move] Moved {moved} file(s) to {final_root}")
     else:
         print(f"[move] No files moved; they were already in {final_root}")
 
     removed = cleanup_model_root_zips()
+    # Reconcile and remove legacy scripts/models
+    reconcile_scripts_models()
     if removed:
         print(f"[clean] Removed {removed} zip file(s) from {pathlib.Path('models').resolve()}")
     else:
         print(f"[clean] No zip files to remove in {pathlib.Path('models').resolve()}")
+    # Remove entire scripts/models folder (legacy temp location)
+    cleanup_scripts_models_dir()
 
     if any_fail and not args.ignore_errors:
         print("[done] Completed with errors.", file=sys.stderr)
