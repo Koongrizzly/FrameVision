@@ -1,0 +1,7 @@
+# Pinned stack for BLIP-based describer
+transformers==4.40.2
+accelerate==0.27.2
+safetensors==0.4.2
+huggingface-hub>=0.23.2
+timm==0.9.16
+pillow>=9.5.0

@@ -1,0 +1,10 @@
+{
+  "style": "",
+  "length_choice": "Long (140–200 words)",
+  "target": "image",
+  "model_key": "qwen2-vl-2b",
+  "negatives": "",
+  "temperature": 0.8,
+  "max_new_tokens": 420,
+  "seed_text": "somewhere deep in space, an alien is in his spaceship, looking for a planet to live"
+}
