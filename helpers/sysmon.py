@@ -3,10 +3,10 @@ from __future__ import annotations
 import os, shutil, subprocess, platform, re, time
 from typing import Optional, List, Tuple, Dict
 
-from PySide6.QtCore import Qt, QTimer, QSettings, Signal, QObject, QThread, QUrl
+from PySide6.QtCore import Qt, QTimer, QSettings, Signal, QObject, QThread, QUrl, QEvent
 from PySide6.QtWidgets import (
     QApplication, QWidget, QVBoxLayout, QHBoxLayout, QLabel, QCheckBox,
-    QPushButton, QSizePolicy, QToolButton, QFrame, QStyle, QScrollArea
+    QPushButton, QSizePolicy, QToolButton, QFrame, QStyle, QScrollArea, QSpinBox
 )
 from PySide6.QtGui import QDesktopServices
 
@@ -53,6 +53,8 @@ ORG="FrameVision"; APP="FrameVision"
 ROOT = os.path.dirname(os.path.dirname(__file__))
 K_SYSMON_ENABLED = "sysmon_enabled"
 K_SYSMON_LOW     = "sysmon_low_impact"
+K_MEM_AUTO_ENABLED = "mem_auto_clean_enabled"
+K_MEM_AUTO_MINUTES = "mem_auto_clean_minutes"
 K_HUD_ENABLED    = "hud_enabled"
 K_FIRST_RUN_TS   = "first_run_epoch"
 
@@ -188,6 +190,154 @@ def _core_counts() -> Tuple[int,int]:
     except Exception:
         return (0, 0)
 
+
+# ---- Memory utilities --------------------------------------------------------
+def _clean_app_ram_best_effort() -> dict:
+    """Best-effort RAM cleanup for this process: drop known caches and collect garbage.
+    Returns a dict with 'before' and 'after' RSS in bytes and any notes.
+    """
+    notes = []
+    before = 0; after = 0
+    try:
+        import psutil  # type: ignore
+        p = psutil.Process(os.getpid())
+        before = int(getattr(p.memory_info(), "rss", 0))
+    except Exception:
+        pass
+
+    # Drop known session caches (helpers.background ONNX sessions)
+    try:
+        import helpers.background as _bg  # type: ignore
+        cache = getattr(_bg, "_ORT_SESSION_CACHE", None)
+        if isinstance(cache, dict) and cache:
+            try:
+                # ensure sessions are dereferenced to allow free
+                for k, sess in list(cache.items()):
+                    try:
+                        del cache[k]
+                    except Exception:
+                        pass
+                cache.clear()
+                notes.append("Cleared background._ORT_SESSION_CACHE")
+            except Exception:
+                pass
+    except Exception:
+        pass
+
+    # General Python GC
+    try:
+        import gc
+        gc.collect()
+        gc.collect()
+        notes.append("gc.collect()")
+    except Exception:
+        pass
+
+    # TensorFlow / Keras session clear (if any)
+    try:
+        import tensorflow as tf  # type: ignore
+        try:
+            tf.keras.backend.clear_session()
+            notes.append("tf.keras.backend.clear_session()")
+        except Exception:
+            pass
+    except Exception:
+        pass
+
+    # Try to measure again
+    try:
+        import psutil  # type: ignore
+        p = psutil.Process(os.getpid())
+        after = int(getattr(p.memory_info(), "rss", 0))
+    except Exception:
+        pass
+
+    return {"before": before, "after": after, "notes": notes}
+
+def _clean_vram_best_effort() -> list[str]:
+    """Best-effort VRAM cleanup for in-process frameworks. Returns list of actions taken."""
+    actions = []
+    # PyTorch CUDA
+    try:
+        import torch  # type: ignore
+        try:
+            if hasattr(torch, "cuda") and torch.cuda.is_available():
+                torch.cuda.synchronize()
+                torch.cuda.empty_cache()
+                # ipc_collect can reclaim interprocess memory handles
+                if hasattr(torch.cuda, "ipc_collect"):
+                    torch.cuda.ipc_collect()
+                actions.append("torch.cuda.empty_cache()")
+        except Exception:
+            pass
+        # Apple MPS
+        try:
+            if hasattr(torch, "mps") and hasattr(torch.mps, "empty_cache"):
+                torch.mps.empty_cache()
+                actions.append("torch.mps.empty_cache()")
+        except Exception:
+            pass
+    except Exception:
+        pass
+
+    # ONNX Runtime CUDA sessions (freed by RAM cleanup when sessions are dropped)
+    try:
+        import helpers.background as _bg  # type: ignore
+        cache = getattr(_bg, "_ORT_SESSION_CACHE", None)
+        if isinstance(cache, dict) and not cache:
+            actions.append("ORT sessions dropped")
+    except Exception:
+        pass
+
+    return actions
+
+def _snapshot_loaded_models() -> str:
+    """Return a short human-readable summary of likely in-memory models."""
+    parts = []
+    # ONNX sessions in background tool
+    try:
+        import helpers.background as _bg  # type: ignore
+        cache = getattr(_bg, "_ORT_SESSION_CACHE", None)
+        if isinstance(cache, dict):
+            names = []
+            for k in list(cache.keys()):
+                try:
+                    # keys may be (model_path, providers); handle tuples/strings
+                    if isinstance(k, (tuple, list)) and k:
+                        kp = k[0]
+                    else:
+                        kp = k
+                    base = os.path.basename(str(kp))
+                    names.append(base)
+                except Exception:
+                    pass
+            if names:
+                parts.append(f"ONNX sessions: {len(names)} ({', '.join(names[:4])}{'…' if len(names)>4 else ''})")
+    except Exception:
+        pass
+    # Diffusers / Transformers presence
+    try:
+        import diffusers  # type: ignore
+        parts.append("Diffusers: present")
+    except Exception:
+        pass
+    try:
+        import transformers  # type: ignore
+        parts.append("Transformers: present")
+    except Exception:
+        pass
+    # Torch & device context snapshot
+    try:
+        import torch  # type: ignore
+        if hasattr(torch, "cuda") and torch.cuda.is_available():
+            try:
+                n = torch.cuda.device_count()
+            except Exception:
+                n = 1
+            parts.append(f"CUDA active (devices={n})")
+    except Exception:
+        pass
+    return " • ".join(parts) if parts else "—"
 # ---- Versions line ----------------------------------------------------------
 def _versions_line() -> str:
     cuda = None; torch_v = None; tv = None; tf = None
@@ -439,6 +589,11 @@ class SysMonPanel(QWidget):
         self.enabled = bool(s.value(K_SYSMON_ENABLED, False))
         self.low_impact = bool(s.value(K_SYSMON_LOW, True))
         self.hud_enabled = bool(s.value(K_HUD_ENABLED, True))
+        self.mem_auto_enabled = bool(s.value(K_MEM_AUTO_ENABLED, False))
+        try:
+            self.mem_auto_minutes = int(s.value(K_MEM_AUTO_MINUTES, 10))
+        except Exception:
+            self.mem_auto_minutes = 10
 
         # First-run timestamp
         first = s.value(K_FIRST_RUN_TS, None)
@@ -471,6 +626,39 @@ class SysMonPanel(QWidget):
 
         top = QHBoxLayout(); top.setContentsMargins(0,0,0,0); top.setSpacing(12)
         top.addWidget(self.toggle); top.addWidget(self.low); top.addWidget(self.hud); top.addStretch(1)
+        # --- Memory controls ---
+        self.btn_clean_ddr = QPushButton("Clean DDR memory")
+        self.btn_clean_ddr.setToolTip("Free this app's RAM by dropping caches and running garbage collection.")
+        self.btn_clean_vram = QPushButton("Clean VRAM completely")
+        self.btn_clean_vram.setToolTip("Free this app's GPU memory by clearing CUDA/MPS caches and dropping sessions.")
+
+        self.btn_clean_ddr.clicked.connect(self._on_clean_ddr)
+        self.btn_clean_vram.clicked.connect(self._on_clean_vram)
+
+        row_mem = QHBoxLayout(); row_mem.setContentsMargins(0,0,0,0); row_mem.setSpacing(8)
+        row_mem.addWidget(self.btn_clean_ddr)
+        row_mem.addWidget(self.btn_clean_vram)
+        row_mem.addStretch(1)
+
+        # Auto-clean on idle
+        self.chk_auto_clean = QCheckBox("Auto-clean on idle")
+        self.chk_auto_clean.setChecked(self.mem_auto_enabled)
+        self.chk_auto_clean.setToolTip("When enabled, automatically clean DDR + VRAM after a period with no user input in the app.")
+        self.spin_idle_min = QSpinBox(self); self.spin_idle_min.setRange(1,59); self.spin_idle_min.setSuffix(" min")
+        self.spin_idle_min.setValue(max(1, min(59, int(self.mem_auto_minutes))))
+
+        self.chk_auto_clean.toggled.connect(self._on_auto_clean_toggle)
+        self.spin_idle_min.valueChanged.connect(self._on_auto_clean_minutes)
+
+        row_auto = QHBoxLayout(); row_auto.setContentsMargins(0,0,0,0); row_auto.setSpacing(8)
+        row_auto.addWidget(self.chk_auto_clean)
+        row_auto.addWidget(self.spin_idle_min)
+        row_auto.addStretch(1)
+
+        # Brief snapshot of models potentially in memory
+        self.lbl_models = QLabel(f"Likely in-memory models: {_snapshot_loaded_models()}")
+        self.lbl_models.setTextFormat(Qt.PlainText)
+
 
         # --- Static CPU info (brand + cores) ---
         brand = _read_cpu_brand()
@@ -554,6 +742,9 @@ class SysMonPanel(QWidget):
 
         v = QVBoxLayout(self); v.setContentsMargins(8,8,8,8); v.setSpacing(6)
         v.addLayout(top)
+        v.addLayout(row_mem)
+        v.addLayout(row_auto)
+        v.addWidget(self.lbl_models)
         v.addWidget(self.lbl_cpu_info)
         v.addWidget(self.lbl_cpu)
         v.addWidget(self.lbl_ram)
@@ -584,6 +775,45 @@ class SysMonPanel(QWidget):
         if self.enabled: self._kick_dir_scan()
 
         QTimer.singleShot(0, _load_hud_setting_and_apply)
+        # Idle tracking
+        self._last_input_ts = time.monotonic()
+        self._idle_clean_done = False
+        app = QApplication.instance()
+        if app:
+            app.installEventFilter(self)
+
+
+
+
+
+    def _on_auto_clean_toggle(self, b: bool):
+        self.mem_auto_enabled = bool(b)
+        QSettings(ORG, APP).setValue(K_MEM_AUTO_ENABLED, self.mem_auto_enabled)
+        # reset idle state
+        self._idle_clean_done = False
+
+    def _on_auto_clean_minutes(self, val: int):
+        self.mem_auto_minutes = int(val)
+        QSettings(ORG, APP).setValue(K_MEM_AUTO_MINUTES, self.mem_auto_minutes)
+        self._idle_clean_done = False
+
+    def _on_clean_ddr(self):
+        try:
+            res = _clean_app_ram_best_effort()
+            # Optionally, reflect snapshot line
+            try: self.lbl_models.setText(f"Likely in-memory models: {_snapshot_loaded_models()}")
+            except Exception: pass
+        except Exception:
+            res = {"before": 0, "after": 0, "notes": []}
+
+    def _on_clean_vram(self):
+        try:
+            _clean_vram_best_effort()
+            # Also try to re-snapshot
+            try: self.lbl_models.setText(f"Likely in-memory models: {_snapshot_loaded_models()}")
+            except Exception: pass
+        except Exception:
+            pass
 
     def _apply_interval(self):
         self.timer.setInterval(2500 if self.low_impact else  1000)
@@ -642,6 +872,19 @@ class SysMonPanel(QWidget):
         self.session_start_ts = time.time()
         self.lbl_uptime_session.setText("Time online (this session): 0m")
 
+
+    def eventFilter(self, obj, event):
+        try:
+            et = event.type()
+            if et in (QEvent.MouseMove, QEvent.MouseButtonPress, QEvent.MouseButtonRelease,
+                      QEvent.KeyPress, QEvent.KeyRelease, QEvent.Wheel, QEvent.TouchBegin,
+                      QEvent.TouchUpdate, QEvent.TouchEnd, QEvent.FocusIn):
+                self._last_input_ts = time.monotonic()
+                self._idle_clean_done = False
+        except Exception:
+            pass
+        return False
+
     def _tick_seconds(self):
         if not self.enabled: return
         now = time.time()
@@ -649,6 +892,18 @@ class SysMonPanel(QWidget):
         except Exception: pass
         try: self.lbl_uptime_total.setText(f"Time online (since first run): {_fmt_dur(now - self.first_run_ts)}")
         except Exception: pass
+        # Auto-clean check based on app idle time
+        try:
+            if self.mem_auto_enabled:
+                idle_secs = max(0, time.monotonic() - getattr(self, '_last_input_ts', time.monotonic()))
+                if (idle_secs >= (int(self.mem_auto_minutes) * 60)) and not self._idle_clean_done:
+                    _clean_app_ram_best_effort()
+                    _clean_vram_best_effort()
+                    self._idle_clean_done = True
+                    try: self.lbl_models.setText(f"Likely in-memory models: {_snapshot_loaded_models()}")
+                    except Exception: pass
+        except Exception:
+            pass
 
     def _tick(self):
         if not self.enabled: return

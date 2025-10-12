@@ -890,6 +890,7 @@ def install_background_tool(pane, section_widget) -> None:
     _ui_flags = {'auto_inpaint': False, 'freeze_unmasked': True}
 
     class Preview(QWidget):
+        _ui_flags = {'auto_inpaint': False, 'freeze_unmasked': True}
 
         maskChanged = Signal()
         fileDropped = Signal(str)
@@ -1451,6 +1452,12 @@ def install_background_tool(pane, section_widget) -> None:
 
             p.end()
 
+
+    # Ensure class-level UI flags exist even if edited above
+    try:
+        getattr(Preview, '_ui_flags')
+    except Exception:
+        Preview._ui_flags = {'auto_inpaint': False, 'freeze_unmasked': True}
 
     container = QWidget()
     vbox = QVBoxLayout(container)
