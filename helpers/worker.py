@@ -119,7 +119,7 @@ def _resolve_models_folder(cfg: dict) -> Path:
     return BASE/'models'
 
 
-LEGACY_BASES = [ROOT / "FrameVision", ROOT / "framevision", ROOT / "FrameLab"]
+LEGACY_BASES = [ROOT / "FrameVision", ROOT / "framevision", ROOT / "Framevis*"]
 def _migrate_legacy_tree():
     base = BASE
     for p in ["output/video","output/trims","output/screenshots","output/descriptions","output/_temp",
@@ -355,6 +355,48 @@ def ffmpeg_path():
 
 FFMPEG = ffmpeg_path()
 
+def _ffprobe_bin():
+    cands = [ROOT/"bin"/('ffprobe.exe' if os.name=='nt' else 'ffprobe'),
+             ROOT/"presets"/"bin"/('ffprobe.exe' if os.name=='nt' else 'ffprobe'),
+             str(FFMPEG).replace("ffmpeg","ffprobe"),
+             "ffprobe"]
+    for c in cands:
+        try:
+            subprocess.check_output([str(c), "-version"], stderr=subprocess.STDOUT)
+            return str(c)
+        except Exception:
+            continue
+    return "ffprobe"
+
+def _probe_src_fps(p: Path) -> str:
+    try:
+        FP = _ffprobe_bin()
+        out = subprocess.check_output(
+            [FP, "-v", "error", "-select_streams", "v:0",
+             "-show_entries", "stream=avg_frame_rate,r_frame_rate",
+             "-of", "csv=p=0", str(p)], stderr=subprocess.STDOUT
+        ).decode("utf-8","ignore").strip().splitlines()
+        for val in out:
+            val = (val or "").strip()
+            if not val or val in ("0/0","0","N/A"):
+                continue
+            if "/" in val:
+                a,b = val.split("/",1)
+                try:
+                    if float(b) != 0:
+                        return val
+                except Exception:
+                    pass
+            try:
+                f = float(val)
+                if f > 0: return f"{f:g}"
+            except Exception:
+                pass
+    except Exception:
+        pass
+    return "30"
+
+
 
 def _normalize_realesr_model(model_name: str, factor: int|float|str):
     """
@@ -488,7 +530,7 @@ def upscale_video(job, cfg, mani):
             except Exception:
                 pass
 
-            enc = [FFMPEG,"-y","-i",str(up/"%06d.png"),"-c:v","libx264","-preset","veryfast","-pix_fmt","yuv420p","-movflags","+faststart",str(out)]
+            enc = [FFMPEG,"-y","-framerate", _probe_src_fps(inp), "-i", str(up/"%06d.png"),"-i",str(inp),"-map","0:v:0","-map","1:a:0?","-c:a","copy","-c:v","libx264","-preset","veryfast","-pix_fmt","yuv420p","-vsync","cfr","-r",_probe_src_fps(inp),"-movflags","+faststart",str(out)]
             if run(enc)!=0:
                 return 1
             try:
