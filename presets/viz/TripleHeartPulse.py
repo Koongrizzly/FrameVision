@@ -8,6 +8,10 @@ from helpers.music import register_visualizer, BaseVisualizer
 _prev = []
 _env = 0.0
 _gate = 0.0
+_punch = 0.0
+_f_short = 0.0
+_f_long = 0.0
+_pt = None  # last timestamp
 
 def _midhi(bands):
     if not bands: return 0.0
@@ -34,24 +38,33 @@ def _flux(bands):
     _prev = [0.88*_prev[i] + 0.12*bands[i] for i in range(n)]
     return f/max(1, c)
 
-def _env_drive(bands, rms):
-    global _env, _gate
+def _env_drive(bands, rms, t):
+    global _env, _gate, _punch, _f_short, _f_long, _pt
     e = _midhi(bands); f = _flux(bands)
-    target = 0.55*e + 1.30*f + 0.20*rms
-    target = target / (1.0 + 0.7*target)  # soft compression
-    # attack/release
-    if target > _env: _env = 0.68*_env + 0.32*target
-    else: _env = 0.92*_env + 0.08*target
-    # onset gate (binary-ish) for extra punch
-    hi, lo = 0.30, 0.18
+    # Energy with stronger soft-ceiling and fast release
+    target = 0.50*e + 1.00*f + 0.10*rms
+    target = target / (1.0 + 1.25*target)
+    if target > _env: _env = 0.78*_env + 0.22*target
+    else:             _env = 0.50*_env + 0.50*target
+    # Gate (keep for sparkles/color)
+    hi, lo = 0.26, 0.14
     g = 1.0 if f > hi else (0.0 if f < lo else _gate)
-    _gate = 0.80*_gate + 0.20*g
-    # clamp
-    if _env < 0: _env = 0.0
-    if _env > 1: _env = 1.0
-    if _gate < 0: _gate = 0.0
-    if _gate > 1: _gate = 1.0
-    return _env, _gate
+    _gate = 0.72*_gate + 0.28*g
+    # Robust onset from flux: dual EMA (no lows available in this file)
+    _f_short = 0.65*_f_short + 0.35*f
+    _f_long  = 0.95*_f_long  + 0.05*f
+    onset = max(0.0, _f_short - _f_long)
+    norm = _f_long + 1e-4
+    onset_n = min(1.0, onset/(0.35*norm))
+    # Time + fast punch decay
+    if _pt is None: _pt = t
+    dt = max(0.0, min(0.033, t - _pt)); _pt = t
+    _punch = max(_punch * pow(0.30, dt/0.05), onset_n)
+    # Clamp
+    _env = max(0.0, min(1.0, _env))
+    _gate = max(0.0, min(1.0, _gate))
+    _punch = max(0.0, min(1.0, _punch))
+    return _env, _gate, _punch
 
 def _heart_path(cx, cy, s):
     # Make a heart at (cx,cy) with size s (roughly half-width).
@@ -72,7 +85,7 @@ class TripleHeartPulse(BaseVisualizer):
         # background
         p.fillRect(r, QBrush(QColor(8, 8, 14)))
 
-        env, gate = _env_drive(bands, rms)
+        env, gate, punch = _env_drive(bands, rms, t)
 
         # layout positions (left, center, right)
         cx = r.center().x()
@@ -82,7 +95,8 @@ class TripleHeartPulse(BaseVisualizer):
 
         # base size and scale with beat (outer and center all scale)
         base_s = min(w, h) * 0.075
-        scale = 0.95 + 1.35*(env**1.15) + (0.25 if gate > 0.6 else 0.0)
+        # Clear big/small: small base, big on punch (onsets)
+        scale = 0.80 + 0.50*env + 1.20*punch + (0.20 if gate>0.55 else 0.00)
 
         # colors
         red_fill = QColor(255, 70, 110, 180)

@@ -72,7 +72,7 @@ class PrismEQLogo(BaseVisualizer):
 
         # logo
         base = min(w,h)
-        size = int(base*0.16)
+        size = int(base*0.12)
         font = QFont("Arial", size, QFont.Bold)
         p.setFont(font)
         fm = QFontMetrics(font)

@@ -7,8 +7,8 @@ from helpers.music import register_visualizer, BaseVisualizer
 
 # ======== Config ========
 FREEZE_WHEN_IDLE   = True    # freeze when no music
-IDLE_TO_CENTER_SEC = 2.0     # seconds since last beat -> idle
-IDLE_ENV_THR       = 0.04    # energy floor to consider idle
+IDLE_TO_CENTER_SEC = 3.0     # seconds since last beat -> idle
+IDLE_ENV_THR       = 0.02    # energy floor to consider idle
 POP_HALF_LIFE      = 0.09    # seconds — visual pop persistence
 
 # ======== Shared state ========

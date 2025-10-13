@@ -1,3 +1,10 @@
+# --- InvertedTrianglesPulse_basspulse_v1.py ---
+# Bass‑biased pulsing: small between beats, big on the kick.
+# Changes vs v4:
+# - Dual‑EMA onset runs on a bass‑weighted mix (0.75*low + 0.25*flux).
+# - Mapping gives a little extra credit to bass (boom) and less to env.
+# - Everything else stays fast and snappy. Comments are plain English.
+
 # --- InvertedTrianglesPulse_pulse128_v4.py ---
 # Fix for 'moves once then stops': dual-EMA onset detection + fast decay.
 # Short EMA vs Long EMA creates a continuous onset signal; no brittle thresholds.

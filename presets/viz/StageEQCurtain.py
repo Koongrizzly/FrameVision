@@ -35,7 +35,7 @@ def _split(bands):
     hi=sum(bands[b:])/max(1,(n-b))
     return lo,mid,hi
 
-def _env_step(env, target, up=0.42, down=0.16):
+def _env_step(env, target, up=0.32, down=0.16):
     return (1-up)*env + up*target if target>env else (1-down)*env + down*target
 
 def _sample_bands(bands, n_out):
@@ -75,20 +75,20 @@ class StageEQCurtain(BaseVisualizer):
 
         # headline logo
         base = min(w,h)
-        size = int(base*0.15)
+        size = int(base*0.12)
         font = QFont("Arial", size, QFont.Black)
         p.setFont(font)
         hue = int((t*16 + 200*_warm) % 360)
         p.setPen(QPen(QColor.fromHsv(hue, 200, 255, 255), 6))
-        p.drawText(QRectF(0, h*0.18 - size*0.6, w, size*1.2), Qt.AlignCenter, SIGN_TEXT)
+        p.drawText(QRectF(0, h*0.22 - size*0.4, w, size*1.2), Qt.AlignCenter, SIGN_TEXT)
 
-        # 12-band floor EQ
-        bins = 12
+        # 24-band floor EQ
+        bins = 24
         vals = _sample_bands(bands, bins)
         if len(_eq)!=bins: _eq=[0.0]*bins
         for i,v in enumerate(vals):
             targ = 2.5*v + 1.0*fx
-            _eq[i] = _env_step(_eq[i], targ, up=0.65, down=0.22)
+            _eq[i] = _env_step(_eq[i], targ, up=0.35, down=0.12)
 
         left = int(w*0.12); right=int(w*0.88)
         base_y = int(h*0.78)

@@ -72,7 +72,7 @@ class BounceStampLogo(BaseVisualizer):
         p.setFont(QFont("Arial", size, QFont.Black))
 
         # bounce + squash
-        y_bounce = int(h*0.06 * (0.35*norm + _imp))
+        y_bounce = int(h*0.03 * (0.35*norm + _imp))
         sx = 1.0 + 0.06*(0.35*norm + _imp)
         sy = 1.0 - 0.08*(0.35*norm + _imp)
 

@@ -5,6 +5,8 @@ from PySide6.QtCore import QPointF, QRectF
 from helpers.music import register_visualizer, BaseVisualizer
 
 _prev = []; _env=_gate=_punch=0.0; _pt=None; _sdict={}
+_f_short = 0.0  # short EMA of onset mix (reacts fast)
+_f_long  = 0.0  # long EMA (baseline)
 
 def _midhi(bands):
     if not bands: return 0.0
@@ -39,20 +41,31 @@ def _flux(bands):
     return f/max(1,c)
 
 def beat_drive(bands, rms, t):
-    global _env,_gate,_punch,_pt
+    global _env,_gate,_punch,_pt,_f_short,_f_long
     e=_midhi(bands); f=_flux(bands); lo=_low(bands)
-    target=0.58*e + 1.30*f + 0.18*rms + 0.22*lo
-    target=target/(1+0.7*target)
+    # Energy mix + soft ceiling (kept moderate)
+    target = 0.55*e + 1.10*f + 0.12*rms + 0.15*lo
+    target = target/(1+1.10*target)
+    # Envelope: quick up, quicker down so it shrinks between hits
     if target>_env: _env=0.72*_env+0.28*target
-    else: _env=0.92*_env+0.08*target
-    hi,lo_thr=0.30,0.18
+    else: _env=0.50*_env+0.50*target
+    # Gate retained for color/extra punch
+    hi,lo_thr=0.24,0.14
     g=1.0 if f>hi else (0.0 if f<lo_thr else _gate)
-    _gate=0.82*_gate + 0.18*g
-    boom=min(1.0, max(0.0, lo*1.25 + 0.42*rms))
+    _gate=0.70*_gate + 0.30*g
+    # Bass-biased dual-EMA onset -> robust pulse that never 'sleeps'
+    mix = 0.70*lo + 0.30*f
+    _f_short = 0.65*_f_short + 0.35*mix
+    _f_long  = 0.95*_f_long  + 0.05*mix
+    onset = max(0.0, _f_short - _f_long)
+    norm = _f_long + 1e-4
+    onset_n = min(1.0, onset/(0.32*norm))
+    # Time step and fast punch decay
     if _pt is None: _pt=t
     dt=max(0.0, min(0.033, t-_pt)); _pt=t
-    decay = pow(0.78, dt/0.016) if dt>0 else 0.78
-    _punch = max(_punch*decay, 1.0 if g>0.6 else 0.0)
+    _punch = max(_punch * pow(0.30, dt/0.05), onset_n)
+    # Bass push (small)
+    boom=min(1.0, max(0.0, 0.70*lo + 0.20*rms))
     return max(0.0,min(1.0,_env)), max(0.0,min(1.0,_gate)), boom, max(0.0,min(1.0,_punch))
 
 def spring_to(key, target, t, k=30.0, c=6.0, lo=0.25, hi=4.0):
