@@ -955,6 +955,22 @@ class MusicOverlay(QWidget):
         L.addLayout(row_btns)
         L.addLayout(row_vis1)
         L.addLayout(row_vis2)
+        # crossfade controls
+        self.chk_xfade = QCheckBox('Crossfade visuals')
+        self.cmb_fade = QComboBox()
+        try:
+            self.cmb_fade.addItems(['1.0s','1.5s','2.0s','3.0s','4.0s'])
+            self.cmb_fade.setCurrentIndex(2)  # default 2.0s
+        except Exception:
+            pass
+        row_vis3 = QHBoxLayout()
+        row_vis3.addWidget(self.chk_xfade)
+        row_vis3.addSpacing(8)
+        row_vis3.addWidget(QLabel('Fade'))
+        row_vis3.addWidget(self.cmb_fade)
+        row_vis3.addStretch(1)
+        L.addLayout(row_vis3)
+
 
         # signals
         self.btn_add.clicked.connect(self._add_files)
@@ -1431,6 +1447,21 @@ class MusicOverlay(QWidget):
             self.btn_vizmode.setText('1')
         else:
             self.btn_vizmode.setText('random')
+
+    def crossfade_enabled(self) -> bool:
+        try:
+            return bool(self.chk_xfade.isChecked())
+        except Exception:
+            return False
+
+    def crossfade_ms(self) -> int:
+        try:
+            txt = self.cmb_fade.currentText().lower().replace('s','').strip()
+            val = float(txt)
+            val = max(1.0, min(4.0, val))
+            return int(val * 1000)
+        except Exception:
+            return 2000
 # ---------------- State helpers ----------------
 
 def _load_state() -> dict:
@@ -1457,6 +1488,11 @@ class MusicRuntime(QObject):
         self.overlay: Optional[MusicOverlay] = None
         self.visual = VisualEngine(self, bars=48)
         self.visual.frameReady.connect(self._on_visual_frame)
+        # engine for outgoing-visual during crossfade (keeps old visual animating)
+        self.visual_prev = VisualEngine(self, bars=48)
+        self.visual_prev.frameReady.connect(self._on_prev_visual_frame)
+        # not started by default; only during fades
+        self._xfade_prev_running = False
         self.timer = QTimer(self)
         self.timer.timeout.connect(self._update)
         self.cover: Optional[QPixmap] = None
@@ -1486,6 +1522,14 @@ class MusicRuntime(QObject):
         self._silence_min_ms = 250  # how long it must stay below gate
         self._return_cooldown_ms = 3700  # min gap between return-triggered switches
 
+    
+        # crossfade state
+        self._last_visual_img = None
+        self._xfade_prev_img = None
+        self._xfade_active = False
+        self._xfade_t0 = 0.0
+        self._xfade_ms = 2000
+
     def start(self, path_for_analysis: Optional[Path] = None):
         try:
             self.visual.set_target(self.video.label.size())
@@ -1501,6 +1545,15 @@ class MusicRuntime(QObject):
         self.timer.stop()
         self.visual.stop()
         self.an.stop()
+    def _on_prev_visual_frame(self, img: QImage):
+        """Capture live frames from the outgoing visual during crossfade."""
+        try:
+            if getattr(self, "_xfade_active", False):
+                self._xfade_prev_img = img.copy()
+        except Exception:
+            pass
+
+
 
     def _draw_header_once(self):
         try:
@@ -1539,7 +1592,37 @@ class MusicRuntime(QObject):
             if self.overlay is None or self.overlay.visuals_enabled():
                 pm = QPixmap.fromImage(img)
                 pm = pm.scaled(QSize(w, h), Qt.KeepAspectRatio, Qt.SmoothTransformation)
-                p.drawPixmap((w - pm.width()) // 2, (h - pm.height()) // 2, pm)
+                # Crossfade blend if active
+                cx = (w - pm.width()) // 2
+                cy = (h - pm.height()) // 2
+                if getattr(self, "_xfade_active", False) and self._xfade_prev_img is not None and (self.overlay and self.overlay.visuals_enabled()):
+                    try:
+                        prog = max(0.0, min(1.0, (((_time.time() - float(self._xfade_t0)) * 1000.0) / max(1, int(self._xfade_ms)))))
+                    except Exception:
+                        prog = 1.0
+                    prev_pm = QPixmap.fromImage(self._xfade_prev_img)
+                    prev_pm = prev_pm.scaled(QSize(w, h), Qt.KeepAspectRatio, Qt.SmoothTransformation)
+                    p.save()
+                    p.setOpacity(1.0 - prog)
+                    p.drawPixmap((w - prev_pm.width()) // 2, (h - prev_pm.height()) // 2, prev_pm)
+                    p.restore()
+                    p.save()
+                    p.setOpacity(prog)
+                    p.drawPixmap(cx, cy, pm)
+                    p.restore()
+                    if prog >= 1.0:
+                        self._xfade_active = False
+                        self._xfade_prev_img = None
+                        # stop the outgoing-visual engine
+                        try:
+                            if getattr(self, "_xfade_prev_running", False):
+                                self.visual_prev.stop()
+                                self.visual_prev.set_enabled(False)
+                                self._xfade_prev_running = False
+                        except Exception:
+                            pass
+                else:
+                    p.drawPixmap(cx, cy, pm)
             if not getattr(self, '_ui_hidden', False):
                 p.fillRect(QRect(18, 18, min(520, int(w * 0.7)), 148), QColor(0, 0, 0, 150))
                 if self.cover and not self.cover.isNull():
@@ -1561,6 +1644,10 @@ class MusicRuntime(QObject):
         finally:
             p.end()
         self.video.label.setPixmap(QPixmap.fromImage(base))
+        try:
+            self._last_visual_img = img.copy()
+        except Exception:
+            pass
 
     def _on_levels(self, bands: list):
         try:
@@ -1708,8 +1795,52 @@ class MusicRuntime(QObject):
                 self.overlay._visual_index = random.choice(choices)
         else:  # all/loop
             self.overlay._visual_index = (self.overlay.cmb_visual.currentIndex() + 1) % count
+        try:
+            self._start_crossfade()
+        except Exception:
+            pass
         self.overlay.cmb_visual.setCurrentIndex(self.overlay._visual_index)
+
+    
+    def _start_crossfade(self):
+        try:
+            if not self.overlay or not self.overlay.visuals_enabled() or not self.overlay.crossfade_enabled():
+                return
+            # Seed with last image so first blended frame has content
+            if getattr(self, "_last_visual_img", None) is not None:
+                self._xfade_prev_img = self._last_visual_img
+            # Configure the 'previous' engine to the current visual + size
+            try:
+                cur_size = self.video.label.size()
+                self.visual_prev.set_target(cur_size)
+            except Exception:
+                pass
+            try:
+                prev_mode = self.overlay.selected_mode() or 'spectrum'
+                self.visual_prev.set_mode(prev_mode)
+            except Exception:
+                pass
+            try:
+                # Connect analyzer feeds (idempotent connections are fine in Qt)
+                self.an.levelsReady.connect(self.visual_prev.inject_levels)
+                self.an.rmsReady.connect(self.visual_prev.inject_rms)
+            except Exception:
+                pass
+            # Start the previous engine so it keeps animating during the fade
+            try:
+                self.visual_prev.set_enabled(True)
+                self.visual_prev.start(30)
+                self._xfade_prev_running = True
+            except Exception:
+                pass
+            # Start fade clock
+            self._xfade_t0 = _time.time()
+            self._xfade_ms = int(self.overlay.crossfade_ms())
+            self._xfade_active = True
+        except Exception:
+            self._xfade_active = False
         self._persist_state()
+
 
     def set_overlay(self, overlay: MusicOverlay):
         self.overlay = overlay
@@ -1723,9 +1854,35 @@ class MusicRuntime(QObject):
             self.overlay.btn_visuals.toggled.connect(lambda c: self.overlay.btn_visuals.setText('Visuals off' if c else 'Visuals on'))
         except Exception:
             pass
+        # load crossfade settings
+        try:
+            st = _load_state()
+            cf_on = bool(st.get('xfade_on', True))
+            cf_ms = int(st.get('xfade_ms', 2000))
+            try:
+                self.overlay.chk_xfade.setChecked(cf_on)
+            except Exception:
+                pass
+            try:
+                opts = ['1.0s','1.5s','2.0s','3.0s','4.0s']
+                sec = max(1.0, min(4.0, cf_ms/1000.0))
+                idx = min(range(len(opts)), key=lambda i: abs(float(opts[i][:-1]) - sec))
+                self.overlay.cmb_fade.setCurrentIndex(idx)
+            except Exception:
+                pass
+        except Exception:
+            pass
+
         # Persist current viz mode (1/all/random) when user toggles the mode button
         try:
             self.overlay.btn_vizmode.clicked.connect(lambda: self._persist_state())
+        except Exception:
+            pass
+        try:
+            self.overlay.chk_xfade.toggled.connect(lambda _c: self._persist_state())
+            self.overlay.cmb_fade.currentIndexChanged.connect(lambda _i: self._persist_state())
+        except Exception:
+            pass
         except Exception:
             pass
         # load state
@@ -1771,6 +1928,13 @@ class MusicRuntime(QObject):
             st['visual_mode_name'] = self.overlay.selected_mode() or ''
             st['auto_beats'] = self.overlay.cmb_beats.currentText()
             st['auto_mode'] = self.overlay.current_viz_mode()
+        except Exception:
+            pass
+        
+        # crossfade settings
+        try:
+            st['xfade_on'] = bool(self.overlay.chk_xfade.isChecked())
+            st['xfade_ms'] = int(self.overlay.crossfade_ms())
         except Exception:
             pass
         _save_state(st)
@@ -2024,6 +2188,15 @@ def wire_to_videopane(VideoPaneClass):
                 self._music_overlay.ensure_in_playlist(p)
             except Exception:
                 pass
+            # Rebind analyzer to the current player in case the VideoPane replaced it
+            try:
+                if getattr(rt, 'an', None):
+                    try:
+                        rt.an.rebind_player(getattr(self, 'player', None))
+                    except Exception:
+                        pass
+            except Exception:
+                pass
             rt.start(path_for_analysis=p)  # kick off hybrid preanalysis
             # one-time 100ms forward scroll on the very first audio after app opens
             try:
@@ -2105,3 +2278,167 @@ def wire_to_videopane(VideoPaneClass):
             return orig_open(self, path)
 
     VideoPaneClass.open = open_wrapper
+
+# ----- Hotfix: silence watchdog for flat visuals (EQ goes flat on pause/stop or no audio) -----
+try:
+    import time as _time
+    from PySide6.QtCore import QTimer as _QTimer
+except Exception:
+    _QTimer = None
+
+# Extend/monkey-patch HybridAnalyzer with silence handling
+def _HybridAnalyzer_mark_silent(self):
+    # Zero RMS / peaks
+    try:
+        self._probe_rms = 0.0
+    except Exception:
+        pass
+    try:
+        self._probe_levels = None
+    except Exception:
+        pass
+    # Try to zero any common arrays used by visuals
+    for _name in ("_bars","_bars_smooth","_spectrum","_spectrum_smooth","_eq_bins","_levels","_levels_smooth"):
+        try:
+            _arr = getattr(self, _name, None)
+            if isinstance(_arr, (list, tuple)):
+                setattr(self, _name, [0.0] * len(_arr))
+            elif hasattr(_arr, "fill"):
+                _arr.fill(0.0)
+        except Exception:
+            pass
+    # Nudge any known update hooks to repaint
+    for _cb in ("_emit_levels","_emit_spectrum","_update_visuals","_tick","_repaint"):
+        try:
+            _f = getattr(self, _cb, None)
+            if callable(_f):
+                _f()
+        except Exception:
+            pass
+
+def _HybridAnalyzer_on_player_state(self, *args):
+    # Determine current state; treat anything not "Playing" as silence
+    _state = None
+    try:
+        if hasattr(self, "player") and hasattr(self.player, "playbackState"):
+            _state = self.player.playbackState()
+        elif hasattr(self, "player") and hasattr(self.player, "state"):
+            _state = self.player.state()
+    except Exception:
+        _state = None
+    # Qt6 QMediaPlayer.PlaybackState: 0=Stopped, 1=Playing, 2=Paused
+    try:
+        if _state is None or int(_state) != 1:
+            _HybridAnalyzer_mark_silent(self)
+    except Exception:
+        _HybridAnalyzer_mark_silent(self)
+
+def _HybridAnalyzer_check_silence(self):
+    # If no buffers recently, flatten
+    try:
+        now = _time.monotonic()
+        last = getattr(self, "_last_buf_ts", None)
+        # Default: if older than 0.6s, consider silence (covers pause and device stalls)
+        timeout_s = getattr(self, "_silence_timeout_s", 0.6)
+        if last is None or (now - last) > timeout_s:
+            _HybridAnalyzer_mark_silent(self)
+    except Exception:
+        pass
+
+def _HybridAnalyzer_hook_buf_timestamp(self):
+    # One-time wrap of _on_buf to update _last_buf_ts
+    try:
+        if getattr(self, "_buf_wrapped", False):
+            return
+        _orig = getattr(self, "_on_buf", None)
+        if callable(_orig):
+            def _wrapped(buf, *a, **kw):
+                try:
+                    self._last_buf_ts = _time.monotonic()
+                except Exception:
+                    pass
+                return _orig(buf, *a, **kw)
+            self._on_buf = _wrapped
+            self._buf_wrapped = True
+    except Exception:
+        pass
+
+def _HybridAnalyzer_install_silence_watchdog(self):
+    # Set timeout configurable
+    try:
+        if not hasattr(self, "_silence_timeout_s"):
+            self._silence_timeout_s = 0.6
+    except Exception:
+        pass
+    # Start periodic timer
+    try:
+        if _QTimer is not None:
+            if getattr(self, "_silence_timer", None) is None:
+                self._silence_timer = _QTimer(self)
+                try:
+                    self._silence_timer.setInterval(250)
+                except Exception:
+                    pass
+                try:
+                    self._silence_timer.timeout.connect(lambda: _HybridAnalyzer_check_silence(self))
+                except Exception:
+                    pass
+                try:
+                    self._silence_timer.start()
+                except Exception:
+                    pass
+    except Exception:
+        pass
+    # Ensure we timestamp every audio buffer
+    _HybridAnalyzer_hook_buf_timestamp(self)
+
+def _HybridAnalyzer_rebind_plus(self, player):
+    # Delegate to any existing rebind_player (if defined), then add silence hooks
+    try:
+        _base = getattr(HybridAnalyzer, "__rebind_base", None)
+    except Exception:
+        _base = None
+    if callable(_base):
+        try:
+            _base(self, player)
+        except Exception:
+            pass
+    else:
+        # Fallback: just set refs and try to connect probes, similar to prior hotfix
+        try:
+            self.player = player
+        except Exception:
+            pass
+    # Hook player state → flatten on pause/stop
+    try:
+        if player is not None:
+            try:
+                if hasattr(player, "playbackStateChanged"):
+                    try:
+                        player.playbackStateChanged.disconnect(lambda *_: None)  # best-effort cleanup
+                    except Exception:
+                        pass
+                    player.playbackStateChanged.connect(lambda *_: _HybridAnalyzer_on_player_state(self))
+                elif hasattr(player, "stateChanged"):
+                    try:
+                        player.stateChanged.disconnect(lambda *_: None)
+                    except Exception:
+                        pass
+                    player.stateChanged.connect(lambda *_: _HybridAnalyzer_on_player_state(self))
+            except Exception:
+                pass
+    except Exception:
+        pass
+    # Install periodic silence watchdog
+    _HybridAnalyzer_install_silence_watchdog(self)
+    # Consider immediately flattening if not in playing state
+    _HybridAnalyzer_on_player_state(self)
+
+# Preserve any existing rebind_player so we can call it first
+try:
+    if hasattr(HybridAnalyzer, "rebind_player"):
+        HybridAnalyzer.__rebind_base = HybridAnalyzer.rebind_player  # type: ignore[attr-defined]
+    HybridAnalyzer.rebind_player = _HybridAnalyzer_rebind_plus  # type: ignore[attr-defined]
+    HybridAnalyzer.mark_silent = _HybridAnalyzer_mark_silent  # optional public helper
+except Exception:
+    pass
