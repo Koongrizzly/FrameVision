@@ -68,6 +68,56 @@ try:
 except Exception:
     pass
 # --- end warnings quiet patch ---
+import helpers.save_guard  # force unique filenames on save
+
+
+
+# --- FrameVision: stderr noise filter (FFmpeg mp3 warnings) ---
+# Hide lines that start with "[mp3float @" or "[mp3 @", which come from FFmpeg's mp3 decoder.
+try:
+    import sys as _sys
+    class _FVStreamPrefixFilter:
+        def __init__(self, stream, prefixes):
+            self._stream = stream
+            self._buf = ""
+            self._prefixes = tuple(prefixes)
+
+        def write(self, data):
+            try:
+                s = data if isinstance(data, str) else str(data)
+                self._buf += s
+                while "\n" in self._buf:
+                    line, self._buf = self._buf.split("\n", 1)
+                    if any(line.lstrip().startswith(p) for p in self._prefixes):
+                        # Drop this noisy line
+                        continue
+                    self._stream.write(line + "\n")
+            except Exception:
+                # Never let logging break the app
+                pass
+
+        def flush(self):
+            try:
+                if self._buf:
+                    line = self._buf
+                    self._buf = ""
+                    if not any(line.lstrip().startswith(p) for p in self._prefixes):
+                        self._stream.write(line)
+                if hasattr(self._stream, "flush"):
+                    self._stream.flush()
+            except Exception:
+                pass
+
+        def __getattr__(self, name):
+            # Delegate anything else to the underlying stream for compatibility
+            return getattr(self._stream, name)
+
+    # Install the filter on stderr only (FFmpeg writes warnings to stderr)
+    _sys.stderr = _FVStreamPrefixFilter(_sys.stderr, prefixes=("[mp3float @", "[mp3 @"))
+except Exception:
+    pass
+# --- end stderr noise filter ---
+
 
 
 
