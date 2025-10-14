@@ -1,5 +1,22 @@
 from __future__ import annotations
 
+# --- Minimal no-overwrite helper ---
+from pathlib import Path as _P
+def _unique_path(p: _P) -> _P:
+    try:
+        p = _P(p)
+        if not p.exists():
+            return p
+        stem, suffix = p.stem, p.suffix
+        i = 1
+        while True:
+            cand = p.with_name(f"{stem}_{i:03d}{suffix}")
+            if not cand.exists():
+                return cand
+            i += 1
+    except Exception:
+        return _P(p)
+
 # === QImageIO maxalloc disabled by patch ===
 import os as _qt_img_os
 _qt_img_os.environ["QT_IMAGEIO_MAXALLOC"] = "0"  # Disable env-based cap (0 = no limit)
@@ -1040,8 +1057,12 @@ class Txt2ImgPane(QWidget):
         self.gpu_index = QSpinBox(); self.gpu_index.setRange(0,8)
         self.threads = QSpinBox(); self.threads.setRange(1,256); self.threads.setValue(8)
         self.format_combo = QComboBox(); self.format_combo.addItems(["png","jpg","webp"])
-        self.filename_template = QLineEdit("IMG_{idx:03d}.png")
-        self.reset_fname = QPushButton("Reset"); self.reset_fname.clicked.connect(lambda: self.filename_template.setText("sd_{seed}_{idx:03d}.png"))
+        self.filename_template = QLineEdit("IMG_{seed}.png")
+        self.reset_fname = QPushButton("Reset"); self.reset_fname.clicked.connect(lambda: self.filename_template.setText(f"IMG_{{seed}}.{self.format_combo.currentText()}"))
+        try:
+            _on_format_changed()
+        except Exception:
+            pass
         self.hires_helper = QCheckBox("Hi-res helper")
         self.fit_check = QCheckBox("Fit-check")
         adv_form.addRow("Sampler", self.sampler)
@@ -1050,10 +1071,50 @@ class Txt2ImgPane(QWidget):
         adv_form.addRow("GPU index", self.gpu_index)
         adv_form.addRow("Threads", self.threads)
         adv_form.addRow("File format", self.format_combo)
+
+        # Auto-sync filename template extension when format changes
+        def _on_format_changed(*_):
+            try:
+                fmt = (self.format_combo.currentText() or "").strip().lower()
+                name = (self.filename_template.text() or "").strip()
+                import re
+                if not name:
+                    name = f"IMG_{{seed}}.{fmt}"
+                else:
+                    # Replace a known image extension at the end, or append if missing
+                    if re.search(r"\.(png|jpe?g|webp|tiff?|bmp)$", name, flags=re.IGNORECASE):
+                        name = re.sub(r"\.(png|jpe?g|webp|tiff?|bmp)$", f".{fmt}", name, flags=re.IGNORECASE)
+                    else:
+                        name = name.rstrip('.') + f".{fmt}"
+                # Avoid recursive autosave storms while updating the field
+                try:
+                    self.filename_template.blockSignals(True)
+                except Exception:
+                    pass
+                self.filename_template.setText(name)
+                try:
+                    self.filename_template.blockSignals(False)
+                except Exception:
+                    pass
+            except Exception:
+                pass
+        try:
+            self.format_combo.currentTextChanged.connect(_on_format_changed)
+        except Exception:
+            pass
+        try:
+            self.format_combo.currentIndexChanged.connect(lambda *_: _on_format_changed())
+        except Exception:
+            pass
         rowf = QHBoxLayout(); rowf.addWidget(self.filename_template, 1); rowf.addWidget(self.reset_fname)
         adv_form.addRow("Filename", rowf)
         adv_form.addRow(self.hires_helper)
-        adv_form.addRow(self.fit_check)
+        # fit-check hidden per request
+        # adv_form.addRow(self.fit_check)
+        try:
+            self.fit_check.hide()
+        except Exception:
+            pass
 
 
         # --- Helpful tooltips for Advanced options ---
@@ -1090,7 +1151,7 @@ class Txt2ImgPane(QWidget):
         except Exception:
             pass
         try:
-            self.fit_check.setToolTip("Quick, lightweight preview to verify composition/aspect before a full render. Saves time when iterating.")
+            self.fit_check.setToolTip("")
         except Exception:
             pass
         root.addLayout(form)
@@ -1164,7 +1225,7 @@ class Txt2ImgPane(QWidget):
             "gpu_index": int(self.gpu_index.value()),
             "threads": int(self.threads.value()),
                         "format": self.format_combo.currentText(),
-            "filename_template": self.filename_template.text().strip() or "sd_{seed}_{idx:03d}.png",
+            "filename_template": self.filename_template.text().strip() or "IMG_{seed}.png",
             "hires_helper": self.hires_helper.isChecked(),
             "fit_check": self.fit_check.isChecked(),
             "steps": int(self.steps_slider.value()),
@@ -1882,11 +1943,12 @@ def _gen_via_diffusers(job: dict, out_dir: Path, progress_cb=None):
                 callback=_cb, callback_steps=1
             )
             img = result.images[0]
-            fn_tmpl = job.get("filename_template") or "sd_{seed}_{idx:03d}.png"
+            fn_tmpl = job.get("filename_template") or "IMG_{seed}.png"
             fname = fn_tmpl.format(seed=(seed if seed else 0)+i, idx=i)
             if not fname.lower().endswith((".png",".jpg",".jpeg",".webp")):
                 fname += ".png"
             fpath = out_dir / fname
+            fpath = _unique_path(fpath)
             img.save(str(fpath))
             files.append(str(fpath))
             try:
@@ -1916,6 +1978,7 @@ def _run_qwen_cli(job: dict, out_dir: Path, tpl: str, progress_cb=None):
             if not fname.lower().endswith(("png","jpg","jpeg","webp")):
                 fname += ".png"
             fpath = out_dir / fname
+            fpath = _unique_path(fpath)
             model = job.get("model_path","")
             cmd = tpl.format(prompt=prompt, neg=neg, w=w, h=h, steps=steps, seed=seed+i, out=str(fpath), model=model)
             try:
@@ -1966,6 +2029,7 @@ def _gen_via_a1111(job: dict, out_dir: Path, base_url: str, progress_cb=None):
             img = Image.open(io.BytesIO(raw)).convert("RGB")
             fname = (job.get("filename_template") or "qwen_{seed}_{idx:03d}.png").format(seed=seed+i, idx=i)
             fpath = out_dir / fname
+            fpath = _unique_path(fpath)
             img.save(str(fpath))
             files.append(str(fpath))
             if progress_cb: progress_cb({"step": (i+1)*max(1, steps), "total": max(1, steps*batch)})
@@ -2027,6 +2091,7 @@ def generate_qwen_images(job: dict, progress_cb: Optional[Callable[[float], None
         fname = fname_tmpl.format(seed=s, idx=i)
         if not fname.lower().endswith(("png","jpg","jpeg","webp")): fname += "." + fmt
         fpath = out_dir / fname
+        fpath = _unique_path(fpath)
         img.save(str(fpath)); files.append(str(fpath))
         if progress_cb: progress_cb(((i+1)/batch))
         time.sleep(0.02)

@@ -2409,22 +2409,81 @@ def _HybridAnalyzer_rebind_plus(self, player):
             self.player = player
         except Exception:
             pass
+
     # Hook player state → flatten on pause/stop
     try:
         if player is not None:
+            # Ensure storage for connection refs
+            if not hasattr(self, "_fv_state_slot"):
+                try:
+                    self._fv_state_slot = None
+                except Exception:
+                    pass
+            if not hasattr(self, "_fv_legacy_state_slot"):
+                try:
+                    self._fv_legacy_state_slot = None
+                except Exception:
+                    pass
+            if not hasattr(self, "_fv_connected_player"):
+                try:
+                    self._fv_connected_player = None
+                except Exception:
+                    pass
+            # Disconnect from previous player (if different)
+            try:
+                _prev = self._fv_connected_player
+            except Exception:
+                _prev = None
+            try:
+                if _prev is not None and _prev is not player:
+                    try:
+                        if hasattr(_prev, "playbackStateChanged") and self._fv_state_slot is not None:
+                            try:
+                                _prev.playbackStateChanged.disconnect(self._fv_state_slot)
+                            except Exception:
+                                pass
+                    except Exception:
+                        pass
+                    try:
+                        if hasattr(_prev, "stateChanged") and self._fv_legacy_state_slot is not None:
+                            try:
+                                _prev.stateChanged.disconnect(self._fv_legacy_state_slot)
+                            except Exception:
+                                pass
+                    except Exception:
+                        pass
+            except Exception:
+                pass
+            # Connect to current player's state signal (Qt6 or legacy)
             try:
                 if hasattr(player, "playbackStateChanged"):
                     try:
-                        player.playbackStateChanged.disconnect(lambda *_: None)  # best-effort cleanup
+                        if self._fv_state_slot is None:
+                            self._fv_state_slot = (lambda *_: _HybridAnalyzer_on_player_state(self))
                     except Exception:
                         pass
-                    player.playbackStateChanged.connect(lambda *_: _HybridAnalyzer_on_player_state(self))
+                    try:
+                        # Avoid duplicate connections
+                        player.playbackStateChanged.disconnect(self._fv_state_slot)
+                    except Exception:
+                        pass
+                    player.playbackStateChanged.connect(self._fv_state_slot)
                 elif hasattr(player, "stateChanged"):
                     try:
-                        player.stateChanged.disconnect(lambda *_: None)
+                        if self._fv_legacy_state_slot is None:
+                            self._fv_legacy_state_slot = (lambda *_: _HybridAnalyzer_on_player_state(self))
                     except Exception:
                         pass
-                    player.stateChanged.connect(lambda *_: _HybridAnalyzer_on_player_state(self))
+                    try:
+                        player.stateChanged.disconnect(self._fv_legacy_state_slot)
+                    except Exception:
+                        pass
+                    player.stateChanged.connect(self._fv_legacy_state_slot)
+            except Exception:
+                pass
+            # Remember which player we're connected to
+            try:
+                self._fv_connected_player = player
             except Exception:
                 pass
     except Exception:

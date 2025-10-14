@@ -7,6 +7,67 @@ try:
 except Exception:
     Image = None
 
+# --- No-overwrite helper: pick a new name if target exists ---
+def _unique_path(p: Path) -> Path:
+    try:
+        p = Path(p)
+        if not p.exists():
+            return p
+        stem, suffix = p.stem, p.suffix
+        i = 1
+        while True:
+            cand = p.with_name(f"{stem}_{i:03d}{suffix}")
+            if not cand.exists():
+                return cand
+            i += 1
+    except Exception:
+        return Path(p)
+
+
+
+# --- Quiet mode: suppress CLIP 77-token complaints & other noisy logs ---
+try:
+    import os as _w_os, warnings as _w_warnings
+    _w_os.environ.setdefault("HF_HUB_DISABLE_PROGRESS_BARS", "1")
+    _w_os.environ.setdefault("BITSANDBYTES_NOWELCOME", "1")
+    _w_os.environ.setdefault("HF_HUB_DISABLE_TELEMETRY", "1")
+    try:
+        from transformers.utils import logging as _w_hf_logging
+        _w_hf_logging.set_verbosity_error()
+    except Exception:
+        pass
+    try:
+        from diffusers.utils import logging as _w_df_logging
+        _w_df_logging.set_verbosity_error()
+        try:
+            _w_df_logging.disable_progress_bar()
+        except Exception:
+            pass
+    except Exception:
+        pass
+    try:
+        import logging as _w_pylogging
+        _w_pylogging.getLogger("transformers").setLevel(_w_pylogging.ERROR)
+        _w_pylogging.getLogger("transformers.tokenization_utils_base").setLevel(_w_pylogging.ERROR)
+    except Exception:
+        pass
+    try:
+        _w_warnings.filterwarnings(
+            "ignore",
+            message=r".*CLIP can only handle sequences up to 77 tokens.*",
+            category=UserWarning,
+        )
+        _w_warnings.filterwarnings(
+            "ignore",
+            message=r"The following part of your input was truncated because CLIP can only handle sequences up to 77 tokens:.*",
+            category=UserWarning,
+        )
+    except Exception:
+        pass
+except Exception:
+    pass
+# -----------------------------------------------------------------------
+
 ROOT = Path(".").resolve()
 BASE = ROOT
 
@@ -449,6 +510,7 @@ def upscale_video(job, cfg, mani):
     model_name, exe_path = resolve_upscaler_exe(cfg, mani, model_name)
     out = out_dir / f"{inp.stem}_x{factor}.mp4"
 
+    out = _unique_path(out)
     # Prepare potential temp dirs (some may not be used; we'll still try to delete them in finally)
     frames = out_dir / f"{inp.stem}_x{factor}_frames"
     up = out_dir / f"{inp.stem}_x{factor}_up"
@@ -622,6 +684,7 @@ def upscale_photo(job, cfg, mani):
     model_name = job["args"].get("model","RealESRGAN-x4plus")
     model_name, exe_path = resolve_upscaler_exe(cfg, mani, model_name)
     out = out_dir / f"{inp.stem}_x{factor}.{fmt}"
+    out = _unique_path(out)
     try:
         _progress_set(5)
     except Exception:
@@ -842,6 +905,7 @@ def txt2img_generate(job, cfg, mani):
                 name += ".png"
             outp = out_dir / name
             try:
+                outp = _unique_path(outp)
                 img.save(str(outp))
             except Exception as e:
                 _mark_error(job, f"save failed: {e}")

@@ -372,12 +372,12 @@ def _resolve_inpaint_model_path(user_text: Optional[str] = None) -> Path:
             continue
     return Path(user_text) if user_text else _default_sd15_inpaint_model_path()
 
-def _get_sd15_inpaint_pipe(model_path: Path):
+def _get_sd15_inpaint_pipe(model_path: Path, low_vram: bool = False):
     """Return a cached StableDiffusionInpaintPipeline from a single .safetensors file."""
     if not _sd15_inpaint_available():
         raise RuntimeError("diffusers/torch not installed. Please install: torch, diffusers, transformers, accelerate, safetensors.")
     device = "cuda" if (hasattr(torch, "cuda") and torch.cuda.is_available()) else "cpu"
-    key = str(model_path.resolve()) + "|" + device
+    key = str(model_path.resolve()) + "|" + device + f"|lvram={1 if low_vram else 0}"
     p = _SD_PIPE_CACHE.get(key)
     if p is None:
         p = StableDiffusionInpaintPipeline.from_single_file(
@@ -389,6 +389,22 @@ def _get_sd15_inpaint_pipe(model_path: Path):
         p = p.to(device)
         try:
             p.enable_attention_slicing()
+            if low_vram:
+                try:
+                    p.enable_vae_slicing()
+                except Exception:
+                    pass
+                try:
+                    p.enable_vae_tiling()
+                except Exception:
+                    pass
+                try:
+                    p.enable_sequential_cpu_offload()
+                except Exception:
+                    try:
+                        p.enable_model_cpu_offload()
+                    except Exception:
+                        pass
         except Exception:
             pass
         _SD_PIPE_CACHE[key] = p
@@ -418,7 +434,12 @@ def inpaint_sd15(
     mask_pil = Image.fromarray(m_u8, mode="L").resize((w, h), Image.BILINEAR)
     img_pil = _pil_from_np(img_rgb)
 
-    pipe = _get_sd15_inpaint_pipe(Path(model_path))
+        # Respect Low-VRAM toggle from UI if present
+    try:
+        _lv = bool(getattr(Preview, '_ui_flags', {}).get('low_vram', False))
+    except Exception:
+        _lv = False
+    pipe = _get_sd15_inpaint_pipe(Path(model_path), low_vram=_lv)
     g = None
     if isinstance(seed, int) and seed >= 0:
         g = torch.Generator(device=getattr(pipe, "device", "cpu")).manual_seed(int(seed))
@@ -887,7 +908,7 @@ def install_background_tool(pane, section_widget) -> None:
                 self._body.layout().addLayout(layout)
 
     # --- Preview canvas at the TOP ---
-    _ui_flags = {'auto_inpaint': False, 'freeze_unmasked': True}
+    _ui_flags = {'auto_inpaint': False, 'freeze_unmasked': True, 'low_vram': False, 'roi_inpaint': False}
 
     class Preview(QWidget):
         _ui_flags = {'auto_inpaint': False, 'freeze_unmasked': True}
@@ -1740,6 +1761,16 @@ def install_background_tool(pane, section_widget) -> None:
     row_pad = QHBoxLayout(); row_pad.addWidget(QLabel("Pad mask edges (px)")); row_pad.addWidget(s_sd_pad)
     inpaint_form.addRow(row_tog)
     inpaint_form.addRow(row_pad)
+    # New: low-VRAM and ROI toggles
+    chk_low_vram = QCheckBox("Low-VRAM mode (offload/tiling)"); chk_low_vram.setChecked(False)
+    chk_roi = QCheckBox("ROI inpaint (crop to mask)"); chk_roi.setChecked(False)
+    inpaint_form.addRow(chk_low_vram)
+    inpaint_form.addRow(chk_roi)
+    try:
+        chk_low_vram.toggled.connect(lambda v: setattr(Preview, '_ui_flags', {**Preview._ui_flags, 'low_vram': bool(v)}))
+        chk_roi.toggled.connect(lambda v: setattr(Preview, '_ui_flags', {**Preview._ui_flags, 'roi_inpaint': bool(v)}))
+    except Exception:
+        pass
     try:
         chk_auto_inpaint.toggled.connect(lambda v: setattr(Preview, '_ui_flags', {**Preview._ui_flags, 'auto_inpaint': bool(v)}))
         chk_freeze_unmasked.toggled.connect(lambda v: setattr(Preview, '_ui_flags', {**Preview._ui_flags, 'freeze_unmasked': bool(v)}))
@@ -2007,6 +2038,25 @@ def install_background_tool(pane, section_widget) -> None:
                 self.done.emit(alpha, None)
             except Exception as e:
                 self.done.emit(None, str(e))
+            finally:
+                try:
+                    import gc as _gc
+                    _gc.collect()
+                except Exception:
+                    pass
+                try:
+                    import torch as _torch
+                    if hasattr(_torch, 'cuda') and _torch.cuda.is_available():
+                        try:
+                            _torch.cuda.empty_cache()
+                        except Exception:
+                            pass
+                        try:
+                            _torch.cuda.ipc_collect()
+                        except Exception:
+                            pass
+                except Exception:
+                    pass
 
     _worker_ref = {'w': None}
 
