@@ -6,12 +6,13 @@
 - Updater (the only place in the app that needs an internet connection)
 App now has an option in File menu/Info/update.
 Replace all files or helper files only with the files from latest release.
-Update all files or only helper files to the newest files on github.
-Auto check for new updates or new release (daily, can be turned off)
+Or you can also update all files/only helper files to the newest files on github to be able to test newest things.
+Has an auto check for new updates or new release (daily, can be turned off)
+comes with backup function and user can also select (in the update to newest/beta files) select which files to update.
 
 - Background remove/replace tool (Beta)
   First version of a background/object/inpaint tool
-  2 models for backhround removal
+  2 models for background removal (fast or quality)
   sd15 loader for stable diffusion inpaint models, comes with default model, User can download other
 - Txt-to-image now also supports a queue; batch runs (>1) always use the queue
 - New upscale model: RealSR (2x/4x)
