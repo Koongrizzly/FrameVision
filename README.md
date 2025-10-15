@@ -14,7 +14,7 @@ comes with backup function and user can also select (in the update to newest/bet
   First version of a background/object/inpaint tool
   2 models for background removal (fast or quality)
   sd15 loader for stable diffusion inpaint models, comes with default model, User can download other
-- Txt-to-image now also supports a queue; batch runs (>1) always use the queue
+- Txt-to-image now also supports a queue; batch runs (>1) always use the queue, user can still select queue on/off for creating 1 image
 - New upscale model: RealSR (2x/4x)
 ---
 ***most important Bugfixes***
