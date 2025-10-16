@@ -579,9 +579,9 @@ class UpscPane(QtWidgets.QWidget):
         # Preset + Keyint
         lay_enc.addWidget(QtWidgets.QLabel("Preset:", self), 3, 0)
         self.combo_preset = QtWidgets.QComboBox(self)
-        for p in ("ultrafast","superfast","veryfast","faster","fast","medium","slow","slower","veryslow"):
+        for p in ("ultrafast","fast","medium","slow"):
             self.combo_preset.addItem(p)
-        self.combo_preset.setCurrentText("veryfast")
+        self.combo_preset.setCurrentText("fast")
         lay_enc.addWidget(self.combo_preset, 3, 1)
         lay_enc.addWidget(QtWidgets.QLabel("Keyint (GOP):", self), 4, 0)
         self.spin_keyint = QtWidgets.QSpinBox(self); self.spin_keyint.setRange(0, 1000); self.spin_keyint.setValue(0)

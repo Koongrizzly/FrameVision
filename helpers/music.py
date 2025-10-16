@@ -242,17 +242,80 @@ class PreAnalyzer(QThread):
 
     def __init__(self, path: Path, sr: int = 24000, bands: int = 48, hop_ms: int = 70, parent=None):
         self._ema_ref = None  # per-bin EMA reference for AGC
+        self._stop_requested = False
+        self._proc = None
+        
         super().__init__(parent)
         self.path = Path(path)
         self.sr = int(sr)
         self.bands = int(bands)
         self.hop_ms = int(hop_ms)
 
+    def request_stop(self):
+        self._stop_requested = True
+        try:
+            if self._proc:
+                self._proc.kill()
+        except Exception:
+            pass
+
+
+    def _viz_rebuild_bag(self):
+        """(Re)build the visual shuffle bag excluding the current visual,
+        so we won't repeat until all visuals have been shown once."""
+        if not self.overlay:
+            self._viz_bag = []
+            self._viz_bag_pos = -1
+            return
+        try:
+            count = len(self.overlay._visual_modes)
+            cur = self.overlay.cmb_visual.currentIndex()
+            idxs = [i for i in range(count) if i != cur]
+            import random
+            random.shuffle(idxs)
+            self._viz_bag = idxs
+            self._viz_bag_pos = -1
+        except Exception:
+            # be safe; clear bag if something goes wrong
+            self._viz_bag = []
+            self._viz_bag_pos = -1
+
+    def _viz_next_random_index(self) -> int:
+        """Return next visual index from the shuffle bag; rebuild if needed."""
+        if not self.overlay:
+            return -1
+        count = 0
+        try:
+            count = len(self.overlay._visual_modes)
+        except Exception:
+            pass
+        if count <= 1:
+            try:
+                return self.overlay.cmb_visual.currentIndex()
+            except Exception:
+                return -1
+        # Rebuild if bag empty or contains invalid indices
+        if not isinstance(self._viz_bag, list) or not self._viz_bag or any((i < 0 or i >= count) for i in self._viz_bag):
+            self._viz_rebuild_bag()
+        # Advance
+        self._viz_bag_pos += 1
+        if self._viz_bag_pos >= len(self._viz_bag):
+            # Completed a full pass; rebuild excluding current to avoid immediate repeat
+            self._viz_rebuild_bag()
+            self._viz_bag_pos = 0 if self._viz_bag else -1
+        if 0 <= self._viz_bag_pos < len(self._viz_bag):
+            return self._viz_bag[self._viz_bag_pos]
+        try:
+            return self.overlay.cmb_visual.currentIndex()
+        except Exception:
+            return -1
+
     def run(self):
         ff = ffmpeg_path()
         cmd = [ff, '-hide_banner', '-nostats', '-loglevel', 'error', '-i', str(self.path), '-vn', '-ac', '1', '-ar', str(self.sr), '-f', 'f32le', 'pipe:1']
         try:
-            p = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+            self._proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+            p = self._proc
         except Exception:
             self.ready.emit([], [], [])
             return
@@ -279,12 +342,16 @@ class PreAnalyzer(QThread):
         centers = None
 
         while True:
+            if getattr(self, '_stop_requested', False):
+                break
             chunk = read(8192)
             if not chunk:
                 break
             buf += chunk
 
             while len(buf) >= max(hop, n_fft) * 4:
+                if getattr(self, '_stop_requested', False):
+                    break
                 if len(buf) < n_fft * 4:
                     break
                 window = buf[:n_fft * 4]
@@ -343,7 +410,7 @@ class PreAnalyzer(QThread):
                     except Exception:
                         self.ready.emit([], [], [])
                         try:
-                            p.kill()
+                            (self._proc or p).kill() if (self._proc or p) else None
                         except Exception:
                             pass
                         return
@@ -377,7 +444,7 @@ class PreAnalyzer(QThread):
                     pass
 
         try:
-            p.kill()
+            (self._proc or p).kill() if (self._proc or p) else None
         except Exception:
             pass
         self.ready.emit(times_ms, bands_mat, rms_list)
@@ -425,18 +492,59 @@ class HybridAnalyzer(QObject):
             self._probe = None
 
     def set_file(self, path: Path):
+        # Stop any previous worker first
         try:
-            self._worker = PreAnalyzer(path, bands=self.bands, hop_ms=self._hop_ms, parent=self)
-            self._worker.ready.connect(self._on_ready)
-            self._worker.start()
+            if hasattr(self, '_worker') and getattr(self, '_worker', None):
+                try:
+                    self._worker.request_stop()
+                except Exception:
+                    pass
+                try:
+                    self._worker.wait(500)
+                except Exception:
+                    pass
         except Exception:
             pass
+        try:
+            LONG_TRACK_MS = 20 * 60 * 1000
+            dur_ms = 0
+            try:
+                dur_ms = _probe_duration_ms(Path(path))
+            except Exception:
+                dur_ms = 0
+            if dur_ms >= LONG_TRACK_MS:
+                # Skip preanalysis for long tracks; rely on live probe to avoid background CPU
+                self._worker = None
+                self._times, self._bands, self._rms = [], [], []
+            else:
+                self._worker = PreAnalyzer(path, bands=self.bands, hop_ms=self._hop_ms, parent=self)
+                try:
+                    self._worker.ready.connect(self._on_ready, getattr(Qt, 'UniqueConnection', 0))
+                except Exception:
+                    self._worker.ready.connect(self._on_ready)
+                self._worker.start()
+        except Exception:
+            pass
+
 
     def start(self):
         self._timer.start(90)
 
     def stop(self):
         self._timer.stop()
+        try:
+            if hasattr(self, '_worker') and getattr(self, '_worker', None):
+                try:
+                    self._worker.request_stop()
+                except Exception:
+                    pass
+                try:
+                    self._worker.wait(500)
+                except Exception:
+                    pass
+                self._worker = None
+        except Exception:
+            pass
 
     def _on_ready(self, times_ms: list, bands: list, rms: list):
         self._times = times_ms or []
@@ -544,7 +652,8 @@ class HybridAnalyzer(QObject):
                 '-i', str(self.path), '-vn',
                 '-f', 'f32le', '-ac', '1', '-ar', '24000', 'pipe:1'
             ]
-            p = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+            self._proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+            p = self._proc
             import struct, math
             hop = int(round(0.001 * self.hop_ms * 24000))
             if hop <= 0: hop = 480
@@ -572,7 +681,7 @@ class HybridAnalyzer(QObject):
                 t_ms = self.start_ms + (i*self.hop_ms)
                 times_ms.append(t_ms)
             try:
-                p.kill()
+                (self._proc or p).kill() if (self._proc or p) else None
             except Exception:
                 pass
             self.ready_segment.emit(self.start_ms, times_ms, bands_mat, rms_list)
@@ -1518,7 +1627,7 @@ class MusicRuntime(QObject):
         self._was_quiet = False
         self._return_cooldown_until_ms = 0
         # tunables (no UI): tweak if needed
-        self._silence_gate = 0.70  # RMS threshold for 'quiet'
+        self._silence_gate = 0.50  # RMS threshold for 'quiet'
         self._silence_min_ms = 250  # how long it must stay below gate
         self._return_cooldown_ms = 3700  # min gap between return-triggered switches
 
@@ -1530,6 +1639,56 @@ class MusicRuntime(QObject):
         self._xfade_t0 = 0.0
         self._xfade_ms = 2000
 
+        # shuffle-bag for visuals random mode (non-repeating)
+        self._viz_bag = []
+        self._viz_bag_pos = -1
+    def _viz_rebuild_bag(self):
+        """(Re)build the visual shuffle bag excluding the current visual to avoid repeats before a full pass."""
+        if not self.overlay:
+            self._viz_bag = []
+            self._viz_bag_pos = -1
+            return
+        try:
+            count = len(self.overlay._visual_modes)
+            cur = self.overlay.cmb_visual.currentIndex()
+            idxs = [i for i in range(count) if i != cur]
+            import random
+            random.shuffle(idxs)
+            self._viz_bag = idxs
+            self._viz_bag_pos = -1
+        except Exception:
+            # be safe; clear bag if something goes wrong
+            self._viz_bag = []
+            self._viz_bag_pos = -1
+
+    def _viz_next_random_index(self) -> int:
+        """Return next visual index from the shuffle bag; rebuild if needed."""
+        if not self.overlay:
+            return -1
+        try:
+            count = len(self.overlay._visual_modes)
+        except Exception:
+            count = 0
+        if count <= 1:
+            try:
+                return self.overlay.cmb_visual.currentIndex()
+            except Exception:
+                return -1
+        # Rebuild if bag empty/invalid
+        if not isinstance(self._viz_bag, list) or not self._viz_bag or any((i < 0 or i >= count) for i in self._viz_bag):
+            self._viz_rebuild_bag()
+        # Advance
+        self._viz_bag_pos += 1
+        if self._viz_bag_pos >= len(self._viz_bag):
+            # Completed a full pass; rebuild excluding current to avoid immediate repeat
+            self._viz_rebuild_bag()
+            self._viz_bag_pos = 0 if self._viz_bag else -1
+        if 0 <= self._viz_bag_pos < len(self._viz_bag):
+            return self._viz_bag[self._viz_bag_pos]
+        try:
+            return self.overlay.cmb_visual.currentIndex()
+        except Exception:
+            return -1
     def start(self, path_for_analysis: Optional[Path] = None):
         try:
             self.visual.set_target(self.video.label.size())
@@ -1655,9 +1814,9 @@ class MusicRuntime(QObject):
                 return
             take = max(3, min(6, len(bands) // 6))
             low = sum(bands[:take]) / max(1, take)
-            self._kick_avg = 0.9 * self._kick_avg + 0.1 * low
+            self._kick_avg = 0.98 * self._kick_avg + 0.1 * low
             pos = int(self.video.player.position()) if hasattr(self.video, 'player') else int(_time.time() * 1000)
-            if low > self._kick_avg * 1.8 and (pos - self._kick_last) > 180:
+            if low > self._kick_avg * 1.5 and (pos - self._kick_last) > 150:
                 if self._kick_last > 0:
                     ib = pos - self._kick_last
                     if 250 <= ib <= 1500:
@@ -1788,11 +1947,9 @@ class MusicRuntime(QObject):
         if mode == 'one':
             return
         if mode == 'random':
-            import random
-            cur = self.overlay.cmb_visual.currentIndex()
-            choices = [i for i in range(count) if i != cur]
-            if choices:
-                self.overlay._visual_index = random.choice(choices)
+            nxt = self._viz_next_random_index()
+            if nxt >= 0:
+                self.overlay._visual_index = nxt
         else:  # all/loop
             self.overlay._visual_index = (self.overlay.cmb_visual.currentIndex() + 1) % count
         try:
@@ -1801,7 +1958,6 @@ class MusicRuntime(QObject):
             pass
         self.overlay.cmb_visual.setCurrentIndex(self.overlay._visual_index)
 
-    
     def _start_crossfade(self):
         try:
             if not self.overlay or not self.overlay.visuals_enabled() or not self.overlay.crossfade_enabled():
@@ -1874,17 +2030,19 @@ class MusicRuntime(QObject):
             pass
 
         # Persist current viz mode (1/all/random) when user toggles the mode button
+
+        # Persist current viz mode (1/all/random) and crossfade changes; also hook bag rebuild
         try:
-            self.overlay.btn_vizmode.clicked.connect(lambda: self._persist_state())
-        except Exception:
-            pass
-        try:
+            self.overlay.btn_vizmode.clicked.connect(lambda: (self._persist_state(), self._viz_rebuild_bag()))
             self.overlay.chk_xfade.toggled.connect(lambda _c: self._persist_state())
             self.overlay.cmb_fade.currentIndexChanged.connect(lambda _i: self._persist_state())
+            # rebuild bag when user manually picks a visual
+            self.overlay.cmb_visual.currentIndexChanged.connect(lambda _i: self._viz_rebuild_bag())
         except Exception:
             pass
-        except Exception:
-            pass
+        # initialize bag once overlay is wired
+        self._viz_rebuild_bag()
+
         # load state
         st = _load_state()
         try:
@@ -2462,23 +2620,14 @@ def _HybridAnalyzer_rebind_plus(self, player):
                             self._fv_state_slot = (lambda *_: _HybridAnalyzer_on_player_state(self))
                     except Exception:
                         pass
-                    try:
-                        # Avoid duplicate connections
-                        player.playbackStateChanged.disconnect(self._fv_state_slot)
-                    except Exception:
-                        pass
-                    player.playbackStateChanged.connect(self._fv_state_slot)
+                    player.playbackStateChanged.connect(self._fv_state_slot, Qt.ConnectionType.UniqueConnection)
                 elif hasattr(player, "stateChanged"):
                     try:
                         if self._fv_legacy_state_slot is None:
                             self._fv_legacy_state_slot = (lambda *_: _HybridAnalyzer_on_player_state(self))
                     except Exception:
                         pass
-                    try:
-                        player.stateChanged.disconnect(self._fv_legacy_state_slot)
-                    except Exception:
-                        pass
-                    player.stateChanged.connect(self._fv_legacy_state_slot)
+                    player.stateChanged.connect(self._fv_legacy_state_slot, Qt.ConnectionType.UniqueConnection)
             except Exception:
                 pass
             # Remember which player we're connected to

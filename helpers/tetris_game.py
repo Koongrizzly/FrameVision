@@ -44,6 +44,31 @@ def _presets_scores_path():
         pass
     return str(save_dir / "tetris_scores.json")
 
+def _backgrounds_dir() -> Path:
+    """Return the backgrounds directory under <app root>/presets/startup/."""
+    root = Path(__file__).resolve().parent
+    if root.name.lower() == "helpers":
+        root = root.parent
+    return root / "presets" / "startup"
+
+def _list_bg_images():
+    """Return sorted list of background image file paths (logo_#.jpg/.jpeg/.png)."""
+    p = _backgrounds_dir()
+    files = []
+    try:
+        for f in p.iterdir():
+            name = f.name.lower()
+            if name.startswith("logo_") and (name.endswith(".jpg") or name.endswith(".jpeg") or name.endswith(".png")):
+                import re
+                m = re.search(r'logo_(\d+)', name)
+                n = int(m.group(1)) if m else 0
+                files.append((n, f))
+        files.sort(key=lambda t: t[0])
+    except Exception:
+        pass
+    return [str(f) for _, f in files]
+
+
 # ------------------------------- Config -------------------------------
 GRID_W = 10
 GRID_H = 20
@@ -359,7 +384,61 @@ class TetrisGame:
         self.shake_until = 0
         self.shake_mag = 0
 
+        # --- Backgrounds (25% opacity, cycle each level) ---
+        self.bg_paths = _list_bg_images()
+        self.bg_images = []
+        self.bg_index = 0
+        self._bg_scaled = None
+        self._bg_cache_key = None
+        # Preload originals (no scaling yet)
+        for pth in self.bg_paths:
+            try:
+                img = pygame.image.load(pth).convert()
+                self.bg_images.append(img)
+            except Exception:
+                pass
+
+
     # ---- helpers ----
+    
+    # ---- background helpers ----
+    def _advance_background(self):
+        if getattr(self, "bg_images", None):
+            self.bg_index = (self.bg_index + 1) % len(self.bg_images)
+            self._bg_cache_key = None  # force rescale
+
+    def _draw_background(self):
+        # Draw current background scaled to fill the entire window at ~25% opacity.
+        if not getattr(self, "bg_images", None):
+            return
+        try:
+            W, H = self.surface.get_size()
+            idx = self.bg_index % len(self.bg_images)
+            key = (idx, W, H)
+            if getattr(self, "_bg_cache_key", None) != key or self._bg_scaled is None:
+                src = self.bg_images[idx]
+                iw, ih = src.get_size()
+                # cover: scale to fill while preserving aspect
+                scale = max(W / max(1, iw), H / max(1, ih))
+                sw, sh = max(1, int(iw * scale)), max(1, int(ih * scale))
+                scaled = pygame.transform.smoothscale(src, (sw, sh))
+                scaled.set_alpha(32)  # ~12% opacity
+                self._bg_scaled = scaled
+                self._bg_cache_key = key
+            x = (W - self._bg_scaled.get_width()) // 2
+            y = (H - self._bg_scaled.get_height()) // 2
+            self.surface.blit(self._bg_scaled, (x, y))
+        except Exception:
+            # Backgrounds are optional; ignore failures
+            pass
+
+    def _on_level_change(self, new_level:int):
+        if new_level != self.level:
+            self.level = new_level
+            self.drop_ms = max(MIN_DROP_MS, BASE_DROP_MS - self.level * LEVEL_MS_STEP)
+            # Next background each time a new level starts
+            self._advance_background()
+
     def _spawn(self) -> Tetromino:
         n = self.bag.next()
         shape0 = ROTS[n][0]
@@ -452,9 +531,7 @@ class TetrisGame:
                 self.lines_total += n
                 self.score += LINE_SCORES.get(n, 100*n)
                 new_level = self.lines_total // 10
-                if new_level != self.level:
-                    self.level = new_level
-                    self.drop_ms = max(MIN_DROP_MS, BASE_DROP_MS - self.level * LEVEL_MS_STEP)
+                self._on_level_change(new_level)
                 if n >= 2:
                     effect = random.choice(['smiley','confetti','flash','sunglasses','sparkle'])
                     self.effects.append(Effect(effect, pygame.time.get_ticks()))
@@ -619,6 +696,7 @@ class TetrisGame:
         self.started = False; self.paused = False; self.game_over = False
         self.name_entry_active = False; self.name_buffer = ""
         self.key_left = self.key_right = False; self.move_dir = 0; self.move_repeat_t = 0
+        self.bg_index = 0; self._bg_cache_key = None
 
     def start(self):
         if not self.started: self.started = True; self.paused = False
@@ -649,9 +727,7 @@ class TetrisGame:
                 self.lines_total += n
                 self.score += LINE_SCORES.get(n, 100*n)
                 new_level = self.lines_total // 10
-                if new_level != self.level:
-                    self.level = new_level
-                    self.drop_ms = max(MIN_DROP_MS, BASE_DROP_MS - self.level * LEVEL_MS_STEP)
+                self._on_level_change(new_level)
                 if n >= 2:
                     effect = random.choice(['smiley','confetti','flash','sunglasses','sparkle'])
                     self.effects.append(Effect(effect, pygame.time.get_ticks()))
@@ -829,6 +905,9 @@ class TetrisGame:
 
 
 # ------------------------------- Loop ---------------------------------
+        # Background overlay at 25% alpha (draw last)
+        self._draw_background()
+
 def run_standalone():
     os.environ.setdefault("SDL_VIDEO_CENTERED", "1")
     pygame.init()

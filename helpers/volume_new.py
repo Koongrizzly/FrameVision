@@ -320,6 +320,18 @@ def add_new_volume_popup(pane, bar_layout):
             pass
 
     btn = QToolButton(pane); btn.setObjectName("btn_volume_new")
+    try:
+        btn.setAutoRaise(True)
+    except Exception:
+        pass
+    try:
+        btn.setFocusPolicy(Qt.NoFocus)
+    except Exception:
+        pass
+    try:
+        btn.setCursor(Qt.PointingHandCursor)
+    except Exception:
+        pass
     btn.setText("🔊"); btn.setToolTip("Volume / EQ")
     try: btn.setFixedSize(48,48)
     except Exception: pass
@@ -331,7 +343,7 @@ def add_new_volume_popup(pane, bar_layout):
     menu.addAction(wa)
     btn.setMenu(menu)
     btn.setPopupMode(QToolButton.InstantPopup)
-    btn.setStyleSheet("QToolButton::menu-indicator{ image: none; width:0px; height:0px; } " " QMenu { background: transparent; border: 0px; }")
+    btn.setStyleSheet("QToolButton#btn_volume_new{background:transparent;border:none;padding:0px;}""QToolButton#btn_volume_new:hover{background:rgba(0,0,0,0.08);border:none;}""QToolButton#btn_volume_new:pressed{background:rgba(0,0,0,0.16);border:none;}""QToolButton#btn_volume_new:checked{background:rgba(0,0,0,0.12);border:none;}""QToolButton::menu-indicator{image:none;width:0px;height:0px;}""QMenu{background:transparent;border:0px;}")
 
     bar_layout.addWidget(btn)
 
@@ -348,8 +360,3 @@ def add_new_volume_popup(pane, bar_layout):
     return btn
 
 
-# Contrast patch: make QMenu background transparent
-try:
-    btn.setStyleSheet((btn.styleSheet() or "") + " QMenu { background: transparent; border: 0px; }")
-except Exception:
-    pass

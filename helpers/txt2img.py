@@ -179,7 +179,7 @@ class _Disclosure(QWidget):
         self._btn.setArrowType(Qt.DownArrow if start_open else Qt.RightArrow)
         self._btn.setText(title)
         self._btn.setCheckable(True); self._btn.setChecked(start_open)
-        self._btn.clicked.connect(self._on_clicked)
+        self._btn.toggled.connect(self._on_clicked)
         self._body = content; self._body.setVisible(start_open)
         lay = QVBoxLayout(self); lay.setContentsMargins(0,0,0,0)
         lay.addWidget(self._btn); lay.addWidget(self._body)
@@ -357,12 +357,6 @@ class Txt2ImgPane(QWidget):
         except Exception:
             pass
 
-
-        # Load saved settings last to override other managers
-        try:
-            self._load_settings()
-        except Exception as e:
-            print('[txt2img] load at init error:', e)
 
 
 
@@ -1724,6 +1718,7 @@ class Txt2ImgPane(QWidget):
 
         threading.Thread(target=worker, daemon=True).start()
 
+
 def _draw_text_image(text: str, size=(1024,1024), seed: int = 0) -> QImage:
     """CPU fallback placeholder: checkerboard + centered prompt text."""
     w, h = size
@@ -2223,44 +2218,179 @@ def _t2i_load_settings(self):
     finally:
         self._t2i_loading = False
 
-def _t2i_post_init(self):
-    # Defer restore until after the UI & other managers have initialized
-    if QTimer is None:
-        try: _t2i_load_settings(self)
-        except Exception: pass
-        return
-    try:
-        QTimer.singleShot(300, lambda: _t2i_load_settings(self))
-    except Exception as e:
-        try: print('[txt2img] deferred load warn:', e)
-        except Exception: pass
-        try: _t2i_load_settings(self)
-        except Exception: pass
 
-# Monkey-patch: wrap __init__ and autosave handler to guard while loading
+# === Minimal persistence patch (no bloat): guard saves during load + map missing fields ===
 try:
-    _Txt2ImgPane = Txt2ImgPane  # type: ignore[name-defined]
-    if not hasattr(_Txt2ImgPane, '_t2i_patched'):
-        _orig_init = _Txt2ImgPane.__init__
-        def _init_patch(self, *a, **k):
-            # Block autosave during initial build
-            try: self._t2i_loading = True
-            except Exception: pass
-            _orig_init(self, *a, **k)
-            _t2i_post_init(self)
-        _Txt2ImgPane.__init__ = _init_patch  # type: ignore[assignment]
+    _T2I = Txt2ImgPane
 
-        # Guard autosave during load (if method exists)
-        if hasattr(_Txt2ImgPane, '_autosave_now'):
-            _orig_auto = _Txt2ImgPane._autosave_now
-            def _auto_patch(self, *a, **k):
-                if getattr(self, '_t2i_loading', False):
-                    return
-                return _orig_auto(self, *a, **k)
-            _Txt2ImgPane._autosave_now = _auto_patch  # type: ignore[assignment]
+    _orig_load = _T2I._load_settings
+    def _load_settings_patched(self):
+        try:
+            self._t2i_loading = True
+        except Exception:
+            pass
+        try:
+            return _orig_load(self)
+        finally:
+            try:
+                self._t2i_loading = False
+            except Exception:
+                pass
+    _T2I._load_settings = _load_settings_patched
 
-        _Txt2ImgPane._t2i_patched = True
+    _orig_save = _T2I._save_settings
+    def _save_settings_patched(self, job: dict):
+        try:
+            if getattr(self, "_t2i_loading", False):
+                return
+        except Exception:
+            pass
+        return _orig_save(self, job)
+    _T2I._save_settings = _save_settings_patched
+
+    def _set_text(w, val):
+        try:
+            w.setText("" if val is None else str(val))
+        except Exception:
+            pass
+    def _set_combo_text(w, val):
+        try:
+            if val is None:
+                return
+            t = str(val)
+            idx = w.findText(t) if hasattr(w, "findText") else -1
+            if idx is not None and idx >= 0:
+                w.setCurrentIndex(idx)
+            elif hasattr(w, "setCurrentText"):
+                w.setCurrentText(t)
+        except Exception:
+            pass
+    def _set_checked(w, val):
+        try:
+            w.setChecked(bool(val))
+        except Exception:
+            pass
+    def _set_value(w, val):
+        try:
+            w.setValue(int(val))
+        except Exception:
+            pass
+
+    _orig_apply = _T2I._apply_settings_from_dict
+    def _apply_settings_from_dict_patched(self, s: dict):
+        _orig_apply(self, s)
+        try:
+            for name in ("attn_slicing", "attention_slicing", "attentionSlicing"):
+                w = getattr(self, name, None)
+                if w is not None and "attn_slicing" in s:
+                    _set_checked(w, s.get("attn_slicing"))
+                    break
+            for name in ("hires_helper", "hires_check", "hiresHelper"):
+                w = getattr(self, name, None)
+                if w is not None and "hires_helper" in s:
+                    _set_checked(w, s.get("hires_helper"))
+                    break
+            for name in ("format_combo", "formatBox", "file_format", "formatCombo"):
+                w = getattr(self, name, None)
+                if w is not None and "format" in s:
+                    _set_combo_text(w, s.get("format"))
+                    break
+            for name in ("filename_template", "filenameTemplate", "filename_edit"):
+                w = getattr(self, name, None)
+                if w is not None and "filename_template" in s:
+                    _set_text(w, s.get("filename_template"))
+                    break
+            for name in ("vae_device", "vaeCombo", "vaeDevice"):
+                w = getattr(self, name, None)
+                if w is not None and "vae_device" in s:
+                    _set_combo_text(w, s.get("vae_device"))
+                    break
+            for name in ("gpu_index", "gpuIndex"):
+                w = getattr(self, name, None)
+                if w is not None and "gpu_index" in s:
+                    _set_value(w, s.get("gpu_index"))
+                    break
+            for name in ("threads", "num_threads", "threadsSpin"):
+                w = getattr(self, name, None)
+                if w is not None and "threads" in s:
+                    _set_value(w, s.get("threads"))
+                    break
+            for name in ("fit_check", "fitCheck"):
+                w = getattr(self, name, None)
+                if w is not None and "fit_check" in s:
+                    _set_checked(w, s.get("fit_check"))
+                    break
+        except Exception:
+            pass
+    _T2I._apply_settings_from_dict = _apply_settings_from_dict_patched
+
+    _orig_collect = _T2I._collect_job
+    def _collect_job_patched(self):
+        job = _orig_collect(self)
+        try:
+            def _get_checked(name):
+                w = getattr(self, name, None)
+                try:
+                    return bool(w.isChecked()) if w is not None else None
+                except Exception:
+                    return None
+            def _get_combo_text(name):
+                w = getattr(self, name, None)
+                try:
+                    if w is None:
+                        return None
+                    if hasattr(w, "currentText"):
+                        return str(w.currentText())
+                    if hasattr(w, "itemText"):
+                        i = w.currentIndex()
+                        return str(w.itemText(i))
+                    return None
+                except Exception:
+                    return None
+            def _get_text(name):
+                w = getattr(self, name, None)
+                try:
+                    return str(w.text()) if w is not None else None
+                except Exception:
+                    return None
+            def _get_value(name):
+                w = getattr(self, name, None)
+                try:
+                    return int(w.value()) if w is not None else None
+                except Exception:
+                    return None
+
+            attn = _get_checked("attn_slicing") or _get_checked("attention_slicing") or _get_checked("attentionSlicing")
+            if attn is not None: job["attn_slicing"] = attn
+
+            hires = _get_checked("hires_helper") or _get_checked("hires_check") or _get_checked("hiresHelper")
+            if hires is not None: job["hires_helper"] = hires
+
+            fmt = _get_combo_text("format_combo") or _get_combo_text("formatBox") or _get_combo_text("file_format") or _get_combo_text("formatCombo")
+            if fmt is not None: job["format"] = fmt
+
+            fname = _get_text("filename_template") or _get_text("filenameTemplate") or _get_text("filename_edit")
+            if fname is not None: job["filename_template"] = fname
+
+            vae = _get_combo_text("vae_device") or _get_combo_text("vaeCombo") or _get_combo_text("vaeDevice")
+            if vae is not None: job["vae_device"] = vae
+
+            gpu = _get_value("gpu_index") or _get_value("gpuIndex")
+            if gpu is not None: job["gpu_index"] = gpu
+
+            th = _get_value("threads") or _get_value("num_threads") or _get_value("threadsSpin")
+            if th is not None: job["threads"] = th
+
+            fitc = _get_checked("fit_check") or _get_checked("fitCheck")
+            if fitc is not None: job["fit_check"] = fitc
+        except Exception:
+            pass
+        return job
+    _T2I._collect_job = _collect_job_patched
+
 except Exception as _e:
-    try: print('[txt2img] minimal patch failed to apply:', _e)
-    except Exception: pass
-# === End tiny patch ===
+    try:
+        print("[txt2img] minimal persistence patch failed:", _e)
+    except Exception:
+        pass
+# === End minimal persistence patch ===

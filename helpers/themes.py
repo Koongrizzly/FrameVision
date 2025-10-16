@@ -74,7 +74,7 @@ QWidget {{ background: {EVE_BG}; color: {EVE_TEXT}; }}
 QMainWindow, QDialog {{ background: {EVE_BG}; }}
 
 QGroupBox {{ background: {EVE_GROUP_BG}; border: 1px solid {EVE_BORDER_SOFT}; border-radius: 8px; margin-top: 14px; }}
-QGroupBox::title {{ subcontrol-origin: margin; left: 10px; padding: 3px 8px; background: {EVE_HEADER}; color: #003349; border-radius: 6px; font-weight: 700; }}
+QGroupBox::title {{ subcontrol-origin: margin; left: 10px; padding: 3px 8px; background: {EVE_HEADER}; color: #E5E7EB; border-radius: 6px; font-weight: 700; }}
 
 QTabWidget::pane {{ border: 1px solid {EVE_BORDER_SOFT}; top: -1px; background: {EVE_GROUP_BG}; }}
 QTabBar::tab {{ background: {EVE_TAB_BG}; padding: 7px 14px; border: 1px solid {EVE_BORDER_SOFT}; border-bottom: none; border-top-left-radius: 8px; border-top-right-radius: 8px; }}
@@ -154,6 +154,13 @@ def qss_for_theme(name: str) -> str:
         "mardi gras": QSS_MARDI_GRAS,
         "mardi grass": QSS_MARDI_GRAS,
         "sunburst": QSS_SUNBURST,
+        "candy pop": QSS_CANDY_POP,
+        "rainbow riot": QSS_RAINBOW_RIOT,
+        "sky light": QSS_SKY_LIGHT,
+        "pastel light": QSS_PASTEL_LIGHT,
+        "mgraphite dusk": QSS_GRAPHITE_DUSK,
+        "graphite dusk": QSS_GRAPHITE_DUSK,
+        "graphite": QSS_GRAPHITE_DUSK,
     }
     # Exact mapping first
     if s in _MAP:
@@ -174,8 +181,60 @@ def qss_for_theme(name: str) -> str:
     if "aurora" in s: return QSS_AURORA
     if "mardi" in s: return QSS_MARDI_GRAS
     if "sunburst" in s: return QSS_SUNBURST
+    if s.startswith("sky") or "sky light" in s: return QSS_SKY_LIGHT
+    if s.startswith("pastel") or "pastel light" in s: return QSS_PASTEL_LIGHT
+    if "graphite" in s or s.endswith("dusk"): return QSS_GRAPHITE_DUSK
+
+
     # Fallback
     return QSS_EVENING
+
+
+def _menu_qss(name: str) -> str:
+    """
+    Extra QSS that ensures visible hover/pressed backgrounds for menus and menubars,
+    tuned per theme. Keeps day themes light; makes dark themes lighter on hover;
+    gives colorful themes strong, on-brand hover tints; and sets Cyberpunk to violet.
+    """
+    s = (name or "").strip().lower()
+
+    def rule(hover_bg: str, pressed_bg: str, panel_bg: str | None = None, separator: str | None = None) -> str:
+        parts = []
+        if panel_bg:
+            parts.append(f"QMenu {{ background: {panel_bg}; }}")
+        if separator:
+            parts.append(f"QMenu::separator {{ height: 1px; background: {separator}; margin: 6px 8px; }}")
+        parts.append(f"QMenu::item:selected {{ background: {hover_bg}; }}")
+        parts.append(f"QMenu::item:pressed {{ background: {pressed_bg}; }}")
+        parts.append(f"QMenuBar::item:selected {{ background: {hover_bg}; }}")
+        parts.append(f"QMenuBar::item:pressed {{ background: {pressed_bg}; }}")
+        return "\n".join(parts) + "\n"
+
+    # Colorful themes (explicit request)
+    if 'color mix' in s or 'colormix' in s:
+        return rule('#22c55e', '#16a34a')  # green
+    if 'candy pop' in s:
+        return rule('#f97316', '#ea580c')  # orange
+    if 'rainbow riot' in s:
+        return rule('#3b82f6', '#2563eb')  # blue
+    if s.startswith('cyber'):
+        return rule('#6d28d9', '#5b21b6')  # violet
+
+    # Day-like themes — keep light and subtle
+    if s.startswith('day'):
+        return rule('#EAF6FF', '#D8F0FF')
+    if s.startswith('solar'):
+        return rule('#e6dfc9', '#e0d7bd')
+    if 'sky light' in s or s.startswith('sky'):
+        return rule('#E6F3FF', '#D9EDFF')
+    if 'pastel' in s:
+        return rule('#F3E8FF', '#E9D5FF')  # soft lavender
+    if 'sunburst' in s:
+        return rule('#FFF3C4', '#FFE8A1')  # pale yellow
+
+    # Dark-ish themes — provide lighter, clearer hover states
+    # Evening, Night, Slate, Graphite Dusk, High Contrast, Neon, Ocean, CRT, Aurora, Mardi Gras, Tropical Fiesta
+    return rule('#1f2937', '#172554')
 def apply_theme(app: QApplication, name: str) -> None:
     if (name or "").strip().lower() == "auto":
         from .framevision_app import pick_auto_theme
@@ -198,7 +257,7 @@ def apply_theme(app: QApplication, name: str) -> None:
             name = pick_auto_theme()
         except Exception:
             name = "Evening"
-    qss = qss_for_theme(name)
+    qss = qss_for_theme(name) + _menu_qss(name)
     try:
         app.setStyleSheet(qss)
         pal = app.palette()
@@ -208,12 +267,18 @@ def apply_theme(app: QApplication, name: str) -> None:
             pal.setColor(QPalette.Button, QColor(NIGHT_TAB_BG))
             pal.setColor(QPalette.Text, Qt.white)
             pal.setColor(QPalette.WindowText, Qt.white)
-        elif (name.lower().startswith("day") or "solar" in name.lower() or "sunburst" in name.lower()):
+        elif (name.lower().startswith("day") or "solar" in name.lower() or "sunburst" in name.lower() or "sky" in name.lower() or "pastel" in name.lower()):
             pal.setColor(QPalette.Window, QColor(DAY_BG))
             pal.setColor(QPalette.Base, QColor(DAY_GROUP_BG))
             pal.setColor(QPalette.Button, QColor(DAY_TAB_BG))
             pal.setColor(QPalette.Text, QColor(DAY_TEXT))
             pal.setColor(QPalette.WindowText, QColor(DAY_TEXT))
+        elif ("graphite" in name.lower() or "dusk" in name.lower()):
+            pal.setColor(QPalette.Window, QColor(GRA_BG))
+            pal.setColor(QPalette.Base, QColor(GRA_GROUP_BG))
+            pal.setColor(QPalette.Button, QColor("#1C2024"))
+            pal.setColor(QPalette.Text, QColor(GRA_TEXT))
+            pal.setColor(QPalette.WindowText, QColor(GRA_TEXT))
         else:
             pal.setColor(QPalette.Window, QColor(EVE_BG))
             pal.setColor(QPalette.Base, QColor(EVE_GROUP_BG))
@@ -229,6 +294,39 @@ def apply_theme(app: QApplication, name: str) -> None:
     except Exception:
         pass
 
+
+# --- Graphite Dusk (cool neutral dusk) ----------------------------------------------------
+GRA_BG = "#202428"           # window background (graphite)
+GRA_GROUP_BG = "#252A30"     # panels
+GRA_TEXT = "#E6E9ED"         # light text
+GRA_BORDER = "#343A42"       # borders
+GRA_ACCENT = "#8B95A1"       # graphite accent (neutral)
+
+QSS_GRAPHITE_DUSK = f"""
+QWidget {{ background: {GRA_BG}; color: {GRA_TEXT}; }}
+QMainWindow, QDialog {{ background: {GRA_BG}; }}
+
+QGroupBox {{ background: {GRA_GROUP_BG}; border: 1px solid {GRA_BORDER}; border-radius: 8px; margin-top: 14px; }}
+QGroupBox::title {{ subcontrol-origin: margin; left: 10px; padding: 3px 8px; background: {GRA_ACCENT}; color: #101215; border-radius: 6px; font-weight: 700; }}
+
+QTabWidget::pane {{ border: 1px solid {GRA_BORDER}; top: -1px; background: {GRA_GROUP_BG}; }}
+QTabBar::tab {{ background: #1C2024; padding: 7px 14px; border: 1px solid {GRA_BORDER}; border-bottom: none; border-top-left-radius: 8px; border-top-right-radius: 8px; }}
+QTabBar::tab:hover {{ background: #171B1F; }}
+QTabBar::tab:selected {{ background: {GRA_GROUP_BG}; color: {GRA_TEXT}; font-weight: 700; }}
+
+QPushButton {{ background: #1C2024; border: 1px solid {GRA_BORDER}; border-radius: 8px; padding: 6px 12px; color: {GRA_TEXT}; }}
+QPushButton:hover {{ background: #171B1F; }}
+QPushButton:pressed {{ background: #13171B; }}
+
+QLineEdit, QComboBox, QTextEdit, QSpinBox, QDoubleSpinBox {{ background: #171B1F; border: 1px solid {GRA_BORDER}; border-radius: 8px; padding: 5px 8px; color: {GRA_TEXT}; }}
+QComboBox::drop-down {{ width: 24px; }}
+
+QSlider::groove:horizontal {{ height: 6px; background: {GRA_BORDER}; border-radius: 3px; }}
+QSlider::handle:horizontal {{ width: 16px; background: {GRA_ACCENT}; border: 1px solid #7a828e; border-radius: 8px; margin: -6px 0; }}
+
+QScrollBar:vertical {{ width: 12px; background: #1C2024; border: 1px solid {GRA_BORDER}; border-radius: 6px; }}
+QScrollBar::handle:vertical {{ background: {GRA_BORDER}; border-radius: 6px; }}
+"""
 
 # --- Extra themes to reach 5 total -------------------------------------------------------
 # Slate (neutral mid-dark) — good for editors
@@ -483,6 +581,17 @@ QToolButton#btn_play    { background: #10b981; color: #03140d; border: 1px solid
 QToolButton#btn_pause   { background: #f59e0b; color: #261300; border: 1px solid #d97706; }
 QToolButton#btn_stop    { background: #ef4444; color: #2a0a0a; border: 1px solid #dc2626; }
 QToolButton#btn_fullscreen, QToolButton#btn_screenshot { background: #22d3ee; color: #00171b; border: 1px solid #0891b2; }
+
+/* Ensure icon-only toolbuttons are visible (even when autoRaise/flat) */
+QToolButton {
+  background: #0e1a16;
+  border: 1px solid #2a5d4c;
+  color: #e8fff4;
+  min-width: 28px; min-height: 28px;
+  border-radius: 14px;
+}
+QToolButton:hover { background: #143126; }
+QToolButton:disabled { color: #3d6a57; border-color: #23483b; }
 QLineEdit, QComboBox, QTextEdit, QSpinBox, QDoubleSpinBox { background: #0c1814; border: 1px solid #2a5d4c; color: #e8fff4; border-radius: 10px; }
 QComboBox QAbstractItemView { background: #0c1814; color: #e8fff4; selection-background-color: #143126; }
 QSlider::groove:horizontal { height: 9px; background: #193a2f; border-radius: 5px; }
@@ -757,3 +866,146 @@ QScrollBar:vertical {{ width: 12px; background: {SUN_TAB_BG}; border: 1px solid 
 QScrollBar::handle:vertical {{ background: {SUN_BORDER}; border-radius: 6px; }}
 """
 
+
+
+# --- Candy Pop (flashy neon candy palette on deep magenta) --------------------------------
+QSS_CANDY_POP = """
+QWidget { background: #120018; color: #FFEAFE; }
+QMainWindow, QDialog { background: #120018; }
+
+QGroupBox { background: #1E0026; border: 1px solid #3A0A57; border-radius: 12px; margin-top: 16px; }
+QGroupBox::title { subcontrol-origin: margin; left: 12px; padding: 2px 10px; background: #FF67C0; color: #2A002F; border-radius: 8px; font-weight: 900; }
+
+QTabWidget::pane { border: 1px solid #3A0A57; top: -1px; background: #1E0026; }
+QTabBar::tab { background: #240033; padding: 9px 18px; border: 1px solid #3A0A57; border-bottom: none; border-top-left-radius: 12px; border-top-right-radius: 12px; color:#FFEAFE; }
+QTabBar::tab:hover { background: #2C0042; border-color: #FF67C0; }
+QTabBar::tab:selected {
+    background: qlineargradient(x1:0,y1:0,x2:1,y2:0, stop:0 #FF67C0, stop:1 #00FFD1);
+    color:#1A001F; font-weight: 900; border-color:#FF67C0;
+}
+
+QPushButton { background: #240033; color: #FFEAFE; border: 1px solid #3A0A57; border-radius: 12px; padding: 9px 14px; }
+QPushButton:hover { border-color: #FF67C0; color: #FF67C0; }
+QPushButton:pressed { background: #FF67C0; color:#2A002F; border-color:#00FFD1; }
+
+QLineEdit, QPlainTextEdit, QTextEdit { background: #240033; border: 1px solid #3A0A57; border-radius: 10px; selection-background-color: #FF67C0; selection-color:#2A002F; }
+QComboBox { background: #240033; border: 1px solid #3A0A57; border-radius: 10px; padding: 6px; color:#FFEAFE; }
+
+QProgressBar { background:#240033; border:1px solid #3A0A57; border-radius: 12px; text-align:center; color:#FFEAFE; }
+QProgressBar::chunk { background: qlineargradient(x1:0,y1:0,x2:1,y2:0, stop:0 #00FFD1, stop:1 #FF67C0); border-radius:12px; }
+
+QSlider::groove:horizontal { height: 6px; background: #240033; border: 1px solid #3A0A57; border-radius: 4px; }
+QSlider::handle:horizontal { width: 18px; background: #00FFD1; border: 1px solid #FF67C0; border-radius: 9px; margin: -6px 0; }
+
+QScrollBar:vertical { width: 12px; background: #240033; border: 1px solid #3A0A57; border-radius: 6px; }
+QScrollBar::handle:vertical { background: #FF67C0; border-radius: 6px; }
+"""
+
+
+# --- Rainbow Riot (bold multi-color gradients on deep navy) --------------------------------
+QSS_RAINBOW_RIOT = """
+QWidget { background: #05070A; color: #F5F7FF; }
+QMainWindow, QDialog { background: #05070A; }
+
+QGroupBox { background: #0A0F1A; border: 1px solid #1D2A3A; border-radius: 12px; margin-top: 16px; }
+QGroupBox::title { subcontrol-origin: margin; left: 12px; padding: 2px 10px; 
+    background: qlineargradient(x1:0,y1:0,x2:1,y2:0, 
+        stop:0 #FF007A, stop:0.2 #FF8A00, stop:0.4 #F8FF00, stop:0.6 #00FF87, stop:0.8 #00E5FF, stop:1 #A100FF);
+    color: #0B0E14; border-radius: 8px; font-weight: 900; 
+}
+
+QTabWidget::pane { border: 1px solid #1D2A3A; top: -1px; background: #0A0F1A; }
+QTabBar::tab { background: #0C1320; padding: 9px 18px; border: 1px solid #1D2A3A; border-bottom: none; border-top-left-radius: 12px; border-top-right-radius: 12px; color:#E8EEFF; }
+QTabBar::tab:hover { background: #0E1829; }
+QTabBar::tab:selected { 
+    background: qlineargradient(x1:0,y1:0,x2:1,y2:0, 
+        stop:0 #FF8A00, stop:0.25 #F8FF00, stop:0.5 #00FF87, stop:0.75 #00E5FF, stop:1 #A100FF);
+    color:#0B0E14; font-weight: 900; border-color:#00E5FF; 
+}
+
+QPushButton { background: #0C1320; color: #F5F7FF; border: 1px solid #1D2A3A; border-radius: 12px; padding: 9px 14px; }
+QPushButton:hover { border-color: #00E5FF; color:#00E5FF; }
+QPushButton:pressed { 
+    background: qlineargradient(x1:0,y1:0,x2:1,y2:0, stop:0 #00FF87, stop:1 #FF007A);
+    color:#0B0E14; border-color:#F8FF00;
+}
+
+QLineEdit, QPlainTextEdit, QTextEdit { background: #0C1320; border: 1px solid #1D2A3A; border-radius: 10px; selection-background-color: #FF007A; selection-color:#0D0F16; }
+QComboBox { background: #0C1320; border: 1px solid #1D2A3A; border-radius: 10px; padding: 6px; color:#F5F7FF; }
+
+QProgressBar { background:#0C1320; border:1px solid #1D2A3A; border-radius: 12px; text-align:center; color:#F5F7FF; }
+QProgressBar::chunk { background: qlineargradient(x1:0,y1:0,x2:1,y2:0, stop:0 #FF007A, stop:0.2 #FF8A00, stop:0.4 #F8FF00, stop:0.6 #00FF87, stop:0.8 #00E5FF, stop:1 #A100FF); border-radius:12px; }
+
+QSlider::groove:horizontal { height: 6px; background: #0C1320; border: 1px solid #1D2A3A; border-radius: 4px; }
+QSlider::handle:horizontal { width: 18px; background: #F8FF00; border: 1px solid #FF007A; border-radius: 9px; margin: -6px 0; }
+
+QScrollBar:vertical { width: 12px; background: #0C1320; border: 1px solid #1D2A3A; border-radius: 6px; }
+QScrollBar::handle:vertical { background: #00E5FF; border-radius: 6px; }
+"""
+
+
+# ----------------------------------------------------------------------------------------
+# Added: Sky Light & Pastel Light (light themes that work in Settings tab)
+# These reuse the Day palette colors with different gentle accents.
+# ----------------------------------------------------------------------------------------
+# --- Sky Light — airy blue light theme ----------------------------------------------------
+QSS_SKY_LIGHT = f"""
+QAbstractScrollArea {{ background: {DAY_BG}; }}
+QScrollArea QWidget#qt_scrollarea_viewport {{ background: {DAY_BG}; }}
+QWidget {{ background: {DAY_BG}; color: {DAY_TEXT}; }}
+QMainWindow, QDialog {{ background: {DAY_BG}; }}
+
+QGroupBox {{ background: {DAY_GROUP_BG}; border: 1px solid {DAY_BORDER_SOFT}; border-radius: 8px; margin-top: 14px; }}
+QGroupBox::title {{ subcontrol-origin: margin; left: 10px; padding: 3px 8px; background: #BFE7FF; color: {DAY_TEXT}; border-radius: 6px; font-weight: 600; }}
+
+QTabWidget::pane {{ border: 1px solid {DAY_BORDER_SOFT}; top: -1px; background: {DAY_GROUP_BG}; }}
+QTabBar::tab {{ background: #E9F6FF; padding: 7px 14px; border: 1px solid {DAY_BORDER_SOFT}; border-bottom: none; border-top-left-radius: 8px; border-top-right-radius: 8px; }}
+QTabBar::tab:hover {{ background: #D9F0FF; }}
+QTabBar::tab:selected {{ background: {DAY_GROUP_BG}; color: {DAY_TEXT}; font-weight: 700; }}
+
+QPushButton {{ background: #E9F6FF; border: 1px solid {DAY_BORDER_SOFT}; border-radius: 8px; padding: 6px 12px; }}
+QPushButton:hover {{ background: #DDF1FF; }}
+QPushButton:pressed {{ background: #D1EBFF; }}
+
+QLineEdit, QComboBox, QTextEdit, QSpinBox, QDoubleSpinBox {{ background: {DAY_INPUT_BG}; border: 1px solid {DAY_BORDER_SOFT}; border-radius: 8px; padding: 5px 8px; color: {DAY_TEXT}; }}
+QComboBox::drop-down {{ width: 24px; }}
+
+QCheckBox, QRadioButton {{ background: transparent; border: none; }}
+
+QSlider::groove:horizontal {{ height: 6px; background: {DAY_BORDER_SOFT}; border-radius: 3px; }}
+QSlider::handle:horizontal {{ width: 16px; background: #7FD6FF; border: 1px solid #78c3ff; border-radius: 8px; margin: -6px 0; }}
+
+QScrollBar:vertical {{ width: 12px; background: #E9F6FF; border: 1px solid {DAY_BORDER_SOFTER}; border-radius: 6px; }}
+QScrollBar::handle:vertical {{ background: {DAY_BORDER_SOFT}; border-radius: 6px; }}
+"""
+
+# --- Pastel Light — soft lilac/peach accents on light base --------------------------------
+QSS_PASTEL_LIGHT = f"""
+QAbstractScrollArea {{ background: {DAY_BG}; }}
+QScrollArea QWidget#qt_scrollarea_viewport {{ background: {DAY_BG}; }}
+QWidget {{ background: {DAY_BG}; color: {DAY_TEXT}; }}
+QMainWindow, QDialog {{ background: {DAY_BG}; }}
+
+QGroupBox {{ background: {DAY_GROUP_BG}; border: 1px solid {DAY_BORDER_SOFT}; border-radius: 8px; margin-top: 14px; }}
+QGroupBox::title {{ subcontrol-origin: margin; left: 10px; padding: 3px 8px; background: #EADCFD; color: {DAY_TEXT}; border-radius: 6px; font-weight: 600; }}
+
+QTabWidget::pane {{ border: 1px solid {DAY_BORDER_SOFT}; top: -1px; background: {DAY_GROUP_BG}; }}
+QTabBar::tab {{ background: #FFF6FA; padding: 7px 14px; border: 1px solid {DAY_BORDER_SOFT}; border-bottom: none; border-top-left-radius: 8px; border-top-right-radius: 8px; }}
+QTabBar::tab:hover {{ background: #FDECF4; }}
+QTabBar::tab:selected {{ background: {DAY_GROUP_BG}; color: {DAY_TEXT}; font-weight: 700; }}
+
+QPushButton {{ background: #FFF6FA; border: 1px solid {DAY_BORDER_SOFT}; border-radius: 8px; padding: 6px 12px; }}
+QPushButton:hover {{ background: #FDECF4; }}
+QPushButton:pressed {{ background: #F8E4EF; }}
+
+QLineEdit, QComboBox, QTextEdit, QSpinBox, QDoubleSpinBox {{ background: {DAY_INPUT_BG}; border: 1px solid {DAY_BORDER_SOFT}; border-radius: 8px; padding: 5px 8px; color: {DAY_TEXT}; }}
+QComboBox::drop-down {{ width: 24px; }}
+
+QCheckBox, QRadioButton {{ background: transparent; border: none; }}
+
+QSlider::groove:horizontal {{ height: 6px; background: {DAY_BORDER_SOFT}; border-radius: 3px; }}
+QSlider::handle:horizontal {{ width: 16px; background: #F5BFD4; border: 1px solid #eaa3bd; border-radius: 8px; margin: -6px 0; }}
+
+QScrollBar:vertical {{ width: 12px; background: #FFF6FA; border: 1px solid {DAY_BORDER_SOFTER}; border-radius: 6px; }}
+QScrollBar::handle:vertical {{ background: {DAY_BORDER_SOFT}; border-radius: 6px; }}
+"""
