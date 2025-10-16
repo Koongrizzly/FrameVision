@@ -1627,9 +1627,9 @@ class MusicRuntime(QObject):
         self._was_quiet = False
         self._return_cooldown_until_ms = 0
         # tunables (no UI): tweak if needed
-        self._silence_gate = 0.50  # RMS threshold for 'quiet'
-        self._silence_min_ms = 250  # how long it must stay below gate
-        self._return_cooldown_ms = 3700  # min gap between return-triggered switches
+        self._silence_gate = 0.30  # RMS threshold for 'quiet'
+        self._silence_min_ms = 350  # how long it must stay below gate
+        self._return_cooldown_ms = 1100  # min gap between return-triggered switches
 
     
         # crossfade state

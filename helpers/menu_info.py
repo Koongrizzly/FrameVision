@@ -476,6 +476,7 @@ class UpdateDialog(QDialog):
         btn_beta_partial= QPushButton("Update python files only", self)
         btn_beta_full   = QPushButton("Update all files", self)
         btn_cancel      = QPushButton("Cancel", self)
+        btn_manual      = QPushButton("Manual check", self)
 
         btn_backup.clicked.connect(self._on_backup)
         btn_rel_partial.clicked.connect(lambda: self._on_update('release','partial'))
@@ -483,6 +484,7 @@ class UpdateDialog(QDialog):
         btn_beta_partial.clicked.connect(lambda: self._on_update('branch','partial'))
         btn_beta_full.clicked.connect(lambda: self._on_update('branch','full'))
         btn_cancel.clicked.connect(self.reject)
+        btn_manual.clicked.connect(self._on_manual_check)
 
         v = QVBoxLayout(self)
         v.addWidget(warn)
@@ -548,6 +550,7 @@ class UpdateDialog(QDialog):
 
         row3 = QHBoxLayout()
         row3.addWidget(btn_backup)
+        row3.addWidget(btn_manual)
         row3.addItem(QSpacerItem(10, 10, QSizePolicy.Expanding, QSizePolicy.Minimum))
         row3.addWidget(btn_cancel)
         v.addLayout(row3)
@@ -577,6 +580,65 @@ class UpdateDialog(QDialog):
         self._backup_worker.ok.connect(_ok)
         self._backup_worker.err.connect(_err)
         self._backup_worker.start()
+
+
+    def _on_manual_check(self):
+        """
+        Manual update check: probes GitHub now and shows the same popup as the daily checker.
+        If nothing is new, it shows a small 'No updates yet' message.
+        """
+        self._append("Starting manual update check…")
+        try:
+            from helpers import update_checker as uc
+        except Exception as e:
+            self._append(f"Update checker not available: {e}")
+            QMessageBox.warning(self, "Manual check", "helpers.update_checker could not be imported.")
+            return
+
+        owner = getattr(uc, "GITHUB_OWNER", None) or globals().get("GITHUB_OWNER", "Koongrizzly")
+        repo  = getattr(uc, "GITHUB_REPO",  None) or globals().get("GITHUB_REPO",  "FrameVision")
+
+        # Run non-blocking probe
+        self._append("Contacting GitHub…")
+        self._manual_probe = uc._ProbeWorker(self, owner, repo)
+
+        def _done(out: dict):
+            # Persist diagnostics for consistency (do not touch the daily gate)
+            try:
+                st = uc._load_state()
+                st["last_result"] = out
+                uc._save_state(st)
+            except Exception:
+                pass
+
+            # Decide what to show
+            has_release = bool(out.get("has_release"))
+            tag = out.get("release_tag")
+            try:
+                if has_release and tag and uc.get_ack_release_tag() == tag:
+                    has_release = False
+            except Exception:
+                pass
+            beta_hint = bool(out.get("beta_hint"))
+
+            if has_release or beta_hint:
+                self._append("Updates available — showing popup.")
+                try:
+                    uc._show_updates_popup(self, out)
+                except Exception as e:
+                    self._append(f"Popup failed: {e}")
+                    try:
+                        uc._open_release_updater(self)
+                    except Exception:
+                        pass
+            else:
+                self._append("No updates found.")
+                QMessageBox.information(self, "No updates", "No updates yet.")
+
+            self._manual_probe = None
+
+        self._manual_probe.result.connect(_done)
+        self._manual_probe.start()
 
 
     def _on_update(self, source: str, mode: str):
