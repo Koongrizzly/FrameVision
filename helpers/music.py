@@ -22,7 +22,7 @@ from PySide6.QtWidgets import (
 # Optional Qt multimedia probe
 try:
     from PySide6.QtMultimedia import QAudioProbe, QMediaPlayer
-    HAVE_AUDIO_PROBE = True
+    HAVE_AUDIO_PROBE = False
 except Exception:
     QAudioProbe = None  # type: ignore
     QMediaPlayer = None  # type: ignore
@@ -240,7 +240,7 @@ class PreAnalyzer(QThread):
     """
     ready = Signal(list, list, list)
 
-    def __init__(self, path: Path, sr: int = 24000, bands: int = 48, hop_ms: int = 70, parent=None):
+    def __init__(self, path: Path, sr: int = 12000, bands: int = 48, hop_ms: int = 70, parent=None):
         self._ema_ref = None  # per-bin EMA reference for AGC
         self._stop_requested = False
         self._proc = None
@@ -250,6 +250,10 @@ class PreAnalyzer(QThread):
         self.sr = int(sr)
         self.bands = int(bands)
         self.hop_ms = int(hop_ms)
+        # Optional segment window (ms) for JIT mode
+        self.start_ms = None
+        self.dur_ms = None
+
 
     def request_stop(self):
         self._stop_requested = True
@@ -312,7 +316,13 @@ class PreAnalyzer(QThread):
 
     def run(self):
         ff = ffmpeg_path()
-        cmd = [ff, '-hide_banner', '-nostats', '-loglevel', 'error', '-i', str(self.path), '-vn', '-ac', '1', '-ar', str(self.sr), '-f', 'f32le', 'pipe:1']
+        cmd = [ff, '-hide_banner', '-nostats', '-loglevel', 'error']
+        if (getattr(self, 'start_ms', None) is not None) and (getattr(self, 'dur_ms', None) is not None):
+            preroll = 200
+            ss = max(0, int(self.start_ms) - preroll)
+            tt = int(self.dur_ms) + preroll
+            cmd += ['-ss', f'{ss/1000:.3f}', '-t', f'{tt/1000:.3f}']
+        cmd += ['-i', str(self.path), '-vn', '-ac', '1', '-ar', str(self.sr), '-f', 'f32le', 'pipe:1']
         try:
             self._proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
             p = self._proc
@@ -334,8 +344,8 @@ class PreAnalyzer(QThread):
         idx = 0
         emitted_initial = False
         last_emit_ms = 0
-        INITIAL_MS = 2500  # first partial emit ~2.5s
-        PERIODIC_MS = 2000  # then every ~2s
+        INITIAL_MS = 900  # first partial emit ~2.5s
+        PERIODIC_MS = 1000  # then every ~2s
 
         freqs = None
         edges = None
@@ -428,7 +438,7 @@ class PreAnalyzer(QThread):
 
                 bands_mat.append(out)
                 rms_list.append(min(1.0, rms * 2.2))
-                t_ms = idx * self.hop_ms
+                t_ms = (int(self.start_ms) if getattr(self, 'start_ms', None) is not None else 0) + idx * self.hop_ms
                 times_ms.append(t_ms)
                 idx += 1
                 # Incremental partial results
@@ -491,6 +501,20 @@ class HybridAnalyzer(QObject):
         else:
             self._probe = None
 
+        # --- JIT small-window analysis (no full preanalysis) ---
+        self._win_ms = 15000
+        self._preroll_ms = 800
+        self._seg_cache = {}
+        self._seg_worker = None
+        self._seg_inflight = False
+        self._win_start = 0
+        self._win_end = 0
+        try:
+            if hasattr(self.player, 'positionChanged'):
+                self.player.positionChanged.connect(self._on_pos_update_window)
+        except Exception:
+            pass
+
     def set_file(self, path: Path):
         # Stop any previous worker first
         try:
@@ -526,6 +550,23 @@ class HybridAnalyzer(QObject):
         except Exception:
             pass
 
+
+        # JIT: cancel any previous preanalysis and prime small window
+        try:
+            if hasattr(self, '_worker') and getattr(self, '_worker', None):
+                try: self._worker.request_stop()
+                except Exception: pass
+                try: self._worker.wait(400)
+                except Exception: pass
+                self._worker = None
+        except Exception: pass
+        try:
+            self._seg_cache.clear()
+        except Exception:
+            self._seg_cache = {}
+        self._cancel_window()
+        self.path = Path(path)
+        self._kick_window(0)
 
     def start(self):
         self._timer.start(90)
@@ -597,6 +638,17 @@ class HybridAnalyzer(QObject):
             pass
 
     def _tick(self):
+        # JIT fast path: serve from tiny cache near playhead
+        try:
+            pos = int(getattr(self.player, 'position', lambda: 0)())
+            b, r = self._lookup_from_cache(pos)
+            if b is not None:
+                self.levelsReady.emit(b)
+                self.rmsReady.emit(float(r or 0.0))
+                return
+        except Exception:
+            pass
+
 
 
         # Prefer cached segment data around current position
@@ -610,7 +662,7 @@ class HybridAnalyzer(QObject):
             ks = list(self._seg_cache.keys())
             if ks:
                 near = min(ks, key=lambda k: abs(k - pos))
-                if abs(near - pos) > max(1, self._hop_ms):
+                if abs(near - pos) > max(1, self._hop_ms) * 100:  # relaxed: hold cached instead of falling back
                     near = None
         if near is not None:
             b, r = self._seg_cache.get(near, (None, None))
@@ -688,6 +740,69 @@ class HybridAnalyzer(QObject):
         except Exception:
             pass
 
+    def _cancel_window(self):
+        try:
+            if getattr(self, '_seg_worker', None):
+                try: self._seg_worker.request_stop()
+                except Exception: pass
+                self._seg_worker = None
+        except Exception:
+            pass
+        self._seg_inflight = False
+
+    def _kick_window(self, center_ms: int):
+        self._cancel_window()
+        if not getattr(self, 'path', None):
+            return
+        start_ms = max(0, int(center_ms) - int(self._preroll_ms))
+        dur_ms = int(self._win_ms)
+        w = PreAnalyzer(self.path, sr=22050, bands=self.bands, hop_ms=self._hop_ms, parent=self)
+        w.start_ms = start_ms
+        w.dur_ms = dur_ms
+        def _take(times, bands, rms):
+            try:
+                for t, b, r in zip(times, bands, rms):
+                    self._seg_cache[int(t)] = (b, r)
+                self._win_start = start_ms
+                self._win_end = start_ms + dur_ms
+                pos = int(getattr(self.player, 'position', lambda: 0)() or 0)
+                #if times:
+                #    idx = max(0, min(len(times)-1, int((pos - start_ms) / max(1, self._hop_ms))))
+                #    self.levelsReady.emit(bands[idx])
+                #    self.rmsReady.emit(rms[idx])
+            except Exception:
+                pass
+            finally:
+                self._seg_inflight = False
+        try:
+            w.ready.connect(_take, getattr(Qt, 'UniqueConnection', 0))
+        except Exception:
+            w.ready.connect(_take)
+        self._seg_worker = w
+        self._seg_inflight = True
+        w.start()
+
+    def _on_pos_update_window(self, pos: int):
+        try:
+            if pos < self._win_start or pos > self._win_end:
+                self._kick_window(int(pos))
+                return
+            span = max(1, self._win_end - self._win_start)
+            if not self._seg_inflight and (pos - self._win_start) >= int(0.70 * span):
+                next_center = int(pos + 0.85 * span)
+                self._kick_window(next_center)
+        except Exception:
+            pass
+
+    def _lookup_from_cache(self, pos_ms: int):
+        try:
+            if not self._seg_cache:
+                return None, None
+            k = min(self._seg_cache.keys(), key=lambda t: abs(t - pos_ms))
+            return self._seg_cache.get(k, (None, None))
+        except Exception:
+            return None, None
+
 class VisualEngine(QObject):
     frameReady = Signal(QImage)
 
@@ -703,7 +818,7 @@ class VisualEngine(QObject):
         self._rms = 0.0
         self._bars = bars
         # High-shelf visual tilt (0.0–0.5). 0.18 ≈ +1.5dB at top band
-        self._high_tilt = 0.18
+        self._high_tilt = 0.16
         self._plugin = None
         _load_visual_plugins()
 
@@ -775,11 +890,11 @@ class VisualEngine(QObject):
                 # === Other bands: gentle asymmetry ===
                 rising = v >= prev
                 if i < max(16, self._bars // 4):        # low-mids
-                    alpha_up, alpha_down = 0.34, 0.18
+                    alpha_up, alpha_down = 0.34, 0.48
                 elif i < max(24, self._bars // 2):      # mids
-                    alpha_up, alpha_down = 0.30, 0.20
+                    alpha_up, alpha_down = 0.30, 0.40
                 else:                                    # highs
-                    alpha_up, alpha_down = 0.36, 0.26
+                    alpha_up, alpha_down = 0.36, 0.46
                 a = alpha_up if rising else alpha_down
                 out[i] = prev * (1.0 - a) + v * a
 
@@ -792,7 +907,7 @@ class VisualEngine(QObject):
 
         # Apply gentle high-shelf tilt: progressively boost higher bands a little
         try:
-            hb = float(getattr(self, '_high_tilt', 0.18))
+            hb = float(getattr(self, '_high_tilt', 0.16))
         except Exception:
             hb = 0.18
         if hb > 0.0 and self._bars > 1:
@@ -1627,9 +1742,9 @@ class MusicRuntime(QObject):
         self._was_quiet = False
         self._return_cooldown_until_ms = 0
         # tunables (no UI): tweak if needed
-        self._silence_gate = 0.30  # RMS threshold for 'quiet'
-        self._silence_min_ms = 350  # how long it must stay below gate
-        self._return_cooldown_ms = 1100  # min gap between return-triggered switches
+        self._silence_gate = 0.15  # RMS threshold for 'quiet'
+        self._silence_min_ms = 250  # how long it must stay below gate
+        self._return_cooldown_ms = 3800  # min gap between return-triggered switches
 
     
         # crossfade state
@@ -2037,7 +2152,7 @@ class MusicRuntime(QObject):
             self.overlay.chk_xfade.toggled.connect(lambda _c: self._persist_state())
             self.overlay.cmb_fade.currentIndexChanged.connect(lambda _i: self._persist_state())
             # rebuild bag when user manually picks a visual
-            self.overlay.cmb_visual.currentIndexChanged.connect(lambda _i: self._viz_rebuild_bag())
+            # self.overlay.cmb_visual.currentIndexChanged.connect(lambda _i: self._viz_rebuild_bag())
         except Exception:
             pass
         # initialize bag once overlay is wired

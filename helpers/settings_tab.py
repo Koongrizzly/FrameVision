@@ -1,5 +1,5 @@
 from __future__ import annotations
-from typing import Optional, Iterable, List, Dict, Callable
+from typing import Optional
 from PySide6 import QtCore, QtGui, QtWidgets
 from PySide6.QtCore import Qt, QSettings, QTimer
 from PySide6.QtWidgets import (
@@ -11,171 +11,13 @@ try:
     from helpers.framevision_app import apply_theme, config, save_config
 except Exception:
     apply_theme=None; config={}
+
 import os, shutil, sys, time
 
 # ------------------------------------------------------------------------------------------
-# === Easter Eggs registry + usage tracking (NEW) ==========================================
+# NOTE: Easter Egg system has been moved to helpers/settings_more.py
+# This file now contains only the Settings UI and minimal wiring.
 # ------------------------------------------------------------------------------------------
-# Add new eggs by inserting more dict entries here. Each entry requires:
-#   id: unique string key
-#   label: menu label
-#   icon_fn: callable -> QIcon
-#   script: relative path to launcher script
-#   unlock_seconds: cumulative app usage seconds required to unlock
-#   message: popup text shown once when unlocked
-#
-# Note: We *hide* locked eggs from the menu entirely.
-EASTER_EGGS: List[Dict] = [
-    {
-        "id": "tetris",
-        "label": "Play Tetris",
-        "icon_fn": lambda: _make_tetris_icon(18),
-        "script": r"helpers\\tetris_game.py",
-        "unlock_seconds": 60 * 60,  # 1 hour
-        "message": "new easter egg unlocked, check settings tab",
-    },
-    {
-        "id": "pong",
-        "label": "Play Pong",
-        "icon_fn": lambda: _make_pong_icon(18),
-        "script": r"helpers\\colorful_pong.py",
-        "unlock_seconds": 60 * 60 * 10,  # 10 hours
-        "message": "way to go, you unlocked another easter egg, check settings tab",
-    },
-
-    {
-        "id": "framie_snake",
-        "label": "Play Framie Snake",
-        "icon_fn": lambda: _make_snake_icon(18),
-        "script": r"helpers\\Framie_snake.py",
-        "unlock_seconds": 60 * 60 * 6,  # 6 hours
-        "message": "new easter egg unlocked, check settings tab",
-    },
-]
-
-_USAGE_SETTINGS_SCOPE = ("FrameVision", "FrameVision")
-_USAGE_TOTAL_KEY = "usage_total_seconds"
-_USAGE_TRACKER_APP_PROP = "_fv_usage_tracker_singleton"
-
-
-def _usage_settings() -> QSettings:
-    return QSettings(*_USAGE_SETTINGS_SCOPE)
-
-
-def _get_usage_total_seconds() -> int:
-    s = _usage_settings()
-    try:
-        val = s.value(_USAGE_TOTAL_KEY, 0, type=int)
-    except Exception:
-        # On some Qt bindings, type=int retrieval may fail; fallback to int(..)
-        try:
-            val = int(s.value(_USAGE_TOTAL_KEY, 0))
-        except Exception:
-            val = 0
-    return int(val or 0)
-
-
-def _set_usage_total_seconds(v: int) -> None:
-    _usage_settings().setValue(_USAGE_TOTAL_KEY, int(max(0, v)))
-
-
-def _egg_unlocked(egg_id: str) -> bool:
-    s = _usage_settings()
-    return bool(s.value(f"egg_{egg_id}_unlocked", False, type=bool))
-
-
-def _mark_egg_unlocked(egg_id: str) -> None:
-    s = _usage_settings()
-    s.setValue(f"egg_{egg_id}_unlocked", True)
-    s.setValue(f"egg_{egg_id}_unlocked_at", int(time.time()))
-
-
-def _unlock_popup_once(egg_id: str, message: str) -> None:
-    # Ensure we only show the "unlocked" popup once and keep it alive.
-    s = _usage_settings()
-    if s.value(f"egg_{egg_id}_popup_shown", False, type=bool):
-        return
-    s.setValue(f"egg_{egg_id}_popup_shown", True)
-
-    try:
-        app = QtWidgets.QApplication.instance()
-        parent = app.activeWindow() if app else None
-        m = QtWidgets.QMessageBox(QtWidgets.QMessageBox.Information,
-                                  "Easter egg unlocked",
-                                  message,
-                                  QtWidgets.QMessageBox.Ok,
-                                  parent)
-        if app is not None:
-            # Keep a reference so it's not garbage-collected
-            if not hasattr(app, "_fv_unlock_popups"):
-                app._fv_unlock_popups = []  # type: ignore[attr-defined]
-            app._fv_unlock_popups.append(m)  # type: ignore[attr-defined]
-            def _cleanup(_res=None, _m=m):
-                try:
-                    app._fv_unlock_popups.remove(_m)  # type: ignore[attr-defined]
-                except Exception:
-                    pass
-            m.finished.connect(_cleanup)
-        m.show()
-    except Exception:
-        pass
-
-
-class _UsageTracker(QtCore.QObject):
-    """Lightweight singleton that increments a persisted counter while the app runs."""
-    def __init__(self, parent: Optional[QtCore.QObject] = None) -> None:
-        super().__init__(parent)
-        self._settings = _usage_settings()
-        self._last = time.time()
-        self._tm = QtCore.QTimer(self)
-        self._tm.setInterval(10_000)  # 10s cadence; coarse is fine
-        self._tm.timeout.connect(self._tick)
-        self._tm.start()
-
-    def _tick(self) -> None:
-        now = time.time()
-        delta = max(0, int(now - self._last))
-        self._last = now
-        if not delta:
-            return
-        total = _get_usage_total_seconds() + delta
-        _set_usage_total_seconds(total)
-        _check_for_unlocks(total)
-
-
-def _ensure_usage_tracker() -> None:
-    try:
-        app = QtWidgets.QApplication.instance()
-        if not app:
-            return
-        if getattr(app, _USAGE_TRACKER_APP_PROP, None):
-            return
-        tracker = _UsageTracker(app)
-        setattr(app, _USAGE_TRACKER_APP_PROP, tracker)
-    except Exception:
-        pass
-
-
-def _check_for_unlocks(total_seconds: Optional[int] = None) -> None:
-    """If any eggs just crossed their threshold, mark & notify."""
-    if total_seconds is None:
-        total_seconds = _get_usage_total_seconds()
-    try:
-        for egg in EASTER_EGGS:
-            if _egg_unlocked(egg["id"]):
-                continue
-            if total_seconds >= int(egg.get("unlock_seconds", 0)):
-                _mark_egg_unlocked(egg["id"])
-                _unlock_popup_once(egg["id"], egg.get("message", "New easter egg unlocked!"))
-    except Exception:
-        pass
-
-
-# Start tracking shortly after import so it works even if Settings page is never opened.
-try:
-    QtCore.QTimer.singleShot(1000, _ensure_usage_tracker)
-except Exception:
-    pass
 
 # ---- small filesystem helpers ------------------------------------------------------------
 def _clean_directory_contents(path: str) -> None:
@@ -183,7 +25,6 @@ def _clean_directory_contents(path: str) -> None:
     try:
         if not path:
             return
-        p = QtCore.QDir.toNativeSeparators(path)
         if not os.path.isdir(path):
             return
         for name in os.listdir(path):
@@ -195,7 +36,6 @@ def _clean_directory_contents(path: str) -> None:
                     try:
                         os.remove(fp)
                     except PermissionError:
-                        # read-only on Windows; try chmod then remove
                         try:
                             os.chmod(fp, 0o666)
                             os.remove(fp)
@@ -208,7 +48,6 @@ def _clean_directory_contents(path: str) -> None:
 
 def _project_root() -> str:
     try:
-        # heuristic: helpers/ is under project root
         here = os.path.abspath(os.path.dirname(__file__))
         return os.path.abspath(os.path.join(here, ".."))
     except Exception:
@@ -234,7 +73,6 @@ def _locate_settings_container(root: QWidget) -> QWidget | None:
             if "setting" in (tabs.tabText(i) or "").lower():
                 w = tabs.widget(i)
                 return w.widget() if isinstance(w, QScrollArea) else w
-    # fallback: direct child named 'settings'
     for w in root.findChildren(QWidget) or []:
         if (w.objectName() or "").lower() == "settings":
             return w
@@ -257,13 +95,11 @@ def _wipe_layout(lay: QVBoxLayout) -> None:
 
 # ---- component builders ------------------------------------------------------------------
 def _theme_row(page: QWidget) -> QWidget:
-    """Top section with (1) Theme controls and (2) Intro overlay controls on a NEW LINE."""
     container = QWidget(page)
     v = QVBoxLayout(container)
     v.setContentsMargins(0,0,0,0)
     v.setSpacing(6)
 
-    # --- Row 1: Theme selection + apply ---------------------------------------------------
     top = QWidget(container)
     h = QHBoxLayout(top); h.setContentsMargins(0,0,0,0); h.setSpacing(8)
     lab = QLabel("Theme:")
@@ -293,7 +129,6 @@ def _theme_row(page: QWidget) -> QWidget:
     h.addWidget(lab); h.addWidget(box); h.addWidget(btn); h.addStretch(1)
     v.addWidget(top)
 
-    # --- Row 2: Intro overlay controls (moved to NEW LINE) -------------------------------
     bottom = QWidget(container)
     h2 = QHBoxLayout(bottom); h2.setContentsMargins(0,0,0,0); h2.setSpacing(8)
 
@@ -306,7 +141,6 @@ def _theme_row(page: QWidget) -> QWidget:
     ov_preview = QCheckBox("Preview in Settings")
     ov_preview.setToolTip("If enabled, shows the intro overlay briefly in the Settings preview.")
 
-    # Persist/restore via QSettings
     _s = QSettings("FrameVision", "FrameVision")
     ov_toggle.setChecked(_s.value("intro_overlay_enabled", False, type=bool))
     mode = _s.value("intro_overlay_mode", "Random", type=str) or "Random"
@@ -344,7 +178,7 @@ def _options_group(page: QWidget) -> QGroupBox:
     v.addWidget(cb1); v.addWidget(cb2);
     cb2.setEnabled(cb1.isChecked())
     cb1.toggled.connect(cb2.setEnabled)
-    # --- Startup toggles ----------------------------------------------------
+
     cb_clear_pyc = QCheckBox(r"Clear app Python cache files in /__pycache__ at (re)start")
     cb_clear_pyc.setChecked(s.value("clear_pyc_on_start", False, type=bool))
     cb_clear_pyc.toggled.connect(lambda b: s.setValue("clear_pyc_on_start", bool(b)))
@@ -356,7 +190,6 @@ def _options_group(page: QWidget) -> QGroupBox:
     v.addWidget(cb_clear_pyc)
     v.addWidget(cb_keep_settings)
 
-    # Temperature units (C/F)
     row = QtWidgets.QWidget(g)
     h2 = QtWidgets.QHBoxLayout(row); h2.setContentsMargins(0,4,0,0); h2.setSpacing(8)
     h2.addWidget(QtWidgets.QLabel("Temperature units:"))
@@ -385,30 +218,22 @@ def _buttons_row(page: QWidget) -> QWidget:
     row = QWidget(page)
     h = QHBoxLayout(row); h.setContentsMargins(0,0,0,0); h.setSpacing(8)
 
-    # Clear cache
     btn_cache = QPushButton("Clear program cache…")
     def do_cache():
-        # Prefer the app dialog if present so users can fine-tune;
-        # but pre-check "temp" and "__pycache__" options by default.
         try:
             from helpers.settings_boost import _make_cache_dialog
-            
             dlg = _make_cache_dialog(page)
-            # --- Runtime UI tweaks without touching settings_boost.py ---
             try:
-                # Hide HuggingFace cache option entirely
                 for cb in dlg.findChildren(QtWidgets.QCheckBox):
                     t = (cb.text() or "").lower()
                     if "huggingface" in t or "hugging face" in t:
                         cb.setChecked(False)
                         cb.setVisible(False)
-                    # Update thumbnails label and keep the checkbox available
                     if "thumbnails" in t:
                         try:
                             cb.setText("Thumbnails (last results) — remove items older than 7 days")
                         except Exception:
                             pass
-                # Update the tip label
                 for lab in dlg.findChildren(QtWidgets.QLabel):
                     txt = (lab.text() or "").strip().lower()
                     if txt.startswith("tip:"):
@@ -419,9 +244,7 @@ def _buttons_row(page: QWidget) -> QWidget:
                         break
             except Exception:
                 pass
-
             try:
-                # Heuristically find relevant checkboxes by text and enable them.
                 for cb in dlg.findChildren(QtWidgets.QCheckBox):
                     txt = (cb.text() or "").lower()
                     if "temp" in txt or "temporary" in txt:
@@ -430,7 +253,6 @@ def _buttons_row(page: QWidget) -> QWidget:
                         cb.setChecked(True)
             except Exception:
                 pass
-            # Run dialog; if accepted, do our extra folders cleanup as well.
             res = dlg.exec()
             if res == QtWidgets.QDialog.Accepted:
                 _extra_temp_cleanup()
@@ -438,10 +260,8 @@ def _buttons_row(page: QWidget) -> QWidget:
         except Exception:
             pass
 
-        # Fallback: do a safe default cleanup with our own routine.
         try:
             from helpers.cleanup_cache import run_cleanup
-            # Ensure temp + pycache are ON by default
             run_cleanup(
                 project_root=_project_root(),
                 clean_pyc=True,
@@ -453,21 +273,16 @@ def _buttons_row(page: QWidget) -> QWidget:
             )
         except Exception:
             pass
-        # Our additional folders, regardless of run_cleanup outcome
         _extra_temp_cleanup()
-
     btn_cache.clicked.connect(do_cache)
 
-    # Restart
     btn_restart = QPushButton("Restart App")
     def do_restart():
         try:
             ss = config.setdefault('session_restore', {})
-            # Remember that restart was triggered from Settings; restore last non-settings tab
             ss['restart_from_settings'] = True
             try: save_config()
             except Exception: pass
-            import sys
             app = QtWidgets.QApplication.instance()
             QtCore.QProcess.startDetached(sys.executable, sys.argv)
             app.quit()
@@ -475,7 +290,6 @@ def _buttons_row(page: QWidget) -> QWidget:
             pass
     btn_restart.clicked.connect(do_restart)
 
-    # Dump QSettings
     btn_dump = QPushButton("Dump QSettings now")
     def do_dump():
         try:
@@ -517,9 +331,8 @@ def _logo_group(page: QWidget) -> QWidget:
 
     lab.resizeEvent = lambda _e: refresh()
     QTimer.singleShot(0, refresh)
-    tm = QTimer(g); tm.setInterval(3500); tm.timeout.connect(refresh); tm.start()  # slideshow in settings preview
+    tm = QTimer(g); tm.setInterval(3500); tm.timeout.connect(refresh); tm.start()
 
-    # --- Overlay preview on the Settings logo block ---
     try:
         from helpers.overlay_animations import apply_intro_overlay_from_settings, stop_overlay
     except Exception:
@@ -580,7 +393,6 @@ def _logo_group(page: QWidget) -> QWidget:
         except Exception:
             pass
 
-    # Start a lightweight poll timer
     try:
         _prev_tm = QTimer(g); _prev_tm.setInterval(2000); _prev_tm.timeout.connect(_sync_overlay_preview); _prev_tm.start()
     except Exception:
@@ -591,25 +403,27 @@ def _logo_group(page: QWidget) -> QWidget:
 # ---- public installer --------------------------------------------------------------------
 def install_settings_tab(main_window: QWidget) -> None:
     try:
-        # Locate Settings container
         page = _locate_settings_container(main_window)
         if not page:
             return
 
-        # Apply light QSS so titles don't overlap buttons
+        # Mark the settings page so settings_more can locate it reliably
+        try:
+            page.setObjectName("FvSettingsContent")
+        except Exception:
+            pass
+
         page.setStyleSheet(
             "QGroupBox { margin-top: 10px; padding-top: 16px; }"
             "QGroupBox::title { subcontrol-origin: margin; left: 10px; padding: 0 6px; }"
         )
 
         lay = _ensure_vbox(page)
-        _wipe_layout(lay)  # authoritative rebuild, but only for this tab
+        _wipe_layout(lay)
 
-        # Desired order
         lay.addWidget(_theme_row(page))
         lay.addWidget(_options_group(page))
         lay.addWidget(_buttons_row(page))
-        # Separator to keep the logo block from crowding previous controls
         try:
             from PySide6.QtWidgets import QFrame
             hr = QFrame(page); hr.setFrameShape(QFrame.HLine); hr.setFrameShadow(QFrame.Sunken)
@@ -619,192 +433,14 @@ def install_settings_tab(main_window: QWidget) -> None:
         lay.addWidget(_logo_group(page))
         lay.addStretch(1)
 
+        # Minimal wiring: delegate Easter Eggs UI injection + tracker to settings_more
+        try:
+            from helpers import settings_more as _sm
+            # ensure tracker & inject the bottom row after build
+            QtCore.QTimer.singleShot(100, _sm.ensure_usage_tracker)
+            QtCore.QTimer.singleShot(200, _sm.install_social_bottom_runtime)
+        except Exception:
+            pass
+
     except Exception:
         pass
-
-
-# === Social + Easter Eggs buttons at the very bottom of Settings ===
-
-def _make_tetris_icon(size: int = 16) -> QtGui.QIcon:
-    """Create a simple Tetris-block icon pixmap."""
-    pm = QtGui.QPixmap(size, size)
-    pm.fill(Qt.transparent)
-    p = QtGui.QPainter(pm)
-    try:
-        # draw a 2x2 block
-        s = size // 2 - 1
-        colors = [QtGui.QColor('#4CC9F0'), QtGui.QColor('#4361EE'),
-                  QtGui.QColor('#F72585'), QtGui.QColor('#4CAF50')]
-        idx = 0
-        for r in range(2):
-            for c in range(2):
-                p.fillRect(c*s + c+1, r*s + r+1, s, s, colors[idx % len(colors)])
-                idx += 1
-                # small grid line
-                pen = QtGui.QPen(QtGui.QColor(20,20,20)); pen.setWidth(1); p.setPen(pen)
-                p.drawRect(c*s + c+1, r*s + r+1, s, s)
-    finally:
-        p.end()
-    return QtGui.QIcon(pm)
-
-def _make_pong_icon(size: int = 16) -> QtGui.QIcon:
-    """Create a minimal Pong icon (two paddles + ball)."""
-    pm = QtGui.QPixmap(size, size)
-    pm.fill(Qt.transparent)
-    p = QtGui.QPainter(pm)
-    try:
-        pen = QtGui.QPen(QtGui.QColor('#ffffff')); pen.setWidth(2); p.setPen(pen)
-        # paddles
-        p.drawLine(3, 4, 3, size-4)
-        p.drawLine(size-3, 4, size-3, size-8)
-        # ball
-        brush = QtGui.QBrush(QtGui.QColor('#ffffff')); p.setBrush(brush)
-        p.drawEllipse(QtCore.QPoint(size//2, size//2), 2, 2)
-    finally:
-        p.end()
-    return QtGui.QIcon(pm)
-
-
-def _populate_easter_menu(menu: QtWidgets.QMenu, parent: QtWidgets.QWidget) -> None:
-    """Rebuild the Easter Eggs menu in-place so newly-unlocked items appear immediately."""
-    try:
-        menu.clear()
-        # Header
-        header = QtWidgets.QWidget(menu)
-        v = QtWidgets.QVBoxLayout(header); v.setContentsMargins(10,6,10,6); v.setSpacing(2)
-        title = QtWidgets.QLabel("Easter Eggs & Fun stuff", header); title.setStyleSheet("font-weight:600;")
-        sub = QtWidgets.QLabel("Use the app to unlock more", header); sub.setStyleSheet("opacity:0.7; font-size:11px;")
-        v.addWidget(title); v.addWidget(sub)
-        wa = QtWidgets.QWidgetAction(menu); wa.setDefaultWidget(header); menu.addAction(wa)
-        menu.addSeparator()
-        any_added = False
-        for egg in EASTER_EGGS:
-            if not _egg_unlocked(egg["id"]):
-                continue
-            any_added = True
-            act = QtGui.QAction(egg["icon_fn"](), egg["label"], menu)
-            act.triggered.connect(lambda _=False, p=egg["script"]: _spawn_helper_script(p))
-            menu.addAction(act)
-        if not any_added:
-            stub = QtGui.QAction("Keep using FrameVision to unlock secrets…", menu)
-            stub.setEnabled(False)
-            menu.addAction(stub)
-    except Exception:
-        pass
-
-def _spawn_helper_script(rel_path: str) -> None:
-    """Launch a helper .py file in a detached process."""
-    try:
-        root = _project_root()
-        abs_path = os.path.join(root, rel_path.replace("\\\\", os.sep).replace("/", os.sep))
-        if not os.path.isfile(abs_path):
-            return
-        app = QtWidgets.QApplication.instance()
-        py = sys.executable or "python"
-        QtCore.QProcess.startDetached(py, [abs_path])
-    except Exception:
-        pass
-
-def _build_easter_menu(parent: QtWidgets.QWidget) -> QtWidgets.QMenu:
-    """Menu only shows unlocked eggs; locked ones are *hidden*."""
-    menu = QtWidgets.QMenu(parent)
-    menu.setObjectName("FvEasterEggsMenu")
-    # Header
-    header = QtWidgets.QWidget(menu)
-    v = QtWidgets.QVBoxLayout(header); v.setContentsMargins(10,6,10,6); v.setSpacing(2)
-    title = QtWidgets.QLabel("Easter Eggs & Fun stuff", header); title.setStyleSheet("font-weight:600;")
-    sub = QtWidgets.QLabel("Use the app to unlock more", header); sub.setStyleSheet("opacity:0.7; font-size:11px;")
-    v.addWidget(title); v.addWidget(sub)
-    wa = QtWidgets.QWidgetAction(menu); wa.setDefaultWidget(header); menu.addAction(wa)
-    # Separator
-    menu.addSeparator()
-
-    # Build actions for *unlocked* eggs only
-    any_added = False
-    for egg in EASTER_EGGS:
-        if not _egg_unlocked(egg["id"]):
-            continue
-        any_added = True
-        act = QtGui.QAction(egg["icon_fn"](), egg["label"], menu)
-        act.triggered.connect(lambda _=False, p=egg["script"]: _spawn_helper_script(p))
-        menu.addAction(act)
-
-    if not any_added:
-        # Friendly stub item so the menu isn't empty
-        stub = QtGui.QAction("Keep using FrameVision to unlock secrets…", menu)
-        stub.setEnabled(False)
-        menu.addAction(stub)
-
-    return menu
-
-def _install_social_bottom_runtime():
-    try:
-        from PySide6 import QtCore, QtWidgets, QtGui
-        app = QtWidgets.QApplication.instance()
-        if not app:
-            return
-        root = None
-        for w in app.allWidgets():
-            try:
-                if (w.objectName() or "") == "FvSettingsContent":
-                    root = w; break
-            except Exception:
-                pass
-        if not root or getattr(root, "_fv_social_bottom_installed", False):
-            return
-        v = root.layout()
-        if not isinstance(v, QtWidgets.QVBoxLayout):
-            return
-        # Add a thin separator
-        sep = QtWidgets.QFrame(root)
-        sep.setFrameShape(QtWidgets.QFrame.HLine)
-        sep.setFrameShadow(QtWidgets.QFrame.Sunken)
-        sep.setObjectName("FvSocialSeparator")
-        v.addWidget(sep)
-        # Row with buttons aligned right
-        row = QtWidgets.QWidget(root)
-        h = QtWidgets.QHBoxLayout(row); h.setContentsMargins(0,6,0,0); h.setSpacing(8)
-        h.addStretch(1)
-        # --- New Easter Eggs button with menu (appears before GitHub) ---
-        btn_ee = QtWidgets.QPushButton("Easter Eggs", row)
-        btn_ee.setMinimumWidth(120); btn_ee.setMinimumHeight(24)
-        menu = QtWidgets.QMenu(btn_ee)
-        _populate_easter_menu(menu, btn_ee)
-        menu.aboutToShow.connect(lambda: _populate_easter_menu(menu, btn_ee))
-        btn_ee.setMenu(menu)
-        # Rebuild menu each time it opens so newly-unlocked eggs appear immediately
-        def _rebuild_menu(_):
-            menu = QtWidgets.QMenu(btn_ee)
-        _populate_easter_menu(menu, btn_ee)
-        menu.aboutToShow.connect(lambda: _populate_easter_menu(menu, btn_ee))
-        btn_ee.setMenu(menu)
-        btn_ee.aboutToShowMenu = _rebuild_menu  # PySide6: attach custom attribute for clarity
-        btn_ee.clicked.connect(lambda: _rebuild_menu(None))
-
-        # Social buttons
-        btn_gh = QtWidgets.QPushButton("GitHub", row)
-        btn_gh.hide()
-        btn_gh.setMinimumWidth(120); btn_gh.setMinimumHeight(24)
-        btn_yt = QtWidgets.QPushButton("YouTube", row)
-        btn_yt.hide()
-        btn_yt.setMinimumWidth(120); btn_yt.setMinimumHeight(24)
-        def open_url(url: str):
-            try:
-                QtGui.QDesktopServices.openUrl(QtCore.QUrl(url))
-            except Exception:
-                pass
-        btn_gh.clicked.connect(lambda: open_url("https://github.com/"))
-        btn_yt.clicked.connect(lambda: open_url("https://www.youtube.com/"))
-        # Order: Easter Eggs, GitHub, YouTube
-        h.addWidget(btn_ee); h.addWidget(btn_gh); h.addWidget(btn_yt)
-        v.addWidget(row)
-        root._fv_social_bottom_installed = True
-    except Exception:
-        pass
-
-# schedule attempt after page builds
-try:
-    from PySide6.QtCore import QTimer
-    QTimer.singleShot(800, _install_social_bottom_runtime)
-except Exception:
-    pass

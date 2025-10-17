@@ -203,6 +203,12 @@ def install_audio_tool(pane, sec_audio):
     # Files
     audio_list = QListWidget()
     audio_list.setSelectionMode(QAbstractItemView.SingleSelection)
+    # Ensure at least ~4 visible rows by default
+    try:
+        _row_h = max(22, audio_list.fontMetrics().height() + 8)
+        audio_list.setMinimumHeight(_row_h * 4 + 12)
+    except Exception:
+        pass
     btn_add = QToolButton(); btn_add.setText("Add…")
     btn_remove = QToolButton(); btn_remove.setText("Remove")
     btn_up = QToolButton(); btn_up.setText("↑")
@@ -248,6 +254,11 @@ def install_audio_tool(pane, sec_audio):
 
     grp_wave = QGroupBox("Waveform preview")
     lw = QVBoxLayout(grp_wave); lw.addWidget(waveform)
+    # Keep waveform from eating too much vertical space
+    try:
+        grp_wave.setMaximumHeight(220)
+    except Exception:
+        pass
 
     grp_mode = QGroupBox("Mode")
     lm = QVBoxLayout(grp_mode); lm.addWidget(rb_mix); lm.addWidget(cb_include_original); lm.addWidget(rb_replace)
@@ -275,6 +286,12 @@ def install_audio_tool(pane, sec_audio):
 
 
     left = QVBoxLayout(); left.addWidget(grp_files); left.addWidget(grp_wave)
+    # Make files area ~3x the height of waveform (when space allows)
+    try:
+        left.setStretch(0, 3)
+        left.setStretch(1, 1)
+    except Exception:
+        pass
     right = QVBoxLayout(); right.addWidget(grp_mode); right.addLayout(form); right.addWidget(ffgrp); right.addStretch(1); right.addWidget(btn_audio)
 
     root = QHBoxLayout()
