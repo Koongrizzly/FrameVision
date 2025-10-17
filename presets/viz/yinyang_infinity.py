@@ -1,17 +1,14 @@
 
-# Note Lines — Bold: fewer but MUCH larger notes (+50%) moving left→right on staff lines.
-# Symbols: ♫ ♪ ♩ ♬ ♭ ♮ ♯
-import random
+# Shared utilities and audio driver (style-matched to your working examples)
+import math, random
 from PySide6.QtGui import QPainter, QPen, QColor, QBrush, QFont
 from PySide6.QtCore import QPointF
 from helpers.music import register_visualizer, BaseVisualizer
 
-NOTES = list("♫♪♩♬♭♮♯")
-
-def HSV(h,s=230,v=255,a=220):
+def HSV(h,s=230,v=255,a=230):
     return QColor.fromHsv(int(h)%360, int(max(0,min(255,s))), int(max(0,min(255,v))), int(max(0,min(255,a))))
 
-# ===== Beat driver (as per your working examples) =====
+# Beat driver (EMA + onset) — same shape as your examples
 _prev=[]; _env=_gate=_punch=0.0; _pt=None
 _f_short=_f_long=0.0
 def _midhi(bands):
@@ -51,8 +48,7 @@ def drive(bands, rms, t):
     mix=0.70*lo+0.30*f
     _f_short=0.65*_f_short+0.35*mix
     _f_long =0.95*_f_long +0.05*mix
-    onset=max(0.0,_f_short-_f_long)
-    norm=_f_long+1e-4
+    onset=max(0.0,_f_short-_f_long); norm=_f_long+1e-4
     onset_n=min(1.0, onset/(0.30*norm))
     if _pt is None: _pt=t
     dt=max(0.0, min(0.05, t-_pt)); _pt=t
@@ -65,67 +61,68 @@ def font_px(px):
     f.setPixelSize(int(max(12, px)))
     return f
 
-# ===== Module-level state =====
-_ACTORS=[]; _EMIT=0.0; _LAST_T=None; _LAST_PUNCH=0.0; _LINES=[]
+# ===== Visual 2: YinYang Infinity (only ☯) =====
+ICON = "☯"
+
+# Module state
+_Y_ACTORS=[]; _Y_EMIT=0.0; _Y_LAST_T=None
+
+def lemniscate(cx, cy, a, tpar):
+    # Gerono lemniscate: x = a*sin(s), y = a*sin(s)*cos(s)
+    s = tpar
+    x = cx + a * math.sin(s)
+    y = cy + a * math.sin(s) * math.cos(s)
+    return x, y
 
 @register_visualizer
-class NoteLinesBold(BaseVisualizer):
-    display_name = "Note Lines — Bold"
+class YinYangInfinity(BaseVisualizer):
+    display_name = "YinYang Infinity"
 
     def paint(self, p:QPainter, r, bands, rms, t):
-        global _ACTORS, _EMIT, _LAST_T, _LAST_PUNCH, _LINES
-        w,h = int(r.width()), int(r.height())
+        global _Y_ACTORS, _Y_EMIT, _Y_LAST_T
+        w,h=int(r.width()), int(r.height())
         if w<=0 or h<=0: return
 
-        if _LAST_T is None: _LAST_T = t
-        dt = max(0.0, min(0.05, t-_LAST_T)); _LAST_T = t
+        if _Y_LAST_T is None: _Y_LAST_T=t
+        dt=max(0.0, min(0.05, t-_Y_LAST_T)); _Y_LAST_T=t
 
-        p.fillRect(r, QBrush(QColor(7,7,11)))
+        p.fillRect(r, QBrush(QColor(6,6,10)))
 
         n = max(24, len(bands) if bands else 32)
         env, gate, boom, punch = drive(bands or [0.0]*n, rms or 0.0, t)
 
-        if not _LINES or len(_LINES)!=5:
-            top = h*0.28; bottom = h*0.72
-            spacing = (bottom-top)/4.0
-            _LINES = [top + i*spacing for i in range(5)]
+        cx, cy = r.center().x(), r.center().y()
+        a = min(w,h)*0.32*(1.0 + 0.15*env)
 
-        p.setCompositionMode(QPainter.CompositionMode_SourceOver)
-        for i,y in enumerate(_LINES):
-            p.setPen(QPen(HSV(200+i*10, s=120, v=130, a=160), 3))
-            p.drawLine(0, int(y), w, int(y))
-
-        # Fewer spawns; sizes increased by +50%
-        base_rate = 0.9 + 2.2*env + 0.9*boom
-        _EMIT += base_rate * dt
-        spawn = int(_EMIT)
-        if spawn>6: spawn=6
-        _EMIT -= spawn
-        if punch>0.55 and _LAST_PUNCH<=0.55:
-            spawn += 3
+        # steady beads + onset bursts
+        base_rate = 2.0 + 4.0*env + 1.5*boom
+        _Y_EMIT += base_rate*dt
+        spawn = int(_Y_EMIT); 
+        if spawn>12: spawn=12
+        _Y_EMIT -= spawn
+        if punch>0.55: spawn += 6
 
         for _ in range(spawn):
-            y = random.choice(_LINES)
-            speed = (0.18 + 0.45*random.random())*(0.75+0.7*env)*w
-            base_size = (min(w,h)*0.065 + 14*random.random())
-            size = int(1.5 * base_size)  # +50% size
-            _ACTORS.append({
-                "x": -80.0, "y": y,
-                "speed": speed,
-                "size": size, "life": 1.0,
-                "h": random.uniform(0,360),
-                "ch": random.choice(NOTES),
+            s0 = random.uniform(0, 2*math.pi)
+            speed = (0.8 + 1.6*random.random())*(0.6+0.8*env)  # rad/sec
+            size = int(min(w,h)*0.075 + 10*random.random())
+            _Y_ACTORS.append({
+                "s": s0, "speed": speed, "life": 1.0,
+                "size": size, "h": random.uniform(0,360)
             })
 
+        p.setCompositionMode(QPainter.CompositionMode_SourceOver)
         alive=[]
-        for it in _ACTORS:
-            it["x"] += it["speed"]*dt
+        for it in _Y_ACTORS:
+            it["s"] += it["speed"]*dt
             it["life"] *= (0.994 - 0.06*dt)
-            it["h"] += 40*dt
-            if -120 < it["x"] < w+120 and it["life"]>0.12:
+            it["h"] += 60*dt
+            x,y = lemniscate(cx, cy, a, it["s"])
+            if -120<x<w+120 and -120<y<h+120 and it["life"]>0.12:
                 alive.append(it)
                 p.setFont(font_px(it["size"]))
-                p.setPen(QPen(HSV(it["h"], a=int(220*it["life"])), 2))
-                p.drawText(int(it["x"]), int(it["y"]+3), it["ch"])
-        _ACTORS = alive
-        _LAST_PUNCH = punch
+                # Yin-yang vibe: oscillate between near-white and near-black hues
+                col = HSV(it["h"], s=40 + int(100*abs(math.sin(it["s"]))), v=240, a=int(220*it["life"]))
+                p.setPen(QPen(col, 2))
+                p.drawText(int(x), int(y), ICON)
+        _Y_ACTORS = alive

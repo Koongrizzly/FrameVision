@@ -87,7 +87,7 @@ class StageEQCurtain(BaseVisualizer):
         vals = _sample_bands(bands, bins)
         if len(_eq)!=bins: _eq=[0.0]*bins
         for i,v in enumerate(vals):
-            targ = 2.5*v + 1.0*fx
+            targ = 1.8*v + 1.0*fx
             _eq[i] = _env_step(_eq[i], targ, up=0.35, down=0.12)
 
         left = int(w*0.12); right=int(w*0.88)
