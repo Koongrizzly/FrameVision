@@ -1,6 +1,6 @@
 
 from __future__ import annotations
-from typing import Optional, List, Dict
+from typing import Optional, List, Dict, Union
 from PySide6 import QtCore, QtGui, QtWidgets
 from PySide6.QtCore import Qt, QSettings, QUrl
 
@@ -256,6 +256,59 @@ def _make_breakout_icon(size: int = 18) -> QtGui.QIcon:
     return QtGui.QIcon(pm)
 
 
+def _make_racecar_icon(size: int = 18) -> QtGui.QIcon:
+    """Small racecar icon for 'FrameRacing'."""
+    pm = QtGui.QPixmap(size, size); pm.fill(Qt.transparent)
+    p = QtGui.QPainter(pm)
+    try:
+        p.setRenderHint(QtGui.QPainter.Antialiasing, True)
+        # body
+        p.setBrush(QtGui.QBrush(QtGui.QColor('#D32F2F'))); p.setPen(Qt.NoPen)
+        body_rect = QtCore.QRect(3, size//3, size-6, size//3)
+        p.drawRoundedRect(body_rect, 3, 3)
+        # cockpit
+        p.setBrush(QtGui.QBrush(QtGui.QColor('#90CAF9')))
+        p.drawRoundedRect(QtCore.QRect(size//3, size//3 - 2, size//3, size//3 - 2), 2, 2)
+        # spoiler
+        p.setBrush(QtGui.QBrush(QtGui.QColor('#B71C1C')))
+        p.drawRect(2, size//3 - 1, 3, size//3 + 2)
+        # wheels
+        p.setBrush(QtGui.QBrush(QtGui.QColor('#212121')))
+        wheel_r = max(2, size//8)
+        p.drawEllipse(QtCore.QPoint(5, size - 3), wheel_r, wheel_r)
+        p.drawEllipse(QtCore.QPoint(size - 5, size - 3), wheel_r, wheel_r)
+        # stripe
+        p.setBrush(QtGui.QBrush(QtGui.QColor('#FFFFFF')))
+        p.drawRect(size//2 - 1, size//3 + 1, 2, size//3 - 2)
+    finally:
+        p.end()
+    return QtGui.QIcon(pm)
+
+
+def _make_donkey_kong_icon(size: int = 18) -> QtGui.QIcon:
+    """Tiny Donkey Kong-inspired icon: brown ape + barrel silhouette."""
+    pm = QtGui.QPixmap(size, size); pm.fill(Qt.transparent)
+    p = QtGui.QPainter(pm)
+    try:
+        p.setRenderHint(QtGui.QPainter.Antialiasing, True)
+        # ape body
+        p.setBrush(QtGui.QBrush(QtGui.QColor('#6D4C41'))); p.setPen(Qt.NoPen)
+        p.drawEllipse(QtCore.QRect(size//6, size//4, size//3, size//3))   # head
+        p.drawRoundedRect(QtCore.QRect(size//6, size//2, size//2, size//3), 3, 3)  # torso
+        # arm
+        p.drawRoundedRect(QtCore.QRect(size//2, size//2, size//3, size//6), 2, 2)
+        # barrel
+        p.setBrush(QtGui.QBrush(QtGui.QColor('#8D6E63')))
+        barrel = QtCore.QRect(size//2 + 1, size//2 + 1, size//3, size//4)
+        p.drawRoundedRect(barrel, 2, 2)
+        pen = QtGui.QPen(QtGui.QColor('#4E342E')); pen.setWidth(1); p.setPen(pen)
+        p.drawLine(barrel.left()+2, barrel.top()+3, barrel.right()-2, barrel.top()+3)
+        p.drawLine(barrel.left()+2, barrel.center().y(), barrel.right()-2, barrel.center().y())
+    finally:
+        p.end()
+    return QtGui.QIcon(pm)
+
+
 # ---------------------------- Dad jokes logic ---------------------------------------------
 _DAD_FILE_REL = os.path.join("assets", "dad_jokes.txt")
 _DAD_BAG_KEY = "dad_jokes_bag"
@@ -410,13 +463,35 @@ EASTER_EGGS: List[Dict] = [
         "unlock_seconds": 60 * 5,  # 5 minutes
         "message": "great, first easter egg unlocked, check settings tab !",
     },
-    # NEW: FrameBreaker
     {
         "id": "framebreaker",
         "label": "FrameBreaker",
         "icon_fn": lambda: _make_breakout_icon(18),
         "script": r"helpers\\framebreaker.py",
         "unlock_seconds": 60 * 60 * 4,  # 4 hours
+        "message": "Great, another easter egg unlocked, check Settings tab !",
+    },
+    {
+        "id": "frameracing",
+        "label": "FrameRacing",
+        "icon_fn": lambda: _make_racecar_icon(18),
+        "script": r"helpers\\frameracers.py",
+        "unlock_seconds": 60 * 60 * 24,  # 24 hours
+        "message": "Great, another easter egg unlocked, check Settings tab !",
+    },
+    # NEW: Donkey Kong Classic (36h)
+    {
+        "id": "dk_classic",
+        "label": "Donkey Kong Classic",
+        "icon_fn": lambda: _make_donkey_kong_icon(18),
+        "scripts": [
+            r"helpers\\DonkeyKongClassic.py",
+            r"helpers\\donkey_kong_classic.py",
+            r"helpers\\donkey_kong.py",
+            r"helpers\\donkeykong.py",
+            r"helpers\\dk_classic.py",
+        ],
+        "unlock_seconds": 60 * 60 * 36,  # 36 hours
         "message": "Great, another easter egg unlocked, check Settings tab !",
     },
 ]
@@ -450,21 +525,33 @@ def _project_root_for_open() -> str:
 def _open_file_default_app(abs_path: str) -> None:
     try:
         if not os.path.isfile(abs_path):
-            QtWidgets.QMessageBox.warning(None, "Open file", f"File not found:\n{abs_path}")
+            QtWidgets.QMessageBox.warning(None, "Open file", f"File not found:\\n{abs_path}")
             return
         QtGui.QDesktopServices.openUrl(QUrl.fromLocalFile(abs_path))
     except Exception:
         pass
 
-def _spawn_helper_script(rel_path: str) -> None:
+def _spawn_helper_script(rel_path: Union[str, List[str]]) -> None:
+    """
+    Launch a helper .py file in a detached process.
+    Accepts a single relative path or a list of candidate relative paths; uses the first that exists.
+    """
     try:
         root = _project_root()
-        abs_path = os.path.join(root, rel_path.replace("\\\\", os.sep).replace("/", os.sep))
-        if not os.path.isfile(abs_path):
-            return
-        app = QtWidgets.QApplication.instance()
-        py = sys.executable or "python"
-        QtCore.QProcess.startDetached(py, [abs_path])
+        paths: List[str] = []
+        if isinstance(rel_path, (list, tuple)):
+            paths = list(rel_path)
+        else:
+            paths = [rel_path]
+        for pth in paths:
+            abs_path = os.path.join(root, pth.replace("\\\\", os.sep).replace("/", os.sep))
+            if os.path.isfile(abs_path):
+                py = sys.executable or "python"
+                QtCore.QProcess.startDetached(py, [abs_path])
+                return
+        # none found
+        QtWidgets.QMessageBox.information(None, "Easter egg not found",
+                                          "Could not locate the game script in /helpers/.")
     except Exception:
         pass
 
@@ -549,8 +636,9 @@ def _populate_easter_menu(menu: QtWidgets.QMenu, parent: QtWidgets.QWidget) -> N
             cb = egg.get("callback")
             if callable(cb):
                 act.triggered.connect(lambda _=False, _cb=cb: _cb(parent))
-            elif egg.get("script"):
-                act.triggered.connect(lambda _=False, p=egg["script"]: _spawn_helper_script(p))
+            elif egg.get("script") or egg.get("scripts"):
+                target = egg.get("scripts") or egg.get("script")
+                act.triggered.connect(lambda _=False, t=target: _spawn_helper_script(t))
             else:
                 act.setEnabled(False)
             menu.addAction(act)

@@ -1,19 +1,18 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-FrameRacing — a retro 4-lane avoidance racer using Pygame.
-Path: root/helpers/frameracing.py
-High scores: root/setsave/presets/racescore.json
-Backgrounds: root/presets/startup/ (scaled to fill; drawn at 15% opacity)
+FrameRacing — retro 4-lane racer (Pygame)
 
-Panels: Info panel on the left; High scores + buttons (Start / Pause / Exit) on the right.
+Paths
+- Game: root/helpers/frameracing.py
+- High scores: root/setsave/presets/racescore.json
+- Backgrounds: root/presets/startup/  (15% opacity overlay, changes on level-up)
+- Car sprites: root/assets/cars/  (player.png, enemy_*.png, special_*.png)
 
-LATEST CHANGES
-- Window is RESIZABLE; you can maximize and the playfield adapts.
-- Background draw order fixed: it now shows across the road area (15% overlay), not only the side panels.
-- Background rescales on resize; lanes and player position adapt to the new size.
-- Scoring and special enemy behavior retained (+20 normal, +50 special; special is faster and color-cycles).
-- Cars >50% off the bottom can no longer cause Game Over.
+Notes
+- Normal pass: +20 points; Special pass: +50 points
+- Special cars are faster and can be animated (multiple special_*.png frames)
+- Cars >50% off-screen at bottom become harmless
 """
 
 import os
@@ -23,20 +22,30 @@ import random
 import time
 from pathlib import Path
 from datetime import datetime
+import warnings
+warnings.filterwarnings("ignore", message=r"pkg_resources is deprecated as an API.*", category=UserWarning)
 
 import pygame
 
-# --------------- Paths -----------------
+# ------------------------------------------------------------------
+# Paths
+# ------------------------------------------------------------------
 THIS_FILE = Path(__file__).resolve()
 ROOT_DIR = THIS_FILE.parents[1]
 HELPERS_DIR = ROOT_DIR / "helpers"
 SCORES_PATH = ROOT_DIR / "setsave" / "presets" / "racescore.json"
 BG_DIR = ROOT_DIR / "presets" / "startup"
+ASSETS_DIR = ROOT_DIR / "assets" / "cars"
 
-# --------------- Config -----------------
-START_MAXIMIZED = True
+# ------------------------------------------------------------------
+# Config
+# ------------------------------------------------------------------
+START_MAXIMIZED = True   # windowed near-max (not fullscreen)
+os.environ.setdefault("SDL_VIDEO_CENTERED", "1")
+
 WIDTH, HEIGHT = 980, 900
 FPS = 60
+PLAYER_VERT_SPEED = 420.0  # pixels/sec when holding ↑/↓
 LANES = 4
 
 # Panels and road
@@ -44,17 +53,8 @@ PANEL_LEFT_W = 200
 PANEL_RIGHT_W = 260
 ROAD_MARGIN = 36
 
-ROAD_COLOR = (22, 22, 26)     # base road color
+ROAD_COLOR = (22, 22, 26)
 LANE_COLOR = (64, 64, 72)
-
-PLAYER_COLOR = (255, 235, 59)  # yellow-ish
-ENEMY_COLOR = (255, 85, 85)    # red-ish (normal cars)
-PU_COLORS = {
-    "FAST": (102, 187, 106),   # green
-    "SLOW": (66, 165, 245),    # blue
-    "SHIELD": (171, 71, 188),  # purple
-    "SHOOT": (255, 202, 40),   # amber
-}
 
 PLAYER_W, PLAYER_H = 56, 98
 ENEMY_W, ENEMY_H = 56, 98
@@ -63,8 +63,8 @@ PU_SIZE = 44
 # Level & spawn
 START_REQUIRED = 8
 REQUIRED_INC = 6
-BASE_ENEMY_SPEED = 160.0        # pixels per second
-LEVEL_SPEED_INC = 18.0          # px/s added per level
+BASE_ENEMY_SPEED = 160.0        # pixels/sec
+LEVEL_SPEED_INC = 18.0          # px/s per level
 SPAWN_MS_START = 900
 SPAWN_MS_MIN = 380
 SPAWN_DEC_PER_LEVEL = 60
@@ -84,21 +84,17 @@ NORMAL_PASS_POINTS = 20
 SPECIAL_PASS_POINTS = 50
 SPECIAL_ENEMY_CHANCE = 0.18
 SPECIAL_SPEED_FACTOR = 1.35
-SPECIAL_COLORS = [
-    (255, 99, 71),   # tomato
-    (255, 193, 7),   # amber
-    (76, 175, 80),   # green
-    (3, 169, 244),   # light blue
-    (156, 39, 176),  # purple
-    (255, 87, 34),   # deep orange
-]
 
-BG_ALPHA = int(255 * 0.15)  # 15%
+# Background
+BG_ALPHA = int(255 * 0.35)  # 55% opacity
 
+# ------------------------------------------------------------------
+# Init
+# ------------------------------------------------------------------
 pygame.init()
 pygame.display.set_caption("FrameRacing")
+
 def get_desktop_size():
-    # Prefer pygame 2's get_desktop_sizes (handles multi-monitor); fallback to display.Info()
     try:
         sizes = pygame.display.get_desktop_sizes()
         if sizes:
@@ -109,39 +105,44 @@ def get_desktop_size():
     return info.current_w, info.current_h
 
 if START_MAXIMIZED:
-    WIDTH, HEIGHT = get_desktop_size()
-if START_MAXIMIZED:
-    WIDTH, HEIGHT = get_desktop_size()
+    dw, dh = get_desktop_size()
+    WIDTH = max(800, dw - 80)
+    HEIGHT = max(600, dh - 120)
+
 screen = pygame.display.set_mode((WIDTH, HEIGHT), pygame.RESIZABLE)
 clock = pygame.time.Clock()
 
+# Fonts
 FONT = pygame.font.SysFont("consolas", 22)
 FONT_BIG = pygame.font.SysFont("consolas", 36, bold=True)
 FONT_HUGE = pygame.font.SysFont("consolas", 64, bold=True)
+PANEL_FONT = pygame.font.SysFont("consolas", 18)
+PANEL_TITLE_FONT = pygame.font.SysFont("consolas", 24, bold=True)
 
-# --------------- Utilities -----------------
+# ------------------------------------------------------------------
+# Utilities
+# ------------------------------------------------------------------
 def road_rect():
     return pygame.Rect(PANEL_LEFT_W, 0, WIDTH - PANEL_LEFT_W - PANEL_RIGHT_W, HEIGHT)
 
 def lanes_geometry():
-    """Return list of lane centers and lane rectangles inside the road rect."""
     rr = road_rect()
     road_w = rr.width - 2 * ROAD_MARGIN
-    lane_w = max(40, road_w / max(1, LANES))  # guard against tiny windows
+    lane_w = max(40, road_w / max(1, LANES))
     centers = [int(rr.left + ROAD_MARGIN + lane_w * (i + 0.5)) for i in range(LANES)]
     rects = [pygame.Rect(int(rr.left + ROAD_MARGIN + i * lane_w), 0, int(lane_w), HEIGHT) for i in range(LANES)]
     return centers, rects, int(lane_w)
 
-# global lane geometry, set at startup and updated on resize
 LANE_CENTERS, LANE_RECTS, LANE_W = lanes_geometry()
 
 def recalc_geometry(player=None):
-    """Recalculate lane geometry after resize and optionally re-center player in its lane."""
     global LANE_CENTERS, LANE_RECTS, LANE_W
     LANE_CENTERS, LANE_RECTS, LANE_W = lanes_geometry()
     if player is not None:
+        # Keep X centered to lane; preserve Y within road bounds.
         player.center_to_lane()
-        player.rect.midbottom = (LANE_CENTERS[player.lane], HEIGHT - 24)
+        rr = road_rect()
+        player.rect.y = clamp(player.rect.y, rr.top + 6, rr.bottom - player.rect.height - 6)
 
 def clamp(v, lo, hi):
     return lo if v < lo else hi if v > hi else v
@@ -174,11 +175,7 @@ def load_scores():
 
 def save_score(name, score):
     scores = load_scores()
-    scores.append({
-        "name": name[:16] or "PLAYER",
-        "score": int(score),
-        "date": datetime.now().isoformat(timespec="seconds"),
-    })
+    scores.append({"name": name[:16] or "PLAYER", "score": int(score), "date": datetime.now().isoformat(timespec="seconds")})
     scores.sort(key=lambda x: x["score"], reverse=True)
     scores = scores[:10]
     try:
@@ -188,6 +185,7 @@ def save_score(name, score):
         pass
     return scores
 
+# Background helpers
 def list_bg_images():
     if not BG_DIR.exists():
         return []
@@ -218,7 +216,38 @@ def random_bg_original(exclude=None):
     choice = random.choice(imgs)
     return load_bg_original(choice), choice
 
-# --------------- Entities -----------------
+# Asset helpers (cars)
+_image_cache = {}
+
+def _load_image(path, target_size):
+    try:
+        key = (str(path), target_size)
+        if key in _image_cache:
+            return _image_cache[key]
+        img = pygame.image.load(str(path)).convert_alpha()
+        scaled = pygame.transform.smoothscale(img, target_size)
+        _image_cache[key] = scaled
+        return scaled
+    except Exception:
+        return None
+
+def list_enemy_sprite_files():
+    if not ASSETS_DIR.exists():
+        return []
+    return sorted(ASSETS_DIR.glob("enemy_*.png"))
+
+def list_special_sprite_files():
+    if not ASSETS_DIR.exists():
+        return []
+    return sorted(ASSETS_DIR.glob("special_*.png"))
+
+def get_player_sprite(target_size):
+    path = ASSETS_DIR / "player.png"
+    return _load_image(path, target_size)
+
+# ------------------------------------------------------------------
+# Entities
+# ------------------------------------------------------------------
 class Player:
     def __init__(self):
         self.lane = 1
@@ -230,6 +259,8 @@ class Player:
         self.fast_until = 0.0
         self.slow_until = 0.0
         self.shoot_ready_at = 0.0
+        # sprite
+        self.sprite = get_player_sprite((PLAYER_W, PLAYER_H))
 
     def center_to_lane(self):
         self.rect.centerx = LANE_CENTERS[self.lane]
@@ -237,6 +268,13 @@ class Player:
     def move_lane(self, delta):
         self.lane = clamp(self.lane + delta, 0, LANES - 1)
         self.center_to_lane()
+
+    def move_vertical(self, dy):
+        rr = road_rect()
+        new_y = self.rect.y + int(dy)
+        min_y = rr.top + 6
+        max_y = rr.bottom - self.rect.height - 6
+        self.rect.y = clamp(new_y, min_y, max_y)
 
     def has_power(self, kind):
         now = time.time()
@@ -258,7 +296,7 @@ class Player:
             self.shield_until = now + dur
         elif kind == "SHOOT":
             self.shoot_until = now + dur
-            self.shoot_ready_at = now  # immediately available
+            self.shoot_ready_at = now
         elif kind == "FAST":
             self.fast_until = now + dur
         elif kind == "SLOW":
@@ -272,9 +310,10 @@ class Player:
         return False
 
     def draw(self, surf):
-        pygame.draw.rect(surf, PLAYER_COLOR, self.rect, border_radius=10)
-        wx = self.rect.centerx
-        pygame.draw.line(surf, (20, 20, 20), (wx - 14, self.rect.top + 22), (wx + 14, self.rect.top + 22), 3)
+        if self.sprite:
+            surf.blit(self.sprite, self.rect)
+        else:
+            pygame.draw.rect(surf, (255, 235, 59), self.rect, border_radius=10)
         if self.has_power("SHIELD"):
             pygame.draw.circle(surf, (120, 200, 255), self.rect.center, self.rect.width, 2)
 
@@ -286,20 +325,37 @@ class Enemy:
         self.rect = pygame.Rect(0, 0, ENEMY_W, ENEMY_H)
         self.rect.midtop = (LANE_CENTERS[lane], -ENEMY_H - 10)
         self.counted = False
+        # choose sprite
+        if special:
+            self.special_frames = [_load_image(p, (ENEMY_W, ENEMY_H)) for p in list_special_sprite_files()]
+            if not any(self.special_frames):
+                files = list_enemy_sprite_files()
+                self.special_frames = [_load_image(p, (ENEMY_W, ENEMY_H)) for p in files]
+            self.sprite = None
+        else:
+            files = list_enemy_sprite_files()
+            if files:
+                self.sprite = _load_image(random.choice(files), (ENEMY_W, ENEMY_H))
+            else:
+                self.sprite = None
 
     def update(self, dt, speed_scale=1.0):
         self.rect.y += int(self.speed * speed_scale * dt)
 
     def draw(self, surf):
         if self.special:
-            idx = int(time.time() * 6) % len(SPECIAL_COLORS)
-            color = SPECIAL_COLORS[idx]
-            pygame.draw.rect(surf, color, self.rect, border_radius=10)
-            pygame.draw.rect(surf, (255, 255, 255), self.rect, 2, border_radius=10)
-        else:
-            pygame.draw.rect(surf, ENEMY_COLOR, self.rect, border_radius=10)
-        gx = self.rect.centerx
-        pygame.draw.line(surf, (50, 10, 10), (gx - 14, self.rect.bottom - 18), (gx + 14, self.rect.bottom - 18), 3)
+            frames = getattr(self, "special_frames", [])
+            if frames:
+                idx = int(time.time() * 6) % len(frames)
+                frame = frames[idx]
+                if frame:
+                    surf.blit(frame, self.rect)
+                    return
+        if self.sprite:
+            surf.blit(self.sprite, self.rect)
+            return
+        # fallback shape
+        pygame.draw.rect(surf, (255, 85, 85) if not self.special else (255,50,50), self.rect, border_radius=10)
 
     def points(self):
         return SPECIAL_PASS_POINTS if self.special else NORMAL_PASS_POINTS
@@ -318,11 +374,19 @@ class PowerUp:
         self.rect.y += int(self.speed * dt)
 
     def draw(self, surf):
-        color = PU_COLORS.get(self.kind, (200, 200, 200))
+        colors = {
+            "FAST": (102, 187, 106),
+            "SLOW": (66, 165, 245),
+            "SHIELD": (171, 71, 188),
+            "SHOOT": (255, 202, 40),
+        }
+        color = colors.get(self.kind, (200, 200, 200))
         pygame.draw.rect(surf, color, self.rect, border_radius=12)
-        draw_text(surf, self.kind[0], (self.rect.centerx, self.rect.centery - 12), font=FONT_BIG, color=(15, 15, 15), center=True)
+        draw_text(surf, self.kind[0].upper(), (self.rect.centerx, self.rect.centery - 12), font=FONT_BIG, color=(15, 15, 15), center=True)
 
-# --------------- Game -----------------
+# ------------------------------------------------------------------
+# Game
+# ------------------------------------------------------------------
 class Game:
     def __init__(self):
         self.bg_original = None
@@ -362,16 +426,17 @@ class Game:
         self.shoot_beam_until = 0.0
         self.ui_buttons = {}
 
-        pygame.time.set_timer(pygame.USEREVENT + 1, self.spawn_ms)
+        # Spawning handled by time accumulator in update()
+        self._spawn_accum = 0.0
 
     def level_up(self):
         self.level += 1
         self.required += REQUIRED_INC + max(0, self.level // 3)
         self.enemy_speed += LEVEL_SPEED_INC
         self.spawn_ms = max(SPAWN_MS_MIN, self.spawn_ms - SPAWN_DEC_PER_LEVEL)
-        pygame.time.set_timer(pygame.USEREVENT + 1, self.spawn_ms)
+        # Spawning handled by time accumulator in update()
+        self._spawn_accum = 0.0
         self.level_up_flash_until = time.time() + 1.5
-        # new background, avoid immediate repeat
         self._set_background(path=None, exclude=self.bg_last_level_path)
         self.bg_last_level_path = self.bg_path
 
@@ -408,6 +473,23 @@ class Game:
         if self.state != "RUN":
             return
 
+        # continuous up/down control
+        keys = pygame.key.get_pressed()
+        dy = 0.0
+        if keys[pygame.K_UP] or keys[pygame.K_w]:
+            dy -= PLAYER_VERT_SPEED * dt
+        if keys[pygame.K_DOWN] or keys[pygame.K_s]:
+            dy += PLAYER_VERT_SPEED * dt
+        if dy:
+            self.player.move_vertical(dy)
+
+        # spawn by accumulator (reliable across platforms)
+        self._spawn_accum += dt
+        interval = max(0.05, self.spawn_ms / 1000.0)
+        while self._spawn_accum >= interval:
+            self.spawn()
+            self._spawn_accum -= interval
+
         now = time.time()
         speed_scale = 1.0
         if self.player.has_power("FAST"):
@@ -415,6 +497,7 @@ class Game:
         if self.player.has_power("SLOW"):
             speed_scale *= 0.7
 
+        # enemies
         for e in list(self.enemies):
             e.update(dt, speed_scale=speed_scale)
             if not e.counted and e.rect.top > HEIGHT:
@@ -422,16 +505,19 @@ class Game:
                 self.enemies.remove(e)
                 self._count_pass_and_score(e)
 
+        # powerups
         for p in list(self.powerups):
             p.update(dt * speed_scale)
             if p.rect.top > HEIGHT:
                 self.powerups.remove(p)
 
+        # collect powerups
         for p in list(self.powerups):
             if self.player.rect.colliderect(p.rect):
                 self.player.grant_power(p.kind)
                 self.powerups.remove(p)
 
+        # collisions (ignore when >50% off bottom)
         safe_top = HEIGHT - ENEMY_H // 2
         for e in list(self.enemies):
             if e.rect.top > safe_top:
@@ -443,6 +529,7 @@ class Game:
                     self.state = "GAMEOVER"
                     break
 
+        # shooting clears lane ahead
         if now < self.shoot_beam_until:
             lane = self.player.lane
             for e in list(self.enemies):
@@ -461,18 +548,18 @@ class Game:
         self.shoot_beam_until = now + 0.22
         self.player.shoot_ready_at = now + SHOOT_COOLDOWN
 
-    # --------- UI Panels ---------
+    # ---------- Panels ----------
     def _draw_left_panel(self, surf):
         panel = pygame.Rect(0, 0, PANEL_LEFT_W, HEIGHT)
         s = pygame.Surface(panel.size, pygame.SRCALPHA)
         s.fill((0, 0, 0, 110))
         surf.blit(s, panel.topleft)
-        draw_text(surf, "FRAMERACING", (panel.centerx, 20), font=FONT_BIG, center=True)
-        draw_text(surf, f"Score: {self.score}", (16, 70))
-        draw_text(surf, f"Level: {self.level}", (16, 96))
-        draw_text(surf, f"Passed: {self.passed}/{self.required}", (16, 122))
-        draw_text(surf, "Power-ups:", (16, 164), font=FONT_BIG)
-        y = 196
+        draw_text(surf, "FRAMERACING", (panel.centerx, 16), font=PANEL_TITLE_FONT, center=True)
+        draw_text(surf, f"Score: {self.score}", (12, 56), font=PANEL_FONT)
+        draw_text(surf, f"Level: {self.level}", (12, 78), font=PANEL_FONT)
+        draw_text(surf, f"Passed: {self.passed}/{self.required}", (12, 100), font=PANEL_FONT)
+        draw_text(surf, "Power-ups:", (12, 130), font=PANEL_TITLE_FONT)
+        y = 152
         powers = []
         if self.player.has_power("FAST"): powers.append("FAST")
         if self.player.has_power("SLOW"): powers.append("SLOW")
@@ -480,13 +567,12 @@ class Game:
         if self.player.has_power("SHOOT"): powers.append("SHOOT")
         if powers:
             for p in powers:
-                draw_text(surf, f"• {p}", (24, y)); y += 24
+                draw_text(surf, f"• {p}", (18, y), font=PANEL_FONT); y += 20
         else:
-            draw_text(surf, "• none", (24, y))
-        draw_text(surf, "Controls", (panel.centerx, HEIGHT - 236), font=FONT_BIG, center=True)
-        lines = ["←/→ lanes", "SPACE shoot", "P pause", "ESC exit", "+20 normal", "+50 special"]
-        for i, t in enumerate(lines):
-            draw_text(surf, t, (16, HEIGHT - 204 + i*24))
+            draw_text(surf, "• none", (18, y), font=PANEL_FONT)
+        draw_text(surf, "Controls", (panel.centerx, HEIGHT - 210), font=PANEL_TITLE_FONT, center=True)
+        for i, t in enumerate(["←/→ lanes", "↑/↓ up/down", "SPACE shoot", "P pause", "ESC exit", "+20 normal", "+50 special"]):
+            draw_text(surf, t, (12, HEIGHT - 186 + i*20), font=PANEL_FONT)
 
     def _draw_right_panel(self, surf):
         panel = pygame.Rect(WIDTH - PANEL_RIGHT_W, 0, PANEL_RIGHT_W, HEIGHT)
@@ -495,8 +581,8 @@ class Game:
         surf.blit(s, panel.topleft)
         # Buttons
         self.ui_buttons = {}
-        btn_y = 16
-        btn_w, btn_h = 72, 32
+        btn_y = 10
+        btn_w, btn_h = 68, 28
         gap = 12
         labels = [("Start", "start"), ("Pause", "pause"), ("Exit", "exit")]
         x = panel.left + 12
@@ -507,23 +593,22 @@ class Game:
             self.ui_buttons[key] = rect
             x += btn_w + gap
         # High scores
-        draw_text(surf, "Top 10", (panel.centerx, 70), font=FONT_BIG, center=True)
+        draw_text(surf, "Top 10", (panel.centerx, 58), font=PANEL_TITLE_FONT, center=True)
         scores = load_scores()
-        y = 106
+        y = 86
         for i, srow in enumerate(scores[:10]):
             txt = f"{i+1:>2}. {srow.get('name','PLAYER')[:12]:<12} {srow.get('score',0):>5}"
-            draw_text(surf, txt, (panel.left + 16, y))
-            y += 24
+            draw_text(surf, txt, (panel.left + 12, y), font=PANEL_FONT)
+            y += 20
 
     def draw(self, surf):
-        # base
         surf.fill(ROAD_COLOR)
 
-        # road area first (so bg overlay can show on top of it)
+        # road area first (underlay for background overlay)
         rr = road_rect()
         pygame.draw.rect(surf, (30, 30, 34), rr)
 
-        # background overlay ACROSS WHOLE WINDOW (15% alpha), drawn after road fill
+        # background overlay across the whole window
         if self.bg_surface:
             surf.blit(self.bg_surface, (0, 0))
 
@@ -543,18 +628,27 @@ class Game:
             p.draw(surf)
         self.player.draw(surf)
 
-        # shoot beam
+        
+        # shoot beam (laser line)
         if time.time() < self.shoot_beam_until:
             lane = self.player.lane
-            x0 = LANE_RECTS[lane].left + 6
-            x1 = LANE_RECTS[lane].right - 6
             y0 = 0
             y1 = self.player.rect.top - 6
-            beam_rect = pygame.Rect(x0, y0, x1 - x0, y1 - y0)
-            s = pygame.Surface(beam_rect.size, pygame.SRCALPHA)
-            s.fill((255, 255, 255, 90))
-            surf.blit(s, beam_rect.topleft)
-            pygame.draw.rect(surf, (255, 255, 255), beam_rect, 2)
+            cx = LANE_CENTERS[lane]
+            # draw a soft glow + bright core using alpha surfaces
+            glow_w = 16
+            core_w = 4
+            glow_h = max(1, y1 - y0)
+            # glow
+            gsurf = pygame.Surface((glow_w, glow_h), pygame.SRCALPHA)
+            gsurf.fill((255, 255, 255, 60))
+            surf.blit(gsurf, (cx - glow_w // 2, y0))
+            # core
+            csurf = pygame.Surface((core_w, glow_h), pygame.SRCALPHA)
+            csurf.fill((255, 255, 255, 230))
+            surf.blit(csurf, (cx - core_w // 2, y0))
+
+        
 
         if time.time() < self.level_up_flash_until:
             draw_text(surf, "LEVEL UP!", (rr.centerx, HEIGHT//2 - 120), font=FONT_HUGE, color=(255, 255, 255), center=True)
@@ -575,7 +669,7 @@ class Game:
             "Avoid cars, pass as many as you can.",
             "Power-ups: FAST, SLOW, BUBBLE, SHOOT",
             "SPACE to shoot when SHOOT is active",
-            "←/→ move lane, P pause, ESC quit",
+            "←/→ lane, ↑/↓ up/down, P pause, ESC quit",
             "+20 per normal car, +50 special",
             "Press ENTER to start",
         ]
@@ -592,21 +686,16 @@ class Game:
         draw_text(surf, name_display, (rr.centerx, HEIGHT//2 + 30), center=True)
         draw_text(surf, "Press ENTER to save, R to restart", (rr.centerx, HEIGHT//2 + 90), center=True)
 
-    # ------------- Event handling -------------
+    # Events
     def handle_event(self, event):
         global WIDTH, HEIGHT, screen
         if event.type == pygame.QUIT:
             pygame.quit()
             sys.exit(0)
 
-        # Handle window resize / maximize
         if event.type == pygame.VIDEORESIZE:
             WIDTH, HEIGHT = max(640, event.w), max(480, event.h)
-            if START_MAXIMIZED:
-    WIDTH, HEIGHT = get_desktop_size()
-if START_MAXIMIZED:
-    WIDTH, HEIGHT = get_desktop_size()
-screen = pygame.display.set_mode((WIDTH, HEIGHT), pygame.RESIZABLE)
+            screen = pygame.display.set_mode((WIDTH, HEIGHT), pygame.RESIZABLE)
             recalc_geometry(self.player)
             self._rescale_bg()
             return
@@ -645,15 +734,12 @@ screen = pygame.display.set_mode((WIDTH, HEIGHT), pygame.RESIZABLE)
                     self.try_fire()
                 elif event.key == pygame.K_p:
                     self.state = "PAUSE"
-
             elif self.state == "PAUSE":
                 if event.key == pygame.K_p:
                     self.state = "RUN"
-
             elif self.state == "START":
                 if event.key == pygame.K_RETURN:
                     self.state = "RUN"
-
             elif self.state == "GAMEOVER":
                 if event.key == pygame.K_RETURN:
                     name = self.name_input.strip() or "PLAYER"
@@ -668,15 +754,13 @@ screen = pygame.display.set_mode((WIDTH, HEIGHT), pygame.RESIZABLE)
                     if ch and (ch.isalnum() or ch in (" ", "_", "-")) and len(self.name_input) < 16:
                         self.name_input += ch
 
-        if event.type == pygame.USEREVENT + 1 and self.state == "RUN":
-            self.spawn()
-
-# --------------- Main Loop -----------------
+# ------------------------------------------------------------------
+# Main loop
+# ------------------------------------------------------------------
 def main():
     global WIDTH, HEIGHT, screen
     game = Game()
     dt = 0.0
-    # Sync to actual client size (accounts for title bar / OS adjustments)
     WIDTH, HEIGHT = screen.get_size()
     recalc_geometry(game.player)
     game._rescale_bg()
@@ -689,7 +773,6 @@ def main():
 
         game.draw(screen)
         pygame.display.flip()
-        # dt in seconds (time-based movement)
         dt = clock.tick(FPS) / 1000.0
 
 if __name__ == "__main__":
