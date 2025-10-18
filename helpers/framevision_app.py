@@ -1399,6 +1399,23 @@ class VideoPane(QWidget):
             except Exception: pass
             try: self.player.stop()
             except Exception: pass
+            # --- HARD REBUILD to fully release multimedia threads before switching to stills ---
+            try:
+                self._rebuild_player()
+            except Exception:
+                pass
+            # Clear any lingering GIF/movie overlay
+            try:
+                self.label.setMovie(None)
+            except Exception:
+                pass
+            try:
+                if hasattr(self, "_gif_movie") and self._gif_movie:
+                    self._gif_movie.stop()
+                    self._gif_movie = None
+            except Exception:
+                pass
+
             try: self.player.setSource(QUrl())
             except Exception: pass
             # Clear video sink
@@ -1440,6 +1457,23 @@ class VideoPane(QWidget):
             except Exception: pass
             try: self.player.stop()
             except Exception: pass
+            # --- HARD REBUILD to fully release multimedia threads before switching to stills ---
+            try:
+                self._rebuild_player()
+            except Exception:
+                pass
+            # Clear any lingering GIF/movie overlay
+            try:
+                self.label.setMovie(None)
+            except Exception:
+                pass
+            try:
+                if hasattr(self, "_gif_movie") and self._gif_movie:
+                    self._gif_movie.stop()
+                    self._gif_movie = None
+            except Exception:
+                pass
+
             try: self.player.setSource(QUrl())
             except Exception: pass
             try:
