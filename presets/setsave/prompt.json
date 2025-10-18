@@ -1,0 +1,10 @@
+{
+  "style": "",
+  "length_choice": "Short (40–60 words)",
+  "target": "image",
+  "model_key": "qwen2-vl-2b",
+  "negatives": "",
+  "temperature": 0.0,
+  "max_new_tokens": 160,
+  "seed_text": "a an anime game figure that looks like a video editor, full size (from head to feet)"
+}

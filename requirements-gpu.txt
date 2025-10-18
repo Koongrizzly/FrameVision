@@ -1,0 +1,28 @@
+# FrameVision — CUDA (GPU) requirements for SDXL + Describer (Vision) — clean, compatible pins
+# Torch/TorchVision/Torchaudio are installed separately with CUDA wheels. Do NOT add them here.
+
+# Core inference stack
+diffusers==0.30.0
+transformers>=4.56.1,<5
+tokenizers>=0.22,<0.24
+accelerate>=0.33.0,<1.0
+safetensors>=0.4.4
+
+# HF + utilities
+huggingface_hub>=0.23,<0.35
+pillow==10.4.0
+tqdm>=4.66.4
+pyyaml>=6.0.1
+numpy>=1.26,<2.0
+# Optional but helpful for some loaders
+sentencepiece>=0.2.0; platform_system != "Windows"  # (Windows often skips; keep optional)
+protobuf>=4.25.3
+
+pygame==2.6.* ; platform_system == "Windows"
+
+# Background removal runtime (keep CPU ONNX Runtime to avoid cuDNN 9 conflicts with Torch cu121)
+onnxruntime==1.18.0
+# NOTE:
+# - transformers 4.56.x pairs with tokenizers 0.22–0.23.x
+# - pillow 11.x can be fine, but 10.4.0 is broadly compatible with py3.10/3.11 + many wheels
+# - adjust pins here (not inline in the .bat) to avoid batch escaping issues

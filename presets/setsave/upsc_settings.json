@@ -1,0 +1,27 @@
+{
+  "remember": true,
+  "scale": 2.0,
+  "engine_index": 0,
+  "model_realsr": "realesr-animevideov3-x2",
+  "model_w2x": "models-cunet",
+  "outdir": "C:\\FrameVision-1.0.6\\output\\upscaled",
+  "vcodec": "libx264",
+  "use_crf": true,
+  "crf": 18,
+  "use_bitrate": false,
+  "bitrate": 8000,
+  "preset": "fast",
+  "keyint": 0,
+  "audio": "copy",
+  "acodec": "aac",
+  "abitrate": 192,
+  "sections": {
+    "models": true,
+    "encoder": true,
+    "advanced": false,
+    "recents": true
+  },
+  "video_thumbs": true,
+  "streaming_lowmem": true,
+  "recents": []
+}
