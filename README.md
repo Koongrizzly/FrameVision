@@ -1,19 +1,48 @@
 [README.md](https://github.com/user-attachments/files/22204351/README.md)
-# 🌟 FrameVision V1.0.6
+# 🌟 FrameVision V1.0.7
+---
+**New in v1.0.7**
+---
+New Features:
+---
+- New easter egg system (use the app to unlock fun stuff)
+- Music Visuals now fade into next visual for a nonstop visual experience
+- Removed the most boring visuals from the music player and replaced them with new visuals (total: 130)
+- Music player got playlist open and save feature,
+- Right-click on music tracks opens a new side menu with options
+- New models for upscaler
+- 5 new themes — 2 day themes (Sky & Pastel), 2 colorful themes (Rainbow Riot & Candy Pop), and one night theme (Graphite Dusk)
+- Manual 'Update Check' button in the Info menu
+---
+Bugfixes:
+---
+- Fixed a bug in music visuals where it stopped reacting to music after 1 track
+- Fixed a bug where it would default to 25fps while upscaling
+- Txt-to-image no longer overwrites previous image when the same name is given by the user
+- Fixed preview in SoundLab
+- Menu hover background fix
+- Fixed menus in Txt-to-Image that needed two clicks to open after restarting the app
+- Music player fine-tuning for visuals
+- Music player new pre-analyzer
+- Music player now plays long music tracks (e.g., DJ sets) without CPU overloading and app slowdowns
+- Music player: fixed the 'bag' for random visuals to show all before starting a new random order list
+- Circle brush in background remover is now more responsive and fades out after use
+- Full screen now also hides player controls when keyboard or mouse is not used for 6 seconds
 ---
 **New in v1.0.6:** 
 ---
 - Updater (the only place in the app that needs an internet connection)
 App now has an option in File menu/Info/update.
 Replace all files or helper files only with the files from latest release.
-Update all files or only helper files to the newest files on github.
-Auto check for new updates or new release (daily, can be turned off)
+Or you can also update all files/only helper files to the newest files on github to be able to test newest things.
+Has an auto check for new updates or new release (daily, can be turned off)
+comes with backup function and user can also select (in the update to newest/beta files) select which files to update.
 
 - Background remove/replace tool (Beta)
   First version of a background/object/inpaint tool
-  2 models for backhround removal
+  2 models for background removal (fast or quality)
   sd15 loader for stable diffusion inpaint models, comes with default model, User can download other
-- Txt-to-image now also supports a queue; batch runs (>1) always use the queue
+- Txt-to-image now also supports a queue; batch runs (>1) always use the queue, user can still select queue on/off for creating 1 image
 - New upscale model: RealSR (2x/4x)
 ---
 ***most important Bugfixes***
