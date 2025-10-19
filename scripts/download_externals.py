@@ -1168,3 +1168,24 @@ if __name__ == "__main__":
         print("[externals][txt2img] demo error:", e)
 # --- end: TXT->IMG quick demo --------------------------------------------------------------------
 
+
+# --- begin: run downloadbg.py at the very end ----------------------------------
+def _run_downloadbg_after_all():
+    try:
+        import sys, subprocess
+        from pathlib import Path as _Path
+        _root = (globals().get("ROOT") or _Path(__file__).resolve().parents[1])
+        _script = _root / "scripts" / "downloadbg.py"
+        if not _script.exists():
+            print("[externals] downloadbg.py not found at", _script)
+            return
+        print("[externals] starting downloadbg.py …")
+        # Use project root as cwd; run with current interpreter
+        subprocess.run([sys.executable, str(_script)], cwd=str(_root), check=False)
+    except Exception as e:
+        print("[externals] downloadbg runner error:", e)
+
+if __name__ == "__main__":
+    # Ensure this fires after all other __main__ blocks above
+    _run_downloadbg_after_all()
+# --- end: run downloadbg.py at the very end ------------------------------------

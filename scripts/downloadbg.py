@@ -137,6 +137,14 @@ def fetch_with_fallback(url_or_list, dest_path, expected_sha256=None, token: str
 
 def move_all_to(temp_dest: pathlib.Path, final_root: pathlib.Path) -> int:
     final_root.mkdir(parents=True, exist_ok=True)
+    try:
+        # Safety: if the temp folder is the same as the final folder, there's nothing to move.
+        if temp_dest.resolve() == final_root.resolve():
+            # This prevents accidental deletion when source == destination.
+            return 0
+    except Exception:
+        # If resolve() fails for any reason, continue without the guard (best-effort).
+        pass
     moved = 0
     for p in temp_dest.glob("*"):
         if not p.is_file():
@@ -473,7 +481,7 @@ def main():
     if moved_bg:
         print(f"[move] Moved {moved_bg} file(s) to {final_bg}")
     else:
-        print(f"[move] No files moved; they were already in {final_bg}")
+        print(f"[move] No move step needed or files already in place at {final_bg}")
 
     removed = cleanup_model_root_zips()
     if removed:
