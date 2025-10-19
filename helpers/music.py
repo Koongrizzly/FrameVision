@@ -661,7 +661,7 @@ class HybridAnalyzer(QObject):
             self._probe = None
 
         # --- JIT small-window analysis (no full preanalysis) ---
-        self._win_ms = 8000
+        self._win_ms = 48000
         self._preroll_ms = 800
         self._seg_cache = {}
         self._seg_worker = None
@@ -709,16 +709,7 @@ class HybridAnalyzer(QObject):
         except Exception:
             pass
 
-
-        # JIT: cancel any previous preanalysis and prime small window
-        try:
-            if hasattr(self, '_worker') and getattr(self, '_worker', None):
-                try: self._worker.request_stop()
-                except Exception: pass
-                try: self._worker.wait(400)
-                except Exception: pass
-                self._worker = None
-        except Exception: pass
+        # JIT: prime small window **without** cancelling full preanalysis
         try:
             self._seg_cache.clear()
         except Exception:
@@ -726,6 +717,7 @@ class HybridAnalyzer(QObject):
         self._cancel_window()
         self.path = Path(path)
         self._kick_window(0)
+
 
     def start(self):
         self._timer.start(90)
@@ -797,6 +789,16 @@ class HybridAnalyzer(QObject):
             pass
 
     def _tick(self):
+        # Ensure our 8s JIT window follows the playhead even if positionChanged isn't firing
+        try:
+            pos = int(getattr(self.player, 'position', lambda: 0)())
+            if (getattr(self, '_win_start', 0) >= 0) and (
+                pos < getattr(self, '_win_start', 0) or pos > getattr(self, '_win_end', 0)
+            ):
+                self._kick_window(int(pos))
+        except Exception:
+            pass
+
         # JIT fast path: serve from tiny cache near playhead
         try:
             pos = int(getattr(self.player, 'position', lambda: 0)())
