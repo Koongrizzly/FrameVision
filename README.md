@@ -56,8 +56,8 @@ comes with backup function and user can also select (in the update to newest/bet
 - Fixed issue where the upscaler switched between sound options and video quality options
 ---
 **New in v1.0.5:** 
-- Full blown music visualizer (100+ visuals) not moving by time but by **BEATS**.
-Loading an mp3 or music track will open a new overlay with a playlist and options for visuals where you can set it as low as 8 beats to have non stop changing visuals that change with sound and beats (and some extra tuning to make it show even more after a break in the track) It comes with a little bug where it will skip first 0.1 seconds of very first track that is loaded, after that it works perfect. Sometimes you notice sometimes you don't.
+- Full blown music visualizer (100+ visuals) not changing by time but by **BEATS**.
+Loading an mp3 or music track will open a new overlay with a playlist and options for visuals where you can set it as low as 8 beats to have non stop changing visuals that change with sound and beats (and some extra tuning to change after a big change in volume in the track) It comes with a little bug where it will skip first 0.1 seconds of very first track that is loaded (workaround to fix another bug lol), after that it works perfect. Sometimes you notice when there is music in first 100ms, sometimes you don't.
 - better last results in upscaler and interpollator
 - queue now has preview thumbnails
 - some batch jobs got a more fancy loader (to add more, delete etc before starting in queue.)
