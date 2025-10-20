@@ -904,74 +904,54 @@ class InterpPane(QWidget):
         QMessageBox.information(self, "Queued", "Interpolation added to Queue.")
         self._watch_timer.start()
 
-    
     def _on_batch_clicked(self):
         self._persist_state()
 
-        # Popup with Add files / Add folder / Cancel and duplicate policy
-        from PySide6.QtWidgets import QDialog, QDialogButtonBox, QRadioButton, QGroupBox, QVBoxLayout, QHBoxLayout, QLabel
+        # Use the reusable BatchSelectDialog (helpers/batch.py). Fallback to helpers/vatch.py if present.
+        try:
+            from helpers.batch import BatchSelectDialog as _BatchDialog
+        except Exception:
+            try:
+                from helpers.vatch import BatchSelectDialog as _BatchDialog  # optional alias
+            except Exception:
+                _BatchDialog = None
 
-        dlg = QDialog(self)
-        dlg.setWindowTitle("Add Batch")
-        v = QVBoxLayout(dlg)
-        v.addWidget(QLabel("Choose what to add and how to handle existing outputs."))
-
-        grp = QGroupBox("If output file already exists:")
-        gv = QVBoxLayout(grp)
-        rb_skip = QRadioButton("Skip existing")
-        rb_over = QRadioButton("Overwrite")
-        rb_auto = QRadioButton("Auto rename (versioned filename)")
-        rb_auto.setChecked(True)
-        gv.addWidget(rb_skip); gv.addWidget(rb_over); gv.addWidget(rb_auto)
-        v.addWidget(grp)
-
-        btns = QDialogButtonBox()
-        btn_files = btns.addButton("Add files", QDialogButtonBox.ActionRole)
-        btn_folder = btns.addButton("Add folder", QDialogButtonBox.ActionRole)
-        btn_cancel = btns.addButton(QDialogButtonBox.Cancel)
-        v.addWidget(btns)
-
-        choice = {"mode": None}
-        btn_files.clicked.connect(lambda: (choice.update(mode="files"), dlg.accept()))
-        btn_folder.clicked.connect(lambda: (choice.update(mode="folder"), dlg.accept()))
-        btn_cancel.clicked.connect(dlg.reject)
-
-        if dlg.exec() != QDialog.Accepted:
+        if _BatchDialog is None:
+            QMessageBox.warning(self, "Add Batch", "Batch picker module not found (helpers/batch.py).")
             return
 
-        dup_mode = 'autorename' if rb_auto.isChecked() else ('overwrite' if rb_over.isChecked() else 'skip')
-
-        files = []
-        if choice["mode"] == "files":
-            file_dlg = QFileDialog(self, "Select videos for batch")
-            file_dlg.setFileMode(QFileDialog.ExistingFiles)
-            file_dlg.setNameFilter("Videos (*.mp4 *.mkv *.mov *.webm *.avi)")
-            if not file_dlg.exec():
-                return
-            files = [Path(p) for p in file_dlg.selectedFiles() if p]
-        elif choice["mode"] == "folder":
-            folder = QFileDialog.getExistingDirectory(self, "Pick a folder")
-            if not folder:
-                return
-            files = self._get_video_files_in_dir(Path(folder))
-        else:
+        files, conflict = _BatchDialog.pick(self, title="Add Batch", exts=getattr(_BatchDialog, "VIDEO_EXTS", None))
+        if files is None:
             return
-
         if not files:
-            QMessageBox.information(self, "Add Batch", "No files found."); return
+            QMessageBox.information(self, "Add Batch", "No files selected.")
+            return
+
+        # Map conflict to our dup_mode values used by _enqueue_job
+        if conflict in ("version", "autorename", "auto", "ver"):
+            dup_mode = "autorename"
+        elif conflict == "overwrite":
+            dup_mode = "overwrite"
+        else:
+            dup_mode = "skip"
 
         mult = max(0.15, min(4.0, self.slider.value()/100.0))
         ok = 0; skipped = 0; cache = {}
-        for src in files:
-            if not src.exists():
-                continue
-            in_fps = cache.get(str(src)) or _probe_fps(src); cache[str(src)] = in_fps
-            res = self._enqueue_job(src, mult, in_fps, dup_mode=dup_mode)
-            if res:
-                ok += 1
-            else:
-                if dup_mode == 'skip':
-                    skipped += 1
+
+        for fp in files:
+            try:
+                src = Path(fp)
+                if not src.exists():
+                    continue
+                in_fps = cache.get(str(src)) or _probe_fps(src); cache[str(src)] = in_fps
+                res = self._enqueue_job(src, mult, in_fps, dup_mode=dup_mode)
+                if res:
+                    ok += 1
+                else:
+                    if dup_mode == 'skip':
+                        skipped += 1
+            except Exception:
+                pass
 
         QMessageBox.information(self, "Add Batch", f"Queued {ok} item(s).{' Skipped ' + str(skipped) + ' existing.' if skipped else ''}")
         try:
@@ -979,6 +959,7 @@ class InterpPane(QWidget):
         except Exception:
             pass
         return
+
 
     def _on_slider_changed(self, v: int):
         mult = max(0.15, min(4.0, v/100.0))

@@ -526,10 +526,38 @@ class ResizePane(QWidget):
             QMessageBox.information(self, "Done", f"Saved:\n{out}")
         else:
             QMessageBox.critical(self, "FFmpeg error", err or "Unknown error")
-
     def _on_resize_batch(self):
-        inputs = self._pick_inputs()
-        if not inputs: return
+        # Prefer the shared BatchSelectDialog (helpers/batch.py). Fallback to classic file picker.
+        inputs = []
+        try:
+            from helpers.batch import BatchSelectDialog as _BatchDialog
+        except Exception:
+            try:
+                from helpers.vatch import BatchSelectDialog as _BatchDialog
+            except Exception:
+                _BatchDialog = None
+
+        if _BatchDialog is not None:
+            exts = tuple(IMAGE_EXTS) if self._is_image_mode() else tuple(VIDEO_EXTS)
+            result = _BatchDialog.pick(self, title="Resize a batch…", exts=exts)
+            if isinstance(result, tuple):
+                files, conflict = result
+            else:
+                files, conflict = result, "skip"
+            if files is None:
+                return  # user cancelled
+            # Sync overwrite policy combo to dialog choice
+            if conflict in ("skip", "none"):
+                self.cmb_overwrite.setCurrentText("Skip existing")
+            elif conflict == "overwrite":
+                self.cmb_overwrite.setCurrentText("Overwrite")
+            elif conflict in ("version", "autorename", "auto", "ver"):
+                self.cmb_overwrite.setCurrentText("Versioned filename")
+            inputs = [Path(f) for f in files]
+        else:
+            inputs = self._pick_inputs()
+            if not inputs:
+                return
 
         # Preflight filtering & summary
         to_process, skipped = self._preflight_batch(inputs)
@@ -580,6 +608,7 @@ class ResizePane(QWidget):
             QMessageBox.warning(self, "Batch finished with errors", msg)
         else:
             QMessageBox.information(self, "Batch finished", msg)
+
 
     def _run_ffmpeg(self, cmd: list[str]) -> tuple[bool, str]:
         try:

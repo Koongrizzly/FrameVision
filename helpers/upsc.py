@@ -2759,3 +2759,272 @@ try:
             _Pane.__init__ = _fv_init
 except Exception:
     pass
+
+
+# --- FRAMEVISION_TOOLTIP_AND_MODELINFO_PATCH (2025-10-20) ---
+try:
+    _Pane = UpscPane  # type: ignore  # noqa: F821
+    if not hasattr(_Pane, "_fv_patched_tooltips_modelinfo_20251020"):
+        _Pane._fv_patched_tooltips_modelinfo_20251020 = True
+
+        from PySide6 import QtWidgets as _FVQtW2  # type: ignore
+
+        # Rich, sourced model info (short, single-line style)
+        _FV_MODEL_HINTS = {
+            # Real-ESRGAN family (primary)
+            "realesrgan-x4plus": ("Photo", "General 4× Real-ESRGAN model for real‑world photos; good default."),
+            "realesrnet-x4plus": ("Photo", "4× RealESRNet (no-GAN) — fewer hallucinated textures; stable on photos."),
+            "realesrgan-x4plus-anime": ("Anime", "4× model tuned for anime/illustrations; preserves clean lines & flats."),
+            "realesr-animevideov3-x4": ("Anime/Video", "4× anime‑video model (v3); reduces temporal artifacts on frames."),
+            "realesr-general-x4v3": ("Photo (Tiny)", "4× general v3 (tiny) for blind SR; robust across varied content."),
+            "realesr-general-wdn-x4v3": ("Photo+Denoise", "4× general v3 with built‑in denoise (WDN) to suppress compression noise."),
+            # Popular community model
+            "4x-ultrasharp": ("UI/Text", "4× UltraSharp: crisp, edge‑preserving detail; great for UI/screens; can look oversharp."),
+            # Waifu2x model dirs
+            "models-cunet": ("Anime", "Waifu2x CUNet model for anime‑style art with denoise levels."),
+            "models-upconv_7_anime_style_art_rgb": ("Anime", "UpConv7 (anime RGB) — fast; keeps flat colors and linework."),
+            "models-upconv_7_photo": ("Photo", "UpConv7 (photo) — better for natural images & gradients."),
+            # SRMD (classical)
+            "srmd": ("Classical SR", "SRMD classical SR; use SRMDNF for noise‑free variant; good on older photos."),
+            "srmdnf": ("Classical SR", "SRMDNF (noise‑free) — removes noise prior to upscaling; stable results."),
+            # RealSR (ncnn)
+            "realsr-x2": ("Photo", "RealSR (x2) real‑world photo SR with degradation modeling; natural detail."),
+            "realsr-x4": ("Photo", "RealSR (x4) real‑world photo SR; fewer artifacts on camera images."),
+        }
+
+        def _fv_lookup_hint(name: str, engine_label: str) -> tuple[str, str]:
+            low = (name or "").lower().strip()
+            elow = (engine_label or "").lower()
+            # Direct keys or substring matches for known models
+            for key, (cat, txt) in _FV_MODEL_HINTS.items():
+                if key in low:
+                    return cat, txt
+            # Upscayl packaged models (label usually "Upscayl - <base>")
+            if "upscayl" in low:
+                if "anime" in low:
+                    return "Anime", "Upscayl anime model based on ESRGAN family; strong line preservation."
+                if "digital" in low or "art" in low:
+                    return "Digital Art", "Upscayl digital‑art model; enhances CG and illustrations with sharp edges."
+                return "Photo", "Upscayl general‑photo model (ESRGAN‑based) for everyday pictures."
+            # Engine‑level fallbacks
+            if "swinir" in elow:
+                return "Transformer", "SwinIR (Transformer‑based SR) — strong fidelity on natural images."
+            if "lapsrn" in elow:
+                return "Pyramid CNN", "LapSRN (Laplacian pyramid CNN) — lightweight & fast SR."
+            if "waifu2x" in elow:
+                return "Anime", "Waifu2x family — best for anime/line art; choose CUNet/UpConv7 variants."
+            if "realsr (" in elow:
+                return "Photo", "RealSR (ncnn) for real‑world photos; good at reducing artifacts."
+            if "srmd" in elow:
+                return "Classical SR", "SRMD classical SR; SRMDNF variant includes denoise prior."
+            # Generic
+            if "ultrasharp" in low or "ui" in low or "text" in low:
+                return "UI/Text", "Edge‑focused model for UI, text, and crisp graphics."
+            if "anime" in low:
+                return "Anime", "Optimized for anime/illustrations; preserves lines & flats."
+            if "general" in low or "x4" in low or "x3" in low or "x2" in low:
+                return "Photo", "Balanced detail for photographs across varied content."
+            return "Other", ""
+
+        def _fv_current_model_text(self) -> str:
+            try:
+                engine_label = self.combo_engine.currentText()
+            except Exception:
+                engine_label = ""
+            try:
+                page = int(self.stk_models.currentIndex())
+            except Exception:
+                page = 0
+            # Choose the right combo for current engine/page
+            if page == 0:
+                if "Waifu2x" in engine_label and hasattr(self, "combo_model_w2x"):
+                    return self.combo_model_w2x.currentText()
+                if "UltraSharp" in engine_label and hasattr(self, "combo_model_ultrasharp"):
+                    return self.combo_model_ultrasharp.currentText()
+                if "SRMD (ncnn via RealESRGAN)" in engine_label and hasattr(self, "combo_model_srmd_realsr"):
+                    return self.combo_model_srmd_realsr.currentText()
+                return self.combo_model_realsr.currentText()
+            # Other stacked pages (best‑effort)
+            for nm in ("combo_model_ultrasharp","combo_model_srmd_realsr","combo_model_w2x","combo_model_srmd","combo_model_realsr_ncnn","combo_model_realsr"):
+                w = getattr(self, nm, None)
+                if w is not None and hasattr(w, "currentText"):
+                    try:
+                        return w.currentText()
+                    except Exception:
+                        pass
+            try:
+                return self.combo_model_realsr.currentText()
+            except Exception:
+                return ""
+
+        # Replace the simple hint updater with the richer one
+        def _fv_update_model_hint(self):
+            try:
+                engine_label = self.combo_engine.currentText()
+            except Exception:
+                engine_label = ""
+            name = ""
+            try:
+                name = _fv_current_model_text(self)
+            except Exception:
+                pass
+            cat, hint = _fv_lookup_hint(name, engine_label)
+            try:
+                self.lbl_model_badge.setText(cat)
+            except Exception:
+                pass
+            try:
+                self.lbl_model_hint.setText(hint)
+            except Exception:
+                pass
+
+        # Install encoder/tool tooltips in a dedicated helper
+        def _fv_install_tooltips(self):
+            def tip(w, text):
+                try:
+                    if w is not None and hasattr(w, "setToolTip"):
+                        w.setToolTip(text)
+                except Exception:
+                    pass
+
+            # Video codec & rate control
+            tip(getattr(self, "combo_vcodec", None),
+                "Video codec: H.264 (libx264) is most compatible; H.265/HEVC (libx265) smaller files; AV1 (SVT‑AV1/libaom) best compression but slower/less supported.")
+            tip(getattr(self, "rad_crf", None),
+                "CRF = Constant Rate Factor (quality‑based). Lower CRF → higher quality & larger file. Typical: x264 ≈ 18–23, x265 ≈ 20–28. Ignored if Bitrate is selected.")
+            tip(getattr(self, "spin_crf", None),
+                "Set CRF quality level for quality‑based encoding. Lower is better quality/larger size.")
+            tip(getattr(self, "rad_bitrate", None),
+                "Bitrate mode targets an average video bitrate (kbps). Use when you need a fixed size/bitrate. Disables CRF.")
+            tip(getattr(self, "spin_bitrate", None),
+                "Target video bitrate in kbps (e.g., 8000 = 8 Mbps). Rough guide: 1080p 6–12 Mbps; 4K 12–35 Mbps (content dependent).")
+            tip(getattr(self, "combo_preset", None),
+                "Encoder speed/quality trade‑off. Slower presets compress better (smaller files for same quality).")
+            tip(getattr(self, "spin_keyint", None),
+                "Keyframe interval (GOP). 0 lets the encoder choose. Otherwise sets ffmpeg -g <N>.")
+
+            # Audio controls
+            tip(getattr(self, "radio_a_copy", None), "Copy audio stream without re‑encoding (fast; keeps original quality/codec).")
+            tip(getattr(self, "radio_a_encode", None), "Encode audio with chosen codec/bitrate (use if changing container/codecs).")
+            tip(getattr(self, "radio_a_mute", None), "Remove/mute audio from the output.")
+            tip(getattr(self, "combo_acodec", None), "Audio codec: AAC (very compatible), Opus (efficient esp. speech), Vorbis (legacy/OGG).")
+            tip(getattr(self, "spin_abitrate", None), "Audio bitrate (kbps). Common: AAC 128–192, Opus 96–160.")
+
+            # Model badge/hint hover
+            tip(getattr(self, "lbl_model_badge", None), "Category of the selected model.")
+            tip(getattr(self, "lbl_model_hint", None), "Short description of the selected model.")
+
+        # Wrap __init__ to attach tooltips and hook our rich hint updater
+        if not hasattr(_Pane, "_fv_orig_init_tooltips"):
+            _Pane._fv_orig_init_tooltips = _Pane.__init__
+            def _fv_init_plus(self, *a, **k):
+                _Pane._fv_orig_init_tooltips(self, *a, **k)
+                try:
+                    # Install tooltips
+                    _fv_install_tooltips(self)
+                except Exception:
+                    pass
+                try:
+                    # Rewire model-hint updater
+                    self._update_model_hint = _fv_update_model_hint.__get__(self, _Pane)  # bind
+                    # Run once to refresh
+                    self._update_model_hint()
+                    # Connect changes
+                    for nm in ("combo_model_realsr", "combo_model_w2x",
+                               "combo_model_ultrasharp", "combo_model_srmd_realsr",
+                               "combo_model_srmd", "combo_model_realsr_ncnn", "combo_engine"):
+                        w = getattr(self, nm, None)
+                        try:
+                            if hasattr(w, "currentTextChanged"):
+                                w.currentTextChanged.connect(self._update_model_hint)
+                        except Exception:
+                            pass
+                        try:
+                            if hasattr(w, "currentIndexChanged"):
+                                w.currentIndexChanged.connect(self._update_model_hint)
+                        except Exception:
+                            pass
+                    try:
+                        if hasattr(self, "stk_models"):
+                            self.stk_models.currentChanged.connect(lambda *_: self._update_model_hint())
+                    except Exception:
+                        pass
+                except Exception:
+                    pass
+            _Pane.__init__ = _fv_init_plus
+except Exception as _fv_patch_exc:
+    try:
+        print("[upsc tooltip/modelinfo patch] non-fatal:", _fv_patch_exc)
+    except Exception:
+        pass
+# --- END FRAMEVISION_TOOLTIP_AND_MODELINFO_PATCH ---
+
+
+
+# --- FRAMEVISION_TOOLTIP_AND_MODELINFO_PATCH v2 (visible-combo fix) ---
+try:
+    _Pane = UpscPane  # type: ignore  # noqa: F821
+    if not hasattr(_Pane, "_fv_visible_combo_fix_20251020b"):
+        _Pane._fv_visible_combo_fix_20251020b = True
+
+        def _fv_current_model_text(self):
+            # Prefer the model combo that is actually visible in the stacked widget.
+            combo_names = (
+                "combo_model_realsr",
+                "combo_model_w2x",
+                "combo_model_ultrasharp",
+                "combo_model_srmd_realsr",
+                "combo_model_srmd",
+                "combo_model_realsr_ncnn",
+            )
+            visible = []
+            for nm in combo_names:
+                w = getattr(self, nm, None)
+                if w is None or not hasattr(w, "currentText"):
+                    continue
+                try:
+                    if hasattr(w, "isVisible") and w.isVisible():
+                        visible.append(w)
+                except Exception:
+                    # If visibility check fails, keep going
+                    pass
+            try:
+                if visible:
+                    return visible[0].currentText()
+            except Exception:
+                pass
+
+            # If none are visible (rare), pick by engine label mapping.
+            try:
+                engine_label = self.combo_engine.currentText().lower()
+            except Exception:
+                engine_label = ""
+
+            def pick(*names):
+                for n in names:
+                    w = getattr(self, n, None)
+                    if w is not None and hasattr(w, "currentText"):
+                        try:
+                            return w.currentText()
+                        except Exception:
+                            pass
+                return ""
+
+            if "srmd" in engine_label:
+                return pick("combo_model_srmd_realsr", "combo_model_srmd")
+            if "waifu2x" in engine_label:
+                return pick("combo_model_w2x")
+            if "ultrasharp" in engine_label:
+                return pick("combo_model_ultrasharp")
+            if "realsr" in engine_label or "ncnn" in engine_label:
+                return pick("combo_model_realsr", "combo_model_realsr_ncnn")
+
+            # Fallback: first available
+            return pick(*combo_names)
+
+except Exception as _fv_fix_exc:
+    try:
+        print("[upsc tooltip/modelinfo patch v2] non-fatal:", _fv_fix_exc)
+    except Exception:
+        pass
+# --- END v2 (visible-combo fix) ---

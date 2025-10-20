@@ -327,6 +327,51 @@ def _tools_line(status: Dict[str, Optional[str]]) -> str:
         parts.append(f"{name} {check}")
     return " • ".join(parts)
 
+
+# ---- BG/Inpaint/SD models check --------------------------------------------
+def _has_file_bigger_than(path: str, gib: float) -> Optional[str]:
+    """Return a file path if any file in 'path' is larger than `gib` GiB, else None."""
+    try:
+        thresh = gib * (1024**3)
+        if not os.path.isdir(path):
+            return None
+        for root, _dirs, files in os.walk(path):
+            for fn in files:
+                fp = os.path.join(root, fn)
+                try:
+                    if os.path.getsize(fp) > thresh:
+                        return fp
+                except Exception:
+                    continue
+    except Exception:
+        pass
+    return None
+
+def _bg_models_status(models_dir: str) -> Dict[str, Optional[str]]:
+    """Check presence of BG + Inpaint + SD15/SDXL models."""
+    bg_dir = os.path.join(models_dir, "bg")
+    biref = os.path.join(bg_dir, "BiRefNet-COD-epoch_125.onnx")
+    modnet = os.path.join(bg_dir, "modnet_photographic_portrait_matting.onnx")
+    inpaint_file = _has_file_bigger_than(bg_dir, 1.1)  # any >1.1 GiB in /bg
+    sd15_dir = os.path.join(models_dir, "sd15")
+    sdxl_dir = os.path.join(models_dir, "sdxl")
+    sd_big = _has_file_bigger_than(sd15_dir, 1.0) or _has_file_bigger_than(sdxl_dir, 1.0)
+    return {
+        "BiRefNet": biref if os.path.isfile(biref) else None,
+        "modnet": modnet if os.path.isfile(modnet) else None,
+        "Inpaint": inpaint_file,
+        "SD15/SDXL": sd_big,
+    }
+
+def _bg_models_line(status: Dict[str, Optional[str]]) -> str:
+    order = ["BiRefNet", "modnet", "Inpaint", "SD15/SDXL"]
+    parts = []
+    for name in order:
+        ok = bool(status.get(name))
+        check = "✅" if ok else "❌"
+        parts.append(f"{name} {check}")
+    return " • ".join(parts)
+
 # ---- HUD visibility helpers --------------------------------------------------
 def _apply_hud_visibility(enable: bool):
     app = QApplication.instance()
@@ -496,6 +541,11 @@ class SysMonPanel(QWidget):
         self.lbl_tools.setTextFormat(Qt.PlainText)
         self.lbl_tools.setToolTip("Checks FFmpeg, Qwen2-VL (describe), RIFE, Real-ESRGAN, Waifu2x, UpScayl(er)")
 
+        self._bg_status = _bg_models_status(paths["models"]) 
+        self.lbl_bg = QLabel(" " + _bg_models_line(self._bg_status))
+        self.lbl_bg.setTextFormat(Qt.PlainText)
+        self.lbl_bg.setToolTip("Checks bg models: BiRefNet, MODNet, Inpaint (>1.1 GiB), SD15/SDXL (>1 GiB)")
+
         # Uptime lines
         self.lbl_uptime_session = QLabel("Time online (this session): —")
         self.lbl_uptime_total = QLabel("Time online (since first run): —")
@@ -513,6 +563,7 @@ class SysMonPanel(QWidget):
         self.btn_rescan.clicked.connect(self._refresh_tools)
         self.btn_rescan.clicked.connect(self._refresh_disk)
 
+        self.btn_rescan.clicked.connect(self._refresh_bg_models)
         # Reset session timer button
         self.btn_reset = QPushButton("Reset session timer")
         self.btn_reset.setToolTip("Reset the 'Time online (this session)' counter to 0.")
@@ -562,6 +613,7 @@ class SysMonPanel(QWidget):
         v.addWidget(self.lbl_gpu_load)
         v.addWidget(self.lbl_versions)
         v.addWidget(self.lbl_tools)
+        v.addWidget(self.lbl_bg)
         v.addWidget(self.lbl_uptime_session)
         v.addWidget(self.lbl_uptime_total)
         v.addWidget(self.lbl_disk)
@@ -598,7 +650,7 @@ class SysMonPanel(QWidget):
         QSettings(ORG, APP).setValue(K_SYSMON_ENABLED, self.enabled)
         if self.enabled:
             self.session_start_ts = time.time()
-            self.timer.start(); self._kick_dir_scan(); self._refresh_tools(); self._refresh_disk()
+            self.timer.start(); self._kick_dir_scan(); self._refresh_tools(); self._refresh_disk(); self._refresh_bg_models()
         else:
             self.timer.stop()
 
@@ -633,6 +685,14 @@ class SysMonPanel(QWidget):
         models_dir = _settings_paths()["models"]
         self._tools_status = _tool_ready_status(models_dir)
         self.lbl_tools.setText(" " + _tools_line(self._tools_status))
+    def _refresh_bg_models(self):
+        models_dir = _settings_paths()["models"]
+        self._bg_status = _bg_models_status(models_dir)
+        try:
+            self.lbl_bg.setText(" " + _bg_models_line(self._bg_status))
+        except Exception:
+            pass
+
 
     def _refresh_disk(self):
         free_d, total_d = _disk_free_total(ROOT)

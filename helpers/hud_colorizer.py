@@ -1,4 +1,5 @@
-# helpers/hud_colorizer.py — colorize % and temperatures (+highlight & hysteresis)
+
+# helpers/hud_colorizer.py — colorize % and temperatures (flashless ≥70°C)
 from __future__ import annotations
 import re
 from PySide6.QtCore import Qt, QTimer
@@ -7,7 +8,7 @@ from PySide6.QtWidgets import QApplication, QLabel
 YELLOW = "#e0c600"
 ORANGE = "#d98a00"
 RED    = "#d70022"
-BG_RED = "#ffe6e6"  # subtle background for ≥70°C (with hysteresis)
+# NOTE: Removed background highlight and hysteresis-based 'red alert' to stop any flashing at ≥70°C.
 
 # Percent patterns (one each)
 _PAT_GPU = re.compile(r"(GPU\s*:.*?\s)(\d{1,3})%", re.IGNORECASE)
@@ -38,9 +39,7 @@ def _wrap_percent(num_str: str) -> str:
     return f"<span style='color:{color};font-weight:600'>{v}%</span>"
 
 def _class_for_temp(value: int, in_red_hys: bool) -> str | None:
-    # Return color hex or None. Applies hysteresis only for red band.
-    if in_red_hys and value >= 68:
-        return RED
+    # Hysteresis no longer used; argument kept for signature compatibility.
     if value >= 70:
         return RED
     if value >= 65:
@@ -51,12 +50,12 @@ def _class_for_temp(value: int, in_red_hys: bool) -> str | None:
 
 def _wrap_temp_token(full_token: str, value_str: str, in_red_hys: bool) -> str:
     """Wrap a temperature token (e.g., '65°C') based on thresholds.
-    Hysteresis: once any temp has reached ≥70°C, we stay in a 'red state' until all temps drop below 68°C.
-    In red state, values ≥68°C render red; otherwise thresholds are:
+    Flashless behavior: no background highlight, no hysteresis-based state.
+    Thresholds:
       <60  : no change
       60-64: yellow
       65-69: orange
-      ≥70  : red
+      ≥70  : red (text only)
     """
     try:
         v = int(value_str)
@@ -99,15 +98,6 @@ def _find_header_label() -> QLabel | None:
                 continue
     return None
 
-def _parse_all_temps(plain: str) -> list[int]:
-    vals = []
-    for m in _PAT_TEMP.finditer(plain):
-        try:
-            vals.append(int(m.group(1)))
-        except Exception:
-            pass
-    return vals
-
 def auto_install_hud_colorizer(interval_ms: int = 2500):
     lbl = _find_header_label()
     if not lbl:
@@ -118,8 +108,8 @@ def auto_install_hud_colorizer(interval_ms: int = 2500):
     lbl._fv_hud_colorizer_active = True
     lbl.setTextFormat(Qt.RichText)
 
-    # Persistent state on the label for hysteresis + change detection
-    state = {"in_red": False, "last_plain": None}
+    # Persistent state on the label for change detection (no hysteresis)
+    state = {"last_plain": None}
     lbl._fv_hud_colorizer_state = state  # for debugging
 
     timer = QTimer(lbl)
@@ -128,30 +118,16 @@ def auto_install_hud_colorizer(interval_ms: int = 2500):
             plain = _strip_tags(lbl.text())
             if plain == state.get("last_plain") and not state.get("force_next", False):
                 return
-            temps = _parse_all_temps(plain)
-            max_t = max(temps) if temps else None
 
-            # Hysteresis for red band: enter at ≥70, leave only when max < 68
-            next_in_red = False
-            if max_t is not None:
-                if state["in_red"]:
-                    next_in_red = max_t >= 68
-                else:
-                    next_in_red = max_t >= 70
-
-            # Colorize: temps first (with hysteresis), then percents
-            colored = _colorize_temps(plain, in_red_hys=next_in_red)
+            # Colorize: temps (no hysteresis) then percents
+            colored = _colorize_temps(plain, in_red_hys=False)
             colored = _colorize_percents(colored)
 
-            # Background highlight if in (or staying in) red zone
-            if next_in_red:
-                colored = f"<span style='background:{BG_RED};border-radius:4px;padding:0 3px'>{colored}</span>"
-
+            # No background highlight; text-only colorization to avoid flashing.
             if colored != lbl.text():
                 lbl.setText(colored)
 
             # Update state
-            state["in_red"] = next_in_red
             state["last_plain"] = plain
             state["force_next"] = False
         except Exception:

@@ -1,13 +1,13 @@
 
 from __future__ import annotations
-from typing import Optional, List, Dict, Union
+from typing import Optional, List, Dict, Union, Sequence
 from PySide6 import QtCore, QtGui, QtWidgets
 from PySide6.QtCore import Qt, QSettings, QUrl
 
 import os, sys, time, json, random
 
 # ==========================================================================================
-# Easter Egg system — moved out of settings_tab.py into this standalone module
+# Easter Egg system — standalone module
 # ==========================================================================================
 
 # ---------------------------- Usage tracking (persisted) ----------------------------------
@@ -175,7 +175,7 @@ def _make_dad_face_icon(size: int = 18) -> QtGui.QIcon:
         p.drawEllipse(1, 1, size-2, size-2)
         # glasses
         gpen = QtGui.QPen(QtGui.QColor('#2f2f2f')); gpen.setWidth(2); p.setPen(gpen)
-        r = size//4
+        r = size // 4
         p.drawEllipse(QtCore.QPoint(size//3, size//3), r//2, r//2)
         p.drawEllipse(QtCore.QPoint(2*size//3, size//3), r//2, r//2)
         p.drawLine(size//3 + r//2, size//3, 2*size//3 - r//2, size//3)
@@ -428,96 +428,6 @@ def _dad_joke_popup(parent: Optional[QtWidgets.QWidget] = None) -> None:
         pass
 
 
-# ----------------------------- Easter Eggs registry ---------------------------------------
-EASTER_EGGS: List[Dict] = [
-    {
-        "id": "tetris",
-        "label": "Play Tetris",
-        "icon_fn": lambda: _make_tetris_icon(18),
-        "script": r"helpers\\tetris_game.py",
-        "unlock_seconds": 60 * 60,  # 1 hour
-        "message": "new easter egg unlocked, check settings tab",
-    },
-    {
-        "id": "pong",
-        "label": "Play Pong",
-        "icon_fn": lambda: _make_pong_icon(18),
-        "script": r"helpers\\colorful_pong.py",
-        "unlock_seconds": 60 * 60 * 10,  # 10 hours
-        "message": "way to go, you unlocked another easter egg, check settings tab",
-    },
-    {
-        "id": "framie_snake",
-        "label": "Play Framie Snake",
-        "icon_fn": lambda: _make_snake_icon(18),
-        "script": r"helpers\\Framie_snake.py",
-        "unlock_seconds": 60 * 60 * 6,  # 6 hours
-        "message": "new easter egg unlocked, check settings tab",
-    },
-    # Visible eggs
-    {
-        "id": "dad_joke",
-        "label": "Random Dad Joke",
-        "icon_fn": lambda: _make_dad_face_icon(18),
-        "callback": _dad_joke_popup,
-        "unlock_seconds": 60 * 5,  # 5 minutes
-        "message": "great, first easter egg unlocked, check settings tab !",
-    },
-    {
-        "id": "framebreaker",
-        "label": "FrameBreaker",
-        "icon_fn": lambda: _make_breakout_icon(18),
-        "script": r"helpers\\framebreaker.py",
-        "unlock_seconds": 60 * 60 * 4,  # 4 hours
-        "message": "Great, another easter egg unlocked, check Settings tab !",
-    },
-    {
-        "id": "frameracing",
-        "label": "FrameRacing",
-        "icon_fn": lambda: _make_racecar_icon(18),
-        "script": r"helpers\\frameracers.py",
-        "unlock_seconds": 60 * 60 * 24,  # 24 hours
-        "message": "Great, another easter egg unlocked, check Settings tab !",
-    },
-    # NEW: Donkey Kong Classic (36h)
-    {
-        "id": "dk_classic",
-        "label": "Donkey Kong Classic",
-        "icon_fn": lambda: _make_donkey_kong_icon(18),
-        "scripts": [
-            r"helpers\\DonkeyKongClassic.py",
-            r"helpers\\donkey_kong_classic.py",
-            r"helpers\\donkey_kong.py",
-            r"helpers\\donkeykong.py",
-            r"helpers\\dk_classic.py",
-        ],
-        "unlock_seconds": 60 * 60 * 36,  # 36 hours
-        "message": "Great, another easter egg unlocked, check Settings tab !",
-    },
-]
-
-
-def _check_for_unlocks(total_seconds: Optional[int] = None) -> None:
-    if total_seconds is None:
-        total_seconds = _get_usage_total_seconds()
-    try:
-        for egg in EASTER_EGGS:
-            if _egg_unlocked(egg["id"]):
-                continue
-            if total_seconds >= int(egg.get("unlock_seconds", 0)):
-                _mark_egg_unlocked(egg["id"])
-                _unlock_popup_once(egg["id"], egg.get("message", "New easter egg unlocked!"))
-    except Exception:
-        pass
-
-
-# Start tracking shortly after import so it works even if Settings page is never opened.
-try:
-    QtCore.QTimer.singleShot(1000, ensure_usage_tracker)
-except Exception:
-    pass
-
-
 # ---------------------------- Helpers ------------------------------------------------------
 def _project_root_for_open() -> str:
     return _project_root()
@@ -531,32 +441,34 @@ def _open_file_default_app(abs_path: str) -> None:
     except Exception:
         pass
 
-def _spawn_helper_script(rel_path: Union[str, List[str]]) -> None:
+def _spawn_helper_script(rel_path: Union[str, Sequence[str]]) -> None:
     """
     Launch a helper .py file in a detached process.
-    Accepts a single relative path or a list of candidate relative paths; uses the first that exists.
+    Accepts a single relative path or a list/tuple of candidate relative paths; uses the first that exists.
     """
     try:
         root = _project_root()
-        paths: List[str] = []
+        candidates: List[str] = []
         if isinstance(rel_path, (list, tuple)):
-            paths = list(rel_path)
+            candidates = list(rel_path)
         else:
-            paths = [rel_path]
-        for pth in paths:
-            abs_path = os.path.join(root, pth.replace("\\\\", os.sep).replace("/", os.sep))
+            candidates = [str(rel_path)]
+        for pth in candidates:
+            norm = pth.replace("\\\\", os.sep).replace("/", os.sep)
+            abs_path = os.path.join(root, norm)
             if os.path.isfile(abs_path):
                 py = sys.executable or "python"
                 QtCore.QProcess.startDetached(py, [abs_path])
                 return
         # none found
+        short_list = ", ".join(candidates)
         QtWidgets.QMessageBox.information(None, "Easter egg not found",
-                                          "Could not locate the game script in /helpers/.")
+                                          f"Could not locate: {short_list}\\nLooked in /helpers/.")
     except Exception:
         pass
 
 
-# ---------------------------- Secret Easter Egg (not in menu) -----------------------------
+# ----------------------------- Secret Easter Egg (not in menu) -----------------------------
 class _SecretKeyListener(QtCore.QObject):
     """
     Global key listener: when user types 'editor.py' then presses Enter,
@@ -616,7 +528,101 @@ def install_secret_editor_egg() -> None:
         pass
 
 
-# ---------------------------- Menu creation/injection -------------------------------------
+# ----------------------------- Easter Eggs registry ---------------------------------------
+EASTER_EGGS: List[Dict] = [
+    {
+        "id": "tetris",
+        "label": "Play Tetris",
+        "icon_fn": lambda: _make_tetris_icon(18),
+        "script": r"helpers\\tetris_game.py",
+        "unlock_seconds": 60 * 60,  # 1 hour
+        "message": "new easter egg unlocked, check settings tab",
+    },
+    {
+        "id": "pong",
+        "label": "Play Pong",
+        "icon_fn": lambda: _make_pong_icon(18),
+        "script": r"helpers\\colorful_pong.py",
+        "unlock_seconds": 60 * 60 * 10,  # 10 hours
+        "message": "way to go, you unlocked another easter egg, check settings tab",
+    },
+    {
+        "id": "framie_snake",
+        "label": "Play Framie Snake",
+        "icon_fn": lambda: _make_snake_icon(18),
+        "script": r"helpers\\Framie_snake.py",
+        "unlock_seconds": 60 * 60 * 6,  # 6 hours
+        "message": "new easter egg unlocked, check settings tab",
+    },
+    # Visible eggs
+    {
+        "id": "dad_joke",
+        "label": "Random Dad Joke",
+        "icon_fn": lambda: _make_dad_face_icon(18),
+        "callback": _dad_joke_popup,
+        "unlock_seconds": 60 * 5,  # 5 minutes
+        "message": "Great, You just unlocked your first easter egg, check Settings tab !",
+    },
+    {
+        "id": "framebreaker",
+        "label": "FrameBreaker",
+        "icon_fn": lambda: _make_breakout_icon(18),
+        "script": r"helpers\\framebreaker.py",
+        "unlock_seconds": 60 * 60 * 4,  # 4 hours
+        "message": "Great, another easter egg unlocked, check Settings tab !",
+    },
+    # UPDATED: FrameRacing supports multiple filenames
+    {
+        "id": "frameracing",
+        "label": "FrameRacing",
+        "icon_fn": lambda: _make_racecar_icon(18),
+        "scripts": [
+            r"helpers\\frameracers.py",
+            r"helpers\\frameracing.py",
+            r"helpers\\FrameRacing.py",
+            r"helpers\\FrameRacers.py",
+        ],
+        "unlock_seconds": 60 * 60 * 14,  # 14 hours
+        "message": "Great, another easter egg unlocked, check Settings tab !",
+    },
+    # Donkey Kong Classic (36h)
+    {
+        "id": "dk_classic",
+        "label": "Donkey Kong Classic",
+        "icon_fn": lambda: _make_donkey_kong_icon(18),
+        "scripts": [
+            r"helpers\\DonkeyKongClassic.py",
+            r"helpers\\donkey_kong_classic.py",
+            r"helpers\\donkey_kong.py",
+            r"helpers\\donkeykong.py",
+            r"helpers\\dk_classic.py",
+        ],
+        "unlock_seconds": 60 * 60 * 30,  # 30 hours
+        "message": "Great, another easter egg unlocked, check Settings tab !",
+    },
+]
+
+
+def _check_for_unlocks(total_seconds: Optional[int] = None) -> None:
+    if total_seconds is None:
+        total_seconds = _get_usage_total_seconds()
+    try:
+        for egg in EASTER_EGGS:
+            if _egg_unlocked(egg["id"]):
+                continue
+            if total_seconds >= int(egg.get("unlock_seconds", 0)):
+                _mark_egg_unlocked(egg["id"])
+                _unlock_popup_once(egg["id"], egg.get("message", "New easter egg unlocked!"))
+    except Exception:
+        pass
+
+
+# schedule setup shortly after import
+try:
+    QtCore.QTimer.singleShot(1000, ensure_usage_tracker)
+except Exception:
+    pass
+
 def _populate_easter_menu(menu: QtWidgets.QMenu, parent: QtWidgets.QWidget) -> None:
     try:
         menu.clear()
@@ -636,11 +642,9 @@ def _populate_easter_menu(menu: QtWidgets.QMenu, parent: QtWidgets.QWidget) -> N
             cb = egg.get("callback")
             if callable(cb):
                 act.triggered.connect(lambda _=False, _cb=cb: _cb(parent))
-            elif egg.get("script") or egg.get("scripts"):
+            else:
                 target = egg.get("scripts") or egg.get("script")
                 act.triggered.connect(lambda _=False, t=target: _spawn_helper_script(t))
-            else:
-                act.setEnabled(False)
             menu.addAction(act)
         if not any_added:
             stub = QtGui.QAction("Keep using FrameVision to unlock secrets…", menu)
@@ -651,11 +655,7 @@ def _populate_easter_menu(menu: QtWidgets.QMenu, parent: QtWidgets.QWidget) -> N
 
 
 def install_social_bottom_runtime() -> None:
-    """
-    Injects the 'Easter Eggs' button at the bottom of the Settings content.
-    Looks for a widget with objectName 'FvSettingsContent' (set by settings_tab installer).
-    Safe to call multiple times.
-    """
+    """Injects the Easter Eggs button at the bottom of the Settings content."""
     try:
         app = QtWidgets.QApplication.instance()
         if not app:
@@ -691,7 +691,7 @@ def install_social_bottom_runtime() -> None:
         btn_ee.setMenu(menu)
         h.addWidget(btn_ee)
 
-        # (Optional hidden socials preserved)
+        # Optional hidden socials preserved (not shown)
         btn_gh = QtWidgets.QPushButton("GitHub", row); btn_gh.hide()
         btn_gh.setMinimumWidth(120); btn_gh.setMinimumHeight(24)
         btn_yt = QtWidgets.QPushButton("YouTube", row); btn_yt.hide()
@@ -703,13 +703,13 @@ def install_social_bottom_runtime() -> None:
     except Exception:
         pass
 
-
-# schedule attempts after page builds / app starts
 try:
     QtCore.QTimer.singleShot(800, install_social_bottom_runtime)
 except Exception:
     pass
+
+# Secret egg install
 try:
-    QtCore.QTimer.singleShot(600, install_secret_editor_egg)
+    QtCore.QTimer.singleShot(600, lambda: install_secret_editor_egg())
 except Exception:
     pass

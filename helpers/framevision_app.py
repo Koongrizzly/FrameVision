@@ -128,7 +128,7 @@ def _open_compare_page():
 
 
 
-# FrameVision V1.0.7 — Full-classic UI + NCNN upscalers + branding
+# FrameVision V1.0.6 — Full-classic UI + NCNN upscalers + branding
 # Classic layout (big player, control bar, seek slider, fullscreen) + click-to-play/pause
 # Auto Theme (Day/Evening/Night), Session Restore, Instant Tools, Presets, Describe-on-Pause,
 # Queue + Worker, Models Manager, Upscale Video/Photo buttons (queue) wired to NCNN CLIs.
@@ -263,6 +263,67 @@ ROOT = Path(".").resolve()
 from PySide6.QtWidgets import QSplitter, QSplitterHandle
 from PySide6.QtGui import QPainter, QPen, QBrush, QPixmap, QCursor
 from PySide6.QtCore import QUrl, QPoint
+
+# --- Animated, theme-aware tab-nav button --------------------------------------
+from PySide6.QtCore import Property, QEasingCurve
+from PySide6.QtGui import QColor
+
+class _TabNavButton(QToolButton):
+    def __init__(self, glyph: str, parent=None):
+        super().__init__(parent)
+        self.setText(glyph)
+        self.setCursor(Qt.PointingHandCursor)
+        self.setAutoRaise(True)
+        self.setToolButtonStyle(Qt.ToolButtonTextOnly)
+        self._bg = QColor(0,0,0,0)
+        self._base = self.palette().button().color()
+        # Use the theme highlight for "selected tab" look
+        self._hi = self.palette().highlight().color()
+        # Start transparent so it blends with the tabbar
+        self._anim = QPropertyAnimation(self, b"bgColor", self)
+        self._anim.setDuration(160)
+        self._anim.setEasingCurve(QEasingCurve.InOutCubic)
+        self.setStyleSheet("QToolButton{border-radius:8px;padding:4px 10px;}")
+        self.pressed.connect(self._pulse_in)
+        self.released.connect(self._pulse_out)
+
+    def _pulse_in(self):
+        # animate to highlight
+        try:
+            self._anim.stop()
+            self._anim.setStartValue(self._bg)
+            self._anim.setEndValue(self._hi)
+            self._anim.start()
+        except Exception:
+            pass
+
+    def _pulse_out(self):
+        # animate back to transparent/base
+        try:
+            self._anim.stop()
+            end = QColor(self._base)
+            end.setAlpha(0)
+            self._anim.setStartValue(self._bg)
+            self._anim.setEndValue(end)
+            self._anim.start()
+        except Exception:
+            pass
+
+    def get_bg(self): 
+        return self._bg
+
+    def set_bg(self, c: QColor):
+        try:
+            self._bg = QColor(c)
+            # Apply via stylesheet so it remains theme-friendly.
+            # We don't set any hard-coded colors for text; let the theme/palette handle it.
+            rgba = f"rgba({self._bg.red()},{self._bg.green()},{self._bg.blue()},{self._bg.alpha()})"
+            self.setStyleSheet("QToolButton{border-radius:8px;padding:4px 10px;background:%s;}" % rgba)
+        except Exception:
+            pass
+
+    bgColor = Property(QColor, get_bg, set_bg)
+
 
 def _format_temp_units(celsius_int: int) -> str:
     try:
@@ -957,7 +1018,7 @@ class VideoPane(QWidget):
 
 
         bar.addStretch(1)
-        lay = QVBoxLayout(self); lay.addWidget(self.label,1); self.info_label=QLabel("—"); self.info_label.setObjectName("videoInfo"); f=self.info_label.font(); f.setPointSize(max(10, f.pointSize())); self.info_label.setFont(f); lay.addWidget(self.info_label); lay.addWidget(self.slider); lay.addLayout(bar)
+        lay = QVBoxLayout(self); lay.addWidget(self.label,1); self.info_label=QLabel("—"); self.info_label.setObjectName("videoInfo"); f=self.info_label.font(); f.setPointSize(max(10, f.pointSize())); self.info_label.setFont(f); lay.addWidget(self.info_label); self.time_label=QLabel("—"); self.time_label.setObjectName("videoTime"); self.time_label.setFont(f); lay.addWidget(self.time_label); lay.addWidget(self.slider); lay.addLayout(bar)
         self.btn_open.clicked.connect(self._open_via_dialog, Qt.ConnectionType.UniqueConnection); self.btn_play.clicked.connect(self._toggle_play_pause, Qt.ConnectionType.UniqueConnection)
         # pause button hidden; no click
         self.btn_stop.clicked.connect(self.player.stop, Qt.ConnectionType.UniqueConnection)
@@ -1335,19 +1396,40 @@ class VideoPane(QWidget):
 
     def set_info_text(self, text):
         try:
-            self.info_label.setText(str(text))
+            s = str(text)
+            try:
+                mode = getattr(self, "_mode", None)
+            except Exception:
+                mode = None
+            if mode == 'image':
+                import re as _re
+                s = _re.sub(r"\s*•\s*\d+(?:\.\d+)?\s*fps", "", s, flags=_re.IGNORECASE)
+                s = _re.sub(r"\s*•\s*\d+(?:\.\d+)?\s*s\b", "", s, flags=_re.IGNORECASE)
+                s = _re.sub(r"\s*•\s*•\s*", " • ", s)
+                s = s.strip().strip('•').strip()
+            self.info_label.setText(s)
         except Exception:
             pass
 
     def _update_time_label(self):
         try:
+            # Hide when showing a still image
+            try:
+                if getattr(self, '_mode', None) == 'image':
+                    try:
+                        self.time_label.setText("")
+                    except Exception:
+                        pass
+                    return
+            except Exception:
+                pass
             pos = self.player.position() or 0
             dur = self.player.duration() or 0
             left = max(0, dur - pos)
             pct = int(round((pos / dur) * 100)) if dur else 0
             text = f"{self._fmt_time(pos)} / {self._fmt_time(left)} left" + (f" • {pct}%" if dur else "")
             try:
-                self.info_label.setText(text)
+                self.time_label.setText(text)
             except Exception:
                 pass
             try:
@@ -2969,6 +3051,82 @@ class BackgroundPane(QWidget):
 
 class MainWindow(QMainWindow):
 
+    def _install_tab_nav_arrows(self):
+        """Place left/right tab selectors at the front (before first tab), hide default scroll buttons, and wire smooth theme-aware color transitions."""
+        try:
+            bar = self.tabs.tabBar()
+        except Exception:
+            return
+        try:
+            # Disable the built-in scroll arrows so we can provide our own
+            bar.setUsesScrollButtons(False)
+        except Exception:
+            pass
+        try:
+            # Build a compact container with two animated buttons
+            cont = QWidget(self.tabs)
+            lay = QHBoxLayout(cont)
+            lay.setContentsMargins(6, 0, 6, 0)
+            lay.setSpacing(4)
+            btn_prev = _TabNavButton("‹", cont)  # U+2039
+            btn_next = _TabNavButton("›", cont)  # U+203A
+            # Accessible names for testing/automation
+            btn_prev.setObjectName("tab_nav_prev")
+            btn_next.setObjectName("tab_nav_next")
+            lay.addWidget(btn_prev)
+            lay.addWidget(btn_next)
+            cont.setLayout(lay)
+
+            def _go_prev():
+                try:
+                    i = self.tabs.currentIndex()
+                    n = self.tabs.count()
+                    if n <= 0: 
+                        return
+                    self.tabs.setCurrentIndex(max(0, i - 1))
+                except Exception:
+                    pass
+            def _go_next():
+                try:
+                    i = self.tabs.currentIndex()
+                    n = self.tabs.count()
+                    if n <= 0:
+                        return
+                    self.tabs.setCurrentIndex(min(n - 1, i + 1))
+                except Exception:
+                    pass
+            btn_prev.clicked.connect(_go_prev, Qt.ConnectionType.UniqueConnection)
+            btn_next.clicked.connect(_go_next, Qt.ConnectionType.UniqueConnection)
+
+            # Put them at the very front of the bar (north position assumed)
+            try:
+                self.tabs.setCornerWidget(cont, Qt.TopLeftCorner)
+            except Exception:
+                # Fallback for unusual positions
+                self.tabs.setCornerWidget(cont)
+
+            # Keep arrow enabled/disabled state in sync (optional nicety)
+            def _sync_enabled(_=None):
+                try:
+                    n = self.tabs.count()
+                    i = self.tabs.currentIndex()
+                    btn_prev.setEnabled(bool(n > 0 and i > 0))
+                    btn_next.setEnabled(bool(n > 0 and i < n - 1))
+                except Exception:
+                    pass
+            _sync_enabled()
+            try:
+                self.tabs.tabBar().tabMoved.connect(_sync_enabled)
+            except Exception:
+                pass
+            try:
+                self.tabs.currentChanged.connect(_sync_enabled)
+            except Exception:
+                pass
+        except Exception:
+            pass
+
+
 
     def _restore_active_tab_by_name(self):
             try:
@@ -3046,7 +3204,7 @@ class MainWindow(QMainWindow):
 
     def __init__(self):
         super().__init__()
-        self.setWindowTitle(APP_NAME + " V1.0.7 " + TAGLINE)
+        self.setWindowTitle(APP_NAME + " V1.0.6 " + TAGLINE)
         self.resize(1280, 800)
         self.setMinimumSize(900, 580)
         self.current_path = None
@@ -3058,6 +3216,10 @@ class MainWindow(QMainWindow):
         self.tabs = QTabWidget(self)
         try:
             self.tabs.setObjectName('main_tabs')
+        except Exception:
+            pass
+        try:
+            self._install_tab_nav_arrows()
         except Exception:
             pass
 

@@ -661,8 +661,8 @@ class HybridAnalyzer(QObject):
             self._probe = None
 
         # --- JIT small-window analysis (no full preanalysis) ---
-        self._win_ms = 48000
-        self._preroll_ms = 800
+        self._win_ms = 57000
+        self._preroll_ms = 1800
         self._seg_cache = {}
         self._seg_worker = None
         self._seg_inflight = False

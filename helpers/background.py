@@ -883,7 +883,7 @@ def install_background_tool(pane, section_widget) -> None:
             self._title = title
             self._btn = QPushButton(f"▾  {title}")
             self._btn.setCheckable(True)
-            self._btn.setChecked(True)
+            self._btn.setChecked(False)
             try:
                 self._btn.setCursor(Qt.PointingHandCursor)
                 self._btn.setStyleSheet('QPushButton { font-weight:600; text-align:left; padding:8px 10px; border-radius:10px; }')
@@ -894,6 +894,11 @@ def install_background_tool(pane, section_widget) -> None:
             v.setContentsMargins(0,0,0,0)
             v.addWidget(self._btn)
             v.addWidget(self._body)
+            try:
+                self._body.setVisible(False)
+                self._btn.setText('▸  ' + self._title)
+            except Exception:
+                pass
             self._btn.toggled.connect(self._on_toggled)
         def _on_toggled(self, on: bool):
             self._body.setVisible(bool(on))
@@ -1597,9 +1602,19 @@ def install_background_tool(pane, section_widget) -> None:
         pass
     vbox.addWidget(preview, stretch=3)  # preview gets most of the space
 
+    try:
+        preview.setOverlayOpacity(0.0)
+    except Exception:
+        pass
+
     # Controls panel below
     panel = QWidget()
     lay = QFormLayout(panel)
+    try:
+        lay.setContentsMargins(0, 0, 0, 0)
+        lay.setVerticalSpacing(6)
+    except Exception:
+        pass
     vbox.addWidget(panel, stretch=0)
 
     # ---- Controls ----
@@ -1702,7 +1717,7 @@ def install_background_tool(pane, section_widget) -> None:
         pass
 
     # Mask overlay
-    s_moverlay = QSpinBox(); s_moverlay.setRange(0,100); s_moverlay.setValue(50)
+    s_moverlay = QSpinBox(); s_moverlay.setRange(0,100); s_moverlay.setValue(0)
     try:
         s_moverlay.valueChanged.connect(lambda v: preview.setOverlayOpacity(v/100.0))
         sl_aggr.valueChanged.connect(lambda _: schedule_update())
@@ -1755,14 +1770,9 @@ def install_background_tool(pane, section_widget) -> None:
         pass
     btn_save      = QPushButton("Save")
     btns_row = QHBoxLayout(); btns_row.addWidget(btn_use_current); btns_row.addWidget(btn_load); btns_row.addWidget(btn_recompute); btns_row.addWidget(btn_undo); btns_row.addWidget(btn_reset); btns_row.addWidget(btn_save); btns_row.addStretch(1); btn_sd_inpaint = QPushButton("INPAINT"); btns_row.addWidget(btn_sd_inpaint);    # Combined row: Mask overlay + Shadow Opacity (moved here per request)
-    row_overlay_opacity = QHBoxLayout()
-    row_overlay_opacity.addWidget(QLabel("Mask overlay")); row_overlay_opacity.addWidget(s_moverlay)
-    row_overlay_opacity.addSpacing(12)
-    row_overlay_opacity.addWidget(QLabel("Shadow opacity")); row_overlay_opacity.addWidget(s_salpha)
-    lay.addRow(row_overlay_opacity)
-    lay.addRow("Lock image size", cb_locksize)
-
-    # --- Tooltips (defaults in parentheses) ---
+        # Shadow opacity control remains hidden; overlay shown and combined with Mode/Lock row.
+    # Lock image size now in Mode row with overlay
+# --- Tooltips (defaults in parentheses) ---
     try:
         cmb_engine.setToolTip('Segmentation engine used to compute the mask. Auto picks a working model (default: Auto).')
         cmb_mode.setToolTip('What to output: keep subject, keep background only, or show the alpha mask (default: Keep subject).')
@@ -1828,7 +1838,7 @@ def install_background_tool(pane, section_widget) -> None:
 
     # Layout wire
     # moved below: combined Engine + Model row
-    lay.addRow("Mode",   cmb_mode)
+    # Mode row moved below (combined with Lock image size and Mask overlay)
     # Presets row
     cmb_presets = QComboBox(); btn_preset_save = QPushButton("Save preset"); btn_preset_del = QPushButton("Delete")
     # (moved) presets row combined below steps/seed
@@ -1876,7 +1886,7 @@ def install_background_tool(pane, section_widget) -> None:
     lay.addRow(row_engine_model)
 
     # --- Inpaint controls group ---
-    inpaint_box = CollapsibleBox('inpaint')
+    inpaint_box = CollapsibleBox('inpaint settings')
     inpaint_form = QFormLayout()
     inpaint_box.setContentLayout(inpaint_form)
 
@@ -1910,26 +1920,35 @@ def install_background_tool(pane, section_widget) -> None:
         chk_freeze_unmasked.toggled.connect(lambda v: setattr(Preview, '_ui_flags', {**Preview._ui_flags, 'freeze_unmasked': bool(v)}))
     except Exception:
         pass
-    lay.addRow(inpaint_box)
-
-    # --- Background presets and settings group ---
-    bg_box = CollapsibleBox('background presets and settings')
+    # deferred: lay.addRow(inpaint_box) will be placed after top rows
+# --- Background presets and settings group ---
+    bg_box = CollapsibleBox('background settings')
     bg_form = QFormLayout()
     bg_box.setContentLayout(bg_form)
-    lay.addRow(bg_box)
-
-    # moved to inpaint_box
+    # deferred: lay.addRow(bg_box) will be placed after top rows
+# moved to inpaint_box
     # moved to inpaint_box
     # moved: Steps sits next to Seed
     # moved: Guidance sits with Strength above Output
     # moved: Strength sits with Guidance above Output
     # moved: Seed sits next to Steps
     # moved: Model sits on the Engine row
-    lay.addRow(sd_grp)
-
     # Presets combo + buttons on one line, placed below Steps/Seed
     row_presets = QHBoxLayout(); row_presets.addWidget(cmb_presets); row_presets.addWidget(btn_preset_save); row_presets.addWidget(btn_preset_del)
-    bg_form.addRow("Presets", row_presets)
+    lay.addRow("Presets", row_presets)
+
+    # Combined row: Mode + Lock image size + Mask overlay
+    row_mode = QHBoxLayout()
+    row_mode.addWidget(cmb_mode)
+    row_mode.addSpacing(16)
+    row_mode.addWidget(cb_locksize)
+    row_mode.addSpacing(16)
+    row_mode.addWidget(QLabel("Mask overlay"))
+    row_mode.addWidget(s_moverlay)
+    lay.addRow("Mode", row_mode)
+    lay.addRow("Output", out_row)
+    lay.addRow(inpaint_box)
+    lay.addRow(bg_box)
 
     # hidden: source row (type/seek) removed from UI
     bg_form.addRow("Background", cmb_repl)
@@ -1947,12 +1966,7 @@ def install_background_tool(pane, section_widget) -> None:
     bg_form.addRow(shadow_row)
     vbox.insertLayout(1, btns_row)
     # Move Output path controls directly under the preview (before the main form panel)
-    out_line = QHBoxLayout(); out_line.addWidget(QLabel("Output")); out_line.addLayout(out_row)
-    # moved into inpaint_box
-    vbox.insertLayout(4, out_line)
-
-
-    # Mount into CollapsibleSection
+# Mount into CollapsibleSection
     try:
         section_widget.setContentLayout(vbox)
     except Exception:
@@ -2013,7 +2027,7 @@ def install_background_tool(pane, section_widget) -> None:
         s_sox.setValue(int(d.get("shadow_offx",10))); s_soy.setValue(int(d.get("shadow_offy",10))); cb_ah.setChecked(bool(d.get("anti_halo",True)))
         try: sl_aggr.setValue(int(d.get("bias", 50)))
         except Exception: pass
-        try: s_moverlay.setValue(int(d.get("overlay", 50))); preview.setOverlayOpacity(s_moverlay.value()/100.0)
+        try: s_moverlay.setValue(int(d.get("overlay", 0))); preview.setOverlayOpacity(s_moverlay.value()/100.0)
         except Exception: pass
         try: s_edge.setValue(int(d.get("edge_shift", 0)))
         except Exception: pass
@@ -2056,7 +2070,7 @@ def install_background_tool(pane, section_widget) -> None:
                     drop_shadow=False, shadow_alpha=120, shadow_blur=20, shadow_offx=10, shadow_offy=10, anti_halo=True,
                     sd_prompt="clean background, realistic", sd_negative="blurry, artifacts, distortion, text, watermark",
                     sd_steps=35, sd_guidance=8.5, sd_strength=0.75, sd_seed=-1, sd_model=str(_default_sd15_inpaint_model_path()),
-                sd_auto_bg=True, sd_auto_inpaint=False, sd_freeze_unmasked=True, sd_pad_px=3, sd_protect_px=6, overlay=50, out_dir=str(_get_out_dir_pref()))
+                sd_auto_bg=True, sd_auto_inpaint=False, sd_freeze_unmasked=True, sd_pad_px=3, sd_protect_px=6, overlay=0, out_dir=str(_get_out_dir_pref()))
 
     def _load_presets_list():
             p = _presets_store_path()
@@ -2615,6 +2629,50 @@ def install_background_tool(pane, section_widget) -> None:
             try: btn_sd_inpaint.setEnabled(False)
             except Exception: pass
 
+            
+            # --- Robust mask derivation: if "Freeze unmasked" is ON, always inpaint only the removed background ---
+            _freeze_mask_override = False
+            try:
+                _freeze_mask_override = bool(chk_freeze_unmasked.isChecked())
+            except Exception:
+                try:
+                    _freeze_mask_override = bool(getattr(Preview, '_ui_flags', {}).get('freeze_unmasked', True))
+                except Exception:
+                    _freeze_mask_override = True
+            if _freeze_mask_override and current_alpha is not None:
+                try:
+                    # Rebuild the effective alpha (subject=1, bg=0) including brush edits
+                    a_eff = current_alpha.copy().astype(np.float32)
+                    hh0, ww0 = a_eff.shape[:2]
+                    _rm_tmp, _km_tmp = None, None
+                    try:
+                        _rm_tmp, _km_tmp = preview.export_masks_to_image_size(ww0, hh0)
+                    except Exception:
+                        try:
+                            _rm_tmp = preview.export_mask_to_image_size(ww0, hh0)
+                            _km_tmp = None
+                        except Exception:
+                            _rm_tmp, _km_tmp = None, None
+                    _rm_tmp = _ensure_mask_hw(_rm_tmp, hh0, ww0)
+                    _km_tmp = _ensure_mask_hw(_km_tmp, hh0, ww0)
+                    if _rm_tmp is not None:
+                        a_eff = a_eff * (1.0 - (_rm_tmp > 0.01).astype(a_eff.dtype))
+                    if _km_tmp is not None:
+                        a_eff = np.clip(a_eff + (_km_tmp > 0.01).astype(a_eff.dtype) * (1.0 - a_eff), 0.0, 1.0)
+                    # Convert to background region (white = to fill), respecting invert toggle
+                    _inv3 = False
+                    try:
+                        _inv3 = bool(cb_inv.isChecked())
+                    except Exception:
+                        try:
+                            _inv3 = bool(getattr(Preview, '_ui_flags', {}).get('invert', False))
+                        except Exception:
+                            _inv3 = False
+                    rm_bg = (1.0 - np.clip(a_eff, 0.0, 1.0)) if not _inv3 else np.clip(a_eff, 0.0, 1.0)
+                    rm = rm_bg.astype(np.float32)
+                except Exception:
+                    pass
+    
             rm = (rm > 0.5).astype(np.float32)
             wkr = _InpaintWorker(current_rgb.copy(), rm, _prompt, _neg, _steps, _guid, _stren, _seed, _mpath)
             _inpaint_worker_ref['w'] = wkr

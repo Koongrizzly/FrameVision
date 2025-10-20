@@ -5,9 +5,11 @@ import os, re, subprocess
 from pathlib import Path
 from helpers.meme_tool import MemeToolPane
 from helpers.trim_tool import install_trim_tool
+from helpers.cropper import install_cropper_tool
 from helpers.audiotool import install_audio_tool
 from helpers.prompt import install_prompt_tool
 from helpers.renam import RenamPane
+from helpers.batch import BatchSelectDialog
 
 import re
 
@@ -514,36 +516,12 @@ class InstantToolsPane(QWidget):
         install_trim_tool(self, sec_trim)
 
 
-
-        self.crop_y = QSlider(Qt.Horizontal); self.crop_y.setRange(0,8192); self.lbl_crop_y = QLabel("0")
-        self.crop_h = QSlider(Qt.Horizontal); self.crop_h.setRange(16,8192); self.lbl_crop_h = QLabel("16")
-        self.spin_crop_y = QSpinBox(); self.spin_crop_y.setRange(0,8192); self.spin_crop_y.setValue(0)
-        self.spin_crop_h = QSpinBox(); self.spin_crop_h.setRange(16,8192); self.spin_crop_h.setValue(16)
-        self.crop_y.valueChanged.connect(lambda v: (self.lbl_crop_y.setText(str(v)), self.spin_crop_y.setValue(int(v))))
-        self.crop_h.valueChanged.connect(lambda v: (self.lbl_crop_h.setText(str(v)), self.spin_crop_h.setValue(int(v))))
-        self.spin_crop_y.valueChanged.connect(lambda val: self.crop_y.setValue(int(val)))
-        self.spin_crop_h.valueChanged.connect(lambda val: self.crop_h.setValue(int(val)))
-        # Tooltips
-        self.crop_y.setToolTip("Top offset in pixels for vertical crop.")
-        self.spin_crop_y.setToolTip("Type exact top offset (px).")
-        self.crop_h.setToolTip("Crop height in pixels (vertical crop).")
-        self.spin_crop_h.setToolTip("Type exact crop height (px).")
-
-        self.crop_y.valueChanged.connect(lambda v: self.lbl_crop_y.setText(str(v)))
-        self.crop_h.valueChanged.connect(lambda v: self.lbl_crop_h.setText(str(v)))
-        self.btn_crop = QPushButton("Crop"); self.btn_crop_batch = QPushButton("Batch…"); self.btn_crop_batch.setToolTip("Batch with current Crop settings."); self.btn_crop_batch.setToolTip("Batch Crop using current Y/H values.")
-        lay_crop = QFormLayout(); lay_crop.addRow("Crop Y", self.crop_y); lay_crop.addRow("", self.lbl_crop_y); lay_crop.addRow("Crop H", self.crop_h); lay_crop.addRow("", self.lbl_crop_h); row_cb = QHBoxLayout(); row_cb.addWidget(self.btn_crop); row_cb.addWidget(self.btn_crop_batch); lay_crop.addRow(row_cb)
-        
+        # Crop (moved to helpers/cropper.py)
         try:
-            lay_crop.addRow("Crop Y (type)", self.spin_crop_y)
-            lay_crop.addRow("Crop H (type)", self.spin_crop_h)
+            from helpers.cropper import install_cropper_tool
+            install_cropper_tool(self, sec_crop)
         except Exception:
             pass
-        sec_crop.setContentLayout(lay_crop)
-        row = QHBoxLayout(); btn_sc = QPushButton("Save preset"); btn_lc = QPushButton("Load preset"); row.addWidget(btn_sc); row.addWidget(btn_lc)
-        lay_crop.addRow(row)
-        btn_sc.clicked.connect(lambda: self._save_preset_crop())
-        btn_lc.clicked.connect(lambda: self._load_preset_crop())
 
         for sec in (sec_meme, sec_prompt, sec_audio, sec_speed, sec_resize, sec_gif, sec_extract, sec_trim, sec_crop, sec_quality, sec_img, sec_rename):
             root.addWidget(sec)
@@ -827,11 +805,7 @@ class InstantToolsPane(QWidget):
             if hasattr(self, 'run_trim_batch'):
                 self.btn_trim_batch.clicked.connect(self.run_trim_batch)
         except Exception:
-            pass
-        self.btn_crop.clicked.connect(self.run_crop)
-        self.btn_crop_batch.clicked.connect(self.run_crop_batch)
-
-    # Helpers and actions stay the same as your previous version
+            pass    # Helpers and actions stay the same as your previous version
     
     def _pick_batch_files(self, for_videos=True):
         try:
@@ -975,24 +949,6 @@ class InstantToolsPane(QWidget):
         else:
             cmd=[ffmpeg_path(),"-y"] + (["-ss",start] if start else []) + ["-i",str(inp)] + (["-to",end] if end else []) + ["-c:v","libx264","-preset","veryfast","-c:a","aac","-movflags","+faststart",str(out)]
         self._run(cmd,out)
-
-    def run_crop(self):
-        inp = self._ensure_input();
-        if not inp: return
-        try:
-            inf = probe_media(inp); ih = int(inf.get("height", 0))
-        except Exception:
-            ih = 0
-        y = int(self.crop_y.value()); h = int(self.crop_h.value())
-        if ih:
-            y = max(0, min(y, max(0, ih-1)))
-            h = max(16, min(h, max(16, ih - y)))
-        out = OUT_VIDEOS / f"{inp.stem}_crop_y{y}_h{h}.mp4"
-        filter_str = f"crop=iw:{h}:0:{y}"
-        cmd=[ffmpeg_path(),"-y","-i",str(inp),"-vf",filter_str,"-c:v","libx264","-preset","veryfast","-movflags","+faststart", str(out)]
-        self._run(cmd,out)
-
-
     # ---- Presets helpers ----
     def _preset_dir(self):
         try:
@@ -1137,27 +1093,6 @@ class InstantToolsPane(QWidget):
             QMessageBox.critical(self, "Preset error", str(e))
 
     # ---- Crop ----
-    def _save_preset_crop(self):
-        y = int(self.crop_y.value()); h = int(self.crop_h.value())
-        name = f"crop_y{y}_h{h}_preset.json"
-        p = self._choose_save_path(name)
-        if not p: return
-        data={"tool":"crop","y":y,"h":h}
-        p.write_text(json.dumps(data, indent=2), encoding="utf-8")
-        QMessageBox.information(self, "Preset saved", str(p))
-
-    def _load_preset_crop(self):
-        p = self._choose_open_path()
-        if not p: return
-        try:
-            data = json.loads(p.read_text(encoding="utf-8"))
-            if data.get("tool")!="crop": raise ValueError("Wrong preset type")
-            self.crop_y.setValue(int(data.get("y", self.crop_y.value())))
-            self.crop_h.setValue(int(data.get("h", self.crop_h.value())))
-        except Exception as e:
-            QMessageBox.critical(self, "Preset error", str(e))
-
-
     def _map_preset(self, enc: str, preset_txt: str) -> list[str]:
         # Map generic preset to encoder-specific flags
         p = preset_txt.lower()
@@ -1231,18 +1166,13 @@ class InstantToolsPane(QWidget):
             try: QMessageBox.warning(self, "Quality tool", str(e))
             except Exception: pass
     def run_quality_batch_popup(self):
-        choice = self._ask_files_or_folder("Batch videos")
-        if choice == "files":
-            return self.run_quality_batch()
-        elif choice == "folder":
-            return self.run_quality_batch_folder()
-        return None
-
-
+        # Use the new batch dialog directly
+        return self.run_quality_batch()
 
     def run_quality_batch(self):
-        paths = self._batch_paths_prompt(True, "Batch")
-        if not paths: return
+        paths = self._batch_paths_with_dialog(title="Batch Quality/Size", exts=BatchSelectDialog.VIDEO_EXTS)
+        if not paths:
+            return
         ok = 0
         for p in paths:
             try:
@@ -1251,31 +1181,6 @@ class InstantToolsPane(QWidget):
             except Exception:
                 continue
         try: QMessageBox.information(self, "Batch Quality", f"Queued {ok} item(s).")
-        except Exception: pass
-    def run_quality_batch_folder(self):
-        d = QFileDialog.getExistingDirectory(self, "Pick a folder with videos", "")
-        if not d: 
-            return
-        import os
-        # typical video extensions
-        exts = {".mp4",".mkv",".mov",".webm",".avi",".m4v",".mpg",".mpeg",".ts",".m2ts"}
-        paths = []
-        for name in os.listdir(d):
-            p = Path(d) / name
-            if p.is_file() and p.suffix.lower() in exts:
-                paths.append(str(p))
-        if not paths:
-            try: QMessageBox.information(self, "Batch folder", "No video files were found in that folder.")
-            except Exception: pass
-            return
-        ok = 0
-        for p in paths:
-            try:
-                cmd, out = self._build_quality_cmd_for(p)
-                self._enqueue_cmd_for_input(p, cmd, out); ok += 1
-            except Exception:
-                continue
-        try: QMessageBox.information(self, "Batch folder", f"Queued {ok} file(s).")
         except Exception: pass
 
     def _probe_codecs_and_disable_unavailable(self):
@@ -1382,9 +1287,14 @@ class InstantToolsPane(QWidget):
         files, _ = QFileDialog.getOpenFileNames(self, "Pick videos", "", exts)
         return [str(p) for p in files]
     def _pick_image_files(self):
-        exts = "Images (*.jpg *.jpeg *.png *.webp *.bmp *.tif *.tiff *.gif)"
-        files, _ = QFileDialog.getOpenFileNames(self, "Pick images", "", exts)
-        return [str(p) for p in files]
+        try:
+            files, _ = BatchSelectDialog.pick(self, title="Batch images", exts=getattr(BatchSelectDialog, "IMAGE_EXTS", {'.jpg','.jpeg','.png','.webp','.bmp','.tif','.tiff','.gif'}))
+            return list(files or [])
+        except Exception:
+            # Fallback to native file dialog if the shared dialog isn't available
+            exts = "Images (*.jpg *.jpeg *.png *.webp *.bmp *.tif *.tiff *.gif)"
+            files, _ = QFileDialog.getOpenFileNames(self, "Pick images", "", exts)
+            return [str(p) for p in files]
 
     
     def _estimate_quality_for_target_image(self, inp_path: str, fmt: str, target_bytes: int, mw: int, mh: int) -> int:
@@ -1487,12 +1397,8 @@ class InstantToolsPane(QWidget):
         cmd, out = self._build_image_cmd_for(inp)
         self._run(cmd, out)
     def run_img_batch_popup(self):
-        choice = self._ask_files_or_folder("Batch images")
-        if choice == "files":
-            return self.run_img_batch()
-        elif choice == "folder":
-            return self.run_img_batch_folder()
-        return None
+        # Unified batch: use shared dialog for images
+        return self.run_img_batch()
     def run_img_batch_popup(self):
         choice = self._ask_files_or_folder("Batch images")
         if choice == "files":
@@ -1518,9 +1424,8 @@ class InstantToolsPane(QWidget):
         try: QMessageBox.information(self, "Batch images", f"Queued {ok} image(s).")
         except Exception: pass
     def run_img_batch_folder(self):
-        d = QFileDialog.getExistingDirectory(self, "Pick a folder with images", "")
-        if not d: 
-            return
+        files = self._pick_image_files()
+        return
         import os
         img_exts = {".jpg",".jpeg",".png",".webp",".bmp",".tif",".tiff",".gif"}
         paths = []
@@ -1554,60 +1459,77 @@ class InstantToolsPane(QWidget):
                 except Exception:
                     return False
 
+    def _batch_paths_with_dialog(self, title="Batch", exts=None):
+        """Use the shared BatchSelectDialog to pick files. Returns list of paths (or [])."""
+        try:
+            files, _ = BatchSelectDialog.pick(self, title=title, exts=exts or BatchSelectDialog.VIDEO_EXTS)
+            return list(files or [])
+        except Exception:
+            return []
+    
+
     def run_speed_batch(self):
-        paths = self._batch_paths_prompt(True, "Batch")
+        paths = self._batch_paths_with_dialog(title="Batch Speed", exts=BatchSelectDialog.VIDEO_EXTS)
         if not paths:
             return
         try:
-            if QMessageBox.question(self, "Batch Speed", f"Add {len(paths)} file(s) with current Speed settings to the queue?") != QMessageBox.Yes:
+            if QMessageBox.question(self, "Batch Speed", f"Add {len(paths)} video(s) with current Speed settings to the queue?") != QMessageBox.Yes:
                 return
         except Exception:
             pass
-        # Build per-file
         for p in paths:
             try:
                 from pathlib import Path as _P
                 inp = _P(p)
                 factor = self.speed.value() / 100.0
-                out = (OUT_VIDEOS if 'OUT_VIDEOS' in globals() else _P('.')) / f"{inp.stem}_spd_{factor:.2f}x.mp4"
                 setpts = 1.0 / float(factor if factor != 0 else 1.0)
-                mute = bool(self.cb_speed_mute.isChecked()) if hasattr(self,'cb_speed_mute') else False
-                sync = bool(self.cb_speed_sync.isChecked()) if hasattr(self,'cb_speed_sync') else True
+                mute = bool(self.cb_speed_mute.isChecked()) if hasattr(self, "cb_speed_mute") else False
+                sync = bool(self.cb_speed_sync.isChecked()) if hasattr(self, "cb_speed_sync") else True
+                out = OUT_VIDEOS / f"{inp.stem}_spd_{factor:.2f}x.mp4"
+                cmd = [ffmpeg_path(), "-y", "-i", str(inp), "-vf", f"setpts={setpts:.6f}*PTS"]
                 if mute:
-                    cmd=[ffmpeg_path(),"-y","-i",str(inp),"-an","-vf",f"setpts={setpts}*PTS",str(out)]
+                    cmd += ["-an"]
                 else:
                     if sync:
-                        atempo = factor if factor>=0.5 else 0.5
-                        cmd=[ffmpeg_path(),"-y","-i",str(inp),"-vf",f"setpts={setpts}*PTS","-filter:a",f"atempo={atempo}",str(out)]
+                        atempos = []
+                        f = float(factor)
+                        while f > 2.0:
+                            atempos.append("2.0"); f /= 2.0
+                        while f < 0.5:
+                            atempos.append("0.5"); f *= 2.0
+                        atempos.append(f"{f:.3f}")
+                        cmd += ["-filter:a", "atempo=" + ",".join(atempos)]
                     else:
-                        cmd=[ffmpeg_path(),"-y","-i",str(inp),"-vf",f"setpts={setpts}*PTS",str(out)]
+                        cmd += ["-c:a", "copy", "-shortest"]
+                cmd += ["-c:v", "libx264", "-preset", "veryfast", "-movflags", "+faststart", str(out)]
                 self._enqueue_cmd_for_input(inp, cmd, out)
             except Exception:
                 continue
-        try:
-            QMessageBox.information(self, "Batch Speed", f"Queued {len(paths)} item(s).")
-        except Exception:
-            pass
 
-    
     def run_gif_batch(self):
-        paths = self._pick_batch_files(for_videos=True)
+        paths = self._batch_paths_with_dialog(title="Batch GIF", exts=BatchSelectDialog.VIDEO_EXTS)
         if not paths:
             return
         fmt = self.gif_fmt.currentText().strip().lower() if hasattr(self, "gif_fmt") else "gif"
         for p in paths:
-            inp = Path(p)
-            opts = gif_backend.options_from_ui(self, inp, self.gif_same.isChecked(), int(self.gif_fps.value()) if hasattr(self, "gif_fps") else 0, batch=True)
-            out = OUT_VIDEOS / gif_backend.output_name_for(inp.stem, fmt, batch=True)
-            cmds = gif_backend.build_commands(inp, out, opts, ffmpeg=ffmpeg_path(), work_dir=OUT_TEMP)
-            # enqueue only the first command per spec
-            self._enqueue_cmd_for_input(inp, cmds[0], out)
-    def run_crop_batch(self):
-        paths = self._batch_paths_prompt(True, "Batch")
+            try:
+                inp = Path(p)
+                opts = gif_backend.options_from_ui(self, inp, self.gif_same.isChecked(), int(self.gif_fps.value()) if hasattr(self, "gif_fps") else 0, batch=True)
+                out = OUT_VIDEOS / gif_backend.output_name_for(inp.stem, fmt, batch=True)
+                cmds = gif_backend.build_commands(inp, out, opts, ffmpeg=ffmpeg_path(), work_dir=OUT_TEMP)
+                self._enqueue_cmd_for_input(inp, cmds[0], out)
+            except Exception:
+                continue
+        # Use shared batch picker for videos
+        try:
+            paths, _ = BatchSelectDialog.pick(self, title="Batch Crop", exts=getattr(BatchSelectDialog, "VIDEO_EXTS", {'.mp4','.mov','.mkv','.avi','.m4v','.webm','.ts','.m2ts','.wmv','.flv','.mpg','.mpeg','.3gp','.3g2','.ogv'}))
+        except Exception:
+            paths = []
+        paths = list(paths or [])
         if not paths:
             return
         try:
-            if QMessageBox.question(self, "Batch Crop", f"Add {len(paths)} file(s) with current Crop settings to the queue?") != QMessageBox.Yes:
+            if QMessageBox.question(self, "Batch Crop", f"Add {len(paths)} video(s) with current Crop settings to the queue?") != QMessageBox.Yes:
                 return
         except Exception:
             pass

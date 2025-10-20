@@ -1,4 +1,17 @@
 
+
+def _infer_image_format_from_input(job_args):
+    try:
+        p = str(job_args.get("input_path") or job_args.get("source") or "")
+        suf = Path(p).suffix.lower().lstrip(".")
+        if suf == "jpeg":
+            suf = "jpg"
+        # Allow common still formats
+        if suf in ("jpg","png","webp","bmp","tif","tiff"):
+            return "tiff" if suf == "tif" else suf
+    except Exception:
+        pass
+    return None
 # FrameVision worker V1.0.6 — NCNN wiring
 import json, time, subprocess, os, re, shutil
 from pathlib import Path
@@ -680,7 +693,7 @@ def tools_ffmpeg(job, cfg, mani):
 def upscale_photo(job, cfg, mani):
     print("[worker] upscale_photo: start", job.get("input"))
     inp = Path(job["input"]); out_dir = Path(job["out_dir"]); out_dir.mkdir(parents=True, exist_ok=True)
-    factor = int(job["args"].get("factor", 4)); fmt = (job["args"].get("format") or "png").lower()
+    factor = int(job["args"].get("factor", 4)); fmt = (job["args"].get("format") or _infer_image_format_from_input(job["args"]) or "png").lower()
     model_name = job["args"].get("model","RealESRGAN-x4plus")
     model_name, exe_path = resolve_upscaler_exe(cfg, mani, model_name)
     out = out_dir / f"{inp.stem}_x{factor}.{fmt}"
@@ -817,7 +830,7 @@ def txt2img_generate(job, cfg, mani):
         cfg_scale= float(args.get("cfg_scale") or 7.5)
         sampler  = (args.get("sampler") or "").strip().lower()
         attn_slice = bool(args.get("attn_slicing"))
-        fmt      = (args.get("format") or "png").lower()
+        fmt = (args.get("format") or _infer_image_format_from_input(args) or "png").lower()
         name_tmpl= args.get("filename_template") or f"sd_{{seed}}_{{idx:03d}}.{fmt}"
 
         ROOT = P(__file__).resolve().parent.parent

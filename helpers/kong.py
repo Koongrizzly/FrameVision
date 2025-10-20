@@ -37,10 +37,10 @@ FPS = 60
 
 GRAVITY = 0.50
 PLAYER_SPEED = 3.2
-PLAYER_JUMP_VELOCITY = -10.0
+PLAYER_JUMP_VELOCITY = -10.5
 BARREL_BASE_SPEED = 2.0
 BARREL_SPAWN_INTERVAL = 2.2  # seconds at level 1 (scales down with level)
-BARREL_RADIUS = 22  # visual radius of barrel body (thumbnail sits inside)
+BARREL_RADIUS = 14  # visual radius of barrel body (thumbnail sits inside)
 
 FONT_NAME = "freesansbold.ttf"  # bundled with pygame
 
@@ -66,8 +66,9 @@ THUMBS_DIR  = ROOT / "presets" / "setsave" / "thumbs" / "kong"
 # Assets directory for custom player sprite
 ASSETS_DIR = ROOT / "assets"
 PLAYER_SPRITE_PATH = ASSETS_DIR / "player1.png"
+# User-provided transparent PNG for custom player sprite
 # --- Sound assets ------------------------------------------------------------------------------
-POP_WAV_PATH = ASSETS_DIR / "reward.mp3"           # reward sound
+POP_MP3_PATH = ASSETS_DIR / "reward.mp3"           # reward sound
 HURT_MP3_PATH = ASSETS_DIR / "hurt.mp3"         # player hit by barrel
 GAME_OVER_MP3_PATH = ASSETS_DIR / "game_over.mp3"  # game over sound
 
@@ -88,7 +89,7 @@ class SFX:
             self.enabled = False
 
         if self.enabled:
-            self._load("reward", POP_WAV_PATH)
+            self._load("reward", POP_MP3_PATH)
             self._load("hurt", HURT_MP3_PATH)
             self._load("game_over", GAME_OVER_MP3_PATH)
 
@@ -131,8 +132,7 @@ class SFX:
 
     def toggle(self):
         self.set_muted(not self.muted)
-   # user-provided transparent PNG
-
+   
 # Reward logo config
 REWARD_W, REWARD_H = 100, 60
 REWARD_RADIUS = 16
@@ -432,7 +432,7 @@ def build_level(level: int) -> Tuple[List[Platform], List[Ladder]]:
 # --- Entities -----------------------------------------------------------------------------------
 class Player:
     def __init__(self, x: float, y: float, sprite: Optional[pygame.Surface] = None):
-        self.w = 50
+        self.w = 60
         self.h = 70
         self.x = x
         self.y = y
@@ -611,7 +611,23 @@ class Player:
             prev_bottom = self.rect.bottom - self.vy
             for p in sorted(platforms, key=lambda p: p.y):
                 if self.jumping and self.jump_lock_y is not None and p.y != self.jump_lock_y:
-                    continue
+
+                    ys_desc = sorted([pl.y for pl in platforms], reverse=True)
+
+                    ladder_exception = False
+
+                    if len(ys_desc) >= 2 and self.jump_lock_y == ys_desc[0] and p.y == ys_desc[1]:
+
+                        for lad in ladders:
+
+                            if lad.y_bottom == p.y and self.rect.colliderect(lad.interact_rect):
+
+                                ladder_exception = True
+
+                                break
+
+                    if not ladder_exception:
+                        continue
                 px1 = min(p.x1, p.x2)
                 px2 = max(p.x1, p.x2)
                 if self.rect.centerx >= px1 and self.rect.centerx <= px2:
@@ -659,6 +675,9 @@ class Barrel:
         self.y = y
         self.spawn_dir = random.choice([-1, 1])
         self.vx = self.spawn_dir * (BARREL_BASE_SPEED * level_speed_mul)
+        # Capture constant roll speed and normalize initial vx
+        self.roll_speed = abs(self.vx) if abs(self.vx) > 0 else 1.2
+        self.vx = (1 if self.vx >= 0 else -1) * self.roll_speed
         self.vy = 0.0
         self.radius = BARREL_RADIUS
         self.spin = random.uniform(-5, 5)
@@ -684,10 +703,10 @@ class Barrel:
         
         if self.x - self.radius < 0:
             self.x = self.radius
-            self.vx = abs(self.vx)
+            self.vx = self.roll_speed
         if self.x + self.radius > WIDTH:
             self.x = WIDTH - self.radius
-            self.vx = -abs(self.vx)
+            self.vx = -self.roll_speed
 
         sorted_plats = sorted(platforms, key=lambda p: p.y)
 
@@ -723,12 +742,12 @@ class Barrel:
                     self.y = plat_y - self.radius
                     self.vy = 0.0
                     self.on_platform_index = tgt_i
-                    speed = max(1.2, abs(self.vx) or 1.2)
+                    speed = self.roll_speed
                     if not self._first_snap_done:
                         self.vx = speed * (self.spawn_dir or 1)
                         self._first_snap_done = True
                     else:
-                        self.vx = math.copysign(speed, target.slope_dir)
+                        self.vx = math.copysign(self.roll_speed, target.slope_dir)
                     self.drop_target_index = None
                     self.drop_target_y = None
                     snapped = True
@@ -743,12 +762,12 @@ class Barrel:
                         self.y = plat_y - self.radius
                         self.vy = 0.0
                         self.on_platform_index = i
-                        speed = max(1.2, abs(self.vx))
+                        speed = self.roll_speed
                         if not self._first_snap_done:
                             self.vx = speed * (self.spawn_dir or 1)
                             self._first_snap_done = True
                         else:
-                            self.vx = math.copysign(speed, p.slope_dir)
+                            self.vx = math.copysign(self.roll_speed, p.slope_dir)
                         break
 
         if self.on_platform_index is not None and self.drop_cooldown == 0.0:
@@ -858,9 +877,14 @@ def load_scores() -> List[dict]:
 
 def save_scores(scores: List[dict]):
     ensure_dirs()
+    # Enforce Top 10 by score (desc)
     try:
-        SAVE_PATH.write_text(json.dumps(scores, indent=2), encoding="utf-8")
-    except Exception as e:
+        pruned = sorted(scores, key=lambda e: int(e.get("score", 0)), reverse=True)[:10]
+    except Exception:
+        pruned = scores[:10]
+    try:
+        SAVE_PATH.write_text(json.dumps(pruned, indent=2), encoding="utf-8")
+    except Exception:
         pass
 
 
@@ -879,13 +903,15 @@ def qualifies_top_n(score: int, n: int = 10) -> bool:
     return int(score) >= threshold
 def add_high_score(score: int, name: str = PLAYER_NAME):
     scores = load_scores()
+    # Only add if this score qualifies for the Top 10
+    if not qualifies_top_n(score, 10):
+        return
     entry = {
         "date": datetime.now().strftime("%Y-%m-%d %H:%M"),
         "score": int(score),
         "name": str(name)
     }
     scores.append(entry)
-    # keep only latest 100 by date
     save_scores(scores)
 
 
@@ -987,10 +1013,33 @@ class Game:
         b = Barrel(self.monkey.x + 10, self.monkey.y + 10, self.level_speed_mul, self.sticker_surface)
         self.barrels.append(b)
     def handle_collisions(self, dt: float):
+        # Ignore collisions from barrels that are clearly on a *higher* floor while the player is mid-jump.
+        def _barrel_is_on_higher_floor_than_player_during_jump(player, barrel) -> bool:
+            if not getattr(player, "jumping", False):
+                return False
+            player_floor_y = getattr(player, "jump_lock_y", None)
+            if player_floor_y is None:
+                player_floor_y = getattr(player, "last_platform_y", None)
+            if player_floor_y is None:
+                return False
+            barrel_floor_y = None
+            try:
+                if getattr(barrel, "on_platform_index", None) is not None:
+                    sorted_plats = sorted(self.platforms, key=lambda p: p.y)
+                    idx = barrel.on_platform_index
+                    if 0 <= idx < len(sorted_plats):
+                        barrel_floor_y = sorted_plats[idx].y
+            except Exception:
+                barrel_floor_y = None
+            if barrel_floor_y is None:
+                return False
+            return barrel_floor_y < player_floor_y
+
         for b in list(self.barrels):
             if self.player.rect.colliderect(b.rect):
+                if _barrel_is_on_higher_floor_than_player_during_jump(self.player, b):
+                    continue
                 if self.player.invuln_time <= 0:
-                    # Play hurt sound on valid hit
                     if hasattr(self, 'sfx'): self.sfx.play('hurt')
                     self.lives -= 1
                     self.player.invuln_time = 2.0
@@ -1122,7 +1171,7 @@ class Game:
                 if qualifies_top_n(self.score, 10):
                     self.open_overlay("enter_name")
                 else:
-                    add_high_score(self.score, PLAYER_NAME)
+                    self.open_overlay("scores")
                 self.gameover_checked = True
             return
 
@@ -1166,9 +1215,17 @@ class Game:
         self.handle_collisions(dt)
 
         if self.player.rect.colliderect(self.goal_rect):
-            self.player.vx = 0.0
-            self.player.vy = 0.0
-            self.start_reward_animation()
+            # Only collect the reward when the player is actually on the TOP floor.
+            # If the player hits the reward while jumping from a lower floor, ignore it.
+            goal_floor_y = self.platforms[-1].y
+            current_floor_y = (
+                self.player.jump_lock_y if self.player.jumping else self.player.last_platform_y
+            )
+            if current_floor_y == goal_floor_y:
+                self.player.vx = 0.0
+                self.player.vy = 0.0
+                self.start_reward_animation()
+
 
     def draw_hud(self):
         info = f"Level {self.level}   Score {self.score}   Lives {self.lives}"

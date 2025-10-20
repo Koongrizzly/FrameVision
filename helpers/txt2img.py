@@ -125,6 +125,7 @@ def _record_result(job, out_dir, status: dict):
         "negative": job.get("negative",""),
         "seed": job.get("seed", 0),
         "seed_policy": job.get("seed_policy","fixed"),
+        "preset": job.get("preset"),
         "batch": job.get("batch",1),
         "files": status.get("files", []),
         "created_at": time.time(),
@@ -209,6 +210,24 @@ class Txt2ImgPane(QWidget):
 
     def _apply_settings_from_dict(self, s: dict):
             """Apply saved settings dict to the UI (best-effort) without triggering autosave."""
+            # Restore preset selection (UI only; block signals to avoid reapplying values)
+            try:
+                if hasattr(self, 'preset_combo') and isinstance(s, dict):
+                    _pv = s.get('preset') or s.get('preset_label') or s.get('preset_name')
+                    if _pv:
+                        try:
+                            self.preset_combo.blockSignals(True)
+                        except Exception:
+                            pass
+                        _pi = self.preset_combo.findText(str(_pv))
+                        if _pi >= 0:
+                            self.preset_combo.setCurrentIndex(_pi)
+                        try:
+                            self.preset_combo.blockSignals(False)
+                        except Exception:
+                            pass
+            except Exception:
+                pass
             try:
                 func = globals().get('_t2i_apply_from_dict')
                 if callable(func):
@@ -600,7 +619,7 @@ class Txt2ImgPane(QWidget):
 
         # Prompts
         form = QFormLayout()
-        self.prompt = QTextEdit(); self.prompt.setPlaceholderText("Describe the image you want…"); self.prompt.setFixedHeight(64)
+        self.prompt = QTextEdit(); self.prompt.setPlaceholderText("Describe the image you want…"); self.prompt.setFixedHeight(124)
         self.negative = QTextEdit(); self.negative.setPlaceholderText("What to avoid (optional)…"); self.negative.setFixedHeight(48)
         form.addRow("Prompt", self.prompt)
         form.addRow("Negative", self.negative)
@@ -1229,6 +1248,8 @@ class Txt2ImgPane(QWidget):
             "width": int(w_ui),
             "height": int(h_ui),
 
+            "preset": (self.preset_combo.currentText() if hasattr(self, "preset_combo") else ""),
+            "preset_index": (int(self.preset_combo.currentIndex()) if hasattr(self, "preset_combo") else -1),
             "a1111_url": self._a1111_url_removed.text().strip() if hasattr(self, "_a1111_url_removed") else "http://127.0.0.1:7860",
                     }
         # Persist settings
@@ -1428,6 +1449,11 @@ class Txt2ImgPane(QWidget):
         except Exception: pass
         try: d["qwen_cli_template"] = self._qwen_cli_template_removed.text().strip()
         except Exception: pass
+        try: d["preset"] = self.preset_combo.currentText()
+        except Exception: pass
+        try: d["preset_index"] = int(self.preset_combo.currentIndex())
+        except Exception: pass
+
         return d
 
     def _autosave_now(self):
@@ -1445,6 +1471,7 @@ class Txt2ImgPane(QWidget):
                 pass
         connect_sig(self.prompt, 'textChanged')
         connect_sig(self.negative, 'textChanged')
+        connect_sig(self.preset_combo, 'currentIndexChanged')
         for obj, sig in [
             (self.seed, 'valueChanged'),
             (self.seed_policy, 'currentIndexChanged'),
