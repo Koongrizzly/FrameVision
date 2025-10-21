@@ -1026,7 +1026,7 @@ def handle_job(jpath: Path):
         return 1
 
 def main():
-    print("FrameVision Worker V1.0.6 Watching for jobs/pending in", JOBS["pending"])
+    print("FrameVision Worker V1.0.7 Watching for jobs/pending in", JOBS["pending"])
     while True:
         try:
             HEARTBEAT.write_text(time.strftime("%Y-%m-%d %H:%M:%S"), encoding="utf-8")
