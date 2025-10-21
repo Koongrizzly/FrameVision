@@ -582,14 +582,19 @@ class UpdateDialog(QDialog):
         self._backup_worker.start()
 
 
+    
     def _on_manual_check(self):
+
         """
-        Manual update check: probes GitHub now and shows the same popup as the daily checker.
-        If nothing is new, it shows a small 'No updates yet' message.
+        Manual check via ZIP: download default branch ZIP, extract to /temp/downloads/,
+        compare by exact file size against APP_ROOT, show a selectable list, then clean up temp.
         """
         self._append("Starting manual update check…")
         try:
             from helpers import update_checker as uc
+            import zipfile, shutil, time
+            from PySide6.QtWidgets import QDialog, QVBoxLayout, QHBoxLayout, QLabel, QListWidget, QListWidgetItem, QPushButton, QSpacerItem, QSizePolicy, QMessageBox
+            from PySide6.QtCore import Qt
         except Exception as e:
             self._append(f"Update checker not available: {e}")
             QMessageBox.warning(self, "Manual check", "helpers.update_checker could not be imported.")
@@ -598,48 +603,167 @@ class UpdateDialog(QDialog):
         owner = getattr(uc, "GITHUB_OWNER", None) or globals().get("GITHUB_OWNER", "Koongrizzly")
         repo  = getattr(uc, "GITHUB_REPO",  None) or globals().get("GITHUB_REPO",  "FrameVision")
 
-        # Run non-blocking probe
-        self._append("Contacting GitHub…")
-        self._manual_probe = uc._ProbeWorker(self, owner, repo)
+        # Prepare temp folder
+        app_root = APP_ROOT
+        temp_root = app_root / "temp" / "downloads"
+        try:
+            shutil.rmtree(temp_root, ignore_errors=True)
+            temp_root.mkdir(parents=True, exist_ok=True)
+        except Exception as e:
+            self._append(f"Cannot prepare temp folder: {e}")
+            QMessageBox.warning(self, "Manual check", f"Cannot prepare temp folder: {e}")
+            return
 
-        def _done(out: dict):
-            # Persist diagnostics for consistency (do not touch the daily gate)
+        # Determine default branch
+        try:
+            branch = uc._get_default_branch(owner, repo) or "main"
+        except Exception:
+            branch = "main"
+
+        # Download ZIP
+        try:
+            self._append("downloading newest files")
+            zip_url = f"https://codeload.github.com/{owner}/{repo}/zip/refs/heads/{branch}"
+            data = uc._http_bytes(zip_url, timeout=90)
+            zip_path = temp_root / "repo.zip"
+            zip_path.write_bytes(data)
+        except Exception as e:
+            self._append(f"Download failed: {e}")
+            QMessageBox.warning(self, "Manual check", f"Download failed: {e}")
+            return
+
+        # Extract ZIP
+        try:
+            self._append("extracting to temp folder")
+            with zipfile.ZipFile(zip_path, "r") as zf:
+                zf.extractall(temp_root)
+            # Pick the single extracted top dir
+            subdirs = [p for p in temp_root.iterdir() if p.is_dir()]
+            if not subdirs:
+                raise RuntimeError("Zip did not contain a root directory.")
+            src_root = max(subdirs, key=lambda p: p.stat().st_mtime)
+        except Exception as e:
+            self._append(f"Extract failed: {e}")
+            QMessageBox.warning(self, "Manual check", f"Extract failed: {e}")
+            return
+
+        # Build candidate list by size difference (or new files)
+        self._append("comparing files")
+        def should_skip(rel: str) -> bool:
+            rl = rel.lower()
+            if rl == "config.json":
+                return True
+            skip_prefixes = (
+                ".git/", ".github/", "temp/", "tools/", "models/",
+                "output/", ".venv/", "presets/setsave/"
+            )
+            return any(rl.startswith(p) for p in skip_prefixes)
+
+        candidates = []
+        for pth in src_root.rglob("*"):
+            if not pth.is_file():
+                continue
+            rel = pth.relative_to(src_root).as_posix()
+            if should_skip(rel):
+                continue
+            dst = app_root / rel
+            sst = pth.stat()
+            if not dst.exists():
+                candidates.append((rel, pth, dst, True, int(sst.st_size), float(sst.st_mtime), None, None))
+            else:
+                dst_st = dst.stat()
+                if int(sst.st_size) != int(dst_st.st_size):
+                    candidates.append((rel, pth, dst, False, int(sst.st_size), float(sst.st_mtime), int(dst_st.st_size), float(dst_st.st_mtime)))
+
+        self._append(f"found {len(candidates)} newer files")
+
+        if not candidates:
+            QMessageBox.information(self, "No updates", "No updates yet.")
             try:
-                st = uc._load_state()
-                st["last_result"] = out
-                uc._save_state(st)
+                shutil.rmtree(temp_root, ignore_errors=True)
             except Exception:
                 pass
+            return
 
-            # Decide what to show
-            has_release = bool(out.get("has_release"))
-            tag = out.get("release_tag")
-            try:
-                if has_release and tag and uc.get_ack_release_tag() == tag:
-                    has_release = False
-            except Exception:
-                pass
-            beta_hint = bool(out.get("beta_hint"))
+        # Selection dialog allowing copy
+        class ZipCompareDialog(QDialog):
+            def __init__(self, parent, items, src_root, app_root, temp_root):
+                super().__init__(parent)
+                self.items = items
+                self.src_root = src_root
+                self.app_root = app_root
+                self.temp_root = temp_root
+                self.setWindowTitle("Manual check — copy newer files")
+                self.resize(820, 560)
 
-            if has_release or beta_hint:
-                self._append("Updates available — showing popup.")
-                try:
-                    uc._show_updates_popup(self, out)
-                except Exception as e:
-                    self._append(f"Popup failed: {e}")
+                self.info = QLabel("Select files to copy from the downloaded archive. New = file missing locally; Changed = size differs.")
+                self.info.setWordWrap(True)
+                self.list = QListWidget(self)
+
+                for rel, src, dst, is_new, ssz, sm, dsz, dm in self.items:
+                    label = f"{rel}  " + ("(NEW)" if is_new else "(CHANGED)")
+                    if dsz is not None:
+                        label += f"   local {int(dsz)} B → remote {int(ssz)} B"
+                    else:
+                        label += f"   remote {int(ssz)} B"
+                    it = QListWidgetItem(label)
+                    it.setCheckState(Qt.Checked)
+                    it.setData(Qt.UserRole, rel)
+                    self.list.addItem(it)
+
+                top = QHBoxLayout()
+                self.btn_all = QPushButton("Select All")
+                self.btn_none = QPushButton("Select None")
+                self.btn_apply = QPushButton("Copy Selected")
+                self.btn_close = QPushButton("Close")
+                top.addWidget(self.btn_all)
+                top.addWidget(self.btn_none)
+                top.addItem(QSpacerItem(10,10,QSizePolicy.Expanding,QSizePolicy.Minimum))
+                top.addWidget(self.btn_apply)
+                top.addWidget(self.btn_close)
+
+                lay = QVBoxLayout(self)
+                lay.addWidget(self.info)
+                lay.addLayout(top)
+                lay.addWidget(self.list, 1)
+
+                self.btn_all.clicked.connect(lambda: self._set_all(True))
+                self.btn_none.clicked.connect(lambda: self._set_all(False))
+                self.btn_close.clicked.connect(self.reject)
+                self.btn_apply.clicked.connect(self._apply)
+
+            def _set_all(self, on: bool):
+                for i in range(self.list.count()):
+                    self.list.item(i).setCheckState(Qt.Checked if on else Qt.Unchecked)
+
+            def _apply(self):
+                copied = 0
+                for i in range(self.list.count()):
+                    it = self.list.item(i)
+                    if it.checkState() != Qt.Checked:
+                        continue
+                    rel = it.data(Qt.UserRole)
+                    src = self.src_root / rel
+                    dst = self.app_root / rel
+                    dst.parent.mkdir(parents=True, exist_ok=True)
+                    shutil.copy2(src, dst)
+                    copied += 1
                     try:
-                        uc._open_release_updater(self)
+                        parent._append(f"Copied {rel}")
                     except Exception:
                         pass
-            else:
-                self._append("No updates found.")
-                QMessageBox.information(self, "No updates", "No updates yet.")
+                QMessageBox.information(self, "Manual check", f"Copied {copied} file(s).")
+                self.accept()
 
-            self._manual_probe = None
+            def closeEvent(self, ev):
+                try:
+                    shutil.rmtree(self.temp_root, ignore_errors=True)
+                except Exception:
+                    pass
+                super().closeEvent(ev)
 
-        self._manual_probe.result.connect(_done)
-        self._manual_probe.start()
-
+        dlg = ZipCompareDialog(self, candidates, src_root, app_root, temp_root)
+        dlg.exec()
 
     def _on_update(self, source: str, mode: str):
         assert source in ("release", "branch")
