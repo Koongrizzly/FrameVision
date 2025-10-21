@@ -1,8 +1,17 @@
 #!/usr/bin/env python3
-# Colorful Pong — Last-Hit Power-Ups + friendly tokens (v1.3.0)
+# Colorful Pong — Last-Hit Power-Ups + friendly tokens (v1.3.3)
 # Buttons always visible; help/high-scores overlays pause/resume with ESC;
 # high scores saved to ./presets/setsave/; F11 & double-click top bar = maximize;
 # level label lowered below pause button.
+#
+# v1.3.3 changes:
+# - Removed paddle trails (clean paddle rendering).
+# - Only balls can collect points and power-ups; paddles no longer pick them up.
+#
+# v1.3.2 changes:
+# - Add left/right movement for player, clamped to midline (A/D or Left/Right).
+# - Fix indentation so AI block doesn't throw IndentationError.
+# - Help overlay updated for new controls.
 #
 # v1.3.0 changes:
 # - Ball slightly smaller
@@ -368,7 +377,7 @@ def main():
             pass
 
 
-    player_trail=Trail(18); ai_trail=Trail(18); particles=[]; textfx=TextFX(mid); bigfx=BigPopupFX(big, small)
+    player_trail=Trail(0); ai_trail=Trail(0); particles=[]; textfx=TextFX(mid); bigfx=BigPopupFX(big, small)
 
     player_score=0; ai_score=0; level=1; ai_speed=AI_BASE_SPEED; shake=0.0
     # Track goals since last level so level-ups are based ONLY on goals, not bonus points
@@ -613,6 +622,16 @@ def main():
                 if keys[pygame.K_w] or keys[pygame.K_UP]: move-=1
                 if keys[pygame.K_s] or keys[pygame.K_DOWN]: move+=1
                 player.y+=int(move*420*dt); player.y=max(10,min(HEIGHT-player.h-10,player.y))
+                # Horizontal movement (player can move left/right up to the middle)
+                move_x = 0
+                if keys[pygame.K_a] or keys[pygame.K_LEFT]: move_x -= 1
+                if keys[pygame.K_d] or keys[pygame.K_RIGHT]: move_x += 1
+                player.x += int(move_x * 420 * dt)
+                min_x = 10
+                # Keep a small margin from the dashed midline (which is 6px wide centered at WIDTH//2)
+                max_x = (WIDTH//2 - 8) - player.w
+                if player.x < min_x: player.x = min_x
+                if player.x > max_x: player.x = max_x
                 target_y=min(balls,key=lambda b:abs(b["rect"].centerx-ai.centerx))["rect"].centery if balls else HEIGHT//2
                 ai_aim_timer -= dt
                 if ai_aim_timer <= 0.0:
@@ -658,7 +677,7 @@ def main():
                     if right_shield and b["vx"]>0 and b["rect"].colliderect(right_shield): b["rect"].right=right_shield.left; b["vx"]*=-1
                     if b["rect"].top<=0: b["rect"].top=0; b["vy"]*=-1
                     if b["rect"].bottom>=HEIGHT: b["rect"].bottom=HEIGHT; b["vy"]*=-1
-                    if b["vx"]<0 and b["rect"].colliderect(player):
+                    if b["rect"].colliderect(player):
                         offset=(b["rect"].centery-player.centery)/(player.h/2)
                         sm_mult = 1.18 if effects.get("player_hardsmack",0.0)>0.0 else 1.0
                         b["vx"]=abs(b["vx"])*(HIT_SPEED_MULT*sm_mult); vy_term=(HIT_VY_BASE+HIT_VY_PER_LEVEL*level)*sm_mult
@@ -678,8 +697,6 @@ def main():
                         collected=True; owner=b["last"] or ("player" if b["vx"]<0 else "ai"); break
                     bx,by=b["rect"].center; cx,cy=powerup.rect.center
                     if (bx-cx)**2+(by-cy)**2 <= POWERUP_SIZE**2: collected=True; owner=b["last"] or ("player" if b["vx"]<0 else "ai"); break
-                if not collected and player.colliderect(pick_rect): collected=True; owner="player"
-                if not collected and ai.colliderect(pick_rect): collected=True; owner="ai"
                 if collected:
                     kind=powerup.kind; award(kind, owner)
                     for _ in range(36): particles.append(Particle(powerup.rect.centerx, powerup.rect.centery, powerup.color))
@@ -691,8 +708,6 @@ def main():
                 for b in balls:
                     if b["rect"].colliderect(pick_rect) or segment_intersects_rect(b["prev"], b["rect"].center, pick_rect):
                         collected=True; owner=b["last"] or ("player" if b["vx"]<0 else "ai"); break
-                if not collected and player.colliderect(pick_rect): collected=True; owner="player"
-                if not collected and ai.colliderect(pick_rect): collected=True; owner="ai"
                 if collected:
                     val = point_token.value
                     if owner=="player":

@@ -1,14 +1,83 @@
 # helpers/menu_file.py
-from __future__ import annotations
 import os, shutil, json
 from pathlib import Path
 
-from PySide6.QtCore import QProcess, QSettings, QUrl
-from PySide6.QtGui import QAction, QIcon
-from PySide6.QtWidgets import (
-    QMenuBar, QMenu, QFileDialog, QMessageBox, QWidget, QPushButton, QApplication, QInputDialog
-)
+from PySide6.QtCore import QEvent, QObject, QProcess, QSettings, QUrl, Qt, QPoint
+from PySide6.QtGui import QAction, QIcon, QCursor
+from PySide6.QtWidgets import QMenuBar, QMenu, QFileDialog, QMessageBox, QWidget, QPushButton, QApplication, QInputDialog
 from PySide6.QtGui import QDesktopServices
+
+# --- Right-clickable menu subclass -----------------------------------------
+class _RemovableMenu(QMenu):
+    def __init__(self, title, parent=None, remove_fn=None, repopulate_cb=None):
+        super().__init__(title, parent)
+        self._remove_fn = remove_fn
+        self._repopulate_cb = repopulate_cb
+        self._last_hovered = None
+        try:
+            self.hovered.connect(self._on_hovered)
+        except Exception:
+            pass
+
+    def _on_hovered(self, action):
+        self._last_hovered = action
+
+    def _action_at_pos(self, pos):
+        act = None
+        try:
+            act = self.actionAt(pos)
+        except Exception:
+            act = None
+        if not act:
+            act = self._last_hovered
+        return act
+
+    def _show_remove_menu(self, global_pos, path:str):
+        ctx = QMenu(self)
+        rm = QAction("Remove from list", ctx)
+        def _do_remove():
+            try:
+                if self._remove_fn: self._remove_fn(path)
+            finally:
+                try:
+                    if self._repopulate_cb: self._repopulate_cb()
+                except Exception:
+                    pass
+        rm.triggered.connect(_do_remove)
+        ctx.addAction(rm)
+        if hasattr(ctx, "exec"):
+            ctx.exec(global_pos)
+        else:
+            ctx.popup(global_pos)
+
+    def contextMenuEvent(self, event):
+        try:
+            act = self._action_at_pos(event.pos())
+            if act and hasattr(act, "data") and act.data():
+                self._show_remove_menu(event.globalPos(), str(act.data()))
+                event.accept()
+                return
+        except Exception:
+            pass
+        try:
+            super().contextMenuEvent(event)
+        except Exception:
+            pass
+
+    def mousePressEvent(self, event):
+        try:
+            if hasattr(event, "button") and event.button() == Qt.RightButton:
+                act = self._action_at_pos(event.pos())
+                if act and hasattr(act, "data") and act.data():
+                    self._show_remove_menu(self.mapToGlobal(event.pos()), str(act.data()))
+                    event.accept()
+                    return
+        except Exception:
+            pass
+        try:
+            super().mousePressEvent(event)
+        except Exception:
+            pass
 
 ORG="FrameVision"; APP="FrameVision"
 
@@ -139,6 +208,13 @@ def _remove_favorite(path: str):
     fav=_load_list(FAV_KEY); path=str(Path(path))
     if path in fav:
         fav.remove(path); _save_list(FAV_KEY, fav)
+
+
+def _remove_recent(path: str):
+    rec = _load_list(RECENT_KEY); path = str(Path(path))
+    if path in rec:
+        rec.remove(path)
+        _save_list(RECENT_KEY, rec)
 
 def _set_last_closed(path: str):
     try:
@@ -546,53 +622,112 @@ def _add(menu: QMenu, text: str, slot, shortcut: str | None = None, checkable: b
     menu.addAction(act)
     return act
 
+
+
+# --- Dynamic (re)population for Recent & Favorites ----------------------------
+def _populate_recent_menu(menu: QMenu, main_window):
+    try:
+        menu.clear()
+        recent = _load_list(RECENT_KEY)
+        if not recent:
+            dummy = QAction("(Empty)", menu); dummy.setEnabled(False); menu.addAction(dummy)
+        else:
+            for path in recent:
+                act = QAction(_icon_for_path(path), path, menu)
+                try:
+                    act.setData(path)
+                except Exception:
+                    pass
+                act.triggered.connect(lambda checked=False, p=path: (_open_in_player(main_window, p) and _remember_recent(p)))
+                menu.addAction(act)
+        menu.addSeparator()
+        clear_act = QAction("Clear Recent List", menu)
+        def _clr():
+            _save_list(RECENT_KEY, [])
+            QMessageBox.information(main_window, "Recent Files", "Recent list cleared.")
+        clear_act.triggered.connect(_clr)
+        menu.addAction(clear_act)
+        try:
+            _attach_right_click_remove(menu, _remove_recent, lambda: _populate_recent_menu(menu, main_window), main_window)
+        except Exception:
+            pass
+    except Exception:
+        pass
+
+def _populate_favorites_menu(menu: QMenu, main_window):
+    try:
+        menu.clear()
+        # Pin/Unpin
+        pin_act = QAction("Pin Current File", menu)
+        def _pin():
+            p = _current_input_path(main_window)
+            if not p:
+                QMessageBox.information(main_window, "Favorites", "No file to pin."); return
+            _remember_favorite(p); QMessageBox.information(main_window, "Favorites", "Pinned.")
+        pin_act.triggered.connect(_pin); menu.addAction(pin_act)
+
+        # Unpin when applicable
+        try:
+            cur = _current_input_path(main_window) or ""
+            fav_list = _load_list(FAV_KEY)
+            if cur and cur in fav_list:
+                unpin_act = QAction("Unpin Current File", menu)
+                unpin_act.triggered.connect(lambda: (_remove_favorite(cur), QMessageBox.information(main_window, "Favorites", "Unpinned.")))
+                menu.addAction(unpin_act)
+        except Exception:
+            pass
+
+        # List as submenu to match existing UI
+        fav = _RemovableMenu("Open Favorite", menu, remove_fn=_remove_favorite, repopulate_cb=lambda: _populate_favorites_menu(menu, main_window))
+        menu.addMenu(fav)
+        try:
+            _attach_right_click_remove(fav, _remove_favorite, lambda: _populate_favorites_menu(menu, main_window), main_window)
+        except Exception:
+            pass
+        fav_list = _load_list(FAV_KEY)
+        if not fav_list:
+            dummy = QAction("(Empty)", fav); dummy.setEnabled(False); fav.addAction(dummy)
+        else:
+            for path in fav_list:
+                act = QAction(_icon_for_path(path), path, fav)
+                try:
+                    act.setData(path)
+                except Exception:
+                    pass
+                act.triggered.connect(lambda checked=False, p=path: (_open_in_player(main_window, p) and _remember_recent(p)))
+                fav.addAction(act)
+
+        menu.addSeparator()
+        clear_act = QAction("Clear Favorites", menu)
+        def _clr():
+            _save_list(FAV_KEY, [])
+            QMessageBox.information(main_window, "Favorites", "Favorites cleared.")
+        clear_act.triggered.connect(_clr); menu.addAction(clear_act)
+        try:
+            _attach_right_click_remove(menu, _remove_recent, lambda: _populate_recent_menu(menu, main_window), main_window)
+        except Exception:
+            pass
+    except Exception:
+        pass
+
 def _build_recent_menu(file_menu: QMenu, main_window):
-    recent_menu=file_menu.addMenu("Recent Files")
-    recent = _load_list(RECENT_KEY)
-    if not recent:
-        dummy=QAction("(Empty)", recent_menu); dummy.setEnabled(False); recent_menu.addAction(dummy)
-    else:
-        for path in recent:
-            act=QAction(_icon_for_path(path), path, recent_menu)
-            act.triggered.connect(lambda checked=False, p=path: (_open_in_player(main_window, p) and _remember_recent(p)))
-            recent_menu.addAction(act)
-    recent_menu.addSeparator()
-    clear_act=QAction("Clear Recent List", recent_menu)
-    def _clr():
-        _save_list(RECENT_KEY, [])
-        QMessageBox.information(main_window,"Recent Files","Recent list cleared.")
-    clear_act.triggered.connect(_clr)
-    recent_menu.addAction(clear_act)
-    return recent_menu
+    menu = _RemovableMenu("Recent Files", file_menu, remove_fn=_remove_recent, repopulate_cb=lambda: _populate_recent_menu(menu, main_window))
+    file_menu.addMenu(menu)
+    try:
+        menu.aboutToShow.connect(lambda: _populate_recent_menu(menu, main_window))
+    except Exception:
+        pass
+    _populate_recent_menu(menu, main_window)  # initial fill so it isn't blank before opening
+    return menu
 
 def _build_favorites_menu(file_menu: QMenu, main_window):
-    fav_menu=file_menu.addMenu("Favorites")
-    cur=_current_input_path(main_window)
-    pin_act=QAction("Pin Current File", fav_menu)
-    def _pin():
-        p=_current_input_path(main_window)
-        if not p:
-            QMessageBox.information(main_window,"Favorites","No file to pin."); return
-        _remember_favorite(p); QMessageBox.information(main_window,"Favorites","Pinned.")
-    pin_act.triggered.connect(_pin); fav_menu.addAction(pin_act)
-
-    fav=fav_menu.addMenu("Open Favorite")
-    fav_list=_load_list(FAV_KEY)
-    if not fav_list:
-        dummy=QAction("(Empty)", fav); dummy.setEnabled(False); fav.addAction(dummy)
-    else:
-        for path in fav_list:
-            act=QAction(_icon_for_path(path), path, fav)
-            act.triggered.connect(lambda checked=False, p=path: (_open_in_player(main_window, p) and _remember_recent(p)))
-            fav.addAction(act)
-
-    fav_menu.addSeparator()
-    clear_act=QAction("Clear Favorites", fav_menu)
-    def _clr():
-        _save_list(FAV_KEY, [])
-        QMessageBox.information(main_window,"Favorites","Favorites cleared.")
-    clear_act.triggered.connect(_clr); fav_menu.addAction(clear_act)
-    return fav_menu
+    menu = file_menu.addMenu("Favorites")
+    try:
+        menu.aboutToShow.connect(lambda: _populate_favorites_menu(menu, main_window))
+    except Exception:
+        pass
+    _populate_favorites_menu(menu, main_window)  # initial fill so it isn't blank before opening
+    return menu
 
 def _open_containing_folder(main_window):
     p=_current_input_path(main_window)
@@ -611,7 +746,55 @@ def _reopen_last_closed(main_window):
 
 # ------------------------------- Public entry -------------------------------
 
+
+
+# --- Recents Watcher (menu-only, safe) ----------------------------------------
+def _start_recents_watcher(main_window):
+    """Start a lightweight watcher that mirrors the currently loaded media into
+    Recents using _current_input_path(main_window). No changes to the player.
+    """
+    try:
+        from PySide6.QtCore import QTimer
+    except Exception:
+        return
+    try:
+        # Only start once per window
+        if getattr(main_window, "__recents_watcher", None):
+            return
+        t = QTimer(main_window)
+        t.setInterval(1000)  # 1s
+        last_key = "__recents_last_seen"
+        def _tick():
+            try:
+                cur = _current_input_path(main_window)
+                if not cur:
+                    return
+                prev = getattr(main_window, last_key, None)
+                if cur != prev:
+                    setattr(main_window, last_key, cur)
+                    try:
+                        _remember_recent(cur)
+                    except Exception:
+                        pass
+                    try:
+                        s = QSettings(ORG, APP)
+                        s.setValue("last_open_file", cur)
+                    except Exception:
+                        pass
+            except Exception:
+                pass
+        t.timeout.connect(_tick)
+        t.start()
+        setattr(main_window, "__recents_watcher", t)
+    except Exception:
+        pass
+
 def install_file_menu(main_window):
+    # Start Recents watcher (menu-only, safe)
+    try:
+        _start_recents_watcher(main_window)
+    except Exception:
+        pass
     if main_window is None: return
     try:
         mb=getattr(main_window,"menuBar",None)

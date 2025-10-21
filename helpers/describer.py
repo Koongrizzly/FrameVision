@@ -189,6 +189,13 @@ class DescriberWidget(QWidget):
         self.btn_describe = QPushButton("Describe")
         self.btn_desc_folder = QPushButton("Describe folder...")
         self.btn_use_current = QPushButton("Use current frame")
+        # HIDE per user request
+        try:
+            self.btn_use_current.setVisible(False)
+            self.btn_use_current.setMaximumWidth(0)
+            self.btn_use_current.setMaximumHeight(0)
+        except Exception:
+            pass
         act_row.addWidget(self.btn_describe); act_row.addWidget(self.btn_desc_folder); act_row.addWidget(self.btn_use_current)
         lay.addWidget(act_box)
 
@@ -564,7 +571,7 @@ class DescriberWidget(QWidget):
     def _describe_clicked(self) -> None:
         img = self.txt_image.text().strip()
         if not img or not Path(img).exists():
-            self.output.setPlainText("Please choose a valid image path or use current frame.")
+            self.output.setPlainText("Please choose a valid image path.")
             return
         try:
             text = self._run_inference(Path(img))
@@ -727,6 +734,13 @@ else:
     # ---------- Presets ----------
     _PRESETS = [
         "General (detail-based)",
+        "SDXL — Faithful reproduction",
+        "SDXL — Photoreal portrait",
+        "SDXL — Product studio",
+        "Txt→Video — Cinematic shot (4–6s)",
+        "Txt→Video — Seamless loop (2–3s)",
+        "Img→Video — Subtle motion (preserve look)",
+        "Img→Video — Action burst (2–4s)",
         "Literal caption (6–12 words)",
         "Photo prompt (SDXL-style tags)",
         "Cinematic still",
@@ -792,6 +806,122 @@ else:
         if preset == "Food styling":
             return ("Describe the food scene: dish type, ingredients, textures, garnishes, plating, props, surface, lighting (soft/hard, direction), "
                     "and mood. No imagined flavors or claims.")
+
+
+        if preset == "SDXL — Faithful reproduction":
+            neg = ""
+            try:
+                neg = (self.negative.text() or "").strip()
+            except Exception:
+                neg = ""
+            tail = f" Avoid: {neg}." if neg else ""
+            # Respect Detail length
+            rng = "30–60"
+            if detail == "Short":
+                rng = "18–26"
+            elif detail == "Medium":
+                rng = "28–44"
+            else:
+                rng = "45–70"
+            return ("You are writing a prompt for SDXL to faithfully reproduce the given image. "
+                    "Describe only what is clearly visible and measurable: primary subject(s), pose, clothing/materials, colors/palette, "
+                    "background/setting, time of day, lighting style and direction, composition/framing, and lens/camera look (e.g., 35mm wide or 85mm portrait). "
+                    f"Return one natural-language prompt ({rng} words). Avoid inventing objects, brands, names, or stories." + tail)
+
+        if preset == "SDXL — Photoreal portrait":
+            neg = ""
+            try:
+                neg = (self.negative.text() or "").strip()
+            except Exception:
+                neg = ""
+            tail = f" Avoid: {neg}." if neg else ""
+            rng = "24–44"
+            if detail == "Short":
+                rng = "18–28"
+            elif detail == "Medium":
+                rng = "24–44"
+            else:
+                rng = "40–60"
+            return ("Write a photoreal portrait prompt for SDXL that matches the visible person without guessing identity or age: "
+                    "angle (e.g., 3/4 view), facial features as seen, skin texture, hair style, clothing fabric, background type and palette, "
+                    "lighting (key/fill/rim; soft/hard), and lens look (e.g., 85mm shallow DOF). "
+                    f"One natural sentence ({rng} words)." + tail)
+
+        if preset == "SDXL — Product studio":
+            neg = ""
+            try:
+                neg = (self.negative.text() or "").strip()
+            except Exception:
+                neg = ""
+            tail = f" Avoid: {neg}." if neg else ""
+            rng = "20–35"
+            if detail == "Short":
+                rng = "15–24"
+            elif detail == "Medium":
+                rng = "20–35"
+            else:
+                rng = "35–55"
+            return ("Write a product-studio SDXL prompt that reproduces this item: object type, material/finish, surface detail, color, condition, "
+                    "camera angle, shadows/reflections, background (white or neutral), and soft studio lighting. "
+                    f"No brands unless readable. {rng} words." + tail)
+
+        if preset == "Txt→Video — Cinematic shot (4–6s)":
+            neg = ""
+            try:
+                neg = (self.negative.text() or "").strip()
+            except Exception:
+                neg = ""
+            tail = f" Avoid: {neg}." if neg else ""
+            rng = "18–28"
+            if detail == "Short":
+                rng = "14–20"
+            elif detail == "Medium":
+                rng = "18–28"
+            else:
+                rng = "24–34"
+            return ("From this image, write one present‑tense sentence for a short continuous cinematic shot (4–6s): "
+                    "subject action implied by the still, environment, ONE camera move (e.g., slow dolly in), lighting/mood, and tone. "
+                    f"{rng} words." + tail)
+
+        if preset == "Txt→Video — Seamless loop (2–3s)":
+            neg = ""
+            try:
+                neg = (self.negative.text() or "").strip()
+            except Exception:
+                neg = ""
+            tail = f" Avoid: {neg}." if neg else ""
+            rng = "14–22"
+            if detail == "Short":
+                rng = "12–18"
+            elif detail == "Medium":
+                rng = "14–22"
+            else:
+                rng = "18–26"
+            return ("From this image, write one present‑tense sentence for a seamless loop (2–3s): "
+                    "describe a cyclic motion that begins and ends on the same pose/framing with a steady camera. "
+                    f"{rng} words." + tail)
+
+        if preset == "Img→Video — Subtle motion (preserve look)":
+            bullets = 5
+            if detail == "Short":
+                bullets = 4
+            elif detail == "Long":
+                bullets = 6
+            return (f"Based strictly on what is visible in the image, write exactly {bullets} bullet lines (start each with a hyphen). "
+                    "Each bullet must describe a tiny motion of a specific visible element (e.g., hair strand, fabric edge, reflection, foliage), "
+                    "plus one micro camera move. Do NOT write instructions or steps, and never mention software, importing, applying effects, or editing. "
+                    "Keep identity, composition, and palette unchanged. Only the bullets, no numbering, no preamble.")
+
+        if preset == "Img→Video — Action burst (2–4s)":
+            bullets = 6
+            if detail == "Short":
+                bullets = 5
+            elif detail == "Long":
+                bullets = 7
+            return (f"From the visible content, write exactly {bullets} bullet lines (start with a hyphen). "
+                    "Describe a small dynamic action of the main subject, one complementary secondary motion, one clear camera move, motion intensity, "
+                    "a precise end pose or frame to stabilize/loop, and one constraint that must not change. "
+                    "Do NOT give how‑to steps or mention software/effects. Only bullets, no numbering or extra text.")
         return "Describe this image clearly with key visible subjects, attributes, setting, lighting, and composition."
 
     def _fv_adjust_gen_for_preset(preset: str, gk: dict) -> dict:
@@ -1079,7 +1209,7 @@ else:
                 if vid is not None and hasattr(vid, "currentFrame"): vid.currentFrame = None
             except Exception: pass
         if not p or not _Path(p).exists():
-            try: self.output.setPlainText("Please choose a valid image path or use current frame.")
+            try: self.output.setPlainText("Please choose a valid image path.")
             except Exception: pass
             return
         if getattr(self, "_fv_busy", False):
