@@ -285,6 +285,15 @@ from PySide6.QtWidgets import QPushButton, QFileDialog, QPlainTextEdit, QSpacerI
 GITHUB_OWNER = "Koongrizzly"
 GITHUB_REPO = "FrameVision"
 
+
+# Files that should NEVER be updated by the updater (excluded from copy/compare)
+SKIP_UPDATER_PATHS = (
+    "presets.json",
+    "presets/info/update_state.json",
+)
+SKIP_UPDATER_SET = {p.lower() for p in SKIP_UPDATER_PATHS}
+
+
 def _http_get_bytes(url: str, headers: dict | None = None, timeout: int = 30) -> bytes:
     req = Request(url, headers=headers or {})
     with urlopen(req, timeout=timeout) as r:
@@ -346,6 +355,9 @@ def _extract_selected(zpath: Path, dest_root: Path, mode: str):
             if len(parts) < 2:
                 continue
             rel = Path(*parts[1:])  # drop the top-level folder GitHub adds
+            rel_posix = rel.as_posix().lower()
+            if rel_posix in SKIP_UPDATER_SET:
+                continue
             if mode == "partial":
                 if not (
                     (len(rel.parts) >= 1 and rel.parts[0] == "helpers") or
@@ -475,7 +487,7 @@ class UpdateDialog(QDialog):
         btn_rel_full    = QPushButton("Replace with release", self)
         btn_beta_partial= QPushButton("Update python files only", self)
         btn_beta_full   = QPushButton("Update all files", self)
-        btn_cancel      = QPushButton("Cancel", self)
+        btn_close      = QPushButton("Close", self)
         btn_manual      = QPushButton("Manual check", self)
 
         btn_backup.clicked.connect(self._on_backup)
@@ -483,7 +495,7 @@ class UpdateDialog(QDialog):
         btn_rel_full.clicked.connect(lambda: self._on_update('release','full'))
         btn_beta_partial.clicked.connect(lambda: self._on_update('branch','partial'))
         btn_beta_full.clicked.connect(lambda: self._on_update('branch','full'))
-        btn_cancel.clicked.connect(self.reject)
+        btn_close.clicked.connect(self.reject)
         btn_manual.clicked.connect(self._on_manual_check)
 
         v = QVBoxLayout(self)
@@ -552,7 +564,7 @@ class UpdateDialog(QDialog):
         row3.addWidget(btn_backup)
         row3.addWidget(btn_manual)
         row3.addItem(QSpacerItem(10, 10, QSizePolicy.Expanding, QSizePolicy.Minimum))
-        row3.addWidget(btn_cancel)
+        row3.addWidget(btn_close)
         v.addLayout(row3)
 
     def _append(self, msg: str):
@@ -651,6 +663,8 @@ class UpdateDialog(QDialog):
         self._append("comparing files")
         def should_skip(rel: str) -> bool:
             rl = rel.lower()
+            if rl in SKIP_UPDATER_SET:
+                return True
             if rl == "config.json":
                 return True
             skip_prefixes = (
