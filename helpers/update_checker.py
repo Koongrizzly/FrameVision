@@ -373,6 +373,36 @@ class BetaDialog(QDialog):
 def _today_str() -> str:
     return date.today().isoformat()
 
+def _show_no_updates_toast(parent=None, text: str = " No new updates", msec: int = 5000):
+    """Show a small non-modal popup that auto-closes after `msec` milliseconds."""
+    try:
+        box = QMessageBox(parent)
+        box.setWindowTitle("Up to date")
+        box.setIcon(QMessageBox.Information)
+        box.setText(text)
+        # No buttons; closes automatically.
+        box.setStandardButtons(QMessageBox.NoButton)
+        # Non-blocking / non-modal so it doesn't steal focus.
+        try:
+            box.setWindowModality(Qt.NonModal)
+        except Exception:
+            pass
+        try:
+            box.setAttribute(Qt.WA_ShowWithoutActivating, True)
+        except Exception:
+            pass
+        try:
+            # Make it a tool window so it floats above without taskbar button.
+            box.setWindowFlag(Qt.Tool, True)
+        except Exception:
+            pass
+        box.show()
+        QTimer.singleShot(msec, box.close)
+    except Exception:
+        # Silently ignore toast errors to avoid breaking startup.
+        pass
+
+
 def _show_updates_popup(parent, result: dict):
     has_release = bool(result.get("has_release"))
     tag = result.get("release_tag")
@@ -382,6 +412,7 @@ def _show_updates_popup(parent, result: dict):
     beta_hint = bool(result.get("beta_hint"))
 
     if not (has_release or beta_hint):
+        _show_no_updates_toast(parent)
         return
 
     lines = []
