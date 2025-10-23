@@ -367,20 +367,54 @@ def url_overrides_for(family: str, cli_url: Optional[str]) -> List[str]:
 
 # --------------------------- Families ---------------------------
 def pull_qwen2_vl_2b(base: Path) -> None:
-    if snapshot_download is None:
-        log("huggingface_hub not available, skipping Qwen.")
-        return
-    dest = base / "describe" / "default" / "qwen2-vl-2b-instruct"
-    log(f"pulling Qwen/Qwen2-VL-2B-Instruct -> {dest.parent}")
-    snapshot_download(
-        repo_id="Qwen/Qwen2-VL-2B-Instruct",
-        local_dir=str(dest),
-        local_dir_use_symlinks=False,
-        resume_download=True,
-        allow_patterns=["*.json","*.safetensors","*.bin","*.model","*.txt","*.tiktoken","*.py","LICENSE*","*.md"],
-        ignore_patterns=["**/raw/**","**/.git/**"]
-    )
-    log("Qwen2-VL-2B ready.")
+    """Deprecated: replaced by pull_qwen3_vl_2b. No action taken."""
+    log("Qwen2 downloader is deprecated; using Qwen3 instead.")
+    return None
+
+def pull_qwen3_vl_2b(base: Path) -> None:
+    """
+    Download Qwen3-VL-2B-Instruct into models/describe/default/qwen3vl2b.
+    Prefers huggingface_hub.snapshot_download when available, otherwise falls back to:
+        huggingface-cli download Qwen/Qwen3-VL-2B-Instruct --local-dir <dest> --resume-download
+    """
+    dest = base / "describe" / "default" / "qwen3vl2b"
+    log(f"pulling Qwen/Qwen3-VL-2B-Instruct -> {dest}")
+    try:
+        dest.mkdir(parents=True, exist_ok=True)
+    except Exception:
+        pass
+
+    used = None
+    # Try Python API first if available
+    try:
+        if snapshot_download is not None:
+            snapshot_download(
+                repo_id="Qwen/Qwen3-VL-2B-Instruct",
+                local_dir=str(dest),
+                local_dir_use_symlinks=False,
+                resume_download=True,
+                allow_patterns=["*.json","*.safetensors","*.bin","*.model","*.txt","*.tiktoken","*.py","LICENSE*","*.md"],
+                ignore_patterns=["**/raw/**","**/.git/**"]
+            )
+            used = "hub"
+    except Exception as e:
+        log(f"Qwen3 snapshot_download failed ({e}); will try huggingface-cli.")
+
+    if used is None:
+        # Fallback to huggingface-cli (as requested)
+        import shutil as _sh, subprocess as _sp
+        cli = _sh.which("huggingface-cli") or _sh.which("hf")
+        if not cli:
+            log("huggingface-cli not found; skipping Qwen3-VL-2B fetch.")
+            return
+        cmd = [cli, "download", "Qwen/Qwen3-VL-2B-Instruct", "--local-dir", str(dest), "--resume-download"]
+        try:
+            _sp.run(cmd, check=True)
+        except Exception as e:
+            log(f"huggingface-cli download failed: {e}")
+            return
+
+    log("Qwen3-VL-2B ready.")
 
 def install_family(owner: str, repo: str, family: str, fixed_candidates: list[str] | None = None, manual_url: Optional[str]=None) -> bool:
     # 0) Try local zips
@@ -758,7 +792,7 @@ def main(argv=None):
     ])
 
     if do_all or args.describe_only:
-        try: pull_qwen2_vl_2b(MODELS)
+        try: pull_qwen3_vl_2b(MODELS)
         except Exception as e: log(f"Qwen error: {e}")
 
     if do_all or args.realesrgan_only:
