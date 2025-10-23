@@ -21,6 +21,17 @@ except Exception:
 SET_PATH = ROOT / "presets" / "setsave" / "prompt.json"
 SET_PATH.parent.mkdir(parents=True, exist_ok=True)
 
+# --- Qwen3-VL 2B local model support ---
+QWEN3_LOCAL_KEY = "__local_qwen3vl2b__"
+
+def _qwen3_local_folder() -> Path:
+    # Expected path per user: models\describe\default\qwen3vl2b (relative to app root)
+    try:
+        base = ROOT
+    except Exception:
+        base = Path(".").resolve()
+    return (base / "models" / "describe" / "default" / "qwen3vl2b").resolve()
+
 DEFAULT_STYLE = ""
 DEFAULT_TEMPLATE_BASE = (
     "Expand the seed into one vivid, {length_words} single-sentence prompt for text-to-{target}. "
@@ -345,21 +356,33 @@ def _save_settings(data:Dict[str, Any])->None:
         pass
 
 # ---------- Model discovery & generation ----------
+
 def _list_qwen_vl_models() -> List[Tuple[str,str]]:
+    """
+    Discover available Qwen-VL models, including the new local Qwen3‑VL 2B folder
+    at models/describe/default/qwen3vl2b.
+    """
+    out: List[Tuple[str, str]] = []
+    # Prefer the new local Qwen3‑VL 2B if present
+    try:
+        q3 = _qwen3_local_folder()
+        if q3.exists() and any(q3.iterdir()):
+            out.append((QWEN3_LOCAL_KEY, "Qwen3-VL 2B (local)"))
+    except Exception:
+        pass
+    # Also include any engines from helpers.describer / describer catalog
     try:
         try:
             import helpers.describer as D  # type: ignore
         except Exception:
             import describer as D  # type: ignore
-    except Exception:
-        return []
-    out = []
-    try:
         cat = getattr(D, "ENGINE_CATALOG", {})
         for k, meta in cat.items():
-            if str(meta.get("type","")).lower() in ("hf_qwen2vl","hf_qwen2_vl","qwen2vl","qwen_vl"):
+            t = str(meta.get("type","")).lower()
+            if t in ("hf_qwen3vl","hf_qwen3_vl","qwen3vl","qwen3_vl","hf_qwen2vl","hf_qwen2_vl","qwen2vl","qwen_vl"):
                 label = meta.get("label", k)
-                out.append((k, label))
+                if (k, label) not in out:
+                    out.append((k, label))
     except Exception:
         pass
     return out

@@ -245,7 +245,7 @@ def _tool_ready_status(models_dir: str) -> Dict[str, Optional[str]]:
 
     # Qwen2 (image model path)
     qwen = _exists_any([
-        os.path.join(models_dir, "describe", "default", "qwen2-vl-2b-instruct"),
+        os.path.join(models_dir, "describe", "default", "qwen3vl2b"),
     ])
 
     # RIFE (models tree + presets\bin + externals + root/bin)
@@ -316,10 +316,10 @@ def _tool_ready_status(models_dir: str) -> Dict[str, Optional[str]]:
             if has_models:
                 upscayl = base
 
-    return {"FFmpeg": ff, "Qwen2-VL 2B": qwen, "RIFE": rife, "Real-ESRGAN": realsr, "Waifu2x": waifu, "UpScayl": upscayl}
+    return {"FFmpeg": ff, "Qwen3-VL 2B": qwen, "RIFE": rife, "Real-ESRGAN": realsr, "Waifu2x": waifu, "UpScayl": upscayl}
 
 def _tools_line(status: Dict[str, Optional[str]]) -> str:
-    order = ["FFmpeg","Qwen2-VL 2B","RIFE","Real-ESRGAN","Waifu2x","UpScayl"]
+    order = ["FFmpeg","Qwen3-VL 2B","RIFE","Real-ESRGAN","Waifu2x","UpScayl"]
     parts = []
     for name in order:
         ok = bool(status.get(name))
@@ -539,7 +539,7 @@ class SysMonPanel(QWidget):
         self._tools_status = _tool_ready_status(paths["models"])
         self.lbl_tools = QLabel(" " + _tools_line(self._tools_status))
         self.lbl_tools.setTextFormat(Qt.PlainText)
-        self.lbl_tools.setToolTip("Checks FFmpeg, Qwen2-VL (describe), RIFE, Real-ESRGAN, Waifu2x, UpScayl(er)")
+        self.lbl_tools.setToolTip("Checks FFmpeg, Qwen3-VL (describe), RIFE, Real-ESRGAN, Waifu2x, UpScayl(er)")
 
         self._bg_status = _bg_models_status(paths["models"]) 
         self.lbl_bg = QLabel(" " + _bg_models_line(self._bg_status))

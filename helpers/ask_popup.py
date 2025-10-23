@@ -10,6 +10,8 @@ from PySide6.QtWidgets import (
     QDialog, QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton, QPlainTextEdit,
     QCheckBox, QSpinBox, QDoubleSpinBox, QLabel as _QLabel, QApplication, QInputDialog, QRubberBand, QInputDialog, QRubberBand, QComboBox, QMenu, QFileDialog
 )
+from transformers import AutoProcessor
+from transformers import TextIteratorStreamer
 
 # === Model path (offline) ===
 
@@ -81,7 +83,7 @@ def _gguf_ram_hint(path: str, ctx: int = 4096) -> str:
     except Exception:
         return "unknown"
 
-MODELS_FOLDER = Path(".").resolve() / "models" / "describe" / "default" / "qwen2-vl-2b-instruct"
+MODELS_FOLDER = Path(".").resolve() / "models" / "describe" / "default" / "qwen3vl2b"
 
 # === Singletons to avoid VRAM growth ===
 _GLOBAL = {"device": None, "dtype": None, "processor": None, "model": None}
@@ -150,31 +152,78 @@ def _qimage_to_pil(img: QImage):
         return pil.convert("RGB")
 
 
+
 def _ensure_model_loaded():
     if _GLOBAL["model"] is not None and _GLOBAL["processor"] is not None:
         return
     device, dtype = _choose_device()
     _GLOBAL["device"], _GLOBAL["dtype"] = device, dtype
-    from transformers import AutoProcessor, Qwen2VLForConditionalGeneration
+
+    # Ensure local model exists
     if not (MODELS_FOLDER.exists() and any(MODELS_FOLDER.iterdir())):
         raise RuntimeError(f"Model not found at {MODELS_FOLDER}")
+
+    # Load processor (tokenizer + processors)
     _GLOBAL["processor"] = AutoProcessor.from_pretrained(
         str(MODELS_FOLDER), trust_remote_code=True, local_files_only=True, use_fast=True
     )
-    _GLOBAL["model"] = Qwen2VLForConditionalGeneration.from_pretrained(
-        str(MODELS_FOLDER),
-        trust_remote_code=True,
-        local_files_only=True,
-        torch_dtype=dtype
-    ).to(device)
-    # Debug: show model class and vision capability
+
+    # Try multiple possible model classes for Qwen VL families (3, 2.5/2) with graceful fallbacks
+    model = None
+    last_err = None
+    try:
+        from transformers import Qwen3VLForConditionalGeneration  # Preferred for Qwen3 VL
+        model = Qwen3VLForConditionalGeneration.from_pretrained(
+            str(MODELS_FOLDER),
+            trust_remote_code=True,
+            local_files_only=True,
+            torch_dtype=dtype
+        )
+    except Exception as e1:
+        last_err = e1
+        try:
+            from transformers import Qwen2VLForConditionalGeneration  # Qwen2/2.5 VL path
+            model = Qwen2VLForConditionalGeneration.from_pretrained(
+                str(MODELS_FOLDER),
+                trust_remote_code=True,
+                local_files_only=True,
+                torch_dtype=dtype
+            )
+        except Exception as e2:
+            last_err = e2
+            try:
+                from transformers import AutoModelForImageTextToText
+                model = AutoModelForImageTextToText.from_pretrained(
+                    str(MODELS_FOLDER),
+                    trust_remote_code=True,
+                    local_files_only=True,
+                    torch_dtype=dtype
+                )
+            except Exception as e3:
+                last_err = e3
+                try:
+                    from transformers import AutoModelForCausalLM
+                    model = AutoModelForCausalLM.from_pretrained(
+                        str(MODELS_FOLDER),
+                        trust_remote_code=True,
+                        local_files_only=True,
+                        torch_dtype=dtype
+                    )
+                except Exception as e4:
+                    last_err = e4
+
+    if model is None:
+        raise RuntimeError(f"Failed to load model from {MODELS_FOLDER}: {last_err}")
+
+    _GLOBAL["model"] = model.to(device)
+
+    # Debug: show model class and vision capability flags, if any
     try:
         _cls = type(_GLOBAL['model']).__name__
         has_vision = hasattr(_GLOBAL['model'], 'vision_tower') or hasattr(getattr(_GLOBAL['model'], 'config', object()), 'vision_config')
         print(f"[DEBUG] model_class={_cls} has_vision={has_vision}")
     except Exception as e:
         print(f"[DEBUG] model_class_check_error: {e}")
-
 
 @dataclass
 class GenConfig:
@@ -300,7 +349,6 @@ class ChatWorker(QThread):
                 self.chunk.emit(f"[DEBUG] model_class={_cls} has_vision={has_vision}\n")
             except Exception as e:
                 self.chunk.emit(f"[DEBUG] model_class_check_error: {e}\n")
-            from transformers import TextIteratorStreamer
             import torch
 
             processor = _GLOBAL["processor"]; model = _GLOBAL["model"]

@@ -104,13 +104,13 @@ ENGINE_CATALOG: Dict[str, Dict[str, Any]] = {
         "type": "hf_blip",
     },
     "qwen2-vl-2b": {
-        "label": "Qwen2-VL (2B Instruct)",
+        "label": "Qwen3-VL (2B Instruct)",
         "size": "~3.0 GB cache",
         "best": "Long, multi-sentence, rich descriptions",
-        "notes": "Qwen/Qwen2-VL-2B-Instruct",
+        "notes": "Qwen/Qwen3-VL-2B-Instruct",
         "runs_on": "CUDA recommended; CPU works (slower)",
-        "folder": "describe/default/qwen2-vl-2b-instruct",
-        "bundle": ["*qwen2*vl*2b*instruct*.zip"],
+        "folder": "describe/default/qwen3vl2b",
+        "bundle": ["*qwen3*vl*2b*instruct*.zip", "*qwen3*vl*2b*.zip"],
         "required": ["config.json", "model.safetensors", "tokenizer.json"],
         "type": "hf_qwen2vl",
     },
@@ -165,7 +165,7 @@ class DescriberWidget(QWidget):
         row = 0
 
         eng_grid.addWidget(QLabel("Engine:"), row, 0)
-        self.lbl_engine_name = QLabel("Qwen2-VL (2B Instruct)")
+        self.lbl_engine_name = QLabel("Qwen3-VL (2B Instruct)")
         eng_grid.addWidget(self.lbl_engine_name, row, 1, 1, 3); row += 1
 
         self.lbl_size = QLabel(""); eng_grid.addWidget(QLabel("Size:"), row, 0); eng_grid.addWidget(self.lbl_size, row, 1)
