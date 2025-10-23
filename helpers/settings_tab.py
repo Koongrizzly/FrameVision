@@ -167,17 +167,19 @@ def _options_group(page: QWidget) -> QGroupBox:
     v = QVBoxLayout(g); v.setContentsMargins(0,0,0,0); v.setSpacing(6)
     s = QSettings("FrameVision","FrameVision")
 
+    # Force intro_follow_theme OFF since the toggle is hidden
+    try:
+        s.setValue("intro_follow_theme", False)
+    except Exception:
+        pass
+
     cb1 = QCheckBox("Show random intro image on startup")
     cb1.setChecked(s.value("intro_enabled", True, type=bool))
     cb1.toggled.connect(lambda b: s.setValue("intro_enabled", bool(b)))
 
-    cb2 = QCheckBox("Intro follows theme routine (Day/Evening/Night)")
-    cb2.setChecked(s.value("intro_follow_theme", False, type=bool))
-    cb2.toggled.connect(lambda b: s.setValue("intro_follow_theme", bool(b)))
+    # (hidden) Intro follows theme toggle removed
 
-    v.addWidget(cb1); v.addWidget(cb2);
-    cb2.setEnabled(cb1.isChecked())
-    cb1.toggled.connect(cb2.setEnabled)
+    v.addWidget(cb1);
 
     cb_clear_pyc = QCheckBox(r"Clear app Python cache files in /__pycache__ at (re)start")
     cb_clear_pyc.setChecked(s.value("clear_pyc_on_start", False, type=bool))

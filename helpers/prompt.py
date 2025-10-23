@@ -21,6 +21,16 @@ except Exception:
 SET_PATH = ROOT / "presets" / "setsave" / "prompt.json"
 SET_PATH.parent.mkdir(parents=True, exist_ok=True)
 
+# --- Qwen3-VL 2B local support ---
+QWEN3_LOCAL_KEY = "__local_qwen3vl2b__"
+
+def _qwen3_local_folder() -> Path:
+    try:
+        base = ROOT
+    except Exception:
+        base = Path(".").resolve()
+    return (base / "models" / "describe" / "default" / "qwen3vl2b").resolve()
+
 # --- Qwen3-VL 2B local model support ---
 QWEN3_LOCAL_KEY = "__local_qwen3vl2b__"
 
@@ -387,7 +397,7 @@ def _list_qwen_vl_models() -> List[Tuple[str,str]]:
         pass
     return out
 
-def _models_root_path()->Path|None:
+def _models_root_path()->Optional[Path]:
     try:
         try:
             import helpers.describer as D  # type: ignore
@@ -400,7 +410,7 @@ def _models_root_path()->Path|None:
     except Exception:
         return None
 
-def _folder_for_model_key(model_key:str)->Path|None:
+def _folder_for_model_key(model_key:str)->Optional[Path]:
     try:
         try:
             import helpers.describer as D  # type: ignore

@@ -1778,44 +1778,122 @@ class UpscPane(QtWidgets.QWidget):
         if d:
             self.edit_outdir.setText(d)
             self._append_log(f"Output set to: {d}")
-
     def _pick_batch(self):
+        # Use the shared BatchSelectDialog (helpers/batch.py); fallback to legacy prompt if missing.
+        try:
+            from helpers.batch import BatchSelectDialog as _BatchDialog
+        except Exception:
+            try:
+                from helpers.vatch import BatchSelectDialog as _BatchDialog  # optional alias
+            except Exception:
+                _BatchDialog = None
+
+        if _BatchDialog is not None:
+            try:
+                # Allow both images and videos
+                _exts = sorted(set(getattr(_BatchDialog, "VIDEO_EXTS", set())) | set(getattr(_BatchDialog, "IMAGE_EXTS", set())))
+                files, conflict = _BatchDialog.pick(self, title="Add Batch", exts=_exts)
+            except Exception:
+                files, conflict = None, None
+
+            if files is None:
+                # cancelled
+                return
+            if not files:
+                QtWidgets.QMessageBox.information(self, "No media", "No files selected.")
+                return
+
+            # map dialog result to internal duplicate mode
+            if conflict in ("version", "autorename", "auto", "ver"):
+                dup_mode = "version"
+            elif conflict == "overwrite":
+                dup_mode = "overwrite"
+            else:
+                dup_mode = "skip"
+
+            # store for _build_outfile behavior (restored at end)
+            prev_dup = getattr(self, "_dup_mode", None)
+            try:
+                self._dup_mode = dup_mode
+            except Exception:
+                pass
+
+            # If skip: pre-filter files whose default outfile already exists
+            to_run = []
+            skipped = 0
+            try:
+                sc = int(round(float(self.spin_scale.value())))
+            except Exception:
+                sc = 2
+            for f in files:
+                p = Path(f)
+                try:
+                    is_video = p.suffix.lower() in _VIDEO_EXTS
+                except Exception:
+                    try:
+                        from pathlib import Path as _P
+                        is_video = _P(f).suffix.lower() in _VIDEO_EXTS
+                    except Exception:
+                        is_video = False
+                try:
+                    outd = Path(self.edit_outdir.text().strip()) if getattr(self, "edit_outdir", None) and (self.edit_outdir.text().strip()) else (OUT_VIDEOS if is_video else OUT_SHOTS)
+                except Exception:
+                    outd = OUT_VIDEOS if is_video else OUT_SHOTS
+                # Compute the *default* name (no versioning) for skip check
+                default_out = outd / f"{p.stem}_x{sc}{p.suffix}"
+                if dup_mode == "skip" and default_out.exists():
+                    skipped += 1
+                    continue
+                to_run.append(p)
+
+            if not to_run:
+                QtWidgets.QMessageBox.information(self, "Nothing to do", "All selected outputs already exist.")
+                # restore dup mode
+                if prev_dup is not None:
+                    self._dup_mode = prev_dup
+                else:
+                    try: delattr(self, "_dup_mode")
+                    except Exception: pass
+                return
+
+            self._run_batch_files(to_run)
+
+            # restore dup mode after queuing
+            if prev_dup is not None:
+                self._dup_mode = prev_dup
+            else:
+                try: delattr(self, "_dup_mode")
+                except Exception: pass
+            if skipped:
+                try:
+                    self._append_log(f"[batch] Skipped {skipped} existing output(s).")
+                except Exception:
+                    pass
+            return
+        # ----- Legacy fallback (original UI) -----
         dlg = QtWidgets.QMessageBox(self)
         dlg.setWindowTitle("Batch input")
         dlg.setText("Pick a folder or choose files.")
         btn_folder = dlg.addButton("Folder…", QtWidgets.QMessageBox.AcceptRole)
         btn_files = dlg.addButton("Files…", QtWidgets.QMessageBox.ActionRole)
-        dlg.addButton(QtWidgets.QMessageBox.Cancel)
+        btn_cancel = dlg.addButton("Cancel", QtWidgets.QMessageBox.RejectRole)
+        dlg.setDefaultButton(btn_files)
         dlg.exec()
-        clicked = dlg.clickedButton()
-        if clicked is btn_folder:
-            d = QtWidgets.QFileDialog.getExistingDirectory(self, "Select input folder", str(ROOT))
-            if d:
-                self._run_batch_from_folder(Path(d))
-        elif clicked is btn_files:
-            files, _ = QtWidgets.QFileDialog.getOpenFileNames(self, "Select files", str(ROOT))
-            if files:
-                self._run_batch_files([Path(f) for f in files])
+        if dlg.clickedButton() is btn_cancel:
+            self._append_log("Batch canceled.")
+            return
+        if dlg.clickedButton() is btn_folder:
+            d = QtWidgets.QFileDialog.getExistingDirectory(self, "Select folder")
+            if not d:
+                self._append_log("Batch canceled.")
+                return
+            self._run_batch_from_folder(Path(d))
+            return
+        filt = "Media files (*.mp4 *.mov *.mkv *.avi *.m4v *.webm *.ts *.m2ts *.wmv *.flv *.mpg *.mpeg *.3gp *.3g2 *.ogv *.jpg *.jpeg *.png *.webp *.bmp *.tif *.tiff *.gif);;All files (*)"
+        files, _ = QtWidgets.QFileDialog.getOpenFileNames(self, "Select files", "", filt)
+        if files:
+            self._run_batch_files([Path(f) for f in files])
 
-    # Core
-    def _do_single(self):
-        raw = (self.edit_input.text() or '').strip()
-        src = Path(raw)
-        if raw in ('.','./','..',''):
-            # Try to fall back to player path if available
-            try:
-                p = _fv_get_input(self)
-                if p:
-                    src = Path(p)
-            except Exception:
-                pass
-        if not src.exists():
-            QtWidgets.QMessageBox.warning(self, "No input", "Please choose an image or video.")
-            return
-        if src.is_dir():
-            self._run_batch_from_folder(src)
-            return
-        self._run_one(src)
 
     def _run_batch_from_folder(self, folder: Path):
         exts = _IMAGE_EXTS | _VIDEO_EXTS
@@ -1856,11 +1934,18 @@ class UpscPane(QtWidgets.QWidget):
             return
         for p in files:
             self._run_one(p)
-
     def _build_outfile(self, src: Path, outd: Path, scale: int) -> Path:
         outd.mkdir(parents=True, exist_ok=True)
-        return outd / f"{src.stem}_x{scale}{src.suffix}"
-
+        base = outd / f"{src.stem}_x{scale}{src.suffix}"
+        mode = getattr(self, "_dup_mode", "overwrite")
+        if mode == "version":
+            i = 1
+            cand = base
+            while cand.exists():
+                cand = outd / f"{src.stem}_x{scale} ({i}){src.suffix}"
+                i += 1
+            return cand
+        return base
     def _realsr_cmd_dir(self, exe: str, indir: Path, outdir: Path, model: str, scale: int) -> List[str]:
         n = model[:-3] if model.endswith(("-x2", "-x3", "-x4")) else model
         cmd = [exe, "-i", str(indir), "-o", str(outdir), "-n", n, "-s", str(scale), "-m", str(REALSR_DIR), "-f", "png"]
@@ -1885,6 +1970,25 @@ class UpscPane(QtWidgets.QWidget):
 
     def _waifu_cmd_file(self, exe: str, infile: Path, outfile: Path, model_dirname: str, scale: int) -> List[str]:
         return [exe, "-i", str(infile), "-o", str(outfile), "-m", str(WAIFU2X_DIR / model_dirname), "-s", str(scale)]
+    def _do_single(self):
+        raw = (self.edit_input.text() or '').strip()
+        src = Path(raw)
+        if raw in ('.','./','..',''):
+            # Try to fall back to player path if available
+            try:
+                p = _fv_get_input(self)
+                if p:
+                    src = Path(p)
+            except Exception:
+                pass
+        if not src.exists():
+            QtWidgets.QMessageBox.warning(self, "No input", "Please choose an image or video.")
+            return
+        if src.is_dir():
+            self._run_batch_from_folder(src)
+            return
+        self._run_one(src)
+
 
     def _run_one(self, src: Path):
         # Make current file visible to the queue shim during batch
@@ -3028,3 +3132,233 @@ except Exception as _fv_fix_exc:
     except Exception:
         pass
 # --- END v2 (visible-combo fix) ---
+
+
+# --- FRAMEVISION_CLEARREALITY_V1_ENGINE_PATCH (2025-10-24) ---
+# Adds a dedicated "ClearReality V1" engine option (re-using the Real-ESRGAN backend)
+# and filters the model list to only ClearReality models when selected. Also augments
+# model tooltips.
+try:
+    from PySide6 import QtCore as _FVQtCore2, QtWidgets as _FVQtW3  # type: ignore
+except Exception:
+    _FVQtCore2 = None
+    _FVQtW3 = None
+
+def _fv_scan_clearreality_models() -> list[str]:
+    try:
+        base = REALSR_DIR  # type: ignore  # provided by module
+    except Exception:
+        try:
+            base = Path(__file__).resolve().parents[1] / "models" / "realesrgan"  # type: ignore
+        except Exception:
+            return []
+    names: set[str] = set()
+    try:
+        if base.exists():
+            for ext in ("*.bin", "*.param"):
+                for p in sorted(base.glob(ext)):
+                    s = p.stem.lower()
+                    if "clearrealityv1" in s:
+                        names.add(p.stem)
+    except Exception:
+        pass
+    # Reasonable fallbacks if nothing found
+    if not names:
+        return ["4x-ClearRealityV1-fp16", "4x-ClearRealityV1-fp32",
+                "4x-ClearRealityV1_Soft-fp16", "4x-ClearRealityV1_Soft-fp32"]
+    return sorted(names)
+
+# 1) Extend engine detection to include "ClearReality V1" (uses realesrgan-ncnn-vulkan)
+try:
+    _fv_orig_detect_engines = detect_engines  # type: ignore
+except Exception:
+    _fv_orig_detect_engines = None
+
+def _fv_detect_engines_plus_clearreality():
+    out = []
+    try:
+        if callable(_fv_orig_detect_engines):
+            out = list(_fv_orig_detect_engines())  # type: ignore
+    except Exception:
+        out = []
+    # Try to find the realesrgan executable used by other engines
+    realsr_exe = None
+    for label, exe in out:
+        l = (label or "").lower()
+        if ("real-esrgan" in l) or ("realesrgan" in l) or ("ultrasharp" in l) or ("srmd (ncnn via realesrgan" in l):
+            realsr_exe = exe
+            break
+    if realsr_exe is None:
+        try:
+            cand = REALSR_DIR / ("realesrgan-ncnn-vulkan.exe" if os.name == "nt" else "realesrgan-ncnn-vulkan")  # type: ignore
+            if cand.exists():
+                realsr_exe = str(cand)
+        except Exception:
+            pass
+    if realsr_exe and not any((lbl or "").lower().startswith("clearreality v1") for (lbl, _x) in out):
+        # Place it near the top for convenience (after Real-ESRGAN if present)
+        idx = 1 if out and "real-esrgan" in (out[0][0] or "").lower() else len(out)
+        out.insert(idx, ("ClearReality V1", realsr_exe))
+    return out
+
+try:
+    detect_engines = _fv_detect_engines_plus_clearreality  # type: ignore
+except Exception:
+    pass
+
+# 2) Filter the Real-ESRGAN model combo when the "ClearReality V1" engine is selected.
+try:
+    _Pane = UpscPane  # type: ignore  # noqa: F821
+    if not hasattr(_Pane, "_fv_clearreality_engine_patch_20251024"):
+        _Pane._fv_clearreality_engine_patch_20251024 = True
+
+        def _fv_restore_or_filter_models(self):
+            try:
+                eng = (self.combo_engine.currentText() or "").lower()
+            except Exception:
+                eng = ""
+            combo = getattr(self, "combo_model_realsr", None)
+            if combo is None or not hasattr(combo, "count"):
+                return
+            # Cache the full model list once
+            full_key = "_fv_realsr_all_items"
+            if not hasattr(self, full_key):
+                try:
+                    all_items = []
+                    for i in range(combo.count()):
+                        all_items.append(combo.itemText(i))
+                    setattr(self, full_key, all_items)
+                except Exception:
+                    setattr(self, full_key, [])
+            all_items = list(getattr(self, full_key, []))
+
+            def _repopulate(items: list[str]):
+                try:
+                    combo.blockSignals(True)
+                    combo.clear()
+                    for it in items:
+                        combo.addItem(it)
+                finally:
+                    try:
+                        combo.blockSignals(False)
+                    except Exception:
+                        pass
+                # refresh hint, if available
+                try:
+                    if hasattr(self, "_update_model_hint"):
+                        self._update_model_hint()
+                except Exception:
+                    pass
+
+            if "clearreality v1" in eng:
+                # Only show ClearReality models
+                items = [s for s in all_items if "clearreality" in (s or "").lower()]
+                if not items:
+                    items = _fv_scan_clearreality_models()
+                _repopulate(items)
+            else:
+                # Restore full list if it looks filtered
+                if combo.count() != len(all_items):
+                    _repopulate(all_items)
+
+        # Hook into __init__ to wire signal + run once
+        _orig_init = _Pane.__init__
+        def _init_and_wire(self, *a, **k):
+            _orig_init(self, *a, **k)
+            try:
+                if hasattr(self.combo_engine, "currentTextChanged"):
+                    self.combo_engine.currentTextChanged.connect(lambda *_: _fv_restore_or_filter_models(self))
+            except Exception:
+                pass
+            try:
+                _fv_restore_or_filter_models(self)
+            except Exception:
+                pass
+        _Pane.__init__ = _init_and_wire
+
+except Exception as _fv_cex:
+    try:
+        print("[ClearReality engine patch] non-fatal:", _fv_cex)
+    except Exception:
+        pass
+
+# 3) Remove ClearReality entries from the generic Real-ESRGAN scan (to avoid duplicates)
+try:
+    _fv_orig_scan_realsr = scan_realsr_models  # type: ignore
+    def scan_realsr_models():  # type: ignore
+        try:
+            items = list(_fv_orig_scan_realsr())
+        except Exception:
+            items = []
+        # filter out ClearReality models; they will live under the dedicated engine
+        return [i for i in items if "clearreality" not in (i or "").lower()]
+except Exception:
+    pass
+
+# 4) Extend tooltip map for ClearReality variants (short, single-line style)
+try:
+    _cr_hints = {
+        "4x-clearrealityv1-fp16": ("Photo/Sharp", "ClearReality V1 (fp16) — crisp detail and punchy edges; fast."),
+        "4x-clearrealityv1-fp32": ("Photo/Sharp", "ClearReality V1 (fp32) — higher precision; slightly slower; crisp detail."),
+        "4x-clearrealityv1_soft-fp16": ("Photo/Soft", "ClearReality V1 Soft (fp16) — gentler sharpening; fewer halos."),
+        "4x-clearrealityv1_soft-fp32": ("Photo/Soft", "ClearReality V1 Soft (fp32) — soft variant with fp32 precision."),
+        "clearrealityv1": ("Photo", "ClearReality V1 family — Real-ESRGAN fine‑tune with clean detail. Use Soft to reduce halos."),
+    }
+    try:
+        _FV_MODEL_HINTS.update(_cr_hints)  # type: ignore
+    except Exception:
+        # If the dict wasn't defined yet, create a minimal overlay and a wrapper resolver
+        _FV_MODEL_HINTS = dict(_cr_hints)  # type: ignore
+except Exception:
+    pass
+# --- END FRAMEVISION_CLEARREALITY_V1_ENGINE_PATCH ---
+
+
+
+# --- FRAMEVISION_HIDE_ENCODER_STYLE_IN_REALESRGAN (2025-10-24) ---
+# Hides 'encoder' and 'style' entries from the Real-ESRGAN model dropdown, globally.
+try:
+    _fv_prev_scan_realsr_2 = scan_realsr_models  # type: ignore
+    def scan_realsr_models():  # type: ignore
+        try:
+            items = list(_fv_prev_scan_realsr_2())
+        except Exception:
+            items = []
+        blocked = {"encoder", "style"}
+        out = []
+        for i in items:
+            s = (i or "").strip()
+            low = s.lower()
+            if low in blocked:
+                continue
+            # Also maintain prior behavior of removing ClearReality from the generic list
+            if "clearreality" in low:
+                continue
+            out.append(s)
+        return out
+except Exception:
+    pass
+
+# Also prune any pre-populated combos on construction, just in case.
+try:
+    _Pane2 = UpscPane  # type: ignore
+    if not hasattr(_Pane2, "_fv_hide_encoder_style_runtime_20251024"):
+        _orig_init_hide = _Pane2.__init__
+        def _init_hide(self, *a, **k):
+            _orig_init_hide(self, *a, **k)
+            try:
+                combo = getattr(self, "combo_model_realsr", None)
+                if combo is not None and hasattr(combo, "count"):
+                    blocked = {"encoder", "style"}
+                    for i in reversed(range(combo.count())):
+                        t = (combo.itemText(i) or "").strip().lower()
+                        if t in blocked:
+                            combo.removeItem(i)
+            except Exception:
+                pass
+        _Pane2.__init__ = _init_hide
+        _Pane2._fv_hide_encoder_style_runtime_20251024 = True
+except Exception:
+    pass
+# --- END FRAMEVISION_HIDE_ENCODER_STYLE_IN_REALESRGAN ---
+

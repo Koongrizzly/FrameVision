@@ -305,6 +305,51 @@ class Txt2ImgPane(QWidget):
                     self.use_queue.setChecked(bool(s.get('use_queue')))
             except Exception:
                 pass
+            # ## enforce_seed_and_size_from_saved — robustly restore tri‑state seed policy and size
+            try:
+                sp = str((s.get('seed_policy') or '')).strip().lower()
+                if hasattr(self, 'seed_policy') and sp:
+                    idx = {'fixed':0,'random':1,'increment':2}.get(sp, 0)
+                    try:
+                        self.seed_policy.blockSignals(True)
+                    except Exception:
+                        pass
+                    self.seed_policy.setCurrentIndex(int(idx))
+                    try:
+                        self.seed_policy.blockSignals(False)
+                    except Exception:
+                        pass
+            except Exception:
+                pass
+            try:
+                w = s.get('width'); h = s.get('height'); spi = s.get('size_preset_index')
+                if hasattr(self, 'size_combo'):
+                    try:
+                        if spi is not None:
+                            spi = int(spi)
+                            if 0 <= spi < self.size_combo.count():
+                                self.size_combo.blockSignals(True)
+                                self.size_combo.setCurrentIndex(spi)
+                                self.size_combo.blockSignals(False)
+                        if w is not None and h is not None and hasattr(self,'_size_presets'):
+                            m = -1
+                            for i,(label,wv,hv) in enumerate(self._size_presets):
+                                if int(w)==int(wv) and int(h)==int(hv):
+                                    m = i; break
+                            if m >= 0:
+                                self.size_combo.blockSignals(True)
+                                self.size_combo.setCurrentIndex(m)
+                                self.size_combo.blockSignals(False)
+                    except Exception:
+                        pass
+                try:
+                    if w is not None and hasattr(self,'size_manual_w'): self.size_manual_w.setValue(int(w))
+                    if h is not None and hasattr(self,'size_manual_h'): self.size_manual_h.setValue(int(h))
+                except Exception:
+                    pass
+            except Exception:
+                pass
+
     
     def _get_settings_path(self):
         """Return Path to presets/setsave/txt2img.json under the app root."""
@@ -1287,7 +1332,15 @@ class Txt2ImgPane(QWidget):
                 return False
             with open(p, "r", encoding="utf-8") as f:
                 data = json.load(f)
+            try:
+                self._t2i_last_loaded = dict(data)
+            except Exception:
+                self._t2i_last_loaded = data
             self._apply_settings_from_dict(data)
+            try:
+                QTimer.singleShot(0, lambda: self._apply_settings_from_dict(getattr(self,'_t2i_last_loaded', data)))
+            except Exception:
+                pass
             return True
         except Exception as e:
             try: print("[txt2img] load settings error:", e)
@@ -1453,6 +1506,11 @@ class Txt2ImgPane(QWidget):
         except Exception: pass
         try: d["preset_index"] = int(self.preset_combo.currentIndex())
         except Exception: pass
+
+        try:
+            d["size_preset_index"] = int(self.size_combo.currentIndex()) if hasattr(self, "size_combo") else -1
+        except Exception:
+            pass
 
         return d
 
@@ -2305,6 +2363,79 @@ try:
 
     _orig_apply = _T2I._apply_settings_from_dict
     def _apply_settings_from_dict_patched(self, s: dict):
+        # ## t2i_force_model_size_seed
+        try:
+            # --- Model restore ---
+            mp = s.get('model_path') or s.get('model') or s.get('model_name')
+            if mp and hasattr(self,'model_combo'):
+                idxm = -1
+                try:
+                    for i in range(self.model_combo.count()):
+                        if (self.model_combo.itemData(i) or '') == mp:
+                            idxm = i; break
+                except Exception:
+                    pass
+                if idxm < 0:
+                    try:
+                        import os
+                        base = os.path.basename(str(mp)).lower()
+                        for i in range(self.model_combo.count()):
+                            txt = (self.model_combo.itemText(i) or '').lower()
+                            if base and base in txt:
+                                idxm = i; break
+                    except Exception:
+                        pass
+                if idxm >= 0:
+                    try: self.model_combo.blockSignals(True)
+                    except Exception: pass
+                    self.model_combo.setCurrentIndex(idxm)
+                    try: self.model_combo.blockSignals(False)
+                    except Exception: pass
+
+            # --- Seed policy restore ---
+            if hasattr(self, 'seed_policy') and 'seed_policy' in s:
+                sp = str(s.get('seed_policy') or '').lower().strip()
+                idxs = {'fixed':0,'random':1,'increment':2}.get(sp, None)
+                if idxs is None:
+                    if 'rand' in sp: idxs = 1
+                    elif 'inc' in sp: idxs = 2
+                    else: idxs = 0
+                try: self.seed_policy.blockSignals(True)
+                except Exception: pass
+                self.seed_policy.setCurrentIndex(int(idxs))
+                try: self.seed_policy.blockSignals(False)
+                except Exception: pass
+
+            # --- Size restore ---
+            w = s.get('width'); h = s.get('height')
+            idxp = s.get('size_preset_index')
+            if hasattr(self,'size_combo'):
+                try:
+                    if idxp is not None:
+                        idxp = int(idxp)
+                        if 0 <= idxp < self.size_combo.count():
+                            self.size_combo.blockSignals(True)
+                            self.size_combo.setCurrentIndex(idxp)
+                            self.size_combo.blockSignals(False)
+                    if w is not None and h is not None and hasattr(self,'_size_presets'):
+                        idx2 = -1
+                        for i,(label,wv,hv) in enumerate(self._size_presets):
+                            if int(w)==int(wv) and int(h)==int(hv):
+                                idx2 = i; break
+                        if idx2 >= 0:
+                            self.size_combo.blockSignals(True)
+                            self.size_combo.setCurrentIndex(idx2)
+                            self.size_combo.blockSignals(False)
+                except Exception:
+                    pass
+            try:
+                if w is not None and hasattr(self,'size_manual_w'): self.size_manual_w.setValue(int(w))
+                if h is not None and hasattr(self,'size_manual_h'): self.size_manual_h.setValue(int(h))
+            except Exception:
+                pass
+        except Exception:
+            pass
+    
         _orig_apply(self, s)
         try:
             for name in ("attn_slicing", "attention_slicing", "attentionSlicing"):
