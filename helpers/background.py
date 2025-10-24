@@ -24,6 +24,49 @@ import numpy as np
 import time
 from PIL import Image, ImageFilter
 
+def _apply_removal_strength(alpha01: np.ndarray, rgb: np.ndarray, bias: int) -> np.ndarray:
+    """
+    Improved control for the 'Removal strength' slider.
+
+    bias: 0..100 where 50 is neutral.
+      - <50 keeps more subject (good for dark-on-dark).
+      - >50 removes more (shrinks the foreground).
+    Internally uses a sigmoid curve with contrast/offset and an optional
+    local-contrast keep-bias for weak edges when bias < 50.
+    """
+    try:
+        a = np.clip(alpha01.astype(np.float32), 0.0, 1.0)
+        s = float(max(0, min(100, int(bias)))) / 100.0      # 0..1
+        signed = (s - 0.5) * 2.0                            # -1..1
+
+        # Sigmoid parameters: neutral around k=10, b=0
+        k = 10.0 + 12.0 * signed                            # contrast
+        b = 0.35 * signed                                   # offset (positive -> remove more)
+
+        # Centered -> sigmoid
+        a_centered = a - 0.5
+        a_sig = 1.0 / (1.0 + np.exp(-(k * a_centered + b)))
+
+        # Local-contrast keep-bias for weak edges when bias < 50
+        if signed < 0.0 and 'cv2' in globals() and cv2 is not None and rgb is not None:
+            try:
+                # fast luma + Sobel magnitude
+                bch, gch, rch = rgb[...,0].astype(np.float32), rgb[...,1].astype(np.float32), rgb[...,2].astype(np.float32)
+                y = (0.114*bch + 0.587*gch + 0.299*rch) / 255.0
+                gradx = cv2.Sobel((y*255.0).astype(np.uint8), cv2.CV_32F, 1, 0, ksize=3)
+                grady = cv2.Sobel((y*255.0).astype(np.uint8), cv2.CV_32F, 0, 1, ksize=3)
+                mag = (gradx*gradx + grady*grady) ** 0.5
+                mag = (mag - mag.min()) / (mag.ptp() + 1e-6)
+                keep_boost = 0.25 * (-signed)               # up to +0.25 when signed = -1
+                a_sig = np.clip(a_sig + keep_boost * mag, 0.0, 1.0)
+            except Exception:
+                pass
+
+        return np.clip(a_sig, 0.0, 1.0).astype(np.float32)
+    except Exception:
+        return np.clip(alpha01.astype(np.float32), 0.0, 1.0)
+
+
 # ---- App paths fallbacks ----
 try:
     from helpers.framevision_app import ROOT, OUT_SHOTS, OUT_TEMP
@@ -492,18 +535,36 @@ def inpaint_sd15(
     return _pil_from_np(out_np_cropped)
 
     # -------------------- Post, composite --------------------
+
 def _apply_post(alpha: np.ndarray, thresh: int, feather: int) -> np.ndarray:
-    """alpha 0..1 -> 0..255 uint8 with threshold + feather."""
+    """alpha 0..1 -> 0..255 uint8 with threshold + feather.
+    Behavior tweak: very small threshold values should NOT fully binarize the mask
+    (that felt like an on/off toggle). For 1..32 we use a *soft hardening*
+    via a logistic curve instead of a binary cut. For >32 we keep the classic
+    hard threshold semantics.
+    """
     if alpha.ndim == 3 and alpha.shape[-1] in (1, 3):
         alpha = alpha[..., 0]
-    a = np.clip(alpha * 255.0, 0, 255).astype(np.uint8)
+    a = np.clip(alpha * 255.0, 0, 255).astype(np.float32)
     if thresh > 0:
-        a = (a >= int(thresh)).astype(np.uint8) * 255
+        if thresh <= 32:
+            # Soft mode: map 1..32 => gentle sigmoid contrast around 0.5
+            k = 4.0 + (float(thresh) / 32.0) * 10.0
+            a01 = a / 255.0
+            a01 = 1.0 / (1.0 + np.exp(-k * (a01 - 0.5)))
+            a = a01 * 255.0
+        else:
+            t = int(thresh)
+            t = 1 if t < 1 else (254 if t > 254 else t)
+            a = (a >= float(t)).astype(np.uint8) * 255.0
     if feather > 0:
-        a = _gaussian(a, float(feather))
+        a = _gaussian(a.astype(np.uint8), float(feather))
         if a.dtype != np.uint8:
             a = np.clip(a, 0, 255).astype(np.uint8)
+    else:
+        a = a.astype(np.uint8)
     return a
+
 
 def _spill_suppress(rgb: np.ndarray, alpha_u8: np.ndarray, strength: float = 0.18) -> np.ndarray:
     """Light edge de-spill: desaturate along semi-transparent edges."""
@@ -790,15 +851,11 @@ def remove_background_preview(
         alpha = _auto_level_alpha(alpha)
     if invert:
         alpha = 1.0 - alpha
-    # Apply removal strength: map 0..100 (50 neutral) to a gamma curve on alpha for smooth control
+    # Apply improved removal strength curve (50 = neutral; <50 keep more; >50 remove more)
     try:
-        b = max(0, min(100, int(bias)))
-        scale = (b - 50) / 50.0  # -1..1
-        # gamma in [~2.8 (weaker removal)..1..~0.35 (stronger removal)]
-        gamma = 2.0 ** (-1.5 * scale)
-        alpha = np.clip(alpha, 0.0, 1.0) ** float(gamma)
+        alpha = _apply_removal_strength(alpha, rgb, int(bias))
     except Exception:
-        pass
+        alpha = np.clip(alpha, 0.0, 1.0)
     a8 = _apply_post(alpha, int(threshold), int(feather))
     # Grow/shrink edges (post-threshold, pre-feather compose)
     try:
