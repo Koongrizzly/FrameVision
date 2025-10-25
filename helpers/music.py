@@ -50,7 +50,7 @@ _MF = _try_mutagen()
 ROOT = Path('.').resolve()
 OUT_TEMP = ROOT / 'output' / '_temp'
 OUT_TEMP.mkdir(parents=True, exist_ok=True)
-MUSIC_STATE_PATH = OUT_TEMP / 'music_state.json'
+MUSIC_STATE_PATH = ROOT / 'presets' / 'setsave' / 'music_state.json'
 
 
 # Playlists save/load directory
@@ -1044,18 +1044,18 @@ class VisualEngine(QObject):
                     s = v  # immediate rise, no EMA
                 else:
                     # Fast release per frame at ~30fps
-                    decay = 0.40
+                    decay = 0.38
                     s = max(v, prev - decay)
                 out[i] = s
             else:
                 # === Other bands: gentle asymmetry ===
                 rising = v >= prev
                 if i < max(16, self._bars // 4):        # low-mids
-                    alpha_up, alpha_down = 0.34, 0.18
+                    alpha_up, alpha_down = 0.74, 0.48
                 elif i < max(24, self._bars // 2):      # mids
-                    alpha_up, alpha_down = 0.30, 0.20
+                    alpha_up, alpha_down = 0.60, 0.50
                 else:                                    # highs
-                    alpha_up, alpha_down = 0.36, 0.26
+                    alpha_up, alpha_down = 0.76, 0.46
                 a = alpha_up if rising else alpha_down
                 out[i] = prev * (1.0 - a) + v * a
 
@@ -1343,7 +1343,7 @@ class MusicOverlay(QWidget):
         L.addLayout(top)
         L.addLayout(row_btns)
         L.addLayout(row_vis1)
-        L.addLayout(row_vis2)
+        # L.addLayout(row_vis2)  # hidden duplicate auto-change row
         # crossfade controls
         self.chk_xfade = QCheckBox('Crossfade visuals')
         self.cmb_fade = QComboBox()
@@ -1787,9 +1787,9 @@ class MusicOverlay(QWidget):
         # place card ~450px from left, but snap to center if wide enough
         w = r.width()
         h = r.height()
-        W = min(560, int(w * 0.9))
-        H = min(280, int(h * 0.6))
-        desired_x = 450
+        W = min(560, int(w * 0.95))
+        H = min(280, int(h * 0.8))
+        desired_x = 0
         center_x = max(12, (w - W) // 2)
         max_x = max(12, w - W - 12)
         if center_x >= desired_x:
@@ -1807,7 +1807,7 @@ class MusicOverlay(QWidget):
         # anchor FAB to header top-right (header rect ~ (18,18,width<=520,148))
         header_x = 18
         header_y = 18
-        header_w = min(520, int(w * 0.7))
+        header_w = min(520, int(w * 0.8))
         fx = header_x + header_w - self.fab.width() - 8 + 75
         fy = header_y + 8 + 25
         fx = min(max(6, fx), max(6, w - self.fab.width() - 6))
@@ -2231,7 +2231,7 @@ class MusicRuntime(QObject):
         self._was_quiet = False
         self._return_cooldown_until_ms = 0
         # tunables (no UI): tweak if needed
-        self._silence_gate = 0.30  # RMS threshold for 'quiet'
+        self._silence_gate = 0.15  # RMS threshold for 'quiet'
         self._silence_min_ms = 350  # how long it must stay below gate
         self._return_cooldown_ms = 1100  # min gap between return-triggered switches
 
@@ -3101,7 +3101,7 @@ def _HybridAnalyzer_check_silence(self):
         now = _time.monotonic()
         last = getattr(self, "_last_buf_ts", None)
         # Default: if older than 0.6s, consider silence (covers pause and device stalls)
-        timeout_s = getattr(self, "_silence_timeout_s", 0.6)
+        timeout_s = getattr(self, "_silence_timeout_s", 0.4)
         if last is None or (now - last) > timeout_s:
             _HybridAnalyzer_mark_silent(self)
     except Exception:
