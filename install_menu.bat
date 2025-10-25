@@ -54,34 +54,51 @@ if "%CHOICE%"=="4" goto cuda
 goto end
 
 :ensure_python
-rem Ensure Python is available; auto-install if missing (3.11, added PATH), based on system arch.
+rem Ensure a REAL Python is available (not MS Store alias). Auto-install if missing.
 set "PYTHON="
+
+rem Prefer Python Launcher with explicit versions (verify it actually runs)
 for %%V in (3.12 3.11 3.10) do if not defined PYTHON (
-  py -%%V -V >nul 2>nul && set "PYTHON=py -%%V"
+  py -%%V -c "import sys;print(1)" >nul 2>nul && set "PYTHON=py -%%V"
 )
+
+rem Fallback to python.exe on PATH, but reject the Microsoft Store alias under WindowsApps
 if not defined PYTHON (
-  where python >nul 2>nul && set "PYTHON=python"
+  for /f "delims=" %%P in ('where python 2^>nul') do (
+    echo %%P | find /I "\WindowsApps\python.exe" >nul
+    if errorlevel 1 (
+      rem Not the Windows Store alias; verify it runs
+      python -c "import sys;print(1)" >nul 2>nul && set "PYTHON=python"
+    )
+  )
 )
+
 if defined PYTHON exit /b 0
 
-echo Python not found. Attempting automatic install of Python 3.11...
+echo Python not found or alias detected. Attempting automatic install of Python 3.11...
 call :_install_python_311
+
 rem Re-detect after install
 set "PYTHON="
-for %%V in (3.11 3.10) do if not defined PYTHON (
-  py -%%V -V >nul 2>nul && set "PYTHON=py -%%V"
+for %%V in (3.12 3.11 3.10) do if not defined PYTHON (
+  py -%%V -c "import sys;print(1)" >nul 2>nul && set "PYTHON=py -%%V"
 )
 if not defined PYTHON (
-  where python >nul 2>nul && set "PYTHON=python"
+  for /f "delims=" %%P in ('where python 2^>nul') do (
+    echo %%P | find /I "\WindowsApps\python.exe" >nul
+    if errorlevel 1 (
+      python -c "import sys;print(1)" >nul 2>nul && set "PYTHON=python"
+    )
+  )
 )
+
 if defined PYTHON (
   echo Python is now available.
   exit /b 0
 ) else (
-  echo Failed to install Python automatically. Please install Python 3.11 and re-run.
+  echo Failed to install Python automatically. Please install Python 3.11+ and re-run.
   exit /b 1
 )
-
 :_install_python_311
 rem Decide arch: AMD64, ARM64, or x86
 set "ARCH=%PROCESSOR_ARCHITECTURE%"
@@ -153,6 +170,25 @@ echo installing some extra packages
 
 exit /b 0
 :check
+REM === [AUTO PATCH] Ensure Python is installed before venv creation (Option 1) ===
+call :ensure_python
+REM Prefer the interpreter chosen by :ensure_python
+if defined PYTHON (
+  set "PY_CMD=%PYTHON%"
+) else (
+  REM Fallback detection (should not happen if ensure_python succeeded)
+  for %%V in (3.12 3.11 3.10) do if not defined PY_CMD (
+    py -%%V -V >nul 2>nul && set "PY_CMD=py -%%V"
+  )
+  if not defined PY_CMD (
+    for /f "delims=" %%P in ('where python 2^>nul') do (
+      echo %%P | find /I "\WindowsApps\python.exe" >nul
+      if errorlevel 1 set "PY_CMD=python"
+    )
+  )
+)
+REM === [AUTO PATCH END] ===
+
 setlocal EnableExtensions EnableDelayedExpansion
 
 echo(
