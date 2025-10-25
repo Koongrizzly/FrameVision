@@ -931,7 +931,7 @@ class Game:
         else:
             draw_text(surf, "• none", (18, y), font=PANEL_FONT)
         draw_text(surf, "Controls", (panel.centerx, HEIGHT - 210), font=PANEL_TITLE_FONT, center=True)
-        for i, t in enumerate(["←/→ lanes", "↑/↓ up/down", "SPACE shoot", "P pause", "ESC exit", "+20 normal", "+50 special"]):
+        for i, t in enumerate(["←/→ lanes", "↑/↓ up/down", "SPACE shoot", "P/ESC pause", "Exit button quits", "+20 normal", "+50 special"]):
             draw_text(surf, t, (12, HEIGHT - 186 + i*20), font=PANEL_FONT)
 
     def _draw_right_panel(self, surf):
@@ -1218,7 +1218,7 @@ class Game:
             "Avoid cars, pass as many as you can.",
             "Power-ups: FAST, SLOW, BUBBLE, SHOOT",
             "SPACE to shoot when SHOOT is active",
-            "←/→ lane, ↑/↓ up/down, P pause, ESC quit",
+            "←/→ lane, ↑/↓ up/down, P/ESC pause",
             "+20 per normal car, +50 special",
             "+1 life every 5000 points",
             "Press ENTER to start",
@@ -1280,9 +1280,16 @@ class Game:
 
         if event.type == pygame.KEYDOWN:
             if event.key == pygame.K_ESCAPE:
-                pygame.quit()
-                sys.exit(0)
-
+                if self.state == "RUN":
+                    self.state = "PAUSE"
+                elif self.state == "PAUSE":
+                    self.state = "RUN"
+                elif self.state == "GAMEOVER" and self.name_allowed:
+                    self.reset(full=False)
+                else:
+                    # Ignore ESC on START screen
+                    pass
+                return
             if self.state == "RUN":
                 if event.key in (pygame.K_LEFT, pygame.K_a):
                     self.player.move_lane(-1)

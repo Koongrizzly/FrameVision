@@ -131,6 +131,7 @@ def qss_for_theme(name: str) -> str:
     # replace non-alphanum with single space, collapse
     import re as _re
     s = _re.sub(r"[^a-z0-9]+", " ", s).strip()
+
     # canonical keys map
     _MAP = {
         "day": QSS_DAY,
@@ -138,16 +139,17 @@ def qss_for_theme(name: str) -> str:
         "night": QSS_NIGHT,
         "slate": QSS_SLATE,
         "high contrast": QSS_HIGH_CONTRAST,
+        "highcontrast": QSS_HIGH_CONTRAST,
         "contrast": QSS_HIGH_CONTRAST,
         "cyberpunk": QSS_CYBERPUNK,
         "neon": QSS_NEON,
         "ocean": QSS_OCEAN,
         "solarized light": QSS_SOLARIZED_LIGHT,
         "solarized": QSS_SOLARIZED_LIGHT,
-        "solar": QSS_SOLARIZED_LIGHT,
         "crt": QSS_CRT,
         "tropical fiesta": QSS_TROPICAL_FIESTA,
         "tropical": QSS_TROPICAL_FIESTA,
+        "fiesta": QSS_TROPICAL_FIESTA,
         "color mix": QSS_COLOR_MIX,
         "colormix": QSS_COLOR_MIX,
         "aurora": QSS_AURORA,
@@ -156,15 +158,21 @@ def qss_for_theme(name: str) -> str:
         "sunburst": QSS_SUNBURST,
         "candy pop": QSS_CANDY_POP,
         "rainbow riot": QSS_RAINBOW_RIOT,
-        "sky light": QSS_SKY_LIGHT,
         "pastel light": QSS_PASTEL_LIGHT,
+        "pastel": QSS_PASTEL_LIGHT,
         "mgraphite dusk": QSS_GRAPHITE_DUSK,
         "graphite dusk": QSS_GRAPHITE_DUSK,
         "graphite": QSS_GRAPHITE_DUSK,
+        "cloud grey": QSS_CLOUD_GREY,
+        "cloud gray": QSS_CLOUD_GREY,
+        "signal grey": QSS_SIGNAL_GREY,
+        "signal gray": QSS_SIGNAL_GREY,
     }
+
     # Exact mapping first
     if s in _MAP:
         return _MAP[s]
+
     # Prefix helpers (for friendly matching like "daylight", "evening glow", etc.)
     if s.startswith("day"): return QSS_DAY
     if s.startswith("even"): return QSS_EVENING
@@ -181,14 +189,13 @@ def qss_for_theme(name: str) -> str:
     if "aurora" in s: return QSS_AURORA
     if "mardi" in s: return QSS_MARDI_GRAS
     if "sunburst" in s: return QSS_SUNBURST
-    if s.startswith("sky") or "sky light" in s: return QSS_SKY_LIGHT
-    if s.startswith("pastel") or "pastel light" in s: return QSS_PASTEL_LIGHT
+    if "pastel" in s: return QSS_PASTEL_LIGHT
+    if "cloud" in s: return QSS_CLOUD_GREY
+    if "signal" in s: return QSS_SIGNAL_GREY
     if "graphite" in s or s.endswith("dusk"): return QSS_GRAPHITE_DUSK
-
 
     # Fallback
     return QSS_EVENING
-
 
 def _menu_qss(name: str) -> str:
     """
@@ -225,16 +232,19 @@ def _menu_qss(name: str) -> str:
         return rule('#EAF6FF', '#D8F0FF')
     if s.startswith('solar'):
         return rule('#e6dfc9', '#e0d7bd')
-    if 'sky light' in s or s.startswith('sky'):
-        return rule('#E6F3FF', '#D9EDFF')
     if 'pastel' in s:
         return rule('#F3E8FF', '#E9D5FF')  # soft lavender
     if 'sunburst' in s:
         return rule('#FFF3C4', '#FFE8A1')  # pale yellow
+    if 'cloud grey' in s or 'cloud gray' in s:
+        return rule('#E6F0FF', '#DDE6FF')
+    if 'signal grey' in s or 'signal gray' in s or s.startswith('signal'):
+        return rule('#FFE8D1', '#E2F0FF')
 
     # Dark-ish themes — provide lighter, clearer hover states
     # Evening, Night, Slate, Graphite Dusk, High Contrast, Neon, Ocean, CRT, Aurora, Mardi Gras, Tropical Fiesta
     return rule('#1f2937', '#172554')
+
 def apply_theme(app: QApplication, name: str) -> None:
     if (name or "").strip().lower() == "auto":
         from .framevision_app import pick_auto_theme
@@ -247,7 +257,7 @@ def apply_theme(app: QApplication, name: str) -> None:
     if s == "random":
         try:
             import random as _rand
-            _pool = ["Day","Solarized Light","Sunburst","Evening","Night","Slate","High Contrast","Cyberpunk","Neon","Ocean","CRT","Aurora","Mardi Gras","Tropical Fiesta","Color Mix"]
+            _pool = ["Day","Solarized Light","Sunburst","Cloud Grey","Signal Grey","Evening","Night","Slate","High Contrast","Cyberpunk","Neon","Ocean","CRT","Aurora","Mardi Gras","Tropical Fiesta","Color Mix"]
             name = _rand.choice(_pool)
         except Exception:
             name = "Evening"
@@ -267,7 +277,7 @@ def apply_theme(app: QApplication, name: str) -> None:
             pal.setColor(QPalette.Button, QColor(NIGHT_TAB_BG))
             pal.setColor(QPalette.Text, Qt.white)
             pal.setColor(QPalette.WindowText, Qt.white)
-        elif (name.lower().startswith("day") or "solar" in name.lower() or "sunburst" in name.lower() or "sky" in name.lower() or "pastel" in name.lower()):
+        elif (name.lower().startswith("day") or "solar" in name.lower() or "sunburst" in name.lower() or "sky" in name.lower() or "pastel" in name.lower() or "cloud" in name.lower() or "signal" in name.lower()):
             pal.setColor(QPalette.Window, QColor(DAY_BG))
             pal.setColor(QPalette.Base, QColor(DAY_GROUP_BG))
             pal.setColor(QPalette.Button, QColor(DAY_TAB_BG))
@@ -294,6 +304,220 @@ def apply_theme(app: QApplication, name: str) -> None:
     except Exception:
         pass
 
+
+
+# --- Cloud Grey (mid-light neutral greys with cool blue accent) ---------------------------
+CLOUD_BG = "#DDE0E5"
+CLOUD_GROUP_BG = "#ECEEF1"
+CLOUD_TEXT = "#1A1A1A"
+CLOUD_BORDER = "#C6CBD4"
+CLOUD_BORDER_SOFT = "#D2D6DE"
+CLOUD_TAB_BG = "#E6EBF5"
+CLOUD_TAB_HOVER = "#DDE6FF"
+CLOUD_SLIDER = "#7FD6FF"
+CLOUD_ACCENT = "#AFCBFF"
+
+QSS_CLOUD_GREY = f"""
+QAbstractScrollArea {{ background: {CLOUD_BG}; }}
+QScrollArea QWidget#qt_scrollarea_viewport {{ background: {CLOUD_BG}; }}
+QWidget {{ background: {CLOUD_BG}; color: {CLOUD_TEXT}; }}
+QMainWindow, QDialog {{ background: {CLOUD_BG}; }}
+
+QGroupBox {{
+    background: {CLOUD_GROUP_BG};
+    border: 1px solid {CLOUD_BORDER_SOFT};
+    border-radius: 8px;
+    margin-top: 14px;
+}}
+QGroupBox::title {{
+    subcontrol-origin: margin;
+    left: 10px;
+    padding: 3px 8px;
+    background: {CLOUD_ACCENT};
+    color: {CLOUD_TEXT};
+    border-radius: 6px;
+    font-weight: 600;
+}}
+
+QTabWidget::pane {{
+    border: 1px solid {CLOUD_BORDER_SOFT};
+    top: -1px;
+    background: {CLOUD_GROUP_BG};
+}}
+QTabBar::tab {{
+    background: {CLOUD_TAB_BG};
+    padding: 7px 14px;
+    border: 1px solid {CLOUD_BORDER_SOFT};
+    border-bottom: none;
+    border-top-left-radius: 8px;
+    border-top-right-radius: 8px;
+    color: {CLOUD_TEXT};
+}}
+QTabBar::tab:hover {{ background: {CLOUD_TAB_HOVER}; }}
+QTabBar::tab:selected {{
+    background: {CLOUD_GROUP_BG};
+    color: {CLOUD_TEXT};
+    font-weight: 700;
+}}
+
+QPushButton {{
+    background: {CLOUD_TAB_BG};
+    border: 1px solid {CLOUD_BORDER_SOFT};
+    border-radius: 8px;
+    padding: 6px 12px;
+    color: {CLOUD_TEXT};
+}}
+QPushButton:hover {{ background: {CLOUD_TAB_HOVER}; }}
+QPushButton:pressed {{ background: #D1EBFF; }}
+
+QLineEdit, QComboBox, QTextEdit, QSpinBox, QDoubleSpinBox {{
+    background: #D7DADF;
+    border: 1px solid {CLOUD_BORDER_SOFT};
+    border-radius: 8px;
+    padding: 5px 8px;
+    color: {CLOUD_TEXT};
+}}
+QComboBox::drop-down {{ width: 24px; }}
+
+QCheckBox, QRadioButton {{
+    background: transparent;
+    border: none;
+    color: {CLOUD_TEXT};
+}}
+
+QSlider::groove:horizontal {{
+    height: 6px;
+    background: {CLOUD_BORDER_SOFT};
+    border-radius: 3px;
+}}
+QSlider::handle:horizontal {{
+    width: 16px;
+    background: {CLOUD_SLIDER};
+    border: 1px solid #78c3ff;
+    border-radius: 8px;
+    margin: -6px 0;
+}}
+
+QScrollBar:vertical {{
+    width: 12px;
+    background: {CLOUD_TAB_BG};
+    border: 1px solid {CLOUD_BORDER_SOFT};
+    border-radius: 6px;
+}}
+QScrollBar::handle:vertical {{
+    background: {CLOUD_BORDER};
+    border-radius: 6px;
+}}
+"""
+
+
+# --- Signal Grey (mid-light greys with orange & blue accents) -----------------------------
+SIG_BG = "#CFCFD4"
+SIG_GROUP_BG = "#DADADD"
+SIG_TEXT = "#1A1A1A"
+SIG_BORDER = "#B8B8BD"
+SIG_BORDER_SOFT = "#C4C4C8"
+SIG_ACCENT_ORANGE = "#FFB766"
+SIG_ACCENT_BLUE = "#6CAEFF"
+SIG_TAB_BG = "#E2E4EA"
+SIG_TAB_HOVER = "#DADDE6"
+SIG_SLIDER = "#6CAEFF"
+
+QSS_SIGNAL_GREY = f"""
+QAbstractScrollArea {{ background: {SIG_BG}; }}
+QScrollArea QWidget#qt_scrollarea_viewport {{ background: {SIG_BG}; }}
+QWidget {{ background: {SIG_BG}; color: {SIG_TEXT}; }}
+QMainWindow, QDialog {{ background: {SIG_BG}; }}
+
+QGroupBox {{
+    background: {SIG_GROUP_BG};
+    border: 1px solid {SIG_BORDER_SOFT};
+    border-radius: 8px;
+    margin-top: 14px;
+}}
+QGroupBox::title {{
+    subcontrol-origin: margin;
+    left: 10px;
+    padding: 3px 8px;
+    background: {SIG_ACCENT_ORANGE};
+    color: {SIG_TEXT};
+    border-radius: 6px;
+    font-weight: 600;
+}}
+
+QTabWidget::pane {{
+    border: 1px solid {SIG_BORDER_SOFT};
+    top: -1px;
+    background: {SIG_GROUP_BG};
+}}
+QTabBar::tab {{
+    background: {SIG_TAB_BG};
+    padding: 7px 14px;
+    border: 1px solid {SIG_BORDER_SOFT};
+    border-bottom: none;
+    border-top-left-radius: 8px;
+    border-top-right-radius: 8px;
+    color: {SIG_TEXT};
+}}
+QTabBar::tab:hover {{ background: {SIG_TAB_HOVER}; }}
+QTabBar::tab:selected {{
+    background: {SIG_ACCENT_BLUE};
+    color: #0F1B2E;
+    font-weight: 700;
+}}
+
+QPushButton {{
+    background: {SIG_TAB_BG};
+    border: 1px solid {SIG_BORDER_SOFT};
+    border-radius: 8px;
+    padding: 6px 12px;
+    color: {SIG_TEXT};
+}}
+QPushButton:hover {{ background: {SIG_TAB_HOVER}; }}
+QPushButton:pressed {{
+    background: {SIG_ACCENT_ORANGE};
+    color: #2A1500;
+}}
+
+QLineEdit, QComboBox, QTextEdit, QSpinBox, QDoubleSpinBox {{
+    background: #D4D4D9;
+    border: 1px solid {SIG_BORDER_SOFT};
+    border-radius: 8px;
+    padding: 5px 8px;
+    color: {SIG_TEXT};
+}}
+QComboBox::drop-down {{ width: 24px; }}
+
+QCheckBox, QRadioButton {{
+    background: transparent;
+    border: none;
+    color: {SIG_TEXT};
+}}
+
+QSlider::groove:horizontal {{
+    height: 6px;
+    background: {SIG_BORDER_SOFT};
+    border-radius: 3px;
+}}
+QSlider::handle:horizontal {{
+    width: 16px;
+    background: {SIG_SLIDER};
+    border: 1px solid {SIG_ACCENT_ORANGE};
+    border-radius: 8px;
+    margin: -6px 0;
+}}
+
+QScrollBar:vertical {{
+    width: 12px;
+    background: {SIG_TAB_BG};
+    border: 1px solid {SIG_BORDER_SOFT};
+    border-radius: 6px;
+}}
+QScrollBar::handle:vertical {{
+    background: {SIG_BORDER};
+    border-radius: 6px;
+}}
+"""
 
 # --- Graphite Dusk (cool neutral dusk) ----------------------------------------------------
 GRA_BG = "#202428"           # window background (graphite)
@@ -344,7 +568,10 @@ QGroupBox::title {{ subcontrol-origin: margin; left: 10px; padding: 3px 8px; bac
 QTabWidget::pane {{ border: 1px solid {SLATE_BORDER}; top: -1px; background: {SLATE_GROUP_BG}; }}
 QTabBar::tab {{ background: #262a31; padding: 7px 14px; border: 1px solid {SLATE_BORDER}; border-bottom: none; border-top-left-radius: 8px; border-top-right-radius: 8px; }}
 QTabBar::tab:hover {{ background: #20242b; }}
-QTabBar::tab:selected {{ background: {SLATE_GROUP_BG}; color: {SLATE_TEXT}; font-weight: 700; }}
+QTabBar::tab:selected {{
+    background: qlineargradient(x1:0,y1:0,x2:1,y2:0, stop:0 #4338ca, stop:1 {SLATE_ACCENT});
+    color: {SLATE_TEXT}; font-weight: 700; border-color: {SLATE_ACCENT};
+}}
 QPushButton {{ background: #262a31; border: 1px solid {SLATE_BORDER}; border-radius: 8px; padding: 6px 12px; color: {SLATE_TEXT}; }}
 QPushButton:hover {{ background: #20242b; }}
 QLineEdit, QComboBox, QTextEdit, QSpinBox, QDoubleSpinBox {{ background: #22262d; border: 1px solid {SLATE_BORDER}; border-radius: 8px; padding: 5px 8px; color: {SLATE_TEXT}; }}
@@ -571,7 +798,10 @@ QGroupBox::title { subcontrol-origin: margin; left: 10px; padding: 4px 10px; bac
 QTabWidget::pane { border: 1px solid #1e3a2f; top: -1px; background: #0f1e19; }
 QTabBar::tab { background: #0e1a16; padding: 8px 16px; border: 1px solid #1e3a2f; color: #d7ffee; border-top-left-radius: 10px; border-top-right-radius: 10px; }
 QTabBar::tab:hover { background: #11241e; }
-QTabBar::tab:selected { background: #22d3ee; color: #00171b; font-weight: 800; }
+QTabBar::tab:selected {
+    background: qlineargradient(x1:0,y1:0,x2:1,y2:0, stop:0 #22d3ee, stop:1 #f59e0b);
+    color: #00171b; font-weight: 800; border-color:#22d3ee;
+}
 QPushButton, QToolButton { background: #0e1a16; border: 1px solid #2a5d4c; border-radius: 12px; padding: 8px 14px; color: #e8fff4; }
 QPushButton:hover, QToolButton:hover { background: #143126; }
 QPushButton:pressed, QToolButton:pressed { background: #0f271f; }
@@ -799,7 +1029,10 @@ QGroupBox::title {{ subcontrol-origin: margin; left: 10px; padding: 0 5px; backg
 QTabWidget::pane {{ border: 1px solid {MARDI_BORDER}; top: -1px; background: {MARDI_GROUP_BG}; }}
 QTabBar::tab {{ background: {MARDI_TAB_BG}; padding: 7px 14px; border: 1px solid {MARDI_BORDER}; border-bottom: none; border-top-left-radius: 8px; border-top-right-radius: 8px; }}
 QTabBar::tab:hover {{ background: {MARDI_TAB_HOVER}; }}
-QTabBar::tab:selected {{ background: {MARDI_ACCENT}; color: {MARDI_ACCENT_TEXT}; font-weight: 700; }}
+QTabBar::tab:selected {{
+    background: qlineargradient(x1:0,y1:0,x2:1,y2:0, stop:0 {MARDI_TAB_BG}, stop:1 {MARDI_ACCENT});
+    color: {MARDI_ACCENT_TEXT}; font-weight: 700; border-color: {MARDI_ACCENT};
+}}
 
 QPushButton {{ background: {MARDI_BTN}; border: 1px solid {MARDI_BORDER}; border-radius: 8px; padding: 6px 10px; }}
 QPushButton:hover {{ background: {MARDI_BTN_HOVER}; }}
@@ -948,37 +1181,6 @@ QScrollBar::handle:vertical { background: #00E5FF; border-radius: 6px; }
 # Added: Sky Light & Pastel Light (light themes that work in Settings tab)
 # These reuse the Day palette colors with different gentle accents.
 # ----------------------------------------------------------------------------------------
-# --- Sky Light — airy blue light theme ----------------------------------------------------
-QSS_SKY_LIGHT = f"""
-QAbstractScrollArea {{ background: {DAY_BG}; }}
-QScrollArea QWidget#qt_scrollarea_viewport {{ background: {DAY_BG}; }}
-QWidget {{ background: {DAY_BG}; color: {DAY_TEXT}; }}
-QMainWindow, QDialog {{ background: {DAY_BG}; }}
-
-QGroupBox {{ background: {DAY_GROUP_BG}; border: 1px solid {DAY_BORDER_SOFT}; border-radius: 8px; margin-top: 14px; }}
-QGroupBox::title {{ subcontrol-origin: margin; left: 10px; padding: 3px 8px; background: #BFE7FF; color: {DAY_TEXT}; border-radius: 6px; font-weight: 600; }}
-
-QTabWidget::pane {{ border: 1px solid {DAY_BORDER_SOFT}; top: -1px; background: {DAY_GROUP_BG}; }}
-QTabBar::tab {{ background: #E9F6FF; padding: 7px 14px; border: 1px solid {DAY_BORDER_SOFT}; border-bottom: none; border-top-left-radius: 8px; border-top-right-radius: 8px; }}
-QTabBar::tab:hover {{ background: #D9F0FF; }}
-QTabBar::tab:selected {{ background: {DAY_GROUP_BG}; color: {DAY_TEXT}; font-weight: 700; }}
-
-QPushButton {{ background: #E9F6FF; border: 1px solid {DAY_BORDER_SOFT}; border-radius: 8px; padding: 6px 12px; }}
-QPushButton:hover {{ background: #DDF1FF; }}
-QPushButton:pressed {{ background: #D1EBFF; }}
-
-QLineEdit, QComboBox, QTextEdit, QSpinBox, QDoubleSpinBox {{ background: {DAY_INPUT_BG}; border: 1px solid {DAY_BORDER_SOFT}; border-radius: 8px; padding: 5px 8px; color: {DAY_TEXT}; }}
-QComboBox::drop-down {{ width: 24px; }}
-
-QCheckBox, QRadioButton {{ background: transparent; border: none; }}
-
-QSlider::groove:horizontal {{ height: 6px; background: {DAY_BORDER_SOFT}; border-radius: 3px; }}
-QSlider::handle:horizontal {{ width: 16px; background: #7FD6FF; border: 1px solid #78c3ff; border-radius: 8px; margin: -6px 0; }}
-
-QScrollBar:vertical {{ width: 12px; background: #E9F6FF; border: 1px solid {DAY_BORDER_SOFTER}; border-radius: 6px; }}
-QScrollBar::handle:vertical {{ background: {DAY_BORDER_SOFT}; border-radius: 6px; }}
-"""
-
 # --- Pastel Light — soft lilac/peach accents on light base --------------------------------
 QSS_PASTEL_LIGHT = f"""
 QAbstractScrollArea {{ background: {DAY_BG}; }}

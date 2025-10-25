@@ -104,7 +104,7 @@ def _theme_row(page: QWidget) -> QWidget:
     h = QHBoxLayout(top); h.setContentsMargins(0,0,0,0); h.setSpacing(8)
     lab = QLabel("Theme:")
     box = QComboBox(); box.addItems([
-        "Day","Sky Light","Pastel Light","Solarized Light","Sunburst",
+        "Day","Pastel Light","Solarized Light","Sunburst","Cloud Grey","Signal Grey",
         "Evening","Night","Graphite Dusk","Slate","High Contrast","Cyberpunk","Neon","Ocean","CRT","Aurora",
         "Mardi Gras","Tropical Fiesta","Color Mix","Candy Pop","Rainbow Riot","Random","Auto"
     ])
