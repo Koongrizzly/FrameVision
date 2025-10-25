@@ -6,12 +6,19 @@ LOG_DIR = None
 LOG_PATH = None
 LOG_FH = None
 _HEARTBEAT = True
+_DISABLED = False
 
 def _now():
     return datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
 
 def _ensure_logs():
+    """
+    Lazily create/open the diagnostics log file.
+    If diagnostics are disabled, this is a no-op.
+    """
     global LOG_DIR, LOG_PATH, LOG_FH
+    if _DISABLED:
+        return LOG_DIR, LOG_PATH
     if LOG_FH:
         return LOG_DIR, LOG_PATH
     base = pathlib.Path.cwd() / "logs"
@@ -23,10 +30,15 @@ def _ensure_logs():
     return LOG_DIR, LOG_PATH
 
 def _writeln(line):
+    """
+    Append a line to the diagnostics log (if enabled).
+    Safe no-op if disabled or file can't be written.
+    """
+    if _DISABLED:
+        return
     _ensure_logs()
     try:
         LOG_FH.write(line + "\n")
-        LOG_FH.flush()
     except Exception:
         pass
 
@@ -93,13 +105,32 @@ def _install_faulthandler():
     try:
         import faulthandler
         ld, lp = _ensure_logs()
-        crash_path = os.path.join(ld, "crash_{}.log".format(datetime.datetime.now().strftime("%Y%m%d_%H%M%S")))
+
+        # cleanup: remove tiny/empty old crash logs (<512 bytes ~ 0.5 KB)
+        try:
+            for name in os.listdir(ld):
+                if not (name.startswith("crash_") and name.endswith(".log")):
+                    continue
+                full = os.path.join(ld, name)
+                try:
+                    st = os.stat(full)
+                    # keep only crash logs that are >=0.5 KB (512 bytes)
+                    if st.st_size < 512:
+                        os.remove(full)
+                except Exception:
+                    # ignore per-file cleanup issues
+                    pass
+        except Exception as cleanup_err:
+            _writeln(f"[{_now()}] cleanup old crash logs failed: {cleanup_err!r}")
+
+        crash_path = os.path.join(
+            ld, "crash_{}.log".format(datetime.datetime.now().strftime("%Y%m%d_%H%M%S"))
+        )
         fh = open(crash_path, "w", encoding="utf-8")
         faulthandler.enable(file=fh, all_threads=True)
         _writeln(f"[{_now()}] faulthandler enabled -> {crash_path}")
     except Exception as e:
         _writeln(f"[{_now()}] faulthandler enable failed: {e!r}")
-
 def _install_qt_message_handler():
     try:
         from PySide6.QtCore import qInstallMessageHandler, QtMsgType
@@ -136,7 +167,7 @@ def _start_heartbeat():
     def beat():
         i = 0
         while _HEARTBEAT:
-            time.sleep(1.0)
+            time.sleep(60.0)
             _writeln(f"[{_now()}] heartbeat {i}")
             i += 1
     t = threading.Thread(target=beat, name="diag_heartbeat", daemon=True)
@@ -187,7 +218,63 @@ def wire_to_videopane(VideoPaneClass):
     VideoPaneClass._diag_open_wrapped = True
     _writeln(f"[{_now()}] VideoPane.open wrapped for diagnostics")
 
+
+def _read_enabled_flag():
+    """
+    Returns True if diag logging is enabled, False if disabled.
+    Priority:
+    1. QSettings("FrameVision","FrameVision") diag_probe_enabled
+    2. helpers.framevision_app.config["diag_probe_enabled"]
+    3. default True
+    Also accepts string-y false values.
+    """
+    # 1. Try QSettings
+    try:
+        from PySide6.QtCore import QSettings
+        s = QSettings("FrameVision", "FrameVision")
+        raw = s.value("diag_probe_enabled", None)
+        if raw is not None:
+            # Normalize various possible types
+            if isinstance(raw, bool):
+                return raw
+            if isinstance(raw, (int, float)):
+                return bool(raw)
+            txt = str(raw).strip().lower()
+            if txt in ("0", "false", "no", "off", "disabled"):
+                return False
+            return True
+    except Exception:
+        pass
+
+    # 2. Fallback to config dict (worker/headless path)
+    try:
+        from helpers.framevision_app import config as _cfg
+        if "diag_probe_enabled" in _cfg:
+            return bool(_cfg["diag_probe_enabled"])
+    except Exception:
+        pass
+
+    # 3. Default
+    return True
+
 def init_diagnostics():
+    """
+    Initialize diagnostics logging (heartbeat, hooks, etc.).
+    Honors the global enabled flag.
+    When disabled:
+      - We DO NOT create diag_*.log
+      - We DO NOT create crash_*.log
+      - We DO NOT start heartbeat / hooks
+      - _writeln() becomes a silent no-op
+    """
+    global _DISABLED
+    enabled = _read_enabled_flag()
+    if not enabled:
+        _DISABLED = True
+        return None
+
+    # Normal path (enabled)
+    _DISABLED = False
     _ensure_logs()
     _dump_header()
     _install_excepthooks()
@@ -197,3 +284,4 @@ def init_diagnostics():
     _start_heartbeat()
     atexit.register(lambda: _writeln(f"[{_now()}] diagnostics exit"))
     return LOG_PATH
+
