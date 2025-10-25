@@ -248,13 +248,13 @@ class InterpPane(QWidget):
             ("rife-v4",   "RIFE v4 — older general use"),
             ("rife-v4.6", "RIFE v4.6 — fast, general use"),
             ("rife-HD",   "RIFE HD — 1080p–1440p detail"),
-            ("rife-UHD",  "RIFE UHD — 4K masters"),
+            ("rife-UHD",  "RIFE UHD — 4K detail"),
             ("rife-anime","RIFE Anime — line-art/Animation"),
         ]
         self._model_blurbs = {
             "rife-v4.6": ("Balanced quality/speed.", "Best for 720p–1080p; default choice."),
-            "rife-HD":   ("More temporal stability for texture.", "Good for 1080p→1440p; slower, more VRAM."),
-            "rife-UHD":  ("Maximum stability for 4K/fine patterns.", "Slowest; highest VRAM usage."),
+            "rife-HD":   ("More temporal stability for texture.", "Good for 1080p→1440p."),
+            "rife-UHD":  ("Maximum stability for 4K/fine patterns.", "Use in combination with profile 4 for best result."),
             "rife-anime":("Edge-stable for cel/line-art.", "Can oversoften live-action."),
         }
 

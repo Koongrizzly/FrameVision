@@ -180,7 +180,7 @@ def _options_group(page: QWidget) -> QGroupBox:
 
     # (hidden) Intro follows theme toggle removed
 
-    v.addWidget(cb1);
+    v.addWidget(cb1)
 
     cb_clear_pyc = QCheckBox(r"Clear app Python cache files in /__pycache__ at (re)start")
     cb_clear_pyc.setChecked(s.value("clear_pyc_on_start", False, type=bool))
@@ -190,19 +190,51 @@ def _options_group(page: QWidget) -> QGroupBox:
     cb_keep_settings.setChecked(s.value("keep_settings_after_restart", True, type=bool))
     cb_keep_settings.toggled.connect(lambda b: s.setValue("keep_settings_after_restart", bool(b)))
 
+    cb_diag = QCheckBox("Enable diagnostic logging (restart to apply)")
+    cb_diag.setToolTip("Turn this off to disable FrameVision's background diagnostics / heartbeat logs.")
+
+    enabled_val = s.value("diag_probe_enabled", True, type=bool)
+    cb_diag.setChecked(enabled_val)
+
+    # mirror value into config so headless/worker processes (no Qt) can read it
+    try:
+        from helpers.framevision_app import config as _cfg, save_config as _save
+        _cfg["diag_probe_enabled"] = bool(enabled_val)
+        _save()
+    except Exception:
+        pass
+
+    def _on_diag_toggle(b):
+        s.setValue("diag_probe_enabled", bool(b))
+        try:
+            from helpers.framevision_app import config as _cfg, save_config as _save
+            _cfg["diag_probe_enabled"] = bool(b)
+            _save()
+        except Exception:
+            pass
+
+    cb_diag.toggled.connect(lambda b: _on_diag_toggle(b))
+
     v.addWidget(cb_clear_pyc)
     v.addWidget(cb_keep_settings)
+    v.addWidget(cb_diag)
 
-    row = QtWidgets.QWidget(g)
-    h2 = QtWidgets.QHBoxLayout(row); h2.setContentsMargins(0,4,0,0); h2.setSpacing(8)
-    h2.addWidget(QtWidgets.QLabel("Temperature units:"))
-    combo = QtWidgets.QComboBox(row); combo.addItem("Celsius (°C)", "C"); combo.addItem("Fahrenheit (°F)", "F")
+    row = QWidget(g)
+    h2 = QHBoxLayout(row); h2.setContentsMargins(0,4,0,0); h2.setSpacing(8)
+    h2.addWidget(QLabel("Temperature units:"))
+
+    combo = QComboBox(row)
+    combo.addItem("Celsius (°C)", "C")
+    combo.addItem("Fahrenheit (°F)", "F")
+
     try:
         from helpers.framevision_app import config as _cfg
         cur = (_cfg.get("temp_units","C") or "C").upper()
     except Exception:
         cur = "C"
+
     combo.setCurrentIndex(0 if cur == "C" else 1)
+
     def _apply_units():
         try:
             from helpers.framevision_app import config as _cfg, save_config as _save
@@ -211,9 +243,13 @@ def _options_group(page: QWidget) -> QGroupBox:
             _save()
         except Exception:
             pass
+
     combo.currentIndexChanged.connect(lambda _i: _apply_units())
-    h2.addWidget(combo); h2.addStretch(1)
+
+    h2.addWidget(combo)
+    h2.addStretch(1)
     v.addWidget(row)
+
     v.addStretch(0)
     return g
 
@@ -305,6 +341,7 @@ def _buttons_row(page: QWidget) -> QWidget:
         h.addWidget(b)
     h.addStretch(1)
     return row
+
 
 def _logo_group(page: QWidget) -> QWidget:
     g = QWidget(page)

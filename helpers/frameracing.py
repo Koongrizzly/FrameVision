@@ -5,7 +5,7 @@ FrameRacing — retro 4-lane racer (Pygame)
 
 Paths
 - Game: root/helpers/frameracing.py
-- High scores: root/setsave/presets/racescore.json
+- High scores: root/presets/setsave/racescore.json
 - Backgrounds: root/presets/startup/  (15% opacity overlay, changes on level-up)
 - Car sprites: root/assets/cars/  (player.png, enemy_*.png, special_*.png)
 
@@ -34,7 +34,7 @@ import pygame
 THIS_FILE = Path(__file__).resolve()
 ROOT_DIR = THIS_FILE.parents[1]
 HELPERS_DIR = ROOT_DIR / "helpers"
-SCORES_PATH = ROOT_DIR / "setsave" / "presets" / "racescore.json"
+SCORES_PATH = ROOT_DIR / "presets" / "setsave" / "racescore.json"
 BG_DIR = ROOT_DIR / "presets" / "startup"
 ASSETS_DIR = ROOT_DIR / "assets" / "cars"
 
