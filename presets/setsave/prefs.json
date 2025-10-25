@@ -1,0 +1,12 @@
+{
+  "greeting": "Professional",
+  "mode": "Coach",
+  "auto_frame": true,
+  "backend": "Transformers (VL)",
+  "device": "auto",
+  "preset": "q5",
+  "gguf": "",
+  "llama_bin": "",
+  "attach": true,
+  "stream": false
+}
