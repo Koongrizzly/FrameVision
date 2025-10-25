@@ -126,11 +126,22 @@ class SnakeGame:
     def __init__(self):
         pygame.init()
         pygame.display.set_caption("Framie the Snake — Levels, Power-Ups, High Scores")
-        pygame.init()
-        pygame.display.set_caption("Framie the Snake — Levels, Power-Ups, High Scores")
 
-        flags = pygame.FULLSCREEN | pygame.SCALED
-        self.screen = pygame.display.set_mode((WINDOW_WIDTH, WINDOW_HEIGHT), flags)
+        # Windowed mode (resizable normal window) and fullscreen mode (F11)
+        self.is_fullscreen = False
+        self.windowed_flags = pygame.RESIZABLE
+        self.fullscreen_flags = pygame.FULLSCREEN
+
+        # Create the main window in windowed mode
+        self.screen = pygame.display.set_mode((WINDOW_WIDTH, WINDOW_HEIGHT), self.windowed_flags)
+
+        # Surface we draw the game onto at the base resolution.
+        # We'll scale this surface to the actual window size each frame
+        # so maximizing the window actually makes the gameplay bigger.
+        self.base_surface = pygame.Surface((WINDOW_WIDTH, WINDOW_HEIGHT)).convert_alpha()
+
+        # Ask OS to maximize the window (normal maximize, not exclusive fullscreen).
+        self.maximize_window()
 
         self.clock = pygame.time.Clock()
 
@@ -370,14 +381,48 @@ class SnakeGame:
         add_btn("Pause", self.toggle_pause, (95,120,165), lambda: self.paused)
         add_btn("Exit", self.do_exit, (140, 60, 60), None)
         add_btn("Help", self.toggle_help, (95,165,120), lambda: self.show_help)
-        add_btn("High Scores", self.toggle_scores, (165,120,95), lambda: self.show_scores)
-        add_btn(f"Wrap: {'On' if self.wrap_enabled else 'Off'}", self.toggle_wrap, (120,120,95), lambda: self.wrap_enabled)
+        add_btn("High", self.toggle_scores, (165,120,95), lambda: self.show_scores)
+        add_btn(f"Wall: {'Off' if self.wrap_enabled else 'On'}", self.toggle_wrap, (120,120,95), lambda: self.wrap_enabled)
 
     def build_start_button(self):
         w, h = 280, 96
         cx = WINDOW_WIDTH//2 - w//2
         cy = TOPBAR_HEIGHT + 160
         self.start_button = Button((cx, cy, w, h), "Start", self.start_game, bg=(85,120,90), active_bg=(95,160,100))
+    def maximize_window(self):
+        # Try to start the game "maximized" in normal windowed mode (not exclusive fullscreen).
+        # On Windows we can ask the OS to maximize the window using the HWND via Win32 API.
+        try:
+            if os.name == "nt":
+                import ctypes
+                hwnd = pygame.display.get_wm_info().get("window")
+                if hwnd:
+                    ctypes.windll.user32.ShowWindow(hwnd, 3)  # SW_MAXIMIZE
+        except Exception:
+            # If it fails (non-Windows etc.) just ignore; the window will still be resizable
+            pass
+
+    def window_to_base(self, pos):
+        """Convert a position in the actual window (which may be scaled up) back
+        to the base 900x640 game coordinates so hover/click hitboxes line up."""
+        win_w, win_h = self.screen.get_size()
+        if win_w == 0 or win_h == 0:
+            return pos
+        scale_x = win_w / WINDOW_WIDTH
+        scale_y = win_h / WINDOW_HEIGHT
+        bx = int(pos[0] / scale_x)
+        by = int(pos[1] / scale_y)
+        return (bx, by)
+
+    def toggle_fullscreen(self):
+        # Toggle exclusive fullscreen with F11
+        self.is_fullscreen = not getattr(self, "is_fullscreen", False)
+        if self.is_fullscreen:
+            self.screen = pygame.display.set_mode((0,0), self.fullscreen_flags)
+        else:
+            self.screen = pygame.display.set_mode((WINDOW_WIDTH, WINDOW_HEIGHT), self.windowed_flags)
+            self.maximize_window()
+
 
     def in_bounds(self, cell):
         x,y = cell
@@ -479,28 +524,49 @@ class SnakeGame:
                 pass
             elif event.type == pygame.KEYDOWN:
                 if event.key == pygame.K_ESCAPE:
-                    if self.show_help: self.show_help = False
-                    elif self.show_scores: self.show_scores = False
+                    if self.show_help:
+                        self.show_help = False
+                    elif self.show_scores:
+                        self.show_scores = False
                     elif self.game_over:
                         self.game_over = False; self.in_menu = True
-                    elif not self.in_menu: self.toggle_pause()
+                    elif not self.in_menu:
+                        self.toggle_pause()
                 elif event.key in (pygame.K_RETURN, pygame.K_SPACE):
-                    if self.in_menu: self.start_game()
+                    if self.in_menu:
+                        self.start_game()
                     elif not self.show_help and not self.show_scores and not self.game_over:
                         self.toggle_pause()
-                elif event.key == pygame.K_h: self.toggle_help()
-                elif event.key == pygame.K_F1: self.toggle_scores()
-                elif event.key == pygame.K_t: self.toggle_wrap()
+                elif event.key == pygame.K_h:
+                    self.toggle_help()
+                elif event.key == pygame.K_F1:
+                    self.toggle_scores()
+                elif event.key == pygame.K_t:
+                    self.toggle_wrap()
+                elif event.key == pygame.K_F11:
+                    self.toggle_fullscreen()
                 elif self.game_over and event.key == pygame.K_r:
                     self.reset(); self.in_menu = False
                 else:
                     if not (self.in_menu or self.paused or self.show_help or self.show_scores or self.game_over):
-                        if event.key in (pygame.K_UP, pygame.K_w): self.set_direction((0,-1))
-                        elif event.key in (pygame.K_DOWN, pygame.K_s): self.set_direction((0,1))
-                        elif event.key in (pygame.K_LEFT, pygame.K_a): self.set_direction((-1,0))
-                        elif event.key in (pygame.K_RIGHT, pygame.K_d): self.set_direction((1,0))
-            for b in self.buttons: b.handle_event(event)
-            if self.in_menu: self.start_button.handle_event(event)
+                        if event.key in (pygame.K_UP, pygame.K_w):
+                            self.set_direction((0,-1))
+                        elif event.key in (pygame.K_DOWN, pygame.K_s):
+                            self.set_direction((0,1))
+                        elif event.key in (pygame.K_LEFT, pygame.K_a):
+                            self.set_direction((-1,0))
+                        elif event.key in (pygame.K_RIGHT, pygame.K_d):
+                            self.set_direction((1,0))
+            elif event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
+                mapped = self.window_to_base(event.pos)
+                # top bar buttons
+                for b in self.buttons:
+                    if b.rect.collidepoint(mapped):
+                        b.callback()
+                # start button in main menu
+                if self.in_menu:
+                    if self.start_button.rect.collidepoint(mapped):
+                        self.start_button.callback()
 
     def toggle_wrap(self):
         self.wrap_enabled = not self.wrap_enabled; self.build_buttons()
@@ -543,7 +609,7 @@ class SnakeGame:
         self.snake.insert(0, new_head)
         # Bonus fruit?
         if getattr(self, 'bonus_pos', None) and new_head == self.bonus_pos:
-            self.score += 300
+            self.score += 100
             self.pending_growth += 1
             self.bonus_pos = None
             self.add_pulse(YELLOW)
@@ -576,13 +642,21 @@ class SnakeGame:
 
     def draw_topbar(self, surf):
         pygame.draw.rect(surf, (30,34,44), (0,0,WINDOW_WIDTH,TOPBAR_HEIGHT))
-        mouse = pygame.mouse.get_pos()
-        for b in self.buttons: b.draw(surf, self.font_medium, mouse)
-        text = f"Score: {self.score}   Level: {self.level}   Speed: {int(1000/self.move_delay)} tps"
-        ts = self.font_medium.render(text, True, WHITE)
+        # Map mouse position from the actual window size back to base coords for hover states
+        mouse_win = pygame.mouse.get_pos()
+        mouse = self.window_to_base(mouse_win)
+        for b in self.buttons:
+            b.draw(surf, self.font_medium, mouse)
+
+        hud_text = f"Score: {self.score}   Level: {self.level}   Speed: {int(1000/self.move_delay)} tps"
+        ts = self.font_medium.render(hud_text, True, WHITE)
+
+        # place the HUD text either right-aligned or right after the last button,
+        # whichever is further to the right, so it never overlaps and never gets cut off
         right_x = WINDOW_WIDTH - ts.get_width() - 12
-        min_x = self.buttons[-1].rect.right + 16
+        min_x = self.buttons[-1].rect.right + 16 if self.buttons else 12
         x = max(right_x, min_x)
+
         surf.blit(ts, (x, (TOPBAR_HEIGHT - ts.get_height())//2))
 
     def draw_snake(self, surf):
@@ -722,17 +796,37 @@ class SnakeGame:
         while True:
             self.clock.tick(60); self.handle_input(); self.update(); self.draw()
     def draw(self):
-        if getattr(self, 'bg_surface', None): self.screen.blit(self.bg_surface, (0,0))
-        else: self.screen.fill(BLACK)
-        self.draw_grid(self.screen); self.draw_topbar(self.screen); self.draw_food(self.screen)
-        self.draw_bonus_fruit(self.screen)
-        self.draw_powerups(self.screen); self.draw_snake(self.screen)
-        for p in self.particles: p.draw(self.screen)
-        self.draw_status_row(self.screen); self.draw_effects(self.screen)
-        if self.in_menu: self.draw_start_menu(self.screen)
-        elif self.show_help: self.draw_help_overlay(self.screen)
-        elif self.show_scores: self.draw_scores_overlay(self.screen)
-        elif self.game_over: self.draw_gameover_overlay(self.screen)
+        # Draw everything to the fixed-resolution base surface first
+        if getattr(self, 'bg_surface', None):
+            self.base_surface.blit(self.bg_surface, (0,0))
+        else:
+            self.base_surface.fill(BLACK)
+    
+        self.draw_grid(self.base_surface)
+        self.draw_topbar(self.base_surface)
+        self.draw_food(self.base_surface)
+        self.draw_bonus_fruit(self.base_surface)
+        self.draw_powerups(self.base_surface)
+        self.draw_snake(self.base_surface)
+    
+        for p in self.particles:
+            p.draw(self.base_surface)
+    
+        self.draw_status_row(self.base_surface)
+        self.draw_effects(self.base_surface)
+    
+        if self.in_menu:
+            self.draw_start_menu(self.base_surface)
+        elif self.show_help:
+            self.draw_help_overlay(self.base_surface)
+        elif self.show_scores:
+            self.draw_scores_overlay(self.base_surface)
+        elif self.game_over:
+            self.draw_gameover_overlay(self.base_surface)
+    
+        # Scale the base surface up to the actual window size
+        scaled = pygame.transform.smoothscale(self.base_surface, self.screen.get_size())
+        self.screen.blit(scaled, (0,0))
         pygame.display.flip()
 
 if __name__ == "__main__":
