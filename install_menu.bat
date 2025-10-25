@@ -4,6 +4,22 @@ set "ROOT=%~dp0"
 cd /d "%ROOT%"
 
 :menu
+REM ===== [FRAMEVISION TOOL LINK - DO NOT REMOVE] =====
+REM Create a 'bin' junction that points to 'presets\bin' so legacy code
+REM looking for ROOT\bin\ffmpeg.exe etc. still works without duplicating files.
+
+set "TOOLREAL=%ROOT%presets\bin"
+set "TOOLLINK=%ROOT%bin"
+
+if exist "%TOOLREAL%" (
+    REM If there's already a real folder at bin (like leftover copied EXEs), leave it.
+    REM If it does NOT exist but a link is needed, create a junction.
+    if not exist "%TOOLLINK%" (
+        REM mklink /J requires admin (or Developer Mode). It creates a directory junction.
+        mklink /J "%TOOLLINK%" "%TOOLREAL%"
+    )
+)
+REM ===== [END FRAMEVISION TOOL LINK] =====
 rem --- initialize ANSI colors (works on Windows 10+ / Windows Terminal) ---
 for /F "delims=#" %%A in ('"prompt #$E# & for %%B in (1) do rem"') do set "ESC=%%A"
 set "RST=%ESC%[0m"
