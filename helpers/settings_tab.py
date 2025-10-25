@@ -138,7 +138,7 @@ def _theme_row(page: QWidget) -> QWidget:
     ov_combo = QComboBox()
     ov_combo.addItems(["Random","Matrix (Green)","Matrix (Blue)","Bokeh","Rain","FirefliesParallax","StarfieldHyperjump","CometTrails","AuroraFlow"])
 
-    ov_preview = QCheckBox("Preview in Settings")
+    ov_preview = QCheckBox("Preview")
     ov_preview.setToolTip("If enabled, shows the intro overlay briefly in the Settings preview.")
 
     _s = QSettings("FrameVision", "FrameVision")
@@ -174,6 +174,7 @@ def _options_group(page: QWidget) -> QGroupBox:
         pass
 
     cb1 = QCheckBox("Show random intro image on startup")
+    cb1.setVisible(False)
     cb1.setChecked(s.value("intro_enabled", True, type=bool))
     cb1.toggled.connect(lambda b: s.setValue("intro_enabled", bool(b)))
 
@@ -292,7 +293,7 @@ def _buttons_row(page: QWidget) -> QWidget:
             pass
     btn_restart.clicked.connect(do_restart)
 
-    btn_dump = QPushButton("Dump QSettings now")
+    btn_dump = QPushButton("Show QSettings in CMD")
     def do_dump():
         try:
             from helpers.diagnostics import dump_qsettings

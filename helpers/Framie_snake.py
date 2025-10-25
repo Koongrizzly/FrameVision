@@ -126,7 +126,12 @@ class SnakeGame:
     def __init__(self):
         pygame.init()
         pygame.display.set_caption("Framie the Snake — Levels, Power-Ups, High Scores")
-        self.screen = pygame.display.set_mode((WINDOW_WIDTH, WINDOW_HEIGHT))
+        pygame.init()
+        pygame.display.set_caption("Framie the Snake — Levels, Power-Ups, High Scores")
+
+        flags = pygame.FULLSCREEN | pygame.SCALED
+        self.screen = pygame.display.set_mode((WINDOW_WIDTH, WINDOW_HEIGHT), flags)
+
         self.clock = pygame.time.Clock()
 
         self.font_small  = pygame.font.SysFont("consolas,dejavusans,arial", 18)
