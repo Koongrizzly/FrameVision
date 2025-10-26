@@ -3,6 +3,13 @@ setlocal EnableExtensions
 set "ROOT=%~dp0"
 cd /d "%ROOT%"
 
+rem --- Ensure legacy .\bin points to .\presets\bin (ffmpeg etc.) ---
+if exist "presets\bin" (
+  if not exist "bin" (
+    mklink /J "bin" "presets\bin" >nul 2>nul
+  )
+)
+
 rem --- Only run app if venv + install flag + entry exist ---
 set "HAVE_VENV="
 if exist .venv\Scripts\python.exe set "HAVE_VENV=1"
