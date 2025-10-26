@@ -1,0 +1,141 @@
+
+# helpers/hud_colorizer.py — colorize % and temperatures (flashless ≥70°C)
+from __future__ import annotations
+import re
+from PySide6.QtCore import Qt, QTimer
+from PySide6.QtWidgets import QApplication, QLabel
+
+YELLOW = "#e0c600"
+ORANGE = "#d98a00"
+RED    = "#d70022"
+# NOTE: Removed background highlight and hysteresis-based 'red alert' to stop any flashing at ≥70°C.
+
+# Percent patterns (one each)
+_PAT_GPU = re.compile(r"(GPU\s*:.*?\s)(\d{1,3})%", re.IGNORECASE)
+_PAT_DDR = re.compile(r"(DDR\s*.*?\s)(\d{1,3})%", re.IGNORECASE)
+_PAT_CPU = re.compile(r"(CPU\s*)(\d{1,3})%", re.IGNORECASE)
+
+# Temperature tokens like '62°C' or '62 C' or '62c'
+_PAT_TEMP = re.compile(r"""
+    (?<![\dA-Za-z])        # not part of a larger token
+    (\d{2,3})              # temperature value (2–3 digits)
+    \s*                    # optional space
+    (?:°\s*)?              # optional degree symbol
+    ([cC])                  # 'C' or 'c'
+    (?![\dA-Za-z])         # not followed by alnum
+""", re.VERBOSE)
+
+def _wrap_percent(num_str: str) -> str:
+    try:
+        v = int(num_str)
+    except Exception:
+        return num_str + "%"
+    if v >= 95:
+        color = RED
+    elif v >= 85:
+        color = ORANGE
+    else:
+        return num_str + "%"
+    return f"<span style='color:{color};font-weight:600'>{v}%</span>"
+
+def _class_for_temp(value: int, in_red_hys: bool) -> str | None:
+    # Hysteresis no longer used; argument kept for signature compatibility.
+    if value >= 70:
+        return RED
+    if value >= 65:
+        return ORANGE
+    if value >= 60:
+        return YELLOW
+    return None
+
+def _wrap_temp_token(full_token: str, value_str: str, in_red_hys: bool) -> str:
+    """Wrap a temperature token (e.g., '65°C') based on thresholds.
+    Flashless behavior: no background highlight, no hysteresis-based state.
+    Thresholds:
+      <60  : no change
+      60-64: yellow
+      65-69: orange
+      ≥70  : red (text only)
+    """
+    try:
+        v = int(value_str)
+    except Exception:
+        return full_token
+    color = _class_for_temp(v, in_red_hys)
+    if not color:
+        return full_token
+    return f"<span style='color:{color};font-weight:600'>{full_token}</span>"
+
+def _colorize_percents(text: str) -> str:
+    s = text
+    for pat in (_PAT_GPU, _PAT_DDR, _PAT_CPU):
+        def repl(m):
+            prefix, num = m.group(1), m.group(2)
+            return prefix + _wrap_percent(num)
+        s = pat.sub(repl, s, count=1)  # one token each
+    return s
+
+def _colorize_temps(text: str, in_red_hys: bool) -> str:
+    def repl(m: re.Match) -> str:
+        value = m.group(1)
+        return _wrap_temp_token(m.group(0), value, in_red_hys)
+    return _PAT_TEMP.sub(repl, text)
+
+def _strip_tags(s: str) -> str:
+    return re.sub(r"<[^>]+>", "", s)
+
+def _find_header_label() -> QLabel | None:
+    app = QApplication.instance()
+    if not app: return None
+    # Find a QLabel whose text contains GPU, DDR and CPU (your header usually has all three)
+    for w in app.allWidgets():
+        if isinstance(w, QLabel):
+            try:
+                t = _strip_tags(w.text())
+                if "GPU" in t and "DDR" in t and "CPU" in t:
+                    return w
+            except Exception:
+                continue
+    return None
+
+def auto_install_hud_colorizer(interval_ms: int = 2500):
+    lbl = _find_header_label()
+    if not lbl:
+        QTimer.singleShot(600, lambda: auto_install_hud_colorizer(interval_ms))
+        return
+    if getattr(lbl, "_fv_hud_colorizer_active", False):
+        return
+    lbl._fv_hud_colorizer_active = True
+    lbl.setTextFormat(Qt.RichText)
+
+    # Persistent state on the label for change detection (no hysteresis)
+    state = {"last_plain": None}
+    lbl._fv_hud_colorizer_state = state  # for debugging
+
+    timer = QTimer(lbl)
+    def tick():
+        try:
+            plain = _strip_tags(lbl.text())
+            if plain == state.get("last_plain") and not state.get("force_next", False):
+                return
+
+            # Colorize: temps (no hysteresis) then percents
+            colored = _colorize_temps(plain, in_red_hys=False)
+            colored = _colorize_percents(colored)
+
+            # No background highlight; text-only colorization to avoid flashing.
+            if colored != lbl.text():
+                lbl.setText(colored)
+
+            # Update state
+            state["last_plain"] = plain
+            state["force_next"] = False
+        except Exception:
+            pass
+
+    timer.setInterval(interval_ms)
+    timer.timeout.connect(tick)
+    timer.start()
+    # run once immediately
+    state["force_next"] = True
+    tick()
