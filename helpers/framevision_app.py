@@ -1653,10 +1653,7 @@ class VideoPane(QWidget):
             self._mode = 'video'
             self.label.setMovie(None)
             self._rebuild_player()
-            src_path = str(p)
-            if hasattr(self, "volume_popup_widget") and self.volume_popup_widget:
-                src_path = self.volume_popup_widget.get_eq_processed_path(src_path)
-            self.player.setSource(QUrl.fromLocalFile(src_path))
+            self.player.setSource(QUrl.fromLocalFile(str(p)))
             try:
                 self.player.play()
             except Exception:

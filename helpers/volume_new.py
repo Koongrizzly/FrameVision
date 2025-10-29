@@ -1,88 +1,63 @@
-import os
-import json
 from PySide6.QtCore import Qt, QTimer
 from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel, QSlider, QPushButton,
-    QFrame, QToolButton, QCheckBox, QGridLayout, QMenu, QWidgetAction,
-    QComboBox, QInputDialog, QMessageBox
+    QFrame, QToolButton, QCheckBox, QGridLayout, QMenu, QWidgetAction
 )
 
 """
-volume_new.py  (v11)
+volume_new.py (safe drop-in with persistent mute/volume, fast re-mute on track change)
 
-What this gives you:
-- Volume slider (0..100)  ✅ works
-- Mute checkbox           ✅ works
-- Sticky mute/volume across tracks (no popping, no skipping first beat)
-- 12-band EQ sliders      ✅ UI
-- Reset EQ button         ✅ UI, resets + saves
-- Preset dropdown         ✅ new
-- Save preset / Delete preset buttons ✅ new
-- EQ state auto-saves and auto-loads across app restarts ✅ new
+Public surface is the SAME as your old file:
+    - add_new_volume_popup(pane, bar_layout)
+    - class _MenuPopupWidget
+    - pane.btn_volume_new
+    - pane.volume_popup_menu
+    - pane.volume_popup_widget
 
-Paths (relative to current working directory when you launch the app):
-    presets/setsave/eq_state.json
-    presets/setsave/eqpresets/*.json
+Behavior guarantees:
+    - We DO NOT pause playback
+    - We DO NOT resume playback
+    - We DO NOT seek / jump / scrub
+    - We DO NOT wrap pane.open()
+    - We DO NOT run gating logic / ffmpeg sidecar / volume guards
 
-These folders/files are created automatically if missing.
+We ONLY:
+    - Give you a popup with Volume, Mute, EQ sliders (placeholder EQ)
+    - Apply volume/mute on the audio output object
+    - Remember desired mute/volume and re-apply them across tracks
 
-Things we very intentionally DO NOT do (for safety/stability right now):
-- We NEVER pause/resume/seek the player
-- We NEVER do 150ms gates or first-beat skips
-- We NEVER hijack playback or spawn a side ffmpeg process
-- We DO NOT yet process audio through an EQ filter (that's the next phase where we build a proper master/mixer)
+What's new vs previous version:
+    - We keep global desired mute/volume and enforce them more aggressively.
+    - Poll loop is now ~75ms instead of 500ms so you don't get ~0.5s of "leak."
+    - We also hook player signals (mediaChanged etc.) so when a new track starts,
+      we instantly re-mute if the user wanted mute.
 
-Public API is the same as before:
-    add_new_volume_popup(pane, bar_layout)
-    class _MenuPopupWidget
-    pane.btn_volume_new
-    pane.volume_popup_menu
-    pane.volume_popup_widget
+EQ sliders:
+    - Still visual only for now. They don't affect audio yet.
+    - You can read them from:
+        pane.volume_popup_widget.get_eq_gains_db()
 """
 
-# 12-band EQ (UI). Each is -12..+12 dB
+# 5-band EQ like the old visible layout you showed.
+# We can expand to 12 bands later, easy.
 BANDS = [
-    ("60 Hz",      60),
-    ("120 Hz",     120),
-    ("230 Hz",     230),
-    ("460 Hz",     460),
-    ("910 Hz",     910),
-    ("1.8 kHz",    1800),
-    ("2.5 kHz",    2500),
-    ("3.6 kHz",    3600),
-    ("5 kHz",      5000),
-    ("7 kHz",      7000),
-    ("10 kHz",     10000),
-    ("14 kHz",     14000),
+    ("60 Hz",   60),
+    ("230 Hz",  230),
+    ("910 Hz",  910),
+    ("3.6 kHz", 3600),
+    ("14 kHz",  14000),
 ]
 
-# Where we persist EQ stuff
-_BASE_EQ_DIR      = os.path.join(os.getcwd(), "presets", "setsave")
-_EQ_STATE_FILE    = os.path.join(_BASE_EQ_DIR, "eq_state.json")
-_EQ_PRESET_DIR    = os.path.join(_BASE_EQ_DIR, "eqpresets")
-
-# Global desired state for sticky mute & volume
-_DESIRED_VOL_PCT = 100    # slider % 0..100
-_DESIRED_MUTED   = False  # True if user checked "Mute"
-
-
-def _ensure_eq_dirs():
-    """Make sure presets/setsave/ and presets/setsave/eqpresets/ actually exist."""
-    try:
-        os.makedirs(_BASE_EQ_DIR, exist_ok=True)
-    except Exception:
-        pass
-    try:
-        os.makedirs(_EQ_PRESET_DIR, exist_ok=True)
-    except Exception:
-        pass
+# Global desired state so it survives track changes / new popup instances
+_DESIRED_VOL_PCT = 100   # 0-100
+_DESIRED_MUTED   = False # True if user hit Mute
 
 
 def _resolve_audio(pane):
     """
-    Find the audio output object (QAudioOutput / similar).
-    We ONLY touch setVolume()/setMuted() on this.
-    We do NOT touch playback timing.
+    Find the audio output object we are allowed to control.
+    We ONLY ever call setVolume()/setMuted() on this.
+    We NEVER touch transport timing.
     """
     for name in ("audio", "audio_output", "audioOutput", "player_audio", "audio_out"):
         if hasattr(pane, name):
@@ -90,7 +65,7 @@ def _resolve_audio(pane):
             if a is not None:
                 return a
 
-    # fallback: pane.player.audioOutput()
+    # fallback via player.audioOutput()
     for nm in ("player", "media_player", "video_player"):
         p = getattr(pane, nm, None)
         if p is not None and hasattr(p, "audioOutput"):
@@ -106,9 +81,9 @@ def _resolve_audio(pane):
 
 def _resolve_player(pane):
     """
-    Try to find the playback object.
-    We ONLY listen to its signals so we can re-apply mute/volume instantly on changes.
-    We DO NOT pause/resume/seek it.
+    Best guess at the playback object (QMediaPlayer-like).
+    We do NOT control it. We ONLY listen for its signals so we can
+    instantly re-apply mute/volume when the source changes.
     """
     for nm in ("player", "media_player", "video_player"):
         p = getattr(pane, nm, None)
@@ -119,45 +94,33 @@ def _resolve_player(pane):
 
 class _MenuPopupWidget(QWidget):
     """
-    The popup content shown when you click the 🔊 button.
+    Popup widget that lives inside the menu.
 
-    Exposes:
-      - self.vol (QSlider horizontal)
-      - self.mute (QCheckBox)
-      - self.eq (list of 12 vertical sliders)
-      - self.preset_combo (QComboBox)
-      - schedule_reapply() (compat no-op)
+    Compatibility:
+        - self.vol  (QSlider, horizontal)
+        - self.mute (QCheckBox)
+        - self.eq   (list of band sliders)
+        - schedule_reapply()  (now harmless no-op)
 
-    Behavior:
-      - Auto-load last EQ state from eq_state.json on startup
-      - Auto-save EQ state whenever sliders move / reset is clicked
-      - Preset dropdown lets you load presets from /eqpresets/
-      - "Save Preset" writes a new file in /eqpresets/
-      - "Delete Preset" removes the selected preset file
+    Safe behavior only:
+        - NO pause/resume/seek logic
+        - NO 150ms push
+        - NO ffmpeg sidecar ownership
     """
 
     def __init__(self, pane, parent=None):
         super().__init__(parent)
         self.pane = pane
 
-        _ensure_eq_dirs()
-
-        # guard to avoid signal loops when we update UI ourselves
+        # prevent feedback loops while syncing
         self._internal_change = False
 
-        # copy global desired volume/mute into this widget instance
+        # mirror globals locally, and update globals when user changes things
         global _DESIRED_VOL_PCT, _DESIRED_MUTED
         self._desired_vol_pct = _DESIRED_VOL_PCT
         self._desired_muted   = _DESIRED_MUTED
 
-        # remember last-applied audio state so we don't spam setVolume()/setMuted()
-        self._last_applied_vol_pct = None
-        self._last_applied_muted   = None
-
-        # -------------------------------------------------
-        # BUILD UI
-        # -------------------------------------------------
-
+        # ---- UI BUILD ----
         frame = QFrame(self)
         frame.setObjectName("fv_menu_volume_frame")
 
@@ -169,11 +132,9 @@ class _MenuPopupWidget(QWidget):
         outer.setContentsMargins(12, 12, 12, 12)
         outer.setSpacing(10)
 
-        #
-        # Top row: Volume slider | Mute | Reset EQ
-        #
-        top_row = QHBoxLayout()
-        top_row.setSpacing(8)
+        # Top row: Volume + Mute
+        top = QHBoxLayout()
+        top.setSpacing(8)
 
         vol_label = QLabel("Volume")
         vol_label.setObjectName("fv_vol_label")
@@ -185,48 +146,17 @@ class _MenuPopupWidget(QWidget):
         self.mute = QCheckBox("Mute")
         self.mute.setChecked(self._desired_muted)
 
-        self.reset_eq = QPushButton("Reset EQ")
-        self.reset_eq.setObjectName("fv_eq_reset")
+        top.addWidget(vol_label)
+        top.addWidget(self.vol, 1)
+        top.addWidget(self.mute)
+        outer.addLayout(top)
 
-        top_row.addWidget(vol_label)
-        top_row.addWidget(self.vol, 1)
-        top_row.addWidget(self.mute)
-        top_row.addWidget(self.reset_eq)
-        outer.addLayout(top_row)
-
-        #
-        # Preset row: [ Preset dropdown | Save Preset | Delete Preset ]
-        #
-        preset_row = QHBoxLayout()
-        preset_row.setSpacing(8)
-
-        preset_label = QLabel("Preset:")
-        preset_label.setObjectName("fv_preset_label")
-
-        self.preset_combo = QComboBox()
-        self.preset_combo.setObjectName("fv_preset_combo")
-        # style will follow palette, we can theme via stylesheet below
-
-        self.btn_save_preset = QPushButton("Save Preset")
-        self.btn_save_preset.setObjectName("fv_save_preset")
-
-        self.btn_delete_preset = QPushButton("Delete Preset")
-        self.btn_delete_preset.setObjectName("fv_delete_preset")
-
-        preset_row.addWidget(preset_label)
-        preset_row.addWidget(self.preset_combo, 1)
-        preset_row.addWidget(self.btn_save_preset)
-        preset_row.addWidget(self.btn_delete_preset)
-        outer.addLayout(preset_row)
-
-        #
-        # 12-band EQ sliders
-        #
-        eq_grid = QGridLayout()
-        eq_grid.setHorizontalSpacing(12)
-        eq_grid.setVerticalSpacing(4)
-
+        # EQ grid (UI only for now)
+        grid = QGridLayout()
+        grid.setHorizontalSpacing(16)
+        grid.setVerticalSpacing(6)
         self.eq = []
+
         for i, (label_text, freq) in enumerate(BANDS):
             sv = QSlider(Qt.Vertical)
             sv.setRange(-12, 12)
@@ -234,7 +164,7 @@ class _MenuPopupWidget(QWidget):
             sv.setToolTip(f"{freq} Hz")
             self.eq.append(sv)
 
-            eq_grid.addWidget(
+            grid.addWidget(
                 sv,
                 0, i,
                 alignment=Qt.AlignHCenter | Qt.AlignBottom,
@@ -243,17 +173,20 @@ class _MenuPopupWidget(QWidget):
             lab = QLabel(label_text)
             lab.setObjectName("fv_freq_label")
             lab.setAlignment(Qt.AlignHCenter)
-            eq_grid.addWidget(
-                lab,
-                1, i,
-                alignment=Qt.AlignHCenter,
-            )
+            grid.addWidget(lab, 1, i, alignment=Qt.AlignHCenter)
 
-        outer.addLayout(eq_grid)
+        outer.addLayout(grid)
 
-        #
-        # Styling
-        #
+        # Bottom row: Reset EQ button
+        bottom = QHBoxLayout()
+        bottom.addStretch(1)
+        self.reset = QPushButton("Reset EQ")
+        self.reset.setObjectName("fv_eq_reset")
+        bottom.addWidget(self.reset)
+        bottom.addStretch(1)
+        outer.addLayout(bottom)
+
+        # Styling close to your old vibe
         self.setStyleSheet(
             "#fv_menu_volume_frame{"
             " background: palette(window);"
@@ -265,139 +198,92 @@ class _MenuPopupWidget(QWidget):
             " background: transparent;"
             "}"
             "QLabel#fv_freq_label{"
-            " font-weight:600; font-size:12px;"
+            " font-weight:600; font-size:13px;"
             "}"
             "QLabel#fv_vol_label{"
             " font-weight:700; font-size:13px;"
             "}"
-            "QLabel#fv_preset_label{"
-            " font-weight:600; font-size:12px;"
-            "}"
-            "QPushButton#fv_eq_reset,"
-            "QPushButton#fv_save_preset,"
-            "QPushButton#fv_delete_preset{"
+            "QPushButton{"
             " background: palette(button);"
             " color: palette(window-text);"
             " border: 1px solid palette(mid);"
             " border-radius: 8px;"
-            " padding: 4px 10px;"
-            " font-size:12px;"
+            " padding: 6px 12px;"
             "}"
-            "QPushButton#fv_eq_reset:hover,"
-            "QPushButton#fv_save_preset:hover,"
-            "QPushButton#fv_delete_preset:hover{"
-            " background: palette(light);"
-            "}"
-            "QPushButton#fv_eq_reset:pressed,"
-            "QPushButton#fv_save_preset:pressed,"
-            "QPushButton#fv_delete_preset:pressed{"
-            " background: palette(dark);"
-            "}"
-            "QComboBox#fv_preset_combo{"
-            " background: palette(base);"
-            " color: palette(window-text);"
-            " border: 1px solid palette(mid);"
-            " border-radius: 6px;"
-            " padding: 2px 8px;"
-            " font-size:12px;"
-            "}"
+            "QPushButton:hover{background: palette(light);}"
+            "QPushButton:pressed{background: palette(dark);}"
         )
+        self.setMinimumWidth(420)
 
-        # -------------------------------------------------
-        # SIGNALS
-        # -------------------------------------------------
-
+        # ---- SIGNALS ----
         self.vol.valueChanged.connect(self._on_volume_changed)
         self.mute.toggled.connect(self._on_mute_toggled)
-        self.reset_eq.clicked.connect(self._on_reset_clicked)
-
-        # EQ sliders
+        self.reset.clicked.connect(self._on_reset_clicked)
         for sv in self.eq:
             sv.valueChanged.connect(self._on_eq_slider_changed)
 
-        # Preset interactions
-        self.preset_combo.currentIndexChanged.connect(self._on_preset_selected)
-        self.btn_save_preset.clicked.connect(self._on_save_preset_clicked)
-        self.btn_delete_preset.clicked.connect(self._on_delete_preset_clicked)
-
-        # Poll timer (every 250ms):
-        # - enforce desired mute/volume if needed
-        # - refresh UI to match desired values
+        # Poll loop:
+        #   runs fast (~75ms), constantly forcing the audio output to match
+        #   "what the user wants" (desired mute/volume).
+        #   This makes mute stick immediately on new tracks.
         self._poll = QTimer(self)
-        self._poll.setSingleShot(False
-        )
-        self._poll.timeout.connect(self._tick)
-        self._poll.start(250)
+        self._poll.setSingleShot(False)
+        self._poll.timeout.connect(self._sync_loop)
+        self._poll.start(75)  # was 500ms before → caused ~0.5s leak
 
-        # Hook player signals so when a new track starts,
-        # we instantly enforce mute/volume.
+        # Hook into player events so we re-apply desired mute/vol
+        # instantly when track/media changes (no audible blip).
         self._hook_player_signals()
 
-        # 1. Load last EQ state from disk (if present)
-        #    This also updates sliders BEFORE we save anything new.
-        self._load_eq_state()
+        # Do one immediate sync/apply right now
+        self._sync_loop()
 
-        # 2. Load the preset list into dropdown
-        self._refresh_presets()
-
-        # 3. Initial sync
-        self._apply_desired_state_to_audio()
-        self._sync_ui_from_desired()
-
-    # -------------------------------------------------
-    # Backward compat with old code
+    # --------------------------------------------------
+    # Compatibility stub from original file
     def schedule_reapply(self, delay_ms=0):
-        # Old versions used this for EQ/ffmpeg.
-        # We keep it so your app won't crash if something still calls it.
+        # old code used this to trigger EQ pipeline; safe no-op now
         return
 
-    # -------------------------------------------------
-    # Internal helpers for audio control
+    # --------------------------------------------------
+    # Internal helpers
     def _audio(self):
         return _resolve_audio(self.pane)
 
     def _apply_desired_state_to_audio(self):
         """
-        Enforce desired mute/volume on the actual audio output.
-        We only call setVolume()/setMuted() if something changed,
-        so CPU stays low and we don't spam.
+        Enforce our desired mute/volume on the *current* audio output.
+        We call this a LOT, but it's lightweight.
         """
         a = self._audio()
         if not a:
             return
 
-        pct = int(self._desired_vol_pct)
-        if pct < 0:
-            pct = 0
-        if pct > 100:
-            pct = 100
+        effective_pct = 0 if self._desired_muted else self._desired_vol_pct
+        if effective_pct < 0:
+            effective_pct = 0
+        if effective_pct > 100:
+            effective_pct = 100
 
-        muted_now = bool(self._desired_muted)
-        vol_now   = float(0 if muted_now else pct) / 100.0
+        effective_vol = float(effective_pct) / 100.0
 
-        if (self._last_applied_muted == muted_now and
-            self._last_applied_vol_pct == pct):
-            return
-
+        # set muted first if available
         try:
             if hasattr(a, "setMuted"):
-                a.setMuted(muted_now)
+                a.setMuted(bool(self._desired_muted))
         except Exception:
             pass
 
+        # then force volume
         try:
             if hasattr(a, "setVolume"):
-                a.setVolume(vol_now)
+                a.setVolume(effective_vol)
         except Exception:
             pass
-
-        self._last_applied_muted = muted_now
-        self._last_applied_vol_pct = pct
 
     def _sync_ui_from_desired(self):
         """
-        Make sure the widgets show what we WANT.
-        We do NOT let backend resets change our UI.
+        Make sure the popup UI matches what we *want*, not what backend reset to.
+        Backend is forced to follow us anyway.
         """
         if self.vol.value() != self._desired_vol_pct:
             self._internal_change = True
@@ -413,28 +299,32 @@ class _MenuPopupWidget(QWidget):
             finally:
                 self._internal_change = False
 
-    def _tick(self):
+    def _sync_loop(self):
         """
-        Runs every 250ms:
-        1. Apply sticky mute/volume if needed.
-        2. Sync UI to desired state.
+        Runs every ~75ms:
+        1. Apply desired mute/volume to the audio output.
+        2. Reflect those desired values back into the UI.
+        This fixes:
+           - mute only lasting one track
+           - "brief leak" of next track before mute hits
         """
         self._apply_desired_state_to_audio()
         self._sync_ui_from_desired()
 
-    # -------------------------------------------------
-    # Track change hook
     def _hook_player_signals(self):
         """
-        Listen for player state changes so we can:
-        - instantly re-apply mute/volume on new track (prevents leaks)
-        We STILL do NOT pause/resume/seek the player.
+        Connect to player events (if they exist) so we immediately enforce
+        mute/volume the moment a new file loads or playback state changes.
+
+        We STILL do not pause/resume/seek. We only re-apply volume/mute.
         """
         p = _resolve_player(self.pane)
         if p is None:
             return
 
-        def _instant_enforce(*_):
+        def _reapply_from_player_event(*_):
+            # When the source changes or playback restarts,
+            # slam desired mute/volume immediately.
             self._apply_desired_state_to_audio()
             self._sync_ui_from_desired()
 
@@ -447,227 +337,37 @@ class _MenuPopupWidget(QWidget):
         ):
             sig = getattr(p, sig_name, None)
             try:
-                sig.connect(_instant_enforce)
+                sig.connect(_reapply_from_player_event)
             except Exception:
                 pass
 
-    # -------------------------------------------------
-    # EQ state persistence
-    def _slider_values_list(self):
-        """
-        Return EQ gains as list of 12 ints (-12..+12), in band order.
-        """
-        return [int(sv.value()) for sv in self.eq]
-
-    def _apply_slider_values_list(self, values):
-        """
-        Given a list of 12 ints, set sliders to those values.
-        (No audio processing yet, just UI + persistence.)
-        """
-        if len(values) != len(self.eq):
-            return
-        self._internal_change = True
-        try:
-            for sv, gain in zip(self.eq, values):
-                try:
-                    gain_i = int(gain)
-                except Exception:
-                    gain_i = 0
-                if gain_i < -12:
-                    gain_i = -12
-                if gain_i > 12:
-                    gain_i = 12
-                sv.setValue(gain_i)
-        finally:
-            self._internal_change = False
-
-    def _save_eq_state_file(self):
-        """
-        Save the CURRENT slider gains to eq_state.json.
-        """
-        _ensure_eq_dirs()
-        data = {
-            "bands": self._slider_values_list(),
-            "labels": [lbl for (lbl, _freq) in BANDS],
-        }
-        try:
-            with open(_EQ_STATE_FILE, "w", encoding="utf-8") as f:
-                json.dump(data, f)
-        except Exception:
-            pass
-
-    def _load_eq_state(self):
-        """
-        On popup init: read eq_state.json (if exists) and apply to sliders.
-        """
-        if not os.path.exists(_EQ_STATE_FILE):
-            return
-        try:
-            with open(_EQ_STATE_FILE, "r", encoding="utf-8") as f:
-                data = json.load(f)
-            bands = data.get("bands", None)
-            if isinstance(bands, list) and len(bands) == len(self.eq):
-                self._apply_slider_values_list(bands)
-        except Exception:
-            pass
-
-    # -------------------------------------------------
-    # Preset handling
-    def _refresh_presets(self):
-        """
-        Refresh dropdown with list of saved presets.
-        We list files in eqpresets/, strip .json.
-        """
-        _ensure_eq_dirs()
-        names = []
-        try:
-            for fname in os.listdir(_EQ_PRESET_DIR):
-                if not fname.lower().endswith(".json"):
-                    continue
-                preset_name = fname[:-5]  # drop ".json"
-                names.append(preset_name)
-        except Exception:
-            pass
-
-        names.sort(key=str.lower)
-
-        self._internal_change = True
-        try:
-            self.preset_combo.clear()
-            # First item is just placeholder text "Choose preset..."
-            self.preset_combo.addItem("Choose preset...")
-            for n in names:
-                self.preset_combo.addItem(n)
-        finally:
-            self._internal_change = False
-
-    def _on_preset_selected(self, idx):
-        """
-        User picked something in the dropdown.
-        Load that preset and apply its gains.
-        """
-        if self._internal_change:
-            return
-        if idx <= 0:
-            # index 0 is "Choose preset..."
-            return
-
-        name = self.preset_combo.currentText()
-        preset_path = os.path.join(_EQ_PRESET_DIR, f"{name}.json")
-        try:
-            with open(preset_path, "r", encoding="utf-8") as f:
-                pdata = json.load(f)
-            bands = pdata.get("bands", None)
-            if isinstance(bands, list) and len(bands) == len(self.eq):
-                self._apply_slider_values_list(bands)
-                # after loading a preset, also save as 'current state'
-                self._save_eq_state_file()
-                # and call hook to eventually update DSP
-                self._apply_eq_to_audio()
-        except Exception:
-            pass
-
-    def _on_save_preset_clicked(self):
-        """
-        Ask user for a preset name, then save current slider values to that name.
-        """
-        _ensure_eq_dirs()
-        name, ok = QInputDialog.getText(
-            self,
-            "Save EQ Preset",
-            "Preset name:"
-        )
-        if not ok or not name.strip():
-            return
-        name = name.strip()
-
-        # sanitize filename-ish
-        safe_name = "".join(ch for ch in name if ch not in r'\/:*?"<>|').strip()
-        if not safe_name:
-            return
-
-        preset_path = os.path.join(_EQ_PRESET_DIR, f"{safe_name}.json")
-        data = {
-            "bands": self._slider_values_list(),
-            "labels": [lbl for (lbl, _freq) in BANDS],
-        }
-        try:
-            with open(preset_path, "w", encoding="utf-8") as f:
-                json.dump(data, f)
-        except Exception:
-            pass
-
-        # refresh list so new preset shows up
-        self._refresh_presets()
-
-        # select it in the combo after save
-        # (find its index)
-        for i in range(self.preset_combo.count()):
-            if self.preset_combo.itemText(i) == safe_name:
-                self.preset_combo.setCurrentIndex(i)
-                break
-
-    def _on_delete_preset_clicked(self):
-        """
-        Delete currently selected preset file (except index 0).
-        """
-        idx = self.preset_combo.currentIndex()
-        if idx <= 0:
-            return
-
-        name = self.preset_combo.currentText()
-        preset_path = os.path.join(_EQ_PRESET_DIR, f"{name}.json")
-
-        # Ask for confirmation just in case
-        resp = QMessageBox.question(
-            self,
-            "Delete EQ Preset",
-            f"Delete preset '{name}'?",
-            QMessageBox.Yes | QMessageBox.No,
-            QMessageBox.No
-        )
-        if resp != QMessageBox.Yes:
-            return
-
-        try:
-            os.remove(preset_path)
-        except Exception:
-            pass
-
-        # reload combo
-        self._refresh_presets()
-        # move back to "Choose preset..."
-        self.preset_combo.setCurrentIndex(0)
-
-    # -------------------------------------------------
-    # User actions on the popup
+    # --------------------------------------------------
+    # UI callbacks (user actions)
     def _on_volume_changed(self, _value):
         """
-        User moved the volume slider.
-        Update desired volume and apply it now.
-        Does NOT auto-unmute if muted; we just remember the new level.
+        User dragged the volume slider.
+        Update what we WANT, then enforce it immediately.
         """
         if self._internal_change:
             return
 
         global _DESIRED_VOL_PCT
-        pct = int(self.vol.value())
-        if pct < 0:
-            pct = 0
-        if pct > 100:
-            pct = 100
+        vol_pct = int(self.vol.value())
+        if vol_pct < 0: vol_pct = 0
+        if vol_pct > 100: vol_pct = 100
 
-        self._desired_vol_pct = pct
-        _DESIRED_VOL_PCT = pct
+        self._desired_vol_pct = vol_pct
+        _DESIRED_VOL_PCT = vol_pct
 
+        # Do not unmute automatically here.
+        # If muted, keep muted. We just remember the new slider value.
         self._apply_desired_state_to_audio()
         self._sync_ui_from_desired()
 
     def _on_mute_toggled(self, state):
         """
-        User toggled mute.
-        We store that and apply it right now
-        (and also on every future track).
+        User toggled mute checkbox.
+        Update what we WANT, and apply it now (and on future tracks).
         """
         if self._internal_change:
             return
@@ -683,9 +383,7 @@ class _MenuPopupWidget(QWidget):
 
     def _on_reset_clicked(self):
         """
-        Reset all EQ sliders to 0 dB.
-        Save new state.
-        Apply new state to audio path (placeholder).
+        Reset all EQ sliders to 0 dB. Still UI-only.
         """
         self._internal_change = True
         try:
@@ -694,52 +392,17 @@ class _MenuPopupWidget(QWidget):
         finally:
             self._internal_change = False
 
-        self._save_eq_state_file()
-        self._apply_eq_to_audio()
-
     def _on_eq_slider_changed(self, _v):
         """
-        Called whenever ANY band slider moves.
-        We immediately:
-            - save current EQ state to disk
-            - call _apply_eq_to_audio() (placeholder for real DSP)
-        """
-        if self._internal_change:
-            return
-
-        self._save_eq_state_file()
-        self._apply_eq_to_audio()
-
-    # -------------------------------------------------
-    # Hook for actual DSP (not implemented yet)
-    def _apply_eq_to_audio(self):
-        """
-        This is where live EQ would actually be applied to the sound.
-
-        Right now we are NOT touching playback audio,
-        because we haven't built the shared "mixer"/"master bus" yet.
-
-        But: the code that *will* do EQ will read gains from:
-            self._slider_values_list()
-        in exactly this method.
-
-        For now it's a no-op so we don't break playback.
+        EQ is still visual only. No audio processing here yet.
         """
         return
 
-    # -------------------------------------------------
-    # Convenience getters
+    # convenience getters (unchanged)
     def get_eq_gains_db(self):
-        """
-        Returns a list of 12 integers, each -12..+12 dB.
-        Order matches BANDS.
-        """
-        return self._slider_values_list()
+        return [int(sv.value()) for sv in self.eq]
 
     def get_volume_scalar(self):
-        """
-        0.0..1.0 effective volume after mute.
-        """
         if self._desired_muted:
             return 0.0
         return float(self._desired_vol_pct) / 100.0
@@ -750,20 +413,26 @@ class _MenuPopupWidget(QWidget):
 
 def _install_cleanup_strong(pane, btn):
     """
-    Old code used to kill ffmpeg processes etc.
-    We intentionally do nothing now.
-    Stub stays so legacy calls won't crash.
+    Old code had a ton of teardown logic. We keep a stub so caller code
+    doesn't explode, but we intentionally do nothing here.
     """
     return
 
 
 def add_new_volume_popup(pane, bar_layout):
     """
-    Call like:
+    This matches your original call style:
         add_new_volume_popup(self, self.bottom_bar_layout)
+
+    What we do:
+    - Create a 48x48 round-ish toolbutton with "🔊"
+    - Attach a popup menu containing _MenuPopupWidget
+    - Add that button to the bar_layout you passed in
+    - Expose pane.btn_volume_new, pane.volume_popup_menu, pane.volume_popup_widget
+    - DO NOT touch playback timing in any way
     """
 
-    # Remove any previous button if it was there
+    # Clean up any previous/stale button
     for attr in ("btn_volume_new", "btn_volume"):
         old = getattr(pane, attr, None)
         if old is not None:
@@ -776,18 +445,13 @@ def add_new_volume_popup(pane, bar_layout):
     btn = QToolButton(pane)
     btn.setObjectName("btn_volume_new")
 
-    try:
-        btn.setAutoRaise(True)
-    except Exception:
-        pass
-    try:
-        btn.setFocusPolicy(Qt.NoFocus)
-    except Exception:
-        pass
-    try:
-        btn.setCursor(Qt.PointingHandCursor)
-    except Exception:
-        pass
+    # match your control bar style: flat, hover highlight, 48x48
+    try: btn.setAutoRaise(True)
+    except Exception: pass
+    try: btn.setFocusPolicy(Qt.NoFocus)
+    except Exception: pass
+    try: btn.setCursor(Qt.PointingHandCursor)
+    except Exception: pass
 
     btn.setText("🔊")
     btn.setToolTip("Volume / EQ")
@@ -796,7 +460,6 @@ def add_new_volume_popup(pane, bar_layout):
     except Exception:
         pass
 
-    # Build popup
     menu = QMenu(btn)
     w = _MenuPopupWidget(pane, parent=menu)
 
@@ -807,7 +470,6 @@ def add_new_volume_popup(pane, bar_layout):
     btn.setMenu(menu)
     btn.setPopupMode(QToolButton.InstantPopup)
 
-    # Style to match your round-ish bottom bar buttons
     btn.setStyleSheet(
         "QToolButton#btn_volume_new{"
         " background:transparent;"
@@ -833,21 +495,25 @@ def add_new_volume_popup(pane, bar_layout):
         "}"
     )
 
-    # Add to your control bar
+    # Put the button into your transport bar layout
     try:
         bar_layout.addWidget(btn)
     except Exception:
+        # worst case: just show it anyway
         btn.setParent(pane)
         btn.show()
 
+    # Old code used to install cleanup hooks etc.
     _install_cleanup_strong(pane, btn)
 
+    # Expose on pane so other code can find it
     pane.btn_volume_new = btn
     pane.volume_popup_menu = menu
     pane.volume_popup_widget = w
 
+    # Old code called w.schedule_reapply(0). Safe no-op here.
     try:
-        w.schedule_reapply(0)  # harmless no-op for legacy code
+        w.schedule_reapply(0)
     except Exception:
         pass
 
