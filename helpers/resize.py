@@ -1,10 +1,16 @@
-
-# helpers/resize.py — Resize tool (rev 4)
-# New: Batch pre-filter + preflight summary (queued/skipped with reasons)
-#      Overwrite policy: Skip / Overwrite / Versioned filename
-# Keeps: compact Images/Video toggle, image formats & quality, CRF/preset, audio copy,
-#        even-dims, SAR, reporting, preset path, back-compat shim.
-
+# helpers/resize.py — Resize tool (rev 8)
+# Rev 8 changes:
+#   - Fixed "Lock aspect ratio" so it actually keeps W/H linked again.
+#   - Internal logic now tracks last committed W/H instead of relying on a
+#     stored ratio that some themes/widgets were dropping.
+#
+# All rev 7 features stay:
+#   - "Do not resize" toggle that hides size + scale UI and keeps native size
+#   - Removed "When file exists"
+#   - Proper hide/show of Image-only vs Video-only rows (not greyed out)
+#   - Video format conversion (MP4/MKV/WebM)
+#   - Image format conversion (Auto/JPG/PNG/WebP/TIFF/BMP)
+#
 import os, re, json, subprocess, math
 from dataclasses import dataclass, asdict
 from pathlib import Path
@@ -33,12 +39,17 @@ class ResizePreset:
     width: int = 1280
     height:  int = 720
     ar_lock: bool = True
-    scale_mode: str = "Fit"            # Fit | Fill | Letterbox
+    # Keep from source | Fit | Fill | Letterbox
+    scale_mode: str = "Keep from source"
 
     # Media mode: "Image" or "Video"
     media_mode: str = "Video"
 
+    # Global toggle
+    no_resize: bool = False  # When True we keep original size and hide size/scale UI
+
     # Video-specific
+    video_format: str = "MP4 (H.264)"  # MP4 (H.264) | MKV (H.264) | WebM (VP9)
     crf: int = 23
     x264_preset: str = "veryfast"
     audio_copy: bool = True
@@ -48,15 +59,16 @@ class ResizePreset:
     image_format: str = "Auto"   # Auto/JPG/PNG/WebP/TIFF/BMP
     image_quality: int = 90      # 0–100
 
-    # Output policy
-    overwrite_policy: str = "Skip existing"  # Skip existing | Overwrite | Versioned filename
-
     @classmethod
     def load(cls) -> "ResizePreset":
         try:
             if PRESET_PATH.exists():
                 data = json.loads(PRESET_PATH.read_text(encoding="utf-8"))
-                return cls(**{**asdict(cls()), **data})
+                # Filter unknown legacy keys for safety
+                defaults = asdict(cls())
+                filtered = {k: v for k, v in data.items() if k in defaults}
+                merged = {**defaults, **filtered}
+                return cls(**merged)
         except Exception:
             pass
         return cls()
@@ -74,6 +86,15 @@ def _round_even_dims(w: int, h: int) -> tuple[int,int]:
 
 def _build_vf(src_w, src_h, out_w, out_h, mode: str, round_even: bool) -> tuple[str,int,int]:
     """Return FFmpeg -vf chain including scale/pad/crop + setsar=1 (for video)."""
+    # "Keep from source" means: don't rescale/pad/crop, just normalize SAR.
+    if mode == "Keep from source":
+        ow, oh = (src_w or out_w, src_h or out_h)
+        if round_even:
+            ow, oh = _round_even_dims(ow, oh)
+        vf = "setsar=1"
+        return vf, ow, oh
+
+    # Otherwise we build based on requested target size.
     ow, oh = (out_w, out_h)
     if round_even:
         ow, oh = _round_even_dims(ow, oh)
@@ -88,6 +109,7 @@ def _build_vf(src_w, src_h, out_w, out_h, mode: str, round_even: bool) -> tuple[
             f"pad={ow}:{oh}:(ow-iw)/2:(oh-ih)/2"
         )
     else:
+        # Fallback safe
         vf = f"scale={ow}:{oh}:flags=lanczos"
 
     vf += ",setsar=1"
@@ -95,18 +117,20 @@ def _build_vf(src_w, src_h, out_w, out_h, mode: str, round_even: bool) -> tuple[
 
 def _build_vf_image(out_w: int, out_h: int, mode: str) -> str:
     """Return -vf for images (no SAR/pix_fmt needed)."""
-    ow, oh = (out_w, out_h)
-    if mode == "Fit":
-        vf = f"scale={ow}:{oh}:flags=lanczos"
+    if mode == "Keep from source":
+        # no-op scale using source size
+        vf = "scale=iw:ih:flags=lanczos"
+    elif mode == "Fit":
+        vf = f"scale={out_w}:{out_h}:flags=lanczos"
     elif mode == "Fill":
-        vf = f"scale={ow}:{oh}:flags=lanczos,crop={ow}:{oh}"
+        vf = f"scale={out_w}:{out_h}:flags=lanczos,crop={out_w}:{out_h}"
     elif mode == "Letterbox":
         vf = (
-            f"scale=min({ow}\\,iw*{oh}/ih):min({oh}\\,ih*{ow}/iw):flags=lanczos,"
-            f"pad={ow}:{oh}:(ow-iw)/2:(oh-ih)/2"
+            f"scale=min({out_w}\\,iw*{out_h}/ih):min({out_h}\\,ih*{out_w}/iw):flags=lanczos,"
+            f"pad={out_w}:{out_h}:(ow-iw)/2:(oh-ih)/2"
         )
     else:
-        vf = f"scale={ow}:{oh}:flags=lanczos"
+        vf = f"scale={out_w}:{out_h}:flags=lanczos"
     return vf
 
 def _ffprobe_size(path: Path) -> tuple[int,int]:
@@ -146,26 +170,13 @@ def _image_ext_from_choice(choice: str, src_ext: str) -> str:
     }
     return mapping.get(choice, src_ext.lower())
 
-def _versioned_path(base: Path) -> Path:
-    """Return base with _v2/_v3... inserted before suffix, choosing first non-existing."""
-    stem, suf = base.stem, base.suffix
-    # If stem already ends with _vN, increment it
-    import re as _re
-    m = _re.search(r"(.*)_v(\d+)$", stem)
-    if m:
-        root = m.group(1)
-        n = int(m.group(2))
-        while True:
-            n += 1
-            candidate = base.with_name(f"{root}_v{n}{suf}")
-            if not candidate.exists():
-                return candidate
-    else:
-        n = 2
-        while True:
-            candidate = base.with_name(f"{stem}_v{n}{suf}")
-            if not candidate.exists():
-                return candidate
+def _video_ext_from_choice(choice: str) -> str:
+    mapping = {
+        "MP4 (H.264)": ".mp4",
+        "MKV (H.264)": ".mkv",
+        "WebM (VP9)": ".webm",
+    }
+    return mapping.get(choice, ".mp4")
 
 # --------------------------- UI ---------------------------
 class ResizePane(QWidget):
@@ -175,6 +186,22 @@ class ResizePane(QWidget):
         self.preset = ResizePreset.load()
 
         form = QFormLayout(self)
+
+        # Small helper for consistent row creation and later show/hide.
+        def _make_row_widget(h_widgets):
+            roww = QWidget()
+            lay = QHBoxLayout(roww)
+            lay.setContentsMargins(0,0,0,0)
+            for w in h_widgets:
+                lay.addWidget(w)
+            lay.addStretch(1)
+            return roww
+
+        def _add_form_row(key: str, label_text: str, field_widget: QWidget):
+            lbl = QLabel(label_text)
+            form.addRow(lbl, field_widget)
+            setattr(self, f"row_{key}_label", lbl)
+            setattr(self, f"row_{key}_widget", field_widget)
 
         # --- Compact media toggle (Images / Video) ---
         self.rad_images = QRadioButton("Images")
@@ -188,81 +215,92 @@ class ResizePane(QWidget):
         else:
             self.rad_video.setChecked(True)
 
-        row_toggle = QHBoxLayout()
-        row_toggle.setContentsMargins(0,0,0,0)
-        row_toggle.addWidget(self.rad_images)
-        row_toggle.addWidget(self.rad_video)
-        row_toggle.addStretch(1)
-        form.addRow(QLabel("Mode"), row_toggle)
+        row_toggle_widget = _make_row_widget([self.rad_images, self.rad_video])
+        _add_form_row("mode", "Mode", row_toggle_widget)
 
-        # Wire toggle
-        self.rad_images.toggled.connect(self._on_media_mode_changed)
-        self.rad_video.toggled.connect(self._on_media_mode_changed)
+        # "Do not resize" global toggle
+        self.chk_noresize = QCheckBox("Do not resize (keep original size)")
+        self.chk_noresize.setChecked(self.preset.no_resize)
+        _add_form_row("noresize", "", self.chk_noresize)
 
         # Width/Height — single pair (no duplicates)
         self.spin_w = QSpinBox(); self.spin_w.setRange(16, 8192); self.spin_w.setValue(self.preset.width)
         self.spin_h = QSpinBox(); self.spin_h.setRange(16, 8192); self.spin_h.setValue(self.preset.height)
-        row_wh = QHBoxLayout()
-        row_wh.addWidget(QLabel("W")); row_wh.addWidget(self.spin_w)
-        row_wh.addWidget(QLabel("H")); row_wh.addWidget(self.spin_h)
-        form.addRow(QLabel("Target size"), row_wh)
+        row_wh_widget = _make_row_widget([QLabel("W"), self.spin_w, QLabel("H"), self.spin_h])
+        _add_form_row("targetsize", "Target size", row_wh_widget)
 
         # AR lock
         self.chk_ar = QCheckBox("Lock aspect ratio"); self.chk_ar.setChecked(self.preset.ar_lock)
-        form.addRow(self.chk_ar)
+        _add_form_row("arlock", "", self.chk_ar)
 
-        # Mode
-        self.cmb_mode = QComboBox(); self.cmb_mode.addItems(["Fit","Fill","Letterbox"])
+        # Scale mode
+        self.cmb_mode = QComboBox()
+        self.cmb_mode.addItems(["Keep from source","Fit","Fill","Letterbox"])
         self.cmb_mode.setCurrentText(self.preset.scale_mode)
-        form.addRow(QLabel("Scale mode"), self.cmb_mode)
+        _add_form_row("scalemode", "Scale mode", self.cmb_mode)
 
         # ---------------- Image-only options ----------------
         self.cmb_imgfmt = QComboBox(); self.cmb_imgfmt.addItems(["Auto","JPG","PNG","WebP","TIFF","BMP"])
         self.cmb_imgfmt.setCurrentText(self.preset.image_format)
-        form.addRow(QLabel("Image format"), self.cmb_imgfmt)
+        _add_form_row("imgfmt", "Image format", self.cmb_imgfmt)
 
         self.slider_imgq = QSlider(Qt.Horizontal); self.slider_imgq.setRange(0,100); self.slider_imgq.setValue(self.preset.image_quality)
         self.lbl_imgq = QLabel(str(self.preset.image_quality) + "%")
         self.slider_imgq.valueChanged.connect(lambda v: self.lbl_imgq.setText(f"{v}%"))
-        row_imgq = QHBoxLayout(); row_imgq.addWidget(self.slider_imgq); row_imgq.addWidget(self.lbl_imgq)
-        form.addRow(QLabel("Image quality (0–100%)"), row_imgq)
+        row_imgq_widget = _make_row_widget([self.slider_imgq, self.lbl_imgq])
+        _add_form_row("imgq", "Image quality (0–100%)", row_imgq_widget)
 
         # ---------------- Video-only options ----------------
+        self.cmb_vidfmt = QComboBox()
+        self.cmb_vidfmt.addItems(["MP4 (H.264)", "MKV (H.264)", "WebM (VP9)"])
+        self.cmb_vidfmt.setCurrentText(self.preset.video_format)
+        _add_form_row("vidfmt", "Video format", self.cmb_vidfmt)
+
         self.slider_crf = QSlider(Qt.Horizontal); self.slider_crf.setRange(18, 28); self.slider_crf.setValue(self.preset.crf)
         self.lbl_crf = QLabel(str(self.preset.crf))
         self.slider_crf.valueChanged.connect(lambda v: self.lbl_crf.setText(str(v)))
-        row_crf = QHBoxLayout(); row_crf.addWidget(self.slider_crf); row_crf.addWidget(self.lbl_crf)
-        form.addRow(QLabel("CRF (18=best, 28=smaller)"), row_crf)
+        row_crf_widget = _make_row_widget([self.slider_crf, self.lbl_crf])
+        _add_form_row("crf", "CRF (18=best, 28=smaller)", row_crf_widget)
 
         self.cmb_x264 = QComboBox(); self.cmb_x264.addItems(
             ["ultrafast","superfast","veryfast","faster","fast","medium","slow","slower","veryslow"]
         )
         self.cmb_x264.setCurrentText(self.preset.x264_preset)
-        form.addRow(QLabel("Encoder preset"), self.cmb_x264)
+        _add_form_row("x264", "Encoder preset", self.cmb_x264)
 
         self.chk_acopy = QCheckBox("Copy audio (no re-encode)"); self.chk_acopy.setChecked(self.preset.audio_copy)
-        form.addRow(self.chk_acopy)
+        _add_form_row("acopy", "", self.chk_acopy)
 
         self.chk_even = QCheckBox("Round to even dimensions"); self.chk_even.setChecked(self.preset.round_even)
-        form.addRow(self.chk_even)
-
-        # Overwrite policy
-        self.cmb_overwrite = QComboBox(); self.cmb_overwrite.addItems(["Skip existing","Overwrite","Versioned filename"])
-        self.cmb_overwrite.setCurrentText(self.preset.overwrite_policy)
-        form.addRow(QLabel("When file exists"), self.cmb_overwrite)
+        _add_form_row("even", "", self.chk_even)
 
         # Action buttons
         self.btn_one = QPushButton("Resize a file…")
         self.btn_batch = QPushButton("Resize a batch…")
-        row_btn = QHBoxLayout(); row_btn.addWidget(self.btn_one); row_btn.addWidget(self.btn_batch)
-        form.addRow(row_btn)
+        row_btn_widget = _make_row_widget([self.btn_one, self.btn_batch])
+        form.addRow(row_btn_widget)
 
         # Preset buttons
         self.btn_save = QPushButton("Save preset"); self.btn_load = QPushButton("Load preset")
-        row_p = QHBoxLayout(); row_p.addWidget(self.btn_save); row_p.addWidget(self.btn_load)
-        form.addRow(row_p)
+        row_p_widget = _make_row_widget([self.btn_save, self.btn_load])
+        form.addRow(row_p_widget)
+
+        # Internal state
+        # last committed W/H for the ratio math
+        self._last_w = self.spin_w.value()
+        self._last_h = self.spin_h.value()
+
+        # historical ratio storage (kept for back-compat / debug)
+        self._ar_ratio = None
+
+        self._src_w = None
+        self._src_h = None
 
         # Signals
+        self.rad_images.toggled.connect(self._on_media_mode_changed)
+        self.rad_video.toggled.connect(self._on_media_mode_changed)
+        self.chk_noresize.stateChanged.connect(self._on_noresize_changed)
+
         self.chk_ar.stateChanged.connect(self._on_ar_lock_changed)
         self.spin_w.valueChanged.connect(self._on_w_changed)
         self.spin_h.valueChanged.connect(self._on_h_changed)
@@ -271,43 +309,290 @@ class ResizePane(QWidget):
         self.btn_save.clicked.connect(self._on_save_preset)
         self.btn_load.clicked.connect(self._on_load_preset)
 
-        self._src_w = None
-        self._src_h = None
+        # ---- Tooltips (long, new-user friendly) ----
+        self.rad_images.setToolTip(
+            "Images mode: export still images.\n\n"
+            "Use this for JPG, PNG, WebP, TIFF, BMP and similar files. "
+            "Image options (format and quality) below will be shown. "
+            "Video-only options will be hidden in this mode."
+        )
+        self.rad_video.setToolTip(
+            "Video mode: export video files.\n\n"
+            "Use this for MP4, MOV, MKV and other videos. "
+            "CRF, Encoder preset, Copy audio etc. will be shown. "
+            "Image-only options will be hidden in this mode."
+        )
 
-        # apply initial mode
-        self._on_media_mode_changed()
+        self.chk_noresize.setToolTip(
+            "Do not resize:\n\n"
+            "Keep the original pixel width/height.\n"
+            "When this is ON, the Width/Height boxes, aspect ratio lock, "
+            "Scale mode, and even-dimension setting are hidden. "
+            "You can still convert formats (e.g. MP4→MKV or PNG→JPG) and adjust quality."
+        )
+
+        self.spin_w.setToolTip(
+            "Target width in pixels.\n\n"
+            "When 'Lock aspect ratio' is enabled, changing Width automatically "
+            "updates Height to preserve the current W:H ratio."
+        )
+        self.spin_h.setToolTip(
+            "Target height in pixels.\n\n"
+            "When 'Lock aspect ratio' is enabled, changing Height automatically "
+            "updates Width to preserve the current W:H ratio."
+        )
+        self.chk_ar.setToolTip(
+            "Lock aspect ratio for the Width/Height pair.\n\n"
+            "When enabled, Width and Height stay in proportion. "
+            "Whichever you change, the other updates instantly using the "
+            "ratio captured at the moment you turned the lock on."
+        )
+
+        # Scale mode tooltip(s)
+        self._init_scale_mode_tooltips()
+
+        self.cmb_imgfmt.setToolTip(
+            "Output image format.\n\n"
+            "• Auto: keep the source format.\n"
+            "• JPG / PNG / WebP / TIFF / BMP: convert to that format.\n\n"
+            "Tip: JPG / WebP are smaller for photos. PNG / TIFF preserve exact pixels."
+        )
+        self.slider_imgq.setToolTip(
+            "Image quality (0–100%).\n\n"
+            "Higher values = better visual quality and larger files.\n"
+            "• JPG / WebP: this is visual compression quality.\n"
+            "• PNG: this mostly changes compression level, not visual quality."
+        )
+        self.lbl_imgq.setToolTip(
+            "Shows the current Image quality percentage."
+        )
+
+        self.cmb_vidfmt.setToolTip(
+            "Output video format / container.\n\n"
+            "• MP4 (H.264): very compatible.\n"
+            "• MKV (H.264): same video codec in an MKV container.\n"
+            "• WebM (VP9): smaller for some content, good for web.\n\n"
+            "Note: WebM will re-encode audio to Opus."
+        )
+
+        self.slider_crf.setToolTip(
+            "CRF for video quality/size (18 = best quality / biggest file, "
+            "28 = most compressed / smallest file).\n\n"
+            "Lower number = higher quality but bigger files. "
+            "23 is a good everyday default."
+        )
+        self.lbl_crf.setToolTip(
+            "Shows the current CRF value for video encoding."
+        )
+        self.cmb_x264.setToolTip(
+            "Encoder preset (H.264 only) = how hard x264 works to compress.\n\n"
+            "Slower presets squeeze filesize down a bit more at the same quality, "
+            "but take longer to run. 'veryfast' is a solid default speed/quality tradeoff."
+        )
+
+        self.chk_acopy.setToolTip(
+            "Copy the audio track without re-encoding (H.264 modes).\n\n"
+            "Keeps original audio quality and avoids extra processing. "
+            "Turn this OFF only if you need to force AAC audio for compatibility. "
+            "For WebM / VP9 we always re-encode audio to Opus."
+        )
+        self.chk_even.setToolTip(
+            "Round output width/height down to even numbers.\n\n"
+            "Many video codecs and players expect even dimensions. "
+            "Leaving this ON is safest for video playback.\n"
+            "Hidden automatically if 'Do not resize' is enabled."
+        )
+
+        self.btn_one.setToolTip(
+            "Resize / convert a single file.\n\n"
+            "If a video or image is already loaded in the Media Player, this button "
+            "will use that file immediately.\n\n"
+            "If nothing is loaded yet, you'll be asked to pick a file. "
+            "That chosen file will be processed using the settings above."
+        )
+        self.btn_batch.setToolTip(
+            "Resize / convert a batch of files.\n\n"
+            "Pick multiple images or videos and process them all in one go. "
+            "You'll get a preflight summary of what will run and what will be skipped."
+        )
+
+        self.btn_save.setToolTip(
+            "Save all current settings (size, mode, quality, etc.) into a preset "
+            "so you can reuse the exact same configuration later."
+        )
+        self.btn_load.setToolTip(
+            "Load your previously saved preset and apply it to all controls."
+        )
+
+        # capture initial lock ratio / visibility
+        self._on_ar_lock_changed(self.chk_ar.checkState())
+        self._apply_visibility()
+
+    # Tooltip helpers
+    def _init_scale_mode_tooltips(self):
+        """
+        Attach detailed tooltips to each Scale mode option and keep the combo's
+        own tooltip synced with the current selection.
+        """
+        tips = {
+            "Keep from source": (
+                "Keep the source resolution.\n\n"
+                "No resizing is performed; we just normalize pixel aspect ratio "
+                "for video. Use this if you only want to change the format/"
+                "codec without changing the pixel size."
+            ),
+            "Fit": (
+                "Stretch/squash to exactly match the target Width × Height.\n\n"
+                "This can distort the image if the aspect ratio is different."
+            ),
+            "Fill": (
+                "Scale until the target Width × Height is completely covered, "
+                "then crop any overflow.\n\n"
+                "No black bars, but edges can be cut off."
+            ),
+            "Letterbox": (
+                "Scale to fit inside the target Width × Height without cropping, "
+                "then pad with borders (black bars) so the final output matches "
+                "the requested size exactly."
+            ),
+        }
+
+        # per-item tooltips in the dropdown
+        for i in range(self.cmb_mode.count()):
+            text = self.cmb_mode.itemText(i)
+            if text in tips:
+                self.cmb_mode.setItemData(i, tips[text], Qt.ToolTipRole)
+
+        # live tooltip on the combo itself
+        def _sync_combo_tooltip(txt):
+            self.cmb_mode.setToolTip(
+                tips.get(
+                    txt,
+                    "Choose how to scale / crop / pad the image or video to reach the target size."
+                )
+            )
+        _sync_combo_tooltip(self.cmb_mode.currentText())
+        self.cmb_mode.currentTextChanged.connect(_sync_combo_tooltip)
 
     # ----------------- AR lock behavior -----------------
-    def _on_ar_lock_changed(self, _v): pass
+    def _on_ar_lock_changed(self, state):
+        """
+        Whenever Lock aspect ratio is toggled, capture the *current* pair
+        of Width/Height as the new baseline. We also store _ar_ratio for
+        debugging/back-compat, but the live math uses _last_w/_last_h.
+        """
+        w = max(1, self.spin_w.value())
+        h = max(1, self.spin_h.value())
+
+        self._last_w = w
+        self._last_h = h
+
+        if state == Qt.Checked:
+            self._ar_ratio = (h / w) if w else None
+        else:
+            self._ar_ratio = None
 
     def _on_w_changed(self, v):
-        if self.chk_ar.isChecked() and self._src_w and self._src_h:
-            ratio = self._src_h / self._src_w
+        """
+        User changed Width.
+        If Lock AR is ON, recalc Height from our last committed ratio.
+        """
+        # always update local last_w so unlocked typing still sticks
+        if self.chk_ar.isChecked() and self._last_w > 0:
+            # ratio of H per W based on the last committed pair
+            ratio_h_per_w = self._last_h / float(self._last_w)
+            new_h = max(1, int(round(v * ratio_h_per_w)))
+
             self.spin_h.blockSignals(True)
-            self.spin_h.setValue(max(1, int(v * ratio)))
+            self.spin_h.setValue(new_h)
             self.spin_h.blockSignals(False)
 
+            # commit the new pair
+            self._last_w = v
+            self._last_h = new_h
+        else:
+            self._last_w = v
+            self._last_h = self.spin_h.value()
+
     def _on_h_changed(self, v):
-        if self.chk_ar.isChecked() and self._src_w and self._src_h:
-            ratio = self._src_w / self._src_h
+        """
+        User changed Height.
+        If Lock AR is ON, recalc Width from our last committed ratio.
+        """
+        if self.chk_ar.isChecked() and self._last_h > 0:
+            ratio_w_per_h = self._last_w / float(self._last_h)
+            new_w = max(1, int(round(v * ratio_w_per_h)))
+
             self.spin_w.blockSignals(True)
-            self.spin_w.setValue(max(1, int(v * ratio)))
+            self.spin_w.setValue(new_w)
             self.spin_w.blockSignals(False)
+
+            # commit the new pair
+            self._last_w = new_w
+            self._last_h = v
+        else:
+            self._last_w = self.spin_w.value()
+            self._last_h = v
 
     # Utility
     def _is_image_mode(self) -> bool:
         return self.rad_images.isChecked()
 
-    # ----------------- Media mode toggle -----------------
-    def _on_media_mode_changed(self, *args):
+    def _is_webm_format(self) -> bool:
+        return "WebM" in self.cmb_vidfmt.currentText()
+
+    # ----------------- Media mode / no-resize toggles -----------------
+    def _apply_visibility(self):
+        """
+        Central show/hide logic:
+        - Hide all video rows in Images mode.
+        - Hide all image rows in Video mode.
+        - Hide size/scale rows when "Do not resize" is ON.
+        - Hide even-dim row if either Images mode OR "Do not resize".
+        """
         is_image = self._is_image_mode()
+        noresize = self.chk_noresize.isChecked()
 
-        # Grey out irrelevant controls
-        for w in (self.cmb_imgfmt, self.slider_imgq, self.lbl_imgq):
-            w.setEnabled(is_image)
+        # rows tied to resize math
+        resize_rows = [
+            ("targetsize",),
+            ("arlock",),
+            ("scalemode",),
+        ]
+        for (key,) in resize_rows:
+            getattr(self, f"row_{key}_label").setVisible(not noresize)
+            getattr(self, f"row_{key}_widget").setVisible(not noresize)
 
-        for w in (self.slider_crf, self.lbl_crf, self.cmb_x264, self.chk_acopy, self.chk_even):
-            w.setEnabled(not is_image)
+        # even-dim row (video-only and also hidden for noresize)
+        even_vis = (not is_image) and (not noresize)
+        self.row_even_label.setVisible(even_vis)
+        self.row_even_widget.setVisible(even_vis)
+
+        # image-only rows
+        img_rows = [
+            ("imgfmt",),
+            ("imgq",),
+        ]
+        for (key,) in img_rows:
+            getattr(self, f"row_{key}_label").setVisible(is_image)
+            getattr(self, f"row_{key}_widget").setVisible(is_image)
+
+        # video-only rows
+        vid_rows = [
+            ("vidfmt",),
+            ("crf",),
+            ("x264",),
+            ("acopy",),
+        ]
+        for (key,) in vid_rows:
+            getattr(self, f"row_{key}_label").setVisible(not is_image)
+            getattr(self, f"row_{key}_widget").setVisible(not is_image)
+
+    def _on_media_mode_changed(self, *args):
+        self._apply_visibility()
+
+    def _on_noresize_changed(self, *args):
+        self._apply_visibility()
 
     # ----------------- Presets -----------------
     def _on_save_preset(self):
@@ -317,13 +602,14 @@ class ResizePane(QWidget):
             ar_lock=self.chk_ar.isChecked(),
             scale_mode=self.cmb_mode.currentText(),
             media_mode="Image" if self._is_image_mode() else "Video",
+            no_resize=self.chk_noresize.isChecked(),
+            video_format=self.cmb_vidfmt.currentText(),
             crf=self.slider_crf.value(),
             x264_preset=self.cmb_x264.currentText(),
             audio_copy=self.chk_acopy.isChecked(),
             round_even=self.chk_even.isChecked(),
             image_format=self.cmb_imgfmt.currentText(),
             image_quality=self.slider_imgq.value(),
-            overwrite_policy=self.cmb_overwrite.currentText(),
         )
         try:
             p.save()
@@ -339,25 +625,34 @@ class ResizePane(QWidget):
             self.chk_ar.setChecked(p.ar_lock)
             self.cmb_mode.setCurrentText(p.scale_mode)
 
+            # update tracking pair
+            self._last_w = p.width
+            self._last_h = p.height
+            self._ar_ratio = (p.height / p.width) if (p.ar_lock and p.width) else None
+
             # radio selection
             self.rad_images.setChecked(p.media_mode == "Image")
             self.rad_video.setChecked(p.media_mode != "Image")
 
+            self.chk_noresize.setChecked(p.no_resize)
+            self.cmb_vidfmt.setCurrentText(p.video_format)
             self.slider_crf.setValue(p.crf)
             self.cmb_x264.setCurrentText(p.x264_preset)
             self.chk_acopy.setChecked(p.audio_copy)
             self.chk_even.setChecked(p.round_even)
             self.cmb_imgfmt.setCurrentText(p.image_format)
             self.slider_imgq.setValue(p.image_quality)
-            self.cmb_overwrite.setCurrentText(p.overwrite_policy)
 
-            self._on_media_mode_changed()
+            # refresh vis / AR ratio
+            self._apply_visibility()
+            self._on_ar_lock_changed(self.chk_ar.checkState())
+
             QMessageBox.information(self, "Preset loaded", f"Loaded from:\n{PRESET_PATH}")
         except Exception as e:
             QMessageBox.critical(self, "Preset error", str(e))
 
     # ----------------- Actions -----------------
-    def _pick_input(self) -> Path:
+    def _pick_input(self) -> Path | None:
         dlg = QFileDialog(self, "Choose media file")
         dlg.setFileMode(QFileDialog.ExistingFile)
         if dlg.exec():
@@ -373,28 +668,18 @@ class ResizePane(QWidget):
             return [Path(f) for f in dlg.selectedFiles()]
         return []
 
+    def _video_ext_for_current(self) -> str:
+        return _video_ext_from_choice(self.cmb_vidfmt.currentText())
+
     def _suggest_out_suffix(self, inp: Path) -> str:
         if self._is_image_mode():
             fmt_ext = _image_ext_from_choice(self.cmb_imgfmt.currentText(), inp.suffix)
             return ".resized" + fmt_ext
         else:
-            return ".resized.mp4"
+            fmt_ext = self._video_ext_for_current()
+            return ".resized" + fmt_ext
 
-    def _apply_overwrite_policy(self, out_path: Path) -> tuple[Path, str]:
-        """Return (final_path, skip_reason or "") obeying overwrite policy."""
-        policy = self.cmb_overwrite.currentText()
-        if not out_path.exists():
-            return out_path, ""
-        if policy == "Overwrite":
-            return out_path, ""
-        if policy == "Skip existing":
-            return out_path, "exists"
-        if policy == "Versioned filename":
-            return _versioned_path(out_path), ""
-        # Default safe
-        return out_path, "exists"
-
-    def _pick_output(self, inp: Path) -> Path:
+    def _pick_output(self, inp: Path) -> Path | None:
         base = inp.with_name(inp.stem + self._suggest_out_suffix(inp))
         dlg = QFileDialog(self, "Save as")
         dlg.setAcceptMode(QFileDialog.AcceptSave)
@@ -403,40 +688,74 @@ class ResizePane(QWidget):
             files = dlg.selectedFiles()
             if files:
                 chosen = Path(files[0])
-                final, reason = self._apply_overwrite_policy(chosen)
-                if reason == "exists":
-                    QMessageBox.information(self, "Skipped", f"File exists and policy is 'Skip existing':\n{chosen}")
-                    return None
-                return final
+                # overwrite/rename/skip is now handled globally elsewhere;
+                # here we just return the chosen path.
+                return chosen
         return None
 
     def _build_cmd_video(self, inp: Path, out: Path, src_w: int, src_h: int) -> list[str]:
         tgt_w, tgt_h = self.spin_w.value(), self.spin_h.value()
-        vf, ow, oh = _build_vf(src_w, src_h, tgt_w, tgt_h, self.cmb_mode.currentText(), self.chk_even.isChecked())
+        noresize = self.chk_noresize.isChecked()
+
+        # Build scaling / SAR
+        if noresize:
+            vf_chain = "setsar=1"
+        else:
+            vf, ow, oh = _build_vf(
+                src_w, src_h,
+                tgt_w, tgt_h,
+                self.cmb_mode.currentText(),
+                self.chk_even.isChecked()
+            )
+            vf_chain = vf
+
+        fmt_choice = self.cmb_vidfmt.currentText()
+        is_webm = "WebM" in fmt_choice
 
         cmd = [
             "ffmpeg", "-y",
             "-i", str(inp),
-            "-vf", vf,
-            "-pix_fmt", "yuv420p",
-            "-c:v", "libx264",
-            "-preset", self.cmb_x264.currentText(),
-            "-crf", str(self.slider_crf.value())
         ]
-        if self.chk_acopy.isChecked():
-            cmd += ["-c:a", "copy"]
+
+        if vf_chain:
+            cmd += ["-vf", vf_chain]
+
+        if is_webm:
+            # WebM (VP9 + Opus). audio_copy is ignored.
+            cmd += [
+                "-c:v", "libvpx-vp9",
+                "-pix_fmt", "yuv420p",
+                "-b:v", "0",
+                "-crf", str(self.slider_crf.value()),
+                "-c:a", "libopus",
+                "-b:a", "192k",
+            ]
         else:
-            cmd += ["-c:a", "aac", "-b:a", "192k"]
+            # MP4/MKV with H.264
+            cmd += [
+                "-pix_fmt", "yuv420p",
+                "-c:v", "libx264",
+                "-preset", self.cmb_x264.currentText(),
+                "-crf", str(self.slider_crf.value())
+            ]
+            if self.chk_acopy.isChecked():
+                cmd += ["-c:a", "copy"]
+            else:
+                cmd += ["-c:a", "aac", "-b:a", "192k"]
+
         cmd += [str(out)]
         return cmd
 
     def _build_cmd_image(self, inp: Path, out: Path) -> list[str]:
         tgt_w, tgt_h = self.spin_w.value(), self.spin_h.value()
-        vf = _build_vf_image(tgt_w, tgt_h, self.cmb_mode.currentText())
+        noresize = self.chk_noresize.isChecked()
         quality = self.slider_imgq.value()
         ext = out.suffix.lower()
 
-        cmd = ["ffmpeg", "-y", "-i", str(inp), "-vf", vf]
+        cmd = ["ffmpeg", "-y", "-i", str(inp)]
+        if not noresize:
+            vf = _build_vf_image(tgt_w, tgt_h, self.cmb_mode.currentText())
+            cmd += ["-vf", vf]
 
         if ext in (".jpg", ".jpeg"):
             cmd += ["-q:v", str(_map_jpeg_q(quality))]
@@ -470,19 +789,14 @@ class ResizePane(QWidget):
                     skipped.append((inp, "not video (mode=Video)"))
                     continue
 
-                # Output path & overwrite policy
+                # Output path
                 if image_mode:
                     out_ext = _image_ext_from_choice(self.cmb_imgfmt.currentText(), ext)
-                    out = inp.with_name(inp.stem + ".resized" + out_ext)
                 else:
-                    out = inp.with_name(inp.stem + ".resized.mp4")
+                    out_ext = self._video_ext_for_current()
+                out = inp.with_name(inp.stem + ".resized" + out_ext)
 
-                final_out, reason = self._apply_overwrite_policy(out)
-                if reason == "exists":
-                    skipped.append((inp, "exists (policy=Skip)"))
-                    continue
-
-                to_process.append((inp, final_out))
+                to_process.append((inp, out))
             except Exception as e:
                 skipped.append((inp, f"error: {e}"))
 
@@ -504,7 +818,8 @@ class ResizePane(QWidget):
 
     def _on_resize_single(self):
         inp = self._pick_input()
-        if not inp: return
+        if not inp:
+            return
         ext = inp.suffix.lower()
 
         if self._is_image_mode() and ext not in IMAGE_EXTS:
@@ -518,7 +833,8 @@ class ResizePane(QWidget):
         self._src_w, self._src_h = src_w, src_h
 
         out = self._pick_output(inp)
-        if not out: return
+        if not out:
+            return
 
         cmd = self._build_cmd_image(inp, out) if self._is_image_mode() else self._build_cmd_video(inp, out, src_w, src_h)
         ok, err = self._run_ffmpeg(cmd)
@@ -526,6 +842,7 @@ class ResizePane(QWidget):
             QMessageBox.information(self, "Done", f"Saved:\n{out}")
         else:
             QMessageBox.critical(self, "FFmpeg error", err or "Unknown error")
+
     def _on_resize_batch(self):
         # Prefer the shared BatchSelectDialog (helpers/batch.py). Fallback to classic file picker.
         inputs = []
@@ -541,18 +858,11 @@ class ResizePane(QWidget):
             exts = tuple(IMAGE_EXTS) if self._is_image_mode() else tuple(VIDEO_EXTS)
             result = _BatchDialog.pick(self, title="Resize a batch…", exts=exts)
             if isinstance(result, tuple):
-                files, conflict = result
+                files, _conflict = result
             else:
-                files, conflict = result, "skip"
+                files, _conflict = result, "skip"
             if files is None:
                 return  # user cancelled
-            # Sync overwrite policy combo to dialog choice
-            if conflict in ("skip", "none"):
-                self.cmb_overwrite.setCurrentText("Skip existing")
-            elif conflict == "overwrite":
-                self.cmb_overwrite.setCurrentText("Overwrite")
-            elif conflict in ("version", "autorename", "auto", "ver"):
-                self.cmb_overwrite.setCurrentText("Versioned filename")
             inputs = [Path(f) for f in files]
         else:
             inputs = self._pick_inputs()
@@ -609,7 +919,6 @@ class ResizePane(QWidget):
         else:
             QMessageBox.information(self, "Batch finished", msg)
 
-
     def _run_ffmpeg(self, cmd: list[str]) -> tuple[bool, str]:
         try:
             p = subprocess.run(cmd, capture_output=True, text=True)
@@ -648,6 +957,7 @@ def install_resize_tool(*args, **kwargs):
         if section is not None and hasattr(section, "setContentLayout"):
             from PySide6.QtWidgets import QVBoxLayout
             lay = QVBoxLayout()
+            lay.setContentsMargins(0,0,0,0)
             lay.addWidget(widget)
             section.setContentLayout(lay)
             return widget

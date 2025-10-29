@@ -567,13 +567,75 @@ def _fv_select_startup_logo():
 STARTUP_LOGO_PATH = _fv_select_startup_logo()
 
 def now_stamp(): return datetime.now().strftime("%Y%m%d_%H%M%S")
+def _sec_to_mss(sec_val):
+    """Return M:SS or H:MM:SS for a duration in seconds (float or str).
+    If sec_val is None/invalid, return empty string."""
+    try:
+        total = int(float(sec_val or 0))
+    except Exception:
+        return ""
+    h = total // 3600
+    m = (total % 3600) // 60
+    s = total % 60
+    if h:
+        return f"{h}:{m:02d}:{s:02d}"
+    return f"{m}:{s:02d}"
+
 def compose_video_info_text(path: Path) -> str:
+    """Build the info line under the player.
+
+    Rules:
+    - For audio or still images: hide resolution and fps.
+    - Duration shows as M:SS (no raw "123.45 s"), when available.
+    - For video: show resolution, fps (if available), duration M:SS, and size.
+    """
     try:
         inf = probe_media(path)
-        return f"{path.name} • {inf.get('width','?')}x{inf.get('height','?')} • {inf.get('fps','?')} fps • {inf.get('duration','?')} s • {human_mb(inf.get('size',0))} MB"
-    except Exception:
-        return path.name
+        ext = str(path.suffix or "").lower()
+        size_mb = human_mb(inf.get('size', 0))
 
+        dur_txt = _sec_to_mss(inf.get('duration'))
+
+        # classify extension types locally (don't rely on later IMAGE_EXTS definition order)
+        audio_exts = set(x.lower() for x in list(AUDIO_EXTS))
+        image_exts = {
+            '.png','.jpg','.jpeg','.bmp','.webp','.tif','.tiff',
+            '.gif','.avif','.heic','.heif'
+        }
+
+        # Audio file: filename • M:SS • size MB
+        if ext in audio_exts:
+            parts = [path.name]
+            if dur_txt:
+                parts.append(dur_txt)
+            parts.append(f"{size_mb} MB")
+            return " • ".join(parts)
+
+        # Still image (or animated gif treated as image in info line):
+        # filename • size MB
+        if ext in image_exts:
+            parts = [path.name, f"{size_mb} MB"]
+            return " • ".join(parts)
+
+        # Default / video clip: filename • WxH • fps fps • M:SS • size MB
+        parts = [path.name]
+
+        w = inf.get('width')
+        h = inf.get('height')
+        if w and h:
+            parts.append(f"{w}x{h}")
+
+        fps = inf.get('fps')
+        if fps:
+            parts.append(f"{fps} fps")
+
+        if dur_txt:
+            parts.append(dur_txt)
+
+        parts.append(f"{size_mb} MB")
+        return " • ".join(parts)
+    except Exception:
+        return str(path.name)
 def human_mb(b):
     try: return round(b/(1024*1024),2)
     except: return 0.0
@@ -1591,7 +1653,10 @@ class VideoPane(QWidget):
             self._mode = 'video'
             self.label.setMovie(None)
             self._rebuild_player()
-            self.player.setSource(QUrl.fromLocalFile(str(p)))
+            src_path = str(p)
+            if hasattr(self, "volume_popup_widget") and self.volume_popup_widget:
+                src_path = self.volume_popup_widget.get_eq_processed_path(src_path)
+            self.player.setSource(QUrl.fromLocalFile(src_path))
             try:
                 self.player.play()
             except Exception:

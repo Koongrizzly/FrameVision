@@ -1,603 +1,844 @@
+import os
+import json
 from PySide6.QtCore import Qt, QTimer
 from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel, QSlider, QPushButton,
-    QFrame, QToolButton, QCheckBox, QGridLayout, QMenu, QWidgetAction, QApplication
+    QFrame, QToolButton, QCheckBox, QGridLayout, QMenu, QWidgetAction,
+    QComboBox, QInputDialog, QMessageBox
 )
 
-import atexit
+"""
+volume_new.py  (v11)
 
-BANDS = [("60 Hz", 60), ("230 Hz", 230), ("910 Hz", 910), ("3.6 kHz", 3600), ("14 kHz", 14000)]
+What this gives you:
+- Volume slider (0..100)  ✅ works
+- Mute checkbox           ✅ works
+- Sticky mute/volume across tracks (no popping, no skipping first beat)
+- 12-band EQ sliders      ✅ UI
+- Reset EQ button         ✅ UI, resets + saves
+- Preset dropdown         ✅ new
+- Save preset / Delete preset buttons ✅ new
+- EQ state auto-saves and auto-loads across app restarts ✅ new
 
-def _resolve_audio(pane):
-    for name in ("audio", "audio_output", "audioOutput", "player_audio", "audio_out"):
-        if hasattr(pane, name):
-            return getattr(pane, name)
-    for name in ("player", "media_player", "video_player"):
-        p = getattr(pane, name, None)
-        if p and hasattr(p, "audioOutput"):
-            try:
-                a = p.audioOutput()
-                if a: return a
-            except Exception:
-                pass
-    return None
+Paths (relative to current working directory when you launch the app):
+    presets/setsave/eq_state.json
+    presets/setsave/eqpresets/*.json
 
-def _resolve_player(pane):
-    for name in ("player", "media_player", "video_player"):
-        if hasattr(pane, name):
-            return getattr(pane, name)
-    return None
+These folders/files are created automatically if missing.
 
-def _ffmpeg_eq_filter(gains):
-    freqs = [60, 230, 910, 3600, 14000]
-    parts = []
-    for f, g in zip(freqs, gains):
-        parts.append(f"equalizer=f={f}:t=q:w=1:g={int(g)}")
-    return ",".join(parts)
+Things we very intentionally DO NOT do (for safety/stability right now):
+- We NEVER pause/resume/seek the player
+- We NEVER do 150ms gates or first-beat skips
+- We NEVER hijack playback or spawn a side ffmpeg process
+- We DO NOT yet process audio through an EQ filter (that's the next phase where we build a proper master/mixer)
 
-# --- global emergency cleanup at interpreter exit ---
-def _atexit_cleanup():
+Public API is the same as before:
+    add_new_volume_popup(pane, bar_layout)
+    class _MenuPopupWidget
+    pane.btn_volume_new
+    pane.volume_popup_menu
+    pane.volume_popup_widget
+"""
+
+# 12-band EQ (UI). Each is -12..+12 dB
+BANDS = [
+    ("60 Hz",      60),
+    ("120 Hz",     120),
+    ("230 Hz",     230),
+    ("460 Hz",     460),
+    ("910 Hz",     910),
+    ("1.8 kHz",    1800),
+    ("2.5 kHz",    2500),
+    ("3.6 kHz",    3600),
+    ("5 kHz",      5000),
+    ("7 kHz",      7000),
+    ("10 kHz",     10000),
+    ("14 kHz",     14000),
+]
+
+# Where we persist EQ stuff
+_BASE_EQ_DIR      = os.path.join(os.getcwd(), "presets", "setsave")
+_EQ_STATE_FILE    = os.path.join(_BASE_EQ_DIR, "eq_state.json")
+_EQ_PRESET_DIR    = os.path.join(_BASE_EQ_DIR, "eqpresets")
+
+# Global desired state for sticky mute & volume
+_DESIRED_VOL_PCT = 100    # slider % 0..100
+_DESIRED_MUTED   = False  # True if user checked "Mute"
+
+
+def _ensure_eq_dirs():
+    """Make sure presets/setsave/ and presets/setsave/eqpresets/ actually exist."""
     try:
-        from . import eq_ffmpeg
-        eq_ffmpeg.stop()
+        os.makedirs(_BASE_EQ_DIR, exist_ok=True)
     except Exception:
         pass
-atexit.register(_atexit_cleanup)
+    try:
+        os.makedirs(_EQ_PRESET_DIR, exist_ok=True)
+    except Exception:
+        pass
+
+
+def _resolve_audio(pane):
+    """
+    Find the audio output object (QAudioOutput / similar).
+    We ONLY touch setVolume()/setMuted() on this.
+    We do NOT touch playback timing.
+    """
+    for name in ("audio", "audio_output", "audioOutput", "player_audio", "audio_out"):
+        if hasattr(pane, name):
+            a = getattr(pane, name)
+            if a is not None:
+                return a
+
+    # fallback: pane.player.audioOutput()
+    for nm in ("player", "media_player", "video_player"):
+        p = getattr(pane, nm, None)
+        if p is not None and hasattr(p, "audioOutput"):
+            try:
+                a = p.audioOutput()
+                if a:
+                    return a
+            except Exception:
+                pass
+
+    return None
+
+
+def _resolve_player(pane):
+    """
+    Try to find the playback object.
+    We ONLY listen to its signals so we can re-apply mute/volume instantly on changes.
+    We DO NOT pause/resume/seek it.
+    """
+    for nm in ("player", "media_player", "video_player"):
+        p = getattr(pane, nm, None)
+        if p is not None:
+            return p
+    return None
 
 
 class _MenuPopupWidget(QWidget):
+    """
+    The popup content shown when you click the 🔊 button.
+
+    Exposes:
+      - self.vol (QSlider horizontal)
+      - self.mute (QCheckBox)
+      - self.eq (list of 12 vertical sliders)
+      - self.preset_combo (QComboBox)
+      - schedule_reapply() (compat no-op)
+
+    Behavior:
+      - Auto-load last EQ state from eq_state.json on startup
+      - Auto-save EQ state whenever sliders move / reset is clicked
+      - Preset dropdown lets you load presets from /eqpresets/
+      - "Save Preset" writes a new file in /eqpresets/
+      - "Delete Preset" removes the selected preset file
+    """
+
     def __init__(self, pane, parent=None):
         super().__init__(parent)
-        from . import eq_ffmpeg  # sidecar module
-        self.eq_ffmpeg = eq_ffmpeg
         self.pane = pane
-        self._eq_enabled = False      # actual sidecar running
-        self._eq_armed = True         # desired state (EQ "on" even if no media yet)
 
-        # start-gate state (prevents blips and first-second peaks)
-        self._gate_active = False
-        self._gate_t_play = QTimer(self); self._gate_t_play.setSingleShot(True)
-        self._gate_t_play.timeout.connect(self._finalize_gate)
-        self._gate_t_force = QTimer(self); self._gate_t_force.setSingleShot(True)
-        self._gate_t_force.timeout.connect(self._finalize_gate)
-        self._vol_guard = QTimer(self); self._vol_guard.setSingleShot(False)
-        self._vol_guard.timeout.connect(self._enforce_desired_volume)
+        _ensure_eq_dirs()
 
-        # startup EQ default enforcement (to override late settings loaders)
-        self._eq_default_enforce = True
-        self._eq_default_timer = QTimer(self); self._eq_default_timer.setInterval(150); self._eq_default_timer.timeout.connect(self._enforce_eq_default)
-        self._eq_default_deadline_ms = 2000  # enforce for ~2s max
-        self._internal_toggle = False  # distinguishes programmatic vs user
+        # guard to avoid signal loops when we update UI ourselves
+        self._internal_change = False
 
-        frame = QFrame(self); frame.setObjectName("fv_menu_volume_frame")
-        root = QVBoxLayout(self); root.setContentsMargins(0,0,0,0); root.addWidget(frame)
-        v = QVBoxLayout(frame); v.setContentsMargins(12,12,12,12); v.setSpacing(10)
+        # copy global desired volume/mute into this widget instance
+        global _DESIRED_VOL_PCT, _DESIRED_MUTED
+        self._desired_vol_pct = _DESIRED_VOL_PCT
+        self._desired_muted   = _DESIRED_MUTED
 
-        # Top: Volume + Mute
-        top = QHBoxLayout(); top.setSpacing(8)
-        vol_label = QLabel("Volume"); vol_label.setObjectName("fv_vol_label")
-        top.addWidget(vol_label)
-        self.vol = QSlider(Qt.Horizontal); self.vol.setRange(0,100); self.vol.setValue(100); top.addWidget(self.vol, 1)
-        self.mute = QCheckBox("Mute"); top.addWidget(self.mute)
-        v.addLayout(top)
+        # remember last-applied audio state so we don't spam setVolume()/setMuted()
+        self._last_applied_vol_pct = None
+        self._last_applied_muted   = None
 
-        # EQ grid
-        grid = QGridLayout(); grid.setHorizontalSpacing(16); grid.setVerticalSpacing(6)
+        # -------------------------------------------------
+        # BUILD UI
+        # -------------------------------------------------
+
+        frame = QFrame(self)
+        frame.setObjectName("fv_menu_volume_frame")
+
+        root = QVBoxLayout(self)
+        root.setContentsMargins(0, 0, 0, 0)
+        root.addWidget(frame)
+
+        outer = QVBoxLayout(frame)
+        outer.setContentsMargins(12, 12, 12, 12)
+        outer.setSpacing(10)
+
+        #
+        # Top row: Volume slider | Mute | Reset EQ
+        #
+        top_row = QHBoxLayout()
+        top_row.setSpacing(8)
+
+        vol_label = QLabel("Volume")
+        vol_label.setObjectName("fv_vol_label")
+
+        self.vol = QSlider(Qt.Horizontal)
+        self.vol.setRange(0, 100)
+        self.vol.setValue(self._desired_vol_pct)
+
+        self.mute = QCheckBox("Mute")
+        self.mute.setChecked(self._desired_muted)
+
+        self.reset_eq = QPushButton("Reset EQ")
+        self.reset_eq.setObjectName("fv_eq_reset")
+
+        top_row.addWidget(vol_label)
+        top_row.addWidget(self.vol, 1)
+        top_row.addWidget(self.mute)
+        top_row.addWidget(self.reset_eq)
+        outer.addLayout(top_row)
+
+        #
+        # Preset row: [ Preset dropdown | Save Preset | Delete Preset ]
+        #
+        preset_row = QHBoxLayout()
+        preset_row.setSpacing(8)
+
+        preset_label = QLabel("Preset:")
+        preset_label.setObjectName("fv_preset_label")
+
+        self.preset_combo = QComboBox()
+        self.preset_combo.setObjectName("fv_preset_combo")
+        # style will follow palette, we can theme via stylesheet below
+
+        self.btn_save_preset = QPushButton("Save Preset")
+        self.btn_save_preset.setObjectName("fv_save_preset")
+
+        self.btn_delete_preset = QPushButton("Delete Preset")
+        self.btn_delete_preset.setObjectName("fv_delete_preset")
+
+        preset_row.addWidget(preset_label)
+        preset_row.addWidget(self.preset_combo, 1)
+        preset_row.addWidget(self.btn_save_preset)
+        preset_row.addWidget(self.btn_delete_preset)
+        outer.addLayout(preset_row)
+
+        #
+        # 12-band EQ sliders
+        #
+        eq_grid = QGridLayout()
+        eq_grid.setHorizontalSpacing(12)
+        eq_grid.setVerticalSpacing(4)
+
         self.eq = []
-        for i,(label,_freq) in enumerate(BANDS):
-            sv = QSlider(Qt.Vertical); sv.setRange(-12,12); sv.setValue(0); self.eq.append(sv)
-            grid.addWidget(sv,0,i,alignment=Qt.AlignHCenter|Qt.AlignBottom)
-            lb = QLabel(label); lb.setObjectName('fv_freq_label'); lb.setAlignment(Qt.AlignHCenter); grid.addWidget(lb,1,i,alignment=Qt.AlignHCenter)
-        v.addLayout(grid)
+        for i, (label_text, freq) in enumerate(BANDS):
+            sv = QSlider(Qt.Vertical)
+            sv.setRange(-12, 12)
+            sv.setValue(0)
+            sv.setToolTip(f"{freq} Hz")
+            self.eq.append(sv)
 
-        # Bottom: Toggle EQ + Reset
-        bottom = QHBoxLayout(); bottom.addStretch(1)
-        self.toggle_btn = QPushButton("EQ")
-        self.toggle_btn.setCheckable(True)
-        self.toggle_btn.setObjectName("fv_eq_toggle")
-        self.reset = QPushButton("Reset EQ")
-        bottom.addWidget(self.toggle_btn)
-        bottom.addWidget(self.reset)
-        bottom.addStretch(1)
-        v.addLayout(bottom)
+            eq_grid.addWidget(
+                sv,
+                0, i,
+                alignment=Qt.AlignHCenter | Qt.AlignBottom,
+            )
 
-        # Debouncers
-        self._eq_apply_timer = QTimer(self); self._eq_apply_timer.setSingleShot(True)
-        self._eq_apply_timer.timeout.connect(self._apply_eq_now)
+            lab = QLabel(label_text)
+            lab.setObjectName("fv_freq_label")
+            lab.setAlignment(Qt.AlignHCenter)
+            eq_grid.addWidget(
+                lab,
+                1, i,
+                alignment=Qt.AlignHCenter,
+            )
 
-        self._reapply_timer = QTimer(self); self._reapply_timer.setSingleShot(True)
-        self._reapply_timer.timeout.connect(lambda: self.reapply_to_audio(True, reason="debounced"))
+        outer.addLayout(eq_grid)
 
-        # Wire
+        #
+        # Styling
+        #
+        self.setStyleSheet(
+            "#fv_menu_volume_frame{"
+            " background: palette(window);"
+            " border: 1px solid palette(mid);"
+            " border-radius: 12px;"
+            "}"
+            "QLabel,QCheckBox{"
+            " color: palette(window-text);"
+            " background: transparent;"
+            "}"
+            "QLabel#fv_freq_label{"
+            " font-weight:600; font-size:12px;"
+            "}"
+            "QLabel#fv_vol_label{"
+            " font-weight:700; font-size:13px;"
+            "}"
+            "QLabel#fv_preset_label{"
+            " font-weight:600; font-size:12px;"
+            "}"
+            "QPushButton#fv_eq_reset,"
+            "QPushButton#fv_save_preset,"
+            "QPushButton#fv_delete_preset{"
+            " background: palette(button);"
+            " color: palette(window-text);"
+            " border: 1px solid palette(mid);"
+            " border-radius: 8px;"
+            " padding: 4px 10px;"
+            " font-size:12px;"
+            "}"
+            "QPushButton#fv_eq_reset:hover,"
+            "QPushButton#fv_save_preset:hover,"
+            "QPushButton#fv_delete_preset:hover{"
+            " background: palette(light);"
+            "}"
+            "QPushButton#fv_eq_reset:pressed,"
+            "QPushButton#fv_save_preset:pressed,"
+            "QPushButton#fv_delete_preset:pressed{"
+            " background: palette(dark);"
+            "}"
+            "QComboBox#fv_preset_combo{"
+            " background: palette(base);"
+            " color: palette(window-text);"
+            " border: 1px solid palette(mid);"
+            " border-radius: 6px;"
+            " padding: 2px 8px;"
+            " font-size:12px;"
+            "}"
+        )
+
+        # -------------------------------------------------
+        # SIGNALS
+        # -------------------------------------------------
+
         self.vol.valueChanged.connect(self._on_volume_changed)
         self.mute.toggled.connect(self._on_mute_toggled)
-        self.reset.clicked.connect(self._reset_eq)
-        self.toggle_btn.toggled.connect(self._toggle_eq)
-        for idx, sv in enumerate(self.eq):
-            sv.valueChanged.connect(lambda _g, i=idx: self._on_eq_changed())
+        self.reset_eq.clicked.connect(self._on_reset_clicked)
 
-        # init from audio
-        self._sync_from_audio()
+        # EQ sliders
+        for sv in self.eq:
+            sv.valueChanged.connect(self._on_eq_slider_changed)
 
-        # DEFAULT: EQ ON (armed) at app start regardless of media presence
-        self._internal_toggle = True
-        self.toggle_btn.setChecked(True)
-        self._internal_toggle = False
-        self._eq_armed = True
+        # Preset interactions
+        self.preset_combo.currentIndexChanged.connect(self._on_preset_selected)
+        self.btn_save_preset.clicked.connect(self._on_save_preset_clicked)
+        self.btn_delete_preset.clicked.connect(self._on_delete_preset_clicked)
 
-        self._update_visual_state()
-
-        # style
-        self.setStyleSheet(
-            "#fv_menu_volume_frame{background: palette(window);border: 1px solid palette(mid);border-radius: 12px;}"
-            "QLabel,QCheckBox{color: palette(window-text); background: transparent;}"
-            "QLabel#fv_freq_label{font-weight:600; font-size:13px;}"
-            "QLabel#fv_vol_label{font-weight:700; font-size:13px;}"
-            "QPushButton{background: palette(button);color: palette(window-text);border: 1px solid palette(mid);border-radius: 8px; padding: 6px 12px;}"
-            "QPushButton:hover{background: palette(light);}"
-            "QPushButton:pressed{background: palette(dark);}"
-            "QPushButton:checked{background: palette(midlight); border-color: palette(highlight);}"
-            "QToolTip{color: palette(toolTipText); background-color: palette(toolTipBase); border: 1px solid palette(mid);}"
-            "QPushButton#fv_eq_toggle { border-radius: 8px; font-weight: 600; }"
-            "QPushButton#fv_eq_toggle:checked { background: #16a34a; color: white; }"
+        # Poll timer (every 250ms):
+        # - enforce desired mute/volume if needed
+        # - refresh UI to match desired values
+        self._poll = QTimer(self)
+        self._poll.setSingleShot(False
         )
-        self.setMinimumWidth(420)
+        self._poll.timeout.connect(self._tick)
+        self._poll.start(250)
 
-        # publish initial visual state
-        self._publish_visual_state()
+        # Hook player signals so when a new track starts,
+        # we instantly enforce mute/volume.
+        self._hook_player_signals()
 
-        # --- Reapply UI state automatically when media changes/loads ---
-        self._install_media_change_hooks()
+        # 1. Load last EQ state from disk (if present)
+        #    This also updates sliders BEFORE we save anything new.
+        self._load_eq_state()
 
-        # Ensure the current UI state is applied immediately with gate
-        self.schedule_reapply(0)
+        # 2. Load the preset list into dropdown
+        self._refresh_presets()
 
-        # Start EQ default enforcement window
-        self._eq_default_timer.start()
+        # 3. Initial sync
+        self._apply_desired_state_to_audio()
+        self._sync_ui_from_desired()
 
-    # ---------- Helpers to detect media readiness ----------
-    def _media_ready(self):
-        """Return True if player likely has a bound source capable of audio output."""
-        p = _resolve_player(self.pane)
-        if p is None:
-            # If we at least have an audio output, we might still be okay
-            return _resolve_audio(self.pane) is not None
-        try:
-            # Heuristic: if position exists or duration>0 or status indicates loaded/buffered
-            if hasattr(p, "position") and callable(p.position) and p.position() > 0:
-                return True
-        except Exception:
-            pass
-        for attr in ("duration", "mediaStatus"):
-            try:
-                val = getattr(p, attr)() if callable(getattr(p, attr, None)) else getattr(p, attr, None)
-                if val and int(val) > 0:
-                    return True
-            except Exception:
-                pass
-        # Fallback: if we have an audio output, allow applying; sidecar may still refuse — that's okay
-        return _resolve_audio(self.pane) is not None
+    # -------------------------------------------------
+    # Backward compat with old code
+    def schedule_reapply(self, delay_ms=0):
+        # Old versions used this for EQ/ffmpeg.
+        # We keep it so your app won't crash if something still calls it.
+        return
 
-    # ---------- EQ default enforcer ----------
-    def _enforce_eq_default(self):
-        if not self._eq_default_enforce:
-            self._eq_default_timer.stop()
-            return
-        self._eq_default_deadline_ms -= self._eq_default_timer.interval()
-        if self._eq_default_deadline_ms <= 0:
-            self._eq_default_timer.stop()
-            self._eq_default_enforce = False
-            return
-        # Keep toggle visually ON
-        if not self.toggle_btn.isChecked():
-            self._internal_toggle = True
-            self.toggle_btn.setChecked(True)
-            self._internal_toggle = False
-        # Arm EQ (apply when ready)
-        self._eq_armed = True
-        # Try to apply if media is ready
-        if self._media_ready():
-            self._apply_eq_pipeline(force_zero=True)
-
-    # ---------- Start-gate logic to eliminate blips ----------
-    def _begin_gate(self):
-        if self._gate_active:
-            return
-        self._gate_active = True
-
-        a = self._audio()
-        if a:
-            try: a.setMuted(True)
-            except Exception: pass
-            try: a.setVolume(0.0)
-            except Exception: pass
-
-        try: self.eq_ffmpeg.stop()
-        except Exception: pass
-
-        # If armed, prep pipeline at zero even if media not yet ready (sidecar may refuse; that's fine)
-        if self._eq_armed:
-            self._apply_eq_pipeline(force_zero=True)
-
-        self._gate_t_force.start(1200)
-
-    def _finalize_gate(self):
-        if not self._gate_active:
-            return
-        self._gate_active = False
-        try: self._gate_t_force.stop()
-        except Exception: pass
-        try: self._gate_t_play.stop()
-        except Exception: pass
-
-        a = self._audio()
-        desired_muted = bool(self.mute.isChecked())
-        desired_volume = max(0.0, min(1.0, float(self.vol.value())/100.0))
-
-        if a:
-            try: a.setVolume(0.0 if desired_muted else desired_volume)
-            except Exception: pass
-            try: a.setMuted(desired_muted)
-            except Exception: pass
-
-        if not desired_muted:
-            try: self.eq_ffmpeg.unmute_qt(self.pane)
-            except Exception: pass
-
-        try:
-            self._guard_deadline_ms = 900
-            self._vol_guard.start(60)
-        except Exception:
-            pass
-
-        self._publish_visual_state()
-        self._update_visual_state()
-
-    def _enforce_desired_volume(self):
-        try:
-            self._guard_deadline_ms -= 60
-            if self._guard_deadline_ms <= 0:
-                self._vol_guard.stop()
-        except Exception:
-            try: self._vol_guard.stop()
-            except Exception: pass
-            return
-
-        a = self._audio()
-        if not a:
-            return
-        desired_muted = bool(self.mute.isChecked())
-        desired_volume = max(0.0, min(1.0, float(self.vol.value())/100.0))
-
-        try:
-            cur_vol = 0.0
-            try: cur_vol = float(a.volume())
-            except Exception: pass
-            if desired_muted:
-                if cur_vol != 0.0:
-                    a.setVolume(0.0)
-                if hasattr(a, "setMuted"):
-                    a.setMuted(True)
-            else:
-                if abs(cur_vol - desired_volume) > 0.005:
-                    a.setVolume(desired_volume)
-                if hasattr(a, "setMuted"):
-                    a.setMuted(False)
-        except Exception:
-            pass
-
-    # ---------- Reapply orchestration ----------
-    def schedule_reapply(self, delay_ms=120):
-        try:
-            self._reapply_timer.stop()
-            self._reapply_timer.start(max(0, int(delay_ms)))
-        except Exception:
-            self.reapply_to_audio(True, reason="fallback")
-
-    def reapply_to_audio(self, also_eq=True, reason="manual"):
-        self._begin_gate()
-        if also_eq and self._eq_armed:
-            # Apply only when ready; otherwise stay armed
-            if self._media_ready():
-                self._apply_eq_pipeline(force_zero=self.mute.isChecked() or self._gate_active)
-        self._publish_visual_state()
-        self._update_visual_state()
-
-    # ---------- Media hooks ----------
-    def _install_media_change_hooks(self):
-        if getattr(self.pane, "_fv_media_hooks_installed_v5_eq_armed", False):
-            return
-        setattr(self.pane, "_fv_media_hooks_installed_v5_eq_armed", True)
-
-        p = _resolve_player(self.pane)
-        if p is None:
-            return
-
-        def _on_status_change(*_):
-            self.schedule_reapply(0)
-
-        def _on_playback_change(*_):
-            try:
-                self._gate_t_play.start(150)
-            except Exception:
-                self._finalize_gate()
-
-        def _on_position_changed(pos_ms):
-            if pos_ms and int(pos_ms) > 40:
-                self._finalize_gate()
-
-        for sig_name, handler in (
-            ("mediaStatusChanged", _on_status_change),
-            ("sourceChanged", _on_status_change),
-            ("currentMediaChanged", _on_status_change),
-            ("mediaChanged", _on_status_change),
-            ("playbackStateChanged", _on_playback_change),
-            ("positionChanged", _on_position_changed),
-        ):
-            try:
-                getattr(p, sig_name).connect(handler)
-            except Exception:
-                pass
-
-        # Guard pane.open as well
-        try:
-            orig_open = getattr(self.pane, "open")
-            if callable(orig_open) and not getattr(orig_open, "_fv_eq_wrapped_gate_v5_eq_armed", False):
-                def wrapped_open(*args, **kwargs):
-                    self._begin_gate()
-                    try: self.eq_ffmpeg.stop()
-                    except Exception: pass
-                    res = orig_open(*args, **kwargs)
-                    self.schedule_reapply(0)
-                    return res
-                wrapped_open._fv_eq_wrapped_gate_v5_eq_armed = True
-                setattr(self.pane, "open", wrapped_open)
-        except Exception:
-            pass
-
-    # ---------- EQ pipeline helpers ----------
-    def _apply_eq_pipeline(self, force_zero=False):
-        """Try to start/update the sidecar pipeline. Never flips the toggle OFF on failure.
-        Keeps _eq_armed True and sets _eq_enabled based on success."""
-        try:
-            ok = self.eq_ffmpeg.apply_filter(self.pane, self._filter_chain(force_volume_zero=force_zero))
-            self._eq_enabled = bool(ok)
-            # Visual stays ON regardless; _eq_enabled just tracks running state
-            self._apply_toggle_style(True)
-        except Exception:
-            self._eq_enabled = False
-            # Keep toggle visually ON if armed
-            if self._eq_armed:
-                self._apply_toggle_style(True)
-
-    # ----- toggle logic -----
-    def _apply_toggle_style(self, on):
-        self.toggle_btn.setChecked(bool(on))
-
-    def _toggle_eq(self, on):
-        # If user toggles during enforcement, stop enforcing
-        if not self._internal_toggle and self._eq_default_enforce:
-            self._eq_default_enforce = False
-            try: self._eq_default_timer.stop()
-            except Exception: pass
-
-        if on:
-            # Arm the EQ even if no media yet; do not revert toggle on failure
-            self._eq_armed = True
-            if self._media_ready():
-                self._apply_eq_pipeline(force_zero=self.mute.isChecked() or self._gate_active)
-            else:
-                # Not ready: keep armed, will auto-apply on first track
-                self._eq_enabled = False
-                self._apply_toggle_style(True)
-        else:
-            # Disarm & stop sidecar
-            self._eq_armed = False
-            try: self.eq_ffmpeg.stop()
-            except Exception: pass
-            if not self.mute.isChecked():
-                try: self.eq_ffmpeg.unmute_qt(self.pane)
-                except Exception: pass
-            self._eq_enabled = False
-            self._apply_toggle_style(False)
-        self._update_visual_state()
-
-    # ----- UI change handlers -----
-    def _on_volume_changed(self, _):
-        a = self._audio()
-        try:
-            if a and hasattr(a,"setVolume"):
-                a.setVolume(0.0 if self.mute.isChecked() else float(self.vol.value())/100.0)
-        except Exception: pass
-        self._schedule_eq_apply()
-        self._publish_visual_state(); self._update_visual_state()
-
-    def _on_mute_toggled(self, st):
-        a = self._audio()
-        try:
-            if a and hasattr(a,"setMuted"):
-                a.setMuted(bool(st))
-        except Exception: pass
-        try:
-            if a and hasattr(a,"setVolume"):
-                a.setVolume(0.0 if st else float(self.vol.value())/100.0)
-        except Exception: pass
-        self._schedule_eq_apply()
-        if not st and not self._gate_active:
-            try: self.eq_ffmpeg.unmute_qt(self.pane)
-            except Exception: pass
-        self._publish_visual_state(); self._update_visual_state()
-
-    def _on_eq_changed(self):
-        self._schedule_eq_apply()
-        self._publish_visual_state(); self._update_visual_state()
-
-    def _schedule_eq_apply(self):
-        try:
-            self._eq_apply_timer.stop()
-            self._eq_apply_timer.start(80)
-        except Exception:
-            self._apply_eq_now()
-
-    def _apply_eq_now(self):
-        if self._eq_armed:
-            self._apply_eq_pipeline(force_zero=self.mute.isChecked() or self._gate_active)
-
-    def _reset_eq(self):
-        for s in self.eq:
-            s.blockSignals(True); s.setValue(0); s.blockSignals(False)
-        self._schedule_eq_apply()
-        self._publish_visual_state(); self._update_visual_state()
-
-    # ----- misc helpers -----
-    def _update_visual_state(self):
-        try:
-            vol = max(0.0, min(1.0, float(self.vol.value())/100.0))
-            mute = bool(self.mute.isChecked())
-            gains = [int(s.value()) for s in self.eq]
-            eq_on = bool(self._eq_armed)  # reflect desired state, not sidecar running
-            self.eq_ffmpeg.set_visual_from_ui(volume=vol, mute=mute, gains=gains, eq_on=eq_on)
-        except Exception:
-            pass
-
-    def _publish_visual_state(self):
-        try:
-            p = self.pane
-            p._fv_visual_gain = max(0.0, min(1.0, float(self.vol.value())/100.0)) if not self.mute.isChecked() else 0.0
-            p._fv_visual_mute = bool(self.mute.isChecked())
-            p._fv_eq_freqs = [f for (_label, f) in BANDS]
-            p._fv_eq_gains_db = [int(s.value()) for s in self.eq]
-        except Exception:
-            pass
-
+    # -------------------------------------------------
+    # Internal helpers for audio control
     def _audio(self):
         return _resolve_audio(self.pane)
 
-    def _sync_from_audio(self):
+    def _apply_desired_state_to_audio(self):
+        """
+        Enforce desired mute/volume on the actual audio output.
+        We only call setVolume()/setMuted() if something changed,
+        so CPU stays low and we don't spam.
+        """
         a = self._audio()
-        try:
-            if a and hasattr(a,"volume"):
-                self.vol.setValue(int(round((a.volume() or 1.0)*100)))
-        except Exception: pass
-        try:
-            if a and hasattr(a,"isMuted"):
-                self.mute.setChecked(bool(a.isMuted()))
-        except Exception: pass
+        if not a:
+            return
 
-    def _gains(self):
-        return [int(s.value()) for s in self.eq]
+        pct = int(self._desired_vol_pct)
+        if pct < 0:
+            pct = 0
+        if pct > 100:
+            pct = 100
 
-    def _filter_chain(self, force_volume_zero=False):
-        gains = self._gains()
-        eq = _ffmpeg_eq_filter(gains)
-        if force_volume_zero:
-            vol_filter = "volume=0.0"
-        else:
-            vol = 0 if self.mute.isChecked() else max(0, min(100, int(self.vol.value())))
-            if vol == 100: vol_filter = "volume=1.0"
-            elif vol == 0: vol_filter = "volume=0.0"
-            else: vol_filter = f"volume={vol/100.0:.3f}"
-        return f"{eq},{vol_filter}" if eq else vol_filter
+        muted_now = bool(self._desired_muted)
+        vol_now   = float(0 if muted_now else pct) / 100.0
+
+        if (self._last_applied_muted == muted_now and
+            self._last_applied_vol_pct == pct):
+            return
+
+        try:
+            if hasattr(a, "setMuted"):
+                a.setMuted(muted_now)
+        except Exception:
+            pass
+
+        try:
+            if hasattr(a, "setVolume"):
+                a.setVolume(vol_now)
+        except Exception:
+            pass
+
+        self._last_applied_muted = muted_now
+        self._last_applied_vol_pct = pct
+
+    def _sync_ui_from_desired(self):
+        """
+        Make sure the widgets show what we WANT.
+        We do NOT let backend resets change our UI.
+        """
+        if self.vol.value() != self._desired_vol_pct:
+            self._internal_change = True
+            try:
+                self.vol.setValue(self._desired_vol_pct)
+            finally:
+                self._internal_change = False
+
+        if self.mute.isChecked() != self._desired_muted:
+            self._internal_change = True
+            try:
+                self.mute.setChecked(self._desired_muted)
+            finally:
+                self._internal_change = False
+
+    def _tick(self):
+        """
+        Runs every 250ms:
+        1. Apply sticky mute/volume if needed.
+        2. Sync UI to desired state.
+        """
+        self._apply_desired_state_to_audio()
+        self._sync_ui_from_desired()
+
+    # -------------------------------------------------
+    # Track change hook
+    def _hook_player_signals(self):
+        """
+        Listen for player state changes so we can:
+        - instantly re-apply mute/volume on new track (prevents leaks)
+        We STILL do NOT pause/resume/seek the player.
+        """
+        p = _resolve_player(self.pane)
+        if p is None:
+            return
+
+        def _instant_enforce(*_):
+            self._apply_desired_state_to_audio()
+            self._sync_ui_from_desired()
+
+        for sig_name in (
+            "mediaStatusChanged",
+            "currentMediaChanged",
+            "sourceChanged",
+            "mediaChanged",
+            "playbackStateChanged",
+        ):
+            sig = getattr(p, sig_name, None)
+            try:
+                sig.connect(_instant_enforce)
+            except Exception:
+                pass
+
+    # -------------------------------------------------
+    # EQ state persistence
+    def _slider_values_list(self):
+        """
+        Return EQ gains as list of 12 ints (-12..+12), in band order.
+        """
+        return [int(sv.value()) for sv in self.eq]
+
+    def _apply_slider_values_list(self, values):
+        """
+        Given a list of 12 ints, set sliders to those values.
+        (No audio processing yet, just UI + persistence.)
+        """
+        if len(values) != len(self.eq):
+            return
+        self._internal_change = True
+        try:
+            for sv, gain in zip(self.eq, values):
+                try:
+                    gain_i = int(gain)
+                except Exception:
+                    gain_i = 0
+                if gain_i < -12:
+                    gain_i = -12
+                if gain_i > 12:
+                    gain_i = 12
+                sv.setValue(gain_i)
+        finally:
+            self._internal_change = False
+
+    def _save_eq_state_file(self):
+        """
+        Save the CURRENT slider gains to eq_state.json.
+        """
+        _ensure_eq_dirs()
+        data = {
+            "bands": self._slider_values_list(),
+            "labels": [lbl for (lbl, _freq) in BANDS],
+        }
+        try:
+            with open(_EQ_STATE_FILE, "w", encoding="utf-8") as f:
+                json.dump(data, f)
+        except Exception:
+            pass
+
+    def _load_eq_state(self):
+        """
+        On popup init: read eq_state.json (if exists) and apply to sliders.
+        """
+        if not os.path.exists(_EQ_STATE_FILE):
+            return
+        try:
+            with open(_EQ_STATE_FILE, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            bands = data.get("bands", None)
+            if isinstance(bands, list) and len(bands) == len(self.eq):
+                self._apply_slider_values_list(bands)
+        except Exception:
+            pass
+
+    # -------------------------------------------------
+    # Preset handling
+    def _refresh_presets(self):
+        """
+        Refresh dropdown with list of saved presets.
+        We list files in eqpresets/, strip .json.
+        """
+        _ensure_eq_dirs()
+        names = []
+        try:
+            for fname in os.listdir(_EQ_PRESET_DIR):
+                if not fname.lower().endswith(".json"):
+                    continue
+                preset_name = fname[:-5]  # drop ".json"
+                names.append(preset_name)
+        except Exception:
+            pass
+
+        names.sort(key=str.lower)
+
+        self._internal_change = True
+        try:
+            self.preset_combo.clear()
+            # First item is just placeholder text "Choose preset..."
+            self.preset_combo.addItem("Choose preset...")
+            for n in names:
+                self.preset_combo.addItem(n)
+        finally:
+            self._internal_change = False
+
+    def _on_preset_selected(self, idx):
+        """
+        User picked something in the dropdown.
+        Load that preset and apply its gains.
+        """
+        if self._internal_change:
+            return
+        if idx <= 0:
+            # index 0 is "Choose preset..."
+            return
+
+        name = self.preset_combo.currentText()
+        preset_path = os.path.join(_EQ_PRESET_DIR, f"{name}.json")
+        try:
+            with open(preset_path, "r", encoding="utf-8") as f:
+                pdata = json.load(f)
+            bands = pdata.get("bands", None)
+            if isinstance(bands, list) and len(bands) == len(self.eq):
+                self._apply_slider_values_list(bands)
+                # after loading a preset, also save as 'current state'
+                self._save_eq_state_file()
+                # and call hook to eventually update DSP
+                self._apply_eq_to_audio()
+        except Exception:
+            pass
+
+    def _on_save_preset_clicked(self):
+        """
+        Ask user for a preset name, then save current slider values to that name.
+        """
+        _ensure_eq_dirs()
+        name, ok = QInputDialog.getText(
+            self,
+            "Save EQ Preset",
+            "Preset name:"
+        )
+        if not ok or not name.strip():
+            return
+        name = name.strip()
+
+        # sanitize filename-ish
+        safe_name = "".join(ch for ch in name if ch not in r'\/:*?"<>|').strip()
+        if not safe_name:
+            return
+
+        preset_path = os.path.join(_EQ_PRESET_DIR, f"{safe_name}.json")
+        data = {
+            "bands": self._slider_values_list(),
+            "labels": [lbl for (lbl, _freq) in BANDS],
+        }
+        try:
+            with open(preset_path, "w", encoding="utf-8") as f:
+                json.dump(data, f)
+        except Exception:
+            pass
+
+        # refresh list so new preset shows up
+        self._refresh_presets()
+
+        # select it in the combo after save
+        # (find its index)
+        for i in range(self.preset_combo.count()):
+            if self.preset_combo.itemText(i) == safe_name:
+                self.preset_combo.setCurrentIndex(i)
+                break
+
+    def _on_delete_preset_clicked(self):
+        """
+        Delete currently selected preset file (except index 0).
+        """
+        idx = self.preset_combo.currentIndex()
+        if idx <= 0:
+            return
+
+        name = self.preset_combo.currentText()
+        preset_path = os.path.join(_EQ_PRESET_DIR, f"{name}.json")
+
+        # Ask for confirmation just in case
+        resp = QMessageBox.question(
+            self,
+            "Delete EQ Preset",
+            f"Delete preset '{name}'?",
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.No
+        )
+        if resp != QMessageBox.Yes:
+            return
+
+        try:
+            os.remove(preset_path)
+        except Exception:
+            pass
+
+        # reload combo
+        self._refresh_presets()
+        # move back to "Choose preset..."
+        self.preset_combo.setCurrentIndex(0)
+
+    # -------------------------------------------------
+    # User actions on the popup
+    def _on_volume_changed(self, _value):
+        """
+        User moved the volume slider.
+        Update desired volume and apply it now.
+        Does NOT auto-unmute if muted; we just remember the new level.
+        """
+        if self._internal_change:
+            return
+
+        global _DESIRED_VOL_PCT
+        pct = int(self.vol.value())
+        if pct < 0:
+            pct = 0
+        if pct > 100:
+            pct = 100
+
+        self._desired_vol_pct = pct
+        _DESIRED_VOL_PCT = pct
+
+        self._apply_desired_state_to_audio()
+        self._sync_ui_from_desired()
+
+    def _on_mute_toggled(self, state):
+        """
+        User toggled mute.
+        We store that and apply it right now
+        (and also on every future track).
+        """
+        if self._internal_change:
+            return
+
+        global _DESIRED_MUTED
+        muted = bool(state)
+
+        self._desired_muted = muted
+        _DESIRED_MUTED = muted
+
+        self._apply_desired_state_to_audio()
+        self._sync_ui_from_desired()
+
+    def _on_reset_clicked(self):
+        """
+        Reset all EQ sliders to 0 dB.
+        Save new state.
+        Apply new state to audio path (placeholder).
+        """
+        self._internal_change = True
+        try:
+            for sv in self.eq:
+                sv.setValue(0)
+        finally:
+            self._internal_change = False
+
+        self._save_eq_state_file()
+        self._apply_eq_to_audio()
+
+    def _on_eq_slider_changed(self, _v):
+        """
+        Called whenever ANY band slider moves.
+        We immediately:
+            - save current EQ state to disk
+            - call _apply_eq_to_audio() (placeholder for real DSP)
+        """
+        if self._internal_change:
+            return
+
+        self._save_eq_state_file()
+        self._apply_eq_to_audio()
+
+    # -------------------------------------------------
+    # Hook for actual DSP (not implemented yet)
+    def _apply_eq_to_audio(self):
+        """
+        This is where live EQ would actually be applied to the sound.
+
+        Right now we are NOT touching playback audio,
+        because we haven't built the shared "mixer"/"master bus" yet.
+
+        But: the code that *will* do EQ will read gains from:
+            self._slider_values_list()
+        in exactly this method.
+
+        For now it's a no-op so we don't break playback.
+        """
+        return
+
+    # -------------------------------------------------
+    # Convenience getters
+    def get_eq_gains_db(self):
+        """
+        Returns a list of 12 integers, each -12..+12 dB.
+        Order matches BANDS.
+        """
+        return self._slider_values_list()
+
+    def get_volume_scalar(self):
+        """
+        0.0..1.0 effective volume after mute.
+        """
+        if self._desired_muted:
+            return 0.0
+        return float(self._desired_vol_pct) / 100.0
+
+    def is_muted(self):
+        return bool(self._desired_muted)
 
 
 def _install_cleanup_strong(pane, btn):
-    if getattr(pane, "_fv_eq_cleanup_installed_v5_eq_armed", False):
-        return
-    setattr(pane, "_fv_eq_cleanup_installed_v5_eq_armed", True)
-
-    try:
-        from . import eq_ffmpeg
-    except Exception:
-        return
-
-    app = QApplication.instance()
-    if app is not None:
-        try:
-            app.aboutToQuit.connect(lambda: (eq_ffmpeg.stop(), (eq_ffmpeg.unmute_qt(pane) if not getattr(pane, "volume_popup_widget", None) or not pane.volume_popup_widget.mute.isChecked() else None)))
-        except Exception:
-            pass
-
-    win = btn.window()
-    if win is not None:
-        try:
-            _orig_close = getattr(win, "closeEvent", None)
-            def _wrapped(ev):
-                try:
-                    eq_ffmpeg.stop()
-                    if not getattr(pane, "volume_popup_widget", None) or not pane.volume_popup_widget.mute.isChecked():
-                        eq_ffmpeg.unmute_qt(pane)
-                except Exception:
-                    pass
-                if callable(_orig_close):
-                    return _orig_close(ev)
-            win.closeEvent = _wrapped
-        except Exception:
-            pass
-
-    try:
-        stop_btn = getattr(pane, "btn_stop", None)
-        if stop_btn is not None:
-            stop_btn.clicked.connect(lambda: (eq_ffmpeg.stop(), (eq_ffmpeg.unmute_qt(pane) if not getattr(pane, "volume_popup_widget", None) or not pane.volume_popup_widget.mute.isChecked() else None)))
-    except Exception:
-        pass
-
-    try:
-        orig_open = getattr(pane, "open")
-        if callable(orig_open) and not getattr(orig_open, "_fv_eq_wrapped_gate_v5_eq_armed", False):
-            def wrapped_open(*args, **kwargs):
-                w = getattr(pane, "volume_popup_widget", None)
-                if w and hasattr(w, "_begin_gate"):
-                    w._begin_gate()
-                try: eq_ffmpeg.stop()
-                except Exception: pass
-                res = orig_open(*args, **kwargs)
-                if w and hasattr(w, "schedule_reapply"):
-                    w.schedule_reapply(0)
-                return res
-            wrapped_open._fv_eq_wrapped_gate_v5_eq_armed = True
-            setattr(pane, "open", wrapped_open)
-    except Exception:
-        pass
-
-    try:
-        pane.destroyed.connect(lambda _=None: eq_ffmpeg.stop())
-    except Exception:
-        pass
+    """
+    Old code used to kill ffmpeg processes etc.
+    We intentionally do nothing now.
+    Stub stays so legacy calls won't crash.
+    """
+    return
 
 
 def add_new_volume_popup(pane, bar_layout):
+    """
+    Call like:
+        add_new_volume_popup(self, self.bottom_bar_layout)
+    """
+
+    # Remove any previous button if it was there
     for attr in ("btn_volume_new", "btn_volume"):
         old = getattr(pane, attr, None)
-        try:
-            if old: old.setParent(None); old.deleteLater()
-        except Exception:
-            pass
+        if old is not None:
+            try:
+                old.setParent(None)
+                old.deleteLater()
+            except Exception:
+                pass
 
-    btn = QToolButton(pane); btn.setObjectName("btn_volume_new")
-    try: btn.setAutoRaise(True)
-    except Exception: pass
-    try: btn.setFocusPolicy(Qt.NoFocus)
-    except Exception: pass
-    try: btn.setCursor(Qt.PointingHandCursor)
-    except Exception: pass
-    btn.setText("🔊"); btn.setToolTip("Volume / EQ")
-    try: btn.setFixedSize(48,48)
-    except Exception: pass
+    btn = QToolButton(pane)
+    btn.setObjectName("btn_volume_new")
 
+    try:
+        btn.setAutoRaise(True)
+    except Exception:
+        pass
+    try:
+        btn.setFocusPolicy(Qt.NoFocus)
+    except Exception:
+        pass
+    try:
+        btn.setCursor(Qt.PointingHandCursor)
+    except Exception:
+        pass
+
+    btn.setText("🔊")
+    btn.setToolTip("Volume / EQ")
+    try:
+        btn.setFixedSize(48, 48)
+    except Exception:
+        pass
+
+    # Build popup
     menu = QMenu(btn)
     w = _MenuPopupWidget(pane, parent=menu)
-    wa = QWidgetAction(menu); wa.setDefaultWidget(w)
+
+    wa = QWidgetAction(menu)
+    wa.setDefaultWidget(w)
     menu.addAction(wa)
+
     btn.setMenu(menu)
     btn.setPopupMode(QToolButton.InstantPopup)
-    btn.setStyleSheet("QToolButton#btn_volume_new{background:transparent;border:none;padding:0px;}"
-                      "QToolButton#btn_volume_new:hover{background:rgba(0,0,0,0.08);border:none;}"
-                      "QToolButton#btn_volume_new:pressed{background:rgba(0,0,0,0.16);border:none;}"
-                      "QToolButton#btn_volume_new:checked{background:rgba(0,0,0,0.12);border:none;}"
-                      "QToolButton::menu-indicator{image:none;width:0px;height:0px;}"
-                      "QMenu{background:transparent;border:0px;}")
 
-    bar_layout.addWidget(btn)
+    # Style to match your round-ish bottom bar buttons
+    btn.setStyleSheet(
+        "QToolButton#btn_volume_new{"
+        " background:transparent;"
+        " border:none;"
+        " padding:0px;"
+        " border-radius:24px;"
+        "}"
+        "QToolButton#btn_volume_new:hover{"
+        " background:rgba(255,255,255,0.08);"
+        "}"
+        "QToolButton#btn_volume_new:pressed{"
+        " background:rgba(255,255,255,0.16);"
+        "}"
+        "QToolButton#btn_volume_new:checked{"
+        " background:rgba(255,255,255,0.12);"
+        "}"
+        "QToolButton::menu-indicator{"
+        " image:none; width:0px; height:0px;"
+        "}"
+        "QMenu{"
+        " background:transparent;"
+        " border:0px;"
+        "}"
+    )
+
+    # Add to your control bar
+    try:
+        bar_layout.addWidget(btn)
+    except Exception:
+        btn.setParent(pane)
+        btn.show()
 
     _install_cleanup_strong(pane, btn)
 
@@ -606,7 +847,7 @@ def add_new_volume_popup(pane, bar_layout):
     pane.volume_popup_widget = w
 
     try:
-        w.schedule_reapply(0)
+        w.schedule_reapply(0)  # harmless no-op for legacy code
     except Exception:
         pass
 

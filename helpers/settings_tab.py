@@ -12,6 +12,16 @@ try:
 except Exception:
     apply_theme=None; config={}
 
+# TooltipManager import (with safe fallback so Settings never crashes)
+try:
+    from helpers.tooltip_manager import TooltipManager
+except Exception:
+    class TooltipManager:  # fallback no-op if file missing
+        @staticmethod
+        def set_enabled(_b: bool): pass
+        @staticmethod
+        def is_enabled() -> bool: return True
+
 import os, shutil, sys, time
 
 # ------------------------------------------------------------------------------------------
@@ -136,7 +146,7 @@ def _theme_row(page: QWidget) -> QWidget:
     ov_toggle.setToolTip("Enable a visual overlay during the startup intro image (e.g., Matrix rain).")
 
     ov_combo = QComboBox()
-    ov_combo.addItems(["Random","Matrix (Green)","Matrix (Blue)","Bokeh","Rain","FirefliesParallax","StarfieldHyperjump","CometTrails","AuroraFlow"])
+    ov_combo.addItems(["Random","Matrix (Green)","Matrix (Blue)","Bokeh","Rain","Fireworks","FirefliesParallax","Glitch Shards","LightningStrike","StarfieldHyperjump","Warp in","CometTrails","AuroraFlow"])
 
     ov_preview = QCheckBox("Preview")
     ov_preview.setToolTip("If enabled, shows the intro overlay briefly in the Settings preview.")
@@ -167,7 +177,7 @@ def _options_group(page: QWidget) -> QGroupBox:
     v = QVBoxLayout(g); v.setContentsMargins(0,0,0,0); v.setSpacing(6)
     s = QSettings("FrameVision","FrameVision")
 
-    # Force intro_follow_theme OFF since the toggle is hidden
+    # Force intro_follow_theme OFF since that toggle is hidden now
     try:
         s.setValue("intro_follow_theme", False)
     except Exception:
@@ -177,34 +187,90 @@ def _options_group(page: QWidget) -> QGroupBox:
     cb1.setVisible(False)
     cb1.setChecked(s.value("intro_enabled", True, type=bool))
     cb1.toggled.connect(lambda b: s.setValue("intro_enabled", bool(b)))
-
-    # (hidden) Intro follows theme toggle removed
-
     v.addWidget(cb1)
 
+    # -- Clear pycache checkbox ------------------------------------------------------
     cb_clear_pyc = QCheckBox(r"Clear app Python cache files in /__pycache__ at (re)start")
-    cb_clear_pyc.setChecked(s.value("clear_pyc_on_start", False, type=bool))
-    cb_clear_pyc.toggled.connect(lambda b: s.setValue("clear_pyc_on_start", bool(b)))
+    cb_clear_pyc.setToolTip(
+        "If enabled, FrameVision will try to delete compiled .pyc cache folders "
+        "on startup to avoid stale bytecode."
+    )
+    clear_default = s.value("clear_pyc_on_start", False, type=bool)
+    cb_clear_pyc.setChecked(clear_default)
 
+    # -- Tooltip visibility checkbox -------------------------------------------------
+    cb_tooltips = QCheckBox("Show hover tooltips / help bubbles")
+    cb_tooltips.setToolTip(
+        "Turn off to hide ALL mouse-hover tooltips and help popups "
+        "everywhere in FrameVision right away."
+    )
+    tooltips_default = s.value("tooltips_enabled", True, type=bool)
+    cb_tooltips.setChecked(tooltips_default)
+
+    # Sync TooltipManager immediately to saved state and make sure
+    # the eventFilter is active (lazy install will grab QApplication).
+    try:
+        TooltipManager.set_enabled(bool(tooltips_default))
+    except Exception:
+        pass
+
+    # -- Keep settings after restart checkbox ---------------------------------------
     cb_keep_settings = QCheckBox("Keep all used settings after restart")
-    cb_keep_settings.setChecked(s.value("keep_settings_after_restart", True, type=bool))
-    cb_keep_settings.toggled.connect(lambda b: s.setValue("keep_settings_after_restart", bool(b)))
+    cb_keep_settings.setToolTip(
+        "If enabled, FrameVision will remember the last values you used for tools, "
+        "models, and UI options and restore them next time."
+    )
+    keep_default = s.value("keep_settings_after_restart", True, type=bool)
+    cb_keep_settings.setChecked(keep_default)
 
+    # -- Diagnostic logging checkbox -------------------------------------------------
     cb_diag = QCheckBox("Enable diagnostic logging (restart to apply)")
-    cb_diag.setToolTip("Turn this off to disable FrameVision's background diagnostics / heartbeat logs.")
-
-    enabled_val = s.value("diag_probe_enabled", True, type=bool)
-    cb_diag.setChecked(enabled_val)
+    cb_diag.setToolTip(
+        "Turn this off to disable FrameVision's background diagnostics / heartbeat logs."
+    )
+    diag_default = s.value("diag_probe_enabled", True, type=bool)
+    cb_diag.setChecked(diag_default)
 
     # mirror value into config so headless/worker processes (no Qt) can read it
     try:
         from helpers.framevision_app import config as _cfg, save_config as _save
-        _cfg["diag_probe_enabled"] = bool(enabled_val)
+        _cfg["diag_probe_enabled"] = bool(diag_default)
         _save()
     except Exception:
         pass
 
-    def _on_diag_toggle(b):
+    # ---- shared visual helper: grey out when OFF ---------------------------------
+    def _sync_grey_state(chk: QCheckBox, is_on: bool):
+        # we tint text color when off (unchecked). when on, reset to theme default
+        if is_on:
+            chk.setStyleSheet("")
+        else:
+            chk.setStyleSheet("color: #666666;")
+
+    # initial grey states
+    _sync_grey_state(cb_clear_pyc, bool(clear_default))
+    _sync_grey_state(cb_tooltips, bool(tooltips_default))
+    _sync_grey_state(cb_keep_settings, bool(keep_default))
+    _sync_grey_state(cb_diag, bool(diag_default))
+
+    # ---- handlers + persistence ---------------------------------------------------
+    def _on_clear_pyc_toggle(b: bool):
+        s.setValue("clear_pyc_on_start", bool(b))
+        _sync_grey_state(cb_clear_pyc, bool(b))
+
+    def _on_tooltips_toggle(b: bool):
+        s.setValue("tooltips_enabled", bool(b))
+        try:
+            TooltipManager.set_enabled(bool(b))
+        except Exception:
+            pass
+        _sync_grey_state(cb_tooltips, bool(b))
+
+    def _on_keep_settings_toggle(b: bool):
+        s.setValue("keep_settings_after_restart", bool(b))
+        _sync_grey_state(cb_keep_settings, bool(b))
+
+    def _on_diag_toggle(b: bool):
         s.setValue("diag_probe_enabled", bool(b))
         try:
             from helpers.framevision_app import config as _cfg, save_config as _save
@@ -212,13 +278,25 @@ def _options_group(page: QWidget) -> QGroupBox:
             _save()
         except Exception:
             pass
+        _sync_grey_state(cb_diag, bool(b))
 
+    # connect signals
+    cb_clear_pyc.toggled.connect(lambda b: _on_clear_pyc_toggle(b))
+    cb_tooltips.toggled.connect(lambda b: _on_tooltips_toggle(b))
+    cb_keep_settings.toggled.connect(lambda b: _on_keep_settings_toggle(b))
     cb_diag.toggled.connect(lambda b: _on_diag_toggle(b))
 
+    # Add widgets to layout in the requested visual order:
+    # 1. Clear pycache
+    # 2. Tooltip visibility (NEW)
+    # 3. Keep settings after restart
+    # 4. Diagnostic logging
     v.addWidget(cb_clear_pyc)
+    v.addWidget(cb_tooltips)
     v.addWidget(cb_keep_settings)
     v.addWidget(cb_diag)
 
+    # -- Temperature units row -------------------------------------------------------
     row = QWidget(g)
     h2 = QHBoxLayout(row); h2.setContentsMargins(0,4,0,0); h2.setSpacing(8)
     h2.addWidget(QLabel("Temperature units:"))
@@ -476,7 +554,6 @@ def install_settings_tab(main_window: QWidget) -> None:
         # Minimal wiring: delegate Easter Eggs UI injection + tracker to settings_more
         try:
             from helpers import settings_more as _sm
-            # ensure tracker & inject the bottom row after build
             QtCore.QTimer.singleShot(100, _sm.ensure_usage_tracker)
             QtCore.QTimer.singleShot(200, _sm.install_social_bottom_runtime)
         except Exception:

@@ -582,7 +582,7 @@ EASTER_EGGS: List[Dict] = [
             r"helpers\\FrameRacing.py",
             r"helpers\\FrameRacers.py",
         ],
-        "unlock_seconds": 60 * 60 * 14,  # 14 hours
+        "unlock_seconds": 60 * 60 * 24,  # 14 hours
         "message": "Great, another easter egg unlocked, check Settings tab !",
     },
     # Donkey Kong Classic (36h)
@@ -596,8 +596,9 @@ EASTER_EGGS: List[Dict] = [
             r"helpers\\donkey_kong.py",
             r"helpers\\donkeykong.py",
             r"helpers\\dk_classic.py",
+            r"helpers\\kong.py",
         ],
-        "unlock_seconds": 60 * 60 * 30,  # 30 hours
+        "unlock_seconds": 60 * 60 * 36,  # 30 hours
         "message": "Great, another easter egg unlocked, check Settings tab !",
     },
 ]

@@ -1,14 +1,18 @@
 # helpers/overlay_animations.py
 from __future__ import annotations
-import random, time
-from typing import Tuple, Optional
-from PySide6.QtCore import Qt, QTimer, QRect, QSize, QPoint, QEvent
+import random, math
+from typing import Tuple, Optional, List, Dict
+from PySide6.QtCore import Qt, QTimer, QRect, QRectF, QSize, QPoint, QEvent
 from PySide6.QtGui import QColor, QPainter, QFont, QPen, QBrush, QLinearGradient
 from PySide6.QtWidgets import QWidget
 
 __all__ = [
     "MatrixRainOverlay",
     "BokehOverlay",
+    "GlitchShardsOverlay",
+    "LightningStrikeOverlay",
+    "WarpInOverlay",
+    "FireworksOverlay",
     "attach_random_intro_overlay",
     "start_overlay",
     "stop_overlay",
@@ -141,8 +145,7 @@ class MatrixRainOverlay(_BaseOverlay):
                 self._ypos[i] = -random.uniform(0, h * 0.75)
         p.end()
 
-# -------- Scanlines -----------------------------------------------------------
-
+# -------- Bokeh (soft floaty dots) --------------------------------------------
 
 class BokehOverlay(_BaseOverlay):
     def __init__(self, target: QWidget, count: int = 28, fps: int = 30, force_topmost: bool = False):
@@ -185,10 +188,7 @@ class BokehOverlay(_BaseOverlay):
             p.drawEllipse(QPoint(int(d["x"] * w), int(d["y"] * h)), int(d["r"]), int(d["r"]))
         p.end()
 
-# -------- Film Grain ----------------------------------------------------------
-
-
-# -------- Helpers -------------------------------------------------------------
+# -------- Helpers / API -------------------------------------------------------
 
 def start_overlay(name: str, target_widget: QWidget, *, force_topmost: bool = True):
     n = _norm_mode_name(name)
@@ -208,6 +208,14 @@ def start_overlay(name: str, target_widget: QWidget, *, force_topmost: bool = Tr
         o = CometTrailsOverlay(target_widget, force_topmost=force_topmost)
     elif n == "aurora":
         o = AuroraFlowOverlay(target_widget, force_topmost=force_topmost)
+    elif n == "glitch":
+        o = GlitchShardsOverlay(target_widget, force_topmost=force_topmost)
+    elif n in ("lightning","strike","storm"):
+        o = LightningStrikeOverlay(target_widget, force_topmost=force_topmost)
+    elif n in ("warp","warpin","pull"):
+        o = WarpInOverlay(target_widget, force_topmost=force_topmost)
+    elif n in ("fireworks","fw","show"):
+        o = FireworksOverlay(target_widget, force_topmost=force_topmost)
     else:
         o = MatrixRainOverlay(target_widget, style="green", force_topmost=force_topmost)
     o.start()
@@ -270,6 +278,10 @@ def _norm_mode_name(txt: str) -> str:
     if t.startswith("starfield") or t.startswith("hyperjump"): return "starfield"
     if t.startswith("comet"): return "comets"
     if t.startswith("aurora"): return "aurora"
+    if "glitch" in t: return "glitch"
+    if "lightning" in t or "storm" in t: return "lightning"
+    if "warp" in t or "pull" in t: return "warp"
+    if "firework" in t or "fireworks" in t or "fw" in t or "show" in t: return "fireworks"
     return t
 
 def apply_intro_overlay_from_settings(target_widget: QWidget, theme_name: str | None = None, *, force_topmost: bool = True):
@@ -297,13 +309,13 @@ def apply_intro_overlay_from_settings(target_widget: QWidget, theme_name: str | 
                 except Exception:
                     name = "matrix_green"
             else:
-                name = random.choice(["matrix_green","matrix_blue","bokeh","rain","fireflies","starfield","comets","aurora"])
+                name = random.choice(["matrix_green","matrix_blue","bokeh","rain","fireflies","starfield","comets","aurora","glitch","lightning","warp","fireworks"])
         return start_overlay(name, target_widget, force_topmost=force_topmost)
     except Exception:
         return None
 
 
-# -------- Rain
+# -------- Rain ----------------------------------------------------------------
 class RainOverlay(_BaseOverlay):
     """Rain hits only (no falling streaks).
     - Heavy startup burst to instantly 'wet' the glass
@@ -385,6 +397,7 @@ class RainOverlay(_BaseOverlay):
             ring = QColor(220, 235, 255, a)
             pen = QPen(ring)
             pen.setWidth(1)
+            pen.setCapStyle(Qt.RoundCap)
             p.setPen(pen)
             p.setBrush(Qt.NoBrush)
             p.drawEllipse(QPoint(int(s["x"]), int(s["y"])), int(s["r"]), int(s["r"]))
@@ -396,7 +409,8 @@ class RainOverlay(_BaseOverlay):
                 p.drawEllipse(QPoint(int(s["x"]), int(s["y"])), 2, 2)
 
         p.end()
-# -------- Fireflies Parallax
+
+# -------- Fireflies Parallax --------------------------------------------------
 class FirefliesParallaxOverlay(_BaseOverlay):
     def __init__(self, target: QWidget, count: int = 60, layers: int = 3, fps: int = 30, force_topmost: bool = False):
         super().__init__(target, fps=fps, force_topmost=force_topmost)
@@ -436,15 +450,14 @@ class FirefliesParallaxOverlay(_BaseOverlay):
         w, h = self.width(), self.height()
         for f in self._flies:
             a = 160 if f["z"] == 0 else 120 if f["z"] == 1 else 90
-            import math as _m
-            tw = 0.5 + 0.5 * (1.0 + _m.sin(f["phase"])) * f["twinkle"]
+            tw = 0.5 + 0.5 * (1.0 + math.sin(f["phase"])) * f["twinkle"]
             a = int(min(255, a * (0.7 + 0.3 * tw)))
             col = QColor(255, 255, 210, a)
             p.setBrush(QBrush(col)); p.setPen(Qt.NoPen)
             p.drawEllipse(QPoint(int(f["x"] * w), int(f["y"] * h)), f["size"], f["size"])
         p.end()
 
-# -------- Starfield Hyperjump
+# -------- Starfield Hyperjump -------------------------------------------------
 class StarfieldHyperjumpOverlay(_BaseOverlay):
     def __init__(self, target: QWidget, count: int = 100, fps: int = 30, force_topmost: bool = False):
         super().__init__(target, fps=fps, force_topmost=force_topmost)
@@ -532,7 +545,7 @@ class SmokeWispOverlay(_BaseOverlay):
             self._puffs = self._puffs[-self._max_puffs:]
 
     def _tick(self):
-        import random as _r, math as _m
+        import random as _r
         dt = self._dt
         self._time += dt
 
@@ -554,15 +567,14 @@ class SmokeWispOverlay(_BaseOverlay):
             # normalized vel with noise
             t = self._time + puf["seed"] * 0.11
             # pseudo curl-ish motion field
-            nx = _m.sin(5.1 * (puf["y"] + t * 0.13)) * 0.06 + _m.cos(3.3 * (puf["x"] - t * 0.17)) * 0.03
-            ny = _m.cos(4.7 * (puf["x"] + t * 0.09)) * 0.05 - 0.06  # upward bias
+            nx = math.sin(5.1 * (puf["y"] + t * 0.13)) * 0.06 + math.cos(3.3 * (puf["x"] - t * 0.17)) * 0.03
+            ny = math.cos(4.7 * (puf["x"] + t * 0.09)) * 0.05 - 0.06  # upward bias
             puf["x"] += (puf["vx"] + nx) * dt
             puf["y"] += (puf["vy"] + ny) * dt
             # grow slowly over life
             puf["r"] += puf["grow"] * dt * (0.4 + 0.6 * min(1.0, puf["life"] / (puf["ttl"] * 0.7)))
 
         # cull
-        w, h = self.width(), self.height()
         self._puffs[:] = [
             p for p in self._puffs
             if p["life"] < p["ttl"] and -0.2 <= p["x"] <= 1.2 and -0.2 <= p["y"] <= 1.2
@@ -593,8 +605,6 @@ class SmokeWispOverlay(_BaseOverlay):
             rx = puff["r"]
             ry = puff["r"] / max(0.1, puff["aspr"])  # slight ellipse
 
-            # layered soft falloff (fake radial gradient)
-            # 4 layers from dense core to wide halo
             core = int(a * 255)
             levels = [
                 (1.00, core),
@@ -603,8 +613,6 @@ class SmokeWispOverlay(_BaseOverlay):
                 (3.20, int(core * 0.10)),
             ]
             p.save()
-            # small rotation adds organic look
-            # (keep angles subtle to avoid cloud-like blobs)
             p.translate(cx, cy)
             p.rotate(puff["ang"])
             p.translate(-cx, -cy)
@@ -617,32 +625,16 @@ class SmokeWispOverlay(_BaseOverlay):
             p.restore()
 
         p.end()
-# -------- Comet Trails
 
-# -------- Aurora Flow
+# -------- Aurora Flow (sweep flash only, no bands) ---------------------------
 class AuroraFlowOverlay(_BaseOverlay):
-    """High-visibility aurora ribbons with a quick sweep flash in the first second."""
+    """Quick sweep flash over the logo. No heavy ribbons covering text."""
     def __init__(self, target: QWidget, bands: int = 3, fps: int = 60, speed: float = 0.6, force_topmost: bool = False):
         super().__init__(target, fps=fps, force_topmost=force_topmost)
-        import random as _r
         self._t = 0.0
         self._speed = float(speed)
-        self._bands = []
-        bands = max(1, min(6, int(bands)))
-        for i in range(bands):
-            self._bands.append({
-                "base": 0.25 + 0.25 * i / max(1, bands-1),  # normalized vertical base
-                "amp": 0.10 + 0.05 * (bands - i) / bands,   # vertical amplitude
-                "thick": 0.035 + 0.015 * (bands - i) / bands,  # thickness relative to min(w,h)
-                "ph1": _r.uniform(0.0, 6.28318),
-                "ph2": _r.uniform(0.0, 6.28318),
-                "f1": _r.uniform(0.6, 1.2),
-                "f2": _r.uniform(1.3, 2.4),
-                # color A->B per band (neon-ish)
-                "colA": (60 + 40*i, 140 + 20*i, 255),
-                "colB": (120 + 10*i, 80 + 20*i, 255),
-            })
-        # Strong opening sweep
+
+        # Strong opening sweep (single pass)
         self._sweep_age = 0.0
         self._sweep_dur = 0.9  # seconds
 
@@ -652,52 +644,12 @@ class AuroraFlowOverlay(_BaseOverlay):
         self._sweep_age += dt
         self.update()
 
-    def _y_for(self, band, u, t):
-        import math as _m
-        # Two sine layers create organic ribbon curves
-        return (band["base"]
-                + band["amp"] * _m.sin(2.0*_m.pi*(band["f1"]*u + band["ph1"] + 0.20*t))
-                + 0.6*band["amp"] * _m.sin(2.0*_m.pi*(band["f2"]*(u+0.15) + band["ph2"] - 0.34*t)))
-
-    def _lerp(self, a, b, k): return a + (b - a) * k
-
     def paintEvent(self, ev):
-        import math as _m
         p = QPainter(self)
         p.setRenderHint(QPainter.Antialiasing, True)
         w = float(self.width()); h = float(self.height())
-        s = min(w, h)
 
-        # Use screen composition for glowy layering
         p.setCompositionMode(QPainter.CompositionMode_Screen)
-
-        # Draw ribbons back-to-front
-        for idx, band in enumerate(self._bands):
-            # build a path as a thick polyline
-            steps = 48
-            pen = QPen()
-            pen.setWidthF(max(2.0, band["thick"] * s))
-            pen.setCapStyle(Qt.RoundCap)
-
-            # gradient along the ribbon
-            r,g,b = band["colA"]; r2,g2,b2 = band["colB"]
-            grad = QLinearGradient(0, 0, self.width(), 0)
-            grad.setColorAt(0.0, QColor(r, g, b, 160))
-            grad.setColorAt(1.0, QColor(r2, g2, b2, 160))
-            pen.setBrush(QBrush(grad))
-
-            p.setPen(pen)
-            lastx = None; lasty = None
-            for i in range(steps+1):
-                u = i/steps
-                y = self._y_for(band, u, self._t)
-                x = u
-                # subtle vertical squeeze toward center for readability
-                y = 0.5 + (y - 0.5) * 0.85
-                px = int(x * w); py = int(y * h)
-                if lastx is not None:
-                    p.drawLine(lastx, lasty, px, py)
-                lastx, lasty = px, py
 
         # Opening sweep flash: wide soft bar moving across once
         if self._sweep_age < self._sweep_dur:
@@ -712,7 +664,491 @@ class AuroraFlowOverlay(_BaseOverlay):
 
         p.end()
 
+# -------- Glitch Shards Overlay (UPDATED) -------------------------------------
+class GlitchShardsOverlay(_BaseOverlay):
+    """Neon glass shards that keep popping around the logo for ~5s.
 
+    - Shards spawn randomly during the first few seconds (not just frame 0)
+    - Each shard jitters for ~0.2s, then fades out over ~0.4s
+    - Each shard cycles hue so you get different bright colors
+    """
+    def __init__(self, target: QWidget, fps: int = 60, force_topmost: bool = False):
+        super().__init__(target, fps=fps, force_topmost=force_topmost)
+
+        self._dt = 1.0 / float(max(30, fps))
+        self._age_total = 0.0          # overlay age
+        self._spawn_window = 5.0       # keep spawning this long (sec)
+
+        # shard lifetime profile
+        self._jitter_dur = 0.20        # twitch time
+        self._fade_dur = 0.40          # fade time
+        self._life_ttl = self._jitter_dur + self._fade_dur
+
+        self._shards: List[Dict[str, float]] = []
+
+    def _spawn_shard(self):
+        cx = random.uniform(0.38, 0.62)
+        cy = random.uniform(0.38, 0.62)
+        w = random.uniform(40.0, 120.0)
+        h = random.uniform(8.0, 24.0)
+        ang = random.uniform(-35.0, 35.0)
+        base_alpha = random.randint(140, 210)
+        hue0 = random.uniform(0.0, 360.0)
+        hue_shift = random.uniform(-90.0, 90.0)
+
+        self._shards.append({
+            "cx": cx,
+            "cy": cy,
+            "w": w,
+            "h": h,
+            "ang": ang,
+            "a0": base_alpha,
+            "born": self._age_total,
+            "h0": hue0,
+            "dh": hue_shift,
+        })
+
+    def _tick(self):
+        self._age_total += self._dt
+
+        # spawn new shards Poisson-style for first few seconds
+        if self._age_total < self._spawn_window:
+            lam = 8.0 * self._dt  # ~8 shards/sec
+            checks = 1 + int(lam * 4)
+            p_spawn = lam / max(1, checks)
+            for _ in range(checks):
+                if random.random() < p_spawn:
+                    self._spawn_shard()
+
+        # cull old shards
+        alive = []
+        for sh in self._shards:
+            life = self._age_total - sh["born"]
+            if life < self._life_ttl:
+                alive.append(sh)
+        self._shards = alive
+
+        self.update()
+
+    def paintEvent(self, ev):
+        p = QPainter(self)
+        p.setRenderHint(QPainter.Antialiasing, True)
+        p.setCompositionMode(QPainter.CompositionMode_Screen)
+
+        w = float(self.width()); h = float(self.height())
+
+        for sh in self._shards:
+            life = self._age_total - sh["born"]
+            if life < 0.0 or life > self._life_ttl:
+                continue
+
+            # alpha over shard's lifetime
+            if life < self._jitter_dur:
+                a = sh["a0"]
+            else:
+                k = (life - self._jitter_dur) / self._fade_dur
+                if k >= 1.0:
+                    continue
+                a = int(sh["a0"] * max(0.0, 1.0 - k))
+
+            if a <= 2:
+                continue
+
+            # jitter only during the first 0.2s
+            jx = jy = 0.0
+            if life < self._jitter_dur:
+                jx = random.uniform(-2.0, 2.0)
+                jy = random.uniform(-2.0, 2.0)
+
+            cx = sh["cx"] * w + jx
+            cy = sh["cy"] * h + jy
+            rw = sh["w"]
+            rh = sh["h"]
+
+            # animated hue for rainbow tech-glitch feel
+            hue = (sh["h0"] + sh["dh"] * life) % 360.0
+
+            p.save()
+            p.translate(cx, cy)
+            p.rotate(sh["ang"])
+
+            # glow pass (broad, soft)
+            glow_col = QColor.fromHsv(int(hue) % 360, 180, 255, int(a * 0.35))
+            p.setPen(Qt.NoPen)
+            p.setBrush(QBrush(glow_col))
+            p.drawRoundedRect(QRectF(-rw/2.0, -rh/2.0, rw, rh), 4.0, 4.0)
+
+            # edge/highlight pass
+            edge_col = QColor.fromHsv(int(hue) % 360, 255, 255, a)
+            pen = QPen(edge_col)
+            pen.setWidth(2)
+            pen.setCapStyle(Qt.RoundCap)
+            p.setPen(pen)
+            p.setBrush(Qt.NoBrush)
+            p.drawRoundedRect(QRectF(-rw/2.0, -rh/2.0, rw, rh), 4.0, 4.0)
+
+            p.restore()
+
+        p.end()
+
+# -------- Lightning Strike (UPDATED: no white strobe flash) -------------------
+class LightningStrikeOverlay(_BaseOverlay):
+    """Jagged lightning bolts from the top. No fullscreen white strobe.
+
+    - Bolts spawn in first ~2 seconds
+    - Each bolt lives ~0.18s with a soft blue glow + white core
+    """
+    def __init__(self, target: QWidget, fps: int = 60, force_topmost: bool = False):
+        super().__init__(target, fps=fps, force_topmost=force_topmost)
+        self._bolts: List[Dict] = []
+        self._dt = 1.0 / float(max(30, fps))
+        self._age = 0.0
+        self._max_age = 2.0  # only spawn new bolts early
+
+    def _spawn_bolt(self):
+        x0 = random.uniform(0.3, 0.7)
+        y0 = -0.05
+        y_end = random.uniform(0.4, 0.7)
+
+        steps = 6 + random.randint(0, 3)
+        pts = []
+        x = x0
+        for i in range(steps):
+            t = i / max(1, steps - 1)
+            y = y0 + (y_end - y0) * t
+            x += random.uniform(-0.04, 0.04)
+            pts.append((x, y))
+
+        branch_pts = None
+        if steps >= 4 and random.random() < 0.7:
+            b_idx = random.randint(1, steps-2)
+            bx0, by0 = pts[b_idx]
+            branch_pts = [(bx0, by0)]
+            bsteps = 3 + random.randint(0, 2)
+            bx = bx0
+            by = by0
+            for j in range(1, bsteps):
+                t2 = j / max(1, bsteps - 1)
+                by = by0 + (y_end - by0) * t2 * random.uniform(0.2, 0.5)
+                bx = bx0 + random.uniform(-0.07, 0.07) * t2
+                branch_pts.append((bx, by))
+
+        self._bolts.append({
+            "pts": pts,
+            "branch": branch_pts,
+            "life": 0.0,
+            "ttl": 0.18,
+            "a0": 255,
+        })
+
+    def _tick(self):
+        self._age += self._dt
+
+        if self._age < self._max_age:
+            if len(self._bolts) < 2 and random.random() < 0.04:
+                self._spawn_bolt()
+
+        for b in self._bolts:
+            b["life"] += self._dt
+
+        self._bolts[:] = [b for b in self._bolts if b["life"] < b["ttl"]]
+
+        self.update()
+
+    def paintEvent(self, ev):
+        p = QPainter(self)
+        p.setRenderHint(QPainter.Antialiasing, True)
+        p.setCompositionMode(QPainter.CompositionMode_Screen)
+
+        w = float(self.width()); h = float(self.height())
+
+        for b in self._bolts:
+            k = max(0.0, 1.0 - b["life"]/b["ttl"])
+            a_core = int(b["a0"] * k)
+            if a_core <= 2:
+                continue
+
+            glow_pen = QPen(QColor(150, 200, 255, int(a_core * 0.4)))
+            glow_pen.setWidth(8)
+            glow_pen.setCapStyle(Qt.RoundCap)
+            p.setPen(glow_pen)
+            pts = b["pts"]
+            for i in range(len(pts) - 1):
+                x1, y1 = pts[i]
+                x2, y2 = pts[i+1]
+                p.drawLine(QPoint(int(x1*w), int(y1*h)), QPoint(int(x2*w), int(y2*h)))
+            if b["branch"]:
+                for i in range(len(b["branch"]) - 1):
+                    x1, y1 = b["branch"][i]
+                    x2, y2 = b["branch"][i+1]
+                    p.drawLine(QPoint(int(x1*w), int(y1*h)), QPoint(int(x2*w), int(y2*h)))
+
+            core_pen = QPen(QColor(255, 255, 255, a_core))
+            core_pen.setWidth(2)
+            core_pen.setCapStyle(Qt.RoundCap)
+            p.setPen(core_pen)
+            for i in range(len(pts) - 1):
+                x1, y1 = pts[i]
+                x2, y2 = pts[i+1]
+                p.drawLine(QPoint(int(x1*w), int(y1*h)), QPoint(int(x2*w), int(y2*h)))
+            if b["branch"]:
+                for i in range(len(b["branch"]) - 1):
+                    x1, y1 = b["branch"][i]
+                    x2, y2 = b["branch"][i+1]
+                    p.drawLine(QPoint(int(x1*w), int(y1*h)), QPoint(int(x2*w), int(y2*h)))
+
+        p.end()
+
+# -------- Micro Particle Warp-in ---------------------------------------------
+class WarpInOverlay(_BaseOverlay):
+    """Tiny bright dots rushing IN toward center, like energy converging.
+    Runs ~2 seconds, then naturally stops spawning."""
+    def __init__(self, target: QWidget, emit_rate: float = 80.0, fps: int = 60, force_topmost: bool = False):
+        super().__init__(target, fps=fps, force_topmost=force_topmost)
+        self._emit_rate = float(emit_rate)
+        self._dt = 1.0 / float(max(30, fps))
+        self._age = 0.0
+        self._max_age = 2.0
+        self._parts: List[Dict] = []
+
+        self._cx = 0.5
+        self._cy = 0.5
+
+    def _spawn_particle(self, rnd: random.Random):
+        side = rnd.choice(("left","right","top","bottom"))
+        if side == "left":
+            x = -0.1
+            y = rnd.uniform(0.0, 1.0)
+        elif side == "right":
+            x = 1.1
+            y = rnd.uniform(0.0, 1.0)
+        elif side == "top":
+            x = rnd.uniform(0.0, 1.0)
+            y = -0.1
+        else:
+            x = rnd.uniform(0.0, 1.0)
+            y = 1.1
+
+        dx = (self._cx - x)
+        dy = (self._cy - y)
+        mag = math.hypot(dx, dy) or 1.0
+        dx /= mag
+        dy /= mag
+
+        speed = rnd.uniform(1.5, 2.2)
+        vx = dx * speed
+        vy = dy * speed
+
+        ttl = rnd.uniform(0.8, 1.2)
+        self._parts.append({
+            "x": x, "y": y,
+            "vx": vx, "vy": vy,
+            "life": 0.0, "ttl": ttl,
+        })
+
+    def _tick(self):
+        self._age += self._dt
+
+        if self._age < self._max_age:
+            lam = self._emit_rate * self._dt
+            checks = 1 + int(lam * 4)
+            p = lam / max(1, checks)
+            for _ in range(checks):
+                if random.random() < p:
+                    self._spawn_particle(random)
+
+        for prt in self._parts:
+            prt["life"] += self._dt
+            prt["x"] += prt["vx"] * self._dt
+            prt["y"] += prt["vy"] * self._dt
+
+        self._parts[:] = [pr for pr in self._parts if pr["life"] < pr["ttl"]]
+
+        self.update()
+
+    def paintEvent(self, ev):
+        p = QPainter(self)
+        p.setRenderHint(QPainter.Antialiasing, True)
+        p.setCompositionMode(QPainter.CompositionMode_Screen)
+
+        w = float(self.width()); h = float(self.height())
+
+        for pr in self._parts:
+            dist = math.hypot(pr["x"]-self._cx, pr["y"]-self._cy)
+            dist_k = max(0.0, min(1.0, 1.0 - dist/0.7))
+            life_k = max(0.0, min(1.0, 1.0 - pr["life"]/pr["ttl"]))
+            a_core = int(255 * dist_k * life_k)
+            if a_core <= 2:
+                continue
+
+            x = pr["x"] * w
+            y = pr["y"] * h
+            tx = x - pr["vx"] * 0.05 * w
+            ty = y - pr["vy"] * 0.05 * h
+
+            glow_pen = QPen(QColor(100, 220, 255, int(a_core * 0.4)))
+            glow_pen.setWidth(4)
+            glow_pen.setCapStyle(Qt.RoundCap)
+            p.setPen(glow_pen)
+            p.drawLine(QPoint(int(tx), int(ty)), QPoint(int(x), int(y)))
+
+            core_pen = QPen(QColor(255, 255, 255, a_core))
+            core_pen.setWidth(2)
+            core_pen.setCapStyle(Qt.RoundCap)
+            p.setPen(core_pen)
+            p.drawLine(QPoint(int(tx), int(ty)), QPoint(int(x), int(y)))
+
+            p.setPen(Qt.NoPen)
+            p.setBrush(QBrush(QColor(255, 255, 255, a_core)))
+            p.drawEllipse(QPoint(int(x), int(y)), 2, 2)
+
+        p.end()
+
+# -------- Fireworks -----------------------------------------------------------
+class FireworksOverlay(_BaseOverlay):
+    """Color fireworks.
+    - shells rise from bottom
+    - explode at ~2.0, ~2.5, ~3.0 seconds
+    - bursts spray colored sparks with gravity
+    """
+    def __init__(self, target: QWidget, fps: int = 60, force_topmost: bool = False):
+        super().__init__(target, fps=fps, force_topmost=force_topmost)
+        self._dt = 1.0 / float(max(30, fps))
+        self._t = 0.0
+
+        self._palette = [
+            (255, 80, 80),
+            (80, 160, 255),
+            (120, 255, 120),
+            (255, 120, 255),
+            (255, 255, 120),
+            (120, 255, 255),
+            (255, 160, 80),
+        ]
+
+        explode_times = [2.0, 2.5, 3.0]
+        self._shells: List[Dict] = []
+        for et in explode_times:
+            x0 = random.uniform(0.2, 0.8)
+            y0 = 1.05
+            xt = x0 + random.uniform(-0.05, 0.05)
+            yt = random.uniform(0.2, 0.4)
+            col = random.choice(self._palette)
+            self._shells.append({
+                "x0": x0, "y0": y0,
+                "xt": xt, "yt": yt,
+                "explode_t": et,
+                "color": col,
+                "alive": True,
+                "cur_x": x0,
+                "cur_y": y0,
+            })
+
+        self._particles: List[Dict] = []
+
+    def _explode_shell(self, sh):
+        bx = sh["xt"]
+        by = sh["yt"]
+        for _ in range(40):
+            ang = random.uniform(0.0, 2.0*math.pi)
+            spd = random.uniform(0.25, 0.6)
+            vx = math.cos(ang) * spd
+            vy = math.sin(ang) * spd
+            ttl = random.uniform(0.8, 1.3)
+            base_col = random.choice(self._palette)
+            self._particles.append({
+                "x": bx, "y": by,
+                "vx": vx, "vy": vy,
+                "life": 0.0, "ttl": ttl,
+                "rgb": base_col,
+                "a0": random.randint(180, 255),
+            })
+
+    def _tick(self):
+        self._t += self._dt
+
+        for sh in self._shells:
+            if sh["alive"]:
+                if self._t >= sh["explode_t"]:
+                    sh["alive"] = False
+                    self._explode_shell(sh)
+                else:
+                    k = min(max(self._t / sh["explode_t"], 0.0), 1.0)
+                    sh["cur_x"] = sh["x0"] + (sh["xt"] - sh["x0"]) * k
+                    sh["cur_y"] = sh["y0"] + (sh["yt"] - sh["y0"]) * k
+
+        for pr in self._particles:
+            pr["life"] += self._dt
+            pr["x"] += pr["vx"] * self._dt
+            pr["y"] += pr["vy"] * self._dt
+            pr["vy"] += 0.6 * self._dt
+
+        self._particles[:] = [p for p in self._particles if p["life"] < p["ttl"]]
+
+        self.update()
+
+    def paintEvent(self, ev):
+        p = QPainter(self)
+        p.setRenderHint(QPainter.Antialiasing, True)
+        p.setCompositionMode(QPainter.CompositionMode_Screen)
+
+        w = float(self.width()); h = float(self.height())
+
+        for sh in self._shells:
+            if sh["alive"]:
+                x = sh["cur_x"] * w
+                y = sh["cur_y"] * h
+                tail_y = y + 0.06 * h
+
+                r, g, b = sh["color"]
+                glow_pen = QPen(QColor(r, g, b, 160))
+                glow_pen.setWidth(4)
+                glow_pen.setCapStyle(Qt.RoundCap)
+                p.setPen(glow_pen)
+                p.drawLine(QPoint(int(x), int(y)), QPoint(int(x), int(tail_y)))
+
+                core_pen = QPen(QColor(255, 255, 255, 230))
+                core_pen.setWidth(2)
+                core_pen.setCapStyle(Qt.RoundCap)
+                p.setPen(core_pen)
+                p.drawLine(QPoint(int(x), int(y)), QPoint(int(x), int(tail_y)))
+
+                p.setPen(Qt.NoPen)
+                p.setBrush(QBrush(QColor(255, 255, 255, 230)))
+                p.drawEllipse(QPoint(int(x), int(y)), 2, 2)
+
+        for pr in self._particles:
+            k = max(0.0, 1.0 - pr["life"]/pr["ttl"])
+            a_core = int(pr["a0"] * k)
+            if a_core <= 2:
+                continue
+
+            x = pr["x"] * w
+            y = pr["y"] * h
+            tx = x - pr["vx"] * 0.03 * w
+            ty = y - pr["vy"] * 0.03 * h
+
+            r, g, b = pr["rgb"]
+
+            glow_pen = QPen(QColor(r, g, b, int(a_core * 0.4)))
+            glow_pen.setWidth(4)
+            glow_pen.setCapStyle(Qt.RoundCap)
+            p.setPen(glow_pen)
+            p.drawLine(QPoint(int(tx), int(ty)), QPoint(int(x), int(y)))
+
+            core_pen = QPen(QColor(r, g, b, a_core))
+            core_pen.setWidth(2)
+            core_pen.setCapStyle(Qt.RoundCap)
+            p.setPen(core_pen)
+            p.drawLine(QPoint(int(tx), int(ty)), QPoint(int(x), int(y)))
+
+            p.setPen(Qt.NoPen)
+            p.setBrush(QBrush(QColor(r, g, b, a_core)))
+            p.drawEllipse(QPoint(int(x), int(y)), 2, 2)
+
+        p.end()
+
+# -------- Comet Trails --------------------------------------------------------
 class CometTrailsOverlay(_BaseOverlay):
     def __init__(self, target: QWidget, count: int = 4, fps: int = 30, force_topmost: bool = False):
         super().__init__(target, fps=fps, force_topmost=force_topmost)
