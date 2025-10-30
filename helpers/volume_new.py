@@ -1,13 +1,13 @@
 from PySide6.QtCore import Qt, QTimer
 from PySide6.QtWidgets import (
-    QWidget, QVBoxLayout, QHBoxLayout, QLabel, QSlider, QPushButton,
-    QFrame, QToolButton, QCheckBox, QGridLayout, QMenu, QWidgetAction
+    QWidget, QVBoxLayout, QHBoxLayout, QLabel, QSlider,
+    QFrame, QToolButton, QCheckBox, QMenu, QWidgetAction, QPushButton
 )
 
 """
-volume_new.py (safe drop-in with persistent mute/volume, fast re-mute on track change)
+volume_new.py (mute + volume only)
 
-Public surface is the SAME as your old file:
+Public surface remains compatible:
     - add_new_volume_popup(pane, bar_layout)
     - class _MenuPopupWidget
     - pane.btn_volume_new
@@ -15,38 +15,13 @@ Public surface is the SAME as your old file:
     - pane.volume_popup_widget
 
 Behavior guarantees:
-    - We DO NOT pause playback
-    - We DO NOT resume playback
-    - We DO NOT seek / jump / scrub
-    - We DO NOT wrap pane.open()
-    - We DO NOT run gating logic / ffmpeg sidecar / volume guards
+    - We DO NOT pause/resume/seek or alter transport timing.
+    - We ONLY control audio mute/volume and persist desired state across tracks.
 
-We ONLY:
-    - Give you a popup with Volume, Mute, EQ sliders (placeholder EQ)
-    - Apply volume/mute on the audio output object
-    - Remember desired mute/volume and re-apply them across tracks
-
-What's new vs previous version:
-    - We keep global desired mute/volume and enforce them more aggressively.
-    - Poll loop is now ~75ms instead of 500ms so you don't get ~0.5s of "leak."
-    - We also hook player signals (mediaChanged etc.) so when a new track starts,
-      we instantly re-mute if the user wanted mute.
-
-EQ sliders:
-    - Still visual only for now. They don't affect audio yet.
-    - You can read them from:
-        pane.volume_popup_widget.get_eq_gains_db()
+Removed:
+    - Equalizer UI and reset button
+    - Presets and EQ-related methods/signals
 """
-
-# 5-band EQ like the old visible layout you showed.
-# We can expand to 12 bands later, easy.
-BANDS = [
-    ("60 Hz",   60),
-    ("230 Hz",  230),
-    ("910 Hz",  910),
-    ("3.6 kHz", 3600),
-    ("14 kHz",  14000),
-]
 
 # Global desired state so it survives track changes / new popup instances
 _DESIRED_VOL_PCT = 100   # 0-100
@@ -57,7 +32,6 @@ def _resolve_audio(pane):
     """
     Find the audio output object we are allowed to control.
     We ONLY ever call setVolume()/setMuted() on this.
-    We NEVER touch transport timing.
     """
     for name in ("audio", "audio_output", "audioOutput", "player_audio", "audio_out"):
         if hasattr(pane, name):
@@ -93,19 +67,58 @@ def _resolve_player(pane):
 
 
 class _MenuPopupWidget(QWidget):
+    # --- aggressively remove any leftover small 5-band EQ UIs ---
+    def _purge_unwanted_children(self):
+        # Remove any vertical sliders, 'Reset EQ' buttons, and Hz labels added by legacy code.
+        keep = {self, self.vol, self.mute}
+        try:
+            root_frame = self.findChild(QFrame, "fv_menu_volume_frame")
+            if root_frame:
+                keep.add(root_frame)
+        except Exception:
+            pass
+
+        for w in list(self.findChildren(QWidget)):
+            if w in keep:
+                continue
+
+            objn = getattr(w, "objectName", lambda: "")() or ""
+            text = ""
+            try:
+                text = w.text() if hasattr(w, "text") else ""
+            except Exception:
+                text = ""
+
+            try:
+                if isinstance(w, QSlider) and w.orientation() == Qt.Vertical:
+                    w.setParent(None); w.deleteLater(); continue
+            except Exception:
+                pass
+
+            # Remove labels like "60 Hz", "3.6 kHz", etc.
+            if isinstance(w, QLabel):
+                t = (text or "").strip().lower()
+                if "hz" in t or "kHz" in t or t.endswith("hz") or "eq" in objn.lower():
+                    w.setParent(None); w.deleteLater(); continue
+
+            if isinstance(w, QPushButton):
+                if "eq" in (text or "").lower():
+                    w.setParent(None); w.deleteLater(); continue
+
+            if "eq" in objn.lower() or "equaliz" in objn.lower():
+                try:
+                    w.setParent(None); w.deleteLater(); continue
+                except Exception:
+                    pass
+
+    
     """
     Popup widget that lives inside the menu.
 
     Compatibility:
         - self.vol  (QSlider, horizontal)
         - self.mute (QCheckBox)
-        - self.eq   (list of band sliders)
-        - schedule_reapply()  (now harmless no-op)
-
-    Safe behavior only:
-        - NO pause/resume/seek logic
-        - NO 150ms push
-        - NO ffmpeg sidecar ownership
+        - schedule_reapply()  (harmless no-op)
     """
 
     def __init__(self, pane, parent=None):
@@ -140,51 +153,18 @@ class _MenuPopupWidget(QWidget):
         vol_label.setObjectName("fv_vol_label")
 
         self.vol = QSlider(Qt.Horizontal)
+        self.vol.setObjectName("fv_vol_slider")
         self.vol.setRange(0, 100)
         self.vol.setValue(self._desired_vol_pct)
 
         self.mute = QCheckBox("Mute")
+        self.mute.setObjectName("fv_mute_checkbox")
         self.mute.setChecked(self._desired_muted)
 
         top.addWidget(vol_label)
         top.addWidget(self.vol, 1)
         top.addWidget(self.mute)
         outer.addLayout(top)
-
-        # EQ grid (UI only for now)
-        grid = QGridLayout()
-        grid.setHorizontalSpacing(16)
-        grid.setVerticalSpacing(6)
-        self.eq = []
-
-        for i, (label_text, freq) in enumerate(BANDS):
-            sv = QSlider(Qt.Vertical)
-            sv.setRange(-12, 12)
-            sv.setValue(0)
-            sv.setToolTip(f"{freq} Hz")
-            self.eq.append(sv)
-
-            grid.addWidget(
-                sv,
-                0, i,
-                alignment=Qt.AlignHCenter | Qt.AlignBottom,
-            )
-
-            lab = QLabel(label_text)
-            lab.setObjectName("fv_freq_label")
-            lab.setAlignment(Qt.AlignHCenter)
-            grid.addWidget(lab, 1, i, alignment=Qt.AlignHCenter)
-
-        outer.addLayout(grid)
-
-        # Bottom row: Reset EQ button
-        bottom = QHBoxLayout()
-        bottom.addStretch(1)
-        self.reset = QPushButton("Reset EQ")
-        self.reset.setObjectName("fv_eq_reset")
-        bottom.addWidget(self.reset)
-        bottom.addStretch(1)
-        outer.addLayout(bottom)
 
         # Styling close to your old vibe
         self.setStyleSheet(
@@ -197,45 +177,30 @@ class _MenuPopupWidget(QWidget):
             " color: palette(window-text);"
             " background: transparent;"
             "}"
-            "QLabel#fv_freq_label{"
-            " font-weight:600; font-size:13px;"
-            "}"
             "QLabel#fv_vol_label{"
             " font-weight:700; font-size:13px;"
             "}"
-            "QPushButton{"
-            " background: palette(button);"
-            " color: palette(window-text);"
-            " border: 1px solid palette(mid);"
-            " border-radius: 8px;"
-            " padding: 6px 12px;"
-            "}"
-            "QPushButton:hover{background: palette(light);}"
-            "QPushButton:pressed{background: palette(dark);}"
         )
-        self.setMinimumWidth(420)
+        self.setMinimumWidth(260)
 
         # ---- SIGNALS ----
         self.vol.valueChanged.connect(self._on_volume_changed)
         self.mute.toggled.connect(self._on_mute_toggled)
-        self.reset.clicked.connect(self._on_reset_clicked)
-        for sv in self.eq:
-            sv.valueChanged.connect(self._on_eq_slider_changed)
 
         # Poll loop:
         #   runs fast (~75ms), constantly forcing the audio output to match
         #   "what the user wants" (desired mute/volume).
-        #   This makes mute stick immediately on new tracks.
         self._poll = QTimer(self)
         self._poll.setSingleShot(False)
         self._poll.timeout.connect(self._sync_loop)
-        self._poll.start(75)  # was 500ms before → caused ~0.5s leak
+        self._poll.start(75)
 
         # Hook into player events so we re-apply desired mute/vol
         # instantly when track/media changes (no audible blip).
         self._hook_player_signals()
 
         # Do one immediate sync/apply right now
+        self._purge_unwanted_children()
         self._sync_loop()
 
     # --------------------------------------------------
@@ -299,15 +264,20 @@ class _MenuPopupWidget(QWidget):
             finally:
                 self._internal_change = False
 
+    def showEvent(self, ev):
+        try:
+            self._purge_unwanted_children()
+        except Exception:
+            pass
+        super().showEvent(ev)
+
     def _sync_loop(self):
         """
         Runs every ~75ms:
         1. Apply desired mute/volume to the audio output.
         2. Reflect those desired values back into the UI.
-        This fixes:
-           - mute only lasting one track
-           - "brief leak" of next track before mute hits
         """
+        self._purge_unwanted_children()
         self._apply_desired_state_to_audio()
         self._sync_ui_from_desired()
 
@@ -315,16 +285,12 @@ class _MenuPopupWidget(QWidget):
         """
         Connect to player events (if they exist) so we immediately enforce
         mute/volume the moment a new file loads or playback state changes.
-
-        We STILL do not pause/resume/seek. We only re-apply volume/mute.
         """
         p = _resolve_player(self.pane)
         if p is None:
             return
 
         def _reapply_from_player_event(*_):
-            # When the source changes or playback restarts,
-            # slam desired mute/volume immediately.
             self._apply_desired_state_to_audio()
             self._sync_ui_from_desired()
 
@@ -361,6 +327,7 @@ class _MenuPopupWidget(QWidget):
 
         # Do not unmute automatically here.
         # If muted, keep muted. We just remember the new slider value.
+        self._purge_unwanted_children()
         self._apply_desired_state_to_audio()
         self._sync_ui_from_desired()
 
@@ -378,30 +345,11 @@ class _MenuPopupWidget(QWidget):
         self._desired_muted = muted
         _DESIRED_MUTED = muted
 
+        self._purge_unwanted_children()
         self._apply_desired_state_to_audio()
         self._sync_ui_from_desired()
 
-    def _on_reset_clicked(self):
-        """
-        Reset all EQ sliders to 0 dB. Still UI-only.
-        """
-        self._internal_change = True
-        try:
-            for sv in self.eq:
-                sv.setValue(0)
-        finally:
-            self._internal_change = False
-
-    def _on_eq_slider_changed(self, _v):
-        """
-        EQ is still visual only. No audio processing here yet.
-        """
-        return
-
     # convenience getters (unchanged)
-    def get_eq_gains_db(self):
-        return [int(sv.value()) for sv in self.eq]
-
     def get_volume_scalar(self):
         if self._desired_muted:
             return 0.0
@@ -454,7 +402,7 @@ def add_new_volume_popup(pane, bar_layout):
     except Exception: pass
 
     btn.setText("🔊")
-    btn.setToolTip("Volume / EQ")
+    btn.setToolTip("Volume")
     try:
         btn.setFixedSize(48, 48)
     except Exception:
