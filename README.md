@@ -343,44 +343,6 @@ Planned features for future updates:
 
 ---
 
-## 🖼 Screenshots 
-
-<p align="center">
-  <img src="https://github.com/user-attachments/assets/56a1c424-b723-4f12-9837-e3c21507005e"
-       alt="FrameVision Screenshots (animated preview)"
-       width="800">
-</p>
-
----
----
-
-## 🔄 How to Update FrameVision
-
-Keeping FrameVision up to date is **super easy** — 
-Inside the app go to the file menu that says 'info', in there you find update with 4 option :
-Stable : updates to the latest release, option for full update or puthon files only
-Beta : updates to the most recent files on the github page, these files can change every day and bring test features but also bugs and unfinished work. Also has option for full update or python file only
----
-
-
-### 🟢 `update_all.bat`
-**Safe & Non-Destructive**  
-If you can't get in the app anymore there is also an update_all.bat file, delete folder \helpers\ and if needed also the .venv directory before running this.
-**Best for:**  
-- app don't start and option 2 from installer (quick fixer) didn't work either, this sets you back to official release.
-
----
-
-### 🔴 Hard Update — `RESET_ALL.bat`
-**Strict Sync (Advanced)**  
-- ✅ Adds **new files**  
-- ✅ Updates **changed files**  
-- ⚠️ **Restores deleted files**  
-- ⚠️ **Removes all local files** 
-**Best for:**  
-- Resetting to a **clean, exact copy** of the latest GitHub version.  
-
----
 
 ## 🤝 Contributing
 Pull requests and feature suggestions are welcome!  
