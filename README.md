@@ -335,15 +335,8 @@ start.bat
 Planned features for future updates:
 - **Built-in Compare Panel (A/B):**, not the html version that i use now. Side-by-side, swipe, zoom/pan, and much 
     more.
-- Global & per tab save settings after (re)start.
-- **Installer upgrades:** Unified progress bars and resume support. app might get it's own windows installer one 
-  day
-- **Better integration with queue for the TXT2IMG models:** 
-  At the moment it is not using the queue until i have more time for this
-- zip with over **100 intros**
 - Global action buttons (a button action changes depending on the tab you are
 - Multi job where user can select more then one tool and do them all at once (for example upscale->rife->add sound...)
-- polishing and bugfixing for the rest of my life i think
 - a low weight txt/img to video would be nice but let's get the rest working 100% first
   (many failed attempts so far)
 - **Easter eggs** for extra fun surprises! Don't forget to click the intro 4x before it ends ;-)
