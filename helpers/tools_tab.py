@@ -10,6 +10,7 @@ from helpers.audiotool import install_audio_tool
 from helpers.prompt import install_prompt_tool
 from helpers.renam import RenamPane
 from helpers.batch import BatchSelectDialog
+from helpers.frames import install_frames_tool
 
 import re
 
@@ -283,78 +284,12 @@ class InstantToolsPane(QWidget):
 
         # Sections
         sec_speed = CollapsibleSection("Slow motion - Speedup Video", expanded=False)
-        sec_resize = CollapsibleSection("Resize Images & Video", expanded=False)
+        sec_resize = CollapsibleSection("Resize/convert - Images/Video", expanded=False)
         sec_gif = CollapsibleSection("Animated Frames Lab", expanded=False)
         sec_extract = CollapsibleSection("Extract frames", expanded=False)
         sec_trim = CollapsibleSection("Trim Lab", expanded=False)
-        sec_crop = CollapsibleSection("Cropping Tool", expanded=False)
+        sec_crop = CollapsibleSection("Cropping", expanded=False)
 
-        sec_quality = CollapsibleSection("Quality / Size Video", expanded=False)
-
-        # --- Quality/Size controls ---
-        self.q_mode = QComboBox(); self.q_mode.addItems(["CRF (quality)", "Bitrate (kbps)"])
-        self.q_preset = QComboBox(); self.q_preset.addItems(["ultrafast","superfast","veryfast","faster","fast","medium","slow","slower","veryslow"])
-        self.q_codec = QComboBox(); self.q_codec.addItems([
-            "H.264 (x264)", "H.265 (x265)", "AV1 (SVT-AV1)",
-            "H.264 (NVENC)", "HEVC (NVENC)", "AV1 (NVENC)",
-        ])
-        self.q_crf = QSpinBox(); self.q_crf.setRange(0, 51); self.q_crf.setValue(23)
-        self.q_bitrate = QSpinBox(); self.q_bitrate.setRange(100, 50000); self.q_bitrate.setSingleStep(100); self.q_bitrate.setValue(3500)
-        self.q_audio = QComboBox(); self.q_audio.addItems(["copy", "aac 128k", "aac 192k", "opus 96k", "opus 128k"])
-        self.q_format = QComboBox(); self.q_format.addItems(["mp4","mkv","mov"])
-        self.btn_quality = QPushButton("Change quality"); self.btn_quality_batch = QPushButton("Batch…")
-        self.btn_quality.setToolTip("Re-encode/transcode with selected codec and quality mode.")
-
-        lay_q = QFormLayout()
-        lay_q.addRow("Quality mode", self.q_mode)
-        lay_q.addRow("Video codec", self.q_codec)
-                # sliders paired with spinboxes
-        self.q_crf_slider = QSlider(Qt.Horizontal); self.q_crf_slider.setRange(0,51); self.q_crf_slider.setValue(self.q_crf.value())
-        self.q_bitrate_slider = QSlider(Qt.Horizontal); self.q_bitrate_slider.setRange(100,50000); self.q_bitrate_slider.setSingleStep(100); self.q_bitrate_slider.setValue(self.q_bitrate.value())
-        # link slider<->spin
-        self.q_crf_slider.valueChanged.connect(self.q_crf.setValue); self.q_crf.valueChanged.connect(self.q_crf_slider.setValue)
-        self.q_bitrate_slider.valueChanged.connect(self.q_bitrate.setValue); self.q_bitrate.valueChanged.connect(self.q_bitrate_slider.setValue)
-        _w_crf = QWidget(); _h1 = QHBoxLayout(_w_crf); _h1.setContentsMargins(0,0,0,0); _h1.addWidget(self.q_crf_slider); _h1.addWidget(self.q_crf)
-        _w_br = QWidget(); _h2 = QHBoxLayout(_w_br); _h2.setContentsMargins(0,0,0,0); _h2.addWidget(self.q_bitrate_slider); _h2.addWidget(self.q_bitrate)
-        lay_q.addRow("CRF (0-51)", _w_crf)
-        lay_q.addRow("Bitrate (kbps)", _w_br)
-        lay_q.addRow("Encoder preset", self.q_preset)
-        lay_q.addRow("Audio", self.q_audio)
-        lay_q.addRow("Format", self.q_format)
-        row_q = QHBoxLayout(); row_q.addWidget(self.btn_quality); row_q.addWidget(self.btn_quality_batch); lay_q.addRow(row_q)
-        sec_quality.setContentLayout(lay_q)
-
-        # ---- Image Quality / Convert ----
-        sec_img = CollapsibleSection("Image Quality / Convert", expanded=False)
-
-        self.img_format = QComboBox(); self.img_format.addItems(["jpg","webp","png"])
-        self.img_quality = QSpinBox(); self.img_quality.setRange(1,100); self.img_quality.setValue(85)
-        self.img_w = QSpinBox(); self.img_w.setRange(0,16384); self.img_w.setValue(0)
-        self.img_h = QSpinBox(); self.img_h.setRange(0,16384); self.img_h.setValue(0)
-        self.img_keep_meta = QCheckBox("Keep metadata (EXIF)"); self.img_keep_meta.setChecked(False)
-
-        # Sliders paired with quality and width/height
-        self.img_q_slider = QSlider(Qt.Horizontal); self.img_q_slider.setRange(1,100); self.img_q_slider.setValue(self.img_quality.value())
-        self.img_q_slider.valueChanged.connect(self.img_quality.setValue); self.img_quality.valueChanged.connect(self.img_q_slider.setValue)
-
-        self.btn_img_convert = QPushButton("Convert image"); self.btn_img_batch = QPushButton("Batch…")
-
-        
-        # Mode: Quality or Target size
-        self.img_mode = QComboBox(); self.img_mode.addItems(["Quality (%)","Target size"])
-        self.img_target = QSpinBox(); self.img_target.setRange(10, 500000); self.img_target.setValue(400)  # KB
-        self.img_target_unit = QComboBox(); self.img_target_unit.addItems(["KB","MB"])
-        lay_i = QFormLayout()
-        lay_i.addRow("Mode", self.img_mode)
-        _it = QWidget(); _hti = QHBoxLayout(_it); _hti.setContentsMargins(0,0,0,0); _hti.addWidget(self.img_target); _hti.addWidget(self.img_target_unit); lay_i.addRow("Target size", _it)
-        _iq = QWidget(); _hqi = QHBoxLayout(_iq); _hqi.setContentsMargins(0,0,0,0); _hqi.addWidget(self.img_q_slider); _hqi.addWidget(self.img_quality)
-        lay_i.addRow("Output format", self.img_format)
-        lay_i.addRow("Quality (1-100)", _iq)
-        lay_i.addRow("Max width (0 = keep)", self.img_w)
-        lay_i.addRow("Max height (0 = keep)", self.img_h)
-        lay_i.addRow(self.img_keep_meta)
-        row_i = QHBoxLayout(); row_i.addWidget(self.btn_img_convert); row_i.addWidget(self.btn_img_batch); lay_i.addRow(row_i)
-        sec_img.setContentLayout(lay_i)
         # ---- Meme / Caption ----
         sec_meme = CollapsibleSection("Thumbnail / Meme Creator", expanded=True)
         _meme_wrap = QWidget(); _memel = QVBoxLayout(_meme_wrap); _memel.setContentsMargins(0,0,0,0)
@@ -377,7 +312,7 @@ class InstantToolsPane(QWidget):
             except Exception:
                 pass
 # ---- Multi Rename (moved to helpers/renam.py) ----
-        sec_rename = CollapsibleSection("Multi Rename", expanded=False)
+        sec_rename = CollapsibleSection("Multi Rename/Replace", expanded=False)
         _rn_wrap = QWidget(); _rn_layout = QVBoxLayout(_rn_wrap); _rn_layout.setContentsMargins(0,0,0,0)
         try:
             _rn_widget = RenamPane(self.main, self)
@@ -386,30 +321,6 @@ class InstantToolsPane(QWidget):
         _rn_layout.addWidget(_rn_widget)
         sec_rename.setContentLayout(_rn_layout)
 
-
-        def _img_mode_update():
-            tgt = (self.img_mode.currentIndex()==1)
-            qual_ok = (self.img_format.currentText().lower() != "png")
-            self.img_q_slider.setEnabled(not tgt)
-            self.img_quality.setEnabled(not tgt)
-            self.img_target.setEnabled(tgt and qual_ok)
-            self.img_target_unit.setEnabled(tgt and qual_ok)
-        self.img_mode.currentIndexChanged.connect(lambda _=0: _img_mode_update())
-        self.img_format.currentIndexChanged.connect(lambda _=0: _img_mode_update())
-        _img_mode_update()
-
-        self._probe_codecs_and_disable_unavailable()
-
-        # Toggle CRF/Bitrate widgets visibility based on mode
-        def _upd_q_mode(idx):
-            use_crf = idx == 0
-            self.q_crf.setEnabled(use_crf); self.q_bitrate.setEnabled(not use_crf)
-            try:
-                self.q_crf_slider.setEnabled(use_crf); self.q_bitrate_slider.setEnabled(not use_crf)
-            except Exception:
-                pass
-        _upd_q_mode(self.q_mode.currentIndex())
-        self.q_mode.currentIndexChanged.connect(_upd_q_mode)
 
         # Speed
         self.speed = QSlider(Qt.Horizontal); self.speed.setRange(25, 250); self.speed.setValue(150)
@@ -502,15 +413,14 @@ class InstantToolsPane(QWidget):
         lay_gif.addRow(row)
         btn_sg.clicked.connect(lambda: self._save_preset_gif())
         btn_lg.clicked.connect(lambda: self._load_preset_gif())
+        # Extract (moved to helpers/frames.py)
+        try:
+            install_frames_tool(self, sec_extract)
+        except Exception:
+            pass
 
-        # Extract
-        self.btn_last = QPushButton("Extract Last Frame"); self.btn_all = QPushButton("Extract All Frames"); self.btn_all.setToolTip("Export every frame to images. Large output!")
-        lay_ext = QVBoxLayout(); lay_ext.addWidget(self.btn_last); lay_ext.addWidget(self.btn_all)
-        sec_extract.setContentLayout(lay_ext)
-        row = QHBoxLayout(); btn_se = QPushButton("Save preset"); btn_le = QPushButton("Load preset"); row.addWidget(btn_se); row.addWidget(btn_le)
-        lay_ext.addLayout(row)
-        btn_se.clicked.connect(lambda: self._save_preset_extract())
-        btn_le.clicked.connect(lambda: self._load_preset_extract())
+
+
 
         # Trim (moved to helpers/trim_tool.py)
         install_trim_tool(self, sec_trim)
@@ -523,7 +433,7 @@ class InstantToolsPane(QWidget):
         except Exception:
             pass
 
-        for sec in (sec_meme, sec_prompt, sec_audio, sec_speed, sec_resize, sec_gif, sec_extract, sec_trim, sec_crop, sec_quality, sec_img, sec_rename):
+        for sec in (sec_meme, sec_prompt, sec_audio, sec_speed, sec_resize, sec_gif, sec_extract, sec_trim, sec_crop, sec_rename):
             root.addWidget(sec)
         root.addStretch(1)
         # --- Remember settings (per-tool + global) ---
@@ -535,9 +445,9 @@ class InstantToolsPane(QWidget):
                 "Animated Frames Lab": sec_gif,
                 "Extract frames": sec_extract,
                 "Trim Lab": sec_trim,
-                "Cropping Tool": sec_crop,
-                "Quality / Size Video": sec_quality,
-                "Image Quality / Convert": sec_img,
+                "Cropping": sec_crop,
+
+
                 "Thumbnail / Meme Creator": sec_meme,
                 "Prompt Enhancement": sec_prompt,
                 "Multi Rename": sec_rename
@@ -781,23 +691,17 @@ class InstantToolsPane(QWidget):
             _save_all_tools()
         except Exception:
             pass
-
-    
-
-        
-        self.btn_quality.clicked.connect(self.run_quality)
-        self.btn_quality_batch.clicked.connect(self.run_quality_batch_popup)
+        # removed quality/img tool wiring
+        # removed quality/img tool wiring
         # removed: batch_folder button
-        self.btn_img_convert.clicked.connect(self.run_img_convert)
-        self.btn_img_batch.clicked.connect(self.run_img_batch_popup)
+        # removed quality/img tool wiring
+        # removed quality/img tool wiring
         # removed: batch_folder button
 # Wire
         self.btn_speed.clicked.connect(self.run_speed)
         self.btn_speed_batch.clicked.connect(self.run_speed_batch)
         self.btn_gif.clicked.connect(self.run_gif)
         self.btn_gif_batch.clicked.connect(self.run_gif_batch)
-        self.btn_last.clicked.connect(self.run_last)
-        self.btn_all.clicked.connect(self.run_all)
 
         self.btn_trim.clicked.connect(self.run_trim)
         # Let the Trim tool own the batch popup; wire here only if provided.
@@ -925,14 +829,11 @@ class InstantToolsPane(QWidget):
             self._gif_last_out = out
         except Exception:
             pass
-    def run_last(self):
         inp = self._ensure_input();
         if not inp: return
         out=OUT_VIDEOS / f"{inp.stem}_lastframe.png"
         cmd=[ffmpeg_path(),"-y","-sseof","-1","-i",str(inp),"-update","1","-frames:v","1",str(out)]
         self._run(cmd,out)
-
-    def run_all(self):
         inp = self._ensure_input();
         if not inp: return
         outdir=OUT_VIDEOS / f"{inp.stem}_frames"; outdir.mkdir(parents=True, exist_ok=True); out=outdir / "frame_%06d.png"
@@ -1048,16 +949,12 @@ class InstantToolsPane(QWidget):
                 QMessageBox.critical(self, 'Preset error', str(e))
             except Exception:
                 pass
-
-    def _save_preset_extract(self):
         name = "extract_preset.json"
         p = self._choose_save_path(name)
         if not p: return
         data={"tool":"extract"}
         p.write_text(json.dumps(data, indent=2), encoding="utf-8")
         QMessageBox.information(self, "Preset saved", str(p))
-
-    def _load_preset_extract(self):
         p = self._choose_open_path()
         if not p: return
         try:

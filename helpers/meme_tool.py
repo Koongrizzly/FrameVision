@@ -115,6 +115,10 @@ class MemeTextItem(QGraphicsPathItem):
         self._build_path()
         self.setAcceptHoverEvents(True)
         self.setCursor(Qt.OpenHandCursor)
+        try:
+            self.setToolTip('Text box: drag to move. Use rotation, skew, letter spacing, arc & glow controls on the left. Double-click Edit to enter multi-line text. Snap to image edges when you release.')
+        except Exception:
+            pass
 
     def setRect(self, r: QRectF):
         self._rect = QRectF(r); self._build_path()
@@ -358,6 +362,10 @@ class MemeGraphicsView(QGraphicsView):
         self.setRenderHint(QPainter.Antialiasing, True)
         self.setViewportUpdateMode(QGraphicsView.FullViewportUpdate)
         self.setDragMode(QGraphicsView.RubberBandDrag)
+        try:
+            self.setToolTip('Preview: scroll to zoom (auto-fit on resize). Drag a box to select multiple text items. Arrow keys nudge selection (Shift = bigger steps). Esc cancels active crop. Double-click the crop box to apply.')
+        except Exception:
+            pass
     def resizeEvent(self, e):
         super().resizeEvent(e)
         try:
@@ -404,6 +412,10 @@ class CropRectItem(QGraphicsRectItem):
         self.setPen(pen)
         self._shade = None  # optional outside shade
         self._install_shade()
+        try:
+            self.setToolTip('Crop box: drag inside to move. Drag the white squares to resize. Hold Alt to scale from center. Esc cancels. Double-click to APPLY CROP. 16:9 or 9:16 buttons lock aspect.')
+        except Exception:
+            pass
         # live HUD
         try:
             self._hud = QGraphicsSimpleTextItem("", self)
@@ -768,6 +780,11 @@ class MemeToolPane(QWidget):
         self.scene = QGraphicsScene(self); self.view.setScene(self.scene)
         self.view.setStyleSheet("QGraphicsView{border:1px solid rgba(255,255,255,30);}")
         lay.addWidget(self.view, 1)
+        # Install rich tooltips and What's This help so users understand controls
+        try:
+            self._install_tooltips()
+        except Exception:
+            pass
 
         
 
@@ -956,6 +973,184 @@ class MemeToolPane(QWidget):
         # state
         self._img_item: Optional[QGraphicsPixmapItem] = None
         self._items: List[MemeTextItem] = []
+
+
+    def _install_tooltips(self):
+        """Attach concise tooltips and longer What's This help to all controls."""
+        # Make global tooltip font a bit clearer
+        try:
+            from PySide6.QtGui import QFont
+            try:
+                QToolTip.setFont(QFont(getattr(self, "def_family", "Segoe UI"), 9))
+            except Exception:
+                pass
+        except Exception:
+            pass
+
+        def tip(w, short=None, long=None):
+            try:
+                if w is None:
+                    return
+                if short:
+                    w.setToolTip(short)
+                if long:
+                    w.setWhatsThis(long)
+            except Exception:
+                pass
+
+        # Row: source image / preview
+        tip(
+            self.btn_use_current,
+            "Use the image that’s currently open in the player.",
+            "If a video is open, this grabs the CURRENT FRAME at full resolution and uses it as the meme background. "
+            "Tip: open a video, pause on the exact frame you want, then click this to start adding text."
+        )
+
+        tip(
+            self.btn_open,
+            "Open image file(s)…",
+            "Pick one or more images to use as the meme background. "
+            "The first image opens in the preview; the rest are staged for Batch export."
+        )
+
+        tip(
+            self.btn_big,
+            "Large live preview",
+            "Opens a bigger, live-linked preview window. Any changes you make update here instantly."
+        )
+
+        # Text controls
+        tip(
+            self.btn_add,
+            "Add a new text box",
+            "Creates a movable text box. Drag to move; use the Font & Style section and sliders to format it."
+        )
+        tip(
+            self.btn_edit,
+            "Edit selected text…",
+            "Opens a multi-line editor for the currently selected text box. "
+            "You can paste text and add line breaks."
+        )
+        tip(
+            self.btn_remove,
+            "Remove selected text",
+            "Deletes the currently selected text box(es). This cannot be undone."
+        )
+        tip(
+            self.btn_reset,
+            "Reset text positions",
+            "Repositions the first two text boxes to classic meme TOP/BOTTOM layouts."
+        )
+
+        # Crop controls
+        tip(
+            self.btn_crop_169,
+            "Start 16:9 crop",
+            "Creates a movable crop box locked to 16:9. Drag to move; drag handles to resize. "
+            "Double-click the box or click Apply Crop to commit."
+        )
+        tip(
+            self.btn_crop_916,
+            "Start 9:16 crop",
+            "Creates a movable crop box locked to 9:16 (vertical). Drag to move; drag handles to resize. "
+            "Double-click the box or click Apply Crop to commit."
+        )
+        tip(
+            self.btn_crop_reset,
+            "Reset crop",
+            "Restores the original uncropped image."
+        )
+        tip(
+            self.btn_crop_apply,
+            "Apply crop",
+            "Applies the current crop box to the image and keeps text positions relative to the new bounds."
+        )
+
+        # Export / output
+        tip(
+            self.cmb_fmt,
+            "Choose export format",
+            "PNG: lossless, supports transparency. "
+            "JPG: smaller files, no transparency (quality slider matters). "
+            "WebP: modern format with good quality/size."
+        )
+        tip(
+            self.chk_keepmeta,
+            "Keep EXIF/metadata in output",
+            "When enabled, we try to preserve source metadata (EXIF, etc.). "
+            "Disable for the smallest, cleanest files."
+        )
+        tip(
+            self.btn_export,
+            "Export this image…",
+            "Renders the current composition to a single image file using the selected format."
+        )
+        tip(
+            self.btn_batch,
+            "Batch process more images…",
+            "Pick additional images, apply the SAME layout (text positions, fonts, styles) and export them automatically."
+        )
+
+        # Sliders / numeric controls
+        tip(
+            self.sl_rot,
+            "Rotate selected text",
+            "Rotates the selected text box(es). Use the number field for precise values; Reset to go back to 0°."
+        )
+        tip(self.sp_rot, "Rotation (degrees)", "Precise rotation value.")
+
+        tip(
+            self.sl_shear,
+            "Tilt/Skew selected text",
+            "Applies a horizontal shear to create italicized / perspective-like effects. Reset returns to 0%."
+        )
+        tip(self.sp_shear, "Tilt/Skew (%)", "Precise skew amount.")
+
+        tip(
+            self.sl_glow,
+            "Outer glow",
+            "Adds a soft glow beneath outline/fill for better separation. Higher values increase radius/intensity."
+        )
+        tip(self.sp_glow, "Glow amount", "Precise glow amount.")
+
+        tip(
+            self.sl_track,
+            "Letter spacing (tracking)",
+            "Adjusts extra spacing between letters. Negative = squeeze; positive = spread."
+        )
+        tip(self.sp_track, "Letter spacing value", "Precise tracking value.")
+
+        tip(
+            self.sl_arc,
+            "Arc curvature",
+            "Bends the baseline into an arc to form arched text. Positive curves downward; negative curves upward."
+        )
+        tip(self.sp_arc, "Arc curvature (°)", "Precise arc amount.")
+
+        # Font & style section
+        tip(
+            self.font_combo,
+            "Font family",
+            "Choose the typeface. Use the Font… button for full control or load custom fonts from files/folders in the menu."
+        )
+        tip(self.sp_size, "Font size", "Point size for selected text. Auto-fit keeps text within its box; turn it off to allow overflow.")
+        tip(self.sp_stroke, "Outline width", "Thickness of the outline. Set to 0 for no outline.")
+        tip(self.chk_auto, "Auto-fit text to box", "When ON, font size automatically scales to keep the text inside its box width.")
+        tip(self.chk_shadow, "Drop shadow", "Adds a subtle shadow under the text for readability.")
+        tip(self.chk_allcaps, "ALL CAPS", "For classic meme style, forces text to UPPERCASE. Turn off to keep original casing.")
+
+        # View help
+        try:
+            if hasattr(self, "view") and self.view is not None:
+                self.view.setWhatsThis(
+                    "Preview tips:\n"
+                    "• Drag text to move it.\n"
+                    "• Drag a rectangle to multi-select; use Arrow keys to nudge (Shift for 10px).\n"
+                    "• Use Crop buttons to create a crop box; double-click the box to apply.\n"
+                    "• The view auto-fits on resize; use the Big preview for more space."
+                )
+        except Exception:
+            pass
 
     def _connect(self):
 

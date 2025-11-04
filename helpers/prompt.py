@@ -1,4 +1,3 @@
-
 from __future__ import annotations
 
 import os, json, traceback, inspect, datetime, threading, random
@@ -35,7 +34,7 @@ def _qwen3_local_folder() -> Path:
 QWEN3_LOCAL_KEY = "__local_qwen3vl2b__"
 
 def _qwen3_local_folder() -> Path:
-    # Expected path per user: models\describe\default\qwen3vl2b (relative to app root)
+    # Expected path per user: models\\describe\\default\\qwen3vl2b (relative to app root)
     try:
         base = ROOT
     except Exception:
@@ -389,7 +388,7 @@ def _list_qwen_vl_models() -> List[Tuple[str,str]]:
         cat = getattr(D, "ENGINE_CATALOG", {})
         for k, meta in cat.items():
             t = str(meta.get("type","")).lower()
-            if t in ("hf_qwen3vl","hf_qwen3_vl","qwen3vl","qwen3_vl","hf_qwen2vl","hf_qwen2_vl","qwen2vl","qwen_vl"):
+            if t in ("hf_qwen3vl","hf_qwen3_vl","qwen3vl","qwen3_vl"):
                 label = meta.get("label", k)
                 if (k, label) not in out:
                     out.append((k, label))
@@ -411,6 +410,12 @@ def _models_root_path()->Optional[Path]:
         return None
 
 def _folder_for_model_key(model_key:str)->Optional[Path]:
+    # Special case: local Qwen3-VL 2B folder
+    try:
+        if model_key == QWEN3_LOCAL_KEY:
+            return _qwen3_local_folder()
+    except Exception:
+        pass
     try:
         try:
             import helpers.describer as D  # type: ignore
@@ -611,7 +616,7 @@ class PromptToolPane(QWidget):
     """
     Prompt Generator that expands short seeds into long prompts.
     - Saves settings to presets/setsave/prompt.json
-    - Lets you choose Length, Target (image/video), Model (Qwen2-VL engines discovered), and Presets
+    - Lets you choose Length, Target (image/video), Model (Qwen3-VL engines discovered), and Presets
     - Favorite presets (⭐) pin to top; remembers last used
     - Category filter: All / People / Styles / Tech / Scenes
     - Per-preset defaults: target, length, temperature, negatives (applied when preset changes)
@@ -640,9 +645,16 @@ class PromptToolPane(QWidget):
 
         # Model & target
         self.combo_model = QComboBox()
+        self.combo_model.setToolTip(
+            "Model\n\n"
+            "Which language+vision model will expand your Seed into a full prompt.\n"
+            "If you pick a local model (like Qwen3‑VL 2B local), it runs fully offline.\n"
+            "If this list is empty, the app will try to auto-pick something, and if nothing "
+            "is available it falls back to a tiny offline expander."
+        )
         models = _list_qwen_vl_models()
         if not models:
-            self.combo_model.addItem("Qwen2-VL (auto)", "")
+            self.combo_model.addItem("Qwen3-VL (auto)", "")
         else:
             for k,label in models:
                 self.combo_model.addItem(label, k)
@@ -653,12 +665,30 @@ class PromptToolPane(QWidget):
 
         # Target
         self.combo_target = QComboBox(); self.combo_target.addItems(["image","video"])
+        self.combo_target.setToolTip(
+            "Target\n\n"
+            "Tells the generator what you're making:\n"
+            "- image  → still image prompt\n"
+            "- video  → cinematic motion prompt\n\n"
+            "Video mode adds motion words like camera movement / dynamic framing so your "
+            "text-to-video model understands action."
+        )
         tgt = (self.state.get("target") or "image").lower()
         if tgt in ("image","video"):
             self.combo_target.setCurrentText(tgt)
 
         # Category filter
         self.combo_category = QComboBox()
+        self.combo_category.setToolTip(
+            "Category Filter\n\n"
+            "Filters the Presets dropdown by theme:\n"
+            "• All       → show everything\n"
+            "• People    → portraits, fashion, characters\n"
+            "• Styles    → looks / vibes (anime, noir, cyberpunk...)\n"
+            "• Tech      → product shots, blueprints, futuristic UI\n"
+            "• Scenes    → locations, moods, storytelling setups\n\n"
+            "This just helps you find the right preset faster."
+        )
         for c in CATEGORIES_ORDER:
             self.combo_category.addItem(c)
         cat = self.state.get("preset_category","All")
@@ -668,11 +698,26 @@ class PromptToolPane(QWidget):
 
         # Presets (will be populated via rebuild; Default pinned)
         self.combo_preset = QComboBox()
+        self.combo_preset.setToolTip(
+            "Preset\n\n"
+            "Your 'style recipe'. A preset can:\n"
+            "• Inject style tags (lighting, camera, vibe)\n"
+            "• Add safety/cleanup negatives\n"
+            "• Add guidance text (what to describe)\n"
+            "• Change defaults like Temperature, Length, Target\n\n"
+            "When you pick a preset, those defaults may auto-fill "
+            "to get you a good result quickly."
+        )
 
         # Favorite star
         self.btn_star = QPushButton("☆")
         self.btn_star.setFixedWidth(28)
-        self.btn_star.setToolTip("Toggle favorite")
+        self.btn_star.setToolTip(
+            "Favorite Preset ★\n\n"
+            "Click to mark/unmark this preset as a Favorite.\n"
+            "Favorites get pinned to the top of the Presets list and are remembered "
+            "next time you open the app."
+        )
 
         # Put Target, Category, Presets, Star on the same row
         top_row = QHBoxLayout()
@@ -689,15 +734,57 @@ class PromptToolPane(QWidget):
 
         # Length preset
         self.combo_len = QComboBox()
+        self.combo_len.setToolTip(
+            "Length\n\n"
+            "How long / descriptive the final prompt should be.\n\n"
+            "Short  (40–60 words)  → fast, clean, minimal\n"
+            "Medium (80–120 words) → balanced detail (default)\n"
+            "Long   (140–200 words)→ super cinematic & verbose\n\n"
+            "This also controls Max Tokens below."
+        )
         for label in LENGTH_PRESETS.keys():
             self.combo_len.addItem(label)
         self.combo_len.setCurrentText(self.state.get("length_choice","Medium (80–120 words)"))
 
         # Style/negatives and generation params
-        self.style = QLineEdit(self.state.get("style", DEFAULT_STYLE)); self.style.setPlaceholderText("Style tags (Cinematic, Photoreal, Anime)…")
-        self.neg = QLineEdit(self.state.get("negatives", DEFAULT_NEG)); self.neg.setPlaceholderText("Negatives (optional; leave empty if not needed)")
+        self.style = QLineEdit(self.state.get("style", DEFAULT_STYLE))
+        self.style.setPlaceholderText("Style tags (Cinematic, Photoreal, Anime)…")
+        self.style.setToolTip(
+            "Style\n\n"
+            "Extra visual/style tags you ALWAYS want baked into the prompt.\n"
+            "Examples: 'cinematic, moody backlight, 35mm film grain, rain-soaked street'.\n\n"
+            "These stack with whatever the Preset adds. The Shuffle Synonyms button can "
+            "slightly remix wording here to avoid repetition."
+        )
+
+        self.neg = QLineEdit(self.state.get("negatives", DEFAULT_NEG))
+        self.neg.setPlaceholderText("Negatives (optional; leave empty if not needed)")
+        self.neg.setToolTip(
+            "Negatives\n\n"
+            "Stuff you DON'T want. Example: 'watermark, extra fingers, blurry, text overlay'.\n\n"
+            "These are NOT inserted into the main Result line. Instead, we show them in the "
+            "Negatives box under the Result, so you can paste them directly into your model's "
+            "negative prompt field.\n\n"
+            "Tip: leave empty if you don't care about negatives."
+        )
+
         self.temp = QDoubleSpinBox(); self.temp.setRange(0.0, 2.0); self.temp.setSingleStep(0.05); self.temp.setValue(float(self.state.get("temperature", 0.85)))
+        self.temp.setToolTip(
+            "Temperature\n\n"
+            "Creativity / chaos level for wording.\n"
+            "Lower (~0.6)  = safer, literal, controlled.\n"
+            "Higher (~1.0) = wilder wording, more cinematic flourish.\n\n"
+            "Most photoreal stuff: 0.7–0.9. Cartoon / surreal can go higher."
+        )
+
         self.max_new = QSpinBox(); self.max_new.setRange(64, 4096); self.max_new.setValue(int(self.state.get("max_new_tokens", 280)))
+        self.max_new.setToolTip(
+            "Max tokens\n\n"
+            "Upper limit for how long the model is allowed to talk.\n"
+            "Bigger = potentially more detail (and slower).\n\n"
+            "When you change Length above, this usually auto-updates.\n"
+            "You can override it manually if you want walls of text."
+        )
 
         form.addRow("Model", self.combo_model)
         form.addRow(top_row)
@@ -712,6 +799,15 @@ class PromptToolPane(QWidget):
         # ---- Seed / Buttons / Result ----
         self.seed = QTextEdit(self.state.get("seed_text",""))
         self.seed.setPlaceholderText("Enter seed words, e.g. 'a cat in a tree'")
+        self.seed.setToolTip(
+            "Seed words\n\n"
+            "Your raw idea. Keep it short and human:\n"
+            "  'retro sci‑fi biker in neon rain',\n"
+            "  'luxury skincare product floating in water splash',\n"
+            "  'slow-motion basketball dunk with sparks'.\n\n"
+            "You can click Rephrase to cycle cleaner / alternate phrasings "
+            "before you Generate the final production prompt."
+        )
         self.seed.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
         self.seed.setLineWrapMode(QTextEdit.LineWrapMode.WidgetWidth)
         self.seed.setFixedHeight(_lines_to_px(self.seed, 2))
@@ -720,19 +816,79 @@ class PromptToolPane(QWidget):
 
         btns = QHBoxLayout()
         self.btn_gen = QPushButton("Generate")
+        self.btn_gen.setToolTip(
+            "Generate\n\n"
+            "Creates the final, polished prompt based on:\n"
+            "• Seed words\n"
+            "• Style / Preset\n"
+            "• Target (image/video)\n"
+            "• Temperature, Length, etc.\n\n"
+            "Result appears below and is safe to paste straight into "
+            "your image/video model as the positive prompt."
+        )
         self.btn_cancel = QPushButton("Cancel")
+        self.btn_cancel.setToolTip(
+            "Cancel\n\n"
+            "Stops a running generation. Handy if a huge local model "
+            "is taking too long, or you just changed your mind."
+        )
         self.btn_cancel.setVisible(False)
+
         self.btn_copy = QPushButton("Copy result")
+        self.btn_copy.setToolTip(
+            "Copy result\n\n"
+            "Copies the Result box (the main positive prompt) to your clipboard "
+            "so you can paste it into another tool or tab."
+        )
+
         self.btn_clear = QPushButton("Clear")
+        self.btn_clear.setToolTip(
+            "Clear\n\n"
+            "Wipes the Result and Negatives boxes below.\n"
+            "Does NOT clear your Seed or settings."
+        )
+
         self.btn_save_txt = QPushButton("Save .txt")
+        self.btn_save_txt.setToolTip(
+            "Save .txt\n\n"
+            "Exports ONLY the Result prompt as a plain .txt file.\n"
+            "Good for quickly saving the exact wording you'll feed your model."
+        )
+
         self.btn_save_json = QPushButton("Save .json")
+        self.btn_save_json.setToolTip(
+            "Save .json\n\n"
+            "Exports a bundle: seed, final prompt, negatives, preset info, temperature, etc.\n"
+            "Perfect for versioning, sharing with teammates, or reloading later."
+        )
+
         for b in (self.btn_gen, self.btn_cancel, self.btn_copy, self.btn_clear, self.btn_save_txt, self.btn_save_json):
             btns.addWidget(b)
         btns.addStretch(1)
         # Variation dial + synonym shuffler
         self.var_count = QSpinBox(); self.var_count.setRange(1, 8); self.var_count.setValue(int(self.state.get("var_count", 3)))
+        self.var_count.setToolTip(
+            "Variations\n\n"
+            "Controls how much variety you get from Rephrase / Shuffle Synonyms.\n"
+            "Higher number = more alternate wordings that you can cycle through."
+        )
+
         self.btn_rephrase = QPushButton("Rephrase")
+        self.btn_rephrase.setToolTip(
+            "Rephrase\n\n"
+            "Auto-rewrites your Seed in different words (same idea).\n"
+            "Great for removing awkward wording or making it sound more pro.\n\n"
+            "Click multiple times to cycle through the generated variations."
+        )
+
         self.btn_shuffle = QPushButton("Shuffle Synonyms")
+        self.btn_shuffle.setToolTip(
+            "Shuffle Synonyms\n\n"
+            "Light remix. Swaps some adjectives in Style and sometimes in Seed "
+            "to avoid sounding copy-paste.\n\n"
+            "Doesn't change the core concept, just the flavor words."
+        )
+
         btns.addSpacing(12)
         btns.addWidget(QLabel("Variations"))
         btns.addWidget(self.var_count)
@@ -742,6 +898,13 @@ class PromptToolPane(QWidget):
 
         self.out = QTextEdit("")
         self.out.setReadOnly(True)
+        self.out.setToolTip(
+            "Result (Positive Prompt)\n\n"
+            "This is the final, production-ready prompt sentence.\n"
+            "Paste this directly into your model's Positive / Main / Prompt field.\n\n"
+            "We keep it one long descriptive sentence on purpose — lots of detail, "
+            "but still 'one idea' so video/image models don't split into multiple scenes."
+        )
         self.out.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
         self.out.setLineWrapMode(QTextEdit.LineWrapMode.WidgetWidth)
         self.out.setFixedHeight(_lines_to_px(self.out, 15))
@@ -751,6 +914,14 @@ class PromptToolPane(QWidget):
         # New: separate Negatives box (no longer appended to the prompt itself)
         self.out_neg = QTextEdit("")
         self.out_neg.setReadOnly(True)
+        self.out_neg.setToolTip(
+            "Negatives (Suggested)\n\n"
+            "Everything you probably want to AVOID: bad hands, watermarks, blurry, etc.\n\n"
+            "This is built from your Negatives field + preset cleanup filters.\n"
+            "Use this in your model's Negative Prompt box.\n\n"
+            "We don't merge it into the main Result line, because most UIs "
+            "have a dedicated negative prompt field anyway."
+        )
         self.out_neg.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
         self.out_neg.setLineWrapMode(QTextEdit.LineWrapMode.WidgetWidth)
         self.out_neg.setFixedHeight(_lines_to_px(self.out_neg, 3))
@@ -821,7 +992,20 @@ class PromptToolPane(QWidget):
         name = self.combo_preset.currentText()
         on = self._is_favorite(name)
         self.btn_star.setText("★" if on else "☆")
-        self.btn_star.setToolTip("Unfavorite" if on else "Favorite")
+        if on:
+            tip = (
+                "★ Favorite Preset\n\n"
+                "This preset is in Favorites.\n"
+                "Click to remove it. Favorites stay pinned to the top of the list "
+                "and are remembered next time you open the app."
+            )
+        else:
+            tip = (
+                "☆ Not Favorited\n\n"
+                "Click to add this preset to Favorites. Favorites are pinned to the top "
+                "of the Presets list and remembered next time you open the app."
+            )
+        self.btn_star.setToolTip(tip)
 
     def _rebuild_preset_combo(self, keep_current:bool=False):
         cur = self.combo_preset.currentText()
@@ -1074,7 +1258,7 @@ class PromptToolPane(QWidget):
     def _segments(self, s):
         try:
             import re as _re
-            parts = _re.split(r';|,|\band\b', s)
+            parts = _re.split(r';|,|\\band\\b', s)
             parts = [p.strip() for p in parts if p and p.strip()]
             return parts if parts else [s]
         except Exception:
@@ -1099,7 +1283,7 @@ class PromptToolPane(QWidget):
             if _r.random() < 0.5:
                 draft += _r.choice(boosters)
             import re as _re
-            return _re.sub(r'\s+', ' ', draft).strip()
+            return _re.sub(r'\\s+', ' ', draft).strip()
         except Exception:
             return base
 
@@ -1211,7 +1395,7 @@ class PromptToolPane(QWidget):
 
     def _on_worker_failed(self, err: str):
         try:
-            QMessageBox.critical(self, "Prompt generator", f"{err}\n\nFalling back to local expand.")
+            QMessageBox.critical(self, "Prompt generator", f"{err}\\n\\nFalling back to local expand.")
         except Exception:
             pass
         seed = (self.seed.toPlainText() or "").strip()
@@ -1259,11 +1443,13 @@ class PromptToolPane(QWidget):
 
     def _copy_to_clipboard(self):
         try:
-            from PySide6.QtWidgets import QApplication
+            from PySide6.QtWidgets import QApplication, QToolTip
             QApplication.clipboard().setText(self.out.toPlainText())
-            QMessageBox.information(self, "Copied", "Result copied to clipboard.")
+            pos = self.mapToGlobal(self.rect().center())
+            QToolTip.showText(pos, "Result copied to clipboard.", self, self.rect(), 2000)
         except Exception:
             pass
+
 
     
     def _clear_outputs(self):

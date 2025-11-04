@@ -309,6 +309,67 @@ def _make_donkey_kong_icon(size: int = 18) -> QtGui.QIcon:
     return QtGui.QIcon(pm)
 
 
+def _make_pacman_icon(size: int = 18) -> QtGui.QIcon:
+    """Simple Pac-Man icon: yellow pie (300° span) with a small eye."""
+    pm = QtGui.QPixmap(size, size); pm.fill(Qt.transparent)
+    p = QtGui.QPainter(pm)
+    try:
+        p.setRenderHint(QtGui.QPainter.Antialiasing, True)
+        rect = QtCore.QRect(1, 1, size - 2, size - 2)
+        p.setBrush(QtGui.QBrush(QtGui.QColor('#FFD54F')))
+        p.setPen(QtGui.QPen(QtGui.QColor('#F9A825')))
+        start_angle = int(30 * 16)   # 30 degrees
+        span_angle = int(300 * 16)   # 300 degrees
+        p.drawPie(rect, start_angle, span_angle)
+        p.setBrush(QtGui.QBrush(QtGui.QColor('#212121')))
+        p.setPen(Qt.NoPen)
+        eye_r = max(1, size // 12)
+        p.drawEllipse(QtCore.QPoint(size // 2, size // 3), eye_r, eye_r)
+    finally:
+        p.end()
+    return QtGui.QIcon(pm)
+
+
+def _make_jet_icon(size: int = 18) -> QtGui.QIcon:
+    """Simple jet fighter icon (triangle body + tail + canopy)."""
+    pm = QtGui.QPixmap(size, size); pm.fill(Qt.transparent)
+    p = QtGui.QPainter(pm)
+    try:
+        p.setRenderHint(QtGui.QPainter.Antialiasing, True)
+        body = QtGui.QPolygon([
+            QtCore.QPoint(size//2, 2),
+            QtCore.QPoint(size-3, size-3),
+            QtCore.QPoint(3, size-3),
+        ])
+        p.setBrush(QtGui.QBrush(QtGui.QColor('#90CAF9')))
+        p.setPen(QtGui.QPen(QtGui.QColor('#1565C0')))
+        p.drawPolygon(body)
+        p.setBrush(QtGui.QBrush(QtGui.QColor('#E3F2FD'))); p.setPen(Qt.NoPen)
+        p.drawEllipse(QtCore.QPoint(size//2, size//3), max(1, size//10), max(1, size//12))
+        p.setBrush(QtGui.QBrush(QtGui.QColor('#42A5F5'))); p.setPen(Qt.NoPen)
+        p.drawPolygon(QtGui.QPolygon([
+            QtCore.QPoint(size//2, size-4),
+            QtCore.QPoint(size//2 + 3, size-8),
+            QtCore.QPoint(size//2 - 3, size-8),
+        ]))
+        p.setBrush(QtGui.QBrush(QtGui.QColor('#64B5F6')))
+        p.drawPolygon(QtGui.QPolygon([
+            QtCore.QPoint(size//2 - 6, size//2),
+            QtCore.QPoint(3, size-4),
+            QtCore.QPoint(size//2 - 1, size-6),
+        ]))
+        p.drawPolygon(QtGui.QPolygon([
+            QtCore.QPoint(size//2 + 6, size//2),
+            QtCore.QPoint(size-3, size-4),
+            QtCore.QPoint(size//2 + 1, size-6),
+        ]))
+    finally:
+        p.end()
+    return QtGui.QIcon(pm)
+
+
+
+
 # ---------------------------- Dad jokes logic ---------------------------------------------
 _DAD_FILE_REL = os.path.join("assets", "dad_jokes.txt")
 _DAD_BAG_KEY = "dad_jokes_bag"
@@ -582,7 +643,7 @@ EASTER_EGGS: List[Dict] = [
             r"helpers\\FrameRacing.py",
             r"helpers\\FrameRacers.py",
         ],
-        "unlock_seconds": 60 * 60 * 14,  # 14 hours
+        "unlock_seconds": 60 * 60 * 24,  # 14 hours
         "message": "Great, another easter egg unlocked, check Settings tab !",
     },
     # Donkey Kong Classic (36h)
@@ -596,11 +657,28 @@ EASTER_EGGS: List[Dict] = [
             r"helpers\\donkey_kong.py",
             r"helpers\\donkeykong.py",
             r"helpers\\dk_classic.py",
+            r"helpers\\kong.py",
         ],
-        "unlock_seconds": 60 * 60 * 30,  # 30 hours
+        "unlock_seconds": 60 * 60 * 36,  # 30 hours
         "message": "Great, another easter egg unlocked, check Settings tab !",
     },
-]
+
+    {
+        "id": "pacvision",
+        "label": "Pacvision",
+        "icon_fn": lambda: _make_pacman_icon(18),
+        "script": r"helpers\\pacvision.py",
+        "unlock_seconds": 60 * 90,  # 90 minutes
+        "message": "Thanks for using the app, here is another easter egg -> check Settings Tab",
+    },
+    {
+        "id": "frameshooters",
+        "label": "FrameShooters",
+        "icon_fn": lambda: _make_jet_icon(18),
+        "script": r"helpers\\frameshooters.py",
+        "unlock_seconds": 60 * 60 * 12,  # 12 hours
+        "message": "Another easter egg unlocked,\nNow you are never bored again while waiting for that movie to finish upscaling",
+    },]
 
 
 def _check_for_unlocks(total_seconds: Optional[int] = None) -> None:
@@ -628,7 +706,7 @@ def _populate_easter_menu(menu: QtWidgets.QMenu, parent: QtWidgets.QWidget) -> N
         menu.clear()
         header = QtWidgets.QWidget(menu)
         v = QtWidgets.QVBoxLayout(header); v.setContentsMargins(10,6,10,6); v.setSpacing(2)
-        title = QtWidgets.QLabel("Easter Eggs & Fun stuff", header); title.setStyleSheet("font-weight:600;")
+        title = QtWidgets.QLabel("️ 🥚   Easter Eggs   🕹️ ", header); title.setStyleSheet("font-weight:600;")
         sub = QtWidgets.QLabel("Use the app to unlock more", header); sub.setStyleSheet("opacity:0.7; font-size:11px;")
         v.addWidget(title); v.addWidget(sub)
         wa = QtWidgets.QWidgetAction(menu); wa.setDefaultWidget(header); menu.addAction(wa)
@@ -683,7 +761,7 @@ def install_social_bottom_runtime() -> None:
         h = QtWidgets.QHBoxLayout(row); h.setContentsMargins(0,6,0,0); h.setSpacing(8)
         h.addStretch(1)
 
-        btn_ee = QtWidgets.QPushButton("Easter Eggs", row)
+        btn_ee = QtWidgets.QPushButton(" Easter Eggs 🥚️", row)
         btn_ee.setMinimumWidth(120); btn_ee.setMinimumHeight(24)
         menu = QtWidgets.QMenu(btn_ee)
         _populate_easter_menu(menu, btn_ee)

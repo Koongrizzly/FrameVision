@@ -295,7 +295,7 @@ class DescriberWidget(QWidget):
         # --- Paths ---
         path_box = QGroupBox("Paths")
         g = QGridLayout(path_box)
-        g.addWidget(QLabel("Test image path:"), 0, 0)
+        g.addWidget(QLabel("image path:"), 0, 0)
         self.txt_image = QLineEdit(); g.addWidget(self.txt_image, 0, 1)
         self.btn_browse = QPushButton("Browse..."); g.addWidget(self.btn_browse, 0, 2)
         self.lbl_player = QLabel(""); self.lbl_player.setVisible(False); self.lbl_player.setMaximumHeight(0)  # hidden

@@ -136,6 +136,10 @@ def _record_result(job, out_dir, status: dict):
         "steps": job.get("steps", 30),
         "requested_size": [job.get("width", 1024), job.get("height", 1024)],
         "actual_size": status.get("actual_size"),
+        "lora_mode": status.get("lora_mode"),
+        "loras": status.get("loras"),
+        "lora_scales": status.get("lora_scales"),
+        "lora_names": status.get("lora_names"),
     }
     # Write next to first image or into out_dir
     target = out_dir / (status.get("files",[None])[0] and (pathlib.Path(status["files"][0]).stem + ".json") or "last_txt2img.json")
@@ -161,7 +165,8 @@ from PySide6.QtWidgets import (
     QMessageBox,
     QWidget, QVBoxLayout, QHBoxLayout, QLabel, QLineEdit, QTextEdit, QPushButton, QSpinBox,
     QCheckBox, QFileDialog, QComboBox, QProgressBar, QGroupBox, QFormLayout, QScrollArea, QToolButton, QSlider,
-    QDoubleSpinBox
+    QDoubleSpinBox,
+    QSizePolicy
 )
 # Import QShortcut correctly from QtGui; fall back to no shortcut if missing
 try:
@@ -279,10 +284,8 @@ class Txt2ImgPane(QWidget):
             except Exception:
                 pass
             try:
-                if hasattr(self,'steps_slider') and 'steps' in s:
-                    self.steps_slider.setValue(int(s.get('steps') or 30))
-                if hasattr(self,'cfg_scale') and 'cfg_scale' in s:
-                    self.cfg_scale.setValue(float(s.get('cfg_scale') or 7.5))
+                    if hasattr(self,'steps_slider') and 'steps' in s: self.steps_slider.setValue(int(s.get('steps') or 30))
+                    if hasattr(self,'cfg_scale') and 'cfg_scale' in s: self.cfg_scale.setValue(float(s.get('cfg_scale') or 7.5))
             except Exception:
                 pass
             try:
@@ -820,12 +823,12 @@ class Txt2ImgPane(QWidget):
             self.steps_slider.setTickInterval(10)
         except Exception:
             pass
-        self.steps_value = QLabel("30")
-        self.steps_default = QCheckBox("Lock to default (30)")
+        self.steps_value = QLabel("25")
+        self.steps_default = QCheckBox("Lock to default")
         self.steps_default.setChecked(False)
         def _on_steps_default_changed(checked: bool):
             if checked:
-                self.steps_slider.setValue(30)
+                self.steps_slider.setValue(25)
         self.steps_default.toggled.connect(_on_steps_default_changed)
         self.steps_slider.valueChanged.connect(lambda v: self.steps_value.setText(str(int(v))))
         steps_row.addWidget(QLabel("Steps:"))
@@ -837,11 +840,12 @@ class Txt2ImgPane(QWidget):
         # CFG scale
         cfg_row = QHBoxLayout()
         self.cfg_scale = QDoubleSpinBox(); self.cfg_scale.setRange(1.0, 15.0); self.cfg_scale.setSingleStep(0.1); self.cfg_scale.setDecimals(1); self.cfg_scale.setValue(7.5)
-        cfg_row.addWidget(QLabel("CFG:"))
-        cfg_row.addWidget(self.cfg_scale, 0)
-        form.addRow(cfg_row)
-
-        # Seed used (always visible)
+        
+        # Move CFG into the Steps row per user request
+        steps_row.addWidget(QLabel("CFG:"))
+        steps_row.addWidget(self.cfg_scale, 0)
+        # (removed) form.addRow(cfg_row) — CFG now sits on Steps row
+# Seed used (always visible)
         self.seed_used_label = QLabel("Seed used: —"); self.seed_used_label.setVisible(False)
         form.addRow(self.seed_used_label)
 
@@ -850,7 +854,7 @@ class Txt2ImgPane(QWidget):
         self.output_path = QLineEdit(str(Path("./output/images").resolve()))
         self.browse_btn = QPushButton("Browse…"); self.browse_btn.clicked.connect(self._on_browse)
         self.show_in_player = QCheckBox("Show in Player")
-        self.use_queue = QCheckBox("Use queue (Add/Run)")
+        self.use_queue = QCheckBox("Use queue")
         
         try:
             self.use_queue.toggled.connect(lambda *_: self._autosave_now())
@@ -862,7 +866,6 @@ class Txt2ImgPane(QWidget):
             pass
 
         out_row.addWidget(QLabel("Output:")); out_row.addWidget(self.output_path, 1); out_row.addWidget(self.browse_btn)
-        out_row.addWidget(self.show_in_player); out_row.addWidget(self.use_queue)
         form.addRow(out_row)
 
         # VRAM profile override
@@ -871,6 +874,9 @@ class Txt2ImgPane(QWidget):
         self.restore_auto = QPushButton("Restore Auto")
         self.restore_auto.hide(); self.restore_auto.clicked.connect(lambda: self.vram_profile.setCurrentIndex(0))
         vram_row.addWidget(QLabel("VRAM profile:")); vram_row.addWidget(self.vram_profile); vram_row.addWidget(self.restore_auto)
+        
+        vram_row.addWidget(self.show_in_player)
+        vram_row.addWidget(self.use_queue)
         form.addRow(vram_row)
         # Ensure hidden CLI fields exist before persistence restore
         try:
@@ -958,19 +964,23 @@ class Txt2ImgPane(QWidget):
         self.lora_combo = QComboBox()
         self.lora_refresh = QPushButton("Reload")
         rowl = QHBoxLayout()
-        rowl.addWidget(self.lora_combo, 1)
         rowl.addWidget(self.lora_refresh, 0)
+        rowl.addWidget(self.lora_combo, 1)
         mdl_form.addRow("LoRA (SDXL)", rowl)
         # LoRA 1 Strength (scale)
         self.lora_strength_slider = QSlider(Qt.Horizontal)
+        try:
+            self.lora_strength_slider.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+        except Exception:
+            pass
         self.lora_strength_slider.setMinimum(0)
         self.lora_strength_slider.setMaximum(150)
         self.lora_strength_slider.setValue(100)
         self.lora_strength = QDoubleSpinBox(); self.lora_strength.setRange(0.0, 1.5); self.lora_strength.setSingleStep(0.05); self.lora_strength.setDecimals(2); self.lora_strength.setValue(1.0)
         rowls = QHBoxLayout()
         rowls.addWidget(QLabel("LoRA 1 Strength:"))
-        rowls.addWidget(self.lora_strength_slider, 1)
         rowls.addWidget(self.lora_strength, 0)
+        rowls.addWidget(self.lora_strength_slider, 1)
         mdl_form.addRow(rowls)
 
         def _sync_lora1_strength_from_slider(v):
@@ -995,8 +1005,8 @@ class Txt2ImgPane(QWidget):
         self.lora2_combo = QComboBox()
         self.lora2_refresh = QPushButton("Reload")
         rowl2 = QHBoxLayout()
-        rowl2.addWidget(self.lora2_combo, 1)
         rowl2.addWidget(self.lora2_refresh, 0)
+        rowl2.addWidget(self.lora2_combo, 1)
         mdl_form.addRow("LoRA 2 (SDXL)", rowl2)
 
         def _populate_loras2():
@@ -1056,14 +1066,18 @@ class Txt2ImgPane(QWidget):
 
         # LoRA 2 strength (scale)
         self.lora2_strength_slider = QSlider(Qt.Horizontal)
+        try:
+            self.lora2_strength_slider.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+        except Exception:
+            pass
         self.lora2_strength_slider.setMinimum(0)
         self.lora2_strength_slider.setMaximum(150)
         self.lora2_strength_slider.setValue(100)
         self.lora2_strength = QDoubleSpinBox(); self.lora2_strength.setRange(0.0, 1.5); self.lora2_strength.setSingleStep(0.05); self.lora2_strength.setDecimals(2); self.lora2_strength.setValue(1.0)
         rowls2 = QHBoxLayout()
         rowls2.addWidget(QLabel("LoRA 2 Strength:"))
-        rowls2.addWidget(self.lora2_strength_slider, 1)
         rowls2.addWidget(self.lora2_strength, 0)
+        rowls2.addWidget(self.lora2_strength_slider, 1)
         mdl_form.addRow(rowls2)
 
         def _sync_lora2_strength_from_slider(v):
@@ -1901,55 +1915,60 @@ def _gen_via_diffusers(job: dict, out_dir: Path, progress_cb=None):
 
         
         # Optionally load up to two LoRAs for SDXL (from UI slots 1 & 2)
+        lora_mode = None
+        lora_names = []
+        loras_to_load = []
+        scales = []
         try:
             lora1 = str(job.get("lora_path") or "").strip()
             lora2 = str(job.get("lora2_path") or "").strip()
             s1 = float(job.get("lora_scale", 1.0) or 1.0)
             s2 = float(job.get("lora2_scale", 1.0) or 1.0)
-            loras_to_load = []
-            scales = []
             if lora1 and Path(lora1).exists():
                 loras_to_load.append(lora1); scales.append(s1)
             if lora2 and Path(lora2).exists():
                 loras_to_load.append(lora2); scales.append(s2)
             if loras_to_load and is_sdxl:
                 try:
-                    names = [f"lora_{i}" for i in range(len(loras_to_load))]
-                    for path, name in zip(loras_to_load, names):
-                        pipe.load_lora_weights(path)
+                    lora_names = [f"lora_{i+1}" for i in range(len(loras_to_load))]
+                    for path, name in zip(loras_to_load, lora_names):
+                        try:
+                            pipe.load_lora_weights(path, adapter_name=name)
+                        except TypeError:
+                            pipe.load_lora_weights(path)
                     if hasattr(pipe, "set_adapters"):
-                        pipe.set_adapters(names, scales)
+                        pipe.set_adapters(lora_names, scales)
+                        lora_mode = "adapters"
+                        try:
+                            print(f"[txt2img] LoRA applied via adapters: {list(zip(lora_names, scales))}")
+                        except Exception:
+                            pass
+                    else:
+                        raise RuntimeError("set_adapters missing")
                 except Exception as e:
                     print("[txt2img] adapter set failed, fallback fuse", e)
-                    for path in loras_to_load:
-                        try:
-                            pipe.load_lora_weights(path)
-                        except Exception as inner_e:
-                            print("[txt2img] fallback load error:", inner_e)
                     try:
                         if hasattr(pipe, "fuse_lora"):
-                            # best-effort: fuse once with first scale, then reload second and fuse again
-                            if len(scales) >= 1:
-                                pipe.fuse_lora(lora_scale=scales[0])
-                            if len(scales) >= 2:
+                            if len(loras_to_load) >= 1:
                                 try:
-                                    pipe.load_lora_weights(loras_to_load[1])
-                                    pipe.fuse_lora(lora_scale=scales[1])
+                                    pipe.load_lora_weights(loras_to_load[0])
                                 except Exception:
                                     pass
+                                pipe.fuse_lora(lora_scale=scales[0])
+                            if len(loras_to_load) >= 2:
+                                try:
+                                    pipe.load_lora_weights(loras_to_load[1])
+                                except Exception:
+                                    pass
+                                pipe.fuse_lora(lora_scale=scales[1])
+                            lora_mode = "fused"
+                            try:
+                                print(f"[txt2img] LoRA applied via fuse: {list(zip(loras_to_load, scales))}")
+                            except Exception:
+                                pass
                     except Exception:
                         pass
         except Exception as _e:
-            try:
-                print("[txt2img] LoRA load failed:", _e)
-            except Exception:
-                pass
-
-            try:
-                print("[txt2img] LoRA load failed:", _e)
-            except Exception:
-                pass
-
             try:
                 print("[txt2img] LoRA load failed:", _e)
             except Exception:
@@ -2036,7 +2055,7 @@ def _gen_via_diffusers(job: dict, out_dir: Path, progress_cb=None):
                     progress_cb({"step": (i+1)*max(1, steps), "total": max(1, steps*batch)})
             except Exception:
                 pass
-        return {"files": files, "backend": "diffusers", "model": model_path, "actual_size": [width, height]}
+        return {"files": files, "backend": "diffusers", "model": model_path, "actual_size": [width, height], "lora_mode": (lora_mode or ""), "loras": loras_to_load, "lora_scales": scales, "lora_names": lora_names}
     except Exception as e:
         import traceback
         err = {"backend":"diffusers","error":str(e),"trace": traceback.format_exc()}
@@ -2148,7 +2167,7 @@ def generate_qwen_images(job: dict, progress_cb: Optional[Callable[[float], None
                     "seed": seed, "seed_policy": seed_policy, "batch": batch, "files": files,
                     "created_at": time.time(), "engine": meta_backend, "model": meta_model,
                     "vram_profile": job.get("vram_profile","auto"), "steps": steps, "seeds": seeds_list,
-                    "requested_size": [req_w, req_h], "actual_size": [safe_w, safe_h]}
+                    "requested_size": [req_w, req_h], "actual_size": [safe_w, safe_h], "lora_mode": (diff.get("lora_mode") if diff else None), "loras": (diff.get("loras") if diff else None), "lora_scales": (diff.get("lora_scales") if diff else None), "lora_names": (diff.get("lora_names") if diff else None)}
             try:
                 with open(out_dir / (Path(files[0]).stem + ".json"), "w", encoding="utf-8") as f:
                     json.dump(meta, f, ensure_ascii=False, indent=2)
@@ -2178,7 +2197,7 @@ def generate_qwen_images(job: dict, progress_cb: Optional[Callable[[float], None
     meta = {"ok": True, "prompt": prompt, "negative": job.get("negative",""), "seed": seed,
             "seed_policy": seed_policy, "batch": batch, "files": files, "created_at": time.time(),
             "engine": "fallback", "vram_profile": job.get("vram_profile","auto"), "steps": steps, "seeds": seeds_list,
-            "requested_size": [req_w, req_h], "actual_size": [safe_w, safe_h]}
+            "requested_size": [req_w, req_h], "actual_size": [safe_w, safe_h], "lora_mode": (diff.get("lora_mode") if diff else None), "loras": (diff.get("loras") if diff else None), "lora_scales": (diff.get("lora_scales") if diff else None), "lora_names": (diff.get("lora_names") if diff else None)}
     try:
         with open(out_dir / (Path(files[0]).stem + ".json"), "w", encoding="utf-8") as f:
             json.dump(meta, f, ensure_ascii=False, indent=2)

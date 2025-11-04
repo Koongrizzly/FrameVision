@@ -702,6 +702,7 @@ class AskPopup(QDialog):
         _menu.addAction("Select llama binary…", self._select_llama_bin)
         self.btn_tools.setMenu(_menu)
         bar.addWidget(self.btn_tools)
+        self.btn_tools.setVisible(False)
         bar.addStretch(1)
         root.addLayout(bar)
 
@@ -725,6 +726,16 @@ class AskPopup(QDialog):
         self.btn_browse_gguf.setToolTip("Browse for a GGUF model file.")
         mm.addWidget(self.btn_browse_gguf)
         root.addLayout(mm)
+
+        # Hide backend/device/preset/GGUF row (user preference)
+        try:
+            for _i in range(mm.count()):
+                _item = mm.itemAt(_i)
+                _w = _item.widget()
+                if _w is not None:
+                    _w.setVisible(False)
+        except Exception:
+            pass
 
         # HUD
         hud = QHBoxLayout()

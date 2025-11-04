@@ -4,13 +4,24 @@ from PySide6 import QtCore, QtGui, QtWidgets
 from PySide6.QtCore import Qt, QSettings, QTimer
 from PySide6.QtWidgets import (
     QWidget, QTabWidget, QScrollArea, QVBoxLayout, QHBoxLayout, QLabel,
-    QGroupBox, QComboBox, QPushButton, QCheckBox, QSizePolicy
+    QGroupBox, QComboBox, QPushButton, QCheckBox, QSizePolicy, QAbstractButton,
+    QToolButton
 )
 
 try:
     from helpers.framevision_app import apply_theme, config, save_config
 except Exception:
     apply_theme=None; config={}
+
+# TooltipManager import (with safe fallback so Settings never crashes)
+try:
+    from helpers.tooltip_manager import TooltipManager
+except Exception:
+    class TooltipManager:  # fallback no-op if file missing
+        @staticmethod
+        def set_enabled(_b: bool): pass
+        @staticmethod
+        def is_enabled() -> bool: return True
 
 import os, shutil, sys, time
 
@@ -112,7 +123,7 @@ def _theme_row(page: QWidget) -> QWidget:
         cur = (config.get("theme") or "Auto"); idx = box.findText(cur); box.setCurrentIndex(max(0, idx))
     except Exception:
         pass
-    btn = QPushButton("Apply theme")
+    btn = QPushButton("Apply")
     def do_apply():
         try:
             t = box.currentText(); config["theme"] = t
@@ -136,7 +147,7 @@ def _theme_row(page: QWidget) -> QWidget:
     ov_toggle.setToolTip("Enable a visual overlay during the startup intro image (e.g., Matrix rain).")
 
     ov_combo = QComboBox()
-    ov_combo.addItems(["Random","Matrix (Green)","Matrix (Blue)","Bokeh","Rain","FirefliesParallax","StarfieldHyperjump","CometTrails","AuroraFlow"])
+    ov_combo.addItems(["Random","Matrix (Green)","Matrix (Blue)","Bokeh","Rain","Fireworks","FirefliesParallax","Glitch Shards","LightningStrike","StarfieldHyperjump","Warp in","CometTrails","AuroraFlow"])
 
     ov_preview = QCheckBox("Preview")
     ov_preview.setToolTip("If enabled, shows the intro overlay briefly in the Settings preview.")
@@ -167,7 +178,7 @@ def _options_group(page: QWidget) -> QGroupBox:
     v = QVBoxLayout(g); v.setContentsMargins(0,0,0,0); v.setSpacing(6)
     s = QSettings("FrameVision","FrameVision")
 
-    # Force intro_follow_theme OFF since the toggle is hidden
+    # Force intro_follow_theme OFF since that toggle is hidden now
     try:
         s.setValue("intro_follow_theme", False)
     except Exception:
@@ -177,34 +188,90 @@ def _options_group(page: QWidget) -> QGroupBox:
     cb1.setVisible(False)
     cb1.setChecked(s.value("intro_enabled", True, type=bool))
     cb1.toggled.connect(lambda b: s.setValue("intro_enabled", bool(b)))
-
-    # (hidden) Intro follows theme toggle removed
-
     v.addWidget(cb1)
 
-    cb_clear_pyc = QCheckBox(r"Clear app Python cache files in /__pycache__ at (re)start")
-    cb_clear_pyc.setChecked(s.value("clear_pyc_on_start", False, type=bool))
-    cb_clear_pyc.toggled.connect(lambda b: s.setValue("clear_pyc_on_start", bool(b)))
+    # -- Clear pycache checkbox ------------------------------------------------------
+    cb_clear_pyc = QCheckBox(r"Clear app Python cache at (re)start")
+    cb_clear_pyc.setToolTip(
+        "If enabled, FrameVision will try to delete compiled .pyc cache folders "
+        "on startup to avoid stale bytecode."
+    )
+    clear_default = s.value("clear_pyc_on_start", False, type=bool)
+    cb_clear_pyc.setChecked(clear_default)
 
-    cb_keep_settings = QCheckBox("Keep all used settings after restart")
-    cb_keep_settings.setChecked(s.value("keep_settings_after_restart", True, type=bool))
-    cb_keep_settings.toggled.connect(lambda b: s.setValue("keep_settings_after_restart", bool(b)))
+    # -- Tooltip visibility checkbox -------------------------------------------------
+    cb_tooltips = QCheckBox("Show hover tips / help bubbles")
+    cb_tooltips.setToolTip(
+        "Turn off to hide ALL mouse-hover tooltips and help popups "
+        "everywhere in FrameVision right away."
+    )
+    tooltips_default = s.value("tooltips_enabled", True, type=bool)
+    cb_tooltips.setChecked(tooltips_default)
 
+    # Sync TooltipManager immediately to saved state and make sure
+    # the eventFilter is active (lazy install will grab QApplication).
+    try:
+        TooltipManager.set_enabled(bool(tooltips_default))
+    except Exception:
+        pass
+
+    # -- Keep settings after restart checkbox ---------------------------------------
+    cb_keep_settings = QCheckBox("Keep user preferences")
+    cb_keep_settings.setToolTip(
+        "If enabled, FrameVision will remember the last values you used for tools, "
+        "models, and UI options and restore them next time."
+    )
+    keep_default = s.value("keep_settings_after_restart", True, type=bool)
+    cb_keep_settings.setChecked(keep_default)
+
+    # -- Diagnostic logging checkbox -------------------------------------------------
     cb_diag = QCheckBox("Enable diagnostic logging (restart to apply)")
-    cb_diag.setToolTip("Turn this off to disable FrameVision's background diagnostics / heartbeat logs.")
-
-    enabled_val = s.value("diag_probe_enabled", True, type=bool)
-    cb_diag.setChecked(enabled_val)
+    cb_diag.setToolTip(
+        "Turn this off to disable FrameVision's background diagnostics logs."
+    )
+    diag_default = s.value("diag_probe_enabled", True, type=bool)
+    cb_diag.setChecked(diag_default)
 
     # mirror value into config so headless/worker processes (no Qt) can read it
     try:
         from helpers.framevision_app import config as _cfg, save_config as _save
-        _cfg["diag_probe_enabled"] = bool(enabled_val)
+        _cfg["diag_probe_enabled"] = bool(diag_default)
         _save()
     except Exception:
         pass
 
-    def _on_diag_toggle(b):
+    # ---- shared visual helper: grey out when OFF ---------------------------------
+    def _sync_grey_state(chk: QCheckBox, is_on: bool):
+        # we tint text color when off (unchecked). when on, reset to theme default
+        if is_on:
+            chk.setStyleSheet("")
+        else:
+            chk.setStyleSheet("color: #666666;")
+
+    # initial grey states
+    _sync_grey_state(cb_clear_pyc, bool(clear_default))
+    _sync_grey_state(cb_tooltips, bool(tooltips_default))
+    _sync_grey_state(cb_keep_settings, bool(keep_default))
+    _sync_grey_state(cb_diag, bool(diag_default))
+
+    # ---- handlers + persistence ---------------------------------------------------
+    def _on_clear_pyc_toggle(b: bool):
+        s.setValue("clear_pyc_on_start", bool(b))
+        _sync_grey_state(cb_clear_pyc, bool(b))
+
+    def _on_tooltips_toggle(b: bool):
+        s.setValue("tooltips_enabled", bool(b))
+        try:
+            TooltipManager.set_enabled(bool(b))
+        except Exception:
+            pass
+        _sync_grey_state(cb_tooltips, bool(b))
+
+    def _on_keep_settings_toggle(b: bool):
+        s.setValue("keep_settings_after_restart", bool(b))
+        _sync_grey_state(cb_keep_settings, bool(b))
+
+    def _on_diag_toggle(b: bool):
         s.setValue("diag_probe_enabled", bool(b))
         try:
             from helpers.framevision_app import config as _cfg, save_config as _save
@@ -212,13 +279,75 @@ def _options_group(page: QWidget) -> QGroupBox:
             _save()
         except Exception:
             pass
+        _sync_grey_state(cb_diag, bool(b))
 
+    # connect signals
+    cb_clear_pyc.toggled.connect(lambda b: _on_clear_pyc_toggle(b))
+    cb_tooltips.toggled.connect(lambda b: _on_tooltips_toggle(b))
+    cb_keep_settings.toggled.connect(lambda b: _on_keep_settings_toggle(b))
     cb_diag.toggled.connect(lambda b: _on_diag_toggle(b))
 
+    # Add widgets to layout in the requested visual order:
+    # 1. Clear pycache
+    # 2. Tooltip visibility (NEW)
+    # 3. Keep settings after restart
+    # 4. Diagnostic logging
     v.addWidget(cb_clear_pyc)
+    v.addWidget(cb_tooltips)
     v.addWidget(cb_keep_settings)
     v.addWidget(cb_diag)
 
+    
+    # -- Emoji labels toggle --------------------------------------------------------
+    cb_emoji = QCheckBox("Emoji labels")
+    cb_emoji.setToolTip("Replace feature labels with emoji like 🔍 ⏱️ 📝 📸 🖌️ 🤖 ⏳ ⚙️/⚒️. "
+                        "Turn off if your system font renders emoji poorly.")
+    emoji_default = s.value("emoji_labels_enabled", False, type=bool)
+    cb_emoji.setChecked(emoji_default)
+    _sync_grey_state(cb_emoji, bool(emoji_default))
+
+    def _on_emoji_toggle(b: bool):
+        s.setValue("emoji_labels_enabled", bool(b))
+        _sync_grey_state(cb_emoji, bool(b))
+        try:
+            cb_emoji_tabs.setVisible(bool(b))
+
+            win = page.window()
+            if b:
+                apply_emoji_labels_globally(win)
+            else:
+                restore_emoji_labels_globally(win)
+        except Exception:
+            pass
+
+    cb_emoji.toggled.connect(lambda b: _on_emoji_toggle(b))
+    v.addWidget(cb_emoji)
+    # -- Emoji tabs: show labels + emojis option (dependent) ---------------------
+    cb_emoji_tabs = QCheckBox("Show labels with emojis on the tabs")
+    cb_emoji_tabs.setToolTip(
+        "When Emoji labels are enabled, show both the emoji and the text on tab titles."
+    )
+    emoji_tabs_default = s.value("emoji_tabs_show_labels", False, type=bool)
+    cb_emoji_tabs.setChecked(emoji_tabs_default)
+    _sync_grey_state(cb_emoji_tabs, bool(emoji_tabs_default))
+    cb_emoji_tabs.setVisible(bool(emoji_default))
+
+    def _on_emoji_tabs_toggle(b: bool):
+        s.setValue("emoji_tabs_show_labels", bool(b))
+        _sync_grey_state(cb_emoji_tabs, bool(b))
+        try:
+            win = page.window()
+            if cb_emoji.isChecked():
+                # Re-apply so tabs update between emoji-only and emoji+label
+                restore_emoji_labels_globally(win)
+                apply_emoji_labels_globally(win)
+        except Exception:
+            pass
+
+    cb_emoji_tabs.toggled.connect(lambda b: _on_emoji_tabs_toggle(b))
+    v.addWidget(cb_emoji_tabs)
+
+# -- Temperature units row -------------------------------------------------------
     row = QWidget(g)
     h2 = QHBoxLayout(row); h2.setContentsMargins(0,4,0,0); h2.setSpacing(8)
     h2.addWidget(QLabel("Temperature units:"))
@@ -440,6 +569,199 @@ def _logo_group(page: QWidget) -> QWidget:
 
     return g
 
+
+# === Emoji Labels (single-file implementation) ===========================================
+# Borderless emoji set & mappers (no boxed symbols). Replaces tab titles with emoji-only
+# and prefixes matching buttons/labels with an emoji. Restores originals when toggled off.
+_EMOJI_MAP = {
+    "down": "👇",
+    "selected": "👉",
+    "wards": "☝",
+    "eastereggs": "🕹️",
+    "framevision": "🍀️",
+    "upscale": "🧪",
+    "engine": "🚀",
+    "interpolator": "⏱️",
+    "model": "🧩️",
+    "cancel": "❌️",
+    "describer": "📝",
+    "describe": "📝",
+    "folder": "🗂️",
+    "batch": "📦",
+    "info": "💡",
+    "txt2img": "📸",
+    "txt to img": "📸",
+    "running": "🏃️",
+    "pending": "💤️",
+    "background": "🖌️",
+    "preset": "💾️",
+    "inpaint": "💫",
+    "ptofile": "🧍",
+    "queue": "⏳",
+    "settings": "️⚙️",
+    "tools": "🧱",
+    "txttoimg": "📸",
+    "copy": "🧬",
+    "preview": "👁️",
+    "texttoimg": "📸",
+    "file": "📂",
+    "rifefps": "⏱️",
+    "rife fps": "⏱️",
+    "cpu": "⚡️",
+    "memory": "🧮",
+    "askframie": "👽",
+    "failed": "❌️",
+    "finished": "🎉",
+    "refresh": "🌀",
+    "current": "🧲️",
+    "reset": "♻️",
+    "Browse": "🗂",
+    "undo": "↶",
+    "save": "🗃️",
+    "vibevoice": "🎙️",
+    "profile": "🎭️",
+    "units": "🌤️",
+    "theme": "🌈️",
+    "overlay": "💠️",
+    "update": "🌟",
+    "East": "🌟",
+}
+def _canon_text_for_emoji(s: str) -> str:
+    import re as _re
+    s = (s or "").lower()
+    s = _re.sub(r"[\s\-_]+", "", s)
+    s = _re.sub(r"[^a-z0-9]+", "", s)
+    return s
+def _emoji_for_text(s: str) -> str | None:
+    c = _canon_text_for_emoji(s)
+    if c in _EMOJI_MAP:
+        return _EMOJI_MAP[c]
+    # partial contains — check longer keys first to avoid "chat" vs "chatbot" mismatches
+    for k in sorted(_EMOJI_MAP.keys(), key=len, reverse=True):
+        if k in c:
+            return _EMOJI_MAP[k]
+    return None
+
+def _emoji_store_tab_orig(tabs: QTabWidget, idx: int, text: str) -> None:
+    try:
+        store = tabs.property("emoji_orig_tab_texts") or {}
+        if int(idx) not in store:
+            store[int(idx)] = text
+            tabs.setProperty("emoji_orig_tab_texts", store)
+    except Exception:
+        pass
+def _emoji_restore_tabs(tabs: QTabWidget) -> None:
+    try:
+        store = tabs.property("emoji_orig_tab_texts") or {}
+        for i, txt in list(store.items()):
+            try:
+                tabs.setTabText(int(i), str(txt))
+            except Exception:
+                pass
+        tabs.setProperty("emoji_orig_tab_texts", {})
+    except Exception:
+        pass
+def _emoji_store_widget_orig(w: QWidget, text: str) -> None:
+    try:
+        if not w.property("emoji_orig_text"):
+            w.setProperty("emoji_orig_text", text)
+    except Exception:
+        pass
+def _emoji_restore_widgets(root: QWidget) -> None:
+    for cls in (QAbstractButton, QPushButton, QToolButton, QLabel):
+        for w in root.findChildren(cls):
+            try:
+                orig = w.property("emoji_orig_text")
+                if orig:
+                    w.setText(str(orig))
+                    w.setProperty("emoji_orig_text", None)
+            except Exception:
+                pass
+
+def apply_emoji_labels_globally(root: QWidget) -> None:
+    """Idempotently apply emoji label replacements across the app."""
+    if root is None:
+        return
+    # Tabs: emoji or emoji+label depending on setting
+    show_labels = _emoji_tabs_show_labels_qsettings()
+    for tabs in root.findChildren(QTabWidget):
+        try:
+            count = tabs.count()
+        except Exception:
+            count = 0
+        for i in range(count):
+            try:
+                old = tabs.tabText(i) or ""
+            except Exception:
+                continue
+            e = _emoji_for_text(old)
+            if not e:
+                continue
+            _emoji_store_tab_orig(tabs, i, old)
+            try:
+                new_txt = f"{e} {old}" if show_labels else e
+                tabs.setTabText(i, new_txt)
+            except Exception:
+                pass
+    # Buttons / toolbuttons / labels: prefix emoji + space
+    for cls in (QAbstractButton, QPushButton, QToolButton, QLabel):
+        for w in root.findChildren(cls):
+            try:
+                old = w.text() or ""
+            except Exception:
+                continue
+            e = _emoji_for_text(old)
+            if not e:
+                continue
+            _emoji_store_widget_orig(w, old)
+            if not old.startswith(e):
+                try:
+                    w.setText(f"{e} {old}")
+                except Exception:
+                    pass
+
+def restore_emoji_labels_globally(root: QWidget) -> None:
+    """Restore original labels for tabs/buttons/labels that were modified."""
+    if root is None:
+        return
+    for tabs in root.findChildren(QTabWidget):
+        _emoji_restore_tabs(tabs)
+    _emoji_restore_widgets(root)
+
+def _emoji_enabled_qsettings() -> bool:
+    try:
+        s = QSettings("FrameVision","FrameVision")
+        return bool(s.value("emoji_labels_enabled", False, type=bool))
+    except Exception:
+        return False
+def _emoji_set_enabled_qsettings(val: bool) -> None:
+    try:
+        s = QSettings("FrameVision","FrameVision")
+        s.setValue("emoji_labels_enabled", bool(val))
+    except Exception:
+        pass
+
+
+
+def _emoji_tabs_show_labels_qsettings() -> bool:
+    """Return whether tabs should show both emoji and label text when emoji mode is on."""
+    try:
+        s = QSettings("FrameVision","FrameVision")
+        return bool(s.value("emoji_tabs_show_labels", False, type=bool))
+    except Exception:
+        return False
+def _apply_emoji_on_start(root: QWidget) -> None:
+    """Auto-apply if enabled; called from install_settings_tab once UI exists."""
+    try:
+        if _emoji_enabled_qsettings():
+            # slight delay: ensure tabs/buttons are live
+            def _go():
+                apply_emoji_labels_globally(root)
+            QTimer.singleShot(50, _go)
+    except Exception:
+        pass
+# ==========================================================================================
+
 # ---- public installer --------------------------------------------------------------------
 def install_settings_tab(main_window: QWidget) -> None:
     try:
@@ -473,10 +795,15 @@ def install_settings_tab(main_window: QWidget) -> None:
         lay.addWidget(_logo_group(page))
         lay.addStretch(1)
 
-        # Minimal wiring: delegate Easter Eggs UI injection + tracker to settings_more
+        
+        # Auto-apply emoji labels if previously enabled
+        try:
+            _apply_emoji_on_start(main_window)
+        except Exception:
+            pass
+# Minimal wiring: delegate Easter Eggs UI injection + tracker to settings_more
         try:
             from helpers import settings_more as _sm
-            # ensure tracker & inject the bottom row after build
             QtCore.QTimer.singleShot(100, _sm.ensure_usage_tracker)
             QtCore.QTimer.singleShot(200, _sm.install_social_bottom_runtime)
         except Exception:

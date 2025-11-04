@@ -61,12 +61,13 @@ except Exception:
     pass
 AUDIO_EXTS = {'.mp3', '.wav', '.flac', '.m4a', '.aac', '.ogg', '.opus', '.wma', '.aif', '.aiff'}
 
-# ---------------- initial one-time scroll hack ----------------
-# Workaround: on app start, the first audio track will seek forward by 100ms
-# right after starting at 00:00. This mitigates a freeze when loading another
-# track/video before any user scroll occurs.
-_INITIAL_SCROLL_ARMED = False
-_INITIAL_SCROLL_DONE = False
+# ---------------- initial one-time scroll hack (DISABLED) ----------------
+# Original behavior: on first audio track after app start, seek forward ~100-150ms.
+# We are turning this OFF so playback starts at true 0ms and never auto-seeks.
+_INITIAL_SCROLL_ARMED = True
+_INITIAL_SCROLL_DONE = True
+
+
 
 
 # ---------------- ffmpeg helpers ----------------
@@ -688,18 +689,27 @@ class HybridAnalyzer(QObject):
                     pass
         except Exception:
             pass
+
+        # Decide analysis strategy based on track length.
+        # Short (<10 min): full preanalysis (smooth visuals).
+        # Long (>=10 min): JIT window only (lower CPU), no full preanalysis.
+        self._is_long_track = False
         try:
-            LONG_TRACK_MS = 20 * 60 * 1000
+            LONG_TRACK_MS = 10 * 60 * 1000
             dur_ms = 0
             try:
                 dur_ms = _probe_duration_ms(Path(path))
             except Exception:
                 dur_ms = 0
-            if dur_ms >= LONG_TRACK_MS:
-                # Skip preanalysis for long tracks; rely on live probe to avoid background CPU
+
+            self._is_long_track = (dur_ms >= LONG_TRACK_MS)
+
+            if self._is_long_track:
+                # Skip full preanalysis for long tracks; rely on lightweight JIT / live probe
                 self._worker = None
                 self._times, self._bands, self._rms = [], [], []
             else:
+                # Short track: precompute entire analysis up front for perfectly stable visuals
                 self._worker = PreAnalyzer(path, bands=self.bands, hop_ms=self._hop_ms, parent=self)
                 try:
                     self._worker.ready.connect(self._on_ready, getattr(Qt, 'UniqueConnection', 0))
@@ -709,15 +719,15 @@ class HybridAnalyzer(QObject):
         except Exception:
             pass
 
-        # JIT: prime small window **without** cancelling full preanalysis
+        # Prep the rolling JIT window (only needed for long tracks)
         try:
             self._seg_cache.clear()
         except Exception:
             self._seg_cache = {}
         self._cancel_window()
         self.path = Path(path)
-        self._kick_window(0)
-
+        if getattr(self, '_is_long_track', False):
+            self._kick_window(0)
 
     def start(self):
         self._timer.start(90)
@@ -929,8 +939,6 @@ class HybridAnalyzer(QObject):
                 pos = int(getattr(self.player, 'position', lambda: 0)() or 0)
                 if times:
                     idx = max(0, min(len(times)-1, int((pos - start_ms) / max(1, self._hop_ms))))
-                    self.levelsReady.emit(bands[idx])
-                    self.rmsReady.emit(rms[idx])
             except Exception:
                 pass
             finally:
@@ -2302,9 +2310,9 @@ class MusicRuntime(QObject):
         self._was_quiet = False
         self._return_cooldown_until_ms = 0
         # tunables (no UI): tweak if needed
-        self._silence_gate = 0.20  # RMS threshold for 'quiet'
-        self._silence_min_ms = 350  # how long it must stay below gate
-        self._return_cooldown_ms = 2100  # min gap between return-triggered switches
+        self._silence_gate = 0.05  # RMS threshold for 'quiet'
+        self._silence_min_ms = 250  # how long it must stay below gate
+        self._return_cooldown_ms = 3100  # min gap between return-triggered switches
 
     
         # crossfade state
@@ -2508,7 +2516,7 @@ class MusicRuntime(QObject):
                 import time as _time
                 pos = int(_time.time() * 1000)
             gate = float(getattr(self, "_silence_gate", 0.05))
-            min_ms = int(getattr(self, "_silence_min_ms", 750))
+            min_ms = int(getattr(self, "_silence_min_ms", 250))
             if float(rms) < gate:
                 if getattr(self, "_quiet_since_ms", None) is None:
                     self._quiet_since_ms = pos
@@ -3094,45 +3102,6 @@ def wire_to_videopane(VideoPaneClass):
             except Exception:
                 pass
             rt.start(path_for_analysis=p)  # kick off hybrid preanalysis
-            # one-time 100ms forward scroll on the very first audio after app opens
-            try:
-                from PySide6.QtCore import QTimer
-                global _INITIAL_SCROLL_ARMED, _INITIAL_SCROLL_DONE
-                if not _INITIAL_SCROLL_DONE and not _INITIAL_SCROLL_ARMED:
-                    _INITIAL_SCROLL_ARMED = True
-                    def _arm_scroll():
-                        # wait until duration is known to avoid a no-op seek
-                        try:
-                            pl = getattr(self, 'player', None)
-                            dur = int(pl.duration()) if pl else 0
-                        except Exception:
-                            dur = 0
-                        if dur <= 0:
-                            QTimer.singleShot(20, _arm_scroll)
-                            return
-                        # start at zero then nudge forward a tiny bit later
-                        try:
-                            pl.setPosition(0)
-                        except Exception:
-                            pass
-                        def _nudge():
-                            try:
-                                d = int(pl.duration()) if pl else 0
-                            except Exception:
-                                d = 0
-                            tgt = 150
-                            if d > 0:
-                                tgt = min(150, max(0, d - 2))
-                            try:
-                                pl.setPosition(tgt)
-                            except Exception:
-                                pass
-                            # mark done so we never do this again
-                            globals()['_INITIAL_SCROLL_DONE'] = True
-                        QTimer.singleShot(50, _nudge)
-                    QTimer.singleShot(60, _arm_scroll)
-            except Exception:
-                pass
             return result
         else:
             # Soft suspend overlay/runtime when opening non-audio (image/video/gif/etc)

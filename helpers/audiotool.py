@@ -1,7 +1,8 @@
-
 # helpers/audiotool.py — Audio tool with waveform preview.
-# Now with a smart fallback that auto-adds the base Python's site-packages if pyqtgraph import fails in a venv.
-import os, re, sys, subprocess, tempfile, wave
+# Now with a smart fallback that auto-adds the base Python's site-packages if pyqtgraph import fails in a venv,
+# and beginner-friendly tooltips for new users.
+
+import os, re, sys, subprocess, tempfile, wave, json
 from pathlib import Path
 
 from PySide6.QtCore import Qt, QSettings
@@ -59,6 +60,35 @@ except Exception:
     ROOT = _Path('.').resolve()
     BASE = ROOT
     OUT_VIDEOS = BASE/'output'/'video'
+
+def _tip(key:str, default:str) -> str:
+    """
+    Fetch a human-friendly tooltip string.
+
+    We first try to read a shared assets/tooltips.json so the app can
+    centralize wording. If that fails (for example older builds without
+    that file), we gracefully fall back to the local default text.
+
+    key: small string like "audiotool.btn_add"
+    default: fallback text shown if key isn't found.
+    """
+    global _TOOLTIP_MAP
+    try:
+        _TOOLTIP_MAP
+    except NameError:
+        _TOOLTIP_MAP = None
+    if _TOOLTIP_MAP is None:
+        _TOOLTIP_MAP = {}
+        try:
+            assets_dir = ROOT / "assets"
+            with open(assets_dir / "tooltips.json", "r", encoding="utf-8") as f:
+                import json as _json
+                maybe = _json.load(f)
+                if isinstance(maybe, dict):
+                    _TOOLTIP_MAP.update(maybe)
+        except Exception:
+            pass
+    return _TOOLTIP_MAP.get(key, default)
 
 def _candidate_ff_bins(settings:QSettings):
     override = settings.value("ffmpeg_path", "")
@@ -140,6 +170,16 @@ class _Waveform(QWidget):
             self._label.setAlignment(Qt.AlignCenter)
             self._layout.addWidget(self._label)
             self.plot = None
+            # Tooltip for when waveform isn't available
+            try:
+                self.setToolTip(_tip(
+                    "audiotool.waveform_disabled",
+                    "Waveform preview\\n\\nShows a visual of the selected audio file so you can spot silence and beats. "
+                    "It's disabled right now because the graph library (pyqtgraph) is missing, "
+                    "but you can still add audio and export normally."
+                ))
+            except Exception:
+                pass
         else:
             self.plot = _pg.PlotWidget()
             try:
@@ -153,6 +193,14 @@ class _Waveform(QWidget):
                 pass
             self._curve = self.plot.plot([], [])
             self._layout.addWidget(self.plot)
+            try:
+                self.setToolTip(_tip(
+                    "audiotool.waveform",
+                    "Waveform preview\\n\\nThis mini-graph lets you SEE the selected audio (loud parts, quiet parts, "
+                    "silences). It's only a preview: changing it here will NOT edit the sound."
+                ))
+            except Exception:
+                pass
 
     def clear(self):
         if getattr(self, "_curve", None):
@@ -209,10 +257,54 @@ def install_audio_tool(pane, sec_audio):
         audio_list.setMinimumHeight(_row_h * 4 + 12)
     except Exception:
         pass
+    try:
+        audio_list.setToolTip(_tip(
+            "audiotool.audio_list",
+            "Step 1: your audio files (music, voiceover, etc.) that will go into the video.\\n\\n"
+            "Click an item to preview its waveform and tweak settings. Use ↑ / ↓ to reorder. "
+            "The first item is chosen by default in 'Replace' mode."
+        ))
+    except Exception:
+        pass
+
     btn_add = QToolButton(); btn_add.setText("Add…")
+    try:
+        btn_add.setToolTip(_tip(
+            "audiotool.btn_add",
+            "Add a music / voiceover file (MP3, WAV, etc.) to the list.\\n\\n"
+            "This does NOT copy or move the file on disk; it just tells FrameVision to use it."
+        ))
+    except Exception:
+        pass
+
     btn_remove = QToolButton(); btn_remove.setText("Remove")
+    try:
+        btn_remove.setToolTip(_tip(
+            "audiotool.btn_remove",
+            "Remove the selected file from the list.\\n\\n"
+            "Your original file on disk is untouched."
+        ))
+    except Exception:
+        pass
+
     btn_up = QToolButton(); btn_up.setText("↑")
+    try:
+        btn_up.setToolTip(_tip(
+            "audiotool.btn_up",
+            "Move the selected audio UP in the list.\\n\\n"
+            "Tip: The top item is used automatically if you choose 'Replace with selected track'."
+        ))
+    except Exception:
+        pass
+
     btn_down = QToolButton(); btn_down.setText("↓")
+    try:
+        btn_down.setToolTip(_tip(
+            "audiotool.btn_down",
+            "Move the selected audio DOWN in the list."
+        ))
+    except Exception:
+        pass
 
     waveform = _Waveform()
 
@@ -220,39 +312,157 @@ def install_audio_tool(pane, sec_audio):
     rb_replace = QRadioButton("Replace with selected track")
     rb_mix = QRadioButton("Mix added tracks")
     cb_include_original = QCheckBox("Include original video audio in mix")
+    try:
+        rb_mix.setToolTip(_tip(
+            "audiotool.mode_mix",
+            "Blend all added audio files together.\\n\\n"
+            "Great for background music under dialogue or voiceover."
+        ))
+        cb_include_original.setToolTip(_tip(
+            "audiotool.include_original",
+            "Keep the video's original audio (camera voice / game sounds) in the final result.\\n\\n"
+            "Turn this OFF if you want only the new music / voiceover."
+        ))
+        rb_replace.setToolTip(_tip(
+            "audiotool.mode_replace",
+            "Throw away the video's original audio and use ONLY one selected track from the list "
+            "(full soundtrack swap)."
+        ))
+    except Exception:
+        pass
     rb_mix.setChecked(True)
 
     # Controls
     vol_slider = QSlider(Qt.Horizontal); vol_slider.setRange(0, 300); vol_slider.setValue(100)
     vol_label = QLabel("Volume: 1.00x")
+    try:
+        vol_slider.setToolTip(_tip(
+            "audiotool.volume",
+            "Overall loudness for the ADDED audio tracks.\\n\\n"
+            "1.00x = original volume. Lower to duck music under speech, raise to boost it."
+        ))
+        vol_label.setToolTip(_tip(
+            "audiotool.volume",
+            "Overall loudness for the ADDED audio tracks.\\n\\n"
+            "1.00x = original volume. Lower to duck music under speech, raise to boost it."
+        ))
+    except Exception:
+        pass
     vol_slider.valueChanged.connect(lambda v: vol_label.setText(f"Volume: {v/100.0:.2f}x"))
 
     spin_fadein = QSpinBox(); spin_fadein.setRange(0, 3600); spin_fadein.setSuffix(" s")
     spin_fadeout_st = QSpinBox(); spin_fadeout_st.setRange(0, 24*3600); spin_fadeout_st.setSuffix(" s")
     spin_fadeout_d = QSpinBox(); spin_fadeout_d.setRange(0, 3600); spin_fadeout_d.setSuffix(" s")
+    try:
+        spin_fadein.setToolTip(_tip(
+            "audiotool.fadein",
+            "Fade in (seconds): how long the added audio takes to go from silent to full volume at the start."
+        ))
+        spin_fadeout_st.setToolTip(_tip(
+            "audiotool.fadeout_start",
+            "Fade out start (seconds): when the fade-out should BEGIN in the added audio timeline."
+        ))
+        spin_fadeout_d.setToolTip(_tip(
+            "audiotool.fadeout_dur",
+            "Fade out dur (seconds): how long the fade-out lasts once it starts."
+        ))
+    except Exception:
+        pass
 
     edit_ss = QLineEdit(); edit_ss.setPlaceholderText("start (e.g. 5 or 0:05)")
     edit_to = QLineEdit(); edit_to.setPlaceholderText("end (e.g. 1:00)")
     spin_delay = QSpinBox(); spin_delay.setRange(0, 24*3600*1000); spin_delay.setSuffix(" ms")
     cb_loudnorm = QCheckBox("Normalize (EBU R128 loudnorm)")
     fmt = QComboBox(); fmt.addItems(["mp4", "mkv", "mov", "webm"])
+    try:
+        edit_ss.setToolTip(_tip(
+            "audiotool.trim_start",
+            "Trim start: begin using the audio from this time.\\nExamples: 5 or 0:05.\\n"
+            "Use this to skip any silence at the beginning of the song."
+        ))
+        edit_to.setToolTip(_tip(
+            "audiotool.trim_end",
+            "Trim end: stop using the audio after this time.\\nLeave blank to play until the file ends."
+        ))
+        spin_delay.setToolTip(_tip(
+            "audiotool.delay_ms",
+            "Delay start (ms): wait this long before the added audio begins.\\n"
+            "Example: 1000 = start music 1 second after the video begins."
+        ))
+        cb_loudnorm.setToolTip(_tip(
+            "audiotool.loudnorm",
+            "Normalize loudness: automatically level volumes so the result isn't too loud or too quiet.\\n"
+            "Recommended if you mix multiple clips with different volumes."
+        ))
+        fmt.setToolTip(_tip(
+            "audiotool.format",
+            "Output file type for the new video.\\nMP4 works almost everywhere.\\n"
+            "WEBM is smaller but not ideal for some editors."
+        ))
+    except Exception:
+        pass
 
     # ffmpeg/ffprobe override
     edit_ffpath = QLineEdit(); edit_ffpath.setPlaceholderText("ffmpeg path (optional)")
     btn_pick_ff = QToolButton(); btn_pick_ff.setText("…")
     edit_fbpath = QLineEdit(); edit_fbpath.setPlaceholderText("ffprobe path (optional)")
     btn_pick_fb = QToolButton(); btn_pick_fb.setText("…")
+    try:
+        edit_ffpath.setToolTip(_tip(
+            "audiotool.ffmpeg_override",
+            "Advanced: manually choose your ffmpeg.exe (the video+audio engine).\\n"
+            "Leave this blank if everything works."
+        ))
+        btn_pick_ff.setToolTip(_tip(
+            "audiotool.ffmpeg_browse",
+            "Browse for ffmpeg.exe manually.\\nMost people don't need this."
+        ))
+        edit_fbpath.setToolTip(_tip(
+            "audiotool.ffprobe_override",
+            "Advanced: manually choose your ffprobe.exe (media inspector).\\n"
+            "Leave this blank if everything works."
+        ))
+        btn_pick_fb.setToolTip(_tip(
+            "audiotool.ffprobe_browse",
+            "Browse for ffprobe.exe manually.\\nMost people don't need this."
+        ))
+    except Exception:
+        pass
 
     btn_audio = QPushButton("Add Audio to Video")
+    try:
+        btn_audio.setToolTip(_tip(
+            "audiotool.render",
+            "Final step: create a NEW video file with the audio settings above.\\n\\n"
+            "Your original video is never overwritten."
+        ))
+    except Exception:
+        pass
 
     # Grouping
     grp_files = QGroupBox("Audio files")
+    try:
+        grp_files.setToolTip(_tip(
+            "audiotool.grp_files",
+            "Step 1: Add one or more audio files that you want in your final video "
+            "(music bed, voiceover, etc.)."
+        ))
+    except Exception:
+        pass
     lf = QVBoxLayout(grp_files)
     row_files = QHBoxLayout()
     row_files.addWidget(btn_add); row_files.addWidget(btn_remove); row_files.addWidget(btn_up); row_files.addWidget(btn_down); row_files.addStretch(1)
     lf.addWidget(audio_list); lf.addLayout(row_files)
 
     grp_wave = QGroupBox("Waveform preview")
+    try:
+        grp_wave.setToolTip(_tip(
+            "audiotool.grp_wave",
+            "Step 2: Preview the currently selected audio as a waveform so you can spot "
+            "silence, drops and beats."
+        ))
+    except Exception:
+        pass
     lw = QVBoxLayout(grp_wave); lw.addWidget(waveform)
     # Keep waveform from eating too much vertical space
     try:
@@ -261,6 +471,15 @@ def install_audio_tool(pane, sec_audio):
         pass
 
     grp_mode = QGroupBox("Mode")
+    try:
+        grp_mode.setToolTip(_tip(
+            "audiotool.grp_mode",
+            "Step 3: Tell FrameVision how to use the audio:\\n"
+            "• Mix added tracks (background music under dialogue)\\n"
+            "• Replace with selected track (full soundtrack swap)"
+        ))
+    except Exception:
+        pass
     lm = QVBoxLayout(grp_mode); lm.addWidget(rb_mix); lm.addWidget(cb_include_original); lm.addWidget(rb_replace)
 
     form = QFormLayout()
@@ -277,6 +496,14 @@ def install_audio_tool(pane, sec_audio):
     row_ff = QHBoxLayout(); row_ff.addWidget(edit_ffpath); row_ff.addWidget(btn_pick_ff)
     row_fb = QHBoxLayout(); row_fb.addWidget(edit_fbpath); row_fb.addWidget(btn_pick_fb)
     ffgrp = QGroupBox("Advanced: ffmpeg/ffprobe location (leave blank to auto-detect)")
+    try:
+        ffgrp.setToolTip(_tip(
+            "audiotool.ffgrp",
+            "Advanced only: If FrameVision can't auto-detect ffmpeg / ffprobe, point to them here.\\n"
+            "Most people can ignore this section."
+        ))
+    except Exception:
+        pass
     lf2 = QVBoxLayout(ffgrp); lf2.addLayout(row_ff); lf2.addLayout(row_fb)
     try:
         ffgrp.setVisible(False)
@@ -311,6 +538,17 @@ def install_audio_tool(pane, sec_audio):
 
     lay_audio = QVBoxLayout(); lay_audio.addWidget(container)
     sec_audio.setContentLayout(lay_audio)
+    try:
+        sec_audio.setToolTip(_tip(
+            "audiotool.section",
+            "Audio Tool workflow:\\n"
+            "1. Add your music / voiceover.\\n"
+            "2. Pick Mix or Replace.\\n"
+            "3. Adjust volume, fades, etc.\\n"
+            "4. Click 'Add Audio to Video' to render a NEW file."
+        ))
+    except Exception:
+        pass
 
     # Settings
     settings = QSettings("FrameVision", "AudioTool")

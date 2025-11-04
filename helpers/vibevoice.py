@@ -172,13 +172,13 @@ def _is_exec(p: Path) -> bool:
 
 
 def _is_windows_exec(p: Path) -> bool:
-    if os.name == "nt":
+    if _os.name == "nt":
         return p.suffix.lower() in (".exe", ".bat", ".cmd") and _can_run(p)
     return False
 
 
 def _is_posix_exec(p: Path) -> bool:
-    if os.name != "nt":
+    if _os.name != "nt":
         return _can_run(p)
     return False
 
@@ -391,28 +391,93 @@ def vram_snapshot(logger: logging.Logger) -> Dict[str, Any]:
 
 def import_vibevoice(logger: logging.Logger):
     """
-    Import the actual VibeVoice 1.5B API. This code tries a few typical module names.
-    If import fails, exit with code 5.
+    Import the actual VibeVoice API. Tries vendor paths first (project-local),
+    then common package names. If all fail, exits with code 5.
     """
+    # Prepend vendor paths (project local) so we don't need to pip-install
+    try:
+        root = Path(__file__).resolve().parents[1]
+        for rel in ("third_party/vibevoice", "external/vibevoice", "deps/vibevoice"):
+            p = (root / rel).resolve()
+            if p.exists() and p.is_dir():
+                sp = str(p)
+                if sp not in sys.path:
+                    sys.path.insert(0, sp)
+                    try:
+                        logger.debug(f"Added vendor path: {sp}")
+                    except Exception:
+                        pass
+    except Exception:
+        pass
+
     candidates = [
         "vibevoice",
         "vibevoice_tts",
         "vibevoice_1_5b",
         "VibeVoice",
     ]
+    here = Path(__file__).resolve()
     last_err = None
     for name in candidates:
         try:
             mod = __import__(name, fromlist=["*"])
+            # Self-import guard: skip if this file got imported as 'vibevoice'
+            try:
+                mod_file = Path(getattr(mod, "__file__", "") or "").resolve()
+                if mod_file == here:
+                    logger.debug(f"Skipped self-imported module '{name}' at {mod_file}")
+                    continue
+            except Exception:
+                pass
             logger.info(f"Imported VibeVoice module: {name}")
+            try:
+                logger.debug(f"VibeVoice module path: {mod.__file__}")
+            except Exception:
+                pass
             return mod
         except Exception as e:
             last_err = e
+            continue
     logger.error("VibeVoice 1.5B API not found; install locally and place weights under --model-root.")
     if last_err:
         logger.debug(f"Last import error: {last_err}")
     sys.exit(EXIT_IMPORT_FAIL)
 
+def _ensure_top_level_api(vv_mod: Any, logger: logging.Logger):
+    """
+    If the imported 'vibevoice' package doesn't expose VibeVoiceTTS/from_pretrained
+    at the top level, add thin wrappers from common submodules.
+    """
+    try:
+        had_vvt = hasattr(vv_mod, "VibeVoiceTTS")
+        had_fp  = hasattr(vv_mod, "from_pretrained")
+        # Try common submodule
+        tts_mod = None
+        if not had_vvt or not had_fp:
+            try:
+                import importlib
+                tts_mod = importlib.import_module(vv_mod.__name__ + ".tts")
+            except Exception:
+                tts_mod = None
+        if not had_vvt and tts_mod and hasattr(tts_mod, "VibeVoiceTTS"):
+            setattr(vv_mod, "VibeVoiceTTS", getattr(tts_mod, "VibeVoiceTTS"))
+            logger.debug("Added alias: vibevoice.VibeVoiceTTS -> vibevoice.tts.VibeVoiceTTS")
+        if not hasattr(vv_mod, "from_pretrained") and hasattr(vv_mod, "VibeVoiceTTS") and hasattr(vv_mod.VibeVoiceTTS, "from_pretrained"):
+            def _vv_from_pretrained(pretrained_model_name_or_path, torch_dtype=None, device_map=None,
+                                    local_files_only=True, cache_dir=None, attn_backend=None):
+                return vv_mod.VibeVoiceTTS.from_pretrained(
+                    pretrained_model_name_or_path=pretrained_model_name_or_path,
+                    torch_dtype=torch_dtype,
+                    device_map=device_map,
+                    local_files_only=local_files_only,
+                    cache_dir=cache_dir,
+                    attn_backend=attn_backend,
+                )
+            setattr(vv_mod, "from_pretrained", _vv_from_pretrained)
+            logger.debug("Added wrapper: vibevoice.from_pretrained(...)")
+    except Exception as e:
+        logger.debug(f"Top-level API shim skipped: {e}")
+    return vv_mod
 
 def load_model(vv_mod,
                model_dir: Path,
@@ -422,89 +487,199 @@ def load_model(vv_mod,
                cache_dir: Path,
                logger: logging.Logger):
     """
-    Load VibeVoice model from local files only.
-    Honor attention backend and dtype/device preferences.
-    NOTE: The exact API depends on the VibeVoice package; we attempt common patterns.
+    Prefer TTS-capable classes (with synth methods) over base PreTrainedModel.
+    Auto-discover across submodules and validate capabilities before accepting.
     """
-    if not model_dir.exists():
-        logger.error(f"Model directory not found: {model_dir}")
-        sys.exit(EXIT_MISSING_WEIGHTS)
+    import importlib, inspect, pkgutil
 
-    if torch is None:
-        logger.error("torch is required to run the model.")
-        sys.exit(EXIT_IMPORT_FAIL)
+    def _is_modelish(obj):
+        return hasattr(obj, "to") or hasattr(obj, "eval")
 
-    # Attention backend handling
-    attn_backend = "sdpa"
-    if attn == "flashattn":
-        try:
-            __import__("flash_attn")  # probe availability
-            attn_backend = "flashattn"
-        except Exception:
-            logger.warning("flash-attn not available; falling back to sdpa.")
-            attn_backend = "sdpa"
+    def _has_tts_api(obj):
+        # Accept if any common TTS entrypoint exists
+        for name in [
+            "tts", "speak", "synthesize", "synthesise", "infer",
+            "generate_audio", "generate_wav", "generate_speech",
+            "text_to_speech", "forward_tts"
+        ]:
+            if hasattr(obj, name) and callable(getattr(obj, name)):
+                return True
+        return False
 
     dtype = dtype_from_str(dtype_str)
     dev = torch.device(device)
 
-    # Attempt to load using common hooks.
     model = None
-    err = None
+    last_err = None
+
+    # 1) Known entrypoints (fast path) — but require TTS API
     try_order = [
         ("VibeVoiceTTS.from_pretrained", lambda: getattr(vv_mod, "VibeVoiceTTS").from_pretrained(
             pretrained_model_name_or_path=str(model_dir),
-            torch_dtype=dtype,
+            dtype=dtype,  # use new Transformers kw
             device_map=None,
             local_files_only=True,
             cache_dir=str(cache_dir),
-            attn_backend=attn_backend,
+            attn_backend=attn,
         )),
         ("VibeVoiceTTS.load", lambda: getattr(vv_mod, "VibeVoiceTTS").load(
             model_dir=str(model_dir),
             dtype=dtype_str,
             device=device,
-            attn=attn_backend,
+            attn=attn,
         )),
         ("from_pretrained", lambda: getattr(vv_mod, "from_pretrained")(
-            str(model_dir),
-            torch_dtype=dtype,
+            pretrained_model_name_or_path=str(model_dir),
+            dtype=dtype,
+            device_map=None,
             local_files_only=True,
+            cache_dir=str(cache_dir),
+            attn_backend=attn,
+        )),
+        ("load_pretrained", lambda: getattr(vv_mod, "load_pretrained")(
+            model_dir=str(model_dir),
+            dtype=dtype_str,
+            device=device,
+            attn=attn,
+        )),
+        ("load_tts", lambda: getattr(vv_mod, "load_tts")(
+            model_dir=str(model_dir),
+            dtype=dtype_str,
+            device=device,
+            attn=attn,
             cache_dir=str(cache_dir),
         )),
     ]
     for label, fn in try_order:
         try:
-            model = fn()
-            logging.getLogger(APP_NAME).info(f"Model loaded via {label}")
-            break
-        except Exception as e:
-            err = e
-            continue
-    if model is None:
-        logging.getLogger(APP_NAME).error(f"Failed to load VibeVoice model from {model_dir}")
-        if err:
-            logging.getLogger(APP_NAME).debug(f"Load error: {err}")
-        sys.exit(EXIT_MISSING_WEIGHTS)
-
-    # Move to device / dtype if needed
-    try:
-        if hasattr(model, "to"):
-            model = model.to(dev)
-    except Exception:
-        pass
-
-    # Apply attention backend if the model exposes a setter
-    for attr in ("set_attention_backend", "set_attn_backend", "set_attn"):
-        if hasattr(model, attr):
-            try:
-                getattr(model, attr)(attn_backend)
+            candidate = fn()
+            if not _is_modelish(candidate):
+                raise TypeError(f"{label} returned non-model: {type(candidate).__name__}")
+            # If it has a clear TTS API, accept immediately
+            if _has_tts_api(candidate):
+                model = candidate
+                logger.info(f"Model loaded via {label}")
                 break
-            except Exception:
-                pass
+            else:
+                # Keep as fallback, but keep searching for a better TTS-capable class
+                if model is None:
+                    model = candidate
+                    logger.info(f"Loaded base model via {label}; searching for TTS-capable wrapper...")
+        except Exception as e:
+            last_err = e
+            continue
 
-    return model
+    # 2) If we don't yet have a TTS-capable model, auto-discover across submodules
+    if model is None or not _has_tts_api(model):
+        logger.debug("Auto-discovering TTS-capable loader in vibevoice package...")
+        candidates = []
 
+        def add_candidate(score, label, maker):
+            candidates.append((score, label, maker))
 
+        # Top-level classes
+        try:
+            for name, obj in inspect.getmembers(vv_mod):
+                if inspect.isclass(obj):
+                    n = name.lower()
+                    score = 0
+                    if "tts" in n: score += 5
+                    if "voice" in n or "model" in n: score += 2
+                    has_fp = hasattr(obj, "from_pretrained")
+                    has_ld = hasattr(obj, "load")
+                    if has_fp:
+                        add_candidate(score + 2, f"{vv_mod.__name__}.{name}.from_pretrained",
+                                      lambda o=obj: o.from_pretrained(
+                                          pretrained_model_name_or_path=str(model_dir),
+                                          dtype=dtype,
+                                          device_map=None,
+                                          local_files_only=True,
+                                          cache_dir=str(cache_dir),
+                                          attn_backend=attn))
+                    if has_ld:
+                        add_candidate(score + 1, f"{vv_mod.__name__}.{name}.load",
+                                      lambda o=obj: o.load(
+                                          model_dir=str(model_dir),
+                                          dtype=dtype_str,
+                                          device=device,
+                                          attn=attn))
+        except Exception as e:
+            last_err = e
+
+        # Submodules (prefer *.tts.* first)
+        try:
+            if hasattr(vv_mod, "__path__"):
+                for m in pkgutil.walk_packages(vv_mod.__path__, vv_mod.__name__ + "."):
+                    subname = m.name
+                    try:
+                        sm = importlib.import_module(subname)
+                    except Exception:
+                        continue
+                    for name, obj in inspect.getmembers(sm):
+                        if inspect.isclass(obj):
+                            n = f"{subname}.{name}".lower()
+                            score = 0
+                            if ".tts" in subname.lower(): score += 6
+                            if "tts" in n: score += 5
+                            if "voice" in n or "model" in n: score += 2
+                            has_fp = hasattr(obj, "from_pretrained")
+                            has_ld = hasattr(obj, "load")
+                            if has_fp:
+                                add_candidate(score + 2, f"{subname}.{name}.from_pretrained",
+                                              lambda o=obj: o.from_pretrained(
+                                                  pretrained_model_name_or_path=str(model_dir),
+                                                  dtype=dtype,
+                                                  device_map=None,
+                                                  local_files_only=True,
+                                                  cache_dir=str(cache_dir),
+                                                  attn_backend=attn))
+                            if has_ld:
+                                add_candidate(score + 1, f"{subname}.{name}.load",
+                                              lambda o=obj: o.load(
+                                                  model_dir=str(model_dir),
+                                                  dtype=dtype_str,
+                                                  device=device,
+                                                  attn=attn))
+        except Exception as e:
+            last_err = e
+
+        # Best-first
+        candidates.sort(key=lambda x: -x[0])
+        for _, label, maker in candidates:
+            try:
+                candidate = maker()
+                if not _is_modelish(candidate):
+                    raise TypeError(f"{label} returned non-model: {type(candidate).__name__}")
+                if _has_tts_api(candidate):
+                    model = candidate
+                    logger.info(f"Model loaded via {label}")
+                    break
+                else:
+                    # Keep only if we still don't have any model
+                    if model is None:
+                        model = candidate
+                        logger.info(f"Loaded base model via {label}; still looking for TTS-capable wrapper...")
+            except Exception as e:
+                last_err = e
+                continue
+
+    if model is None:
+        logger.error(f"Failed to load VibeVoice model from {model_dir}")
+        if last_err:
+            logger.debug(f"Last load error: {last_err}")
+        sys.exit(EXIT_INVALID_ARGS)
+
+    # Final guard: if we ended up with a base PreTrainedModel, try to attach a simple .tts alias if a suitable method exists
+    if not _has_tts_api(model):
+        for name in ["generate_audio", "generate_wav", "generate_speech", "infer"]:
+            if hasattr(model, name) and callable(getattr(model, name)):
+                setattr(model, "tts", getattr(model, name))
+                logger.info(f"Attached tts -> {name} on model")
+                break
+
+    if hasattr(model, "eval"):
+        model.eval()
+    return model.to(dev)
 def _ensure_mono(np_audio: np.ndarray) -> np.ndarray:
     if np_audio.ndim == 1:
         return np_audio
@@ -1012,6 +1187,7 @@ def main(argv: Optional[List[str]] = None) -> int:
 
         # Import model API (must exist locally) and load model
         vv_mod = import_vibevoice(logger)
+        vv_mod = _ensure_top_level_api(vv_mod, logger)
         model = load_model(vv_mod,
                            paths["selected_model_dir"],
                            device,

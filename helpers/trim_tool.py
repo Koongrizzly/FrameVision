@@ -17,7 +17,7 @@ def ffmpeg_path():
         from helpers.framevision_app import ROOT  # type: ignore
     except Exception:
         ROOT = Path('.').resolve()
-    candidates = [ROOT/'bin'/('ffmpeg.exe' if os.name=='nt' else 'ffmpeg'), 'ffmpeg']
+    candidates = [ROOT/'presets'/'bin'/('ffmpeg.exe' if os.name=='nt' else 'ffmpeg'), 'ffmpeg']
     for c in candidates:
         try:
             subprocess.check_output([str(c), '-version'], stderr=subprocess.STDOUT); return str(c)
@@ -30,7 +30,7 @@ def ffprobe_path():
         from helpers.framevision_app import ROOT  # type: ignore
     except Exception:
         ROOT = Path('.').resolve()
-    candidates = [ROOT/'bin'/('ffprobe.exe' if os.name=='nt' else 'ffprobe'), 'ffprobe']
+    candidates = [ROOT/'presets'/'bin'/('ffprobe.exe' if os.name=='nt' else 'ffprobe'), 'ffprobe']
     for c in candidates:
         try:
             subprocess.check_output([str(c), '-version'], stderr=subprocess.STDOUT); return str(c)
@@ -164,8 +164,11 @@ def install_trim_tool(pane, section_widget):
 
     # Preview controls
     pane.btn_trim_preview = QPushButton("Generate preview")
+    pane.btn_trim_preview.setToolTip("Generate / update the preview thumbnails and timeline for the loaded video. Use this after changing the thumbnail count or loading a new video.")
     pane.trim_thumbs_spin = QSpinBox(); pane.trim_thumbs_spin.setRange(6, 60); pane.trim_thumbs_spin.setValue(12); pane.trim_thumbs_spin.setSuffix(" thumbs")
+    pane.trim_thumbs_spin.setToolTip("How many thumbnails to generate for the preview strip. After changing this number, press \"Generate preview\" to rebuild.")
     pane.thumb_size = QSlider(Qt.Horizontal); pane.thumb_size.setRange(24, 140); pane.thumb_size.setValue(86)
+    pane.thumb_size.setToolTip("Thumbnail display size only. This just scales the preview thumbnails visually; it does not regenerate them.")
     r2 = QHBoxLayout(); r2.addWidget(pane.btn_trim_preview); r2.addWidget(pane.trim_thumbs_spin); r2.addWidget(QLabel("Size")); r2.addWidget(pane.thumb_size)
     lay.addRow(r2)
 

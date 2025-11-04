@@ -1,16 +1,16 @@
 {
   "remember": true,
-  "scale": 2.0,
+  "scale": 4.0,
   "engine_index": 2,
-  "model_realsr": "4x-ClearRealityV1-fp32",
-  "model_w2x": "models-cunet",
+  "model_realsr": "realesrgan-x4plus",
+  "model_w2x": "models-upconv_7_photo",
   "outdir": "C:/FrameVision-main/output/upscaled",
   "vcodec": "libx264",
-  "use_crf": true,
+  "use_crf": false,
   "crf": 18,
-  "use_bitrate": false,
+  "use_bitrate": true,
   "bitrate": 3000,
-  "preset": "ultrafast",
+  "preset": "fast",
   "keyint": 0,
   "audio": "copy",
   "acodec": "aac",
@@ -22,6 +22,6 @@
     "recents": true
   },
   "video_thumbs": true,
-  "streaming_lowmem": true,
+  "streaming_lowmem": false,
   "recents": []
 }

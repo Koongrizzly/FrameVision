@@ -367,16 +367,24 @@ class Ladder:
 
 def build_level(level: int) -> Tuple[List[Platform], List[Ladder]]:
     rng = random.Random(1000 + level)  # deterministic per level number
+
+    # We now generate exactly 5 floors (bottom + 3 middle + top),
+    # spaced evenly from bottom_y up to top_y so the gaps are uniform.
+    # Gaps (~117-118px) are taller than a jump arc, so you can't jump
+    # directly to the next floor, but there's still good headroom
+    # to hop barrels.
     margin = 60
-    gap = 100
-    top = 90
+    bottom_y = HEIGHT - 80
+    top_y = 90
     plat_count = 5
+
+    gap = (bottom_y - top_y) / (plat_count - 1)
 
     platforms: List[Platform] = []
     ladders: List[Ladder] = []
 
     for i in range(plat_count):
-        y = HEIGHT - 80 - i*gap
+        y = int(bottom_y - i * gap)
         if i % 2 == 0:
             x1, x2 = margin, WIDTH - margin
             slope = +1
@@ -385,8 +393,6 @@ def build_level(level: int) -> Tuple[List[Platform], List[Ladder]]:
             slope = -1
         off = rng.randint(-30, 30)
         platforms.append(Platform(x1 + off, x2 + off, y, slope))
-
-    platforms.append(Platform(margin, WIDTH - margin, top, +1))
 
     def pick_spaced_xs(min_x: int, max_x: int, k: int, min_sep: int, avoid: list) -> list:
         xs = []
@@ -398,17 +404,18 @@ def build_level(level: int) -> Tuple[List[Platform], List[Ladder]]:
             tries += 1
         if len(xs) < k:
             step = (max_x - min_x) / (k + 1)
-            xs = [int(min_x + step*(i+1)) for i in range(k)]
+            xs = [int(min_x + step * (i + 1)) for i in range(k)]
         return sorted(xs)
 
     prev_xs = []
-    for i in range(len(platforms)-1):
+    for i in range(len(platforms) - 1):
         p_low = platforms[i]
-        p_high = platforms[i+1]
+        p_high = platforms[i + 1]
         px1 = min(p_low.x1, p_low.x2) + 30
         px2 = max(p_low.x1, p_low.x2) - 30
 
         if level <= 3:
+            # Two ladders roughly evenly spaced, a little randomness
             for j in range(2):
                 t = (j + 1) / 3.0
                 x = int(px1 + t * (px2 - px1))
@@ -418,6 +425,7 @@ def build_level(level: int) -> Tuple[List[Platform], List[Ladder]]:
                 ladders.append(Ladder(x, y_top, y_bottom))
             prev_xs = [ladders[-1].x, ladders[-2].x]
         else:
+            # Two ladders, but try to keep them apart and not stacked over previous pair
             min_sep = 150
             xs = pick_spaced_xs(px1, px2, k=2, min_sep=min_sep, avoid=prev_xs)
             for x in xs:
@@ -429,7 +437,6 @@ def build_level(level: int) -> Tuple[List[Platform], List[Ladder]]:
     return platforms, ladders
 
 
-# --- Entities -----------------------------------------------------------------------------------
 class Player:
     def __init__(self, x: float, y: float, sprite: Optional[pygame.Surface] = None):
         self.w = 60
@@ -812,9 +819,20 @@ class Monkey:
         self.x = x
         self.y = y
         self.timer = 0.0
+        # Which arm the monkey will use to throw ("left" or "right").
+        self.arm_side = "right"
+        # Countdown (seconds) for showing that arm before the barrel is released.
+        self.prep_timer = 0.0
 
+    def prepare_throw(self, prep_time: float = 0.4):
+        """Signal that a barrel is about to be thrown.
+        Monkey always throws to the RIGHT now."""
+        self.arm_side = "right"
+        self.prep_timer = prep_time
     def update(self, dt: float):
         self.timer += dt
+        if self.prep_timer > 0:
+            self.prep_timer = max(0.0, self.prep_timer - dt)
 
     def draw(self, surf: pygame.Surface, t: float):
         body = pygame.Rect(self.x-24, self.y-28, 48, 56)
@@ -822,9 +840,18 @@ class Monkey:
         pygame.draw.circle(surf, (140, 90, 50), (body.centerx, body.top+18), 16)
         pygame.draw.circle(surf, BLACK, (body.centerx-5, body.top+15), 2)
         pygame.draw.circle(surf, BLACK, (body.centerx+5, body.top+15), 2)
-        hand_y = body.centery + int(math.sin(t*4) * 6)
-        pygame.draw.circle(surf, (100,60,30), (body.right+8, hand_y), 8)
 
+        hand_y = body.centery + int(math.sin(t*4) * 6)
+
+        # Show whichever arm is about to throw, briefly, before the barrel spawns.
+        # Otherwise default to right arm like before.
+        side = self.arm_side if self.prep_timer > 0 else "right"
+        if side == "left":
+            hand_x = body.left - 8
+        else:
+            hand_x = body.right + 8
+
+        pygame.draw.circle(surf, (100,60,30), (hand_x, hand_y), 8)
 
 # --- Simple particle for reward animation -------------------------------------------------------
 class Particle:
@@ -983,9 +1010,14 @@ class Game:
         self.platforms, self.ladders = build_level(self.level)
         start_plat = self.platforms[0]
         self.player = Player(40, start_plat.y - 60, sprite=self.player_sprite_surface)
+        # reset anti-idle tracking for this level (anti-AFK scoring)
+        self.idle_seconds = 0.0
+        self.prev_player_pos = (self.player.x, self.player.y)
 
         top_plat = self.platforms[-1]
         self.monkey = Monkey(top_plat.x1 + 30, top_plat.y - 20)
+        # state for barrel telegraph / delayed spawn
+        self.barrel_waiting_to_spawn = False
 
         self.reward_surf, self.reward_path = load_reward_logo_for_level(self.level)
         margin = 10
@@ -1010,8 +1042,34 @@ class Game:
             self.state = "playing"
 
     def spawn_barrel(self):
-        b = Barrel(self.monkey.x + 10, self.monkey.y + 10, self.level_speed_mul, self.sticker_surface)
+        # Monkey always throws to the RIGHT.
+        # Spawn the barrel high (on the highest playable floor just under the reward),
+        # nudge it in from the left edge so it doesn't snag, and push it right.
+        b = Barrel(self.monkey.x + 10, self.monkey.y + 10,
+                   self.level_speed_mul, self.sticker_surface)
+
+        try:
+            if len(self.platforms) >= 2:
+                # platforms[-1] is the top/reward floor.
+                # platforms[-2] is the top playable floor just below it.
+                top_playable = self.platforms[-2]
+                px_left = min(top_playable.x1, top_playable.x2)
+
+                spawn_x = px_left + 40  # offset inward from the edge to avoid getting stuck
+                spawn_y = top_playable.y - b.radius - 2
+
+                b.x = spawn_x
+                b.y = spawn_y
+
+                # force roll to the right
+                b.spawn_dir = 1
+                b.vx = abs(b.roll_speed)
+        except Exception:
+            # if anything unexpected happens, we just keep default b position/speed
+            pass
+
         self.barrels.append(b)
+
     def handle_collisions(self, dt: float):
         # Ignore collisions from barrels that are clearly on a *higher* floor while the player is mid-jump.
         def _barrel_is_on_higher_floor_than_player_during_jump(player, barrel) -> bool:
@@ -1199,19 +1257,41 @@ class Game:
 
         self.player.update(keys, self.platforms, self.ladders, dt)
         self.monkey.update(dt)
+        # Track player movement to detect AFK farming
+        moved = (abs(self.player.x - self.prev_player_pos[0]) > 0.01 or
+                 abs(self.player.y - self.prev_player_pos[1]) > 0.01 or
+                 abs(self.player.vx) > 0.01 or
+                 abs(self.player.vy) > 0.01)
+        if moved:
+            self.idle_seconds = 0.0
+        else:
+            self.idle_seconds += dt
+        self.prev_player_pos = (self.player.x, self.player.y)
+        
 
         for b in list(self.barrels):
             b.update(self.platforms, self.ladders, dt)
             if b.y - b.radius > HEIGHT + 80:
                 self.barrels.remove(b)
-                self.score += 5
+                if self.idle_seconds < 55.0:
+                    self.score += 5
 
         self.time_since_barrel += dt
-        if self.time_since_barrel >= self.next_barrel_interval:
-            self.time_since_barrel = 0.0
-            self.spawn_barrel()
-            self.next_barrel_interval = max(0.6, random.uniform(3.0, 4.0) / self.level_speed_mul)
-
+        
+        # Barrel throwing logic with pre-throw animation:
+        if self.barrel_waiting_to_spawn:
+            # Wait until the monkey's prep animation finishes, then actually spawn.
+            if self.monkey.prep_timer <= 0:
+                self.barrel_waiting_to_spawn = False
+                self.spawn_barrel()
+                self.next_barrel_interval = max(0.6, random.uniform(3.0, 4.0) / self.level_speed_mul)
+        else:
+            if self.time_since_barrel >= self.next_barrel_interval:
+                self.time_since_barrel = 0.0
+                # Monkey telegraphs with either left or right arm
+                self.monkey.prepare_throw()
+                self.barrel_waiting_to_spawn = True
+        
         self.handle_collisions(dt)
 
         if self.player.rect.colliderect(self.goal_rect):

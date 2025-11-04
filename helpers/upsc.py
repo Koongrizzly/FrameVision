@@ -373,13 +373,13 @@ class UpscPane(QtWidgets.QWidget):
         scale_lay = QtWidgets.QHBoxLayout()
         scale_lay.addWidget(QtWidgets.QLabel("Scale:", self))
         self.spin_scale = QtWidgets.QDoubleSpinBox(self)
-        self.spin_scale.setRange(1.0, 4.0)
+        self.spin_scale.setRange(1.0, 8.0)
         self.spin_scale.setSingleStep(0.5)
         self.spin_scale.setValue(2.0)
         self.spin_scale.setDecimals(1)
         self.slider_scale = QtWidgets.QSlider(Qt.Horizontal, self)
         self.slider_scale.setMinimum(10)
-        self.slider_scale.setMaximum(40)
+        self.slider_scale.setMaximum(80)
         self.slider_scale.setSingleStep(5)
         self.slider_scale.setPageStep(5)
         self.slider_scale.setValue(20)
@@ -576,6 +576,28 @@ class UpscPane(QtWidgets.QWidget):
         self.rad_bitrate = QtWidgets.QRadioButton("Bitrate (kbps)", self)
         self.spin_bitrate = QtWidgets.QSpinBox(self); self.spin_bitrate.setRange(100, 200000); self.spin_bitrate.setValue(8000)
         lay_enc.addWidget(self.rad_bitrate, 2, 0); lay_enc.addWidget(self.spin_bitrate, 2, 1)
+
+        # Grey out the non-selected rate control
+        try:
+            def _update_rate_controls():
+                use_crf = bool(self.rad_crf.isChecked())
+                try:
+                    self.spin_crf.setEnabled(use_crf)
+                except Exception:
+                    pass
+                try:
+                    self.spin_bitrate.setEnabled(bool(self.rad_bitrate.isChecked()))
+                except Exception:
+                    pass
+            try:
+                self.rad_crf.toggled.connect(_update_rate_controls)
+                self.rad_bitrate.toggled.connect(_update_rate_controls)
+            except Exception:
+                pass
+            _update_rate_controls()
+        except Exception:
+            pass
+
         # Preset + Keyint
         lay_enc.addWidget(QtWidgets.QLabel("Preset:", self), 3, 0)
         self.combo_preset = QtWidgets.QComboBox(self)
@@ -587,6 +609,22 @@ class UpscPane(QtWidgets.QWidget):
         self.spin_keyint = QtWidgets.QSpinBox(self); self.spin_keyint.setRange(0, 1000); self.spin_keyint.setValue(0)
         self.spin_keyint.setToolTip("0 = let encoder decide; otherwise sets -g keyint")
         lay_enc.addWidget(self.spin_keyint, 4, 1)
+
+        # Hide Keyint (auto mode). Force to 0 under the hood.
+        try:
+            self._lbl_keyint = lay_enc.itemAtPosition(4, 0).widget() if hasattr(lay_enc, "itemAtPosition") else None
+            if self._lbl_keyint is not None:
+                self._lbl_keyint.hide()
+            self.spin_keyint.setValue(0)
+            self.spin_keyint.hide()
+            try:
+                # ensure any saved setting won't override this
+                self.spin_keyint.valueChanged.connect(lambda _v: self.spin_keyint.setValue(0))
+            except Exception:
+                pass
+        except Exception:
+            pass
+
         # Audio
         lay_enc.addWidget(QtWidgets.QLabel("Audio:", self), 5, 0)
         self.radio_a_copy = QtWidgets.QRadioButton("Copy", self); self.radio_a_copy.setChecked(True)
@@ -618,6 +656,25 @@ class UpscPane(QtWidgets.QWidget):
         lay_enc.addWidget(QtWidgets.QLabel("Audio bitrate (kbps):", self), 7, 0)
         self.spin_abitrate = QtWidgets.QSpinBox(self); self.spin_abitrate.setRange(32, 1024); self.spin_abitrate.setValue(192)
         lay_enc.addWidget(self.spin_abitrate, 7, 1)
+
+        # Replace spinner with dropdown for audio bitrate
+        try:
+            self.combo_abitrate = QtWidgets.QComboBox(self)
+            _abrs = [24, 36, 48, 64, 112, 128, 160, 192, 256, 320]
+            for _br in _abrs:
+                self.combo_abitrate.addItem(str(_br))
+            try:
+                self.combo_abitrate.setCurrentText("192")
+            except Exception:
+                pass
+            lay_enc.addWidget(self.combo_abitrate, 7, 1)
+            try:
+                self.spin_abitrate.hide()
+            except Exception:
+                pass
+        except Exception:
+            pass
+
 
         # --- Audio controls visibility & bitrate discretization ---
         try:
@@ -654,7 +711,7 @@ class UpscPane(QtWidgets.QWidget):
                     enc = bool(self.radio_a_encode.isChecked())
                 except Exception:
                     pass
-                for w in (self.lbl_acodec, self.combo_acodec, self.lbl_abitrate, self.spin_abitrate):
+                for w in (self.lbl_acodec, self.combo_acodec, self.lbl_abitrate, self.combo_abitrate):
                     try:
                         if w is not None:
                             w.setVisible(enc)
@@ -860,7 +917,7 @@ class UpscPane(QtWidgets.QWidget):
             ("radio_a_encode", "toggled"),
             ("radio_a_mute", "toggled"),
             ("combo_acodec", "currentTextChanged"),
-            ("spin_abitrate", "valueChanged"),
+            ("combo_abitrate", "currentTextChanged"),
             ("spin_tile", "valueChanged"),
             ("spin_overlap", "valueChanged"),
             ("chk_deinterlace", "toggled"),
@@ -929,7 +986,7 @@ class UpscPane(QtWidgets.QWidget):
         except Exception: pass
         try: d["preset"] = self.combo_preset.currentText()
         except Exception: pass
-        try: d["keyint"] = int(self.spin_keyint.value())
+        try: d["keyint"] = 0
         except Exception: pass
         # Audio
         try:
@@ -942,7 +999,7 @@ class UpscPane(QtWidgets.QWidget):
         except Exception: pass
         try: d["acodec"] = self.combo_acodec.currentText()
         except Exception: pass
-        try: d["abitrate"] = int(self.spin_abitrate.value())
+        try: d["abitrate"] = int(self.combo_abitrate.currentText())
         except Exception: pass
         # Advanced / tiles
         try:
@@ -1064,7 +1121,7 @@ class UpscPane(QtWidgets.QWidget):
         except Exception:
             pass
         try:
-            self.spin_keyint.setValue(int(d.get("keyint", 0)))
+            self.spin_keyint.setValue(0)
         except Exception:
             pass
         try:
@@ -1079,7 +1136,7 @@ class UpscPane(QtWidgets.QWidget):
             if ac:
                 i = self.combo_acodec.findText(ac)
                 if i >= 0: self.combo_acodec.setCurrentIndex(i)
-            self.spin_abitrate.setValue(int(d.get("abitrate", 192)))
+            (_i := self.combo_abitrate.findText(str(d.get("abitrate", 192)))); self.combo_abitrate.setCurrentIndex(_i if _i >= 0 else self.combo_abitrate.findText("192"))
         except Exception:
             pass
         try:
@@ -2018,7 +2075,7 @@ class UpscPane(QtWidgets.QWidget):
                 return
     
             scale = int(round(float(self.spin_scale.value())))
-            scale = max(1, min(4, scale))
+            scale = max(1, min(8, scale))
             outd = Path(self.edit_outdir.text().strip()) if self.edit_outdir.text().strip() else (OUT_VIDEOS if is_video else OUT_SHOTS)
             outfile = self._build_outfile(src, outd, scale)
             self._last_outfile = outfile
@@ -2071,7 +2128,7 @@ class UpscPane(QtWidgets.QWidget):
                 elif self.radio_a_copy.isChecked():
                     cmd_encode += ["-c:a", "copy"]
                 else:
-                    cmd_encode += ["-c:a", self.combo_acodec.currentText(), "-b:a", f"{self.spin_abitrate.value()}k"]
+                    cmd_encode += ["-c:a", self.combo_acodec.currentText(), "-b:a", f"{self.combo_abitrate.currentText()}k"]
                 cmd_encode += ["-r", fps, "-shortest", str(outfile)]
     
                 self._append_log(f"Engine: {engine_label}")
@@ -2778,10 +2835,11 @@ try:
         def _fv_is_realsr_engine(self) -> bool:
             try:
                 t = (self.combo_engine.currentText() or '').lower()
-                return ('realesrgan' in t) or ('real-esrgan' in t)
+                # Treat ALL engines as fixed-scale except Waifu2x.
+                # When this returns True, the UI hides the Scale label/slider/spin.
+                return ('waifu2x' not in t)
             except Exception:
                 return False
-
         def _fv_native_scale(self) -> int:
             try:
                 t = (self.combo_model_realsr.currentText() or '').lower()

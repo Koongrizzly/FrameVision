@@ -1,5 +1,36 @@
 [README.md](https://github.com/user-attachments/files/22204351/README.md)
-# 🌟 FrameVision V1.0.8
+# 🌟 FrameVision V1.0.9
+---
+**New in v1.0.9**
+---
+🧩 Features
+---
+- Toggle in Settings to turn tooltips on/off across the app
+- Toggle in Settings to turn emojis on/off across the app
+- 4 new intro overlay animations: Lightning, Fireworks, Inside Warp, and GlitchShards
+- Upgrade for “Extract Frames” tool:
+  - Can now grab any frame from a playing video
+  - User can select JPG or PNG for saving
+  - New buttons to open a media file directly from the tool and open the destination folder
+  - Info label shows loaded media details
+  - Option to choose how many frames to skip before taking the next one
+  - Added batch to queue option for automated extraction
+- Added 2 new easter eggs
+
+🐞 Bugfixes
+---
+- Fixed resizer aspect ratio toggle
+- Removed the bugged equalizer (loading music tracks is normal again)
+- Fixed Background Remover to use any frame of a playing video
+
+🎨 UI Improvements
+---
+- Resizer now has an option to keep the source aspect ratio
+- Improved tooltips for many tools
+- Removed image and video convert/quality tools (they’re now integrated into other tools)
+- Added quality and convert options to the Resize tool
+- Settings toggles that are turned off are now greyed out
+- Rearranged parts of the interface
 ---
 **New in v1.0.8**
 ---

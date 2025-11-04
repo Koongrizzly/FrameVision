@@ -221,10 +221,13 @@ except Exception as _e:
     print("[framevision] txt2img tab import failed:", _e)
     Txt2ImgPane = None
 # <<< FRAMEVISION_TXT2IMG_END
-# >>> FRAMEVISION_EDITOR_BEGIN
-
-
-EditorPane = None  # Editor disabled
+# >>> CORRECT FRAMEVISION_EDITOR_IMPORT BEGIN
+# Safe import of the Editor pane; never crash app on failure.
+#try:
+#    from helpers.editor import EditorPane
+#except Exception as _e:
+#    print("[framevision] editor tab import failed:", _e)
+#    EditorPane = None
 # <<< FRAMEVISION_EDITOR_END
 
 
@@ -234,8 +237,12 @@ Wan22Pane = None
 # <<< FRAMEVISION_WAN22_END
 
 # >>> FRAMEVISION_VIBEVOICE_BEGIN
-# VibeVoice tab disabled: do not import or add missing module.
-VibeVoicePane = None
+# Safe import of the VibeVoice pane; never crash app on failure.
+try:
+    from helpers.vibevoice import VibeVoicePane
+except Exception as _e:
+    print("[framevision] VibeVoice tab import failed:", _e)
+    VibeVoicePane = None
 # <<< FRAMEVISION_VIBEVOICE_END
 
 
@@ -567,13 +574,79 @@ def _fv_select_startup_logo():
 STARTUP_LOGO_PATH = _fv_select_startup_logo()
 
 def now_stamp(): return datetime.now().strftime("%Y%m%d_%H%M%S")
+def _sec_to_mss(sec_val):
+    """Return M:SS or H:MM:SS for a duration in seconds (float or str).
+    If sec_val is None/invalid, return empty string."""
+    try:
+        total = int(float(sec_val or 0))
+    except Exception:
+        return ""
+    h = total // 3600
+    m = (total % 3600) // 60
+    s = total % 60
+    if h:
+        return f"{h}:{m:02d}:{s:02d}"
+    return f"{m}:{s:02d}"
+
 def compose_video_info_text(path: Path) -> str:
+    """Build the info line under the player.
+
+    Rules:
+    - For audio or still images: hide resolution and fps.
+    - Duration shows as M:SS (no raw "123.45 s"), when available.
+    - For video: show resolution, fps (if available), duration M:SS, and size.
+    """
     try:
         inf = probe_media(path)
-        return f"{path.name} • {inf.get('width','?')}x{inf.get('height','?')} • {inf.get('fps','?')} fps • {inf.get('duration','?')} s • {human_mb(inf.get('size',0))} MB"
-    except Exception:
-        return path.name
+        ext = str(path.suffix or "").lower()
+        size_mb = human_mb(inf.get('size', 0))
 
+        dur_txt = _sec_to_mss(inf.get('duration'))
+
+        # classify extension types locally (don't rely on later IMAGE_EXTS definition order)
+        audio_exts = set(x.lower() for x in list(AUDIO_EXTS))
+        image_exts = {
+            '.png','.jpg','.jpeg','.bmp','.webp','.tif','.tiff',
+            '.gif','.avif','.heic','.heif'
+        }
+
+        # Audio file: filename • M:SS • size MB
+        if ext in audio_exts:
+            parts = [path.name]
+            if dur_txt:
+                parts.append(dur_txt)
+            parts.append(f"{size_mb} MB")
+            return " • ".join(parts)
+
+        # Still image (or animated gif treated as image in info line):
+        # filename • size MB
+        if ext in image_exts:
+            parts = [path.name, f"{size_mb} MB"]
+        w = inf.get('width')
+        h = inf.get('height')
+        if w and h:
+            parts.append(f"{w}x{h}")
+            return " • ".join(parts)
+
+        # Default / video clip: filename • WxH • fps fps • M:SS • size MB
+        parts = [path.name]
+
+        w = inf.get('width')
+        h = inf.get('height')
+        if w and h:
+            parts.append(f"{w}x{h}")
+
+        fps = inf.get('fps')
+        if fps:
+            parts.append(f"{fps} fps")
+
+        if dur_txt:
+            parts.append(dur_txt)
+
+        parts.append(f"{size_mb} MB")
+        return " • ".join(parts)
+    except Exception:
+        return str(path.name)
 def human_mb(b):
     try: return round(b/(1024*1024),2)
     except: return 0.0
@@ -2430,12 +2503,12 @@ class QueuePane(QWidget):
         grid.addWidget(self.btn_refresh, 0, 0); grid.addWidget(clearw, 0, 1); grid.addWidget(self.worker_status, 0, 2, 1, 1, Qt.AlignRight); grid.setColumnStretch(2, 1)
 
         # Row 2: Move up · Move down · Delete selected
-        self.btn_move_up = QPushButton("Move Up"); self.btn_move_down = QPushButton("Move Down"); self.btn_delete_sel = QPushButton("Delete Selected")
+        self.btn_move_up = QPushButton("Move Upwards"); self.btn_move_down = QPushButton("Move Down"); self.btn_delete_sel = QPushButton("Delete Selected")
         grid.addWidget(self.btn_move_up, 1, 0); grid.addWidget(self.btn_move_down, 1, 1); grid.addWidget(self.btn_delete_sel, 1, 2)
 
         # Row 3: Mark running → failed · Clear finished + failed · Recover running → pending
-        self.btn_mark_running_failed = QPushButton("Mark Running → Failed")
-        self.btn_reset_running = QPushButton("Recover Running → Pending")
+        self.btn_mark_running_failed = QPushButton("Try to Move to Failed")
+        self.btn_reset_running = QPushButton("Move to Pending")
         grid.addWidget(self.btn_mark_running_failed, 2, 0); grid.addWidget(self.btn_reset_running, 2, 1)
 
         # Counters row
@@ -3262,7 +3335,7 @@ class MainWindow(QMainWindow):
 
     def __init__(self):
         super().__init__()
-        self.setWindowTitle(APP_NAME + " V1.0.8 " + TAGLINE)
+        self.setWindowTitle(APP_NAME + " V1.0.9 " + TAGLINE)
         self.resize(1280, 800)
         self.setMinimumSize(900, 580)
         self.current_path = None
@@ -3296,18 +3369,6 @@ class MainWindow(QMainWindow):
         except Exception as _e:
             print("[framevision] txt2img tab insert failed:", _e)
         # <<< FRAMEVISION_TXT2IMG_END
-        # >>> FRAMEVISION_EDITOR_BEGIN
-
-        # Editor tab disabled by request — skip import entirely.
-        EditorPane = None
-# <<< FRAMEVISION_EDITOR_END
-
-        # >>> FRAMEVISION_WAN22_VIBEVOICE_TABS_BEGIN
-
-
-        # WAN22/VibeVoice tabs disabled: skip insertion.
-        # <<< FRAMEVISION_WAN22_VIBEVOICE_TABS_END
-        # GAB (QuickActionDriver) removed cleanly
         # The analyzer integration was disabled to avoid runtime errors.
         # (Previously initialized QuickActionDriver and installed it here.)
         self.edit = InterpPane(self, {
@@ -3330,8 +3391,15 @@ class MainWindow(QMainWindow):
         self.presets_tab = PresetsPane(self)
         self.settings = SettingsPane(self)
         # >>> FRAMEVISION_EDITOR_INIT_BEGIN
-
-        self.mini_editor = None  # Editor disabled
+        # Create Editor tab instance if available
+        #try:
+         #   if 'EditorPane' in globals() and EditorPane is not None:
+          #      self.editor = EditorPane(self)
+           # else:
+            #    self.editor = None
+      #  except Exception as _e:
+       #     print("[framevision] editor init failed:", _e)
+        #    self.editor = None
 # <<< FRAMEVISION_EDITOR_INIT_END
 
 
@@ -3339,10 +3407,17 @@ class MainWindow(QMainWindow):
 
         for name, w in [("Edit", self.edit),("Background", self.background),("Tools", self.tools),("Describe", self.describe),("Queue", self.queue),("Models", self.models),("Presets", self.presets_tab),("Settings", self.settings)]:
             self.tabs.addTab(w, name)
-        # >>> FRAMEVISION_EDITOR_ADDTAB_BEGIN
 
-        # Editor disabled: do not add tab.
-# <<< FRAMEVISION_EDITOR_ADDTAB_END
+        # >>> FRAMEVISION_VIBEVOICE_INIT_BEGIN
+        # Create VibeVoice tab if available
+#        try:
+ #           if 'VibeVoicePane' in globals() and VibeVoicePane is not None:
+  #              self.vibevoice = VibeVoicePane(self)
+   #             self.tabs.addTab(self.vibevoice, 'VibeVoice')
+    #    except Exception as _e:
+     #       print('[framevision] VibeVoice init failed:', _e)
+        # <<< FRAMEVISION_VIBEVOICE_INIT_END
+
 
 
         splitter = QSplitter(Qt.Horizontal, self)
@@ -3569,6 +3644,13 @@ from helpers import job_helper  # noqa
 
 def main():
     app = QApplication(sys.argv)
+    from PySide6.QtGui import QIcon
+    try:
+        icon_path = str((ROOT / 'assets' / 'icons' / 'fv.png')) if 'ROOT' in globals() else 'assets/icons/fv.png'
+        app.setWindowIcon(QIcon(icon_path))
+    except Exception:
+        pass
+
     apply_theme(app, config.get("theme","Auto"))
     w = MainWindow(); w.show()
     sys.exit(app.exec())

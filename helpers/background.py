@@ -752,9 +752,19 @@ def _compose_with_bg(
 
 # -------------------- I/O helpers --------------------
 def _ffmpeg_path() -> Optional[str]:
-    cand = ROOT / "presets" / "tools" / ("ffmpeg.exe" if os.name == "nt" else "ffmpeg")
-    if cand.exists():
-        return str(cand)
+    win = os.name == "nt"
+    names = ["ffmpeg.exe"] if win else ["ffmpeg"]
+    roots = [
+        ROOT / "presets" / "bin",
+        ROOT / "presets" / "tools",
+        ROOT / "bin",
+        ROOT,
+    ]
+    for base in roots:
+        for n in names:
+            cand = base / n
+            if cand.exists():
+                return str(cand)
     return "ffmpeg"
 
 def load_image_or_frame(path: str, time_s: float = 0.0) -> Image.Image:
@@ -1135,7 +1145,7 @@ def install_background_tool(pane, section_widget) -> None:
             try:
                 self._btn_brush.setToolTip('Brush tool — left-drag = remove (make transparent), right-drag = keep. Mouse wheel changes brush size. Default radius: 20px.')
                 self._btn_zoom.setToolTip('Zoom/Pan tool — mouse wheel to zoom, left-drag to pan. Default zoom: 1.0.')
-                self.setToolTip('Preview — paint with 🖌 to remove/keep, or use 🔍 to zoom and pan. Overlay opacity is adjustable below.')
+                self.setToolTip('Use Brush to remove/keep, change mask overlay to make brush more or less visible.')
             except Exception:
                 pass
 
@@ -1818,7 +1828,7 @@ def install_background_tool(pane, section_widget) -> None:
     out_row = QHBoxLayout(); out_row.addWidget(le_out); out_row.addWidget(btn_out_change); out_row.addWidget(btn_out_open)
 
     # Actions
-    btn_recompute = QPushButton("Remove BG")
+    btn_recompute = QPushButton("Remove Background")
     btn_reset     = QPushButton("Reset")
     btn_undo      = QPushButton("Undo")
     try:
@@ -1865,11 +1875,11 @@ def install_background_tool(pane, section_widget) -> None:
         btn_out_change.setToolTip('Change the output folder and remember it for next time.')
         btn_out_open.setToolTip('Open the output folder in your file manager.')
 
-        btn_recompute.setToolTip('Recompute the alpha mask using the selected engine.')
+        btn_recompute.setToolTip('Pick a bckground removal preset, select an engine abd bext press this button to remove a background.')
         btn_reset.setToolTip('Reset controls and masks back to defaults.')
         btn_undo.setToolTip('Undo the last brush stroke or change (where available).')
         btn_save.setToolTip('Save the current result as a PNG into the output folder.')
-        btn_sd_inpaint.setToolTip('Run Stable Diffusion 1.5 Inpaint over removed areas to fill them realistically.')
+        btn_sd_inpaint.setToolTip('Sekect an inpaint preset from the presets first. You can change the prompt and negatives or other settings after that.')
 
         cmb_presets.setToolTip('Saved presets of all controls. Select to apply.')
         btn_preset_save.setToolTip('Save the current settings as a preset.')
@@ -2021,7 +2031,27 @@ def install_background_tool(pane, section_widget) -> None:
     bg_form.addRow(row_tog1)
     bg_form.addRow(row_tog2)
     bg_form.addRow(shadow_row)
+    # Rebuild button rows so 'Remove BG' and 'INPAINT' go on the next line.
+    try:
+        btns_row = QHBoxLayout()
+        for _w in (btn_use_current, btn_load, btn_undo, btn_reset, btn_save):
+            try:
+                btns_row.addWidget(_w)
+            except Exception:
+                pass
+        btns_row2 = QHBoxLayout()
+        try:
+            btns_row2.addWidget(btn_recompute)
+        except Exception:
+            pass
+        try:
+            btns_row2.addWidget(btn_sd_inpaint)
+        except Exception:
+            pass
+    except Exception:
+        pass
     vbox.insertLayout(1, btns_row)
+    vbox.insertLayout(2, btns_row2)
     # Move Output path controls directly under the preview (before the main form panel)
 # Mount into CollapsibleSection
     try:
@@ -2338,9 +2368,36 @@ def install_background_tool(pane, section_widget) -> None:
 
         _clear_auto_bg_if_needed()
 
+        # First: try to grab the actual CURRENT frame from the same video widget the meme tool uses
+        tmp_img_path = None
+        main_obj = getattr(pane, "main", None)
+        vid = getattr(main_obj, "video", None) if main_obj is not None else None
+        if vid is not None:
+            try:
+                from PySide6.QtGui import QPixmap
+                qimg = getattr(vid, "currentFrame", None)
+                if qimg is not None and (not hasattr(qimg, "isNull") or not qimg.isNull()):
+                    import tempfile
+                    f = tempfile.NamedTemporaryFile(prefix="bgtool_frame_", suffix=".png", delete=False)
+                    tmp_img_path = f.name; f.close()
+                    pm = QPixmap.fromImage(qimg); pm.save(tmp_img_path, "PNG")
+                if tmp_img_path is None and hasattr(vid, "label") and hasattr(vid.label, "pixmap"):
+                    pm = vid.label.pixmap()
+                    if pm is not None and (not hasattr(pm, "isNull") or not pm.isNull()):
+                        import tempfile
+                        f = tempfile.NamedTemporaryFile(prefix="bgtool_frame_", suffix=".png", delete=False)
+                        tmp_img_path = f.name; f.close()
+                        pm.save(tmp_img_path, "PNG")
+            except Exception:
+                tmp_img_path = None
+
         current_path = media_path
         try:
-            img = load_image_or_frame(str(media_path), float(time_s))
+            if tmp_img_path is not None:
+                from PIL import Image
+                img = Image.open(tmp_img_path).convert("RGB")
+            else:
+                img = load_image_or_frame(str(media_path), float(time_s))
         except Exception as e:
             try:
                 QMessageBox.critical(panel, "Load error", str(e))
