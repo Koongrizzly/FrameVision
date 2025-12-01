@@ -42,6 +42,8 @@ if not exist "%PYTHON_EXE%" (
 )
 
 REM --- 2. Upgrade pip --------------------------------------------------------
+"%ACE_ENV_DIR%\Scripts\python.exe" -m pip install "transformers>=4.44.0,<5.0.0" "peft>=0.13.0"
+
 echo.
 echo [ACE] Upgrading pip...
 "%PYTHON_EXE%" -m pip install --upgrade pip
@@ -74,6 +76,11 @@ pushd "%ACE_REPO_DIR%"
 "%PYTHON_EXE%" -m pip install -e .
 popd
 
+REM --- 7. Ensure compatible transformers + peft versions ---------------------
+echo.
+echo [ACE] Ensuring compatible transformers/peft versions...
+"%PYTHON_EXE%" -m pip install --upgrade "transformers==4.55.0" "peft>=0.13.0"
+
 echo.
 echo [ACE] Copying ACE-Step patches...
 
@@ -92,6 +99,7 @@ echo [ACE] Installation finished.
 echo     Env:  %VENV_DIR%
 echo     Repo: %ACE_REPO_DIR%
 echo.
+echo You can now run your helpers\\ace.py using this environment.
 echo The first generation will download the model weights once (needs internet).
 echo After that, it can run offline from this folder.
 echo.

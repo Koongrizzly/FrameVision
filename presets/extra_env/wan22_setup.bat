@@ -1,12 +1,13 @@
 @echo off
-REM WAN 2.2 5B - FINAL CLEAN INSTALLER
+REM WAN 2.2 5B - FINAL CLEAN INSTALLER (FIXED)
 REM - Uses Python snapshot_download (no hf CLI)
 REM - Downloads WAN-AI/Wan2.2-TI2V-5B into models\wan22
 REM - Downloads GitHub Wan2.2 repo and merges scripts
+REM - Pins CUDA PyTorch and prevents it from being overwritten
 
 echo.
 echo ===============================================
-echo   WAN 2.2 5B - Installer / Repair (FINAL)
+echo   WAN 2.2 5B - Installer / Repair (FIXED)
 echo ===============================================
 echo.
 
@@ -68,48 +69,43 @@ echo [INFO] Upgrading pip, setuptools, wheel...
 if errorlevel 1 goto :fatal_error
 
 REM ------------------------------------------------
-REM 4) Install PyTorch + WAN requirements + huggingface_hub
+REM 4) Install CUDA PyTorch (pinned) FIRST
+REM    We install torch/vision/audio explicitly from the cu121 index
+REM    so they do NOT get replaced by CPU wheels.
 REM ------------------------------------------------
 
 echo.
-echo [INFO] Installing CUDA-enabled PyTorch 2.4.0 (torch / torchvision / torchaudio)...
-"%VENV_DIR%\Scripts\python.exe" -m pip install --upgrade --force-reinstall --index-url https://download.pytorch.org/whl/cu121 ^
-  "torch==2.4.0+cu121" ^
-  "torchvision==0.19.0+cu121" ^
-  "torchaudio==2.4.0+cu121"
+echo [INFO] Installing PyTorch (CUDA 12.1, pinned)...
+"%VENV_DIR%\Scripts\python.exe" -m pip install ^
+  torch==2.4.0 torchvision==0.19.0 torchaudio==2.4.0 ^
+  --index-url https://download.pytorch.org/whl/cu121
 if errorlevel 1 goto :fatal_error
 
-REM NOTE: torch / torchvision / torchaudio are now fixed to the CUDA 12.1 stack above.
-REM       WAN core deps are installed later with --no-deps so they do NOT upgrade torch.
-
+REM ------------------------------------------------
+REM 5) Install WAN 2.2 requirements (without torch)
+REM    torch/vision/audio are NOT in wan22_requirements.txt.
+REM    We also avoid --upgrade here to stop pip from trying to
+REM    "improve" torch to 2.9.1+cpu.
+REM ------------------------------------------------
 
 echo.
-echo [INFO] Installing WAN 2.2 requirements (remaining deps)...
-"%VENV_DIR%\Scripts\python.exe" -m pip install --upgrade --force-reinstall -r "%REQ_FILE%"
+echo [INFO] Installing WAN 2.2 requirements (no torch)...
+"%VENV_DIR%\Scripts\python.exe" -m pip install -r "%REQ_FILE%"
 if errorlevel 1 goto :fatal_error
 
+REM ------------------------------------------------
+REM 6) Ensure WAN core deps are pinned WITHOUT touching torch
+REM    Important: we use --no-deps so these packages do not try
+REM    to pull in another torch version.
+REM ------------------------------------------------
+
 echo.
-echo [INFO] Ensuring WAN core Python deps (transformers/diffusers/peft/accelerate/tokenizers) are pinned without touching torch...
-"%VENV_DIR%\Scripts\python.exe" -m pip install --upgrade --force-reinstall --no-deps ^
-  "transformers==4.57.3" ^
+echo [INFO] Ensuring WAN core Python deps (transformers/diffusers/peft) are pinned...
+"%VENV_DIR%\Scripts\python.exe" -m pip install --upgrade --no-deps ^
+  "transformers>=4.52.0,<5.0.0" ^
   "diffusers==0.35.2" ^
-  "peft==0.18.0" ^
-  "accelerate==1.12.0" ^
-  "tokenizers==0.22.1"
+  "peft==0.18.0"
 if errorlevel 1 goto :fatal_error
-
-echo.
-REM [INFO] Optimization deps (Triton, Sage, TeaCache, MagCache) are skipped by default to keep install stable.
-REM "%VENV_DIR%\Scripts\pip.exe" install triton-windows
-REM if errorlevel 1 goto :fatal_error
-REM "%VENV_DIR%\Scripts\pip.exe" install git+https://github.com/thu-ml/SageAttention.git
-REM if errorlevel 1 goto :fatal_error
-REM "%VENV_DIR%\Scripts\pip.exe" install git+https://github.com/ali-vilab/TeaCache.git
-REM if errorlevel 1 goto :fatal_error
-REM "%VENV_DIR%\Scripts\pip.exe" install git+https://github.com/Zehong-Ma/MagCache.git
-REM if errorlevel 1 goto :fatal_error
-REM "%VENV_DIR%\Scripts\pip.exe" install bitsandbytes>=0.44.1
-REM if errorlevel 1 goto :fatal_error
 
 echo.
 echo [INFO] Ensuring compatible huggingface_hub (>=0.30,<1.0)...
@@ -117,11 +113,11 @@ echo [INFO] Ensuring compatible huggingface_hub (>=0.30,<1.0)...
 if errorlevel 1 goto :fatal_error
 
 REM ------------------------------------------------
-REM 5) Download WAN 2.2-5B weights from Hugging Face via Python
+REM 7) Download WAN 2.2-5B weights from Hugging Face via Python
 REM     Repo: Wan-AI/Wan2.2-TI2V-5B (gated, requires HF login)
 REM ------------------------------------------------
 
-_DIR%" (
+if not exist "%MODEL_DIR%" (
     echo [INFO] Creating model directory: %MODEL_DIR%
     mkdir "%MODEL_DIR%" 2>nul
 )
@@ -146,7 +142,7 @@ dir "%MODEL_DIR%"
 echo.
 
 REM ------------------------------------------------
-REM 6) Download + merge GitHub repo (Wan2.2 main)
+REM 8) Download + merge GitHub repo (Wan2.2 main)
 REM ------------------------------------------------
 
 echo [INFO] Downloading Wan2.2 GitHub repo (generate.py and scripts)...
@@ -203,8 +199,6 @@ REM ------------------------------------------------
 echo.
 echo [FATAL] WAN 2.2 setup did NOT complete successfully.
 echo         Check the last messages above for the failing step.
-REM ------------------------------------------------
-
 echo.
 pause
 exit /b 1

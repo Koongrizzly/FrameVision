@@ -1,7 +1,8 @@
-# Use CUDA-enabled PyTorch wheels (CUDA 12.1).
+# Use CUDA-enabled PyTorch wheels (CUDA 12.1) for WAN 2.2.
+# NOTE: PyTorch (torch/torchvision/torchaudio) is installed separately
+#       in wan22_setup.bat and MUST NOT be installed from this file.
 --extra-index-url https://download.pytorch.org/whl/cu121
 
-# Core image / UI / HF deps
 Pillow
 tqdm
 imageio
@@ -9,26 +10,22 @@ PySide6
 huggingface_hub
 safetensors
 
-# Media / math / vision helpers
+# Wan 2.2 deps (no torch/torchvision/torchaudio here!)
 einops
 decord
 librosa
-opencv-python>=4.9.0.80
+peft==0.18.0
 
-# Utility / text / misc
+opencv-python>=4.9.0.80
+diffusers==0.35.2
+transformers>=4.52.0,<5.0.0
+tokenizers>=0.20.3
+accelerate>=1.1.1
+tqdm
+imageio[ffmpeg]
 easydict
 ftfy
 dashscope
 imageio-ffmpeg
+# flash_attn
 numpy>=1.23.5,<2
-
-# WAN core stack (installed in wan22_setup.bat with --no-deps so they don't touch torch)
-# transformers==4.57.3
-# diffusers==0.35.2
-# peft==0.18.0
-# accelerate==1.12.0
-# tokenizers==0.22.1
-
-# Optional optimizations for Wan2.2 (kept commented to avoid fragile installs)
-# triton-windows==3.5.0
-# bitsandbytes>=0.44.1
