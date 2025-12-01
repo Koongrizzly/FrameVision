@@ -21,7 +21,8 @@ _Music Video Clip Creator_
 - [ ] Aspect ratios: 16:9 or 9:16 with Source, Fill (auto-crop), or Stretch modes.
 - [ ] Multiple output resolutions supported.(source/lowest/highest + fixed 480/720/1080)
 - [ ] Beat-synced Music visuals (this setting more then doubles generation time)
-- choose 1 for the whole clip
+- [ ] 3 settings
+- 1 (random) beat synced visual for the whole clip
 - a new (random) one for every segment
 - One per Section (intro verse chorus break drop outro) with user selection (200+ visuals)
 - Transparency slider 0-100 (100 will only show beat synced visuals)
