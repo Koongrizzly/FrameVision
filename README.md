@@ -102,16 +102,17 @@ _Metadata Tool_ – edit or delete metadata from videos and images (with batch s
 - [ ] Frame Extractor fix – proper saving for single and batch modes.
 
 ---
+---
 
-Framevidion All in one sound/image/video tool FULL feauture list
-
+FrameVision All in one sound/image/video tool FULL feauture list
+---
 ### 🧪 Upscaler with model loader (15+ open source upscale models for photo & video)
 ### ⏱️ RIFE Interpolation
 ### 📝 Describe anything with Qwen3 VL 2B
 ### 🖌️ TXT → IMG (SD15/SDXL/Z-Image)
-### 🎬 WAN 2.2 5B txt/img/video to video with extender
-### 🎵 Ace Music
-### 🖌 Remove Background + basic inpainting
+### 🎬 WAN 2.2 5B txt/img/video to video with video extender
+### 🎵 Ace Music creation
+### 🖌 Remove Background + basic (sd15) inpainting
 ### 👽 Ask Framie, little offline chatbot, works with Qwen3VL 2B
 ### 🧰 Tools
 - Change speed for videos (with audio sync).
