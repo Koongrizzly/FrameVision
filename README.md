@@ -6,6 +6,7 @@ December 1, 2025 V2.0 is finally ready
 ### 🌟 Release Notes
 ---
 **🧩 NEW Features**
+---
 _Music Video Clip Creator_
 - [ ] Works with every CPU or Gpu.
 - [ ] Load one or multiple clips and/or images, add your music track, and create a complete music video in a couple of minutes*.
