@@ -105,36 +105,36 @@ _Metadata Tool_ – edit or delete metadata from videos and images (with batch s
 ---
 ---
 
-FrameVision All in one sound/image/video tool FULL feauture list
+FrameVision All in one sound/image/video tool FULL feature list
 ---
 ### 🧪 Upscaler with model loader (15+ open source upscale models for photo & video)
 ### ⏱️ RIFE Interpolation
-### 📝 Describe anything with Qwen3 VL 2B
+### 📝 Describe in detail with Qwen3 VL 2B
 ### 🖌️ TXT → IMG (SD15/SDXL/Z-Image)
-### 🎬 WAN 2.2 5B txt/img/video to video with video extender
+### 🎬 txt/img/video to video with WAN 2.2 5B (video extender included)
 ### 🎵 Ace Music creation
 ### 🖌 Remove Background + basic (sd15) inpainting
 ### 👽 Ask Framie, little offline chatbot, works with Qwen3VL 2B
 ### 🧰 Tools
 - Change speed for videos (with audio sync).
-- Prompt enhancer
+- Prompt enhancer (Qwen3VL)
 - Thumbnail/meme creator
 - Sound edit (mini audacity)
 - sound mixer
 - (music) videoclip creator
 - Resize image/video 
-- Create Gif files
-- Extract frames, add frames together
+- Create Gif files :2 sections : use currently playing video or load images from a folder
+- Extract/join frames
 - Trim videos
 - Crop videos/images
-- Multi rename/replace
+- Multi rename/replace 
 - Metadata editor/remover
 ### ⏳ Batch tools for almost all tools
 ### 📋 Advanced Queue with seperate worker for most tools
 ### 🧮 System Monitor with Hud
 ### 🕹️ EASTER EGGS : use the app to unlock them
 ### 📺 in app resizable Multi media player
-### 🎶 Music player with playlist & 200+ bneat synced visuals
+### 🎶 Music player with playlist & 200+ beat synced visuals
 ### All kinds of extra's i forgot to mention such as random 'open app' screens with visual overlays or 20+ themes.
 ---
 
