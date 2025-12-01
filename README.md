@@ -28,10 +28,11 @@ _Music Video Clip Creator_
 - Transparency slider 0-100 (100 will only show beat synced visuals)
 - [ ] Timeline Editor Tab
 - Shows a detailed view of the entire track
-- Visual preview of each segment with zoom and pan and right moiuse button options
+- Visual preview of each segment with zoom and pan and right mouse button options
 - Rename added clips/images.
 - Add clips or images directly to segments.
-- (beta) Save or load JSON timeline files for re-use *Lowering beats per segment, long tracks, and/or adding beat-synced visuals will make generation time longer. 
+- (beta) Save or load JSON timeline files for re-use.
+-   *Lowering beats per segment, long tracks, and/or adding beat-synced visuals will make generation time longer. 
 
 _Wan 2.2 – Text & Image to Video creation_
 
