@@ -12,8 +12,8 @@ def _infer_image_format_from_input(job_args):
     except Exception:
         pass
     return None
-# FrameVision worker V1.0.6 — NCNN wiring
-import json, time, subprocess, os, re, shutil
+# FrameVision worker V2.0 — NCNN wiring
+import json, time, subprocess, os, re, shutil, sys
 from pathlib import Path
 try:
     from PIL import Image
@@ -79,6 +79,20 @@ try:
         pass
 except Exception:
     pass
+
+import warnings
+
+# 1) Suppress the original scary warning
+warnings.filterwarnings(
+    "ignore",
+    message="torch.distributed.reduce_op is deprecated, please use torch.distributed.ReduceOp instead",
+    category=UserWarning,
+)
+
+# 2) Print your own friendlier note once at startup
+print("[torch info] Using an older internal PyTorch alias; this warning is harmless and can be ignored.")
+
+
 # -----------------------------------------------------------------------
 
 ROOT = Path(".").resolve()
@@ -330,24 +344,34 @@ def manifest():
     except Exception: return {}
 
 def run(cmd):
+    env = os.environ.copy()
+    env.setdefault("PYTHONUTF8", "1")
+    env.setdefault("PYTHONIOENCODING", "utf-8")
     try:
         LOGS = ROOT/"logs"; LOGS.mkdir(parents=True, exist_ok=True)
         stamp = time.strftime("%Y%m%d_%H%M%S")
         log_file = LOGS/f"run_{stamp}.log"
         with open(log_file, "w", encoding="utf-8") as f:
             f.write("CMD: " + " ".join([str(x) for x in cmd]) + "\n\n")
-            p = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+            p = subprocess.Popen(
+                cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                env=env,
+            )
             for line in p.stdout:
-                try: f.write(line)
-                except Exception: pass
+                try:
+                    f.write(line)
+                except Exception:
+                    pass
             code = p.wait()
             f.write(f"\nEXIT CODE: {code}\n")
         return code
     except Exception:
-        return subprocess.call(cmd)
-
-
-
+        return subprocess.call(cmd, env=env)
 def _progress_set(pct: int):
     try:
         global PROGRESS_FILE, RUNNING_JSON_FILE
@@ -799,6 +823,138 @@ def upscale_photo(job, cfg, mani):
 
 
 def txt2img_generate(job, cfg, mani):
+    """Queue worker entry for txt2img (SD15/SDXL/Z-Image via helpers.txt2img).
+
+    Strong-fail for Z-Image: when engine == "zimage", we never fall back to the
+    legacy Diffusers path. For all other engines we still allow a legacy
+    fallback so existing SD15/SDXL jobs keep working.
+    """
+    # Try the shared helpers.txt2img implementation first
+    try:
+        from helpers import txt2img as _txt2img
+    except BaseException as _imp_err:
+        # Option B: if the helpers package is not available (e.g. standalone worker),
+        # fall back to importing a local txt2img.py that lives next to worker.py.
+        try:
+            import txt2img as _txt2img  # type: ignore
+            try:
+                print("[worker txt2img] helpers package not present; using local txt2img.py (OK)")
+            except Exception:
+                pass
+        except BaseException as _imp_err2:
+            try:
+                print("[worker txt2img] helpers.txt2img and local txt2img imports failed; falling back to legacy:",
+                      _imp_err, "/", _imp_err2)
+            except Exception:
+                pass
+            return _txt2img_generate_legacy(job, cfg, mani)
+
+    # Pull args produced by queue_adapter / enqueue_txt2img
+    try:
+        args = job.get("args") or {}
+    except Exception:
+        args = {}
+
+    # Resolve output directory (queue JSON uses job["out_dir"])
+    try:
+        from pathlib import Path as _P
+        out_dir = _P(job.get("out_dir") or "./output/photo/txt2img")
+        out_dir.mkdir(parents=True, exist_ok=True)
+    except Exception:
+        out_dir = None
+
+    # Build a UI-style job dict for helpers.txt2img
+    helper_job = dict(args)
+    if out_dir is not None:
+        helper_job.setdefault("output", str(out_dir))
+
+    # Normalise engine selector
+    try:
+        engine = (str(args.get("engine") or job.get("engine") or "diffusers")).strip().lower()
+    except Exception:
+        engine = "diffusers"
+    helper_job["engine"] = engine
+    try:
+        print(f"[worker txt2img] job id={job.get('id','?')} engine={engine!r}")
+    except Exception:
+        pass
+
+    res = None
+
+    # Strict Z-Image path (Option A: no SDXL fallback)
+    if engine == "zimage":
+        try:
+            res = _txt2img.generate_qwen_images(helper_job, progress_cb=None, cancel_event=None)
+        except BaseException as e:
+            try:
+                _mark_error(job, f"Z-Image txt2img failed: {e}")
+            except Exception:
+                pass
+            try:
+                print("[worker txt2img] Z-Image backend raised; NOT falling back to legacy SDXL.")
+            except Exception:
+                pass
+            return 2
+
+        if not res or not res.get("files"):
+            try:
+                _mark_error(job, "Z-Image backend produced no images.")
+            except Exception:
+                pass
+            try:
+                print("[worker txt2img] Z-Image backend returned no files; NOT falling back to legacy SDXL.")
+            except Exception:
+                pass
+            return 2
+    else:
+        # Non-Z-Image engines: allow helper + legacy Diffusers fallback
+        try:
+            res = _txt2img.generate_qwen_images(helper_job, progress_cb=None, cancel_event=None)
+        except Exception as e:
+            try:
+                _mark_error(job, f"txt2img helper failed: {e}")
+            except Exception:
+                pass
+            try:
+                print("[worker txt2img] helper path failed; falling back to legacy diffusers.")
+            except Exception:
+                pass
+            return _txt2img_generate_legacy(job, cfg, mani)
+
+        if not res or not res.get("files"):
+            try:
+                _mark_error(job, "No images produced (helpers.txt2img returned empty result).")
+            except Exception:
+                pass
+            try:
+                print("[worker txt2img] helper produced no images; falling back to legacy diffusers.")
+            except Exception:
+                pass
+            return _txt2img_generate_legacy(job, cfg, mani)
+
+    # Map result back onto the queue job for UI / JSON
+    try:
+        files = res.get("files") or []
+        job["files"] = files
+        if files:
+            job["produced"] = files[-1]
+        backend = res.get("engine") or res.get("backend")
+        if backend:
+            job["backend"] = backend
+        model = res.get("model")
+        if model:
+            job["model"] = model
+    except Exception:
+        pass
+
+    try:
+        _progress_set(100)
+    except Exception:
+        pass
+    return 0
+
+
+def _txt2img_generate_legacy(job, cfg, mani):
     # Offline txt2img using local diffusers pipeline
     try:
         import importlib, time
@@ -946,6 +1102,683 @@ def txt2img_generate(job, cfg, mani):
         except Exception: pass
         return 2
 
+
+def ace_generate(job, cfg, mani):
+    """Queue worker entry for ACE-Step (text-to-music or audio-to-audio).
+
+    Accepts job types:
+      - "ace_text2music"
+      - "ace_audio2audio"
+      - "ace" / "ace_step" / "ace_music" (aliases)
+
+    This mirrors the logic of helpers/ace.py:AceWorker.run but uses the
+    job['args'] dict plus Ace config JSON (presets/setsave/ace.json).
+    """
+    import subprocess as _subprocess, tempfile as _tempfile, time as _time
+    from pathlib import Path as _Path
+
+    # Pull args safely
+    try:
+        args = job.get("args") or {}
+    except Exception:
+        args = {}
+
+    # Friendly title / label for the queue row
+    try:
+        title = args.get("label") or (args.get("prompt", "")[:80] or "ACE-Step")
+        job["title"] = title
+        try:
+            job["label"] = title
+        except Exception:
+            pass
+        try:
+            a = job.get("args") or {}
+            if not a.get("label"):
+                a["label"] = title
+            job["args"] = a
+        except Exception:
+            pass
+    except Exception:
+        pass
+
+    # Resolve FrameVision root
+    root = BASE
+
+    # Load ACE config JSON (same file AceConfig uses)
+    ace_cfg = {}
+    try:
+        cfg_path = root / "presets" / "setsave" / "ace.json"
+        if cfg_path.exists():
+            ace_cfg = json.loads(cfg_path.read_text(encoding="utf-8"))
+    except Exception:
+        ace_cfg = {}
+
+    def _cfg(key, default=None):
+        """Prefer explicit job args, then ace.json, then default."""
+        v = args.get(key, None)
+        if v is None:
+            v = ace_cfg.get(key, default)
+        return v if v is not None else default
+
+    # Core generation parameters
+    prompt = _cfg("prompt", "")
+    negative_prompt = _cfg("negative_prompt", "")
+    lyrics = _cfg("lyrics", "")
+    audio_duration = float(_cfg("audio_duration", 60.0) or 60.0)
+    infer_step = int(_cfg("infer_step", 60) or 60)
+    guidance_scale = float(_cfg("guidance_scale", 15.0) or 15.0)
+    scheduler_type = _cfg("scheduler_type", "euler") or "euler"
+    cfg_type = _cfg("cfg_type", "apg") or "apg"
+
+    # Advanced guidance / ERG settings
+    omega_scale = float(_cfg("omega_scale", 10.0) or 10.0)
+    guidance_interval = float(_cfg("guidance_interval", 0.5) or 0.5)
+    guidance_interval_decay = float(_cfg("guidance_interval_decay", 0.0) or 0.0)
+    min_guidance_scale = float(_cfg("min_guidance_scale", 3.0) or 3.0)
+    guidance_scale_text = float(_cfg("guidance_scale_text", 5.0) or 5.0)
+    guidance_scale_lyric = float(_cfg("guidance_scale_lyric", 1.5) or 1.5)
+    use_erg_tag = bool(_cfg("use_erg_tag", True))
+    use_erg_lyric = bool(_cfg("use_erg_lyric", False))
+    use_erg_diffusion = bool(_cfg("use_erg_diffusion", True))
+
+    # Device / precision
+    bf16 = bool(_cfg("bf16", True))
+    cpu_offload = bool(_cfg("cpu_offload", False))
+    overlapped_decode = bool(_cfg("overlapped_decode", False))
+    device_id = int(_cfg("device_id", 0) or 0)
+
+    # Seed handling: single-seed text or audio2audio job
+    try:
+        seed_val = int(_cfg("seed", 0) or 0)
+    except Exception:
+        seed_val = 0
+    if seed_val == 0:
+        try:
+            import random as _rnd
+            seed_val = _rnd.randint(0, 2_147_483_647)
+        except Exception:
+            seed_val = 0
+    actual_seeds = [int(seed_val)]
+    manual_seeds = ", ".join(map(str, actual_seeds))
+
+    # OSS steps: list or string
+    oss_steps = _cfg("oss_steps", [])
+    if isinstance(oss_steps, (list, tuple)):
+        oss_steps_str = ", ".join(map(str, oss_steps))
+    else:
+        oss_steps_str = str(oss_steps or "")
+
+    # Reference audio
+    ref_audio_input = str(_cfg("ref_audio_input", "") or "").strip()
+    ref_audio_strength = float(_cfg("ref_audio_strength", 0.5) or 0.5)
+    if ref_audio_input:
+        try:
+            p = _Path(ref_audio_input)
+            if not p.is_absolute():
+                p = (root / p).resolve()
+            ref_audio_input = str(p)
+        except Exception:
+            ref_audio_input = str(ref_audio_input)
+        audio2audio_enable = True
+    else:
+        ref_audio_input = None
+        audio2audio_enable = bool(_cfg("audio2audio_enable", False))
+
+    # Output directory
+    try:
+        out_dir = _Path(job.get("out_dir") or (root / "output" / "ace"))
+    except Exception:
+        out_dir = root / "output" / "ace"
+    try:
+        out_dir.mkdir(parents=True, exist_ok=True)
+    except Exception:
+        pass
+
+    # Build descriptive filename using user track name, seed and preset
+    try:
+        track_name_raw = str(_cfg("track_name", "") or "").strip()
+    except Exception:
+        track_name_raw = ""
+    try:
+        preset_name_raw = str(_cfg("preset_name", "") or "").strip()
+    except Exception:
+        preset_name_raw = ""
+    import re as _re
+    def _slugify_name(value: str, default: str) -> str:
+        value = (value or "").strip()
+        if not value:
+            return default
+        value = _re.sub(r"[^a-zA-Z0-9_]+", "_", value)
+        value = value.strip("_") or default
+        return value.lower()
+    track_slug = _slugify_name(track_name_raw, "track")
+    preset_slug = _slugify_name(preset_name_raw, "preset")
+
+    base_seed = actual_seeds[0] if actual_seeds else int(seed_val or 0)
+    filename = f"{track_slug}_{base_seed}_{preset_slug}.wav"
+    output_path = str(out_dir / filename)
+
+    # Checkpoint directory: use ace.json if it overrides, else default under presets/extra_env
+    checkpoint_rel = ace_cfg.get("checkpoint_path", ".ace_env/ACE-Step/checkpoints")
+    try:
+        checkpoint_path = str((root / checkpoint_rel).resolve())
+    except Exception:
+        # Fallback: standard location under presets/extra_env
+        checkpoint_path = str((root / "presets" / "extra_env" / ".ace_env" / "ACE-Step" / "checkpoints").resolve())
+
+    # Build job payload for the ACE runner
+    jobj = {
+        "checkpoint_path": checkpoint_path,
+        "dtype": "bfloat16" if bf16 else "float32",
+        "torch_compile": False,
+        "cpu_offload": bool(cpu_offload),
+        "overlapped_decode": bool(overlapped_decode),
+        "device_id": int(device_id),
+        "prompt": prompt,
+        "negative_prompt": negative_prompt,
+        "lyrics": lyrics,
+        "audio_duration": float(audio_duration),
+        "infer_step": int(infer_step),
+        "guidance_scale": float(guidance_scale),
+        "scheduler_type": scheduler_type,
+        "cfg_type": cfg_type,
+        "manual_seeds": manual_seeds,
+        "omega_scale": float(omega_scale),
+        "guidance_interval": float(guidance_interval),
+        "guidance_interval_decay": float(guidance_interval_decay),
+        "min_guidance_scale": float(min_guidance_scale),
+        "use_erg_tag": bool(use_erg_tag),
+        "use_erg_lyric": bool(use_erg_lyric),
+        "use_erg_diffusion": bool(use_erg_diffusion),
+        "oss_steps": oss_steps_str,
+        "guidance_scale_text": float(guidance_scale_text),
+        "guidance_scale_lyric": float(guidance_scale_lyric),
+        "audio2audio_enable": bool(audio2audio_enable),
+        "ref_audio_strength": float(ref_audio_strength),
+        "ref_audio_input": ref_audio_input,
+        "output_path": output_path,
+    }
+
+    # Write temporary job JSON
+    tmp_dir = _Path(_tempfile.gettempdir())
+    tmp_path = tmp_dir / f"framevision_ace_job_{os.getpid()}_{int(_time.time())}.json"
+    try:
+        tmp_path.write_text(json.dumps(jobj), encoding="utf-8")
+    except Exception as e:
+        _mark_error(job, f"Could not write ACE job file: {e}")
+        return 2
+
+    # Determine ACE env Python and runner script (same layout as in helpers/ace.py)
+    ace_env_dir = root / "presets" / "extra_env" / ".ace_env"
+    ace_repo_dir = ace_env_dir / "ACE-Step"
+    if os.name == "nt":
+        ace_python = ace_env_dir / "Scripts" / "python.exe"
+    else:
+        ace_python = ace_env_dir / "bin" / "python"
+
+    runner_script = ace_repo_dir / "framevision_ace_runner.py"
+    if not ace_python.exists():
+        _mark_error(job, f"ACE env python not found at: {ace_python}")
+        return 2
+    if not runner_script.exists():
+        _mark_error(job, f"ACE runner script not found at: {runner_script}")
+        return 2
+
+    env = os.environ.copy()
+    env["CUDA_VISIBLE_DEVICES"] = str(device_id)
+
+    cmd = [str(ace_python), str(runner_script), str(tmp_path)]
+
+    # Progress/ETA: stream ACE logs and infer "X/Y" style step progress when possible.
+    try:
+        log_dir = root / "logs"
+        log_dir.mkdir(parents=True, exist_ok=True)
+        stamp = _time.strftime("%Y%m%d_%H%M%S")
+        log_file = log_dir / f"ace_{stamp}.log"
+    except Exception:
+        log_file = None
+
+    try:
+        _progress_set(5)
+    except Exception:
+        pass
+
+    import re as _re
+
+    step_re = _re.compile(r"(\d+)\s*/\s*(\d+)")
+    total_steps = None
+    last_step = 0
+    last_pct = -1
+    start_ts = _time.time()
+
+    def _update_progress():
+        nonlocal last_pct
+        pct = 5.0
+        if total_steps and total_steps > 0:
+            frac = max(0.0, min(1.0, float(last_step) / float(total_steps)))
+            pct = 5.0 + 90.0 * frac
+        else:
+            # Fallback: small time-based ramp up to ~25% so very fast jobs aren't stuck at 5%.
+            elapsed = max(0.0, _time.time() - start_ts)
+            pct = 5.0 + min(20.0, (elapsed / 20.0) * 20.0)
+        ipct = int(max(5, min(98, round(pct))))
+        if ipct != last_pct:
+            try:
+                _progress_set(ipct)
+            except Exception:
+                pass
+            last_pct = ipct
+
+    code = 0
+    try:
+        lf = None
+        if log_file is not None:
+            try:
+                lf = open(log_file, "w", encoding="utf-8")
+                lf.write("CMD: " + " ".join(str(x) for x in cmd) + "\n\n")
+                lf.flush()
+            except Exception:
+                lf = None
+
+        p = _subprocess.Popen(
+            cmd,
+            stdout=_subprocess.PIPE,
+            stderr=_subprocess.STDOUT,
+            text=True,
+            env=env,
+        )
+        while True:
+            line = p.stdout.readline()
+            if line == "" and p.poll() is not None:
+                break
+            if not line:
+                _update_progress()
+                _time.sleep(0.3)
+                continue
+
+            if lf is not None:
+                try:
+                    lf.write(line)
+                except Exception:
+                    pass
+            try:
+                print("[ACE]", line, end="")
+            except Exception:
+                pass
+
+            try:
+                m = step_re.search(line)
+            except Exception:
+                m = None
+            if m:
+                try:
+                    cur = int(m.group(1))
+                    tot = int(m.group(2))
+                    if tot > 0:
+                        if total_steps is None or total_steps != tot:
+                            total_steps = tot
+                        if cur > last_step:
+                            last_step = min(cur, tot)
+                except Exception:
+                    pass
+
+            _update_progress()
+
+        code = p.wait()
+        if lf is not None:
+            try:
+                lf.write(f"\nEXIT CODE: {code}\n")
+                lf.close()
+            except Exception:
+                pass
+    except Exception as e:
+        _mark_error(job, f"ACE-Step runner exception: {e}")
+        return 2
+
+    if code != 0:
+        _mark_error(job, f"ACE-Step runner failed (code {code}).")
+        return 2
+    # Success: record produced file and mark 100%
+    try:
+        job["produced"] = output_path
+    except Exception:
+        pass
+    try:
+        _progress_set(100)
+    except Exception:
+        pass
+    return 0
+
+
+def wan22_generate(job, cfg, mani):
+    """
+    Queue worker entry for Wan 2.2 TI2V (text2video / image2video) with
+    best-effort progress + ETA reporting based on stdout "step" logs.
+
+    Expected job shape:
+      type: "wan22_text2video" | "wan22_image2video" | "wan22_ti2v" | "wan22"
+      input: optional path to start image for image2video
+      out_dir: base output folder (optional – defaults to ./output/video/wan22)
+      args: {
+          "prompt": str,
+          "mode": "text2video" | "image2video" (optional, inferred from type),
+          "image": str (start image, for image2video),
+          "size": "1280*704" | "704*1280",
+          "steps": int,
+          "guidance": float | int,
+          "guidance_scale": float | int,
+          "frames": int,
+          "frame_num": int,
+          "seed": int,
+          "base_seed": int,
+          "random_seed": bool | str,
+          "save_file": str,
+          "output_path": str,
+      }
+    """
+    from pathlib import Path as _Path
+    import time as _time
+    import re as _re
+    global ROOT, BASE
+
+    try:
+        args = job.get("args") or {}
+    except Exception:
+        args = {}
+
+    # Nice title in the queue row
+    try:
+        title = args.get("label") or (args.get("prompt", "")[:80] or "WAN 2.2")
+        job["title"] = title
+        # Mirror onto common fields some UIs may read
+        try:
+            job["label"] = title
+        except Exception:
+            pass
+        try:
+            a = job.get("args") or {}
+            if not a.get("label"):
+                a["label"] = title
+            job["args"] = a
+        except Exception:
+            pass
+    except Exception:
+        pass
+
+    root = BASE
+
+    # Resolve Wan virtualenv Python
+    try:
+        if os.name == "nt":
+            cand = root / ".wan_venv" / "Scripts" / "python.exe"
+        else:
+            cand = root / ".wan_venv" / "bin" / "python"
+        if cand.exists():
+            py = str(cand)
+        else:
+            py = sys.executable or "python"
+    except Exception:
+        try:
+            py = sys.executable
+        except Exception:
+            py = "python"
+
+    model_root = root / "models" / "wan22"
+    gen = model_root / "generate.py"
+    if not gen.exists():
+        _mark_error(job, f"Wan2.2 generate.py not found at {gen}")
+        return 2
+
+    # Mode inference
+    mode = (str(args.get("mode") or "") or "").strip().lower()
+    t = str(job.get("type") or "").lower()
+    if not mode:
+        if "image" in t:
+            mode = "image2video"
+        else:
+            mode = "text2video"
+
+    # Core params
+    size_str = (args.get("size") or "1280*704").strip() or "1280*704"
+    steps = int(args.get("steps") or args.get("sample_steps") or 30)
+    guidance = float(args.get("guidance") or args.get("guidance_scale") or 7)
+    frames = int(args.get("frames") or args.get("frame_num") or 121)
+
+    base_seed = int(args.get("seed") or args.get("base_seed") or 42)
+    rs = args.get("random_seed")
+    if rs in (True, 1, "1", "true", "True", "yes", "on"):
+        import random as _rnd
+        try:
+            base_seed = _rnd.randint(0, 2147483647)
+        except Exception:
+            pass
+
+    prompt = args.get("prompt", "") or ""
+    image = (
+        args.get("image")
+        or args.get("input_image")
+        or args.get("image_path")
+        or job.get("input")
+        or ""
+    )
+
+    # Output folder / file
+    try:
+        out_dir = _Path(job.get("out_dir") or (BASE / "output" / "video" / "wan22"))
+    except Exception:
+        out_dir = BASE / "output" / "video" / "wan22"
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    save_file_arg = args.get("save_file") or args.get("output_path") or ""
+    if save_file_arg:
+        save_path = _Path(save_file_arg)
+        if not save_path.is_absolute():
+            save_path = out_dir / save_path
+    else:
+        base_name = args.get("filename") or f"wan22_{job.get('id') or int(time.time())}.mp4"
+        if not str(base_name).lower().endswith(".mp4"):
+            base_name = f"{base_name}.mp4"
+        save_path = out_dir / base_name
+    try:
+        save_path.parent.mkdir(parents=True, exist_ok=True)
+    except Exception:
+        pass
+
+    # Build command
+    cmd = [
+        py,
+        str(gen),
+        "--task", "ti2v-5B",
+        "--size", size_str,
+        "--sample_steps", str(steps),
+        "--sample_guide_scale", str(guidance),
+        "--base_seed", str(base_seed),
+        "--frame_num", str(frames),
+        "--ckpt_dir", str(model_root),
+        "--convert_model_dtype",
+    ]
+    if prompt:
+        cmd += ["--prompt", prompt]
+    if mode == "image2video":
+        if not image:
+            _mark_error(job, "Wan2.2 image2video mode requires an image path (args['image'] or job['input']).")
+            return 2
+        cmd += ["--image", str(image)]
+    cmd += ["--save_file", str(save_path)]
+
+    # Expose command for debugging
+    try:
+        job["cmd"] = " ".join(str(x) for x in cmd)
+    except Exception:
+        pass
+
+    # --- Progress-aware run: 2-phase estimate (steps + post) ---
+    # We treat the second phase as roughly equal length to the sampling steps.
+    # Progress is estimated from stdout "step X/Y" logs and wall-clock.
+    log_dir = ROOT / "logs"
+    try:
+        log_dir.mkdir(parents=True, exist_ok=True)
+    except Exception:
+        pass
+    stamp = _time.strftime("%Y%m%d_%H%M%S")
+    log_file = log_dir / f"wan22_{stamp}.log"
+
+    import subprocess as _sp
+
+    # Step / ETA tracking
+    start_ts = _time.time()
+    first_step_ts = None
+    est_step_sec = None
+    total_steps = None
+    last_step_idx = 0
+    est_total_dur = None
+    last_pct = -1
+
+    step_re = _re.compile(r"(?i)(?:step[^0-9]*)?(\d+)\s*/\s*(\d+)")
+
+    def _update_progress_from_state():
+        nonlocal last_pct, est_total_dur
+        now = _time.time()
+        elapsed = max(0.0, now - start_ts)
+
+        if total_steps and est_step_sec:
+            # Estimated duration for one "phase" (sampling) based on steps.
+            phase1_dur = est_step_sec * float(total_steps)
+            # Assume phase2 ~= phase1.
+            est_total_dur = max(phase1_dur * 2.0, phase1_dur + 1.0)
+            if elapsed <= phase1_dur:
+                # First phase: clamp by observed step index.
+                if total_steps > 0:
+                    frac1 = max(0.0, min(1.0, float(last_step_idx) / float(total_steps)))
+                else:
+                    frac1 = 0.0
+                # Map to 0–50%.
+                pct = 50.0 * frac1
+            else:
+                # Second phase: 50–100% over remaining time.
+                rem = max(0.1, est_total_dur - phase1_dur)
+                frac2 = max(0.0, min(1.0, (elapsed - phase1_dur) / rem))
+                pct = 50.0 + 50.0 * frac2
+        elif total_steps:
+            # We know total steps but not timing yet – just use steps → 0–50%.
+            if total_steps > 0:
+                frac1 = max(0.0, min(1.0, float(last_step_idx) / float(total_steps)))
+            else:
+                frac1 = 0.0
+            pct = 50.0 * frac1
+        else:
+            # No info – keep a small "spinner" effect.
+            # Do NOT over-commit ETA; just bump to 5% after a bit.
+            if elapsed > 5.0:
+                pct = 5.0
+            else:
+                pct = 0.0
+
+        ipct = int(max(0, min(99, round(pct))))
+        if ipct != last_pct:
+            try:
+                _progress_set(ipct)
+            except Exception:
+                pass
+            last_pct = ipct
+
+    try:
+        with open(log_file, "w", encoding="utf-8") as lf:
+            lf.write("CMD: " + " ".join([str(x) for x in cmd]) + "\n\n")
+            lf.flush()
+            try:
+                _progress_set(0)
+            except Exception:
+                pass
+
+            env = os.environ.copy()
+            env.setdefault("PYTHONUTF8", "1")
+            env.setdefault("PYTHONIOENCODING", "utf-8")
+
+            p = _sp.Popen(
+                cmd,
+                stdout=_sp.PIPE,
+                stderr=_sp.STDOUT,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                env=env,
+            )
+            while True:
+                line = p.stdout.readline()
+                if line == "" and p.poll() is not None:
+                    break
+                if not line:
+                    # Idle; still update progress from time if we have an estimate.
+                    _update_progress_from_state()
+                    _time.sleep(0.5)
+                    continue
+
+                try:
+                    lf.write(line)
+                except Exception:
+                    pass
+                try:
+                    print("[WAN22]", line, end="")
+                except Exception:
+                    pass
+
+                # Try to parse "step X/Y" style logs.
+                try:
+                    m = step_re.search(line)
+                except Exception:
+                    m = None
+                if m:
+                    try:
+                        cur = int(m.group(1))
+                        tot = int(m.group(2))
+                        if tot > 0:
+                            if total_steps is None or total_steps != tot:
+                                total_steps = tot
+                            now = _time.time()
+                            if first_step_ts is None:
+                                first_step_ts = now
+                            if cur > last_step_idx:
+                                # Update step-rate estimate from timing.
+                                if last_step_idx > 0:
+                                    dt = max(0.01, now - step_ts)  # step_ts set below
+                                    step_count = max(1, cur - last_step_idx)
+                                    sec_per_step = dt / float(step_count)
+                                    if est_step_sec is None:
+                                        est_step_sec = sec_per_step
+                                    else:
+                                        # Smooth the estimate.
+                                        est_step_sec = (est_step_sec * 0.7) + (sec_per_step * 0.3)
+                                last_step_idx = cur
+                                step_ts = now
+                    except Exception:
+                        pass
+
+                # Update progress view
+                _update_progress_from_state()
+
+            code = p.wait()
+            try:
+                _progress_set(100)
+            except Exception:
+                pass
+            lf.write(f"\nEXIT CODE: {code}\n")
+    except Exception:
+        # As a fallback, run without streaming/progress.
+        code = run(cmd)
+
+    if code == 0:
+        if save_path.exists():
+            try:
+                job["produced"] = str(save_path)
+            except Exception:
+                pass
+        else:
+            _mark_error(job, f"Wan2.2 finished but output file is missing: {save_path}")
+            return 2
+    return code
+
+
 def handle_job(jpath: Path):
     job = json.loads(jpath.read_text(encoding="utf-8"))
     cfg = load_config(); mani = manifest()
@@ -994,8 +1827,12 @@ def handle_job(jpath: Path):
         elif t=='tools_ffmpeg': code = tools_ffmpeg(job, cfg, mani)
         elif t=='rife_interpolate':
             code = rife_interpolate(job, cfg, mani)
-        elif t=='txt2img':
+        elif t in ('txt2img','txt2img_qwen'):
             code = txt2img_generate(job, cfg, mani)
+        elif t in ("wan22_text2video","wan22_image2video","wan22_ti2v","wan22"):
+            code = wan22_generate(job, cfg, mani)
+        elif t in ("ace_text2music","ace_audio2audio","ace","ace_step","ace_music"):
+            code = ace_generate(job, cfg, mani)
         else:
             _mark_error(job, f"Unknown job type: {t}")
             code = 2
@@ -1018,7 +1855,7 @@ def handle_job(jpath: Path):
         except Exception:
             pass
         return code
-    except Exception as e:
+    except BaseException as e:
         try:
             _mark_error(job, str(e))
         except Exception:
@@ -1026,7 +1863,7 @@ def handle_job(jpath: Path):
         return 1
 
 def main():
-    print("FrameVision Worker V1.0.9 Watching for jobs in", JOBS["pending"])
+    print("FrameVision Worker V2.0 Waiting for jobs in", JOBS["pending"])
     while True:
         try:
             HEARTBEAT.write_text(time.strftime("%Y-%m-%d %H:%M:%S"), encoding="utf-8")
@@ -1039,7 +1876,13 @@ def main():
         handle_job(items[0])
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except BaseException as e:
+        try:
+            print("[worker main] fatal error caught:", e)
+        except Exception:
+            pass
 
 def _find_rife_exe(cfg: dict, mani: dict):
     names = ["rife-ncnn-vulkan.exe","rife-ncnn-vulkan"]

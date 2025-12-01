@@ -1,17 +1,19 @@
+
 #!/usr/bin/env python3
 
 """
-downloadbg.py — v3.8
+downloadbg.py — v3.9
 - Pre-check destination folders BEFORE any download (prevents re-fetching huge files)
 - Reconciliation FIRST: move scripts/models -> project root models/, then clean
 - Adds --force to re-download even if destination already has the file
 - UltraSharp NCNN (Hugging Face) + SRMD (GitHub) upscaler downloads to models/realesrgan
 - NEW: Treat any file matching 'sd-v1-5-inpainting*.*' in models/bg as present (skip download)
 - Default = ALL models when no flags passed
+- NEW v3.9: Faster-Whisper "medium" model downloader to models/faster_whisper/medium
 """
 import argparse, hashlib, os, sys, urllib.request, urllib.error, pathlib, shutil, time, math, zipfile, io
 
-VERSION = "v3.8"
+VERSION = "v3.9"
 
 # ------------------------------
 # Paths and helpers
@@ -26,6 +28,8 @@ ROOT = _get_project_root()
 ROOT_MODELS = ROOT / "models"
 ROOT_BG = ROOT_MODELS / "bg"
 ROOT_REALESRGAN = ROOT_MODELS / "realesrgan"
+ROOT_FWHISPER = ROOT_MODELS / "faster_whisper"
+ROOT_FWHISPER_MEDIUM = ROOT_FWHISPER / "medium"
 SCRIPTS_MODELS = pathlib.Path(__file__).resolve().parent / "models"
 
 def _human(n_bytes: int) -> str:
@@ -358,6 +362,103 @@ def download_srmd_models(temp_dest: pathlib.Path) -> tuple[int,int]:
         print(f"[move] SRMD -> {ROOT_REALESRGAN} ({moved} file(s))")
     return (extracted, moved)
 
+# RealESRGAN extra models (Remacri + RealeSR-general-v3)
+REALESR_REM_BASE = "https://huggingface.co/tumuyan2/realsr-models/resolve/main/models-ESRGAN-Remacri"
+REALESR_GEN_BASE = "https://huggingface.co/tumuyan2/realsr-models/resolve/main/models-RealeSR-general-v3"
+
+REALESR_EXTRA_FILES = {
+    "realesr-remacri_x4.bin": f"{REALESR_REM_BASE}/x4.bin?download=true",
+    "realesr-remacri_x4.param": f"{REALESR_REM_BASE}/x4.param?download=true",
+    "realesr-general-v3_x4.bin": f"{REALESR_GEN_BASE}/x4.bin?download=true",
+    "realesr-general-v3_x4.param": f"{REALESR_GEN_BASE}/x4.param?download=true",
+}
+
+def download_realesr_extra_models(temp_dest: pathlib.Path, token: str | None = None, force: bool = False) -> tuple[int,int]:
+    """
+    Download extra RealESRGAN NCNN models:
+    - realesr-remacri_x4
+    - realesr-general-v3_x4
+
+    Files are fetched from tumuyan2/realsr-models on HuggingFace
+    into a temporary folder and renamed to the expected NCNN filenames
+    before being moved into models/realesrgan.
+    """
+    temp_dest.mkdir(parents=True, exist_ok=True)
+    ROOT_REALESRGAN.mkdir(parents=True, exist_ok=True)
+
+    downloaded = 0
+    for final_name, url in REALESR_EXTRA_FILES.items():
+        final_path = ROOT_REALESRGAN / final_name
+        if final_path.exists() and not force:
+            print(f"[skip] {final_name} already exists in {ROOT_REALESRGAN}")
+            continue
+        out = temp_dest / final_name
+        if out.exists() and not force:
+            print(f"[skip] {out.name} already exists in {temp_dest}")
+        else:
+            try:
+                print(f"[get ] {final_name} (RealESRGAN extra)")
+                fetch_with_fallback(url, out, expected_sha256=None, token=token)
+                print(f"[ ok ] Saved to {out}")
+                downloaded += 1
+            except Exception as e:
+                print(f"[fail] {final_name}: {e}")
+
+    moved = move_all_to(temp_dest, ROOT_REALESRGAN)
+    if moved:
+        print(f"[move] RealESRGAN extras -> {ROOT_REALESRGAN} ({moved} file(s))")
+    return (downloaded, moved)
+
+
+# Faster-Whisper "medium" model (Systran/faster-whisper-medium)
+FWHISPER_MEDIUM_BASE = "https://huggingface.co/Systran/faster-whisper-medium/resolve/main"
+FWHISPER_MEDIUM_FILES = [
+    "config.json",
+    "model.bin",
+    "tokenizer.json",
+    "vocabulary.txt",
+]
+
+def download_fasterwhisper_medium(temp_dest: pathlib.Path, token: str | None = None, force: bool = False) -> tuple[int,int]:
+    """
+    Download the Faster-Whisper 'medium' CTranslate2 model from HuggingFace into
+    models/faster_whisper/medium.
+
+    - Uses temp_dest as temporary holder then moves into ROOT_FWHISPER_MEDIUM.
+    - Skips download if all expected files already exist (unless force=True).
+    """
+    temp_dest.mkdir(parents=True, exist_ok=True)
+    ROOT_FWHISPER_MEDIUM.mkdir(parents=True, exist_ok=True)
+
+    # Skip if all target files already exist in final folder
+    if not force and all((ROOT_FWHISPER_MEDIUM / f).exists() for f in FWHISPER_MEDIUM_FILES):
+        print(f"[skip] Faster-Whisper medium already present in {ROOT_FWHISPER_MEDIUM}")
+        return (0,0)
+
+    downloaded = 0
+    for fname in FWHISPER_MEDIUM_FILES:
+        final_path = ROOT_FWHISPER_MEDIUM / fname
+        if final_path.exists() and not force:
+            print(f"[skip] {fname} already exists in {ROOT_FWHISPER_MEDIUM}")
+            continue
+        out = temp_dest / fname
+        if out.exists() and not force:
+            print(f"[skip] {out.name} already exists in {temp_dest}")
+        else:
+            url = f"{FWHISPER_MEDIUM_BASE}/{fname}?download=true"
+            try:
+                print(f"[get ] {fname} (Faster-Whisper medium)")
+                fetch_with_fallback(url, out, expected_sha256=None, token=token)
+                print(f"[ ok ] Saved to {out}")
+                downloaded += 1
+            except Exception as e:
+                print(f"[fail] {fname}: {e}")
+
+    moved = move_all_to(temp_dest, ROOT_FWHISPER_MEDIUM)
+    if moved:
+        print(f"[move] Faster-Whisper medium -> {ROOT_FWHISPER_MEDIUM} ({moved} file(s))")
+    return (downloaded, moved)
+
 # ------------------------------
 # Main
 # ------------------------------
@@ -371,7 +472,8 @@ def main():
     ap.add_argument("--realsr", action="store_true", help="Include RealSR 2x/4x (realsr-ncnn-vulkan) zip")
     ap.add_argument("--ultrasharp", action="store_true", help="Download UltraSharp NCNN files to models/realesrgan")
     ap.add_argument("--srmd", action="store_true", help="Download SRMD models (nihui) to models/realesrgan")
-    ap.add_argument("--all", action="store_true", help="Download ALL supported models (includes UltraSharp+SRMD)")
+    ap.add_argument("--fw-medium", action="store_true", help="Download Faster-Whisper medium model (≈1.6 GB) to models/faster_whisper/medium")
+    ap.add_argument("--all", action="store_true", help="Download ALL supported models (includes UltraSharp+SRMD+Faster-Whisper medium)")
     ap.add_argument("--only", nargs="+", choices=list(MODELS.keys()), help="Download only these model keys (space-separated)")
     ap.add_argument("--hf-token", default=None, help="Hugging Face access token (overrides HF_TOKEN/HUGGINGFACE_TOKEN env vars)")
     ap.add_argument("--ignore-errors", action="store_true", help="Return success even if some downloads fail")
@@ -388,13 +490,13 @@ def main():
 
     token = args.hf_token or os.getenv("HF_TOKEN") or os.getenv("HUGGINGFACE_TOKEN")
 
-    # 2) Determine selection
+    # 2) Determine selection for background + main models
     all_keys = list(MODELS.keys())
     selected_default_all = False
     if args.only:
         to_get = args.only
         reason = "--only"
-    elif args.all or (not args.pro and not args.sd15_inpaint and not args.only and not args.realsr and not args.ultrasharp and not args.srmd):
+    elif args.all or (not args.pro and not args.sd15_inpaint and not args.only and not args.realsr and not args.ultrasharp and not args.srmd and not args.fw_medium):
         to_get = all_keys
         reason = "--all(default)"
         selected_default_all = True
@@ -489,9 +591,10 @@ def main():
     else:
         print(f"[clean] No zip files to remove in {ROOT_MODELS.resolve()}")
 
-    # 5) Upscaler extras (UltraSharp + SRMD)
+    # 5) Upscaler extras (UltraSharp + SRMD + RealESRGAN extras)
     include_ultrasharp = args.ultrasharp or selected_default_all or args.all
     include_srmd = args.srmd or selected_default_all or args.all
+    include_realesr_extras = selected_default_all or args.all or args.ultrasharp or args.srmd
     realesr_tmp = pathlib.Path("scripts") / "_tmp_realesrgan"
     try:
         if include_ultrasharp:
@@ -502,6 +605,10 @@ def main():
             ex, mv = download_srmd_models(realesr_tmp)
             if ex == 0 and mv == 0:
                 print("[info] SRMD models done (nothing to do)")
+        if include_realesr_extras:
+            dl2, mv2 = download_realesr_extra_models(realesr_tmp, token=token, force=args.force)
+            if dl2 == 0 and mv2 == 0:
+                print("[info] RealESRGAN extras (Remacri + RealeSR-general-v3) done (nothing to do)")
     finally:
         try:
             if realesr_tmp.exists():
@@ -510,11 +617,27 @@ def main():
         except Exception:
             pass
 
+    # 6) Faster-Whisper medium model
+    include_fw_medium = args.fw_medium or selected_default_all or args.all
+    fw_tmp = pathlib.Path("scripts") / "_tmp_fasterwhisper"
+    try:
+        if include_fw_medium:
+            dl, mv = download_fasterwhisper_medium(fw_tmp, token=token, force=args.force)
+            if dl == 0 and mv == 0:
+                print("[info] Faster-Whisper medium done (nothing to do)")
+    finally:
+        try:
+            if fw_tmp.exists():
+                import shutil as _shutil3
+                _shutil3.rmtree(fw_tmp)
+        except Exception:
+            pass
+
     if any_fail and not args.ignore_errors:
         print("[done] Completed with errors.", file=sys.stderr)
         return 1
 
-    print("[done] Background + upscaler models ready in", ROOT_BG.resolve(), "and", ROOT_REALESRGAN.resolve())
+    print("[done] Background + upscaler models + Faster-Whisper medium ready in", ROOT_BG.resolve(), ",", ROOT_REALESRGAN.resolve(), "and", ROOT_FWHISPER_MEDIUM.resolve())
     return 0
 
 if __name__ == "__main__":

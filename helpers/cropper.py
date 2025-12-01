@@ -151,8 +151,12 @@ def install_cropper_tool(host, section_widget):
     host.img_opts = QWidget(); ilay = QFormLayout(host.img_opts)
     host.combo_img_format = QComboBox(); host.combo_img_format.addItems(["PNG","JPG"])
     host.spin_jpg_quality = QSpinBox(); host.spin_jpg_quality.setRange(1,100); host.spin_jpg_quality.setValue(92)
+    host.spin_png_compression = QSpinBox(); host.spin_png_compression.setRange(0,9); host.spin_png_compression.setValue(6)
+    host.lbl_jpg_quality = QLabel("JPG quality")
+    host.lbl_png_compression = QLabel("PNG compression")
     ilay.addRow("Output format", host.combo_img_format)
-    ilay.addRow("JPG quality", host.spin_jpg_quality)
+    ilay.addRow(host.lbl_jpg_quality, host.spin_jpg_quality)
+    ilay.addRow(host.lbl_png_compression, host.spin_png_compression)
 
     # Buttons
     host.btn_crop = QPushButton("Crop")
@@ -188,10 +192,20 @@ def install_cropper_tool(host, section_widget):
             section_widget.setLayout(lay)
 
     # Mode visibility
+    def _update_img_quality_ui():
+        fmt = host.combo_img_format.currentText().lower()
+        is_jpg = (fmt == "jpg")
+        host.lbl_jpg_quality.setVisible(is_jpg)
+        host.spin_jpg_quality.setVisible(is_jpg)
+        host.lbl_png_compression.setVisible(not is_jpg)
+        host.spin_png_compression.setVisible(not is_jpg)
+
     def _update_mode_ui():
         is_vid = host.mode_combo.currentText().lower() == "video"
         host.vid_opts.setVisible(is_vid); host.img_opts.setVisible(not is_vid)
+
     host.mode_combo.currentIndexChanged.connect(_update_mode_ui); _update_mode_ui()
+    host.combo_img_format.currentIndexChanged.connect(_update_img_quality_ui); _update_img_quality_ui()
 
     # --- Helpers ---
     IMAGE_EXTS = {'.png','.jpg','.jpeg','.webp','.bmp','.tif','.tiff'}
@@ -296,7 +310,13 @@ def install_cropper_tool(host, section_widget):
             q = 2 + int((31 - 2) * (100 - host.spin_jpg_quality.value()) / 100); q = max(2, min(31, q))
             cmd = [ffmpeg_path(), "-y", "-i", str(inp), "-vf", filter_str, "-q:v", str(q), str(out)]
         else:
-            cmd = [ffmpeg_path(), "-y", "-i", str(inp), "-vf", filter_str, str(out)]
+            # PNG: use compression level 0-9 (higher = smaller file, slower)
+            try:
+                comp = int(host.spin_png_compression.value())
+            except Exception:
+                comp = 6
+            comp = max(0, min(9, comp))
+            cmd = [ffmpeg_path(), "-y", "-i", str(inp), "-vf", filter_str, "-compression_level", str(comp), str(out)]
         host._run(cmd, out)
 
     def run_crop():
@@ -351,7 +371,13 @@ def install_cropper_tool(host, section_widget):
                         q = 2 + int((31 - 2) * (100 - host.spin_jpg_quality.value()) / 100); q = max(2, min(31, q))
                         cmd = [ffmpeg_path(), "-y", "-i", str(_p), "-vf", filter_str, "-q:v", str(q), str(out)]
                     else:
-                        cmd = [ffmpeg_path(), "-y", "-i", str(_p), "-vf", filter_str, str(out)]
+                        # PNG: use compression level 0-9 (higher = smaller file, slower)
+                        try:
+                            comp = int(host.spin_png_compression.value())
+                        except Exception:
+                            comp = 6
+                        comp = max(0, min(9, comp))
+                        cmd = [ffmpeg_path(), "-y", "-i", str(_p), "-vf", filter_str, "-compression_level", str(comp), str(out)]
                 host._enqueue_cmd_for_input(_p, cmd, out); ok += 1
             except Exception:
                 continue
@@ -371,7 +397,8 @@ def install_cropper_tool(host, section_widget):
             "w":w,"h":h,
             "x264_preset":host.combo_x264_preset.currentText(),
             "img_format":host.combo_img_format.currentText(),
-            "jpg_quality":int(host.spin_jpg_quality.value())
+            "jpg_quality":int(host.spin_jpg_quality.value()),
+            "png_compression":int(host.spin_png_compression.value())
         }
         pth.write_text(json.dumps(data, indent=2), encoding="utf-8")
         try: QMessageBox.information(host, "Preset saved", str(pth))
@@ -393,6 +420,11 @@ def install_cropper_tool(host, section_widget):
             host.combo_x264_preset.setCurrentText(preset_val)
             host.combo_img_format.setCurrentText(data.get("img_format", host.combo_img_format.currentText()))
             host.spin_jpg_quality.setValue(int(data.get("jpg_quality", host.spin_jpg_quality.value())))
+            host.spin_png_compression.setValue(int(data.get("png_compression", host.spin_png_compression.value())))
+            try:
+                _update_img_quality_ui()
+            except Exception:
+                pass
         except Exception as e:
             try: QMessageBox.critical(host, "Preset error", str(e))
             except Exception: pass
@@ -441,7 +473,13 @@ def install_cropper_tool(host, section_widget):
                         q = 2 + int((31 - 2) * (100 - host.spin_jpg_quality.value()) / 100); q = max(2, min(31, q))
                         cmd = [ffmpeg_path(), "-y", "-i", str(_p), "-vf", filter_str, "-q:v", str(q), str(out)]
                     else:
-                        cmd = [ffmpeg_path(), "-y", "-i", str(_p), "-vf", filter_str, str(out)]
+                        # PNG: use compression level 0-9 (higher = smaller file, slower)
+                        try:
+                            comp = int(host.spin_png_compression.value())
+                        except Exception:
+                            comp = 6
+                        comp = max(0, min(9, comp))
+                        cmd = [ffmpeg_path(), "-y", "-i", str(_p), "-vf", filter_str, "-compression_level", str(comp), str(out)]
                 host._enqueue_cmd_for_input(_p, cmd, out); ok += 1
             except Exception:
                 continue
@@ -461,7 +499,8 @@ def install_cropper_tool(host, section_widget):
             "w":w,"h":h,
             "x264_preset":host.combo_x264_preset.currentText(),
             "img_format":host.combo_img_format.currentText(),
-            "jpg_quality":int(host.spin_jpg_quality.value())
+            "jpg_quality":int(host.spin_jpg_quality.value()),
+            "png_compression":int(host.spin_png_compression.value())
         }
         p.write_text(json.dumps(data, indent=2), encoding="utf-8")
         try: QMessageBox.information(host, "Preset saved", str(p))
@@ -485,6 +524,11 @@ def install_cropper_tool(host, section_widget):
             host.combo_x264_preset.setCurrentText(preset_val)
             host.combo_img_format.setCurrentText(data.get("img_format", host.combo_img_format.currentText()))
             host.spin_jpg_quality.setValue(int(data.get("jpg_quality", host.spin_jpg_quality.value())))
+            host.spin_png_compression.setValue(int(data.get("png_compression", host.spin_png_compression.value())))
+            try:
+                _update_img_quality_ui()
+            except Exception:
+                pass
         except Exception as e:
             try: QMessageBox.critical(host, "Preset error", str(e))
             except Exception: pass

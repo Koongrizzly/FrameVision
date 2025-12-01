@@ -12,7 +12,7 @@ from helpers.mediainfo import refresh_info_now
 
 from PySide6 import QtCore, QtWidgets
 from PySide6.QtCore import Qt, Signal, QSize, QTimer
-from PySide6.QtGui import QTextCursor, QPixmap, QIcon
+from PySide6.QtGui import QTextCursor, QPixmap, QIcon, QPainter, QPainterPath
 
 try:
     from helpers.framevision_app import ROOT, OUT_VIDEOS, OUT_SHOTS
@@ -111,6 +111,69 @@ class FlowLayout(QLayout):
             lineHeight = max(lineHeight, item.sizeHint().height())
 
         return y + lineHeight - rect.y()
+
+# --- helper: rounded pixmap for nicer thumbnails (shared with recents) ---
+def _rounded_pixmap(pm, radius: int = 10):
+    try:
+        if pm is None:
+            return pm
+        if isinstance(pm, QPixmap) and not pm.isNull():
+            w, h = pm.width(), pm.height()
+            if w <= 0 or h <= 0:
+                return pm
+            r = max(0, int(radius))
+            out = QPixmap(w, h)
+            out.fill(Qt.transparent)
+            p = QPainter(out)
+            p.setRenderHint(QPainter.Antialiasing, True)
+            p.setRenderHint(QPainter.SmoothPixmapTransform, True)
+            path = QPainterPath()
+            from PySide6.QtCore import QRectF as _QRectF
+            path.addRoundedRect(_QRectF(0, 0, w, h), r, r)
+            p.setClipPath(path)
+            p.drawPixmap(0, 0, pm)
+            p.end()
+            return out
+        return pm
+    except Exception:
+        return pm
+# --- end helper ---
+
+
+class _Disclosure(QtWidgets.QWidget):
+    """Minimal collapsible section used for the Upscale recents box."""
+    toggled = Signal(bool)
+
+    def __init__(self, title: str, content: QtWidgets.QWidget, start_open: bool = False, parent=None):
+        super().__init__(parent)
+        self._btn = QtWidgets.QToolButton(self)
+        self._btn.setToolButtonStyle(Qt.ToolButtonTextBesideIcon)
+        self._btn.setArrowType(Qt.DownArrow if start_open else Qt.RightArrow)
+        self._btn.setText(title)
+        self._btn.setCheckable(True)
+        self._btn.setChecked(start_open)
+        self._btn.toggled.connect(self._on_clicked)
+        self._body = content
+        self._body.setVisible(start_open)
+        lay = QtWidgets.QVBoxLayout(self)
+        lay.setContentsMargins(6, 6, 6, 6)
+        lay.addWidget(self._btn)
+        lay.addWidget(self._body)
+
+    def _on_clicked(self, checked: bool):
+        try:
+            self._body.setVisible(checked)
+        except Exception:
+            pass
+        try:
+            self._btn.setArrowType(Qt.DownArrow if checked else Qt.RightArrow)
+        except Exception:
+            pass
+        try:
+            self.toggled.emit(checked)
+        except Exception:
+            pass
+
 
 PRESETS_BIN = ROOT / "presets" / "bin"
 BIN_DIR = ROOT / "bin"
@@ -325,6 +388,32 @@ class UpscPane(QtWidgets.QWidget):
 
     def _build_ui(self):
         v_main = QtWidgets.QVBoxLayout(self)
+
+        # Fancy green banner at the top
+        self.banner = QtWidgets.QLabel("Upscaling", self)
+        self.banner.setObjectName("upscBanner")
+        self.banner.setAlignment(Qt.AlignCenter)
+        self.banner.setSizePolicy(QtWidgets.QSizePolicy.Expanding, QtWidgets.QSizePolicy.Fixed)
+        self.banner.setFixedHeight(45)
+        self.banner.setStyleSheet(
+            "#upscBanner {"
+            " font-size: 15px;"
+            " font-weight: 600;"
+            " padding: 8px 17px;"
+            " border-radius: 12px;"
+            " margin: 0 0 6px 0;"
+            " color: white;"
+            " background: qlineargradient("
+            "   x1:0, y1:0, x2:1, y2:0,"
+            "   stop:0 #1565c0,"      # deep blue
+            "   stop:0.5 #1e88e5,"    # medium blue
+            "   stop:1 #42a5f5"       # bright blue
+            " );"
+            " letter-spacing: 0.5px;"
+            "}"
+        )
+        v_main.addWidget(self.banner)
+        v_main.addSpacing(4)
         scroll = QtWidgets.QScrollArea(self)
         scroll.setWidgetResizable(True)
         _content = QtWidgets.QWidget(self)
@@ -486,79 +575,6 @@ class UpscPane(QtWidgets.QWidget):
         inner.addLayout(hl_out)
         v.addWidget(self.box_models)
 
-        # --- Recent results ---
-        rec_box = CollapsibleSection("Recent results", expanded=True, parent=self)
-        self.recents_box = rec_box
-
-        rec_wrap = QtWidgets.QVBoxLayout(); rec_wrap.setContentsMargins(6,2,6,6); rec_wrap.setSpacing(6)
-
-        # Size slider
-        size_row = QtWidgets.QHBoxLayout()
-        size_row.addWidget(QtWidgets.QLabel("Thumb size:", self))
-        self.sld_recent_size = QtWidgets.QSlider(Qt.Horizontal, self)
-        self.sld_recent_size.setMinimum(50)
-        self.sld_recent_size.setMaximum(180)
-        self.sld_recent_size.setSingleStep(8)
-        self.sld_recent_size.setPageStep(30)
-        self.sld_recent_size.setValue(100)
-        size_row.addWidget(self.sld_recent_size, 1)
-        self.lbl_recent_size = QtWidgets.QLabel("100 px", self)
-        size_row.addWidget(self.lbl_recent_size)
-        rec_wrap.addLayout(size_row)
-
-        # Horizontal scroller with items in a row
-        self.recents_scroll = QtWidgets.QScrollArea(self)
-        self.recents_scroll.setWidgetResizable(True)
-        self.recents_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
-        self.recents_scroll.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
-
-        
-        try:
-            # Fix '1-per-row' by triggering rebuilds on width changes
-            self.recents_scroll.viewport().installEventFilter(self)
-        except Exception:
-            pass
-
-        self._recents_inner = QtWidgets.QWidget(self)
-        self._recents_row = QtWidgets.QGridLayout(self._recents_inner)  # wrapped grid
-        self._recents_row.setContentsMargins(0,0,0,0)
-        self._recents_row.setSpacing(8)
-        self.recents_scroll.setWidget(self._recents_inner)
-        rec_wrap.addWidget(self.recents_scroll)
-
-        try:
-            self.recents_box.setContentLayout(rec_wrap)
-        except Exception:
-            _rw = QtWidgets.QWidget(); _rw.setLayout(rec_wrap); self.recents_box.addWidget(_rw)
-        v.addWidget(rec_box)
-        
-        try:
-            QTimer.singleShot(0, self._rebuild_recents)
-        except Exception:
-            pass
-
-# start recents poller
-        try:
-            self._install_recents_poller()
-        except Exception:
-            pass
-
-        # Wires for size slider
-        def _on_recent_size(val):
-            try:
-                self.lbl_recent_size.setText(f"{val} px")
-            except Exception:
-                pass
-            try:
-                self._rebuild_recents()
-            except Exception:
-                pass
-
-        try:
-            self.sld_recent_size.valueChanged.connect(_on_recent_size)
-        except Exception:
-            pass
-
         # Encoder (inline)
         self.box_encoder = QtWidgets.QWidget(self)
         lay_enc = QtWidgets.QGridLayout(self.box_encoder); lay_enc.setContentsMargins(6,2,6,6)
@@ -627,7 +643,7 @@ class UpscPane(QtWidgets.QWidget):
 
         # Audio
         lay_enc.addWidget(QtWidgets.QLabel("Audio:", self), 5, 0)
-        self.radio_a_copy = QtWidgets.QRadioButton("Copy", self); self.radio_a_copy.setChecked(True)
+        self.radio_a_copy = QtWidgets.QRadioButton("Keep", self); self.radio_a_copy.setChecked(True)
         self.radio_a_encode = QtWidgets.QRadioButton("Encode", self)
         self.radio_a_mute = QtWidgets.QRadioButton("Mute", self)
         arow = QtWidgets.QHBoxLayout(); arow.addWidget(self.radio_a_copy); arow.addWidget(self.radio_a_encode); arow.addWidget(self.radio_a_mute); arow.addStretch(1)
@@ -746,6 +762,187 @@ class UpscPane(QtWidgets.QWidget):
         else:
             self.log.hide()
 
+        # Recent results (sticky, above Upscale / Batch / Info; collapsed by default)
+        try:
+            rec_body = QtWidgets.QWidget(self)
+            rec_wrap = QtWidgets.QVBoxLayout(rec_body)
+            rec_wrap.setContentsMargins(6, 2, 6, 6)
+            rec_wrap.setSpacing(6)
+
+            # Size + sort row
+            size_row = QtWidgets.QHBoxLayout()
+
+            # Sort dropdown (recent results)
+            try:
+                lbl_sort = QtWidgets.QLabel("Sort:", self)
+            except Exception:
+                lbl_sort = None
+            try:
+                self.combo_recent_sort = QtWidgets.QComboBox(self)
+                self.combo_recent_sort.addItem("Newest first", "newest")
+                self.combo_recent_sort.addItem("Oldest first", "oldest")
+                self.combo_recent_sort.addItem("Alphabetical (A-Z)", "az")
+                self.combo_recent_sort.addItem("Alphabetical (Z-A)", "za")
+                self.combo_recent_sort.addItem("Size (smallest first)", "size_small")
+                self.combo_recent_sort.addItem("Size (largest first)", "size_large")
+            except Exception:
+                self.combo_recent_sort = None
+
+            try:
+                if lbl_sort is not None:
+                    size_row.addWidget(lbl_sort)
+            except Exception:
+                pass
+            try:
+                if self.combo_recent_sort is not None:
+                    size_row.addWidget(self.combo_recent_sort)
+            except Exception:
+                pass
+
+            size_row.addSpacing(12)
+            size_row.addWidget(QtWidgets.QLabel("Thumb size:", self))
+            self.sld_recent_size = QtWidgets.QSlider(Qt.Horizontal, self)
+            self.sld_recent_size.setMinimum(50)
+            self.sld_recent_size.setMaximum(180)
+            self.sld_recent_size.setSingleStep(8)
+            self.sld_recent_size.setPageStep(30)
+            self.sld_recent_size.setValue(100)
+            size_row.addWidget(self.sld_recent_size, 1)
+            self.lbl_recent_size = QtWidgets.QLabel("100 px", self)
+            size_row.addWidget(self.lbl_recent_size)
+            rec_wrap.addLayout(size_row)
+
+            # Scroll area with a wrapped grid of thumbnails
+            self.recents_scroll = QtWidgets.QScrollArea(self)
+            self.recents_scroll.setWidgetResizable(True)
+            self.recents_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+            self.recents_scroll.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+            try:
+                from PySide6.QtWidgets import QFrame as _QFrame
+                self.recents_scroll.setFrameShape(_QFrame.NoFrame)
+            except Exception:
+                pass
+
+            try:
+                # Watch width changes so we can re-wrap items correctly
+                self.recents_scroll.viewport().installEventFilter(self)
+            except Exception:
+                pass
+
+            self._recents_inner = QtWidgets.QWidget(self)
+            from PySide6.QtWidgets import QGridLayout as _QGridLayout
+            self._recents_row = _QGridLayout(self._recents_inner)
+            self._recents_row.setContentsMargins(0, 0, 0, 0)
+            self._recents_row.setSpacing(8)
+            self.recents_scroll.setWidget(self._recents_inner)
+            rec_wrap.addWidget(self.recents_scroll)
+
+            # Collapsible wrapper, closed by default (and stays closed after restart)
+            self.recents_box = _Disclosure("Recent results", rec_body, start_open=False, parent=self)
+            v_main.addWidget(self.recents_box)
+
+            # Initial build + poller
+            try:
+                QTimer.singleShot(0, self._rebuild_recents)
+            except Exception:
+                pass
+            try:
+                self._install_recents_poller()
+            except Exception:
+                pass
+
+            # Wire slider to resize thumbnails (resize in-place without rebuilding the list)
+            def _on_recent_size(val):
+                try:
+                    self.lbl_recent_size.setText(f"{val} px")
+                except Exception:
+                    pass
+
+                # Clamp and normalize size
+                try:
+                    size = int(val)
+                except Exception:
+                    size = 100
+                if size < 40:
+                    size = 40
+                if size > 200:
+                    size = 200
+
+                # Resize existing buttons
+                try:
+                    layout = getattr(self, "_recents_row", None)
+                    inner = getattr(self, "_recents_inner", None)
+                    scroll = getattr(self, "recents_scroll", None)
+                except Exception:
+                    layout = inner = scroll = None
+
+                if layout is not None:
+                    try:
+                        from PySide6 import QtWidgets as _QtW
+                        from PySide6.QtCore import QSize as _QSize
+                        for i in range(layout.count()):
+                            item = layout.itemAt(i)
+                            btn = item.widget() if item is not None else None
+                            if isinstance(btn, _QtW.QToolButton):
+                                try:
+                                    btn.setIconSize(_QSize(int(size), int(size)))
+                                    btn.setFixedSize(int(size * 1.25), int(size * 1.25) + 28)
+                                except Exception:
+                                    pass
+                    except Exception:
+                        pass
+
+                # Update scroll area height to account for new size
+                try:
+                    if layout is not None and inner is not None and scroll is not None:
+                        spacing = getattr(layout, "spacing", lambda: 8)()
+                        item_w = int(size * 1.25)
+                        item_h = int(size * 1.25) + 28
+                        try:
+                            vpw = scroll.viewport().width()
+                        except Exception:
+                            try:
+                                vpw = inner.width()
+                            except Exception:
+                                vpw = 0
+                        if not vpw or vpw <= 1:
+                            try:
+                                vpw = max(scroll.width(), inner.width(), 600)
+                            except Exception:
+                                vpw = 600
+                        cols = max(1, int((vpw + spacing) // (item_w + spacing)))
+                        total = layout.count()
+                        rows = max(1, (total + cols - 1) // cols)
+                        min_h = rows * item_h + max(0, rows - 1) * spacing + 12
+                        try:
+                            inner.setMinimumHeight(min_h)
+                        except Exception:
+                            pass
+                except Exception:
+                    pass
+
+            try:
+                self.sld_recent_size.valueChanged.connect(_on_recent_size)
+            except Exception:
+                pass
+
+            # Wire sort dropdown to rebuild thumbnails
+            try:
+                if getattr(self, "combo_recent_sort", None) is not None:
+                    def _on_recent_sort(_index):
+                        try:
+                            self._rebuild_recents()
+                        except Exception:
+                            pass
+                    try:
+                        self.combo_recent_sort.currentIndexChanged.connect(_on_recent_sort)
+                    except Exception:
+                        pass
+            except Exception:
+                pass
+        except Exception:
+            pass
+
         # ----- Fixed bottom action bar (does not scroll) -----
         bottom = QtWidgets.QHBoxLayout()
         bottom.addWidget(self.btn_upscale)
@@ -753,6 +950,44 @@ class UpscPane(QtWidgets.QWidget):
         bottom.addWidget(self.btn_info)
         bottom.addStretch(1)
         v_main.addLayout(bottom)
+
+        # Tooltips
+        try:
+            self.btn_upscale.setToolTip("Load any video or image in the media player, then select an engine and model and press 'Upscale'.")
+            self.btn_batch.setToolTip("Add multiple files or a full folder to the queue for upscaling with the current settings.")
+            self.btn_info.setToolTip("Shows detailed info (only works when you load an image or video directly in the Upscale tab).")
+        except Exception:
+            pass
+
+        # -- Style tweaks: bigger bottom button fonts + Upscale hover blue
+        try:
+            # Make the bottom action buttons' font match the Describer actions
+            for _b in (self.btn_upscale, self.btn_batch, self.btn_info):
+                try:
+                    _b.setMinimumHeight(32)
+                except Exception:
+                    pass
+                _f = _b.font()
+                try:
+                    _sz = _f.pointSize()
+                    if _sz <= 0:
+                        _sz = 10
+                except Exception:
+                    _sz = 10
+                # About +3pt for a clearly larger label, like in Describer
+                _f.setPointSize(_sz + 3)
+                _b.setFont(_f)
+                try:
+                    from PySide6.QtWidgets import QSizePolicy as _QSP
+                    _b.setSizePolicy(_QSP.Preferred, _QSP.Fixed)
+                except Exception:
+                    pass
+            # Hover background for Upscale button only
+            self.btn_upscale.setObjectName("btn_upscale_main")
+            self.btn_upscale.setStyleSheet((self.btn_upscale.styleSheet() or "") + "QPushButton:hover{background-color:#0d6efd;}")
+        except Exception:
+            pass
+
 
         # wiring
         self.btn_browse.clicked.connect(self._pick_single)
@@ -790,12 +1025,6 @@ class UpscPane(QtWidgets.QWidget):
         except Exception:
             pass
 
-
-        # --- Settings + Recents wiring ---
-        try:
-            self.list_recents.itemClicked.connect(self._open_recent_item)
-        except Exception:
-            pass
 
         # Load persisted settings (if any)
         try:
@@ -863,19 +1092,6 @@ class UpscPane(QtWidgets.QWidget):
             return Path("presets/setsave/upsc_settings.json").resolve()
     def eventFilter(self, obj, ev):
         try:
-            from PySide6.QtCore import QEvent
-            if hasattr(self, "recents_scroll") and obj is self.recents_scroll.viewport():
-                if ev.type() == QEvent.Resize:
-                    w = ev.size().width()
-                    if w != getattr(self, "_recents_last_w", 0):
-                        self._recents_last_w = w
-                        try:
-                            self._rebuild_recents()
-                        except Exception:
-                            pass
-        except Exception:
-            pass
-        try:
             return super().eventFilter(obj, ev)
         except Exception:
             return False
@@ -926,6 +1142,8 @@ class UpscPane(QtWidgets.QWidget):
             ("chk_denoise", "toggled"),
             ("chk_deband", "toggled"),
             ("sld_sharpen", "valueChanged"),
+            ("sld_recent_size", "valueChanged"),
+            ("combo_recent_sort", "currentIndexChanged"),
                     ]
 
         connected = 0
@@ -935,7 +1153,7 @@ class UpscPane(QtWidgets.QWidget):
                 connected += 1
 
         # Collapsible sections (their .toggle has a .toggled signal)
-        for box_name in ("box_models", "box_encoder", "box_advanced", "recents_box"):
+        for box_name in ("box_models", "box_encoder", "box_advanced"):
             box = getattr(self, box_name, None)
             toggle = getattr(box, "toggle", None) if box is not None else None
             if _connect(toggle, "toggled"):
@@ -1040,21 +1258,33 @@ class UpscPane(QtWidgets.QWidget):
                 d["sections"]["advanced"] = bool(getattr(self.box_advanced, "isExpanded", lambda: False)())
             except Exception:
                 d["sections"]["advanced"] = False
-        try:
-            if hasattr(self, "recents_box"):
-                d["sections"]["recents"] = bool(self.recents_box.toggle.isChecked())
-            else:
-                d["sections"]["recents"] = True
-        except Exception:
-            d["sections"]["recents"] = True
         # Batch / gallery options
         try: d["video_thumbs"] = bool(self.chk_video_thumbs.isChecked())
         except Exception: d["video_thumbs"] = False
         try: d["streaming_lowmem"] = bool(self.chk_streaming_lowmem.isChecked())
         except Exception: d["streaming_lowmem"] = True
-        # Recents list
-        try: d["recents"] = [str(p) for p in getattr(self, "_recents", [])]
-        except Exception: pass
+
+        # Recent results options
+        try:
+            d["recents_thumb_size"] = int(self.sld_recent_size.value())
+        except Exception:
+            pass
+        try:
+            sort = None
+            try:
+                sort = self.combo_recent_sort.currentData()
+            except Exception:
+                sort = None
+            if sort is None:
+                try:
+                    if getattr(self, "combo_recent_sort", None) is not None:
+                        sort = self.combo_recent_sort.currentText()
+                except Exception:
+                    sort = None
+            if sort:
+                d["recents_sort"] = str(sort)
+        except Exception:
+            pass
         return d
 
     def _apply_settings(self, d: dict):
@@ -1165,30 +1395,51 @@ class UpscPane(QtWidgets.QWidget):
             self._set_section_state(self.box_models, bool(secs.get("models", True)))
             self._set_section_state(self.box_encoder, bool(secs.get("encoder", True)))
             self._set_section_state(self.box_advanced, bool(secs.get("advanced", False)))
-            if hasattr(self, "recents_box"):
-                self._set_section_state(self.recents_box, bool(secs.get("recents", True)))
         except Exception:
             pass
         try:
             self.chk_video_thumbs.setChecked(bool(d.get("video_thumbs", False)))
         except Exception:
             pass
+        # Recent results options
+        try:
+            sz = int(d.get("recents_thumb_size", 100))
+            if hasattr(self, "sld_recent_size"):
+                try:
+                    self.sld_recent_size.setValue(sz)
+                except Exception:
+                    pass
+        except Exception:
+            pass
+        try:
+            sort = d.get("recents_sort")
+            cb = getattr(self, "combo_recent_sort", None)
+            if cb is not None and sort is not None:
+                idx = -1
+                try:
+                    for i in range(cb.count()):
+                        v = cb.itemData(i)
+                        if v == sort:
+                            idx = i
+                            break
+                except Exception:
+                    idx = -1
+                if idx < 0:
+                    try:
+                        idx = cb.findText(str(sort))
+                    except Exception:
+                        idx = -1
+                if idx >= 0:
+                    try:
+                        cb.setCurrentIndex(idx)
+                    except Exception:
+                        pass
+        except Exception:
+            pass
         try:
             self.chk_streaming_lowmem.setChecked(bool(d.get("streaming_lowmem", True)))
         except Exception:
             pass
-        except Exception:
-            pass
-        # Recents
-        try:
-            recs = []
-            for p in d.get("recents", []) or []:
-                from pathlib import Path as _P
-                pp = _P(p)
-                if pp.exists():
-                    recs.append(pp)
-            self._recents = recs[:20]
-            self._rebuild_recents()
         except Exception:
             pass
 
@@ -1240,6 +1491,978 @@ class UpscPane(QtWidgets.QWidget):
         """Batch limit control removed; keeping method as no-op for compatibility."""
         return
 
+    def _recents_dir(self):
+        """Return Path to the Upscale recent-thumbnail folder."""
+        from pathlib import Path as _Path
+        try:
+            try:
+                base = ROOT  # type: ignore[name-defined]
+            except Exception:
+                base = _Path(__file__).resolve().parent.parent
+            d = base / "output" / "last results" / "upsc"
+            try:
+                d.mkdir(parents=True, exist_ok=True)
+            except Exception:
+                pass
+            return d
+        except Exception:
+            # Fallback to relative path
+            return _Path("output") / "last results" / "upsc"
+
+    def _thumb_path_for_media(self, media_path, max_side: int = 120):
+        """Return a Path under _recents_dir used to store a thumbnail for *media_path*."""
+        from pathlib import Path as _P
+        import hashlib
+
+        d = self._recents_dir()
+        try:
+            d.mkdir(parents=True, exist_ok=True)
+        except Exception:
+            pass
+
+        try:
+            stem = _P(media_path).stem
+        except Exception:
+            stem = "media"
+
+        try:
+            key = str(media_path)
+            h = hashlib.sha1(key.encode("utf-8")).hexdigest()[:8]
+        except Exception:
+            h = "thumb"
+
+        return d / f"{stem}_{h}_{max_side}.jpg"
+
+    def _ensure_recent_thumb_for_media(self, media_path, max_side: int = 120):
+        """Create (or reuse) a thumbnail in _recents_dir for the given media file."""
+        from pathlib import Path as _P
+
+        media_path = _P(media_path)
+        try:
+            if not (media_path.exists() and media_path.is_file()):
+                return None
+        except Exception:
+            return None
+
+        thumb = self._thumb_path_for_media(media_path, max_side=max_side)
+        try:
+            if thumb.exists() and thumb.stat().st_mtime >= media_path.stat().st_mtime:
+                return thumb
+        except Exception:
+            # If we cannot stat, fall through and try to rebuild
+            pass
+
+        ext = media_path.suffix.lower()
+        img = None
+
+        # Treat anything that is NOT a known video as an image first
+        if ext not in _VIDEO_EXTS:
+            try:
+                from PySide6.QtGui import QImageReader
+                from PySide6.QtCore import QSize as _QSize
+                reader = QImageReader(str(media_path))
+                reader.setAutoTransform(True)
+                sz = reader.size()
+                if sz.isValid():
+                    w, h = sz.width(), sz.height()
+                    if w > 0 and h > 0:
+                        scale = max(w, h) / float(max_side or 1)
+                        if scale > 1.0:
+                            w = int(w / scale)
+                            h = int(h / scale)
+                            reader.setScaledSize(_QSize(max(16, w), max(16, h)))
+                img = reader.read()
+                if img.isNull():
+                    img = None
+            except Exception:
+                img = None
+
+        # Videos, or image-reader failure: fall back to _make_thumb
+        if img is None and ext in _VIDEO_EXTS:
+            try:
+                pm = self._make_thumb(media_path)
+            except Exception:
+                pm = QPixmap()
+            try:
+                if pm and not pm.isNull():
+                    pm2 = pm.scaled(int(max_side), int(max_side), Qt.KeepAspectRatio, Qt.SmoothTransformation)
+                else:
+                    pm2 = None
+            except Exception:
+                pm2 = None
+            try:
+                if pm2 is not None:
+                    img = pm2.toImage()
+            except Exception:
+                img = None
+
+        if img is None:
+            return None
+
+        try:
+            thumb.parent.mkdir(parents=True, exist_ok=True)
+        except Exception:
+            pass
+
+        try:
+            img.save(str(thumb), "JPG", 88)
+            return thumb
+        except Exception:
+            return None
+
+    def _resolve_media_for_thumb(self, thumb_path):
+        """Best-effort: given a thumbnail path, return the original media path."""
+        from pathlib import Path as _P
+
+        try:
+            t = _P(str(thumb_path))
+        except Exception:
+            return thumb_path
+
+        # 1) In-memory mapping (new thumbnails in this session)
+        try:
+            mapping = getattr(self, "_recents_thumb_map", {}) or {}
+            orig = mapping.get(str(t))
+            if orig:
+                p = _P(str(orig))
+                if p.exists() and p.is_file():
+                    return p
+        except Exception:
+            pass
+
+        # 2) Parse the thumbnail filename: stem_hash_size.jpg -> stem
+        try:
+            name_stem = t.stem
+            parts = name_stem.rsplit("_", 2)
+            if len(parts) == 3 and parts[1] and parts[2]:
+                base_stem = parts[0]
+            else:
+                base_stem = name_stem
+        except Exception:
+            base_stem = None
+
+        if not base_stem:
+            return thumb_path
+
+        media_exts = tuple(_IMAGE_EXTS | _VIDEO_EXTS)
+
+        # Build a list of candidate folders to search
+        dirs = []
+        try:
+            edit = getattr(self, "edit_outdir", None)
+            out_dir = Path(edit.text().strip()) if (edit is not None and edit.text().strip()) else None
+        except Exception:
+            out_dir = None
+        if out_dir and out_dir.exists():
+            dirs.append(out_dir)
+        try:
+            if OUT_VIDEOS not in dirs:
+                dirs.append(OUT_VIDEOS)
+        except Exception:
+            pass
+        try:
+            if OUT_SHOTS not in dirs:
+                dirs.append(OUT_SHOTS)
+        except Exception:
+            pass
+
+        for d in dirs:
+            try:
+                if not d.exists():
+                    continue
+                for p in d.iterdir():
+                    try:
+                        if not p.is_file():
+                            continue
+                        if p.suffix.lower() not in media_exts:
+                            continue
+                        if p.stem == base_stem:
+                            return p
+                    except Exception:
+                        continue
+            except Exception:
+                continue
+
+        return thumb_path
+
+    def _list_recent_files(self):
+        """List recent result thumbnail files for Upscale (most recent first).
+
+        This merges three sources:
+        - Existing thumbnails under output/last results/upsc
+        - New images/videos from the usual Upscale output folders
+        - Finished Upscale queue jobs (from jobs/finished or jobs/done)
+        """
+        from pathlib import Path as _Path
+        exts = set(_IMAGE_EXTS | _VIDEO_EXTS)
+        candidates = []
+
+        # 1) Existing thumbs under the recents dir
+        try:
+            thumbs_dir = self._recents_dir()
+            if thumbs_dir and thumbs_dir.exists():
+                for p in thumbs_dir.iterdir():
+                    try:
+                        if p.is_file() and p.suffix.lower() in {".jpg", ".jpeg", ".png", ".webp", ".bmp", ".gif"}:
+                            candidates.append(p)
+                    except Exception:
+                        continue
+        except Exception:
+            pass
+
+        # 2) Direct Upscale output folders (non-queued runs)
+        try:
+            outs = []
+            try:
+                edit = getattr(self, "edit_outdir", None)
+                if edit is not None:
+                    text = (edit.text() or "").strip()
+                    if text:
+                        p = _Path(text).expanduser()
+                        if p.exists() and p.is_dir():
+                            outs.append(p)
+            except Exception:
+                pass
+            try:
+                if OUT_VIDEOS not in outs:
+                    outs.append(OUT_VIDEOS)
+            except Exception:
+                pass
+            try:
+                if OUT_SHOTS not in outs:
+                    outs.append(OUT_SHOTS)
+            except Exception:
+                pass
+            # Deduplicate
+            unique_outs = []
+            seen = set()
+            for d in outs:
+                try:
+                    key = str(_Path(d).resolve())
+                except Exception:
+                    key = str(d)
+                if key in seen:
+                    continue
+                seen.add(key)
+                unique_outs.append(_Path(d))
+
+            for out_dir in unique_outs:
+                try:
+                    if not out_dir.exists():
+                        continue
+                    medias = [
+                        p for p in out_dir.iterdir()
+                        if p.is_file() and p.suffix.lower() in exts
+                    ]
+                    medias.sort(key=lambda p: p.stat().st_mtime, reverse=True)
+                    for media in medias[:40]:
+                        tp = self._ensure_recent_thumb_for_media(media, max_side=120)
+                        if tp:
+                            candidates.append(tp)
+                            try:
+                                m = getattr(self, "_recents_thumb_map", {}) or {}
+                                m[str(tp)] = str(media)
+                                self._recents_thumb_map = m
+                            except Exception:
+                                pass
+                except Exception:
+                    continue
+        except Exception:
+            pass
+
+        # 3) Finished queue jobs (Upscale jobs only)
+        try:
+            jobs = self._list_recent_upscale_jobs()
+            for job_json in jobs:
+                media, _j = self._resolve_output_from_upscale_job(job_json)
+                if not media:
+                    continue
+                tp = self._ensure_recent_thumb_for_media(media, max_side=120)
+                if tp:
+                    candidates.append(tp)
+                    try:
+                        m = getattr(self, "_recents_thumb_map", {}) or {}
+                        m[str(tp)] = str(media)
+                        self._recents_thumb_map = m
+                    except Exception:
+                        pass
+        except Exception:
+            pass
+
+        # Final sort on the thumbnail files themselves
+        try:
+            candidates = [p for p in candidates if p is not None]
+            # dedupe by path string
+            tmp = {}
+            for p in candidates:
+                try:
+                    key = str(_Path(p))
+                except Exception:
+                    key = str(p)
+                tmp[key] = p
+            candidates = list(tmp.values())
+            candidates.sort(key=lambda p: p.stat().st_mtime, reverse=True)
+            return candidates[:48]
+        except Exception:
+            return []
+
+    def _jobs_done_dirs(self):
+        """Return a list of job result folders to scan for finished Upscale queue jobs."""
+        from pathlib import Path as _Path
+        try:
+            try:
+                base = ROOT  # type: ignore[name-defined]
+            except Exception:
+                base = _Path(__file__).resolve().parent.parent
+            roots = []
+            for name in ("finished", "done"):
+                try:
+                    d = base / "jobs" / name
+                    if d.exists() and d.is_dir():
+                        roots.append(d)
+                except Exception:
+                    continue
+            return roots
+        except Exception:
+            return []
+
+    def _list_recent_upscale_jobs(self):
+        """List finished Upscale job JSON files (newest first)."""
+        from pathlib import Path as _Path
+        jobs = []
+        try:
+            for d in self._jobs_done_dirs():
+                try:
+                    for p in d.iterdir():
+                        try:
+                            if p.is_file() and p.suffix.lower() == ".json" and "upscale" in p.name.lower():
+                                jobs.append(p)
+                        except Exception:
+                            continue
+                except Exception:
+                    continue
+            jobs.sort(key=lambda p: p.stat().st_mtime, reverse=True)
+            return jobs[:64]
+        except Exception:
+            return jobs
+
+    def _resolve_output_from_upscale_job(self, job_json):
+        """Given an Upscale job JSON file, return (media_path, job_dict)."""
+        from pathlib import Path as _Path
+        import json as _json
+        try:
+            jp = _Path(job_json)
+            with jp.open("r", encoding="utf-8") as f:
+                data = _json.load(f)
+        except Exception:
+            return None, None
+        try:
+            if data.get("category") not in ("upscale", "Upscale", "UPSC", "upsc") and "upsc" not in str(data.get("name", "")).lower():
+                # Not an Upscale job; ignore
+                return None, data
+        except Exception:
+            pass
+        media = None
+        try:
+            out = data.get("output") or data.get("outfile") or data.get("out") or data.get("result")
+            if out:
+                media = _Path(out)
+        except Exception:
+            media = None
+        return media, data
+
+
+    def _install_recents_poller(self):
+        """Poll the Upscale recents folder every few seconds; rebuild UI on change."""
+        try:
+            if getattr(self, "_recents_poller", None):
+                return
+
+            def _sig():
+                try:
+                    files = self._list_recent_files()
+                    return tuple((p.name, int(p.stat().st_mtime)) for p in files)
+                except Exception:
+                    return tuple()
+
+            def _tick():
+                try:
+                    cur = _sig()
+                    if cur != getattr(self, "_recents_sig", None):
+                        self._recents_sig = cur
+                        self._rebuild_recents()
+                except Exception:
+                    pass
+
+            try:
+                self._recents_sig = None
+                _tick()
+            except Exception:
+                pass
+
+            t = QTimer(self)
+            t.setInterval(5000)
+            t.timeout.connect(_tick)
+            t.start()
+            self._recents_poller = t
+        except Exception:
+            pass
+
+    def _add_recent(self, media):
+        """Record a freshly produced output in recents (thumbnail + in-memory map)."""
+        from pathlib import Path as _P
+        try:
+            if not media:
+                return
+            p = _P(str(media))
+            if not (p.exists() and p.is_file()):
+                return
+        except Exception:
+            return
+
+        try:
+            size_slider = getattr(self, "sld_recent_size", None)
+            size = int(size_slider.value()) if size_slider is not None else 100
+        except Exception:
+            size = 100
+
+        thumb = self._ensure_recent_thumb_for_media(p, max_side=size)
+        if not thumb:
+            return
+        try:
+            mapping = getattr(self, "_recents_thumb_map", {}) or {}
+            mapping[str(thumb)] = str(p)
+            self._recents_thumb_map = mapping
+        except Exception:
+            pass
+
+    def _rebuild_recents(self):
+        """Rebuild the Recent results grid from thumbnail files."""
+        try:
+            layout = getattr(self, "_recents_row", None)
+            inner = getattr(self, "_recents_inner", None)
+            scroll = getattr(self, "recents_scroll", None)
+            if layout is None or inner is None or scroll is None:
+                return
+
+            # Clear existing widgets
+            try:
+                while layout.count():
+                    item = layout.takeAt(0)
+                    w = item.widget()
+                    if w is not None:
+                        w.setParent(None)
+            except Exception:
+                pass
+
+            # Thumb size from slider (clamped)
+            try:
+                size_slider = getattr(self, "sld_recent_size", None)
+                size = int(size_slider.value()) if size_slider is not None else 100
+            except Exception:
+                size = 100
+            if size < 40:
+                size = 40
+            if size > 200:
+                size = 200
+
+            files = self._list_recent_files()
+            if not files:
+                lab = QtWidgets.QLabel("No results yet.", self)
+                try:
+                    lab.setStyleSheet("color:#9fb3c8;")
+                except Exception:
+                    pass
+                layout.addWidget(lab, 0, 0)
+                try:
+                    inner.setMinimumHeight(lab.sizeHint().height() + 8)
+                except Exception:
+                    pass
+                return
+
+            # Helper functions for sorting by underlying media
+            def _media_for_sort(thumb_path):
+                try:
+                    return self._resolve_media_for_thumb(thumb_path)
+                except Exception:
+                    return thumb_path
+
+            def _mtime_for(thumb_path):
+                from pathlib import Path as _P
+                try:
+                    mp = _P(str(_media_for_sort(thumb_path)))
+                    if mp.exists():
+                        return mp.stat().st_mtime
+                except Exception:
+                    pass
+                try:
+                    return _P(str(thumb_path)).stat().st_mtime
+                except Exception:
+                    return 0
+
+            def _name_for(thumb_path):
+                from pathlib import Path as _P
+                try:
+                    mp = _P(str(_media_for_sort(thumb_path)))
+                    return mp.name.lower()
+                except Exception:
+                    pass
+                try:
+                    return _P(str(thumb_path)).name.lower()
+                except Exception:
+                    return str(thumb_path)
+
+            def _size_for(thumb_path):
+                from pathlib import Path as _P
+                try:
+                    mp = _P(str(_media_for_sort(thumb_path)))
+                    if mp.exists():
+                        return mp.stat().st_size
+                except Exception:
+                    pass
+                try:
+                    return _P(str(thumb_path)).stat().st_size
+                except Exception:
+                    return 0
+
+            # Determine sort mode from combo box
+            try:
+                mode = None
+                cb = getattr(self, "combo_recent_sort", None)
+                if cb is not None:
+                    mode = cb.currentData()
+                    if not mode:
+                        mode = cb.currentText()
+                if not mode:
+                    mode = "newest"
+            except Exception:
+                mode = "newest"
+
+            # Apply sorting
+            try:
+                if mode in ("newest", "oldest"):
+                    files.sort(key=_mtime_for, reverse=(mode == "newest"))
+                elif mode in ("az", "za"):
+                    files.sort(key=_name_for, reverse=(mode == "za"))
+                elif mode in ("size_small", "size_large"):
+                    files.sort(key=_size_for, reverse=(mode == "size_large"))
+            except Exception:
+                # Fallback: newest first by thumbnail mtime
+                try:
+                    files.sort(key=lambda p: p.stat().st_mtime, reverse=True)
+                except Exception:
+                    pass
+
+            setattr(self, "_recents_idx", 0)
+            for p in files:
+                btn = QtWidgets.QToolButton(self)
+                btn.setToolButtonStyle(Qt.ToolButtonTextUnderIcon)
+                try:
+                    btn.setText(p.name)
+                except Exception:
+                    pass
+                btn.setCursor(Qt.PointingHandCursor)
+                btn.setAutoRaise(True)
+                try:
+                    btn.setStyleSheet(
+                        "QToolButton { border-radius: 10px; padding: 4px 2px; }"
+                        "QToolButton:hover { background: rgba(255,255,255,0.06); }"
+                    )
+                except Exception:
+                    pass
+
+                # Thumbnail icon
+                try:
+                    pm = QPixmap(str(p))
+                except Exception:
+                    pm = QPixmap()
+                if pm and not pm.isNull():
+                    try:
+                        pm2 = pm.scaled(int(size), int(size), Qt.KeepAspectRatio, Qt.SmoothTransformation)
+                    except Exception:
+                        pm2 = pm
+                    try:
+                        pm2 = _rounded_pixmap(pm2, 10)
+                    except Exception:
+                        pass
+                    try:
+                        btn.setIcon(QIcon(pm2))
+                    except Exception:
+                        pass
+                try:
+                    btn.setIconSize(QSize(int(size), int(size)))
+                    btn.setFixedSize(int(size * 1.25), int(size * 1.25) + 28)
+                except Exception:
+                    pass
+
+                # Tooltip with underlying media path (best effort)
+                try:
+                    media_tp = _media_for_sort(p)
+                    from pathlib import Path as _P
+                    btn.setToolTip(str(_P(str(media_tp))))
+                except Exception:
+                    pass
+
+                # Left-click: open result
+                def _mk_open(thumb_path):
+                    def _open():
+                        try:
+                            media = self._resolve_media_for_thumb(thumb_path)
+                        except Exception:
+                            media = thumb_path
+                        try:
+                            if not self._play_in_player(media):
+                                self._open_file(media)
+                        except Exception:
+                            try:
+                                self._open_file(media)
+                            except Exception:
+                                pass
+                    return _open
+                try:
+                    btn.clicked.connect(_mk_open(p))
+                except Exception:
+                    pass
+
+                # Right-click: context menu with "Delete from disk"
+                def _mk_ctx(thumb_path, button):
+                    def _on_menu(pos):
+                        from pathlib import Path as _P
+                        import os as _os
+                        try:
+                            menu = QtWidgets.QMenu(button)
+                        except Exception:
+                            return
+
+                        # Pre-resolve the underlying media, so all actions share it
+                        try:
+                            media = self._resolve_media_for_thumb(thumb_path)
+                        except Exception:
+                            media = thumb_path
+                        try:
+                            mp = _P(str(media))
+                        except Exception:
+                            mp = None
+
+                        try:
+                            act_info = menu.addAction("Info")
+                        except Exception:
+                            act_info = None
+                        try:
+                            act_rename = menu.addAction("Rename")
+                        except Exception:
+                            act_rename = None
+                        try:
+                            act_open = menu.addAction("Open folder")
+                        except Exception:
+                            act_open = None
+                        try:
+                            menu.addSeparator()
+                        except Exception:
+                            pass
+                        try:
+                            act_del = menu.addAction("Delete")
+                        except Exception:
+                            act_del = None
+
+                        try:
+                            global_pos = button.mapToGlobal(pos)
+                        except Exception:
+                            try:
+                                global_pos = None
+                            except Exception:
+                                global_pos = None
+                        try:
+                            chosen = menu.exec(global_pos) if global_pos is not None else menu.exec()
+                        except Exception:
+                            chosen = None
+                        if not chosen:
+                            return
+
+                        # Info: show ffprobe JSON for this media
+                        if chosen is act_info and act_info is not None:
+                            try:
+                                if mp is not None and mp.exists():
+                                    self._show_media_info_for(mp)
+                                else:
+                                    QtWidgets.QMessageBox.information(
+                                        self,
+                                        "Info",
+                                        "File no longer exists on disk.",
+                                    )
+                            except Exception:
+                                pass
+                            return
+
+                        # Rename: change the underlying media file name and keep the thumbnail in sync
+                        if chosen is act_rename and act_rename is not None:
+                            try:
+                                if mp is None or not mp.exists():
+                                    QtWidgets.QMessageBox.warning(
+                                        self,
+                                        "Rename",
+                                        "File no longer exists on disk.",
+                                    )
+                                    return
+                                cur_stem = mp.stem
+                                new_name, ok = QtWidgets.QInputDialog.getText(
+                                    self,
+                                    "Rename file",
+                                    "New name (without extension):",
+                                    text=cur_stem,
+                                )
+                                if not ok:
+                                    return
+                                new_name = (new_name or "").strip()
+                                if not new_name or new_name == cur_stem:
+                                    return
+                                new_path = mp.with_name(new_name + mp.suffix)
+                                if new_path.exists():
+                                    QtWidgets.QMessageBox.warning(
+                                        self,
+                                        "Rename",
+                                        "A file with that name already exists.",
+                                    )
+                                    return
+                                try:
+                                    mp.rename(new_path)
+                                    mp = new_path
+                                    media = new_path
+                                except Exception:
+                                    QtWidgets.QMessageBox.warning(
+                                        self,
+                                        "Rename failed",
+                                        "Could not rename the file on disk.",
+                                    )
+                                    return
+                                # Try to rename the thumbnail file so the label matches
+                                try:
+                                    tp = _P(str(thumb_path))
+                                except Exception:
+                                    tp = None
+                                new_tp = None
+                                if tp is not None and tp.exists():
+                                    try:
+                                        stem = tp.stem
+                                        parts = stem.rsplit("_", 2)
+                                        if len(parts) == 3:
+                                            # stem_hash_size -> preserve hash+size
+                                            _, hash_part, size_part = parts
+                                            new_stem = new_path.stem
+                                            new_base = f"{new_stem}_{hash_part}_{size_part}"
+                                        else:
+                                            new_base = new_path.stem
+                                        new_tp = tp.with_name(new_base + tp.suffix)
+                                        if new_tp != tp:
+                                            try:
+                                                tp.rename(new_tp)
+                                            except Exception:
+                                                new_tp = tp
+                                    except Exception:
+                                        new_tp = tp
+                                else:
+                                    new_tp = tp
+                                # Update in-memory mapping
+                                try:
+                                    mapping = getattr(self, "_recents_thumb_map", {}) or {}
+                                    old_key = str(thumb_path)
+                                    new_key = str(new_tp) if new_tp is not None else old_key
+                                    val = mapping.pop(old_key, None)
+                                    if val is None:
+                                        val = str(new_path)
+                                    mapping[new_key] = str(new_path)
+                                    self._recents_thumb_map = mapping
+                                except Exception:
+                                    pass
+                                try:
+                                    self._rebuild_recents()
+                                except Exception:
+                                    pass
+                            except Exception:
+                                pass
+                            return
+
+                        # Open folder: reveal the file in its folder
+                        if chosen is act_open and act_open is not None:
+                            try:
+                                if mp is None or not mp.exists():
+                                    QtWidgets.QMessageBox.warning(
+                                        self,
+                                        "Open folder",
+                                        "File no longer exists on disk.",
+                                    )
+                                    return
+                                folder = mp.parent
+                                try:
+                                    if _os.name == "nt":
+                                        # On Windows, try to select the file in Explorer
+                                        try:
+                                            import subprocess as _sub
+                                            _sub.Popen(["explorer", "/select,", str(mp)])
+                                        except Exception:
+                                            _os.startfile(str(folder))  # nosec - user initiated
+                                    else:
+                                        import subprocess as _sub
+                                        _sub.Popen(["xdg-open", str(folder)])
+                                except Exception:
+                                    pass
+                            except Exception:
+                                pass
+                            return
+
+                        # Delete: unload then remove media+thumbnail from disk
+                        if chosen is not act_del or act_del is None:
+                            return
+
+                        # Confirm deletion
+                        try:
+                            fname = mp.name if mp is not None else str(media)
+                        except Exception:
+                            fname = str(media)
+                        try:
+                            res = QtWidgets.QMessageBox.question(
+                                self,
+                                "Delete upscaled file?",
+                                f"Delete this upscaled file from disk?\n\n{fname}",
+                                QtWidgets.QMessageBox.Yes | QtWidgets.QMessageBox.No,
+                                QtWidgets.QMessageBox.No,
+                            )
+                        except Exception:
+                            res = QtWidgets.QMessageBox.Yes
+                        if res != QtWidgets.QMessageBox.Yes:
+                            return
+
+                        # Best-effort: unload from player/viewer before deleting
+                        try:
+                            if mp is not None:
+                                self._try_unload_media_before_delete(mp)
+                        except Exception:
+                            pass
+
+                        # Delete media file
+                        delete_ok = True
+                        try:
+                            if mp is not None and mp.exists():
+                                mp.unlink()
+                        except Exception:
+                            delete_ok = False
+                            try:
+                                QtWidgets.QMessageBox.warning(
+                                    self,
+                                    "Delete failed",
+                                    "Could not delete file. Please load another recent result, then try again.",
+                                )
+                            except Exception:
+                                pass
+
+                        if not delete_ok:
+                            return
+
+                        # Delete thumbnail file
+                        try:
+                            tp = _P(str(thumb_path))
+                            if tp.exists():
+                                tp.unlink()
+                        except Exception:
+                            pass
+
+                        # Remove from in-memory mapping
+                        try:
+                            mapping = getattr(self, "_recents_thumb_map", {}) or {}
+                            mapping.pop(str(thumb_path), None)
+                            self._recents_thumb_map = mapping
+                        except Exception:
+                            pass
+
+                        # Rebuild grid
+                        try:
+                            self._rebuild_recents()
+                        except Exception:
+                            pass
+                    return _on_menu
+
+                try:
+                    btn.setContextMenuPolicy(Qt.CustomContextMenu)
+                    btn.customContextMenuRequested.connect(_mk_ctx(p, btn))
+                except Exception:
+                    pass
+
+                # Grid placement with wrapping
+                try:
+                    try:
+                        vpw = scroll.viewport().width()
+                    except Exception:
+                        vpw = inner.width()
+                    if not vpw or vpw <= 1:
+                        vpw = max(scroll.width(), self.width(), 600)
+                except Exception:
+                    vpw = 600
+                try:
+                    spacing = getattr(layout, "spacing", lambda: 8)()
+                except Exception:
+                    spacing = 8
+                item_w = int(size * 1.25)
+                if vpw <= item_w + spacing and len(files) > 1:
+                    cols = min(len(files), 4)
+                else:
+                    cols = max(1, int((vpw + spacing) // (item_w + spacing)))
+                idx = getattr(self, "_recents_idx", 0)
+                row = idx // cols
+                col = idx % cols
+                setattr(self, "_recents_idx", idx + 1)
+                try:
+                    layout.addWidget(btn, row, col)
+                except Exception:
+                    pass
+
+            # Ensure the scroll area can expand vertically if needed
+            try:
+                spacing = getattr(layout, "spacing", lambda: 8)()
+                item_w = int(size * 1.25)
+                item_h = int(size * 1.25) + 28
+                try:
+                    vpw = scroll.viewport().width()
+                except Exception:
+                    vpw = inner.width()
+                if not vpw or vpw <= 1:
+                    vpw = max(scroll.width(), self.width(), 600)
+                cols = max(1, int((vpw + spacing) // (item_w + spacing)))
+                total = layout.count()
+                rows = max(1, (total + cols - 1) // cols)
+                min_h = rows * item_h + max(0, rows - 1) * spacing + 12
+                inner.setMinimumHeight(min_h)
+            except Exception:
+                pass
+        except Exception as e:
+            try:
+                print("[upsc] recents rebuild error:", e)
+            except Exception:
+                pass
+
+    def eventFilter(self, obj, ev):
+        """Forward event filtering to base class, but watch recents viewport width."""
+        try:
+            from PySide6.QtCore import QEvent
+            if hasattr(self, "recents_scroll") and self.recents_scroll is not None:
+                if obj is self.recents_scroll.viewport():
+                    if ev.type() == QEvent.Resize:
+                        try:
+                            w = ev.size().width()
+                        except Exception:
+                            w = 0
+                        if w and w != getattr(self, "_recents_last_w", 0):
+                            self._recents_last_w = w
+                            try:
+                                self._rebuild_recents()
+                            except Exception:
+                                pass
+        except Exception:
+            pass
+        try:
+            return super().eventFilter(obj, ev)
+        except Exception:
+            return False
+
     def _apply_streaming_lowmem(self, cmd: list) -> list:
         """Inject low-memory streaming flags into FFmpeg commands when the toggle is ON."""
         try:
@@ -1255,48 +2478,7 @@ class UpscPane(QtWidgets.QWidget):
             pass
         return cmd
 
-    def _open_recent_item(self, item):
-        try:
-            from pathlib import Path as _P
-            p = _P(item.data(Qt.UserRole))
-            if p.exists():
-                if not self._play_in_player(p):
-                    self._open_file(p)
-        except Exception:
-            pass
 
-    def _add_recent(self, p: Path):
-        try:
-            if not hasattr(self, "_recents") or self._recents is None:
-                self._recents = []
-            from pathlib import Path as _P
-            p = _P(p)
-            if not p.exists():
-                return
-            self._recents = [x for x in self._recents if _P(x) != p]
-            self._recents.insert(0, p)
-            self._recents = self._recents[:10]
-            self._rebuild_recents()
-            self._save_settings()
-        except Exception:
-            pass
-
-    def _refresh_recents_gallery(self):
-        try:
-            self.list_recents.clear()
-            for p in getattr(self, "_recents", [])[:10]:
-                it = QtWidgets.QListWidgetItem()
-                it.setText(p.name)
-                try:
-                    pm = self._make_thumb(p)
-                    if pm and not pm.isNull():
-                        it.setIcon(QIcon(pm))
-                except Exception:
-                    pass
-                it.setData(Qt.UserRole, str(p))
-                self.list_recents.addItem(it)
-        except Exception:
-            pass
 
 
     def _make_thumb(self, p: "Path") -> QPixmap:
@@ -1365,59 +2547,6 @@ class UpscPane(QtWidgets.QWidget):
         except Exception:
             return QPixmap()
 
-            files = self._list_last_results()
-            if not files:
-                lab = QtWidgets.QLabel("No results yet.", self)
-                lab.setStyleSheet("color:#9fb3c8;")
-                layout.addWidget(lab)
-                return
-
-            for p in files:
-                # ensure tiny thumb exists
-                tp = self._thumb_for(p, 120)
-                btn = QtWidgets.QToolButton(self)
-                btn.setToolButtonStyle(Qt.ToolButtonTextUnderIcon)
-                btn.setText(p.name)
-                btn.setCursor(Qt.PointingHandCursor)
-                btn.setAutoRaise(True)
-                if tp:
-                    btn.setIcon(QIcon(str(tp)))
-                btn.setIconSize(QSize(size, size))
-                btn.setFixedSize(int(size*1.25), int(size*1.25)+28)
-
-                def _mk_open(path: Path):
-                    def _open():
-                        try:
-                            if not self._play_in_player(path):
-                                _open_file(self, path)
-                        except Exception:
-                            _open_file(self, path)
-                    return _open
-                btn.clicked.connect(_mk_open(p))
-                layout.addWidget(btn)
-
-            # ensure the scroll area can expand vertically if needed
-            try:
-                self._recents_inner.setMinimumHeight(int(size*1.25)+36)
-                try:
-                    vpw = self.recents_scroll.viewport().width()
-                except Exception:
-                    vpw = self._recents_inner.width()
-                spacing = getattr(layout, "spacing", lambda: 8)()
-                item_w = int(size*1.25)
-                cols = max(1, int((vpw + spacing) // (item_w + spacing)))
-                rows = max(1, (getattr(self, "_recents_idx", 0)+cols-1)//cols)
-                self._recents_inner.setMinimumHeight(rows * (int(size*1.25)+28) + 12)
-            except Exception:
-                pass
-
-        except Exception as e:
-            try:
-                self._append_log(f"[recents] rebuild error: {e}")
-            except Exception:
-                pass
-
-    
     def _update_engine_ui(self):
         # Keep model stack in sync with engine
         eng_txt = (self.combo_engine.currentText() or '').lower()
@@ -1471,348 +2600,6 @@ class UpscPane(QtWidgets.QWidget):
         except Exception:
             pass
 
-    # ===== Recents (interp) — driven by finished jobs =====
-    def _jobs_done_dir(self) -> Path:
-        try:
-            base = ROOT
-        except Exception:
-            base = Path(__file__).resolve().parent.parent
-        return base / "jobs" / "done"
-
-    def _list_recent_jobs(self) -> list[Path]:
-        d = self._jobs_done_dir()
-        try:
-            if not d.exists():
-                return []
-            items = [p for p in d.iterdir() if p.suffix.lower()==".json" and p.is_file() and "_upscale_" in p.name.lower()]
-            items.sort(key=lambda p: p.stat().st_mtime, reverse=True)
-            return items[:20]
-        except Exception:
-            return []
-
-
-    def _recents_dir(self) -> Path:
-        try:
-            base = ROOT
-        except Exception:
-            base = Path(__file__).resolve().parent.parent
-        # Thumbs only live here
-        return base / "output" / "last results" / "upsc"
-
-    def _list_recent_jobs(self) -> list[Path]:
-        d = self._jobs_done_dir()
-        try:
-            if not d.exists():
-                return []
-            items = [p for p in d.iterdir() if p.suffix.lower()==".json" and p.is_file()]
-            items.sort(key=lambda p: p.stat().st_mtime, reverse=True)
-            return items[:20]
-        except Exception:
-            return []
-
-    def _resolve_output_from_job(self, job_json: Path) -> tuple[Path|None, dict]:
-        """Return (media_path, job_data) for a finished job JSON."""
-        try:
-            j = json.loads(job_json.read_text(encoding="utf-8"))
-        except Exception:
-            j = {}
-        def _as_path(val):
-            if not val: return None
-            try:
-                p = Path(str(val)).expanduser()
-                if not p.is_absolute():
-                    out_dir = j.get("out_dir") or (j.get("args") or {}).get("out_dir")
-                    if out_dir:
-                        p = Path(out_dir).expanduser() / p
-                return p
-            except Exception:
-                return None
-        # Priority fields
-        for k in ("produced","outfile","output","result","file","path"):
-            v = j.get(k) or (j.get("args") or {}).get(k)
-            p = _as_path(v)
-            if p and p.exists() and p.is_file():
-                return p, j
-        # List fields
-        for k in ("outputs","produced_files","results","files","artifacts","saved"):
-            seq = j.get(k) or (j.get("args") or {}).get(k)
-            if isinstance(seq, (list, tuple)):
-                for v in seq:
-                    p = _as_path(v)
-                    if p and p.exists() and p.is_file():
-                        return p, j
-
-        # ## PATCH derive expected media from input/factor/format
-        try:
-            args = (j.get("args") or {})
-            inp = (j.get("input") or args.get("input") or "").strip()
-            fac = int(args.get("factor") or 0)
-            fmt = (args.get("format") or "png").lower()
-            out_dir_val = j.get("out_dir") or args.get("out_dir")
-            from pathlib import Path as _P
-            if inp and fac and out_dir_val:
-                cand = _P(str(out_dir_val)).expanduser() / f"{_P(inp).stem}_x{fac}.{fmt}"
-                if cand.exists() and cand.is_file():
-                    return cand, j
-        except Exception:
-            pass
-
-        # Fallback: scan out_dir for newest media
-        media_exts = {'.mp4','.mov','.mkv','.avi','.webm','.gif','.png','.jpg','.jpeg','.bmp','.tif','.tiff'}
-        out_dir = _as_path(j.get("out_dir") or (j.get("args") or {}).get("out_dir"))
-        try:
-            if out_dir and out_dir.exists():
-                cand = [p for p in out_dir.iterdir() if p.is_file() and p.suffix.lower() in media_exts]
-                cand.sort(key=lambda p: p.stat().st_mtime, reverse=True)
-                if cand:
-                    return cand[0], j
-        except Exception:
-            pass
-        return None, j
-
-    def _thumb_path_for_job(self, job_json: Path, media_path: Path, max_side: int) -> Path:
-        d = self._recents_dir(); d.mkdir(parents=True, exist_ok=True)
-        # ## PATCH unique thumb per job
-
-        name = f"{job_json.stem}__{media_path.stem}.__thumb.jpg"
-        return d / name
-
-    def _thumb_from_media(self, media_path: Path, target_jpg: Path, max_side: int) -> None:
-        try:
-            if max_side < 32: max_side = 32
-            if max_side > 120: max_side = 120
-            # if media is video -> ffmpeg first frame; else use Qt decode
-            vext = {'.mp4','.mov','.mkv','.avi','.webm'}
-            if media_path.suffix.lower() in vext:
-                cmd = [FFMPEG, "-hide_banner", "-loglevel", "quiet", "-y",
-                       "-fflags", "nobuffer", "-probesize", "64k", "-analyzeduration", "0",
-                       "-i", str(media_path),
-                       "-vf", f"thumbnail,scale={int(max_side)}:-1",
-                       "-frames:v", "1", str(target_jpg)]
-                try:
-                    subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-                except Exception:
-                    pass
-            else:
-                from PySide6.QtGui import QImageReader
-                reader = QImageReader(str(media_path))
-                reader.setAutoTransform(True)
-                sz = reader.size()
-                if sz.isValid() and sz.width() > 0 and sz.height() > 0:
-                    w, h = sz.width(), sz.height()
-                    if w >= h:
-                        reader.setScaledSize(QSize(int(max_side), max(1, int(h * max_side / max(1, w)))))
-                    else:
-                        reader.setScaledSize(QSize(max(1, int(w * max_side / max(1, h))), int(max_side)))
-                img = reader.read()
-                if not img.isNull():
-                    img.save(str(target_jpg), "JPG", 70)
-        except Exception:
-            pass
-
-    def _ensure_recent_thumb(self, job_json: Path, media: Path, max_side: int) -> Path|None:
-        try:
-            t = self._thumb_path_for_job(job_json, media, max_side)
-            if (not t.exists()) or (t.stat().st_mtime < media.stat().st_mtime):
-                self._thumb_from_media(media, t, max_side)
-            return t if t.exists() else None
-        except Exception:
-            return None
-
-
-    def _load_pixmap_cached(self, path: "Path", size: int, rounded: bool = False, radius: int | None = None):
-        """Load and scale a QPixmap with LRU(128) caching; optionally return a rounded pixmap."""
-        try:
-            key = f"{str(path)}|{int(size)}|r{int(radius) if (rounded and radius is not None) else 0}"
-            if hasattr(self, "_pm_cache") and key in self._pm_cache:
-                pm = self._pm_cache.pop(key)
-                self._pm_cache[key] = pm  # refresh LRU
-                return pm
-            from PySide6.QtGui import QPixmap, QPainter, QPainterPath
-            from PySide6.QtCore import QRectF, Qt
-            pm = QPixmap(str(path))
-            if pm and not pm.isNull():
-                pm2 = pm.scaled(int(size), int(size), Qt.KeepAspectRatio, Qt.SmoothTransformation)
-                if rounded:
-                    try:
-                        R = int(radius) if radius is not None else max(6, int(size*0.18))
-                        out = QPixmap(int(size), int(size))
-                        out.fill(Qt.transparent)
-                        painter = QPainter(out)
-                        painter.setRenderHint(QPainter.Antialiasing, True)
-                        x = max(0, (int(size) - pm2.width()) // 2)
-                        y = max(0, (int(size) - pm2.height()) // 2)
-                        path = QPainterPath()
-                        path.addRoundedRect(QRectF(x, y, pm2.width(), pm2.height()), R, R)
-                        painter.setClipPath(path)
-                        painter.drawPixmap(x, y, pm2)
-                        painter.end()
-                        pm2 = out
-                    except Exception:
-                        pass
-                try:
-                    self._pm_cache[key] = pm2
-                    while len(self._pm_cache) > getattr(self, "_pm_cache_cap", 128):
-                        self._pm_cache.popitem(last=False)
-                except Exception:
-                    pass
-                return pm2
-        except Exception:
-            pass
-        try:
-            from PySide6.QtGui import QPixmap as _QPM
-            return _QPM()
-        except Exception:
-            return None
-
-
-    def _install_recents_poller(self):
-        # Poll filtered Upscale jobs (jobs/done/*_upscale_*.json) every 5s; rebuild only on change.
-        try:
-            if getattr(self, "_recents_poller", None):
-                return
-            from PySide6.QtCore import QTimer
-            def _sig():
-                try:
-                    jobs = self._list_recent_jobs()
-                    return tuple((p.name, int(p.stat().st_mtime)) for p in jobs)
-                except Exception:
-                    return tuple()
-            def _tick():
-                try:
-                    cur = _sig()
-                    if cur != getattr(self, "_recents_jobs_sig", None):
-                        self._recents_jobs_sig = cur
-                        self._rebuild_recents()
-                except Exception:
-                    pass
-            # run once immediately
-            try:
-                self._recents_jobs_sig = None
-                _tick()
-            except Exception:
-                pass
-            t = QTimer(self)
-            t.setInterval(5000)  # 5 seconds
-            t.timeout.connect(_tick)
-            t.start()
-            self._recents_poller = t
-        except Exception:
-            pass
-    def _rebuild_recents(self):
-        """Rebuild the horizontal recents row from jobs/done JSONs. Low-resource, no heavy loading."""
-        try:
-            layout = getattr(self, "_recents_row", None)
-            if layout is None:
-                return
-            self._recents_idx = 0
-            while layout.count():
-                item = layout.takeAt(0)
-                w = item.widget()
-                if w is not None:
-                    w.deleteLater()
-
-            size = 96
-            try: size = int(self.sld_recent_size.value())
-            except Exception: pass
-
-            jobs = self._list_recent_jobs()
-            if not jobs:
-                lab = QtWidgets.QLabel("No results yet.", self)
-                lab.setStyleSheet("color:#9fb3c8;")
-                layout.addWidget(lab)
-                return
-
-            for jpath in jobs:
-                # Hard-guard: Upscale-only JSON files
-                try:
-                    if "_upscale_" not in jpath.name.lower():
-                        continue
-                except Exception:
-                    continue
-                media, j = self._resolve_output_from_job(jpath)
-                if not (media and media.exists() and media.is_file()):
-                    continue
-                tp = self._ensure_recent_thumb(jpath, media, 120)
-
-                btn = QtWidgets.QToolButton(self)
-                btn.setToolButtonStyle(Qt.ToolButtonTextUnderIcon)
-                btn.setText(Path(media).name)
-                btn.setCursor(Qt.PointingHandCursor)
-                btn.setAutoRaise(True)
-                try:
-                    btn.setStyleSheet("QToolButton{border:1px solid rgba(255,255,255,0.12);border-radius:12px;padding:6px 6px 10px 6px;background:rgba(255,255,255,0.03);}QToolButton:hover{background:rgba(255,255,255,0.06);}")
-                except Exception:
-                    pass
-                if tp:
-                    try:
-                        pm = self._load_pixmap_cached(tp, size, rounded=True, radius=12)
-                        if pm:
-                            btn.setIcon(QIcon(pm))
-                        else:
-                            btn.setIcon(QIcon(str(tp)))
-                    except Exception:
-                        btn.setIcon(QIcon(str(tp)))
-                btn.setIconSize(QSize(size, size))
-                btn.setFixedSize(int(size*1.25), int(size*1.25)+28)
-
-                def _mk_open(path: Path):
-                    def _open():
-                        try:
-                            if not self._play_in_player(path):
-                                _open_file(self, path)
-                        except Exception:
-                            _open_file(self, path)
-                    return _open
-                btn.clicked.connect(_mk_open(media))
-                # grid placement with wrapping
-                try:
-                    vpw = self.recents_scroll.viewport().width()
-                except Exception:
-                    vpw = self._recents_inner.width()
-                try:
-                    if not vpw or vpw <= 1:
-                        vpw = max(self.recents_scroll.width(), self.width(), 600)
-                except Exception:
-                    vpw = 600
-                spacing = getattr(layout, "spacing", lambda: 8)()
-                item_w = int(size*1.25)
-                if vpw <= item_w + spacing and len(jobs) > 1:
-                    cols = min(len(jobs), 4)
-                else:
-                    cols = max(1, int((vpw + spacing) // (item_w + spacing)))
-                idx = getattr(self, "_recents_idx", 0)
-                row = idx // cols
-                col = idx % cols
-                setattr(self, "_recents_idx", idx+1)
-                layout.addWidget(btn, row, col)
-
-            try:
-                spacing = getattr(layout, "spacing", lambda: 8)()
-                item_w = int(size*1.25)
-                item_h = int(size*1.25)+28
-                try:
-                    vpw = self.recents_scroll.viewport().width()
-                except Exception:
-                    vpw = self._recents_inner.width()
-                try:
-                    if not vpw or vpw <= 1:
-                        vpw = max(self.recents_scroll.width(), self.width(), 600)
-                except Exception:
-                    vpw = 600
-                cols = max(1, int((vpw + spacing) // (item_w + spacing)))
-                total = layout.count()
-                rows = max(1, (total + cols - 1) // cols)
-                min_h = rows * item_h + max(0, rows-1) * spacing + 12
-                self._recents_inner.setMinimumHeight(min_h)
-            except Exception:
-                pass
-
-        except Exception as e:
-            try: self._append_log(f"[recents] rebuild error: {e}")
-            except Exception: pass
-
-
     def _sync_scale_from_slider(self, v: int):
         self.spin_scale.blockSignals(True)
         self.spin_scale.setValue(v / 10.0)
@@ -1821,6 +2608,7 @@ class UpscPane(QtWidgets.QWidget):
             self._update_batch_limit()
         except Exception:
             pass
+
 
     def _pick_single(self):
         path, _ = QtWidgets.QFileDialog.getOpenFileName(self, "Select image or video", str(ROOT))
@@ -2258,6 +3046,99 @@ class UpscPane(QtWidgets.QWidget):
             pass
         return ",".join(fs)
 
+
+    def _try_unload_media_before_delete(self, media_path: Path):
+        """Best-effort: unload *media_path* from the main player/viewer before deleting.
+
+        This tries to clear any player in the main window that currently has this path
+        open, so Windows can release file locks. Failures are silently ignored; the
+        caller still needs to handle delete errors.
+        """
+        try:
+            if media_path is None:
+                return
+            m = getattr(self, "_main", None) or getattr(self, "main", None)
+            if not m:
+                return
+            try:
+                media_resolved = media_path.resolve()
+            except Exception:
+                media_resolved = media_path
+            targets = []
+            for attr in ("video", "player", "viewer"):
+                try:
+                    obj = getattr(m, attr, None)
+                except Exception:
+                    obj = None
+                if obj is not None:
+                    targets.append(obj)
+            for obj in targets:
+                try:
+                    cur = getattr(obj, "current_path", None)
+                except Exception:
+                    cur = None
+                if not cur:
+                    try:
+                        cur = getattr(obj, "source", None)
+                    except Exception:
+                        cur = None
+                if not cur:
+                    continue
+                try:
+                    from pathlib import Path as _P
+                    cur_p = _P(str(cur))
+                    cur_resolved = cur_p.resolve()
+                except Exception:
+                    cur_resolved = cur
+                try:
+                    same = (cur_resolved == media_resolved)
+                except Exception:
+                    same = False
+                if not same:
+                    continue
+                # Try a few common ways to unload
+                for meth in ("clear", "close", "stop"):
+                    fn = getattr(obj, meth, None)
+                    if callable(fn):
+                        try:
+                            fn()
+                        except Exception:
+                            pass
+                fn = getattr(obj, "open", None)
+                if callable(fn):
+                    for arg in (None, "", " "):
+                        try:
+                            fn(arg)
+                            break
+                        except Exception:
+                            continue
+            # Clear main-window current_path-style attributes if they point here
+            for attr in ("current_path", "current_media", "current_file"):
+                try:
+                    cur = getattr(m, attr, None)
+                except Exception:
+                    cur = None
+                if not cur:
+                    continue
+                try:
+                    from pathlib import Path as _P
+                    cur_p = _P(str(cur))
+                    cur_resolved = cur_p.resolve()
+                except Exception:
+                    cur_resolved = cur
+                try:
+                    same = (cur_resolved == media_resolved)
+                except Exception:
+                    same = False
+                if same:
+                    try:
+                        setattr(m, attr, None)
+                    except Exception:
+                        pass
+        except Exception:
+            # Best-effort only
+            pass
+
     def _play_in_player(self, p: Path):
 
         m = getattr(self, "_main", None) or getattr(self, "main", None)
@@ -2286,6 +3167,13 @@ class UpscPane(QtWidgets.QWidget):
         src_path = self.edit_input.text().strip()
         if not src_path:
             QtWidgets.QMessageBox.information(self, "Info", "No input selected.")
+            return
+        self._show_media_info_for(src_path)
+
+    def _show_media_info_for(self, src_path):
+        src_path = (str(src_path) or "").strip()
+        if not src_path:
+            QtWidgets.QMessageBox.information(self, "Info", "No media selected.")
             return
         try:
             cmd = [FFPROBE, "-v", "error", "-print_format", "json", "-show_format", "-show_streams", src_path]
@@ -2934,7 +3822,7 @@ try:
         # Rich, sourced model info (short, single-line style)
         _FV_MODEL_HINTS = {
             # Real-ESRGAN family (primary)
-            "realesrgan-x4plus": ("Photo", "General 4× Real-ESRGAN model for real‑world photos; good default."),
+            "realesrgan-x4plus": ("Photo", "General 4× model for real‑world photo/video; Can take a while to finish on longer videos."),
             "realesrnet-x4plus": ("Photo", "4× RealESRNet (no-GAN) — fewer hallucinated textures; stable on photos."),
             "realesrgan-x4plus-anime": ("Anime", "4× model tuned for anime/illustrations; preserves clean lines & flats."),
             "realesr-animevideov3-x4": ("Anime/Video", "4× anime‑video model (v3); reduces temporal artifacts on frames."),
@@ -3074,7 +3962,7 @@ try:
 
             # Model badge/hint hover
             tip(getattr(self, "lbl_model_badge", None), "Category of the selected model.")
-            tip(getattr(self, "lbl_model_hint", None), "Short description of the selected model.")
+            tip(getattr(self, "lbl_model_hint", None), "selected model.")
 
         # Wrap __init__ to attach tooltips and hook our rich hint updater
         if not hasattr(_Pane, "_fv_orig_init_tooltips"):
@@ -3309,10 +4197,27 @@ try:
                     pass
 
             if "clearreality v1" in eng:
-                # Only show ClearReality models
-                items = [s for s in all_items if "clearreality" in (s or "").lower()]
+                # Only show ClearReality models (scan directly from disk)
+                try:
+                    items = list(_fv_scan_clearreality_models())
+                except Exception:
+                    items = []
+ #           elif "bstexty for text upscaling" in eng:
+  #              # Only show BStexty models
+   #             items = [s for s in all_items if "bstexty" in (s or "").lower()]
+ #           elif "fatality noisetoner for sharping/denoising" in eng:
+    #            # Only show Fatality NoiseToner models
+     #           items = [s for s in all_items if ("fatality" in (s or "").lower()) or ("noisetoner" in (s or "").lower())]
+            elif "real-esrgan" in eng:
+                # Real-ESRGAN engine: hide BStexty/Fatality models (they have their own engines)
+                items = [s for s in all_items if ("bstexty" not in (s or "").lower()) and ("fatality" not in (s or "").lower()) and ("noisetoner" not in (s or "").lower())]
+            else:
+                items = None
+
+            if items is not None:
+                # If nothing matched, fall back to the full list so the combo never ends up empty.
                 if not items:
-                    items = _fv_scan_clearreality_models()
+                    items = list(all_items)
                 _repopulate(items)
             else:
                 # Restore full list if it looks filtered

@@ -4,6 +4,7 @@ except Exception:
     pass
 
 # --- FrameVision: quiet specific Qt warnings ---
+
 def _fv_msg_filter(mode, context, message):
     try:
         msg = str(message)
@@ -25,6 +26,13 @@ except Exception:
     pass
 # --- end quiet block ---
 
+import warnings
+
+warnings.filterwarnings(
+    "ignore",
+    category=UserWarning,
+    message=r"torch\.distributed\.reduce_op is deprecated, please use torch\.distributed\.ReduceOp instead"
+)
 
 # --- FrameVision: global warnings/verbosity quiet patch ---
 # Set env + filters BEFORE importing torch/transformers/diffusers
@@ -45,6 +53,12 @@ try:
     _warnings.filterwarnings(
         "ignore",
         message=r".*`callback`.*deprecated.*",
+        category=FutureWarning,
+        module=r"diffusers\..*",
+    )
+    _warnings.filterwarnings(
+        "ignore",
+        message=r".*`QColor`.*fromHsv.*",
         category=FutureWarning,
         module=r"diffusers\..*",
     )
@@ -129,6 +143,7 @@ from PySide6.QtCore import Qt, QTimer
 from PySide6.QtGui import QShortcut, QKeySequence
 
 import helpers.framevision_app as app_mod
+from helpers.no_wheel_guard import install_no_wheel_guard
 from helpers.ui_fixups import schedule_all_ui_fixes
 from helpers.intro_screen import run_intro_if_enabled
 
@@ -209,6 +224,12 @@ def main():
 
     # F11 fullscreen toggle
     QShortcut(QKeySequence("F11"), win, activated=lambda: _toggle_fullscreen(win))
+
+    # Disable mouse-wheel changes on sliders/spinboxes/combos (so scrolling is safe)
+    try:
+        install_no_wheel_guard(win)
+    except Exception:
+        pass
 
     schedule_all_ui_fixes(win)
     sys.exit(app.exec())

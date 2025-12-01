@@ -789,7 +789,12 @@ def auto_install_sysmon_settings(retries: int = 14, delay_ms:int = 350):
 
     lay = getattr(content, "layout", lambda: None)()
     if lay:
-        lay.insertWidget(0, section)
+        # Insert System monitor just below the top banner (index 1),
+        # falling back to appending if something unexpected happens.
+        try:
+            lay.insertWidget(1, section)
+        except Exception:
+            lay.addWidget(section)
     else:
         section.setParent(content); section.show()
 

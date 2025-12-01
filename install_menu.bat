@@ -56,10 +56,11 @@ echo %ITEM% 4^)  Full install %GRAY%(CUDA GPU)
 echo %RST%      Installs the app plus CUDA-enabled ML dependencies
 echo %BLUE%      for NVIDIA GPUs. 8 gig Vram or more is advised 
 echo.
-echo %ITEM% 5^)  Exit
+echo %ITEM% 5^)  Show optional installs%RST%
+echo %ITEM% 6^)  Exit
 echo. %RST%
 
-choice /C 12345 /N /M "Choose an option [1-5]: "%RST%
+choice /C 123456 /N /M "Choose an option [1-6]: "%RST%
 set "CHOICE=%ERRORLEVEL%"
 echo.
 
@@ -67,8 +68,8 @@ if "%CHOICE%"=="1" goto check
 if "%CHOICE%"=="2" goto core
 if "%CHOICE%"=="3" goto cpu
 if "%CHOICE%"=="4" goto cuda
-goto end
-
+if "%CHOICE%"=="5" goto extras_only
+if "%CHOICE%"=="6" goto end
 :ensure_python
 rem Ensure a REAL Python is available (not MS Store alias). Auto-install if missing.
 set "PYTHON="
@@ -1019,9 +1020,146 @@ pause
 
 endlocal & goto menu
 
+:extras_only
+rem Run only optional extras (WAN 2.2, Z-image, Ace Music) without core/CUDA reinstall
+call :ensure_python || exit /b 1
+call :ensure_venv   || exit /b 1
+call :select_extras
+rem --- Run selected extras only ---
+if "%WAN22_EXTRA%"=="1" (
+  if exist "%ROOT%presets\extra_env\wan22_setup.bat" (
+    call "%ROOT%presets\extra_env\wan22_setup.bat"
+  ) else (
+    echo %NOTE%[WARN] WAN 2.2 extra selected, but "%ROOT%presets\extra_env\wan22_setup.bat" was not found.%RST%
+  )
+)
+if "%COMFUI_EXTRA%"=="1" (
+  if exist "%ROOT%presets\extra_env\zimage_install.bat" (
+    call "%ROOT%presets\extra_env\zimage_install.bat"
+  ) else (
+    echo %NOTE%[WARN] Z-image selected, but "%ROOT%presets\extra_env\zimage_install.bat" was not found.%RST%
+  )
+)
+if "%ACE_EXTRA%"=="1" (
+  if exist "%ROOT%presets\extra_env\ace_setup.bat" (
+    call "%ROOT%presets\extra_env\ace_setup.bat"
+  ) else (
+    echo %NOTE%[WARN] Ace Music selected, but "%ROOT%presets\extra_env\ace_setup.bat" was not found.%RST%
+  )
+)
+echo.
+echo Optional installs completed.
+pause
+goto menu
+
+:select_extras
+rem Second-page menu for optional extra installs (WAN 2.2, Z-image, Ace Music)
+set "WAN22_EXTRA=0"
+set "COMFUI_EXTRA=0"
+set "ACE_EXTRA=0"
+
+:extras_menu
+cls
+echo.
+echo %TITLE%==============================================%RST%
+echo %BOLD%      Extra options for this install%RST%
+echo %TITLE%==============================================%RST%
+echo.
+echo %NOTE% You can enable one or more extras below, then start the install.%RST%
+echo.
+echo %ITEM% 1^)  WAN 2.2 environment%RST%
+echo %NOTE%      Needs about 30 gigabyte of extra space on disk.%RST%
+if "%WAN22_EXTRA%"=="1" (
+  echo %GREEN%      [X] Enabled%RST%
+) else (
+  echo %GRAY%      [ ] Disabled%RST%
+)
+echo.
+echo %ITEM% 2^)  Z-image%RST%
+echo %NOTE%      Extra image creator, more realistic, correct spelling of text.%RST%
+echo %NOTE%      Better prompt following (needs 30-35 gig extra space on disk%RST%
+echo %NOTE%      +16 gigabyte VRAM minimum).%RST%
+if "%COMFUI_EXTRA%"=="1" (
+  echo %GREEN%      [X] Enabled%RST%
+) else (
+  echo %GRAY%      [ ] Disabled%RST%
+)
+echo.
+echo %ITEM% 3^)  Ace Music%RST%
+echo %NOTE%      Takes about ~6 GiB of additional disk space.%RST%
+if "%ACE_EXTRA%"=="1" (
+  echo %GREEN%      [X] Enabled%RST%
+) else (
+  echo %GRAY%      [ ] Disabled%RST%
+)
+echo.
+echo %ITEM% 4^)  Start install with current selections%RST%
+echo %ITEM% 5^)  Back to main menu%RST%
+echo.
+choice /C 12345 /N /M "Choose: "%RST%
+set "ECHOICE=%ERRORLEVEL%"
+echo.
+if "%ECHOICE%"=="1" goto toggle_wan22_extra
+if "%ECHOICE%"=="2" goto toggle_comfui_extra
+if "%ECHOICE%"=="3" goto toggle_ace_extra
+if "%ECHOICE%"=="4" goto extras_done
+if "%ECHOICE%"=="5" goto menu
+goto extras_menu
+
+:toggle_wan22_extra
+if "%WAN22_EXTRA%"=="0" (
+  set "WAN22_EXTRA=1"
+) else (
+  set "WAN22_EXTRA=0"
+)
+goto extras_menu
+
+:toggle_comfui_extra
+if "%COMFUI_EXTRA%"=="0" (
+  set "COMFUI_EXTRA=1"
+) else (
+  set "COMFUI_EXTRA=0"
+)
+goto extras_menu
+
+:toggle_ace_extra
+if "%ACE_EXTRA%"=="0" (
+  set "ACE_EXTRA=1"
+) else (
+  set "ACE_EXTRA=0"
+)
+goto extras_menu
+
+:extras_done
+rem Return to caller (core/cuda/extras_only) with WAN22_EXTRA / COMFUI_EXTRA / ACE_EXTRA set
+exit /b 0
+
 :core
 call :ensure_python || exit /b 1
 call :ensure_venv   || exit /b 1
+call :select_extras
+rem --- Run selected extras for this Core install (if any) ---
+if "%WAN22_EXTRA%"=="1" (
+  if exist "%ROOT%presets\extra_env\wan22_setup.bat" (
+    call "%ROOT%presets\extra_env\wan22_setup.bat"
+  ) else (
+    echo %NOTE%[WARN] WAN 2.2 extra selected, but "%ROOT%presets\extra_env\wan22_setup.bat" was not found.%RST%
+  )
+)
+if "%COMFUI_EXTRA%"=="1" (
+  if exist "%ROOT%presets\extra_env\zimage_install.bat" (
+    call "%ROOT%presets\extra_env\zimage_install.bat"
+  ) else (
+    echo %NOTE%[WARN] Z-image selected, but "%ROOT%presets\extra_env\zimage_install.bat" was not found.%RST%
+  )
+)
+if "%ACE_EXTRA%"=="1" (
+  if exist "%ROOT%presets\extra_env\ace_setup.bat" (
+    call "%ROOT%presets\extra_env\ace_setup.bat"
+  ) else (
+    echo %NOTE%[WARN] Ace Music selected, but "%ROOT%presets\extra_env\ace_setup.bat" was not found.%RST%
+  )
+)
 call :pip_upgrade
 echo Installing core requirements...
 if exist requirements-core.txt (
@@ -1090,6 +1228,29 @@ if exist "framevision_run.py" (
 :cuda
 call :ensure_python
 call :ensure_venv
+call :select_extras
+rem --- Run selected extras for this CUDA install (if any) ---
+if "%WAN22_EXTRA%"=="1" (
+  if exist "%ROOT%presets\extra_env\wan22_setup.bat" (
+    call "%ROOT%presets\extra_env\wan22_setup.bat"
+  ) else (
+    echo %NOTE%[WARN] WAN 2.2 extra selected, but "%ROOT%presets\extra_env\wan22_setup.bat" was not found.%RST%
+  )
+)
+if "%COMFUI_EXTRA%"=="1" (
+  if exist "%ROOT%presets\extra_env\zimage_install.bat" (
+    call "%ROOT%presets\extra_env\zimage_install.bat"
+  ) else (
+    echo %NOTE%[WARN] Z-image selected, but "%ROOT%presets\extra_env\zimage_install.bat" was not found.%RST%
+  )
+)
+if "%ACE_EXTRA%"=="1" (
+  if exist "%ROOT%presets\extra_env\ace_setup.bat" (
+    call "%ROOT%presets\extra_env\ace_setup.bat"
+  ) else (
+    echo %NOTE%[WARN] Ace Music selected, but "%ROOT%presets\extra_env\ace_setup.bat" was not found.%RST%
+  )
+)
 call :pip_upgrade
 if exist scripts\external_downloader.py (
   call ".venv\Scripts\python.exe" scripts\external_downloader.py >nul 2>nul

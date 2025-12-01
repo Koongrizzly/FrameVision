@@ -1,0 +1,38 @@
+# Use CUDA-enabled PyTorch wheels (CUDA 12.1).
+--extra-index-url https://download.pytorch.org/whl/cu121
+
+Pillow
+tqdm
+imageio
+PySide6
+huggingface_hub
+safetensors
+
+# CUDA-enabled PyTorch
+torch==2.4.0
+torchvision==0.19.0
+torchaudio
+
+# Wan 2.2 deps
+einops
+decord
+librosa
+peft
+
+opencv-python>=4.9.0.80
+diffusers>=0.31.0
+transformers>=4.49.0,<=4.51.3
+tokenizers>=0.20.3
+accelerate>=1.1.1
+tqdm
+imageio[ffmpeg]
+easydict
+ftfy
+dashscope
+imageio-ffmpeg
+# flash_attn
+numpy>=1.23.5,<2
+
+# Optimizations for Wan2.2
+triton-windows==3.5.0  # Windows-specific Triton (from OpenAI fork)
+bitsandbytes>=0.44.1  # For quantization in VRAM limiter

@@ -1,0 +1,9 @@
+{
+  "height": 640,
+  "width": 1024,
+  "num_inference_steps": 9,
+  "guidance_scale": 0.0,
+  "seed": 581717,
+  "output_dir": "output/zimage",
+  "last_prompt": "an ultra realistic Grizzly bear, wearing a tuxedo,  is a deejay in a nightclub. The grizzly bear is spinning the decks on professional Pioneer Deejay gear"
+}

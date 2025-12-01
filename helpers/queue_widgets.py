@@ -1078,6 +1078,16 @@ class JobRowWidget(QWidget):
     def _resolve_output_file(self) -> Optional[Path]:
         d = self.data or {}
         args = d.get("args") or {}
+
+        # Fast path: direct 'produced' field if it points to a real file (helps ace_text2music WAV, etc.)
+        try:
+            produced_val = d.get("produced")
+            if isinstance(produced_val, str):
+                p = Path(produced_val).expanduser()
+                if p.is_file():
+                    return p
+        except Exception:
+            pass
     
         # Identify source (never return this)
         src_path = None

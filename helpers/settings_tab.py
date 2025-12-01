@@ -200,7 +200,7 @@ def _options_group(page: QWidget) -> QGroupBox:
     cb_clear_pyc.setChecked(clear_default)
 
     # -- Tooltip visibility checkbox -------------------------------------------------
-    cb_tooltips = QCheckBox("Show hover tips / help bubbles")
+    cb_tooltips = QCheckBox("Show hover tips")
     cb_tooltips.setToolTip(
         "Turn off to hide ALL mouse-hover tooltips and help popups "
         "everywhere in FrameVision right away."
@@ -240,6 +240,19 @@ def _options_group(page: QWidget) -> QGroupBox:
     except Exception:
         pass
 
+    # -- Fancy banner toggles ------------------------------------------------------
+    cb_banner = QCheckBox("Banners")
+    cb_banner.setToolTip("Show or hide the fancy banner headers at the top of each tab.")
+    banner_default = s.value("banner_enabled", True, type=bool)
+    cb_banner.setChecked(banner_default)
+
+    cb_banner_color = QCheckBox("Colored")
+    cb_banner_color.setToolTip("If off, all banners use a neutral grey gradient instead of colorful themes.")
+    banner_color_default = s.value("banner_colored", True, type=bool)
+    cb_banner_color.setChecked(banner_color_default)
+    # Only show the colored toggle when the banner itself is enabled
+    cb_banner_color.setVisible(bool(banner_default))
+
     # ---- shared visual helper: grey out when OFF ---------------------------------
     def _sync_grey_state(chk: QCheckBox, is_on: bool):
         # we tint text color when off (unchecked). when on, reset to theme default
@@ -253,6 +266,8 @@ def _options_group(page: QWidget) -> QGroupBox:
     _sync_grey_state(cb_tooltips, bool(tooltips_default))
     _sync_grey_state(cb_keep_settings, bool(keep_default))
     _sync_grey_state(cb_diag, bool(diag_default))
+    _sync_grey_state(cb_banner, bool(banner_default))
+    _sync_grey_state(cb_banner_color, bool(banner_color_default))
 
     # ---- handlers + persistence ---------------------------------------------------
     def _on_clear_pyc_toggle(b: bool):
@@ -281,23 +296,54 @@ def _options_group(page: QWidget) -> QGroupBox:
             pass
         _sync_grey_state(cb_diag, bool(b))
 
+    def _on_banner_toggle(b: bool):
+        s.setValue("banner_enabled", bool(b))
+        _sync_grey_state(cb_banner, bool(b))
+        # Show/hide the "Colored on/off" toggle along with the banner itself
+        try:
+            cb_banner_color.setVisible(bool(b))
+        except Exception:
+            pass
+        try:
+            _banner_apply_visibility(page, bool(b))
+        except Exception:
+            pass
+
+    def _on_banner_color_toggle(b: bool):
+        s.setValue("banner_colored", bool(b))
+        _sync_grey_state(cb_banner_color, bool(b))
+        try:
+            _banner_apply_colored(page, bool(b))
+        except Exception:
+            pass
+
     # connect signals
     cb_clear_pyc.toggled.connect(lambda b: _on_clear_pyc_toggle(b))
     cb_tooltips.toggled.connect(lambda b: _on_tooltips_toggle(b))
     cb_keep_settings.toggled.connect(lambda b: _on_keep_settings_toggle(b))
     cb_diag.toggled.connect(lambda b: _on_diag_toggle(b))
+    cb_banner.toggled.connect(lambda b: _on_banner_toggle(b))
+    cb_banner_color.toggled.connect(lambda b: _on_banner_color_toggle(b))
 
     # Add widgets to layout in the requested visual order:
     # 1. Clear pycache
     # 2. Tooltip visibility (NEW)
     # 3. Keep settings after restart
     # 4. Diagnostic logging
+    # 5. Banner on/off + Colored on/off (same row)
     v.addWidget(cb_clear_pyc)
     v.addWidget(cb_tooltips)
     v.addWidget(cb_keep_settings)
     v.addWidget(cb_diag)
 
-    
+    # Banner row: banner visibility + colored/neutral on one line
+    row_banner = QWidget(g)
+    h_banner = QHBoxLayout(row_banner); h_banner.setContentsMargins(0,0,0,0); h_banner.setSpacing(12)
+    h_banner.addWidget(cb_banner)
+    h_banner.addWidget(cb_banner_color)
+    h_banner.addStretch(1)
+    v.addWidget(row_banner)
+
     # -- Emoji labels toggle --------------------------------------------------------
     cb_emoji = QCheckBox("Emoji labels")
     cb_emoji.setToolTip("Replace feature labels with emoji like 🔍 ⏱️ 📝 📸 🖌️ 🤖 ⏳ ⚙️/⚒️. "
@@ -321,7 +367,7 @@ def _options_group(page: QWidget) -> QGroupBox:
             pass
 
     cb_emoji.toggled.connect(lambda b: _on_emoji_toggle(b))
-    v.addWidget(cb_emoji)
+
     # -- Emoji tabs: show labels + emojis option (dependent) ---------------------
     cb_emoji_tabs = QCheckBox("Show labels with emojis on the tabs")
     cb_emoji_tabs.setToolTip(
@@ -345,7 +391,79 @@ def _options_group(page: QWidget) -> QGroupBox:
             pass
 
     cb_emoji_tabs.toggled.connect(lambda b: _on_emoji_tabs_toggle(b))
-    v.addWidget(cb_emoji_tabs)
+
+    # Emoji + Emoji-tabs share one row in the layout
+    row_emoji = QWidget(g)
+    h_emoji = QHBoxLayout(row_emoji); h_emoji.setContentsMargins(0,0,0,0); h_emoji.setSpacing(12)
+    h_emoji.addWidget(cb_emoji)
+    h_emoji.addWidget(cb_emoji_tabs)
+    h_emoji.addStretch(1)
+    v.addWidget(row_emoji)
+    # -- Swap left/right (tabs ↔ player) — structural, text stays normal -----------
+    cb_rswap = QCheckBox("Swap left/right layout")
+    cb_rswap.setToolTip("Swap the tabs and media player positions (tabs on left, player on right) without changing text direction.")
+    swap_default = s.value("rtl_layout_enabled", False, type=bool)
+    cb_rswap.setChecked(swap_default)
+    _sync_grey_state(cb_rswap, bool(swap_default))
+
+    def _find_main_splitter(root: QWidget):
+        from PySide6.QtWidgets import QSplitter
+        win = root.window() if hasattr(root, 'window') else root
+        cands = win.findChildren(QSplitter)
+        best = None
+        best_total = -1
+        for sp in cands:
+            try:
+                total = sum(sp.sizes()) if sp.count() >= 2 else -1
+                if total > best_total:
+                    best_total = total
+                    best = sp
+            except Exception:
+                pass
+        return best
+
+    def _apply_swap_main(root: QWidget, enabled: bool):
+        from PySide6.QtWidgets import QWidget
+        sp = _find_main_splitter(root)
+        if not sp or sp.count() < 2:
+            return
+        # remember original order once
+        orig = sp.property('orig_lr')
+        if not orig:
+            orig = [sp.widget(0), sp.widget(1)]
+            sp.setProperty('orig_lr', orig)
+        left, right = orig[0], orig[1]
+        if enabled:
+            sp.insertWidget(0, right)
+            sp.insertWidget(1, left)
+        else:
+            sp.insertWidget(0, left)
+            sp.insertWidget(1, right)
+        sp.update()
+
+    def _on_swap_toggle(b: bool):
+        s.setValue("rtl_layout_enabled", bool(b))
+        _sync_grey_state(cb_rswap, bool(b))
+        try:
+            _apply_swap_main(page, bool(b))
+        except Exception:
+            pass
+
+    cb_rswap.toggled.connect(lambda b: _on_swap_toggle(b))
+    v.addWidget(cb_rswap)
+
+    # Apply persisted swap immediately
+    try:
+        _apply_swap_main(page, bool(swap_default))
+    except Exception:
+        pass
+
+    # Apply persisted banner settings once now that the UI exists
+    try:
+        _banner_apply_visibility(page, bool(banner_default))
+        _banner_apply_colored(page, bool(banner_color_default))
+    except Exception:
+        pass
 
 # -- Temperature units row -------------------------------------------------------
     row = QWidget(g)
@@ -471,13 +589,12 @@ def _buttons_row(page: QWidget) -> QWidget:
     h.addStretch(1)
     return row
 
-
 def _logo_group(page: QWidget) -> QWidget:
     g = QWidget(page)
     v = QVBoxLayout(g); v.setContentsMargins(8,8,8,8); v.setSpacing(8)
     lab = QLabel(g); lab.setAlignment(Qt.AlignCenter)
-    lab.setMinimumHeight(240); lab.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
-    lab.setStyleSheet("QLabel { background:#1a1a1a; color:#aaaaaa; border-radius:8px; }")
+    lab.setMinimumHeight(260); lab.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+  #  lab.setStyleSheet("QLabel { background:#1a1a1a; color:#aaaaaa; border-radius:2px; }")
     lab.setAutoFillBackground(True)
     from helpers.kv_index import attach_click_hint
     attach_click_hint(lab)
@@ -500,7 +617,7 @@ def _logo_group(page: QWidget) -> QWidget:
 
     lab.resizeEvent = lambda _e: refresh()
     QTimer.singleShot(0, refresh)
-    tm = QTimer(g); tm.setInterval(3500); tm.timeout.connect(refresh); tm.start()
+    tm = QTimer(g); tm.setInterval(4500); tm.timeout.connect(refresh); tm.start()
 
     try:
         from helpers.overlay_animations import apply_intro_overlay_from_settings, stop_overlay
@@ -569,6 +686,79 @@ def _logo_group(page: QWidget) -> QWidget:
 
     return g
 
+# --- Fancy banner helpers -------------------------------------------------------
+def _banner__iter_banners(root: QWidget):
+    """Yield all QLabel instances that act as fancy banners (per-tab headers)."""
+    if root is None:
+        return
+    if isinstance(root, QWidget):
+        win = root.window() or root
+    else:
+        win = root
+    if not isinstance(win, QWidget):
+        return
+    for lab in win.findChildren(QLabel):
+        try:
+            name = lab.objectName() or ""
+        except Exception:
+            name = ""
+        if name.endswith("Banner"):
+            yield lab
+
+def _banner_grey_style_from(style: str) -> str:
+    """Return a stylesheet string with the banner gradient forced to greyscale."""
+    try:
+        style = style or ""
+        key = "background:"
+        idx = style.find(key)
+        grey_block = (
+            " background: qlineargradient("
+            "   x1:0, y1:0, x2:1, y2:0,"
+            "   stop:0 #e0e0e0,"
+            "   stop:0.5 #b0b0b0,"
+            "   stop:1 #707070"
+            " );"
+        )
+        if idx == -1:
+            return style + grey_block
+        semi = style.find(";", idx)
+        if semi == -1:
+            semi = len(style)
+        return style[:idx] + grey_block + style[semi+1:]
+    except Exception:
+        return style
+
+def _banner_apply_visibility(root: QWidget, enabled: bool) -> None:
+    """Show or hide all fancy banners in the main window."""
+    try:
+        for lab in _banner__iter_banners(root):
+            try:
+                lab.setVisible(bool(enabled))
+            except Exception:
+                pass
+    except Exception:
+        pass
+
+def _banner_apply_colored(root: QWidget, colored: bool) -> None:
+    """
+    Switch all fancy banners between their original colorful gradients (colored=True)
+    and a neutral light-grey to dark-grey gradient (colored=False).
+    """
+    try:
+        for lab in _banner__iter_banners(root):
+            try:
+                orig = lab.property("fv_banner_orig_style")
+                if orig is None:
+                    orig = lab.styleSheet() or ""
+                    lab.setProperty("fv_banner_orig_style", orig)
+                if colored:
+                    lab.setStyleSheet(orig)
+                else:
+                    lab.setStyleSheet(_banner_grey_style_from(orig))
+            except Exception:
+                pass
+    except Exception:
+        pass
 
 # === Emoji Labels (single-file implementation) ===========================================
 # Borderless emoji set & mappers (no boxed symbols). Replaces tab titles with emoji-only
@@ -580,6 +770,7 @@ _EMOJI_MAP = {
     "eastereggs": "🕹️",
     "framevision": "🍀️",
     "upscale": "🧪",
+    "upscaling": "🧪",
     "engine": "🚀",
     "interpolator": "⏱️",
     "model": "🧩️",
@@ -590,6 +781,7 @@ _EMOJI_MAP = {
     "batch": "📦",
     "info": "💡",
     "txt2img": "📸",
+    "loader": "📸",
     "txt to img": "📸",
     "running": "🏃️",
     "pending": "💤️",
@@ -598,14 +790,34 @@ _EMOJI_MAP = {
     "inpaint": "💫",
     "ptofile": "🧍",
     "queue": "⏳",
+    "split": "📽️",
     "settings": "️⚙️",
-    "tools": "🧱",
+    "tool": "🧱",
     "txttoimg": "📸",
+    "thumbnail": "🖼️",
+    "enhancement": "📝",
+    "mixer": "🎼",
+    "music": "🎶",
+    "whisper": "💬",
+    "metadata": "🏷️",
+    "speedup": "🐢",
+    "frames": "🎞️",
+    "animated": "🔮️",
+    "trim": "✂️",
+    "cropping": "📐",
+    "images": "📸️",
+    "rename": "📗️",
     "copy": "🧬",
+    "sound": "🎵️",
+    "videoclip": "📺",
     "preview": "👁️",
-    "texttoimg": "📸",
+    "wan22": "🎬",
+    "video input": "🎬",
     "file": "📂",
     "rifefps": "⏱️",
+    "interpolation": "⏱️",
+    "acemusic": "🎵️",
+    "seed": "🌱️",
     "rife fps": "⏱️",
     "cpu": "⚡️",
     "memory": "🧮",
@@ -623,7 +835,7 @@ _EMOJI_MAP = {
     "units": "🌤️",
     "theme": "🌈️",
     "overlay": "💠️",
-    "update": "🌟",
+    "Update": "🌟",
     "East": "🌟",
 }
 def _canon_text_for_emoji(s: str) -> str:
@@ -741,8 +953,6 @@ def _emoji_set_enabled_qsettings(val: bool) -> None:
     except Exception:
         pass
 
-
-
 def _emoji_tabs_show_labels_qsettings() -> bool:
     """Return whether tabs should show both emoji and label text when emoji mode is on."""
     try:
@@ -782,6 +992,32 @@ def install_settings_tab(main_window: QWidget) -> None:
 
         lay = _ensure_vbox(page)
         _wipe_layout(lay)
+
+        # Fancy red banner at the top of Settings
+        banner = QLabel('Settings', page)
+        banner.setObjectName('settingsBanner')
+        banner.setAlignment(Qt.AlignCenter)
+        banner.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+        banner.setFixedHeight(45)
+        banner.setStyleSheet(
+            "#settingsBanner {"
+            " font-size: 15px;"
+            " font-weight: 600;"
+            " padding: 8px 17px;"
+            " border-radius: 12px;"
+            " margin: 0 0 6px 0;"
+            " color: white;"
+            " background: qlineargradient("
+            "   x1:0, y1:0, x2:1, y2:0,"
+            "   stop:0 #ff5252,"
+            "   stop:0.5 #e53935,"
+            "   stop:1 #b71c1c"
+            " );"
+            " letter-spacing: 0.5px;"
+            "}"
+        )
+        lay.addWidget(banner)
+        lay.addSpacing(6)
 
         lay.addWidget(_theme_row(page))
         lay.addWidget(_options_group(page))

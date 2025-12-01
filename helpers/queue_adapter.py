@@ -4,6 +4,8 @@ def default_outdir(is_video: bool=False, purpose: str='upscale') -> str:
     base = Path('.').resolve()
     if purpose == 'rife':
         d = base / 'output' / 'video' / 'interpolated'
+    elif purpose == 'wan22':
+        d = base / 'output' / 'video' / 'wan22'
     else:
         d = base / 'output' / ('video' if is_video else 'photo') / 'upscaled'
     d.mkdir(parents=True, exist_ok=True)
@@ -157,13 +159,23 @@ def add_job(input_path: str, out_dir: str, factor: int, model: str):
 
 def enqueue_external(job: dict):
     """Enqueue a single external command job via tools_ffmpeg.
-    Expects job like { 'cmd': [...], 'out_dir': optional }.
+
+    Expected job keys include:
+      - cmd: list/str command to execute (required)
+      - out_dir: optional output directory for the job
+      - any additional metadata (prompt, label, outfile, etc.) will be stored
+        in the job's "args" dict and is available to the queue UI.
     """
     import os as _os
     out_dir = job.get('out_dir') or default_outdir(False, 'tools')
-    args = {'cmd': job.get('cmd')}
-    if not args['cmd']:
+    # Copy all fields into args so downstream code (thumbnails, output
+    # resolver, etc.) can see things like outfile/label/prompt.
+    args = dict(job) if isinstance(job, dict) else {'cmd': job}
+    cmd = args.get('cmd') or args.get('ffmpeg_cmd')
+    if not cmd:
         raise RuntimeError('enqueue_external: missing job["cmd"]')
+    # out_dir is carried separately in the job JSON; don't duplicate it in args
+    args.pop('out_dir', None)
     # input_path not required for tools job
     return enqueue_tool_job('tools_ffmpeg', '', out_dir, args, priority=550)
 # <<< FRAMEVISION_QWEN_END
@@ -195,7 +207,7 @@ def enqueue_txt2img(job: dict) -> bool:
             "lora_path","lora_scale","lora2_path","lora2_scale",
             "attn_slicing","vae_device","gpu_index","threads",
             "format","filename_template","hires_helper","fit_check",
-            "vram_profile"
+            "vram_profile","engine"
         ]
         base = {k: job.get(k) for k in keys if k in job}
         base["label"] = preview
@@ -230,4 +242,265 @@ def enqueue_txt2img(job: dict) -> bool:
     except Exception as e:
         try: print("[queue] enqueue_txt2img failed:", e)
         except Exception: pass
+        return False
+
+
+def enqueue_wan22_from_widget(inner) -> bool:
+    """Read fields from Wan22Pane and enqueue a Wan 2.2 text/image-to-video job.
+
+    This mirrors the direct-run settings in helpers/wan22.py but sends them
+    to the worker queue instead of launching generate.py in-process.
+    """
+    try:
+        # Resolve mode from combo box; fall back to text2video
+        try:
+            mode = str(inner.cmb_mode.currentText()).strip().lower()
+        except Exception:
+            mode = "text2video"
+        job_type = "wan22_image2video" if "image" in mode else "wan22_text2video"
+
+        # Prompt & image
+        try:
+            prompt = str(inner.ed_prompt.toPlainText()).strip()
+        except Exception:
+            prompt = ""
+        try:
+            image = str(inner.ed_image.text()).strip()
+        except Exception:
+            image = ""
+
+        if job_type == "wan22_image2video" and not image:
+            raise RuntimeError("Start image is required for image2video mode.")
+
+        # Core numeric settings
+        try:
+            size_str = str(inner.cmb_size.currentText()).strip()
+        except Exception:
+            size_str = "1280*704"
+        try:
+            steps = int(inner.spn_steps.value())
+        except Exception:
+            steps = 30
+        try:
+            guidance = float(inner.spn_guidance.value())
+        except Exception:
+            guidance = 7.0
+        try:
+            frames = int(inner.spn_frames.value())
+        except Exception:
+            frames = 121
+        try:
+            seed = int(inner.spn_seed.value())
+        except Exception:
+            seed = 42
+        try:
+            random_seed = bool(inner.chk_random_seed.isChecked())
+        except Exception:
+            random_seed = False
+
+        # Output hint / directory
+        try:
+            out_hint = str(inner.ed_out.text()).strip()
+        except Exception:
+            out_hint = ""
+
+        out_dir = ""
+        save_file = ""
+        if out_hint:
+            p = Path(out_hint)
+            if not p.suffix:
+                p = p.with_suffix(".mp4")
+            if p.is_absolute():
+                out_dir = str(p.parent)
+                save_file = p.name
+            else:
+                # Treat as relative file name inside default Wan22 folder
+                out_dir = default_outdir(True, "wan22")
+                save_file = p.name
+        else:
+            out_dir = default_outdir(True, "wan22")
+            save_file = ""
+
+        # Human-friendly label for the queue row
+        label = (prompt[:80] or ("Wan2.2 " + ("image2video" if job_type == "wan22_image2video" else "text2video")))
+
+        args = {
+            "prompt": prompt,
+            "mode": "image2video" if job_type == "wan22_image2video" else "text2video",
+            "image": image if job_type == "wan22_image2video" else "",
+            "size": size_str or "1280*704",
+            "steps": int(steps),
+            "guidance": float(guidance),
+            "frames": int(frames),
+            "seed": int(seed),
+            "random_seed": bool(random_seed),
+            "save_file": save_file,
+            "label": label,
+        }
+
+        # For image2video, also store the start image as the job's input.
+        # For pure text2video jobs, the queue UI expects some input path,
+        # so we create a small text file containing the prompt.
+        if job_type == "wan22_image2video":
+            input_path = image
+        else:
+            from pathlib import Path as _Path
+            try:
+                base_dir = _Path(out_dir) if out_dir else _Path(".").resolve()
+            except Exception:
+                base_dir = _Path(".").resolve()
+            dummy = base_dir / "wan22_text_prompt.txt"
+            try:
+                if not dummy.exists():
+                    dummy.parent.mkdir(parents=True, exist_ok=True)
+                    snippet = (prompt or label or "Wan2.2 text2video job")[:160]
+                    dummy.write_text(snippet, encoding="utf-8")
+                input_path = str(dummy)
+            except Exception:
+                input_path = ""
+
+        return bool(enqueue_tool_job(job_type, input_path, out_dir, args, priority=550))
+    except Exception as e:
+        try:
+            print("[queue] enqueue_wan22_from_widget failed:", e)
+        except Exception:
+            pass
+        return False
+
+
+def default_ace_outdir() -> str:
+    from pathlib import Path
+    base = Path('.').resolve()
+    d = base / 'output' / 'ace'
+    d.mkdir(parents=True, exist_ok=True)
+    return str(d)
+
+
+def enqueue_ace_from_widget(inner) -> bool:
+    """Read fields from AceUI and enqueue an ACE-Step text-to-music or audio-to-audio job."""
+    try:
+        from helpers.job_helper import make_job_json
+        from helpers.queue_adapter import jobs_dirs
+        from pathlib import Path as _Path
+        d = jobs_dirs()
+
+        def _val(obj, name, default=None):
+            try:
+                w = getattr(obj, name, None)
+                if hasattr(w, 'value'):
+                    return w.value()
+            except Exception:
+                pass
+            return default
+
+        prompt = ''
+        try:
+            if hasattr(inner, 'prompt_edit'):
+                prompt = str(inner.prompt_edit.text()).strip()
+        except Exception:
+            prompt = ''
+        negative = ''
+        try:
+            if hasattr(inner, 'negative_edit'):
+                negative = str(inner.negative_edit.text()).strip()
+        except Exception:
+            negative = ''
+        lyrics = ''
+        try:
+            if hasattr(inner, 'lyrics_edit'):
+                lyrics = str(inner.lyrics_edit.toPlainText()).strip()
+        except Exception:
+            lyrics = ''
+
+        duration = int(_val(inner, 'duration_spin', 60) or 60)
+        steps = int(_val(inner, 'steps_spin', 60) or 60)
+        try:
+            guidance = float(getattr(inner, 'guidance_spin').value())
+        except Exception:
+            guidance = 15.0
+        scheduler = 'euler'
+        try:
+            if hasattr(inner, 'scheduler_combo'):
+                scheduler = str(inner.scheduler_combo.currentText()).strip()
+        except Exception:
+            pass
+        cfg_type = 'apg'
+        try:
+            if hasattr(inner, 'cfg_combo'):
+                cfg_type = str(inner.cfg_combo.currentText()).strip()
+        except Exception:
+            pass
+        seed = int(_val(inner, 'seed_spin', 0) or 0)
+
+        out_rel = ''
+        try:
+            out_rel = str(inner.output_edit.text()).strip()
+        except Exception:
+            out_rel = ''
+        out_dir = out_rel or default_ace_outdir()
+
+        ref_audio_input = ''
+        try:
+            if hasattr(inner, 'ref_audio_edit'):
+                ref_audio_input = str(inner.ref_audio_edit.text()).strip()
+        except Exception:
+            ref_audio_input = ''
+        try:
+            if ref_audio_input:
+                p = _Path(ref_audio_input)
+                if not p.is_absolute():
+                    p = _Path('.').resolve() / p
+                ref_audio_input = str(p)
+        except Exception:
+            pass
+        try:
+            v = int(getattr(inner, 'ref_strength_slider').value())
+            ref_strength = max(0, min(100, v)) / 100.0
+        except Exception:
+            ref_strength = 0.5
+
+        job_type = 'ace_audio2audio' if ref_audio_input else 'ace_text2music'
+        label = (prompt[:80] or ('ACE-Step ' + ('audio2audio' if ref_audio_input else 'text2music')))
+
+        args = {
+            'prompt': prompt,
+            'negative_prompt': negative,
+            'lyrics': lyrics,
+            'audio_duration': float(duration),
+            'infer_step': int(steps),
+            'guidance_scale': float(guidance),
+            'scheduler_type': scheduler or 'euler',
+            'cfg_type': cfg_type or 'apg',
+            'seed': int(seed),
+            'output_rel': out_rel or 'output/ace',
+            'ref_audio_input': ref_audio_input,
+            'ref_audio_strength': float(ref_strength),
+            'audio2audio_enable': bool(ref_audio_input),
+            'label': label,
+        }
+
+        if ref_audio_input:
+            input_path = ref_audio_input
+        else:
+            try:
+                base_dir = _Path(out_dir) if out_dir else _Path(default_ace_outdir())
+            except Exception:
+                base_dir = _Path(default_ace_outdir())
+            dummy = base_dir / 'ace_text_prompt.txt'
+            try:
+                if not dummy.exists():
+                    dummy.parent.mkdir(parents=True, exist_ok=True)
+                    snippet = (prompt or label or 'ACE text2music job')[:160]
+                    dummy.write_text(snippet, encoding='utf-8')
+                input_path = str(dummy)
+            except Exception:
+                input_path = ''
+
+        pending_dir = d['pending']
+        return make_job_json(job_type, input_path, out_dir, args, str(pending_dir))
+    except Exception as e:
+        try:
+            print('[queue] enqueue_ace_from_widget failed:', e)
+        except Exception:
+            pass
         return False

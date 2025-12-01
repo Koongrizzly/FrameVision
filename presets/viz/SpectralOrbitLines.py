@@ -92,7 +92,8 @@ class SpectralOrbitLines(BaseVisualizer):
                 x1,y1=points[i]
                 k=i/float(len(points))
                 hue=(base_hue+80*k)%360
-                alpha=int(alpha_scale*(k**1.5))
+                raw_alpha=alpha_scale*(k**1.5)
+                alpha=max(0, min(255, int(raw_alpha)))
                 col=QColor.fromHsv(int(hue),255,255,alpha)
                 pen=QPen(col, 1+width_scale*k)
                 pen.setCapStyle(Qt.RoundCap)
@@ -100,9 +101,9 @@ class SpectralOrbitLines(BaseVisualizer):
                 p.setPen(pen)
                 p.drawLine(QPointF(x0,y0),QPointF(x1,y1))
 
-        draw_trail(_trails["lo"], base_hue=120, alpha_scale=255*(0.5+_env_lo), width_scale=4)
-        draw_trail(_trails["mid"], base_hue=40,  alpha_scale=255*(0.5+_env_mid), width_scale=3)
-        draw_trail(_trails["hi"], base_hue=300,  alpha_scale=255*(0.5+_env_hi), width_scale=2)
+        draw_trail(_trails["lo"], base_hue=120, alpha_scale=min(255.0, 255*(0.5+_env_lo)), width_scale=4)
+        draw_trail(_trails["mid"], base_hue=40,  alpha_scale=min(255.0, 255*(0.5+_env_mid)), width_scale=3)
+        draw_trail(_trails["hi"], base_hue=300,  alpha_scale=min(255.0, 255*(0.5+_env_hi)), width_scale=2)
 
         center_r=min(w,h)*0.05*(1.0+0.5*(_env_lo+_env_mid+_env_hi)/3.0)
         center_col=QColor.fromHsv(int((60+200*_env_mid)%360),255,255,255)

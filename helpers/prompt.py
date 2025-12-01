@@ -445,11 +445,79 @@ def _choose_device():
         return "cpu", None
 
 def _get_qwen_text_model(model_path: Path):
+    """
+    Load or reuse the Qwen text model, making sure it lives on the desired device.
+
+    This is made resilient against external CUDA VRAM cleaners that may move the
+    model back to CPU after it has been cached. On every call we:
+      * re-run _choose_device() to decide desired (device, dtype)
+      * check any cached model's *actual* device
+      * move the model to the desired device when possible
+      * otherwise fall back safely to CPU
+    """
     key = str(model_path.resolve())
+    # Decide what device/dtype we want *now*
+    desired_device, desired_dtype = _choose_device()
+
+    # Fast path: we already have a cached model
     with _MODEL_LOCK:
-        if key in _MODEL_CACHE:
-            return _MODEL_CACHE[key]
-    device, dtype = _choose_device()
+        cached = _MODEL_CACHE.get(key)
+
+    if cached is not None:
+        processor, model, cached_device, cached_dtype = cached
+        actual_device = None
+        try:
+            try:
+                first_param = next(model.parameters())
+                actual_device = str(first_param.device)
+            except Exception:
+                # Some models may not have parameters() implemented or may be empty;
+                # in that case, fall back to the cached device.
+                actual_device = cached_device
+        except Exception:
+            actual_device = cached_device
+
+        current_device = actual_device or cached_device or desired_device
+
+        # If the cleaner has pushed us off GPU (or device changed), try to move.
+        if current_device != desired_device:
+            try:
+                import torch
+                target_dtype = desired_dtype or cached_dtype or getattr(model, "dtype", None) or torch.float32
+                try:
+                    model = model.to(device=desired_device, dtype=target_dtype)
+                    new_device = desired_device
+                    new_dtype = target_dtype
+                except Exception:
+                    # Could not move to desired device (e.g. CUDA OOM) → fall back to CPU.
+                    model = model.to(device="cpu", dtype=torch.float32)
+                    new_device = "cpu"
+                    new_dtype = torch.float32
+            except Exception:
+                # If anything goes wrong while moving, keep the old device info.
+                new_device = current_device
+                new_dtype = cached_dtype or desired_dtype
+
+            with _MODEL_LOCK:
+                _MODEL_CACHE[key] = (processor, model, new_device, new_dtype)
+            return processor, model, new_device, new_dtype
+
+        # Devices already match; optionally update dtype if needed.
+        if desired_dtype is not None and desired_dtype != cached_dtype:
+            try:
+                model = model.to(device=desired_device, dtype=desired_dtype)
+                new_dtype = desired_dtype
+                with _MODEL_LOCK:
+                    _MODEL_CACHE[key] = (processor, model, desired_device, new_dtype)
+                return processor, model, desired_device, new_dtype
+            except Exception:
+                # If changing dtype fails, just keep using the cached dtype.
+                pass
+
+        return processor, model, current_device, cached_dtype
+
+    # Slow path: we need to load the model fresh.
+    device, dtype = desired_device, desired_dtype
     try:
         from transformers import AutoProcessor
         try:
@@ -460,30 +528,36 @@ def _get_qwen_text_model(model_path: Path):
             except Exception:
                 _VLMModel = None  # type: ignore
         if _VLMModel is None:
-            raise RuntimeError("Transformers model class not available")
-    except Exception as e:
-        raise RuntimeError(f"Transformers unavailable: {e}")
+            raise RuntimeError("Could not import a compatible Qwen VLM model class.")
 
-    processor = AutoProcessor.from_pretrained(
-        str(model_path),
-        trust_remote_code=True,
-        local_files_only=True,
-        use_fast=True
-    )
-    model = _VLMModel.from_pretrained(
-        str(model_path),
-        trust_remote_code=True,
-        local_files_only=True,
-        torch_dtype=dtype
-    ).to(device)
-    try:
-        model.eval()
+        processor = AutoProcessor.from_pretrained(
+            str(model_path),
+            trust_remote_code=True,
+            local_files_only=True,
+            use_fast=True
+        )
+        model = _VLMModel.from_pretrained(
+            str(model_path),
+            trust_remote_code=True,
+            local_files_only=True,
+            torch_dtype=dtype
+        ).to(device)
+        try:
+            model.eval()
+        except Exception:
+            pass
+
+        with _MODEL_LOCK:
+            _MODEL_CACHE[key] = (processor, model, device, dtype)
+        return processor, model, device, dtype
+
     except Exception:
-        pass
+        # Ensure we don't leave a half-initialised entry in the cache on failure.
+        with _MODEL_LOCK:
+            if key in _MODEL_CACHE:
+                _MODEL_CACHE.pop(key, None)
+        raise
 
-    with _MODEL_LOCK:
-        _MODEL_CACHE[key] = (processor, model, device, dtype)
-    return processor, model, device, dtype
 
 def _generate_with_qwen_text(
     model_path: Path,

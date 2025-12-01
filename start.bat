@@ -47,12 +47,6 @@ if not defined WORKER if exist helpers\worker.py set "WORKER=helpers\worker.py"
 if not defined WORKER if exist scripts\framevision_worker.py set "WORKER=scripts\framevision_worker.py"
 if defined WORKER start "" /MIN ".venv\Scripts\python.exe" "%WORKER%" 1>>"logs\worker.log" 2>&1
 
-
-rem --- Prefer local Qwen20B model for TXT->IMG if present ---
-if exist ".\models\Qwen20B" (
-  set "FRAMEVISION_DIFFUSERS_MODEL=.\models\Qwen20B"
-)
-
 echo Starting FrameVision...
 ".venv\Scripts\python.exe" framevision_run.py
 goto :eof

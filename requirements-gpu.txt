@@ -17,7 +17,6 @@ numpy>=1.26,<2.0
 # Optional but helpful for some loaders
 sentencepiece>=0.2.0; platform_system != "Windows"  # (Windows often skips; keep optional)
 protobuf>=4.25.3
-
 pygame==2.6.* ; platform_system == "Windows"
 
 # Background removal runtime (keep CPU ONNX Runtime to avoid cuDNN 9 conflicts with Torch cu121)
@@ -26,3 +25,6 @@ onnxruntime==1.18.0
 # - transformers 4.56.x pairs with tokenizers 0.22–0.23.x
 # - pillow 11.x can be fine, but 10.4.0 is broadly compatible with py3.10/3.11 + many wheels
 # - adjust pins here (not inline in the .bat) to avoid batch escaping issues
+
+faster-whisper
+piexif

@@ -1,13 +1,13 @@
 {
-  "last_add_dir": "E:\\Music\\[muzhousebeat.com] Weekend Picks Melodic 2025_ Week 16_532d453e-9404-4551-a465-97655a30de24",
+  "last_add_dir": "output\\ace",
   "visuals_on": true,
-  "visual_mode_name": "viz:City Skyline EQ (fast fall, flicker windows)",
-  "auto_beats": "32",
-  "auto_mode": "one",
+  "visual_mode_name": "viz:Liquid Ribbons",
+  "auto_beats": "16",
+  "auto_mode": "random",
   "xfade_on": true,
   "xfade_ms": 2000,
   "playlist_paths": [
-    "E:\\Music\\[muzhousebeat.com] Weekend Picks Melodic 2025_ Week 16_532d453e-9404-4551-a465-97655a30de24\\Dunes - Jamek Ortega (Extended Version).mp3"
+    "output\\ace\\track_1651977615_hip_hop_trap.wav"
   ],
-  "playlist_current_idx": -1
+  "playlist_current_idx": 0
 }

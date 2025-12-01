@@ -45,6 +45,9 @@ class _TooltipBlocker(QObject):
     """Internal event filter that swallows tooltip events when disabled."""
 
     def eventFilter(self, obj, event):
+        from PySide6.QtCore import QObject
+        if not isinstance(obj, QObject):
+            return False
         # QEvent.ToolTip fires right before Qt shows a tooltip bubble.
         if event.type() == QEvent.ToolTip and not TooltipManager.tooltips_enabled:
             # Returning True means "we handled it", so Qt will NOT show the tooltip.

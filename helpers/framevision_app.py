@@ -128,7 +128,7 @@ def _open_compare_page():
 
 
 
-# FrameVision V1.0.7 — Full-classic UI + NCNN upscalers + branding
+# FrameVision V2.0 — Full-classic UI + NCNN upscalers + branding
 # Classic layout (big player, control bar, seek slider, fullscreen) + click-to-play/pause
 # Auto Theme (Day/Evening/Night), Session Restore, Instant Tools, Presets, Describe-on-Pause,
 # Queue + Worker, Models Manager, Upscale Video/Photo buttons (queue) wired to NCNN CLIs.
@@ -230,20 +230,34 @@ except Exception as _e:
 #    EditorPane = None
 # <<< FRAMEVISION_EDITOR_END
 
-
 # >>> FRAMEVISION_WAN22_BEGIN
-# WAN22 tab disabled: do not import or add missing module.
+# Safe import of the WAN 2.2 pane; never crash app on failure.
+# We import the module first so that a class name mismatch is easier to debug,
+# and we try a few common pane class names before giving up.
 Wan22Pane = None
+try:
+    import helpers.wan22 as _wan22_mod
+    for _name in ("Wan22Pane", "WAN22Pane", "WanPane", "WanTab", "Wan22Tab"):
+        Wan22Pane = getattr(_wan22_mod, _name, None)
+        if Wan22Pane is not None:
+            break
+    if Wan22Pane is None:
+        print("[framevision] WAN22: module imported but no suitable pane class found. "
+              "Expected one of Wan22Pane/WAN22Pane/WanPane/WanTab/Wan22Tab.")
+except Exception as _e:
+    print("[framevision] WAN22 tab import failed:", _e)
+    Wan22Pane = None
 # <<< FRAMEVISION_WAN22_END
 
-# >>> FRAMEVISION_VIBEVOICE_BEGIN
-# Safe import of the VibeVoice pane; never crash app on failure.
+
+# >>> FRAMEVISION_ace_BEGIN
+# Safe import of the ace pane; never crash app on failure.
 try:
-    from helpers.vibevoice import VibeVoicePane
+    from helpers.ace import acePane
 except Exception as _e:
-    print("[framevision] VibeVoice tab import failed:", _e)
-    VibeVoicePane = None
-# <<< FRAMEVISION_VIBEVOICE_END
+    print("[framevision] ace tab import failed:", _e)
+    acePane = None
+# <<< FRAMEVISION_ace_END
 
 
 try:
@@ -264,6 +278,10 @@ import psutil
 APP_NAME = "FrameVision"
 TAGLINE  = "All-in-one Video & Photo Upscaler/Editor"
 ROOT = Path(".").resolve()
+
+# Check if extra environment is installed for WAN 2.2 and AceMusic virtualenv folders at app root
+WAN22_ENV_DIR_LEGACY = ROOT / ".wan_venv"
+ACE_ENV_DIR = ROOT / "presets" / "extra_env" / ".ace_env"
 
 
 # --- Grabbable Splitter with themed hover/arrow & cursor ----------------------
@@ -2490,7 +2508,35 @@ class QueuePane(QWidget):
         self.qs = QueueSystem(BASE)
 
         # Root layout and scroll container
-        root = QVBoxLayout(self); root.setContentsMargins(6,6,6,6); root.setSpacing(8)
+        root = QVBoxLayout(self)
+        root.setContentsMargins(6, 6, 6, 6)
+        root.setSpacing(8)
+
+        # Fancy banner at the top of the Queue tab
+        self.queue_banner = QLabel('Advanced Queue System')
+        self.queue_banner.setObjectName('queueBanner')
+        self.queue_banner.setAlignment(Qt.AlignCenter)
+        self.queue_banner.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+        self.queue_banner.setFixedHeight(45)
+        self.queue_banner.setStyleSheet(
+            "#queueBanner {"
+            " font-size: 15px;"
+            " font-weight: 600;"
+            " padding: 8px 17px;"
+            " border-radius: 12px;"
+            " margin: 0 0 6px 0;"
+            " color: #1a2500;"
+            " background: qlineargradient("
+            "   x1:0, y1:0, x2:1, y2:0,"
+            "   stop:0 #d4ff66,"
+            "   stop:0.5 #a9ff28,"
+            "   stop:1 #7acb1f"
+            " );"
+            " letter-spacing: 0.5px;"
+            "}"
+        )
+        root.addWidget(self.queue_banner)
+        root.addSpacing(4)
         topw = QWidget(); grid = QGridLayout(topw); grid.setContentsMargins(0,0,0,0); grid.setHorizontalSpacing(8); grid.setVerticalSpacing(6)
 
         # Row 1: Refresh · Clear finished/failed · Worker LED+label (right)
@@ -3335,9 +3381,9 @@ class MainWindow(QMainWindow):
 
     def __init__(self):
         super().__init__()
-        self.setWindowTitle(APP_NAME + " V1.0.9 " + TAGLINE)
+        self.setWindowTitle(APP_NAME + " V2.0 " + TAGLINE)
         self.resize(1280, 800)
-        self.setMinimumSize(900, 580)
+        self.setMinimumSize(700, 500)
         self.current_path = None
 
         # left: video
@@ -3407,16 +3453,112 @@ class MainWindow(QMainWindow):
 
         for name, w in [("Edit", self.edit),("Background", self.background),("Tools", self.tools),("Describe", self.describe),("Queue", self.queue),("Models", self.models),("Presets", self.presets_tab),("Settings", self.settings)]:
             self.tabs.addTab(w, name)
+        # Create WAN 2.2 tab if available and the WAN 2.2 environment is present
+        # Decide which optional tabs should be shown based on installed extras
+        try:
+            # Check both new (".wan22_venv") and legacy (".wan_venv") WAN environments
+            wan22_enabled = WAN22_ENV_DIR.exists()
+            try:
+                from pathlib import Path as _Path
+                _root = _Path(".").resolve()
+                if not wan22_enabled:
+                    wan22_enabled = _root.joinpath(".wan_venv").exists()
+            except Exception:
+                # Best-effort legacy check; ignore errors
+                pass
+            if not wan22_enabled:
+                try:
+                    from pathlib import Path as _Path
+                    _root = _Path(".").resolve()
+                    wan22_enabled = _root.joinpath(".wan22_venv").exists()
+                except Exception:
+                    pass
+        except Exception:
+            try:
+                from pathlib import Path as _Path
+                _root = _Path(".").resolve()
+                wan22_enabled = (
+                    _root.joinpath(".wan22_venv").exists() or
+                    _root.joinpath(".wan_venv").exists()
+                )
+            except Exception:
+                wan22_enabled = False
 
-        # >>> FRAMEVISION_VIBEVOICE_INIT_BEGIN
-        # Create VibeVoice tab if available
-#        try:
- #           if 'VibeVoicePane' in globals() and VibeVoicePane is not None:
-  #              self.vibevoice = VibeVoicePane(self)
-   #             self.tabs.addTab(self.vibevoice, 'VibeVoice')
-    #    except Exception as _e:
-     #       print('[framevision] VibeVoice init failed:', _e)
-        # <<< FRAMEVISION_VIBEVOICE_INIT_END
+        if wan22_enabled:
+            # >>> FRAMEVISION_WAN22_INIT_BEGIN
+            try:
+                if 'Wan22Pane' in globals() and Wan22Pane is not None:
+                    try:
+                        self.wan22 = Wan22Pane(self)
+                    except Exception as _e:
+                        # If the pane itself raises, show a friendly error tab instead of hiding it.
+                        print("[framevision] WAN22 init failed in pane constructor:", _e)
+                        err = QWidget(self)
+                        lay = QVBoxLayout(err)
+                        lab = QLabel(f"WAN 2.2 failed to load:\n{_e}", err)
+                        lab.setWordWrap(True)
+                        lay.addWidget(lab)
+                        self.wan22 = err
+                else:
+                    # Module imported but no usable pane class, or import failed completely.
+                    err = QWidget(self)
+                    lay = QVBoxLayout(err)
+                    txt = (
+                        "WAN 2.2 module not found or no Wan22Pane class defined.\n"
+                        "Make sure helpers/wan22.py defines a QWidget subclass named 'Wan22Pane'."
+                    )
+                    lab = QLabel(txt, err)
+                    lab.setWordWrap(True)
+                    lay.addWidget(lab)
+                    self.wan22 = err
+                # Insert WAN 2.2 tab just after TXT to IMG if present; otherwise append.
+                try:
+                    idx_txt = -1
+                    try:
+                        idx_txt = self.tabs.indexOf(getattr(self, "_txt2img_qwen", None))
+                    except Exception:
+                        idx_txt = -1
+                    if idx_txt is not None and idx_txt >= 0:
+                        self.tabs.insertTab(idx_txt + 1, self.wan22, "WAN 2.2")
+                    else:
+                        self.tabs.addTab(self.wan22, "WAN 2.2")
+                except Exception as _attach_e:
+                    try:
+                        self.tabs.addTab(self.wan22, "WAN 2.2")
+                    except Exception as _e2:
+                        print("[framevision] WAN22 tab attach failed:", _e2)
+            except Exception as _e:
+                print("[framevision] WAN22 init failed:", _e)
+            # <<< FRAMEVISION_WAN22_INIT_END
+        else:
+            # WAN 2.2 extra not installed; skip creating the tab entirely.
+            self.wan22 = None
+
+                # >>> FRAMEVISION_ace_INIT_BEGIN
+        # Create ace tab if available and the AceMusic environment is present
+        try:
+            try:
+                ace_enabled = ACE_ENV_DIR.exists()
+            except Exception:
+                from pathlib import Path as _Path
+                ace_enabled = _Path(".").resolve().joinpath(".ace_env").exists()
+            if ace_enabled and 'acePane' in globals() and acePane is not None:
+                self.ace = acePane(self)
+                try:
+                    idx_tools = self.tabs.indexOf(self.tools)
+                except Exception:
+                    idx_tools = -1
+                if idx_tools is not None and idx_tools >= 0:
+                    self.tabs.insertTab(idx_tools, self.ace, 'AceMusic')
+                else:
+                    self.tabs.addTab(self.ace, 'ace')
+            else:
+                # AceMusic extra not installed or pane not available; don't create a tab.
+                self.ace = None
+        except Exception as _e:
+            print('[framevision] ace init failed:', _e)
+        # <<< FRAMEVISION_ace_INIT_END
+
 
 
 

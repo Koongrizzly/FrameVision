@@ -2,6 +2,12 @@
 import os, shutil, json
 from pathlib import Path
 
+try:
+    from helpers.framevision_app import ROOT
+except Exception:
+    ROOT = Path(__file__).resolve().parents[1]
+
+
 from PySide6.QtCore import QEvent, QObject, QProcess, QSettings, QUrl, Qt, QPoint
 from PySide6.QtGui import QAction, QIcon, QCursor
 from PySide6.QtWidgets import QMenuBar, QMenu, QFileDialog, QMessageBox, QWidget, QPushButton, QApplication, QInputDialog

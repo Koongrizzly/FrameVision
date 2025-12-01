@@ -3,6 +3,59 @@ import json
 import subprocess
 import platform
 from pathlib import Path
+
+def _frames_get_input(owner):
+    """
+    Resolve the active input path for this tool WITHOUT popping host dialogs.
+    Priority:
+      1) owner._frames_loaded_path
+      2) Common path attrs on owner/main: current_path, input_path, video_path
+      3) owner._ensure_input() (last resort)
+    """
+    def _first_existing(paths):
+        from pathlib import Path
+        for cand in paths:
+            if isinstance(cand, (str, Path)) and cand:
+                pc = Path(cand)
+                if pc.exists():
+                    return str(pc)
+        return None
+
+    try:
+        # 1) direct
+        direct = getattr(owner, "_frames_loaded_path", None)
+        if direct:
+            from pathlib import Path as _P
+            return str(_P(direct))
+
+        # 2) common attrs on owner and owner.main
+        main = getattr(owner, "main", None)
+        probes = []
+        for obj in (owner, main):
+            if obj is None: 
+                continue
+            for attr in ("current_path", "input_path", "video_path"):
+                try:
+                    probes.append(getattr(obj, attr, None))
+                except Exception:
+                    pass
+        found = _first_existing(probes)
+        if found:
+            return found
+
+        # 3) last resort: host ensure (may show a dialog)
+        ensure = getattr(owner, "_ensure_input", None)
+        if callable(ensure):
+            try:
+                ensured = ensure()
+            except Exception:
+                ensured = None
+            if ensured:
+                return _first_existing([ensured])
+
+        return None
+    except Exception:
+        return None
 from typing import Optional, Tuple
 
 from PySide6.QtCore import QSettings
@@ -83,11 +136,24 @@ def _ensure_outdir(p: Path) -> None:
         pass
 
 def _set_owner_input(owner, path: Path) -> None:
-    """Best-effort: stash selected path so _ensure_input (if missing) can return it."""
+    """Best-effort: stash selected path so downstream tools and the host can find it."""
     try:
-        # If owner already has _ensure_input, don't override
+        spath = str(path)
+        # Fill common attributes on owner and main
+        for obj in (owner, getattr(owner, "main", None)):
+            if obj is None:
+                continue
+            try:
+                setattr(obj, "current_path", spath)
+                setattr(obj, "input_path", spath)
+                setattr(obj, "video_path", spath)
+            except Exception:
+                pass
+
+        # If owner already has _ensure_input, do NOT override it (respect host behavior)
         if not hasattr(owner, "_ensure_input"):
-            owner._ensure_input = lambda: path  # type: ignore[attr-defined]
+            owner._ensure_input = lambda: spath  # type: ignore[attr-defined]
+
         # Also keep a named attr for other tools
         owner._frames_loaded_path = path  # type: ignore[attr-defined]
     except Exception:
@@ -191,7 +257,7 @@ def _open_frames_folder(owner):
         _set_info(owner, f"Folder: {base}")
 
 def _run_last(owner):
-    inp = getattr(owner, "_ensure_input", lambda: None)()
+    inp = _frames_get_input(owner)
     if not inp:
         QMessageBox.information(owner, "Extract", "No input selected."); return
     ext = _selected_ext(owner)
@@ -203,14 +269,14 @@ def _run_last(owner):
     _set_info(owner, f"Queued last-frame extraction → {out}")
 
 def _run_all(owner):
-    inp = getattr(owner, "_ensure_input", lambda: None)()
+    inp = _frames_get_input(owner)
     if not inp:
         QMessageBox.information(owner, "Extract", "No input selected."); return
     outdir = OUT_FRAMES / f"{Path(inp).stem}"
     outdir.mkdir(parents=True, exist_ok=True)
     setattr(owner, "_frames_last_dir", outdir)
-    out = outdir / "frame_%06d.png"
     ext = _selected_ext(owner)
+    out = outdir / f"frame_%06d.{ext}"
     # Build step-aware filter if needed
     try:
         step_val = int(getattr(owner, "frames_step_spin").value()) if hasattr(owner, "frames_step_spin") else 1
@@ -219,9 +285,95 @@ def _run_all(owner):
     vf = []
     if step_val > 1:
         vf = [f"select='not(mod(n\\,{step_val}))',setpts=N/FRAME_RATE/TB"]
-    cmd = [ffmpeg_path(), '-y', '-i', str(inp)] + (['-vf', ','.join(vf), '-vsync', 'vfr'] if vf else []) + [str(out)]
+    cmd = [ffmpeg_path(), '-y', '-i', str(inp)]
+    if vf:
+        cmd += ['-vf', ','.join(vf), '-vsync', 'vfr']
+    cmd += _codec_args_for_ext(ext)
+    cmd += [str(out)]
     getattr(owner, "_run", lambda *_: None)(cmd, outdir)
     _set_info(owner, f"Queued all-frames extraction (every N={getattr(owner, 'frames_step_spin').value() if hasattr(owner, 'frames_step_spin') else 1}) → {outdir}")
+
+
+def _join_frames(owner):
+    """Pick a folder with image frames and join them into a video using ffmpeg."""
+    # Remember last used folder
+    try:
+        settings = QSettings("FrameVision", "FrameVision")
+    except Exception:
+        settings = None
+    start = ""
+    if settings is not None:
+        try:
+            start = settings.value("frames/join_last_dir", "") or ""
+        except Exception:
+            start = ""
+    if not start:
+        start = str(OUT_FRAMES)
+
+    try:
+        folder = QFileDialog.getExistingDirectory(owner, "Select frames folder", start)
+    except Exception:
+        folder = ""
+    if not folder:
+        return
+
+    if settings is not None:
+        try:
+            settings.setValue("frames/join_last_dir", folder)
+        except Exception:
+            pass
+
+    p = Path(folder)
+    # Detect which image extension is present
+    candidates = ["*.png", "*.jpg", "*.jpeg", "*.webp", "*.bmp", "*.tif", "*.tiff"]
+    pattern = None
+    for glob_pat in candidates:
+        try:
+            if any(p.glob(glob_pat)):
+                pattern = str(p / glob_pat)
+                break
+        except Exception:
+            continue
+
+    if not pattern:
+        try:
+            QMessageBox.warning(owner, "Join frames", "No image frames (png/jpg/webp/bmp/tif) were found in that folder.")
+        except Exception:
+            pass
+        return
+
+    # Determine FPS from UI spinbox if available
+    fps_spin = getattr(owner, "frames_join_fps_spin", None)
+    try:
+        fps = int(fps_spin.value()) if fps_spin is not None else 30
+    except Exception:
+        fps = 30
+    if fps < 1:
+        fps = 1
+
+    out = OUT_FRAMES / f"{p.name}_joined.mp4"
+    _ensure_outdir(out)
+
+    cmd = [
+        ffmpeg_path(), "-y",
+        "-framerate", str(fps),
+        "-pattern_type", "glob",
+        "-i", pattern,
+        "-c:v", "libx264",
+        "-pix_fmt", "yuv420p",
+        str(out)
+    ]
+
+    runner = getattr(owner, "_run", None)
+    if callable(runner):
+        runner(cmd, out)
+    else:
+        try:
+            subprocess.Popen(cmd)
+        except Exception:
+            pass
+
+    _set_info(owner, f"Queued join-frames → video at {fps} fps → {out}")
 
 def _get_current_frame(owner):
     """
@@ -304,8 +456,8 @@ def _on_batch(owner):
                 i += 1
         outdir.mkdir(parents=True, exist_ok=True)
         setattr(owner, "_frames_last_dir", outdir)
-        out = outdir / "frame_%06d.png"
         ext = _selected_ext(owner)
+        out = outdir / f"frame_%06d.{ext}"
         try:
             step_val = int(getattr(owner, "frames_step_spin").value()) if hasattr(owner, "frames_step_spin") else 1
         except Exception:
@@ -313,7 +465,11 @@ def _on_batch(owner):
         vf = []
         if step_val > 1:
             vf = [f"select='not(mod(n\\,{step_val}))',setpts=N/FRAME_RATE/TB"]
-        cmd = [ffmpeg_path(), '-y', '-i', str(fpath)] + (['-vf', ','.join(vf), '-vsync', 'vfr'] if vf else []) + [str(out)]
+        cmd = [ffmpeg_path(), '-y', '-i', str(fpath)]
+        if vf:
+            cmd += ['-vf', ','.join(vf), '-vsync', 'vfr']
+        cmd += _codec_args_for_ext(ext)
+        cmd += [str(out)]
         getattr(owner, "_run", lambda *_: None)(cmd, outdir)
     _set_info(owner, f"Queued all-frames extraction (every N={getattr(owner, 'frames_step_spin').value() if hasattr(owner, 'frames_step_spin') else 1}) → {outdir}")
 
@@ -391,6 +547,33 @@ def install_frames_tool(owner, section_widget):
     step_spin.valueChanged.connect(_on_step_change)
 
 
+
+    # Join frames → video row
+    row_join = QHBoxLayout()
+    btn_join = QPushButton("Join frames to video")
+    join_fps_label = QLabel("FPS:")
+    join_fps_spin = QSpinBox()
+    join_fps_spin.setRange(1, 240)
+    join_fps_spin.setToolTip("Playback framerate for the joined video")
+    row_join.addWidget(btn_join)
+    row_join.addWidget(join_fps_label)
+    row_join.addWidget(join_fps_spin)
+    row_join.addStretch(1)
+    lay_ext.addLayout(row_join)
+
+    # Persist join FPS
+    saved_join_fps = settings.value("frames/join_fps", 30)
+    try:
+        saved_join_fps = int(saved_join_fps)
+    except Exception:
+        saved_join_fps = 25
+    if saved_join_fps < 1:
+        saved_join_fps = 25
+    join_fps_spin.setValue(saved_join_fps)
+    def _on_join_fps_change(v):
+        settings.setValue("frames/join_fps", int(v))
+    join_fps_spin.valueChanged.connect(_on_join_fps_change)
+
     # Info line just under the buttons
     info_row = QHBoxLayout()
     info_label = QLabel("")
@@ -425,6 +608,7 @@ def install_frames_tool(owner, section_widget):
     btn_load.clicked.connect(lambda: _on_load(owner))
     btn_last.clicked.connect(lambda: _run_last(owner))
     btn_all.clicked.connect(lambda: _run_all(owner))
+    btn_join.clicked.connect(lambda: _join_frames(owner))
     btn_se.clicked.connect(lambda: _save_preset(owner))
     btn_le.clicked.connect(lambda: _load_preset(owner))
     btn_open.clicked.connect(lambda: _open_frames_folder(owner))
@@ -437,9 +621,11 @@ def install_frames_tool(owner, section_widget):
         owner.btn_batch_extract = btn_batch
         owner.btn_load_video = btn_load
         owner.btn_open_frames = btn_open
+        owner.btn_join_frames = btn_join
         owner.frames_format_combo = fmt_combo
         owner.frames_info_label = info_label
         owner.frames_step_spin = step_spin
+        owner.frames_join_fps_spin = join_fps_spin
     except Exception:
         pass
 

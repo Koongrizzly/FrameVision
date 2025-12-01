@@ -546,5 +546,6 @@
         "overlay": 50
       }
     }
-  ]
+  ],
+  "out_dir": "C:\\FrameVision-main\\output\\images\\BG inpaint"
 }

@@ -12,7 +12,35 @@ from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton, QSlider,
     QCheckBox, QMessageBox, QFileDialog, QComboBox, QSizePolicy, QScrollArea, QFrame
 )
-from PySide6.QtWidgets import QProgressBar
+from PySide6.QtWidgets import QProgressBar, QMenu, QInputDialog
+
+# ---- Local FFmpeg/FFprobe discovery (prefer presets/bin) ----
+try:
+    from helpers.framevision_app import ROOT as APP_ROOT
+except Exception:
+    APP_ROOT = Path(__file__).resolve().parent.parent
+
+def _which_ff(name: str) -> str:
+    exe = name + (".exe" if os.name == "nt" else "")
+    try_dirs = [
+        APP_ROOT / "presets" / "bin",
+        APP_ROOT / "bin",
+        APP_ROOT,
+    ]
+    for d in try_dirs:
+        try:
+            cand = d / exe
+            if cand.exists():
+                return str(cand)
+        except Exception:
+            continue
+    return name
+
+FFMPEG = _which_ff("ffmpeg")
+FFPROBE = _which_ff("ffprobe")
+
+
+
 
 
 # ---- FlowLayout (wrapping layout for thumbnails) ----
@@ -138,7 +166,7 @@ def _probe_fps(path: Path) -> float:
     fps = 30.0
     try:
         proc = QProcess()
-        proc.start("ffprobe", ["-v","error","-select_streams","v:0","-show_entries","stream=r_frame_rate","-of","default=nokey=1:noprint_wrappers=1", str(path)])
+        proc.start(FFPROBE, ["-v","error","-select_streams","v:0","-show_entries","stream=r_frame_rate","-of","default=nokey=1:noprint_wrappers=1", str(path)])
         proc.waitForFinished(1500)
         txt = proc.readAllStandardOutput().data().decode("utf-8","ignore").strip()
         if "/" in txt:
@@ -151,18 +179,94 @@ def _count_frames_fast(path: Path) -> int:
     """Try to count frames quickly via ffprobe. Fallback 0 on failure."""
     try:
         proc = QProcess()
-        proc.start("ffprobe", ["-v","error","-count_frames","-select_streams","v:0","-show_entries","stream=nb_read_frames","-of","default=nokey=1:noprint_wrappers=1", str(path)])
+        proc.start(FFPROBE, ["-v","error","-count_frames","-select_streams","v:0","-show_entries","stream=nb_read_frames","-of","default=nokey=1:noprint_wrappers=1", str(path)])
         proc.waitForFinished(3000)
         txt = proc.readAllStandardOutput().data().decode("utf-8","ignore").strip()
         return int(txt) if txt.isdigit() else 0
     except Exception:
         return 0
 
+
+
+def _probe_video_meta(path: Path) -> dict:
+    """Return basic video metadata via ffprobe: width, height, duration, bitrate, codec."""
+    info = {
+        "width": None,
+        "height": None,
+        "duration": None,
+        "bitrate": None,
+        "codec": None,
+    }
+    try:
+        proc = QProcess()
+        proc.start(
+            FFPROBE,
+            [
+                "-v", "error",
+                "-select_streams", "v:0",
+                "-show_entries", "stream=width,height,codec_name,bit_rate",
+                "-show_entries", "format=duration,bit_rate",
+                "-of", "json",
+                str(path),
+            ],
+        )
+        proc.waitForFinished(2500)
+        raw = proc.readAllStandardOutput().data().decode("utf-8", "ignore")
+        if not raw.strip():
+            return info
+        data = json.loads(raw)
+        stream = None
+        try:
+            streams = data.get("streams") or []
+            if streams:
+                stream = streams[0]
+        except Exception:
+            stream = None
+        fmt = data.get("format") or {}
+
+        if stream is not None:
+            try:
+                info["width"] = int(stream.get("width") or 0) or None
+            except Exception:
+                pass
+            try:
+                info["height"] = int(stream.get("height") or 0) or None
+            except Exception:
+                pass
+            try:
+                codec = stream.get("codec_name")
+                if codec:
+                    info["codec"] = str(codec)
+            except Exception:
+                pass
+            try:
+                br = stream.get("bit_rate")
+                if br is not None:
+                    info["bitrate"] = float(br)
+            except Exception:
+                pass
+
+        try:
+            dur = fmt.get("duration")
+            if dur is not None:
+                info["duration"] = float(dur)
+        except Exception:
+            pass
+        try:
+            brf = fmt.get("bit_rate")
+            if brf is not None:
+                info["bitrate"] = float(brf)
+        except Exception:
+            pass
+    except Exception:
+        return info
+    return info
+
 def _extract_first_frame(src: Path, dst: Path) -> bool:
     try:
         dst.parent.mkdir(parents=True, exist_ok=True)
         p = QProcess()
-        p.start("ffmpeg", ["-hide_banner","-y","-ss","0","-i", str(src), "-frames:v","1", "-q:v","3", str(dst)])
+        p.start(FFMPEG, ["-hide_banner","-y","-ss","0","-i", str(src), "-frames:v","1", "-q:v","3", str(dst)])
         p.waitForFinished(4000)
         return dst.exists()
     except Exception:
@@ -248,13 +352,13 @@ class InterpPane(QWidget):
             ("rife-v4",   "RIFE v4 — older general use"),
             ("rife-v4.6", "RIFE v4.6 — fast, general use"),
             ("rife-HD",   "RIFE HD — 1080p–1440p detail"),
-            ("rife-UHD",  "RIFE UHD — 4K detail"),
+            ("rife-UHD",  "RIFE UHD — 4K masters"),
             ("rife-anime","RIFE Anime — line-art/Animation"),
         ]
         self._model_blurbs = {
             "rife-v4.6": ("Balanced quality/speed.", "Best for 720p–1080p; default choice."),
-            "rife-HD":   ("More temporal stability for texture.", "Good for 1080p→1440p."),
-            "rife-UHD":  ("Maximum stability for 4K/fine patterns.", "Use in combination with profile 4 for best result."),
+            "rife-HD":   ("More temporal stability for texture.", "Good for 1080p→1440p; slower, more VRAM."),
+            "rife-UHD":  ("Maximum stability for 4K/fine patterns.", "Slowest; highest VRAM usage."),
             "rife-anime":("Edge-stable for cel/line-art.", "Can oversoften live-action."),
         }
 
@@ -270,6 +374,33 @@ class InterpPane(QWidget):
         outer.addWidget(scroll, 1)
         content = QWidget(); scroll.setWidget(content)
         root = QVBoxLayout(content); root.setContentsMargins(0,0,0,0); root.setSpacing(4)
+
+        # Fancy banner at the top
+        self.banner = QLabel("Interpolation with RIFE")
+        self.banner.setObjectName("rifeBanner")
+        self.banner.setAlignment(Qt.AlignCenter)
+        self.banner.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+        self.banner.setFixedHeight(48)
+        self.banner.setStyleSheet(
+            "#rifeBanner {"
+            " font-size: 17px;"
+            " font-weight: 600;"
+            " padding: 6px 14px;"
+            " border-radius: 10px;"
+            " margin: 0 0 6px 0;"
+            " color: white;"
+            " background: qlineargradient("
+            "   x1:0, y1:0, x2:1, y2:0,"
+            "   stop:0 #2e7d32,"
+            "   stop:0.5 #43a047,"
+            "   stop:1 #66bb6a"
+            " );"
+            " letter-spacing: 0.5px;"
+            "}"
+        )
+        root.addWidget(self.banner)
+        root.addSpacing(4)
+
 
         # ---- Options ----
         # Options shown inline (no collapsible)
@@ -381,6 +512,36 @@ class InterpPane(QWidget):
         root.addWidget(self.recent)
         rlay = self.recent.body_layout()
 
+        # Recent sort row
+        sort_row = QHBoxLayout()
+        try:
+            lbl_recent_sort = QLabel("Sort:", self)
+        except Exception:
+            lbl_recent_sort = None
+        try:
+            self.combo_recent_sort = QComboBox(self)
+            self.combo_recent_sort.addItem("Newest first", "newest")
+            self.combo_recent_sort.addItem("Oldest first", "oldest")
+            self.combo_recent_sort.addItem("Alphabetical (A-Z)", "az")
+            self.combo_recent_sort.addItem("Alphabetical (Z-A)", "za")
+            self.combo_recent_sort.addItem("Size (smallest first)", "size_small")
+            self.combo_recent_sort.addItem("Size (largest first)", "size_large")
+        except Exception:
+            self.combo_recent_sort = None
+
+        try:
+            if lbl_recent_sort is not None:
+                sort_row.addWidget(lbl_recent_sort)
+        except Exception:
+            pass
+        try:
+            if self.combo_recent_sort is not None:
+                sort_row.addWidget(self.combo_recent_sort)
+        except Exception:
+            pass
+        sort_row.addStretch(1)
+        rlay.addLayout(sort_row)
+
         self.recent_area = QScrollArea()
         self.recent_area.setWidgetResizable(True)
         self.recent_area.setFrameShape(QFrame.NoFrame)
@@ -400,7 +561,24 @@ class InterpPane(QWidget):
         btns = QVBoxLayout(); btns.setSpacing(6)
         r2 = QHBoxLayout(); r2.setSpacing(8)
         self.btn_start = QPushButton("Add to Queue") 
-        self.btn_batch = QPushButton("Add Batch"); self.btn_open_folder = QPushButton("Open RIFE folder")
+        self.btn_batch = QPushButton("Add Batch")
+        self.btn_open_folder = QPushButton("Open RIFE folder")
+
+        # Larger font on footer buttons (+3px) and green hover on "Add to Queue"
+        base_btn_style = "font-size: 15px; padding: 6px 14px;"
+        self.btn_start.setStyleSheet(
+            "QPushButton {"
+            + base_btn_style +
+            " font-weight: 500;"
+            "}"
+            "QPushButton:hover {"
+            " background-color: #43a047;"
+            " color: white;"
+            "}"
+        )
+        self.btn_batch.setStyleSheet("QPushButton {" + base_btn_style + "}")
+        self.btn_open_folder.setStyleSheet("QPushButton {" + base_btn_style + "}")
+
         r2.addWidget(self.btn_start); r2.addWidget(self.btn_batch); r2.addWidget(self.btn_open_folder); r2.addStretch(1)
         btns.addLayout(r2)
         footer = QWidget(); footer.setObjectName("stickyFooter"); footer.setLayout(btns)
@@ -433,6 +611,12 @@ class InterpPane(QWidget):
         self.cb_speed_default.toggled.connect(self._on_speed_default)
         self.combo_model.currentIndexChanged.connect(self._on_model_changed)
         self.btn_model_install.clicked.connect(self._on_model_install)
+        # Recent sort wiring
+        try:
+            if getattr(self, "combo_recent_sort", None) is not None:
+                self.combo_recent_sort.currentIndexChanged.connect(lambda _i: self._refresh_recent())
+        except Exception:
+            pass
 
         # Set initial result state
         self._set_result_state('idle')
@@ -581,6 +765,33 @@ class InterpPane(QWidget):
         self.cb_speed_default.setChecked(bool(int(s.value("rife/speed_default", 0))))
         model_key = s.value("rife/model_key", "rife-UHD")
         self._set_model_ui(model_key)
+
+        # Restore recent sort mode (optional)
+        try:
+            sort_mode = s.value("rife/recent_sort", "newest") if s is not None else "newest"
+            cb = getattr(self, "combo_recent_sort", None)
+            if cb is not None and sort_mode is not None:
+                idx = -1
+                try:
+                    for i in range(cb.count()):
+                        v = cb.itemData(i)
+                        if v == sort_mode:
+                            idx = i
+                            break
+                except Exception:
+                    idx = -1
+                if idx < 0:
+                    try:
+                        idx = cb.findText(str(sort_mode))
+                    except Exception:
+                        idx = -1
+                if idx >= 0:
+                    try:
+                        cb.setCurrentIndex(idx)
+                    except Exception:
+                        pass
+        except Exception:
+            pass
         # Migration block removed: no longer force overwrite of saved speed/model        # One-time corrective migration v3: force Superfast + UHD if previous bug left bad values
         migrated_v3 = int(self.settings.value("rife/migrated_superfast_default_v3", 0))
         try:
@@ -610,6 +821,17 @@ class InterpPane(QWidget):
         s.setValue('rife/model_key', self.combo_model.currentData())
         try:
             s.sync()
+        except Exception:
+            pass
+
+        try:
+            if hasattr(self, "combo_recent_sort") and self.combo_recent_sort is not None:
+                try:
+                    mode = self.combo_recent_sort.currentData() or self.combo_recent_sort.currentText()
+                except Exception:
+                    mode = None
+                if mode is not None:
+                    s.setValue('rife/recent_sort', mode)
         except Exception:
             pass
         # JSON store as truth
@@ -678,12 +900,12 @@ class InterpPane(QWidget):
         if mult >= 1.0:
             target = in_fps * mult
             vf = vf_tmpl.format(fps=f"{target:.3f}")
-            base = ["ffmpeg","-hide_banner","-y"] + (["-progress", str(progress_file)] if progress_file else []) + ["-i", str(src)]
+            base = [FFMPEG,"-hide_banner","-y"] + (["-progress", str(progress_file)] if progress_file else []) + ["-i", str(src)]
             return base + ["-vf", vf, "-c:a","copy","-c:v","libx264", *preset, "-crf","18", str(out_path)]
         else:
             vf = vf_tmpl.format(fps=f"{in_fps:.3f}") + f",setpts=PTS/({max(0.01,mult):.4f})"
             atempo = _atempo_chain(mult)
-            base = ["ffmpeg","-hide_banner","-y"] + (["-progress", str(progress_file)] if progress_file else []) + ["-i", str(src)]
+            base = [FFMPEG,"-hide_banner","-y"] + (["-progress", str(progress_file)] if progress_file else []) + ["-i", str(src)]
             return base + ["-vf", vf, "-af", atempo, "-c:v","libx264", *preset, "-crf","18", str(out_path)]
 
     
@@ -772,12 +994,12 @@ class InterpPane(QWidget):
 
         # extract audio
         audio = tmp / "audio.m4a"
-        p1 = QProcess(self); p1.start("ffmpeg", ["-hide_banner","-y","-i", str(src), "-vn","-acodec","copy", str(audio)]); p1.waitForFinished(-1)
+        p1 = QProcess(self); p1.start(FFMPEG, ["-hide_banner","-y","-i", str(src), "-vn","-acodec","copy", str(audio)]); p1.waitForFinished(-1)
         if getattr(self, '_cancel_flag', False): self._progress_end(); self._set_result_state('idle', 'Result: —'); shutil.rmtree(tmp, ignore_errors=True); return
         self._progress_set(3)
 
         # decode frames
-        p2 = QProcess(self); p2.start("ffmpeg", ["-hide_banner","-y","-i", str(src), str(frames_in / "frame_%08d.png")]); p2.waitForFinished(-1)
+        p2 = QProcess(self); p2.start(FFMPEG, ["-hide_banner","-y","-i", str(src), str(frames_in / "frame_%08d.png")]); p2.waitForFinished(-1)
         if getattr(self, '_cancel_flag', False): self._progress_end(); self._set_result_state('idle', 'Result: —'); shutil.rmtree(tmp, ignore_errors=True); return
         in_count = len(list(frames_in.glob('*.png')))
         self._progress_total_frames = in_count if mult < 1.0 else in_count * (2 if mult >= 1.0 else 1)
@@ -841,11 +1063,11 @@ class InterpPane(QWidget):
         if mult >= 1.0:
             out_fps = int(round(in_fps * mult))
             enc = ["-framerate", str(out_fps), "-i", str(frames_out / "%08d.png")]
-            cmd = ["ffmpeg","-hide_banner","-y", *enc, "-i", str(audio), "-c:a","copy","-crf","18","-c:v","libx264","-pix_fmt","yuv420p", str(out_path)]
+            cmd = [FFMPEG,"-hide_banner","-y", *enc, "-i", str(audio), "-c:a","copy","-crf","18","-c:v","libx264","-pix_fmt","yuv420p", str(out_path)]
         else:
             enc = ["-framerate", str(int(round(in_fps))), "-i", str(frames_out / "%08d.png")]
             atempo = _atempo_chain(mult)
-            cmd = ["ffmpeg","-hide_banner","-y", *enc, "-i", str(audio), "-af", atempo, "-c:v","libx264","-crf","18","-pix_fmt","yuv420p", str(out_path)]
+            cmd = [FFMPEG,"-hide_banner","-y", *enc, "-i", str(audio), "-af", atempo, "-c:v","libx264","-crf","18","-pix_fmt","yuv420p", str(out_path)]
         p4 = QProcess(self); p4.start(cmd[0], cmd[1:]); p4.waitForFinished(-1)
         if getattr(self, '_cancel_flag', False): self._progress_end(); self._set_result_state('idle', 'Result: —'); shutil.rmtree(tmp, ignore_errors=True); return
         self._progress_set(100, self._progress_total_frames)
@@ -1124,19 +1346,83 @@ class InterpPane(QWidget):
 
     # ---- recent gallery ----
     def _refresh_recent(self):
-        # Clear
-        while self.recent_flow.count():
-            item = self.recent_flow.takeAt(0)
-            w = item.widget()
-            if w: w.deleteLater()
+        # Clear existing items from flow layout
+        try:
+            flow = self.recent_flow
+        except Exception:
+            return
+        try:
+            while flow.count():
+                item = flow.takeAt(0)
+                w = item.widget()
+                if w is not None:
+                    w.deleteLater()
+        except Exception:
+            pass
 
         out_dir = _outputs_dir(self.ROOT)
-        vids = sorted(out_dir.glob("*_interp_*.mp4"), key=lambda p: p.stat().st_mtime, reverse=True)[:20]
+        try:
+            vids = [p for p in out_dir.glob("*_interp_*.mp4") if p.is_file()]
+        except Exception:
+            vids = []
+
+        # Determine sort mode from combo_recent_sort
+        try:
+            mode = None
+            cb = getattr(self, "combo_recent_sort", None)
+            if cb is not None:
+                mode = cb.currentData()
+                if not mode:
+                    mode = cb.currentText()
+            if not mode:
+                mode = "newest"
+        except Exception:
+            mode = "newest"
+
+        # Apply sorting by date/name/size
+        try:
+            from pathlib import Path as _P
+            def _mtime_for(p):
+                try:
+                    return _P(str(p)).stat().st_mtime
+                except Exception:
+                    return 0
+            def _name_for(p):
+                try:
+                    return _P(str(p)).name.lower()
+                except Exception:
+                    return str(p)
+            def _size_for(p):
+                try:
+                    return _P(str(p)).stat().st_size
+                except Exception:
+                    return 0
+
+            if mode in ("newest", "oldest"):
+                vids.sort(key=_mtime_for, reverse=(mode == "newest"))
+            elif mode in ("az", "za"):
+                vids.sort(key=_name_for, reverse=(mode == "za"))
+            elif mode in ("size_small", "size_large"):
+                vids.sort(key=_size_for, reverse=(mode == "size_large"))
+        except Exception:
+            # Fallback: newest first by mtime
+            try:
+                vids.sort(key=lambda p: p.stat().st_mtime, reverse=True)
+            except Exception:
+                pass
+
+        # Limit to 20 items
+        vids = vids[:20]
+
         thumbs_dir = self.ROOT / "output" / "last results" / "interp"
         for v in vids:
             thumb = thumbs_dir / (v.stem + ".jpg")
-            if not thumb.exists():
-                _extract_first_frame(v, thumb)
+            try:
+                if not thumb.exists():
+                    _extract_first_frame(v, thumb)
+            except Exception:
+                pass
+
             lbl = QLabel()
             if thumb.exists():
                 pm_final = self._get_thumb_pixmap(thumb, QSize(160, 90))
@@ -1149,8 +1435,390 @@ class InterpPane(QWidget):
             lbl.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Fixed)
             lbl.setToolTip(v.name)
             lbl.setCursor(Qt.PointingHandCursor)
-            lbl.mousePressEvent = (lambda p=v: (lambda evt: (self._open_in_player(p) or QDesktopServices.openUrl(QUrl.fromLocalFile(str(p))))))()
+
+            # Mouse handler: left-click open, right-click menu (Delete from disk)
+            def _make_mouse_handler(path, thumb_path, widget):
+                from functools import partial
+                def handler(evt):
+                    try:
+                        btn = evt.button()
+                    except Exception:
+                        btn = Qt.LeftButton
+                    if btn == Qt.RightButton:
+                        try:
+                            global_pos = widget.mapToGlobal(evt.pos())
+                        except Exception:
+                            global_pos = None
+                        self._show_recent_context_menu(path, thumb_path, widget, global_pos)
+                        return
+                    if btn == Qt.LeftButton:
+                        try:
+                            if not self._open_in_player(path):
+                                QDesktopServices.openUrl(QUrl.fromLocalFile(str(path)))
+                        except Exception:
+                            try:
+                                QDesktopServices.openUrl(QUrl.fromLocalFile(str(path)))
+                            except Exception:
+                                pass
+                return handler
+
+            lbl.mousePressEvent = _make_mouse_handler(v, thumb, lbl)
             self.recent_flow.addWidget(lbl)
+
+    
+def _show_recent_context_menu(self, video_path: Path, thumb_path: Path, widget, global_pos):
+        """Show right-click menu for a recent interpolated video."""
+        try:
+            menu = QMenu(widget)
+        except Exception:
+            return
+
+        # Build context menu: Info / Rename / Open folder / Delete
+        try:
+            act_info = menu.addAction("Info")
+        except Exception:
+            act_info = None
+        try:
+            act_rename = menu.addAction("Rename")
+        except Exception:
+            act_rename = None
+        try:
+            act_open = menu.addAction("Open folder")
+        except Exception:
+            act_open = None
+        try:
+            menu.addSeparator()
+        except Exception:
+            pass
+        try:
+            act_del = menu.addAction("Delete")
+        except Exception:
+            act_del = None
+
+        try:
+            chosen = menu.exec(global_pos) if global_pos is not None else menu.exec()
+        except Exception:
+            chosen = None
+        if not chosen:
+            return
+
+        if act_info is not None and chosen is act_info:
+            self._show_recent_info(video_path)
+            return
+        if act_rename is not None and chosen is act_rename:
+            self._rename_recent_video(video_path, thumb_path)
+            return
+        if act_open is not None and chosen is act_open:
+            self._open_recent_folder(video_path)
+            return
+        if act_del is not None and chosen is act_del:
+            self._delete_recent_from_disk(video_path, thumb_path)
+            return
+
+
+def _delete_recent_from_disk(self, video_path: Path, thumb_path: Path):
+    """Delete an interpolated video + its thumbnail from disk, with confirmation."""
+    try:
+        vp = Path(str(video_path))
+    except Exception:
+        vp = None
+    try:
+        tp = Path(str(thumb_path))
+    except Exception:
+        tp = None
+
+    try:
+        fname = vp.name if vp is not None else str(video_path)
+    except Exception:
+        fname = str(video_path)
+
+    # If the video is currently in use by the internal player, do not touch it.
+    try:
+        if vp is not None and self._is_video_in_use(vp):
+            QMessageBox.information(
+                self,
+                "Video in use",
+                "This video is currently in use.\nPlease load another video in the player first before deleting.",
+            )
+            return
+    except Exception:
+        pass
+
+    # Confirm deletion
+        try:
+            res = QMessageBox.question(
+                self,
+                "Delete interpolated video?",
+                f"Delete this interpolated video from disk?\n\n{fname}",
+                QMessageBox.Yes | QMessageBox.No,
+                QMessageBox.No,
+            )
+        except Exception:
+            res = QMessageBox.Yes
+        if res != QMessageBox.Yes:
+            return
+
+        # Try to stop playback if the internal player is currently using this file
+        try:
+            player = getattr(self.main, "video", None) if getattr(self, "main", None) is not None else None
+        except Exception:
+            player = None
+        if player is not None:
+            try:
+                cur = _guess_current_video(self.main)
+            except Exception:
+                cur = None
+            try:
+                if cur is not None and Path(str(cur)) == vp:
+                    if hasattr(player, "stop"):
+                        player.stop()
+                    elif hasattr(player, "pause"):
+                        player.pause()
+            except Exception:
+                pass
+
+        # Delete video file
+        try:
+            if vp is not None and vp.exists():
+                vp.unlink()
+        except Exception:
+            try:
+                QMessageBox.warning(
+                    self,
+                    "Delete failed",
+                    f"Could not delete file:\n{fname}",
+                )
+            except Exception:
+                pass
+
+        # Delete thumbnail
+        try:
+            if tp is not None and tp.exists():
+                tp.unlink()
+        except Exception:
+            pass
+
+        # Refresh recent gallery
+        try:
+            self._refresh_recent()
+        except Exception:
+            pass
+
+
+
+def _is_video_in_use(self, vp: Path) -> bool:
+    """Return True if the given video path is currently loaded in the player."""
+    try:
+        cur = _guess_current_video(self.main)
+    except Exception:
+        cur = None
+    try:
+        return cur is not None and Path(str(cur)) == Path(str(vp))
+    except Exception:
+        return False
+
+def _open_recent_folder(self, video_path: Path):
+    """Open the folder that contains the given video."""
+    try:
+        vp = Path(str(video_path))
+        QDesktopServices.openUrl(QUrl.fromLocalFile(str(vp.parent)))
+    except Exception:
+        pass
+
+def _show_recent_info(self, video_path: Path):
+    """Show a small info popup about the selected video (size, fps, resolution, quality)."""
+    try:
+        vp = Path(str(video_path))
+    except Exception:
+        vp = None
+    if vp is None or not vp.exists():
+        try:
+            QMessageBox.warning(self, "Info", "File not found on disk.")
+        except Exception:
+            pass
+        return
+
+    # Basic size
+    try:
+        size_bytes = vp.stat().st_size
+        if size_bytes >= 1024 * 1024 * 1024:
+            size_str = f"{size_bytes / (1024*1024*1024):.2f} GiB"
+        elif size_bytes >= 1024 * 1024:
+            size_str = f"{size_bytes / (1024*1024):.2f} MiB"
+        elif size_bytes >= 1024:
+            size_str = f"{size_bytes / 1024:.2f} KiB"
+        else:
+            size_str = f"{size_bytes} bytes"
+    except Exception:
+        size_bytes = None
+        size_str = "Unknown"
+
+    # FPS via existing probe helper
+    try:
+        fps = _probe_fps(vp)
+        fps_str = f"{fps:.2f}"
+    except Exception:
+        fps_str = "Unknown"
+
+    meta = _probe_video_meta(vp)
+    w = meta.get("width") or 0
+    h = meta.get("height") or 0
+    if w and h:
+        res_str = f"{w} × {h}"
+    else:
+        res_str = "Unknown"
+
+    dur = meta.get("duration")
+    if isinstance(dur, (int, float)) and dur > 0:
+        mins = int(dur) // 60
+        secs = int(dur) % 60
+        dur_str = f"{mins:d}:{secs:02d} min"
+    else:
+        dur_str = "Unknown"
+
+    br = meta.get("bitrate")
+    if isinstance(br, (int, float)) and br > 0:
+        mbps = br / 1_000_000.0
+        bitrate_str = f"{mbps:.2f} Mbps"
+    else:
+        bitrate_str = "Unknown"
+
+    codec = meta.get("codec") or "Unknown"
+
+    lines = [
+        f"File: {vp.name}",
+        f"Location: {vp.parent}",
+        "",
+        f"Size: {size_str}",
+        f"Resolution: {res_str}",
+        f"FPS: {fps_str}",
+        f"Duration: {dur_str}",
+        f"Codec: {codec}",
+        f"Average bitrate: {bitrate_str}",
+    ]
+    msg = "\n".join(lines)
+    try:
+        QMessageBox.information(self, "Video info", msg)
+    except Exception:
+        pass
+
+def _rename_recent_video(self, video_path: Path, thumb_path: Path):
+    """Rename the selected video (and its thumbnail)."""
+    try:
+        vp = Path(str(video_path))
+    except Exception:
+        vp = None
+    try:
+        tp = Path(str(thumb_path))
+    except Exception:
+        tp = None
+
+    if vp is None or not vp.exists():
+        try:
+            QMessageBox.warning(self, "Rename", "File not found on disk.")
+        except Exception:
+            pass
+        return
+
+    # Do not rename if in use
+    try:
+        if self._is_video_in_use(vp):
+            QMessageBox.information(
+                self,
+                "Video in use",
+                "This video is currently in use.\nPlease load another video in the player first before renaming.",
+            )
+            return
+    except Exception:
+        pass
+
+    # Ask for new name (stem only)
+    from os import path as _os_path
+    try:
+        current_stem = vp.stem
+    except Exception:
+        current_stem = _os_path.splitext(_os_path.basename(str(vp)))[0]
+
+    try:
+        new_name, ok = QInputDialog.getText(
+            self,
+            "Rename video",
+            f"New name for:\n{vp.name}",
+            text=current_stem,
+        )
+    except Exception:
+        ok = False
+        new_name = None
+
+    if not ok or not new_name:
+        return
+
+    new_name = str(new_name).strip()
+    # Basic sanitisation – avoid path separators
+    for ch in ("/", "\\"):
+        new_name = new_name.replace(ch, "_")
+    if not new_name:
+        try:
+            QMessageBox.warning(self, "Rename", "New name cannot be empty.")
+        except Exception:
+            pass
+        return
+
+    target = vp.with_name(new_name + vp.suffix)
+
+    # If target exists, ask before overwriting
+    if target.exists():
+        try:
+            res = QMessageBox.question(
+                self,
+                "Overwrite?",
+                f"A file named '{target.name}' already exists.\nOverwrite it?",
+                QMessageBox.Yes | QMessageBox.No,
+                QMessageBox.No,
+            )
+        except Exception:
+            res = QMessageBox.No
+        if res != QMessageBox.Yes:
+            return
+
+    # Try to rename video
+    try:
+        vp.rename(target)
+    except Exception as e:
+        try:
+            QMessageBox.warning(self, "Rename failed", f"Could not rename file:\n{e}")
+        except Exception:
+            pass
+        return
+
+    # Rename thumbnail if present
+    try:
+        if tp is not None and tp.exists():
+            new_thumb = tp.with_name(target.stem + tp.suffix)
+            try:
+                tp.rename(new_thumb)
+            except Exception:
+                pass
+    except Exception:
+        pass
+
+    # Update last_output setting if it pointed to the old file
+    try:
+        s = getattr(self, "settings", None)
+        if s is not None:
+            last = s.value("rife/last_output", "", type=str)
+            if str(last) == str(vp):
+                s.setValue("rife/last_output", str(target))
+    except Exception:
+        pass
+
+    # Refresh gallery
+    try:
+        self._refresh_recent()
+    except Exception:
+        pass
+
+
         # ---- Interp persistence hooks (appended) ----
 try:
     from PySide6.QtCore import QTimer, QSettings

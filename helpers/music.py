@@ -2783,7 +2783,7 @@ class MusicRuntime(QObject):
             self.overlay.chk_xfade.toggled.connect(lambda _c: self._persist_state())
             self.overlay.cmb_fade.currentIndexChanged.connect(lambda _i: self._persist_state())
             # rebuild bag when user manually picks a visual
-            self.overlay.cmb_visual.currentIndexChanged.connect(lambda _i: self._viz_rebuild_bag())
+            self.overlay.cmb_visual.activated.connect(lambda _i: self._viz_rebuild_bag())
         except Exception:
             pass
         # initialize bag once overlay is wired

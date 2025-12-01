@@ -1438,6 +1438,31 @@ class VibeVoicePane(QWidget):
     def _script_path(self):
         from pathlib import Path
         return str(Path(__file__).resolve())
+    def _python_executable(self) -> str:
+        """Prefer Python from a nearby .wan_venv, fall back to current sys.executable."""
+        import sys
+        from pathlib import Path
+
+        base = Path(__file__).resolve().parent
+        cur = base
+
+        # Walk up a few parents looking for .wan_venv
+        for _ in range(5):
+            venv = cur / ".wan_venv"
+            if venv.is_dir():
+                if _os.name == "nt":
+                    cand = venv / "Scripts" / "python.exe"
+                else:
+                    cand = venv / "bin" / "python"
+                if cand.exists():
+                    return str(cand)
+            if cur.parent == cur:
+                break
+            cur = cur.parent
+
+        # Fallback: whatever is running this UI
+        return sys.executable
+
 
     def _launch(self, dry: bool):
         mode = self.cmb_mode.currentText()
@@ -1462,16 +1487,19 @@ class VibeVoicePane(QWidget):
             args += ["--out", outp]
         if dry:
             args += ["--dry-run"]
-        import sys
+        py = self._python_executable()
         self.log.clear()
-        self._append_log("Launching: python " + " ".join(args))
-        self.proc.start(sys.executable, args)
+        self._append_log(f"Using interpreter: {py}")
+        self._append_log("Launching: " + py + " " + " ".join(args))
+        self.proc.start(py, args)
 
     def _do_probe(self):
-        import sys
         self.log.clear()
         args = [self._script_path(), "--probe"]
-        self.proc.start(sys.executable, args)
+        py = self._python_executable()
+        self._append_log(f"Using interpreter: {py}")
+        self._append_log("Launching: " + py + " " + " ".join(args))
+        self.proc.start(py, args)
 
     def _on_finished(self, code, status):
         self._append_log(f"[process finished] code={code}")

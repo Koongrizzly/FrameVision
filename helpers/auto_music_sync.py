@@ -1,0 +1,6503 @@
+
+"""
+Music Clip Creator / Auto Music Sync for FrameVision
+
+Features
+--------
+- Audio-driven beat + energy analysis (lightweight RMS-based)
+- Works with a single long video OR a folder of short clips
+- FX Level: Minimal / Moderate / High
+- Microclips:
+    - Off
+    - Only in chorus / drops
+    - Verses only
+    - Whole track
+- Transitions:
+    - Soft fades
+    - Hard cuts
+    - Mixed (fades + flash cuts)
+- Clip order modes for folders:
+    - Random (avoids immediate repeats)
+    - Sequential
+    - Shuffle (no repeats until all clips used)
+- Optional fixed random seed for repeatable edits
+- Resolution strategies for mixed clip sets
+- Timestamped output name to avoid overwrites:
+  <audio-base-name>_clip_YYYYMMDD_HHMM.mp4
+
+Integration from tools_tab.py:
+
+    from helpers.auto_music_sync import install_auto_music_sync_tool
+    sec_musicclip = CollapsibleSection("Music Clip Creator", expanded=False)
+    install_auto_music_sync_tool(self, sec_musicclip)
+"""
+
+from __future__ import annotations
+
+import os
+import sys
+import math
+import json
+import random
+import shutil
+import subprocess
+import tempfile
+from datetime import datetime
+from dataclasses import dataclass, replace
+from typing import List, Optional, Tuple, Dict
+
+from PySide6.QtCore import Qt, QThread, Signal, QSettings
+from PySide6.QtWidgets import (
+    QWidget,
+    QVBoxLayout,
+    QHBoxLayout,
+    QFormLayout,
+    QLabel,
+    QLineEdit,
+    QPushButton,
+    QFileDialog,
+    QComboBox,
+    QCheckBox,
+    QProgressBar,
+    QMessageBox,
+    QSizePolicy,
+    QGroupBox,
+    QSlider,
+    QSpinBox,
+    QDoubleSpinBox,
+    QDialog,
+    QDialogButtonBox,
+    QTabWidget,
+    QListWidget,
+    QListWidgetItem,
+)
+
+
+
+
+# Optional timeline panel (separate module to keep this file smaller)
+try:
+    from .timeline import TimelinePanel
+except Exception:  # pragma: no cover - fallback if helpers package/module not available
+    TimelinePanel = None  # type: ignore
+# ---------------------------- small helpers --------------------------------
+
+
+def _find_ffmpeg_from_env() -> str:
+    env_ffmpeg = os.environ.get("FV_FFMPEG")
+    if env_ffmpeg and os.path.exists(env_ffmpeg):
+        return env_ffmpeg
+
+    here = os.path.dirname(os.path.abspath(__file__))
+    candidates = [
+        os.path.join(here, "..", "presets", "bin", "ffmpeg.exe"),
+        os.path.join(here, "..", "presets", "bin", "ffmpeg"),
+        "ffmpeg.exe",
+        "ffmpeg",
+    ]
+    for c in candidates:
+        if shutil.which(c) or os.path.exists(c):
+            return c
+
+    return "ffmpeg"
+
+
+def _find_ffprobe_from_env() -> str:
+    env_ffprobe = os.environ.get("FV_FFPROBE")
+    if env_ffprobe and os.path.exists(env_ffprobe):
+        return env_ffprobe
+
+    here = os.path.dirname(os.path.abspath(__file__))
+    candidates = [
+        os.path.join(here, "..", "presets", "bin", "ffprobe.exe"),
+        os.path.join(here, "..", "presets", "bin", "ffprobe"),
+        "ffprobe.exe",
+        "ffprobe",
+    ]
+    for c in candidates:
+        if shutil.which(c) or os.path.exists(c):
+            return c
+
+    return "ffprobe"
+
+
+
+
+def _cine_grid_dims(screen_count: int) -> tuple[int, int]:
+    """Return (cols, rows) for 2–9 tiles so the grid cleanly fills the frame.
+
+    We keep it simple and deterministic: every value 2–9 maps to a fixed
+    (cols, rows) pair with cols * rows == screen_count, so there are no
+    unused "empty" cells in the xstack layout.
+    """
+    try:
+        n = int(screen_count)
+    except Exception:
+        n = 4
+    if n < 2:
+        n = 2
+    if n > 9:
+        n = 9
+
+    layout_map = {
+        2: (2, 1),  # two vertical panels
+        3: (3, 1),  # three vertical panels
+        4: (2, 2),
+        5: (5, 1),
+        6: (3, 2),
+        7: (7, 1),
+        8: (4, 2),
+        9: (3, 3),
+    }
+    return layout_map.get(n, (n, 1))
+
+def _run_ffmpeg(cmd: List[str]) -> Tuple[int, str]:
+    try:
+        proc = subprocess.Popen(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            universal_newlines=True,
+        )
+        out, _ = proc.communicate()
+        return proc.returncode, out or ""
+    except Exception as e:
+        return 1, f"Failed to run ffmpeg: {e!r}"
+
+
+def _ffprobe_duration(ffprobe: str, path: str) -> Optional[float]:
+    cmd = [
+        ffprobe,
+        "-v",
+        "error",
+        "-show_entries",
+        "format=duration",
+        "-of",
+        "default=noprint_wrappers=1:nokey=1",
+        path,
+    ]
+    try:
+        out = subprocess.check_output(cmd, stderr=subprocess.STDOUT, text=True)
+        return float(out.strip())
+    except Exception:
+        return None
+
+
+def _ensure_dir(path: str) -> None:
+    os.makedirs(path, exist_ok=True)
+
+
+
+def _load_clip_presets() -> List[Tuple[str, str, str]]:
+    """Load 1-click clip presets from JSON, with minimal built-in fallback.
+
+    JSON location (relative to app root):
+        /presets/setsave/clip_presets.json
+
+    Schema:
+        {
+            "version": 1,
+            "presets": [
+                {
+                    "id": "clean",
+                    "name": "Clean cuts (no FX)",
+                    "description": "...",
+                    "settings": { ... }
+                },
+                ...
+            ]
+        }
+    """
+    # Only keep the two "safe" built-ins as a fallback so the dialog
+    # still works even if the JSON file is missing or broken.
+    default_presets: List[Tuple[str, str, str]] = [
+        ("clean", "Clean cuts (no FX)", "Very clean edit, slower cuts, no extra FX."),
+        ("chill", "Chill / slow cinematic", "Soft cuts with gentle slow-motion and cinematic moves."),
+    ]
+    try:
+        here = os.path.dirname(os.path.abspath(__file__))
+        json_path = os.path.join(here, "..", "presets", "setsave", "clip_presets.json")
+        if not os.path.exists(json_path):
+            return default_presets
+
+        with open(json_path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+
+        items = data.get("presets", [])
+        if not isinstance(items, list):
+            return default_presets
+
+        presets: List[Tuple[str, str, str]] = []
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            pid = str(item.get("id") or "").strip()
+            if not pid:
+                continue
+            name = str(item.get("name") or "").strip() or pid
+            desc = str(item.get("description") or "").strip()
+            presets.append((pid, name, desc))
+
+        # If JSON is empty or invalid, fall back to the two built-ins.
+        return presets or default_presets
+    except Exception:
+        # Any error: fall back to the two built-in presets so the UI keeps working.
+        return default_presets
+
+
+def _get_clip_preset_settings(preset_id: str) -> dict | None:
+    """Return the settings dict for a given preset id from clip_presets.json.
+
+    This is used by _apply_preset so that all 1-click presets (including
+    user-defined ones) live in JSON instead of being hardcoded here.
+
+    Returns None if the file is missing, broken or the preset is not found.
+    """
+    try:
+        here = os.path.dirname(os.path.abspath(__file__))
+        json_path = os.path.join(here, "..", "presets", "setsave", "clip_presets.json")
+        if not os.path.exists(json_path):
+            return None
+
+        with open(json_path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+
+        items = data.get("presets", [])
+        if not isinstance(items, list):
+            return None
+
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            pid = str(item.get("id") or "").strip()
+            if pid != preset_id:
+                continue
+            settings = item.get("settings")
+            if isinstance(settings, dict):
+                return settings
+            return None
+    except Exception:
+        return None
+    return None
+
+
+# --------------------------- data classes ----------------------------------
+
+
+@dataclass
+class Beat:
+    time: float
+    strength: float
+    kind: str  # "major" / "minor"
+
+
+@dataclass
+class Section:
+    start: float
+    end: float
+    kind: str  # "intro", "verse", "chorus", "drop", "break"
+
+
+@dataclass
+class ClipSource:
+    path: str
+    duration: float
+    is_image: bool = False
+
+
+@dataclass
+class TimelineSegment:
+    clip_path: str
+    clip_start: float
+    duration: float
+    effect: str
+    energy_class: str  # "low", "mid", "high"
+    transition: str    # "none", "fade", "flashcut"
+    slow_factor: float = 1.0  # 1.0 = normal speed, <1.0 = slow motion (video only)
+    # Cinematic one-off effects (freeze, stutter, reverse, ramp)
+    cine_freeze: bool = False
+    cine_stutter: bool = False
+    cine_reverse: bool = False
+    cine_speed_ramp: bool = False
+    cine_freeze_len: float = 0.0
+    cine_freeze_zoom: float = 0.0
+    cine_stutter_repeats: int = 0
+    cine_reverse_len: float = 0.0
+    cine_ramp_in: float = 0.0
+    cine_ramp_out: float = 0.0
+    cine_boomerang: bool = False
+    cine_boomerang_bounces: int = 0
+    # Mosaic multi-screen effect
+    cine_mosaic: bool = False
+    cine_mosaic_screens: int = 0
+    # Multiply same-clip multi-screen effect
+    cine_multiply: bool = False
+    cine_multiply_screens: int = 0
+    # Upside-down flip and rotating screen
+    cine_flip: bool = False
+    cine_rotate: bool = False
+    cine_rotate_degrees: float = 0.0
+    # Camera motion hits (dolly / Ken Burns)
+    cine_dolly: bool = False
+    cine_dolly_strength: float = 0.0
+    cine_kenburns: bool = False
+    cine_kenburns_strength: float = 0.0
+    # Shared camera motion direction: 0=random, 1=zoom in, 2=zoom out,
+    # 3=pan left, 4=pan right, 5=pan up, 6=pan down
+    cine_motion_dir: int = 0
+    # Break impact FX (first beat after a break)
+    is_break_impact: bool = False
+    impact_flash_strength: float = 0.0
+    impact_shock_strength: float = 0.0
+    impact_confetti_density: float = 0.0
+    impact_zoom_amount: float = 0.0
+    impact_shake_strength: float = 0.0
+    impact_fog_density: float = 0.0
+    impact_fire_gold_intensity: float = 0.0
+    impact_fire_multi_intensity: float = 0.0
+    # Absolute position on the music timeline (seconds)
+    timeline_start: float = 0.0
+    timeline_end: float = 0.0
+    is_image: bool = False  # Mark if this is an image (for special effects)
+
+
+@dataclass
+class MusicAnalysisConfig:
+    sensitivity: int = 5
+
+
+@dataclass
+class MusicAnalysisResult:
+    beats: List[Beat]
+    sections: List[Section]
+    duration: float
+
+
+# --------------------------- music analysis --------------------------------
+
+
+def analyze_music(audio_path: str, ffmpeg: str, config: Optional[MusicAnalysisConfig] = None) -> MusicAnalysisResult:
+    """Very lightweight beat + energy analysis using ffmpeg + PCM RMS."""
+    tmpdir = tempfile.mkdtemp(prefix="fv_mclip_an_")
+    wav_path = os.path.join(tmpdir, "mono.wav")
+
+    cmd = [
+        ffmpeg,
+        "-y",
+        "-i",
+        audio_path,
+        "-vn",
+        "-ac",
+        "1",
+        "-ar",
+        "44100",
+        "-f",
+        "wav",
+        wav_path,
+    ]
+    code, out = _run_ffmpeg(cmd)
+    if code != 0 or not os.path.exists(wav_path):
+        shutil.rmtree(tmpdir, ignore_errors=True)
+        raise RuntimeError("Failed to convert audio for analysis:\n" + out)
+
+    import wave
+    import struct
+
+    with wave.open(wav_path, "rb") as wf:
+        fr = wf.getframerate()
+        total_frames = wf.getnframes()
+        duration = total_frames / float(fr)
+
+        win_size = int(fr * 0.05)  # 50ms windows
+        values = []
+        times = []
+        read = 0
+        while read < total_frames:
+            n = min(win_size, total_frames - read)
+            raw = wf.readframes(n)
+            read += n
+            if not raw:
+                break
+            count = len(raw) // 2  # 16-bit
+            if count == 0:
+                rms = 0.0
+            else:
+                fmt = "<" + "h" * count
+                samples = struct.unpack(fmt, raw)
+                acc = 0.0
+                for s in samples:
+                    acc += (s / 32768.0) ** 2
+                rms = math.sqrt(acc / count)
+            values.append(rms)
+            times.append(len(values) * (n / float(fr)))
+
+    shutil.rmtree(tmpdir, ignore_errors=True)
+
+    if not values:
+        raise RuntimeError("Audio analysis produced no samples.")
+
+    max_v = max(values) or 1.0
+    norm = [v / max_v for v in values]
+
+    mean = sum(norm) / len(norm)
+    var = sum((v - mean) ** 2 for v in norm) / len(norm)
+    std = math.sqrt(var)
+
+    # Apply beat sensitivity from config (1 = fewer beats, 10 = more beats)
+    if config is not None:
+        try:
+            raw_val = float(config.sensitivity)
+        except Exception:
+            raw_val = 10.0
+    else:
+        raw_val = 10.0
+    # Slider uses 2..20 -> map to 1.0..10.0 in 0.5 steps
+    sens = max(1.0, min(10.0, raw_val / 2.0))
+    # Map sensitivity linearly: 1 -> ~1.24x thresholds (fewer beats), 10 -> ~0.70x (more beats)
+    scale = 1.0 - (sens - 5.0) * 0.06
+    if scale < 0.6:
+        scale = 0.6
+    elif scale > 1.4:
+        scale = 1.4
+    beat_thr = mean + std * 0.7 * scale
+    major_thr = mean + std * 1.4 * scale
+
+    beats: List[Beat] = []
+    last_peak = -9999
+    min_dist = int(0.15 / 0.05)  # 150ms
+
+    for i in range(1, len(norm) - 1):
+        v = norm[i]
+        if v < beat_thr:
+            continue
+        if v >= norm[i - 1] and v >= norm[i + 1]:
+            if i - last_peak < min_dist:
+                if beats and v > beats[-1].strength:
+                    beats[-1] = Beat(
+                        time=times[i],
+                        strength=v,
+                        kind="major" if v >= major_thr else "minor",
+                    )
+                    last_peak = i
+                continue
+            kind = "major" if v >= major_thr else "minor"
+            beats.append(Beat(time=times[i], strength=v, kind=kind))
+            last_peak = i
+
+    # If we have beats but there's a long quiet tail with no peaks,
+    # synthesize gentle extra beats in the tail so quiet / outro parts
+    # still have material for the timeline.
+    if beats:
+        tail = duration - beats[-1].time
+        if tail > 5.0:
+            # Place minor beats at regular spacing in the tail.
+            # Use a stable pattern so results remain predictable.
+            num_virtual = max(2, min(16, int(tail / 1.0)))
+            if num_virtual > 0:
+                spacing = tail / (num_virtual + 1)
+                t = beats[-1].time + spacing
+                while t < duration - 0.25:
+                    beats.append(
+                        Beat(
+                            time=t,
+                            strength=mean,
+                            kind="minor",
+                        )
+                    )
+                    t += spacing
+
+    # Ensure beats are sorted in time in case virtual beats were appended
+    beats.sort(key=lambda b: b.time)
+
+    # Energy profile in 1s windows
+    win1 = int(1.0 / 0.05)
+    e_vals = []
+    e_times = []
+    for i in range(0, len(norm), win1):
+        chunk = norm[i : i + win1]
+        if not chunk:
+            continue
+        e_vals.append(sum(chunk) / len(chunk))
+        e_times.append(i * 0.05)
+
+    if not e_vals:
+        e_vals = [mean]
+        e_times = [0.0]
+
+    e_mean = sum(e_vals) / len(e_vals)
+    e_var = sum((v - e_mean) ** 2 for v in e_vals) / len(e_vals)
+    e_std = math.sqrt(e_var)
+
+    low_thr = e_mean - 0.4 * e_std
+    high_thr = e_mean + 0.4 * e_std
+
+    sections: List[Section] = []
+    cur_kind = None
+    cur_start = 0.0
+
+    def flush(end_t: float):
+        nonlocal cur_kind, cur_start
+        if cur_kind is None:
+            return
+        sections.append(Section(start=cur_start, end=end_t, kind=cur_kind))
+
+    for i, v in enumerate(e_vals):
+        t = e_times[i]
+        if v < low_thr:
+            kind = "intro_or_break"
+        elif v > high_thr:
+            kind = "chorus_or_drop"
+        else:
+            kind = "verse_or_mid"
+        if cur_kind is None:
+            cur_kind = kind
+            cur_start = t
+        elif kind != cur_kind:
+            flush(t)
+            cur_kind = kind
+            cur_start = t
+    flush(duration)
+
+    labelled: List[Section] = []
+    chorus_seen = False
+    for idx, s in enumerate(sections):
+        if idx == 0:
+            k = "intro"
+        elif s.kind == "chorus_or_drop":
+            k = "chorus" if not chorus_seen else "drop"
+            chorus_seen = True
+        elif s.kind == "intro_or_break":
+            k = "break"
+        else:
+            k = "verse"
+        labelled.append(Section(start=s.start, end=s.end, kind=k))
+
+    # Ensure we always end on an explicit "outro" section.
+    if labelled:
+        last = labelled[-1]
+        last_duration = max(0.0, last.end - last.start)
+        # If the final segment is extremely short, merge it with the
+        # previous one so the outro feels like a real section instead
+        # of a tiny fragment.
+        if last_duration < 1.25 and len(labelled) >= 2:
+            prev = labelled[-2]
+            merged = Section(
+                start=prev.start,
+                end=last.end,
+                kind="outro",
+            )
+            labelled[-2:] = [merged]
+        else:
+            labelled[-1] = Section(
+                start=last.start,
+                end=last.end,
+                kind="outro",
+            )
+
+    return MusicAnalysisResult(beats=beats, sections=labelled, duration=duration)
+
+
+
+
+def discover_video_sources(video_input: str, ffprobe: str) -> List[ClipSource]:
+    """Return a list of ClipSource from a file, directory, or a '|' separated list of files."""
+    exts = {".mp4", ".mov", ".mkv", ".avi", ".webm", ".mpg", ".mpeg"}
+    sources: List[ClipSource] = []
+
+    # Multiple explicit files
+    if "|" in video_input:
+        parts = [p.strip() for p in video_input.split("|") if p.strip()]
+        for raw in parts:
+            path = os.path.abspath(raw)
+            if not os.path.isfile(path):
+                continue
+            _, ext = os.path.splitext(path)
+            if ext.lower() not in exts:
+                continue
+            dur = _ffprobe_duration(ffprobe, path)
+            if dur and dur > 0:
+                sources.append(ClipSource(path=path, duration=dur))
+        return sources
+
+    # Single file or directory
+    video_input = os.path.abspath(video_input)
+
+    if os.path.isdir(video_input):
+        for name in sorted(os.listdir(video_input)):
+            path = os.path.join(video_input, name)
+            if not os.path.isfile(path):
+                continue
+            _, ext = os.path.splitext(path)
+            if ext.lower() not in exts:
+                continue
+            dur = _ffprobe_duration(ffprobe, path)
+            if dur and dur > 0:
+                sources.append(ClipSource(path=path, duration=dur))
+    elif os.path.isfile(video_input):
+        dur = _ffprobe_duration(ffprobe, video_input)
+        if dur and dur > 0:
+            sources.append(ClipSource(path=video_input, duration=dur))
+
+    return sources
+
+# --------------------------- timeline builder ------------------------------
+
+def build_timeline(
+    analysis: MusicAnalysisResult,
+    sources: List[ClipSource],
+    fx_level: str,
+    microclip_mode: int,
+    beats_per_segment: int,
+    transition_mode: int,
+    clip_order_mode: int,
+    force_full_length: bool,
+    seed_enabled: bool,
+    seed_value: int,
+    transition_random: bool,
+    transition_modes_enabled: Optional[List[int]],
+    slow_motion_enabled: bool = False,
+    slow_motion_factor: float = 1.0,
+    slow_motion_sections: Optional[List[str]] = None,
+    slow_motion_random: bool = False,
+    cine_enable: bool = False,
+    cine_freeze: bool = False,
+    cine_stutter: bool = False,
+    cine_reverse: bool = False,
+    cine_speed_ramp: bool = False,
+    cine_freeze_len: float = 0.5,
+    cine_freeze_zoom: float = 0.15,
+    cine_stutter_repeats: int = 3,
+    cine_reverse_len: float = 0.5,
+    cine_ramp_in: float = 0.25,
+    cine_ramp_out: float = 0.25,
+    cine_boomerang: bool = False,
+    cine_boomerang_bounces: int = 2,
+    cine_mosaic: bool = False,
+    cine_mosaic_screens: int = 4,
+    cine_mosaic_random: bool = False,
+    cine_flip: bool = False,
+    cine_rotate: bool = False,
+    cine_rotate_max_degrees: float = 20.0,
+    cine_multiply: bool = False,
+    cine_multiply_screens: int = 4,
+    cine_multiply_random: bool = False,
+    cine_dolly: bool = False,
+    cine_dolly_strength: float = 0.4,
+    cine_kenburns: bool = False,
+    cine_kenburns_strength: float = 0.35,
+    cine_motion_dir: int = 0,
+    audio_duration: float | None = None,
+    impact_enable: bool = False,
+    impact_flash: bool = False,
+    impact_shock: bool = False,
+    impact_confetti: bool = False,
+    impact_zoom: bool = False,
+    impact_shake: bool = False,
+    impact_fog: bool = False,
+    impact_fire_gold: bool = False,
+    impact_fire_multi: bool = False,
+    impact_random: bool = False,
+    impact_flash_strength: float = 0.8,
+    impact_shock_strength: float = 0.75,
+    impact_confetti_density: float = 0.7,
+    impact_zoom_amount: float = 0.2,
+    impact_shake_strength: float = 0.6,
+    impact_fog_density: float = 0.65,
+    impact_fire_gold_intensity: float = 0.75,
+    impact_fire_multi_intensity: float = 0.8,
+    image_sources: Optional[List[ClipSource]] = None,
+    section_overrides: Optional[Dict[int, ClipSource]] = None,
+) -> List[TimelineSegment]:
+
+
+    """Build a musical timeline from beats, sections and sources.
+
+    fx_level:
+        "minimal", "moderate", "high"
+
+    microclip_mode:
+        0 = off
+        1 = only in high-energy sections (chorus / drops)
+        2 = whole track
+        3 = verses only (microclips inside verse sections; longer cuts elsewhere)
+
+    transition_mode:
+        0 = soft fades
+        1 = hard cuts
+        2 = mixed (fades + flash cuts sometimes)
+
+    clip_order_mode:
+        0 = random (default)
+        1 = sequential
+        2 = shuffle (no repeats until all clips used)
+    """
+    if not sources:
+        return []
+
+    if image_sources is None:
+        image_sources = []
+
+    if seed_enabled:
+        random.seed(int(seed_value) & 0xFFFFFFFF)
+
+    # Helper: map a logical time (seconds) to a section label, including 'outro' for the final section.
+    def _section_label_at(time_t: float) -> str:
+        sections = analysis.sections
+        if not sections:
+            return "verse"
+        last_idx = len(sections) - 1
+        for idx, s in enumerate(sections):
+            # Include the tail of the last section
+            if s.start <= time_t < s.end or (idx == last_idx and time_t >= s.start):
+                if idx == last_idx and s.kind not in ("intro",):
+                    return "outro"
+                return s.kind
+        # Fallback: treat as part of the last section
+        return sections[-1].kind
+
+    def _section_index_at(time_t: float) -> Optional[int]:
+        """Return the index of the section that contains the given time."""
+        sections = analysis.sections
+        if not sections:
+            return None
+        last_idx = len(sections) - 1
+        for idx, s in enumerate(sections):
+            if s.start <= time_t < s.end or (idx == last_idx and time_t >= s.start):
+                return idx
+        return last_idx
+
+    def _apply_slow_motion(segments: List[TimelineSegment],
+                           centers: List[float],
+                           section_labels: List[str]) -> None:
+        if not slow_motion_enabled or not segments:
+            return
+
+        # Normalize configuration
+        selected_sections = set()
+        if slow_motion_sections:
+            selected_sections = {str(k).lower() for k in slow_motion_sections}
+
+        # 1) Direct section-based slow motion
+        slow_flags = [False] * len(segments)
+        for idx, label in enumerate(section_labels):
+            lbl = (label or "").lower()
+            if lbl in selected_sections:
+                slow_flags[idx] = True
+
+        # 2) Random slow motion: at most one event per 60 seconds of timeline
+        if slow_motion_random:
+            cumulative = 0.0
+            centers_timeline: List[float] = []
+            for seg in segments:
+                center = cumulative + max(seg.duration, 0.0) * 0.5
+                centers_timeline.append(center)
+                cumulative += max(seg.duration, 0.0)
+
+            blocks = {}
+            for idx, t in enumerate(centers_timeline):
+                if slow_flags[idx]:
+                    continue  # already slowed via section selection
+                block = int(t // 60.0)
+                blocks.setdefault(block, []).append(idx)
+
+            for idx_list in blocks.values():
+                if not idx_list:
+                    continue
+                choice = random.choice(idx_list)
+                slow_flags[choice] = True
+
+        # Apply final slow factors
+        for idx, seg in enumerate(segments):
+            if slow_flags[idx]:
+                seg.slow_factor = float(slow_motion_factor or 1.0)
+            else:
+                seg.slow_factor = 1.0
+
+
+    def _apply_cinematic_effects(segments: List[TimelineSegment]) -> None:
+        """Mark segments for rare cinematic effects (freeze, stutter, reverse, ramps).
+
+        The logic is intentionally conservative: for the freeze / stutter / reverse
+        effects we pick at most one segment per 5 seconds of video timeline, and
+        only when the global cinematic toggle plus the corresponding effect toggle
+        are enabled. Speed ramps are applied to all slow-motion segments when the
+        option is on, but they currently piggy-back on the existing slow-factor
+        logic rather than splitting segments.
+        """
+        if not cine_enable or not segments:
+            return
+
+        # Collect which cinematic effects are globally enabled.
+        enabled_effects: List[str] = []
+        boomerang_indices: List[int] = []
+        used_segments = set()
+        if cine_freeze:
+            enabled_effects.append("freeze")
+        if cine_stutter:
+            enabled_effects.append("stutter")
+        if cine_reverse:
+            enabled_effects.append("reverse")
+        if cine_boomerang:
+            enabled_effects.append("boomerang")
+        # Mosaic uses the same 'one event per 5s' rule as the other cinematic effects.
+        if cine_mosaic:
+            enabled_effects.append("mosaic")
+        if cine_flip:
+            enabled_effects.append("flip")
+        if cine_rotate:
+            enabled_effects.append("rotate")
+        # Multiply (same-clip multi-screen) follows the same cadence as Mosaic.
+        if cine_multiply:
+            enabled_effects.append("multiply")
+
+        # If nothing except ramps is enabled, we only tag slow-motion segments below.
+        # (Still honour cine_enable so the user can quickly disable everything.)
+        # Compute segment centres on the *video* timeline so we can respect the
+        # "about once every 5 seconds" requirement.
+        centers: List[float] = []
+        cumulative = 0.0
+        for seg in segments:
+            duration = max(0.0, float(getattr(seg, "duration", 0.0)))
+            centers.append(cumulative + duration * 0.5)
+            cumulative += duration
+
+        if enabled_effects and cumulative > 0.0:
+            buckets: dict[int, List[int]] = {}
+            for idx, t in enumerate(centers):
+                block = int(t // 5.0)
+                buckets.setdefault(block, []).append(idx)
+
+            for block_idx in sorted(buckets.keys()):
+                idx_list = buckets[block_idx]
+
+                if not idx_list:
+                    continue
+                # One cinematic event per 5-second block at most.
+                seg_idx = random.choice(idx_list)
+                seg = segments[seg_idx]
+                effect_name = random.choice(enabled_effects)
+                if effect_name == "freeze":
+                    seg.cine_freeze = True
+                    seg.cine_freeze_len = float(max(0.10, min(1.0, cine_freeze_len)))
+                    # Clamp zoom factor to a safe 0.0–0.5 range (0–50%% punch-in).
+                    seg.cine_freeze_zoom = float(max(0.0, min(0.5, cine_freeze_zoom)))
+                    # Optionally clamp the logical segment duration to the freeze window
+                    # so the pacing stays snappy.
+                    seg.duration = min(seg.duration, seg.cine_freeze_len)
+                elif effect_name == "stutter":
+                    seg.cine_stutter = True
+                    seg.cine_stutter_repeats = int(max(2, min(5, cine_stutter_repeats)))
+                elif effect_name == "reverse":
+                    seg.cine_reverse = True
+                    seg.cine_reverse_len = float(max(0.10, min(1.5, cine_reverse_len)))
+                    # Clamp segment duration to the reverse window so the slider
+                    # truly controls how long the reversed hit lasts.
+                    seg.duration = min(seg.duration, seg.cine_reverse_len)
+                elif effect_name == "boomerang":
+                    # Mark this segment as a boomerang loop and clamp the
+                    # underlying clip region to the *first ~2 seconds* of the
+                    # source clip so the bounce is always short and punchy.
+                    boomerang_indices.append(seg_idx)
+                    seg.cine_boomerang = True
+                    try:
+                        bounces = int(cine_boomerang_bounces)
+                    except Exception:
+                        bounces = 2
+                    bounces = max(1, min(9, bounces))
+                    seg.cine_boomerang_bounces = bounces
+                    # Ensure the clip region used for this segment lives fully
+                    # inside the first 2 seconds of the source clip.
+                    try:
+                        max_window = 0.25  # use only the first ~0.25 second of the source clip for boomerang
+                        cur_dur = float(getattr(seg, "duration", 0.0) or 0.0)
+                        if cur_dur <= 0.0:
+                            cur_dur = 0.1
+                        if cur_dur > max_window:
+                            cur_dur = max_window
+                        seg.duration = cur_dur
+                        cur_start = float(getattr(seg, "clip_start", 0.0) or 0.0)
+                        if cur_start < 0.0:
+                            cur_start = 0.0
+                        if cur_start + cur_dur > max_window:
+                            cur_start = max(0.0, max_window - cur_dur)
+                        seg.clip_start = cur_start
+                    except Exception:
+                        # As a safety fallback, just pin to the absolute start.
+                        try:
+                            seg.clip_start = 0.0
+                        except Exception:
+                            pass
+                elif effect_name == "mosaic":
+                    seg.cine_mosaic = True
+                    if cine_mosaic_random:
+                        # Pick any layout between 2 and 9 screens each time Mosaic is assigned.
+                        screens = random.randint(2, 9)
+                    else:
+                        try:
+                            screens = int(cine_mosaic_screens)
+                        except Exception:
+                            screens = 4
+                        # Clamp to the supported 2–9 range
+                        screens = max(2, min(9, screens))
+                    seg.cine_mosaic_screens = screens
+
+                elif effect_name == "flip":
+                    # Mark this segment for a 180° upside-down hit, and also
+                    # apply a rotating-screen spin so it feels intentional.
+                    seg.cine_flip = True
+                    seg.cine_rotate = True
+                    try:
+                        max_deg = float(cine_rotate_max_degrees)
+                    except Exception:
+                        max_deg = 20.0
+                    # Clamp to a safe range to avoid nausea.
+                    max_deg = max(5.0, min(90.0, max_deg))
+                    seg.cine_rotate_degrees = max_deg
+
+                elif effect_name == "rotate":
+                    # Apply a short rotating-screen hit with a random angle
+                    # up to the user-specified maximum.
+                    seg.cine_rotate = True
+                    try:
+                        max_deg = float(cine_rotate_max_degrees)
+                    except Exception:
+                        max_deg = 20.0
+                    # Clamp to a safe range to avoid nausea.
+                    max_deg = max(5.0, min(90.0, max_deg))
+                    seg.cine_rotate_degrees = max_deg
+
+                elif effect_name == "multiply":
+                    # Multiply uses the same layouts as Mosaic, but
+                    # shows multiple copies of *the same* clip instead of
+                    # filling the grid with different sources.
+                    seg.cine_multiply = True
+                    if cine_multiply_random:
+                        # Pick any layout between 2 and 9 screens each time Multiply is assigned.
+                        screens = random.randint(2, 9)
+                    else:
+                        try:
+                            screens = int(cine_multiply_screens)
+                        except Exception:
+                            screens = 4
+                        # Clamp to the supported 2–9 range
+                        screens = max(2, min(9, screens))
+                    seg.cine_multiply_screens = screens
+
+        # Camera motion hits (dolly-zoom / Ken Burns) – rarer, about one per 15s block.
+        camera_enabled = (cine_dolly or cine_kenburns)
+        if camera_enabled and cumulative > 0.0:
+            cam_buckets: dict[int, List[int]] = {}
+            for idx, t in enumerate(centers):
+                block = int(t // 15.0)
+                cam_buckets.setdefault(block, []).append(idx)
+
+            def _pick_motion_dir(global_dir: int, allowed_dirs) -> int:
+                try:
+                    g = int(global_dir)
+                except Exception:
+                    g = 0
+                allowed_list = list(allowed_dirs)
+                if not allowed_list:
+                    return 0
+                # If the user picked a specific direction and it's allowed, honour it.
+                if g in allowed_list:
+                    return g
+                # Otherwise pick a random direction from the allowed set.
+                return random.choice(allowed_list)
+
+            available_cams: List[str] = []
+            if cine_dolly:
+                available_cams.append("dolly")
+            if cine_kenburns:
+                available_cams.append("kenburns")
+
+            for block_idx, idx_list in cam_buckets.items():
+                if not idx_list or not available_cams:
+                    continue
+                seg_idx = random.choice(idx_list)
+                seg = segments[seg_idx]
+                which = random.choice(available_cams)
+                if which == "dolly":
+                    seg.cine_dolly = True
+                    seg.cine_dolly_strength = float(max(0.10, min(1.0, cine_dolly_strength)))
+                    seg.cine_motion_dir = int(_pick_motion_dir(cine_motion_dir, (1, 2)))
+                elif which == "kenburns":
+                    seg.cine_kenburns = True
+                    seg.cine_kenburns_strength = float(max(0.10, min(1.0, cine_kenburns_strength)))
+                    seg.cine_motion_dir = int(_pick_motion_dir(cine_motion_dir, (3, 4, 5, 6)))
+
+        # Speed ramps: tag all slow-motion segments (slow_factor != 1.0) when enabled.
+        if cine_speed_ramp and slow_motion_enabled:
+            for seg in segments:
+                if float(getattr(seg, "slow_factor", 1.0)) != 1.0:
+                    seg.cine_speed_ramp = True
+                    seg.cine_ramp_in = float(max(0.05, min(0.60, cine_ramp_in)))
+                    seg.cine_ramp_out = float(max(0.05, min(0.60, cine_ramp_out)))
+
+    
+
+
+    def _apply_break_impact_fx(segments: List[TimelineSegment],
+                               centers: List[float]) -> None:
+        """Mark segments that should receive 'break impact' FX (first beat after a break).
+
+        We scan music sections for 'break' regions, then for each break we find the
+        first strong beat that follows the end of the break (within a short window).
+        The segment whose logical centre is closest to that beat (or whose
+        approximate coverage includes it) is tagged as an impact segment and
+        receives break impact parameters according to the UI configuration.
+
+        If no explicit 'break' sections are found, we fall back to section boundaries
+        into high–energy parts (chorus / drop). As a last resort, we pick the first
+        beat after the largest silence / gap between beats so that the feature still
+        does something musical on simpler tracks.
+        """
+        if not impact_enable or not segments:
+            return
+
+        beats = analysis.beats
+        if not beats:
+            return
+
+        impact_times: List[float] = []
+
+        # --- Primary: merged 'break' clusters --------------------------------
+        raw_breaks: List[Section] = [sec for sec in analysis.sections if sec.kind == "break"]
+        if raw_breaks:
+            raw_breaks.sort(key=lambda s: s.start)
+            merged: List[Section] = []
+            cur = raw_breaks[0]
+            gap_limit = 4.0  # seconds; small gaps are treated as one big build‑up
+            for sec in raw_breaks[1:]:
+                if sec.start - cur.end <= gap_limit:
+                    # Extend current build‑up cluster.
+                    cur = Section(start=cur.start, end=max(cur.end, sec.end), kind="break")
+                else:
+                    merged.append(cur)
+                    cur = sec
+            merged.append(cur)
+
+            for mb in merged:
+                end_t = float(mb.end)
+                # Consider beats up to a few seconds after the *merged* break.
+                window_end = min(analysis.duration, end_t + 4.0)
+                cand = [b for b in beats if end_t <= b.time <= window_end]
+                if not cand:
+                    continue
+                majors = [b for b in cand if b.kind == "major"]
+                if majors:
+                    chosen = min(majors, key=lambda b: b.time)
+                else:
+                    chosen = min(cand, key=lambda b: b.time)
+                impact_times.append(chosen.time)
+
+        # --- Fallback 1: boundaries into chorus / drop -----------------------
+        if not impact_times and analysis.sections:
+            for prev, cur in zip(analysis.sections, analysis.sections[1:]):
+                if cur.kind in ("chorus", "drop") and cur.start > prev.end:
+                    start_t = float(prev.end)
+                    window_end = min(analysis.duration, float(cur.start) + 4.0)
+                    cand = [b for b in beats if start_t <= b.time <= window_end]
+                    if not cand:
+                        continue
+                    majors = [b for b in cand if b.kind == "major"]
+                    if majors:
+                        chosen = min(majors, key=lambda b: b.time)
+                    else:
+                        chosen = min(cand, key=lambda b: b.time)
+                    impact_times.append(chosen.time)
+
+        # --- Fallback 2: largest beat gap (main drop guess) ------------------
+        if not impact_times and len(beats) >= 2:
+            max_gap = 0.0
+            drop_time = None
+            for i in range(len(beats) - 1):
+                gap = float(beats[i + 1].time - beats[i].time)
+                if gap > max_gap:
+                    max_gap = gap
+                    drop_time = float(beats[i + 1].time)
+            # Require a reasonably long gap so we don't fire on micro‑pauses.
+            if drop_time is not None and max_gap >= 1.0:
+                impact_times.append(drop_time)
+
+        if not impact_times:
+            return
+
+        # Prepare list of enabled effects for selection.
+        enabled_effect_names: List[str] = []
+        if impact_flash:
+            enabled_effect_names.append("flash")
+        if impact_shock:
+            enabled_effect_names.append("shock")
+        if impact_confetti:
+            enabled_effect_names.append("confetti")
+        if impact_zoom:
+            enabled_effect_names.append("zoom")
+        if impact_shake:
+            enabled_effect_names.append("shake")
+        if impact_fog:
+            enabled_effect_names.append("fog")
+        if impact_fire_gold:
+            enabled_effect_names.append("fire_gold")
+        if impact_fire_multi:
+            enabled_effect_names.append("fire_multi")
+
+        if not enabled_effect_names:
+            # Nothing to do even if master toggle is on.
+            return
+
+        # Helper to assign parameters for a chosen set of effect names on a segment.
+        def _tag_segment(seg: TimelineSegment, chosen_effects: List[str]) -> None:
+            seg.is_break_impact = True
+
+            seg.impact_flash_strength = impact_flash_strength if "flash" in chosen_effects else 0.0
+            seg.impact_shock_strength = impact_shock_strength if "shock" in chosen_effects else 0.0
+            seg.impact_confetti_density = impact_confetti_density if "confetti" in chosen_effects else 0.0
+            seg.impact_zoom_amount = impact_zoom_amount if "zoom" in chosen_effects else 0.0
+            seg.impact_shake_strength = impact_shake_strength if "shake" in chosen_effects else 0.0
+            seg.impact_fog_density = impact_fog_density if "fog" in chosen_effects else 0.0
+            seg.impact_fire_gold_intensity = impact_fire_gold_intensity if "fire_gold" in chosen_effects else 0.0
+            seg.impact_fire_multi_intensity = impact_fire_multi_intensity if "fire_multi" in chosen_effects else 0.0
+
+        # Map each impact time to the segment whose centre best matches it.
+        impact_candidates: List[int] = []
+        for t_imp in impact_times:
+            best_idx: Optional[int] = None
+            best_dist: Optional[float] = None
+
+            for idx, seg in enumerate(segments):
+                seg_len = max(0.1, float(getattr(seg, "duration", 0.0)))
+                center_t = centers[idx] if idx < len(centers) else 0.0
+                start_t = center_t - 0.5 * seg_len
+                end_t = center_t + 0.5 * seg_len
+
+                if start_t <= t_imp <= end_t:
+                    best_idx = idx
+                    break
+
+                # Fallback: pick segment whose centre is closest to the impact time.
+                dist = abs(center_t - t_imp)
+                if best_dist is None or dist < best_dist:
+                    best_dist = dist
+                    best_idx = idx
+
+            if best_idx is not None:
+                impact_candidates.append(best_idx)
+
+        if not impact_candidates:
+            return
+
+        # Group candidates into ~5 second buckets along the video timeline,
+        # mirroring the cadence of cinematic effects.
+        bucket_map: Dict[int, List[int]] = {}
+        for idx in impact_candidates:
+            center_t = centers[idx] if idx < len(centers) else 0.0
+            bucket = int(center_t // 5.0)
+            bucket_map.setdefault(bucket, []).append(idx)
+
+        chosen_indices: List[int] = []
+        for bucket_idx in sorted(bucket_map.keys()):
+            idx_list = bucket_map[bucket_idx]
+            if not idx_list:
+                continue
+            # Avoid duplicates inside a bucket, then pick a single segment.
+            unique = sorted(set(idx_list))
+            chosen_indices.append(random.choice(unique))
+
+        if not chosen_indices:
+            return
+
+        # Assign break-impact FX. We always apply exactly one effect per chosen
+        # segment so they are spaced out like cinematic FX instead of all
+        # firing at once. With "Random" enabled, the chosen effect is random
+        # per impact; otherwise we cycle deterministically through the enabled
+        # list.
+        num_effects = len(enabled_effect_names)
+        eff_cursor = 0
+
+        for seg_idx in sorted(set(chosen_indices)):
+            seg = segments[seg_idx]
+            if impact_random:
+                eff_name = random.choice(enabled_effect_names)
+            else:
+                eff_name = enabled_effect_names[eff_cursor % num_effects]
+                eff_cursor += 1
+            _tag_segment(seg, [eff_name])
+
+
+
+    def _rebuild_timeline_positions(segments: List[TimelineSegment]) -> None:
+        """Rebuild absolute timeline_start / timeline_end for all segments.
+
+        We treat each segment's ``duration`` as the *base* amount of source
+        material (real-time seconds). When a segment is slowed down
+        (slow_factor < 1.0), it needs *more* room on the musical timeline to
+        play the same material, so we stretch its logical length by dividing
+        by the slow factor. For all other cases we keep the base duration.
+
+        This mirrors the intent of:
+
+            base_duration = beats_per_segment * avg_beat_interval
+            if seg.slow_factor < 1.0 and seg.slow_factor > 0.01:
+                seg_duration = base_duration / seg.slow_factor
+            else:
+                seg_duration = base_duration
+
+        and ensures that cumulative timeline time always uses the stretched
+        duration, not the base duration.
+        """
+        current_time = 0.0
+        for seg in segments:
+            base_duration = float(getattr(seg, "duration", 0.0))
+            try:
+                sf = float(getattr(seg, "slow_factor", 1.0) or 1.0)
+            except Exception:
+                sf = 1.0
+            if 0.01 < sf < 1.0 and base_duration > 0.0:
+                seg_duration = base_duration / sf
+            else:
+                seg_duration = base_duration
+            seg.timeline_start = current_time
+            current_time += seg_duration
+            seg.timeline_end = current_time
+
+
+# Determine which transition modes are allowed for randomization
+    allowed_modes: List[int] = []
+    if transition_modes_enabled:
+        for m in transition_modes_enabled:
+            if 0 <= m <= 7 and m not in allowed_modes:
+                allowed_modes.append(m)
+    if not allowed_modes:
+        allowed_modes.append(transition_mode)
+
+    beats = analysis.beats
+    if len(beats) < 4:
+        # Single-segment fallback for very short tracks.
+        seg = TimelineSegment(
+            clip_path=sources[0].path,
+            clip_start=0.0,
+            duration=analysis.duration,
+            effect="none",
+            energy_class="mid",
+            transition="none" if transition_mode == 1 else "fade",
+        )
+        segments_tmp = [seg]
+        center_time = max(0.0, analysis.duration * 0.5)
+        label = _section_label_at(center_time)
+        _apply_slow_motion(segments_tmp, [center_time], [label])
+        return segments_tmp
+
+    def energy_class(time_t: float) -> str:
+        for s in analysis.sections:
+            if s.start <= time_t < s.end:
+                if s.kind in ("chorus", "drop"):
+                    return "high"
+                if s.kind in ("intro", "break"):
+                    return "low"
+                return "mid"
+        return "mid"
+
+    # Beat intervals
+    # We build intervals between consecutive beats (plus a tail segment up to the
+    # end of the track), then group those intervals into base segments according
+    # to beats_per_segment. For each grouped segment we also track how many beats
+    # it spans so we can detect "calm" regions (large gaps between beats).
+    intervals = []
+    for i in range(len(beats) - 1):
+        t0 = beats[i].time
+        t1 = beats[i + 1].time
+        if t1 > t0:
+            intervals.append((t0, t1))
+    if beats[-1].time < analysis.duration:
+        intervals.append((beats[-1].time, analysis.duration))
+
+    grouped = []  # list of (start_time, end_time, beat_count)
+    cur_start = None
+    cur_count = 0
+    for (t0, t1) in intervals:
+        if cur_start is None:
+            cur_start = t0
+            cur_count = 1
+        else:
+            cur_count += 1
+        if cur_count >= max(1, beats_per_segment):
+            grouped.append((cur_start, t1, cur_count))
+            cur_start = None
+            cur_count = 0
+    if cur_start is not None:
+        # Tail segment that didn't reach beats_per_segment; still keep its count.
+        grouped.append((cur_start, analysis.duration, max(1, cur_count)))
+
+    num_sources = len(sources)
+    last_source_idx: Optional[int] = None
+    shuffle_pool = list(range(num_sources))
+    random.shuffle(shuffle_pool)
+    shuffle_pos = 0
+    clip_offsets = {i: 0.0 for i in range(num_sources)}
+    section_overrides = section_overrides or {}
+    section_override_offsets: Dict[int, float] = {}
+
+    def _pick_source_index() -> int:
+        nonlocal last_source_idx, shuffle_pool, shuffle_pos
+        if num_sources == 1:
+            idx = 0
+        elif clip_order_mode == 1:  # sequential
+            if last_source_idx is None:
+                idx = 0
+            else:
+                idx = (last_source_idx + 1) % num_sources
+        elif clip_order_mode == 2:  # shuffle, no repeats until all used
+            if shuffle_pos >= len(shuffle_pool):
+                shuffle_pool = list(range(num_sources))
+                random.shuffle(shuffle_pool)
+                shuffle_pos = 0
+            idx = shuffle_pool[shuffle_pos]
+            shuffle_pos += 1
+        else:  # 0 = random (no immediate repeat if possible)
+            candidates = list(range(num_sources))
+            if last_source_idx is not None and num_sources > 1:
+                try:
+                    candidates.remove(last_source_idx)
+                except ValueError:
+                    pass
+            idx = random.choice(candidates)
+        last_source_idx = idx
+        return idx
+
+    def pick_region(length: float) -> Tuple[str, float]:
+        idx = _pick_source_index()
+        src = sources[idx]
+        offset = clip_offsets.get(idx, 0.0)
+        if offset + length > src.duration:
+            offset = 0.0
+        start = offset
+        clip_offsets[idx] = offset + length
+        return src.path, max(0.0, start)
+
+    segments: List[TimelineSegment] = []
+
+    # Smart energy-aware pacing:
+    # In calm regions (few / widely spaced beats or low-energy sections),
+    # we prefer longer shots so the video can breathe instead of cutting
+    # every beat. In active regions we keep the existing microclip logic.
+    CALM_GAP_THRESHOLD = 1.4   # seconds between beats to consider section "calm"
+    CALM_MIN_LEN = 3.0         # preferred minimum length for calm shots
+    CALM_MAX_LEN = 7.0         # preferred maximum length for calm shots
+
+    previous_was_calm = False
+
+    # Track segment centers and section labels for slow-motion targeting
+    segment_centers: List[float] = []
+    segment_labels: List[str] = []
+
+    for (t0, t1, beat_count) in grouped:
+        dur = max(0.35, t1 - t0)
+        center = 0.5 * (t0 + t1)
+        energy = energy_class(center)
+        section_label = _section_label_at(center)
+
+        # Average spacing between beats in this segment (proxy for beat density)
+        avg_gap = dur / max(1, beat_count)
+        is_calm = (avg_gap >= CALM_GAP_THRESHOLD) or (energy == "low")
+        just_after_calm = (not is_calm) and previous_was_calm
+
+        # Base segment length
+        if is_calm:
+            # Calm / break-like section: use longer, more relaxed shots.
+            if dur <= CALM_MIN_LEN:
+                seg_len = dur
+            else:
+                max_len = min(CALM_MAX_LEN, dur)
+                seg_len = random.uniform(CALM_MIN_LEN, max_len)
+        elif just_after_calm:
+            # First segment right after a calm/break: emphasise the beat
+            # by forcing a short accent shot so the new beat is noticeable.
+            if dur <= 1.0:
+                seg_len = dur
+            else:
+                seg_len = max(0.3, min(1.0, dur, random.uniform(0.4, 1.0)))
+        else:
+            # Microclip logic for active sections.
+            if microclip_mode == 0:
+                seg_len = min(dur, 4.0)
+            elif microclip_mode == 1:
+                if energy == "high":
+                    seg_len = max(0.3, min(0.8, dur, random.uniform(0.3, 0.8)))
+                else:
+                    seg_len = min(dur, 4.0)
+            elif microclip_mode == 2:
+                if energy == "high":
+                    base_min, base_max = 0.25, 0.7
+                elif energy == "mid":
+                    base_min, base_max = 0.4, 1.0
+                else:
+                    base_min, base_max = 0.6, 1.3
+                seg_len = max(
+                    base_min,
+                    min(base_max, dur, random.uniform(base_min, base_max)),
+                )
+            else:
+                # Verses only: microclips are used only during verse sections.
+                if section_label == "verse":
+                    if energy == "high":
+                        base_min, base_max = 0.25, 0.7
+                    elif energy == "mid":
+                        base_min, base_max = 0.4, 1.0
+                    else:
+                        base_min, base_max = 0.6, 1.3
+                    seg_len = max(
+                        base_min,
+                        min(base_max, dur, random.uniform(base_min, base_max)),
+                    )
+                else:
+                    seg_len = min(dur, 4.0)
+
+        # Safety: never exceed the beat-group window duration.
+        seg_len = min(seg_len, dur)
+
+        use_image = False
+
+        # Prefer explicit per-section media overrides when present.
+        sec_idx = _section_index_at(center)
+        override_src: Optional[ClipSource] = None
+        if section_overrides and sec_idx is not None:
+            override_src = section_overrides.get(sec_idx)
+
+        if override_src is not None:
+            if bool(getattr(override_src, "is_image", False)):
+                # For still images, always use the full frame.
+                clip_path = override_src.path
+                clip_start = 0.0
+                use_image = True
+            else:
+                # For override videos, walk through the file across segments.
+                total = float(getattr(override_src, "duration", 0.0) or 0.0)
+                offset = section_override_offsets.get(sec_idx, 0.0)
+                if total > 0.0 and offset + seg_len > total:
+                    offset = 0.0
+                clip_path = override_src.path
+                clip_start = max(0.0, offset)
+                section_override_offsets[sec_idx] = offset + seg_len
+        elif image_sources:
+            # Occasionally pick a random image (15%% chance) when no override
+            # is assigned for this section.
+            if random.random() < 0.15:
+                source = random.choice(image_sources)
+                clip_path = source.path
+                clip_start = 0.0  # Images have no "start" in file
+                use_image = True
+            else:
+                clip_path, clip_start = pick_region(seg_len)
+        else:
+            clip_path, clip_start = pick_region(seg_len)
+
+        previous_was_calm = is_calm
+
+        # FX selection by level and energy
+        # Now supports a small library of segment FX:
+        #   - zoom        : gentle punch-in
+        #   - flash       : small brightness pop
+        #   - rgb_split   : chromatic aberration
+        #   - vhs         : VHS-style noise + scanlines
+        #   - motion_blur : mild global blend
+        effect = "none"
+        r = random.random()
+
+        if fx_level == "minimal":
+            # Very subtle: only occasional zoom on strong peaks
+            if energy == "high" and r < 0.18:
+                effect = "zoom"
+
+        elif fx_level == "moderate":
+            if energy == "high":
+                if r < 0.25:
+                    effect = "zoom"
+                elif r < 0.45:
+                    effect = "flash"
+                elif r < 0.65:
+                    effect = "rgb_split"
+                elif r < 0.78:
+                    effect = "vhs"
+                elif r < 0.90:
+                    effect = "motion_blur"
+            elif energy == "mid":
+                if r < 0.20:
+                    effect = random.choice(["zoom", "rgb_split"])
+
+        elif fx_level == "high":  # high
+            if energy == "high":
+                if r < 0.25:
+                    effect = "zoom"
+                elif r < 0.25:
+                    effect = "flash"
+                elif r < 0.65:
+                    effect = "rgb_split"
+                elif r < 0.80:
+                    effect = "vhs"
+                else:
+                    effect = "motion_blur"
+            elif energy == "mid":
+                if r < 0.30:
+                    effect = random.choice(["zoom", "rgb_split", "flash"])
+                elif r < 0.45:
+                    effect = "vhs"
+                elif r < 0.60:
+                    effect = "motion_blur"
+            else:
+                if r < 0.22:
+                    effect = random.choice(["zoom", "rgb_split"])
+
+        # Transition choice (fade-safe, using a small transition effect library)
+        if transition_random and allowed_modes:
+            mode_for_segment = random.choice(allowed_modes)
+        else:
+            mode_for_segment = transition_mode
+
+        # 0 = Slide   -> currently behaves like a gentle cut (no extra filter)
+        # 1 = Hard cuts
+        # 2 = Mixed   -> mix of white flash + cuts
+        # 3 = Creative mix -> mix of color flashes + subtle whip pans + cuts
+        # 4 = Zoom pulse / scale pulse (legacy)
+        # 5 = RGB split / chromatic aberration (legacy)
+        # 6 = VHS noise + scanlines (legacy)
+        # 7 = Motion blur boost (legacy)
+        if mode_for_segment == 1:  # Hard cuts
+            transition = "none"
+        elif mode_for_segment == 2:  # Mixed (white flash + cuts)
+            if energy == "high" and random.random() < 0.5:
+                transition = "flashcut"      # white flash
+            else:
+                transition = "none"
+        elif mode_for_segment == 3:  # Creative mix (color flashes + subtle whip)
+            if energy == "high":
+                # On strong peaks, alternate between color flash and whip-like motion
+                if random.random() < 0.6:
+                    transition = "flashcolor"
+                else:
+                    transition = "whip"
+            elif energy == "mid":
+                r = random.random()
+                if r < 0.3:
+                    transition = "flashcolor"
+                elif r < 0.5:
+                    transition = "whip"
+                else:
+                    transition = "none"
+            else:
+                transition = "none"
+        elif mode_for_segment == 4:  # Zoom pulse / scale pulse
+            transition = "t_zoom_pulse"
+        elif mode_for_segment == 5:  # RGB split / chromatic aberration
+            transition = "t_rgb_split"
+        elif mode_for_segment == 6:  # VHS noise + scanlines
+            transition = "t_vhs"
+        elif mode_for_segment == 7:  # Motion blur boost
+            transition = "t_motion_blur"
+        else:  # 0 = Slide (soft cut for now)
+            transition = "none"
+        segments.append(
+            TimelineSegment(
+                clip_path=clip_path,
+                clip_start=clip_start,
+                duration=seg_len,
+                effect=effect,
+                energy_class=energy,
+                transition=transition,
+                is_image=use_image,
+            )
+        )
+        # Track center time and section label for slow-motion logic
+        segment_centers.append(center)
+        segment_labels.append(section_label)
+
+
+    # Apply slow-motion decisions on built segments
+    _apply_slow_motion(segments, segment_centers, segment_labels)
+
+    # Rebuild timeline positions so slow-motion segments
+    # take up more room on the musical timeline.
+    _rebuild_timeline_positions(segments)
+
+
+
+    # REAL DROP DETECTION – THE ONE THAT ACTUALLY FEELS PERFECT
+    # For each detected 'break' section, look ahead a few seconds and find the
+    # strongest major beat that follows. The segment that actually *contains*
+    # that beat becomes the break-impact moment, and its FX strength scales
+    # with the beat power so hard drops feel noticeably bigger.
+    if impact_enable and analysis.sections and analysis.beats and segments:
+        break_sections = [s for s in analysis.sections if s.kind == "break"]
+
+        for break_sec in break_sections:
+            window_start = break_sec.end
+            window_end = min(analysis.duration, window_start + 6.0)  # look up to 6 seconds after break
+
+            # Get all major beats in this window
+            candidates = [
+                b for b in analysis.beats
+                if window_start <= b.time < window_end and b.kind == "major"
+            ]
+
+            if not candidates:
+                continue
+
+            # THIS IS THE MAGIC LINE
+            strongest_beat = max(candidates, key=lambda b: b.strength)
+
+            # Find the segment that contains this absolute god-tier beat
+            for seg in segments:
+                if seg.timeline_start <= strongest_beat.time < seg.timeline_end:
+                    seg.is_break_impact = True
+
+                    # Optional: make the impact strength follow the actual beat power
+                    power = min(1.0, strongest_beat.strength * 1.8)  # your strength is ~0.3–1.0
+
+                    if impact_flash:
+                        seg.impact_flash_strength = max(seg.impact_flash_strength, power * 1.0)
+                    if impact_shock:
+                        seg.impact_shock_strength = max(seg.impact_shock_strength, power * 0.9)
+                    if impact_zoom:
+                        seg.impact_zoom_amount = max(seg.impact_zoom_amount, power * 0.4)
+                    if impact_shake:
+                        seg.impact_shake_strength = max(seg.impact_shake_strength, power * 0.8)
+                    if impact_confetti:
+                        seg.impact_confetti_density = max(seg.impact_confetti_density, power * 0.7)
+                    break
+
+    # Extra: ensure the main drop (loudest beat inside any 'drop' section)
+    # is always tagged as an impact segment based on its true beat strength.
+    if impact_enable and analysis.sections and analysis.beats:
+        drop_ranges = [(s.start, s.end) for s in analysis.sections if s.kind == "drop"]
+        if drop_ranges:
+            drop_beats: List[Beat] = []
+            for b in analysis.beats:
+                for start_t, end_t in drop_ranges:
+                    if start_t <= b.time < end_t:
+                        drop_beats.append(b)
+                        break
+            if drop_beats:
+                chosen_beat = max(drop_beats, key=lambda b: b.strength)
+                intensity = min(1.0, chosen_beat.strength * 2.0)
+                for seg in segments:
+                    if seg.timeline_start <= chosen_beat.time < seg.timeline_end:
+                        seg.is_break_impact = True
+                        # Optionally boost the effect strength based on how hard the beat actually is.
+                        if impact_flash:
+                            seg.impact_flash_strength = max(seg.impact_flash_strength, intensity * 1.0)
+                        if impact_zoom:
+                            seg.impact_zoom_amount = max(seg.impact_zoom_amount, intensity * 0.3)
+                        if impact_shake:
+                            seg.impact_shake_strength = max(seg.impact_shake_strength, intensity * 0.8)
+                        break
+
+    # Optionally extend timeline so total video duration matches full music length
+    if force_full_length and segments:
+        total_video = sum(seg.duration for seg in segments)
+        target = analysis.duration
+        if audio_duration is not None and audio_duration > 0:
+            try:
+                target = max(target, float(audio_duration))
+            except Exception:
+                pass
+        # Only extend (never shrink); allow a small tolerance before extending.
+        if total_video < target * 0.998 and target > 0:
+            remaining = target - total_video
+            # Use a conservative average length for filler segments
+            avg_len = max(0.5, min(2.5, total_video / len(segments)))
+            def _make_filler_segment(start_fraction: float, length: float) -> TimelineSegment:
+                # Clamp logical time to the track duration
+                t_center = target * min(max(start_fraction, 0.0), 1.0)
+                energy = energy_class(t_center)
+                clip_path, clip_start = pick_region(length)
+                # Use similar transition logic for fillers, but a bit softer
+                if transition_random and allowed_modes:
+                    mode_for_segment = random.choice(allowed_modes)
+                else:
+                    mode_for_segment = transition_mode
+
+                if mode_for_segment == 1:
+                    transition = "none"
+                elif mode_for_segment == 2:
+                    if energy == "high" and random.random() < 0.4:
+                        transition = "flashcut"
+                    else:
+                        transition = "none"
+                elif mode_for_segment == 3:
+                    if energy == "high" and random.random() < 0.4:
+                        transition = "flashcolor"
+                    elif energy == "mid" and random.random() < 0.2:
+                        transition = random.choice(["flashcolor", "whip"])
+                    else:
+                        transition = "none"
+                else:
+                    transition = "none"
+                seg = TimelineSegment(
+                    clip_path=clip_path,
+                    clip_start=clip_start,
+                    duration=length,
+                    effect="none",
+                    energy_class=energy,
+                    transition=transition,
+                )
+                # Track filler center time and label as well
+                segment_centers.append(t_center)
+                segment_labels.append(_section_label_at(t_center))
+                return seg
+
+            # Add filler segments towards the end of the track until we cover the gap
+            while remaining > 0.05:
+                seg_len = min(avg_len, remaining)
+                start_frac = (target - remaining + seg_len * 0.5) / target
+                filler = _make_filler_segment(start_frac, seg_len)
+                segments.append(filler)
+                remaining -= seg_len
+
+    # Final pass: also rebuild after any optional extension so filler
+    # segments receive proper timeline_start / timeline_end values.
+    _rebuild_timeline_positions(segments)
+
+    # After extension, apply cinematic and break-impact FX across the
+    # full timeline so late filler segments also get hits. We then
+    # rebuild positions again before constructing the calm outro, so
+    # the last few seconds can still avoid hard cuts.
+    if segments:
+        segment_centers_final: List[float] = []
+        for seg in segments:
+            start_t = float(getattr(seg, 'timeline_start', 0.0) or 0.0)
+            end_t = float(getattr(seg, 'timeline_end', 0.0) or 0.0)
+            center_t = start_t + max(0.0, (end_t - start_t)) * 0.5
+            segment_centers_final.append(center_t)
+
+        _apply_cinematic_effects(segments)
+        _apply_break_impact_fx(segments, segment_centers_final)
+        _rebuild_timeline_positions(segments)
+
+    # --- CINEMATIC OUTRO: reserve the final few seconds for 1–2 calm shots ---
+    OUTRO_DURATION = 8.0
+
+    # Prefer an explicit audio duration when available, otherwise fall back to
+    # the analysed track length.
+    track_len = None
+    try:
+        if audio_duration is not None and float(audio_duration) > 0.0:
+            track_len = float(audio_duration)
+        else:
+            track_len = float(analysis.duration)
+    except Exception:
+        track_len = None
+
+    if segments and track_len is not None and track_len > 10.0:
+        # We want the last ~OUTRO_DURATION seconds to be a calm outro.
+        target_outro_start = max(0.0, track_len - OUTRO_DURATION)
+
+        # Keep all segments that clearly end before the planned outro window.
+        main_segments: List[TimelineSegment] = []
+        for seg in segments:
+            if getattr(seg, "timeline_end", 0.0) <= target_outro_start:
+                main_segments.append(seg)
+            else:
+                break
+
+        if main_segments:
+            # Remaining logical time we want to cover with the outro.
+            outro_start_time = getattr(main_segments[-1], "timeline_end", 0.0)
+            remaining = max(0.5, track_len - outro_start_time)
+
+            # Pick the longest (or two longest) clips that can reasonably cover the outro.
+            eligible = [s for s in sources if s.duration >= remaining * 0.7]
+            if eligible:
+                k = min(8, len(eligible))
+                candidates = random.sample(eligible, k=k)
+            else:
+                candidates = sorted(sources, key=lambda s: s.duration, reverse=True)[:8]
+            if not candidates:
+                candidates = sorted(sources, key=lambda s: s.duration, reverse=True)[:2]
+
+            outro_segments: List[TimelineSegment] = []
+            time_left = remaining
+            for clip in candidates:
+                if time_left <= 0.0:
+                    break
+                seg_dur = min(clip.duration, time_left)
+                if seg_dur < 2.0:
+                    continue
+
+                seg = TimelineSegment(
+                    clip_path=clip.path,
+                    clip_start=0.0,
+                    duration=seg_dur,
+                    effect="minimal",
+                    energy_class="low",
+                    transition="fade",
+                    slow_factor=0.85,   # gentle slow‑mo
+                    cine_speed_ramp=True,
+                    cine_ramp_out=0.15,
+                )
+                outro_segments.append(seg)
+                time_left -= seg_dur
+
+            if outro_segments:
+                # Adjust the final outro segment so that, after slow‑motion is applied,
+                # the overall logical length is close to the track length.
+                def _effective_len(seg: TimelineSegment) -> float:
+                    try:
+                        sf = float(getattr(seg, "slow_factor", 1.0) or 1.0)
+                    except Exception:
+                        sf = 1.0
+                    base = float(getattr(seg, "duration", 0.0))
+                    if 0.01 < sf < 1.0 and base > 0.0:
+                        return base / sf
+                    return base
+
+                combined = main_segments + outro_segments
+                total_eff = sum(_effective_len(s) for s in combined)
+                if total_eff > 0.0:
+                    last = outro_segments[-1]
+                    last_eff = _effective_len(last)
+                    delta = track_len - total_eff
+                    # Convert the desired change in effective length back to base duration.
+                    try:
+                        sf_last = float(getattr(last, "slow_factor", 1.0) or 1.0)
+                    except Exception:
+                        sf_last = 1.0
+                    adjust = delta * (sf_last if sf_last < 1.0 else 1.0)
+                    if last.duration + adjust > 0.2:
+                        last.duration += adjust
+
+                segments = main_segments + outro_segments
+
+                # Rebuild positions one more time so the new outro snaps cleanly
+                # to the end of the track.
+                _rebuild_timeline_positions(segments)
+
+    return segments
+
+
+# ---------------------------- render worker --------------------------------
+
+
+
+class SourceScanWorker(QThread):
+    progress = Signal(int, str)
+    finished_ok = Signal(list)
+    failed = Signal(str)
+
+    def __init__(
+        self,
+        video_input: str,
+        ffprobe: str,
+        min_clip_length: float | None = None,
+        parent=None,
+    ) -> None:
+        super().__init__(parent)
+        self.video_input = video_input
+        self.ffprobe = ffprobe
+        self.min_clip_length = min_clip_length
+
+    def run(self) -> None:
+        """Scan video sources in a background thread with caching + progress.
+
+        This worker mirrors discover_video_sources() but:
+        - Emits incremental progress updates so the UI can show scan status.
+        - Caches per‑file durations under the app's temp directory so
+          repeated scans of the same folder are much faster.
+        """
+        try:
+            exts = {".mp4", ".mov", ".mkv", ".avi", ".webm", ".mpg", ".mpeg"}
+
+            video_input = self.video_input
+            ffprobe = self.ffprobe
+
+            # Build list of candidate files (single file, folder, or '|' list).
+            paths: list[str] = []
+            if "|" in video_input:
+                parts = [p.strip() for p in str(video_input).split("|") if p.strip()]
+                for raw in parts:
+                    path = os.path.abspath(raw)
+                    if not os.path.isfile(path):
+                        continue
+                    _, ext = os.path.splitext(path)
+                    if ext.lower() not in exts:
+                        continue
+                    paths.append(path)
+            else:
+                base = os.path.abspath(video_input)
+                if os.path.isdir(base):
+                    try:
+                        names = sorted(os.listdir(base))
+                    except Exception:
+                        names = []
+                    for name in names:
+                        path = os.path.join(base, name)
+                        if not os.path.isfile(path):
+                            continue
+                        _, ext = os.path.splitext(path)
+                        if ext.lower() not in exts:
+                            continue
+                        paths.append(path)
+                elif os.path.isfile(base):
+                    _, ext = os.path.splitext(base)
+                    if ext.lower() in exts:
+                        paths.append(base)
+
+            if not paths:
+                self.failed.emit("__no_clips__")
+                return
+
+            # Cache disabled: do not read or write scan_cache.json; always probe durations fresh.
+            cache: dict[str, dict] = {}
+            cache_file: str | None = None
+            dirty = False
+
+            sources: list[ClipSource] = []
+            total = len(paths)
+
+            for idx, path in enumerate(paths):
+                try:
+                    st = os.stat(path)
+                    key = os.path.abspath(path)
+                    entry = cache.get(key) if isinstance(cache, dict) else None
+                    dur: float | None = None
+
+                    if isinstance(entry, dict):
+                        try:
+                            if (
+                                entry.get("mtime") == st.st_mtime
+                                and entry.get("size") == st.st_size
+                            ):
+                                d_val = float(entry.get("duration", 0.0) or 0.0)
+                                if d_val > 0.0:
+                                    dur = d_val
+                        except Exception:
+                            dur = None
+
+                    if dur is None:
+                        dur = _ffprobe_duration(ffprobe, path)
+                        if dur and dur > 0:
+                            if isinstance(cache, dict):
+                                cache[key] = {
+                                    "duration": float(dur),
+                                    "mtime": st.st_mtime,
+                                    "size": st.st_size,
+                                }
+                                dirty = True
+
+                    if dur and dur > 0:
+                        sources.append(ClipSource(path=path, duration=float(dur)))
+                except Exception:
+                    # Ignore individual file failures; we only care about usable clips.
+                    pass
+
+                # Update scan progress (0–10%% reserved for scanning).
+                try:
+                    pct = int(1 + 9 * ((idx + 1) / max(1, total)))
+                    self.progress.emit(pct, f"Scanning clips {idx+1}/{total}...")
+                except Exception:
+                    pass
+
+            if not sources:
+                self.failed.emit("__no_clips__")
+                return
+
+            # Apply optional minimum clip length filter.
+            if self.min_clip_length is not None and self.min_clip_length > 0:
+                usable = [s for s in sources if s.duration >= self.min_clip_length]
+                if not usable:
+                    # Signal a specific "all too short" condition back to the UI.
+                    self.failed.emit(f"__all_short__:{self.min_clip_length:.1f}")
+                    return
+                sources = usable
+
+            # Cache persistence disabled: no scan_cache.json will be written.
+            # if dirty and cache_file and isinstance(cache, dict):
+            #     try:
+            #         with open(cache_file, "w", encoding="utf-8") as f:
+            #             json.dump(cache, f)
+            #     except Exception:
+            #         # Cache write failure is non-fatal.
+            #         pass
+
+            self.finished_ok.emit(sources)
+        except Exception as e:
+            self.failed.emit(str(e))
+
+
+class RenderWorker(QThread):
+    progress = Signal(int, str)
+    finished_ok = Signal(str)
+    failed = Signal(str)
+
+    def __init__(
+        self,
+        audio_path: str,
+        output_dir: str,
+        analysis: MusicAnalysisResult,
+        segments: List[TimelineSegment],
+        ffmpeg: str,
+        ffprobe: str,
+        target_resolution: Optional[Tuple[int, int]],
+        fit_mode: int,
+        transition_mode: int,
+        intro_fade: bool,
+        outro_fade: bool,
+        use_visual_overlay: bool = False,
+        visual_strategy: int = 0,
+        visual_section_overrides: Optional[Dict[str, Optional[str]]] = None,
+        visual_overlay_opacity: float = 0.25,
+        parent=None,
+    ) -> None:
+        super().__init__(parent)
+        self.audio_path = audio_path
+        self.output_dir = output_dir
+        self.analysis = analysis
+        self.segments = segments
+        self.ffmpeg = ffmpeg
+        self.ffprobe = ffprobe
+        self.target_resolution = target_resolution
+        self.fit_mode = fit_mode
+        self.transition_mode = transition_mode
+        self.intro_fade = intro_fade
+        self.outro_fade = outro_fade
+        # When True, render a music-player visual track and overlay it.
+        self.use_visual_overlay = bool(use_visual_overlay)
+        # 0 = single visual, 1 = per segment, 2 = per section type
+        try:
+            self.visual_strategy = int(visual_strategy)
+        except Exception:
+            self.visual_strategy = 0
+        self.visual_section_overrides = visual_section_overrides or {}
+        try:
+            self.visual_overlay_opacity = float(visual_overlay_opacity)
+        except Exception:
+            self.visual_overlay_opacity = 0.25
+
+
+    def run(self) -> None:
+        try:
+            self._run_impl()
+        except Exception as e:
+            self.failed.emit(str(e))
+
+    def _run_impl(self) -> None:
+        if not self.segments:
+            raise RuntimeError("Timeline is empty.")
+
+        _ensure_dir(self.output_dir)
+        tmpdir = tempfile.mkdtemp(prefix="fv_mclip_render_")
+
+        try:
+            # Collect all available video source paths once for Mosaic effects.
+            all_video_paths = sorted(
+                {
+                    getattr(s, "clip_path", None)
+                    for s in self.segments
+                    if getattr(s, "clip_path", None)
+                    and not getattr(s, "is_image", False)
+                }
+            )
+            duration_cache: dict[str, float] = {}
+
+            parts = []
+            n = len(self.segments)
+            for i, seg in enumerate(self.segments):
+                pct = int(5 + 80 * (i / max(1, n)))
+                self.progress.emit(pct, f"Rendering segment {i+1}/{n}...")
+                out_part = os.path.join(tmpdir, f"part_{i:04d}.mp4")
+
+                vf_parts: List[str] = []
+                base_vf_parts: List[str] = []
+
+                if self.target_resolution is not None:
+                    w, h = self.target_resolution
+                    try:
+                        fit_mode = int(getattr(self, "fit_mode", 0))
+                    except Exception:
+                        fit_mode = 0
+
+                    if fit_mode == 1:  # Fill (crop to fill)
+                        base_vf_parts = [
+                            f"scale={w}:{h}:force_original_aspect_ratio=increase",
+                            f"crop={w}:{h}",
+                        ]
+                    elif fit_mode == 2:  # Stretch (distort to fill)
+                        base_vf_parts = [
+                            f"scale={w}:{h}",
+                        ]
+                    else:  # Original (letterbox / pillarbox)
+                        base_vf_parts = [
+                            f"scale={w}:{h}:force_original_aspect_ratio=decrease",
+                            f"pad={w}:{h}:(ow-iw)/2:(oh-ih)/2:black",
+                        ]
+                    vf_parts.extend(base_vf_parts)
+
+                # Ken Burns zoom for images
+                if getattr(seg, "is_image", False) and self.target_resolution is not None:
+                    try:
+                        w, h = self.target_resolution
+                    except Exception:
+                        w, h = 1920, 1080
+                    zoom_dir = "zoom+0.0025" if random.random() < 0.5 else "zoom-0.0025"
+                    vf_parts.append(f"zoompan=z='{zoom_dir}':d=75:s={w}x{h}:fps=30")  # Longer zoom duration (75 frames ~2.5s at 30fps)
+
+                # Segment-level FX (per-segment visual styles)
+                if seg.effect == "zoom":
+                    # Gentle punch-in (about 8%)
+                    vf_parts.append("scale=iw*1.08:ih*1.08,crop=iw/1.08:ih/1.08")
+                elif seg.effect == "flash":
+                    # Small global brightness lift for the whole segment
+                    vf_parts.append("eq=brightness=0.18")
+                elif seg.effect == "rgb_split":
+                    # Chromatic aberration / RGB split
+                    vf_parts.append("chromashift=u=2:v=-2")
+                elif seg.effect == "vhs":
+                    # VHS noise + scanlines (downscale + upscale with neighbor sampling)
+                    vf_parts.append("noise=alls=15:allf=t+u,scale=iw:ih/2:flags=neighbor,scale=iw:ih:flags=neighbor")
+                elif seg.effect == "motion_blur":
+                    # Mild motion blur via temporal blend
+                    vf_parts.append("tblend=all_mode=average,framestep=1")
+
+                # Cinematic one-off effects
+                if getattr(seg, "cine_freeze", False):
+                    # Full-segment freeze-frame with optional gentle zoom.
+                    zoom = float(getattr(seg, "cine_freeze_zoom", 0.0) or 0.0)
+                    if zoom > 0.0:
+                        z_expr = 1.0 + zoom
+                        vf_parts.append(f"scale=iw*{z_expr:.3f}:ih*{z_expr:.3f},crop=iw/{z_expr:.3f}:ih/{z_expr:.3f}")
+                    # Repeat a single frame; using loop keeps duration fixed to -t.
+                    vf_parts.append("loop=loop=-1:size=1:start=0")
+                if getattr(seg, "cine_stutter", False):
+                    # Stutter / triple-frame style slice: drop interim frames so motion
+                    # feels jittery. We keep duration the same, only the cadence changes.
+                    repeats = int(getattr(seg, "cine_stutter_repeats", 3) or 3)
+                    # For now we map repeats -> a simple framestep factor in a safe range.
+                    step = max(2, min(5, repeats + 1))
+                    vf_parts.append(f"framestep={step}")
+                if getattr(seg, "cine_reverse", False):
+                    # Reverse the visual segment (audio is separate so this stays safe).
+                    vf_parts.append("reverse")
+                if getattr(seg, "cine_flip", False):
+                    # Flip the frame 180° (upside-down) by combining vertical and horizontal flips.
+                    vf_parts.append("vflip,hflip")
+                if getattr(seg, "cine_rotate", False):
+                    # Apply a short rotating-screen pulse: 0° → max → 0° over the segment.
+                    try:
+                        max_deg = float(getattr(seg, "cine_rotate_degrees", 20.0) or 20.0)
+                    except Exception:
+                        max_deg = 20.0
+                    max_deg = max(5.0, min(90.0, max_deg))
+                    try:
+                        seg_dur = float(getattr(seg, "duration", 0.0) or 0.0)
+                    except Exception:
+                        seg_dur = 0.0
+                    if seg_dur <= 0.1:
+                        seg_dur = 0.1
+                    max_rad = math.radians(max_deg)
+                    # Use ffmpeg expression: angle(t) = max_rad * sin(PI * t / seg_dur)
+                    # This yields a single pulse: 0 → +max → 0 over the lifetime of the segment.
+                    vf_parts.append(f"rotate={max_rad:.6f}*sin(PI*t/{seg_dur:.3f}):c=black")
+                if getattr(seg, "cine_speed_ramp", False) and not getattr(seg, "is_image", False):
+                    # Use the configured ramp-in / ramp-out times to drive how strong
+                    # the motion blend should be. Longer ramps -> stronger smoothing.
+                    try:
+                        base_len = float(getattr(seg, "duration", 0.0) or 0.0)
+                    except Exception:
+                        base_len = 0.0
+                    try:
+                        ramp_in = float(getattr(seg, "cine_ramp_in", 0.0) or 0.0)
+                    except Exception:
+                        ramp_in = 0.0
+                    try:
+                        ramp_out = float(getattr(seg, "cine_ramp_out", 0.0) or 0.0)
+                    except Exception:
+                        ramp_out = 0.0
+
+                    ramp_span = max(0.05, ramp_in + ramp_out)
+                    if base_len > 0.0:
+                        frac = max(0.1, min(1.0, ramp_span / base_len))
+                    else:
+                        frac = 0.5
+
+                    # Map the fraction of the segment covered by ramps into
+                    # 1–3 passes of tblend: short ramps = subtle, long ramps = strong.
+                    if frac > 0.6:
+                        passes = 3
+                    elif frac > 0.3:
+                        passes = 2
+                    else:
+                        passes = 1
+
+                    ramp_filters = ",".join(["tblend=all_mode=average,framestep=1"] * passes)
+                    vf_parts.append(ramp_filters)
+
+                # Camera motion hits: dolly-zoom / Ken Burns pan/zoom
+                if getattr(seg, "cine_dolly", False) or getattr(seg, "cine_kenburns", False):
+                    # Use whichever strength is active; both are in the 0.10–1.0 range.
+                    if getattr(seg, "cine_dolly", False):
+                        base = float(getattr(seg, "cine_dolly_strength", 0.4) or 0.4)
+                    else:
+                        base = float(getattr(seg, "cine_kenburns_strength", 0.35) or 0.35)
+                    # Map to a subtle zoom amount between ~1.02x and ~1.35x.
+                    zoom_amount = 1.0 + max(0.02, min(0.35, base * 0.35))
+                    motion_dir = int(getattr(seg, "cine_motion_dir", 0) or 0)
+
+                    if motion_dir in (1, 2):
+                        # Pure zoom in/out.
+                        if motion_dir == 1:
+                            z_expr = zoom_amount
+                        else:
+                            z_expr = 1.0 / zoom_amount
+                        vf_parts.append(
+                            f"scale=iw*{z_expr:.3f}:ih*{z_expr:.3f},crop=iw/{z_expr:.3f}:ih/{z_expr:.3f}"
+                        )
+                    else:
+                        # Pan across the clip with a slight zoom (Ken Burns style).
+                        pan_zoom = zoom_amount
+                        inv = 1.0 / pan_zoom
+                        if motion_dir == 3:   # pan left
+                            x_expr = "0"
+                            y_expr = f"(ih-ih/{pan_zoom:.3f})/2"
+                        elif motion_dir == 4: # pan right
+                            x_expr = f"(iw-iw/{pan_zoom:.3f})"
+                            y_expr = f"(ih-ih/{pan_zoom:.3f})/2"
+                        elif motion_dir == 5: # pan up
+                            x_expr = f"(iw-iw/{pan_zoom:.3f})/2"
+                            y_expr = "0"
+                        elif motion_dir == 6: # pan down
+                            x_expr = f"(iw-iw/{pan_zoom:.3f})/2"
+                            y_expr = f"(ih-ih/{pan_zoom:.3f})"
+                        else:
+                            # Fallback: centred slight zoom.
+                            x_expr = f"(iw-iw/{pan_zoom:.3f})/2"
+                            y_expr = f"(ih-ih/{pan_zoom:.3f})/2"
+                        vf_parts.append(
+                            f"scale=iw*{pan_zoom:.3f}:ih*{pan_zoom:.3f},"
+                            f"crop=iw/{pan_zoom:.3f}:ih/{pan_zoom:.3f}:{x_expr}:{y_expr}"
+                        )
+
+                # Break impact FX (first beat after a break)
+                if getattr(seg, "is_break_impact", False):
+                    # Flash strobe: rapid short flashes at the very start (club strobe style).
+                    flash_s = float(getattr(seg, "impact_flash_strength", 0.0) or 0.0)
+                    if flash_s > 0.0:
+                        # Map strength (0.1–1.0) to pulse count and brightness.
+                        s = max(0.1, min(1.0, flash_s))
+                        pulses = 3 + int(3 * s)  # 3–6 pulses
+                        # Each pulse is a very short flash; gaps are the same length.
+                        pulse_len = 0.02 + 0.02 * s   # ~40–60 ms
+                        gap_len = pulse_len
+                        # Keep all strobes within the first half-second of the segment.
+                        max_window = 0.5
+                        # Translate strength to brightness lift; stays under ~0.6 to avoid a full whiteout.
+                        flash_b = 0.25 + 0.35 * s
+
+                        t0 = 0.0
+                        for _ in range(pulses):
+                            start = t0
+                            end = start + pulse_len
+                            if start >= max_window:
+                                break
+                            if end > max_window:
+                                end = max_window
+                            vf_parts.append(
+                                f"eq=brightness={flash_b:.2f}:enable='between(t,{start:.3f},{end:.3f})'"
+                            )
+                            t0 += pulse_len + gap_len
+
+                    # Shockwave burst: a brief zoom pulse with mild contrast lift.
+                    shock_s = float(getattr(seg, "impact_shock_strength", 0.0) or 0.0)
+                    if shock_s > 0.0:
+                        zoom_amt = 0.05 + 0.20 * max(0.0, min(1.0, shock_s))
+                        z_expr = 1.0 + zoom_amt
+                        vf_parts.append(
+                            f"scale=iw*{z_expr:.3f}:ih*{z_expr:.3f},crop=iw/{z_expr:.3f}:ih/{z_expr:.3f}"
+                        )
+
+                    # Confetti / fireworks style shimmer: colourful noise overlay.
+                    conf_s = float(getattr(seg, "impact_confetti_density", 0.0) or 0.0)
+                    fire_gold_s = float(getattr(seg, "impact_fire_gold_intensity", 0.0) or 0.0)
+                    fire_multi_s = float(getattr(seg, "impact_fire_multi_intensity", 0.0) or 0.0)
+                    if conf_s > 0.0 or fire_gold_s > 0.0 or fire_multi_s > 0.0:
+                        noise_level = int(10 + 50 * max(conf_s, fire_gold_s, fire_multi_s))
+                        # Gentle hue rotation at the start of the segment.
+                        hue_span = 45.0 * max(fire_multi_s, conf_s)
+                        vf_parts.append(
+                            f"noise=alls={noise_level}:allf=t+u"
+                        )
+                        if hue_span > 0.0:
+                            vf_parts.append(
+                                f"hue=h='t*{hue_span/seg.duration if seg.duration > 0 else hue_span:.2f}':s=1.1"
+                            )
+
+                    # Zoom punch-in: segment-wide punch for extra impact.
+                    zoom_s = float(getattr(seg, "impact_zoom_amount", 0.0) or 0.0)
+                    if zoom_s > 0.0:
+                        zoom_amt = max(0.02, min(0.40, zoom_s))
+                        z_expr = 1.0 + zoom_amt
+                        vf_parts.append(
+                            f"scale=iw*{z_expr:.3f}:ih*{z_expr:.3f},crop=iw/{z_expr:.3f}:ih/{z_expr:.3f}"
+                        )
+
+                    # Camera shake: tiny rotation jitter.
+                    shake_s = float(getattr(seg, "impact_shake_strength", 0.0) or 0.0)
+                    if shake_s > 0.0:
+                        # Amplitude scaled by strength; frequency is fixed so it stays readable.
+                        amp = 0.02 * max(0.2, min(1.0, shake_s))
+                        vf_parts.append(
+                            f"rotate={amp:.3f}*sin(40*PI*t):bilinear=0"
+                        )
+
+                    # Fog blast: a soft haze using brightness + a touch of noise.
+                    fog_s = float(getattr(seg, "impact_fog_density", 0.0) or 0.0)
+                    if fog_s > 0.0:
+                        fog_b = 0.15 * max(0.2, min(1.0, fog_s))
+                        fog_d = max(0.10, min(0.50, seg.duration * 0.5))
+                        vf_parts.append(
+                            f"eq=brightness={fog_b:.2f}:enable='between(t,0,{fog_d:.3f})'"
+                        )
+
+                # Transitions using a small effect library (all short and fade-safe)
+                if seg.transition == "flashcut":
+                    # White flash: short brightness pop at the start (~30–60ms).
+                    flash_d = max(0.06, min(0.06, seg.duration / 6.0))
+                    vf_parts.append(
+                        f"eq=brightness=0.45:enable='between(t,0,{flash_d:.3f})'"
+                    )
+                elif seg.transition == "flashcolor":
+                    # Colored flash: short hue-shifted flash at the start.
+                    flash_d   = max(0.4, min(1.2, seg.duration * 0.8))
+                    # Rotate hue by a fixed offset per segment index for reproducible variety.
+                    hue_shift = (i * 37) % 360  # pseudo "16-ish" cycle
+                    vf_parts.append(
+                        f"eq=brightness=0.35:enable='between(t,0,{flash_d:.3f})',"
+                        f"hue=h={hue_shift}:enable='between(t,0,{flash_d:.3f})'"
+                    )
+                elif seg.transition == "whip":
+                    # Zoom pulse / scale pulse: beat-style zoom using scale+crop.
+                    # This is a visual effect only (no fades), safe across ffmpeg builds.
+                    # Use a fixed gentle pulse period (~0.5s) since we don't have beat_period here.
+                    base_period = 0.3
+                    zoom_amount = 0.04
+                    zoom_expr = f"1+{zoom_amount}*abs(sin(2*3.14159*t/{base_period:.3f}))"
+                    vf_parts.append(
+                        f"scale=iw*({zoom_expr}):ih*({zoom_expr}):eval=frame,crop=iw:ih"
+                    )
+                elif seg.transition == "t_zoom_pulse":
+                    # Legacy zoom pulse / scale pulse from the old Auto Music Sync tool
+                    base_period = 0.5
+                    zoom_amount = 0.03
+                    zoom_expr = f"1+{zoom_amount}*abs(sin(2*3.14159*t/{base_period:.3f}))"
+                    vf_parts.append(
+                        f"scale=iw*({zoom_expr}):ih*({zoom_expr}):eval=frame,crop=iw:ih"
+                    )
+                elif seg.transition == "t_rgb_split":
+                    # Legacy RGB split / chromatic aberration transition
+                    vf_parts.append("chromashift=u=2:v=-2")
+                elif seg.transition == "t_vhs":
+                    # Legacy VHS noise + scanlines transition
+                    vf_parts.append("noise=alls=15:allf=t+u,scale=iw:ih/2:flags=neighbor,scale=iw:ih:flags=neighbor")
+                elif seg.transition == "t_motion_blur":
+                    # Legacy motion blur boost transition
+                    vf_parts.append("tblend=all_mode=average,framestep=1")
+                else:
+                    # "none" and anything else fall back to a hard cut (no extra filters here)
+                    pass
+
+                # Apply slow-motion filter if requested for this segment
+                if getattr(seg, "slow_factor", 1.0) != 1.0:
+                    try:
+                        sf = float(seg.slow_factor)
+                    except Exception:
+                        sf = 1.0
+                    if sf != 1.0:
+                        vf_parts.append(f"setpts=PTS/{sf}")
+                        if base_vf_parts:
+                            base_vf_parts = base_vf_parts + [f"setpts=PTS/{sf}"]
+
+                vf_arg = ",".join(vf_parts) if vf_parts else None
+                safe_vf_arg = ",".join(base_vf_parts) if base_vf_parts else None
+
+
+                # Base ffmpeg command for this segment (input, trim, no audio)
+                # Special-case: cinematic "boomerang" effect (short forward-back loop).
+                if getattr(seg, "cine_boomerang", False) and not getattr(seg, "is_image", False):
+                    # Use the pre-trimmed region defined by clip_start/duration,
+                    # which _apply_cinematic_effects has already clamped to the
+                    # first ~1 second of the source clip.
+                    try:
+                        seg_duration = float(getattr(seg, "duration", 0.0) or 0.0)
+                    except Exception:
+                        seg_duration = 0.0
+                    if seg_duration <= 0.0:
+                        seg_duration = 0.2
+                    try:
+                        start = float(getattr(seg, "clip_start", 0.0) or 0.0)
+                    except Exception:
+                        start = 0.0
+
+                    input_args = [
+                        "-ss",
+                        f"{start:.3f}",
+                        "-t",
+                        f"{seg_duration:.3f}",
+                        "-i",
+                        seg.clip_path,
+                    ]
+
+                    # Fallback resolution if none was requested.
+                    if self.target_resolution:
+                        target_w, target_h = self.target_resolution
+                    else:
+                        target_w, target_h = 1920, 1080
+
+                    # Number of boomerang cycles requested (1–9 from the UI).
+                    try:
+                        cycles = int(getattr(seg, "cine_boomerang_bounces", 1) or 1)
+                    except Exception:
+                        cycles = 1
+                    if cycles < 1:
+                        cycles = 1
+                    if cycles > 9:
+                        cycles = 9
+
+                    # Build a forward + reverse pair, then loop that pair
+                    # (cycles-1) extra times so higher counts produce longer
+                    # and more energetic boomerang hits.
+                    filter_graph_parts = [
+                        "[0:v]split[fwd][tmp]",
+                        "[tmp]reverse[rev]",
+                        "[fwd][rev]concat=n=2:v=1:a=0[pair]",
+                        f"[pair]loop=loop={max(0, cycles-1)}:size=0:start=0[boom]",
+                        f"[boom]fps=fps=30,scale={target_w}:{target_h}:force_original_aspect_ratio=decrease,"
+                        f"pad={target_w}:{target_h}:(ow-iw)/2:(oh-ih)/2:black[vout]",
+                    ]
+                    filter_complex = ";".join(filter_graph_parts)
+
+                    cmd = [
+                        self.ffmpeg,
+                        "-y",
+                        *input_args,
+                        "-an",
+                        "-filter_complex",
+                        filter_complex,
+                        "-map",
+                        "[vout]",
+                        "-c:v",
+                        "h264_nvenc",
+                        "-preset",
+                        "p2",
+                        "-rc",
+                        "vbr_hq",
+                        "-cq",
+                        "19",
+                        "-b:v",
+                        "0",
+                        "-r",
+                        "30",
+                        out_part,
+                    ]
+                    code, out = _run_ffmpeg(cmd)
+                    if code != 0 or not os.path.exists(out_part):
+                        raise RuntimeError(f"ffmpeg failed for boomerang segment {i+1}:\n{out}")
+                    parts.append(out_part)
+                    continue
+
+                # Multiply cinematic effect: same clip in a grid of multiple tiles.
+                if getattr(seg, "cine_multiply", False) and getattr(seg, "clip_path", None) and not getattr(seg, "is_image", False):
+                    # Number of screens requested (clamped 2–9).
+                    try:
+                        screens = int(getattr(seg, "cine_multiply_screens", 4))
+                    except Exception:
+                        screens = 4
+                    screens = max(2, min(9, screens))
+
+                    path = getattr(seg, "clip_path")
+                    # Target resolution for the grid (fall back to 1920x1080 if not specified).
+                    if self.target_resolution:
+                        target_w, target_h = self.target_resolution
+                    else:
+                        target_w, target_h = 1920, 1080
+
+                    # Compute a deterministic (cols, rows) layout that fully covers the frame.
+                    cols, rows = _cine_grid_dims(screens)
+                    tile_w = max(1, target_w // cols)
+                    tile_h = max(1, target_h // rows)
+
+                    # Build input list with per-tile seek & duration, using cached durations.
+                    seg_duration = float(getattr(seg, "duration", 0.0)) or 1.0
+                    input_args = []
+                    valid_inputs = 0
+                    for idx_m in range(screens):
+                        dur = duration_cache.get(path)
+                        if dur is None:
+                            dur = _ffprobe_duration(self.ffprobe, path)
+                            if dur is None or dur <= 0.0:
+                                break
+                            duration_cache[path] = dur
+                        max_start = max(0.0, dur - seg_duration)
+                        start = random.uniform(0.0, max_start) if max_start > 0 else 0.0
+                        input_args.extend(
+                            [
+                                "-ss",
+                                f"{start:.3f}",
+                                "-t",
+                                f"{seg_duration:.3f}",
+                                "-i",
+                                path,
+                            ]
+                        )
+                        valid_inputs += 1
+
+                    if valid_inputs > 0:
+                        # Build filter_complex: scale/pad each tile, stack with xstack, then fit to target.
+                        per_inputs = []
+                        layout_entries = []
+                        for idx_m in range(valid_inputs):
+                            per_inputs.append(
+                                f"[{idx_m}:v]scale={tile_w}:{tile_h}:force_original_aspect_ratio=decrease,"
+                                f"pad={tile_w}:{tile_h}:(ow-iw)/2:(oh-ih)/2:black[v{idx_m}]"
+                            )
+                            row = idx_m // cols
+                            col = idx_m % cols
+                            layout_entries.append(f"{col * tile_w}_{row * tile_h}")
+
+                        xstack = (
+                            "".join(f"[v{idx_m}]" for idx_m in range(valid_inputs))
+                            + f"xstack=inputs={valid_inputs}:layout="
+                            + "|".join(layout_entries)
+                            + ":fill=black[vs]"
+                        )
+
+                        # Optional slow-motion factor: keep behaviour consistent with other segments.
+                        slow_factor = float(getattr(seg, "slow_factor", 1.0) or 1.0)
+                        if slow_factor != 1.0:
+                            final = (
+                                f"[vs]setpts=PTS/{slow_factor},fps=fps=30,"
+                                f"scale={target_w}:{target_h}:force_original_aspect_ratio=decrease,"
+                                f"pad={target_w}:{target_h}:(ow-iw)/2:(oh-ih)/2:black[vout]"
+                            )
+                        else:
+                            final = (
+                                f"[vs]fps=fps=30,scale={target_w}:{target_h}:force_original_aspect_ratio=decrease,"
+                                f"pad={target_w}:{target_h}:(ow-iw)/2:(oh-ih)/2:black[vout]"
+                            )
+
+                        filter_complex = ";".join(per_inputs + [xstack, final])
+
+                        out_part = os.path.join(tmpdir, f"part_{i:04d}.mp4")
+                        cmd = [
+                            self.ffmpeg,
+                            "-y",
+                            *input_args,
+                            "-an",
+                            "-filter_complex",
+                            filter_complex,
+                            "-map",
+                            "[vout]",
+                            "-c:v",
+                            "h264_nvenc",
+                            "-preset",
+                            "fast",
+                            "-pix_fmt",
+                            "yuv420p",
+                            out_part,
+                        ]
+                        code, out = _run_ffmpeg(cmd)
+                        if code != 0 or not os.path.exists(out_part):
+                            raise RuntimeError(f"ffmpeg failed for multiply segment {i+1}:\n{out}")
+                        parts.append(out_part)
+                        continue
+                
+                # Mosaic cinematic effect: replace this segment with a grid of multiple clips.
+                if getattr(seg, "cine_mosaic", False):
+                    # Number of screens requested (clamped 2–9).
+                    try:
+                        screens = int(getattr(seg, "cine_mosaic_screens", 4))
+                    except Exception:
+                        screens = 4
+                    screens = max(2, min(9, screens))
+
+                    if all_video_paths:
+                        # Choose random source clips for the mosaic.
+                        if len(all_video_paths) >= screens:
+                            chosen_paths = random.sample(all_video_paths, screens)
+                        else:
+                            # Sample with replacement when there are fewer unique clips than screens.
+                            chosen_paths = [random.choice(all_video_paths) for _ in range(screens)]
+
+                        # Target resolution for the grid (fall back to 1920x1080 if not specified).
+                        if self.target_resolution:
+                            target_w, target_h = self.target_resolution
+                        else:
+                            target_w, target_h = 1920, 1080
+
+                        # Compute a deterministic (cols, rows) layout that fully covers the frame.
+                        cols, rows = _cine_grid_dims(screens)
+                        tile_w = max(1, target_w // cols)
+                        tile_h = max(1, target_h // rows)
+
+                        # Build input list with per-source seek & duration, using cached durations.
+                        seg_duration = float(getattr(seg, "duration", 0.0)) or 1.0
+                        input_args = []
+                        valid_inputs = 0
+                        for path in chosen_paths:
+                            dur = duration_cache.get(path)
+                            if dur is None:
+                                dur = _ffprobe_duration(self.ffprobe, path)
+                                if dur is None or dur <= 0.0:
+                                    continue
+                                duration_cache[path] = dur
+                            max_start = max(0.0, dur - seg_duration)
+                            start = random.uniform(0.0, max_start) if max_start > 0 else 0.0
+                            input_args.extend(
+                                [
+                                    "-ss",
+                                    f"{start:.3f}",
+                                    "-t",
+                                    f"{seg_duration:.3f}",
+                                    "-i",
+                                    path,
+                                ]
+                            )
+                            valid_inputs += 1
+
+                        if valid_inputs > 0:
+                            # Build filter_complex: scale/pad each tile, stack with xstack, then fit to target.
+                            per_inputs = []
+                            layout_entries = []
+                            for idx_m in range(valid_inputs):
+                                per_inputs.append(
+                                    f"[{idx_m}:v]scale={tile_w}:{tile_h}:force_original_aspect_ratio=decrease,"
+                                    f"pad={tile_w}:{tile_h}:(ow-iw)/2:(oh-ih)/2:black[v{idx_m}]"
+                                )
+                                row = idx_m // cols
+                                col = idx_m % cols
+                                layout_entries.append(f"{col * tile_w}_{row * tile_h}")
+
+                            xstack = (
+                                "".join(f"[v{idx_m}]" for idx_m in range(valid_inputs))
+                                + f"xstack=inputs={valid_inputs}:layout="
+                                + "|".join(layout_entries)
+                                + ":fill=black[vs]"
+                            )
+
+                            # Optional slow-motion factor: keep behaviour consistent with other segments.
+                            slow_factor = float(getattr(seg, "slow_factor", 1.0) or 1.0)
+                            if slow_factor != 1.0:
+                                final = (
+                                    f"[vs]setpts=PTS/{slow_factor},fps=fps=30,"
+                                    f"scale={target_w}:{target_h}:force_original_aspect_ratio=decrease,"
+                                    f"pad={target_w}:{target_h}:(ow-iw)/2:(oh-ih)/2:black[vout]"
+                                )
+                            else:
+                                final = (
+                                    f"[vs]fps=fps=30,scale={target_w}:{target_h}:force_original_aspect_ratio=decrease,"
+                                    f"pad={target_w}:{target_h}:(ow-iw)/2:(oh-ih)/2:black[vout]"
+                                )
+
+                            filter_complex = ";".join(per_inputs + [xstack, final])
+
+                            out_part = os.path.join(tmpdir, f"part_{i:04d}.mp4")
+                            cmd = [
+                                self.ffmpeg,
+                                "-y",
+                                *input_args,
+                                "-an",
+                                "-filter_complex",
+                                filter_complex,
+                                "-map",
+                                "[vout]",
+                                "-c:v",
+                                "h264_nvenc",
+                                "-preset",
+                                "fast",
+                                "-pix_fmt",
+                                "yuv420p",
+                                out_part,
+                            ]
+                            code, out = _run_ffmpeg(cmd)
+                            if code != 0 or not os.path.exists(out_part):
+                                raise RuntimeError(f"ffmpeg failed for mosaic segment {i+1}:\n{out}")
+                            parts.append(out_part)
+                            continue
+                        # If we couldn't build a valid mosaic, fall back to standard rendering.
+
+                base_cmd = [
+                    self.ffmpeg,
+                    "-y",
+                    "-i",
+                    seg.clip_path,
+                    "-ss",
+                    f"{seg.clip_start:.3f}",
+                    "-t",
+                    f"{seg.duration:.3f}",
+                    "-an",
+                ]
+
+                # Common encoding settings
+                encode_args = [
+                    "-c:v",
+                    "h264_nvenc",
+                    "-preset",
+                    "p2",
+                    "-rc",
+                    "vbr_hq",
+                    "-cq",
+                    "19",
+                    "-b:v",
+                    "0",
+                    "-r",
+                    "30",
+                    out_part,
+                ]
+
+                # First attempt: full filter chain (resolution + FX + transitions)
+                cmd = list(base_cmd)
+                if vf_arg:
+                    cmd += ["-vf", vf_arg]
+                cmd += encode_args
+                code, out = _run_ffmpeg(cmd)
+
+                # Second attempt: only resolution scaling/padding (if any)
+                if (code != 0 or not os.path.exists(out_part)) and safe_vf_arg and safe_vf_arg != vf_arg:
+                    try:
+                        if os.path.exists(out_part):
+                            os.remove(out_part)
+                    except Exception:
+                        pass
+                    cmd = list(base_cmd)
+                    cmd += ["-vf", safe_vf_arg]
+                    cmd += encode_args
+                    code, out = _run_ffmpeg(cmd)
+
+                # Final attempt: minimal, ultra-safe scaling/padding only.
+                # We still try to honor the requested target resolution if one
+                # was set, but drop all cinematic FX/transition filters.
+                if code != 0 or not os.path.exists(out_part):
+                    try:
+                        if os.path.exists(out_part):
+                            os.remove(out_part)
+                    except Exception:
+                        pass
+
+                    cmd = list(base_cmd)
+
+                    fallback_vf = None
+                    if self.target_resolution is not None:
+                        try:
+                            tw, th = self.target_resolution
+                        except Exception:
+                            tw, th = 1920, 1080
+                        # Use the simplest and most compatible scaling chain,
+                        # ignoring fit_mode. This is only used in rare error
+                        # cases where the more advanced chains failed.
+                        fallback_vf = (
+                            f"scale={int(tw)}:{int(th)}:force_original_aspect_ratio=decrease,"
+                            f"pad={int(tw)}:{int(th)}:(ow-iw)/2:(oh-ih)/2:black"
+                        )
+
+                    if fallback_vf:
+                        cmd += ["-vf", fallback_vf]
+
+                    cmd += encode_args
+                    code, out = _run_ffmpeg(cmd)
+
+                if code != 0 or not os.path.exists(out_part):
+                    raise RuntimeError(f"ffmpeg failed for segment {i+1} ({seg.clip_path}):\n{out}")
+                parts.append(out_part)
+            self.progress.emit(90, "Concatenating segments...")
+            concat_list = os.path.join(tmpdir, "concat.txt")
+            with open(concat_list, "w", encoding="utf-8") as f:
+                for p in parts:
+                    safe = p.replace("\\", "/")
+                    f.write(f"file '{safe}'\n")
+
+            concat_video = os.path.join(tmpdir, "video_concat.mp4")
+            # Re-encode concatenated video to ensure stable timestamps and avoid
+            # black/freezing issues in some players. We only have video here;
+            # audio is added in the final mux step.
+            cmd = [
+                self.ffmpeg,
+                "-y",
+                "-f",
+                "concat",
+                "-safe",
+                "0",
+                "-i",
+                concat_list,
+                "-c:v",
+                "libx264",
+                "-preset",
+                "veryfast",
+                "-crf",
+                "18",
+                "-pix_fmt",
+                "yuv420p",
+                concat_video,
+            ]
+            code, out = _run_ffmpeg(cmd)
+            if code != 0 or not os.path.exists(concat_video):
+                raise RuntimeError("Failed to concat segments:\n" + out)
+
+            # Optional intro/outro styling (fade to/from black)
+            video_for_mux = concat_video
+            if self.intro_fade or self.outro_fade:
+                self.progress.emit(93, "Applying intro/outro styling...")
+                dur = _ffprobe_duration(self.ffprobe, concat_video)
+                if dur and dur > 0.2:
+                    styled_video = os.path.join(tmpdir, "video_styled.mp4")
+                    vf_parts = []
+
+                    # Fade-in duration: up to 15%% of track, clamped between 0.2s and 1.0s
+                    if self.intro_fade:
+                        fade_in_d = 0.8
+                        fade_in_d = min(fade_in_d, max(0.2, dur * 0.15))
+                        vf_parts.append(f"fade=t=in:st=0:d={fade_in_d:.3f}")
+                    # Fade-out duration: up to 15%% of track, clamped between 0.2s and 1.2s
+                    if self.outro_fade:
+                        fade_out_d = 0.8
+                        fade_out_d = min(fade_out_d, max(0.2, dur * 0.15))
+                        start_out = max(0.0, dur - fade_out_d)
+                        vf_parts.append(f"fade=t=out:st={start_out:.3f}:d={fade_out_d:.3f}")
+                    if vf_parts:
+                        vf_chain = ",".join(vf_parts)
+                        cmd = [
+                            self.ffmpeg,
+                            "-y",
+                            "-i",
+                            concat_video,
+                            "-vf",
+                            vf_chain,
+                            "-c:v",
+                            "libx264",
+                            "-preset",
+                            "veryfast",
+                            "-crf",
+                            "18",
+                            "-pix_fmt",
+                            "yuv420p",
+                            styled_video,
+                        ]
+                        code, out = _run_ffmpeg(cmd)
+                        if code == 0 and os.path.exists(styled_video):
+                            video_for_mux = styled_video
+
+
+            # After you have video_for_mux (either styled_video or concat_video)
+            video_dur = _ffprobe_duration(self.ffprobe, video_for_mux)
+            if video_dur is None:
+                raise RuntimeError("Could not probe final video duration")
+
+            audio_dur = self.analysis.duration
+
+            if abs(video_dur - audio_dur) > 0.02:  # more than 1 frame off at 30 fps
+                adjusted_video = os.path.join(tmpdir, "video_exact_duration.mp4")
+                multiplier = audio_dur / video_dur
+                vf = f"setpts={multiplier:.10f}*PTS,fps=fps=30"
+                
+                cmd = [
+                    self.ffmpeg, "-y",
+                    "-i", video_for_mux,
+                    "-vf", vf,
+                    "-c:v", "libx264", "-preset", "veryfast", "-crf", "18",
+                    adjusted_video
+                ]
+                code, out = _run_ffmpeg(cmd)
+                if code != 0:
+                    raise RuntimeError(f"Duration fix failed: {out}")
+                video_for_mux = adjusted_video
+
+            
+            # Optional impact overlays using MP4 assets (fog/confetti/fireworks)
+            try:
+                assets_dir = os.path.join(os.path.dirname(__file__), "assets")
+                overlay_path = None
+
+                # Scan all segments to see which impact styles are actually used
+                max_fog = max((float(getattr(s, "impact_fog_density", 0.0) or 0.0) for s in self.segments), default=0.0)
+                max_conf = max((float(getattr(s, "impact_confetti_density", 0.0) or 0.0) for s in self.segments), default=0.0)
+                max_fire_gold = max((float(getattr(s, "impact_fire_gold_intensity", 0.0) or 0.0) for s in self.segments), default=0.0)
+                max_fire_multi = max((float(getattr(s, "impact_fire_multi_intensity", 0.0) or 0.0) for s in self.segments), default=0.0)
+
+                # Pick the first non-zero overlay in a simple priority order
+                cand = None
+                if max_fog > 0.0:
+                    cand = os.path.join(assets_dir, "smoke.mp4")
+                elif max_conf > 0.0:
+                    cand = os.path.join(assets_dir, "confetti.mp4")
+                elif max_fire_gold > 0.0:
+                    cand = os.path.join(assets_dir, "fireworks.mp4")
+                elif max_fire_multi > 0.0:
+                    cand = os.path.join(assets_dir, "fireworks2.mp4")
+
+                if cand and os.path.exists(cand):
+                    overlay_path = cand
+
+                if overlay_path:
+                    safe_p = overlay_path.replace("\\", "/")
+                    overlayed_video = os.path.join(tmpdir, "video_with_overlay.mp4")
+                    vf = (
+                        f"movie='{safe_p}'[ov];"
+                        f"[0:v][ov]overlay=(W-w)/2:(H-h)/2:shortest=1:alpha=0.6"
+                    )
+                    cmd = [
+                        self.ffmpeg,
+                        "-y",
+                        "-i",
+                        video_for_mux,
+                        "-vf",
+                        vf,
+                        "-c:v",
+                        "libx264",
+                        "-preset",
+                        "veryfast",
+                        "-crf",
+                        "18",
+                        "-pix_fmt",
+                        "yuv420p",
+                        overlayed_video,
+                    ]
+                    code, out = _run_ffmpeg(cmd)
+                    if code == 0 and os.path.exists(overlayed_video):
+                        video_for_mux = overlayed_video
+            except Exception:
+                # Overlay effects are purely cosmetic; ignore failures.
+                pass
+
+            # Optional music-player visual overlay using the same presets as the live player
+            if getattr(self, "use_visual_overlay", False):
+                try:
+                    from .viz_offline import render_visual_track
+
+                    self.progress.emit(92, "Rendering music-player visuals...")
+                    visuals_path = os.path.join(tmpdir, "visuals_track.mp4")
+                    # Use the target resolution if available; otherwise fall back to 1920x1080.
+                    if self.target_resolution is not None:
+                        try:
+                            vw, vh = self.target_resolution
+                        except Exception:
+                            vw, vh = 1920, 1080
+                    else:
+                        vw, vh = 1920, 1080
+
+                    # Build simple visual schedules based on strategy.
+                    strategy = int(getattr(self, "visual_strategy", 0))
+                    segment_boundaries = None
+                    section_map = None
+                    if strategy == 1:
+                        # New random visual every segment: use segment timeline starts as boundaries.
+                        try:
+                            starts = sorted(
+                                set(
+                                    float(getattr(seg, "timeline_start", 0.0) or 0.0)
+                                    for seg in (self.segments or [])
+                                )
+                            )
+                            if not starts or starts[0] > 0.01:
+                                starts.insert(0, 0.0)
+                            segment_boundaries = starts
+                        except Exception:
+                            segment_boundaries = None
+                    elif strategy == 2:
+                        # One visual per section type: intro/verse/chorus/break/drop/outro.
+                        try:
+                            section_map = [
+                                (float(sec.start), float(sec.end), str(sec.kind))
+                                for sec in (getattr(self, "analysis", None).sections or [])
+                            ]
+                        except Exception:
+                            section_map = None
+
+                    ok_viz = render_visual_track(
+                        audio_path=self.audio_path,
+                        out_video=visuals_path,
+                        ffmpeg_bin=self.ffmpeg,
+                        resolution=(int(vw), int(vh)),
+                        fps=30,
+                        strategy=strategy,
+                        segment_boundaries=segment_boundaries,
+                        section_map=section_map,
+                        section_visual_overrides=getattr(self, "visual_section_overrides", None),
+                    )
+                    if ok_viz and os.path.exists(visuals_path):
+                        overlayed_video_viz = os.path.join(tmpdir, "video_with_visuals.mp4")
+                        # Use visuals track as a second input and overlay it directly with transparency.
+                        # This avoids relying on the ffmpeg 'movie' source filter and keeps the base
+                        # clips visible underneath.
+                        # Build filter string with user-selected opacity (visual_overlay_opacity).
+                        try:
+                            alpha = float(getattr(self, "visual_overlay_opacity", 0.25))
+                        except Exception:
+                            alpha = 0.25
+                        if alpha < 0.0:
+                            alpha = 0.0
+                        if alpha > 1.0:
+                            alpha = 1.0
+                        filter_str = "[1:v]format=rgba,colorchannelmixer=aa=%(alpha)0.2f[viz];[0:v][viz]overlay=0:0:shortest=1" % {"alpha": alpha}
+
+                        cmd = [
+                            self.ffmpeg,
+                            "-y",
+                            "-i",
+                            video_for_mux,
+                            "-i",
+                            visuals_path,
+                            "-filter_complex",
+                            filter_str,
+                            "-c:v",
+                            "libx264",
+                            "-preset",
+                            "veryfast",
+                            "-crf",
+                            "18",
+                            "-pix_fmt",
+                            "yuv420p",
+                            overlayed_video_viz,
+                        ]
+                        code, out = _run_ffmpeg(cmd)
+                        if code == 0 and os.path.exists(overlayed_video_viz):
+                            video_for_mux = overlayed_video_viz
+                except Exception:
+                    # Visual overlay is cosmetic; ignore failures.
+                    pass
+
+            # mux with audio
+            self.progress.emit(95, "Merging with audio...")
+            base = os.path.splitext(os.path.basename(self.audio_path))[0]
+            ts = datetime.now().strftime("%d%m%H%M")  # ddmmhhmm to avoid overwrites
+            safe_base = base.strip().replace(" ", "_")
+            out_name = f"{safe_base}_clip_{ts}.mp4"
+            out_final = os.path.join(self.output_dir, out_name)
+            cmd = [
+                self.ffmpeg,
+                "-y",
+                "-i",
+                video_for_mux,
+                "-i",
+                self.audio_path,
+                "-c:v",
+                "copy",
+                "-c:a",
+                "aac",
+                out_final,
+            ]
+            code, out = _run_ffmpeg(cmd)
+            if code != 0 or not os.path.exists(out_final):
+                raise RuntimeError("Failed to mux video and audio:\n" + out)
+
+            self.progress.emit(100, "Done.")
+            self.finished_ok.emit(out_final)
+        finally:
+            shutil.rmtree(tmpdir, ignore_errors=True)
+
+
+# ---------------------------- main widget ----------------------------------
+
+
+class AutoMusicSyncWidget(QWidget):
+    def __init__(self, parent=None) -> None:
+        super().__init__(parent)
+        self._ffmpeg = _find_ffmpeg_from_env()
+        self._ffprobe = _find_ffprobe_from_env()
+        self._analysis: Optional[MusicAnalysisResult] = None
+        self._analysis_config = MusicAnalysisConfig()
+        self._worker: Optional[RenderWorker] = None
+        self._scan_worker: Optional[SourceScanWorker] = None
+        self._pending_audio: Optional[str] = None
+        self._pending_video: Optional[str] = None
+        self._pending_out_dir: Optional[str] = None
+        self.clip_sources = []
+        self.image_sources = []  # List for loaded images
+        # Optional per-section media overrides chosen from the timeline tab
+        self._section_media: Dict[int, ClipSource] = {}
+        # Enabled transition styles for randomization (indices of combo_transitions)
+        self._enabled_transition_modes = {0, 1, 2, 3, 4, 5, 6, 7}
+        # Guard flag used when toggling No FX programmatically so we don't immediately undo it
+        self._nofx_guard = False
+
+        # Per-section music-player visual overrides (intro/verse/chorus/break/drop/outro)
+        self._visual_section_overrides = {}
+        # Default opacity for music-player visuals overlay (0.0–1.0)
+        self.visual_overlay_opacity = 0.25
+        # Settings for remembering last paths & options
+        self._settings = QSettings("FrameVision", "MusicClipCreator")
+
+        self._build_ui()
+        self._load_settings()
+
+    def _build_ui(self) -> None:
+        self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
+
+        # Outer layout holds a tab widget so we can have a dedicated timeline tab
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(6, 4, 6, 6)
+        outer.setSpacing(6)
+
+        self.tabs = QTabWidget(self)
+        outer.addWidget(self.tabs)
+
+        # Main generator tab
+        page_main = QWidget(self)
+        main = QVBoxLayout(page_main)
+        main.setContentsMargins(0, 0, 0, 0)
+        main.setSpacing(6)
+        form = QFormLayout()
+        form.setLabelAlignment(Qt.AlignRight | Qt.AlignVCenter)
+        form.setFormAlignment(Qt.AlignLeft | Qt.AlignTop)
+        form.setSpacing(4)
+
+        # audio
+        self.edit_audio = QLineEdit(self)
+        btn_a = QPushButton("Browse...", self)
+        row_a = QHBoxLayout()
+        row_a.addWidget(self.edit_audio, 1)
+        row_a.addWidget(btn_a)
+        form.addRow("Music / Audio:", row_a)
+
+        # video (file or folder)
+        self.edit_video = QLineEdit(self)
+        btn_vf = QPushButton("Video file...", self)
+        btn_vd = QPushButton("Clip folder...", self)
+        btn_vmf = QPushButton("Clip files...", self)
+        row_v = QHBoxLayout()
+        row_v.addWidget(self.edit_video, 1)
+        row_v.addWidget(btn_vf)
+        row_v.addWidget(btn_vd)
+        row_v.addWidget(btn_vmf)
+        form.addRow("Video input:", row_v)
+
+        # Optional loader for image sources
+        row_clips = QHBoxLayout()
+        btn_load_images = QPushButton("Load Images (file/folder)", self)
+        row_clips.addWidget(btn_load_images)
+        btn_load_images.clicked.connect(self._on_load_images)
+        form.addRow("Loaded sources:", row_clips)
+
+        self.list_sources = QListWidget(self)
+        form.addRow("", self.list_sources)
+
+        # output
+        self.edit_output = QLineEdit(self)
+        btn_o = QPushButton("Browse...", self)
+        row_o = QHBoxLayout()
+        row_o.addWidget(self.edit_output, 1)
+        row_o.addWidget(btn_o)
+        form.addRow("Output folder:", row_o)
+
+        # clip order
+        row_order = QHBoxLayout()
+        row_order.addWidget(QLabel("Clip order:", self))
+        self.combo_clip_order = QComboBox(self)
+        self.combo_clip_order.addItems(
+            [
+                "Random (default)",
+                "Sequential",
+                "Shuffle (no repeats)",
+            ]
+        )
+        self.combo_clip_order.setToolTip(
+            "How clips from a folder are picked:\n"
+            "- Random: random clips, avoid using the same clip twice in a row.\n"
+            "- Sequential: go through the folder in order, then loop.\n"
+            "- Shuffle: each round uses all clips once in random order before repeating."
+        )
+        row_order.addWidget(self.combo_clip_order, 1)
+        row_order.addStretch(1)
+        form.addRow(row_order)
+
+        # minimum clip length filter
+        row_minclip = QHBoxLayout()
+        self.check_min_clip = QCheckBox("Ignore clips shorter than", self)
+        self.check_min_clip.setChecked(False)
+        self.spin_min_clip = QDoubleSpinBox(self)
+        self.spin_min_clip.setDecimals(1)
+        self.spin_min_clip.setSingleStep(0.5)
+        self.spin_min_clip.setRange(0.5, 10.0)
+        self.spin_min_clip.setValue(1.5)
+        self.spin_min_clip.setSuffix(" s")
+        self.check_min_clip.setToolTip(
+            "When enabled, video clips shorter than this duration will be ignored\n"
+            "during clip discovery. Useful to avoid ultra-short fragments that can\n"
+            "cause jittery pacing or visual glitches."
+        )
+        row_minclip.addWidget(self.check_min_clip)
+        row_minclip.addWidget(self.spin_min_clip)
+        row_minclip.addStretch(1)
+        form.addRow(row_minclip)
+
+        # random seed
+        row_seed = QHBoxLayout()
+        row_seed.addWidget(QLabel("Random seed:", self))
+        self.spin_seed = QSpinBox(self)
+        self.spin_seed.setRange(0, 999999999)
+        self.spin_seed.setValue(1337)
+        self.spin_seed.setEnabled(False)
+        self.spin_seed.setToolTip(
+            "Seed value used when 'Use fixed seed' is enabled.\n"
+            "Same seed + same inputs = repeatable clip order and FX.\n"
+            "Disable to get a fresh random result each run."
+        )
+        row_seed.addWidget(self.spin_seed)
+        self.check_use_seed = QCheckBox("Use fixed seed", self)
+        self.check_use_seed.setToolTip(
+            "When enabled, the random generator is seeded with the value above,\n"
+            "so you can reproduce the same edit again. When disabled, each run\n"
+            "will be different."
+        )
+        row_seed.addWidget(self.check_use_seed)
+        row_seed.addStretch(1)
+        form.addRow(row_seed)
+
+        # resolution
+        row_res = QHBoxLayout()
+        row_res.addWidget(QLabel("Output resolution:", self))
+        self.combo_res = QComboBox(self)
+        self.combo_res.addItems(
+            [
+                "Auto (single video: keep source)",
+                "Multi clips: highest clip resolution",
+                "Multi clips: lowest clip resolution",
+                "Fixed: 1080p (1920×1080) 16:9",
+                "Fixed: 720p (1280×720) 16:9",
+                "Fixed: 480p (854×480) 16:9",
+                "Fixed: 1080p (1080×1920) 9:16",
+                "Fixed: 720p (720×1280) 9:16",
+                "Fixed: 480p (480×854) 9:16",
+            ]
+        )
+        self.combo_res.setToolTip(
+            "Resolution strategy when working with multiple clips.\n"
+            "- Auto: single video -> keep its resolution.\n"
+            "- Highest/Lowest clip resolution: unify to that size.\n"
+            "- Fixed 16:9: scale everything to 480p / 720p / 1080p landscape.\n"
+            "- Fixed 9:16: scale everything to 480p / 720p / 1080p vertical."
+        )
+        row_res.addWidget(self.combo_res, 1)
+        form.addRow(row_res)
+
+        # frame fit mode
+        row_fit = QHBoxLayout()
+        row_fit.addWidget(QLabel("Frame fit:", self))
+        self.combo_fit = QComboBox(self)
+        self.combo_fit.addItems(
+            [
+                "Original (letterbox/pillarbox)",
+                "Fill (crop to fill)",
+                "Stretch (distort to fill)",
+            ]
+        )
+        self.combo_fit.setToolTip(
+            "How clips are fitted into the target resolution.\\n"\
+            "- Original: keep aspect ratio, add black bars if needed.\\n"\
+            "- Fill: keep aspect ratio but crop edges to fill the frame.\\n"\
+            "- Stretch: ignore aspect ratio and stretch to fill the frame."
+        )
+        row_fit.addWidget(self.combo_fit, 1)
+        form.addRow(row_fit)
+
+        main.addLayout(form)
+
+        # options
+        box_opts = QGroupBox("Options", self)
+        opts = QVBoxLayout(box_opts)
+
+        # FX level
+        row_fx = QHBoxLayout()
+        row_fx.addWidget(QLabel("FX Level:", self))
+        self.combo_fx = QComboBox(self)
+        self.combo_fx.addItems(["Minimal", "Moderate", "High"])
+        self.combo_fx.setToolTip(
+            "Choose how active the visual effects should be:\n"
+            "- Minimal: clean cuts with subtle accents.\n"
+            "- Moderate: more zoom/flash on peaks.\n"
+            "- High: strongest visual activity, best with many short clips."
+        )
+        row_fx.addWidget(self.combo_fx, 1)
+        row_fx.addStretch(1)
+        opts.addLayout(row_fx)
+
+        # microclip toggles
+        row_micro = QHBoxLayout()
+        self.check_micro_chorus = QCheckBox("Microclips in chorus/drops only", self)
+        self.check_micro_chorus.setToolTip(
+            "Short energetic microclips only during high-energy sections\n"
+            "(chorus / drops). Verses and intros stay calmer."
+        )
+        row_micro.addWidget(self.check_micro_chorus)
+
+        self.check_micro_all = QCheckBox("Microclips for the whole track", self)
+        self.check_micro_all.setToolTip(
+            "Microclips are used throughout the entire song. Great with many\n"
+            "short clips; can feel hyperactive on a single long video."
+        )
+        row_micro.addWidget(self.check_micro_all)
+
+        self.check_micro_verses = QCheckBox("Verses only", self)
+        self.check_micro_verses.setToolTip(
+            "Microclips are used only during verse sections. Choruses, drops\n"
+            "and other parts of the song use longer, calmer shots."
+        )
+        row_micro.addWidget(self.check_micro_verses)
+
+        row_micro.addStretch(1)
+        opts.addLayout(row_micro)
+
+        # full-length mode (hidden, always enabled internally)
+        self.check_full_length = QCheckBox("Always fill full music length", self)
+        self.check_full_length.setToolTip(
+            "When enabled, the generated video will be extended with extra segments\n"
+            "so that its duration matches the full music track. Useful when microclips\n"
+            "or sparse beats would otherwise create a shorter video."
+        )
+        self.check_full_length.setChecked(True)
+        self.check_full_length.hide()
+
+        # intro / outro fades
+        row_fade = QHBoxLayout()
+        self.check_intro_fade = QCheckBox("Fade in from black at start         ", self)
+        self.check_intro_fade.setChecked(True)
+        self.check_intro_fade.setToolTip(
+            "Add a short fade-in from black at the very beginning of the music clip."
+        )
+        row_fade.addWidget(self.check_intro_fade)
+
+        self.check_outro_fade = QCheckBox("Fade out to black at end", self)
+        self.check_outro_fade.setChecked(True)
+        self.check_outro_fade.setToolTip(
+            "Add a short fade-out to black at the very end of the music clip."
+        )
+        row_fade.addWidget(self.check_outro_fade)
+        row_fade.addStretch(1)
+        opts.addLayout(row_fade)
+
+        # slow motion options
+        row_slow_master = QHBoxLayout()
+        self.check_slow_enable = QCheckBox("Enable slow-motion effect", self)
+        self.check_slow_enable.setToolTip(
+            "Enable to slow down the video (visuals only) during selected song sections.\n"
+            "Audio stays at normal speed."
+        )
+        row_slow_master.addWidget(self.check_slow_enable)
+        row_slow_master.addStretch(1)
+        opts.addLayout(row_slow_master)
+
+        self.slow_options = QWidget(self)
+        slow_layout = QVBoxLayout(self.slow_options)
+        slow_layout.setContentsMargins(26, 0, 0, 0)
+        slow_layout.setSpacing(2)
+
+        row_slow_sections1 = QHBoxLayout()
+        self.check_slow_intro = QCheckBox("Intro", self.slow_options)
+        self.check_slow_break = QCheckBox("Break", self.slow_options)
+        self.check_slow_chorus = QCheckBox("Chorus", self.slow_options)
+        row_slow_sections1.addWidget(self.check_slow_intro)
+        row_slow_sections1.addWidget(self.check_slow_break)
+        row_slow_sections1.addWidget(self.check_slow_chorus)
+        row_slow_sections1.addStretch(1)
+        slow_layout.addLayout(row_slow_sections1)
+
+        row_slow_sections2 = QHBoxLayout()
+        self.check_slow_drop = QCheckBox("Drop", self.slow_options)
+        self.check_slow_outro = QCheckBox("Outro", self.slow_options)
+        self.check_slow_random = QCheckBox("Random (1× every 60s max)", self.slow_options)
+        row_slow_sections2.addWidget(self.check_slow_drop)
+        row_slow_sections2.addWidget(self.check_slow_outro)
+        row_slow_sections2.addWidget(self.check_slow_random)
+        row_slow_sections2.addStretch(1)
+        slow_layout.addLayout(row_slow_sections2)
+
+        row_slow_factor = QHBoxLayout()
+        label_slow = QLabel("Slow-motion factor:", self.slow_options)
+        row_slow_factor.addWidget(label_slow)
+        self.slider_slow_factor = QSlider(Qt.Horizontal, self.slow_options)
+        self.slider_slow_factor.setMinimum(10)
+        self.slider_slow_factor.setMaximum(100)
+        self.slider_slow_factor.setSingleStep(1)
+        self.slider_slow_factor.setPageStep(5)
+        self.slider_slow_factor.setValue(50)
+        self.slider_slow_factor.setToolTip(
+            "Video speed factor for slow motion.\n"
+            "1.00 = normal speed, 0.50 = 2× slower, 0.25 = 4× slower."
+        )
+        row_slow_factor.addWidget(self.slider_slow_factor, 1)
+        self.label_slow_factor_value = QLabel("0.50x", self.slow_options)
+        self.label_slow_factor_value.setMinimumWidth(40)
+        row_slow_factor.addWidget(self.label_slow_factor_value)
+        slow_layout.addLayout(row_slow_factor)
+
+        opts.addWidget(self.slow_options)
+        self.slow_options.setVisible(False)
+
+        # cinematic effects options
+        row_cine_master = QHBoxLayout()
+        self.check_cine_enable = QCheckBox("Enable cinematic effects", self)
+        self.check_cine_enable.setToolTip(
+            "Enable a few rare, high-impact visual effects (freeze-frame, stutter, "
+            "reverse-bounce, ramps). Effects are placed automatically at most "
+            "about once per minute so the edit never feels overloaded."
+        )
+        row_cine_master.addWidget(self.check_cine_enable)
+        row_cine_master.addStretch(1)
+        opts.addLayout(row_cine_master)
+
+        self.cine_options = QWidget(self)
+        cine_layout = QVBoxLayout(self.cine_options)
+        cine_layout.setContentsMargins(26, 0, 0, 0)
+        cine_layout.setSpacing(2)
+
+        # Freeze-frame effect
+        row_cine_freeze = QHBoxLayout()
+        self.check_cine_freeze = QCheckBox("Freeze-frame (pause + zoom-in)", self.cine_options)
+        self.check_cine_freeze.setToolTip(
+            "Occasionally pause the video on a single frame with a gentle zoom-in, "
+            "then snap back to normal motion."
+        )
+        row_cine_freeze.addWidget(self.check_cine_freeze)
+        label_freeze_len = QLabel("Length:", self.cine_options)
+        row_cine_freeze.addWidget(label_freeze_len)
+        self.slider_cine_freeze_len = QSlider(Qt.Horizontal, self.cine_options)
+        self.slider_cine_freeze_len.setMinimum(10)   # 0.10 s
+        self.slider_cine_freeze_len.setMaximum(100)  # 1.00 s
+        self.slider_cine_freeze_len.setSingleStep(1)
+        self.slider_cine_freeze_len.setValue(50)     # default 0.50 s
+        row_cine_freeze.addWidget(self.slider_cine_freeze_len, 1)
+        self.label_cine_freeze_len = QLabel("0.50 s", self.cine_options)
+        self.label_cine_freeze_len.setMinimumWidth(50)
+        row_cine_freeze.addWidget(self.label_cine_freeze_len)
+        cine_layout.addLayout(row_cine_freeze)
+
+        row_cine_freeze_zoom = QHBoxLayout()
+        label_freeze_zoom = QLabel("Freeze zoom:", self.cine_options)
+        row_cine_freeze_zoom.addWidget(label_freeze_zoom)
+        self.slider_cine_freeze_zoom = QSlider(Qt.Horizontal, self.cine_options)
+        self.slider_cine_freeze_zoom.setMinimum(5)    # 5%%
+        self.slider_cine_freeze_zoom.setMaximum(30)   # 30%%
+        self.slider_cine_freeze_zoom.setSingleStep(1)
+        self.slider_cine_freeze_zoom.setValue(15)     # default 15%%
+        row_cine_freeze_zoom.addWidget(self.slider_cine_freeze_zoom, 1)
+        self.label_cine_freeze_zoom = QLabel("+15%%", self.cine_options)
+        self.label_cine_freeze_zoom.setMinimumWidth(50)
+        row_cine_freeze_zoom.addWidget(self.label_cine_freeze_zoom)
+        cine_layout.addLayout(row_cine_freeze_zoom)
+
+        # Stutter slice
+        row_cine_stutter = QHBoxLayout()
+        self.check_cine_stutter = QCheckBox("Stutter slice", self.cine_options)
+        self.check_cine_stutter.setToolTip(
+            "Occasionally create a short triple-frame style stutter hit for extra impact."
+        )
+        row_cine_stutter.addWidget(self.check_cine_stutter)
+        label_stutter = QLabel("Repeats:", self.cine_options)
+        row_cine_stutter.addWidget(label_stutter)
+        self.spin_cine_stutter_repeats = QSpinBox(self.cine_options)
+        self.spin_cine_stutter_repeats.setRange(2, 5)
+        self.spin_cine_stutter_repeats.setValue(3)
+        row_cine_stutter.addWidget(self.spin_cine_stutter_repeats)
+        row_cine_stutter.addStretch(1)
+        cine_layout.addLayout(row_cine_stutter)
+
+        # Reverse-bounce
+        row_cine_reverse = QHBoxLayout()
+        self.check_cine_reverse = QCheckBox("Reverse-bounce", self.cine_options)
+        self.check_cine_reverse.setToolTip(
+            "Occasionally play a very short fragment backwards for a bounce-like feel."
+        )
+        row_cine_reverse.addWidget(self.check_cine_reverse)
+        label_reverse_len = QLabel("Length:", self.cine_options)
+        row_cine_reverse.addWidget(label_reverse_len)
+        self.slider_cine_reverse_len = QSlider(Qt.Horizontal, self.cine_options)
+        self.slider_cine_reverse_len.setMinimum(10)   # 0.10 s
+        self.slider_cine_reverse_len.setMaximum(200)  # 2.00 s
+        self.slider_cine_reverse_len.setSingleStep(1)
+        self.slider_cine_reverse_len.setValue(50)     # default 0.50 s
+        row_cine_reverse.addWidget(self.slider_cine_reverse_len, 1)
+        self.label_cine_reverse_len = QLabel("0.50 s", self.cine_options)
+        self.label_cine_reverse_len.setMinimumWidth(50)
+        row_cine_reverse.addWidget(self.label_cine_reverse_len)
+        cine_layout.addLayout(row_cine_reverse)
+
+        # Boomerang loop
+        row_cine_boom = QHBoxLayout()
+        self.check_cine_boomerang = QCheckBox("Boomerang loop", self.cine_options)
+        self.check_cine_boomerang.setToolTip(
+            "Occasionally turn a segment into a short forward/back 'boomerang' bounce.\n"
+            "Balanced presets use a single bounce; club/rave can use faster mini-loops."
+        )
+        row_cine_boom.addWidget(self.check_cine_boomerang)
+        label_cine_boom = QLabel("Bounces:", self.cine_options)
+        row_cine_boom.addWidget(label_cine_boom)
+        self.slider_cine_boomerang_bounces = QSlider(Qt.Horizontal, self.cine_options)
+        self.slider_cine_boomerang_bounces.setMinimum(1)
+        self.slider_cine_boomerang_bounces.setMaximum(9)
+        self.slider_cine_boomerang_bounces.setSingleStep(1)
+        self.slider_cine_boomerang_bounces.setValue(2)
+        row_cine_boom.addWidget(self.slider_cine_boomerang_bounces, 1)
+        self.label_cine_boomerang_bounces = QLabel("x2", self.cine_options)
+        self.label_cine_boomerang_bounces.setMinimumWidth(40)
+        row_cine_boom.addWidget(self.label_cine_boomerang_bounces)
+        cine_layout.addLayout(row_cine_boom)
+
+        # Mosaic multi-screen effect
+        row_cine_mosaic = QHBoxLayout()
+        self.check_cine_mosaic = QCheckBox("Mosaic multi-screen", self.cine_options)
+        self.check_cine_mosaic.setToolTip(
+            "Occasionally replace a segment with a grid of multiple clips from the source folder."
+        )
+        row_cine_mosaic.addWidget(self.check_cine_mosaic)
+        self.check_cine_mosaic_random = QCheckBox("Random", self.cine_options)
+        self.check_cine_mosaic_random.setToolTip(
+            "Pick a random layout (2–9 screens) each time Mosaic is used."
+        )
+        row_cine_mosaic.addWidget(self.check_cine_mosaic_random)
+        label_cine_mosaic = QLabel("Screens:", self.cine_options)
+        row_cine_mosaic.addWidget(label_cine_mosaic)
+        self.slider_cine_mosaic_screens = QSlider(Qt.Horizontal, self.cine_options)
+        self.slider_cine_mosaic_screens.setMinimum(2)
+        self.slider_cine_mosaic_screens.setMaximum(9)
+        self.slider_cine_mosaic_screens.setSingleStep(1)
+        self.slider_cine_mosaic_screens.setValue(4)
+        row_cine_mosaic.addWidget(self.slider_cine_mosaic_screens, 1)
+        self.label_cine_mosaic_screens = QLabel("4 screens", self.cine_options)
+        self.label_cine_mosaic_screens.setMinimumWidth(60)
+        row_cine_mosaic.addWidget(self.label_cine_mosaic_screens)
+        cine_layout.addLayout(row_cine_mosaic)
+
+        # Upside-down flip
+        row_cine_flip = QHBoxLayout()
+        self.check_cine_flip = QCheckBox("Upside-down flip", self.cine_options)
+        self.check_cine_flip.setToolTip(
+            "Occasionally flip the frame 180° for a disorienting upside-down hit."
+        )
+        row_cine_flip.addWidget(self.check_cine_flip)
+        row_cine_flip.addStretch(1)
+        cine_layout.addLayout(row_cine_flip)
+
+        # Rotating screen hit
+        row_cine_rotate = QHBoxLayout()
+        self.check_cine_rotate = QCheckBox("Rotating screen hit", self.cine_options)
+        self.check_cine_rotate.setToolTip(
+            "Occasionally apply a short rotating-screen hit (small spin) on strong musical moments."
+        )
+        row_cine_rotate.addWidget(self.check_cine_rotate)
+        label_cine_rotate = QLabel("Max angle:", self.cine_options)
+        row_cine_rotate.addWidget(label_cine_rotate)
+        self.slider_cine_rotate_degrees = QSlider(Qt.Horizontal, self.cine_options)
+        self.slider_cine_rotate_degrees.setMinimum(5)
+        self.slider_cine_rotate_degrees.setMaximum(90)
+        self.slider_cine_rotate_degrees.setSingleStep(1)
+        self.slider_cine_rotate_degrees.setValue(20)
+        row_cine_rotate.addWidget(self.slider_cine_rotate_degrees, 1)
+        self.label_cine_rotate_degrees = QLabel("±20°", self.cine_options)
+        self.label_cine_rotate_degrees.setMinimumWidth(50)
+        row_cine_rotate.addWidget(self.label_cine_rotate_degrees)
+        cine_layout.addLayout(row_cine_rotate)
+
+        # Multiply: same-clip multi-screen effect
+        row_cine_multiply = QHBoxLayout()
+        self.check_cine_multiply = QCheckBox("Multiply (same clip)", self.cine_options)
+        self.check_cine_multiply.setToolTip(
+            "Occasionally split the screen into a grid that shows multiple copies of the *same* clip."
+        )
+        row_cine_multiply.addWidget(self.check_cine_multiply)
+        self.check_cine_multiply_random = QCheckBox("Random", self.cine_options)
+        self.check_cine_multiply_random.setToolTip(
+            "Pick a random layout (2–9 screens) each time Multiply is used."
+        )
+        row_cine_multiply.addWidget(self.check_cine_multiply_random)
+        label_cine_multiply = QLabel("Copies:", self.cine_options)
+        row_cine_multiply.addWidget(label_cine_multiply)
+        self.slider_cine_multiply_screens = QSlider(Qt.Horizontal, self.cine_options)
+        self.slider_cine_multiply_screens.setMinimum(2)
+        self.slider_cine_multiply_screens.setMaximum(9)
+        self.slider_cine_multiply_screens.setSingleStep(1)
+        self.slider_cine_multiply_screens.setValue(4)
+        row_cine_multiply.addWidget(self.slider_cine_multiply_screens, 1)
+        self.label_cine_multiply_screens = QLabel("4 copies", self.cine_options)
+        self.label_cine_multiply_screens.setMinimumWidth(60)
+        row_cine_multiply.addWidget(self.label_cine_multiply_screens)
+        cine_layout.addLayout(row_cine_multiply)
+
+        # Dolly-zoom hit
+        row_cine_dolly = QHBoxLayout()
+        self.check_cine_dolly = QCheckBox("Dolly-zoom hit", self.cine_options)
+        self.check_cine_dolly.setToolTip(
+            "Rare dolly-zoom style camera move (push in/out while zooming) for a dramatic hit.\n"
+            "Hits are placed at most about once every 30 seconds."
+        )
+        row_cine_dolly.addWidget(self.check_cine_dolly)
+        label_cine_dolly = QLabel("Strength:", self.cine_options)
+        row_cine_dolly.addWidget(label_cine_dolly)
+        self.slider_cine_dolly_strength = QSlider(Qt.Horizontal, self.cine_options)
+        self.slider_cine_dolly_strength.setMinimum(10)
+        self.slider_cine_dolly_strength.setMaximum(200)
+        self.slider_cine_dolly_strength.setSingleStep(5)
+        self.slider_cine_dolly_strength.setValue(50)
+        row_cine_dolly.addWidget(self.slider_cine_dolly_strength, 1)
+        self.label_cine_dolly_strength = QLabel("50%", self.cine_options)
+        self.label_cine_dolly_strength.setMinimumWidth(40)
+        row_cine_dolly.addWidget(self.label_cine_dolly_strength)
+        cine_layout.addLayout(row_cine_dolly)
+
+        # Ken Burns pan/zoom
+        row_cine_kb = QHBoxLayout()
+        self.check_cine_kenburns = QCheckBox("Ken Burns pan/zoom", self.cine_options)
+        self.check_cine_kenburns.setToolTip(
+            "Rare, gentle pan/zoom across a clip (Ken Burns style).\n"
+            "Also limited to about one hit every 30 seconds."
+        )
+        row_cine_kb.addWidget(self.check_cine_kenburns)
+        label_cine_kb = QLabel("Strength:", self.cine_options)
+        row_cine_kb.addWidget(label_cine_kb)
+        self.slider_cine_kenburns_strength = QSlider(Qt.Horizontal, self.cine_options)
+        self.slider_cine_kenburns_strength.setMinimum(10)
+        self.slider_cine_kenburns_strength.setMaximum(200)
+        self.slider_cine_kenburns_strength.setSingleStep(5)
+        self.slider_cine_kenburns_strength.setValue(40)
+        row_cine_kb.addWidget(self.slider_cine_kenburns_strength, 1)
+        self.label_cine_kenburns_strength = QLabel("40%", self.cine_options)
+        self.label_cine_kenburns_strength.setMinimumWidth(40)
+        row_cine_kb.addWidget(self.label_cine_kenburns_strength)
+        cine_layout.addLayout(row_cine_kb)
+
+        # Shared motion direction dropdown
+        row_cine_dir = QHBoxLayout()
+        label_cine_dir = QLabel("Motion direction:", self.cine_options)
+        row_cine_dir.addWidget(label_cine_dir)
+        self.combo_cine_motion_dir = QComboBox(self.cine_options)
+        self.combo_cine_motion_dir.addItems(
+            [
+                "Random each hit",
+                "Zoom in",
+                "Zoom out",
+                "Pan left",
+                "Pan right",
+                "Pan up",
+                "Pan down",
+            ]
+        )
+        self.combo_cine_motion_dir.setToolTip(
+            "Controls the direction for dolly / Ken Burns camera moves.\n"
+            "Leave on 'Random each hit' to vary direction automatically."
+        )
+        row_cine_dir.addWidget(self.combo_cine_motion_dir, 1)
+        cine_layout.addLayout(row_cine_dir)
+
+        # Speed ramps (only useful when slow-motion is enabled)
+        row_cine_ramp = QHBoxLayout()
+        self.check_cine_speed_ramp = QCheckBox("Use cinematic speed ramps", self.cine_options)
+        self.check_cine_speed_ramp.setToolTip(
+            "When slow-motion is enabled, smooth the change into and out of "
+            "slow segments instead of an abrupt jump."
+        )
+        row_cine_ramp.addWidget(self.check_cine_speed_ramp)
+        row_cine_ramp.addStretch(1)
+        cine_layout.addLayout(row_cine_ramp)
+
+        row_cine_ramp_times = QHBoxLayout()
+        label_ramp_in = QLabel("Ramp in:", self.cine_options)
+        row_cine_ramp_times.addWidget(label_ramp_in)
+        self.slider_cine_ramp_in = QSlider(Qt.Horizontal, self.cine_options)
+        self.slider_cine_ramp_in.setMinimum(15)    # 0.15 s
+        self.slider_cine_ramp_in.setMaximum(100)   # 1.00 s
+        self.slider_cine_ramp_in.setSingleStep(1)
+        self.slider_cine_ramp_in.setValue(25)     # 0.25 s
+        row_cine_ramp_times.addWidget(self.slider_cine_ramp_in, 1)
+        self.label_cine_ramp_in = QLabel("0.25 s", self.cine_options)
+        self.label_cine_ramp_in.setMinimumWidth(50)
+        row_cine_ramp_times.addWidget(self.label_cine_ramp_in)
+
+        label_ramp_out = QLabel("Ramp out:", self.cine_options)
+        row_cine_ramp_times.addWidget(label_ramp_out)
+        self.slider_cine_ramp_out = QSlider(Qt.Horizontal, self.cine_options)
+        self.slider_cine_ramp_out.setMinimum(15)   # 0.15 s
+        self.slider_cine_ramp_out.setMaximum(100)  # 0.50 s
+        self.slider_cine_ramp_out.setSingleStep(1)
+        self.slider_cine_ramp_out.setValue(25)    # 0.25 s
+        row_cine_ramp_times.addWidget(self.slider_cine_ramp_out, 1)
+        self.label_cine_ramp_out = QLabel("0.25 s", self.cine_options)
+        self.label_cine_ramp_out.setMinimumWidth(50)
+        row_cine_ramp_times.addWidget(self.label_cine_ramp_out)
+        cine_layout.addLayout(row_cine_ramp_times)
+
+        opts.addWidget(self.cine_options)
+        self.cine_options.setVisible(False)
+
+        # break impact FX options (first beat after a break)
+        row_impact_master = QHBoxLayout()
+        self.check_impact_enable = QCheckBox("Enhance break / drop impact", self)
+        self.check_impact_enable.setToolTip(
+            "Trigger strong club-style FX (flash, shockwave, confetti, zoom, shake, fog, "
+            "fireworks) on the very first beat after a breakdown."
+        )
+        row_impact_master.addWidget(self.check_impact_enable)
+        row_impact_master.addStretch(1)
+        opts.addLayout(row_impact_master)
+
+        self.impact_options = QWidget(self)
+        impact_layout = QVBoxLayout(self.impact_options)
+        impact_layout.setContentsMargins(26, 0, 0, 0)
+        impact_layout.setSpacing(2)
+
+        # Flash strobe
+        row_impact_flash = QHBoxLayout()
+        self.check_impact_flash = QCheckBox("Flash strobe", self.impact_options)
+        row_impact_flash.addWidget(self.check_impact_flash)
+        label_impact_flash = QLabel("Strength:", self.impact_options)
+        row_impact_flash.addWidget(label_impact_flash)
+        self.slider_impact_flash = QSlider(Qt.Horizontal, self.impact_options)
+        self.slider_impact_flash.setMinimum(10)
+        self.slider_impact_flash.setMaximum(150)
+        self.slider_impact_flash.setSingleStep(1)
+        self.slider_impact_flash.setValue(80)
+        row_impact_flash.addWidget(self.slider_impact_flash, 1)
+        self.label_impact_flash = QLabel("0.80", self.impact_options)
+        self.label_impact_flash.setMinimumWidth(40)
+        row_impact_flash.addWidget(self.label_impact_flash)
+        impact_layout.addLayout(row_impact_flash)
+
+        # Shockwave
+        row_impact_shock = QHBoxLayout()
+        self.check_impact_shock = QCheckBox("Shockwave burst", self.impact_options)
+        row_impact_shock.addWidget(self.check_impact_shock)
+        label_impact_shock = QLabel("Strength:", self.impact_options)
+        row_impact_shock.addWidget(label_impact_shock)
+        self.slider_impact_shock = QSlider(Qt.Horizontal, self.impact_options)
+        self.slider_impact_shock.setMinimum(10)
+        self.slider_impact_shock.setMaximum(150)
+        self.slider_impact_shock.setSingleStep(1)
+        self.slider_impact_shock.setValue(75)
+        row_impact_shock.addWidget(self.slider_impact_shock, 1)
+        self.label_impact_shock = QLabel("0.75", self.impact_options)
+        self.label_impact_shock.setMinimumWidth(40)
+        row_impact_shock.addWidget(self.label_impact_shock)
+        impact_layout.addLayout(row_impact_shock)
+
+        # Confetti
+        row_impact_confetti = QHBoxLayout()
+        self.check_impact_confetti = QCheckBox("Confetti burst", self.impact_options)
+        row_impact_confetti.addWidget(self.check_impact_confetti)
+        label_impact_confetti = QLabel("Density:", self.impact_options)
+        row_impact_confetti.addWidget(label_impact_confetti)
+        self.slider_impact_confetti = QSlider(Qt.Horizontal, self.impact_options)
+        self.slider_impact_confetti.setMinimum(10)
+        self.slider_impact_confetti.setMaximum(100)
+        self.slider_impact_confetti.setSingleStep(1)
+        self.slider_impact_confetti.setValue(70)
+        row_impact_confetti.addWidget(self.slider_impact_confetti, 1)
+        self.label_impact_confetti = QLabel("0.70", self.impact_options)
+        self.label_impact_confetti.setMinimumWidth(40)
+        row_impact_confetti.addWidget(self.label_impact_confetti)
+        impact_layout.addLayout(row_impact_confetti)
+
+        # Hide legacy break-impact FX (confetti) while keeping state + settings support.
+        self.check_impact_confetti.setChecked(False)
+        for w in (
+            self.check_impact_confetti,
+            label_impact_confetti,
+            self.slider_impact_confetti,
+            self.label_impact_confetti,
+        ):
+            w.hide()
+
+        # Zoom punch
+        row_impact_zoom = QHBoxLayout()
+        self.check_impact_zoom = QCheckBox("Zoom punch-in", self.impact_options)
+        row_impact_zoom.addWidget(self.check_impact_zoom)
+        label_impact_zoom = QLabel("Amount:", self.impact_options)
+        row_impact_zoom.addWidget(label_impact_zoom)
+        self.slider_impact_zoom = QSlider(Qt.Horizontal, self.impact_options)
+        self.slider_impact_zoom.setMinimum(5)
+        self.slider_impact_zoom.setMaximum(50)
+        self.slider_impact_zoom.setSingleStep(1)
+        self.slider_impact_zoom.setValue(20)
+        row_impact_zoom.addWidget(self.slider_impact_zoom, 1)
+        self.label_impact_zoom = QLabel("20%", self.impact_options)
+        self.label_impact_zoom.setMinimumWidth(40)
+        row_impact_zoom.addWidget(self.label_impact_zoom)
+        impact_layout.addLayout(row_impact_zoom)
+
+        # Camera shake
+        row_impact_shake = QHBoxLayout()
+        self.check_impact_shake = QCheckBox("Camera shake", self.impact_options)
+        row_impact_shake.addWidget(self.check_impact_shake)
+        label_impact_shake = QLabel("Strength:", self.impact_options)
+        row_impact_shake.addWidget(label_impact_shake)
+        self.slider_impact_shake = QSlider(Qt.Horizontal, self.impact_options)
+        self.slider_impact_shake.setMinimum(10)
+        self.slider_impact_shake.setMaximum(150)
+        self.slider_impact_shake.setSingleStep(1)
+        self.slider_impact_shake.setValue(60)
+        row_impact_shake.addWidget(self.slider_impact_shake, 1)
+        self.label_impact_shake = QLabel("0.60", self.impact_options)
+        self.label_impact_shake.setMinimumWidth(40)
+        row_impact_shake.addWidget(self.label_impact_shake)
+        impact_layout.addLayout(row_impact_shake)
+
+        # Fog blast
+        row_impact_fog = QHBoxLayout()
+        self.check_impact_fog = QCheckBox("Fog / CO₂ blast", self.impact_options)
+        row_impact_fog.addWidget(self.check_impact_fog)
+        label_impact_fog = QLabel("Density:", self.impact_options)
+        row_impact_fog.addWidget(label_impact_fog)
+        self.slider_impact_fog = QSlider(Qt.Horizontal, self.impact_options)
+        self.slider_impact_fog.setMinimum(10)
+        self.slider_impact_fog.setMaximum(100)
+        self.slider_impact_fog.setSingleStep(1)
+        self.slider_impact_fog.setValue(65)
+        row_impact_fog.addWidget(self.slider_impact_fog, 1)
+        self.label_impact_fog = QLabel("0.65", self.impact_options)
+        self.label_impact_fog.setMinimumWidth(40)
+        row_impact_fog.addWidget(self.label_impact_fog)
+        impact_layout.addLayout(row_impact_fog)
+
+        # Hide legacy break-impact FX (fog blast) while keeping state + settings support.
+        self.check_impact_fog.setChecked(False)
+        for w in (
+            self.check_impact_fog,
+            label_impact_fog,
+            self.slider_impact_fog,
+            self.label_impact_fog,
+        ):
+            w.hide()
+
+        # Fireworks (gold)
+        row_impact_fire_gold = QHBoxLayout()
+        self.check_impact_fire_gold = QCheckBox("Fireworks (gold)", self.impact_options)
+        row_impact_fire_gold.addWidget(self.check_impact_fire_gold)
+        label_impact_fire_gold = QLabel("Intensity:", self.impact_options)
+        row_impact_fire_gold.addWidget(label_impact_fire_gold)
+        self.slider_impact_fire_gold = QSlider(Qt.Horizontal, self.impact_options)
+        self.slider_impact_fire_gold.setMinimum(10)
+        self.slider_impact_fire_gold.setMaximum(100)
+        self.slider_impact_fire_gold.setSingleStep(1)
+        self.slider_impact_fire_gold.setValue(75)
+        row_impact_fire_gold.addWidget(self.slider_impact_fire_gold, 1)
+        self.label_impact_fire_gold = QLabel("0.75", self.impact_options)
+        self.label_impact_fire_gold.setMinimumWidth(40)
+        row_impact_fire_gold.addWidget(self.label_impact_fire_gold)
+        impact_layout.addLayout(row_impact_fire_gold)
+
+        # Hide legacy break-impact FX (gold fireworks) while keeping state + settings support.
+        self.check_impact_fire_gold.setChecked(False)
+        for w in (
+            self.check_impact_fire_gold,
+            label_impact_fire_gold,
+            self.slider_impact_fire_gold,
+            self.label_impact_fire_gold,
+        ):
+            w.hide()
+
+        # Fireworks (multicolor)
+        row_impact_fire_multi = QHBoxLayout()
+        self.check_impact_fire_multi = QCheckBox("Fireworks (multicolor)", self.impact_options)
+        row_impact_fire_multi.addWidget(self.check_impact_fire_multi)
+        label_impact_fire_multi = QLabel("Intensity:", self.impact_options)
+        row_impact_fire_multi.addWidget(label_impact_fire_multi)
+        self.slider_impact_fire_multi = QSlider(Qt.Horizontal, self.impact_options)
+        self.slider_impact_fire_multi.setMinimum(10)
+        self.slider_impact_fire_multi.setMaximum(100)
+        self.slider_impact_fire_multi.setSingleStep(1)
+        self.slider_impact_fire_multi.setValue(80)
+        row_impact_fire_multi.addWidget(self.slider_impact_fire_multi, 1)
+        self.label_impact_fire_multi = QLabel("0.80", self.impact_options)
+        self.label_impact_fire_multi.setMinimumWidth(40)
+        row_impact_fire_multi.addWidget(self.label_impact_fire_multi)
+        impact_layout.addLayout(row_impact_fire_multi)
+
+        # Hide legacy break-impact FX (multicolor fireworks) while keeping state + settings support.
+        self.check_impact_fire_multi.setChecked(False)
+        for w in (
+            self.check_impact_fire_multi,
+            label_impact_fire_multi,
+            self.slider_impact_fire_multi,
+            self.label_impact_fire_multi,
+        ):
+            w.hide()
+
+        # Random choice mode
+        row_impact_random = QHBoxLayout()
+        self.check_impact_random = QCheckBox("Random (choose 1 per break)", self.impact_options)
+        row_impact_random.addWidget(self.check_impact_random)
+        row_impact_random.addStretch(1)
+        impact_layout.addLayout(row_impact_random)
+
+        opts.addWidget(self.impact_options)
+        self.impact_options.setVisible(False)
+
+        # Master FX kill-switch
+        row_nofx = QHBoxLayout()
+        self.check_nofx = QCheckBox("Disable ALL video FX (No FX mode)", self)
+        self.check_nofx.setToolTip(
+            "When enabled, all video effects are disabled: no slow motion, no cinematic FX, "
+            "no break-impact FX and only clean hard cuts between clips."
+        )
+        row_nofx.addWidget(self.check_nofx)
+        row_nofx.addStretch(1)
+        opts.addLayout(row_nofx)
+
+
+        # Music-player visuals overlay (optional)
+        row_viz = QHBoxLayout()
+        self.check_visual_overlay = QCheckBox("Add music-player visuals overlay", self)
+        self.check_visual_overlay.setToolTip(
+            "Render one of your live music-player visuals as an overlay layer on the final clip. "
+            "Uses a random visual preset from presets/viz for each render."
+        )
+        row_viz.addWidget(self.check_visual_overlay)
+        row_viz.addStretch(1)
+        opts.addLayout(row_viz)
+
+        # Music-player visuals strategies (shown only when overlay is enabled)
+        self.viz_options_container = QWidget(self)
+        viz_layout = QVBoxLayout(self.viz_options_container)
+        viz_layout.setContentsMargins(32, 0, 0, 0)
+
+        self.check_visual_strategy_segment = QCheckBox(
+            "New random visual every segment", self.viz_options_container
+        )
+        self.check_visual_strategy_section = QCheckBox(
+            "Different visual per section type (intro / verse / chorus / break / drop / outro)",
+            self.viz_options_container,
+        )
+
+        viz_layout.addWidget(self.check_visual_strategy_segment)
+        viz_layout.addWidget(self.check_visual_strategy_section)
+
+        row_viz_section_select = QHBoxLayout()
+        self.btn_visual_section_select = QPushButton("Select my own…", self.viz_options_container)
+        self.btn_visual_section_select.setEnabled(False)
+        row_viz_section_select.addWidget(self.btn_visual_section_select)
+        row_viz_section_select.addStretch(1)
+        viz_layout.addLayout(row_viz_section_select)
+
+        self.label_visual_section_choices = QLabel("", self.viz_options_container)
+        self.label_visual_section_choices.setWordWrap(True)
+        viz_layout.addWidget(self.label_visual_section_choices)
+
+        # Visual overlay opacity controls
+        row_viz_opacity = QHBoxLayout()
+        lbl_viz_opacity = QLabel("Visual overlay opacity:", self.viz_options_container)
+        row_viz_opacity.addWidget(lbl_viz_opacity)
+
+        self.slider_visual_opacity = QSlider(Qt.Horizontal, self.viz_options_container)
+        self.slider_visual_opacity.setMinimum(10)   # 0.10
+        self.slider_visual_opacity.setMaximum(100)  # 1.00
+        self.slider_visual_opacity.setSingleStep(5)
+        self.slider_visual_opacity.setPageStep(10)
+        self.slider_visual_opacity.setValue(int(self.visual_overlay_opacity * 100.0))
+        self.slider_visual_opacity.setToolTip(
+            "Controls how strong the music-player visuals appear on top of the video.\n"
+            "Lower = more transparent, Higher = more opaque."
+        )
+        row_viz_opacity.addWidget(self.slider_visual_opacity, 1)
+
+        self.spin_visual_opacity = QDoubleSpinBox(self.viz_options_container)
+        self.spin_visual_opacity.setRange(0.10, 1.00)
+        self.spin_visual_opacity.setSingleStep(0.05)
+        self.spin_visual_opacity.setDecimals(2)
+        self.spin_visual_opacity.setValue(float(self.visual_overlay_opacity))
+        self.spin_visual_opacity.setToolTip(
+            "Controls how strong the music-player visuals appear on top of the video.\n"
+            "Lower = more transparent, Higher = more opaque."
+        )
+        row_viz_opacity.addWidget(self.spin_visual_opacity)
+
+        viz_layout.addLayout(row_viz_opacity)
+
+        self.slider_visual_opacity.valueChanged.connect(self._on_visual_opacity_slider_changed)
+        self.spin_visual_opacity.valueChanged.connect(self._on_visual_opacity_spin_changed)
+
+        self.viz_options_container.setVisible(False)
+        opts.addWidget(self.viz_options_container)
+
+        # transitions
+        row_trans = QHBoxLayout()
+        self.label_transitions = QLabel("Transitions:", self)
+        row_trans.addWidget(self.label_transitions)
+        self.combo_transitions = QComboBox(self)
+        # High-level transition presets (indices must stay stable)
+        self.combo_transitions.addItems(
+            [
+                "Soft film dissolves",
+                "Hard cuts",
+                "Scale punch (zoom)",
+                "Chromatic glitch",
+                "VHS analog warp",
+                "Motion blur whip-cuts",
+                "Flash/dip mix",
+                "Creative festival mix (strobes + hits)",
+            ]
+        )
+        self.combo_transitions.setToolTip(
+            "High-level transition look:\n"
+            "- Soft film dissolves: gentle, low-key transitions (currently clean cuts).\n"
+            "- Hard cuts: straight, no-frills cuts.\n"
+            "- Scale punch (zoom): rhythmic zoom pulses on cuts.\n"
+            "- Chromatic glitch: RGB split / chromatic aberration-style glitch.\n"
+            "- VHS analog warp: noisy, retro VHS-style texture.\n"
+            "- Motion blur whip-cuts: extra blur on fast cuts.\n"
+            "- Flash/dip mix: combo of bright flashes and quick dips.\n"
+            "- Creative festival mix: playful blend of flashes, dips and pulses.\n"
+        )
+        row_trans.addWidget(self.combo_transitions, 1)
+        row_trans.addStretch(1)
+        opts.addLayout(row_trans)
+
+        
+        # random transitions toggle + manager
+        row_trans_ctrl = QHBoxLayout()
+        self.check_trans_random = QCheckBox("Random transitions", self)
+        self.check_trans_random.setToolTip(
+            "When enabled, each segment will pick a transition style at random\n"
+            "from the enabled list below. When disabled, the selected style\n"
+            "in the dropdown is used for all segments."
+        )
+        row_trans_ctrl.addWidget(self.check_trans_random)
+        btn_manage_trans = QPushButton("Manage transitions...", self)
+        btn_manage_trans.setToolTip(
+            "Choose which transition styles are allowed when 'Random transitions'\n"
+            "is enabled (Slide, Hard cuts, Zoom pulse, RGB split, VHS, Motion blur), Mixed, Creative mix."
+        )
+        row_trans_ctrl.addWidget(btn_manage_trans)
+        row_trans_ctrl.addStretch(1)
+        opts.addLayout(row_trans_ctrl)
+
+
+        main.addWidget(box_opts)
+
+        # advanced
+        box_adv = QGroupBox("Advanced", self)
+        box_adv.setCheckable(True)
+        box_adv.setChecked(False)
+        adv = QFormLayout(box_adv)
+        adv.setLabelAlignment(Qt.AlignRight | Qt.AlignVCenter)
+        adv.setSpacing(4)
+
+        self.slider_sens = QSlider(Qt.Horizontal, self)
+        self.slider_sens.setMinimum(10)   # represents 1.0
+        self.slider_sens.setMaximum(200)  # represents 20.0 (i.e. 2.0 steps *10)
+        self.slider_sens.setValue(50)     # default 5.0
+        self.slider_sens.setSingleStep(5) # 0.5 represented as +5
+        
+        self.slider_sens.setMinimum(2)
+        self.slider_sens.setMaximum(20)
+        self.slider_sens.setValue(10)
+        self.slider_sens.setToolTip(
+            "Beat sensitivity for the detector (0.5–20.0 internal scale).\n"
+            "Lower = fewer beats (stricter), higher = more beats (looser)."
+        )
+        adv.addRow("Beat sensitivity:", self.slider_sens)
+
+        self.spin_beats_per_seg = QSpinBox(self)
+        self.spin_beats_per_seg.setRange(1, 16)
+        self.spin_beats_per_seg.setValue(2)
+        self.spin_beats_per_seg.setToolTip(
+            "Number of beats grouped into one base video segment.\n"
+            "1 = very fast cuts, 2 = default, 4+ = slower cuts."
+        )
+        adv.addRow("Beats per base segment:", self.spin_beats_per_seg)
+
+        main.addWidget(box_adv)
+
+        # progress + buttons
+        self.progress = QProgressBar(self)
+        self.progress.setRange(0, 100)
+        self.progress.setValue(0)
+        self.progress.setFormat("Ready.")
+        main.addWidget(self.progress)
+
+        # compact analysis summary
+        self.label_summary = QLabel("", self)
+        self.label_summary.setWordWrap(True)
+        main.addWidget(self.label_summary)
+
+        # shortcut button to jump directly to the Music timeline tab
+        self.btn_check_timeline = QPushButton("Check timeline", self)
+        self.btn_check_timeline.setVisible(False)
+        main.addWidget(self.btn_check_timeline)
+
+        row_btn = QHBoxLayout()
+        self.btn_analyze = QPushButton("Analyze", self)
+        self.btn_generate = QPushButton("Generate Clip", self)
+
+        # New: 1-click presets button
+        self.btn_presets = QPushButton("1-click presets", self)
+        self.btn_presets.setToolTip(
+            "Open 1-click presets for FX and timing.\n"
+            "Presets do NOT change which clips, music track, output folder\n"
+            "or resolution you selected – set those first."
+        )
+
+        self.btn_cancel = QPushButton("Cancel", self)
+        # Hidden in UI: keep handler wired but don't show the button.
+        self.btn_cancel.hide()
+        self.btn_reset_all = QPushButton("Reset all", self)
+        self.btn_reset_all.setToolTip(
+            "Stop any running job, clear loaded sources and reset all settings to defaults."
+        )
+
+        row_btn.addWidget(self.btn_analyze)
+        row_btn.addWidget(self.btn_generate)
+        row_btn.addWidget(self.btn_presets)
+        row_btn.addWidget(self.btn_cancel)
+        row_btn.addWidget(self.btn_reset_all)
+        main.addLayout(row_btn)
+        main.addStretch(1)
+
+
+        # Install tabs
+        self.tabs.addTab(page_main, "Generator")
+
+        # Music timeline tab lives in a separate helper module so it can grow
+        # without bloating this file too much.
+        if TimelinePanel is not None:
+            self.timeline_panel = TimelinePanel(self)
+        else:
+            self.timeline_panel = QWidget(self)
+            tl = QVBoxLayout(self.timeline_panel)
+            lbl = QLabel(
+                "Timeline view will show the analyzed music structure here once available.",
+                self.timeline_panel,
+            )
+            lbl.setWordWrap(True)
+            tl.addWidget(lbl)
+            tl.addStretch(1)
+        self.tabs.addTab(self.timeline_panel, "Music timeline")
+
+        # Connect mini-timeline actions to this widget (if available)
+        if TimelinePanel is not None and isinstance(self.timeline_panel, TimelinePanel):
+            try:
+                self.timeline_panel.segmentAddRequested.connect(self._on_timeline_add)  # type: ignore[attr-defined]
+                self.timeline_panel.segmentRemoveRequested.connect(self._on_timeline_remove)  # type: ignore[attr-defined]
+                self.timeline_panel.segmentSelected.connect(self._on_timeline_select)  # type: ignore[attr-defined]
+            except Exception:
+                # Never let optional timeline wiring break the main tool.
+                pass
+
+        # connections
+        btn_a.clicked.connect(self._browse_audio)
+        btn_vf.clicked.connect(self._browse_video_file)
+        btn_vd.clicked.connect(self._browse_video_dir)
+        btn_vmf.clicked.connect(self._browse_video_files)
+        btn_o.clicked.connect(self._browse_output)
+        self.btn_analyze.clicked.connect(self._on_analyze)
+        self.btn_generate.clicked.connect(self._on_generate)
+        self.btn_presets.clicked.connect(self._on_presets_clicked)
+        self.btn_cancel.clicked.connect(self._on_cancel)
+        self.btn_reset_all.clicked.connect(self._on_reset_all)
+        self.btn_check_timeline.clicked.connect(self._on_check_timeline)
+        btn_manage_trans.clicked.connect(self._on_manage_transitions)
+
+        self.check_micro_chorus.stateChanged.connect(self._on_micro_mode_changed)
+        self.check_micro_all.stateChanged.connect(self._on_micro_mode_changed)
+        if hasattr(self, "check_micro_verses"):
+            self.check_micro_verses.stateChanged.connect(self._on_micro_mode_changed)
+        self.check_use_seed.stateChanged.connect(self._on_seed_toggle)
+        self.check_trans_random.stateChanged.connect(self._on_trans_random_toggled)
+        self.check_slow_enable.stateChanged.connect(self._on_slow_toggle)
+        self.slider_slow_factor.valueChanged.connect(self._on_slow_factor_changed)
+
+        # Cinematic effects panel
+        self.check_cine_enable.stateChanged.connect(self._on_cine_toggle)
+        self.check_cine_enable.toggled.connect(self.cine_options.setVisible)
+        self.slider_cine_freeze_len.valueChanged.connect(self._on_cine_freeze_len_changed)
+        self.slider_cine_freeze_zoom.valueChanged.connect(self._on_cine_freeze_zoom_changed)
+        self.slider_cine_reverse_len.valueChanged.connect(self._on_cine_reverse_len_changed)
+        self.slider_cine_ramp_in.valueChanged.connect(self._on_cine_ramp_in_changed)
+        self.slider_cine_ramp_out.valueChanged.connect(self._on_cine_ramp_out_changed)
+        self.slider_cine_boomerang_bounces.valueChanged.connect(self._on_cine_boomerang_bounces_changed)
+        self.slider_cine_mosaic_screens.valueChanged.connect(self._on_cine_mosaic_screens_changed)
+        self.check_cine_mosaic_random.stateChanged.connect(self._on_cine_mosaic_random_changed)
+        self.slider_cine_rotate_degrees.valueChanged.connect(self._on_cine_rotate_degrees_changed)
+        self.slider_cine_multiply_screens.valueChanged.connect(self._on_cine_multiply_screens_changed)
+        self.check_cine_multiply_random.stateChanged.connect(self._on_cine_multiply_random_changed)
+        self.slider_cine_dolly_strength.valueChanged.connect(self._on_cine_dolly_strength_changed)
+        self.slider_cine_kenburns_strength.valueChanged.connect(self._on_cine_kenburns_strength_changed)
+
+        # Break impact FX panel
+        self.check_impact_enable.toggled.connect(self.impact_options.setVisible)
+        self.slider_impact_flash.valueChanged.connect(self._on_impact_flash_changed)
+        self.slider_impact_shock.valueChanged.connect(self._on_impact_shock_changed)
+        self.slider_impact_confetti.valueChanged.connect(self._on_impact_confetti_changed)
+        self.slider_impact_zoom.valueChanged.connect(self._on_impact_zoom_changed)
+        self.slider_impact_shake.valueChanged.connect(self._on_impact_shake_changed)
+        self.slider_impact_fog.valueChanged.connect(self._on_impact_fog_changed)
+        self.slider_impact_fire_gold.valueChanged.connect(self._on_impact_fire_gold_changed)
+        self.slider_impact_fire_multi.valueChanged.connect(self._on_impact_fire_multi_changed)
+
+        
+        # When the user explicitly enables any FX-related option, automatically
+        # release the master 'No FX' switch so effects become visible again.
+        self.combo_fx.currentIndexChanged.connect(lambda _i: self._maybe_release_nofx())
+        self.combo_transitions.currentIndexChanged.connect(lambda _i: self._maybe_release_nofx())
+        self.check_slow_enable.stateChanged.connect(lambda s: self._maybe_release_nofx() if s else None)
+        self.check_cine_enable.stateChanged.connect(lambda s: self._maybe_release_nofx() if s else None)
+        self.check_impact_enable.stateChanged.connect(lambda s: self._maybe_release_nofx() if s else None)
+# Global 'No FX' master switch
+        self.check_nofx.stateChanged.connect(self._on_nofx_toggled)
+
+        # If visuals overlay or its strategies are enabled, automatically release No FX.
+        if hasattr(self, "check_visual_overlay"):
+            self.check_visual_overlay.stateChanged.connect(lambda s: self._maybe_release_nofx() if s else None)
+        if hasattr(self, "check_visual_strategy_segment"):
+            self.check_visual_strategy_segment.stateChanged.connect(lambda s: self._maybe_release_nofx() if s else None)
+        if hasattr(self, "check_visual_strategy_section"):
+            self.check_visual_strategy_section.stateChanged.connect(lambda s: self._maybe_release_nofx() if s else None)
+
+        # Keep visual strategy options mutually exclusive and only visible when overlay is enabled.
+        if hasattr(self, "check_visual_overlay") and hasattr(self, "viz_options_container"):
+
+            def _update_visual_strategy_visibility(checked: bool) -> None:
+                self.viz_options_container.setVisible(bool(checked))
+                if not checked:
+                    # When overlay is turned off, clear strategy toggles.
+                    try:
+                        self.check_visual_strategy_segment.setChecked(False)
+                    except Exception:
+                        pass
+                    try:
+                        self.check_visual_strategy_section.setChecked(False)
+                    except Exception:
+                        pass
+
+            self.check_visual_overlay.toggled.connect(_update_visual_strategy_visibility)
+
+        if hasattr(self, "check_visual_strategy_segment") and hasattr(self, "check_visual_strategy_section"):
+
+            def _on_segment_strategy_toggled(checked: bool) -> None:
+                if checked:
+                    try:
+                        self.check_visual_strategy_section.setChecked(False)
+                    except Exception:
+                        pass
+                if hasattr(self, "btn_visual_section_select"):
+                    try:
+                        self.btn_visual_section_select.setEnabled(
+                            bool(getattr(self, "check_visual_strategy_section", None))
+                            and bool(self.check_visual_strategy_section.isChecked())
+                        )
+                    except Exception:
+                        self.btn_visual_section_select.setEnabled(False)
+
+            def _on_section_strategy_toggled(checked: bool) -> None:
+                if checked:
+                    try:
+                        self.check_visual_strategy_segment.setChecked(False)
+                    except Exception:
+                        pass
+                if hasattr(self, "btn_visual_section_select"):
+                    try:
+                        self.btn_visual_section_select.setEnabled(bool(checked))
+                    except Exception:
+                        self.btn_visual_section_select.setEnabled(False)
+
+            self.check_visual_strategy_segment.toggled.connect(_on_segment_strategy_toggled)
+            self.check_visual_strategy_section.toggled.connect(_on_section_strategy_toggled)
+
+            if hasattr(self, "btn_visual_section_select"):
+                try:
+                    self.btn_visual_section_select.clicked.connect(self._on_select_visuals_per_section)
+                except Exception:
+                    pass
+
+            # Ensure initial enabled state of the button matches current strategy.
+            try:
+                _on_section_strategy_toggled(self.check_visual_strategy_section.isChecked())
+            except Exception:
+                pass
+
+
+    def _update_visual_section_summary(self) -> None:
+        label = getattr(self, "label_visual_section_choices", None)
+        overrides = getattr(self, "_visual_section_overrides", None)
+        if label is None or overrides is None:
+            return
+        if not overrides:
+            label.setText("")
+            return
+        order = [
+            ("intro", "Intro"),
+            ("verse", "Verse"),
+            ("chorus", "Chorus"),
+            ("break", "Break"),
+            ("drop", "Drop"),
+            ("outro", "Outro"),
+        ]
+        parts = []
+        for key, title in order:
+            if key in overrides:
+                mode = overrides.get(key)
+                if mode is None:
+                    desc = "no visual"
+                else:
+                    pretty = str(mode)
+                    if pretty.startswith("viz:"):
+                        pretty = pretty[4:]
+                    desc = pretty
+                parts.append(f"{title}: {desc}")
+        label.setText(" / ".join(parts))
+
+    def _on_select_visuals_per_section(self) -> None:
+        try:
+            from .viz_offline import _list_visual_modes
+            from .music import VisualEngine
+        except Exception:
+            QMessageBox.warning(
+                self,
+                "Visual presets not available",
+                                "Could not load visual presets for the music-player visuals.\n"
+                "Please ensure presets/viz is available.",
+
+                QMessageBox.Ok,
+            )
+            return
+
+        try:
+            engine = VisualEngine(parent=None)
+            modes = _list_visual_modes(engine)
+        except Exception:
+            modes = []
+
+        if not modes:
+            QMessageBox.warning(
+                self,
+                "No visuals found",
+                                "No music-player visual presets were found.\n"
+                "Please add presets in presets/viz and try again.",
+
+                QMessageBox.Ok,
+            )
+            return
+
+        # Map section keys to human-readable labels
+        sections = [
+            ("intro", "Intro"),
+            ("verse", "Verse"),
+            ("chorus", "Chorus"),
+            ("break", "Break"),
+            ("drop", "Drop"),
+            ("outro", "Outro"),
+        ]
+
+        current = getattr(self, "_visual_section_overrides", {}) or {}
+
+        dlg = QDialog(self)
+        dlg.setWindowTitle("Select visuals per section type")
+        layout = QVBoxLayout(dlg)
+
+        info = QLabel(
+            "Choose which music-player visual preset to use for each section type.\n"
+            "You can also disable visuals for specific sections."
+        , dlg)
+        info.setWordWrap(True)
+        layout.addWidget(info)
+
+        row_widgets = []  # (section_key, combo, checkbox)
+        for key, label_text in sections:
+            row = QHBoxLayout()
+            lbl = QLabel(f"{label_text}:", dlg)
+            row.addWidget(lbl)
+
+            combo = QComboBox(dlg)
+            combo.addItem("Random visual", "")
+            for m in modes:
+                if not m:
+                    continue
+                pretty = str(m)
+                if pretty.startswith("viz:"):
+                    pretty = pretty[4:]
+                combo.addItem(pretty, m)
+
+            override = current.get(key)
+            if isinstance(override, str) and override:
+                # Try to select matching preset
+                for i in range(combo.count()):
+                    if combo.itemData(i) == override:
+                        combo.setCurrentIndex(i)
+                        break
+
+            row.addWidget(combo, 1)
+
+            chk = QCheckBox("No beat-synced visual", dlg)
+            row.addWidget(chk)
+
+            if key in current and current.get(key) is None:
+                chk.setChecked(True)
+                combo.setEnabled(False)
+
+            def _make_toggle(c: QComboBox, cb: QCheckBox):
+                def _on_toggled(state: bool) -> None:
+                    c.setEnabled(not state)
+                return _on_toggled
+
+            chk.toggled.connect(_make_toggle(combo, chk))
+
+            layout.addLayout(row)
+            row_widgets.append((key, combo, chk))
+
+        buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel, dlg)
+        layout.addWidget(buttons)
+        buttons.accepted.connect(dlg.accept)
+        buttons.rejected.connect(dlg.reject)
+
+        if dlg.exec() != QDialog.Accepted:
+            return
+
+        overrides = {}
+        for key, combo, chk in row_widgets:
+            if chk.isChecked():
+                overrides[key] = None
+            else:
+                data = combo.currentData()
+                if isinstance(data, str) and data:
+                    overrides[key] = data
+
+        self._visual_section_overrides = overrides
+        self._update_visual_section_summary()
+
+
+    def _on_visual_opacity_slider_changed(self, value: int) -> None:
+        """Sync spinbox + internal opacity value when the slider changes."""
+        try:
+            alpha = float(value) / 100.0
+        except Exception:
+            alpha = float(getattr(self, "visual_overlay_opacity", 0.25))
+        alpha = max(0.10, min(1.0, alpha))
+        self.visual_overlay_opacity = alpha
+        spin = getattr(self, "spin_visual_opacity", None)
+        if spin is not None:
+            try:
+                spin.blockSignals(True)
+                spin.setValue(alpha)
+            finally:
+                spin.blockSignals(False)
+    
+    def _on_visual_opacity_spin_changed(self, value: float) -> None:
+        """Sync slider + internal opacity value when the spinbox changes."""
+        try:
+            alpha = float(value)
+        except Exception:
+            alpha = float(getattr(self, "visual_overlay_opacity", 0.25))
+        alpha = max(0.10, min(1.0, alpha))
+        self.visual_overlay_opacity = alpha
+        slider = getattr(self, "slider_visual_opacity", None)
+        if slider is not None:
+            try:
+                slider.blockSignals(True)
+                slider.setValue(int(round(alpha * 100.0)))
+            finally:
+                slider.blockSignals(False)
+
+    def _on_manage_transitions(self) -> None:
+        """Open a dialog to choose which transition styles are allowed for random mode."""
+        names = [
+            "Soft film dissolves",
+            "Hard cuts",
+            "Scale punch (zoom)",
+            "Chromatic glitch",
+            "VHS analog warp",
+            "Motion blur whip-cuts",
+            "Flash/dip mix",
+            "Creative festival mix (strobes + hits)",
+        ]
+        dlg = QDialog(self)
+        dlg.setWindowTitle("Manage transitions")
+        layout = QVBoxLayout(dlg)
+        info = QLabel(
+            "Select which transition styles can be used when\n"
+            "'Random transitions' is enabled."
+        )
+        info.setWordWrap(True)
+        layout.addWidget(info)
+        checkboxes = []
+        for i, name in enumerate(names):
+            cb = QCheckBox(name, dlg)
+            cb.setChecked(i in self._enabled_transition_modes)
+            layout.addWidget(cb)
+            checkboxes.append(cb)
+        buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel, dlg)
+        layout.addWidget(buttons)
+        buttons.accepted.connect(dlg.accept)
+        buttons.rejected.connect(dlg.reject)
+        if dlg.exec() != QDialog.Accepted:
+            return
+        selected = {i for i, cb in enumerate(checkboxes) if cb.isChecked()}
+        if not selected:
+            QMessageBox.warning(
+                self,
+                "No transitions selected",
+                "At least one transition style must be enabled for random mode.",
+                QMessageBox.Ok,
+            )
+            return
+        self._enabled_transition_modes = selected
+
+
+
+    def _update_transition_visibility(self) -> None:
+        """Show or hide the transitions dropdown row based on random mode."""
+        # If random transitions are enabled, hide the label + dropdown since
+        # they are not used. When disabled, show them again.
+        try:
+            is_random = self.check_trans_random.isChecked()
+        except Exception:
+            return
+        visible = not is_random
+        try:
+            self.label_transitions.setVisible(visible)
+        except Exception:
+            pass
+        try:
+            self.combo_transitions.setVisible(visible)
+        except Exception:
+            pass
+
+    def _on_trans_random_toggled(self, state: int) -> None:
+        """Keep the transitions row in sync with the 'Random transitions' toggle."""
+        self._update_transition_visibility()
+
+    def _on_cancel(self) -> None:
+        """Cancel current render (if any), reset progress and clean temp folder."""
+        # If a worker exists and is running, ask it to stop.
+        if getattr(self, "_worker", None) is not None:
+            try:
+                self._worker.requestInterruption()
+            except Exception:
+                pass
+        # Update UI
+        self.progress.setValue(0)
+        self.progress.setFormat("Cancelled.")
+        self.label_summary.setText(self.label_summary.text() + "\nRender cancelled.")
+        # Best-effort temp cleanup by rerunning cleanup helper.
+        try:
+            cleanup_temp_dir(self.edit_output.text().strip())
+        except Exception:
+            pass
+
+
+
+    def _on_reset_all(self) -> None:
+        """Fully reset the Music Clip Creator state and clear loaded sources."""
+        # Stop any running render or background scan.
+        try:
+            if getattr(self, "_worker", None) is not None:
+                try:
+                    self._worker.requestInterruption()
+                except Exception:
+                    pass
+                self._worker = None
+        except Exception:
+            pass
+        try:
+            if getattr(self, "_scan_worker", None) is not None:
+                try:
+                    self._scan_worker.requestInterruption()
+                except Exception:
+                    pass
+                self._scan_worker = None
+        except Exception:
+            pass
+
+        # Clear progress + summary text.
+        try:
+            self.progress.setValue(0)
+            self.progress.setFormat("Ready.")
+        except Exception:
+            pass
+        try:
+            self.label_summary.setText("")
+        except Exception:
+            pass
+
+        # Reset in-memory analysis and configuration.
+        try:
+            self._analysis = None
+            self._analysis_config = MusicAnalysisConfig()
+        except Exception:
+            pass
+
+        # Clear any per-section overrides and cached sources.
+        try:
+            self._section_media.clear()
+        except Exception:
+            pass
+        try:
+            self.clip_sources = []
+            self.image_sources = []
+        except Exception:
+            pass
+        try:
+            self._pending_audio = None
+            self._pending_video = None
+            self._pending_out_dir = None
+        except Exception:
+            pass
+
+        # Clear the visible sources list.
+        try:
+            if hasattr(self, "list_sources"):
+                self.list_sources.clear()
+        except Exception:
+            pass
+
+        # Clear basic path fields.
+        try:
+            self.edit_audio.clear()
+            self.edit_video.clear()
+            self.edit_output.clear()
+        except Exception:
+            pass
+
+        # Ask the timeline panel (if present) to forget any previous analysis.
+        try:
+            if hasattr(self, "timeline_panel"):
+                for name in ("clear_timeline", "reset_view", "clear"):
+                    fn = getattr(self.timeline_panel, name, None)
+                    if callable(fn):
+                        fn()
+                        break
+        except Exception:
+            pass
+
+        # Finally, forget persisted settings so a fresh session starts from defaults.
+        try:
+            self._settings.clear()
+        except Exception:
+            pass
+
+    # ------------------------------------------------------------------
+    # 1-click preset helper
+    # ------------------------------------------------------------------
+
+    def _on_presets_clicked(self) -> None:
+        """
+        Show a small dialog with the built-in presets, apply the choice and
+        immediately start a render.
+
+        Important: presets ONLY touch visual / FX options. They do not
+        change which audio/clip paths are selected, the output folder or
+        the resolution.
+        """
+        # Avoid starting while something else is running.
+        if getattr(self, "_worker", None) is not None and self._worker.isRunning():
+            self._error("Busy", "A render is already running.")
+            return
+        if getattr(self, "_scan_worker", None) is not None and self._scan_worker.isRunning():
+            self._error("Busy", "Clip scanning is already running.")
+            return
+
+        dlg = QDialog(self)
+        dlg.setWindowTitle("1-click presets")
+        layout = QVBoxLayout(dlg)
+
+        info = QLabel(
+            "Choose a preset for how intense the visuals should be.\n\n"
+            "Presets only change visual / FX options:\n"
+            "  • FX level and transitions\n"
+            "  • microclips + beats per base segment\n"
+            "  • slow-motion, cinematic and break-impact FX\n\n"
+            "They do NOT change:\n"
+            "  • which music track is selected\n"
+            "  • which clip(s) or folder are selected\n"
+            "  • the output folder or output resolution.\n\n"
+            "Set those first, then pick a preset and press OK.\n"
+            "After you confirm, the preset is applied and the normal\n"
+            "'Generate Music Clip' flow is started.",
+            dlg,
+        )
+        info.setWordWrap(True)
+        layout.addWidget(info)
+
+        list_widget = QListWidget(dlg)
+        # Load presets from JSON (if present) merged with built-ins.
+        presets = _load_clip_presets()
+        for _, name, desc in presets:
+            item = QListWidgetItem(name)
+            item.setToolTip(desc)
+            list_widget.addItem(item)
+        list_widget.setCurrentRow(0)
+        layout.addWidget(list_widget)
+
+        buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel, dlg)
+        layout.addWidget(buttons)
+        buttons.accepted.connect(dlg.accept)
+        buttons.rejected.connect(dlg.reject)
+
+        if dlg.exec() != QDialog.Accepted:
+            return
+
+        row = list_widget.currentRow()
+        if row < 0 or row >= len(presets):
+            return
+
+        preset_id, preset_name, _ = presets[row]
+        self._apply_preset(preset_id, preset_name)
+
+        # Fire off the normal generate logic with the chosen preset.
+        self._on_generate()
+
+    def _apply_preset(self, preset_id: str, preset_name: str) -> None:
+        """
+        Apply one of the 1-click FX presets to the current UI.
+
+        The actual preset values are loaded from clip_presets.json so that
+        presets live in data instead of code. Only the two safe presets
+        ("clean" / NoFX and "chill" / slow cinematic) keep a hard-coded
+        fallback so the dialog still works if the JSON file is missing.
+        """
+        # ---------- global baseline ----------
+        # No-FX off by default (individual presets may turn it back on).
+        self.check_nofx.setChecked(False)
+
+        # Microclips
+        self.check_micro_chorus.setChecked(False)
+        self.check_micro_all.setChecked(False)
+        try:
+            self.check_micro_verses.setChecked(False)
+        except Exception:
+            pass
+
+        # Fades: all presets keep gentle fades in/out.
+        self.check_intro_fade.setChecked(True)
+        self.check_outro_fade.setChecked(True)
+
+        # Slow-motion base
+        self.check_slow_enable.setChecked(False)
+        for cb in (
+            self.check_slow_intro,
+            self.check_slow_break,
+            self.check_slow_chorus,
+            self.check_slow_drop,
+            self.check_slow_outro,
+            self.check_slow_random,
+        ):
+            cb.setChecked(False)
+        self.slider_slow_factor.setValue(50)  # 0.50x baseline (only used when enabled)
+
+        # Cinematic base
+        self.check_cine_enable.setChecked(False)
+        self.check_cine_freeze.setChecked(False)
+        self.check_cine_stutter.setChecked(False)
+        self.check_cine_reverse.setChecked(False)
+        self.check_cine_speed_ramp.setChecked(False)
+        self.check_cine_boomerang.setChecked(False)
+        # New camera motion toggles
+        self.check_cine_dolly.setChecked(False)
+        self.check_cine_kenburns.setChecked(False)
+        try:
+            self.slider_cine_dolly_strength.setValue(50)
+            self.slider_cine_kenburns_strength.setValue(40)
+            self.combo_cine_motion_dir.setCurrentIndex(0)
+        except Exception:
+            pass
+
+        # Break-impact base
+        self.check_impact_enable.setChecked(False)
+        for cb in (
+            self.check_impact_flash,
+            self.check_impact_shock,
+            self.check_impact_confetti,
+            self.check_impact_zoom,
+            self.check_impact_shake,
+            self.check_impact_fog,
+            self.check_impact_fire_gold,
+            self.check_impact_fire_multi,
+            self.check_impact_random,
+        ):
+            cb.setChecked(False)
+
+        # Transitions + beats baseline
+        self.combo_transitions.setCurrentIndex(1)  # Hard cuts
+        self.check_trans_random.setChecked(False)
+        self.spin_beats_per_seg.setValue(2)        # mid-speed by default
+        self.combo_fx.setCurrentIndex(1)           # Moderate by default
+
+        # ---------- JSON‑driven preset body ----------
+
+        settings = _get_clip_preset_settings(preset_id)
+
+        if isinstance(settings, dict):
+            # Apply JSON settings on top of the baseline.
+            self._apply_preset_from_settings_dict(settings)
+        else:
+            # If JSON is missing or this preset id is not defined, fall back
+            # to the two safe built-ins so the classic behaviour still works.
+            if preset_id == "clean":
+                self.check_nofx.setChecked(True)
+                self.combo_fx.setCurrentIndex(0)   # Minimal
+                self.spin_beats_per_seg.setValue(8)
+                self.combo_transitions.setCurrentIndex(1)  # Hard cuts only
+
+            elif preset_id == "chill":
+                self.combo_fx.setCurrentIndex(0)   # Minimal
+                self.spin_beats_per_seg.setValue(16)
+                self.check_slow_enable.setChecked(True)
+                try:
+                    self.check_slow_break.setChecked(True)
+                    self.check_slow_chorus.setChecked(True)
+                except Exception:
+                    pass
+                self.slider_slow_factor.setValue(60)  # 0.60x
+                self.check_cine_enable.setChecked(True)
+                self.check_cine_freeze.setChecked(True)
+                self.slider_cine_freeze_len.setValue(70)   # 0.70 s
+                self.slider_cine_freeze_zoom.setValue(10)  # subtle zoom
+                self.check_cine_speed_ramp.setChecked(True)
+                self.slider_cine_ramp_in.setValue(25)      # 0.25 s
+                self.slider_cine_ramp_out.setValue(25)     # 0.25 s
+                # Chill: gentle Ken Burns only, no dolly-zoom by default.
+                self.check_cine_dolly.setChecked(False)
+                self.check_cine_kenburns.setChecked(True)
+                try:
+                    self.slider_cine_dolly_strength.setValue(35)
+                    self.slider_cine_kenburns_strength.setValue(40)
+                    self.combo_cine_motion_dir.setCurrentIndex(0)
+                except Exception:
+                    pass
+                self.combo_transitions.setCurrentIndex(0)  # Soft film dissolves
+            else:
+                # Unknown preset without JSON data – leave the baseline in place
+                # and show a friendly message instead of crashing.
+                try:
+                    self._info(
+                        "Preset not found",
+                        f"Preset '{preset_name}' (id: {preset_id}) is not defined in "
+                        "clip_presets.json and has no built-in fallback.\n\n"
+                        "Please re-save your presets or update the presets file."
+                    )
+                except Exception:
+                    pass
+
+        try:
+            self.label_summary.setText(f"Preset applied: {preset_name}")
+        except Exception:
+            pass
+
+
+    def _apply_preset_from_settings_dict(self, settings: dict) -> None:
+        """Apply a preset settings dict (from clip_presets.json) onto the UI.
+
+        The dict uses widget attribute names as keys (for example
+        "check_nofx", "combo_fx", "spin_beats_per_seg", "slider_slow_factor"...)
+        and the method does a best-effort mapping to the actual Qt widgets.
+
+        Any unknown keys or missing widgets are silently ignored so that
+        presets stay forwards‑compatible with future UI tweaks.
+        """
+        for key, value in settings.items():
+            attr = getattr(self, key, None)
+            if attr is None:
+                continue
+            try:
+                # QCheckBox / QAbstractButton‑style
+                if hasattr(attr, "setChecked"):
+                    attr.setChecked(bool(value))
+                    continue
+                # QComboBox‑style
+                if hasattr(attr, "setCurrentIndex"):
+                    try:
+                        idx = int(value)
+                    except Exception:
+                        continue
+                    attr.setCurrentIndex(idx)
+                    continue
+                # Sliders / spinboxes etc. – anything that exposes setValue().
+                if hasattr(attr, "setValue"):
+                    try:
+                        attr.setValue(value)
+                    except TypeError:
+                        try:
+                            # Fallback conversions for json numbers.
+                            if isinstance(value, bool):
+                                attr.setValue(int(value))
+                            else:
+                                attr.setValue(float(value))
+                        except Exception:
+                            # Last resort, try int() and ignore on failure.
+                            try:
+                                attr.setValue(int(value))
+                            except Exception:
+                                pass
+            except Exception:
+                # Never crash if a single field fails – just skip it.
+                continue
+    def _load_settings(self) -> None:
+        """Load last-used paths and options from QSettings."""
+        s = self._settings
+        self.edit_audio.setText(s.value("audio_path", "", str))
+        self.edit_video.setText(s.value("video_path", "", str))
+        self.edit_output.setText(s.value("output_path", "", str))
+
+        self.combo_fx.setCurrentIndex(int(s.value("fx_level", self.combo_fx.currentIndex())))
+        self.check_nofx.setChecked(bool(int(s.value("nofx", int(self.check_nofx.isChecked() if hasattr(self, "check_nofx") else 0)))))
+        if hasattr(self, "check_visual_overlay"):
+            self.check_visual_overlay.setChecked(bool(int(s.value("visual_overlay", int(self.check_visual_overlay.isChecked())))))
+        if hasattr(self, "check_visual_strategy_segment"):
+            self.check_visual_strategy_segment.setChecked(bool(int(s.value("visual_strategy_segment", int(self.check_visual_strategy_segment.isChecked())))))
+        if hasattr(self, "check_visual_strategy_section"):
+            self.check_visual_strategy_section.setChecked(bool(int(s.value("visual_strategy_section", int(self.check_visual_strategy_section.isChecked())))))
+        self.check_micro_chorus.setChecked(bool(int(s.value("micro_chorus", int(self.check_micro_chorus.isChecked())))))
+        self.check_micro_all.setChecked(bool(int(s.value("micro_all", int(self.check_micro_all.isChecked())))))
+        if hasattr(self, "check_micro_verses"):
+            self.check_micro_verses.setChecked(bool(int(s.value("micro_verses", int(self.check_micro_verses.isChecked())))))
+        self.check_full_length.setChecked(True)
+        self.check_intro_fade.setChecked(bool(int(s.value("intro_fade", int(self.check_intro_fade.isChecked())))))
+        self.check_outro_fade.setChecked(bool(int(s.value("outro_fade", int(self.check_outro_fade.isChecked())))))
+        self.combo_clip_order.setCurrentIndex(int(s.value("clip_order", self.combo_clip_order.currentIndex())))
+        self.combo_transitions.setCurrentIndex(int(s.value("transitions_mode", self.combo_transitions.currentIndex())))
+        self.check_trans_random.setChecked(bool(int(s.value("transitions_random", int(self.check_trans_random.isChecked())))))
+        self.spin_seed.setValue(int(s.value("seed_value", self.spin_seed.value())))
+        self.check_use_seed.setChecked(bool(int(s.value("use_seed", int(self.check_use_seed.isChecked())))))
+        self.combo_res.setCurrentIndex(int(s.value("res_mode", self.combo_res.currentIndex())))
+        self.combo_fit.setCurrentIndex(int(s.value("fit_mode", self.combo_fit.currentIndex())))
+
+        self.slider_sens.setValue(int(s.value("beat_sensitivity", self.slider_sens.value())))
+        self.spin_beats_per_seg.setValue(int(s.value("beats_per_segment", self.spin_beats_per_seg.value())))
+
+        self.check_min_clip.setChecked(bool(int(s.value("min_clip_enabled", int(self.check_min_clip.isChecked())))))
+        self.spin_min_clip.setValue(float(s.value("min_clip_seconds", self.spin_min_clip.value())))
+
+        # Slow motion options
+        self.check_slow_enable.setChecked(bool(int(s.value("slow_enable", int(self.check_slow_enable.isChecked())))))
+        self.check_slow_intro.setChecked(bool(int(s.value("slow_intro", int(self.check_slow_intro.isChecked())))))
+        self.check_slow_break.setChecked(bool(int(s.value("slow_break", int(self.check_slow_break.isChecked())))))
+        self.check_slow_chorus.setChecked(bool(int(s.value("slow_chorus", int(self.check_slow_chorus.isChecked())))))
+        self.check_slow_drop.setChecked(bool(int(s.value("slow_drop", int(self.check_slow_drop.isChecked())))))
+        self.check_slow_outro.setChecked(bool(int(s.value("slow_outro", int(self.check_slow_outro.isChecked())))))
+        self.check_slow_random.setChecked(bool(int(s.value("slow_random", int(self.check_slow_random.isChecked())))))
+        self.slider_slow_factor.setValue(int(s.value("slow_factor_slider", self.slider_slow_factor.value())))
+
+        # Cinematic effects options
+        self.check_cine_enable.setChecked(bool(int(s.value("cine_enable", int(self.check_cine_enable.isChecked())))))
+        self.check_cine_freeze.setChecked(bool(int(s.value("cine_freeze", int(self.check_cine_freeze.isChecked())))))
+        self.slider_cine_freeze_len.setValue(int(s.value("cine_freeze_len", self.slider_cine_freeze_len.value())))
+        self.slider_cine_freeze_zoom.setValue(int(s.value("cine_freeze_zoom", self.slider_cine_freeze_zoom.value())))
+        self.check_cine_stutter.setChecked(bool(int(s.value("cine_stutter", int(self.check_cine_stutter.isChecked())))))
+        self.spin_cine_stutter_repeats.setValue(int(s.value("cine_stutter_repeats", self.spin_cine_stutter_repeats.value())))
+        self.check_cine_reverse.setChecked(bool(int(s.value("cine_reverse", int(self.check_cine_reverse.isChecked())))))
+        self.slider_cine_reverse_len.setValue(int(s.value("cine_reverse_len", self.slider_cine_reverse_len.value())))
+        self.check_cine_speed_ramp.setChecked(bool(int(s.value("cine_speed_ramp", int(self.check_cine_speed_ramp.isChecked())))))
+        self.slider_cine_ramp_in.setValue(int(s.value("cine_ramp_in", self.slider_cine_ramp_in.value())))
+        self.slider_cine_ramp_out.setValue(int(s.value("cine_ramp_out", self.slider_cine_ramp_out.value())))
+        self.check_cine_boomerang.setChecked(bool(int(s.value("cine_boomerang", int(self.check_cine_boomerang.isChecked())))))
+        self.slider_cine_boomerang_bounces.setValue(int(s.value("cine_boomerang_bounces", self.slider_cine_boomerang_bounces.value())))
+
+        self.check_cine_mosaic.setChecked(bool(int(s.value("cine_mosaic", int(self.check_cine_mosaic.isChecked())))))
+        self.slider_cine_mosaic_screens.setValue(int(s.value("cine_mosaic_screens", self.slider_cine_mosaic_screens.value())))
+        self.check_cine_mosaic_random.setChecked(bool(int(s.value("cine_mosaic_random", int(self.check_cine_mosaic_random.isChecked())))))
+        self.check_cine_flip.setChecked(bool(int(s.value("cine_flip", int(self.check_cine_flip.isChecked())))))
+        self.check_cine_rotate.setChecked(bool(int(s.value("cine_rotate", int(self.check_cine_rotate.isChecked())))))
+        self.slider_cine_rotate_degrees.setValue(int(s.value("cine_rotate_degrees", self.slider_cine_rotate_degrees.value())))
+        self.check_cine_multiply.setChecked(bool(int(s.value("cine_multiply", int(self.check_cine_multiply.isChecked())))))
+        self.slider_cine_multiply_screens.setValue(int(s.value("cine_multiply_screens", self.slider_cine_multiply_screens.value())))
+        self.check_cine_multiply_random.setChecked(bool(int(s.value("cine_multiply_random", int(self.check_cine_multiply_random.isChecked())))))
+
+        # Break impact FX options
+        self.check_impact_enable.setChecked(bool(int(s.value("impact_enable", int(getattr(self, "check_impact_enable").isChecked())))))
+        self.check_impact_flash.setChecked(bool(int(s.value("impact_flash", int(self.check_impact_flash.isChecked())))))
+        self.slider_impact_flash.setValue(int(s.value("impact_flash_strength", self.slider_impact_flash.value())))
+        self.check_impact_shock.setChecked(bool(int(s.value("impact_shock", int(self.check_impact_shock.isChecked())))))
+        self.slider_impact_shock.setValue(int(s.value("impact_shock_strength", self.slider_impact_shock.value())))
+        self.check_impact_confetti.setChecked(bool(int(s.value("impact_confetti", int(self.check_impact_confetti.isChecked())))))
+        self.slider_impact_confetti.setValue(int(s.value("impact_confetti_density", self.slider_impact_confetti.value())))
+        self.check_impact_zoom.setChecked(bool(int(s.value("impact_zoom", int(self.check_impact_zoom.isChecked())))))
+        self.slider_impact_zoom.setValue(int(s.value("impact_zoom_amount", self.slider_impact_zoom.value())))
+        self.check_impact_shake.setChecked(bool(int(s.value("impact_shake", int(self.check_impact_shake.isChecked())))))
+        self.slider_impact_shake.setValue(int(s.value("impact_shake_strength", self.slider_impact_shake.value())))
+        self.check_impact_fog.setChecked(bool(int(s.value("impact_fog", int(self.check_impact_fog.isChecked())))))
+        self.slider_impact_fog.setValue(int(s.value("impact_fog_density", self.slider_impact_fog.value())))
+        self.check_impact_fire_gold.setChecked(bool(int(s.value("impact_fire_gold", int(self.check_impact_fire_gold.isChecked())))))
+        self.slider_impact_fire_gold.setValue(int(s.value("impact_fire_gold_intensity", self.slider_impact_fire_gold.value())))
+        self.check_impact_fire_multi.setChecked(bool(int(s.value("impact_fire_multi", int(self.check_impact_fire_multi.isChecked())))))
+        self.slider_impact_fire_multi.setValue(int(s.value("impact_fire_multi_intensity", self.slider_impact_fire_multi.value())))
+        self.check_impact_random.setChecked(bool(int(s.value("impact_random", int(self.check_impact_random.isChecked())))))
+
+        # Hidden break-impact FX rows are always disabled, even if older settings had them on.
+        for cb in (
+            getattr(self, "check_impact_confetti", None),
+            getattr(self, "check_impact_fog", None),
+            getattr(self, "check_impact_fire_gold", None),
+            getattr(self, "check_impact_fire_multi", None),
+        ):
+            if cb is not None:
+                try:
+                    cb.setChecked(False)
+                except Exception:
+                    pass
+
+        # Ensure transitions dropdown visibility matches restored random toggle
+        self._update_transition_visibility()
+        # Ensure slow-motion controls reflect restored toggle
+        self._on_slow_toggle(int(self.check_slow_enable.isChecked()))
+        self._on_slow_factor_changed(self.slider_slow_factor.value())
+        # Ensure cinematic controls visibility + labels
+        self._on_cine_toggle(int(self.check_cine_enable.isChecked()))
+        self._on_cine_freeze_len_changed(self.slider_cine_freeze_len.value())
+        self._on_cine_freeze_zoom_changed(self.slider_cine_freeze_zoom.value())
+        self._on_cine_reverse_len_changed(self.slider_cine_reverse_len.value())
+        self._on_cine_ramp_in_changed(self.slider_cine_ramp_in.value())
+        self._on_cine_ramp_out_changed(self.slider_cine_ramp_out.value())
+        self._on_cine_boomerang_bounces_changed(self.slider_cine_boomerang_bounces.value())
+        self._on_cine_mosaic_screens_changed(self.slider_cine_mosaic_screens.value())
+        self._on_cine_mosaic_random_changed(self.check_cine_mosaic_random.isChecked())
+        self._on_cine_dolly_strength_changed(self.slider_cine_dolly_strength.value())
+        self._on_cine_kenburns_strength_changed(self.slider_cine_kenburns_strength.value())
+        # Ensure break impact FX panel visibility + labels
+        try:
+            self.impact_options.setVisible(self.check_impact_enable.isChecked())
+        except Exception:
+            pass
+        self._on_impact_flash_changed(self.slider_impact_flash.value())
+        self._on_impact_shock_changed(self.slider_impact_shock.value())
+        self._on_impact_confetti_changed(self.slider_impact_confetti.value())
+        self._on_impact_zoom_changed(self.slider_impact_zoom.value())
+        self._on_impact_shake_changed(self.slider_impact_shake.value())
+        self._on_impact_fog_changed(self.slider_impact_fog.value())
+        self._on_impact_fire_gold_changed(self.slider_impact_fire_gold.value())
+        self._on_impact_fire_multi_changed(self.slider_impact_fire_multi.value())
+
+        # Load per-section visual overrides for music-player overlay (if present).
+        try:
+            raw_viz_sections = s.value("visual_section_overrides", "", str)
+        except Exception:
+            raw_viz_sections = ""
+        overrides = {}
+        if raw_viz_sections:
+            try:
+                data = json.loads(raw_viz_sections)
+                if isinstance(data, dict):
+                    for k, v in data.items():
+                        key = str(k).lower().strip()
+                        if not key:
+                            continue
+                        if v in (None, ""):
+                            overrides[key] = None
+                        else:
+                            overrides[key] = str(v)
+            except Exception:
+                overrides = {}
+        self._visual_section_overrides = overrides
+        try:
+            self._update_visual_section_summary()
+        except Exception:
+            pass
+
+        # Load visual overlay opacity (music-player visuals alpha).
+        try:
+            alpha = float(s.value("visual_overlay_opacity", self.visual_overlay_opacity))
+        except Exception:
+            alpha = float(getattr(self, "visual_overlay_opacity", 0.25))
+        alpha = max(0.10, min(1.0, alpha))
+        self.visual_overlay_opacity = alpha
+        
+        slider = getattr(self, "slider_visual_opacity", None)
+        if slider is not None:
+            try:
+                slider.blockSignals(True)
+                slider.setValue(int(round(alpha * 100.0)))
+            finally:
+                slider.blockSignals(False)
+        
+        spin = getattr(self, "spin_visual_opacity", None)
+        if spin is not None:
+            try:
+                spin.blockSignals(True)
+                spin.setValue(alpha)
+            finally:
+                spin.blockSignals(False)
+
+    def _save_settings(self) -> None:
+        """Save last-used paths and options to QSettings."""
+        s = self._settings
+        s.setValue("audio_path", self.edit_audio.text().strip())
+        s.setValue("video_path", self.edit_video.text().strip())
+        s.setValue("output_path", self.edit_output.text().strip())
+
+        s.setValue("fx_level", self.combo_fx.currentIndex())
+        s.setValue("nofx", int(self.check_nofx.isChecked()))
+        if hasattr(self, "check_visual_overlay"):
+            s.setValue("visual_overlay", int(self.check_visual_overlay.isChecked()))
+        if hasattr(self, "check_visual_strategy_segment"):
+            s.setValue("visual_strategy_segment", int(self.check_visual_strategy_segment.isChecked()))
+        if hasattr(self, "check_visual_strategy_section"):
+            s.setValue("visual_strategy_section", int(self.check_visual_strategy_section.isChecked()))
+        s.setValue("visual_section_overrides", json.dumps(getattr(self, "_visual_section_overrides", {})))
+        s.setValue("visual_overlay_opacity", float(getattr(self, "visual_overlay_opacity", 0.25)))
+        s.setValue("micro_chorus", int(self.check_micro_chorus.isChecked()))
+        s.setValue("micro_all", int(self.check_micro_all.isChecked()))
+        if hasattr(self, "check_micro_verses"):
+            s.setValue("micro_verses", int(self.check_micro_verses.isChecked()))
+        s.setValue("full_length", int(self.check_full_length.isChecked()))
+        s.setValue("intro_fade", int(self.check_intro_fade.isChecked()))
+        s.setValue("outro_fade", int(self.check_outro_fade.isChecked()))
+        s.setValue("clip_order", self.combo_clip_order.currentIndex())
+        s.setValue("transitions_mode", self.combo_transitions.currentIndex())
+        s.setValue("transitions_random", int(self.check_trans_random.isChecked()))
+        s.setValue("seed_value", self.spin_seed.value())
+        s.setValue("use_seed", int(self.check_use_seed.isChecked()))
+        s.setValue("res_mode", self.combo_res.currentIndex())
+        s.setValue("fit_mode", self.combo_fit.currentIndex())
+
+        s.setValue("beat_sensitivity", self.slider_sens.value())
+        s.setValue("beats_per_segment", self.spin_beats_per_seg.value())
+
+        s.setValue("min_clip_enabled", int(self.check_min_clip.isChecked()))
+        s.setValue("min_clip_seconds", float(self.spin_min_clip.value()))
+
+        # Slow motion options
+        s.setValue("slow_enable", int(self.check_slow_enable.isChecked()))
+        s.setValue("slow_intro", int(self.check_slow_intro.isChecked()))
+        s.setValue("slow_break", int(self.check_slow_break.isChecked()))
+        s.setValue("slow_chorus", int(self.check_slow_chorus.isChecked()))
+        s.setValue("slow_drop", int(self.check_slow_drop.isChecked()))
+        s.setValue("slow_outro", int(self.check_slow_outro.isChecked()))
+        s.setValue("slow_random", int(self.check_slow_random.isChecked()))
+        s.setValue("slow_factor_slider", int(self.slider_slow_factor.value()))
+
+        # Cinematic effects options
+        s.setValue("cine_enable", int(self.check_cine_enable.isChecked()))
+        s.setValue("cine_freeze", int(self.check_cine_freeze.isChecked()))
+        s.setValue("cine_freeze_len", int(self.slider_cine_freeze_len.value()))
+        s.setValue("cine_freeze_zoom", int(self.slider_cine_freeze_zoom.value()))
+        s.setValue("cine_stutter", int(self.check_cine_stutter.isChecked()))
+        s.setValue("cine_stutter_repeats", int(self.spin_cine_stutter_repeats.value()))
+        s.setValue("cine_reverse", int(self.check_cine_reverse.isChecked()))
+        s.setValue("cine_reverse_len", int(self.slider_cine_reverse_len.value()))
+        s.setValue("cine_speed_ramp", int(self.check_cine_speed_ramp.isChecked()))
+        s.setValue("cine_ramp_in", int(self.slider_cine_ramp_in.value()))
+        s.setValue("cine_ramp_out", int(self.slider_cine_ramp_out.value()))
+        s.setValue("cine_boomerang", int(self.check_cine_boomerang.isChecked()))
+        s.setValue("cine_boomerang_bounces", int(self.slider_cine_boomerang_bounces.value()))
+        s.setValue("cine_mosaic", int(self.check_cine_mosaic.isChecked()))
+        s.setValue("cine_mosaic_screens", int(self.slider_cine_mosaic_screens.value()))
+        s.setValue("cine_mosaic_random", int(self.check_cine_mosaic_random.isChecked()))
+        s.setValue("cine_flip", int(self.check_cine_flip.isChecked()))
+        s.setValue("cine_rotate", int(self.check_cine_rotate.isChecked()))
+        s.setValue("cine_rotate_degrees", int(self.slider_cine_rotate_degrees.value()))
+        s.setValue("cine_multiply", int(self.check_cine_multiply.isChecked()))
+        s.setValue("cine_multiply_screens", int(self.slider_cine_multiply_screens.value()))
+        s.setValue("cine_multiply_random", int(self.check_cine_multiply_random.isChecked()))
+        s.setValue("cine_dolly", int(self.check_cine_dolly.isChecked()))
+        s.setValue("cine_dolly_strength", int(self.slider_cine_dolly_strength.value()))
+        s.setValue("cine_kenburns", int(self.check_cine_kenburns.isChecked()))
+        s.setValue("cine_kenburns_strength", int(self.slider_cine_kenburns_strength.value()))
+        s.setValue("cine_motion_dir", int(self.combo_cine_motion_dir.currentIndex()))
+        # Break impact FX options
+        s.setValue("impact_enable", int(self.check_impact_enable.isChecked()))
+        s.setValue("impact_flash", int(self.check_impact_flash.isChecked()))
+        s.setValue("impact_flash_strength", int(self.slider_impact_flash.value()))
+        s.setValue("impact_shock", int(self.check_impact_shock.isChecked()))
+        s.setValue("impact_shock_strength", int(self.slider_impact_shock.value()))
+        s.setValue("impact_confetti", int(self.check_impact_confetti.isChecked()))
+        s.setValue("impact_confetti_density", int(self.slider_impact_confetti.value()))
+        s.setValue("impact_zoom", int(self.check_impact_zoom.isChecked()))
+        s.setValue("impact_zoom_amount", int(self.slider_impact_zoom.value()))
+        s.setValue("impact_shake", int(self.check_impact_shake.isChecked()))
+        s.setValue("impact_shake_strength", int(self.slider_impact_shake.value()))
+        s.setValue("impact_fog", int(self.check_impact_fog.isChecked()))
+        s.setValue("impact_fog_density", int(self.slider_impact_fog.value()))
+        s.setValue("impact_fire_gold", int(self.check_impact_fire_gold.isChecked()))
+        s.setValue("impact_fire_gold_intensity", int(self.slider_impact_fire_gold.value()))
+        s.setValue("impact_fire_multi", int(self.check_impact_fire_multi.isChecked()))
+        s.setValue("impact_fire_multi_intensity", int(self.slider_impact_fire_multi.value()))
+        s.setValue("impact_random", int(self.check_impact_random.isChecked()))
+
+    # dialogs / helpers
+
+    def _browse_audio(self) -> None:
+        path, _ = QFileDialog.getOpenFileName(
+            self,
+            "Select music/audio file",
+            "",
+            "Audio files (*.mp3 *.wav *.flac *.m4a *.ogg);;All files (*.*)",
+        )
+        if path:
+            self.edit_audio.setText(path)
+
+    def _browse_video_file(self) -> None:
+        path, _ = QFileDialog.getOpenFileName(
+            self,
+            "Select video file",
+            "",
+            "Video files (*.mp4 *.mov *.mkv *.avi *.webm *.mpg *.mpeg);;All files (*.*)",
+        )
+        if path:
+            self.edit_video.setText(path)
+
+    def _browse_video_dir(self) -> None:
+        path = QFileDialog.getExistingDirectory(self, "Select folder with clips", "")
+        if path:
+            self.edit_video.setText(path)
+
+    def _browse_video_files(self) -> None:
+        paths, _ = QFileDialog.getOpenFileNames(
+            self,
+            "Select one or more video clips",
+            "",
+            "Video files (*.mp4 *.mov *.mkv *.avi *.webm *.mpg *.mpeg);;All files (*.*)",
+        )
+        if paths:
+            # Join multiple paths with '|' so discovery can treat them as a list
+            self.edit_video.setText("|".join(paths))
+
+    def _browse_output(self) -> None:
+        path = QFileDialog.getExistingDirectory(self, "Select output folder", "")
+        if path:
+            self.edit_output.setText(path)
+
+    def _on_load_clips(self) -> None:
+        """Load one or more video clips (or a folder) into the sources list."""
+        options = QFileDialog.Options()
+        files, _ = QFileDialog.getOpenFileNames(
+            self,
+            "Select Video Clips",
+            "",
+            "Video files (*.mp4 *.mov *.mkv *.avi *.webm *.mpg *.mpeg);;All Files (*)",
+            options=options,
+        )
+        video_input = ""
+        if files:
+            video_input = "|".join(files)
+            # Update text field for consistency with the existing video input logic
+            self.edit_video.setText(video_input)
+        else:
+            folder = QFileDialog.getExistingDirectory(self, "Select Clips Folder")
+            if not folder:
+                return
+            video_input = folder
+            self.edit_video.setText(video_input)
+
+        # Discover clip sources using the same helper as the background scanner.
+        try:
+            sources = discover_video_sources(video_input, self._ffprobe)
+        except Exception:
+            sources = []
+
+        if not sources:
+            self._error("No clips", "Could not find any usable video clips in the selection.")
+            return
+
+        self.clip_sources = sources
+        self._update_sources_list()
+
+    def _on_load_images(self) -> None:
+        """Load one or more images (or a folder) and add as short video clips."""
+        options = QFileDialog.Options()
+        files, _ = QFileDialog.getOpenFileNames(
+            self,
+            "Select Images",
+            "",
+            "Images (*.png *.jpg *.jpeg *.bmp *.gif *.webp);;All Files (*)",
+            options=options,
+        )
+        if not files:
+            folder = QFileDialog.getExistingDirectory(self, "Select Images Folder")
+            if folder:
+                import glob
+                extensions = ["*.png", "*.jpg", "*.jpeg", "*.bmp", "*.gif", "*.webp"]
+                files = []
+                for ext in extensions:
+                    files.extend(glob.glob(os.path.join(folder, ext)))
+                    files.extend(glob.glob(os.path.join(folder, ext.upper())))
+
+        if not files:
+            return
+
+        # Convert images to short clips with random duration
+        for img_path in files:
+            duration = random.uniform(1.5, 3.0)  # 3-8 seconds per image
+            clip = ClipSource(
+                path=img_path,
+                duration=duration,
+            )
+            clip.is_image = True  # Mark as image
+            self.image_sources.append(clip)
+
+        self._update_sources_list()
+
+    def _error(self, title: str, msg: str) -> None:
+        QMessageBox.critical(self, title, msg, QMessageBox.Ok)
+
+    def _info(self, title: str, msg: str) -> None:
+        QMessageBox.information(self, title, msg, QMessageBox.Ok)
+
+    def _resolve_paths(self) -> Optional[Tuple[str, str, str]]:
+        audio = self.edit_audio.text().strip()
+        video = self.edit_video.text().strip()
+        out_dir = self.edit_output.text().strip()
+
+        if not audio or not os.path.isfile(audio):
+            self._error("Missing audio", "Please select a valid music/audio file.")
+            return None
+
+        # video can be:
+        # - a single file
+        # - a folder
+        # - or a '|' separated list of files (from Clip files... picker)
+        if not video:
+            self._error(
+                "Missing video input",
+                "Please select a valid video file, a folder containing clips, "
+                "or use the Clip files... button to pick multiple clips.",
+            )
+            return None
+
+        if "|" in video:
+            # basic validation: at least one existing file in the list
+            parts = [p.strip() for p in video.split("|") if p.strip()]
+            if not parts or not any(os.path.isfile(p) for p in parts):
+                self._error(
+                    "Missing video input",
+                    "None of the selected clip files could be found. Please re-select your clips.",
+                )
+                return None
+        elif not (os.path.isfile(video) or os.path.isdir(video)):
+            self._error(
+                "Missing video input",
+                "Please select a valid video file or a folder containing clips.",
+            )
+            return None
+        if not out_dir:
+            out_dir = os.path.join(os.path.dirname(audio), "output")
+            self.edit_output.setText(out_dir)
+        _ensure_dir(out_dir)
+        return audio, video, out_dir
+
+    # microclip mode mutual exclusivity
+
+    def _on_micro_mode_changed(self, state: int) -> None:
+        if not state:
+            return
+        sender = self.sender()
+        toggles = [
+            getattr(self, "check_micro_chorus", None),
+            getattr(self, "check_micro_all", None),
+            getattr(self, "check_micro_verses", None),
+        ]
+        for cb in toggles:
+            if cb is None or cb is sender:
+                continue
+            cb.blockSignals(True)
+            cb.setChecked(False)
+            cb.blockSignals(False)
+
+    def _on_seed_toggle(self, state: int) -> None:
+        enabled = state != 0
+        self.spin_seed.setEnabled(enabled)
+
+    def _on_slow_toggle(self, state: int) -> None:
+        # Show or hide slow-motion controls when the main toggle changes.
+        enabled = state != 0
+        try:
+            self.slow_options.setVisible(enabled)
+        except Exception:
+            pass
+
+    def _on_slow_factor_changed(self, value: int) -> None:
+        # Update the numeric label next to the slow-motion factor slider.
+        try:
+            factor = max(0.10, min(1.0, value / 100.0))
+        except Exception:
+            factor = 1.0
+        try:
+            self.label_slow_factor_value.setText(f"{factor:.2f}x")
+        except Exception:
+            pass
+        # Also refresh cinematic controls that depend on slow-motion being enabled.
+        try:
+            self._update_cine_controls_enabled()
+        except Exception:
+            pass
+
+    # --- cinematic effects helpers -------------------------------------
+
+    def _on_cine_toggle(self, state: int) -> None:
+        # Accept either Qt.CheckState values (0/1/2) or plain bool/int.
+        enabled = bool(state)
+        try:
+            self.cine_options.setVisible(enabled)
+        except Exception:
+            pass
+        try:
+            self._update_cine_controls_enabled()
+        except Exception:
+            pass
+
+    def _update_cine_controls_enabled(self) -> None:
+        cine_enabled = getattr(self, "check_cine_enable", None)
+        slow_enabled = getattr(self, "check_slow_enable", None)
+        cine_on = bool(cine_enabled and cine_enabled.isChecked())
+        slow_on = bool(slow_enabled and slow_enabled.isChecked())
+        ramp_ok = cine_on and slow_on
+        for w in (
+            getattr(self, "check_cine_speed_ramp", None),
+            getattr(self, "slider_cine_ramp_in", None),
+            getattr(self, "slider_cine_ramp_out", None),
+            getattr(self, "label_cine_ramp_in", None),
+            getattr(self, "label_cine_ramp_out", None),
+        ):
+            if w is not None:
+                try:
+                    w.setEnabled(ramp_ok)
+                except Exception:
+                    pass
+
+    def _on_cine_freeze_len_changed(self, value: int) -> None:
+        seconds = value / 100.0
+        try:
+            self.label_cine_freeze_len.setText(f"{seconds:.2f} s")
+        except Exception:
+            pass
+
+    def _on_cine_freeze_zoom_changed(self, value: int) -> None:
+        pct = value
+        try:
+            self.label_cine_freeze_zoom.setText(f"+{pct:d}%")
+        except Exception:
+            pass
+
+    def _on_cine_reverse_len_changed(self, value: int) -> None:
+        seconds = value / 100.0
+        try:
+            self.label_cine_reverse_len.setText(f"{seconds:.2f} s")
+        except Exception:
+            pass
+
+    def _on_cine_ramp_in_changed(self, value: int) -> None:
+        seconds = value / 100.0
+        try:
+            self.label_cine_ramp_in.setText(f"{seconds:.2f} s")
+        except Exception:
+            pass
+
+    def _on_cine_ramp_out_changed(self, value: int) -> None:
+        seconds = value / 100.0
+        try:
+            self.label_cine_ramp_out.setText(f"{seconds:.2f} s")
+        except Exception:
+            pass
+
+    def _on_cine_boomerang_bounces_changed(self, value: int) -> None:
+        try:
+            v = int(value)
+        except Exception:
+            v = 1
+        v = max(1, min(9, v))
+        try:
+            self.label_cine_boomerang_bounces.setText(f"x{v:d}")
+        except Exception:
+            pass
+
+    def _on_cine_mosaic_screens_changed(self, value: int) -> None:
+        """Clamp Mosaic slider to 2–9 screens and refresh the label."""
+        try:
+            v = int(value)
+        except Exception:
+            v = 4
+        # Clamp to supported range.
+        if v < 2:
+            v = 2
+        if v > 9:
+            v = 9
+        # Keep the slider's value in sync with the clamped number.
+        try:
+            if self.slider_cine_mosaic_screens.value() != v:
+                self.slider_cine_mosaic_screens.blockSignals(True)
+                self.slider_cine_mosaic_screens.setValue(v)
+                self.slider_cine_mosaic_screens.blockSignals(False)
+        except Exception:
+            pass
+        # Update label; when random is enabled, show a generic message instead.
+        try:
+            if hasattr(self, "check_cine_mosaic_random") and self.check_cine_mosaic_random.isChecked():
+                self.label_cine_mosaic_screens.setText("Random 2–9")
+            else:
+                self.label_cine_mosaic_screens.setText(f"{v} screens")
+        except Exception:
+            pass
+
+    def _on_cine_mosaic_random_changed(self, state: int) -> None:
+        """Enable/disable the Mosaic screens slider and adjust label when random is toggled."""
+        try:
+            is_random = bool(state)
+        except Exception:
+            try:
+                is_random = self.check_cine_mosaic_random.isChecked()
+            except Exception:
+                is_random = False
+        # Disable the slider when random is on, since each Mosaic hit will pick its own layout.
+        try:
+            self.slider_cine_mosaic_screens.setEnabled(not is_random)
+        except Exception:
+            pass
+        # Update label to reflect mode.
+        try:
+            if is_random:
+                self.label_cine_mosaic_screens.setText("Random 2–9")
+            else:
+                # Re-apply current slider value to refresh the label with a concrete number.
+                self._on_cine_mosaic_screens_changed(self.slider_cine_mosaic_screens.value())
+        except Exception:
+            pass
+
+
+
+    def _on_cine_multiply_screens_changed(self, value: int) -> None:
+        """Clamp Multiply slider to 2–9 copies and refresh the label."""
+        try:
+            v = int(value)
+        except Exception:
+            v = 4
+        # Clamp to supported range.
+        if v < 2:
+            v = 2
+        if v > 9:
+            v = 9
+        try:
+            if self.slider_cine_multiply_screens.value() != v:
+                self.slider_cine_multiply_screens.blockSignals(True)
+                self.slider_cine_multiply_screens.setValue(v)
+                self.slider_cine_multiply_screens.blockSignals(False)
+        except Exception:
+            pass
+        try:
+            if hasattr(self, "check_cine_multiply_random") and self.check_cine_multiply_random.isChecked():
+                self.label_cine_multiply_screens.setText("Random 2–9")
+            else:
+                self.label_cine_multiply_screens.setText(f"{v} copies")
+        except Exception:
+            pass
+
+    def _on_cine_multiply_random_changed(self, state: int) -> None:
+        """Enable/disable Multiply slider and adjust label when random is toggled."""
+        try:
+            is_random = bool(state)
+        except Exception:
+            try:
+                is_random = self.check_cine_multiply_random.isChecked()
+            except Exception:
+                is_random = False
+        try:
+            self.slider_cine_multiply_screens.setEnabled(not is_random)
+        except Exception:
+            pass
+        try:
+            if is_random:
+                self.label_cine_multiply_screens.setText("Random 2–9")
+            else:
+                self._on_cine_multiply_screens_changed(self.slider_cine_multiply_screens.value())
+        except Exception:
+            pass
+    def _on_cine_rotate_degrees_changed(self, value: int) -> None:
+        """Update label for the rotating screen max angle slider."""
+        try:
+            v = int(value)
+        except Exception:
+            v = 20
+        v = max(5, min(90, v))
+        try:
+            self.label_cine_rotate_degrees.setText(f"±{v:d}°")
+        except Exception:
+            pass
+
+
+
+    def _on_cine_dolly_strength_changed(self, value: int) -> None:
+        try:
+            v = int(value)
+        except Exception:
+            v = 40
+        v = max(10, min(100, v))
+        try:
+            self.label_cine_dolly_strength.setText(f"{v:d}%")
+        except Exception:
+            pass
+
+    def _on_cine_kenburns_strength_changed(self, value: int) -> None:
+        try:
+            v = int(value)
+        except Exception:
+            v = 10
+        try:
+            self.label_cine_kenburns_strength.setText(f"{v:d}%")
+        except Exception:
+            pass
+
+
+    # --- break impact FX helpers ----------------------------------------
+
+    def _on_impact_flash_changed(self, value: int) -> None:
+        try:
+            v = int(value)
+        except Exception:
+            v = 0
+        try:
+            self.label_impact_flash.setText(f"{v/100.0:.2f}")
+        except Exception:
+            pass
+
+    def _on_impact_shock_changed(self, value: int) -> None:
+        try:
+            v = int(value)
+        except Exception:
+            v = 0
+        try:
+            self.label_impact_shock.setText(f"{v/100.0:.2f}")
+        except Exception:
+            pass
+
+    def _on_impact_confetti_changed(self, value: int) -> None:
+        try:
+            v = int(value)
+        except Exception:
+            v = 0
+        try:
+            self.label_impact_confetti.setText(f"{v/100.0:.2f}")
+        except Exception:
+            pass
+
+    def _on_impact_zoom_changed(self, value: int) -> None:
+        try:
+            v = int(value)
+        except Exception:
+            v = 0
+        try:
+            self.label_impact_zoom.setText(f"{v:d}%")
+        except Exception:
+            pass
+
+    def _on_impact_shake_changed(self, value: int) -> None:
+        try:
+            v = int(value)
+        except Exception:
+            v = 0
+        try:
+            self.label_impact_shake.setText(f"{v/100.0:.2f}")
+        except Exception:
+            pass
+
+    def _on_impact_fog_changed(self, value: int) -> None:
+        try:
+            v = int(value)
+        except Exception:
+            v = 0
+        try:
+            self.label_impact_fog.setText(f"{v/100.0:.2f}")
+        except Exception:
+            pass
+
+    def _on_impact_fire_gold_changed(self, value: int) -> None:
+        try:
+            v = int(value)
+        except Exception:
+            v = 0
+        try:
+            self.label_impact_fire_gold.setText(f"{v/100.0:.2f}")
+        except Exception:
+            pass
+
+    def _on_impact_fire_multi_changed(self, value: int) -> None:
+        try:
+            v = int(value)
+        except Exception:
+            v = 0
+        try:
+            self.label_impact_fire_multi.setText(f"{v/100.0:.2f}")
+        except Exception:
+            pass
+
+    def _on_nofx_toggled(self, state: int) -> None:
+        """Master kill switch for all FX. When enabled, turn off all other FX toggles."""
+        enabled = bool(state)
+        if not enabled:
+            # When turning No FX off, we do not restore previous FX states; user can re-enable manually.
+            return
+
+        # While we are programmatically disabling other FX checkboxes, suppress the auto-release helper.
+        self._nofx_guard = True
+        try:
+            # Turn off slow motion
+            try:
+                self.check_slow_enable.setChecked(False)
+            except Exception:
+                pass
+            # Turn off cinematic effects
+            try:
+                self.check_cine_enable.setChecked(False)
+            except Exception:
+                pass
+            # Turn off break impact FX
+            try:
+                self.check_impact_enable.setChecked(False)
+            except Exception:
+                pass
+            # Disable random transitions to avoid surprise flash / creative modes.
+            try:
+                self.check_trans_random.setChecked(False)
+            except Exception:
+                pass
+            # Turn off music-player visuals overlay and strategies
+            try:
+                if hasattr(self, "check_visual_overlay"):
+                    self.check_visual_overlay.setChecked(False)
+            except Exception:
+                pass
+            try:
+                if hasattr(self, "check_visual_strategy_segment"):
+                    self.check_visual_strategy_segment.setChecked(False)
+            except Exception:
+                pass
+            try:
+                if hasattr(self, "check_visual_strategy_section"):
+                    self.check_visual_strategy_section.setChecked(False)
+            except Exception:
+                pass
+        finally:
+            self._nofx_guard = False
+    def _maybe_release_nofx(self) -> None:
+        """If No FX is currently enabled and the user explicitly turns some FX back on,
+        automatically release the master switch.
+
+        This is gated by ``_nofx_guard`` so internal changes (like when enabling
+        No FX itself or restoring settings) do not immediately flip it off again.
+        """
+        if getattr(self, "check_nofx", None) is None:
+            return
+        if self._nofx_guard:
+            return
+        if self.check_nofx.isChecked():
+            # Avoid recursive signal storms
+            self.check_nofx.blockSignals(True)
+            try:
+                self.check_nofx.setChecked(False)
+            finally:
+                self.check_nofx.blockSignals(False)
+
+    def _on_check_timeline(self) -> None:
+        """Switch to the Music timeline tab."""
+        try:
+            index = self.tabs.indexOf(self.timeline_panel)
+            if index != -1:
+                self.tabs.setCurrentIndex(index)
+        except Exception:
+            # Never let timeline navigation issues break the main tool.
+            pass
+
+    # --- Mini-timeline callbacks (per-section media links) -----------------
+
+    def _find_section_index(self, section) -> Optional[int]:
+        """Map a timeline section object back to its index in the analysis."""
+        if self._analysis is None or not getattr(self._analysis, "sections", None):
+            return None
+        sections = list(self._analysis.sections)
+        try:
+            return sections.index(section)
+        except ValueError:
+            target = (
+                float(getattr(section, "start", 0.0) or 0.0),
+                float(getattr(section, "end", 0.0) or 0.0),
+                str(getattr(section, "kind", "section") or "section"),
+            )
+            for idx, sec in enumerate(sections):
+                cur = (
+                    float(getattr(sec, "start", 0.0) or 0.0),
+                    float(getattr(sec, "end", 0.0) or 0.0),
+                    str(getattr(sec, "kind", "section") or "section"),
+                )
+                if cur == target:
+                    return idx
+        return None
+
+    def _update_timeline_media_label(self, section, path: Optional[str]) -> None:
+        """Ask the timeline panel to show the attached media name, if available."""
+        if not hasattr(self, "timeline_panel"):
+            return
+        try:
+            label = os.path.basename(path) if path else ""
+            if hasattr(self.timeline_panel, "set_section_media_label"):
+                # type: ignore[attr-defined]
+                self.timeline_panel.set_section_media_label(section, label)
+        except Exception:
+            # Never let UI decoration issues break the main tool.
+            pass
+
+    def _on_timeline_add(self, section) -> None:
+        """Right-click 'Add' on the mini-timeline: attach a clip or image."""
+        idx = self._find_section_index(section)
+        if idx is None:
+            return
+
+        filters = (
+            "Video files (*.mp4 *.mov *.mkv *.avi *.webm *.mpg *.mpeg *.m4v);;"
+            "Image files (*.png *.jpg *.jpeg *.bmp *.gif *.webp);;"
+            "All files (*.*)"
+        )
+        path, _ = QFileDialog.getOpenFileName(
+            self,
+            "Select video or image for this section",
+            "",
+            filters,
+        )
+        if not path:
+            return
+
+        ext = os.path.splitext(path)[1].lower()
+        is_image = ext in (".png", ".jpg", ".jpeg", ".bmp", ".gif", ".webp")
+
+        if is_image:
+            # Nominal duration for stills; real pacing follows the music.
+            duration = 2.5
+        else:
+            dur = _ffprobe_duration(self._ffprobe, path)
+            if dur is None or dur <= 0:
+                try:
+                    duration = float(getattr(self._analysis, "duration", 0.0) or 0.0)
+                except Exception:
+                    duration = 10.0
+                if duration <= 0:
+                    duration = 10.0
+            else:
+                duration = float(dur)
+
+        override = ClipSource(path=path, duration=duration)
+        # Remember whether this override came from an image or a video.
+        try:
+            override.is_image = bool(is_image)  # type: ignore[attr-defined]
+        except Exception:
+            pass
+
+        self._section_media[idx] = override
+        self._update_timeline_media_label(section, path)
+
+    def _on_timeline_remove(self, section) -> None:
+        """Right-click 'Remove' on the mini-timeline: clear attached media."""
+        idx = self._find_section_index(section)
+        if idx is None:
+            return
+        self._section_media.pop(idx, None)
+        self._update_timeline_media_label(section, None)
+
+    def _on_timeline_select(self, section) -> None:
+        """Section selection from the mini-timeline (hook kept for future use)."""
+        # TimelinePanel already highlights the matching row in its own table.
+        return
+
+    # analysis
+
+    def _on_analyze(self) -> None:
+        # If clips or images have been attached to the music timeline,
+        # warn that a fresh analysis will wipe those overrides.
+        try:
+            has_overrides = bool(getattr(self, "_section_media", {}))
+        except Exception:
+            has_overrides = False
+        if has_overrides:
+            from PySide6.QtWidgets import QMessageBox
+            box = QMessageBox(self)
+            box.setIcon(QMessageBox.Warning)
+            box.setWindowTitle("Warning")
+            box.setText(
+                "Analyzing will remove the video/image clips you added to the timeline.\n\n"
+                "Do you want to continue?"
+            )
+            btn_yes = box.addButton("Yes", QMessageBox.YesRole)
+            btn_no = box.addButton("No", QMessageBox.NoRole)
+            btn_keep = box.addButton("Use existing analysis", QMessageBox.RejectRole)
+            box.setDefaultButton(btn_yes)
+            box.exec()
+            clicked = box.clickedButton()
+            if clicked is btn_no:
+                return
+            if clicked is btn_keep:
+                # Skip re-analysis and keep the existing analysis and timeline clips.
+                return
+
+        resolved = self._resolve_paths()
+        if not resolved:
+            return
+        audio, _, _ = resolved
+        self.progress.setValue(0)
+        self.progress.setFormat("Analyzing music...")
+        # Sync analysis config with current UI
+        self._analysis_config.sensitivity = self.slider_sens.value()
+        try:
+            self._analysis = analyze_music(audio, self._ffmpeg, self._analysis_config)
+        except Exception as e:
+            self._analysis = None
+            self.progress.setValue(0)
+            self.progress.setFormat("Ready.")
+            self._error("Analysis failed", str(e))
+            return
+
+        # Reset any section-specific media overrides for this new analysis
+        self._section_media.clear()
+
+        beats = len(self._analysis.beats)
+        secs = len(self._analysis.sections)
+        self.progress.setValue(30)
+        self.progress.setFormat(f"Analysis complete: {beats} beats, {secs} sections.")
+
+        # Save current paths and analysis-related options
+        self._save_settings()
+
+        # Compact analysis summary under the progress bar
+        try:
+            total_dur = self._analysis.duration
+        except Exception:
+            total_dur = None
+
+        parts = []
+        if total_dur is not None:
+            parts.append(f"Total duration: {total_dur:.1f}s")
+        parts.append(f"Beats detected: {beats}")
+        parts.append(f"Sections: {secs}")
+        # Single‑line summary only; full structure lives in the Music timeline tab.
+        self.label_summary.setText(" \u2022 ".join(parts))
+        try:
+            # Reveal the shortcut once we have something meaningful to show.
+            self.btn_check_timeline.setVisible(True)
+        except Exception:
+            pass
+
+        # Update timeline tab with the latest analysis, if available.
+        try:
+            if hasattr(self, "timeline_panel") and hasattr(self.timeline_panel, "set_analysis") and self._analysis is not None:
+                self.timeline_panel.set_analysis(self._analysis)
+        except Exception:
+            # Never let timeline issues break the main tool.
+            pass
+    def _target_resolution(
+        self, sources: List[ClipSource], video_input: str
+    ) -> Optional[Tuple[int, int]]:
+        mode = self.combo_res.currentIndex()
+
+        # Mode 0: single video keep source
+        if os.path.isfile(video_input) and mode == 0:
+            return None
+
+        if not sources:
+            return None
+
+        def get_res(path: str) -> Optional[Tuple[int, int]]:
+            cmd = [
+                self._ffprobe,
+                "-v",
+                "error",
+                "-select_streams",
+                "v:0",
+                "-show_entries",
+                "stream=width,height",
+                "-of",
+                "json",
+                path,
+            ]
+            try:
+                out = subprocess.check_output(cmd, stderr=subprocess.STDOUT, text=True)
+                data = json.loads(out)
+                streams = data.get("streams") or []
+                if not streams:
+                    return None
+                s = streams[0]
+                return int(s.get("width", 0)), int(s.get("height", 0))
+            except Exception:
+                return None
+
+        res_list = []
+        for s in sources:
+            r = get_res(s.path)
+            if r and r[0] > 0 and r[1] > 0:
+                res_list.append(r)
+
+        if not res_list:
+            return None
+
+        if mode == 1:  # highest
+            w = max(r[0] for r in res_list)
+            h = max(r[1] for r in res_list)
+            return w, h
+        if mode == 2:  # lowest
+            w = min(r[0] for r in res_list)
+            h = min(r[1] for r in res_list)
+            return w, h
+        if mode == 3:
+            return 854, 480
+        if mode == 4:
+            return 1280, 720
+        if mode == 5:
+            return 1920, 1080
+        return None
+
+
+
+    def _get_fixed_resolution(self) -> Tuple[int, int] | None:
+        text = self.combo_res.currentText()
+        if "1080×1920" in text or "1080p (1080×1920)" in text:
+            return 1080, 1920
+        if "720×1280" in text or "720p (720×1280)" in text:
+            return 720, 1280
+        if "480×854" in text or "480p (480×854)" in text:
+            return 480, 854
+        if "1080p (1920×1080)" in text or "Fixed: 1080p" in text:
+            return 1920, 1080
+        if "720p (1280×720)" in text or "Fixed: 720p" in text:
+            return 1280, 720
+        if "480p (854×480)" in text or "Fixed: 480p" in text:
+            return 854, 480
+        return None  # Not a fixed resolution
+
+    def _on_generate(self) -> None:
+        # Prevent starting a new render or scan while one is already running.
+        if self._worker is not None and self._worker.isRunning():
+            self._error("Busy", "A render is already running.")
+            return
+        if self._scan_worker is not None and self._scan_worker.isRunning():
+            self._error("Busy", "Clip scanning is already running.")
+            return
+
+        resolved = self._resolve_paths()
+        if not resolved:
+            return
+        audio, video, out_dir = resolved
+
+        # Always analyze fresh for every creation so we never reuse
+        # segments from a previous music track, even if paths and
+        # settings look the same.
+        self._on_analyze()
+        if self._analysis is None:
+            return
+
+        # Stash paths so we can continue once the clip scan finishes.
+        self._pending_audio = audio
+        self._pending_video = video
+        self._pending_out_dir = out_dir
+
+        # Optional minimum clip length configured in the UI.
+        min_len: float | None = None
+        if self.check_min_clip.isChecked():
+            try:
+                min_len = float(self.spin_min_clip.value())
+            except Exception:
+                min_len = None
+
+        # Start background scan of folder / clip list so the UI stays responsive.
+        self.progress.setValue(0)
+        self.progress.setFormat("Scanning video clips...")
+
+        self._scan_worker = SourceScanWorker(
+            video_input=video,
+            ffprobe=self._ffprobe,
+            min_clip_length=min_len,
+            parent=self,
+        )
+        # Reuse the same progress bar for scanning as for rendering.
+        self._scan_worker.progress.connect(self._on_worker_progress)
+        self._scan_worker.finished_ok.connect(self._on_scan_finished)
+        self._scan_worker.failed.connect(self._on_scan_failed)
+        self._scan_worker.start()
+
+    def _continue_generate_with_sources(
+        self,
+        audio: str,
+        video: str,
+        out_dir: str,
+        sources: List[ClipSource],
+    ) -> None:
+        # Measure actual audio duration so 'fill full music length' can match the real track
+        audio_duration = _ffprobe_duration(self._ffprobe, audio)
+
+        # Master No-FX state
+        nofx = self.check_nofx.isChecked()
+
+        idx = self.combo_fx.currentIndex()
+        if nofx:
+            fx_level = "none"
+        elif idx == 0:
+            fx_level = "minimal"
+        elif idx == 1:
+            fx_level = "moderate"
+        else:
+            fx_level = "high"
+
+        if self.check_micro_chorus.isChecked():
+            micro_mode = 1
+        elif self.check_micro_all.isChecked():
+            micro_mode = 2
+        elif getattr(self, "check_micro_verses", None) is not None and self.check_micro_verses.isChecked():
+            micro_mode = 3
+        else:
+            micro_mode = 0
+
+        beats_per = max(1, self.spin_beats_per_seg.value())
+
+        trans_idx = self.combo_transitions.currentIndex()
+        transition_mode = trans_idx  # 0,1,2
+        if nofx:
+            # Force hard cuts only when No-FX is enabled.
+            transition_mode = 1
+
+        clip_order_mode = self.combo_clip_order.currentIndex()  # 0,1,2
+
+        force_full_length = self.check_full_length.isChecked()
+        # Determine the random seed used for this run.
+        # If 'Use fixed seed' is enabled, use the value from the spin box.
+        # Otherwise, generate a new random seed and show it in the UI.
+        if self.check_use_seed.isChecked():
+            seed_enabled = True
+            seed_value = int(self.spin_seed.value())
+        else:
+            seed_value = random.randint(0, 999999999)
+            seed_enabled = True
+            try:
+                # Reflect the seed that was actually used back into the UI.
+                self.spin_seed.setValue(seed_value)
+            except Exception:
+                pass
+
+        # Slow motion configuration from UI
+        slow_enabled = self.check_slow_enable.isChecked() and not nofx
+        slow_sections: List[str] = []
+        if slow_enabled:
+            if self.check_slow_intro.isChecked():
+                slow_sections.append("intro")
+            if self.check_slow_break.isChecked():
+                slow_sections.append("break")
+            if self.check_slow_chorus.isChecked():
+                slow_sections.append("chorus")
+            if self.check_slow_drop.isChecked():
+                slow_sections.append("drop")
+            if self.check_slow_outro.isChecked():
+                slow_sections.append("outro")
+        slow_factor = max(0.10, min(1.0, self.slider_slow_factor.value() / 100.0)) if slow_enabled else 1.0
+        slow_random = bool(self.check_slow_random.isChecked()) if slow_enabled else False
+
+        # Break impact FX configuration (first beat after each break)
+        impact_enabled = self.check_impact_enable.isChecked() and not nofx
+        impact_flash = self.check_impact_flash.isChecked()
+        impact_shock = self.check_impact_shock.isChecked()
+        impact_confetti = self.check_impact_confetti.isChecked()
+        impact_zoom = self.check_impact_zoom.isChecked()
+        impact_shake = self.check_impact_shake.isChecked()
+        impact_fog = self.check_impact_fog.isChecked()
+        impact_fire_gold = self.check_impact_fire_gold.isChecked()
+        impact_fire_multi = self.check_impact_fire_multi.isChecked()
+        impact_random = self.check_impact_random.isChecked()
+
+        impact_flash_strength = self.slider_impact_flash.value() / 100.0
+        impact_shock_strength = self.slider_impact_shock.value() / 100.0
+        impact_confetti_density = self.slider_impact_confetti.value() / 100.0
+        impact_zoom_amount = self.slider_impact_zoom.value() / 100.0
+        impact_shake_strength = self.slider_impact_shake.value() / 100.0
+        impact_fog_density = self.slider_impact_fog.value() / 100.0
+        impact_fire_gold_intensity = self.slider_impact_fire_gold.value() / 100.0
+        impact_fire_multi_intensity = self.slider_impact_fire_multi.value() / 100.0
+
+        # Hidden break-impact FX (confetti, fog, fireworks) are always disabled.
+        impact_confetti = False
+        impact_fog = False
+        impact_fire_gold = False
+        impact_fire_multi = False
+        impact_confetti_density = 0.0
+        impact_fog_density = 0.0
+        impact_fire_gold_intensity = 0.0
+        impact_fire_multi_intensity = 0.0
+
+        segments = build_timeline(
+            self._analysis,
+            sources,
+            fx_level=fx_level,
+            microclip_mode=micro_mode,
+            beats_per_segment=beats_per,
+            transition_mode=transition_mode,
+            clip_order_mode=clip_order_mode,
+            force_full_length=force_full_length,
+            seed_enabled=seed_enabled,
+            seed_value=seed_value,
+            transition_random=(self.check_trans_random.isChecked() and not nofx),
+            transition_modes_enabled=sorted(self._enabled_transition_modes),
+            slow_motion_enabled=slow_enabled,
+            slow_motion_factor=slow_factor,
+            slow_motion_sections=slow_sections,
+            slow_motion_random=slow_random,
+            cine_enable=(bool(self.check_cine_enable.isChecked()) and not nofx),
+            cine_freeze=bool(self.check_cine_freeze.isChecked()),
+            cine_stutter=bool(self.check_cine_stutter.isChecked()),
+            cine_reverse=bool(self.check_cine_reverse.isChecked()),
+            cine_speed_ramp=bool(self.check_cine_speed_ramp.isChecked()),
+            cine_freeze_len=self.slider_cine_freeze_len.value() / 100.0,
+            cine_freeze_zoom=self.slider_cine_freeze_zoom.value() / 100.0,
+            cine_stutter_repeats=int(self.spin_cine_stutter_repeats.value()),
+            cine_reverse_len=self.slider_cine_reverse_len.value() / 100.0,
+            cine_ramp_in=self.slider_cine_ramp_in.value() / 100.0,
+            cine_ramp_out=self.slider_cine_ramp_out.value() / 100.0,
+            cine_boomerang=bool(self.check_cine_boomerang.isChecked()),
+            cine_boomerang_bounces=int(self.slider_cine_boomerang_bounces.value()),
+            cine_mosaic=bool(self.check_cine_mosaic.isChecked()),
+            cine_mosaic_screens=int(self.slider_cine_mosaic_screens.value()),
+            cine_mosaic_random=bool(self.check_cine_mosaic_random.isChecked()),
+            cine_flip=bool(self.check_cine_flip.isChecked()),
+            cine_rotate=bool(self.check_cine_rotate.isChecked()),
+            cine_rotate_max_degrees=float(self.slider_cine_rotate_degrees.value()),
+            cine_multiply=bool(self.check_cine_multiply.isChecked()),
+            cine_multiply_screens=int(self.slider_cine_multiply_screens.value()),
+            cine_multiply_random=bool(self.check_cine_multiply_random.isChecked()),
+            cine_dolly=bool(self.check_cine_dolly.isChecked()),
+            cine_dolly_strength=self.slider_cine_dolly_strength.value() / 100.0,
+            cine_kenburns=bool(self.check_cine_kenburns.isChecked()),
+            cine_kenburns_strength=self.slider_cine_kenburns_strength.value() / 100.0,
+            cine_motion_dir=int(self.combo_cine_motion_dir.currentIndex()),
+            audio_duration=audio_duration,
+            impact_enable=impact_enabled,
+            impact_flash=impact_flash,
+            impact_shock=impact_shock,
+            impact_confetti=impact_confetti,
+            impact_zoom=impact_zoom,
+            impact_shake=impact_shake,
+            impact_fog=impact_fog,
+            impact_fire_gold=impact_fire_gold,
+            impact_fire_multi=impact_fire_multi,
+            impact_random=impact_random,
+            impact_flash_strength=impact_flash_strength,
+            impact_shock_strength=impact_shock_strength,
+            impact_confetti_density=impact_confetti_density,
+            impact_zoom_amount=impact_zoom_amount,
+            impact_shake_strength=impact_shake_strength,
+            impact_fog_density=impact_fog_density,
+            impact_fire_gold_intensity=impact_fire_gold_intensity,
+            impact_fire_multi_intensity=impact_fire_multi_intensity,
+            image_sources=self.image_sources,
+            section_overrides=self._section_media,
+        )
+        if not segments:
+            self._error("Timeline empty", "Failed to build a video timeline.")
+            return
+
+        fixed = self._get_fixed_resolution()
+
+
+        if fixed:
+
+
+            target_res = fixed
+
+
+        else:
+
+
+            target_res = self._target_resolution(sources, video)
+
+        if self._worker is not None and self._worker.isRunning():
+            self._error("Busy", "A render is already running.")
+            return
+
+        # Persist current options before kicking off the render
+        self._save_settings()
+
+        self.progress.setValue(0)
+        self.progress.setFormat("Starting render...")
+
+        # Derive visual strategy enum from UI:
+        # 0 = single visual for whole track
+        # 1 = new random visual every segment
+        # 2 = one visual per section type (intro/verse/chorus/break/outro)
+        visual_strategy = 0
+        if getattr(self, "check_visual_strategy_segment", None) and self.check_visual_strategy_segment.isChecked():
+            visual_strategy = 1
+        elif getattr(self, "check_visual_strategy_section", None) and self.check_visual_strategy_section.isChecked():
+            visual_strategy = 2
+
+        self._worker = RenderWorker(
+            audio_path=audio,
+            output_dir=out_dir,
+            analysis=self._analysis,
+            segments=segments,
+            ffmpeg=self._ffmpeg,
+            ffprobe=self._ffprobe,
+            target_resolution=target_res,
+            fit_mode=self.combo_fit.currentIndex(),
+            transition_mode=transition_mode,
+            intro_fade=self.check_intro_fade.isChecked(),
+            outro_fade=self.check_outro_fade.isChecked(),
+            use_visual_overlay=bool(getattr(self, "check_visual_overlay", None) and self.check_visual_overlay.isChecked()),
+            visual_strategy=visual_strategy,
+            visual_section_overrides=getattr(self, "_visual_section_overrides", None) if visual_strategy == 2 else None,
+            visual_overlay_opacity=float(getattr(self, "visual_overlay_opacity", 0.25)),
+        )
+        self._worker.progress.connect(self._on_worker_progress)
+        self._worker.finished_ok.connect(self._on_worker_finished)
+        self._worker.failed.connect(self._on_worker_failed)
+        self._worker.start()
+
+
+    def _update_sources_list(self) -> None:
+        if not hasattr(self, "list_sources"):
+            return
+        self.list_sources.clear()
+        for s in getattr(self, "clip_sources", []):
+            item = QListWidgetItem(s.path)
+            try:
+                item.setToolTip(f"Duration: {s.duration:.1f} s (Video)")
+            except Exception:
+                item.setToolTip("Video clip")
+            self.list_sources.addItem(item)
+        for s in getattr(self, "image_sources", []):
+            item = QListWidgetItem(s.path)
+            try:
+                item.setToolTip(f"Duration: {s.duration:.1f} s (Image)")
+            except Exception:
+                item.setToolTip("Image")
+            self.list_sources.addItem(item)
+
+    def _on_scan_finished(self, sources: list) -> None:
+        # Scan worker finished successfully; clear handle first.
+        self._scan_worker = None
+
+        if not sources:
+            self._error("No video clips", "Could not find any usable video sources.")
+            self.progress.setValue(0)
+            self.progress.setFormat("Ready.")
+            self._pending_audio = None
+            self._pending_video = None
+            self._pending_out_dir = None
+            return
+
+        if not (self._pending_audio and self._pending_video and self._pending_out_dir):
+            # Missing context; abort gracefully.
+            self._error("Internal error", "Missing pending paths after clip scan.")
+            self.progress.setValue(0)
+            self.progress.setFormat("Ready.")
+            self._pending_audio = None
+            self._pending_video = None
+            self._pending_out_dir = None
+            return
+
+        # Cache discovered sources for the UI list
+        try:
+            self.clip_sources = list(sources)
+            self._update_sources_list()
+        except Exception:
+            pass
+
+        audio = self._pending_audio
+        video = self._pending_video
+        out_dir = self._pending_out_dir
+
+        # Clear pending state before moving on.
+        self._pending_audio = None
+        self._pending_video = None
+        self._pending_out_dir = None
+
+        # Continue with the same logic that used to live in _on_generate.
+        self._continue_generate_with_sources(audio, video, out_dir, sources)
+
+    def _on_scan_failed(self, msg: str) -> None:
+        # Background scan failed; reset state and show a friendly error.
+        self._scan_worker = None
+        self.progress.setValue(0)
+        self.progress.setFormat("Ready.")
+        self._pending_audio = None
+        self._pending_video = None
+        self._pending_out_dir = None
+
+        if msg.startswith("__no_clips__"):
+            self._error("No video clips", "Could not find any usable video sources.")
+        elif msg.startswith("__all_short__"):
+            try:
+                val = float(msg.split(":", 1)[1])
+            except Exception:
+                val = 0.0
+            if val > 0:
+                self._error(
+                    "All clips too short",
+                    f"All discovered clips were shorter than {val:.1f}s and were ignored.",
+                )
+            else:
+                self._error(
+                    "All clips too short",
+                    "All discovered clips were shorter than the configured minimum length.",
+                )
+        else:
+            self._error("Clip scan failed", msg)
+
+    # worker callbacks
+
+    def _on_worker_progress(self, pct: int, msg: str) -> None:
+        self.progress.setValue(max(0, min(100, pct)))
+        if msg:
+            self.progress.setFormat(msg)
+
+    def _on_worker_finished(self, out_path: str) -> None:
+        self.progress.setValue(100)
+        self.progress.setFormat("Done.")
+        QMessageBox.information(
+            self,
+            "Music Clip created",
+            f"Finished generating music clip:\n{out_path}",
+            QMessageBox.Ok,
+        )
+        self._worker = None
+
+    def _on_worker_failed(self, msg: str) -> None:
+        self.progress.setValue(0)
+        self.progress.setFormat("Failed.")
+        self._error("Music Clip Creator failed", msg)
+        self._worker = None
+
+
+# ------------------------- integration entry point -------------------------
+
+
+def install_auto_music_sync_tool(parent, section) -> AutoMusicSyncWidget:
+    """Install the Music Clip Creator UI into a CollapsibleSection."""
+    content = getattr(section, "content", None)
+    parent_widget = content if content is not None else section
+
+    widget = AutoMusicSyncWidget(parent=parent_widget)
+    widget.setObjectName("MusicClipCreatorWidget")
+
+    if content is not None:
+        layout = content.layout()
+        if layout is None:
+            layout = QVBoxLayout(content)
+    else:
+        layout = section.layout()
+        if layout is None:
+            layout = QVBoxLayout(section)
+
+    layout.addWidget(widget)
+    return widget
+
+
+def cleanup_temp_dir(output_path: str) -> None:
+    """Best-effort removal of temp files for the music clip creator.
+
+    This looks for a sibling 'temp' directory next to the chosen output file
+    and removes any intermediate segment files if possible.
+    """
+    import shutil
+    from pathlib import Path
+
+    if not output_path:
+        return
+    p = Path(output_path)
+    # If user picked a folder, we still look for a 'temp' subdir.
+    parent = p if p.is_dir() else p.parent
+    temp_dir = parent / "temp"
+    if temp_dir.is_dir():
+        try:
+            for child in temp_dir.iterdir():
+                if child.is_file() and child.suffix in {".mp4", ".mkv", ".mov", ".ts"}:
+                    child.unlink(missing_ok=True)
+        except Exception:
+            # Don't crash the UI if cleanup fails.
+            pass
+
+
+if __name__ == "__main__":
+    from PySide6.QtWidgets import QApplication
+
+    app = QApplication(sys.argv)
+    w = AutoMusicSyncWidget()
+    w.setWindowTitle("Music Clip Creator (Standalone Test)")
+    w.resize(900, 620)
+    w.show()
+    sys.exit(app.exec())

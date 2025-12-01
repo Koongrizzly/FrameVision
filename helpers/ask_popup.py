@@ -13,6 +13,36 @@ from PySide6.QtWidgets import (
 from transformers import AutoProcessor
 from transformers import TextIteratorStreamer
 
+
+import os
+from pathlib import Path as _AP_PATH
+
+# Prefer app-local ffmpeg/ffprobe over PATH
+_APP_ROOT = _AP_PATH(__file__).resolve().parents[1]
+_PRESETS_BIN = _APP_ROOT / "presets" / "bin"
+_BIN_DIR = _APP_ROOT / "bin"
+
+
+def _ff_tool_bin(name: str) -> str:
+    """
+    Resolve ffmpeg/ffprobe for helper tools.
+
+    Order:
+      1) <root>/presets/bin/name(.exe)
+      2) <root>/bin/name(.exe)
+      3) <root>/name(.exe)
+      4) bare name (PATH)
+    """
+    exe = name + (".exe" if os.name == "nt" else "")
+    for d in (_PRESETS_BIN, _BIN_DIR, _APP_ROOT):
+        try:
+            cand = d / exe
+            if cand.exists():
+                return str(cand)
+        except Exception:
+            pass
+    return name
+
 # === Model path (offline) ===
 
 # === Framie: helpers ===

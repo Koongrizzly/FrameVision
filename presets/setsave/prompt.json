@@ -1,16 +1,16 @@
 {
   "style": "",
-  "length_choice": "Long (140–200 words)",
+  "length_choice": "Short (40–60 words)",
   "target": "image",
   "model_key": "__local_qwen3vl2b__",
-  "negatives": "watermark, signature, text, logo, low-res, blurry, jpeg artifacts, heavy noise, overprocessed",
+  "negatives": "overexposure, blown highlights, harsh shadows, asymmetrical eyes, cross-eyed, lazy eye, extra eyes, deformed eyes, blank or empty eyes, malformed nose, wide nostrils, nostril deformity, extra nostrils, crooked nose, fused nose, deformed nose, missing fingers, extra fingers, fused fingers, disfigured hands, deformed hands, long fingers, short fingers, missing hand, extra hand, deformed feet, fused toes, extra toes, missing toes, watermark, signature, text, logo, low-res, blurry, jpeg artifacts, heavy noise, overprocessed, anime, manga, cartoon, cel-shaded, line art, illustration, chibi, kawaii, toon",
   "applied_negatives": "",
-  "temperature": 0.9,
-  "max_new_tokens": 420,
-  "seed_text": "",
-  "preset": "Default",
+  "temperature": 0.7,
+  "max_new_tokens": 160,
+  "seed_text": "a 3d rendered Homer Simpson",
+  "preset": "Photo Shoot",
   "favorites": [],
-  "preset_category": "All",
-  "last_used_preset": "Default",
-  "var_count": 5
+  "preset_category": "People",
+  "last_used_preset": "Photo Shoot",
+  "var_count": 8
 }

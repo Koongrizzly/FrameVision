@@ -100,10 +100,10 @@ def _candidate_ff_bins(settings:QSettings):
 
     exe = "ffmpeg.exe" if os.name=="nt" else "ffmpeg"
     app_dirs = [
-        ROOT/'bin',
         ROOT/'presets'/'bin',
-        Path(sys.argv[0]).resolve().parent/'bin',
+        ROOT/'bin',
         Path(sys.argv[0]).resolve().parent/'presets'/'bin',
+        Path(sys.argv[0]).resolve().parent/'bin',
     ]
     for d in app_dirs:
         yield str(d/exe)
@@ -118,10 +118,10 @@ def _candidate_probe_bins(settings:QSettings):
         yield env_fp
     pro = "ffprobe.exe" if os.name=="nt" else "ffprobe"
     app_dirs = [
-        ROOT/'bin',
         ROOT/'presets'/'bin',
-        Path(sys.argv[0]).resolve().parent/'bin',
+        ROOT/'bin',
         Path(sys.argv[0]).resolve().parent/'presets'/'bin',
+        Path(sys.argv[0]).resolve().parent/'bin',
     ]
     for d in app_dirs:
         yield str(d/pro)

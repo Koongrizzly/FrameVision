@@ -134,7 +134,34 @@ class DescriberWidget(QWidget):
         if self.decode_style not in ("Deterministic","Creative"):
             self.decode_style = "Deterministic"
         lay = QVBoxLayout(self)
-        lay.setContentsMargins(8,8,8,8)
+
+        # Fancy orange banner at the top
+        self.banner = QLabel("Describe with Qwen3-VL-2B")
+        self.banner.setObjectName("descBanner")
+        self.banner.setAlignment(Qt.AlignCenter)
+        self.banner.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+        self.banner.setFixedHeight(45)
+        self.banner.setStyleSheet(
+            "#descBanner {"
+            " font-size: 15px;"
+            " font-weight: 600;"
+            " padding: 8px 17px;"
+            " border-radius: 12px;"
+            " margin: 0 0 6px 0;"
+            " color: white;"
+            " background: qlineargradient("
+            "   x1:0, y1:0, x2:1, y2:0,"
+            "   stop:0 #e65100,"
+            "   stop:0.5 #fb8c00,"
+            "   stop:1 #ffb300"
+            " );"
+            " letter-spacing: 0.5px;"
+            "}"
+        )
+        lay.addWidget(self.banner)
+        lay.addSpacing(6)
+
+        lay.setContentsMargins(6,6,6,6)
         lay.setSpacing(10)
         # Hide host-injected "Loaded: helpers.describer..." footer label
         def __hide_loader_blurb():
@@ -202,7 +229,7 @@ class DescriberWidget(QWidget):
         # --- Output ---
         out_box = QGroupBox("Generated description")
         out_v = QVBoxLayout(out_box)
-        self.output = QPlainTextEdit(); self.output.setReadOnly(True); self.output.setMinimumHeight(360)
+        self.output = QPlainTextEdit(); self.output.setReadOnly(True); self.output.setMinimumHeight(320)
         out_v.addWidget(self.output)
         # Auto-size output to fully fit wrapped content; clamp 120–960; persist height when Save settings is ON
         try:
@@ -275,10 +302,10 @@ class DescriberWidget(QWidget):
 
         row2 = QHBoxLayout(); out_v.addLayout(row2)
         self.btn_copy = QPushButton("Copy")
-        self.btn_copy_prompt = QPushButton("Copy as Prompt")
+        self.btn_region = QPushButton("Describe region")
         self.btn_save_txt = QPushButton("Save .txt")
         self.btn_save_json = QPushButton("Save .json")
-        row2.addWidget(self.btn_copy); row2.addWidget(self.btn_copy_prompt); row2.addWidget(self.btn_save_txt); row2.addWidget(self.btn_save_json)
+        row2.addWidget(self.btn_copy); row2.addWidget(self.btn_region); row2.addWidget(self.btn_save_txt); row2.addWidget(self.btn_save_json)
 
         # Output options 
 
@@ -324,6 +351,24 @@ class DescriberWidget(QWidget):
         hsave.addWidget(self.chk_save_settings); hsave.addStretch(1); hsave.addWidget(self.btn_defaults)
         gg.addWidget(row_save, r, 0, 1, 2); r+=1
 
+        # CPU threads and model caching (Advanced)
+        row_cpu = QWidget(self); hcpu = QHBoxLayout(row_cpu); hcpu.setContentsMargins(0,0,0,0)
+        hcpu.addWidget(QLabel("CPU threads:"))
+        self.spin_cpu = QSpinBox()
+        mx = max(1, os.cpu_count() or 8)
+        s_threads = QSettings("FrameVision","FrameVision")
+        cap = int(s_threads.value("describe_cpu_threads", max(1, mx//2)))
+        self.spin_cpu.setRange(1, mx); self.spin_cpu.setValue(min(mx, max(1, cap)))
+        self.spin_cpu.valueChanged.connect(lambda v: QSettings("FrameVision","FrameVision").setValue("describe_cpu_threads", int(v)))
+        hcpu.addWidget(self.spin_cpu)
+        self.chk_warm = QCheckBox("Warm model on load"); self.chk_warm.setChecked(_settings().value("warm_on_load", True, bool)); hcpu.addSpacing(12); hcpu.addWidget(self.chk_warm)
+        self.chk_keep = QCheckBox("Keep in memory"); self.chk_keep.setChecked(_settings().value("keep_in_memory", True, bool)); hcpu.addSpacing(12); hcpu.addWidget(self.chk_keep)
+        hcpu.addStretch(1)
+        hcpu.addWidget(QLabel("Backend:"))
+        self.lbl_backend = QLabel("—")
+        hcpu.addWidget(self.lbl_backend)
+        gg.addWidget(row_cpu, r, 0, 1, 2); r+=1
+
         gg.addWidget(QLabel("max_new_tokens"), r,0); self.sp_max = QSpinBox(); self.sp_max.setRange(16,2048); self.sp_max.setValue(_settings().value("max_new_tokens", 320, int)); gg.addWidget(self.sp_max, r,1); r+=1
         gg.addWidget(QLabel("min_length"), r,0); self.sp_min = QSpinBox(); self.sp_min.setRange(0,1024); self.sp_min.setValue(_settings().value("min_length", 60, int)); gg.addWidget(self.sp_min, r,1); r+=1
         gg.addWidget(QLabel("no_repeat_ngram_size"), r,0); self.sp_ngram = QSpinBox(); self.sp_ngram.setRange(0,10); self.sp_ngram.setValue(_settings().value("no_repeat_ngram_size", 3, int)); gg.addWidget(self.sp_ngram, r,1); r+=1
@@ -331,8 +376,6 @@ class DescriberWidget(QWidget):
         gg.addWidget(QLabel("top_p"), r,0); self.sp_topp = QDoubleSpinBox(); self.sp_topp.setRange(0.0,1.0); self.sp_topp.setSingleStep(0.05); self.sp_topp.setValue(_settings().value("top_p", 0.9, float)); gg.addWidget(self.sp_topp, r,1); r+=1
         gg.addWidget(QLabel("top_k"), r,0); self.sp_topk = QSpinBox(); self.sp_topk.setRange(0,200); self.sp_topk.setValue(_settings().value("top_k", 50, int)); gg.addWidget(self.sp_topk, r,1); r+=1
         gg.addWidget(QLabel("repetition_penalty"), r,0); self.sp_rep = QDoubleSpinBox(); self.sp_rep.setRange(0.0, 4.0); self.sp_rep.setValue(_settings().value("repetition_penalty", 1.1, float)); gg.addWidget(self.sp_rep, r,1); r+=1
-        self.chk_warm = QCheckBox("Warm model on load"); self.chk_warm.setChecked(_settings().value("warm_on_load", True, bool)); gg.addWidget(self.chk_warm, r,0,1,2); r+=1
-        self.chk_keep = QCheckBox("Keep in memory"); self.chk_keep.setChecked(_settings().value("keep_in_memory", True, bool)); gg.addWidget(self.chk_keep, r,0,1,2); r+=1
         lay.addWidget(self.btn_adv)
         lay.addWidget(adv)
 
@@ -341,7 +384,7 @@ class DescriberWidget(QWidget):
         self.btn_browse.clicked.connect(self._browse)
         self.btn_describe.clicked.connect(self._describe_clicked)
         self.btn_copy.clicked.connect(lambda: self._copy(self.output.toPlainText()))
-        self.btn_copy_prompt.clicked.connect(self._copy_prompt)
+        self.btn_region.clicked.connect(self._fv_on_click_describe_region)
         self.btn_save_txt.clicked.connect(self._save_txt)
         self.btn_save_json.clicked.connect(self._save_json)
         # --- Settings persistence: helpers (scoped in __init__) ---
@@ -415,10 +458,31 @@ class DescriberWidget(QWidget):
             except Exception: pass
         def _save_now():
             try:
-                if hasattr(self,"chk_save_settings") and not self.chk_save_settings.isChecked(): return
-                pp = _setsave_path(); data = _gather()
+                pp = _setsave_path()
+                # Always persist the negative box so it survives restarts
+                base = {}
+                if pp.exists():
+                    try:
+                        base = json.loads(pp.read_text(encoding="utf-8"))
+                    except Exception:
+                        base = {}
+                # Start from existing data so we don't wipe unrelated keys
+                data = dict(base)
+                try:
+                    if hasattr(self, "negative"):
+                        data["negative"] = str(self.negative.text())
+                except Exception:
+                    pass
+                # When "Save settings" is enabled, persist all other tunables too
+                try:
+                    if hasattr(self, "chk_save_settings") and self.chk_save_settings.isChecked():
+                        full = _gather()
+                        data.update(full)
+                except Exception:
+                    pass
                 pp.write_text(json.dumps(data, indent=2), encoding="utf-8")
-            except Exception: pass
+            except Exception:
+                pass
         def _load_now():
             try:
                 pp = _setsave_path()
@@ -518,15 +582,110 @@ class DescriberWidget(QWidget):
         self.status_chip.setText("Checking…"); self.status_chip.setStyleSheet("QLabel{background:#ffe9b3;color:#6a4;padding:3px 8px;border-radius:8px;}")
 
     def _ensure_ready_async(self) -> None:
-        # lightweight check+extract on UI thread (fast)
+        """Ensure the selected engine's model is present without blocking the UI."""
         cfg = ENGINE_CATALOG[self.engine_key]
         target = models_root() / cfg["folder"]
-        ready = auto_extract_if_missing(target, cfg["bundle"], self.prep_progress)
-        self.prep_progress.setVisible(False)
-        if ready and file_exists_any(target, cfg["required"]):
-            self.status_chip.setText("Ready"); self.status_chip.setStyleSheet("QLabel{background:#dff5d9;color:#27632a;padding:3px 8px;border-radius:8px;}")
-        else:
-            self.status_chip.setText("Missing"); self.status_chip.setStyleSheet("QLabel{background:#f9dede;color:#a33;padding:3px 8px;border-radius:8px;}")
+
+        # Fast path: already present on disk
+        try:
+            if target.exists() and any(target.iterdir()) and file_exists_any(target, cfg["required"]):
+                try:
+                    self.status_chip.setText("Ready")
+                    self.status_chip.setStyleSheet("QLabel{background:#dff5d9;color:#27632a;padding:3px 8px;border-radius:8px;}")
+                except Exception:
+                    pass
+                try:
+                    if hasattr(self, "btn_describe"):
+                        self.btn_describe.setEnabled(True)
+                    if hasattr(self, "btn_desc_folder"):
+                        self.btn_desc_folder.setEnabled(True)
+                except Exception:
+                    pass
+                try:
+                    if hasattr(self, "prep_progress"):
+                        self.prep_progress.setVisible(False)
+                except Exception:
+                    pass
+                return
+        except Exception:
+            pass
+
+        # If a prep thread is already running, don't start another
+        prep = getattr(self, "_prep_thread", None)
+        try:
+            if prep is not None and hasattr(prep, "isRunning") and prep.isRunning():
+                return
+        except Exception:
+            pass
+
+        # Mark as preparing; keep actions disabled until we're done
+        try:
+            self.status_chip.setText("Preparing…")
+            self.status_chip.setStyleSheet("QLabel{background:#ffe9b3;color:#6a4;padding:3px 8px;border-radius:8px;}")
+        except Exception:
+            pass
+        try:
+            if hasattr(self, "btn_describe"):
+                self.btn_describe.setEnabled(False)
+            if hasattr(self, "btn_desc_folder"):
+                self.btn_desc_folder.setEnabled(False)
+        except Exception:
+            pass
+        try:
+            if hasattr(self, "prep_progress"):
+                # We don't animate this from the worker (no cross-thread UI),
+                # but we can still show a simple busy indicator if the engine
+                # panel is ever made visible again.
+                self.prep_progress.setMaximum(0)
+                self.prep_progress.setValue(-1)
+                self.prep_progress.setVisible(True)
+        except Exception:
+            pass
+
+        from PySide6.QtCore import QThread
+
+        class _FVModelPrepThread(QThread):
+            def __init__(self, parent, cfg_local):
+                super().__init__(parent)
+                self._cfg = cfg_local
+                self.ok = False
+
+            def run(self):
+                try:
+                    cfg = self._cfg
+                    t = models_root() / cfg["folder"]
+                    # Heavy zip extract happens entirely off the UI thread
+                    ready = auto_extract_if_missing(t, cfg["bundle"], None)
+                    self.ok = bool(ready and file_exists_any(t, cfg["required"]))
+                except Exception:
+                    self.ok = False
+
+        prep = _FVModelPrepThread(self, cfg)
+        self._prep_thread = prep
+
+        def _on_finished():
+            ok = bool(getattr(prep, "ok", False))
+            try:
+                if hasattr(self, "prep_progress"):
+                    self.prep_progress.setVisible(False)
+            except Exception:
+                pass
+            try:
+                if ok:
+                    self.status_chip.setText("Ready")
+                    self.status_chip.setStyleSheet("QLabel{background:#dff5d9;color:#27632a;padding:3px 8px;border-radius:8px;}")
+                    if hasattr(self, "btn_describe"):
+                        self.btn_describe.setEnabled(True)
+                    if hasattr(self, "btn_desc_folder"):
+                        self.btn_desc_folder.setEnabled(True)
+                else:
+                    self.status_chip.setText("Missing")
+                    self.status_chip.setStyleSheet("QLabel{background:#f9dede;color:#a33;padding:3px 8px;border-radius:8px;}")
+            except Exception:
+                pass
+
+        prep.finished.connect(_on_finished)
+        prep.start()
 
     def _browse(self) -> None:
         p, _ = QFileDialog.getOpenFileName(self, "Choose image", str(find_project_root()), "Images (*.png *.jpg *.jpeg *.bmp *.webp)")
@@ -1075,48 +1234,6 @@ else:
             except Exception: insert_index = 1
         root.insertWidget(insert_index, row)
 
-        # CPU threads + backend row under engine info (top)
-        try:
-            w = getattr(self, "lbl_engine_name", None)
-            ins_after = None
-            if w is not None:
-                gp = w.parentWidget().parentWidget()
-                for i in range(root.count()):
-                    it = root.itemAt(i)
-                    if it and it.widget() is gp: ins_after = i+1; break
-            if ins_after is None: ins_after = 1
-            row2 = QWidget(self); h2 = QHBoxLayout(row2); h2.setContentsMargins(0,0,0,0)
-            h2.addWidget(QLabel("CPU threads:"))
-            if not hasattr(self, "spin_cpu"):
-                self.spin_cpu = QSpinBox()
-                mx = max(1, os.cpu_count() or 8)
-                s = QSettings("FrameVision","FrameVision")
-                cap = int(s.value("describe_cpu_threads", max(1, mx//2)))
-                self.spin_cpu.setRange(1, mx); self.spin_cpu.setValue(min(mx, max(1, cap)))
-                self.spin_cpu.valueChanged.connect(lambda v: QSettings("FrameVision","FrameVision").setValue("describe_cpu_threads", int(v)))
-            h2.addWidget(self.spin_cpu)
-            # Move toggles from Advanced to top row, after CPU threads spinner
-            try:
-                if hasattr(self, "chk_warm"):
-                    self.chk_warm.setParent(row2)
-                    h2.addSpacing(12)
-                    h2.addWidget(self.chk_warm)
-                if hasattr(self, "chk_keep"):
-                    self.chk_keep.setParent(row2)
-                    h2.addSpacing(12)
-                    h2.addWidget(self.chk_keep)
-            except Exception:
-                pass
-
-            h2.addStretch(1)
-            h2.addWidget(QLabel("Backend:"))
-            if not hasattr(self, "lbl_backend"):
-                self.lbl_backend = QLabel("—")
-            h2.addWidget(self.lbl_backend)
-            row2.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
-            root.insertWidget(ins_after, row2)
-        except Exception:
-            pass
 
         # Compact actions & add Cancel as 4th small button
         try:
@@ -1125,8 +1242,26 @@ else:
                 self.btn_cancel = QPushButton("Cancel"); self.btn_cancel.setEnabled(False); self.btn_cancel.clicked.connect(self._fv_on_cancel_clicked); lay.addWidget(self.btn_cancel)
             for b in (self.btn_describe, self.btn_desc_folder, self.btn_use_current, self.btn_cancel):
                 try:
-                    b.setMinimumHeight(32); f=b.font(); f.setPointSize(max(8, f.pointSize()-2)); b.setFont(f)
-                except Exception: pass
+                    # Keep button height the same
+                    b.setMinimumHeight(32)
+                    f = b.font()
+                    sz = f.pointSize()
+                    if sz <= 0:
+                        sz = 10
+                    # Make label clearly larger (about +3px / +3pt)
+                    f.setPointSize(sz + 3)
+                    b.setFont(f)
+                    # Prevent the buttons from stretching vertically
+                    b.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Fixed)
+                except Exception:
+                    pass
+            # Hover style for main Describe button: orange background on hover
+            try:
+                base = self.btn_describe.styleSheet().strip()
+                extra = "QPushButton:hover { background-color: #ff9900; }"
+                self.btn_describe.setStyleSheet((base + "\n" + extra) if base else extra)
+            except Exception:
+                pass
         except Exception:
             pass
 
@@ -1163,6 +1298,43 @@ else:
             except Exception:
                 pass
 
+        # Pin Actions row to the bottom so it stays visible when scrolling
+        try:
+            # Only restructure once
+            if not getattr(self, "_fv_actions_pinned", False) and hasattr(self, "btn_describe"):
+                from PySide6.QtWidgets import QScrollArea as _FVScrollArea
+                root = self.layout()
+                act_box = self.btn_describe.parentWidget()
+                if isinstance(root, QVBoxLayout) and act_box is not None:
+                    self._fv_actions_pinned = True
+                    # Make the Actions group prefer a fixed height
+                    act_box.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Fixed)
+                    content = QWidget(self)
+                    content_lay = QVBoxLayout(content)
+                    # Inner content has no extra margins; outer layout keeps existing ones
+                    content_lay.setContentsMargins(0, 0, 0, 0)
+                    content_lay.setSpacing(root.spacing())
+                    # Move all existing items except the Actions row into the scroll area
+                    while root.count():
+                        item = root.takeAt(0)
+                        w = item.widget()
+                        if w is act_box:
+                            continue
+                        if w is not None:
+                            content_lay.addWidget(w)
+                        else:
+                            content_lay.addItem(item)
+                    scroll = _FVScrollArea(self)
+                    scroll.setWidgetResizable(True)
+                    scroll.setWidget(content)
+                    # Scroll area takes all extra space; Actions row keeps minimal height
+                    root.addWidget(scroll)
+                    root.addWidget(act_box)
+                    root.setStretch(root.indexOf(scroll), 1)
+                    root.setStretch(root.indexOf(act_box), 0)
+        except Exception:
+            pass
+
         # Wrap Browse to preview chosen image in player
         if hasattr(self, "_browse"):
             orig = self._browse
@@ -1194,11 +1366,20 @@ else:
         p = ""
         try: p = (self.txt_image.text() or "").strip()
         except Exception: p = ""
-        # Always prefer grabbing the current video frame (overrides stale path)
+        # In region mode, skip grabbing the live video frame (we already saved a cropped temp image)
+        use_frame = True
         try:
-            qimg = _fv_grab_qimage_from_player(self)
+            if getattr(self, "_fv_region_mode", False):
+                use_frame = False
         except Exception:
-            qimg = None
+            use_frame = True
+        # Always prefer grabbing the current video frame (overrides stale path)
+        qimg = None
+        if use_frame:
+            try:
+                qimg = _fv_grab_qimage_from_player(self)
+            except Exception:
+                qimg = None
         if qimg is not None and (not hasattr(qimg, "isNull") or not qimg.isNull()):
             p = _fv_save_temp_png(qimg)
             try: self.txt_image.setText(p)
@@ -1219,8 +1400,6 @@ else:
         self._fv_busy = True; self._fv_cancelled = False
         try: self.btn_describe.setEnabled(False); self.btn_use_current.setEnabled(False); self.btn_cancel.setEnabled(True)
         except Exception: pass
-        try: QGuiApplication.setOverrideCursor(Qt.WaitCursor)
-        except Exception: pass
         try: self.output.setPlainText("Creating the description, this could take a minute")
         except Exception: pass
         try: self.prog.setVisible(True); self.prog.setRange(0,0); self.prog.setValue(0)
@@ -1240,12 +1419,136 @@ else:
 
     DescriberWidget._fv_on_click_describe_async = _fv_on_click_describe_async  # type: ignore[attr-defined]
 
+    # ---------- Region describe ----------
+    from PySide6.QtWidgets import QDialog, QDialogButtonBox, QRubberBand
+
+    class _FVRegionDialog(QDialog):
+        def __init__(self, qimg: QImage, parent=None):
+            super().__init__(parent)
+            self.setWindowTitle("Select region to describe")
+            self._qimg = qimg
+            pm = QPixmap.fromImage(qimg)
+            max_w, max_h = 800, 600
+            if pm.width() > max_w or pm.height() > max_h:
+                pm = pm.scaled(max_w, max_h, Qt.KeepAspectRatio, Qt.SmoothTransformation)
+            self._pm = pm
+            self._scale_x = qimg.width() / max(1, pm.width())
+            self._scale_y = qimg.height() / max(1, pm.height())
+
+            self.label = QLabel()
+            self.label.setPixmap(pm)
+            self.label.setFixedSize(pm.size())
+            self.label.setAlignment(Qt.AlignCenter)
+
+            self._rubber = QRubberBand(QRubberBand.Rectangle, self.label)
+            self._origin = None
+
+            lay = QVBoxLayout(self)
+            lay.addWidget(self.label)
+            btns = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+            lay.addWidget(btns)
+            btns.accepted.connect(self.accept)
+            btns.rejected.connect(self.reject)
+
+            self.label.installEventFilter(self)
+
+        def eventFilter(self, obj, event):
+            if obj is self.label:
+                et = event.type()
+                if et == QtCore.QEvent.MouseButtonPress:
+                    self._origin = event.pos()
+                    self._rubber.setGeometry(QtCore.QRect(self._origin, QtCore.QSize()))
+                    self._rubber.show()
+                elif et == QtCore.QEvent.MouseMove and self._rubber.isVisible() and self._origin is not None:
+                    rect = QtCore.QRect(self._origin, event.pos()).normalized()
+                    self._rubber.setGeometry(rect)
+                elif et == QtCore.QEvent.MouseButtonRelease and self._rubber.isVisible():
+                    rect = QtCore.QRect(self._origin, event.pos()).normalized()
+                    self._rubber.setGeometry(rect)
+            return QDialog.eventFilter(self, obj, event)
+
+        def crop_image(self) -> Optional[QImage]:
+            rect = self._rubber.geometry()
+            if rect.isNull():
+                return None
+            x = max(0, int(rect.x() * self._scale_x))
+            y = max(0, int(rect.y() * self._scale_y))
+            w = max(1, int(rect.width() * self._scale_x))
+            h = max(1, int(rect.height() * self._scale_y))
+            if x >= self._qimg.width() or y >= self._qimg.height():
+                return None
+            w = min(w, self._qimg.width() - x)
+            h = min(h, self._qimg.height() - y)
+            return self._qimg.copy(QtCore.QRect(x, y, w, h))
+
+    def _fv_on_click_describe_region(self):
+        # Try to grab the current frame from the player first
+        try:
+            qimg = _fv_grab_qimage_from_player(self)
+        except Exception:
+            qimg = None
+        # Fallback to loading from the image path
+        if qimg is None or (hasattr(qimg, "isNull") and qimg.isNull()):
+            p = ""
+            try:
+                p = (self.txt_image.text() or "").strip()
+            except Exception:
+                p = ""
+            if p:
+                try:
+                    from PIL import Image
+                    im = Image.open(p).convert("RGB")
+                    qimg = QImage(im.tobytes(), im.width, im.height, im.width * 3, QImage.Format_RGB888)
+                except Exception:
+                    qimg = None
+        if qimg is None or (hasattr(qimg, "isNull") and qimg.isNull()):
+            try:
+                self.output.setPlainText("No image available to select a region from.")
+            except Exception:
+                pass
+            return
+
+        dlg = _FVRegionDialog(qimg, self)
+        if dlg.exec() != QDialog.Accepted:
+            return
+        cropped = dlg.crop_image()
+        if cropped is None or (hasattr(cropped, "isNull") and cropped.isNull()):
+            try:
+                self.output.setPlainText("No region selected.")
+            except Exception:
+                pass
+            return
+
+        # Save the cropped region to a temp PNG and run describe just on that
+        roi_path = _fv_save_temp_png(cropped)
+        original_path = ""
+        try:
+            original_path = self.txt_image.text() or ""
+        except Exception:
+            original_path = ""
+
+        try:
+            self.txt_image.setText(roi_path)
+        except Exception:
+            pass
+
+        # Tell the async handler to skip grabbing a fresh video frame
+        self._fv_region_mode = True
+        try:
+            self._fv_on_click_describe_async()
+        finally:
+            self._fv_region_mode = False
+            try:
+                self.txt_image.setText(original_path)
+            except Exception:
+                pass
+
+    DescriberWidget._fv_on_click_describe_region = _fv_on_click_describe_region  # type: ignore[attr-defined]
+
     def _fv__reset_busy_ui(self):
         try: self.btn_describe.setEnabled(True); self.btn_use_current.setEnabled(True); self.btn_cancel.setEnabled(False)
         except Exception: pass
         try: self.prog.setVisible(False); self.prog.setRange(0,1); self.prog.setValue(0)
-        except Exception: pass
-        try: QGuiApplication.restoreOverrideCursor()
         except Exception: pass
         self._fv_busy = False; self._fv_cancelled = False
 

@@ -72,6 +72,8 @@ def beat_drive(bands, rms, t):
 # We procedurally generate 'routes' across the screen. Each is a smooth polyline.
 _routes = []          # each: {pts:[QPointF...], hue:int, bands:(a,b), pulses:[{t,spd,life}]}
 _last_t = None
+_routes_w = 0
+_routes_h = 0
 
 def _compress_bands(bands, target):
     if not bands: return [0.0]*target
@@ -85,8 +87,10 @@ def _compress_bands(bands, target):
     return out
 
 def _gen_routes(w,h, n_routes=6, points_per=140):
-    global _routes
-    _routes=[]
+    global _routes, _routes_w, _routes_h
+    _routes = []
+    _routes_w = w
+    _routes_h = h
     rnd = random.Random(1337)
     # frequency ownership slices across the (compressed) 24 bands
     bands_per = max(1, 24//n_routes)
@@ -103,7 +107,9 @@ def _gen_routes(w,h, n_routes=6, points_per=140):
         _routes.append({"pts":pts, "hue":hue, "bands":bands, "pulses":[]})
 
 def _ensure_routes(w,h):
-    if not _routes or len(_routes[0]["pts"])==0:
+    global _routes_w, _routes_h
+    if (not _routes or len(_routes[0]["pts"]) == 0 or
+        abs(w - _routes_w) > 4 or abs(h - _routes_h) > 4):
         _gen_routes(w,h)
 
 def _path_len(pts):

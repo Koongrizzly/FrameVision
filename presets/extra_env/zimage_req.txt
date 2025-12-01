@@ -1,0 +1,12 @@
+# Diffusers + ecosystem
+git+https://github.com/huggingface/diffusers.git
+transformers
+accelerate
+huggingface_hub
+safetensors
+einops
+
+# UI / utilities
+PySide6
+Pillow
+tqdm

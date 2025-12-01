@@ -11,6 +11,10 @@ from helpers.prompt import install_prompt_tool
 from helpers.renam import RenamPane
 from helpers.batch import BatchSelectDialog
 from helpers.frames import install_frames_tool
+from helpers.musicedit import MusicEditWidget
+from helpers.split_glue_video import SpliglueVideoTool
+# from helpers.whisper import WhisperWidget
+from helpers.metadata import MetadataEditorWidget
 
 import re
 
@@ -41,19 +45,36 @@ except Exception:
     OUT_TEMP   = BASE/'output'/'_temp'
 
 def ffmpeg_path():
-    candidates = [ROOT/"bin"/("ffmpeg.exe" if os.name=="nt" else "ffmpeg"), "ffmpeg"]
+    """Resolve ffmpeg, preferring app-local presets/bin first, then bin, then PATH."""
+    exe = "ffmpeg.exe" if os.name=="nt" else "ffmpeg"
+    candidates = [
+        ROOT/"presets"/"bin"/exe,
+        ROOT/"bin"/exe,
+        "ffmpeg",
+    ]
     for c in candidates:
-        try: subprocess.check_output([str(c), "-version"], stderr=subprocess.STDOUT); return str(c)
-        except Exception: continue
+        try:
+            subprocess.check_output([str(c), "-version"], stderr=subprocess.STDOUT)
+            return str(c)
+        except Exception:
+            continue
     return "ffmpeg"
 
 
 def ffprobe_path():
-    candidates = [Path('.').resolve()/'bin'/('ffprobe.exe' if os.name=='nt' else 'ffprobe'), 'ffprobe']
+    """Resolve ffprobe, preferring app-local presets/bin first, then bin, then PATH."""
+    exe = 'ffprobe.exe' if os.name=='nt' else 'ffprobe'
+    candidates = [
+        ROOT/"presets"/"bin"/exe,
+        ROOT/"bin"/exe,
+        'ffprobe',
+    ]
     for c in candidates:
         try:
-            subprocess.check_output([str(c), '-version'], stderr=subprocess.STDOUT); return str(c)
-        except Exception: continue
+            subprocess.check_output([str(c), '-version'], stderr=subprocess.STDOUT)
+            return str(c)
+        except Exception:
+            continue
     return 'ffprobe'
 
 def probe_media(path: Path):
@@ -187,7 +208,7 @@ class CollapsibleSection(QWidget):
         self.anim.finished.connect(self._on_anim_finished)
 
         lay = QVBoxLayout(self)
-        lay.setContentsMargins(0,0,0,0)
+        lay.setContentsMargins(6,6,6,6)
         lay.setSpacing(6)
         lay.addWidget(self.toggle)
         lay.addWidget(self.content)
@@ -259,6 +280,33 @@ class InstantToolsPane(QWidget):
         root.setContentsMargins(0,0,0,0)
         root.setSpacing(12)
         root.setSpacing(10)
+
+        # Fancy banner at the top for Multi Tool tab
+        self.banner = QLabel("Multi Tool")
+        self.banner.setObjectName("toolsBanner")
+        self.banner.setAlignment(Qt.AlignCenter)
+        self.banner.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+        self.banner.setFixedHeight(48)
+        self.banner.setStyleSheet(
+            "#toolsBanner {"
+            " font-size: 15px;"
+            " font-weight: 600;"
+            " padding: 8px 17px;"
+            " border-radius: 12px;"
+            " margin: 0 0 6px 0;"
+            " color: #e8f5e9;"
+            " background: qlineargradient("
+            "   x1:0, y1:0, x2:1, y2:0,"
+            "   stop:0 #424242,"
+            "   stop:0.5 #1e88e5,"
+            "   stop:1 #1b5e20"
+            " );"
+            " letter-spacing: 0.5px;"
+            "}"
+        )
+        root.addWidget(self.banner)
+        root.addSpacing(4)
+
         # --- Global remember toggle for Tools tab ---
         try:
             self._qs = QSettings("FrameVision","FrameVision")
@@ -285,6 +333,7 @@ class InstantToolsPane(QWidget):
         # Sections
         sec_speed = CollapsibleSection("Slow motion - Speedup Video", expanded=False)
         sec_resize = CollapsibleSection("Resize/convert - Images/Video", expanded=False)
+        sec_splitglue = CollapsibleSection("Video Split and join", expanded=False)
         sec_gif = CollapsibleSection("Animated Frames Lab", expanded=False)
         sec_extract = CollapsibleSection("Extract frames", expanded=False)
         sec_trim = CollapsibleSection("Trim Lab", expanded=False)
@@ -321,6 +370,34 @@ class InstantToolsPane(QWidget):
         _rn_layout.addWidget(_rn_widget)
         sec_rename.setContentLayout(_rn_layout)
 
+        # Whisper Lab (Faster-Whisper)
+        sec_whisper = CollapsibleSection("Whisper Lab", expanded=False)
+        _whisper_wrap = QWidget(); _whisper_layout = QVBoxLayout(_whisper_wrap); _whisper_layout.setContentsMargins(0,0,0,0)
+        try:
+            _whisper_widget = WhisperWidget(self)
+        except Exception:
+            try:
+                _whisper_widget = WhisperWidget(None)
+            except Exception:
+                _whisper_widget = QLabel("Whisper Lab failed to load.")
+        _whisper_layout.addWidget(_whisper_widget)
+        sec_whisper.setContentLayout(_whisper_layout)
+
+        # Metadata editor (embedded directly in this section)
+        sec_metadata = CollapsibleSection("Metadata editor", expanded=False)
+        _meta_wrap = QWidget()
+        _meta_layout = QVBoxLayout(_meta_wrap)
+        _meta_layout.setContentsMargins(0, 0, 0, 0)
+        try:
+            # If the main window exposes a shared log QTextEdit, pass it through.
+            if hasattr(self.main, "log_widget") and isinstance(getattr(self.main, "log_widget"), QTextEdit):
+                _meta_widget = MetadataEditorWidget(parent=self, external_log_widget=self.main.log_widget)
+            else:
+                _meta_widget = MetadataEditorWidget(parent=self)
+        except Exception:
+            _meta_widget = QLabel("Metadata Editor failed to load.")
+        _meta_layout.addWidget(_meta_widget)
+        sec_metadata.setContentLayout(_meta_layout)
 
         # Speed
         self.speed = QSlider(Qt.Horizontal); self.speed.setRange(25, 250); self.speed.setValue(150)
@@ -399,12 +476,70 @@ class InstantToolsPane(QWidget):
                 # --- Advanced GIF options ---
         gif_backend.install_ui(self, lay_gif, sec_gif)
         sec_gif.setContentLayout(lay_gif)
+
+        # Split & Glue Video (near frames tools)
+        _sg_wrap = QWidget()
+        _sg_layout = QVBoxLayout(_sg_wrap)
+        _sg_layout.setContentsMargins(0, 0, 0, 0)
+        try:
+            _sg_widget = SpliglueVideoTool(self)
+        except Exception:
+            try:
+                _sg_widget = SpliglueVideoTool(None)
+            except Exception:
+                _sg_widget = QLabel("Split & Glue tool failed to load.")
+        _sg_layout.addWidget(_sg_widget)
+        sec_splitglue.setContentLayout(_sg_layout)
+
+        # Music Clip Creator (auto music sync) — embedded like other tools
+        sec_musicclip = CollapsibleSection("VideoClip Creator", expanded=False)
+        try:
+            from helpers import auto_music_sync as _mcc
+            # Preferred installer-style API
+            if hasattr(_mcc, "install_auto_music_sync_tool"):
+                _mcc.install_auto_music_sync_tool(self, sec_musicclip)
+            elif hasattr(_mcc, "install_music_clip_creator"):
+                _mcc.install_music_clip_creator(self, sec_musicclip)
+            else:
+                # Fallback to a direct widget, if provided
+                _mcc_wrap = QWidget(); _mcc_layout = QVBoxLayout(_mcc_wrap); _mcc_layout.setContentsMargins(0,0,0,0)
+                try:
+                    widget_cls = getattr(_mcc, "MusicClipCreatorWidget", None) or getattr(_mcc, "MusicClipCreator", None)
+                    if widget_cls is not None:
+                        try:
+                            _mcc_widget = widget_cls(self)
+                        except Exception:
+                            _mcc_widget = widget_cls(None)
+                    else:
+                        _mcc_widget = QLabel("Music Clip Creator tool loaded, but no UI entrypoint was found.")
+                except Exception:
+                    _mcc_widget = QLabel("Music Clip Creator tool failed to load.")
+                _mcc_layout.addWidget(_mcc_widget)
+                sec_musicclip.setContentLayout(_mcc_layout)
+        except Exception:
+            _mcc_wrap = QWidget(); _mcc_layout = QVBoxLayout(_mcc_wrap); _mcc_layout.setContentsMargins(0,0,0,0)
+            _mcc_layout.addWidget(QLabel("Music Clip Creator tool failed to load."))
+            sec_musicclip.setContentLayout(_mcc_layout)
+
         # Audio (moved to helpers/audiotool.py)
-        sec_audio = CollapsibleSection("Sound Lab", expanded=False)
+        sec_audio = CollapsibleSection("Sound Mixer", expanded=False)
         try:
             install_audio_tool(self, sec_audio)
         except Exception:
             pass
+
+        # Music Edit
+        sec_music = CollapsibleSection("Sound Edit", expanded=False)
+        _music_wrap = QWidget(); _music_layout = QVBoxLayout(_music_wrap); _music_layout.setContentsMargins(0,0,0,0)
+        try:
+            _music_widget = MusicEditWidget(self)
+        except Exception:
+            try:
+                _music_widget = MusicEditWidget(None)
+            except Exception:
+                _music_widget = QLabel("Music Edit tool failed to load.")
+        _music_layout.addWidget(_music_widget)
+        sec_music.setContentLayout(_music_layout)
 
 
         # moved below to reorder; see tuple later
@@ -433,24 +568,28 @@ class InstantToolsPane(QWidget):
         except Exception:
             pass
 
-        for sec in (sec_meme, sec_prompt, sec_audio, sec_speed, sec_resize, sec_gif, sec_extract, sec_trim, sec_crop, sec_rename):
+        for sec in (sec_prompt, sec_meme, sec_musicclip, sec_music, sec_audio, sec_speed, sec_resize, sec_trim, sec_crop, sec_splitglue, sec_gif, sec_extract, sec_rename, sec_metadata):
             root.addWidget(sec)
         root.addStretch(1)
         # --- Remember settings (per-tool + global) ---
         def _sec_name_map():
             return {
                 "Sound Lab": sec_audio,
+                "Music Edit": sec_music,
+                "Music Clip Creator": sec_musicclip,
                 "Slow motion - Speedup Video": sec_speed,
                 "Resize Images & Video": sec_resize,
+                "Split & Glue Video": sec_splitglue,
                 "Animated Frames Lab": sec_gif,
                 "Extract frames": sec_extract,
                 "Trim Lab": sec_trim,
                 "Cropping": sec_crop,
 
-
                 "Thumbnail / Meme Creator": sec_meme,
                 "Prompt Enhancement": sec_prompt,
-                "Multi Rename": sec_rename
+                "Multi Rename": sec_rename,
+                "Whisper Lab": sec_whisper,
+                "Metadata editor": sec_metadata
             }
         self._sections_map = _sec_name_map()
         # Build default whitelist (all except Trim and Audio)

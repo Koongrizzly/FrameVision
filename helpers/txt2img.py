@@ -151,8 +151,133 @@ def _safe_exists(path_str):
     from pathlib import Path as _P
     try:
         return _P(path_str).exists()
+
     except Exception:
         return False
+
+
+def _aggressive_free_cuda_vram():
+    """Best-effort CUDA VRAM cleanup focused on Qwen/Qwen-VL style models.
+
+    This walks:
+      - sys.modules to find obvious Qwen-related modules
+      - gc.get_objects() to find live torch.nn.Module instances whose
+        class or module name mentions "qwen" and that still have CUDA
+        parameters.
+
+    It then tries to move those modules to CPU via .to("cpu"), followed by
+    a generic gc.collect() + torch.cuda.empty_cache()/ipc_collect().
+
+    Everything is wrapped defensively so it can never crash callers.
+    """
+    try:
+        import sys as _sys
+        import gc as _gc
+        try:
+            import torch as _torch  # type: ignore
+            from torch import nn as _nn  # type: ignore
+        except Exception:
+            _torch = None  # type: ignore
+            _nn = None     # type: ignore
+
+        # First pass: scan sys.modules for obvious Qwen modules and try to
+        # move any .to()-capable attributes to CPU.
+        try:
+            for _name, _mod in list((_sys.modules or {}).items()):
+                if not _mod:
+                    continue
+                try:
+                    _lname = str(_name).lower()
+                except Exception:
+                    _lname = ""
+                if "qwen" not in _lname:
+                    continue
+                for _attr in dir(_mod):
+                    if _attr.startswith("__"):
+                        continue
+                    try:
+                        _obj = getattr(_mod, _attr)
+                    except Exception:
+                        continue
+                    try:
+                        if hasattr(_obj, "to"):
+                            try:
+                                _obj.to("cpu")
+                            except Exception:
+                                pass
+                    except Exception:
+                        pass
+        except Exception:
+            # Best-effort only
+            pass
+
+        # Second pass: scan all live objects for torch.nn.Module instances
+        # that look like Qwen/Qwen-VL models and still have CUDA params.
+        try:
+            if _torch is not None and _nn is not None:
+                for _obj in list(_gc.get_objects()):
+                    try:
+                        if not isinstance(_obj, _nn.Module):
+                            continue
+                    except Exception:
+                        continue
+                    try:
+                        _cls = _obj.__class__
+                        _cname = getattr(_cls, "__name__", "") or ""
+                        _mname = getattr(_cls, "__module__", "") or ""
+                        _lname_c = str(_cname).lower()
+                        _lname_m = str(_mname).lower()
+                    except Exception:
+                        _lname_c = ""
+                        _lname_m = ""
+                    if "qwen" not in _lname_c and "qwen" not in _lname_m:
+                        continue
+
+                    # Check if any parameters are on CUDA
+                    try:
+                        has_cuda_param = False
+                        for _p in _obj.parameters():
+                            try:
+                                if getattr(_p, "is_cuda", False):
+                                    has_cuda_param = True
+                                    break
+                            except Exception:
+                                continue
+                        if not has_cuda_param:
+                            continue
+                    except Exception:
+                        # If we can't inspect parameters, skip
+                        continue
+
+                    # Try to move the whole module to CPU
+                    try:
+                        _obj.to("cpu")
+                    except Exception:
+                        pass
+        except Exception:
+            pass
+
+        # Final GC + CUDA cache clear
+        try:
+            _gc.collect()
+        except Exception:
+            pass
+        try:
+            if _torch is not None and hasattr(_torch, "cuda") and _torch.cuda.is_available():
+                try:
+                    _torch.cuda.empty_cache()
+                except Exception:
+                    pass
+                try:
+                    if hasattr(_torch.cuda, "ipc_collect"):
+                        _torch.cuda.ipc_collect()
+                except Exception:
+                    pass
+        except Exception:
+            pass
+    except Exception:
+        # Absolutely never crash caller from here
+        pass
 
 from typing import Callable, Optional
 try:
@@ -166,11 +291,12 @@ from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel, QLineEdit, QTextEdit, QPushButton, QSpinBox,
     QCheckBox, QFileDialog, QComboBox, QProgressBar, QGroupBox, QFormLayout, QScrollArea, QToolButton, QSlider,
     QDoubleSpinBox,
-    QSizePolicy
+    QSizePolicy,
+    QApplication,
 )
 # Import QShortcut correctly from QtGui; fall back to no shortcut if missing
 try:
-    from PySide6.QtGui import QKeySequence, QImage, QPainter, QShortcut
+    from PySide6.QtGui import QKeySequence, QImage, QPainter, QPainterPath, QShortcut
 except Exception:
     from PySide6.QtGui import QKeySequence, QImage, QPainter  # type: ignore
     QShortcut = None  # type: ignore
@@ -187,12 +313,40 @@ class _Disclosure(QWidget):
         self._btn.setCheckable(True); self._btn.setChecked(start_open)
         self._btn.toggled.connect(self._on_clicked)
         self._body = content; self._body.setVisible(start_open)
-        lay = QVBoxLayout(self); lay.setContentsMargins(0,0,0,0)
+        lay = QVBoxLayout(self); lay.setContentsMargins(6,6,6,6)
         lay.addWidget(self._btn); lay.addWidget(self._body)
     def _on_clicked(self, checked: bool):
         self._body.setVisible(checked)
         self._btn.setArrowType(Qt.DownArrow if checked else Qt.RightArrow)
         self.toggled.emit(checked)
+
+# --- helper: rounded pixmap for nicer thumbnails ---
+def _rounded_pixmap(pm, radius: int = 10):
+    try:
+        from PySide6.QtGui import QPixmap
+        from PySide6.QtCore import QRectF, Qt
+        if pm is None:
+            return pm
+        if isinstance(pm, QPixmap) and not pm.isNull():
+            w, h = pm.width(), pm.height()
+            if w <= 0 or h <= 0:
+                return pm
+            r = max(0, int(radius))
+            out = QPixmap(w, h)
+            out.fill(Qt.transparent)
+            p = QPainter(out)
+            p.setRenderHint(QPainter.Antialiasing, True)
+            p.setRenderHint(QPainter.SmoothPixmapTransform, True)
+            path = QPainterPath()
+            path.addRoundedRect(QRectF(0, 0, w, h), r, r)
+            p.setClipPath(path)
+            p.drawPixmap(0, 0, pm)
+            p.end()
+            return out
+        return pm
+    except Exception:
+        return pm
+# --- end helper ---
 class Txt2ImgPane(QWidget):
 
 
@@ -236,8 +390,8 @@ class Txt2ImgPane(QWidget):
             try:
                 func = globals().get('_t2i_apply_from_dict')
                 if callable(func):
+                    # Apply rich loader but continue so engine/output can also be restored
                     func(self, s)
-                    return
             except Exception:
                 pass
             # Minimal built-in mapper
@@ -261,6 +415,24 @@ class Txt2ImgPane(QWidget):
                                 idx = _i; break
                         if idx >= 0:
                             self.seed_policy.setCurrentIndex(idx) if sp is not None else None
+            except Exception:
+                pass
+            try:
+                eng = (str(s.get("engine") or s.get("backend") or "")).strip().lower()
+                cb = getattr(self, "engine_combo", None)
+                if cb is not None and eng:
+                    idx = -1
+                    try:
+                        for _i in range(cb.count()):
+                            data = cb.itemData(_i)
+                            text = (cb.itemText(_i) or "").lower()
+                            if (isinstance(data, str) and isinstance(eng, str) and data is not None and str(data).lower() == eng) or (eng and eng in text):
+                                idx = _i
+                                break
+                    except Exception:
+                        idx = -1
+                    if idx >= 0:
+                        cb.setCurrentIndex(idx)
             except Exception:
                 pass
             try:
@@ -306,6 +478,42 @@ class Txt2ImgPane(QWidget):
                     self.show_in_player.setChecked(bool(s.get('show_in_player')))
                 if hasattr(self,'use_queue') and 'use_queue' in s:
                     self.use_queue.setChecked(bool(s.get('use_queue')))
+            except Exception:
+                pass
+
+            # Recent results options
+            try:
+                sz = int(s.get("recents_thumb_size", 100))
+                if hasattr(self, "sld_recent_size"):
+                    try:
+                        self.sld_recent_size.setValue(sz)
+                    except Exception:
+                        pass
+            except Exception:
+                pass
+            try:
+                sort = s.get("recents_sort")
+                cb = getattr(self, "combo_recent_sort", None)
+                if cb is not None and sort is not None:
+                    idx = -1
+                    try:
+                        for i in range(cb.count()):
+                            v = cb.itemData(i)
+                            if v == sort:
+                                idx = i
+                                break
+                    except Exception:
+                        idx = -1
+                    if idx < 0:
+                        try:
+                            idx = cb.findText(str(sort))
+                        except Exception:
+                            idx = -1
+                    if idx >= 0:
+                        try:
+                            cb.setCurrentIndex(idx)
+                        except Exception:
+                            pass
             except Exception:
                 pass
             # ## enforce_seed_and_size_from_saved — robustly restore tri‑state seed policy and size
@@ -490,14 +698,22 @@ class Txt2ImgPane(QWidget):
         except Exception:
             pass
 
+        # Check for Z-Image env; hide engine dropdown if missing
+        try:
+            self._update_engine_visibility_for_zimage_env()
+        except Exception:
+            pass
+
         # Hotkey (Ctrl+Enter) only if QShortcut available
         try:
-            if QShortcut is not None:
+            # Only create the shortcut once we actually have a QApplication instance.
+            app = QApplication.instance()
+            if QShortcut is not None and app is not None:
                 QShortcut(QKeySequence("Ctrl+Enter"), self, activated=self._on_generate_clicked)
         except Exception:
             pass
 
-        # --- Lightweight ETA timer (time-based, no per-step) ---
+# --- Lightweight ETA timer (time-based, no per-step) ---
         try:
             self._eta_timer = QTimer(self)
             self._eta_timer.setInterval(500)
@@ -552,6 +768,99 @@ class Txt2ImgPane(QWidget):
                         self.seed_policy.setCurrentIndex(idx) if sp is not None else None
         except Exception:
             pass
+
+        # After startup, force 'Recent results' closed once, a bit after other
+        # state restorers have done their work (in case something else reopens it).
+        try:
+            from PySide6.QtCore import QTimer as _T2I_QTimer
+        except Exception:
+            _T2I_QTimer = None
+        try:
+            if _T2I_QTimer is not None:
+                def _t2i_close_recents_later():
+                    try:
+                        box = getattr(self, "recents_box", None)
+                        if box is not None:
+                            try:
+                                box._btn.setChecked(False)
+                            except Exception:
+                                pass
+                            try:
+                                box._body.setVisible(False)
+                            except Exception:
+                                pass
+                    except Exception:
+                        pass
+                _T2I_QTimer.singleShot(3000, _t2i_close_recents_later)
+        except Exception:
+            pass
+
+
+    def _update_engine_visibility_for_zimage_env(self):
+        """Hide engine dropdown and force SD engine when Z-Image env is missing."""
+        try:
+            from pathlib import Path as _P
+        except Exception:
+            return
+        # Determine app root (prefer ROOT if available)
+        try:
+            base = ROOT  # type: ignore[name-defined]
+        except Exception:
+            try:
+                base = _P(__file__).resolve().parent.parent
+            except Exception:
+                base = _P.cwd()
+        try:
+            env_path = base / ".zimage_env" / "scripts" / "python.exe"
+        except Exception:
+            env_path = None
+
+        has_zimage = False
+        try:
+            if env_path is not None:
+                has_zimage = env_path.exists()
+        except Exception:
+            has_zimage = False
+
+        cb = getattr(self, "engine_combo", None)
+        lab = getattr(self, "engine_label", None)
+
+        if not has_zimage:
+            # Hide engines dropdown and force SD models (SD15/SDXL)
+            try:
+                if cb is not None:
+                    idx = -1
+                    try:
+                        for i in range(cb.count()):
+                            data = cb.itemData(i)
+                            text = (cb.itemText(i) or "").lower()
+                            if (isinstance(data, str) and data.lower() == "diffusers") or "sd models" in text:
+                                idx = i
+                                break
+                    except Exception:
+                        idx = -1
+                    if idx >= 0:
+                        cb.setCurrentIndex(idx)
+                    cb.setVisible(False)
+            except Exception:
+                pass
+            try:
+                if lab is not None:
+                    lab.setVisible(False)
+            except Exception:
+                pass
+        else:
+            # Environment present: keep engines dropdown visible
+            try:
+                if cb is not None:
+                    cb.setVisible(True)
+            except Exception:
+                pass
+            try:
+                if lab is not None:
+                    lab.setVisible(True)
+            except Exception:
+                pass
 
     def _apply_preset(self, name: str):
         presets = {
@@ -643,10 +952,1078 @@ class Txt2ImgPane(QWidget):
                 self.negative.setPlainText(cfg["neg"])
         except Exception:
             pass
+
+
+    # ===== Recent results: gather from thumbnails, output dir, and finished queue jobs =====
+    def _recents_dir(self):
+        """Return Path to the txt2img recent-thumbnail folder."""
+        from pathlib import Path as _Path
+        try:
+            try:
+                base = _Path(__file__).resolve().parent.parent
+            except Exception:
+                base = _Path.cwd()
+            d = base / "output" / "last results" / "txt2img"
+            try:
+                d.mkdir(parents=True, exist_ok=True)
+            except Exception:
+                pass
+            return d
+        except Exception:
+            # Fallback to relative path
+            return _Path("output") / "last results" / "txt2img"
+
+    def _current_output_dir(self):
+        """Best-effort: return Path for the last chosen txt2img output folder."""
+        from pathlib import Path as _Path
+        try:
+            p = None
+            try:
+                text = self.output_path.text().strip()
+                if text:
+                    p = _Path(text).expanduser()
+            except Exception:
+                p = None
+            if not p:
+                return None
+            try:
+                p.mkdir(parents=True, exist_ok=True)
+            except Exception:
+                pass
+            return p
+        except Exception:
+            return None
+
+    def _jobs_done_dirs(self):
+        """Return a list of job result folders to scan for finished txt2img queue jobs."""
+        from pathlib import Path as _Path
+        try:
+            # ROOT is provided by the main app in most places
+            base = ROOT  # type: ignore[name-defined]
+        except Exception:
+            base = _Path(__file__).resolve().parent.parent
+        roots = []
+        for name in ("finished", "done"):
+            try:
+                d = base / "jobs" / name
+                if d.exists() and d.is_dir():
+                    roots.append(d)
+            except Exception:
+                continue
+        return roots
+
+    def _list_recent_txt2img_jobs(self):
+        """List finished txt2img job JSON files (newest first)."""
+        from pathlib import Path as _Path
+        jobs = []
+        try:
+            for d in self._jobs_done_dirs():
+                try:
+                    for p in d.iterdir():
+                        try:
+                            if (
+                                p.is_file()
+                                and p.suffix.lower() == ".json"
+                                and "txt2img" in p.name.lower()
+                            ):
+                                jobs.append(p)
+                        except Exception:
+                            continue
+                except Exception:
+                    continue
+            jobs.sort(key=lambda p: p.stat().st_mtime, reverse=True)
+            return jobs[:40]
+        except Exception:
+            return []
+
+    def _resolve_output_from_job(self, job_json):
+        """Return (media_path, job_data) for a finished job JSON.
+
+        This mirrors the generic logic from the Upscale tab and should also work
+        for txt2img jobs.
+        """
+        from pathlib import Path as _Path
+        import json as _json
+
+        try:
+            j = _json.loads(_Path(job_json).read_text(encoding="utf-8"))
+        except Exception:
+            j = {}
+
+        def _as_path(val):
+            if not val:
+                return None
+            try:
+                p = _Path(str(val)).expanduser()
+                if not p.is_absolute():
+                    out_dir = j.get("out_dir") or (j.get("args") or {}).get("out_dir")
+                    if out_dir:
+                        p = _Path(out_dir).expanduser() / p
+                return p
+            except Exception:
+                return None
+
+        # Priority fields
+        for k in ("produced", "outfile", "output", "result", "file", "path"):
+            v = j.get(k) or (j.get("args") or {}).get(k)
+            p = _as_path(v)
+            if p and p.exists() and p.is_file():
+                return p, j
+
+        # List fields
+        for k in ("outputs", "produced_files", "results", "files", "artifacts", "saved"):
+            seq = j.get(k) or (j.get("args") or {}).get(k)
+            if isinstance(seq, (list, tuple)):
+                for v in seq:
+                    p = _as_path(v)
+                    if p and p.exists() and p.is_file():
+                        return p, j
+
+        # Fallback: newest media from out_dir
+        media_exts = {".png", ".jpg", ".jpeg", ".webp", ".bmp", ".gif"}
+        out_dir = _as_path(j.get("out_dir") or (j.get("args") or {}).get("out_dir"))
+        try:
+            if out_dir and out_dir.exists():
+                cand = [
+                    p for p in out_dir.iterdir()
+                    if p.is_file() and p.suffix.lower() in media_exts
+                ]
+                cand.sort(key=lambda p: p.stat().st_mtime, reverse=True)
+                if cand:
+                    return cand[0], j
+        except Exception:
+            pass
+        return None, j
+
+    def _thumb_path_for_media(self, media_path, max_side: int = 120):
+        """Return a Path under _recents_dir used to store a thumbnail for *media_path*."""
+        from pathlib import Path as _Path
+        import hashlib
+
+        d = self._recents_dir()
+        try:
+            d.mkdir(parents=True, exist_ok=True)
+        except Exception:
+            pass
+
+        try:
+            stem = _Path(media_path).stem
+        except Exception:
+            stem = "img"
+
+        try:
+            key = str(media_path)
+            h = hashlib.sha1(key.encode("utf-8")).hexdigest()[:8]
+        except Exception:
+            h = "thumb"
+
+        return d / f"{stem}_{h}_{max_side}.jpg"
+
+    def _ensure_recent_thumb_for_media(self, media_path, max_side: int = 120):
+        """Create (or reuse) a thumbnail in _recents_dir for the given media file."""
+        from pathlib import Path as _Path
+        from PySide6.QtGui import QImageReader
+        from PySide6.QtCore import QSize, Qt
+
+        media_path = _Path(media_path)
+        try:
+            if not (media_path.exists() and media_path.is_file()):
+                return None
+        except Exception:
+            return None
+
+        thumb = self._thumb_path_for_media(media_path, max_side=max_side)
+        try:
+            if thumb.exists() and thumb.stat().st_mtime >= media_path.stat().st_mtime:
+                return thumb
+        except Exception:
+            # If we cannot stat, fall through and try to rebuild
+            pass
+
+        try:
+            reader = QImageReader(str(media_path))
+            reader.setAutoTransform(True)
+            sz = reader.size()
+            if sz.isValid():
+                w, h = sz.width(), sz.height()
+                if w > 0 and h > 0:
+                    scale = max(w, h) / float(max_side or 1)
+                    if scale > 1.0:
+                        w = int(w / scale)
+                        h = int(h / scale)
+                        reader.setScaledSize(QSize(max(16, w), max(16, h)))
+            img = reader.read()
+            if img.isNull():
+                return None
+        except Exception:
+            return None
+
+        try:
+            thumb.parent.mkdir(parents=True, exist_ok=True)
+        except Exception:
+            pass
+
+        try:
+            img.save(str(thumb), "JPG", 88)
+            return thumb
+        except Exception:
+            return None
+
+
+    def _resolve_media_for_thumb(self, thumb_path):
+        """Best-effort: given a thumbnail path, return the original media path.
+
+        Uses an in-memory thumb->media map populated when thumbnails are created,
+        and falls back to searching likely output folders by filename stem.
+        """
+        try:
+            from pathlib import Path as _P
+        except Exception:
+            _P = None
+
+        if _P is None:
+            return thumb_path
+
+        try:
+            t = _P(str(thumb_path))
+        except Exception:
+            return thumb_path
+
+        # 1) In-memory mapping (new thumbnails in this session)
+        try:
+            mapping = getattr(self, "_recents_thumb_map", {}) or {}
+            orig = mapping.get(str(t))
+            if orig:
+                p = _P(str(orig))
+                if p.exists() and p.is_file():
+                    return p
+        except Exception:
+            pass
+
+        # 2) Parse the thumbnail filename: stem_hash_size.jpg -> stem
+        try:
+            name_stem = t.stem
+            parts = name_stem.rsplit("_", 2)
+            if len(parts) == 3 and parts[1] and parts[2]:
+                base_stem = parts[0]
+            else:
+                base_stem = name_stem
+        except Exception:
+            base_stem = None
+
+        media_exts = (".png", ".jpg", ".jpeg", ".webp", ".bmp", ".gif")
+
+        # Build a list of candidate folders to search
+        dirs = []
+        try:
+            out_dir = self._current_output_dir()
+            if out_dir and out_dir.exists():
+                dirs.append(out_dir)
+        except Exception:
+            pass
+
+        # Include result folders from recent txt2img queue jobs
+        try:
+            jobs = self._list_recent_txt2img_jobs()
+            for job_json in jobs:
+                try:
+                    media, _j = self._resolve_output_from_job(job_json)
+                except Exception:
+                    media = None
+                if media is not None:
+                    d = getattr(media, "parent", None)
+                    if d is not None and d not in dirs:
+                        dirs.append(d)
+        except Exception:
+            pass
+
+        # 3) Try to find a matching media file by stem and known image extensions
+        for d in dirs:
+            try:
+                if base_stem:
+                    for ext in media_exts:
+                        cand = d / f"{base_stem}{ext}"
+                        if cand.exists() and cand.is_file():
+                            return cand
+                # Fallback: any file in the folder whose stem matches
+                for f in d.iterdir():
+                    try:
+                        if f.is_file() and f.suffix.lower() in media_exts:
+                            if base_stem and f.stem == base_stem:
+                                return f
+                    except Exception:
+                        continue
+            except Exception:
+                continue
+
+        # Last resort: fall back to the thumbnail itself
+        return thumb_path
+
+    def _list_recent_files(self):
+        """List recent result thumbnail files (most recent first).
+
+        This merges three sources:
+        - Existing thumbnails under output/last results/txt2img
+        - New images from the current txt2img output folder (non-queued runs)
+        - Finished txt2img queue jobs (from jobs/finished or jobs/done)
+        """
+        exts = {".png", ".jpg", ".jpeg", ".webp", ".bmp", ".gif"}
+        candidates = []
+
+        # 1) Existing thumbs under the recents dir
+        try:
+            thumbs_dir = self._recents_dir()
+            if thumbs_dir and thumbs_dir.exists():
+                for p in thumbs_dir.iterdir():
+                    try:
+                        if p.is_file() and p.suffix.lower() in exts:
+                            candidates.append(p)
+                    except Exception:
+                        continue
+        except Exception:
+            pass
+
+        # Ensure we have a mapping dict available for thumb -> media
+        try:
+            if not hasattr(self, "_recents_thumb_map") or getattr(self, "_recents_thumb_map") is None:
+                self._recents_thumb_map = {}
+        except Exception:
+            try:
+                self._recents_thumb_map = {}
+            except Exception:
+                pass
+
+        # 2) Non-queued direct output folder (current output_path)
+        try:
+            out_dir = self._current_output_dir()
+            if out_dir and out_dir.exists():
+                imgs = [
+                    p for p in out_dir.iterdir()
+                    if p.is_file() and p.suffix.lower() in exts
+                ]
+                imgs.sort(key=lambda p: p.stat().st_mtime, reverse=True)
+                for media in imgs[:40]:
+                    tp = self._ensure_recent_thumb_for_media(media, max_side=120)
+                    if tp:
+                        candidates.append(tp)
+                        try:
+                            m = getattr(self, "_recents_thumb_map", {}) or {}
+                            m[str(tp)] = str(media)
+                            self._recents_thumb_map = m
+                        except Exception:
+                            pass
+        except Exception:
+            pass
+
+        # 3) Finished queue jobs (txt2img jobs only)
+        try:
+            jobs = self._list_recent_txt2img_jobs()
+            for job_json in jobs:
+                media, _j = self._resolve_output_from_job(job_json)
+                if not media:
+                    continue
+                tp = self._ensure_recent_thumb_for_media(media, max_side=120)
+                if tp:
+                    candidates.append(tp)
+                    try:
+                        m = getattr(self, "_recents_thumb_map", {}) or {}
+                        m[str(tp)] = str(media)
+                        self._recents_thumb_map = m
+                    except Exception:
+                        pass
+        except Exception:
+            pass
+
+
+        # Deduplicate & sort by mtime (newest first)
+        try:
+            uniq = {}
+            for p in candidates:
+                try:
+                    mt = p.stat().st_mtime
+                except Exception:
+                    mt = 0
+                key = str(p)
+                cur = uniq.get(key)
+                if (cur is None) or (mt > cur[1]):
+                    uniq[key] = (p, mt)
+            files = [v[0] for v in uniq.values()]
+            files.sort(key=lambda p: p.stat().st_mtime, reverse=True)
+            return files[:48]
+        except Exception:
+            try:
+                candidates.sort(key=lambda p: p.stat().st_mtime, reverse=True)
+                return candidates[:48]
+            except Exception:
+                return []
+    def _install_recents_poller(self):
+        """Poll the txt2img recents folder every few seconds; rebuild UI on change."""
+        try:
+            if getattr(self, "_recents_poller", None):
+                return
+            from PySide6.QtCore import QTimer
+            def _sig():
+                try:
+                    files = self._list_recent_files()
+                    return tuple((p.name, int(p.stat().st_mtime)) for p in files)
+                except Exception:
+                    return tuple()
+            def _tick():
+                try:
+                    cur = _sig()
+                    if cur != getattr(self, "_recents_sig", None):
+                        self._recents_sig = cur
+                        self._rebuild_recents()
+                except Exception:
+                    pass
+            try:
+                self._recents_sig = None
+                _tick()
+            except Exception:
+                pass
+            t = QTimer(self)
+            t.setInterval(5000)
+            t.timeout.connect(_tick)
+            t.start()
+            self._recents_poller = t
+        except Exception:
+            pass
+
+    def _rebuild_recents(self):
+        """Rebuild the Recent results grid from thumbnail files."""
+        try:
+            layout = getattr(self, "_recents_row", None)
+            inner = getattr(self, "_recents_inner", None)
+            scroll = getattr(self, "recents_scroll", None)
+            if layout is None or inner is None or scroll is None:
+                return
+
+            # Clear existing widgets
+            try:
+                while layout.count():
+                    item = layout.takeAt(0)
+                    w = item.widget()
+                    if w is not None:
+                        w.setParent(None)
+            except Exception:
+                pass
+
+            # Thumb size from slider (clamped)
+            try:
+                size_slider = getattr(self, "sld_recent_size", None)
+                size = int(size_slider.value()) if size_slider is not None else 100
+            except Exception:
+                size = 100
+            if size < 40:
+                size = 40
+            if size > 200:
+                size = 200
+
+            files = self._list_recent_files()
+            if not files:
+                from PySide6.QtWidgets import QLabel as _QLabel
+                lab = _QLabel("No results yet.", self)
+                try:
+                    lab.setStyleSheet("color:#9fb3c8;")
+                except Exception:
+                    pass
+                layout.addWidget(lab, 0, 0)
+                try:
+                    inner.setMinimumHeight(lab.sizeHint().height() + 8)
+                except Exception:
+                    pass
+                return
+
+            from PySide6.QtGui import QIcon, QPixmap
+            from PySide6.QtCore import QSize, Qt
+
+            # Helper functions for sorting by underlying media
+            def _media_for_sort(thumb_path):
+                try:
+                    return self._resolve_media_for_thumb(thumb_path)
+                except Exception:
+                    return thumb_path
+
+            def _mtime_for(thumb_path):
+                from pathlib import Path as _P
+                try:
+                    mp = _P(str(_media_for_sort(thumb_path)))
+                    if mp.exists():
+                        return mp.stat().st_mtime
+                except Exception:
+                    pass
+                try:
+                    return _P(str(thumb_path)).stat().st_mtime
+                except Exception:
+                    return 0
+
+            def _name_for(thumb_path):
+                from pathlib import Path as _P
+                try:
+                    mp = _P(str(_media_for_sort(thumb_path)))
+                    return mp.name.lower()
+                except Exception:
+                    pass
+                try:
+                    return _P(str(thumb_path)).name.lower()
+                except Exception:
+                    return str(thumb_path)
+
+            def _size_for(thumb_path):
+                from pathlib import Path as _P
+                try:
+                    mp = _P(str(_media_for_sort(thumb_path)))
+                    if mp.exists():
+                        return mp.stat().st_size
+                except Exception:
+                    pass
+                try:
+                    return _P(str(thumb_path)).stat().st_size
+                except Exception:
+                    return 0
+
+            # Determine sort mode from combo box
+            try:
+                mode = None
+                cb = getattr(self, "combo_recent_sort", None)
+                if cb is not None:
+                    mode = cb.currentData()
+                    if not mode:
+                        mode = cb.currentText()
+                if not mode:
+                    mode = "newest"
+            except Exception:
+                mode = "newest"
+
+            # Apply sorting
+            try:
+                if mode in ("newest", "oldest"):
+                    files.sort(key=_mtime_for, reverse=(mode == "newest"))
+                elif mode in ("az", "za"):
+                    files.sort(key=_name_for, reverse=(mode == "za"))
+                elif mode in ("size_small", "size_large"):
+                    files.sort(key=_size_for, reverse=(mode == "size_large"))
+            except Exception:
+                # Fallback: newest first by thumbnail mtime
+                try:
+                    files.sort(key=lambda p: p.stat().st_mtime, reverse=True)
+                except Exception:
+                    pass
+
+            setattr(self, "_recents_idx", 0)
+            for p in files:
+                btn = QToolButton(self)
+                btn.setToolButtonStyle(Qt.ToolButtonTextUnderIcon)
+                try:
+                    btn.setText(p.name)
+                except Exception:
+                    pass
+                btn.setCursor(Qt.PointingHandCursor)
+                btn.setAutoRaise(True)
+                try:
+                    btn.setStyleSheet(
+                        "QToolButton { border-radius: 10px; padding: 4px 2px; }"
+                        "QToolButton:hover { background: rgba(255,255,255,0.06); }"
+                    )
+                except Exception:
+                    pass
+
+                try:
+                    pm = QPixmap(str(p))
+                except Exception:
+                    pm = QPixmap()
+                if pm and not pm.isNull():
+                    try:
+                        pm2 = pm.scaled(int(size), int(size), Qt.KeepAspectRatio, Qt.SmoothTransformation)
+                    except Exception:
+                        pm2 = pm
+                    try:
+                        pm2 = _rounded_pixmap(pm2, 10)
+                    except Exception:
+                        pass
+                    try:
+                        btn.setIcon(QIcon(pm2))
+                    except Exception:
+                        pass
+                try:
+                    btn.setIconSize(QSize(int(size), int(size)))
+                    btn.setFixedSize(int(size * 1.25), int(size * 1.25) + 28)
+                except Exception:
+                    pass
+
+                # Tooltip with underlying media path (best effort)
+                try:
+                    media_tp = _media_for_sort(p)
+                    from pathlib import Path as _P
+                    btn.setToolTip(str(_P(str(media_tp))))
+                except Exception:
+                    pass
+
+                # Left-click: open result
+                def _mk_open(thumb_path):
+                    def _open():
+                        try:
+                            media = self._resolve_media_for_thumb(thumb_path)
+                        except Exception:
+                            media = thumb_path
+                        try:
+                            # Prefer the app's internal media player; fall back to OS viewer only if needed
+                            if not _play_in_player(self, media):
+                                _open_file(self, media)
+                        except Exception:
+                            _open_file(self, media)
+                    return _open
+                try:
+                    btn.clicked.connect(_mk_open(p))
+                except Exception:
+                    pass
+
+                # Right-click: context menu with Info / Rename / Open folder / Delete
+                def _mk_ctx(thumb_path, button):
+                    def _on_menu(pos):
+                        from pathlib import Path as _P
+                        try:
+                            from PySide6.QtWidgets import QMenu, QInputDialog
+                        except Exception:
+                            QMenu = None  # type: ignore
+                            QInputDialog = None  # type: ignore
+                        try:
+                            from PySide6.QtGui import QDesktopServices
+                        except Exception:
+                            QDesktopServices = None  # type: ignore
+                        try:
+                            from PySide6.QtCore import QUrl
+                        except Exception:
+                            QUrl = None  # type: ignore
+
+                        if QMenu is None:
+                            return
+
+                        # Resolve underlying media file once
+                        try:
+                            media = self._resolve_media_for_thumb(thumb_path)
+                        except Exception:
+                            media = thumb_path
+                        try:
+                            mp = _P(str(media))
+                        except Exception:
+                            mp = None
+
+                        try:
+                            menu = QMenu(button)
+                        except Exception:
+                            return
+                        try:
+                            act_info = menu.addAction("Info")
+                        except Exception:
+                            act_info = None
+                        try:
+                            act_rename = menu.addAction("Rename")
+                        except Exception:
+                            act_rename = None
+                        try:
+                            act_open = menu.addAction("Open folder")
+                        except Exception:
+                            act_open = None
+                        try:
+                            menu.addSeparator()
+                        except Exception:
+                            pass
+                        try:
+                            act_del = menu.addAction("Delete")
+                        except Exception:
+                            act_del = None
+
+                        try:
+                            global_pos = button.mapToGlobal(pos)
+                        except Exception:
+                            global_pos = None
+                        try:
+                            chosen = menu.exec(global_pos) if global_pos is not None else menu.exec()
+                        except Exception:
+                            chosen = None
+                        if not chosen:
+                            return
+
+                        # Info
+                        if act_info is not None and chosen is act_info:
+                            try:
+                                if mp is None or (not mp.exists()):
+                                    QMessageBox.information(
+                                        self,
+                                        "Info",
+                                        "Original image file could not be found on disk."
+                                    )
+                                    return
+                            except Exception:
+                                pass
+                            try:
+                                from PySide6.QtGui import QImageReader
+                                reader = QImageReader(str(mp))
+                                size = reader.size()
+                                w = size.width() if size.isValid() else 0
+                                h = size.height() if size.isValid() else 0
+                                fmt_bytes = reader.format()
+                                fmt = fmt_bytes.data().decode("ascii", "ignore").upper() if hasattr(fmt_bytes, "data") else (str(fmt_bytes).upper() if fmt_bytes else (mp.suffix.upper() if mp is not None else "?"))
+                            except Exception:
+                                w = h = 0
+                                fmt = mp.suffix.upper() if mp is not None else "?"
+                            try:
+                                st = mp.stat() if mp is not None and mp.exists() else None
+                                size_bytes = st.st_size if st is not None else 0
+                            except Exception:
+                                size_bytes = 0
+                            try:
+                                size_kib = size_bytes / 1024.0 if size_bytes else 0.0
+                                mpx = (w * h) / 1_000_000.0 if w and h else 0.0
+                                txt = []
+                                txt.append(f"File: {mp.name if mp is not None else media}")
+                                txt.append(f"Path: {mp}")
+                                txt.append("")
+                                txt.append(f"Resolution: {w} × {h} px" if w and h else "Resolution: unknown")
+                                txt.append(f"Format: {fmt}" if fmt else "Format: unknown")
+                                txt.append(f"File size: {size_kib:.1f} KiB ({size_bytes} bytes)")
+                                if mpx:
+                                    txt.append(f"Megapixels: {mpx:.2f} MP")
+                                QMessageBox.information(self, "Image info", "\n".join(txt))
+                            except Exception:
+                                pass
+                            return
+
+                        # Rename
+                        if act_rename is not None and chosen is act_rename:
+                            try:
+                                if mp is None or (not mp.exists()):
+                                    QMessageBox.warning(
+                                        self,
+                                        "Rename failed",
+                                        "Original image file could not be found on disk."
+                                    )
+                                    return
+                            except Exception:
+                                pass
+                            try:
+                                current_name = mp.name
+                            except Exception:
+                                current_name = str(media)
+                            try:
+                                ok = False
+                                new_name, ok = QInputDialog.getText(
+                                    self,
+                                    "Rename image",
+                                    "New filename:",
+                                    text=current_name
+                                )
+                            except Exception:
+                                new_name = ""
+                                ok = False
+                            if not ok:
+                                return
+                            try:
+                                new_name = str(new_name).strip()
+                            except Exception:
+                                pass
+                            if not new_name:
+                                return
+                            # Keep directory, avoid path components
+                            try:
+                                base_dir = mp.parent
+                            except Exception:
+                                base_dir = None
+                            try:
+                                # Drop any path fragments user may have entered
+                                simple = new_name.replace("\\", "/").split("/")[-1]
+                            except Exception:
+                                simple = new_name
+                            # Ensure extension
+                            try:
+                                if "." not in simple and mp is not None:
+                                    simple = simple + mp.suffix
+                            except Exception:
+                                pass
+                            try:
+                                if base_dir is not None:
+                                    dest = base_dir / simple
+                                else:
+                                    dest = _P(simple)
+                            except Exception:
+                                dest = None
+                            if dest is None:
+                                return
+                            try:
+                                if dest.exists():
+                                    QMessageBox.warning(
+                                        self,
+                                        "Rename failed",
+                                        "A file with that name already exists."
+                                    )
+                                    return
+                            except Exception:
+                                pass
+                            try:
+                                mp.rename(dest)
+                            except Exception:
+                                try:
+                                    QMessageBox.warning(
+                                        self,
+                                        "Rename failed",
+                                        "Could not rename the image file."
+                                    )
+                                except Exception:
+                                    pass
+                                return
+                            # Update mapping + tooltip + label
+                            try:
+                                mapping = getattr(self, "_recents_thumb_map", {}) or {}
+                                mapping[str(thumb_path)] = str(dest)
+                                self._recents_thumb_map = mapping
+                            except Exception:
+                                pass
+                            try:
+                                button.setToolTip(str(dest))
+                            except Exception:
+                                pass
+                            try:
+                                button.setText(dest.name)
+                            except Exception:
+                                pass
+                            try:
+                                self._rebuild_recents()
+                            except Exception:
+                                pass
+                            return
+
+                        # Open folder
+                        if act_open is not None and chosen is act_open:
+                            try:
+                                if mp is not None and mp.exists():
+                                    folder = mp.parent
+                                else:
+                                    folder = _P(str(thumb_path)).parent
+                            except Exception:
+                                folder = None
+                            if folder is None:
+                                return
+                            try:
+                                if QDesktopServices is not None and QUrl is not None:
+                                    QDesktopServices.openUrl(QUrl.fromLocalFile(str(folder)))
+                            except Exception:
+                                pass
+                            return
+
+                        # Delete (unload + remove media & thumb)
+                        if act_del is not None and chosen is act_del:
+                            # Confirm deletion
+                            try:
+                                fname = mp.name if mp is not None else str(media)
+                            except Exception:
+                                fname = str(media)
+                            try:
+                                res = QMessageBox.question(
+                                    self,
+                                    "Delete image?",
+                                    f"Delete this generated image from disk?\n\n{fname}",
+                                    QMessageBox.Yes | QMessageBox.No,
+                                    QMessageBox.No,
+                                )
+                            except Exception:
+                                res = QMessageBox.Yes
+                            if res != QMessageBox.Yes:
+                                return
+
+                            # Try to unload from player if currently open
+                            try:
+                                m = getattr(self, "_main", None) or getattr(self, "main", None)
+                            except Exception:
+                                m = None
+                            if m is None:
+                                try:
+                                    from PySide6.QtWidgets import QApplication as _QApp
+                                    for w in _QApp.topLevelWidgets():
+                                        if hasattr(w, "video"):
+                                            m = w
+                                            break
+                                except Exception:
+                                    m = None
+                            try:
+                                if m is not None and hasattr(m, "current_path"):
+                                    cur = getattr(m, "current_path", None)
+                                    if cur is not None and str(cur) == (str(mp) if mp is not None else str(media)):
+                                        try:
+                                            player = getattr(m, "video", None)
+                                            if player is not None and hasattr(player, "stop"):
+                                                player.stop()
+                                        except Exception:
+                                            pass
+                                        try:
+                                            m.current_path = None
+                                        except Exception:
+                                            pass
+                            except Exception:
+                                pass
+
+                            # Delete media file
+                            try:
+                                if mp is not None and mp.exists():
+                                    mp.unlink()
+                            except Exception:
+                                try:
+                                    QMessageBox.warning(
+                                        self,
+                                        "Delete failed",
+                                        f"Could not delete file:\n{fname}",
+                                    )
+                                except Exception:
+                                    pass
+
+                            # Delete thumbnail file
+                            try:
+                                tp = _P(str(thumb_path))
+                                if tp.exists():
+                                    tp.unlink()
+                            except Exception:
+                                pass
+
+                            # Remove from in-memory mapping
+                            try:
+                                mapping = getattr(self, "_recents_thumb_map", {}) or {}
+                                mapping.pop(str(thumb_path), None)
+                                self._recents_thumb_map = mapping
+                            except Exception:
+                                pass
+
+                            # Rebuild grid
+                            try:
+                                self._rebuild_recents()
+                            except Exception:
+                                pass
+                            return
+                    return _on_menu
+
+                try:
+                    from PySide6 import QtWidgets as _QtW  # local alias
+                except Exception:
+                    _QtW = None
+                try:
+                    btn.setContextMenuPolicy(Qt.CustomContextMenu)
+                    if _QtW is not None:
+                        btn.customContextMenuRequested.connect(_mk_ctx(p, btn))
+                except Exception:
+                    pass
+
+                # grid placement with wrapping
+                try:
+                    try:
+                        vpw = scroll.viewport().width()
+                    except Exception:
+                        vpw = inner.width()
+                    if not vpw or vpw <= 1:
+                        vpw = max(scroll.width(), self.width(), 600)
+                except Exception:
+                    vpw = 600
+                try:
+                    spacing = getattr(layout, "spacing", lambda: 8)()
+                except Exception:
+                    spacing = 8
+                item_w = int(size * 1.25)
+                if vpw <= item_w + spacing and len(files) > 1:
+                    cols = min(len(files), 4)
+                else:
+                    cols = max(1, int((vpw + spacing) // (item_w + spacing)))
+                idx = getattr(self, "_recents_idx", 0)
+                row = idx // cols
+                col = idx % cols
+                setattr(self, "_recents_idx", idx + 1)
+                try:
+                    layout.addWidget(btn, row, col)
+                except Exception:
+                    pass
+
+            # ensure the scroll area can expand vertically if needed
+            try:
+                try:
+                    spacing = getattr(layout, "spacing", lambda: 8)()
+                except Exception:
+                    spacing = 8
+                item_w = int(size * 1.25)
+                item_h = int(size * 1.25) + 28
+                try:
+                    vpw = scroll.viewport().width()
+                except Exception:
+                    vpw = inner.width()
+                if not vpw or vpw <= 1:
+                    vpw = max(scroll.width(), self.width(), 600)
+                cols = max(1, int((vpw + spacing) // (item_w + spacing)))
+                total = layout.count()
+                rows = max(1, (total + cols - 1) // cols)
+                min_h = rows * item_h + max(0, rows - 1) * spacing + 12
+                inner.setMinimumHeight(min_h)
+            except Exception:
+                pass
+        except Exception as e:
+            try:
+                print("[txt2img] recents rebuild error:", e)
+            except Exception:
+                pass
+
+    def eventFilter(self, obj, ev):
+        """Forward event filtering to base class, but watch recents viewport width."""
+        try:
+            from PySide6.QtCore import QEvent
+            if hasattr(self, "recents_scroll") and self.recents_scroll is not None:
+                if obj is self.recents_scroll.viewport():
+                    if ev.type() == QEvent.Resize:
+                        try:
+                            w = ev.size().width()
+                        except Exception:
+                            w = 0
+                        if w and w != getattr(self, "_recents_last_w", 0):
+                            self._recents_last_w = w
+                            try:
+                                self._rebuild_recents()
+                            except Exception:
+                                pass
+        except Exception:
+            pass
+        try:
+            return super().eventFilter(obj, ev)
+        except Exception:
+            return False
+
     def _build_ui(self):
         outer = QVBoxLayout(self)
         outer.setContentsMargins(10,10,10,10)
         outer.setSpacing(8)
+
+        # Fancy purple banner at the top
+        self.banner = QLabel("Text to Image with SDXL Loader")
+        try:
+            self._banner_default_text = self.banner.text()
+        except Exception:
+            self._banner_default_text = "Text to Image with SDXL Loader"
+        self.banner.setObjectName("txt2imgBanner")
+        self.banner.setAlignment(Qt.AlignCenter)
+        self.banner.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+        self.banner.setFixedHeight(45)
+        self.banner.setStyleSheet(
+            "#txt2imgBanner {"
+            " font-size: 15px;"
+            " font-weight: 600;"
+            " padding: 8px 17px;"
+            " border-radius: 12px;"
+            " margin: 0 0 6px 0;"
+            " color: white;"
+            " background: qlineargradient("
+            "   x1:0, y1:0, x2:1, y2:0,"
+            "   stop:0 #7e3cff,"
+            "   stop:0.5 #a64dff,"
+            "   stop:1 #c27aff"
+            " );"
+            " letter-spacing: 0.5px;"
+            "}"
+        )
+        outer.addWidget(self.banner)
+        outer.addSpacing(4)
         scroll = QScrollArea(self)
         scroll.setWidgetResizable(True)
         scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
@@ -655,12 +2032,31 @@ class Txt2ImgPane(QWidget):
         container = QWidget(); scroll.setWidget(container)
         root = QVBoxLayout(container)
 
+        # Engine / backend selector
+        engine_row = QHBoxLayout()
+        self.engine_combo = QComboBox()
+        try:
+            self.engine_combo.addItem("SD models (SD15/SDXL)", "diffusers")
+            self.engine_combo.addItem("Z-Image Turbo", "zimage")
+        except Exception:
+            # Fallback without userData support
+            self.engine_combo.addItem("SD models (SD15/SDXL)")
+            self.engine_combo.addItem("Z-Image Turbo")
+        self.engine_label = QLabel("Engine:")
+        engine_row.addWidget(self.engine_label)
+        engine_row.addWidget(self.engine_combo, 1)
+        try:
+            root.insertLayout(0, engine_row)
+        except Exception:
+            root.addLayout(engine_row)
+
         # Presets and chips
         top = QHBoxLayout()
+        self.preset_label = QLabel("Preset:")
         self.preset_combo = QComboBox()
         self.style_builder_btn = QPushButton("Style Builder")
         self.style_builder_btn.hide()
-        top.addWidget(QLabel("Preset:"))
+        top.addWidget(self.preset_label)
         top.addWidget(self.preset_combo, 1)
         top.addWidget(self.style_builder_btn, 0)
         root.addLayout(top)
@@ -672,14 +2068,13 @@ class Txt2ImgPane(QWidget):
         form.addRow("Prompt", self.prompt)
         form.addRow("Negative", self.negative)
 
-        # Seed, batch, seed policy
+        # Seed + seed policy (Batch moved next to Generate button)
         row = QHBoxLayout()
         self.seed = QSpinBox(); self.seed.setRange(0, 2_147_483_647); self.seed.setValue(0)
         self.seed_policy = QComboBox(); self.seed_policy.addItems(["Fixed (use seed)", "Random", "Increment"]); self.seed_policy.setCurrentIndex(1)
         self.batch = QSpinBox(); self.batch.setRange(1, 64); self.batch.setValue(1)
         row.addWidget(QLabel("Seed:")); row.addWidget(self.seed)
         row.addWidget(QLabel("")); row.addWidget(self.seed_policy)
-        row.addWidget(QLabel("Batch:")); row.addWidget(self.batch)
         form.addRow(row)
 
         # --- Quality / Output Size (next to seed) ---
@@ -696,46 +2091,59 @@ class Txt2ImgPane(QWidget):
             ("768x768 (1:1)", 768, 768),
             ("896x896 (1:1)", 896, 896),
             ("960x960 (1:1)", 960, 960),
-            ("1024x1024 (1:1)", 1024, 1024),
+            ("1024x1024 (1:1, recommended)", 1024, 1024),
+            ("1280x1280 (1:1, recommended)", 1280, 1280),
+
             # 16:9/9:16
             ("576x1024 (9:16)", 576, 1024),
             ("1024x576 (16:9)", 1024, 576),
             ("640x1136 (9:16)", 640, 1136),
             ("1136x640 (16:9)", 1136, 640),
-            ("720x1280 (9:16)", 720, 1280),
-            ("1280x720 (16:9)", 1280, 720),
-            ("864x1536 (9:16)", 864, 1536),
-            ("1536x864 (16:9)", 1536, 864),
+            ("720x1280 (9:16, recommended)", 720, 1280),
+            ("1280x720 (16:9, recommended)", 1280, 720),
+            ("704x1280 (9:16, WAN specific size)", 704, 1280),
+            ("1280x704 (16:9, WAN specific size)", 1280, 704),
+            ("864x1536 (9:16, recommended)", 864, 1536),
+            ("1344x768 (16:9, recommended)", 1344, 768),
+            ("768x1344 (9:16, recommended)", 768, 1344),
+            ("1536x864 (16:9, max advised for SDXL)", 1536, 864),
+            ("864x1536 (9:16, max advised for SDXL)", 864, 1536),
+            #        ("972x1728 (9:16)", 972, 1728),
+            #        ("1728x972 (16:9)", 1728, 972),
+
             # 21:9/9:21
             ("544x1280 (9:21)", 544, 1280),
             ("1280x544 (21:9)", 1280, 544),
-            ("576x1344 (9:21)", 576, 1344),
-            ("1344x576 (21:9)", 1344, 576),
+            ("576x1344 (9:21, recommended)", 576, 1344),
+            ("1344x576 (21:9, recommended)", 1344, 576),
+
             # 9:7/7:9
-            ("896x1152 (7:9)", 896, 1152),
-            ("1152x896 (9:7)", 1152, 896),
+            ("896x1152 (7:9, recommended)", 896, 1152),
+            ("1152x896 (9:7, recommended)", 1152, 896),
+
             # 4:3/3:4
             ("480x640 (3:4)", 480, 640),
             ("640x480 (4:3)", 640, 480),
             ("600x800 (3:4)", 600, 800),
             ("800x600 (4:3)", 800, 600),
             ("896x672 (4:3)", 896, 672),
-            ("768x1024 (3:4)", 768, 1024),
-            ("1024x768 (4:3)", 1024, 768),
+            ("768x1024 (3:4, recommended)", 768, 1024),
+            ("1024x768 (4:3, recommended)", 1024, 768),
             ("832x1104 (3:4)", 832, 1104),
             ("1104x832 (4:3)", 1104, 832),
-            ("1152x864 (4:3)", 1152, 864),
+            ("1152x864 (4:3, max advised for SDXL)", 1152, 864),
+
             # 3:2/2:3
             ("960x640 (3:2)", 960, 640),
-            ("768x1152 (2:3)", 768, 1152),
-            ("1152x768 (3:2)", 1152, 768),
-            ("1024x1536 (2:3)", 1024, 1536),
-            ("1536x1024 (3:2)", 1536, 1024),
+            ("768x1152 (2:3, recommended)", 768, 1152),
+            ("1152x768 (3:2, recommended)", 1152, 768),
+            ("1024x1536 (2:3, max advised for SDXL)", 1024, 1536),
+            ("1536x1024 (3:2, max advised for SDXL)", 1536, 1024),
+
             # 2:1/1:2
             ("1024x512 (2:1)", 1024, 512),
-            ("1280x640 (2:1)", 1280, 640),
+            ("1280x640 (2:1, recommended)", 1280, 640),
         ]
-
         for label, w, h in self._size_presets:
             self.size_combo.addItem(label, (w, h))
         # default selection
@@ -743,8 +2151,8 @@ class Txt2ImgPane(QWidget):
         if 0 <= idx_default < self.size_combo.count():
             self.size_combo.setCurrentIndex(idx_default)
         # Optional manual override (advanced later; present but small)
-        self.size_manual_w = QSpinBox(); self.size_manual_w = QSpinBox(); self.size_manual_w.setRange(256, 1536)
-        self.size_manual_h = QSpinBox(); self.size_manual_h.setRange(256, 1536)  # allow manual height(256, 4096); self.sself.size_manual_h.setSingleStep(64); ~8)
+        self.size_manual_w = QSpinBox(); self.size_manual_w = QSpinBox(); self.size_manual_w.setRange(256, 2560)
+        self.size_manual_h = QSpinBox(); self.size_manual_h.setRange(256, 2560); self.size_manual_h.setSingleStep(64)
         self.size_lock = QCheckBox("Lock aspect")
         self.size_lock.setChecked(False)  # default removed; will restore via UI
         def _on_size_combo_changed(i):
@@ -754,6 +2162,13 @@ class Txt2ImgPane(QWidget):
                 self.size_manual_w.blockSignals(True); self.size_manual_h.blockSignals(True)
                 self.size_manual_w.setValue(int(w)); self.size_manual_h.setValue(int(h))
                 self.size_manual_w.blockSignals(False); self.size_manual_h.blockSignals(False)
+                try:
+                    lbl = getattr(self, "size_warning_label", None)
+                    if lbl is not None and hasattr(self, "size_manual_w") and hasattr(self, "size_manual_h"):
+                        wv = int(self.size_manual_w.value()); hv = int(self.size_manual_h.value())
+                        lbl.setVisible((wv * hv) > (1536 * 864))
+                except Exception:
+                    pass
         self.size_combo.currentIndexChanged.connect(_on_size_combo_changed)
         # Ensure manual boxes reflect default only if persistence is OFF
         try:
@@ -775,15 +2190,22 @@ class Txt2ImgPane(QWidget):
             # Clamp by category maxima
             try:
                 if w0 == h0:
-                    v = min(int(v), 1024); new_h = min(int(new_h), 1024)
+                    v = min(int(v), 1920); new_h = min(int(new_h), 1920)
                 elif w0 > h0:
-                    v = min(int(v), 1536); new_h = min(int(new_h), 864)
+                    v = min(int(v), 2560); new_h = min(int(new_h), 1440)
                 else:
-                    v = min(int(v), 864); new_h = min(int(new_h), 1536)
+                    v = min(int(v), 1440); new_h = min(int(new_h), 2560)
             except Exception:
                 pass
             self.size_manual_w.blockSignals(True); self.size_manual_w.setValue(int(v)); self.size_manual_w.blockSignals(False)
             self.size_manual_h.blockSignals(True); self.size_manual_h.setValue(new_h); self.size_manual_h.blockSignals(False)
+            try:
+                lbl = getattr(self, "size_warning_label", None)
+                if lbl is not None and hasattr(self, "size_manual_w") and hasattr(self, "size_manual_h"):
+                    wv = int(self.size_manual_w.value()); hv = int(self.size_manual_h.value())
+                    lbl.setVisible((wv * hv) > (1536 * 864))
+            except Exception:
+                pass
         def _sync_manual_h(v):
             if not self.size_lock.isChecked(): return
             data = self.size_combo.currentData()
@@ -794,15 +2216,22 @@ class Txt2ImgPane(QWidget):
             # Clamp by category maxima
             try:
                 if w0 == h0:
-                    v = min(int(v), 1024); new_w = min(int(new_w), 1024)
+                    v = min(int(v), 1920); new_w = min(int(new_w), 1920)
                 elif h0 > w0:
-                    v = min(int(v), 1536); new_w = min(int(new_w), 864)
+                    v = min(int(v), 2560); new_w = min(int(new_w), 1440)
                 else:
-                    v = min(int(v), 864); new_w = min(int(new_w), 1536)
+                    v = min(int(v), 1440); new_w = min(int(new_w), 2560)
             except Exception:
                 pass
             self.size_manual_h.blockSignals(True); self.size_manual_h.setValue(int(v)); self.size_manual_h.blockSignals(False)
             self.size_manual_w.blockSignals(True); self.size_manual_w.setValue(new_w); self.size_manual_w.blockSignals(False)
+            try:
+                lbl = getattr(self, "size_warning_label", None)
+                if lbl is not None and hasattr(self, "size_manual_w") and hasattr(self, "size_manual_h"):
+                    wv = int(self.size_manual_w.value()); hv = int(self.size_manual_h.value())
+                    lbl.setVisible((wv * hv) > (1536 * 864))
+            except Exception:
+                pass
         self.size_manual_w.valueChanged.connect(_sync_manual_w)
         self.size_manual_h.valueChanged.connect(_sync_manual_h)
         size_row.addWidget(self.size_combo, 2)
@@ -812,6 +2241,15 @@ class Txt2ImgPane(QWidget):
         size_row.addWidget(self.size_manual_h, 0)
         size_row.addWidget(self.size_lock, 0)
         form.addRow(size_row)
+        self.size_warning_label = QLabel("Higher resolutions can create 'clones' in the image")
+        self.size_warning_label.setWordWrap(True)
+        try:
+            self.size_warning_label.setStyleSheet("font-size: 11px; color: palette(mid);")
+        except Exception:
+            pass
+        self.size_warning_label.setVisible(False)
+        form.addRow(self.size_warning_label)
+
 
         # Steps slider (right behind seed section)
         steps_row = QHBoxLayout()
@@ -845,7 +2283,7 @@ class Txt2ImgPane(QWidget):
         steps_row.addWidget(QLabel("CFG:"))
         steps_row.addWidget(self.cfg_scale, 0)
         # (removed) form.addRow(cfg_row) — CFG now sits on Steps row
-# Seed used (always visible)
+        # Seed used (always visible)
         self.seed_used_label = QLabel("Seed used: —"); self.seed_used_label.setVisible(False)
         form.addRow(self.seed_used_label)
 
@@ -890,6 +2328,37 @@ class Txt2ImgPane(QWidget):
             self._a1111_url_removed = QLineEdit("http://127.0.0.1:7860")
             self._a1111_url_removed.setVisible(False)
 
+        # Ensure shared QSettings store exists (for backends, LoRA path, etc.)
+        try:
+            self._persist_settings
+        except Exception:
+            try:
+                self._persist_settings = QSettings('FrameVision','FrameVision')
+            except Exception:
+                self._persist_settings = QSettings()
+
+        # Determine default LoRA root folder (relative to app root)
+        def _default_lora_root():
+            try:
+                from pathlib import Path as _P
+                base = _P(__file__).resolve().parent.parent
+            except Exception:
+                from pathlib import Path as _P
+                base = _P.cwd()
+            return str((base / "loras" / "txt2img").resolve())
+
+        # Restore persisted LoRA root if any; otherwise fall back to default
+        try:
+            _lr = self._persist_settings.value("txt2img_lora_root", None, type=str)
+        except Exception:
+            _lr = None
+        if not _lr:
+            try:
+                _lr = _default_lora_root()
+            except Exception:
+                _lr = "./loras/txt2img"
+        self._lora_root = _lr
+
         # Restore persisted UI values
         try:
             v = None
@@ -911,8 +2380,6 @@ class Txt2ImgPane(QWidget):
                 pass
         self._a1111_url_removed.textChanged.connect(lambda *_: _save_backend())
         self._qwen_cli_template_removed.textChanged.connect(lambda *_: _save_backend())
-
-
 
         # Model (collapsed group)
         mdl_body = QWidget()
@@ -960,13 +2427,89 @@ class Txt2ImgPane(QWidget):
         self.model_refresh.clicked.connect(_populate_models)
         self.model_browse.clicked.connect(_browse_model)
 
+        # Helper: where to scan for LoRA files
+        def _get_lora_root():
+            try:
+                lr = getattr(self, "_lora_root", None)
+            except Exception:
+                lr = None
+            if not lr:
+                try:
+                    lr = _default_lora_root()
+                except Exception:
+                    lr = "./loras/txt2img"
+                try:
+                    self._lora_root = lr
+                except Exception:
+                    pass
+            return lr
+
+        def _set_lora_root(path_str):
+            try:
+                if not path_str:
+                    return
+                self._lora_root = str(path_str)
+                try:
+                    self._persist_settings.setValue("txt2img_lora_root", self._lora_root)
+                except Exception:
+                    pass
+                try:
+                    if hasattr(self, "lora_path_btn") and self.lora_path_btn is not None:
+                        self.lora_path_btn.setToolTip(self._lora_root)
+                except Exception:
+                    pass
+            except Exception:
+                pass
+
+        def _browse_lora_root():
+            try:
+                start_dir = _get_lora_root()
+            except Exception:
+                start_dir = "./loras/txt2img"
+            try:
+                path = QFileDialog.getExistingDirectory(self, "Choose LoRA folder", start_dir)
+            except Exception as e:
+                try:
+                    print("[txt2img] choose LoRA folder failed:", e)
+                except Exception:
+                    pass
+                path = ""
+            if path:
+                try:
+                    from pathlib import Path as _P
+                    path = str(_P(path).resolve())
+                except Exception:
+                    pass
+                _set_lora_root(path)
+                try:
+                    _reload_all_loras()
+                except Exception:
+                    try:
+                        _populate_loras()
+                    except Exception:
+                        pass
+                    try:
+                        _populate_loras2()
+                    except Exception:
+                        pass
+
         # --- LoRA picker (SDXL) ---
         self.lora_combo = QComboBox()
         self.lora_refresh = QPushButton("Reload")
+        self.lora_path_btn = QPushButton("Choose LoRA path…")
+        try:
+            self.lora_path_btn.setToolTip(_get_lora_root())
+        except Exception:
+            pass
         rowl = QHBoxLayout()
+        rowl.addWidget(self.lora_path_btn, 0)
         rowl.addWidget(self.lora_refresh, 0)
         rowl.addWidget(self.lora_combo, 1)
         mdl_form.addRow("LoRA (SDXL)", rowl)
+        try:
+            self.lora_path_btn.clicked.connect(_browse_lora_root)
+        except Exception:
+            pass
         # LoRA 1 Strength (scale)
         self.lora_strength_slider = QSlider(Qt.Horizontal)
         try:
@@ -1012,7 +2555,8 @@ class Txt2ImgPane(QWidget):
         def _populate_loras2():
             try:
                 from pathlib import Path as _P
-                base = _P("./models") / "Loras" / "SDXL"
+                root = _get_lora_root()
+                base = _P(root)
                 self.lora2_combo.blockSignals(True)
                 self.lora2_combo.clear()
                 self.lora2_combo.addItem("None", "")
@@ -1046,8 +2590,7 @@ class Txt2ImgPane(QWidget):
             except Exception:
                 pass
 
-        
-# Both reloads refresh both dropdowns for convenience
+        # Both reloads refresh both dropdowns for convenience
         def _reload_all_loras():
             try:
                 _populate_loras()
@@ -1103,7 +2646,8 @@ class Txt2ImgPane(QWidget):
         def _populate_loras():
             try:
                 from pathlib import Path as _P
-                base = _P("./models") / "Loras" / "SDXL"
+                root = _get_lora_root()
+                base = _P(root)
                 self.lora_combo.blockSignals(True)
                 self.lora_combo.clear()
                 self.lora_combo.addItem("None", "")
@@ -1119,6 +2663,16 @@ class Txt2ImgPane(QWidget):
 
         self._model_picker = _Disclosure("Model", mdl_body, start_open=False, parent=self)
         root.addWidget(self._model_picker)
+                # Engine-dependent banner and Model/LoRA visibility
+        try:
+            if hasattr(self, "engine_combo") and self.engine_combo is not None:
+                self.engine_combo.currentIndexChanged.connect(self._on_engine_changed)
+        except Exception:
+            pass
+        try:
+            self._on_engine_changed()
+        except Exception:
+            pass
 
         # Advanced (collapsed group)
         adv_body = QWidget()
@@ -1246,17 +2800,369 @@ class Txt2ImgPane(QWidget):
         except Exception:
             pass
 
+        # Recent results (sticky, above Generate button; collapsed by default)
+        try:
+            from PySide6.QtWidgets import QGridLayout
+            rec_body = QWidget(self)
+            rec_wrap = QVBoxLayout(rec_body)
+            rec_wrap.setContentsMargins(6, 2, 6, 6)
+            rec_wrap.setSpacing(6)
+
+            # Size + sort row
+            size_row = QHBoxLayout()
+
+            # Sort dropdown (recent results)
+            try:
+                lbl_sort = QLabel("Sort:", self)
+            except Exception:
+                lbl_sort = None
+            try:
+                self.combo_recent_sort = QComboBox(self)
+                self.combo_recent_sort.addItem("Newest first", "newest")
+                self.combo_recent_sort.addItem("Oldest first", "oldest")
+                self.combo_recent_sort.addItem("Alphabetical (A-Z)", "az")
+                self.combo_recent_sort.addItem("Alphabetical (Z-A)", "za")
+                self.combo_recent_sort.addItem("Size (smallest first)", "size_small")
+                self.combo_recent_sort.addItem("Size (largest first)", "size_large")
+            except Exception:
+                self.combo_recent_sort = None
+
+            try:
+                if lbl_sort is not None:
+                    size_row.addWidget(lbl_sort)
+            except Exception:
+                pass
+            try:
+                if self.combo_recent_sort is not None:
+                    size_row.addWidget(self.combo_recent_sort)
+            except Exception:
+                pass
+
+            size_row.addSpacing(12)
+            size_row.addWidget(QLabel("Thumb size:", self))
+            self.sld_recent_size = QSlider(Qt.Horizontal, self)
+            self.sld_recent_size.setMinimum(50)
+            self.sld_recent_size.setMaximum(180)
+            self.sld_recent_size.setSingleStep(8)
+            self.sld_recent_size.setPageStep(30)
+            self.sld_recent_size.setValue(100)
+            size_row.addWidget(self.sld_recent_size, 1)
+            self.lbl_recent_size = QLabel("100 px", self)
+            size_row.addWidget(self.lbl_recent_size)
+            rec_wrap.addLayout(size_row)
+
+            # Scroll area with a wrapped grid of thumbnails
+            self.recents_scroll = QScrollArea(self)
+            self.recents_scroll.setWidgetResizable(True)
+            self.recents_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+            self.recents_scroll.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+            try:
+                self.recents_scroll.setFrameShape(QScrollArea.NoFrame)
+            except Exception:
+                pass
+
+            try:
+                # Watch width changes so we can re-wrap items correctly
+                self.recents_scroll.viewport().installEventFilter(self)
+            except Exception:
+                pass
+
+            self._recents_inner = QWidget(self)
+            self._recents_row = QGridLayout(self._recents_inner)
+            self._recents_row.setContentsMargins(0, 0, 0, 0)
+            self._recents_row.setSpacing(8)
+            self.recents_scroll.setWidget(self._recents_inner)
+            rec_wrap.addWidget(self.recents_scroll)
+
+            # Collapsible wrapper, closed by default
+            self.recents_box = _Disclosure("Recent results", rec_body, start_open=False, parent=self)
+            outer.addWidget(self.recents_box)
+
+            # Initial build + poller
+            try:
+                QTimer.singleShot(0, self._rebuild_recents)
+            except Exception:
+                pass
+            try:
+                self._install_recents_poller()
+            except Exception:
+                pass
+
+            # Wire slider to resize thumbnails
+            def _on_recent_size(val):
+                try:
+                    self.lbl_recent_size.setText(f"{val} px")
+                except Exception:
+                    pass
+                try:
+                    self._rebuild_recents()
+                except Exception:
+                    pass
+            try:
+                self.sld_recent_size.valueChanged.connect(_on_recent_size)
+            except Exception:
+                pass
+
+            # Wire sort dropdown to rebuild thumbnails
+            try:
+                if getattr(self, "combo_recent_sort", None) is not None:
+                    def _on_recent_sort(_index):
+                        try:
+                            self._rebuild_recents()
+                        except Exception:
+                            pass
+                    try:
+                        self.combo_recent_sort.currentIndexChanged.connect(_on_recent_sort)
+                    except Exception:
+                        pass
+            except Exception:
+                pass
+        except Exception:
+            pass
+
+
+        
+
         btns = QHBoxLayout()
         self.add_to_queue = QPushButton("Add to Queue")
         self.add_and_run = QPushButton("Add & Run")
         self.add_and_run.hide()
-        self.generate_now = QPushButton("Generate")
+        self.generate_now = QPushButton("Generate image(s)")
+        # Batch controls moved next to Generate button on the same line
+        self.batch_label_bottom = QLabel("Batch:")
+        # Enlarge the main action buttons (+3 px) and keep hover style for Generate
+        try:
+            for _btn, _name in ((self.generate_now, "generateNowButton"), (self.add_and_run, "addAndRunButton")):
+                _btn.setObjectName(_name)
+                _font = _btn.font()
+                try:
+                    _ps = _font.pointSize()
+                    if _ps and _ps > 0:
+                        _font.setPointSize(_ps + 3)
+                    else:
+                        _px = _font.pixelSize()
+                        if _px and _px > 0:
+                            _font.setPixelSize(_px + 3)
+                except Exception:
+                    pass
+                _btn.setFont(_font)
+            self.generate_now.setStyleSheet("""
+                QPushButton#generateNowButton:hover {
+                    background-color: #a64dff;
+                }
+            """.strip())
+        except Exception:
+            pass
         btns.addWidget(self.add_to_queue)
         self.add_to_queue.hide()
-        btns.addWidget(self.add_and_run)
         btns.addWidget(self.generate_now)
+        btns.addWidget(self.batch_label_bottom)
+        btns.addWidget(self.batch)
+        btns.addStretch(1)
+        btns.addWidget(self.add_and_run)
         outer.addLayout(btns)
 
+    def _on_engine_changed(self, *_):
+        """
+        Toggle banner text and show/hide the SD model/LoRA picker
+        based on the selected engine.
+
+        Also adjusts Steps / CFG ranges for Z-Image:
+        - Z-Image: steps 1–50 (default 9), CFG 0.0–5.0 (default 0.0)
+        - Diffusers (SD15/SDXL): steps 10–100 (default 25), CFG 1.0–15.0 (default 5.5)
+        """
+        try:
+            cb = getattr(self, "engine_combo", None)
+        except Exception:
+            cb = None
+        if cb is None:
+            return
+
+        # Determine engine key: prefer itemData, fall back to text
+        key = ""
+        try:
+            data = cb.currentData()
+        except Exception:
+            data = None
+        try:
+            if data:
+                key = str(data).lower()
+            else:
+                text = (cb.currentText() or "").lower()
+                if "z-image" in text or "zimage" in text:
+                    key = "zimage"
+                else:
+                    key = "diffusers"
+        except Exception:
+            pass
+        is_zimage = (key == "zimage")
+
+        # If switching to Z-Image, aggressively try to free CUDA VRAM
+        if is_zimage:
+            try:
+                _aggressive_free_cuda_vram()
+            except Exception:
+                pass
+
+        # Update banner text
+        try:
+            base = getattr(self, "_banner_default_text", None)
+            if not base and hasattr(self, "banner") and self.banner is not None:
+                base = self.banner.text()
+                self._banner_default_text = base
+            if hasattr(self, "banner") and self.banner is not None:
+                if is_zimage:
+                    self.banner.setText("Text to image with Z-image Turbo")
+                else:
+                    self.banner.setText(base or "Text to Image with SDXL Loader")
+        except Exception:
+            pass
+
+        # Show/hide SD model + LoRA dropdown group
+        try:
+            if hasattr(self, "_model_picker") and self._model_picker is not None:
+                self._model_picker.setVisible(not is_zimage)
+        except Exception:
+            pass
+
+        # Show/hide presets row based on engine
+        try:
+            lab = getattr(self, "preset_label", None)
+            combo = getattr(self, "preset_combo", None)
+            visible = not is_zimage
+            if lab is not None:
+                lab.setVisible(visible)
+            if combo is not None:
+                combo.setVisible(visible)
+        except Exception:
+            pass
+
+        # Adjust filename template depending on engine
+        try:
+            fname_edit = getattr(self, "filename_template", None)
+        except Exception:
+            fname_edit = None
+        if fname_edit is not None:
+            try:
+                prev_engine = getattr(self, "_last_engine_key", None)
+            except Exception:
+                prev_engine = None
+            try:
+                if is_zimage:
+                    # Store previous template once when entering Z-Image
+                    if prev_engine != "zimage":
+                        try:
+                            self._filename_template_before_zimage = fname_edit.text()
+                        except Exception:
+                            pass
+                    try:
+                        fname_edit.blockSignals(True)
+                    except Exception:
+                        pass
+                    fname_edit.setText("z_img_{seed}_{idx:03d}.png")
+                    try:
+                        fname_edit.blockSignals(False)
+                    except Exception:
+                        pass
+                else:
+                    # Switching back to SD15/SDXL: restore original or default
+                    try:
+                        orig = getattr(self, "_filename_template_before_zimage", "") or ""
+                    except Exception:
+                        orig = ""
+                    if not orig:
+                        orig = "IMG_{seed}.png"
+                    try:
+                        fname_edit.blockSignals(True)
+                    except Exception:
+                        pass
+                    fname_edit.setText(orig)
+                    try:
+                        fname_edit.blockSignals(False)
+                    except Exception:
+                        pass
+            except Exception:
+                pass
+            try:
+                self._last_engine_key = ("zimage" if is_zimage else "diffusers")
+            except Exception:
+                pass
+
+        # Adjust Steps / CFG ranges depending on engine
+        try:
+            # Steps slider
+            ss = getattr(self, "steps_slider", None)
+            sv = getattr(self, "steps_value", None)
+            if ss is not None:
+                if is_zimage:
+                    # Z-Image prefers very low steps; force 9 steps on switch
+                    try:
+                        ss.blockSignals(True)
+                    except Exception:
+                        pass
+                    ss.setRange(1, 50)
+                    ss.setValue(9)
+                    try:
+                        ss.blockSignals(False)
+                    except Exception:
+                        pass
+                    try:
+                        if sv is not None:
+                            sv.setText("9")
+                    except Exception:
+                        pass
+                else:
+                    # Diffusers SD15/SDXL: 10–100, force 25 steps on switch
+                    try:
+                        ss.blockSignals(True)
+                    except Exception:
+                        pass
+                    ss.setRange(10, 100)
+                    ss.setValue(25)
+                    try:
+                        ss.blockSignals(False)
+                    except Exception:
+                        pass
+                    try:
+                        if sv is not None:
+                            sv.setText("25")
+                    except Exception:
+                        pass
+        except Exception:
+            pass
+
+        try:
+            # CFG scale
+            cs = getattr(self, "cfg_scale", None)
+            if cs is not None:
+                if is_zimage:
+                    # Z-Image: CFG 0.0–5.0, force 0.0 on switch
+                    try:
+                        cs.blockSignals(True)
+                    except Exception:
+                        pass
+                    cs.setRange(0.0, 5.0)
+                    cs.setSingleStep(0.1)
+                    cs.setValue(0.0)
+                    try:
+                        cs.blockSignals(False)
+                    except Exception:
+                        pass
+                else:
+                    # Diffusers SD15/SDXL: CFG 1.0–15.0, force 5.5 on switch
+                    try:
+                        cs.blockSignals(True)
+                    except Exception:
+                        pass
+                    cs.setRange(1.0, 15.0)
+                    cs.setSingleStep(0.1)
+                    cs.setValue(5.5)
+                    try:
+                        cs.blockSignals(False)
+                    except Exception:
+                        pass
+        except Exception:
+            pass
 
 
     def _on_browse(self):
@@ -1271,8 +3177,21 @@ class Txt2ImgPane(QWidget):
         data = self.size_combo.currentData() if hasattr(self, "size_combo") else None
         w_ui, h_ui = (data if data else (self.size_manual_w.value() if hasattr(self, "size_manual_w") else 1024,
                                          self.size_manual_h.value() if hasattr(self, "size_manual_h") else 1024))
+        # Determine engine key for defaults
+        engine = (self.engine_combo.currentData() if hasattr(self, "engine_combo") else "diffusers") or "diffusers"
+        engine_key = str(engine).lower().strip() or "diffusers"
+        # Determine filename template; special default for Z-Image
+        fname = self.filename_template.text().strip() if hasattr(self, "filename_template") else ""
+        if not fname:
+            if engine_key == "zimage":
+                fname = "z_img_{seed}_{idx:03d}.png"
+            else:
+                fname = "IMG_{seed}.png"
         job = {
             "type": "txt2img",
+            "engine": engine,
+"type": "txt2img",
+            "engine": (self.engine_combo.currentData() if hasattr(self, "engine_combo") else "diffusers") or "diffusers",
             "prompt": self.prompt.toPlainText().strip(),
             "negative": self.negative.toPlainText().strip(),
             "seed": seed,
@@ -1297,7 +3216,8 @@ class Txt2ImgPane(QWidget):
             "gpu_index": int(self.gpu_index.value()),
             "threads": int(self.threads.value()),
                         "format": self.format_combo.currentText(),
-            "filename_template": self.filename_template.text().strip() or "IMG_{seed}.png",
+            "filename_template": fname,
+
             "hires_helper": self.hires_helper.isChecked(),
             "fit_check": self.fit_check.isChecked(),
             "steps": int(self.steps_slider.value()),
@@ -1495,7 +3415,26 @@ class Txt2ImgPane(QWidget):
         except Exception: pass
         try: d["threads"] = int(self.threads.value())
         except Exception: pass
-        except Exception: pass
+        # Remember current engine (Z-Image / SDXL etc.) so we restore it on restart
+        try:
+            if hasattr(self, "engine_combo"):
+                eng = None
+                try:
+                    eng = self.engine_combo.currentData()
+                except Exception:
+                    eng = None
+                if not eng:
+                    try:
+                        eng = self.engine_combo.currentText()
+                    except Exception:
+                        eng = None
+                if eng is not None:
+                    try:
+                        d["engine"] = str(eng)
+                    except Exception:
+                        d["engine"] = eng
+        except Exception:
+            pass
         try: d["format"] = self.format_combo.currentText()
         except Exception: pass
         try: d["filename_template"] = self.filename_template.text().strip()
@@ -1520,6 +3459,28 @@ class Txt2ImgPane(QWidget):
         except Exception: pass
         try: d["preset_index"] = int(self.preset_combo.currentIndex())
         except Exception: pass
+
+        # Recent results options
+        try:
+            d["recents_thumb_size"] = int(self.sld_recent_size.value())
+        except Exception:
+            pass
+        try:
+            sort = None
+            try:
+                sort = self.combo_recent_sort.currentData()
+            except Exception:
+                sort = None
+            if sort is None:
+                try:
+                    if getattr(self, "combo_recent_sort", None) is not None:
+                        sort = self.combo_recent_sort.currentText()
+                except Exception:
+                    sort = None
+            if sort:
+                d["recents_sort"] = str(sort)
+        except Exception:
+            pass
 
         try:
             d["size_preset_index"] = int(self.size_combo.currentIndex()) if hasattr(self, "size_combo") else -1
@@ -1577,7 +3538,7 @@ class Txt2ImgPane(QWidget):
             if obj is None: 
                 continue
             connect_sig(obj, sig)
-        try: print("Autosave wired")
+        try: print("Applied all settings")
         except Exception: pass
 
     # === Busy indicator (indeterminate; no ETA) ===
@@ -2055,6 +4016,28 @@ def _gen_via_diffusers(job: dict, out_dir: Path, progress_cb=None):
                     progress_cb({"step": (i+1)*max(1, steps), "total": max(1, steps*batch)})
             except Exception:
                 pass
+        # After finishing a Diffusers SD15/SDXL run, try to free as much
+        # GPU memory as possible from this process so other engines (like Z-Image
+        # in its own environment) can see more available VRAM.
+        try:
+            import torch, gc  # type: ignore
+            try:
+                gc.collect()
+            except Exception:
+                pass
+            if hasattr(torch, "cuda") and torch.cuda.is_available():
+                try:
+                    torch.cuda.empty_cache()
+                except Exception:
+                    pass
+                try:
+                    if hasattr(torch.cuda, "ipc_collect"):
+                        torch.cuda.ipc_collect()
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
         return {"files": files, "backend": "diffusers", "model": model_path, "actual_size": [width, height], "lora_mode": (lora_mode or ""), "loras": loras_to_load, "lora_scales": scales, "lora_names": lora_names}
     except Exception as e:
         import traceback
@@ -2135,6 +4118,163 @@ def _gen_via_a1111(job: dict, out_dir: Path, base_url: str, progress_cb=None):
         return {"files": files, "backend": "a1111"}
     except Exception:
         return None
+
+def _gen_via_zimage(job: dict, out_dir: Path, progress_cb=None):
+    """
+    Z-Image Turbo backend that runs in its own virtualenv (.zimage_env) as an
+    external process, so it can have independent deps (torch/diffusers).
+
+    It calls helpers/zimage_cli.py using the python.exe from:
+        <root>/.zimage_env/Scripts/python.exe   (Windows)
+        <root>/.zimage_env/scripts/python.exe   (alt)
+        <root>/.zimage_env/bin/python           (Linux/macOS)
+
+    The CLI returns a JSON payload with a list of files.
+    """
+    # Before calling into the external Z-Image env, try to free
+    # as much CUDA VRAM as possible from this process (e.g. Qwen VL).
+    try:
+        _aggressive_free_cuda_vram()
+    except Exception:
+        pass
+
+    try:
+        from pathlib import Path as _P
+        import subprocess, json, shlex, os as _os
+    except Exception:
+        return None
+
+    # Resolve root dir (app root = parent of helpers/)
+    try:
+        root_dir = _P(__file__).resolve().parents[1]
+    except Exception:
+        root_dir = Path(".").resolve()
+
+    # Locate dedicated Z-Image env python
+    candidates = [
+        root_dir / ".zimage_env" / "Scripts" / "python.exe",
+        root_dir / ".zimage_env" / "scripts" / "python.exe",
+        root_dir / ".zimage_env" / "bin" / "python",
+    ]
+    pyexe = None
+    for c in candidates:
+        try:
+            if c.exists():
+                pyexe = c
+                break
+        except Exception:
+            continue
+    if pyexe is None:
+        try:
+            print("[txt2img] Z-Image: python.exe not found in .zimage_env; tried:", candidates)
+        except Exception:
+            pass
+        return None
+
+    # Helper CLI script
+    cli = root_dir / "helpers" / "zimage_cli.py"
+    if not cli.exists():
+        try:
+            print("[txt2img] Z-Image: helpers/zimage_cli.py not found at", cli)
+        except Exception:
+            pass
+        return None
+
+    # Basic job params
+    prompt = str(job.get("prompt") or "")
+    neg = str(job.get("negative") or "")
+    batch = int(job.get("batch", 1) or 1)
+    steps = int(job.get("steps", 9) or 9)
+    cfg = float(job.get("cfg_scale", 0.0) or 0.0)
+    width = int(job.get("width", 1024) or 1024)
+    height = int(job.get("height", 1024) or 1024)
+    seed = int(job.get("seed", 0) or 0)
+    fmt = (job.get("format", "png") or "png").lower().strip()
+    if fmt not in ("png", "jpg", "jpeg", "webp", "bmp"):
+        fmt = "png"
+    fname_tmpl = job.get("filename_template") or "zimage_{seed}_{idx:03d}.png"
+
+    # Build command
+    args = [
+        str(pyexe),
+        str(cli),
+        "--prompt", prompt,
+        "--negative", neg,
+        "--height", str(height),
+        "--width", str(width),
+        "--steps", str(steps),
+        "--guidance", str(cfg),
+        "--seed", str(seed),
+        "--batch", str(batch),
+        "--outdir", str(out_dir),
+        "--fmt", fmt,
+        "--filename_template", fname_tmpl,
+    ]
+
+    try:
+        # Ensure out_dir exists before launching
+        try:
+            out_dir.mkdir(parents=True, exist_ok=True)
+        except Exception:
+            pass
+
+        proc = subprocess.run(
+            args,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+    except Exception as e:
+        try:
+            print("[txt2img] Z-Image: failed to launch CLI:", e)
+        except Exception:
+            pass
+        return None
+
+    if proc.returncode != 0:
+        try:
+            print("[txt2img] Z-Image CLI stderr:", proc.stderr)
+        except Exception:
+            pass
+        return None
+
+    # CLI prints JSON (possibly with other logs; take last JSON-looking line)
+    out_text = (proc.stdout or "").strip()
+    if not out_text and proc.stderr:
+        out_text = proc.stderr.strip()
+
+    payload = None
+    if out_text:
+        for line in out_text.splitlines()[::-1]:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                payload = json.loads(line)
+                break
+            except Exception:
+                continue
+    if not isinstance(payload, dict):
+        return None
+
+    files = payload.get("files") or []
+    if not files:
+        return None
+
+    # Progress callback: mark as done
+    if progress_cb:
+        try:
+            progress_cb(batch, batch)
+        except Exception:
+            pass
+
+    return {
+        "files": [str(f) for f in files],
+        "backend": "zimage",
+        "model": payload.get("model") or "Z-Image-Turbo",
+    }
+
+
 def generate_qwen_images(job: dict, progress_cb: Optional[Callable[[float], None]] = None, cancel_event: Optional[threading.Event] = None):
     """Generator that saves images and returns metadata. Uses CPU fallback to validate pipeline end-to-end."""
     out_dir = Path(job.get("output") or "./output/images"); out_dir.mkdir(parents=True, exist_ok=True)
@@ -2156,9 +4296,13 @@ def generate_qwen_images(job: dict, progress_cb: Optional[Callable[[float], None
             rng = random.Random(seed if seed else int(time.time()))
             seeds_list = [rng.randint(0, 2_147_483_647) for _ in range(batch)]
     files = []
-    # Try Diffusers backend if available
+    engine = str(job.get("engine") or "").strip().lower()
+    # Try Diffusers or Z-Image backend if available
     try:
-        diff = _gen_via_diffusers(job, out_dir, progress_cb)
+        if engine == "zimage":
+            diff = _gen_via_zimage(job, out_dir, progress_cb)
+        else:
+            diff = _gen_via_diffusers(job, out_dir, progress_cb)
         if diff and diff.get('files'):
             files = diff['files']
             meta_backend = diff.get('backend') or 'diffusers'
@@ -2205,6 +4349,120 @@ def generate_qwen_images(job: dict, progress_cb: Optional[Callable[[float], None
         pass
     return meta
 # <<< FRAMEVISION_QWEN_END
+
+# --- Tiny helper: open a result in the main player or OS viewer (shared with Recents) ---
+try:
+    from pathlib import Path as _PathForOpen
+except Exception:
+    _PathForOpen = None
+
+def _play_in_player(self, p):
+    """Try to open a media path in the app's internal player if available; return True on success.
+
+    This mirrors the internal-player behavior used by the Wan2.2 tab:
+    - Prefer main.video.open(...)
+    - Fall back to main.open_video(...)
+    - Keep main.current_path and media info in sync when possible.
+    """
+    # Normalize to a Path-like object when possible
+    try:
+        from pathlib import Path as _Path
+    except Exception:
+        _Path = None
+
+    try:
+        global _PathForOpen
+    except Exception:
+        _PathForOpen = None
+
+    try:
+        if _PathForOpen is not None and not isinstance(p, _PathForOpen):
+            try:
+                p = _PathForOpen(str(p))
+            except Exception:
+                if _Path is not None:
+                    try:
+                        p = _Path(str(p))
+                    except Exception:
+                        pass
+        elif _Path is not None and not isinstance(p, _Path):
+            try:
+                p = _Path(str(p))
+            except Exception:
+                pass
+    except Exception:
+        pass
+
+    # Find the main window that owns the media player
+    m = None
+    try:
+        m = getattr(self, "_main", None) or getattr(self, "main", None)
+    except Exception:
+        m = None
+
+    if m is None:
+        try:
+            from PySide6.QtWidgets import QApplication
+            for w in QApplication.topLevelWidgets():
+                if hasattr(w, "video") and hasattr(getattr(w, "video", None), "open"):
+                    m = w
+                    break
+        except Exception:
+            m = None
+
+    if m is None:
+        return False
+
+    # 1) Preferred: main.video.open(...)
+    try:
+        player = getattr(m, "video", None)
+        if player is not None and hasattr(player, "open"):
+            try:
+                player.open(p)
+            except TypeError:
+                # Some builds expect a plain string path
+                player.open(str(p))
+            try:
+                if _Path is not None:
+                    m.current_path = _Path(str(p))
+                else:
+                    m.current_path = p
+            except Exception:
+                pass
+            try:
+                from helpers.mediainfo import refresh_info_now
+                refresh_info_now(p)
+            except Exception:
+                pass
+            return True
+    except Exception:
+        pass
+
+    # 2) Legacy hook: main.open_video(...)
+    try:
+        if hasattr(m, "open_video"):
+            m.open_video(str(p))
+            return True
+    except Exception:
+        pass
+
+    return False
+
+def _open_file(self, p):
+    """Fallback: open a path via the OS (Explorer / Finder / xdg-open)."""
+    try:
+        import os, subprocess
+        if _PathForOpen is not None and not isinstance(p, _PathForOpen):
+            try:
+                p = _PathForOpen(str(p))
+            except Exception:
+                pass
+        if os.name == "nt":
+            os.startfile(str(p))  # nosec - user initiated
+        else:
+            subprocess.Popen(["xdg-open", str(p)])
+    except Exception:
+        pass
 
 
 # === Tiny Txt2Img deferred-load patch (minimal & safe) ===

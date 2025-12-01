@@ -245,6 +245,224 @@ def _menu_qss(name: str) -> str:
     # Evening, Night, Slate, Graphite Dusk, High Contrast, Neon, Ocean, CRT, Aurora, Mardi Gras, Tropical Fiesta
     return rule('#1f2937', '#172554')
 
+
+
+
+def _button_hover_qss(name: str) -> str:
+    """
+    Extra QSS that gives QPushButton (and key toolbuttons) a clear, theme-aware
+    hover/pressed outline so buttons always feel "alive" when you move the mouse
+    over them. Neon/color-bomb themes that already define strong button hover
+    effects keep their original styling (this helper returns an empty string).
+    """
+    s = (name or "").strip().lower()
+
+    # Skip themes that already define flashy hover borders in their own QSS
+    if any(key in s for key in ("cyber", "rainbow riot", "candy pop", "candypop", "color mix", "colormix")):
+        return ""
+
+    # --- Light / day-like themes ------------------------------------------------------
+    if s.startswith("day"):
+        return f"""
+QPushButton:hover {{
+    border-color: #3b82f6;
+    color: {DAY_TEXT};
+}}
+QPushButton:pressed {{
+    border-color: #2563eb;
+}}
+"""
+
+    if "pastel" in s:
+        return """
+QPushButton:hover {
+    border-color: #e879f9;
+    color: #374151;
+}
+QPushButton:pressed {
+    border-color: #d946ef;
+}
+"""
+
+    if "sunburst" in s:
+        return f"""
+QPushButton:hover {{
+    border-color: {SUN_ACCENT};
+    color: {SUN_TEXT};
+}}
+QPushButton:pressed {{
+    border-color: {SUN_SLIDER};
+}}
+"""
+
+    if "solar" in s:
+        return """
+QPushButton:hover {
+    border-color: #268bd2;
+    color: #073642;
+}
+QPushButton:pressed {
+    border-color: #1c6fa8;
+}
+"""
+
+    if "cloud" in s:
+        return f"""
+QPushButton:hover {{
+    border-color: {CLOUD_ACCENT};
+    color: {CLOUD_TEXT};
+}}
+QPushButton:pressed {{
+    border-color: {CLOUD_SLIDER};
+}}
+"""
+
+    if "signal" in s:
+        return f"""
+QPushButton:hover {{
+    border-color: {SIG_ACCENT_ORANGE};
+    color: {SIG_TEXT};
+}}
+QPushButton:pressed {{
+    border-color: {SIG_ACCENT_BLUE};
+}}
+"""
+
+    # --- Evening / neutral darks ------------------------------------------------------
+    if s.startswith("even"):
+        return f"""
+QPushButton:hover {{
+    border-color: {EVE_SLIDER};
+    color: {EVE_TEXT};
+}}
+QPushButton:pressed {{
+    border-color: {EVE_HEADER};
+}}
+"""
+
+    if s.startswith("night"):
+        return f"""
+QPushButton:hover {{
+    border-color: {NIGHT_HEADER};
+    color: {NIGHT_TEXT};
+}}
+QPushButton:pressed {{
+    border-color: {NIGHT_SLIDER};
+}}
+"""
+
+    if s.startswith("slate"):
+        return f"""
+QPushButton:hover {{
+    border-color: {SLATE_ACCENT};
+    color: {SLATE_TEXT};
+}}
+QPushButton:pressed {{
+    border-color: {SLATE_ACCENT};
+}}
+"""
+
+    if s.startswith("high") or "contrast" in s:
+        return f"""
+QPushButton:hover {{
+    border-color: {HC_ACCENT};
+    color: {HC_TEXT};
+}}
+QPushButton:pressed {{
+    border-color: {HC_ACCENT};
+}}
+"""
+
+    if "graphite" in s or "dusk" in s:
+        return f"""
+QPushButton:hover {{
+    border-color: {GRA_ACCENT};
+    color: {GRA_TEXT};
+}}
+QPushButton:pressed {{
+    border-color: {GRA_ACCENT};
+}}
+"""
+
+    # --- Other dark / colorful themes ------------------------------------------------
+    if s.startswith("neon"):
+        return """
+QPushButton:hover {
+    border-color: #22c55e;
+    color: #eaffea;
+}
+QPushButton:pressed {
+    border-color: #16a34a;
+}
+"""
+
+    if s.startswith("ocean"):
+        return """
+QPushButton:hover {
+    border-color: #14b8a6;
+    color: #e6f7ff;
+}
+QPushButton:pressed {
+    border-color: #0ea5a7;
+}
+"""
+
+    if s.startswith("crt"):
+        return """
+QPushButton:hover {
+    border-color: #16a34a;
+    color: #9aff9a;
+}
+QPushButton:pressed {
+    border-color: #22c55e;
+}
+"""
+
+    if "tropic" in s or "fiesta" in s:
+        return """
+QPushButton:hover, QToolButton:hover {
+    border-color: #22d3ee;
+    color: #e8fff4;
+}
+QPushButton:pressed, QToolButton:pressed {
+    border-color: #f59e0b;
+}
+"""
+
+    if "aurora" in s:
+        return f"""
+QPushButton:hover {{
+    border-color: {AURORA_ACCENT};
+    color: {AURORA_TEXT};
+}}
+QPushButton:pressed {{
+    border-color: {AURORA_ACCENT};
+}}
+"""
+
+    if "mardi" in s:
+        return f"""
+QPushButton:hover {{
+    border-color: {MARDI_ACCENT};
+    color: {MARDI_TEXT};
+}}
+QPushButton:pressed {{
+    border-color: {MARDI_ACCENT};
+}}
+"""
+
+    # Fallback: use the evening accent as a sensible default
+    return f"""
+QPushButton:hover {{
+    border-color: {EVE_SLIDER};
+    color: {EVE_TEXT};
+}}
+QPushButton:pressed {{
+    border-color: {EVE_HEADER};
+}}
+"""
+
+
 def apply_theme(app: QApplication, name: str) -> None:
     if (name or "").strip().lower() == "auto":
         from .framevision_app import pick_auto_theme
@@ -267,7 +485,7 @@ def apply_theme(app: QApplication, name: str) -> None:
             name = pick_auto_theme()
         except Exception:
             name = "Evening"
-    qss = qss_for_theme(name) + _menu_qss(name)
+    qss = qss_for_theme(name) + _menu_qss(name) + _button_hover_qss(name)
     try:
         app.setStyleSheet(qss)
         pal = app.palette()

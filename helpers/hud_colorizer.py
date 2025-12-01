@@ -1,4 +1,3 @@
-
 # helpers/hud_colorizer.py — colorize % and temperatures (flashless ≥70°C)
 from __future__ import annotations
 import re
@@ -15,9 +14,14 @@ _PAT_GPU = re.compile(r"(GPU\s*:.*?\s)(\d{1,3})%", re.IGNORECASE)
 _PAT_DDR = re.compile(r"(DDR\s*.*?\s)(\d{1,3})%", re.IGNORECASE)
 _PAT_CPU = re.compile(r"(CPU\s*)(\d{1,3})%", re.IGNORECASE)
 
+# VRAM amount pattern like 'DDR 5.3/24.0 GB'
+_PAT_VRAM_AMOUNT = re.compile(
+    r"(DDR\s*:?\s*)(\d+(?:\.\d+)?)/(\d+(?:\.\d+)?)(\s*[GMK]i?B)",
+    re.IGNORECASE,
+)
+
 # Temperature tokens like '62°C' or '62 C' or '62c'
-_PAT_TEMP = re.compile(r"""
-    (?<![\dA-Za-z])        # not part of a larger token
+_PAT_TEMP = re.compile(r"""    (?<![\dA-Za-z])        # not part of a larger token
     (\d{2,3})              # temperature value (2–3 digits)
     \s*                    # optional space
     (?:°\s*)?              # optional degree symbol
@@ -25,7 +29,9 @@ _PAT_TEMP = re.compile(r"""
     (?![\dA-Za-z])         # not followed by alnum
 """, re.VERBOSE)
 
+
 def _wrap_percent(num_str: str) -> str:
+    """Generic percent wrapper (GPU / CPU), orange ≥85%, red ≥95%."""
     try:
         v = int(num_str)
     except Exception:
@@ -38,6 +44,67 @@ def _wrap_percent(num_str: str) -> str:
         return num_str + "%"
     return f"<span style='color:{color};font-weight:600'>{v}%</span>"
 
+
+def _vram_color_for_percent(pct: float) -> str | None:
+    """Color thresholds specifically for VRAM fullness.
+
+    When VRAM is:
+      - ≥85% and <90% : yellow
+      - ≥90% and <95% : orange
+      - ≥95%          : red
+    """
+    if pct >= 95:
+        return RED
+    if pct >= 90:
+        return ORANGE
+    if pct >= 85:
+        return YELLOW
+    return None
+
+
+def _wrap_vram_percent(num_str: str) -> str:
+    """Percent wrapper for VRAM usage, using VRAM thresholds (85/90/95)."""
+    try:
+        v = int(num_str)
+    except Exception:
+        return num_str + "%"
+    color = _vram_color_for_percent(float(v))
+    if not color:
+        return num_str + "%"
+    return f"<span style='color:{color};font-weight:600'>{v}%</span>"
+
+
+def _wrap_vram_amount(used_str: str, total_str: str, unit_tail: str) -> str:
+    """Wraps the VRAM 'used/total' amount based on how full it is.
+
+    Example matched text (no HTML tags here):
+        'DDR 5.3/24.0 GB 22%'
+
+    We compute 5.3 / 24.0 ≈ 22% and apply:
+      - yellow when ≥85%
+      - orange when ≥90%
+      - red when ≥95%
+    """
+    try:
+        used = float(used_str)
+        total = float(total_str)
+        if total <= 0:
+            raise ValueError
+        pct = used / total * 100.0
+    except Exception:
+        return f"{used_str}/{total_str}{unit_tail}"
+
+    color = _vram_color_for_percent(pct)
+    if not color:
+        return f"{used_str}/{total_str}{unit_tail}"
+
+    return (
+        f"<span style='color:{color};font-weight:600'>"
+        f"{used_str}/{total_str}{unit_tail}"
+        f"</span>"
+    )
+
+
 def _class_for_temp(value: int, in_red_hys: bool) -> str | None:
     # Hysteresis no longer used; argument kept for signature compatibility.
     if value >= 70:
@@ -47,6 +114,7 @@ def _class_for_temp(value: int, in_red_hys: bool) -> str | None:
     if value >= 60:
         return YELLOW
     return None
+
 
 def _wrap_temp_token(full_token: str, value_str: str, in_red_hys: bool) -> str:
     """Wrap a temperature token (e.g., '65°C') based on thresholds.
@@ -66,14 +134,52 @@ def _wrap_temp_token(full_token: str, value_str: str, in_red_hys: bool) -> str:
         return full_token
     return f"<span style='color:{color};font-weight:600'>{full_token}</span>"
 
+
+def _colorize_vram_amount(text: str) -> str:
+    """Colorize the VRAM 'used/total' amount based on fullness.
+
+    Matches sequences like:
+        'DDR 5.3/24.0 GB'
+        'DDR: 7.8/8.0GiB'
+    and wraps the whole numeric portion with a colored span when ≥85% full.
+    """
+    def repl(m: re.Match) -> str:
+        prefix = m.group(1)
+        used = m.group(2)
+        total = m.group(3)
+        tail = m.group(4) or ""
+        wrapped = _wrap_vram_amount(used, total, tail)
+        return prefix + wrapped
+
+    # Only one DDR block expected, so count=1 is enough
+    return _PAT_VRAM_AMOUNT.sub(repl, text, count=1)
+
+
 def _colorize_percents(text: str) -> str:
+    """Colorize GPU/DDR/CPU percentage tokens.
+
+    - GPU and CPU use the generic _wrap_percent thresholds.
+    - DDR (VRAM) uses VRAM-specific 85/90/95 thresholds.
+    """
     s = text
-    for pat in (_PAT_GPU, _PAT_DDR, _PAT_CPU):
-        def repl(m):
-            prefix, num = m.group(1), m.group(2)
-            return prefix + _wrap_percent(num)
-        s = pat.sub(repl, s, count=1)  # one token each
+
+    def repl_gpu(m: re.Match) -> str:
+        prefix, num = m.group(1), m.group(2)
+        return prefix + _wrap_percent(num)
+
+    def repl_ddr(m: re.Match) -> str:
+        prefix, num = m.group(1), m.group(2)
+        return prefix + _wrap_vram_percent(num)
+
+    def repl_cpu(m: re.Match) -> str:
+        prefix, num = m.group(1), m.group(2)
+        return prefix + _wrap_percent(num)
+
+    s = _PAT_GPU.sub(repl_gpu, s, count=1)
+    s = _PAT_DDR.sub(repl_ddr, s, count=1)
+    s = _PAT_CPU.sub(repl_cpu, s, count=1)
     return s
+
 
 def _colorize_temps(text: str, in_red_hys: bool) -> str:
     def repl(m: re.Match) -> str:
@@ -81,12 +187,15 @@ def _colorize_temps(text: str, in_red_hys: bool) -> str:
         return _wrap_temp_token(m.group(0), value, in_red_hys)
     return _PAT_TEMP.sub(repl, text)
 
+
 def _strip_tags(s: str) -> str:
     return re.sub(r"<[^>]+>", "", s)
 
+
 def _find_header_label() -> QLabel | None:
     app = QApplication.instance()
-    if not app: return None
+    if not app:
+        return None
     # Find a QLabel whose text contains GPU, DDR and CPU (your header usually has all three)
     for w in app.allWidgets():
         if isinstance(w, QLabel):
@@ -97,6 +206,7 @@ def _find_header_label() -> QLabel | None:
             except Exception:
                 continue
     return None
+
 
 def auto_install_hud_colorizer(interval_ms: int = 2500):
     lbl = _find_header_label()
@@ -113,14 +223,16 @@ def auto_install_hud_colorizer(interval_ms: int = 2500):
     lbl._fv_hud_colorizer_state = state  # for debugging
 
     timer = QTimer(lbl)
+
     def tick():
         try:
             plain = _strip_tags(lbl.text())
             if plain == state.get("last_plain") and not state.get("force_next", False):
                 return
 
-            # Colorize: temps (no hysteresis) then percents
+            # Colorize: temps (no hysteresis), VRAM amount, then percents
             colored = _colorize_temps(plain, in_red_hys=False)
+            colored = _colorize_vram_amount(colored)
             colored = _colorize_percents(colored)
 
             # No background highlight; text-only colorization to avoid flashing.

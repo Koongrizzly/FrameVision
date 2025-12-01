@@ -78,6 +78,7 @@ except Exception:
 OUT_SHOTS.mkdir(parents=True, exist_ok=True)
 OUT_TEMP.mkdir(parents=True, exist_ok=True)
 
+
 # ---- Optional deps ----
 try:
     import onnxruntime as ort
@@ -88,12 +89,21 @@ try:
     import cv2
 except Exception:
     cv2 = None
+
 try:
     import torch
-    from diffusers import StableDiffusionInpaintPipeline
 except Exception:
     torch = None
+
+try:
+    from diffusers import StableDiffusionInpaintPipeline
+except Exception:
     StableDiffusionInpaintPipeline = None
+
+try:
+    from diffusers import StableDiffusionXLInpaintPipeline
+except Exception:
+    StableDiffusionXLInpaintPipeline = None
 
 
 # -------------------- Preferences --------------------
@@ -106,7 +116,7 @@ def _presets_store_path() -> Path:
 
 
 def _prefs_path() -> Path:
-    cfg = ROOT / "config"
+    cfg = ROOT / "presets" / "setsave"
     cfg.mkdir(parents=True, exist_ok=True)
     return cfg / "background_tool.json"
 
@@ -375,11 +385,28 @@ def _infer_onnx_alpha(model_path: Path, img_rgb: np.ndarray, engine_id: str) -> 
     return np.clip(alpha, 0.0, 1.0)
 
 
-# -------------------- SD Inpainting (Stable Diffusion 1.5) --------------------
-_SD_PIPE_CACHE = {}
+
+# -------------------- SD Inpainting (Stable Diffusion 1.5 / SDXL) --------------------
+_SD_PIPE_CACHE: dict = {}
+
 
 def _sd15_inpaint_available() -> bool:
-    return ('torch' in globals() and torch is not None) and ('StableDiffusionInpaintPipeline' in globals() and StableDiffusionInpaintPipeline is not None)
+    return (
+        "torch" in globals()
+        and torch is not None
+        and "StableDiffusionInpaintPipeline" in globals()
+        and StableDiffusionInpaintPipeline is not None
+    )
+
+
+def _sdxl_inpaint_available() -> bool:
+    return (
+        "torch" in globals()
+        and torch is not None
+        and "StableDiffusionXLInpaintPipeline" in globals()
+        and StableDiffusionXLInpaintPipeline is not None
+    )
+
 
 def _default_sd15_inpaint_model_path() -> Path:
     # As provided by the user: root \models\bg\sd-v1-5-inpainting.safetensors
@@ -387,72 +414,210 @@ def _default_sd15_inpaint_model_path() -> Path:
 
 
 def _resolve_inpaint_model_path(user_text: Optional[str] = None) -> Path:
-    # Resolve a valid SD inpaint model path with fallbacks
+    """Resolve a valid SD inpaint model path with fallbacks."""
     import os
+
     # 1) From UI
     if user_text:
-        s = user_text.strip().strip('"').strip("'")
+        s = str(user_text).strip().strip('"').strip("'")
         s = os.path.expanduser(os.path.expandvars(s))
         pth = Path(s)
         if pth.exists():
             return pth
+
     # 2) Preferred defaults under models/bg
     candidates = [
-        _models_dir() / 'bg' / 'sd-v1-5-inpainting.safetensors',
-        _models_dir() / 'bg' / 'sd-v1-5-inpainting.fp16.safetensors',
+        _models_dir() / "bg" / "sd-v1-5-inpainting.safetensors",
+        _models_dir() / "bg" / "sd-v1-5-inpainting.fp16.safetensors",
     ]
-    # 3) Any sd*inpaint*.safetensors under models/bg
+
+    # 3) Any *inpaint* checkpoint under models/bg
     try:
-        for g in ['sd*-inpaint*.safetensors', 'sd*inpaint*.safetensors', '*inpaint*.safetensors']:
-            for m in sorted((_models_dir() / 'bg').glob(g)):
+        bg_dir = _models_dir() / "bg"
+        for pattern in ["sd*-inpaint*.safetensors", "sd*inpaint*.safetensors", "*inpaint*.safetensors"]:
+            for m in sorted(bg_dir.glob(pattern)):
                 candidates.append(m)
     except Exception:
         pass
+
     for c in candidates:
         try:
             if Path(c).exists():
                 return Path(c)
         except Exception:
             continue
+
+    # Fallback: trust what the user typed, or our hard default.
     return Path(user_text) if user_text else _default_sd15_inpaint_model_path()
 
+
+
+def _load_inpaint_pipe(
+    pipe_cls,
+    model_path: Path,
+    device: str,
+    low_vram: bool,
+    is_single_file: bool,
+):
+    """Internal helper: try loading a diffusers inpaint pipeline with tolerant kwargs.
+
+    This is shared between SD 1.5 and SDXL:
+    - For SDXL inpaint we force num_in_channels=9 and disable the safety checker.
+    - We try combinations of low_cpu_mem_usage / ignore_mismatched_sizes but
+      gracefully fall back if the local diffusers build does not support them.
+    """
+    if pipe_cls is None:
+        raise RuntimeError("Requested inpaint pipeline class is not available.")
+
+    if "torch" not in globals() or torch is None:
+        raise RuntimeError("torch is required to load inpaint pipelines.")
+
+    # Heuristic: detect SDXL inpaint pipeline class
+    is_sdxl_inpaint = False
+    try:
+        from diffusers import StableDiffusionXLInpaintPipeline as _SDXLInpaint  # type: ignore
+        if pipe_cls is _SDXLInpaint:
+            is_sdxl_inpaint = True
+    except Exception:
+        # Fallback: naive name-based detection
+        try:
+            name = pipe_cls.__name__.lower()
+            if "xl" in name and "inpaint" in name:
+                is_sdxl_inpaint = True
+        except Exception:
+            is_sdxl_inpaint = False
+
+    torch_dtype = torch.float16 if (device == "cuda" and hasattr(torch, "float16")) else torch.float32
+
+    # Base kwargs applied to all loads
+    base_kwargs = {
+        "safety_checker": None,
+        "torch_dtype": torch_dtype,
+    }
+
+    # SDXL inpaint-specific tweaks: most SDXL inpaint checkpoints are 9‑channel UNets.
+    if is_sdxl_inpaint:
+        base_kwargs.update(
+            {
+                "num_in_channels": 9,
+                # On some diffusers builds this is still consulted
+                "load_safety_checker": False,
+            }
+        )
+
+    # Loader function wrapper: single file vs pretrained folder/repo.
+    if is_single_file:
+        def _call(extra_kwargs):
+            kw = dict(base_kwargs)
+            kw.update(extra_kwargs)
+            return pipe_cls.from_single_file(
+                str(model_path),
+                local_files_only=True,
+                **kw,
+            )
+    else:
+        def _call(extra_kwargs):
+            kw = dict(base_kwargs)
+            kw.update(extra_kwargs)
+            return pipe_cls.from_pretrained(
+                str(model_path),
+                local_files_only=True,
+                **kw,
+            )
+
+    pipe = None
+    last_exc: Exception | None = None
+
+    # Try with the recommended kwargs first, then back off.
+    extra_variants = [
+        {"low_cpu_mem_usage": False, "ignore_mismatched_sizes": True},
+        {"low_cpu_mem_usage": False},
+        {"ignore_mismatched_sizes": True},
+        {},
+    ]
+
+    for extra in extra_variants:
+        try:
+            pipe = _call(extra)
+            last_exc = None
+            break
+        except TypeError:
+            # Some diffusers versions don't accept some of these kwargs
+            last_exc = None
+            continue
+        except Exception as e:  # noqa: BLE001
+            # Real loading error; remember the last one and keep trying simpler kwargs
+            last_exc = e
+            continue
+
+    if pipe is None:
+        raise RuntimeError(f"Failed to load inpaint model at {model_path}: {last_exc or 'unknown error'}")
+
+    # Move to device and enable VRAM-saving tricks when requested.
+    try:
+        pipe = pipe.to(device)
+        if hasattr(pipe, "enable_attention_slicing"):
+            pipe.enable_attention_slicing()
+        if low_vram:
+            try:
+                if hasattr(pipe, "enable_vae_slicing"):
+                    pipe.enable_vae_slicing()
+            except Exception:
+                pass
+            try:
+                if hasattr(pipe, "enable_vae_tiling"):
+                    pipe.enable_vae_tiling()
+            except Exception:
+                pass
+            try:
+                # Either sequential or model CPU offload, depending on diffusers version
+                if hasattr(pipe, "enable_sequential_cpu_offload"):
+                    pipe.enable_sequential_cpu_offload()
+                elif hasattr(pipe, "enable_model_cpu_offload"):
+                    pipe.enable_model_cpu_offload()
+            except Exception:
+                pass
+    except Exception:
+        # Best effort: if we fail here we still return the pipe, just without the extra tweaks.
+        pass
+
+    return pipe
+
+
 def _get_sd15_inpaint_pipe(model_path: Path, low_vram: bool = False):
-    """Return a cached StableDiffusionInpaintPipeline from a single .safetensors file."""
+    """Return a cached Stable Diffusion 1.5 inpaint pipeline."""
     if not _sd15_inpaint_available():
-        raise RuntimeError("diffusers/torch not installed. Please install: torch, diffusers, transformers, accelerate, safetensors.")
+        raise RuntimeError(
+            "diffusers/torch not installed. Please install: torch, diffusers, transformers, accelerate, safetensors."
+        )
+
     device = "cuda" if (hasattr(torch, "cuda") and torch.cuda.is_available()) else "cpu"
-    key = str(model_path.resolve()) + "|" + device + f"|lvram={1 if low_vram else 0}"
+    key = str(model_path.resolve()) + "|sd15|" + device + f"|lvram={1 if low_vram else 0}"
     p = _SD_PIPE_CACHE.get(key)
     if p is None:
-        p = StableDiffusionInpaintPipeline.from_single_file(
-            str(model_path),
-            local_files_only=True,
-            safety_checker=None,
-            torch_dtype=torch.float16 if device == "cuda" else torch.float32,
-        )
-        p = p.to(device)
-        try:
-            p.enable_attention_slicing()
-            if low_vram:
-                try:
-                    p.enable_vae_slicing()
-                except Exception:
-                    pass
-                try:
-                    p.enable_vae_tiling()
-                except Exception:
-                    pass
-                try:
-                    p.enable_sequential_cpu_offload()
-                except Exception:
-                    try:
-                        p.enable_model_cpu_offload()
-                    except Exception:
-                        pass
-        except Exception:
-            pass
+        is_single_file = model_path.suffix.lower() in {".safetensors", ".ckpt", ".pt", ".bin"}
+        p = _load_inpaint_pipe(StableDiffusionInpaintPipeline, model_path, device, low_vram, is_single_file)
         _SD_PIPE_CACHE[key] = p
     return p
+
+
+def _get_sdxl_inpaint_pipe(model_path: Path, low_vram: bool = False):
+    """Return a cached SDXL inpaint pipeline."""
+    if not _sdxl_inpaint_available():
+        raise RuntimeError(
+            "diffusers/torch with StableDiffusionXLInpaintPipeline not installed. "
+            "Please update diffusers and install: torch, diffusers, transformers, accelerate, safetensors."
+        )
+
+    device = "cuda" if (hasattr(torch, "cuda") and torch.cuda.is_available()) else "cpu"
+    key = str(model_path.resolve()) + "|sdxl|" + device + f"|lvram={1 if low_vram else 0}"
+    p = _SD_PIPE_CACHE.get(key)
+    if p is None:
+        is_single_file = model_path.suffix.lower() in {".safetensors", ".ckpt", ".pt", ".bin"}
+        p = _load_inpaint_pipe(StableDiffusionXLInpaintPipeline, model_path, device, low_vram, is_single_file)
+        _SD_PIPE_CACHE[key] = p
+    return p
+
 
 def inpaint_sd15(
     img_rgb: np.ndarray,
@@ -465,30 +630,52 @@ def inpaint_sd15(
     seed: int = -1,
     model_path: Optional[Path | str] = None,
 ) -> Image.Image:
-    """Fill the masked (removed) regions using SD 1.5 inpainting."""
+    """Fill the masked (removed) regions using SD 1.5 or SDXL inpainting.
+
+    - If the resolved model path looks like an SDXL checkpoint (contains 'sdxl', 'sd_xl' or 'sd-xl'),
+      and the SDXL pipeline is available, SDXL inpainting will be used.
+    - Otherwise SD 1.5 inpainting is used (original behavior).
+    """
     from pathlib import Path as _PathAlias
+
     if model_path is None:
         model_path = _default_sd15_inpaint_model_path()
     model_path = _resolve_inpaint_model_path(str(model_path))
+
     if not _PathAlias(model_path).exists():
-        raise FileNotFoundError(f"SD1.5 inpainting model not found at: {model_path}")
+        raise FileNotFoundError(f"Inpainting model not found at: {model_path}")
+
     h, w = img_rgb.shape[:2]
     m = np.clip(remove_mask01.astype(np.float32), 0.0, 1.0)
     m_u8 = (m * 255.0).astype(np.uint8)
     mask_pil = Image.fromarray(m_u8, mode="L").resize((w, h), Image.BILINEAR)
     img_pil = _pil_from_np(img_rgb)
 
-        # Respect Low-VRAM toggle from UI if present
+    # Respect Low-VRAM toggle from UI if present
     try:
-        _lv = bool(getattr(Preview, '_ui_flags', {}).get('low_vram', False))
+        _lv = bool(getattr(Preview, "_ui_flags", {}).get("low_vram", False))
     except Exception:
         _lv = False
-    pipe = _get_sd15_inpaint_pipe(Path(model_path), low_vram=_lv)
-    g = None
-    if isinstance(seed, int) and seed >= 0:
-        g = torch.Generator(device=getattr(pipe, "device", "cpu")).manual_seed(int(seed))
 
-    # First try: ask the pipeline to keep the original dimensions.
+    # Choose SDXL vs SD1.5 based on path + availability
+    path_str = str(model_path)
+    lower = path_str.lower()
+    use_sdxl = ("sdxl" in lower) or ("sd_xl" in lower) or ("sd-xl" in lower)
+
+    if use_sdxl and _sdxl_inpaint_available():
+        pipe = _get_sdxl_inpaint_pipe(_PathAlias(model_path), low_vram=_lv)
+    else:
+        pipe = _get_sd15_inpaint_pipe(_PathAlias(model_path), low_vram=_lv)
+
+    # Seed handling
+    g = None
+    if seed is not None and seed >= 0 and "torch" in globals() and torch is not None:
+        try:
+            g = torch.Generator(device=pipe.device).manual_seed(int(seed))
+        except Exception:
+            g = None
+
+    # First try: keep original dimensions
     try:
         out = pipe(
             prompt=prompt or "",
@@ -509,14 +696,14 @@ def inpaint_sd15(
     except Exception:
         pass
 
-    # Fallback: pad to nearest multiple-of-8 (VAE factor), run, then crop back.
+    # Fallback: pad to nearest multiple-of-8, run, then crop back.
     padded_img, pads = _pad_to_multiple(img_rgb, 8)
-    # Pad the mask consistently (single channel); reuse reflect padding via helper on a 3-channel view.
     m3 = np.repeat(m_u8[..., None], 3, axis=2)
     padded_m3, _ = _pad_to_multiple(m3, 8)
     padded_mask_u8 = padded_m3[..., 0]
     img_pil2 = Image.fromarray(padded_img)
     mask_pil2 = Image.fromarray(padded_mask_u8, mode="L")
+
     out2 = pipe(
         prompt=prompt or "",
         negative_prompt=negative_prompt or None,
@@ -534,7 +721,8 @@ def inpaint_sd15(
     out_np_cropped = _crop_from_padding(out_np, pads)
     return _pil_from_np(out_np_cropped)
 
-    # -------------------- Post, composite --------------------
+
+# -------------------- Post, composite --------------------
 
 def _apply_post(alpha: np.ndarray, thresh: int, feather: int) -> np.ndarray:
     """alpha 0..1 -> 0..255 uint8 with threshold + feather.
@@ -935,7 +1123,7 @@ def install_background_tool(pane, section_widget) -> None:
     try:
         from PySide6.QtWidgets import (
             QWidget, QFormLayout, QComboBox, QSpinBox, QSlider, QHBoxLayout, QVBoxLayout, QDoubleSpinBox,
-            QPushButton, QCheckBox, QFileDialog, QMessageBox, QLabel, QLineEdit
+            QPushButton, QCheckBox, QFileDialog, QMessageBox, QLabel, QLineEdit, QScrollArea
         , QButtonGroup)
         from PySide6.QtCore import Qt, QTimer, QSize, Signal, QThread
         from PySide6.QtGui import QPixmap, QImage, QColor
@@ -1659,7 +1847,47 @@ def install_background_tool(pane, section_widget) -> None:
         Preview._ui_flags = {'auto_inpaint': False, 'freeze_unmasked': True}
 
     container = QWidget()
-    vbox = QVBoxLayout(container)
+    outer_vbox = QVBoxLayout(container)
+    try:
+        outer_vbox.setContentsMargins(0, 0, 0, 0)
+        outer_vbox.setSpacing(6)
+    except Exception:
+        pass
+
+    # Scrollable content: preview + all controls
+    scroll = QScrollArea()
+    try:
+        scroll.setWidgetResizable(True)
+    except Exception:
+        pass
+    scroll_body = QWidget()
+    vbox = QVBoxLayout(scroll_body)
+    scroll.setWidget(scroll_body)
+    # --- Fancy banner at the top ---
+    banner = QLabel('Remove Background & inpaint with sd15')
+    banner.setObjectName('bgBanner')
+    banner.setAlignment(Qt.AlignCenter)
+    banner.setFixedHeight(46)
+    banner.setStyleSheet(
+        "#bgBanner {"
+        " font-size: 15px;"
+        " font-weight: 600;"
+        " padding: 8px 17px;"
+        " border-radius: 12px;"
+        " margin: 0 0 6px 0;"
+        " color: white;"
+        " background: qlineargradient("
+        "   x1:0, y1:0, x2:1, y2:0,"
+        "   stop:0 #cd28ff,"
+        "   stop:0.5 #9f4df2,"
+        "   stop:1 #28ffbb"
+        " );"
+        " letter-spacing: 0.5px;"
+        "}"
+    )
+    outer_vbox.addWidget(banner)
+    outer_vbox.addSpacing(4)
+    outer_vbox.addWidget(scroll, stretch=1)
 
     preview = Preview()
 
@@ -1836,7 +2064,28 @@ def install_background_tool(pane, section_widget) -> None:
     except Exception:
         pass
     btn_save      = QPushButton("Save")
-    btns_row = QHBoxLayout(); btns_row.addWidget(btn_use_current); btns_row.addWidget(btn_load); btns_row.addWidget(btn_recompute); btns_row.addWidget(btn_undo); btns_row.addWidget(btn_reset); btns_row.addWidget(btn_save); btns_row.addStretch(1); btn_sd_inpaint = QPushButton("INPAINT"); btns_row.addWidget(btn_sd_inpaint);    # Combined row: Mask overlay + Shadow Opacity (moved here per request)
+    btns_row = QHBoxLayout(); btns_row.addWidget(btn_use_current); btns_row.addWidget(btn_load); btns_row.addWidget(btn_recompute); btns_row.addWidget(btn_undo); btns_row.addWidget(btn_reset); btns_row.addWidget(btn_save); btns_row.addStretch(1); btn_sd_inpaint = QPushButton("INPAINT")
+    # --- Button styles: +3px font and colored hovers ---
+    for _b in (btn_recompute, btn_sd_inpaint):
+        _f = _b.font()
+        _sz = _f.pointSize()
+        if _sz <= 0:
+            _sz = 10
+        _f.setPointSize(_sz + 3)
+        _b.setFont(_f)
+        try:
+            _b.setMinimumHeight(34)
+        except Exception:
+            pass
+    btn_recompute.setObjectName('bgRemoveButton')
+    btn_recompute.setStyleSheet(
+        'QPushButton#bgRemoveButton:hover { background-color: #cd28ff; color: white; }'
+    )
+    btn_sd_inpaint.setObjectName('bgInpaintButton')
+    btn_sd_inpaint.setStyleSheet(
+        'QPushButton#bgInpaintButton:hover { background-color: #28ffbb; color: #082c33; }'
+    )
+    btns_row.addWidget(btn_sd_inpaint);    # Combined row: Mask overlay + Shadow Opacity (moved here per request)
         # Shadow opacity control remains hidden; overlay shown and combined with Mode/Lock row.
     # Lock image size now in Mode row with overlay
 # --- Tooltips (defaults in parentheses) ---
@@ -2051,11 +2300,11 @@ def install_background_tool(pane, section_widget) -> None:
     except Exception:
         pass
     vbox.insertLayout(1, btns_row)
-    vbox.insertLayout(2, btns_row2)
+    outer_vbox.addLayout(btns_row2)
     # Move Output path controls directly under the preview (before the main form panel)
 # Mount into CollapsibleSection
     try:
-        section_widget.setContentLayout(vbox)
+        section_widget.setContentLayout(outer_vbox)
     except Exception:
         pass
 
