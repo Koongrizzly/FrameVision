@@ -1,6 +1,6 @@
 ### 🌟 FrameVision 2.0 
-**All-in-one Video & Photo Upscaler/Editor**  
-✨ *Upscale, edit, describe, and create — in one streamlined app.*
+**All-in-one sound/mage/Video Tool**  
+✨ *Upscale, edit, describe, create — in one streamlined app.*
 
 December 1, 2025 V2.0 is finally ready
 ### 🌟 Release Notes
