@@ -12,7 +12,7 @@ if exist ".venv\Scripts\activate.bat" (
   if exist ".venv\Scripts\activate.bat" call ".venv\Scripts\activate.bat"
 )
 
-echo [run] Downloading describe + upscaler packs...
+echo [run] Downloading describe  + upscaler packs...
 python "scripts\download_externals.py" --all
 set "ERR=%ERRORLEVEL%"
 if not "%ERR%"=="0" (
