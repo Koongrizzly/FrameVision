@@ -787,6 +787,11 @@ class Wan22Pane(QWidget):
         self.chk_use_queue = QCheckBox("Use queue")
         self.chk_use_queue.setToolTip("Tip : Always use queue if you want to do more then one job in the app")
 
+        # Text encoder (T5) CPU offload toggle (helps lower VRAM GPUs)
+        self.chk_t5_cpu = QCheckBox("T5 on CPU")
+        self.chk_t5_cpu.setChecked(False)
+        self.chk_t5_cpu.setToolTip("Offload the WAN 2.2 text encoder (T5) to CPU to reduce VRAM usage. Helpful on 8–12GB GPUs. Slower when enabled.")
+
         # Use Current button: grab current frame from Media Player
         self.btn_use_current = QPushButton("Use Current")
         self.btn_use_current.setToolTip(
@@ -829,6 +834,7 @@ class Wan22Pane(QWidget):
         btn_row.addWidget(self.btn_run)
         btn_row.addWidget(self.btn_play_last)
         btn_row.addWidget(self.chk_use_queue)
+        btn_row.addWidget(self.chk_t5_cpu)
         btn_row.addWidget(self.btn_use_current)
         btn_row.addStretch(1)
         layout.addLayout(btn_row)
@@ -947,6 +953,7 @@ class Wan22Pane(QWidget):
                 "batch_count": int(self.spn_batch.value()) if getattr(self, "spn_batch", None) else 1,
                 "output_path": self.ed_out.text(),
                 "use_queue": bool(getattr(self, "chk_use_queue", None) and self.chk_use_queue.isChecked()),
+                "t5_cpu": bool(getattr(self, "chk_t5_cpu", None) and self.chk_t5_cpu.isChecked()),
                 "use_nvenc": bool(getattr(self, "chk_use_nvenc", None) and self.chk_use_nvenc.isChecked()),
                 "thumb_size": int(self.sld_thumb_size.value()) if getattr(self, "sld_thumb_size", None) else 100,
                 "recent_sort": (
@@ -1068,6 +1075,8 @@ class Wan22Pane(QWidget):
 
         if "use_queue" in settings and getattr(self, "chk_use_queue", None):
             self.chk_use_queue.setChecked(bool(settings["use_queue"]))
+        if "t5_cpu" in settings and getattr(self, "chk_t5_cpu", None):
+            self.chk_t5_cpu.setChecked(bool(settings["t5_cpu"]))
         if "use_nvenc" in settings and getattr(self, "chk_use_nvenc", None):
             self.chk_use_nvenc.setChecked(bool(settings["use_nvenc"]))
 
@@ -2314,13 +2323,45 @@ class Wan22Pane(QWidget):
 
 
 
+
+
+    def _detect_wan_t5_cpu_flag(self, py_exe: str, gen_path: Path, model_root: Path):
+        """
+        Inspect `generate.py --help` once and cache whether WAN supports the
+        --t5_cpu flag (text encoder CPU offload).
+        """
+        if hasattr(self, "_wan_t5_cpu_flag"):
+            return self._wan_t5_cpu_flag
+
+        has_flag = False
+        try:
+            proc = subprocess.run(
+                [py_exe, str(gen_path), "--help"],
+                cwd=str(model_root),
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                timeout=20,
+            )
+            help_text = (proc.stdout or "") + "\n" + (proc.stderr or "")
+            if "--t5_cpu" in help_text:
+                has_flag = True
+        except Exception as e:
+            try:
+                print(f"Wan2.2 T5 CPU flag detection failed: {e}")
+            except Exception:
+                pass
+
+        self._wan_t5_cpu_flag = has_flag
+        return has_flag
+
     def _build_command(self):
         """
         Build the python + args + working directory tuple for QProcess.
 
-        We deliberately do NOT pass --t5_cpu or --offload_model so that WAN
-        can fully use the GPU by default. If VRAM OOMs, we can revisit this
-        and add switches in the UI.
+        We avoid full-model CPU offload because it can make long clips extremely slow.
+        The optional "T5 on CPU" toggle lets users offload only the text encoder
+        to reduce VRAM usage with a smaller speed penalty.
         """
         py = self._python_exe()
         gen = self._generate_script()
@@ -2370,11 +2411,28 @@ class Wan22Pane(QWidget):
             "--base_seed", str(seed_value),
             "--frame_num", str(self.spn_frames.value()),
             "--ckpt_dir", str(model_root),
+            "--offload_model", "false",
             "--convert_model_dtype",
         ]
 
         if prompt:
             args += ["--prompt", prompt]
+
+        # Optional text-encoder (T5) CPU offload: only when user requests it.
+        try:
+            if getattr(self, "chk_t5_cpu", None) and self.chk_t5_cpu.isChecked():
+                has_t5_cpu = self._detect_wan_t5_cpu_flag(py, gen, model_root)
+                if has_t5_cpu:
+                    args.append("--t5_cpu")
+                else:
+                    try:
+                        self._append_log(
+                            "T5 on CPU requested, but --t5_cpu is not supported by your generate.py; skipping."
+                        )
+                    except Exception:
+                        pass
+        except Exception:
+            pass
 
         # Negative prompt (best-effort; only if generate.py advertises a matching flag)
         if negative:

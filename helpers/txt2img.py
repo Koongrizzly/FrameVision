@@ -457,7 +457,11 @@ class Txt2ImgPane(QWidget):
                 pass
             try:
                     if hasattr(self,'steps_slider') and 'steps' in s: self.steps_slider.setValue(int(s.get('steps') or 30))
-                    if hasattr(self,'cfg_scale') and 'cfg_scale' in s: self.cfg_scale.setValue(float(s.get('cfg_scale') or 7.5))
+                    if hasattr(self,'cfg_scale') and 'cfg_scale' in s:
+                        try:
+                            self.cfg_scale.setValue(float(s.get('cfg_scale')))
+                        except Exception:
+                            pass
             except Exception:
                 pass
             try:
@@ -2091,52 +2095,67 @@ class Txt2ImgPane(QWidget):
             ("768x768 (1:1)", 768, 768),
             ("896x896 (1:1)", 896, 896),
             ("960x960 (1:1)", 960, 960),
-            ("1024x1024 (1:1, recommended)", 1024, 1024),
-            ("1280x1280 (1:1, recommended)", 1280, 1280),
-
+            ("1024x1024 (1:1)", 1024, 1024),
+            ("1280x1280 (1:1, Max recommended SDXL)", 1280, 1280),
+            ("1440x1440 (1:1)", 1440, 1440),
+            ("1920x1920 (1:1)", 1920, 1920),
+            ("2048x2048 (1:1)", 2048, 2048),
+            ("3072x3072 (1:1)", 3072, 3072),
+            ("4096x4096 (1:1)", 4096, 4096),
             # 16:9/9:16
-            ("576x1024 (9:16)", 576, 1024),
+            ("640x384 (16:9)", 640, 384),
             ("1024x576 (16:9)", 1024, 576),
-            ("640x1136 (9:16)", 640, 1136),
+            ("854x480 (16:9)", 854, 480),
+            ("1024x576 (16:9)", 1024, 576),
             ("1136x640 (16:9)", 1136, 640),
-            ("720x1280 (9:16, recommended)", 720, 1280),
-            ("1280x720 (16:9, recommended)", 1280, 720),
-            ("704x1280 (9:16, WAN specific size)", 704, 1280),
+            ("1280x720 (16:9)", 1280, 720),
             ("1280x704 (16:9, WAN specific size)", 1280, 704),
-            ("864x1536 (9:16, recommended)", 864, 1536),
-            ("1344x768 (16:9, recommended)", 1344, 768),
-            ("768x1344 (9:16, recommended)", 768, 1344),
+            ("1344x768 (16:9)", 1344, 768),
             ("1536x864 (16:9, max advised for SDXL)", 1536, 864),
+            ("1728x972 (16:9)", 1728, 972),
+            ("1920x1080 (16:9)", 1920, 1088),
+            ("2048x1152 (16:9)", 2048, 1152),
+            ("2560x1440 (16:9)", 2560, 1440),
+            ("4096x2560 (16:9)", 4096, 2560),
+            ("384x640 (9:16)", 384, 640),
+            ("576x1024 (9:16)", 576, 1024),
+            ("640x1136 (9:16)", 640, 1136),
+            ("720x1280 (9:16)", 720, 1280),
+            ("704x1280 (9:16, WAN specific size)", 704, 1280),
+            ("864x1536 (9:16)", 864, 1536),
+            ("768x1344 (9:16)", 768, 1344),
             ("864x1536 (9:16, max advised for SDXL)", 864, 1536),
-            #        ("972x1728 (9:16)", 972, 1728),
-            #        ("1728x972 (16:9)", 1728, 972),
-
+            ("972x1728 (9:16)", 972, 1728),
+            ("1088x1920 (9:16)", 1088, 1920),
+            ("1152x2048 (9:16)", 1152, 2048),
+            ("1440x2560 (9:16)", 1440, 2560),
+            ("2560x4096 (9:16)", 2560, 4096),
+            
             # 21:9/9:21
-            ("544x1280 (9:21)", 544, 1280),
             ("1280x544 (21:9)", 1280, 544),
-            ("576x1344 (9:21, recommended)", 576, 1344),
-            ("1344x576 (21:9, recommended)", 1344, 576),
+            ("1344x576 (21:9, max advised for SDXL)", 1344, 576),
+            ("1600x684 (21:9)", 1600, 684),
+            ("1920x800 (21:9, ultrawide)", 1920, 800),
+            ("2560x1088 (21:9, ultrawide)", 2560, 1088),
 
             # 9:7/7:9
-            ("896x1152 (7:9, recommended)", 896, 1152),
-            ("1152x896 (9:7, recommended)", 1152, 896),
+            ("896x1152 (7:9)", 896, 1152),
+            ("1152x896 (9:7)", 1152, 896),
 
             # 4:3/3:4
-            ("480x640 (3:4)", 480, 640),
-            ("640x480 (4:3)", 640, 480),
             ("600x800 (3:4)", 600, 800),
             ("800x600 (4:3)", 800, 600),
             ("896x672 (4:3)", 896, 672),
-            ("768x1024 (3:4, recommended)", 768, 1024),
-            ("1024x768 (4:3, recommended)", 1024, 768),
+            ("768x1024 (3:4)", 768, 1024),
+            ("1024x768 (4:3)", 1024, 768),
             ("832x1104 (3:4)", 832, 1104),
             ("1104x832 (4:3)", 1104, 832),
             ("1152x864 (4:3, max advised for SDXL)", 1152, 864),
 
             # 3:2/2:3
             ("960x640 (3:2)", 960, 640),
-            ("768x1152 (2:3, recommended)", 768, 1152),
-            ("1152x768 (3:2, recommended)", 1152, 768),
+            ("768x1152 (2:3)", 768, 1152),
+            ("1152x768 (3:2)", 1152, 768),
             ("1024x1536 (2:3, max advised for SDXL)", 1024, 1536),
             ("1536x1024 (3:2, max advised for SDXL)", 1536, 1024),
 
@@ -2144,6 +2163,7 @@ class Txt2ImgPane(QWidget):
             ("1024x512 (2:1)", 1024, 512),
             ("1280x640 (2:1, recommended)", 1280, 640),
         ]
+
         for label, w, h in self._size_presets:
             self.size_combo.addItem(label, (w, h))
         # default selection
@@ -2306,16 +2326,24 @@ class Txt2ImgPane(QWidget):
         out_row.addWidget(QLabel("Output:")); out_row.addWidget(self.output_path, 1); out_row.addWidget(self.browse_btn)
         form.addRow(out_row)
 
-        # VRAM profile override
+        # VRAM profile override (kept for jobs but hidden in UI)
         vram_row = QHBoxLayout()
         self.vram_profile = QComboBox(); self.vram_profile.addItems(["Auto", "6 GB", "8 GB", "12 GB", "24 GB"])
         self.restore_auto = QPushButton("Restore Auto")
         self.restore_auto.hide(); self.restore_auto.clicked.connect(lambda: self.vram_profile.setCurrentIndex(0))
-        vram_row.addWidget(QLabel("VRAM profile:")); vram_row.addWidget(self.vram_profile); vram_row.addWidget(self.restore_auto)
+        self.vram_label = QLabel("VRAM profile:")
+        vram_row.addWidget(self.vram_label); vram_row.addWidget(self.vram_profile); vram_row.addWidget(self.restore_auto)
         
         vram_row.addWidget(self.show_in_player)
         vram_row.addWidget(self.use_queue)
         form.addRow(vram_row)
+        # Hide VRAM controls from the UI, keep underlying value for internal use
+        try:
+            self.vram_label.hide()
+            self.vram_profile.hide()
+            self.restore_auto.hide()
+        except Exception:
+            pass
         # Ensure hidden CLI fields exist before persistence restore
         try:
             self._qwen_cli_template_removed
@@ -3163,6 +3191,96 @@ class Txt2ImgPane(QWidget):
                         pass
         except Exception:
             pass
+        # Adjust size presets and manual width/height range depending on engine
+        try:
+            combo = getattr(self, "size_combo", None)
+            w_spin = getattr(self, "size_manual_w", None)
+            h_spin = getattr(self, "size_manual_h", None)
+            base_presets = getattr(self, "_size_presets", None)
+            z_presets = getattr(self, "_zimage_size_presets", [])
+            if combo is not None and base_presets:
+                # Remember current requested size (if any)
+                try:
+                    data = combo.currentData()
+                    cur_size = (int(data[0]), int(data[1])) if data else None
+                except Exception:
+                    cur_size = None
+                try:
+                    last_idx = int(getattr(self, "_last_size_index", combo.currentIndex()))
+                except Exception:
+                    last_idx = combo.currentIndex()
+                try:
+                    combo.blockSignals(True)
+                except Exception:
+                    pass
+                try:
+                    combo.clear()
+                except Exception:
+                    pass
+                # Rebuild from base presets (SDXL-safe)
+                try:
+                    for lbl, wv, hv in base_presets:
+                        combo.addItem(lbl, (wv, hv))
+                except Exception:
+                    pass
+                # If Z-Image is active, append 2K–4K presets
+                if is_zimage and z_presets:
+                    try:
+                        for lbl, wv, hv in z_presets:
+                            combo.addItem(lbl, (wv, hv))
+                    except Exception:
+                        pass
+                # Restore selection by size when possible
+                sel_idx = -1
+                if cur_size:
+                    try:
+                        for i in range(combo.count()):
+                            d = combo.itemData(i)
+                            if d and int(d[0]) == cur_size[0] and int(d[1]) == cur_size[1]:
+                                sel_idx = i
+                                break
+                    except Exception:
+                        sel_idx = -1
+                if sel_idx < 0:
+                    # Fallback: keep previous index if valid, otherwise pick a sensible default
+                    if 0 <= last_idx < combo.count():
+                        sel_idx = last_idx
+                    else:
+                        # For Z-Image, prefer the largest preset (last item); otherwise first
+                        sel_idx = combo.count() - 1 if (is_zimage and combo.count() > 0) else 0
+                try:
+                    combo.setCurrentIndex(max(0, sel_idx))
+                except Exception:
+                    pass
+                try:
+                    combo.blockSignals(False)
+                except Exception:
+                    pass
+                try:
+                    self._last_size_index = sel_idx
+                except Exception:
+                    pass
+            # Manual spinbox ranges:
+            # - SDXL/diffusers: clamp to SDXL-safe max (1536px)
+            # - Z-Image: allow up to full 4K (4096px)
+            max_dim = 4096 if is_zimage else 1536
+            for sp in (w_spin, h_spin):
+                if sp is not None:
+                    try:
+                        sp.blockSignals(True)
+                    except Exception:
+                        pass
+                    try:
+                        sp.setRange(256, max_dim)
+                    except Exception:
+                        pass
+                    try:
+                        sp.blockSignals(False)
+                    except Exception:
+                        pass
+        except Exception:
+            pass
+
 
 
     def _on_browse(self):
@@ -4211,6 +4329,14 @@ def _gen_via_zimage(job: dict, out_dir: Path, progress_cb=None):
         "--filename_template", fname_tmpl,
     ]
 
+    # Pass attention slicing flag through to Z-Image CLI so low-VRAM
+    # users can enable it from the Advanced settings checkbox.
+    try:
+        if bool(job.get("attn_slicing")):
+            args.append("--attn-slicing")
+    except Exception:
+        pass
+
     try:
         # Ensure out_dir exists before launching
         try:
@@ -4282,6 +4408,21 @@ def generate_qwen_images(job: dict, progress_cb: Optional[Callable[[float], None
     seed_policy = job.get("seed_policy", "fixed"); fmt = job.get("format", "png").lower().strip()
     steps = int(job.get("steps", 30))
     req_w = int(job.get("width", 1024)); req_h = int(job.get("height", 1024))
+    # Z-Image: auto-correct resolutions in the fragile band around 1080p on the short side.
+    # Many turbo builds produce NaNs for non-square sizes where min(W,H) is ~1000–1150.
+    # To keep things stable, we gently downscale such sizes so the short side becomes ~960px.
+    try:
+        engine_key = str(job.get("engine") or "").strip().lower()
+        if engine_key == "zimage":
+            short_side = min(req_w, req_h)
+            if 960 < short_side < 1200:
+                scale = 960.0 / float(short_side)
+                def _snap64(v: float) -> int:
+                    return max(256, int(round(v / 64.0) * 64))
+                req_w = _snap64(req_w * scale)
+                req_h = _snap64(req_h * scale)
+    except Exception:
+        pass
     # Snap to a safe bucket that typical T2I models like (multiples of 64, near known presets)
     safe_w, safe_h = _safe_snap_size(req_w, req_h)
     fname_tmpl = job.get("filename_template", "qwen_{seed}_{idx:03d}.png"); prompt = job.get("prompt", "")

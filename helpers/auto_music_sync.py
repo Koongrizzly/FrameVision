@@ -151,6 +151,74 @@ def _cine_grid_dims(screen_count: int) -> tuple[int, int]:
     }
     return layout_map.get(n, (n, 1))
 
+
+def _cine_grid_layout(screen_count: int, target_w: int, target_h: int):
+    """Return per-tile (w, h, x, y) for 2–9 tiles.
+
+    Layouts are tuned so that, for example, 5 ⇒ 3+2 and 7 ⇒ 4+3 rows,
+    which keeps the overall grid closer to a cinematic 16:9 aspect ratio
+    and avoids the ultra‑wide strip look while still filling the frame.
+    """
+    try:
+        n = int(screen_count)
+    except Exception:
+        n = 4
+    if n < 1:
+        n = 1
+    if n > 9:
+        n = 9
+
+    # Rows are described as "how many tiles in this row", top to bottom.
+    row_patterns = {
+        1: [1],
+        2: [2],
+        3: [3],
+        4: [2, 2],
+        5: [3, 2],
+        6: [3, 3],
+        7: [4, 3],
+        8: [4, 4],
+        9: [3, 3, 3],
+    }
+    rows_spec = row_patterns.get(n, [n])
+    total_rows = len(rows_spec)
+
+    # Split the height evenly between rows, put any remainder on the last row
+    # so the stacked rows always fill the frame top‑to‑bottom.
+    base_h = max(1, target_h // max(1, total_rows))
+    heights = [base_h for _ in range(total_rows)]
+    used_h = base_h * total_rows
+    remainder_h = target_h - used_h
+    if remainder_h != 0 and heights:
+        heights[-1] = max(1, heights[-1] + remainder_h)
+
+    layout = []
+    y = 0
+    idx_tile = 0
+    for row_idx, cols_in_row in enumerate(rows_spec):
+        if idx_tile >= n:
+            break
+        h = heights[row_idx]
+        cols_in_row = max(1, int(cols_in_row))
+        base_w = max(1, target_w // cols_in_row)
+        widths = [base_w for _ in range(cols_in_row)]
+        used_w = base_w * cols_in_row
+        remainder_w = target_w - used_w
+        if remainder_w != 0 and widths:
+            widths[-1] = max(1, widths[-1] + remainder_w)
+
+        x = 0
+        for col in range(cols_in_row):
+            if idx_tile >= n:
+                break
+            w = widths[col]
+            layout.append((w, h, x, y))
+            x += w
+            idx_tile += 1
+        y += h
+
+    return layout
+
 def _run_ffmpeg(cmd: List[str]) -> Tuple[int, str]:
     try:
         proc = subprocess.Popen(
@@ -2518,7 +2586,7 @@ class RenderWorker(QThread):
                     else:
                         target_w, target_h = 1920, 1080
 
-                    # Compute a deterministic (cols, rows) layout that fully covers the frame.
+                    # Compute a deterministic layout and per-tile placement that fully covers the frame.
                     cols, rows = _cine_grid_dims(screens)
                     tile_w = max(1, target_w // cols)
                     tile_h = max(1, target_h // rows)
@@ -2550,16 +2618,17 @@ class RenderWorker(QThread):
 
                     if valid_inputs > 0:
                         # Build filter_complex: scale/pad each tile, stack with xstack, then fit to target.
+                        # Use the same smart layout helper as Mosaic so rows fill the frame cleanly.
+                        layout = _cine_grid_layout(valid_inputs, target_w, target_h)
                         per_inputs = []
                         layout_entries = []
                         for idx_m in range(valid_inputs):
+                            tile_w_i, tile_h_i, pos_x, pos_y = layout[idx_m]
                             per_inputs.append(
-                                f"[{idx_m}:v]scale={tile_w}:{tile_h}:force_original_aspect_ratio=decrease,"
-                                f"pad={tile_w}:{tile_h}:(ow-iw)/2:(oh-ih)/2:black[v{idx_m}]"
+                                f"[{idx_m}:v]scale={tile_w_i}:{tile_h_i}:force_original_aspect_ratio=decrease,"
+                                f"pad={tile_w_i}:{tile_h_i}:(ow-iw)/2:(oh-ih)/2:black[v{idx_m}]"
                             )
-                            row = idx_m // cols
-                            col = idx_m % cols
-                            layout_entries.append(f"{col * tile_w}_{row * tile_h}")
+                            layout_entries.append(f"{pos_x}_{pos_y}")
 
                         xstack = (
                             "".join(f"[v{idx_m}]" for idx_m in range(valid_inputs))
@@ -2607,7 +2676,8 @@ class RenderWorker(QThread):
                             raise RuntimeError(f"ffmpeg failed for multiply segment {i+1}:\n{out}")
                         parts.append(out_part)
                         continue
-                
+
+
                 # Mosaic cinematic effect: replace this segment with a grid of multiple clips.
                 if getattr(seg, "cine_mosaic", False):
                     # Number of screens requested (clamped 2–9).
@@ -2663,17 +2733,20 @@ class RenderWorker(QThread):
 
                         if valid_inputs > 0:
                             # Build filter_complex: scale/pad each tile, stack with xstack, then fit to target.
+                            # Use a smarter layout so that 5 ⇒ 3+2 and 7 ⇒ 4+3 etc.,
+                            # and rows always fill the full frame height.
+                            layout = _cine_grid_layout(valid_inputs, target_w, target_h)
                             per_inputs = []
                             layout_entries = []
                             for idx_m in range(valid_inputs):
+                                tile_w_i, tile_h_i, pos_x, pos_y = layout[idx_m]
                                 per_inputs.append(
-                                    f"[{idx_m}:v]scale={tile_w}:{tile_h}:force_original_aspect_ratio=decrease,"
-                                    f"pad={tile_w}:{tile_h}:(ow-iw)/2:(oh-ih)/2:black[v{idx_m}]"
+                                    f"[{idx_m}:v]scale={tile_w_i}:{tile_h_i}:force_original_aspect_ratio=decrease,"
+                                    f"pad={tile_w_i}:{tile_h_i}:(ow-iw)/2:(oh-ih)/2:black[v{idx_m}]"
                                 )
-                                row = idx_m // cols
-                                col = idx_m % cols
-                                layout_entries.append(f"{col * tile_w}_{row * tile_h}")
+                                layout_entries.append(f"{pos_x}_{pos_y}")
 
+                            
                             xstack = (
                                 "".join(f"[v{idx_m}]" for idx_m in range(valid_inputs))
                                 + f"xstack=inputs={valid_inputs}:layout="
@@ -3033,7 +3106,47 @@ class RenderWorker(QThread):
                             alpha = 0.0
                         if alpha > 1.0:
                             alpha = 1.0
-                        filter_str = "[1:v]format=rgba,colorchannelmixer=aa=%(alpha)0.2f[viz];[0:v][viz]overlay=0:0:shortest=1" % {"alpha": alpha}
+
+                        # Build ffmpeg filter string and optionally disable the
+                        # music-player visuals for sections where the user
+                        # explicitly chose "No beat-synced visual" in the UI.
+                        disable_ranges = []
+                        try:
+                            # Only meaningful for per-section strategy.
+                            overrides = getattr(self, "visual_section_overrides", {}) or {}
+                            if strategy == 2 and section_map and isinstance(overrides, dict):
+                                for start_sec, end_sec, kind in section_map:
+                                    key = str(kind).lower().strip()
+                                    if key in overrides and overrides.get(key) is None:
+                                        try:
+                                            st = float(start_sec)
+                                            en = float(end_sec)
+                                        except Exception:
+                                            continue
+                                        if en <= st:
+                                            continue
+                                        if st < 0.0:
+                                            st = 0.0
+                                        disable_ranges.append((st, en))
+                        except Exception:
+                            disable_ranges = []
+
+                        enable_clause = ""
+                        if disable_ranges:
+                            parts = [
+                                f"between(t,{st:.3f},{en:.3f})" for st, en in disable_ranges
+                            ]
+                            joined = "+".join(parts)
+                            enable_expr = f"not({joined})"
+                            # Use ffmpeg's generic 'enable' expression on the overlay
+                            # so visuals are skipped entirely during disabled ranges.
+                            enable_clause = f":enable='{enable_expr}'"
+
+                        filter_str = (
+                            "[1:v]format=rgba,colorchannelmixer=aa=%(alpha)0.2f[viz];"
+                            "[0:v][viz]overlay=0:0:shortest=1%(enable)s"
+                            % {"alpha": alpha, "enable": enable_clause}
+                        )
 
                         cmd = [
                             self.ffmpeg,

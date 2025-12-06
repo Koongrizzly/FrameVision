@@ -1,20 +1,35 @@
 #!/usr/bin/env python
 """
-Small helper script that runs Z-Image Turbo txt2img in a dedicated environment.
+Z-Image Turbo txt2img helper for FrameVision.
 
-It is meant to be called from helpers/txt2img.py via the python.exe inside
-<root>/.zimage_env/, and returns a single line of JSON with the list of files.
+This version is fully OFFLINE and uses the local model folder:
+    <root>/models/Z-Image-Turbo
+
+Requirements (handled by zimage_install.bat):
+  * models/Z-Image-Turbo/ directory must contain a full snapshot of
+    Tongyi-MAI/Z-Image-Turbo, with the transformer weights replaced by
+    an FP8 checkpoint at:
+        transformer/diffusion_pytorch_model.safetensors
+
+It:
+  * Chooses CUDA + bfloat16/float16 when available, else CPU + float32.
+  * Loads ZImagePipeline from the LOCAL directory only (local_files_only=True).
+  * Uses Diffusers' enable_model_cpu_offload() on CUDA for lower VRAM.
+  * Saves one or more images to the requested output directory.
+  * Prints a single JSON line to stdout: { "files": [paths], "model": "Z-Image-Turbo", "error": ... }
 """
 from __future__ import annotations
 
 import argparse
 import json
-import sys
 import time
 import traceback
 from pathlib import Path
+import sys
+
 
 def _unique_path(p: Path) -> Path:
+    """Return a unique path by appending _### if needed."""
     try:
         p = Path(p)
         if not p.exists():
@@ -29,6 +44,7 @@ def _unique_path(p: Path) -> Path:
     except Exception:
         return Path(p)
 
+
 def main(argv=None) -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--prompt", required=True)
@@ -42,6 +58,8 @@ def main(argv=None) -> int:
     parser.add_argument("--outdir", required=True)
     parser.add_argument("--fmt", default="png")
     parser.add_argument("--filename_template", default="zimage_{seed}_{idx:03d}.png")
+    # Optional: explicit attention-slicing flag from UI / caller.
+    parser.add_argument("--attn-slicing", action="store_true", default=False)
     args = parser.parse_args(argv)
 
     try:
@@ -49,17 +67,6 @@ def main(argv=None) -> int:
         from diffusers import ZImagePipeline  # type: ignore
     except Exception as e:
         payload = {"files": [], "error": f"import_failed: {e}"}
-        print(json.dumps(payload))
-        return 1
-
-    # Resolve root + model dir
-    try:
-        root_dir = Path(__file__).resolve().parents[1]
-    except Exception:
-        root_dir = Path(".").resolve()
-    model_dir = root_dir / "models" / "Z-Image-Turbo"
-    if not model_dir.exists():
-        payload = {"files": [], "error": f"model_not_found: {model_dir}"}
         print(json.dumps(payload))
         return 1
 
@@ -80,14 +87,73 @@ def main(argv=None) -> int:
         dtype = torch.float32
         device = "cpu"
 
+
+    # Simple VRAM-based heuristic for low-VRAM GPUs: treat GPUs with
+    # less than ~16 GiB as low-VRAM and default to attention slicing.
+    auto_low_vram = False
     try:
+        if device == "cuda" and hasattr(torch, "cuda"):
+            props = torch.cuda.get_device_properties(0)
+            total_gib = float(getattr(props, "total_memory", 0)) / float(1024 ** 3)
+            if total_gib < 16.0:
+                auto_low_vram = True
+    except Exception:
+        auto_low_vram = False
+
+    # Resolve LOCAL model directory: <root>/models/Z-Image-Turbo
+    try:
+        script_path = Path(__file__).resolve()
+        root = script_path.parents[1]  # helpers/ -> project root
+        model_dir = root / "models" / "Z-Image-Turbo"
+    except Exception:
+        model_dir = Path("models/Z-Image-Turbo")
+
+    # Load pipeline from LOCAL directory only, no HF cache/network.
+    try:
+        if not model_dir.exists():
+            raise RuntimeError(f"model_dir_not_found: {model_dir}")
+
         pipe = ZImagePipeline.from_pretrained(
             str(model_dir),
-            torch_dtype=dtype,
-            low_cpu_mem_usage=False,
+            torch_dtype=dtype if device == "cuda" else torch.float32,
+            low_cpu_mem_usage=True,
             local_files_only=True,
         )
-        pipe = pipe.to(device)
+
+        if device == "cuda":
+            # Prefer Diffusers' CPU offload to keep VRAM reasonable.
+            used_offload = False
+            try:
+                pipe.enable_model_cpu_offload()
+                used_offload = True
+            except Exception:
+                used_offload = False
+
+            if not used_offload:
+                # Fallback: move entire pipeline to CUDA if offload is unavailable.
+                pipe.to(device)
+
+            # Extra memory tweaks (safe no-ops if unsupported)
+            try:
+                if hasattr(pipe, "enable_vae_slicing"):
+                    pipe.enable_vae_slicing()
+            except Exception:
+                pass
+
+            # Attention slicing: reduce VRAM by splitting attention into smaller
+            # chunks. We enable this automatically on low-VRAM GPUs (auto_low_vram)
+            # and whenever the caller passes --attn-slicing from the UI.
+            try:
+                want_attn_slicing = bool(getattr(args, "attn_slicing", False) or auto_low_vram)
+            except Exception:
+                want_attn_slicing = auto_low_vram
+            try:
+                if want_attn_slicing and hasattr(pipe, "enable_attention_slicing"):
+                    pipe.enable_attention_slicing("max")
+            except Exception:
+                pass
+
+        # Turn off safety checker if present to save a bit of memory.
         try:
             if hasattr(pipe, "safety_checker"):
                 pipe.safety_checker = None
@@ -95,8 +161,13 @@ def main(argv=None) -> int:
                 pipe.requires_safety_checker = False
         except Exception:
             pass
+
     except Exception as e:
-        payload = {"files": [], "error": f"load_failed: {e}", "trace": traceback.format_exc()}
+        payload = {
+            "files": [],
+            "error": f"load_failed: {e}",
+            "trace": traceback.format_exc(),
+        }
         print(json.dumps(payload))
         return 1
 
@@ -123,7 +194,7 @@ def main(argv=None) -> int:
             gen = None
 
         try:
-            result = pipe(
+            kwargs = dict(
                 prompt=args.prompt,
                 height=int(args.height),
                 width=int(args.width),
@@ -131,9 +202,17 @@ def main(argv=None) -> int:
                 guidance_scale=float(args.guidance or 0.0),
                 generator=gen,
             )
+            neg = (args.negative or "").strip()
+            if neg:
+                kwargs["negative_prompt"] = neg
+            result = pipe(**kwargs)
             img = result.images[0]
         except Exception as e:
-            payload = {"files": files, "error": f"generate_failed: {e}", "trace": traceback.format_exc()}
+            payload = {
+                "files": files,
+                "error": f"generate_failed: {e}",
+                "trace": traceback.format_exc(),
+            }
             print(json.dumps(payload))
             return 1
 
@@ -155,7 +234,11 @@ def main(argv=None) -> int:
         try:
             img.save(str(fpath))
         except Exception as e:
-            payload = {"files": files, "error": f"save_failed: {e}", "trace": traceback.format_exc()}
+            payload = {
+                "files": files,
+                "error": f"save_failed: {e}",
+                "trace": traceback.format_exc(),
+            }
             print(json.dumps(payload))
             return 1
 
