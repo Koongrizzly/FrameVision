@@ -38,7 +38,7 @@ REM >>> FRAMEVISION_QWEN_BEGIN
 :QWEN_TOOL_PROMPT
 echo.
 echo Select VRAM tier for Qwen (TXT->IMG):
-echo   1^) 6-8 GB  (Q3_K_M)
+echo   1^) 6 -8 GB  (Q3_K_M)
 echo   2^) 12-24 GB (Q4_K_M)
 set /p TIER=Enter choice 1-2 (or leave blank to cancel): 
 if "%TIER%"=="1" goto QWEN_TOOL_Q3
