@@ -71,6 +71,8 @@ from PySide6.QtWidgets import (
     QListWidget,
     QListWidgetItem,
 )
+from PySide6.QtGui import QIcon
+from .visual_thumbs import VisualThumbManager
 
 
 
@@ -775,6 +777,7 @@ def build_timeline(
     impact_fire_multi_intensity: float = 0.8,
     image_sources: Optional[List[ClipSource]] = None,
     section_overrides: Optional[Dict[int, ClipSource]] = None,
+    image_segment_interval: int = 0,
 ) -> List[TimelineSegment]:
 
 
@@ -1445,6 +1448,17 @@ def build_timeline(
 
     segments: List[TimelineSegment] = []
 
+    # User-controlled pacing for still images: how many segments between image inserts.
+    try:
+        image_interval = int(image_segment_interval or 0)
+    except Exception:
+        image_interval = 0
+    if image_interval < 0:
+        image_interval = 0
+    image_index = 0
+    segments_since_image = 0
+
+
     # Smart energy-aware pacing:
     # In calm regions (few / widely spaced beats or low-energy sections),
     # we prefer longer shots so the video can breathe instead of cutting
@@ -1548,15 +1562,28 @@ def build_timeline(
                 clip_start = max(0.0, offset)
                 section_override_offsets[sec_idx] = offset + seg_len
         elif image_sources:
-            # Occasionally pick a random image (15%% chance) when no override
-            # is assigned for this section.
-            if random.random() < 0.15:
-                source = random.choice(image_sources)
-                clip_path = source.path
-                clip_start = 0.0  # Images have no "start" in file
-                use_image = True
+            # Deterministic pacing for still images based on the user slider.
+            # If image_interval <= 0, fall back to the previous random behaviour.
+            if image_interval > 0 and image_sources:
+                if segments_since_image >= max(1, image_interval) - 1:
+                    source = image_sources[image_index % len(image_sources)]
+                    image_index += 1
+                    clip_path = source.path
+                    clip_start = 0.0  # Images have no "start" in file
+                    use_image = True
+                    segments_since_image = 0
+                else:
+                    clip_path, clip_start = pick_region(seg_len)
+                    segments_since_image += 1
             else:
-                clip_path, clip_start = pick_region(seg_len)
+                # Legacy ~15%% random image insert behaviour.
+                if image_sources and random.random() < 0.15:
+                    source = random.choice(image_sources)
+                    clip_path = source.path
+                    clip_start = 0.0  # Images have no "start" in file
+                    use_image = True
+                else:
+                    clip_path, clip_start = pick_region(seg_len)
         else:
             clip_path, clip_start = pick_region(seg_len)
 
@@ -2205,8 +2232,18 @@ class RenderWorker(QThread):
                         w, h = self.target_resolution
                     except Exception:
                         w, h = 1920, 1080
+                    # Match zoom duration to the segment length so the image animates for the full segment.
+                    try:
+                        seg_dur = float(getattr(seg, "duration", 0.0) or 0.0)
+                    except Exception:
+                        seg_dur = 0.0
+                    if seg_dur <= 0.0:
+                        seg_dur = 2.5  # sensible fallback
+                    kb_frames = max(1, int(seg_dur * 30.0))
                     zoom_dir = "zoom+0.0025" if random.random() < 0.5 else "zoom-0.0025"
-                    vf_parts.append(f"zoompan=z='{zoom_dir}':d=75:s={w}x{h}:fps=30")  # Longer zoom duration (75 frames ~2.5s at 30fps)
+                    vf_parts.append(
+                        f"zoompan=z='{zoom_dir}':d={kb_frames}:s={w}x{h}:fps=30"
+                    )
 
                 # Segment-level FX (per-segment visual styles)
                 if seg.effect == "zoom":
@@ -2795,17 +2832,31 @@ class RenderWorker(QThread):
                             continue
                         # If we couldn't build a valid mosaic, fall back to standard rendering.
 
-                base_cmd = [
-                    self.ffmpeg,
-                    "-y",
-                    "-i",
-                    seg.clip_path,
-                    "-ss",
-                    f"{seg.clip_start:.3f}",
-                    "-t",
-                    f"{seg.duration:.3f}",
-                    "-an",
-                ]
+                # For still images, loop the single frame so it lasts the full segment duration.
+                if getattr(seg, "is_image", False):
+                    base_cmd = [
+                        self.ffmpeg,
+                        "-y",
+                        "-loop",
+                        "1",
+                        "-t",
+                        f"{seg.duration:.3f}",
+                        "-i",
+                        seg.clip_path,
+                        "-an",
+                    ]
+                else:
+                    base_cmd = [
+                        self.ffmpeg,
+                        "-y",
+                        "-i",
+                        seg.clip_path,
+                        "-ss",
+                        f"{seg.clip_start:.3f}",
+                        "-t",
+                        f"{seg.duration:.3f}",
+                        "-an",
+                    ]
 
                 # Common encoding settings
                 encode_args = [
@@ -3141,11 +3192,18 @@ class RenderWorker(QThread):
                             # Use ffmpeg's generic 'enable' expression on the overlay
                             # so visuals are skipped entirely during disabled ranges.
                             enable_clause = f":enable='{enable_expr}'"
-
                         filter_str = (
-                            "[1:v]format=rgba,colorchannelmixer=aa=%(alpha)0.2f[viz];"
+                            "[1:v]"
+                            "scale=%(w)d:%(h)d:force_original_aspect_ratio=decrease,"
+                            "pad=%(w)d:%(h)d:(ow-iw)/2:(oh-ih)/2:black,"
+                            "format=rgba,colorchannelmixer=aa=%(alpha)0.2f[viz];"
                             "[0:v][viz]overlay=0:0:shortest=1%(enable)s"
-                            % {"alpha": alpha, "enable": enable_clause}
+                            % {
+                                "w": int(vw),
+                                "h": int(vh),
+                                "alpha": alpha,
+                                "enable": enable_clause,
+                            }
                         )
 
                         cmd = [
@@ -3221,6 +3279,8 @@ class AutoMusicSyncWidget(QWidget):
         self._pending_out_dir: Optional[str] = None
         self.clip_sources = []
         self.image_sources = []  # List for loaded images
+        # User-controlled interval (number of segments) between still images
+        self.image_segment_interval = 4
         # Optional per-section media overrides chosen from the timeline tab
         self._section_media: Dict[int, ClipSource] = {}
         # Enabled transition styles for randomization (indices of combo_transitions)
@@ -3234,6 +3294,8 @@ class AutoMusicSyncWidget(QWidget):
         self.visual_overlay_opacity = 0.25
         # Settings for remembering last paths & options
         self._settings = QSettings("FrameVision", "MusicClipCreator")
+        # Manager for per-visual thumbnails (lazy-generated real previews)
+        self._visual_thumbs = VisualThumbManager(self, ffmpeg=self._ffmpeg)
 
         self._build_ui()
         self._load_settings()
@@ -3285,6 +3347,24 @@ class AutoMusicSyncWidget(QWidget):
         row_clips.addWidget(btn_load_images)
         btn_load_images.clicked.connect(self._on_load_images)
         form.addRow("Loaded sources:", row_clips)
+
+        # Slider: how many segments between still images
+        row_img_interval = QHBoxLayout()
+        self.label_image_interval = QLabel("New image every 4 segments", self)
+        self.slider_image_interval = QSlider(Qt.Horizontal, self)
+        self.slider_image_interval.setMinimum(2)
+        self.slider_image_interval.setMaximum(20)
+        self.slider_image_interval.setSingleStep(1)
+        self.slider_image_interval.setPageStep(2)
+        self.slider_image_interval.setValue(4)
+        self.slider_image_interval.setToolTip(
+            "How many segments to wait before switching to a new still image.\\n"
+            "2 = very frequent image changes, 20 = very rare."
+        )
+        self.slider_image_interval.valueChanged.connect(self._on_image_interval_changed)
+        row_img_interval.addWidget(self.label_image_interval)
+        row_img_interval.addWidget(self.slider_image_interval, 1)
+        form.addRow("", row_img_interval)
 
         self.list_sources = QListWidget(self)
         form.addRow("", self.list_sources)
@@ -4493,6 +4573,7 @@ class AutoMusicSyncWidget(QWidget):
         ]
 
         current = getattr(self, "_visual_section_overrides", {}) or {}
+        manager = getattr(self, "_visual_thumbs", None)
 
         dlg = QDialog(self)
         dlg.setWindowTitle("Select visuals per section type")
@@ -4504,6 +4585,80 @@ class AutoMusicSyncWidget(QWidget):
         , dlg)
         info.setWordWrap(True)
         layout.addWidget(info)
+
+        # Main content area: section rows on the left, large preview on the right.
+        main_row = QHBoxLayout()
+        layout.addLayout(main_row)
+
+        left_col = QVBoxLayout()
+        main_row.addLayout(left_col, 1)
+
+        right_col = QVBoxLayout()
+        main_row.addLayout(right_col)
+
+        preview_title = QLabel("Preview:", dlg)
+        right_col.addWidget(preview_title)
+
+        preview_label = QLabel(
+            "Hover over a visual in the list\n"
+            "to see a larger preview here.",
+            dlg,
+        )
+        preview_label.setAlignment(Qt.AlignCenter)
+        preview_label.setWordWrap(True)
+        preview_label.setMinimumSize(320, 180)
+        preview_label.setStyleSheet(
+            "background-color: rgba(0, 0, 0, 80);"
+            "border: 1px solid rgba(255, 255, 255, 60);"
+        )
+        right_col.addWidget(preview_label)
+
+        def _make_preview_updater(combo: QComboBox):
+            """Create a slot that updates the large preview when the combo changes.
+
+            We rely on VisualThumbManager.preview_pixmap_for_mode to reuse the
+            existing tiny thumbnail on disk and simply scale it up. No new
+            thumbnails are written.
+            """
+            def _update(index: int) -> None:
+                if preview_label is None:
+                    return
+
+                # Guard against weird indices or missing items.
+                try:
+                    data = combo.itemData(index)
+                    text = combo.itemText(index)
+                except Exception:
+                    data = None
+                    text = ""
+                if not text:
+                    text = "Random visual"
+
+                # Random / none entry: text-only hint.
+                if not isinstance(data, str) or not data:
+                    preview_label.clear()
+                    preview_label.setText(
+                        f"{text}\n(uses any installed preset)."
+                    )
+                    return
+
+                # Ask the manager for a larger pixmap based on the existing thumb.
+                pm = None
+                if manager is not None:
+                    try:
+                        pm = manager.preview_pixmap_for_mode(str(data))
+                    except Exception:
+                        pm = None
+
+                if pm is None or getattr(pm, "isNull", lambda: True)():
+                    preview_label.clear()
+                    preview_label.setText(text)
+                    return
+
+                preview_label.setPixmap(pm)
+                preview_label.setText("")
+
+            return _update
 
         row_widgets = []  # (section_key, combo, checkbox)
         for key, label_text in sections:
@@ -4519,7 +4674,16 @@ class AutoMusicSyncWidget(QWidget):
                 pretty = str(m)
                 if pretty.startswith("viz:"):
                     pretty = pretty[4:]
-                combo.addItem(pretty, m)
+                icon = QIcon()
+                if manager is not None:
+                    try:
+                        icon = manager.icon_for_mode(str(m))
+                    except Exception:
+                        icon = QIcon()
+                if icon.isNull():
+                    combo.addItem(pretty, m)
+                else:
+                    combo.addItem(icon, pretty, m)
 
             override = current.get(key)
             if isinstance(override, str) and override:
@@ -4545,7 +4709,15 @@ class AutoMusicSyncWidget(QWidget):
 
             chk.toggled.connect(_make_toggle(combo, chk))
 
-            layout.addLayout(row)
+            update_preview = _make_preview_updater(combo)
+            combo.currentIndexChanged.connect(update_preview)
+            try:
+                combo.highlighted.connect(update_preview)
+            except Exception:
+                # Some very old Qt builds may not support highlighted().
+                pass
+
+            left_col.addLayout(row)
             row_widgets.append((key, combo, chk))
 
         buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel, dlg)
@@ -4567,6 +4739,26 @@ class AutoMusicSyncWidget(QWidget):
 
         self._visual_section_overrides = overrides
         self._update_visual_section_summary()
+
+
+
+    def _on_image_interval_changed(self, value: int) -> None:
+        """Update label + internal setting for the still-image segment interval slider."""
+        try:
+            v = int(value)
+        except Exception:
+            v = int(getattr(self, "image_segment_interval", 4) or 4)
+        if v < 2:
+            v = 2
+        if v > 20:
+            v = 20
+        self.image_segment_interval = v
+        label = getattr(self, "label_image_interval", None)
+        if label is not None:
+            try:
+                label.setText(f"New image every {v} segments")
+            except Exception:
+                pass
 
 
     def _on_visual_opacity_slider_changed(self, value: int) -> None:
@@ -5067,6 +5259,27 @@ class AutoMusicSyncWidget(QWidget):
         self.slider_sens.setValue(int(s.value("beat_sensitivity", self.slider_sens.value())))
         self.spin_beats_per_seg.setValue(int(s.value("beats_per_segment", self.spin_beats_per_seg.value())))
 
+        # Restore still-image segment interval (segments per image)
+        try:
+            interval = int(s.value("image_segment_interval", int(getattr(self, "image_segment_interval", 4))))
+        except Exception:
+            interval = int(getattr(self, "image_segment_interval", 4))
+        if interval < 2:
+            interval = 2
+        if interval > 20:
+            interval = 20
+        self.image_segment_interval = interval
+        slider = getattr(self, "slider_image_interval", None)
+        if slider is not None:
+            try:
+                slider.blockSignals(True)
+                slider.setMinimum(2)
+                slider.setMaximum(20)
+                slider.setValue(interval)
+            finally:
+                slider.blockSignals(False)
+        self._on_image_interval_changed(interval)
+
         self.check_min_clip.setChecked(bool(int(s.value("min_clip_enabled", int(self.check_min_clip.isChecked())))))
         self.spin_min_clip.setValue(float(s.value("min_clip_seconds", self.spin_min_clip.value())))
 
@@ -5253,6 +5466,8 @@ class AutoMusicSyncWidget(QWidget):
 
         s.setValue("beat_sensitivity", self.slider_sens.value())
         s.setValue("beats_per_segment", self.spin_beats_per_seg.value())
+        s.setValue("image_segment_interval", int(getattr(self, "image_segment_interval", 4)))
+
 
         s.setValue("min_clip_enabled", int(self.check_min_clip.isChecked()))
         s.setValue("min_clip_seconds", float(self.spin_min_clip.value()))
@@ -6379,6 +6594,7 @@ class AutoMusicSyncWidget(QWidget):
             impact_fire_multi_intensity=impact_fire_multi_intensity,
             image_sources=self.image_sources,
             section_overrides=self._section_media,
+            image_segment_interval=int(getattr(self, "image_segment_interval", 0) or 0),
         )
         if not segments:
             self._error("Timeline empty", "Failed to build a video timeline.")

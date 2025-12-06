@@ -563,6 +563,22 @@ class Wan22Pane(QWidget):
         frames_widget = QWidget()
         frames_widget.setLayout(frames_row)
         form.addRow("", frames_widget)
+        # T5 text encoder CPU offload + model offload controls (below frames/extend)
+        t5_offload_row = QHBoxLayout()
+        self.chk_t5_cpu = QCheckBox("T5 on CPU")
+        self.chk_t5_cpu.setToolTip(
+            "Offload the WAN 2.2 text encoder (T5) to CPU to reduce VRAM usage. Helpful on 8–12GB GPUs. Slower when enabled."
+        )
+        self.chk_offload_model = QCheckBox("Offload model")
+        self.chk_offload_model.setToolTip(
+            "When enabled, Wan 2.2 will offload the main model weights to CPU during sampling (if supported by generate.py)."
+        )
+        t5_offload_row.addWidget(self.chk_t5_cpu)
+        t5_offload_row.addWidget(self.chk_offload_model)
+        t5_offload_row.addStretch(1)
+        t5_offload_widget = QWidget()
+        t5_offload_widget.setLayout(t5_offload_row)
+        form.addRow("", t5_offload_widget)
 
         # Output path (optional – Wan2.2 can also auto-name)
         out_row = QHBoxLayout()
@@ -787,11 +803,6 @@ class Wan22Pane(QWidget):
         self.chk_use_queue = QCheckBox("Use queue")
         self.chk_use_queue.setToolTip("Tip : Always use queue if you want to do more then one job in the app")
 
-        # Text encoder (T5) CPU offload toggle (helps lower VRAM GPUs)
-        self.chk_t5_cpu = QCheckBox("T5 on CPU")
-        self.chk_t5_cpu.setChecked(False)
-        self.chk_t5_cpu.setToolTip("Offload the WAN 2.2 text encoder (T5) to CPU to reduce VRAM usage. Helpful on 8–12GB GPUs. Slower when enabled.")
-
         # Use Current button: grab current frame from Media Player
         self.btn_use_current = QPushButton("Use Current")
         self.btn_use_current.setToolTip(
@@ -834,7 +845,6 @@ class Wan22Pane(QWidget):
         btn_row.addWidget(self.btn_run)
         btn_row.addWidget(self.btn_play_last)
         btn_row.addWidget(self.chk_use_queue)
-        btn_row.addWidget(self.chk_t5_cpu)
         btn_row.addWidget(self.btn_use_current)
         btn_row.addStretch(1)
         layout.addLayout(btn_row)
@@ -912,6 +922,10 @@ class Wan22Pane(QWidget):
             self.chk_use_queue.toggled.connect(self._save_settings)
         if getattr(self, "chk_use_nvenc", None):
             self.chk_use_nvenc.toggled.connect(self._save_settings)
+        if getattr(self, "chk_t5_cpu", None):
+            self.chk_t5_cpu.toggled.connect(self._save_settings)
+        if getattr(self, "chk_offload_model", None):
+            self.chk_offload_model.toggled.connect(self._save_settings)
         # Recent results controls
         if getattr(self, "sld_thumb_size", None):
             self.sld_thumb_size.valueChanged.connect(self._save_settings)
@@ -954,6 +968,7 @@ class Wan22Pane(QWidget):
                 "output_path": self.ed_out.text(),
                 "use_queue": bool(getattr(self, "chk_use_queue", None) and self.chk_use_queue.isChecked()),
                 "t5_cpu": bool(getattr(self, "chk_t5_cpu", None) and self.chk_t5_cpu.isChecked()),
+                "offload_model": bool(getattr(self, "chk_offload_model", None) and self.chk_offload_model.isChecked()),
                 "use_nvenc": bool(getattr(self, "chk_use_nvenc", None) and self.chk_use_nvenc.isChecked()),
                 "thumb_size": int(self.sld_thumb_size.value()) if getattr(self, "sld_thumb_size", None) else 100,
                 "recent_sort": (
@@ -1077,6 +1092,8 @@ class Wan22Pane(QWidget):
             self.chk_use_queue.setChecked(bool(settings["use_queue"]))
         if "t5_cpu" in settings and getattr(self, "chk_t5_cpu", None):
             self.chk_t5_cpu.setChecked(bool(settings["t5_cpu"]))
+        if "offload_model" in settings and getattr(self, "chk_offload_model", None):
+            self.chk_offload_model.setChecked(bool(settings["offload_model"]))
         if "use_nvenc" in settings and getattr(self, "chk_use_nvenc", None):
             self.chk_use_nvenc.setChecked(bool(settings["use_nvenc"]))
 
