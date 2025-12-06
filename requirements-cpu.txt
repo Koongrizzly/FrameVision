@@ -1,4 +1,4 @@
-# FrameVision — Describer (Qwen2‑VL) — CPU only
+# FrameVision — Describer (Qwen3‑VL) — attempt for CPU only
 # Uses CPU wheels from PyTorch index.
 --extra-index-url https://download.pytorch.org/whl/cpu
 
