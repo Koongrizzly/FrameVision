@@ -1,7 +1,7 @@
 import os
 from pathlib import Path
 def default_outdir(is_video: bool=False, purpose: str='upscale') -> str:
-    base = Path('.').resolve()
+    base = _base_root()
     if purpose == 'rife':
         d = base / 'output' / 'video' / 'interpolated'
     elif purpose == 'wan22':
@@ -10,9 +10,21 @@ def default_outdir(is_video: bool=False, purpose: str='upscale') -> str:
         d = base / 'output' / ('video' if is_video else 'photo') / 'upscaled'
     d.mkdir(parents=True, exist_ok=True)
     return str(d)
+
 def _base_root():
-    root = Path('.').resolve()
-    return root
+    """Return a stable project root.
+
+    We try to anchor relative paths to the repository/app root
+    by inferring it from this file location when possible.
+    """
+    try:
+        here = Path(__file__).resolve()
+        parent = here.parent
+        if parent.name.lower() == "helpers":
+            return parent.parent
+        return parent
+    except Exception:
+        return Path('.').resolve()
 
 def _read_last_input_path():
     try:

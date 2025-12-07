@@ -421,9 +421,9 @@ class Wan22Pane(QWidget):
             "480*832",
             "896*512",
             "512*896",
-            "912*528",
+            "928*528",
             "960*544",
-            "1024*704"
+            "1024*704",            
             "1280*704",    # Landscape 704p (primary)
             "704*1280",    # Portrait 704p              
         ])
@@ -506,7 +506,7 @@ class Wan22Pane(QWidget):
         self.spn_frames.setToolTip("Number of frames in the generated video")
 
         self.spn_fps = QSpinBox()
-        self.spn_fps.setRange(1, 60)
+        self.spn_fps.setRange(15, 30)
         self.spn_fps.setValue(24)
         self.spn_fps.setToolTip("Frames per second. Affects video smoothness and duration")
 
@@ -552,6 +552,10 @@ class Wan22Pane(QWidget):
         # First row: frames + img-batch + text2video batch controls
         frames_row.addWidget(QLabel("Frames:"))
         frames_row.addWidget(self.spn_frames)
+        frames_row.addSpacing(8)
+        frames_row.addWidget(QLabel("FPS:"))
+        frames_row.addWidget(self.spn_fps)
+        frames_row.addSpacing(8)
         frames_row.addWidget(self.btn_img_batch)
         frames_row.addSpacing(12)
         self.lbl_batch = QLabel("Batch:")

@@ -889,6 +889,10 @@ def build_timeline(
 
         # Apply final slow factors
         for idx, seg in enumerate(segments):
+            # Images should not participate in slow-motion timing; keep them stable.
+            if getattr(seg, "is_image", False):
+                seg.slow_factor = 1.0
+                continue
             if slow_flags[idx]:
                 seg.slow_factor = float(slow_motion_factor or 1.0)
             else:
@@ -958,17 +962,36 @@ def build_timeline(
                 if not idx_list:
                     continue
                 # One cinematic event per 5-second block at most.
-                seg_idx = random.choice(idx_list)
-                seg = segments[seg_idx]
                 effect_name = random.choice(enabled_effects)
+
+                # Avoid applying time-warping or multi-clip cinematic effects to still images.
+                # Images already have their own motion language (Ken Burns / camera hits),
+                # and time-altering filters can break segment duration assumptions.
+                time_sensitive = {
+                    "freeze",
+                    "stutter",
+                    "reverse",
+                    "speedup_forward",
+                    "speedup_backward",
+                    "boomerang",
+                    "mosaic",
+                    "multiply",
+                }
+                candidates = idx_list
+                if effect_name in time_sensitive:
+                    non_img = [i for i in idx_list if not getattr(segments[i], "is_image", False)]
+                    if non_img:
+                        candidates = non_img
+
+                seg_idx = random.choice(candidates)
+                seg = segments[seg_idx]
                 if effect_name == "freeze":
                     seg.cine_freeze = True
                     seg.cine_freeze_len = float(max(0.10, min(1.0, cine_freeze_len)))
                     # Clamp zoom factor to a safe 0.0–0.5 range (0–50%% punch-in).
                     seg.cine_freeze_zoom = float(max(0.0, min(0.5, cine_freeze_zoom)))
-                    # Optionally clamp the logical segment duration to the freeze window
-                    # so the pacing stays snappy.
-                    seg.duration = min(seg.duration, seg.cine_freeze_len)
+                    # Preserve the musical segment duration; the renderer will
+                    # handle the freeze hit without shortening the segment.
                 elif effect_name == "stutter":
                     seg.cine_stutter = True
                     seg.cine_stutter_repeats = int(max(2, min(5, cine_stutter_repeats)))
@@ -1150,6 +1173,8 @@ def build_timeline(
         # Speed ramps: tag all slow-motion segments (slow_factor != 1.0) when enabled.
         if cine_speed_ramp and slow_motion_enabled:
             for seg in segments:
+                if getattr(seg, "is_image", False):
+                    continue
                 if float(getattr(seg, "slow_factor", 1.0)) != 1.0:
                     seg.cine_speed_ramp = True
                     seg.cine_ramp_in = float(max(0.05, min(0.60, cine_ramp_in)))
@@ -3077,15 +3102,18 @@ class RenderWorker(QThread):
 
                 # For still images, loop the single frame so it lasts the full segment duration.
                 if getattr(seg, "is_image", False):
+                    # Keep -t as an *output* option so any downstream timing filters
+                    # (e.g., accidental slow_factor tags) cannot change the final
+                    # segment length for still images.
                     base_cmd = [
                         self.ffmpeg,
                         "-y",
                         "-loop",
                         "1",
-                        "-t",
-                        f"{seg.duration:.3f}",
                         "-i",
                         seg.clip_path,
+                        "-t",
+                        f"{seg.duration:.3f}",
                         "-an",
                     ]
                 else:
@@ -4301,7 +4329,7 @@ class AutoMusicSyncWidget(QWidget):
         row_impact_confetti.addWidget(label_impact_confetti)
         self.slider_impact_confetti = QSlider(Qt.Horizontal, self.impact_options)
         self.slider_impact_confetti.setMinimum(10)
-        self.slider_impact_confetti.setMaximum(100)
+        self.slider_impact_confetti.setMaximum(150)
         self.slider_impact_confetti.setSingleStep(1)
         self.slider_impact_confetti.setValue(70)
         row_impact_confetti.addWidget(self.slider_impact_confetti, 1)
@@ -4937,6 +4965,13 @@ class AutoMusicSyncWidget(QWidget):
         )
         right_col.addWidget(preview_label)
 
+        btn_update_thumbs = QPushButton("Update thumbnails", dlg)
+        btn_update_thumbs.setToolTip(
+            "Regenerate thumbnail previews for all music-player visuals.\n"
+            "Note: On the first run this can take up to a minute to create all thumbnails."
+        )
+        right_col.addWidget(btn_update_thumbs)
+
         def _make_preview_updater(combo: QComboBox):
             """Create a slot that updates the large preview when the combo changes.
 
@@ -4998,16 +5033,10 @@ class AutoMusicSyncWidget(QWidget):
                 pretty = str(m)
                 if pretty.startswith("viz:"):
                     pretty = pretty[4:]
-                icon = QIcon()
-                if manager is not None:
-                    try:
-                        icon = manager.icon_for_mode(str(m))
-                    except Exception:
-                        icon = QIcon()
-                if icon.isNull():
-                    combo.addItem(pretty, m)
-                else:
-                    combo.addItem(icon, pretty, m)
+                # Icons are now applied on demand when the user clicks the
+                # "Update thumbnails" button. We avoid generating thumbnails
+                # automatically when opening this dialog.
+                combo.addItem(pretty, m)
 
             override = current.get(key)
             if isinstance(override, str) and override:
@@ -5043,6 +5072,54 @@ class AutoMusicSyncWidget(QWidget):
 
             left_col.addLayout(row)
             row_widgets.append((key, combo, chk))
+
+        def _on_update_thumbnails() -> None:
+            """Manually refresh thumbnail icons for all visuals.
+
+            This avoids any automatic thumbnail regeneration when opening
+            the dialog and lets the user trigger it only when needed.
+            """
+            if manager is None:
+                QMessageBox.information(
+                    dlg,
+                    "Thumbnails not available",
+                    "Thumbnail manager is not available in this build.",
+                    QMessageBox.Ok,
+                )
+                return
+
+            # Iterate over all combos and ask the manager for an icon
+            # for each visual preset. VisualThumbManager is responsible
+            # for reusing or regenerating cached thumbnails on disk.
+            for _key, combo, _chk in row_widgets:
+                # Index 0 is the 'Random visual' entry.
+                for i in range(1, combo.count()):
+                    data = combo.itemData(i)
+                    if not isinstance(data, str) or not data:
+                        continue
+                    try:
+                        icon = manager.icon_for_mode(str(data))
+                    except Exception:
+                        icon = QIcon()
+                    if not icon.isNull():
+                        try:
+                            combo.setItemIcon(i, icon)
+                        except Exception:
+                            # If we cannot set the icon for any reason,
+                            # continue with the remaining items.
+                            pass
+
+            # Optionally refresh the preview for the currently selected row.
+            try:
+                if row_widgets:
+                    first_combo = row_widgets[0][1]
+                    upd = _make_preview_updater(first_combo)
+                    upd(first_combo.currentIndex())
+            except Exception:
+                pass
+
+        btn_update_thumbs.clicked.connect(_on_update_thumbnails)
+
 
         buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel, dlg)
         layout.addWidget(buttons)

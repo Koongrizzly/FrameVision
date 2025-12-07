@@ -80,7 +80,11 @@ def run_cleanup(
     if clean_pyc:
         # Do not touch bytecode inside our virtual envs / extra env presets
         exclude_roots = [
-            (base / ".env"),
+            (base / ".venv"),
+            (base / ".ace_env"),
+            (base / "models"),
+            (base / ".comfy_env"),
+            (base / ".zimage_env"),
             (base / ".wan_env"),
             (base / "presets" / "extra_env"),
         ]

@@ -288,7 +288,7 @@ class Game:
         self.state = "START"  # START, RUN, PAUSE, GAMEOVER
         self.time_accum = 0.0
         self.power_fx_timer = 0.0  # radial burst effect after eating a power pellet
-        self.offscreen_timer = 0.0  # time Pac-Man has been completely off-screen
+        self.offscreen_timer = 0.0  # legacy tunnel timer (immediate wrap now used)
         self.level = 1
         self.score = 0
         self.lives = LIVES_START
@@ -298,6 +298,12 @@ class Game:
 
         self.tile, self.offx, self.offy = compute_tile()
         self.bg_surf, self.bg_path = random_bg(exclude=None)
+
+        # Precompute floor tiles Pac-Man can actually reach,
+        # so fruits / power-ups won't spawn in unreachable areas.
+        self.reachable_floor = self.compute_reachable_floor()
+        self.reachable_floor_list = list(self.reachable_floor)
+
 
         # Fruit & extra life systems
         self.fruits = []              # list of {'rc': (r,c), 'idx': int, 'points': int, 'ttl': float}
@@ -325,6 +331,23 @@ class Game:
         self.release_done = False
         self.reset_level(full=True)
 
+
+    def compute_reachable_floor(self):
+        """Compute walkable tiles reachable by Pac-Man from the start."""
+        start = PAC_START
+        if is_wall(start):
+            return set()
+        q = [start]
+        seen = {start}
+        while q:
+            r, c = q.pop(0)
+            for dr, dc in DIRS.values():
+                nr, nc = r + dr, c + dc
+                if 0 <= nr < MAZE_H and 0 <= nc < MAZE_W and not is_wall((nr, nc)):
+                    if (nr, nc) not in seen:
+                        seen.add((nr, nc))
+                        q.append((nr, nc))
+        return seen
 
     def rescale_bg(self):
         global WIDTH, HEIGHT, screen
@@ -418,17 +441,27 @@ class Game:
 
 
     def spawn_fruit(self):
-        # Spawn a single fruit (same rules as before) into self.fruits with its own TTL
+        # Spawn a single fruit into self.fruits with its own TTL.
+        pool = self.reachable_floor_list if getattr(self, 'reachable_floor_list', None) else None
         for _ in range(300):
-            r = random.randrange(MAZE_H); c = random.randrange(MAZE_W)
-            if is_wall((r, c)): continue
-            if manhattan((r, c), GHOST_START) <= 2: continue
-            if hasattr(self, 'pac') and (r, c) == self.pac.rc: continue
+            if pool:
+                r, c = random.choice(pool)
+            else:
+                r = random.randrange(MAZE_H); c = random.randrange(MAZE_W)
+            if is_wall((r, c)):
+                continue
+            if manhattan((r, c), GHOST_START) <= 2:
+                continue
+            if hasattr(self, 'pac') and (r, c) == self.pac.rc:
+                continue
+            if any(fr['rc'] == (r, c) for fr in self.fruits):
+                continue
             idx = self.choose_fruit_index()
             points = FRUIT_TYPES[idx]['points']
             ttl = 20.0 if points <= 200 else 15.0
             self.fruits.append({'rc': (r, c), 'idx': idx, 'points': points, 'ttl': ttl})
-            if points == 500: self.block_500_until_level = self.level + 4
+            if points == 500:
+                self.block_500_until_level = self.level + 4
             return True
         return False
 
@@ -470,14 +503,22 @@ class Game:
         types = ['GOOD_FRUITS', 'GOOD_SHIELD', 'GOOD_SCARE', 'BAD_EXTRA_GHOST', 'BAD_SLOW']
         t = random.choice(types)
         good = t.startswith('GOOD')
-        # pick location
+        # pick location (restricted to Pac-Man reachable tiles)
+        pool = self.reachable_floor_list if getattr(self, 'reachable_floor_list', None) else None
         for _ in range(300):
-            r = random.randrange(MAZE_H); c = random.randrange(MAZE_W)
-            if is_wall((r, c)): continue
-            if manhattan((r, c), GHOST_START) <= 2: continue
-            if hasattr(self, 'pac') and (r, c) == self.pac.rc: continue
+            if pool:
+                r, c = random.choice(pool)
+            else:
+                r = random.randrange(MAZE_H); c = random.randrange(MAZE_W)
+            if is_wall((r, c)):
+                continue
+            if manhattan((r, c), GHOST_START) <= 2:
+                continue
+            if hasattr(self, 'pac') and (r, c) == self.pac.rc:
+                continue
             # avoid overlapping fruits
-            if any(fr['rc']==(r,c) for fr in self.fruits): continue
+            if any(fr['rc'] == (r, c) for fr in self.fruits):
+                continue
             self.powerup = {'rc': (r, c), 'type': t, 'good': good, 'ttl': 15.0}
             return True
         return False
@@ -525,6 +566,27 @@ class Game:
         # Fallback: try PAC_START column if that row is blocked entirely
         fallback_c = PAC_START[1] if 0 <= PAC_START[1] < MAZE_W else MAZE_W//2
         return fallback_c
+
+    def wrap_mover_horiz(self, mover):
+        """Instant horizontal wrap for tunnel exits.
+
+        If a mover's column leaves the maze bounds, place it on the first
+        walkable tile at the opposite edge of the same row.
+
+        Returns True if a wrap occurred.
+        """
+        r, c = mover.rc
+        if c < 0:
+            target_c = self._find_edge_walkable(r, 'right')
+        elif c >= MAZE_W:
+            target_c = self._find_edge_walkable(r, 'left')
+        else:
+            return False
+
+        mover.rc = (r, target_c)
+        mover.to_rc = (r, target_c)
+        mover.progress = 0.0
+        return True
     def check_extra_life(self):
             # Grant extra lives at each 10,000 points milestone (stacking)
             while self.score >= self.next_extra:
@@ -714,23 +776,7 @@ class Game:
         # Apply speed modifiers continuously
         self.apply_speed_modifiers()
 
-        # Off-screen wrap
-        px, py = self.pac.pixel_pos(self.tile, self.offx, self.offy)
-        radius = self.tile // 2
-        outside = (px < -radius) or (px > WIDTH + radius) or (py < -radius) or (py > HEIGHT + radius)
-        if outside:
-            self.offscreen_timer += dt
-            if self.offscreen_timer >= 1.6:
-                side = 'left' if px < 0 else 'right'
-                row = self.pac.rc[0]
-                target_c = self._find_edge_walkable(row, 'right' if side == 'left' else 'left')
-                self.pac.rc = (row, target_c)
-                self.pac.to_rc = (row, target_c)
-                self.pac.progress = 0.0
-                self.offscreen_timer = 0.0
-        else:
-            self.offscreen_timer = 0.0
-
+        # Immediate horizontal wrapping is handled on tile arrival for Pac-Man and ghosts.
         # Level start timers
         if self.ready_timer > 0.0:
             self.ready_timer = max(0.0, self.ready_timer - dt)
@@ -791,6 +837,11 @@ class Game:
         # step Pac
         reached = self.pac.step(dt)
 
+        # Instant tunnel wrap for Pac-Man
+        if reached:
+            self.wrap_mover_horiz(self.pac)
+
+
         # Ghost movement
         gr, gc = self.gate_rc
         for g in self.ghosts:
@@ -810,13 +861,17 @@ class Game:
                                             if g.set_dir(d): break
                         else:
                             g.released_out = True
-                    g.step(dt)
+                    reached_g = g.step(dt)
+                    if reached_g:
+                        self.wrap_mover_horiz(g)
                 else:
                     if g.at_center():
                         nd = self.ghost_next_dir(g)
                         if nd:
                             g.set_dir(nd)
-                    g.step(dt)
+                    reached_g = g.step(dt)
+                    if reached_g:
+                        self.wrap_mover_horiz(g)
 
         # Tile arrival: pellets/power/fruit/powerup
         if reached:

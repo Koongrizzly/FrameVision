@@ -2726,6 +2726,40 @@ class Txt2ImgPane(QWidget):
         # Advanced (collapsed group)
         adv_body = QWidget()
         adv_form = QFormLayout(adv_body)
+        # Z-Image-only: Seed variance enhancer (UI-only; persists with settings)
+        self.seed_variance_panel = QWidget()
+        try:
+            self.seed_variance_panel.setObjectName("SeedVariancePanel")
+        except Exception:
+            pass
+        _sv_wrap = QVBoxLayout(self.seed_variance_panel)
+        try:
+            _sv_wrap.setContentsMargins(0, 0, 0, 0)
+            _sv_wrap.setSpacing(4)
+        except Exception:
+            pass
+        self.seed_variance_enable = QCheckBox("Seed variance enhancer")
+        self.seed_variance_strength = QSpinBox()
+        try:
+            self.seed_variance_strength.setRange(0, 100)
+            self.seed_variance_strength.setValue(30)
+        except Exception:
+            pass
+        _sv_row = QHBoxLayout()
+        try:
+            _sv_row.setContentsMargins(0, 0, 0, 0)
+        except Exception:
+            pass
+        try:
+            _sv_row.addWidget(QLabel("Strength"), 0)
+        except Exception:
+            pass
+        _sv_row.addWidget(self.seed_variance_strength, 0)
+        _sv_row.addStretch(1)
+        _sv_wrap.addWidget(self.seed_variance_enable)
+        _sv_wrap.addLayout(_sv_row)
+        adv_form.addRow(self.seed_variance_panel)
+
         self.sampler = QComboBox(); self.sampler.addItems(["auto","DPM++ 2M (Karras)","Euler a","Euler","Heun","UniPC","DDIM"])
         self.attn_slicing = QCheckBox("Attention slicing")
         self.vae_device = QComboBox(); self.vae_device.addItems(["auto","cpu","gpu"])
@@ -3119,6 +3153,14 @@ class Txt2ImgPane(QWidget):
         except Exception:
             pass
 
+        # Z-Image-only advanced options visibility
+        try:
+            svp = getattr(self, "seed_variance_panel", None)
+            if svp is not None:
+                svp.setVisible(bool(is_zimage))
+        except Exception:
+            pass
+
         # Adjust filename template depending on engine
         try:
             fname_edit = getattr(self, "filename_template", None)
@@ -3387,6 +3429,8 @@ class Txt2ImgPane(QWidget):
             "vae_device": self.vae_device.currentText(),
             "gpu_index": int(self.gpu_index.value()),
             "threads": int(self.threads.value()),
+            "seed_variance_enabled": bool(self.seed_variance_enable.isChecked()) if hasattr(self, "seed_variance_enable") else False,
+            "seed_variance_strength": int(self.seed_variance_strength.value()) if hasattr(self, "seed_variance_strength") else 0,
                         "format": self.format_combo.currentText(),
             "filename_template": fname,
 
@@ -3516,6 +3560,15 @@ class Txt2ImgPane(QWidget):
             if hasattr(self, 'vae_device'): self.vae_device.setCurrentText(str(s['vae_device'])) if 'vae_device' in s else None
             if hasattr(self, 'gpu_index'): self.gpu_index.setValue(int(s['gpu_index'])) if 'gpu_index' in s else None
             if hasattr(self, 'threads'): self.threads.setValue(int(s['threads'])) if 'threads' in s else None
+            try:
+                if hasattr(self, 'seed_variance_enable') and 'seed_variance_enabled' in s:
+                    try: self.seed_variance_enable.setChecked(bool(s.get('seed_variance_enabled')))
+                    except Exception: pass
+                if hasattr(self, 'seed_variance_strength') and 'seed_variance_strength' in s:
+                    try: self.seed_variance_strength.setValue(int(s.get('seed_variance_strength') or 0))
+                    except Exception: pass
+            except Exception:
+                pass
             if hasattr(self, 'format_combo'): self.format_combo.setCurrentText(str(s['format'])) if 'format' in s else None
             if hasattr(self, 'filename_template'): self.filename_template.setText(s['filename_template']) if 'filename_template' in s else None
             if hasattr(self, 'hires_helper'): self.hires_helper.setChecked(bool(s['hires_helper'])) if 'hires_helper' in s else None
@@ -3597,6 +3650,10 @@ class Txt2ImgPane(QWidget):
         try: d["gpu_index"] = int(self.gpu_index.value())
         except Exception: pass
         try: d["threads"] = int(self.threads.value())
+        except Exception: pass
+        try: d["seed_variance_enabled"] = bool(getattr(self, "seed_variance_enable", None).isChecked())
+        except Exception: pass
+        try: d["seed_variance_strength"] = int(getattr(self, "seed_variance_strength", None).value())
         except Exception: pass
         # Remember current engine (Z-Image / SDXL etc.) so we restore it on restart
         try:
@@ -3707,6 +3764,8 @@ class Txt2ImgPane(QWidget):
             (self.vae_device, 'currentIndexChanged'),
             (self.gpu_index, 'valueChanged'),
             (self.threads, 'valueChanged'),
+            (getattr(self,'seed_variance_enable', None), 'toggled'),
+            (getattr(self,'seed_variance_strength', None), 'valueChanged'),
             (self.format_combo, 'currentIndexChanged'),
             (self.filename_template, 'textChanged'),
             (self.hires_helper, 'toggled'),
@@ -4941,6 +5000,17 @@ try:
                 w = getattr(self, name, None)
                 if w is not None and "hires_helper" in s:
                     _set_checked(w, s.get("hires_helper"))
+                    break
+            # --- Seed variance restore (Z-Image advanced) ---
+            for name in ("seed_variance_enable", "seed_variance", "seedVariance"):
+                w = getattr(self, name, None)
+                if w is not None and "seed_variance_enabled" in s:
+                    _set_checked(w, s.get("seed_variance_enabled"))
+                    break
+            for name in ("seed_variance_strength", "seed_variance_amount", "seedVarianceStrength"):
+                w = getattr(self, name, None)
+                if w is not None and "seed_variance_strength" in s:
+                    _set_value(w, s.get("seed_variance_strength"))
                     break
             for name in ("format_combo", "formatBox", "file_format", "formatCombo"):
                 w = getattr(self, name, None)

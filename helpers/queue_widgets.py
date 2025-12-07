@@ -240,6 +240,8 @@ def install_queue_toggle_play_last(pane_widget, grid_layout, config: dict, save_
         pass
 
 class JobRowWidget(QWidget):
+    queueOrderChanged = Signal()
+
     def _themed_icon(self, theme_names: list[str], fallback_std) -> QIcon:
         try:
             for name in theme_names:
@@ -449,7 +451,7 @@ class JobRowWidget(QWidget):
         if self._status_from_fs() == "running" or self.status == "running":
             self.timer = QTimer(self)
             self.timer.timeout.connect(self.refresh)
-            self.timer.start(1000)
+            self.timer.start(2000)
 
                 # Enable custom context menu
         self.setContextMenuPolicy(Qt.DefaultContextMenu)
@@ -564,13 +566,83 @@ class JobRowWidget(QWidget):
         menu.exec(event.globalPos())
 
     # ---------- Queue operations (running/pending) ----------
+    def _fallback_base_root(self) -> Path:
+        try:
+            here = Path(__file__).resolve()
+            parent = here.parent
+            if parent.name.lower() == "helpers":
+                return parent.parent
+            return parent
+        except Exception:
+            return Path('.').resolve()
+
+    def _notify_queue_order_changed(self) -> None:
+        # Emit a local signal (optional hookup by QueuePane)
+        try:
+            self.queueOrderChanged.emit()
+        except Exception:
+            pass
+
+        # Try to trigger a rebuild/refresh on a parent widget or window.
+        candidates = (
+            "refresh_queue",
+            "rebuild_queue",
+            "rebuild_pending",
+            "refresh_pending",
+            "refresh_jobs",
+            "reload_queue",
+            "refresh_list",
+            "refresh",
+        )
+
+        def _try_call(obj):
+            for name in candidates:
+                fn = getattr(obj, name, None)
+                if callable(fn):
+                    try:
+                        fn()
+                        return True
+                    except Exception:
+                        continue
+            return False
+
+        try:
+            obj = self.parent()
+            seen = set()
+            while obj is not None and id(obj) not in seen:
+                seen.add(id(obj))
+                if _try_call(obj):
+                    return
+                try:
+                    obj = obj.parent()
+                except Exception:
+                    break
+        except Exception:
+            pass
+
+        try:
+            win = self.window()
+            if win is not None:
+                if _try_call(win):
+                    return
+        except Exception:
+            pass
+
+        # Last resort: request an update.
+        try:
+            pw = self.parentWidget()
+            if pw is not None:
+                pw.update()
+        except Exception:
+            pass
+
     def _jobs_dirs_safe(self):
         """Resolve jobs directories with a hard fallback."""
         try:
             from helpers.queue_adapter import jobs_dirs  # type: ignore
             return jobs_dirs()
         except Exception:
-            base = Path('.').resolve()
+            base = self._fallback_base_root()
             d = {k: base / 'jobs' / k for k in ('pending','running','done','failed')}
             for p in d.values():
                 try:
@@ -639,11 +711,33 @@ class JobRowWidget(QWidget):
             d = self._jobs_dirs_safe()
             pdir = Path(d.get("pending"))
             items = [p for p in pdir.glob("*.json") if p.is_file()]
-            # Oldest first (natural FIFO)
-            items.sort(key=lambda p: p.stat().st_mtime if p.exists() else 0.0)
+            # Oldest first (natural FIFO). Secondary key for stability.
+            items.sort(key=lambda p: (
+                p.stat().st_mtime if p.exists() else 0.0,
+                p.name
+            ))
             return items
         except Exception:
             return []
+
+    def _pending_index_of(self, items: list[Path], cur: Path) -> int:
+        if not items:
+            return -1
+        try:
+            cur_res = cur.resolve()
+        except Exception:
+            cur_res = cur
+
+        for i, p in enumerate(items):
+            if p == cur or p == cur_res:
+                return i
+
+        # Fallback: match by filename
+        for i, p in enumerate(items):
+            if p.name == cur.name:
+                return i
+
+        return -1
 
     def _set_mtime(self, p: Path, ts: float):
         try:
@@ -651,54 +745,54 @@ class JobRowWidget(QWidget):
         except Exception:
             pass
 
-    def _pending_swap_with(self, other: Path):
+    def _pending_swap_with(self, offset: int):
         try:
-            a = Path(self.job_path)
-            if not (a.exists() and other and other.exists()):
+            items = self._pending_jobs_sorted()
+            cur = Path(self.job_path)
+            i = self._pending_index_of(items, cur)
+            if i < 0:
                 return
-            ta = a.stat().st_mtime
-            tb = other.stat().st_mtime
+
+            j = i + int(offset)
+            if j < 0 or j >= len(items):
+                return
+
+            a = items[i]
+            b = items[j]
+
+            ta = a.stat().st_mtime if a.exists() else time.time()
+            tb = b.stat().st_mtime if b.exists() else time.time()
+
+            # Swap timestamps to reorder
             self._set_mtime(a, tb)
-            self._set_mtime(other, ta)
+            self._set_mtime(b, ta)
+
             self.refresh()
+            self._notify_queue_order_changed()
         except Exception:
             pass
 
     def _pending_move_up(self):
-        try:
-            items = self._pending_jobs_sorted()
-            cur = Path(self.job_path)
-            if cur not in items:
-                return
-            i = items.index(cur)
-            if i <= 0:
-                return
-            self._pending_swap_with(items[i-1])
-        except Exception:
-            pass
+        self._pending_swap_with(-1)
 
     def _pending_move_down(self):
-        try:
-            items = self._pending_jobs_sorted()
-            cur = Path(self.job_path)
-            if cur not in items:
-                return
-            i = items.index(cur)
-            if i >= len(items)-1:
-                return
-            self._pending_swap_with(items[i+1])
-        except Exception:
-            pass
+        self._pending_swap_with(+1)
 
     def _pending_move_top(self):
         try:
             items = self._pending_jobs_sorted()
             cur = Path(self.job_path)
-            if not items or cur not in items:
+            i = self._pending_index_of(items, cur)
+            if i < 0 or not items:
                 return
-            first_ts = items[0].stat().st_mtime if items[0].exists() else time.time()
+
+            first = items[0]
+            first_ts = first.stat().st_mtime if first.exists() else time.time()
+            # Push current slightly before the first item
             self._set_mtime(cur, first_ts - 10.0)
+
             self.refresh()
+            self._notify_queue_order_changed()
         except Exception:
             pass
 
@@ -706,16 +800,20 @@ class JobRowWidget(QWidget):
         try:
             items = self._pending_jobs_sorted()
             cur = Path(self.job_path)
-            if not items or cur not in items:
+            i = self._pending_index_of(items, cur)
+            if i < 0 or not items:
                 return
-            last_ts = items[-1].stat().st_mtime if items[-1].exists() else time.time()
+
+            last = items[-1]
+            last_ts = last.stat().st_mtime if last.exists() else time.time()
+            # Push current slightly after the last item
             self._set_mtime(cur, last_ts + 10.0)
+
             self.refresh()
+            self._notify_queue_order_changed()
         except Exception:
             pass
 
-
-# ---------- Internals ----------
     def _load_json_safely(self) -> None:
         try:
             txt = Path(self.job_path).read_text(encoding="utf-8")
