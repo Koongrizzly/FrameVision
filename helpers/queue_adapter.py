@@ -212,6 +212,17 @@ def enqueue_txt2img(job: dict) -> bool:
         base = {k: job.get(k) for k in keys if k in job}
         base["label"] = preview
 
+        # Avoid SDXL model name bleeding into Z-Image queue rows
+        try:
+            ek = str(job.get('engine') or '').lower().strip()
+            if ek == 'zimage':
+                base.pop('model_path', None)
+                base.setdefault('model_name', 'Z-Image-Turbo')
+                base.setdefault('model', 'Z-Image-Turbo')
+        except Exception:
+            pass
+
+
         # seeds fan-out
         batch = int(job.get("batch") or 1)
         seed0 = int(job.get("seed") or 0)
@@ -229,7 +240,7 @@ def enqueue_txt2img(job: dict) -> bool:
                 seeds = [seed0 for _ in range(batch)]
             items = [(s, base) for s in seeds]
 
-        prio = 550 if job.get("run_now") else 600
+        prio = 550 if job.get("run_now") else 650
         ok_all = True
         for s, base_args in items:
             args = dict(base_args)
@@ -243,7 +254,6 @@ def enqueue_txt2img(job: dict) -> bool:
         try: print("[queue] enqueue_txt2img failed:", e)
         except Exception: pass
         return False
-
 
 def enqueue_wan22_from_widget(inner) -> bool:
     """Read fields from Wan22Pane and enqueue a Wan 2.2 text/image-to-video job.

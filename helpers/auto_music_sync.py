@@ -384,15 +384,21 @@ class TimelineSegment:
     energy_class: str  # "low", "mid", "high"
     transition: str    # "none", "fade", "flashcut"
     slow_factor: float = 1.0  # 1.0 = normal speed, <1.0 = slow motion (video only)
-    # Cinematic one-off effects (freeze, stutter, reverse, ramp)
+    # Cinematic one-off effects (freeze, stutter, reverse, speedups, ramp)
     cine_freeze: bool = False
     cine_stutter: bool = False
     cine_reverse: bool = False
+    # Speedup hits (play the source forward/backwards faster and repeat if needed)
+    cine_speedup_forward: bool = False
+    cine_speedup_backward: bool = False
+    cine_speedup_forward_factor: float = 1.0
+    cine_speedup_backward_factor: float = 1.0
     cine_speed_ramp: bool = False
     cine_freeze_len: float = 0.0
     cine_freeze_zoom: float = 0.0
     cine_stutter_repeats: int = 0
     cine_reverse_len: float = 0.0
+    cine_reverse_window: float = 0.0
     cine_ramp_in: float = 0.0
     cine_ramp_out: float = 0.0
     cine_boomerang: bool = False
@@ -733,6 +739,10 @@ def build_timeline(
     cine_freeze: bool = False,
     cine_stutter: bool = False,
     cine_reverse: bool = False,
+    cine_speedup_forward: bool = False,
+    cine_speedup_forward_factor: float = 1.5,
+    cine_speedup_backward: bool = False,
+    cine_speedup_backward_factor: float = 1.5,
     cine_speed_ramp: bool = False,
     cine_freeze_len: float = 0.5,
     cine_freeze_zoom: float = 0.15,
@@ -886,7 +896,7 @@ def build_timeline(
 
 
     def _apply_cinematic_effects(segments: List[TimelineSegment]) -> None:
-        """Mark segments for rare cinematic effects (freeze, stutter, reverse, ramps).
+        """Mark segments for rare cinematic effects (freeze, stutter, reverse, speedups, ramps).
 
         The logic is intentionally conservative: for the freeze / stutter / reverse
         effects we pick at most one segment per 5 seconds of video timeline, and
@@ -908,6 +918,10 @@ def build_timeline(
             enabled_effects.append("stutter")
         if cine_reverse:
             enabled_effects.append("reverse")
+        if cine_speedup_forward:
+            enabled_effects.append("speedup_forward")
+        if cine_speedup_backward:
+            enabled_effects.append("speedup_backward")
         if cine_boomerang:
             enabled_effects.append("boomerang")
         # Mosaic uses the same 'one event per 5s' rule as the other cinematic effects.
@@ -961,9 +975,41 @@ def build_timeline(
                 elif effect_name == "reverse":
                     seg.cine_reverse = True
                     seg.cine_reverse_len = float(max(0.10, min(1.5, cine_reverse_len)))
-                    # Clamp segment duration to the reverse window so the slider
-                    # truly controls how long the reversed hit lasts.
-                    seg.duration = min(seg.duration, seg.cine_reverse_len)
+                    # Preserve the musical segment duration.
+                    # Store a dedicated short window for the reverse-bounce renderer.
+                    try:
+                        win = float(seg.cine_reverse_len or 0.0)
+                    except Exception:
+                        win = 0.0
+                    if win <= 0.0:
+                        win = 0.5
+                    try:
+                        base_len = float(getattr(seg, "duration", 0.0) or 0.0)
+                    except Exception:
+                        base_len = 0.0
+                    if base_len > 0.0:
+                        win = min(win, base_len)
+                    seg.cine_reverse_window = win
+                elif effect_name == "speedup_forward":
+                    seg.cine_speedup_forward = True
+                    try:
+                        factor = float(cine_speedup_forward_factor)
+                    except Exception:
+                        factor = 1.5
+                    factor = max(1.25, min(4.0, factor))
+                    seg.cine_speedup_forward_factor = factor
+                    # Reuse the shared speed pipeline.
+                    seg.slow_factor = factor
+                elif effect_name == "speedup_backward":
+                    seg.cine_speedup_backward = True
+                    try:
+                        factor = float(cine_speedup_backward_factor)
+                    except Exception:
+                        factor = 1.5
+                    factor = max(1.25, min(4.0, factor))
+                    seg.cine_speedup_backward_factor = factor
+                    seg.cine_reverse = True
+                    seg.slow_factor = factor
                 elif effect_name == "boomerang":
                     # Mark this segment as a boomerang loop and clamp the
                     # underlying clip region to the *first ~2 seconds* of the
@@ -977,15 +1023,18 @@ def build_timeline(
                     bounces = max(1, min(9, bounces))
                     seg.cine_boomerang_bounces = bounces
                     # Ensure the clip region used for this segment lives fully
-                    # inside the first 2 seconds of the source clip.
+                    # inside a short punchy window of the source clip, but do NOT
+                    # shrink the musical segment duration. We store a dedicated
+                    # boomerang window length for the renderer.
                     try:
                         max_window = 0.25  # use only the first ~0.25 second of the source clip for boomerang
-                        cur_dur = float(getattr(seg, "duration", 0.0) or 0.0)
+                        target_len = float(getattr(seg, "duration", 0.0) or 0.0)
+                        if target_len <= 0.0:
+                            target_len = 0.1
+                        cur_dur = min(target_len, max_window)
                         if cur_dur <= 0.0:
                             cur_dur = 0.1
-                        if cur_dur > max_window:
-                            cur_dur = max_window
-                        seg.duration = cur_dur
+                        setattr(seg, "cine_boomerang_window", cur_dur)
                         cur_start = float(getattr(seg, "clip_start", 0.0) or 0.0)
                         if cur_start < 0.0:
                             cur_start = 0.0
@@ -995,6 +1044,7 @@ def build_timeline(
                     except Exception:
                         # As a safety fallback, just pin to the absolute start.
                         try:
+                            setattr(seg, "cine_boomerang_window", 0.25)
                             seg.clip_start = 0.0
                         except Exception:
                             pass
@@ -1288,11 +1338,29 @@ def build_timeline(
 
         for seg_idx in sorted(set(chosen_indices)):
             seg = segments[seg_idx]
+
+            # Per‑segment enabled list: colour strobe ("confetti") is only used
+            # on segments that are at most 2 seconds long so the strobe stays snappy.
+            per_seg_enabled = list(enabled_effect_names)
+            try:
+                seg_len = float(getattr(seg, "duration", 0.0) or 0.0)
+            except Exception:
+                seg_len = 0.0
+            if seg_len > 2.0 and "confetti" in per_seg_enabled:
+                per_seg_enabled = [e for e in per_seg_enabled if e != "confetti"]
+
+            if not per_seg_enabled:
+                continue
+
             if impact_random:
-                eff_name = random.choice(enabled_effect_names)
+                eff_name = random.choice(per_seg_enabled)
             else:
-                eff_name = enabled_effect_names[eff_cursor % num_effects]
+                # Cycle deterministically through the global list, but fall back
+                # to the first allowed effect if the chosen one was filtered out.
+                base_name = enabled_effect_names[eff_cursor % num_effects]
                 eff_cursor += 1
+                eff_name = base_name if base_name in per_seg_enabled else per_seg_enabled[0]
+
             _tag_segment(seg, [eff_name])
 
 
@@ -1337,7 +1405,7 @@ def build_timeline(
     allowed_modes: List[int] = []
     if transition_modes_enabled:
         for m in transition_modes_enabled:
-            if 0 <= m <= 7 and m not in allowed_modes:
+            if 0 <= m <= 10 and m not in allowed_modes:
                 allowed_modes.append(m)
     if not allowed_modes:
         allowed_modes.append(transition_mode)
@@ -1657,6 +1725,9 @@ def build_timeline(
         # 5 = RGB split / chromatic aberration (legacy)
         # 6 = VHS noise + scanlines (legacy)
         # 7 = Motion blur boost (legacy)
+        # 8 = Directional push (slide-style motion)
+        # 9 = Luma fade (soft brightness fade)
+        # 10 = Smooth zoom crossfade (continuous zoom across cut)
         if mode_for_segment == 1:  # Hard cuts
             transition = "none"
         elif mode_for_segment == 2:  # Mixed (white flash + cuts)
@@ -1689,6 +1760,12 @@ def build_timeline(
             transition = "t_vhs"
         elif mode_for_segment == 7:  # Motion blur boost
             transition = "t_motion_blur"
+        elif mode_for_segment == 8:  # Directional push (slide-style motion)
+            transition = "t_push"
+        elif mode_for_segment == 9:  # Luma fade (soft brightness fade)
+            transition = "t_luma_fade"
+        elif mode_for_segment == 10:  # Smooth zoom crossfade
+            transition = "t_smooth_zoom"
         else:  # 0 = Slide (soft cut for now)
             transition = "none"
         segments.append(
@@ -2264,13 +2341,34 @@ class RenderWorker(QThread):
 
                 # Cinematic one-off effects
                 if getattr(seg, "cine_freeze", False):
-                    # Full-segment freeze-frame with optional gentle zoom.
+                    # Freeze the first frame and gently zoom in over the freeze duration.
+
                     zoom = float(getattr(seg, "cine_freeze_zoom", 0.0) or 0.0)
-                    if zoom > 0.0:
-                        z_expr = 1.0 + zoom
-                        vf_parts.append(f"scale=iw*{z_expr:.3f}:ih*{z_expr:.3f},crop=iw/{z_expr:.3f}:ih/{z_expr:.3f}")
-                    # Repeat a single frame; using loop keeps duration fixed to -t.
+                    try:
+                        freeze_len = float(getattr(seg, "cine_freeze_len", 0.0) or 0.0)
+                    except Exception:
+                        freeze_len = 0.0
+                    if freeze_len <= 0.0:
+                        # Fallback: use the segment duration or a small default
+                        try:
+                            freeze_len = float(getattr(seg, "duration", 0.0) or 0.5)
+                        except Exception:
+                            freeze_len = 0.5
+
+                    # 1) Freeze: repeat a single frame for the whole (short) segment.
                     vf_parts.append("loop=loop=-1:size=1:start=0")
+
+                    # 2) Optional zoom: animate from 1.0x to (1.0 + zoom) over freeze_len.
+                    if zoom > 0.0:
+                        # Clamp to avoid div-by-zero and excessively long ramps.
+                        dur = max(0.05, min(5.0, freeze_len))
+                        # Scale factor grows with time t in [0, dur], then stays at max.
+                        z_expr = f"1+{zoom:.3f}*min(t/{dur:.3f},1)"
+
+                        vf_parts.append(
+                            f"scale=iw*({z_expr}):ih*({z_expr}):eval=frame,"
+                            f"crop=iw/({z_expr}):ih/({z_expr})"
+                        )
                 if getattr(seg, "cine_stutter", False):
                     # Stutter / triple-frame style slice: drop interim frames so motion
                     # feels jittery. We keep duration the same, only the cadence changes.
@@ -2279,8 +2377,46 @@ class RenderWorker(QThread):
                     step = max(2, min(5, repeats + 1))
                     vf_parts.append(f"framestep={step}")
                 if getattr(seg, "cine_reverse", False):
-                    # Reverse the visual segment (audio is separate so this stays safe).
-                    vf_parts.append("reverse")
+                    # Reverse-bounce: optionally repeat a short reversed window
+                    # to fill long segments, using a finite loop for safety.
+                    try:
+                        seg_dur = float(getattr(seg, "duration", 0.0) or 0.0)
+                    except Exception:
+                        seg_dur = 0.0
+                    try:
+                        win = float(getattr(seg, "cine_reverse_window", 0.0) or 0.0)
+                    except Exception:
+                        win = 0.0
+                    if win <= 0.0:
+                        try:
+                            win = float(getattr(seg, "cine_reverse_len", 0.0) or 0.0)
+                        except Exception:
+                            win = 0.0
+                    if win <= 0.0:
+                        win = min(0.5, seg_dur) if seg_dur > 0 else 0.5
+                    if seg_dur > 0.0:
+                        win = min(win, seg_dur)
+
+                    # If the window is shorter than the segment, loop the reversed slice.
+                    if seg_dur > 0.0 and win > 0.0 and seg_dur > (win + 0.01):
+                        fps_guess = 30.0
+                        try:
+                            frames = max(1, int(round(win * fps_guess)))
+                        except Exception:
+                            frames = 1
+                        try:
+                            needed = int(math.ceil(seg_dur / win))
+                        except Exception:
+                            needed = 1
+                        loops = max(0, needed - 1)
+                        # Safety cap to avoid runaway memory usage.
+                        loops = min(50, loops)
+                        vf_parts.append(
+                            f"trim=duration={win:.3f},reverse,loop=loop={loops}:size={frames}:start=0,trim=duration={seg_dur:.3f}"
+                        )
+                    else:
+                        # Simple full-segment reverse.
+                        vf_parts.append("reverse")
                 if getattr(seg, "cine_flip", False):
                     # Flip the frame 180° (upside-down) by combining vertical and horizontal flips.
                     vf_parts.append("vflip,hflip")
@@ -2418,22 +2554,56 @@ class RenderWorker(QThread):
                             f"scale=iw*{z_expr:.3f}:ih*{z_expr:.3f},crop=iw/{z_expr:.3f}:ih/{z_expr:.3f}"
                         )
 
-                    # Confetti / fireworks style shimmer: colourful noise overlay.
+                    
+                    # Colour strobe: fast colour flashes driven by the former 'confetti' slider.
+                    # Slider mapping: 0.10 -> ~1 flash/second, 1.00 -> ~20 flashes/second.
                     conf_s = float(getattr(seg, "impact_confetti_density", 0.0) or 0.0)
-                    fire_gold_s = float(getattr(seg, "impact_fire_gold_intensity", 0.0) or 0.0)
-                    fire_multi_s = float(getattr(seg, "impact_fire_multi_intensity", 0.0) or 0.0)
-                    if conf_s > 0.0 or fire_gold_s > 0.0 or fire_multi_s > 0.0:
-                        noise_level = int(10 + 50 * max(conf_s, fire_gold_s, fire_multi_s))
-                        # Gentle hue rotation at the start of the segment.
-                        hue_span = 45.0 * max(fire_multi_s, conf_s)
-                        vf_parts.append(
-                            f"noise=alls={noise_level}:allf=t+u"
-                        )
-                        if hue_span > 0.0:
-                            vf_parts.append(
-                                f"hue=h='t*{hue_span/seg.duration if seg.duration > 0 else hue_span:.2f}':s=1.1"
-                            )
+                    if conf_s > 0.0:
+                        # Normalise strength into 0.0–1.0, clamp for safety.
+                        s = max(0.0, min(1.0, conf_s))
 
+                        # Determine the time window we strobe over: the whole segment,
+                        # but never longer than 2 seconds to keep things punchy.
+                        try:
+                            seg_len = float(getattr(seg, "duration", 0.0) or 0.0)
+                        except Exception:
+                            seg_len = 0.0
+                        max_window = min(2.0, seg_len if seg_len > 0.0 else 2.0)
+                        if max_window > 0.05:
+                            # Map slider value to frequency: 1–20 flashes per second.
+                            min_freq = 1.0
+                            max_freq = 20.0
+                            freq = min_freq + (max_freq - min_freq) * s
+                            if freq < min_freq:
+                                freq = min_freq
+                            if freq > max_freq:
+                                freq = max_freq
+
+                            period = 1.0 / freq if freq > 0.0 else 1.0
+                            duty = 0.45
+                            pulse_len = period * duty
+
+                            # Vivid hue palette for clear multi-colour strobes.
+                            hue_palette = [10, 60, 120, 190, 260, 320]
+                            palette_len = len(hue_palette) or 1
+
+                            t0 = 0.0
+                            k = 0
+                            while t0 < max_window:
+                                start = t0
+                                end = min(t0 + pulse_len, max_window)
+                                # Map strength to a visible brightness jump.
+                                bright = 0.25 + 0.45 * s  # up to ~0.70
+                                # Step through a small, vivid palette so each pulse can have a distinct colour.
+                                hue_deg = hue_palette[k % palette_len] if palette_len else 0
+                                vf_parts.append(
+                                    f"eq=brightness={bright:.2f}:enable='between(t,{start:.3f},{end:.3f})'"
+                                )
+                                vf_parts.append(
+                                    f"hue=h={hue_deg}:s=2.0:enable='between(t,{start:.3f},{end:.3f})'"
+                                )
+                                t0 += period
+                                k += 1
                     # Zoom punch-in: segment-wide punch for extra impact.
                     zoom_s = float(getattr(seg, "impact_zoom_amount", 0.0) or 0.0)
                     if zoom_s > 0.0:
@@ -2470,19 +2640,27 @@ class RenderWorker(QThread):
                     )
                 elif seg.transition == "flashcolor":
                     # Colored flash: short hue-shifted flash at the start.
-                    flash_d   = max(0.4, min(1.2, seg.duration * 0.8))
-                    # Rotate hue by a fixed offset per segment index for reproducible variety.
-                    hue_shift = (i * 37) % 360  # pseudo "16-ish" cycle
+                    # Keep the flash fairly short but visible.
+                    flash_d   = max(0.10, min(0.45, seg.duration * 0.6))
+
+                    # Use a small vivid hue palette instead of a single biased angle.
+                    # This avoids everything drifting towards the same greenish tint.
+                    hue_palette = [20, 60, 120, 190, 260, 320]  # orange, yellow, green, cyan, blue, magenta
+                    if hue_palette:
+                        hue_shift = hue_palette[i % len(hue_palette)]
+                    else:
+                        hue_shift = 0
+
                     vf_parts.append(
                         f"eq=brightness=0.35:enable='between(t,0,{flash_d:.3f})',"
-                        f"hue=h={hue_shift}:enable='between(t,0,{flash_d:.3f})'"
+                        f"hue=h={hue_shift}:s=2.0:enable='between(t,0,{flash_d:.3f})'"
                     )
                 elif seg.transition == "whip":
                     # Zoom pulse / scale pulse: beat-style zoom using scale+crop.
                     # This is a visual effect only (no fades), safe across ffmpeg builds.
                     # Use a fixed gentle pulse period (~0.5s) since we don't have beat_period here.
                     base_period = 0.3
-                    zoom_amount = 0.04
+                    zoom_amount = 0.02
                     zoom_expr = f"1+{zoom_amount}*abs(sin(2*3.14159*t/{base_period:.3f}))"
                     vf_parts.append(
                         f"scale=iw*({zoom_expr}):ih*({zoom_expr}):eval=frame,crop=iw:ih"
@@ -2504,6 +2682,47 @@ class RenderWorker(QThread):
                 elif seg.transition == "t_motion_blur":
                     # Legacy motion blur boost transition
                     vf_parts.append("tblend=all_mode=average,framestep=1")
+                elif seg.transition == "t_push":
+                    # Directional push: mild zoom-in plus horizontal slide near the cut.
+                    push_len = min(0.75, max(0.20, seg.duration * 0.50))
+                    vf_parts.append(
+                        f"scale=iw*1.10:ih*1.10:eval=frame,"
+                        f"crop=iw:ih:x='(iw*0.10)*min(t/{push_len:.3f},1)':y='0'"
+                    )
+                elif seg.transition == "t_luma_fade":
+                    # Improved luma fade: always short, snappy, and never stays dark too long.
+
+                    # Segment length (fallback to small nonzero value)
+                    seg_len = max(0.10, float(seg.duration or 0.10))
+
+                    # Base fade duration: ~15% of segment
+                    fade_d = seg_len * 0.15
+
+                    # Clamp: always between 0.06s and 0.25s for quick transitions
+                    fade_d = max(0.06, min(0.25, fade_d))
+
+                    # Ensure fade-in + fade-out never overlap so much that frame stays dark
+                    if fade_d * 2.0 >= seg_len:
+                        fade_d = seg_len / 2.0 - 0.01
+                        if fade_d <= 0:
+                            fade_d = seg_len / 3.0
+
+                    # Out fade starts at end minus fade_d
+                    fade_out_start = seg_len - fade_d
+
+                    vf_parts.append(
+                        f"fade=t=in:st=0:d={fade_d:.3f},"
+                        f"fade=t=out:st={fade_out_start:.3f}:d={fade_d:.3f}"
+                    )
+                elif seg.transition == "t_smooth_zoom":
+                    # Smooth zoom crossfade: stronger continuous zoom over the whole clip
+                    # so it's clearly visible even on short segments.
+                    total = max(0.30, float(seg.duration or 1.0))
+                    # Zoom from 1.0x up to ~1.25x across the segment.
+                    zoom_expr = "1+0.25*t/{:.3f}".format(total)
+                    vf_parts.append(
+                        f"scale=iw*({zoom_expr}):ih*({zoom_expr}):eval=frame,crop=iw:ih"
+                    )
                 else:
                     # "none" and anything else fall back to a hard cut (no extra filters here)
                     pass
@@ -2526,15 +2745,24 @@ class RenderWorker(QThread):
                 # Base ffmpeg command for this segment (input, trim, no audio)
                 # Special-case: cinematic "boomerang" effect (short forward-back loop).
                 if getattr(seg, "cine_boomerang", False) and not getattr(seg, "is_image", False):
-                    # Use the pre-trimmed region defined by clip_start/duration,
-                    # which _apply_cinematic_effects has already clamped to the
-                    # first ~1 second of the source clip.
+                    # Use a short source window for the forward/reverse bounce,
+                    # but keep the musical segment length as the target output duration.
                     try:
-                        seg_duration = float(getattr(seg, "duration", 0.0) or 0.0)
+                        target_len = float(getattr(seg, "duration", 0.0) or 0.0)
                     except Exception:
-                        seg_duration = 0.0
-                    if seg_duration <= 0.0:
-                        seg_duration = 0.2
+                        target_len = 0.0
+                    if target_len <= 0.0:
+                        target_len = 0.2
+
+                    try:
+                        boom_window = float(getattr(seg, "cine_boomerang_window", 0.0) or 0.0)
+                    except Exception:
+                        boom_window = 0.0
+                    if boom_window <= 0.0:
+                        boom_window = min(0.25, target_len)
+                        if boom_window <= 0.0:
+                            boom_window = 0.2
+
                     try:
                         start = float(getattr(seg, "clip_start", 0.0) or 0.0)
                     except Exception:
@@ -2544,7 +2772,7 @@ class RenderWorker(QThread):
                         "-ss",
                         f"{start:.3f}",
                         "-t",
-                        f"{seg_duration:.3f}",
+                        f"{boom_window:.3f}",
                         "-i",
                         seg.clip_path,
                     ]
@@ -2557,23 +2785,38 @@ class RenderWorker(QThread):
 
                     # Number of boomerang cycles requested (1–9 from the UI).
                     try:
-                        cycles = int(getattr(seg, "cine_boomerang_bounces", 1) or 1)
+                        user_cycles = int(getattr(seg, "cine_boomerang_bounces", 1) or 1)
                     except Exception:
-                        cycles = 1
-                    if cycles < 1:
-                        cycles = 1
-                    if cycles > 9:
-                        cycles = 9
+                        user_cycles = 1
+                    if user_cycles < 1:
+                        user_cycles = 1
+                    if user_cycles > 9:
+                        user_cycles = 9
 
-                    # Build a forward + reverse pair, then loop that pair
-                    # (cycles-1) extra times so higher counts produce longer
-                    # and more energetic boomerang hits.
+                    # Compute how many cycles are needed to fill the segment time.
+                    pair_len = max(0.01, boom_window * 2.0)
+                    try:
+                        needed_cycles = int(math.ceil(target_len / pair_len))
+                    except Exception:
+                        needed_cycles = 1
+                    if needed_cycles < 1:
+                        needed_cycles = 1
+
+                    cycles = max(user_cycles, needed_cycles)
+                    # Safety cap to avoid runaway memory usage.
+                    if cycles > 50:
+                        cycles = 50
+
+                    # The loop filter needs a concrete frame count.
+                    pair_frames = max(1, int(round(pair_len * 30)))
+
                     filter_graph_parts = [
                         "[0:v]split[fwd][tmp]",
                         "[tmp]reverse[rev]",
                         "[fwd][rev]concat=n=2:v=1:a=0[pair]",
-                        f"[pair]loop=loop={max(0, cycles-1)}:size=0:start=0[boom]",
-                        f"[boom]fps=fps=30,scale={target_w}:{target_h}:force_original_aspect_ratio=decrease,"
+                        f"[pair]loop=loop={max(0, cycles-1)}:size={pair_frames}:start=0[boom]",
+                        f"[boom]trim=duration={target_len:.3f},setpts=PTS-STARTPTS[boomtrim]",
+                        f"[boomtrim]fps=fps=30,scale={target_w}:{target_h}:force_original_aspect_ratio=decrease,"
                         f"pad={target_w}:{target_h}:(ow-iw)/2:(oh-ih)/2:black[vout]",
                     ]
                     filter_complex = ";".join(filter_graph_parts)
@@ -2846,17 +3089,65 @@ class RenderWorker(QThread):
                         "-an",
                     ]
                 else:
-                    base_cmd = [
-                        self.ffmpeg,
-                        "-y",
-                        "-i",
-                        seg.clip_path,
-                        "-ss",
-                        f"{seg.clip_start:.3f}",
-                        "-t",
-                        f"{seg.duration:.3f}",
-                        "-an",
-                    ]
+                    # Speedup hits may need repeating if the usable clip window is shorter
+                    # than the segment duration. We use a finite stream_loop count to avoid
+                    # runaway memory usage from infinite loops.
+                    if getattr(seg, "cine_speedup_forward", False) or getattr(seg, "cine_speedup_backward", False):
+                        # Determine active factor
+                        try:
+                            if getattr(seg, "cine_speedup_forward", False):
+                                factor = float(getattr(seg, "cine_speedup_forward_factor", 1.5) or 1.5)
+                            else:
+                                factor = float(getattr(seg, "cine_speedup_backward_factor", 1.5) or 1.5)
+                        except Exception:
+                            factor = 1.5
+                        factor = max(1.25, min(4.0, factor))
+
+                        # Estimate how many repeats are needed based on probed source duration.
+                        usable = None
+                        try:
+                            src_dur = _ffprobe_duration(self.ffprobe, seg.clip_path)
+                            if src_dur is not None:
+                                usable = max(0.0, float(src_dur) - float(seg.clip_start))
+                        except Exception:
+                            usable = None
+
+                        loop_args = []
+                        if usable and usable > 0:
+                            effective_window = usable / factor if factor > 0 else usable
+                            if effective_window > 0:
+                                needed = int(math.ceil(float(seg.duration) / effective_window))
+                                # -stream_loop is "number of additional times" after first play.
+                                loops = max(0, needed - 1)
+                                # Hard cap for safety.
+                                loops = min(50, loops)
+                                if loops > 0:
+                                    loop_args = ["-stream_loop", str(loops)]
+
+                        base_cmd = [
+                            self.ffmpeg,
+                            "-y",
+                            *loop_args,
+                            "-i",
+                            seg.clip_path,
+                            "-ss",
+                            f"{seg.clip_start:.3f}",
+                            "-t",
+                            f"{seg.duration:.3f}",
+                            "-an",
+                        ]
+                    else:
+                        base_cmd = [
+                            self.ffmpeg,
+                            "-y",
+                            "-i",
+                            seg.clip_path,
+                            "-ss",
+                            f"{seg.clip_start:.3f}",
+                            "-t",
+                            f"{seg.duration:.3f}",
+                            "-an",
+                        ]
 
                 # Common encoding settings
                 encode_args = [
@@ -3284,7 +3575,7 @@ class AutoMusicSyncWidget(QWidget):
         # Optional per-section media overrides chosen from the timeline tab
         self._section_media: Dict[int, ClipSource] = {}
         # Enabled transition styles for randomization (indices of combo_transitions)
-        self._enabled_transition_modes = {0, 1, 2, 3, 4, 5, 6, 7}
+        self._enabled_transition_modes = {0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10}
         # Guard flag used when toggling No FX programmatically so we don't immediately undo it
         self._nofx_guard = False
 
@@ -3626,8 +3917,7 @@ class AutoMusicSyncWidget(QWidget):
         self.check_cine_enable = QCheckBox("Enable cinematic effects", self)
         self.check_cine_enable.setToolTip(
             "Enable a few rare, high-impact visual effects (freeze-frame, stutter, "
-            "reverse-bounce, ramps). Effects are placed automatically at most "
-            "about once per minute so the edit never feels overloaded."
+            "reverse-bounce, ramps). Effects are placed automatically "
         )
         row_cine_master.addWidget(self.check_cine_enable)
         row_cine_master.addStretch(1)
@@ -3875,6 +4165,44 @@ class AutoMusicSyncWidget(QWidget):
         row_cine_dir.addWidget(self.combo_cine_motion_dir, 1)
         cine_layout.addLayout(row_cine_dir)
 
+        # Speedup (forward)
+        row_cine_speedup_forward = QHBoxLayout()
+        self.check_cine_speedup_forward = QCheckBox("Speedup (forward)", self.cine_options)
+        self.check_cine_speedup_forward.setToolTip(
+            "Speed up a segment while playing it forward. If the source clip is shorter than the segment, it will be repeated as needed."
+        )
+        row_cine_speedup_forward.addWidget(self.check_cine_speedup_forward)
+        label_cine_speedup_forward = QLabel("Rate:", self.cine_options)
+        row_cine_speedup_forward.addWidget(label_cine_speedup_forward)
+        self.spin_cine_speedup_forward = QDoubleSpinBox(self.cine_options)
+        self.spin_cine_speedup_forward.setDecimals(2)
+        self.spin_cine_speedup_forward.setSingleStep(0.05)
+        self.spin_cine_speedup_forward.setRange(1.25, 4.0)
+        self.spin_cine_speedup_forward.setValue(1.5)
+        self.spin_cine_speedup_forward.setSuffix("x")
+        row_cine_speedup_forward.addWidget(self.spin_cine_speedup_forward)
+        row_cine_speedup_forward.addStretch(1)
+        cine_layout.addLayout(row_cine_speedup_forward)
+
+        # Speedup (backwards)
+        row_cine_speedup_backward = QHBoxLayout()
+        self.check_cine_speedup_backward = QCheckBox("Speedup (backwards)", self.cine_options)
+        self.check_cine_speedup_backward.setToolTip(
+            "Speed up a segment while playing it backwards. If the source clip is shorter than the segment, it will be repeated as needed."
+        )
+        row_cine_speedup_backward.addWidget(self.check_cine_speedup_backward)
+        label_cine_speedup_backward = QLabel("Rate:", self.cine_options)
+        row_cine_speedup_backward.addWidget(label_cine_speedup_backward)
+        self.spin_cine_speedup_backward = QDoubleSpinBox(self.cine_options)
+        self.spin_cine_speedup_backward.setDecimals(2)
+        self.spin_cine_speedup_backward.setSingleStep(0.05)
+        self.spin_cine_speedup_backward.setRange(1.25, 4.0)
+        self.spin_cine_speedup_backward.setValue(1.5)
+        self.spin_cine_speedup_backward.setSuffix("x")
+        row_cine_speedup_backward.addWidget(self.spin_cine_speedup_backward)
+        row_cine_speedup_backward.addStretch(1)
+        cine_layout.addLayout(row_cine_speedup_backward)
+
         # Speed ramps (only useful when slow-motion is enabled)
         row_cine_ramp = QHBoxLayout()
         self.check_cine_speed_ramp = QCheckBox("Use cinematic speed ramps", self.cine_options)
@@ -3919,7 +4247,7 @@ class AutoMusicSyncWidget(QWidget):
         row_impact_master = QHBoxLayout()
         self.check_impact_enable = QCheckBox("Enhance break / drop impact", self)
         self.check_impact_enable.setToolTip(
-            "Trigger strong club-style FX (flash, shockwave, confetti, zoom, shake, fog, "
+            "Trigger strong club-style FX (flash, shockwave, colour strobe, zoom, shake, fog, "
             "fireworks) on the very first beat after a breakdown."
         )
         row_impact_master.addWidget(self.check_impact_enable)
@@ -3965,11 +4293,11 @@ class AutoMusicSyncWidget(QWidget):
         row_impact_shock.addWidget(self.label_impact_shock)
         impact_layout.addLayout(row_impact_shock)
 
-        # Confetti
+        # Colour strobe (per‑segment colour flashes replaces non working confetti effect)
         row_impact_confetti = QHBoxLayout()
-        self.check_impact_confetti = QCheckBox("Confetti burst", self.impact_options)
+        self.check_impact_confetti = QCheckBox("Color strobe", self.impact_options)
         row_impact_confetti.addWidget(self.check_impact_confetti)
-        label_impact_confetti = QLabel("Density:", self.impact_options)
+        label_impact_confetti = QLabel("Speed:", self.impact_options)
         row_impact_confetti.addWidget(label_impact_confetti)
         self.slider_impact_confetti = QSlider(Qt.Horizontal, self.impact_options)
         self.slider_impact_confetti.setMinimum(10)
@@ -3981,16 +4309,6 @@ class AutoMusicSyncWidget(QWidget):
         self.label_impact_confetti.setMinimumWidth(40)
         row_impact_confetti.addWidget(self.label_impact_confetti)
         impact_layout.addLayout(row_impact_confetti)
-
-        # Hide legacy break-impact FX (confetti) while keeping state + settings support.
-        self.check_impact_confetti.setChecked(False)
-        for w in (
-            self.check_impact_confetti,
-            label_impact_confetti,
-            self.slider_impact_confetti,
-            self.label_impact_confetti,
-        ):
-            w.hide()
 
         # Zoom punch
         row_impact_zoom = QHBoxLayout()
@@ -4219,6 +4537,9 @@ class AutoMusicSyncWidget(QWidget):
                 "Motion blur whip-cuts",
                 "Flash/dip mix",
                 "Creative festival mix (strobes + hits)",
+                "Directional push (slide)",
+                "Luma fade",
+                "Smooth zoom crossfade",
             ]
         )
         self.combo_transitions.setToolTip(
@@ -4231,6 +4552,9 @@ class AutoMusicSyncWidget(QWidget):
             "- Motion blur whip-cuts: extra blur on fast cuts.\n"
             "- Flash/dip mix: combo of bright flashes and quick dips.\n"
             "- Creative festival mix: playful blend of flashes, dips and pulses.\n"
+            "- Directional push: smooth slide-style motion across the cut.\n"
+            "- Luma fade: soft brightness-based fade in/out.\n"
+            "- Smooth zoom crossfade: continuous, gentle zoom across the cut.\n"
         )
         row_trans.addWidget(self.combo_transitions, 1)
         row_trans.addStretch(1)
@@ -4804,6 +5128,9 @@ class AutoMusicSyncWidget(QWidget):
             "Motion blur whip-cuts",
             "Flash/dip mix",
             "Creative festival mix (strobes + hits)",
+            "Directional push (slide)",
+            "Luma fade",
+            "Smooth zoom crossfade",
         ]
         dlg = QDialog(self)
         dlg.setWindowTitle("Manage transitions")
@@ -5302,6 +5629,16 @@ class AutoMusicSyncWidget(QWidget):
         self.spin_cine_stutter_repeats.setValue(int(s.value("cine_stutter_repeats", self.spin_cine_stutter_repeats.value())))
         self.check_cine_reverse.setChecked(bool(int(s.value("cine_reverse", int(self.check_cine_reverse.isChecked())))))
         self.slider_cine_reverse_len.setValue(int(s.value("cine_reverse_len", self.slider_cine_reverse_len.value())))
+        self.check_cine_speedup_forward.setChecked(bool(int(s.value("cine_speedup_forward", int(self.check_cine_speedup_forward.isChecked())))))
+        try:
+            self.spin_cine_speedup_forward.setValue(float(s.value("cine_speedup_forward_factor", self.spin_cine_speedup_forward.value())))
+        except Exception:
+            pass
+        self.check_cine_speedup_backward.setChecked(bool(int(s.value("cine_speedup_backward", int(self.check_cine_speedup_backward.isChecked())))))
+        try:
+            self.spin_cine_speedup_backward.setValue(float(s.value("cine_speedup_backward_factor", self.spin_cine_speedup_backward.value())))
+        except Exception:
+            pass
         self.check_cine_speed_ramp.setChecked(bool(int(s.value("cine_speed_ramp", int(self.check_cine_speed_ramp.isChecked())))))
         self.slider_cine_ramp_in.setValue(int(s.value("cine_ramp_in", self.slider_cine_ramp_in.value())))
         self.slider_cine_ramp_out.setValue(int(s.value("cine_ramp_out", self.slider_cine_ramp_out.value())))
@@ -5340,7 +5677,6 @@ class AutoMusicSyncWidget(QWidget):
 
         # Hidden break-impact FX rows are always disabled, even if older settings had them on.
         for cb in (
-            getattr(self, "check_impact_confetti", None),
             getattr(self, "check_impact_fog", None),
             getattr(self, "check_impact_fire_gold", None),
             getattr(self, "check_impact_fire_multi", None),
@@ -5491,6 +5827,10 @@ class AutoMusicSyncWidget(QWidget):
         s.setValue("cine_stutter_repeats", int(self.spin_cine_stutter_repeats.value()))
         s.setValue("cine_reverse", int(self.check_cine_reverse.isChecked()))
         s.setValue("cine_reverse_len", int(self.slider_cine_reverse_len.value()))
+        s.setValue("cine_speedup_forward", int(self.check_cine_speedup_forward.isChecked()))
+        s.setValue("cine_speedup_forward_factor", float(self.spin_cine_speedup_forward.value()))
+        s.setValue("cine_speedup_backward", int(self.check_cine_speedup_backward.isChecked()))
+        s.setValue("cine_speedup_backward_factor", float(self.spin_cine_speedup_backward.value()))
         s.setValue("cine_speed_ramp", int(self.check_cine_speed_ramp.isChecked()))
         s.setValue("cine_ramp_in", int(self.slider_cine_ramp_in.value()))
         s.setValue("cine_ramp_out", int(self.slider_cine_ramp_out.value()))
@@ -6519,12 +6859,10 @@ class AutoMusicSyncWidget(QWidget):
         impact_fire_gold_intensity = self.slider_impact_fire_gold.value() / 100.0
         impact_fire_multi_intensity = self.slider_impact_fire_multi.value() / 100.0
 
-        # Hidden break-impact FX (confetti, fog, fireworks) are always disabled.
-        impact_confetti = False
+        # Hidden break-impact FX (fog, fireworks) are always disabled.
         impact_fog = False
         impact_fire_gold = False
         impact_fire_multi = False
-        impact_confetti_density = 0.0
         impact_fog_density = 0.0
         impact_fire_gold_intensity = 0.0
         impact_fire_multi_intensity = 0.0
@@ -6550,6 +6888,10 @@ class AutoMusicSyncWidget(QWidget):
             cine_freeze=bool(self.check_cine_freeze.isChecked()),
             cine_stutter=bool(self.check_cine_stutter.isChecked()),
             cine_reverse=bool(self.check_cine_reverse.isChecked()),
+            cine_speedup_forward=bool(self.check_cine_speedup_forward.isChecked()),
+            cine_speedup_forward_factor=float(self.spin_cine_speedup_forward.value()),
+            cine_speedup_backward=bool(self.check_cine_speedup_backward.isChecked()),
+            cine_speedup_backward_factor=float(self.spin_cine_speedup_backward.value()),
             cine_speed_ramp=bool(self.check_cine_speed_ramp.isChecked()),
             cine_freeze_len=self.slider_cine_freeze_len.value() / 100.0,
             cine_freeze_zoom=self.slider_cine_freeze_zoom.value() / 100.0,

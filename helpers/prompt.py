@@ -1265,7 +1265,13 @@ class PromptToolPane(QWidget):
 
     def _set_busy(self, busy: bool):
         self.btn_gen.setEnabled(not busy)
-        self.btn_cancel.setVisible(busy)
+        # Keep Cancel permanently hidden/disabled; it isn't wired up and
+        # was causing layout jitter when its visibility changed.
+        try:
+            self.btn_cancel.setVisible(False)
+            self.btn_cancel.setEnabled(False)
+        except Exception:
+            pass
         self.btn_copy.setEnabled(not busy)
         self.btn_clear.setEnabled(not busy)
         self.btn_save_txt.setEnabled(not busy)

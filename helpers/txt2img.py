@@ -1280,7 +1280,18 @@ class Txt2ImgPane(QWidget):
             if thumbs_dir and thumbs_dir.exists():
                 for p in thumbs_dir.iterdir():
                     try:
-                        if p.is_file() and p.suffix.lower() in exts:
+                        if not p.is_file():
+                            continue
+                        sfx = p.suffix.lower()
+                        # Treat only generated JPG thumbnails as recents; avoid counting
+                        # full-size images in this folder (which could otherwise appear
+                        # twice when also scanned from the main output directory).
+                        if sfx != ".jpg":
+                            continue
+                        name = p.stem
+                        parts = name.rsplit("_", 2)
+                        # Our thumbs look like: originalStem_<hash>_<size>.jpg
+                        if len(parts) == 3 and parts[2].isdigit():
                             candidates.append(p)
                     except Exception:
                         continue
@@ -2288,11 +2299,17 @@ class Txt2ImgPane(QWidget):
             if checked:
                 self.steps_slider.setValue(25)
         self.steps_default.toggled.connect(_on_steps_default_changed)
+        # Hide 'Lock to default' toggle and keep it off
+        try:
+            self.steps_default.setChecked(False)
+            self.steps_default.setVisible(False)
+        except Exception:
+            pass
         self.steps_slider.valueChanged.connect(lambda v: self.steps_value.setText(str(int(v))))
         steps_row.addWidget(QLabel("Steps:"))
         steps_row.addWidget(self.steps_slider, 1)
         steps_row.addWidget(self.steps_value, 0)
-        steps_row.addWidget(self.steps_default, 0)
+        # 'Lock to default' is intentionally not added to the layout anymore
         form.addRow(steps_row)
 
         # CFG scale
@@ -2411,7 +2428,8 @@ class Txt2ImgPane(QWidget):
 
         # Model (collapsed group)
         mdl_body = QWidget()
-        mdl_form = QFormLayout(mdl_body)
+        self._mdl_form = QFormLayout(mdl_body)
+        mdl_form = self._mdl_form
         self.model_combo = QComboBox()
         self.model_refresh = QPushButton("Refresh")
         self.model_browse = QPushButton("Browse…")
@@ -2419,7 +2437,8 @@ class Txt2ImgPane(QWidget):
         rowm.addWidget(self.model_combo, 1)
         rowm.addWidget(self.model_refresh, 0)
         rowm.addWidget(self.model_browse, 0)
-        mdl_form.addRow("Model", rowm)
+        self.model_label = QLabel("Model")
+        mdl_form.addRow(self.model_label, rowm)
 
         def _populate_models():
             try:
@@ -2533,7 +2552,8 @@ class Txt2ImgPane(QWidget):
         rowl.addWidget(self.lora_path_btn, 0)
         rowl.addWidget(self.lora_refresh, 0)
         rowl.addWidget(self.lora_combo, 1)
-        mdl_form.addRow("LoRA (SDXL)", rowl)
+        self.lora_label = QLabel("LoRA (SDXL)")
+        mdl_form.addRow(self.lora_label, rowl)
         try:
             self.lora_path_btn.clicked.connect(_browse_lora_root)
         except Exception:
@@ -2578,7 +2598,8 @@ class Txt2ImgPane(QWidget):
         rowl2 = QHBoxLayout()
         rowl2.addWidget(self.lora2_refresh, 0)
         rowl2.addWidget(self.lora2_combo, 1)
-        mdl_form.addRow("LoRA 2 (SDXL)", rowl2)
+        self.lora2_label = QLabel("LoRA 2 (SDXL)")
+        mdl_form.addRow(self.lora2_label, rowl2)
 
         def _populate_loras2():
             try:
@@ -3046,10 +3067,43 @@ class Txt2ImgPane(QWidget):
         except Exception:
             pass
 
-        # Show/hide SD model + LoRA dropdown group
+        # Keep Model/LoRA group visible, but adjust contents/labels per engine
         try:
-            if hasattr(self, "_model_picker") and self._model_picker is not None:
-                self._model_picker.setVisible(not is_zimage)
+            picker = getattr(self, "_model_picker", None)
+        except Exception:
+            picker = None
+        try:
+            if picker is not None:
+                # Always keep the group itself visible
+                picker.setVisible(True)
+                # Update the disclosure title: 'Model' for SD engines, 'LoRA' for Z-Image
+                try:
+                    btn = getattr(picker, "_btn", None)
+                    if btn is not None:
+                        btn.setText("LoRA" if is_zimage else "Model")
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
+        # Toggle SDXL model row visibility and rename LoRA labels depending on engine
+        try:
+            # Model row: hide for Z-Image, show for SD engines
+            model_label = getattr(self, "model_label", None)
+            for _w in (model_label,
+                       getattr(self, "model_combo", None),
+                       getattr(self, "model_refresh", None),
+                       getattr(self, "model_browse", None)):
+                if _w is not None:
+                    _w.setVisible(not is_zimage)
+
+            # LoRA labels: show engine-specific text
+            lora_label = getattr(self, "lora_label", None)
+            if lora_label is not None:
+                lora_label.setText("LoRA (Z-Image)" if is_zimage else "LoRA (SDXL)")
+            lora2_label = getattr(self, "lora2_label", None)
+            if lora2_label is not None:
+                lora2_label.setText("LoRA 2 (Z-Image)" if is_zimage else "LoRA 2 (SDXL)")
         except Exception:
             pass
 
@@ -3349,7 +3403,18 @@ class Txt2ImgPane(QWidget):
             "preset_index": (int(self.preset_combo.currentIndex()) if hasattr(self, "preset_combo") else -1),
             "a1111_url": self._a1111_url_removed.text().strip() if hasattr(self, "_a1111_url_removed") else "http://127.0.0.1:7860",
                     }
-        # Persist settings
+        # Engine-specific queue metadata to avoid SDXL model bleed into Z-Image jobs
+        try:
+            ek = str(job.get("engine") or "").lower().strip()
+            if ek == "zimage":
+                # Z-Image uses its own internal model management; don't carry SDXL model_path
+                job.pop("model_path", None)
+                job.setdefault("model_name", "Z-Image-Turbo")
+                job.setdefault("model", "Z-Image-Turbo")
+        except Exception:
+            pass
+
+                # Persist settings
         try:
             self._save_settings(job)
         except Exception as e:
@@ -3810,19 +3875,30 @@ class Txt2ImgPane(QWidget):
             use_q = bool(self.use_queue.isChecked())
         except Exception:
             use_q = False
-        if (int(job.get('batch',1))>1) or use_q:
+
+        # Queue logic:
+        # - If user enabled "Use queue", enqueue normally (do NOT jump ahead).
+        # - If batch>1 without queue toggle, we still queue but allow "run now" priority.
+        batch_n = int(job.get('batch', 1) or 1)
+        should_queue = (batch_n > 1) or use_q
+        run_now_flag = bool((batch_n > 1) and (not use_q))
+
+        if should_queue:
             try:
                 from helpers.queue_adapter import enqueue_txt2img
             except Exception:
                 enqueue_txt2img = None
-            if enqueue_txt2img and enqueue_txt2img(job | {'run_now': True}):
-                try: self.status.setText('Enqueued and running…')
-                except Exception: pass
+            if enqueue_txt2img and enqueue_txt2img(job | {'run_now': run_now_flag}):
+                try:
+                    self.status.setText('Enqueued' + (' and running…' if run_now_flag else ''))
+                except Exception:
+                    pass
             else:
                 try: self.status.setText('Enqueue failed')
                 except Exception: pass
         else:
             self._run_direct(job)
+
 
     def _run_direct(self, job: dict):
         # Ensure a sane default filename template for Diffusers runs

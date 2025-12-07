@@ -414,8 +414,18 @@ class Wan22Pane(QWidget):
         # Size preset (only working resolutions)
         self.cmb_size = QComboBox()
         self.cmb_size.addItems([
+
+            "640*384",
+            "736*432",
+            "832*480",
+            "480*832",
+            "896*512",
+            "512*896",
+            "912*528",
+            "960*544",
+            "1024*704"
             "1280*704",    # Landscape 704p (primary)
-            "704*1280"     # Portrait 704p  
+            "704*1280",    # Portrait 704p              
         ])
         self.cmb_size.setToolTip("Video resolution. Only these two seem to work reliably with Wan2.2")
         
@@ -491,7 +501,7 @@ class Wan22Pane(QWidget):
         # Frames / FPS controls
         frames_row = QHBoxLayout()
         self.spn_frames = QSpinBox()
-        self.spn_frames.setRange(24, 240)
+        self.spn_frames.setRange(16, 240)
         self.spn_frames.setValue(121)
         self.spn_frames.setToolTip("Number of frames in the generated video")
 
@@ -879,6 +889,11 @@ class Wan22Pane(QWidget):
         
         # Apply loaded settings after UI is fully initialized
         self._apply_loaded_settings()
+
+        # Debounced thumbnail resize timer for Recent results
+        self._thumb_resize_timer = QTimer(self)
+        self._thumb_resize_timer.setSingleShot(True)
+        self._thumb_resize_timer.timeout.connect(self._apply_thumb_resize)
 
         # Recent wiring
         try:
@@ -1787,18 +1802,56 @@ class Wan22Pane(QWidget):
         self._open_in_player(p)
 
     def _on_thumb_size_changed(self, value: int):
-        """Adjust recent-results thumbnail display size without regenerating thumbnails."""
+        """Debounced handler for the thumbnail size slider.
+
+        We only update the numeric label immediately and then schedule a resize
+        of all Recent-result thumbnails via a short QTimer. This avoids a storm
+        of layout recalculations (and weird popup preview windows) while the
+        user is dragging the slider.
+        """
         try:
+            # Keep the label in sync with the live slider value
+            if hasattr(self, "lbl_thumb_size_value"):
+                self.lbl_thumb_size_value.setText(f"{int(value)}%")
+        except Exception:
+            pass
+
+        # Defer actual widget/icon resizing until the user pauses dragging
+        try:
+            timer = getattr(self, "_thumb_resize_timer", None)
+            if timer is not None:
+                timer.start(160)  # ms
+        except Exception:
+            pass
+
+
+    def _apply_thumb_resize(self):
+        """Apply the current thumbnail-size slider value to all Recent buttons.
+
+        Called from the debounced QTimer started in _on_thumb_size_changed.
+        """
+        try:
+            slider = getattr(self, "sld_thumb_size", None)
+            if slider is None:
+                return
             # Slider gives 20–100, treat as percentage of base size
-            value = max(20, min(100, int(value)))
+            try:
+                value = int(slider.value())
+            except Exception:
+                value = 100
+            value = max(20, min(100, value))
             base = getattr(self, "_thumb_base_size", 180)
             display_size = max(20, int(base * (value / 100.0)))
             self._thumb_display_size = display_size
+
+            # Update label once more with clamped value
             if hasattr(self, "lbl_thumb_size_value"):
                 self.lbl_thumb_size_value.setText(f"{value}%")
+
             buttons = getattr(self, "_recent_thumb_buttons", [])
             if not buttons:
                 return
+
             btn_side = max(display_size + 16, 40)
             for btn in buttons:
                 try:
@@ -1816,6 +1869,7 @@ class Wan22Pane(QWidget):
                     pass
         except Exception:
             pass
+
 
     def _refresh_recent(self):
         lay = getattr(self, "_recent_layout", None)
@@ -2300,6 +2354,7 @@ class Wan22Pane(QWidget):
             caps["has_lora_scale"] = "--lora_scale" in help_text
             caps["has_relighting_flag"] = "--use_relighting_lora" in help_text
         except Exception as e:
+            # Don't crash if detection fails; just assume no LoRA support.
             # Don't crash if detection fails; just assume no LoRA support.
             print(f"Wan2.2 LoRA CLI detection failed: {e}")
 

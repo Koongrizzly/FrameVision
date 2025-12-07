@@ -607,64 +607,74 @@ def _sec_to_mss(sec_val):
     return f"{m}:{s:02d}"
 
 def compose_video_info_text(path: Path) -> str:
-    """Build the info line under the player.
+    """Build the first info line under the player.
 
-    Rules:
-    - For audio or still images: hide resolution and fps.
-    - Duration shows as M:SS (no raw "123.45 s"), when available.
-    - For video: show resolution, fps (if available), duration M:SS, and size.
+    User-facing intent:
+    - Keep it short.
+    - For videos: show filename • WxH • size on disk (e.g., 5.5mb)
+    - For audio: show filename • duration • size
+    - For still images: show filename • size • WxH (when available)
     """
     try:
         inf = probe_media(path)
         ext = str(path.suffix or "").lower()
-        size_mb = human_mb(inf.get('size', 0))
 
-        dur_txt = _sec_to_mss(inf.get('duration'))
+        # raw bytes from ffprobe, fallback to filesystem size
+        size_b = inf.get("size")
+        try:
+            if not size_b:
+                size_b = path.stat().st_size
+        except Exception:
+            size_b = size_b or 0
 
-        # classify extension types locally (don't rely on later IMAGE_EXTS definition order)
+        def _fmt_mb_simple(b):
+            try:
+                mb = float(b) / (1024.0 * 1024.0)
+            except Exception:
+                mb = 0.0
+            # one decimal, trim trailing .0
+            s = f"{mb:.1f}"
+            if s.endswith(".0"):
+                s = s[:-2]
+            return f"{s}mb"
+
+        dur_txt = _sec_to_mss(inf.get("duration"))
+
         audio_exts = set(x.lower() for x in list(AUDIO_EXTS))
         image_exts = {
-            '.png','.jpg','.jpeg','.bmp','.webp','.tif','.tiff',
-            '.gif','.avif','.heic','.heif'
+            ".png", ".jpg", ".jpeg", ".bmp", ".webp", ".tif", ".tiff",
+            ".gif", ".avif", ".heic", ".heif"
         }
 
-        # Audio file: filename • M:SS • size MB
+        w = inf.get("width")
+        h = inf.get("height")
+
+        # Audio file
         if ext in audio_exts:
             parts = [path.name]
             if dur_txt:
                 parts.append(dur_txt)
-            parts.append(f"{size_mb} MB")
+            parts.append(_fmt_mb_simple(size_b))
             return " • ".join(parts)
 
-        # Still image (or animated gif treated as image in info line):
-        # filename • size MB
+        # Still images (including gif treated as image for info line)
         if ext in image_exts:
-            parts = [path.name, f"{size_mb} MB"]
-        w = inf.get('width')
-        h = inf.get('height')
-        if w and h:
-            parts.append(f"{w}x{h}")
+            parts = [path.name, _fmt_mb_simple(size_b)]
+            if w and h:
+                parts.append(f"{w}x{h}")
             return " • ".join(parts)
 
-        # Default / video clip: filename • WxH • fps fps • M:SS • size MB
+        # Video / default
         parts = [path.name]
-
-        w = inf.get('width')
-        h = inf.get('height')
         if w and h:
             parts.append(f"{w}x{h}")
-
-        fps = inf.get('fps')
-        if fps:
-            parts.append(f"{fps} fps")
-
-        if dur_txt:
-            parts.append(dur_txt)
-
-        parts.append(f"{size_mb} MB")
+        parts.append(_fmt_mb_simple(size_b))
         return " • ".join(parts)
     except Exception:
-        return str(path.name)
+        try:
+            return str(path.name)
+        except Exception:
+            return ""
 def human_mb(b):
     try: return round(b/(1024*1024),2)
     except: return 0.0
@@ -867,6 +877,42 @@ class VideoPane(QWidget):
             self._ask_popup.activateWindow()
         except Exception:
             pass
+
+    def _set_repeat_available(self, is_video: bool):
+        try:
+            if hasattr(self, 'btn_repeat'):
+                self.btn_repeat.setVisible(bool(is_video))
+        except Exception:
+            pass
+
+    def _update_repeat_style(self):
+        try:
+            enabled = bool(getattr(self, '_repeat_enabled', False))
+            if not hasattr(self, 'btn_repeat') or self.btn_repeat is None:
+                return
+            base = self.palette().button().color()
+            hi = self.palette().highlight().color()
+            txt_base = self.palette().buttonText().color()
+            txt_hi = self.palette().highlightedText().color()
+            bg = hi if enabled else base
+            fg = txt_hi if enabled else txt_base
+            css = (
+                "QPushButton#btn_repeat { padding:4px 14px; border-radius:8px; font-weight:600;"
+                f" background: rgba({bg.red()},{bg.green()},{bg.blue()},255);"
+                f" color: rgba({fg.red()},{fg.green()},{fg.blue()},255); }}"
+                "QPushButton#btn_repeat:hover { opacity: 0.9; }"
+            )
+            self.btn_repeat.setStyleSheet(css)
+        except Exception:
+            pass
+
+    def _toggle_repeat(self):
+        try:
+            self._repeat_enabled = not bool(getattr(self, '_repeat_enabled', False))
+            self._update_repeat_style()
+        except Exception:
+            pass
+
     frameCaptured = Signal(QImage)
     # --- zoom/pan helpers ---
     def _set_zoom(self, new_zoom: float):
@@ -1068,9 +1114,24 @@ class VideoPane(QWidget):
         )
         bar.addWidget(self.btn_ask)
 
+        # Repeat button (video loop)
+        self.btn_repeat = QPushButton("Repeat")
+        self.btn_repeat.setObjectName("btn_repeat")
+        self._repeat_enabled = False
+        bar.addWidget(self.btn_repeat)
+        self.btn_repeat.setVisible(False)
+        try:
+            self._update_repeat_style()
+        except Exception:
+            pass
+
         # Volume/EQ popup button (new)
         try:
             add_new_volume_popup(self, bar)
+        except Exception:
+            pass
+        try:
+            self.btn_repeat.clicked.connect(self._toggle_repeat, Qt.ConnectionType.UniqueConnection)
         except Exception:
             pass
         self.btn_ask.clicked.connect(self._open_ask_popup, Qt.ConnectionType.UniqueConnection)
@@ -1314,11 +1375,22 @@ class VideoPane(QWidget):
             pass
         self._clear_video_sink()
         self._show_empty_background()
+        try:
+            self._set_repeat_available(False)
+        except Exception:
+            pass
 
     def _on_media_status(self, status):
         try:
             from PySide6.QtMultimedia import QMediaPlayer as _QMediaPlayer
             if status == _QMediaPlayer.EndOfMedia:
+                try:
+                    if bool(getattr(self, "_repeat_enabled", False)) and getattr(self, "_mode", None) == "video":
+                        self.player.setPosition(0)
+                        self.player.play()
+                        return
+                except Exception:
+                    pass
                 self._clear_video_sink()
                 self._show_empty_background()
         except Exception:
@@ -1549,6 +1621,10 @@ class VideoPane(QWidget):
             p = _P(str(path))
         ext = p.suffix.lower()
 
+        try:
+            self._set_repeat_available(False)
+        except Exception:
+            pass
 
         try:
             _w = self.window() if hasattr(self, 'window') else None
@@ -1694,6 +1770,10 @@ class VideoPane(QWidget):
         # Video
         try: self.slider.setEnabled(True)
         except Exception: pass
+        try:
+            self._set_repeat_available(True)
+        except Exception:
+            pass
         try: self._image_pm_orig = None
         except Exception: pass
         

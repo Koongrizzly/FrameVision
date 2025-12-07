@@ -1,5 +1,7 @@
 from __future__ import annotations
 import os
+import shutil
+import time
 
 import json
 from pathlib import Path
@@ -476,7 +478,70 @@ class JobRowWidget(QWidget):
 
     # ---------- Context menu ----------
     def contextMenuEvent(self, event) -> None:
+        """Context menu varies by job state.
+
+        Running:
+          - Cancel job
+          - Move back to pending
+          - Show info
+
+        Pending:
+          - Move up / Move to top
+          - Move down / Move to bottom
+          - Delete job
+
+        Done/Failed:
+          - Open output folder
+          - Play output media
+          - Delete output + remove from queue
+          - View job JSON
+        """
+        status = (self._status_from_fs() or self.status).lower()
         menu = QMenu(self)
+
+        # --- Running menu ---
+        if status == "running":
+            act_cancel = QAction(self.style().standardIcon(QStyle.SP_BrowserStop), "Cancel job", self)
+            act_to_pending = QAction(self.style().standardIcon(QStyle.SP_ArrowLeft), "Move back to pending", self)
+            act_info = QAction(self.style().standardIcon(QStyle.SP_FileIcon), "Show info", self)
+
+            act_cancel.triggered.connect(self._cancel_job)
+            act_to_pending.triggered.connect(lambda: self._move_job_to("pending"))
+            act_info.triggered.connect(self._view_json)
+
+            menu.addAction(act_cancel)
+            menu.addAction(act_to_pending)
+            menu.addSeparator()
+            menu.addAction(act_info)
+
+            menu.exec(event.globalPos())
+            return
+
+        # --- Pending menu ---
+        if status == "pending":
+            act_up = QAction(self.style().standardIcon(QStyle.SP_ArrowUp), "Move up", self)
+            act_top = QAction(self.style().standardIcon(QStyle.SP_ArrowUp), "Move to top", self)
+            act_down = QAction(self.style().standardIcon(QStyle.SP_ArrowDown), "Move down", self)
+            act_bottom = QAction(self.style().standardIcon(QStyle.SP_ArrowDown), "Move to bottom", self)
+            act_del = QAction(self.style().standardIcon(QStyle.SP_TrashIcon), "Delete job", self)
+
+            act_up.triggered.connect(self._pending_move_up)
+            act_top.triggered.connect(self._pending_move_top)
+            act_down.triggered.connect(self._pending_move_down)
+            act_bottom.triggered.connect(self._pending_move_bottom)
+            act_del.triggered.connect(self._delete_job)
+
+            menu.addAction(act_up)
+            menu.addAction(act_top)
+            menu.addSeparator()
+            menu.addAction(act_down)
+            menu.addAction(act_bottom)
+            menu.addSeparator()
+            menu.addAction(act_del)
+            menu.exec(event.globalPos())
+            return
+
+        # --- Default (done/failed/other) ---
         act_open = QAction(self.style().standardIcon(QStyle.SP_DirOpenIcon), "Open output folder", self)
         act_play = QAction(self.style().standardIcon(QStyle.SP_MediaPlay), "Play output media", self)
         act_del = QAction(self.style().standardIcon(QStyle.SP_TrashIcon), "Delete output + remove from queue", self)
@@ -487,7 +552,6 @@ class JobRowWidget(QWidget):
         act_del.triggered.connect(self._delete_job)
         act_view.triggered.connect(self._view_json)
 
-        status = (self._status_from_fs() or self.status).lower()
         term = status in ("done", "failed")
 
         menu.addAction(act_open).setEnabled(term)
@@ -499,7 +563,159 @@ class JobRowWidget(QWidget):
 
         menu.exec(event.globalPos())
 
-    # ---------- Internals ----------
+    # ---------- Queue operations (running/pending) ----------
+    def _jobs_dirs_safe(self):
+        """Resolve jobs directories with a hard fallback."""
+        try:
+            from helpers.queue_adapter import jobs_dirs  # type: ignore
+            return jobs_dirs()
+        except Exception:
+            base = Path('.').resolve()
+            d = {k: base / 'jobs' / k for k in ('pending','running','done','failed')}
+            for p in d.values():
+                try:
+                    p.mkdir(parents=True, exist_ok=True)
+                except Exception:
+                    pass
+            return d
+
+    def _move_job_to(self, target_status: str):
+        try:
+            target_status = str(target_status or '').lower().strip()
+            if not target_status:
+                return
+            d = self._jobs_dirs_safe()
+            dst_dir = d.get(target_status)
+            if not dst_dir:
+                return
+            dst_dir = Path(dst_dir)
+            dst_dir.mkdir(parents=True, exist_ok=True)
+
+            src = Path(self.job_path)
+            if not src.exists():
+                return
+            dst = dst_dir / src.name
+            try:
+                if dst.exists():
+                    # Avoid collisions by renaming
+                    dst = dst_dir / f"{src.stem}_{int(time.time())}.json"
+            except Exception:
+                pass
+
+            shutil.move(str(src), str(dst))
+            self.job_path = Path(dst)
+            self.status = target_status
+            self.refresh()
+        except Exception:
+            pass
+
+    def _cancel_job(self):
+        """Best-effort cancel: write a cancel marker and set JSON flag."""
+        try:
+            jp = Path(self.job_path)
+            if not jp.exists():
+                return
+            # marker file pattern: <job>.cancel
+            try:
+                marker = jp.with_suffix(jp.suffix + ".cancel")
+                marker.write_text("cancel", encoding="utf-8")
+            except Exception:
+                pass
+
+            # Update JSON flag
+            try:
+                txt = jp.read_text(encoding="utf-8")
+                data = json.loads(txt) if txt else {}
+                data["cancel_requested"] = True
+                jp.write_text(json.dumps(data, indent=2), encoding="utf-8")
+            except Exception:
+                pass
+        except Exception:
+            pass
+
+    # ----- Pending reordering -----
+    def _pending_jobs_sorted(self):
+        try:
+            d = self._jobs_dirs_safe()
+            pdir = Path(d.get("pending"))
+            items = [p for p in pdir.glob("*.json") if p.is_file()]
+            # Oldest first (natural FIFO)
+            items.sort(key=lambda p: p.stat().st_mtime if p.exists() else 0.0)
+            return items
+        except Exception:
+            return []
+
+    def _set_mtime(self, p: Path, ts: float):
+        try:
+            os.utime(str(p), (ts, ts))
+        except Exception:
+            pass
+
+    def _pending_swap_with(self, other: Path):
+        try:
+            a = Path(self.job_path)
+            if not (a.exists() and other and other.exists()):
+                return
+            ta = a.stat().st_mtime
+            tb = other.stat().st_mtime
+            self._set_mtime(a, tb)
+            self._set_mtime(other, ta)
+            self.refresh()
+        except Exception:
+            pass
+
+    def _pending_move_up(self):
+        try:
+            items = self._pending_jobs_sorted()
+            cur = Path(self.job_path)
+            if cur not in items:
+                return
+            i = items.index(cur)
+            if i <= 0:
+                return
+            self._pending_swap_with(items[i-1])
+        except Exception:
+            pass
+
+    def _pending_move_down(self):
+        try:
+            items = self._pending_jobs_sorted()
+            cur = Path(self.job_path)
+            if cur not in items:
+                return
+            i = items.index(cur)
+            if i >= len(items)-1:
+                return
+            self._pending_swap_with(items[i+1])
+        except Exception:
+            pass
+
+    def _pending_move_top(self):
+        try:
+            items = self._pending_jobs_sorted()
+            cur = Path(self.job_path)
+            if not items or cur not in items:
+                return
+            first_ts = items[0].stat().st_mtime if items[0].exists() else time.time()
+            self._set_mtime(cur, first_ts - 10.0)
+            self.refresh()
+        except Exception:
+            pass
+
+    def _pending_move_bottom(self):
+        try:
+            items = self._pending_jobs_sorted()
+            cur = Path(self.job_path)
+            if not items or cur not in items:
+                return
+            last_ts = items[-1].stat().st_mtime if items[-1].exists() else time.time()
+            self._set_mtime(cur, last_ts + 10.0)
+            self.refresh()
+        except Exception:
+            pass
+
+
+# ---------- Internals ----------
     def _load_json_safely(self) -> None:
         try:
             txt = Path(self.job_path).read_text(encoding="utf-8")
@@ -797,7 +1013,15 @@ class JobRowWidget(QWidget):
         try:
             smp = (args.get("sampler") or "").strip()
             stp = args.get("steps")
-            mdl = (d.get("model") or d.get("model_name") or args.get("model") or args.get("ai_model") or args.get("model_path"))
+            mdl = None
+            try:
+                ek = str(args.get("engine") or d.get("backend") or d.get("engine") or "").lower().strip()
+            except Exception:
+                ek = ""
+            if ek == "zimage":
+                mdl = (d.get("model") or d.get("model_name") or args.get("model") or args.get("ai_model") or "Z-Image-Turbo")
+            else:
+                mdl = (d.get("model") or d.get("model_name") or args.get("model") or args.get("ai_model") or args.get("model_path"))
             mdl = os.path.basename(str(mdl)) if mdl else None
             if smp:
                 parts.append(str(smp))
