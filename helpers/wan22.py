@@ -358,6 +358,41 @@ class Wan22Pane(QWidget):
         self.ed_negative.setPlaceholderText("Things you do NOT want to see in the video (e.g. low quality, distortion, text artifacts)")
         self.ed_negative.setFixedHeight(60)
         self.ed_negative.setToolTip("Negative prompt: describe what should be avoided in the video.")
+        # Prompt helper row (Enhance + Clear) between prompt and negatives
+        prompt_btn_row = QHBoxLayout()
+        self.btn_prompt_enhance = QPushButton("Enhance prompt (Qwen)")
+        try:
+            self.btn_prompt_enhance.setToolTip(
+                "Expand this prompt with the Qwen3-VL prompt helper (running in its own .venv). "
+                "Great for adding detail and variety to Wan 2.2 prompts."
+            )
+        except Exception:
+            pass
+        try:
+            self.btn_prompt_enhance.clicked.connect(self._on_enhance_prompt_clicked)
+        except Exception:
+            pass
+
+        self.btn_prompt_clear = QPushButton("Clear")
+        try:
+            self.btn_prompt_clear.setToolTip("Clear the main prompt box so you can start over.")
+        except Exception:
+            pass
+        try:
+            self.btn_prompt_clear.clicked.connect(self._on_clear_prompt_clicked)
+        except Exception:
+            pass
+
+        try:
+            prompt_btn_row.addWidget(self.btn_prompt_enhance)
+            prompt_btn_row.addWidget(self.btn_prompt_clear)
+            prompt_btn_row.addStretch(1)
+            prompt_btn_wrap = QWidget(self)
+            prompt_btn_wrap.setLayout(prompt_btn_row)
+            form.addRow("", prompt_btn_wrap)
+        except Exception:
+            pass
+
         form.addRow("Negative:", self.ed_negative)
 
         # Start image (for image2video)
@@ -424,6 +459,7 @@ class Wan22Pane(QWidget):
             "928*528",
             "960*544",
             "1024*704",            
+            "1280*544", 
             "1280*704",    # Landscape 704p (primary)
             "704*1280",    # Portrait 704p              
         ])
@@ -501,12 +537,12 @@ class Wan22Pane(QWidget):
         # Frames / FPS controls
         frames_row = QHBoxLayout()
         self.spn_frames = QSpinBox()
-        self.spn_frames.setRange(16, 240)
+        self.spn_frames.setRange(16, 300)
         self.spn_frames.setValue(121)
         self.spn_frames.setToolTip("Number of frames in the generated video")
 
         self.spn_fps = QSpinBox()
-        self.spn_fps.setRange(15, 30)
+        self.spn_fps.setRange(16, 30)
         self.spn_fps.setValue(24)
         self.spn_fps.setToolTip("Frames per second. Affects video smoothness and duration")
 
@@ -910,6 +946,195 @@ class Wan22Pane(QWidget):
             QTimer.singleShot(0, self._refresh_recent)
         except Exception:
             pass
+
+    def _on_enhance_prompt_clicked(self):
+        # Run the Qwen3-VL prompt helper from its own .venv and replace the prompt/negative text.
+        try:
+            base_prompt = (self.ed_prompt.toPlainText() or "").strip()
+        except Exception:
+            base_prompt = ""
+        if not base_prompt:
+            try:
+                QMessageBox.warning(self, "Prompt enhancer", "Please enter a base prompt first.")
+            except Exception:
+                pass
+            return
+        try:
+            neg = (self.ed_negative.toPlainText() or "").strip() if getattr(self, "ed_negative", None) else ""
+        except Exception:
+            neg = ""
+
+        try:
+            import subprocess, json, os
+            from pathlib import Path as _P
+        except Exception as e:
+            try:
+                QMessageBox.critical(self, "Prompt enhancer", f"Missing standard modules: {e}")
+            except Exception:
+                pass
+            return
+
+        # Locate app root / helpers
+        try:
+            here = _P(__file__).resolve()
+            helpers_dir = here.parent
+            app_root = helpers_dir.parent
+        except Exception:
+            try:
+                app_root = _P.cwd()
+                helpers_dir = app_root / "helpers"
+            except Exception:
+                app_root = _P.cwd()
+                helpers_dir = app_root
+
+        # Locate dedicated .venv Python (Qwen environment)
+        py_candidates = []
+        try:
+            venv = app_root / ".venv"
+            win_py = venv / "Scripts" / "python.exe"
+            nix_py = venv / "bin" / "python"
+            if win_py.exists():
+                py_candidates.append(win_py)
+            if nix_py.exists():
+                py_candidates.append(nix_py)
+        except Exception:
+            pass
+
+        py_path = None
+        for c in py_candidates:
+            try:
+                if c.exists():
+                    py_path = c
+                    break
+            except Exception:
+                continue
+
+        if py_path is None:
+            try:
+                QMessageBox.critical(
+                    self,
+                    "Prompt enhancer",
+                    "Could not find a dedicated .venv Python.\n"
+                    "Expected .venv/Scripts/python.exe or .venv/bin/python next to the app folder."
+                )
+            except Exception:
+                pass
+            return
+
+        # Use shared CLI helper
+        cli_path = helpers_dir / "prompt_enhancer_cli.py"
+        if not cli_path.exists():
+            # If this file lives outside helpers/, try app_root/helpers
+            try:
+                alt = app_root / "helpers" / "prompt_enhancer_cli.py"
+                if alt.exists():
+                    cli_path = alt
+            except Exception:
+                pass
+
+        if not cli_path.exists():
+            try:
+                QMessageBox.critical(
+                    self,
+                    "Prompt enhancer",
+                    "helpers/prompt_enhancer_cli.py is missing.\n"
+                    "This button reuses the Txt2Img Qwen helper."
+                )
+            except Exception:
+                pass
+            return
+
+        cmd = [str(py_path), str(cli_path), "--seed", base_prompt]
+        if neg:
+            cmd += ["--neg", neg]
+
+        try:
+            env = os.environ.copy()
+        except Exception:
+            env = None
+        if env is not None:
+            env.setdefault("PYTHONUTF8", "1")
+
+        try:
+            proc = subprocess.run(
+                cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                cwd=str(app_root),
+            )
+        except Exception as e:
+            try:
+                QMessageBox.critical(self, "Prompt enhancer", f"Failed to run Qwen helper: {e}")
+            except Exception:
+                pass
+            return
+
+        try:
+            out_txt = proc.stdout.decode("utf-8", "ignore").strip()
+            err_txt = proc.stderr.decode("utf-8", "ignore").strip()
+        except Exception:
+            out_txt = ""
+            err_txt = ""
+
+        if proc.returncode != 0:
+            msg = err_txt or out_txt or f"Exit code {proc.returncode}"
+            if len(msg) > 2000:
+                msg = msg[:2000] + "..."
+            try:
+                QMessageBox.critical(self, "Prompt enhancer", "Qwen prompt helper failed:\n\n" + msg)
+            except Exception:
+                pass
+            return
+
+        data = None
+        try:
+            data = json.loads(out_txt)
+        except Exception:
+            data = None
+
+        if not isinstance(data, dict) or not data.get("ok"):
+            msg = out_txt or "Unexpected response from helper."
+            if len(msg) > 2000:
+                msg = msg[:2000] + "..."
+            try:
+                QMessageBox.critical(
+                    self,
+                    "Prompt enhancer",
+                    "Qwen prompt helper returned an unexpected payload:\n\n" + msg
+                )
+            except Exception:
+                pass
+            return
+
+        new_prompt = data.get("prompt") or ""
+        new_neg = data.get("negatives") or ""
+
+        if new_prompt:
+            try:
+                self.ed_prompt.setPlainText(new_prompt)
+            except Exception:
+                pass
+        if new_neg and getattr(self, "ed_negative", None):
+            try:
+                self.ed_negative.setPlainText(new_neg)
+            except Exception:
+                pass
+
+        try:
+            self._append_log("Prompt enhanced with Qwen3-VL")
+        except Exception:
+            pass
+
+    def _on_clear_prompt_clicked(self):
+        """Clear the main positive prompt box."""
+        try:
+            self.ed_prompt.clear()
+        except Exception:
+            try:
+                self.ed_prompt.setPlainText("")
+            except Exception:
+                pass
+
 
     # ---------------------------------------------------------------------
     # Settings Persistence
@@ -2486,6 +2711,7 @@ class Wan22Pane(QWidget):
             "--sample_guide_scale", str(self.spn_guidance.value()),
             "--base_seed", str(seed_value),
             "--frame_num", str(self.spn_frames.value()),
+            "--fps", str(self.spn_fps.value() if getattr(self, "spn_fps", None) else 24),
             "--ckpt_dir", str(model_root),
             "--offload_model", "false",
             "--convert_model_dtype",

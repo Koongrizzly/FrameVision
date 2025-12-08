@@ -1543,6 +1543,7 @@ def wan22_generate(job, cfg, mani):
     steps = int(args.get("steps") or args.get("sample_steps") or 30)
     guidance = float(args.get("guidance") or args.get("guidance_scale") or 7)
     frames = int(args.get("frames") or args.get("frame_num") or 121)
+    fps = int(args.get("fps") or args.get("sample_fps") or 24)
 
     base_seed = int(args.get("seed") or args.get("base_seed") or 42)
     rs = args.get("random_seed")
@@ -1594,6 +1595,7 @@ def wan22_generate(job, cfg, mani):
         "--sample_guide_scale", str(guidance),
         "--base_seed", str(base_seed),
         "--frame_num", str(frames),
+        "--fps", str(fps),
         "--ckpt_dir", str(model_root),
         "--convert_model_dtype",
     ]

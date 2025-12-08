@@ -1,6 +1,6 @@
 # helpers/sysmon.py — System monitor with versions, sizes, uptimes, tools check + UI tweaks
 from __future__ import annotations
-import os, shutil, subprocess, platform, re, time
+import os, shutil, subprocess, platform, re, time, glob
 from typing import Optional, List, Tuple, Dict
 
 from PySide6.QtCore import Qt, QTimer, QSettings, Signal, QObject, QThread, QUrl
@@ -316,16 +316,58 @@ def _tool_ready_status(models_dir: str) -> Dict[str, Optional[str]]:
             if has_models:
                 upscayl = base
 
-    return {"FFmpeg": ff, "Qwen3-VL 2B": qwen, "RIFE": rife, "Real-ESRGAN": realsr, "Waifu2x": waifu, "UpScayl": upscayl}
+
+    # Ace Music — checks if ROOT/.ace_env exists
+    ace_music = _exists_any([
+        os.path.join(ROOT, ".ace_env"),
+    ])
+
+    # Z-image — checks if any folder/file matching models/z-image*.* exists
+    z_image = None
+    try:
+        candidates = glob.glob(os.path.join(models_dir, "z-image*.*")) + glob.glob(os.path.join(models_dir, "z-image*"))
+        for p in candidates:
+            if p and (os.path.isdir(p) or os.path.isfile(p)):
+                z_image = p
+                break
+    except Exception:
+        z_image = None
+
+    # Wan 2.2 — checks if any folder/file matching models/wan22* (or wan2.2*) exists
+    wan22 = None
+    try:
+        candidates = glob.glob(os.path.join(models_dir, "wan22*")) + glob.glob(os.path.join(models_dir, "wan2.2*"))
+        for p in candidates:
+            if p and (os.path.isdir(p) or os.path.isfile(p)):
+                wan22 = p
+                break
+    except Exception:
+        wan22 = None
+    return {
+        "FFmpeg": ff,
+        "Qwen3-VL 2B": qwen,
+        "RIFE": rife,
+        "Real-ESRGAN": realsr,
+        "Waifu2x": waifu,
+        "UpScayl": upscayl,
+        "Ace Music": ace_music,
+        "Z-image": z_image,
+        "Wan 2.2": wan22,
+    }
 
 def _tools_line(status: Dict[str, Optional[str]]) -> str:
-    order = ["FFmpeg","Qwen3-VL 2B","RIFE","Real-ESRGAN","Waifu2x","UpScayl"]
-    parts = []
-    for name in order:
-        ok = bool(status.get(name))
-        check = "✅" if ok else "❌"
-        parts.append(f"{name} {check}")
-    return " • ".join(parts)
+    group1 = ["FFmpeg","Qwen3-VL 2B","RIFE","Real-ESRGAN","Waifu2x","UpScayl"]
+    group2 = ["Ace Music","Z-image","Wan 2.2"]
+
+    def _fmt(group: List[str]) -> str:
+        parts: List[str] = []
+        for name in group:
+            ok = bool(status.get(name))
+            check = "✅" if ok else "❌"
+            parts.append(f"{name} {check}")
+        return " • ".join(parts)
+
+    return _fmt(group1) + "\n" + _fmt(group2)
 
 
 # ---- BG/Inpaint/SD models check --------------------------------------------
@@ -537,9 +579,10 @@ class SysMonPanel(QWidget):
         # Tools ready line
         paths = _settings_paths()
         self._tools_status = _tool_ready_status(paths["models"])
-        self.lbl_tools = QLabel(" " + _tools_line(self._tools_status))
+        self.lbl_tools = QLabel(_tools_line(self._tools_status))
         self.lbl_tools.setTextFormat(Qt.PlainText)
-        self.lbl_tools.setToolTip("Checks FFmpeg, Qwen3-VL (describe), RIFE, Real-ESRGAN, Waifu2x, UpScayl(er)")
+        self.lbl_tools.setWordWrap(True)
+        self.lbl_tools.setToolTip("Checks FFmpeg, Qwen3-VL (describe), RIFE, Real-ESRGAN, Waifu2x, UpScayl(er), Ace Music, Z-image, Wan 2.2")
 
         self._bg_status = _bg_models_status(paths["models"]) 
         self.lbl_bg = QLabel(" " + _bg_models_line(self._bg_status))
@@ -684,7 +727,7 @@ class SysMonPanel(QWidget):
     def _refresh_tools(self):
         models_dir = _settings_paths()["models"]
         self._tools_status = _tool_ready_status(models_dir)
-        self.lbl_tools.setText(" " + _tools_line(self._tools_status))
+        self.lbl_tools.setText(_tools_line(self._tools_status))
     def _refresh_bg_models(self):
         models_dir = _settings_paths()["models"]
         self._bg_status = _bg_models_status(models_dir)

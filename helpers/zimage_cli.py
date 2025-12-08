@@ -26,6 +26,7 @@ import time
 import traceback
 from pathlib import Path
 import sys
+import inspect
 
 
 def _unique_path(p: Path) -> Path:
@@ -60,6 +61,11 @@ def main(argv=None) -> int:
     parser.add_argument("--filename_template", default="zimage_{seed}_{idx:03d}.png")
     # Optional: explicit attention-slicing flag from UI / caller.
     parser.add_argument("--attn-slicing", action="store_true", default=False)
+    # Seed variance enhancer (Turbo): optional prompt-embedding noise.
+    # These flags are safe no-ops if the pipeline does not support prompt_embeds.
+    parser.add_argument("--seed-variance", action="store_true", default=False)
+    parser.add_argument("--seed-variance-enabled", action="store_true", dest="seed_variance_enabled", default=False)
+    parser.add_argument("--seed-variance-strength", type=float, default=0.0)
     args = parser.parse_args(argv)
 
     try:
@@ -171,6 +177,77 @@ def main(argv=None) -> int:
         print(json.dumps(payload))
         return 1
 
+
+    # ------------------------------------------------------------------
+    # Seed variance enhancer (Turbo)
+    #
+    # This is a lightweight, fully-offline implementation that adds
+    # controlled randomness to the *positive* prompt embeddings to help
+    # increase visual diversity when Z-Image Turbo shows low seed variance.
+    #
+    # If the underlying Diffusers pipeline does not expose encode_prompt
+    # or does not accept prompt_embeds, this feature becomes a safe no-op.
+    # ------------------------------------------------------------------
+    def _supports_kw(fn, name: str) -> bool:
+        try:
+            sig = inspect.signature(fn)
+            return name in sig.parameters
+        except Exception:
+            return False
+
+    def _maybe_build_noised_embeds(pipe, prompt: str, negative: str, strength: float, noise_seed: int, device: str):
+        try:
+            if not strength or strength <= 0:
+                return None
+            if not hasattr(pipe, "encode_prompt"):
+                return None
+
+            import torch  # local import to keep startup resilient
+
+            # Deterministic noise per image when a base seed is provided.
+            try:
+                gen_dev = device if device != "cpu" else "cpu"
+                gen = torch.Generator(device=gen_dev).manual_seed(int(noise_seed))
+            except Exception:
+                gen = torch.Generator().manual_seed(int(noise_seed))
+
+            # Try common encode_prompt signatures used across Diffusers pipelines.
+            try:
+                enc = pipe.encode_prompt(
+                    prompt=prompt,
+                    device=device,
+                    num_images_per_prompt=1,
+                    do_classifier_free_guidance=False,
+                    negative_prompt=negative if negative else None,
+                )
+            except TypeError:
+                enc = pipe.encode_prompt(prompt=prompt, device=device)
+
+            prompt_embeds = None
+            negative_embeds = None
+            if isinstance(enc, (tuple, list)):
+                if len(enc) >= 1:
+                    prompt_embeds = enc[0]
+                if len(enc) >= 2:
+                    negative_embeds = enc[1]
+            else:
+                prompt_embeds = enc
+
+            if prompt_embeds is None:
+                return None
+
+            # Map UI-like 0-100 strength to a modest embedding noise scale.
+            # Users can tune this if they want stronger/weaker variation.
+            scale = max(0.0, float(strength)) / 100.0 * 0.30
+            if scale <= 0:
+                return (prompt_embeds, negative_embeds)
+
+            noise = torch.randn_like(prompt_embeds, generator=gen) * scale
+            prompt_embeds = prompt_embeds + noise
+
+            return (prompt_embeds, negative_embeds)
+        except Exception:
+            return None
     out_dir = Path(args.outdir).expanduser()
     try:
         out_dir.mkdir(parents=True, exist_ok=True)
@@ -183,6 +260,14 @@ def main(argv=None) -> int:
 
     files = []
     base_seed = int(args.seed or 0)
+    # Seed variance flags from UI/CLI
+    try:
+        sv_enabled = bool(getattr(args, "seed_variance", False) or getattr(args, "seed_variance_enabled", False))
+        sv_strength = float(getattr(args, "seed_variance_strength", 0.0) or 0.0)
+    except Exception:
+        sv_enabled = False
+        sv_strength = 0.0
+
     for i in range(int(args.batch or 1)):
         # Generator
         gen = None
@@ -205,6 +290,20 @@ def main(argv=None) -> int:
             neg = (args.negative or "").strip()
             if neg:
                 kwargs["negative_prompt"] = neg
+            # Optional: seed variance enhancer (Turbo)
+            if sv_enabled and sv_strength > 0:
+                try:
+                    noise_seed = (base_seed if base_seed else 0) + i + 1337
+                    embeds = _maybe_build_noised_embeds(pipe, args.prompt, neg, sv_strength, noise_seed, device)
+                    if embeds and _supports_kw(pipe.__call__, "prompt_embeds"):
+                        pe, ne = embeds
+                        kwargs.pop("prompt", None)
+                        kwargs.pop("negative_prompt", None)
+                        kwargs["prompt_embeds"] = pe
+                        if ne is not None and _supports_kw(pipe.__call__, "negative_prompt_embeds"):
+                            kwargs["negative_prompt_embeds"] = ne
+                except Exception:
+                    pass
             result = pipe(**kwargs)
             img = result.images[0]
         except Exception as e:

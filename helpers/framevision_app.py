@@ -2628,9 +2628,18 @@ class QueuePane(QWidget):
         cl.addWidget(self.btn_remove_done); cl.addWidget(self.btn_remove_failed)
         grid.addWidget(self.btn_refresh, 0, 0); grid.addWidget(clearw, 0, 1); grid.addWidget(self.worker_status, 0, 2, 1, 1, Qt.AlignRight); grid.setColumnStretch(2, 1)
 
-        # Row 2: Move up · Move down · Delete selected
-        self.btn_move_up = QPushButton("Move Upwards"); self.btn_move_down = QPushButton("Move Down"); self.btn_delete_sel = QPushButton("Delete Selected")
-        grid.addWidget(self.btn_move_up, 1, 0); grid.addWidget(self.btn_move_down, 1, 1); grid.addWidget(self.btn_delete_sel, 1, 2)
+        # Row 2: Delete selected (move up/down controls removed)
+        self.btn_move_up = QPushButton("Move Upwards")
+        self.btn_move_down = QPushButton("Move Down")
+        self.btn_delete_sel = QPushButton("Delete Selected")
+        # Hide move up/down in UI (kept for compatibility but not shown)
+        self.btn_move_up.setVisible(False)
+        self.btn_move_up.setEnabled(False)
+        self.btn_move_down.setVisible(False)
+        self.btn_move_down.setEnabled(False)
+        grid.addWidget(self.btn_move_up, 1, 0)
+        grid.addWidget(self.btn_move_down, 1, 1)
+        grid.addWidget(self.btn_delete_sel, 1, 2)
 
         # Row 3: Mark running → failed · Clear finished + failed · Recover running → pending
         self.btn_mark_running_failed = QPushButton("Try to Move to Failed")
@@ -2798,6 +2807,40 @@ class QueuePane(QWidget):
         except Exception:
             files = []
 
+        # Apply per-status limits and stable ordering (newest first)
+        max_rows = None
+        if status == "pending":
+            max_rows = 99
+        elif status == "done":
+            max_rows = 50
+        elif status == "failed":
+            max_rows = 25
+
+        if files:
+            try:
+                files_sorted = sorted(files, key=lambda t_p: t_p[0], reverse=True)
+            except Exception:
+                files_sorted = list(files)
+        else:
+            files_sorted = []
+
+        # For finished/failed queues, prune extra JSON files on disk
+        if max_rows is not None and status in ("done", "failed") and len(files_sorted) > max_rows:
+            try:
+                for _ts, p in files_sorted[max_rows:]:
+                    try:
+                        p.unlink()
+                    except Exception:
+                        pass
+            except Exception:
+                pass
+
+        if max_rows is not None and len(files_sorted) > max_rows:
+            files = files_sorted[:max_rows]
+        else:
+            files = files_sorted
+
+
         # Remove stale items not in target set (in-place, from bottom)
         try:
             from PySide6.QtCore import QUrl, Qt
@@ -2821,7 +2864,7 @@ class QueuePane(QWidget):
 
         
         # Add or refresh rows (preserve order by newest first) — and **reposition** to keep newest on top live.
-        for idx, (_ts, p) in enumerate(sorted(files, key=lambda t_p: t_p[0], reverse=True)):
+        for idx, (_ts, p) in enumerate(files):
             try:
                 from PySide6.QtCore import QUrl, Qt
             except Exception:

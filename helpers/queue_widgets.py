@@ -451,7 +451,7 @@ class JobRowWidget(QWidget):
         if self._status_from_fs() == "running" or self.status == "running":
             self.timer = QTimer(self)
             self.timer.timeout.connect(self.refresh)
-            self.timer.start(2000)
+            self.timer.start(1000)
 
                 # Enable custom context menu
         self.setContextMenuPolicy(Qt.DefaultContextMenu)
@@ -521,24 +521,8 @@ class JobRowWidget(QWidget):
 
         # --- Pending menu ---
         if status == "pending":
-            act_up = QAction(self.style().standardIcon(QStyle.SP_ArrowUp), "Move up", self)
-            act_top = QAction(self.style().standardIcon(QStyle.SP_ArrowUp), "Move to top", self)
-            act_down = QAction(self.style().standardIcon(QStyle.SP_ArrowDown), "Move down", self)
-            act_bottom = QAction(self.style().standardIcon(QStyle.SP_ArrowDown), "Move to bottom", self)
             act_del = QAction(self.style().standardIcon(QStyle.SP_TrashIcon), "Delete job", self)
-
-            act_up.triggered.connect(self._pending_move_up)
-            act_top.triggered.connect(self._pending_move_top)
-            act_down.triggered.connect(self._pending_move_down)
-            act_bottom.triggered.connect(self._pending_move_bottom)
             act_del.triggered.connect(self._delete_job)
-
-            menu.addAction(act_up)
-            menu.addAction(act_top)
-            menu.addSeparator()
-            menu.addAction(act_down)
-            menu.addAction(act_bottom)
-            menu.addSeparator()
             menu.addAction(act_del)
             menu.exec(event.globalPos())
             return
@@ -961,11 +945,218 @@ class JobRowWidget(QWidget):
             return None
 
 
+
+    def _job_category(self) -> str:
+        """Return a coarse job category for icon rendering (never raises)."""
+        try:
+            d = self.data or {}
+        except Exception:
+            d = {}
+        try:
+            jt = str(d.get("job_type") or d.get("type") or "").lower()
+        except Exception:
+            jt = ""
+        try:
+            args = d.get("args") or {}
+        except Exception:
+            args = {}
+        engine = str(args.get("engine") or d.get("engine") or "").lower()
+        model = str(
+            args.get("model")
+            or args.get("model_name")
+            or d.get("model")
+            or d.get("model_name")
+            or ""
+        ).lower()
+        label = str(args.get("label") or d.get("label") or "").lower()
+
+        # Specific tools first
+        if "rife" in jt:
+            return "rife"
+        if "wan22" in jt or "wan 2.2" in label or "wan2.2" in label:
+            return "wan"
+        if jt.startswith("ace_") or "ace" in jt or "ace" in label:
+            return "ace"
+        if jt.startswith("upscale_") or "upscale" in jt:
+            return "upscale"
+
+        # Txt2img family → SDXL vs Z-image
+        if jt.startswith("txt2img"):
+            if (
+                engine == "zimage"
+                or "zimage" in engine
+                or "z-image" in engine
+                or "zimage" in model
+                or "z-image" in model
+            ):
+                return "zimage"
+            return "sdxl"
+
+        # Fallback by engine hints
+        if "zimage" in engine or "z-image" in engine:
+            return "zimage"
+        if "rife" in engine:
+            return "rife"
+        if "wan" in engine:
+            return "wan"
+        if "ace" in engine:
+            return "ace"
+        if "upscale" in engine:
+            return "upscale"
+
+        return "other"
+
+    def _make_status_icon_pixmap(self, w: int, h: int, status: str):
+        """Lightweight colored icon for pending/running jobs."""
+        from PySide6.QtGui import QPainter, QPainterPath, QPen, QColor, QPixmap
+        from PySide6.QtCore import Qt
+
+        try:
+            w = int(w or 0)
+            h = int(h or 0)
+        except Exception:
+            w = h = 32
+        if w <= 0 or h <= 0:
+            w = h = 32
+
+        cat = self._job_category()
+
+        pm = QPixmap(w, h)
+        try:
+            pm.fill(Qt.transparent)
+        except Exception:
+            return pm
+
+        p = QPainter(pm)
+        try:
+            p.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+        except Exception:
+            try:
+                p.setRenderHint(QPainter.Antialiasing, True)
+            except Exception:
+                pass
+
+        # Base colors per tool/model
+        if cat == "sdxl":
+            base = QColor("#8b5cf6")  # violet
+        elif cat == "zimage":
+            base = QColor("#f59e0b")  # orange
+        elif cat == "rife":
+            base = QColor("#22c55e")  # green lightning
+        elif cat == "ace":
+            base = QColor("#6abfd4")  # Ace/audio blue
+        elif cat == "wan":
+            base = QColor("#ef4444")  # WAN red
+        elif cat == "upscale":
+            base = QColor("#3b82f6")  # Upscale blue
+        else:
+            base = QColor("#facc15")  # Other tools: yellow
+
+        # Rounded background
+        try:
+            p.setPen(Qt.NoPen)
+            p.setBrush(base)
+            r = float(min(w, h))
+            margin = max(2.0, r / 8.0)
+            rect = pm.rect().adjusted(int(margin), int(margin), int(-margin), int(-margin))
+            p.drawRoundedRect(rect, 6.0, 6.0)
+        except Exception:
+            pass
+
+        # Foreground glyph color
+        fg = QColor(255, 255, 255)
+        try:
+            pen = QPen(fg, max(2, int(min(w, h) / 10)))
+            p.setPen(pen)
+        except Exception:
+            pass
+
+        try:
+            rect = pm.rect().adjusted(int(w * 0.2), int(h * 0.2), int(-w * 0.2), int(-h * 0.2))
+            cx, cy = rect.center().x(), rect.center().y()
+            rw, rh = rect.width(), rect.height()
+        except Exception:
+            rect = pm.rect()
+            cx = rect.center().x()
+            cy = rect.center().y()
+            rw = rect.width()
+            rh = rect.height()
+
+        # Simple glyphs per category
+        try:
+            path = QPainterPath()
+            if cat == "rife":
+                # Lightning bolt
+                path.moveTo(rect.left() + rw * 0.35, rect.top() + rh * 0.15)
+                path.lineTo(rect.left() + rw * 0.6, rect.top() + rh * 0.45)
+                path.lineTo(rect.left() + rw * 0.45, rect.top() + rh * 0.45)
+                path.lineTo(rect.left() + rw * 0.7, rect.bottom() - rh * 0.15)
+                path.closeSubpath()
+                p.fillPath(path, fg)
+            elif cat == "ace":
+                # Three waveform bars
+                for i, height in enumerate((0.4, 0.8, 0.6)):
+                    x = rect.left() + rw * (0.25 + 0.25 * i)
+                    top = cy - rh * height * 0.5
+                    bottom = cy + rh * height * 0.5
+                    p.drawLine(int(x), int(top), int(x), int(bottom))
+            elif cat == "wan":
+                # Film strip: inner rect + perforations
+                inner = rect.adjusted(int(rw * 0.18), int(rh * 0.18), int(-rw * 0.18), int(-rh * 0.18))
+                p.drawRect(inner)
+                dots = 3
+                step = inner.width() / float(dots + 1)
+                for row in (inner.top() + rh * 0.08, inner.bottom() - rh * 0.08):
+                    for i in range(dots):
+                        x = inner.left() + step * (i + 1)
+                        p.drawPoint(int(x), int(row))
+            elif cat == "upscale":
+                # Diagonal arrow up-right
+                path.moveTo(rect.left() + rw * 0.25, rect.bottom() - rh * 0.25)
+                path.lineTo(rect.right() - rw * 0.25, rect.top() + rh * 0.25)
+                path.lineTo(rect.right() - rw * 0.45, rect.top() + rh * 0.25)
+                path.lineTo(rect.right() - rw * 0.25, rect.top() + rh * 0.45)
+                path.closeSubpath()
+                p.fillPath(path, fg)
+            else:
+                # SDXL / Z-image / other: simple play or tool-ish glyph
+                if cat in ("sdxl", "zimage"):
+                    path.moveTo(rect.left() + rw * 0.3, cy - rh * 0.28)
+                    path.lineTo(rect.right() - rw * 0.25, cy)
+                    path.lineTo(rect.left() + rw * 0.3, cy + rh * 0.28)
+                    path.closeSubpath()
+                    p.fillPath(path, fg)
+                else:
+                    # "Tool": horizontal bar
+                    path.moveTo(rect.left() + rw * 0.25, cy)
+                    path.lineTo(rect.right() - rw * 0.25, cy)
+                    p.drawPath(path)
+        except Exception:
+            pass
+
+        try:
+            p.end()
+        except Exception:
+            pass
+        return pm
     def _set_thumbnail(self) -> None:
         """Render a thumbnail for this row.")"""
         try:
             w, h = self.thumb.width(), self.thumb.height()
             status = (self._status_from_fs() or self.status).lower()
+            # Lightweight icons for pending/running to avoid heavy previews
+            if status in ("running", "pending", "queued"):
+                try:
+                    pm = self._make_status_icon_pixmap(w, h, status)
+                except Exception:
+                    pm = None
+                if pm is not None:
+                    try:
+                        self.thumb.setPixmap(pm)
+                    except Exception:
+                        pass
+                return
+
 
             def _show_from_path(path: Path, is_input: bool = False) -> bool:
                 try:

@@ -311,6 +311,12 @@ def enqueue_wan22_from_widget(inner) -> bool:
             frames = int(inner.spn_frames.value())
         except Exception:
             frames = 121
+
+        # FPS (best-effort)
+        try:
+            fps = int(inner.spn_fps.value())
+        except Exception:
+            fps = 24
         try:
             seed = int(inner.spn_seed.value())
         except Exception:
@@ -354,6 +360,7 @@ def enqueue_wan22_from_widget(inner) -> bool:
             "steps": int(steps),
             "guidance": float(guidance),
             "frames": int(frames),
+            "fps": int(fps),
             "seed": int(seed),
             "random_seed": bool(random_seed),
             "save_file": save_file,
