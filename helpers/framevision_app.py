@@ -2576,9 +2576,9 @@ class QueuePane(QWidget):
         from PySide6.QtCore import QUrl, QFileSystemWatcher
 
         # Timers (keep internal refresh cadence intact)
-        self.auto_timer = QTimer(self); self.auto_timer.setInterval(2000); self.auto_timer.timeout.connect(self.request_refresh)
-        self.watch_timer = QTimer(self); self.watch_timer.setInterval(1200); self.watch_timer.timeout.connect(self.request_refresh)
-        self.worker_timer = QTimer(self); self.worker_timer.setInterval(1000); self.worker_timer.timeout.connect(self._update_worker_led)
+        self.auto_timer = QTimer(self); self.auto_timer.setInterval(4000); self.auto_timer.timeout.connect(self.request_refresh)
+        self.watch_timer = QTimer(self); self.watch_timer.setInterval(1300); self.watch_timer.timeout.connect(self.request_refresh)
+        self.worker_timer = QTimer(self); self.worker_timer.setInterval(2000); self.worker_timer.timeout.connect(self._update_worker_led)
 
         # Queue system and paths
         try:

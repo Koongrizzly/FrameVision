@@ -44,6 +44,16 @@ except Exception:
     OUT_SHOTS  = BASE/'output'/'screenshots'
     OUT_TEMP   = BASE/'output'/'_temp'
 
+try:
+    OUT_REVERSE
+except Exception:
+    try:
+        OUT_REVERSE = ROOT/'output'/'video'/'reverse'
+    except Exception:
+        from pathlib import Path as _Path
+        OUT_REVERSE = _Path('output')/'video'/'reverse'
+
+
 def ffmpeg_path():
     """Resolve ffmpeg, preferring app-local presets/bin first, then bin, then PATH."""
     exe = "ffmpeg.exe" if os.name=="nt" else "ffmpeg"
@@ -332,6 +342,7 @@ class InstantToolsPane(QWidget):
 
         # Sections
         sec_speed = CollapsibleSection("Slow motion - Speedup Video", expanded=False)
+        sec_reverse = CollapsibleSection("Reverse video", expanded=False)
         sec_resize = CollapsibleSection("Resize/convert - Images/Video", expanded=False)
         sec_splitglue = CollapsibleSection("Video Split and join", expanded=False)
         sec_gif = CollapsibleSection("Animated Frames Lab", expanded=False)
@@ -440,6 +451,30 @@ class InstantToolsPane(QWidget):
         btn_ls.clicked.connect(lambda: self._load_preset_speed())
 
         
+        # Reverse video
+        self.cb_reverse_mute = QCheckBox("Mute audio")
+        self.cb_reverse_mute.setToolTip("Output reversed video without audio.")
+        self.btn_reverse_load = QPushButton("Load video…")
+        self.btn_reverse_load.setToolTip("Pick a video file to use with the Reverse video tool.")
+        self.btn_reverse = QPushButton("Reverse video")
+        self.btn_reverse.setToolTip("Create a reversed playback copy of the selected video or the main player video.")
+        self.btn_reverse_batch = QPushButton("Batch…")
+        self.btn_reverse_batch.setToolTip("Reverse multiple videos at once using the current Reverse settings.")
+        self.lbl_reverse_info = QLabel("Using main Media Player video. No separate file loaded.")
+        try:
+            self.lbl_reverse_info.setWordWrap(True)
+        except Exception:
+            pass
+        lay_reverse = QFormLayout()
+        lay_reverse.addRow(self.btn_reverse_load)
+        lay_reverse.addRow(self.lbl_reverse_info)
+        lay_reverse.addRow(self.cb_reverse_mute)
+        row_reverse = QHBoxLayout()
+        row_reverse.addWidget(self.btn_reverse)
+        row_reverse.addWidget(self.btn_reverse_batch)
+        lay_reverse.addRow(row_reverse)
+        sec_reverse.setContentLayout(lay_reverse)
+
         # Resize (moved to helpers/resize.py)
 
         try:
@@ -568,7 +603,7 @@ class InstantToolsPane(QWidget):
         except Exception:
             pass
 
-        for sec in (sec_prompt, sec_meme, sec_musicclip, sec_music, sec_audio, sec_speed, sec_resize, sec_trim, sec_crop, sec_splitglue, sec_gif, sec_extract, sec_rename, sec_metadata):
+        for sec in (sec_prompt, sec_meme, sec_musicclip, sec_music, sec_audio, sec_speed, sec_reverse, sec_resize, sec_trim, sec_crop, sec_splitglue, sec_gif, sec_extract, sec_rename, sec_metadata):
             root.addWidget(sec)
         root.addStretch(1)
         # --- Remember settings (per-tool + global) ---
@@ -578,6 +613,7 @@ class InstantToolsPane(QWidget):
                 "Music Edit": sec_music,
                 "Music Clip Creator": sec_musicclip,
                 "Slow motion - Speedup Video": sec_speed,
+                "Reverse video": sec_reverse,
                 "Resize Images & Video": sec_resize,
                 "Split & Glue Video": sec_splitglue,
                 "Animated Frames Lab": sec_gif,
@@ -837,6 +873,9 @@ class InstantToolsPane(QWidget):
         # removed quality/img tool wiring
         # removed: batch_folder button
 # Wire
+        self.btn_reverse_load.clicked.connect(self._reverse_load_video)
+        self.btn_reverse.clicked.connect(self.run_reverse)
+        self.btn_reverse_batch.clicked.connect(self.run_reverse_batch)
         self.btn_speed.clicked.connect(self.run_speed)
         self.btn_speed_batch.clicked.connect(self.run_speed_batch)
         self.btn_gif.clicked.connect(self.run_gif)
@@ -975,9 +1014,229 @@ class InstantToolsPane(QWidget):
         self._run(cmd,out)
         inp = self._ensure_input();
         if not inp: return
-        outdir=OUT_VIDEOS / f"{inp.stem}_frames"; outdir.mkdir(parents=True, exist_ok=True); out=outdir / "frame_%06d.png"
-        cmd=[ffmpeg_path(),"-y","-i",str(inp),str(out)]
-        self._run(cmd,outdir)
+
+    def _reverse_set_input(self, path):
+        """Remember reverse tool input and update the info label."""
+        try:
+            from pathlib import Path as _P
+            p = _P(str(path)) if path else None
+        except Exception:
+            p = None
+        try:
+            self._reverse_input_path = p
+        except Exception:
+            pass
+        try:
+            label = getattr(self, "lbl_reverse_info", None)
+        except Exception:
+            label = None
+        if label is None:
+            return
+        if not p or not p.exists():
+            try:
+                label.setText("Using main Media Player video. No separate file loaded.")
+            except Exception:
+                pass
+            return
+        info = probe_media(p)
+        try:
+            name = p.name
+        except Exception:
+            name = str(p)
+        parts = []
+        try:
+            w = info.get("width")
+            h = info.get("height")
+            if w and h:
+                parts.append(f"{w}x{h}")
+        except Exception:
+            pass
+        try:
+            dur = info.get("duration")
+            if dur is not None:
+                parts.append(self._fmt_duration(dur))
+        except Exception:
+            pass
+        try:
+            size_b = info.get("size")
+            if size_b is not None:
+                parts.append(self._fmt_size(size_b))
+        except Exception:
+            pass
+        summary = " • ".join(parts) if parts else "No details"
+        try:
+            label.setText(f"{name} — {summary}")
+        except Exception:
+            pass
+
+    def _reverse_get_input(self):
+        """Prefer a manually loaded video; fall back to the main Media Player video."""
+        try:
+            p = getattr(self, "_reverse_input_path", None)
+        except Exception:
+            p = None
+        if p:
+            try:
+                from pathlib import Path as _P
+                return _P(str(p))
+            except Exception:
+                pass
+        return self._ensure_input()
+
+    def _reverse_load_video(self):
+        """Pick a video file to use just for the Reverse tool."""
+        try:
+            from PySide6.QtWidgets import QFileDialog
+        except Exception:
+            QFileDialog = None
+        if QFileDialog is None:
+            return
+        exts = "Videos (*.mp4 *.mkv *.mov *.webm *.avi *.m4v *.mpg *.mpeg *.ts *.m2ts)"
+        files, _ = QFileDialog.getOpenFileNames(self, "Choose video for Reverse tool", "", exts)
+        if not files:
+            return
+        try:
+            path = files[0]
+        except Exception:
+            return
+        self._reverse_set_input(path)
+
+    def _fmt_duration(self, seconds):
+        try:
+            s = int(round(float(seconds)))
+            h = s // 3600
+            m = (s % 3600) // 60
+            s = s % 60
+            return f"{h:02d}:{m:02d}:{s:02d}"
+        except Exception:
+            return "?"
+
+    def _fmt_size(self, size_bytes):
+        try:
+            b = float(size_bytes)
+        except Exception:
+            return "?"
+        units = ["B","KB","MB","GB","TB"]
+        i = 0
+        while b >= 1024 and i < len(units)-1:
+            b /= 1024.0
+            i += 1
+        try:
+            return f"{b:.1f} {units[i]}"
+        except Exception:
+            return f"{int(b)} {units[i]}"
+
+    def run_reverse(self):
+        inp = self._reverse_get_input()
+        if not inp:
+            return
+        # Ensure info label is in sync with the file we are actually using
+        try:
+            self._reverse_set_input(inp)
+        except Exception:
+            pass
+        from pathlib import Path as _P
+        try:
+            out_dir = OUT_REVERSE
+        except Exception:
+            try:
+                out_dir = OUT_VIDEOS
+            except Exception:
+                out_dir = _P(".")
+        try:
+            _P(out_dir).mkdir(parents=True, exist_ok=True)
+        except Exception:
+            pass
+        inp_path = _P(str(inp))
+        out = _P(out_dir) / f"{inp_path.stem}_reversed.mp4"
+        mute = False
+        try:
+            mute = bool(self.cb_reverse_mute.isChecked())
+        except Exception:
+            pass
+        cmd = [ffmpeg_path(), "-y", "-i", str(inp_path), "-vf", "reverse"]
+        if mute:
+            cmd += ["-an"]
+        else:
+            cmd += ["-af", "areverse"]
+        # Try to keep similar bitrate to the source by estimating from size and duration
+        br_flags = []
+        try:
+            info = probe_media(inp_path)
+            size_b = info.get("size")
+            dur = info.get("duration") or 0
+            if size_b and dur and dur > 0:
+                # bits per second -> kilobits per second
+                br_kbps = int((size_b * 8) / (dur * 1000.0))
+                # clamp to a sane range
+                if br_kbps < 300:
+                    br_kbps = 300
+                if br_kbps > 50000:
+                    br_kbps = 50000
+                br_flags = ["-b:v", f"{br_kbps}k", "-maxrate", f"{br_kbps}k", "-bufsize", f"{br_kbps*2}k"]
+        except Exception:
+            br_flags = []
+        cmd += ["-c:v", "libx264", "-preset", "veryfast"] + br_flags + ["-movflags", "+faststart", str(out)]
+        # Use the selected input path directly so manually loaded videos work even if the main player is empty
+        ok = False
+        try:
+            ok = bool(self._enqueue_cmd_for_input(inp_path, cmd, out))
+        except Exception:
+            ok = False
+        if not ok:
+            # Fallback to legacy path that uses the main Media Player input
+            self._run(cmd, out)
+
+
+
+    def run_reverse_batch(self):
+        """Batch reverse multiple videos using current Reverse settings."""
+        try:
+            paths = self._batch_paths_with_dialog(title="Batch Reverse", exts=BatchSelectDialog.VIDEO_EXTS)
+        except Exception:
+            paths = []
+        if not paths:
+            return
+        # Confirm with user (optional)
+        try:
+            if QMessageBox.question(
+                self,
+                "Batch Reverse",
+                f"Add {len(paths)} video(s) with current Reverse settings to the queue?"
+            ) != QMessageBox.Yes:
+                return
+        except Exception:
+            pass
+        mute = False
+        try:
+            mute = bool(self.cb_reverse_mute.isChecked())
+        except Exception:
+            pass
+        from pathlib import Path as _P
+        for p in paths:
+            try:
+                inp = _P(str(p))
+                try:
+                    out_dir = OUT_REVERSE
+                except Exception:
+                    try:
+                        out_dir = OUT_VIDEOS
+                    except Exception:
+                        out_dir = _P(".")
+                try:
+                    _P(out_dir).mkdir(parents=True, exist_ok=True)
+                except Exception:
+                    pass
+                out = _P(out_dir) / f"{inp.stem}_reversed.mp4"
+                cmd = [ffmpeg_path(), "-y", "-i", str(inp), "-vf", "reverse"]
+                if mute:
+                    cmd += ["-an"]
+                else:
+                    cmd += ["-af", "areverse"]
+                cmd += ["-c:v", "libx264", "-preset", "veryfast", "-movflags", "+faststart", str(out)]
+                self._enqueue_cmd_for_input(inp, cmd, out)
+            except Exception:
+                continue
 
     def run_trim(self):
         inp = self._ensure_input();

@@ -285,7 +285,7 @@ try:
 except Exception:
     requests = None
 
-from PySide6.QtCore import QSettings, QTimer, Qt, Signal
+from PySide6.QtCore import QSettings, QTimer, Qt, Signal, QProcess, QProcessEnvironment
 from PySide6.QtWidgets import (
     QMessageBox,
     QWidget, QVBoxLayout, QHBoxLayout, QLabel, QLineEdit, QTextEdit, QPushButton, QSpinBox,
@@ -695,6 +695,12 @@ class Txt2ImgPane(QWidget):
         # Load saved settings last, then wire autosave
         try:
             self._load_settings()
+        except Exception:
+            pass
+        # Hi-res helper is hidden by default; force it off while hidden
+        try:
+            if hasattr(self, 'hires_helper') and self.hires_helper is not None:
+                self.hires_helper.setChecked(False)
         except Exception:
             pass
         try:
@@ -2167,7 +2173,7 @@ class Txt2ImgPane(QWidget):
             ("1344x768 (16:9)", 1344, 768),
             ("1536x864 (16:9, max advised for SDXL)", 1536, 864),
             ("1728x972 (16:9)", 1728, 972),
-            ("1920x1080 (16:9)", 1920, 1088),
+            ("1920x1088 (16:9)", 1920, 1088),
             ("2048x1152 (16:9)", 2048, 1152),
             ("2560x1440 (16:9)", 2560, 1440),
             ("4096x2560 (16:9)", 4096, 2560),
@@ -2782,6 +2788,11 @@ class Txt2ImgPane(QWidget):
         except Exception:
             pass
         self.hires_helper = QCheckBox("Hi-res helper")
+        try:
+            self.hires_helper.setChecked(False)
+            self.hires_helper.setVisible(False)
+        except Exception:
+            pass
         self.fit_check = QCheckBox("Fit-check")
         adv_form.addRow("Sampler", self.sampler)
         adv_form.addRow(self.attn_slicing)
@@ -2838,7 +2849,7 @@ class Txt2ImgPane(QWidget):
             pass
         rowf = QHBoxLayout(); rowf.addWidget(self.filename_template, 1); rowf.addWidget(self.reset_fname)
         adv_form.addRow("Filename", rowf)
-        adv_form.addRow(self.hires_helper)
+     #   adv_form.addRow(self.hires_helper)
         # fit-check hidden per request
         # adv_form.addRow(self.fit_check)
         try:
@@ -2865,7 +2876,7 @@ class Txt2ImgPane(QWidget):
         except Exception:
             pass
         try:
-            self.threads.setToolTip("Max CPU threads for image I/O and any CPU-side steps (e.g., VAE on CPU). Higher can speed up saves/loads, but too high may reduce UI responsiveness.")
+            self.threads.setToolTip("Only Relevant for CPU users and any CPU-side offloading steps (e.g., VAE on CPU). Higher can speed up saves/loads, but using all cores of your CPU may reduce UI responsiveness.")
         except Exception:
             pass
         try:
@@ -3195,6 +3206,28 @@ class Txt2ImgPane(QWidget):
                 prev_engine = getattr(self, "_last_engine_key", None)
             except Exception:
                 prev_engine = None
+
+            # Determine the active format (user choice wins)
+            try:
+                fmt = (saved_fmt or (self.format_combo.currentText() if hasattr(self, "format_combo") else "png") or "png")
+            except Exception:
+                fmt = "png"
+            try:
+                fmt = str(fmt).strip().lower() or "png"
+            except Exception:
+                fmt = "png"
+
+            def _ensure_ext(name: str, _fmt: str) -> str:
+                try:
+                    import re as _re
+                    if not name:
+                        return name
+                    if _re.search(r"\.(png|jpe?g|webp|tiff?|bmp)$", name, flags=_re.IGNORECASE):
+                        return _re.sub(r"\.(png|jpe?g|webp|tiff?|bmp)$", f".{_fmt}", name, flags=_re.IGNORECASE)
+                    return name.rstrip('.') + f".{_fmt}"
+                except Exception:
+                    return name
+
             try:
                 if is_zimage:
                     # Store previous template once when entering Z-Image
@@ -3207,7 +3240,7 @@ class Txt2ImgPane(QWidget):
                         fname_edit.blockSignals(True)
                     except Exception:
                         pass
-                    fname_edit.setText("z_img_{seed}_{idx:03d}.png")
+                    fname_edit.setText(f"z_img_{{seed}}_{{idx:03d}}.{fmt}")
                     try:
                         fname_edit.blockSignals(False)
                     except Exception:
@@ -3219,7 +3252,13 @@ class Txt2ImgPane(QWidget):
                     except Exception:
                         orig = ""
                     if not orig:
-                        orig = "IMG_{seed}.png"
+                        orig = f"IMG_{{seed}}.{fmt}"
+                    else:
+                        # Ensure restored template extension matches current format
+                        try:
+                            orig = _ensure_ext(str(orig), fmt)
+                        except Exception:
+                            pass
                     try:
                         fname_edit.blockSignals(True)
                     except Exception:
@@ -3429,7 +3468,9 @@ class Txt2ImgPane(QWidget):
 
 
 
+
     def _on_enhance_prompt_clicked(self):
+        """Enhance the current prompt using the external Qwen helper without blocking the UI."""
         # Run the Qwen3-VL prompt helper from its own .venv and replace the prompt/negative text.
         try:
             base_prompt = (self.prompt.toPlainText() or "").strip()
@@ -3441,12 +3482,26 @@ class Txt2ImgPane(QWidget):
             except Exception:
                 pass
             return
+
+        # Prevent re-entry if a helper is already running
+        try:
+            proc = getattr(self, "_qwen_prompt_proc", None)
+            if proc is not None and proc.state() != QProcess.NotRunning:
+                try:
+                    QMessageBox.information(self, "Prompt enhancer", "Qwen prompt enhancer is already running.")
+                except Exception:
+                    pass
+                return
+        except Exception:
+            pass
+
         try:
             neg = (self.negative.toPlainText() or "").strip()
         except Exception:
             neg = ""
+
         try:
-            import subprocess, json, os
+            import json, os
             from pathlib import Path as _P
         except Exception as e:
             try:
@@ -3454,6 +3509,8 @@ class Txt2ImgPane(QWidget):
             except Exception:
                 pass
             return
+
+        # Resolve app root + helpers dir
         try:
             here = _P(__file__).resolve()
             helpers_dir = here.parent
@@ -3464,6 +3521,7 @@ class Txt2ImgPane(QWidget):
                 helpers_dir = app_root / "helpers"
             except Exception:
                 app_root = _P.cwd()
+
         # Locate dedicated .venv Python
         py_candidates = []
         try:
@@ -3486,90 +3544,250 @@ class Txt2ImgPane(QWidget):
                 continue
         if py_path is None:
             try:
-                QMessageBox.critical(self, "Prompt enhancer",
-                                     "Could not find a dedicated .venv Python.\n"
-                                     "Expected .venv/Scripts/python.exe or .venv/bin/python next to the app folder.")
+                QMessageBox.critical(
+                    self,
+                    "Prompt enhancer",
+                    "Could not find a dedicated .venv Python.\n"
+                    "Expected .venv/Scripts/python.exe or .venv/bin/python next to the app folder."
+                )
             except Exception:
                 pass
             return
+
         cli_path = helpers_dir / "prompt_enhancer_cli.py"
         if not cli_path.exists():
             try:
-                QMessageBox.critical(self, "Prompt enhancer",
-                                     "helpers/prompt_enhancer_cli.py is missing.\n"
-                                     "Please copy the helper script into the helpers/ folder.")
+                QMessageBox.critical(
+                    self,
+                    "Prompt enhancer",
+                    "helpers/prompt_enhancer_cli.py is missing.\n"
+                    "Please copy the helper script into the helpers/ folder."
+                )
             except Exception:
                 pass
             return
-        cmd = [str(py_path), str(cli_path), "--seed", base_prompt]
+
+        # Build args (no shell) — QProcess runs async, so the UI stays responsive.
+        args = [str(cli_path), "--seed", base_prompt]
         if neg:
-            cmd += ["--neg", neg]
+            args += ["--neg", neg]
+
+        # Update UI state
         try:
-            env = os.environ.copy()
+            self._qwen_prompt_prev_status = self.status.text()
         except Exception:
-            env = None
-        if env is not None:
-            env.setdefault("PYTHONUTF8", "1")
+            self._qwen_prompt_prev_status = ""
         try:
-            proc = subprocess.run(
-                cmd,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                cwd=str(app_root),
-            )
-        except Exception as e:
-            try:
-                QMessageBox.critical(self, "Prompt enhancer", f"Failed to run Qwen helper: {e}")
-            except Exception:
-                pass
-            return
-        try:
-            out_txt = proc.stdout.decode("utf-8", "ignore").strip()
-            err_txt = proc.stderr.decode("utf-8", "ignore").strip()
-        except Exception:
-            out_txt = ""
-            err_txt = ""
-        if proc.returncode != 0:
-            msg = err_txt or out_txt or f"Exit code {proc.returncode}"
-            if len(msg) > 2000:
-                msg = msg[:2000] + "..."
-            try:
-                QMessageBox.critical(self, "Prompt enhancer",
-                                     "Qwen prompt helper failed:\n\n" + msg)
-            except Exception:
-                pass
-            return
-        data = None
-        try:
-            data = json.loads(out_txt)
-        except Exception:
-            data = None
-        if not isinstance(data, dict) or not data.get("ok"):
-            msg = out_txt or "Unexpected response from helper."
-            if len(msg) > 2000:
-                msg = msg[:2000] + "..."
-            try:
-                QMessageBox.critical(self, "Prompt enhancer",
-                                     "Qwen prompt helper returned an unexpected payload:\n\n" + msg)
-            except Exception:
-                pass
-            return
-        new_prompt = data.get("prompt") or ""
-        new_neg = data.get("negatives") or ""
-        if new_prompt:
-            try:
-                self.prompt.setPlainText(new_prompt)
-            except Exception:
-                pass
-        if new_neg:
-            try:
-                self.negative.setPlainText(new_neg)
-            except Exception:
-                pass
-        try:
-            self.status.setText("Prompt enhanced with Qwen3-VL")
+            self.status.setText("Enhancing prompt (Qwen)…")
         except Exception:
             pass
+        try:
+            self._qwen_prompt_btn_text = self.btn_prompt_enhance.text()
+            self.btn_prompt_enhance.setText("Enhancing…")
+            self.btn_prompt_enhance.setEnabled(False)
+        except Exception:
+            pass
+
+        # Buffers for output
+        try:
+            self._qwen_prompt_stdout = bytearray()
+            self._qwen_prompt_stderr = bytearray()
+        except Exception:
+            self._qwen_prompt_stdout = None
+            self._qwen_prompt_stderr = None
+
+        # Start QProcess
+        try:
+            proc = QProcess(self)
+            proc.setProgram(str(py_path))
+            proc.setArguments(args)
+            proc.setWorkingDirectory(str(app_root))
+
+            try:
+                env = QProcessEnvironment.systemEnvironment()
+                env.insert("PYTHONUTF8", "1")
+                proc.setProcessEnvironment(env)
+            except Exception:
+                pass
+
+            def _read_out():
+                try:
+                    chunk = proc.readAllStandardOutput()
+                    b = bytes(chunk)
+                    if getattr(self, "_qwen_prompt_stdout", None) is not None:
+                        self._qwen_prompt_stdout.extend(b)
+                except Exception:
+                    pass
+
+            def _read_err():
+                try:
+                    chunk = proc.readAllStandardError()
+                    b = bytes(chunk)
+                    if getattr(self, "_qwen_prompt_stderr", None) is not None:
+                        self._qwen_prompt_stderr.extend(b)
+                except Exception:
+                    pass
+
+            def _cleanup_ui():
+                try:
+                    self.btn_prompt_enhance.setEnabled(True)
+                except Exception:
+                    pass
+                try:
+                    t = getattr(self, "_qwen_prompt_btn_text", None)
+                    if t:
+                        self.btn_prompt_enhance.setText(t)
+                except Exception:
+                    pass
+
+            def _finalize(exit_code: int):
+                try:
+                    out_txt = bytes(getattr(self, "_qwen_prompt_stdout", b"")).decode("utf-8", "ignore").strip()
+                except Exception:
+                    out_txt = ""
+                try:
+                    err_txt = bytes(getattr(self, "_qwen_prompt_stderr", b"")).decode("utf-8", "ignore").strip()
+                except Exception:
+                    err_txt = ""
+
+                if int(exit_code) != 0:
+                    msg = err_txt or out_txt or f"Exit code {exit_code}"
+                    if len(msg) > 2000:
+                        msg = msg[:2000] + "…"
+                    try:
+                        QMessageBox.critical(self, "Prompt enhancer", "Qwen prompt helper failed:\n\n" + msg)
+                    except Exception:
+                        pass
+                    try:
+                        self.status.setText("Prompt enhancer failed")
+                    except Exception:
+                        pass
+                    return
+
+                data = None
+                try:
+                    data = json.loads(out_txt)
+                except Exception:
+                    data = None
+                if not isinstance(data, dict) or not data.get("ok"):
+                    msg = out_txt or "Unexpected response from helper."
+                    if len(msg) > 2000:
+                        msg = msg[:2000] + "…"
+                    try:
+                        QMessageBox.critical(
+                            self,
+                            "Prompt enhancer",
+                            "Qwen prompt helper returned an unexpected payload:\n\n" + msg
+                        )
+                    except Exception:
+                        pass
+                    try:
+                        self.status.setText("Prompt enhancer returned bad output")
+                    except Exception:
+                        pass
+                    return
+
+                new_prompt = data.get("prompt") or ""
+                new_neg = data.get("negatives") or ""
+                if new_prompt:
+                    try:
+                        self.prompt.setPlainText(new_prompt)
+                    except Exception:
+                        pass
+                if new_neg:
+                    try:
+                        self.negative.setPlainText(new_neg)
+                    except Exception:
+                        pass
+                try:
+                    self.status.setText("Prompt enhanced with Qwen3-VL")
+                except Exception:
+                    pass
+
+            def _on_finished(exit_code, _exit_status):
+                try:
+                    _read_out()
+                    _read_err()
+                except Exception:
+                    pass
+                try:
+                    _cleanup_ui()
+                except Exception:
+                    pass
+                try:
+                    _finalize(int(exit_code))
+                finally:
+                    try:
+                        proc.deleteLater()
+                    except Exception:
+                        pass
+                    try:
+                        self._qwen_prompt_proc = None
+                    except Exception:
+                        pass
+
+            def _on_error(_err):
+                try:
+                    _read_out()
+                    _read_err()
+                except Exception:
+                    pass
+                try:
+                    _cleanup_ui()
+                except Exception:
+                    pass
+                try:
+                    msg = bytes(getattr(self, "_qwen_prompt_stderr", b"")).decode("utf-8", "ignore").strip()
+                except Exception:
+                    msg = ""
+                if not msg:
+                    msg = "Qwen prompt helper crashed or failed to start."
+                if len(msg) > 2000:
+                    msg = msg[:2000] + "…"
+                try:
+                    QMessageBox.critical(self, "Prompt enhancer", msg)
+                except Exception:
+                    pass
+                try:
+                    self.status.setText("Prompt enhancer failed")
+                except Exception:
+                    pass
+                try:
+                    proc.deleteLater()
+                except Exception:
+                    pass
+                try:
+                    self._qwen_prompt_proc = None
+                except Exception:
+                    pass
+
+            proc.readyReadStandardOutput.connect(_read_out)
+            proc.readyReadStandardError.connect(_read_err)
+            proc.finished.connect(_on_finished)
+            proc.errorOccurred.connect(_on_error)
+
+            self._qwen_prompt_proc = proc
+            proc.start()
+        except Exception as e:
+            try:
+                QMessageBox.critical(self, "Prompt enhancer", f"Failed to start Qwen helper: {e}")
+            except Exception:
+                pass
+            try:
+                self.btn_prompt_enhance.setEnabled(True)
+            except Exception:
+                pass
+            try:
+                t = getattr(self, "_qwen_prompt_btn_text", None)
+                if t:
+                    self.btn_prompt_enhance.setText(t)
+            except Exception:
+                pass
+            try:
+                self._qwen_prompt_proc = None
+            except Exception:
+                pass
+            return
 
     def _on_browse(self):
         d = QFileDialog.getExistingDirectory(self, "Choose output folder", self.output_path.text())
@@ -3589,10 +3807,18 @@ class Txt2ImgPane(QWidget):
         # Determine filename template; special default for Z-Image
         fname = self.filename_template.text().strip() if hasattr(self, "filename_template") else ""
         if not fname:
+            try:
+                fmt = (self.format_combo.currentText() if hasattr(self, "format_combo") else "png") or "png"
+            except Exception:
+                fmt = "png"
+            try:
+                fmt = str(fmt).strip().lower() or "png"
+            except Exception:
+                fmt = "png"
             if engine_key == "zimage":
-                fname = "z_img_{seed}_{idx:03d}.png"
+                fname = f"z_img_{{seed}}_{{idx:03d}}.{fmt}"
             else:
-                fname = "IMG_{seed}.png"
+                fname = f"IMG_{{seed}}.{fmt}"
         job = {
             "type": "txt2img",
             "engine": engine,
@@ -3623,8 +3849,7 @@ class Txt2ImgPane(QWidget):
             "threads": int(self.threads.value()),
                         "format": self.format_combo.currentText(),
             "filename_template": fname,
-
-            "hires_helper": self.hires_helper.isChecked(),
+            "hires_helper": (bool(self.hires_helper.isChecked()) if hasattr(self, "hires_helper") else False),
             "fit_check": self.fit_check.isChecked(),
             "steps": int(self.steps_slider.value()),
             "created_at": time.time(),
@@ -3943,7 +4168,7 @@ class Txt2ImgPane(QWidget):
             (self.threads, 'valueChanged'),
             (self.format_combo, 'currentIndexChanged'),
             (self.filename_template, 'textChanged'),
-            (self.hires_helper, 'toggled'),
+            (getattr(self,'hires_helper', None), 'toggled'),
             (self.fit_check, 'toggled'),
             (self.use_queue, 'toggled'),
             (self.show_in_player, 'toggled'),
@@ -4434,7 +4659,11 @@ def _gen_via_diffusers(job: dict, out_dir: Path, progress_cb=None):
             fn_tmpl = job.get("filename_template") or "IMG_{seed}.png"
             fname = fn_tmpl.format(seed=(seed if seed else 0)+i, idx=i)
             if not fname.lower().endswith((".png",".jpg",".jpeg",".webp")):
-                fname += ".png"
+                try:
+                    _fmt = str(job.get("format","png")).strip().lower() or "png"
+                except Exception:
+                    _fmt = "png"
+                fname += f".{_fmt}"
             fpath = out_dir / fname
             fpath = _unique_path(fpath)
             img.save(str(fpath))
@@ -4486,7 +4715,11 @@ def _run_qwen_cli(job: dict, out_dir: Path, tpl: str, progress_cb=None):
         for i in range(batch):
             fname = (job.get("filename_template") or "qwen_{seed}_{idx:03d}.png").format(seed=seed+i, idx=i)
             if not fname.lower().endswith(("png","jpg","jpeg","webp")):
-                fname += ".png"
+                try:
+                    _fmt = str(job.get("format","png")).strip().lower() or "png"
+                except Exception:
+                    _fmt = "png"
+                fname += f".{_fmt}"
             fpath = out_dir / fname
             fpath = _unique_path(fpath)
             model = job.get("model_path","")

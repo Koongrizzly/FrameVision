@@ -367,8 +367,6 @@ class TimelineSegment:
     cine_reverse: bool = False
     # Screen tear (vertical 3-slice)
     cine_tear_v: bool = False
-    # Screen tear (horizontal 3-slice)
-    cine_tear_h: bool = False
     # Speedup hits (play the source forward/backwards faster and repeat if needed)
     cine_speedup_forward: bool = False
     cine_speedup_backward: bool = False
@@ -378,7 +376,6 @@ class TimelineSegment:
     cine_freeze_len: float = 0.0
     cine_freeze_zoom: float = 0.0
     cine_tear_v_strength: float = 0.0
-    cine_tear_h_strength: float = 0.0
     cine_stutter_repeats: int = 0
     cine_reverse_len: float = 0.0
     cine_reverse_window: float = 0.0
@@ -724,8 +721,6 @@ def build_timeline(
     cine_stutter: bool = False,
     cine_tear_v: bool = False,
     cine_tear_v_strength: float = 0.7,
-    cine_tear_h: bool = False,
-    cine_tear_h_strength: float = 0.7,
     cine_reverse: bool = False,
     cine_speedup_forward: bool = False,
     cine_speedup_forward_factor: float = 1.5,
@@ -885,7 +880,7 @@ def build_timeline(
                 seg.slow_factor = 1.0
 
 
-    def _apply_cinematic_effects(segments: List[TimelineSegment], allow_mosaic: bool) -> None:
+    def _apply_cinematic_effects(segments: List[TimelineSegment]) -> None:
         """Mark segments for rare cinematic effects (freeze, stutter, reverse, speedups, ramps).
 
         The logic is intentionally conservative: for the freeze / stutter / reverse
@@ -906,8 +901,6 @@ def build_timeline(
             enabled_effects.append("freeze")
         if cine_tear_v:
             enabled_effects.append("tear_v")
-        if cine_tear_h:
-            enabled_effects.append("tear_h")
 
         if cine_stutter:
             enabled_effects.append("stutter")
@@ -920,8 +913,7 @@ def build_timeline(
         if cine_boomerang:
             enabled_effects.append("boomerang")
         # Mosaic uses the same 'one event per 5s' rule as the other cinematic effects.
-        # Safety: only enable Mosaic when there are enough video clips loaded.
-        if cine_mosaic and allow_mosaic:
+        if cine_mosaic:
             enabled_effects.append("mosaic")
         if cine_flip:
             enabled_effects.append("flip")
@@ -981,19 +973,6 @@ def build_timeline(
                     # Per-event direction (left slice goes left OR right, right slice mirrors)
                     # We store it on the segment; no dataclass change required.
                     seg.cine_tear_v_dir = random.choice([-1, 1])
-                elif effect_name == "tear_h":
-                    seg.cine_tear_h = True
-
-                    # Base strength from slider (0.1–1.0)
-                    base = float(max(0.1, min(1.0, cine_tear_h_strength)))
-
-                    # Per-event strength jitter (keeps it from feeling identical)
-                    jitter = random.uniform(0.85, 1.15)
-                    seg.cine_tear_h_strength = float(max(0.1, min(1.0, base * jitter)))
-
-                    # Per-event direction (top slice goes up OR down, bottom slice mirrors)
-                    # We store it on the segment; no dataclass change required.
-                    seg.cine_tear_h_dir = random.choice([-1, 1])
                 elif effect_name == "reverse":
                     seg.cine_reverse = True
                     seg.cine_reverse_len = float(max(0.10, min(1.5, cine_reverse_len)))
@@ -1491,7 +1470,6 @@ def build_timeline(
         grouped.append((cur_start, analysis.duration, max(1, cur_count)))
 
     num_sources = len(sources)
-    allow_mosaic = num_sources >= 10
     last_source_idx: Optional[int] = None
     shuffle_pool = list(range(num_sources))
     random.shuffle(shuffle_pool)
@@ -1717,7 +1695,7 @@ def build_timeline(
                     effect = "zoom"
                 elif r < 0.25:
                     effect = "flash"
-                elif r < 0.85:
+                elif r < 0.65:
                     effect = "rgb_split"
                 elif r < 0.80:
                     effect = "vhs"
@@ -1749,7 +1727,7 @@ def build_timeline(
         # 6 = VHS noise + scanlines (legacy)
         # 7 = Motion blur boost (legacy)
         # 8 = Directional push (slide-style motion)
-        # 9 = Exposure dissolve (real crossfade, no black)
+        # 9 = Luma fade (soft brightness fade)
         # 10 = Smooth zoom crossfade (continuous zoom across cut)
         if mode_for_segment == 1:  # Hard cuts
             transition = "none"
@@ -1760,11 +1738,11 @@ def build_timeline(
                 transition = "none"
         elif mode_for_segment == 3:  # Creative mix (color flashes + subtle whip)
             if energy == "high":
-                # On strong peaks, alternate between color flash and rgb split-like motion
+                # On strong peaks, alternate between color flash and whip-like motion
                 if random.random() < 0.6:
                     transition = "flashcolor"
                 else:
-                    transition = "rgb_split"
+                    transition = "whip"
             elif energy == "mid":
                 r = random.random()
                 if r < 0.3:
@@ -1785,8 +1763,8 @@ def build_timeline(
             transition = "t_motion_blur"
         elif mode_for_segment == 8:  # Directional push (slide-style motion)
             transition = "t_push"
-        elif mode_for_segment == 9:  # Exposure dissolve (real crossfade, no black)
-            transition = "t_exposure_dissolve"
+        elif mode_for_segment == 9:  # Luma fade (soft brightness fade)
+            transition = "t_luma_fade"
         elif mode_for_segment == 10:  # Smooth zoom crossfade
             transition = "t_smooth_zoom"
         else:  # 0 = Slide (soft cut for now)
@@ -1964,7 +1942,7 @@ def build_timeline(
             center_t = start_t + max(0.0, (end_t - start_t)) * 0.5
             segment_centers_final.append(center_t)
 
-        _apply_cinematic_effects(segments, allow_mosaic)
+        _apply_cinematic_effects(segments)
         _apply_break_impact_fx(segments, segment_centers_final)
         _rebuild_timeline_positions(segments)
 
@@ -2407,9 +2385,9 @@ class RenderWorker(QThread):
                     except Exception:
                         s = 0.7
                     s = max(0.1, min(1.0, s))
-                    tear_d = 0.14
+                    tear_d = 0.35
                     # Fraction of width to shift slices during the tear.
-                    shift_frac = 0.02 + 0.06 * s
+                    shift_frac = 0.04 + 0.08 * s
                     # Direction picked per event in _apply_cinematic_effects
                     try:
                         dir_sign = int(getattr(seg, "cine_tear_v_dir", 1) or 1)
@@ -2433,37 +2411,6 @@ class RenderWorker(QThread):
                     )
 
                     
-                if getattr(seg, "cine_tear_h", False):
-                    # Horizontal screen tear (3-slice): briefly offset up/down slices.
-                    try:
-                        s = float(getattr(seg, "cine_tear_h_strength", 0.7) or 0.7)
-                    except Exception:
-                        s = 0.7
-                    s = max(0.1, min(1.0, s))
-                    tear_d = 0.14
-                    # Fraction of height to shift slices during the tear.
-                    shift_frac = 0.02 + 0.06 * s
-                    # Direction picked per event in _apply_cinematic_effects
-                    try:
-                        dir_sign = int(getattr(seg, "cine_tear_h_dir", 1) or 1)
-                    except Exception:
-                        dir_sign = 1
-                    dir_sign = -1 if dir_sign < 0 else 1
-
-                    signed_shift = shift_frac * dir_sign
-
-                    # The graph:
-                    #   1) split into 3
-                    #   2) crop each third with a tiny time-gated y-offset
-                    #   3) vstack back into a full frame
-                    vf_parts.append(
-                        "split=3[a][b][c];"
-                        f"[a]crop=w=iw:h=ih/3:x=0:y='0+ih*{signed_shift:.3f}*between(t,0,{tear_d:.3f})'[a0];"
-                        f"[b]crop=w=iw:h=ih/3:x=0:y='ih/3'[b0];"
-                        f"[c]crop=w=iw:h=ih/3:x=0:y='2*ih/3-ih*{signed_shift:.3f}*between(t,0,{tear_d:.3f})'[c0];"
-                        "[a0][b0][c0]vstack=inputs=3"
-                    )
-
                 if getattr(seg, "cine_reverse", False):
                     # Reverse-bounce: optionally repeat a short reversed window
                     # to fill long segments, using a finite loop for safety.
@@ -2787,16 +2734,37 @@ class RenderWorker(QThread):
                         f"scale=iw*1.10:ih*1.10:eval=frame,"
                         f"crop=iw:ih:x='(iw*0.10)*min(t/{push_len:.3f},1)':y='0'"
                     )
-                elif seg.transition in ("t_luma_fade", "t_exposure_dissolve"):
-                    # Exposure dissolve is a *real* crossfade between adjacent clips.
-                    # It is applied later during the stitching step so we do NOT fade to black here.
-                    pass
+                elif seg.transition == "t_luma_fade":
+                    # Improved luma fade: always short, snappy, and never stays dark too long.
+
+                    # Segment length (fallback to small nonzero value)
+                    seg_len = max(0.10, float(seg.duration or 0.10))
+
+                    # Base fade duration: ~15% of segment
+                    fade_d = seg_len * 0.15
+
+                    # Clamp: always between 0.06s and 0.25s for quick transitions
+                    fade_d = max(0.06, min(0.25, fade_d))
+
+                    # Ensure fade-in + fade-out never overlap so much that frame stays dark
+                    if fade_d * 2.0 >= seg_len:
+                        fade_d = seg_len / 2.0 - 0.01
+                        if fade_d <= 0:
+                            fade_d = seg_len / 3.0
+
+                    # Out fade starts at end minus fade_d
+                    fade_out_start = seg_len - fade_d
+
+                    vf_parts.append(
+                        f"fade=t=in:st=0:d={fade_d:.3f},"
+                        f"fade=t=out:st={fade_out_start:.3f}:d={fade_d:.3f}"
+                    )
                 elif seg.transition == "t_smooth_zoom":
                     # Smooth zoom crossfade: stronger continuous zoom over the whole clip
                     # so it's clearly visible even on short segments.
-                    total = max(0.20, float(seg.duration or 1.0))
-                    # Zoom from 1.0x up to ~1.15x across the segment.
-                    zoom_expr = "1+0.15*t/{:.3f}".format(total)
+                    total = max(0.30, float(seg.duration or 1.0))
+                    # Zoom from 1.0x up to ~1.25x across the segment.
+                    zoom_expr = "1+0.25*t/{:.3f}".format(total)
                     vf_parts.append(
                         f"scale=iw*({zoom_expr}):ih*({zoom_expr}):eval=frame,crop=iw:ih"
                     )
@@ -3298,226 +3266,38 @@ class RenderWorker(QThread):
                     raise RuntimeError(f"ffmpeg failed for segment {i+1} ({seg.clip_path}):\n{out}")
                 parts.append(out_part)
             self.progress.emit(90, "Concatenating segments...")
-            # Stitch segments. For most transition styles we can safely concat, but
-            # the Exposure dissolve (mode 9) needs overlap between clips, so we apply
-            # it here as a real crossfade (no black frames).
+            concat_list = os.path.join(tmpdir, "concat.txt")
+            with open(concat_list, "w", encoding="utf-8") as f:
+                for p in parts:
+                    safe = p.replace("\\", "/")
+                    f.write(f"file '{safe}'\n")
+
             concat_video = os.path.join(tmpdir, "video_concat.mp4")
-
-            def _concat_demuxer(out_path: str) -> None:
-                concat_list = os.path.join(tmpdir, "concat.txt")
-                with open(concat_list, "w", encoding="utf-8") as f:
-                    for p in parts:
-                        safe = p.replace("\\", "/")
-                        f.write(f"file '{safe}'\n")
-                cmd = [
-                    self.ffmpeg,
-                    "-y",
-                    "-f",
-                    "concat",
-                    "-safe",
-                    "0",
-                    "-i",
-                    concat_list,
-                    "-c:v",
-                    "libx264",
-                    "-preset",
-                    "veryfast",
-                    "-crf",
-                    "18",
-                    "-pix_fmt",
-                    "yuv420p",
-                    out_path,
-                ]
-                code, out = _run_ffmpeg(cmd)
-                if code != 0 or not os.path.exists(out_path):
-                    raise RuntimeError("Failed to concat segments:\n" + out)
-
-            # Fast path: single part (no stitching needed)
-            if len(parts) == 1:
-                try:
-                    if parts[0] != concat_video:
-                        try:
-                            shutil.copy(parts[0], concat_video)
-                        except Exception:
-                            # If copy fails for any reason, just use the original part.
-                            concat_video = parts[0]
-                except Exception:
-                    concat_video = parts[0]
-            else:
-                dissolve_ids = {"t_exposure_dissolve", "t_luma_fade"}
-                use_stitch = False
-                try:
-                    # We treat the *incoming* segment's transition as the cut style.
-                    for j in range(1, min(len(parts), len(self.segments))):
-                        if getattr(self.segments[j], "transition", None) in dissolve_ids:
-                            use_stitch = True
-                            break
-                except Exception:
-                    use_stitch = False
-
-                if use_stitch:
-                    self.progress.emit(90, "Stitching transitions (exposure dissolve)...")
-                    try:
-                        cur = parts[0]
-                        for j in range(1, len(parts)):
-                            trans = "none"
-                            try:
-                                if j < len(self.segments):
-                                    trans = getattr(self.segments[j], "transition", "none") or "none"
-                            except Exception:
-                                trans = "none"
-
-                            out_tmp = os.path.join(tmpdir, f"stitch_{j:04d}.mp4")
-
-                            if trans in dissolve_ids:
-                                # Real dissolve using xfade (no black frames).
-                                dur_a = _ffprobe_duration(self.ffprobe, cur) or 0.0
-                                dur_b = _ffprobe_duration(self.ffprobe, parts[j]) or 0.0
-
-                                base_d = 0.18  # visible but still snappy
-                                if dur_a > 0.0 and dur_b > 0.0:
-                                    d = min(base_d, max(0.04, dur_a * 0.35), max(0.04, dur_b * 0.35))
-                                else:
-                                    d = 0.12
-                                offset = max(0.0, (dur_a if dur_a > 0.0 else 0.0) - d)
-
-                                # Slight exposure shift to make the dissolve feel "filmic" (optional but subtle).
-                                bright = 0.08
-                                fc = (
-                                    f"[0:v]format=yuv420p,eq=brightness={bright:.3f}[a];"
-                                    f"[1:v]format=yuv420p,eq=brightness={-bright:.3f}[b];"
-                                    f"[a][b]xfade=transition=fade:duration={d:.3f}:offset={offset:.3f},format=yuv420p[v]"
-                                )
-
-                                cmd = [
-                                    self.ffmpeg,
-                                    "-y",
-                                    "-i",
-                                    cur,
-                                    "-i",
-                                    parts[j],
-                                    "-filter_complex",
-                                    fc,
-                                    "-map",
-                                    "[v]",
-                                    "-c:v",
-                                    "h264_nvenc",
-                                    "-preset",
-                                    "p3",
-                                    "-cq",
-                                    "19",
-                                    "-pix_fmt",
-                                    "yuv420p",
-                                    out_tmp,
-                                ]
-                                code, out = _run_ffmpeg(cmd)
-                                if code != 0 or not os.path.exists(out_tmp):
-                                    # Fallback encoder
-                                    cmd = [
-                                        self.ffmpeg,
-                                        "-y",
-                                        "-i",
-                                        cur,
-                                        "-i",
-                                        parts[j],
-                                        "-filter_complex",
-                                        fc,
-                                        "-map",
-                                        "[v]",
-                                        "-c:v",
-                                        "libx264",
-                                        "-preset",
-                                        "veryfast",
-                                        "-crf",
-                                        "18",
-                                        "-pix_fmt",
-                                        "yuv420p",
-                                        out_tmp,
-                                    ]
-                                    code, out = _run_ffmpeg(cmd)
-                            else:
-                                # Hard cut (concat two videos).
-                                fc = "[0:v][1:v]concat=n=2:v=1:a=0[v]"
-                                cmd = [
-                                    self.ffmpeg,
-                                    "-y",
-                                    "-i",
-                                    cur,
-                                    "-i",
-                                    parts[j],
-                                    "-filter_complex",
-                                    fc,
-                                    "-map",
-                                    "[v]",
-                                    "-c:v",
-                                    "h264_nvenc",
-                                    "-preset",
-                                    "p3",
-                                    "-cq",
-                                    "19",
-                                    "-pix_fmt",
-                                    "yuv420p",
-                                    out_tmp,
-                                ]
-                                code, out = _run_ffmpeg(cmd)
-                                if code != 0 or not os.path.exists(out_tmp):
-                                    cmd = [
-                                        self.ffmpeg,
-                                        "-y",
-                                        "-i",
-                                        cur,
-                                        "-i",
-                                        parts[j],
-                                        "-filter_complex",
-                                        fc,
-                                        "-map",
-                                        "[v]",
-                                        "-c:v",
-                                        "libx264",
-                                        "-preset",
-                                        "veryfast",
-                                        "-crf",
-                                        "18",
-                                        "-pix_fmt",
-                                        "yuv420p",
-                                        out_tmp,
-                                    ]
-                                    code, out = _run_ffmpeg(cmd)
-
-                            if code != 0 or not os.path.exists(out_tmp):
-                                raise RuntimeError("Failed to stitch segments:\n" + out)
-
-                            # Remove previous intermediate to keep temp size sane.
-                            try:
-                                if cur not in parts and os.path.exists(cur):
-                                    os.remove(cur)
-                            except Exception:
-                                pass
-
-                            cur = out_tmp
-                            try:
-                                # keep progress moving between 90–92
-                                pct = 90 + int(2 * (j / max(1, (len(parts) - 1))))
-                                self.progress.emit(min(92, pct), f"Stitching transitions ({j}/{len(parts)-1})...")
-                            except Exception:
-                                pass
-
-                        # Final stitched output
-                        try:
-                            if cur != concat_video:
-                                try:
-                                    os.replace(cur, concat_video)
-                                except Exception:
-                                    shutil.copy(cur, concat_video)
-                        except Exception:
-                            # If moving fails, keep using current file
-                            concat_video = cur
-                    except Exception:
-                        # Fallback: hard concat (no transitions)
-                        self.progress.emit(90, "Concatenating segments...")
-                        _concat_demuxer(concat_video)
-                else:
-                    _concat_demuxer(concat_video)
+            # Re-encode concatenated video to ensure stable timestamps and avoid
+            # black/freezing issues in some players. We only have video here;
+            # audio is added in the final mux step.
+            cmd = [
+                self.ffmpeg,
+                "-y",
+                "-f",
+                "concat",
+                "-safe",
+                "0",
+                "-i",
+                concat_list,
+                "-c:v",
+                "libx264",
+                "-preset",
+                "veryfast",
+                "-crf",
+                "18",
+                "-pix_fmt",
+                "yuv420p",
+                concat_video,
+            ]
+            code, out = _run_ffmpeg(cmd)
+            if code != 0 or not os.path.exists(concat_video):
+                raise RuntimeError("Failed to concat segments:\n" + out)
 
             # Optional intro/outro styling (fade to/from black)
             video_for_mux = concat_video
@@ -3912,10 +3692,10 @@ class AutoMusicSyncWidget(QWidget):
         self.slider_image_interval.setMaximum(20)
         self.slider_image_interval.setSingleStep(1)
         self.slider_image_interval.setPageStep(2)
-        self.slider_image_interval.setValue(4)
+        self.slider_image_interval.setValue(0)
         self.slider_image_interval.setToolTip(
             "How many segments to wait before switching to a new still image.\\n"
-            "2 = very frequent image changes, 20 = very rare."
+            "2 = very frequent image changes, 20 = very rare. 0 is random"
         )
         self.slider_image_interval.valueChanged.connect(self._on_image_interval_changed)
         row_img_interval.addWidget(self.label_image_interval)
@@ -4193,14 +3973,6 @@ class AutoMusicSyncWidget(QWidget):
         cine_layout.setContentsMargins(26, 0, 0, 0)
         cine_layout.setSpacing(2)
 
-        # Quick toggle: turn all cinematic toggles on/off at once
-        row_cine_all = QHBoxLayout()
-        self.btn_cine_all = QPushButton("All on/off", self.cine_options)
-        self.btn_cine_all.setToolTip("Turn ON/OFF all toggles in the cinematic section.")
-        row_cine_all.addWidget(self.btn_cine_all)
-        row_cine_all.addStretch(1)
-        cine_layout.addLayout(row_cine_all)
-
         # Freeze-frame effect
         row_cine_freeze = QHBoxLayout()
         self.check_cine_freeze = QCheckBox("Freeze-frame (pause + zoom-in)", self.cine_options)
@@ -4255,26 +4027,6 @@ class AutoMusicSyncWidget(QWidget):
         self.label_cine_tear_v_strength.setMinimumWidth(40)
         row_cine_tear_v.addWidget(self.label_cine_tear_v_strength)
         cine_layout.addLayout(row_cine_tear_v)
-
-        # Horizontal screen tear (3 stripes)
-        row_cine_tear_h = QHBoxLayout()
-        self.check_cine_tear_h = QCheckBox("Screen tear (horizontal 3-slice)", self.cine_options)
-        self.check_cine_tear_h.setToolTip(
-            "A quick glitch-like tear that offsets three horizontal slices, then snaps back."
-        )
-        row_cine_tear_h.addWidget(self.check_cine_tear_h)
-        label_cine_tear_h = QLabel("Strength:", self.cine_options)
-        row_cine_tear_h.addWidget(label_cine_tear_h)
-        self.slider_cine_tear_h_strength = QSlider(Qt.Horizontal, self.cine_options)
-        self.slider_cine_tear_h_strength.setMinimum(10)
-        self.slider_cine_tear_h_strength.setMaximum(100)
-        self.slider_cine_tear_h_strength.setSingleStep(1)
-        self.slider_cine_tear_h_strength.setValue(70)
-        row_cine_tear_h.addWidget(self.slider_cine_tear_h_strength, 1)
-        self.label_cine_tear_h_strength = QLabel("0.70", self.cine_options)
-        self.label_cine_tear_h_strength.setMinimumWidth(40)
-        row_cine_tear_h.addWidget(self.label_cine_tear_h_strength)
-        cine_layout.addLayout(row_cine_tear_h)
 
         # Stutter slice
         row_cine_stutter = QHBoxLayout()
@@ -4413,34 +4165,52 @@ class AutoMusicSyncWidget(QWidget):
         row_cine_multiply.addWidget(self.label_cine_multiply_screens)
         cine_layout.addLayout(row_cine_multiply)
 
-        # Dolly-zoom / Ken Burns camera motion (backend-only; hidden from UI)
+        # Dolly-zoom hit
+        row_cine_dolly = QHBoxLayout()
         self.check_cine_dolly = QCheckBox("Dolly-zoom hit", self.cine_options)
         self.check_cine_dolly.setToolTip(
             "Rare dolly-zoom style camera move (push in/out while zooming) for a dramatic hit.\n"
             "Hits are placed at most about once every 30 seconds."
         )
+        row_cine_dolly.addWidget(self.check_cine_dolly)
+        label_cine_dolly = QLabel("Strength:", self.cine_options)
+        row_cine_dolly.addWidget(label_cine_dolly)
         self.slider_cine_dolly_strength = QSlider(Qt.Horizontal, self.cine_options)
         self.slider_cine_dolly_strength.setMinimum(10)
         self.slider_cine_dolly_strength.setMaximum(200)
         self.slider_cine_dolly_strength.setSingleStep(5)
         self.slider_cine_dolly_strength.setValue(50)
+        row_cine_dolly.addWidget(self.slider_cine_dolly_strength, 1)
         self.label_cine_dolly_strength = QLabel("50%", self.cine_options)
         self.label_cine_dolly_strength.setMinimumWidth(40)
+        row_cine_dolly.addWidget(self.label_cine_dolly_strength)
+        cine_layout.addLayout(row_cine_dolly)
 
+        # Ken Burns pan/zoom
+        row_cine_kb = QHBoxLayout()
         self.check_cine_kenburns = QCheckBox("Ken Burns pan/zoom", self.cine_options)
         self.check_cine_kenburns.setToolTip(
             "Rare, gentle pan/zoom across a clip (Ken Burns style).\n"
             "Also limited to about one hit every 30 seconds."
         )
+        row_cine_kb.addWidget(self.check_cine_kenburns)
+        label_cine_kb = QLabel("Strength:", self.cine_options)
+        row_cine_kb.addWidget(label_cine_kb)
         self.slider_cine_kenburns_strength = QSlider(Qt.Horizontal, self.cine_options)
         self.slider_cine_kenburns_strength.setMinimum(10)
         self.slider_cine_kenburns_strength.setMaximum(200)
         self.slider_cine_kenburns_strength.setSingleStep(5)
         self.slider_cine_kenburns_strength.setValue(40)
+        row_cine_kb.addWidget(self.slider_cine_kenburns_strength, 1)
         self.label_cine_kenburns_strength = QLabel("40%", self.cine_options)
         self.label_cine_kenburns_strength.setMinimumWidth(40)
+        row_cine_kb.addWidget(self.label_cine_kenburns_strength)
+        cine_layout.addLayout(row_cine_kb)
 
-        # Shared motion direction dropdown (used internally, hidden)
+        # Shared motion direction dropdown
+        row_cine_dir = QHBoxLayout()
+        label_cine_dir = QLabel("Motion direction:", self.cine_options)
+        row_cine_dir.addWidget(label_cine_dir)
         self.combo_cine_motion_dir = QComboBox(self.cine_options)
         self.combo_cine_motion_dir.addItems(
             [
@@ -4457,6 +4227,8 @@ class AutoMusicSyncWidget(QWidget):
             "Controls the direction for dolly / Ken Burns camera moves.\n"
             "Leave on 'Random each hit' to vary direction automatically."
         )
+        row_cine_dir.addWidget(self.combo_cine_motion_dir, 1)
+        cine_layout.addLayout(row_cine_dir)
 
         # Speedup (forward)
         row_cine_speedup_forward = QHBoxLayout()
@@ -4551,14 +4323,6 @@ class AutoMusicSyncWidget(QWidget):
         impact_layout = QVBoxLayout(self.impact_options)
         impact_layout.setContentsMargins(26, 0, 0, 0)
         impact_layout.setSpacing(2)
-
-        # Quick toggle: turn all break/drop impact toggles on/off at once
-        row_impact_all = QHBoxLayout()
-        self.btn_impact_all = QPushButton("All on/off", self.impact_options)
-        self.btn_impact_all.setToolTip("Turn ON/OFF all toggles in the break/drop impact section.")
-        row_impact_all.addWidget(self.btn_impact_all)
-        row_impact_all.addStretch(1)
-        impact_layout.addLayout(row_impact_all)
 
         # Flash strobe
         row_impact_flash = QHBoxLayout()
@@ -4773,8 +4537,8 @@ class AutoMusicSyncWidget(QWidget):
         row_viz = QHBoxLayout()
         self.check_visual_overlay = QCheckBox("Add music-player visuals overlay", self)
         self.check_visual_overlay.setToolTip(
-            "Render one of your beat synced visuals as an overlay layer on the final clip. "
-             "Warning : Every toggle in here will MORE then double the generation time of your finished video !"
+            "Render one of your live music-player visuals as an overlay layer on the final clip. "
+            "Uses a random visual preset from presets/viz for each render."
         )
         row_viz.addWidget(self.check_visual_overlay)
         row_viz.addStretch(1)
@@ -4860,7 +4624,7 @@ class AutoMusicSyncWidget(QWidget):
                 "Flash/dip mix",
                 "Creative festival mix (strobes + hits)",
                 "Directional push (slide)",
-                "Exposure dissolve (no black)",
+                "Luma fade",
                 "Smooth zoom crossfade",
             ]
         )
@@ -4875,7 +4639,7 @@ class AutoMusicSyncWidget(QWidget):
             "- Flash/dip mix: combo of bright flashes and quick dips.\n"
             "- Creative festival mix: playful blend of flashes, dips and pulses.\n"
             "- Directional push: smooth slide-style motion across the cut.\n"
-            "- Exposure dissolve (no black): real dissolve between clips without black frames.\n"
+            "- Luma fade: soft brightness-based fade in/out.\n"
             "- Smooth zoom crossfade: continuous, gentle zoom across the cut.\n"
         )
         row_trans.addWidget(self.combo_transitions, 1)
@@ -5042,7 +4806,6 @@ class AutoMusicSyncWidget(QWidget):
         self.slider_cine_freeze_len.valueChanged.connect(self._on_cine_freeze_len_changed)
         self.slider_cine_freeze_zoom.valueChanged.connect(self._on_cine_freeze_zoom_changed)
         self.slider_cine_tear_v_strength.valueChanged.connect(self._on_cine_tear_v_strength_changed)
-        self.slider_cine_tear_h_strength.valueChanged.connect(self._on_cine_tear_h_strength_changed)
         self.slider_cine_reverse_len.valueChanged.connect(self._on_cine_reverse_len_changed)
         self.slider_cine_ramp_in.valueChanged.connect(self._on_cine_ramp_in_changed)
         self.slider_cine_ramp_out.valueChanged.connect(self._on_cine_ramp_out_changed)
@@ -5068,17 +4831,6 @@ class AutoMusicSyncWidget(QWidget):
         self.slider_impact_fire_multi.valueChanged.connect(self._on_impact_fire_multi_changed)
 
         
-
-        # All on/off buttons for the two FX sub-sections
-        try:
-            self.btn_cine_all.clicked.connect(self._on_cine_all_onoff)
-        except Exception:
-            pass
-        try:
-            self.btn_impact_all.clicked.connect(self._on_impact_all_onoff)
-        except Exception:
-            pass
-
         # When the user explicitly enables any FX-related option, automatically
         # release the master 'No FX' switch so effects become visible again.
         self.combo_fx.currentIndexChanged.connect(lambda _i: self._maybe_release_nofx())
@@ -5465,7 +5217,7 @@ class AutoMusicSyncWidget(QWidget):
             "Flash/dip mix",
             "Creative festival mix (strobes + hits)",
             "Directional push (slide)",
-            "Exposure dissolve (no black)",
+            "Luma fade",
             "Smooth zoom crossfade",
         ]
         dlg = QDialog(self)
@@ -5608,30 +5360,11 @@ class AutoMusicSyncWidget(QWidget):
         except Exception:
             pass
 
-        # Clear basic path fields (keep output path).
+        # Clear basic path fields.
         try:
             self.edit_audio.clear()
             self.edit_video.clear()
-        except Exception:
-            pass
-
-        # Turn off cinematic + break/drop FX using the section all-on/off helpers.
-        try:
-            if hasattr(self, "check_cine_enable"):
-                self.check_cine_enable.setChecked(False)
-        except Exception:
-            pass
-        try:
-            self._set_all_cinematic_toggles(False)
-        except Exception:
-            pass
-        try:
-            if hasattr(self, "check_impact_enable"):
-                self.check_impact_enable.setChecked(False)
-        except Exception:
-            pass
-        try:
-            self._set_all_impact_toggles(False)
+            self.edit_output.clear()
         except Exception:
             pass
 
@@ -5647,16 +5380,8 @@ class AutoMusicSyncWidget(QWidget):
             pass
 
         # Finally, forget persisted settings so a fresh session starts from defaults.
-        # Keep the output folder so 'Reset all' doesn't wipe it.
         try:
-            out_keep = ""
-            try:
-                out_keep = self.edit_output.text().strip()
-            except Exception:
-                out_keep = ""
             self._settings.clear()
-            if out_keep:
-                self._settings.setValue("output_path", out_keep)
         except Exception:
             pass
 
@@ -5864,12 +5589,6 @@ class AutoMusicSyncWidget(QWidget):
                 except Exception:
                     pass
 
-        # Make sure hidden camera-motion FX stay off even if a preset tries to enable them.
-        try:
-            self._disable_camera_motion_fx()
-        except Exception:
-            pass
-
         try:
             self.label_summary.setText(f"Preset applied: {preset_name}")
         except Exception:
@@ -5923,12 +5642,6 @@ class AutoMusicSyncWidget(QWidget):
             except Exception:
                 # Never crash if a single field fails – just skip it.
                 continue
-        # Ensure hidden camera-motion FX are always off, even if present in the preset dict.
-        try:
-            self._disable_camera_motion_fx()
-        except Exception:
-            pass
-
     def _load_settings(self) -> None:
         """Load last-used paths and options from QSettings."""
         s = self._settings
@@ -5976,7 +5689,7 @@ class AutoMusicSyncWidget(QWidget):
         if slider is not None:
             try:
                 slider.blockSignals(True)
-                slider.setMinimum(0)
+                slider.setMinimum(2)
                 slider.setMaximum(20)
                 slider.setValue(interval)
             finally:
@@ -6003,8 +5716,6 @@ class AutoMusicSyncWidget(QWidget):
         self.slider_cine_freeze_zoom.setValue(int(s.value("cine_freeze_zoom", self.slider_cine_freeze_zoom.value())))
         self.check_cine_tear_v.setChecked(bool(int(s.value("cine_tear_v", int(self.check_cine_tear_v.isChecked())))))
         self.slider_cine_tear_v_strength.setValue(int(s.value("cine_tear_v_strength", self.slider_cine_tear_v_strength.value())))
-        self.check_cine_tear_h.setChecked(bool(int(s.value("cine_tear_h", int(self.check_cine_tear_h.isChecked())))))
-        self.slider_cine_tear_h_strength.setValue(int(s.value("cine_tear_h_strength", self.slider_cine_tear_h_strength.value())))
 
         self.check_cine_stutter.setChecked(bool(int(s.value("cine_stutter", int(self.check_cine_stutter.isChecked())))))
         self.spin_cine_stutter_repeats.setValue(int(s.value("cine_stutter_repeats", self.spin_cine_stutter_repeats.value())))
@@ -6035,12 +5746,6 @@ class AutoMusicSyncWidget(QWidget):
         self.check_cine_multiply.setChecked(bool(int(s.value("cine_multiply", int(self.check_cine_multiply.isChecked())))))
         self.slider_cine_multiply_screens.setValue(int(s.value("cine_multiply_screens", self.slider_cine_multiply_screens.value())))
         self.check_cine_multiply_random.setChecked(bool(int(s.value("cine_multiply_random", int(self.check_cine_multiply_random.isChecked())))))
-
-        # Dolly / Ken Burns camera moves are hidden from the UI and always disabled.
-        try:
-            self._disable_camera_motion_fx()
-        except Exception:
-            pass
 
         # Break impact FX options
         self.check_impact_enable.setChecked(bool(int(s.value("impact_enable", int(getattr(self, "check_impact_enable").isChecked())))))
@@ -6214,8 +5919,6 @@ class AutoMusicSyncWidget(QWidget):
         s.setValue("cine_freeze_zoom", int(self.slider_cine_freeze_zoom.value()))
         s.setValue("cine_tear_v", int(self.check_cine_tear_v.isChecked()))
         s.setValue("cine_tear_v_strength", int(self.slider_cine_tear_v_strength.value()))
-        s.setValue("cine_tear_h", int(self.check_cine_tear_h.isChecked()))
-        s.setValue("cine_tear_h_strength", int(self.slider_cine_tear_h_strength.value()))
         s.setValue("cine_stutter", int(self.check_cine_stutter.isChecked()))
         s.setValue("cine_stutter_repeats", int(self.spin_cine_stutter_repeats.value()))
         s.setValue("cine_reverse", int(self.check_cine_reverse.isChecked()))
@@ -6505,60 +6208,6 @@ class AutoMusicSyncWidget(QWidget):
                 except Exception:
                     pass
 
-
-    def _disable_camera_motion_fx(self) -> None:
-        """Hide and force-disable dolly-zoom / Ken Burns camera motion FX.
-
-        The underlying widgets stay alive for backwards compatibility with
-        saved presets/settings, but while this helper is active they are
-        always hidden and turned off.
-        """
-        for name in (
-            "check_cine_dolly",
-            "check_cine_kenburns",
-        ):
-            cb = getattr(self, name, None)
-            if cb is not None:
-                try:
-                    cb.setChecked(False)
-                    cb.setEnabled(False)
-                    cb.hide()
-                except Exception:
-                    pass
-
-        for name, default in (
-            ("slider_cine_dolly_strength", 50),
-            ("slider_cine_kenburns_strength", 40),
-        ):
-            w = getattr(self, name, None)
-            if w is not None:
-                try:
-                    w.setValue(default)
-                    w.setEnabled(False)
-                    w.hide()
-                except Exception:
-                    pass
-
-        for name in (
-            "label_cine_dolly_strength",
-            "label_cine_kenburns_strength",
-        ):
-            w = getattr(self, name, None)
-            if w is not None:
-                try:
-                    w.hide()
-                except Exception:
-                    pass
-
-        combo = getattr(self, "combo_cine_motion_dir", None)
-        if combo is not None:
-            try:
-                combo.setCurrentIndex(0)
-                combo.setEnabled(False)
-                combo.hide()
-            except Exception:
-                pass
-
     def _on_cine_freeze_len_changed(self, value: int) -> None:
         seconds = value / 100.0
         try:
@@ -6580,16 +6229,6 @@ class AutoMusicSyncWidget(QWidget):
             v = 0
         try:
             self.label_cine_tear_v_strength.setText(f"{v/100.0:.2f}")
-        except Exception:
-            pass
-
-    def _on_cine_tear_h_strength_changed(self, value: int) -> None:
-        try:
-            v = int(value)
-        except Exception:
-            v = 0
-        try:
-            self.label_cine_tear_h_strength.setText(f"{v/100.0:.2f}")
         except Exception:
             pass
 
@@ -6759,138 +6398,6 @@ class AutoMusicSyncWidget(QWidget):
             self.label_cine_kenburns_strength.setText(f"{v:d}%")
         except Exception:
             pass
-
-
-    # --- section all on/off helpers -------------------------------------
-
-    def _set_all_cinematic_toggles(self, enabled: bool) -> None:
-        """Set all visible cinematic toggles to the given state."""
-        targets = [
-            "check_cine_freeze",
-            "check_cine_tear_v",
-            "check_cine_tear_h",
-            "check_cine_stutter",
-            "check_cine_reverse",
-            "check_cine_speedup_forward",
-            "check_cine_speedup_backward",
-            "check_cine_speed_ramp",
-            "check_cine_boomerang",
-            "check_cine_mosaic",
-            "check_cine_mosaic_random",
-            "check_cine_flip",
-            "check_cine_rotate",
-            "check_cine_multiply",
-            "check_cine_multiply_random",
-        ]
-        for name in targets:
-            cb = getattr(self, name, None)
-            if cb is None:
-                continue
-            try:
-                cb.setChecked(bool(enabled))
-            except Exception:
-                pass
-
-        # Keep hidden camera-motion FX forced off.
-        try:
-            self._disable_camera_motion_fx()
-        except Exception:
-            pass
-
-    def _on_cine_all_onoff(self) -> None:
-        """Toggle all cinematic checkboxes in this section."""
-        targets = [
-            getattr(self, "check_cine_freeze", None),
-            getattr(self, "check_cine_tear_v", None),
-            getattr(self, "check_cine_tear_h", None),
-            getattr(self, "check_cine_stutter", None),
-            getattr(self, "check_cine_reverse", None),
-            getattr(self, "check_cine_speedup_forward", None),
-            getattr(self, "check_cine_speedup_backward", None),
-            getattr(self, "check_cine_speed_ramp", None),
-            getattr(self, "check_cine_boomerang", None),
-            getattr(self, "check_cine_mosaic", None),
-            getattr(self, "check_cine_mosaic_random", None),
-            getattr(self, "check_cine_flip", None),
-            getattr(self, "check_cine_rotate", None),
-            getattr(self, "check_cine_multiply", None),
-            getattr(self, "check_cine_multiply_random", None),
-        ]
-        all_on = True
-        any_cb = False
-        for cb in targets:
-            if cb is None:
-                continue
-            any_cb = True
-            try:
-                if not cb.isChecked():
-                    all_on = False
-                    break
-            except Exception:
-                all_on = False
-                break
-        if not any_cb:
-            return
-        self._set_all_cinematic_toggles(not all_on)
-
-    def _set_all_impact_toggles(self, enabled: bool) -> None:
-        """Set all visible break/drop impact toggles to the given state."""
-        targets = [
-            "check_impact_flash",
-            "check_impact_shock",
-            "check_impact_echo",
-            "check_impact_confetti",
-            "check_impact_zoom",
-            "check_impact_shake",
-            "check_impact_random",
-        ]
-        for name in targets:
-            cb = getattr(self, name, None)
-            if cb is None:
-                continue
-            try:
-                cb.setChecked(bool(enabled))
-            except Exception:
-                pass
-
-        # Ensure hidden legacy impact FX stay off.
-        for name in ("check_impact_fog", "check_impact_fire_gold", "check_impact_fire_multi"):
-            cb = getattr(self, name, None)
-            if cb is None:
-                continue
-            try:
-                cb.setChecked(False)
-            except Exception:
-                pass
-
-    def _on_impact_all_onoff(self) -> None:
-        """Toggle all break/drop impact checkboxes in this section."""
-        targets = [
-            getattr(self, "check_impact_flash", None),
-            getattr(self, "check_impact_shock", None),
-            getattr(self, "check_impact_echo", None),
-            getattr(self, "check_impact_confetti", None),
-            getattr(self, "check_impact_zoom", None),
-            getattr(self, "check_impact_shake", None),
-            getattr(self, "check_impact_random", None),
-        ]
-        all_on = True
-        any_cb = False
-        for cb in targets:
-            if cb is None:
-                continue
-            any_cb = True
-            try:
-                if not cb.isChecked():
-                    all_on = False
-                    break
-            except Exception:
-                all_on = False
-                break
-        if not any_cb:
-            return
-        self._set_all_impact_toggles(not all_on)
-
 
 
     # --- break impact FX helpers ----------------------------------------
@@ -7450,23 +6957,6 @@ class AutoMusicSyncWidget(QWidget):
         slow_factor = max(0.10, min(1.0, self.slider_slow_factor.value() / 100.0)) if slow_enabled else 1.0
         slow_random = bool(self.check_slow_random.isChecked()) if slow_enabled else False
 
-        # Safety: when still images are used, disable slow‑motion segments and
-        # force a single, stable transition mode instead of random transitions.
-        has_images = bool(getattr(self, "image_sources", []))
-        if has_images and slow_enabled:
-            slow_enabled = False
-            slow_sections = []
-            slow_factor = 1.0
-            slow_random = False
-
-        # Compute whether random transitions are allowed for this run.
-        transition_random_enabled = (self.check_trans_random.isChecked() and not nofx)
-        if has_images:
-            # With still images, random transitions can cause ffmpeg issues,
-            # so we silently disable them and stick to Motion blur whip‑cuts.
-            transition_random_enabled = False
-            transition_mode = 5
-
         # Break impact FX configuration (first beat after each break)
         impact_enabled = self.check_impact_enable.isChecked() and not nofx
         impact_flash = self.check_impact_flash.isChecked()
@@ -7509,7 +6999,7 @@ class AutoMusicSyncWidget(QWidget):
             force_full_length=force_full_length,
             seed_enabled=seed_enabled,
             seed_value=seed_value,
-            transition_random=transition_random_enabled,
+            transition_random=(self.check_trans_random.isChecked() and not nofx),
             transition_modes_enabled=sorted(self._enabled_transition_modes),
             slow_motion_enabled=slow_enabled,
             slow_motion_factor=slow_factor,
@@ -7528,8 +7018,6 @@ class AutoMusicSyncWidget(QWidget):
             cine_freeze_zoom=self.slider_cine_freeze_zoom.value() / 100.0,
             cine_tear_v=bool(self.check_cine_tear_v.isChecked()),
             cine_tear_v_strength=self.slider_cine_tear_v_strength.value() / 100.0,
-            cine_tear_h=bool(self.check_cine_tear_h.isChecked()),
-            cine_tear_h_strength=self.slider_cine_tear_h_strength.value() / 100.0,
             cine_stutter_repeats=int(self.spin_cine_stutter_repeats.value()),
             cine_reverse_len=self.slider_cine_reverse_len.value() / 100.0,
             cine_ramp_in=self.slider_cine_ramp_in.value() / 100.0,

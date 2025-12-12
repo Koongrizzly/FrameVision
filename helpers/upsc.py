@@ -810,6 +810,23 @@ class UpscPane(QtWidgets.QWidget):
             size_row.addWidget(self.sld_recent_size, 1)
             self.lbl_recent_size = QtWidgets.QLabel("100 px", self)
             size_row.addWidget(self.lbl_recent_size)
+
+            # Manual refresh button for Recent results
+            try:
+                self.btn_recents_refresh = QtWidgets.QPushButton("Refresh", self)
+                try:
+                    self.btn_recents_refresh.setToolTip("Refresh Recent results")
+                except Exception:
+                    pass
+                size_row.addSpacing(8)
+                size_row.addWidget(self.btn_recents_refresh)
+                try:
+                    self.btn_recents_refresh.clicked.connect(lambda: self._rebuild_recents())
+                except Exception:
+                    pass
+            except Exception:
+                self.btn_recents_refresh = None
+
             rec_wrap.addLayout(size_row)
 
             # Scroll area with a wrapped grid of thumbnails
@@ -841,13 +858,11 @@ class UpscPane(QtWidgets.QWidget):
             self.recents_box = _Disclosure("Recent results", rec_body, start_open=False, parent=self)
             v_main.addWidget(self.recents_box)
 
-            # Initial build + poller
+            # Recent results: manual refresh mode
+            self._recents_manual_mode = True
             try:
-                QTimer.singleShot(0, self._rebuild_recents)
-            except Exception:
-                pass
-            try:
-                self._install_recents_poller()
+                # One-time delayed build at startup (no background polling)
+                QTimer.singleShot(2500, self._rebuild_recents)
             except Exception:
                 pass
 
@@ -926,7 +941,7 @@ class UpscPane(QtWidgets.QWidget):
             except Exception:
                 pass
 
-            # Wire sort dropdown to rebuild thumbnails
+            # Wire sort dropdown to reorder the grid (user-driven)
             try:
                 if getattr(self, "combo_recent_sort", None) is not None:
                     def _on_recent_sort(_index):
@@ -940,6 +955,10 @@ class UpscPane(QtWidgets.QWidget):
                         pass
             except Exception:
                 pass
+
+
+
+
         except Exception:
             pass
 
@@ -1874,39 +1893,8 @@ class UpscPane(QtWidgets.QWidget):
 
     def _install_recents_poller(self):
         """Poll the Upscale recents folder every few seconds; rebuild UI on change."""
-        try:
-            if getattr(self, "_recents_poller", None):
-                return
-
-            def _sig():
-                try:
-                    files = self._list_recent_files()
-                    return tuple((p.name, int(p.stat().st_mtime)) for p in files)
-                except Exception:
-                    return tuple()
-
-            def _tick():
-                try:
-                    cur = _sig()
-                    if cur != getattr(self, "_recents_sig", None):
-                        self._recents_sig = cur
-                        self._rebuild_recents()
-                except Exception:
-                    pass
-
-            try:
-                self._recents_sig = None
-                _tick()
-            except Exception:
-                pass
-
-            t = QTimer(self)
-            t.setInterval(5000)
-            t.timeout.connect(_tick)
-            t.start()
-            self._recents_poller = t
-        except Exception:
-            pass
+        # Disabled: Recent results now use manual refresh to avoid UI hitches.
+        return
 
     def _add_recent(self, media):
         """Record a freshly produced output in recents (thumbnail + in-memory map)."""
@@ -2274,13 +2262,14 @@ class UpscPane(QtWidgets.QWidget):
                                     self._recents_thumb_map = mapping
                                 except Exception:
                                     pass
+                                # User-driven rename: update the grid immediately
                                 try:
                                     self._rebuild_recents()
                                 except Exception:
                                     pass
+                                return
                             except Exception:
                                 pass
-                            return
 
                         # Open folder: reveal the file in its folder
                         if chosen is act_open and act_open is not None:
@@ -2452,10 +2441,12 @@ class UpscPane(QtWidgets.QWidget):
                             w = 0
                         if w and w != getattr(self, "_recents_last_w", 0):
                             self._recents_last_w = w
-                            try:
-                                self._rebuild_recents()
-                            except Exception:
-                                pass
+                            # In manual mode, don't auto-rebuild on resize
+                            if not getattr(self, "_recents_manual_mode", False):
+                                try:
+                                    self._rebuild_recents()
+                                except Exception:
+                                    pass
         except Exception:
             pass
         try:
@@ -2956,10 +2947,7 @@ class UpscPane(QtWidgets.QWidget):
             self._run_cmd([cmd], open_on_success=True)
         finally:
             self._job_running = False
-            try:
-                self._rebuild_recents()
-            except Exception:
-                pass
+            # Recent results are refreshed manually using the Refresh button.
 
     
     def _run_cmd(self, cmds: List[List[str]], open_on_success: bool = False, cleanup_dirs: Optional[List[Path]] = None):
@@ -2981,10 +2969,6 @@ class UpscPane(QtWidgets.QWidget):
                             pass
                         finally:
                             self._job_running = False
-                            try:
-                                self._rebuild_recents()
-                            except Exception:
-                                pass
                     if cleanup_dirs:
                         for d in cleanup_dirs:
                             try:
