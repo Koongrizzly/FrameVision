@@ -39,7 +39,20 @@
         "check_visual_overlay": true,
         "check_visual_strategy_segment": false,
         "check_visual_strategy_section": true,
-        "slider_visual_opacity": 20
+        "slider_visual_opacity": 20,
+        "check_cine_tear_v": true,
+        "check_cine_tear_h": true,
+        "slider_cine_tear_v_strength": 40,
+        "slider_cine_tear_h_strength": 40,
+        "slider_cine_rotate_degrees": 25,
+        "check_cine_flip": false,
+        "check_cine_speedup_forward": false,
+        "check_cine_speedup_backward": false,
+        "spin_cine_speedup_forward": 1.5,
+        "spin_cine_speedup_backward": 1.75,
+        "check_impact_enable": true,
+        "check_impact_echo": true,
+        "slider_impact_echo": 30
       }
     },
     {
@@ -87,7 +100,19 @@
         "check_visual_overlay": false,
         "check_visual_strategy_segment": false,
         "check_visual_strategy_section": false,
-        "slider_visual_opacity": 20
+        "slider_visual_opacity": 40,
+        "check_cine_tear_v": true,
+        "check_cine_tear_h": true,
+        "slider_cine_tear_v_strength": 86,
+        "slider_cine_tear_h_strength": 86,
+        "slider_cine_rotate_degrees": 75,
+        "check_cine_flip": true,
+        "check_cine_speedup_forward": false,
+        "check_cine_speedup_backward": false,
+        "spin_cine_speedup_forward": 2.66,
+        "spin_cine_speedup_backward": 3.3,
+        "check_impact_echo": true,
+        "slider_impact_echo": 84
       }
     },
     {
@@ -142,7 +167,19 @@
         "check_visual_overlay": true,
         "check_visual_strategy_segment": false,
         "check_visual_strategy_section": true,
-        "slider_visual_opacity": 20
+        "slider_visual_opacity": 50,
+        "check_cine_tear_v": true,
+        "check_cine_tear_h": true,
+        "slider_cine_tear_v_strength": 94,
+        "slider_cine_tear_h_strength": 94,
+        "slider_cine_rotate_degrees": 84,
+        "check_cine_flip": true,
+        "check_cine_speedup_forward": true,
+        "check_cine_speedup_backward": true,
+        "spin_cine_speedup_forward": 2.85,
+        "spin_cine_speedup_backward": 3.56,
+        "check_impact_echo": true,
+        "slider_impact_echo": 93
       }
     },
     {
@@ -192,7 +229,19 @@
         "check_visual_overlay": true,
         "check_visual_strategy_segment": true,
         "check_visual_strategy_section": false,
-        "slider_visual_opacity": 30
+        "slider_visual_opacity": 60,
+        "check_cine_tear_v": true,
+        "check_cine_tear_h": true,
+        "slider_cine_tear_v_strength": 98,
+        "slider_cine_tear_h_strength": 98,
+        "slider_cine_rotate_degrees": 88,
+        "check_cine_flip": true,
+        "check_cine_speedup_forward": true,
+        "check_cine_speedup_backward": true,
+        "spin_cine_speedup_forward": 2.95,
+        "spin_cine_speedup_backward": 3.69,
+        "check_impact_echo": true,
+        "slider_impact_echo": 98
       }
     },
     {
@@ -235,7 +284,7 @@
         "check_cine_mosaic": true,
         "check_cine_mosaic_random": true,
         "check_cine_rotate": true,
-        "slider_cine_rotate_degrees": 45,
+        "slider_cine_rotate_degrees": 75,
         "check_cine_multiply": true,
         "check_cine_multiply_random": true,
         "check_cine_dolly": false,
@@ -256,7 +305,18 @@
         "check_visual_overlay": true,
         "check_visual_strategy_segment": false,
         "check_visual_strategy_section": true,
-        "slider_visual_opacity": 20
+        "slider_visual_opacity": 40,
+        "check_cine_tear_v": true,
+        "check_cine_tear_h": true,
+        "slider_cine_tear_v_strength": 86,
+        "slider_cine_tear_h_strength": 86,
+        "check_cine_flip": true,
+        "check_cine_speedup_forward": true,
+        "check_cine_speedup_backward": true,
+        "spin_cine_speedup_forward": 2.66,
+        "spin_cine_speedup_backward": 3.3,
+        "check_impact_echo": true,
+        "slider_impact_echo": 84
       }
     },
     {
@@ -301,9 +361,9 @@
         "check_cine_mosaic": true,
         "slider_cine_mosaic_screens": 9,
         "check_cine_mosaic_random": true,
-        "check_cine_flip": false,
+        "check_cine_flip": true,
         "check_cine_rotate": true,
-        "slider_cine_rotate_degrees": 46,
+        "slider_cine_rotate_degrees": 75,
         "check_cine_multiply": true,
         "slider_cine_multiply_screens": 9,
         "check_cine_multiply_random": true,
@@ -333,7 +393,17 @@
         "check_visual_overlay": true,
         "check_visual_strategy_segment": false,
         "check_visual_strategy_section": true,
-        "slider_visual_opacity": 20
+        "slider_visual_opacity": 45,
+        "check_cine_tear_v": true,
+        "check_cine_tear_h": true,
+        "slider_cine_tear_v_strength": 86,
+        "slider_cine_tear_h_strength": 86,
+        "check_cine_speedup_forward": true,
+        "check_cine_speedup_backward": true,
+        "spin_cine_speedup_forward": 2.66,
+        "spin_cine_speedup_backward": 3.3,
+        "check_impact_echo": true,
+        "slider_impact_echo": 84
       }
     },
     {
@@ -387,7 +457,19 @@
         "check_visual_overlay": true,
         "check_visual_strategy_segment": true,
         "check_visual_strategy_section": false,
-        "slider_visual_opacity": 35
+        "slider_visual_opacity": 55,
+        "check_cine_tear_v": true,
+        "check_cine_tear_h": true,
+        "slider_cine_tear_v_strength": 100,
+        "slider_cine_tear_h_strength": 100,
+        "slider_cine_rotate_degrees": 90,
+        "check_cine_flip": true,
+        "check_cine_speedup_forward": true,
+        "check_cine_speedup_backward": true,
+        "spin_cine_speedup_forward": 3.0,
+        "spin_cine_speedup_backward": 3.75,
+        "check_impact_echo": true,
+        "slider_impact_echo": 100
       }
     },
     {
@@ -400,12 +482,24 @@
         "spin_beats_per_seg": 4,
         "combo_transitions": 1,
         "check_slow_enable": false,
-        "check_cine_enable": false,
-        "check_impact_enable": false,
+        "check_cine_enable": true,
+        "check_impact_enable": true,
         "check_visual_overlay": true,
         "check_visual_strategy_segment": true,
         "check_visual_strategy_section": false,
-        "slider_visual_opacity": 100
+        "slider_visual_opacity": 100,
+        "check_cine_tear_v": true,
+        "check_cine_tear_h": true,
+        "slider_cine_tear_v_strength": 94,
+        "slider_cine_tear_h_strength": 94,
+        "slider_cine_rotate_degrees": 84,
+        "check_cine_flip": true,
+        "check_cine_speedup_forward": true,
+        "check_cine_speedup_backward": true,
+        "spin_cine_speedup_forward": 2.85,
+        "spin_cine_speedup_backward": 3.56,
+        "check_impact_echo": true,
+        "slider_impact_echo": 93
       }
     }
   ]
