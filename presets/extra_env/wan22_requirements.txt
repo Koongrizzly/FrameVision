@@ -1,7 +1,7 @@
 # Use CUDA-enabled PyTorch wheels (CUDA 12.1) for WAN 2.2.
 # NOTE: PyTorch (torch/torchvision/torchaudio) is installed separately
 #       in wan22_setup.bat and MUST NOT be installed from this file.
---extra-index-url https://download.pytorch.org/whl/cu121
+# --extra-index-url https://download.pytorch.org/whl/cu121
 
 Pillow
 tqdm

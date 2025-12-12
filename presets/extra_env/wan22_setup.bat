@@ -1,5 +1,4 @@
 @echo off
-setlocal EnableExtensions
 REM WAN 2.2 5B - FINAL CLEAN INSTALLER (FIXED)
 REM - Uses Python snapshot_download (no hf CLI)
 REM - Downloads WAN-AI/Wan2.2-TI2V-5B into models\wan22
@@ -38,11 +37,10 @@ REM ------------------------------------------------
 REM 2) Basic checks
 REM ------------------------------------------------
 
-REM Requirements file check (safe for paths with parentheses)
-if exist "%REQ_FILE%" goto :req_ok
-echo [ERROR] Requirements file not found: %REQ_FILE%
-goto :fatal_error
-:req_ok
+if not exist "%REQ_FILE%" (
+    echo [ERROR] Requirements file not found: %REQ_FILE%
+    goto :fatal_error
+)
 
 where python >nul 2>&1
 if errorlevel 1 (
@@ -54,18 +52,16 @@ REM ------------------------------------------------
 REM 3) Create / reuse virtual environment
 REM ------------------------------------------------
 
-REM Virtual environment setup (safe for paths with parentheses)
-if exist "%VENV_DIR%\Scripts\python.exe" goto :venv_ok
-echo [INFO] Creating virtual environment...
-python -m venv "%VENV_DIR%"
-if errorlevel 1 (
-    echo [ERROR] Failed to create virtualenv.
-    goto :fatal_error
+if not exist "%VENV_DIR%\Scripts\python.exe" (
+    echo [INFO] Creating virtual environment...
+    python -m venv "%VENV_DIR%"
+    if errorlevel 1 (
+        echo [ERROR] Failed to create virtualenv.
+        goto :fatal_error
+    )
+) else (
+    echo [INFO] Reusing existing virtual environment.
 )
-goto :venv_done
-:venv_ok
-echo [INFO] Reusing existing virtual environment.
-:venv_done
 
 echo.
 echo [INFO] Upgrading pip, setuptools, wheel...
@@ -121,9 +117,10 @@ REM 7) Download WAN 2.2-5B weights from Hugging Face via Python
 REM     Repo: Wan-AI/Wan2.2-TI2V-5B (gated, requires HF login)
 REM ------------------------------------------------
 
-REM Model directory ensure (safe for paths with parentheses)
-if not exist "%MODEL_DIR%" echo [INFO] Creating model directory: %MODEL_DIR%
-if not exist "%MODEL_DIR%" mkdir "%MODEL_DIR%" 2>nul
+if not exist "%MODEL_DIR%" (
+    echo [INFO] Creating model directory: %MODEL_DIR%
+    mkdir "%MODEL_DIR%" 2>nul
+)
 
 echo.
 echo [INFO] Checking for existing WAN 2.2-5B weights...
@@ -179,18 +176,16 @@ echo.
 set "WAN_PATCH_ZIP=%SCRIPT_DIR%wan22.zip"
 echo [INFO] Applying WAN patch bundle from: %WAN_PATCH_ZIP%
 
-REM Apply optional wan22.zip patch bundle (safe for paths with parentheses)
-if not exist "%WAN_PATCH_ZIP%" goto :wan_patch_missing
+if exist "%WAN_PATCH_ZIP%" (
     powershell -NoProfile -Command "Expand-Archive -LiteralPath '%WAN_PATCH_ZIP%' -DestinationPath '%APP_ROOT%\models' -Force"
-if errorlevel 1 goto :wan_patch_failed
-echo [OK] wan22.zip extracted into %APP_ROOT%\models
-goto :wan_patch_done
-:wan_patch_failed
-echo [WARN] Could not extract wan22.zip patch bundle.
-goto :wan_patch_done
-:wan_patch_missing
-echo [WARN] wan22.zip not found in %SCRIPT_DIR% - skipping patch bundle.
-:wan_patch_done
+    if errorlevel 1 (
+        echo [WARN] Could not extract wan22.zip patch bundle.
+    ) else (
+        echo [OK] wan22.zip extracted into %APP_ROOT%\models
+    )
+) else (
+    echo [WARN] wan22.zip not found in %SCRIPT_DIR% - skipping patch bundle.
+)
 
 echo.
 pause
