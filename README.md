@@ -1,10 +1,14 @@
 ### 🌟 FrameVision 2.1 
-**All-in-one sound/mage/Video Tool**  
+**All-in-one Sound/Image/Video Tool**  
 ✨ *Create, Upscale, edit, describe, play — in one streamlined app.*
 ---
-**December 24 2025 V2.1**
+<details>
+  <summary>December 25, 2025 — v2.1 release notes</summary>
+
+  **December 25 2025 V2.1**
+  
 **✨ New Features**
----
+
 - Music Videoclip Creator
   - Added more transitions, cinematic effects, and drop/chorus effects
   - a couple of extra settings such as 'skip Fx in intro'
@@ -82,9 +86,9 @@
   - Resize bug fixed
 - Misc
   - Fixed a bug in one of the easter eggs
-
----
----
+</details>
+<details>
+  <summary>December 1, 2025 — v2.0 full release notes</summary>
 December 1, 2025 V2.0 is finally ready
 ### 🌟 Release Notes
 ---
@@ -186,27 +190,34 @@ _Metadata Tool_ – edit or delete metadata from videos and images (with batch s
 - [ ] Ace Music AI reference track fix – stable alignment and output.
 - [ ] RIFE fixed for systems without FFmpeg on PATH.
 - [ ] Frame Extractor fix – proper saving for single and batch modes.
-
+</details>
 ---
+FrameVision All in one sound/image/video tool feature list
 ---
-
-FrameVision All in one sound/image/video tool FULL feature list
----
+### 🎵 (music) videoclip creator
 ### 🧪 Upscaler with model loader (15+ open source upscale models for photo & video)
 ### ⏱️ RIFE Interpolation
 ### 📝 Describe in detail with Qwen3 VL 2B
-### 🖌️ TXT → IMG (SD15/SDXL/Z-Image)
-### 🎬 txt/img/video to video with WAN 2.2 5B (video extender included)
+### 🖌️ TXT → IMG (SD15/SDXL/Z-Image fp16/gguf q4-q8)
+### 🎬 txt/img/video to video with WAN 2.2 5B and/or HunyuanVideo 1.5 (video extender included)
 ### 🎵 Ace Music creation
+### 📁 Media Explorer
 ### 🖌 Remove Background + basic (sd15) inpainting
 ### 👽 Ask Framie, little offline chatbot, works with Qwen3VL 2B
-### 🧰 Tools
+### ⏳ Batch tools for almost all tools
+### 📋 Advanced Queue with seperate worker for most tools
+### 🧮 System Monitor with Hud
+### 🕹️ EASTER EGGS : use the app to unlock them
+### 📺 in app resizable Multi media player
+### 🎶 Music player with playlist & 250+ beat synced visuals
+### All kinds of extra's i forgot to mention such as random 'open app' screens with visual overlays or 20+ themes.
+### 🧰 Other Tools
 - Change speed for videos (with audio sync).
 - Prompt enhancer (Qwen3VL)
+- Reverse video / boomerang
 - Thumbnail/meme creator
 - Sound edit (mini audacity)
 - sound mixer
-- (music) videoclip creator
 - Resize image/video 
 - Create Gif files :2 sections : use currently playing video or load images from a folder
 - Extract/join frames
@@ -214,32 +225,23 @@ FrameVision All in one sound/image/video tool FULL feature list
 - Crop videos/images
 - Multi rename/replace 
 - Metadata editor/remover
-### ⏳ Batch tools for almost all tools
-### 📋 Advanced Queue with seperate worker for most tools
-### 🧮 System Monitor with Hud
-### 🕹️ EASTER EGGS : use the app to unlock them
-### 📺 in app resizable Multi media player
-### 🎶 Music player with playlist & 200+ beat synced visuals
-### All kinds of extra's i forgot to mention such as random 'open app' screens with visual overlays or 20+ themes.
 ---
 
 ## 🛠 Installation
 Run **`framevision.exe`** — it automatically:
-1. Opens the installer menu if setup is incomplete.
+1. Opens the installer menu if setup is incomplete. (give approval to windows to use unknown app)
 2. Repairs missing components (like `psutil`).
-3. Starts the app and background worker.
+3. Starts the app and background worker. (keep the background worker open when using queue)
 
 ### Installer Menu Options
 - 1 **check requirements** + basic 'first time ai' installer.
 - 2 **Core Install:** App only (minimal).
 - 3 **Full CPU Install:** Torch CPU + models/binaries.
 - 4 **Full CUDA Install:** Torch CUDA + models/binaries.
-- 5 **optional install** list with extra tools that have their own environment (wan 2.2, z-image,...
-    These kan be skipped, or when installed, deleting their model folder and environment folder wikk safely remove them again from the app
 ---
 Portable & offline
-(install must go to c:\framevision-main, once everything is installed no more internet is needed and you can move it to any other location on the drive
-One click install tries to make everything work out of the box, even for 'new to ai' users
+(install must go to c:\framevision-main, once everything is installed no more internet is needed and you can move the folder to any other location on the drive.
+One click install tries to make everything work out of the box (git, python, environment..) even for 'new to ai' users (Z-image gguf models may need ectra install : visual studio when you get error of missing dll files.
 Tooltips everywhere (can be turned of in settings tab)
 Draggable middle splitter & swap ui to make the app look the way user wants
 ---
@@ -256,6 +258,6 @@ If you encounter bugs, please open an issue or use the **Bug Report** button in 
 ---
 
 > Built by **Contrinsan**  
-> installer help by **ChatGPT**  
-> *This project is a living work — details evolve with releases.*
+> Debug help by **ChatGPT**  
+> *This project is a living work — details evolve with releases. Features can come and go as the app matures*
 
