@@ -1,0 +1,10 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" width="48" height="48" viewBox="0 0 48 48" role="img" aria-label="WAN video">
+  <g fill="none" stroke="#ffffff" stroke-width="2.6" stroke-linecap="round" stroke-linejoin="round">
+
+    <rect x="10" y="14" width="28" height="20" rx="5"/>
+    <polygon points="22,20 22,28 29,24"/>
+    <path d="M14 38c2.2-2 5.3-3.2 10-3.2S31.8 36 34 38"/>
+
+  </g>
+</svg>

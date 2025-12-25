@@ -1,0 +1,33 @@
+# HunyuanVideo-1.5 (Diffusers) runtime deps
+# Keep this file reasonably "broad" (avoid hard pins) to reduce install failures on Windows.
+
+# NOTE: FlashAttention is intentionally NOT listed here.
+# On Windows it often tries to build from source (slow / fragile). FrameVision installs a known-good
+# prebuilt wheel from the HunyuanVideo installer when the environment matches (Python 3.11 + torch 2.5.1 + cu124).
+
+# Core HF stack
+huggingface_hub>=0.24.6
+diffusers>=0.33.0
+transformers>=4.45.0
+accelerate>=0.33.0
+safetensors>=0.4.5
+
+# Common utilities
+numpy>=1.26
+pillow>=10.0
+tqdm>=4.66
+requests>=2.31
+packaging>=24.0
+pyyaml>=6.0
+
+# Video / IO helpers
+imageio>=2.34
+imageio-ffmpeg>=0.5.1
+opencv-python>=4.8
+
+# Often needed by tokenizers / models
+sentencepiece>=0.2.0
+protobuf>=4.25
+
+# Math / tensor helpers used by many video pipelines
+einops>=0.8

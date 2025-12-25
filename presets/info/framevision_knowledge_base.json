@@ -1,0 +1,2960 @@
+{
+  "FrameVisionKnowledgeBase": {
+    "Overview": {
+      "key_terms": [
+        "FrameVision",
+        "all-in-one video & photo upscaler/editor",
+        "tabs",
+        "workflow",
+        "install",
+        "Windows CPU/GPU PySide6",
+        "modular design",
+        "tidy caches",
+        "binaries inside app folder",
+        "create videos",
+        "music player with visuals",
+        "sound tools",
+        "videoclip creator",
+        "AI describe",
+        "RIFE interpolation",
+        "thumbnail/meme creator"
+      ],
+      "description": "FrameVision is a **local, all‑in‑one** toolbox for **creating, editing, and upscaling** both **images and videos**.\n\nIt’s built around a simple workflow: **open media in the left viewer → pick a task tab on the right → run (or queue) → browse results**.\n\nBesides classic upscaling and editing, FrameVision also includes:\n• a **music player** with **hundreds of built‑in visuals** (250+ in recent builds) and an optional beat/energy pre‑analysis\n• **sound tools** (speed change with sync, add/mix audio, quality/size control, GIF export, trims, frame extract)\n• a **Music Videoclip Creator** (beat‑matched automatic editing + optional timeline control)\n• AI **Describe** (captioning / prompt generation) and **RIFE** interpolation for smoother motion\n• handy creators like **Thumbnail/Meme**.\n\nEverything runs on your machine (Windows‑first), with a background worker to keep the UI responsive.",
+      "hints_tips": [
+        "Use the resizable layout by dragging the splitter to adjust player and tabs.",
+        "Tooltips are available on every feature for guidance.",
+        "Start with 'start.bat' for easy entry; it handles setup if needed.",
+        "The document is a living guide, so features may evolve."
+      ],
+      "qa_pairs": [
+        {
+          "question": "What is FrameVision?",
+          "answer": "FrameVision is a local all‑in‑one app to create, edit, and upscale images/videos—plus a music player with hundreds of visuals, sound tools, a beat‑matched videoclip creator, AI Describe, and RIFE interpolation."
+        },
+        {
+          "question": "How do I start using FrameVision?",
+          "answer": "Run 'start.bat'—it opens the installer if not set up, self-heals minor issues, and starts the app."
+        },
+        {
+          "question": "What platforms does FrameVision support?",
+          "answer": "Primarily Windows; code runs on Linux/WSL2, with easier GPU setup for Qwen3-VL-2B."
+        },
+        {
+          "question": "What else is included besides upscaling?",
+          "answer": "A built‑in multimedia player, music player with beat‑reactive visuals, sound tools (speed/audio/quality), a beat‑matched Music Videoclip Creator, AI Describe (captioning/prompting), and RIFE interpolation."
+        }
+      ],
+      "overview": "FrameVision is a **local, all‑in‑one** toolbox for **creating, editing, and upscaling** both **images and videos**.\n\nIt’s built around a simple workflow: **open media in the left viewer → pick a task tab on the right → run (or queue) → browse results**.\n\nBesides classic upscaling and editing, FrameVision also includes:\n• a **music player** with **hundreds of built‑in visuals** (250+ in recent builds) and an optional beat/energy pre‑analysis\n• **sound tools** (speed change with sync, add/mix audio, quality/size control, GIF export, trims, frame extract)\n• a **Music Videoclip Creator** (beat‑matched automatic editing + optional timeline control)\n• AI **Describe** (captioning / prompt generation) and **RIFE** interpolation for smoother motion\n• handy creators like **Thumbnail/Meme**.\n\nEverything runs on your machine (Windows‑first), with a background worker to keep the UI responsive.",
+      "features": [
+        "Key term: FrameVision",
+        "Key term: all-in-one video & photo upscaler/editor",
+        "Key term: tabs",
+        "Key term: workflow",
+        "Key term: install",
+        "Key term: Windows CPU/GPU PySide6",
+        "Key term: modular design",
+        "Key term: tidy caches",
+        "Key term: binaries inside app folder"
+      ],
+      "install": [
+        "See **InstallUpdates → Install** for full environment setup and model downloads."
+      ],
+      "troubleshoot": [
+        "For environment issues, follow **InstallUpdates → Troubleshoot** steps.",
+        "Check the job **run_*.log** in the logs folder for this feature’s errors (if applicable)."
+      ],
+      "_layout": "overview/features/install/troubleshoot"
+    },
+    "DescribeAI": {
+      "description": "Vision captioning & prompt generation via Qwen3‑VL‑2B Instruct (rich, multi‑sentence) and BLIP (quick, short captions). Works on CPU (slower) and CUDA (faster). Inputs: current player frame or files/folders; outputs: clipboard and sidecar .txt. Advanced controls expose decoding and length behavior.\n\n---\n**KB Addendum 2025-09-07 — Describe AI**\nAdds deeper guidance on model choice, decoding controls, batching, and performance.\n",
+      "key_terms": [
+        "Qwen3‑VL‑2B Instruct",
+        "BLIP captioning",
+        "Detail level (Short/Medium/Long)",
+        "Decode style (Deterministic/Creative)",
+        "Promptify / Negative terms",
+        "Advanced (max_new_tokens, temperature, top_p, top_k, repetition_penalty, no_repeat_ngram_size)",
+        "Batch: Describe folder",
+        "CPU thread cap / CUDA",
+        "Sidecar .txt outputs"
+      ],
+      "hints_tips": [
+        "Start with Deterministic + Short to validate pipeline, then scale length/creativity.",
+        "Use Negative to suppress artifacts (e.g., watermark, low‑res).",
+        "Increase max_new_tokens for Long outputs; expect slower runtime on CPU.",
+        "Batch mode writes sidecars next to images; safe to resume after interruption.",
+        "Prefer CUDA for speed; on CPU, reduce threads and tokens.",
+        "Use Promptify when you need generator‑friendly phrasing.",
+        "Consistent phrasing: Deterministic + fixed params across the batch.",
+        "Start with Deterministic + Short to validate the pipeline, then raise detail/creativity.",
+        "Use Negative to suppress artifacts like watermarks and over‑stylized language.",
+        "Batch mode writes sidecars and can be resumed safely after interruptions.",
+        "For speed, prefer CUDA; on CPU, cap threads and lower tokens.",
+        "Promptify rewrites captions into generator‑friendly prompts.",
+        "Consistency across batches: fix parameters and keep Deterministic."
+      ],
+      "qa_pairs": [
+        {
+          "question": "Which model do I pick?",
+          "answer": "Qwen3‑VL‑2B for rich multi‑sentence; BLIP for fast, short captions."
+        },
+        {
+          "question": "CPU vs GPU?",
+          "answer": "CPU works universally but is slower; CUDA accelerates both models if available."
+        },
+        {
+          "question": "What does Detail level change?",
+          "answer": "Controls length and granularity of the description."
+        },
+        {
+          "question": "Deterministic vs Creative?",
+          "answer": "Deterministic yields stable outputs; Creative increases variety with temperature/top‑p."
+        },
+        {
+          "question": "What does Promptify do?",
+          "answer": "Rewrites outputs into prompt‑ready phrasing for image/video generators."
+        },
+        {
+          "question": "Why Negative terms?",
+          "answer": "To explicitly exclude common artifacts or styles you don’t want."
+        },
+        {
+          "question": "Safe Advanced defaults?",
+          "answer": "max_new_tokens 96–160, temperature 0.2–0.7, top_p 0.9, no_repeat_ngram_size 3–4, repetition_penalty 1.05–1.2."
+        },
+        {
+          "question": "Batch ‘Describe folder’?",
+          "answer": "Processes all images and writes .txt sidecars with progress display."
+        },
+        {
+          "question": "Use current frame?",
+          "answer": "Captures the player’s paused frame directly as the Describe input."
+        },
+        {
+          "question": "Why outputs feel too poetic or too literal?",
+          "answer": "Adjust Decode style and temperature; use Negative to curb clichés."
+        },
+        {
+          "question": "Keep consistent phrasing across a batch?",
+          "answer": "Use Deterministic and lock parameters across runs."
+        },
+        {
+          "question": "Speed up on CPU?",
+          "answer": "Lower tokens, cap threads, prefer BLIP, and close heavy apps."
+        },
+        {
+          "question": "Model missing/corrupted?",
+          "answer": "Use auto‑extract or run the downloader; verify models folder in Models pane."
+        },
+        {
+          "question": "Where are outputs stored?",
+          "answer": "As .txt sidecars next to the source images; single‑run also offers clipboard copy."
+        },
+        {
+          "question": "Language/tone control?",
+          "answer": "Use style presets (product/architecture/anime/cinematic) plus Creative mode for flair."
+        },
+        {
+          "question": "Which model should I use?",
+          "answer": "Qwen3‑VL‑2B for rich, multi‑sentence descriptions; BLIP for fast short captions."
+        },
+        {
+          "question": "CPU vs GPU?",
+          "answer": "CPU works everywhere but is slower; CUDA accelerates both models significantly."
+        },
+        {
+          "question": "What does Detail level change?",
+          "answer": "Output length and granularity."
+        },
+        {
+          "question": "What does Promptify do?",
+          "answer": "Turns plain captions into prompt‑style text suitable for generation models."
+        },
+        {
+          "question": "Why use Negative terms?",
+          "answer": "To explicitly exclude unwanted artifacts or styles."
+        },
+        {
+          "question": "How does ‘Describe folder’ work?",
+          "answer": "Processes all images, writing .txt sidecars with progress and resume safety."
+        },
+        {
+          "question": "Can I capture the current player frame?",
+          "answer": "Yes—pause at the desired frame and use ‘Use current frame’."
+        },
+        {
+          "question": "Why are outputs too poetic or too literal?",
+          "answer": "Adjust Decode style and temperature; Negative can reduce clichés."
+        },
+        {
+          "question": "How to keep phrasing consistent across a batch?",
+          "answer": "Use Deterministic and fixed parameters."
+        },
+        {
+          "question": "How to speed up on CPU?",
+          "answer": "Lower tokens, cap threads, prefer BLIP, close other heavy apps."
+        },
+        {
+          "question": "Model missing/corrupted?",
+          "answer": "Use auto‑extract or run the downloader; verify path in Models pane."
+        },
+        {
+          "question": "Where are outputs stored?",
+          "answer": "As .txt sidecars next to images; single runs also offer clipboard copy."
+        },
+        {
+          "question": "Language/tone control?",
+          "answer": "Style presets (product/architecture/anime/cinematic) plus Creative mode for flair."
+        }
+      ],
+      "controls": [
+        "Engine:",
+        "Qwen3-VL (2B Instruct)",
+        "Size:",
+        "Runs on:",
+        "Best for:",
+        "Notes:",
+        "Models root:",
+        "Actions",
+        "Describe",
+        "Describe folder...",
+        "Use current frame",
+        "Generated description",
+        "Copy",
+        "Copy as Prompt",
+        "Save .txt",
+        "Save .json",
+        "Promptify output",
+        "Detail level:",
+        "Decode style:",
+        "Paths",
+        "Test image path:",
+        "Browse...",
+        "Player frame not available.",
+        "Advanced settings",
+        "max_new_tokens",
+        "min_length",
+        "no_repeat_ngram_size",
+        "temperature",
+        "top_p",
+        "top_k",
+        "repetition_penalty",
+        "Warm model on load",
+        "Keep in memory",
+        "Preset:",
+        "CPU threads:",
+        "Backend:",
+        "Cancel",
+        "Checking…",
+        "Ready",
+        "Missing"
+      ],
+      "_controls_meta": {
+        "last_appended": "2025-09-07",
+        "source": "auto-extracted from code (helpers/)",
+        "modules_used": [
+          "describer.py"
+        ]
+      },
+      "features": [
+        "Qwen3‑VL‑2B Instruct (rich captions) and BLIP (short captions).",
+        "Detail level, Decode style, Promptify/Negative, Advanced decoding knobs.",
+        "Batch: Describe folder; sidecar .txt outputs; Use current frame.",
+        "Qwen3‑VL‑2B Instruct",
+        "BLIP captioning",
+        "Detail level (Short/Medium/Long)",
+        "Decode style (Deterministic/Creative)",
+        "Promptify / Negative terms",
+        "Advanced (max_new_tokens, temperature, top_p, top_k, repetition_penalty, no_repeat_ngram_size)",
+        "Batch: Describe folder",
+        "CPU thread cap / CUDA",
+        "Sidecar .txt outputs",
+        "Engine:",
+        "Qwen3-VL (2B Instruct)",
+        "Size:",
+        "Runs on:",
+        "Best for:",
+        "Notes:",
+        "Models root:",
+        "Actions",
+        "Describe",
+        "Describe folder...",
+        "Use current frame",
+        "Generated description",
+        "Key term: Qwen3‑VL‑2B Instruct",
+        "Key term: BLIP captioning",
+        "Key term: Detail level (Short/Medium/Long)",
+        "Key term: Decode style (Deterministic/Creative)",
+        "Key term: Promptify / Negative terms",
+        "Key term: Advanced (max_new_tokens, temperature, top_p, top_k, repetition_penalty, no_repeat_ngram_size)",
+        "Key term: Batch: Describe folder",
+        "Key term: CPU thread cap / CUDA",
+        "Key term: Sidecar .txt outputs",
+        "Control: Engine: — label. Default: unset/neutral. Does: UI control.",
+        "Control: Qwen3-VL (2B Instruct) — label. Default: unset/neutral. Does: UI control.",
+        "Control: Size: — label. Default: unset/neutral. Does: UI control.",
+        "Control: Runs on: — label. Default: unset/neutral. Does: UI control.",
+        "Control: Best for: — label. Default: unset/neutral. Does: UI control.",
+        "Control: Notes: — label. Default: unset/neutral. Does: UI control.",
+        "Control: Models root: — label. Default: unset/neutral. Does: UI control.",
+        "Control: Actions — groupbox. Default: unset/neutral. Does: UI control.",
+        "Control: Describe — button. Default: n/a (runs on click). Does: Perform the labeled action immediately.",
+        "Control: Describe folder... — button. Default: n/a (runs on click). Does: Perform the labeled action immediately.",
+        "Control: Use current frame — button. Default: n/a (runs on click). Does: Perform the labeled action immediately.",
+        "Control: Generated description — groupbox. Default: unset/neutral. Does: UI control.",
+        "Control: Copy — button. Default: n/a (runs on click). Does: Perform the labeled action immediately.",
+        "Control: Copy as Prompt — button. Default: n/a (runs on click). Does: Perform the labeled action immediately.",
+        "Control: Save .txt — button. Default: n/a (runs on click). Does: Perform the labeled action immediately.",
+        "Control: Save .json — button. Default: n/a (runs on click). Does: Perform the labeled action immediately.",
+        "Control: Promptify output — checkbox. Default: off (toggle to enable). Does: Rewrite captions as prompt‑friendly text.",
+        "Control: Detail level: — label. Default: unset/neutral. Does: Set output length/granularity for captions.",
+        "Control: Decode style: — label. Default: unset/neutral. Does: UI control.",
+        "Control: Paths — groupbox. Default: unset/neutral. Does: UI control.",
+        "Control: Test image path: — label. Default: unset/neutral. Does: UI control.",
+        "Control: Browse... — button. Default: n/a (runs on click). Does: Perform the labeled action immediately.",
+        "Control: Player frame not available. — label. Default: unset/neutral. Does: Transport control to start/stop playback.",
+        "Control: Advanced settings — groupbox. Default: unset/neutral. Does: UI control.",
+        "Control: max_new_tokens — label. Default: unset/neutral. Does: UI control.",
+        "Control: min_length — label. Default: unset/neutral. Does: UI control.",
+        "Control: no_repeat_ngram_size — label. Default: unset/neutral. Does: UI control.",
+        "Control: temperature — label. Default: unset/neutral. Does: Decoding controls that affect diversity and randomness.",
+        "Control: top_p — label. Default: unset/neutral. Does: Decoding controls that affect diversity and randomness.",
+        "Control: top_k — label. Default: unset/neutral. Does: UI control.",
+        "Control: repetition_penalty — label. Default: unset/neutral. Does: UI control.",
+        "Control: Warm model on load — checkbox. Default: off (toggle to enable). Does: Toggle feature on/off.",
+        "Control: Keep in memory — checkbox. Default: off (toggle to enable). Does: Toggle feature on/off.",
+        "Control: Preset: — label. Default: unset/neutral. Does: UI control.",
+        "Control: CPU threads: — label. Default: unset/neutral. Does: UI control.",
+        "Control: Backend: — label. Default: unset/neutral. Does: UI control.",
+        "Control: Cancel — button. Default: n/a (runs on click). Does: Perform the labeled action immediately.",
+        "Control: Checking… — text label. Default: unset/neutral. Does: UI control.",
+        "Control: Ready — text label. Default: unset/neutral. Does: UI control.",
+        "Control: Missing — text label. Default: unset/neutral. Does: UI control."
+      ],
+      "install": [
+        "Ensure vision models are present; use `scripts/download_externals.py` if missing.",
+        "General install flow: use **Install/Updates → Option 1** to auto-detect environment, then **Option 2** for repair, or **Option 3/4** for full stacks.",
+        "See **InstallUpdates → Install** for full environment setup and model downloads."
+      ],
+      "troubleshoot": [
+        "On CPU timeout/slow, reduce max_new_tokens or switch to BLIP; prefer CUDA when available.",
+        "Run **install_menu.bat** and choose **Option 1 — System check & advisor** (creates venv if missing, checks Python/FFmpeg/GPU/VRAM, prints a full info page and recommends Option 3 or 4).",
+        "If only the app is broken, run **Option 2 — Core install** (quick repair, minimal download).",
+        "If problems persist, pick a full stack: **Option 3 — Full CPU (< 6 GiB VRAM, ~3.5 GB download)** or **Option 4 — Full GPU (≥ 6 GiB VRAM, ~5 GB download)**.",
+        "Still failing? **Delete the `.venv` folder** and re-run Option 3 or 4. You **do not** need to delete helper binaries or models; it’s recommended to clear **cache** and **preset** files.",
+        "If a model/tool is missing or corrupted, run the models-only downloader:\n  - **Windows:** `python \"scripts\\download_externals.py\"`\n  - **macOS/Linux:** `python scripts/download_externals.py`",
+        "Planned: `update.bat` will auto-check and update to the latest stable build.",
+        "For environment issues, follow **InstallUpdates → Troubleshoot** steps.",
+        "Check the job **run_*.log** in the logs folder for this feature’s errors (if applicable)."
+      ],
+      "overview": "Vision captioning & prompt generation via Qwen3‑VL‑2B Instruct (rich, multi‑sentence) and BLIP (quick, short captions). Works on CPU (slower) and CUDA (faster). Inputs: current player frame or files/folders; outputs: clipboard and sidecar .txt. Advanced controls expose decoding and length behavior.\n\n---\n**KB Addendum 2025-09-07 — Describe AI**\nAdds deeper guidance on model choice, decoding controls, batching, and performance.\n",
+      "_layout": "overview/features/install/troubleshoot",
+      "_features_meta": {
+        "oneliners_last_updated": "2025-09-07",
+        "oneliners_source": "helpers/ code scan",
+        "oneliners_count_added": 40
+      }
+    },
+    "FileMenu": {
+      "description": "The **File** menu is the fastest way to **open media**, **grab screenshots/frames**, **re-open recent sources**, and run a few **export + batch utilities**.\n\n**Main actions:**\n• **Open** (Ctrl+O)\n• **Screenshot (select region)…** (Ctrl+S)\n\n**Recent Files** (submenu): dynamically lists up to **10** recent paths, plus **Clear Recent List**. You can also **right‑click a recent item → Remove from list**.\n\n**Favorites** (submenu):\n• **Pin Current File** (adds the currently loaded media to favorites)\n• **Unpin Current File** (only shown when the current file is already pinned)\n• **Open Favorite** (submenu listing pinned paths; supports right‑click remove)\n• **Clear Favorites**\n\n**Save / Export:**\n• **Save Frame As…** (captures the currently visible frame as PNG/JPG)\n• **Save As…** (images: convert via Qt; videos: uses FFmpeg and tries stream‑copy for common containers)\n• **Save As MP3…** (FFmpeg MP3 export with bitrate + volume controls; optional “Use source bitrate”)\n\n**Batch Tools** (submenu):\n• **Convert to MP3 (folder)…**\n• **Video → Audio Extract (WAV/AAC/FLAC)…**\n• **Video Convert (folder)…**\n• **Image Convert (folder)…**\n• **Export ALL Audio Tracks (1 file)…**\n\n**Utilities:**\n• **Open Containing Folder** (opens the folder of the currently loaded file)\n• **Reopen Last Closed File** (reopens the previous file remembered when you used Open)\n\n**Exit:**\n• **Exit (to console)** (clean quit)\n• **Exit (close process)** (force exit)\n",
+      "key_terms": [
+        "Batch Tools",
+        "Clear Favorites",
+        "Clear Recent List",
+        "Exit (close process)",
+        "Exit (to console)",
+        "Favorites",
+        "Open",
+        "Open Containing Folder",
+        "Open Favorite",
+        "Pin Current File",
+        "Recent Files",
+        "Reopen Last Closed File",
+        "Remove from list",
+        "Save As MP3…",
+        "Save As…",
+        "Save Frame As…",
+        "Screenshot (select region)…",
+        "Unpin Current File"
+      ],
+      "hints_tips": [
+        "If you’re opening the same source repeatedly, **Pin Current File** so it’s one click away in Favorites.",
+        "Right‑click a Recent/Favorite entry to remove just that one item instead of clearing the whole list.",
+        "For video **Save As…**, the app tries **stream‑copy** first (fast, no quality loss) when the target container supports it; otherwise it re‑encodes.",
+        "Save As MP3 remembers the last folder you used (mp3_last_save_dir) so repetitive exports are quicker."
+      ],
+      "qa_pairs": [
+        {
+          "question": "What items are in the File menu?",
+          "answer": "Open; Screenshot (select region)…; Recent Files; Favorites (Pin/Unpin + Open Favorite); Save Frame As…; Save As…; Save As MP3…; Batch Tools; Open Containing Folder; Reopen Last Closed File; Exit (to console/process)."
+        },
+        {
+          "question": "How does Recent Files work?",
+          "answer": "It lists up to 10 recent paths. Selecting one opens it directly and moves it back to the top. Use **Clear Recent List** to wipe it, or right‑click an entry to remove just that path."
+        },
+        {
+          "question": "How do Favorites work?",
+          "answer": "Use **Pin Current File** to add the currently loaded file to Favorites. Open it later via **Open Favorite**. If the current file is pinned, you’ll also see **Unpin Current File**."
+        },
+        {
+          "question": "What’s the difference between Save Frame As… and Save As…?",
+          "answer": "Save Frame As… captures the visible frame (PNG/JPG). Save As… exports the whole media (images can be converted; videos use FFmpeg)."
+        },
+        {
+          "question": "Why does Reopen Last Closed File sometimes do nothing?",
+          "answer": "The “last closed” slot is only updated when you use **Open** (it stores the file you had loaded before opening a new one). If you haven’t opened a new file yet, there may be no last‑closed entry."
+        }
+      ]
+    },
+    "HUDColorizer": {
+      "description": "A visual add‑on that colorizes header stats (GPU/CPU/DDR % and temperatures) so saturation stands out. Uses thresholds with hysteresis and a subtle red background in hot conditions (~900 ms refresh).",
+      "key_terms": [
+        "GPU/CPU/DDR % colorizer",
+        "Red background chip",
+        "Temp thresholds with hysteresis",
+        "~900 ms refresh"
+      ],
+      "hints_tips": [
+        "Coloring kicks in only at higher loads; background appears in the red zone.",
+        "Hysteresis prevents flicker around temperature thresholds."
+      ],
+      "qa_pairs": [
+        {
+          "question": "What does it colorize?",
+          "answer": "The first GPU, DDR, and CPU percentage tokens, plus numeric temperature tokens (e.g., 70°C)."
+        },
+        {
+          "question": "When do colors trigger?",
+          "answer": "Usage: ≥85% orange, ≥95% red. Temps: ≥60°C yellow, ≥65°C orange, ≥70°C red; returns below red after ~68°C."
+        }
+      ]
+    },
+    "HunyuanVideo15": {
+      "description": "Generate videos with **HunyuanVideo 1.5** inside FrameVision (text2video, image2video, video→video, and Extend). Includes Qwen3‑VL prompt enhancer presets and VRAM offload options.",
+      "key_terms": [
+        "HunyuanVideo 1.5",
+        "text2video",
+        "image2video",
+        "Video→Video",
+        "Extend",
+        "Auto‑merge segments",
+        "Enable model CPU offload",
+        "Enable Group Offload",
+        "FirstBlockCache",
+        "FBC threshold",
+        "Enhance prompt (Qwen3‑VL)",
+        "Prompt enhancer presets",
+        ".hunyuan15_env",
+        "hunuyan15_install.bat",
+        "output/video/hunyuan15",
+        "Media Explorer"
+      ],
+      "overview": "HunyuanVideo 1.5 is FrameVision’s higher-quality video model tool with flexible **text→video**, **image→video**, **video→video**, and **Extend**. It also includes VRAM-saving/offload toggles and a built-in **Qwen3‑VL prompt enhancer with presets**.\n\n### Quick start\n1. Open **Video Creation → Engine: HunyuanVideo 1.5**.\n2. If this is your first run: click **Install/Update Cuda** and then **Download Models**.\n3. Choose a model preset (for example **480p Text‑to‑Video** or **720p Image‑to‑Video**).\n4. Pick **Aspect** (Landscape/Portrait/Square) and a **Resolution** (192p–720p).\n5. Write your prompt, optionally click **Enhance prompt (Qwen)**, then click **Generate Video**.\n\n### Image→Video and Video→Video\n- **Start image (I2V):** choose an image, or click **Use Current** to grab the current Media Player frame.\n- **Video→Video:** click **load video** — FrameVision extracts the **last frame** and uses it as the Start image. (This keeps the workflow simple and predictable.)\n\n### Extend (longer videos)\n- Set **Extend** to 1+ “extra segments”.\n- Each new segment uses the **last frame** of the previous segment as the next start image.\n- **Important:** Extend is **direct-run only**. Queue and Batch runs ignore Extend.\n- If **Auto‑merge segments** is enabled, FrameVision merges all segments into a single MP4 at the end. Hunyuan’s merge step also trims/blends a tiny seam to reduce the “pause” between chunks.\n\n### VRAM / speed toggles (simple guide)\n- **Enable model CPU offload:** recommended when you have **< 24 GB VRAM** (slower, but avoids OOM).\n- **Enable Group Offload (experimental):** additional VRAM saving; can conflict with model offload.\n- **Enable FirstBlockCache:** a speed booster that skips work when changes are small. Tune **FBC threshold**:\n  - ~0.05 is a safe start\n  - Higher = faster, but may hurt quality\n  - Lower = safer quality, less speedup\n",
+      "features": [
+        "**Model presets:** 480p/720p Text‑to‑Video, 480p/720p Image‑to‑Video, and distilled / step‑distilled variants.",
+        "**Aspect + Resolution:** quick aspect presets (16:9, 9:16, 1:1) with a resolution ladder from 192p to 720p.",
+        "**Prompt enhancer:** built-in “Enhance prompt (Qwen)” with a **preset dropdown** (shared with Tools → Prompt enhancement). Target is forced to **video** for better wording.",
+        "**Video→Video:** load a video and automatically extract the last frame as the Start image.",
+        "**Extend + Auto‑merge:** chain extra segments and optionally merge them into one MP4 (with seam trimming/blending).",
+        "**Offload & performance:** model CPU offload (recommended under 24GB VRAM), Group Offload (experimental), FirstBlockCache + threshold.",
+        "**Bitrate control:** set target bitrate (kbps) for the final output encode.",
+        "**Results helpers:** View results (Media Explorer), Use Current (from Media Player)."
+      ],
+      "qa_pairs": [
+        {
+          "question": "Which Hunyuan model preset should I pick?",
+          "answer": "Start with **480p Text‑to‑Video** for fast tests. Use **720p** presets when you want more detail (and you have enough VRAM or you enable CPU offload). For Image‑to‑Video, the **step‑distilled** option is designed for low steps (roughly 8–12)."
+        },
+        {
+          "question": "What do Aspect and Resolution do?",
+          "answer": "Aspect picks the shape (Landscape/Portrait/Square). Resolution selects the target size tier (from 192p up to 720p). Higher resolution costs more VRAM/time."
+        },
+        {
+          "question": "How do I do image→video?",
+          "answer": "Pick a **Start image**, or click **Use Current** to capture the current Media Player frame, then generate."
+        },
+        {
+          "question": "How does video→video work?",
+          "answer": "Click **load video**. FrameVision extracts the **last frame** of that clip and uses it as the Start image for image→video generation."
+        },
+        {
+          "question": "How do I make longer videos?",
+          "answer": "Set **Extend** to 1+ extra segments. Keep **Auto‑merge segments** enabled if you want one final file. Remember: Extend is **direct-run only** (Queue/Batch ignores it)."
+        },
+        {
+          "question": "Why does Extend say “Direct run only”?",
+          "answer": "Because chaining requires tight handoff between segments (extract last frame → run next segment). In FrameVision, Queue/Batch runs intentionally ignore Extend to keep the worker flow reliable."
+        },
+        {
+          "question": "What does “Enable model CPU offload” do?",
+          "answer": "It moves parts of the model to system RAM to reduce VRAM usage. This is slower, but it’s the main switch to avoid out-of-memory errors on < 24GB VRAM."
+        },
+        {
+          "question": "Should I use Group Offload too?",
+          "answer": "Only if you need more VRAM savings and you’re okay with it being experimental. If you already use model CPU offload, keep Group Offload OFF (they can conflict)."
+        },
+        {
+          "question": "What is FirstBlockCache?",
+          "answer": "A speed booster that skips transformer work when changes are small. It can be very helpful, but aggressive settings can reduce quality."
+        },
+        {
+          "question": "How do I set the FirstBlockCache threshold?",
+          "answer": "Start around **0.05**. Higher values skip more (faster, riskier quality). Lower values are safer (less speedup)."
+        },
+        {
+          "question": "What does the Qwen prompt enhancer preset dropdown change?",
+          "answer": "It chooses a shared preset from **Tools → Prompt enhancement** (styles/negatives/length/temperature). The Hunyuan enhancer temporarily applies it for that one run and then restores your previous prompt-tool settings."
+        },
+        {
+          "question": "Where do results go?",
+          "answer": "Outputs are stored under `output/video/hunyuan15`. Use **View results** to open Media Explorer on the correct folder."
+        }
+      ],
+      "controls": [
+        "Control: Engine — dropdown. Does: Select WAN 2.2 or HunyuanVideo 1.5 engine page.",
+        "Control: Install/Update Cuda — button. Does: Set up/repair the Hunyuan tool environment (`.hunyuan15_env`).",
+        "Control: Download Models — button. Does: Download weights for the selected model preset.",
+        "Control: Model preset — dropdown. Does: Choose 480p/720p T2V/I2V and distilled variants.",
+        "Control: Prompt — text box. Does: Describe what you want to see.",
+        "Control: Enhance prompt (Qwen) — button. Does: Expand the prompt using Qwen3‑VL helper.",
+        "Control: Enhancer preset — dropdown. Does: Pick a preset shared with Tools → Prompt enhancement.",
+        "Control: Negative prompt — text box. Does: Describe what to avoid.",
+        "Control: Start image (I2V) — path/browse. Does: Starting frame for image→video (and for video→video).",
+        "Control: Video→Video — toggle + load video/Use last. Does: Extract last frame from a source clip to use as Start image.",
+        "Control: Aspect — dropdown. Does: Landscape/Portrait/Square.",
+        "Control: Resolution — dropdown. Does: Output size tier (192p–720p).",
+        "Control: Frames / Steps / FPS / Seed — controls. Does: Duration/quality/speed/randomness.",
+        "Control: Bitrate (kbps) — control. Does: Target output bitrate.",
+        "Control: Extend — spinbox. Does: Number of extra segments (direct-run only).",
+        "Control: Auto‑merge segments — checkbox. Does: Merge extend segments into one MP4 at the end.",
+        "Control: Enable model CPU offload — checkbox. Does: Reduce VRAM usage (slower).",
+        "Control: Enable Group Offload — checkbox. Does: Experimental VRAM saver (may conflict with model offload).",
+        "Control: Enable FirstBlockCache — checkbox. Does: Speed booster; tune threshold.",
+        "Control: FBC threshold — slider/spin. Does: How aggressively FirstBlockCache skips work.",
+        "Control: Use Queue — button. Does: Toggle queue mode vs direct run.",
+        "Control: Generate Video — button. Does: Start generation.",
+        "Control: Use Current — button. Does: Grab current Media Player frame as Start image.",
+        "Control: View results — button. Does: Open Media Explorer on Hunyuan output folder."
+      ],
+      "install": [
+        "Click **Install/Update Cuda** to run `presets/extra_env/hunuyan15_install.bat`, which prepares the tool’s dedicated environment at `.hunyuan15_env`.",
+        "Click **Download Models** to fetch the selected model preset’s weights (downloads can be large).",
+        "FFmpeg is required for Auto‑merge segments (FrameVision prefers the bundled FFmpeg in `presets/bin/`)."
+      ],
+      "troubleshoot": [
+        "If **Install/Update Cuda** fails with “Missing file”: confirm `presets/extra_env/hunuyan15_install.bat` exists next to the app.",
+        "If prompt enhancement fails: verify the shared Qwen environment exists (`.venv`) and that `helpers/prompt_enhancer_cli.py` is present.",
+        "If Auto‑merge fails: confirm FFmpeg exists in `presets/bin/` (or on PATH on non‑Windows builds).",
+        "If you get VRAM/OOM errors: turn ON **Enable model CPU offload**, reduce Resolution/Frames/Steps, and avoid running other VRAM-heavy tools simultaneously.",
+        "If output looks “stuck”/too similar: increase Steps slightly or disable FirstBlockCache (it trades some quality for speed)."
+      ],
+      "_layout": "overview/features/install/troubleshoot"
+    },
+    "InstallUpdates": {
+      "description": "Installer provides 1) environment checks, 2) core app install, 3) Full CPU stack (~3.5 GB), 4) Full CUDA stack (~5 GB, cu121). Start via start.bat which self‑heals psutil, starts worker, and launches the app. Models downloader installs Qwen Image GGUF tiers and external tools; Models pane manages paths, manifests, and quick tests.\n\n---\n**KB Addendum 2025-09-07 — Installer/Models**\nAdds a decision guide for Options 1–4 and VRAM‑tier notes for Qwen Image GGUF; clarifies start.bat self‑heal behavior.\n",
+      "key_terms": [
+        "install_menu.bat options 1–4",
+        "start.bat self‑heal + launch",
+        "Requirements (CPU/GPU stacks)",
+        "CUDA cu121 pins",
+        "Models downloader (Qwen Image GGUF)",
+        "VRAM tiers (Q3_K_M, Q4_K_M)",
+        "Models pane (Exists/Test/Manifest)"
+      ],
+      "hints_tips": [
+        "Choose Full CUDA if you have ≥6 GB VRAM; otherwise Full CPU is universal.",
+        "If the venv breaks, delete .venv and re‑run Option 3 or 4.",
+        "Use the models‑only downloader to refresh models without reinstalling the app.",
+        "Torch/TorchVision pins match CUDA toolkits; avoid mixing versions.",
+        "Keep models/ outside the venv to survive reinstalls.",
+        "Choose Full CUDA if you have ≥6 GB VRAM; use Full CPU for universal compatibility.",
+        "If the venv breaks, delete .venv and rerun Option 3 or 4.",
+        "Use models‑only downloader to refresh models without reinstalling the app.",
+        "Keep models/ outside the venv so they persist across reinstalls."
+      ],
+      "qa_pairs": [
+        {
+          "question": "Which option should I choose?",
+          "answer": "Core only for upgrades; Full CPU for universal support; Full CUDA for NVIDIA acceleration."
+        },
+        {
+          "question": "Python not found?",
+          "answer": "Installer tries multiple launchers (py -3.11/-3.10, python on PATH) and prints guidance."
+        },
+        {
+          "question": "Where does Qwen Image install?",
+          "answer": "Under models/qwen_image; pick a VRAM tier matching your GPU."
+        },
+        {
+          "question": "Can I only update models?",
+          "answer": "Yes—run the models downloader; it won’t touch the core app."
+        },
+        {
+          "question": "Where are logs?",
+          "answer": "Check logs/run_*.log and Settings → Open log folder."
+        },
+        {
+          "question": "Python not found?",
+          "answer": "Installer tries py -3.11/-3.10 and python on PATH; otherwise prints guidance."
+        },
+        {
+          "question": "Where does Qwen Image install?",
+          "answer": "Under models/qwen_image with VRAM‑tiered files."
+        },
+        {
+          "question": "Can I only update models?",
+          "answer": "Yes—run the models downloader to refresh models independently."
+        }
+      ],
+      "requirements": {
+        "requirements-core.txt": [
+          "PySide6==6.7.2",
+          "pillow>=10.3.0",
+          "huggingface_hub>=0.23.0",
+          "packaging>=23.2"
+        ],
+        "requirements-cpu.txt": [
+          "--extra-index-url https://download.pytorch.org/whl/cpu",
+          "torch==2.3.1+cpu",
+          "torchvision==0.18.1+cpu",
+          "torchaudio==2.3.1+cpu",
+          "transformers==4.45.2",
+          "accelerate==0.33.0",
+          "huggingface-hub==0.24.6",
+          "safetensors==0.4.4",
+          "tokenizers==0.20.1",
+          "packaging>=23.2",
+          "pillow==10.4.0",
+          "numpy==1.26.4",
+          "opencv-python==4.10.0.84",
+          "PySide6==6.7.2"
+        ],
+        "requirements-gpu.txt": [
+          "--extra-index-url https://download.pytorch.org/whl/cu121",
+          "torch==2.3.1+cu121",
+          "torchvision==0.18.1+cu121",
+          "torchaudio==2.3.1+cu121",
+          "transformers==4.45.2",
+          "accelerate==0.33.0",
+          "huggingface-hub==0.24.6",
+          "safetensors==0.4.4",
+          "tokenizers==0.20.1",
+          "packaging>=23.2",
+          "pillow==10.4.0",
+          "numpy==1.26.4",
+          "opencv-python==4.10.0.84",
+          "PySide6==6.7.2"
+        ]
+      },
+      "features": [
+        "Installer menu with 4 options: 1) System check & advisor, 2) Core install, 3) Full CPU stack, 4) Full GPU stack.",
+        "Self-healing launcher (**start.bat**) that checks psutil, starts the worker, and launches the app.",
+        "Requirements profiles: core, CPU (Torch CPU), GPU (CUDA/cu121) with pinned versions.",
+        "Models-only downloader (`scripts/download_externals.py`) to refresh tools/models without a full reinstall.",
+        "Key term: install_menu.bat options 1–4",
+        "Key term: start.bat self‑heal + launch",
+        "Key term: Requirements (CPU/GPU stacks)",
+        "Key term: CUDA cu121 pins",
+        "Key term: Models downloader (Qwen Image GGUF)",
+        "Key term: VRAM tiers (Q3_K_M, Q4_K_M)",
+        "Key term: Models pane (Exists/Test/Manifest)"
+      ],
+      "install": [
+        "**Option 1 — System check & advisor:** creates venv if missing; checks Python/FFmpeg/GPU/VRAM; prints a full info page and suggests Option 3 or 4.",
+        "**Option 2 — Core install:** quick repair of the app environment; minimal downloads.",
+        "**Option 3 — Full CPU:** recommended for non-GPU systems or < 6 GiB VRAM; approx **3.5 GB**.",
+        "**Option 4 — Full GPU:** recommended for NVIDIA GPUs with ≥ 6 GiB VRAM; approx **5 GB**.",
+        "**Models-only refresh:** Windows `python \"scripts\\download_externals.py\"`; macOS/Linux `python scripts/download_externals.py`.",
+        "Option 1 — **System check & advisor**: creates venv if missing, checks Python/FFmpeg/GPU/VRAM, prints a full info page and recommends Option 3 or 4.",
+        "Option 2 — **Core install**: quick repair of the application without models (fast).",
+        "Option 3 — **Full CPU stack**: for non‑GPU or < 6 GiB VRAM (~3.5 GB download).",
+        "Option 4 — **Full GPU stack (CUDA)**: for ≥ 6 GiB VRAM (~5 GB download).",
+        "Models‑only: open a terminal in the app root and run:\n  • Windows: `python \"scripts\\download_externals.py\"`\n  • macOS/Linux: `python scripts/download_externals.py`"
+      ],
+      "troubleshoot": [
+        "Run **install_menu.bat** and choose **Option 1 — System check & advisor** (creates venv if missing, checks Python/FFmpeg/GPU/VRAM, prints a full info page and recommends Option 3 or 4).",
+        "If only the app is broken, run **Option 2 — Core install** (quick repair, minimal download).",
+        "If problems persist, pick a full stack: **Option 3 — Full CPU (< 6 GiB VRAM, ~3.5 GB download)** or **Option 4 — Full GPU (≥ 6 GiB VRAM, ~5 GB download)**.",
+        "Still failing? **Delete the `.venv` folder** and re-run Option 3 or 4. You **do not** need to delete helper binaries or models; it’s recommended to clear **cache** and **preset** files.",
+        "If a model/tool is missing or corrupted, run the models-only downloader:\n  - **Windows:** `python \"scripts\\download_externals.py\"`\n  - **macOS/Linux:** `python scripts/download_externals.py`",
+        "Planned: `update.bat` will auto-check and update to the latest stable build.",
+        "Start with **Option 1 (System check & advisor)** to validate your environment and get a recommendation.",
+        "If only the app seems broken, run **Option 2 (Core install)** for a quick repair.",
+        "If issues persist, run a **full install**: **Option 3** for CPU (< 6 GiB VRAM) or **Option 4** for GPU (≥ 6 GiB VRAM).",
+        "Still failing? **Delete the `.venv`** folder and reinstall (safe; models/helpers are preserved). Expect re‑download sizes: ~3.5 GB (CPU) or ~5 GB (GPU).",
+        "Prefer clearing **cache and preset files** if behavior remains odd; keep models and helper binaries.",
+        "Roadmap: an upcoming `update.bat` will auto‑check and repair to the latest version."
+      ],
+      "overview": "Installer provides 1) environment checks, 2) core app install, 3) Full CPU stack (~3.5 GB), 4) Full CUDA stack (~5 GB, cu121). Start via start.bat which self‑heals psutil, starts worker, and launches the app. Models downloader installs Qwen Image GGUF tiers and external tools; Models pane manages paths, manifests, and quick tests.\n\n---\n**KB Addendum 2025-09-07 — Installer/Models**\nAdds a decision guide for Options 1–4 and VRAM‑tier notes for Qwen Image GGUF; clarifies start.bat self‑heal behavior.\n",
+      "_layout": "overview/features/install/troubleshoot"
+    },
+    "ModelsFootprint": {
+      "description": "Model storage, sizes, and maintenance. You can fetch or repair models without reinstalling the app.",
+      "key_terms": [
+        "download_externals.py",
+        "models/ folder",
+        "safe deletions (cache/presets)"
+      ],
+      "hints_tips": [
+        "Use the models‑only downloader to avoid large reinstalls.",
+        "Keep models/helper binaries when resetting venv to save time."
+      ],
+      "qa_pairs": [
+        {
+          "question": "Where do I re‑download models only?",
+          "answer": "From the app root: Windows: `python \"scripts\\download_externals.py\"` • macOS/Linux: `python scripts/download_externals.py`."
+        },
+        {
+          "question": "What can I safely delete to reset?",
+          "answer": "Delete the venv and caches/presets. Keep models and helper binaries; reinstall will recreate the environment."
+        }
+      ],
+      "controls": [
+        "Pick folder",
+        "Test selected (--help)"
+      ],
+      "_controls_meta": {
+        "last_appended": "2025-09-07",
+        "source": "auto-extracted from code (helpers/)",
+        "modules_used": [
+          "mods.py"
+        ]
+      },
+      "features": [
+        "Models pane to pick/check folders; manifests; quick `--help` tests on exes.",
+        "download_externals.py",
+        "models/ folder",
+        "safe deletions (cache/presets)",
+        "Pick folder",
+        "Test selected (--help)",
+        "Key term: download_externals.py",
+        "Key term: models/ folder",
+        "Key term: safe deletions (cache/presets)",
+        "Control: Pick folder — button. Default: n/a (runs on click). Does: Perform the labeled action immediately.",
+        "Control: Test selected (--help) — button. Default: n/a (runs on click). Does: Perform the labeled action immediately."
+      ],
+      "install": [
+        "Use Option 1 to detect environment; run the models-only downloader to populate or refresh external tools.",
+        "General install flow: use **Install/Updates → Option 1** to auto-detect environment, then **Option 2** for repair, or **Option 3/4** for full stacks.",
+        "See **InstallUpdates → Install** for full environment setup and model downloads."
+      ],
+      "troubleshoot": [
+        "If a model is missing, run the downloader; verify Exists/Test columns in the Models pane.",
+        "Run **install_menu.bat** and choose **Option 1 — System check & advisor** (creates venv if missing, checks Python/FFmpeg/GPU/VRAM, prints a full info page and recommends Option 3 or 4).",
+        "If only the app is broken, run **Option 2 — Core install** (quick repair, minimal download).",
+        "If problems persist, pick a full stack: **Option 3 — Full CPU (< 6 GiB VRAM, ~3.5 GB download)** or **Option 4 — Full GPU (≥ 6 GiB VRAM, ~5 GB download)**.",
+        "Still failing? **Delete the `.venv` folder** and re-run Option 3 or 4. You **do not** need to delete helper binaries or models; it’s recommended to clear **cache** and **preset** files.",
+        "If a model/tool is missing or corrupted, run the models-only downloader:\n  - **Windows:** `python \"scripts\\download_externals.py\"`\n  - **macOS/Linux:** `python scripts/download_externals.py`",
+        "Planned: `update.bat` will auto-check and update to the latest stable build.",
+        "For environment issues, follow **InstallUpdates → Troubleshoot** steps.",
+        "Check the job **run_*.log** in the logs folder for this feature’s errors (if applicable)."
+      ],
+      "overview": "Model storage, sizes, and maintenance. You can fetch or repair models without reinstalling the app.",
+      "_layout": "overview/features/install/troubleshoot",
+      "_features_meta": {
+        "oneliners_last_updated": "2025-09-07",
+        "oneliners_source": "helpers/ code scan",
+        "oneliners_count_added": 2
+      }
+    },
+    "MultimediaPlayer": {
+      "description": "Main FrameVision viewer for images, GIFs, video, and audio. Includes classic transport, seek slider + time readout, fullscreen overlay controls, zoom/pan, compare wipe, quick upscale, and an Ask Framie chat button.",
+      "key_terms": [
+        "Multimedia player",
+        "Drag & drop media",
+        "Open / Play-Pause / Stop",
+        "Seek slider + time left + percent",
+        "Fullscreen overlay controls",
+        "Zoom & pan (0.5×–50×)",
+        "Zoom reset bubble",
+        "Compare wipe (▷│◁) with slider + draggable divider",
+        "Repeat (video only)",
+        "Quick Upscale (queues RealESRGAN-general-x4v3 4×)",
+        "Ask Framie (chat popup)",
+        "FFmpeg QtMultimedia backend (QT_MEDIA_BACKEND=ffmpeg)",
+        "Player rebuild to avoid deadlocks",
+        "Large image allocation limit bump"
+      ],
+      "hints_tips": [
+        "If playback stutters when lots of finished jobs exist in the queue, the app can pause queue auto-refresh while video is playing (config: queue_pause_refresh_while_playing).",
+        "Use the Play button for transport—clicking the preview area does not toggle play/pause.",
+        "Wheel to zoom (0.5×–50×). When zoomed in, left-drag to pan; click the on-cursor bubble to reset zoom.",
+        "Fullscreen: double-click the preview (or press ⛶). In fullscreen, Esc exits and Space toggles play/pause.",
+        "Compare: click ▷│◁, pick a second file, then use the wipe slider (or drag the divider) to compare details.",
+        "Repeat: enable it if you want the video to loop instead of returning to the background at the end."
+      ],
+      "qa_pairs": [
+        {
+          "question": "Does single-click on the preview toggle Play/Pause?",
+          "answer": "No. Click-to-toggle is disabled; use the ▶ / ▮▮ button (or Space in fullscreen)."
+        },
+        {
+          "question": "How do I enter/exit fullscreen?",
+          "answer": "Double-click the preview or press ⛶ to enter. Press Esc to exit. In fullscreen, the control overlay auto-hides on inactivity."
+        },
+        {
+          "question": "How do I compare two files?",
+          "answer": "Click ▷│◁ (Compare), pick a second file, then use the wipe slider (or drag the divider on the preview). Image-vs-image and video-vs-video are supported; in video compare the right side is muted and kept in sync."
+        },
+        {
+          "question": "What does Repeat do?",
+          "answer": "Repeat loops video when it reaches the end. If Repeat is off, reaching the end clears the video sink and returns to the background view."
+        },
+        {
+          "question": "Why does FrameVision rebuild the player when switching media types?",
+          "answer": "To fully release QtMultimedia threads/sinks between still images/GIFs and video/audio, avoiding backend deadlocks and stuck overlays."
+        }
+      ],
+      "controls": [
+        "Drop area (viewer): drag & drop a file to load it.",
+        "📂 Open: choose a file to load into the player.",
+        "▶ / ▮▮ Play/Pause: toggles playback (single-click on the preview area does NOT toggle playback).",
+        "■ Stop: stops playback, clears the video sink, and returns to the empty background view.",
+        "Seek slider: scrub position for audio/video (disabled for still images and GIF playback).",
+        "Time label: shows elapsed / remaining and a percent readout for time-based media.",
+        "ℹ Info: opens the media metadata popup (ffprobe-style details).",
+        "⛶ Fullscreen: enters fullscreen; double-click the preview to toggle; Esc exits; Space toggles play/pause.",
+        "▷│◁ Compare: pick a second file and enable wipe-compare; uses a dedicated compare slider (0–1000).",
+        "Compare slider: reveal left vs right; you can also drag the divider directly on the preview.",
+        "Upscale: queues a quick 4× upscale job (RealESRGAN-general-x4v3) for the current file.",
+        "Ask Framie: opens the AskPopup chat window.",
+        "Repeat: toggles video looping; visible only when a video is loaded."
+      ],
+      "_controls_meta": {
+        "last_appended": "2025-12-21",
+        "source": "auto-extracted from code (helpers/)",
+        "modules_used": [
+          "framevision_app.py"
+        ]
+      },
+      "features": [
+        "Toolbar: Open (📂), Play/Pause (▶/▮▮), Stop (■), Info (ℹ), Fullscreen (⛶), Compare (▷│◁), Upscale, Ask Framie, Repeat (video only).",
+        "Drag & drop onto the viewer area to load media.",
+        "Animated GIFs use QMovie (CacheAll) on the label; stills use pixmap rendering with zoom/pan support.",
+        "Audio/video use QMediaPlayer + QAudioOutput + QVideoSink; seek slider enabled for time-based media.",
+        "Time label shows elapsed / time-left plus a percent readout while playing.",
+        "Fullscreen toggled by double-click; overlay control bar auto-hides; Esc exits; Space toggles play/pause.",
+        "Zoom: mouse wheel changes zoom in 0.5× steps, clamped to 0.5×–50×; pan by dragging when zoomed > 1×.",
+        "Compare mode: choose a second file and use the wipe slider to reveal left vs right; divider can be dragged directly on the view; close compare returns to normal.",
+        "Video compare uses a second muted QMediaPlayer kept in sync with seek/play/pause/stop.",
+        "Repeat toggle loops video at EndOfMedia; when repeat is off, EndOfMedia clears the video sink and shows the background.",
+        "Quick Upscale queues a 4× RealESRGAN-general-x4v3 upscale job to the worker queue, writing to the standard output/upscale folder.",
+        "Info button runs ffprobe-style probing and shows a metadata popup (streams/codecs/size/duration, etc.).",
+        "Engine tweaks: prefer FFmpeg multimedia backend; silence noisy multimedia logs; bump image IO allocation limit."
+      ],
+      "install": [
+        "FrameVision prefers the FFmpeg QtMultimedia backend (sets QT_MEDIA_BACKEND=ffmpeg at startup) to avoid WMF first-play stalls on Windows.",
+        "Large image safety: bumps Qt image allocation limit (QImageReader) to ~1.5GB and sets QT_IMAGEIO_MAXALLOC.",
+        "If media probing is needed, Info uses ffprobe-style probing via helpers.mediainfo."
+      ],
+      "troubleshoot": [
+        "If a video ends and the view goes blank: that is expected when Repeat is OFF; the sink is cleared and the background logo returns.",
+        "If a previous GIF or still seems to ‘stick’ over video: Stop and reload; the player rebuild logic is designed to clear QMovie/pixmaps before video playback.",
+        "If playback feels choppy while the queue is busy, disable or enable queue_pause_refresh_while_playing depending on your preference (it pauses queue polling during playback by default).",
+        "If very large images fail to load, the app already raises the allocation limit; if it still fails, try opening a smaller version or converting the file."
+      ],
+      "overview": "Purpose: a single, always-available media viewer inside FrameVision for quick preview and inspection.\n\nSupported media\n- Still images: .png .jpg/.jpeg .bmp .webp .tif/.tiff (and any Qt-supported image)\n- Animated GIF: handled via QMovie on the viewer label (with cache enabled)\n- Audio: any extension in AUDIO_EXTS (decoded by QtMultimedia)\n- Video: decoded by QtMultimedia (FFmpeg backend preferred)\n\nCore UI\n- Big preview area with drag & drop support\n- Toolbar buttons: Open, Play/Pause, Stop, Info, Fullscreen, Compare, Upscale, Ask Framie, Repeat (video only)\n- Seek slider (audio/video) + time label showing elapsed/remaining and %\n\nViewer features\n- Mouse wheel zoom (0.5×–50×), left-drag pan when zoomed, and a small on-cursor reset bubble\n- Fullscreen via double-click (Esc exits; Space toggles Play/Pause inside fullscreen)\n- Compare mode: wipe slider (and draggable divider) between current media and a second picked file; supports image-vs-image and video-vs-video (right side muted, both players kept in sync)\n\nRobustness/perf notes\n- The player is rebuilt when switching between stills/GIFs and video/audio to avoid backend thread deadlocks.\n- Queue auto-refresh can pause while playing video (config: queue_pause_refresh_while_playing).\n- Large image allocation limit is raised (QImageReader) to reduce ‘Rejecting image … 256 megabytes’ issues.",
+      "_layout": "overview/features/install/troubleshoot",
+      "_features_meta": {
+        "oneliners_last_updated": "2025-12-21",
+        "oneliners_source": "manual update from framevision_app.py",
+        "oneliners_count_added": 13
+      }
+    },
+    "MusicVideoClipCreator": {
+      "key_terms": [
+        "Music VideoClip Creator",
+        "Music Clip Creator",
+        "Auto Music Sync",
+        "beat detection",
+        "beats per segment",
+        "timeline",
+        "one click presets",
+        "clip_presets.json",
+        "FFmpeg",
+        "ffprobe",
+        "random clip selection",
+        "beat synced visuals"
+      ],
+      "description": "Create a beat‑matched music videoclip from your own video clips (and optionally images). FrameVision analyzes your music, detects beats/energy, then builds a timeline that cuts on musical moments. You can keep it fully automatic (random clip selection) or take control with the Timeline.\n\n**Workflow (typical):**\n1) Pick a **music track**.\n2) Choose your **clip source** (a folder, a single file, or a list of files).\n3) Tune the style (beats per segment, transitions, FX level / cinematic options).\n4) Generate the videoclip, then optionally add **beat‑synced visuals** on top.\n\nUnder the hood this tool uses local **FFmpeg/ffprobe** for probing and rendering.",
+      "hints_tips": [
+        "Start simple: try a clean preset first, then add heavier FX once timing feels right.",
+        "If cuts feel too long, reduce **beats per segment** (e.g., 4 → 2 → 1).",
+        "If your sources repeat too often, prefer shuffle/no‑repeat style (when available) and load more clips.",
+        "If you use images, expect them to behave differently than video (some timeline functions are video‑only).",
+        "If processing feels slow, disable Beat‑synced visuals during your first test render and turn it on for the final export."
+      ],
+      "features": [
+        "Automatic beat/energy analysis to drive clip cuts and pacing.",
+        "Optional Timeline override to manually choose clips per segment.",
+        "One‑click presets loaded from `presets/setsave/clip_presets.json` (with built‑in fallbacks).",
+        "Optional Beat‑synced visuals overlay on top of the finished video (slider controls intensity)."
+      ],
+      "qa_pairs": [
+        {
+          "question": "What does Beat synced visuals do?",
+          "answer": "Beat synced visuals toggle\nThis will create beat synced visuals on top off the finished video.\nUsing the slider will show more or less of the visuals, 100 will only show the beatsynced visuals.\nUsing this feature more then doubles processing time."
+        },
+        {
+          "question": "How does the Timeline work?",
+          "answer": "Timeline\nUse the timeline to bypass the random selection off clips by adding your own clips to each segment.\nThe timeline allows saving and loading from json, but this only works for video. Images will be replaced by random clips."
+        },
+        {
+          "question": "What are One click presets?",
+          "answer": "One click presets\nApply a variety of settings and effects and create a videoclip in 1 click.\nThese are default settings and might not look good with every music track."
+        },
+        {
+          "question": "Where do One‑click presets come from?",
+          "answer": "Presets are loaded from `presets/setsave/clip_presets.json`. If the file is missing or broken, FrameVision falls back to safe built‑ins like “Clean cuts (no FX)” and “Chill / slow cinematic”."
+        },
+        {
+          "question": "Why are my images not preserved when I load a timeline JSON?",
+          "answer": "Timeline JSON save/load is designed for video segments. If your timeline includes images, they may be replaced by random clips when reloading."
+        }
+      ],
+      "controls": [
+        "Music track: choose an audio file to analyze.",
+        "Clip source: choose a folder / file(s) containing your footage.",
+        "One click presets…: pick a preset and auto‑generate a videoclip with those settings.",
+        "Timeline: manual per‑segment clip selection (optional).",
+        "Beat‑synced visuals: overlay visuals on top of the finished video (slider controls how much you see)."
+      ],
+      "install": [
+        "Uses your bundled FFmpeg/ffprobe. If missing, see **InstallUpdates → Install**.",
+        "Optional preset file: `presets/setsave/clip_presets.json` (safe fallbacks exist if missing)."
+      ],
+      "troubleshoot": [
+        "If generation fails immediately, check that FFmpeg/ffprobe are detected and that the source clips are valid video files.",
+        "If your output feels off‑beat: try a different sensitivity / beats‑per‑segment setting, or use the Timeline to lock key moments.",
+        "If it’s very slow: disable Beat‑synced visuals for test runs; enable only for the final render (it can more than double processing time)."
+      ],
+      "overview": "Create a beat‑matched music videoclip from your clips. Automatic mode cuts on the music; Timeline mode lets you fully control segment clips. Optional Beat‑synced visuals can be layered on top of the finished render.",
+      "_layout": "overview/features/install/troubleshoot"
+    },
+    "PerformanceReliabilityPlatform": {
+      "key_terms": [
+        "Performance/Reliability/Platform",
+        "CUDA auto-detected",
+        "one-click cu121 switch",
+        "CPU mode",
+        "DirectML",
+        "FP16",
+        "detached installers",
+        "clear messages (install CUDA Torch?, missing einops/flash-attn)",
+        "background worker/logs",
+        "Windows primary",
+        "Linux/WSL2 supported"
+      ],
+      "description": "Auto-detects CUDA; switches to cu121. CPU fallback for everything. DirectML/FP16 for optimization. Clear UX messages; responsive UI via background worker.",
+      "hints_tips": [
+        "If missing libraries (e.g., einops), app prompts installation.",
+        "Use CPU for reliability on non-NVIDIA."
+      ],
+      "qa_pairs": [
+        {
+          "question": "Does FrameVision support GPU?",
+          "answer": "Yes, CUDA auto-detected for NVIDIA; one-click switch to cu121."
+        },
+        {
+          "question": "What if GPU isn't available?",
+          "answer": "Falls back to CPU mode, which works but is slower."
+        },
+        {
+          "question": "How stable is the app?",
+          "answer": "Detached installers prevent locks; clear messages for issues like missing flash-attn."
+        }
+      ]
+    },
+    "Queue": {
+      "description": "Central job manager for Upscaler/Tools. Uses on‑disk state folders (jobs/pending|running|done|failed), per‑job logs in logs/, and outputs under output/. Supports reordering and cancel.",
+      "key_terms": [
+        "cancel",
+        "jobs/done",
+        "jobs/failed",
+        "jobs/pending",
+        "jobs/running",
+        "logs",
+        "output/screenshots",
+        "output/trims",
+        "output/video",
+        "reorder"
+      ],
+      "hints_tips": [
+        "Open a job’s log to see the exact command lines and errors.",
+        "If UI flickers, temporarily disable Auto refresh (debounced updates planned)."
+      ],
+      "qa_pairs": [
+        {
+          "question": "Where are outputs and logs?",
+          "answer": "Outputs are under output/; logs are in logs/. Job state folders are under jobs/."
+        },
+        {
+          "question": "Why does progress look indeterminate?",
+          "answer": "Some engines don’t emit %; real parsing is planned where possible."
+        }
+      ],
+      "features": [
+        "States: pending/running/done/failed; per-job run_*.log; heartbeat; cancel/reorder; progress via .progress.json.",
+        "cancel",
+        "jobs/done",
+        "jobs/failed",
+        "jobs/pending",
+        "jobs/running",
+        "logs",
+        "output/screenshots",
+        "output/trims",
+        "output/video",
+        "reorder",
+        "Key term: cancel",
+        "Key term: jobs/done",
+        "Key term: jobs/failed",
+        "Key term: jobs/pending",
+        "Key term: jobs/running",
+        "Key term: logs",
+        "Key term: output/screenshots",
+        "Key term: output/trims",
+        "Key term: output/video",
+        "Key term: reorder"
+      ],
+      "install": [
+        "General install flow: use **Install/Updates → Option 1** to auto-detect environment, then **Option 2** for repair, or **Option 3/4** for full stacks.",
+        "See **InstallUpdates → Install** for full environment setup and model downloads."
+      ],
+      "troubleshoot": [
+        "If the queue UI flickers, disable Auto refresh as a temporary workaround (see roadmap for debounce fix).",
+        "Run **install_menu.bat** and choose **Option 1 — System check & advisor** (creates venv if missing, checks Python/FFmpeg/GPU/VRAM, prints a full info page and recommends Option 3 or 4).",
+        "If only the app is broken, run **Option 2 — Core install** (quick repair, minimal download).",
+        "If problems persist, pick a full stack: **Option 3 — Full CPU (< 6 GiB VRAM, ~3.5 GB download)** or **Option 4 — Full GPU (≥ 6 GiB VRAM, ~5 GB download)**.",
+        "Still failing? **Delete the `.venv` folder** and re-run Option 3 or 4. You **do not** need to delete helper binaries or models; it’s recommended to clear **cache** and **preset** files.",
+        "If a model/tool is missing or corrupted, run the models-only downloader:\n  - **Windows:** `python \"scripts\\download_externals.py\"`\n  - **macOS/Linux:** `python scripts/download_externals.py`",
+        "Planned: `update.bat` will auto-check and update to the latest stable build.",
+        "For environment issues, follow **InstallUpdates → Troubleshoot** steps.",
+        "Check the job **run_*.log** in the logs folder for this feature’s errors (if applicable)."
+      ],
+      "overview": "Central job manager for Upscaler/Tools. Uses on‑disk state folders (jobs/pending|running|done|failed), per‑job logs in logs/, and outputs under output/. Supports reordering and cancel.",
+      "_layout": "overview/features/install/troubleshoot"
+    },
+    "RIFEInterpolation": {
+      "key_terms": [
+        "RIFE Interpolation",
+        "one-click frame interpolation",
+        "2× default",
+        "queue-native",
+        "slow-mo 0.15×–1.0×",
+        "audio retime",
+        "1.0×–4.0× interpolation",
+        "Superfast NCNN/Vulkan mode",
+        "bundled models auto-extract",
+        "speed profiles 1–5",
+        "Vulkan Superfast"
+      ],
+      "description": "Interpolates frames for smoother video (default 2× FPS). Supports slow-motion (0.15×–1.0× with audio adjustment) and higher FPS (1.0×–4.0×). Models auto-extract on first run. Superfast mode uses NCNN/Vulkan for speed. Integrates with queue for progress/ETA/logs.",
+      "hints_tips": [
+        "No setup needed—models extract automatically.",
+        "Use Superfast for quick jobs but note it blocks UI.",
+        "For slow-mo, audio is automatically retimed.",
+        "Cancel jobs safely cleans temps."
+      ],
+      "qa_pairs": [
+        {
+          "question": "How does RIFE work in FrameVision?",
+          "answer": "One-click interpolation at 2× default; supports slow-mo (0.15×–1.0×) or higher FPS (up to 4×) with audio retime."
+        },
+        {
+          "question": "What is Superfast mode?",
+          "answer": "An optional NCNN/Vulkan toggle for blazing speed using bundled models like v4.6/HD/UHD/Anime."
+        },
+        {
+          "question": "Where are RIFE models stored?",
+          "answer": "Auto-extracted to models/rife/default on first run."
+        }
+      ],
+      "controls": [
+        "Browse...",
+        "Choose Folder",
+        "Open Folder",
+        "Start",
+        "Cancel",
+        "Ready.",
+        "Streaming (low memory)",
+        "Model:",
+        "GPU:",
+        "Threads:",
+        "Chunk size:",
+        "RIFE preset:",
+        "Pace between chunks (ms):",
+        "UHD safety (-u)",
+        "Keep temp frames",
+        "Auto CPU fallback",
+        "CRF:",
+        "PNG level:",
+        "Use JPEG temp frames",
+        "JPEG quality:",
+        "Use NVENC for final encode",
+        "x264 preset:",
+        "Minimal logging (to file)",
+        "Starting ...",
+        "Auto",
+        "Multiplier:",
+        "2.00×",
+        "2×",
+        "4×",
+        "Auto-play when finished",
+        "Result: —",
+        "Load profile:",
+        "Default",
+        "Install/Verify",
+        "Use NCNN Vulkan superfast engine (blocks UI)",
+        "Play last result (internal)",
+        "Result in external player",
+        "Start (Queue)",
+        "Add Batch",
+        "Open RIFE folder"
+      ],
+      "_controls_meta": {
+        "last_appended": "2025-09-07",
+        "source": "auto-extracted from code (helpers/)",
+        "modules_used": [
+          "rife_tab.py",
+          "interp.py"
+        ]
+      },
+      "overview": "Interpolates frames for smoother video (default 2× FPS). Supports slow-motion (0.15×–1.0× with audio adjustment) and higher FPS (1.0×–4.0×). Models auto-extract on first run. Superfast mode uses NCNN/Vulkan for speed. Integrates with queue for progress/ETA/logs.",
+      "features": [
+        "Key term: RIFE Interpolation",
+        "Key term: one-click frame interpolation",
+        "Key term: 2× default",
+        "Key term: queue-native",
+        "Key term: slow-mo 0.15×–1.0×",
+        "Key term: audio retime",
+        "Key term: 1.0×–4.0× interpolation",
+        "Key term: Superfast NCNN/Vulkan mode",
+        "Key term: bundled models auto-extract",
+        "Key term: speed profiles 1–5",
+        "Key term: Vulkan Superfast",
+        "Control: Multiplier: — label. Default: unset/neutral. Does: UI control.",
+        "Control: 2.00× — label. Default: unset/neutral. Does: UI control.",
+        "Control: 2× — button. Default: n/a (runs on click). Does: Perform the labeled action immediately.",
+        "Control: 4× — button. Default: n/a (runs on click). Does: Perform the labeled action immediately.",
+        "Control: Streaming (low memory) — checkbox. Default: off (toggle to enable). Does: Toggle feature on/off.",
+        "Control: Auto-play when finished — checkbox. Default: off (toggle to enable). Does: Transport control to start/stop playback.",
+        "Control: Result: — — label. Default: unset/neutral. Does: UI control.",
+        "Control: Load profile: — label. Default: unset/neutral. Does: UI control.",
+        "Control: Default — checkbox. Default: off (toggle to enable). Does: Toggle feature on/off.",
+        "Control: Model: — label. Default: unset/neutral. Does: UI control.",
+        "Control: Install/Verify — button. Default: n/a (runs on click). Does: Perform the labeled action immediately.",
+        "Control: Use NCNN Vulkan superfast engine (blocks UI) — checkbox. Default: off (toggle to enable). Does: Toggle feature on/off.",
+        "Control: Play last result (internal) — button. Default: n/a (runs on click). Does: Transport control to start/stop playback.",
+        "Control: Result in external player — button. Default: n/a (runs on click). Does: Transport control to start/stop playback.",
+        "Control: Start (Queue) — button. Default: n/a (runs on click). Does: Perform the labeled action immediately.",
+        "Control: Add Batch — button. Default: n/a (runs on click). Does: Perform the labeled action immediately.",
+        "Control: Open RIFE folder — button. Default: n/a (runs on click). Does: Perform the labeled action immediately.",
+        "Control: Result: — — text label. Default: unset/neutral. Does: UI control.",
+        "Control: Browse... — button. Default: n/a (runs on click). Does: Perform the labeled action immediately.",
+        "Control: Choose Folder — button. Default: n/a (runs on click). Does: Perform the labeled action immediately.",
+        "Control: Open Folder — button. Default: n/a (runs on click). Does: Perform the labeled action immediately.",
+        "Control: Start — button. Default: n/a (runs on click). Does: Perform the labeled action immediately.",
+        "Control: Cancel — button. Default: n/a (runs on click). Does: Perform the labeled action immediately.",
+        "Control: Ready. — label. Default: unset/neutral. Does: UI control.",
+        "Control: GPU: — label. Default: unset/neutral. Does: UI control.",
+        "Control: Threads: — label. Default: unset/neutral. Does: UI control.",
+        "Control: Chunk size: — label. Default: unset/neutral. Does: UI control.",
+        "Control: RIFE preset: — label. Default: unset/neutral. Does: UI control.",
+        "Control: Pace between chunks (ms): — label. Default: unset/neutral. Does: UI control.",
+        "Control: UHD safety (-u) — checkbox. Default: off (toggle to enable). Does: Toggle feature on/off.",
+        "Control: Keep temp frames — checkbox. Default: off (toggle to enable). Does: Toggle feature on/off.",
+        "Control: Auto CPU fallback — checkbox. Default: off (toggle to enable). Does: Toggle feature on/off.",
+        "Control: CRF: — label. Default: CRF 20 (typical default). Does: Control quality vs size; lower CRF = higher quality.",
+        "Control: PNG level: — label. Default: unset/neutral. Does: UI control.",
+        "Control: Use JPEG temp frames — checkbox. Default: off (toggle to enable). Does: Toggle feature on/off.",
+        "Control: JPEG quality: — label. Default: unset/neutral. Does: Control quality vs size; lower CRF = higher quality.",
+        "Control: Use NVENC for final encode — checkbox. Default: off (toggle to enable). Does: Toggle feature on/off.",
+        "Control: x264 preset: — label. Default: unset/neutral. Does: UI control.",
+        "Control: Minimal logging (to file) — checkbox. Default: off (toggle to enable). Does: Toggle feature on/off.",
+        "Control: Starting ... — text label. Default: unset/neutral. Does: UI control.",
+        "Control: Auto — list item. Default: selectable option (default depends on the combo). Does: An option in a dropdown list."
+      ],
+      "install": [
+        "See **InstallUpdates → Install** for full environment setup and model downloads."
+      ],
+      "troubleshoot": [
+        "For environment issues, follow **InstallUpdates → Troubleshoot** steps.",
+        "Check the job **run_*.log** in the logs folder for this feature’s errors (if applicable)."
+      ],
+      "_layout": "overview/features/install/troubleshoot",
+      "_features_meta": {
+        "oneliners_last_updated": "2025-09-07",
+        "oneliners_source": "helpers/ code scan",
+        "oneliners_count_added": 41
+      }
+    },
+    "Settings": {
+      "description": "Controls themes, behavior, paths, and diagnostics. Includes the Theme picker (Apply, Auto, Random), maintenance buttons (Open log folder, Clear program cache…, Restart App, Dump QSettings), temperature units (°C/°F), and the System Monitor (SysMon).",
+      "key_terms": [
+        "Auto theme",
+        "Clear program cache",
+        "Dump QSettings",
+        "Open log folder",
+        "Random theme",
+        "Restart App",
+        "SysMon",
+        "Temperature units",
+        "Theme Apply"
+      ],
+      "hints_tips": [
+        "Use Open log folder to quickly grab diagnostics for support.",
+        "Clear program cache… removes temp files; safe to run after updates or odd UI behavior.",
+        "Auto theme switches Day/Evening/Night by local time; Random picks a theme on apply."
+      ],
+      "qa_pairs": [
+        {
+          "question": "How do I change the theme?",
+          "answer": "Pick a theme in Settings and click Apply. Use Auto to change by time of day or Random to pick a theme each apply."
+        },
+        {
+          "question": "Where are logs/configs?",
+          "answer": "Click Open log folder for logs. Use Dump QSettings to export current settings for support."
+        },
+        {
+          "question": "Can I restart from Settings?",
+          "answer": "Yes—Restart App relaunches the app with current configuration."
+        }
+      ],
+      "controls": [
+        "Theme:",
+        "Apply theme",
+        "Options",
+        "Show random intro image on startup",
+        "Intro follows theme routine (Day/Evening/Night)",
+        "Clear app Python cache files in /__pycache__ at (re)start",
+        "Keep all used settings after restart",
+        "Temperature units:",
+        "Clear program cache…",
+        "Restart App",
+        "Dump QSettings now",
+        "GitHub",
+        "YouTube"
+      ],
+      "_controls_meta": {
+        "last_appended": "2025-09-07",
+        "source": "auto-extracted from code (helpers/)",
+        "modules_used": [
+          "settings_tab.py"
+        ]
+      },
+      "features": [
+        "Open log folder; QSettings dump; per-tab remember settings; °C/°F toggle (global).",
+        "Auto theme",
+        "Clear program cache",
+        "Dump QSettings",
+        "Open log folder",
+        "Random theme",
+        "Restart App",
+        "SysMon",
+        "Temperature units",
+        "Theme Apply",
+        "Theme:",
+        "Apply theme",
+        "Options",
+        "Show random intro image on startup",
+        "Intro follows theme routine (Day/Evening/Night)",
+        "Clear app Python cache files in /__pycache__ at (re)start",
+        "Keep all used settings after restart",
+        "Temperature units:",
+        "Clear program cache…",
+        "Restart App",
+        "Dump QSettings now",
+        "GitHub",
+        "Key term: Auto theme",
+        "Key term: Clear program cache",
+        "Key term: Dump QSettings",
+        "Key term: Open log folder",
+        "Key term: Random theme",
+        "Key term: Restart App",
+        "Key term: SysMon",
+        "Key term: Temperature units",
+        "Key term: Theme Apply",
+        "Control: Theme: — label. Default: unset/neutral. Does: UI control.",
+        "Control: Apply theme — button. Default: n/a (runs on click). Does: Perform the labeled action immediately.",
+        "Control: Options — groupbox. Default: unset/neutral. Does: UI control.",
+        "Control: Show random intro image on startup — checkbox. Default: off (toggle to enable). Does: Toggle feature on/off.",
+        "Control: Intro follows theme routine (Day/Evening/Night) — checkbox. Default: off (toggle to enable). Does: Toggle feature on/off.",
+        "Control: Clear app Python cache files in /__pycache__ at (re)start — checkbox. Default: off (toggle to enable). Does: Toggle feature on/off.",
+        "Control: Keep all used settings after restart — checkbox. Default: off (toggle to enable). Does: Toggle feature on/off.",
+        "Control: Temperature units: — label. Default: unset/neutral. Does: Decoding controls that affect diversity and randomness.",
+        "Control: Clear program cache… — button. Default: n/a (runs on click). Does: Perform the labeled action immediately.",
+        "Control: Restart App — button. Default: n/a (runs on click). Does: Perform the labeled action immediately.",
+        "Control: Dump QSettings now — button. Default: n/a (runs on click). Does: Perform the labeled action immediately.",
+        "Control: GitHub — button. Default: n/a (runs on click). Does: Perform the labeled action immediately.",
+        "Control: YouTube — button. Default: n/a (runs on click). Does: Perform the labeled action immediately."
+      ],
+      "install": [
+        "General install flow: use **Install/Updates → Option 1** to auto-detect environment, then **Option 2** for repair, or **Option 3/4** for full stacks.",
+        "See **InstallUpdates → Install** for full environment setup and model downloads."
+      ],
+      "troubleshoot": [
+        "Run **install_menu.bat** and choose **Option 1 — System check & advisor** (creates venv if missing, checks Python/FFmpeg/GPU/VRAM, prints a full info page and recommends Option 3 or 4).",
+        "If only the app is broken, run **Option 2 — Core install** (quick repair, minimal download).",
+        "If problems persist, pick a full stack: **Option 3 — Full CPU (< 6 GiB VRAM, ~3.5 GB download)** or **Option 4 — Full GPU (≥ 6 GiB VRAM, ~5 GB download)**.",
+        "Still failing? **Delete the `.venv` folder** and re-run Option 3 or 4. You **do not** need to delete helper binaries or models; it’s recommended to clear **cache** and **preset** files.",
+        "If a model/tool is missing or corrupted, run the models-only downloader:\n  - **Windows:** `python \"scripts\\download_externals.py\"`\n  - **macOS/Linux:** `python scripts/download_externals.py`",
+        "Planned: `update.bat` will auto-check and update to the latest stable build.",
+        "For environment issues, follow **InstallUpdates → Troubleshoot** steps.",
+        "Check the job **run_*.log** in the logs folder for this feature’s errors (if applicable)."
+      ],
+      "overview": "Controls themes, behavior, paths, and diagnostics. Includes the Theme picker (Apply, Auto, Random), maintenance buttons (Open log folder, Clear program cache…, Restart App, Dump QSettings), temperature units (°C/°F), and the System Monitor (SysMon).",
+      "_layout": "overview/features/install/troubleshoot",
+      "_features_meta": {
+        "oneliners_last_updated": "2025-09-07",
+        "oneliners_source": "helpers/ code scan",
+        "oneliners_count_added": 13
+      }
+    },
+    "SystemMonitor": {
+      "description": "System Monitor shows environment versions (CUDA/Torch/TorchVision/Transformers), hardware metrics, and tool presence checks. Includes a °C/°F toggle, optional HUD overlay with colorized thresholds (with hysteresis), and quick diagnostics links.\n\n---\n**KB Addendum 2025-09-07 — System Monitor**\nClarifies the versions line, °C/°F toggle behavior, tools check list, and HUD overlay hysteresis.\n",
+      "key_terms": [
+        "Versions line",
+        "Temp units (°C/°F)",
+        "Tools check (FFmpeg/Real‑ESRGAN/Waifu2x/RIFE/Qwen)",
+        "HUD overlay",
+        "Diagnostics (logs, QSettings)"
+      ],
+      "hints_tips": [
+        "If GPU metrics are N/A, update drivers and ensure CUDA toolkit matches Torch.",
+        "Use °F/°C toggle to match your preference; units propagate across the UI.",
+        "Keep HUD in low‑impact mode during heavy processing.",
+        "Use Diagnostics to open logs and dump settings for support.",
+        "If GPU metrics show N/A, update drivers and align CUDA/Torch versions.",
+        "Use the temperature units toggle; it applies across the UI.",
+        "Enable low‑impact HUD during long runs to minimize overhead.",
+        "Use diagnostics links to open logs and dump settings for support."
+      ],
+      "controls": [
+        "Developer Diagnostics",
+        "Enable diagnostics logging (console + logs/framevision.log)",
+        "Dump QSettings now",
+        "Open log folder"
+      ],
+      "_controls_meta": {
+        "last_appended": "2025-09-07",
+        "source": "auto-extracted from code (helpers/)",
+        "modules_used": [
+          "settings_diagnostics.py"
+        ]
+      },
+      "features": [
+        "Versions line (CUDA/Torch/TorchVision/Transformers); tools presence check.",
+        "HUD overlay with colorized thresholds and hysteresis; low-impact mode.",
+        "Versions line",
+        "Temp units (°C/°F)",
+        "Tools check (FFmpeg/Real‑ESRGAN/Waifu2x/RIFE/Qwen)",
+        "HUD overlay",
+        "Diagnostics (logs, QSettings)",
+        "Developer Diagnostics",
+        "Enable diagnostics logging (console + logs/framevision.log)",
+        "Dump QSettings now",
+        "Open log folder",
+        "Key term: Versions line",
+        "Key term: Temp units (°C/°F)",
+        "Key term: Tools check (FFmpeg/Real‑ESRGAN/Waifu2x/RIFE/Qwen)",
+        "Key term: HUD overlay",
+        "Key term: Diagnostics (logs, QSettings)",
+        "Control: Developer Diagnostics — groupbox. Default: unset/neutral. Does: UI control.",
+        "Control: Enable diagnostics logging (console + logs/framevision.log) — checkbox. Default: off (toggle to enable). Does: Toggle feature on/off.",
+        "Control: Dump QSettings now — button. Default: n/a (runs on click). Does: Perform the labeled action immediately.",
+        "Control: Open log folder — button. Default: n/a (runs on click). Does: Perform the labeled action immediately."
+      ],
+      "install": [
+        "General install flow: use **Install/Updates → Option 1** to auto-detect environment, then **Option 2** for repair, or **Option 3/4** for full stacks.",
+        "See **InstallUpdates → Install** for full environment setup and model downloads."
+      ],
+      "troubleshoot": [
+        "Run **install_menu.bat** and choose **Option 1 — System check & advisor** (creates venv if missing, checks Python/FFmpeg/GPU/VRAM, prints a full info page and recommends Option 3 or 4).",
+        "If only the app is broken, run **Option 2 — Core install** (quick repair, minimal download).",
+        "If problems persist, pick a full stack: **Option 3 — Full CPU (< 6 GiB VRAM, ~3.5 GB download)** or **Option 4 — Full GPU (≥ 6 GiB VRAM, ~5 GB download)**.",
+        "Still failing? **Delete the `.venv` folder** and re-run Option 3 or 4. You **do not** need to delete helper binaries or models; it’s recommended to clear **cache** and **preset** files.",
+        "If a model/tool is missing or corrupted, run the models-only downloader:\n  - **Windows:** `python \"scripts\\download_externals.py\"`\n  - **macOS/Linux:** `python scripts/download_externals.py`",
+        "Planned: `update.bat` will auto-check and update to the latest stable build.",
+        "For environment issues, follow **InstallUpdates → Troubleshoot** steps.",
+        "Check the job **run_*.log** in the logs folder for this feature’s errors (if applicable)."
+      ],
+      "overview": "System Monitor shows environment versions (CUDA/Torch/TorchVision/Transformers), hardware metrics, and tool presence checks. Includes a °C/°F toggle, optional HUD overlay with colorized thresholds (with hysteresis), and quick diagnostics links.\n\n---\n**KB Addendum 2025-09-07 — System Monitor**\nClarifies the versions line, °C/°F toggle behavior, tools check list, and HUD overlay hysteresis.\n",
+      "_layout": "overview/features/install/troubleshoot",
+      "_features_meta": {
+        "oneliners_last_updated": "2025-09-07",
+        "oneliners_source": "helpers/ code scan",
+        "oneliners_count_added": 4
+      }
+    },
+    "Themes": {
+      "description": "Multiple built‑in themes with Apply, Auto (time‑based), and Random. Examples: Day, Evening, Night, Slate, High Contrast, Cyberpunk, Neon, Ocean, CRT, Aurora, Mardi Gras, Tropical Fiesta, Color Mix, Solarized Light, Sunburst.",
+      "key_terms": [
+        "Aurora",
+        "Auto",
+        "CRT",
+        "Color Mix",
+        "Cyberpunk",
+        "Day",
+        "Evening",
+        "High Contrast",
+        "Mardi Gras",
+        "Neon",
+        "Night",
+        "Ocean",
+        "Random",
+        "Slate",
+        "Solarized Light",
+        "Sunburst",
+        "Tropical Fiesta"
+      ],
+      "hints_tips": [
+        "Use Auto for hands‑free day/evening/night; Random for variety during sessions."
+      ],
+      "qa_pairs": [
+        {
+          "question": "How does Auto decide?",
+          "answer": "Maps local time into Day/Evening/Night bands."
+        },
+        {
+          "question": "What does Random do?",
+          "answer": "Picks one of the available themes each time you apply."
+        }
+      ]
+    },
+    "ThumbnailMemeCreator": {
+      "key_terms": [
+        "ALL CAPS",
+        "Alt keep center",
+        "EXIF keep/remove",
+        "Esc cancel",
+        "HUD W×H/AR",
+        "Shift = 10px",
+        "Thumbnail/Meme Creator",
+        "align",
+        "arc curvature",
+        "arrow-key nudging",
+        "auto-fit bounds",
+        "big preview",
+        "color pickers",
+        "crop overlay",
+        "crop presets",
+        "current frame",
+        "dimmed background",
+        "double-click apply",
+        "drag handles",
+        "edge auto-scroll",
+        "export PNG/JPG",
+        "fonts",
+        "free crop",
+        "handle size setting",
+        "interactive crop overlay",
+        "letter spacing",
+        "live preview",
+        "open image",
+        "outer glow",
+        "outline width",
+        "overlay opacity setting",
+        "rotate",
+        "shadow",
+        "spinboxes next to sliders",
+        "text layers",
+        "tilt/skew",
+        "transform sliders"
+      ],
+      "description": "Create thumbnails or memes from the current frame or any image with live preview. Multiple text layers (fonts, outline width, shadow, alignment, ALL CAPS). Transform with rotate, tilt/skew, and arc curvature; plus readability sliders for outer glow and letter spacing. Interactive crop overlay (16:9 / 9:16 / free) with drag/resize handles, dim-out, double‑click Apply, Esc cancel, and Alt keep‑center. Arrow‑key nudging (1px; Shift=10px), edge auto‑scroll, live HUD (W×H, AR), and spinboxes next to sliders. Export PNG/JPG with EXIF keep/remove and quality options.",
+      "hints_tips": [
+        "Hold Alt while resizing the crop to keep its center fixed.",
+        "Double‑click inside the crop to apply; press Esc to cancel.",
+        "Use arrow keys for 1px nudging; hold Shift for 10px steps.",
+        "Increase handle size or overlay opacity in settings if the crop box is hard to see.",
+        "Use outer glow to separate text from busy backgrounds; adjust letter spacing for ALL‑CAPS clarity."
+      ],
+      "qa_pairs": [
+        {
+          "question": "How do I create a meme in FrameVision?",
+          "answer": "Open an image or use current frame, add text layers with fonts/outlines/shadows, apply transforms like rotate or arc, then export as PNG/JPG."
+        },
+        {
+          "question": "What crop options are available?",
+          "answer": "Presets (e.g., 16:9) or free crop; movable presets allow positioning before commit."
+        },
+        {
+          "question": "Can I preview changes?",
+          "answer": "Yes, live preview and big preview options are available."
+        },
+        {
+          "question": "How do I use the new crop overlay?",
+          "answer": "Click a crop preset (16:9 or 9:16) or Free to show the overlay, then drag the handles. Double‑click to apply; Esc cancels. Hold Alt to keep the center locked while resizing. Tweak handle size and overlay opacity in settings."
+        },
+        {
+          "question": "Can I make fine adjustments?",
+          "answer": "Yes. Use arrow keys for 1px nudging (Shift = 10px). All sliders have spinboxes for numeric entry and show a small value popover as you drag."
+        },
+        {
+          "question": "What do Outer glow and Letter spacing do?",
+          "answer": "Outer glow draws a soft halo underneath text to improve readability on busy shots. Letter spacing (tracking) tightens or opens space between letters—great for ALL‑CAPS titles."
+        },
+        {
+          "question": "Why does the crop box sometimes scroll the view?",
+          "answer": "Edge auto‑scroll is enabled—when you drag near the viewport edges, the canvas scrolls so you can keep resizing beyond the current view."
+        }
+      ],
+      "controls": [
+        "Use current image",
+        "Open image…",
+        "Big preview",
+        "Add text",
+        "Edit selected…",
+        "Remove selected",
+        "Reset positions",
+        "Crop 16:9",
+        "Crop 9:16",
+        "Reset crop",
+        "Apply crop",
+        "Keep metadata (EXIF)",
+        "Export → Save as…",
+        "Batch…",
+        "Format",
+        "Quality",
+        "Add fonts…",
+        "Load folder…",
+        "Font…",
+        "Auto-fit",
+        "Shadow",
+        "ALL CAPS",
+        "Text color…",
+        "Outline color…",
+        "Use current frame",
+        "Close"
+      ],
+      "_controls_meta": {
+        "last_appended": "2025-09-07",
+        "source": "auto-extracted from code (helpers/)",
+        "modules_used": [
+          "meme_tool.py"
+        ]
+      },
+      "features": [
+        "Text layers with outline/shadow/glow; arc curvature; ALL CAPS; letter spacing.",
+        "Crop presets (16:9, 9:16, Free); keyboard nudges; overlay opacity; export PNG/JPG.",
+        "ALL CAPS",
+        "Alt keep center",
+        "EXIF keep/remove",
+        "Esc cancel",
+        "HUD W×H/AR",
+        "Shift = 10px",
+        "Thumbnail/Meme Creator",
+        "align",
+        "arc curvature",
+        "arrow-key nudging",
+        "auto-fit bounds",
+        "big preview",
+        "Use current image",
+        "Open image…",
+        "Big preview",
+        "Add text",
+        "Edit selected…",
+        "Remove selected",
+        "Reset positions",
+        "Crop 16:9",
+        "Crop 9:16",
+        "Reset crop",
+        "Apply crop",
+        "Keep metadata (EXIF)",
+        "Key term: ALL CAPS",
+        "Key term: Alt keep center",
+        "Key term: EXIF keep/remove",
+        "Key term: Esc cancel",
+        "Key term: HUD W×H/AR",
+        "Key term: Shift = 10px",
+        "Key term: Thumbnail/Meme Creator",
+        "Key term: align",
+        "Key term: arc curvature",
+        "Key term: arrow-key nudging",
+        "Key term: auto-fit bounds",
+        "Key term: big preview",
+        "Key term: color pickers",
+        "Key term: crop overlay",
+        "Key term: crop presets",
+        "Key term: current frame",
+        "Key term: dimmed background",
+        "Key term: double-click apply",
+        "Key term: drag handles",
+        "Key term: edge auto-scroll",
+        "Key term: export PNG/JPG",
+        "Key term: fonts",
+        "Key term: free crop",
+        "Key term: handle size setting",
+        "Key term: interactive crop overlay",
+        "Key term: letter spacing",
+        "Key term: live preview",
+        "Key term: open image",
+        "Key term: outer glow",
+        "Key term: outline width",
+        "Key term: overlay opacity setting",
+        "Key term: rotate",
+        "Key term: shadow",
+        "Key term: spinboxes next to sliders",
+        "Key term: text layers",
+        "Key term: tilt/skew",
+        "Key term: transform sliders",
+        "Control: Use current image — button. Default: n/a (runs on click). Does: Perform the labeled action immediately.",
+        "Control: Open image… — button. Default: n/a (runs on click). Does: Perform the labeled action immediately.",
+        "Control: Big preview — button. Default: n/a (runs on click). Does: Perform the labeled action immediately.",
+        "Control: Add text — button. Default: n/a (runs on click). Does: Perform the labeled action immediately.",
+        "Control: Edit selected… — button. Default: n/a (runs on click). Does: Perform the labeled action immediately.",
+        "Control: Remove selected — button. Default: n/a (runs on click). Does: Perform the labeled action immediately.",
+        "Control: Reset positions — button. Default: n/a (runs on click). Does: Perform the labeled action immediately.",
+        "Control: Crop 16:9 — button. Default: n/a (runs on click). Does: Perform the labeled action immediately.",
+        "Control: Crop 9:16 — button. Default: n/a (runs on click). Does: Perform the labeled action immediately.",
+        "Control: Reset crop — button. Default: n/a (runs on click). Does: Perform the labeled action immediately.",
+        "Control: Apply crop — button. Default: n/a (runs on click). Does: Perform the labeled action immediately.",
+        "Control: Keep metadata (EXIF) — checkbox. Default: off (toggle to enable). Does: Toggle feature on/off.",
+        "Control: Export → Save as… — button. Default: n/a (runs on click). Does: Perform the labeled action immediately.",
+        "Control: Batch… — button. Default: n/a (runs on click). Does: Perform the labeled action immediately.",
+        "Control: Format — label. Default: unset/neutral. Does: UI control.",
+        "Control: Quality — label. Default: unset/neutral. Does: Control quality vs size; lower CRF = higher quality.",
+        "Control: Add fonts… — button. Default: n/a (runs on click). Does: Perform the labeled action immediately.",
+        "Control: Load folder… — button. Default: n/a (runs on click). Does: Perform the labeled action immediately.",
+        "Control: Font… — button. Default: n/a (runs on click). Does: Perform the labeled action immediately.",
+        "Control: Auto-fit — checkbox. Default: off (toggle to enable). Does: Toggle feature on/off.",
+        "Control: Shadow — checkbox. Default: off (toggle to enable). Does: Toggle feature on/off.",
+        "Control: ALL CAPS — checkbox. Default: off (toggle to enable). Does: Toggle feature on/off.",
+        "Control: Text color… — button. Default: n/a (runs on click). Does: Perform the labeled action immediately.",
+        "Control: Outline color… — button. Default: n/a (runs on click). Does: Perform the labeled action immediately.",
+        "Control: Use current frame — button. Default: n/a (runs on click). Does: Perform the labeled action immediately.",
+        "Control: Close — button. Default: n/a (runs on click). Does: Perform the labeled action immediately."
+      ],
+      "install": [
+        "General install flow: use **Install/Updates → Option 1** to auto-detect environment, then **Option 2** for repair, or **Option 3/4** for full stacks.",
+        "See **InstallUpdates → Install** for full environment setup and model downloads."
+      ],
+      "troubleshoot": [
+        "Run **install_menu.bat** and choose **Option 1 — System check & advisor** (creates venv if missing, checks Python/FFmpeg/GPU/VRAM, prints a full info page and recommends Option 3 or 4).",
+        "If only the app is broken, run **Option 2 — Core install** (quick repair, minimal download).",
+        "If problems persist, pick a full stack: **Option 3 — Full CPU (< 6 GiB VRAM, ~3.5 GB download)** or **Option 4 — Full GPU (≥ 6 GiB VRAM, ~5 GB download)**.",
+        "Still failing? **Delete the `.venv` folder** and re-run Option 3 or 4. You **do not** need to delete helper binaries or models; it’s recommended to clear **cache** and **preset** files.",
+        "If a model/tool is missing or corrupted, run the models-only downloader:\n  - **Windows:** `python \"scripts\\download_externals.py\"`\n  - **macOS/Linux:** `python scripts/download_externals.py`",
+        "Planned: `update.bat` will auto-check and update to the latest stable build.",
+        "For environment issues, follow **InstallUpdates → Troubleshoot** steps.",
+        "Check the job **run_*.log** in the logs folder for this feature’s errors (if applicable)."
+      ],
+      "overview": "Create thumbnails or memes from the current frame or any image with live preview. Multiple text layers (fonts, outline width, shadow, alignment, ALL CAPS). Transform with rotate, tilt/skew, and arc curvature; plus readability sliders for outer glow and letter spacing. Interactive crop overlay (16:9 / 9:16 / free) with drag/resize handles, dim-out, double‑click Apply, Esc cancel, and Alt keep‑center. Arrow‑key nudging (1px; Shift=10px), edge auto‑scroll, live HUD (W×H, AR), and spinboxes next to sliders. Export PNG/JPG with EXIF keep/remove and quality options.",
+      "_layout": "overview/features/install/troubleshoot",
+      "_features_meta": {
+        "oneliners_last_updated": "2025-09-07",
+        "oneliners_source": "helpers/ code scan",
+        "oneliners_count_added": 26
+      }
+    },
+    "Tools": {
+      "description": "A comprehensive toolkit for fast, single‑purpose edits that pairs well with the Upscaler. Includes Quality/Size (Video), Change Speed (with sound sync), Add Audio (replace/mix), Export GIF (palettegen/paletteuse), Extract Frames, Resize (non‑AI), Trim (fast copy vs precise), Meme/Thumbnail creator with arc text & crop presets, and Multi‑Rename. Presets and per‑tool ‘Remember settings’ are available. Outputs go to standard output folders.\n\n---\n**KB Addendum 2025-09-07 — Tools Deep‑Dive**\nThis addendum expands the Tools section with concrete recipes, richer option explanations, and troubleshooting notes.\n- **Quality/Size (Video):** CRF vs Bitrate, encoder presets, keyint/GOP, color range (Full/Limited), audio (copy/encode).\n- **Change Speed:** time‑stretch via atempo with chained factors (>2×), sync/mute options, desync caveats.\n- **Add Audio:** Replace vs Mix (amix), input gain staging, peak management.\n- **Export GIF:** palettegen/paletteuse pipeline, FPS/resize strategies for filesize control.\n- **Extract Frames:** last/all, naming, PNG vs JPG trade‑offs.\n- **Resize (Video):** non‑AI scaling; when to prefer Upscaler instead.\n- **Trim:** fast copy (keyframe‑aligned) vs precise re‑encode (accurate in/out).\n- **Meme/Thumbnail:** arc curvature, outline/shadow/glow, crop presets (16:9/9:16/Free), keyboard nudges.\n- **Multi‑Rename:** preview/dry‑run, base name + numbering, date stamps, remove N chars, zero‑padding.\n\n\n**Controls (auto-discovered):** The list under 'controls' enumerates buttons, toggles, actions, and list items detected from the UI code. This complements the human-written overview and Q&A. Use it to audit coverage: every label should appear in the KB.",
+      "key_terms": [
+        "Quality/Size (Video)",
+        "CRF vs Bitrate",
+        "Encoder preset (x264/x265/AV1)",
+        "Keyint/GOP",
+        "Color range (Full/Limited)",
+        "Change Speed (with atempo)",
+        "Add Audio (Replace/Mix)",
+        "Export GIF (palettegen/paletteuse)",
+        "Extract Frames (last/all)",
+        "Resize (Video)",
+        "Trim (Fast copy / Precise)",
+        "Meme/Thumbnail (arc curvature)",
+        "Multi‑Rename (preview/dry‑run)",
+        "Presets & Remember settings"
+      ],
+      "hints_tips": [
+        "Prefer CRF for quality targeting; use bitrate only when you must hit a size cap.",
+        "For H.264 start at CRF 18–22; H.265 20–24; AV1 30–36.",
+        "Long GOPs compress better but hurt seeking; 2–4× frame‑rate is a practical range.",
+        "Use ‘Sound sync’ in Change Speed to keep audio aligned via atempo; chain steps for >2×.",
+        "When mixing audio, lower both sources by 3–6 dB to avoid clipping.",
+        "For small GIFs: cut FPS to 8–15, resize first, and always use palettegen/paletteuse.",
+        "Trim: choose Fast copy for keyframe‑aligned speed, Precise re‑encode for exact cuts.",
+        "Keep Video Thumbnails OFF during long runs; it uses software decode.",
+        "Use presets for repeat tasks (e.g., 720p CRF20 H.264).",
+        "Tools outputs are organized under output/… by type (e.g., trims, screenshots).",
+        "Prefer CRF for quality; use bitrate only when you must hit a file‑size or bandwidth target.",
+        "H.264 CRF 18–22 is a safe range; lower CRF increases quality and size.",
+        "Longer GOP improves compression but hurts seekability in editors.",
+        "Enable ‘Sound sync’ to keep audio aligned; chain atempo steps for >2× speed changes.",
+        "When mixing audio, reduce each source by 3–6 dB to prevent clipping.",
+        "For smaller GIFs: reduce FPS to 8–15, resize first, and use palettegen/paletteuse.",
+        "Fast copy trim is near‑instant but may shift cut points to the nearest keyframe.",
+        "Keep Video Thumbnails OFF during heavy jobs to conserve CPU.",
+        "Create presets for repeat tasks (e.g., 720p CRF20 H.264 with AAC 160k).",
+        "Outputs are organized under output/… by tool (e.g., trims, screenshots)."
+      ],
+      "qa_pairs": [
+        {
+          "question": "Upscaler vs Tools → Resize?",
+          "answer": "Upscaler uses AI (NCNN/Vulkan) for fidelity; Tools → Resize uses FFmpeg scaling. Use Resize for quick downscale, Upscaler for quality improvement."
+        },
+        {
+          "question": "CRF or Bitrate?",
+          "answer": "Use CRF for consistent visual quality. Use bitrate only when targeting a hard size or bandwidth limit."
+        },
+        {
+          "question": "Recommended CRF values?",
+          "answer": "H.264: 18–22; H.265: 20–24; AV1: 30–36. Lower CRF = higher quality."
+        },
+        {
+          "question": "What’s keyint/GOP for?",
+          "answer": "Controls keyframe spacing; larger values compress better but reduce seek/edit responsiveness."
+        },
+        {
+          "question": "Color range fix?",
+          "answer": "Converts 0–255 ↔ 16–235. Use if blacks look gray or whites are crushed."
+        },
+        {
+          "question": "Change Speed keeps audio in sync how?",
+          "answer": "By time‑stretching with atempo when Sound sync is enabled."
+        },
+        {
+          "question": "When disable Sound sync?",
+          "answer": "If replacing/muting audio or intentionally decoupling audio timing."
+        },
+        {
+          "question": "Add Audio — Replace vs Mix?",
+          "answer": "Replace swaps the track; Mix blends with original via amix—adjust gains to prevent clipping."
+        },
+        {
+          "question": "Shrink GIF size?",
+          "answer": "Lower FPS, reduce resolution, and use palettegen/paletteuse."
+        },
+        {
+          "question": "Extracted frames naming?",
+          "answer": "`frame_000001.png` numbering; PNG is lossless, JPG saves space."
+        },
+        {
+          "question": "Trim modes difference?",
+          "answer": "Fast copy snaps to nearest keyframes; Precise re‑encode cuts on exact timestamps."
+        },
+        {
+          "question": "Thumbnails don’t change after count update?",
+          "answer": "Change count then click Generate preview; size slider rescales current set."
+        },
+        {
+          "question": "Make meme text readable?",
+          "answer": "Use outer glow + slight shadow; increase letter spacing for ALL‑CAPS."
+        },
+        {
+          "question": "Arc text mirrors down?",
+          "answer": "Current curvature bends without mirroring; use modest arcs for readability."
+        },
+        {
+          "question": "Crop controls?",
+          "answer": "Presets 16:9 / 9:16 or Free; drag handles; Alt keeps center; Esc cancels; double‑click applies."
+        },
+        {
+          "question": "Multi‑Rename zero‑padding?",
+          "answer": "Enable number padding (e.g., 001–120) and run preview/dry‑run first."
+        },
+        {
+          "question": "Where are Tools outputs?",
+          "answer": "Standard output subfolders, e.g., output/trims, output/screenshots."
+        },
+        {
+          "question": "See exact commands?",
+          "answer": "Open the job’s run_*.log; FFmpeg/engine commands are printed."
+        },
+        {
+          "question": "Which audio format is safest?",
+          "answer": "AAC for widest compatibility; Opus is efficient but prefers MKV/WebM."
+        },
+        {
+          "question": "Presets sharing?",
+          "answer": "Local presets are supported; export/sharing is planned."
+        },
+        {
+          "question": "Upscaler vs Tools → Resize?",
+          "answer": "Upscaler uses AI models (NCNN/Vulkan) for fidelity gains; Resize uses FFmpeg scaling. Use Resize for quick downscale, Upscaler for quality improvement."
+        },
+        {
+          "question": "CRF or Bitrate?",
+          "answer": "Use CRF for consistent quality. Use bitrate only for strict size or bandwidth constraints."
+        },
+        {
+          "question": "Recommended CRF values?",
+          "answer": "H.264: 18–22; H.265: 20–24; AV1: 30–36. Lower CRF = higher quality and larger files."
+        },
+        {
+          "question": "What does keyint/GOP control?",
+          "answer": "Keyframe spacing. Larger values compress better but reduce seek/edit responsiveness."
+        },
+        {
+          "question": "How does Change Speed keep audio in sync?",
+          "answer": "Time‑stretching with `atempo` when Sound sync is enabled."
+        },
+        {
+          "question": "When should I disable Sound sync?",
+          "answer": "If you will replace/mute the audio or intentionally decouple audio timing."
+        },
+        {
+          "question": "Add Audio — Replace vs Mix?",
+          "answer": "Replace swaps the track; Mix blends with `amix`; adjust gains to prevent clipping."
+        },
+        {
+          "question": "How do I shrink GIF size without destroying quality?",
+          "answer": "Lower FPS, resize smaller, and always use palettegen/paletteuse."
+        },
+        {
+          "question": "How are extracted frames named?",
+          "answer": "`frame_000001.png` with zero‑padded numbering; PNG is lossless, JPG is lighter."
+        },
+        {
+          "question": "Trim: Fast copy vs Precise?",
+          "answer": "Fast copy snaps to keyframes and is instant; Precise re‑encodes for exact in/out."
+        },
+        {
+          "question": "Thumbnails didn’t update after I changed the count.",
+          "answer": "Change the count, then click Generate preview to rebuild; the size slider only rescales."
+        },
+        {
+          "question": "How do I make meme text readable on busy shots?",
+          "answer": "Combine outer glow with a subtle shadow and increase letter spacing for ALL‑CAPS."
+        },
+        {
+          "question": "Arc curvature mirrors text?",
+          "answer": "The current arc bends without mirroring; use modest curvature for readability."
+        },
+        {
+          "question": "Crop controls at a glance?",
+          "answer": "Presets 16:9 / 9:16 / Free; drag handles; Alt keeps center; Esc cancels; double‑click applies."
+        },
+        {
+          "question": "Multi‑Rename zero‑padding?",
+          "answer": "Enable number padding (e.g., 001–120) and dry‑run first on a small set."
+        },
+        {
+          "question": "Where are Tools outputs stored?",
+          "answer": "Under output/ by tool type (e.g., output/trims, output/screenshots)."
+        },
+        {
+          "question": "Can I see the exact FFmpeg command?",
+          "answer": "Open the job’s run log; commands are printed verbatim."
+        },
+        {
+          "question": "Safest audio format?",
+          "answer": "AAC for widest compatibility; Opus is more efficient but prefers MKV/WebM containers."
+        },
+        {
+          "question": "Can I export/share presets?",
+          "answer": "Local presets are supported today; export/sharing is planned."
+        },
+        {
+          "question": "What’s the difference between Convert Image/Compress vs Resize?",
+          "answer": "Convert/Compress targets still images and formats; Resize affects video dimensions."
+        }
+      ],
+      "controls": [
+        "Remember settings",
+        "Remember…",
+        "Change quality",
+        "Batch…",
+        "Keep metadata (EXIF)",
+        "Convert image",
+        "Choose folder…",
+        "Choose files…",
+        "Remove numbers from start",
+        "Add date",
+        "Preview",
+        "Rename",
+        "1.50x",
+        "Change Speed",
+        "Sound sync (adjust audio tempo)",
+        "Mute audio",
+        "Save preset",
+        "Load preset",
+        "1280",
+        "720",
+        "Resize",
+        "NOTE: this does not upscale, only resizes",
+        "12",
+        "Same as video",
+        "Export GIF",
+        "Mix with original audio (instead of replacing)",
+        "Add Audio to Video",
+        "Extract Last Frame",
+        "Extract All Frames",
+        "16",
+        "Crop",
+        "Choose what to batch"
+      ],
+      "_controls_meta": {
+        "last_appended": "2025-09-07",
+        "source": "auto-extracted from code (helpers/)",
+        "modules_used": [
+          "tools_tab.py"
+        ]
+      },
+      "features": [
+        "Quality/Size (Video), Change Speed (with atempo), Add Audio (replace/mix), Export GIF, Extract Frames, Resize (non-AI).",
+        "Trim (Fast copy vs Precise re-encode), Meme/Thumbnail (arc text, crop presets), Multi-Rename (preview/dry-run).",
+        "Quality/Size (Video)",
+        "CRF vs Bitrate",
+        "Encoder preset (x264/x265/AV1)",
+        "Keyint/GOP",
+        "Color range (Full/Limited)",
+        "Change Speed (with atempo)",
+        "Add Audio (Replace/Mix)",
+        "Export GIF (palettegen/paletteuse)",
+        "Extract Frames (last/all)",
+        "Resize (Video)",
+        "Trim (Fast copy / Precise)",
+        "Meme/Thumbnail (arc curvature)",
+        "Remember settings",
+        "Remember…",
+        "Change quality",
+        "Batch…",
+        "Keep metadata (EXIF)",
+        "Convert image",
+        "Choose folder…",
+        "Choose files…",
+        "Remove numbers from start",
+        "Add date",
+        "Preview",
+        "Rename",
+        "Key term: Quality/Size (Video)",
+        "Key term: CRF vs Bitrate",
+        "Key term: Encoder preset (x264/x265/AV1)",
+        "Key term: Keyint/GOP",
+        "Key term: Color range (Full/Limited)",
+        "Key term: Change Speed (with atempo)",
+        "Key term: Add Audio (Replace/Mix)",
+        "Key term: Export GIF (palettegen/paletteuse)",
+        "Key term: Extract Frames (last/all)",
+        "Key term: Resize (Video)",
+        "Key term: Trim (Fast copy / Precise)",
+        "Key term: Meme/Thumbnail (arc curvature)",
+        "Key term: Multi‑Rename (preview/dry‑run)",
+        "Key term: Presets & Remember settings",
+        "Control: Remember settings — checkbox. Default: off (toggle to enable). Does: Toggle feature on/off.",
+        "Control: Remember… — button. Default: n/a (runs on click). Does: Perform the labeled action immediately.",
+        "Control: Change quality — button. Default: n/a (runs on click). Does: Control quality vs size; lower CRF = higher quality.",
+        "Control: Batch… — button. Default: n/a (runs on click). Does: Perform the labeled action immediately.",
+        "Control: Keep metadata (EXIF) — checkbox. Default: off (toggle to enable). Does: Toggle feature on/off.",
+        "Control: Convert image — button. Default: n/a (runs on click). Does: Perform the labeled action immediately.",
+        "Control: Choose folder… — button. Default: n/a (runs on click). Does: Perform the labeled action immediately.",
+        "Control: Choose files… — button. Default: n/a (runs on click). Does: Perform the labeled action immediately.",
+        "Control: Remove numbers from start — checkbox. Default: off (toggle to enable). Does: Toggle feature on/off.",
+        "Control: Add date — checkbox. Default: off (toggle to enable). Does: Toggle feature on/off.",
+        "Control: Preview — button. Default: n/a (runs on click). Does: Perform the labeled action immediately.",
+        "Control: Rename — button. Default: n/a (runs on click). Does: Perform the labeled action immediately.",
+        "Control: 1.50x — label. Default: unset/neutral. Does: UI control.",
+        "Control: Change Speed — button. Default: n/a (runs on click). Does: Change playback speed; pair with audio atempo for sync.",
+        "Control: Sound sync (adjust audio tempo) — checkbox. Default: off (toggle to enable). Does: Toggle feature on/off.",
+        "Control: Mute audio — checkbox. Default: off (toggle to enable). Does: Toggle feature on/off.",
+        "Control: Save preset — button. Default: n/a (runs on click). Does: Perform the labeled action immediately.",
+        "Control: Load preset — button. Default: n/a (runs on click). Does: Perform the labeled action immediately.",
+        "Control: 1280 — label. Default: unset/neutral. Does: UI control.",
+        "Control: 720 — label. Default: unset/neutral. Does: UI control.",
+        "Control: Resize — button. Default: n/a (runs on click). Does: Rescale video with FFmpeg (non‑AI).",
+        "Control: NOTE: this does not upscale, only resizes — label. Default: unset/neutral. Does: Rescale video with FFmpeg (non‑AI).",
+        "Control: 12 — label. Default: unset/neutral. Does: UI control.",
+        "Control: Same as video — checkbox. Default: off (toggle to enable). Does: Toggle feature on/off.",
+        "Control: Export GIF — button. Default: n/a (runs on click). Does: Export a clip as GIF using palettegen/paletteuse for quality.",
+        "Control: Mix with original audio (instead of replacing) — checkbox. Default: off (toggle to enable). Does: Replace or blend external audio with the current video.",
+        "Control: Add Audio to Video — button. Default: n/a (runs on click). Does: Replace or blend external audio with the current video.",
+        "Control: Extract Last Frame — button. Default: n/a (runs on click). Does: Save frames to disk (last frame or all frames).",
+        "Control: Extract All Frames — button. Default: n/a (runs on click). Does: Save frames to disk (last frame or all frames).",
+        "Control: 16 — label. Default: unset/neutral. Does: UI control.",
+        "Control: Crop — button. Default: n/a (runs on click). Does: Perform the labeled action immediately.",
+        "Control: Choose what to batch — text label. Default: unset/neutral. Does: UI control."
+      ],
+      "install": [
+        "Tools rely on FFmpeg; installer Option 1/3/4 ensures the correct binary is bundled.",
+        "General install flow: use **Install/Updates → Option 1** to auto-detect environment, then **Option 2** for repair, or **Option 3/4** for full stacks.",
+        "See **InstallUpdates → Install** for full environment setup and model downloads."
+      ],
+      "troubleshoot": [
+        "For FFmpeg-related errors, run Option 1 to verify tools and Option 3/4 to reinstall binaries.",
+        "Run **install_menu.bat** and choose **Option 1 — System check & advisor** (creates venv if missing, checks Python/FFmpeg/GPU/VRAM, prints a full info page and recommends Option 3 or 4).",
+        "If only the app is broken, run **Option 2 — Core install** (quick repair, minimal download).",
+        "If problems persist, pick a full stack: **Option 3 — Full CPU (< 6 GiB VRAM, ~3.5 GB download)** or **Option 4 — Full GPU (≥ 6 GiB VRAM, ~5 GB download)**.",
+        "Still failing? **Delete the `.venv` folder** and re-run Option 3 or 4. You **do not** need to delete helper binaries or models; it’s recommended to clear **cache** and **preset** files.",
+        "If a model/tool is missing or corrupted, run the models-only downloader:\n  - **Windows:** `python \"scripts\\download_externals.py\"`\n  - **macOS/Linux:** `python scripts/download_externals.py`",
+        "Planned: `update.bat` will auto-check and update to the latest stable build.",
+        "For environment issues, follow **InstallUpdates → Troubleshoot** steps.",
+        "Check the job **run_*.log** in the logs folder for this feature’s errors (if applicable)."
+      ],
+      "overview": "A comprehensive toolkit for fast, single‑purpose edits that pairs well with the Upscaler. Includes Quality/Size (Video), Change Speed (with sound sync), Add Audio (replace/mix), Export GIF (palettegen/paletteuse), Extract Frames, Resize (non‑AI), Trim (fast copy vs precise), Meme/Thumbnail creator with arc text & crop presets, and Multi‑Rename. Presets and per‑tool ‘Remember settings’ are available. Outputs go to standard output folders.\n\n---\n**KB Addendum 2025-09-07 — Tools Deep‑Dive**\nThis addendum expands the Tools section with concrete recipes, richer option explanations, and troubleshooting notes.\n- **Quality/Size (Video):** CRF vs Bitrate, encoder presets, keyint/GOP, color range (Full/Limited), audio (copy/encode).\n- **Change Speed:** time‑stretch via atempo with chained factors (>2×), sync/mute options, desync caveats.\n- **Add Audio:** Replace vs Mix (amix), input gain staging, peak management.\n- **Export GIF:** palettegen/paletteuse pipeline, FPS/resize strategies for filesize control.\n- **Extract Frames:** last/all, naming, PNG vs JPG trade‑offs.\n- **Resize (Video):** non‑AI scaling; when to prefer Upscaler instead.\n- **Trim:** fast copy (keyframe‑aligned) vs precise re‑encode (accurate in/out).\n- **Meme/Thumbnail:** arc curvature, outline/shadow/glow, crop presets (16:9/9:16/Free), keyboard nudges.\n- **Multi‑Rename:** preview/dry‑run, base name + numbering, date stamps, remove N chars, zero‑padding.\n\n\n**Controls (auto-discovered):** The list under 'controls' enumerates buttons, toggles, actions, and list items detected from the UI code. This complements the human-written overview and Q&A. Use it to audit coverage: every label should appear in the KB.",
+      "_layout": "overview/features/install/troubleshoot",
+      "_features_meta": {
+        "oneliners_last_updated": "2025-09-07",
+        "oneliners_source": "helpers/ code scan",
+        "oneliners_count_added": 32
+      }
+    },
+    "Ask_framie": {
+      "description": "**Ask (Framie)** is an **offline** mini‑chatbot built into FrameVision. It can answer basic questions, guide you through workflows, and—when you attach an image—**describe what it sees** and point out details.\n\n**What it can “see”:**\n• The **current preview frame** from the player (optional attach).\n• A **screenshot** region (Windows global snip, or in‑app region picker fallback).\n\n**What it can’t do:**\n• No online knowledge or browsing—responses are generated from **local models + local app info** only.\n",
+      "overview": "Open **Ask** to chat with **Framie**, FrameVision’s offline assistant. Use it like a lightweight help desk: ask how to do something in the app, request step‑by‑step troubleshooting, or attach the current frame / a screenshot and ask “what is this?” or “why does this look wrong?”\n\n**Core idea:** text chat + optional image attachment (frame/screenshot) for grounded answers.\n",
+      "key_terms": [
+        "Ask",
+        "Framie",
+        "offline chatbot",
+        "AskPopup",
+        "Attach current frame",
+        "Auto ‘this frame’ image",
+        "Screenshot",
+        "Stream",
+        "Enter sends message",
+        "Greeting",
+        "Mode",
+        "Coach",
+        "Power User",
+        "ELI5",
+        "Bug hunt",
+        "Backend",
+        "Transformers (VL)",
+        "llama.cpp (GGUF)",
+        "Device auto/cpu/cuda",
+        "Preset Tiny (Q4)",
+        "Preset Balanced (Q5)",
+        "Preset Quality (Q8)",
+        "GGUF path",
+        "Tools menu",
+        "Analyze Clip… (ffprobe)",
+        "Dry-run Export… (ffmpeg null)",
+        "Apply last ffmpeg…",
+        "Select llama binary…",
+        "Pinned",
+        "prefs.json",
+        "pins.json",
+        "/joke",
+        "/info",
+        "/reloadlocal"
+      ],
+      "features": [
+        "Offline assistant embedded in the app UI (no internet required).",
+        "Optional image grounding: **Attach current frame** or take a **Screenshot** and ask questions about it.",
+        "Modes to shape the answer style: **Coach**, **Power User**, **ELI5**, **Bug hunt**.",
+        "Greeting tone selector: **Professional / Casual / Playful**.",
+        "Two backends: **Transformers (VL)** for vision‑language, or **llama.cpp (GGUF)** for local GGUF models.",
+        "Quality/latency controls: **Stream** tokens, **Temp** (creativity), and **Max** tokens.",
+        "Convenience: **Pinned** replies for re‑use, and “Apply last ffmpeg…” to copy an ffmpeg command from the last answer."
+      ],
+      "hints_tips": [
+        "If you want Framie to comment on what you’re looking at, enable **Attach current frame** (or keep **Auto ‘this frame’** enabled) and ask about “this frame”.",
+        "Use **Screenshot** when the thing you want to ask about isn’t in the video player (e.g., an error dialog).",
+        "If you often reuse the same troubleshooting checklist or ffmpeg command, click **📌 Pin last** so you can insert it later via **📂 Pinned**.",
+        "For faster chatting, enable **Enter sends message** (Shift+Enter makes a newline).",
+        "If the answer is too long or slow, lower **Max** and/or reduce **Temp**."
+      ],
+      "qa_pairs": [
+        {
+          "question": "What is Ask / Framie?",
+          "answer": "Ask is FrameVision’s built‑in offline assistant (Framie). It can answer questions about the app and, when you attach an image, describe what it sees and help you troubleshoot visually."
+        },
+        {
+          "question": "Is Framie online? Does it browse the internet?",
+          "answer": "No. Ask runs from local models and local app files. It does not browse the web or pull online knowledge."
+        },
+        {
+          "question": "How do I attach the current frame?",
+          "answer": "Enable **Attach current frame** to include the current preview frame with your next message. Framie can then ground its answer in what’s visible."
+        },
+        {
+          "question": "What does “Auto ‘this frame’ image (≤1024px)” do?",
+          "answer": "When enabled, Framie will automatically attach a downscaled snapshot of the current frame if your message includes phrases like “this frame / current frame / this image”."
+        },
+        {
+          "question": "How does Screenshot work?",
+          "answer": "Click **Screenshot**, choose a delay, then select a region. On Windows it uses the native snipping UI when available; otherwise it falls back to an in‑app region picker. The captured image is queued for your next question."
+        },
+        {
+          "question": "What are the modes (Coach / Power User / ELI5 / Bug hunt)?",
+          "answer": "Modes change how Framie responds: Coach = step‑by‑step and encouraging; Power User = terse and command‑like; ELI5 = simple words; Bug hunt = ask for logs and narrow down causes."
+        },
+        {
+          "question": "What’s the difference between Transformers (VL) and llama.cpp (GGUF)?",
+          "answer": "Transformers (VL) is the default vision‑language backend that supports answering with an attached image. llama.cpp (GGUF) runs a local GGUF text model via a llama.cpp binary (great for text help, not image vision)."
+        },
+        {
+          "question": "What does Device (auto/cpu/cuda) control?",
+          "answer": "It chooses where the model runs: auto picks CUDA if available, otherwise CPU; cpu forces CPU; cuda forces GPU (if available)."
+        },
+        {
+          "question": "What do Tiny (Q4) / Balanced (Q5) / Quality (Q8) presets do?",
+          "answer": "They’re llama.cpp quality presets that trade speed/VRAM for quality when using GGUF models."
+        },
+        {
+          "question": "What does Stream do?",
+          "answer": "Streams tokens as they generate so the response starts appearing sooner (lower perceived latency)."
+        },
+        {
+          "question": "What are “Analyze Clip…” and “Dry-run Export…” in Tools?",
+          "answer": "Analyze Clip runs **ffprobe** and prints a JSON report. Dry‑run Export runs a 1‑second **ffmpeg** null export to surface codec/decoder errors quickly."
+        },
+        {
+          "question": "How do Pins work?",
+          "answer": "Use **📌 Pin last** to store the last assistant reply. Use **📂 Pinned** to insert a pinned snippet back into the input box."
+        },
+        {
+          "question": "Are there any built-in chat commands?",
+          "answer": "Yes: **/joke** (a local dad joke), **/info** (local app info/help text), and **/reloadlocal** (reload the local joke/help files)."
+        }
+      ],
+      "controls": [
+        "Greeting (Professional / Casual / Playful)",
+        "Mode (Coach / Power User / ELI5 / Bug hunt)",
+        "Auto ‘this frame’ image (≤1024px)",
+        "📌 Pin last",
+        "📂 Pinned",
+        "Temp",
+        "Max",
+        "Backend (Transformers (VL) / llama.cpp (GGUF))",
+        "Device (auto / cpu / cuda)",
+        "Preset (Tiny (Q4) / Balanced (Q5) / Quality (Q8))",
+        "GGUF path",
+        "System prompt (editable)",
+        "Attach current frame",
+        "Stream",
+        "Enter sends message",
+        "Screenshot",
+        "Reset",
+        "Close",
+        "Send",
+        "Tools → Analyze Clip…",
+        "Tools → Dry-run Export…",
+        "Tools → Apply last ffmpeg…",
+        "Tools → Select llama binary…"
+      ],
+      "install": [
+        "Ask is designed to run **offline**. The default vision backend loads from a local model folder: `models/describe/default/qwen3vl2b`.",
+        "For **llama.cpp (GGUF)**: set a GGUF model path and select a llama.cpp binary (Tools → Select llama binary…) or ensure `llama`/`llama-cli` is on PATH.",
+        "Screenshot tools prefer app‑local FFmpeg/ffprobe binaries when available."
+      ],
+      "troubleshoot": [
+        "If **Attach current frame** says no frame is available: make sure a video/image is loaded and visible in the player; try pausing on a frame.",
+        "If **Auto ‘this frame’** doesn’t attach: include phrases like “this frame” or enable **Attach current frame** manually.",
+        "If Screenshot returns black/empty: try the native snip again, or use the in‑app region picker; Framie skips obviously black captures.",
+        "If llama.cpp says binary not found: set it via Tools → Select llama binary… or add it to PATH.",
+        "If answers are too long/slow: reduce **Max** tokens; disable **Stream** if you prefer a single final answer."
+      ],
+      "_layout": "overview/features/install/troubleshoot"
+    },
+    "TrimTool": {
+      "key_terms": [
+        "Trim tool",
+        "thumbnail preview grid",
+        "6–60 thumbs",
+        "size slider 24–140px",
+        "adaptive grid wrap",
+        "draggable range bar",
+        "dim thumbnails outside range",
+        "left-click Start",
+        "right-click End",
+        "manual Generate preview",
+        "no auto-regenerate",
+        "time format HH:MM:SS.mmm (flexible)",
+        "Start/End sliders + fields",
+        "Fast copy (keyframe) mode",
+        "Precise re-encode mode",
+        "batch-ready",
+        "queue integration",
+        "FFmpeg/FFprobe",
+        "preview cache: output/_temp/trim_preview"
+      ],
+      "description": "Visually select a time range to keep. Generate a thumbnail grid (6–60) with a size slider (24–140px). Click a thumb to set Start (left) or End (right). Drag the range bar to adjust; items outside the range dim to show what will be cut. Uses manual generation (no auto-regenerate) for responsiveness. Supports Fast copy (keyframe) and Precise re-encode. Works on single files or batches with full Queue integration.\n\n**Controls (auto-discovered):** Items reflect trim preview generation, count/size sliders, and mode selectors (Fast copy vs Precise re-encode).",
+      "hints_tips": [
+        "Use Generate preview after setting the desired 'thumbs' count; the grid will not auto-regenerate while you change the value.",
+        "Shrink or enlarge thumbnails with the Size slider; existing thumbs rescale instantly without re-extracting frames.",
+        "Left-click any thumbnail to set Start; right-click to set End. You can also drag the range bar handles.",
+        "Type timecodes directly (HH:MM:SS.mmm). If you enter just seconds, the tool interprets them correctly.",
+        "Fast copy (keyframe) is instant but may shift slightly to the nearest keyframe; pick Precise re-encode for exact cuts.",
+        "Batch mode processes entire folders; use the Queue to watch progress, ETA, and logs.",
+        "Preview images are written to output/_temp/trim_preview and can be safely deleted after use."
+      ],
+      "qa_pairs": [
+        {
+          "question": "How do I visually choose a trim range?",
+          "answer": "Click Generate preview to build a thumbnail grid. Left-click a thumbnail to set Start, right-click to set End, or drag the range bar handles. The thumbnails outside the kept range dim automatically."
+        },
+        {
+          "question": "What is the difference between Fast copy and Precise re-encode?",
+          "answer": "Fast copy (keyframe) copies the selected segment without re-encoding—it's very fast but cuts align to keyframes. Precise re-encode re-encodes the boundaries so you get exact Start/End at the cost of more processing."
+        },
+        {
+          "question": "Can I use the trim tool in batch?",
+          "answer": "Yes. Apply the same Start/End and mode to multiple files. All jobs go to the Queue with progress and logs."
+        },
+        {
+          "question": "Does the grid regenerate while I change the number of thumbnails?",
+          "answer": "No. You can adjust the count freely; the grid rebuilds only when you press Generate preview."
+        },
+        {
+          "question": "What timecode formats are accepted?",
+          "answer": "Flexible HH:MM:SS.mmm; you can also type numbers like 65.5 (seconds) and it will be parsed correctly."
+        },
+        {
+          "question": "Where are preview thumbnails stored?",
+          "answer": "In output/_temp/trim_preview inside the app folder. They can be removed at any time."
+        },
+        {
+          "question": "How does the range bar relate to the Start/End fields?",
+          "answer": "They are synchronized. Dragging the bar updates Start/End fields and sliders, and vice versa."
+        },
+        {
+          "question": "What if the End field is blank?",
+          "answer": "The tool interprets it as 'to the end of the clip' when running a trim."
+        }
+      ],
+      "controls": [
+        "Trim",
+        "Batch…",
+        "Generate preview",
+        "Size",
+        "Trim range",
+        "Start",
+        "End"
+      ],
+      "_controls_meta": {
+        "last_appended": "2025-09-07",
+        "source": "auto-extracted from code (helpers/)",
+        "modules_used": [
+          "trim_tool.py"
+        ]
+      },
+      "features": [
+        "Thumbnail grid with manual regenerate; size slider; range bar.",
+        "Fast copy (keyframe-aligned) vs Precise re-encode (exact cuts); output to `output/trims/`.",
+        "Trim tool",
+        "thumbnail preview grid",
+        "6–60 thumbs",
+        "size slider 24–140px",
+        "adaptive grid wrap",
+        "draggable range bar",
+        "dim thumbnails outside range",
+        "left-click Start",
+        "right-click End",
+        "manual Generate preview",
+        "no auto-regenerate",
+        "time format HH:MM:SS.mmm (flexible)",
+        "Trim",
+        "Batch…",
+        "Generate preview",
+        "Size",
+        "Trim range",
+        "Start",
+        "End",
+        "Key term: Trim tool",
+        "Key term: thumbnail preview grid",
+        "Key term: 6–60 thumbs",
+        "Key term: size slider 24–140px",
+        "Key term: adaptive grid wrap",
+        "Key term: draggable range bar",
+        "Key term: dim thumbnails outside range",
+        "Key term: left-click Start",
+        "Key term: right-click End",
+        "Key term: manual Generate preview",
+        "Key term: no auto-regenerate",
+        "Key term: time format HH:MM:SS.mmm (flexible)",
+        "Key term: Start/End sliders + fields",
+        "Key term: Fast copy (keyframe) mode",
+        "Key term: Precise re-encode mode",
+        "Key term: batch-ready",
+        "Key term: queue integration",
+        "Key term: FFmpeg/FFprobe",
+        "Key term: preview cache: output/_temp/trim_preview",
+        "Control: Trim — button. Default: n/a (runs on click). Does: Cut a segment; choose fast copy (keyframe) or precise re‑encode.",
+        "Control: Batch… — button. Default: n/a (runs on click). Does: Perform the labeled action immediately.",
+        "Control: Generate preview — button. Default: n/a (runs on click). Does: Perform the labeled action immediately.",
+        "Control: Size — label. Default: unset/neutral. Does: UI control.",
+        "Control: Trim range — label. Default: unset/neutral. Does: Cut a segment; choose fast copy (keyframe) or precise re‑encode.",
+        "Control: Start — label. Default: unset/neutral. Does: UI control.",
+        "Control: End — label. Default: unset/neutral. Does: UI control."
+      ],
+      "install": [
+        "General install flow: use **Install/Updates → Option 1** to auto-detect environment, then **Option 2** for repair, or **Option 3/4** for full stacks.",
+        "See **InstallUpdates → Install** for full environment setup and model downloads."
+      ],
+      "troubleshoot": [
+        "Run **install_menu.bat** and choose **Option 1 — System check & advisor** (creates venv if missing, checks Python/FFmpeg/GPU/VRAM, prints a full info page and recommends Option 3 or 4).",
+        "If only the app is broken, run **Option 2 — Core install** (quick repair, minimal download).",
+        "If problems persist, pick a full stack: **Option 3 — Full CPU (< 6 GiB VRAM, ~3.5 GB download)** or **Option 4 — Full GPU (≥ 6 GiB VRAM, ~5 GB download)**.",
+        "Still failing? **Delete the `.venv` folder** and re-run Option 3 or 4. You **do not** need to delete helper binaries or models; it’s recommended to clear **cache** and **preset** files.",
+        "If a model/tool is missing or corrupted, run the models-only downloader:\n  - **Windows:** `python \"scripts\\download_externals.py\"`\n  - **macOS/Linux:** `python scripts/download_externals.py`",
+        "Planned: `update.bat` will auto-check and update to the latest stable build.",
+        "For environment issues, follow **InstallUpdates → Troubleshoot** steps.",
+        "Check the job **run_*.log** in the logs folder for this feature’s errors (if applicable)."
+      ],
+      "overview": "Visually select a time range to keep. Generate a thumbnail grid (6–60) with a size slider (24–140px). Click a thumb to set Start (left) or End (right). Drag the range bar to adjust; items outside the range dim to show what will be cut. Uses manual generation (no auto-regenerate) for responsiveness. Supports Fast copy (keyframe) and Precise re-encode. Works on single files or batches with full Queue integration.\n\n**Controls (auto-discovered):** Items reflect trim preview generation, count/size sliders, and mode selectors (Fast copy vs Precise re-encode).",
+      "_layout": "overview/features/install/troubleshoot",
+      "_features_meta": {
+        "oneliners_last_updated": "2025-09-07",
+        "oneliners_source": "helpers/ code scan",
+        "oneliners_count_added": 7
+      }
+    },
+    "Troubleshooting": {
+      "description": "Quick recovery guide when something stops working. Steps escalate only as needed and avoid redownloading models unless necessary.",
+      "key_terms": [
+        "Core install",
+        "Full CPU/GPU",
+        "Open log folder",
+        "Repair flow",
+        "cache cleanup",
+        "models‑only downloader",
+        "presets cleanup",
+        "venv reset"
+      ],
+      "hints_tips": [
+        "Try with a small known‑good media file to isolate project issues.",
+        "Check logs via **Settings → Open log folder** and attach key errors when requesting help.",
+        "VRAM errors: reduce tile size/enable Auto tile; close GPU‑heavy apps."
+      ],
+      "qa_pairs": [
+        {
+          "question": "Something broke—what’s the quickest path?",
+          "answer": "1) Run Install→Option 1 (advisor). 2) If only the app/UI is broken, Option 2 (Core). 3) If needed, Option 3 (Full CPU ~3.5 GB) or 4 (Full GPU ~5 GB). 4) Still failing? Delete venv and reinstall; keep models/helpers; clear cache/presets if suspect."
+        },
+        {
+          "question": "A model is missing or stopped working—fastest fix?",
+          "answer": "Run models‑only downloader from the root: Windows: `python \"scripts\\download_externals.py\"` • macOS/Linux: `python scripts/download_externals.py`."
+        },
+        {
+          "question": "Playback is fine but Queue jobs don’t start.",
+          "answer": "Check the worker heartbeat (logs/worker_heartbeat.txt). Restart the app/worker if stale."
+        }
+      ]
+    },
+    "TxtToImgZImageTurbo": {
+      "description": "Fast local text‑to‑image engine (Z‑Image Turbo). Runs in a dedicated `.zimage_env` so it doesn’t conflict with other backends. Optimized for low step counts (default 9) and low guidance (default CFG 0.0), with optional Attention slicing and LoRA support.",
+      "key_terms": [
+        "TXT→IMG",
+        "Text to Image",
+        "Z‑Image Turbo",
+        ".zimage_env",
+        "separate process",
+        "low steps",
+        "CFG / guidance",
+        "negative prompt",
+        "batch generation",
+        "LoRA (2 slots)",
+        "Attention slicing",
+        "2K–4K size presets",
+        "queue",
+        "player preview",
+        "filename template",
+        "logs/zimage_*.log"
+      ],
+      "overview": "Z‑Image Turbo is FrameVision’s **fast** TXT→IMG engine. It’s aimed at quick iteration: you typically get good results at **very low Steps** and **low CFG/guidance**.\n\n### How it works (under the hood)\n- FrameVision launches Z‑Image as a **separate Python process** from a dedicated environment named **`.zimage_env`**.\n- The app calls `helpers/zimage_cli.py` and reads the CLI output to show progress; a **log file** is also written under the `logs/` folder.\n- When you switch the Engine to Z‑Image, FrameVision tries to **free CUDA VRAM** used by other backends first (helps avoid out‑of‑memory issues).\n\n### What’s different vs SD models (SD15/SDXL)\n- There is **no Model picker** (Z‑Image manages its own model internally).\n- You still get **Prompt + Negative**, **Seed/Batch**, and **Output size**, plus **LoRA slots**.\n- Z‑Image’s “sweet spot” is usually **Steps ~6–12** and **CFG 0–2** (FrameVision defaults to 9 steps and CFG 0.0).\n\n### Best use cases\n- Rapid ideation / “give me 20 variations quickly”\n- Big images (you’ll see extra **2K–4K** size presets when Z‑Image is active)\n- Style nudging with **LoRAs** (2 slots)\n\n**Tip:** If you want full control over different checkpoints, samplers, and SD‑style presets, switch back to **SD models (SD15/SDXL)**.",
+      "features": [
+        "Fast TXT→IMG generation (low steps).",
+        "Dedicated backend env (`.zimage_env`) launched as a separate process.",
+        "Queue integration + optional auto‑preview in the Player.",
+        "Prompt + Negative prompt, Seed policies, Batch generation.",
+        "LoRA support (2 slots) with per‑LoRA strength.",
+        "Optional Attention slicing for low‑VRAM GPUs.",
+        "Extra high‑resolution presets (2K–4K) appear when Z‑Image is selected.",
+        "Flexible output formats (PNG/JPG/WEBP) + filename templates.",
+        "Writes a `logs/zimage_*.log` file for debugging."
+      ],
+      "hints_tips": [
+        "Start with the defaults (Steps 9, CFG 0.0) and only change one knob at a time.",
+        "If the result ignores your prompt: raise CFG a bit (try 0.5 → 1.5 → 2.5).",
+        "If the image looks over‑cooked or “too forced”: lower CFG back toward 0–1.",
+        "If you hit VRAM errors: enable Attention slicing, lower resolution, and/or reduce Batch.",
+        "LoRAs are `.safetensors` files. Keep strengths modest first (0.6–1.0) before pushing higher.",
+        "For batches, prefer a filename template that includes `{idx}` so images don’t overwrite each other."
+      ],
+      "qa_pairs": [
+        {
+          "question": "Where do I pick the Z‑Image model/checkpoint?",
+          "answer": "You don’t—Z‑Image Turbo uses its own internal model. That’s why the ‘Model’ dropdown disappears when Z‑Image is selected; you can still influence style using LoRAs."
+        },
+        {
+          "question": "Why does Z‑Image default to only 9 steps?",
+          "answer": "Z‑Image Turbo is tuned for low step counts. In FrameVision, switching to Z‑Image forces Steps to 9 to match that intended workflow."
+        },
+        {
+          "question": "Why is CFG (guidance) set to 0.0 by default?",
+          "answer": "For this engine, very low guidance can look more natural and stable. If you need stronger prompt adherence, increase CFG gradually (0.5–2.5 is a common range; max is 5.0 in the UI for Z‑Image)."
+        },
+        {
+          "question": "Does Negative prompt work with Z‑Image?",
+          "answer": "Yes. FrameVision forwards the Negative prompt to the Z‑Image CLI the same way it does for other engines."
+        },
+        {
+          "question": "What does ‘Attention slicing’ do?",
+          "answer": "It reduces VRAM usage by splitting attention into smaller chunks. It’s slower, but it can be the difference between ‘works’ and ‘out of memory’ on smaller GPUs."
+        },
+        {
+          "question": "Can I use LoRAs with Z‑Image?",
+          "answer": "Yes—FrameVision passes LoRA slot 1 and 2 (plus strengths) through to the Z‑Image CLI. Use ‘Choose LoRA path…’ to point to your `.safetensors` folder."
+        },
+        {
+          "question": "Why did my presets disappear when I switch to Z‑Image?",
+          "answer": "Presets are currently tied to the SD (Diffusers) engine and are hidden for Z‑Image to keep the UI focused. Switch back to SD models to use presets again."
+        },
+        {
+          "question": "Where are the results saved?",
+          "answer": "To the Output folder shown in the tab. You can also click ‘View results’ to open the folder in Media Explorer and see the new images."
+        },
+        {
+          "question": "How do I debug a failed Z‑Image run?",
+          "answer": "Check the newest `logs/zimage_*.log` file for the exact command and error output. If `.zimage_env` is missing, reinstall/repair so the env gets created."
+        },
+        {
+          "question": "Why is FrameVision using a separate `.zimage_env`?",
+          "answer": "It isolates dependencies (Torch/Diffusers/etc.) so Z‑Image doesn’t break other AI features and vice‑versa, and it lets FrameVision launch Z‑Image as a clean process."
+        }
+      ],
+      "controls": [
+        "Engine: → select ‘Z‑Image Turbo’",
+        "Prompt / Negative",
+        "Seed + Seed policy (Fixed/Random/Increment)",
+        "Batch",
+        "Output size (plus extra 2K–4K presets when Z‑Image is active)",
+        "Steps (1–50; defaults to 9 for Z‑Image)",
+        "CFG (0.0–5.0; defaults to 0.0 for Z‑Image)",
+        "LoRA (Z‑Image) + LoRA 2 (Z‑Image) + strengths",
+        "Attention slicing",
+        "File format (png/jpg/webp)",
+        "Filename template (supports {seed} and {idx})",
+        "Show in Player",
+        "Use queue (Add/Run)",
+        "Generate / Add & Run / View results"
+      ],
+      "install": [
+        "Z‑Image runs from a dedicated env: the app expects a Python interpreter at `.zimage_env/Scripts/python.exe` (Windows) or `.zimage_env/bin/python` (Linux).",
+        "If Z‑Image fails to launch, run **install_menu.bat → Option 1 (System check & advisor)**, then follow the recommended install/repair option so `.zimage_env` is created.",
+        "No manual model download is required for the UI—Z‑Image manages its own model internally."
+      ],
+      "troubleshoot": [
+        "If you see ‘python.exe not found in .zimage_env’: the Z‑Image environment is missing or incomplete. Re‑run the installer repair/full install that includes Z‑Image.",
+        "If generation starts then fails: open the newest `logs/zimage_*.log` to see the full CLI output.",
+        "Out of VRAM: enable Attention slicing, reduce resolution, reduce Batch, and close other GPU-heavy apps (including other AI tabs).",
+        "LoRA not applying: verify the file exists, ends in `.safetensors`, and try a smaller strength first (0.6–1.0)."
+      ],
+      "_layout": "overview/features/install/troubleshoot"
+    },
+    "Updater": {
+      "key_terms": [
+        "Updater",
+        "Info → Updates…",
+        "Stable release",
+        "Beta (default branch)",
+        "Create backup ZIP…",
+        "Manual check",
+        "Replace python files only",
+        "Update all files",
+        "helpers/",
+        "presets/viz/",
+        "temp/downloads",
+        "restart required"
+      ],
+      "description": "FrameVision includes a built‑in **GitHub updater** under **Info → Updates…**.\n\nIt’s intentionally **manual-first**: you choose what to update (stable release vs beta branch), and you can create a safety backup before overwriting anything.\n\n**What you can do in the Updates dialog:**\n• **Create backup ZIP…** — saves a zip of the important app files so you can roll back.\n• **Stable (Release):** update from the latest GitHub Release.\n• **Beta (Default branch):** update from the newest code on the repo’s default branch.\n• **Manual check:** downloads the newest repo ZIP, compares it against your local files, and lets you selectively copy only the changed files.",
+      "hints_tips": [
+        "For the **most recent updates**, use **Manual check** — it pulls the latest default-branch ZIP and shows a selectable list of changed files.",
+        "Before updating, click **Create backup ZIP…** (fast, no compression) so you can restore if something breaks.",
+        "Choose **Python files only** when you mainly want new logic/UI fixes (updates only **helpers/** and **presets/viz/**).",
+        "Choose **All files** only when you expect broader changes; it can overwrite more of your local app folder.",
+        "After any update, **restart FrameVision** so the new Python files are reloaded.",
+        "Manual check compares by **file size** (plus “new file” detection). If a file changed but stayed the same size, it may not show up—use the Beta updater in that case."
+      ],
+      "qa_pairs": [
+        {
+          "question": "Where do I find the updater?",
+          "answer": "Open **Info → Updates…**. This opens the GitHub update dialog with Stable/Beta update buttons, a Backup button, and Manual check."
+        },
+        {
+          "question": "What’s the difference between Stable and Beta?",
+          "answer": "**Stable** pulls the latest GitHub **Release** zip (meant to be tested/stable). **Beta** pulls the repo’s **default branch HEAD** (newest changes, can be experimental)."
+        },
+        {
+          "question": "Why is Manual check recommended for the newest changes?",
+          "answer": "Manual check downloads the latest default-branch ZIP, extracts it into `temp/downloads/`, then compares it to your local app and lets you **copy only the files you want**."
+        },
+        {
+          "question": "What does “Create backup ZIP…” include?",
+          "answer": "It zips the core app files while skipping heavy folders like `tools/`, `models/`, `output/`, and `.venv/` (and also skips preset `bin/` and existing archive formats). The ZIP is written with **no compression** so it’s quick."
+        },
+        {
+          "question": "Where are downloaded update ZIPs stored?",
+          "answer": "Stable/Beta update downloads are saved into a temporary OS folder (created with `tempfile.mkdtemp(...)`). Manual check uses your app folder: `temp/downloads/` (it cleans this up when the dialog closes)."
+        },
+        {
+          "question": "Does updating overwrite my changes?",
+          "answer": "Yes. Updating can overwrite local edits (especially inside **helpers/** and **presets/viz/**). Always create a backup ZIP first if you’ve customized anything."
+        }
+      ],
+      "features": [
+        "GitHub updater in **Info → Updates…** (Stable release + Beta default-branch).",
+        "**Create backup ZIP…** (fast, no compression) to preserve important files before overwriting.",
+        "Two update modes: **Python files only** (helpers + presets/viz) or **All files** (entire app).",
+        "**Manual check**: downloads a repo ZIP → extracts to `temp/downloads/` → compares and lets you copy selected changed files.",
+        "Skips update of certain local-only files (e.g., `presets.json` and `presets/info/update_state.json`) to protect local state."
+      ],
+      "install": [
+        "Requires an internet connection to reach GitHub (API + ZIP download).",
+        "If you’re offline or on a restricted network, you can still update manually by downloading releases from GitHub in a browser."
+      ],
+      "troubleshoot": [
+        "If **Manual check** says it can’t prepare `temp/downloads/`, delete that folder manually and try again.",
+        "If downloads fail, check firewall/proxy rules (the updater downloads from GitHub’s `codeload.github.com`).",
+        "If you see “Update checker not available”, your build is missing `helpers/update_checker.py` or the import path is broken.",
+        "If Manual check finds nothing but you know changes exist, remember it compares by file size—try **Beta → Update python files only** instead."
+      ],
+      "overview": "Update FrameVision from GitHub (Stable releases or Beta branch), create a backup ZIP for safety, or use Manual check to selectively copy the newest changed files.",
+      "_layout": "overview/features/install/troubleshoot"
+    },
+    "Upscaler": {
+      "key_terms": [
+        "Upscaler",
+        "AI upscaling",
+        "NCNN-Vulkan",
+        "FFmpeg",
+        "ffprobe",
+        "Auto tile probe",
+        "tile size",
+        "overlap",
+        "scale (x1–x4)",
+        "sharpen (unsharp)",
+        "deinterlace (yadif)",
+        "deblock",
+        "denoise (hqdn3d)",
+        "deband (gradfun)",
+        "color range (Full↔Limited)",
+        "encoder (libx264/libx265/libsvtav1/libaom-av1/NVENC)",
+        "CRF vs Bitrate",
+        "preset",
+        "audio copy/encode/mute",
+        "audio codec (aac/opus/vorbis)",
+        "audio bitrate",
+        "container (mp4/mkv/mov)",
+        "Real-ESRGAN (ncnn)",
+        "UltraSharp (ncnn)",
+        "ClearReality V1",
+        "SRMD (ncnn)",
+        "SRMD (ncnn via RealESRGAN)",
+        "Waifu2x (ncnn)",
+        "RealSR (ncnn)",
+        "SwinIR (ncnn)",
+        "LapSRN (ncnn)",
+        "Upscayl (CLI)",
+        "Upscayl model packs (.param/.bin)",
+        "GFPGAN (faces)",
+        "View results button",
+        "Media Explorer integration",
+        "upsc_settings.json (auto-save)"
+      ],
+      "description": "The Upscaler performs super‑resolution on images and videos using fast local engines (mostly **NCNN‑Vulkan**) and a frame‑sequence video pipeline.\n\n**Engines (auto‑detected):**\n• **Real‑ESRGAN (ncnn)** — general purpose photo/video upscaler (multiple models).\n• **UltraSharp (ncnn)** — sharper Real‑ESRGAN profile for crisp detail.\n• **ClearReality V1** — curated Real‑ESRGAN model family (filters the model list to ClearReality variants).\n• **SRMD (ncnn)** and **SRMD (ncnn via RealESRGAN)** — classic denoise‑friendly upscalers (good for noisy sources).\n• **Waifu2x (ncnn)** — anime/line‑art image upscaler with denoise.\n• **RealSR (ncnn)**, **SwinIR (ncnn)**, **LapSRN (ncnn)** — alternative SR engines for different looks.\n• **Upscayl (CLI)** — lets you use Upscayl model packs (pairs of `.param` + `.bin`) from `models/upscayl/`.\n• **GFPGAN (faces)** — face restoration (best used on portraits / close‑ups; can look too smooth on wide shots).\n\n**Video pipeline:** FFmpeg extracts frames → selected engine upscales the frame folder → FFmpeg re‑encodes with your chosen codec + audio mode. Images are processed directly.\n\n**Results & workflow:** use **View results** to jump straight to the output folder in **Media Explorer** (and trigger a scan), or open the folder in your OS file explorer as a fallback.\n\n**Settings:** Upscaler settings are **auto‑saved** to `upsc_settings.json` (no need to manually toggle “remember”).",
+      "hints_tips": [
+        "Photos (general): start with **Real‑ESRGAN (ncnn)** models like `realesr-general-x4v3` / `realesrgan-x4plus`.",
+        "Anime/line art: try **Waifu2x (ncnn)** (with low denoise) or `realesr-animevideov3` under Real‑ESRGAN.",
+        "If you want an extra‑crisp look, try **UltraSharp (ncnn)**; if you see halos, switch to **ClearReality V1 Soft** (when available) or reduce **Sharpen**.",
+        "Portraits: run **GFPGAN (faces)** for cleaner faces—avoid on wide shots if it makes skin too plastic.",
+        "For noisy/low‑quality sources, **SRMD** can be a nicer first pass than a super‑sharp model.",
+        "Use **Auto tile** / smaller **Tile size** if you hit VRAM errors; close other GPU apps.",
+        "Keep **Video thumbnails** OFF during heavy runs if your system gets sluggish; enable only when browsing.",
+        "**View results** is the quickest way to browse outputs—especially now that Media Explorer can search/sort/play results.",
+        "Outputting to a fast SSD helps for long videos (frame sequences get big).",
+        "CRF ~16–20 (x264/x265) is a good quality/size balance; AV1 is smaller but slower."
+      ],
+      "qa_pairs": [
+        {
+          "question": "Which engine should I pick for photos, anime, and videos?",
+          "answer": "Use **Real‑ESRGAN (ncnn)** for most photos and for videos. Use **Waifu2x (ncnn)** for single images with anime/line‑art and when you want built‑in denoising. Try **UltraSharp** for extra crisp detail and **SRMD** for noisy sources."
+        },
+        {
+          "question": "What is ClearReality V1?",
+          "answer": "A dedicated Upscaler engine entry that re‑uses the Real‑ESRGAN backend but **filters the model list** to ClearReality V1 variants (and provides model hints for them)."
+        },
+        {
+          "question": "How do I browse my upscaled outputs quickly?",
+          "answer": "Click **View results**. It opens the current output folder in **Media Explorer** and triggers a scan. If the app can’t switch tabs (older builds), it falls back to opening the folder in your OS file explorer."
+        },
+        {
+          "question": "Where do Upscayl models go, and how are they detected?",
+          "answer": "Drop Upscayl model pairs (`.param` + `.bin`) under `models/upscayl/` (or `models/upscayl/resources/models`). FrameVision scans those folders and adds them to the model list as **“Upscayl – <model>”** entries."
+        },
+        {
+          "question": "Are Upscaler settings remembered after restart?",
+          "answer": "Yes. Upscaler settings are **auto‑saved** to **upsc_settings.json** as you change them, and restored when the tab loads."
+        },
+        {
+          "question": "What are the Encoder options?",
+          "answer": "Choose codec (**x264/x265/SVT‑AV1/AOM‑AV1/NVENC**). Rate control can be **CRF** (quality‑targeted) or **Bitrate** (size‑targeted). **Preset** trades speed for compression. **Keyint** sets GOP (0=auto)."
+        },
+        {
+          "question": "How is audio handled?",
+          "answer": "Pick **Copy** (stream‑copy original), **Encode** (AAC/Opus/Vorbis with chosen bitrate), or **Mute**. Copy is fastest with no quality loss."
+        },
+        {
+          "question": "Where are files written?",
+          "answer": "Outputs go to your chosen folder. For videos, a temporary work directory holds frame sequences during processing and is cleaned after success."
+        },
+        {
+          "question": "Does the log show the exact commands?",
+          "answer": "Yes. The log streams engine and FFmpeg output including the exact model, scale, codec, and working paths used."
+        },
+        {
+          "question": "What does the Info button do?",
+          "answer": "Shows the media’s technical metadata (streams, codec, bitrate, resolution, FPS) via ffprobe so you can choose sensible encoder settings."
+        },
+        {
+          "question": "Why do I see seams or halos?",
+          "answer": "Excessive sharpening or too‑small overlap can create halos or faint seams. Keep sharpening low; overlap may be ignored by some engines."
+        },
+        {
+          "question": "Can I batch multiple files?",
+          "answer": "Yes—use **Batch…** to select a folder or files. Each item runs with current settings and writes to your output directory."
+        },
+        {
+          "question": "What does ‘Streaming (low memory)’ do exactly?",
+          "answer": "Injects conservative low‑buffer flags across FFmpeg calls (e.g., `-fflags nobuffer -probesize 64k -analyzeduration 0`) and adds `-threads 1` if not specified. Applies to thumbnails too when enabled."
+        }
+      ],
+      "features": [
+        "AI upscaling via multiple local engines (NCNN/Vulkan + optional CLI): Real‑ESRGAN, UltraSharp, ClearReality V1, SRMD, Waifu2x, RealSR, SwinIR, LapSRN, Upscayl models, GFPGAN face restore.",
+        "Video pipeline: extract frames → upscale folder → re‑encode with codec/audio controls.",
+        "Quick browsing via **View results** (opens output folder in Media Explorer).",
+        "Upscaler settings auto‑save to **upsc_settings.json**.",
+        "AI upscaling via NCNN/Vulkan (Real-ESRGAN/Waifu2x).",
+        "Streaming low-memory pipeline for large videos.",
+        "Auto tile probe",
+        "CRF vs Bitrate",
+        "FFmpeg low‑buffer flags",
+        "GPU VRAM",
+        "Logger newest‑at‑top (buffered)"
+      ],
+      "install": [
+        "GFPGAN face restore uses the bundled `models/gfpgan/` folder (and its local Python env under `models/gfpgan/.GFPGAN/` when present).",
+        "Upscayl model packs: place `.param` + `.bin` pairs under `models/upscayl/` (or `models/upscayl/resources/models`).",
+        "Upscaler engines are included in externals; if missing, run the models-only downloader.",
+        "General install flow: use **Install/Updates → Option 1** to auto-detect environment, then **Option 2** for repair, or **Option 3/4** for full stacks."
+      ],
+      "troubleshoot": [
+        "If outputs seem “missing”, use **View results** to open the exact output folder being used for the current run.",
+        "If an engine/model isn’t showing up, confirm its folder exists under `models/` and restart the app (engine lists are built at tab load).",
+        "If an upscaler binary is not detected, open **Models** and verify paths; run `scripts/download_externals.py` to fetch it.",
+        "Run **install_menu.bat** and choose **Option 1 — System check & advisor** (creates venv if missing, checks Python/FFmpeg/GPU/VRAM, prints a full info page and recommends Option 3 or 4).",
+        "If only the app is broken, run **Option 2 — Core install** (quick repair, minimal download).",
+        "If problems persist, pick a full stack: **Option 3 — Full CPU (< 6 GiB VRAM, ~3.5 GB download)** or **Option 4 — Full GPU (≥ 6 GiB VRAM, ~5 GB download)**.",
+        "Still failing? **Delete the `.venv` folder** and re-run Option 3 or 4. You **do not** need to delete helper binaries or models; it’s recommended to clear **cache** and **preset** files.",
+        "If a model/tool is missing or corrupted, run the models-only downloader:\n  - **Windows:** `python \"scripts\\download_externals.py\"`\n  - **macOS/Linux:** `python scripts/download_externals.py`",
+        "Planned: `update.bat` will auto-check and update to the latest stable build."
+      ]
+    },
+    "UserFriendlyAspects": {
+      "key_terms": [
+        "User-friendly",
+        "easy installer",
+        "requirements check",
+        "automated setup: Core/Full CPU/Full CUDA",
+        "helpful tooltips",
+        "resizable layout",
+        "clear messages",
+        "graceful fallbacks"
+      ],
+      "description": "Installer checks requirements/space. Setup options: Core (app only), Full CPU, Full CUDA. Tooltips everywhere; resizable splitter; clear errors/fallbacks (e.g., CPU if GPU fails).",
+      "hints_tips": [
+        "Run installer for automated setup.",
+        "Tooltips provide instant help."
+      ],
+      "qa_pairs": [
+        {
+          "question": "Why is FrameVision user-friendly?",
+          "answer": "Easy installer with checks, tooltips on all features, resizable UI, clear messages, and fallbacks like CPU mode."
+        }
+      ]
+    },
+    "Visual_music_play": {
+      "description": "Play audio inside FrameVision with an info header overlay and optional beat-reactive visuals.",
+      "key_terms": [
+        "Album art & tags",
+        "BPM/TBPM tag",
+        "Beats per switch (8/16/32/64)",
+        "Beat‑reactive visuals",
+        "Beat‑sync engine",
+        "FAB (♪)",
+        "FAB (♪) control button",
+        "FFmpeg/Qt audio stack",
+        "FFmpeg/Qt backend",
+        "Info header (art/title/artist/album)",
+        "Keyboard shortcuts (V/P/N)",
+        "Kick/low‑band detector",
+        "Music Player overlay",
+        "Persistence defaults",
+        "Playlist navigation",
+        "Repeat (all/1)",
+        "TBPM / BPM tag",
+        "Tempo lock",
+        "Visuals modes: random/all/1"
+      ],
+      "overview": "Purpose: Play audio inside FrameVision with an info header overlay and optional beat-reactive visuals.\n\nDefault at launch\n- Info header (cover art, title, artist, album) shows immediately\n- Visuals start OFF so the track can pre-analyze timing in the background\n- The ♪ floating button (FAB) is visible and the control card opens by default\n\nBeat-sync\n- In Random or All mode, visuals can switch exactly every 8 / 16 / 32 / 64 beats\n",
+      "features": [
+        "Info header (cover art, title, artist, album) shows immediately on open.",
+        "Visuals are OFF by default to allow pre-analysis; toggle with the Visuals switch.",
+        "Beat-sync switching exactly every 8 / 16 / 32 / 64 beats in ‘random’ or ‘all’ modes.",
+        "Mode button cycles: random → all → 1 (no switching).",
+        "Beats button cycles: 8 → 16 → 32 → 64 (beats per switch).",
+        "Primary tempo source: embedded BPM/TBPM tag; fallback kick/low-band detector estimates ms per beat.",
+        "FAB (♪) opens/closes the controls card; positioned near header with fixed offset.",
+        "Playlist & transport: Add…, Clear, Prev/Next, Repeat (all/1), double‑click to play.",
+        "Persistence: remembers last visual, mode, and beat interval between sessions; visuals start OFF on launch.",
+        "Keyboard shortcuts: V (Visuals), P (Previous), N (Next); OS media keys may work."
+      ],
+      "controls": [
+        "Floating Action Button (♪): opens/closes music controls card (anchored near header).",
+        "Info Header: glass panel showing cover art, title, artist, album; visible even when visuals are OFF.",
+        "Playlist & Transport: Add…, Clear, Prev, Next, Repeat (all/1), double‑click to play track.",
+        "Visuals toggle: enable/disable visual rendering (defaults OFF on launch).",
+        "Mode button: random → all → 1.",
+        "Visual selector: widened dropdown of visuals.",
+        "Beats button: 8 → 16 → 32 → 64 beats per switch."
+      ],
+      "_controls_meta": {
+        "order": "top‑to‑bottom"
+      },
+      "install": [
+        "Uses bundled FFmpeg/Qt backend for audio decoding; no separate install required.",
+        "If media backends are missing, see InstallUpdates → Install."
+      ],
+      "troubleshoot": [
+        "If visuals don’t change on the beat: ensure Visuals ON and mode (random/all); fallback BPM detection may need a few seconds; try 16/32 beats.",
+        "Header shows but no visual: expected when Visuals are OFF.",
+        "Visuals start OFF each launch by design; toggle ON after playback starts.",
+        "Difference between random vs all: random picks a new visual; all walks the list.",
+        "Repeat affects playlist only; visuals switching is mode + beats.",
+        "If visuals list feels cramped: widen the window or reduce UI scale.",
+        "FAB overlaps UI: can be anchored to header bottom‑right or offset; ask for a small patch."
+      ],
+      "hints_tips": [
+        "For variable‑energy tracks, try 16 or 32 beats for more musical switching.",
+        "Prefer a steady look? Set mode = ‘1’ — Beats button remains but switching is disabled."
+      ],
+      "qa_pairs": [
+        {
+          "question": "Overview",
+          "answer": "Purpose: Play audio inside FrameVision with an info header overlay and optional beat-reactive visuals.\n\nDefault at launch\n- Info header (cover art, title, artist, album) shows immediately\n- Visuals start OFF so the track can pre-analyze timing in the background\n- The ♪ floating button (FAB) is visible and the control card opens by default\n\nBeat-sync\n- In Random or All mode, visuals can switch exactly every 8 / 16 / 32 / 64 beats"
+        },
+        {
+          "question": "Quick start",
+          "answer": "1) Open an audio file (MP3, WAV, FLAC, etc.). The header appears at the top of the video area.\n2) Turn Visuals ON (optional).\n3) Pick a visual, pick a mode (Random / All / 1), then pick Beats (8 / 16 / 32 / 64).\n4) Use Repeat (All / 1) and Prev/Next to navigate the playlist."
+        },
+        {
+          "question": "Persistence & defaults",
+          "answer": "- Remembers last visual, last mode, and last beat interval between sessions.\n- Exception: Visuals always start OFF on launch (even if they were ON last session)."
+        },
+        {
+          "question": "Keyboard shortcuts",
+          "answer": "- V: toggle Visuals on/off\n- P: previous track\n- N: next track\n(OS media keys may also work depending on your setup.)"
+        },
+        {
+          "question": "File support & metadata",
+          "answer": "- Most common audio types work (MP3, WAV, FLAC, etc.).\n- If the file has BPM/TBPM metadata, it will be used as the primary tempo source.\n- If not, a fallback kick/low-band detector estimates timing; it may take a few seconds to stabilize."
+        },
+        {
+          "question": "Tips",
+          "answer": "- 16 or 32 beats usually feels more musical than 8 for longer tracks.\n- If the intro is quiet, switching can start late; try 16/32 beats or jump forward slightly.\n- If you want a steady look, use mode 1 (no switching)."
+        },
+        {
+          "question": "Visuals don’t change on the beat.",
+          "answer": "- Check Visuals is ON.\n- Check mode is Random or All (mode 1 never switches).\n- If there is no BPM tag, give the fallback detector a few seconds.\n- Quiet intros can delay detection; try 16 or 32 beats."
+        },
+        {
+          "question": "Header shows but no background visual.",
+          "answer": "That’s normal when Visuals are OFF. Turn Visuals ON to render a background visual."
+        },
+        {
+          "question": "Previous session had Visuals ON but they’re OFF now.",
+          "answer": "By design: Visuals always start OFF on launch so timing can pre-analyze cleanly."
+        },
+        {
+          "question": "Difference between ‘random’ and ‘all’?",
+          "answer": "- Random: picks a different visual every interval.\n- All: steps through the visual list in order every interval."
+        },
+        {
+          "question": "Do Repeat controls affect visuals?",
+          "answer": "No. Repeat affects playlist playback only. Visual switching is controlled by Mode + Beats."
+        },
+        {
+          "question": "Visuals list is short / names truncated.",
+          "answer": "Some visuals may be hidden or grouped depending on the build; names may be shortened to fit the dropdown. (If you want, we can add a tooltip-on-hover style later.)"
+        },
+        {
+          "question": "Can I move the FAB (♪)?",
+          "answer": "Yes. The FAB position is an anchor + offset; it can be nudged to avoid overlap with the header or controls."
+        }
+      ],
+      "_layout": "overview/features/install/troubleshoot",
+      "article_md": "# Visual music play\n\n## Overview\nPurpose: Play audio inside FrameVision with an info header overlay and optional beat-reactive visuals.\n\nDefault at launch\n- The info header (cover art, title, artist, album) shows immediately\n- Visuals start OFF so the track can pre-analyze timing in the background\n- The ♪ floating button (FAB) is visible and the control card opens by default\n\nBeat-sync basics\n- Visuals can switch exactly every 8 / 16 / 32 / 64 beats\n- Switching happens only when mode is Random or All\n\n## Quick start\n1) Open an audio file (MP3, WAV, FLAC, etc.).\n2) Turn Visuals ON (optional).\n3) Pick a visual, pick a mode (Random / All / 1), then pick Beats (8 / 16 / 32 / 64).\n4) Use Repeat (All / 1) and Prev/Next to move through the playlist.\n\n## Controls (top to bottom)\nFloating action button (♪)\n- Opens/closes the music controls card\n\nInfo header\n- Shows cover art + title + artist + album\n- Stays visible even when Visuals are OFF\n\nPlaylist & transport\n- Add… (add tracks), Clear (clear playlist)\n- Prev / Next\n- Repeat: All or 1\n- Tip: double-click a track to play it\n\nVisuals row\n- Visuals toggle: ON/OFF (defaults OFF on launch)\n- Mode: Random / All / 1\n  - Random: picks a different visual every interval\n  - All: walks the list in order every interval\n  - 1: stays on the selected visual (no switching)\n- Visual selector: dropdown list of visuals\n- Beats: 8 / 16 / 32 / 64 (beats per switch)\n\n## Beat-sync timing\n- First choice: BPM/TBPM tag in the audio metadata (if present)\n- Fallback: kick/low-band detector estimates ms per beat (may take a few seconds)\n- Switch rule: in Random/All mode, visuals change on the exact boundary of every N beats\n\nWhy Visuals start OFF\n- Helps the analyzer lock in timing so the first switch happens cleanly on-grid\n\n## Persistence & defaults\n- Remembers last visual, last mode, and last beat interval between sessions\n- Exception: Visuals always start OFF on launch (even if you had them ON last time)\n\n## Keyboard shortcuts\n- V: toggle Visuals on/off\n- P: previous track\n- N: next track\n\n## Troubleshooting\nVisuals don’t change on the beat\n- Make sure Visuals are ON and mode is Random or All (mode 1 never switches)\n- If there’s no BPM tag, give the fallback detector a few seconds\n- Quiet intros can delay detection; try 16 or 32 beats\n\nHeader shows but no background visual\n- Normal when Visuals are OFF\n\nVisuals were ON last session but are OFF now\n- By design: Visuals always start OFF on launch\n\nRandom vs All\n- Random picks a different visual each interval\n- All steps through the list in order\n\nRepeat affects visuals\n- No. Repeat controls the playlist only; visual switching is controlled by Mode + Beats\n\n## Tips\n- For tracks with changing energy, 16 or 32 beats usually feels more musical than 8\n- Want a steady look? Set mode to 1 (switching disabled)\n",
+      "_meta": {
+        "added_or_updated": "2025-09-20 05:19:12",
+        "source": "User-supplied Markdown (verbatim)",
+        "updated": "2025-09-20 05:29:34"
+      },
+      "quick_start_md": "1) Open an audio file (MP3, WAV, FLAC, etc.). The header appears at the top of the video area.\n2) Turn Visuals ON (optional).\n3) Pick a visual, pick a mode (Random / All / 1), then pick Beats (8 / 16 / 32 / 64).\n4) Use Repeat (All / 1) and Prev/Next to navigate the playlist.\n",
+      "quick_start_steps": [
+        "Open an audio file (MP3, WAV, FLAC, etc.). The header appears at the top of the video area.",
+        "Turn Visuals ON (optional).",
+        "Pick a visual, pick a mode (Random / All / 1), then pick Beats (8 / 16 / 32 / 64).",
+        "Use Repeat (All / 1) and Prev/Next to navigate the playlist."
+      ],
+      "shortcuts": [
+        "V — toggle Visuals on/off.",
+        "P — previous track.",
+        "N — next track.",
+        "(OS media keys may also work depending on your setup.)"
+      ]
+    },
+    "Wan22VideoCreation": {
+      "description": "Generate videos with **Wan 2.2 TI2V‑5B** inside FrameVision (text2video, image2video, and video→video). Includes Extend chaining, Qwen prompt enhancer, and VRAM offload options.",
+      "key_terms": [
+        "WAN 2.2 TI2V‑5B",
+        "text2video",
+        "image2video",
+        "Video→Video",
+        "Extend",
+        "Auto‑merge",
+        "Multi prompt",
+        "Enhance prompt (Qwen3‑VL)",
+        "Use queue",
+        "T5 on CPU",
+        "Offload model",
+        ".wan_venv",
+        "models/wan22",
+        "output/video/wan22",
+        "Media Explorer"
+      ],
+      "overview": "Wan 2.2 5B is FrameVision’s fast “text → video” and “image → video” engine. It supports **prompt enhancement (Qwen3‑VL)**, **video→video** (by extracting the last frame), and **Extend** (chaining extra segments).\n\n### Quick start (most common)\n1. Open **Video Creation → Engine: WAN 2.2**.\n2. Pick a **Mode**:\n   - **text2video**: start from a text prompt.\n   - **image2video**: add a **Start image** (or click **Use Current** to grab the current Media Player frame).\n3. Write a strong **Prompt**. Optionally click **Enhance prompt (Qwen)** for more detail/variety.\n4. Set **Steps**, **Guidance**, **Frames**, **FPS**, and **Seed** (leave seed at -1 for random).\n   - Default is **121 frames at 24 FPS** (≈ 5 seconds).\n5. Click **Generate Video**.\n\n### Extend (longer videos)\n- Set **Extend** to 1+ to generate extra segments.\n- **Important:** Extend is **direct-run only**, so **turn OFF “Use queue”**. (The UI also nudges you toward this.)\n- If **Auto-merge** is enabled, FrameVision will merge the segments into one final MP4 at the end.\n\n### Video→Video (style/scene continuation)\n- Turn on **Video→Video** and select a source video.\n- FrameVision will extract the **last frame** of the source video and use it as the Start image, then run image2video.\n- If you also use **Extend + Auto-merge**, you can optionally **Include source in merge** (prepends the original clip before the new segments).\n",
+      "features": [
+        "**Modes:** text2video and image2video (TI2V‑5B).",
+        "**Prompt enhancer:** “Enhance prompt (Qwen)” runs the shared Qwen3‑VL helper from the app’s `.venv` and forces the prompt tool target to **video**.",
+        "**Extend:** chain multiple segments by reusing the last frame of the previous segment as the next start image (direct runs only).",
+        "**Auto‑merge:** merges chained segments into one file when Extend > 0; optional “Include source in merge” for video→video.",
+        "**Offload options:** “T5 on CPU” (text encoder) and optional “Offload model” (main weights), to reduce VRAM at the cost of speed.",
+        "**Queue mode:** run in the worker queue for safer background runs and batch generation.",
+        "**Results helpers:** Play last, View results (opens Media Explorer on the output folder).",
+        "**Multi prompt:** for Extend runs, lets you use a different prompt per extend segment (requires Extend ≥ 1)."
+      ],
+      "qa_pairs": [
+        {
+          "question": "Text2video or image2video — which one should I use?",
+          "answer": "Use **text2video** for pure imagination / new scenes. Use **image2video** when you want control over the first frame (a keyframe, concept art, or a still)."
+        },
+        {
+          "question": "What does “Enhance prompt (Qwen)” actually do?",
+          "answer": "It runs the shared **Qwen3‑VL prompt helper** and replaces your prompt with a more detailed version. It’s great for adding camera language, materials, motion, and extra details."
+        },
+        {
+          "question": "Where do the prompt enhancer presets live?",
+          "answer": "Presets and detailed settings live in **Tools → Prompt enhancement**. The WAN “Enhance prompt (Qwen)” button reuses those shared settings and forces the target to **video**."
+        },
+        {
+          "question": "How do I make a longer video?",
+          "answer": "Set **Extend** to 1+ to generate extra segments. Turn **Use queue OFF** (Extend is direct-run only). Keep **Auto‑merge** enabled if you want one final file."
+        },
+        {
+          "question": "What is “Multi prompt” and when should I use it?",
+          "answer": "When **Extend ≥ 1**, Multi prompt lets you set a different prompt per segment so the video can evolve over time (instead of repeating the same idea)."
+        },
+        {
+          "question": "What does Guidance mean?",
+          "answer": "Guidance is how literally the model follows your prompt. Higher usually means more literal / less drift, but can also look less natural if pushed too far."
+        },
+        {
+          "question": "What does “T5 on CPU” do?",
+          "answer": "It offloads the WAN text encoder (T5) to CPU to save VRAM. It’s slower, but can be the difference between running and crashing on 8–12GB GPUs."
+        },
+        {
+          "question": "Why is T5 on CPU disabled in direct mode?",
+          "answer": "FrameVision disables it for direct runs to avoid stalls; it becomes available when the queue is effectively used (queue mode is safer for this kind of offload)."
+        },
+        {
+          "question": "What does “Offload model” do?",
+          "answer": "If supported by the underlying `generate.py`, it offloads parts of the main model weights to CPU during sampling. This reduces VRAM pressure but can slow generation a lot."
+        },
+        {
+          "question": "How does Video→Video work here?",
+          "answer": "You pick a source clip, and FrameVision extracts its **last frame** as the next Start image, then runs image2video to continue the motion/style."
+        },
+        {
+          "question": "Where do my videos go?",
+          "answer": "They’re saved under the app output folders (WAN defaults to `output/video/wan22`). Use **View results** to open Media Explorer on the right folder."
+        },
+        {
+          "question": "How do I reuse something I’m already watching?",
+          "answer": "Click **Use Current** to capture the current Media Player frame as the Start image (image2video)."
+        }
+      ],
+      "controls": [
+        "Control: Engine — dropdown. Does: Select WAN 2.2 or HunyuanVideo 1.5 engine page.",
+        "Control: Mode — dropdown. Does: Choose text2video or image2video.",
+        "Control: Prompt — text box. Does: Describe what you want to see.",
+        "Control: Enhance prompt (Qwen) — button. Does: Expand the prompt using Qwen3‑VL helper.",
+        "Control: Negative — text box. Does: Describe what to avoid in the output.",
+        "Control: Start image — path/browse. Does: Starting frame for image2video (and for video→video).",
+        "Control: Use Current — button. Does: Grab the current Media Player frame as the Start image.",
+        "Control: Video→Video — toggle/browse. Does: Use a source video; last frame becomes the Start image.",
+        "Control: Steps — spin/slider. Does: Sampling steps (quality vs speed).",
+        "Control: Guidance — spin/slider. Does: Prompt adherence strength.",
+        "Control: Frames — spinbox. Does: Length in frames.",
+        "Control: FPS — spinbox. Does: Playback FPS and duration relationship.",
+        "Control: Seed — spinbox. Does: Randomness; -1 = random.",
+        "Control: Batch — spinbox. Does: Number of variations (queue-only when >1).",
+        "Control: Extend — spinbox. Does: Chain extra segments (direct-run only).",
+        "Control: Auto‑merge — checkbox. Does: Merge segments into one MP4 after extend finishes.",
+        "Control: Include source in merge — checkbox. Does: For video→video + merge, prepend the original clip.",
+        "Control: Multi prompt — button. Does: Assign a per‑segment prompt for extend chains.",
+        "Control: T5 on CPU — checkbox. Does: Offload text encoder to CPU (queue-enabled).",
+        "Control: Offload model — checkbox. Does: Offload main model weights to CPU if supported.",
+        "Control: Use queue — checkbox. Does: Run via worker queue (recommended for batch and some offload modes).",
+        "Control: Generate Video — button. Does: Start generation.",
+        "Control: Play last — button. Does: Open the last output.",
+        "Control: View results — button. Does: Open Media Explorer on WAN output folder."
+      ],
+      "install": [
+        "WAN runs via the official `generate.py` CLI from `models/wan22`, using a dedicated Python if present: `.wan_venv` (falls back to the main interpreter).",
+        "If WAN is missing or broken, use **Install/Updates** (full stack) or the **models-only downloader** (`scripts/download_externals.py`) to restore dependencies and model files.",
+        "FFmpeg is used for merging when Extend + Auto‑merge is enabled (FrameVision prefers the bundled FFmpeg under `presets/bin/`)."
+      ],
+      "troubleshoot": [
+        "If **Extend** is enabled but the app keeps forcing queue OFF: that’s expected — Extend is **direct-run only**.",
+        "If **T5 on CPU** is grayed out: it is only enabled when the queue is effectively used (to avoid stalls in direct mode).",
+        "If prompt enhancement fails: verify the shared Qwen environment exists (`.venv`) and that `helpers/prompt_enhancer_cli.py` is present.",
+        "If Auto‑merge fails: confirm FFmpeg exists in `presets/bin/` (or on PATH on non‑Windows builds).",
+        "If output plays black/no frames: reduce Steps/Frames first and retry; also avoid running other VRAM-heavy jobs simultaneously (especially in direct mode)."
+      ],
+      "_layout": "overview/features/install/troubleshoot"
+    },
+    "Worker": {
+      "description": "A separate process that executes queued jobs so the UI stays smooth. Watches jobs/pending/, moves to jobs/running/, stamps start/finish/duration, writes logs, and finishes in jobs/done/ or jobs/failed/. Writes a heartbeat for liveness and a .progress.json for UI progress.",
+      "key_terms": [
+        ".progress.json",
+        "FFmpeg passthrough",
+        "Heartbeat (logs/worker_heartbeat.txt)",
+        "Progress sidecar",
+        "RIFE (with minterpolate fallback)",
+        "Real‑ESRGAN/SwinIR/LapSRN",
+        "Separate process",
+        "models_manifest.json auto‑detect",
+        "run_*.log",
+        "started_at/finished_at/duration"
+      ],
+      "hints_tips": [
+        "Each run logs the full command and stdout/stderr to logs/run_*.log.",
+        "If the heartbeat is stale and jobs don’t move, restart the app/worker."
+      ],
+      "qa_pairs": [
+        {
+          "question": "How does a job flow?",
+          "answer": "Pending → Running (set started_at, create .progress.json) → Done/Failed (set finished_at/duration, write final JSON)."
+        },
+        {
+          "question": "Which engines are called?",
+          "answer": "Upscaler: Real‑ESRGAN/SwinIR/LapSRN; Interpolation: RIFE (or FFmpeg minterpolate fallback); Tools: arbitrary FFmpeg commands."
+        },
+        {
+          "question": "How are models found?",
+          "answer": "Checks models_manifest.json then scans models/ for known names; RIFE model dirs auto‑detected."
+        }
+      ]
+    }
+  }
+}

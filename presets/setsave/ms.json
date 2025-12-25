@@ -1,0 +1,13 @@
+{
+  "prompt": "Vivid scene of a charming, anthropomorphic robot with soft glowing blue eyes and warm yellow accents, walking gracefully through a vibrant neon city at night. 3d motion",
+  "num_frames": 10,
+  "num_inference_steps": 48,
+  "guidance_scale": 7.5,
+  "seed": -1,
+  "fps": 2,
+  "use_cpu_offload": false,
+  "use_vae_slicing": true,
+  "output_dir": "output\\video",
+  "model_local_dir": "models\\text-to-video-ms-1.7b",
+  "note": "placeholder; will be overwritten by ms_install.bat on first run"
+}

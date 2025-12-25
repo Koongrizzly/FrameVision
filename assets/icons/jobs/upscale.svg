@@ -1,0 +1,14 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" width="48" height="48" viewBox="0 0 48 48" role="img" aria-label="Upscale">
+  <g fill="none" stroke="#ffffff" stroke-width="2.6" stroke-linecap="round" stroke-linejoin="round">
+
+    <rect x="12" y="14" width="24" height="20" rx="5"/>
+    <path d="M24 30V20"/>
+    <path d="M20 24l4-4 4 4"/>
+    <path d="M15 17h5"/>
+    <path d="M15 17v5"/>
+    <path d="M33 31h-5"/>
+    <path d="M33 31v-5"/>
+
+  </g>
+</svg>

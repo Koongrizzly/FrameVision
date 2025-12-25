@@ -1,0 +1,645 @@
+{
+  "presets": [
+    {
+      "name": "Custom (manual tags)",
+      "genre": "Other",
+      "prompt": "",
+      "params": {},
+      "negative_prompt": "background noise, distortion"
+    },
+    {
+      "name": "Club 128 BPM (EDM)",
+      "genre": "EDM",
+      "prompt": "house, groove, 128bpm, punchy, kick, bass, clean mixline, rolling, percussion, uplifting, pads, atmospheric, synths, club, modern, energetic, dancefloor, groove, reverb, delay, minimal, polished, punchy 4-on-the-floor kick, deep rolling bass, clean mixline, crisp hi-hats, rhythmic percussion. uplifting chords with a subtle analog feel, atmospheric pads",
+      "params": {
+        "audio_duration": 100,
+        "infer_step": 65,
+        "guidance_scale": 5.0,
+        "scheduler_type": "euler",
+        "cfg_type": "apg",
+        "omega_scale": 10.0,
+        "guidance_interval": 0.5,
+        "guidance_interval_decay": 0.0,
+        "min_guidance_scale": 3.0,
+        "use_erg_tag": true,
+        "use_erg_diffusion": true,
+        "guidance_scale_text": 4.0,
+        "oss_steps": [],
+        "guidance_scale_lyric": 0.5,
+        "use_erg_lyric": false
+      },
+      "negative_prompt": "background noise, distortion"
+    },
+    {
+      "name": "House 126 BPM",
+      "genre": "EDM",
+      "prompt": "house, deep house, 126 BPM, 4-on-the-floor, groovy bass, clean mixline, piano stabs, warm pads, club, dancefloor",
+      "params": {
+        "audio_duration": 100,
+        "infer_step": 65,
+        "guidance_scale": 5.5,
+        "scheduler_type": "euler",
+        "cfg_type": "apg",
+        "omega_scale": 10.0,
+        "guidance_interval": 0.5,
+        "guidance_interval_decay": 0.0,
+        "min_guidance_scale": 3.0,
+        "use_erg_tag": true,
+        "use_erg_diffusion": true,
+        "guidance_scale_text": 4.0,
+        "oss_steps": [],
+        "guidance_scale_lyric": 0.5,
+        "use_erg_lyric": false
+      },
+      "negative_prompt": "background noise, distortion"
+    },
+    {
+      "name": "Melodic Techno 126 BPM",
+      "genre": "EDM",
+      "prompt": "melodic techno, techno, 126 BPM, arpeggiated synths, deep bass, clean mix, atmospheric pads, dark, warehouse, underground",
+      "params": {
+        "audio_duration": 100,
+        "infer_step": 65,
+        "guidance_scale": 5.0,
+        "scheduler_type": "euler",
+        "cfg_type": "apg",
+        "omega_scale": 10.0,
+        "guidance_interval": 0.5,
+        "guidance_interval_decay": 0.0,
+        "min_guidance_scale": 3.0,
+        "use_erg_tag": true,
+        "use_erg_diffusion": true,
+        "guidance_scale_text": 5.0,
+        "oss_steps": [],
+        "guidance_scale_lyric": 0.5,
+        "use_erg_lyric": false
+      },
+      "negative_prompt": "background noise, distortion"
+    },
+    {
+      "name": "More hpuse music attempts",
+      "genre": "EDM",
+      "prompt": "drum and bass, clean mix, dnb, 170 BPM, fast breakbeats, deep sub bass, clean mix, liquid, atmospheric pads, rolling, modern",
+      "params": {
+        "omega_scale": 10.0,
+        "guidance_interval": 0.5,
+        "guidance_interval_decay": 0.0,
+        "min_guidance_scale": 3.0,
+        "use_erg_tag": true,
+        "use_erg_diffusion": true,
+        "guidance_scale_text": 5.0,
+        "oss_steps": [],
+        "guidance_scale_lyric": 0.5,
+        "use_erg_lyric": false
+      },
+      "negative_prompt": "background noise, distortion"
+    },
+    {
+      "name": "Afro House 122 BPM",
+      "genre": "EDM",
+      "prompt": "afro house, 122 BPM, tribal percussion, shakers, deep bass, clean mix, soulful, warm, groove",
+      "params": {
+        "audio_duration": 100,
+        "infer_step": 65,
+        "guidance_scale": 5.0,
+        "scheduler_type": "euler",
+        "cfg_type": "apg",
+        "omega_scale": 10.0,
+        "guidance_interval": 0.5,
+        "guidance_interval_decay": 0.0,
+        "min_guidance_scale": 3.0,
+        "use_erg_tag": true,
+        "use_erg_diffusion": true,
+        "guidance_scale_text": 5.0,
+        "oss_steps": [],
+        "guidance_scale_lyric": 0.5,
+        "use_erg_lyric": false
+      },
+      "negative_prompt": "background noise, distortion"
+    },
+    {
+      "name": "Lo-fi Hip Hop 80 BPM",
+      "genre": "Hiphop/RnB",
+      "prompt": "lofi hip hop, 80 BPM, dusty drums, mellow piano, vinyl crackle, chill, study beat",
+      "params": {
+        "omega_scale": 10.0,
+        "guidance_interval": 0.5,
+        "guidance_interval_decay": 0.0,
+        "min_guidance_scale": 3.0,
+        "use_erg_tag": true,
+        "use_erg_diffusion": true,
+        "guidance_scale_text": 5.0,
+        "oss_steps": [],
+        "guidance_scale_lyric": 0.5,
+        "use_erg_lyric": false
+      },
+      "negative_prompt": "background noise, distortion"
+    },
+    {
+      "name": "Rock Anthem 140 BPM",
+      "genre": "Rock",
+      "prompt": "rock, hard rock, alternative rock, 140 BPM, clear male vocal, powerful voice, energetic, distorted electric guitars, bass, clean mix, drums, anthem, stadium, crowd chants",
+      "params": {
+        "audio_duration": 100,
+        "infer_step": 65,
+        "guidance_scale": 4.0,
+        "scheduler_type": "euler",
+        "cfg_type": "apg",
+        "omega_scale": 10.0,
+        "guidance_interval": 0.5,
+        "guidance_interval_decay": 0.0,
+        "min_guidance_scale": 3.0,
+        "use_erg_tag": true,
+        "use_erg_diffusion": true,
+        "guidance_scale_text": 5.0,
+        "oss_steps": [],
+        "guidance_scale_lyric": 2.5,
+        "use_erg_lyric": true
+      },
+      "negative_prompt": "background noise, distortion"
+    },
+    {
+      "name": "Heavy Metal 160 BPM",
+      "genre": "Rock",
+      "prompt": "metal, heavy metal, 160 BPM, aggressive male vocal, harsh vocal, distorted rhythm guitars, driving bass, clean mix, double kick drums, intense, dark, energetic",
+      "params": {
+        "audio_duration": 100,
+        "infer_step": 65,
+        "guidance_scale": 4.0,
+        "scheduler_type": "euler",
+        "cfg_type": "apg",
+        "omega_scale": 10.0,
+        "guidance_interval": 0.5,
+        "guidance_interval_decay": 0.0,
+        "min_guidance_scale": 3.0,
+        "use_erg_tag": true,
+        "use_erg_diffusion": true,
+        "guidance_scale_text": 5.0,
+        "oss_steps": [],
+        "guidance_scale_lyric": 2.5,
+        "use_erg_lyric": true
+      },
+      "negative_prompt": "background noise, distortion"
+    },
+    {
+      "name": "Modern Pop",
+      "genre": "Other",
+      "prompt": "pop, bright synths, punchy drums, electric guitar, 120 BPM, upbeat, catchy, energetic, female lead vocal, polished studio sound",
+      "params": {
+        "omega_scale": 10.0,
+        "guidance_interval": 0.5,
+        "guidance_interval_decay": 0.0,
+        "min_guidance_scale": 3.0,
+        "use_erg_tag": true,
+        "use_erg_diffusion": true,
+        "guidance_scale_text": 5.0,
+        "oss_steps": [],
+        "guidance_scale_lyric": 2.5,
+        "use_erg_lyric": true
+      },
+      "negative_prompt": "background noise, distortion"
+    },
+    {
+      "name": "Rock",
+      "genre": "Rock",
+      "prompt": "rock, distorted electric guitars, live drums, bass, clean mix guitar, 130 BPM, loud, gritty, rebellious, male vocal, raw performance",
+      "params": {
+        "omega_scale": 10.0,
+        "guidance_interval": 0.5,
+        "guidance_interval_decay": 0.0,
+        "min_guidance_scale": 3.0,
+        "use_erg_tag": true,
+        "use_erg_diffusion": true,
+        "guidance_scale_text": 5.0,
+        "oss_steps": [],
+        "guidance_scale_lyric": 2.5,
+        "use_erg_lyric": true
+      },
+      "negative_prompt": "background noise, distortion"
+    },
+    {
+      "name": "Hip Hop / Trap",
+      "genre": "Hiphop/RnB",
+      "prompt": "hip hop, 808 bass, clean mix, sharp hi-hats, trap drums, atmospheric synths, 90 BPM, urban, swagger, rhythmic rap vocal, punchy mix",
+      "params": {
+        "omega_scale": 10.0,
+        "guidance_interval": 0.5,
+        "guidance_interval_decay": 0.0,
+        "min_guidance_scale": 3.0,
+        "use_erg_tag": true,
+        "use_erg_diffusion": true,
+        "guidance_scale_text": 5.0,
+        "oss_steps": [],
+        "guidance_scale_lyric": 2.5,
+        "use_erg_lyric": true
+      },
+      "negative_prompt": "background noise, distortion"
+    },
+    {
+      "name": "R&B",
+      "genre": "Hiphop/RnB",
+      "prompt": "r&b, warm synths, deep bass, clean mix, smooth drums, 85 BPM, sultry, groovy, romantic, female vocal, silky melismas",
+      "params": {
+        "omega_scale": 10.0,
+        "guidance_interval": 0.5,
+        "guidance_interval_decay": 0.0,
+        "min_guidance_scale": 3.0,
+        "use_erg_tag": true,
+        "use_erg_diffusion": true,
+        "guidance_scale_text": 5.0,
+        "oss_steps": [],
+        "guidance_scale_lyric": 2.5,
+        "use_erg_lyric": true
+      },
+      "negative_prompt": "background noise, distortion"
+    },
+    {
+      "name": "Country",
+      "genre": "Other",
+      "prompt": "country, acoustic guitar, steel guitar, fiddle, gentle drums, 100 BPM, heartfelt, rustic, warm, male vocal, storytelling style",
+      "params": {
+        "omega_scale": 10.0,
+        "guidance_interval": 0.5,
+        "guidance_interval_decay": 0.0,
+        "min_guidance_scale": 3.0,
+        "use_erg_tag": true,
+        "use_erg_diffusion": true,
+        "guidance_scale_text": 5.0,
+        "oss_steps": [],
+        "guidance_scale_lyric": 2.5,
+        "use_erg_lyric": true
+      },
+      "negative_prompt": "background noise, distortion"
+    },
+    {
+      "name": "Reggae",
+      "genre": "Other",
+      "prompt": "reggae, off-beat guitar skank, bass, clean mix and drums, 80 BPM, relaxed, soulful, positive, male vocal, smooth delivery",
+      "params": {
+        "omega_scale": 10.0,
+        "guidance_interval": 0.5,
+        "guidance_interval_decay": 0.0,
+        "min_guidance_scale": 3.0,
+        "use_erg_tag": true,
+        "use_erg_diffusion": true,
+        "guidance_scale_text": 5.0,
+        "oss_steps": [],
+        "guidance_scale_lyric": 2.5,
+        "use_erg_lyric": true
+      },
+      "negative_prompt": "background noise, distortion"
+    },
+    {
+      "name": "EDM (Big-room / festival)",
+      "genre": "EDM",
+      "prompt": "edm, supersaw synth leads, sidechained pads, heavy kick, sub bass, clean mix, 128 BPM, euphoric, anthemic, festival, mostly instrumental with chopped vocal",
+      "params": {
+        "audio_duration": 100,
+        "infer_step": 65,
+        "guidance_scale": 4.0,
+        "scheduler_type": "euler",
+        "cfg_type": "apg",
+        "omega_scale": 10.0,
+        "guidance_interval": 0.5,
+        "guidance_interval_decay": 0.0,
+        "min_guidance_scale": 3.0,
+        "use_erg_tag": true,
+        "use_erg_diffusion": true,
+        "guidance_scale_text": 5.0,
+        "oss_steps": [],
+        "guidance_scale_lyric": 1.5,
+        "use_erg_lyric": true
+      },
+      "negative_prompt": "background noise, distortion"
+    },
+    {
+      "name": "Techno",
+      "genre": "EDM",
+      "prompt": "techno, analog synths, rolling kick and bass, clean mix, percussion loops, 130 BPM, hypnotic, dark, industrial, long evolving build, instrumental",
+      "params": {
+        "audio_duration": 100,
+        "infer_step": 65,
+        "guidance_scale": 4.0,
+        "scheduler_type": "euler",
+        "cfg_type": "apg",
+        "omega_scale": 10.0,
+        "guidance_interval": 0.5,
+        "guidance_interval_decay": 0.0,
+        "min_guidance_scale": 3.0,
+        "use_erg_tag": true,
+        "use_erg_diffusion": true,
+        "guidance_scale_text": 5.0,
+        "oss_steps": [],
+        "guidance_scale_lyric": 0.0,
+        "use_erg_lyric": false
+      },
+      "negative_prompt": "background noise, distortion"
+    },
+    {
+      "name": "Melodic Techno",
+      "genre": "EDM",
+      "prompt": "melodic techno, emotional synth arpeggios, deep kick, warm bass, clean mix, atmospheric pads, 126 BPM, cinematic, melancholic, club, sparse processed female vocal",
+      "params": {
+        "audio_duration": 100,
+        "infer_step": 65,
+        "guidance_scale": 4.0,
+        "scheduler_type": "euler",
+        "cfg_type": "apg",
+        "omega_scale": 10.0,
+        "guidance_interval": 0.5,
+        "guidance_interval_decay": 0.0,
+        "min_guidance_scale": 3.0,
+        "use_erg_tag": true,
+        "use_erg_diffusion": true,
+        "guidance_scale_text": 5.0,
+        "oss_steps": [],
+        "guidance_scale_lyric": 1.5,
+        "use_erg_lyric": true
+      },
+      "negative_prompt": "background noise, distortion"
+    },
+    {
+      "name": "Deep House",
+      "genre": "EDM",
+      "prompt": "deep house, smooth electric piano, muted bass, clean mix, soft kick and claps, 122 BPM, groovy, laid-back, lounge, subtle soulful vocal ad-libs",
+      "params": {
+        "audio_duration": 100,
+        "infer_step": 65,
+        "guidance_scale": 5.5,
+        "scheduler_type": "euler",
+        "cfg_type": "apg",
+        "omega_scale": 10.0,
+        "guidance_interval": 0.5,
+        "guidance_interval_decay": 0.0,
+        "min_guidance_scale": 3.0,
+        "use_erg_tag": true,
+        "use_erg_diffusion": true,
+        "guidance_scale_text": 4.0,
+        "oss_steps": [],
+        "guidance_scale_lyric": 1.5,
+        "use_erg_lyric": true
+      },
+      "negative_prompt": "background noise, distortion"
+    },
+    {
+      "name": "Progressive House",
+      "genre": "EDM",
+      "prompt": "progressive house, layered synth chords, pluck leads, sidechained pads, 126 BPM, uplifting, evolving, festival, wide stereo, occasional vocal hooks",
+      "params": {
+        "audio_duration": 100,
+        "infer_step": 65,
+        "guidance_scale": 5.0,
+        "scheduler_type": "euler",
+        "cfg_type": "apg",
+        "omega_scale": 10.0,
+        "guidance_interval": 0.5,
+        "guidance_interval_decay": 0.0,
+        "min_guidance_scale": 3.0,
+        "use_erg_tag": true,
+        "use_erg_diffusion": true,
+        "guidance_scale_text": 5.0,
+        "oss_steps": [],
+        "guidance_scale_lyric": 1.5,
+        "use_erg_lyric": true
+      },
+      "negative_prompt": "background noise, distortion"
+    },
+    {
+      "name": "Drum & bass 2",
+      "genre": "EDM",
+      "prompt": "drum and bass, clean mix, breakbeat drums, rolling sub bass, clean mix, reese bass, clean mix, sharp snares, 172 BPM, high energy, futuristic, club, occasional chopped vocal",
+      "params": {
+        "omega_scale": 10.0,
+        "guidance_interval": 0.5,
+        "guidance_interval_decay": 0.0,
+        "min_guidance_scale": 3.0,
+        "use_erg_tag": true,
+        "use_erg_diffusion": true,
+        "guidance_scale_text": 5.0,
+        "oss_steps": [],
+        "guidance_scale_lyric": 1.5,
+        "use_erg_lyric": true
+      },
+      "negative_prompt": "background noise, distortion"
+    },
+    {
+      "name": "Lo-fi / Chillhop",
+      "genre": "Hiphop/RnB",
+      "prompt": "lo-fi hip hop, dusty drums, vinyl crackle, mellow electric piano, soft bass, clean mix, 80 BPM, nostalgic, relaxed, study vibe, mostly instrumental",
+      "params": {
+        "omega_scale": 10.0,
+        "guidance_interval": 0.5,
+        "guidance_interval_decay": 0.0,
+        "min_guidance_scale": 3.0,
+        "use_erg_tag": true,
+        "use_erg_diffusion": true,
+        "guidance_scale_text": 5.0,
+        "oss_steps": [],
+        "guidance_scale_lyric": 1.5,
+        "use_erg_lyric": true
+      },
+      "negative_prompt": "background noise, distortion"
+    },
+    {
+      "name": "Singer-Songwriter / Acoustic",
+      "genre": "Other",
+      "prompt": "acoustic pop, fingerpicked acoustic guitar, light percussion, 90 BPM, intimate, emotional, storytelling, soft breathy vocal, minimal arrangement",
+      "params": {
+        "omega_scale": 10.0,
+        "guidance_interval": 0.5,
+        "guidance_interval_decay": 0.0,
+        "min_guidance_scale": 3.0,
+        "use_erg_tag": true,
+        "use_erg_diffusion": true,
+        "guidance_scale_text": 5.0,
+        "oss_steps": [],
+        "guidance_scale_lyric": 2.5,
+        "use_erg_lyric": true
+      },
+      "negative_prompt": "background noise, distortion"
+    },
+    {
+      "name": "Jazz (small combo)",
+      "genre": "Other",
+      "prompt": "jazz, saxophone lead, piano, double bass, clean mix, brushed drums, 110 BPM, smooth, improvisational, smoky club ambience, male crooner vocal",
+      "params": {
+        "omega_scale": 10.0,
+        "guidance_interval": 0.5,
+        "guidance_interval_decay": 0.0,
+        "min_guidance_scale": 3.0,
+        "use_erg_tag": true,
+        "use_erg_diffusion": true,
+        "guidance_scale_text": 5.0,
+        "oss_steps": [],
+        "guidance_scale_lyric": 2.5,
+        "use_erg_lyric": true
+      },
+      "negative_prompt": "background noise, distortion"
+    },
+    {
+      "name": "Jazz (instrumental / solo)",
+      "genre": "Other",
+      "prompt": "jazz, piano trio, acoustic piano, upright bass, clean mix, drums, 110 BPM, expressive, swing feel, instrumental improvisation",
+      "params": {
+        "omega_scale": 10.0,
+        "guidance_interval": 0.5,
+        "guidance_interval_decay": 0.0,
+        "min_guidance_scale": 3.0,
+        "use_erg_tag": true,
+        "use_erg_diffusion": true,
+        "guidance_scale_text": 5.0,
+        "oss_steps": [],
+        "guidance_scale_lyric": 0.0,
+        "use_erg_lyric": false
+      },
+      "negative_prompt": "background noise, distortion"
+    },
+    {
+      "name": "Classical / Orchestral",
+      "genre": "Other",
+      "prompt": "orchestral, full strings, woodwinds, brass, timpani, 60 BPM, cinematic, emotional, wide dynamic range, instrumental, film score style",
+      "params": {
+        "omega_scale": 10.0,
+        "guidance_interval": 0.5,
+        "guidance_interval_decay": 0.0,
+        "min_guidance_scale": 3.0,
+        "use_erg_tag": true,
+        "use_erg_diffusion": true,
+        "guidance_scale_text": 5.0,
+        "oss_steps": [],
+        "guidance_scale_lyric": 0.0,
+        "use_erg_lyric": false
+      },
+      "negative_prompt": "background noise, distortion"
+    },
+    {
+      "name": "Piano Solo",
+      "genre": "Other",
+      "prompt": "classical piano, solo grand piano, 70 BPM, expressive, romantic, spacious hall reverb, instrumental, delicate dynamics",
+      "params": {
+        "omega_scale": 10.0,
+        "guidance_interval": 0.5,
+        "guidance_interval_decay": 0.0,
+        "min_guidance_scale": 3.0,
+        "use_erg_tag": true,
+        "use_erg_diffusion": true,
+        "guidance_scale_text": 5.0,
+        "oss_steps": [],
+        "guidance_scale_lyric": 0.0,
+        "use_erg_lyric": false
+      },
+      "negative_prompt": "background noise, distortion"
+    },
+    {
+      "name": "Metal",
+      "genre": "Rock",
+      "prompt": "metal, heavily distorted electric guitars, double-kick drums, bass, clean mix guitar, 160 BPM, aggressive, intense, heavy, male screamed and shouted vocals",
+      "params": {
+        "omega_scale": 10.0,
+        "guidance_interval": 0.5,
+        "guidance_interval_decay": 0.0,
+        "min_guidance_scale": 3.0,
+        "use_erg_tag": true,
+        "use_erg_diffusion": true,
+        "guidance_scale_text": 5.0,
+        "oss_steps": [],
+        "guidance_scale_lyric": 2.5,
+        "use_erg_lyric": true
+      },
+      "negative_prompt": "background noise, distortion"
+    },
+    {
+      "name": "Pop-Punk / Emo Rock",
+      "genre": "Rock",
+      "prompt": "pop punk, crunchy guitars, fast drums, 160 BPM, energetic, emotional, anthemic, male vocal, shout-along choruses",
+      "params": {
+        "omega_scale": 10.0,
+        "guidance_interval": 0.5,
+        "guidance_interval_decay": 0.0,
+        "min_guidance_scale": 3.0,
+        "use_erg_tag": true,
+        "use_erg_diffusion": true,
+        "guidance_scale_text": 5.0,
+        "oss_steps": [],
+        "guidance_scale_lyric": 2.5,
+        "use_erg_lyric": true
+      },
+      "negative_prompt": "background noise, distortion"
+    },
+    {
+      "name": "Afrobeats",
+      "genre": "Hiphop/RnB",
+      "prompt": "afrobeats, syncopated drums, percussive groove, plucky guitars, warm bass, clean mix, 105 BPM, danceable, sunny, afro-fusion, melodic male and female vocals",
+      "params": {
+        "omega_scale": 10.0,
+        "guidance_interval": 0.5,
+        "guidance_interval_decay": 0.0,
+        "min_guidance_scale": 3.0,
+        "use_erg_tag": true,
+        "use_erg_diffusion": true,
+        "guidance_scale_text": 5.0,
+        "oss_steps": [],
+        "guidance_scale_lyric": 2.5,
+        "use_erg_lyric": true
+      },
+      "negative_prompt": "background noise, distortion"
+    },
+    {
+      "name": "Latin Pop / Reggaeton-ish",
+      "genre": "Hiphop/RnB",
+      "prompt": "latin pop, reggaeton rhythm, deep sub bass, clean mix, bright synths, 96 BPM, sexy, club, spanish-influenced vocals, catchy chorus",
+      "params": {
+        "omega_scale": 10.0,
+        "guidance_interval": 0.5,
+        "guidance_interval_decay": 0.0,
+        "min_guidance_scale": 3.0,
+        "use_erg_tag": true,
+        "use_erg_diffusion": true,
+        "guidance_scale_text": 5.0,
+        "oss_steps": [],
+        "guidance_scale_lyric": 2.5,
+        "use_erg_lyric": true
+      },
+      "negative_prompt": "background noise, distortion"
+    },
+    {
+      "name": "Ambient / Atmosphere",
+      "genre": "Other",
+      "prompt": "ambient, evolving pads, soft drones, sparse piano, no drums, 60 BPM or slower, dreamy, spacious, cinematic, instrumental soundscape",
+      "params": {
+        "omega_scale": 10.0,
+        "guidance_interval": 0.5,
+        "guidance_interval_decay": 0.25,
+        "min_guidance_scale": 2.0,
+        "use_erg_tag": true,
+        "use_erg_diffusion": true,
+        "guidance_scale_text": 4.0,
+        "oss_steps": [],
+        "guidance_scale_lyric": 0.0,
+        "use_erg_lyric": false
+      },
+      "negative_prompt": "background noise, distortion"
+    },
+    {
+      "name": "Cinematic Trailer",
+      "genre": "Other",
+      "prompt": "epic trailer music, hybrid orchestra, big percussion, braams, 80 BPM, dramatic, tension, heroic, rises and hits, mostly instrumental choir accents",
+      "params": {
+        "omega_scale": 10.0,
+        "guidance_interval": 0.5,
+        "guidance_interval_decay": 0.15,
+        "min_guidance_scale": 2.5,
+        "use_erg_tag": true,
+        "use_erg_diffusion": true,
+        "guidance_scale_text": 5.0,
+        "oss_steps": [],
+        "guidance_scale_lyric": 1.5,
+        "use_erg_lyric": true
+      },
+      "negative_prompt": "background noise, distortion"
+    }
+  ],
+  "favorites": [
+    "Heavy Metal 160 BPM"
+  ]
+}

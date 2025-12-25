@@ -1,0 +1,12 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" width="48" height="48" viewBox="0 0 48 48" role="img" aria-label="Interpolation">
+  <g fill="none" stroke="#ffffff" stroke-width="2.6" stroke-linecap="round" stroke-linejoin="round">
+
+    <rect x="12" y="16" width="10" height="16" rx="3.5"/>
+    <rect x="26" y="16" width="10" height="16" rx="3.5"/>
+    <path d="M22.5 24h3"/>
+    <path d="M23.5 24l-1.6-1.6"/>
+    <path d="M23.5 24l-1.6 1.6"/>
+
+  </g>
+</svg>

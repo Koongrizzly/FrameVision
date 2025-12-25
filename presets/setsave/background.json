@@ -1,0 +1,37 @@
+{
+  "last_state": {
+    "engine": "modnet",
+    "mode": "keep_subject",
+    "threshold": 0,
+    "feather": 3,
+    "bias": 50,
+    "spill": true,
+    "invert": false,
+    "auto_level": true,
+    "repl_mode": "transparent",
+    "repl_color": [
+      255,
+      255,
+      255
+    ],
+    "repl_blur": 20,
+    "repl_image": null,
+    "drop_shadow": false,
+    "shadow_alpha": 120,
+    "shadow_blur": 20,
+    "shadow_offx": 10,
+    "shadow_offy": 10,
+    "anti_halo": true,
+    "overlay": 50,
+    "out_dir": "C:\\FrameVision-1.0.6\\output\\images",
+    "sd_prompt": "clean background, realistic",
+    "sd_negative": "blurry, artifacts, distortion, text, watermark",
+    "sd_steps": 30,
+    "sd_guidance": 7.0,
+    "sd_strength": 0.85,
+    "sd_seed": -1,
+    "sd_model": "C:\\FrameVision-1.0.6\\models\\bg\\sd-v1-5-inpainting.safetensors",
+    "sd_auto_bg": false
+  },
+  "out_dir": "C:\\FrameVision-1.0.6\\output\\images"
+}
