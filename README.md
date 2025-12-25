@@ -227,13 +227,13 @@ FrameVision feature list
 Run **`framevision.exe`** — it automatically:
 1. Opens the installer menu if setup is incomplete. (give 1 time approval in windows to use an unknown app)
 2. select 'check requirements' if you never installed something A.i. related before to have environment, git, python,... installed
-3. This app is mainly created for RTX Nvidea users but an option for cpu install is also included (expect big models to not work or take forever to creae a video or image)
+3. This app is mainly created for RTX Nvidea users but an option for cpu install is also included (expect big models to not work or take forever to create a video or image)
 4. After install it starts the app and background worker. (keep the background worker open when using queue)
 5. select an optional install in the app (optional downloads menu) to get the model(s) you need (wan 2.2, hunyuan, z-image,..)
 
 ### Installer Menu Options
 - 1 **check requirements** + basic 'first time ai' installer.
-- 2 **Core Install:** App only (minimal).use this if app stops woreking after install to get a quick reset
+- 2 **Core Install:** App only (minimal).use this if app stops working after install to get a quick reset
 - 3 **Full CPU Install:** Torch CPU + models/binaries.
 - 4 **Full CUDA Install:** Torch CUDA + models/binaries.
 ---
