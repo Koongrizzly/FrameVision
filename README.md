@@ -87,7 +87,7 @@
 
 <details>
   <summary>December 1, 2025 — v2.0 full release notes</summary>
-December 1, 2025 V2.0 is finally ready
+December 01, 2025 V2.0 is finally ready
 
   ### 🌟 Release Notes
 
