@@ -38,9 +38,9 @@
 
 **🎨 UI Improvements**
 
-- Music video creator beat-synced visuals now come with a preview thumbnail, i included a thumbnail pack lso (to avoid long wait at first time use)
-- Repeat button for video files (shows u when a video file is loaded, hides again when images are loaded)
-- Right mouse button in queue for running & pendingget a couple of options (cancel running job, move back to pending, delete job from pending, show JSON info)
+- Music video creator beat-synced visuals now come with a preview thumbnail, i included ready thumbnail pack (to avoid long wait at first time use)
+- Repeat button for video files (shows up when a video file is loaded, hides again when images are loaded, music player already has it's own repeat features)
+- Right mouse button in queue for running & pending get a couple of options (cancel running job, move back to pending, delete job from pending, show JSON info)
 - Prompt enhancers directly under prompt box in WAN 2.2 / Hunyuan 1.5 & Z-image / SDXL
 - Wheel guard: avoids accidentally changing settings while scrolling over something with mouse
 - Reorder tabs & tools (upscaling, Rife, Qwen describe, background remover and Ace Music now are in tools tab)
