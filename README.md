@@ -213,41 +213,42 @@ FrameVision feature list
 - Change speed for videos (with audio sync).
 - Prompt enhancer (Qwen3VL)
 - Reverse video / boomerang
-- Thumbnail/meme creator
+- Thumbnail/meme creator for easy adding text with effects to an image
 - Sound edit (mini audacity)
-- sound mixer
+- sound mixer for adding extra sound to video
 - Resize image/video 
-- Create Gif files :2 sections : use currently playing video or load images from a folder
+- Create Gif files : 2 sections -> use currently playing video or load images from a folder
 - Extract/join frames
-- Trim videos
+- Trim videos with preview
 - Crop videos/images
-- Multi rename/replace 
+- Multi rename/replace filenames
 - Metadata editor/remover
-### All kinds of extra's i forgot to mention such as random 'open app' screens with visual overlays or 20+ themes.
+### All kinds of extra's i forgot to mention such as a file menu with recents/favorites/converter, many random 'open app' screens with visual overlays, 20+ themes, an in app updater (to latest stable release or to latest files on github), a huge Knowledge base with q&a etc etc.
 ---
 
 ## 🛠 Installation
 Run **`framevision.exe`** — it automatically:
-1. Opens the installer menu if setup is incomplete. (give approval to windows to use unknown app)
-2. Repairs missing components (like `psutil`).
-3. Starts the app and background worker. (keep the background worker open when using queue)
+1. Opens the installer menu if setup is incomplete. (give 1 time approval in windows to use an unknown app)
+2. select 'check requirements' if you never installed something A.i. related before to have environment, git, python,... installed
+3. This app is mainly created for RTX Nvidea users but an option for cpu install is also included (expect big models to not work or take forever to creae a video or image)
+4. After install it starts the app and background worker. (keep the background worker open when using queue)
+5. select an optional install in the app (optional downloads menu) to get the model(s) you need (wan 2.2, hunyuan, z-image,..)
 
 ### Installer Menu Options
 - 1 **check requirements** + basic 'first time ai' installer.
-- 2 **Core Install:** App only (minimal).
+- 2 **Core Install:** App only (minimal).use this if app stops woreking after install to get a quick reset
 - 3 **Full CPU Install:** Torch CPU + models/binaries.
 - 4 **Full CUDA Install:** Torch CUDA + models/binaries.
 ---
-Portable & offline
+User friendly, Portable & offline
 (install must go to c:\framevision-main, once everything is installed no more internet is needed and you can move the folder to any other location on the drive.
-One click install tries to make everything work out of the box (git, python, environment..) even for 'new to ai' users (Z-image gguf models may need ectra install : visual studio when you get error of missing dll files.
+One click install tries to make everything work out of the box (git, python, environment..) even for 'new to ai' users (Z-image gguf models may need extra install of visual studio (when you get error of missing dll files.)
 Tooltips everywhere (can be turned of in settings tab)
-Draggable middle splitter & swap ui to make the app look the way user wants
+Draggable middle splitter & swap ui to make the app look the way user wants. (Drag completely to one side to get a full screen for the tabs or the media player)
 ---
 
 ## 🤝 Contributing
-Pull requests and feature suggestions are welcome!  
-If you encounter bugs, please open an issue or use the **Bug Report** button in the app's Settings tab.
+bug reports or feature suggestions are welcome!  
 
 ---
 
