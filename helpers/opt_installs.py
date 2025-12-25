@@ -174,8 +174,8 @@ def _run_gfpgan(root: Path) -> Optional[Tuple[str, List[str], Path]]:
 
 
 def _run_hunyuan15(root: Path) -> Optional[Tuple[str, List[str], Path]]:
-    # Note: matches install_menu.bat spelling: hunuyan15_install.bat
-    script = root / "presets" / "extra_env" / "hunuyan15_install.bat"
+    # Note: matches install_menu.bat spelling: hunyuan15_install.bat
+    script = root / "presets" / "extra_env" / "hunyuan15_install.bat"
     if not script.exists():
         return None
     return _cmd_call_bat(script, root)
