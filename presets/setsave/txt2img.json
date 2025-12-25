@@ -1,11 +1,11 @@
 {
-  "prompt": "an alien in New York",
+  "prompt": "",
   "negative": "flat lighting, cartoonish,",
   "seed": 92061456,
   "seed_policy": "random",
   "batch": 1,
-  "width": 1536,
-  "height": 864,
+  "width": 1280,
+  "height": 720,
   "steps": 8,
   "cfg_scale": 5.0,
   "sampler": "UniPC",
@@ -31,7 +31,5 @@
   "qwen_cli_template": "qwen_image --model \"{model}\" --prompt \"{prompt}\" --negative \"{neg}\" --w {w} --h {h} --steps {steps} --seed {seed} --out \"{out}\"",
   "preset": "Cinematic / Moody",
   "preset_index": 2,
-  "recents_thumb_size": 100,
-  "recents_sort": "newest",
-  "size_preset_index": 20
+  "size_preset_index": 19
 }
