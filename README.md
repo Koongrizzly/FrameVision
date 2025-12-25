@@ -23,18 +23,18 @@
   - Aspect ratio for all resolutions (192p–720p): 1:1 / 16:9 / 9:16
 - Media explorer tab
   - Replaces the buggy “last result” screens from every model,
-  - Most tools now have a 'view results' button which will open the folder, scan for json files and show all results in the media folder.
+  - Most tools now have a 'view results' button which will open the folder, scan for json files and show all results in the media explorer.
   - Double click plays them in the app multi mediaplayer, right click give extra options such as :
-  - Search/sort/play/preview/cut/copy/paste/delete/rename/favorite
-  - User can scan any folder + subfolders and scan directly or open tree view and select folder.
-  - adds a 'view results' button with the tools that auto scans their folder in the media explorer when clicked
+  - Search/sort/play/preview/cut/copy/paste/delete/rename/favorite+...
+  - User can scan any folder + subfolders (or open basic tree view) (Huge drives with video can take longtime)
 - Z-Image Turbo GGUF Model loader
   - Get FP16 or a GGuf variant for the Z-image Turbo image creator
   - use them in a model loader, queue allows combining any model
   - Q4–Q8 variants allow fast image creation on virtually any VRAM
+  - may give an error for missing dll on some computers, popup will point to windows file for install of visual studio
 - Optional downloads
   - a new menu for optional installs (moved from the installer into a new part of the app, so user can decide later what to install
-  - Currently includes : Z-image fp16 + gguf model downloader, Hunyuanvideo 1.5, wan2.2 5b, a model for SDXL, background/inpaint models, ace step music and a face restorer These are no longer installed with the app by default and can be installed in here
+  - Currently includes : Z-image fp16 + gguf model downloader, Hunyuanvideo 1.5, wan2.2 5b, a model for SDXL, background/inpaint models, ace step music and a face restorer These are no longer installed with the app by default and can be skipped/installed in here to save time on first time install of the app
 
 **🎨 UI Improvements**
 
