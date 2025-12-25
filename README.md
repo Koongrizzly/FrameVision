@@ -5,8 +5,6 @@
 <details>
   <summary>December 25, 2025 — v2.1 release notes</summary>
 
-  **December 25 2025 V2.1**
-  
 **✨ New Features**
 
 - Music Videoclip Creator
@@ -37,7 +35,7 @@
 - Optional downloads
   - a new menu for optional installs (moved from the installer into a new part of the app, so user can decide later what to install
   - Currently includes : Z-image fp16 + gguf model downloader, Hunyuanvideo 1.5, wan2.2 5b, a model for SDXL, background/inpaint models, ace step music and a face restorer These are no longer installed with the app by default and can be installed in here
----
+
 **🎨 UI Improvements**
 
 - Music video creator beat-synced visuals now come with a preview thumbnail, i included a thumbnail pack lso (to avoid long wait at first time use)
@@ -49,7 +47,6 @@
 - Settings have a new toggle that allows reordering the main tabs, Tools tab also gets a reorder toggle.
 - HUD now also shows internet traffic up/down (when above 50kb/s) to be able to follow 'silent downloads' of some models 
 
----
 **✅ Bugfixes**
 
 - Z-image
@@ -87,14 +84,16 @@
 - Misc
   - Fixed a bug in one of the easter eggs
 </details>
+
 <details>
   <summary>December 1, 2025 — v2.0 full release notes</summary>
 December 1, 2025 V2.0 is finally ready
-### 🌟 Release Notes
----
+
+  ### 🌟 Release Notes
+
 **🧩 NEW Features**
----
-_Music Video Clip Creator_
+
+Music Video Clip Creator_
 - [ ] Works with every CPU or Gpu.
 - [ ] Load one or multiple clips and/or images, add your music track, and create a complete music video in a couple of minutes*.
 - [ ] Three settings for FX intensity or FX OFF (only hardcuts).
@@ -154,7 +153,6 @@ _Ace Music creation_
 - [ ] Recents list with Play/Delete options.
 - [ ] Various fine-tuning controls.
 
-
 ### Audio Edit – mini Audacity-style editor
 
 - [ ] Basic tool to edit sound files
@@ -191,8 +189,9 @@ _Metadata Tool_ – edit or delete metadata from videos and images (with batch s
 - [ ] RIFE fixed for systems without FFmpeg on PATH.
 - [ ] Frame Extractor fix – proper saving for single and batch modes.
 </details>
+
 ---
-FrameVision All in one sound/image/video tool feature list
+FrameVision feature list
 ---
 ### 🎵 (music) videoclip creator
 ### 🧪 Upscaler with model loader (15+ open source upscale models for photo & video)
@@ -210,7 +209,6 @@ FrameVision All in one sound/image/video tool feature list
 ### 🕹️ EASTER EGGS : use the app to unlock them
 ### 📺 in app resizable Multi media player
 ### 🎶 Music player with playlist & 250+ beat synced visuals
-### All kinds of extra's i forgot to mention such as random 'open app' screens with visual overlays or 20+ themes.
 ### 🧰 Other Tools
 - Change speed for videos (with audio sync).
 - Prompt enhancer (Qwen3VL)
@@ -225,6 +223,7 @@ FrameVision All in one sound/image/video tool feature list
 - Crop videos/images
 - Multi rename/replace 
 - Metadata editor/remover
+### All kinds of extra's i forgot to mention such as random 'open app' screens with visual overlays or 20+ themes.
 ---
 
 ## 🛠 Installation
