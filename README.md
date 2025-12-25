@@ -86,11 +86,8 @@
 </details>
 
 <details>
-  <summary>December 1, 2025 — v2.0 full release notes</summary>
-December 01, 2025 V2.0 is finally ready
-
-  ### 🌟 Release Notes
-
+  <summary>December 01, 2025 — v2.0 full release notes</summary>
+  
 **🧩 NEW Features**
 
 Music Video Clip Creator_
