@@ -1887,30 +1887,7 @@ def install_background_tool(pane, section_widget) -> None:
     scroll_body = QWidget()
     vbox = QVBoxLayout(scroll_body)
     scroll.setWidget(scroll_body)
-    # --- Fancy banner at the top ---
-    banner = QLabel('Remove Background & inpaint with sd15')
-    banner.setObjectName('bgBanner')
-    banner.setAlignment(Qt.AlignCenter)
-    banner.setFixedHeight(46)
-    banner.setStyleSheet(
-        "#bgBanner {"
-        " font-size: 15px;"
-        " font-weight: 600;"
-        " padding: 8px 17px;"
-        " border-radius: 12px;"
-        " margin: 0 0 6px 0;"
-        " color: white;"
-        " background: qlineargradient("
-        "   x1:0, y1:0, x2:1, y2:0,"
-        "   stop:0 #cd28ff,"
-        "   stop:0.5 #9f4df2,"
-        "   stop:1 #28ffbb"
-        " );"
-        " letter-spacing: 0.5px;"
-        "}"
-    )
-    outer_vbox.addWidget(banner)
-    outer_vbox.addSpacing(4)
+
     outer_vbox.addWidget(scroll, stretch=1)
 
     preview = Preview()

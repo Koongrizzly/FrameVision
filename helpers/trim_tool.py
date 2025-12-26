@@ -183,6 +183,10 @@ class TrimPreviewWorker(QObject):
             if p is not None:
                 try:
                     p.terminate()
+                    try:
+                        p.kill()
+                    except Exception:
+                        pass
                 except Exception:
                     pass
         except Exception:
@@ -222,23 +226,43 @@ class TrimPreviewWorker(QObject):
                     break
                 outp = self.out_dir / f"th_{t_ms:08d}.jpg"
                 cmd = [
-                    str(ffm), "-nostdin", "-y",
+                    str(ffm),
+                    "-hide_banner",
+                    "-loglevel", "error",
+                    "-nostdin", "-y",
+                    # Force software decode for stability on some Windows builds that otherwise
+                    # use a hardware frames context and can fail on large / long H.264 files.
+                    "-hwaccel", "none",
+                    "-threads", "1",
                     "-ss", f"{t:.3f}",
                     "-i", str(self.input_path),
+                    "-an", "-sn", "-dn",
                     "-frames:v", "1",
                     "-vf", f"scale=-2:{self.thumb_max_h}",
                     "-q:v", "4",
                     str(outp)
                 ]
+                stderr_txt = ""
                 try:
-                    self._proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-                    rc = self._proc.wait()
+                    # Capture stderr so we can show a meaningful error if ffmpeg fails.
+                    self._proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+                    _out_b, _err_b = self._proc.communicate()
+                    rc = int(self._proc.returncode or 0)
+                    err_b = _err_b or b""
+                    stderr_txt = err_b.decode(errors="ignore").strip()
                 finally:
                     self._proc = None
                 if self._cancel:
                     canceled = True
                     break
-                if rc == 0 and outp.exists():
+                if rc != 0:
+                    # Stop on first ffmpeg error (usually indicates decode/IO issues).
+                    if stderr_txt:
+                        err = f"ffmpeg failed generating preview thumbnail at {_fmt_ms(int(t_ms))}:\n{stderr_txt}"
+                    else:
+                        err = f"ffmpeg failed generating preview thumbnail at {_fmt_ms(int(t_ms))} (rc={rc})."
+                    break
+                if outp.exists():
                     self.thumb_ready.emit(self.run_id, int(t_ms), str(outp))
         except Exception as e:
             err = str(e)
@@ -258,8 +282,8 @@ def install_trim_tool(pane, section_widget):
     # Preview controls
     pane.btn_trim_preview = QPushButton("Generate preview")
     pane.btn_trim_preview.setToolTip("Generate / update the preview thumbnails and timeline for the loaded video. Use this after changing the thumbnail count or loading a new video.")
-    pane.trim_thumbs_spin = QSpinBox(); pane.trim_thumbs_spin.setRange(6, 60); pane.trim_thumbs_spin.setValue(12); pane.trim_thumbs_spin.setSuffix(" thumbs")
-    pane.trim_thumbs_spin.setToolTip("How many thumbnails to generate for the preview strip. After changing this number, press \"Generate preview\" to rebuild.")
+    pane.trim_thumbs_spin = QSpinBox(); pane.trim_thumbs_spin.setRange(6, 99); pane.trim_thumbs_spin.setValue(12); pane.trim_thumbs_spin.setSuffix(" thumbs")
+    pane.trim_thumbs_spin.setToolTip("How many thumbnails to generate for the preview strip. After changing this number, YIP: don''t resize until all tiles are loaded when loading big video files.")
     pane.thumb_size = QSlider(Qt.Horizontal); pane.thumb_size.setRange(24, 140); pane.thumb_size.setValue(86)
     pane.thumb_size.setToolTip("Thumbnail display size only. This just scales the preview thumbnails visually; it does not regenerate them.")
     r2 = QHBoxLayout(); r2.addWidget(pane.btn_trim_preview); r2.addWidget(pane.trim_thumbs_spin); r2.addWidget(QLabel("Size")); r2.addWidget(pane.thumb_size)
