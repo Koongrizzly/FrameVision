@@ -1143,7 +1143,6 @@ _EMOJI_MAP = {
     "log": "📝",
     "steps": "👣",
     "folder": "🗂️",
-    "explorer": "🗂️",
     "batch": "📦",
     "info": "💡",
     "txt2img": "📸",
