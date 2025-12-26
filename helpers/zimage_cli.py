@@ -29,6 +29,8 @@ import traceback
 from pathlib import Path
 import sys
 import inspect
+import unicodedata
+import re
 
 
 def _unique_path(p: Path) -> Path:
@@ -51,6 +53,50 @@ def _unique_path(p: Path) -> Path:
 def _root_dir() -> "Path":
     # helpers/zimage_cli.py -> <root>/helpers
     return Path(__file__).resolve().parent.parent
+
+
+def _sanitize_sdcli_text(s: str) -> str:
+    """
+    sd-cli.exe (stable-diffusion.cpp) can crash in MSVC debug builds when
+    argv contains non-ASCII bytes and it uses ctype() on signed chars.
+    To keep GGUF mode stable, we sanitize prompt/negative to plain ASCII.
+    """
+    try:
+        if s is None:
+            return ""
+        s = str(s)
+
+        # Normalize common Unicode punctuation to ASCII equivalents first.
+        trans = {
+            "\u2018": "'", "\u2019": "'", "\u201a": "'", "\u201b": "'",
+            "\u2032": "'", "\u2035": "'",
+            "\u201c": '"', "\u201d": '"', "\u201e": '"', "\u201f": '"',
+            "\u00ab": '"', "\u00bb": '"',
+            "\u2013": "-", "\u2014": "-", "\u2212": "-", "\u00ad": "-",
+            "\u2026": "...",
+            "\u00a0": " ",  # nbsp
+        }
+        s = s.translate(str.maketrans(trans))
+
+        # Remove zero-width/invisible characters.
+        s = re.sub(r"[\u200B-\u200D\uFEFF]", "", s)
+
+        # Strip control chars that can confuse parsers.
+        s = s.replace("\r", " ").replace("\n", " ").replace("\t", " ")
+
+        # Best-effort transliteration to ASCII (e.g., Beyoncé -> Beyonce).
+        s = unicodedata.normalize("NFKD", s)
+        s = s.encode("ascii", "ignore").decode("ascii", "ignore")
+
+        # Collapse excessive whitespace.
+        s = re.sub(r"\s+", " ", s).strip()
+        return s
+    except Exception:
+        # Last resort: ensure we never crash the wrapper.
+        try:
+            return str(s).encode("ascii", "ignore").decode("ascii", "ignore")
+        except Exception:
+            return ""
 
 
 def _run_gguf(args) -> dict:
@@ -129,8 +175,20 @@ def _run_gguf(args) -> dict:
             fname = f"z_img_{seed}_{idx:03d}.png"
         fpath = outdir / fname
 
-        prompt = str(getattr(args, "prompt", ""))
-        neg = str(getattr(args, "negative", "") or "")
+        prompt_raw = str(getattr(args, "prompt", ""))
+        neg_raw = str(getattr(args, "negative", "") or "")
+
+        # IMPORTANT: sd-cli.exe may crash on non-ASCII text in prompts (MSVC debug assertion).
+        prompt = _sanitize_sdcli_text(prompt_raw)
+        neg = _sanitize_sdcli_text(neg_raw)
+
+        if (prompt != prompt_raw) or (neg != neg_raw):
+            try:
+                msg = "[zimage_cli][gguf] Sanitized prompt/negative to ASCII for sd-cli compatibility."
+                _log(msg)
+                print(msg, flush=True)
+            except Exception:
+                pass
         h = int(getattr(args, "height", 1024))
         w = int(getattr(args, "width", 1024))
         steps = int(getattr(args, "steps", 20))
