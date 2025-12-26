@@ -448,7 +448,7 @@ def _tool_ready_status(models_dir: str) -> Dict[str, Optional[str]]:
 
     # Ace Music — checks if ROOT/.ace_env exists
     ace_music = _exists_any([
-        os.path.join(ROOT, ".ace_env"),
+        os.path.join(ROOT, "presets", "extra_env", "ace_env"),
     ])
 
     # Z-image — checks if any folder/file matching models/z-image*.* exists
