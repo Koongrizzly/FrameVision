@@ -14,7 +14,7 @@
       "params": {
         "audio_duration": 100,
         "infer_step": 65,
-        "guidance_scale": 5.0,
+        "guidance_scale": 15.0,
         "scheduler_type": "euler",
         "cfg_type": "apg",
         "omega_scale": 10.0,
@@ -23,9 +23,9 @@
         "min_guidance_scale": 3.0,
         "use_erg_tag": true,
         "use_erg_diffusion": true,
-        "guidance_scale_text": 4.0,
+        "guidance_scale_text": 0.0,
         "oss_steps": [],
-        "guidance_scale_lyric": 0.5,
+        "guidance_scale_lyric": 0.0,
         "use_erg_lyric": false
       },
       "negative_prompt": "background noise, distortion"
@@ -37,7 +37,7 @@
       "params": {
         "audio_duration": 100,
         "infer_step": 65,
-        "guidance_scale": 5.5,
+        "guidance_scale": 15.0,
         "scheduler_type": "euler",
         "cfg_type": "apg",
         "omega_scale": 10.0,
@@ -46,9 +46,9 @@
         "min_guidance_scale": 3.0,
         "use_erg_tag": true,
         "use_erg_diffusion": true,
-        "guidance_scale_text": 4.0,
+        "guidance_scale_text": 0.0,
         "oss_steps": [],
-        "guidance_scale_lyric": 0.5,
+        "guidance_scale_lyric": 0.0,
         "use_erg_lyric": false
       },
       "negative_prompt": "background noise, distortion"
@@ -60,7 +60,7 @@
       "params": {
         "audio_duration": 100,
         "infer_step": 65,
-        "guidance_scale": 5.0,
+        "guidance_scale": 15.0,
         "scheduler_type": "euler",
         "cfg_type": "apg",
         "omega_scale": 10.0,
@@ -69,9 +69,9 @@
         "min_guidance_scale": 3.0,
         "use_erg_tag": true,
         "use_erg_diffusion": true,
-        "guidance_scale_text": 5.0,
+        "guidance_scale_text": 0.0,
         "oss_steps": [],
-        "guidance_scale_lyric": 0.5,
+        "guidance_scale_lyric": 0.0,
         "use_erg_lyric": false
       },
       "negative_prompt": "background noise, distortion"
@@ -87,10 +87,11 @@
         "min_guidance_scale": 3.0,
         "use_erg_tag": true,
         "use_erg_diffusion": true,
-        "guidance_scale_text": 5.0,
+        "guidance_scale_text": 0.0,
         "oss_steps": [],
-        "guidance_scale_lyric": 0.5,
-        "use_erg_lyric": false
+        "guidance_scale_lyric": 0.0,
+        "use_erg_lyric": false,
+        "guidance_scale": 15.0
       },
       "negative_prompt": "background noise, distortion"
     },
@@ -101,7 +102,7 @@
       "params": {
         "audio_duration": 100,
         "infer_step": 65,
-        "guidance_scale": 5.0,
+        "guidance_scale": 15.0,
         "scheduler_type": "euler",
         "cfg_type": "apg",
         "omega_scale": 10.0,
@@ -110,9 +111,9 @@
         "min_guidance_scale": 3.0,
         "use_erg_tag": true,
         "use_erg_diffusion": true,
-        "guidance_scale_text": 5.0,
+        "guidance_scale_text": 0.0,
         "oss_steps": [],
-        "guidance_scale_lyric": 0.5,
+        "guidance_scale_lyric": 0.0,
         "use_erg_lyric": false
       },
       "negative_prompt": "background noise, distortion"
@@ -296,7 +297,7 @@
       "params": {
         "audio_duration": 100,
         "infer_step": 65,
-        "guidance_scale": 4.0,
+        "guidance_scale": 15.0,
         "scheduler_type": "euler",
         "cfg_type": "apg",
         "omega_scale": 10.0,
@@ -305,10 +306,10 @@
         "min_guidance_scale": 3.0,
         "use_erg_tag": true,
         "use_erg_diffusion": true,
-        "guidance_scale_text": 5.0,
+        "guidance_scale_text": 0.0,
         "oss_steps": [],
-        "guidance_scale_lyric": 1.5,
-        "use_erg_lyric": true
+        "guidance_scale_lyric": 0.0,
+        "use_erg_lyric": false
       },
       "negative_prompt": "background noise, distortion"
     },
@@ -319,7 +320,7 @@
       "params": {
         "audio_duration": 100,
         "infer_step": 65,
-        "guidance_scale": 4.0,
+        "guidance_scale": 15.0,
         "scheduler_type": "euler",
         "cfg_type": "apg",
         "omega_scale": 10.0,
@@ -328,7 +329,7 @@
         "min_guidance_scale": 3.0,
         "use_erg_tag": true,
         "use_erg_diffusion": true,
-        "guidance_scale_text": 5.0,
+        "guidance_scale_text": 0.0,
         "oss_steps": [],
         "guidance_scale_lyric": 0.0,
         "use_erg_lyric": false
@@ -342,7 +343,7 @@
       "params": {
         "audio_duration": 100,
         "infer_step": 65,
-        "guidance_scale": 4.0,
+        "guidance_scale": 15.0,
         "scheduler_type": "euler",
         "cfg_type": "apg",
         "omega_scale": 10.0,
@@ -351,10 +352,10 @@
         "min_guidance_scale": 3.0,
         "use_erg_tag": true,
         "use_erg_diffusion": true,
-        "guidance_scale_text": 5.0,
+        "guidance_scale_text": 0.0,
         "oss_steps": [],
-        "guidance_scale_lyric": 1.5,
-        "use_erg_lyric": true
+        "guidance_scale_lyric": 0.0,
+        "use_erg_lyric": false
       },
       "negative_prompt": "background noise, distortion"
     },
@@ -365,7 +366,7 @@
       "params": {
         "audio_duration": 100,
         "infer_step": 65,
-        "guidance_scale": 5.5,
+        "guidance_scale": 15.0,
         "scheduler_type": "euler",
         "cfg_type": "apg",
         "omega_scale": 10.0,
@@ -374,10 +375,10 @@
         "min_guidance_scale": 3.0,
         "use_erg_tag": true,
         "use_erg_diffusion": true,
-        "guidance_scale_text": 4.0,
+        "guidance_scale_text": 0.0,
         "oss_steps": [],
-        "guidance_scale_lyric": 1.5,
-        "use_erg_lyric": true
+        "guidance_scale_lyric": 0.0,
+        "use_erg_lyric": false
       },
       "negative_prompt": "background noise, distortion"
     },
@@ -388,7 +389,7 @@
       "params": {
         "audio_duration": 100,
         "infer_step": 65,
-        "guidance_scale": 5.0,
+        "guidance_scale": 15.0,
         "scheduler_type": "euler",
         "cfg_type": "apg",
         "omega_scale": 10.0,
@@ -397,10 +398,10 @@
         "min_guidance_scale": 3.0,
         "use_erg_tag": true,
         "use_erg_diffusion": true,
-        "guidance_scale_text": 5.0,
+        "guidance_scale_text": 0.0,
         "oss_steps": [],
-        "guidance_scale_lyric": 1.5,
-        "use_erg_lyric": true
+        "guidance_scale_lyric": 0.0,
+        "use_erg_lyric": false
       },
       "negative_prompt": "background noise, distortion"
     },
@@ -415,10 +416,11 @@
         "min_guidance_scale": 3.0,
         "use_erg_tag": true,
         "use_erg_diffusion": true,
-        "guidance_scale_text": 5.0,
+        "guidance_scale_text": 0.0,
         "oss_steps": [],
-        "guidance_scale_lyric": 1.5,
-        "use_erg_lyric": true
+        "guidance_scale_lyric": 0.0,
+        "use_erg_lyric": false,
+        "guidance_scale": 15.0
       },
       "negative_prompt": "background noise, distortion"
     },
@@ -433,10 +435,11 @@
         "min_guidance_scale": 3.0,
         "use_erg_tag": true,
         "use_erg_diffusion": true,
-        "guidance_scale_text": 5.0,
+        "guidance_scale_text": 0.0,
         "oss_steps": [],
-        "guidance_scale_lyric": 1.5,
-        "use_erg_lyric": true
+        "guidance_scale_lyric": 0.0,
+        "use_erg_lyric": false,
+        "guidance_scale": 12.0
       },
       "negative_prompt": "background noise, distortion"
     },
@@ -487,10 +490,11 @@
         "min_guidance_scale": 3.0,
         "use_erg_tag": true,
         "use_erg_diffusion": true,
-        "guidance_scale_text": 5.0,
+        "guidance_scale_text": 0.0,
         "oss_steps": [],
         "guidance_scale_lyric": 0.0,
-        "use_erg_lyric": false
+        "use_erg_lyric": false,
+        "guidance_scale": 12.0
       },
       "negative_prompt": "background noise, distortion"
     },
@@ -505,10 +509,11 @@
         "min_guidance_scale": 3.0,
         "use_erg_tag": true,
         "use_erg_diffusion": true,
-        "guidance_scale_text": 5.0,
+        "guidance_scale_text": 0.0,
         "oss_steps": [],
         "guidance_scale_lyric": 0.0,
-        "use_erg_lyric": false
+        "use_erg_lyric": false,
+        "guidance_scale": 12.0
       },
       "negative_prompt": "background noise, distortion"
     },
@@ -523,10 +528,11 @@
         "min_guidance_scale": 3.0,
         "use_erg_tag": true,
         "use_erg_diffusion": true,
-        "guidance_scale_text": 5.0,
+        "guidance_scale_text": 0.0,
         "oss_steps": [],
         "guidance_scale_lyric": 0.0,
-        "use_erg_lyric": false
+        "use_erg_lyric": false,
+        "guidance_scale": 12.0
       },
       "negative_prompt": "background noise, distortion"
     },
@@ -613,10 +619,11 @@
         "min_guidance_scale": 2.0,
         "use_erg_tag": true,
         "use_erg_diffusion": true,
-        "guidance_scale_text": 4.0,
+        "guidance_scale_text": 0.0,
         "oss_steps": [],
         "guidance_scale_lyric": 0.0,
-        "use_erg_lyric": false
+        "use_erg_lyric": false,
+        "guidance_scale": 12.0
       },
       "negative_prompt": "background noise, distortion"
     },
@@ -631,10 +638,11 @@
         "min_guidance_scale": 2.5,
         "use_erg_tag": true,
         "use_erg_diffusion": true,
-        "guidance_scale_text": 5.0,
+        "guidance_scale_text": 0.0,
         "oss_steps": [],
-        "guidance_scale_lyric": 1.5,
-        "use_erg_lyric": true
+        "guidance_scale_lyric": 0.0,
+        "use_erg_lyric": false,
+        "guidance_scale": 12.0
       },
       "negative_prompt": "background noise, distortion"
     }
