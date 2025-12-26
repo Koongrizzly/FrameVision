@@ -2,6 +2,11 @@
 **All-in-one Sound/Image/Video Tool**  
 *Create, Upscale, edit, describe, play — in one streamlined app.*
 ---
+Video Walktrough (most is speedup x2 to show much in less time)
+
+[![Watch the video](https://img.youtube.com/vi/QLIaL4uAFlE/hqdefault.jpg)](https://youtu.be/QLIaL4uAFlE)
+
+---
 <details>
   <summary>December 25, 2025 — v2.1 release notes</summary>
 
