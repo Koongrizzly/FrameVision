@@ -27,6 +27,16 @@ import time
 import urllib.error
 import urllib.request
 
+# Ensure Windows consoles using cp1252 don't crash on Unicode output
+try:
+    if hasattr(sys.stdout, "reconfigure"):
+        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+    if hasattr(sys.stderr, "reconfigure"):
+        sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+except Exception:
+    pass
+
+
 VERSION = "v1.0"
 
 # ------------------------------
@@ -269,21 +279,21 @@ MODELS = {
         ],
         "sha256": "07c308cf0fc7e6e8b2065a12ed7fc07e1de8febb7dc7839d7b7f15dd66584df9",
         "filename": "modnet_photographic_portrait_matting.onnx",
-        "size_hint": "≈ 100 MB",
+        "size_hint": "~ 100 MB",
         "optional": False,
     },
     "birefnet_onnx": {
         "url": "https://github.com/ZhengPeng7/BiRefNet/releases/download/v1/BiRefNet-COD-epoch_125.onnx",
         "sha256": None,
         "filename": "BiRefNet-COD-epoch_125.onnx",
-        "size_hint": "≈ 900 MB",
+        "size_hint": "~ 900 MB",
         "optional": True,
     },
     "sd15_inpaint_fp16": {
         "url": "https://huggingface.co/webui/stable-diffusion-inpainting/resolve/main/sd-v1-5-inpainting.safetensors?download=true",
         "sha256": None,
         "filename": "sd-v1-5-inpainting.safetensors",
-        "size_hint": "≈ 4.0 GB",
+        "size_hint": "~ 4.0 GB",
         "optional": True,
         # treat alt names as present
         "present_globs": ["sd-v1-5-inpainting*.*"],
@@ -301,8 +311,8 @@ def main() -> int:
         default="models/bg",
         help="Temporary download folder (files will be moved to project-root models/bg at the end)",
     )
-    ap.add_argument("--pro", action="store_true", help="Include BiRefNet (≈900 MB) when not using --all/--only")
-    ap.add_argument("--sd15-inpaint", action="store_true", help="Include SD 1.5 Inpainting (≈4.0 GB) when not using --all/--only")
+    ap.add_argument("--pro", action="store_true", help="Include BiRefNet (~900 MB) when not using --all/--only")
+    ap.add_argument("--sd15-inpaint", action="store_true", help="Include SD 1.5 Inpainting (~4.0 GB) when not using --all/--only")
     ap.add_argument("--all", action="store_true", help="Download ALL background/inpaint models (also the default when no flags are passed)")
     ap.add_argument("--only", nargs="+", choices=list(MODELS.keys()), help="Download only these model keys (space-separated)")
     ap.add_argument("--hf-token", default=None, help="Hugging Face access token (overrides HF_TOKEN/HUGGINGFACE_TOKEN env vars)")
