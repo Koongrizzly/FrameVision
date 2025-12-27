@@ -23,7 +23,7 @@ from datetime import datetime
 from dataclasses import dataclass, replace
 from typing import List, Optional, Tuple, Dict
 
-from PySide6.QtCore import Qt, QThread, Signal, QSettings
+from PySide6.QtCore import Qt, QThread, Signal, QSettings, QTimer, QPropertyAnimation, QEasingCurve
 from PySide6.QtWidgets import (
     QWidget,
     QVBoxLayout,
@@ -37,6 +37,7 @@ from PySide6.QtWidgets import (
     QCheckBox,
     QProgressBar,
     QMessageBox,
+    QGraphicsOpacityEffect,
     QSizePolicy,
     QGroupBox,
     QSlider,
@@ -395,9 +396,9 @@ class TimelineSegment:
     cine_freeze: bool = False
     cine_stutter: bool = False
     cine_reverse: bool = False
-    # Screen tear (vertical 3-slice)
+    # Prism whip (horizontal drift)
     cine_tear_v: bool = False
-    # Screen tear (horizontal 3-slice)
+    # Prism whip (vertical drift)
     cine_tear_h: bool = False
     # Speedup hits (play the source forward/backwards faster and repeat if needed)
     cine_speedup_forward: bool = False
@@ -474,6 +475,162 @@ class MusicAnalysisResult:
     beats: List[Beat]
     sections: List[Section]
     duration: float
+
+
+
+
+# --------------------------- queue/headless helpers ------------------------
+
+def _analysis_to_dict(a: "MusicAnalysisResult") -> dict:
+    try:
+        from dataclasses import asdict
+        return asdict(a)
+    except Exception:
+        # Fallback: best-effort manual
+        return {
+            "beats": [getattr(b, "__dict__", {}) for b in (getattr(a, "beats", []) or [])],
+            "sections": [getattr(s, "__dict__", {}) for s in (getattr(a, "sections", []) or [])],
+            "duration": float(getattr(a, "duration", 0.0) or 0.0),
+        }
+
+def _analysis_from_dict(d: dict) -> "MusicAnalysisResult":
+    beats = [Beat(**b) for b in (d.get("beats") or [])]
+    sections = [Section(**s) for s in (d.get("sections") or [])]
+    return MusicAnalysisResult(beats=beats, sections=sections, duration=float(d.get("duration") or 0.0))
+
+def _segments_to_list(segments: list) -> list:
+    try:
+        from dataclasses import asdict
+        return [asdict(s) for s in (segments or [])]
+    except Exception:
+        out = []
+        for s in (segments or []):
+            try:
+                out.append(dict(getattr(s, "__dict__", {})))
+            except Exception:
+                pass
+        return out
+
+def _segments_from_list(items: list) -> list:
+    out = []
+    for d in (items or []):
+        try:
+            out.append(TimelineSegment(**d))
+        except Exception:
+            try:
+                # tolerate missing keys
+                out.append(TimelineSegment(
+                    clip_path=str(d.get("clip_path","")),
+                    clip_start=float(d.get("clip_start") or 0.0),
+                    duration=float(d.get("duration") or 0.0),
+                    effect=str(d.get("effect") or "none"),
+                    energy_class=str(d.get("energy_class") or "mid"),
+                    transition=str(d.get("transition") or "none"),
+                    slow_factor=float(d.get("slow_factor") or 1.0),
+                ))
+            except Exception:
+                pass
+    return out
+
+def run_queue_payload(payload_path: str) -> int:
+    """Headless entrypoint used by queued jobs.
+
+    This is intentionally dependency-light: it reuses RenderWorker's pipeline
+    but swaps Qt signals for simple stdout progress lines so worker.tools_ffmpeg
+    can parse percentages.
+    """
+    try:
+        with open(payload_path, "r", encoding="utf-8") as f:
+            payload = json.load(f)
+    except Exception as e:
+        try:
+            print(f"ERROR: failed to read payload: {e}")
+        except Exception:
+            pass
+        return 2
+
+    try:
+        analysis = _analysis_from_dict(payload.get("analysis") or {})
+        segments = _segments_from_list(payload.get("segments") or [])
+        audio_path = str(payload.get("audio_path") or "")
+        output_dir = str(payload.get("output_dir") or "")
+        ffmpeg = str(payload.get("ffmpeg") or ffmpeg_path())
+        ffprobe = str(payload.get("ffprobe") or ffprobe_path())
+        tr = payload.get("target_resolution")
+        target_resolution = None
+        if isinstance(tr, (list, tuple)) and len(tr) == 2:
+            try:
+                target_resolution = (int(tr[0]), int(tr[1]))
+            except Exception:
+                target_resolution = None
+        fit_mode = int(payload.get("fit_mode") or 0)
+        transition_mode = int(payload.get("transition_mode") or 0)
+        intro_fade = bool(payload.get("intro_fade", True))
+        outro_fade = bool(payload.get("outro_fade", True))
+        use_visual_overlay = bool(payload.get("use_visual_overlay", False))
+        visual_strategy = int(payload.get("visual_strategy") or 0)
+        visual_section_overrides = payload.get("visual_section_overrides") or None
+        visual_overlay_opacity = float(payload.get("visual_overlay_opacity") or 0.25)
+        out_name_override = payload.get("out_name_override") or None
+    except Exception as e:
+        try:
+            print(f"ERROR: invalid payload fields: {e}")
+        except Exception:
+            pass
+        return 3
+
+    # Create worker and monkeypatch progress signal to stdout
+    rw = RenderWorker(
+        audio_path=audio_path,
+        output_dir=output_dir,
+        analysis=analysis,
+        segments=segments,
+        ffmpeg=ffmpeg,
+        ffprobe=ffprobe,
+        target_resolution=target_resolution,
+        fit_mode=fit_mode,
+        transition_mode=transition_mode,
+        intro_fade=intro_fade,
+        outro_fade=outro_fade,
+        use_visual_overlay=use_visual_overlay,
+        visual_strategy=visual_strategy,
+        visual_section_overrides=visual_section_overrides,
+        visual_overlay_opacity=visual_overlay_opacity,
+        out_name_override=out_name_override,
+    )
+
+    class _DummySig:
+        def emit(self, pct, msg=""):
+            try:
+                ip = int(pct)
+            except Exception:
+                ip = pct
+            try:
+                print(f"{ip}% {msg}".strip())
+            except Exception:
+                try:
+                    print(f"{ip}%")
+                except Exception:
+                    pass
+
+    try:
+        rw.progress = _DummySig()
+    except Exception:
+        pass
+
+    try:
+        rw._run_impl()
+        try:
+            print("100% Done.")
+        except Exception:
+            pass
+        return 0
+    except Exception as e:
+        try:
+            print(f"ERROR: {e}")
+        except Exception:
+            pass
+        return 1
 
 
 # --------------------------- music analysis --------------------------------
@@ -1049,11 +1206,10 @@ def build_timeline(
                 if effect_name == "freeze":
                     seg.cine_freeze = True
                     seg.cine_freeze_len = float(max(0.10, min(1.0, cine_freeze_len)))
-                    # Clamp zoom factor to a safe 0.0–0.5 range (0–50%% punch-in).
+                    # Slider stays the same (0.0–0.5), but now drives the Shutter-pop intensity.
                     seg.cine_freeze_zoom = float(max(0.0, min(0.5, cine_freeze_zoom)))
-                    # Optionally clamp the logical segment duration to the freeze window
-                    # so the pacing stays snappy.
-                    seg.duration = min(seg.duration, seg.cine_freeze_len)
+                    # Random left/right chroma direction so repeats feel less samey.
+                    seg.cine_freeze_dir = random.choice([-1, 1])
                 elif effect_name == "stutter":
                     seg.cine_stutter = True
                     seg.cine_stutter_repeats = int(max(2, min(5, cine_stutter_repeats)))
@@ -2481,6 +2637,7 @@ class RenderWorker(QThread):
         visual_strategy: int = 0,
         visual_section_overrides: Optional[Dict[str, Optional[str]]] = None,
         visual_overlay_opacity: float = 0.25,
+        out_name_override: Optional[str] = None,
         parent=None,
     ) -> None:
         super().__init__(parent)
@@ -2507,6 +2664,7 @@ class RenderWorker(QThread):
             self.visual_overlay_opacity = float(visual_overlay_opacity)
         except Exception:
             self.visual_overlay_opacity = 0.25
+        self.out_name_override = out_name_override
 
 
     def run(self) -> None:
@@ -2701,37 +2859,61 @@ class RenderWorker(QThread):
                     # Mild motion blur via temporal blend
                     vf_parts.append("tblend=all_mode=average,framestep=1")
 
-                # Cinematic one-off effects
+                # Cinematic one-off effects                # Cinematic one-off effects
                 if getattr(seg, "cine_freeze", False):
-                    # Freeze the first frame and gently zoom in over the freeze duration.
+                    # Shutter-pop: quick punch + glossy smear (no speed change).
+                    # (This replaces the old freeze-frame effect; it never pauses or slows time.)
 
-                    zoom = float(getattr(seg, "cine_freeze_zoom", 0.0) or 0.0)
                     try:
-                        freeze_len = float(getattr(seg, "cine_freeze_len", 0.0) or 0.0)
+                        punch = float(getattr(seg, "cine_freeze_zoom", 0.0) or 0.0)
                     except Exception:
-                        freeze_len = 0.0
-                    if freeze_len <= 0.0:
-                        # Fallback: use the segment duration or a small default
-                        try:
-                            freeze_len = float(getattr(seg, "duration", 0.0) or 0.5)
-                        except Exception:
-                            freeze_len = 0.5
+                        punch = 0.0
 
-                    # 1) Freeze: repeat a single frame for the whole (short) segment.
-                    vf_parts.append("loop=loop=-1:size=1:start=0")
+                    # Map the old "zoom %" slider (stored as 0.0–0.5) into a 0.0–1.0 intensity.
+                    intensity = max(0.0, min(1.0, punch / 0.30 if 0.30 > 0 else punch))
 
-                    # 2) Optional zoom: animate from 1.0x to (1.0 + zoom) over freeze_len.
-                    if zoom > 0.0:
-                        # Clamp to avoid div-by-zero and excessively long ramps.
-                        dur = max(0.05, min(5.0, freeze_len))
-                        # Scale factor grows with time t in [0, dur], then stays at max.
-                        z_expr = f"1+{zoom:.3f}*min(t/{dur:.3f},1)"
+                    try:
+                        hit_d = float(getattr(seg, "cine_freeze_len", 0.0) or 0.0)
+                    except Exception:
+                        hit_d = 0.0
+                    if hit_d <= 0.0:
+                        hit_d = 0.35
+                    hit_d = max(0.08, min(1.0, hit_d))
 
-                        vf_parts.append(
-                            f"scale=iw*({z_expr}):ih*({z_expr}):eval=frame,"
-                            f"crop=iw/({z_expr}):ih/({z_expr})"
-                        )
+                    # Smooth envelope: 0 -> 1 -> 0 over the hit window.
+                    env_expr = f"if(lt(t,{hit_d:.3f}),sin(PI*t/{hit_d:.3f}),0)"
+                    z_amp = max(0.02, min(0.18, 0.02 + 0.16 * intensity))
+                    z_expr = f"(1+{z_amp:.4f}*({env_expr}))"
+
+                    try:
+                        dir_sign = int(getattr(seg, "cine_freeze_dir", 1) or 1)
+                    except Exception:
+                        dir_sign = 1
+                    dir_sign = -1 if dir_sign < 0 else 1
+
+                    # Pixel-level chroma offset.
+                    px = int(round(2 + 8 * intensity)) * dir_sign
+                    px = max(-18, min(18, px))
+
+                    alpha = max(0.35, min(0.88, 0.48 + 0.40 * intensity))
+                    con = 1.02 + 0.16 * intensity
+                    sat = 1.00 + 0.10 * intensity
+                    sharp = 0.25 + 0.70 * intensity
+
+                    vf_parts.append(
+                        "split=2[psrc][pbase];"
+                        f"[psrc]tmix=frames=5:weights='1 0.90 0.72 0.52 0.35',"
+                        f"rgbashift=rh={px}:bh={-px}:edge=smear,"
+                        f"eq=contrast={con:.3f}:saturation={sat:.3f},"
+                        f"scale=w='iw*({z_expr})':h='ih*({z_expr})':eval=frame,"
+                        f"crop=w='iw/({z_expr})':h='ih/({z_expr})',"
+                        f"unsharp=5:5:{sharp:.3f}:5:5:0,"
+                        f"format=rgba,colorchannelmixer=aa={alpha:.3f}[pfx];"
+                        f"[pbase][pfx]overlay=shortest=1:enable='lt(t,{hit_d:.3f})',format=yuv420p"
+                    )
+
                 if getattr(seg, "cine_stutter", False):
+
                     # Stutter / triple-frame style slice: drop interim frames so motion
                     # feels jittery. We keep duration the same, only the cadence changes.
                     repeats = int(getattr(seg, "cine_stutter_repeats", 3) or 3)
@@ -2740,15 +2922,14 @@ class RenderWorker(QThread):
                     vf_parts.append(f"framestep={step}")
 
                 if getattr(seg, "cine_tear_v", False):
-                    # Vertical screen tear (3-slice): briefly offset left/right slices.
+                    # Prism whip (horizontal drift): a short chroma-smeared whip + micro-zoom.
+                    # (Replaces the old 3-slice "screen tear" which looked harsh.)
                     try:
                         s = float(getattr(seg, "cine_tear_v_strength", 0.7) or 0.7)
                     except Exception:
                         s = 0.7
                     s = max(0.1, min(1.0, s))
-                    tear_d = 0.75
-                    # Fraction of width to shift slices during the tear.
-                    shift_frac = 0.04 + 0.08 * s
+
                     # Direction picked per event in _apply_cinematic_effects
                     try:
                         dir_sign = int(getattr(seg, "cine_tear_v_dir", 1) or 1)
@@ -2756,32 +2937,51 @@ class RenderWorker(QThread):
                         dir_sign = 1
                     dir_sign = -1 if dir_sign < 0 else 1
 
-                    signed_shift = shift_frac * dir_sign
+                    # Short hit window (seconds)
+                    hit_d = 0.22 + 0.28 * s
 
-                    # We keep this as a single filtergraph chunk so it can live inside vf_parts.
-                    # The graph:
-                    #   1) split into 3
-                    #   2) crop each third with a tiny time-gated x-offset
-                    #   3) hstack back into a full frame
+                    # Envelope (0 -> 1 -> 0) for the hit.
+                    env_expr = f"if(lt(t,{hit_d:.3f}),sin(PI*t/{hit_d:.3f}),0)"
+
+                    # Micro zoom + drift
+                    z_amp = 0.030 + 0.070 * s
+                    z_expr = f"(1+{z_amp:.4f}*({env_expr}))"
+                    drift_x = (0.012 + 0.030 * s) * dir_sign
+                    drift_y = (0.004 + 0.010 * s) * (-dir_sign)
+
+                    x_expr = f"iw*{drift_x:.5f}*({env_expr})"
+                    y_expr = f"ih*{drift_y:.5f}*({env_expr})"
+
+                    # Chromatic offset (pixels)
+                    try:
+                        px = int(round(2 + 7 * s)) * dir_sign
+                    except Exception:
+                        px = 5 * dir_sign
+                    px = max(-18, min(18, px))
+
+                    alpha = max(0.35, min(0.95, 0.55 + 0.35 * s))
+
                     vf_parts.append(
-                        "split=3[a][b][c];"
-                        f"[a]crop=w=iw/3:h=ih:x='0+iw*{signed_shift:.3f}*between(t,0,{tear_d:.3f})':y=0[a0];"
-                        f"[b]crop=w=iw/3:h=ih:x='iw/3':y=0[b0];"
-                        f"[c]crop=w=iw/3:h=ih:x='2*iw/3-iw*{signed_shift:.3f}*between(t,0,{tear_d:.3f})':y=0[c0];"
-                        "[a0][b0][c0]hstack=inputs=3"
+                        "split=2[tvsrc][tvbase];"
+                        f"[tvsrc]tmix=frames=3:weights='1 2 1',"
+                        f"rgbashift=rh={px}:bh={-px}:edge=smear,"
+                        f"eq=contrast={1.00 + 0.18*s:.3f}:saturation={1.00 + 0.10*s:.3f},"
+                        f"scale=w='iw*({z_expr})':h='ih*({z_expr})':eval=frame,"
+                        f"crop=w='iw/({z_expr})':h='ih/({z_expr})':x='{x_expr}':y='{y_expr}',"
+                        f"unsharp=5:5:{0.35 + 0.55*s:.3f}:5:5:0,"
+                        f"format=rgba,colorchannelmixer=aa={alpha:.3f}[tvfx];"
+                        f"[tvbase][tvfx]overlay=shortest=1:enable='lt(t,{hit_d:.3f})',format=yuv420p"
                     )
 
-                    
+
                 if getattr(seg, "cine_tear_h", False):
-                    # Horizontal screen tear (3-slice): briefly offset up/down slices.
+                    # Prism whip (vertical drift): same as above but drifting vertically.
                     try:
                         s = float(getattr(seg, "cine_tear_h_strength", 0.7) or 0.7)
                     except Exception:
                         s = 0.7
                     s = max(0.1, min(1.0, s))
-                    tear_d = 0.50
-                    # Fraction of height to shift slices during the tear.
-                    shift_frac = 0.05 + 0.10 * s
+
                     # Direction picked per event in _apply_cinematic_effects
                     try:
                         dir_sign = int(getattr(seg, "cine_tear_h_dir", 1) or 1)
@@ -2789,18 +2989,36 @@ class RenderWorker(QThread):
                         dir_sign = 1
                     dir_sign = -1 if dir_sign < 0 else 1
 
-                    signed_shift = shift_frac * dir_sign
+                    hit_d = 0.18 + 0.26 * s
+                    env_expr = f"if(lt(t,{hit_d:.3f}),sin(PI*t/{hit_d:.3f}),0)"
 
-                    # The graph:
-                    #   1) split into 3
-                    #   2) crop each third with a tiny time-gated y-offset
-                    #   3) vstack back into a full frame
+                    z_amp = 0.028 + 0.060 * s
+                    z_expr = f"(1+{z_amp:.4f}*({env_expr}))"
+
+                    drift_x = (0.004 + 0.012 * s) * (dir_sign)
+                    drift_y = (0.014 + 0.034 * s) * (dir_sign)
+
+                    x_expr = f"iw*{drift_x:.5f}*({env_expr})"
+                    y_expr = f"ih*{drift_y:.5f}*({env_expr})"
+
+                    try:
+                        py = int(round(2 + 7 * s)) * dir_sign
+                    except Exception:
+                        py = 5 * dir_sign
+                    py = max(-18, min(18, py))
+
+                    alpha = max(0.35, min(0.95, 0.55 + 0.35 * s))
+
                     vf_parts.append(
-                        "split=3[a][b][c];"
-                        f"[a]crop=w=iw:h=ih/3:x=0:y='0+ih*{signed_shift:.3f}*between(t,0,{tear_d:.3f})'[a0];"
-                        f"[b]crop=w=iw:h=ih/3:x=0:y='ih/3'[b0];"
-                        f"[c]crop=w=iw:h=ih/3:x=0:y='2*ih/3-ih*{signed_shift:.3f}*between(t,0,{tear_d:.3f})'[c0];"
-                        "[a0][b0][c0]vstack=inputs=3"
+                        "split=2[thsrc][thbase];"
+                        f"[thsrc]tmix=frames=3:weights='1 2 1',"
+                        f"rgbashift=rv={py}:bv={-py}:edge=smear,"
+                        f"eq=contrast={1.00 + 0.18*s:.3f}:saturation={1.00 + 0.10*s:.3f},"
+                        f"scale=w='iw*({z_expr})':h='ih*({z_expr})':eval=frame,"
+                        f"crop=w='iw/({z_expr})':h='ih/({z_expr})':x='{x_expr}':y='{y_expr}',"
+                        f"unsharp=5:5:{0.35 + 0.55*s:.3f}:5:5:0,"
+                        f"format=rgba,colorchannelmixer=aa={alpha:.3f}[thfx];"
+                        f"[thbase][thfx]overlay=shortest=1:enable='lt(t,{hit_d:.3f})',format=yuv420p"
                     )
 
                 if getattr(seg, "cine_reverse", False):
@@ -3470,7 +3688,9 @@ class RenderWorker(QThread):
                         "0",
                         "-r",
                         "30",
-                        out_part,
+                        "-pix_fmt",
+                    "yuv420p",
+                    out_part,
                     ]
                     code, out = _run_ffmpeg(cmd)
                     if code != 0 or not os.path.exists(out_part):
@@ -3803,6 +4023,13 @@ class RenderWorker(QThread):
 
                 # Second attempt: only resolution scaling/padding (if any)
                 if (code != 0 or not os.path.exists(out_part)) and safe_vf_arg and safe_vf_arg != vf_arg:
+                    try:
+                        if vf_arg:
+                            # Helps diagnose cases where a new FX filter isn't supported on a user's ffmpeg build.
+                            tail = (out or '').splitlines()[-1] if out else ''
+                            print(f"[mclip] Segment {i+1}: FX filter failed; retrying safe chain. {tail}")
+                    except Exception:
+                        pass
                     try:
                         if os.path.exists(out_part):
                             os.remove(out_part)
@@ -5470,11 +5697,14 @@ class RenderWorker(QThread):
 
             # mux with audio
             self.progress.emit(95, "Merging with audio...")
-            base = os.path.splitext(os.path.basename(self.audio_path))[0]
-            ts = datetime.now().strftime("%d%m%H%M")  # ddmmhhmm to avoid overwrites
-            safe_base = base.strip().replace(" ", "_")
-            out_name = f"{safe_base}_clip_{ts}.mp4"
-            out_final = os.path.join(self.output_dir, out_name)
+            if self.out_name_override:
+                out_final = os.path.join(self.output_dir, str(self.out_name_override))
+            else:
+                base = os.path.splitext(os.path.basename(self.audio_path))[0]
+                ts = datetime.now().strftime("%d%m%H%M")  # ddmmhhmm to avoid overwrites
+                safe_base = base.strip().replace(" ", "_")
+                out_name = f"{safe_base}_clip_{ts}.mp4"
+                out_final = os.path.join(self.output_dir, out_name)
             cmd = [
                 self.ffmpeg,
                 "-y",
@@ -5505,6 +5735,7 @@ class AutoMusicSyncWidget(QWidget):
     def __init__(self, parent=None, sticky_footer: bool = False) -> None:
         super().__init__(parent)
         self._sticky_footer = bool(sticky_footer)
+        self._queue_requested = False
         self._ffmpeg = _find_ffmpeg_from_env()
         self._ffprobe = _find_ffprobe_from_env()
         self._analysis: Optional[MusicAnalysisResult] = None
@@ -5539,6 +5770,106 @@ class AutoMusicSyncWidget(QWidget):
 
         # Hide still-image UI block (images in generator)
         self._hide_image_sources_block()
+
+
+    # ----------------------------- UI toast ---------------------------------
+    def _show_toast(self, message: str, duration_ms: int = 2200, fade_ms: int = 650) -> None:
+        """Show a small non-blocking toast near the bottom of the window."""
+        try:
+            parent = self.window() if self.window() is not None else self
+        except Exception:
+            parent = self
+
+        # Close previous toast if still visible
+        try:
+            old = getattr(self, "_active_toast", None)
+            if old is not None:
+                try:
+                    old.close()
+                except Exception:
+                    pass
+                try:
+                    old.deleteLater()
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
+        try:
+            toast = QFrame(parent)
+            toast.setObjectName("FVToast")
+            toast.setWindowFlags(Qt.FramelessWindowHint | Qt.ToolTip)
+            toast.setAttribute(Qt.WA_ShowWithoutActivating, True)
+            toast.setAttribute(Qt.WA_TransparentForMouseEvents, True)
+            lay = QVBoxLayout(toast)
+            lay.setContentsMargins(14, 10, 14, 10)
+            lay.setSpacing(0)
+            lbl = QLabel(str(message), toast)
+            lbl.setWordWrap(True)
+            lbl.setAlignment(Qt.AlignCenter)
+            lay.addWidget(lbl)
+
+            # Minimal styling (keeps working even if no app stylesheet is loaded)
+            toast.setStyleSheet(
+                "#FVToast {"
+                " background: rgba(0,0,0,190);"
+                " color: white;"
+                " border: 1px solid rgba(255,255,255,70);"
+                " border-radius: 10px;"
+                " }"
+            )
+
+            toast.adjustSize()
+
+            # Position: bottom-center of the parent window
+            try:
+                g = parent.frameGeometry()
+            except Exception:
+                g = parent.geometry()
+            x = int(g.x() + (g.width() - toast.width()) * 0.5)
+            y = int(g.y() + g.height() - toast.height() - 80)
+            toast.move(x, y)
+
+            eff = QGraphicsOpacityEffect(toast)
+            eff.setOpacity(1.0)
+            toast.setGraphicsEffect(eff)
+
+            anim = QPropertyAnimation(eff, b"opacity", toast)
+            anim.setDuration(int(max(120, fade_ms)))
+            anim.setStartValue(1.0)
+            anim.setEndValue(0.0)
+            anim.setEasingCurve(QEasingCurve.InOutQuad)
+
+            def _finish():
+                try:
+                    toast.close()
+                except Exception:
+                    pass
+                try:
+                    toast.deleteLater()
+                except Exception:
+                    pass
+                try:
+                    if getattr(self, "_active_toast", None) is toast:
+                        self._active_toast = None
+                except Exception:
+                    pass
+
+            anim.finished.connect(_finish)
+
+            # Keep references alive
+            toast._toast_anim = anim  # type: ignore[attr-defined]
+            self._active_toast = toast
+
+            toast.show()
+            toast.raise_()
+
+            # Start fade after the on-screen duration
+            QTimer.singleShot(int(max(300, duration_ms)), anim.start)
+        except Exception:
+            # Toast is best-effort; never break workflows if it fails.
+            pass
+
 
     def _build_ui(self) -> None:
         self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
@@ -5898,7 +6229,7 @@ class AutoMusicSyncWidget(QWidget):
         row_cine_master = QHBoxLayout()
         self.check_cine_enable = QCheckBox("Enable cinematic effects", self)
         self.check_cine_enable.setToolTip(
-            "Enable a few rare, high-impact visual effects (freeze-frame, stutter, "
+            "Enable a few rare, high-impact visual effects (shutter-pop, stutter, "
             "reverse-bounce, ramps). Effects are placed automatically "
         )
         row_cine_master.addWidget(self.check_cine_enable)
@@ -5918,15 +6249,15 @@ class AutoMusicSyncWidget(QWidget):
         row_cine_all.addStretch(1)
         cine_layout.addLayout(row_cine_all)
 
-        # Freeze-frame effect
+        # Shutter-pop effect
         row_cine_freeze = QHBoxLayout()
-        self.check_cine_freeze = QCheckBox("Freeze-frame (pause + zoom-in)", self.cine_options)
+        self.check_cine_freeze = QCheckBox("Shutter-pop (punch + smear)", self.cine_options)
         self.check_cine_freeze.setToolTip(
-            "Occasionally pause the video on a single frame with a gentle zoom-in, "
-            "then snap back to normal motion."
+            "Occasionally add a quick camera-shutter style punch: micro-zoom + glossy motion smear.\n"
+            "No speed change, no freezing."
         )
         row_cine_freeze.addWidget(self.check_cine_freeze)
-        label_freeze_len = QLabel("Length:", self.cine_options)
+        label_freeze_len = QLabel("Hit:", self.cine_options)
         row_cine_freeze.addWidget(label_freeze_len)
         self.slider_cine_freeze_len = QSlider(Qt.Horizontal, self.cine_options)
         self.slider_cine_freeze_len.setMinimum(10)   # 0.10 s
@@ -5940,7 +6271,7 @@ class AutoMusicSyncWidget(QWidget):
         cine_layout.addLayout(row_cine_freeze)
 
         row_cine_freeze_zoom = QHBoxLayout()
-        label_freeze_zoom = QLabel("Freeze zoom:", self.cine_options)
+        label_freeze_zoom = QLabel("Punch:", self.cine_options)
         row_cine_freeze_zoom.addWidget(label_freeze_zoom)
         self.slider_cine_freeze_zoom = QSlider(Qt.Horizontal, self.cine_options)
         self.slider_cine_freeze_zoom.setMinimum(5)    # 5%%
@@ -5953,11 +6284,11 @@ class AutoMusicSyncWidget(QWidget):
         row_cine_freeze_zoom.addWidget(self.label_cine_freeze_zoom)
         cine_layout.addLayout(row_cine_freeze_zoom)
 
-        # Vertical screen tear (3 stripes)
+        # Prism whip (horizontal drift)
         row_cine_tear_v = QHBoxLayout()
-        self.check_cine_tear_v = QCheckBox("Screen tear (vertical 3-slice)", self.cine_options)
+        self.check_cine_tear_v = QCheckBox("Prism whip (horizontal drift)", self.cine_options)
         self.check_cine_tear_v.setToolTip(
-            "A quick glitch-like tear that offsets three vertical slices, then snaps back."
+            "A short, eye-catching whip: micro-zoom + chroma smear + soft motion trail (horizontal drift)."
         )
         row_cine_tear_v.addWidget(self.check_cine_tear_v)
         label_cine_tear_v = QLabel("Strength:", self.cine_options)
@@ -5973,11 +6304,11 @@ class AutoMusicSyncWidget(QWidget):
         row_cine_tear_v.addWidget(self.label_cine_tear_v_strength)
         cine_layout.addLayout(row_cine_tear_v)
 
-        # Horizontal screen tear (3 stripes)
+        # Prism whip (vertical drift)
         row_cine_tear_h = QHBoxLayout()
-        self.check_cine_tear_h = QCheckBox("Screen tear (horizontal 3-slice)", self.cine_options)
+        self.check_cine_tear_h = QCheckBox("Prism whip (vertical drift)", self.cine_options)
         self.check_cine_tear_h.setToolTip(
-            "A quick glitch-like tear that offsets three horizontal slices, then snaps back."
+            "A short, eye-catching whip: micro-zoom + chroma smear + soft motion trail (vertical drift)."
         )
         row_cine_tear_h.addWidget(self.check_cine_tear_h)
         label_cine_tear_h = QLabel("Strength:", self.cine_options)
@@ -6796,12 +7127,26 @@ class AutoMusicSyncWidget(QWidget):
         # footer button bar (embedded by default; can be 'sticky' when wrapped in a scroll area)
         self.footer_bar = QWidget(self)
         self.footer_bar.setObjectName("MusicClipCreatorFooter")
-        footer_lay = QHBoxLayout(self.footer_bar)
-        footer_lay.setContentsMargins(0, 0, 0, 0)
-        footer_lay.setSpacing(6)
+        footer_outer = QVBoxLayout(self.footer_bar)
+        footer_outer.setContentsMargins(0, 0, 0, 0)
+        footer_outer.setSpacing(4)
+
+        footer_row_top = QHBoxLayout()
+        footer_row_top.setContentsMargins(0, 0, 0, 0)
+        footer_row_top.setSpacing(6)
+
+        footer_row_bottom = QHBoxLayout()
+        footer_row_bottom.setContentsMargins(0, 0, 0, 0)
+        footer_row_bottom.setSpacing(6)
 
         self.btn_analyze = QPushButton("Analyze", self.footer_bar)
         self.btn_generate = QPushButton("Generate Clip", self.footer_bar)
+
+        self.btn_queue = QPushButton("Queue Clip", self.footer_bar)
+        try:
+            self.btn_queue.setToolTip("Queue this Music Clip Creator job to the Queue tab instead of rendering immediately.")
+        except Exception:
+            pass
 
         # Hover style for the "Generate Clip" button: match the top banner gradient.
         try:
@@ -6846,13 +7191,25 @@ class AutoMusicSyncWidget(QWidget):
             "Stop any running job, clear loaded sources and reset all settings to defaults."
         )
 
-        footer_lay.addWidget(self.btn_analyze)
-        footer_lay.addWidget(self.btn_generate)
-        footer_lay.addWidget(self.btn_view_results)
-        footer_lay.addWidget(self.btn_presets)
-        footer_lay.addWidget(self.btn_cancel)
-        footer_lay.addWidget(self.btn_reset_all)
-        footer_lay.addStretch(1)
+        # Row 1: main actions
+        footer_row_top.addWidget(self.btn_analyze)
+        footer_row_top.addWidget(self.btn_generate)
+        try:
+            footer_row_top.addWidget(self.btn_queue)
+        except Exception:
+            pass
+        footer_row_top.addStretch(1)
+
+        # Row 2: secondary actions
+        footer_row_bottom.addWidget(self.btn_view_results)
+        footer_row_bottom.addWidget(self.btn_presets)
+        footer_row_bottom.addWidget(self.btn_cancel)
+        footer_row_bottom.addWidget(self.btn_reset_all)
+        footer_row_bottom.addStretch(1)
+
+        footer_outer.addLayout(footer_row_top)
+        footer_outer.addLayout(footer_row_bottom)
+
 
         if not self._sticky_footer:
             main.addWidget(self.footer_bar)
@@ -6896,6 +7253,10 @@ class AutoMusicSyncWidget(QWidget):
         btn_o.clicked.connect(self._browse_output)
         self.btn_analyze.clicked.connect(self._on_analyze)
         self.btn_generate.clicked.connect(self._on_generate)
+        try:
+            self.btn_queue.clicked.connect(self._on_queue_generate)
+        except Exception:
+            pass
         try:
             self.btn_view_results.clicked.connect(self._open_output_in_media_explorer)
         except Exception:
@@ -7553,7 +7914,7 @@ class AutoMusicSyncWidget(QWidget):
     def _on_presets_clicked(self) -> None:
         """
         Show a small dialog with the built-in presets, apply the choice and
-        immediately start a render.
+        immediately queue a render.
 
         Important: presets ONLY touch visual / FX options. They do not
         change which audio/clip paths are selected, the output folder or
@@ -7583,7 +7944,7 @@ class AutoMusicSyncWidget(QWidget):
             "  • the output folder or output resolution.\n\n"
             "Set those first, then pick a preset and press OK.\n"
             "After you confirm, the preset is applied and the normal\n"
-            "'Generate Music Clip' flow is started.",
+            "'Queue Clip' flow is started (check the Queue tab).",
             dlg,
         )
         info.setWordWrap(True)
@@ -7614,8 +7975,8 @@ class AutoMusicSyncWidget(QWidget):
         preset_id, preset_name, _ = presets[row]
         self._apply_preset(preset_id, preset_name)
 
-        # Fire off the normal generate logic with the chosen preset.
-        self._on_generate()
+        # Queue the clip with the chosen preset.
+        self._on_queue_generate()
 
     def _apply_preset(self, preset_id: str, preset_name: str) -> None:
         """
@@ -9582,6 +9943,17 @@ class AutoMusicSyncWidget(QWidget):
         self._scan_worker.failed.connect(self._on_scan_failed)
         self._scan_worker.start()
 
+    
+    def _on_queue_generate(self) -> None:
+        """Queue the current Music Clip Creator job instead of rendering immediately."""
+        try:
+            self._queue_requested = True
+        except Exception:
+            pass
+        # Reuse the same pipeline as Generate (analyze + scan + build timeline),
+        # but the final step will enqueue a headless render job.
+        self._on_generate()
+
     def _continue_generate_with_sources(
         self,
         audio: str,
@@ -9833,6 +10205,33 @@ class AutoMusicSyncWidget(QWidget):
         elif getattr(self, "check_visual_strategy_section", None) and self.check_visual_strategy_section.isChecked():
             visual_strategy = 2
 
+        
+        # If requested, enqueue instead of render-now.
+        if getattr(self, "_queue_requested", False):
+            try:
+                self._queue_requested = False
+            except Exception:
+                pass
+            try:
+                self._enqueue_render_job(
+                    audio=audio,
+                    out_dir=out_dir,
+                    analysis=self._analysis,
+                    segments=segments,
+                    target_res=target_res,
+                    transition_mode=transition_mode,
+                    use_visual_overlay=bool(getattr(self, "check_visual_overlay", None) and self.check_visual_overlay.isChecked()),
+                    visual_strategy=visual_strategy,
+                    visual_section_overrides=getattr(self, "_visual_section_overrides", None) if visual_strategy == 2 else None,
+                    visual_overlay_opacity=float(getattr(self, "visual_overlay_opacity", 0.25)),
+                )
+            except Exception as e:
+                try:
+                    self._error("Queue error", str(e))
+                except Exception:
+                    pass
+            return
+
         self._worker = RenderWorker(
             audio_path=audio,
             output_dir=out_dir,
@@ -9855,6 +10254,113 @@ class AutoMusicSyncWidget(QWidget):
         self._worker.failed.connect(self._on_worker_failed)
         self._worker.start()
 
+
+    
+    def _enqueue_render_job(
+        self,
+        audio: str,
+        out_dir: str,
+        analysis: "MusicAnalysisResult",
+        segments: List["TimelineSegment"],
+        target_res: Optional[Tuple[int, int]],
+        transition_mode: int,
+        use_visual_overlay: bool,
+        visual_strategy: int,
+        visual_section_overrides: Optional[Dict[str, Optional[str]]],
+        visual_overlay_opacity: float,
+    ) -> None:
+        """Serialize the current timeline and enqueue a headless render job in Queue."""
+        try:
+            from helpers.queue_adapter import enqueue_tool_job
+        except Exception:
+            # Fallback when helpers is not a package (dev runs)
+            from queue_adapter import enqueue_tool_job  # type: ignore
+
+        # Deterministic output name for the queued job (so the Queue can point to the produced file).
+        base = os.path.splitext(os.path.basename(audio))[0]
+        safe_base = base.strip().replace(" ", "_")
+        ts = datetime.now().strftime("%d%m%H%M%S")
+        out_name = f"{safe_base}_clip_{ts}.mp4"
+        out_final = os.path.join(out_dir, out_name)
+
+        payload_dir = os.path.join(out_dir, "_payloads")
+        _ensure_dir(payload_dir)
+        payload_path = os.path.join(payload_dir, f"mclip_job_{ts}.json")
+
+        payload = {
+            "audio_path": audio,
+            "output_dir": out_dir,
+            "ffmpeg": self._ffmpeg,
+            "ffprobe": self._ffprobe,
+            "target_resolution": list(target_res) if target_res else None,
+            "fit_mode": int(self.combo_fit.currentIndex()),
+            "transition_mode": int(transition_mode),
+            "intro_fade": bool(self.check_intro_fade.isChecked()),
+            "outro_fade": bool(self.check_outro_fade.isChecked()),
+            "use_visual_overlay": bool(use_visual_overlay),
+            "visual_strategy": int(visual_strategy),
+            "visual_section_overrides": visual_section_overrides,
+            "visual_overlay_opacity": float(visual_overlay_opacity),
+            "out_name_override": out_name,
+            "analysis": _analysis_to_dict(analysis),
+            "segments": _segments_to_list(segments),
+        }
+        with open(payload_path, "w", encoding="utf-8") as f:
+            json.dump(payload, f, indent=2)
+
+        # Build a portable python command to run the headless job.
+        py = sys.executable or "python"
+        payload_path_esc = payload_path.replace("\\", "\\\\").replace("'", "\\'")
+        cmd_code = (
+            "import sys\n"
+            f"p=r'{payload_path_esc}'\n"
+            "try:\n"
+            "    import helpers.auto_music_sync as m\n"
+            "except Exception:\n"
+            "    import auto_music_sync as m\n"
+            "sys.exit(m.run_queue_payload(p))\n"
+        )
+        cmd = [py, "-u", "-c", cmd_code]
+
+        args = {
+            "cmd": cmd,
+            "outfile": out_final,
+            "label": f"Music Clip Creator: {safe_base}",
+        }
+        try:
+            # Ensure the command runs from app root so imports resolve.
+            args["cwd"] = str(Path(".").resolve())
+        except Exception:
+            pass
+
+        # Enqueue as a tools_ffmpeg job so the existing worker logic can run it.
+        ok = enqueue_tool_job("tools_ffmpeg", audio, out_dir, args, priority=560)
+        if not ok:
+            raise RuntimeError("Failed to enqueue job (job file could not be written).")
+
+        try:
+            self.progress.setValue(0)
+            self.progress.setFormat("Queued.")
+        except Exception:
+            pass
+
+        # Switch to Queue tab automatically (same behavior as Tools tab).
+        try:
+            tabs = self.parent()
+            while tabs is not None and not isinstance(tabs, QTabWidget):
+                tabs = tabs.parent()
+            if isinstance(tabs, QTabWidget):
+                for i in range(tabs.count()):
+                    if str(tabs.tabText(i)).lower().startswith("queue"):
+                        tabs.setCurrentIndex(i)
+                        break
+        except Exception:
+            pass
+
+        try:
+            self._show_toast("Queued — check progress in the Queue tab.")
+        except Exception:
+            pass
 
     def _update_sources_list(self) -> None:
         if not hasattr(self, "list_sources"):

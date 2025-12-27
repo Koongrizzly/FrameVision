@@ -3314,7 +3314,7 @@ class QueuePane(QWidget):
         from PySide6.QtCore import QUrl, QFileSystemWatcher
 
         # Timers (keep internal refresh cadence intact)
-        self.auto_timer = QTimer(self); self.auto_timer.setInterval(3000); self.auto_timer.timeout.connect(self.request_refresh)
+        self.auto_timer = QTimer(self); self.auto_timer.setInterval(5000); self.auto_timer.timeout.connect(self.request_refresh)
         self.watch_timer = QTimer(self); self.watch_timer.setInterval(1300); self.watch_timer.timeout.connect(self.request_refresh)
         self.worker_timer = QTimer(self); self.worker_timer.setInterval(2500); self.worker_timer.timeout.connect(self._update_worker_led)
         # Pause queue refreshing while video is playing to prevent playback stutter.
@@ -3586,11 +3586,11 @@ class QueuePane(QWidget):
         if status == "pending":
             max_show = getattr(self, "MAX_PENDING_SHOW", 99)
         elif status == "done":
-            max_keep = getattr(self, "MAX_DONE_KEEP", 30)
-            max_show = getattr(self, "MAX_DONE_SHOW", 20)
+            max_keep = getattr(self, "MAX_DONE_KEEP", 50)
+            max_show = getattr(self, "MAX_DONE_SHOW", 50)
         elif status == "failed":
-            max_keep = getattr(self, "MAX_FAILED_KEEP", 25)
-            max_show = getattr(self, "MAX_FAILED_SHOW", 25)
+            max_keep = getattr(self, "MAX_FAILED_KEEP", 50)
+            max_show = getattr(self, "MAX_FAILED_SHOW", 50)
 
         if files:
             try:
@@ -3612,33 +3612,31 @@ class QueuePane(QWidget):
 
             if auto_cleanup:
                 try:
-                    # Start cleanup a bit earlier than the max. Example: max_keep 50 -> trigger at 48.
-                    trigger_at = max(1, int(max_keep) - 2)
+                    # Start cleanup slightly before hitting the max.
+                    # Done: allow up to (max_keep - 2) then remove a batch of 10 so we drop to ~38-39.
+                    # Failed: keep gentler cleanup so errors remain visible.
+                    if status == "done":
+                        trigger_at = max(1, int(max_keep) - 5)  # e.g. 50 -> start at 48
+                        max_per_refresh = 10
+                    else:
+                        trigger_at = max(1, int(max_keep) - 2)  # e.g. 50 -> start at 49
+                        max_per_refresh = 3
                 except Exception:
                     trigger_at = max_keep
-
-                # Finished (done): batch cleanup so we drop by ~10 at once (48 -> 38, 49 -> 39).
-                # Failed: gentler cleanup so errors remain visible.
-                try:
-                    if status == "done" and len(files_sorted) >= trigger_at:
-                        max_per_refresh = 10
-                    elif status == "failed" and len(files_sorted) >= trigger_at:
-                        max_per_refresh = 3
-                    else:
-                        max_per_refresh = 0
-                except Exception:
-                    max_per_refresh = 0
+                    max_per_refresh = 3
 
                 moved = 0
-                if max_per_refresh > 0:
+                # Only kick in when we reach the trigger threshold.
+                if files_sorted and (len(files_sorted) >= int(trigger_at)):
                     try:
                         import shutil as _shutil
                         import time as _time
-                        old_dir = (BASE / "jobs" / status / "old_jobs")
+                        old_dir = (BASE / "jobs" / "done" / "old_jobs")
                         old_dir.mkdir(parents=True, exist_ok=True)
 
-                        while files_sorted and moved < max_per_refresh:
-                            victim = files_sorted[-1][1]  # oldest (files_sorted is newest-first)
+                        # Move the oldest jobs first (files_sorted is newest-first).
+                        while files_sorted and moved < int(max_per_refresh):
+                            victim = files_sorted[-1][1]
                             if victim is None:
                                 break
                             try:
@@ -3670,6 +3668,99 @@ class QueuePane(QWidget):
         else:
             files = files_sorted
 
+
+        # --- Pending safety rebuild ---
+        # Qt/PySide can hard-crash (access violation) if we reorder QListWidgetItems that have
+        # setItemWidget() row widgets attached. Pending order changes (move up/down) require
+        # re-sorting, so for pending we rebuild the list from scratch in a widget-safe way.
+        if str(status).lower() == "pending":
+            try:
+                from PySide6.QtCore import Qt
+            except Exception:
+                Qt = None  # type: ignore
+
+            # 1) Clear existing items safely: detach row widgets before removing items.
+            try:
+                i = widget.count() - 1
+                while i >= 0:
+                    it_old = widget.item(i)
+                    try:
+                        w_old = widget.itemWidget(it_old)
+                    except Exception:
+                        w_old = None
+                    if w_old is not None:
+                        try:
+                            widget.removeItemWidget(it_old)
+                        except Exception:
+                            pass
+                        try:
+                            w_old.setParent(None)
+                        except Exception:
+                            pass
+                        try:
+                            w_old.deleteLater()
+                        except Exception:
+                            pass
+                    try:
+                        widget.takeItem(i)
+                    except Exception:
+                        # Worst-case fallback
+                        try:
+                            widget.clear()
+                        except Exception:
+                            pass
+                        break
+                    i -= 1
+            except Exception:
+                try:
+                    widget.clear()
+                except Exception:
+                    pass
+
+            # 2) Rebuild in the desired order.
+            for _idx, (_ts, p) in enumerate(files):
+                it = QListWidgetItem("")
+                w = JobRowWidget(str(p), status)
+                try:
+                    hint = w.sizeHint()
+                    if hint.height() < 56:
+                        hint.setHeight(56)
+                    it.setSizeHint(hint)
+                except Exception:
+                    try:
+                        it.setSizeHint(w.sizeHint())
+                    except Exception:
+                        pass
+
+                try:
+                    widget.addItem(it)
+                except Exception:
+                    # fallback
+                    try:
+                        widget.insertItem(_idx, it)
+                    except Exception:
+                        pass
+
+                try:
+                    widget.setItemWidget(it, w)
+                except Exception:
+                    pass
+
+                try:
+                    if Qt is not None:
+                        it.setData(Qt.UserRole, str(p))
+                except Exception:
+                    pass
+
+                # Wire pending order change → safe refresh (debounced, queued).
+                try:
+                    if hasattr(w, "queueOrderChanged"):
+                        from PySide6.QtCore import QTimer
+                        w.queueOrderChanged.connect(lambda *a: QTimer.singleShot(0, self.request_refresh))
+                except Exception:
+                    pass
+
+            return
 
         # Remove stale items not in target set (in-place, from bottom)
         try:
@@ -5036,14 +5127,14 @@ class MainWindow(QMainWindow):
 
 # >>> FRAMEVISION_EDITOR_INIT_BEGIN
         # Create Editor tab instance if available
-        # try:
-         #   if 'EditorPane' in globals() and EditorPane is not None:
-          #      self.editor = EditorPane(self)
-           # else:
-            #    self.editor = None
-      #  except Exception as _e:
-       #     print("[framevision] editor init failed:", _e)
-        #    self.editor = None
+#        try:
+ #           if 'EditorPane' in globals() and EditorPane is not None:
+  #              self.editor = EditorPane(self)
+   #         else:
+    #            self.editor = None
+     #   except Exception as _e:
+      #      print("[framevision] editor init failed:", _e)
+       #     self.editor = None
 # <<< FRAMEVISION_EDITOR_INIT_END
 
         self.video.frameCaptured.connect(self.describe.on_pause_capture)

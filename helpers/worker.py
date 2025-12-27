@@ -1159,7 +1159,49 @@ def tools_ffmpeg(job, cfg, mani):
         except Exception:
             pass
 
-        if int(code) == 0:
+        # Normalize return code
+        try:
+            code_i = int(code)
+        except Exception:
+            code_i = 1
+
+        # Salvage: some helper scripts exit non-zero even though the expected output was produced.
+        # For queue UX, it's more useful to mark these as DONE (with a warning) than FAILED.
+        salvaged = False
+        try:
+            if code_i not in (0, 130) and outfile:
+                op = pathlib.Path(str(outfile))
+                if op.exists():
+                    try:
+                        sz = int(op.stat().st_size or 0)
+                    except Exception:
+                        sz = 0
+                    # Small threshold avoids "empty placeholder file" false-positives.
+                    if sz > 4096:
+                        salvaged = True
+        except Exception:
+            salvaged = False
+
+        if salvaged:
+            try:
+                job["exit_code"] = int(code_i)
+            except Exception:
+                pass
+            try:
+                prev_err = job.get("error")
+                msg = f"Command exited with code {code_i} but output exists; marking job as done."
+                if prev_err:
+                    msg = f"{msg}  (original error: {prev_err})"
+                job["warning"] = msg
+                try:
+                    job.pop("error", None)
+                except Exception:
+                    job["error"] = ""
+            except Exception:
+                pass
+            code_i = 0
+
+        if int(code_i) == 0:
             # Mark produced output if known
             try:
                 if outfile and pathlib.Path(str(outfile)).exists():
@@ -1169,11 +1211,12 @@ def tools_ffmpeg(job, cfg, mani):
         else:
             try:
                 if not job.get("error"):
-                    job["error"] = f"tools_ffmpeg failed (code {code})."
+                    job["error"] = f"tools_ffmpeg failed (code {code_i})."
             except Exception:
                 pass
 
-        return int(code)
+        return int(code_i)
+
     except Exception as e:
         try:
             job["error"] = f"tools_ffmpeg exception: {e}"

@@ -1145,6 +1145,7 @@ _EMOJI_MAP = {
     "folder": "🗂️",
 #    "explorer": "🗂️",
     "batch": "📦",
+    "clip": "🎬",
     "info": "💡",
     "txt2img": "📸",
     "loader": "📸",

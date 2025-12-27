@@ -13,7 +13,7 @@ from PySide6.QtCore import QUrl, Qt, QTimer, Signal, QEvent
 from PySide6.QtGui import QAction, QColor, QDesktopServices, QFont, QIcon, QPainter, QPainterPath, QPen, QPixmap
 from PySide6.QtWidgets import (
     QWidget, QLabel, QToolButton, QProgressBar,
-    QHBoxLayout, QVBoxLayout, QSizePolicy, QMenu, QStyle, QFrame, QListWidget, QListWidgetItem
+    QHBoxLayout, QVBoxLayout, QSizePolicy, QMenu, QStyle, QFrame
 )
 
 ETA_FUDGE_SEC = 3  # small cushion for cleanup (temp deletion, final writes)
@@ -490,9 +490,9 @@ class JobRowWidget(QWidget):
         top.setContentsMargins(0, 0, 0, 0)
         top.setSpacing(8)
         top.addWidget(self.status_strip, 0)
+        top.addLayout(actions, 0)
         top.addWidget(self.thumb, 0)
         top.addLayout(text_col, 1)
-        top.addLayout(actions, 0)
 
         lay = QVBoxLayout(self)
         lay.setContentsMargins(8, 6, 8, 6)
@@ -640,43 +640,42 @@ class JobRowWidget(QWidget):
 
         # --- Pending menu ---
         if status == "pending":
+            # NOTE: do not rebuild the queue synchronously from within a context menu action.
+            # We only adjust on-disk order (mtime swap) and then emit queueOrderChanged;
+            # QueuePane will debounce refresh safely.
+            try:
+                from PySide6.QtCore import QTimer
+                _defer = lambda fn: QTimer.singleShot(0, fn)
+            except Exception:
+                _defer = lambda fn: fn()
+
             act_up = QAction(self.style().standardIcon(QStyle.SP_ArrowUp), "Move up", self)
-            act_top = QAction(self.style().standardIcon(QStyle.SP_ArrowUp), "Move to top", self)
+            act_top = QAction(self.style().standardIcon(QStyle.SP_MediaSkipBackward), "Move to top", self)
             act_down = QAction(self.style().standardIcon(QStyle.SP_ArrowDown), "Move down", self)
-            act_bottom = QAction(self.style().standardIcon(QStyle.SP_ArrowDown), "Move to bottom", self)
-            act_info = QAction(self.style().standardIcon(QStyle.SP_FileIcon), "Show info", self)
+            act_bottom = QAction(self.style().standardIcon(QStyle.SP_MediaSkipForward), "Move to bottom", self)
+            act_info = QAction(self.style().standardIcon(QStyle.SP_MessageBoxInformation), "Show info", self)
             act_del = QAction(self.style().standardIcon(QStyle.SP_TrashIcon), "Delete job", self)
 
-            # Enable/disable up/down based on current UI position
-            try:
-                lw, it, ui_i = self._pending_find_list_item()
-                if ui_i <= 0:
-                    act_up.setEnabled(False)
-                    act_top.setEnabled(False)
-                if lw is not None and ui_i >= (lw.count() - 1):
-                    act_down.setEnabled(False)
-                    act_bottom.setEnabled(False)
-            except Exception:
-                pass
-
-            act_up.triggered.connect(self._pending_move_up)
-            act_top.triggered.connect(self._pending_move_top)
-            act_down.triggered.connect(self._pending_move_down)
-            act_bottom.triggered.connect(self._pending_move_bottom)
-            act_info.triggered.connect(self._view_json)
-            act_del.triggered.connect(self._delete_job)
+            act_up.triggered.connect(lambda: _defer(self._pending_move_up))
+            act_top.triggered.connect(lambda: _defer(self._pending_move_top))
+            act_down.triggered.connect(lambda: _defer(self._pending_move_down))
+            act_bottom.triggered.connect(lambda: _defer(self._pending_move_bottom))
+            act_info.triggered.connect(lambda: _defer(self._view_json))
+            act_del.triggered.connect(lambda: _defer(self._delete_job))
 
             menu.addAction(act_up)
             menu.addAction(act_top)
+            menu.addSeparator()
             menu.addAction(act_down)
             menu.addAction(act_bottom)
             menu.addSeparator()
             menu.addAction(act_info)
             menu.addAction(act_del)
+
             menu.exec(event.globalPos())
             return
 
-        # --- Default (done/failed/other) ---
+# --- Default (done/failed/other) ---
         act_open = QAction(self.style().standardIcon(QStyle.SP_DirOpenIcon), "Open output folder", self)
         act_play = QAction(self.style().standardIcon(QStyle.SP_MediaPlay), "Play output media", self)
         act_del = QAction(self.style().standardIcon(QStyle.SP_TrashIcon), "Delete output + remove from queue", self)
@@ -710,64 +709,16 @@ class JobRowWidget(QWidget):
             return Path('.').resolve()
 
     def _notify_queue_order_changed(self) -> None:
-        # Emit a local signal (optional hookup by QueuePane)
+        """Notify the QueuePane that pending job ordering changed.
+
+        IMPORTANT: Do not call parent .refresh() here (can crash Qt if invoked from context menu).
+        QueuePane should connect to queueOrderChanged and debounce via request_refresh().
+        """
         try:
             self.queueOrderChanged.emit()
         except Exception:
             pass
 
-        # Try to trigger a rebuild/refresh on a parent widget or window.
-        candidates = (
-            "refresh_queue",
-            "rebuild_queue",
-            "rebuild_pending",
-            "refresh_pending",
-            "refresh_jobs",
-            "reload_queue",
-            "refresh_list",
-            "refresh",
-        )
-
-        def _try_call(obj):
-            for name in candidates:
-                fn = getattr(obj, name, None)
-                if callable(fn):
-                    try:
-                        fn()
-                        return True
-                    except Exception:
-                        continue
-            return False
-
-        try:
-            obj = self.parent()
-            seen = set()
-            while obj is not None and id(obj) not in seen:
-                seen.add(id(obj))
-                if _try_call(obj):
-                    return
-                try:
-                    obj = obj.parent()
-                except Exception:
-                    break
-        except Exception:
-            pass
-
-        try:
-            win = self.window()
-            if win is not None:
-                if _try_call(win):
-                    return
-        except Exception:
-            pass
-
-        # Last resort: request an update.
-        try:
-            pw = self.parentWidget()
-            if pw is not None:
-                pw.update()
-        except Exception:
-            pass
 
     def _jobs_dirs_safe(self):
         """Resolve jobs directories with a hard fallback."""
@@ -872,72 +823,6 @@ class JobRowWidget(QWidget):
 
         return -1
 
-    def _pending_find_list_item(self):
-        """
-        Find the QListWidget/QListWidgetItem that hosts this row widget.
-        JobRowWidget is attached via QListWidget.setItemWidget, so its parent is usually the viewport.
-        """
-        try:
-            vp = self.parent()
-            lw = vp.parent() if vp is not None else None
-            if lw is None or not hasattr(lw, "count") or not hasattr(lw, "itemWidget"):
-                return None, None, -1
-
-            for i in range(int(lw.count())):
-                it = lw.item(i)
-                try:
-                    if lw.itemWidget(it) is self:
-                        return lw, it, i
-                except Exception:
-                    continue
-        except Exception:
-            pass
-        return None, None, -1
-
-    def _pending_move_visual_to(self, new_index: int):
-        """
-        Move the current row visually inside the QListWidget WITHOUT rebuilding the whole queue.
-        This avoids Qt crashes caused by repopulating the list while a context menu action is executing.
-        """
-        try:
-            lw, it, old_index = self._pending_find_list_item()
-            if lw is None or it is None or old_index < 0:
-                return
-            count = int(lw.count())
-            if count <= 1:
-                return
-
-            if new_index < 0:
-                new_index = 0
-            if new_index >= count:
-                new_index = count - 1
-            if new_index == old_index:
-                return
-
-            w = lw.itemWidget(it)
-            try:
-                lw.removeItemWidget(it)
-            except Exception:
-                pass
-
-            taken = lw.takeItem(old_index)
-            lw.insertItem(new_index, taken)
-
-            if w is not None:
-                lw.setItemWidget(taken, w)
-                try:
-                    taken.setSizeHint(w.sizeHint())
-                except Exception:
-                    pass
-
-            try:
-                lw.setCurrentItem(taken)
-                lw.scrollToItem(taken)
-            except Exception:
-                pass
-        except Exception:
-            pass
-
     def _set_mtime(self, p: Path, ts: float):
         try:
             os.utime(str(p), (ts, ts))
@@ -966,13 +851,7 @@ class JobRowWidget(QWidget):
             self._set_mtime(a, tb)
             self._set_mtime(b, ta)
 
-            # Move the row visually without rebuilding the whole queue (avoids Qt crashes).
-            try:
-                lw, it, ui_i = self._pending_find_list_item()
-                if ui_i >= 0:
-                    self._pending_move_visual_to(ui_i + int(offset))
-            except Exception:
-                pass
+            self._notify_queue_order_changed()
         except Exception:
             pass
 
@@ -995,11 +874,7 @@ class JobRowWidget(QWidget):
             # Push current slightly before the first item
             self._set_mtime(cur, first_ts - 10.0)
 
-            # Visual move: go to top without rebuilding.
-            try:
-                self._pending_move_visual_to(0)
-            except Exception:
-                pass
+            self._notify_queue_order_changed()
         except Exception:
             pass
 
@@ -1016,13 +891,7 @@ class JobRowWidget(QWidget):
             # Push current slightly after the last item
             self._set_mtime(cur, last_ts + 10.0)
 
-            # Visual move: go to bottom without rebuilding.
-            try:
-                lw, it, ui_i = self._pending_find_list_item()
-                if lw is not None:
-                    self._pending_move_visual_to(int(lw.count()) - 1)
-            except Exception:
-                pass
+            self._notify_queue_order_changed()
         except Exception:
             pass
 

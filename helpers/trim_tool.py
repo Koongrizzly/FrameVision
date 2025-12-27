@@ -1,7 +1,7 @@
 
 # helpers/trim_tool.py — adaptive grid + draggable range bar + dim outside + no auto-regenerate
 from __future__ import annotations
-import os, subprocess
+import os, subprocess, sys
 from pathlib import Path
 from PySide6.QtCore import Qt, QEvent, QObject, QRect, Signal
 from PySide6.QtGui import QPainter, QPixmap
@@ -12,6 +12,23 @@ from PySide6.QtWidgets import (
 , QDialog, QVBoxLayout, QListWidget, QFileDialog, QDialogButtonBox, QGroupBox, QRadioButton, QListWidgetItem)
 
 # ---- paths ----
+# Try to reuse app-wide output paths. Fallback keeps the tool usable standalone.
+try:
+    from helpers.framevision_app import ROOT, OUT_VIDEOS, OUT_TRIMS  # type: ignore
+except Exception:
+    ROOT = Path('.').resolve()
+    OUT_VIDEOS = ROOT / 'output' / 'video'
+    OUT_TRIMS = OUT_VIDEOS / 'trims'
+try:
+    OUT_TRIMS = (OUT_VIDEOS / 'trims')
+except Exception:
+    pass
+try:
+    OUT_TRIMS.mkdir(parents=True, exist_ok=True)
+except Exception:
+    pass
+
+
 def ffmpeg_path():
     try:
         from helpers.framevision_app import ROOT  # type: ignore
@@ -158,9 +175,10 @@ def install_trim_tool(pane, section_widget):
     # Base controls
     pane.trim_mode = QComboBox(); pane.trim_mode.addItems(["Fast copy (keyframe)", "Precise re-encode"])  # type: ignore
     pane.trim_start = QLineEdit("00:00:00.000"); pane.trim_end = QLineEdit("")
-    pane.btn_trim = QPushButton("Trim"); pane.btn_trim_batch = QPushButton("Batch…")
+    pane.btn_trim = QPushButton("Trim"); pane.btn_trim_batch = QPushButton("Batch…"); pane.btn_trim_open_folder = QPushButton("View results")
+    pane.btn_trim_open_folder.setToolTip("Open these results in Media Explorer.")
     lay = QFormLayout(); lay.addRow("Trim mode", pane.trim_mode); lay.addRow("Start", pane.trim_start); lay.addRow("End", pane.trim_end)
-    row = QHBoxLayout(); row.addWidget(pane.btn_trim); row.addWidget(pane.btn_trim_batch); lay.addRow(row)
+    row = QHBoxLayout(); row.addWidget(pane.btn_trim); row.addWidget(pane.btn_trim_batch); row.addWidget(pane.btn_trim_open_folder); lay.addRow(row)
 
     # Preview controls
     pane.btn_trim_preview = QPushButton("Generate preview")
@@ -417,6 +435,87 @@ def install_trim_tool(pane, section_widget):
     # wire up the Batch button
     try:
         pane.btn_trim_batch.clicked.connect(_open_batch_dialog)
+    except Exception:
+        pass
+
+# ---- view results ----
+def _open_folder_in_os(folder_path):
+    """Open a folder in the system file manager (Explorer/Finder/etc.)."""
+    try:
+        fp = Path(str(folder_path))
+    except Exception:
+        fp = None
+    if fp is None:
+        return
+    try:
+        fp.mkdir(parents=True, exist_ok=True)
+    except Exception:
+        pass
+    try:
+        if os.name == "nt":
+            os.startfile(str(fp))  # type: ignore[attr-defined]
+            return
+    except Exception:
+        pass
+    try:
+        if sys.platform == "darwin":
+            subprocess.Popen(["open", str(fp)])
+        else:
+            subprocess.Popen(["xdg-open", str(fp)])
+    except Exception:
+        pass
+
+def _trim_open_folder():
+    """Open Trim tool results in Media Explorer (fallback: OS folder)."""
+    folder = None
+    try:
+        folder = getattr(pane, "_trim_last_out_dir", None)
+    except Exception:
+        folder = None
+    if not folder:
+        try:
+            folder = OUT_TRIMS
+        except Exception:
+            folder = Path("output") / "video" / "trims"
+    try:
+        fp = folder if isinstance(folder, Path) else Path(str(folder))
+        try:
+            fp.mkdir(parents=True, exist_ok=True)
+        except Exception:
+            pass
+    except Exception:
+        fp = None
+
+    # Prefer Media Explorer on main window if available
+    main = None
+    try:
+        main = getattr(pane, "main", None)
+    except Exception:
+        main = None
+    if main is None:
+        try:
+            main = pane.window() if hasattr(pane, "window") else None
+        except Exception:
+            main = None
+
+    if main is not None and hasattr(main, "open_media_explorer_folder") and fp is not None:
+        try:
+            main.open_media_explorer_folder(str(fp), preset="videos", include_subfolders=False)
+            return
+        except TypeError:
+            try:
+                main.open_media_explorer_folder(str(fp))
+                return
+            except Exception:
+                pass
+        except Exception:
+            pass
+
+    if fp is not None:
+        _open_folder_in_os(fp)
+
+    try:
+        pane.btn_trim_open_folder.clicked.connect(_trim_open_folder)
     except Exception:
         pass
 
