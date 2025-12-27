@@ -900,6 +900,11 @@ class VideoPane(QWidget):
         try:
             if hasattr(self, 'btn_repeat'):
                 self.btn_repeat.setVisible(bool(is_video))
+                try:
+                    from PySide6.QtCore import QTimer as _QTimer
+                    _QTimer.singleShot(0, self._update_compact_button_labels)
+                except Exception:
+                    pass
         except Exception:
             pass
 
@@ -908,6 +913,11 @@ class VideoPane(QWidget):
             enabled = bool(getattr(self, '_repeat_enabled', False))
             if not hasattr(self, 'btn_repeat') or self.btn_repeat is None:
                 return
+
+            compact = bool(getattr(self.btn_repeat, "_fv_compact_label", False))
+            pad = "4px 10px" if compact else "4px 14px"
+            fw  = "900" if compact else "600"
+
             base = self.palette().button().color()
             hi = self.palette().highlight().color()
             txt_base = self.palette().buttonText().color()
@@ -915,7 +925,7 @@ class VideoPane(QWidget):
             bg = hi if enabled else base
             fg = txt_hi if enabled else txt_base
             css = (
-                "QPushButton#btn_repeat { padding:4px 14px; border-radius:8px; font-weight:600;"
+                f"QPushButton#btn_repeat {{ padding:{pad}; border-radius:8px; font-weight:{fw};"
                 f" background: rgba({bg.red()},{bg.green()},{bg.blue()},255);"
                 f" color: rgba({fg.red()},{fg.green()},{fg.blue()},255); }}"
                 "QPushButton#btn_repeat:hover { opacity: 0.9; }"
@@ -965,12 +975,16 @@ class VideoPane(QWidget):
             pass
 
     def _update_compact_button_labels(self):
-        """Swap Upscale/Ask Framie to single-letter mode when there isn't room for the full label."""
+        """Swap Upscale/Ask Framie/Repeat to single-letter mode when there isn't room for the full labels."""
         try:
             bu = getattr(self, "btn_upscale", None)
             ba = getattr(self, "btn_ask", None)
+            br = getattr(self, "btn_repeat", None)
+
             if bu is None or ba is None:
                 return
+
+            include_repeat = bool(br is not None and br.isVisible())
 
             # Layout can report 0 sizes early in init; retry once we're laid out.
             if self.width() <= 10:
@@ -983,6 +997,7 @@ class VideoPane(QWidget):
 
             full_u = getattr(self, "_btn_upscale_full_text", "Upscale")
             full_a = getattr(self, "_btn_ask_full_text", "Ask Framie")
+            full_r = getattr(self, "_btn_repeat_full_text", "Repeat")
 
             fm_u = bu.fontMetrics()
             fm_a = ba.fontMetrics()
@@ -990,6 +1005,14 @@ class VideoPane(QWidget):
             # Approximate full-label width as (text + padding/border).
             need_u = int(fm_u.horizontalAdvance(full_u)) + 28
             need_a = int(fm_a.horizontalAdvance(full_a)) + 28
+
+            need_r = 0
+            if include_repeat:
+                try:
+                    fm_r = br.fontMetrics()
+                    need_r = int(fm_r.horizontalAdvance(full_r)) + 28
+                except Exception:
+                    need_r = 0
 
             # IMPORTANT:
             # Don't decide compactness based on *current* button width.
@@ -1014,7 +1037,7 @@ class VideoPane(QWidget):
                     if spacing < 0:
                         spacing = 6
 
-                    # Sum size hints of everything else on the row (excluding the two label-switching buttons).
+                    # Sum size hints of everything else on the row (excluding the label-switching buttons).
                     vis_widgets = []
                     total_vis = 0
                     for i in range(lay.count()):
@@ -1023,7 +1046,7 @@ class VideoPane(QWidget):
                         if w is None or (not w.isVisible()):
                             continue
                         total_vis += 1
-                        if (w is bu) or (w is ba):
+                        if (w is bu) or (w is ba) or (include_repeat and (w is br)):
                             continue
                         vis_widgets.append(w)
 
@@ -1042,9 +1065,9 @@ class VideoPane(QWidget):
             except Exception:
                 pass
 
-            # If full labels fit, force full; otherwise force compact (both together).
+            # If full labels fit, force full; otherwise force compact (all together).
             cushion = 8
-            want_full = (avail >= (fixed + need_u + need_a + cushion))
+            want_full = (avail >= (fixed + need_u + need_a + need_r + cushion))
             compact_u = not want_full
             compact_a = not want_full
 
@@ -1064,10 +1087,34 @@ class VideoPane(QWidget):
                 getattr(self, "_btn_ask_style_full", ""),
                 getattr(self, "_btn_ask_style_compact", ""),
             )
+
+            # Repeat uses palette-driven styling, so we only switch the label flag + text and then refresh its style.
+            if include_repeat:
+                try:
+                    want = bool(not want_full)
+                    cur = bool(getattr(br, "_fv_compact_label", False))
+                    if want != cur:
+                        br._fv_compact_label = want
+                        if want:
+                            br.setText(str(getattr(self, "_btn_repeat_compact_text", "R") or "R")[:1].upper())
+                            try:
+                                br.setToolTip(full_r)
+                            except Exception:
+                                pass
+                        else:
+                            br.setText(full_r)
+                            try:
+                                br.setToolTip("")
+                            except Exception:
+                                pass
+                        try:
+                            self._update_repeat_style()
+                        except Exception:
+                            pass
+                except Exception:
+                    pass
         except Exception:
             pass
-
-
 
     frameCaptured = Signal(QImage)
     # --- zoom/pan helpers ---
@@ -1290,6 +1337,8 @@ class VideoPane(QWidget):
             # Swap to a single bold capital letter (U/A) until there's room again.
             self._btn_upscale_full_text = "Upscale"
             self._btn_ask_full_text = "Ask Framie"
+            self._btn_repeat_full_text = "Repeat"
+            self._btn_repeat_compact_text = "R"
             self._btn_upscale_compact_text = "U"
             self._btn_ask_compact_text = "A"
 
