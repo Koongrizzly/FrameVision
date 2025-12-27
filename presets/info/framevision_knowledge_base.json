@@ -19,7 +19,7 @@
         "RIFE interpolation",
         "thumbnail/meme creator"
       ],
-      "description": "FrameVision is a **local, all‑in‑one** toolbox for **creating, editing, and upscaling** both **images and videos**.\n\nIt’s built around a simple workflow: **open media in the left viewer → pick a task tab on the right → run (or queue) → browse results**.\n\nBesides classic upscaling and editing, FrameVision also includes:\n• a **music player** with **hundreds of built‑in visuals** (250+ in recent builds) and an optional beat/energy pre‑analysis\n• **sound tools** (speed change with sync, add/mix audio, quality/size control, GIF export, trims, frame extract)\n• a **Music Videoclip Creator** (beat‑matched automatic editing + optional timeline control)\n• AI **Describe** (captioning / prompt generation) and **RIFE** interpolation for smoother motion\n• handy creators like **Thumbnail/Meme**.\n\nEverything runs on your machine (Windows‑first), with a background worker to keep the UI responsive.",
+      "description": "FrameVision is a **local, all‑in‑one** toolbox for **creating, editing, and upscaling** both **images and videos**.\n\nIt’s built around a simple workflow: **open media in the left viewer → pick a task tab on the right → run (or queue) → browse results**.\n\nBesides classic upscaling and editing, FrameVision also includes:\n• a **music player** with **hundreds of built‑in visuals** (250+ in recent builds) and an optional beat/energy pre‑analysis\n• **sound tools** (speed change with sync, add/mix audio, quality/size control, GIF export, trims, frame extract)\n• a **Music Videoclip Creator** (beat‑matched automatic editing + optional timeline control)\n• AI **Describe** (captioning / prompt generation) and **RIFE** interpolation for smoother motion\n• handy creators like **Thumbnail/Meme**.\n\nEverything runs on your machine (Windows‑first), with a background worker to keep the UI responsive. It’s also a **safety layer**: jobs keep running inside the worker even if FrameVision is closed, restarted, or crashes. Jobs only stop when you close the **worker window itself**, or when a broken job crashes the worker (for example: missing model files or invalid commands).",
       "hints_tips": [
         "Use the resizable layout by dragging the splitter to adjust player and tabs.",
         "Tooltips are available on every feature for guidance.",
@@ -44,7 +44,7 @@
           "answer": "A built‑in multimedia player, music player with beat‑reactive visuals, sound tools (speed/audio/quality), a beat‑matched Music Videoclip Creator, AI Describe (captioning/prompting), and RIFE interpolation."
         }
       ],
-      "overview": "FrameVision is a **local, all‑in‑one** toolbox for **creating, editing, and upscaling** both **images and videos**.\n\nIt’s built around a simple workflow: **open media in the left viewer → pick a task tab on the right → run (or queue) → browse results**.\n\nBesides classic upscaling and editing, FrameVision also includes:\n• a **music player** with **hundreds of built‑in visuals** (250+ in recent builds) and an optional beat/energy pre‑analysis\n• **sound tools** (speed change with sync, add/mix audio, quality/size control, GIF export, trims, frame extract)\n• a **Music Videoclip Creator** (beat‑matched automatic editing + optional timeline control)\n• AI **Describe** (captioning / prompt generation) and **RIFE** interpolation for smoother motion\n• handy creators like **Thumbnail/Meme**.\n\nEverything runs on your machine (Windows‑first), with a background worker to keep the UI responsive.",
+      "overview": "FrameVision is a **local, all‑in‑one** toolbox for **creating, editing, and upscaling** both **images and videos**.\n\nIt’s built around a simple workflow: **open media in the left viewer → pick a task tab on the right → run (or queue) → browse results**.\n\nBesides classic upscaling and editing, FrameVision also includes:\n• a **music player** with **hundreds of built‑in visuals** (250+ in recent builds) and an optional beat/energy pre‑analysis\n• **sound tools** (speed change with sync, add/mix audio, quality/size control, GIF export, trims, frame extract)\n• a **Music Videoclip Creator** (beat‑matched automatic editing + optional timeline control)\n• AI **Describe** (captioning / prompt generation) and **RIFE** interpolation for smoother motion\n• handy creators like **Thumbnail/Meme**.\n\nEverything runs on your machine (Windows‑first), with a background worker to keep the UI responsive. It’s also a **safety layer**: jobs keep running inside the worker even if FrameVision is closed, restarted, or crashes. Jobs only stop when you close the **worker window itself**, or when a broken job crashes the worker (for example: missing model files or invalid commands).",
       "features": [
         "Key term: FrameVision",
         "Key term: all-in-one video & photo upscaler/editor",
@@ -1189,104 +1189,97 @@
       }
     },
     "Settings": {
-      "description": "Controls themes, behavior, paths, and diagnostics. Includes the Theme picker (Apply, Auto, Random), maintenance buttons (Open log folder, Clear program cache…, Restart App, Dump QSettings), temperature units (°C/°F), and the System Monitor (SysMon).",
+      "description": "Controls global look & behavior. Includes a Theme picker (Apply / Auto / Random), intro overlay effects for the startup intro image (with optional preview), a collapsible Options panel for UI/diagnostics toggles, temperature units (°C/°F), and maintenance tools like Clear program cache…, Restart App, and Show QSettings in CMD.",
       "key_terms": [
+        "Apply",
         "Auto theme",
+        "Banners",
         "Clear program cache",
-        "Dump QSettings",
-        "Open log folder",
+        "Colored banners",
+        "Diagnostic logging",
+        "Emoji labels",
+        "Intro overlay",
+        "Keep user preferences",
+        "Matrix overlay",
+        "Options (collapsible)",
+        "Overlay preview",
         "Random theme",
+        "Reorder tabs",
+        "Reset tab order",
         "Restart App",
-        "SysMon",
-        "Temperature units",
-        "Theme Apply"
+        "Show QSettings",
+        "Show hover tips",
+        "Swap layout",
+        "Temperature units (°C/°F)",
+        "Theme"
       ],
       "hints_tips": [
-        "Use Open log folder to quickly grab diagnostics for support.",
-        "Clear program cache… removes temp files; safe to run after updates or odd UI behavior.",
-        "Auto theme switches Day/Evening/Night by local time; Random picks a theme on apply."
+        "Theme changes apply immediately when you pick a new theme (and you can still hit Apply).",
+        "Intro overlay is purely visual for the startup intro image; if you don’t want extra animation, toggle it off or disable Preview.",
+        "Clear program cache… is safe and runs in a separate process so the UI doesn’t freeze—use it after updates or when the app feels ‘weird’.",
+        "If emoji looks broken on your system, disable Emoji labels (or keep Emoji labels on but turn off ‘Show labels with emojis on the tabs’).",
+        "Use Reorder tabs to drag tabs into your preferred order; hit Reset to default if you want the original layout back."
       ],
       "qa_pairs": [
         {
           "question": "How do I change the theme?",
-          "answer": "Pick a theme in Settings and click Apply. Use Auto to change by time of day or Random to pick a theme each apply."
+          "answer": "Go to Settings → Theme and pick a theme. It applies immediately when you change the selection (and the Apply button is there too). Choose Auto to switch by time of day or Random for a different theme each time."
         },
         {
-          "question": "Where are logs/configs?",
-          "answer": "Click Open log folder for logs. Use Dump QSettings to export current settings for support."
+          "question": "What is “Intro overlay”?",
+          "answer": "It adds a visual effect on top of the startup intro image (e.g., Matrix rain, Bokeh, Starfield). You can pick the overlay style and optionally enable Preview to see it briefly inside Settings."
         },
         {
-          "question": "Can I restart from Settings?",
-          "answer": "Yes—Restart App relaunches the app with current configuration."
+          "question": "What does “Clear program cache…” remove?",
+          "answer": "It opens a checklist (Python cache, old logs, old thumbnails, Qt cache, temp folders). Pick what you want to clean, then it runs a cleanup helper in a separate process and reports what it removed."
+        },
+        {
+          "question": "How do I reorder tabs?",
+          "answer": "Enable Settings → Options → Reorder tabs. Then you can drag tabs to rearrange them. Use Reset to default to restore the original order."
+        },
+        {
+          "question": "Where do I find temperature units?",
+          "answer": "In Settings → Options → Temperature units. Pick Celsius or Fahrenheit; it’s stored in the app config and used across the UI."
         }
       ],
       "controls": [
         "Theme:",
-        "Apply theme",
+        "Apply",
+        "Intro overlay",
+        "Overlay mode (Random / Matrix (Green) / Matrix (Blue) / Bokeh / Rain / Fireworks / …)",
+        "Preview",
         "Options",
-        "Show random intro image on startup",
-        "Intro follows theme routine (Day/Evening/Night)",
-        "Clear app Python cache files in /__pycache__ at (re)start",
-        "Keep all used settings after restart",
+        "Clear app Python cache at (re)start",
+        "Show hover tips",
+        "Keep user preferences",
+        "Enable diagnostic logging (restart to apply)",
+        "Banners",
+        "Colored",
+        "Emoji labels",
+        "Show labels with emojis on the tabs",
+        "Swap left/right layout",
+        "Reorder tabs",
+        "Reset to default",
         "Temperature units:",
         "Clear program cache…",
         "Restart App",
-        "Dump QSettings now",
-        "GitHub",
-        "YouTube"
+        "Show QSettings in CMD"
       ],
       "_controls_meta": {
-        "last_appended": "2025-09-07",
-        "source": "auto-extracted from code (helpers/)",
+        "last_appended": "2025-12-27",
+        "source": "updated from settings_tab.py (user-provided)",
         "modules_used": [
           "settings_tab.py"
         ]
       },
       "features": [
-        "Open log folder; QSettings dump; per-tab remember settings; °C/°F toggle (global).",
-        "Auto theme",
-        "Clear program cache",
-        "Dump QSettings",
-        "Open log folder",
-        "Random theme",
-        "Restart App",
-        "SysMon",
-        "Temperature units",
-        "Theme Apply",
-        "Theme:",
-        "Apply theme",
-        "Options",
-        "Show random intro image on startup",
-        "Intro follows theme routine (Day/Evening/Night)",
-        "Clear app Python cache files in /__pycache__ at (re)start",
-        "Keep all used settings after restart",
-        "Temperature units:",
-        "Clear program cache…",
-        "Restart App",
-        "Dump QSettings now",
-        "GitHub",
-        "Key term: Auto theme",
-        "Key term: Clear program cache",
-        "Key term: Dump QSettings",
-        "Key term: Open log folder",
-        "Key term: Random theme",
-        "Key term: Restart App",
-        "Key term: SysMon",
-        "Key term: Temperature units",
-        "Key term: Theme Apply",
-        "Control: Theme: — label. Default: unset/neutral. Does: UI control.",
-        "Control: Apply theme — button. Default: n/a (runs on click). Does: Perform the labeled action immediately.",
-        "Control: Options — groupbox. Default: unset/neutral. Does: UI control.",
-        "Control: Show random intro image on startup — checkbox. Default: off (toggle to enable). Does: Toggle feature on/off.",
-        "Control: Intro follows theme routine (Day/Evening/Night) — checkbox. Default: off (toggle to enable). Does: Toggle feature on/off.",
-        "Control: Clear app Python cache files in /__pycache__ at (re)start — checkbox. Default: off (toggle to enable). Does: Toggle feature on/off.",
-        "Control: Keep all used settings after restart — checkbox. Default: off (toggle to enable). Does: Toggle feature on/off.",
-        "Control: Temperature units: — label. Default: unset/neutral. Does: Decoding controls that affect diversity and randomness.",
-        "Control: Clear program cache… — button. Default: n/a (runs on click). Does: Perform the labeled action immediately.",
-        "Control: Restart App — button. Default: n/a (runs on click). Does: Perform the labeled action immediately.",
-        "Control: Dump QSettings now — button. Default: n/a (runs on click). Does: Perform the labeled action immediately.",
-        "Control: GitHub — button. Default: n/a (runs on click). Does: Perform the labeled action immediately.",
-        "Control: YouTube — button. Default: n/a (runs on click). Does: Perform the labeled action immediately."
+        "Theme picker with Apply + Auto + Random; expanded theme list (Day/Evening/Night, greys, neon, colorful themes).",
+        "Intro overlay effects for the startup intro image, with selectable mode and optional preview in Settings.",
+        "Collapsible Options panel (persisted) to keep the Settings tab lightweight and avoid scroll clipping glitches.",
+        "Behavior toggles: clear Python cache at (re)start, show hover tips, keep user preferences after restart, swap left/right layout.",
+        "UI toggles: banners on/off + colored/grey, emoji labels (and optional text on tab titles), reorder tabs with reset.",
+        "Temperature units (°C/°F) stored in config (`temp_units`).",
+        "Maintenance: Clear program cache… (selectable cleanup; runs in a separate process), Restart App, Show QSettings in CMD."
       ],
       "install": [
         "General install flow: use **Install/Updates → Option 1** to auto-detect environment, then **Option 2** for repair, or **Option 3/4** for full stacks.",
@@ -1302,7 +1295,7 @@
         "For environment issues, follow **InstallUpdates → Troubleshoot** steps.",
         "Check the job **run_*.log** in the logs folder for this feature’s errors (if applicable)."
       ],
-      "overview": "Controls themes, behavior, paths, and diagnostics. Includes the Theme picker (Apply, Auto, Random), maintenance buttons (Open log folder, Clear program cache…, Restart App, Dump QSettings), temperature units (°C/°F), and the System Monitor (SysMon).",
+      "overview": "Controls global look & behavior. Includes a Theme picker (Apply / Auto / Random), intro overlay effects for the startup intro image (with optional preview), a collapsible Options panel for UI/diagnostics toggles, temperature units (°C/°F), and maintenance tools like Clear program cache…, Restart App, and Show QSettings in CMD.",
       "_layout": "overview/features/install/troubleshoot",
       "_features_meta": {
         "oneliners_last_updated": "2025-09-07",
@@ -1387,28 +1380,35 @@
       }
     },
     "Themes": {
-      "description": "Multiple built‑in themes with Apply, Auto (time‑based), and Random. Examples: Day, Evening, Night, Slate, High Contrast, Cyberpunk, Neon, Ocean, CRT, Aurora, Mardi Gras, Tropical Fiesta, Color Mix, Solarized Light, Sunburst.",
+      "description": "Multiple built‑in themes with **Apply**, **Auto** (time‑based), and **Random**.\n\nAvailable themes: Day, Evening, Night, Slate, High Contrast, Cyberpunk, Neon, Ocean, CRT, Aurora, Mardi Gras, Tropical Fiesta, Color Mix, Solarized Light, Sunburst, Pastel Light, Cloud Grey, Signal Grey, Graphite Dusk, Rainbow Riot, Candy Pop.",
       "key_terms": [
         "Aurora",
         "Auto",
         "CRT",
+        "Candy Pop",
+        "Cloud Grey",
         "Color Mix",
         "Cyberpunk",
         "Day",
         "Evening",
+        "Graphite Dusk",
         "High Contrast",
         "Mardi Gras",
         "Neon",
         "Night",
         "Ocean",
+        "Pastel Light",
+        "Rainbow Riot",
         "Random",
+        "Signal Grey",
         "Slate",
         "Solarized Light",
         "Sunburst",
         "Tropical Fiesta"
       ],
       "hints_tips": [
-        "Use Auto for hands‑free day/evening/night; Random for variety during sessions."
+        "Use Auto for hands‑free day/evening/night; Random for variety during sessions.",
+        "Colorful picks: Rainbow Riot, Candy Pop, and Color Mix. Softer greys: Cloud Grey and Signal Grey. Dark vibe: Graphite Dusk."
       ],
       "qa_pairs": [
         {
@@ -2924,7 +2924,7 @@
       "_layout": "overview/features/install/troubleshoot"
     },
     "Worker": {
-      "description": "A separate process that executes queued jobs so the UI stays smooth. Watches jobs/pending/, moves to jobs/running/, stamps start/finish/duration, writes logs, and finishes in jobs/done/ or jobs/failed/. Writes a heartbeat for liveness and a .progress.json for UI progress.",
+      "description": "The Worker is a **separate process** that executes Queue jobs so the UI stays smooth **and** so jobs keep running reliably.\n\n- Watches `jobs/pending/` → moves jobs into `jobs/running/`\n- Stamps `started_at`, `finished_at`, and `duration_sec`\n- Streams tool output into `logs/run_*.log`\n- Writes progress to a sidecar `.progress.json` (plus richer fields like `elapsed_sec` / `eta_sec` in the running job JSON)\n- Supports **cancel** (UI flag + `.cancel` marker) and best‑effort process‑tree killing\n- Finishes jobs in `jobs/done/` or `jobs/failed/` and keeps a heartbeat at `logs/worker_heartbeat.txt`\n\n**Safety behavior:** the worker keeps going if the main app is closed/restarted/crashes — only closing the worker itself stops jobs.",
       "key_terms": [
         ".progress.json",
         "FFmpeg passthrough",
@@ -2935,11 +2935,22 @@
         "Separate process",
         "models_manifest.json auto‑detect",
         "run_*.log",
-        "started_at/finished_at/duration"
+        "started_at/finished_at/duration",
+        ".cancel marker",
+        "cancel_requested",
+        "active_pid / active_cmd",
+        "elapsed_sec / eta_sec",
+        "process-tree kill (taskkill /T)",
+        "job reroute (image↔video)",
+        "no-overwrite outputs (_001, _002…)",
+        "legacy tree migration"
       ],
       "hints_tips": [
         "Each run logs the full command and stdout/stderr to logs/run_*.log.",
-        "If the heartbeat is stale and jobs don’t move, restart the app/worker."
+        "If the heartbeat is stale and jobs don’t move, restart the app/worker.",
+        "If FrameVision is closed or crashes, **don’t panic** — the worker keeps running and will finish the job unless the worker itself is closed/crashes.",
+        "If a job is **stuck** and can’t be cancelled in the UI, or a job **crashes the worker**: go to `(root)/jobs/` and delete the bad job JSON from `jobs/running/`. If it’s queued to run later, also delete it from `jobs/pending/`.",
+        "For cancellation: the app can set `cancel_requested` in the running job JSON and/or create a `.cancel` sidecar next to it; the worker will stop the active subprocess when possible."
       ],
       "qa_pairs": [
         {
@@ -2952,7 +2963,15 @@
         },
         {
           "question": "How are models found?",
-          "answer": "Checks models_manifest.json then scans models/ for known names; RIFE model dirs auto‑detected."
+          "answer": "Checks `models_manifest.json` first, then scans your models/tools folders for known executables (upscalers + RIFE). If paths change, the worker can usually still auto-detect as long as the files exist under your configured models folder."
+        },
+        {
+          "question": "Can I close FrameVision while a job is running?",
+          "answer": "Yes. The Worker is a separate process, so jobs keep running even if the UI is closed, restarted, or crashes. Jobs stop only if you close the worker window itself, or if a bad job crashes the worker."
+        },
+        {
+          "question": "A job is stuck / won’t cancel — what do I do?",
+          "answer": "Go to `(root)/jobs/` and delete the bad job JSON from `jobs/running/`. If it’s a bad job waiting in line, also delete it from `jobs/pending/`. Then restart the worker if needed."
         }
       ]
     }
