@@ -62,6 +62,13 @@ SAFE_VAE_FILES = [
 
 
 
+# ---- Diffusers (folder) snapshot downloads (used by the FP16 installer)
+# This installs the *Diffusers* layout (model_index.json + subfolders like transformer/, text_encoder/, vae/, scheduler/, tokenizer/, ...).
+# Default points to the official model repo; override via --diffusers-repo if you maintain your own repack.
+DIFFUSERS_REPO_DEFAULT = "Tongyi-MAI/Z-Image-Turbo"
+DIFFUSERS_REVISION_DEFAULT = "main"
+HF_MODEL_API = "https://huggingface.co/api/models/{repo}"
+
 VAE_URL = "https://huggingface.co/Comfy-Org/z_image_turbo/resolve/main/split_files/vae/ae.safetensors"
 SDCPP_LATEST_API = "https://api.github.com/repos/leejet/stable-diffusion.cpp/releases/latest"
 
@@ -182,6 +189,81 @@ def download_any(urls: list[str], dst: Path) -> None:
             last = e
             log(f"[zimage-gguf]   mirror failed: {u} ({type(e).__name__})")
     raise RuntimeError(f"all mirrors failed for {dst.name}\n{last}")
+
+
+def hf_list_repo_files(repo: str, revision: str = "main") -> list[str]:
+    """List file paths in a Hugging Face model repo using the public API."""
+    url = HF_MODEL_API.format(repo=repo)
+    if revision:
+        url = url + ("?revision=" + revision)
+    data = json.loads(http_get(url).decode("utf-8", errors="replace"))
+    sib = data.get("siblings") or []
+    files: list[str] = []
+    for s in sib:
+        fn = s.get("rfilename") or s.get("path") or s.get("name")
+        if fn:
+            files.append(fn)
+    return sorted(set(files))
+
+def _install_diffusers_snapshot(repo: str, revision: str, target: Path) -> None:
+    """Download the full Diffusers snapshot for Z-Image Turbo.
+
+    Mirrors the original fp16_install.bat which used huggingface_hub.snapshot_download(),
+    but avoids requiring huggingface_hub to be installed.
+    """
+    target.mkdir(parents=True, exist_ok=True)
+
+    log(f"[zimage-diff] repo    : {repo}")
+    log(f"[zimage-diff] revision: {revision}")
+
+    files = hf_list_repo_files(repo, revision)
+    if not files:
+        raise RuntimeError(f"No files returned by HF API for repo: {repo}")
+
+    log(f"[zimage-diff] files   : {len(files)}")
+
+    base = f"https://huggingface.co/{repo}/resolve/{revision}/"
+    for rel in files:
+        if not rel or rel.endswith("/"):
+            continue
+        dst = target / rel
+        download(base + rel, dst)
+
+    # Verify model_index.json exists (Diffusers layout sanity check).
+    mi = target / "model_index.json"
+    if not mi.exists():
+        (target / "_DIFFUSERS_INCOMPLETE.txt").write_text(
+            "\n".join(
+                [
+                    "[WARN] model_index.json not found after download.",
+                    "This usually indicates an incomplete download.",
+                    "Try deleting the folder and running the installer again.",
+                    "",
+                    f"Repo: {repo}",
+                    f"Revision: {revision}",
+                    "",
+                ]
+            ),
+            encoding="utf-8",
+        )
+        log("[zimage-diff] warn: model_index.json not found (incomplete download?)")
+    else:
+        log("[zimage-diff] ok: model_index.json found")
+
+    (target / "_diffusers_sources.txt").write_text(
+        "\n".join(
+            [
+                f"Repo: {repo}",
+                f"Revision: {revision}",
+                f"File count: {len(files)}",
+                "",
+                "Files:",
+                *[f"  {f}" for f in files],
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
 
 def extract_zip(zip_path: Path, dst_dir: Path) -> None:
     if dst_dir.exists():
@@ -475,13 +557,19 @@ def _parse_args(argv) -> argparse.Namespace:
     # Back-compat: allow positional root + target (as older .bat wrapper passed).
     p.add_argument("root", nargs="?", default=None, help="FrameVision root folder (optional)")
     p.add_argument("target", nargs="?", default=None, help="Target install folder (optional)")
-    p.add_argument("--mode", default="gguf", choices=["gguf", "safetensors"],
-                   help="Install mode: 'gguf' installs GGUF diffusion+text+VAE + sd.cpp binaries; "
-                        "'safetensors' installs ComfyUI-style safetensors (diffusion+text encoder+VAE).")
+    p.add_argument("--mode", default="gguf", choices=["gguf", "safetensors", "diffusers"],
+               help="Install mode: 'gguf' installs GGUF diffusion+text+VAE + sd.cpp binaries; "
+                    "'safetensors' installs ComfyUI-style safetensors (diffusion+text encoder+VAE); "
+                    "'diffusers' downloads the full Diffusers snapshot (model_index.json + subfolders).")
     p.add_argument("--precision", default="fp16", choices=["fp16", "bf16", "fp32"],
                    help="Safetensors precision to download (only used when --mode safetensors).")
     p.add_argument("--safe-repo", default=SAFE_REPO_DEFAULT,
                    help="Hugging Face repo for safetensors downloads (only used when --mode safetensors).")
+
+    p.add_argument("--diffusers-repo", default=DIFFUSERS_REPO_DEFAULT,
+                   help="Hugging Face repo for Diffusers snapshot download (only used when --mode diffusers).")
+    p.add_argument("--diffusers-revision", default=DIFFUSERS_REVISION_DEFAULT,
+                   help="Revision/branch for Diffusers snapshot download (only used when --mode diffusers).")
     p.add_argument("--quant", default="Q5_0", choices=list(ZIMAGE_DIFFUSION_URLS.keys()),
                    help="Z-Image Turbo diffusion GGUF quant to download")
     p.add_argument("--text-quant", default=None, choices=list(QWEN_TEXT_URLS.keys()),
@@ -496,12 +584,19 @@ def _resolve_root_and_target(args: argparse.Namespace) -> tuple[Path, Path]:
     if args.target:
         target = Path(args.target).resolve()
     else:
-        # Defaults differ by mode to avoid mixing GGUF and safetensors installs.
-        if getattr(args, "mode", "gguf") == "safetensors":
+        # Defaults differ by mode to avoid mixing installs.
+        mode = getattr(args, "mode", "gguf")
+        if mode == "diffusers":
+            # Diffusers snapshot layout (model_index.json + subfolders)
+            target = (root / "models" / "Z-Image-Turbo").resolve()
+        elif mode == "safetensors":
+            # ComfyUI-style safetensors layout (diffusion_models/text_encoders/vae)
             target = (root / "models" / "Z-Image-Turbo").resolve()
         else:
+            # GGUF backend layout
             target = (root / "models" / "Z-Image-Turbo GGUF").resolve()
     return root, target
+
 
 
 
@@ -553,6 +648,13 @@ def _install_safetensors(precision: str, target: Path, repo: str) -> None:
 def main() -> int:
     args = _parse_args(sys.argv[1:])
     root, target = _resolve_root_and_target(args)
+
+    if getattr(args, "mode", "gguf") == "diffusers":
+        log(f"[zimage-diff] Root  : {root}")
+        log(f"[zimage-diff] Target: {target}")
+        _install_diffusers_snapshot(args.diffusers_repo, args.diffusers_revision, target)
+        log("[zimage-diff] done")
+        return 0
 
     if getattr(args, "mode", "gguf") == "safetensors":
         log(f"[zimage-safe] Root  : {root}")

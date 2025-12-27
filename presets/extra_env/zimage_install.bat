@@ -1,84 +1,80 @@
 @echo off
 setlocal ENABLEDELAYEDEXPANSION
 
-echo =========================================
-echo   Z-image Turbo - environment installer
-echo   - Creates: .zimage_env
-echo   - Installs deps from: presets\extra_env\zimage_req.txt
-echo   Note: This step does NOT download any model weights.
-echo         Use the optional installs for:
-echo           - Full FP16 model
-echo           - Z-image Turbo GGUF (Q4/Q5/Q6/Q8)
-echo =========================================
+echo ===============================================
+echo   Z-Image-Turbo offline CUDA setup
+echo   This will create .zimage_env,
+echo   install CUDA PyTorch and deps,
+echo   This does NOT download any models
+echo   use their individual installer (gguf or fp16)
+echo ===============================================
 echo.
 
 REM Get directory of this script (presets\extra_env)
-set "SCRIPT_DIR=%~dp0"
+set SCRIPT_DIR=%~dp0
 
 REM Go to project root (two levels up)
 cd /d "%SCRIPT_DIR%\..\.."
-if errorlevel 1 (
-  echo [ERROR] Could not cd to project root.
-  pause
-  exit /b 1
+
+echo Working directory: %CD%
+echo.
+
+REM Create virtual environment if it does not exist yet
+if not exist ".zimage_env\Scripts\python.exe" (
+    echo Creating virtual environment in .zimage_env ...
+    python -m venv ".zimage_env"
+    if errorlevel 1 (
+        echo [ERROR] Failed to create virtual environment.
+        echo Make sure Python is installed and on PATH.
+        pause
+        exit /b 1
+    )
+) else (
+    echo Virtual environment already exists. Skipping creation.
 )
 
-set "ROOT=%CD%"
+set PYTHON_EXEC=.zimage_env\Scripts\python.exe
 
-REM Choose a bootstrap python (prefer FrameVision .venv if present)
-set "BOOT_PY=%ROOT%\.venv\Scripts\python.exe"
-if exist "%BOOT_PY%" goto have_py
-
-set "BOOT_PY=%ROOT%\.venv\bin\python"
-if exist "%BOOT_PY%" goto have_py
-
-set "BOOT_PY=python"
-
-:have_py
-echo [1/3] Using bootstrap python: %BOOT_PY%
-
-REM Create venv if needed
-if exist "%ROOT%\.zimage_env\Scripts\python.exe" goto venv_ok
-if exist "%ROOT%\.zimage_env\bin\python" goto venv_ok
-
-echo [2/3] Creating venv: %ROOT%\.zimage_env
-"%BOOT_PY%" -m venv "%ROOT%\.zimage_env"
+echo.
+echo Upgrading pip ...
+"%PYTHON_EXEC%" -m pip install --upgrade pip
 if errorlevel 1 (
-  echo [ERROR] Failed to create .zimage_env
-  pause
-  exit /b 1
-)
-
-:venv_ok
-set "PYTHON_EXEC=%ROOT%\.zimage_env\Scripts\python.exe"
-if exist "%PYTHON_EXEC%" goto got_venv_py
-set "PYTHON_EXEC=%ROOT%\.zimage_env\bin\python"
-
-:got_venv_py
-echo [3/3] Installing Python dependencies from presets\extra_env\zimage_req.txt ...
-"%PYTHON_EXEC%" -m pip install --upgrade pip setuptools wheel
-if errorlevel 1 (
-  echo [WARN] pip upgrade failed (continuing)...
-)
-
-if not exist "presets\extra_env\zimage_req.txt" (
-  echo [ERROR] Missing presets\extra_env\zimage_req.txt
-  pause
-  exit /b 1
-)
-
-"%PYTHON_EXEC%" -m pip install -r "presets\extra_env\zimage_req.txt"
-if errorlevel 1 (
-  echo [ERROR] Failed to install Python requirements.
-  pause
-  exit /b 1
+    echo [ERROR] Failed to upgrade pip.
+    pause
+    exit /b 1
 )
 
 echo.
+echo Installing CUDA-enabled PyTorch (cu121) ...
+echo   (If this fails, check your NVIDIA driver and CUDA support.)
+"%PYTHON_EXEC%" -m pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu121
+if errorlevel 1 (
+    echo [ERROR] Failed to install CUDA PyTorch with cu121 wheels.
+    echo You can try a different index-url from pytorch.org for your setup,
+    echo or install torch manually inside .zimage_env.
+    pause
+    exit /b 1
+)
+
+echo.
+echo Installing remaining Python dependencies from presets\extra_env\zimage_req.txt ...
+"%PYTHON_EXEC%" -m pip install -r "presets\extra_env\zimage_req.txt"
+if errorlevel 1 (
+    echo [ERROR] Failed to install Python packages.
+    echo Tip: Make sure you have internet access for this step
+    echo so packages and the model can be downloaded once.
+    pause
+    exit /b 1
+)
+
+echo.
+
+echo.
 echo =========================================
-echo   Z-image environment install complete!
+echo   Z-Image-Turbo CUDA setup complete!
 echo   Environment: .zimage_env
-echo   Next: pick a model download option (FP16 or GGUF) in Optional Installs.
+echo   Model path:  models\Z-Image-Turbo
+echo.
 echo =========================================
 echo.
 pause
