@@ -2074,16 +2074,40 @@ def build_timeline(
                 else:
                     mode_for_segment = transition_mode
 
-                if mode_for_segment == 1:
+                if mode_for_segment == 1:  # Hard cuts
                     transition = "none"
-                elif mode_for_segment == 2:
-                    if energy == "high" and random.random() < 0.4:
+                elif mode_for_segment == 0:  # Soft film dissolves (stitched later)
+                    transition = "t_exposure_dissolve"
+                elif mode_for_segment == 2:  # Scale punch (zoom)
+                    # Keep a tiny chance of a flashcut on high energy to avoid "too smooth" late filler.
+                    if energy == "high" and random.random() < 0.22:
                         transition = "flashcut"
                     else:
-                        transition = "none"
+                        transition = "t_smooth_zoom"
                 elif mode_for_segment == 3:  # Shimmer blur (shiny)
-                    # Shimmer blur (shiny)
-                    transition = "none"
+                    transition = "t_shimmer_blur"
+                elif mode_for_segment == 4:  # Iris reveal (circle)
+                    transition = "t_iris"
+                elif mode_for_segment == 5:  # Motion blur whip-cuts
+                    transition = "t_motion_blur"
+                elif mode_for_segment == 6:  # Slit-scan smear push (stitched later)
+                    transition = "t_slitscan_push"
+                elif mode_for_segment == 7:  # Radial burst reveal (stitched later)
+                    transition = "t_radial_burst"
+                elif mode_for_segment == 8:  # Directional push (stitched later)
+                    transition = "t_push"
+                elif mode_for_segment == 9:  # Wipe (stitched later)
+                    transition = "t_wipe"
+                elif mode_for_segment == 10:  # Smooth zoom crossfade
+                    transition = "t_smooth_zoom"
+                elif mode_for_segment == 11:  # Curtain open (stitched later)
+                    transition = "t_curtain_open"
+                elif mode_for_segment == 12:  # Pixelize (stitched later)
+                    transition = "t_pixelize"
+                elif mode_for_segment == 13:  # Distance (stitched later)
+                    transition = "t_distance"
+                elif mode_for_segment == 14:  # Wind smears (stitched later)
+                    transition = "t_wind_smears"
                 else:
                     transition = "none"
                 seg = TimelineSegment(
@@ -6032,6 +6056,7 @@ class AutoMusicSyncWidget(QWidget):
         cine_layout.addLayout(row_cine_dim)
 
         # 9:16 pan crop (boomerang)
+        # Main row: enable + speed
         row_cine_pan916 = QHBoxLayout()
         self.check_cine_pan916 = QCheckBox("Slice reveal (boomerang)", self.cine_options)
         self.check_cine_pan916.setToolTip(
@@ -6050,9 +6075,14 @@ class AutoMusicSyncWidget(QWidget):
         self.label_cine_pan916_speed = QLabel("400 ms", self.cine_options)
         self.label_cine_pan916_speed.setMinimumWidth(70)
         row_cine_pan916.addWidget(self.label_cine_pan916_speed)
-        # Extra options: number of slices and background transparency
+        row_cine_pan916.addStretch(1)
+        cine_layout.addLayout(row_cine_pan916)
+
+        # Options row (moved under the setting): parts slider + transparent + random
+        row_cine_pan916_opts = QHBoxLayout()
+        row_cine_pan916_opts.addSpacing(22)  # indent under the checkbox label
         label_cine_pan916_parts = QLabel("Parts:", self.cine_options)
-        row_cine_pan916.addWidget(label_cine_pan916_parts)
+        row_cine_pan916_opts.addWidget(label_cine_pan916_parts)
 
         self.slider_cine_pan916_parts = QSlider(Qt.Horizontal, self.cine_options)
         self.slider_cine_pan916_parts.setRange(2, 6)
@@ -6061,17 +6091,17 @@ class AutoMusicSyncWidget(QWidget):
         self.slider_cine_pan916_parts.setFixedWidth(90)
         self.slider_cine_pan916_parts.setValue(3)
         self.slider_cine_pan916_parts.valueChanged.connect(self._on_cine_pan916_parts_changed)
-        row_cine_pan916.addWidget(self.slider_cine_pan916_parts)
+        row_cine_pan916_opts.addWidget(self.slider_cine_pan916_parts)
 
         self.label_cine_pan916_parts = QLabel("3", self.cine_options)
         self.label_cine_pan916_parts.setMinimumWidth(85)
-        row_cine_pan916.addWidget(self.label_cine_pan916_parts)
+        row_cine_pan916_opts.addWidget(self.label_cine_pan916_parts)
 
         self.check_cine_pan916_transparent = QCheckBox("Transparent", self.cine_options)
         self.check_cine_pan916_transparent.setToolTip(
             "When enabled, the hidden area shows the same video at 50% opacity instead of solid black."
         )
-        row_cine_pan916.addWidget(self.check_cine_pan916_transparent)
+        row_cine_pan916_opts.addWidget(self.check_cine_pan916_transparent)
 
         self.check_cine_pan916_random = QCheckBox("Random", self.cine_options)
         self.check_cine_pan916_random.setToolTip(
@@ -6079,10 +6109,9 @@ class AutoMusicSyncWidget(QWidget):
             "(If you use a seed, it will stay reproducible.)"
         )
         self.check_cine_pan916_random.stateChanged.connect(self._on_cine_pan916_random_changed)
-
-        row_cine_pan916.addWidget(self.check_cine_pan916_random)
-        row_cine_pan916.addStretch(1)
-        cine_layout.addLayout(row_cine_pan916)
+        row_cine_pan916_opts.addWidget(self.check_cine_pan916_random)
+        row_cine_pan916_opts.addStretch(1)
+        cine_layout.addLayout(row_cine_pan916_opts)
 
         # Mosaic multi-screen effect
         row_cine_mosaic = QHBoxLayout()
@@ -6767,6 +6796,26 @@ class AutoMusicSyncWidget(QWidget):
 
         self.btn_analyze = QPushButton("Analyze", self.footer_bar)
         self.btn_generate = QPushButton("Generate Clip", self.footer_bar)
+
+        # Hover style for the "Generate Clip" button: match the top banner gradient.
+        try:
+            self.btn_generate.setObjectName("mvGenerate")
+            self.btn_generate.setStyleSheet(
+                "#mvGenerate:hover {"
+                " color: white;"
+                " border: 1px solid rgba(255, 255, 255, 70);"
+                " background: qlineargradient(x1:0, y1:0, x2:1, y2:0,"
+                "   stop:0 #cd28ff, stop:0.5 #9f4df2, stop:1 #28ffbb);"
+                "}"
+                "#mvGenerate:pressed {"
+                " color: white;"
+                " border: 1px solid rgba(255, 255, 255, 90);"
+                " background: qlineargradient(x1:0, y1:0, x2:1, y2:0,"
+                "   stop:0 #b020e6, stop:0.5 #8440d6, stop:1 #20d6a0);"
+                "}"
+            )
+        except Exception:
+            pass
 
         # New: View results (open Media Explorer on output folder)
         self.btn_view_results = QPushButton("View results", self.footer_bar)
