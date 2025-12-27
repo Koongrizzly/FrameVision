@@ -1569,7 +1569,7 @@ def build_timeline(
     allowed_modes: List[int] = []
     if transition_modes_enabled:
         for m in transition_modes_enabled:
-            if 0 <= m <= 10 and m not in allowed_modes:
+            if 0 <= m <= 14 and m not in allowed_modes:
                 allowed_modes.append(m)
     if not allowed_modes:
         allowed_modes.append(transition_mode)
@@ -1898,6 +1898,10 @@ def build_timeline(
         # 8  Directional push (slide)      -> real between-clip push/slide (stitched later)
         # 9  Wipe                          -> real between-clip wipe (stitched later)
         # 10 Smooth zoom crossfade         -> in-clip smooth zoom
+        # 11 Curtain open (doors)         -> real between-clip curtain/doors open (stitched later)
+        # 12 Pixelize                      -> real between-clip pixelize (stitched later)
+        # 13 Distance (liquid blend)          -> real xfade distance (stitched later)
+        # 14 Wind smears                    -> real xfade wind smears (stitched later)
         if mode_for_segment == 1:  # Hard cuts
             transition = "none"
 
@@ -1931,6 +1935,18 @@ def build_timeline(
 
         elif mode_for_segment == 10:  # Smooth zoom crossfade
             transition = "t_smooth_zoom"
+
+        elif mode_for_segment == 11:  # Curtain open (doors)
+            transition = "t_curtain_open"
+
+        elif mode_for_segment == 12:  # Pixelize
+            transition = "t_pixelize"
+
+        elif mode_for_segment == 13:  # Distance (liquid blend)
+            transition = "t_distance"
+
+        elif mode_for_segment == 14:  # Wind smears
+            transition = "t_wind_smears"
 
         else:
             transition = "none"
@@ -2502,10 +2518,14 @@ class RenderWorker(QThread):
             push_ids = {"t_push"}
             slitscan_ids = {"t_slitscan_push"}
             wipe_ids = {"t_wipe"}
+            curtain_ids = {"t_curtain_open"}
+            pixelize_ids = {"t_pixelize"}
             iris_ids = {"t_iris"}
             radial_ids = {"t_radial_burst"}
             shimmer_ids = {"t_shimmer_blur"}
-            stitch_ids = dissolve_ids | push_ids | slitscan_ids | wipe_ids | iris_ids | radial_ids | shimmer_ids
+            distance_ids = {"t_distance"}
+            wind_ids = {"t_wind_smears"}
+            stitch_ids = dissolve_ids | push_ids | slitscan_ids | wipe_ids | curtain_ids | pixelize_ids | iris_ids | radial_ids | shimmer_ids | distance_ids | wind_ids
 
             def _seg_expected_out_len(s: TimelineSegment) -> float:
                 try:
@@ -3243,7 +3263,7 @@ class RenderWorker(QThread):
                     # Directional push / slit-scan smear push are real between-clip transitions.
                     # It is applied later during stitching, so we do nothing here.
                     pass
-                elif seg.transition in ("t_luma_fade", "t_exposure_dissolve", "t_wipe"):
+                elif seg.transition in ("t_luma_fade", "t_exposure_dissolve", "t_wipe", "t_curtain_open", "t_pixelize", "t_distance", "t_wind_smears"):
                     # Wipe / exposure dissolve are real between-clip transitions.
                     # It is applied later during the stitching step so we do NOT fade to black here.
                     pass
@@ -3886,10 +3906,14 @@ class RenderWorker(QThread):
                 push_ids = {"t_push"}
                 slitscan_ids = {"t_slitscan_push"}
                 wipe_ids = {"t_wipe"}
+                curtain_ids = {"t_curtain_open"}
+                pixelize_ids = {"t_pixelize"}
                 iris_ids = {"t_iris"}
                 radial_ids = {"t_radial_burst"}
                 shimmer_ids = {"t_shimmer_blur"}
-                stitch_ids = dissolve_ids | push_ids | slitscan_ids | wipe_ids | iris_ids | radial_ids | shimmer_ids
+                distance_ids = {"t_distance"}
+                wind_ids = {"t_wind_smears"}
+                stitch_ids = dissolve_ids | push_ids | slitscan_ids | wipe_ids | curtain_ids | pixelize_ids | iris_ids | radial_ids | shimmer_ids | distance_ids | wind_ids
                 use_stitch = False
                 total_overlap = 0.0
 
@@ -3922,7 +3946,7 @@ class RenderWorker(QThread):
                     use_stitch = False
 
                 if use_stitch:
-                    self.progress.emit(90, "Stitching transitions (exposure dissolve)...")
+                    self.progress.emit(90, "Stitching transitions (xfade)...")
                     try:
                         cur = parts[0]
                         for j in range(1, len(parts)):
@@ -4213,7 +4237,7 @@ class RenderWorker(QThread):
                                 offset = max(0.0, (dur_a if dur_a > 0.0 else 0.0) - d)
 
                                 # Alternate wipe directions so it doesn't feel repetitive.
-                                wipe_modes = ["wipeleft", "wiperight", "wipeup", "wipedown"]
+                                wipe_modes = ["wipeleft", "wiperight", "wipeup", "wipedown", "diagtl", "diagbr"]
                                 mode = wipe_modes[int(j) % len(wipe_modes)]
 
                                 fc = (
@@ -4389,6 +4413,158 @@ class RenderWorker(QThread):
                                     use_stitch = True
                                     total_overlap += float(d)
 
+
+                            elif trans in curtain_ids:
+
+                                # Curtain/doors open transition using xfade (center opening).
+                                dur_a = _ffprobe_duration(self.ffprobe, cur) or 0.0
+                                dur_b = _ffprobe_duration(self.ffprobe, parts[j]) or 0.0
+
+                                try:
+                                    d = float(getattr(self.segments[j], "_stitch_dur", 0.0) or 0.0)
+                                except Exception:
+                                    d = 0.0
+                                if d <= 0.0:
+                                    d = random.uniform(0.25, 0.6)
+                                if dur_a > 0.0 and dur_b > 0.0:
+                                    max_allowed = max(0.12, min(dur_a, dur_b) * 0.25)
+                                    d = min(d, max_allowed)
+                                d = max(0.12, min(1.0, float(d)))
+                                offset = max(0.0, (dur_a if dur_a > 0.0 else 0.0) - d)
+
+                                # Alternate between horizontal and vertical opening to avoid repetition.
+                                curtain_modes = ["horzopen", "vertopen"]
+                                mode = curtain_modes[int(j) % len(curtain_modes)]
+
+                                fc = (
+                                    f"[0:v]{stitch_norm}[a];"
+                                    f"[1:v]{stitch_norm}[b];"
+                                    f"[a][b]xfade=transition={mode}:duration={d:.3f}:offset={offset:.3f},format=yuv420p[v]"
+                                )
+
+                                cmd = [
+                                    self.ffmpeg,
+                                    "-y",
+                                    "-i",
+                                    cur,
+                                    "-i",
+                                    parts[j],
+                                    "-filter_complex",
+                                    fc,
+                                    "-map",
+                                    "[v]",
+                                    "-c:v",
+                                    "h264_nvenc",
+                                    "-preset",
+                                    "p3",
+                                    "-cq",
+                                    "19",
+                                    "-pix_fmt",
+                                    "yuv420p",
+                                    out_tmp,
+                                ]
+                                code, out = _run_ffmpeg(cmd)
+                                if code != 0 or not os.path.exists(out_tmp):
+                                    cmd = [
+                                        self.ffmpeg,
+                                        "-y",
+                                        "-i",
+                                        cur,
+                                        "-i",
+                                        parts[j],
+                                        "-filter_complex",
+                                        fc,
+                                        "-map",
+                                        "[v]",
+                                        "-c:v",
+                                        "libx264",
+                                        "-preset",
+                                        "veryfast",
+                                        "-crf",
+                                        "18",
+                                        "-pix_fmt",
+                                        "yuv420p",
+                                        out_tmp,
+                                    ]
+                                    code, out = _run_ffmpeg(cmd)
+
+                                if code == 0 and os.path.exists(out_tmp):
+                                    use_stitch = True
+                                    total_overlap += float(d)
+
+                            elif trans in pixelize_ids:
+
+                                # Pixelize transition using xfade (chunky pixel blocks).
+                                dur_a = _ffprobe_duration(self.ffprobe, cur) or 0.0
+                                dur_b = _ffprobe_duration(self.ffprobe, parts[j]) or 0.0
+
+                                try:
+                                    d = float(getattr(self.segments[j], "_stitch_dur", 0.0) or 0.0)
+                                except Exception:
+                                    d = 0.0
+                                if d <= 0.0:
+                                    d = random.uniform(0.22, 0.55)
+                                if dur_a > 0.0 and dur_b > 0.0:
+                                    max_allowed = max(0.12, min(dur_a, dur_b) * 0.25)
+                                    d = min(d, max_allowed)
+                                d = max(0.12, min(1.0, float(d)))
+                                offset = max(0.0, (dur_a if dur_a > 0.0 else 0.0) - d)
+
+                                fc = (
+                                    f"[0:v]{stitch_norm}[a];"
+                                    f"[1:v]{stitch_norm}[b];"
+                                    f"[a][b]xfade=transition=pixelize:duration={d:.3f}:offset={offset:.3f},format=yuv420p[v]"
+                                )
+
+                                cmd = [
+                                    self.ffmpeg,
+                                    "-y",
+                                    "-i",
+                                    cur,
+                                    "-i",
+                                    parts[j],
+                                    "-filter_complex",
+                                    fc,
+                                    "-map",
+                                    "[v]",
+                                    "-c:v",
+                                    "h264_nvenc",
+                                    "-preset",
+                                    "p3",
+                                    "-cq",
+                                    "19",
+                                    "-pix_fmt",
+                                    "yuv420p",
+                                    out_tmp,
+                                ]
+                                code, out = _run_ffmpeg(cmd)
+                                if code != 0 or not os.path.exists(out_tmp):
+                                    cmd = [
+                                        self.ffmpeg,
+                                        "-y",
+                                        "-i",
+                                        cur,
+                                        "-i",
+                                        parts[j],
+                                        "-filter_complex",
+                                        fc,
+                                        "-map",
+                                        "[v]",
+                                        "-c:v",
+                                        "libx264",
+                                        "-preset",
+                                        "veryfast",
+                                        "-crf",
+                                        "18",
+                                        "-pix_fmt",
+                                        "yuv420p",
+                                        out_tmp,
+                                    ]
+                                    code, out = _run_ffmpeg(cmd)
+
+                                if code == 0 and os.path.exists(out_tmp):
+                                    use_stitch = True
+                                    total_overlap += float(d)
 
                             elif trans in iris_ids:
 
@@ -4607,6 +4783,226 @@ class RenderWorker(QThread):
                                 if code == 0 and os.path.exists(out_tmp):
                                     use_stitch = True
                                     total_overlap += float(d)
+
+                            elif trans in distance_ids:
+
+                                # "Distance" transition (pseudo-morph / liquid blend feel) using xfade.
+
+                                dur_a = _ffprobe_duration(self.ffprobe, cur) or 0.0
+
+                                dur_b = _ffprobe_duration(self.ffprobe, parts[j]) or 0.0
+
+
+                                try:
+
+                                    d = float(getattr(self.segments[j], "_stitch_dur", 0.0) or 0.0)
+
+                                except Exception:
+
+                                    d = 0.0
+
+                                if d <= 0.0:
+
+                                    d = random.uniform(0.25, 0.55)
+
+                                if dur_a > 0.0 and dur_b > 0.0:
+
+                                    max_allowed = max(0.12, min(dur_a, dur_b) * 0.25)
+
+                                    d = min(d, max_allowed)
+
+                                d = max(0.12, min(1.0, float(d)))
+
+                                offset = max(0.0, (dur_a if dur_a > 0.0 else 0.0) - d)
+
+
+                                fc = (
+
+                                    f"[0:v]{stitch_norm}[a];"
+
+                                    f"[1:v]{stitch_norm}[b];"
+
+                                    f"[a][b]xfade=transition=distance:duration={d:.3f}:offset={offset:.3f},format=yuv420p[v]"
+
+                                )
+
+
+                                cmd = [
+
+                                    self.ffmpeg,
+
+                                    "-y",
+
+                                    "-i",
+
+                                    cur,
+
+                                    "-i",
+
+                                    parts[j],
+
+                                    "-filter_complex",
+
+                                    fc,
+
+                                    "-map",
+
+                                    "[v]",
+
+                                    "-c:v",
+
+                                    "h264_nvenc",
+
+                                    "-preset",
+
+                                    "p3",
+
+                                    "-cq",
+
+                                    "19",
+
+                                    "-pix_fmt",
+
+                                    "yuv420p",
+
+                                    out_tmp,
+
+                                ]
+
+                                code, out = _run_ffmpeg(cmd)
+
+                                if code != 0 or not os.path.exists(out_tmp):
+
+                                    cmd = [
+
+                                        self.ffmpeg,
+
+                                        "-y",
+
+                                        "-i",
+
+                                        cur,
+
+                                        "-i",
+
+                                        parts[j],
+
+                                        "-filter_complex",
+
+                                        fc,
+
+                                        "-map",
+
+                                        "[v]",
+
+                                        "-c:v",
+
+                                        "libx264",
+
+                                        "-crf",
+
+                                        "18",
+
+                                        "-pix_fmt",
+
+                                        "yuv420p",
+
+                                        out_tmp,
+
+                                    ]
+
+                                    code, out = _run_ffmpeg(cmd)
+
+
+                                if code == 0 and os.path.exists(out_tmp):
+
+                                    use_stitch = True
+
+                                    total_overlap += float(d)
+
+
+                            elif trans in wind_ids:
+
+                                # "Wind smears" transition (directional streaky blend) using xfade wind modes.
+
+                                dur_a = _ffprobe_duration(self.ffprobe, cur) or 0.0
+                                dur_b = _ffprobe_duration(self.ffprobe, parts[j]) or 0.0
+
+                                try:
+                                    d = float(getattr(self.segments[j], "_stitch_dur", 0.0) or 0.0)
+                                except Exception:
+                                    d = 0.0
+
+                                if d <= 0.0:
+                                    d = random.uniform(0.25, 0.60)
+
+                                if dur_a > 0.0 and dur_b > 0.0:
+                                    max_allowed = max(0.12, min(dur_a, dur_b) * 0.25)
+                                    d = min(d, max_allowed)
+
+                                d = max(0.12, min(1.0, float(d)))
+                                offset = max(0.0, (dur_a if dur_a > 0.0 else 0.0) - d)
+
+                                wind_modes = ["hlwind", "hrwind", "vuwind", "vdwind"]
+                                mode = random.choice(wind_modes)
+
+                                fc = (
+                                    f"[0:v]{stitch_norm}[a];"
+                                    f"[1:v]{stitch_norm}[b];"
+                                    f"[a][b]xfade=transition={mode}:duration={d:.3f}:offset={offset:.3f},format=yuv420p[v]"
+                                )
+
+                                cmd = [
+                                    self.ffmpeg,
+                                    "-y",
+                                    "-i",
+                                    cur,
+                                    "-i",
+                                    parts[j],
+                                    "-filter_complex",
+                                    fc,
+                                    "-map",
+                                    "[v]",
+                                    "-c:v",
+                                    "h264_nvenc",
+                                    "-preset",
+                                    "p3",
+                                    "-cq",
+                                    "19",
+                                    "-pix_fmt",
+                                    "yuv420p",
+                                    out_tmp,
+                                ]
+                                code, out = _run_ffmpeg(cmd)
+
+                                if code != 0 or not os.path.exists(out_tmp):
+                                    cmd = [
+                                        self.ffmpeg,
+                                        "-y",
+                                        "-i",
+                                        cur,
+                                        "-i",
+                                        parts[j],
+                                        "-filter_complex",
+                                        fc,
+                                        "-map",
+                                        "[v]",
+                                        "-c:v",
+                                        "libx264",
+                                        "-preset",
+                                        "veryfast",
+                                        "-crf",
+                                        "18",
+                                        "-pix_fmt",
+                                        "yuv420p",
+                                        out_tmp,
+                                    ]
+                                    code, out = _run_ffmpeg(cmd)
+
+                                if code == 0 and os.path.exists(out_tmp):
+                                    use_stitch = True
+                                    total_overlap += float(d)
+
 
                             elif trans in dissolve_ids:
                                 # Real dissolve using xfade (no black frames).
@@ -5101,7 +5497,7 @@ class AutoMusicSyncWidget(QWidget):
         # Optional per-section media overrides chosen from the timeline tab
         self._section_media: Dict[int, ClipSource] = {}
         # Enabled transition styles for randomization (indices of combo_transitions)
-        self._enabled_transition_modes = {0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10}
+        self._enabled_transition_modes = {0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14}
         # Guard flag used when toggling No FX programmatically so we don't immediately undo it
         self._nofx_guard = False
 
@@ -6260,10 +6656,15 @@ class AutoMusicSyncWidget(QWidget):
                 "Directional push (slide)",
                 "Wipe",
                 "Smooth zoom crossfade",
+                "Curtain open (doors)",
+                "Pixelize",
+                "Distance (liquid blend)",
+                "Wind smears",
             ]
         )
         self.combo_transitions.setToolTip(
             "High-level transition look:\n"
+            "\n"
             "- Soft film dissolves: gentle, low-key transitions (currently clean cuts).\n"
             "- Hard cuts: straight, no-frills cuts.\n"
             "- Scale punch (zoom): rhythmic zoom pulses on cuts.\n"
@@ -6273,8 +6674,12 @@ class AutoMusicSyncWidget(QWidget):
             "- Slit-scan smear push: modern smear + push (real stitched transition).\n"
             "- Radial burst reveal: quick expanding burst reveal (real stitched transition).\n"
             "- Directional push: smooth slide-style motion across the cut.\n"
-            "- Wipe: real dissolve between clips without black frames.\n"
+            "- Wipe: real between-clip wipe (stitched transition).\n"
             "- Smooth zoom crossfade: continuous, gentle zoom across the cut.\n"
+            "- Curtain open (doors): center-opening curtain/doors (real stitched transition).\n"
+            "- Pixelize: chunky pixel-block transition (real stitched transition).\n"
+            "- Distance (liquid blend): pseudo-morph / liquid blend feel (real stitched transition).\n"
+            "- Wind smears: wind-like streaky crossfade (real stitched transition)."
         )
         row_trans.addWidget(self.combo_transitions, 1)
         row_trans.addStretch(1)
@@ -6889,6 +7294,10 @@ class AutoMusicSyncWidget(QWidget):
             "Directional push (slide)",
             "Wipe",
             "Smooth zoom crossfade",
+            "Curtain open (doors)",
+            "Pixelize",
+            "Distance (liquid blend)",
+            "Wind smears",
         ]
         dlg = QDialog(self)
         dlg.setWindowTitle("Manage transitions")
@@ -9517,6 +9926,37 @@ class OneClickVideoClipTab(QWidget):
 
         outer = QVBoxLayout(self)
         outer.setContentsMargins(0, 0, 0, 0)
+
+        # --- Fancy banner at the top ---
+        banner_wrap = QWidget(self)
+        bw = QVBoxLayout(banner_wrap)
+        bw.setContentsMargins(6, 4, 6, 0)
+        bw.setSpacing(0)
+
+        banner = QLabel('Create a music videoclip', banner_wrap)
+        banner.setObjectName('mvbanner')
+        banner.setAlignment(Qt.AlignCenter)
+        banner.setFixedHeight(48)
+        banner.setStyleSheet(
+            "#mvbanner {"
+            " font-size: 15px;"
+            " font-weight: 600;"
+            " padding: 8px 17px;"
+            " border-radius: 12px;"
+            " margin: 0 0 6px 0;"
+            " color: white;"
+            " background: qlineargradient("
+            "   x1:0, y1:0, x2:1, y2:0,"
+            "   stop:0 #cd28ff,"
+            "   stop:0.5 #9f4df2,"
+            "   stop:1 #28ffbb"
+            " );"
+            " letter-spacing: 0.5px;"
+            "}"
+        )
+        bw.addWidget(banner)
+        outer.addWidget(banner_wrap)
+        outer.addSpacing(4)
 
         sc = QScrollArea(self)
         sc.setWidgetResizable(True)

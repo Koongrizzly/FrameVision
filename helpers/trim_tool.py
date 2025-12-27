@@ -3,7 +3,7 @@
 from __future__ import annotations
 import os, subprocess
 from pathlib import Path
-from PySide6.QtCore import Qt, QEvent, QObject, QRect, Signal, QThread, Slot
+from PySide6.QtCore import Qt, QEvent, QObject, QRect, Signal
 from PySide6.QtGui import QPainter, QPixmap
 from helpers.batch import BatchSelectDialog
 from PySide6.QtWidgets import (
@@ -12,12 +12,6 @@ from PySide6.QtWidgets import (
 , QDialog, QVBoxLayout, QListWidget, QFileDialog, QDialogButtonBox, QGroupBox, QRadioButton, QListWidgetItem)
 
 # ---- paths ----
-# Finished trim jobs output folder (relative to app root)
-DEFAULT_TRIM_OUTPUT_DIR = Path('./output/video/trims')
-
-# Preview thumbnails are generated off the UI thread and scaled down at extraction time
-PREVIEW_THUMB_MAX_H = 220
-
 def ffmpeg_path():
     try:
         from helpers.framevision_app import ROOT  # type: ignore
@@ -159,119 +153,8 @@ class _ResizeWatcher(QObject):
             self.pane._reflow_thumbs()
         return False
 
-
-# ---- threaded preview generation ----
-class TrimPreviewWorker(QObject):
-    init_ready = Signal(int, int, object)   # run_id, duration_ms, times_ms(list[int])
-    thumb_ready = Signal(int, int, str)     # run_id, t_ms, filepath
-    done = Signal(int, bool, str)           # run_id, canceled, error_message
-
-    def __init__(self, run_id:int, input_path:str, thumb_count:int, out_dir:Path, thumb_max_h:int):
-        super().__init__()
-        self.run_id = int(run_id)
-        self.input_path = str(input_path)
-        self.thumb_count = max(1, int(thumb_count))
-        self.out_dir = Path(out_dir)
-        self.thumb_max_h = max(64, int(thumb_max_h))
-        self._cancel = False
-        self._proc = None
-
-    def cancel(self):
-        self._cancel = True
-        try:
-            p = self._proc
-            if p is not None:
-                try:
-                    p.terminate()
-                    try:
-                        p.kill()
-                    except Exception:
-                        pass
-                except Exception:
-                    pass
-        except Exception:
-            pass
-
-    def _duration_seconds(self, path:str) -> float:
-        try:
-            out = subprocess.check_output(
-                [ffprobe_path(), "-v", "error", "-show_entries", "format=duration",
-                 "-of", "default=nokey=1:noprint_wrappers=1", str(path)],
-                stderr=subprocess.STDOUT
-            )
-            return float(out.decode(errors="ignore").strip() or "0")
-        except Exception:
-            return 0.0
-
-    @Slot()
-    def run(self):
-        err = ""
-        canceled = False
-        try:
-            dur = self._duration_seconds(self.input_path)
-            N = self.thumb_count
-            # Build timeline sample points
-            times = [(dur*i)/(N-1) if dur > 0 and N > 1 else 0.0 for i in range(N)]
-            times_ms = [int(round(t*1000.0)) for t in times]
-            duration_ms = int(round(dur*1000.0)) if dur > 0 else 1000
-            self.out_dir.mkdir(parents=True, exist_ok=True)
-
-            # Tell UI to create placeholders + configure sliders
-            self.init_ready.emit(self.run_id, duration_ms, times_ms)
-
-            ffm = ffmpeg_path()
-            for t, t_ms in zip(times, times_ms):
-                if self._cancel:
-                    canceled = True
-                    break
-                outp = self.out_dir / f"th_{t_ms:08d}.jpg"
-                cmd = [
-                    str(ffm),
-                    "-hide_banner",
-                    "-loglevel", "error",
-                    "-nostdin", "-y",
-                    # Force software decode for stability on some Windows builds that otherwise
-                    # use a hardware frames context and can fail on large / long H.264 files.
-                    "-hwaccel", "none",
-                    "-threads", "1",
-                    "-ss", f"{t:.3f}",
-                    "-i", str(self.input_path),
-                    "-an", "-sn", "-dn",
-                    "-frames:v", "1",
-                    "-vf", f"scale=-2:{self.thumb_max_h}",
-                    "-q:v", "4",
-                    str(outp)
-                ]
-                stderr_txt = ""
-                try:
-                    # Capture stderr so we can show a meaningful error if ffmpeg fails.
-                    self._proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
-                    _out_b, _err_b = self._proc.communicate()
-                    rc = int(self._proc.returncode or 0)
-                    err_b = _err_b or b""
-                    stderr_txt = err_b.decode(errors="ignore").strip()
-                finally:
-                    self._proc = None
-                if self._cancel:
-                    canceled = True
-                    break
-                if rc != 0:
-                    # Stop on first ffmpeg error (usually indicates decode/IO issues).
-                    if stderr_txt:
-                        err = f"ffmpeg failed generating preview thumbnail at {_fmt_ms(int(t_ms))}:\n{stderr_txt}"
-                    else:
-                        err = f"ffmpeg failed generating preview thumbnail at {_fmt_ms(int(t_ms))} (rc={rc})."
-                    break
-                if outp.exists():
-                    self.thumb_ready.emit(self.run_id, int(t_ms), str(outp))
-        except Exception as e:
-            err = str(e)
-        self.done.emit(self.run_id, bool(canceled), err)
-
 # ---- installer ----
 def install_trim_tool(pane, section_widget):
-    # Default output folder for finished trims
-    pane.trim_output_dir = str(DEFAULT_TRIM_OUTPUT_DIR)
     # Base controls
     pane.trim_mode = QComboBox(); pane.trim_mode.addItems(["Fast copy (keyframe)", "Precise re-encode"])  # type: ignore
     pane.trim_start = QLineEdit("00:00:00.000"); pane.trim_end = QLineEdit("")
@@ -283,7 +166,7 @@ def install_trim_tool(pane, section_widget):
     pane.btn_trim_preview = QPushButton("Generate preview")
     pane.btn_trim_preview.setToolTip("Generate / update the preview thumbnails and timeline for the loaded video. Use this after changing the thumbnail count or loading a new video.")
     pane.trim_thumbs_spin = QSpinBox(); pane.trim_thumbs_spin.setRange(6, 99); pane.trim_thumbs_spin.setValue(12); pane.trim_thumbs_spin.setSuffix(" thumbs")
-    pane.trim_thumbs_spin.setToolTip("How many thumbnails to generate for the preview strip. After changing this number, YIP: don''t resize until all tiles are loaded when loading big video files.")
+    pane.trim_thumbs_spin.setToolTip("How many thumbnails to generate for the preview strip. After changing this number, press \"Generate preview\" to rebuild.")
     pane.thumb_size = QSlider(Qt.Horizontal); pane.thumb_size.setRange(24, 140); pane.thumb_size.setValue(86)
     pane.thumb_size.setToolTip("Thumbnail display size only. This just scales the preview thumbnails visually; it does not regenerate them.")
     r2 = QHBoxLayout(); r2.addWidget(pane.btn_trim_preview); r2.addWidget(pane.trim_thumbs_spin); r2.addWidget(QLabel("Size")); r2.addWidget(pane.thumb_size)
@@ -333,163 +216,41 @@ def install_trim_tool(pane, section_widget):
         except Exception:
             pass
 
-    # --- threaded preview generation (keeps UI responsive) ---
-    pane._trim_preview_run_id = 0
-    pane._trim_preview_thread = None
-    pane._trim_preview_worker = None
-    pane._thumb_by_t = {}
-
-    def _set_preview_busy(busy:bool):
-        try:
-            pane.btn_trim_preview.setEnabled(not busy)
-            pane.trim_thumbs_spin.setEnabled(not busy)
-            pane.btn_trim_preview.setText("Generating preview…" if busy else "Generate preview")
-        except Exception:
-            pass
-
-    def _cancel_preview_worker():
-        try:
-            w = getattr(pane, "_trim_preview_worker", None)
-            if w is not None:
-                try:
-                    w.cancel()
-                except Exception:
-                    pass
-        except Exception:
-            pass
-
-    def _start_preview_worker():
+    def _build_thumbs():
+        # build/rebuild labels list according to spin value
         try:
             p = getattr(pane.main, "current_path", None)
-            if not p:
-                QMessageBox.information(pane, "Trim preview", "Open a video first (File ▶ Open).")
-                return
-
-            # Bump run id so late signals from old runs are ignored
-            pane._trim_preview_run_id = int(getattr(pane, "_trim_preview_run_id", 0)) + 1
-            run_id = int(pane._trim_preview_run_id)
-
-            # Cancel previous run (best effort)
-            _cancel_preview_worker()
-
-            out_dir = Path("./output/_temp/trim_preview") / f"run_{run_id:04d}"
-            worker = TrimPreviewWorker(run_id, str(p), int(pane.trim_thumbs_spin.value()), out_dir, PREVIEW_THUMB_MAX_H)
-            thread = QThread(pane)
-            worker.moveToThread(thread)
-
-            def _on_init(rid:int, duration_ms:int, times_ms_obj):
-                if rid != pane._trim_preview_run_id:
-                    return
+            if not p: QMessageBox.information(pane, "Trim preview", "Open a video first (File ▶ Open)."); return
+            dur = _duration_seconds(p); N = int(pane.trim_thumbs_spin.value())
+            # clear existing labels from grid & list
+            grid = pane._thumb_grid
+            while grid.count():
+                it = grid.takeAt(0); w = it.widget()
+                if w: w.setParent(None)
+            pane._thumb_labels.clear()
+            base = Path("./output/_temp/trim_preview"); base.mkdir(parents=True, exist_ok=True)
+            times = [(dur*i)/(N-1) if dur>0 and N>1 else 0 for i in range(N)]
+            h = int(pane.thumb_size.value())
+            for t in times:
+                t_ms = int(round(t*1000)); outp = base / f"th_{t_ms:08d}.jpg"
                 try:
-                    times_ms = list(times_ms_obj or [])
+                    subprocess.check_call([ffmpeg_path(), "-y", "-ss", f"{t:.3f}", "-i", str(p), "-frames:v","1","-q:v","4", str(outp)],
+                                          stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
                 except Exception:
-                    times_ms = []
-
-                duration_ms = int(duration_ms) if int(duration_ms) > 0 else 1000
-
-                # configure sliders and range
-                pane.trim_start_slider.setRange(0, duration_ms)
-                pane.trim_end_slider.setRange(0, duration_ms)
-                if not pane.trim_end.text().strip():
-                    pane.trim_end.setText(_fmt_ms(duration_ms))
-
-                s_ms = _parse_time(pane.trim_start.text())
-                e_ms = _parse_time(pane.trim_end.text())
-                s_ms = max(0, min(int(s_ms), duration_ms))
-                e_ms = max(0, min(int(e_ms), duration_ms))
-
-                pane.range_bar.set_range(duration_ms, s_ms, e_ms)
-
-                # clear existing labels from grid & list
-                grid = pane._thumb_grid
-                while grid.count():
-                    it = grid.takeAt(0)
-                    w = it.widget()
-                    if w:
-                        w.setParent(None)
-
-                pane._thumb_labels.clear()
-                pane._thumb_by_t = {}
-                pane._preview_first_pix = False
-
-                h = int(pane.thumb_size.value())
-                for t_ms in times_ms:
-                    t_ms = int(t_ms)
-                    lab = _ClickableLabel(t_ms)
-                    lab.t_ms = t_ms
-                    lab._orig_pm = None
-                    lab.setMinimumHeight(h)
-                    lab.setMaximumHeight(h)
+                    continue
+                pm = QPixmap(str(outp))
+                lab = _ClickableLabel(t_ms); lab.t_ms = t_ms
+                lab.setMinimumHeight(h); lab.setMaximumHeight(h)
+                lab._orig_pm = pm if not pm.isNull() else None
+                if lab._orig_pm:
+                    lab.setPixmap(lab._orig_pm.scaledToHeight(h, Qt.SmoothTransformation))
+                else:
                     lab.setText(_fmt_ms(t_ms))
-                    pane._thumb_labels.append(lab)
-                    pane._thumb_by_t[t_ms] = lab
-
-                _reflow_thumbs()
-                _apply_dimming()
-
-            def _on_thumb(rid:int, t_ms:int, fp:str):
-                if rid != pane._trim_preview_run_id:
-                    return
-                try:
-                    lab = getattr(pane, "_thumb_by_t", {}).get(int(t_ms))
-                    if not lab:
-                        return
-                    pm = QPixmap(str(fp))
-                    lab._orig_pm = pm if not pm.isNull() else None
-                    h = int(pane.thumb_size.value())
-                    if lab._orig_pm:
-                        lab.setPixmap(lab._orig_pm.scaledToHeight(h, Qt.SmoothTransformation))
-                        # reflow once when the first pixmap arrives to improve column calc
-                        if not getattr(pane, "_preview_first_pix", False):
-                            pane._preview_first_pix = True
-                            _reflow_thumbs()
-                    else:
-                        lab.setText(_fmt_ms(int(t_ms)))
-                except Exception:
-                    pass
-
-            def _on_done(rid:int, canceled:bool, err_msg:str):
-                # Always stop the thread for this worker
-                try:
-                    thread.quit()
-                except Exception:
-                    pass
-
-                if rid != pane._trim_preview_run_id:
-                    return
-
-                _set_preview_busy(False)
-                pane._trim_preview_thread = None
-                pane._trim_preview_worker = None
-
-                try:
-                    if err_msg:
-                        QMessageBox.warning(pane, "Trim preview", err_msg)
-                except Exception:
-                    pass
-
-                _reflow_thumbs()
-                _apply_dimming()
-
-            worker.init_ready.connect(_on_init)
-            worker.thumb_ready.connect(_on_thumb)
-            worker.done.connect(_on_done)
-
-            thread.started.connect(worker.run)
-            thread.finished.connect(worker.deleteLater)
-            thread.finished.connect(thread.deleteLater)
-
-            pane._trim_preview_thread = thread
-            pane._trim_preview_worker = worker
-
-            _set_preview_busy(True)
-            thread.start()
+                pane._thumb_labels.append(lab)
+            _reflow_thumbs()
+            _apply_dimming()
         except Exception:
-            _set_preview_busy(False)
-
-    def _load_preview():
-        # Start preview generation (runs in background thread)
-        _start_preview_worker()
+            pass
 
     def _rescale_thumbs():
         # rescale existing labels only (no ffmpeg)
@@ -526,6 +287,19 @@ def install_trim_tool(pane, section_widget):
         except Exception:
             pass
 
+    def _load_preview():
+        # set slider ranges and build thumbs
+        try:
+            p = getattr(pane.main, "current_path", None)
+            if not p: QMessageBox.information(pane, "Trim preview", "Open a video first (File ▶ Open)."); return
+            dur = _duration_seconds(p); rng = int(dur*1000) if dur>0 else 1000
+            pane.trim_start_slider.setRange(0, rng); pane.trim_end_slider.setRange(0, rng)
+            if not pane.trim_end.text().strip(): pane.trim_end.setText(_fmt_ms(rng))
+            s_ms = _parse_time(pane.trim_start.text()); e_ms = _parse_time(pane.trim_end.text())
+            pane.range_bar.set_range(rng, s_ms, e_ms)
+            _build_thumbs()
+        except Exception:
+            pass
 
     # guards to avoid feedback loops
     pane._trim_syncing = False
@@ -623,7 +397,7 @@ def install_trim_tool(pane, section_widget):
                     pane.on_trim_batch(selected, s_ms, e_ms, mode, conflict or "version"); handled = True
                 elif hasattr(pane, "main") and hasattr(pane.main, "enqueue_job"):
                     for fp in selected:
-                        job = {"tool":"trim","input":fp,"start_ms":int(s_ms),"end_ms":int(e_ms),"mode":mode,"conflict":(conflict or "version"),"output_dir": str(DEFAULT_TRIM_OUTPUT_DIR), "out_dir": str(DEFAULT_TRIM_OUTPUT_DIR)}
+                        job = {"tool":"trim","input":fp,"start_ms":int(s_ms),"end_ms":int(e_ms),"mode":mode,"conflict":(conflict or "version")}
                         try:
                             pane.main.enqueue_job(job)
                             handled = True

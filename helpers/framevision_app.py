@@ -4772,15 +4772,40 @@ class MainWindow(QMainWindow):
                 pass
             return
 
-        # Locate the Media Explorer tab index by name (robust to future widget wrapping).
+        # Locate the Media Explorer tab index WITHOUT relying on the visible tab text.
         idx = -1
+        tab_ref = None
         try:
-            for i in range(self.tabs.count()):
-                if (self.tabs.tabText(i) or "").strip().lower() == "media explorer":
-                    idx = i
-                    break
+            tab_ref = getattr(self, "media_explorer", None)
+        except Exception:
+            tab_ref = None
+
+        # Preferred: direct widget reference.
+        try:
+            if tab_ref is not None:
+                idx = int(self.tabs.indexOf(tab_ref))
         except Exception:
             idx = -1
+
+        # Fallback: stable objectName.
+        if idx < 0:
+            try:
+                found = self._find_tab_index_by_id("tab_media_explorer")
+                if found is not None:
+                    idx = int(found)
+            except Exception:
+                pass
+
+        # Last-resort: normalize tabText and match a stable slug.
+        if idx < 0:
+            try:
+                target = "media_explorer"
+                for i in range(self.tabs.count()):
+                    if self._slug_tab_name(self.tabs.tabText(i)) == target:
+                        idx = i
+                        break
+            except Exception:
+                pass
 
         if activate and idx >= 0:
             try:
@@ -4961,6 +4986,16 @@ class MainWindow(QMainWindow):
         # >>> FRAMEVISION_MEDIA_EXPLORER_INIT_BEGIN
         # Media Explorer is optional: if it fails to load we show a placeholder tab and keep running.
         self.media_explorer = self._init_media_explorer_hardfail()
+        try:
+            # Stable internal id (do NOT depend on tab label text, which may be emoji-only).
+            if getattr(self, "media_explorer", None) is not None:
+                try:
+                    if not str(self.media_explorer.objectName() or ""):
+                        self.media_explorer.setObjectName("tab_media_explorer")
+                except Exception:
+                    pass
+        except Exception:
+            pass
         # <<< FRAMEVISION_MEDIA_EXPLORER_INIT_END
 
         _main_tabs = [("Edit", self.edit),("Background", self.background),("Media Explorer", self.media_explorer),("Tools", self.tools),("Describe", self.describe),("Queue", self.queue),("Models", self.models),("Presets", self.presets_tab),("Settings", self.settings)]
@@ -4976,12 +5011,27 @@ class MainWindow(QMainWindow):
 
         # >>> FRAMEVISION_MEDIA_EXPLORER_POSTCHECK_BEGIN
         # Crash loudly if the tab still isn't present (so we don't silently fail).
+        # IMPORTANT: Do NOT depend on the visible label text (it may include emojis or be empty).
         try:
             ok = False
-            for _i in range(self.tabs.count()):
-                if (self.tabs.tabText(_i) or "").strip().lower() == "media explorer":
-                    ok = True
-                    break
+            try:
+                if getattr(self, "media_explorer", None) is not None:
+                    ok = (self.tabs.indexOf(self.media_explorer) >= 0)
+            except Exception:
+                ok = False
+            if not ok:
+                try:
+                    ok = (self._find_tab_index_by_id("tab_media_explorer") is not None)
+                except Exception:
+                    ok = False
+            if not ok:
+                try:
+                    for _i in range(self.tabs.count()):
+                        if self._slug_tab_name(self.tabs.tabText(_i)) == "media_explorer":
+                            ok = True
+                            break
+                except Exception:
+                    pass
             if not ok:
                 raise RuntimeError("Media Explorer tab was not added to the main tabs.")
         except Exception as _e:
@@ -5195,6 +5245,131 @@ class MainWindow(QMainWindow):
         openAct = QAction("&Open", self); openAct.setShortcut(QKeySequence.Open); openAct.triggered.connect(self.open_file)
         try:
             self._install_optional_downloads_menu()
+        except Exception:
+            pass
+
+
+    # --- Startup layout settle (auto-resize/relayout) ----------------------------
+    def showEvent(self, ev):
+        # Some complex tabs (nested scroll areas / splitters) may not finalize their
+        # geometry until the user manually resizes the window. We do a small, safe
+        # one-time relayout after first show to make the UI correct immediately.
+        try:
+            super().showEvent(ev)
+        except Exception:
+            try:
+                QMainWindow.showEvent(self, ev)
+            except Exception:
+                pass
+        try:
+            if getattr(self, "_did_startup_layout_fix", False):
+                return
+            self._did_startup_layout_fix = True
+        except Exception:
+            return
+
+        # Multiple passes to catch late-created widgets / style polish.
+        try:
+            QTimer.singleShot(0,  lambda: self._startup_layout_fix_pass(0))
+            QTimer.singleShot(50, lambda: self._startup_layout_fix_pass(1))
+            QTimer.singleShot(200, lambda: self._startup_layout_fix_pass(2))
+        except Exception:
+            pass
+
+    def _startup_layout_fix_pass(self, pass_no: int = 0):
+        try:
+            if not self.isVisible():
+                return
+        except Exception:
+            pass
+
+        try:
+            st = self.windowState()
+            is_max = bool(st & Qt.WindowMaximized) or bool(getattr(self, "isMaximized", lambda: False)())
+            is_fs  = bool(st & Qt.WindowFullScreen) or bool(getattr(self, "isFullScreen", lambda: False)())
+        except Exception:
+            is_max = False
+            is_fs = False
+
+        # 1) Force polish + layout activation
+        try:
+            self.ensurePolished()
+        except Exception:
+            pass
+        try:
+            cw = self.centralWidget()
+            if cw is not None:
+                try:
+                    cw.ensurePolished()
+                except Exception:
+                    pass
+                try:
+                    cw.updateGeometry()
+                except Exception:
+                    pass
+                try:
+                    lay = cw.layout()
+                    if lay is not None:
+                        lay.invalidate()
+                        lay.activate()
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
+        # 2) Current tab may contain scroll areas with late size hints
+        try:
+            if hasattr(self, "tabs") and self.tabs is not None:
+                try:
+                    self.tabs.updateGeometry()
+                except Exception:
+                    pass
+                try:
+                    cur = self.tabs.currentWidget()
+                except Exception:
+                    cur = None
+                if cur is not None:
+                    try:
+                        cur.ensurePolished()
+                    except Exception:
+                        pass
+                    try:
+                        cur.updateGeometry()
+                    except Exception:
+                        pass
+                    try:
+                        lay2 = cur.layout()
+                        if lay2 is not None:
+                            lay2.invalidate()
+                            lay2.activate()
+                    except Exception:
+                        pass
+        except Exception:
+            pass
+
+        # 3) Give Qt one chance to process queued layout events
+        try:
+            QApplication.processEvents()
+        except Exception:
+            pass
+
+        # 4) Pixel-nudge (only when not maximized/fullscreen) to trigger a real resize event
+        #    This mimics the user "making it bigger then smaller" without noticeable change.
+        if (pass_no >= 1) and (not is_max) and (not is_fs):
+            try:
+                w0 = int(self.width())
+                h0 = int(self.height())
+                self.resize(w0 + 1, h0 + 1)
+                self.resize(w0, h0)
+            except Exception:
+                pass
+
+        try:
+            self.updateGeometry()
+        except Exception:
+            pass
+        try:
+            self.repaint()
         except Exception:
             pass
 
