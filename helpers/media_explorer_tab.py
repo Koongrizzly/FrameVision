@@ -1177,6 +1177,8 @@ class MediaExplorerTab(QtWidgets.QWidget):
 
         self._connect()
         self._ensure_default_sort_newest_first()
+        self._update_empty_help()
+
         # Tools are auto-discovered; UI does not expose a manual refresh/status row.
 
         # Nice-to-have: remember last folder in-session (you can swap to QSettings later)
@@ -1298,6 +1300,32 @@ class MediaExplorerTab(QtWidgets.QWidget):
         self.table.horizontalHeader().setDefaultAlignment(QtCore.Qt.AlignmentFlag.AlignLeft | QtCore.Qt.AlignmentFlag.AlignVCenter)
         self.table.setContextMenuPolicy(QtCore.Qt.ContextMenuPolicy.CustomContextMenu)
         self.table.setToolTip("Right click for actions. Double click to open in player.")
+        # Empty-state help (shown when the list is empty and no scan is running).
+        # This reduces confusion for first-time users.
+        self._empty_help = QtWidgets.QLabel(self.table.viewport())
+        self._empty_help.setText(self._empty_help_text())
+        self._empty_help.setWordWrap(True)
+        self._empty_help.setAlignment(QtCore.Qt.AlignmentFlag.AlignCenter)
+        try:
+            self._empty_help.setMargin(14)
+        except Exception:
+            pass
+        self._empty_help.setStyleSheet(
+            "QLabel{"
+            "background-color: palette(base);"
+            "color: palette(text);"
+            "border: 1px dashed palette(mid);"
+            "border-radius: 12px;"
+            "padding: 14px;"
+            "}"
+        )
+        self._empty_help.setVisible(True)
+        try:
+            self.table.viewport().installEventFilter(self)
+        except Exception:
+            pass
+        self._position_empty_help()
+
 
         # Column sizing
         self.table.setColumnWidth(Column.ICON, 26)
@@ -1675,6 +1703,8 @@ class MediaExplorerTab(QtWidgets.QWidget):
 
         self._scanner.start()
 
+        self._update_empty_help()
+
     # ---------- Scan callbacks ----------
 
     @QtCore.Slot(object)
@@ -1691,12 +1721,14 @@ class MediaExplorerTab(QtWidgets.QWidget):
             except Exception:
                 pass
         self._update_counts(defer=True)
+        self._update_empty_help()
 
     # Backward compatibility (unused by default)
     @QtCore.Slot(object)
     def _on_item_ready(self, item: MediaItem) -> None:
         self.model.add_item(item)
         self._update_counts(defer=True)
+        self._update_empty_help()
 
     @QtCore.Slot(int, int)
     def _on_progress(self, cur: int, total: int) -> None:
@@ -1713,6 +1745,7 @@ class MediaExplorerTab(QtWidgets.QWidget):
         self.btn_rescan.setEnabled(True)
         self.progress.setVisible(False)
         self._update_counts()
+        self._update_empty_help()
         self._restore_sorting_after_scan()
         # Default sort: newest first (Modified desc) unless the user has a saved sort preference.
         # Only apply if sorting is enabled.
@@ -1752,8 +1785,18 @@ class MediaExplorerTab(QtWidgets.QWidget):
         self.btn_stop.setEnabled(False)
         self.btn_rescan.setEnabled(True)
         self.progress.setVisible(False)
+        try:
+            self._update_counts()
+        except Exception:
+            pass
+        self._update_empty_help()
         self._restore_sorting_after_scan()
         self.lbl_status.setText(f"Error: {msg}")
+        try:
+            self._update_counts()
+        except Exception:
+            pass
+        self._update_empty_help()
         QtWidgets.QMessageBox.warning(self, "Media Explorer", msg)
 
     def _stop_scan(self) -> None:
@@ -3199,6 +3242,11 @@ class MediaExplorerTab(QtWidgets.QWidget):
             return
         total = self.proxy.rowCount()
         self.lbl_count.setText(f"{total} items")
+        try:
+            self._update_empty_help()
+        except Exception:
+            pass
+
 
 
     def _ensure_default_sort_newest_first(self) -> None:
@@ -3238,6 +3286,51 @@ class MediaExplorerTab(QtWidgets.QWidget):
             )
         except Exception:
             pass
+
+    # ---------- Empty state help ----------
+
+    def _empty_help_text(self) -> str:
+        return (
+            "No media files listed yet.\n\n"
+            "1. Select type of media files to be searched for (Images / Video / Sound)\n"
+            "2. Enable/disable search in subfolders\n"
+            "3. Click 'Browse…' to select a folder (or open Tree view and select a folder)\n"
+            "4. Click 'Scan'\n\n"
+            "Depending on the amount of files and availability of .json files this may take a while, "
+            "especially for video files."
+        )
+
+    def _position_empty_help(self) -> None:
+        try:
+            if not getattr(self, "_empty_help", None):
+                return
+            vp = self.table.viewport()
+            r = vp.rect().adjusted(14, 14, -14, -14)
+            self._empty_help.setGeometry(r)
+        except Exception:
+            pass
+
+    def _update_empty_help(self) -> None:
+        try:
+            w = getattr(self, "_empty_help", None)
+            if not w:
+                return
+            running = bool(self._scanner and self._scanner.isRunning())
+            show = (self.model.rowCount() == 0) and (not running)
+            w.setVisible(bool(show))
+            if show:
+                self._position_empty_help()
+        except Exception:
+            pass
+
+    def eventFilter(self, obj: QtCore.QObject, event: QtCore.QEvent) -> bool:
+        try:
+            if hasattr(self, "table") and obj == self.table.viewport():
+                if event.type() == QtCore.QEvent.Type.Resize:
+                    self._position_empty_help()
+        except Exception:
+            pass
+        return super().eventFilter(obj, event)
 
     def changeEvent(self, event: QtCore.QEvent) -> None:
         super().changeEvent(event)

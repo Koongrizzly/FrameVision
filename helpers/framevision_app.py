@@ -3611,11 +3611,24 @@ class QueuePane(QWidget):
 
             if auto_cleanup:
                 try:
-                    trigger_at = max(1, int(max_keep) - 1)  # e.g. 25 -> start at 24
+                    # Start cleanup slightly before hitting the max.
+                    trigger_at = max(1, int(max_keep) - 1)  # e.g. 50 -> start at 49
                 except Exception:
                     trigger_at = max_keep
 
-                # Move a few per refresh (bounded) so we don't stall the UI.
+                # Finished (done) queue: be aggressive.
+                # Allow up to ~48-49 items, then move old jobs so we drop back to ~39.
+                try:
+                    if status == "done":
+                        target_after = max(0, int(trigger_at) - 10)  # 49 -> 39
+                        to_move = max(0, int(len(files_sorted)) - int(target_after))
+                        max_per_refresh = min(max(0, int(to_move)), 20)
+                    else:
+                        # Failed: keep gentler cleanup so errors remain visible.
+                        max_per_refresh = 3
+                except Exception:
+                    max_per_refresh = 3
+
                 moved = 0
                 try:
                     import shutil as _shutil
@@ -3623,7 +3636,7 @@ class QueuePane(QWidget):
                     old_dir = (BASE / "jobs" / "done" / "old_jobs")
                     old_dir.mkdir(parents=True, exist_ok=True)
 
-                    while len(files_sorted) >= trigger_at and files_sorted and moved < 3:
+                    while len(files_sorted) >= trigger_at and files_sorted and moved < max_per_refresh:
                         victim = files_sorted[-1][1]  # oldest (files_sorted is newest-first)
                         if victim is None:
                             break
@@ -3638,6 +3651,7 @@ class QueuePane(QWidget):
                             break
                 except Exception:
                     pass
+
             else:
                 # Legacy behavior: hard-delete beyond max_keep
                 if len(files_sorted) > max_keep:
