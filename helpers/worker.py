@@ -2676,7 +2676,18 @@ def main():
             HEARTBEAT.write_text(time.strftime("%Y-%m-%d %H:%M:%S"), encoding="utf-8")
         except Exception:
             pass
-        items = sorted(JOBS["pending"].glob("*.json"))
+        items = []
+        try:
+            cand = [p for p in JOBS["pending"].glob("*.json") if p.is_file()]
+            for p in cand:
+                n = p.name
+                if (n.endswith(".progress.json") or n.endswith(".json.progress") or n.endswith(".meta.json") or n.startswith("_")):
+                    continue
+                items.append(p)
+            # Oldest first = FIFO (matches UI + supports reordering via file mtime)
+            items.sort(key=lambda p: (p.stat().st_mtime if p.exists() else 0.0, p.name))
+        except Exception:
+            items = []
         if not items:
             time.sleep(1.0)
             continue

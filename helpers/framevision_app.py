@@ -3567,7 +3567,8 @@ class QueuePane(QWidget):
                                 pass
                         return None
                     if status == "pending":
-                        sort_ts = _parse(d.get("enqueued_at") or d.get("created_at") or d.get("added_at")) or sort_ts
+                        # For pending jobs, always sort by file mtime so manual reordering (mtime swaps) is reflected.
+                        pass
                     elif status == "running":
                         sort_ts = _parse(d.get("started_at")) or sort_ts
                     elif status in ("done","failed"):
@@ -3593,7 +3594,7 @@ class QueuePane(QWidget):
 
         if files:
             try:
-                files_sorted = sorted(files, key=lambda t_p: t_p[0], reverse=True)
+                files_sorted = sorted(files, key=lambda t_p: t_p[0], reverse=(status != "pending"))
             except Exception:
                 files_sorted = list(files)
         else:
@@ -3611,46 +3612,46 @@ class QueuePane(QWidget):
 
             if auto_cleanup:
                 try:
-                    # Start cleanup slightly before hitting the max.
-                    trigger_at = max(1, int(max_keep) - 1)  # e.g. 50 -> start at 49
+                    # Start cleanup a bit earlier than the max. Example: max_keep 50 -> trigger at 48.
+                    trigger_at = max(1, int(max_keep) - 2)
                 except Exception:
                     trigger_at = max_keep
 
-                # Finished (done) queue: be aggressive.
-                # Allow up to ~48-49 items, then move old jobs so we drop back to ~39.
+                # Finished (done): batch cleanup so we drop by ~10 at once (48 -> 38, 49 -> 39).
+                # Failed: gentler cleanup so errors remain visible.
                 try:
-                    if status == "done":
-                        target_after = max(0, int(trigger_at) - 10)  # 49 -> 39
-                        to_move = max(0, int(len(files_sorted)) - int(target_after))
-                        max_per_refresh = min(max(0, int(to_move)), 20)
-                    else:
-                        # Failed: keep gentler cleanup so errors remain visible.
+                    if status == "done" and len(files_sorted) >= trigger_at:
+                        max_per_refresh = 10
+                    elif status == "failed" and len(files_sorted) >= trigger_at:
                         max_per_refresh = 3
+                    else:
+                        max_per_refresh = 0
                 except Exception:
-                    max_per_refresh = 3
+                    max_per_refresh = 0
 
                 moved = 0
-                try:
-                    import shutil as _shutil
-                    import time as _time
-                    old_dir = (BASE / "jobs" / "done" / "old_jobs")
-                    old_dir.mkdir(parents=True, exist_ok=True)
+                if max_per_refresh > 0:
+                    try:
+                        import shutil as _shutil
+                        import time as _time
+                        old_dir = (BASE / "jobs" / status / "old_jobs")
+                        old_dir.mkdir(parents=True, exist_ok=True)
 
-                    while len(files_sorted) >= trigger_at and files_sorted and moved < max_per_refresh:
-                        victim = files_sorted[-1][1]  # oldest (files_sorted is newest-first)
-                        if victim is None:
-                            break
-                        try:
-                            dest = old_dir / victim.name
-                            if dest.exists():
-                                dest = old_dir / f"{victim.stem}_{int(_time.time())}{victim.suffix}"
-                            _shutil.move(str(victim), str(dest))
-                            files_sorted.pop(-1)
-                            moved += 1
-                        except Exception:
-                            break
-                except Exception:
-                    pass
+                        while files_sorted and moved < max_per_refresh:
+                            victim = files_sorted[-1][1]  # oldest (files_sorted is newest-first)
+                            if victim is None:
+                                break
+                            try:
+                                dest = old_dir / victim.name
+                                if dest.exists():
+                                    dest = old_dir / f"{victim.stem}_{int(_time.time())}{victim.suffix}"
+                                _shutil.move(str(victim), str(dest))
+                                files_sorted.pop(-1)
+                                moved += 1
+                            except Exception:
+                                break
+                    except Exception:
+                        pass
 
             else:
                 # Legacy behavior: hard-delete beyond max_keep

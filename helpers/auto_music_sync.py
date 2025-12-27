@@ -5575,12 +5575,18 @@ class AutoMusicSyncWidget(QWidget):
         btn_vf = QPushButton("Video file...", self)
         btn_vd = QPushButton("Clip folder...", self)
         btn_vmf = QPushButton("Clip files...", self)
-        row_v = QHBoxLayout()
-        row_v.addWidget(self.edit_video, 1)
-        row_v.addWidget(btn_vf)
-        row_v.addWidget(btn_vd)
-        row_v.addWidget(btn_vmf)
-        form.addRow("Video input:", row_v)
+
+        # Put the pickers on the first row, and the resulting path(s) on the next row
+        # so the selected input can use the full width.
+        row_v_btns = QHBoxLayout()
+        row_v_btns.setContentsMargins(0, 0, 0, 0)
+        row_v_btns.setSpacing(6)
+        row_v_btns.addWidget(btn_vf)
+        row_v_btns.addWidget(btn_vd)
+        row_v_btns.addWidget(btn_vmf)
+        row_v_btns.addStretch(1)
+        form.addRow("", row_v_btns)
+        form.addRow("", self.edit_video)
 
         # Optional loader for image sources (hidden by default)
         self.image_sources_row = QWidget(self)
