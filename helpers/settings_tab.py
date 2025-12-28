@@ -23,6 +23,19 @@ except Exception:
         @staticmethod
         def is_enabled() -> bool: return True
 
+
+# AnimatedButtonsManager import (safe fallback so Settings never crashes)
+try:
+    from helpers.animated_buttons import AnimatedButtonsManager
+except Exception:
+    class AnimatedButtonsManager:  # fallback no-op if file missing
+        @staticmethod
+        def install(_app=None): 
+            return None
+        @staticmethod
+        def apply_from_settings(_app=None): 
+            return None
+
 import os, shutil, sys, time, json
 
 
@@ -465,6 +478,163 @@ def _options_group(page: QWidget) -> QGroupBox:
         h_banner.addWidget(cb_banner_color)
         h_banner.addStretch(1)
         v.addWidget(row_banner)
+
+        # -- Animated buttons ----------------------------------------------------------
+        cb_animbtn = QCheckBox("Animated buttons")
+        cb_animbtn.setToolTip("If enabled, 'Generate' and 'View results' buttons will animate on hover.")
+        animbtn_default = s.value("animated_buttons_enabled", False, type=bool)
+        cb_animbtn.setChecked(animbtn_default)
+        _sync_grey_state(cb_animbtn, bool(animbtn_default))
+
+        # Style modes (only one can be enabled at a time)
+        cb_anim_glow = QCheckBox("Glow")
+        cb_anim_shift = QCheckBox("Color shift")
+        cb_anim_boom = QCheckBox("Boomerang")
+        cb_anim_outline = QCheckBox("Neon outline")
+        cb_anim_shimmer = QCheckBox("Shimmer")
+        cb_anim_pop = QCheckBox("Pop")
+        cb_anim_rand = QCheckBox("Random (each hover)")
+
+        cb_anim_glow.setToolTip("Soft glowing hover effect.")
+        cb_anim_shift.setToolTip("Smooth color cycling on hover.")
+        cb_anim_boom.setToolTip("Animated left-right-left gradient sweep on hover.")
+        cb_anim_outline.setToolTip("Pulsing neon outline while hovered.")
+        cb_anim_shimmer.setToolTip("Diagonal shine that sweeps across the button.")
+        cb_anim_pop.setToolTip("Micro pop feeling via center highlight and lift shadow.")
+        cb_anim_rand.setToolTip("Pick a different effect each time you hover (all effects).")
+
+        mode_default = (s.value("animated_buttons_mode", "glow", type=str) or "glow").strip().lower()
+        if mode_default not in ("glow", "shift", "boomerang", "outline", "shimmer", "pop", "random"):
+            mode_default = "glow"
+
+        row_anim = QWidget(content)
+        h_anim = QHBoxLayout(row_anim)
+        h_anim.setContentsMargins(0, 0, 0, 0)
+        h_anim.setSpacing(12)
+        h_anim.addWidget(cb_animbtn)
+        h_anim.addStretch(1)
+        v.addWidget(row_anim)
+
+        row_anim_modes = QWidget(content)
+        v_anim2 = QVBoxLayout(row_anim_modes)
+        v_anim2.setContentsMargins(18, 0, 0, 0)
+        v_anim2.setSpacing(6)
+
+        row_anim_modes_1 = QWidget(row_anim_modes)
+        h_anim2_1 = QHBoxLayout(row_anim_modes_1)
+        h_anim2_1.setContentsMargins(0, 0, 0, 0)
+        h_anim2_1.setSpacing(12)
+        h_anim2_1.addWidget(cb_anim_glow)
+        h_anim2_1.addWidget(cb_anim_shift)
+        h_anim2_1.addWidget(cb_anim_boom)
+        h_anim2_1.addStretch(1)
+        v_anim2.addWidget(row_anim_modes_1)
+
+        row_anim_modes_2 = QWidget(row_anim_modes)
+        h_anim2_2 = QHBoxLayout(row_anim_modes_2)
+        h_anim2_2.setContentsMargins(0, 0, 0, 0)
+        h_anim2_2.setSpacing(12)
+        h_anim2_2.addWidget(cb_anim_outline)
+        h_anim2_2.addStretch(1)
+        v_anim2.addWidget(row_anim_modes_2)
+
+        row_anim_modes_3 = QWidget(row_anim_modes)
+        h_anim2_3 = QHBoxLayout(row_anim_modes_3)
+        h_anim2_3.setContentsMargins(0, 0, 0, 0)
+        h_anim2_3.setSpacing(12)
+        h_anim2_3.addWidget(cb_anim_shimmer)
+        h_anim2_3.addWidget(cb_anim_pop)
+        h_anim2_3.addWidget(cb_anim_rand)
+        h_anim2_3.addStretch(1)
+        v_anim2.addWidget(row_anim_modes_3)
+
+        row_anim_modes.setVisible(bool(animbtn_default))
+        v.addWidget(row_anim_modes)
+
+        def _anim_apply_to_app():
+            try:
+                app = QtWidgets.QApplication.instance()
+                AnimatedButtonsManager.install(app)
+                AnimatedButtonsManager.apply_from_settings(app)
+            except Exception:
+                pass
+
+        def _anim_set_mode(mode: str):
+            mode = (mode or "").strip().lower()
+            if mode not in ("glow", "shift", "boomerang", "outline", "shimmer", "pop", "random"):
+                mode = "glow"
+            try:
+                s.setValue("animated_buttons_mode", mode)
+            except Exception:
+                pass
+
+            # Ensure only one is active (checkbox look, radio behavior)
+            items = [
+                (cb_anim_glow, mode == "glow"),
+                (cb_anim_shift, mode == "shift"),
+                (cb_anim_boom, mode == "boomerang"),
+                (cb_anim_outline, mode == "outline"),
+                (cb_anim_shimmer, mode == "shimmer"),
+                (cb_anim_pop, mode == "pop"),
+                (cb_anim_rand, mode == "random"),
+            ]
+            for w, on in items:
+                try:
+                    w.blockSignals(True)
+                    w.setChecked(bool(on))
+                except Exception:
+                    pass
+                try:
+                    w.blockSignals(False)
+                except Exception:
+                    pass
+                _sync_grey_state(w, bool(on))
+
+            _anim_apply_to_app()
+
+        def _anim_on_main_toggle(b: bool):
+            try:
+                s.setValue("animated_buttons_enabled", bool(b))
+            except Exception:
+                pass
+            _sync_grey_state(cb_animbtn, bool(b))
+            try:
+                row_anim_modes.setVisible(bool(b))
+            except Exception:
+                pass
+
+            # If turning ON, ensure a mode is selected.
+            if b:
+                cur = (s.value("animated_buttons_mode", "glow", type=str) or "glow").strip().lower()
+                if cur not in ("glow", "shift", "boomerang", "outline", "shimmer", "pop", "random"):
+                    cur = "glow"
+                _anim_set_mode(cur)
+            else:
+                _anim_apply_to_app()
+
+        cb_animbtn.toggled.connect(_anim_on_main_toggle)
+
+        def _anim_on_sub_toggle(mode: str, b: bool):
+            if not cb_animbtn.isChecked():
+                return
+            if b:
+                _anim_set_mode(mode)
+            else:
+                # Prevent ending up with zero mode selected while enabled.
+                cur = (s.value("animated_buttons_mode", "glow", type=str) or "glow").strip().lower()
+                if cur == (mode or "").strip().lower():
+                    QTimer.singleShot(0, lambda: _anim_set_mode(cur))
+
+        cb_anim_glow.toggled.connect(lambda b: _anim_on_sub_toggle("glow", b))
+        cb_anim_shift.toggled.connect(lambda b: _anim_on_sub_toggle("shift", b))
+        cb_anim_boom.toggled.connect(lambda b: _anim_on_sub_toggle("boomerang", b))
+        cb_anim_outline.toggled.connect(lambda b: _anim_on_sub_toggle("outline", b))
+        cb_anim_shimmer.toggled.connect(lambda b: _anim_on_sub_toggle("shimmer", b))
+        cb_anim_pop.toggled.connect(lambda b: _anim_on_sub_toggle("pop", b))
+        cb_anim_rand.toggled.connect(lambda b: _anim_on_sub_toggle("random", b))
+
+        # Apply initial mode states
+        _anim_set_mode(mode_default)
 
         # -- Emoji labels toggle --------------------------------------------------------
         cb_emoji = QCheckBox("Emoji labels")
@@ -1144,6 +1314,7 @@ _EMOJI_MAP = {
     "steps": "👣",
     "folder": "🗂️",
 #    "explorer": "🗂️",
+    "generate": "✨",
     "batch": "📦",
     "clip": "🎬",
     "info": "💡",
@@ -1453,6 +1624,16 @@ def install_settings_tab(main_window: QWidget) -> None:
             _apply_emoji_on_start(main_window)
         except Exception:
             pass
+
+
+        # Auto-install animated buttons manager (applies saved settings)
+        try:
+            app = QtWidgets.QApplication.instance()
+            AnimatedButtonsManager.install(app)
+            AnimatedButtonsManager.apply_from_settings(app)
+        except Exception:
+            pass
+
 
         # Minimal wiring: delegate Easter Eggs UI injection + tracker to settings_more
         try:
