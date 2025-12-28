@@ -1,19 +1,18 @@
 """
 helpers/videotext.py
 
-PySide6 UI pane for adding text overlays to video with:
-- Text content
-- Font family + size (+ optional font file for export)
-- Position (anchor + x/y offset)
-- Start + duration
-- Video preview with overlay (uses QGraphicsVideoItem so overlay renders reliably on Windows)
-- Clickable/zoomable timeline that seeks the player + draggable segment
-- Export video with text via ffmpeg drawtext (single overlay segment)
+Video Text Overlay / Text-to-Video Creator (PySide6)
 
-Settings persistence:
-- /presets/setsave/videotext.json  (relative to project root)
+What you get:
+- Reliable on-top preview overlay on Windows (no QVideoWidget child overlay issues)
+  Uses QGraphicsVideoItem + multiple QGraphicsTextItem overlays
+- Multiple text overlays (each with its own text/font/size/color/position/timing)
+- Fade-in / fade-out per overlay (preview + export)
+- Preview pane can be hidden (for more timeline space)
+- Export baked-in text via ffmpeg drawtext
 
-Standalone runner available at bottom.
+Settings saved to:
+  /presets/setsave/videotext.json   (relative to project root)
 """
 
 from __future__ import annotations
@@ -21,22 +20,24 @@ from __future__ import annotations
 import json
 import os
 import subprocess
-from dataclasses import dataclass, asdict
+import uuid
+from dataclasses import dataclass, asdict, field
 from pathlib import Path
 from typing import Dict, Any, Optional, Tuple, List
 
 from PySide6.QtCore import (
-    Qt, QRect, QSize, QPoint, QUrl, Signal, QTimer
+    Qt, QRect, QSize, QUrl, Signal, QTimer, QSizeF, QRectF, QEvent, QPointF
 )
 from PySide6.QtGui import (
-    QPainter, QPen, QFont, QColor
+    QPainter, QPen, QFont, QColor, QTransform
 )
 from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QFormLayout,
     QLabel, QPushButton, QLineEdit, QSpinBox, QDoubleSpinBox,
     QComboBox, QFontComboBox, QFileDialog, QSlider, QScrollArea,
     QFrame, QColorDialog, QToolButton, QSizePolicy, QApplication,
-    QCheckBox, QMessageBox, QGraphicsView, QGraphicsScene, QGraphicsTextItem
+    QCheckBox, QMessageBox, QGraphicsView, QGraphicsScene, QGraphicsTextItem,
+    QListWidget, QListWidgetItem, QSplitter
 )
 
 from PySide6.QtMultimedia import QMediaPlayer, QAudioOutput
@@ -44,7 +45,6 @@ from PySide6.QtMultimediaWidgets import QGraphicsVideoItem
 
 
 def _project_root_from_helpers_file() -> Path:
-    # Assuming this file is at: <root>/helpers/videotext.py
     p = Path(__file__).resolve()
     return p.parents[1]
 
@@ -61,24 +61,30 @@ def _clamp(v: float, lo: float, hi: float) -> float:
     return max(lo, min(hi, v))
 
 
+def _to_bool(v: Any, default: bool = False) -> bool:
+    """Robust bool coercion for settings loaded from JSON (handles 'False' strings, 0/1, etc.)."""
+    if isinstance(v, bool):
+        return v
+    if v is None:
+        return default
+    if isinstance(v, (int, float)):
+        return bool(v)
+    if isinstance(v, str):
+        s = v.strip().lower()
+        if s in ("1", "true", "yes", "y", "on"):
+            return True
+        if s in ("0", "false", "no", "n", "off", ""):
+            return False
+    return default
+
+
+
 def _ms_to_s(ms: int) -> float:
     return max(0.0, float(ms) / 1000.0)
 
 
-def _rgba_to_ffmpeg_color(rgba: list[int]) -> str:
-    r, g, b, a = rgba
-    alpha = _clamp(a / 255.0, 0.0, 1.0)
-    return f"#{r:02x}{g:02x}{b:02x}@{alpha:.3f}"
-
-
 def _ff_escape_value(s: str) -> str:
-    """
-    Escape for ffmpeg drawtext option values:
-      - backslash must be doubled
-      - ':' must be escaped as '\:'
-      - "'" must be escaped as "\'"
-      - '%' escaped to avoid expansions in some builds
-    """
+    # Escape for ffmpeg drawtext option values.
     return (
         s.replace("\\", "\\\\")
          .replace(":", "\\:")
@@ -103,6 +109,10 @@ def _split_nonword(s: str) -> List[str]:
 
 
 def _guess_windows_fontfile(family: str) -> Optional[str]:
+    """
+    Best-effort Windows font file guess for ffmpeg drawtext.
+    Some ffmpeg builds on Windows require an explicit font file path.
+    """
     try:
         fonts_dir = Path(os.environ.get("WINDIR", r"C:\Windows")) / "Fonts"
         if not fonts_dir.exists():
@@ -153,11 +163,25 @@ def _which(cmd: str) -> Optional[str]:
 
 
 def _find_ffmpeg_exe() -> Optional[str]:
-    for exe in ("ffmpeg", "ffmpeg.exe"):
-        if _which(exe):
-            return exe
-
+    """
+    Preferred location for this app:
+      (root) /presets/bin/ffmpeg.exe
+    Falls back to PATH and a few common app folders.
+    """
     root = _project_root_from_helpers_file()
+    preferred = [
+        root / "presets" / "bin" / "ffmpeg.exe",
+        root / "presets" / "bin" / "ffmpeg",
+    ]
+    for p in preferred:
+        if p.exists():
+            return str(p)
+
+    for exe in ("ffmpeg", "ffmpeg.exe"):
+        found = _which(exe)
+        if found:
+            return exe  # use PATH-resolvable command
+
     common = [
         root / "ffmpeg" / "bin" / "ffmpeg.exe",
         root / "bin" / "ffmpeg.exe",
@@ -185,12 +209,18 @@ ANCHORS = [
 ]
 
 
+def _new_uid() -> str:
+    return uuid.uuid4().hex[:12]
+
+
 @dataclass
-class VideoTextSettings:
+class TextOverlay:
+    uid: str = field(default_factory=_new_uid)
+
     text: str = "Your text here"
     font_family: str = "Arial"
-    font_size: int = 48
-    color_rgba: list[int] | None = None  # [r,g,b,a]
+    font_size: int = 48  # pixels
+    color_rgba: list[int] = field(default_factory=lambda: [255, 255, 255, 255])
 
     # Export-only: optional font file path for ffmpeg drawtext
     font_file: str = ""
@@ -202,20 +232,91 @@ class VideoTextSettings:
     start_ms: int = 0
     duration_ms: int = 2500
 
+    fade_in_ms: int = 250
+    fade_out_ms: int = 250
+
+    enabled: bool = True
+
+    def normalize(self, video_duration_ms: int | None = None) -> None:
+        self.font_size = int(_clamp(int(self.font_size), 6, 300))
+        self.offset_x = int(_clamp(int(self.offset_x), -4000, 4000))
+        self.offset_y = int(_clamp(int(self.offset_y), -4000, 4000))
+
+        self.start_ms = int(max(0, int(self.start_ms)))
+        self.duration_ms = int(max(1, int(self.duration_ms)))
+
+        self.fade_in_ms = int(max(0, int(self.fade_in_ms)))
+        self.fade_out_ms = int(max(0, int(self.fade_out_ms)))
+
+        # Clamp to video duration
+        if video_duration_ms is not None and video_duration_ms > 0:
+            if self.start_ms > video_duration_ms:
+                self.start_ms = int(video_duration_ms)
+            if self.start_ms + self.duration_ms > video_duration_ms:
+                self.duration_ms = max(1, int(video_duration_ms - self.start_ms))
+
+        # Fade constraints
+        self.fade_in_ms = int(_clamp(self.fade_in_ms, 0, self.duration_ms))
+        self.fade_out_ms = int(_clamp(self.fade_out_ms, 0, self.duration_ms))
+        if self.fade_in_ms + self.fade_out_ms > self.duration_ms:
+            # Scale them down proportionally (keep ratio)
+            total = max(1, self.fade_in_ms + self.fade_out_ms)
+            self.fade_in_ms = int(self.duration_ms * (self.fade_in_ms / total))
+            self.fade_out_ms = int(self.duration_ms - self.fade_in_ms)
+
+
+@dataclass
+class VideoTextSettings:
+    overlays: List[TextOverlay] = field(default_factory=list)
+
+    # UI state
+    selected_uid: str = ""
     zoom: float = 1.0
     last_video_path: str = ""
 
     # Preview behavior
     preview_always_show: bool = False
+    preview_hidden: bool = False
 
     def __post_init__(self) -> None:
-        if self.color_rgba is None:
-            self.color_rgba = [255, 255, 255, 255]
+        if not self.overlays:
+            self.overlays = [TextOverlay()]
+        self.zoom = float(_clamp(float(self.zoom), 0.25, 10.0))
+        if not isinstance(self.preview_always_show, bool):
+            self.preview_always_show = False
+        if not isinstance(self.preview_hidden, bool):
+            self.preview_hidden = False
+        # Ensure selection is valid
+        if self.selected_uid:
+            if not any(o.uid == self.selected_uid for o in self.overlays):
+                self.selected_uid = self.overlays[0].uid
+        else:
+            self.selected_uid = self.overlays[0].uid
+
+    def get_selected(self) -> TextOverlay:
+        for o in self.overlays:
+            if o.uid == self.selected_uid:
+                return o
+        self.selected_uid = self.overlays[0].uid
+        return self.overlays[0]
+
+
+class _OverlayItems:
+    def __init__(self, uid: str, shadow: QGraphicsTextItem, text: QGraphicsTextItem) -> None:
+        self.uid = uid
+        self.shadow = shadow
+        self.text = text
 
 
 class VideoPreview(QWidget):
+    overlaySelected = Signal(str)
+    overlayMoved = Signal(str, int, int)
+
     """
-    QGraphicsView-based preview so text overlay is guaranteed to render over video.
+    Preview widget with reliable overlay:
+    - Video renders into QGraphicsVideoItem
+    - Multiple text overlays render as QGraphicsTextItem above it
+    - We compute an aspect-fit video rect and anchor each text item to that rect
     """
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
@@ -225,7 +326,17 @@ class VideoPreview(QWidget):
         self.view.setFrameShape(QFrame.NoFrame)
         self.view.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
         self.view.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        self.view.setAlignment(Qt.AlignLeft | Qt.AlignTop)
         self.view.setRenderHints(self.view.renderHints() | QPainter.Antialiasing | QPainter.TextAntialiasing)
+        self.view.setBackgroundBrush(QColor(0, 0, 0))
+
+        # Mouse interactions: click/drag overlays inside the preview
+        self.view.setMouseTracking(True)
+        try:
+            self.view.viewport().setMouseTracking(True)
+            self.view.viewport().installEventFilter(self)
+        except Exception:
+            pass
 
         lay = QVBoxLayout(self)
         lay.setContentsMargins(0, 0, 0, 0)
@@ -234,104 +345,381 @@ class VideoPreview(QWidget):
         self.video_item = QGraphicsVideoItem()
         self.scene.addItem(self.video_item)
 
-        # Shadow + text (two items)
-        self.text_shadow = QGraphicsTextItem()
-        self.text_shadow.setDefaultTextColor(QColor(0, 0, 0, 170))
-        self.scene.addItem(self.text_shadow)
+        self._items: Dict[str, _OverlayItems] = {}
+        self._item_to_uid: Dict[object, str] = {}
 
-        self.text_item = QGraphicsTextItem()
-        self.text_item.setDefaultTextColor(QColor(255, 255, 255))
-        self.scene.addItem(self.text_item)
+        # drag state
+        self._drag_uid: str = ""
+        self._drag_grab: QPointF = QPointF(0, 0)
+        self._drag_anchor_base: QPointF = QPointF(0, 0)
 
         self._settings = VideoTextSettings()
-        self._visible_now = True
+        self._native_size = QSizeF(0, 0)
+        self._video_rect = QRectF(0, 0, 1, 1)
+
+        # When available, use nativeSizeChanged to recompute the aspect-fit rect.
+        try:
+            self.video_item.nativeSizeChanged.connect(self._on_native_size_changed)  # type: ignore
+        except Exception:
+            pass
 
         self.setMinimumSize(QSize(480, 270))
 
+    def _on_native_size_changed(self, size) -> None:
+        try:
+            self._native_size = QSizeF(size)
+        except Exception:
+            try:
+                self._native_size = size
+            except Exception:
+                return
+        self._update_video_layout()
+        self._reposition_all()
+
     def set_settings(self, s: VideoTextSettings) -> None:
         self._settings = s
-        self._apply_text_style()
-        self._reposition_text()
+        self._sync_items()
+        self._update_video_layout()
+        self._apply_all_styles()
+        self._reposition_all()
 
-    def set_visible_now(self, v: bool) -> None:
-        self._visible_now = bool(v)
-        self.text_item.setVisible(self._visible_now)
-        self.text_shadow.setVisible(self._visible_now)
+    def update_for_time(self, pos_ms: int) -> None:
+        s = self._settings
+        for ov in s.overlays:
+            items = self._items.get(ov.uid)
+            if not items:
+                continue
+            if not ov.enabled or not (ov.text or "").strip():
+                items.text.setVisible(False)
+                items.shadow.setVisible(False)
+                continue
+
+            if s.preview_always_show:
+                alpha = (ov.color_rgba[3] / 255.0) if ov.color_rgba else 1.0
+            else:
+                alpha = self._alpha_at_ms(ov, pos_ms)
+
+            if alpha <= 0.001:
+                items.text.setVisible(False)
+                items.shadow.setVisible(False)
+            else:
+                items.text.setVisible(True)
+                items.shadow.setVisible(True)
+                items.text.setOpacity(alpha)
+                items.shadow.setOpacity(alpha)
 
     def resizeEvent(self, event) -> None:
         super().resizeEvent(event)
-        r = self.view.viewport().rect()
-        self.video_item.setSize(r.size())
-        self.scene.setSceneRect(0, 0, r.width(), r.height())
-        self._reposition_text()
+        self._update_video_layout()
+        self._reposition_all()
 
-    def _apply_text_style(self) -> None:
-        s = self._settings
-        txt = s.text or ""
-        font = QFont(s.font_family, int(s.font_size))
-        self.text_item.setFont(font)
-        self.text_shadow.setFont(font)
 
-        self.text_item.setPlainText(txt)
-        self.text_shadow.setPlainText(txt)
+    def _uid_at(self, scene_pos: QPointF) -> str:
+        """Return overlay uid under scene_pos (hits text or shadow), else ''"""
+        try:
+            item = self.scene.itemAt(scene_pos, QTransform())
+        except Exception:
+            item = None
+        if not item:
+            return ""
+        try:
+            return str(self._item_to_uid.get(item, ""))
+        except Exception:
+            return ""
 
-        c = QColor(*s.color_rgba)
-        self.text_item.setDefaultTextColor(c)
-        self.text_shadow.setDefaultTextColor(QColor(0, 0, 0, 170))
+    def _overlay_by_uid(self, uid: str) -> Optional[TextOverlay]:
+        for ov in self._settings.overlays:
+            if ov.uid == uid:
+                return ov
+        return None
 
-    def _anchor_pos(self, scene_w: float, scene_h: float, text_w: float, text_h: float, anchor: str) -> Tuple[float, float]:
-        if anchor == "top_left":
-            return (0.0, 0.0)
-        if anchor == "top_center":
-            return ((scene_w - text_w) / 2.0, 0.0)
-        if anchor == "top_right":
-            return (scene_w - text_w, 0.0)
+    def eventFilter(self, obj, event) -> bool:
+        # Dragging and selection on the preview overlay text.
+        try:
+            if obj is self.view.viewport():
+                et = event.type()
 
-        if anchor == "center_left":
-            return (0.0, (scene_h - text_h) / 2.0)
-        if anchor == "center":
-            return ((scene_w - text_w) / 2.0, (scene_h - text_h) / 2.0)
-        if anchor == "center_right":
-            return (scene_w - text_w, (scene_h - text_h) / 2.0)
+                if et == QEvent.MouseButtonPress and event.button() == Qt.LeftButton:
+                    pos = event.position()
+                    scene_pos = self.view.mapToScene(int(pos.x()), int(pos.y()))
+                    uid = self._uid_at(scene_pos)
+                    if uid:
+                        self._drag_uid = uid
 
-        if anchor == "bottom_left":
-            return (0.0, scene_h - text_h)
-        if anchor == "bottom_center":
-            return ((scene_w - text_w) / 2.0, scene_h - text_h)
-        if anchor == "bottom_right":
-            return (scene_w - text_w, scene_h - text_h)
+                        # Update selection
+                        self._settings.selected_uid = uid
+                        try:
+                            self.overlaySelected.emit(uid)
+                        except Exception:
+                            pass
 
-        return (0.0, 0.0)
+                        items = self._items.get(uid)
+                        ov = self._overlay_by_uid(uid)
+                        if items and ov:
+                            item_pos = items.text.pos()
+                            self._drag_grab = scene_pos - item_pos
 
-    def _reposition_text(self) -> None:
-        s = self._settings
-        if not (s.text or "").strip():
-            self.text_item.setVisible(False)
-            self.text_shadow.setVisible(False)
+                            # Precompute anchor base for offset math
+                            br = items.text.boundingRect()
+                            text_w = float(br.width())
+                            text_h = float(br.height())
+
+                            base_rect = self._video_rect
+                            if base_rect.width() <= 1 or base_rect.height() <= 1:
+                                base_rect = self.scene.sceneRect()
+
+                            base_x, base_y = self._anchor_pos(base_rect, text_w, text_h, ov.anchor)
+                            self._drag_anchor_base = QPointF(base_x, base_y)
+
+                        self.view.setCursor(Qt.ClosedHandCursor)
+                        event.accept()
+                        return True
+
+                if et == QEvent.MouseMove:
+                    pos = event.position()
+                    scene_pos = self.view.mapToScene(int(pos.x()), int(pos.y()))
+
+                    if self._drag_uid and (event.buttons() & Qt.LeftButton):
+                        uid = self._drag_uid
+                        ov = self._overlay_by_uid(uid)
+                        if ov:
+                            new_pos = scene_pos - self._drag_grab
+
+                            base_rect = self._video_rect
+                            if base_rect.width() <= 1 or base_rect.height() <= 1:
+                                base_rect = self.scene.sceneRect()
+
+                            # Soft clamp (same as _reposition_overlay)
+                            clamp_rect = base_rect.adjusted(
+                                -base_rect.width(), -base_rect.height(),
+                                base_rect.width(), base_rect.height()
+                            )
+
+                            x = float(_clamp(new_pos.x(), clamp_rect.left(), clamp_rect.right()))
+                            y = float(_clamp(new_pos.y(), clamp_rect.top(), clamp_rect.bottom()))
+
+                            if ov.anchor == "custom":
+                                ov.offset_x = int(round(x))
+                                ov.offset_y = int(round(y))
+                            else:
+                                ov.offset_x = int(round(x - float(self._drag_anchor_base.x())))
+                                ov.offset_y = int(round(y - float(self._drag_anchor_base.y())))
+
+                            ov.normalize(video_duration_ms=None)
+                            self._reposition_overlay(ov)
+
+                            try:
+                                self.overlayMoved.emit(uid, int(ov.offset_x), int(ov.offset_y))
+                            except Exception:
+                                pass
+
+                        event.accept()
+                        return True
+
+                    # Hover cursor
+                    uid = self._uid_at(scene_pos)
+                    if uid:
+                        self.view.setCursor(Qt.OpenHandCursor)
+                    else:
+                        self.view.setCursor(Qt.ArrowCursor)
+
+                if et == QEvent.MouseButtonRelease and event.button() == Qt.LeftButton:
+                    if self._drag_uid:
+                        self._drag_uid = ""
+                        self.view.setCursor(Qt.ArrowCursor)
+                        event.accept()
+                        return True
+        except Exception:
+            pass
+        return super().eventFilter(obj, event)
+
+    def _sync_items(self) -> None:
+        wanted = {ov.uid for ov in self._settings.overlays}
+
+        # Remove old
+        for uid in list(self._items.keys()):
+            if uid not in wanted:
+                it = self._items.pop(uid)
+                try:
+                    self._item_to_uid.pop(it.shadow, None)
+                    self._item_to_uid.pop(it.text, None)
+                except Exception:
+                    pass
+                self.scene.removeItem(it.shadow)
+                self.scene.removeItem(it.text)
+
+        # Add new
+        for ov in self._settings.overlays:
+            if ov.uid in self._items:
+                continue
+
+            shadow = QGraphicsTextItem()
+            shadow.setDefaultTextColor(QColor(0, 0, 0, 170))
+            shadow.setZValue(10.0)
+
+            text = QGraphicsTextItem()
+            text.setDefaultTextColor(QColor(255, 255, 255))
+            text.setZValue(11.0)
+
+            self.scene.addItem(shadow)
+            self.scene.addItem(text)
+
+            self._items[ov.uid] = _OverlayItems(ov.uid, shadow, text)
+            self._item_to_uid[shadow] = ov.uid
+            self._item_to_uid[text] = ov.uid
+
+    def _update_video_layout(self) -> None:
+        vp = self.view.viewport().rect()
+        vw = float(vp.width())
+        vh = float(vp.height())
+        if vw <= 1 or vh <= 1:
             return
 
-        rect = self.scene.sceneRect()
-        scene_w = rect.width()
-        scene_h = rect.height()
+        # Scene matches the viewport.
+        self.scene.setSceneRect(0, 0, vw, vh)
 
-        br = self.text_item.boundingRect()
-        text_w = br.width()
-        text_h = br.height()
+        ns = self._native_size
+        ns_w = float(ns.width()) if hasattr(ns, "width") else 0.0
+        ns_h = float(ns.height()) if hasattr(ns, "height") else 0.0
+        if ns_w <= 1 or ns_h <= 1:
+            ns_w, ns_h = vw, vh
 
-        base_x, base_y = self._anchor_pos(scene_w, scene_h, text_w, text_h, s.anchor)
+        # Aspect-fit
+        scale = min(vw / ns_w, vh / ns_h) if ns_w > 0 and ns_h > 0 else 1.0
+        out_w = max(1.0, ns_w * scale)
+        out_h = max(1.0, ns_h * scale)
+        x = (vw - out_w) / 2.0
+        y = (vh - out_h) / 2.0
 
-        if s.anchor == "custom":
-            x = float(s.offset_x)
-            y = float(s.offset_y)
+        self._video_rect = QRectF(x, y, out_w, out_h)
+
+        try:
+            self.video_item.setSize(QSizeF(out_w, out_h))
+        except Exception:
+            pass
+        self.video_item.setPos(x, y)
+
+    def _apply_all_styles(self) -> None:
+        for ov in self._settings.overlays:
+            self._apply_overlay_style(ov)
+
+    def _apply_overlay_style(self, ov: TextOverlay) -> None:
+        items = self._items.get(ov.uid)
+        if not items:
+            return
+
+        txt = ov.text or ""
+
+        font = QFont(ov.font_family)
+        font.setPixelSize(int(ov.font_size))  # pixel-based sizing
+
+        for it in (items.text, items.shadow):
+            it.setScale(1.0)
+            it.setFont(font)
+            it.setPlainText(txt)
+
+        if ov.color_rgba and len(ov.color_rgba) == 4:
+            c = QColor(*ov.color_rgba)
         else:
-            x = base_x + float(s.offset_x)
-            y = base_y + float(s.offset_y)
+            c = QColor(255, 255, 255, 255)
+        items.text.setDefaultTextColor(c)
+        items.shadow.setDefaultTextColor(QColor(0, 0, 0, 170))
 
-        x = _clamp(x, -scene_w, scene_w)
-        y = _clamp(y, -scene_h, scene_h)
+    def _anchor_pos(self, rect: QRectF, text_w: float, text_h: float, anchor: str) -> Tuple[float, float]:
+        x0 = rect.x()
+        y0 = rect.y()
+        w = rect.width()
+        h = rect.height()
 
-        self.text_item.setPos(x, y)
-        self.text_shadow.setPos(x + 2, y + 2)
+        if anchor == "top_left":
+            return (x0, y0)
+        if anchor == "top_center":
+            return (x0 + (w - text_w) / 2.0, y0)
+        if anchor == "top_right":
+            return (x0 + (w - text_w), y0)
+
+        if anchor == "center_left":
+            return (x0, y0 + (h - text_h) / 2.0)
+        if anchor == "center":
+            return (x0 + (w - text_w) / 2.0, y0 + (h - text_h) / 2.0)
+        if anchor == "center_right":
+            return (x0 + (w - text_w), y0 + (h - text_h) / 2.0)
+
+        if anchor == "bottom_left":
+            return (x0, y0 + (h - text_h))
+        if anchor == "bottom_center":
+            return (x0 + (w - text_w) / 2.0, y0 + (h - text_h))
+        if anchor == "bottom_right":
+            return (x0 + (w - text_w), y0 + (h - text_h))
+
+        return (x0, y0)
+
+    def _reposition_all(self) -> None:
+        for ov in self._settings.overlays:
+            self._reposition_overlay(ov)
+
+    def _reposition_overlay(self, ov: TextOverlay) -> None:
+        items = self._items.get(ov.uid)
+        if not items:
+            return
+
+        if not (ov.text or "").strip():
+            items.text.setVisible(False)
+            items.shadow.setVisible(False)
+            return
+
+        br = items.text.boundingRect()
+        text_w = float(br.width())
+        text_h = float(br.height())
+
+        base_rect = self._video_rect
+        if base_rect.width() <= 1 or base_rect.height() <= 1:
+            base_rect = self.scene.sceneRect()
+
+        base_x, base_y = self._anchor_pos(base_rect, text_w, text_h, ov.anchor)
+
+        if ov.anchor == "custom":
+            x = float(ov.offset_x)
+            y = float(ov.offset_y)
+        else:
+            x = base_x + float(ov.offset_x)
+            y = base_y + float(ov.offset_y)
+
+        # Soft clamp around the video rect so it doesn't fly off-screen.
+        clamp_rect = base_rect.adjusted(-base_rect.width(), -base_rect.height(), base_rect.width(), base_rect.height())
+        x = _clamp(x, clamp_rect.left(), clamp_rect.right())
+        y = _clamp(y, clamp_rect.top(), clamp_rect.bottom())
+
+        items.text.setPos(x, y)
+        items.shadow.setPos(x + 2, y + 2)
+
+    @staticmethod
+    def _alpha_at_ms(ov: TextOverlay, pos_ms: int) -> float:
+        if ov.duration_ms <= 0:
+            return 0.0
+        if pos_ms < ov.start_ms or pos_ms > (ov.start_ms + ov.duration_ms):
+            return 0.0
+
+        base_alpha = (ov.color_rgba[3] / 255.0) if ov.color_rgba else 1.0
+        if base_alpha <= 0.001:
+            return 0.0
+
+        t = pos_ms - ov.start_ms
+        dur = max(1, ov.duration_ms)
+        fi = int(_clamp(ov.fade_in_ms, 0, dur))
+        fo = int(_clamp(ov.fade_out_ms, 0, dur))
+
+        a = 1.0
+
+        if fi > 0 and t < fi:
+            a = t / float(fi)
+
+        if fo > 0 and t > (dur - fo):
+            a2 = (dur - t) / float(fo)
+            a = min(a, a2)
+
+        a = float(_clamp(a, 0.0, 1.0))
+        return base_alpha * a
 
 
 class TimelineWidget(QWidget):
@@ -456,7 +844,7 @@ class TimelineWidget(QWidget):
         p.drawRoundedRect(seg, 6, 6)
 
         p.setPen(QPen(QColor(255, 255, 255, 220)))
-        seg_label = f"Text: {self._format_time(self._seg_start_ms)}  +{self._format_time(self._seg_dur_ms)}"
+        seg_label = f"Selected: {self._format_time(self._seg_start_ms)}  +{self._format_time(self._seg_dur_ms)}"
         p.drawText(seg.x() + 10, seg.y() + 22, seg_label)
 
         if self._duration_ms > 0:
@@ -537,13 +925,18 @@ class VideoTextPane(QWidget):
 
         self.preview = VideoPreview(self)
         self.preview.set_settings(self._settings)
-
-        # Attach video output to graphics item (fixes overlay not showing on Windows)
         self.player.setVideoOutput(self.preview.video_item)
+
+        # Preview interactions (click/drag text)
+        try:
+            self.preview.overlaySelected.connect(self._on_preview_overlay_selected)
+            self.preview.overlayMoved.connect(self._on_preview_overlay_moved)
+        except Exception:
+            pass
 
         self._tick = QTimer(self)
         self._tick.setInterval(33)
-        self._tick.timeout.connect(self._update_overlay_visibility)
+        self._tick.timeout.connect(self._tick_preview)
         self._tick.start()
 
         self._save_timer = QTimer(self)
@@ -555,41 +948,69 @@ class VideoTextPane(QWidget):
         root.setContentsMargins(10, 10, 10, 10)
         root.setSpacing(10)
 
+        # Top controls
         controls = QHBoxLayout()
         self.btn_open = QPushButton("Open Video…")
         self.btn_export = QPushButton("Export with Text…")
-        self.lbl_path = QLabel("No video loaded")
-        self.lbl_path.setTextInteractionFlags(Qt.TextSelectableByMouse)
         self.btn_play = QPushButton("Play/Pause")
         self.btn_stop = QPushButton("Stop")
+
+        self.btn_toggle_preview = QToolButton()
+        self.btn_toggle_preview.setCheckable(True)
+        self.btn_toggle_preview.setText("Hide Preview")
+
         self.lbl_time = QLabel("00:00.000 / 00:00.000")
+        self.lbl_path = QLabel("No video loaded")
+        self.lbl_path.setTextInteractionFlags(Qt.TextSelectableByMouse)
 
         controls.addWidget(self.btn_open, 0)
         controls.addWidget(self.btn_play, 0)
         controls.addWidget(self.btn_stop, 0)
         controls.addWidget(self.btn_export, 0)
+        controls.addWidget(self.btn_toggle_preview, 0)
         controls.addWidget(self.lbl_time, 0)
         controls.addWidget(self.lbl_path, 1)
         root.addLayout(controls)
 
-        mid = QHBoxLayout()
-        mid.setSpacing(10)
-
-        video_frame = QFrame()
-        video_frame.setFrameShape(QFrame.StyledPanel)
-        vlay = QVBoxLayout(video_frame)
+        # Main area: splitter (preview | editor)
+        self.video_frame = QFrame()
+        self.video_frame.setFrameShape(QFrame.StyledPanel)
+        vlay = QVBoxLayout(self.video_frame)
         vlay.setContentsMargins(0, 0, 0, 0)
         vlay.addWidget(self.preview, 1)
-        mid.addWidget(video_frame, 2)
 
-        panel = QFrame()
-        panel.setFrameShape(QFrame.StyledPanel)
-        panel_lay = QVBoxLayout(panel)
+        self.panel = QFrame()
+        self.panel.setFrameShape(QFrame.StyledPanel)
+        panel_lay = QVBoxLayout(self.panel)
         panel_lay.setContentsMargins(10, 10, 10, 10)
         panel_lay.setSpacing(10)
 
+        # Overlay list toolbar
+        ov_bar = QHBoxLayout()
+        self.btn_add_overlay = QPushButton("Add")
+        self.btn_dup_overlay = QPushButton("Duplicate")
+        self.btn_del_overlay = QPushButton("Delete")
+        self.btn_up_overlay = QPushButton("↑")
+        self.btn_down_overlay = QPushButton("↓")
+        ov_bar.addWidget(QLabel("Overlays"), 0)
+        ov_bar.addStretch(1)
+        ov_bar.addWidget(self.btn_add_overlay, 0)
+        ov_bar.addWidget(self.btn_dup_overlay, 0)
+        ov_bar.addWidget(self.btn_del_overlay, 0)
+        ov_bar.addWidget(self.btn_up_overlay, 0)
+        ov_bar.addWidget(self.btn_down_overlay, 0)
+
+        self.list_overlays = QListWidget()
+        self.list_overlays.setMinimumHeight(120)
+
+        panel_lay.addLayout(ov_bar)
+        panel_lay.addWidget(self.list_overlays, 0)
+
+        # Editor widgets (for selected overlay)
         self.edit_text = QLineEdit()
         self.edit_text.setPlaceholderText("Type the overlay text…")
+
+        self.chk_enabled = QCheckBox("Enabled")
 
         self.combo_font = QFontComboBox()
         self.spin_size = QSpinBox()
@@ -598,7 +1019,6 @@ class VideoTextPane(QWidget):
         self.btn_color = QToolButton()
         self.btn_color.setText("Color…")
 
-        # Export font file row
         self.edit_fontfile = QLineEdit()
         self.edit_fontfile.setPlaceholderText("Optional: font file for export (ffmpeg drawtext)")
         self.btn_fontfile = QPushButton("Browse…")
@@ -606,6 +1026,7 @@ class VideoTextPane(QWidget):
         self.combo_anchor = QComboBox()
         for label, key in ANCHORS:
             self.combo_anchor.addItem(label, key)
+
         self.spin_x = QSpinBox()
         self.spin_x.setRange(-4000, 4000)
         self.spin_y = QSpinBox()
@@ -621,13 +1042,23 @@ class VideoTextPane(QWidget):
         self.spin_dur.setDecimals(3)
         self.spin_dur.setSingleStep(0.1)
 
+        self.spin_fade_in = QDoubleSpinBox()
+        self.spin_fade_in.setRange(0.0, 60.0)
+        self.spin_fade_in.setDecimals(3)
+        self.spin_fade_in.setSingleStep(0.05)
+
+        self.spin_fade_out = QDoubleSpinBox()
+        self.spin_fade_out.setRange(0.0, 60.0)
+        self.spin_fade_out.setDecimals(3)
+        self.spin_fade_out.setSingleStep(0.05)
+
         self.btn_start_now = QPushButton("Start = current")
         self.btn_end_now = QPushButton("End = current")
         self.btn_seek_start = QPushButton("Seek to start")
 
-        self.chk_preview_always = QCheckBox("Always show overlay in preview")
-        self.lbl_active = QLabel("Overlay: OFF")
-        self.lbl_active.setStyleSheet("QLabel { color: #ff6b6b; }")
+        self.chk_preview_always = QCheckBox("Always show overlays in preview")
+        self.lbl_active = QLabel("Overlays: 0 active")
+        self.lbl_active.setStyleSheet("QLabel { color: #bdbdbd; }")
 
         form = QFormLayout()
         form.setLabelAlignment(Qt.AlignLeft | Qt.AlignVCenter)
@@ -636,6 +1067,7 @@ class VideoTextPane(QWidget):
         form.setVerticalSpacing(10)
 
         form.addRow(QLabel("Text"), self.edit_text)
+        form.addRow(QLabel(""), self.chk_enabled)
 
         font_row = QHBoxLayout()
         font_row.addWidget(self.combo_font, 1)
@@ -663,16 +1095,27 @@ class VideoTextPane(QWidget):
         pos_wrap.setLayout(pos_row)
         form.addRow(QLabel("Position"), pos_wrap)
 
-        dur_row = QHBoxLayout()
-        dur_row.addWidget(QLabel("Start (s)"), 0)
-        dur_row.addWidget(self.spin_start, 0)
-        dur_row.addSpacing(8)
-        dur_row.addWidget(QLabel("Duration (s)"), 0)
-        dur_row.addWidget(self.spin_dur, 0)
-        dur_row.addStretch(1)
-        dur_wrap = QWidget()
-        dur_wrap.setLayout(dur_row)
-        form.addRow(QLabel("Timing"), dur_wrap)
+        time_row = QHBoxLayout()
+        time_row.addWidget(QLabel("Start (s)"), 0)
+        time_row.addWidget(self.spin_start, 0)
+        time_row.addSpacing(8)
+        time_row.addWidget(QLabel("Duration (s)"), 0)
+        time_row.addWidget(self.spin_dur, 0)
+        time_row.addStretch(1)
+        time_wrap = QWidget()
+        time_wrap.setLayout(time_row)
+        form.addRow(QLabel("Timing"), time_wrap)
+
+        fade_row = QHBoxLayout()
+        fade_row.addWidget(QLabel("Fade in (s)"), 0)
+        fade_row.addWidget(self.spin_fade_in, 0)
+        fade_row.addSpacing(8)
+        fade_row.addWidget(QLabel("Fade out (s)"), 0)
+        fade_row.addWidget(self.spin_fade_out, 0)
+        fade_row.addStretch(1)
+        fade_wrap = QWidget()
+        fade_wrap.setLayout(fade_row)
+        form.addRow(QLabel("Fades"), fade_wrap)
 
         btn_row = QHBoxLayout()
         btn_row.addWidget(self.btn_start_now, 0)
@@ -694,9 +1137,14 @@ class VideoTextPane(QWidget):
         panel_lay.addLayout(form)
         panel_lay.addStretch(1)
 
-        mid.addWidget(panel, 1)
-        root.addLayout(mid, 1)
+        self.splitter = QSplitter(Qt.Horizontal)
+        self.splitter.addWidget(self.video_frame)
+        self.splitter.addWidget(self.panel)
+        self.splitter.setStretchFactor(0, 2)
+        self.splitter.setStretchFactor(1, 1)
+        root.addWidget(self.splitter, 1)
 
+        # Bottom: timeline
         bottom = QVBoxLayout()
         bottom.setSpacing(6)
 
@@ -721,14 +1169,21 @@ class VideoTextPane(QWidget):
 
         root.addLayout(bottom, 0)
 
-        # wiring
+        # wiring (keep existing tool behavior / signals stable)
         self.btn_open.clicked.connect(self._open_video)
         self.btn_play.clicked.connect(self._toggle_play_pause)
         self.btn_stop.clicked.connect(self.player.stop)
         self.btn_export.clicked.connect(self._export_video)
+        self.btn_toggle_preview.toggled.connect(self._toggle_preview_pane)
 
         self.player.positionChanged.connect(self._on_position_changed)
         self.player.durationChanged.connect(self._on_duration_changed)
+
+        # Some backends emit positionChanged sparsely; poll to keep overlays in sync.
+        self._preview_poll = QTimer(self)
+        self._preview_poll.setInterval(50)  # 20 FPS is enough for fades
+        self._preview_poll.timeout.connect(self._tick_preview)
+        self._preview_poll.start()
 
         self.timeline.seekRequested.connect(self._seek_to_ms)
         self.timeline.segmentChanged.connect(self._on_segment_dragged)
@@ -742,7 +1197,15 @@ class VideoTextPane(QWidget):
 
         self.btn_fontfile.clicked.connect(self._pick_fontfile)
 
+        self.btn_add_overlay.clicked.connect(self._add_overlay)
+        self.btn_dup_overlay.clicked.connect(self._duplicate_overlay)
+        self.btn_del_overlay.clicked.connect(self._delete_overlay)
+        self.btn_up_overlay.clicked.connect(lambda: self._move_overlay(-1))
+        self.btn_down_overlay.clicked.connect(lambda: self._move_overlay(+1))
+        self.list_overlays.currentRowChanged.connect(self._on_overlay_selected)
+
         self.edit_text.textChanged.connect(self._on_inputs_changed)
+        self.chk_enabled.toggled.connect(self._on_inputs_changed)
         self.combo_font.currentFontChanged.connect(self._on_inputs_changed)
         self.spin_size.valueChanged.connect(self._on_inputs_changed)
         self.edit_fontfile.textChanged.connect(self._on_inputs_changed)
@@ -753,14 +1216,23 @@ class VideoTextPane(QWidget):
 
         self.spin_start.valueChanged.connect(self._on_inputs_changed)
         self.spin_dur.valueChanged.connect(self._on_inputs_changed)
+        self.spin_fade_in.valueChanged.connect(self._on_inputs_changed)
+        self.spin_fade_out.valueChanged.connect(self._on_inputs_changed)
 
         self.chk_preview_always.toggled.connect(self._on_inputs_changed)
 
         # apply
+        self._rebuild_overlay_list(select_uid=self._settings.selected_uid)
         self._apply_settings_to_ui()
         self._apply_settings_to_preview()
         self._update_zoom_label()
-        self._update_overlay_visibility(force=True)
+        self._tick_preview()
+
+        # restore preview visibility
+        self.btn_toggle_preview.blockSignals(True)
+        self.btn_toggle_preview.setChecked(bool(self._settings.preview_hidden))
+        self.btn_toggle_preview.blockSignals(False)
+        self._apply_preview_hidden()
 
         if self._settings.last_video_path:
             try:
@@ -769,6 +1241,59 @@ class VideoTextPane(QWidget):
                     self._load_video(str(p))
             except Exception:
                 pass
+
+    # helpers
+    def _current_overlay(self) -> TextOverlay:
+        return self._settings.get_selected()
+
+    def _index_for_uid(self, uid: str) -> int:
+        for i, ov in enumerate(self._settings.overlays):
+            if ov.uid == uid:
+                return i
+        return -1
+
+    def _rebuild_overlay_list(self, select_uid: str | None = None) -> None:
+        self.list_overlays.blockSignals(True)
+        self.list_overlays.clear()
+
+        for i, ov in enumerate(self._settings.overlays):
+            label = self._overlay_label(ov, index=i)
+            it = QListWidgetItem(label)
+            it.setData(Qt.UserRole, ov.uid)
+            self.list_overlays.addItem(it)
+
+        # select
+        if select_uid:
+            idx = self._index_for_uid(select_uid)
+            if idx >= 0:
+                self.list_overlays.setCurrentRow(idx)
+                self._settings.selected_uid = select_uid
+            else:
+                self.list_overlays.setCurrentRow(0)
+                self._settings.selected_uid = self._settings.overlays[0].uid
+        else:
+            self.list_overlays.setCurrentRow(0)
+            self._settings.selected_uid = self._settings.overlays[0].uid
+
+        self.list_overlays.blockSignals(False)
+
+    @staticmethod
+    def _overlay_label(ov: TextOverlay, index: int) -> str:
+        txt = (ov.text or "").strip()
+        if len(txt) > 28:
+            txt = txt[:28] + "…"
+        st = TimelineWidget._format_time(ov.start_ms)
+        en = TimelineWidget._format_time(ov.start_ms + ov.duration_ms)
+        prefix = "✓" if ov.enabled else "×"
+        return f"{prefix} {index + 1:02d}  [{st} – {en}]  {txt or '(empty)'}"
+
+    def _refresh_overlay_list_labels(self) -> None:
+        for row in range(self.list_overlays.count()):
+            it = self.list_overlays.item(row)
+            uid = it.data(Qt.UserRole)
+            ov = next((o for o in self._settings.overlays if o.uid == uid), None)
+            if ov:
+                it.setText(self._overlay_label(ov, row))
 
     # open/load
     def _open_video(self) -> None:
@@ -804,15 +1329,152 @@ class VideoTextPane(QWidget):
         self.player.setPosition(int(ms))
 
     def _seek_to_start(self) -> None:
-        self.player.setPosition(int(self._settings.start_ms))
+        ov = self._current_overlay()
+        self.player.setPosition(int(ov.start_ms))
+
+    # overlays list actions
+    def _add_overlay(self) -> None:
+        ov = TextOverlay()
+        ov.text = "New text"
+        ov.start_ms = int(self.player.position())
+        ov.duration_ms = 2500
+        ov.fade_in_ms = 250
+        ov.fade_out_ms = 250
+        dur = int(self.player.duration())
+        ov.normalize(video_duration_ms=dur if dur > 0 else None)
+
+        self._settings.overlays.append(ov)
+        self._settings.selected_uid = ov.uid
+
+        self._rebuild_overlay_list(select_uid=ov.uid)
+        self._apply_settings_to_ui()
+        self._apply_settings_to_preview()
+        self._schedule_save()
+        self._emit_settings()
+
+    def _duplicate_overlay(self) -> None:
+        src = self._current_overlay()
+        new = TextOverlay()
+        # copy fields
+        new.text = src.text
+        new.font_family = src.font_family
+        new.font_size = src.font_size
+        new.color_rgba = list(src.color_rgba) if src.color_rgba else [255, 255, 255, 255]
+        new.font_file = src.font_file
+        new.anchor = src.anchor
+        new.offset_x = src.offset_x
+        new.offset_y = src.offset_y
+        new.start_ms = src.start_ms
+        new.duration_ms = src.duration_ms
+        new.fade_in_ms = src.fade_in_ms
+        new.fade_out_ms = src.fade_out_ms
+        new.enabled = src.enabled
+
+        self._settings.overlays.append(new)
+        self._settings.selected_uid = new.uid
+
+        self._rebuild_overlay_list(select_uid=new.uid)
+        self._apply_settings_to_ui()
+        self._apply_settings_to_preview()
+        self._schedule_save()
+        self._emit_settings()
+
+    def _delete_overlay(self) -> None:
+        if len(self._settings.overlays) <= 1:
+            QMessageBox.information(self, "Delete overlay", "You need at least one overlay.")
+            return
+        uid = self._settings.selected_uid
+        idx = self._index_for_uid(uid)
+        if idx < 0:
+            return
+        self._settings.overlays.pop(idx)
+
+        # select nearest
+        idx = min(idx, len(self._settings.overlays) - 1)
+        self._settings.selected_uid = self._settings.overlays[idx].uid
+
+        self._rebuild_overlay_list(select_uid=self._settings.selected_uid)
+        self._apply_settings_to_ui()
+        self._apply_settings_to_preview()
+        self._schedule_save()
+        self._emit_settings()
+
+    def _move_overlay(self, delta: int) -> None:
+        uid = self._settings.selected_uid
+        idx = self._index_for_uid(uid)
+        if idx < 0:
+            return
+        new_idx = idx + int(delta)
+        if new_idx < 0 or new_idx >= len(self._settings.overlays):
+            return
+        ov = self._settings.overlays.pop(idx)
+        self._settings.overlays.insert(new_idx, ov)
+        self._rebuild_overlay_list(select_uid=uid)
+        self._apply_settings_to_preview()
+        self._schedule_save()
+        self._emit_settings()
+
+    def _on_overlay_selected(self, row: int) -> None:
+        if row < 0 or row >= self.list_overlays.count():
+            return
+        it = self.list_overlays.item(row)
+        uid = it.data(Qt.UserRole)
+        if not uid:
+            return
+        self._settings.selected_uid = str(uid)
+        self._apply_settings_to_ui()
+        self._apply_settings_to_preview()
+        self._schedule_save()
+        self._emit_settings()
+
+
+    def _on_preview_overlay_selected(self, uid: str) -> None:
+        uid = str(uid or "")
+        if not uid:
+            return
+        self._settings.selected_uid = uid
+        self._apply_settings_to_ui()
+        self._apply_settings_to_preview()
+        self._schedule_save()
+        self._emit_settings()
+
+    def _on_preview_overlay_moved(self, uid: str, ox: int, oy: int) -> None:
+        uid = str(uid or "")
+        if not uid:
+            return
+
+        # If user dragged a non-selected overlay, select it (once).
+        if uid != self._settings.selected_uid:
+            self._settings.selected_uid = uid
+            self._apply_settings_to_ui()
+            self._apply_settings_to_preview()
+
+        ov = self._current_overlay()
+        ov.offset_x = int(ox)
+        ov.offset_y = int(oy)
+
+        # Update X/Y boxes without re-triggering full input sync loops.
+        self.spin_x.blockSignals(True)
+        self.spin_y.blockSignals(True)
+        self.spin_x.setValue(int(ox))
+        self.spin_y.setValue(int(oy))
+        self.spin_x.blockSignals(False)
+        self.spin_y.blockSignals(False)
+
+        self._schedule_save()
+        self._emit_settings()
 
     # segment/zoom
     def _on_segment_dragged(self, start_ms: int, dur_ms: int) -> None:
-        self._settings.start_ms = int(start_ms)
-        self._settings.duration_ms = int(dur_ms)
+        ov = self._current_overlay()
+        ov.start_ms = int(start_ms)
+        ov.duration_ms = int(dur_ms)
+        dur = int(self.player.duration())
+        ov.normalize(video_duration_ms=dur if dur > 0 else None)
         self._sync_timing_to_spins()
-        self.timeline.set_segment(self._settings.start_ms, self._settings.duration_ms)
-        self.player.setPosition(int(self._settings.start_ms))
+        self.timeline.set_segment(ov.start_ms, ov.duration_ms)
+        self.player.setPosition(int(ov.start_ms))
+        self._refresh_overlay_list_labels()
         self._apply_settings_to_preview()
         self._schedule_save()
         self._emit_settings()
@@ -830,11 +1492,12 @@ class VideoTextPane(QWidget):
 
     # ui actions
     def _pick_color(self) -> None:
-        cur = QColor(*self._settings.color_rgba)
+        ov = self._current_overlay()
+        cur = QColor(*ov.color_rgba)
         picked = QColorDialog.getColor(cur, self, "Pick text color")
         if not picked.isValid():
             return
-        self._settings.color_rgba = [picked.red(), picked.green(), picked.blue(), picked.alpha()]
+        ov.color_rgba = [picked.red(), picked.green(), picked.blue(), picked.alpha()]
         self._apply_settings_to_preview()
         self._schedule_save()
         self._emit_settings()
@@ -851,74 +1514,84 @@ class VideoTextPane(QWidget):
         self.edit_fontfile.setText(path)
 
     def _set_start_to_current(self) -> None:
-        self._settings.start_ms = int(self.player.position())
-        dur = self.player.duration()
-        if dur > 0 and self._settings.start_ms + self._settings.duration_ms > dur:
-            self._settings.duration_ms = max(1, dur - self._settings.start_ms)
+        ov = self._current_overlay()
+        ov.start_ms = int(self.player.position())
+        dur = int(self.player.duration())
+        ov.normalize(video_duration_ms=dur if dur > 0 else None)
         self._sync_timing_to_spins()
-        self.timeline.set_segment(self._settings.start_ms, self._settings.duration_ms)
+        self.timeline.set_segment(ov.start_ms, ov.duration_ms)
+        self._refresh_overlay_list_labels()
         self._apply_settings_to_preview()
         self._schedule_save()
         self._emit_settings()
 
     def _set_end_to_current(self) -> None:
+        ov = self._current_overlay()
         end = int(self.player.position())
-        start = int(self._settings.start_ms)
+        start = int(ov.start_ms)
         if end <= start:
-            self._settings.duration_ms = 50
+            ov.duration_ms = 50
         else:
-            self._settings.duration_ms = max(1, end - start)
+            ov.duration_ms = max(1, end - start)
 
-        dur = self.player.duration()
-        if dur > 0 and start + self._settings.duration_ms > dur:
-            self._settings.duration_ms = max(1, dur - start)
+        dur = int(self.player.duration())
+        ov.normalize(video_duration_ms=dur if dur > 0 else None)
 
         self._sync_timing_to_spins()
-        self.timeline.set_segment(self._settings.start_ms, self._settings.duration_ms)
+        self.timeline.set_segment(ov.start_ms, ov.duration_ms)
+        self._refresh_overlay_list_labels()
         self._apply_settings_to_preview()
         self._schedule_save()
         self._emit_settings()
+
+    # preview pane
+    def _toggle_preview_pane(self, checked: bool) -> None:
+        self._settings.preview_hidden = bool(checked)
+        self._apply_preview_hidden()
+        self._schedule_save()
+        self._emit_settings()
+
+    def _apply_preview_hidden(self) -> None:
+        hidden = bool(self._settings.preview_hidden)
+        self.video_frame.setVisible(not hidden)
+        self.btn_toggle_preview.setText("Show Preview" if hidden else "Hide Preview")
 
     # player callbacks
     def _on_position_changed(self, pos: int) -> None:
-        dur = self.player.duration()
+        dur = int(self.player.duration())
         self.lbl_time.setText(f"{TimelineWidget._format_time(pos)} / {TimelineWidget._format_time(dur)}")
         self.timeline.set_playhead_ms(pos)
-        self._update_overlay_visibility()
+        self._tick_preview()
 
     def _on_duration_changed(self, dur: int) -> None:
         self.timeline.set_duration_ms(dur)
-        if dur > 0:
-            if self._settings.start_ms > dur:
-                self._settings.start_ms = dur
-            if self._settings.start_ms + self._settings.duration_ms > dur:
-                self._settings.duration_ms = max(1, dur - self._settings.start_ms)
-        self.timeline.set_segment(self._settings.start_ms, self._settings.duration_ms)
+
+        # normalize overlays against duration
+        for ov in self._settings.overlays:
+            ov.normalize(video_duration_ms=dur if dur > 0 else None)
+
+        ov = self._current_overlay()
+        self.timeline.set_segment(ov.start_ms, ov.duration_ms)
         self._sync_timing_to_spins()
+        self._refresh_overlay_list_labels()
         self._apply_settings_to_preview()
         self._schedule_save()
         self._emit_settings()
 
-    def _update_overlay_visibility(self, force: bool = False) -> None:
+    def _tick_preview(self) -> None:
         pos = int(self.player.position())
-        s = self._settings
+        self.preview.update_for_time(pos)
 
-        if s.preview_always_show:
-            visible = True
+        if self._settings.preview_always_show:
+            active = sum(1 for ov in self._settings.overlays if ov.enabled and (ov.text or "").strip())
         else:
-            visible = (pos >= s.start_ms) and (pos <= (s.start_ms + s.duration_ms))
-
-        self.preview.set_visible_now(visible)
-
-        if visible:
-            self.lbl_active.setText("Overlay: ON")
-            self.lbl_active.setStyleSheet("QLabel { color: #7CFC98; }")
-        else:
-            self.lbl_active.setText("Overlay: OFF")
-            self.lbl_active.setStyleSheet("QLabel { color: #ff6b6b; }")
-
-        if force:
-            self.preview.update()
+            active = 0
+            for ov in self._settings.overlays:
+                if not ov.enabled or not (ov.text or "").strip():
+                    continue
+                if ov.start_ms <= pos <= (ov.start_ms + ov.duration_ms):
+                    active += 1
+        self.lbl_active.setText(f"Overlays: {active} active")
 
     # settings io
     def _load_settings(self) -> VideoTextSettings:
@@ -926,28 +1599,73 @@ class VideoTextPane(QWidget):
         try:
             if path.exists():
                 data = json.loads(path.read_text(encoding="utf-8"))
+
+                # Backward compatibility: old single-overlay schema
+                if isinstance(data, dict) and "overlays" not in data:
+                    ov = TextOverlay()
+                    ov.text = str(data.get("text", ov.text))
+                    ov.font_family = str(data.get("font_family", ov.font_family))
+                    ov.font_size = int(data.get("font_size", ov.font_size))
+                    col = data.get("color_rgba", None)
+                    if isinstance(col, list) and len(col) == 4:
+                        ov.color_rgba = [int(col[0]), int(col[1]), int(col[2]), int(col[3])]
+                    ov.font_file = str(data.get("font_file", data.get("fontfile", "")) or "")
+                    ov.anchor = str(data.get("anchor", ov.anchor))
+                    ov.offset_x = int(data.get("offset_x", ov.offset_x))
+                    ov.offset_y = int(data.get("offset_y", ov.offset_y))
+                    ov.start_ms = int(data.get("start_ms", ov.start_ms))
+                    ov.duration_ms = int(data.get("duration_ms", ov.duration_ms))
+                    # Older versions had no fades; keep defaults.
+                    s = VideoTextSettings(
+                        overlays=[ov],
+                        selected_uid=ov.uid,
+                        zoom=float(data.get("zoom", 1.0)),
+                        last_video_path=str(data.get("last_video_path", "")),
+                        preview_always_show=_to_bool(data.get("preview_always_show", False), default=False),
+                        preview_hidden=_to_bool(data.get("preview_hidden", False), default=False),
+                    )
+                    return s
+
+                # New schema
                 s = VideoTextSettings()
-                for k, v in data.items():
-                    if hasattr(s, k):
-                        setattr(s, k, v)
+                if isinstance(data, dict):
+                    # overlays
+                    ovs = []
+                    raw_ovs = data.get("overlays", [])
+                    if isinstance(raw_ovs, list):
+                        for raw in raw_ovs:
+                            if not isinstance(raw, dict):
+                                continue
+                            ov = TextOverlay(uid=str(raw.get("uid", _new_uid())))
+                            ov.text = str(raw.get("text", ov.text))
+                            ov.font_family = str(raw.get("font_family", ov.font_family))
+                            ov.font_size = int(raw.get("font_size", ov.font_size))
+                            col = raw.get("color_rgba", None)
+                            if isinstance(col, list) and len(col) == 4:
+                                ov.color_rgba = [int(col[0]), int(col[1]), int(col[2]), int(col[3])]
+                            ov.font_file = str(raw.get("font_file", "") or "")
+                            ov.anchor = str(raw.get("anchor", ov.anchor))
+                            ov.offset_x = int(raw.get("offset_x", ov.offset_x))
+                            ov.offset_y = int(raw.get("offset_y", ov.offset_y))
+                            ov.start_ms = int(raw.get("start_ms", ov.start_ms))
+                            ov.duration_ms = int(raw.get("duration_ms", ov.duration_ms))
+                            ov.fade_in_ms = int(raw.get("fade_in_ms", ov.fade_in_ms))
+                            ov.fade_out_ms = int(raw.get("fade_out_ms", ov.fade_out_ms))
+                            ov.enabled = _to_bool(raw.get("enabled", True), default=True)
+                            ovs.append(ov)
 
-                s.font_size = int(_clamp(int(getattr(s, "font_size", 48)), 6, 300))
-                s.offset_x = int(_clamp(int(getattr(s, "offset_x", 0)), -4000, 4000))
-                s.offset_y = int(_clamp(int(getattr(s, "offset_y", 0)), -4000, 4000))
-                s.start_ms = int(max(0, int(getattr(s, "start_ms", 0))))
-                s.duration_ms = int(max(1, int(getattr(s, "duration_ms", 2500))))
-                s.zoom = float(_clamp(float(getattr(s, "zoom", 1.0)), 0.25, 10.0))
+                    if not ovs:
+                        ovs = [TextOverlay()]
 
-                if not isinstance(getattr(s, "color_rgba", None), list) or len(s.color_rgba) != 4:
-                    s.color_rgba = [255, 255, 255, 255]
-
-                if not isinstance(getattr(s, "preview_always_show", False), bool):
-                    s.preview_always_show = False
-
-                if not isinstance(getattr(s, "font_file", ""), str):
-                    s.font_file = ""
-
-                return s
+                    s = VideoTextSettings(
+                        overlays=ovs,
+                        selected_uid=str(data.get("selected_uid", "")),
+                        zoom=float(data.get("zoom", 1.0)),
+                        last_video_path=str(data.get("last_video_path", "")),
+                        preview_always_show=_to_bool(data.get("preview_always_show", False), default=False),
+                        preview_hidden=_to_bool(data.get("preview_hidden", False), default=False),
+                    )
+                    return s
         except Exception:
             pass
         return VideoTextSettings()
@@ -959,49 +1677,105 @@ class VideoTextPane(QWidget):
         path = _settings_path()
         _ensure_parent_dir(path)
         try:
-            path.write_text(json.dumps(asdict(self._settings), indent=2), encoding="utf-8")
+            # Normalize before saving
+            dur = int(self.player.duration())
+            for ov in self._settings.overlays:
+                ov.normalize(video_duration_ms=dur if dur > 0 else None)
+
+            out = asdict(self._settings)
+            path.write_text(json.dumps(out, indent=2), encoding="utf-8")
         except Exception:
             pass
 
     # apply/sync
     def _apply_settings_to_ui(self) -> None:
-        s = self._settings
-        self.edit_text.setText(s.text)
-        self.combo_font.setCurrentFont(QFont(s.font_family))
-        self.spin_size.setValue(int(s.font_size))
-        self.edit_fontfile.setText(s.font_file or "")
+        ov = self._current_overlay()
 
-        idx = 0
-        for i in range(self.combo_anchor.count()):
-            if self.combo_anchor.itemData(i) == s.anchor:
-                idx = i
-                break
-        self.combo_anchor.setCurrentIndex(idx)
+        # selected row should track selected_uid
+        idx = self._index_for_uid(self._settings.selected_uid)
+        if idx >= 0 and idx != self.list_overlays.currentRow():
+            self.list_overlays.blockSignals(True)
+            self.list_overlays.setCurrentRow(idx)
+            self.list_overlays.blockSignals(False)
 
-        self.spin_x.setValue(int(s.offset_x))
-        self.spin_y.setValue(int(s.offset_y))
-
-        self.chk_preview_always.setChecked(bool(s.preview_always_show))
-
-        self._sync_timing_to_spins()
-
-        self.timeline.set_zoom(s.zoom)
-        self.timeline.set_segment(s.start_ms, s.duration_ms)
-
-        if s.last_video_path:
-            self.lbl_path.setText(s.last_video_path)
-
-    def _sync_timing_to_spins(self) -> None:
+        self.edit_text.blockSignals(True)
+        self.chk_enabled.blockSignals(True)
+        self.combo_font.blockSignals(True)
+        self.spin_size.blockSignals(True)
+        self.edit_fontfile.blockSignals(True)
+        self.combo_anchor.blockSignals(True)
+        self.spin_x.blockSignals(True)
+        self.spin_y.blockSignals(True)
         self.spin_start.blockSignals(True)
         self.spin_dur.blockSignals(True)
-        self.spin_start.setValue(self._settings.start_ms / 1000.0)
-        self.spin_dur.setValue(self._settings.duration_ms / 1000.0)
+        self.spin_fade_in.blockSignals(True)
+        self.spin_fade_out.blockSignals(True)
+        self.chk_preview_always.blockSignals(True)
+
+        self.edit_text.setText(ov.text)
+        self.chk_enabled.setChecked(bool(ov.enabled))
+        self.combo_font.setCurrentFont(QFont(ov.font_family))
+        self.spin_size.setValue(int(ov.font_size))
+        self.edit_fontfile.setText(ov.font_file or "")
+
+        idxa = 0
+        for i in range(self.combo_anchor.count()):
+            if self.combo_anchor.itemData(i) == ov.anchor:
+                idxa = i
+                break
+        self.combo_anchor.setCurrentIndex(idxa)
+
+        self.spin_x.setValue(int(ov.offset_x))
+        self.spin_y.setValue(int(ov.offset_y))
+
+        self.spin_start.setValue(ov.start_ms / 1000.0)
+        self.spin_dur.setValue(ov.duration_ms / 1000.0)
+        self.spin_fade_in.setValue(ov.fade_in_ms / 1000.0)
+        self.spin_fade_out.setValue(ov.fade_out_ms / 1000.0)
+
+        self.chk_preview_always.setChecked(bool(self._settings.preview_always_show))
+
+        self.edit_text.blockSignals(False)
+        self.chk_enabled.blockSignals(False)
+        self.combo_font.blockSignals(False)
+        self.spin_size.blockSignals(False)
+        self.edit_fontfile.blockSignals(False)
+        self.combo_anchor.blockSignals(False)
+        self.spin_x.blockSignals(False)
+        self.spin_y.blockSignals(False)
         self.spin_start.blockSignals(False)
         self.spin_dur.blockSignals(False)
+        self.spin_fade_in.blockSignals(False)
+        self.spin_fade_out.blockSignals(False)
+        self.chk_preview_always.blockSignals(False)
+
+        self.timeline.set_zoom(self._settings.zoom)
+        self.timeline.set_segment(ov.start_ms, ov.duration_ms)
+
+        if self._settings.last_video_path:
+            self.lbl_path.setText(self._settings.last_video_path)
+
+        self._update_zoom_label()
+        self._refresh_overlay_list_labels()
+
+    def _sync_timing_to_spins(self) -> None:
+        ov = self._current_overlay()
+        self.spin_start.blockSignals(True)
+        self.spin_dur.blockSignals(True)
+        self.spin_fade_in.blockSignals(True)
+        self.spin_fade_out.blockSignals(True)
+        self.spin_start.setValue(ov.start_ms / 1000.0)
+        self.spin_dur.setValue(ov.duration_ms / 1000.0)
+        self.spin_fade_in.setValue(ov.fade_in_ms / 1000.0)
+        self.spin_fade_out.setValue(ov.fade_out_ms / 1000.0)
+        self.spin_start.blockSignals(False)
+        self.spin_dur.blockSignals(False)
+        self.spin_fade_in.blockSignals(False)
+        self.spin_fade_out.blockSignals(False)
 
     def _apply_settings_to_preview(self) -> None:
         self.preview.set_settings(self._settings)
-        self._update_overlay_visibility(force=True)
+        self._tick_preview()
 
     def _emit_settings(self) -> None:
         try:
@@ -1010,29 +1784,40 @@ class VideoTextPane(QWidget):
             pass
 
     def _on_inputs_changed(self, *args) -> None:
-        s = self._settings
-        s.text = self.edit_text.text()
-        s.font_family = self.combo_font.currentFont().family()
-        s.font_size = int(self.spin_size.value())
-        s.font_file = self.edit_fontfile.text().strip()
+        ov = self._current_overlay()
 
-        s.anchor = str(self.combo_anchor.currentData())
-        s.offset_x = int(self.spin_x.value())
-        s.offset_y = int(self.spin_y.value())
+        # Ensure typed values are committed even if a spinbox still has focus.
+        for w in (
+            self.spin_start, self.spin_dur, self.spin_fade_in, self.spin_fade_out,
+            self.spin_x, self.spin_y, self.spin_size,
+        ):
+            try:
+                w.interpretText()
+            except Exception:
+                pass
 
-        s.start_ms = int(self.spin_start.value() * 1000.0)
-        s.duration_ms = int(max(1, self.spin_dur.value() * 1000.0))
+        ov.text = self.edit_text.text()
+        ov.enabled = bool(self.chk_enabled.isChecked())
+        ov.font_family = self.combo_font.currentFont().family()
+        ov.font_size = int(self.spin_size.value())
+        ov.font_file = self.edit_fontfile.text().strip()
 
-        s.preview_always_show = bool(self.chk_preview_always.isChecked())
+        ov.anchor = str(self.combo_anchor.currentData())
+        ov.offset_x = int(self.spin_x.value())
+        ov.offset_y = int(self.spin_y.value())
+
+        ov.start_ms = int(self.spin_start.value() * 1000.0)
+        ov.duration_ms = int(max(1, self.spin_dur.value() * 1000.0))
+        ov.fade_in_ms = int(max(0, self.spin_fade_in.value() * 1000.0))
+        ov.fade_out_ms = int(max(0, self.spin_fade_out.value() * 1000.0))
+
+        self._settings.preview_always_show = bool(self.chk_preview_always.isChecked())
 
         dur = int(self.player.duration())
-        if dur > 0:
-            if s.start_ms > dur:
-                s.start_ms = dur
-            if s.start_ms + s.duration_ms > dur:
-                s.duration_ms = max(1, dur - s.start_ms)
+        ov.normalize(video_duration_ms=dur if dur > 0 else None)
 
-        self.timeline.set_segment(s.start_ms, s.duration_ms)
+        self.timeline.set_segment(ov.start_ms, ov.duration_ms)
+        self._refresh_overlay_list_labels()
         self._apply_settings_to_preview()
         self._schedule_save()
         self._emit_settings()
@@ -1067,7 +1852,7 @@ class VideoTextPane(QWidget):
 
         ffmpeg = _find_ffmpeg_exe()
         if not ffmpeg:
-            QMessageBox.warning(self, "Export", "ffmpeg not found (PATH or common app folders).")
+            QMessageBox.warning(self, "Export", "ffmpeg not found. Expected in /presets/bin/ or on PATH.")
             return
 
         default_out = str(Path(in_path).with_name(Path(in_path).stem + "_text.mp4"))
@@ -1111,53 +1896,123 @@ class VideoTextPane(QWidget):
             self.btn_export.setText("Export with Text…")
 
     def _build_drawtext_filter(self) -> Tuple[str, Optional[str]]:
-        s = self._settings
-        if not (s.text or "").strip():
+        dur = int(self.player.duration())
+        missing_fonts: List[str] = []
+        parts: List[str] = []
+
+        for i, ov in enumerate(self._settings.overlays):
+            if not ov.enabled:
+                continue
+            if not (ov.text or "").strip():
+                continue
+
+            ov.normalize(video_duration_ms=dur if dur > 0 else None)
+
+            filt, warn = self._build_drawtext_for_overlay(ov)
+            if warn == "MISSING_FONT":
+                missing_fonts.append(f"Overlay {i + 1}")
+                continue
+            if warn:
+                return "", warn
+            if filt:
+                parts.append(filt)
+
+        if not parts:
+            return "", "Nothing to export: all overlays are empty or disabled."
+
+        if missing_fonts:
+            return "", "Pick a font file for: " + ", ".join(missing_fonts) + "\n(Font file → Browse…)."
+
+        # Chain drawtext filters
+        return ",".join(parts), None
+
+    def _build_drawtext_for_overlay(self, ov: TextOverlay) -> Tuple[str, Optional[str]]:
+        if not (ov.text or "").strip():
             return "", "Text is empty."
 
-        fontfile = (s.font_file or "").strip()
+        fontfile = (ov.font_file or "").strip()
         if not fontfile and os.name == "nt":
-            guess = _guess_windows_fontfile(s.font_family)
+            guess = _guess_windows_fontfile(ov.font_family)
             if guess:
                 fontfile = guess
 
-        start_s = _ms_to_s(s.start_ms)
-        end_s = _ms_to_s(s.start_ms + s.duration_ms)
+        if not fontfile:
+            return "", "MISSING_FONT"
+
+        start_s = _ms_to_s(ov.start_ms)
+        end_s = _ms_to_s(ov.start_ms + ov.duration_ms)
         if end_s <= start_s:
             end_s = start_s + 0.05
 
-        ox = int(s.offset_x)
-        oy = int(s.offset_y)
+        fi_s = _ms_to_s(ov.fade_in_ms)
+        fo_s = _ms_to_s(ov.fade_out_ms)
+        # Keep them sane
+        max_dur = max(0.05, end_s - start_s)
+        fi_s = float(_clamp(fi_s, 0.0, max_dur))
+        fo_s = float(_clamp(fo_s, 0.0, max_dur))
+        if fi_s + fo_s > max_dur:
+            if max_dur <= 1e-6:
+                fi_s = 0.0
+                fo_s = 0.0
+            else:
+                scale = max_dur / (fi_s + fo_s)
+                fi_s *= scale
+                fo_s *= scale
 
-        if s.anchor == "custom":
+        ox = int(ov.offset_x)
+        oy = int(ov.offset_y)
+
+        if ov.anchor == "custom":
             x_expr = f"{ox}"
             y_expr = f"{oy}"
         else:
-            x_expr, y_expr = self._anchor_to_drawtext_xy(s.anchor, ox, oy)
+            x_expr, y_expr = self._anchor_to_drawtext_xy(ov.anchor, ox, oy)
 
-        txt = _ff_escape_value(s.text)
-        color = _rgba_to_ffmpeg_color(s.color_rgba)
+        txt = _ff_escape_value(ov.text)
+
+        r, g, b, a = ov.color_rgba if (ov.color_rgba and len(ov.color_rgba) == 4) else (255, 255, 255, 255)
+        base_alpha = float(_clamp(a / 255.0, 0.0, 1.0))
+        base_color = f"#{int(r):02x}{int(g):02x}{int(b):02x}"
+
+        alpha_expr = self._fade_alpha_expr(start_s, end_s, fi_s, fo_s, base_alpha)
 
         parts = ["drawtext="]
-        if fontfile:
-            ff = _ff_escape_value(fontfile)
-            parts.append(f"fontfile='{ff}':")
-
+        ff = _ff_escape_value(fontfile)
+        parts.append(f"fontfile='{ff}':")
         parts.append(f"text='{txt}':")
-        parts.append(f"fontcolor={color}:")
-        parts.append(f"fontsize={int(s.font_size)}:")
+        parts.append(f"fontcolor={base_color}:")
+        parts.append(f"fontsize={int(ov.font_size)}:")
         parts.append(f"x={x_expr}:")
         parts.append(f"y={y_expr}:")
+        parts.append(f"enable='between(t,{start_s:.6f},{end_s:.6f})':")
         parts.append("shadowcolor=black@0.65:shadowx=2:shadowy=2:")
-        parts.append(f"enable='between(t,{start_s:.3f},{end_s:.3f})'")
+        parts.append(f"alpha='{alpha_expr}'")
 
-        filt = "".join(parts)
+        return "".join(parts), None
 
-        if not fontfile:
-            # exporting may fail depending on ffmpeg build; require explicit fontfile to avoid a bad experience
-            return "", "Pick a font file first (Font file → Browse…). Some ffmpeg builds need it for drawtext."
+    @staticmethod
+    def _fade_alpha_expr(start_s: float, end_s: float, fi_s: float, fo_s: float, base_alpha: float) -> str:
+        """
+        Returns an ffmpeg expression in [0..1] for drawtext alpha with fade in/out.
+        base_alpha is multiplied in.
+        """
+        s = float(start_s)
+        e = float(end_s)
+        fi = float(max(0.0, fi_s))
+        fo = float(max(0.0, fo_s))
+        a0 = float(_clamp(base_alpha, 0.0, 1.0))
 
-        return filt, None
+        # inner curve (0..1) inside [s,e]
+        inner = "1"
+        if fi > 1e-6:
+            inner = f"if(lt(t,{s + fi:.6f}),(t-{s:.6f})/{fi:.6f},1)"
+        if fo > 1e-6:
+            inner = f"if(lt(t,{e - fo:.6f}),{inner},({e:.6f}-t)/{fo:.6f})"
+
+        full = f"if(lt(t,{s:.6f}),0,if(lt(t,{e:.6f}),{inner},0))"
+        if abs(a0 - 1.0) < 1e-6:
+            return full
+        return f"{a0:.6f}*({full})"
 
     def _anchor_to_drawtext_xy(self, anchor: str, ox: int, oy: int) -> Tuple[str, str]:
         if anchor == "top_left":
@@ -1187,11 +2042,14 @@ class VideoTextPane(QWidget):
         return asdict(self._settings)
 
 
+# Backwards-compatible alias (Tools tab expects `videotextPane`)
+videotextPane = VideoTextPane
+
 if __name__ == "__main__":
     import sys
     app = QApplication(sys.argv)
     w = VideoTextPane()
-    w.setWindowTitle("Video Text Overlay")
-    w.resize(1200, 760)
+    w.setWindowTitle("Video Text Overlay / Creator")
+    w.resize(1400, 820)
     w.show()
     sys.exit(app.exec())

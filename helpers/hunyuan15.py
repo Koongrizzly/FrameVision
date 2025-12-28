@@ -3291,9 +3291,11 @@ Pick a Start image, or enable Video→Video and pick a source video.""",
 
         venv_py = self._env_python()
         model_key = self.model.currentData()
-        out_path = self._apply_autoname(prompt, int(self.seed.value()), extra=("i2v" if (self._model_is_i2v() and self._start_image_path()) else None))
+        seed_req = int(self.seed.value())
+        seed_use = self._resolve_seed(seed_req)
+        out_path = self._apply_autoname(prompt, seed_use, extra=("i2v" if (self._model_is_i2v() and self._start_image_path()) else None))
 
-        args = self._build_generate_args(prompt=prompt, out_path=out_path, seed_override=self.seed.value())
+        args = self._build_generate_args(prompt=prompt, out_path=out_path, seed_override=seed_use)
 
         # Prepare extend-chain state (Direct run only)
         try:
@@ -3315,14 +3317,20 @@ Pick a Start image, or enable Video→Video and pick a source video.""",
         self._extend_base_out = out_path
         self._extend_base_model = str(model_key) if model_key is not None else None
         self._extend_base_prompt = str(prompt)
-        self._extend_base_seed = int(self.seed.value())
+        self._extend_base_seed = int(seed_use)
         self._last_run_out_path = out_path
         self._current_task = "generate"
+        try:
+            self._last_prompt = str(prompt)
+            self._last_seed = int(seed_use)
+        except Exception:
+            pass
+
 
         # Prepare sidecar metadata for this run (written when the process finishes successfully)
         try:
             self._pending_sidecar_out = out_path
-            self._pending_sidecar_meta = self._build_sidecar_meta(prompt=prompt, out_path=out_path, seed=int(self.seed.value()), mode="direct", extra={"extend": int(ext)})
+            self._pending_sidecar_meta = self._build_sidecar_meta(prompt=prompt, out_path=out_path, seed=int(seed_use), mode="direct", extra={"extend": int(ext)})
         except Exception:
             self._pending_sidecar_out = out_path
             self._pending_sidecar_meta = None
@@ -3355,9 +3363,12 @@ Pick a Start image, or enable Video→Video and pick a source video.""",
         if not self._validate_i2v():
             return
 
-        out_path = self._apply_autoname(prompt, int(self.seed.value()), extra=("i2v" if (self._model_is_i2v() and self._start_image_path()) else None))
-        args = self._build_generate_args(prompt=prompt, out_path=out_path, seed_override=self.seed.value())
-        meta = self._build_sidecar_meta(prompt=prompt, out_path=out_path, seed=int(self.seed.value()), mode="queue", extra={"label": f"hunyuan15: {prompt[:64]}", "queued": True})
+        seed_req = int(self.seed.value())
+        seed_use = self._resolve_seed(seed_req)
+
+        out_path = self._apply_autoname(prompt, seed_use, extra=("i2v" if (self._model_is_i2v() and self._start_image_path()) else None))
+        args = self._build_generate_args(prompt=prompt, out_path=out_path, seed_override=seed_use)
+        meta = self._build_sidecar_meta(prompt=prompt, out_path=out_path, seed=int(seed_use), mode="queue", extra={"label": f"hunyuan15: {prompt[:64]}", "queued": True})
         self._queue_job(args=args, outfile=out_path, label=f"hunyuan15: {prompt[:64]}", sidecar_meta=meta)
 
     def on_batch_queue(self):
@@ -3414,18 +3425,16 @@ Pick a Start image, or enable Video→Video and pick a source video.""",
         queued = 0
         for i in range(int(n)):
             # Seed: increment if user set an explicit seed; otherwise keep random (-1)
-            seed_override = -1
-            if base_seed >= 0:
-                seed_override = base_seed + i
+            seed_use = (base_seed + i) if base_seed >= 0 else self._resolve_seed(-1)
 
-            extra = f"b{i+1:02d}" if seed_override < 0 else None
-            out_path = self._apply_autoname(prompt, seed_override, extra=extra)
+            extra = f"b{i+1:02d}" if base_seed < 0 else None
+            out_path = self._apply_autoname(prompt, seed_use, extra=extra)
 
-            args = self._build_generate_args(prompt=prompt, out_path=out_path, seed_override=seed_override)
+            args = self._build_generate_args(prompt=prompt, out_path=out_path, seed_override=seed_use)
             meta = self._build_sidecar_meta(
                 prompt=prompt,
                 out_path=out_path,
-                seed=int(seed_override),
+                seed=int(seed_use),
                 mode="queue",
                 extra={
                     "label": f"hunyuan15(b{i+1:02d}): {prompt[:48]}",
@@ -3578,33 +3587,32 @@ Pick a Start image, or enable Video→Video and pick a source video.""",
             slug = self._first3_words_slug(prompt)
         except Exception:
             slug = "prompt"
-        ts = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+        ts = datetime.now().strftime("%y%m%d")
 
         total = len(image_paths)
         queued = 0
 
         for i, imgp in enumerate(image_paths):
             try:
-                seed_override = -1
-                if base_seed >= 0:
-                    seed_override = base_seed + i
+                seed_use = (base_seed + i) if base_seed >= 0 else self._resolve_seed(-1)
 
-                seed_part = str(seed_override) if seed_override >= 0 else "rand"
+                seed_part = str(seed_use)
                 img_stem = imgp.stem[:48]
                 fname = f"H15_{slug}_{seed_part}_{ts}_i2v_{img_stem}_b{i+1:02d}.mp4"
+                fname = self._ensure_unique_output_name(fname)
                 out_path = self._output_path_for_name(fname)
 
                 args = self._build_generate_args(
                     prompt=prompt,
                     out_path=out_path,
-                    seed_override=seed_override,
+                    seed_override=seed_use,
                     image_override=str(imgp),
                 )
 
                 meta = self._build_sidecar_meta(
                     prompt=prompt,
                     out_path=out_path,
-                    seed=int(seed_override),
+                    seed=int(seed_use),
                     mode="queue",
                     extra={
                         "queued": True,
@@ -3752,10 +3760,52 @@ Pick a Start image, or enable Video→Video and pick a source video.""",
             except Exception:
                 pass
 
+
+    def _pick_random_seed(self) -> int:
+        """Pick a random positive integer seed (used when UI seed is -1)."""
+        try:
+            import secrets
+            return int(secrets.randbelow(2147483647))
+        except Exception:
+            try:
+                import random
+                return int(random.randint(0, 2147483646))
+            except Exception:
+                return 0
+
+    def _resolve_seed(self, seed: int) -> int:
+        try:
+            s = int(seed)
+        except Exception:
+            s = -1
+        return s if s >= 0 else self._pick_random_seed()
+
+    def _ensure_unique_output_name(self, name: str) -> str:
+        """If the resolved output path already exists, append _02/_03… to avoid overwriting."""
+        try:
+            p = self._output_path_for_name(name)
+        except Exception:
+            return name
+        if not p.exists():
+            return name
+        stem = p.stem
+        suf = p.suffix or ""
+        for i in range(2, 1000):
+            cand = f"{stem}_{i:02d}{suf}"
+            try:
+                if not self._output_path_for_name(cand).exists():
+                    return cand
+            except Exception:
+                continue
+        try:
+            return f"{stem}_{datetime.now().strftime('%H%M%S')}{suf}"
+        except Exception:
+            return f"{stem}_new{suf}"
+
     def _make_autoname(self, prompt: str, seed: int, extra: str | None = None) -> str:
         slug = self._first3_words_slug(prompt)
-        seed_part = str(seed) if seed >= 0 else "rand"
-        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+        seed_part = str(int(seed))
+        ts = datetime.now().strftime("%y%m%d")
         base = f"H15_{slug}_{seed_part}_{ts}"
         if extra:
             base = f"{base}_{extra}"
@@ -3763,6 +3813,7 @@ Pick a Start image, or enable Video→Video and pick a source video.""",
 
     def _apply_autoname(self, prompt: str, seed: int, extra: str | None = None) -> Path:
         name = self._make_autoname(prompt, seed, extra=extra)
+        name = self._ensure_unique_output_name(name)
         try:
             self.output_name.setText(name)
         except Exception:
