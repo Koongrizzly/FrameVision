@@ -529,6 +529,9 @@ def install_ui(pane, lay_gif, sec_gif) -> None:
     pane.gif_pb = QProgressBar(); pane.gif_pb.setRange(0,100); pane.gif_pb.setVisible(False)
     pane.gif_eta = QLabel(""); pane.gif_eta.setVisible(False)
     pane.gif_btn_play = QPushButton("Play last"); pane.gif_btn_play.setEnabled(False)
+    pane.gif_btn_view_results = QPushButton("View results")
+    pane.gif_btn_view_results.setToolTip("Open these results in Media Explorer.")
+    pane.gif_btn_view_results.setEnabled(True)
     def _play_last():
         try:
             p = getattr(pane, "_gif_last_out", None)
@@ -537,9 +540,60 @@ def install_ui(pane, lay_gif, sec_gif) -> None:
         except Exception:
             pass
     pane.gif_btn_play.clicked.connect(_play_last)
-    row_res = QHBoxLayout(); row_res.addWidget(pane.gif_pb); row_res.addWidget(pane.gif_eta); row_res.addWidget(pane.gif_btn_play); row_res.addStretch(1)
+    row_res = QHBoxLayout(); row_res.addWidget(pane.gif_pb); row_res.addWidget(pane.gif_eta); row_res.addWidget(pane.gif_btn_play); row_res.addWidget(pane.gif_btn_view_results); row_res.addStretch(1)
     lay_gif.addRow(row_res)
 
+    # View results
+    def _gif_view_results():
+        folder = None
+        try:
+            p = getattr(pane, "_gif_last_out", None)
+            if p:
+                folder = Path(str(p)).parent
+        except Exception:
+            folder = None
+        if folder is None:
+            try:
+                folder = Path(getattr(pane, "OUT_VIDEOS", Path.cwd()))
+            except Exception:
+                folder = Path.cwd()
+        try:
+            folder.mkdir(parents=True, exist_ok=True)
+        except Exception:
+            pass
+        main = None
+        try:
+            main = getattr(pane, "main", None)
+        except Exception:
+            main = None
+        if main is None:
+            try:
+                main = pane.window() if hasattr(pane, "window") else None
+            except Exception:
+                main = None
+        if main is not None and hasattr(main, "open_media_explorer_folder"):
+            try:
+                main.open_media_explorer_folder(str(folder), preset="images", include_subfolders=False)
+                return
+            except TypeError:
+                try:
+                    main.open_media_explorer_folder(str(folder))
+                    return
+                except Exception:
+                    pass
+            except Exception:
+                pass
+        try:
+            QDesktopServices.openUrl(QUrl.fromLocalFile(str(folder)))
+        except Exception:
+            pass
+
+    try:
+        pane.gif_btn_view_results.clicked.connect(_gif_view_results)
+    except Exception:
+        pass
+
+    
 
     # --- Create new from images (single animation) ---
     try:

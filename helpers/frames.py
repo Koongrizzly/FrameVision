@@ -234,7 +234,7 @@ def _codec_args_for_ext(ext: str):
     return []
 # ---------------- actions ----------------
 def _open_frames_folder(owner):
-    """Open the frames output folder (or the most recent subfolder) in the OS file explorer."""
+    """Open the frames output folder in Media Explorer (fallback: OS file explorer)."""
     try:
         last_dir = getattr(owner, "_frames_last_dir", None)
     except Exception:
@@ -244,6 +244,35 @@ def _open_frames_folder(owner):
         base.mkdir(parents=True, exist_ok=True)
     except Exception:
         pass
+
+    # Prefer Media Explorer on main window if available
+    main = None
+    try:
+        main = getattr(owner, "main", None)
+    except Exception:
+        main = None
+    if main is None:
+        try:
+            main = owner.window() if hasattr(owner, "window") else None
+        except Exception:
+            main = None
+
+    if main is not None and hasattr(main, "open_media_explorer_folder"):
+        try:
+            main.open_media_explorer_folder(str(base), preset="images", include_subfolders=False)
+            _set_info(owner, f"Opened in Media Explorer: {base}")
+            return
+        except TypeError:
+            try:
+                main.open_media_explorer_folder(str(base))
+                _set_info(owner, f"Opened in Media Explorer: {base}")
+                return
+            except Exception:
+                pass
+        except Exception:
+            pass
+
+    # Fallback: OS folder open
     try:
         sysname = platform.system().lower()
         if sysname.startswith("win"):
@@ -254,7 +283,8 @@ def _open_frames_folder(owner):
             subprocess.Popen(["xdg-open", str(base)])
         _set_info(owner, f"Opened folder: {base}")
     except Exception:
-        _set_info(owner, f"Folder: {base}")
+        _set_info(owner, f"Folder open failed: {base}")
+
 
 def _run_last(owner):
     inp = _frames_get_input(owner)

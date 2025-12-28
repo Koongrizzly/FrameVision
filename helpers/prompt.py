@@ -728,11 +728,12 @@ class CollapsibleBox(QWidget):
         self._toggle.setArrowType(Qt.DownArrow if not start_collapsed else Qt.RightArrow)
         self._toggle.setStyleSheet("QToolButton { border: none; padding: 2px; }")
 
-        self._content = QScrollArea()
-        self._content.setWidgetResizable(True)
-        self._content.setFrameShape(QFrame.NoFrame)
-        self._content.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
+        # NOTE: Avoid nesting a QScrollArea here. The PromptToolPane already lives in a
+        # scrollable container in the app; a second scroll area causes the "tiny window"
+        # effect with an inner scrollbar.
+        self._content = QWidget()
         self._content.setVisible(not start_collapsed)
+        self._content.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
 
         lay = QVBoxLayout(self)
         lay.setContentsMargins(0, 0, 0, 0)
@@ -748,12 +749,33 @@ class CollapsibleBox(QWidget):
         except Exception:
             pass
         self._content.setVisible(bool(checked))
+        # Force a relayout so the section expands immediately.
+        try:
+            self._content.adjustSize()
+            self.adjustSize()
+            self.updateGeometry()
+        except Exception:
+            pass
 
     def setContentLayout(self, layout):
         """Attach a QLayout as the collapsible content."""
-        w = QWidget()
-        w.setLayout(layout)
-        self._content.setWidget(w)
+        try:
+            old = self._content.layout()
+            if old is not None:
+                while old.count():
+                    item = old.takeAt(0)
+                    w = item.widget()
+                    if w is not None:
+                        w.setParent(None)
+        except Exception:
+            pass
+        self._content.setLayout(layout)
+        try:
+            self._content.adjustSize()
+            self.adjustSize()
+            self.updateGeometry()
+        except Exception:
+            pass
 
 # ---------- UI ----------
 class PromptToolPane(QWidget):
@@ -931,7 +953,6 @@ class PromptToolPane(QWidget):
         )
 
         form.addRow("Model", self.combo_model)
-        form.addRow(top_row)
         form.addRow("Length", self.combo_len)
         form.addRow("Style", self.style)
         form.addRow("Negatives", self.neg)
@@ -962,6 +983,9 @@ class PromptToolPane(QWidget):
         self.advanced_box.setContentLayout(form)
         root.addWidget(self.advanced_box)
 
+
+        # Keep Target/Category/Presets visible (outside the collapsible Advanced section)
+        root.addLayout(top_row)
         btns = QHBoxLayout()
         self.btn_gen = QPushButton("Generate")
         self.btn_gen.setToolTip(

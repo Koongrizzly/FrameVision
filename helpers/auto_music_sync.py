@@ -438,6 +438,9 @@ class TimelineSegment:
     cine_flip: bool = False
     cine_rotate: bool = False
     cine_rotate_degrees: float = 0.0
+    # Color-cycle glitch (cinematic)
+    cine_color_cycle: bool = False
+    cine_color_cycle_speed_ms: int = 350
     # Camera motion hits (dolly / Ken Burns)
     cine_dolly: bool = False
     cine_dolly_strength: float = 0.0
@@ -953,6 +956,8 @@ def build_timeline(
     cine_flip: bool = False,
     cine_rotate: bool = False,
     cine_rotate_max_degrees: float = 20.0,
+    cine_color_cycle: bool = False,
+    cine_color_cycle_speed_ms: int = 350,
     cine_multiply: bool = False,
     cine_multiply_screens: int = 4,
     cine_multiply_random: bool = False,
@@ -1146,6 +1151,9 @@ def build_timeline(
 
         if cine_stutter:
             enabled_effects.append("stutter")
+
+        if cine_color_cycle:
+            enabled_effects.append("color_cycle")
         if cine_reverse:
             enabled_effects.append("reverse")
         if cine_speedup_forward:
@@ -1239,6 +1247,16 @@ def build_timeline(
                     # Per-event direction (top slice goes up OR down, bottom slice mirrors)
                     # We store it on the segment; no dataclass change required.
                     seg.cine_tear_h_dir = random.choice([-1, 1])
+                elif effect_name == "color_cycle":
+                    seg.cine_color_cycle = True
+                    try:
+                        ms = int(cine_color_cycle_speed_ms)
+                    except Exception:
+                        ms = 350
+                    ms = max(100, min(1000, ms))
+                    ms = int(round(ms / 50.0) * 50)
+                    seg.cine_color_cycle_speed_ms = ms
+
                 elif effect_name == "reverse":
                     seg.cine_reverse = True
                     seg.cine_reverse_len = float(max(0.10, min(1.5, cine_reverse_len)))
@@ -3020,6 +3038,35 @@ class RenderWorker(QThread):
                         f"format=rgba,colorchannelmixer=aa={alpha:.3f}[thfx];"
                         f"[thbase][thfx]overlay=shortest=1:enable='lt(t,{hit_d:.3f})',format=yuv420p"
                     )
+
+                if getattr(seg, "cine_color_cycle", False):
+                    # Cinematic color-cycle glitch: full-spectrum hue cycling with a subtle early smear.
+                    try:
+                        ms = int(getattr(seg, "cine_color_cycle_speed_ms", 350) or 350)
+                    except Exception:
+                        ms = 350
+                    ms = max(100, min(1000, ms))
+                    ms = int(round(ms / 50.0) * 50)
+                    period_s = ms / 1000.0
+                    # Interpret slider as ms per full hue cycle.
+                    rate = 360.0 / max(0.05, period_s)  # degrees/sec
+                    vf_parts.append("format=yuv420p")
+                    vf_parts.append(
+                        f"hue=h='t*{rate:.1f}':s=1.35"
+                    )
+                    vf_parts.append("eq=contrast=1.05:saturation=1.18")
+                    # Smear only near the start so it reads glitchy, not blurry.
+                    try:
+                        seg_len = float(getattr(seg, "duration", 0.0) or 0.0)
+                    except Exception:
+                        seg_len = 0.0
+                    smear_d = 0.30
+                    if seg_len > 0.0:
+                        smear_d = max(0.12, min(0.35, seg_len * 0.30))
+                    vf_parts.append(
+                        f"tmix=frames=3:weights='1 0.75 0.45':enable='between(t,0,{smear_d:.3f})'"
+                    )
+                    vf_parts.append("format=yuv420p")
 
                 if getattr(seg, "cine_reverse", False):
                     # Reverse-bounce: optionally repeat a short reversed window
@@ -6340,6 +6387,28 @@ class AutoMusicSyncWidget(QWidget):
         row_cine_stutter.addStretch(1)
         cine_layout.addLayout(row_cine_stutter)
 
+        # Color-cycle glitch (all colors)
+        row_cine_colorcycle = QHBoxLayout()
+        self.check_cine_color_cycle = QCheckBox("Color-cycle glitch (all colors)", self.cine_options)
+        self.check_cine_color_cycle.setToolTip(
+            "Occasionally cycle through the full hue spectrum for a vivid glitchy hit.\n"
+            "Speed controls how fast it cycles through colors."
+        )
+        row_cine_colorcycle.addWidget(self.check_cine_color_cycle)
+        label_cine_cc = QLabel("Speed:", self.cine_options)
+        row_cine_colorcycle.addWidget(label_cine_cc)
+        self.slider_cine_color_cycle_speed = QSlider(Qt.Horizontal, self.cine_options)
+        self.slider_cine_color_cycle_speed.setRange(100, 1000)  # ms per full color cycle
+        self.slider_cine_color_cycle_speed.setSingleStep(50)
+        self.slider_cine_color_cycle_speed.setPageStep(100)
+        self.slider_cine_color_cycle_speed.setValue(350)
+        row_cine_colorcycle.addWidget(self.slider_cine_color_cycle_speed, 1)
+        self.label_cine_color_cycle_speed = QLabel("350 ms", self.cine_options)
+        self.label_cine_color_cycle_speed.setMinimumWidth(70)
+        row_cine_colorcycle.addWidget(self.label_cine_color_cycle_speed)
+        row_cine_colorcycle.addStretch(1)
+        cine_layout.addLayout(row_cine_colorcycle)
+
         # Reverse-bounce
         row_cine_reverse = QHBoxLayout()
         self.check_cine_reverse = QCheckBox("Reverse-bounce", self.cine_options)
@@ -7284,6 +7353,7 @@ class AutoMusicSyncWidget(QWidget):
         self.slider_cine_tear_v_strength.valueChanged.connect(self._on_cine_tear_v_strength_changed)
         self.slider_cine_tear_h_strength.valueChanged.connect(self._on_cine_tear_h_strength_changed)
         self.slider_cine_reverse_len.valueChanged.connect(self._on_cine_reverse_len_changed)
+        self.slider_cine_color_cycle_speed.valueChanged.connect(self._on_cine_color_cycle_speed_changed)
         self.slider_cine_ramp_in.valueChanged.connect(self._on_cine_ramp_in_changed)
         self.slider_cine_ramp_out.valueChanged.connect(self._on_cine_ramp_out_changed)
         self.slider_cine_boomerang_bounces.valueChanged.connect(self._on_cine_boomerang_bounces_changed)
@@ -8263,6 +8333,10 @@ class AutoMusicSyncWidget(QWidget):
         self.slider_cine_tear_h_strength.setValue(int(s.value("cine_tear_h_strength", self.slider_cine_tear_h_strength.value())))
 
         self.check_cine_stutter.setChecked(bool(int(s.value("cine_stutter", int(self.check_cine_stutter.isChecked())))))
+        if hasattr(self, "check_cine_color_cycle"):
+            self.check_cine_color_cycle.setChecked(bool(int(s.value("cine_color_cycle", int(self.check_cine_color_cycle.isChecked())))))
+        if hasattr(self, "slider_cine_color_cycle_speed"):
+            self.slider_cine_color_cycle_speed.setValue(int(s.value("cine_color_cycle_speed_ms", self.slider_cine_color_cycle_speed.value())))
         self.spin_cine_stutter_repeats.setValue(int(s.value("cine_stutter_repeats", self.spin_cine_stutter_repeats.value())))
         self.check_cine_reverse.setChecked(bool(int(s.value("cine_reverse", int(self.check_cine_reverse.isChecked())))))
         self.slider_cine_reverse_len.setValue(int(s.value("cine_reverse_len", self.slider_cine_reverse_len.value())))
@@ -8520,6 +8594,10 @@ class AutoMusicSyncWidget(QWidget):
         s.setValue("cine_tear_h", int(self.check_cine_tear_h.isChecked()))
         s.setValue("cine_tear_h_strength", int(self.slider_cine_tear_h_strength.value()))
         s.setValue("cine_stutter", int(self.check_cine_stutter.isChecked()))
+        if hasattr(self, "check_cine_color_cycle"):
+            s.setValue("cine_color_cycle", int(self.check_cine_color_cycle.isChecked()))
+        if hasattr(self, "slider_cine_color_cycle_speed"):
+            s.setValue("cine_color_cycle_speed_ms", int(self.slider_cine_color_cycle_speed.value()))
         s.setValue("cine_stutter_repeats", int(self.spin_cine_stutter_repeats.value()))
         s.setValue("cine_reverse", int(self.check_cine_reverse.isChecked()))
         s.setValue("cine_reverse_len", int(self.slider_cine_reverse_len.value()))
@@ -9052,6 +9130,31 @@ class AutoMusicSyncWidget(QWidget):
         except Exception:
             pass
 
+    def _on_cine_color_cycle_speed_changed(self, value: int) -> None:
+        """Update label for the cinematic color-cycle speed slider (ms)."""
+        try:
+            v = int(value)
+        except Exception:
+            v = 350
+        v = max(100, min(1000, v))
+        # Snap to 50ms steps for predictable presets.
+        v = int(round(v / 50.0) * 50)
+        try:
+            if getattr(self, "slider_cine_color_cycle_speed").value() != v:
+                self.slider_cine_color_cycle_speed.blockSignals(True)
+                self.slider_cine_color_cycle_speed.setValue(v)
+                self.slider_cine_color_cycle_speed.blockSignals(False)
+        except Exception:
+            try:
+                self.slider_cine_color_cycle_speed.blockSignals(False)
+            except Exception:
+                pass
+        try:
+            self.label_cine_color_cycle_speed.setText(f"{v:d} ms")
+        except Exception:
+            pass
+
+
     def _on_cine_ramp_in_changed(self, value: int) -> None:
         seconds = value / 100.0
         try:
@@ -9296,6 +9399,7 @@ class AutoMusicSyncWidget(QWidget):
             "check_cine_tear_v",
             "check_cine_tear_h",
             "check_cine_stutter",
+            "check_cine_color_cycle",
             "check_cine_reverse",
             "check_cine_speedup_forward",
             "check_cine_speedup_backward",
@@ -9332,6 +9436,7 @@ class AutoMusicSyncWidget(QWidget):
             getattr(self, "check_cine_tear_v", None),
             getattr(self, "check_cine_tear_h", None),
             getattr(self, "check_cine_stutter", None),
+            getattr(self, "check_cine_color_cycle", None),
             getattr(self, "check_cine_reverse", None),
             getattr(self, "check_cine_speedup_forward", None),
             getattr(self, "check_cine_speedup_backward", None),
@@ -10131,6 +10236,8 @@ class AutoMusicSyncWidget(QWidget):
             cine_flip=bool(self.check_cine_flip.isChecked()),
             cine_rotate=bool(self.check_cine_rotate.isChecked()),
             cine_rotate_max_degrees=float(self.slider_cine_rotate_degrees.value()),
+            cine_color_cycle=bool(getattr(self, "check_cine_color_cycle", None) and self.check_cine_color_cycle.isChecked()),
+            cine_color_cycle_speed_ms=int(getattr(self, "slider_cine_color_cycle_speed", None).value()) if getattr(self, "slider_cine_color_cycle_speed", None) is not None else 350,
             cine_multiply=bool(self.check_cine_multiply.isChecked()),
             cine_multiply_screens=int(self.slider_cine_multiply_screens.value()),
             cine_multiply_random=bool(self.check_cine_multiply_random.isChecked()),

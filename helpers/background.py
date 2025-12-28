@@ -2366,18 +2366,24 @@ def install_background_tool(pane, section_widget) -> None:
             except Exception:
                 pass
         btns_row2 = QHBoxLayout()
+        # Make the two main action buttons share the full width.
         try:
-            btns_row2.addWidget(btn_recompute)
+            btns_row2.addWidget(btn_recompute, 1)
         except Exception:
             pass
         try:
-            btns_row2.addWidget(btn_sd_inpaint)
+            btns_row2.addWidget(btn_sd_inpaint, 1)
         except Exception:
             pass
     except Exception:
         pass
     vbox.insertLayout(1, btns_row)
-    outer_vbox.addLayout(btns_row2)
+    # Place the two primary actions (Remove Background / INPAINT) at the very top of the tool
+    # so they are always visible without scrolling.
+    try:
+        outer_vbox.insertLayout(0, btns_row2)
+    except Exception:
+        outer_vbox.addLayout(btns_row2)
     # Move Output path controls directly under the preview (before the main form panel)
 # Mount into CollapsibleSection
     try:

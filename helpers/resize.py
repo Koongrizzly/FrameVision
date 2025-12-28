@@ -305,7 +305,7 @@ class ResizePane(QWidget):
 
         # Output folder buttons
         self.btn_select_outdir = QPushButton("Select Output Folder…")
-        self.btn_open_outdir = QPushButton("Open Output Folder")
+        self.btn_open_outdir = QPushButton("View results")
         row_out_widget = _make_row_widget([self.btn_select_outdir, self.btn_open_outdir])
         form.addRow(row_out_widget)
 
@@ -701,7 +701,7 @@ class ResizePane(QWidget):
         QMessageBox.information(self, "Output folder set", f"Auto-saved files will go to:\n{path}")
 
     def _on_open_output_folder(self):
-        """Open the currently selected output folder in the OS file browser."""
+        """Open the currently selected output folder (Media Explorer preferred)."""
         path = self._output_dir
         if (not path or not path.exists()) and getattr(self, "preset", None):
             try:
@@ -717,6 +717,33 @@ class ResizePane(QWidget):
                 "No valid output folder is set yet.\n\nUse 'Select Output Folder' first.",
             )
             return
+
+        # Prefer Media Explorer on main window if available
+        main = None
+        try:
+            main = getattr(self, "main", None)
+        except Exception:
+            main = None
+        if main is None:
+            try:
+                main = self.window() if hasattr(self, "window") else None
+            except Exception:
+                main = None
+
+        if main is not None and hasattr(main, "open_media_explorer_folder"):
+            try:
+                main.open_media_explorer_folder(str(path), preset="all", include_subfolders=False)
+                return
+            except TypeError:
+                try:
+                    main.open_media_explorer_folder(str(path))
+                    return
+                except Exception:
+                    pass
+            except Exception:
+                pass
+
+        # Fallback: OS open
         try:
             QDesktopServices.openUrl(QUrl.fromLocalFile(str(path)))
         except Exception as e:
