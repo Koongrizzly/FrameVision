@@ -20,6 +20,7 @@ from __future__ import annotations
 import json
 import os
 import subprocess
+import time
 import uuid
 from dataclasses import dataclass, asdict, field
 from pathlib import Path
@@ -29,7 +30,7 @@ from PySide6.QtCore import (
     Qt, QRect, QSize, QUrl, Signal, QTimer, QSizeF, QRectF, QEvent, QPointF
 )
 from PySide6.QtGui import (
-    QPainter, QPen, QFont, QColor, QTransform
+    QPainter, QPen, QFont, QColor, QTransform, QPixmap, QFontMetrics
 )
 from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QFormLayout,
@@ -927,6 +928,16 @@ class VideoTextPane(QWidget):
         self.preview.set_settings(self._settings)
         self.player.setVideoOutput(self.preview.video_item)
 
+        # Big preview toggle (FrameVision integration)
+        self._local_player = self.player
+        self._main_player = None
+        self._main_prev_state = None
+        self._main_prev_source = None
+        self._main_prev_pos = None
+        self._main_prev_rate = None
+        self._big_preview = None
+        self._big_preview_active = False
+
         # Preview interactions (click/drag text)
         try:
             self.preview.overlaySelected.connect(self._on_preview_overlay_selected)
@@ -949,7 +960,10 @@ class VideoTextPane(QWidget):
         root.setSpacing(10)
 
         # Top controls
-        controls = QHBoxLayout()
+        controls_outer = QVBoxLayout()
+        controls_outer.setSpacing(6)
+
+        row1 = QHBoxLayout()
         self.btn_open = QPushButton("Open Video…")
         self.btn_export = QPushButton("Export with Text…")
         self.btn_play = QPushButton("Play/Pause")
@@ -959,18 +973,49 @@ class VideoTextPane(QWidget):
         self.btn_toggle_preview.setCheckable(True)
         self.btn_toggle_preview.setText("Hide Preview")
 
+        self.btn_big_preview = QToolButton()
+        self.btn_big_preview.setCheckable(True)
+        self.btn_big_preview.setChecked(False)
+        self.btn_big_preview.setText("Preview on Main Player: OFF")
+        self.btn_big_preview.setToolTip(
+            "VideoText Preview OFF\n\n"
+            "Turn ON to draw your text overlays on top of FrameVision’s main media player preview. "
+            "While ON, the Play/Pause/Stop buttons and timeline scrubbing in this tool control the main player.\n\n"
+            "Turn OFF to give control back to the app and to avoid double-text when watching exported (baked) videos."
+        )
+
         self.lbl_time = QLabel("00:00.000 / 00:00.000")
         self.lbl_path = QLabel("No video loaded")
         self.lbl_path.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        self.lbl_path.setWordWrap(True)
+        try:
+            self.lbl_path.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
+        except Exception:
+            pass
 
-        controls.addWidget(self.btn_open, 0)
-        controls.addWidget(self.btn_play, 0)
-        controls.addWidget(self.btn_stop, 0)
-        controls.addWidget(self.btn_export, 0)
-        controls.addWidget(self.btn_toggle_preview, 0)
-        controls.addWidget(self.lbl_time, 0)
-        controls.addWidget(self.lbl_path, 1)
-        root.addLayout(controls)
+        # Row 1: main buttons
+        row1.addWidget(self.btn_open, 0)
+        row1.addWidget(self.btn_play, 0)
+        row1.addWidget(self.btn_stop, 0)
+        row1.addWidget(self.btn_export, 0)
+        row1.addWidget(self.btn_toggle_preview, 0)
+        row1.addStretch(1)
+        controls_outer.addLayout(row1)
+
+        # Row 2: preview-on-main toggle + time
+        row2 = QHBoxLayout()
+        row2.addWidget(self.btn_big_preview, 0)
+        row2.addSpacing(12)
+        row2.addWidget(self.lbl_time, 0)
+        row2.addStretch(1)
+        controls_outer.addLayout(row2)
+
+        # Row 3: current video path
+        row3 = QHBoxLayout()
+        row3.addWidget(self.lbl_path, 1)
+        controls_outer.addLayout(row3)
+
+        root.addLayout(controls_outer)
 
         # Main area: splitter (preview | editor)
         self.video_frame = QFrame()
@@ -1172,12 +1217,12 @@ class VideoTextPane(QWidget):
         # wiring (keep existing tool behavior / signals stable)
         self.btn_open.clicked.connect(self._open_video)
         self.btn_play.clicked.connect(self._toggle_play_pause)
-        self.btn_stop.clicked.connect(self.player.stop)
+        self.btn_stop.clicked.connect(self._stop_current)
         self.btn_export.clicked.connect(self._export_video)
         self.btn_toggle_preview.toggled.connect(self._toggle_preview_pane)
+        self.btn_big_preview.toggled.connect(self._toggle_big_preview)
 
-        self.player.positionChanged.connect(self._on_position_changed)
-        self.player.durationChanged.connect(self._on_duration_changed)
+        self._bind_player(self.player)
 
         # Some backends emit positionChanged sparsely; poll to keep overlays in sync.
         self._preview_poll = QTimer(self)
@@ -1242,7 +1287,528 @@ class VideoTextPane(QWidget):
             except Exception:
                 pass
 
+        # FrameVision integration: when embedded, always preview on the main media player
+        # (ditch the tab preview pane entirely).
+        try:
+            QTimer.singleShot(0, self._auto_use_main_player_if_available)
+        except Exception:
+            pass
+
+
+
     # helpers
+
+    # --- FrameVision integration: always use the main media player for preview (no tab preview pane) ---
+    
+    def _auto_use_main_player_if_available(self) -> None:
+        """
+        FrameVision integration (safe mode):
+        - Detect the main window + VideoPane
+        - Hide the tab preview (we preview on the big player only when the user explicitly enables it)
+        - Patch VideoPane._refresh_label_pixmap once (does nothing unless preview is enabled)
+        IMPORTANT: This function must NOT take control of the main player automatically.
+        """
+        if getattr(self, "_fv_checked", False):
+            return
+        self._fv_checked = True
+
+        main = None
+        try:
+            main = self._find_framevision_main()
+        except Exception:
+            main = None
+        if main is None:
+            return
+
+        vp = getattr(main, "video", None)
+        if vp is None or (not hasattr(vp, "player")) or (not hasattr(vp, "label")):
+            return
+
+        # Mark embedded environment
+        self._fv_main = main
+        self._fv_video = vp
+        self._fv_use_main_player = True  # backward-compat flag: "embedded detected"
+        self._fv_attached = False
+
+        # Keep local player as a harmless fallback (standalone behavior)
+        try:
+            self._local_player = self._local_player if getattr(self, "_local_player", None) is not None else self.player
+        except Exception:
+            self._local_player = self.player
+        try:
+            if self._local_player is not None:
+                self._local_player.pause()
+        except Exception:
+            pass
+
+        # Hide internal preview UI in embedded mode (avoid duplicate previews + empty windows)
+        try:
+            self.video_frame.hide()
+        except Exception:
+            pass
+        try:
+            self.btn_toggle_preview.hide()
+        except Exception:
+            pass
+        try:
+            # Editor fills the tab
+            self.splitter.setSizes([0, 1])
+        except Exception:
+            pass
+
+        # Disable playback controls until the user enables preview on the main player
+        try:
+            self._fv_apply_attach_state(False)
+        except Exception:
+            pass
+
+        # Patch VideoPane once; overlay painting stays OFF until user enables it.
+        try:
+            self._patch_fv_video_pane(vp)
+        except Exception:
+            pass
+        try:
+            vp._videotext_overlay_provider = None
+            vp._videotext_overlay_painter = None
+        except Exception:
+            pass
+
+        # Stop background refresh timers (they can cause stutter in embedded mode)
+        try:
+            if getattr(self, "_tick", None) is not None:
+                self._tick.stop()
+        except Exception:
+            pass
+        try:
+            if getattr(self, "_preview_poll", None) is not None:
+                self._preview_poll.stop()
+        except Exception:
+            pass
+
+        # Ensure button state text
+        try:
+            self.btn_big_preview.blockSignals(True)
+            self.btn_big_preview.setChecked(False)
+            self.btn_big_preview.setText("Preview on Main Player: OFF")
+            self.btn_big_preview.blockSignals(False)
+        except Exception:
+            pass
+
+        # In embedded mode, do NOT auto-load last video into the main player.
+        # (last_video_path is still used for export, but loading must be explicit.)
+
+    def _fv_watch_player_swap(self) -> None:
+        if not getattr(self, "_fv_use_main_player", False):
+            return
+        vp = getattr(self, "_fv_video", None)
+        if vp is None:
+            return
+        try:
+            mp = getattr(vp, "player", None)
+        except Exception:
+            mp = None
+        if mp is None:
+            return
+        # Rebind when VideoPane recreates its player
+        if mp is not getattr(self, "player", None):
+            try:
+                self._bind_player(mp)
+            except Exception:
+                pass
+        # Keep provider attached while visible
+        try:
+            if self.isVisible():
+                vp._videotext_overlay_provider = self._fv_overlay_provider
+                vp._videotext_overlay_painter = self._fv_paint_overlays_on_pixmap
+        except Exception:
+            pass
+
+    def _request_main_video_refresh(self) -> None:
+        vp = getattr(self, "_fv_video", None)
+        if vp is None:
+            return
+        try:
+            if hasattr(vp, "_refresh_label_pixmap"):
+                vp._refresh_label_pixmap()
+        except Exception:
+            pass
+
+    @staticmethod
+    
+    def _fv_anchor_pos(base_rect, text_w: float, text_h: float, anchor: str):
+        """
+        Return (x,y) for the top-left corner of the text box inside base_rect.
+        Anchor values are kept compatible with the VideoText settings.
+        """
+        a = (anchor or "").strip().lower()
+
+        # normalize common variants
+        if a == "top":
+            a = "top_center"
+        if a == "bottom":
+            a = "bottom_center"
+        if a == "left":
+            a = "center_left"
+        if a == "right":
+            a = "center_right"
+
+        if a == "top_left":
+            return base_rect.left(), base_rect.top()
+        if a == "top_center":
+            return base_rect.center().x() - text_w / 2.0, base_rect.top()
+        if a == "top_right":
+            return base_rect.right() - text_w, base_rect.top()
+
+        if a == "center_left":
+            return base_rect.left(), base_rect.center().y() - text_h / 2.0
+        if a in ("center", "middle"):
+            return base_rect.center().x() - text_w / 2.0, base_rect.center().y() - text_h / 2.0
+        if a == "center_right":
+            return base_rect.right() - text_w, base_rect.center().y() - text_h / 2.0
+
+        if a == "bottom_left":
+            return base_rect.left(), base_rect.bottom() - text_h
+        if a == "bottom_center":
+            return base_rect.center().x() - text_w / 2.0, base_rect.bottom() - text_h
+        if a == "bottom_right":
+            return base_rect.right() - text_w, base_rect.bottom() - text_h
+
+        # fallback
+        return base_rect.center().x() - text_w / 2.0, base_rect.center().y() - text_h / 2.0
+
+
+    def _fv_overlay_provider(self):
+        # Called from the VideoPane draw wrapper; returns list[(TextOverlay, opacity)]
+        out = []
+        try:
+            pos_ms = int(self.player.position())
+        except Exception:
+            pos_ms = 0
+        s = self._settings
+        for ov in s.overlays:
+            try:
+                if not ov.enabled or not (ov.text or "").strip():
+                    continue
+            except Exception:
+                continue
+
+            try:
+                if s.preview_always_show:
+                    alpha = (ov.color_rgba[3] / 255.0) if ov.color_rgba else 1.0
+                else:
+                    alpha = VideoPreview._alpha_at_ms(ov, pos_ms)
+            except Exception:
+                alpha = 0.0
+
+            try:
+                if alpha <= 0.001:
+                    continue
+            except Exception:
+                continue
+
+            out.append((ov, float(alpha)))
+        return out
+
+    
+    def _fv_paint_overlays_on_pixmap(self, pm: QPixmap, overlays) -> None:
+        """
+        Paint overlays directly onto the already-scaled pixmap the VideoPane is showing.
+
+        Performance notes:
+        - Avoid forced refresh timers in embedded mode (done elsewhere).
+        - Cache font metrics per overlay so each frame doesn't re-measure text.
+        """
+        if pm is None:
+            return
+        try:
+            if pm.isNull():
+                return
+        except Exception:
+            return
+        if not overlays:
+            return
+
+        # layout cache: key -> (sig, font, lines, line_h, ascent, text_w, text_h)
+        cache = getattr(self, "_fv_layout_cache", None)
+        if cache is None:
+            cache = {}
+            self._fv_layout_cache = cache
+
+        w = float(pm.width())  # logical px
+        h = float(pm.height())
+        base_rect = QRectF(0.0, 0.0, w, h)
+        clamp_rect = base_rect.adjusted(-w, -h, w, h)
+
+        painter = QPainter(pm)
+        try:
+            painter.setRenderHints(
+                QPainter.Antialiasing | QPainter.TextAntialiasing | QPainter.SmoothPixmapTransform, True
+            )
+        except Exception:
+            pass
+
+        for ov, opacity in overlays:
+            try:
+                txt = (ov.text or "").strip()
+            except Exception:
+                txt = ""
+            if not txt:
+                continue
+
+            # Cache text measurement for this overlay
+            try:
+                key = getattr(ov, "uid", None) or id(ov)
+            except Exception:
+                key = id(ov)
+
+            try:
+                ff = str(getattr(ov, "font_family", None) or "Arial")
+            except Exception:
+                ff = "Arial"
+            try:
+                fs = int(max(1, int(getattr(ov, "font_size", 48) or 48)))
+            except Exception:
+                fs = 48
+
+            sig = (txt, ff, fs)
+            c = cache.get(key, None)
+            if c is None or c[0] != sig:
+                try:
+                    font = QFont(ff)
+                except Exception:
+                    font = QFont("Arial")
+                try:
+                    font.setPixelSize(fs)
+                except Exception:
+                    pass
+                try:
+                    fm = QFontMetrics(font)
+                except Exception:
+                    fm = None
+
+                lines = txt.splitlines() or [txt]
+                try:
+                    line_h = float(fm.height()) if fm is not None else float(fs)
+                except Exception:
+                    line_h = float(fs)
+                try:
+                    ascent = float(fm.ascent()) if fm is not None else float(line_h * 0.8)
+                except Exception:
+                    ascent = float(line_h * 0.8)
+
+                try:
+                    max_w = 0.0
+                    if fm is not None:
+                        for ln in lines:
+                            try:
+                                max_w = max(max_w, float(fm.horizontalAdvance(ln)))
+                            except Exception:
+                                pass
+                    text_w = max_w
+                except Exception:
+                    text_w = 0.0
+
+                text_h = line_h * float(len(lines))
+                cache[key] = (sig, font, lines, line_h, ascent, text_w, text_h)
+                c = cache[key]
+
+            _, font, lines, line_h, ascent, text_w, text_h = c
+
+            try:
+                painter.setFont(font)
+            except Exception:
+                pass
+
+            # Position
+            try:
+                anchor = str(getattr(ov, "anchor", None) or "top_left")
+            except Exception:
+                anchor = "top_left"
+
+            if anchor == "custom":
+                try:
+                    x = float(getattr(ov, "offset_x", 0.0))
+                except Exception:
+                    x = 0.0
+                try:
+                    y = float(getattr(ov, "offset_y", 0.0))
+                except Exception:
+                    y = 0.0
+            else:
+                ax, ay = self._fv_anchor_pos(base_rect, text_w, text_h, anchor)
+                try:
+                    x = float(ax) + float(getattr(ov, "offset_x", 0.0))
+                except Exception:
+                    x = float(ax)
+                try:
+                    y = float(ay) + float(getattr(ov, "offset_y", 0.0))
+                except Exception:
+                    y = float(ay)
+
+            # Soft clamp like the tab preview
+            try:
+                x = float(_clamp(x, clamp_rect.left(), clamp_rect.right()))
+                y = float(_clamp(y, clamp_rect.top(), clamp_rect.bottom()))
+            except Exception:
+                pass
+
+            # Colors (match tab preview behavior: opacity multiplies the stored alpha)
+            try:
+                rgba = list(getattr(ov, "color_rgba", None) or [255, 255, 255, 255])
+            except Exception:
+                rgba = [255, 255, 255, 255]
+            try:
+                r, g, b, a = int(rgba[0]), int(rgba[1]), int(rgba[2]), int(rgba[3])
+            except Exception:
+                r, g, b, a = 255, 255, 255, 255
+
+            try:
+                text_a = int(_clamp(a * float(opacity), 0, 255))
+            except Exception:
+                text_a = int(a)
+            try:
+                shadow_a = int(_clamp(170 * float(opacity), 0, 255))
+            except Exception:
+                shadow_a = 170
+
+            text_col = QColor(r, g, b, int(text_a))
+            sh_col = QColor(0, 0, 0, int(shadow_a))
+
+            # Draw shadow then text (baseline-based)
+            try:
+                painter.setPen(sh_col)
+                for i, ln in enumerate(lines):
+                    painter.drawText(QPointF(x + 2.0, y + 2.0 + ascent + (float(i) * line_h)), ln)
+            except Exception:
+                pass
+
+            try:
+                painter.setPen(text_col)
+                for i, ln in enumerate(lines):
+                    painter.drawText(QPointF(x, y + ascent + (float(i) * line_h)), ln)
+            except Exception:
+                pass
+
+        try:
+            painter.end()
+        except Exception:
+            pass
+
+    def _patch_fv_video_pane(self, vp) -> None:
+        # Patch only once per VideoPane instance.
+        if getattr(vp, "_videotext_overlay_patch_applied", False):
+            return
+        vp._videotext_overlay_patch_applied = True
+
+        # Ensure attributes exist even when provider is disabled
+        try:
+            vp._videotext_overlay_provider = None
+            vp._videotext_overlay_painter = None
+        except Exception:
+            pass
+
+        try:
+            orig = vp._refresh_label_pixmap
+        except Exception:
+            return
+
+        def _wrapped_refresh():
+            # Call original first (it sets the label pixmap from the current frame)
+            try:
+                orig()
+            except Exception:
+                pass
+
+            try:
+                # Only paint in normal video mode (skip compare mode)
+                if getattr(vp, "_mode", None) != "video":
+                    return
+                if getattr(vp, "_compare_active", False):
+                    return
+
+                prov = getattr(vp, "_videotext_overlay_provider", None)
+                paint_fn = getattr(vp, "_videotext_overlay_painter", None)
+                if prov is None or paint_fn is None:
+                    return
+
+                overlays = prov()
+                if not overlays:
+                    return
+
+                pm0 = None
+                try:
+                    pm0 = vp.label.pixmap()
+                except Exception:
+                    pm0 = None
+                if pm0 is None:
+                    return
+                try:
+                    if pm0.isNull():
+                        return
+                except Exception:
+                    return
+
+                pm = QPixmap(pm0)
+                try:
+                    paint_fn(pm, overlays)
+                except Exception:
+                    pass
+                try:
+                    vp.label.setPixmap(pm)
+                except Exception:
+                    pass
+            except Exception:
+                pass
+
+        try:
+            vp._videotext_orig_refresh_label_pixmap = orig
+        except Exception:
+            pass
+        try:
+            vp._refresh_label_pixmap = _wrapped_refresh
+        except Exception:
+            pass
+
+    
+    def showEvent(self, e):
+        try:
+            super().showEvent(e)
+        except Exception:
+            pass
+
+        # In embedded mode, only attach overlay preview when the user explicitly enabled it.
+        if getattr(self, "_fv_use_main_player", False) and getattr(self, "_fv_attached", False):
+            vp = getattr(self, "_fv_video", None)
+            if vp is not None:
+                try:
+                    vp._videotext_overlay_provider = self._fv_overlay_provider
+                    vp._videotext_overlay_painter = self._fv_paint_overlays_on_pixmap
+                except Exception:
+                    pass
+            try:
+                self._request_main_video_refresh()
+            except Exception:
+                pass
+
+    def hideEvent(self, e):
+        # Always detach when leaving the tab (so VideoText never keeps controlling the app).
+        if getattr(self, "_fv_use_main_player", False) and getattr(self, "_fv_attached", False):
+            try:
+                self.btn_big_preview.blockSignals(True)
+                self.btn_big_preview.setChecked(False)
+                self.btn_big_preview.blockSignals(False)
+            except Exception:
+                pass
+            try:
+                self._toggle_big_preview(False)
+            except Exception:
+                pass
+
+        try:
+            super().hideEvent(e)
+        except Exception:
+            pass
+
     def _current_overlay(self) -> TextOverlay:
         return self._settings.get_selected()
 
@@ -1295,6 +1861,258 @@ class VideoTextPane(QWidget):
             if ov:
                 it.setText(self._overlay_label(ov, row))
 
+
+    # --- Big preview integration (FrameVision) ----------------------------------
+    def _stop_current(self) -> None:
+        try:
+            self.player.stop()
+        except Exception:
+            pass
+
+    
+    def _bind_player(self, p: QMediaPlayer) -> None:
+        """
+        (Re)bind time signals to the given player and make it the active player for this pane.
+
+        Important: PySide can emit RuntimeWarning if you call disconnect() on a slot that was never connected.
+        We avoid that by tracking connection state ourselves.
+        """
+        if p is None:
+            return
+
+        prev = getattr(self, "_bound_player", None)
+
+        # Disconnect previous player if we were actually connected
+        try:
+            if prev is not None and prev is not p:
+                if getattr(self, "_bound_pos_connected", False):
+                    try:
+                        prev.positionChanged.disconnect(self._on_position_changed)
+                    except Exception:
+                        pass
+                if getattr(self, "_bound_dur_connected", False):
+                    try:
+                        prev.durationChanged.disconnect(self._on_duration_changed)
+                    except Exception:
+                        pass
+        except Exception:
+            pass
+
+        # Set new player
+        self.player = p
+        self._bound_player = p
+        self._bound_pos_connected = False
+        self._bound_dur_connected = False
+
+        # Connect signals (prefer UniqueConnection)
+        try:
+            try:
+                p.positionChanged.connect(self._on_position_changed, Qt.UniqueConnection)
+            except Exception:
+                p.positionChanged.connect(self._on_position_changed)
+            self._bound_pos_connected = True
+        except Exception:
+            self._bound_pos_connected = False
+
+        try:
+            try:
+                p.durationChanged.connect(self._on_duration_changed, Qt.UniqueConnection)
+            except Exception:
+                p.durationChanged.connect(self._on_duration_changed)
+            self._bound_dur_connected = True
+        except Exception:
+            self._bound_dur_connected = False
+
+        # Sync UI immediately
+        try:
+            self._on_duration_changed(int(p.duration()))
+        except Exception:
+            pass
+        try:
+            self._on_position_changed(int(p.position()))
+        except Exception:
+            pass
+
+
+    def _find_framevision_main(self):
+        try:
+            w = self.window()
+        except Exception:
+            w = None
+        if w is None:
+            return None
+        # FrameVision main window convention: has .video (VideoPane) and the override helpers we add.
+        if hasattr(w, "video") and hasattr(w, "set_left_override_widget"):
+            return w
+        return None
+
+    def _ensure_big_preview(self):
+        if getattr(self, "_big_preview", None) is not None:
+            return self._big_preview
+        try:
+            bp = VideoPreview(None)
+            try:
+                bp.set_settings(self._settings)
+            except Exception:
+                pass
+            try:
+                bp.overlaySelected.connect(self._on_preview_overlay_selected)
+                bp.overlayMoved.connect(self._on_preview_overlay_moved)
+            except Exception:
+                pass
+            self._big_preview = bp
+        except Exception:
+            self._big_preview = None
+        return self._big_preview
+
+    
+    def _fv_apply_attach_state(self, attached: bool) -> None:
+        """
+        Embedded-mode UX:
+        - When detached: do not control the main player; keep playback controls disabled
+        - When attached: this tool controls the main player (play/pause/seek) and draws overlays on it
+        """
+        try:
+            self.btn_play.setEnabled(bool(attached))
+        except Exception:
+            pass
+        try:
+            self.btn_stop.setEnabled(bool(attached))
+        except Exception:
+            pass
+        try:
+            self.timeline.setEnabled(bool(attached))
+        except Exception:
+            pass
+        try:
+            self.slider_zoom.setEnabled(bool(attached))
+        except Exception:
+            pass
+
+        # Make it very obvious what's happening
+        try:
+            if attached:
+                self.btn_big_preview.setText("Preview on Main Player: ON")
+            else:
+                self.btn_big_preview.setText("Preview on Main Player: OFF")
+        except Exception:
+            pass
+
+        # Helpful tooltip on Open Video in embedded mode
+        try:
+            if getattr(self, "_fv_use_main_player", False):
+                if attached:
+                    self.btn_open.setToolTip(
+                        "Open Video…\n\n"
+                        "Loads the selected video into FrameVision’s main media player and previews your overlays on top."
+                    )
+                else:
+                    self.btn_open.setToolTip(
+                        "Open Video…\n\n"
+                        "Selects a video for export.\n"
+                        "Tip: Turn ON “Preview on Main Player” if you want this tool to load/seek/play the main player."
+                    )
+        except Exception:
+            pass
+
+    def _toggle_big_preview(self, checked: bool) -> None:
+        """
+        Repurposed: this is now the safe ON/OFF switch for VideoText preview on the main player.
+        OFF (default): VideoText does not touch the main player.
+        ON: VideoText draws overlays on the main player and routes play/seek controls to it.
+        """
+        main = self._find_framevision_main()
+        if main is None:
+            # Standalone mode: this toggle has no meaning
+            try:
+                self.btn_big_preview.blockSignals(True)
+                self.btn_big_preview.setChecked(False)
+                self.btn_big_preview.setText("Preview on Main Player: OFF")
+                self.btn_big_preview.blockSignals(False)
+            except Exception:
+                pass
+            return
+
+        # Ensure we ran embedded detection
+        try:
+            self._auto_use_main_player_if_available()
+        except Exception:
+            pass
+
+        vp = getattr(self, "_fv_video", None)
+        if vp is None or not hasattr(vp, "player"):
+            try:
+                self.btn_big_preview.blockSignals(True)
+                self.btn_big_preview.setChecked(False)
+                self.btn_big_preview.setText("Preview on Main Player: OFF")
+                self.btn_big_preview.blockSignals(False)
+            except Exception:
+                pass
+            return
+
+        if not checked:
+            # Detach
+            try:
+                vp._videotext_overlay_provider = None
+                vp._videotext_overlay_painter = None
+            except Exception:
+                pass
+
+            try:
+                self._fv_attached = False
+            except Exception:
+                pass
+
+            # Rebind tool controls back to local player so we don't hijack the app
+            try:
+                if getattr(self, "_local_player", None) is not None:
+                    self._bind_player(self._local_player)
+            except Exception:
+                pass
+
+            try:
+                self._fv_apply_attach_state(False)
+            except Exception:
+                pass
+
+            # Force a redraw to remove any last painted overlay from the current frame
+            try:
+                self._request_main_video_refresh()
+            except Exception:
+                pass
+            return
+
+        # Attach
+        try:
+            self._fv_attached = True
+        except Exception:
+            pass
+
+        # Route time/seek controls to the main player
+        try:
+            self._bind_player(vp.player)
+        except Exception:
+            pass
+
+        # Enable overlay painting (only while enabled)
+        try:
+            vp._videotext_overlay_provider = self._fv_overlay_provider
+            vp._videotext_overlay_painter = self._fv_paint_overlays_on_pixmap
+        except Exception:
+            pass
+
+        try:
+            self._fv_apply_attach_state(True)
+        except Exception:
+            pass
+
+        # If the user already selected a last video for this tool and the main player is empty,
+        # we do NOT auto-load it (to avoid hijacking). They can click Open Video… to load explicitly.
+        try:
+            self._request_main_video_refresh()
+        except Exception:
+            pass
+
     # open/load
     def _open_video(self) -> None:
         start_dir = ""
@@ -1313,11 +2131,61 @@ class VideoTextPane(QWidget):
             return
         self._load_video(path)
 
+    
     def _load_video(self, path: str) -> None:
+        # Always remember the path (used for export in both standalone and embedded mode)
         self._settings.last_video_path = path
-        self.lbl_path.setText(path)
-        self.player.setSource(QUrl.fromLocalFile(path))
+        try:
+            self.lbl_path.setText(path)
+        except Exception:
+            pass
         self._schedule_save()
+
+        embedded = bool(getattr(self, "_fv_use_main_player", False) and getattr(self, "_fv_video", None) is not None)
+
+        # Embedded mode: only touch the main player when the user enabled preview.
+        if embedded:
+            if getattr(self, "_fv_attached", False):
+                try:
+                    vp = self._fv_video
+                    try:
+                        vp.open(Path(path))
+                    except Exception:
+                        # fallback: try to set source directly
+                        try:
+                            vp.player.setSource(QUrl.fromLocalFile(path))
+                        except Exception:
+                            pass
+                    try:
+                        self._bind_player(vp.player)
+                    except Exception:
+                        pass
+                    try:
+                        vp._videotext_overlay_provider = self._fv_overlay_provider
+                        vp._videotext_overlay_painter = self._fv_paint_overlays_on_pixmap
+                    except Exception:
+                        pass
+                except Exception:
+                    pass
+                try:
+                    self._request_main_video_refresh()
+                except Exception:
+                    pass
+            else:
+                # Preview is OFF; do not hijack the app by loading anything.
+                try:
+                    self.lbl_time.setText("Preview OFF (enable to control main player)")
+                except Exception:
+                    pass
+            return
+
+        # Standalone / non-embedded: use our local player & tab preview.
+        try:
+            self.player.setSource(QUrl.fromLocalFile(path))
+        except Exception:
+            pass
+
+
 
     def _toggle_play_pause(self) -> None:
         if self.player.playbackState() == QMediaPlayer.PlayingState:
@@ -1578,9 +2446,28 @@ class VideoTextPane(QWidget):
         self._schedule_save()
         self._emit_settings()
 
+    
     def _tick_preview(self) -> None:
         pos = int(self.player.position())
-        self.preview.update_for_time(pos)
+
+        # Standalone preview updates (tab preview and optional big preview widget).
+        if not getattr(self, "_fv_use_main_player", False):
+            try:
+                self.preview.update_for_time(pos)
+            except Exception:
+                pass
+            try:
+                if self._big_preview is not None:
+                    try:
+                        self._big_preview.update_for_time(pos)
+                    except Exception:
+                        pass
+            except Exception:
+                pass
+
+        # Embedded mode: do NOT force-refresh the main player every tick.
+        # The main VideoPane will refresh on its own frames; overlays are painted there.
+        # We only request refresh on user edits / attach-detach.
 
         if self._settings.preview_always_show:
             active = sum(1 for ov in self._settings.overlays if ov.enabled and (ov.text or "").strip())
@@ -1592,6 +2479,7 @@ class VideoTextPane(QWidget):
                 if ov.start_ms <= pos <= (ov.start_ms + ov.duration_ms):
                     active += 1
         self.lbl_active.setText(f"Overlays: {active} active")
+
 
     # settings io
     def _load_settings(self) -> VideoTextSettings:
@@ -1774,7 +2662,15 @@ class VideoTextPane(QWidget):
         self.spin_fade_out.blockSignals(False)
 
     def _apply_settings_to_preview(self) -> None:
-        self.preview.set_settings(self._settings)
+        try:
+            self.preview.set_settings(self._settings)
+        except Exception:
+            pass
+        try:
+            if self._big_preview is not None:
+                self._big_preview.set_settings(self._settings)
+        except Exception:
+            pass
         self._tick_preview()
 
     def _emit_settings(self) -> None:

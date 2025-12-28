@@ -519,7 +519,7 @@ def apply_theme(app: QApplication, name: str) -> None:
         # Updating top-level widgets is typically enough; Qt will propagate style changes to children.
         for w in app.topLevelWidgets():
             try:
-                w.style().unpolish(w); w.style().polish(w); w.update()
+                w.update()
             except Exception:
                 pass
     except Exception:

@@ -39,6 +39,74 @@ except Exception:
 import os, shutil, sys, time, json
 
 
+# ---- Global font size (px delta) helpers -----------------------------------------------
+def _font_size__orig_font(app: QtWidgets.QApplication) -> QtGui.QFont:
+    """Get or store the original application font (used to restore later)."""
+    try:
+        orig = app.property("fv_orig_app_font")
+        if isinstance(orig, QtGui.QFont):
+            return QtGui.QFont(orig)
+        f = QtGui.QFont(app.font())
+        app.setProperty("fv_orig_app_font", QtGui.QFont(f))
+        return QtGui.QFont(f)
+    except Exception:
+        return QtGui.QFont()
+
+def _font_size_apply(app: Optional[QtWidgets.QApplication], enabled: bool, delta_px: int) -> None:
+    """Apply a global font size delta in *pixels* using QApplication.setFont()."""
+    try:
+        if app is None:
+            app = QtWidgets.QApplication.instance()
+        if app is None:
+            return
+
+        orig = _font_size__orig_font(app)
+
+        if not enabled:
+            app.setFont(orig)
+            return
+
+        try:
+            delta_px = int(delta_px)
+        except Exception:
+            delta_px = 0
+
+        # Determine actual rendered pixel size (works even if font uses pointSize internally).
+        try:
+            base_px = int(QtGui.QFontInfo(orig).pixelSize())
+        except Exception:
+            base_px = -1
+
+        if base_px <= 0:
+            # Fallback: use font metrics height (approx) if pixelSize is unavailable.
+            try:
+                base_px = int(QtGui.QFontMetrics(orig).height())
+            except Exception:
+                base_px = 14
+
+        new_px = max(8, base_px + delta_px)
+
+        f = QtGui.QFont(orig)
+        f.setPixelSize(int(new_px))
+        app.setFont(f)
+    except Exception:
+        pass
+
+def _font_size_apply_from_qsettings(app: Optional[QtWidgets.QApplication] = None) -> None:
+    """Apply the saved font size settings on startup/UI build."""
+    try:
+        s = QSettings("FrameVision", "FrameVision")
+        en = bool(s.value("ui_font_size_enabled", False, type=bool))
+        delta = s.value("ui_font_size_delta_px", 0)
+        try:
+            delta = int(delta)
+        except Exception:
+            delta = 0
+        _font_size_apply(app or QtWidgets.QApplication.instance(), en, delta)
+    except Exception:
+        pass
+
+
 # ---- small filesystem helpers ------------------------------------------------------------
 def _clean_directory_contents(path: str) -> None:
     """Delete files/folders inside *path* without deleting *path* itself."""
@@ -164,9 +232,45 @@ def _theme_row(page: QWidget) -> QWidget:
     except Exception:
         pass
     btn = QPushButton("Apply")
-    def do_apply():
+
+    _busy = {"on": False}
+
+    def _set_busy(on: bool) -> None:
+        on = bool(on)
+        if _busy.get("on") == on:
+            return
+        _busy["on"] = on
         try:
-            t = box.currentText(); config["theme"] = t
+            if on:
+                btn.setProperty("_fv_prev_text", btn.text() or "Apply")
+                btn.setText("Applying…")
+                btn.setEnabled(False)
+                box.setEnabled(False)
+            else:
+                prev = btn.property("_fv_prev_text") or "Apply"
+                btn.setText(str(prev))
+                btn.setEnabled(True)
+                box.setEnabled(True)
+        except Exception:
+            pass
+
+    def do_apply():
+        if _busy.get("on"):
+            return
+        try:
+            t = box.currentText()
+            config["theme"] = t
+
+            _set_busy(True)
+
+            # Let the UI repaint the "Applying…" state before we run the heavier apply_theme.
+            try:
+                app = QtWidgets.QApplication.instance()
+                if app:
+                    app.processEvents(QtCore.QEventLoop.AllEvents, 50)
+            except Exception:
+                pass
+
             app = QtWidgets.QApplication.instance()
             if apply_theme and app:
                 apply_theme(app, t)
@@ -176,7 +280,11 @@ def _theme_row(page: QWidget) -> QWidget:
                 pass
         except Exception:
             pass
-    btn.clicked.connect(do_apply); box.currentIndexChanged.connect(lambda _i: do_apply())
+        finally:
+            _set_busy(False)
+
+    btn.clicked.connect(do_apply)
+    box.currentIndexChanged.connect(lambda _i: QtCore.QTimer.singleShot(0, do_apply))
     h.addWidget(lab); h.addWidget(box); h.addWidget(btn); h.addStretch(1)
     v.addWidget(top)
 
@@ -635,6 +743,96 @@ def _options_group(page: QWidget) -> QGroupBox:
 
         # Apply initial mode states
         _anim_set_mode(mode_default)
+
+
+        # -- Font size (global) ----------------------------------------------------------
+        cb_font = QCheckBox("Change font size")
+        cb_font.setToolTip("Adjust the global UI font size. Turn on to reveal the slider (in pixels).")
+        font_enabled_default = s.value("ui_font_size_enabled", False, type=bool)
+        cb_font.setChecked(font_enabled_default)
+        _sync_grey_state(cb_font, bool(font_enabled_default))
+
+        # Slider row (only visible when enabled)
+        row_font = QWidget(content)
+        h_font = QHBoxLayout(row_font)
+        h_font.setContentsMargins(18, 0, 0, 0)
+        h_font.setSpacing(10)
+
+        lab_font = QLabel("Font size: (click 'apply' theme change the font size)")
+        slider_font = QtWidgets.QSlider(Qt.Horizontal, row_font)
+        slider_font.setRange(-5, 5)
+        slider_font.setSingleStep(1)
+        slider_font.setPageStep(1)
+        slider_font.setTickInterval(1)
+        slider_font.setTickPosition(QtWidgets.QSlider.TicksBelow)
+
+        delta_default = s.value("ui_font_size_delta_px", 0)
+        try:
+            delta_default = int(delta_default)
+        except Exception:
+            delta_default = 0
+        if delta_default < -5:
+            delta_default = -5
+        if delta_default > 5:
+            delta_default = 5
+        slider_font.setValue(delta_default)
+
+        lab_font_val = QLabel(f"{int(slider_font.value()):+d} px")
+        lab_font_val.setMinimumWidth(52)
+
+        h_font.addWidget(lab_font)
+        h_font.addWidget(slider_font, 1)
+        h_font.addWidget(lab_font_val)
+        h_font.addStretch(1)
+
+        row_font.setVisible(bool(font_enabled_default))
+
+        def _font_apply_now():
+            try:
+                app = QtWidgets.QApplication.instance()
+                _font_size_apply(app, bool(cb_font.isChecked()), int(slider_font.value()))
+            except Exception:
+                pass
+
+        def _on_font_toggle(b: bool):
+            try:
+                s.setValue("ui_font_size_enabled", bool(b))
+            except Exception:
+                pass
+            _sync_grey_state(cb_font, bool(b))
+            try:
+                row_font.setVisible(bool(b))
+            except Exception:
+                pass
+            _font_apply_now()
+
+        def _on_font_slider(vv: int):
+            try:
+                vv = int(vv)
+            except Exception:
+                vv = 0
+            try:
+                s.setValue("ui_font_size_delta_px", int(vv))
+            except Exception:
+                pass
+            try:
+                lab_font_val.setText(f"{int(vv):+d} px")
+            except Exception:
+                pass
+            if cb_font.isChecked():
+                _font_apply_now()
+
+        cb_font.toggled.connect(_on_font_toggle)
+        slider_font.valueChanged.connect(_on_font_slider)
+
+        v.addWidget(cb_font)
+        v.addWidget(row_font)
+
+        # Apply initial setting once the UI exists (safe if already applied elsewhere).
+        try:
+            _font_apply_now()
+        except Exception:
+            pass
 
         # -- Emoji labels toggle --------------------------------------------------------
         cb_emoji = QCheckBox("Emoji labels")
@@ -1626,7 +1824,14 @@ def install_settings_tab(main_window: QWidget) -> None:
             pass
 
 
-        # Auto-install animated buttons manager (applies saved settings)
+        # Auto-apply font size from saved settings
+        try:
+            _font_size_apply_from_qsettings(QtWidgets.QApplication.instance())
+        except Exception:
+            pass
+
+
+# Auto-install animated buttons manager (applies saved settings)
         try:
             app = QtWidgets.QApplication.instance()
             AnimatedButtonsManager.install(app)

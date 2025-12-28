@@ -42,7 +42,8 @@ class AnimatedButtonsManager(QtCore.QObject):
         animated_buttons_random_pick (legacy): unused (random now chooses per-hover)
     """
     _APP_PROP = "_fv_animated_buttons_manager"
-    _KEYWORDS = ("generate", "view results", "restart app", "restart app", "analyze", "clear program cache", "show qsettings in cmd")
+    _HOVER_MARK = "/* fv_animbtn_hover */"
+    _KEYWORDS = ("view results", "restart app", "restart app", "analyze", "clear program cache", "apply","show qsettings in cmd")
     _RANDOM_CHOICES = ("glow", "shift", "boomerang", "outline", "shimmer", "pop")
 
     def __init__(self, app: QtWidgets.QApplication):
@@ -147,14 +148,39 @@ class AnimatedButtonsManager(QtCore.QObject):
         # If enabled, nothing else needed until hover events occur.
 
     def _ensure_orig_style(self, btn: QtWidgets.QPushButton) -> str:
+        """Return the button's current *base* stylesheet (without our hover marker).
+        This is refreshed on every hover start so theme/font-size changes are preserved.
+        """
         try:
-            orig = btn.property("fv_animbtn_orig_style")
-            if orig is None:
-                orig = btn.styleSheet() or ""
-                btn.setProperty("fv_animbtn_orig_style", orig)
-            return str(orig or "")
+            ss = btn.styleSheet() or ""
+            mark = getattr(self, "_HOVER_MARK", "/* fv_animbtn_hover */")
+            if mark and mark in ss:
+                ss = ss.split(mark, 1)[0].rstrip()
+            btn.setProperty("fv_animbtn_orig_style", ss)
+            return str(ss or "")
         except Exception:
             return ""
+
+    def _apply_hover_qss(self, btn: QtWidgets.QPushButton, st: Dict[str, Any], qss: str) -> None:
+        """Apply hover-only visuals without nuking the button's existing stylesheet.
+        We append a marked block so we can strip it back out later.
+        """
+        try:
+            base = str(st.get("orig_style") or "")
+            mark = getattr(self, "_HOVER_MARK", "/* fv_animbtn_hover */")
+            # Defensive: if something already appended our mark, strip it first.
+            if mark and mark in base:
+                base = base.split(mark, 1)[0].rstrip()
+            combined = base
+            if qss:
+                combined = (base + "\n" + mark + "\n" + qss) if base else (mark + "\n" + qss)
+            if btn.styleSheet() != combined:
+                btn.setStyleSheet(combined)
+        except Exception:
+            try:
+                btn.setStyleSheet(qss or "")
+            except Exception:
+                pass
 
     def _start(self, btn: QtWidgets.QPushButton) -> None:
         if btn in self._active:
@@ -173,7 +199,7 @@ class AnimatedButtonsManager(QtCore.QObject):
         self._active[btn] = st
 
         # Some modes use a graphics effect; others are stylesheet-only.
-        if st.get("mode") in ("glow", "pop"):
+        if st.get("mode") in ("glow", "pop", "outline"):
             try:
                 if btn.graphicsEffect() is None:
                     eff = QtWidgets.QGraphicsDropShadowEffect(btn)
@@ -188,7 +214,12 @@ class AnimatedButtonsManager(QtCore.QObject):
 
     def _restore_btn(self, btn: QtWidgets.QPushButton, st: Dict[str, Any]) -> None:
         try:
-            btn.setStyleSheet(str(st.get("orig_style") or ""))
+            base = str(st.get("orig_style") or "")
+            mark = getattr(self, "_HOVER_MARK", "/* fv_animbtn_hover */")
+            if mark and mark in base:
+                base = base.split(mark, 1)[0].rstrip()
+            btn.setStyleSheet(base)
+            btn.setProperty("fv_animbtn_orig_style", base)
         except Exception:
             pass
         try:
@@ -296,7 +327,7 @@ class AnimatedButtonsManager(QtCore.QObject):
                         f" stop:0 {_rgba(c1, 255)},"
                         f" stop:1 {_rgba(c2, 255)});"
                     )
-                    btn.setStyleSheet(f"QPushButton{{ background: {grad} }}")
+                    self._apply_hover_qss(btn, st, f"QPushButton{{ background: {grad} }}")
 
                 elif st.get("mode", "glow") == "boomerang":
                     # Moving highlight band across the button
@@ -315,22 +346,56 @@ class AnimatedButtonsManager(QtCore.QObject):
                         f" stop:{c:.3f} {_rgba(bg,255)},"
                         f" stop:1 {_rgba(bg,255)});"
                     )
-                    btn.setStyleSheet(f"QPushButton{{ background: {grad} }}")
+                    self._apply_hover_qss(btn, st, f"QPushButton{{ background: {grad} }}")
 
 
                 elif st.get("mode", "glow") == "outline":
-                    # Neon outline pulse (border-only emphasis).
+                    # Neon outline pulse with color-changing (HSV) outline.
+                    # This stays "border-first" (not a full fill effect) while still feeling alive.
                     pulse = 0.35 + 0.35 * (0.5 + 0.5 * math.sin(2 * math.pi * phase))
                     alpha = int(90 + 140 * pulse)
-                    border_c = QtGui.QColor(accent.red(), accent.green(), accent.blue(), alpha)
+
+                    # Hue cycle across the outline (good on both light/dark themes).
+                    try:
+                        bl = int(base.lightness())
+                    except Exception:
+                        bl = 128
+                    if bl >= 180:
+                        sat, val = 170, 215
+                    elif bl <= 80:
+                        sat, val = 235, 240
+                    else:
+                        sat, val = 205, 230
+
+                    h = int((phase * 360.0) % 360)
+                    raw = QtGui.QColor.fromHsv(h, sat, val)
+                    # Blend a bit with the theme accent so it still feels consistent.
+                    border_c = _blend(accent, raw, 0.75)
+
                     # Slightly tint the background so the outline doesn't feel detached.
-                    bg = _blend(base, accent, 0.10 + 0.08 * math.sin(2 * math.pi * phase))
-                    btn.setStyleSheet(
+                    bg = _blend(base, border_c, 0.10 + 0.06 * math.sin(2 * math.pi * phase))
+
+                    self._apply_hover_qss(
+                        btn,
+                        st,
                         "QPushButton{"
                         f" background: {_rgba(bg,255)};"
-                        f" border: 2px solid {_rgba(border_c, alpha)};"
                         "}"
                     )
+                    # Outline glow via shadow effect (no border => no size hint jump).
+                    try:
+                        eff = btn.graphicsEffect()
+                        if not isinstance(eff, QtWidgets.QGraphicsDropShadowEffect):
+                            eff = QtWidgets.QGraphicsDropShadowEffect(btn)
+                            eff.setOffset(0, 0)
+                            btn.setGraphicsEffect(eff)
+                            st["added_effect"] = True
+                        blur = 10 + int(14 * pulse)
+                        eff.setBlurRadius(float(blur))
+                        eff.setColor(QtGui.QColor(border_c.red(), border_c.green(), border_c.blue(), alpha))
+                        eff.setOffset(0, 0)
+                    except Exception:
+                        pass
 
                 elif st.get("mode", "glow") == "shimmer":
                     # Diagonal shimmer band sliding across the button.
@@ -349,7 +414,7 @@ class AnimatedButtonsManager(QtCore.QObject):
                         f" stop:{c:.3f} {_rgba(bg,255)},"
                         f" stop:1 {_rgba(bg,255)});"
                     )
-                    btn.setStyleSheet(f"QPushButton{{ background: {grad} }}")
+                    self._apply_hover_qss(btn, st, f"QPushButton{{ background: {grad} }}")
 
                 elif st.get("mode", "glow") == "pop":
                     # Micro "pop" feeling via center highlight + pulsing shadow (no geometry changes).
@@ -361,7 +426,7 @@ class AnimatedButtonsManager(QtCore.QObject):
                         f" stop:0 {_rgba(center,255)},"
                         f" stop:1 {_rgba(edge,255)});"
                     )
-                    btn.setStyleSheet(f"QPushButton{{ background: {grad} }}")
+                    self._apply_hover_qss(btn, st, f"QPushButton{{ background: {grad} }}")
                     try:
                         eff = btn.graphicsEffect()
                         if isinstance(eff, QtWidgets.QGraphicsDropShadowEffect):
@@ -381,7 +446,7 @@ class AnimatedButtonsManager(QtCore.QObject):
                         f"qlineargradient(x1:0,y1:0,x2:1,y2:0,"
                         f" stop:0 {_rgba(c1,255)}, stop:1 {_rgba(base,255)});"
                     )
-                    btn.setStyleSheet(f"QPushButton{{ background: {grad} }}")
+                    self._apply_hover_qss(btn, st, f"QPushButton{{ background: {grad} }}")
                     try:
                         eff = btn.graphicsEffect()
                         if isinstance(eff, QtWidgets.QGraphicsDropShadowEffect):

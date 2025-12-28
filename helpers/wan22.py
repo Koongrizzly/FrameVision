@@ -172,6 +172,7 @@ class Wan22Pane(QWidget):
         engine_row = QHBoxLayout()
         self.cmb_engine = QComboBox()
         self.cmb_engine.addItem("WAN 2.2", "wan22")
+        self.cmb_engine.addItem("WAN 2.2 UI", "wan22_ui")
         self.cmb_engine.addItem("HunyuanVideo 1.5", "hunyuan15")
         engine_row.addWidget(QLabel("Engine:"))
         engine_row.addWidget(self.cmb_engine)
@@ -1520,12 +1521,12 @@ class Wan22Pane(QWidget):
 
         try:
             if getattr(self, "_engine_stack", None) is not None:
-                self._engine_stack.setCurrentIndex(0 if key == "wan22" else 1)
+                self._engine_stack.setCurrentIndex(0 if key in ("wan22", "wan22_ui") else 1)
         except Exception:
             pass
 
         try:
-            if key == "wan22":
+            if key in ("wan22", "wan22_ui"):
                 self.banner.setText("Video Creation with Wan 2.2 5B")
             else:
                 self.banner.setText("Video Creation with HunyuanVideo 1.5")

@@ -204,7 +204,7 @@ except Exception:
     pass
 # --- END: Image allocation limit bump ---
 
-from PySide6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QGridLayout, QLabel, QPushButton, QFileDialog, QTabWidget, QSplitter, QListWidget, QListWidgetItem, QLineEdit, QFormLayout, QMessageBox, QComboBox, QSpinBox, QDoubleSpinBox, QTextEdit, QCheckBox, QTreeWidget, QTreeWidgetItem, QHeaderView, QStyle, QSlider, QToolButton, QSizePolicy, QScrollArea, QFrame, QGroupBox, QScrollArea, QFrame)
+from PySide6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QGridLayout, QLabel, QPushButton, QFileDialog, QTabWidget, QSplitter, QStackedWidget, QListWidget, QListWidgetItem, QLineEdit, QFormLayout, QMessageBox, QComboBox, QSpinBox, QDoubleSpinBox, QTextEdit, QCheckBox, QTreeWidget, QTreeWidgetItem, QHeaderView, QStyle, QSlider, QToolButton, QSizePolicy, QScrollArea, QFrame, QGroupBox, QScrollArea, QFrame)
 from PySide6.QtMultimedia import QMediaPlayer, QAudioOutput, QVideoSink
 from helpers.tools_tab import InstantToolsPane
 from helpers.themes import QSS_DAY, QSS_EVENING, QSS_NIGHT
@@ -862,6 +862,21 @@ class VideoPane(QWidget):
             self.player.setAudioOutput(self.audio)
             self.sink = QVideoSink(self)
             self.player.setVideoSink(self.sink)
+            # If a tool has redirected video output, honor it after rebuild.
+            try:
+                ov = getattr(self, "_video_output_override", None)
+                if ov:
+                    mode, target = ov
+                    if str(mode) == "sink":
+                        self.player.setVideoSink(target)
+                    elif str(mode) == "output":
+                        try:
+                            self.player.setVideoSink(None)
+                        except Exception:
+                            pass
+                        self.player.setVideoOutput(target)
+            except Exception:
+                pass
             self.sink.videoFrameChanged.connect(self._on_frame)
             self.player.positionChanged.connect(self.on_pos)
             self.player.durationChanged.connect(self.on_dur)
@@ -1245,12 +1260,52 @@ class VideoPane(QWidget):
         except Exception:
             pass
 
+    # --- Tool video output override (for temporary UI takeovers) ---
+    def set_video_output_override(self, mode: str, target) -> None:
+        """mode='sink' uses QVideoSink. mode='output' uses Qt's video output (e.g., QGraphicsVideoItem)."""
+        try:
+            self._video_output_override = (str(mode or ""), target)
+        except Exception:
+            self._video_output_override = None
+        try:
+            m = str(mode or "")
+            if m == "sink":
+                try:
+                    self.player.setVideoOutput(None)
+                except Exception:
+                    pass
+                self.player.setVideoSink(target)
+            elif m == "output":
+                try:
+                    self.player.setVideoSink(None)
+                except Exception:
+                    pass
+                self.player.setVideoOutput(target)
+        except Exception:
+            pass
+
+    def clear_video_output_override(self) -> None:
+        try:
+            self._video_output_override = None
+        except Exception:
+            pass
+        try:
+            try:
+                self.player.setVideoOutput(None)
+            except Exception:
+                pass
+            self.player.setVideoSink(self.sink)
+        except Exception:
+            pass
+
+
     def __init__(self,parent=None):
         # TODO: Future: audio visualizer / track info / thumbnail for audio-only playback
         # FPS throttle stripped — keep inert placeholders
         self._render_timer = None
         self._target_fps = None
         super().__init__(parent)
+        self._video_output_override = None
         self.player = QMediaPlayer(self); self.audio = QAudioOutput(self); self.player.setAudioOutput(self.audio)
         self.sink = QVideoSink(self); self.player.setVideoSink(self.sink); self.sink.videoFrameChanged.connect(self._on_frame)
         # Autoplay state
@@ -1986,7 +2041,68 @@ class VideoPane(QWidget):
             pass
 
 
-    def _open_via_dialog(self): self.parent().parent().parent().open_file()
+    def _open_via_dialog(self):
+            """Open File dialog via MainWindow (robust to layout changes)."""
+            # Prefer the top-level window (MainWindow)
+            try:
+                w = self.window()
+                if w is not None and hasattr(w, "open_file"):
+                    return w.open_file()
+            except Exception:
+                pass
+
+            # Fall back to stored main reference (some tools attach self.main)
+            try:
+                m = getattr(self, "main", None)
+                if m is not None and hasattr(m, "open_file"):
+                    return m.open_file()
+            except Exception:
+                pass
+
+            # Walk parent chain (handles reparented layouts/splitters)
+            try:
+                p = self.parent()
+                hops = 0
+                while p is not None and hops < 16:
+                    if hasattr(p, "open_file"):
+                        try:
+                            return p.open_file()
+                        except Exception:
+                            pass
+                    p = p.parent()
+                    hops += 1
+            except Exception:
+                pass
+
+            # Last resort: open directly and route into this VideoPane
+            try:
+                d = config.get("last_open_dir", str(ROOT))
+                flt = ("Media files (*.mp4 *.mov *.mkv *.avi *.webm *.png *.jpg *.jpeg *.bmp *.webp "
+                       "*.mp3 *.wav *.flac *.m4a *.aac *.ogg *.opus *.wma *.aif *.aiff);;"
+                       "Video files (*.mp4 *.mov *.mkv *.avi *.webm);;"
+                       "Images (*.png *.jpg *.jpeg *.bmp *.webp);;"
+                       "Audio files (*.mp3 *.wav *.flac *.m4a *.aac *.ogg *.opus *.wma *.aif *.aiff);;"
+                       "All files (*.*)")
+                fn, _ = QFileDialog.getOpenFileName(self, "Open media", d, flt)
+                if fn:
+                    p = Path(fn)
+                    config["last_open_dir"] = str(p.parent)
+                    try:
+                        save_config()
+                    except Exception:
+                        pass
+                    try:
+                        w = self.window()
+                        if w is not None and hasattr(w, "current_path"):
+                            w.current_path = p
+                    except Exception:
+                        pass
+                    try:
+                        self.open(p)
+                    except Exception:
+                        pass
+            except Exception:
+                pass
     
     def open(self, path: Path):
         # Unified open: images -> QPixmap (GIF -> QMovie), audio -> QMediaPlayer, video -> QMediaPlayer
@@ -3302,7 +3418,7 @@ class QueuePane(QWidget):
 
     MAX_DONE_KEEP    = 50
 
-    MAX_DONE_SHOW    = 50
+    MAX_DONE_SHOW    = 55
 
     MAX_FAILED_KEEP  = 50
 
@@ -3314,7 +3430,7 @@ class QueuePane(QWidget):
         from PySide6.QtCore import QUrl, QFileSystemWatcher
 
         # Timers (keep internal refresh cadence intact)
-        self.auto_timer = QTimer(self); self.auto_timer.setInterval(5000); self.auto_timer.timeout.connect(self.request_refresh)
+        self.auto_timer = QTimer(self); self.auto_timer.setInterval(7000); self.auto_timer.timeout.connect(self.request_refresh)
         self.watch_timer = QTimer(self); self.watch_timer.setInterval(1300); self.watch_timer.timeout.connect(self.request_refresh)
         self.worker_timer = QTimer(self); self.worker_timer.setInterval(2500); self.worker_timer.timeout.connect(self._update_worker_led)
         # Pause queue refreshing while video is playing to prevent playback stutter.
@@ -5045,6 +5161,63 @@ class MainWindow(QMainWindow):
 
 
 
+    # --- Left pane override: allow tools to temporarily occupy the big left media area ---
+    def set_left_override_widget(self, w: QWidget, owner: str = "tool") -> None:
+        """Show a tool-provided widget in the left pane (temporarily replacing the VideoPane visually)."""
+        try:
+            if w is None:
+                self.clear_left_override_widget(owner=owner)
+                return
+            stack = getattr(self, "left_stack", None)
+            if stack is None:
+                return
+            try:
+                self._left_override_owner = owner or "tool"
+                self._left_override_widget = w
+            except Exception:
+                pass
+            try:
+                idx = stack.indexOf(w)
+            except Exception:
+                idx = -1
+            if idx is None or idx < 0:
+                try:
+                    stack.addWidget(w)
+                except Exception:
+                    pass
+            try:
+                stack.setCurrentWidget(w)
+            except Exception:
+                pass
+        except Exception:
+            pass
+
+    def clear_left_override_widget(self, owner=None) -> None:
+        """Return left pane to the normal VideoPane. If owner is set, only clears if it matches."""
+        try:
+            if owner:
+                cur_owner = getattr(self, "_left_override_owner", None)
+                if cur_owner and str(cur_owner) != str(owner):
+                    return
+        except Exception:
+            pass
+        try:
+            stack = getattr(self, "left_stack", None)
+            if stack is None:
+                return
+            try:
+                stack.setCurrentWidget(self.video)
+            except Exception:
+                pass
+        except Exception:
+            pass
+        try:
+            self._left_override_owner = None
+            self._left_override_widget = None
+        except Exception:
+            pass
+
+
     def __init__(self):
         super().__init__()
         self.setWindowTitle(APP_NAME + " V2.1 " + TAGLINE)
@@ -5299,7 +5472,26 @@ class MainWindow(QMainWindow):
             splitter.setObjectName('main_splitter')
         except Exception:
             pass
-        left = QWidget(); lv = QVBoxLayout(left); lv.addWidget(self.video)
+        self.left_stack = QStackedWidget()
+        try:
+            self.left_stack.setObjectName('left_stack')
+        except Exception:
+            pass
+        try:
+            self.left_stack.addWidget(self.video)
+            self.left_stack.setCurrentWidget(self.video)
+        except Exception:
+            pass
+        self._left_override_widget = None
+        self._left_override_owner = None
+
+        left = QWidget(); lv = QVBoxLayout(left)
+        try:
+            lv.setContentsMargins(0, 0, 0, 0)
+            lv.setSpacing(0)
+        except Exception:
+            pass
+        lv.addWidget(self.left_stack)
         right = QWidget(); rv = QVBoxLayout(right); rv.addWidget(self.hud); rv.addWidget(self.tabs)
         left.setMinimumSize(320, 240); right.setMinimumSize(360, 240)
         self.tabs.setMinimumWidth(360)

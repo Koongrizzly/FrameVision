@@ -19,6 +19,7 @@ import random
 import shutil
 import subprocess
 import tempfile
+import re
 from datetime import datetime
 from dataclasses import dataclass, replace
 from typing import List, Optional, Tuple, Dict
@@ -266,6 +267,59 @@ def _ensure_dir(path: str) -> None:
 
 
 
+
+# ------------------------------------------------------------------
+# Filename sanitizers (Windows-safe)
+# ------------------------------------------------------------------
+
+_INVALID_FILENAME_CHARS = set('<>:"/\\|?*')
+
+def _sanitize_stem(stem: str, fallback: str = "output") -> str:
+    """Return a filesystem-safe filename stem (no extension)."""
+    try:
+        s = str(stem)
+    except Exception:
+        s = fallback
+    s = s.strip().replace(" ", "_")
+    # Replace control chars and Windows-forbidden characters.
+    out = []
+    for ch in s:
+        o = ord(ch)
+        if o < 32 or ch in _INVALID_FILENAME_CHARS:
+            out.append("_")
+        else:
+            out.append(ch)
+    s = "".join(out)
+    s = re.sub(r"_+", "_", s).strip(" ._")
+    if not s:
+        s = fallback
+    # Keep it reasonably short to avoid path length issues.
+    if len(s) > 120:
+        s = s[:120].rstrip(" ._")
+        if not s:
+            s = fallback
+    return s
+
+def _sanitize_filename(name: str, fallback: str = "output.mp4") -> str:
+    """Return a filesystem-safe filename (keeps extension if present)."""
+    try:
+        n = str(name)
+    except Exception:
+        return fallback
+    n = n.strip()
+    stem, ext = os.path.splitext(n)
+    safe_stem = _sanitize_stem(stem, fallback=os.path.splitext(fallback)[0] or "output")
+    safe_ext = ext
+    # If extension has forbidden chars, drop it.
+    if any((ch in _INVALID_FILENAME_CHARS or ord(ch) < 32) for ch in safe_ext):
+        safe_ext = ""
+    out = safe_stem + safe_ext
+    # Avoid empty result
+    if not out or out.strip(" ._") == "":
+        out = fallback
+    return out
+
+
 def _load_clip_presets() -> List[Tuple[str, str, str]]:
     """Load 1-click clip presets from JSON, with minimal built-in fallback.
 
@@ -410,6 +464,9 @@ class TimelineSegment:
     cine_freeze_zoom: float = 0.0
     cine_tear_v_strength: float = 0.0
     cine_tear_h_strength: float = 0.0
+    # Color-cycle glitch (cinematic)
+    cine_color_cycle: bool = False
+    cine_color_cycle_speed_ms: int = 400
     cine_stutter_repeats: int = 0
     cine_reverse_len: float = 0.0
     cine_reverse_window: float = 0.0
@@ -438,9 +495,6 @@ class TimelineSegment:
     cine_flip: bool = False
     cine_rotate: bool = False
     cine_rotate_degrees: float = 0.0
-    # Color-cycle glitch (cinematic)
-    cine_color_cycle: bool = False
-    cine_color_cycle_speed_ms: int = 350
     # Camera motion hits (dolly / Ken Burns)
     cine_dolly: bool = False
     cine_dolly_strength: float = 0.0
@@ -930,6 +984,8 @@ def build_timeline(
     cine_tear_v_strength: float = 0.7,
     cine_tear_h: bool = False,
     cine_tear_h_strength: float = 0.7,
+    cine_color_cycle: bool = False,
+    cine_color_cycle_speed_ms: int = 400,
     cine_reverse: bool = False,
     cine_speedup_forward: bool = False,
     cine_speedup_forward_factor: float = 1.5,
@@ -956,8 +1012,6 @@ def build_timeline(
     cine_flip: bool = False,
     cine_rotate: bool = False,
     cine_rotate_max_degrees: float = 20.0,
-    cine_color_cycle: bool = False,
-    cine_color_cycle_speed_ms: int = 350,
     cine_multiply: bool = False,
     cine_multiply_screens: int = 4,
     cine_multiply_random: bool = False,
@@ -1149,11 +1203,11 @@ def build_timeline(
         if cine_tear_h:
             enabled_effects.append("tear_h")
 
-        if cine_stutter:
-            enabled_effects.append("stutter")
-
         if cine_color_cycle:
             enabled_effects.append("color_cycle")
+
+        if cine_stutter:
+            enabled_effects.append("stutter")
         if cine_reverse:
             enabled_effects.append("reverse")
         if cine_speedup_forward:
@@ -1252,11 +1306,11 @@ def build_timeline(
                     try:
                         ms = int(cine_color_cycle_speed_ms)
                     except Exception:
-                        ms = 350
+                        ms = 400
                     ms = max(100, min(1000, ms))
+                    # Snap to 50ms steps like the other speed sliders.
                     ms = int(round(ms / 50.0) * 50)
                     seg.cine_color_cycle_speed_ms = ms
-
                 elif effect_name == "reverse":
                     seg.cine_reverse = True
                     seg.cine_reverse_len = float(max(0.10, min(1.5, cine_reverse_len)))
@@ -2062,7 +2116,7 @@ def build_timeline(
         # Transition style mapping (must match the UI order in "Transitions" + "Manage transitions")
         # 0  Soft film dissolves           -> real between-clip dissolve (stitched later)
         # 1  Hard cuts                     -> no transition
-        # 2  Scale punch (zoom)            -> in-clip zoom pulse
+        # 2  Scale punch (zoom)            -> real xfade punch (stitched later)
         # 3  Shimmer blur (shiny)           -> real blurred crossfade (stitched later)
 
         # 4  Iris reveal (circle)          -> real stitched iris transition (xfade)
@@ -2083,7 +2137,7 @@ def build_timeline(
             transition = "t_exposure_dissolve"
 
         elif mode_for_segment == 2:  # Scale punch (zoom)
-            transition = "t_smooth_zoom"
+            transition = "t_scale_punch"
 
         elif mode_for_segment == 3:  # Shimmer blur (shiny)
             transition = "t_shimmer_blur"
@@ -2257,7 +2311,7 @@ def build_timeline(
                     if energy == "high" and random.random() < 0.22:
                         transition = "flashcut"
                     else:
-                        transition = "t_smooth_zoom"
+                        transition = "t_scale_punch"
                 elif mode_for_segment == 3:  # Shimmer blur (shiny)
                     transition = "t_shimmer_blur"
                 elif mode_for_segment == 4:  # Iris reveal (circle)
@@ -2715,6 +2769,7 @@ class RenderWorker(QThread):
             # - extend that segment by exactly the overlap at render time (prevents end-freeze padding)
             # - reuse the same duration during stitching (stable timing)
             dissolve_ids = {"t_exposure_dissolve", "t_luma_fade"}
+            scale_punch_ids = {"t_scale_punch"}
             push_ids = {"t_push"}
             slitscan_ids = {"t_slitscan_push"}
             wipe_ids = {"t_wipe"}
@@ -2725,7 +2780,7 @@ class RenderWorker(QThread):
             shimmer_ids = {"t_shimmer_blur"}
             distance_ids = {"t_distance"}
             wind_ids = {"t_wind_smears"}
-            stitch_ids = dissolve_ids | push_ids | slitscan_ids | wipe_ids | curtain_ids | pixelize_ids | iris_ids | radial_ids | shimmer_ids | distance_ids | wind_ids
+            stitch_ids = dissolve_ids | push_ids | slitscan_ids | wipe_ids | curtain_ids | pixelize_ids | iris_ids | radial_ids | shimmer_ids | distance_ids | wind_ids | scale_punch_ids
 
             def _seg_expected_out_len(s: TimelineSegment) -> float:
                 try:
@@ -2877,6 +2932,7 @@ class RenderWorker(QThread):
                     # Mild motion blur via temporal blend
                     vf_parts.append("tblend=all_mode=average,framestep=1")
 
+                cine_start = len(vf_parts)
                 # Cinematic one-off effects                # Cinematic one-off effects
                 if getattr(seg, "cine_freeze", False):
                     # Shutter-pop: quick punch + glossy smear (no speed change).
@@ -3040,33 +3096,19 @@ class RenderWorker(QThread):
                     )
 
                 if getattr(seg, "cine_color_cycle", False):
-                    # Cinematic color-cycle glitch: full-spectrum hue cycling with a subtle early smear.
+                    # Color-cycle glitch (cinematic): full-spectrum hue rotation.
+                    # Speed is interpreted as milliseconds per full 360° cycle.
                     try:
-                        ms = int(getattr(seg, "cine_color_cycle_speed_ms", 350) or 350)
+                        ms = int(getattr(seg, "cine_color_cycle_speed_ms", 400) or 400)
                     except Exception:
-                        ms = 350
+                        ms = 400
                     ms = max(100, min(1000, ms))
-                    ms = int(round(ms / 50.0) * 50)
-                    period_s = ms / 1000.0
-                    # Interpret slider as ms per full hue cycle.
-                    rate = 360.0 / max(0.05, period_s)  # degrees/sec
-                    vf_parts.append("format=yuv420p")
-                    vf_parts.append(
-                        f"hue=h='t*{rate:.1f}':s=1.35"
-                    )
-                    vf_parts.append("eq=contrast=1.05:saturation=1.18")
-                    # Smear only near the start so it reads glitchy, not blurry.
-                    try:
-                        seg_len = float(getattr(seg, "duration", 0.0) or 0.0)
-                    except Exception:
-                        seg_len = 0.0
-                    smear_d = 0.30
-                    if seg_len > 0.0:
-                        smear_d = max(0.12, min(0.35, seg_len * 0.30))
-                    vf_parts.append(
-                        f"tmix=frames=3:weights='1 0.75 0.45':enable='between(t,0,{smear_d:.3f})'"
-                    )
-                    vf_parts.append("format=yuv420p")
+                    # Convert ms-per-cycle into degrees-per-second.
+                    rate = 360000.0 / float(ms)
+                    # Use mod() to keep hue stable on all ffmpeg builds.
+                    vf_parts.append(f"hue=h='mod(t*{rate:.3f},360)':s=1.35")
+                    vf_parts.append("eq=contrast=1.06:saturation=1.18")
+
 
                 if getattr(seg, "cine_reverse", False):
                     # Reverse-bounce: optionally repeat a short reversed window
@@ -3318,6 +3360,10 @@ class RenderWorker(QThread):
                             f"crop=iw/{pan_zoom:.3f}:ih/{pan_zoom:.3f}:{x_expr}:{y_expr}"
                         )
 
+                cine_end = len(vf_parts)
+
+                impact_start = len(vf_parts)
+
                 # Break impact FX (first beat after a break)
                 if getattr(seg, "is_break_impact", False):
                     # Flash strobe: short white flashes at the very start (club strobe style).
@@ -3482,6 +3528,8 @@ class RenderWorker(QThread):
                             "eq=contrast=1.06:saturation=1.18"
                         )
 
+                impact_end = len(vf_parts)
+
                 # Transitions using a small effect library (all short and fade-safe)
                 if seg.transition == "flashcut":
                     # White flash: short brightness pop at the start (~30–60ms).
@@ -3552,7 +3600,7 @@ class RenderWorker(QThread):
                     # Directional push / slit-scan smear push are real between-clip transitions.
                     # It is applied later during stitching, so we do nothing here.
                     pass
-                elif seg.transition in ("t_luma_fade", "t_exposure_dissolve", "t_wipe", "t_curtain_open", "t_pixelize", "t_distance", "t_wind_smears"):
+                elif seg.transition in ("t_luma_fade", "t_exposure_dissolve", "t_scale_punch", "t_wipe", "t_curtain_open", "t_pixelize", "t_distance", "t_wind_smears"):
                     # Wipe / exposure dissolve are real between-clip transitions.
                     # It is applied later during the stitching step so we do NOT fade to black here.
                     pass
@@ -3631,8 +3679,46 @@ class RenderWorker(QThread):
                         if base_vf_parts:
                             base_vf_parts = base_vf_parts + [f"setpts=PTS/{sf}"]
 
-                vf_arg = ",".join(vf_parts) if vf_parts else None
-                safe_vf_arg = ",".join(base_vf_parts) if base_vf_parts else None
+                def _vf_join(parts):
+                    if not parts:
+                        return None
+                    p = list(parts)
+                    # Make NVENC happy / keep stitching stable.
+                    # Only add a final format if the chain doesn't already end in yuv420p.
+                    tail = ",".join(p[-3:]) if len(p) >= 3 else ",".join(p)
+                    if "format=yuv420p" not in tail:
+                        p.append("format=yuv420p")
+                    return ",".join(p)
+
+                vf_arg = _vf_join(vf_parts)
+                safe_vf_arg = _vf_join(base_vf_parts)
+
+                vf_no_cine_arg = None
+                vf_no_impact_arg = None
+                vf_no_cine_no_impact_arg = None
+                try:
+                    if "cine_start" in locals() and "cine_end" in locals():
+                        if isinstance(cine_start, int) and isinstance(cine_end, int) and cine_end > cine_start:
+                            parts_no_cine = vf_parts[:cine_start] + vf_parts[cine_end:]
+                            vf_no_cine_arg = _vf_join(parts_no_cine)
+                except Exception:
+                    vf_no_cine_arg = None
+                try:
+                    if "impact_start" in locals() and "impact_end" in locals():
+                        if isinstance(impact_start, int) and isinstance(impact_end, int) and impact_end > impact_start:
+                            parts_no_impact = vf_parts[:impact_start] + vf_parts[impact_end:]
+                            vf_no_impact_arg = _vf_join(parts_no_impact)
+
+                            if "cine_start" in locals() and "cine_end" in locals():
+                                if isinstance(cine_start, int) and isinstance(cine_end, int) and cine_end >= cine_start:
+                                    # Impact section comes after cinematic section in this filter build.
+                                    a = vf_parts[:cine_start]
+                                    b = vf_parts[cine_end:impact_start]
+                                    c = vf_parts[impact_end:]
+                                    vf_no_cine_no_impact_arg = _vf_join(a + b + c)
+                except Exception:
+                    vf_no_impact_arg = None
+                    vf_no_cine_no_impact_arg = None
 
 
                 # Base ffmpeg command for this segment (input, trim, no audio)
@@ -4061,35 +4147,48 @@ class RenderWorker(QThread):
                     out_part,
                 ]
 
-                # First attempt: full filter chain (resolution + FX + transitions)
-                cmd = list(base_cmd)
+                                # Attempt filter chains in a safe order:
+                # 1) full chain
+                # 2) without cinematic one-offs (keeps other FX)
+                # 3) without cinematic + impact FX
+                # 4) safe chain (resolution-only)
+                attempts = []
                 if vf_arg:
-                    cmd += ["-vf", vf_arg]
-                cmd += encode_args
-                code, out = _run_ffmpeg(cmd)
+                    attempts.append(("full", vf_arg))
+                if vf_no_cine_arg and vf_no_cine_arg != vf_arg:
+                    attempts.append(("no_cine", vf_no_cine_arg))
+                if vf_no_cine_no_impact_arg and vf_no_cine_no_impact_arg not in (vf_arg, vf_no_cine_arg):
+                    attempts.append(("no_cine_no_impact", vf_no_cine_no_impact_arg))
+                if safe_vf_arg and safe_vf_arg not in (vf_arg, vf_no_cine_arg, vf_no_cine_no_impact_arg):
+                    attempts.append(("safe", safe_vf_arg))
+                if not attempts:
+                    attempts.append(("none", None))
 
-                # Second attempt: only resolution scaling/padding (if any)
-                if (code != 0 or not os.path.exists(out_part)) and safe_vf_arg and safe_vf_arg != vf_arg:
-                    try:
-                        if vf_arg:
-                            # Helps diagnose cases where a new FX filter isn't supported on a user's ffmpeg build.
-                            tail = (out or '').splitlines()[-1] if out else ''
-                            print(f"[mclip] Segment {i+1}: FX filter failed; retrying safe chain. {tail}")
-                    except Exception:
-                        pass
-                    try:
-                        if os.path.exists(out_part):
-                            os.remove(out_part)
-                    except Exception:
-                        pass
+                code = 1
+                out = ""
+                for ai, (aname, avf) in enumerate(attempts):
                     cmd = list(base_cmd)
-                    cmd += ["-vf", safe_vf_arg]
+                    if avf:
+                        cmd += ["-vf", avf]
                     cmd += encode_args
                     code, out = _run_ffmpeg(cmd)
 
-                # Final attempt: minimal, ultra-safe scaling/padding only.
-                # We still try to honor the requested target resolution if one
-                # was set, but drop all cinematic FX/transition filters.
+                    if code == 0 and os.path.exists(out_part):
+                        break
+
+                    if ai < len(attempts) - 1:
+                        # Re-try with a safer chain, but keep the segment alive.
+                        try:
+                            tail = (out or "").splitlines()[-1] if out else ""
+                            print(f"[Videoclip_creator] Segment {i+1}: FX effect filter failed; no worries, we are defaulting to safe chain. {tail}")
+                        except Exception:
+                            pass
+                        try:
+                            if os.path.exists(out_part):
+                                os.remove(out_part)
+                        except Exception:
+                            pass
+
                 if code != 0 or not os.path.exists(out_part):
                     try:
                         if os.path.exists(out_part):
@@ -4201,6 +4300,7 @@ class RenderWorker(QThread):
                     concat_video = parts[0]
             else:
                 dissolve_ids = {"t_exposure_dissolve", "t_luma_fade"}
+                scale_punch_ids = {"t_scale_punch"}
                 push_ids = {"t_push"}
                 slitscan_ids = {"t_slitscan_push"}
                 wipe_ids = {"t_wipe"}
@@ -4211,7 +4311,7 @@ class RenderWorker(QThread):
                 shimmer_ids = {"t_shimmer_blur"}
                 distance_ids = {"t_distance"}
                 wind_ids = {"t_wind_smears"}
-                stitch_ids = dissolve_ids | push_ids | slitscan_ids | wipe_ids | curtain_ids | pixelize_ids | iris_ids | radial_ids | shimmer_ids | distance_ids | wind_ids
+                stitch_ids = dissolve_ids | push_ids | slitscan_ids | wipe_ids | curtain_ids | pixelize_ids | iris_ids | radial_ids | shimmer_ids | distance_ids | wind_ids | scale_punch_ids
                 use_stitch = False
                 total_overlap = 0.0
 
@@ -4365,6 +4465,143 @@ class RenderWorker(QThread):
                                     use_stitch = True
                                     total_overlap += float(d)
 
+
+                            elif trans in scale_punch_ids:
+
+                                # "Scale punch" (zoom-burst) transition:
+                                # a punchy zoom-in at the cut, with a short flash + motion smear,
+                                # while still being a *real* xfade overlap (editor-style).
+                                dur_a = _ffprobe_duration(self.ffprobe, cur) or 0.0
+                                dur_b = _ffprobe_duration(self.ffprobe, parts[j]) or 0.0
+
+                                try:
+                                    d = float(getattr(self.segments[j], "_stitch_dur", 0.0) or 0.0)
+                                except Exception:
+                                    d = 0.0
+
+                                if d <= 0.0:
+                                    d = random.uniform(0.22, 0.48)
+
+                                if dur_a > 0.0 and dur_b > 0.0:
+                                    max_allowed = max(0.12, min(dur_a, dur_b) * 0.28)
+                                    d = min(d, max_allowed)
+
+                                d = max(0.12, min(1.0, float(d)))
+                                offset = max(0.0, (dur_a if dur_a > 0.0 else 0.0) - d)
+
+                                # Strength varies slightly so it doesn't feel copy/pasted.
+                                z0 = random.uniform(1.12, 1.22)
+                                z_amp = max(0.01, z0 - 1.0)
+
+                                # Apply the "punch" ONLY inside the overlap window by trimming.
+                                t0 = offset
+                                t1 = offset + d
+
+                                z_expr = f"max(1.0\\, {z0:.4f} - ({z_amp:.4f})*t/{d:.4f})"
+
+                                mid_fx = (
+                                    # Pop + tiny flash at the start
+                                    "eq=contrast=1.06:brightness=0.02:saturation=1.10,"
+                                    "eq=brightness=0.14:contrast=1.12:enable='lt(t,0.060)',"
+                                    # Motion smear for the first fraction of the overlap (adds energy)
+                                    "tmix=frames=5:weights='1 0.85 0.65 0.45 0.25':enable='between(t,0,0.180)',"
+                                    # Zoom-burst (scale up then settle) + center crop back to output size
+                                    f"scale=iw*({z_expr}):ih*({z_expr}):eval=frame,"
+                                    f"crop={stitch_w}:{stitch_h}:(iw-{stitch_w})/2:(ih-{stitch_h})/2"
+                                )
+
+                                fc = (
+                                    f"[0:v]{stitch_norm}[a];"
+                                    f"[1:v]{stitch_norm}[b];"
+                                    f"[a][b]xfade=transition=fade:duration={d:.3f}:offset={offset:.3f}[x];"
+                                    f"[x]split=3[x0][x1][x2];"
+                                    f"[x0]trim=0:{t0:.3f},setpts=PTS-STARTPTS[pre];"
+                                    f"[x1]trim={t0:.3f}:{t1:.3f},setpts=PTS-STARTPTS,{mid_fx}[mid];"
+                                    f"[x2]trim={t1:.3f},setpts=PTS-STARTPTS[post];"
+                                    f"[pre][mid][post]concat=n=3:v=1:a=0,format=yuv420p[v]"
+                                )
+
+                                cmd = [
+                                    self.ffmpeg,
+                                    "-y",
+                                    "-i",
+                                    cur,
+                                    "-i",
+                                    parts[j],
+                                    "-filter_complex",
+                                    fc,
+                                    "-map",
+                                    "[v]",
+                                    "-c:v",
+                                    "h264_nvenc",
+                                    "-preset",
+                                    "p3",
+                                    "-cq",
+                                    "19",
+                                    "-pix_fmt",
+                                    "yuv420p",
+                                    out_tmp,
+                                ]
+                                code, out = _run_ffmpeg(cmd)
+
+                                if code != 0 or not os.path.exists(out_tmp):
+                                    cmd = [
+                                        self.ffmpeg,
+                                        "-y",
+                                        "-i",
+                                        cur,
+                                        "-i",
+                                        parts[j],
+                                        "-filter_complex",
+                                        fc,
+                                        "-map",
+                                        "[v]",
+                                        "-c:v",
+                                        "libx264",
+                                        "-preset",
+                                        "veryfast",
+                                        "-crf",
+                                        "18",
+                                        "-pix_fmt",
+                                        "yuv420p",
+                                        out_tmp,
+                                    ]
+                                    code, out = _run_ffmpeg(cmd)
+
+                                # Last resort: if this punch filter chain isn't supported in this ffmpeg build,
+                                # fall back to a normal fade dissolve so the run still completes.
+                                if code != 0 or not os.path.exists(out_tmp):
+                                    fc2 = (
+                                        f"[0:v]{stitch_norm}[a];"
+                                        f"[1:v]{stitch_norm}[b];"
+                                        f"[a][b]xfade=transition=fade:duration={d:.3f}:offset={offset:.3f},format=yuv420p[v]"
+                                    )
+                                    cmd = [
+                                        self.ffmpeg,
+                                        "-y",
+                                        "-i",
+                                        cur,
+                                        "-i",
+                                        parts[j],
+                                        "-filter_complex",
+                                        fc2,
+                                        "-map",
+                                        "[v]",
+                                        "-c:v",
+                                        "libx264",
+                                        "-preset",
+                                        "veryfast",
+                                        "-crf",
+                                        "18",
+                                        "-pix_fmt",
+                                        "yuv420p",
+                                        out_tmp,
+                                    ]
+                                    code, out = _run_ffmpeg(cmd)
+
+                                if code == 0 and os.path.exists(out_tmp):
+                                    use_stitch = True
+                                    total_overlap += float(d)
                             elif trans in slitscan_ids:
 
                                 # Slit-scan smear push: real stitched push with a modern smear over the overlap window.
@@ -5745,11 +5982,11 @@ class RenderWorker(QThread):
             # mux with audio
             self.progress.emit(95, "Merging with audio...")
             if self.out_name_override:
-                out_final = os.path.join(self.output_dir, str(self.out_name_override))
+                out_final = os.path.join(self.output_dir, _sanitize_filename(str(self.out_name_override)))
             else:
                 base = os.path.splitext(os.path.basename(self.audio_path))[0]
                 ts = datetime.now().strftime("%d%m%H%M")  # ddmmhhmm to avoid overwrites
-                safe_base = base.strip().replace(" ", "_")
+                safe_base = _sanitize_stem(base)
                 out_name = f"{safe_base}_clip_{ts}.mp4"
                 out_final = os.path.join(self.output_dir, out_name)
             cmd = [
@@ -6371,6 +6608,29 @@ class AutoMusicSyncWidget(QWidget):
         row_cine_tear_h.addWidget(self.label_cine_tear_h_strength)
         cine_layout.addLayout(row_cine_tear_h)
 
+        # Color-cycle glitch (cinematic)
+        row_cine_color_cycle = QHBoxLayout()
+        self.check_cine_color_cycle = QCheckBox("Color-cycle glitch", self.cine_options)
+        self.check_cine_color_cycle.setToolTip(
+            "Occasionally add a short hue-cycle glitch (like the break/drop Color-cycle),\n"
+            "but as a cinematic one-off effect.\n"
+            "Speed controls how fast the hue cycles: 100ms = very fast, 1000ms = slow."
+        )
+        row_cine_color_cycle.addWidget(self.check_cine_color_cycle)
+        label_cine_color_cycle = QLabel("Speed:", self.cine_options)
+        row_cine_color_cycle.addWidget(label_cine_color_cycle)
+        self.slider_cine_color_cycle_speed = QSlider(Qt.Horizontal, self.cine_options)
+        self.slider_cine_color_cycle_speed.setMinimum(100)
+        self.slider_cine_color_cycle_speed.setMaximum(1000)
+        self.slider_cine_color_cycle_speed.setSingleStep(50)
+        self.slider_cine_color_cycle_speed.setPageStep(100)
+        self.slider_cine_color_cycle_speed.setValue(400)
+        row_cine_color_cycle.addWidget(self.slider_cine_color_cycle_speed, 1)
+        self.label_cine_color_cycle_speed = QLabel("400 ms", self.cine_options)
+        self.label_cine_color_cycle_speed.setMinimumWidth(55)
+        row_cine_color_cycle.addWidget(self.label_cine_color_cycle_speed)
+        cine_layout.addLayout(row_cine_color_cycle)
+
         # Stutter slice
         row_cine_stutter = QHBoxLayout()
         self.check_cine_stutter = QCheckBox("Stutter slice", self.cine_options)
@@ -6386,28 +6646,6 @@ class AutoMusicSyncWidget(QWidget):
         row_cine_stutter.addWidget(self.spin_cine_stutter_repeats)
         row_cine_stutter.addStretch(1)
         cine_layout.addLayout(row_cine_stutter)
-
-        # Color-cycle glitch (all colors)
-        row_cine_colorcycle = QHBoxLayout()
-        self.check_cine_color_cycle = QCheckBox("Color-cycle glitch (all colors)", self.cine_options)
-        self.check_cine_color_cycle.setToolTip(
-            "Occasionally cycle through the full hue spectrum for a vivid glitchy hit.\n"
-            "Speed controls how fast it cycles through colors."
-        )
-        row_cine_colorcycle.addWidget(self.check_cine_color_cycle)
-        label_cine_cc = QLabel("Speed:", self.cine_options)
-        row_cine_colorcycle.addWidget(label_cine_cc)
-        self.slider_cine_color_cycle_speed = QSlider(Qt.Horizontal, self.cine_options)
-        self.slider_cine_color_cycle_speed.setRange(100, 1000)  # ms per full color cycle
-        self.slider_cine_color_cycle_speed.setSingleStep(50)
-        self.slider_cine_color_cycle_speed.setPageStep(100)
-        self.slider_cine_color_cycle_speed.setValue(350)
-        row_cine_colorcycle.addWidget(self.slider_cine_color_cycle_speed, 1)
-        self.label_cine_color_cycle_speed = QLabel("350 ms", self.cine_options)
-        self.label_cine_color_cycle_speed.setMinimumWidth(70)
-        row_cine_colorcycle.addWidget(self.label_cine_color_cycle_speed)
-        row_cine_colorcycle.addStretch(1)
-        cine_layout.addLayout(row_cine_colorcycle)
 
         # Reverse-bounce
         row_cine_reverse = QHBoxLayout()
@@ -7102,7 +7340,7 @@ class AutoMusicSyncWidget(QWidget):
             "\n"
             "- Soft film dissolves: gentle, low-key transitions (currently clean cuts).\n"
             "- Hard cuts: straight, no-frills cuts.\n"
-            "- Scale punch (zoom): rhythmic zoom pulses on cuts.\n"
+            "- Scale punch (zoom): punchy zoom-burst crossfade with a tiny flash.\n"
             "- Shimmer blur (shiny): fast blurred crossfade (glossy, editor-style).\n"
             "- Iris reveal (circle): real stitched iris transition between clips.\n"
             "- Motion blur whip-cuts: extra blur on fast cuts.\n"
@@ -7352,8 +7590,8 @@ class AutoMusicSyncWidget(QWidget):
         self.slider_cine_freeze_zoom.valueChanged.connect(self._on_cine_freeze_zoom_changed)
         self.slider_cine_tear_v_strength.valueChanged.connect(self._on_cine_tear_v_strength_changed)
         self.slider_cine_tear_h_strength.valueChanged.connect(self._on_cine_tear_h_strength_changed)
-        self.slider_cine_reverse_len.valueChanged.connect(self._on_cine_reverse_len_changed)
         self.slider_cine_color_cycle_speed.valueChanged.connect(self._on_cine_color_cycle_speed_changed)
+        self.slider_cine_reverse_len.valueChanged.connect(self._on_cine_reverse_len_changed)
         self.slider_cine_ramp_in.valueChanged.connect(self._on_cine_ramp_in_changed)
         self.slider_cine_ramp_out.valueChanged.connect(self._on_cine_ramp_out_changed)
         self.slider_cine_boomerang_bounces.valueChanged.connect(self._on_cine_boomerang_bounces_changed)
@@ -8331,12 +8569,10 @@ class AutoMusicSyncWidget(QWidget):
         self.slider_cine_tear_v_strength.setValue(int(s.value("cine_tear_v_strength", self.slider_cine_tear_v_strength.value())))
         self.check_cine_tear_h.setChecked(bool(int(s.value("cine_tear_h", int(self.check_cine_tear_h.isChecked())))))
         self.slider_cine_tear_h_strength.setValue(int(s.value("cine_tear_h_strength", self.slider_cine_tear_h_strength.value())))
+        self.check_cine_color_cycle.setChecked(bool(int(s.value("cine_color_cycle", int(self.check_cine_color_cycle.isChecked())))))
+        self.slider_cine_color_cycle_speed.setValue(int(s.value("cine_color_cycle_speed_ms", int(self.slider_cine_color_cycle_speed.value()))))
 
         self.check_cine_stutter.setChecked(bool(int(s.value("cine_stutter", int(self.check_cine_stutter.isChecked())))))
-        if hasattr(self, "check_cine_color_cycle"):
-            self.check_cine_color_cycle.setChecked(bool(int(s.value("cine_color_cycle", int(self.check_cine_color_cycle.isChecked())))))
-        if hasattr(self, "slider_cine_color_cycle_speed"):
-            self.slider_cine_color_cycle_speed.setValue(int(s.value("cine_color_cycle_speed_ms", self.slider_cine_color_cycle_speed.value())))
         self.spin_cine_stutter_repeats.setValue(int(s.value("cine_stutter_repeats", self.spin_cine_stutter_repeats.value())))
         self.check_cine_reverse.setChecked(bool(int(s.value("cine_reverse", int(self.check_cine_reverse.isChecked())))))
         self.slider_cine_reverse_len.setValue(int(s.value("cine_reverse_len", self.slider_cine_reverse_len.value())))
@@ -8443,6 +8679,7 @@ class AutoMusicSyncWidget(QWidget):
         self._on_cine_toggle(int(self.check_cine_enable.isChecked()))
         self._on_cine_freeze_len_changed(self.slider_cine_freeze_len.value())
         self._on_cine_freeze_zoom_changed(self.slider_cine_freeze_zoom.value())
+        self._on_cine_color_cycle_speed_changed(self.slider_cine_color_cycle_speed.value())
         self._on_cine_reverse_len_changed(self.slider_cine_reverse_len.value())
         self._on_cine_ramp_in_changed(self.slider_cine_ramp_in.value())
         self._on_cine_ramp_out_changed(self.slider_cine_ramp_out.value())
@@ -8593,11 +8830,9 @@ class AutoMusicSyncWidget(QWidget):
         s.setValue("cine_tear_v_strength", int(self.slider_cine_tear_v_strength.value()))
         s.setValue("cine_tear_h", int(self.check_cine_tear_h.isChecked()))
         s.setValue("cine_tear_h_strength", int(self.slider_cine_tear_h_strength.value()))
+        s.setValue("cine_color_cycle", int(self.check_cine_color_cycle.isChecked()))
+        s.setValue("cine_color_cycle_speed_ms", int(self.slider_cine_color_cycle_speed.value()))
         s.setValue("cine_stutter", int(self.check_cine_stutter.isChecked()))
-        if hasattr(self, "check_cine_color_cycle"):
-            s.setValue("cine_color_cycle", int(self.check_cine_color_cycle.isChecked()))
-        if hasattr(self, "slider_cine_color_cycle_speed"):
-            s.setValue("cine_color_cycle_speed_ms", int(self.slider_cine_color_cycle_speed.value()))
         s.setValue("cine_stutter_repeats", int(self.spin_cine_stutter_repeats.value()))
         s.setValue("cine_reverse", int(self.check_cine_reverse.isChecked()))
         s.setValue("cine_reverse_len", int(self.slider_cine_reverse_len.value()))
@@ -9123,37 +9358,25 @@ class AutoMusicSyncWidget(QWidget):
         except Exception:
             pass
 
+    def _on_cine_color_cycle_speed_changed(self, value: int) -> None:
+        try:
+            v = int(value)
+        except Exception:
+            v = 400
+        # Clamp and snap to 50ms steps
+        v = max(100, min(1000, v))
+        v = int(round(v / 50.0) * 50)
+        try:
+            self.label_cine_color_cycle_speed.setText(f"{v:d} ms")
+        except Exception:
+            pass
+
     def _on_cine_reverse_len_changed(self, value: int) -> None:
         seconds = value / 100.0
         try:
             self.label_cine_reverse_len.setText(f"{seconds:.2f} s")
         except Exception:
             pass
-
-    def _on_cine_color_cycle_speed_changed(self, value: int) -> None:
-        """Update label for the cinematic color-cycle speed slider (ms)."""
-        try:
-            v = int(value)
-        except Exception:
-            v = 350
-        v = max(100, min(1000, v))
-        # Snap to 50ms steps for predictable presets.
-        v = int(round(v / 50.0) * 50)
-        try:
-            if getattr(self, "slider_cine_color_cycle_speed").value() != v:
-                self.slider_cine_color_cycle_speed.blockSignals(True)
-                self.slider_cine_color_cycle_speed.setValue(v)
-                self.slider_cine_color_cycle_speed.blockSignals(False)
-        except Exception:
-            try:
-                self.slider_cine_color_cycle_speed.blockSignals(False)
-            except Exception:
-                pass
-        try:
-            self.label_cine_color_cycle_speed.setText(f"{v:d} ms")
-        except Exception:
-            pass
-
 
     def _on_cine_ramp_in_changed(self, value: int) -> None:
         seconds = value / 100.0
@@ -9398,8 +9621,8 @@ class AutoMusicSyncWidget(QWidget):
             "check_cine_freeze",
             "check_cine_tear_v",
             "check_cine_tear_h",
-            "check_cine_stutter",
             "check_cine_color_cycle",
+            "check_cine_stutter",
             "check_cine_reverse",
             "check_cine_speedup_forward",
             "check_cine_speedup_backward",
@@ -9435,8 +9658,8 @@ class AutoMusicSyncWidget(QWidget):
             getattr(self, "check_cine_freeze", None),
             getattr(self, "check_cine_tear_v", None),
             getattr(self, "check_cine_tear_h", None),
-            getattr(self, "check_cine_stutter", None),
             getattr(self, "check_cine_color_cycle", None),
+            getattr(self, "check_cine_stutter", None),
             getattr(self, "check_cine_reverse", None),
             getattr(self, "check_cine_speedup_forward", None),
             getattr(self, "check_cine_speedup_backward", None),
@@ -10218,6 +10441,8 @@ class AutoMusicSyncWidget(QWidget):
             cine_tear_v_strength=self.slider_cine_tear_v_strength.value() / 100.0,
             cine_tear_h=bool(self.check_cine_tear_h.isChecked()),
             cine_tear_h_strength=self.slider_cine_tear_h_strength.value() / 100.0,
+            cine_color_cycle=bool(self.check_cine_color_cycle.isChecked()),
+            cine_color_cycle_speed_ms=int(self.slider_cine_color_cycle_speed.value()),
             cine_stutter_repeats=int(self.spin_cine_stutter_repeats.value()),
             cine_reverse_len=self.slider_cine_reverse_len.value() / 100.0,
             cine_ramp_in=self.slider_cine_ramp_in.value() / 100.0,
@@ -10236,8 +10461,6 @@ class AutoMusicSyncWidget(QWidget):
             cine_flip=bool(self.check_cine_flip.isChecked()),
             cine_rotate=bool(self.check_cine_rotate.isChecked()),
             cine_rotate_max_degrees=float(self.slider_cine_rotate_degrees.value()),
-            cine_color_cycle=bool(getattr(self, "check_cine_color_cycle", None) and self.check_cine_color_cycle.isChecked()),
-            cine_color_cycle_speed_ms=int(getattr(self, "slider_cine_color_cycle_speed", None).value()) if getattr(self, "slider_cine_color_cycle_speed", None) is not None else 350,
             cine_multiply=bool(self.check_cine_multiply.isChecked()),
             cine_multiply_screens=int(self.slider_cine_multiply_screens.value()),
             cine_multiply_random=bool(self.check_cine_multiply_random.isChecked()),
@@ -10385,7 +10608,7 @@ class AutoMusicSyncWidget(QWidget):
 
         # Deterministic output name for the queued job (so the Queue can point to the produced file).
         base = os.path.splitext(os.path.basename(audio))[0]
-        safe_base = base.strip().replace(" ", "_")
+        safe_base = _sanitize_stem(base)
         ts = datetime.now().strftime("%d%m%H%M%S")
         out_name = f"{safe_base}_clip_{ts}.mp4"
         out_final = os.path.join(out_dir, out_name)

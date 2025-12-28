@@ -88,6 +88,12 @@ def ffmpeg_path():
     return "ffmpeg"
 
 
+try:
+    from helpers.videotext import videotextPane
+except Exception as _e:
+    print("[framevision] videotext tool import failed:", _e)
+    videotextPane = None
+
 def ffprobe_path():
     """Resolve ffprobe, preferring app-local presets/bin first, then bin, then PATH."""
     exe = 'ffprobe.exe' if os.name=='nt' else 'ffprobe'
@@ -724,6 +730,7 @@ class InstantToolsPane(QWidget):
         sec_extract = CollapsibleSection("Extract frames", expanded=False)
         sec_trim = CollapsibleSection("Video Trim Lab", expanded=False)
         sec_crop = CollapsibleSection("Cropping", expanded=False)
+        sec_videotext = CollapsibleSection("Video Text Overlay", expanded=False)
         sec_describe = CollapsibleSection("Describe anything with Qwen3 VL", expanded=False)
         _desc_wrap = QWidget(); _descl = QVBoxLayout(_desc_wrap); _descl.setContentsMargins(0,0,0,0)
         _descl.setSpacing(6)
@@ -1216,8 +1223,29 @@ class InstantToolsPane(QWidget):
             install_cropper_tool(self, sec_crop)
         except Exception:
             pass
+
+        # Video Text Overlay
+        _vt_wrap = QWidget(); _vt_layout = QVBoxLayout(_vt_wrap); _vt_layout.setContentsMargins(0,0,0,0)
+        _vt_layout.setSpacing(6)
+        try:
+            if videotextPane is not None:
+                try:
+                    _vt_widget = videotextPane(self)
+                except Exception:
+                    _vt_widget = videotextPane(None)
+                _vt_layout.addWidget(_vt_widget, 1)
+            else:
+                _lbl = QLabel("Video Text tool is unavailable (missing or failed helpers/videotext.py).")
+                _lbl.setWordWrap(True)
+                _vt_layout.addWidget(_lbl)
+        except Exception:
+            _lbl = QLabel("Video Text tool failed to load.")
+            _lbl.setWordWrap(True)
+            _vt_layout.addWidget(_lbl)
+        sec_videotext.setContentLayout(_vt_layout)
+
         default_sections = [sec_prompt, sec_bg, sec_ace, sec_describe, sec_meme, sec_music, sec_audio, sec_speed, sec_reverse, sec_upscale, sec_rife,
-                            sec_resize, sec_trim, sec_crop, sec_splitglue, sec_gif, sec_extract, sec_rename, sec_metadata]
+                            sec_resize, sec_trim, sec_crop, sec_videotext, sec_splitglue, sec_gif, sec_extract, sec_rename, sec_metadata]
 
 # sec_musicclip,  # to re add put this back in default_sections
 
@@ -1256,6 +1284,8 @@ class InstantToolsPane(QWidget):
                 "Extract frames": sec_extract,
                 "Trim Lab": sec_trim,
                 "Cropping": sec_crop,
+
+                "Video Text Overlay": sec_videotext,
 
                 "Thumbnail / Meme Creator": sec_meme,
                 "Prompt Enhancement": sec_prompt,
