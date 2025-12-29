@@ -847,28 +847,9 @@ if __name__ == "__main__":
     move_to_models()
 # --- end: Move folders to models ---
 
-# --- begin: TXT->IMG model families (SD1.5 / SDXL) --------------------------------------------
-# Moved to separate module: download_sd_models.py
-# Keeping download_externals.py focused on non-SD externals, while TXT->IMG (SD15/SDXL) remains optional.
-try:
-    # When executed as scripts/download_externals.py
-    from download_sd_models import run_txt2img_auto as _fv_run_txt2img_auto
-except Exception:
-    try:
-        # When executed as a module package (rare)
-        from .download_sd_models import run_txt2img_auto as _fv_run_txt2img_auto
-    except Exception:
-        _fv_run_txt2img_auto = None
-
-if __name__ == "__main__":
-    if _fv_run_txt2img_auto is None:
-        print("[externals][txt2img] download_sd_models.py not found; skipping TXT→IMG downloads")
-    else:
-        try:
-            _fv_run_txt2img_auto()
-        except Exception as e:
-            print("[externals][txt2img] error:", e)
-# --- end: TXT->IMG model families -------------------------------------------------------------
+# --- TXT->IMG model families (SD1.5 / SDXL) ---
+# NOTE: Auto-run of download_sd_models.py has been removed.
+# If you want TXT→IMG model downloads, run download_sd_models.py manually.
 # --- begin: run downloadbg.py at the very end ----------------------------------
 def _run_downloadbg_after_all():
     try:
