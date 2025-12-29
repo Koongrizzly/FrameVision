@@ -1,4 +1,4 @@
-### ✨ FrameVision 2.1 ✨
+### ✨ FrameVision 2.1.1 ✨
 **All-in-one Sound/Image/Video Tool**  
 *Create, Upscale, edit, describe, play — in one streamlined app.*
 ---
