@@ -4180,7 +4180,7 @@ class RenderWorker(QThread):
                         # Re-try with a safer chain, but keep the segment alive.
                         try:
                             tail = (out or "").splitlines()[-1] if out else ""
-                            print(f"[Videoclip_creator] Segment {i+1}: FX effect filter failed; no worries, we are defaulting to safe chain. {tail}")
+                            print(f"[Videoclip_creator] Segment {i+1}: FX effect filter failed; defaulting to safe chain, error is harmless. {tail}")
                         except Exception:
                             pass
                         try:

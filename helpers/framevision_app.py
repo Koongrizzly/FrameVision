@@ -129,7 +129,7 @@ def _open_compare_page():
 
 
 
-# FrameVision V2.1 — Full-classic UI + NCNN upscalers + branding
+# FrameVision V2.1.1 — Full-classic UI + NCNN upscalers + branding
 # Classic layout (big player, control bar, seek slider, fullscreen) + click-to-play/pause
 # Auto Theme (Day/Evening/Night), Session Restore, Instant Tools, Presets, Describe-on-Pause,
 # Queue + Worker, Models Manager, Upscale Video/Photo buttons (queue) wired to NCNN CLIs.
@@ -3416,9 +3416,9 @@ class QueuePane(QWidget):
 
     MAX_PENDING_SHOW = 99
 
-    MAX_DONE_KEEP    = 50
+    MAX_DONE_KEEP    = 99
 
-    MAX_DONE_SHOW    = 55
+    MAX_DONE_SHOW    = 99
 
     MAX_FAILED_KEEP  = 50
 
@@ -3430,9 +3430,9 @@ class QueuePane(QWidget):
         from PySide6.QtCore import QUrl, QFileSystemWatcher
 
         # Timers (keep internal refresh cadence intact)
-        self.auto_timer = QTimer(self); self.auto_timer.setInterval(7000); self.auto_timer.timeout.connect(self.request_refresh)
+        self.auto_timer = QTimer(self); self.auto_timer.setInterval(7500); self.auto_timer.timeout.connect(self.request_refresh)
         self.watch_timer = QTimer(self); self.watch_timer.setInterval(1300); self.watch_timer.timeout.connect(self.request_refresh)
-        self.worker_timer = QTimer(self); self.worker_timer.setInterval(2500); self.worker_timer.timeout.connect(self._update_worker_led)
+        self.worker_timer = QTimer(self); self.worker_timer.setInterval(3500); self.worker_timer.timeout.connect(self._update_worker_led)
         # Pause queue refreshing while video is playing to prevent playback stutter.
         # (Queue refresh runs on the GUI thread; any filesystem + thumbnail work can hitch QMediaPlayer.)
         self._bound_video_player = None
@@ -3702,8 +3702,8 @@ class QueuePane(QWidget):
         if status == "pending":
             max_show = getattr(self, "MAX_PENDING_SHOW", 99)
         elif status == "done":
-            max_keep = getattr(self, "MAX_DONE_KEEP", 50)
-            max_show = getattr(self, "MAX_DONE_SHOW", 50)
+            max_keep = getattr(self, "MAX_DONE_KEEP", 99)
+            max_show = getattr(self, "MAX_DONE_SHOW", 99)
         elif status == "failed":
             max_keep = getattr(self, "MAX_FAILED_KEEP", 50)
             max_show = getattr(self, "MAX_FAILED_SHOW", 50)
@@ -3732,10 +3732,10 @@ class QueuePane(QWidget):
                     # Done: allow up to (max_keep - 2) then remove a batch of 10 so we drop to ~38-39.
                     # Failed: keep gentler cleanup so errors remain visible.
                     if status == "done":
-                        trigger_at = max(1, int(max_keep) - 5)  # e.g. 50 -> start at 48
-                        max_per_refresh = 10
+                        trigger_at = max(1, int(max_keep) - 25)  # e.g. 50 -> start at 48
+                        max_per_refresh = 5
                     else:
-                        trigger_at = max(1, int(max_keep) - 2)  # e.g. 50 -> start at 49
+                        trigger_at = max(1, int(max_keep) - 5)  # e.g. 50 -> start at 49
                         max_per_refresh = 3
                 except Exception:
                     trigger_at = max_keep
@@ -5220,7 +5220,7 @@ class MainWindow(QMainWindow):
 
     def __init__(self):
         super().__init__()
-        self.setWindowTitle(APP_NAME + " V2.1 " + TAGLINE)
+        self.setWindowTitle(APP_NAME + " V2.1.1 " + TAGLINE)
         self.resize(1280, 800)
         self.setMinimumSize(700, 500)
         self.current_path = None

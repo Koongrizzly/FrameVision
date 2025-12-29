@@ -729,7 +729,7 @@ class TimelineWidget(QWidget):
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
-        self.setMinimumHeight(88)
+        self.setMinimumHeight(176)
         self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
 
         self._duration_ms = 0
@@ -747,6 +747,13 @@ class TimelineWidget(QWidget):
         self._drag_start_seg_ms = 0
 
         self.setMouseTracking(True)
+
+    def _ui_scale(self) -> float:
+        # Base design height is 88px; scale UI to the actual height so the timeline can grow cleanly.
+        try:
+            return max(1.0, float(self.height()) / 88.0)
+        except Exception:
+            return 1.0
 
     def set_duration_ms(self, ms: int) -> None:
         self._duration_ms = max(0, int(ms))
@@ -795,16 +802,22 @@ class TimelineWidget(QWidget):
     def _seg_rect(self) -> QRect:
         x1 = self._time_to_x(self._seg_start_ms)
         x2 = self._time_to_x(self._seg_start_ms + self._seg_dur_ms)
-        top = 28
-        h = 34
+
+        s = self._ui_scale()
+        top = int(round(28 * s))
+        h = int(round(34 * s))
         return QRect(int(x1), top, int(max(4.0, x2 - x1)), h)
 
     def paintEvent(self, event) -> None:
         p = QPainter(self)
         p.setRenderHint(QPainter.Antialiasing, True)
 
+        s = self._ui_scale()
+
         p.fillRect(self.rect(), QColor(20, 20, 20))
-        track = QRect(self._margin_left, 18, self.width() - self._margin_left - self._margin_right, 56)
+        track_top = int(round(18 * s))
+        track_h = int(round(56 * s))
+        track = QRect(self._margin_left, track_top, self.width() - self._margin_left - self._margin_right, track_h)
         p.fillRect(track, QColor(28, 28, 28))
 
         if self._duration_ms > 0:
@@ -823,12 +836,12 @@ class TimelineWidget(QWidget):
             while t <= dur_s + 1e-6:
                 x = self._margin_left + t * px_per_sec
                 if int(round(t / minor_s)) % 5 != 0:
-                    p.drawLine(int(x), track.bottom() - 10, int(x), track.bottom())
+                    p.drawLine(int(x), track.bottom() - int(round(10 * s)), int(x), track.bottom())
                 t += minor_s
 
             p.setPen(QPen(QColor(85, 85, 85)))
             font = p.font()
-            font.setPointSize(max(8, int(8 + (self._zoom - 1) * 1.2)))
+            font.setPointSize(max(8, int((8 * s) + (self._zoom - 1) * (1.2 * s))))
             p.setFont(font)
 
             t = 0.0
@@ -836,22 +849,24 @@ class TimelineWidget(QWidget):
                 x = self._margin_left + t * px_per_sec
                 p.drawLine(int(x), track.top(), int(x), track.bottom())
                 label = self._format_time(int(t * 1000.0))
-                p.drawText(int(x) + 4, track.top() + 12, label)
+                p.drawText(int(x) + int(round(4 * s)), track.top() + int(round(12 * s)), label)
                 t += major_s
 
         seg = self._seg_rect()
         p.setPen(QPen(QColor(255, 255, 255, 40)))
         p.setBrush(QColor(70, 130, 255, 170))
-        p.drawRoundedRect(seg, 6, 6)
+        r = max(2, int(round(6 * s)))
+        p.drawRoundedRect(seg, r, r)
 
         p.setPen(QPen(QColor(255, 255, 255, 220)))
         seg_label = f"Selected: {self._format_time(self._seg_start_ms)}  +{self._format_time(self._seg_dur_ms)}"
-        p.drawText(seg.x() + 10, seg.y() + 22, seg_label)
+        p.drawText(seg.x() + int(round(10 * s)), seg.y() + int(round(22 * s)), seg_label)
 
         if self._duration_ms > 0:
             x = self._time_to_x(self._playhead_ms)
             p.setPen(QPen(QColor(255, 80, 80, 220), 2))
-            p.drawLine(int(x), track.top() - 6, int(x), track.bottom() + 6)
+            pad = int(round(6 * s))
+            p.drawLine(int(x), track.top() - pad, int(x), track.bottom() + pad)
 
         p.setPen(QPen(QColor(45, 45, 45)))
         p.drawRect(self.rect().adjusted(0, 0, -1, -1))
@@ -959,11 +974,14 @@ class VideoTextPane(QWidget):
         root.setContentsMargins(10, 10, 10, 10)
         root.setSpacing(10)
 
-        # Top controls
-        controls_outer = QVBoxLayout()
-        controls_outer.setSpacing(6)
+                # Top controls (3 rows)
+        controls = QVBoxLayout()
+        controls.setSpacing(6)
 
         row1 = QHBoxLayout()
+        row2 = QHBoxLayout()
+        row3 = QHBoxLayout()
+
         self.btn_open = QPushButton("Open Video…")
         self.btn_export = QPushButton("Export with Text…")
         self.btn_play = QPushButton("Play/Pause")
@@ -987,35 +1005,28 @@ class VideoTextPane(QWidget):
         self.lbl_time = QLabel("00:00.000 / 00:00.000")
         self.lbl_path = QLabel("No video loaded")
         self.lbl_path.setTextInteractionFlags(Qt.TextSelectableByMouse)
-        self.lbl_path.setWordWrap(True)
-        try:
-            self.lbl_path.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
-        except Exception:
-            pass
 
-        # Row 1: main buttons
+        # Row 1: Open / Play / Stop (+ Export)
         row1.addWidget(self.btn_open, 0)
         row1.addWidget(self.btn_play, 0)
         row1.addWidget(self.btn_stop, 0)
         row1.addWidget(self.btn_export, 0)
-        row1.addWidget(self.btn_toggle_preview, 0)
         row1.addStretch(1)
-        controls_outer.addLayout(row1)
 
-        # Row 2: preview-on-main toggle + time
-        row2 = QHBoxLayout()
+        # Row 2: Preview ON/OFF toggle + time (and optional "Hide Preview" for standalone mode)
         row2.addWidget(self.btn_big_preview, 0)
-        row2.addSpacing(12)
+        row2.addSpacing(8)
         row2.addWidget(self.lbl_time, 0)
         row2.addStretch(1)
-        controls_outer.addLayout(row2)
+        row2.addWidget(self.btn_toggle_preview, 0)
 
-        # Row 3: current video path
-        row3 = QHBoxLayout()
+        # Row 3: Loaded video path
         row3.addWidget(self.lbl_path, 1)
-        controls_outer.addLayout(row3)
 
-        root.addLayout(controls_outer)
+        controls.addLayout(row1)
+        controls.addLayout(row2)
+        controls.addLayout(row3)
+        root.addLayout(controls)
 
         # Main area: splitter (preview | editor)
         self.video_frame = QFrame()

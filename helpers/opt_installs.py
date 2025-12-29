@@ -85,74 +85,6 @@ def _run_wan22(root: Path) -> Optional[Tuple[str, List[str], Path]]:
     return _cmd_call_bat(script, root)
 
 
-
-def _run_wan21_fp16(root: Path) -> Optional[Tuple[str, List[str], Path]]:
-    """WAN 2.1 (Diffusers / full FP16) optional install.
-
-    We try a few common script names to stay compatible with different packagings.
-    """
-    candidates = [
-        root / "presets" / "extra_env" / "wan21_setup.bat",
-        root / "presets" / "extra_env" / "wan21_install.bat",
-        root / "presets" / "extra_env" / "wan21_fp16_install.bat",
-        root / "presets" / "extra_env" / "wan21_fp16_setup.bat",
-        root / "presets" / "extra_env" / "wan21_setup_fp16.bat",
-    ]
-    script = next((p for p in candidates if p.exists()), None)
-    if script is None:
-        return None
-    return _cmd_call_bat(script, root)
-
-
-def _run_wan21gguf_runtime(root: Path) -> Optional[Tuple[str, List[str], Path]]:
-    """WAN 2.1 GGUF runtime installer (sd.cpp / sd-cli + isolated env)."""
-    script = root / "presets" / "extra_env" / "wan21_guff_install.bat"
-    if not script.exists():
-        return None
-    return _cmd_call_bat(script, root)
-
-
-def _run_wan21gguf_model(root: Path, quant: str) -> Optional[Tuple[str, List[str], Path]]:
-    """Download ONE WAN 2.1 GGUF model (and any required extras) via wan21_guff.py.
-
-    Expected interface (kept intentionally simple):
-        python -u wan21_guff.py <root> <target_dir> --quant Q5_0
-    """
-    script = root / "presets" / "extra_env" / "wan21_guff.py"
-    if not script.exists():
-        return None
-
-    py = _venv_python(root)
-    if not py:
-        return None
-
-    target = (root / "models" / "WAN2.1 GGUF").resolve()
-    args = [
-        "-u",
-        str(script),
-        str(root),
-        str(target),
-        "--quant",
-        quant,
-    ]
-    return (str(py), args, root)
-
-
-def _run_wan21gguf_q4(root: Path) -> Optional[Tuple[str, List[str], Path]]:
-    return _run_wan21gguf_model(root, "Q4_0")
-
-
-def _run_wan21gguf_q5(root: Path) -> Optional[Tuple[str, List[str], Path]]:
-    return _run_wan21gguf_model(root, "Q5_0")
-
-
-def _run_wan21gguf_q6(root: Path) -> Optional[Tuple[str, List[str], Path]]:
-    return _run_wan21gguf_model(root, "Q6_K")
-
-
-def _run_wan21gguf_q8(root: Path) -> Optional[Tuple[str, List[str], Path]]:
-    return _run_wan21gguf_model(root, "Q8_0")
-
 def _run_zimage(root: Path) -> Optional[Tuple[str, List[str], Path]]:
     script = root / "presets" / "extra_env" / "zimage_install.bat"
     if not script.exists():
@@ -275,44 +207,6 @@ def _default_installs() -> List[OptionalInstall]:
             description="VRAM: 24GB recommended (offloading works with less, but very slow). Disk: +30GB.",
             runner=_run_wan22,
         ),
-
-OptionalInstall(
-    key="wan21_fp16",
-    title="WAN 2.1 Full FP16 model (Diffusers) — Text/image/video to Video",
-    description="Installs the WAN 2.1 (Diffusers) environment + full FP16 weights (script-driven).",
-    runner=_run_wan21_fp16,
-),
-OptionalInstall(
-    key="wan21gguf",
-    title="WAN 2.1 GGUF runtime (sd.cpp) — no ComfyUI",
-    description="Installs WAN 2.1 GGUF runtime (sd-cli / stable-diffusion.cpp) and its isolated environment.",
-    runner=_run_wan21gguf_runtime,
-),
-OptionalInstall(
-    key="wan21gguf_q4",
-    title="WAN 2.1 GGUF model (Q4_0)",
-    description="Smallest/fastest GGUF model download. Requires WAN 2.1 GGUF runtime.",
-    runner=_run_wan21gguf_q4,
-),
-OptionalInstall(
-    key="wan21gguf_q5",
-    title="WAN 2.1 GGUF model (Q5_0)",
-    description="Balanced GGUF model download. Requires WAN 2.1 GGUF runtime.",
-    runner=_run_wan21gguf_q5,
-),
-OptionalInstall(
-    key="wan21gguf_q6",
-    title="WAN 2.1 GGUF model (Q6_K)",
-    description="Higher quality GGUF model download. Requires WAN 2.1 GGUF runtime.",
-    runner=_run_wan21gguf_q6,
-),
-OptionalInstall(
-    key="wan21gguf_q8",
-    title="WAN 2.1 GGUF model (Q8_0)",
-    description="Largest/best quality GGUF model download. Requires WAN 2.1 GGUF runtime.",
-    runner=_run_wan21gguf_q8,
-),
-
         OptionalInstall(
             key="hunyuan15",
             title="HunyuanVideo 1.5, text/image/video to Video with extender",
@@ -394,7 +288,6 @@ _ENV_DIR_BY_KEY = {
     "hunyuan15": Path(".hunyuan15_env"),
     "gfpgan": Path("models") / "gfpgan" / ".GFPGAN",
     "wan22": Path(".wan_venv"),
-    "wan21gguf": Path(".wan21gguf_env"),
     "zimage": Path(".zimage_env"),
     # Not on the UI list yet, but reserved for future use.
     "comfui": Path(".comfui_env"),
@@ -586,44 +479,16 @@ class OptionalInstallsDialog(QtWidgets.QDialog):
         row_by_key: Dict[str, _OptionRow] = {}
 
         for opt in self.installs:
-            # Indent model download options consistently (avoid alternating rows).
+            # Indent *all* Z-image model download options consistently (avoid alternating rows).
             is_zimage_extra = opt.key.startswith("zimage_") and opt.key != "zimage"
-            is_wan21gguf_extra = opt.key.startswith("wan21gguf_") and opt.key != "wan21gguf"
-            row = _OptionRow(opt, indent=(26 if (is_zimage_extra or is_wan21gguf_extra) else 0))
-
+            row = _OptionRow(opt, indent=(26 if is_zimage_extra else 0))
             if opt.key.startswith("zimage_") and opt.key != "zimage":
                 row.toggled.connect(lambda checked, k=opt.key: self._on_zimage_model_toggled(k, checked))
-
-            if opt.key == "wan21_fp16" or opt.key.startswith("wan21gguf"):
-                row.toggled.connect(lambda checked, k=opt.key: self._on_wan21_variant_toggled(k, checked))
             self.rows.append(row)
             row_by_key[opt.key] = row
             opts_lay.addWidget(row)
 
         self._row_by_key = row_by_key
-
-        # Child options visibility:
-        # Show model-download toggles only when the main runtime toggle is enabled.
-        self._zimage_child_keys = [k for k in self._row_by_key.keys() if k.startswith("zimage_") and k != "zimage"]
-        self._wan21gguf_child_keys = [k for k in self._row_by_key.keys() if k.startswith("wan21gguf_") and k != "wan21gguf"]
-
-        z_parent = self._row_by_key.get("zimage")
-        if z_parent is not None:
-            z_parent.toggled.connect(self._on_zimage_parent_toggled)
-
-        w_parent = self._row_by_key.get("wan21gguf")
-        if w_parent is not None:
-            w_parent.toggled.connect(self._on_wan21gguf_parent_toggled)
-
-        # Initial sync (default: hidden until the parent is checked)
-        try:
-            if z_parent is not None:
-                self._on_zimage_parent_toggled(z_parent.is_checked())
-            if w_parent is not None:
-                self._on_wan21gguf_parent_toggled(w_parent.is_checked())
-        except Exception:
-            pass
-
 
         opts_lay.addStretch(1)
 
@@ -952,38 +817,6 @@ class OptionalInstallsDialog(QtWidgets.QDialog):
 
 
 
-
-    def _set_child_group_visible(self, keys: List[str], visible: bool) -> None:
-        """Show/hide a group of option rows.
-
-        When hiding, we also uncheck them so hidden selections can't run.
-        """
-        try:
-            rows = getattr(self, "_row_by_key", {})
-        except Exception:
-            rows = {}
-        for k in keys:
-            row = rows.get(k)
-            if row is None:
-                continue
-            if not visible:
-                try:
-                    if row.is_checked():
-                        row.set_checked(False)
-                except Exception:
-                    pass
-            row.setVisible(bool(visible))
-
-    def _on_zimage_parent_toggled(self, checked: bool) -> None:
-        """Z-image: reveal model downloads only when Z-image itself is enabled."""
-        keys = list(getattr(self, "_zimage_child_keys", []) or [])
-        self._set_child_group_visible(keys, bool(checked))
-
-    def _on_wan21gguf_parent_toggled(self, checked: bool) -> None:
-        """WAN 2.1 GGUF: reveal GGUF model downloads only when the runtime is enabled."""
-        keys = list(getattr(self, "_wan21gguf_child_keys", []) or [])
-        self._set_child_group_visible(keys, bool(checked))
-
     def _on_zimage_model_toggled(self, key: str, checked: bool) -> None:
         """Keep Z-image model selections sane and warn when prerequisites are missing."""
         if not checked:
@@ -1016,75 +849,6 @@ class OptionalInstallsDialog(QtWidgets.QDialog):
             self._toast("Full FP16 model will download when you press Start (no env reinstall needed).")
 
 
-    def _on_wan21_variant_toggled(self, key: str, checked: bool) -> None:
-        """WAN 2.1: keep FP16 vs GGUF selections sane."""
-        if not checked:
-            return
-
-        if key == "wan21_fp16":
-            try:
-                for k, row in getattr(self, "_row_by_key", {}).items():
-                    if k.startswith("wan21gguf") and row.is_checked():
-                        row.set_checked(False)
-            except Exception:
-                pass
-
-            has_script = any(
-                (self.root_dir / "presets" / "extra_env" / n).exists()
-                for n in (
-                    "wan21_setup.bat",
-                    "wan21_install.bat",
-                    "wan21_fp16_install.bat",
-                    "wan21_fp16_setup.bat",
-                    "wan21_setup_fp16.bat",
-                )
-            )
-            if not has_script:
-                self._toast("Missing WAN 2.1 installer (.bat) in presets/extra_env/")
-            return
-
-        try:
-            fp16_row = getattr(self, "_row_by_key", {}).get("wan21_fp16")
-            if fp16_row is not None and fp16_row.is_checked():
-                fp16_row.set_checked(False)
-        except Exception:
-            pass
-
-        if key.startswith("wan21gguf_"):
-            try:
-                for k, row in getattr(self, "_row_by_key", {}).items():
-                    if k.startswith("wan21gguf_") and k != key and row.is_checked():
-                        row.set_checked(False)
-            except Exception:
-                pass
-
-            try:
-                runtime_row = getattr(self, "_row_by_key", {}).get("wan21gguf")
-                if runtime_row is not None and (not runtime_row.is_checked()):
-                    runtime_row.set_checked(True)
-            except Exception:
-                pass
-
-        if key == "wan21gguf":
-            script = self.root_dir / "presets" / "extra_env" / "wan21_guff_install.bat"
-            if not script.exists():
-                self._toast("Missing installer: presets/extra_env/wan21_guff_install.bat")
-                return
-            self._toast("WAN 2.1 GGUF runtime will install when you press Start.")
-            return
-
-        if key.startswith("wan21gguf_"):
-            script = self.root_dir / "presets" / "extra_env" / "wan21_guff.py"
-            if not script.exists():
-                self._toast("Missing downloader: presets/extra_env/wan21_guff.py")
-                return
-            py = _venv_python(self.root_dir)
-            if py is None or (not py.exists()):
-                self._toast("Python .venv not found. Run the main installer first so FrameVision creates .venv.")
-                return
-            self._toast("WAN 2.1 GGUF model will download when you press Start (runtime auto-added if missing).")
-
-
     def selected_installs(self) -> List[OptionalInstall]:
         # Preserve install order from self.installs.
         checked_keys = [row.opt.key for row in self.rows if row.is_checked()]
@@ -1113,24 +877,6 @@ class OptionalInstallsDialog(QtWidgets.QDialog):
                             break
         except Exception:
             pass
-
-        # WAN 2.1 GGUF: if user selects a GGUF model but runtime isn't installed yet,
-        # auto-add the runtime install step first (silent).
-        self._auto_added_wan21gguf_runtime = False
-        try:
-            wants_wan21gguf_models = any(k.startswith("wan21gguf_") for k in checked_set)
-            if wants_wan21gguf_models and ("wan21gguf" not in checked_set):
-                env_rel = _ENV_DIR_BY_KEY.get("wan21gguf")
-                env_dir = (self.root_dir / env_rel).resolve() if env_rel is not None else None
-                if env_dir is not None and (not env_dir.exists()):
-                    for opt in self.installs:
-                        if opt.key == "wan21gguf":
-                            ordered.insert(0, opt)
-                            self._auto_added_wan21gguf_runtime = True
-                            break
-        except Exception:
-            pass
-
 
         return ordered
 
@@ -1162,8 +908,6 @@ class OptionalInstallsDialog(QtWidgets.QDialog):
         self._append_line("=== Starting optional installs ===")
         if getattr(self, "_auto_added_zimage_env", False):
             self._append_line("[INFO] Z-image env not found — installing it first so Z-image can run after model download.")
-        if getattr(self, "_auto_added_wan21gguf_runtime", False):
-            self._append_line("[INFO] WAN 2.1 GGUF runtime not found — installing it first before the GGUF model download.")
 
         self.progress.setRange(0, len(selected))
         self.progress.setValue(0)

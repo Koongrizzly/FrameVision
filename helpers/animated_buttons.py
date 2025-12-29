@@ -33,18 +33,169 @@ def _blend(a: QtGui.QColor, b: QtGui.QColor, t: float) -> QtGui.QColor:
         return b
 
 
+
+def _clamp(v: float, lo: float, hi: float) -> float:
+    try:
+        v = float(v)
+    except Exception:
+        v = lo
+    if v < lo:
+        return lo
+    if v > hi:
+        return hi
+    return v
+
+
+def _bright_ui_for_btn(btn: QtWidgets.QPushButton, fallback_base: Optional[QtGui.QColor] = None) -> bool:
+    """Best-effort 'is this a bright/day theme?' detector.
+    We prefer the application's Window color over the button's base color because
+    bright themes may still render dark buttons (e.g. accent buttons).
+    """
+    try:
+        app = QtWidgets.QApplication.instance()
+        if app is not None:
+            pal = app.palette()
+            wl = int(pal.color(QtGui.QPalette.Window).lightness())
+            if wl >= 150:
+                return True
+    except Exception:
+        pass
+    try:
+        if fallback_base is not None:
+            return int(fallback_base.lightness()) >= 150
+    except Exception:
+        pass
+    return False
+
+
+
+def _rel_lum(c: QtGui.QColor) -> float:
+    # Relative luminance (WCAG-ish), sRGB -> linear
+    try:
+        r, g, b, _a = c.getRgb()
+        def _lin(u: int) -> float:
+            x = u / 255.0
+            return x / 12.92 if x <= 0.04045 else ((x + 0.055) / 1.055) ** 2.4
+        rl, gl, bl = _lin(r), _lin(g), _lin(b)
+        return 0.2126 * rl + 0.7152 * gl + 0.0722 * bl
+    except Exception:
+        return 0.0
+
+
+def _contrast_ratio(a: QtGui.QColor, b: QtGui.QColor) -> float:
+    try:
+        la = _rel_lum(a)
+        lb = _rel_lum(b)
+        hi = max(la, lb)
+        lo = min(la, lb)
+        return (hi + 0.05) / (lo + 0.05)
+    except Exception:
+        return 1.0
+
+
+def _pick_text_color(bg: QtGui.QColor, preferred: QtGui.QColor) -> QtGui.QColor:
+    """Ensure readable text on top of bg.
+    Keep preferred if it has decent contrast; otherwise choose black/white with best contrast.
+    """
+    try:
+        if _contrast_ratio(bg, preferred) >= 3.5:
+            return preferred
+        black = QtGui.QColor(0, 0, 0)
+        white = QtGui.QColor(255, 255, 255)
+        return white if _contrast_ratio(bg, white) >= _contrast_ratio(bg, black) else black
+    except Exception:
+        return preferred
+
+
+def _min_lightness(*colors: QtGui.QColor) -> int:
+    vals = []
+    for c in colors:
+        try:
+            vals.append(int(c.lightness()))
+        except Exception:
+            pass
+    return min(vals) if vals else 128
+
+
+def _max_lightness(*colors: QtGui.QColor) -> int:
+    vals = []
+    for c in colors:
+        try:
+            vals.append(int(c.lightness()))
+        except Exception:
+            pass
+    return max(vals) if vals else 128
+
+
+def _auto_fg_for_gradient(preferred: QtGui.QColor, *bg_colors: QtGui.QColor) -> QtGui.QColor:
+    """Pick black/white in a way that stays readable across a gradient/animated fill.
+
+    This is intentionally *more conservative* than _pick_text_color():
+    if any significant part of the gradient is dark, we prefer white text (even on day themes).
+    """
+    try:
+        min_l = _min_lightness(*bg_colors)
+        max_l = _max_lightness(*bg_colors)
+    except Exception:
+        return preferred
+
+    try:
+        pref_l = int(preferred.lightness())
+    except Exception:
+        pref_l = 128
+
+    # Day themes typically use dark text as preferred.
+    if pref_l < 128:
+        return QtGui.QColor(255, 255, 255) if min_l < 175 else preferred
+
+    # Dark themes typically use light text as preferred.
+    return QtGui.QColor(0, 0, 0) if max_l > 215 else preferred
+
+
+
+def _boost_for_bright_ui(base: QtGui.QColor, accent: QtGui.QColor, accent2: QtGui.QColor, ui_bright: bool) -> tuple[QtGui.QColor, QtGui.QColor, QtGui.QColor]:
+    """Subtle automatic boost for bright/day themes.
+    Purpose: avoid dark/navy-looking hover fills on light UIs, without needing a slider.
+    """
+    if not ui_bright:
+        return base, accent, accent2
+    try:
+        bl = int(base.lightness())
+    except Exception:
+        bl = 140
+
+    # Accents: slightly brighter so the effect reads on light UIs.
+    try:
+        accent_b = QtGui.QColor(accent).lighter(150)
+    except Exception:
+        accent_b = accent
+    try:
+        accent2_b = QtGui.QColor(accent2).lighter(160)
+    except Exception:
+        accent2_b = accent2
+
+    # Base: lift only a bit (more lift if the button itself is dark).
+    try:
+        t = 0.26 if bl < 160 else 0.14
+        base_b = _blend(base, QtGui.QColor(255, 255, 255), t)
+    except Exception:
+        base_b = base
+
+    return base_b, accent_b, accent2_b
+
+
 class AnimatedButtonsManager(QtCore.QObject):
     """
     Hover animation manager for important buttons (e.g., "Generate", "View results").
     - Enabled/disabled + mode are stored in QSettings under:
         animated_buttons_enabled (bool)
-        animated_buttons_mode (str): glow | shift | boomerang | random
+        animated_buttons_mode (str): glow | shift | boomerang | outline | scanline | shimmer | pop | random
         animated_buttons_random_pick (legacy): unused (random now chooses per-hover)
     """
     _APP_PROP = "_fv_animated_buttons_manager"
     _HOVER_MARK = "/* fv_animbtn_hover */"
     _KEYWORDS = ("view results", "restart app", "restart app", "analyze", "clear program cache", "apply","show qsettings in cmd")
-    _RANDOM_CHOICES = ("glow", "shift", "boomerang", "outline", "shimmer", "pop")
+    _RANDOM_CHOICES = ("glow", "shift", "boomerang", "outline", "scanline", "shimmer", "pop")
 
     def __init__(self, app: QtWidgets.QApplication):
         super().__init__(app)
@@ -112,7 +263,7 @@ class AnimatedButtonsManager(QtCore.QObject):
         - If mode is random -> choose a mode on EVERY hover
         """
         mode = (self.mode or "glow").strip().lower()
-        if mode not in ("glow", "shift", "boomerang", "outline", "shimmer", "pop", "random"):
+        if mode not in ("glow", "shift", "boomerang", "outline", "scanline", "shimmer", "pop", "random"):
             mode = "glow"
         if not self.enabled:
             return "glow"
@@ -296,6 +447,12 @@ class AnimatedButtonsManager(QtCore.QObject):
                 accent = pal.color(QtGui.QPalette.Highlight)
                 link = pal.color(QtGui.QPalette.Link)
                 accent2 = link if link.isValid() else accent.lighter(125)
+                ui_bright = _bright_ui_for_btn(btn, base)
+                base_b, accent_b, accent2_b = _boost_for_bright_ui(base, accent, accent2, ui_bright)
+
+                # Preferred text color from theme, but we'll auto-contrast during hover if needed.
+                btn_text = pal.color(QtGui.QPalette.ButtonText)
+
 
                 if st.get("mode", "glow") == "shift":
                     # Rainbow hue cycling across the button.
@@ -327,7 +484,8 @@ class AnimatedButtonsManager(QtCore.QObject):
                         f" stop:0 {_rgba(c1, 255)},"
                         f" stop:1 {_rgba(c2, 255)});"
                     )
-                    self._apply_hover_qss(btn, st, f"QPushButton{{ background: {grad} }}")
+                    fg = _pick_text_color(_blend(c1, c2, 0.5), btn_text)
+                    self._apply_hover_qss(btn, st, f"QPushButton{{ background: {grad} color: {_rgba(fg,255)}; }}")
 
                 elif st.get("mode", "glow") == "boomerang":
                     # Moving highlight band across the button
@@ -336,8 +494,8 @@ class AnimatedButtonsManager(QtCore.QObject):
                     a = max(0.0, t - w)
                     b = t
                     c = min(1.0, t + w)
-                    bg = _blend(base, accent, 0.25)
-                    hi = _blend(base, accent, 0.85)
+                    bg = _blend(base_b, accent_b, 0.25)
+                    hi = _blend(base_b, accent_b, 0.85)
                     grad = (
                         "qlineargradient(x1:0,y1:0,x2:1,y2:0,"
                         f" stop:0 {_rgba(bg,255)},"
@@ -346,7 +504,8 @@ class AnimatedButtonsManager(QtCore.QObject):
                         f" stop:{c:.3f} {_rgba(bg,255)},"
                         f" stop:1 {_rgba(bg,255)});"
                     )
-                    self._apply_hover_qss(btn, st, f"QPushButton{{ background: {grad} }}")
+                    fg = _auto_fg_for_gradient(btn_text, bg, hi)
+                    self._apply_hover_qss(btn, st, f"QPushButton{{ background: {grad} color: {_rgba(fg,255)}; }}")
 
 
                 elif st.get("mode", "glow") == "outline":
@@ -370,16 +529,18 @@ class AnimatedButtonsManager(QtCore.QObject):
                     h = int((phase * 360.0) % 360)
                     raw = QtGui.QColor.fromHsv(h, sat, val)
                     # Blend a bit with the theme accent so it still feels consistent.
-                    border_c = _blend(accent, raw, 0.75)
+                    border_c = _blend(accent_b, raw, 0.75)
 
                     # Slightly tint the background so the outline doesn't feel detached.
                     bg = _blend(base, border_c, 0.10 + 0.06 * math.sin(2 * math.pi * phase))
 
+                    fg = _pick_text_color(bg, btn_text)
                     self._apply_hover_qss(
                         btn,
                         st,
                         "QPushButton{"
                         f" background: {_rgba(bg,255)};"
+                        f" color: {_rgba(fg,255)};"
                         "}"
                     )
                     # Outline glow via shadow effect (no border => no size hint jump).
@@ -397,6 +558,30 @@ class AnimatedButtonsManager(QtCore.QObject):
                     except Exception:
                         pass
 
+                
+
+
+
+                elif st.get("mode", "glow") == "scanline":
+                    # Bright scanline band sweeping top-to-bottom (very readable on both light/dark themes).
+                    t = phase
+                    w = 0.18
+                    a = max(0.0, t - w)
+                    b = t
+                    c = min(1.0, t + w)
+                    bg = _blend(base_b, accent_b, 0.18)
+                    hi = _blend(base_b, accent2_b, 0.92)
+                    grad = (
+                        "qlineargradient(x1:0,y1:0,x2:0,y2:1,"
+                        f" stop:0 {_rgba(bg,255)},"
+                        f" stop:{a:.3f} {_rgba(bg,255)},"
+                        f" stop:{b:.3f} {_rgba(hi,255)},"
+                        f" stop:{c:.3f} {_rgba(bg,255)},"
+                        f" stop:1 {_rgba(bg,255)});"
+                    )
+                    fg = _auto_fg_for_gradient(btn_text, bg, hi)
+                    self._apply_hover_qss(btn, st, f"QPushButton{{ background: {grad} color: {_rgba(fg,255)}; }}")
+
                 elif st.get("mode", "glow") == "shimmer":
                     # Diagonal shimmer band sliding across the button.
                     t = phase
@@ -404,8 +589,8 @@ class AnimatedButtonsManager(QtCore.QObject):
                     a = max(0.0, t - w)
                     b = t
                     c = min(1.0, t + w)
-                    bg = _blend(base, accent, 0.12)
-                    hi = _blend(base, accent2, 0.95)
+                    bg = _blend(base_b, accent_b, 0.12)
+                    hi = _blend(base_b, accent2_b, 0.95)
                     grad = (
                         "qlineargradient(x1:0,y1:0,x2:1,y2:1,"
                         f" stop:0 {_rgba(bg,255)},"
@@ -414,26 +599,28 @@ class AnimatedButtonsManager(QtCore.QObject):
                         f" stop:{c:.3f} {_rgba(bg,255)},"
                         f" stop:1 {_rgba(bg,255)});"
                     )
-                    self._apply_hover_qss(btn, st, f"QPushButton{{ background: {grad} }}")
+                    fg = _auto_fg_for_gradient(btn_text, bg, hi)
+                    self._apply_hover_qss(btn, st, f"QPushButton{{ background: {grad} color: {_rgba(fg,255)}; }}")
 
                 elif st.get("mode", "glow") == "pop":
                     # Micro "pop" feeling via center highlight + pulsing shadow (no geometry changes).
                     lift = 0.35 + 0.35 * (0.5 + 0.5 * math.sin(2 * math.pi * phase))
-                    center = _blend(base, accent2, 0.18 + 0.22 * lift)
-                    edge = _blend(base, accent, 0.10 + 0.06 * lift)
+                    center = _blend(base_b, accent2_b, 0.18 + 0.22 * lift)
+                    edge = _blend(base_b, accent_b, 0.10 + 0.06 * lift)
                     grad = (
                         "qradialgradient(cx:0.5, cy:0.5, radius:0.9,"
                         f" stop:0 {_rgba(center,255)},"
                         f" stop:1 {_rgba(edge,255)});"
                     )
-                    self._apply_hover_qss(btn, st, f"QPushButton{{ background: {grad} }}")
+                    fg = _pick_text_color(center, btn_text)
+                    self._apply_hover_qss(btn, st, f"QPushButton{{ background: {grad} color: {_rgba(fg,255)}; }}")
                     try:
                         eff = btn.graphicsEffect()
                         if isinstance(eff, QtWidgets.QGraphicsDropShadowEffect):
                             blur = 8 + int(14 * lift)
                             alpha = 70 + int(130 * lift)
                             eff.setBlurRadius(float(blur))
-                            eff.setColor(QtGui.QColor(accent.red(), accent.green(), accent.blue(), alpha))
+                            eff.setColor(QtGui.QColor(accent_b.red(), accent_b.green(), accent_b.blue(), alpha))
                             eff.setOffset(0, -1)
                     except Exception:
                         pass
@@ -441,19 +628,20 @@ class AnimatedButtonsManager(QtCore.QObject):
                 else:  # glow
                     # Subtle tint + pulsing drop shadow
                     tint = 0.35 + 0.15 * math.sin(2 * math.pi * phase)
-                    c1 = _blend(base, accent, tint)
+                    c1 = _blend(base_b, accent_b, tint)
                     grad = (
                         f"qlineargradient(x1:0,y1:0,x2:1,y2:0,"
                         f" stop:0 {_rgba(c1,255)}, stop:1 {_rgba(base,255)});"
                     )
-                    self._apply_hover_qss(btn, st, f"QPushButton{{ background: {grad} }}")
+                    fg = _pick_text_color(_blend(c1, base_b, 0.55), btn_text)
+                    self._apply_hover_qss(btn, st, f"QPushButton{{ background: {grad} color: {_rgba(fg,255)}; }}")
                     try:
                         eff = btn.graphicsEffect()
                         if isinstance(eff, QtWidgets.QGraphicsDropShadowEffect):
                             blur = 10 + int(10 * (0.5 + 0.5 * math.sin(2 * math.pi * phase)))
                             alpha = 60 + int(120 * (0.5 + 0.5 * math.sin(2 * math.pi * phase)))
                             eff.setBlurRadius(float(blur))
-                            eff.setColor(QtGui.QColor(accent.red(), accent.green(), accent.blue(), alpha))
+                            eff.setColor(QtGui.QColor(accent_b.red(), accent_b.green(), accent_b.blue(), alpha))
                             eff.setOffset(0, 0)
                     except Exception:
                         pass

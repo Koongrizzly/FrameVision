@@ -3,6 +3,7 @@ import os
 import time
 import random
 import json
+import re
 import subprocess
 from pathlib import Path
 
@@ -27,6 +28,7 @@ from PySide6.QtWidgets import (
     QSlider,
     QComboBox,
     QGridLayout,
+    QScrollArea,
 )
 
 # Lazy imports for heavy ML libs happen inside the worker.
@@ -169,6 +171,104 @@ class Wan21Worker(QObject):
     def _log(self, msg: str) -> None:
         self.progress.emit(msg)
 
+
+    # WAN env subprocess (Diffusers) ---------------------------------
+    def _find_wan21_python(self) -> Path | None:
+        """Return python.exe from wan21 env if available."""
+        root = _get_root_dir()
+        candidates = [
+            root / ".wan21_env" / "Scripts" / "python.exe",
+            root / "wan21_env" / "Scripts" / "python.exe",
+        ]
+        for p in candidates:
+            if p.exists():
+                return p
+        return None
+
+    def _run_diffusers_in_wan_env(self) -> str:
+        """Run Diffusers generation in the dedicated WAN venv."""
+        cfg = self.config
+        py = self._find_wan21_python()
+        if py is None:
+            raise RuntimeError(
+                "WAN 2.1 diffusers backend requires the WAN environment, but it wasn't found.\n\n"
+                "Expected one of:\n"
+                f"  {_get_root_dir() / '.wan21_env' / 'Scripts' / 'python.exe'}\n"
+                f"  {_get_root_dir() / 'wan21_env' / 'Scripts' / 'python.exe'}\n\n"
+                "Please run the Wan 2.1 installer from the Extras page, then retry."
+            )
+
+        runner = _get_root_dir() / "helpers" / "wan21_runner.py"
+        if not runner.exists():
+            raise RuntimeError(f"Missing runner script: {runner}")
+
+        # Write config JSON to a temp file in the output directory
+        cfg.output_dir.mkdir(parents=True, exist_ok=True)
+        tmp_json = cfg.output_dir / f"wan21_run_{int(time.time())}.json"
+        payload = {
+            "prompt": cfg.prompt,
+            "negative_prompt": cfg.negative_prompt,
+            "width": int(cfg.width),
+            "height": int(cfg.height),
+            "num_frames": int(cfg.num_frames),
+            "fps": int(cfg.fps),
+            "guidance_scale": float(cfg.guidance_scale),
+            "num_inference_steps": int(cfg.num_inference_steps),
+            "seed": None if cfg.seed is None else int(cfg.seed),
+            "use_random_seed": bool(cfg.use_random_seed),
+            "mode": str(cfg.mode),
+            "init_image_path": cfg.init_image_path,
+            "output_dir": str(cfg.output_dir),
+        }
+        tmp_json.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+
+        env = os.environ.copy()
+        env["PYTHONUTF8"] = "1"
+        env["PYTHONIOENCODING"] = "utf-8"
+
+        cmd = [str(py), str(runner), "--config", str(tmp_json)]
+        self._log(f"[Diffusers] Using WAN python: {py}")
+        self._log(f"[Diffusers] Runner: {runner}")
+
+        # Stream output back into the UI
+        creationflags = 0
+        if hasattr(subprocess, "CREATE_NO_WINDOW"):
+            creationflags = subprocess.CREATE_NO_WINDOW
+
+        proc = subprocess.Popen(
+            cmd,
+            cwd=str(_get_root_dir()),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            env=env,
+            creationflags=creationflags,
+        )
+
+        out_path = None
+        assert proc.stdout is not None
+        for line in proc.stdout:
+            s = line.rstrip("\r\n")
+            if s.startswith("__WAN21_RESULT__"):
+                out_path = s.split(" ", 1)[-1].strip()
+            else:
+                self._log(s)
+
+        rc = proc.wait()
+        try:
+            tmp_json.unlink(missing_ok=True)
+        except Exception:
+            pass
+
+        if rc != 0:
+            raise RuntimeError(f"WAN diffusers runner failed (exit_code={rc}). See log for details.")
+        if not out_path:
+            raise RuntimeError("WAN diffusers runner finished but did not report an output file.")
+        return out_path
+
+
     # Pipelines -------------------------------------------------------
     def _ensure_t2v_pipeline(self, device: str):
         """Load Wan 2.1 T2V 1.3B Diffusers pipeline on demand."""
@@ -277,7 +377,10 @@ class Wan21Worker(QObject):
         """
         Run Wan2.1 via stable-diffusion.cpp (sd-cli.exe).
 
-        This tries a couple flag variants to stay compatible with sd-cli changes.
+        Notes:
+        - Many sd-cli builds generate image sequences for vid_gen. We therefore always render
+          to PNG frames first, then encode an MP4 via ffmpeg.
+        - We also write a full log file next to the output for easier debugging.
         """
         cfg = self.config
 
@@ -304,203 +407,271 @@ class Wan21Worker(QObject):
             msg += "  .\\.wan21gguf_env\\venv\\Scripts\\python.exe presets\\extra_env\\wan21_guff.py download <key> --with-deps\n"
             raise RuntimeError(msg)
 
-        # output file
+        cfg.output_dir.mkdir(parents=True, exist_ok=True)
+
+        # output names
         timestamp = time.strftime("%Y%m%d_%H%M%S")
         out_suffix = "i2v" if cfg.mode == "i2v" else "t2v"
         seed = cfg.seed if cfg.seed is not None else random.randint(0, 2**31 - 1)
         out_path = cfg.output_dir / f"wan21_{out_suffix}_gguf_{timestamp}_{seed}.mp4"
 
-        # base command
-        base = [
+        # frames folder (sd-cli typically writes images, not mp4)
+        frames_dir = cfg.output_dir / f"wan21_{out_suffix}_gguf_{timestamp}_{seed}_frames"
+        frames_dir.mkdir(parents=True, exist_ok=True)
+        frames_pattern = str(frames_dir / "frame_%05d.png")
+
+        # full log
+        log_path = cfg.output_dir / f"wan21_{out_suffix}_gguf_{timestamp}_{seed}.log"
+
+        def _log_file_append(s: str) -> None:
+            try:
+                with open(log_path, "a", encoding="utf-8", errors="replace") as f:
+                    f.write(s)
+                    if not s.endswith("\n"):
+                        f.write("\n")
+            except Exception:
+                pass
+
+        def _tail_text(s: str, max_lines: int = 40) -> str:
+            lines = (s or "").splitlines()
+            if len(lines) <= max_lines:
+                return "\n".join(lines)
+            return "\n".join(lines[-max_lines:])
+
+        def _run_capture(cmd: list[str]) -> tuple[int, str]:
+            # Always log the exact command + output.
+            header = "\n" + ("=" * 90) + "\n" + "CMD: " + " ".join(cmd) + "\n"
+            self._log("[GGUF] Running:\n  " + " ".join(cmd))
+            _log_file_append(header)
+
+            creationflags = 0
+            if hasattr(subprocess, "CREATE_NO_WINDOW"):
+                creationflags = subprocess.CREATE_NO_WINDOW
+
+            p = subprocess.run(
+                cmd,
+                cwd=str(_get_root_dir()),
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                creationflags=creationflags,
+            )
+            combined = (p.stdout or "") + ("\n" if p.stdout and p.stderr else "") + (p.stderr or "")
+            if combined.strip():
+                # Stream into UI (truncate per-chunk so UI remains responsive)
+                for line in combined.splitlines():
+                    self._log(line)
+            _log_file_append(combined.rstrip())
+            _log_file_append(f"EXIT_CODE: {p.returncode}\n")
+            return p.returncode, combined
+
+        def _probe_help() -> str:
+            # Some builds print help to stderr; capture both.
+            for args in ([str(sdcli), "--help"], [str(sdcli), "-h"]):
+                try:
+                    p = subprocess.run(args, capture_output=True, text=True, encoding="utf-8", errors="replace")
+                    txt = (p.stdout or "") + "\n" + (p.stderr or "")
+                    if txt.strip():
+                        return txt
+                except Exception:
+                    continue
+            return ""
+
+        help_txt = _probe_help()
+
+        def _has(flag: str) -> bool:
+            if not help_txt:
+                return True  # can't probe; assume yes
+            return flag in help_txt
+
+        def _pick(candidates: list[str], fallback: str) -> str:
+            if help_txt:
+                for c in candidates:
+                    if c in help_txt:
+                        return c
+            return fallback
+
+        # Choose flags based on detected help output (or sane defaults).
+        steps_f = _pick(["--steps", "--num-steps", "-s"], "--steps")
+        width_f = _pick(["--width", "-W"], "--width")
+        height_f = _pick(["--height", "-H"], "--height")
+        frames_f = _pick(["--frames", "--num-frames", "--num_frames"], "--frames")
+        fps_f = _pick(["--fps", "--frame-rate", "--frame_rate"], "--fps")
+        out_f = _pick(["-o", "--output", "--out"], "-o")
+        out_begin_f = _pick(["--output-begin-idx", "--output_begin_idx"], "--output-begin-idx")
+        neg_f = _pick(["-n", "--negative-prompt", "--negative_prompt"], "-n")
+        cfg_f = _pick(["--cfg-scale", "--cfg_scale"], "--cfg-scale")
+        sampler_f = _pick(["--sampling-method", "--sampling_method", "--sampler"], "--sampling-method")
+        t5_f = _pick(["--t5xxl", "--t5xxl-model", "--t5"], "--t5xxl")
+        seed_f = _pick(["--seed"], "--seed")
+
+        # i2v flags
+        init_candidates = ["--init-img", "--init-image", "--init_img", "--image", "--input"]
+        init_f = _pick(init_candidates, init_candidates[0])
+
+        # Find ffmpeg (FrameVision typically ships one, otherwise fall back to PATH)
+        def _find_ffmpeg() -> str:
+            root = _get_root_dir()
+            candidates = [
+                root / "ffmpeg" / "bin" / "ffmpeg.exe",
+                root / "bin" / "ffmpeg.exe",
+                root / "tools" / "ffmpeg" / "bin" / "ffmpeg.exe",
+                root / ".ffmpeg" / "bin" / "ffmpeg.exe",
+                Path("ffmpeg"),
+            ]
+            for c in candidates:
+                try:
+                    if c.exists():
+                        return str(c)
+                except Exception:
+                    continue
+            return "ffmpeg"
+
+        # Build base command (minimal, only add optional flags if present in help)
+        cmd = [
             str(sdcli),
             "-M", "vid_gen",
             "--diffusion-model", str(diffusion),
             "--vae", str(vae),
-            "--t5xxl", str(t5),
+            t5_f, str(t5),
             "-p", cfg.prompt,
-            "--cfg-scale", str(cfg.guidance_scale),
-            "--sampling-method", "euler",
-            "--seed", str(seed),
         ]
-        if cfg.negative_prompt.strip():
-            base += ["-n", cfg.negative_prompt.strip()]
 
+        if cfg.negative_prompt.strip() and _has(neg_f):
+            cmd += [neg_f, cfg.negative_prompt.strip()]
+
+        if _has(seed_f):
+            cmd += [seed_f, str(seed)]
+
+        # Optional tuning flags
+        if _has(cfg_f):
+            cmd += [cfg_f, str(cfg.guidance_scale)]
+        if _has(sampler_f):
+            cmd += [sampler_f, "euler"]
+
+        # Core size/time controls
+        if _has(steps_f):
+            cmd += [steps_f, str(cfg.num_inference_steps)]
+        if _has(width_f) and _has(height_f):
+            cmd += [width_f, str(cfg.width), height_f, str(cfg.height)]
+        if _has(frames_f):
+            cmd += [frames_f, str(cfg.num_frames)]
+        if _has(fps_f):
+            cmd += [fps_f, str(cfg.fps)]
+
+        # I2V extras
         if cfg.mode == "i2v":
             if not cfg.init_image_path:
                 raise ValueError("Image-to-video mode enabled but no image was selected.")
             image_path = Path(cfg.init_image_path)
             if not image_path.exists():
                 raise ValueError(f"Input image does not exist: {image_path}")
-            base += ["--clip_vision", str(clipv)]
-            # init-image flag differs across builds; we will try a few.
-            init_flag_candidates = ["--init-img", "--init-image", "--image", "--input"]
-        else:
-            init_flag_candidates = []
 
-        # Some flags vary across sd-cli versions; try a few combinations.
-        steps_flags = ["--steps", "--num-steps"]
-        width_flags = ["--width", "-W"]
-        height_flags = ["--height", "-H"]
-        frames_flags = ["--frames", "--num-frames", "--num_frames"]
-        fps_flags = ["--fps", "--frame-rate"]
-        out_flags = ["-o", "--output", "--out"]
+            if _has("--clip_vision"):
+                cmd += ["--clip_vision", str(clipv)]
+            if _has(init_f):
+                cmd += [init_f, str(image_path)]
 
-        def try_run(cmd: list[str]) -> tuple[int, str, str]:
-            self._log("[GGUF] Running:\n  " + " ".join(cmd))
-            p = subprocess.run(cmd, capture_output=True, text=True)
-            if p.stdout:
-                self._log(p.stdout.strip())
-            if p.stderr:
-                self._log(p.stderr.strip())
-            return p.returncode, p.stdout, p.stderr
+        # Output is an image sequence; encode to mp4 afterwards.
+        cmd += [out_f, frames_pattern]
+        if _has(out_begin_f):
+            cmd += [out_begin_f, "0"]
 
-        last_err = ""
-        for steps_f in steps_flags:
-            for wf in width_flags:
-                for hf in height_flags:
-                    for ff in frames_flags:
-                        for fpsf in fps_flags:
-                            for outf in out_flags:
-                                cmd = base.copy()
-                                cmd += [steps_f, str(cfg.num_inference_steps)]
-                                cmd += [wf, str(cfg.width), hf, str(cfg.height)]
-                                cmd += [ff, str(cfg.num_frames)]
-                                cmd += [fpsf, str(cfg.fps)]
-                                if cfg.mode == "i2v":
-                                    # insert init-image flag as one of candidates
-                                    ok = False
-                                    for initf in init_flag_candidates:
-                                        cmd2 = cmd.copy()
-                                        cmd2 += [initf, str(Path(cfg.init_image_path))]
-                                        cmd2 += [outf, str(out_path)]
-                                        rc, _, err = try_run(cmd2)
-                                        if rc == 0:
-                                            ok = True
-                                            break
-                                        last_err = err or last_err
-                                        # if unknown-arg, keep trying; else also try.
-                                    if ok:
-                                        break
-                                    else:
-                                        continue
-                                else:
-                                    cmd += [outf, str(out_path)]
-                                    rc, _, err = try_run(cmd)
-                                    if rc == 0:
-                                        break
-                                    last_err = err or last_err
-                            else:
-                                continue
-                            break
-                        else:
-                            continue
-                        break
-                    else:
-                        continue
-                    break
-                else:
-                    continue
+        # Run sd-cli (retry a couple times if it reports unknown args and we can safely drop them)
+        last_out = ""
+        for attempt in range(3):
+            rc, combined = _run_capture(cmd)
+            last_out = combined
+
+            if rc == 0:
                 break
-            else:
+
+            # If unknown argument, try removing that flag (and its value if present)
+            m = re.search(r"unknown argument:\s*(--?[\w\-]+)", combined or "", flags=re.IGNORECASE)
+            if not m:
+                break
+            bad = m.group(1).strip()
+
+            # Known flags that consume a value
+            takes_value = {
+                "--diffusion-model", "--vae", t5_f, "-p", neg_f, seed_f, cfg_f, sampler_f,
+                steps_f, width_f, height_f, frames_f, fps_f, out_f, out_begin_f, "--clip_vision", init_f,
+            }
+
+            if bad in cmd:
+                i = cmd.index(bad)
+                # remove flag
+                cmd.pop(i)
+                # remove value if this flag expects one and the next token is not another flag
+                if bad in takes_value and i < len(cmd) and not str(cmd[i]).startswith("-"):
+                    cmd.pop(i)
+                self._log(f"[GGUF] sd-cli rejected {bad}; retrying without it...")
+                _log_file_append(f"[NOTE] Removed rejected flag: {bad}\n")
                 continue
+
             break
 
-        if not out_path.exists():
+        # Determine if frames were created
+        frames = sorted(frames_dir.glob("*.png"))
+        if not frames:
+            # Some sd-cli builds might still write directly to the output path; check.
+            if out_path.exists():
+                self._log(f"Saving video to: {out_path}")
+                self.finished.emit(str(out_path))
+                return
+
             raise RuntimeError(
-                "GGUF run finished but output file was not found:\n"
-                f"  {out_path}\n\n"
-                "sd-cli error output (last):\n"
-                f"{last_err}"
+                "GGUF run finished but no output frames were found.\n\n"
+                f"Expected frames like:\n  {frames_pattern}\n\n"
+                f"Log saved to:\n  {log_path}\n\n"
+                "Last sd-cli output (tail):\n"
+                f"{_tail_text(last_out)}"
+            )
+
+        # Encode frames -> mp4
+        ffmpeg = _find_ffmpeg()
+        ff_in = str(frames_dir / "frame_%05d.png")
+        ff_cmd = [
+            ffmpeg,
+            "-y",
+            "-hide_banner",
+            "-loglevel", "error",
+            "-framerate", str(cfg.fps),
+            "-start_number", "0",
+            "-i", ff_in,
+            "-vf", "pad=ceil(iw/2)*2:ceil(ih/2)*2",
+            "-c:v", "libx264",
+            "-pix_fmt", "yuv420p",
+            str(out_path),
+        ]
+
+        rc2, out2 = _run_capture(ff_cmd)
+        if rc2 != 0 or not out_path.exists():
+            raise RuntimeError(
+                "Frames were generated, but encoding to MP4 failed.\n\n"
+                f"Frames folder:\n  {frames_dir}\n\n"
+                f"Log saved to:\n  {log_path}\n\n"
+                "ffmpeg output (tail):\n"
+                f"{_tail_text(out2)}"
             )
 
         self._log(f"Saving video to: {out_path}")
         self.finished.emit(str(out_path))
 
+
     # Main worker -----------------------------------------------------
     def run(self) -> None:
         try:
-            from diffusers.utils import export_to_video, load_image
-            import torch
-
             cfg = self.config
 
+            # GGUF backend runs in-process
             if getattr(cfg, "backend", "diffusers") == "gguf":
                 self._run_gguf()
                 return
 
-            if not cfg.prompt.strip():
-                raise ValueError("Prompt is empty. Please enter a prompt.")
-
-            device = "cuda" if torch.cuda.is_available() else "cpu"
-            if device == "cpu":
-                self._log("[WARNING] CUDA GPU not detected. Falling back to CPU (very slow and may OOM).")
-
-            # Seed handling
-            if cfg.use_random_seed or cfg.seed is None:
-                seed = random.randint(0, 2**31 - 1)
-            else:
-                seed = int(cfg.seed)
-
-            self._log(f"Using seed: {seed}")
-            generator = torch.Generator(device=device).manual_seed(seed)
-
-            # Ensure output directory exists
-            cfg.output_dir.mkdir(parents=True, exist_ok=True)
-            timestamp = time.strftime("%Y%m%d_%H%M%S")
-            out_suffix = "i2v" if cfg.mode == "i2v" else "t2v"
-            out_path = cfg.output_dir / f"wan21_{out_suffix}_{timestamp}_{seed}.mp4"
-
-            if cfg.mode == "i2v":
-                # ----------------- I2V branch ---------------------
-                if not cfg.init_image_path:
-                    raise ValueError("Image-to-video mode enabled but no image was selected.")
-
-                image_path = Path(cfg.init_image_path)
-                if not image_path.exists():
-                    raise ValueError(f"Input image does not exist: {image_path}")
-
-                self._log(f"[I2V] Loading init image:\n  {image_path}")
-                init_image = load_image(str(image_path))
-
-                pipe = self._ensure_i2v_pipeline(device)
-                self._log(
-                    f"[I2V] Generating video at {cfg.width}x{cfg.height}, {cfg.num_frames} frames, "
-                    f"guidance_scale={cfg.guidance_scale}, steps={cfg.num_inference_steps}..."
-                )
-
-                result = pipe(
-                    prompt=cfg.prompt,
-                    image=init_image,
-                    negative_prompt=cfg.negative_prompt or None,
-                    num_frames=cfg.num_frames,
-                    guidance_scale=cfg.guidance_scale,
-                    num_inference_steps=cfg.num_inference_steps,
-                    generator=generator,
-                )
-                frames = result.frames[0]
-            else:
-                # ----------------- T2V branch ---------------------
-                pipe = self._ensure_t2v_pipeline(device)
-                self._log(
-                    f"[T2V] Generating video at {cfg.width}x{cfg.height}, {cfg.num_frames} frames, "
-                    f"guidance_scale={cfg.guidance_scale}, steps={cfg.num_inference_steps}..."
-                )
-
-                result = pipe(
-                    prompt=cfg.prompt,
-                    negative_prompt=cfg.negative_prompt or None,
-                    height=cfg.height,
-                    width=cfg.width,
-                    num_frames=cfg.num_frames,
-                    guidance_scale=cfg.guidance_scale,
-                    num_inference_steps=cfg.num_inference_steps,
-                    generator=generator,
-                )
-                frames = result.frames[0]
-
-            self._log(f"Saving video to: {out_path}")
-            export_to_video(frames, str(out_path), fps=cfg.fps)
-
+            # Diffusers backend MUST run in the dedicated WAN venv, not the app .venv
+            out_path = self._run_diffusers_in_wan_env()
             self.finished.emit(str(out_path))
         except Exception as exc:  # noqa: BLE001
             self.error.emit(str(exc))
@@ -517,8 +688,23 @@ class Wan21Window(QMainWindow):
 
         central = QWidget(self)
         self.setCentralWidget(central)
-        layout = QVBoxLayout(central)
-        layout.setContentsMargins(10, 10, 10, 10)
+
+        # Use a scroll area for the main controls so the UI remains usable on small windows.
+        outer_layout = QVBoxLayout(central)
+        outer_layout.setContentsMargins(10, 10, 10, 10)
+        outer_layout.setSpacing(8)
+
+        scroll_area = QScrollArea(central)
+        scroll_area.setWidgetResizable(True)
+        scroll_area.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+        scroll_area.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        outer_layout.addWidget(scroll_area, stretch=0)
+
+        form = QWidget(scroll_area)
+        scroll_area.setWidget(form)
+
+        layout = QVBoxLayout(form)
+        layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(8)
 
 
@@ -737,12 +923,15 @@ class Wan21Window(QMainWindow):
         self.log_edit.setReadOnly(True)
         self.log_edit.setPlaceholderText("Log output will appear here...")
 
-        # Assemble layout
+        # Assemble layout (scrollable form area)
         layout.addWidget(prompt_group)
         layout.addWidget(neg_group)
         layout.addWidget(settings_group)
-        layout.addWidget(self.progress_bar)
-        layout.addWidget(self.log_edit, stretch=1)
+        layout.addStretch(1)
+
+        # Progress + log (always visible, below the scroll area)
+        outer_layout.addWidget(self.progress_bar)
+        outer_layout.addWidget(self.log_edit, stretch=1)
 
         # Sync sliders <-> spinboxes
         self._wire_spin_slider_sync()

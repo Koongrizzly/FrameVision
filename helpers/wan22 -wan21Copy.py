@@ -173,6 +173,7 @@ class Wan22Pane(QWidget):
         self.cmb_engine = QComboBox()
         self.cmb_engine.addItem("WAN 2.2", "wan22")
         self.cmb_engine.addItem("HunyuanVideo 1.5", "hunyuan15")
+        self.cmb_engine.addItem("WAN 2.1", "wan21")
         engine_row.addWidget(QLabel("Engine:"))
         engine_row.addWidget(self.cmb_engine)
         engine_row.addStretch(1)
@@ -758,6 +759,42 @@ class Wan22Pane(QWidget):
 
         try:
             self._engine_stack.addWidget(self._huny_page)
+        except Exception:
+            pass
+
+        # WAN 2.1 page (optional)
+        self._wan21_page = QWidget()
+        wan21_layout = QVBoxLayout(self._wan21_page)
+        wan21_layout.setContentsMargins(0, 0, 0, 0)
+        wan21_layout.setSpacing(0)
+        self._wan21_widget = None
+        try:
+            try:
+                from helpers.wan21 import Wan21Window  # type: ignore
+            except Exception:
+                from wan21 import Wan21Window  # type: ignore
+            self._wan21_widget = Wan21Window()
+            try:
+                self._wan21_widget.setParent(self._wan21_page)
+            except Exception:
+                pass
+            try:
+                # Embed the QMainWindow inside our stack
+                self._wan21_widget.setWindowFlags(Qt.Widget)
+            except Exception:
+                pass
+            try:
+                self._wan21_widget.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+            except Exception:
+                pass
+            wan21_layout.addWidget(self._wan21_widget)
+        except Exception:
+            lbl = QLabel("WAN 2.1 UI not available (missing wan21.py).")
+            lbl.setWordWrap(True)
+            wan21_layout.addWidget(lbl)
+
+        try:
+            self._engine_stack.addWidget(self._wan21_page)
         except Exception:
             pass
 
@@ -1518,15 +1555,25 @@ class Wan22Pane(QWidget):
         except Exception:
             key = "wan22"
 
+        # Map engine key -> stacked index
+        idx_map = {
+            "wan22": 0,
+            "hunyuan15": 1,
+            "wan21": 2,
+        }
+
         try:
             if getattr(self, "_engine_stack", None) is not None:
-                self._engine_stack.setCurrentIndex(0 if key == "wan22" else 1)
+                self._engine_stack.setCurrentIndex(int(idx_map.get(key, 0)))
         except Exception:
             pass
 
+        # Banner text
         try:
             if key == "wan22":
                 self.banner.setText("Video Creation with Wan 2.2 5B")
+            elif key == "wan21":
+                self.banner.setText("Video Creation with Wan 2.1")
             else:
                 self.banner.setText("Video Creation with HunyuanVideo 1.5")
         except Exception:
@@ -1537,6 +1584,7 @@ class Wan22Pane(QWidget):
                 self._save_settings()
             except Exception:
                 pass
+
 
     def _on_engine_changed(self, *_):
         self._sync_engine_view(save=True)

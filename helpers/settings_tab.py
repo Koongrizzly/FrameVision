@@ -586,7 +586,6 @@ def _options_group(page: QWidget) -> QGroupBox:
         h_banner.addWidget(cb_banner_color)
         h_banner.addStretch(1)
         v.addWidget(row_banner)
-
         # -- Animated buttons ----------------------------------------------------------
         cb_animbtn = QCheckBox("Animated buttons")
         cb_animbtn.setToolTip("If enabled, 'Generate' and 'View results' buttons will animate on hover.")
@@ -599,6 +598,7 @@ def _options_group(page: QWidget) -> QGroupBox:
         cb_anim_shift = QCheckBox("Color shift")
         cb_anim_boom = QCheckBox("Boomerang")
         cb_anim_outline = QCheckBox("Neon outline")
+        cb_anim_scanline = QCheckBox("Scanline")
         cb_anim_shimmer = QCheckBox("Shimmer")
         cb_anim_pop = QCheckBox("Pop")
         cb_anim_rand = QCheckBox("Random (each hover)")
@@ -607,12 +607,13 @@ def _options_group(page: QWidget) -> QGroupBox:
         cb_anim_shift.setToolTip("Smooth color cycling on hover.")
         cb_anim_boom.setToolTip("Animated left-right-left gradient sweep on hover.")
         cb_anim_outline.setToolTip("Pulsing neon outline while hovered.")
+        cb_anim_scanline.setToolTip("A bright scanline band sweeps top-to-bottom on hover.")
         cb_anim_shimmer.setToolTip("Diagonal shine that sweeps across the button.")
         cb_anim_pop.setToolTip("Micro pop feeling via center highlight and lift shadow.")
         cb_anim_rand.setToolTip("Pick a different effect each time you hover (all effects).")
 
         mode_default = (s.value("animated_buttons_mode", "glow", type=str) or "glow").strip().lower()
-        if mode_default not in ("glow", "shift", "boomerang", "outline", "shimmer", "pop", "random"):
+        if mode_default not in ("glow", "shift", "boomerang", "outline", "scanline", "shimmer", "pop", "random"):
             mode_default = "glow"
 
         row_anim = QWidget(content)
@@ -643,6 +644,7 @@ def _options_group(page: QWidget) -> QGroupBox:
         h_anim2_2.setContentsMargins(0, 0, 0, 0)
         h_anim2_2.setSpacing(12)
         h_anim2_2.addWidget(cb_anim_outline)
+        h_anim2_2.addWidget(cb_anim_scanline)
         h_anim2_2.addStretch(1)
         v_anim2.addWidget(row_anim_modes_2)
 
@@ -669,7 +671,7 @@ def _options_group(page: QWidget) -> QGroupBox:
 
         def _anim_set_mode(mode: str):
             mode = (mode or "").strip().lower()
-            if mode not in ("glow", "shift", "boomerang", "outline", "shimmer", "pop", "random"):
+            if mode not in ("glow", "shift", "boomerang", "outline", "scanline", "shimmer", "pop", "random"):
                 mode = "glow"
             try:
                 s.setValue("animated_buttons_mode", mode)
@@ -682,6 +684,7 @@ def _options_group(page: QWidget) -> QGroupBox:
                 (cb_anim_shift, mode == "shift"),
                 (cb_anim_boom, mode == "boomerang"),
                 (cb_anim_outline, mode == "outline"),
+                (cb_anim_scanline, mode == "scanline"),
                 (cb_anim_shimmer, mode == "shimmer"),
                 (cb_anim_pop, mode == "pop"),
                 (cb_anim_rand, mode == "random"),
@@ -714,7 +717,7 @@ def _options_group(page: QWidget) -> QGroupBox:
             # If turning ON, ensure a mode is selected.
             if b:
                 cur = (s.value("animated_buttons_mode", "glow", type=str) or "glow").strip().lower()
-                if cur not in ("glow", "shift", "boomerang", "outline", "shimmer", "pop", "random"):
+                if cur not in ("glow", "shift", "boomerang", "outline", "scanline", "shimmer", "pop", "random"):
                     cur = "glow"
                 _anim_set_mode(cur)
             else:
@@ -737,13 +740,13 @@ def _options_group(page: QWidget) -> QGroupBox:
         cb_anim_shift.toggled.connect(lambda b: _anim_on_sub_toggle("shift", b))
         cb_anim_boom.toggled.connect(lambda b: _anim_on_sub_toggle("boomerang", b))
         cb_anim_outline.toggled.connect(lambda b: _anim_on_sub_toggle("outline", b))
+        cb_anim_scanline.toggled.connect(lambda b: _anim_on_sub_toggle("scanline", b))
         cb_anim_shimmer.toggled.connect(lambda b: _anim_on_sub_toggle("shimmer", b))
         cb_anim_pop.toggled.connect(lambda b: _anim_on_sub_toggle("pop", b))
         cb_anim_rand.toggled.connect(lambda b: _anim_on_sub_toggle("random", b))
 
         # Apply initial mode states
         _anim_set_mode(mode_default)
-
 
         # -- Font size (global) ----------------------------------------------------------
         cb_font = QCheckBox("Change font size")

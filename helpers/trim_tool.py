@@ -8,10 +8,11 @@ from PySide6.QtCore import Qt, QEvent, QObject, QRect, Signal
 from PySide6.QtGui import QPainter, QPixmap
 from helpers.batch import BatchSelectDialog
 from PySide6.QtWidgets import (
+    QApplication,
     QFormLayout, QHBoxLayout, QLabel, QLineEdit, QComboBox, QPushButton, QSlider,
-    QScrollArea, QWidget, QMessageBox, QSpinBox, QGridLayout, QGraphicsOpacityEffect
-, QDialog, QVBoxLayout, QListWidget, QFileDialog, QDialogButtonBox, QGroupBox, QRadioButton, QListWidgetItem)
-
+    QScrollArea, QWidget, QMessageBox, QSpinBox, QGridLayout, QGraphicsOpacityEffect,
+    QDialog, QVBoxLayout, QListWidget, QFileDialog, QDialogButtonBox, QGroupBox, QRadioButton, QListWidgetItem,
+)
 # ---- paths ----
 def ffmpeg_path():
     try:
@@ -415,7 +416,28 @@ def install_trim_tool(pane, section_widget):
                 pass
 
     # connect
-    pane.btn_trim_preview.clicked.connect(_load_preview)   # manual generate only
+    def _on_generate_preview():
+        # show busy state while thumbnails are being generated
+        btn = pane.btn_trim_preview
+        prev = btn.text()
+        btn.setText("Generating…")
+        btn.setEnabled(False)
+        try:
+            QApplication.setOverrideCursor(Qt.WaitCursor)
+            QApplication.processEvents()
+        except Exception:
+            pass
+        try:
+            _load_preview()
+        finally:
+            try:
+                QApplication.restoreOverrideCursor()
+            except Exception:
+                pass
+            btn.setEnabled(True)
+            btn.setText(prev)
+
+    pane.btn_trim_preview.clicked.connect(_on_generate_preview)   # manual generate only
     # NO auto-regenerate on spin/size; size only rescales & reflows
     pane.thumb_size.valueChanged.connect(lambda _: _rescale_thumbs())
     pane.trim_preview_area.viewport().installEventFilter(_ResizeWatcher(pane))
