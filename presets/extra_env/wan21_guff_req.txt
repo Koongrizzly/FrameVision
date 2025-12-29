@@ -1,0 +1,7 @@
+# WAN 2.1 GGUF optional environment (lightweight)
+# This env is used for downloading models + grabbing stable-diffusion.cpp binaries.
+
+huggingface_hub>=0.24.6
+requests>=2.31.0
+tqdm>=4.66.0
+colorama>=0.4.6
