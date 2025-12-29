@@ -8,6 +8,37 @@ Video Walktrough (most is speedup x2 to show much in less time)
 
 ---
 <details>
+  <summary>December 28, 2025. V2.1.1 mini update</summary>
+
+Bugfixes
+- fixed optional installs: background model + Z-image fp16 installer
+- fixed move up/down in queue (pending) + right click options restored for moving
+- fixed shrink feature for repeat button
+- fixed adding Music Clip Creator jobs to the queue, queue-ing button restored
+- fixed filename for random seeds in Hunyuan
+- not 100% fixed yet: queue finished results — if video playback or visuals from music player stutter: clear finished results in queue
+---
+UI improvements
+- more “View Result” buttons (most tools now have it)
+- new Settings toggles ;
+- animated hover effects on some buttons (6 animations + random)
+- Change font size
+- moved buttons to front in queue (finished)
+- simplified treeview in Media Explorer
+- updated Features HTML + a big part of the Knowledge Base in the Info menu
+
+New features
+- VideoText (beta test)
+  - allows adding text to video
+  - choice of font, size, position
+  - unlimited text adding
+  - adjustable fade in/out
+  - preview toggle to always show all text
+  - preview timeline with zoom/pan/drag/drop
+  - text effects
+  - load/play/pause/stop/save
+</details>
+<details>
   <summary>December 25, 2025 — v2.1 release notes</summary>
 
 **✨ New Features**
