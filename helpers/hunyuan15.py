@@ -323,6 +323,7 @@ class Hunyuan15ToolWidget(QWidget):
 
         # Video-to-video state (use last frame of a chosen source video as the start image)
         self._video2video_path: Path | None = None
+        self._v2v_last_frame: Path | None = None
         self._extend_auto_merge: bool = False
         self._extend_pending_output: Path | None = None
         self._extend_base_out: Path | None = None
@@ -3176,7 +3177,11 @@ Pick a Start image, or enable Video→Video and pick a source video.""",
         return False
 
     def _apply_v2v_source(self, video: Path, silent: bool = False) -> bool:
-        """Set Video→Video source, extract last frame, and fill Start image."""
+        """Set Video→Video source, extract last frame, and fill Start image.
+
+        Note: switching the V2V source should never keep using an old auto-extracted frame.
+        We clear the previous auto frame first so a failed extract cannot silently reuse it.
+        """
         try:
             p = Path(video)
         except Exception:
@@ -3194,6 +3199,36 @@ Pick a Start image, or enable Video→Video and pick a source video.""",
                 self.chk_video2video.setChecked(True)
         except Exception:
             pass
+
+        # If Start image currently points to an auto-extracted V2V frame, clear it before switching sources.
+        # This prevents an old V2V frame from being reused if extracting the new frame fails.
+        should_clear_old = False
+        try:
+            cur_img = self._start_image_path()
+        except Exception:
+            cur_img = ""
+        try:
+            prev_frame = getattr(self, "_v2v_last_frame", None)
+        except Exception:
+            prev_frame = None
+        try:
+            if cur_img:
+                curp = Path(cur_img)
+                if prev_frame and Path(str(prev_frame)) == curp:
+                    should_clear_old = True
+                else:
+                    try:
+                        if curp.parent == _extend_frames_dir():
+                            should_clear_old = True
+                    except Exception:
+                        pass
+        except Exception:
+            pass
+        if should_clear_old:
+            try:
+                self.start_image.setText("")
+            except Exception:
+                pass
 
         self._video2video_path = p
 
@@ -3216,11 +3251,29 @@ Pick a Start image, or enable Video→Video and pick a source video.""",
             frame_path = self._next_extend_frame_path()
             ok = self._extract_last_frame(p, frame_path)
             if not ok:
+                # Make sure we don't keep the old V2V auto-frame if we cleared it.
+                try:
+                    if should_clear_old:
+                        self.start_image.setText("")
+                except Exception:
+                    pass
+                try:
+                    self._v2v_last_frame = None
+                except Exception:
+                    pass
                 if not silent:
-                    QMessageBox.warning(self, "Video→Video", "Failed to extract last frame from the source video.")
+                    try:
+                        QMessageBox.warning(self, "Video→Video", "Failed to extract last frame from the source video.")
+                    except Exception:
+                        pass
                 return False
+
             try:
                 self.start_image.setText(str(frame_path))
+            except Exception:
+                pass
+            try:
+                self._v2v_last_frame = frame_path
             except Exception:
                 pass
             try:
@@ -3239,6 +3292,7 @@ Pick a Start image, or enable Video→Video and pick a source video.""",
                 except Exception:
                     pass
             return False
+
 
 
     def on_download(self):

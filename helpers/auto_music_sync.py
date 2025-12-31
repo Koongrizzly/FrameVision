@@ -7404,11 +7404,11 @@ class AutoMusicSyncWidget(QWidget):
         adv.addRow("Beat sensitivity:", self.slider_sens)
 
         self.spin_beats_per_seg = QSpinBox(self)
-        self.spin_beats_per_seg.setRange(1, 64)
+        self.spin_beats_per_seg.setRange(1, 256)
         self.spin_beats_per_seg.setValue(2)
         self.spin_beats_per_seg.setToolTip(
             "Number of beats grouped into one base video segment.\n"
-            "1 = very fast cuts, 2 = default, 4+ = slower cuts."
+            "1 = very fast cuts, 4 = default, 8+ = slower cuts. You can go up to 256 when you want long clips in very fast music (eg. DnB 170bpm"
         )
         adv.addRow("Beats per base segment:", self.spin_beats_per_seg)
 
@@ -8057,6 +8057,12 @@ class AutoMusicSyncWidget(QWidget):
 
 
 
+
+        # Persist immediately so it survives app restart even if the user doesn't render right away.
+        try:
+            self._save_settings()
+        except Exception:
+            pass
     def _update_transition_visibility(self) -> None:
         """Show or hide the transitions dropdown row based on random mode."""
         # If random transitions are enabled, hide the label + dropdown since
@@ -8518,6 +8524,39 @@ class AutoMusicSyncWidget(QWidget):
         self.combo_clip_order.setCurrentIndex(int(s.value("clip_order", self.combo_clip_order.currentIndex())))
         self.combo_transitions.setCurrentIndex(int(s.value("transitions_mode", self.combo_transitions.currentIndex())))
         self.check_trans_random.setChecked(bool(int(s.value("transitions_random", int(self.check_trans_random.isChecked())))))
+        # Restore the allowed transition styles for Random transitions
+        try:
+            raw = s.value("transitions_random_enabled_modes", "", str)
+        except Exception:
+            raw = ""
+        modes = []
+        if raw:
+            try:
+                data = json.loads(raw)
+                if isinstance(data, (list, tuple)):
+                    modes = [int(x) for x in data]
+                else:
+                    modes = [int(x.strip()) for x in str(raw).split(",") if x.strip()]
+            except Exception:
+                try:
+                    modes = [int(x.strip()) for x in str(raw).split(",") if x.strip()]
+                except Exception:
+                    modes = []
+        cleaned = []
+        for x in modes:
+            try:
+                xi = int(x)
+            except Exception:
+                continue
+            if 0 <= xi <= 14 and xi not in cleaned:
+                cleaned.append(xi)
+        if cleaned:
+            self._enabled_transition_modes = set(cleaned)
+        else:
+            # If nothing was saved yet, keep the current default (all enabled)
+            if not getattr(self, "_enabled_transition_modes", None):
+                self._enabled_transition_modes = {0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14}
+
         self.spin_seed.setValue(int(s.value("seed_value", self.spin_seed.value())))
         self.check_use_seed.setChecked(bool(int(s.value("use_seed", int(self.check_use_seed.isChecked())))))
         self.combo_res.setCurrentIndex(int(s.value("res_mode", self.combo_res.currentIndex())))
@@ -8798,6 +8837,11 @@ class AutoMusicSyncWidget(QWidget):
         s.setValue("clip_order", self.combo_clip_order.currentIndex())
         s.setValue("transitions_mode", self.combo_transitions.currentIndex())
         s.setValue("transitions_random", int(self.check_trans_random.isChecked()))
+        # Remember which transition styles are enabled for Random transitions
+        try:
+            s.setValue("transitions_random_enabled_modes", json.dumps(sorted(getattr(self, "_enabled_transition_modes", []))))
+        except Exception:
+            pass
         s.setValue("seed_value", self.spin_seed.value())
         s.setValue("use_seed", int(self.check_use_seed.isChecked()))
         s.setValue("res_mode", self.combo_res.currentIndex())
