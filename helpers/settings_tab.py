@@ -213,25 +213,98 @@ def _wipe_layout(lay: QtWidgets.QLayout) -> None:
     except Exception:
         pass
 
+def _force_theme_refresh(app: Optional[QtWidgets.QApplication]) -> None:
+    """Force a full style repolish across existing widgets.
+
+    This helps when switching between light/dark themes where some widgets keep old palette roles
+    or cached stylesheet colors (e.g., text becomes low-contrast until a repolish).
+    """
+    try:
+        if app is None:
+            app = QtWidgets.QApplication.instance()
+        if app is None:
+            return
+
+        widgets = list(app.allWidgets() or [])
+        # Pause updates briefly to reduce flicker while repolishing.
+        for w in widgets:
+            try:
+                w.setUpdatesEnabled(False)
+            except Exception:
+                pass
+
+        # Repolish + push the current app palette everywhere.
+        pal = app.palette()
+        for w in widgets:
+            try:
+                st = w.style()
+                st.unpolish(w)
+                st.polish(w)
+            except Exception:
+                pass
+            try:
+                w.setPalette(pal)
+            except Exception:
+                pass
+            try:
+                w.update()
+                vp = getattr(w, "viewport", None)
+                if callable(vp):
+                    v = vp()
+                    if v is not None:
+                        v.update()
+            except Exception:
+                pass
+
+        for w in widgets:
+            try:
+                w.setUpdatesEnabled(True)
+            except Exception:
+                pass
+
+        # Nudge top-level windows.
+        for w in app.topLevelWidgets() or []:
+            try:
+                w.update()
+                w.repaint()
+            except Exception:
+                pass
+    except Exception:
+        pass
+
 def _theme_row(page: QWidget) -> QWidget:
     container = QWidget(page)
     v = QVBoxLayout(container)
-    v.setContentsMargins(0,0,0,0)
+    v.setContentsMargins(0, 0, 0, 0)
     v.setSpacing(6)
 
+    # --- Theme row ------------------------------------------------------------
     top = QWidget(container)
-    h = QHBoxLayout(top); h.setContentsMargins(0,0,0,0); h.setSpacing(8)
+    h = QHBoxLayout(top)
+    h.setContentsMargins(0, 0, 0, 0)
+    h.setSpacing(8)
+
     lab = QLabel("Theme:")
-    box = QComboBox(); box.addItems([
-        "Day","Pastel Light","Solarized Light","Sunburst","Cloud Grey","Signal Grey",
-        "Evening","Night","Graphite Dusk","Slate","High Contrast","Cyberpunk","Neon","Ocean","CRT","Aurora",
-        "Mardi Gras","Tropical Fiesta","Color Mix","Candy Pop","Rainbow Riot","Random","Auto"
+    box = QComboBox()
+    box.addItems([
+        "Day", "Pastel Light", "Solarized Light", "Sunburst", "Cloud Grey", "Signal Grey",
+        "Evening", "Night", "Graphite Dusk", "Slate", "High Contrast", "Cyberpunk", "Neon", "Ocean", "CRT", "Aurora",
+        "Mardi Gras", "Tropical Fiesta", "Color Mix", "Candy Pop", "Rainbow Riot", "Random", "Auto"
     ])
+
     try:
-        cur = (config.get("theme") or "Auto"); idx = box.findText(cur); box.setCurrentIndex(max(0, idx))
+        cur = (config.get("theme") or "Auto")
+        idx = box.findText(cur)
+        box.setCurrentIndex(max(0, idx))
     except Exception:
         pass
+
     btn = QPushButton("Apply")
+    safe_btn = QPushButton("Safe apply")
+
+    # Tooltips (rich text supported)
+    btn.setToolTip("<b>Apply</b><br>Applies the theme directly, but may freeze the app until it finishes.")
+    safe_btn.setToolTip("<b>Safe apply</b><br>Applies the theme by restarting the UI, so it won’t freeze while applying.")
 
     _busy = {"on": False}
 
@@ -243,37 +316,60 @@ def _theme_row(page: QWidget) -> QWidget:
         try:
             if on:
                 btn.setProperty("_fv_prev_text", btn.text() or "Apply")
+                safe_btn.setProperty("_fv_prev_text", safe_btn.text() or "Safe apply")
                 btn.setText("Applying…")
+                safe_btn.setText("Applying…")
                 btn.setEnabled(False)
+                safe_btn.setEnabled(False)
                 box.setEnabled(False)
             else:
                 prev = btn.property("_fv_prev_text") or "Apply"
                 btn.setText(str(prev))
+                prev2 = safe_btn.property("_fv_prev_text") or "Safe apply"
+                safe_btn.setText(str(prev2))
                 btn.setEnabled(True)
+                safe_btn.setEnabled(True)
                 box.setEnabled(True)
         except Exception:
             pass
 
-    def do_apply():
+    def do_apply() -> None:
         if _busy.get("on"):
             return
+        _set_busy(True)
         try:
             t = box.currentText()
             config["theme"] = t
 
-            _set_busy(True)
+            app = QtWidgets.QApplication.instance()
 
-            # Let the UI repaint the "Applying…" state before we run the heavier apply_theme.
+            # Let the UI paint the button state before the heavier work.
             try:
-                app = QtWidgets.QApplication.instance()
                 if app:
                     app.processEvents(QtCore.QEventLoop.AllEvents, 50)
             except Exception:
                 pass
 
-            app = QtWidgets.QApplication.instance()
-            if apply_theme and app:
-                apply_theme(app, t)
+            # Clear any previous global QSS first to avoid "layered" styles / mixed palettes.
+            try:
+                if app:
+                    app.setStyleSheet("")
+            except Exception:
+                pass
+
+            # Apply theme (in-process). This may freeze briefly on some systems.
+            try:
+                if apply_theme and app:
+                    apply_theme(app, t)
+            except Exception:
+                pass
+
+            # Force a repolish so existing widgets (like System monitor) pick up the new palette/QSS.
+            try:
+                _force_theme_refresh(app)
+            except Exception:
+                pass
+
             try:
                 save_config()
             except Exception:
@@ -283,19 +379,81 @@ def _theme_row(page: QWidget) -> QWidget:
         finally:
             _set_busy(False)
 
+    def do_safe_apply() -> None:
+        if _busy.get("on"):
+            return
+        _set_busy(True)
+        try:
+            t = box.currentText()
+            config["theme"] = t
+
+            # Mark restart intent (optional; some builds restore focus/state based on this)
+            try:
+                ss = config.setdefault("session_restore", {})
+                ss["restart_from_settings"] = True
+            except Exception:
+                pass
+
+            try:
+                save_config()
+            except Exception:
+                pass
+
+            # Small event pump so UI shows the state before we exit.
+            try:
+                app = QtWidgets.QApplication.instance()
+                if app:
+                    app.processEvents(QtCore.QEventLoop.AllEvents, 50)
+            except Exception:
+                pass
+
+            # Restart the app shell/UI.
+            try:
+                QtCore.QProcess.startDetached(sys.executable, sys.argv)
+            except Exception:
+                try:
+                    QtCore.QProcess.startDetached(sys.executable, sys.argv, os.getcwd())
+                except Exception:
+                    pass
+
+            try:
+                app = QtWidgets.QApplication.instance()
+                if app:
+                    app.quit()
+            except Exception:
+                pass
+        except Exception:
+            # If restart fails, restore UI state.
+            pass
+        finally:
+            # If we didn't quit, re-enable UI.
+            _set_busy(False)
+
     btn.clicked.connect(do_apply)
-    box.currentIndexChanged.connect(lambda _i: QtCore.QTimer.singleShot(0, do_apply))
-    h.addWidget(lab); h.addWidget(box); h.addWidget(btn); h.addStretch(1)
+    safe_btn.clicked.connect(do_safe_apply)
+
+    h.addWidget(lab)
+    h.addWidget(box)
+    h.addWidget(btn)
+    h.addWidget(safe_btn)
+    h.addStretch(1)
     v.addWidget(top)
 
+    # --- Intro overlay row ----------------------------------------------------
     bottom = QWidget(container)
-    h2 = QHBoxLayout(bottom); h2.setContentsMargins(0,0,0,0); h2.setSpacing(8)
+    h2 = QHBoxLayout(bottom)
+    h2.setContentsMargins(0, 0, 0, 0)
+    h2.setSpacing(8)
 
     ov_toggle = QCheckBox("Intro overlay")
     ov_toggle.setToolTip("Enable a visual overlay during the startup intro image (e.g., Matrix rain).")
 
     ov_combo = QComboBox()
-    ov_combo.addItems(["Random","Matrix (Green)","Matrix (Blue)","Bokeh","Rain","Fireworks","FirefliesParallax","Glitch Shards","LightningStrike","StarfieldHyperjump","Warp in","CometTrails","AuroraFlow"])
+    ov_combo.addItems([
+        "Random", "Matrix (Green)", "Matrix (Blue)", "Bokeh", "Rain", "Fireworks",
+        "FirefliesParallax", "Glitch Shards", "LightningStrike", "StarfieldHyperjump",
+        "Warp in", "CometTrails", "AuroraFlow"
+    ])
 
     ov_preview = QCheckBox("Preview")
     ov_preview.setToolTip("If enabled, shows the intro overlay briefly in the Settings preview.")
@@ -303,7 +461,8 @@ def _theme_row(page: QWidget) -> QWidget:
     _s = QSettings("FrameVision", "FrameVision")
     ov_toggle.setChecked(_s.value("intro_overlay_enabled", False, type=bool))
     mode = _s.value("intro_overlay_mode", "Random", type=str) or "Random"
-    idx = ov_combo.findText(mode); ov_combo.setCurrentIndex(max(0, idx))
+    idx = ov_combo.findText(mode)
+    ov_combo.setCurrentIndex(max(0, idx))
     ov_preview.setChecked(_s.value("intro_overlay_preview_enabled", True, type=bool))
 
     ov_toggle.toggled.connect(lambda b: _s.setValue("intro_overlay_enabled", bool(b)))
