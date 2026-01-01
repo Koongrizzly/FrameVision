@@ -12,6 +12,8 @@ Video Walktrough (most is speedup x2 to show much in less time)
   
 - fixed themes freezing app for 5 seconds after applying (added a 'safe apply' button if freezing comes back)
 - fixed upscaler defaulting to 30fps
+- fixed compare tool crash when loading new media file while repeat button was on.
+- fixed compare tool sync problems for video (85% lol)
 - added a date/time changer to the metadata editor
 - added a couple of simple effects to the text on top of video overlay tool
 - added 'strobe on time' in the video clip creator, now you can pick the perfect moment for a strobe effect
