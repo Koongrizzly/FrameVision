@@ -8,6 +8,17 @@ Video Walktrough (most is speedup x2 to show much in less time)
 
 ---
 <details>
+  <summary>Januari 1, 2026. V2.1.2 Happy Newyear and another update</summary>
+  
+- fixed themes freezing app for 5 seconds after applying (added a 'safe apply' button if freezing comes back)
+- fixed upscaler defaulting to 30fps
+- added a date/time changer to the metadata editor
+- added a couple of simple effects to the text on top of video overlay tool
+- added 'strobe on time' in the video clip creator, now you can pick the perfect moment for a strobe effect
+- Behind the scenes upgrade : Moved queue to it's own python file, no longer inside the big main framevision python file. This may come with new bugs, i will fix them as i run into them  
+
+</details>
+  <details>
   <summary>December 28, 2025. V2.1.1 mini update</summary>
 
 Bugfixes
@@ -278,6 +289,16 @@ User friendly, Portable & offline
 One click install tries to make everything work out of the box (git, python, environment..) even for 'new to ai' users (Z-image gguf models may need extra install of visual studio (when you get error of missing dll files.)
 Tooltips everywhere (can be turned of in settings tab)
 Draggable middle splitter & swap ui to make the app look the way user wants. (Drag completely to one side to get a full screen for the tabs or the media player)
+---
+
+**Not working/bugs/todo:**
+---
+- compare overlay feature for video don't work properly (sync problems etc) use only for images.
+- preview timeline for cropping tool still makes the app freeze until finished building preview.
+- To many finished results in queue still makes video stutter, clean finished results manually when you see it happen.
+- image selection disabled in music video clip creator (needs to much re writing code to get it to work properly again, maybe one day
+- timeline editing in music video ceator is not working properly anymore after adding to many new features, is on todo list to fix this.
+- more ? let me know :-)
 ---
 
 ## 🤝 Contributing
