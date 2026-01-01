@@ -439,6 +439,18 @@ class JobRowWidget(QWidget):
         self.subtitle.setWordWrap(False)
         self.subtitle.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
 
+
+        # --- Time info (started / done / ETA) ---
+        self.timeinfo = QLabel(self._time_text())
+        self.timeinfo.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        self.timeinfo.setStyleSheet("color: palette(mid); font-size: 11px;")
+        self.timeinfo.setWordWrap(False)
+        self.timeinfo.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
+        try:
+            self.timeinfo.setVisible(bool(self.timeinfo.text().strip()))
+        except Exception:
+            pass
+
         # --- Progress bar ---
         self.bar = QProgressBar()
         self.bar.setMinimumHeight(8)
@@ -477,6 +489,7 @@ class JobRowWidget(QWidget):
         text_col.setSpacing(2)
         text_col.addWidget(self.title)
         text_col.addWidget(self.subtitle)
+        text_col.addWidget(self.timeinfo)
         text_col.addWidget(self.bar)
 
         actions = QHBoxLayout()
@@ -567,6 +580,12 @@ class JobRowWidget(QWidget):
         # Update text + progress every time (cheap).
         self.title.setText(self._title_text())
         self.subtitle.setText(self._subtitle_text())
+        try:
+            self.timeinfo.setText(self._time_text())
+            self.timeinfo.setVisible(bool(self.timeinfo.text().strip()))
+        except Exception:
+            pass
+
         self._update_progressbar()
         self._update_button_visibility()
         self._apply_status_style()
@@ -598,6 +617,21 @@ class JobRowWidget(QWidget):
                     pass
 
     # ---------- Context menu ----------
+    def _find_queue_pane(self):
+        """Find the QueuePane parent (used to pause refresh while menus are open)."""
+        try:
+            w = self.parent()
+            while w is not None:
+                if hasattr(w, "_enter_context_menu") and hasattr(w, "_exit_context_menu"):
+                    return w
+                try:
+                    w = w.parent()
+                except Exception:
+                    break
+        except Exception:
+            pass
+        return None
+
     def contextMenuEvent(self, event) -> None:
         """Context menu varies by job state.
 
@@ -635,7 +669,20 @@ class JobRowWidget(QWidget):
             menu.addSeparator()
             menu.addAction(act_info)
 
-            menu.exec(event.globalPos())
+            host = self._find_queue_pane()
+            try:
+                if host is not None:
+                    host._enter_context_menu()
+            except Exception:
+                pass
+            try:
+                menu.exec(event.globalPos())
+            finally:
+                try:
+                    if host is not None:
+                        host._exit_context_menu()
+                except Exception:
+                    pass
             return
 
         # --- Pending menu ---
@@ -672,7 +719,20 @@ class JobRowWidget(QWidget):
             menu.addAction(act_info)
             menu.addAction(act_del)
 
-            menu.exec(event.globalPos())
+            host = self._find_queue_pane()
+            try:
+                if host is not None:
+                    host._enter_context_menu()
+            except Exception:
+                pass
+            try:
+                menu.exec(event.globalPos())
+            finally:
+                try:
+                    if host is not None:
+                        host._exit_context_menu()
+                except Exception:
+                    pass
             return
 
 # --- Default (done/failed/other) ---
@@ -695,8 +755,20 @@ class JobRowWidget(QWidget):
         menu.addSeparator()
         menu.addAction(act_view).setEnabled(True)
 
-        menu.exec(event.globalPos())
-
+        host = self._find_queue_pane()
+        try:
+            if host is not None:
+                host._enter_context_menu()
+        except Exception:
+            pass
+        try:
+            menu.exec(event.globalPos())
+        finally:
+            try:
+                if host is not None:
+                    host._exit_context_menu()
+            except Exception:
+                pass
     # ---------- Queue operations (running/pending) ----------
     def _fallback_base_root(self) -> Path:
         try:
@@ -1422,7 +1494,7 @@ class JobRowWidget(QWidget):
                 return f"{jobname}  |  {timings}"
             return str(jobname)
 
-        # Informative subtitle for other states
+        # Informative subtitle for other states (NO timing here; timing is on its own line)
         parts = []
         # sampler / steps / model (basename)
         try:
@@ -1441,14 +1513,14 @@ class JobRowWidget(QWidget):
             if smp:
                 parts.append(str(smp))
             try:
-                if stp: parts.append(f"{int(stp)} steps")
+                if stp:
+                    parts.append(f"{int(stp)} steps")
             except Exception:
                 pass
             if mdl:
                 parts.append(str(mdl))
         except Exception:
             pass
-
 
         src = d.get("input") or args.get("infile") or args.get("input")
         if src:
@@ -1458,7 +1530,7 @@ class JobRowWidget(QWidget):
         res = self._extract_resolution(d, args)
         if res:
             if parts:
-                parts[-1] = f"{parts[-1]} \u2192 {res}"
+                parts[-1] = f"{parts[-1]} → {res}"
             else:
                 parts.append(res)
 
@@ -1466,37 +1538,63 @@ class JobRowWidget(QWidget):
         if model:
             parts.append(str(model))
 
+        return "  |  ".join(parts)
+
+    def _time_text(self) -> str:
+        """Return a dedicated timing line (started / done / duration / ETA)."""
+        d = self.data or {}
+        status = (self._status_from_fs() or self.status).lower()
+
         started = d.get("started_at")
         finished = d.get("finished_at")
         eta_sec_raw = d.get("eta_sec")
         elapsed_sec = d.get("duration_sec") or self._compute_elapsed(d)
 
-        time_frag = []
+        frag = []
+        try:
+            if started:
+                frag.append(f"Started {self._fmt_clock(started)}")
+        except Exception:
+            pass
+
         if status == "running":
-            if started:
-                time_frag.append(f"Started {self._fmt_clock(started)}")
-            if elapsed_sec is not None:
-                time_frag.append(f"Elapsed {self._fmt_dur(elapsed_sec)}")
-            if eta_sec_raw is not None:
-                try:
-                    eta_display = int(float(eta_sec_raw)) + int(ETA_FUDGE_SEC)
-                except Exception:
-                    eta_display = None
-                if eta_display and eta_display > 0:
-                    time_frag.append(f"ETA {self._fmt_dur(eta_display)}")
-        elif status in ("failed",):
-            if finished:
-                time_frag.append(f"Finished {self._fmt_clock(finished)}")
-            if elapsed_sec is not None:
-                time_frag.append(f"Duration {self._fmt_dur(elapsed_sec)}")
+            try:
+                if elapsed_sec is not None:
+                    frag.append(f"Elapsed {self._fmt_dur(elapsed_sec)}")
+            except Exception:
+                pass
+            try:
+                if eta_sec_raw is not None:
+                    try:
+                        eta_display = int(float(eta_sec_raw)) + int(ETA_FUDGE_SEC)
+                    except Exception:
+                        eta_display = None
+                    if eta_display and eta_display > 0:
+                        frag.append(f"ETA {self._fmt_dur(eta_display)}")
+            except Exception:
+                pass
+
+        elif status in ("done", "failed"):
+            try:
+                if finished:
+                    frag.append(f"Done {self._fmt_clock(finished)}" if status == "done" else f"Finished {self._fmt_clock(finished)}")
+            except Exception:
+                pass
+            try:
+                if elapsed_sec is not None:
+                    frag.append(f"Duration {self._fmt_dur(elapsed_sec)}")
+            except Exception:
+                pass
+
         elif status in ("queued", "pending"):
-            if started:
-                time_frag.append(f"Queued since {self._fmt_clock(started)}")
+            # Some jobs use started_at as "queued time"
+            try:
+                if started:
+                    frag = [f"Queued since {self._fmt_clock(started)}"]
+            except Exception:
+                pass
 
-        if time_frag:
-            parts.append(" \u2022 ".join(time_frag))
-
-        return "  |  ".join(parts)
+        return " • ".join([x for x in frag if x])
 
     def _compute_elapsed(self, d: dict) -> Optional[int]:
         try:

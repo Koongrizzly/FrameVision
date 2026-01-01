@@ -21,7 +21,7 @@ import subprocess
 import tempfile
 import re
 from datetime import datetime
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, replace, field
 from typing import List, Optional, Tuple, Dict
 
 from PySide6.QtCore import Qt, QThread, Signal, QSettings, QTimer, QPropertyAnimation, QEasingCurve
@@ -516,6 +516,8 @@ class TimelineSegment:
     impact_fire_gold_intensity: float = 0.0
     impact_fire_multi_intensity: float = 0.0
     impact_color_cycle_speed: float = 0.0
+    # Timed strobe: list of offsets (seconds within this segment) where Flash strobe should fire.
+    strobe_on_time_offsets: List[float] = field(default_factory=list)
     # Absolute position on the music timeline (seconds)
     timeline_start: float = 0.0
     timeline_end: float = 0.0
@@ -629,6 +631,15 @@ def run_queue_payload(payload_path: str) -> int:
         visual_section_overrides = payload.get("visual_section_overrides") or None
         visual_overlay_opacity = float(payload.get("visual_overlay_opacity") or 0.25)
         out_name_override = payload.get("out_name_override") or None
+        strobe_on_time_times = payload.get("strobe_on_time_times") or None
+        try:
+            strobe_flash_strength = float(payload.get("strobe_flash_strength") or 0.0)
+        except Exception:
+            strobe_flash_strength = 0.0
+        try:
+            strobe_flash_speed_ms = int(payload.get("strobe_flash_speed_ms") or 250)
+        except Exception:
+            strobe_flash_speed_ms = 250
     except Exception as e:
         try:
             print(f"ERROR: invalid payload fields: {e}")
@@ -654,6 +665,9 @@ def run_queue_payload(payload_path: str) -> int:
         visual_section_overrides=visual_section_overrides,
         visual_overlay_opacity=visual_overlay_opacity,
         out_name_override=out_name_override,
+        strobe_on_time_times=strobe_on_time_times,
+        strobe_flash_strength=strobe_flash_strength,
+        strobe_flash_speed_ms=strobe_flash_speed_ms,
     )
 
     class _DummySig:
@@ -1044,6 +1058,8 @@ def build_timeline(
     impact_fire_gold_intensity: float = 0.75,
     impact_fire_multi_intensity: float = 0.8,
     impact_color_cycle_speed: float = 0.7,
+    strobe_on_time: bool = False,
+    strobe_on_time_times: Optional[List[float]] = None,
     image_sources: Optional[List[ClipSource]] = None,
     section_overrides: Optional[Dict[int, ClipSource]] = None,
     image_segment_interval: int = 0,
@@ -2535,6 +2551,72 @@ def build_timeline(
             if lbl == "intro":
                 _reset_fx_on_segment(seg)
 
+    # Timed strobe: map user timestamps to segment-local offsets so the Flash strobe can fire on time.
+    if strobe_on_time and strobe_on_time_times and segments:
+        times: List[float] = []
+        for v in strobe_on_time_times:
+            try:
+                fv = float(v)
+            except Exception:
+                continue
+            if fv < 0.0:
+                continue
+            times.append(fv)
+        # De-dup + sort
+        uniq: List[float] = []
+        for t in sorted(times):
+            if not uniq or abs(uniq[-1] - t) >= 0.01:
+                uniq.append(t)
+
+        for t in uniq:
+            # Find the segment that covers this timestamp (output timeline seconds).
+            best_idx: Optional[int] = None
+            for i, seg in enumerate(segments):
+                try:
+                    st = float(getattr(seg, "timeline_start", 0.0) or 0.0)
+                    en = float(getattr(seg, "timeline_end", st) or st)
+                except Exception:
+                    continue
+                if st <= t < en or (i == len(segments) - 1 and st <= t <= en):
+                    best_idx = i
+                    break
+            if best_idx is None:
+                continue
+
+            seg = segments[best_idx]
+            try:
+                st = float(getattr(seg, "timeline_start", 0.0) or 0.0)
+                en = float(getattr(seg, "timeline_end", st) or st)
+            except Exception:
+                st, en = 0.0, 0.0
+            seg_len = max(0.0, en - st)
+            if seg_len <= 0.0:
+                continue
+
+            off = max(0.0, min(seg_len, t - st))
+            try:
+                seg.strobe_on_time_offsets.append(off)
+            except Exception:
+                try:
+                    setattr(seg, "strobe_on_time_offsets", [off])
+                except Exception:
+                    pass
+
+            # Reuse the Flash strobe settings (strength/speed) even if the break-impact toggles are off.
+            try:
+                cur = float(getattr(seg, "impact_flash_strength", 0.0) or 0.0)
+            except Exception:
+                cur = 0.0
+            try:
+                setattr(seg, "impact_flash_strength", max(cur, float(impact_flash_strength)))
+            except Exception:
+                pass
+            try:
+                setattr(seg, "impact_flash_speed_ms", int(impact_flash_speed_ms))
+            except Exception:
+                pass
+
+
     return segments
 
 
@@ -2710,6 +2792,9 @@ class RenderWorker(QThread):
         visual_section_overrides: Optional[Dict[str, Optional[str]]] = None,
         visual_overlay_opacity: float = 0.25,
         out_name_override: Optional[str] = None,
+        strobe_on_time_times: Optional[List[float]] = None,
+        strobe_flash_strength: float = 0.0,
+        strobe_flash_speed_ms: int = 250,
         parent=None,
     ) -> None:
         super().__init__(parent)
@@ -2737,6 +2822,21 @@ class RenderWorker(QThread):
         except Exception:
             self.visual_overlay_opacity = 0.25
         self.out_name_override = out_name_override
+
+        # Timed strobe (global): keep these on the worker so we can apply the strobe
+        # after any duration correction / overlays, guaranteeing accurate timestamps.
+        try:
+            self.strobe_on_time_times = list(strobe_on_time_times) if strobe_on_time_times else []
+        except Exception:
+            self.strobe_on_time_times = []
+        try:
+            self.strobe_flash_strength = float(strobe_flash_strength or 0.0)
+        except Exception:
+            self.strobe_flash_strength = 0.0
+        try:
+            self.strobe_flash_speed_ms = int(strobe_flash_speed_ms or 250)
+        except Exception:
+            self.strobe_flash_speed_ms = 250
 
 
     def run(self) -> None:
@@ -3527,6 +3627,68 @@ class RenderWorker(QThread):
                         vf_parts.append(
                             "eq=contrast=1.06:saturation=1.18"
                         )
+
+                # Timed strobe: user-specified timestamps (within this segment).
+                strobe_offsets = getattr(seg, "strobe_on_time_offsets", None) if not getattr(self, "strobe_on_time_times", None) else None
+                if strobe_offsets:
+                    try:
+                        flash_s = float(getattr(seg, "impact_flash_strength", 0.0) or 0.0)
+                    except Exception:
+                        flash_s = 0.0
+                    if flash_s > 0.0:
+                        s = max(0.1, min(1.0, flash_s))
+                        try:
+                            speed_ms = int(getattr(seg, "impact_flash_speed_ms", 250) or 250)
+                        except Exception:
+                            speed_ms = 250
+                        speed_ms = max(100, min(1000, speed_ms))
+                        period_s = speed_ms / 1000.0
+                        pulse_s = max(0.02, min(0.08, period_s * 0.35))
+
+                        # Use output-time segment length when available, so offsets stay correct even with slow motion.
+                        try:
+                            st = float(getattr(seg, "timeline_start", 0.0) or 0.0)
+                            en = float(getattr(seg, "timeline_end", st) or st)
+                            seg_len = max(0.0, en - st)
+                        except Exception:
+                            seg_len = 0.0
+                        if seg_len <= 0.0:
+                            try:
+                                seg_len = float(getattr(seg, "duration", 0.0) or 0.0)
+                            except Exception:
+                                seg_len = 0.0
+                        seg_len = max(0.0, seg_len)
+
+                        flash_a = 0.30 + 0.55 * s  # 0.30–0.85
+
+                        # Add one drawbox strobe per timestamp (offset).
+                        try:
+                            offs = sorted(set([float(x) for x in strobe_offsets]))
+                        except Exception:
+                            offs = []
+                        for off in offs:
+                            try:
+                                off_f = float(off)
+                            except Exception:
+                                continue
+                            if off_f < 0.0:
+                                continue
+                            if seg_len > 0.0:
+                                off_f = max(0.0, min(seg_len, off_f))
+                            # Strobe window: up to 0.9s starting from the offset (clamped to segment).
+                            max_window = 0.9
+                            if seg_len > 0.0:
+                                max_window = min(0.9, max(0.02, seg_len - off_f))
+                            end_t = off_f + max_window
+                            if seg_len > 0.0:
+                                end_t = min(seg_len, end_t)
+
+                            vf_parts.append(
+                                "drawbox=x=0:y=0:w=iw:h=ih:"
+                                f"color=white@{flash_a:.2f}:t=fill:"
+                                f"enable='between(t,{off_f:.3f},{end_t:.3f})*lt(mod(t-{off_f:.3f},{period_s:.3f}),{pulse_s:.3f})'"
+                            )
+
 
                 impact_end = len(vf_parts)
 
@@ -5979,6 +6141,94 @@ class RenderWorker(QThread):
                     # Visual overlay is cosmetic; ignore failures.
                     pass
 
+
+            # Timed strobe (global): apply AFTER duration correction and overlays so timestamps stay accurate.
+            if getattr(self, "strobe_on_time_times", None):
+                try:
+                    raw_times = self.strobe_on_time_times or []
+                    times: List[float] = []
+                    for v in raw_times:
+                        try:
+                            fv = float(v)
+                        except Exception:
+                            continue
+                        if fv < 0.0:
+                            continue
+                        times.append(fv)
+
+                    # De-dup + sort
+                    uniq: List[float] = []
+                    for t in sorted(times):
+                        if not uniq or abs(uniq[-1] - t) >= 0.01:
+                            uniq.append(t)
+
+                    if uniq:
+                        try:
+                            s_val = float(getattr(self, "strobe_flash_strength", 0.0) or 0.0)
+                        except Exception:
+                            s_val = 0.0
+                        if s_val > 0.0:
+                            s = max(0.1, min(1.0, s_val))
+
+                            try:
+                                speed_ms = int(getattr(self, "strobe_flash_speed_ms", 250) or 250)
+                            except Exception:
+                                speed_ms = 250
+                            speed_ms = max(100, min(1000, speed_ms))
+                            period_s = speed_ms / 1000.0
+                            pulse_s = max(0.02, min(0.08, period_s * 0.35))
+
+                            flash_a = 0.30 + 0.55 * s  # 0.30–0.85
+
+                            try:
+                                total_dur = float(getattr(self.analysis, "duration", 0.0) or 0.0)
+                            except Exception:
+                                total_dur = 0.0
+
+                            vf_parts: List[str] = []
+                            for t0 in uniq:
+                                if total_dur > 0.0 and t0 > total_dur + 0.01:
+                                    continue
+                                end_t = t0 + 0.9
+                                if total_dur > 0.0:
+                                    end_t = min(total_dur, end_t)
+                                if end_t <= t0 + 0.01:
+                                    continue
+
+                                vf_parts.append(
+                                    "drawbox=x=0:y=0:w=iw:h=ih:"
+                                    f"color=white@{flash_a:.2f}:t=fill:"
+                                    f"enable='between(t,{t0:.3f},{end_t:.3f})*lt(mod(t-{t0:.3f},{period_s:.3f}),{pulse_s:.3f})'"
+                                )
+
+                            if vf_parts:
+                                self.progress.emit(94, "Applying timed strobe...")
+                                strobe_video = os.path.join(tmpdir, "video_timed_strobe.mp4")
+                                vf = ",".join(vf_parts)
+                                cmd = [
+                                    self.ffmpeg,
+                                    "-y",
+                                    "-i",
+                                    video_for_mux,
+                                    "-vf",
+                                    vf,
+                                    "-c:v",
+                                    "libx264",
+                                    "-preset",
+                                    "veryfast",
+                                    "-crf",
+                                    "18",
+                                    "-pix_fmt",
+                                    "yuv420p",
+                                    strobe_video,
+                                ]
+                                code, out = _run_ffmpeg(cmd)
+                                if code == 0 and os.path.exists(strobe_video):
+                                    video_for_mux = strobe_video
+                except Exception:
+                    # Cosmetic only — ignore failures
+                    pass
+
             # mux with audio
             self.progress.emit(95, "Merging with audio...")
             if self.out_name_override:
@@ -6039,6 +6289,9 @@ class AutoMusicSyncWidget(QWidget):
         self._enabled_transition_modes = {0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14}
         # Guard flag used when toggling No FX programmatically so we don't immediately undo it
         self._nofx_guard = False
+
+        # Timed strobe (flash strobe at user-specified timeline seconds)
+        self._strobe_on_time_times: List[float] = []
 
         # Per-section music-player visual overrides (intro/verse/chorus/break/drop/outro)
         self._visual_section_overrides = {}
@@ -7224,6 +7477,52 @@ class AutoMusicSyncWidget(QWidget):
         opts.addWidget(self.impact_options)
         self.impact_options.setVisible(False)
 
+        # Timed strobe: trigger the Flash strobe at custom time(s) in the song/video timeline.
+        row_strobe_on_time = QHBoxLayout()
+        self.check_strobe_on_time = QCheckBox("Strobe on time", self)
+        self.check_strobe_on_time.setToolTip(
+            "When enabled, you can add one or more timestamps (seconds) where the Flash strobe should fire."
+        )
+        row_strobe_on_time.addWidget(self.check_strobe_on_time)
+        row_strobe_on_time.addStretch(1)
+        opts.addLayout(row_strobe_on_time)
+
+        self.strobe_time_options = QWidget(self)
+        strobe_layout = QVBoxLayout(self.strobe_time_options)
+        strobe_layout.setContentsMargins(26, 0, 0, 0)
+        strobe_layout.setSpacing(4)
+
+        row_strobe_add = QHBoxLayout()
+        label_strobe_time = QLabel("Time (s):", self.strobe_time_options)
+        row_strobe_add.addWidget(label_strobe_time)
+
+        self.spin_strobe_time = QDoubleSpinBox(self.strobe_time_options)
+        self.spin_strobe_time.setDecimals(2)
+        self.spin_strobe_time.setSingleStep(0.25)
+        self.spin_strobe_time.setRange(0.0, 99999.0)
+        self.spin_strobe_time.setValue(0.0)
+        row_strobe_add.addWidget(self.spin_strobe_time)
+
+        self.btn_strobe_time_add = QPushButton("Add", self.strobe_time_options)
+        row_strobe_add.addWidget(self.btn_strobe_time_add)
+
+        self.btn_strobe_time_remove = QPushButton("Remove selected", self.strobe_time_options)
+        row_strobe_add.addWidget(self.btn_strobe_time_remove)
+
+        self.btn_strobe_time_clear = QPushButton("Remove all", self.strobe_time_options)
+        row_strobe_add.addWidget(self.btn_strobe_time_clear)
+
+        row_strobe_add.addStretch(1)
+        strobe_layout.addLayout(row_strobe_add)
+
+        self.list_strobe_times = QListWidget(self.strobe_time_options)
+        self.list_strobe_times.setToolTip("Strobe timestamps (seconds).")
+        self.list_strobe_times.setMaximumHeight(110)
+        strobe_layout.addWidget(self.list_strobe_times)
+
+        opts.addWidget(self.strobe_time_options)
+        self.strobe_time_options.setVisible(False)
+
         # Master FX kill-switch
         row_nofx = QHBoxLayout()
         self.check_nofx = QCheckBox("Disable ALL video FX (No FX mode)", self)
@@ -7639,6 +7938,17 @@ class AutoMusicSyncWidget(QWidget):
         self.check_impact_enable.stateChanged.connect(lambda s: self._maybe_release_nofx() if s else None)
 # Global 'No FX' master switch
         self.check_nofx.stateChanged.connect(self._on_nofx_toggled)
+        # Timed strobe signals
+        try:
+            self.check_strobe_on_time.stateChanged.connect(self._on_strobe_on_time_toggle)
+        except Exception:
+            pass
+        try:
+            self.btn_strobe_time_add.clicked.connect(self._on_strobe_time_add)
+            self.btn_strobe_time_remove.clicked.connect(self._on_strobe_time_remove_selected)
+            self.btn_strobe_time_clear.clicked.connect(self._on_strobe_time_clear_all)
+        except Exception:
+            pass
 
         # If visuals overlay or its strategies are enabled, automatically release No FX.
         if hasattr(self, "check_visual_overlay"):
@@ -8696,6 +9006,41 @@ class AutoMusicSyncWidget(QWidget):
         self.check_impact_fire_multi.setChecked(bool(int(s.value("impact_fire_multi", int(self.check_impact_fire_multi.isChecked())))))
         self.slider_impact_fire_multi.setValue(int(s.value("impact_fire_multi_intensity", self.slider_impact_fire_multi.value())))
         self.check_impact_random.setChecked(bool(int(s.value("impact_random", int(self.check_impact_random.isChecked())))))
+        # Timed strobe (flash on time)
+        try:
+            self.check_strobe_on_time.setChecked(bool(int(s.value("strobe_on_time", int(self.check_strobe_on_time.isChecked())))))
+        except Exception:
+            try:
+                self.check_strobe_on_time.setChecked(False)
+            except Exception:
+                pass
+
+        times: List[float] = []
+        try:
+            raw = s.value("strobe_on_time_times", "", str)
+        except Exception:
+            raw = ""
+        if raw:
+            try:
+                data = json.loads(raw)
+                if isinstance(data, list):
+                    for v in data:
+                        try:
+                            fv = float(v)
+                        except Exception:
+                            continue
+                        if fv >= 0.0:
+                            times.append(fv)
+            except Exception:
+                times = []
+        try:
+            self._set_strobe_times(times)
+        except Exception:
+            pass
+        try:
+            self._on_strobe_on_time_toggle(int(self.check_strobe_on_time.isChecked()))
+        except Exception:
+            pass
 
         # Hidden break-impact FX rows are always disabled, even if older settings had them on.
         for cb in (
@@ -8937,6 +9282,14 @@ class AutoMusicSyncWidget(QWidget):
         s.setValue("impact_fire_multi", int(self.check_impact_fire_multi.isChecked()))
         s.setValue("impact_fire_multi_intensity", int(self.slider_impact_fire_multi.value()))
         s.setValue("impact_random", int(self.check_impact_random.isChecked()))
+
+        # Timed strobe (flash on time)
+        if hasattr(self, "check_strobe_on_time"):
+            s.setValue("strobe_on_time", int(self.check_strobe_on_time.isChecked()))
+            try:
+                s.setValue("strobe_on_time_times", json.dumps(self._get_strobe_times()))
+            except Exception:
+                s.setValue("strobe_on_time_times", "[]")
 
     # dialogs / helpers
 
@@ -9796,6 +10149,93 @@ class AutoMusicSyncWidget(QWidget):
         self._set_all_impact_toggles(not all_on)
 
 
+    # --- timed strobe (flash on time) helpers -----------------------------
+    def _strobe_times_sorted_unique(self, values: List[float]) -> List[float]:
+        out: List[float] = []
+        for v in values:
+            try:
+                fv = float(v)
+            except Exception:
+                continue
+            if fv < 0.0:
+                continue
+            # de-dup with small tolerance
+            dup = False
+            for ex in out:
+                if abs(ex - fv) < 0.01:
+                    dup = True
+                    break
+            if not dup:
+                out.append(fv)
+        out.sort()
+        return out
+
+    def _set_strobe_times(self, times: List[float]) -> None:
+        self._strobe_on_time_times = self._strobe_times_sorted_unique(times)
+        try:
+            self.list_strobe_times.clear()
+        except Exception:
+            return
+        for t in self._strobe_on_time_times:
+            item = QListWidgetItem(f"{t:.2f} s")
+            item.setData(Qt.UserRole, float(t))
+            self.list_strobe_times.addItem(item)
+
+    def _get_strobe_times(self) -> List[float]:
+        # Source of truth: internal list (kept in sync with the list widget).
+        try:
+            return list(self._strobe_on_time_times)
+        except Exception:
+            return []
+
+    def _on_strobe_on_time_toggle(self, state: int) -> None:
+        enabled = bool(state)
+        try:
+            self.strobe_time_options.setVisible(enabled)
+        except Exception:
+            pass
+        if enabled:
+            # Turning this on implies FX, so auto-release No FX.
+            try:
+                self._maybe_release_nofx()
+            except Exception:
+                pass
+
+    def _on_strobe_time_add(self) -> None:
+        try:
+            t = float(self.spin_strobe_time.value())
+        except Exception:
+            t = 0.0
+        times = self._get_strobe_times()
+        times.append(t)
+        self._set_strobe_times(times)
+        try:
+            self._maybe_release_nofx()
+        except Exception:
+            pass
+
+    def _on_strobe_time_remove_selected(self) -> None:
+        try:
+            sel = self.list_strobe_times.selectedItems()
+        except Exception:
+            sel = []
+        if not sel:
+            return
+        cur = self._get_strobe_times()
+        rem = set()
+        for it in sel:
+            try:
+                rem.add(float(it.data(Qt.UserRole)))
+            except Exception:
+                pass
+        new = [t for t in cur if all(abs(t - r) >= 0.01 for r in rem)]
+        self._set_strobe_times(new)
+
+    def _on_strobe_time_clear_all(self) -> None:
+        self._set_strobe_times([])
+
+
+
 
     # --- break impact FX helpers ----------------------------------------
 
@@ -9949,6 +10389,12 @@ class AutoMusicSyncWidget(QWidget):
             # Turn off break impact FX
             try:
                 self.check_impact_enable.setChecked(False)
+            except Exception:
+                pass
+            # Turn off timed strobe
+            try:
+                if hasattr(self, "check_strobe_on_time"):
+                    self.check_strobe_on_time.setChecked(False)
             except Exception:
                 pass
             # Disable random transitions to avoid surprise flash / creative modes.
@@ -10528,6 +10974,8 @@ class AutoMusicSyncWidget(QWidget):
             impact_random=impact_random,
             impact_flash_strength=impact_flash_strength,
             impact_flash_speed_ms=impact_flash_speed_ms,
+            strobe_on_time=bool(getattr(self, 'check_strobe_on_time', None) and self.check_strobe_on_time.isChecked() and not nofx),
+            strobe_on_time_times=self._get_strobe_times() if (getattr(self, 'check_strobe_on_time', None) and self.check_strobe_on_time.isChecked() and not nofx) else None,
             impact_shock_strength=impact_shock_strength,
             impact_echo_trail_strength=impact_echo_trail_strength,
             impact_confetti_density=impact_confetti_density,
@@ -10622,6 +11070,9 @@ class AutoMusicSyncWidget(QWidget):
             visual_strategy=visual_strategy,
             visual_section_overrides=getattr(self, "_visual_section_overrides", None) if visual_strategy == 2 else None,
             visual_overlay_opacity=float(getattr(self, "visual_overlay_opacity", 0.25)),
+            strobe_on_time_times=self._get_strobe_times() if (getattr(self, "check_strobe_on_time", None) and self.check_strobe_on_time.isChecked() and not nofx) else None,
+            strobe_flash_strength=float(getattr(self, "slider_impact_flash", None).value() / 100.0) if hasattr(self, "slider_impact_flash") else 0.0,
+            strobe_flash_speed_ms=int(getattr(self, "slider_impact_flash_speed", None).value()) if hasattr(self, "slider_impact_flash_speed") else 250,
         )
         self._worker.progress.connect(self._on_worker_progress)
         self._worker.finished_ok.connect(self._on_worker_finished)
@@ -10676,6 +11127,9 @@ class AutoMusicSyncWidget(QWidget):
             "visual_section_overrides": visual_section_overrides,
             "visual_overlay_opacity": float(visual_overlay_opacity),
             "out_name_override": out_name,
+            "strobe_on_time_times": self._get_strobe_times() if (getattr(self, "check_strobe_on_time", None) and self.check_strobe_on_time.isChecked() and not (getattr(self, "check_nofx", None) and self.check_nofx.isChecked())) else None,
+            "strobe_flash_strength": float(getattr(self, "slider_impact_flash", None).value() / 100.0) if hasattr(self, "slider_impact_flash") else 0.0,
+            "strobe_flash_speed_ms": int(getattr(self, "slider_impact_flash_speed", None).value()) if hasattr(self, "slider_impact_flash_speed") else 250,
             "analysis": _analysis_to_dict(analysis),
             "segments": _segments_to_list(segments),
         }

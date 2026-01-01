@@ -141,6 +141,12 @@ from helpers.ask_popup import AskPopup
 from helpers import state_persist
 from helpers.img_fallback import load_pixmap
 from helpers.worker_led import WorkerStatusWidget
+
+try:
+    from helpers.queue_pane import QueuePane
+except Exception:
+    from queue_pane import QueuePane
+
 from helpers.tools_tab import CollapsibleSection as ToolsCollapsibleSection
 from pathlib import Path
 # ---- Begin: Quiet specific Qt warnings ----
@@ -892,14 +898,13 @@ class VideoPane(QWidget):
         except Exception:
             pass
 
-        # Inform QueuePane that the player instance was rebuilt so it can re-bind playback hooks.
+        # Inform MainWindow that the internal player was rebuilt so global hooks can rebind safely.
         try:
-            q = getattr(self.main, "queue", None)
-            if q is not None and hasattr(q, "bind_video_player"):
-                q.bind_video_player(self.player)
+            hook = getattr(self.main, "_hook_video_player", None)
+            if callable(hook):
+                hook(self.player)
         except Exception:
             pass
-
     def _open_ask_popup(self):
         """Open the Ask chat popup (lazy-create)."""
         if not hasattr(self, "_ask_popup") or self._ask_popup is None:
@@ -1480,8 +1485,7 @@ class VideoPane(QWidget):
         lay = QVBoxLayout(self); lay.addWidget(self.label,1); self.info_label=QLabel("—"); self.info_label.setObjectName("videoInfo"); f=self.info_label.font(); f.setPointSize(max(10, f.pointSize())); self.info_label.setFont(f); lay.addWidget(self.info_label); self.time_label=QLabel("—"); self.time_label.setObjectName("videoTime"); self.time_label.setFont(f); lay.addWidget(self.time_label); lay.addWidget(self.slider); lay.addWidget(self.compare_slider); lay.addLayout(bar)
         self.btn_open.clicked.connect(self._open_via_dialog, Qt.ConnectionType.UniqueConnection); self.btn_play.clicked.connect(self._toggle_play_pause, Qt.ConnectionType.UniqueConnection)
         # pause button hidden; no click
-        self.btn_stop.clicked.connect(self.player.stop, Qt.ConnectionType.UniqueConnection)
-        self.btn_stop.clicked.connect(self._handle_stop)
+        self.btn_stop.clicked.connect(self._handle_stop, Qt.ConnectionType.UniqueConnection)
         self.btn_info.clicked.connect(self._show_info_popup, Qt.ConnectionType.UniqueConnection)
         # ratio button removed
                 # compare button: open in-app dialog (replaces external HTML page)
@@ -1644,7 +1648,16 @@ class VideoPane(QWidget):
                 return
             p = getattr(self, '_bg_logo_path', None)
             if not p:
-                # still allow plain text fallback, do nothing
+                # Text-only fallback so the player never goes blank.
+                try:
+                    self.label.setMovie(None)
+                except Exception:
+                    pass
+                try:
+                    # Setting text clears any pixmap (if present).
+                    self.label.setText("Drop a media file here")
+                except Exception:
+                    pass
                 return
             pm = load_pixmap(p)
             if not pm or pm.isNull():
@@ -1695,8 +1708,22 @@ class VideoPane(QWidget):
             pass
         self._clear_video_sink()
         self._show_empty_background()
+        # Keep Repeat button in sync with the currently loaded media (don't hide it on Stop).
         try:
-            self._set_repeat_available(False)
+            main = self.window()
+            cp = getattr(main, "current_path", None)
+            is_vid = False
+            if cp:
+                try:
+                    from pathlib import Path as _P
+                    ext = _P(str(cp)).suffix.lower()
+                    try:
+                        is_vid = ext in set([str(x).lower() for x in list(VIDEO_EXTS)])
+                    except Exception:
+                        is_vid = ext in {".mp4",".mov",".mkv",".avi",".webm",".m4v"}
+                except Exception:
+                    is_vid = False
+            self._set_repeat_available(bool(is_vid))
         except Exception:
             pass
 
@@ -1739,6 +1766,11 @@ class VideoPane(QWidget):
                 rp = getattr(self, "_compare_right_player", None)
                 if rp is not None:
                     rp.setPosition(pos)
+                    try:
+                        import time as _t
+                        self._compare_sync_soft_until = float(_t.perf_counter()) + 1.2
+                    except Exception:
+                        pass
         except Exception:
             pass
 
@@ -2283,8 +2315,17 @@ class VideoPane(QWidget):
         except Exception: pass
         try:
             from PySide6.QtGui import QPixmap as _QPM
-            self.label.setPixmap(_QPM())  # clear old still image
-        except Exception: pass
+            # Clear old still/GIF frame and show a background while the first video frame arrives.
+            self.label.setPixmap(_QPM())
+            try:
+                self._render_background_logo()
+            except Exception:
+                try:
+                    self.label.setText("Loading…")
+                except Exception:
+                    pass
+        except Exception:
+            pass
         # Stop any active GIF/QMovie to prevent an overlay from sticking
         try:
             if hasattr(self, "_gif_movie") and self._gif_movie:
@@ -2297,6 +2338,54 @@ class VideoPane(QWidget):
         self.player.setSource(QUrl.fromLocalFile(str(p)))
         try: self.player.play()
         except Exception: pass
+    def play(self):
+        """Play the main media; if compare-video is active, keep the right player in lockstep."""
+        try:
+            self.player.play()
+        except Exception:
+            pass
+        try:
+            if getattr(self, "_compare_active", False) and getattr(self, "_compare_kind", None) == "video":
+                rp = getattr(self, "_compare_right_player", None)
+                if rp is not None:
+                    try:
+                        rp.setPlaybackRate(self.player.playbackRate())
+                    except Exception:
+                        pass
+                    try:
+                        rp.setPosition(self.player.position())
+                    except Exception:
+                        pass
+                    try:
+                        rp.play()
+                    except Exception:
+                        pass
+                    try:
+                        from PySide6.QtCore import QTimer
+                        import time as _t
+                        # Tighten sync for the first moments after (re)start; QMediaPlayer often starts a few frames late.
+                        self._compare_sync_soft_until = float(_t.perf_counter()) + 1.6
+                        def _nudge_sync():
+                            try:
+                                if getattr(self, "_compare_active", False) and getattr(self, "_compare_kind", None) == "video":
+                                    _rp2 = getattr(self, "_compare_right_player", None)
+                                    if _rp2 is not None:
+                                        _rp2.setPosition(int(self.player.position() or 0))
+                            except Exception:
+                                pass
+                        QTimer.singleShot(60, _nudge_sync)
+                        QTimer.singleShot(140, _nudge_sync)
+                        QTimer.singleShot(260, _nudge_sync)
+                    except Exception:
+                        pass
+
+                try:
+                    self._compare_begin_video_sync()
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
 
     def pause(self):
         self.player.pause()
@@ -2347,7 +2436,7 @@ class VideoPane(QWidget):
             if self.player.playbackState() == QMediaPlayer.PlayingState:
                 self.pause()
             else:
-                self.player.play()
+                self.play()
             try: self._mode = 'video'
             except Exception: pass
             try: self.label.setMovie(None)
@@ -2528,7 +2617,7 @@ class VideoPane(QWidget):
                         if self.player.playbackState()==QMediaPlayer.PlayingState:
                             self.pause()
                         else:
-                            self.player.play()
+                            self.play()
                         _fs_sync_pp()
                     except Exception:
                         pass
@@ -2658,7 +2747,7 @@ class VideoPane(QWidget):
                         if self.player.playbackState()==QMediaPlayer.PlayingState:
                             self.pause()
                         else:
-                            self.player.play()
+                            self.play()
                         return
                 except Exception:
                     pass
@@ -2994,14 +3083,141 @@ class VideoPane(QWidget):
                 pass
 
     def _present_compare_frame(self):
+        # Present compare frame; throttle to the same FPS cap as the main presenter.
         try:
             self._compare_present_pending = False
         except Exception:
             pass
+
+        # --- FPS throttle ---
+        try:
+            from PySide6.QtCore import QTimer
+            import time as _t
+            if not hasattr(self, '_fps_target') or not self._fps_target:
+                self._fps_target = 30  # default cap
+            if not hasattr(self, '_compare_last_present_ts'):
+                self._compare_last_present_ts = 0.0
+            _now = _t.perf_counter()
+            _interval = max(0.001, 1.0 / float(self._fps_target))
+            _elapsed = _now - float(self._compare_last_present_ts or 0.0)
+            if _elapsed < _interval:
+                _ms = int((_interval - _elapsed) * 1000)
+                if _ms > 0:
+                    # Coalesce: schedule a later present and don't spam the UI thread.
+                    if not getattr(self, "_compare_present_pending", False):
+                        self._compare_present_pending = True
+                        QTimer.singleShot(max(0, _ms), self._present_compare_frame)
+                    return
+            self._compare_last_present_ts = _now
+        except Exception:
+            pass
+
         try:
             self._refresh_label_pixmap()
         except Exception:
             pass
+
+    def _compare_begin_video_sync(self):
+        """Start a lightweight timer that keeps compare-right video synced to the main player."""
+        try:
+            if not getattr(self, "_compare_active", False) or getattr(self, "_compare_kind", None) != "video":
+                return
+            from PySide6.QtCore import QTimer
+            try:
+                import time as _t
+                # After opening/resuming compare-video, be more aggressive about drift correction for a short window.
+                self._compare_sync_soft_until = float(_t.perf_counter()) + 1.6
+            except Exception:
+                pass
+            t = getattr(self, "_compare_sync_timer", None)
+            if t is None:
+                t = QTimer(self)
+                try:
+                    t.setInterval(80)
+                except Exception:
+                    pass
+                try:
+                    t.timeout.connect(self._compare_sync_tick)
+                except Exception:
+                    pass
+                self._compare_sync_timer = t
+            if not t.isActive():
+                t.start()
+        except Exception:
+            pass
+
+    def _compare_end_video_sync(self):
+        try:
+            t = getattr(self, "_compare_sync_timer", None)
+            if t is not None and t.isActive():
+                t.stop()
+        except Exception:
+            pass
+
+    def _compare_sync_tick(self):
+        try:
+            if not getattr(self, "_compare_active", False) or getattr(self, "_compare_kind", None) != "video":
+                try:
+                    self._compare_end_video_sync()
+                except Exception:
+                    pass
+                return
+
+            rp = getattr(self, "_compare_right_player", None)
+            if rp is None:
+                return
+
+            # Keep playback rate in sync.
+            try:
+                rp.setPlaybackRate(self.player.playbackRate())
+            except Exception:
+                pass
+
+            # Mirror play/pause state.
+            try:
+                from PySide6.QtMultimedia import QMediaPlayer as _QMP
+                lp_state = self.player.playbackState()
+                rp_state = rp.playbackState()
+                if lp_state == _QMP.PlayingState and rp_state != _QMP.PlayingState:
+                    rp.play()
+                    try:
+                        import time as _t
+                        self._compare_sync_soft_until = float(_t.perf_counter()) + 1.6
+                    except Exception:
+                        pass
+                elif lp_state != _QMP.PlayingState and rp_state == _QMP.PlayingState:
+                    rp.pause()
+            except Exception:
+                pass
+
+            # Drift correction (skip while the user is scrubbing).
+            try:
+                if hasattr(self, "slider") and self.slider.isSliderDown():
+                    return
+            except Exception:
+                pass
+            try:
+                import time as _t
+                lp = int(self.player.position() or 0)
+                rp_pos = int(rp.position() or 0)
+                delta = rp_pos - lp
+                now = float(_t.perf_counter())
+                soft_until = float(getattr(self, "_compare_sync_soft_until", 0.0) or 0.0)
+                thr = 12 if now <= soft_until else 25
+                if abs(delta) >= thr:
+                    rp.setPosition(lp)
+                    # Some backends can "stick" after a position snap; re-issue play if needed.
+                    try:
+                        from PySide6.QtMultimedia import QMediaPlayer as _QMP
+                        if self.player.playbackState() == _QMP.PlayingState:
+                            rp.play()
+                    except Exception:
+                        pass
+            except Exception:
+                pass
+        except Exception:
+            pass
+
 
     def open_compare(self, left_path: str, right_path: str, kind: str):
         try:
@@ -3051,12 +3267,7 @@ class VideoPane(QWidget):
                 self._compare_right_frame = None
                 try:
                     self._compare_right_player = QMediaPlayer(self)
-                    self._compare_right_audio = QAudioOutput(self)
-                    try:
-                        self._compare_right_audio.setVolume(0.0)
-                    except Exception:
-                        pass
-                    self._compare_right_player.setAudioOutput(self._compare_right_audio)
+                    self._compare_right_audio = None  # compare-right is silent (prevents audio clock drift)
 
                     self._compare_right_sink = QVideoSink(self)
                     self._compare_right_player.setVideoSink(self._compare_right_sink)
@@ -3071,6 +3282,20 @@ class VideoPane(QWidget):
                         self._compare_right_player.setPosition(self.player.position())
                     except Exception:
                         pass
+                    try:
+                        import time as _t
+                        self._compare_sync_soft_until = float(_t.perf_counter()) + 1.6
+                    except Exception:
+                        pass
+                    try:
+                        self._compare_right_player.setPlaybackRate(self.player.playbackRate())
+                    except Exception:
+                        pass
+                    try:
+                        if self.player.playbackState() == QMediaPlayer.PlayingState:
+                            self._compare_right_player.play()
+                    except Exception:
+                        pass
                 except Exception:
                     self._compare_right_player = None
                     self._compare_right_audio = None
@@ -3080,6 +3305,12 @@ class VideoPane(QWidget):
                 self._refresh_label_pixmap()
             except Exception:
                 pass
+
+            try:
+                if getattr(self, "_compare_kind", None) == "video":
+                    self._compare_begin_video_sync()
+            except Exception:
+                pass
         except Exception:
             pass
 
@@ -3087,6 +3318,12 @@ class VideoPane(QWidget):
         try:
             self._compare_active = False
             self._compare_kind = None
+        except Exception:
+            pass
+
+
+        try:
+            self._compare_end_video_sync()
         except Exception:
             pass
 
@@ -3113,6 +3350,31 @@ class VideoPane(QWidget):
                     pass
         except Exception:
             pass
+
+
+        # Fully dispose compare-right multimedia objects (avoids leaks / backend freezes).
+        try:
+            rp = getattr(self, "_compare_right_player", None)
+            rs = getattr(self, "_compare_right_sink", None)
+            ra = getattr(self, "_compare_right_audio", None)
+            if rp is not None:
+                try:
+                    rp.setVideoSink(None)
+                except Exception:
+                    pass
+                try:
+                    rp.setAudioOutput(None)
+                except Exception:
+                    pass
+            for obj in (rs, ra, rp):
+                try:
+                    if obj is not None:
+                        obj.deleteLater()
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
 
         for k in ["_compare_right_player","_compare_right_audio","_compare_right_sink",
                   "_compare_right_frame","_compare_right_image_pm_orig",
@@ -3404,1062 +3666,8 @@ class DescribePane(QWidget):
         fname=OUT_DESCR / f"{datetime.now().strftime('%Y%m%d_%H%M%S')}_{first}.txt"; fname.write_text(text, encoding="utf-8")
         QMessageBox.information(self,"Saved", str(fname))
 
-# --- Queue Pane
+# --- Queue Pane (moved to helpers/queue_pane.py)
 
-
-class QueuePane(QWidget):
-    """
-    Queue tab with vertical-only scrolling, responsive header (3 rows), worker LED, and live counters.
-    """
-
-    # --- Queue list limits ---
-
-    MAX_PENDING_SHOW = 99
-
-    MAX_DONE_KEEP    = 99
-
-    MAX_DONE_SHOW    = 99
-
-    MAX_FAILED_KEEP  = 50
-
-    MAX_FAILED_SHOW  = 50
-
-
-    def __init__(self, main, parent=None):
-        super().__init__(parent); self.main = main
-        from PySide6.QtCore import QUrl, QFileSystemWatcher
-
-        # Timers (keep internal refresh cadence intact)
-        self.auto_timer = QTimer(self); self.auto_timer.setInterval(7500); self.auto_timer.timeout.connect(self.request_refresh)
-        self.watch_timer = QTimer(self); self.watch_timer.setInterval(1300); self.watch_timer.timeout.connect(self.request_refresh)
-        self.worker_timer = QTimer(self); self.worker_timer.setInterval(3500); self.worker_timer.timeout.connect(self._update_worker_led)
-        # Pause queue refreshing while video is playing to prevent playback stutter.
-        # (Queue refresh runs on the GUI thread; any filesystem + thumbnail work can hitch QMediaPlayer.)
-        self._bound_video_player = None
-        self._q_refresh_paused_for_playback = False
-        try:
-            v = getattr(self.main, "video", None)
-            p = getattr(v, "player", None) if v is not None else None
-            self.bind_video_player(p)
-        except Exception:
-            pass
-
-
-        # Queue system and paths
-        try:
-            from helpers.queue_system import QueueSystem
-        except Exception:
-            from queue_system import QueueSystem
-        self.qs = QueueSystem(BASE)
-
-        # Root layout and scroll container
-        root = QVBoxLayout(self)
-        root.setContentsMargins(6, 6, 6, 6)
-        root.setSpacing(8)
-
-        # Fancy banner at the top of the Queue tab
-        self.queue_banner = QLabel('Advanced Queue System')
-        self.queue_banner.setObjectName('queueBanner')
-        self.queue_banner.setAlignment(Qt.AlignCenter)
-        self.queue_banner.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
-        self.queue_banner.setFixedHeight(45)
-        self.queue_banner.setStyleSheet(
-            "#queueBanner {"
-            " font-size: 15px;"
-            " font-weight: 600;"
-            " padding: 8px 17px;"
-            " border-radius: 12px;"
-            " margin: 0 0 6px 0;"
-            " color: #1a2500;"
-            " background: qlineargradient("
-            "   x1:0, y1:0, x2:1, y2:0,"
-            "   stop:0 #d4ff66,"
-            "   stop:0.5 #a9ff28,"
-            "   stop:1 #7acb1f"
-            " );"
-            " letter-spacing: 0.5px;"
-            "}"
-        )
-        root.addWidget(self.queue_banner)
-        root.addSpacing(4)
-        topw = QWidget()
-        grid = QGridLayout(topw)
-        grid.setContentsMargins(0, 0, 0, 0)
-        grid.setHorizontalSpacing(8)
-        grid.setVerticalSpacing(6)
-
-        # Header layout: compact + balanced after hiding some legacy buttons.
-        # Columns: [left controls] [left controls] [stretch spacer] [right status]
-        try:
-            grid.setColumnStretch(0, 0)
-            grid.setColumnStretch(1, 0)
-            grid.setColumnStretch(2, 1)
-            grid.setColumnStretch(3, 0)
-        except Exception:
-            pass
-
-        # Row 1: Refresh · Clear finished/failed (left) · Worker LED (right)
-        self.btn_refresh = QPushButton("Refresh")
-        self.btn_remove_done = QPushButton("Clear Finished")
-        self.btn_remove_failed = QPushButton("Clear Failed")
-        clearw = QWidget()
-        cl = QHBoxLayout(clearw)
-        cl.setContentsMargins(0, 0, 0, 0)
-        cl.setSpacing(6)
-        cl.addWidget(self.btn_remove_done)
-        cl.addWidget(self.btn_remove_failed)
-
-        self.worker_status = WorkerStatusWidget()
-        self.lbl_worker = self.worker_status.label
-
-        grid.addWidget(self.btn_refresh, 0, 0)
-        grid.addWidget(clearw, 0, 1)
-        grid.addWidget(self.worker_status, 0, 3, 1, 1, Qt.AlignRight)
-
-        # Row 2: Repair tools (left) · Delete Selected (right)
-        self.btn_mark_running_failed = QPushButton("Cancel running job(s)")
-        self.btn_reset_running = QPushButton("Move to Pending")
-        self.btn_delete_sel = QPushButton("Delete Selected")
-        grid.addWidget(self.btn_mark_running_failed, 1, 0)
-        grid.addWidget(self.btn_reset_running, 1, 1)
-        grid.addWidget(self.btn_delete_sel, 1, 3, 1, 1, Qt.AlignRight)
-
-        # Legacy re-order buttons (kept for compatibility but hidden)
-        self.btn_move_up = QPushButton("Move Upwards")
-        self.btn_move_down = QPushButton("Move Down")
-        self.btn_move_up.setVisible(False); self.btn_move_up.setEnabled(False)
-        self.btn_move_down.setVisible(False); self.btn_move_down.setEnabled(False)
-
-        # Row 3: Counters (left) · last refresh timestamp (right)
-        self.counts = QLabel("Running 0 | Pending 0 | Done 0 | Failed 0")
-        self.last_updated = QLabel("--:--:--")
-        grid.addWidget(self.counts, 2, 0, 1, 3, Qt.AlignLeft)
-        grid.addWidget(self.last_updated, 2, 3, 1, 1, Qt.AlignRight)
-
-        __import__("helpers.queue_widgets", fromlist=["install_queue_toggle_play_last"]).install_queue_toggle_play_last(
-            self, grid, config, save_config, JOBS_DIRS["done"]
-        )
-        root.addWidget(topw)
-
-        # Scroll area with sections
-        sc = QScrollArea(); sc.setWidgetResizable(True); sc.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff); sc.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
-        content = QWidget(); v = QVBoxLayout(content); v.setContentsMargins(0,0,0,0); v.setSpacing(8)
-
-        # Lists (5-row viewport, vertical only)
-        self.lst_running = QListWidget(); self._apply_policies(self.lst_running)
-        try:
-            _h3 = 56*3 + 8
-            self.lst_running.setMinimumHeight(_h3)
-            self.lst_running.setMaximumHeight(_h3)
-        except Exception:
-            pass
-        self.lst_pending = QListWidget(); self._apply_policies(self.lst_pending)
-        self.lst_done = QListWidget(); self._apply_policies(self.lst_done)
-        self.lst_failed = QListWidget(); self._apply_policies(self.lst_failed)
-
-        sec_running = ToolsCollapsibleSection("Running", expanded=True)
-        lay_sec_running = QVBoxLayout(); lay_sec_running.setContentsMargins(0,0,0,0); lay_sec_running.setSpacing(6)
-        lay_sec_running.addWidget(self.lst_running)
-        try:
-            sec_running.setContentLayout(lay_sec_running)
-        except Exception:
-            # Fallback if API differs
-            sec_running.content = QWidget(); sec_running.content.setLayout(lay_sec_running)
-        v.addWidget(sec_running)
-        sec_pending = ToolsCollapsibleSection("Pending", expanded=False)
-        lay_sec_pending = QVBoxLayout(); lay_sec_pending.setContentsMargins(0,0,0,0); lay_sec_pending.setSpacing(6)
-        lay_sec_pending.addWidget(self.lst_pending)
-        try:
-            sec_pending.setContentLayout(lay_sec_pending)
-        except Exception:
-            # Fallback if API differs
-            sec_pending.content = QWidget(); sec_pending.content.setLayout(lay_sec_pending)
-        v.addWidget(sec_pending)
-        sec_done = ToolsCollapsibleSection("Finished", expanded=False)
-        lay_sec_done = QVBoxLayout(); lay_sec_done.setContentsMargins(0,0,0,0); lay_sec_done.setSpacing(6)
-        lay_sec_done.addWidget(self.lst_done)
-        try:
-            sec_done.setContentLayout(lay_sec_done)
-        except Exception:
-            # Fallback if API differs
-            sec_done.content = QWidget(); sec_done.content.setLayout(lay_sec_done)
-        v.addWidget(sec_done)
-        sec_failed = ToolsCollapsibleSection("Failed", expanded=False)
-        lay_sec_failed = QVBoxLayout(); lay_sec_failed.setContentsMargins(0,0,0,0); lay_sec_failed.setSpacing(6)
-        lay_sec_failed.addWidget(self.lst_failed)
-        try:
-            sec_failed.setContentLayout(lay_sec_failed)
-        except Exception:
-            # Fallback if API differs
-            sec_failed.content = QWidget(); sec_failed.content.setLayout(lay_sec_failed)
-        v.addWidget(sec_failed)
-        sc.setWidget(content); root.addWidget(sc)
-
-        # File-system watcher for live counters + inserts (debounced <=5 Hz)
-        self._fsw = QFileSystemWatcher(self)
-        for k in ("pending","running","done","failed"):
-            self._fsw.addPath(str(JOBS_DIRS[k]))
-        self._debounce = QTimer(self); self._debounce.setInterval(180); self._debounce.setSingleShot(True)
-        self._fsw.directoryChanged.connect(lambda _: self._debounce.start())
-        self._debounce.timeout.connect(self._on_queue_changed)
-
-        # Wire actions
-        self.btn_refresh.clicked.connect(self.refresh)
-        self.btn_remove_done.clicked.connect(self.clear_done)
-        self.btn_remove_failed.clicked.connect(self.clear_failed)
-        self.btn_move_up.clicked.connect(self.move_up)
-        self.btn_move_down.clicked.connect(self.move_down)
-        self.btn_delete_sel.clicked.connect(self.delete_selected)
-        self.btn_reset_running.clicked.connect(self.recover_running_to_pending)
-        self.btn_mark_running_failed.clicked.connect(self.cancel_running_jobs)
-
-        # First refresh and timers
-        self.refresh()
-        self.auto_timer.start(); self.worker_timer.start()
-
-    def _apply_policies(self, w: QListWidget):
-        try:
-            w.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
-            w.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
-            min_h = 56 * 5 + 8  # ~5 rows
-            w.setMinimumHeight(min_h)
-            w.setMaximumHeight(16777215)
-        except Exception:
-            pass
-
-
-    def _is_main_job_json(self, p: Path) -> bool:
-        name = p.name
-        if not name.endswith(".json"):
-            return False
-        if name.endswith(".progress.json") or name.endswith(".json.progress") or name.endswith(".meta.json") or name.startswith("_"):
-            return False
-        return True
-
-
-    def _populate(self, folder: Path, widget: QListWidget, status: str):
-        from helpers.queue_widgets import JobRowWidget
-        # In-place diff to minimize flicker
-        try:
-            from PySide6.QtCore import QUrl, Qt
-        except Exception:
-            pass
-        existing_keys = {}
-        try:
-            for i in range(widget.count()):
-                it = widget.item(i)
-                key = it.data(Qt.UserRole) if 'Qt' in globals() else None
-                w = widget.itemWidget(it) if key is None else None
-                if not key and w is not None:
-                    key = getattr(w, 'path', None) or getattr(w, 'job_path', None) or getattr(w, 'json_path', None)
-                if key:
-                    existing_keys[str(key)] = i
-        except Exception:
-            existing_keys = {}
-        
-        # Build desired file list first (path + sort key)
-        files = []
-        try:
-            for p in folder.glob('*.json'):
-                name = p.name
-                if (name.endswith('.progress.json') or name.endswith('.json.progress') or name.endswith('.progress')
-                    or name.endswith('.meta.json') or name.startswith('_')):
-                    continue
-                try:
-                    d = json.loads(p.read_text(encoding='utf-8') or '{}')
-                    if not isinstance(d, dict) or (not d.get('type')) or ((not d.get('input') and not d.get('frames')) and d.get('type')!='txt2img'):
-                        continue
-                except Exception:
-                    continue
-                sort_ts = p.stat().st_mtime
-                try:
-                    from datetime import datetime
-                    def _parse(s):
-                        if not s: return None
-                        for fmt in ("%Y-%m-%d %H:%M:%S","%Y-%m-%d %H:%M:%S.%f"):
-                            try:
-                                return datetime.strptime(s, fmt).timestamp()
-                            except Exception:
-                                pass
-                        return None
-                    if status == "pending":
-                        # For pending jobs, always sort by file mtime so manual reordering (mtime swaps) is reflected.
-                        pass
-                    elif status == "running":
-                        sort_ts = _parse(d.get("started_at")) or sort_ts
-                    elif status in ("done","failed"):
-                        sort_ts = _parse(d.get("finished_at")) or sort_ts
-                except Exception:
-                    pass
-                files.append((sort_ts, p))
-        except Exception:
-            files = []
-
-        
-        # Apply per-status limits (keep vs show) and stable ordering (newest first)
-        max_keep = None
-        max_show = None
-        if status == "pending":
-            max_show = getattr(self, "MAX_PENDING_SHOW", 99)
-        elif status == "done":
-            max_keep = getattr(self, "MAX_DONE_KEEP", 99)
-            max_show = getattr(self, "MAX_DONE_SHOW", 99)
-        elif status == "failed":
-            max_keep = getattr(self, "MAX_FAILED_KEEP", 50)
-            max_show = getattr(self, "MAX_FAILED_SHOW", 50)
-
-        if files:
-            try:
-                files_sorted = sorted(files, key=lambda t_p: t_p[0], reverse=(status != "pending"))
-            except Exception:
-                files_sorted = list(files)
-        else:
-            files_sorted = []
-
-        # For finished/failed queues, prune/move extra JSON files on disk.
-        # When "Auto clean-up queue" is enabled, we *move* old job JSONs to:
-        #   (root)\jobs\done\old_jobs
-        # and we start doing so slightly before hitting the max, to keep the UI fast.
-        if max_keep is not None and status in ("done", "failed"):
-            try:
-                auto_cleanup = bool(config.get("queue_auto_cleanup", False))
-            except Exception:
-                auto_cleanup = False
-
-            if auto_cleanup:
-                try:
-                    # Start cleanup slightly before hitting the max.
-                    # Done: allow up to (max_keep - 2) then remove a batch of 10 so we drop to ~38-39.
-                    # Failed: keep gentler cleanup so errors remain visible.
-                    if status == "done":
-                        trigger_at = max(1, int(max_keep) - 25)  # e.g. 50 -> start at 48
-                        max_per_refresh = 5
-                    else:
-                        trigger_at = max(1, int(max_keep) - 5)  # e.g. 50 -> start at 49
-                        max_per_refresh = 3
-                except Exception:
-                    trigger_at = max_keep
-                    max_per_refresh = 3
-
-                moved = 0
-                # Only kick in when we reach the trigger threshold.
-                if files_sorted and (len(files_sorted) >= int(trigger_at)):
-                    try:
-                        import shutil as _shutil
-                        import time as _time
-                        old_dir = (BASE / "jobs" / "done" / "old_jobs")
-                        old_dir.mkdir(parents=True, exist_ok=True)
-
-                        # Move the oldest jobs first (files_sorted is newest-first).
-                        while files_sorted and moved < int(max_per_refresh):
-                            victim = files_sorted[-1][1]
-                            if victim is None:
-                                break
-                            try:
-                                dest = old_dir / victim.name
-                                if dest.exists():
-                                    dest = old_dir / f"{victim.stem}_{int(_time.time())}{victim.suffix}"
-                                _shutil.move(str(victim), str(dest))
-                                files_sorted.pop(-1)
-                                moved += 1
-                            except Exception:
-                                break
-                    except Exception:
-                        pass
-
-            else:
-                # Legacy behavior: hard-delete beyond max_keep
-                if len(files_sorted) > max_keep:
-                    try:
-                        for _ts, p in files_sorted[max_keep:]:
-                            try:
-                                p.unlink()
-                            except Exception:
-                                pass
-                    except Exception:
-                        pass
-
-        if max_show is not None and len(files_sorted) > max_show:
-            files = files_sorted[:max_show]
-        else:
-            files = files_sorted
-
-
-        # --- Pending safety rebuild ---
-        # Qt/PySide can hard-crash (access violation) if we reorder QListWidgetItems that have
-        # setItemWidget() row widgets attached. Pending order changes (move up/down) require
-        # re-sorting, so for pending we rebuild the list from scratch in a widget-safe way.
-        if str(status).lower() == "pending":
-            try:
-                from PySide6.QtCore import Qt
-            except Exception:
-                Qt = None  # type: ignore
-
-            # 1) Clear existing items safely: detach row widgets before removing items.
-            try:
-                i = widget.count() - 1
-                while i >= 0:
-                    it_old = widget.item(i)
-                    try:
-                        w_old = widget.itemWidget(it_old)
-                    except Exception:
-                        w_old = None
-                    if w_old is not None:
-                        try:
-                            widget.removeItemWidget(it_old)
-                        except Exception:
-                            pass
-                        try:
-                            w_old.setParent(None)
-                        except Exception:
-                            pass
-                        try:
-                            w_old.deleteLater()
-                        except Exception:
-                            pass
-                    try:
-                        widget.takeItem(i)
-                    except Exception:
-                        # Worst-case fallback
-                        try:
-                            widget.clear()
-                        except Exception:
-                            pass
-                        break
-                    i -= 1
-            except Exception:
-                try:
-                    widget.clear()
-                except Exception:
-                    pass
-
-            # 2) Rebuild in the desired order.
-            for _idx, (_ts, p) in enumerate(files):
-                it = QListWidgetItem("")
-                w = JobRowWidget(str(p), status)
-                try:
-                    hint = w.sizeHint()
-                    if hint.height() < 56:
-                        hint.setHeight(56)
-                    it.setSizeHint(hint)
-                except Exception:
-                    try:
-                        it.setSizeHint(w.sizeHint())
-                    except Exception:
-                        pass
-
-                try:
-                    widget.addItem(it)
-                except Exception:
-                    # fallback
-                    try:
-                        widget.insertItem(_idx, it)
-                    except Exception:
-                        pass
-
-                try:
-                    widget.setItemWidget(it, w)
-                except Exception:
-                    pass
-
-                try:
-                    if Qt is not None:
-                        it.setData(Qt.UserRole, str(p))
-                except Exception:
-                    pass
-
-                # Wire pending order change → safe refresh (debounced, queued).
-                try:
-                    if hasattr(w, "queueOrderChanged"):
-                        from PySide6.QtCore import QTimer
-                        w.queueOrderChanged.connect(lambda *a: QTimer.singleShot(0, self.request_refresh))
-                except Exception:
-                    pass
-
-            return
-
-        # Remove stale items not in target set (in-place, from bottom)
-        try:
-            from PySide6.QtCore import QUrl, Qt
-            target = {str(p) for _, p in files}
-            i = widget.count() - 1
-            while i >= 0:
-                it = widget.item(i)
-                key = None
-                try:
-                    key = it.data(Qt.UserRole)
-                except Exception:
-                    key = None
-                if key is None:
-                    w = widget.itemWidget(it)
-                    key = getattr(w, 'path', None) if w is not None else None
-                if (key is None) or (str(key) not in target):
-                    widget.takeItem(i)
-                i -= 1
-        except Exception:
-            pass
-
-        
-        # Add or refresh rows (preserve order by newest first) — and **reposition** to keep newest on top live.
-        for idx, (_ts, p) in enumerate(files):
-            try:
-                from PySide6.QtCore import QUrl, Qt
-            except Exception:
-                pass
-
-            found = False
-            found_item = None
-            found_widget = None
-            found_row = None
-
-            # Locate existing row for this path (if any)
-            try:
-                for _i in range(widget.count()):
-                    _it = widget.item(_i)
-                    _key = _it.data(Qt.UserRole)
-                    if _key is None:
-                        _w = widget.itemWidget(_it)
-                        _key = getattr(_w, 'path', None) if _w is not None else None
-                    if str(_key) == str(p):
-                        found = True
-                        found_item = _it
-                        found_widget = widget.itemWidget(_it)
-                        found_row = _i
-                        break
-            except Exception:
-                found = False
-
-            if found:
-                # Refresh existing row's contents
-                try:
-                    if hasattr(found_widget, 'refresh'):
-                        found_widget.refresh()
-                except Exception:
-                    pass
-                # Reposition item if order changed
-                try:
-                    if found_row is not None and found_row != idx:
-                        it_take = widget.takeItem(found_row)
-                        # Reinsert at the correct index and reattach the widget
-                        widget.insertItem(idx, it_take)
-                        if found_widget is not None:
-                            widget.setItemWidget(it_take, found_widget)
-                        try:
-                            it_take.setData(Qt.UserRole, str(p))
-                        except Exception:
-                            pass
-                except Exception:
-                    pass
-                continue
-
-            # If not found, create a new row and insert at the correct position
-            it = QListWidgetItem("")
-            w = JobRowWidget(str(p), status)
-            try:
-                hint = w.sizeHint()
-                if hint.height() < 56:
-                    from PySide6.QtCore import QUrl, QSize
-                    hint.setHeight(56)
-                it.setSizeHint(hint)
-            except Exception:
-                it.setSizeHint(w.sizeHint())
-            try:
-                widget.insertItem(idx, it)
-            except Exception:
-                widget.addItem(it)  # fallback
-            widget.setItemWidget(it, w)
-            try:
-                from PySide6.QtCore import QUrl, Qt
-                it.setData(Qt.UserRole, str(p))
-            except Exception:
-                pass
-
-    def bind_video_player(self, player):
-        """(Re)bind the queue's playback hook to the current internal player instance.
-
-        The VideoPane can rebuild QMediaPlayer to avoid backend deadlocks; when that happens,
-        previously connected signals point to the old player object and queue refresh won't pause
-        during playback anymore.
-        """
-        try:
-            # Disconnect from the previous player if any
-            old = getattr(self, "_bound_video_player", None)
-            if old is not None and hasattr(old, "playbackStateChanged"):
-                try:
-                    old.playbackStateChanged.disconnect(self._on_video_playback_state)
-                except Exception:
-                    pass
-            self._bound_video_player = player
-            if player is not None and hasattr(player, "playbackStateChanged"):
-                try:
-                    player.playbackStateChanged.connect(self._on_video_playback_state)
-                except Exception:
-                    pass
-                # Apply current state immediately
-                try:
-                    self._on_video_playback_state(player.playbackState())
-                except Exception:
-                    pass
-        except Exception:
-            pass
-
-    def _is_video_playing(self):
-        """Best-effort check of current playback state (robust against player rebuilds)."""
-        try:
-            from PySide6.QtMultimedia import QMediaPlayer as _QMP
-            v = getattr(self.main, "video", None)
-            p = getattr(v, "player", None) if v is not None else None
-            if p is None:
-                return False
-            return (p.playbackState() == _QMP.PlayingState)
-        except Exception:
-            return False
-
-    def request_refresh(self):
-        try:
-            # Optional safeguard: pause queue refresh while video is playing (prevents playback stutter).
-            try:
-                _pause_on_play = bool(config.get("queue_pause_refresh_while_playing", True))
-            except Exception:
-                _pause_on_play = True
-
-            if _pause_on_play:
-                # If video is currently playing, keep the queue refresh paused.
-                # (This is robust against VideoPane rebuilding the QMediaPlayer instance.)
-                if self._is_video_playing():
-                    try:
-                        if not bool(getattr(self, "_q_refresh_paused_for_playback", False)):
-                            self._q_refresh_paused_for_playback = True
-                            self.stop_auto()
-                    except Exception:
-                        pass
-                    return
-
-                # If we were paused due to playback but the player isn't playing now, unpause.
-                if bool(getattr(self, "_q_refresh_paused_for_playback", False)):
-                    try:
-                        self._q_refresh_paused_for_playback = False
-                        self.start_auto()
-                    except Exception:
-                        pass
-            else:
-                # Safeguard disabled: ensure we are not stuck in a paused state.
-                if bool(getattr(self, "_q_refresh_paused_for_playback", False)):
-                    try:
-                        self._q_refresh_paused_for_playback = False
-                        self.start_auto()
-                    except Exception:
-                        pass
-
-
-            # Debounce/coalesce refresh calls
-
-            if not hasattr(self, '_refresh_coalesce'):
-
-                from PySide6.QtCore import QUrl, QTimer
-
-                self._refresh_coalesce = QTimer(self)
-
-                self._refresh_coalesce.setSingleShot(True)
-
-                self._refresh_coalesce.setInterval(350)
-
-                self._refresh_coalesce.timeout.connect(self._do_refresh)
-
-            self._refresh_coalesce.start()
-
-        except Exception:
-
-            # Fallback: direct refresh
-
-            self.refresh()
-
-
-    def _do_refresh(self):
-
-        try:
-
-            self.refresh()
-
-        except Exception:
-
-            pass
-    def refresh(self):
-        # Avoid UI hitches: block repaints while we rebuild lists.
-        try:
-            self.setUpdatesEnabled(False)
-            for _lst in (getattr(self, "lst_running", None), getattr(self, "lst_pending", None),
-                         getattr(self, "lst_done", None), getattr(self, "lst_failed", None)):
-                try:
-                    if _lst is not None:
-                        _lst.setUpdatesEnabled(False)
-                except Exception:
-                    pass
-
-            self._populate(JOBS_DIRS['running'], self.lst_running, 'running')
-            self._populate(JOBS_DIRS['pending'], self.lst_pending, 'pending')
-            self._populate(JOBS_DIRS['done'], self.lst_done, 'done')
-            self._populate(JOBS_DIRS['failed'], self.lst_failed, 'failed')
-            self._update_counts_label()
-            self._update_worker_led()
-            try:
-                from datetime import datetime as _dt
-                if hasattr(self, 'last_updated'):
-                    self.last_updated.setText(_dt.now().strftime("%H:%M:%S"))
-            except Exception:
-                pass
-        finally:
-            try:
-                for _lst in (getattr(self, "lst_running", None), getattr(self, "lst_pending", None),
-                             getattr(self, "lst_done", None), getattr(self, "lst_failed", None)):
-                    try:
-                        if _lst is not None:
-                            _lst.setUpdatesEnabled(True)
-                    except Exception:
-                        pass
-                self.setUpdatesEnabled(True)
-            except Exception:
-                pass
-
-    def _update_counts_label(self):
-        try:
-            r = sum(1 for pth in JOBS_DIRS["running"].glob("*.json") if self._is_main_job_json(pth))
-            p = sum(1 for pth in JOBS_DIRS["pending"].glob("*.json") if self._is_main_job_json(pth))
-            d = sum(1 for pth in JOBS_DIRS["done"].glob("*.json") if self._is_main_job_json(pth))
-            f = sum(1 for pth in JOBS_DIRS["failed"].glob("*.json") if self._is_main_job_json(pth))
-            done_show = getattr(self, "MAX_DONE_SHOW", 20)
-            done_txt = f"Done {d}" if d <= done_show else f"Done {d} (showing {done_show})"
-            self.counts.setText(f"Running {r} | Pending {p} | {done_txt} | Failed {f}")
-        except Exception:
-            self.counts.setText("Running ? | Pending ? | Done ? | Failed ?")
-
-    def _watch_tick(self):
-        try:
-            self.refresh()
-        except Exception:
-            pass
-
-    def _on_queue_changed(self):
-        # Use debounced refresh to avoid thrash
-        self.request_refresh()
-
-    # --- Queue actions (filesystem-based; minimal and safe) ---
-    def _selected_job_path(self):
-        # Return (bucket, Path) for the currently selected row; None if nothing selected
-        try_lists = [
-            ("running", self.lst_running),
-            ("pending", self.lst_pending),
-            ("done", self.lst_done),
-            ("failed", self.lst_failed),
-        ]
-        for bucket, lst in try_lists:
-            it = lst.currentItem()
-            if it is None:
-                continue
-            try:
-                w = lst.itemWidget(it)
-                p = Path(getattr(w, "path", "") or getattr(w, "job_path", ""))
-                if p and p.exists():
-                    return bucket, p
-            except Exception:
-                pass
-        return None, None
-
-    def clear_done(self):
-        try:
-            for p in list(JOBS_DIRS["done"].glob("*.json")):
-                try: p.unlink()
-                except Exception: pass
-        except Exception:
-            pass
-        self.refresh()
-
-    def clear_failed(self):
-        try:
-            try:
-                self.qs.remove_failed()
-            except Exception:
-                for p in list(JOBS_DIRS["failed"].glob("*.json")):
-                    try: p.unlink()
-                    except Exception: pass
-        except Exception:
-            pass
-        self.refresh()
-
-    def clear_done_failed(self):
-        try:
-            try:
-                self.qs.clear_finished_failed()
-            except Exception:
-                for p in list(JOBS_DIRS["done"].glob("*.json")):
-                    try: p.unlink()
-                    except Exception: pass
-                for p in list(JOBS_DIRS["failed"].glob("*.json")):
-                    try: p.unlink()
-                    except Exception: pass
-        except Exception:
-            pass
-        self.refresh()
-
-    def delete_selected(self):
-        bucket, p = self._selected_job_path()
-        if not p:
-            return
-        try:
-            p.unlink()
-        except Exception:
-            pass
-        self.refresh()
-
-    def move_up(self):
-        bucket, p = self._selected_job_path()
-        if bucket != "pending" or not p:
-            return
-        try:
-            now = time.time()
-            os.utime(p, (now, now + 60))
-        except Exception:
-            pass
-        self.refresh()
-
-    def move_down(self):
-        bucket, p = self._selected_job_path()
-        if bucket != "pending" or not p:
-            return
-        try:
-            now = time.time()
-            os.utime(p, (now, now - 60))
-        except Exception:
-            pass
-        self.refresh()
-
-    def recover_running_to_pending(self):
-        bucket, p = self._selected_job_path()
-        if bucket != "running" or not p:
-            return
-        try:
-            dest = JOBS_DIRS["pending"] / p.name
-            try:
-                d = json.loads(p.read_text(encoding="utf-8") or "{}")
-                for k in ("started_at","finished_at","ended_at","duration_sec","error"):
-                    if k in d: d.pop(k, None)
-                p.write_text(json.dumps(d, ensure_ascii=False, indent=2))
-            except Exception:
-                pass
-            import shutil as _shutil
-            _shutil.move(str(p), str(dest))
-            try:
-                self.qs.nudge_pending()
-            except Exception:
-                pass
-        except Exception:
-            pass
-        self.refresh()
-
-
-    def cancel_running_jobs(self):
-        """Cancel selected running job(s) (or all running jobs if none selected).
-
-        This mirrors the Running-row right-click 'Cancel job' action:
-          - Write <job>.json.cancel marker
-          - Set job['cancel_requested'] = True
-
-        The worker is responsible for killing the underlying process and moving the job to failed.
-        """
-        try:
-            from pathlib import Path
-            from PySide6.QtCore import Qt
-        except Exception:
-            Path = None
-            Qt = None
-
-        paths = []
-        # Prefer selected items in the Running list
-        try:
-            if Qt is not None:
-                for it in self.lst_running.selectedItems():
-                    k = it.data(Qt.UserRole)
-                    if k:
-                        paths.append(Path(str(k)))
-        except Exception:
-            paths = []
-
-        # Fallback: cancel all running jobs
-        if not paths:
-            try:
-                paths = [p for p in JOBS_DIRS["running"].glob("*.json")
-                         if getattr(self, "_is_main_job_json", lambda x: True)(p)]
-            except Exception:
-                paths = []
-
-        for p in paths:
-            try:
-                if not p or (not p.exists()):
-                    continue
-            except Exception:
-                continue
-
-            # Marker file: <job>.json.cancel
-            try:
-                marker = p.with_suffix(p.suffix + ".cancel")
-                marker.write_text("cancel", encoding="utf-8")
-            except Exception:
-                pass
-
-            # JSON flag: cancel_requested = True
-            try:
-                d = {}
-                try:
-                    d = json.loads(p.read_text(encoding="utf-8") or "{}")
-                except Exception:
-                    d = {}
-                d["cancel_requested"] = True
-                try:
-                    p.write_text(json.dumps(d, ensure_ascii=False, indent=2), encoding="utf-8")
-                except Exception:
-                    p.write_text(json.dumps(d, ensure_ascii=False, indent=2))
-            except Exception:
-                pass
-
-        self.refresh()
-
-
-    def mark_running_failed(self):
-        bucket, p = self._selected_job_path()
-        if bucket != "running" or not p:
-            return
-        try:
-            d = {}
-            try:
-                d = json.loads(p.read_text(encoding="utf-8") or "{}")
-            except Exception:
-                d = {}
-            try:
-                from datetime import datetime
-                d["finished_at"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-            except Exception:
-                pass
-            d["error"] = d.get("error") or "Manually marked as failed"
-            p.write_text(json.dumps(d, ensure_ascii=False, indent=2))
-            import shutil as _shutil
-            dest = JOBS_DIRS["failed"] / p.name
-            _shutil.move(str(p), str(dest))
-        except Exception:
-            pass
-        self.refresh()
-
-    def _update_worker_led(self):
-        try:
-            try:
-                running_count = sum(1 for pth in JOBS_DIRS["running"].glob("*.json")
-                                    if getattr(self, "_is_main_job_json", lambda p: True)(pth))
-            except Exception:
-                running_count = 0
-
-            import time
-            hb = globals().get('HEARTBEAT_PATH', BASE / 'logs' / 'worker_heartbeat.txt')
-            age = None
-            if hb.exists():
-                try:
-                    age = time.time() - hb.stat().st_mtime
-                except Exception:
-                    age = None
-
-            if running_count > 0:
-                self.worker_status.set_state("running", f"{running_count} active job(s)")
-            elif age is not None and age < 12.0:
-                self.worker_status.set_state("idle", f"Heartbeat {int(age)}s ago")
-            elif age is not None:
-                self.worker_status.set_state("stopped", f"No heartbeat for {int(age)}s")
-            else:
-                self.worker_status.set_state("stopped", "No heartbeat file")
-        except Exception as e:
-            try:
-                self.worker_status.set_state("error", str(e))
-            except Exception:
-                pass
-    def _on_video_playback_state(self, state):
-        """Stop queue timers while the internal video player is playing (prevents periodic stutter)."""
-        try:
-            from PySide6.QtMultimedia import QMediaPlayer as _QMP
-            playing = (state == _QMP.PlayingState)
-        except Exception:
-            playing = False
-
-        try:
-            try:
-                _pause_on_play = bool(config.get("queue_pause_refresh_while_playing", True))
-            except Exception:
-                _pause_on_play = True
-
-            if not _pause_on_play:
-                # Safeguard disabled: ensure we are not stuck paused from a previous session.
-                if bool(getattr(self, "_q_refresh_paused_for_playback", False)):
-                    self._q_refresh_paused_for_playback = False
-                    self.start_auto()
-                return
-
-            if playing:
-                self._q_refresh_paused_for_playback = True
-                self.stop_auto()
-            else:
-                # Only restart if we paused it due to playback
-                if bool(getattr(self, "_q_refresh_paused_for_playback", False)):
-                    self._q_refresh_paused_for_playback = False
-                    self.start_auto()
-        except Exception:
-            pass
-
-    def stop_auto(self):
-        try:
-            self.auto_timer.stop()
-        except Exception:
-            pass
-        try:
-            self.watch_timer.stop()
-        except Exception:
-            pass
-        try:
-            self.worker_timer.stop()
-        except Exception:
-            pass
-
-    def start_auto(self):
-        # Start/Restart timers safely and schedule a debounced refresh
-        try:
-            self.auto_timer.start()
-        except Exception:
-            pass
-        try:
-            self.watch_timer.start()
-        except Exception:
-            pass
-        try:
-            self.worker_timer.start()
-        except Exception:
-            pass
-        try:
-            self.request_refresh()
-        except Exception:
-            try:
-                self.refresh()
-            except Exception:
-                pass
-
-
-    def closeEvent(self, e):
-        try:
-            state_persist.save_all(self)
-        except Exception:
-            pass
-        try:
-            self.stop_auto()
-        except Exception:
-            pass
-        try:
-            super().closeEvent(e)
-        except Exception:
-            pass
 
 class SettingsPane(QWidget):
     def __init__(self, main, parent=None):
@@ -4474,7 +3682,7 @@ class SettingsPane(QWidget):
         row2=QHBoxLayout()
         btn.clicked.connect(lambda: (config.update({"theme":self.cmb.currentText()}), save_config(), apply_theme(QApplication.instance(), config["theme"])))
         # About area
-        about = QLabel(f"<h2>{APP_NAME}</h2><p>{TAGLINE}</p><p>© {datetime.now().year}</p><p>Placeholder splash — your logo can go here.</p>")
+        about = QLabel(f"<h2>{APP_NAME}</h2><p>{TAGLINE}</p><p>© {datetime.now().year}</p><p>Placeholder — Settings_tab.py did not load or import.</p>")
         v.addWidget(about)
 
 # --- Main Window
@@ -4808,6 +4016,50 @@ class MainWindow(QMainWindow):
             self._save_tab_order_ids()
         except Exception:
             pass
+
+
+
+    def _on_global_video_playback_state(self, state):
+        """Global playback hook (owned by MainWindow). Keeps QueuePane passive."""
+        try:
+            from PySide6.QtMultimedia import QMediaPlayer as _QMP
+            playing = (state == _QMP.PlayingState)
+        except Exception:
+            playing = False
+        try:
+            q = getattr(self, "queue", None)
+            if q is not None and hasattr(q, "set_playback_active"):
+                q.set_playback_active(bool(playing))
+        except Exception:
+            pass
+
+    def _hook_video_player(self, player):
+        """(Re)bind MainWindow playback hooks to the current QMediaPlayer instance."""
+        # Disconnect previous binding if any
+        try:
+            old = getattr(self, "_bound_video_player", None)
+            if old is not None and hasattr(old, "playbackStateChanged"):
+                try:
+                    old.playbackStateChanged.disconnect(self._on_global_video_playback_state)
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
+        self._bound_video_player = player
+        try:
+            if player is not None and hasattr(player, "playbackStateChanged"):
+                try:
+                    player.playbackStateChanged.connect(self._on_global_video_playback_state)
+                except Exception:
+                    pass
+                try:
+                    self._on_global_video_playback_state(player.playbackState())
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
 
     def _install_tab_reorder_behavior(self):
         """Wire up movable tabs + persistence."""
@@ -5278,7 +4530,23 @@ class MainWindow(QMainWindow):
             'MANIFEST_PATH': MANIFEST_PATH,
             'config': config
         })
-        self.queue = QueuePane(self)
+        self.queue = QueuePane(self, {'BASE': BASE, 'JOBS_DIRS': JOBS_DIRS, 'config': config, 'save_config': save_config})
+        
+        # Expose shared config/paths on MainWindow (helps keep panes decoupled)
+        try:
+            self.config = config
+            self.BASE = BASE
+            self.JOBS_DIRS = JOBS_DIRS
+            self.save_config = save_config
+        except Exception:
+            pass
+
+        # Hook playback state so the queue can pause its own refresh timers without touching the player.
+        try:
+            self._hook_video_player(getattr(self.video, 'player', None))
+        except Exception:
+            pass
+
         self.presets_tab = PresetsPane(self)
         self.settings = SettingsPane(self)
 

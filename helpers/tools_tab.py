@@ -71,6 +71,21 @@ except Exception:
         OUT_REVERSE = _Path('output')/'video'/'reverse'
 
 
+try:
+    OUT_SLOW_FAST
+except Exception:
+    try:
+        OUT_SLOW_FAST = ROOT/'output'/'video'/'slow_fast'
+    except Exception:
+        from pathlib import Path as _Path
+        OUT_SLOW_FAST = _Path('output')/'video'/'slow_fast'
+
+try:
+    OUT_SLOW_FAST.mkdir(parents=True, exist_ok=True)
+except Exception:
+    pass
+
+
 def ffmpeg_path():
     """Resolve ffmpeg, preferring app-local presets/bin first, then bin, then PATH."""
     exe = "ffmpeg.exe" if os.name=="nt" else "ffmpeg"
@@ -1018,8 +1033,14 @@ class InstantToolsPane(QWidget):
         self.speed.valueChanged.connect(lambda v: self.spin_speed.setValue(round(v/100.0,2)))
         self.spin_speed.valueChanged.connect(lambda val: self.speed.setValue(int(round(val*100))))
         self.btn_speed = QPushButton("Change Speed"); self.btn_speed.setToolTip("Change playback speed. If Sound sync is on, audio pitch is preserved."); self.btn_speed.setToolTip("Change playback speed. 1.00x keeps pitch if Sound sync is on."); self.btn_speed_batch = QPushButton("Batch…"); self.btn_speed_batch.setToolTip("Batch with current Speed settings."); self.btn_speed_batch.setToolTip("Select multiple videos or a folder; one job per file using current Speed settings.")
+        self.btn_speed_open_folder = QPushButton("View results")
+        self.btn_speed_open_folder.setToolTip("Open these results in Media Explorer.")
         lay_speed = QFormLayout();
         row_speed = QHBoxLayout(); row_speed.addWidget(self.speed); row_speed.addWidget(self.spin_speed); lay_speed.addRow("Speed factor", row_speed); lay_speed.addRow("", self.lbl_speed); row_b = QHBoxLayout(); row_b.addWidget(self.btn_speed); row_b.addWidget(self.btn_speed_batch); lay_speed.addRow(row_b)
+        try:
+            row_b.addWidget(self.btn_speed_open_folder)
+        except Exception:
+            pass
 
         # Audio options
         try:
@@ -1569,6 +1590,10 @@ class InstantToolsPane(QWidget):
             pass
         self.btn_speed.clicked.connect(self.run_speed)
         self.btn_speed_batch.clicked.connect(self.run_speed_batch)
+        try:
+            self.btn_speed_open_folder.clicked.connect(self._speed_open_folder)
+        except Exception:
+            pass
         self.btn_gif.clicked.connect(self.run_gif)
         self.btn_gif_batch.clicked.connect(self.run_gif_batch)
 
@@ -1822,10 +1847,21 @@ class InstantToolsPane(QWidget):
             return
         factor = self.speed.value() / 100.0
         try:
-            out_dir = OUT_VIDEOS
+            out_dir = OUT_SLOW_FAST
         except Exception:
             out_dir = Path('.')
+        try:
+            from pathlib import Path as _P
+            _P(str(out_dir)).mkdir(parents=True, exist_ok=True)
+        except Exception:
+            pass
+
         out = out_dir / f"{inp.stem}_spd_{factor:.2f}x.mp4"
+        try:
+            from pathlib import Path as _P
+            self._speed_last_out_dir = _P(str(out)).parent
+        except Exception:
+            pass
         setpts = 1.0 / float(factor if factor != 0 else 1.0)
         mute = False
         sync = True
@@ -2073,6 +2109,58 @@ class InstantToolsPane(QWidget):
             fp = None
 
         # Prefer Media Explorer (single shared entry-point) if available on the main window.
+        main = None
+        try:
+            main = getattr(self, "main", None)
+        except Exception:
+            main = None
+        if main is None:
+            try:
+                main = self.window() if hasattr(self, "window") else None
+            except Exception:
+                main = None
+
+        if main is not None and hasattr(main, "open_media_explorer_folder") and fp is not None:
+            try:
+                main.open_media_explorer_folder(str(fp), preset="videos", include_subfolders=False)
+                return
+            except TypeError:
+                try:
+                    main.open_media_explorer_folder(str(fp))
+                    return
+                except Exception:
+                    pass
+            except Exception:
+                pass
+
+        # Fallback: open in OS file browser
+        if fp is not None:
+            self._open_folder_in_os(fp)
+
+    def _speed_open_folder(self):
+        """Open Speed tool results in Media Explorer (fallback: OS folder)."""
+        folder = None
+        try:
+            folder = getattr(self, "_speed_last_out_dir", None)
+        except Exception:
+            folder = None
+        if not folder:
+            try:
+                folder = OUT_SLOW_FAST
+            except Exception:
+                try:
+                    from pathlib import Path as _P
+                    folder = _P(".")
+                except Exception:
+                    folder = None
+
+        try:
+            from pathlib import Path as _P
+            fp = _P(str(folder)) if folder else None
+        except Exception:
+            fp = None
+
+        # Prefer Media Explorer if available
         main = None
         try:
             main = getattr(self, "main", None)
@@ -2944,6 +3032,16 @@ class InstantToolsPane(QWidget):
                 return
         except Exception:
             pass
+        try:
+            from pathlib import Path as _P
+            self._speed_last_out_dir = _P(str(OUT_SLOW_FAST))
+        except Exception:
+            pass
+        try:
+            from pathlib import Path as _P
+            _P(str(OUT_SLOW_FAST)).mkdir(parents=True, exist_ok=True)
+        except Exception:
+            pass
         for p in paths:
             try:
                 from pathlib import Path as _P
@@ -2952,7 +3050,7 @@ class InstantToolsPane(QWidget):
                 setpts = 1.0 / float(factor if factor != 0 else 1.0)
                 mute = bool(self.cb_speed_mute.isChecked()) if hasattr(self, "cb_speed_mute") else False
                 sync = bool(self.cb_speed_sync.isChecked()) if hasattr(self, "cb_speed_sync") else True
-                out = OUT_VIDEOS / f"{inp.stem}_spd_{factor:.2f}x.mp4"
+                out = OUT_SLOW_FAST / f"{inp.stem}_spd_{factor:.2f}x.mp4"
                 cmd = [ffmpeg_path(), "-y", "-i", str(inp), "-vf", f"setpts={setpts:.6f}*PTS"]
                 if mute:
                     cmd += ["-an"]

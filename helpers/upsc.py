@@ -169,25 +169,49 @@ def scan_realsr_ncnn_models() -> List[str]:
 
 
 def _parse_fps(src: Path) -> Optional[str]:
-    try:
-        out = subprocess.check_output(
-            [FFPROBE, "-v", "0", "-select_streams", "v:0", "-show_entries", "stream=r_frame_rate",
-             "-of", "default=noprint_wrappers=1:nokey=1", str(src)],
-            cwd=str(ROOT), universal_newlines=True
-        )
-        rat = out.strip() or "0/0"
-        if "/" in rat:
-            a, b = rat.split("/", 1)
-            a = float(a)
-            b = float(b) if float(b) != 0 else 1.0
-            fps = a / b
-        else:
-            fps = float(rat)
-        if fps <= 0:
+    """Best-effort: return source FPS as a ffmpeg-friendly string.
+
+    Prefer avg_frame_rate (matches real timing/duration), then fall back to r_frame_rate.
+    Returns a ratio when available (e.g. 24000/1001) to preserve exact timing.
+    """
+    def _probe(entry: str) -> Optional[str]:
+        try:
+            out = subprocess.check_output(
+                [FFPROBE, "-v", "error", "-select_streams", "v:0",
+                 "-show_entries", f"stream={entry}",
+                 "-of", "default=noprint_wrappers=1:nokey=1", str(src)],
+                cwd=str(ROOT),
+                universal_newlines=True,
+            )
+            val = (out or "").strip()
+            if not val or val in ("0/0", "0", "N/A"):
+                return None
+            # Keep ratios intact if valid (ffmpeg accepts them directly).
+            if "/" in val:
+                a, b = val.split("/", 1)
+                try:
+                    if float(b) == 0:
+                        return None
+                except Exception:
+                    return None
+                # Normalize whitespace
+                return f"{a.strip()}/{b.strip()}"
+            # Plain float
+            try:
+                fps = float(val)
+                if fps <= 0:
+                    return None
+                return f"{fps:.6f}".rstrip("0").rstrip(".")
+            except Exception:
+                return None
+        except Exception:
             return None
-        return f"{fps:.6f}".rstrip("0").rstrip(".")
-    except Exception:
-        return None
+
+    for key in ("avg_frame_rate", "r_frame_rate"):
+        v = _probe(key)
+        if v:
+            return v
+    return None
 
 
 class _RunThread(QtCore.QThread):
@@ -1623,7 +1647,7 @@ class UpscPane(QtWidgets.QWidget):
                     return
     
                 model = self.combo_model_realsr.currentText()
-                fps = "30"
+                fps = _parse_fps(src) or "30"
                 work = outd / f"{src.stem}_x{scale}_work"
                 in_dir = work / "in"
                 out_dir = work / "out"
@@ -1656,9 +1680,9 @@ class UpscPane(QtWidgets.QWidget):
                 if int(self.spin_keyint.value() or 0) > 0:
                     cmd_encode += ["-g", str(int(self.spin_keyint.value()))]
                 if post:
-                    cmd_encode += ["-vf", f"fps={fps}," + post]
-                else:
-                    cmd_encode += ["-vf", f"fps={fps}"]
+                    cmd_encode += ["-vf", post]
+                
+                
                 if self.radio_a_mute.isChecked():
                     cmd_encode += ["-an"]
                 elif self.radio_a_copy.isChecked():

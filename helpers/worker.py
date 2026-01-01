@@ -685,31 +685,45 @@ def _ffprobe_bin():
     return "ffprobe"
 
 def _probe_src_fps(p: Path) -> str:
+    """Return source FPS for ffmpeg (ratio or float). Prefer avg_frame_rate to avoid speedup/slowdown."""
     try:
         FP = _ffprobe_bin()
-        out = subprocess.check_output(
-            [FP, "-v", "error", "-select_streams", "v:0",
-             "-show_entries", "stream=avg_frame_rate,r_frame_rate",
-             "-of", "csv=p=0", str(p)], stderr=subprocess.STDOUT
-        ).decode("utf-8","ignore").strip().splitlines()
-        for val in out:
-            val = (val or "").strip()
-            if not val or val in ("0/0","0","N/A"):
-                continue
+    except Exception:
+        FP = "ffprobe"
+
+    def _probe(entry: str) -> str | None:
+        try:
+            out = subprocess.check_output(
+                [FP, "-v", "error", "-select_streams", "v:0",
+                 "-show_entries", f"stream={entry}",
+                 "-of", "default=noprint_wrappers=1:nokey=1", str(p)],
+                stderr=subprocess.STDOUT
+            ).decode("utf-8", "ignore").strip()
+            val = (out or "").strip()
+            if not val or val in ("0/0", "0", "N/A"):
+                return None
             if "/" in val:
-                a,b = val.split("/",1)
+                a, b = val.split("/", 1)
                 try:
-                    if float(b) != 0:
-                        return val
+                    if float(b) == 0:
+                        return None
                 except Exception:
-                    pass
+                    return None
+                return f"{a.strip()}/{b.strip()}"
             try:
                 f = float(val)
-                if f > 0: return f"{f:g}"
+                if f > 0:
+                    return f"{f:.6f}".rstrip("0").rstrip(".")
             except Exception:
-                pass
-    except Exception:
-        pass
+                return None
+            return None
+        except Exception:
+            return None
+
+    for key in ("avg_frame_rate", "r_frame_rate"):
+        v = _probe(key)
+        if v:
+            return v
     return "30"
 
 
