@@ -194,7 +194,7 @@ class AnimatedButtonsManager(QtCore.QObject):
     """
     _APP_PROP = "_fv_animated_buttons_manager"
     _HOVER_MARK = "/* fv_animbtn_hover */"
-    _KEYWORDS = ("view results", "restart app", "restart app", "analyze", "clear program cache", "apply","show qsettings in cmd")
+    _KEYWORDS = ("view results", "queue", "restart app", "restart app", "analyze", "clear program cache", "apply","show qsettings in cmd")
     _RANDOM_CHOICES = ("glow", "shift", "boomerang", "outline", "scanline", "shimmer", "pop")
 
     def __init__(self, app: QtWidgets.QApplication):

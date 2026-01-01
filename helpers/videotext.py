@@ -223,6 +223,14 @@ class TextOverlay:
     font_size: int = 48  # pixels
     color_rgba: list[int] = field(default_factory=lambda: [255, 255, 255, 255])
 
+    # Effects
+    # - none: static
+    # - flash: blink on/off
+    # - color_swap: alternate between Color and Alt Color
+    effect: str = "none"
+    effect_hz: float = 2.0
+    effect_color2_rgba: list[int] = field(default_factory=lambda: [255, 64, 64, 255])
+
     # Export-only: optional font file path for ffmpeg drawtext
     font_file: str = ""
 
@@ -264,6 +272,32 @@ class TextOverlay:
             total = max(1, self.fade_in_ms + self.fade_out_ms)
             self.fade_in_ms = int(self.duration_ms * (self.fade_in_ms / total))
             self.fade_out_ms = int(self.duration_ms - self.fade_in_ms)
+
+        # Effects
+        try:
+            self.effect = str(getattr(self, "effect", "none") or "none")
+        except Exception:
+            self.effect = "none"
+        if self.effect not in ("none", "flash", "color_swap"):
+            self.effect = "none"
+
+        try:
+            self.effect_hz = float(getattr(self, "effect_hz", 2.0) or 0.0)
+        except Exception:
+            self.effect_hz = 0.0
+        self.effect_hz = float(_clamp(self.effect_hz, 0.0, 20.0))
+
+        try:
+            c2 = list(getattr(self, "effect_color2_rgba", None) or [255, 64, 64, 255])
+        except Exception:
+            c2 = [255, 64, 64, 255]
+        if len(c2) != 4:
+            c2 = [255, 64, 64, 255]
+        try:
+            c2 = [int(_clamp(int(v), 0, 255)) for v in c2[:4]]
+        except Exception:
+            c2 = [255, 64, 64, 255]
+        self.effect_color2_rgba = c2
 
 
 @dataclass
@@ -397,6 +431,24 @@ class VideoPreview(QWidget):
 
             if s.preview_always_show:
                 alpha = (ov.color_rgba[3] / 255.0) if ov.color_rgba else 1.0
+                # Apply flash even when "always show" is enabled (skip time-window, but still blink)
+                try:
+                    eff = str(getattr(ov, "effect", "none") or "none")
+                except Exception:
+                    eff = "none"
+                if eff == "flash":
+                    try:
+                        hz = float(getattr(ov, "effect_hz", 2.0) or 0.0)
+                    except Exception:
+                        hz = 0.0
+                    if hz > 0.001:
+                        per = 1000.0 / hz
+                        try:
+                            phase = ((pos_ms - ov.start_ms) % per) / per
+                        except Exception:
+                            phase = 0.0
+                        if phase >= 0.5:
+                            alpha = 0.0
             else:
                 alpha = self._alpha_at_ms(ov, pos_ms)
 
@@ -406,6 +458,62 @@ class VideoPreview(QWidget):
             else:
                 items.text.setVisible(True)
                 items.shadow.setVisible(True)
+                # Color effects (swap)
+                try:
+                    eff = str(getattr(ov, "effect", "none") or "none")
+                except Exception:
+                    eff = "none"
+                if eff == "color_swap":
+                    try:
+                        hz = float(getattr(ov, "effect_hz", 2.0) or 0.0)
+                    except Exception:
+                        hz = 0.0
+                    if hz > 0.001:
+                        per = 1000.0 / hz
+                        try:
+                            phase = ((pos_ms - ov.start_ms) % per) / per
+                        except Exception:
+                            phase = 0.0
+                        if phase >= 0.5:
+                            try:
+                                c2 = list(getattr(ov, "effect_color2_rgba", None) or [255, 64, 64, 255])
+                            except Exception:
+                                c2 = [255, 64, 64, 255]
+                            if len(c2) == 4:
+                                rgb = (int(c2[0]), int(c2[1]), int(c2[2]))
+                            else:
+                                rgb = None
+                        else:
+                            rgb = None
+                    else:
+                        rgb = None
+                else:
+                    rgb = None
+
+                try:
+                    base_rgba = list(getattr(ov, "color_rgba", None) or [255, 255, 255, 255])
+                except Exception:
+                    base_rgba = [255, 255, 255, 255]
+                try:
+                    base_rgb = (int(base_rgba[0]), int(base_rgba[1]), int(base_rgba[2]))
+                except Exception:
+                    base_rgb = (255, 255, 255)
+
+                want = rgb if rgb is not None else base_rgb
+                try:
+                    last = getattr(items.text, "_videotext_last_rgb", None)
+                except Exception:
+                    last = None
+                if last != want:
+                    try:
+                        items.text.setDefaultTextColor(QColor(want[0], want[1], want[2]))
+                    except Exception:
+                        pass
+                    try:
+                        setattr(items.text, "_videotext_last_rgb", want)
+                    except Exception:
+                        pass
+
                 items.text.setOpacity(alpha)
                 items.shadow.setOpacity(alpha)
 
@@ -720,6 +828,26 @@ class VideoPreview(QWidget):
             a = min(a, a2)
 
         a = float(_clamp(a, 0.0, 1.0))
+
+        # Effects (alpha mods)
+        try:
+            eff = str(getattr(ov, "effect", "none") or "none")
+        except Exception:
+            eff = "none"
+        if eff == "flash":
+            try:
+                hz = float(getattr(ov, "effect_hz", 2.0) or 0.0)
+            except Exception:
+                hz = 0.0
+            if hz > 0.001:
+                per = 1000.0 / hz
+                try:
+                    phase = ((pos_ms - ov.start_ms) % per) / per
+                except Exception:
+                    phase = 0.0
+                if phase >= 0.5:
+                    return 0.0
+
         return base_alpha * a
 
 
@@ -1134,6 +1262,30 @@ class VideoTextPane(QWidget):
         font_wrap.setLayout(font_row)
         form.addRow(QLabel("Font"), font_wrap)
 
+        # Effects
+        self.combo_effect = QComboBox()
+        self.combo_effect.addItem("None", "none")
+        self.combo_effect.addItem("Flash", "flash")
+        self.combo_effect.addItem("Color swap", "color_swap")
+
+        self.spin_effect = QDoubleSpinBox()
+        self.spin_effect.setRange(0.0, 20.0)
+        self.spin_effect.setDecimals(2)
+        self.spin_effect.setSingleStep(0.25)
+        self.spin_effect.setSuffix(" Hz")
+
+        self.btn_color2 = QToolButton()
+        self.btn_color2.setText("Alt Color…")
+
+        eff_row = QHBoxLayout()
+        eff_row.addWidget(self.combo_effect, 1)
+        eff_row.addWidget(QLabel("Speed"), 0)
+        eff_row.addWidget(self.spin_effect, 0)
+        eff_row.addWidget(self.btn_color2, 0)
+        eff_wrap = QWidget()
+        eff_wrap.setLayout(eff_row)
+        form.addRow(QLabel("Effect"), eff_wrap)
+
         ff_row = QHBoxLayout()
         ff_row.addWidget(self.edit_fontfile, 1)
         ff_row.addWidget(self.btn_fontfile, 0)
@@ -1247,6 +1399,7 @@ class VideoTextPane(QWidget):
         self.slider_zoom.valueChanged.connect(self._on_zoom_slider)
 
         self.btn_color.clicked.connect(self._pick_color)
+        self.btn_color2.clicked.connect(self._pick_color2)
         self.btn_start_now.clicked.connect(self._set_start_to_current)
         self.btn_end_now.clicked.connect(self._set_end_to_current)
         self.btn_seek_start.clicked.connect(self._seek_to_start)
@@ -1264,6 +1417,8 @@ class VideoTextPane(QWidget):
         self.chk_enabled.toggled.connect(self._on_inputs_changed)
         self.combo_font.currentFontChanged.connect(self._on_inputs_changed)
         self.spin_size.valueChanged.connect(self._on_inputs_changed)
+        self.combo_effect.currentIndexChanged.connect(self._on_inputs_changed)
+        self.spin_effect.valueChanged.connect(self._on_inputs_changed)
         self.edit_fontfile.textChanged.connect(self._on_inputs_changed)
 
         self.combo_anchor.currentIndexChanged.connect(self._on_inputs_changed)
@@ -1506,6 +1661,24 @@ class VideoTextPane(QWidget):
             try:
                 if s.preview_always_show:
                     alpha = (ov.color_rgba[3] / 255.0) if ov.color_rgba else 1.0
+                    # Apply flash even when "always show" is enabled
+                    try:
+                        eff = str(getattr(ov, "effect", "none") or "none")
+                    except Exception:
+                        eff = "none"
+                    if eff == "flash":
+                        try:
+                            hz = float(getattr(ov, "effect_hz", 2.0) or 0.0)
+                        except Exception:
+                            hz = 0.0
+                        if hz > 0.001:
+                            per = 1000.0 / hz
+                            try:
+                                phase = ((pos_ms - ov.start_ms) % per) / per
+                            except Exception:
+                                phase = 0.0
+                            if phase >= 0.5:
+                                alpha = 0.0
                 else:
                     alpha = VideoPreview._alpha_at_ms(ov, pos_ms)
             except Exception:
@@ -1557,6 +1730,11 @@ class VideoTextPane(QWidget):
             )
         except Exception:
             pass
+
+        try:
+            pos_ms = int(self.player.position())
+        except Exception:
+            pos_ms = 0
 
         for ov, opacity in overlays:
             try:
@@ -1672,6 +1850,33 @@ class VideoTextPane(QWidget):
                 r, g, b, a = int(rgba[0]), int(rgba[1]), int(rgba[2]), int(rgba[3])
             except Exception:
                 r, g, b, a = 255, 255, 255, 255
+
+            # Color effects (swap)
+            try:
+                eff = str(getattr(ov, "effect", "none") or "none")
+            except Exception:
+                eff = "none"
+            if eff == "color_swap":
+                try:
+                    hz = float(getattr(ov, "effect_hz", 2.0) or 0.0)
+                except Exception:
+                    hz = 0.0
+                if hz > 0.001:
+                    per = 1000.0 / hz
+                    try:
+                        phase = ((pos_ms - ov.start_ms) % per) / per
+                    except Exception:
+                        phase = 0.0
+                    if phase >= 0.5:
+                        try:
+                            c2 = list(getattr(ov, "effect_color2_rgba", None) or [255, 64, 64, 255])
+                        except Exception:
+                            c2 = [255, 64, 64, 255]
+                        if len(c2) == 4:
+                            try:
+                                r, g, b = int(c2[0]), int(c2[1]), int(c2[2])
+                            except Exception:
+                                pass
 
             try:
                 text_a = int(_clamp(a * float(opacity), 0, 255))
@@ -2248,6 +2453,9 @@ class VideoTextPane(QWidget):
         new.fade_in_ms = src.fade_in_ms
         new.fade_out_ms = src.fade_out_ms
         new.enabled = src.enabled
+        new.effect = getattr(src, "effect", "none")
+        new.effect_hz = float(getattr(src, "effect_hz", 2.0) or 0.0)
+        new.effect_color2_rgba = list(getattr(src, "effect_color2_rgba", None) or [255, 64, 64, 255])
 
         self._settings.overlays.append(new)
         self._settings.selected_uid = new.uid
@@ -2380,6 +2588,26 @@ class VideoTextPane(QWidget):
         self._apply_settings_to_preview()
         self._schedule_save()
         self._emit_settings()
+
+    def _pick_color2(self) -> None:
+        ov = self._current_overlay()
+        try:
+            cur_rgba = list(getattr(ov, "effect_color2_rgba", None) or [255, 64, 64, 255])
+        except Exception:
+            cur_rgba = [255, 64, 64, 255]
+        if len(cur_rgba) != 4:
+            cur_rgba = [255, 64, 64, 255]
+
+        cur = QColor(*cur_rgba)
+        picked = QColorDialog.getColor(cur, self, "Pick alternate text color")
+        if not picked.isValid():
+            return
+        ov.effect_color2_rgba = [picked.red(), picked.green(), picked.blue(), picked.alpha()]
+        self._apply_settings_to_preview()
+        self._schedule_save()
+        self._emit_settings()
+
+
 
     def _pick_fontfile(self) -> None:
         path, _ = QFileDialog.getOpenFileName(
@@ -2551,6 +2779,15 @@ class VideoTextPane(QWidget):
                             ov.fade_in_ms = int(raw.get("fade_in_ms", ov.fade_in_ms))
                             ov.fade_out_ms = int(raw.get("fade_out_ms", ov.fade_out_ms))
                             ov.enabled = _to_bool(raw.get("enabled", True), default=True)
+                            ov.effect = str(raw.get("effect", raw.get("effect_mode", getattr(ov, "effect", "none"))) or "none")
+                            try:
+                                ov.effect_hz = float(raw.get("effect_hz", getattr(ov, "effect_hz", 2.0)) or 0.0)
+                            except Exception:
+                                ov.effect_hz = float(getattr(ov, "effect_hz", 2.0) or 0.0)
+                            try:
+                                ov.effect_color2_rgba = list(raw.get("effect_color2_rgba", getattr(ov, "effect_color2_rgba", None) or [255, 64, 64, 255]))
+                            except Exception:
+                                ov.effect_color2_rgba = list(getattr(ov, "effect_color2_rgba", None) or [255, 64, 64, 255])
                             ovs.append(ov)
 
                     if not ovs:
@@ -2601,6 +2838,8 @@ class VideoTextPane(QWidget):
         self.chk_enabled.blockSignals(True)
         self.combo_font.blockSignals(True)
         self.spin_size.blockSignals(True)
+        self.combo_effect.blockSignals(True)
+        self.spin_effect.blockSignals(True)
         self.edit_fontfile.blockSignals(True)
         self.combo_anchor.blockSignals(True)
         self.spin_x.blockSignals(True)
@@ -2615,6 +2854,24 @@ class VideoTextPane(QWidget):
         self.chk_enabled.setChecked(bool(ov.enabled))
         self.combo_font.setCurrentFont(QFont(ov.font_family))
         self.spin_size.setValue(int(ov.font_size))
+
+        # Effects
+        eff = str(getattr(ov, "effect", "none") or "none")
+        idxe = 0
+        for i in range(self.combo_effect.count()):
+            if self.combo_effect.itemData(i) == eff:
+                idxe = i
+                break
+        self.combo_effect.setCurrentIndex(idxe)
+        try:
+            self.spin_effect.setValue(float(getattr(ov, "effect_hz", 2.0) or 0.0))
+        except Exception:
+            self.spin_effect.setValue(0.0)
+        try:
+            self.btn_color2.setEnabled(eff == "color_swap")
+        except Exception:
+            pass
+
         self.edit_fontfile.setText(ov.font_file or "")
 
         idxa = 0
@@ -2638,6 +2895,8 @@ class VideoTextPane(QWidget):
         self.chk_enabled.blockSignals(False)
         self.combo_font.blockSignals(False)
         self.spin_size.blockSignals(False)
+        self.combo_effect.blockSignals(False)
+        self.spin_effect.blockSignals(False)
         self.edit_fontfile.blockSignals(False)
         self.combo_anchor.blockSignals(False)
         self.spin_x.blockSignals(False)
@@ -2707,6 +2966,21 @@ class VideoTextPane(QWidget):
         ov.enabled = bool(self.chk_enabled.isChecked())
         ov.font_family = self.combo_font.currentFont().family()
         ov.font_size = int(self.spin_size.value())
+
+        # Effects
+        try:
+            ov.effect = str(self.combo_effect.currentData() or "none")
+        except Exception:
+            ov.effect = "none"
+        try:
+            ov.effect_hz = float(self.spin_effect.value())
+        except Exception:
+            ov.effect_hz = 0.0
+        try:
+            self.btn_color2.setEnabled(str(getattr(ov, "effect", "none") or "none") == "color_swap")
+        except Exception:
+            pass
+
         ov.font_file = self.edit_fontfile.text().strip()
 
         ov.anchor = str(self.combo_anchor.currentData())
@@ -2880,6 +3154,16 @@ class VideoTextPane(QWidget):
         r, g, b, a = ov.color_rgba if (ov.color_rgba and len(ov.color_rgba) == 4) else (255, 255, 255, 255)
         base_alpha = float(_clamp(a / 255.0, 0.0, 1.0))
         base_color = f"#{int(r):02x}{int(g):02x}{int(b):02x}"
+        # Effects
+        try:
+            eff = str(getattr(ov, "effect", "none") or "none")
+        except Exception:
+            eff = "none"
+        try:
+            hz = float(getattr(ov, "effect_hz", 2.0) or 0.0)
+        except Exception:
+            hz = 0.0
+
 
         alpha_expr = self._fade_alpha_expr(start_s, end_s, fi_s, fo_s, base_alpha)
 
@@ -2891,11 +3175,44 @@ class VideoTextPane(QWidget):
         parts.append(f"fontsize={int(ov.font_size)}:")
         parts.append(f"x={x_expr}:")
         parts.append(f"y={y_expr}:")
-        parts.append(f"enable='between(t,{start_s:.6f},{end_s:.6f})':")
+        enable_base = f"between(t,{start_s:.6f},{end_s:.6f})"
+        enable_expr = enable_base
+        if hz > 0.001 and eff in ("flash", "color_swap"):
+            per = 1.0 / hz
+            half = per / 2.0
+            mod_expr = f"mod(t-{start_s:.6f},{per:.6f})"
+            if eff == "flash":
+                enable_expr = f"{enable_base}*lt({mod_expr},{half:.6f})"
+        parts.append(f"enable='{enable_expr}':")
         parts.append("shadowcolor=black@0.65:shadowx=2:shadowy=2:")
         parts.append(f"alpha='{alpha_expr}'")
 
-        return "".join(parts), None
+        filt = "".join(parts)
+
+        if hz > 0.001 and eff == "color_swap":
+            try:
+                c2 = list(getattr(ov, "effect_color2_rgba", None) or [255, 64, 64, 255])
+            except Exception:
+                c2 = [255, 64, 64, 255]
+            if len(c2) != 4:
+                c2 = [255, 64, 64, 255]
+            try:
+                r2, g2, b2 = int(c2[0]), int(c2[1]), int(c2[2])
+            except Exception:
+                r2, g2, b2 = 255, 64, 64
+            col2 = f"#{int(r2):02x}{int(g2):02x}{int(b2):02x}"
+
+            per = 1.0 / hz
+            half = per / 2.0
+            enable_base = f"between(t,{start_s:.6f},{end_s:.6f})"
+            mod_expr = f"mod(t-{start_s:.6f},{per:.6f})"
+            enable2 = f"{enable_base}*gte({mod_expr},{half:.6f})"
+
+            filt2 = filt.replace(f"fontcolor={base_color}:", f"fontcolor={col2}:", 1)
+            filt2 = filt2.replace(f"enable='{enable_expr}':", f"enable='{enable2}':", 1)
+            return filt + "," + filt2, None
+
+        return filt, None
 
     @staticmethod
     def _fade_alpha_expr(start_s: float, end_s: float, fi_s: float, fo_s: float, base_alpha: float) -> str:

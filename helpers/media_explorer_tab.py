@@ -3773,6 +3773,36 @@ class MediaExplorerTab(QtWidgets.QWidget):
 
         menu.addSeparator()
 
+        # Sort submenu (quick access)
+        sort_actions = {}
+        try:
+            sort_menu = menu.addMenu("Sort")
+            sort_menu.setToolTip("Sort the table by common fields.")
+
+            def _add_sort_group(title: str, col: int) -> None:
+                sub = sort_menu.addMenu(title)
+                act_up = sub.addAction("Up")
+                act_down = sub.addAction("Down")
+                try:
+                    act_up.setToolTip("Sort ascending.")
+                    act_down.setToolTip("Sort descending.")
+                except Exception:
+                    pass
+                sort_actions[act_up] = (col, QtCore.Qt.SortOrder.AscendingOrder)
+                sort_actions[act_down] = (col, QtCore.Qt.SortOrder.DescendingOrder)
+
+            _add_sort_group("By date", Column.MODIFIED)
+            _add_sort_group("By duration", Column.DURATION)
+            _add_sort_group("By folder", Column.FOUND_IN)
+            _add_sort_group("By name", Column.NAME)
+            _add_sort_group("By resolution", Column.RESOLUTION)
+            _add_sort_group("By size", Column.SIZE)
+            _add_sort_group("By type", Column.TYPE)
+        except Exception:
+            sort_actions = {}
+
+        menu.addSeparator()
+
         # Open / play actions
         act_open_player = menu.addAction("Open in player")
         act_open_player.setToolTip("Open the file inside FrameVision's built-in player.")
@@ -3819,6 +3849,22 @@ class MediaExplorerTab(QtWidgets.QWidget):
         chosen = menu.exec(self.table.viewport().mapToGlobal(pos))
         if not chosen:
             return
+
+        # Sort actions
+        try:
+            if chosen in sort_actions:
+                col, order = sort_actions[chosen]
+                try:
+                    self.table.sortByColumn(int(col), order)
+                except Exception:
+                    pass
+                try:
+                    self._schedule_save_table_state()
+                except Exception:
+                    pass
+                return
+        except Exception:
+            pass
 
         # Favorites actions (if present)
         try:
