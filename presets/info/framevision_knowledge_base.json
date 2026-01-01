@@ -65,6 +65,40 @@
       ],
       "_layout": "overview/features/install/troubleshoot"
     },
+    "Did_You_Know": {
+      "description": "Tips, tricks, and first‑time‑use advice to help you get the most out of FrameVision.",
+      "overview": "A grab‑bag of helpful shortcuts, hidden features, and practical advice—especially useful on your first days with the app.<br><br>",
+      "key_terms": [
+        "Did you know",
+        "easter egg",
+        "Use low memory (streaming)",
+        "Use current",
+        "View results",
+        "Media Explorer",
+        "Optional downloads",
+        "Enable diagnostics logging",
+        "Clean finished results",
+        "RIFE",
+        "HunyuanVideo 1.5",
+        "System Monitor HUD"
+      ],
+      "hints_tips": [
+        "On the opening screen, quickly click anywhere <b>4×</b> to trigger a hidden easter egg.",
+        "Use the app over time to unlock more easter eggs. (Cheat code: leave the app open overnight.)",
+        "Image upscaling is usually fast (especially the <b>Anime</b> upscalers). Video upscaling is slower and can use a lot of memory — enable the <b>Use low memory (streaming)</b> toggle for longer videos. It’s slower, but safer.",
+        "<b>RIFE</b> has two main speed modes: <b>Slow (CPU)</b> and <b>Superfast (GPU)</b>. Slow can look a bit cleaner; Superfast is great for previews. The <b>4K preset + Superfast</b> combo is often “good enough”.",
+        "Many tools include <b>Use current</b>. It grabs the exact frame currently shown in the Media Player (or the currently loaded image) at the moment you click it.",
+        "Most tools also have a <b>View results</b> button. It opens Media Explorer on that tool’s last output folder, scans it, and lets you preview results and inspect JSON sidecars.",
+        "Known quirk: in this Knowledge Base version, <b>Trim Tool → Preview</b> may freeze the UI while thumbnails load (especially with 50+ preview thumbs). Wait a few seconds — it should recover once the preview is ready.",
+        "You can reorder tabs or tools to fit your workflow. Find more toggles like this in the <b>Settings</b> tab.",
+        "Don’t leave <b>Enable diagnostics logging</b> on unless you need it — logs can grow endlessly and may slow down video playback and beat‑synced music visuals.",
+        "If video playback stutters and the Queue tab toggles (pause refresh while video is playing / auto cleanup queue) don’t help, use <b>Queue → Clean finished results</b> to clear old items manually.",
+        "On first install, many AI models won’t be downloaded yet. You can install them from the <b>Optional downloads</b> menu.",
+        "Some model downloads are huge and can look “stuck” on slower connections — check the <b>System Monitor HUD</b> at the top to confirm download speed/activity.",
+        "<b>Hunyuan 1.5</b> can download new variants directly inside the tab and shows almost no logging. That’s normal — let it run, and watch the HUD to confirm it’s still downloading."
+      ],
+      "_layout": "overview/hints_tips"
+    },
     "Ace_Music_creation": {
       "description": "Generate music locally using the ACE-Step model. Supports <b>text → music</b> and optional <b>audio → audio</b> guidance via a reference track. Runs ACE in its own dedicated environment to avoid dependency conflicts, then saves a <code>.wav</code> to your output folder.",
       "key_terms": [
