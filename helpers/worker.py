@@ -685,46 +685,100 @@ def _ffprobe_bin():
     return "ffprobe"
 
 def _probe_src_fps(p: Path) -> str:
-    """Return source FPS for ffmpeg (ratio or float). Prefer avg_frame_rate to avoid speedup/slowdown."""
-    try:
-        FP = _ffprobe_bin()
-    except Exception:
-        FP = "ffprobe"
+    """Best-effort source FPS for video->frames->encode pipelines.
 
-    def _probe(entry: str) -> str | None:
+    Prefer avg_frame_rate; fall back to nb_frames/duration; last resort r_frame_rate; default 30.
+    Returns an ffmpeg-friendly value (ratio like 24000/1001 or decimal string).
+    """
+    def _parse_ratio(s: str):
         try:
-            out = subprocess.check_output(
-                [FP, "-v", "error", "-select_streams", "v:0",
-                 "-show_entries", f"stream={entry}",
-                 "-of", "default=noprint_wrappers=1:nokey=1", str(p)],
-                stderr=subprocess.STDOUT
-            ).decode("utf-8", "ignore").strip()
-            val = (out or "").strip()
-            if not val or val in ("0/0", "0", "N/A"):
+            s = (s or "").strip()
+            if not s or s in ("0/0", "0", "N/A"):
                 return None
-            if "/" in val:
-                a, b = val.split("/", 1)
-                try:
-                    if float(b) == 0:
-                        return None
-                except Exception:
+            if "/" in s:
+                a, b = s.split("/", 1)
+                a_i = int(float(a))
+                b_i = int(float(b))
+                if b_i == 0:
                     return None
-                return f"{a.strip()}/{b.strip()}"
-            try:
-                f = float(val)
-                if f > 0:
-                    return f"{f:.6f}".rstrip("0").rstrip(".")
-            except Exception:
+                return (a_i, b_i)
+            f = float(s)
+            if f <= 0:
                 return None
-            return None
+            den = 1_000_000
+            num = int(round(f * den))
+            if num <= 0:
+                return None
+            return (num, den)
         except Exception:
             return None
 
-    for key in ("avg_frame_rate", "r_frame_rate"):
-        v = _probe(key)
-        if v:
-            return v
+    def _ratio_to_str(r):
+        try:
+            n, d = r
+            return str(n) if d == 1 else f"{n}/{d}"
+        except Exception:
+            return ""
+
+    def _fps_from_ratio(r):
+        try:
+            n, d = r
+            return float(n) / float(d) if d else 0.0
+        except Exception:
+            return 0.0
+
+    try:
+        FP = _ffprobe_bin()
+        out = subprocess.check_output(
+            [FP, "-v", "error",
+             "-select_streams", "v:0",
+             "-show_entries", "stream=avg_frame_rate,r_frame_rate,nb_frames,duration",
+             "-show_entries", "format=duration",
+             "-of", "json",
+             str(p)],
+            stderr=subprocess.STDOUT
+        ).decode("utf-8", "ignore").strip()
+
+        j = {}
+        try:
+            j = json.loads(out or "{}")
+        except Exception:
+            j = {}
+        streams = j.get("streams") or []
+        s0 = streams[0] if streams else {}
+        fmt = j.get("format") or {}
+
+        avg = _parse_ratio(str(s0.get("avg_frame_rate") or ""))
+        rfr = _parse_ratio(str(s0.get("r_frame_rate") or ""))
+        nb_frames = s0.get("nb_frames")
+        try:
+            nb = int(nb_frames) if nb_frames not in (None, "", "N/A") else None
+        except Exception:
+            nb = None
+        dur_s = s0.get("duration")
+        if dur_s in (None, "", "N/A"):
+            dur_s = fmt.get("duration")
+        try:
+            dur = float(dur_s) if dur_s not in (None, "", "N/A") else None
+        except Exception:
+            dur = None
+
+        candidates = []
+        if avg:
+            candidates.append((_ratio_to_str(avg), _fps_from_ratio(avg)))
+        if nb and dur and dur > 0:
+            f = float(nb) / float(dur)
+            candidates.append((f"{f:.6f}".rstrip("0").rstrip("."), f))
+        if rfr:
+            candidates.append((_ratio_to_str(rfr), _fps_from_ratio(rfr)))
+
+        for val_str, fps in candidates:
+            if fps and 1.0 <= fps <= 240.0:
+                return val_str or "30"
+    except Exception:
+        pass
     return "30"
+
 
 
 

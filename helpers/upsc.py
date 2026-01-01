@@ -169,49 +169,106 @@ def scan_realsr_ncnn_models() -> List[str]:
 
 
 def _parse_fps(src: Path) -> Optional[str]:
-    """Best-effort: return source FPS as a ffmpeg-friendly string.
+    """Return best-effort source FPS (as an ffmpeg-friendly value).
 
-    Prefer avg_frame_rate (matches real timing/duration), then fall back to r_frame_rate.
-    Returns a ratio when available (e.g. 24000/1001) to preserve exact timing.
+    Why this exists:
+      - r_frame_rate can be misleading (often 30/1) for VFR or certain encodes.
+      - avg_frame_rate is usually closer to real playback timing.
+      - As a fallback, derive FPS from nb_frames / duration when available.
     """
-    def _probe(entry: str) -> Optional[str]:
+    def _parse_ratio(s: str) -> Optional[tuple[int,int]]:
         try:
-            out = subprocess.check_output(
-                [FFPROBE, "-v", "error", "-select_streams", "v:0",
-                 "-show_entries", f"stream={entry}",
-                 "-of", "default=noprint_wrappers=1:nokey=1", str(src)],
-                cwd=str(ROOT),
-                universal_newlines=True,
-            )
-            val = (out or "").strip()
-            if not val or val in ("0/0", "0", "N/A"):
+            s = (s or "").strip()
+            if not s or s in ("0/0", "0", "N/A"):
                 return None
-            # Keep ratios intact if valid (ffmpeg accepts them directly).
-            if "/" in val:
-                a, b = val.split("/", 1)
-                try:
-                    if float(b) == 0:
-                        return None
-                except Exception:
+            if "/" in s:
+                a, b = s.split("/", 1)
+                a_i = int(float(a))
+                b_i = int(float(b))
+                if b_i == 0:
                     return None
-                # Normalize whitespace
-                return f"{a.strip()}/{b.strip()}"
-            # Plain float
-            try:
-                fps = float(val)
-                if fps <= 0:
-                    return None
-                return f"{fps:.6f}".rstrip("0").rstrip(".")
-            except Exception:
+                return (a_i, b_i)
+            # decimal
+            f = float(s)
+            if f <= 0:
                 return None
+            # represent as ratio with 1e6 precision
+            den = 1_000_000
+            num = int(round(f * den))
+            if num <= 0:
+                return None
+            return (num, den)
         except Exception:
             return None
 
-    for key in ("avg_frame_rate", "r_frame_rate"):
-        v = _probe(key)
-        if v:
-            return v
-    return None
+    def _ratio_to_str(r: tuple[int,int]) -> str:
+        n, d = r
+        if d == 1:
+            return str(n)
+        return f"{n}/{d}"
+
+    def _fps_from_ratio(r: tuple[int,int]) -> float:
+        try:
+            n, d = r
+            return float(n) / float(d) if d else 0.0
+        except Exception:
+            return 0.0
+
+    try:
+        # Pull multiple fields at once (JSON) so we can pick the best.
+        out = subprocess.check_output(
+            [FFPROBE, "-v", "error",
+             "-select_streams", "v:0",
+             "-show_entries", "stream=avg_frame_rate,r_frame_rate,nb_frames,duration,time_base",
+             "-show_entries", "format=duration",
+             "-of", "json",
+             str(src)],
+            cwd=str(ROOT),
+            universal_newlines=True
+        )
+        j = json.loads(out or "{}")
+        streams = j.get("streams") or []
+        s0 = streams[0] if streams else {}
+        fmt = j.get("format") or {}
+
+        avg = _parse_ratio(str(s0.get("avg_frame_rate") or ""))
+        rfr = _parse_ratio(str(s0.get("r_frame_rate") or ""))
+        nb_frames = s0.get("nb_frames")
+        try:
+            nb = int(nb_frames) if nb_frames not in (None, "", "N/A") else None
+        except Exception:
+            nb = None
+
+        # Prefer stream.duration, fallback to format.duration
+        dur_s = s0.get("duration")
+        if dur_s in (None, "", "N/A"):
+            dur_s = fmt.get("duration")
+        try:
+            dur = float(dur_s) if dur_s not in (None, "", "N/A") else None
+        except Exception:
+            dur = None
+
+        candidates: list[tuple[str, float]] = []
+
+        if avg:
+            candidates.append((_ratio_to_str(avg), _fps_from_ratio(avg)))
+        if nb and dur and dur > 0:
+            candidates.append((f"{(nb/dur):.6f}".rstrip("0").rstrip("."), float(nb) / float(dur)))
+        if rfr:
+            candidates.append((_ratio_to_str(rfr), _fps_from_ratio(rfr)))
+
+        # Pick the first sane candidate (avg > derived > r_frame_rate).
+        for val_str, fps in candidates:
+            if fps and 1.0 <= fps <= 240.0:
+                return val_str
+
+        # If nothing sane, last resort: try r_frame_rate as-is.
+        if rfr:
+            return _ratio_to_str(rfr)
+
+        return None
+    except Exception:
+        return None
 
 
 class _RunThread(QtCore.QThread):
