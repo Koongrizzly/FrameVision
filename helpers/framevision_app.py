@@ -129,7 +129,7 @@ def _open_compare_page():
 
 
 
-# FrameVision V2.1.1 — Full-classic UI + NCNN upscalers + branding
+# FrameVision V2.2.2 — Full-classic UI + NCNN upscalers + branding
 # Classic layout (big player, control bar, seek slider, fullscreen) + click-to-play/pause
 # Auto Theme (Day/Evening/Night), Session Restore, Instant Tools, Presets, Describe-on-Pause,
 # Queue + Worker, Models Manager, Upscale Video/Photo buttons (queue) wired to NCNN CLIs.
@@ -4472,7 +4472,7 @@ class MainWindow(QMainWindow):
 
     def __init__(self):
         super().__init__()
-        self.setWindowTitle(APP_NAME + " V2.1.1 " + TAGLINE)
+        self.setWindowTitle(APP_NAME + " V2.2.2 " + TAGLINE)
         self.resize(1280, 800)
         self.setMinimumSize(700, 500)
         self.current_path = None

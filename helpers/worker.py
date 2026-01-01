@@ -781,6 +781,136 @@ def _probe_src_fps(p: Path) -> str:
 
 
 
+def _bytes_human(n: int | float | None) -> str:
+    try:
+        if n is None:
+            return ""
+        n = float(n)
+        if n < 1024:
+            return f"{int(n)} B"
+        for unit in ["KB","MB","GB","TB"]:
+            n /= 1024.0
+            if n < 1024.0:
+                return f"{n:.2f} {unit}"
+        return f"{n:.2f} PB"
+    except Exception:
+        try:
+            return str(n)
+        except Exception:
+            return ""
+
+def _probe_video_info(p: Path) -> dict:
+    """Best-effort ffprobe info for video files.
+    Returns dict with: width,height,duration,fps_str,fps,nb_frames,vcodec,acodec,bit_rate,a_channels,a_rate
+    """
+    info = {}
+    try:
+        FP = _ffprobe_bin()
+        out = subprocess.check_output(
+            [FP, "-v", "error",
+             "-show_streams", "-show_format",
+             "-of", "json",
+             str(p)],
+            stderr=subprocess.STDOUT
+        ).decode("utf-8", "ignore").strip()
+        j = json.loads(out or "{}")
+        streams = j.get("streams") or []
+        fmt = j.get("format") or {}
+
+        v0 = None
+        a0 = None
+        for s in streams:
+            if not isinstance(s, dict):
+                continue
+            if s.get("codec_type") == "video" and v0 is None:
+                v0 = s
+            elif s.get("codec_type") == "audio" and a0 is None:
+                a0 = s
+
+        if v0:
+            try: info["width"] = int(v0.get("width") or 0)
+            except Exception: pass
+            try: info["height"] = int(v0.get("height") or 0)
+            except Exception: pass
+            try: info["vcodec"] = str(v0.get("codec_name") or "")
+            except Exception: pass
+            try:
+                afr = str(v0.get("avg_frame_rate") or "") or ""
+                info["fps_str"] = afr
+                # Convert to float if possible
+                if "/" in afr:
+                    a,b = afr.split("/",1)
+                    a = float(a); b = float(b)
+                    if b:
+                        info["fps"] = a/b
+                else:
+                    f = float(afr) if afr else 0.0
+                    if f:
+                        info["fps"] = f
+            except Exception:
+                pass
+            try:
+                nb = v0.get("nb_frames")
+                if nb not in (None, "", "N/A"):
+                    info["nb_frames"] = int(float(nb))
+            except Exception:
+                pass
+            try:
+                br = v0.get("bit_rate")
+                if br not in (None, "", "N/A"):
+                    info["v_bit_rate"] = int(float(br))
+            except Exception:
+                pass
+
+        if a0:
+            try: info["acodec"] = str(a0.get("codec_name") or "")
+            except Exception: pass
+            try:
+                ch = a0.get("channels")
+                if ch not in (None,"","N/A"):
+                    info["a_channels"] = int(float(ch))
+            except Exception:
+                pass
+            try:
+                sr = a0.get("sample_rate")
+                if sr not in (None,"","N/A"):
+                    info["a_rate"] = int(float(sr))
+            except Exception:
+                pass
+            try:
+                br = a0.get("bit_rate")
+                if br not in (None,"","N/A"):
+                    info["a_bit_rate"] = int(float(br))
+            except Exception:
+                pass
+
+        try:
+            dur = fmt.get("duration")
+            if dur not in (None,"","N/A"):
+                info["duration"] = float(dur)
+        except Exception:
+            pass
+        try:
+            br = fmt.get("bit_rate")
+            if br not in (None,"","N/A"):
+                info["bit_rate"] = int(float(br))
+        except Exception:
+            pass
+    except Exception:
+        return info
+
+    # Fill nb_frames estimate if missing
+    try:
+        if not info.get("nb_frames"):
+            fps = float(info.get("fps") or 0.0)
+            dur = float(info.get("duration") or 0.0)
+            if fps > 0 and dur > 0:
+                info["nb_frames"] = int(round(fps * dur))
+    except Exception:
+        pass
+    return info
+
+
 
 def _normalize_realesr_model(model_name: str, factor: int|float|str):
     """
@@ -827,17 +957,105 @@ def build_lapsrn_cmd(exe, inp, out, factor):
 
 def upscale_video(job, cfg, mani):
     print("[worker] upscale_video: start", job.get("input"))
-    inp = Path(job["input"]); out_dir = Path(job["out_dir"]); out_dir.mkdir(parents=True, exist_ok=True)
-    factor = int(job["args"].get("factor", 4))
-    model_name = job["args"].get("model","RealESRGAN-x4plus")
-    model_name, exe_path = resolve_upscaler_exe(cfg, mani, model_name)
-    out = out_dir / f"{inp.stem}_x{factor}.mp4"
+    inp = Path(job["input"])
+    out_dir = Path(job["out_dir"])
+    out_dir.mkdir(parents=True, exist_ok=True)
 
+    factor = int((job.get("args") or {}).get("factor", 4))
+    model_name_req = (job.get("args") or {}).get("model", "RealESRGAN-x4plus")
+    model_name, exe_path = resolve_upscaler_exe(cfg, mani, model_name_req)
+
+    out = out_dir / f"{inp.stem}_x{factor}.mp4"
     out = _unique_path(out)
+
     # Prepare potential temp dirs (some may not be used; we'll still try to delete them in finally)
     frames = out_dir / f"{inp.stem}_x{factor}_frames"
     up = out_dir / f"{inp.stem}_x{factor}_up"
     work = out_dir / f"{inp.stem}_x{factor}_work"  # also clean UI-created temp dirs if present
+
+    # --- Helpful upfront info ---
+    src = {}
+    try:
+        if is_video_path(inp):
+            src = _probe_video_info(inp)
+    except Exception:
+        src = {}
+
+    try:
+        in_size = int(inp.stat().st_size or 0)
+    except Exception:
+        in_size = 0
+
+    iw = int(src.get("width") or 0) if isinstance(src, dict) else 0
+    ih = int(src.get("height") or 0) if isinstance(src, dict) else 0
+    ow = iw * factor if iw else 0
+    oh = ih * factor if ih else 0
+
+    try:
+        fps_str = _probe_src_fps(inp)
+    except Exception:
+        fps_str = "30"
+
+    try:
+        dur = float(src.get("duration") or 0.0)
+    except Exception:
+        dur = 0.0
+
+    try:
+        nb_est = int(src.get("nb_frames") or 0)
+    except Exception:
+        nb_est = 0
+
+    try:
+        vcodec = (src.get("vcodec") or "").strip()
+        acodec = (src.get("acodec") or "").strip()
+    except Exception:
+        vcodec = ""
+        acodec = ""
+
+    try:
+        print(
+            "[worker][upscale_video] input:",
+            str(inp),
+            "| size",
+            _bytes_human(in_size),
+            "| src",
+            (f"{iw}x{ih}" if iw and ih else "unknown"),
+            "| fps",
+            fps_str,
+            "| dur",
+            (f"{dur:.2f}s" if dur else "unknown"),
+            "| vcodec",
+            (vcodec or "unknown"),
+            "| audio",
+            (acodec or "none"),
+        )
+        if ow and oh:
+            print(f"[worker][upscale_video] output: {ow}x{oh}  |  factor x{factor}  |  out_file: {out.name}")
+    except Exception:
+        pass
+
+    # Patch queue JSON with richer metadata (best-effort)
+    try:
+        _patch_running_json({
+            "stage": "Preparing video upscale",
+            "input_path": str(inp),
+            "out_path": str(out),
+            "factor": int(factor),
+            "model": str(model_name),
+            "src_w": iw,
+            "src_h": ih,
+            "out_w": ow,
+            "out_h": oh,
+            "src_fps": str(fps_str),
+            "duration_sec": float(dur) if dur else None,
+            "frames_est": int(nb_est) if nb_est else None,
+            "src_size_bytes": int(in_size) if in_size else None,
+            "vcodec": vcodec or None,
+            "acodec": acodec or None,
+        })
+    except Exception:
+        pass
 
     _hb_thr = None
     _hb_stop = {"run": False}
@@ -850,21 +1068,58 @@ def upscale_video(job, cfg, mani):
         except Exception:
             pass
 
+    def _count_pngs(d: Path) -> int:
+        try:
+            c = 0
+            with os.scandir(str(d)) as it:
+                for e in it:
+                    try:
+                        if e.is_file() and e.name.lower().endswith(".png"):
+                            c += 1
+                    except Exception:
+                        continue
+            return int(c)
+        except Exception:
+            try:
+                return len(list(Path(d).glob("*.png")))
+            except Exception:
+                return 0
+
     try:
         if exe_path and exe_path.exists() and exe_path.is_file():
             print(f"[worker] Using model '{model_name}' at {exe_path}")
+
             # 1) Extract frames
+            try:
+                _patch_running_json({"stage": "Extracting frames"})
+            except Exception:
+                pass
+            print("[worker][upscale_video] Stage 1/3: extracting frames...")
+
             frames.mkdir(parents=True, exist_ok=True)
-            code = run([FFMPEG,"-y","-i",str(inp), str(frames/"%06d.png")])
+            code = run([FFMPEG, "-y", "-i", str(inp), str(frames / "%06d.png")])
             if code != 0:
                 return 1
 
-            # 2) Upscale frames (batch dir-mode for RealESRGAN; per-frame for others)
-            up.mkdir(parents=True, exist_ok=True)
+            # 2) Upscale frames
             try:
-                total_frames = len(list(frames.glob("*.png")))
+                _patch_running_json({"stage": "Counting frames"})
+            except Exception:
+                pass
+
+            try:
+                total_frames = int(nb_est) if nb_est else 0
             except Exception:
                 total_frames = 0
+            if total_frames <= 0:
+                total_frames = _count_pngs(frames)
+
+            try:
+                print(f"[worker][upscale_video] extracted frames: {total_frames}")
+            except Exception:
+                pass
+
+            up.mkdir(parents=True, exist_ok=True)
             try:
                 _progress_set(10)
             except Exception:
@@ -872,75 +1127,191 @@ def upscale_video(job, cfg, mani):
 
             import threading as _th, time as _time
             _hb_stop["run"] = True
-            _hb_state = {"last": -1}
+            _hb_state = {
+                "last_pct": -1,
+                "last_bucket": -1,
+                "last_done": 0,
+                "last_ts": _time.time(),
+                "t0": _time.time(),
+                "last_json_ts": 0.0,
+            }
+
             def _hb_loop():
                 while _hb_stop.get("run", False):
                     try:
-                        done = len(list(up.glob("*.png")))
+                        done = _count_pngs(up)
+                        now = _time.time()
+                        dt = max(0.001, now - float(_hb_state.get("last_ts") or now))
+                        dframes = max(0, int(done) - int(_hb_state.get("last_done") or 0))
+                        speed = float(dframes) / float(dt) if dt > 0 else 0.0
+                        _hb_state["last_done"] = int(done)
+                        _hb_state["last_ts"] = now
+
                         if total_frames > 0:
-                            pct = 10.0 + min(85.0, (done / total_frames) * 85.0)
+                            pct = 10.0 + min(85.0, (float(done) / float(total_frames)) * 85.0)
                             ipct = int(pct)
-                            if ipct != _hb_state["last"]:
+                            if ipct != int(_hb_state.get("last_pct") or -1):
                                 _progress_set(ipct)
-                                _hb_state["last"] = ipct
+                                _hb_state["last_pct"] = ipct
+
+                            # Print every 10% bucket so the console stays readable
+                            bucket = int(ipct / 10)
+                            if bucket != int(_hb_state.get("last_bucket") or -1):
+                                _hb_state["last_bucket"] = bucket
+                                eta_s = None
+                                if speed > 0 and done < total_frames:
+                                    eta_s = float(total_frames - done) / float(speed)
+                                msg = f"[worker][upscale_video] upscaling: {done}/{total_frames}  |  {speed:.2f} frames/s"
+                                if eta_s is not None:
+                                    msg += f"  |  eta {_fmt_dur_short(eta_s)}"
+                                try:
+                                    print(msg)
+                                except Exception:
+                                    pass
+
+                        # Patch running JSON at most ~2 Hz
+                        if (now - float(_hb_state.get("last_json_ts") or 0.0)) >= 0.5:
+                            _hb_state["last_json_ts"] = now
+                            try:
+                                eta_s = None
+                                if total_frames > 0 and speed > 0 and done < total_frames:
+                                    eta_s = float(total_frames - done) / float(speed)
+                                _patch_running_json({
+                                    "stage": "Upscaling frames",
+                                    "done_frames": int(done),
+                                    "total_frames": int(total_frames) if total_frames else None,
+                                    "speed_fps": float(speed) if speed else None,
+                                    "eta_frames_sec": float(eta_s) if eta_s is not None else None,
+                                })
+                            except Exception:
+                                pass
                     except Exception:
                         pass
                     _time.sleep(1.0)
+
             _hb_thr = _th.Thread(target=_hb_loop, daemon=True)
             try:
                 _hb_thr.start()
             except Exception:
                 pass
 
+            try:
+                _patch_running_json({"stage": "Upscaling frames", "total_frames": int(total_frames) if total_frames else None})
+            except Exception:
+                pass
+            print("[worker][upscale_video] Stage 2/3: upscaling frames...")
+
             m = str(model_name).lower()
             if ("realesr" in m) or ("realesrgan" in m):
-                cmd = build_realesrgan_cmd(str(exe_path), frames, up, factor, model_name, models_dir=Path(exe_path).parent, is_dir=True)
-                if run(cmd)!=0:
+                cmd = build_realesrgan_cmd(
+                    str(exe_path),
+                    frames,
+                    up,
+                    factor,
+                    model_name,
+                    models_dir=Path(exe_path).parent,
+                    is_dir=True
+                )
+                if run(cmd) != 0:
                     return 1
             else:
+                # Per-frame upscale for other engines / fallback
                 for png in sorted(frames.glob("*.png")):
+                    if _cancel_requested():
+                        _note_cancel("Cancelled by user")
+                        return 130
                     if "swinir" in m:
-                        cmd = build_swinir_cmd(str(exe_path), png, up/png.name, factor)
+                        cmd = build_swinir_cmd(str(exe_path), png, up / png.name, factor)
                     elif "lapsrn" in m:
-                        cmd = build_lapsrn_cmd(str(exe_path), png, up/png.name, factor)
+                        cmd = build_lapsrn_cmd(str(exe_path), png, up / png.name, factor)
                     else:
-                        cmd = [FFMPEG,"-y","-i",str(png),"-vf",f"scale=iw*{factor}:ih*{factor}:flags=lanczos","-frames:v","1",str(up/png.name)]
-                    if run(cmd)!=0:
+                        cmd = [
+                            FFMPEG, "-y", "-i", str(png),
+                            "-vf", f"scale=iw*{factor}:ih*{factor}:flags=lanczos",
+                            "-frames:v", "1",
+                            str(up / png.name)
+                        ]
+                    if run(cmd) != 0:
                         return 1
 
             # 3) Re-encode
             _stop_hb()
             try:
+                _patch_running_json({"stage": "Encoding video"})
+            except Exception:
+                pass
+
+            try:
                 _progress_set(90)
             except Exception:
                 pass
 
-            enc = [FFMPEG,"-y","-framerate", _probe_src_fps(inp), "-i", str(up/"%06d.png"),"-i",str(inp),"-map","0:v:0","-map","1:a:0?","-c:a","copy","-c:v","libx264","-preset","veryfast","-pix_fmt","yuv420p","-vsync","cfr","-r",_probe_src_fps(inp),"-movflags","+faststart",str(out)]
-            if run(enc)!=0:
+            src_fps = fps_str or _probe_src_fps(inp)
+            print("[worker][upscale_video] Stage 3/3: encoding video...")
+            try:
+                print(f"[worker][upscale_video] encoder: libx264 preset=veryfast | fps={src_fps} | audio=copy")
+            except Exception:
+                pass
+
+            enc = [
+                FFMPEG, "-y",
+                "-framerate", str(src_fps),
+                "-i", str(up / "%06d.png"),
+                "-i", str(inp),
+                "-map", "0:v:0",
+                "-map", "1:a:0?",
+                "-c:a", "copy",
+                "-c:v", "libx264",
+                "-preset", "veryfast",
+                "-pix_fmt", "yuv420p",
+                "-vsync", "cfr",
+                "-r", str(src_fps),
+                "-movflags", "+faststart",
+                str(out)
+            ]
+            if run(enc) != 0:
                 return 1
+
             try:
                 _progress_set(100)
             except Exception:
                 pass
             try:
-                job['produced'] = str(out)
+                job["produced"] = str(out)
+            except Exception:
+                pass
+            try:
+                _patch_running_json({"stage": "Done", "produced": str(out)})
             except Exception:
                 pass
             return 0
-        else:
-            # Fallback: ffmpeg scale (no model)
-            print("[worker] No model exe found, using ffmpeg scale fallback")
-            code = run([FFMPEG,"-y","-i",str(inp),"-vf",f"scale=iw*{factor}:ih*{factor}:flags=lanczos", str(out)])
+
+        # Fallback: ffmpeg scale (no model)
+        print("[worker] No model exe found, using ffmpeg scale fallback")
+        try:
+            _patch_running_json({"stage": "FFmpeg scale fallback", "model": None})
+        except Exception:
+            pass
+
+        cmd = [FFMPEG, "-y", "-i", str(inp), "-vf", f"scale=iw*{factor}:ih*{factor}:flags=lanczos", str(out)]
+        code = run(cmd)
+
+        try:
+            _progress_set(100)
+        except Exception:
+            pass
+
+        if code == 0:
             try:
-                _progress_set(100)
+                job["produced"] = str(out)
             except Exception:
                 pass
-            if code == 0:
-                try:
-                    job['produced'] = str(out)
-                except Exception:
-                    pass
-            return code
+            try:
+                _patch_running_json({"stage": "Done", "produced": str(out)})
+            except Exception:
+                pass
+        return int(code)
+
     finally:
         # Always try to clean temp dirs; ignore errors
         _stop_hb()
@@ -950,6 +1321,7 @@ def upscale_video(job, cfg, mani):
                     _safe_rmtree(d)
             except Exception:
                 pass
+
 
 def tools_ffmpeg(job, cfg, mani):
     """Run an external command job (legacy job_type name: tools_ffmpeg).
@@ -2781,7 +3153,7 @@ def handle_job(jpath: Path):
         return 1
 
 def main():
-    print("FrameVision Worker V2.1.1 Waiting for jobs in", JOBS["pending"])
+    print("FrameVision Worker V2.2.2 Waiting for jobs in", JOBS["pending"])
     while True:
         try:
             HEARTBEAT.write_text(time.strftime("%Y-%m-%d %H:%M:%S"), encoding="utf-8")
