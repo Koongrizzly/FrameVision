@@ -1482,7 +1482,43 @@ class VideoPane(QWidget):
 
 
         bar.addStretch(1)
-        lay = QVBoxLayout(self); lay.addWidget(self.label,1); self.info_label=QLabel("—"); self.info_label.setObjectName("videoInfo"); f=self.info_label.font(); f.setPointSize(max(10, f.pointSize())); self.info_label.setFont(f); lay.addWidget(self.info_label); self.time_label=QLabel("—"); self.time_label.setObjectName("videoTime"); self.time_label.setFont(f); lay.addWidget(self.time_label); lay.addWidget(self.slider); lay.addWidget(self.compare_slider); lay.addLayout(bar)
+        lay = QVBoxLayout(self)
+        lay.addWidget(self.label, 1)
+
+        self.info_label = QLabel("—")
+        self.info_label.setObjectName("videoInfo")
+        f = self.info_label.font()
+        f.setPointSize(max(10, f.pointSize()))
+        self.info_label.setFont(f)
+        lay.addWidget(self.info_label)
+
+        # Compare info (only visible in compare mode)
+        self.compare_info_label = QLabel("")
+        self.compare_info_label.setObjectName("compareInfo")
+        try:
+            f2 = self.compare_info_label.font()
+            f2.setPointSize(max(9, f2.pointSize() - 1))
+            self.compare_info_label.setFont(f2)
+        except Exception:
+            pass
+        try:
+            self.compare_info_label.setWordWrap(True)
+        except Exception:
+            pass
+        try:
+            self.compare_info_label.hide()
+        except Exception:
+            pass
+        lay.addWidget(self.compare_info_label)
+
+        self.time_label = QLabel("—")
+        self.time_label.setObjectName("videoTime")
+        self.time_label.setFont(f)
+        lay.addWidget(self.time_label)
+
+        lay.addWidget(self.slider)
+        lay.addWidget(self.compare_slider)
+        lay.addLayout(bar)
         self.btn_open.clicked.connect(self._open_via_dialog, Qt.ConnectionType.UniqueConnection); self.btn_play.clicked.connect(self._toggle_play_pause, Qt.ConnectionType.UniqueConnection)
         # pause button hidden; no click
         self.btn_stop.clicked.connect(self._handle_stop, Qt.ConnectionType.UniqueConnection)
@@ -1694,6 +1730,13 @@ class VideoPane(QWidget):
             pass
 
     def _handle_stop(self):
+        # Guard against EndOfMedia callbacks triggering Repeat while we are intentionally stopping/unloading.
+        try:
+            self._fv_stop_intent = True
+            from PySide6.QtCore import QTimer
+            QTimer.singleShot(3500, lambda: setattr(self, "_fv_stop_intent", False))
+        except Exception:
+            pass
         try:
             self.player.stop()
         except Exception:
@@ -1731,6 +1774,11 @@ class VideoPane(QWidget):
         try:
             from PySide6.QtMultimedia import QMediaPlayer as _QMediaPlayer
             if status == _QMediaPlayer.EndOfMedia:
+                try:
+                    if bool(getattr(self, "_fv_stop_intent", False)):
+                        return
+                except Exception:
+                    pass
                 try:
                     if bool(getattr(self, "_repeat_enabled", False)) and getattr(self, "_mode", None) == "video":
                         self.player.setPosition(0)
@@ -2144,10 +2192,34 @@ class VideoPane(QWidget):
             from pathlib import Path as _P
             p = _P(str(path))
         ext = p.suffix.lower()
-        # If compare mode is active, opening a new file should exit compare
+        # If compare mode is active, opening a new file should exit compare.
+        # IMPORTANT: stop/clear first, then defer the open to the next tick. This avoids
+        # QtMultimedia backend stalls/crashes when swapping sources while the compare
+        # right-player is still winding down.
         try:
             if getattr(self, "_compare_active", False) and not getattr(self, "_compare_opening", False):
-                self.close_compare()
+                try:
+                    # Matches the manual workaround ("Stop" first), but automatic.
+                    self._handle_stop()
+                except Exception:
+                    try:
+                        self.player.stop()
+                    except Exception:
+                        pass
+                try:
+                    self.close_compare()
+                except Exception:
+                    try:
+                        self._compare_active = False
+                    except Exception:
+                        pass
+                try:
+                    from PySide6.QtCore import QTimer
+                    _pp = str(path)
+                    QTimer.singleShot(0, lambda _p=_pp: self.open(_p))
+                    return
+                except Exception:
+                    pass
         except Exception:
             pass
 
@@ -3022,6 +3094,74 @@ class VideoPane(QWidget):
     # -----------------------------
     # Compare tool (in-app)
     # -----------------------------
+
+
+    def _compare_media_text(self, pth: str) -> str:
+        """Return 'filename • WxH' for compare panes (works for images/videos)."""
+        try:
+            p = Path(str(pth))
+            name = p.name
+        except Exception:
+            return "— • ?x?"
+        w = h = None
+        try:
+            info = probe_media(p)
+            w = info.get("width", None)
+            h = info.get("height", None)
+        except Exception:
+            pass
+        # Fallback: if probe failed and it's an image, try pixmap dimensions
+        try:
+            if (w is None or h is None) and p.suffix.lower() in IMAGE_EXTS:
+                pm = QPixmap(str(p))
+                if not pm.isNull():
+                    w, h = pm.width(), pm.height()
+        except Exception:
+            pass
+        try:
+            if w is None or h is None:
+                return f"{name} • ?x?"
+            return f"{name} • {int(w)}x{int(h)}"
+        except Exception:
+            return f"{name} • ?x?"
+
+    def _update_compare_info_labels(self):
+        """Show/hide the compare info label (left/right file + resolution)."""
+        try:
+            lbl = getattr(self, "compare_info_label", None)
+            if lbl is None:
+                return
+
+            # Hide the normal single-line info while Compare is active (avoids duplicate info).
+            try:
+                info_lbl = getattr(self, "info_label", None)
+                if info_lbl is not None:
+                    if getattr(self, "_compare_active", False):
+                        info_lbl.hide()
+                    else:
+                        info_lbl.show()
+            except Exception:
+                pass
+
+            if not getattr(self, "_compare_active", False):
+                try:
+                    lbl.hide()
+                    lbl.setText("")
+                except Exception:
+                    pass
+                return
+
+            l = str(getattr(self, "_compare_left_path", "") or "")
+            r = str(getattr(self, "_compare_right_path", "") or "")
+            lt = self._compare_media_text(l) if l else "— • ?x?"
+            rt = self._compare_media_text(r) if r else "— • ?x?"
+            try:
+                lbl.setText(f"Left: {lt}\nRight: {rt}")
+                lbl.show()
+            except Exception:
+                pass
+        except Exception:
+            pass
     def _open_compare_dialog(self):
         try:
             from PySide6.QtWidgets import QDialog
@@ -3233,7 +3373,7 @@ class VideoPane(QWidget):
                 self._compare_opening = False
 
             self._compare_active = True
-            self._compare_kind = str(kind)
+            self._compare_kind = str(kind).strip().lower()
             self._compare_left_path = str(left_path)
             self._compare_right_path = str(right_path)
             self._compare_wipe = 500
@@ -3242,6 +3382,11 @@ class VideoPane(QWidget):
                 self.compare_slider.setValue(500)
                 self.compare_slider.show()
                 self.compare_slider.setEnabled(True)
+            except Exception:
+                pass
+
+            try:
+                self._update_compare_info_labels()
             except Exception:
                 pass
 
@@ -3278,6 +3423,35 @@ class VideoPane(QWidget):
 
                     rp = Path(str(right_path))
                     self._compare_right_player.setSource(QUrl.fromLocalFile(str(rp)))
+                    # Ensure initial alignment happens after the backend has actually loaded the media.
+                    try:
+                        def _rp_loaded(st):
+                            try:
+                                from PySide6.QtMultimedia import QMediaPlayer as _QMP
+                                if st == _QMP.LoadedMedia:
+                                    try:
+                                        self._compare_right_player.setPosition(int(self.player.position() or 0))
+                                    except Exception:
+                                        pass
+                                    try:
+                                        self._compare_right_player.setPlaybackRate(self.player.playbackRate())
+                                    except Exception:
+                                        pass
+                                    try:
+                                        if self.player.playbackState() == _QMP.PlayingState:
+                                            self._compare_right_player.play()
+                                    except Exception:
+                                        pass
+                                    try:
+                                        self._compare_right_player.mediaStatusChanged.disconnect(_rp_loaded)
+                                    except Exception:
+                                        pass
+                            except Exception:
+                                pass
+                        self._compare_right_player.mediaStatusChanged.connect(_rp_loaded)
+                    except Exception:
+                        pass
+
                     try:
                         self._compare_right_player.setPosition(self.player.position())
                     except Exception:
@@ -3318,6 +3492,12 @@ class VideoPane(QWidget):
         try:
             self._compare_active = False
             self._compare_kind = None
+        except Exception:
+            pass
+
+
+        try:
+            self._update_compare_info_labels()
         except Exception:
             pass
 
