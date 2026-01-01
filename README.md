@@ -268,7 +268,7 @@ FrameVision feature list
 - Trim videos with preview
 - Crop videos/images
 - Multi rename/replace filenames
-- Metadata editor/remover
+- Metadata/date editor/remover
 ### All kinds of extra's i forgot to mention such as a file menu with recents/favorites/converter, many random 'open app' screens with visual overlays, 20+ themes, an in app updater (to latest stable release or to latest files on github), a huge Knowledge base with q&a etc etc.
 ---
 
@@ -295,7 +295,6 @@ Draggable middle splitter & swap ui to make the app look the way user wants. (Dr
 
 **Not working/bugs/todo:**
 ---
-- compare overlay feature for video don't work properly (sync problems etc) use only for images.
 - preview timeline for cropping tool still makes the app freeze until finished building preview.
 - To many finished results in queue still makes video stutter, clean finished results manually when you see it happen.
 - image selection disabled in music video clip creator (needs to much re writing code to get it to work properly again, maybe one day
