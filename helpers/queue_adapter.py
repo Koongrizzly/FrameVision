@@ -1,4 +1,5 @@
 import os
+import re
 from pathlib import Path
 def default_outdir(is_video: bool=False, purpose: str='upscale') -> str:
     base = _base_root()
@@ -60,17 +61,84 @@ def _read_field(w, names, getter='text'):
         except Exception: pass
     return ''
 def infer_upscale_args(inner):
+    # Input / output
     inp = _read_field(inner, ['edit_input','edit_input_path','line_input','input_path','edit_source'])
     outdir = _read_field(inner, ['edit_outdir','edit_output','line_output','output_dir'])
+
+    # Scale
     scale = _read_field(inner, ['spin_scale','spin_factor'], getter='value')
-    if not scale: scale = _safe_int(_read_field(inner, ['edit_scale','line_scale'], getter='text'), 4)
-    model = _read_field(inner, ['edit_model','line_model'], getter='text') or _read_field(inner, ['combo_model'], getter='currentText') or 'RealESRGAN-general-x4v3'
-    inp = os.path.abspath(inp) if inp else ''; outdir = os.path.abspath(outdir) if outdir else ''
+    if not scale:
+        scale = _safe_int(_read_field(inner, ['edit_scale','line_scale'], getter='text'), 4)
+
+    # Model: pick the *active* model dropdown based on the selected engine.
+    # (Many UIs keep other model combos instantiated; reading the wrong one yields "first item always".)
+    engine = _read_field(inner, ['combo_engine','engine_combo','combo_upscale_engine'], getter='currentText').lower()
+
+    model = ""
+    # Best-case: Upscaler pane exposes a helper that returns the currently selected model text.
+    try:
+        fn = getattr(inner, "_fv_current_model_text", None)
+        if callable(fn):
+            model = str(fn() or "").strip()
+    except Exception:
+        model = ""
+
+    # Engine-specific combo boxes (FrameVision Upscaler)
+    if not model:
+        if "waifu" in engine or "w2x" in engine:
+            model = _read_field(inner, ['combo_model_w2x','combo_model_waifu','combo_model_waifu2x'], getter='currentText')
+        elif "ultrasharp" in engine:
+            model = _read_field(inner, ['combo_model_ultrasharp'], getter='currentText')
+        elif "srmd" in engine:
+            # Some builds use SRMD models via Real-ESRGAN naming; prefer that combo if present.
+            model = _read_field(inner, ['combo_model_srmd_realsr','combo_model_srmd_realesr','combo_model_srmd_realesrgan'], getter='currentText')
+            if not model:
+                model = _read_field(inner, ['combo_model_srmd'], getter='currentText')
+        elif "ncnn" in engine and "realsr" in engine:
+            model = _read_field(inner, ['combo_model_realsr_ncnn','combo_model_realsrgan_ncnn'], getter='currentText')
+        elif "realsr" in engine or "realesrgan" in engine or "real-esrgan" in engine or "esrgan" in engine:
+            model = _read_field(inner, ['combo_model_realsr','combo_model_realesrgan','combo_model_esrgan'], getter='currentText')
+
+    # Fallback: try any known model combo
+    if not model:
+        model = _read_field(inner, [
+            'combo_model_realsr',
+            'combo_model_realsr_ncnn',
+            'combo_model_ultrasharp',
+            'combo_model_srmd_realsr',
+            'combo_model_srmd',
+            'combo_model_w2x',
+            'combo_model',
+        ], getter='currentText')
+
+    # Last resort: free-text fields
+    if not model:
+        model = _read_field(inner, ['edit_model','line_model'], getter='text')
+
+    if not model:
+        model = 'RealESRGAN-general-x4v3'
+
+    inp = os.path.abspath(inp) if inp else ''
+    outdir = os.path.abspath(outdir) if outdir else ''
     return inp, outdir, _safe_int(scale, 4), model
+
 def enqueue(job_type, input_path, out_dir, factor, model, fmt='png'):
     from helpers.job_helper import make_job_json
     d = jobs_dirs()
+    # Keep factor consistent with model suffix when using fixed-scale Real-ESRGAN style models.
+    try:
+        _ms = re.search(r"(?i)-x(\d+)\s*$", str(model or ""))
+        if _ms:
+            factor = int(_ms.group(1))
+    except Exception:
+        pass
     args = {'factor': int(factor), 'model': model}
+    try:
+        _ms = re.search(r"(?i)-x(\d+)\s*$", str(model or ""))
+        if _ms:
+            args['model_scale'] = int(_ms.group(1))
+    except Exception:
+        pass
     if job_type == 'upscale_photo': args['format'] = fmt
     return make_job_json(job_type, input_path, out_dir, args, str(d['pending']), priority=500)
 def enqueue_from_widget(inner, is_video: bool):

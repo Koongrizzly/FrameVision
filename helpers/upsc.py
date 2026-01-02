@@ -1296,7 +1296,6 @@ class UpscPane(QtWidgets.QWidget):
     def _update_engine_ui(self):
         # Keep model stack in sync with engine
         eng_txt = (self.combo_engine.currentText() or '').lower()
-        engine_label = (self.combo_engine.currentText() or '')
         page = 0
         if 'gfpgan' in eng_txt:
             page = 6
@@ -1325,19 +1324,13 @@ class UpscPane(QtWidgets.QWidget):
             eng = (self.combo_engine.currentText() or '').lower()
         except Exception:
             eng = ''
-        if ('realesrgan' in eng) or ('real-esrgan' in eng) or ('ultrasharp' in eng) or ('srmd (ncnn via realesrgan' in eng) or ('realsr' in eng):
+        if ('realesrgan' in eng) or ('real-esrgan' in eng) or ('ultrasharp' in eng) or ('srmd (ncnn via realesrgan' in eng):
             try:
-                if page == 1:
-                    model = self.combo_model_w2x.currentText()
-                elif page == 3:
-                    model = getattr(self, "combo_model_realsr_ncnn", self.combo_model_realsr).currentText()
-                elif page == 4:
-                    model = getattr(self, "combo_model_ultrasharp", self.combo_model_realsr).currentText()
-                elif page == 5:
-                    model = getattr(self, "combo_model_srmd_realsr", self.combo_model_realsr).currentText()
-                else:
-                    model = self.combo_model_realsr.currentText()
-
+                model = (self.combo_model_w2x.currentText() if "Waifu2x" in engine_label else (
+                    getattr(self, "combo_model_ultrasharp", self.combo_model_realsr).currentText() if "UltraSharp" in engine_label else (
+                    getattr(self, "combo_model_srmd_realsr", self.combo_model_realsr).currentText() if "SRMD (ncnn via RealESRGAN)" in engine_label else self.combo_model_realsr.currentText()))) if page==0 else (
+                        self.combo_model_ultrasharp.currentText() if page==4 else (
+                        self.combo_model_srmd_realsr.currentText() if page==5 else self.combo_model_realsr.currentText()))
                 t = (model or '').lower()
                 native = 4 if ('-x4' in t or 'x4' in t) else (3 if ('-x3' in t or 'x3' in t) else (2 if ('-x2' in t or 'x2' in t) else 2))
                 self.spin_scale.blockSignals(True); self.spin_scale.setValue(float(native)); self.spin_scale.blockSignals(False)
@@ -1620,7 +1613,7 @@ class UpscPane(QtWidgets.QWidget):
             return cand
         return base
     def _realsr_cmd_dir(self, exe: str, indir: Path, outdir: Path, model: str, scale: int) -> List[str]:
-        n = model[:-3] if model.endswith(("-x2", "-x3", "-x4")) else model
+        n = (model or "").strip()
         cmd = [exe, "-i", str(indir), "-o", str(outdir), "-n", n, "-s", str(scale), "-m", str(REALSR_DIR), "-f", "png"]
         try:
             t = int(self.spin_tile.value()) if hasattr(self, "spin_tile") else 0
@@ -1631,7 +1624,7 @@ class UpscPane(QtWidgets.QWidget):
         return cmd
 
     def _realsr_cmd_file(self, exe: str, infile: Path, outfile: Path, model: str, scale: int) -> List[str]:
-        n = model[:-3] if model.endswith(("-x2", "-x3", "-x4")) else model
+        n = (model or "").strip()
         cmd = [exe, "-i", str(infile), "-o", str(outfile), "-n", n, "-s", str(scale), "-m", str(REALSR_DIR)]
         try:
             t = int(self.spin_tile.value()) if hasattr(self, "spin_tile") else 0
@@ -1639,29 +1632,6 @@ class UpscPane(QtWidgets.QWidget):
                 cmd += ["-t", str(t)]
         except Exception:
             pass
-        return cmd
-
-
-    def _realsr_ncnn_cmd_dir(self, exe: str, indir: Path, outdir: Path, model: str, scale: int) -> List[str]:
-        # RealSR (ncnn) uses different model directory and does NOT strip the -x2/-x4 suffix.
-        cmd = [exe, "-i", str(indir), "-o", str(outdir), "-n", model, "-s", str(scale), "-m", str(REALSR_NCNN_DIR), "-f", "png"]
-        try:
-            tile = int(self.spin_tile.value())
-        except Exception:
-            tile = 0
-        if tile and tile > 0:
-            cmd += ["-t", str(tile)]
-        return cmd
-
-    def _realsr_ncnn_cmd_file(self, exe: str, infile: Path, outfile: Path, model: str, scale: int) -> List[str]:
-        # RealSR (ncnn) uses different model directory and does NOT strip the -x2/-x4 suffix.
-        cmd = [exe, "-i", str(infile), "-o", str(outfile), "-n", model, "-s", str(scale), "-m", str(REALSR_NCNN_DIR)]
-        try:
-            tile = int(self.spin_tile.value())
-        except Exception:
-            tile = 0
-        if tile and tile > 0:
-            cmd += ["-t", str(tile)]
         return cmd
 
     def _waifu_cmd_file(self, exe: str, infile: Path, outfile: Path, model_dirname: str, scale: int) -> List[str]:
@@ -1732,14 +1702,17 @@ class UpscPane(QtWidgets.QWidget):
                     QtWidgets.QMessageBox.information(self, "Not supported", "GFPGAN is a face restorer for images only (no video pipeline here yet). Please select a Real-ESRGAN engine for videos.")
                     self._append_log("GFPGAN selected for a video — blocked (images only).")
                     return
-                if "RealSR" in engine_label:
-                    model = getattr(self, "combo_model_realsr_ncnn", self.combo_model_realsr).currentText()
-                elif "UltraSharp" in engine_label:
-                    model = getattr(self, "combo_model_ultrasharp", self.combo_model_realsr).currentText()
-                elif "SRMD (ncnn via RealESRGAN)" in engine_label:
-                    model = getattr(self, "combo_model_srmd_realsr", self.combo_model_realsr).currentText()
-                else:
-                    model = self.combo_model_realsr.currentText()
+    
+                # Pick model from the currently active engine/page (important for UltraSharp/SRMD, etc.)
+                try:
+                    model = (self._fv_current_model_text() or "").strip()
+                except Exception:
+                    model = ""
+                if not model:
+                    try:
+                        model = self.combo_model_realsr.currentText()
+                    except Exception:
+                        model = ""
                 fps = _parse_fps(src) or "30"
                 work = outd / f"{src.stem}_x{scale}_work"
                 in_dir = work / "in"
@@ -1753,10 +1726,7 @@ class UpscPane(QtWidgets.QWidget):
                 cmd_extract = [FFMPEG, "-hide_banner", "-loglevel", "warning", "-y", "-i", str(src), "-map", "0:v:0"]
                 if pre: cmd_extract += ["-vf", pre]
                 cmd_extract += ["-fps_mode", "vfr", str(seq_in)]
-                if "RealSR" in engine_label:
-                    cmd_upscale = self._realsr_ncnn_cmd_dir(engine_exe, in_dir, out_dir, model, scale)
-                else:
-                    cmd_upscale = self._realsr_cmd_dir(engine_exe, in_dir, out_dir, model, scale)
+                cmd_upscale = self._realsr_cmd_dir(engine_exe, in_dir, out_dir, model, scale)
                 post = self._build_post_filters()
                 cmd_encode = [FFMPEG, "-hide_banner", "-loglevel", "warning", "-y", "-framerate", fps, "-i", str(seq_out), "-i", str(src), "-map", "0:v:0"]
                 if self.radio_a_mute.isChecked():
@@ -1790,10 +1760,7 @@ class UpscPane(QtWidgets.QWidget):
                 self._append_log(f"Engine: {engine_label}")
                 self._append_log(f"Executable: {engine_exe}")
                 self._append_log(f"Model: {model}")
-                if "RealSR" in engine_label:
-                    self._append_log(f"Model dir: {REALSR_NCNN_DIR}")
-                else:
-                    self._append_log(f"Model dir: {REALSR_DIR}")
+                self._append_log(f"Model dir: {REALSR_DIR}")
                 self._append_log(f"Scale: x{scale}")
                 self._append_log(f"FPS: {fps}")
                 self._append_log(f"Work dir: {work}")
@@ -1816,9 +1783,6 @@ class UpscPane(QtWidgets.QWidget):
             elif "Waifu2x" in engine_label:
                 model = self.combo_model_w2x.currentText()
                 cmd = self._waifu_cmd_file(engine_exe, src, outfile, model, scale)
-            elif "RealSR" in engine_label:
-                model = getattr(self, "combo_model_realsr_ncnn", self.combo_model_realsr).currentText()
-                cmd = self._realsr_ncnn_cmd_file(engine_exe, src, outfile, model, scale)
             elif "UltraSharp" in engine_label:
                 model = getattr(self, "combo_model_ultrasharp", self.combo_model_realsr).currentText()
                 cmd = self._realsr_cmd_file(engine_exe, src, outfile, model, scale)
@@ -1839,10 +1803,7 @@ class UpscPane(QtWidgets.QWidget):
                 except Exception:
                     pass
             elif "Waifu2x" not in engine_label:
-                if "RealSR" in engine_label:
-                    self._append_log(f"Model dir: {REALSR_NCNN_DIR}")
-                else:
-                    self._append_log(f"Model dir: {REALSR_DIR}")
+                self._append_log(f"Model dir: {REALSR_DIR}")
             self._append_log(f"Scale: x{scale}")
             self._append_log(f"Input: {src}")
             self._append_log(f"Output: {outfile}")
@@ -2048,6 +2009,308 @@ def _open_file(self, p: Path):
 # === FrameVision patch: queue + player wiring (adaptive queue args) ===
 from pathlib import Path as _FVPath
 import inspect as _FVinspect
+try:
+    from PySide6 import QtWidgets as _FVQtW  # type: ignore
+except Exception:  # pragma: no cover
+    _FVQtW = None  # type: ignore
+
+def _fv_is_valid_file(p):
+    try:
+        return p and _FVPath(p).exists() and _FVPath(p).is_file()
+    except Exception:
+        return False
+
+def _fv_guess_player_path(owner):
+    m = getattr(owner, "_main", None) or getattr(owner, "main", None)
+    candidates = []
+    if m:
+        candidates += [
+            getattr(m, "current_path", None),
+            getattr(m, "current_file", None),
+            getattr(m, "current_media", None),
+            getattr(getattr(m, "player", None), "current_path", None),
+            getattr(getattr(m, "player", None), "source", None),
+            getattr(getattr(m, "viewer", None), "current_path", None),
+        ]
+    seen = set(); cand = []
+    for c in candidates:
+        s = str(c) if c is not None else None
+        if s and s not in seen:
+            seen.add(s); cand.append(s)
+    for c in cand:
+        if _fv_is_valid_file(c):
+            return c
+    return None
+
+def _fv_get_input(self):
+    # try text fields first
+    for attr in ("edit_input","line_input","edit_in","input_line","editPath","linePath"):
+        w = getattr(self, attr, None)
+        try:
+            if w and hasattr(w, "text"):
+                t = (w.text() or '').strip()
+                if t in ('.','./','..',''):
+                    pass
+                elif _fv_is_valid_file(t):
+                    return t
+        except Exception:
+            pass
+    # then stored infile
+    try:
+        p = getattr(self, "_last_infile", None)
+        if p and _fv_is_valid_file(str(p)):
+            return str(p)
+    except Exception:
+        pass
+    # finally ask player
+    return _fv_guess_player_path(self)
+
+def _fv_push_input_to_tab(self, path_str):
+    pushed = False
+    for attr in ("edit_input","line_input","edit_in","input_line","editPath","linePath"):
+        w = getattr(self, attr, None)
+        try:
+            if w and hasattr(w, "setText"):
+                w.setText(path_str); pushed = True
+        except Exception:
+            pass
+    for meth in ("set_input_path","load_single_input","set_source","set_path"):
+        fn = getattr(self, meth, None)
+        try:
+            if callable(fn):
+                fn(path_str); pushed = True
+        except Exception:
+            pass
+    try:
+        self._last_infile = _FVPath(path_str)
+    except Exception:
+        pass
+    return pushed
+
+def _fv_find_enqueue(self):
+    """Return a callable that accepts (job_dict) OR (input_path, out_dir, factor, model), plus a label."""
+    m = getattr(self, "_main", None) or getattr(self, "main", None)
+
+    candidates = []
+    # direct
+    for name in ("enqueue", "enqueue_job", "enqueue_external", "enqueue_single_action", "queue_add", "add_job"):
+        fn = getattr(m, name, None) if m is not None else None
+        if callable(fn): candidates.append((fn, f"main.{name}"))
+    # queue_adapter on main
+    qa = getattr(m, "queue_adapter", None) if m is not None else None
+    for name in ("enqueue", "add", "put"):
+        fn = getattr(qa, name, None) if qa is not None else None
+        if callable(fn): candidates.append((fn, f"main.queue_adapter.{name}"))
+    # nested queue
+    q = getattr(m, "queue", None) if m is not None else None
+    for name in ("enqueue", "add", "put", "add_job"):
+        fn = getattr(q, name, None) if q is not None else None
+        if callable(fn): candidates.append((fn, f"main.queue.{name}"))
+    # module-level
+    try:
+        import helpers.queue_adapter as _qa  # type: ignore
+        for name in ("enqueue", "add", "put", "add_job"):
+            fn = getattr(_qa, name, None)
+            if callable(fn): candidates.append((fn, f"helpers.queue_adapter.{name}"))
+    except Exception:
+        pass
+
+    # pick best (prefer queue_adapter.enqueue if it exists)
+    lbl_order = ["helpers.queue_adapter.enqueue", "main.queue_adapter.enqueue", "main.enqueue", "main.enqueue_job"]
+    for prefer in lbl_order:
+        for fn, label in candidates:
+            if label.endswith(prefer):
+                return fn, label
+    return candidates[0] if candidates else (None, "")
+
+def _fv_call_enqueue(self, enq, where_label, cmds, open_on_success):
+    """Try to call enqueue either with a job dict, or with signature (input_path, out_dir, factor, model)."""
+    sig = None
+    try:
+        sig = _FVinspect.signature(enq)
+    except Exception:
+        pass
+
+    # Collect context
+    input_path = _fv_get_input(self)
+    out_dir = ""
+    try:
+        out_dir = (getattr(self, 'edit_outdir', None).text() if getattr(self, 'edit_outdir', None) else '') or (getattr(self, 'edit_output', None).text() if getattr(self, 'edit_output', None) else '')
+    except Exception:
+        pass
+    # factor: try to read from UI or model name
+    factor = 2
+    try:
+        factor = int(round(float(getattr(self, 'spin_scale', None).value())))
+    except Exception:
+        try:
+            txt = getattr(self, 'combo_model', None).currentText()
+            if isinstance(txt, str) and 'x4' in txt: factor = 4
+            elif isinstance(txt, str) and 'x3' in txt: factor = 3
+            elif isinstance(txt, str) and 'x2' in txt: factor = 2
+        except Exception:
+            pass
+    # Model: prefer helper that knows which dropdown is active.
+    # This prevents the "always picks the first model" bug when multiple model combos exist.
+    model_name = ''
+    try:
+        fn = getattr(self, "_fv_current_model_text", None)
+        if callable(fn):
+            model_name = str(fn() or "").strip()
+    except Exception:
+        model_name = ''
+
+    if not model_name:
+        # Fallback: choose by stacked-models page (what the user is actually looking at)
+        try:
+            stk = getattr(self, "stk_models", None)
+            page = int(stk.currentIndex()) if stk is not None else -1
+        except Exception:
+            page = -1
+
+        def _ct(attr: str) -> str:
+            w = getattr(self, attr, None)
+            try:
+                return str(w.currentText()).strip() if (w is not None and hasattr(w, "currentText")) else ""
+            except Exception:
+                return ""
+
+        if page == 1:
+            model_name = _ct("combo_model_w2x")
+        elif page == 2:
+            model_name = _ct("combo_model_srmd")
+        elif page == 3:
+            model_name = _ct("combo_model_realsr_ncnn")
+        elif page == 4:
+            model_name = _ct("combo_model_ultrasharp")
+        elif page == 5:
+            model_name = _ct("combo_model_srmd_realsr")
+        elif page == 6:
+            model_name = _ct("combo_model_gfpgan")
+        else:
+            # page 0 or unknown: use engine label mapping as best-effort
+            eng_label = _ct("combo_engine")
+            if "waifu2x" in eng_label.lower():
+                model_name = _ct("combo_model_w2x")
+            elif "ultrasharp" in eng_label.lower():
+                model_name = _ct("combo_model_ultrasharp")
+            elif "srmd (ncnn via realesrgan" in eng_label.lower():
+                model_name = _ct("combo_model_srmd_realsr")
+            elif "srmd" in eng_label.lower():
+                model_name = _ct("combo_model_srmd")
+            elif "realsr" in eng_label.lower():
+                model_name = _ct("combo_model_realsr_ncnn")
+            elif "gfpgan" in eng_label.lower():
+                model_name = _ct("combo_model_gfpgan")
+            else:
+                model_name = _ct("combo_model_realsr") or _ct("combo_model")
+
+        if not model_name:
+            model_name = _ct("combo_model_realsr") or _ct("combo_model")
+
+
+    # If signature wants plain args, call with those
+    if sig:
+        params = list(sig.parameters.keys())
+        if params[:4] == ["input_path", "out_dir", "factor", "model"] or set(("input_path","out_dir","factor","model")).issubset(set(params)):
+            try:
+                enq(job_type=('upscale_photo' if str(Path(input_path)).lower().endswith(tuple(_IMAGE_EXTS)) else 'upscale_video'), input_path=input_path, out_dir=out_dir, factor=factor, model=model_name)
+                try:
+                    self._append_log(f"Queued via {where_label} (kwargs).")
+                except Exception: pass
+                return True
+            except Exception as e:
+                try: self._append_log(f"Queue error via {where_label}: {e}")
+                except Exception: pass
+                return False
+
+    # Else, fallback to job dicts (one per command)
+    for i, c in enumerate(cmds, 1):
+        job = {
+            "name": "Upscale" if len(cmds) == 1 else f"Upscale ({i}/{len(cmds)})",
+            "category": "upscale",
+            "cmd": c,
+            "cwd": str(globals().get("ROOT", ".")),
+            "open_on_success": bool(open_on_success and i == len(cmds)),
+            "output": str(getattr(self, "_last_outfile", "")),
+        }
+        try:
+            enq(job)
+        except Exception as e:
+            try: self._append_log(f"Queue error via {where_label}: {e}")
+            except Exception: pass
+            return False
+    try:
+        self._append_log(f"Queued {len(cmds)} job(s) via {where_label}")
+    except Exception:
+        pass
+    return True
+
+try:
+    _UpscClass = None
+    for _n, _obj in list(globals().items()):
+        if isinstance(_obj, type) and hasattr(_obj, "_run_cmd"):
+            _UpscClass = _obj
+            break
+
+    if _UpscClass is not None:
+        _orig_run_cmd = getattr(_UpscClass, "_run_cmd", None)
+        def _patched_run_cmd(self, cmds, open_on_success: bool = False, cleanup_dirs=None):
+            enq, where = _fv_find_enqueue(self)
+            if callable(enq) and cmds:
+                if _fv_call_enqueue(self, enq, where, cmds, open_on_success):
+                    return
+            # Fallback to original implementation
+            if callable(_orig_run_cmd):
+                return _orig_run_cmd(self, cmds, open_on_success=open_on_success, cleanup_dirs=cleanup_dirs)
+
+        setattr(_UpscClass, "_run_cmd", _patched_run_cmd)
+
+        _orig_set_main = getattr(_UpscClass, "set_main", None)
+        def _patched_set_main(self, main):
+            if callable(_orig_set_main):
+                try:
+                    _orig_set_main(self, main)
+                except TypeError:
+                    try: self._main = main
+                    except Exception: pass
+            else:
+                try: self._main = main
+                except Exception: pass
+            if _FVQtW is not None and main is not None:
+                try:
+                    for _btn in main.findChildren(_FVQtW.QPushButton):
+                        if _btn.text().strip().lower() == "upscale":
+                            try: _btn.clicked.disconnect()
+                            except Exception: pass
+                            def _call():
+                                p = _fv_guess_player_path(self) or _fv_get_input(self)
+                                if not _fv_is_valid_file(p):
+                                    try: self._append_log("Player Upscale: no valid file path available.")
+                                    except Exception: pass
+                                    return
+                                _fv_push_input_to_tab(self, p)
+                                try:
+                                    if hasattr(self, "btn_upscale"):
+                                        self.btn_upscale.click()
+                                    else:
+                                        self._do_single()
+                                except Exception:
+                                    try: self._do_single()
+                                    except Exception: pass
+                            _btn.clicked.connect(_call)
+                            break
+                except Exception:
+                    pass
+
+        setattr(_UpscClass, "set_main", _patched_set_main)
+
+except Exception as _patch_exc:
+    try:
+        print(f"[upsc patch] non-fatal: {_patch_exc}")
+    except Exception:
+        pass
+
 
 
 # --- FrameVision silent integration r11 ---

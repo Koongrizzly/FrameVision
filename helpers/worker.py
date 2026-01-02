@@ -965,6 +965,16 @@ def upscale_video(job, cfg, mani):
     # If UI provided a model-specific scale, honor it (prevents mismatched x2/x4 models).
     factor = int(args.get("model_scale") or args.get("factor") or 4)
     model_name_req = args.get("model", "RealESRGAN-x4plus")
+    # If the requested model encodes its own scale suffix (-x2/-x3/-x4) and UI didn't set model_scale,
+    # keep factor consistent so filenames/dimensions match what Real-ESRGAN will actually do.
+    try:
+        if not args.get("model_scale"):
+            _ms = re.search(r"(?i)-x(\d+)\s*$", str(model_name_req or ""))
+            if _ms:
+                factor = int(_ms.group(1))
+    except Exception:
+        pass
+
     model_name, exe_path = resolve_upscaler_exe(cfg, mani, model_name_req)
 
     out = out_dir / f"{inp.stem}_x{factor}.mp4"
@@ -1204,7 +1214,7 @@ def upscale_video(job, cfg, mani):
             print("[worker][upscale_video] Stage 2/3: upscaling frames...")
 
             m = str(model_name).lower()
-            if ("realesr" in m) or ("realesrgan" in m):
+            if any(tag in m for tag in ("realesr", "realesrgan", "esrgan", "ultrasharp", "srmd")):
                 cmd = build_realesrgan_cmd(
                     str(exe_path),
                     frames,
@@ -1678,6 +1688,16 @@ def upscale_photo(job, cfg, mani):
     factor = int(args.get("model_scale") or args.get("factor") or 4)
     fmt = (args.get("format") or _infer_image_format_from_input(args) or "png").lower()
     model_name = args.get("model", "RealESRGAN-x4plus")
+    # If the requested model encodes its own scale suffix (-x2/-x3/-x4) and UI didn't set model_scale,
+    # keep factor consistent so filenames/dimensions match what Real-ESRGAN will actually do.
+    try:
+        if not args.get("model_scale"):
+            _ms = re.search(r"(?i)-x(\d+)\s*$", str(model_name or ""))
+            if _ms:
+                factor = int(_ms.group(1))
+    except Exception:
+        pass
+
     model_name, exe_path = resolve_upscaler_exe(cfg, mani, model_name)
     out = out_dir / f"{inp.stem}_x{factor}.{fmt}"
     out = _unique_path(out)
@@ -1714,7 +1734,7 @@ def upscale_photo(job, cfg, mani):
     try:
         if exe_path and exe_path.exists() and exe_path.is_file():
             m = str(model_name).lower()
-            if ("realesr" in m) or ("realesrgan" in m):
+            if any(tag in m for tag in ("realesr", "realesrgan", "esrgan", "ultrasharp", "srmd")):
                 models_dir_guess = None
                 try:
                     models_dir_guess = Path(exe_path).parent
