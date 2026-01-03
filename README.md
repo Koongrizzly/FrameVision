@@ -12,6 +12,7 @@ Video Walktrough (most is speedup x2 to show much in less time)
   
 - fixed themes freezing app for 5 seconds after applying (added a 'safe apply' button if freezing comes back)
 - fixed upscaler defaulting to 30fps
+- fixed tab integration still thinking upscaler was a main tab (finaly found why upscaler needed restart to apply new upscaler engine/model)
 - fixed compare tool crash when loading new media file while repeat button was on.
 - fixed compare tool sync problems for video (85% lol)
 - added a date/time changer to the metadata editor
