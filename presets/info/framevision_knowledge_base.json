@@ -1135,6 +1135,119 @@
       "overview": "Installer provides 1) environment checks, 2) core app install, 3) Full CPU stack (~3.5 GB), 4) Full CUDA stack (~5 GB, cu121). Start via start.bat which self‑heals psutil, starts worker, and launches the app. Models downloader installs Qwen Image GGUF tiers and external tools; Models pane manages paths, manifests, and quick tests.<br><br>",
       "_layout": "overview/features/install/troubleshoot"
     },
+    "Media_Explorer": {
+      "description": "The <b>Media Explorer</b> is FrameVision’s fast file browser for finished results and source folders. Scan any folder (optionally including subfolders) and get a searchable, sortable list of <b>images / video / audio</b> with quick actions (open/play, reveal folder, rename, copy path, delete) and a details panel.<br><br><b>Designed for speed:</b> it intentionally shows <b>no thumbnails</b> (uses default file-type icons) so huge folders stay responsive.",
+      "key_terms": [
+        "Scan",
+        "Tree view",
+        "Include subfolders",
+        "Search (name or folder)",
+        "Images / Video / Sound filters",
+        "★ favorites",
+        "★ Only (favorites filter)",
+        "Open in player",
+        "Open in external Windows app",
+        "Play with ffplay",
+        "Open containing folder",
+        "Copy full path",
+        "Copy filename",
+        "Rename…",
+        "Move to Recycle Bin…",
+        "Copy / Cut / Paste (Media Explorer clipboard)",
+        "Details panel (Expand / Copy)",
+        "ffprobe / ffplay / ffmpeg",
+        "presets/bin",
+        "presets/setsave/explorerfav.json (folder favorites)"
+      ],
+      "overview": "Media Explorer is your “where did my file go?” tab. It’s meant to replace scattered “last result” boxes by letting you browse any output folder, hit Scan, and instantly filter/sort across hundreds or thousands of files.<br><br><b>Workflow (typical):</b><br><ol><li>Click <b>Browse…</b> and pick the folder you want to inspect (for example <code>output/</code> or a tool-specific subfolder).</li><li>Choose what to include: <b>Images</b>, <b>Video</b>, <b>Sound</b> and (optionally) <b>Include subfolders</b>.</li><li>Press <b>Scan</b>. Use the search box to filter by file name or folder, and click table headers to sort.</li><li>Select a row to see metadata + any linked job/settings JSON in the <b>Details</b> pane.</li><li>Right‑click for actions like <b>Open in player</b>, <b>Play with ffplay</b>, <b>Rename…</b>, or <b>Move to Recycle Bin…</b>.</li></ol><b>Notes (important):</b><br><ul><li><b>No thumbnails by design.</b> This keeps scans fast and avoids GPU/CPU spikes in giant folders.</li><li><b>Sorting may pause during scanning.</b> The tab temporarily disables heavy sorting/filtering while a scan is running, then restores it when finished (or when you press Stop).</li><li><b>FFmpeg tools are auto-discovered.</b> Media Explorer uses <code>ffprobe</code>/<code>ffplay</code>/<code>ffmpeg</code> from <code>&lt;root&gt;/presets/bin/</code> when available. If the tools aren’t detected, some metadata and playback options may be limited.</li><li><b>Delete behavior:</b> “Move to Recycle Bin…” is used when available on Windows; otherwise the file may be deleted permanently.</li></ul><b>Folder favorites (Tree view):</b><br>The <b>Tree view</b> button opens a folder picker with a drive tree. Right‑click any folder in the tree to add/remove it as a favorite. Folder favorites are saved to <code>presets/setsave/explorerfav.json</code> so you can jump to common output folders quickly.",
+      "features": [
+        "Folder scan for Images / Video / Sound, with optional recursive “Include subfolders”.",
+        "Search + sort table (name/folder/date/size and more), designed to stay responsive on huge folders.",
+        "Favorites system (★) for individual files, plus a one-click “★ Only” filter to show favorites only.",
+        "Context menu actions: open in FrameVision’s player, open with external Windows app, play with ffplay, open containing folder, copy path/filename, rename, rescan, and move to Recycle Bin.",
+        "In-app clipboard for file management between folders (Copy / Cut / Paste) without leaving the app.",
+        "Details panel that can show probed metadata and large text blocks with Expand + Copy for quick sharing/debugging."
+      ],
+      "hints_tips": [
+        "Use <b>View results</b> buttons in other tools (when present) to jump straight into Media Explorer with the correct folder scanned.",
+        "If a folder is massive: scan without <b>Include subfolders</b> first, then enable recursion only when you really need it.",
+        "Use <b>Search (name or folder)…</b> like a filter: try parts of a seed, model name, preset name, or a date string.",
+        "Favorite your “keeper” outputs with <b>F</b> (or right‑click → ★ Add to favorites). Then toggle <b>★ Only</b> to review just the best takes.",
+        "For quick comparisons, sort by <b>Modified</b> (newest first) after a run and you’ll see the latest outputs at the top.",
+        "If the scan feels slow, press <b>Stop</b>, narrow the scan (disable one of Images/Video/Sound), and rescan.",
+        "When you’re cleaning up: use <b>Move to Recycle Bin…</b> first so you can undo mistakes outside the app.",
+        "Using Copy/Cut/Paste: keep an eye on the folder field—Media Explorer can auto-scan the destination folder before pasting, so you always paste into what you see.",
+        "If a details field is truncated, use the <b>Expand</b> button in the Details panel, then <b>Copy</b> to share full logs/settings.",
+        "If “Play with ffplay” fails, it usually means FFmpeg tools aren’t detected—re-run the FFmpeg install in <b>Install & Updates</b>."
+      ],
+      "qa_pairs": [
+        {
+          "question": "Why are there no thumbnails?",
+          "answer": "This is on purpose. Thumbnails are expensive in big folders (lots of decoding + scaling), and they can cause UI hitching. Media Explorer uses default file-type icons so scanning stays fast and stable."
+        },
+        {
+          "question": "What does “Include subfolders” do?",
+          "answer": "It makes the scanner recurse into all subfolders under the selected folder. Great for a big output tree, but it can increase scan time a lot."
+        },
+        {
+          "question": "How do favorites work?",
+          "answer": "Select one or more files and press <b>F</b> (or right‑click → ★ Add/Remove). Favorites are remembered between app runs. Use <b>★ Only</b> (or the context menu “Show only favorites”) to filter the table to favorites."
+        },
+        {
+          "question": "What’s the difference between file favorites and folder favorites?",
+          "answer": "File favorites (★) mark specific media files in the table. Folder favorites live in the Tree view dialog and help you quickly jump to commonly used folders; they are saved to <code>presets/setsave/explorerfav.json</code>."
+        },
+        {
+          "question": "I clicked Scan, but sorting feels weird while it’s scanning. Bug?",
+          "answer": "Not necessarily. To keep scanning fast, Media Explorer may temporarily disable heavy sorting/filtering and then restore it after the scan (or after you press Stop)."
+        },
+        {
+          "question": "What does “Open in player” do?",
+          "answer": "It asks FrameVision’s built-in player to open the selected media file. If the app can’t open it internally for any reason, you can use “Open in external Windows app” instead."
+        },
+        {
+          "question": "What is “Play with ffplay”?",
+          "answer": "It launches FFmpeg’s <code>ffplay</code> for quick playback. This is handy for odd formats or fast checking without loading into the main player. It requires FFmpeg tools to be available."
+        },
+        {
+          "question": "Where do the FFmpeg tools come from?",
+          "answer": "Media Explorer auto-discovers <code>ffprobe</code>/<code>ffplay</code>/<code>ffmpeg</code> from <code>&lt;root&gt;/presets/bin/</code> when present. If they’re missing, reinstall via <b>Install & Updates</b>."
+        },
+        {
+          "question": "Is “Move to Recycle Bin…” safe?",
+          "answer": "On Windows, it uses the Recycle Bin when available. If the OS can’t move the file (permissions, network share, etc.), the fallback may delete permanently—so be careful with critical files."
+        },
+        {
+          "question": "How do I quickly find outputs from my last run?",
+          "answer": "Scan the tool’s output folder (or use its <b>View results</b> button if available), then sort by <b>Modified</b> (newest first). Optionally type part of the filename/seed/preset into Search."
+        }
+      ],
+      "controls": [
+        "Browse…: pick a folder to scan.",
+        "Folder field: shows the current scan folder (you can paste a path).",
+        "Scan: start scanning the current folder.",
+        "Stop: abort an in-progress scan.",
+        "Tree view: pick a folder via a drive tree; supports folder favorites.",
+        "Images / Video / Sound: toggle which media types to include.",
+        "Include subfolders: recurse into subfolders when scanning.",
+        "Search (name or folder)…: filter the table as you type.",
+        "★ Only: show only favorited files.",
+        "Right‑click table row: open/play/copy/rename/delete and file management actions.",
+        "Details panel: shows metadata; long values offer Expand + Copy."
+      ],
+      "install": [
+        "Media Explorer relies on your bundled FFmpeg tools (ffprobe/ffplay/ffmpeg). If they’re missing, install them via <b>Install & Updates</b>.",
+        "Folder favorites are stored in <code>presets/setsave/explorerfav.json</code> (created automatically when you add your first favorite folder)."
+      ],
+      "troubleshoot": [
+        "If Scan finds nothing: double-check the selected folder and that the correct media type toggles (Images/Video/Sound) are enabled.",
+        "If metadata is missing: FFmpeg tools may not be detected; reinstall FFmpeg via <b>Install & Updates</b>.",
+        "If scanning is too slow: disable <b>Include subfolders</b>, narrow media types, or scan a smaller folder first.",
+        "If “Open in player” doesn’t work for a file: try “Open in external Windows app” or “Play with ffplay”.",
+        "If delete fails: the file may be locked by another program. Close the program and try again."
+      ],
+      "_layout": "overview/features/hints_tips/install/troubleshoot"
+    },
     "Multimedia_Player": {
       "description": "Main FrameVision viewer for images, GIFs, video, and audio. Includes classic transport, seek slider + time readout, fullscreen overlay controls, zoom/pan, compare wipe, quick upscale, and an Ask Framie chat button.",
       "key_terms": [
@@ -2502,6 +2615,108 @@
           "answer": "Check the worker heartbeat (logs/worker_heartbeat.txt). Restart the app/worker if stale."
         }
       ]
+    },
+    "TXT_to_Image_SD15_SDXL": {
+      "description": "Classic Stable Diffusion <b>TXT→IMG</b> using <b>Diffusers</b>, with support for <b>SD 1.5</b> and <b>SDXL</b> single‑file <code>.safetensors</code> checkpoints. This is the “normal” text‑to‑image path (higher quality per step than Turbo engines), with familiar knobs: Steps, CFG, Sampler, seed policies, batch, and optional SDXL LoRAs.",
+      "key_terms": [
+        "txt2img.py (Diffusers backend)",
+        "SD15 (Stable Diffusion 1.5)",
+        "SDXL",
+        "Checkpoint (.safetensors)",
+        "models/SD15",
+        "models/SDXL",
+        "Model dropdown (Refresh / Browse)",
+        "CFG scale (guidance_scale)",
+        "Sampler / Scheduler (DPM++ 2M Karras, Euler a, Euler, Heun, UniPC, DDIM)",
+        "Attention slicing",
+        "LoRA (SDXL) – 2 slots",
+        "Seed policy (Fixed / Increment / Random)",
+        "Filename template ({seed}, {idx})",
+        "FRAMEVISION_DIFFUSERS_MODEL (env override)"
+      ],
+      "overview": "This section documents the <b>SD models (SD15/SDXL)</b> engine inside <code>helpers/txt2img.py</code> (the Diffusers path). When you select that engine in the TXT→IMG tab, FrameVision loads a <code>.safetensors</code> checkpoint locally and runs it through <b>Diffusers</b>: <code>StableDiffusionPipeline</code> for SD1.5 and <code>StableDiffusionXLPipeline</code> for SDXL. <br><br><b>How the model is chosen</b><br><ul><li><b>Model dropdown</b> scans <code>models/SD15</code> and <code>models/SDXL</code> for <code>*.safetensors</code> (use <b>Refresh</b> after adding files).</li><li><b>Browse…</b> lets you pick a checkpoint from anywhere (still expected to be <code>.safetensors</code>).</li><li>If the selected path is empty/invalid, FrameVision falls back to a default SD1.5 checkpoint: <code>models/SD15/DreamShaper_8_pruned.safetensors</code>.</li><li>You can also override the default via <code>FRAMEVISION_DIFFUSERS_MODEL</code> (environment variable).</li></ul><br><b>SD15 vs SDXL detection</b><br>FrameVision detects SDXL by checking whether the resolved model path contains <code>sdxl</code> (or <code>sd_xl</code>). That means putting SDXL checkpoints in the <code>models/SDXL</code> folder (or naming them with “sdxl”) is enough for correct detection. <br><br><b>What happens at runtime</b><br><ul><li>Runs on <b>CUDA</b> when available (float16), otherwise CPU (float32).</li><li>Applies your <b>Prompt</b>, optional <b>Negative prompt</b>, <b>Steps</b>, <b>CFG</b>, <b>Width/Height</b>, and <b>Seed</b>.</li><li>Optional: swaps the scheduler when you pick a non‑auto sampler (DPM++ 2M Karras / Euler a / Euler / Heun / UniPC / DDIM).</li><li>Disables the Diffusers safety checker for local use.</li><li>Optional: enables <b>Attention slicing</b> for lower VRAM.</li></ul><br><b>When Diffusers isn’t available</b><br>If Diffusers/Torch can’t be imported (or the pipeline fails), FrameVision generates a simple <b>placeholder image</b> (checkerboard + your prompt text) so the rest of the app/queue can keep working. <br><br><b>Adding extra checkpoints (Civitai / other sources)</b><br><ol><li>Download a <b>Checkpoint</b> file in <code>.safetensors</code> format (SD1.5 checkpoints for SD15, SDXL checkpoints for SDXL). Many sites (including Civitai) offer multiple variants—pick the checkpoint, not an embedding/LoRA, and avoid formats that require a custom workflow.</li><li>Drop the file into:<ul><li><code>models/SD15/</code> for SD1.5 checkpoints</li><li><code>models/SDXL/</code> for SDXL checkpoints</li></ul>(If you use lowercase folders like <code>models/sd15</code> or <code>models/sdxl</code>, the safest option is to rename them to match the scanned folders, or use <b>Browse…</b> to select the checkpoint directly.)</li><li>Back in the app: click <b>Refresh</b> next to Model, then select your new checkpoint.</li></ol>",
+      "features": [
+        "Local Diffusers TXT→IMG for SD1.5 and SDXL single‑file checkpoints.",
+        "Model dropdown scans <code>models/SD15</code> and <code>models/SDXL</code> for <code>.safetensors</code>; Browse supports custom locations.",
+        "Prompt + Negative prompt.",
+        "Steps + CFG (guidance scale).",
+        "Sampler selection: auto, DPM++ 2M (Karras), Euler a, Euler, Heun, UniPC, DDIM.",
+        "Batch generation + seed policies (fixed / increment / random).",
+        "Optional Attention slicing for VRAM savings.",
+        "SDXL LoRA support (2 slots) with independent strengths (0.0–1.5).",
+        "Output formats (png/jpg/webp) + filename templates with <code>{seed}</code> and <code>{idx}</code>.",
+        "Writes a sidecar <code>.json</code> next to the first output image with run metadata (engine/model/seeds/actual size)."
+      ],
+      "hints_tips": [
+        "Start simple: pick a known checkpoint, set a clear prompt, and run 1 image before touching batch settings.",
+        "For SD1.5 checkpoints, try smaller sizes first (e.g., 512–768 range) and scale up only after you like the look. For SDXL, 1024‑ish sizes tend to be a better default.",
+        "If your image ignores the prompt: raise <b>CFG</b> a bit. If it looks “forced” or oversharpened: lower CFG before lowering Steps.",
+        "If hands/faces drift: increase Steps slightly and/or switch sampler (DPM++ 2M Karras is a common first choice).",
+        "If you hit VRAM errors: enable <b>Attention slicing</b>, reduce resolution, and keep Batch=1. (Batch is the fastest way to OOM.)",
+        "Use the built‑in Presets as starting points—they set Sampler/Steps/CFG/Size and only auto-fill Negative if your Negative box is empty. ",
+        "When doing Batch > 1, use a filename template that includes <code>{idx}</code> to avoid overwrites (for example: <code>IMG_{seed}_{idx:03d}.png</code>).",
+        "If a checkpoint loads but produces nonsense: it might not be a single-file Diffusers‑compatible checkpoint. Try a different checkpoint or use Browse to point to the correct file."
+      ],
+      "qa_pairs": [
+        {
+          "question": "Where does FrameVision look for SD15/SDXL checkpoints?",
+          "answer": "The Model dropdown scans <code>models/SD15</code> and <code>models/SDXL</code> for <code>*.safetensors</code>. After you drop in a new file, click <b>Refresh</b> next to the Model picker. "
+        },
+        {
+          "question": "How does it decide if a checkpoint is SDXL or SD1.5?",
+          "answer": "It checks the resolved checkpoint path for <code>sdxl</code> or <code>sd_xl</code>. Putting SDXL models under <code>models/SDXL</code> makes the path contain “sdxl”, so detection works automatically. "
+        },
+        {
+          "question": "Can I use LoRAs with SD15 too?",
+          "answer": "In the current Diffusers path, LoRAs are only applied when the selected checkpoint is detected as <b>SDXL</b> (two LoRA slots with per‑slot strength). "
+        },
+        {
+          "question": "Why do I get a checkerboard image with my prompt text?",
+          "answer": "That’s the built‑in CPU fallback. It typically means Diffusers/Torch is missing, failed to import, or the pipeline couldn’t load the checkpoint. FrameVision returns a placeholder image so the rest of the app (and queue) doesn’t break. "
+        },
+        {
+          "question": "What does “Attention slicing” do?",
+          "answer": "It reduces VRAM usage by splitting attention into smaller chunks. It’s slower, but it can be the difference between running and crashing on smaller GPUs. "
+        },
+        {
+          "question": "Why is the safety checker disabled?",
+          "answer": "For local/offline use FrameVision disables the Diffusers safety checker (it returns “not flagged” for all outputs) to avoid false positives and dependency issues. "
+        }
+      ],
+      "controls": [
+        "Engine — dropdown. Does: Select <b>SD models (SD15/SDXL)</b> to use the Diffusers backend. ",
+        "Preset — dropdown. Does: Apply a tuned bundle of Sampler/Steps/CFG/Size (and Negative if empty). ",
+        "Prompt — text box. Does: Main description of the image to generate.",
+        "Negative — text box. Does: What to avoid (optional).",
+        "Model — dropdown + Refresh + Browse. Does: Pick a local <code>.safetensors</code> checkpoint; Refresh rescans model folders; Browse picks any file. ",
+        "LoRA (SDXL) / LoRA 2 (SDXL) — dropdown(s) + strength. Does: Apply up to two SDXL LoRAs from the chosen LoRA folder. ",
+        "Sampler — dropdown. Does: Select scheduler (auto / DPM++ 2M Karras / Euler a / Euler / Heun / UniPC / DDIM). ",
+        "Steps — slider. Does: Number of diffusion steps (quality vs speed). ",
+        "CFG — spinbox. Does: Guidance scale (prompt adherence). ",
+        "Size — presets + W/H manual. Does: Output resolution; FrameVision snaps to safe buckets (multiples of 64). ",
+        "Seed + Seed policy + Batch. Does: Reproducible variation controls.",
+        "Attention slicing — checkbox. Does: Reduce VRAM usage (slower). ",
+        "File format — dropdown. Does: png/jpg/webp; filename template auto-updates extension. ",
+        "Filename template — text box. Does: Naming pattern; supports <code>{seed}</code> and <code>{idx}</code>. ",
+        "Output — path + Browse. Does: Where results are saved.",
+        "Show in Player — checkbox. Does: Auto-load the last generated image in the Media Player.",
+        "Use queue — checkbox. Does: Route jobs through the Worker queue (recommended for background runs and batch). "
+      ],
+      "install": [
+        "Put your checkpoints in <code>models/SD15</code> and/or <code>models/SDXL</code>, then press <b>Refresh</b> in the Model row. ",
+        "Diffusers/Torch must be available in the app environment for SD15/SDXL generation. If you only get placeholder images, repair/reinstall FrameVision (or the optional AI stack) so the Diffusers backend can import. ",
+        "Optional: set <code>FRAMEVISION_DIFFUSERS_MODEL</code> to force a default checkpoint path (useful for portable setups). ",
+        "Optional: keep SDXL LoRAs in a folder like <code>loras/txt2img</code>; use <b>Choose LoRA path…</b> to point the picker at your folder. "
+      ],
+      "troubleshoot": [
+        "Model dropdown is empty: confirm your files are <code>.safetensors</code> and placed under <code>models/SD15</code> or <code>models/SDXL</code>, then click <b>Refresh</b>. ",
+        "You get placeholder checkerboard images: Diffusers/Torch import or pipeline load failed. Check the console/logs, verify the checkpoint path is valid, and reinstall/repair the AI stack if needed. ",
+        "SDXL checkpoint loads as SD1.5 (or crashes): ensure the path contains “sdxl” (placing it in <code>models/SDXL</code> usually fixes this). ",
+        "Out of VRAM: enable <b>Attention slicing</b>, lower resolution, set Batch=1, and close other VRAM-heavy tools. ",
+        "Sampler seems to do nothing: only non-<b>auto</b> selections replace the scheduler; try DPM++ 2M (Karras) or Euler a first. ",
+        "LoRA doesn’t apply: LoRAs are only applied for SDXL in this path, and the LoRA file must exist on disk (use Reload after changing folders). "
+      ],
+      "_layout": "overview/features/install/troubleshoot"
     },
     "Txt_To_Img_Z_Image_Turbo": {
       "description": "Fast local text‑to‑image engine (Z‑Image Turbo). Runs in a dedicated <code>.zimage_env</code> so it doesn’t conflict with other backends. Optimized for low step counts (default 9) and low guidance (default CFG 0.0), with optional Attention slicing and LoRA support.",
