@@ -12,7 +12,7 @@ def _infer_image_format_from_input(job_args):
     except Exception:
         pass
     return None
-# FrameVision worker V2.0 — NCNN wiring
+# FrameVision worker - NCNN wiring
 import json, time, subprocess, os, re, shutil, sys
 from pathlib import Path
 try:
@@ -3226,7 +3226,7 @@ def handle_job(jpath: Path):
         return 1
 
 def main():
-    print("FrameVision Worker V2.2.2 Waiting for jobs in", JOBS["pending"])
+    print("FrameVision Worker V2.1.2 Waiting for jobs in", JOBS["pending"])
     while True:
         try:
             HEARTBEAT.write_text(time.strftime("%Y-%m-%d %H:%M:%S"), encoding="utf-8")

@@ -306,11 +306,11 @@ class Wan22Pane(QWidget):
         self.cmb_size = QComboBox()
         self.cmb_size.addItems([
 
-            "640*384",
-            "736*432",
-            "832*480",
-            "480*832",
-            "896*512",
+       #     "640*384",
+       #     "736*432",
+            "832*480, not working well",
+            "480*832, not working well",
+            "896*512, still bad quality",
             "512*896",
             "960*544",
             "1024*704",            

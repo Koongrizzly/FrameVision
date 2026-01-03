@@ -147,8 +147,6 @@ if __name__ == '__main__':
     main()
 """
 # Extend-chain merge seam fix (Hunyuan 1.5)
-# Hunyuan segments can "pause" for a split second at the start of each new chunk.
-# These settings help hide the join by trimming the start of appended chunks before merging.
 # - DROP_FRAMES: frames removed from the START of every appended segment (not the first).
 # - BLEND_FRAMES: optional micro crossfade length in frames (0 disables; concat-only).
 EXTEND_JOIN_DROP_FRAMES = 1
@@ -334,6 +332,9 @@ class Hunyuan15ToolWidget(QWidget):
         # Remember exact output path used for the last direct run (helps extend bookkeeping)
         self._last_run_out_path: Path | None = None
 
+        # Last completed Direct run result (used for optional auto-play)
+        self._last_direct_result_path: Path | None = None
+
         # Track what the current QProcess was launched for (install/download/generate)
         self._current_task: str | None = None
 
@@ -374,6 +375,23 @@ class Hunyuan15ToolWidget(QWidget):
         self.btn_open_out.setToolTip("Open Media Explorer and scan the current output folder.")
         self.btn_clear_log = QPushButton("Clear Log")
         self.btn_clear_log.setToolTip("Clear the log output in this panel.")
+        self.btn_play_last = QPushButton("Play last result")
+        self.btn_play_last.setCheckable(True)
+        self.btn_play_last.setChecked(False)
+        try:
+            self._update_play_last_btn_text()
+        except Exception:
+            pass
+        try:
+            self.btn_play_last.setToolTip(
+                "When enabled (Direct run / Extend mode), the last finished result will auto-play in the Media Player."
+            )
+        except Exception:
+            pass
+        try:
+            self.btn_play_last.setVisible(False)
+        except Exception:
+            pass
         self.btn_stop.setEnabled(False)
         self.btn_stop.setToolTip("Stop the currently running process (if any).")
         self.btn_queue.setToolTip(
@@ -940,6 +958,7 @@ class Hunyuan15ToolWidget(QWidget):
         btns2.addWidget(self.btn_stop)
         btns2.addWidget(self.btn_open_out)
         btns2.addWidget(self.btn_clear_log)
+        btns2.addWidget(self.btn_play_last)
         btns2.addStretch(1)
 
         # Scrollable content: settings + logs
@@ -966,6 +985,12 @@ class Hunyuan15ToolWidget(QWidget):
         self.btn_stop.clicked.connect(self.on_stop)
         self.btn_open_out.clicked.connect(self.on_view_results)
         self.btn_clear_log.clicked.connect(self.on_clear_log)
+        try:
+            # Keep a very obvious ON/OFF indicator in the button text (themes may not style :checked).
+            self.btn_play_last.toggled.connect(self._on_play_last_toggled)
+            self.btn_play_last.toggled.connect(self._schedule_persist)
+        except Exception:
+            pass
         self.btn_pick_image.clicked.connect(self.on_pick_image)
         self.btn_clear_image.clicked.connect(self.on_clear_image)
 
@@ -1162,6 +1187,15 @@ class Hunyuan15ToolWidget(QWidget):
 # Restore Queue toggle (Use Queue) — forced OFF when Extend > 0
         try:
             self._set_queue_enabled(bool(s.get("use_queue", False)), persist=False, quiet=True)
+            try:
+                if getattr(self, "btn_play_last", None) is not None:
+                    self.btn_play_last.setChecked(bool(s.get("play_last_result", False)))
+                    try:
+                        self._update_play_last_btn_text()
+                    except Exception:
+                        pass
+            except Exception:
+                pass
         except Exception:
             pass
 
@@ -1313,6 +1347,7 @@ class Hunyuan15ToolWidget(QWidget):
             v2v_enabled=bool(getattr(self, 'chk_video2video', None) and self.chk_video2video.isChecked()),
             v2v_source=str(getattr(self, '_video2video_path', '') or ''),
             use_queue=bool(getattr(self, 'btn_queue', None) and self.btn_queue.isChecked()),
+            play_last_result=bool(getattr(self, 'btn_play_last', None) and self.btn_play_last.isChecked()),
             prompt_preset=str(getattr(self, 'combo_prompt_preset', None).currentText() if getattr(self, 'combo_prompt_preset', None) is not None else "Default"),
         )
         save_settings(s)
@@ -1466,6 +1501,12 @@ class Hunyuan15ToolWidget(QWidget):
         try:
             if getattr(self, "btn_clear_log", None) is not None:
                 self.btn_clear_log.setVisible(v > 0)
+            if getattr(self, "btn_play_last", None) is not None:
+                self.btn_play_last.setVisible(v > 0)
+                try:
+                    self._update_play_last_btn_text()
+                except Exception:
+                    pass
         except Exception:
             pass
 
@@ -1477,6 +1518,27 @@ class Hunyuan15ToolWidget(QWidget):
 
         try:
             self._schedule_persist()
+        except Exception:
+            pass
+
+
+    def _update_play_last_btn_text(self) -> None:
+        """Keep the button state visually obvious even if the theme doesn't style :checked."""
+        btn = getattr(self, 'btn_play_last', None)
+        if btn is None:
+            return
+        try:
+            on = bool(btn.isChecked())
+        except Exception:
+            on = False
+        try:
+            btn.setText('Play last result: ON' if on else 'Play last result: OFF')
+        except Exception:
+            pass
+
+    def _on_play_last_toggled(self, checked: bool) -> None:
+        try:
+            self._update_play_last_btn_text()
         except Exception:
             pass
 
@@ -2724,6 +2786,11 @@ class Hunyuan15ToolWidget(QWidget):
         except Exception:
             pass
 
+        try:
+            self._last_direct_result_path = segment_path
+        except Exception:
+            pass
+
         if self._extend_remaining > 0:
             return self._start_extend_segment(segment_path)
 
@@ -2736,6 +2803,10 @@ class Hunyuan15ToolWidget(QWidget):
                 merged = None
 
             if isinstance(merged, Path) and merged.is_file():
+                try:
+                    self._last_direct_result_path = merged
+                except Exception:
+                    pass
                 try:
                     segs = []
                     try:
@@ -2866,7 +2937,27 @@ class Hunyuan15ToolWidget(QWidget):
         except Exception:
             pass
 
-        # Stop the direct-run log timer and reset UI state.
+        
+        # Auto-play last Direct run result in the internal Media Player (Direct run / Extend only)
+        try:
+            if code == 0 and (getattr(self, "_current_task", None) == "generate"):
+                try:
+                    ext_now = int(self.extend.value())
+                except Exception:
+                    ext_now = 0
+                if ext_now > 0:
+                    try:
+                        if getattr(self, "btn_play_last", None) is not None and self.btn_play_last.isChecked():
+                            p = getattr(self, "_last_direct_result_path", None)
+                            if isinstance(p, Path) and p.exists():
+                                if self._play_in_main_player(p):
+                                    self._append(f"[ui] Playing last result in Media Player:\n{p}")
+                    except Exception:
+                        pass
+        except Exception:
+            pass
+
+# Stop the direct-run log timer and reset UI state.
         try:
             self._log_flush_timer.stop()
         except Exception:
@@ -3072,6 +3163,82 @@ Pick a Start image, or enable Video→Video and pick a source video.""",
                 continue
 
         return None
+
+    def _play_in_main_player(self, media_path: Path) -> bool:
+        """Best-effort: open and play a media file in the app's internal Media Player."""
+        try:
+            p = Path(str(media_path)).expanduser()
+        except Exception:
+            return False
+        try:
+            if not p.exists():
+                return False
+        except Exception:
+            return False
+
+        main = None
+        try:
+            main = self._find_main_with_video()
+        except Exception:
+            main = None
+        if main is None:
+            return False
+
+        # Try main-window helper methods first (if present).
+        for name in ("play_path", "play_file", "open_media", "open_file", "open_path", "load_media", "load_file"):
+            try:
+                fn = getattr(main, name, None)
+                if callable(fn):
+                    fn(str(p))
+                    return True
+            except Exception:
+                pass
+
+        # Fall back to the shared video widget.
+        try:
+            video = getattr(main, "video", None)
+        except Exception:
+            video = None
+        if video is None:
+            return False
+
+        # Keep the app's tracked current_path in sync.
+        try:
+            setattr(main, "current_path", str(p))
+        except Exception:
+            pass
+
+        opened = False
+        for name in ("open", "load", "set_source", "setSource", "set_media", "setMedia"):
+            try:
+                fn = getattr(video, name, None)
+                if callable(fn):
+                    fn(str(p))
+                    opened = True
+                    break
+            except Exception:
+                pass
+        if not opened:
+            try:
+                setattr(video, "current_path", str(p))
+                opened = True
+            except Exception:
+                pass
+
+        # Start playback if possible (non-fatal if missing; some players auto-play on open()).
+        for obj in (video, getattr(video, "player", None), getattr(video, "mediaPlayer", None), getattr(video, "mp", None)):
+            if obj is None:
+                continue
+            for name in ("play", "toggle_play", "togglePlay", "start"):
+                try:
+                    fn = getattr(obj, name, None)
+                    if callable(fn):
+                        fn()
+                        return True
+                except Exception:
+                    pass
+
+        return opened
 
     def _player_position_seconds(self, video_obj) -> float | None:
         """Best-effort: extract current playback position as seconds (float)."""
