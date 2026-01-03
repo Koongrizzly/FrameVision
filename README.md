@@ -11,6 +11,7 @@ Video Walktrough (most is speedup x2 to show much in less time)
   <summary>Januari 1, 2026. V2.1.2 Happy Newyear and another update</summary>
   
 - fixed themes freezing app for 5 seconds after applying (added a 'safe apply' button if freezing comes back)
+- fixed trim tool freezinh ui while generating preview
 - fixed upscaler defaulting to 30fps
 - fixed tab integration still thinking upscaler was a main tab (finaly found why upscaler needed restart to apply new upscaler engine/model)
 - fixed compare tool crash when loading new media file while repeat button was on.
@@ -296,7 +297,6 @@ Draggable middle splitter & swap ui to make the app look the way user wants. (Dr
 
 **Not working/bugs/todo:**
 ---
-- preview timeline for cropping tool still makes the app freeze until finished building preview.
 - To many finished results in queue still makes video stutter, clean finished results manually when you see it happen.
 - image selection disabled in music video clip creator (needs to much re writing code to get it to work properly again, maybe one day
 - timeline editing in music video ceator is not working properly anymore after adding to many new features, is on todo list to fix this.
