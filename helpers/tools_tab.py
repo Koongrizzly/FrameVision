@@ -782,15 +782,57 @@ class InstantToolsPane(QWidget):
         sec_upscale = CollapsibleSection("Upscale Video and images", expanded=False)
         _upsc_wrap = QWidget(); _upscl = QVBoxLayout(_upsc_wrap); _upscl.setContentsMargins(0,0,0,0)
         _upscl.setSpacing(6)
+
+        # IMPORTANT:
+        # We used to have Upscale as a main tab. If a legacy "Upscale" tab still exists (even hidden),
+        # it can fight with this Tools-embedded instance and cause settings/engine/model to appear stale.
+        # So: if we find a legacy Upscale tab, we *move the existing upscaler pane here* and remove the tab.
+        _upsc = None
         try:
-            from helpers.upsc import UpscPane
-            _upsc = UpscPane(self)
+            tabs = getattr(self.main, "tabs", None)
+            if tabs is not None:
+                for _i in range(tabs.count()):
+                    try:
+                        _nm = (tabs.tabText(_i) or "").strip().lower()
+                    except Exception:
+                        _nm = ""
+                    if _nm == "upscale":
+                        _w = tabs.widget(_i)
+                        try:
+                            tabs.removeTab(_i)
+                        except Exception:
+                            pass
+                        # Extract actual pane (UpscTab wrapper uses .inner)
+                        _inner = getattr(_w, "inner", None)
+                        if _inner is not None:
+                            try:
+                                _inner.setParent(None)
+                            except Exception:
+                                pass
+                            _upsc = _inner
+                            try:
+                                _w.setParent(None)
+                                _w.deleteLater()
+                            except Exception:
+                                pass
+                        else:
+                            _upsc = _w
+                        break
         except Exception:
+            _upsc = None
+
+        # If no legacy tab pane exists, create a fresh UpscPane as before.
+        if _upsc is None:
             try:
                 from helpers.upsc import UpscPane
-                _upsc = UpscPane(None)
+                _upsc = UpscPane(self)
             except Exception:
-                _upsc = None
+                try:
+                    from helpers.upsc import UpscPane
+                    _upsc = UpscPane(None)
+                except Exception:
+                    _upsc = None
+
         # Wire the main-window "Upscale" button to this embedded Upscale tool.
         # (This prevents the old legacy quick-upscale popup from firing.)
         try:
@@ -1444,6 +1486,9 @@ class InstantToolsPane(QWidget):
                     elif isinstance(target, QDoubleSpinBox):
                         target.setValue(float(val))
                     elif isinstance(target, QComboBox):
+                        # Skip comboboxes marked by other tabs (e.g., upscaler engine/model)
+                        if target.property("_fv_skip_restore"):
+                            continue
                         target.setCurrentIndex(int(val))
                     elif isinstance(target, (QCheckBox, QRadioButton)):
                         target.setChecked(bool(val))

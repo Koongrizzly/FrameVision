@@ -604,48 +604,38 @@ def integrate_into_main_window(main):
     except Exception:
         pass
     
-    # Ensure "Upscale" tab at index 0 (only upscaling tab)
-    upsc_idx = None
-    for i in range(tabs.count()):
-        if (tabs.tabText(i) or '').strip().lower() == 'upscale':
-            upsc_idx = i; break
-    if upsc_idx is None:
-        try:
-            upsc_tab = UpscTab(main); tabs.insertTab(0, upsc_tab, 'Upscale'); upsc_idx = 0; main.upsc_tab = upsc_tab
-        except Exception:
-            pass
-    elif upsc_idx != 0:
-        try:
-            w = tabs.widget(upsc_idx); tabs.removeTab(upsc_idx); tabs.insertTab(0, w, 'Upscale'); main.upsc_tab = w
-        except Exception:
-            pass
 
-    # Rename/move legacy Edit -> Rife Fps at index 1
-
+    # ---- Tools owns Upscale/Rife/Describe ----
+    # IMPORTANT: Do NOT instantiate legacy tabs here. If we create them and later "hide" them,
+    # the widgets stay alive and can still auto-save settings (causing the Tools-embedded UI to
+    # appear "stuck" until restart). Instead: remove any legacy tabs if present.
     try:
-        legacy = getattr(main, 'edit', None)
-        if legacy is not None:
-            for i in range(tabs.count()):
-                if tabs.widget(i) is legacy:
-                    tabs.removeTab(i); break
-            tabs.insertTab(1, legacy, 'Rife Fps')
+        def _remove_tab(name_lower: str):
+            for _i in range(tabs.count() - 1, -1, -1):
+                _nm = (tabs.tabText(_i) or '').strip().lower()
+                if _nm == name_lower:
+                    _w = tabs.widget(_i)
+                    tabs.removeTab(_i)
+                    try:
+                        if _w is not None:
+                            _w.setParent(None)
+                            _w.deleteLater()
+                    except Exception:
+                        pass
+
+        for _nm in ("upscale", "rife fps", "rife", "edit", "describe"):
+            _remove_tab(_nm)
+
+        # Clear any stale references so the widgets can be collected
+        for _attr in ("upsc_tab", "upscaler_tab", "describer_tab"):
+            try:
+                if hasattr(main, _attr):
+                    setattr(main, _attr, None)
+            except Exception:
+                pass
     except Exception:
         pass
-    # Ensure Describe at index 2
-    desc_idx = None
-    for i in range(tabs.count()):
-        if (tabs.tabText(i) or '').strip().lower() == 'describe':
-            desc_idx = i; break
-    if desc_idx is None:
-        try:
-            dt = DescriberTab(main); tabs.insertTab(2, dt, 'Describe'); main.describer_tab = dt
-        except Exception:
-            pass
-    elif desc_idx != 2:
-        try:
-            w = tabs.widget(desc_idx); tabs.removeTab(desc_idx); tabs.insertTab(2, w, 'Describe'); main.describer_tab = w
-        except Exception:
-            pass
+
     try: _enforce_scroll_policies(main)
     except Exception: pass
     try: _wrap_video_open(main)
@@ -662,20 +652,32 @@ def integrate_into_main_window(main):
         pass
     return main
 
+
 def _hide_tools_tabs(main):
-    """Remove legacy top-level tabs that are now shown inside Tools."""
+    """Remove legacy top-level tabs that are now shown inside Tools.
+
+    IMPORTANT: removeTab() does not delete the widget. If we don't delete it,
+    hidden/removed panes can keep running timers and auto-saving settings.
+    """
     tabs = getattr(main, 'tabs', None)
     if tabs is None:
         return
     kill = {"upscale", "rife fps", "rife", "edit", "describe"}
-    # Remove from right-to-left to keep indexes stable
     for i in range(tabs.count() - 1, -1, -1):
         nm = (tabs.tabText(i) or '').strip().lower()
         if nm in kill:
             try:
+                w = tabs.widget(i)
                 tabs.removeTab(i)
+                try:
+                    if w is not None:
+                        w.setParent(None)
+                        w.deleteLater()
+                except Exception:
+                    pass
             except Exception:
                 pass
+
 def _enforce_scroll_policies(widget):
     # Apply to all QScrollArea descendants
     try:
