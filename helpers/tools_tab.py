@@ -957,8 +957,8 @@ class InstantToolsPane(QWidget):
                 pass
 
 
-        # ---- Background Remover / Inpainter ----
-        sec_bg = CollapsibleSection("Background Remover / Inpainter", expanded=False)
+        # ---- Background Remover ----
+        sec_bg = CollapsibleSection("Background Remover", expanded=False)
         try:
             install_background_tool(self, sec_bg)
         except Exception:
