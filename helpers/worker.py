@@ -37,6 +37,51 @@ def _unique_path(p: Path) -> Path:
         return Path(p)
 
 
+# --- Salvage helper: treat non-zero exit as success if output exists ---
+def _salvage_nonzero_output(code, outfile, job, label="Command"):
+    """If a tool exits non-zero but the expected output file exists and looks non-empty,
+    treat it as success (queue UX) and attach a warning + original exit code."""
+    try:
+        code_i = int(code)
+    except Exception:
+        code_i = 1
+    try:
+        if code_i in (0, 130):
+            return code_i
+        if not outfile:
+            return code_i
+        op = Path(str(outfile))
+        if not op.exists():
+            return code_i
+        try:
+            sz = int(op.stat().st_size or 0)
+        except Exception:
+            sz = 0
+        if sz <= 4096:
+            return code_i
+
+        # Mark as salvaged success
+        try:
+            job["exit_code"] = int(code_i)
+        except Exception:
+            pass
+        try:
+            prev_err = job.get("error")
+            msg = f"{label} exited with code {code_i} but output exists; marking job as done."
+            if prev_err:
+                msg = f"{msg}  (original error: {prev_err})"
+            job["warning"] = msg
+            try:
+                job.pop("error", None)
+            except Exception:
+                job["error"] = ""
+        except Exception:
+            pass
+        return 0
+    except Exception:
+        return code_i
+
+
 
 # --- Quiet mode: suppress CLIP 77-token complaints & other noisy logs ---
 try:
@@ -965,16 +1010,6 @@ def upscale_video(job, cfg, mani):
     # If UI provided a model-specific scale, honor it (prevents mismatched x2/x4 models).
     factor = int(args.get("model_scale") or args.get("factor") or 4)
     model_name_req = args.get("model", "RealESRGAN-x4plus")
-    # If the requested model encodes its own scale suffix (-x2/-x3/-x4) and UI didn't set model_scale,
-    # keep factor consistent so filenames/dimensions match what Real-ESRGAN will actually do.
-    try:
-        if not args.get("model_scale"):
-            _ms = re.search(r"(?i)-x(\d+)\s*$", str(model_name_req or ""))
-            if _ms:
-                factor = int(_ms.group(1))
-    except Exception:
-        pass
-
     model_name, exe_path = resolve_upscaler_exe(cfg, mani, model_name_req)
 
     out = out_dir / f"{inp.stem}_x{factor}.mp4"
@@ -1214,7 +1249,7 @@ def upscale_video(job, cfg, mani):
             print("[worker][upscale_video] Stage 2/3: upscaling frames...")
 
             m = str(model_name).lower()
-            if any(tag in m for tag in ("realesr", "realesrgan", "esrgan", "ultrasharp", "srmd")):
+            if ("realesr" in m) or ("realesrgan" in m):
                 cmd = build_realesrgan_cmd(
                     str(exe_path),
                     frames,
@@ -1281,7 +1316,12 @@ def upscale_video(job, cfg, mani):
                 "-movflags", "+faststart",
                 str(out)
             ]
-            if run(enc) != 0:
+            code = run(enc)
+            try:
+                code = _salvage_nonzero_output(code, out, job, label="FFmpeg encode")
+            except Exception:
+                pass
+            if int(code) != 0:
                 return 1
 
             try:
@@ -1307,6 +1347,11 @@ def upscale_video(job, cfg, mani):
 
         cmd = [FFMPEG, "-y", "-i", str(inp), "-vf", f"scale=iw*{factor}:ih*{factor}:flags=lanczos", str(out)]
         code = run(cmd)
+
+        try:
+            code = _salvage_nonzero_output(code, out, job, label="FFmpeg scale")
+        except Exception:
+            pass
 
         try:
             _progress_set(100)
@@ -1688,16 +1733,6 @@ def upscale_photo(job, cfg, mani):
     factor = int(args.get("model_scale") or args.get("factor") or 4)
     fmt = (args.get("format") or _infer_image_format_from_input(args) or "png").lower()
     model_name = args.get("model", "RealESRGAN-x4plus")
-    # If the requested model encodes its own scale suffix (-x2/-x3/-x4) and UI didn't set model_scale,
-    # keep factor consistent so filenames/dimensions match what Real-ESRGAN will actually do.
-    try:
-        if not args.get("model_scale"):
-            _ms = re.search(r"(?i)-x(\d+)\s*$", str(model_name or ""))
-            if _ms:
-                factor = int(_ms.group(1))
-    except Exception:
-        pass
-
     model_name, exe_path = resolve_upscaler_exe(cfg, mani, model_name)
     out = out_dir / f"{inp.stem}_x{factor}.{fmt}"
     out = _unique_path(out)
@@ -1734,7 +1769,7 @@ def upscale_photo(job, cfg, mani):
     try:
         if exe_path and exe_path.exists() and exe_path.is_file():
             m = str(model_name).lower()
-            if any(tag in m for tag in ("realesr", "realesrgan", "esrgan", "ultrasharp", "srmd")):
+            if ("realesr" in m) or ("realesrgan" in m):
                 models_dir_guess = None
                 try:
                     models_dir_guess = Path(exe_path).parent
@@ -1759,6 +1794,11 @@ def upscale_photo(job, cfg, mani):
                 job['cmd'] = ' '.join([str(x) for x in cmd])
             except Exception:
                 pass
+            try:
+                code = _salvage_nonzero_output(code, out, job, label="Upscaler")
+            except Exception:
+                pass
+
             # ## PATCH set produced after model-exe
             try:
                 if code == 0:
@@ -1778,6 +1818,11 @@ def upscale_photo(job, cfg, mani):
             job['cmd'] = ' '.join(str(x) for x in cmd)
         except Exception:
             pass
+        try:
+            code = _salvage_nonzero_output(code, out, job, label="Upscaler")
+        except Exception:
+            pass
+
         if code == 0:
             try: job['produced'] = str(out)
             except Exception: pass
