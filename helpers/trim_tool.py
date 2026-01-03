@@ -4,7 +4,7 @@ from __future__ import annotations
 import os, subprocess
 import sys
 from pathlib import Path
-from PySide6.QtCore import Qt, QEvent, QObject, QRect, Signal
+from PySide6.QtCore import Qt, QEvent, QObject, QRect, Signal, QThread, Slot
 from PySide6.QtGui import QPainter, QPixmap
 from helpers.batch import BatchSelectDialog
 from PySide6.QtWidgets import (
@@ -155,6 +155,68 @@ class _ResizeWatcher(QObject):
             self.pane._reflow_thumbs()
         return False
 
+
+class _ThumbGenWorker(QObject):
+    """Generate preview thumbnails in a background thread.
+
+    Emits file paths; UI thread is responsible for loading QPixmap.
+    """
+    thumbReady = Signal(int, int, str)   # index, t_ms, filepath
+    progress = Signal(int, int)         # done, total
+    finished = Signal(bool)             # cancelled?
+    error = Signal(str)
+
+    def __init__(self, video_path:str, times:list[float], out_dir:str, ffmpeg_bin:str, parent=None):
+        super().__init__(parent)
+        self.video_path = video_path
+        self.times = times
+        self.out_dir = out_dir
+        self.ffmpeg_bin = ffmpeg_bin
+        self._cancel = False
+
+    def cancel(self):
+        self._cancel = True
+
+    @Slot()
+    def run(self):
+        total = len(self.times)
+        done = 0
+        out_base = Path(self.out_dir)
+        out_base.mkdir(parents=True, exist_ok=True)
+
+        for i, t in enumerate(self.times):
+            if self._cancel:
+                self.finished.emit(True)
+                return
+
+            t_ms = int(round(float(t) * 1000.0))
+            outp = out_base / f"th_{t_ms:08d}.jpg"
+
+            try:
+                if not outp.exists():
+                    subprocess.check_call(
+                        [self.ffmpeg_bin, "-y", "-ss", f"{t:.3f}", "-i", str(self.video_path),
+                         "-frames:v", "1", "-q:v", "4", str(outp)],
+                        stdout=subprocess.DEVNULL,
+                        stderr=subprocess.DEVNULL,
+                    )
+                if outp.exists():
+                    self.thumbReady.emit(i, t_ms, str(outp))
+            except Exception as e:
+                # Keep going; missing thumbs are not fatal.
+                try:
+                    self.error.emit(str(e))
+                except Exception:
+                    pass
+
+            done += 1
+            try:
+                self.progress.emit(done, total)
+            except Exception:
+                pass
+
+        self.finished.emit(False)
+
 # ---- installer ----
 def install_trim_tool(pane, section_widget):
     # Base controls
@@ -220,41 +282,161 @@ def install_trim_tool(pane, section_widget):
         except Exception:
             pass
 
+    
     def _build_thumbs():
-        # build/rebuild labels list according to spin value
+        """Build/rebuild the preview thumbnail strip without blocking the UI."""
+        # Ensure bookkeeping attrs exist
+        if not hasattr(pane, "_thumb_gen_id"):
+            pane._thumb_gen_id = 0
+        if not hasattr(pane, "_thumb_thread"):
+            pane._thumb_thread = None
+        if not hasattr(pane, "_thumb_worker"):
+            pane._thumb_worker = None
+
+        # Cancel any previous run (won't interrupt a currently-running ffmpeg call,
+        # but prevents further UI updates from the old run).
         try:
-            p = getattr(pane.main, "current_path", None)
-            if not p: QMessageBox.information(pane, "Trim preview", "Open a video first (File ▶ Open)."); return
-            dur = _duration_seconds(p); N = int(pane.trim_thumbs_spin.value())
-            # clear existing labels from grid & list
-            grid = pane._thumb_grid
-            while grid.count():
-                it = grid.takeAt(0); w = it.widget()
-                if w: w.setParent(None)
-            pane._thumb_labels.clear()
-            base = Path("./output/_temp/trim_preview"); base.mkdir(parents=True, exist_ok=True)
-            times = [(dur*i)/(N-1) if dur>0 and N>1 else 0 for i in range(N)]
-            h = int(pane.thumb_size.value())
-            for t in times:
-                t_ms = int(round(t*1000)); outp = base / f"th_{t_ms:08d}.jpg"
+            w = getattr(pane, "_thumb_worker", None)
+            if w is not None:
                 try:
-                    subprocess.check_call([ffmpeg_path(), "-y", "-ss", f"{t:.3f}", "-i", str(p), "-frames:v","1","-q:v","4", str(outp)],
-                                          stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                    w.cancel()
                 except Exception:
-                    continue
-                pm = QPixmap(str(outp))
-                lab = _ClickableLabel(t_ms); lab.t_ms = t_ms
-                lab.setMinimumHeight(h); lab.setMaximumHeight(h)
-                lab._orig_pm = pm if not pm.isNull() else None
-                if lab._orig_pm:
-                    lab.setPixmap(lab._orig_pm.scaledToHeight(h, Qt.SmoothTransformation))
-                else:
-                    lab.setText(_fmt_ms(t_ms))
-                pane._thumb_labels.append(lab)
-            _reflow_thumbs()
-            _apply_dimming()
+                    pass
+            th = getattr(pane, "_thumb_thread", None)
+            if th is not None:
+                try:
+                    th.quit()
+                except Exception:
+                    pass
         except Exception:
             pass
+
+        try:
+            p = getattr(pane.main, "current_path", None)
+            if not p:
+                QMessageBox.information(pane, "Trim preview", "Open a video first (File ▶ Open).")
+                return
+
+            dur = _duration_seconds(p)
+            N = int(pane.trim_thumbs_spin.value())
+
+            # Clear existing labels from grid & list
+            grid = pane._thumb_grid
+            while grid.count():
+                it = grid.takeAt(0)
+                wdg = it.widget()
+                if wdg:
+                    wdg.setParent(None)
+            pane._thumb_labels.clear()
+
+            # Placeholder labels first (instant UI), then fill them asynchronously.
+            times = [(dur * i) / (N - 1) if dur > 0 and N > 1 else 0 for i in range(N)]
+            h = int(pane.thumb_size.value())
+            for t in times:
+                t_ms = int(round(t * 1000))
+                lab = _ClickableLabel(t_ms)
+                lab.t_ms = t_ms
+                lab.setMinimumHeight(h)
+                lab.setMaximumHeight(h)
+                lab._orig_pm = None
+                lab.setText(_fmt_ms(t_ms))
+                pane._thumb_labels.append(lab)
+
+            _reflow_thumbs()
+            _apply_dimming()
+
+            # Busy state
+            btn = pane.btn_trim_preview
+            btn.setEnabled(False)
+            btn.setText(f"Generating… 0/{N}")
+            try:
+                QApplication.setOverrideCursor(Qt.WaitCursor)
+            except Exception:
+                pass
+
+            # New generation id (guards stale signal delivery)
+            pane._thumb_gen_id = int(getattr(pane, "_thumb_gen_id", 0)) + 1
+            gid = pane._thumb_gen_id
+
+            # Cache thumbs per (video mtime + count)
+            base = Path("./output/_temp/trim_preview")
+            try:
+                mtime = int(Path(p).stat().st_mtime)
+            except Exception:
+                mtime = 0
+            tag = f"{Path(p).stem}_{mtime}_{N}"
+            out_dir = base / tag
+
+            worker = _ThumbGenWorker(str(p), times, str(out_dir), ffmpeg_path())
+            thread = QThread(pane)
+            worker.moveToThread(thread)
+
+            pane._thumb_worker = worker
+            pane._thumb_thread = thread
+
+            def _ui_thumb_ready(i:int, t_ms:int, fp:str, gid=gid):
+                if int(getattr(pane, "_thumb_gen_id", 0)) != gid:
+                    return
+                if i < 0 or i >= len(pane._thumb_labels):
+                    return
+                lab = pane._thumb_labels[i]
+                lab.t_ms = int(t_ms)
+                pm = QPixmap(fp)
+                if pm and not pm.isNull():
+                    lab._orig_pm = pm
+                    hh = int(pane.thumb_size.value())
+                    lab.setPixmap(pm.scaledToHeight(hh, Qt.SmoothTransformation))
+                else:
+                    lab.setText(_fmt_ms(int(t_ms)))
+
+            def _ui_progress(done:int, total:int, gid=gid):
+                if int(getattr(pane, "_thumb_gen_id", 0)) != gid:
+                    return
+                try:
+                    pane.btn_trim_preview.setText(f"Generating… {done}/{total}")
+                except Exception:
+                    pass
+
+            def _ui_finished(cancelled:bool, gid=gid):
+                if int(getattr(pane, "_thumb_gen_id", 0)) != gid:
+                    return
+                try:
+                    QApplication.restoreOverrideCursor()
+                except Exception:
+                    pass
+                try:
+                    pane.btn_trim_preview.setEnabled(True)
+                    pane.btn_trim_preview.setText("Generate preview")
+                except Exception:
+                    pass
+                _reflow_thumbs()
+                _apply_dimming()
+                try:
+                    pane._thumb_worker = None
+                    pane._thumb_thread = None
+                except Exception:
+                    pass
+
+            worker.thumbReady.connect(_ui_thumb_ready)
+            worker.progress.connect(_ui_progress)
+            worker.finished.connect(_ui_finished)
+            worker.finished.connect(thread.quit)
+            worker.finished.connect(worker.deleteLater)
+            thread.finished.connect(thread.deleteLater)
+            thread.started.connect(worker.run)
+            thread.start()
+
+        except Exception:
+            # Restore UI if something went wrong.
+            try:
+                QApplication.restoreOverrideCursor()
+            except Exception:
+                pass
+            try:
+                pane.btn_trim_preview.setEnabled(True)
+                pane.btn_trim_preview.setText("Generate preview")
+            except Exception:
+                pass
 
     def _rescale_thumbs():
         # rescale existing labels only (no ffmpeg)
@@ -417,25 +599,8 @@ def install_trim_tool(pane, section_widget):
 
     # connect
     def _on_generate_preview():
-        # show busy state while thumbnails are being generated
-        btn = pane.btn_trim_preview
-        prev = btn.text()
-        btn.setText("Generating…")
-        btn.setEnabled(False)
-        try:
-            QApplication.setOverrideCursor(Qt.WaitCursor)
-            QApplication.processEvents()
-        except Exception:
-            pass
-        try:
-            _load_preview()
-        finally:
-            try:
-                QApplication.restoreOverrideCursor()
-            except Exception:
-                pass
-            btn.setEnabled(True)
-            btn.setText(prev)
+        # Generate preview thumbnails & timeline without blocking the UI.
+        _load_preview()
 
     pane.btn_trim_preview.clicked.connect(_on_generate_preview)   # manual generate only
     # NO auto-regenerate on spin/size; size only rescales & reflows
