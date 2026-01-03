@@ -528,6 +528,92 @@ class Hunyuan15ToolWidget(QWidget):
             "After all segments are generated, merge them into a single MP4 using ffmpeg concat (fast copy when possible)."
         )
 
+        # Extend join seam-fix controls (visible only when Extend > 0)
+        # 1) Remove frames from the START of every appended segment before merging (0 disables)
+        self.extend_join_drop_slider = QSlider(Qt.Horizontal)
+        self.extend_join_drop_slider.setRange(0, 10)
+        self.extend_join_drop_slider.setSingleStep(1)
+        self.extend_join_drop_spin = QSpinBox()
+        self.extend_join_drop_spin.setRange(0, 10)
+        try:
+            self.extend_join_drop_spin.setValue(int(globals().get("EXTEND_JOIN_DROP_FRAMES", 0) or 0))
+        except Exception:
+            self.extend_join_drop_spin.setValue(0)
+
+        try:
+            tip = (
+                "Extend seam fix — remove frames from the START of every appended segment before merging.\n"
+                "0 = disabled.\n"
+                "Higher values can hide the tiny 'pause' seam, but may cut motion at the join."
+            )
+            self.extend_join_drop_slider.setToolTip(tip)
+            self.extend_join_drop_spin.setToolTip(tip)
+        except Exception:
+            pass
+
+        self.extend_join_drop_row = QWidget()
+        _dj_lay = QHBoxLayout(self.extend_join_drop_row)
+        _dj_lay.setContentsMargins(0, 0, 0, 0)
+        _dj_lay.addWidget(self.extend_join_drop_slider, 1)
+        _dj_lay.addWidget(self.extend_join_drop_spin, 0)
+        self.extend_join_drop_row.setVisible(False)
+
+        # 2) Blend frames across joins (micro crossfade) during auto-merge (0 disables)
+        self.extend_join_blend_slider = QSlider(Qt.Horizontal)
+        self.extend_join_blend_slider.setRange(0, 15)
+        self.extend_join_blend_slider.setSingleStep(1)
+        self.extend_join_blend_spin = QSpinBox()
+        self.extend_join_blend_spin.setRange(0, 15)
+        try:
+            self.extend_join_blend_spin.setValue(int(globals().get("EXTEND_JOIN_BLEND_FRAMES", 0) or 0))
+        except Exception:
+            self.extend_join_blend_spin.setValue(0)
+
+        try:
+            tip = (
+                "Extend seam fix — blend (crossfade) this many frames across joins when auto-merging.\n"
+                "0 = disabled (concat-only).\n"
+                "Uses ffmpeg xfade and requires ffprobe for accurate timing."
+            )
+            self.extend_join_blend_slider.setToolTip(tip)
+            self.extend_join_blend_spin.setToolTip(tip)
+        except Exception:
+            pass
+
+        self.extend_join_blend_row = QWidget()
+        _bj_lay = QHBoxLayout(self.extend_join_blend_row)
+        _bj_lay.setContentsMargins(0, 0, 0, 0)
+        _bj_lay.addWidget(self.extend_join_blend_slider, 1)
+        _bj_lay.addWidget(self.extend_join_blend_spin, 0)
+        self.extend_join_blend_row.setVisible(False)
+
+        # Wire seam-fix sliders <-> number boxes
+        try:
+            self._set_extend_join_drop(int(self.extend_join_drop_spin.value()))
+        except Exception:
+            pass
+        try:
+            self._set_extend_join_blend(int(self.extend_join_blend_spin.value()))
+        except Exception:
+            pass
+        try:
+            self.extend_join_drop_slider.valueChanged.connect(self._on_extend_join_drop_slider_changed)
+        except Exception:
+            pass
+        try:
+            self.extend_join_drop_spin.valueChanged.connect(self._on_extend_join_drop_spin_changed)
+        except Exception:
+            pass
+        try:
+            self.extend_join_blend_slider.valueChanged.connect(self._on_extend_join_blend_slider_changed)
+        except Exception:
+            pass
+        try:
+            self.extend_join_blend_spin.valueChanged.connect(self._on_extend_join_blend_spin_changed)
+        except Exception:
+            pass
+
+
         self.offload = QCheckBox("Enable model CPU offload")
         try:
             # Qt tooltips support rich text; we use <b> to highlight the key guidance for new users.
@@ -830,6 +916,16 @@ class Hunyuan15ToolWidget(QWidget):
         h_ext.addStretch(1)
         form.addRow(h_ext)
 
+        self.lbl_extend_join_drop = QLabel("Remove frames (seam fix):")
+        self.lbl_extend_join_blend = QLabel("Merge blend frames:")
+        try:
+            self.lbl_extend_join_drop.setVisible(False)
+            self.lbl_extend_join_blend.setVisible(False)
+        except Exception:
+            pass
+        form.addRow(self.lbl_extend_join_drop, self.extend_join_drop_row)
+        form.addRow(self.lbl_extend_join_blend, self.extend_join_blend_row)
+
         form.addRow(QLabel("Output filename:"), self.output_name)
         form.addRow(self.adv_box)
 
@@ -926,18 +1022,43 @@ class Hunyuan15ToolWidget(QWidget):
         except Exception:
             pass
         self.seed.setValue(int(s.get("seed", self.seed.value())))
+        # Extend is a one-shot mode; always start at 0 after restart.
         try:
-            self.extend.setValue(int(s.get("extend", self.extend.value())))
-        except Exception:
             self.extend.setValue(0)
+        except Exception:
+            pass
         try:
             self.extend_merge.setChecked(bool(s.get("extend_merge", self.extend_merge.isChecked())))
         except Exception:
             pass
+
+        # Extend seam-fix sliders
+        try:
+            drop = s.get("extend_join_drop_frames", None)
+            if drop is None:
+                drop = int(globals().get("EXTEND_JOIN_DROP_FRAMES", 0) or 0)
+            self._set_extend_join_drop(int(drop))
+        except Exception:
+            try:
+                self._set_extend_join_drop(int(globals().get("EXTEND_JOIN_DROP_FRAMES", 0) or 0))
+            except Exception:
+                pass
+        try:
+            blend = s.get("extend_join_blend_frames", None)
+            if blend is None:
+                blend = int(globals().get("EXTEND_JOIN_BLEND_FRAMES", 0) or 0)
+            self._set_extend_join_blend(int(blend))
+        except Exception:
+            try:
+                self._set_extend_join_blend(int(globals().get("EXTEND_JOIN_BLEND_FRAMES", 0) or 0))
+            except Exception:
+                pass
+
         try:
             self._on_extend_value_changed(int(self.extend.value()))
         except Exception:
             pass
+
         self.offload.setChecked(bool(s.get("offload", True)))
         self.attn_slicing.setChecked(bool(s.get("attn_slicing", False)))
         self.vae_slicing.setChecked(bool(s.get("vae_slicing", False)))
@@ -1006,34 +1127,39 @@ class Hunyuan15ToolWidget(QWidget):
         except Exception:
             pass
 
-        # Restore Video→Video
+        # Video→Video is a one-shot mode; always start OFF after restart.
         try:
-            self.chk_video2video.setChecked(bool(s.get("v2v_enabled", False)))
+            self.chk_video2video.setChecked(False)
         except Exception:
             pass
         try:
-            src = (s.get("v2v_source", "") or "").strip()
-            if src:
-                p = Path(src)
-                if p.exists():
-                    self._video2video_path = p
-                    try:
-                        size_mb = p.stat().st_size / (1024 * 1024)
-                        self.lbl_video2_info.setText(f"{p.name}  ({size_mb:.1f} MB)")
-                    except Exception:
-                        self.lbl_video2_info.setText(p.name)
-                else:
-                    self._video2video_path = None
+            self._video2video_path = None
+            self._v2v_last_frame = None
         except Exception:
             pass
         try:
-            self.btn_pick_v2v.setEnabled(self.chk_video2video.isChecked())
-            self.btn_use_last_v2v.setEnabled(self.chk_video2video.isChecked())
+            self.lbl_video2_info.setText("No source selected")
+        except Exception:
+            pass
+
+        # If Start image points to an auto-extracted V2V/extend frame, clear it so it can't stay active.
+        try:
+            cur_img = self._start_image_path()
+            if cur_img:
+                p = Path(cur_img)
+                if p.parent == _extend_frames_dir():
+                    self.start_image.setText("")
+        except Exception:
+            pass
+
+        try:
+            self.btn_pick_v2v.setEnabled(False)
+            self.btn_use_last_v2v.setEnabled(False)
         except Exception:
             pass
 
 
-        # Restore Queue toggle (Use Queue) — forced OFF when Extend > 0
+# Restore Queue toggle (Use Queue) — forced OFF when Extend > 0
         try:
             self._set_queue_enabled(bool(s.get("use_queue", False)), persist=False, quiet=True)
         except Exception:
@@ -1132,7 +1258,7 @@ class Hunyuan15ToolWidget(QWidget):
                 pass
 
         # spinboxes
-        for sb_name in ("frames", "steps", "fps", "bitrate_kbps", "seed", "extend"):
+        for sb_name in ("frames", "steps", "fps", "bitrate_kbps", "seed", "extend", "extend_join_drop_spin", "extend_join_blend_spin"):
             try:
                 sb = getattr(self, sb_name, None)
                 if sb is not None:
@@ -1170,6 +1296,8 @@ class Hunyuan15ToolWidget(QWidget):
             seed=int(self.seed.value()),
             extend=int(self.extend.value()),
             extend_merge=bool(self.extend_merge.isChecked()),
+            extend_join_drop_frames=int(getattr(self, "extend_join_drop_spin", None).value() if getattr(self, "extend_join_drop_spin", None) is not None else int(globals().get("EXTEND_JOIN_DROP_FRAMES", 0) or 0)),
+            extend_join_blend_frames=int(getattr(self, "extend_join_blend_spin", None).value() if getattr(self, "extend_join_blend_spin", None) is not None else int(globals().get("EXTEND_JOIN_BLEND_FRAMES", 0) or 0)),
             offload=bool(self.offload.isChecked()),
             group_offload=bool(getattr(self, 'group_offload', None) and self.group_offload.isChecked()),
             first_block_cache=bool(getattr(self, 'first_block_cache', None) and self.first_block_cache.isChecked()),
@@ -1291,46 +1419,148 @@ class Hunyuan15ToolWidget(QWidget):
             pass
 
     def _on_extend_value_changed(self, v: int) -> None:
-        """UI helper: enable auto-merge only when Extend is > 0."""
+        """UI helper for Extend mode.
+
+        Requirements:
+        - Seam-fix sliders + Cancel/Clear Log only visible when Extend > 0.
+        - Queue is forced:
+            * Extend == 0  → Queue ON (user cannot change)
+            * Extend > 0   → Queue OFF (user cannot change)
+        """
         try:
             v = int(v)
         except Exception:
             v = 0
+
         try:
             self.extend_merge.setEnabled(v > 0)
         except Exception:
             pass
 
-        # Extend is Direct-run only; disable Queue while Extend > 0.
         try:
-            ext_now = int(v)
+            if getattr(self, "extend_join_drop_row", None) is not None:
+                self.extend_join_drop_row.setVisible(v > 0)
+                try:
+                    if getattr(self, "lbl_extend_join_drop", None) is not None:
+                        self.lbl_extend_join_drop.setVisible(v > 0)
+                except Exception:
+                    pass
         except Exception:
-            ext_now = 0
+            pass
         try:
-            if ext_now > 0:
-                self._set_queue_enabled(False, persist=True, quiet=True)
+            if getattr(self, "extend_join_blend_row", None) is not None:
+                self.extend_join_blend_row.setVisible(v > 0)
                 try:
-                    self.btn_queue.setEnabled(False)
-                except Exception:
-                    pass
-            else:
-                try:
-                    self.btn_queue.setEnabled(True)
-                except Exception:
-                    pass
-                # Refresh text/tooltips (state may be unchanged)
-                try:
-                    self._set_queue_enabled(bool(self.btn_queue.isChecked()), persist=False, quiet=True)
+                    if getattr(self, "lbl_extend_join_blend", None) is not None:
+                        self.lbl_extend_join_blend.setVisible(v > 0)
                 except Exception:
                     pass
         except Exception:
             pass
 
-        # Debounced autosave
+        try:
+            if getattr(self, "btn_stop", None) is not None:
+                self.btn_stop.setVisible(v > 0)
+        except Exception:
+            pass
+        try:
+            if getattr(self, "btn_clear_log", None) is not None:
+                self.btn_clear_log.setVisible(v > 0)
+        except Exception:
+            pass
+
+        forced_queue = (v <= 0)
+        try:
+            self._set_queue_enabled(bool(forced_queue), persist=True, quiet=True)
+        except Exception:
+            pass
+
         try:
             self._schedule_persist()
         except Exception:
             pass
+
+
+    # ---------- Extend seam-fix slider helpers ----------
+
+    def _set_extend_join_drop(self, v: int) -> None:
+        try:
+            v = int(v)
+        except Exception:
+            v = 0
+        v = max(0, min(10, v))
+        try:
+            self.extend_join_drop_slider.blockSignals(True)
+            self.extend_join_drop_spin.blockSignals(True)
+            self.extend_join_drop_slider.setValue(v)
+            self.extend_join_drop_spin.setValue(v)
+        except Exception:
+            pass
+        try:
+            self.extend_join_drop_slider.blockSignals(False)
+            self.extend_join_drop_spin.blockSignals(False)
+        except Exception:
+            pass
+
+    def _set_extend_join_blend(self, v: int) -> None:
+        try:
+            v = int(v)
+        except Exception:
+            v = 0
+        v = max(0, min(15, v))
+        try:
+            self.extend_join_blend_slider.blockSignals(True)
+            self.extend_join_blend_spin.blockSignals(True)
+            self.extend_join_blend_slider.setValue(v)
+            self.extend_join_blend_spin.setValue(v)
+        except Exception:
+            pass
+        try:
+            self.extend_join_blend_slider.blockSignals(False)
+            self.extend_join_blend_spin.blockSignals(False)
+        except Exception:
+            pass
+
+    def _on_extend_join_drop_slider_changed(self, v: int) -> None:
+        try:
+            self._set_extend_join_drop(int(v))
+        except Exception:
+            pass
+        try:
+            self._schedule_persist()
+        except Exception:
+            pass
+
+    def _on_extend_join_drop_spin_changed(self, v: int) -> None:
+        try:
+            self._set_extend_join_drop(int(v))
+        except Exception:
+            pass
+        try:
+            self._schedule_persist()
+        except Exception:
+            pass
+
+    def _on_extend_join_blend_slider_changed(self, v: int) -> None:
+        try:
+            self._set_extend_join_blend(int(v))
+        except Exception:
+            pass
+        try:
+            self._schedule_persist()
+        except Exception:
+            pass
+
+    def _on_extend_join_blend_spin_changed(self, v: int) -> None:
+        try:
+            self._set_extend_join_blend(int(v))
+        except Exception:
+            pass
+        try:
+            self._schedule_persist()
+        except Exception:
+            pass
+
 
     # ---------- Queue toggle helpers ----------
 
@@ -1341,26 +1571,23 @@ class Hunyuan15ToolWidget(QWidget):
             return False
 
     def _set_queue_enabled(self, enabled: bool, persist: bool = True, quiet: bool = False) -> None:
-        """Apply Queue toggle state, update UI, and optionally persist.
+        """Apply Queue state and update UI.
 
-        Rule:
-        - If Extend > 0, Queue is forced OFF and the toggle is disabled.
+        Forced behavior:
+        - Extend == 0  → Queue ON (Generate Video queues)
+        - Extend > 0   → Queue OFF (Direct run)
+        The toggle is always non-interactive (user cannot change it).
         """
-        # Enforce Extend rule
         try:
             ext = int(self.extend.value())
         except Exception:
             ext = 0
-        if ext > 0:
-            enabled = False
 
-        # Apply checked state without recursion
+        enabled = bool(ext <= 0)
+
         try:
             self.btn_queue.blockSignals(True)
-        except Exception:
-            pass
-        try:
-            self.btn_queue.setChecked(bool(enabled))
+            self.btn_queue.setChecked(enabled)
         except Exception:
             pass
         try:
@@ -1368,30 +1595,26 @@ class Hunyuan15ToolWidget(QWidget):
         except Exception:
             pass
 
-        # Update text (simple visual hint)
+        try:
+            self.btn_queue.setEnabled(False)
+        except Exception:
+            pass
+
         try:
             self.btn_queue.setText("Use Queue ✓" if enabled else "Use Queue")
         except Exception:
             pass
 
-
-        # Update main action label based on Queue
         try:
             self.btn_generate.setText("Generate Video" if enabled else "Direct run")
         except Exception:
             pass
-        # Enable/disable toggle based on Extend
-        try:
-            self.btn_queue.setEnabled(ext <= 0)
-        except Exception:
-            pass
 
-        # Tooltips (include your requested warnings)
         try:
             q_tip = (
-                "Toggle Queue mode.\n"
-                "ON: clicking \"Generate Video\" will queue the job to the Queue tab.\n\n"
-                "Tip: Extend (extra segments) requires Direct run, so Queue is disabled while Extend > 0."
+                "Queue mode is automatic.\n\n"
+                "Extend == 0  → Queue ON (jobs go to the Queue tab).\n"
+                "Extend > 0   → Queue OFF (Direct run / extend-chain)."
             )
             self.btn_queue.setToolTip(q_tip)
         except Exception:
@@ -1400,11 +1623,10 @@ class Hunyuan15ToolWidget(QWidget):
         try:
             run_tip = (
                 "Generate Video will queue the job to the Queue tab.\n"
-                "Tip: avoid running other heavy VRAM apps at the same time.\n"
-                "Extend requires Direct run (Queue OFF)."
+                "Queue is forced ON when Extend == 0."
             ) if enabled else (
                 "Direct run starts immediately (no Queue).\n"
-                "Tip: avoid running other heavy VRAM apps at the same time."
+                "Queue is forced OFF while Extend > 0."
             )
             self.btn_generate.setToolTip(run_tip)
         except Exception:
@@ -1417,13 +1639,21 @@ class Hunyuan15ToolWidget(QWidget):
                 pass
         if (not quiet) and ext > 0:
             try:
-                self._append("[ui] Extend > 0: Queue has been disabled (Extend is Direct-run only).")
+                self._append("[ui] Extend > 0: Queue is forced OFF (Direct-run only).")
             except Exception:
                 pass
 
     def on_queue_toggled(self, checked: bool) -> None:
-        """Slot: Use Queue toggle changed."""
-        self._set_queue_enabled(bool(checked), persist=True, quiet=False)
+        """Slot: Use Queue toggle changed.
+
+        Queue is forced based on Extend, so we simply re-apply the rule.
+        """
+        try:
+            self._set_queue_enabled(bool(checked), persist=True, quiet=True)
+        except Exception:
+            pass
+
+
     # ---------- output sidecar (.json) ----------
     def _build_sidecar_meta(self, prompt: str, out_path: Path, seed: int, mode: str = "direct", extra: dict | None = None) -> dict:
         meta: dict = {}
@@ -1457,6 +1687,8 @@ class Hunyuan15ToolWidget(QWidget):
             meta["steps"] = int(self.steps.value())
             meta["fps"] = int(self.fps.value())
             meta["bitrate_kbps"] = int(self.bitrate_kbps.value())
+            meta["extend_join_drop_frames"] = int(getattr(self, "extend_join_drop_spin", None).value() if getattr(self, "extend_join_drop_spin", None) is not None else int(globals().get("EXTEND_JOIN_DROP_FRAMES", 0) or 0))
+            meta["extend_join_blend_frames"] = int(getattr(self, "extend_join_blend_spin", None).value() if getattr(self, "extend_join_blend_spin", None) is not None else int(globals().get("EXTEND_JOIN_BLEND_FRAMES", 0) or 0))
         except Exception:
             pass
 
@@ -2175,15 +2407,21 @@ class Hunyuan15ToolWidget(QWidget):
         except Exception:
             merged = root_dir() / "output" / "video" / "hunyuan15" / f"h15_extend_merged_{ts}.mp4"
 
-        # Read settings
+        # Read settings (from UI; fallback to module defaults)
         try:
-            drop_frames = int(globals().get("EXTEND_JOIN_DROP_FRAMES", 0) or 0)
+            drop_frames = int(getattr(self, "extend_join_drop_spin", None).value()) if getattr(self, "extend_join_drop_spin", None) is not None else int(globals().get("EXTEND_JOIN_DROP_FRAMES", 0) or 0)
         except Exception:
-            drop_frames = 0
+            try:
+                drop_frames = int(globals().get("EXTEND_JOIN_DROP_FRAMES", 0) or 0)
+            except Exception:
+                drop_frames = 0
         try:
-            blend_frames = int(globals().get("EXTEND_JOIN_BLEND_FRAMES", 0) or 0)
+            blend_frames = int(getattr(self, "extend_join_blend_spin", None).value()) if getattr(self, "extend_join_blend_spin", None) is not None else int(globals().get("EXTEND_JOIN_BLEND_FRAMES", 0) or 0)
         except Exception:
-            blend_frames = 0
+            try:
+                blend_frames = int(globals().get("EXTEND_JOIN_BLEND_FRAMES", 0) or 0)
+            except Exception:
+                blend_frames = 0
         try:
             fps = int(getattr(self, "fps", None).value()) if getattr(self, "fps", None) is not None else 15
         except Exception:
