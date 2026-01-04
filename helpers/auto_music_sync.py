@@ -6270,6 +6270,7 @@ class AutoMusicSyncWidget(QWidget):
         super().__init__(parent)
         self._sticky_footer = bool(sticky_footer)
         self._queue_requested = False
+        self._direct_run_active = False
         self._ffmpeg = _find_ffmpeg_from_env()
         self._ffprobe = _find_ffprobe_from_env()
         self._analysis: Optional[MusicAnalysisResult] = None
@@ -8415,6 +8416,17 @@ class AutoMusicSyncWidget(QWidget):
 
 
 
+
+        # Reset UI state
+        try:
+            self._queue_requested = False
+        except Exception:
+            pass
+        try:
+            if getattr(self, "_direct_run_active", False):
+                self._set_direct_run_active(False)
+        except Exception:
+            pass
     def _on_reset_all(self) -> None:
         """Fully reset the Music Clip Creator state and clear loaded sources."""
         # Stop any running render or background scan.
@@ -8434,6 +8446,18 @@ class AutoMusicSyncWidget(QWidget):
                 except Exception:
                     pass
                 self._scan_worker = None
+        except Exception:
+            pass
+
+
+        # Reset UI state (DIRECT RUN label / queued flag)
+        try:
+            self._queue_requested = False
+        except Exception:
+            pass
+        try:
+            if getattr(self, "_direct_run_active", False):
+                self._set_direct_run_active(False)
         except Exception:
             pass
 
@@ -10694,6 +10718,19 @@ class AutoMusicSyncWidget(QWidget):
         return None
 
 
+    def _set_direct_run_active(self, active: bool) -> None:
+        """Update the Generate button label while a DIRECT RUN is in progress."""
+        try:
+            self._direct_run_active = bool(active)
+        except Exception:
+            pass
+        try:
+            btn = getattr(self, "btn_generate", None)
+            if btn is not None:
+                btn.setText("Generating Clip" if active else "Generate Clip")
+        except Exception:
+            pass
+
 
     def _get_fixed_resolution(self) -> Tuple[int, int] | None:
         text = self.combo_res.currentText()
@@ -10725,13 +10762,30 @@ class AutoMusicSyncWidget(QWidget):
             return
         audio, video, out_dir = resolved
 
+
+        # DIRECT RUN UX: toast + button label while render is running.
+        direct_run = not bool(getattr(self, "_queue_requested", False))
+        if direct_run:
+            try:
+                self._set_direct_run_active(True)
+            except Exception:
+                pass
+            try:
+                self._show_toast("DIRECT RUN started, don't start other heavy CPU jobs while it is running.")
+            except Exception:
+                pass
+
         # Always analyze fresh for every creation so we never reuse
         # segments from a previous music track, even if paths and
         # settings look the same.
         self._on_analyze()
         if self._analysis is None:
+            try:
+                if getattr(self, "_direct_run_active", False):
+                    self._set_direct_run_active(False)
+            except Exception:
+                pass
             return
-
         # Stash paths so we can continue once the clip scan finishes.
         self._pending_audio = audio
         self._pending_video = video
@@ -10991,8 +11045,12 @@ class AutoMusicSyncWidget(QWidget):
         )
         if not segments:
             self._error("Timeline empty", "Failed to build a video timeline.")
+            try:
+                if getattr(self, "_direct_run_active", False):
+                    self._set_direct_run_active(False)
+            except Exception:
+                pass
             return
-
         fixed = self._get_fixed_resolution()
 
 
@@ -11186,7 +11244,7 @@ class AutoMusicSyncWidget(QWidget):
             pass
 
         try:
-            self._show_toast("Queued — check progress in the Queue tab.")
+            self._show_toast("Added to Queue, follow progress in the worker or the Queue Tab")
         except Exception:
             pass
 
@@ -11220,6 +11278,11 @@ class AutoMusicSyncWidget(QWidget):
             self._pending_audio = None
             self._pending_video = None
             self._pending_out_dir = None
+            try:
+                if getattr(self, "_direct_run_active", False):
+                    self._set_direct_run_active(False)
+            except Exception:
+                pass
             return
 
         if not (self._pending_audio and self._pending_video and self._pending_out_dir):
@@ -11230,6 +11293,11 @@ class AutoMusicSyncWidget(QWidget):
             self._pending_audio = None
             self._pending_video = None
             self._pending_out_dir = None
+            try:
+                if getattr(self, "_direct_run_active", False):
+                    self._set_direct_run_active(False)
+            except Exception:
+                pass
             return
 
         # Cache discovered sources for the UI list
@@ -11260,6 +11328,18 @@ class AutoMusicSyncWidget(QWidget):
         self._pending_video = None
         self._pending_out_dir = None
 
+
+        # Reset UI state (DIRECT RUN label / queued flag) after scan errors.
+        try:
+            self._queue_requested = False
+        except Exception:
+            pass
+        try:
+            if getattr(self, "_direct_run_active", False):
+                self._set_direct_run_active(False)
+        except Exception:
+            pass
+
         if msg.startswith("__no_clips__"):
             self._error("No video clips", "Could not find any usable video sources.")
         elif msg.startswith("__all_short__"):
@@ -11288,6 +11368,12 @@ class AutoMusicSyncWidget(QWidget):
             self.progress.setFormat(msg)
 
     def _on_worker_finished(self, out_path: str) -> None:
+        try:
+            if getattr(self, "_direct_run_active", False):
+                self._set_direct_run_active(False)
+        except Exception:
+            pass
+
         self.progress.setValue(100)
         self.progress.setFormat("Done.")
         QMessageBox.information(
@@ -11299,6 +11385,12 @@ class AutoMusicSyncWidget(QWidget):
         self._worker = None
 
     def _on_worker_failed(self, msg: str) -> None:
+        try:
+            if getattr(self, "_direct_run_active", False):
+                self._set_direct_run_active(False)
+        except Exception:
+            pass
+
         self.progress.setValue(0)
         self.progress.setFormat("Failed.")
         self._error("Music Clip Creator failed", msg)

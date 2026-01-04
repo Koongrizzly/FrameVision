@@ -4,7 +4,7 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
-from PySide6.QtCore import Qt, QUrl
+from PySide6.QtCore import Qt, QUrl, QEvent
 from PySide6.QtCore import QThread, Signal
 from PySide6.QtGui import QAction, QDesktopServices
 from PySide6.QtWidgets import (
@@ -94,6 +94,7 @@ class KnowledgeDialog(QDialog):
         self.search = QLineEdit(self)
         self.search.setPlaceholderText("Type a question or keywords… (Enter to search)")
         self.search.returnPressed.connect(self.perform_search)
+        self.search.installEventFilter(self)
 
         self.list = QListWidget(self)
         self.list.currentItemChanged.connect(self._on_item_changed)
@@ -119,11 +120,25 @@ class KnowledgeDialog(QDialog):
         # Buttons
         buttons = QDialogButtonBox(QDialogButtonBox.Close, self)
         buttons.rejected.connect(self.reject)
+        close_btn = buttons.button(QDialogButtonBox.Close)
+        if close_btn is not None:
+            close_btn.setAutoDefault(False)
+            close_btn.setDefault(False)
+            close_btn.setFocusPolicy(Qt.NoFocus)
         right.addWidget(buttons)
 
         # Data
         self.kb = _load_kb()
         self._populate_sections()
+
+
+    def eventFilter(self, obj, event):
+        # Prevent Enter/Return in the search box from activating the dialog's Close button.
+        if obj is getattr(self, "search", None) and event.type() == QEvent.KeyPress:
+            if event.key() in (Qt.Key_Return, Qt.Key_Enter):
+                self.perform_search()
+                return True
+        return super().eventFilter(obj, event)
 
     def _populate_sections(self):
         self.list.clear()
