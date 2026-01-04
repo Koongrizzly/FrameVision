@@ -288,13 +288,68 @@ def _theme_row(page: QWidget) -> QWidget:
     box = QComboBox()
     box.addItems([
         "Day", "Pastel Light", "Solarized Light", "Sunburst", "Cloud Grey", "Signal Grey",
-        "Evening", "Night", "Graphite Dusk", "Slate", "High Contrast", "Cyberpunk", "Neon", "Ocean", "CRT", "Aurora",
-        "Mardi Gras", "Tropical Fiesta", "Color Mix", "Candy Pop", "Rainbow Riot", "Random", "Auto"
+        "Evening", "Night", "Graphite Dusk", "Slate", "High Contrast", "NeonGreen", "Ocean", "CRT", "Aurora",
+        "Purple Life", "Tropical Fiesta", "Cyberpunk", "Color Mix", "Candy Pop", "Rainbow Riot", "Random"
     ])
+
+    # "Just enough" width: size to the longest theme name + padding (avoid huge popup).
+    try:
+        fm = box.fontMetrics()
+        longest_px = 0
+        for i in range(box.count()):
+            t = box.itemText(i)
+            try:
+                longest_px = max(longest_px, int(fm.horizontalAdvance(t)))
+            except Exception:
+                pass
+
+        extra_px = 60  # arrow/margins/scrollbar safety padding
+        try:
+            st = box.style()
+            if st is not None:
+                extra_px = int(
+                    st.pixelMetric(QtWidgets.QStyle.PM_ScrollBarExtent)
+                    + st.pixelMetric(QtWidgets.QStyle.PM_DefaultFrameWidth) * 2
+                    + 44
+                )
+        except Exception:
+            pass
+
+        w = max(220, min(420, longest_px + extra_px))
+        box.setMinimumWidth(int(w))
+        box.setMaximumWidth(int(w))
+        box.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Fixed)
+
+        if box.view() is not None:
+            box.view().setMinimumWidth(int(w))
+    except Exception:
+        pass
 
     try:
         cur = (config.get("theme") or "Auto")
+
+        # Backwards compatibility: older builds used "Mardi Gras".
+        try:
+            if isinstance(cur, str):
+                _n = cur.strip().lower()
+                if _n in ("mardi gras", "mardi grass", "mardigras", "mardigrass"):
+                    cur = "Purple Life"
+                    try:
+                        config["theme"] = cur
+                    except Exception:
+                        pass
+        except Exception:
+            pass
+
         idx = box.findText(cur)
+        if idx < 0:
+            # Extra fallback for odd stored variants.
+            try:
+                if isinstance(cur, str) and cur.strip().lower() in ("purplelife",):
+                    idx = box.findText("Purple Life")
+            except Exception:
+                pass
+
         box.setCurrentIndex(max(0, idx))
     except Exception:
         pass

@@ -1,0 +1,551 @@
+animated_buttons.py:7:from PySide6.QtCore import Qt, QSettings, QTimer, QEvent
+animated_buttons.py:190:    - Enabled/disabled + mode are stored in QSettings under:
+animated_buttons.py:197:    _KEYWORDS = ("view results", "queue", "restart app", "restart app", "analyze", "clear program cache", "apply","show qsettings in cmd")
+animated_buttons.py:203:        self.s = QSettings("FrameVision", "FrameVision")
+audiotool.py:8:from PySide6.QtCore import Qt, QSettings
+audiotool.py:93:def _candidate_ff_bins(settings:QSettings):
+audiotool.py:94:    override = settings.value("ffmpeg_path", "")
+audiotool.py:112:def _candidate_probe_bins(settings:QSettings):
+audiotool.py:113:    override = settings.value("ffprobe_path", "")
+audiotool.py:139:def ffmpeg_path(settings:QSettings):
+audiotool.py:143:def ffprobe_path(settings:QSettings):
+audiotool.py:218:            settings = QSettings("FrameVision", "AudioTool")
+audiotool.py:612:    settings = QSettings("FrameVision", "AudioTool")
+audiotool.py:614:        vol_slider.setValue(int(settings.value("volume_pct", 100)))
+audiotool.py:615:        spin_fadein.setValue(int(settings.value("fadein", 0)))
+audiotool.py:616:        spin_fadeout_d.setValue(int(settings.value("fadeout_d", 0)))
+audiotool.py:617:        edit_ss.setText(settings.value("trim_ss", ""))
+audiotool.py:618:        edit_to.setText(settings.value("trim_to", ""))
+audiotool.py:619:        spin_delay.setValue(int(settings.value("delay_ms", 0)))
+audiotool.py:620:        cb_loudnorm.setChecked(bool(int(settings.value("loudnorm", 0))))
+audiotool.py:621:        fmt.setCurrentText(settings.value("fmt", "mp4"))
+audiotool.py:622:        onebyone = bool(int(settings.value("mix_onebyone", 0)))
+audiotool.py:625:        xfade_slider.setValue(int(settings.value("mix_fade_sec", 3)))
+audiotool.py:627:        cb_include_original.setChecked(bool(int(settings.value("include_orig", 1))))
+audiotool.py:628:        edit_ffpath.setText(settings.value("ffmpeg_path", ""))
+audiotool.py:629:        edit_fbpath.setText(settings.value("ffprobe_path", ""))
+audiotool.py:630:        recent = settings.value("recent_files", "")
+audiotool.py:637:        settings.setValue("volume_pct", vol_slider.value())
+audiotool.py:638:        settings.setValue("fadein", spin_fadein.value())
+audiotool.py:639:        settings.setValue("fadeout_d", spin_fadeout_d.value())
+audiotool.py:640:        settings.setValue("trim_ss", edit_ss.text())
+audiotool.py:641:        settings.setValue("trim_to", edit_to.text())
+audiotool.py:642:        settings.setValue("delay_ms", spin_delay.value())
+audiotool.py:643:        settings.setValue("loudnorm", int(cb_loudnorm.isChecked()))
+audiotool.py:644:        settings.setValue("fmt", fmt.currentText())
+audiotool.py:645:        settings.setValue("include_orig", int(cb_include_original.isChecked()))
+audiotool.py:646:        settings.setValue("mix_onebyone", int(rb_mix_seq.isChecked()))
+audiotool.py:647:        settings.setValue("mix_fade_sec", int(xfade_slider.value()))
+audiotool.py:648:        settings.setValue("ffmpeg_path", edit_ffpath.text().strip())
+audiotool.py:649:        settings.setValue("ffprobe_path", edit_fbpath.text().strip())
+audiotool.py:651:        settings.setValue("recent_files", "|".join(files))
+audiotool.py:657:        start_dir = settings.value("last_dir", "")
+audiotool.py:662:                settings.setValue("last_dir", str(Path(paths[0]).parent))
+auto_music_sync.py:27:from PySide6.QtCore import Qt, QThread, Signal, QSettings, QTimer, QPropertyAnimation, QEasingCurve
+auto_music_sync.py:6301:        self._settings = QSettings("FrameVision", "MusicClipCreator")
+auto_music_sync.py:8530:                self._settings.setValue("output_path", out_keep)
+auto_music_sync.py:8806:        """Load last-used paths and options from QSettings."""
+auto_music_sync.py:9157:        """Save last-used paths and options to QSettings."""
+bug_reporter.py:105:        from PySide6.QtCore import QSettings
+bug_reporter.py:106:        self._settings = QSettings()
+bug_reporter.py:108:        self.ed_host = QLineEdit(self._settings.value("bugreport/smtp_host", ""))
+bug_reporter.py:109:        self.sp_port = QSpinBox(); self.sp_port.setRange(1,65535); self.sp_port.setValue(int(self._settings.value("bugreport/smtp_port", 587)))
+bug_reporter.py:110:        self.ed_user = QLineEdit(self._settings.value("bugreport/smtp_user", ""))
+bug_reporter.py:121:        from PySide6.QtCore import QSettings
+bug_reporter.py:123:            s = QSettings()
+describer.py:8:from PySide6.QtCore import QEvent, QSettings, QSize, QTimer, Qt
+describer.py:32:def _settings() -> QSettings:
+describer.py:33:    return QSettings(APP_ORG, APP_NAME)
+describer.py:359:        s_threads = QSettings("FrameVision","FrameVision")
+describer.py:362:        self.spin_cpu.valueChanged.connect(lambda v: QSettings("FrameVision","FrameVision").setValue("describe_cpu_threads", int(v)))
+describer.py:570:        self.engine_key = self.combo_engine.currentData()
+describer.py:828:    from PySide6.QtCore import Qt, QSettings, QBuffer, QByteArray, QThread, Signal, Slot
+describer.py:1214:            s = QSettings("FrameVision","FrameVision")
+describer.py:1217:            combo.currentTextChanged.connect(lambda v: QSettings("FrameVision","FrameVision").setValue("describe_preset", v))
+describer_promptify.py:5:from PySide6.QtCore import QSettings
+describer_promptify.py:9:def _S() -> QSettings:
+describer_promptify.py:10:    s = QSettings(ORG, APP); s.sync(); return s
+diagnostics.py:6:from PySide6.QtCore import QSettings, QTimer, Qt
+diagnostics.py:22:        s = QSettings(APP_ORG, APP_NAME)
+diagnostics.py:135:            s = QSettings(APP_ORG, APP_NAME)
+diagnostics.py:195:def dump_qsettings(prefix: Optional[str]=None) -> None:
+diagnostics.py:197:        s = QSettings(APP_ORG, APP_NAME); keys = sorted(list(s.allKeys()))
+diagnostics.py:198:        log(f"QSettings dump ({len(keys)} keys){' — ' + prefix if prefix else ''}:")
+diagnostics.py:203:    except Exception as e: log("QSettings dump failed:", e)
+diagnostics.py:236:        # Optional probes (controlled by env or QSettings)
+diagnostics.py:237:        s = QSettings(APP_ORG, APP_NAME)
+diagnostics.py:251:        QTimer.singleShot(2600, lambda: dump_qsettings("startup"))
+frames.py:61:from PySide6.QtCore import QSettings
+frames.py:331:        settings = QSettings("FrameVision", "FrameVision")
+frames.py:337:            start = settings.value("frames/join_last_dir", "") or ""
+frames.py:352:            settings.setValue("frames/join_last_dir", folder)
+frames.py:466:    settings = QSettings("FrameVision", "FrameVision")
+frames.py:467:    start = settings.value("frames/last_dir", "") or ""
+frames.py:473:            settings.setValue("frames/last_dir", os.path.dirname(files[0]))
+frames.py:508:    settings = QSettings("FrameVision", "FrameVision")
+frames.py:509:    start = settings.value("frames/last_dir", "") or ""
+frames.py:515:        settings.setValue("frames/last_dir", os.path.dirname(path))
+frames.py:561:    # Persist selected format (PNG/JPG) via QSettings
+frames.py:562:    settings = QSettings("FrameVision", "FrameVision")
+frames.py:563:    saved_fmt = str(settings.value("frames/format", "png")).lower()
+frames.py:568:        settings.setValue("frames/format", t.lower())
+frames.py:571:    saved_step = int(settings.value("frames/step", 1)) if settings.value("frames/step", None) is not None else 1
+frames.py:576:        settings.setValue("frames/step", int(v))
+frames.py:595:    saved_join_fps = settings.value("frames/join_fps", 30)
+frames.py:604:        settings.setValue("frames/join_fps", int(v))
+framevision_app.py:192:from PySide6.QtCore import QUrl, QSettings
+framevision_app.py:3640:            from PySide6.QtCore import QUrl, QSettings
+framevision_app.py:3642:            ini = str(QSettings('FrameVision','FrameVision').value('perf_safe','0')).lower() in ('1','true','on','yes')
+framevision_app.py:4150:            s = QSettings("FrameVision", "FrameVision")
+framevision_app.py:4157:            s = QSettings("FrameVision", "FrameVision")
+framevision_app.py:4247:            s = QSettings("FrameVision", "FrameVision")
+gif.py:601:        from PySide6.QtCore import QSettings, Qt
+gif.py:702:                settings = QSettings("FrameVision", "FrameVision")
+gif.py:703:                start = settings.value("tools/export_gif/images_last_dir", "")
+gif.py:726:                        if settings: settings.setValue("tools/export_gif/images_last_dir", common)
+gif.py:740:                        if settings: settings.setValue("tools/export_gif/images_last_dir", folder)
+gif.py:847:                settings = QSettings('FrameVision', 'FrameVision')
+gif.py:848:                settings.setValue('tools/export_gif/last_save_dir', str(sp.parent))
+good.py:48:from PySide6.QtCore import Qt, QThread, Signal, QSettings
+good.py:1132:        self._settings = QSettings("FrameVision", "MusicClipCreator")
+good.py:1543:        """Load last-used paths and options from QSettings."""
+good.py:1572:        """Save last-used paths and options to QSettings."""
+interp.py:9:from PySide6.QtCore import Qt, QSettings, QTimer, QUrl, QProcess, QCoreApplication, QThread, QSize
+interp.py:333:        self.settings = QSettings("FrameVision","FrameVision")
+interp.py:516:        self.combo_model = QComboBox()
+interp.py:518:            self.combo_model.addItem(title, key)
+interp.py:519:        mp.addWidget(self.combo_model)
+interp.py:593:        self.combo_model.setToolTip("RIFE model (used by the NCNN path).")
+interp.py:609:        self.combo_model.currentIndexChanged.connect(self._on_model_changed)
+interp.py:703:        self._kv_write("rife/model_key", self.combo_model.currentData())
+interp.py:751:        self.combo_model.blockSignals(True)
+interp.py:787:        migrated_v3 = int(self.settings.value("rife/migrated_superfast_default_v3", 0))
+interp.py:801:        self.combo_model.blockSignals(False)
+interp.py:812:        s.setValue('rife/model_key', self.combo_model.currentData())
+interp.py:834:        idx = max(0, self.combo_model.findData(key))
+interp.py:835:        self.combo_model.setCurrentIndex(idx)
+interp.py:843:        key = self.combo_model.currentData()
+interp.py:865:            key = self.combo_model.currentData()
+interp.py:966:        key = self.combo_model.currentData()
+interp.py:1070:        self.settings.setValue("rife/last_output", str(out_path))
+interp.py:1255:                    self.settings.setValue("rife/last_output", outp)
+interp.py:1261:                        self.settings.setValue("rife/last_output", prod)
+interp.py:1831:    from PySide6.QtCore import QTimer, QSettings
+interp.py:1866:        s = getattr(self, 'settings', QSettings('FrameVision', 'FrameVision'))
+interp.py:1891:        if hasattr(self, 'combo_model') and self.combo_model is not None:
+interp.py:1892:            mk = self.combo_model.currentData()
+interp.py:1894:            if s is not None: s.setValue('combo/interp_model', int(self.combo_model.currentIndex()))
+interp.py:1905:        s = getattr(self, 'settings', QSettings('FrameVision', 'FrameVision'))
+interp.py:1925:        if hasattr(self, 'combo_model') and self.combo_model is not None:
+interp.py:1926:            mk = _get('rife/model_key', s.value('rife/model_key', self.combo_model.currentData(), str) if s is not None else None, self.combo_model.currentData())
+interp.py:1927:            j = self.combo_model.findData(mk)
+interp.py:1928:            if j >= 0: self.combo_model.setCurrentIndex(j)
+interp.py:1935:            self.combo_model.setObjectName('interp_model')
+interp.py:1951:        for name in ('combo_speed','combo_model'):
+intro_data.py:5:from PySide6.QtCore import QSettings
+intro_data.py:17:    s = QSettings(ORG, APP)
+intro_data.py:45:    s = QSettings(ORG, APP)
+intro_screen.py:6:from PySide6.QtCore import Qt, QSettings, QTimer, QEventLoop, QRect, QSize
+intro_screen.py:91:    s = QSettings(ORG, APP); theme = (s.value("theme","") or "").lower()
+intro_screen.py:174:        s = QSettings(ORG, APP)
+kv_index.py:5:from PySide6.QtCore import Qt, QTimer, QSettings
+kv_index.py:115:    s = QSettings(ORG, APP)
+kv_index.py:135:    s = QSettings(ORG, APP); theme = (s.value("theme","") or "").lower()
+media_explorer_tab.py:1786:        self._settings = QtCore.QSettings()
+media_explorer_tab.py:1789:        # Favorites (persisted via QSettings)
+media_explorer_tab.py:1805:        # Remember last scanned folder between runs (QSettings).
+media_explorer_tab.py:2390:                col = self._settings.value(f"{self._settings_group}/sort_col", None)
+media_explorer_tab.py:2391:                order = self._settings.value(f"{self._settings_group}/sort_order", None)
+media_explorer_tab.py:2491:            raw = self._settings.value(self._favorites_settings_key(), "")
+media_explorer_tab.py:2518:            self._settings.setValue(self._favorites_settings_key(), json.dumps(paths))
+media_explorer_tab.py:3367:            v = self._settings.value(self._last_folder_settings_key(), "")
+media_explorer_tab.py:3388:            self._settings.setValue(self._last_folder_settings_key(), folder)
+media_explorer_tab.py:4003:            col = self._settings.value(f"{self._settings_group}/sort_col", None)
+media_explorer_tab.py:4004:            order = self._settings.value(f"{self._settings_group}/sort_order", None)
+media_explorer_tab.py:4006:                self._settings.setValue(f"{self._settings_group}/sort_col", int(Column.MODIFIED))
+media_explorer_tab.py:4007:                self._settings.setValue(f"{self._settings_group}/sort_order", int(QtCore.Qt.SortOrder.DescendingOrder))
+media_explorer_tab.py:4158:                self._settings.setValue(f"{self._settings_group}/row_height", row_h)
+media_explorer_tab.py:4171:                    self._settings.setValue(f"{self._settings_group}/header_state", state)
+media_explorer_tab.py:4180:                self._settings.setValue(f"{self._settings_group}/header_order_json", json.dumps(order))
+media_explorer_tab.py:4181:                self._settings.setValue(f"{self._settings_group}/header_sizes_json", json.dumps(sizes))
+media_explorer_tab.py:4187:                self._settings.setValue(f"{self._settings_group}/sort_col", int(hh.sortIndicatorSection()))
+media_explorer_tab.py:4188:                self._settings.setValue(f"{self._settings_group}/sort_order", int(hh.sortIndicatorOrder()))
+media_explorer_tab.py:4216:                st = self._settings.value(f"{self._settings_group}/header_state", None)
+media_explorer_tab.py:4226:                    b64 = self._settings.value(f"{self._settings_group}/header_state_b64", "")
+media_explorer_tab.py:4241:                order_s = self._settings.value(f"{self._settings_group}/header_order_json", "")
+media_explorer_tab.py:4242:                sizes_s = self._settings.value(f"{self._settings_group}/header_sizes_json", "")
+media_explorer_tab.py:4292:                row_h = self._settings.value(f"{self._settings_group}/row_height", None)
+media_explorer_tab.py:4311:                col = self._settings.value(f"{self._settings_group}/sort_col", None)
+media_explorer_tab.py:4312:                order = self._settings.value(f"{self._settings_group}/sort_order", None)
+media_explorer_tab.py:4325:            col = self._settings.value(f"{self._settings_group}/sort_col", None)
+media_explorer_tab.py:4326:            order = self._settings.value(f"{self._settings_group}/sort_order", None)
+meme_tool.py:9:from PySide6.QtCore import Qt, QRectF, QPointF, QSettings, Signal
+meme_tool.py:669:        self.settings = QSettings("FrameVision","FrameVision")
+meme_tool.py:670:        self._last_dir = self.settings.value("meme/last_dir","") or ""
+meme_tool.py:717:            paths_json = self.settings.value("meme/extra_fonts","[]")
+meme_tool.py:730:            paths_json = self.settings.value("meme/extra_fonts","[]")
+meme_tool.py:734:            self.settings.setValue("meme/extra_fonts", json.dumps(paths))
+meme_tool.py:1282:                self.settings.setValue("meme/glow", v)
+meme_tool.py:1315:            self.def_track = float(val); self.settings.setValue("meme/track", float(val))
+meme_tool.py:1424:                self._crop_overlay.handle_size = float(self.settings.value('meme/crop_handle', 18))
+meme_tool.py:1425:                alpha = int(self.settings.value('meme/crop_opacity', 120))
+meme_tool.py:1436:            self.settings.setValue('meme/crop_handle', int(self.sl_handle.value()))
+meme_tool.py:1437:            self.settings.setValue('meme/crop_opacity', int(self.sl_opacity.value()))
+menu_file.py:11:from PySide6.QtCore import QEvent, QObject, QProcess, QSettings, QUrl, Qt, QPoint
+menu_file.py:114:        s = QSettings(ORG, APP)
+menu_file.py:128:        s=QSettings(ORG,APP); s.setValue("last_open_file", path)
+menu_file.py:183:        s = QSettings(ORG, APP)
+menu_file.py:212:        s = QSettings(ORG, APP)
+menu_file.py:248:        s=QSettings(ORG,APP); v=s.value(key, [])
+menu_file.py:259:        s=QSettings(ORG,APP); s.setValue(key, items)
+menu_file.py:292:        s=QSettings(ORG,APP); s.setValue(LAST_CLOSED_KEY, path)
+menu_file.py:298:        s=QSettings(ORG,APP); v=s.value(LAST_CLOSED_KEY, "")
+menu_file.py:441:    s = QSettings(ORG, APP)
+menu_file.py:870:        d = QSettings(ORG, APP).value("last_open_dir", str(Path.home()))
+menu_file.py:879:        s = QSettings(ORG, APP); s.setValue("last_open_dir", str(p.parent))
+menu_file.py:1054:                        s = QSettings(ORG, APP)
+no collapsbox settings_tab.py:4:from PySide6.QtCore import Qt, QSettings, QTimer
+no collapsbox settings_tab.py:151:    _s = QSettings("FrameVision", "FrameVision")
+no collapsbox settings_tab.py:175:    s = QSettings("FrameVision","FrameVision")
+no collapsbox settings_tab.py:564:            s = QSettings("FrameVision", "FrameVision")
+no collapsbox settings_tab.py:773:    btn_dump = QPushButton("Show QSettings in CMD")
+no collapsbox settings_tab.py:776:            from helpers.diagnostics import dump_qsettings
+no collapsbox settings_tab.py:777:            dump_qsettings("manual")
+no collapsbox settings_tab.py:823:            s = QSettings('FrameVision','FrameVision')
+no collapsbox settings_tab.py:1099:    show_labels = _emoji_tabs_show_labels_qsettings()
+no collapsbox settings_tab.py:1144:def _emoji_enabled_qsettings() -> bool:
+no collapsbox settings_tab.py:1146:        s = QSettings("FrameVision","FrameVision")
+no collapsbox settings_tab.py:1150:def _emoji_set_enabled_qsettings(val: bool) -> None:
+no collapsbox settings_tab.py:1152:        s = QSettings("FrameVision","FrameVision")
+no collapsbox settings_tab.py:1157:def _emoji_tabs_show_labels_qsettings() -> bool:
+no collapsbox settings_tab.py:1160:        s = QSettings("FrameVision","FrameVision")
+no collapsbox settings_tab.py:1167:        if _emoji_enabled_qsettings():
+old framevision_app.py:186:from PySide6.QtCore import QUrl, QSettings
+old framevision_app.py:3198:            from PySide6.QtCore import QUrl, QSettings
+old framevision_app.py:3200:            ini = str(QSettings('FrameVision','FrameVision').value('perf_safe','0')).lower() in ('1','true','on','yes')
+old framevision_app.py:4762:            s = QSettings("FrameVision", "FrameVision")
+old framevision_app.py:4769:            s = QSettings("FrameVision", "FrameVision")
+old framevision_app.py:4815:            s = QSettings("FrameVision", "FrameVision")
+overlay_animations.py:267:# Convenience: start overlay based on QSettings + theme
+overlay_animations.py:288:    """Reads QSettings for intro overlay and starts/stops accordingly.
+overlay_animations.py:295:        from PySide6.QtCore import QSettings
+overlay_animations.py:296:        s = QSettings("FrameVision","FrameVision")
+prompt.py:813:        self.combo_model = QComboBox()
+prompt.py:814:        self.combo_model.setToolTip(
+prompt.py:823:            self.combo_model.addItem("Qwen3-VL (auto)", "")
+prompt.py:826:                self.combo_model.addItem(label, k)
+prompt.py:829:            idx = max(0, self.combo_model.findData(want_key))
+prompt.py:830:            self.combo_model.setCurrentIndex(idx)
+prompt.py:955:        form.addRow("Model", self.combo_model)
+prompt.py:1128:        for w in (self.style, self.neg, self.combo_model, self.combo_len, self.combo_target, self.combo_preset):
+prompt.py:1253:            "model_key": self.combo_model.currentData() or "",
+prompt.py:1391:        self.combo_model.setEnabled(not busy)
+prompt.py:1544:        model_key = self.combo_model.currentData() or ""
+prompt.py:1681:            "model_key": self.combo_model.currentData() or "",
+queue_adapter.py:96:    engine = (_read_field(inner, ['combo_engine', 'engine_combo', 'combo_upscale_engine'], getter='currentText') or '').lower()
+queue_adapter.py:103:        'combo_engine', 'engine_combo', 'combo_upscale_engine',
+queue_adapter.py:139:                for attr in ['combo_model_realsr', 'combo_model_realesrgan', 'combo_model_esrgan']:
+queue_adapter.py:144:                for attr in ['combo_model_w2x', 'combo_model_waifu2x', 'combo_model_waifu']:
+queue_adapter.py:149:                combo = getattr(inner, 'combo_model_ultrasharp', None)
+queue_adapter.py:151:                for attr in ['combo_model_srmd_realsr', 'combo_model_srmd_realesrgan', 'combo_model_srmd']:
+queue_adapter.py:178:            model = _read_field(inner, ['combo_model_w2x', 'combo_model_waifu', 'combo_model_waifu2x'], getter='currentText')
+queue_adapter.py:181:            model = _read_field(inner, ['combo_model_ultrasharp'], getter='currentText')
+queue_adapter.py:185:            model = _read_field(inner, ['combo_model_srmd_realsr', 'combo_model_srmd_realesr', 'combo_model_srmd_realesrgan'], getter='currentText')
+queue_adapter.py:187:                model = _read_field(inner, ['combo_model_srmd'], getter='currentText')
+queue_adapter.py:190:            model = _read_field(inner, ['combo_model_realsr_ncnn', 'combo_model_realsrgan_ncnn'], getter='currentText')
+queue_adapter.py:193:            model = _read_field(inner, ['combo_model_realsr', 'combo_model_realesrgan', 'combo_model_esrgan'], getter='currentText')
+queue_adapter.py:201:                'combo_model_realsr',
+queue_adapter.py:202:                'combo_model_realsr_ncnn',
+queue_adapter.py:203:                'combo_model_ultrasharp',
+queue_adapter.py:204:                'combo_model_srmd_realsr',
+queue_adapter.py:205:                'combo_model_srmd',
+queue_adapter.py:206:                'combo_model_w2x',
+queue_adapter.py:207:                'combo_model',
+queue_adapter.py:273:    engine = _read_field(inner, ['combo_engine', 'engine_combo', 'combo_upscale_engine'], getter='currentText')
+queue_adapter.py:274:    engine_exe = _read_field(inner, ['combo_engine', 'engine_combo', 'combo_upscale_engine'], getter='currentData')
+queue_system.py:116:        s = QSettings('FrameVision','FrameVision')
+rife_core.py:9:  - Persist choices to QSettings so the UI/worker can read them.
+rife_core.py:24:    # Persist to QSettings if available (UI side)
+rife_core.py:26:        from PySide6.QtCore import QSettings
+rife_core.py:27:        s = QSettings("FrameVision","FrameVision")
+rife_core.py:49:        from PySide6.QtCore import QSettings
+rife_core.py:50:        s = QSettings("FrameVision","FrameVision")
+safe_scale.py:67:            if "Real-ESRGAN" not in str(self.combo_engine.currentText()):
+safe_scale.py:70:            model = self.combo_model_realsr.currentText()
+safe_scale.py:88:            if "Real-ESRGAN" not in str(self.combo_engine.currentText()):
+safe_scale.py:92:            model = self.combo_model_realsr.currentText()
+safe_scale.py:154:                    exe = self.combo_engine.currentData()
+safe_scale.py:182:            if "Real-ESRGAN" in str(self.combo_engine.currentText()):
+safe_scale.py:184:                model = self.combo_model_realsr.currentText()
+settings_boost.py:46:    chk_qt = QCheckBox("Qt cache (QSettings, etc.)")
+settings_diag.py:5:from PySide6.QtCore import QSettings
+settings_diag.py:19:        fmt = QSettings.defaultFormat()
+settings_diag.py:20:        info["qsettings_default_format"] = {0:"Native",1:"Reg",2:"Ini"}.get(int(fmt), str(fmt))
+settings_diag.py:22:        info["qsettings_default_format"] = f"error: {e}"
+settings_diag.py:26:    s = QSettings(ORG, APP)
+settings_diag.py:30:    info["qsettings_native_write_ok"] = (str(got) == "ok")
+settings_diagnostics.py:61:    btn_dump = QPushButton("Dump QSettings now")
+settings_diagnostics.py:64:            diag.dump_qsettings("manual")
+settings_diagnostics.py:66:            diag.log("Dump QSettings button failed:", e)
+settings_more.py:5:from PySide6.QtCore import Qt, QSettings, QUrl
+settings_more.py:20:def _usage_settings() -> QSettings:
+settings_more.py:21:    return QSettings(*_USAGE_SETTINGS_SCOPE)
+settings_tab.py:4:from PySide6.QtCore import Qt, QSettings, QTimer
+settings_tab.py:95:def _font_size_apply_from_qsettings(app: Optional[QtWidgets.QApplication] = None) -> None:
+settings_tab.py:98:        s = QSettings("FrameVision", "FrameVision")
+settings_tab.py:461:    _s = QSettings("FrameVision", "FrameVision")
+settings_tab.py:491:    State is stored in QSettings key: settings_options_expanded (bool).
+settings_tab.py:493:    s = QSettings("FrameVision", "FrameVision")
+settings_tab.py:1250:            s = QSettings("FrameVision", "FrameVision")
+settings_tab.py:1459:    btn_dump = QPushButton("Show QSettings in CMD")
+settings_tab.py:1462:            from helpers.diagnostics import dump_qsettings
+settings_tab.py:1463:            dump_qsettings("manual")
+settings_tab.py:1521:            s = QSettings('FrameVision','FrameVision')
+settings_tab.py:1800:    show_labels = _emoji_tabs_show_labels_qsettings()
+settings_tab.py:1845:def _emoji_enabled_qsettings() -> bool:
+settings_tab.py:1847:        s = QSettings("FrameVision","FrameVision")
+settings_tab.py:1851:def _emoji_set_enabled_qsettings(val: bool) -> None:
+settings_tab.py:1853:        s = QSettings("FrameVision","FrameVision")
+settings_tab.py:1858:def _emoji_tabs_show_labels_qsettings() -> bool:
+settings_tab.py:1861:        s = QSettings("FrameVision","FrameVision")
+settings_tab.py:1868:        if _emoji_enabled_qsettings():
+settings_tab.py:1991:            _font_size_apply_from_qsettings(QtWidgets.QApplication.instance())
+startuplog.py:164:            from PySide6.QtCore import QSettings as _QSettings
+startuplog.py:165:            _s = _QSettings("FrameVision", "FrameVision")
+state_persist.py:10:from PySide6.QtCore import QSettings, QByteArray, Qt
+state_persist.py:30:def _qs() -> QSettings:
+state_persist.py:31:    return QSettings(ORG, APP)
+state_persist.py:253:    def __init__(self, settings: QSettings | None = None) -> None:
+sysmon.py:6:from PySide6.QtCore import Qt, QTimer, QSettings, Signal, QObject, QThread, QUrl
+sysmon.py:568:    s = QSettings(ORG, APP)
+sysmon.py:636:    s = QSettings(ORG, APP)
+sysmon.py:657:        s = QSettings(ORG, APP)
+sysmon.py:834:        QSettings(ORG, APP).setValue(K_SYSMON_LOW, self.low_impact)
+sysmon.py:839:        QSettings(ORG, APP).setValue(K_SYSMON_ENABLED, self.enabled)
+sysmon.py:848:        QSettings(ORG, APP).setValue(K_HUD_ENABLED, self.hud_enabled)
+tab_integration.py:123:        engine = _read_val(self, "edit_engine", "text", _read_val(self, "combo_engine", "currentText", "realesrgan-ncnn-vulkan.exe"))
+tab_integration.py:126:        model  = _read_val(self, "edit_model", "text", _read_val(self, "combo_model", "currentText", "realesr-general-x4v3"))
+tab_integration.py:148:            "engine": _read_val(self, "edit_engine", "text", _read_val(self, "combo_engine", "currentText", "")),
+tab_integration.py:151:            "model": _read_val(self, "edit_model", "text", _read_val(self, "combo_model", "currentText", "")),
+tab_integration.py:181:            _set_val(self, "combo_engine", "setCurrentText", data.get("engine"))
+tab_integration.py:185:            _set_val(self, "combo_model", "setCurrentText", data.get("model"))
+tab_integration.py:198:            from PySide6.QtCore import QSettings
+tab_integration.py:200:            s = QSettings("FrameVision", "Upscaler")
+tab_integration.py:218:    from PySide6.QtCore import QSettings, QUrl
+tab_integration.py:223:            s = QSettings("FrameVision", "Upscaler")
+tab_integration.py:265:                s = QSettings("FrameVision", "Upscaler")
+tab_integration.py:287:        for name in ("combo_model","edit_model","combo_dml_model"):
+tab_integration.py:368:                _set_val(self, "combo_engine", "setCurrentText", settings.get("engine"))
+tab_integration.py:372:                _set_val(self, "combo_model", "setCurrentText", settings.get("model"))
+tools_tab.py:29:from PySide6.QtCore import Qt, QPropertyAnimation, QEasingCurve, QSettings, QTimer, QEvent
+tools_tab.py:668:            self._qs = QSettings("FrameVision","FrameVision")
+tools_tab.py:670:            from PySide6.QtCore import QSettings as _QS
+tooltip_manager.py:22:#     from PySide6.QtCore import QSettings
+tooltip_manager.py:27:#     s = QSettings("FrameVision","FrameVision")
+tooltip_manager.py:37:# and also update QSettings("tooltips_enabled", b). This instantly
+txt2img.py:108:        return bool(QSettings('FrameVision','FrameVision').value('keep_settings_after_restart', True, type=bool))
+txt2img.py:326:from PySide6.QtCore import QSettings, QTimer, Qt, Signal, QProcess, QProcessEnvironment
+txt2img.py:1281:                    want = str(QSettings('FrameVision','FrameVision').value("txt2img_prompt_preset", "Default") or "Default")
+txt2img.py:1622:        # Ensure shared QSettings store exists (for backends, LoRA path, etc.)
+txt2img.py:1627:                self._persist_settings = QSettings('FrameVision','FrameVision')
+txt2img.py:1629:                self._persist_settings = QSettings()
+txt2img.py:1643:            _lr = self._persist_settings.value("txt2img_lora_root", None, type=str)
+txt2img.py:1657:                            v = self._persist_settings.value("a1111_url")
+txt2img.py:1659:            v = self._persist_settings.value("qwen_cli_template")
+txt2img.py:1667:                self._persist_settings.setValue("backend_text", "Qwen CLI")
+txt2img.py:1668:                self._persist_settings.setValue("a1111_url", self._a1111_url_removed.text().strip())
+txt2img.py:1669:                self._persist_settings.setValue("qwen_cli_template", self._qwen_cli_template_removed.text().strip())
+txt2img.py:1782:                    saved = self._persist_settings.value("zimage_gguf_model_path", "") if hasattr(self, "_persist_settings") else ""
+txt2img.py:1816:                    saved = self._persist_settings.value("zimage_gguf_vae_path", "") if hasattr(self, "_persist_settings") else ""
+txt2img.py:1876:                        self._persist_settings.setValue("zimage_gguf_model_path", self.gguf_model_combo.currentData() or "")
+txt2img.py:1877:                        self._persist_settings.setValue("zimage_gguf_vae_path", self.gguf_vae_combo.currentData() or "")
+txt2img.py:1913:                    self._persist_settings.setValue("txt2img_lora_root", self._lora_root)
+txt2img.py:2874:            QSettings('FrameVision','FrameVision').setValue("txt2img_prompt_preset", self._current_prompt_preset())
+upsc.py:438:        self.combo_engine = QtWidgets.QComboBox(self)
+upsc.py:440:            self.combo_engine.addItem(label, exe)
+upsc.py:441:        if self.combo_engine.count() == 0:
+upsc.py:442:            self.combo_engine.addItem("Real-ESRGAN (expected at models/realesrgan)",
+upsc.py:444:        hl.addWidget(self.combo_engine, 1)
+upsc.py:452:        self.combo_model_realsr = QtWidgets.QComboBox(self)
+upsc.py:454:            self.combo_model_realsr.addItem(m)
+upsc.py:455:        lay_r.addWidget(self.combo_model_realsr, 1)
+upsc.py:466:        self.combo_model_w2x = QtWidgets.QComboBox(self)
+upsc.py:468:            self.combo_model_w2x.addItem(m)
+upsc.py:469:        lay_w.addWidget(self.combo_model_w2x, 1)
+upsc.py:475:        self.combo_model_srmd = QtWidgets.QComboBox(self)
+upsc.py:477:            self.combo_model_srmd.addItem(m)
+upsc.py:478:        lay_s.addWidget(self.combo_model_srmd, 1)
+upsc.py:484:        self.combo_model_realsr_ncnn = QtWidgets.QComboBox(self)
+upsc.py:486:            self.combo_model_realsr_ncnn.addItem(m)
+upsc.py:487:        lay_rs.addWidget(self.combo_model_realsr_ncnn, 1)
+upsc.py:493:        self.combo_model_ultrasharp = QtWidgets.QComboBox(self)
+upsc.py:495:            self.combo_model_ultrasharp.addItem(m)
+upsc.py:496:        lay_ul.addWidget(self.combo_model_ultrasharp, 1)
+upsc.py:503:        self.combo_model_srmd_realsr = QtWidgets.QComboBox(self)
+upsc.py:505:            self.combo_model_srmd_realsr.addItem(m)
+upsc.py:506:        lay_srmd_rs.addWidget(self.combo_model_srmd_realsr, 1)
+upsc.py:514:        self.combo_model_gfpgan = QtWidgets.QComboBox(self)
+upsc.py:516:        self.combo_model_gfpgan.addItem("GFPGANv1.4")
+upsc.py:517:        self.combo_model_gfpgan.addItem("GFPGANv1.3")
+upsc.py:518:        lay_gfp.addWidget(self.combo_model_gfpgan, 1)
+upsc.py:778:        self.combo_engine.currentIndexChanged.connect(self._update_engine_ui)
+upsc.py:779:        # Don't call _update_engine_ui() here - it will be called after settings are loaded
+upsc.py:784:            'combo_model_realsr',
+upsc.py:785:            'combo_model_w2x',
+upsc.py:786:            'combo_model_ultrasharp',
+upsc.py:787:            'combo_model_srmd_realsr',
+upsc.py:788:            'combo_model_srmd',
+upsc.py:789:            'combo_model_realsr_ncnn',
+upsc.py:790:            'combo_model_gfpgan',
+upsc.py:817:        # _update_engine_ui from interfering with model selection during initial load
+upsc.py:820:            self.combo_engine.blockSignals(True)
+upsc.py:823:            self.combo_engine.blockSignals(False)
+upsc.py:825:        # Now that settings are loaded, call _update_engine_ui to sync the UI
+upsc.py:827:        self._update_engine_ui()
+upsc.py:913:            ("combo_engine", "currentIndexChanged"),
+upsc.py:914:            ("combo_model_realsr", "currentTextChanged"),
+upsc.py:915:            ("combo_model_w2x", "currentTextChanged"),
+upsc.py:916:            ("combo_model_gfpgan", "currentTextChanged"),
+upsc.py:977:        try: d["engine_index"] = int(self.combo_engine.currentIndex())
+upsc.py:979:        try: d["model_realsr"] = self.combo_model_realsr.currentText()
+upsc.py:981:        try: d["model_w2x"] = self.combo_model_w2x.currentText()
+upsc.py:983:        try: d["model_gfpgan"] = getattr(self, "combo_model_gfpgan", None).currentText() if getattr(self, "combo_model_gfpgan", None) else ""
+upsc.py:1076:            if 0 <= idx < self.combo_engine.count():
+upsc.py:1077:                self.combo_engine.setCurrentIndex(idx)
+upsc.py:1083:                i = self.combo_model_realsr.findText(m)
+upsc.py:1084:                if i >= 0: self.combo_model_realsr.setCurrentIndex(i)
+upsc.py:1090:                i = self.combo_model_w2x.findText(m)
+upsc.py:1091:                if i >= 0: self.combo_model_w2x.setCurrentIndex(i)
+upsc.py:1096:            if m and getattr(self, "combo_model_gfpgan", None):
+upsc.py:1097:                i = self.combo_model_gfpgan.findText(m)
+upsc.py:1098:                if i >= 0: self.combo_model_gfpgan.setCurrentIndex(i)
+upsc.py:1312:    def _update_engine_ui(self):
+upsc.py:1314:        if getattr(self, '_fv_in_update_engine_ui', False):
+upsc.py:1317:        self._fv_in_update_engine_ui = True
+upsc.py:1320:            eng_txt = (self.combo_engine.currentText() or '').lower()
+upsc.py:1321:            print(f"[DEBUG _update_engine_ui] called with engine='{eng_txt}'")
+upsc.py:1338:            print(f"[DEBUG _update_engine_ui] setting stk_models to page {page}")
+upsc.py:1351:                eng = (self.combo_engine.currentText() or '').lower()
+upsc.py:1356:                    model = (self.combo_model_w2x.currentText() if "Waifu2x" in eng_txt else (
+upsc.py:1357:                        getattr(self, "combo_model_ultrasharp", self.combo_model_realsr).currentText() if "ultrasharp" in eng_txt else (
+upsc.py:1358:                        getattr(self, "combo_model_srmd_realsr", self.combo_model_realsr).currentText() if "srmd" in eng_txt else self.combo_model_realsr.currentText()))) if page==0 else (
+upsc.py:1359:                            self.combo_model_ultrasharp.currentText() if page==4 else (
+upsc.py:1360:                            self.combo_model_srmd_realsr.currentText() if page==5 else self.combo_model_realsr.currentText()))
+upsc.py:1375:            self._fv_in_update_engine_ui = False
+upsc.py:1667:    def _get_current_model(self) -> str:
+upsc.py:1669:        engine_label = (self.combo_engine.currentText() or "").lower()
+upsc.py:1670:        print(f"[_get_current_model] engine_label='{engine_label}'")
+upsc.py:1673:                result = self.combo_model_w2x.currentText() or ""
+upsc.py:1674:                print(f"[_get_current_model] waifu path, returning '{result}'")
+upsc.py:1677:                result = self.combo_model_ultrasharp.currentText() or ""
+upsc.py:1678:                print(f"[_get_current_model] ultrabharp path, returning '{result}'")
+upsc.py:1681:                result = self.combo_model_srmd_realsr.currentText() or ""
+upsc.py:1682:                print(f"[_get_current_model] srmd-realsr path, returning '{result}'")
+upsc.py:1685:                result = self.combo_model_srmd.currentText() or ""
+upsc.py:1686:                print(f"[_get_current_model] srmd path, returning '{result}'")
+upsc.py:1689:                result = self.combo_model_gfpgan.currentText() or ""
+upsc.py:1690:                print(f"[_get_current_model] gfpgan path, returning '{result}'")
+upsc.py:1694:                result = self.combo_model_realsr.currentText() or ""
+upsc.py:1695:                print(f"[_get_current_model] DEFAULT path, returning '{result}'")
+upsc.py:1698:            print(f"[_get_current_model] ERROR: {e}")
+upsc.py:1699:            return self.combo_model_realsr.currentText() or ""
+upsc.py:1738:            engine_label = self.combo_engine.currentText()
+upsc.py:1740:            engine_exe = self.combo_engine.currentData()
+upsc.py:1768:                model = self._get_current_model()
+upsc.py:1828:                    mname = self.combo_model_gfpgan.currentText() if hasattr(self, "combo_model_gfpgan") else "GFPGANv1.4"
+upsc.py:1837:                model = self.combo_model_w2x.currentText()
+upsc.py:1840:                model = getattr(self, "combo_model_ultrasharp", self.combo_model_realsr).currentText()
+upsc.py:1843:                model = getattr(self, "combo_model_srmd_realsr", self.combo_model_realsr).currentText()
+upsc.py:1846:                model = self._get_current_model()
+upsc.py:1998:        exe = self.combo_engine.currentData()
+upsc.py:2007:            model = self._get_current_model(); scale = int(round(self.spin_scale.value()))
+upsc.py:2033:            name = self._get_current_model().lower()
+upsc.py:2200:            txt = getattr(self, 'combo_model', None).currentText()
+upsc.py:2208:        eng_label = getattr(self, 'combo_engine', None).currentText()
+upsc.py:2221:        # because "Real-ESRGAN (ncnn)" contains "ncnn" but uses combo_model_realsr
+upsc.py:2223:            # Real-ESRGAN family (uses combo_model_realsr)
+upsc.py:2224:            cmr = getattr(self, 'combo_model_realsr', None)
+upsc.py:2227:                print(f"[DEBUG] Read from combo_model_realsr: '{model_name}'")
+upsc.py:2229:            # UltraSharp uses combo_model_ultrasharp
+upsc.py:2230:            cms = getattr(self, 'combo_model_ultrasharp', None)
+upsc.py:2233:                print(f"[DEBUG] Read from combo_model_ultrasharp: '{model_name}'")
+upsc.py:2235:            # Waifu2x uses combo_model_w2x
+upsc.py:2236:            cmw = getattr(self, 'combo_model_w2x', None)
+upsc.py:2239:                print(f"[DEBUG] Read from combo_model_w2x: '{model_name}'")
+upsc.py:2242:            cms = getattr(self, 'combo_model_srmd_realsr', None)
+upsc.py:2245:                print(f"[DEBUG] Read from combo_model_srmd_realsr: '{model_name}'")
+upsc.py:2247:                cms = getattr(self, 'combo_model_srmd', None)
+upsc.py:2250:                    print(f"[DEBUG] Read from combo_model_srmd: '{model_name}'")
+upsc.py:2252:            # GFPGAN uses combo_model_gfpgan
+upsc.py:2253:            cmg = getattr(self, 'combo_model_gfpgan', None)
+upsc.py:2256:                print(f"[DEBUG] Read from combo_model_gfpgan: '{model_name}'")
+upsc.py:2260:            cmn = getattr(self, 'combo_model_realsr_ncnn', None)
+upsc.py:2263:                print(f"[DEBUG] Read from combo_model_realsr_ncnn: '{model_name}'")
+upsc.py:2266:            cmr = getattr(self, 'combo_model_realsr', None)
+upsc.py:2269:                print(f"[DEBUG] Read from combo_model_realsr (fallback): '{model_name}'")
+upsc.py:2275:    # Fallback to generic combo_model
+upsc.py:2278:            model_name = getattr(self, 'combo_model', None).currentText() or ''
+upsc.py:2299:                    eng_w = getattr(self, 'combo_engine', None)
+upsc.py:2314:                    cmr = getattr(self, 'combo_model_realsr', None)
+upsc.py:2548:                self.combo_model_realsr.addItem(label, {"fv":"upsc-model","base":base,"dir":dstr,"scale":sc})
+upsc.py:2550:                self.combo_model_realsr.addItem(label)
+upsc.py:2555:        idx = getattr(self.combo_model_realsr, "currentIndex", lambda: -1)()
+upsc.py:2558:            data = self.combo_model_realsr.itemData(idx)
+upsc.py:2577:        idx = getattr(self.combo_model_realsr, "currentIndex", lambda: -1)()
+upsc.py:2580:            data = self.combo_model_realsr.itemData(idx)
+upsc.py:2695:                t = (self.combo_engine.currentText() or '').lower()
+upsc.py:2703:                eng = (self.combo_engine.currentText() or '').lower()
+upsc.py:2706:                t = (self.combo_model_realsr.currentText() or '').lower()
+upsc.py:2772:                        self.combo_engine.currentIndexChanged.connect(lambda *_: _fv_apply_scale_ui(self))
+upsc.py:2776:                        self.combo_model_realsr.currentIndexChanged.connect(lambda *_: _fv_apply_scale_ui(self))
+upsc.py:2854:                engine_label = self.combo_engine.currentText()
+upsc.py:2863:                if "Waifu2x" in engine_label and hasattr(self, "combo_model_w2x"):
+upsc.py:2864:                    return self.combo_model_w2x.currentText()
+upsc.py:2865:                if "UltraSharp" in engine_label and hasattr(self, "combo_model_ultrasharp"):
+upsc.py:2866:                    return self.combo_model_ultrasharp.currentText()
+upsc.py:2867:                if "SRMD (ncnn via RealESRGAN)" in engine_label and hasattr(self, "combo_model_srmd_realsr"):
+upsc.py:2868:                    return self.combo_model_srmd_realsr.currentText()
+upsc.py:2869:                return self.combo_model_realsr.currentText()
+upsc.py:2871:            for nm in ("combo_model_gfpgan","combo_model_ultrasharp","combo_model_srmd_realsr","combo_model_w2x","combo_model_srmd","combo_model_realsr_ncnn","combo_model_realsr"):
+upsc.py:2879:                return self.combo_model_realsr.currentText()
+upsc.py:2886:                engine_label = self.combo_engine.currentText()
+upsc.py:2956:                    for nm in ("combo_model_realsr", "combo_model_w2x",
+upsc.py:2957:                               "combo_model_ultrasharp", "combo_model_srmd_realsr",
+upsc.py:2958:                               "combo_model_srmd", "combo_model_realsr_ncnn", "combo_engine"):
+upsc.py:2996:                "combo_model_realsr",
+upsc.py:2997:                "combo_model_w2x",
+upsc.py:2998:                "combo_model_ultrasharp",
+upsc.py:2999:                "combo_model_srmd_realsr",
+upsc.py:3000:                "combo_model_srmd",
+upsc.py:3001:                "combo_model_realsr_ncnn",
+upsc.py:3022:                engine_label = self.combo_engine.currentText().lower()
+upsc.py:3037:                return pick("combo_model_srmd_realsr", "combo_model_srmd")
+upsc.py:3039:                return pick("combo_model_w2x")
+upsc.py:3041:                return pick("combo_model_ultrasharp")
+upsc.py:3043:                return pick("combo_model_realsr", "combo_model_realsr_ncnn")
+upsc.py:3144:                eng = (self.combo_engine.currentText() or "").lower()
+upsc.py:3147:            combo = getattr(self, "combo_model_realsr", None)
+upsc.py:3232:                if hasattr(self.combo_engine, "currentTextChanged"):
+upsc.py:3233:                    self.combo_engine.currentTextChanged.connect(lambda *_: _fv_restore_or_filter_models(self))
+upsc.py:3238:                # Block signals during model filtering to prevent _update_engine_ui
+upsc.py:3240:                combo_engine = getattr(self, 'combo_engine', None)
+upsc.py:3241:                combo_model = getattr(self, 'combo_model_realsr', None)
+upsc.py:3245:                    if combo_engine:
+upsc.py:3246:                        combo_engine.blockSignals(True)
+upsc.py:3248:                    if combo_model:
+upsc.py:3249:                        combo_model.blockSignals(True)
+upsc.py:3253:                    if combo_model and model_blocked:
+upsc.py:3254:                        combo_model.blockSignals(False)
+upsc.py:3255:                    if combo_engine and engine_blocked:
+upsc.py:3256:                        combo_engine.blockSignals(False)
+upsc.py:3336:                combo = getattr(self, "combo_model_realsr", None)
+upsc.py:3352:# This prevents _update_engine_ui from resetting the engine during restoration
+upsc.py:3365:                if attr.__code__.co_names and 'combo_model_realsr' in attr.__code__.co_names:
+upsc.py:3402:                eng = (self.combo_engine.currentText() or "").lower()
+upsc.py:3406:                    combo = getattr(self, "combo_model_realsr", None)
+upsc.py:3408:                    combo = getattr(self, "combo_model_realsr", None) or getattr(self, "combo_model_realesrgan", None)
+upsc.py:3410:                    combo = getattr(self, "combo_model_ultrasharp", None)
+upsc.py:3412:                    combo = getattr(self, "combo_model_srmd_realsr", None) or getattr(self, "combo_model_srmd_realesrgan", None) or getattr(self, "combo_model_srmd", None)
+upsc.py:3414:                    combo = getattr(self, "combo_model_w2x", None)
+upsc.py:3416:                    combo = getattr(self, "combo_model_realsr_ncnn", None)
+upsc.py:3419:                    combo = getattr(self, "combo_model_realsr", None)

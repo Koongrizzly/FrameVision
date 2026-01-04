@@ -426,9 +426,23 @@ def _checker_brush(tile: int = 16) -> QtGui.QBrush:
 
 
 class ImageView(QtWidgets.QGraphicsView):
-    """Zoomable / pannable image view."""
+    """Zoomable / pannable image view.
+
+    Supports two interaction modes:
+      - "pan": drag pans (hand tool), wheel zooms
+      - "brush": drag paints (left = erase/remove, right = restore), wheel still zooms
+    """
 
     transformed = QtCore.Signal()
+
+    wheel_subject_scale = QtCore.Signal(int)
+
+    subject_drag = QtCore.Signal(QtCore.QPointF)
+
+    # scene_pos, restore(True=bring back), in scene coordinates (pixel-space)
+    brush_begin = QtCore.Signal(QtCore.QPointF, bool)
+    brush_move = QtCore.Signal(QtCore.QPointF, bool)
+    brush_end = QtCore.Signal()
 
     def __init__(self, parent: Optional[QtWidgets.QWidget] = None):
         super().__init__(parent)
@@ -437,22 +451,119 @@ class ImageView(QtWidgets.QGraphicsView):
             | QtGui.QPainter.SmoothPixmapTransform
             | QtGui.QPainter.TextAntialiasing
         )
-        self.setDragMode(QtWidgets.QGraphicsView.ScrollHandDrag)
         self.setViewportUpdateMode(QtWidgets.QGraphicsView.FullViewportUpdate)
         self.setTransformationAnchor(QtWidgets.QGraphicsView.AnchorUnderMouse)
         self.setResizeAnchor(QtWidgets.QGraphicsView.AnchorUnderMouse)
         self.setBackgroundBrush(_checker_brush())
 
+        self._wheel_mode = "view"
+
+        self._subject_dragging = False
+        self._subject_last_scene = QtCore.QPointF()
+
+        self._interaction_mode = "pan"
+        self.set_interaction_mode("pan")
+
+    def interaction_mode(self) -> str:
+        return str(self._interaction_mode)
+
+
+    def wheel_mode(self) -> str:
+        return str(getattr(self, "_wheel_mode", "view"))
+
+    def set_wheel_mode(self, mode: str) -> None:
+        mode = (mode or "view").lower().strip()
+        if mode in ("subject", "subject_scale", "subjectsize", "subject-size"):
+            mode = "subject"
+        if mode not in ("view", "subject"):
+            mode = "view"
+        self._wheel_mode = mode
+
+    def set_interaction_mode(self, mode: str) -> None:
+        mode = (mode or "pan").lower().strip()
+        if mode not in ("pan", "brush"):
+            mode = "pan"
+        self._interaction_mode = mode
+        if mode == "pan":
+            self.setDragMode(QtWidgets.QGraphicsView.ScrollHandDrag)
+            self.setCursor(QtCore.Qt.OpenHandCursor)
+        else:
+            self.setDragMode(QtWidgets.QGraphicsView.NoDrag)
+            self.setCursor(QtCore.Qt.CrossCursor)
+
     def wheelEvent(self, event: QtGui.QWheelEvent) -> None:
-        # Wheel zoom (common editor behavior). Panning is via drag.
+        # Wheel zoom (common editor behavior).
         angle = event.angleDelta().y()
         if angle != 0:
+            if getattr(self, "_wheel_mode", "view") == "subject":
+                self.wheel_subject_scale.emit(int(angle))
+                event.accept()
+                return
             factor = 1.0 + (0.15 if angle > 0 else -0.15)
             self.scale(factor, factor)
             self.transformed.emit()
             event.accept()
             return
         super().wheelEvent(event)
+
+    def _event_scene_pos(self, event: QtGui.QMouseEvent) -> QtCore.QPointF:
+        try:
+            pt = event.position()
+            return self.mapToScene(int(pt.x()), int(pt.y()))
+        except Exception:
+            return self.mapToScene(event.pos())
+
+    def mousePressEvent(self, event: QtGui.QMouseEvent) -> None:
+        # Subject move: when wheel mode is "subject", left-drag moves the cutout instead of panning the view.
+        if self._interaction_mode == "pan" and getattr(self, "_wheel_mode", "view") == "subject":
+            if event.button() == QtCore.Qt.LeftButton:
+                self._subject_dragging = True
+                self._subject_last_scene = self._event_scene_pos(event)
+                event.accept()
+                return
+
+        if self._interaction_mode == "brush" and event.button() in (QtCore.Qt.LeftButton, QtCore.Qt.RightButton):
+            restore = bool(event.button() == QtCore.Qt.RightButton)
+            self.brush_begin.emit(self._event_scene_pos(event), restore)
+            event.accept()
+            return
+        super().mousePressEvent(event)
+
+    def mouseMoveEvent(self, event: QtGui.QMouseEvent) -> None:
+        if getattr(self, "_subject_dragging", False):
+            if event.buttons() & QtCore.Qt.LeftButton:
+                pos = self._event_scene_pos(event)
+                delta = pos - self._subject_last_scene
+                self._subject_last_scene = pos
+                try:
+                    self.subject_drag.emit(delta)
+                except Exception:
+                    pass
+                event.accept()
+                return
+            # Safety: button released without a release event
+            self._subject_dragging = False
+
+        if self._interaction_mode == "brush":
+            buttons = event.buttons()
+            if buttons & (QtCore.Qt.LeftButton | QtCore.Qt.RightButton):
+                restore = bool(buttons & QtCore.Qt.RightButton)
+                self.brush_move.emit(self._event_scene_pos(event), restore)
+                event.accept()
+                return
+        super().mouseMoveEvent(event)
+
+    def mouseReleaseEvent(self, event: QtGui.QMouseEvent) -> None:
+        if getattr(self, "_subject_dragging", False) and event.button() == QtCore.Qt.LeftButton:
+            self._subject_dragging = False
+            event.accept()
+            return
+
+        if self._interaction_mode == "brush" and event.button() in (QtCore.Qt.LeftButton, QtCore.Qt.RightButton):
+            self.brush_end.emit()
+            event.accept()
+            return
+        super().mouseReleaseEvent(event)
 
     def scrollContentsBy(self, dx: int, dy: int) -> None:
         super().scrollContentsBy(dx, dy)
@@ -538,8 +649,15 @@ class BgRemovePane(QtWidgets.QWidget):
             "preview_color": "#ffffff",
             "last_open_dir": "",
             "last_save_dir": "",
+            "last_bg_dir": "",
             "splitter_v_sizes": [],
             "splitter_h_sizes": [],
+            "edit_mode": "pan",
+            "brush_size": 40,
+            "subject_scale_enabled": False,
+            "subject_scale": 1.0,
+            "subject_offset_x": 0.0,
+            "subject_offset_y": 0.0,
         }
         self.settings = SettingsStore(self._settings_path, defaults)
 
@@ -548,7 +666,30 @@ class BgRemovePane(QtWidgets.QWidget):
         self._pil_original: Optional[Image.Image] = None
         self._pil_result: Optional[Image.Image] = None
         self._pil_matte: Optional[Image.Image] = None
+
+        # Result variants
+        self._pil_cutout: Optional[Image.Image] = None  # RGBA cutout (transparent)
+        self._pil_bg: Optional[Image.Image] = None      # Background image to composite behind cutout
+        self._bg_path: Optional[Path] = None
+
         self._current_path: Optional[Path] = None
+
+        # Brush-editable matte state (result mask)
+        self._matte_arr: Optional[np.ndarray] = None
+        self._orig_rgba_arr: Optional[np.ndarray] = None
+        self._undo_stack: list[np.ndarray] = []
+        self._undo_limit = 10
+        self._brush_strength = 0.55
+        self._brush_kernel: Optional[np.ndarray] = None
+        self._brush_dirty = False
+        self._brush_timer = QtCore.QTimer(self)
+        self._brush_timer.setSingleShot(True)
+        self._brush_timer.setInterval(30)
+        self._brush_timer.timeout.connect(self._flush_brush_updates)
+
+        # Subject scaling (for compositing with a new background)
+        self._last_subject_scale = float(self.settings.data.get("subject_scale", 1.0))
+        self._last_subject_enabled = bool(self.settings.data.get("subject_scale_enabled", False))
 
         self._build_ui()
         self._wire()
@@ -576,29 +717,102 @@ class BgRemovePane(QtWidgets.QWidget):
         row2 = QtWidgets.QHBoxLayout()
         row2.setSpacing(8)
 
+        row_mode = QtWidgets.QHBoxLayout()
+        row_mode.setSpacing(8)
+
         self.btn_open = QtWidgets.QPushButton("Open image")
         self.btn_run = QtWidgets.QPushButton("Remove background")
+        self.btn_add_bg = QtWidgets.QPushButton("Add background")
+        self.btn_add_bg.setToolTip("Place a new background image behind the cutout result.")
+        self.btn_add_bg.setEnabled(False)
         self.btn_save_png = QtWidgets.QPushButton("Save PNG")
         self.btn_save_mask = QtWidgets.QPushButton("Save mask")
         self.btn_fit = QtWidgets.QPushButton("Fit")
         self.btn_fit.setToolTip("Fit both previews to image")
         self.btn_run.setDefault(True)
 
+        # Edit controls (mask brush)
+        self.btn_mode_pan = QtWidgets.QPushButton("Pan/Zoom")
+        self.btn_mode_pan.setCheckable(True)
+        self.btn_mode_pan.setToolTip("Pan with drag, zoom with wheel.")
+        self.btn_mode_brush = QtWidgets.QPushButton("Brush")
+        self.btn_mode_brush.setCheckable(True)
+        self.btn_mode_brush.setToolTip("Paint on the mask: Left = remove, Right = restore.")
+        self._mode_group = QtWidgets.QButtonGroup(self)
+        self._mode_group.setExclusive(True)
+        self._mode_group.addButton(self.btn_mode_pan)
+        self._mode_group.addButton(self.btn_mode_brush)
+        self.btn_mode_pan.setChecked(True)
+
+        # Make selected mode more obvious (custom highlight + badge)
+        self.btn_mode_pan.setStyleSheet(
+            'QPushButton{padding:6px 12px;} QPushButton:checked{background:#2563eb;color:white;font-weight:600;}'
+        )
+        self.btn_mode_brush.setStyleSheet(
+            'QPushButton{padding:6px 12px;} QPushButton:checked{background:#d97706;color:white;font-weight:600;}'
+        )
+
+        self.lbl_mode_badge = QtWidgets.QLabel("PAN / ZOOM")
+        self.lbl_mode_badge.setAlignment(QtCore.Qt.AlignCenter)
+        self.lbl_mode_badge.setMinimumWidth(120)
+        self.lbl_mode_badge.setToolTip("Pan/Zoom mode: drag to pan, mouse wheel to zoom.")
+        self.lbl_mode_badge.setStyleSheet(
+            "QLabel{background:#2563eb;color:white;padding:4px 10px;border-radius:10px;font-weight:600;}"
+        )
+
+        self.sp_brush = QtWidgets.QSpinBox()
+        self.sp_brush.setRange(3, 200)
+        self.sp_brush.setSingleStep(2)
+        self.sp_brush.setValue(40)
+        self.sp_brush.setFixedWidth(72)
+        self.sp_brush.setToolTip("Brush size (px). Left drag removes background, right drag restores it.")
+        self.sp_brush.setEnabled(False)
+
+        self.chk_subject_scale = QtWidgets.QCheckBox("Change subject size")
+        self.chk_subject_scale.setToolTip(
+            "When enabled, mouse wheel changes the cutout subject size relative to the background. "
+            "Use the Zoom slider/buttons to zoom the view."
+        )
+        self.chk_subject_scale.setEnabled(False)
+
+        self.lbl_subject_scale = QtWidgets.QLabel("Subject 100%")
+        self.lbl_subject_scale.setMinimumWidth(100)
+        self.lbl_subject_scale.setAlignment(QtCore.Qt.AlignLeft | QtCore.Qt.AlignVCenter)
+        self.lbl_subject_scale.setStyleSheet("color: #888;")
+
+        self.btn_undo = QtWidgets.QPushButton("Undo")
+        self.btn_undo.setToolTip("Undo last brush stroke (up to 10).")
+        self.btn_undo.setEnabled(False)
+
         row1.addWidget(self.btn_open)
         row1.addWidget(self.btn_run)
+        row1.addWidget(self.btn_add_bg)
         row1.addStretch(1)
-        row1.addWidget(self.btn_fit)
+
+        row_mode.addStretch(1)
+        row_mode.addWidget(QtWidgets.QLabel("Mode"))
+        row_mode.addWidget(self.btn_mode_pan)
+        row_mode.addWidget(self.btn_mode_brush)
+        row_mode.addWidget(self.lbl_mode_badge)
+        row_mode.addWidget(QtWidgets.QLabel("Size"))
+        row_mode.addWidget(self.sp_brush)
+        row_mode.addWidget(self.chk_subject_scale)
+        row_mode.addWidget(self.lbl_subject_scale)
+        row_mode.addWidget(self.btn_fit)
 
         row2.addStretch(1)
+        row2.addWidget(self.btn_undo)
         row2.addWidget(self.btn_save_png)
         row2.addWidget(self.btn_save_mask)
 
         top_v.addLayout(row1)
+        top_v.addLayout(row_mode)
         top_v.addLayout(row2)
         main.addWidget(top_box)
 
         # Expose top bar rows for FrameVision integration (injecting extra buttons cleanly).
         self._top_row1 = row1
+        self._top_row_mode = row_mode
         self._top_row2 = row2
 
         # Main content: previews above settings (resizable splitter)
@@ -774,9 +988,28 @@ class BgRemovePane(QtWidgets.QWidget):
     def _wire(self) -> None:
         self.btn_open.clicked.connect(self.open_image_dialog)
         self.btn_run.clicked.connect(self.run_remove)
+        self.btn_add_bg.clicked.connect(self.add_background_dialog)
         self.btn_save_png.clicked.connect(self.save_png_dialog)
         self.btn_save_mask.clicked.connect(self.save_mask_dialog)
         self.btn_fit.clicked.connect(self._fit_views)
+
+        # Edit mode + undo
+        self.btn_mode_pan.clicked.connect(lambda: self.settings.set("edit_mode", "pan"))
+        self.btn_mode_brush.clicked.connect(lambda: self.settings.set("edit_mode", "brush"))
+        self.sp_brush.valueChanged.connect(lambda v: self.settings.set("brush_size", int(v)))
+        self.chk_subject_scale.toggled.connect(lambda v: self.settings.set("subject_scale_enabled", bool(v)))
+        self.btn_undo.clicked.connect(self.undo_brush)
+
+        # Brush input (allow painting on either preview; result mask is shared)
+        for _v in (self.view_a, self.view_b):
+            _v.brush_begin.connect(self._on_brush_begin)
+            _v.brush_move.connect(self._on_brush_move)
+            _v.brush_end.connect(self._on_brush_end)
+            _v.wheel_subject_scale.connect(self._on_subject_wheel)
+            try:
+                _v.subject_drag.connect(self._on_subject_drag)
+            except Exception:
+                pass
 
         # Zoom controls
         self.sl_zoom.valueChanged.connect(self._on_zoom_slider_changed)
@@ -901,6 +1134,449 @@ class BgRemovePane(QtWidgets.QWidget):
         if self._updating_zoom:
             return
         self._set_zoom_percent(int(v))
+    # ---- Mask editing (brush)
+
+    def _set_edit_mode(self, mode: str, *, update_settings: bool = True) -> None:
+        mode = (mode or "pan").lower().strip()
+        if mode not in ("pan", "brush"):
+            mode = "pan"
+        if update_settings:
+            try:
+                self.settings.set("edit_mode", mode)
+            except Exception:
+                pass
+
+        # Subject scaling uses the wheel; disable it while brushing to avoid coordinate mismatch.
+        if mode == "brush":
+            try:
+                if bool(self.settings.data.get("subject_scale_enabled", False)):
+                    self.settings.set("subject_scale_enabled", False)
+            except Exception:
+                pass
+
+        # Update UI controls (best-effort)
+        try:
+            self.btn_mode_pan.setChecked(mode == "pan")
+            self.btn_mode_brush.setChecked(mode == "brush")
+        except Exception:
+            pass
+
+        try:
+            self.sp_brush.setEnabled(mode == "brush")
+        except Exception:
+            pass
+
+        try:
+            self._update_mode_badge(mode)
+        except Exception:
+            pass
+
+        # Apply interaction mode to both views (keeps left/right synced)
+        try:
+            self.view_a.set_interaction_mode("pan" if mode == "pan" else "brush")
+            self.view_b.set_interaction_mode("pan" if mode == "pan" else "brush")
+        except Exception:
+            pass
+
+
+        try:
+            self._update_subject_scale_controls()
+        except Exception:
+            pass
+
+    def _update_mode_badge(self, mode: str) -> None:
+        """Update the mode badge label (makes Pan/Zoom vs Brush much clearer)."""
+        lab = getattr(self, "lbl_mode_badge", None)
+        if lab is None:
+            return
+
+        mode = (mode or "pan").lower().strip()
+        if mode == "brush":
+            lab.setText("BRUSH MODE")
+            lab.setToolTip("Brush mode: Left drag removes background, Right drag restores it.")
+            lab.setStyleSheet(
+                "QLabel{background:#d97706;color:white;padding:4px 10px;border-radius:10px;font-weight:600;}"
+            )
+        else:
+            lab.setText("PAN / ZOOM")
+            lab.setToolTip("Pan/Zoom mode: drag to pan, mouse wheel to zoom.")
+            lab.setStyleSheet(
+                "QLabel{background:#2563eb;color:white;padding:4px 10px;border-radius:10px;font-weight:600;}"
+            )
+
+    def _make_brush_kernel(self, size_px: int) -> np.ndarray:
+        # size_px is a "diameter-like" value (UI friendly).
+        size_px = int(max(3, min(200, size_px)))
+        r = max(1, int(round(size_px / 2.0)))
+        y, x = np.ogrid[-r : r + 1, -r : r + 1]
+        dist = np.sqrt(x * x + y * y)
+        k = np.clip(1.0 - (dist / float(r + 1e-6)), 0.0, 1.0)
+        # Slight softness (feathered falloff)
+        k = k * k
+        return k.astype(np.float32)
+
+    def _set_brush_size(self, size_px: int, *, update_settings: bool = True) -> None:
+        size_px = int(max(3, min(200, int(size_px))))
+        if update_settings:
+            try:
+                self.settings.set("brush_size", size_px)
+            except Exception:
+                pass
+        try:
+            self.sp_brush.setValue(size_px)
+        except Exception:
+            pass
+        try:
+            self._brush_kernel = self._make_brush_kernel(size_px)
+        except Exception:
+            self._brush_kernel = None
+
+    def _update_undo_button(self) -> None:
+        try:
+            self.btn_undo.setEnabled(bool(self._undo_stack))
+        except Exception:
+            pass
+
+    def undo_brush(self) -> None:
+        """Undo last brush stroke (up to 10 snapshots)."""
+        if not self._undo_stack:
+            return
+        try:
+            prev = self._undo_stack.pop()
+            self._matte_arr = np.asarray(prev, dtype=np.uint8).copy()
+            self._update_undo_button()
+            self._brush_dirty = True
+            self._flush_brush_updates()
+        except Exception:
+            pass
+
+    @QtCore.Slot(QtCore.QPointF, bool)
+    def _on_brush_begin(self, scene_pos: QtCore.QPointF, restore: bool) -> None:
+        if self._matte_arr is None or self._pil_original is None:
+            return
+        # Snapshot for undo (one per stroke)
+        try:
+            self._undo_stack.append(self._matte_arr.copy())
+            if len(self._undo_stack) > int(self._undo_limit):
+                self._undo_stack.pop(0)
+        except Exception:
+            self._undo_stack = self._undo_stack[-int(self._undo_limit) :]
+        self._update_undo_button()
+
+        self._apply_brush_at(scene_pos, restore)
+        self._schedule_brush_updates()
+
+    @QtCore.Slot(QtCore.QPointF, bool)
+    def _on_brush_move(self, scene_pos: QtCore.QPointF, restore: bool) -> None:
+        if self._matte_arr is None:
+            return
+        self._apply_brush_at(scene_pos, restore)
+        self._schedule_brush_updates()
+
+    @QtCore.Slot()
+    def _on_brush_end(self) -> None:
+        if self._matte_arr is None:
+            return
+        self._schedule_brush_updates()
+
+    def _apply_brush_at(self, scene_pos: QtCore.QPointF, restore: bool) -> None:
+        if self._matte_arr is None:
+            return
+
+        # Ensure kernel exists
+        if self._brush_kernel is None:
+            try:
+                bs = int(self.settings.data.get("brush_size", 40))
+            except Exception:
+                bs = 40
+            self._brush_kernel = self._make_brush_kernel(bs)
+
+        k = self._brush_kernel
+        if k is None:
+            return
+
+        r = (k.shape[0] - 1) // 2
+        x = int(round(float(scene_pos.x())))
+        y = int(round(float(scene_pos.y())))
+
+        h, w = int(self._matte_arr.shape[0]), int(self._matte_arr.shape[1])
+        if x < 0 or y < 0 or x >= w or y >= h:
+            return
+
+        x0 = max(0, x - r)
+        x1 = min(w, x + r + 1)
+        y0 = max(0, y - r)
+        y1 = min(h, y + r + 1)
+
+        kx0 = x0 - (x - r)
+        ky0 = y0 - (y - r)
+        kx1 = kx0 + (x1 - x0)
+        ky1 = ky0 + (y1 - y0)
+
+        ks = k[ky0:ky1, kx0:kx1]
+        if ks.size == 0:
+            return
+
+        a = self._matte_arr[y0:y1, x0:x1].astype(np.float32) / 255.0
+        s = float(max(0.05, min(1.0, self._brush_strength)))
+
+        if restore:
+            a = a + (1.0 - a) * (ks * s)
+        else:
+            a = a * (1.0 - (ks * s))
+
+        self._matte_arr[y0:y1, x0:x1] = np.clip(a * 255.0 + 0.5, 0, 255).astype(np.uint8)
+        self._brush_dirty = True
+
+    def _schedule_brush_updates(self) -> None:
+        if not self._brush_timer.isActive():
+            self._brush_timer.start()
+
+    # ---- Subject scaling (size vs background)
+
+    def _subject_scale_allowed(self) -> bool:
+        try:
+            mode = str(self.settings.data.get("edit_mode", "pan")).lower().strip()
+        except Exception:
+            mode = "pan"
+        if mode == "brush":
+            return False
+        return (self._pil_original is not None) and (self._matte_arr is not None)
+
+    def _update_subject_scale_controls(self) -> None:
+        """Enable/disable the subject scaling toggle based on current state."""
+        allowed = self._subject_scale_allowed()
+        try:
+            self.chk_subject_scale.setEnabled(bool(allowed))
+            self.lbl_subject_scale.setEnabled(bool(allowed))
+        except Exception:
+            pass
+        self._apply_subject_wheel_mode()
+
+    def _apply_subject_wheel_mode(self) -> None:
+        enabled = False
+        try:
+            enabled = bool(self.settings.data.get("subject_scale_enabled", False))
+        except Exception:
+            enabled = False
+        enabled = bool(enabled and self._subject_scale_allowed())
+        mode = "subject" if enabled else "view"
+        try:
+            self.view_a.set_wheel_mode(mode)
+        except Exception:
+            pass
+        try:
+            self.view_b.set_wheel_mode(mode)
+        except Exception:
+            pass
+
+    def _apply_subject_scale(self, cutout: Image.Image) -> Image.Image:
+        """Scale the subject (RGBA cutout) onto a same-size transparent canvas."""
+        try:
+            enabled = bool(self.settings.data.get("subject_scale_enabled", False))
+            scale = float(self.settings.data.get("subject_scale", 1.0))
+        except Exception:
+            enabled = False
+            scale = 1.0
+
+        try:
+            ox = float(self.settings.data.get("subject_offset_x", 0.0))
+            oy = float(self.settings.data.get("subject_offset_y", 0.0))
+        except Exception:
+            ox, oy = 0.0, 0.0
+
+        if not enabled:
+            return cutout
+
+        if abs(scale - 1.0) < 1e-4 and abs(ox) < 1e-4 and abs(oy) < 1e-4:
+            return cutout
+
+        scale = float(max(0.10, min(4.00, scale)))
+
+        try:
+            resample = Image.Resampling.LANCZOS  # Pillow >= 9
+        except Exception:
+            resample = getattr(Image, "LANCZOS", Image.BICUBIC)
+
+        cw, ch = int(cutout.width), int(cutout.height)
+        nw = max(1, int(round(cw * scale)))
+        nh = max(1, int(round(ch * scale)))
+
+        try:
+            if abs(scale - 1.0) < 1e-4:
+                scaled = cutout.convert("RGBA")
+            else:
+                scaled = cutout.convert("RGBA").resize((nw, nh), resample)
+        except Exception:
+            return cutout
+
+        canvas = Image.new("RGBA", (cw, ch), (0, 0, 0, 0))
+        left = (cw - nw) // 2 + int(round(ox))
+        top = (ch - nh) // 2 + int(round(oy))
+        try:
+            canvas.paste(scaled, (left, top), scaled)
+        except Exception:
+            try:
+                return Image.alpha_composite(canvas, scaled)
+            except Exception:
+                return cutout
+        return canvas
+    @QtCore.Slot(int)
+    def _on_subject_wheel(self, angle: int) -> None:
+        """Mouse wheel adjusts subject scale when the toggle is enabled."""
+        if not self._subject_scale_allowed():
+            return
+        try:
+            if not bool(self.settings.data.get("subject_scale_enabled", False)):
+                return
+        except Exception:
+            return
+
+        try:
+            steps = int(round(int(angle) / 120))
+        except Exception:
+            steps = 1 if angle > 0 else -1
+
+        if steps == 0:
+            return
+
+        base = 1.05  # 5% per wheel step
+        try:
+            cur = float(self.settings.data.get("subject_scale", 1.0))
+        except Exception:
+            cur = 1.0
+
+        if steps > 0:
+            cur *= (base ** steps)
+        else:
+            cur /= (base ** (-steps))
+
+        cur = float(max(0.10, min(4.00, cur)))
+        self.settings.set("subject_scale", cur)
+
+        # Force a recomposite for preview + save
+        self._brush_dirty = True
+        self._refresh_result_from_matte(force=True)
+
+
+    @QtCore.Slot(QtCore.QPointF)
+    def _on_subject_drag(self, delta: QtCore.QPointF) -> None:
+        """Left-drag moves the subject (cutout) relative to the background."""
+        if not self._subject_scale_allowed():
+            return
+        try:
+            if not bool(self.settings.data.get("subject_scale_enabled", False)):
+                return
+        except Exception:
+            return
+    
+        try:
+            dx = float(delta.x())
+            dy = float(delta.y())
+        except Exception:
+            return
+    
+        if abs(dx) < 1e-6 and abs(dy) < 1e-6:
+            return
+    
+        try:
+            ox = float(self.settings.data.get("subject_offset_x", 0.0))
+            oy = float(self.settings.data.get("subject_offset_y", 0.0))
+        except Exception:
+            ox, oy = 0.0, 0.0
+    
+        ox += dx
+        oy += dy
+    
+        lim = 100000.0
+        ox = float(max(-lim, min(lim, ox)))
+        oy = float(max(-lim, min(lim, oy)))
+    
+        try:
+            self.settings.update(subject_offset_x=ox, subject_offset_y=oy)
+        except Exception:
+            try:
+                self.settings.set("subject_offset_x", ox)
+                self.settings.set("subject_offset_y", oy)
+            except Exception:
+                return
+    
+        self._brush_dirty = True
+        self._refresh_result_from_matte(force=True)
+    
+    def _resize_cover_rgb(self, img: Image.Image, target_w: int, target_h: int) -> Image.Image:
+        """Resize an image to cover the target size (center-crop). Returns RGB."""
+        img = _pil_to_rgb(img)
+        w, h = img.size
+        if w <= 0 or h <= 0:
+            return Image.new("RGB", (target_w, target_h), (0, 0, 0))
+        if w == target_w and h == target_h:
+            return img
+
+        scale = max(float(target_w) / float(w), float(target_h) / float(h))
+        nw = max(1, int(round(w * scale)))
+        nh = max(1, int(round(h * scale)))
+
+        try:
+            resample = Image.Resampling.LANCZOS  # Pillow >= 9
+        except Exception:
+            resample = getattr(Image, "LANCZOS", Image.BICUBIC)
+
+        img_r = img.resize((nw, nh), resample)
+        left = max(0, (nw - target_w) // 2)
+        top = max(0, (nh - target_h) // 2)
+        return img_r.crop((left, top, left + target_w, top + target_h))
+
+    def _composite_cutout_with_background(self, cutout: Image.Image) -> Image.Image:
+        """Return a composited RGBA image (background + cutout)."""
+        cutout2 = self._apply_subject_scale(cutout)
+        if self._pil_bg is None:
+            return cutout2
+        bg_rgb = self._resize_cover_rgb(self._pil_bg, cutout2.width, cutout2.height)
+        bg_rgba = bg_rgb.convert("RGBA")
+        return Image.alpha_composite(bg_rgba, cutout2.convert("RGBA"))
+
+    def _refresh_result_from_matte(self, force: bool = False) -> None:
+        """Rebuild current cutout/result from the editable matte and optional background."""
+        if (not force) and (not self._brush_dirty):
+            return
+        self._brush_dirty = False
+
+        if self._pil_original is None or self._matte_arr is None:
+            return
+
+        # Cache original RGBA for fast reapply
+        if self._orig_rgba_arr is None:
+            try:
+                self._orig_rgba_arr = np.asarray(_pil_to_rgb(self._pil_original).convert("RGBA"), dtype=np.uint8)
+            except Exception:
+                return
+
+        rgba = self._orig_rgba_arr.copy()
+        try:
+            rgba[..., 3] = self._matte_arr
+        except Exception:
+            return
+
+        try:
+            cutout = Image.fromarray(rgba, mode="RGBA")
+            self._pil_cutout = cutout
+            self._pil_matte = Image.fromarray(self._matte_arr.copy(), mode="L")
+        except Exception:
+            return
+
+        # Composite with background and optional subject scaling
+        try:
+            self._pil_result = self._composite_cutout_with_background(cutout)
+        except Exception:
+            self._pil_result = cutout
+
+        self._update_result_pixmap(self._pil_result)
+
+    def _flush_brush_updates(self) -> None:
+        self._refresh_result_from_matte(force=False)
+
+
 
     # ---- Settings <-> UI
 
@@ -914,7 +1590,11 @@ class BgRemovePane(QtWidgets.QWidget):
         b6 = QtCore.QSignalBlocker(self.sl_gamma)
         b7 = QtCore.QSignalBlocker(self.sl_feather)
         b8 = QtCore.QSignalBlocker(self.sl_shrink)
-        _ = (b1, b2, b3, b4, b5, b6, b7, b8)
+        b9 = QtCore.QSignalBlocker(self.btn_mode_pan)
+        b10 = QtCore.QSignalBlocker(self.btn_mode_brush)
+        b11 = QtCore.QSignalBlocker(self.sp_brush)
+        b12 = QtCore.QSignalBlocker(self.chk_subject_scale)
+        _ = (b1, b2, b3, b4, b5, b6, b7, b8, b9, b10, b11, b12)
 
         model_key = str(s.get("model_key", ""))
         idx = self.cmb_model.findText(model_key)
@@ -949,6 +1629,42 @@ class BgRemovePane(QtWidgets.QWidget):
         idx = self.cmb_preview_bg.findText(bg)
         if idx >= 0:
             self.cmb_preview_bg.setCurrentIndex(idx)
+
+        # Mask edit mode
+        mode = str(s.get("edit_mode", "pan"))
+        self._set_edit_mode(mode, update_settings=False)
+
+        bs = int(s.get("brush_size", 40))
+        self._set_brush_size(bs, update_settings=False)
+
+        # Subject scaling UI
+        enabled = bool(s.get("subject_scale_enabled", False))
+        try:
+            scale = float(s.get("subject_scale", 1.0))
+        except Exception:
+            scale = 1.0
+        try:
+            self.chk_subject_scale.setChecked(bool(enabled))
+        except Exception:
+            pass
+        try:
+            self.lbl_subject_scale.setText(f"Subject {int(round(scale * 100.0))}%")
+        except Exception:
+            pass
+
+        # Enable/disable toggle based on current mode + whether we have a cutout.
+        self._update_subject_scale_controls()
+
+        # If subject scaling changed, re-composite result for preview/save.
+        try:
+            if (bool(enabled) != bool(getattr(self, "_last_subject_enabled", False))) or (abs(float(scale) - float(getattr(self, "_last_subject_scale", 1.0))) > 1e-4):
+                self._last_subject_enabled = bool(enabled)
+                self._last_subject_scale = float(scale)
+                self._brush_dirty = True
+                self._refresh_result_from_matte(force=True)
+        except Exception:
+            pass
+
         self._apply_preview_bg()
 
     def _on_cutoff_changed(self, v: int) -> None:
@@ -1033,6 +1749,47 @@ class BgRemovePane(QtWidgets.QWidget):
         self.settings.set("last_open_dir", str(p.parent))
         self.load_image(p)
 
+    
+    def add_background_dialog(self) -> None:
+        """Choose an image and place it behind the current cutout result."""
+        # Make sure latest brush edits are applied first.
+        try:
+            self._flush_brush_updates()
+        except Exception:
+            pass
+
+        if self._pil_original is None or self._matte_arr is None:
+            self._set_status("Run background removal first.")
+            return
+
+        start_dir = self.settings.data.get("last_bg_dir") or self.settings.data.get("last_open_dir") or str(_project_root())
+        path, _ = QtWidgets.QFileDialog.getOpenFileName(
+            self,
+            "Choose background image",
+            start_dir,
+            "Images (*.png *.jpg *.jpeg *.webp *.bmp *.tif *.tiff);;All files (*.*)",
+        )
+        if not path:
+            return
+
+        p = Path(path)
+        self.settings.set("last_bg_dir", str(p.parent))
+
+        try:
+            bg = Image.open(p)
+            bg.load()
+        except Exception as e:
+            self._set_status(f"Failed to open background image: {e}")
+            return
+
+        self._pil_bg = bg
+        self._bg_path = p
+
+        # Rebuild composite.
+        self._brush_dirty = True
+        self._refresh_result_from_matte(force=True)
+        self._set_status(f"Background set: {p.name}")
+
     def load_image(self, path: Path) -> None:
         try:
             img = Image.open(path)
@@ -1044,61 +1801,149 @@ class BgRemovePane(QtWidgets.QWidget):
         self._pil_original = img
         self._pil_result = None
         self._pil_matte = None
+        self._pil_cutout = None
+        self._pil_bg = None
+        self._bg_path = None
+        # Reset subject scaling for a new image (prevents confusing carry-over)
+        try:
+            self.settings.update(subject_scale_enabled=False, subject_scale=1.0)
+        except Exception:
+            pass
+        try:
+            self.btn_add_bg.setEnabled(False)
+        except Exception:
+            pass
+        self._matte_arr = None
+        self._orig_rgba_arr = None
+        try:
+            self._undo_stack.clear()
+        except Exception:
+            self._undo_stack = []
+        self._update_undo_button()
+        try:
+            if self._brush_timer.isActive():
+                self._brush_timer.stop()
+        except Exception:
+            pass
         self._show_original(img)
         self._show_result(None)
         self._set_status(f"Loaded: {path.name}  ({img.width}x{img.height})")
         self._fit_views()
-
     def save_png_dialog(self) -> None:
+        """Save the current result immediately (no file dialog).
+
+        Files are saved to last_save_dir (if set) or the default results folder.
+        Filenames are unique and end with a date/time stamp.
+        """
+        self._flush_brush_updates()
         if self._pil_result is None:
             self._set_status("Nothing to save. Run background removal first.")
             return
-        start_dir = self.settings.data.get("last_save_dir") or str(self._default_save_dir)
-        default_name = "result.png"
-        if self._current_path:
-            default_name = f"{self._current_path.stem}_cutout.png"
-        path, _ = QtWidgets.QFileDialog.getSaveFileName(
-            self,
-            "Save PNG",
-            str(Path(start_dir) / default_name),
-            "PNG (*.png)",
-        )
-        if not path:
-            return
-        p = Path(path)
-        try:
-            self._pil_result.save(p, format="PNG")
-            self.settings.set("last_save_dir", str(p.parent))
+        p = self._auto_save_image(self._pil_result, kind="cutout")
+        if p is not None:
             self._set_status(f"Saved: {p.name}")
-        except Exception as e:
-            self._set_status(f"Save failed: {e}")
-
+            self._toast(f"Saved to: {p}")
     def save_mask_dialog(self) -> None:
+        """Save the current matte/mask immediately (no file dialog).
+
+        Files are saved to last_save_dir (if set) or the default results folder.
+        Filenames are unique and end with a date/time stamp.
+        """
+        self._flush_brush_updates()
         if self._pil_matte is None:
             self._set_status("No mask available. Run background removal first.")
             return
-        start_dir = self.settings.data.get("last_save_dir") or str(self._default_save_dir)
-        default_name = "mask.png"
-        if self._current_path:
-            default_name = f"{self._current_path.stem}_mask.png"
-        path, _ = QtWidgets.QFileDialog.getSaveFileName(
-            self,
-            "Save mask",
-            str(Path(start_dir) / default_name),
-            "PNG (*.png)",
-        )
-        if not path:
-            return
-        p = Path(path)
-        try:
-            self._pil_matte.save(p, format="PNG")
-            self.settings.set("last_save_dir", str(p.parent))
+        p = self._auto_save_image(self._pil_matte, kind="mask")
+        if p is not None:
             self._set_status(f"Saved: {p.name}")
+            self._toast(f"Saved to: {p}")
+    def _toast(self, text: str, msec: int = 2200) -> None:
+        """Small 'toast' style popup using QToolTip (simple + dependency-free)."""
+        try:
+            pos = self.mapToGlobal(self.rect().center())
+        except Exception:
+            try:
+                pos = QtGui.QCursor.pos()
+            except Exception:
+                pos = QtCore.QPoint(0, 0)
+        try:
+            QtWidgets.QToolTip.showText(pos, text, self, self.rect(), int(msec))
+        except Exception:
+            pass
+
+    def _resolve_save_dir(self) -> Path:
+        """Return a usable save directory (and create it if needed)."""
+        try:
+            d = str(self.settings.data.get("last_save_dir") or "").strip()
+        except Exception:
+            d = ""
+        p = Path(d) if d else Path(getattr(self, "_default_save_dir", _project_root() / "output" / "images" / "rm_backgrounds"))
+        try:
+            p.mkdir(parents=True, exist_ok=True)
+        except Exception:
+            # last resort
+            p = _project_root() / "output"
+            try:
+                p.mkdir(parents=True, exist_ok=True)
+            except Exception:
+                pass
+        return p
+
+    def _timestamp_suffix(self) -> str:
+        """Return a date/time suffix (includes milliseconds) for unique filenames."""
+        try:
+            return QtCore.QDateTime.currentDateTime().toString("yyyyMMdd_HHmmss_zzz")
+        except Exception:
+            import time as _time
+            base = _time.strftime("%Y%m%d_%H%M%S", _time.localtime())
+            ms = int((_time.time() % 1.0) * 1000.0)
+            return f"{base}_{ms:03d}"
+
+    def _unique_path(self, folder: Path, stem: str, kind: str, ext: str = "png") -> Path:
+        ts = self._timestamp_suffix()
+        safe_stem = (stem or "result").strip().replace(" ", "_")
+        safe_kind = (kind or "out").strip().replace(" ", "_")
+        # Keep the timestamp at the very end (as requested). If a collision happens, insert a counter BEFORE the timestamp.
+        p = folder / f"{safe_stem}_{safe_kind}_{ts}.{ext}"
+        if not p.exists():
+            return p
+        for i in range(1, 1000):
+            cand = folder / f"{safe_stem}_{safe_kind}_{i:02d}_{ts}.{ext}"
+            if not cand.exists():
+                return cand
+        # Extremely unlikely fallback
+        try:
+            extra = int(QtCore.QDateTime.currentMSecsSinceEpoch())
+        except Exception:
+            extra = 0
+        return folder / f"{safe_stem}_{safe_kind}_{ts}_{extra}.{ext}"
+
+    def _auto_save_image(self, pil_img: Image.Image, *, kind: str) -> Optional[Path]:
+        folder = self._resolve_save_dir()
+        stem = "result"
+        try:
+            if self._current_path is not None:
+                stem = self._current_path.stem
+        except Exception:
+            pass
+
+        out_path = self._unique_path(folder, stem=stem, kind=kind, ext="png")
+        try:
+            pil_img.save(out_path, format="PNG")
+            try:
+                self.settings.set("last_save_dir", str(out_path.parent))
+            except Exception:
+                pass
+            return out_path
         except Exception as e:
             self._set_status(f"Save failed: {e}")
+            try:
+                self._toast(f"Save failed: {e}")
+            except Exception:
+                pass
+            return None
 
     # ---- Run
-
     def run_remove(self) -> None:
         if self._pil_original is None:
             self._set_status("Open an image first.")
@@ -1123,13 +1968,56 @@ class BgRemovePane(QtWidgets.QWidget):
 
     @QtCore.Slot(object, object, float, str)
     def _on_done(self, rgba: Image.Image, matte: Image.Image, ms: float, model_label: str) -> None:
+        # New base result: reset any previously chosen background.
+        self._pil_cutout = rgba
+        self._pil_bg = None
+        self._bg_path = None
+        # Reset subject scaling for a fresh cutout (user can enable again if needed)
+        try:
+            self.settings.update(subject_scale_enabled=False, subject_scale=1.0)
+        except Exception:
+            pass
+
         self._pil_result = rgba
         self._pil_matte = matte
+        try:
+            self.btn_add_bg.setEnabled(True)
+        except Exception:
+            pass
+
+        # Cache editable matte for brush edits
+        try:
+            self._matte_arr = np.asarray(matte.convert("L"), dtype=np.uint8).copy()
+        except Exception:
+            self._matte_arr = None
+
+        # Cache original RGBA for fast re-apply of edited alpha
+        try:
+            if self._pil_original is not None:
+                self._orig_rgba_arr = np.asarray(_pil_to_rgb(self._pil_original).convert("RGBA"), dtype=np.uint8)
+            else:
+                self._orig_rgba_arr = None
+        except Exception:
+            self._orig_rgba_arr = None
+
+        # Reset undo history (new base result)
+        try:
+            self._undo_stack.clear()
+        except Exception:
+            self._undo_stack = []
+        self._update_undo_button()
+
+        try:
+            self._update_subject_scale_controls()
+        except Exception:
+            pass
+
         self._show_result(rgba)
         self.progress.setVisible(False)
         self.btn_run.setEnabled(True)
         self._set_status(f"Done ({model_label}) in {ms:.0f} ms")
         self._fit_views()
+
 
     @QtCore.Slot(str)
     def _on_error(self, msg: str) -> None:
@@ -1156,6 +2044,32 @@ class BgRemovePane(QtWidgets.QWidget):
         pix = QtGui.QPixmap.fromImage(qimg)
         self._pix_b = self.scene_b.addPixmap(pix)
         self.scene_b.setSceneRect(QtCore.QRectF(pix.rect()))
+
+
+    def _update_result_pixmap(self, img: Optional[Image.Image]) -> None:
+        """Fast update for the Result preview.
+
+        Brush edits can update very frequently; we avoid clearing/rebuilding the whole scene
+        if a pixmap item already exists.
+        """
+        if img is None:
+            self._show_result(None)
+            return
+        try:
+            qimg = _qimage_from_pil(img)
+            pix = QtGui.QPixmap.fromImage(qimg)
+            if getattr(self, "_pix_b", None) is not None:
+                try:
+                    self._pix_b.setPixmap(pix)  # type: ignore[union-attr]
+                    self.scene_b.setSceneRect(QtCore.QRectF(pix.rect()))
+                    return
+                except Exception:
+                    pass
+            # Fallback: rebuild result scene
+            self._show_result(img)
+        except Exception:
+            self._show_result(img)
+
 
     def _fit_views(self) -> None:
         # Fit both, then sync transforms.
@@ -1253,7 +2167,12 @@ def _extract_video_frame(path: Path, time_s: float = 0.0) -> Optional[Image.Imag
 
 
 def _current_media_from_app(pane) -> Tuple[Optional[Path], float]:
-    """Best-effort: find current media path and current time (seconds) from the host app."""
+    """Best-effort: find current media path and current time (seconds) from the host app.
+
+    Returns: (path, time_s)
+      - time_s >= 0 : a best-effort position in seconds
+      - time_s < 0  : unknown (host did not expose a usable position)
+    """
     # Known attribute patterns in FrameVision:
     candidates = [
         getattr(pane, "current_path", None),
@@ -1270,25 +2189,83 @@ def _current_media_from_app(pane) -> Tuple[Optional[Path], float]:
             except Exception:
                 pass
 
-    # Time is optional; default to 0.
-    t = 0.0
+    # Time is optional; default to UNKNOWN.
+    t = -1.0
+
+    def _as_float(v) -> Optional[float]:
+        try:
+            if callable(v):
+                v = v()
+            if v is None:
+                return None
+            return float(v)
+        except Exception:
+            return None
+
+    def _try_seconds(obj) -> Optional[float]:
+        if obj is None:
+            return None
+        # Direct seconds attributes used in some builds
+        for attr in ("current_time_s", "time_s", "pos_s", "position_s", "playhead_s", "cursor_s"):
+            if hasattr(obj, attr):
+                vv = _as_float(getattr(obj, attr))
+                if vv is not None:
+                    return max(0.0, vv)
+        # Some widgets expose a callable current_time_s()
+        for meth in ("current_time_s", "time_s", "pos_s", "position_s"):
+            if hasattr(obj, meth) and callable(getattr(obj, meth)):
+                vv = _as_float(getattr(obj, meth))
+                if vv is not None:
+                    return max(0.0, vv)
+        return None
+
+    def _try_millis(obj) -> Optional[float]:
+        if obj is None:
+            return None
+        # Common millisecond patterns
+        for attr in ("position_ms", "pos_ms", "current_time_ms", "time_ms"):
+            if hasattr(obj, attr):
+                vv = _as_float(getattr(obj, attr))
+                if vv is not None:
+                    return max(0.0, vv) / 1000.0
+        # QtMultimedia-style position() -> ms
+        for meth in ("position",):
+            if hasattr(obj, meth) and callable(getattr(obj, meth)):
+                vv = _as_float(getattr(obj, meth))
+                if vv is not None:
+                    return max(0.0, vv) / 1000.0
+        return None
+
     try:
         main = getattr(pane, "main", None)
         vid = getattr(main, "video", None) if main is not None else None
-        # Some players expose seconds; ignore if missing.
-        for attr in ("current_time_s", "time_s", "pos_s", "position_s"):
-            if vid is not None and hasattr(vid, attr):
-                try:
-                    t = float(getattr(vid, attr))
+
+        # 1) Try seconds directly from the video widget
+        vv = _try_seconds(vid)
+        if vv is not None:
+            t = vv
+        else:
+            # 2) Try ms from a player object attached to the widget / main
+            player_candidates = [
+                vid,
+                getattr(vid, "player", None),
+                getattr(vid, "_player", None),
+                getattr(vid, "mediaPlayer", None),
+                getattr(vid, "mediaplayer", None),
+                getattr(main, "player", None) if main is not None else None,
+                getattr(main, "_player", None) if main is not None else None,
+                getattr(main, "mediaPlayer", None) if main is not None else None,
+                getattr(main, "mediaplayer", None) if main is not None else None,
+            ]
+            for pc in player_candidates:
+                vv = _try_millis(pc)
+                if vv is not None:
+                    t = vv
                     break
-                except Exception:
-                    pass
     except Exception:
         pass
 
     return pth, t
-
-
 def _try_grab_qimage_from_host(pane) -> Optional["QtGui.QImage"]:
     """Try to grab the currently shown video frame as a QImage (if the host exposes one)."""
     try:
@@ -1321,29 +2298,61 @@ def _try_grab_qimage_from_host(pane) -> Optional["QtGui.QImage"]:
 def _load_current_image_from_host(pane) -> Tuple[Optional[Image.Image], Optional[str]]:
     """Return (PIL image, label) or (None, None).
 
-    IMPORTANT: We prefer FULL-RES sources from disk (image path / ffmpeg video frame)
-    over any UI snapshot (which is often downscaled to the preview widget).
+    Goal: when the user clicks **Use current**, grab the frame that is *currently shown/playing*.
+
+    Strategy:
+      - Images: load directly from disk (full resolution).
+      - Video: prefer the *currently shown* QImage/frame from the player (correct moment),
+               and only fall back to ffmpeg extraction when we have a reliable timestamp.
     """
-    # 1) Try to resolve the currently-open media path from the host app.
+    # 1) Try to resolve the currently-open media path + playhead time from the host app.
     media_path, time_s = _current_media_from_app(pane)
+
+    # Quick helpers
+    img_exts = {".png", ".jpg", ".jpeg", ".bmp", ".tif", ".tiff", ".webp"}
+    vid_exts = {".mp4", ".mkv", ".mov", ".avi", ".webm", ".m4v", ".wmv", ".mpg", ".mpeg"}
 
     # 1a) If it's an image file, load directly from disk (full resolution).
     if media_path is not None:
         try:
-            if media_path.suffix.lower() in {".png", ".jpg", ".jpeg", ".bmp", ".tif", ".tiff", ".webp"}:
+            if media_path.suffix.lower() in img_exts:
                 im = Image.open(media_path)
                 im.load()
                 return im, media_path.name
         except Exception:
             pass
 
-        # 1b) If it's a video, extract a frame with ffmpeg at the current timestamp (full resolution).
-        try:
-            im = _extract_video_frame(media_path, time_s=time_s)
-            if im is not None:
-                return im, f"{media_path.name} @ {time_s:.2f}s"
-        except Exception:
-            pass
+        # 1b) If it's a video, prefer the currently displayed frame (most accurate).
+        if media_path.suffix.lower() in vid_exts:
+            try:
+                qimg = _try_grab_qimage_from_host(pane)
+                if qimg is not None:
+                    import tempfile as _tf
+                    from PySide6.QtGui import QPixmap as _QPixmap
+                    tmp = Path(_tf.gettempdir()) / f"fv_bgtool_qframe_{_os.getpid()}.png"
+                    _QPixmap.fromImage(qimg).save(str(tmp), "PNG")
+                    im = Image.open(tmp)
+                    im.load()
+                    return im, "current frame"
+            except Exception:
+                pass
+
+            # 1c) If we couldn't grab a frame image, fall back to ffmpeg only if time is known.
+            try:
+                if float(time_s) >= 0.0:
+                    im = _extract_video_frame(media_path, time_s=float(time_s))
+                    if im is not None:
+                        return im, f"{media_path.name} @ {float(time_s):.2f}s"
+            except Exception:
+                pass
+
+            # Last fallback for video: first frame (still better than returning nothing).
+            try:
+                im0 = _extract_video_frame(media_path, time_s=0.0)
+                if im0 is not None:
+                    return im0, f"{media_path.name} @ 0.00s"
+            except Exception:
+                pass
 
     # 2) Fallback: grab whatever the host is currently showing (often downscaled).
     try:
@@ -1360,8 +2369,6 @@ def _load_current_image_from_host(pane) -> Tuple[Optional[Image.Image], Optional
         pass
 
     return None, None
-
-
 def _bgpane_load_pil(self: "BgRemovePane", img: Image.Image, label: str = "image") -> None:
     """Load a PIL image directly into the pane (FrameVision 'Use current')."""
     try:
@@ -1372,6 +2379,13 @@ def _bgpane_load_pil(self: "BgRemovePane", img: Image.Image, label: str = "image
     self._pil_original = img
     self._pil_result = None
     self._pil_matte = None
+    self._pil_cutout = None
+    self._pil_bg = None
+    self._bg_path = None
+    try:
+        self.btn_add_bg.setEnabled(False)
+    except Exception:
+        pass
     self._show_original(img)
     self._show_result(None)
     try:

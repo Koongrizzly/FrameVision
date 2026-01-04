@@ -187,7 +187,7 @@ def qss_for_theme(name: str) -> str:
     if "tropic" in s or "fiesta" in s: return QSS_TROPICAL_FIESTA
     if "color" in s and "mix" in s: return QSS_COLOR_MIX
     if "aurora" in s: return QSS_AURORA
-    if "mardi" in s: return QSS_MARDI_GRAS
+    if "mardi" in s or ("purple" in s and "life" in s) or s == "purplelife": return QSS_MARDI_GRAS
     if "sunburst" in s: return QSS_SUNBURST
     if "pastel" in s: return QSS_PASTEL_LIGHT
     if "cloud" in s: return QSS_CLOUD_GREY
@@ -242,7 +242,7 @@ def _menu_qss(name: str) -> str:
         return rule('#FFE8D1', '#E2F0FF')
 
     # Dark-ish themes — provide lighter, clearer hover states
-    # Evening, Night, Slate, Graphite Dusk, High Contrast, Neon, Ocean, CRT, Aurora, Mardi Gras, Tropical Fiesta
+    # Evening, Night, Slate, Graphite Dusk, High Contrast, Neon, Ocean, CRT, Aurora, Purple Life, Tropical Fiesta
     return rule('#1f2937', '#172554')
 
 
@@ -440,7 +440,7 @@ QPushButton:pressed {{
 }}
 """
 
-    if "mardi" in s:
+    if "mardi" in s or ("purple" in s and "life" in s) or "purplelife" in s:
         return f"""
 QPushButton:hover {{
     border-color: {MARDI_ACCENT};
@@ -475,7 +475,7 @@ def apply_theme(app: QApplication, name: str) -> None:
     if s == "random":
         try:
             import random as _rand
-            _pool = ["Day","Solarized Light","Sunburst","Cloud Grey","Signal Grey","Evening","Night","Slate","High Contrast","Cyberpunk","Neon","Ocean","CRT","Aurora","Mardi Gras","Tropical Fiesta","Color Mix"]
+            _pool = ["Day","Solarized Light","Sunburst","Cloud Grey","Signal Grey","Evening","Night","Slate","High Contrast","Cyberpunk","Neon","Ocean","CRT","Aurora","Purple Life","Tropical Fiesta","Color Mix"]
             name = _rand.choice(_pool)
         except Exception:
             name = "Evening"
@@ -1227,7 +1227,7 @@ QScrollBar::handle:vertical {{ background: {AURORA_BORDER}; border-radius: 6px; 
 
 
 
-# --- Mardi Gras theme (purple/green/gold) --------------------------------------------------
+# --- Purple Life theme (purple/green/gold) --------------------------------------------------
 MARDI_BG = "#1B0F2A"
 MARDI_GROUP_BG = "#24123A"
 MARDI_TEXT = "#FDE68A"

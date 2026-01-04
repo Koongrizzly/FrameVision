@@ -415,6 +415,18 @@ class Txt2ImgPane(QWidget):
             except Exception:
                 pass
             try:
+                if hasattr(self, "zimg_init_enable") and "init_image_enabled" in s:
+                    self.zimg_init_enable.setChecked(bool(s.get("init_image_enabled", False)))
+                if hasattr(self, "zimg_init_path") and "init_image" in s:
+                    self.zimg_init_path.setText(str(s.get("init_image") or ""))
+                if hasattr(self, "zimg_strength") and "img2img_strength" in s:
+                    try:
+                        self.zimg_strength.setValue(float(s.get("img2img_strength") or 0.35))
+                    except Exception:
+                        pass
+            except Exception:
+                pass
+            try:
                 if hasattr(self, 'seed') and 'seed' in s:
                     self.seed.setValue(int(s.get('seed') or 0))
                 sp = (s.get('seed_policy') or '').lower()
@@ -1302,6 +1314,99 @@ class Txt2ImgPane(QWidget):
             pass
 
         form.addRow("Negative", self.negative)
+
+        # Z-Image: optional image-to-image (init image) to help keep the same person/composition
+        try:
+            self.zimg_init_enable = QCheckBox("Use init image (img2img)")
+            try:
+                self.zimg_init_enable.setToolTip("Optional: provide an initial image and Z-Image will generate a variation of it. Useful for keeping the same person.")
+            except Exception:
+                pass
+            self.zimg_init_path = QLineEdit()
+            try:
+                self.zimg_init_path.setPlaceholderText("Choose an image (optional)…")
+            except Exception:
+                pass
+            self.zimg_init_browse = QPushButton("Browse")
+            self.zimg_init_clear = QPushButton("Clear")
+            self.zimg_strength = QDoubleSpinBox()
+            try:
+                self.zimg_strength.setRange(0.0, 1.0)
+                self.zimg_strength.setSingleStep(0.05)
+                self.zimg_strength.setDecimals(2)
+                self.zimg_strength.setValue(0.35)
+                self.zimg_strength.setToolTip("Denoising strength: lower = closer to the input image; higher = more change.")
+            except Exception:
+                pass
+
+            def _zimg_i2i_sync_enabled(*_):
+                try:
+                    en = bool(self.zimg_init_enable.isChecked())
+                except Exception:
+                    en = False
+                for _w in (getattr(self, "zimg_init_path", None),
+                           getattr(self, "zimg_init_browse", None),
+                           getattr(self, "zimg_init_clear", None),
+                           getattr(self, "zimg_strength", None)):
+                    try:
+                        if _w is not None:
+                            _w.setEnabled(en)
+                    except Exception:
+                        pass
+
+            try:
+                self.zimg_init_enable.toggled.connect(_zimg_i2i_sync_enabled)
+            except Exception:
+                pass
+
+            def _zimg_pick_init_image():
+                try:
+                    fn, _ = QFileDialog.getOpenFileName(
+                        self,
+                        "Select init image",
+                        "",
+                        "Images (*.png *.jpg *.jpeg *.webp *.bmp)"
+                    )
+                except Exception:
+                    fn = ""
+                if fn:
+                    try:
+                        self.zimg_init_path.setText(fn)
+                        self.zimg_init_enable.setChecked(True)
+                    except Exception:
+                        pass
+
+            def _zimg_clear_init_image():
+                try:
+                    self.zimg_init_path.setText("")
+                except Exception:
+                    pass
+
+            try:
+                self.zimg_init_browse.clicked.connect(_zimg_pick_init_image)
+                self.zimg_init_clear.clicked.connect(_zimg_clear_init_image)
+            except Exception:
+                pass
+
+            zimg_i2i_wrap = QWidget()
+            zimg_i2i_row = QHBoxLayout(zimg_i2i_wrap)
+            zimg_i2i_row.setContentsMargins(0, 0, 0, 0)
+            zimg_i2i_row.addWidget(self.zimg_init_enable, 0)
+            zimg_i2i_row.addWidget(self.zimg_init_path, 1)
+            zimg_i2i_row.addWidget(QLabel("Strength"), 0)
+            zimg_i2i_row.addWidget(self.zimg_strength, 0)
+            zimg_i2i_row.addWidget(self.zimg_init_browse, 0)
+            zimg_i2i_row.addWidget(self.zimg_init_clear, 0)
+
+            self.zimg_i2i_label = QLabel("Init image")
+            self.zimg_i2i_wrap = zimg_i2i_wrap
+            form.addRow(self.zimg_i2i_label, self.zimg_i2i_wrap)
+
+            _zimg_i2i_sync_enabled()
+        except Exception:
+            # UI is best-effort; older builds may not have all widgets available
+            self.zimg_i2i_label = None
+            self.zimg_i2i_wrap = None
 
         # Seed + seed policy (Batch moved next to Generate button)
         row = QHBoxLayout()
@@ -2403,6 +2508,14 @@ class Txt2ImgPane(QWidget):
         is_zimage = key.startswith("zimage")
         is_gguf = (key == "zimage_gguf")
 
+        # Z-Image-only UI: init-image (img2img) row
+        try:
+            for _w in (getattr(self, "zimg_i2i_label", None), getattr(self, "zimg_i2i_wrap", None)):
+                if _w is not None:
+                    _w.setVisible(bool(is_zimage))
+        except Exception:
+            pass
+
         # If switching to Z-Image, aggressively try to free CUDA VRAM
         if is_zimage:
             try:
@@ -3480,6 +3593,9 @@ class Txt2ImgPane(QWidget):
             "engine": engine_key,
             "prompt": self.prompt.toPlainText().strip(),
             "negative": self.negative.toPlainText().strip(),
+            "init_image_enabled": bool(getattr(self, "zimg_init_enable", None).isChecked()) if getattr(self, "zimg_init_enable", None) is not None else False,
+            "init_image": (getattr(self, "zimg_init_path", None).text().strip() if getattr(self, "zimg_init_path", None) is not None else ""),
+            "img2img_strength": float(getattr(self, "zimg_strength", None).value()) if getattr(self, "zimg_strength", None) is not None else 0.35,
             "seed": seed,
             "seed_policy": ["fixed","random","increment"][self.seed_policy.currentIndex()],
             "batch": int(self.batch.value()),
@@ -3679,6 +3795,12 @@ class Txt2ImgPane(QWidget):
         try: d["prompt"] = self.prompt.toPlainText().strip()
         except Exception: pass
         try: d["negative"] = self.negative.toPlainText().strip()
+        except Exception: pass
+        try: d["init_image_enabled"] = bool(getattr(self, "zimg_init_enable", None).isChecked()) if getattr(self, "zimg_init_enable", None) is not None else False
+        except Exception: pass
+        try: d["init_image"] = getattr(self, "zimg_init_path", None).text().strip() if getattr(self, "zimg_init_path", None) is not None else ""
+        except Exception: pass
+        try: d["img2img_strength"] = float(getattr(self, "zimg_strength", None).value()) if getattr(self, "zimg_strength", None) is not None else 0.35
         except Exception: pass
         try: d["seed"] = int(self.seed.value())
         except Exception: pass
@@ -4524,6 +4646,27 @@ def _gen_via_zimage(job: dict, out_dir: Path, progress_cb=None):
         "--fmt", fmt,
         "--filename_template", fname_tmpl,
     ]
+
+    # Optional: image-to-image (init image) for Z-Image (and GGUF) to keep identity/composition
+    try:
+        init_img = (job.get("init_image") or "").strip()
+    except Exception:
+        init_img = ""
+    try:
+        init_enabled = bool(job.get("init_image_enabled", True))
+    except Exception:
+        init_enabled = True
+    if init_enabled and init_img:
+        try:
+            strength = float(job.get("img2img_strength", 0.35))
+        except Exception:
+            strength = 0.35
+        # Clamp to sane range
+        try:
+            strength = max(0.0, min(1.0, strength))
+        except Exception:
+            strength = 0.35
+        args += ["--init-image", str(init_img), "--strength", str(strength)]
 
     # Backend switch: Diffusers (default) vs GGUF (stable-diffusion.cpp)
     try:
