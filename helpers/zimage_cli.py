@@ -99,64 +99,6 @@ def _sanitize_sdcli_text(s: str) -> str:
             return ""
 
 
-
-def _find_ffmpeg(root: Path) -> str:
-    """
-    Prefer the app-bundled ffmpeg if present:
-      <root>/presets/bin/ffmpeg.exe
-    Fallback to "ffmpeg" on PATH.
-    """
-    try:
-        cand = root / "presets" / "bin" / "ffmpeg.exe"
-        if cand.exists():
-            return str(cand)
-        cand2 = root / "presets" / "bin" / "ffmpeg"
-        if cand2.exists():
-            return str(cand2)
-    except Exception:
-        pass
-    return "ffmpeg"
-
-
-def _prep_init_image_for_sdcli(init_path: Path, w: int, h: int, root: Path, log_path: Path | None = None) -> Path:
-    """
-    sd-cli builds can be picky about JPEG variants and/or mismatched init sizes.
-    We normalize by converting to a temp PNG (and resizing if needed) using ffmpeg.
-    Returns the path to a PNG to pass to --init-img.
-    If ffmpeg isn't available or conversion fails, returns the original path.
-    """
-    try:
-        if not init_path.exists():
-            return init_path
-        # Use a project-local temp folder for portability.
-        tdir = root / "temp" / "zimage_cli"
-        tdir.mkdir(parents=True, exist_ok=True)
-        out_png = tdir / (f"init_{int(time.time())}_{abs(hash(str(init_path))) % 1000000}.png")
-
-        ffmpeg = _find_ffmpeg(root)
-
-        # Always force a single-frame PNG and scale to requested W/H.
-        cmd = [
-            ffmpeg, "-y",
-            "-i", str(init_path),
-            "-vf", f"scale={w}:{h}:flags=lanczos",
-            "-frames:v", "1",
-            str(out_png),
-        ]
-        try:
-            if log_path:
-                with open(log_path, "a", encoding="utf-8", errors="ignore") as f:
-                    f.write("FFMPEG_INIT: " + " ".join(cmd) + "\n")
-        except Exception:
-            pass
-
-        p = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, encoding="utf-8", errors="ignore")
-        if p.returncode == 0 and out_png.exists():
-            return out_png
-        return init_path
-    except Exception:
-        return init_path
-
 def _run_gguf(args) -> dict:
     """
     Run Z-Image Turbo GGUF via stable-diffusion.cpp sd-cli.exe.
@@ -270,25 +212,22 @@ def _run_gguf(args) -> dict:
             "--guidance", str(guidance),
         ]
 
-        init_image = str(getattr(args, 'init_image', '') or '').strip()
-        strength = float(getattr(args, 'strength', 0.0) or 0.0)
-        if init_image:
+
+        # Optional img2img: if an init image is provided, switch sd-cli to img2img mode
+        try:
+            init_img = str(getattr(args, "init_image", "") or "").strip()
+        except Exception:
+            init_img = ""
+        if init_img:
             try:
-                ip = Path(init_image)
-                if not ip.is_absolute():
-                    ip = (root / ip).resolve()
-                # Normalize init image for sd-cli (PNG + resize)
-                ip2 = _prep_init_image_for_sdcli(ip, w, h, root, log_path)
-                if strength <= 0.0:
-                    strength = 0.30
-                # Clamp to 0..1
-                strength = max(0.0, min(1.0, float(strength)))
-                cmd += ['--mode', 'img2img', '--init-img', str(ip2), '--strength', str(strength)]
-                _log(f"IMG2IMG: init={ip2} strength={strength}")
-            except Exception as _e:
-                _log(f"IMG2IMG_WARN: { _e }")
-
-
+                strength = float(getattr(args, "strength", 0.35))
+            except Exception:
+                strength = 0.35
+            try:
+                strength = max(0.0, min(1.0, strength))
+            except Exception:
+                strength = 0.35
+            cmd += ["--mode", "img2img", "--init-img", init_img, "--strength", str(strength)]
         if getattr(args, "attn_slicing", False):
             # Use as "low-vram mode" for gguf backend
             cmd += ["--vae-tiling", "--offload-to-cpu", "--clip-on-cpu", "--vae-on-cpu"]
@@ -339,10 +278,10 @@ def main(argv=None) -> int:
     parser.add_argument("--outdir", required=True)
     parser.add_argument("--fmt", default="png")
     parser.add_argument("--filename_template", default="zimage_{seed}_{idx:03d}.png")
-    # Optional: init image for img2img (keeps subject/reference).
-    parser.add_argument("--init-image", dest="init_image", default="", help="Optional init image path for img2img.")
-    # Img2img strength: 0..1, where lower keeps more of the init image.
-    parser.add_argument("--strength", type=float, default=0.0, help="Img2img strength (0..1).")
+
+    # Optional img2img: pass an init image and strength to generate variations
+    parser.add_argument("--init-image", dest="init_image", default="")
+    parser.add_argument("--strength", type=float, default=0.35)
     # Optional: explicit attention-slicing flag from UI / caller.
     parser.add_argument("--attn-slicing", action="store_true", default=False)
     # Seed variance enhancer (Turbo): optional prompt-embedding noise.
@@ -370,7 +309,7 @@ def main(argv=None) -> int:
 
     try:
         import torch  # type: ignore
-        from diffusers import ZImagePipeline, AutoPipelineForImage2Image  # type: ignore
+        from diffusers import ZImagePipeline, ZImageImg2ImgPipeline  # type: ignore
     except Exception as e:
         payload = {"files": [], "error": f"import_failed: {e}"}
         print(json.dumps(payload))
@@ -419,29 +358,19 @@ def main(argv=None) -> int:
         if not model_dir.exists():
             raise RuntimeError(f"model_dir_not_found: {model_dir}")
 
-        
-        # If an init image is supplied, switch to img2img so the input image is actually used.
-        init_image_path = str(getattr(args, "init_image", "") or "").strip()
-        if init_image_path:
-            try:
-                from PIL import Image  # type: ignore
-            except Exception as e:
-                raise RuntimeError(f"init-image requires Pillow (PIL). Install pillow in .zimage_env. ({e})")
-            pipe = AutoPipelineForImage2Image.from_pretrained(
-                model_dir,
-                torch_dtype=dtype,
-                local_files_only=True,
-            )
-            try:
-                print(f"[zimage_cli] Using IMG2IMG pipeline (AutoPipelineForImage2Image). init-image={init_image_path}")
-            except Exception:
-                pass
-        else:
-            pipe = ZImagePipeline.from_pretrained(
-                model_dir,
-                torch_dtype=dtype,
-                local_files_only=True,
-            )
+        init_img_path = ""
+        try:
+            init_img_path = str(getattr(args, "init_image", "") or "").strip()
+        except Exception:
+            init_img_path = ""
+        pipe_cls = ZImageImg2ImgPipeline if init_img_path else ZImagePipeline
+
+        pipe = pipe_cls.from_pretrained(
+            str(model_dir),
+            torch_dtype=dtype if device == "cuda" else torch.float32,
+            low_cpu_mem_usage=True,
+            local_files_only=True,
+        )
 
         if device == "cuda":
             # Prefer Diffusers' CPU offload to keep VRAM reasonable.
@@ -691,12 +620,34 @@ def main(argv=None) -> int:
                 height=int(args.height),
                 width=int(args.width),
                 num_inference_steps=max(1, int(args.steps or 1)),
-                guidance_scale=max(0.1, float(args.guidance or 0.0)),
+                guidance_scale=float(args.guidance or 0.0),
                 generator=gen,
             )
             neg = (args.negative or "").strip()
             if neg:
                 kwargs["negative_prompt"] = neg
+            # Optional img2img: add init image + strength
+            if init_img_path:
+                try:
+                    from PIL import Image  # type: ignore
+                    img0 = Image.open(init_img_path).convert("RGB")
+                    # Match requested output size; the pipeline expects a PIL image
+                    try:
+                        img0 = img0.resize((int(args.width), int(args.height)), resample=getattr(Image, "LANCZOS", 1))
+                    except Exception:
+                        pass
+                    kwargs["image"] = img0
+                    try:
+                        s = float(getattr(args, "strength", 0.35))
+                    except Exception:
+                        s = 0.35
+                    try:
+                        s = max(0.0, min(1.0, s))
+                    except Exception:
+                        s = 0.35
+                    kwargs["strength"] = s
+                except Exception:
+                    pass
             # Optional: seed variance enhancer (Turbo)
             if sv_enabled and sv_strength > 0:
                 try:
@@ -711,41 +662,6 @@ def main(argv=None) -> int:
                             kwargs["negative_prompt_embeds"] = ne
                 except Exception:
                     pass
-            
-            # If running img2img, inject the init image + strength.
-            if init_image_path:
-                try:
-                    from PIL import Image  # type: ignore
-                    ip = Path(init_image_path)
-                    if not ip.is_absolute():
-                        ip = (root / ip).resolve()
-                    img0 = Image.open(str(ip)).convert("RGB")
-                    # Resize to requested output size if needed (keeps model happy with exact W/H).
-                    try:
-                        tw, th = int(getattr(args, "width", img0.size[0])), int(getattr(args, "height", img0.size[1]))
-                        if img0.size != (tw, th):
-                            img0 = img0.resize((tw, th), Image.LANCZOS)
-                    except Exception:
-                        pass
-
-                    s = float(getattr(args, "strength", 0.0) or 0.0)
-                    if s <= 0.0:
-                        s = 0.30
-                    s = max(0.0, min(1.0, s))
-                    # AutoPipelineForImage2Image expects "image" + "strength".
-                    kwargs["image"] = img0
-                    kwargs["strength"] = s
-                    # Some pipelines don't like width/height kwargs for img2img. Drop them if present.
-                    if "width" in kwargs:
-                        kwargs.pop("width", None)
-                    if "height" in kwargs:
-                        kwargs.pop("height", None)
-                    try:
-                        print(f"[zimage_cli] IMG2IMG active: strength={s} init={ip}")
-                    except Exception:
-                        pass
-                except Exception as e:
-                    raise RuntimeError(f"Failed to load init-image: {e}")
             result = pipe(**kwargs)
             img = result.images[0]
         except Exception as e:
