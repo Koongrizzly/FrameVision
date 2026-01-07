@@ -2,17 +2,17 @@
 #!/usr/bin/env python3
 
 """
-downloadbg.py — v3.9
+downloadbg.py — v3.10
 - Pre-check destination folders BEFORE any download (prevents re-fetching huge files)
 - Reconciliation FIRST: move scripts/models -> project root models/, then clean
 - Adds --force to re-download even if destination already has the file
 - UltraSharp NCNN (Hugging Face) + SRMD (GitHub) upscaler downloads to models/realesrgan
-- Default = ALL models when no flags passed
-- NEW v3.9: Faster-Whisper "medium" model downloader to models/faster_whisper/medium
+- Default = ALL models when no flags passed (except Faster-Whisper)
+- Faster-Whisper "medium" model downloader is opt-in via --fw-medium (downloads to models/faster_whisper/medium)
 """
 import argparse, hashlib, os, sys, urllib.request, urllib.error, pathlib, shutil, time, math, zipfile, io
 
-VERSION = "v3.9"
+VERSION = "v3.10"
 
 # ------------------------------
 # Model registries
@@ -438,7 +438,7 @@ def main():
     ap.add_argument("--ultrasharp", action="store_true", help="Download UltraSharp NCNN files to models/realesrgan")
     ap.add_argument("--srmd", action="store_true", help="Download SRMD models (nihui) to models/realesrgan")
     ap.add_argument("--fw-medium", action="store_true", help="Download Faster-Whisper medium model (≈1.6 GB) to models/faster_whisper/medium")
-    ap.add_argument("--all", action="store_true", help="Download ALL supported models (includes UltraSharp+SRMD+Faster-Whisper medium)")
+    ap.add_argument("--all", action="store_true", help="Download ALL supported models (includes UltraSharp+SRMD+RealESRGAN extras; excludes Faster-Whisper unless --fw-medium)")
     only_choices = list(MODELS.keys()) if isinstance(globals().get("MODELS"), dict) else None
     ap.add_argument("--only", nargs="+", choices=only_choices, help="Download only these model keys (space-separated)")
     ap.add_argument("--hf-token", default=None, help="Hugging Face access token (overrides HF_TOKEN/HUGGINGFACE_TOKEN env vars)")
@@ -563,7 +563,7 @@ def main():
             pass
 
     # 6) Faster-Whisper medium model
-    include_fw_medium = args.fw_medium or selected_default_all or args.all
+    include_fw_medium = args.fw_medium
     fw_tmp = pathlib.Path("scripts") / "_tmp_fasterwhisper"
     try:
         if include_fw_medium:
@@ -582,7 +582,12 @@ def main():
         print("[done] Completed with errors.", file=sys.stderr)
         return 1
 
-    print("[done] Upscaler models + Faster-Whisper medium ready in", ROOT_MODELS.resolve(), ",", ROOT_REALESRGAN.resolve(), "and", ROOT_FWHISPER_MEDIUM.resolve())
+    parts = [str(ROOT_MODELS.resolve()), str(ROOT_REALESRGAN.resolve())]
+    if include_fw_medium:
+        parts.append(str(ROOT_FWHISPER_MEDIUM.resolve()))
+        print("[done] Models ready in " + ", ".join(parts))
+    else:
+        print("[done] Models ready in " + ", ".join(parts) + " (Faster-Whisper skipped; use --fw-medium to download)")
     return 0
 
 if __name__ == "__main__":
