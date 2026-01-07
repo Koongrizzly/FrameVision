@@ -65,40 +65,6 @@
       ],
       "_layout": "overview/features/install/troubleshoot"
     },
-    "Did_You_Know": {
-      "description": "Tips, tricks, and first‑time‑use advice to help you get the most out of FrameVision.",
-      "overview": "A grab‑bag of helpful shortcuts, hidden features, and practical advice—especially useful on your first days with the app.<br><br>",
-      "key_terms": [
-        "Did you know",
-        "easter egg",
-        "Use low memory (streaming)",
-        "Use current",
-        "View results",
-        "Media Explorer",
-        "Optional downloads",
-        "Enable diagnostics logging",
-        "Clean finished results",
-        "RIFE",
-        "HunyuanVideo 1.5",
-        "System Monitor HUD"
-      ],
-      "hints_tips": [
-        "On the opening screen, quickly click anywhere <b>4×</b> to trigger a hidden easter egg.",
-        "Use the app over time to unlock more easter eggs. (Cheat code: leave the app open overnight.)",
-        "Image upscaling is usually fast (especially the <b>Anime</b> upscalers). Video upscaling is slower and can use a lot of memory — enable the <b>Use low memory (streaming)</b> toggle for longer videos. It’s slower, but safer.",
-        "<b>RIFE</b> has two main speed modes: <b>Slow (CPU)</b> and <b>Superfast (GPU)</b>. Slow can look a bit cleaner; Superfast is great for previews. The <b>4K preset + Superfast</b> combo is often “good enough”.",
-        "Many tools include <b>Use current</b>. It grabs the exact frame currently shown in the Media Player (or the currently loaded image) at the moment you click it.",
-        "Most tools also have a <b>View results</b> button. It opens Media Explorer on that tool’s last output folder, scans it, and lets you preview results and inspect JSON sidecars.",
-        "Known quirk: in this Knowledge Base version, <b>Trim Tool → Preview</b> may freeze the UI while thumbnails load (especially with 50+ preview thumbs). Wait a few seconds — it should recover once the preview is ready.",
-        "You can reorder tabs or tools to fit your workflow. Find more toggles like this in the <b>Settings</b> tab.",
-        "Don’t leave <b>Enable diagnostics logging</b> on unless you need it — logs can grow endlessly and may slow down video playback and beat‑synced music visuals.",
-        "If video playback stutters and the Queue tab toggles (pause refresh while video is playing / auto cleanup queue) don’t help, use <b>Queue → Clean finished results</b> to clear old items manually.",
-        "On first install, many AI models won’t be downloaded yet. You can install them from the <b>Optional downloads</b> menu.",
-        "Some model downloads are huge and can look “stuck” on slower connections — check the <b>System Monitor HUD</b> at the top to confirm download speed/activity.",
-        "<b>Hunyuan 1.5</b> can download new variants directly inside the tab and shows almost no logging. That’s normal — let it run, and watch the HUD to confirm it’s still downloading."
-      ],
-      "_layout": "overview/hints_tips"
-    },
     "Ace_Music_creation": {
       "description": "Generate music locally using the ACE-Step model. Supports <b>text → music</b> and optional <b>audio → audio</b> guidance via a reference track. Runs ACE in its own dedicated environment to avoid dependency conflicts, then saves a <code>.wav</code> to your output folder.",
       "key_terms": [
@@ -481,6 +447,131 @@
       ],
       "_layout": "overview/features/install/troubleshoot"
     },
+    "Background_Remover": {
+      "description": "Remove image backgrounds locally (no cloud) and save a transparent cutout (PNG) or the raw mask. Includes brush touch‑ups, preview background modes, and optional background replacement + subject scaling.",
+      "key_terms": [
+        "Background Remover",
+        "BgRemovePane",
+        "BiRefNet",
+        "MODNet",
+        "ONNX",
+        "models/bg/",
+        "output/images/rm_backgrounds",
+        "cutout PNG (transparent)",
+        "mask / matte",
+        "Brush mode",
+        "Undo (10)",
+        "Cutoff",
+        "Gamma",
+        "Feather",
+        "Shrink/Grow",
+        "Preview BG checker/white/black/color",
+        "Add background",
+        "Change subject size",
+        "Use current",
+        "View results"
+      ],
+      "overview": "Background Remover is a <b>local</b> cutout tool: it turns an image into a <b>transparent subject PNG</b> plus an optional <b>mask</b>.<br><br><b>Typical workflow:</b><br><ol><li><b>Open image</b> (or use <b>Use current</b> in the Tools tab to grab the current frame).</li><li>Pick a <b>Model</b> (MODNet for portraits/fast; BiRefNet for general objects/cleaner edges).</li><li>Click <b>Remove background</b>.</li><li>Refine edges with <b>Cutoff/Gamma/Feather/Shrink-Grow</b>, and do manual touch‑ups in <b>Brush</b> mode.</li><li>Optional: click <b>Add background</b> to composite a new background behind the cutout, then use <b>Change subject size</b> to scale/move the subject relative to that background.</li><li>Save with <b>Save PNG</b> (transparent cutout or composited result) and/or <b>Save mask</b>.</li></ol><br><b>Where results go:</b> files auto‑save to the last used folder, otherwise to <code>output/images/rm_backgrounds</code>. Filenames are unique and end with a timestamp.",
+      "features": [
+        "Two matting models: <b>MODNet (portraits, fast)</b> and <b>BiRefNet (general objects, slow)</b>.",
+        "Side‑by‑side previews: <b>Original</b> and <b>Result</b>, with synced pan/zoom and a Fit button.",
+        "Edge tuning controls: <b>Cutoff</b> (foreground threshold), <b>Gamma</b> (edge shaping), <b>Feather</b> (soften), <b>Shrink/Grow</b> (tighten/expand matte).",
+        "Manual mask editing: <b>Brush</b> mode with Left‑drag (remove) and Right‑drag (restore), plus <b>Undo</b> (up to 10 strokes).",
+        "Preview background modes: checker, white, black, or a custom color (helps spot fringe).",
+        "Optional background replacement: <b>Add background</b> places a new image behind the cutout (center‑crop cover).",
+        "Subject scaling & positioning: <b>Change subject size</b> repurposes the mouse wheel to scale the cutout (10%–400%); in this mode, left‑drag moves the subject instead of panning.",
+        "Persistent settings stored in <code>presets/setsave/bg_remove.json</code>."
+      ],
+      "notes": [
+        "Model files are expected in <code>models/bg/</code>. If they’re missing, the tool shows a “Missing model files” message and disables Remove background.",
+        "The default inference path uses ONNX Runtime in CPU mode (portable & predictable).",
+        "Brush edits update the matte rapidly; if you’re doing a lot of brushing, hit <b>Save PNG</b> after you finish so the latest edits are flushed.",
+        "Change subject size is intentionally disabled in Brush mode (the wheel is reserved for brush interactions and coordinate stability)."
+      ],
+      "hints_tips": [
+        "If edges look ‘halo‑y’, try: increase <b>Cutoff</b> slightly, then add a small <b>Shrink</b> (negative Shrink/Grow) and a touch of <b>Feather</b>.",
+        "If edges look jagged, bump <b>Quality</b> (ref long‑side) and add a little <b>Feather</b> rather than pushing Gamma too hard.",
+        "Use <b>Preview BG → black</b> to spot light fringes; use <b>white</b> to spot dark fringes; use <b>checker</b> to quickly see transparency issues.",
+        "For portraits, start with <b>MODNet</b>. For objects with holes/complex outlines (bikes, plants), try <b>BiRefNet</b> then touch up with Brush.",
+        "When <b>Change subject size</b> is enabled: mouse wheel scales the subject; left‑drag moves the subject. Use the Zoom slider/buttons to zoom the view instead.",
+        "If you want to keep the background but soften it, you can export the mask and use it elsewhere (or re‑composite in another editor)."
+      ],
+      "qa_pairs": [
+        {
+          "question": "Where do the Background Remover results get saved?",
+          "answer": "It auto‑saves to the last save folder you used (<code>last_save_dir</code>). If none is set yet, it saves to <code>output/images/rm_backgrounds</code>. Filenames are unique and end with a timestamp."
+        },
+        {
+          "question": "Which model should I choose: MODNet or BiRefNet?",
+          "answer": "Start with <b>MODNet</b> for portraits (fast, good hair/skin). Use <b>BiRefNet</b> for general objects (often cleaner object edges but slower). The UI also shows a tip when models are available."
+        },
+        {
+          "question": "What’s the difference between Save PNG and Save mask?",
+          "answer": "<b>Save PNG</b> saves the current result image (transparent cutout, or composited if you added a background). <b>Save mask</b> saves the matte/mask (grayscale) used as the alpha channel."
+        },
+        {
+          "question": "How do I fix small mistakes in the mask?",
+          "answer": "Switch to <b>Brush</b> mode. <b>Left‑drag</b> removes (more transparent). <b>Right‑drag</b> restores (more opaque). Use <b>Size</b> to change brush size and <b>Undo</b> to step back (up to 10 strokes)."
+        },
+        {
+          "question": "Why is “Change subject size” greyed out?",
+          "answer": "It becomes available only after a cutout exists (you ran Remove background) and only in <b>Pan/Zoom</b> mode. It’s disabled while brushing to avoid wheel‑mode conflicts."
+        },
+        {
+          "question": "My subject got smaller/bigger when I used the mouse wheel—why?",
+          "answer": "That happens when <b>Change subject size</b> is enabled. In that mode, the mouse wheel scales the cutout relative to the background. Use the Zoom slider/buttons for view zoom."
+        },
+        {
+          "question": "Why is Add background disabled?",
+          "answer": "Add background is enabled only after you successfully run <b>Remove background</b>. It needs the matte/cutout to composite correctly."
+        },
+        {
+          "question": "Can I use the tool on a frame from a video?",
+          "answer": "Yes. In the FrameVision Tools tab build, <b>Use current</b> grabs the currently displayed frame from the Media Player and loads it into Background Remover."
+        },
+        {
+          "question": "What does Quality do?",
+          "answer": "Quality controls the long‑side resize before inference (higher is sharper but slower). It’s stored as <code>ref_long_side</code>."
+        }
+      ],
+      "controls": [
+        "Open image — button. Does: Load an image file (png/jpg/webp/bmp/tif…).",
+        "Remove background — button. Does: Run the selected model and build a cutout + matte.",
+        "Add background — button. Does: Choose an image and composite it behind the cutout (cover/center‑crop).",
+        "Mode: Pan/Zoom — toggle. Does: Drag pans the view; wheel zooms (unless Change subject size is enabled).",
+        "Mode: Brush — toggle. Does: Edit the matte; Left drag removes, Right drag restores.",
+        "Size — spinbox. Does: Brush size in pixels (only enabled in Brush mode).",
+        "Undo — button. Does: Undo last brush stroke (up to 10).",
+        "Change subject size — checkbox. Does: Switch wheel to scale the subject relative to the background; left‑drag moves the subject.",
+        "Fit — button. Does: Fit both previews to the image.",
+        "Zoom: - / + / 100% / slider — controls. Does: View zoom controls (use these when Change subject size is enabled).",
+        "Save PNG — button. Does: Auto‑save the current result to the output folder (unique timestamped filename).",
+        "Save mask — button. Does: Auto‑save the matte/mask (grayscale PNG).",
+        "Model — dropdown. Does: Choose BiRefNet or MODNet.",
+        "Quality — spinbox. Does: Long‑side resize before inference (256–2048).",
+        "Normalize — dropdown. Does: Select input normalization (-1..1 vs none).",
+        "Cutoff — slider. Does: Foreground cutoff; higher removes more background but can eat edges.",
+        "Gamma — slider. Does: Edge shaping; < 1 keeps more foreground; > 1 tightens.",
+        "Feather — slider. Does: Blur radius for smoother edges.",
+        "Shrink/Grow — slider. Does: Shrink (<0) or grow (>0) the matte.",
+        "Preview BG — dropdown + Pick color. Does: Set preview backdrop (checker/white/black/custom) to spot fringes.",
+        "Use current — button (Tools tab). Does: Load the current frame from the Media Player into this tool.",
+        "View results — button (Tools tab). Does: Open Media Explorer at the results folder and rescan."
+      ],
+      "install": [
+        "Ensure the two model files exist in <code>models/bg/</code>: <code>modnet.onnx</code> and <code>BiRefNet-COD-epoch_125.onnx</code> (names must match).",
+        "If you’re using the FrameVision Tools tab integration, look for <b>Background Remover</b> under Tools; <b>Use current</b> and <b>View results</b> may be present depending on build.",
+        "Settings persist in <code>presets/setsave/bg_remove.json</code>. Deleting that file resets the tool to defaults."
+      ],
+      "troubleshoot": [
+        "Remove background button is disabled and you see “Missing model files”: confirm the ONNX files exist in <code>models/bg/</code> and are not renamed.",
+        "Edges look too ‘eaten’: lower <b>Cutoff</b>, lower <b>Gamma</b> slightly, and consider <b>Grow</b> (positive Shrink/Grow) instead of heavy Feather.",
+        "Edges look too wide/halo‑y: raise <b>Cutoff</b> a little, add slight <b>Shrink</b> (negative Shrink/Grow), and use Brush to fix small holes.",
+        "Add background looks cropped strangely: it uses a cover/center‑crop fit to match the cutout size; pick a background with the same aspect ratio for minimal crop.",
+        "If the tool crashes immediately, check the general logs and verify your Python environment has ONNX Runtime installed (FrameVision’s installer normally handles this)."
+      ],
+      "_layout": "overview/features/notes/hints_tips/controls/install/troubleshoot"
+    },
     "Describe_AI": {
       "description": "Vision captioning &amp; prompt generation via Qwen3‑VL‑2B Instruct (rich, multi‑sentence) and BLIP (quick, short captions). Works on CPU (slower) and CUDA (faster). Inputs: current player frame or files/folders; outputs: clipboard and sidecar.txt. Advanced controls expose decoding and length behavior.<br><br>",
       "key_terms": [
@@ -768,6 +859,41 @@
         "oneliners_source": "helpers/ code scan",
         "oneliners_count_added": 40
       }
+    },
+    "Did_You_Know": {
+      "description": "Tips, tricks, and first‑time‑use advice to help you get the most out of FrameVision.",
+      "overview": "A grab‑bag of helpful shortcuts, hidden features, and practical advice—especially useful on your first days with the app.<br><br>",
+      "key_terms": [
+        "Did you know",
+        "easter egg",
+        "Use low memory (streaming)",
+        "Use current",
+        "View results",
+        "Media Explorer",
+        "Optional downloads",
+        "Enable diagnostics logging",
+        "Clean finished results",
+        "RIFE",
+        "HunyuanVideo 1.5",
+        "System Monitor HUD"
+      ],
+      "hints_tips": [
+        "On the opening screen, quickly click anywhere <b>4×</b> to trigger a hidden easter egg.",
+        "Use the app over time to unlock more easter eggs. (Cheat code: leave the app open overnight.)",
+        "Image upscaling is usually fast (especially the <b>Anime</b> upscalers). Video upscaling is slower and can use a lot of memory — enable the <b>Use low memory (streaming)</b> toggle for longer videos. It’s slower, but safer.",
+        "<b>RIFE</b> has two main speed modes: <b>Slow (CPU)</b> and <b>Superfast (GPU)</b>. Slow can look a bit cleaner; Superfast is great for previews. The <b>4K preset + Superfast</b> combo is often “good enough”.",
+        "Many tools include <b>Use current</b>. It grabs the exact frame currently shown in the Media Player (or the currently loaded image) at the moment you click it.",
+        "Most tools also have a <b>View results</b> button. It opens Media Explorer on that tool’s last output folder, scans it, and lets you preview results and inspect JSON sidecars.",
+        "Known quirk: in this Knowledge Base version, <b>Trim Tool → Preview</b> may freeze the UI while thumbnails load (especially with 50+ preview thumbs). Wait a few seconds — it should recover once the preview is ready.",
+        "You can reorder tabs or tools to fit your workflow. Find more toggles like this in the <b>Settings</b> tab.",
+        "Don’t leave <b>Enable diagnostics logging</b> on unless you need it — logs can grow endlessly and may slow down video playback and beat‑synced music visuals.",
+        "If video playback stutters and the Queue tab toggles (pause refresh while video is playing / auto cleanup queue) don’t help, use <b>Queue → Clean finished results</b> to clear old items manually.",
+        "You can change the intro screen with your own images, add them in (root) /presets/startup/",
+        "On first install, many AI models won’t be downloaded yet. You can install them from the <b>Optional downloads</b> menu.",
+        "Some model downloads are huge and can look “stuck” on slower connections — check the <b>System Monitor HUD</b> at the top to confirm download speed/activity.",
+        "<b>Hunyuan 1.5</b> can download new variants directly inside the tab and shows almost no logging. That’s normal — let it run, and watch the HUD to confirm it’s still downloading."
+      ],
+      "_layout": "overview/hints_tips"
     },
     "File_Menu": {
       "description": "The <b>File</b> menu is the fastest way to <b>open media</b>, <b>grab screenshots/frames</b>, <b>re-open recent sources</b>, and run a few <b>export + batch utilities</b>.<br><br><b>Main actions:</b><br><ul><li><b>Open</b> (Ctrl+O)</li><li><b>Screenshot (select region)…</b> (Ctrl+S)</li></ul><br><br><b>Recent Files</b> (submenu): dynamically lists up to <b>10</b> recent paths, plus <b>Clear Recent List</b>. You can also <b>right‑click a recent item → Remove from list</b>.<br><br><b>Favorites</b> (submenu):<br><ul><li><b>Pin Current File</b> (adds the currently loaded media to favorites)</li><li><b>Unpin Current File</b> (only shown when the current file is already pinned)</li><li><b>Open Favorite</b> (submenu listing pinned paths; supports right‑click remove)</li><li><b>Clear Favorites</b></li></ul><br><br><b>Save / Export:</b><br><ul><li><b>Save Frame As…</b> (captures the currently visible frame as PNG/JPG)</li><li><b>Save As…</b> (images: convert via Qt; videos: uses FFmpeg and tries stream‑copy for common containers)</li><li><b>Save As MP3…</b> (FFmpeg MP3 export with bitrate + volume controls; optional “Use source bitrate”)</li></ul><br><br><b>Batch Tools</b> (submenu):<br><ul><li><b>Convert to MP3 (folder)…</b></li><li><b>Video → Audio Extract (WAV/AAC/FLAC)…</b></li><li><b>Video Convert (folder)…</b></li><li><b>Image Convert (folder)…</b></li><li><b>Export ALL Audio Tracks (1 file)…</b></li></ul><br><br><b>Utilities:</b><br><ul><li><b>Open Containing Folder</b> (opens the folder of the currently loaded file)</li><li><b>Reopen Last Closed File</b> (reopens the previous file remembered when you used Open)</li></ul><br><br><b>Exit:</b><br><ul><li><b>Exit (to console)</b> (clean quit)</li><li><b>Exit (close process)</b> (force exit)</li></ul><br><br>",
@@ -1641,6 +1767,127 @@
         "oneliners_count_added": 41
       }
     },
+    "SDXL_Inpainter": {
+      "description": "SDXL Inpainter lets you <b>edit parts of an image</b> by painting a mask (white = area to change) and describing what you want. Everything runs <b>locally</b> using your own SDXL inpaint model files—no cloud.",
+      "key_terms": [
+        "SDXL Inpainter",
+        "SDXLInpaintPane",
+        "models/inpaint/",
+        "output/inpaint/",
+        ".sdxl_inpaint (dedicated env)",
+        "presets/extra_env/sdxl_inpaint_install.bat",
+        "presets/setsave/sdxl_inpaint_settings.json",
+        "mask (white = change area)",
+        "Paint… mask painter",
+        "Clear painted",
+        "Invert mask",
+        "Match size to loaded image",
+        "Steps",
+        "CFG",
+        "Strength",
+        "Seed (-1 = random)",
+        "Device (auto/cuda/cpu)",
+        "CPU offload",
+        "Attention slicing",
+        "VAE tiling",
+        "Scheduler (Euler / Euler a / DPM++ 2M / DDIM / Heun)"
+      ],
+      "overview": "SDXL Inpainter is FrameVision’s “change only this part” image editor.<br><br><b>Typical workflow:</b><br><ol><li>Select an <b>Inpaint model</b> (it scans <code>models/inpaint/</code>).</li><li>Load an <b>Image</b>.</li><li>Add a <b>Mask</b>: either browse a mask file, or click <b>Paint…</b> and paint the area you want to change. <b>White = will change</b>, black = protected. Use <b>Invert mask</b> if your mask is reversed.</li><li>Write a <b>Prompt</b> (and optional Negative prompt).</li><li>Click <b>Run Inpaint</b>. The preview updates, and you can <b>Save as…</b> or <b>Open folder</b>.</li></ol><br><b>Where results go:</b> <code>output/inpaint/</code>. Your last-used settings are remembered in <code>presets/setsave/sdxl_inpaint_settings.json</code>.",
+      "features": [
+        "Runs <b>SDXL inpainting locally</b> using your own checkpoints (no downloads in-tool).",
+        "Scans <code>models/inpaint/</code> for <code>.safetensors</code>/<code>.ckpt</code> files and Diffusers model folders.",
+        "Built‑in <b>mask painter</b>: paint white to mark the inpaint region; supports quick <b>Clear painted</b> reset.",
+        "Optional <b>Invert mask</b> toggle (useful if your mask file uses the opposite convention).",
+        "Resolution controls with a recommended <b>Match size to loaded image</b> option.",
+        "Performance/VRAM options: <b>CPU offload</b>, <b>Attention slicing</b>, <b>VAE tiling</b>, plus scheduler selection.",
+        "Runs in a <b>dedicated environment</b> (<code>.sdxl_inpaint</code>) to keep the main app lean and avoid dependency conflicts.",
+        "Settings persistence (prompt, sizes, last-used folders, toggles) in <code>presets/setsave/sdxl_inpaint_settings.json</code>."
+      ],
+      "notes": [
+        "<b>Mask rule:</b> SDXL inpaint expects <b>white = change</b> (and black = keep). The UI repeats this in the mask preview.",
+        "If you don’t provide a mask (file or painted), the tool uses an empty mask (so you’ll usually see little to no change).",
+        "<b>Strength</b> is the “how much should it change?” knob. Lower values keep more of the original; higher values allow bigger edits.",
+        "Some checkpoints are not true “inpaint” models. FrameVision has a compatibility fallback that uses an SDXL Img2Img pipeline and composites using your mask; results can differ slightly from a real inpaint model."
+      ],
+      "hints_tips": [
+        "Start with <b>Match size to loaded image</b> ON. It avoids unintended resizes and keeps results predictable.",
+        "For subtle fixes (blemishes, small cleanup): try <b>Strength 0.4–0.65</b>, moderate Steps, and keep the masked area tight.",
+        "For object removal: paint the object fully white, then prompt what should be there instead (e.g., “clean wall texture, no object”).",
+        "If you see VRAM errors: set Device to <b>auto/cuda</b>, turn ON <b>CPU offload</b> + <b>Attention slicing</b> (and optionally <b>VAE tiling</b>), then lower resolution.",
+        "If edges look harsh: paint slightly beyond the boundary and use a slightly lower Strength; SDXL blends better when it has context.",
+        "Seed <b>-1</b> gives a new random result each run; set a fixed seed if you want reproducibility."
+      ],
+      "qa_pairs": [
+        {
+          "question": "Where do I put my SDXL inpaint models?",
+          "answer": "Place them in <code>models/inpaint/</code> (either a single <code>.safetensors</code>/<code>.ckpt</code> file or a Diffusers folder). Then click <b>Refresh</b> in the Model section."
+        },
+        {
+          "question": "Do I need a special “inpaint” model?",
+          "answer": "You’ll get the best results with a true SDXL inpaint model. If you use a regular SDXL checkpoint, the tool may fall back to a compatibility mode (Img2Img + masked composite), which can look different."
+        },
+        {
+          "question": "My mask seems backwards—what do I do?",
+          "answer": "Turn on <b>Invert mask</b>. Remember: <b>white = will change</b>, black = protected."
+        },
+        {
+          "question": "It says the SDXL‑Inpaint environment is missing.",
+          "answer": "Run <code>presets/extra_env/sdxl_inpaint_install.bat</code> to create the dedicated environment at <code>.sdxl_inpaint</code>. After that, restart FrameVision and try again."
+        },
+        {
+          "question": "Can I run SDXL inpaint on CPU?",
+          "answer": "Yes—set Device to <b>cpu</b>. It will be much slower, but it can work on machines without CUDA."
+        },
+        {
+          "question": "Why did it change more than just the masked area?",
+          "answer": "Common causes: (1) your mask is inverted (use <b>Invert mask</b>), (2) the mask got resized/cropped unexpectedly (keep <b>Match size to loaded image</b> ON), or (3) Strength is too high—lower it for more localized edits."
+        },
+        {
+          "question": "Where are my outputs saved?",
+          "answer": "Outputs are written under <code>output/inpaint/</code>. Use <b>Open folder</b> to jump there quickly."
+        }
+      ],
+      "controls": [
+        "Inpaint model — dropdown. Does: Pick an inpaint checkpoint or Diffusers folder found in <code>models/inpaint/</code>.",
+        "Refresh — button. Does: Rescan <code>models/inpaint/</code> for new/removed models.",
+        "Image — path field + Browse… button. Does: Choose the image to edit.",
+        "Mask — path field + Browse… button. Does: Choose an external mask image (white = change).",
+        "Paint… — button. Does: Open the built‑in mask painter (paint white to mark the inpaint area).",
+        "Clear painted — button. Does: Clears the painted mask (keeps any mask file path you selected).",
+        "Invert mask — toggle. Does: Swap white/black before inpainting (useful if your mask convention is reversed).",
+        "Mask preview — panel. Does: Shows the effective mask after resize/invert (white = will change).",
+        "Prompt — text box. Does: Describe what you want in the masked area.",
+        "Negative prompt — text box. Does: Describe what to avoid (optional).",
+        "Steps — spinbox. Does: Number of diffusion steps (quality vs speed).",
+        "CFG — spinbox. Does: Guidance scale (prompt adherence).",
+        "Strength — spinbox. Does: How strongly to change the image (higher = bigger edits).",
+        "Seed — spinbox. Does: Reproducibility control; <b>-1</b> = random seed.",
+        "Width/Height — spinboxes. Does: Output size (multiples of 64).",
+        "Match size to loaded image — checkbox. Does: Uses the input image’s resolution (recommended).",
+        "Device — dropdown. Does: Choose <b>auto</b>, <b>cuda</b>, or <b>cpu</b>.",
+        "CPU offload (if CUDA) — checkbox. Does: Offload parts of the model to CPU to reduce VRAM usage (slower).",
+        "Attention slicing — checkbox. Does: Reduces VRAM usage (slower).",
+        "VAE tiling — checkbox. Does: Reduces VRAM usage (slower; can help at higher resolutions).",
+        "Scheduler — dropdown. Does: Choose the sampler (Euler / Euler a / DPM++ 2M / DDIM / Heun).",
+        "Run Inpaint — button. Does: Start the inpaint job.",
+        "Cancel — button. Does: Stop the current run (best-effort).",
+        "Save as… — button. Does: Save the last output to a location you choose.",
+        "Open folder — button. Does: Open the output folder (<code>output/inpaint/</code>)."
+      ],
+      "install": [
+        "Run <code>presets/extra_env/sdxl_inpaint_install.bat</code> once to create the dedicated environment at <code>.sdxl_inpaint</code> (required for this tool).",
+        "Put your SDXL inpaint checkpoints (or Diffusers folders) in <code>models/inpaint/</code> and press <b>Refresh</b>.",
+        "If you move the app folder, keep the <code>.sdxl_inpaint</code> folder next to it (portable install)."
+      ],
+      "troubleshoot": [
+        "“No models found”: confirm you have models under <code>models/inpaint/</code>, then press <b>Refresh</b>.",
+        "“SDXL‑Inpaint environment not found”: run <code>presets/extra_env/sdxl_inpaint_install.bat</code> and restart FrameVision.",
+        "Out of VRAM / CUDA OOM: enable <b>CPU offload</b> + <b>Attention slicing</b>, consider <b>VAE tiling</b>, and reduce resolution.",
+        "Mask looks wrong: check <b>Invert mask</b>, ensure the mask matches your image, and keep <b>Match size to loaded image</b> ON.",
+        "Runner errors mentioning pipeline / linear layers: your checkpoint may not be compatible with SDXL inpaint. Try a different inpaint model (or use a Diffusers folder version if available)."
+      ],
+      "_layout": "overview/features/notes/hints_tips/qa_pairs/controls/install/troubleshoot"
+    },
     "Settings": {
       "description": "Controls global look &amp; behavior. Includes a Theme picker (Apply / Auto / Random), intro overlay effects for the startup intro image (with optional preview), a collapsible Options panel for UI/diagnostics toggles, temperature units (°C/°F), and maintenance tools like Clear program cache…, Restart App, and Show QSettings in CMD.",
       "key_terms": [
@@ -1827,6 +2074,108 @@
         "oneliners_source": "helpers/ code scan",
         "oneliners_count_added": 4
       }
+    },
+    "TXT_to_Image_SD15_SDXL": {
+      "description": "Classic Stable Diffusion <b>TXT→IMG</b> using <b>Diffusers</b>, with support for <b>SD 1.5</b> and <b>SDXL</b> single‑file <code>.safetensors</code> checkpoints. This is the “normal” text‑to‑image path (higher quality per step than Turbo engines), with familiar knobs: Steps, CFG, Sampler, seed policies, batch, and optional SDXL LoRAs.",
+      "key_terms": [
+        "txt2img.py (Diffusers backend)",
+        "SD15 (Stable Diffusion 1.5)",
+        "SDXL",
+        "Checkpoint (.safetensors)",
+        "models/SD15",
+        "models/SDXL",
+        "Model dropdown (Refresh / Browse)",
+        "CFG scale (guidance_scale)",
+        "Sampler / Scheduler (DPM++ 2M Karras, Euler a, Euler, Heun, UniPC, DDIM)",
+        "Attention slicing",
+        "LoRA (SDXL) – 2 slots",
+        "Seed policy (Fixed / Increment / Random)",
+        "Filename template ({seed}, {idx})",
+        "FRAMEVISION_DIFFUSERS_MODEL (env override)"
+      ],
+      "overview": "This section documents the <b>SD models (SD15/SDXL)</b> engine inside <code>helpers/txt2img.py</code> (the Diffusers path). When you select that engine in the TXT→IMG tab, FrameVision loads a <code>.safetensors</code> checkpoint locally and runs it through <b>Diffusers</b>: <code>StableDiffusionPipeline</code> for SD1.5 and <code>StableDiffusionXLPipeline</code> for SDXL. <br><br><b>How the model is chosen</b><br><ul><li><b>Model dropdown</b> scans <code>models/SD15</code> and <code>models/SDXL</code> for <code>*.safetensors</code> (use <b>Refresh</b> after adding files).</li><li><b>Browse…</b> lets you pick a checkpoint from anywhere (still expected to be <code>.safetensors</code>).</li><li>If the selected path is empty/invalid, FrameVision falls back to a default SD1.5 checkpoint: <code>models/SD15/DreamShaper_8_pruned.safetensors</code>.</li><li>You can also override the default via <code>FRAMEVISION_DIFFUSERS_MODEL</code> (environment variable).</li></ul><br><b>SD15 vs SDXL detection</b><br>FrameVision detects SDXL by checking whether the resolved model path contains <code>sdxl</code> (or <code>sd_xl</code>). That means putting SDXL checkpoints in the <code>models/SDXL</code> folder (or naming them with “sdxl”) is enough for correct detection. <br><br><b>What happens at runtime</b><br><ul><li>Runs on <b>CUDA</b> when available (float16), otherwise CPU (float32).</li><li>Applies your <b>Prompt</b>, optional <b>Negative prompt</b>, <b>Steps</b>, <b>CFG</b>, <b>Width/Height</b>, and <b>Seed</b>.</li><li>Optional: swaps the scheduler when you pick a non‑auto sampler (DPM++ 2M Karras / Euler a / Euler / Heun / UniPC / DDIM).</li><li>Disables the Diffusers safety checker for local use.</li><li>Optional: enables <b>Attention slicing</b> for lower VRAM.</li></ul><br><b>When Diffusers isn’t available</b><br>If Diffusers/Torch can’t be imported (or the pipeline fails), FrameVision generates a simple <b>placeholder image</b> (checkerboard + your prompt text) so the rest of the app/queue can keep working. <br><br><b>Adding extra checkpoints (Civitai / other sources)</b><br><ol><li>Download a <b>Checkpoint</b> file in <code>.safetensors</code> format (SD1.5 checkpoints for SD15, SDXL checkpoints for SDXL). Many sites (including Civitai) offer multiple variants—pick the checkpoint, not an embedding/LoRA, and avoid formats that require a custom workflow.</li><li>Drop the file into:<ul><li><code>models/SD15/</code> for SD1.5 checkpoints</li><li><code>models/SDXL/</code> for SDXL checkpoints</li></ul>(If you use lowercase folders like <code>models/sd15</code> or <code>models/sdxl</code>, the safest option is to rename them to match the scanned folders, or use <b>Browse…</b> to select the checkpoint directly.)</li><li>Back in the app: click <b>Refresh</b> next to Model, then select your new checkpoint.</li></ol>",
+      "features": [
+        "Local Diffusers TXT→IMG for SD1.5 and SDXL single‑file checkpoints.",
+        "Model dropdown scans <code>models/SD15</code> and <code>models/SDXL</code> for <code>.safetensors</code>; Browse supports custom locations.",
+        "Prompt + Negative prompt.",
+        "Steps + CFG (guidance scale).",
+        "Sampler selection: auto, DPM++ 2M (Karras), Euler a, Euler, Heun, UniPC, DDIM.",
+        "Batch generation + seed policies (fixed / increment / random).",
+        "Optional Attention slicing for VRAM savings.",
+        "SDXL LoRA support (2 slots) with independent strengths (0.0–1.5).",
+        "Output formats (png/jpg/webp) + filename templates with <code>{seed}</code> and <code>{idx}</code>.",
+        "Writes a sidecar <code>.json</code> next to the first output image with run metadata (engine/model/seeds/actual size)."
+      ],
+      "hints_tips": [
+        "Start simple: pick a known checkpoint, set a clear prompt, and run 1 image before touching batch settings.",
+        "For SD1.5 checkpoints, try smaller sizes first (e.g., 512–768 range) and scale up only after you like the look. For SDXL, 1024‑ish sizes tend to be a better default.",
+        "If your image ignores the prompt: raise <b>CFG</b> a bit. If it looks “forced” or oversharpened: lower CFG before lowering Steps.",
+        "If hands/faces drift: increase Steps slightly and/or switch sampler (DPM++ 2M Karras is a common first choice).",
+        "If you hit VRAM errors: enable <b>Attention slicing</b>, reduce resolution, and keep Batch=1. (Batch is the fastest way to OOM.)",
+        "Use the built‑in Presets as starting points—they set Sampler/Steps/CFG/Size and only auto-fill Negative if your Negative box is empty. ",
+        "When doing Batch > 1, use a filename template that includes <code>{idx}</code> to avoid overwrites (for example: <code>IMG_{seed}_{idx:03d}.png</code>).",
+        "If a checkpoint loads but produces nonsense: it might not be a single-file Diffusers‑compatible checkpoint. Try a different checkpoint or use Browse to point to the correct file."
+      ],
+      "qa_pairs": [
+        {
+          "question": "Where does FrameVision look for SD15/SDXL checkpoints?",
+          "answer": "The Model dropdown scans <code>models/SD15</code> and <code>models/SDXL</code> for <code>*.safetensors</code>. After you drop in a new file, click <b>Refresh</b> next to the Model picker. "
+        },
+        {
+          "question": "How does it decide if a checkpoint is SDXL or SD1.5?",
+          "answer": "It checks the resolved checkpoint path for <code>sdxl</code> or <code>sd_xl</code>. Putting SDXL models under <code>models/SDXL</code> makes the path contain “sdxl”, so detection works automatically. "
+        },
+        {
+          "question": "Can I use LoRAs with SD15 too?",
+          "answer": "In the current Diffusers path, LoRAs are only applied when the selected checkpoint is detected as <b>SDXL</b> (two LoRA slots with per‑slot strength). "
+        },
+        {
+          "question": "Why do I get a checkerboard image with my prompt text?",
+          "answer": "That’s the built‑in CPU fallback. It typically means Diffusers/Torch is missing, failed to import, or the pipeline couldn’t load the checkpoint. FrameVision returns a placeholder image so the rest of the app (and queue) doesn’t break. "
+        },
+        {
+          "question": "What does “Attention slicing” do?",
+          "answer": "It reduces VRAM usage by splitting attention into smaller chunks. It’s slower, but it can be the difference between running and crashing on smaller GPUs. "
+        },
+        {
+          "question": "Why is the safety checker disabled?",
+          "answer": "For local/offline use FrameVision disables the Diffusers safety checker (it returns “not flagged” for all outputs) to avoid false positives and dependency issues. "
+        }
+      ],
+      "controls": [
+        "Engine — dropdown. Does: Select <b>SD models (SD15/SDXL)</b> to use the Diffusers backend. ",
+        "Preset — dropdown. Does: Apply a tuned bundle of Sampler/Steps/CFG/Size (and Negative if empty). ",
+        "Prompt — text box. Does: Main description of the image to generate.",
+        "Negative — text box. Does: What to avoid (optional).",
+        "Model — dropdown + Refresh + Browse. Does: Pick a local <code>.safetensors</code> checkpoint; Refresh rescans model folders; Browse picks any file. ",
+        "LoRA (SDXL) / LoRA 2 (SDXL) — dropdown(s) + strength. Does: Apply up to two SDXL LoRAs from the chosen LoRA folder. ",
+        "Sampler — dropdown. Does: Select scheduler (auto / DPM++ 2M Karras / Euler a / Euler / Heun / UniPC / DDIM). ",
+        "Steps — slider. Does: Number of diffusion steps (quality vs speed). ",
+        "CFG — spinbox. Does: Guidance scale (prompt adherence). ",
+        "Size — presets + W/H manual. Does: Output resolution; FrameVision snaps to safe buckets (multiples of 64). ",
+        "Seed + Seed policy + Batch. Does: Reproducible variation controls.",
+        "Attention slicing — checkbox. Does: Reduce VRAM usage (slower). ",
+        "File format — dropdown. Does: png/jpg/webp; filename template auto-updates extension. ",
+        "Filename template — text box. Does: Naming pattern; supports <code>{seed}</code> and <code>{idx}</code>. ",
+        "Output — path + Browse. Does: Where results are saved.",
+        "Show in Player — checkbox. Does: Auto-load the last generated image in the Media Player.",
+        "Use queue — checkbox. Does: Route jobs through the Worker queue (recommended for background runs and batch). "
+      ],
+      "install": [
+        "Put your checkpoints in <code>models/SD15</code> and/or <code>models/SDXL</code>, then press <b>Refresh</b> in the Model row. ",
+        "Diffusers/Torch must be available in the app environment for SD15/SDXL generation. If you only get placeholder images, repair/reinstall FrameVision (or the optional AI stack) so the Diffusers backend can import. ",
+        "Optional: set <code>FRAMEVISION_DIFFUSERS_MODEL</code> to force a default checkpoint path (useful for portable setups). ",
+        "Optional: keep SDXL LoRAs in a folder like <code>loras/txt2img</code>; use <b>Choose LoRA path…</b> to point the picker at your folder. "
+      ],
+      "troubleshoot": [
+        "Model dropdown is empty: confirm your files are <code>.safetensors</code> and placed under <code>models/SD15</code> or <code>models/SDXL</code>, then click <b>Refresh</b>. ",
+        "You get placeholder checkerboard images: Diffusers/Torch import or pipeline load failed. Check the console/logs, verify the checkpoint path is valid, and reinstall/repair the AI stack if needed. ",
+        "SDXL checkpoint loads as SD1.5 (or crashes): ensure the path contains “sdxl” (placing it in <code>models/SDXL</code> usually fixes this). ",
+        "Out of VRAM: enable <b>Attention slicing</b>, lower resolution, set Batch=1, and close other VRAM-heavy tools. ",
+        "Sampler seems to do nothing: only non-<b>auto</b> selections replace the scheduler; try DPM++ 2M (Karras) or Euler a first. ",
+        "LoRA doesn’t apply: LoRAs are only applied for SDXL in this path, and the LoRA file must exist on disk (use Reload after changing folders). "
+      ],
+      "_layout": "overview/features/install/troubleshoot"
     },
     "Themes": {
       "description": "Multiple built‑in themes with <b>Apply</b>, <b>Auto</b> (time‑based), and <b>Random</b>.<br><br>Available themes: Day, Evening, Night, Slate, High Contrast, Cyberpunk, Neon, Ocean, CRT, Aurora, Mardi Gras, Tropical Fiesta, Color Mix, Solarized Light, Sunburst, Pastel Light, Cloud Grey, Signal Grey, Graphite Dusk, Rainbow Riot, Candy Pop.",
@@ -2615,108 +2964,6 @@
           "answer": "Check the worker heartbeat (logs/worker_heartbeat.txt). Restart the app/worker if stale."
         }
       ]
-    },
-    "TXT_to_Image_SD15_SDXL": {
-      "description": "Classic Stable Diffusion <b>TXT→IMG</b> using <b>Diffusers</b>, with support for <b>SD 1.5</b> and <b>SDXL</b> single‑file <code>.safetensors</code> checkpoints. This is the “normal” text‑to‑image path (higher quality per step than Turbo engines), with familiar knobs: Steps, CFG, Sampler, seed policies, batch, and optional SDXL LoRAs.",
-      "key_terms": [
-        "txt2img.py (Diffusers backend)",
-        "SD15 (Stable Diffusion 1.5)",
-        "SDXL",
-        "Checkpoint (.safetensors)",
-        "models/SD15",
-        "models/SDXL",
-        "Model dropdown (Refresh / Browse)",
-        "CFG scale (guidance_scale)",
-        "Sampler / Scheduler (DPM++ 2M Karras, Euler a, Euler, Heun, UniPC, DDIM)",
-        "Attention slicing",
-        "LoRA (SDXL) – 2 slots",
-        "Seed policy (Fixed / Increment / Random)",
-        "Filename template ({seed}, {idx})",
-        "FRAMEVISION_DIFFUSERS_MODEL (env override)"
-      ],
-      "overview": "This section documents the <b>SD models (SD15/SDXL)</b> engine inside <code>helpers/txt2img.py</code> (the Diffusers path). When you select that engine in the TXT→IMG tab, FrameVision loads a <code>.safetensors</code> checkpoint locally and runs it through <b>Diffusers</b>: <code>StableDiffusionPipeline</code> for SD1.5 and <code>StableDiffusionXLPipeline</code> for SDXL. <br><br><b>How the model is chosen</b><br><ul><li><b>Model dropdown</b> scans <code>models/SD15</code> and <code>models/SDXL</code> for <code>*.safetensors</code> (use <b>Refresh</b> after adding files).</li><li><b>Browse…</b> lets you pick a checkpoint from anywhere (still expected to be <code>.safetensors</code>).</li><li>If the selected path is empty/invalid, FrameVision falls back to a default SD1.5 checkpoint: <code>models/SD15/DreamShaper_8_pruned.safetensors</code>.</li><li>You can also override the default via <code>FRAMEVISION_DIFFUSERS_MODEL</code> (environment variable).</li></ul><br><b>SD15 vs SDXL detection</b><br>FrameVision detects SDXL by checking whether the resolved model path contains <code>sdxl</code> (or <code>sd_xl</code>). That means putting SDXL checkpoints in the <code>models/SDXL</code> folder (or naming them with “sdxl”) is enough for correct detection. <br><br><b>What happens at runtime</b><br><ul><li>Runs on <b>CUDA</b> when available (float16), otherwise CPU (float32).</li><li>Applies your <b>Prompt</b>, optional <b>Negative prompt</b>, <b>Steps</b>, <b>CFG</b>, <b>Width/Height</b>, and <b>Seed</b>.</li><li>Optional: swaps the scheduler when you pick a non‑auto sampler (DPM++ 2M Karras / Euler a / Euler / Heun / UniPC / DDIM).</li><li>Disables the Diffusers safety checker for local use.</li><li>Optional: enables <b>Attention slicing</b> for lower VRAM.</li></ul><br><b>When Diffusers isn’t available</b><br>If Diffusers/Torch can’t be imported (or the pipeline fails), FrameVision generates a simple <b>placeholder image</b> (checkerboard + your prompt text) so the rest of the app/queue can keep working. <br><br><b>Adding extra checkpoints (Civitai / other sources)</b><br><ol><li>Download a <b>Checkpoint</b> file in <code>.safetensors</code> format (SD1.5 checkpoints for SD15, SDXL checkpoints for SDXL). Many sites (including Civitai) offer multiple variants—pick the checkpoint, not an embedding/LoRA, and avoid formats that require a custom workflow.</li><li>Drop the file into:<ul><li><code>models/SD15/</code> for SD1.5 checkpoints</li><li><code>models/SDXL/</code> for SDXL checkpoints</li></ul>(If you use lowercase folders like <code>models/sd15</code> or <code>models/sdxl</code>, the safest option is to rename them to match the scanned folders, or use <b>Browse…</b> to select the checkpoint directly.)</li><li>Back in the app: click <b>Refresh</b> next to Model, then select your new checkpoint.</li></ol>",
-      "features": [
-        "Local Diffusers TXT→IMG for SD1.5 and SDXL single‑file checkpoints.",
-        "Model dropdown scans <code>models/SD15</code> and <code>models/SDXL</code> for <code>.safetensors</code>; Browse supports custom locations.",
-        "Prompt + Negative prompt.",
-        "Steps + CFG (guidance scale).",
-        "Sampler selection: auto, DPM++ 2M (Karras), Euler a, Euler, Heun, UniPC, DDIM.",
-        "Batch generation + seed policies (fixed / increment / random).",
-        "Optional Attention slicing for VRAM savings.",
-        "SDXL LoRA support (2 slots) with independent strengths (0.0–1.5).",
-        "Output formats (png/jpg/webp) + filename templates with <code>{seed}</code> and <code>{idx}</code>.",
-        "Writes a sidecar <code>.json</code> next to the first output image with run metadata (engine/model/seeds/actual size)."
-      ],
-      "hints_tips": [
-        "Start simple: pick a known checkpoint, set a clear prompt, and run 1 image before touching batch settings.",
-        "For SD1.5 checkpoints, try smaller sizes first (e.g., 512–768 range) and scale up only after you like the look. For SDXL, 1024‑ish sizes tend to be a better default.",
-        "If your image ignores the prompt: raise <b>CFG</b> a bit. If it looks “forced” or oversharpened: lower CFG before lowering Steps.",
-        "If hands/faces drift: increase Steps slightly and/or switch sampler (DPM++ 2M Karras is a common first choice).",
-        "If you hit VRAM errors: enable <b>Attention slicing</b>, reduce resolution, and keep Batch=1. (Batch is the fastest way to OOM.)",
-        "Use the built‑in Presets as starting points—they set Sampler/Steps/CFG/Size and only auto-fill Negative if your Negative box is empty. ",
-        "When doing Batch > 1, use a filename template that includes <code>{idx}</code> to avoid overwrites (for example: <code>IMG_{seed}_{idx:03d}.png</code>).",
-        "If a checkpoint loads but produces nonsense: it might not be a single-file Diffusers‑compatible checkpoint. Try a different checkpoint or use Browse to point to the correct file."
-      ],
-      "qa_pairs": [
-        {
-          "question": "Where does FrameVision look for SD15/SDXL checkpoints?",
-          "answer": "The Model dropdown scans <code>models/SD15</code> and <code>models/SDXL</code> for <code>*.safetensors</code>. After you drop in a new file, click <b>Refresh</b> next to the Model picker. "
-        },
-        {
-          "question": "How does it decide if a checkpoint is SDXL or SD1.5?",
-          "answer": "It checks the resolved checkpoint path for <code>sdxl</code> or <code>sd_xl</code>. Putting SDXL models under <code>models/SDXL</code> makes the path contain “sdxl”, so detection works automatically. "
-        },
-        {
-          "question": "Can I use LoRAs with SD15 too?",
-          "answer": "In the current Diffusers path, LoRAs are only applied when the selected checkpoint is detected as <b>SDXL</b> (two LoRA slots with per‑slot strength). "
-        },
-        {
-          "question": "Why do I get a checkerboard image with my prompt text?",
-          "answer": "That’s the built‑in CPU fallback. It typically means Diffusers/Torch is missing, failed to import, or the pipeline couldn’t load the checkpoint. FrameVision returns a placeholder image so the rest of the app (and queue) doesn’t break. "
-        },
-        {
-          "question": "What does “Attention slicing” do?",
-          "answer": "It reduces VRAM usage by splitting attention into smaller chunks. It’s slower, but it can be the difference between running and crashing on smaller GPUs. "
-        },
-        {
-          "question": "Why is the safety checker disabled?",
-          "answer": "For local/offline use FrameVision disables the Diffusers safety checker (it returns “not flagged” for all outputs) to avoid false positives and dependency issues. "
-        }
-      ],
-      "controls": [
-        "Engine — dropdown. Does: Select <b>SD models (SD15/SDXL)</b> to use the Diffusers backend. ",
-        "Preset — dropdown. Does: Apply a tuned bundle of Sampler/Steps/CFG/Size (and Negative if empty). ",
-        "Prompt — text box. Does: Main description of the image to generate.",
-        "Negative — text box. Does: What to avoid (optional).",
-        "Model — dropdown + Refresh + Browse. Does: Pick a local <code>.safetensors</code> checkpoint; Refresh rescans model folders; Browse picks any file. ",
-        "LoRA (SDXL) / LoRA 2 (SDXL) — dropdown(s) + strength. Does: Apply up to two SDXL LoRAs from the chosen LoRA folder. ",
-        "Sampler — dropdown. Does: Select scheduler (auto / DPM++ 2M Karras / Euler a / Euler / Heun / UniPC / DDIM). ",
-        "Steps — slider. Does: Number of diffusion steps (quality vs speed). ",
-        "CFG — spinbox. Does: Guidance scale (prompt adherence). ",
-        "Size — presets + W/H manual. Does: Output resolution; FrameVision snaps to safe buckets (multiples of 64). ",
-        "Seed + Seed policy + Batch. Does: Reproducible variation controls.",
-        "Attention slicing — checkbox. Does: Reduce VRAM usage (slower). ",
-        "File format — dropdown. Does: png/jpg/webp; filename template auto-updates extension. ",
-        "Filename template — text box. Does: Naming pattern; supports <code>{seed}</code> and <code>{idx}</code>. ",
-        "Output — path + Browse. Does: Where results are saved.",
-        "Show in Player — checkbox. Does: Auto-load the last generated image in the Media Player.",
-        "Use queue — checkbox. Does: Route jobs through the Worker queue (recommended for background runs and batch). "
-      ],
-      "install": [
-        "Put your checkpoints in <code>models/SD15</code> and/or <code>models/SDXL</code>, then press <b>Refresh</b> in the Model row. ",
-        "Diffusers/Torch must be available in the app environment for SD15/SDXL generation. If you only get placeholder images, repair/reinstall FrameVision (or the optional AI stack) so the Diffusers backend can import. ",
-        "Optional: set <code>FRAMEVISION_DIFFUSERS_MODEL</code> to force a default checkpoint path (useful for portable setups). ",
-        "Optional: keep SDXL LoRAs in a folder like <code>loras/txt2img</code>; use <b>Choose LoRA path…</b> to point the picker at your folder. "
-      ],
-      "troubleshoot": [
-        "Model dropdown is empty: confirm your files are <code>.safetensors</code> and placed under <code>models/SD15</code> or <code>models/SDXL</code>, then click <b>Refresh</b>. ",
-        "You get placeholder checkerboard images: Diffusers/Torch import or pipeline load failed. Check the console/logs, verify the checkpoint path is valid, and reinstall/repair the AI stack if needed. ",
-        "SDXL checkpoint loads as SD1.5 (or crashes): ensure the path contains “sdxl” (placing it in <code>models/SDXL</code> usually fixes this). ",
-        "Out of VRAM: enable <b>Attention slicing</b>, lower resolution, set Batch=1, and close other VRAM-heavy tools. ",
-        "Sampler seems to do nothing: only non-<b>auto</b> selections replace the scheduler; try DPM++ 2M (Karras) or Euler a first. ",
-        "LoRA doesn’t apply: LoRAs are only applied for SDXL in this path, and the LoRA file must exist on disk (use Reload after changing folders). "
-      ],
-      "_layout": "overview/features/install/troubleshoot"
     },
     "Txt_To_Img_Z_Image_Turbo": {
       "description": "Fast local text‑to‑image engine (Z‑Image Turbo). Runs in a dedicated <code>.zimage_env</code> so it doesn’t conflict with other backends. Optimized for low step counts (default 9) and low guidance (default CFG 0.0), with optional Attention slicing and LoRA support.",
