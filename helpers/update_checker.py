@@ -27,7 +27,33 @@ GITHUB_REPO  = "FrameVision"
 
 # ---------- HTTP helpers (stdlib) ----------
 import urllib.parse
+import ssl
 from urllib.request import Request, urlopen
+
+# Prefer certifi CA bundle if available (helps embedded/portable Python builds on Windows)
+try:
+    import certifi  # type: ignore
+except Exception:
+    certifi = None
+
+def _ssl_context():
+    try:
+        if certifi is not None:
+            return ssl.create_default_context(cafile=certifi.where())
+    except Exception:
+        pass
+    try:
+        ctx = ssl.create_default_context()
+        # Some embedded Pythons don't load OS certs automatically.
+        try:
+            ctx.load_default_certs()
+        except Exception:
+            pass
+        return ctx
+    except Exception:
+        return None
+
+_SSL_CONTEXT = _ssl_context()
 
 def _http_json(url: str, timeout: int = 25):
     headers = {
@@ -35,14 +61,14 @@ def _http_json(url: str, timeout: int = 25):
         "User-Agent": "FrameVision-Updater"
     }
     req = Request(url, headers=headers)
-    with urlopen(req, timeout=timeout) as r:
+    with urlopen(req, timeout=timeout, context=_SSL_CONTEXT) as r:
         data = r.read()
     return json.loads(data.decode("utf-8"))
 
 def _http_bytes(url: str, timeout: int = 25):
     headers = {"User-Agent": "FrameVision-Updater"}
     req = Request(url, headers=headers)
-    with urlopen(req, timeout=timeout) as r:
+    with urlopen(req, timeout=timeout, context=_SSL_CONTEXT) as r:
         return r.read()
 
 # ---------- GitHub helpers ----------

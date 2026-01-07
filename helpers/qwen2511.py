@@ -101,12 +101,10 @@ def _invert_mask_to_temp(mask_path: str, out_dir: str) -> Optional[str]:
     img = QImage(mask_path)
     if img.isNull():
         return None
+    # Use Qt's native pixel inversion to avoid per-pixel Python loops and
+    # avoid QtCore.qRgb (not available in some PySide6 builds).
     img = img.convertToFormat(QImage.Format_Grayscale8)
-    for y in range(img.height()):
-        for x in range(img.width()):
-            v = img.pixelColor(x, y).red()
-            inv = 255 - v
-            img.setPixel(x, y, QtCore.qRgb(inv, inv, inv))
+    img.invertPixels()  # InvertRgb is fine for grayscale
     _ensure_dir(out_dir)
     tmp = os.path.join(out_dir, f"_mask_inverted_{int(time.time())}.png")
     if img.save(tmp, "PNG"):

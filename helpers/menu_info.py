@@ -294,7 +294,33 @@ def install_info_menu(main_window):
 # ===== Update Dialog: Stable (Release) vs Beta (Default Branch) =====
 import shutil, tempfile, traceback, zipfile as _zipfile
 from datetime import datetime
+import ssl
 from urllib.request import Request, urlopen
+
+# Prefer certifi CA bundle if available (helps embedded/portable Python builds on Windows)
+try:
+    import certifi  # type: ignore
+except Exception:
+    certifi = None
+
+def _ssl_context():
+    try:
+        if certifi is not None:
+            return ssl.create_default_context(cafile=certifi.where())
+    except Exception:
+        pass
+    try:
+        ctx = ssl.create_default_context()
+        try:
+            ctx.load_default_certs()
+        except Exception:
+            pass
+        return ctx
+    except Exception:
+        return None
+
+_SSL_CONTEXT = _ssl_context()
+
 from PySide6.QtWidgets import QPushButton, QFileDialog, QPlainTextEdit, QSpacerItem, QSizePolicy
 
 GITHUB_OWNER = "Koongrizzly"
@@ -311,7 +337,7 @@ SKIP_UPDATER_SET = {p.lower() for p in SKIP_UPDATER_PATHS}
 
 def _http_get_bytes(url: str, headers: dict | None = None, timeout: int = 30) -> bytes:
     req = Request(url, headers=headers or {})
-    with urlopen(req, timeout=timeout) as r:
+    with urlopen(req, timeout=timeout, context=_SSL_CONTEXT) as r:
         return r.read()
 
 def _http_get_json(url: str, headers: dict | None = None, timeout: int = 30) -> dict:

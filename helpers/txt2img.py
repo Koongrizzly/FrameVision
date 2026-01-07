@@ -1659,12 +1659,26 @@ class Txt2ImgPane(QWidget):
                 pass
         self.size_manual_w.valueChanged.connect(_sync_manual_w)
         self.size_manual_h.valueChanged.connect(_sync_manual_h)
+
         size_row.addWidget(self.size_combo, 2)
-        size_row.addWidget(QLabel("W:"), 0)
-        size_row.addWidget(self.size_manual_w, 0)
-        size_row.addWidget(QLabel("H:"), 0)
-        size_row.addWidget(self.size_manual_h, 0)
-        size_row.addWidget(self.size_lock, 0)
+
+        # Manual W/H + Lock aspect (advanced) — hidden by default per UX request
+        # Keep widgets alive for internal size bookkeeping / persistence, but do not show them.
+        self.size_manual_w_label = QLabel("W:")
+        self.size_manual_h_label = QLabel("H:")
+        try:
+            self.size_lock.setChecked(False)
+        except Exception:
+            pass
+        for _w in (self.size_manual_w_label, self.size_manual_w,
+                   self.size_manual_h_label, self.size_manual_h,
+                   self.size_lock):
+            try:
+                _w.setVisible(False)
+            except Exception:
+                pass
+        # (Intentionally not added to the layout)
+
         form.addRow(size_row)
         self.size_warning_label = QLabel("Higher resolutions can create 'clones' in the image")
         self.size_warning_label.setWordWrap(True)
@@ -1888,10 +1902,99 @@ class Txt2ImgPane(QWidget):
         self.qwen_model_label = QLabel("qwen model")
         mdl_form.addRow(self.qwen_model_label, roww)
 
+        # sd-cli.exe selector (used for GGUF engines: Z-Image Turbo GGUF and qwen 2.5 12B GGUF)
+        self.sd_cli_path = QLineEdit()
+        try:
+            self.sd_cli_path.setPlaceholderText("Auto (detect bundled sd-cli.exe)")
+        except Exception:
+            pass
+        self.sd_cli_browse = QPushButton("Browse…")
+        self.sd_cli_clear = QPushButton("Clear")
+        row_sdcli = QHBoxLayout()
+        row_sdcli.addWidget(self.sd_cli_path, 1)
+        row_sdcli.addWidget(self.sd_cli_browse, 0)
+        row_sdcli.addWidget(self.sd_cli_clear, 0)
+        self.sd_cli_label = QLabel("sd-cli.exe")
+        mdl_form.addRow(self.sd_cli_label, row_sdcli)
+
+        # Restore + persist sd-cli path
+        def _save_sd_cli_path():
+            try:
+                if hasattr(self, "_persist_settings"):
+                    self._persist_settings.setValue("sd_cli_path", self.sd_cli_path.text().strip())
+            except Exception:
+                pass
+
+        def _browse_sd_cli_path():
+            try:
+                start_dir = ""
+                try:
+                    from pathlib import Path as _P
+                    # Prefer last used folder, then ./tools, then app root
+                    prev = ""
+                    try:
+                        prev = self.sd_cli_path.text().strip()
+                    except Exception:
+                        prev = ""
+                    if prev:
+                        try:
+                            start_dir = str(_P(prev).resolve().parent)
+                        except Exception:
+                            start_dir = ""
+                    if not start_dir:
+                        cand = _P("./tools").resolve()
+                        if cand.exists() and cand.is_dir():
+                            start_dir = str(cand)
+                    if not start_dir:
+                        try:
+                            start_dir = str(_P(__file__).resolve().parents[1])
+                        except Exception:
+                            start_dir = str(_P(".").resolve())
+                except Exception:
+                    start_dir = ""
+
+                path, _ = QFileDialog.getOpenFileName(
+                    self,
+                    "Choose sd-cli.exe",
+                    start_dir or str(Path(".").resolve()),
+                    "sd-cli.exe (sd-cli.exe);;Executables (*.exe);;All files (*.*)"
+                )
+                if not path:
+                    return
+                self.sd_cli_path.setText(path)
+                _save_sd_cli_path()
+            except Exception as e:
+                try:
+                    print("[txt2img] browse sd-cli failed:", e)
+                except Exception:
+                    pass
+
+        def _clear_sd_cli_path():
+            try:
+                self.sd_cli_path.setText("")
+                _save_sd_cli_path()
+            except Exception:
+                pass
+
+        try:
+            self.sd_cli_browse.clicked.connect(_browse_sd_cli_path)
+            self.sd_cli_clear.clicked.connect(_clear_sd_cli_path)
+            self.sd_cli_path.textChanged.connect(lambda *_: _save_sd_cli_path())
+        except Exception:
+            pass
+
+        try:
+            if hasattr(self, "_persist_settings"):
+                _saved = self._persist_settings.value("sd_cli_path", "") or ""
+                if str(_saved).strip():
+                    self.sd_cli_path.setText(str(_saved).strip())
+        except Exception:
+            pass
+
         # Default hidden until GGUF engine is selected
         try:
             for _w in (self.gguf_model_label, self.gguf_model_combo, self.gguf_model_refresh, self.gguf_model_browse,
-                       self.gguf_vae_label, self.gguf_vae_combo, self.gguf_vae_refresh, self.gguf_vae_browse, self.qwen_model_label, self.qwen_model_combo, self.qwen_model_refresh, self.qwen_model_browse):
+                       self.gguf_vae_label, self.gguf_vae_combo, self.gguf_vae_refresh, self.gguf_vae_browse, self.qwen_model_label, self.qwen_model_combo, self.qwen_model_refresh, self.qwen_model_browse, self.sd_cli_label, self.sd_cli_path, self.sd_cli_browse, self.sd_cli_clear):
                 _w.setVisible(False)
         except Exception:
             pass
@@ -1930,6 +2033,16 @@ class Txt2ImgPane(QWidget):
         _populate_models()
         self.model_refresh.clicked.connect(_populate_models)
         self.model_browse.clicked.connect(_browse_model)
+
+        # Update LoRA visibility when switching between SDXL and SD15 models
+        try:
+            self.model_combo.currentIndexChanged.connect(lambda *_: self._apply_lora_visibility())
+        except Exception:
+            pass
+        try:
+            self.model_combo.currentTextChanged.connect(lambda *_: self._apply_lora_visibility())
+        except Exception:
+            pass
 
         def _populate_gguf_models():
             try:
@@ -2287,7 +2400,8 @@ class Txt2ImgPane(QWidget):
         self.lora_strength_slider.setValue(100)
         self.lora_strength = QDoubleSpinBox(); self.lora_strength.setRange(0.0, 1.5); self.lora_strength.setSingleStep(0.05); self.lora_strength.setDecimals(2); self.lora_strength.setValue(1.0)
         rowls = QHBoxLayout()
-        rowls.addWidget(QLabel("LoRA 1 Strength:"))
+        self.lora_strength_label = QLabel("LoRA 1 Strength:")
+        rowls.addWidget(self.lora_strength_label)
         rowls.addWidget(self.lora_strength, 0)
         rowls.addWidget(self.lora_strength_slider, 1)
         mdl_form.addRow(rowls)
@@ -2390,7 +2504,8 @@ class Txt2ImgPane(QWidget):
         self.lora2_strength_slider.setValue(100)
         self.lora2_strength = QDoubleSpinBox(); self.lora2_strength.setRange(0.0, 1.5); self.lora2_strength.setSingleStep(0.05); self.lora2_strength.setDecimals(2); self.lora2_strength.setValue(1.0)
         rowls2 = QHBoxLayout()
-        rowls2.addWidget(QLabel("LoRA 2 Strength:"))
+        self.lora2_strength_label = QLabel("LoRA 2 Strength:")
+        rowls2.addWidget(self.lora2_strength_label)
         rowls2.addWidget(self.lora2_strength, 0)
         rowls2.addWidget(self.lora2_strength_slider, 1)
         mdl_form.addRow(rowls2)
@@ -2722,6 +2837,57 @@ class Txt2ImgPane(QWidget):
         btns.addWidget(self.add_and_run)
         outer.addLayout(btns)
 
+    def _apply_lora_visibility(self):
+        """LoRA UI is only relevant for SDXL (diffusers) and Z-Image FP16."""
+        try:
+            key = self._engine_key_selected() if hasattr(self, "_engine_key_selected") else ""
+        except Exception:
+            key = ""
+        try:
+            key = str(key or "").lower().strip() or "diffusers"
+        except Exception:
+            key = "diffusers"
+
+        show_lora = False
+        try:
+            if key == "zimage":
+                show_lora = True
+            elif key == "diffusers":
+                mp = ""
+                try:
+                    if hasattr(self, "model_combo") and self.model_combo is not None:
+                        mp = f"{self.model_combo.currentText() or ''} {self.model_combo.currentData() or ''}"
+                except Exception:
+                    mp = ""
+                mp = (mp or "").lower()
+                show_lora = ("sdxl" in mp) or ("sd_xl" in mp) or ("sd-xl" in mp)
+        except Exception:
+            show_lora = False
+
+        try:
+            for _w in (
+                getattr(self, "lora_label", None),
+                getattr(self, "lora_path_btn", None),
+                getattr(self, "lora_combo", None),
+                getattr(self, "lora_refresh", None),
+                getattr(self, "lora_strength_label", None),
+                getattr(self, "lora_strength", None),
+                getattr(self, "lora_strength_slider", None),
+                getattr(self, "lora_a_strength", None),
+                getattr(self, "lora_b_strength", None),
+                getattr(self, "lora2_label", None),
+                getattr(self, "lora2_combo", None),
+                getattr(self, "lora2_refresh", None),
+                getattr(self, "lora2_strength_label", None),
+                getattr(self, "lora2_strength", None),
+                getattr(self, "lora2_strength_slider", None),
+            ):
+                if _w is not None:
+                    _w.setVisible(bool(show_lora))
+        except Exception:
+            pass
+
+
     def _on_engine_changed(self, *_):
         """
         Toggle banner text and show/hide the SD model/LoRA picker
@@ -2876,24 +3042,21 @@ class Txt2ImgPane(QWidget):
                 if _w is not None:
                     _w.setVisible(bool(is_qwen))
 
-
-            # LoRA controls are not supported by the GGUF backend or qwen; hide them in GGUF/qwen mode
+            # sd-cli.exe selector: visible for GGUF engines (Z-Image GGUF + qwen GGUF)
+            _need_sdcli = bool(is_gguf or is_qwen)
             for _w in (
-                getattr(self, "lora_label", None),
-                getattr(self, "lora_path_btn", None),
-                getattr(self, "lora_combo", None),
-                getattr(self, "lora_refresh", None),
-                getattr(self, "lora_strength", None),
-                getattr(self, "lora_a_strength", None),
-                getattr(self, "lora_b_strength", None),
-                getattr(self, "lora2_label", None),
-                getattr(self, "lora2_combo", None),
-                getattr(self, "lora2_refresh", None),
-                getattr(self, "lora2_strength", None),
+                getattr(self, "sd_cli_label", None),
+                getattr(self, "sd_cli_path", None),
+                getattr(self, "sd_cli_browse", None),
+                getattr(self, "sd_cli_clear", None),
             ):
                 if _w is not None:
-                    _w.setVisible(not bool(is_gguf or is_qwen))
-
+                    _w.setVisible(_need_sdcli)
+            # LoRA UI: only for Z-Image FP16 and SDXL (diffusers)
+            try:
+                self._apply_lora_visibility()
+            except Exception:
+                pass
             # Qwen-only UI: show Flow setting only for qwen2512
             for _w in (
                 getattr(self, "qwen_flow_label", None),
@@ -3955,6 +4118,7 @@ class Txt2ImgPane(QWidget):
             "show_in_player": self.show_in_player.isChecked(),
             "use_queue": bool(self.use_queue.isChecked()),
             "vram_profile": self.vram_profile.currentText(),
+            "sd_cli_path": (self.sd_cli_path.text().strip() if hasattr(self, "sd_cli_path") else ""),
             "sampler": self.sampler.currentText(),
             "flow_shift": (int(self.qwen_flow_shift.value()) if hasattr(self, "qwen_flow_shift") else 3),
             "offload_cpu": (bool(self.qwen_offload_cpu.isChecked()) if hasattr(self, "qwen_offload_cpu") else False),
@@ -5171,6 +5335,27 @@ def _gen_via_zimage(job: dict, out_dir: Path, progress_cb=None):
             except Exception:
                 pass
 
+            # Optional: pass sd-cli.exe override to the Z-Image CLI for GGUF backend
+            _env = None
+            try:
+                import os as _os
+                _env = _os.environ.copy()
+                sel_cli = str(job.get("sd_cli_path") or "").strip()
+                if sel_cli:
+                    from pathlib import Path as _P2
+                    pcli = _P2(sel_cli)
+                    if not pcli.is_absolute():
+                        try:
+                            _root = _P2(__file__).resolve().parents[1]
+                        except Exception:
+                            _root = _P2(".").resolve()
+                        pcli = (_root / pcli).resolve()
+                    if pcli.exists() and pcli.is_file():
+                        _env["SD_CLI_PATH"] = str(pcli)
+                        _env["SD_CLI"] = str(pcli)
+            except Exception:
+                _env = None
+
             proc = subprocess.Popen(
                 args,
                 stdout=subprocess.PIPE,
@@ -5297,6 +5482,17 @@ def _gen_via_qwen2512(job: dict, out_dir: Path, progress_cb=None, cancel_event: 
 
     try:
         sd_cli = _qwen._find_sd_cli(root_dir)
+        # Optional UI/job override: allow selecting an explicit sd-cli.exe path
+        try:
+            sel_cli = str(job.get("sd_cli_path") or "").strip()
+            if sel_cli:
+                pcli = _P(sel_cli)
+                if not pcli.is_absolute():
+                    pcli = (root_dir / pcli).resolve()
+                if pcli.exists() and pcli.is_file():
+                    sd_cli = pcli
+        except Exception:
+            pass
         diffusion, llm, vae = _qwen._model_paths(root_dir)
         if not (sd_cli and diffusion and llm and vae):
             return None
@@ -5884,6 +6080,25 @@ try:
                     self.qwen_model_combo.setCurrentIndex(idxw)
                     try: self.qwen_model_combo.blockSignals(False)
                     except Exception: pass
+
+            # --- sd-cli.exe restore (GGUF engines) ---
+            try:
+                sdc = s.get('sd_cli_path') or s.get('sdcli_path') or s.get('sd_cli')
+                if sdc and hasattr(self, 'sd_cli_path'):
+                    try:
+                        self.sd_cli_path.blockSignals(True)
+                    except Exception:
+                        pass
+                    try:
+                        self.sd_cli_path.setText(str(sdc))
+                    except Exception:
+                        pass
+                    try:
+                        self.sd_cli_path.blockSignals(False)
+                    except Exception:
+                        pass
+            except Exception:
+                pass
 
             # --- Seed policy restore ---
             if hasattr(self, 'seed_policy') and 'seed_policy' in s:
