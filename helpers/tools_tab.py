@@ -957,14 +957,14 @@ class InstantToolsPane(QWidget):
                 pass
 
 
-        # ---- Background Remover ----
-        sec_bg = CollapsibleSection("Background Remover", expanded=False)
+        # ---- Background Remover/SDXL inpainter ----
+        sec_bg = CollapsibleSection("Background Remover/SDXL inpainter", expanded=False)
         try:
             install_background_tool(self, sec_bg)
         except Exception:
             try:
                 _bg_wrap = QWidget(); _bg_l = QVBoxLayout(_bg_wrap); _bg_l.setContentsMargins(0,0,0,0)
-                _bg_l.addWidget(QLabel("Background Remover tool failed to load (missing helpers/background.py)."))
+                _bg_l.addWidget(QLabel("Background Remover/SDXL inpainter tool failed to load (missing helpers/background.py)."))
                 sec_bg.setContentLayout(_bg_l)
             except Exception:
                 pass
@@ -1352,7 +1352,7 @@ class InstantToolsPane(QWidget):
 
                 "Thumbnail / Meme Creator": sec_meme,
                 "Prompt Enhancement": sec_prompt,
-                "Background Remover": sec_bg,
+                "Background Remover/SDXL inpainter": sec_bg,
                 "Ace Step Music creation": sec_ace,
                 "Multi Rename": sec_rename,
                 "Whisper Lab": sec_whisper,

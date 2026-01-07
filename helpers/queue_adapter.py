@@ -283,7 +283,7 @@ def enqueue_txt2img(job: dict) -> bool:
         # Keys to pass to worker
         keys = [
             "prompt","negative","seed","seed_policy","batch","cfg_scale",
-            "width","height","steps","sampler","model_path",
+            "width","height","steps","sampler","flow_shift","offload_cpu","model_path",
             "lora_path","lora_scale","lora2_path","lora2_scale",
             "attn_slicing","vae_device","gpu_index","threads",
             "format","filename_template","hires_helper","fit_check",

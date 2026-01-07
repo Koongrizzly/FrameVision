@@ -25,7 +25,7 @@ from pathlib import Path
 from typing import Any, Dict, Optional, Tuple
 
 import numpy as np
-from PIL import Image, ImageFilter
+from PIL import Image, ImageFilter, ImageOps
 
 from PySide6 import QtCore, QtGui, QtWidgets
 
@@ -658,6 +658,7 @@ class BgRemovePane(QtWidgets.QWidget):
             "subject_scale": 1.0,
             "subject_offset_x": 0.0,
             "subject_offset_y": 0.0,
+            "mask_export_mode": "white_subject",
         }
         self.settings = SettingsStore(self._settings_path, defaults)
 
@@ -727,6 +728,14 @@ class BgRemovePane(QtWidgets.QWidget):
         self.btn_add_bg.setEnabled(False)
         self.btn_save_png = QtWidgets.QPushButton("Save PNG")
         self.btn_save_mask = QtWidgets.QPushButton("Save mask")
+        self.cmb_mask_export = QtWidgets.QComboBox()
+        self.cmb_mask_export.addItems(["White = subject", "White = background"])
+        self.cmb_mask_export.setToolTip(
+            "Choose how the saved mask is written.\n"
+            "- White = subject: good when you want to keep the subject (common cutout mask).\n"
+            "- White = background: good when your inpaint tool expects white = area to change."
+        )
+        self.cmb_mask_export.setFixedWidth(170)
         self.btn_fit = QtWidgets.QPushButton("Fit")
         self.btn_fit.setToolTip("Fit both previews to image")
         self.btn_run.setDefault(True)
@@ -803,6 +812,8 @@ class BgRemovePane(QtWidgets.QWidget):
         row2.addStretch(1)
         row2.addWidget(self.btn_undo)
         row2.addWidget(self.btn_save_png)
+        row2.addWidget(QtWidgets.QLabel("Mask"))
+        row2.addWidget(self.cmb_mask_export)
         row2.addWidget(self.btn_save_mask)
 
         top_v.addLayout(row1)
@@ -991,6 +1002,7 @@ class BgRemovePane(QtWidgets.QWidget):
         self.btn_add_bg.clicked.connect(self.add_background_dialog)
         self.btn_save_png.clicked.connect(self.save_png_dialog)
         self.btn_save_mask.clicked.connect(self.save_mask_dialog)
+        self.cmb_mask_export.currentIndexChanged.connect(self._on_mask_export_changed)
         self.btn_fit.clicked.connect(self._fit_views)
 
         # Edit mode + undo
@@ -1630,6 +1642,13 @@ class BgRemovePane(QtWidgets.QWidget):
         if idx >= 0:
             self.cmb_preview_bg.setCurrentIndex(idx)
 
+        # Mask export mode (saved mask color convention)
+        try:
+            mexp = str(s.get("mask_export_mode", "white_subject"))
+            self.cmb_mask_export.setCurrentIndex(1 if mexp == "white_background" else 0)
+        except Exception:
+            pass
+
         # Mask edit mode
         mode = str(s.get("edit_mode", "pan"))
         self._set_edit_mode(mode, update_settings=False)
@@ -1684,6 +1703,18 @@ class BgRemovePane(QtWidgets.QWidget):
     def _on_shrink_changed(self, v: int) -> None:
         self.lbl_shrink.setText(f"{v} px")
         self.settings.set("shrink_grow_px", int(v))
+
+    def _on_mask_export_changed(self, idx: int) -> None:
+        """0 = white subject, 1 = white background (invert)."""
+        try:
+            i = int(idx)
+        except Exception:
+            i = 0
+        mode = "white_subject" if i == 0 else "white_background"
+        try:
+            self.settings.set("mask_export_mode", mode)
+        except Exception:
+            pass
 
     # ---- Preview background
 
@@ -1853,7 +1884,24 @@ class BgRemovePane(QtWidgets.QWidget):
         if self._pil_matte is None:
             self._set_status("No mask available. Run background removal first.")
             return
-        p = self._auto_save_image(self._pil_matte, kind="mask")
+        # Optionally invert the saved mask so you can choose whether
+        # white represents the subject or the background.
+        mode = str(self.settings.data.get("mask_export_mode", "white_subject"))
+        to_save = self._pil_matte
+        try:
+            to_save = to_save.convert("L")
+        except Exception:
+            pass
+        if mode == "white_background":
+            try:
+                to_save = ImageOps.invert(to_save)
+            except Exception:
+                try:
+                    a = np.asarray(to_save, dtype=np.uint8)
+                    to_save = Image.fromarray((255 - a).astype(np.uint8), mode="L")
+                except Exception:
+                    pass
+        p = self._auto_save_image(to_save, kind="mask")
         if p is not None:
             self._set_status(f"Saved: {p.name}")
             self._toast(f"Saved to: {p}")
@@ -2499,11 +2547,62 @@ def remove_background_file(
     return out
 
 
+def _create_sdxl_inpaint_pane(parent=None):
+    """Best-effort: create the SDXLInpaintPane widget.
+
+    We try a few import paths so this works both when running inside FrameVision
+    (helpers.* package) and when running this file standalone.
+    """
+    try:
+        from PySide6 import QtWidgets as _QtW  # type: ignore
+    except Exception:
+        return None
+
+    import importlib
+
+    candidates = (
+        "helpers.sdxl_inpaint",      # expected (this patch)
+        "helpers.sdxl_inpaint_ui",   # older name referenced in some builds
+        "sdxl_inpaint",
+        "sdxl_inpaint_ui",
+    )
+
+    last_err = None
+    for mod_name in candidates:
+        try:
+            mod = importlib.import_module(mod_name)
+            Pane = getattr(mod, "SDXLInpaintPane", None)
+            if Pane is None:
+                continue
+            return Pane(parent)
+        except Exception as e:
+            last_err = e
+            continue
+
+    # Placeholder pane if file isn't available in this build.
+    w = _QtW.QWidget(parent)
+    lay = _QtW.QVBoxLayout(w)
+    lay.setContentsMargins(12, 12, 12, 12)
+    msg = "SDXL Inpaint tab is not available in this build.\n\n" \
+          "Make sure helpers/sdxl_inpaint.py exists and dependencies (torch/diffusers) are installed."
+    if last_err is not None:
+        msg += f"\n\nImport error: {last_err}"
+    lab = _QtW.QLabel(msg)
+    lab.setWordWrap(True)
+    lay.addWidget(lab)
+    lay.addStretch(1)
+    return w
+
+
 def install_background_tool(pane, section_widget) -> None:
-    """Tools-tab entry point expected by helpers.tools_tab."""
+    """Tools-tab entry point expected by helpers.tools_tab.
+
+    Adds a tab UI so you can quickly switch between:
+      - Removal (ONNX background remover)
+      - Inpaint (SDXL inpaint pane)
+    """
     try:
         from PySide6 import QtWidgets as _QtW
-        from PySide6 import QtCore as _QtC
     except Exception:
         return
 
@@ -2534,9 +2633,20 @@ def install_background_tool(pane, section_widget) -> None:
     outer.setContentsMargins(0, 0, 0, 0)
     outer.setSpacing(6)
 
-    bg_pane = BgRemovePane(container)
+    tabs = _QtW.QTabWidget(container)
+    tabs.setObjectName("BackgroundToolTabs")
 
-    # Inject "Use current" + "View results" buttons into the pane's top bar.
+    bg_pane = BgRemovePane(tabs)
+    inpaint_pane = _create_sdxl_inpaint_pane(tabs)
+
+    tabs.addTab(bg_pane, "Removal")
+    if inpaint_pane is not None:
+        tabs.addTab(inpaint_pane, "Inpaint")
+    else:
+        # Should not happen, but keep tool usable.
+        tabs.addTab(_QtW.QLabel("Inpaint tab unavailable (PySide6 not loaded)."), "Inpaint")
+
+    # Inject "Use current" + "View results" buttons into the removal pane's top bar.
     btn_use_current = _QtW.QPushButton("Use current")
     btn_use_current.setToolTip("Use the image (or current video frame) already loaded in FrameVision.")
 
@@ -2589,7 +2699,6 @@ def install_background_tool(pane, section_widget) -> None:
         row.addWidget(btn_view_results)
         outer.addLayout(row)
 
-
     def _on_use_current() -> None:
         im, label = _load_current_image_from_host(pane)
         if im is None:
@@ -2600,6 +2709,10 @@ def install_background_tool(pane, section_widget) -> None:
             return
         try:
             bg_pane.load_pil(im, label or "current")  # type: ignore[attr-defined]
+            try:
+                tabs.setCurrentIndex(0)  # jump to Removal tab since it now has the loaded image
+            except Exception:
+                pass
         except Exception:
             # last-resort: try saving to a temp file then load by path
             try:
@@ -2607,6 +2720,10 @@ def install_background_tool(pane, section_widget) -> None:
                 tmp = Path(_tf.gettempdir()) / f"fv_bgtool_current_{_os.getpid()}.png"
                 im.convert("RGBA").save(tmp)
                 bg_pane.load_image(tmp)
+                try:
+                    tabs.setCurrentIndex(0)
+                except Exception:
+                    pass
             except Exception:
                 pass
 
@@ -2677,11 +2794,11 @@ def install_background_tool(pane, section_widget) -> None:
 
     # Keep it nicely resizable inside the tools tab.
     try:
-        bg_pane.setSizePolicy(_QtW.QSizePolicy.Expanding, _QtW.QSizePolicy.Expanding)
+        tabs.setSizePolicy(_QtW.QSizePolicy.Expanding, _QtW.QSizePolicy.Expanding)
     except Exception:
         pass
 
-    outer.addWidget(bg_pane, stretch=1)
+    outer.addWidget(tabs, stretch=1)
 
     # Mount into the collapsible section.
     try:
@@ -2700,7 +2817,9 @@ def install_background_tool(pane, section_widget) -> None:
     # Prevent GC
     try:
         section_widget._bg_tool_container = container
+        section_widget._bg_tool_tabs = tabs
         section_widget._bg_tool_pane = bg_pane
+        section_widget._bg_tool_inpaint = inpaint_pane
     except Exception:
         pass
 
@@ -2712,12 +2831,22 @@ def install_background_tool(pane, section_widget) -> None:
 class BgRemoveWindow(QtWidgets.QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("Background Remover")
-        self.resize(1200, 720)
-        self.pane = BgRemovePane(self)
-        self.setCentralWidget(self.pane)
+        self.setWindowTitle("Background: Removal + Inpaint")
+        self.resize(1200, 780)
 
-        # Basic menu
+        self.tabs = QtWidgets.QTabWidget(self)
+        self.pane = BgRemovePane(self.tabs)  # keep .pane for existing menu actions
+        self.inpaint = _create_sdxl_inpaint_pane(self.tabs)
+
+        self.tabs.addTab(self.pane, "Removal")
+        if self.inpaint is not None:
+            self.tabs.addTab(self.inpaint, "Inpaint")
+        else:
+            self.tabs.addTab(QtWidgets.QLabel("Inpaint tab unavailable."), "Inpaint")
+
+        self.setCentralWidget(self.tabs)
+
+        # Basic menu (targets the Removal tab)
         file_menu = self.menuBar().addMenu("File")
         act_open = QtGui.QAction("Open...", self)
         act_open.setShortcut(QtGui.QKeySequence.Open)

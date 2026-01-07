@@ -2107,45 +2107,333 @@ def txt2img_generate(job, cfg, mani):
     else:
         # Non-Z-Image engines: allow helper + legacy Diffusers fallback
         try:
-            def _zprog(p):
-                """Progress callback for txt2img engines (pct or step/total dict)."""
+            # Special: Qwen-Image-2512 (GGUF via sd-cli) — print richer debug info like the Z-Image path does.
+            if engine in ("qwen2512", "qwen_2512", "qwenimage2512", "qwen-image-2512"):
+                _q_state = {"t0": _now_ts(), "last_stage": None, "last_step": None, "last_pct": -1, "last_line": None}
+
+                # Pull common settings (best-effort; keys vary a bit across UI versions).
                 try:
-                    if isinstance(p, (int, float)):
-                        _progress_set(int(p))
-                        return
-                    if not isinstance(p, dict):
-                        return
-                    if 'pct' in p:
-                        try:
-                            _progress_set(int(p.get('pct') or 0))
-                        except Exception:
-                            pass
-                    elif 'step' in p and 'total' in p:
-                        try:
-                            step = float(p.get('step') or 0)
-                            total = float(p.get('total') or 0)
-                            if total > 0:
-                                _progress_set(int(100.0 * step / total))
-                        except Exception:
-                            pass
-                    # Patch running job JSON with richer fields (best-effort)
+                    _steps = int(args.get("steps") or helper_job.get("steps") or 0)
+                except Exception:
+                    _steps = 0
+                try:
+                    _w = int(args.get("width") or args.get("w") or helper_job.get("width") or helper_job.get("w") or 0)
+                    _h = int(args.get("height") or args.get("h") or helper_job.get("height") or helper_job.get("h") or 0)
+                except Exception:
+                    _w = _h = 0
+                try:
+                    _cfg = float(args.get("cfg") or args.get("cfg_scale") or helper_job.get("cfg") or helper_job.get("cfg_scale") or 0.0)
+                except Exception:
+                    _cfg = 0.0
+                try:
+                    _sampler = (args.get("sampler") or helper_job.get("sampler") or "").strip()
+                except Exception:
+                    _sampler = ""
+                try:
+                    _flow = int(args.get("flow_shift", helper_job.get("flow_shift", 0)) or 0)
+                except Exception:
+                    _flow = 0
+                try:
+                    _seed = args.get("seed") or helper_job.get("seed")
+                except Exception:
+                    _seed = None
+                try:
+                    _offload_raw = args.get("offload_cpu", None)
+                    if _offload_raw is None:
+                        _offload_raw = args.get("offload_to_cpu", None)
+                    if _offload_raw is None:
+                        _offload_raw = helper_job.get("offload_cpu", None)
+                    if _offload_raw is None:
+                        _offload_raw = helper_job.get("offload_to_cpu", None)
+                    _offload = bool(_offload_raw)
+                except Exception:
+                    _offload = False
+                try:
+                    _batch = int(args.get("batch") or helper_job.get("batch") or 1)
+                except Exception:
+                    _batch = 1
+
+                # Prompt visibility (trimmed so we don't spam the console).
+                try:
+                    _prompt = str(args.get("prompt") or helper_job.get("prompt") or "").strip()
+                except Exception:
+                    _prompt = ""
+                _prompt_short = (_prompt[:120] + "…") if (len(_prompt) > 120) else _prompt
+
+                try:
+                    print(f"[txt2img][Qwen2512] start  |  {_w}x{_h}  |  steps={_steps}  |  cfg={_cfg}  |  batch={_batch}  |  seed={_seed if str(_seed).strip() else 'random'}")
+                except Exception:
+                    pass
+                try:
+                    if _sampler or _flow or _offload:
+                        print(f"[txt2img][Qwen2512] sampler={_sampler or 'default'}  |  flow_shift={_flow}  |  offload_cpu={_offload}")
+                except Exception:
+                    pass
+                try:
+                    if _prompt_short:
+                        print(f"[txt2img][Qwen2512] prompt: {_prompt_short}")
+                except Exception:
+                    pass
+
+                # Try to resolve sd-cli + model file paths (best-effort) so you can spot wrong installs immediately.
+                try:
+                    sd_cli = None
+                    diffusion = llm = vae = None
                     try:
-                        if RUNNING_JSON_FILE:
-                            rj = Path(RUNNING_JSON_FILE)
-                            j = json.loads(rj.read_text(encoding='utf-8')) if rj.exists() else {}
-                            changed = False
-                            for k in ('step','total','status','stage'):
-                                if k in p and j.get(k) != p.get(k):
-                                    j[k] = p.get(k)
-                                    changed = True
-                            if changed:
-                                j['status_at'] = time.strftime('%Y-%m-%d %H:%M:%S')
-                                rj.write_text(json.dumps(j, indent=2), encoding='utf-8')
+                        from helpers import qwen2512 as _qtool  # type: ignore
+                        try:
+                            sd_cli = _qtool._find_sd_cli(BASE)  # type: ignore[attr-defined]
+                        except Exception:
+                            sd_cli = None
+                        try:
+                            diffusion, llm, vae = _qtool._model_paths(BASE)  # type: ignore[attr-defined]
+                        except Exception:
+                            diffusion = llm = vae = None
+                    except Exception:
+                        sd_cli = None
+                        diffusion = llm = vae = None
+
+                    def _pinfo(pth):
+                        try:
+                            if not pth:
+                                return None
+                            pp = Path(str(pth))
+                            if not pp.exists():
+                                return str(pp)
+                            sz = int(pp.stat().st_size or 0)
+                            return f"{pp} ({_bytes_human(sz)})"
+                        except Exception:
+                            try:
+                                return str(pth)
+                            except Exception:
+                                return None
+
+                    if sd_cli:
+                        try:
+                            print(f"[txt2img][Qwen2512] sd-cli: {sd_cli}")
+                        except Exception:
+                            pass
+                    if diffusion or llm or vae:
+                        try:
+                            print("[txt2img][Qwen2512] models:",
+                                  "\n  diffusion:", _pinfo(diffusion),
+                                  "\n  llm:", _pinfo(llm),
+                                  "\n  vae:", _pinfo(vae))
+                        except Exception:
+                            pass
+
+                    # Patch running JSON so the Queue row can show more than just a percent.
+                    try:
+                        _patch_running_json({
+                            "stage": "Preparing (Qwen2512)",
+                            "engine": "qwen2512",
+                            "w": _w or None,
+                            "h": _h or None,
+                            "steps": _steps or None,
+                            "cfg": _cfg or None,
+                            "sampler": _sampler or None,
+                            "flow_shift": _flow or None,
+                            "seed": _seed if str(_seed).strip() else None,
+                            "batch": _batch or None,
+                            "offload_cpu": bool(_offload),
+                            "sd_cli": str(sd_cli) if sd_cli else None,
+                            "diffusion_model": str(diffusion) if diffusion else None,
+                            "llm_model": str(llm) if llm else None,
+                            "vae_model": str(vae) if vae else None,
+                        })
                     except Exception:
                         pass
                 except Exception:
-                    return
-            res = _txt2img.generate_qwen_images(helper_job, progress_cb=_zprog, cancel_event=None)
+                    pass
+
+                def _qprog(p):
+                    """Progress callback for Qwen2512 txt2img (pct or step/total dict)."""
+                    try:
+                        elapsed = None
+                        try:
+                            elapsed = _now_ts() - float(_q_state.get("t0") or _now_ts())
+                        except Exception:
+                            elapsed = None
+
+                        # ---- Numeric progress ----
+                        if isinstance(p, (int, float)):
+                            ip = int(p)
+                            _progress_set(ip)
+                            # Print every 10% or on finish
+                            try:
+                                lastp = int(_q_state.get("last_pct") or -999)
+                            except Exception:
+                                lastp = -999
+                            if ip >= 100 or (ip - lastp) >= 10:
+                                _q_state["last_pct"] = ip
+                                msg = f"[txt2img][Qwen2512] {ip}%"
+                                if elapsed is not None:
+                                    msg += f"  |  elapsed {_fmt_dur_short(elapsed)}"
+                                _print_once("last_line", _q_state, msg)
+                            return
+
+                        if not isinstance(p, dict):
+                            return
+
+                        stage = (p.get("stage") or p.get("status") or "").strip()
+                        status = (p.get("status") or "").strip()
+                        line = (p.get("line") or p.get("msg") or p.get("message") or "").strip()
+
+                        pct = None
+                        if "pct" in p:
+                            try:
+                                pct = int(float(p.get("pct") or 0))
+                            except Exception:
+                                pct = None
+                            if pct is not None:
+                                _progress_set(pct)
+
+                        step = None
+                        total = None
+                        if "step" in p and "total" in p:
+                            try:
+                                step = int(float(p.get("step") or 0))
+                                total = int(float(p.get("total") or 0))
+                            except Exception:
+                                step = None
+                                total = None
+                            if total and total > 0:
+                                if pct is None:
+                                    try:
+                                        pct = int(100.0 * float(step) / float(total))
+                                    except Exception:
+                                        pct = None
+                                try:
+                                    _progress_set(int(100.0 * float(step) / float(total)))
+                                except Exception:
+                                    pass
+
+                        # Reasonable stage inference
+                        if not stage:
+                            if step is not None and total is not None:
+                                stage = "Denoising"
+                            elif pct is not None and pct < 5:
+                                stage = "Preparing"
+                            elif pct is not None and pct >= 95:
+                                stage = "Saving"
+                            else:
+                                stage = "Working"
+
+                        # Print only on stage changes, or every ~10% bucket, or when we get a meaningful line.
+                        should_print = False
+                        try:
+                            last_stage = _q_state.get("last_stage")
+                            if stage and stage != last_stage:
+                                should_print = True
+                                _q_state["last_stage"] = stage
+                        except Exception:
+                            pass
+                        try:
+                            lastp = int(_q_state.get("last_pct") or -999)
+                        except Exception:
+                            lastp = -999
+                        if pct is not None:
+                            bucket = int(max(0, min(100, int(pct))) / 10)
+                            last_bucket = int(max(0, min(100, int(lastp))) / 10) if lastp >= 0 else -999
+                            if bucket != last_bucket:
+                                should_print = True
+                                _q_state["last_pct"] = int(pct)
+
+                        if line:
+                            # Avoid printing identical lines over and over.
+                            if line != _q_state.get("last_line"):
+                                _q_state["last_line"] = line
+                                # Keep this conservative: only print short-ish lines.
+                                if len(line) <= 180:
+                                    should_print = True
+
+                        if not should_print:
+                            return
+
+                        parts = [f"[txt2img][Qwen2512] {stage}"]
+                        if step is not None and total is not None and total > 0:
+                            parts.append(f"{step}/{total}")
+                        elif pct is not None:
+                            parts.append(f"{pct}%")
+                        if status and status != stage:
+                            parts.append(status)
+                        if line and line not in (stage, status):
+                            parts.append(line)
+
+                        msg = "  |  ".join([str(x) for x in parts if x])
+                        if elapsed is not None:
+                            msg += f"  |  elapsed {_fmt_dur_short(elapsed)}"
+                        _print_once("last_line", _q_state, msg)
+
+                        # Patch running job JSON with richer fields (best-effort)
+                        try:
+                            if RUNNING_JSON_FILE:
+                                rj = Path(RUNNING_JSON_FILE)
+                                j = json.loads(rj.read_text(encoding='utf-8')) if rj.exists() else {}
+                                changed = False
+                                for k in ('step','total','status','stage','pct'):
+                                    if k in p and j.get(k) != p.get(k):
+                                        j[k] = p.get(k)
+                                        changed = True
+                                if stage and j.get("stage") != stage:
+                                    j["stage"] = stage
+                                    changed = True
+                                if pct is not None and j.get("pct") != int(pct):
+                                    j["pct"] = int(pct)
+                                    changed = True
+                                if line and j.get("last_line") != line:
+                                    j["last_line"] = line
+                                    changed = True
+                                if changed:
+                                    j['status_at'] = time.strftime('%Y-%m-%d %H:%M:%S')
+                                    rj.write_text(json.dumps(j, indent=2), encoding='utf-8')
+                        except Exception:
+                            pass
+                    except Exception:
+                        return
+
+                res = _txt2img.generate_qwen_images(helper_job, progress_cb=_qprog, cancel_event=None)
+
+            else:
+                def _zprog(p):
+                    """Progress callback for txt2img engines (pct or step/total dict)."""
+                    try:
+                        if isinstance(p, (int, float)):
+                            _progress_set(int(p))
+                            return
+                        if not isinstance(p, dict):
+                            return
+                        if 'pct' in p:
+                            try:
+                                _progress_set(int(p.get('pct') or 0))
+                            except Exception:
+                                pass
+                        elif 'step' in p and 'total' in p:
+                            try:
+                                step = float(p.get('step') or 0)
+                                total = float(p.get('total') or 0)
+                                if total > 0:
+                                    _progress_set(int(100.0 * step / total))
+                            except Exception:
+                                pass
+                        # Patch running job JSON with richer fields (best-effort)
+                        try:
+                            if RUNNING_JSON_FILE:
+                                rj = Path(RUNNING_JSON_FILE)
+                                j = json.loads(rj.read_text(encoding='utf-8')) if rj.exists() else {}
+                                changed = False
+                                for k in ('step','total','status','stage'):
+                                    if k in p and j.get(k) != p.get(k):
+                                        j[k] = p.get(k)
+                                        changed = True
+                                if changed:
+                                    j['status_at'] = time.strftime('%Y-%m-%d %H:%M:%S')
+                                    rj.write_text(json.dumps(j, indent=2), encoding='utf-8')
+                        except Exception:
+                            pass
+                    except Exception:
+                        return
+                res = _txt2img.generate_qwen_images(helper_job, progress_cb=_zprog, cancel_event=None)
         except Exception as e:
             try:
                 _mark_error(job, f"txt2img helper failed: {e}")
