@@ -1612,9 +1612,57 @@ class UpscPane(QtWidgets.QWidget):
                 i += 1
             return cand
         return base
+    def _sanitize_realsr_model(self, model: str, scale: int) -> str:
+        """Best-effort cleanup for Real-ESRGAN model names.
+        Fixes common issues:
+          - model accidentally passed as a full path
+          - model auto-suffixed with _x{scale} / -x{scale} when only the base file exists
+        """
+        n = (model or "").strip().strip('"').strip("'")
+        # If it looks like a path, keep only the basename (without extension)
+        try:
+            if ":" in n or "/" in n or "\\" in n:
+                base = os.path.basename(n.replace("\\", "/"))
+                n = os.path.splitext(base)[0]
+        except Exception:
+            pass
+
+        # If the selected model doesn't exist, but a stripped suffix variant does, fall back.
+        try:
+            cand_param = REALSR_DIR / f"{n}.param"
+            cand_bin = REALSR_DIR / f"{n}.bin"
+            if (not cand_param.exists()) and (not cand_bin.exists()):
+                mm = re.match(r"^(.*?)(?:[_-]x([234]))$", n, flags=re.IGNORECASE)
+                if mm:
+                    base = (mm.group(1) or "").strip()
+                    if base:
+                        b_param = REALSR_DIR / f"{base}.param"
+                        b_bin = REALSR_DIR / f"{base}.bin"
+                        if b_param.exists() or b_bin.exists():
+                            n = base
+        except Exception:
+            pass
+
+        return n
+
     def _realsr_cmd_dir(self, exe: str, indir: Path, outdir: Path, model: str, scale: int) -> List[str]:
         n = (model or "").strip()
+        n = self._sanitize_realsr_model(n, scale)
         cmd = [exe, "-i", str(indir), "-o", str(outdir), "-n", n, "-s", str(scale), "-m", str(REALSR_DIR), "-f", "png"]
+        # Force GPU selection for Real-ESRGAN (ncnn-vulkan).
+        # Default to GPU 0 (usually the discrete NVIDIA GPU). Override with FV_REALSR_GPU_ID.
+        try:
+            gid = os.environ.get("FV_REALSR_GPU_ID", "").strip() or "0"
+            cmd += ["-g", str(gid)]
+        except Exception:
+            pass
+        # Optional thread tuning: FV_REALSR_JOBS like "1:2:2" (load:proc:save).
+        try:
+            jobs = os.environ.get("FV_REALSR_JOBS", "").strip()
+            if jobs:
+                cmd += ["-j", str(jobs)]
+        except Exception:
+            pass
         try:
             t = int(self.spin_tile.value()) if hasattr(self, "spin_tile") else 0
             if t > 0:
@@ -1625,7 +1673,22 @@ class UpscPane(QtWidgets.QWidget):
 
     def _realsr_cmd_file(self, exe: str, infile: Path, outfile: Path, model: str, scale: int) -> List[str]:
         n = (model or "").strip()
+        n = self._sanitize_realsr_model(n, scale)
         cmd = [exe, "-i", str(infile), "-o", str(outfile), "-n", n, "-s", str(scale), "-m", str(REALSR_DIR)]
+        # Force GPU selection for Real-ESRGAN (ncnn-vulkan).
+        # Default to GPU 0 (usually the discrete NVIDIA GPU). Override with FV_REALSR_GPU_ID.
+        try:
+            gid = os.environ.get("FV_REALSR_GPU_ID", "").strip() or "0"
+            cmd += ["-g", str(gid)]
+        except Exception:
+            pass
+        # Optional thread tuning: FV_REALSR_JOBS like "1:2:2" (load:proc:save).
+        try:
+            jobs = os.environ.get("FV_REALSR_JOBS", "").strip()
+            if jobs:
+                cmd += ["-j", str(jobs)]
+        except Exception:
+            pass
         try:
             t = int(self.spin_tile.value()) if hasattr(self, "spin_tile") else 0
             if t > 0:
@@ -2433,11 +2496,49 @@ def _fv_r11_wrap_file(orig):
             in_p = __P(src); out_p = __P(outfile)
             if in_p.exists() and in_p.is_dir():
                 out_p.mkdir(parents=True, exist_ok=True)
-                return [engine_exe, "-i", str(in_p), "-o", str(out_p), "-s", str(sc), "-n", base, "-m", dstr]
+                cmd = [engine_exe, "-i", str(in_p), "-o", str(out_p), "-s", str(sc), "-n", base, "-m", dstr]
+                # Force GPU selection + tuning for Upscayl/ESRGAN models (realesrgan-ncnn-vulkan)
+                try:
+                    gid = os.environ.get("FV_REALSR_GPU_ID", "").strip() or "0"
+                    cmd += ["-g", str(gid)]
+                except Exception:
+                    pass
+                try:
+                    jobs = os.environ.get("FV_REALSR_JOBS", "").strip()
+                    if jobs:
+                        cmd += ["-j", str(jobs)]
+                except Exception:
+                    pass
+                try:
+                    t = int(self.spin_tile.value()) if hasattr(self, "spin_tile") else 0
+                    if t > 0:
+                        cmd += ["-t", str(t)]
+                except Exception:
+                    pass
+                return cmd
             if (not out_p.suffix) or (out_p.exists() and out_p.is_dir()):
                 out_p.mkdir(parents=True, exist_ok=True)
                 out_p = out_p / (in_p.stem + ".png")
-            return [engine_exe, "-i", str(in_p), "-o", str(out_p), "-s", str(sc), "-n", base, "-m", dstr]
+            cmd = [engine_exe, "-i", str(in_p), "-o", str(out_p), "-s", str(sc), "-n", base, "-m", dstr]
+            # Force GPU selection + tuning for Upscayl/ESRGAN models (realesrgan-ncnn-vulkan)
+            try:
+                gid = os.environ.get("FV_REALSR_GPU_ID", "").strip() or "0"
+                cmd += ["-g", str(gid)]
+            except Exception:
+                pass
+            try:
+                jobs = os.environ.get("FV_REALSR_JOBS", "").strip()
+                if jobs:
+                    cmd += ["-j", str(jobs)]
+            except Exception:
+                pass
+            try:
+                t = int(self.spin_tile.value()) if hasattr(self, "spin_tile") else 0
+                if t > 0:
+                    cmd += ["-t", str(t)]
+            except Exception:
+                pass
+            return cmd
         return orig(self, engine_exe, src, outfile, model, scale)
     return _wrapped
 
@@ -2453,7 +2554,26 @@ def _fv_r11_wrap_dir(orig):
         if isinstance(data, dict) and data.get("fv") == "upsc-model":
             base = data["base"]; dstr = data["dir"]; sc = int(data["scale"])
             in_p = __P(in_dir); out_p = __P(out_dir); out_p.mkdir(parents=True, exist_ok=True)
-            return [engine_exe, "-i", str(in_p), "-o", str(out_p), "-s", str(sc), "-n", base, "-m", dstr]
+            cmd = [engine_exe, "-i", str(in_p), "-o", str(out_p), "-s", str(sc), "-n", base, "-m", dstr]
+            # Force GPU selection + tuning for Upscayl/ESRGAN models (realesrgan-ncnn-vulkan)
+            try:
+                gid = os.environ.get("FV_REALSR_GPU_ID", "").strip() or "0"
+                cmd += ["-g", str(gid)]
+            except Exception:
+                pass
+            try:
+                jobs = os.environ.get("FV_REALSR_JOBS", "").strip()
+                if jobs:
+                    cmd += ["-j", str(jobs)]
+            except Exception:
+                pass
+            try:
+                t = int(self.spin_tile.value()) if hasattr(self, "spin_tile") else 0
+                if t > 0:
+                    cmd += ["-t", str(t)]
+            except Exception:
+                pass
+            return cmd
         return orig(self, engine_exe, in_dir, out_dir, model, scale)
     return _wrapped
 

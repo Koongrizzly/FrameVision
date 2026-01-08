@@ -1190,7 +1190,22 @@ def build_timeline(
         option is on, but they currently piggy-back on the existing slow-factor
         logic rather than splitting segments.
         """
-        if not cine_enable or not segments:
+        if not segments:
+            return
+
+        # Most cinematic FX require the global cinematic toggle, but speed ramps
+        # are driven by slow-motion and can run even when other cinematic FX are off.
+        if not cine_enable and not (cine_speed_ramp and slow_motion_enabled):
+            return
+
+        # If cinematic is disabled, we still allow speed ramps and skip all other FX.
+        if not cine_enable:
+            if cine_speed_ramp and slow_motion_enabled:
+                for seg in segments:
+                    if float(getattr(seg, "slow_factor", 1.0)) != 1.0:
+                        seg.cine_speed_ramp = True
+                        seg.cine_ramp_in = float(max(0.05, min(0.60, cine_ramp_in)))
+                        seg.cine_ramp_out = float(max(0.05, min(0.60, cine_ramp_out)))
             return
 
         # Collect which cinematic effects are globally enabled.
@@ -6760,6 +6775,43 @@ class AutoMusicSyncWidget(QWidget):
         row_slow_factor.addWidget(self.label_slow_factor_value)
         slow_layout.addLayout(row_slow_factor)
 
+        # Cinematic speed ramps (slow-motion only)
+        # Only shows (and works) when the main slow-motion toggle is enabled.
+        row_slow_ramp = QHBoxLayout()
+        self.check_cine_speed_ramp = QCheckBox("Use cinematic speed ramps", self.slow_options)
+        self.check_cine_speed_ramp.setToolTip(
+            "Smooth the change into and out of slow-motion segments instead of an abrupt jump."
+        )
+        row_slow_ramp.addWidget(self.check_cine_speed_ramp)
+        row_slow_ramp.addStretch(1)
+        slow_layout.addLayout(row_slow_ramp)
+
+        row_slow_ramp_times = QHBoxLayout()
+        label_ramp_in = QLabel("Ramp in:", self.slow_options)
+        row_slow_ramp_times.addWidget(label_ramp_in)
+        self.slider_cine_ramp_in = QSlider(Qt.Horizontal, self.slow_options)
+        self.slider_cine_ramp_in.setMinimum(15)    # 0.15 s
+        self.slider_cine_ramp_in.setMaximum(100)   # 1.00 s
+        self.slider_cine_ramp_in.setSingleStep(1)
+        self.slider_cine_ramp_in.setValue(25)      # 0.25 s
+        row_slow_ramp_times.addWidget(self.slider_cine_ramp_in, 1)
+        self.label_cine_ramp_in = QLabel("0.25 s", self.slow_options)
+        self.label_cine_ramp_in.setMinimumWidth(50)
+        row_slow_ramp_times.addWidget(self.label_cine_ramp_in)
+
+        label_ramp_out = QLabel("Ramp out:", self.slow_options)
+        row_slow_ramp_times.addWidget(label_ramp_out)
+        self.slider_cine_ramp_out = QSlider(Qt.Horizontal, self.slow_options)
+        self.slider_cine_ramp_out.setMinimum(15)   # 0.15 s
+        self.slider_cine_ramp_out.setMaximum(100)  # 1.00 s
+        self.slider_cine_ramp_out.setSingleStep(1)
+        self.slider_cine_ramp_out.setValue(25)     # 0.25 s
+        row_slow_ramp_times.addWidget(self.slider_cine_ramp_out, 1)
+        self.label_cine_ramp_out = QLabel("0.25 s", self.slow_options)
+        self.label_cine_ramp_out.setMinimumWidth(50)
+        row_slow_ramp_times.addWidget(self.label_cine_ramp_out)
+        slow_layout.addLayout(row_slow_ramp_times)
+
         opts.addWidget(self.slow_options)
         self.slow_options.setVisible(False)
 
@@ -6768,7 +6820,7 @@ class AutoMusicSyncWidget(QWidget):
         self.check_cine_enable = QCheckBox("Enable cinematic effects", self)
         self.check_cine_enable.setToolTip(
             "Enable a few rare, high-impact visual effects (shutter-pop, stutter, "
-            "reverse-bounce, ramps). Effects are placed automatically "
+            "reverse-bounce). Effects are placed automatically "
         )
         row_cine_master.addWidget(self.check_cine_enable)
         row_cine_master.addStretch(1)
@@ -7173,43 +7225,6 @@ class AutoMusicSyncWidget(QWidget):
         row_cine_speedup_backward.addWidget(self.spin_cine_speedup_backward)
         row_cine_speedup_backward.addStretch(1)
         cine_layout.addLayout(row_cine_speedup_backward)
-
-        # Speed ramps (only useful when slow-motion is enabled)
-        row_cine_ramp = QHBoxLayout()
-        self.check_cine_speed_ramp = QCheckBox("Use cinematic speed ramps", self.cine_options)
-        self.check_cine_speed_ramp.setToolTip(
-            "When slow-motion is enabled, smooth the change into and out of "
-            "slow segments instead of an abrupt jump."
-        )
-        row_cine_ramp.addWidget(self.check_cine_speed_ramp)
-        row_cine_ramp.addStretch(1)
-        cine_layout.addLayout(row_cine_ramp)
-
-        row_cine_ramp_times = QHBoxLayout()
-        label_ramp_in = QLabel("Ramp in:", self.cine_options)
-        row_cine_ramp_times.addWidget(label_ramp_in)
-        self.slider_cine_ramp_in = QSlider(Qt.Horizontal, self.cine_options)
-        self.slider_cine_ramp_in.setMinimum(15)    # 0.15 s
-        self.slider_cine_ramp_in.setMaximum(100)   # 1.00 s
-        self.slider_cine_ramp_in.setSingleStep(1)
-        self.slider_cine_ramp_in.setValue(25)     # 0.25 s
-        row_cine_ramp_times.addWidget(self.slider_cine_ramp_in, 1)
-        self.label_cine_ramp_in = QLabel("0.25 s", self.cine_options)
-        self.label_cine_ramp_in.setMinimumWidth(50)
-        row_cine_ramp_times.addWidget(self.label_cine_ramp_in)
-
-        label_ramp_out = QLabel("Ramp out:", self.cine_options)
-        row_cine_ramp_times.addWidget(label_ramp_out)
-        self.slider_cine_ramp_out = QSlider(Qt.Horizontal, self.cine_options)
-        self.slider_cine_ramp_out.setMinimum(15)   # 0.15 s
-        self.slider_cine_ramp_out.setMaximum(100)  # 0.50 s
-        self.slider_cine_ramp_out.setSingleStep(1)
-        self.slider_cine_ramp_out.setValue(25)    # 0.25 s
-        row_cine_ramp_times.addWidget(self.slider_cine_ramp_out, 1)
-        self.label_cine_ramp_out = QLabel("0.25 s", self.cine_options)
-        self.label_cine_ramp_out.setMinimumWidth(50)
-        row_cine_ramp_times.addWidget(self.label_cine_ramp_out)
-        cine_layout.addLayout(row_cine_ramp_times)
 
         opts.addWidget(self.cine_options)
         self.cine_options.setVisible(False)
@@ -7882,6 +7897,11 @@ class AutoMusicSyncWidget(QWidget):
         self.check_trans_random.stateChanged.connect(self._on_trans_random_toggled)
         self.check_slow_enable.stateChanged.connect(self._on_slow_toggle)
         self.slider_slow_factor.valueChanged.connect(self._on_slow_factor_changed)
+        # Speed ramps live under slow-motion controls and depend on slow-motion being enabled.
+        try:
+            self.check_cine_speed_ramp.stateChanged.connect(lambda _=None: self._update_cine_controls_enabled())
+        except Exception:
+            pass
 
         # Cinematic effects panel
         self.check_cine_enable.stateChanged.connect(self._on_cine_toggle)
@@ -9575,6 +9595,25 @@ class AutoMusicSyncWidget(QWidget):
         except Exception:
             pass
 
+        # Speed ramps are only valid in slow-motion mode.
+        if not enabled:
+            cb = getattr(self, "check_cine_speed_ramp", None)
+            if cb is not None:
+                try:
+                    cb.blockSignals(True)
+                    cb.setChecked(False)
+                except Exception:
+                    pass
+                finally:
+                    try:
+                        cb.blockSignals(False)
+                    except Exception:
+                        pass
+        try:
+            self._update_cine_controls_enabled()
+        except Exception:
+            pass
+
     def _on_slow_factor_changed(self, value: int) -> None:
         # Update the numeric label next to the slow-motion factor slider.
         try:
@@ -9606,13 +9645,26 @@ class AutoMusicSyncWidget(QWidget):
             pass
 
     def _update_cine_controls_enabled(self) -> None:
-        cine_enabled = getattr(self, "check_cine_enable", None)
+        """Enable/disable the speed-ramp controls based on slow-motion state.
+
+        This UI used to live under Cinematic Effects, but it is only meaningful
+        when slow-motion is enabled, so we gate it purely on the slow-motion toggle.
+        """
         slow_enabled = getattr(self, "check_slow_enable", None)
-        cine_on = bool(cine_enabled and cine_enabled.isChecked())
         slow_on = bool(slow_enabled and slow_enabled.isChecked())
-        ramp_ok = cine_on and slow_on
+
+        ramp_cb = getattr(self, "check_cine_speed_ramp", None)
+        ramp_on = bool(ramp_cb and ramp_cb.isChecked())
+
+        # The checkbox itself only makes sense when slow-motion is on.
+        if ramp_cb is not None:
+            try:
+                ramp_cb.setEnabled(slow_on)
+            except Exception:
+                pass
+
+        ramp_times_ok = slow_on and ramp_on
         for w in (
-            getattr(self, "check_cine_speed_ramp", None),
             getattr(self, "slider_cine_ramp_in", None),
             getattr(self, "slider_cine_ramp_out", None),
             getattr(self, "label_cine_ramp_in", None),
@@ -9620,7 +9672,7 @@ class AutoMusicSyncWidget(QWidget):
         ):
             if w is not None:
                 try:
-                    w.setEnabled(ramp_ok)
+                    w.setEnabled(ramp_times_ok)
                 except Exception:
                     pass
 
@@ -10047,8 +10099,7 @@ class AutoMusicSyncWidget(QWidget):
             "check_cine_reverse",
             "check_cine_speedup_forward",
             "check_cine_speedup_backward",
-            "check_cine_speed_ramp",
-            "check_cine_boomerang",
+                        "check_cine_boomerang",
             "check_cine_pan916",
             "check_cine_pan916_random",
             "check_cine_mosaic",
@@ -10084,7 +10135,6 @@ class AutoMusicSyncWidget(QWidget):
             getattr(self, "check_cine_reverse", None),
             getattr(self, "check_cine_speedup_forward", None),
             getattr(self, "check_cine_speedup_backward", None),
-            getattr(self, "check_cine_speed_ramp", None),
             getattr(self, "check_cine_boomerang", None),
             getattr(self, "check_cine_pan916", None),
             getattr(self, "check_cine_pan916_random", None),
@@ -10978,7 +11028,7 @@ class AutoMusicSyncWidget(QWidget):
             cine_speedup_forward_factor=float(self.spin_cine_speedup_forward.value()),
             cine_speedup_backward=bool(self.check_cine_speedup_backward.isChecked()),
             cine_speedup_backward_factor=float(self.spin_cine_speedup_backward.value()),
-            cine_speed_ramp=bool(self.check_cine_speed_ramp.isChecked()),
+            cine_speed_ramp=(bool(slow_enabled) and bool(self.check_cine_speed_ramp.isChecked())),
             cine_freeze_len=self.slider_cine_freeze_len.value() / 100.0,
             cine_freeze_zoom=self.slider_cine_freeze_zoom.value() / 100.0,
             cine_tear_v=bool(self.check_cine_tear_v.isChecked()),
