@@ -1903,7 +1903,53 @@ def txt2img_generate(job, cfg, mani):
     except Exception:
         pass
 
-    res = None
+    
+    # Extra: surface LoRA intent early (helps debug "LoRA not applied" reports).
+    try:
+        l1 = (args.get("lora_path") or helper_job.get("lora_path") or "").strip()
+        l2 = (args.get("lora2_path") or helper_job.get("lora2_path") or "").strip()
+        s1 = args.get("lora_scale", helper_job.get("lora_scale", 1.0))
+        s2 = args.get("lora2_scale", helper_job.get("lora2_scale", 1.0))
+        apply_mode = (args.get("lora_apply_mode") or helper_job.get("lora_apply_mode") or "auto")
+        if l1:
+            try:
+                n1 = Path(l1).stem
+            except Exception:
+                n1 = l1
+            try:
+                print(f"[worker txt2img] LoRA1 requested: {n1}  |  scale={s1}  |  path={l1}")
+            except Exception:
+                pass
+        if l2:
+            try:
+                n2 = Path(l2).stem
+            except Exception:
+                n2 = l2
+            try:
+                print(f"[worker txt2img] LoRA2 requested: {n2}  |  scale={s2}  |  path={l2}")
+            except Exception:
+                pass
+        if l1 or l2:
+            try:
+                # Qwen2512 uses sd-cli LoRA support: lora dir + apply mode + prompt tag.
+                print(f"[worker txt2img] LoRA apply mode: {apply_mode}")
+            except Exception:
+                pass
+            try:
+                # Also patch running JSON so the Queue row can show it.
+                _patch_running_json({
+                    "lora_path": l1 or None,
+                    "lora_scale": float(s1) if l1 else None,
+                    "lora2_path": l2 or None,
+                    "lora2_scale": float(s2) if l2 else None,
+                    "lora_apply_mode": str(apply_mode),
+                })
+            except Exception:
+                pass
+    except Exception:
+        pass
+
+res = None
 
     # Strict Z-Image path (Option A: no SDXL fallback)
     if engine == "zimage":

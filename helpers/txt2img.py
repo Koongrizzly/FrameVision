@@ -2383,7 +2383,7 @@ class Txt2ImgPane(QWidget):
         rowl.addWidget(self.lora_path_btn, 0)
         rowl.addWidget(self.lora_refresh, 0)
         rowl.addWidget(self.lora_combo, 1)
-        self.lora_label = QLabel("LoRA (SDXL)")
+        self.lora_label = QLabel("LoRA")
         mdl_form.addRow(self.lora_label, rowl)
         try:
             self.lora_path_btn.clicked.connect(_browse_lora_root)
@@ -2435,7 +2435,7 @@ class Txt2ImgPane(QWidget):
         rowl2 = QHBoxLayout()
         rowl2.addWidget(self.lora2_refresh, 0)
         rowl2.addWidget(self.lora2_combo, 1)
-        self.lora2_label = QLabel("LoRA 2 (SDXL)")
+        self.lora2_label = QLabel("LoRA 2")
         mdl_form.addRow(self.lora2_label, rowl2)
 
         def _populate_loras2():
@@ -2838,7 +2838,7 @@ class Txt2ImgPane(QWidget):
         outer.addLayout(btns)
 
     def _apply_lora_visibility(self):
-        """LoRA UI is only relevant for SDXL (diffusers) and Z-Image FP16."""
+        """LoRA UI is relevant for SDXL (diffusers), Z-Image FP16, and Qwen2512."""
         try:
             key = self._engine_key_selected() if hasattr(self, "_engine_key_selected") else ""
         except Exception:
@@ -2850,7 +2850,7 @@ class Txt2ImgPane(QWidget):
 
         show_lora = False
         try:
-            if key == "zimage":
+            if key in ("zimage", "qwen2512"):
                 show_lora = True
             elif key == "diffusers":
                 mp = ""
@@ -5512,6 +5512,56 @@ def _gen_via_qwen2512(job: dict, out_dir: Path, progress_cb=None, cancel_event: 
         return None
 
     prompt = str(job.get("prompt", "") or "")
+
+    # Optional LoRA support: sd-cli parses <lora:NAME:W> tags when --lora-model-dir is set.
+    lora_path = str(job.get("lora_path", "") or "").strip()
+    lora2_path = str(job.get("lora2_path", "") or "").strip()
+    lora_scale = job.get("lora_scale", None)
+    lora2_scale = job.get("lora2_scale", None)
+    lora_apply_mode = str(job.get("lora_apply_mode", "") or "at_runtime").strip() or "at_runtime"
+    lora_model_dir = ""
+    def _fmt_lora_tag(_path: str, _scale) -> str:
+        if not _path:
+            return ""
+        try:
+            _w = float(_scale) if _scale is not None else 1.0
+        except Exception:
+            _w = 1.0
+        _name = Path(_path).stem
+        # Use :g to avoid '1.0' style spam in the prompt, but keep precision when needed.
+        try:
+            _w_s = (f"{_w:g}")
+        except Exception:
+            _w_s = str(_w)
+        return f"<lora:{_name}:{_w_s}>"
+    try:
+        _dirs = []
+        for _lp in (lora_path, lora2_path):
+            if _lp:
+                try:
+                    _dirs.append(str(Path(_lp).resolve().parent))
+                except Exception:
+                    _dirs.append(str(Path(_lp).parent))
+        if _dirs:
+            import os as _os
+            _common = _os.path.commonpath(_dirs)
+            if _common and Path(_common).exists():
+                lora_model_dir = _common
+            else:
+                lora_model_dir = _dirs[0]
+    except Exception:
+        lora_model_dir = str(Path(lora_path).parent) if lora_path else (str(Path(lora2_path).parent) if lora2_path else "")
+    try:
+        _tags = []
+        _t1 = _fmt_lora_tag(lora_path, lora_scale)
+        _t2 = _fmt_lora_tag(lora2_path, lora2_scale)
+        if _t1: _tags.append(_t1)
+        if _t2: _tags.append(_t2)
+        if _tags:
+            prompt = " ".join(_tags) + " " + prompt
+    except Exception:
+        pass
+
     # Some sd-cli Windows builds assert/crash on non-ASCII bytes in -p.
     try:
         _sp = getattr(_qwen, "_sanitize_prompt_ascii", None)
@@ -5599,6 +5649,9 @@ def _gen_via_qwen2512(job: dict, out_dir: Path, progress_cb=None, cancel_event: 
             "-o", str(out_path),
             "--seed", str(s0),
         ]
+        # LoRA flags (optional)
+        if lora_model_dir and (lora_path or lora2_path):
+            cmd += ["--lora-model-dir", str(lora_model_dir), "--lora-apply-mode", str(lora_apply_mode)]
         if offload_cpu:
             cmd.append("--offload-to-cpu")
 

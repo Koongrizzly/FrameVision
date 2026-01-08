@@ -73,7 +73,10 @@ def _load_settings(root: Path) -> dict:
         "flow_shift": 3,
         "seed": "",
         "offload_cpu": False,
-        "prompt": "a cute creature made of clay, studio lighting, highly detailed"
+        "prompt": "a cute creature made of clay, studio lighting, highly detailed",
+        "lora_enabled": False,
+        "lora_path": "",
+        "lora_scale": 1.0
     }
     try:
         p = _settings_path(root)
@@ -100,7 +103,6 @@ def _find_sd_cli(root: Path) -> str:
     # Common bundled locations
     candidates = [
         root / ".qwen2512" / "bin" / "sd-cli.exe",
-        root / "bin" / "sd-cli.exe",
         root / "presets" / "bin" / "sd-cli.exe",
         root / "sd-cli.exe",
         root / "models" / "Z-Image-Turbo GGUF" / "bin" / "sd-cli.exe",
@@ -167,7 +169,8 @@ def _model_paths(root: Path) -> tuple[Path | None, Path | None, Path | None]:
     return diffusion, llm, vae if (vae and vae.exists()) else None
 
 def _build_cmd(root: Path, prompt: str, w: int, h: int, steps: int, cfg: float,
-               sampler: str, flow_shift: int, seed: str, offload_cpu: bool) -> tuple[list[str], Path]:
+               sampler: str, flow_shift: int, seed: str, offload_cpu: bool,
+               lora_enabled: bool, lora_path: str, lora_scale: float) -> tuple[list[str], Path]:
     sd = _find_sd_cli(root)
     diffusion, llm, vae = _model_paths(root)
     out_dir = root / "output" / "qwen2512"
@@ -180,6 +183,24 @@ def _build_cmd(root: Path, prompt: str, w: int, h: int, steps: int, cfg: float,
         if llm is None: missing.append("LLM GGUF (Qwen2.5-VL-7B-Instruct Q4)")
         if vae is None: missing.append("VAE safetensors")
         raise RuntimeError("Missing required model files: " + ", ".join(missing))
+
+    # Optional LoRA (sd-cli parses <lora:NAME:W> tags into its internal loras map).
+    final_prompt = prompt
+    lora_dir = None
+    if lora_enabled and str(lora_path).strip():
+        lp = Path(str(lora_path).strip().strip('"').strip("'"))
+        if not lp.is_absolute():
+            # Allow relative names (or just a filename) under models/loras/
+            lp = (root / "models" / "loras" / lp).resolve()
+        if not lp.exists():
+            raise RuntimeError(f"LoRA not found: {lp}")
+        lora_dir = lp.parent
+        lora_name = lp.stem
+        try:
+            wgt = float(lora_scale)
+        except Exception:
+            wgt = 1.0
+        final_prompt = f"<lora:{lora_name}:{wgt}> {prompt}"
 
     # Qwen-Image models must be passed via --diffusion-model (NOT -m).
     # Using -m triggers SD "version detection" and fails with:
@@ -197,9 +218,11 @@ def _build_cmd(root: Path, prompt: str, w: int, h: int, steps: int, cfg: float,
         "-H", str(int(h)),
         "--diffusion-fa",
         "--flow-shift", str(int(flow_shift)),
-        "-p", _sanitize_prompt_ascii(prompt),
+        "-p", _sanitize_prompt_ascii(final_prompt),
         "-o", str(out_path),
     ]
+    if lora_dir is not None:
+        args += ["--lora-model-dir", str(lora_dir), "--lora-apply-mode", "at_runtime"]
     if seed.strip():
         args += ["--seed", seed.strip()]
     if offload_cpu:
@@ -247,6 +270,35 @@ def install_qwen2512_tool(tools_pane, section) -> None:
     prompt.setToolTip("Text prompt for the image generation.")
     prompt.setMinimumHeight(90)
     lay.addWidget(prompt)
+
+    # LoRA (optional)
+    row_lora = QHBoxLayout()
+    cb_lora = QCheckBox("Use LoRA")
+    cb_lora.setChecked(bool(s.get("lora_enabled", False)))
+    cb_lora.setToolTip("Enable a LoRA for this run (sd-cli via <lora:NAME:W> + --lora-model-dir).")
+
+    ed_lora = QLineEdit(str(s.get("lora_path", "")))
+    ed_lora.setPlaceholderText("LoRA path (optional)…")
+    ed_lora.setToolTip("Path to a .safetensors LoRA file. You can also paste a filename relative to models/loras/.")
+
+    btn_lora = QPushButton("Browse…")
+    btn_lora.setToolTip("Select a LoRA .safetensors file.")
+
+    sp_lora = QDoubleSpinBox()
+    sp_lora.setRange(0.0, 2.0)
+    sp_lora.setDecimals(2)
+    sp_lora.setSingleStep(0.05)
+    sp_lora.setValue(float(s.get("lora_scale", 1.0)))
+    sp_lora.setToolTip("LoRA strength (weight). 1.0 is typical; try 0.6–1.3.")
+
+    row_lora.addWidget(cb_lora)
+    row_lora.addWidget(ed_lora, 1)
+    row_lora.addWidget(btn_lora)
+    row_lora.addWidget(QLabel("Strength"))
+    row_lora.addWidget(sp_lora)
+
+    lay.addLayout(row_lora)
+
 
     # Settings row
     row1 = QHBoxLayout()
@@ -340,6 +392,9 @@ def install_qwen2512_tool(tools_pane, section) -> None:
             "seed": ed_seed.text(),
             "offload_cpu": cb_offload.isChecked(),
             "prompt": prompt.toPlainText(),
+            "lora_enabled": cb_lora.isChecked(),
+            "lora_path": ed_lora.text(),
+            "lora_scale": float(sp_lora.value()),
         }
         _save_settings(root, d)
 
@@ -353,6 +408,9 @@ def install_qwen2512_tool(tools_pane, section) -> None:
         (sp_flow, sp_flow.valueChanged),
         (ed_seed, ed_seed.textChanged),
         (cb_offload, cb_offload.toggled),
+        (cb_lora, cb_lora.toggled),
+        (ed_lora, ed_lora.textChanged),
+        (sp_lora, sp_lora.valueChanged),
     ]:
         try:
             sig.connect(lambda *_: _snapshot_and_save())
@@ -462,6 +520,18 @@ def install_qwen2512_tool(tools_pane, section) -> None:
             _append(f"[info] Selected folder: {d}")
             _open_folder(Path(d))
 
+
+    def do_pick_lora():
+        try:
+            f, _ = QFileDialog.getOpenFileName(tools_pane, "Select LoRA (.safetensors)", str(root / "models" / "loras"), "LoRA (*.safetensors)")
+        except Exception:
+            f = ""
+        if f:
+            ed_lora.setText(f)
+            cb_lora.setChecked(True)
+            _append(f"[info] LoRA: {f}")
+
+
     def do_open_last():
         p = getattr(tools_pane, "_qwen2512_last_out", None)
         if p:
@@ -490,8 +560,12 @@ def install_qwen2512_tool(tools_pane, section) -> None:
                 flow_shift=sp_flow.value(),
                 seed=ed_seed.text(),
                 offload_cpu=cb_offload.isChecked(),
+                lora_enabled=cb_lora.isChecked(),
+                lora_path=ed_lora.text(),
+                lora_scale=float(sp_lora.value()),
             )
         except Exception as e:
+
             _append(f"[ERR] {e}")
             _append("[hint] Make sure models are downloaded into models/Qwen-Image-2512 GGUF (Q4 diffusion, Q4 LLM, and qwen_image_vae.safetensors).")
             return
@@ -529,6 +603,7 @@ def install_qwen2512_tool(tools_pane, section) -> None:
     btn_models.clicked.connect(do_open_models)
     btn_out.clicked.connect(do_open_out)
     btn_pick.clicked.connect(do_pick_models_folder)
+    btn_lora.clicked.connect(do_pick_lora)
     btn_open_last.clicked.connect(do_open_last)
     btn_run.clicked.connect(do_run)
 
