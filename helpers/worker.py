@@ -1903,53 +1903,7 @@ def txt2img_generate(job, cfg, mani):
     except Exception:
         pass
 
-    
-    # Extra: surface LoRA intent early (helps debug "LoRA not applied" reports).
-    try:
-        l1 = (args.get("lora_path") or helper_job.get("lora_path") or "").strip()
-        l2 = (args.get("lora2_path") or helper_job.get("lora2_path") or "").strip()
-        s1 = args.get("lora_scale", helper_job.get("lora_scale", 1.0))
-        s2 = args.get("lora2_scale", helper_job.get("lora2_scale", 1.0))
-        apply_mode = (args.get("lora_apply_mode") or helper_job.get("lora_apply_mode") or "auto")
-        if l1:
-            try:
-                n1 = Path(l1).stem
-            except Exception:
-                n1 = l1
-            try:
-                print(f"[worker txt2img] LoRA1 requested: {n1}  |  scale={s1}  |  path={l1}")
-            except Exception:
-                pass
-        if l2:
-            try:
-                n2 = Path(l2).stem
-            except Exception:
-                n2 = l2
-            try:
-                print(f"[worker txt2img] LoRA2 requested: {n2}  |  scale={s2}  |  path={l2}")
-            except Exception:
-                pass
-        if l1 or l2:
-            try:
-                # Qwen2512 uses sd-cli LoRA support: lora dir + apply mode + prompt tag.
-                print(f"[worker txt2img] LoRA apply mode: {apply_mode}")
-            except Exception:
-                pass
-            try:
-                # Also patch running JSON so the Queue row can show it.
-                _patch_running_json({
-                    "lora_path": l1 or None,
-                    "lora_scale": float(s1) if l1 else None,
-                    "lora2_path": l2 or None,
-                    "lora2_scale": float(s2) if l2 else None,
-                    "lora_apply_mode": str(apply_mode),
-                })
-            except Exception:
-                pass
-    except Exception:
-        pass
-
-res = None
+    res = None
 
     # Strict Z-Image path (Option A: no SDXL fallback)
     if engine == "zimage":
@@ -2218,6 +2172,22 @@ res = None
                 try:
                     if _prompt_short:
                         print(f"[txt2img][Qwen2512] prompt: {_prompt_short}")
+                        # LoRA (optional)
+                        try:
+                            _lp = (args.get("lora_path") or helper_job.get("lora_path") or "").strip()
+                            _ls = args.get("lora_scale", None)
+                            if _ls is None:
+                                _ls = helper_job.get("lora_scale", None)
+                            _lp2 = (args.get("lora2_path") or helper_job.get("lora2_path") or "").strip()
+                            _ls2 = args.get("lora2_scale", None)
+                            if _ls2 is None:
+                                _ls2 = helper_job.get("lora2_scale", None)
+                            if _lp:
+                                print(f"[txt2img][Qwen2512] LoRA1: {_lp}  |  scale={_ls if _ls is not None else 1.0}")
+                            if _lp2:
+                                print(f"[txt2img][Qwen2512] LoRA2: {_lp2}  |  scale={_ls2 if _ls2 is not None else 1.0}")
+                        except Exception:
+                            pass
                 except Exception:
                     pass
 
@@ -2286,6 +2256,11 @@ res = None
                             "diffusion_model": str(diffusion) if diffusion else None,
                             "llm_model": str(llm) if llm else None,
                             "vae_model": str(vae) if vae else None,
+
+"lora_path": str(args.get("lora_path") or helper_job.get("lora_path") or "") or None,
+"lora_scale": (args.get("lora_scale") if args.get("lora_scale", None) is not None else helper_job.get("lora_scale", None)),
+"lora2_path": str(args.get("lora2_path") or helper_job.get("lora2_path") or "") or None,
+"lora2_scale": (args.get("lora2_scale") if args.get("lora2_scale", None) is not None else helper_job.get("lora2_scale", None)),
                         })
                     except Exception:
                         pass
