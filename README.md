@@ -10,8 +10,8 @@ Video Walktrough (most is speedup x2 to show much in less time)
 <details>
   <summary>Januari 1, 2026. V2.1.2 Happy Newyear and another update</summary>
   
-- fixed themes freezing app for 5 seconds after applying (added a 'safe apply' button if freezing comes back)
-- fixed trim tool freezinh ui while generating preview
+- fixed themes freezing app for 5 seconds after applying (added a 'safe apply' button in case freezing comes back)
+- fixed trim tool freezing ui while generating preview
 - fixed upscaler defaulting to 30fps
 - fixed tab integration still thinking upscaler was a main tab (finaly found why upscaler needed restart to apply new upscaler engine/model)
 - fixed compare tool crash when loading new media file while repeat button was on.
@@ -61,7 +61,7 @@ New features
 - Music Videoclip Creator
   - Added more transitions, cinematic effects, and drop/chorus effects
   - a couple of extra settings such as 'skip Fx in intro'
-  - new 1 clisk preset : 'get it done FAST' (3 minute videoclip in less then a minute, only uses easy to render effects and transitions)
+  - new 1 click preset : 'get it done FAST' (3 minute videoclip in less then a minute, only uses easy to render effects and transitions)
 - Reverse video tool
   - Simple tool to fix AI videos that run backwards
   - Supports batch, queue, use currently playing video, and load video
