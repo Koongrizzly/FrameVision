@@ -1777,6 +1777,7 @@ _EMOJI_MAP = {
     "seed": "🌱️",
     "rife fps": "⏱️",
     "cpu": "⚡️",
+    "2511": "⚡️",
     "memory": "🧮",
     "askframie": "👽",
     "failed": "❌️",
