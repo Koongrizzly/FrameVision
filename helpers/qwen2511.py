@@ -141,7 +141,6 @@ class SdCliCaps:
 
     steps: Optional[str] = None
     cfg: Optional[str] = None
-    img_cfg: Optional[str] = None
     seed: Optional[str] = None
     width: Optional[str] = None
     height: Optional[str] = None
@@ -237,8 +236,6 @@ def detect_sdcli_caps(sdcli_path: str) -> SdCliCaps:
         caps.steps = "--steps"
     if has("--cfg-scale"):
         caps.cfg = "--cfg-scale"
-    if has("--img-cfg-scale"):
-        caps.img_cfg = "--img-cfg-scale"
     if has("--seed"):
         caps.seed = "--seed"
     if has("--width"):
@@ -330,7 +327,6 @@ def build_sdcli_cmd(
     vae_path: str,
     steps: int,
     cfg: float,
-    img_cfg: float,
     seed: int,
     width: int,
     height: int,
@@ -384,8 +380,6 @@ def build_sdcli_cmd(
         cmd += [caps.steps, str(int(steps))]
     if caps.cfg:
         cmd += [caps.cfg, str(float(cfg))]
-    if caps.img_cfg:
-        cmd += [caps.img_cfg, str(float(img_cfg))]
     if caps.seed:
         cmd += [caps.seed, str(int(seed))]
     if caps.width:
@@ -446,11 +440,11 @@ class Qwen2511Pane(QtWidgets.QWidget):
             "\nWhy you got a different woman + blurry output:\n"
             "- Without a mask, the model is free to rewrite the entire image.\n"
             "- If Width/Height are square, sd-cli crops your 16:9 image to a square (it logged a crop).\n"
-            "\nBest practice for 'change dress color':\n"
-            "1) Provide a mask for the dress area,\n"
-            "2) Strength ~0.25–0.45,\n"
+            "\nBest practice for clean edits (like \"change dress color\"):\n"
+            "1) Use a mask/inpaint for the area you want to change,\n"
+            "2) Strength is locked to 1.00 for reliable ref-image following,\n"
             "3) Keep aspect ratio (use the Auto size helper),\n"
-            "4) Consider 28–40 steps and Img-CFG 6–9 to preserve the original."
+            "4) Use low CFG (1–4) and ~24–40 steps; increase steps if details break."
         )
 
     def _append_log(self, s: str):
@@ -490,7 +484,6 @@ class Qwen2511Pane(QtWidgets.QWidget):
             f"  vae flag: {c.vae}\n"
             f"  output flag: {c.output}\n"
             f"  sampling flag: {c.sampling_method}\n"
-            f"  supports img-cfg: {bool(c.img_cfg)}\n"
             f"  supports vae-tiling: {bool(c.vae_tiling)}\n"
             f"  supports offload-to-cpu: {bool(c.offload_to_cpu)}\n"
             f"  supports vae-on-cpu: {bool(c.vae_on_cpu)}\n"
@@ -645,14 +638,10 @@ class Qwen2511Pane(QtWidgets.QWidget):
         self.sp_cfg = QtWidgets.QDoubleSpinBox(); self.sp_cfg.setRange(0.0, 30.0); self.sp_cfg.setDecimals(2); self.sp_cfg.setSingleStep(0.25); self.sp_cfg.setValue(4.5)
         self.sp_cfg.setToolTip("Text guidance scale (CFG). Higher follows the prompt more, but can drift away from the source image.")
 
-        self.sp_imgcfg = QtWidgets.QDoubleSpinBox()
-        self.sp_imgcfg.setRange(0.0, 30.0)
-        self.sp_imgcfg.setDecimals(2)
-        self.sp_imgcfg.setSingleStep(0.25)
-        self.sp_imgcfg.setValue(7.0)
-        self.sp_imgcfg.setToolTip("Image guidance scale (if supported). Helps preserve the init image structure for edits.")
 
         self.sp_seed = QtWidgets.QSpinBox(); self.sp_seed.setRange(-1, 2**31 - 1); self.sp_seed.setValue(-1)
+        self.lbl_strength = QtWidgets.QLabel("1.00 (locked)")
+        self.lbl_strength.setToolTip("Strength is locked to 1.00 because lower values frequently ignore the ref image and collapse the edit. If you want a lighter touch edit, use masks / inpaint or lower CFG/steps instead.")
         self.sp_seed.setToolTip("Random seed. -1 = random each run. Set a fixed value to reproduce results.")
 
         self.sp_w = QtWidgets.QSpinBox(); self.sp_w.setRange(64, 4096); self.sp_w.setSingleStep(64); self.sp_w.setValue(1024)
@@ -660,8 +649,6 @@ class Qwen2511Pane(QtWidgets.QWidget):
         self.sp_h = QtWidgets.QSpinBox(); self.sp_h.setRange(64, 4096); self.sp_h.setSingleStep(64); self.sp_h.setValue(576)
         self.sp_h.setToolTip("Output height (multiple of 64). Keep aspect similar to input to avoid crop.")
 
-        self.sp_strength = QtWidgets.QDoubleSpinBox(); self.sp_strength.setRange(0.0, 1.0); self.sp_strength.setDecimals(2); self.sp_strength.setSingleStep(0.05); self.sp_strength.setValue(0.35)
-        self.sp_strength.setToolTip("How much the model is allowed to change the image. Lower = preserves more. For small edits try ~0.25–0.45.")
 
         self.cb_sampling = QtWidgets.QComboBox()
         self.cb_sampling.setToolTip("Sampler / sampling method. If results look unstable, try euler or heun.")
@@ -691,9 +678,11 @@ class Qwen2511Pane(QtWidgets.QWidget):
 
         # Low VRAM options
         self.chk_vae_tiling = QtWidgets.QCheckBox("VAE tiling (low VRAM)")
-        self.chk_vae_tiling.setToolTip("Reduces VRAM usage during VAE decode/encode. Slightly slower, can avoid out-of-memory.")
-        self.ed_vae_tile_size = QtWidgets.QLineEdit("32x32")
-        self.ed_vae_tile_size.setToolTip("Tile size for VAE tiling, e.g. 32x32 or 64x64. Smaller = lower VRAM, slower.")
+        self.chk_vae_tiling.setToolTip("Splits VAE encode/decode into tiles to reduce VRAM. Only affects the VAE (not the diffusion model). Use this if you hit out-of-memory during VAE encode/decode. Smaller tiles use less VRAM but are slower and can create seams. Start with 256x256; if needed try 128x128 → 64x64 → 32x32 (last resort).")
+        self.cb_vae_tile_size = QtWidgets.QComboBox()
+        self.cb_vae_tile_size.addItems(["32x32", "64x64", "128x128", "256x256", "512x512"])
+        self.cb_vae_tile_size.setCurrentText("256x256")
+        self.cb_vae_tile_size.setToolTip("VAE tile size. Smaller tiles reduce VRAM usage but slow down processing and may introduce seams. Recommended: 256x256; drop to 128x128 or 64x64 if you run out of VRAM; 32x32 is last resort. 512x512 is fastest but uses more VRAM.")
         self.sp_vae_tile_overlap = QtWidgets.QDoubleSpinBox()
         self.sp_vae_tile_overlap.setToolTip("Overlap between VAE tiles. Higher overlap can reduce seams, but costs time.")
         self.sp_vae_tile_overlap.setRange(0.0, 0.95); self.sp_vae_tile_overlap.setDecimals(2); self.sp_vae_tile_overlap.setSingleStep(0.05); self.sp_vae_tile_overlap.setValue(0.50)
@@ -713,11 +702,10 @@ class Qwen2511Pane(QtWidgets.QWidget):
         sl.addWidget(QtWidgets.QLabel("Steps"), r, 0); sl.addWidget(self.sp_steps, r, 1)
         sl.addWidget(QtWidgets.QLabel("CFG"), r, 2); sl.addWidget(self.sp_cfg, r, 3)
         r += 1
-        sl.addWidget(QtWidgets.QLabel("Img-CFG"), r, 0); sl.addWidget(self.sp_imgcfg, r, 1)
+        sl.addWidget(QtWidgets.QLabel("Strength"), r, 0); sl.addWidget(self.lbl_strength, r, 1)
         sl.addWidget(QtWidgets.QLabel("Seed"), r, 2); sl.addWidget(self.sp_seed, r, 3)
         r += 1
         sl.addWidget(QtWidgets.QLabel("Sampling"), r, 0); sl.addWidget(self.cb_sampling, r, 1)
-        sl.addWidget(QtWidgets.QLabel("Strength"), r, 2); sl.addWidget(self.sp_strength, r, 3)
         r += 1
         sl.addWidget(QtWidgets.QLabel("Width"), r, 0); sl.addWidget(self.sp_w, r, 1)
         sl.addWidget(QtWidgets.QLabel("Height"), r, 2); sl.addWidget(self.sp_h, r, 3)
@@ -727,7 +715,7 @@ class Qwen2511Pane(QtWidgets.QWidget):
 
         r += 1
         sl.addWidget(self.chk_vae_tiling, r, 0, 1, 2)
-        sl.addWidget(QtWidgets.QLabel("Tile size"), r, 2); sl.addWidget(self.ed_vae_tile_size, r, 3)
+        sl.addWidget(QtWidgets.QLabel("Tile size"), r, 2); sl.addWidget(self.cb_vae_tile_size, r, 3)
 
         r += 1
         sl.addWidget(self.chk_mmap, r, 0, 1, 2)
@@ -879,11 +867,9 @@ class Qwen2511Pane(QtWidgets.QWidget):
         self._settings.setdefault("vae_path", d["vae"] or "")
         self._settings.setdefault("steps", 28)
         self._settings.setdefault("cfg", 4.5)
-        self._settings.setdefault("img_cfg", 7.0)
         self._settings.setdefault("seed", -1)
         self._settings.setdefault("width", 1024)
         self._settings.setdefault("height", 576)
-        self._settings.setdefault("strength", 0.35)
         self._settings.setdefault("sampling_method", "euler_a")
         self._settings.setdefault("shift", 12.5)
         self._settings.setdefault("auto_aspect", True)
@@ -917,11 +903,9 @@ class Qwen2511Pane(QtWidgets.QWidget):
 
         self.sp_steps.setValue(int(s.get("steps", 28)))
         self.sp_cfg.setValue(float(s.get("cfg", 4.5)))
-        self.sp_imgcfg.setValue(float(s.get("img_cfg", 7.0)))
         self.sp_seed.setValue(int(s.get("seed", -1)))
         self.sp_w.setValue(int(s.get("width", 1024)))
         self.sp_h.setValue(int(s.get("height", 576)))
-        self.sp_strength.setValue(float(s.get("strength", 0.35)))
         self.cb_sampling.setCurrentText(str(s.get("sampling_method", "euler_a")))
         self.sp_shift.setValue(float(s.get("shift", 12.5)))
 
@@ -930,7 +914,7 @@ class Qwen2511Pane(QtWidgets.QWidget):
         self.cb_base.setCurrentText(str(base))
 
         self.chk_vae_tiling.setChecked(bool(s.get("vae_tiling", True)))
-        self.ed_vae_tile_size.setText(str(s.get("vae_tile_size", "32x32")))
+        self.cb_vae_tile_size.setCurrentText(str(s.get("vae_tile_size", "256x256")))
         self.sp_vae_tile_overlap.setValue(float(s.get("vae_tile_overlap", 0.50)))
         self.chk_offload.setChecked(bool(s.get("offload_to_cpu", False)))
         self.chk_mmap.setChecked(bool(s.get("mmap", True)))
@@ -970,17 +954,15 @@ class Qwen2511Pane(QtWidgets.QWidget):
             "vae_path": self.cb_vae.currentData(),
             "steps": int(self.sp_steps.value()),
             "cfg": float(self.sp_cfg.value()),
-            "img_cfg": float(self.sp_imgcfg.value()),
             "seed": int(self.sp_seed.value()),
             "width": int(self.sp_w.value()),
             "height": int(self.sp_h.value()),
-            "strength": float(self.sp_strength.value()),
             "sampling_method": str(self.cb_sampling.currentText()),
             "shift": float(self.sp_shift.value()),
             "auto_aspect": bool(self.chk_auto_aspect.isChecked()),
             "auto_aspect_base": int(self.cb_base.currentText()),
             "vae_tiling": bool(self.chk_vae_tiling.isChecked()),
-            "vae_tile_size": self.ed_vae_tile_size.text().strip(),
+            "vae_tile_size": self.cb_vae_tile_size.currentText().strip(),
             "vae_tile_overlap": float(self.sp_vae_tile_overlap.value()),
             "offload_to_cpu": bool(self.chk_offload.isChecked()),
             "mmap": bool(self.chk_mmap.isChecked()),
@@ -1199,16 +1181,15 @@ class Qwen2511Pane(QtWidgets.QWidget):
             vae_path=vae,
             steps=int(self.sp_steps.value()),
             cfg=float(self.sp_cfg.value()),
-            img_cfg=float(self.sp_imgcfg.value()),
             seed=int(self.sp_seed.value()),
             width=int(self.sp_w.value()),
             height=int(self.sp_h.value()),
-            strength=float(self.sp_strength.value()),
+            strength=1.0,  # locked (required for consistent ref-image editing)
             sampling_method=str(self.cb_sampling.currentText()),
             shift=float(self.sp_shift.value()),
             out_file=out_file,
             use_vae_tiling=bool(self.chk_vae_tiling.isChecked()),
-            vae_tile_size=self.ed_vae_tile_size.text().strip(),
+            vae_tile_size=self.cb_vae_tile_size.currentText().strip(),
             vae_tile_overlap=float(self.sp_vae_tile_overlap.value()),
             use_offload=bool(self.chk_offload.isChecked()),
             use_mmap=bool(self.chk_mmap.isChecked()),
