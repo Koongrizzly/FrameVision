@@ -26,6 +26,10 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Dict, Iterable, List, Optional, Sequence, Tuple
 
+
+# Optional override when the script is run from outside presets/extra_env.
+_ROOT_OVERRIDE: Optional[Path] = None
+
 # ----------------------------
 # Model sources (public)
 # ----------------------------
@@ -70,10 +74,17 @@ ProgressCb = Callable[[str, int, Optional[int]], None]
 
 
 def _project_root() -> Path:
+    """Return the FrameVision project root.
+
+    Default expectation:
+        presets/extra_env/qwen2511_download.py -> <root>/presets/extra_env
+        parents[0]=extra_env, [1]=presets, [2]=root
+
+    If the script is copied elsewhere, pass --root <root> to override.
     """
-    presets/extra_env/qwen2511_download.py -> <root>/presets/extra_env
-    parents[0]=extra_env, [1]=presets, [2]=root
-    """
+    global _ROOT_OVERRIDE
+    if _ROOT_OVERRIDE is not None:
+        return _ROOT_OVERRIDE
     return Path(__file__).resolve().parents[2]
 
 
@@ -267,9 +278,14 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                    help="Comma-separated UNet variants to download, e.g. Q4_K_M,Q5_K_S (default: Q4_K_M).")
     p.add_argument("--list", action="store_true", help="List available variants and exit.")
     p.add_argument("--models-dir", type=str, default="", help="Override destination folder.")
+    p.add_argument("--root", type=str, default="", help="Override FrameVision project root (useful if script is relocated).")
     p.add_argument("--ensure-cli", action="store_true", help="Check shared sd-cli/dlls exist in <root>/presets/bin (no download).")
     p.add_argument("--bin-dir", type=str, default="", help="Override shared bin dir for sd-cli check.")
     args = p.parse_args(list(argv) if argv is not None else None)
+
+    global _ROOT_OVERRIDE
+    if args.root:
+        _ROOT_OVERRIDE = Path(args.root).resolve()
 
     if args.list:
         for k in list_options():
