@@ -17,6 +17,29 @@ def _unique_path(p: _P) -> _P:
     except Exception:
         return _P(p)
 
+
+# --- sd-cli.exe / sd.exe preferred location (GGUF engines) ---
+def _preferred_sd_cli_from_presets_bin(root_dir: _P):
+    """Prefer <root>/presets/bin/{sd-cli.exe, sd.exe} for GGUF engines, fall back elsewhere."""
+    try:
+        rd = _P(root_dir)
+    except Exception:
+        rd = _P('.')
+    cand = [
+        rd / 'presets' / 'bin' / 'sd-cli.exe',
+        rd / 'presets' / 'bin' / 'sd.exe',
+        rd / 'presets' / 'bin' / 'sd-cli',
+        rd / 'presets' / 'bin' / 'sd',
+    ]
+    for c in cand:
+        try:
+            if c.exists() and c.is_file():
+                return c
+        except Exception:
+            continue
+    return None
+
+
 # === QImageIO maxalloc disabled by patch ===
 import os as _qt_img_os
 _qt_img_os.environ["QT_IMAGEIO_MAXALLOC"] = "0"  # Disable env-based cap (0 = no limit)
@@ -5335,12 +5358,14 @@ def _gen_via_zimage(job: dict, out_dir: Path, progress_cb=None):
             except Exception:
                 pass
 
-            # Optional: pass sd-cli.exe override to the Z-Image CLI for GGUF backend
+            # Optional: pass sd-cli.exe / sd.exe override to the Z-Image CLI for GGUF backend
             _env = None
             try:
                 import os as _os
-                _env = _os.environ.copy()
+                eng0 = str(job.get("engine") or "").strip().lower()
                 sel_cli = str(job.get("sd_cli_path") or "").strip()
+                pcli = None
+
                 if sel_cli:
                     from pathlib import Path as _P2
                     pcli = _P2(sel_cli)
@@ -5350,19 +5375,39 @@ def _gen_via_zimage(job: dict, out_dir: Path, progress_cb=None):
                         except Exception:
                             _root = _P2(".").resolve()
                         pcli = (_root / pcli).resolve()
-                    if pcli.exists() and pcli.is_file():
-                        _env["SD_CLI_PATH"] = str(pcli)
-                        _env["SD_CLI"] = str(pcli)
+                    if not (pcli.exists() and pcli.is_file()):
+                        pcli = None
+
+                # Auto default for GGUF engines: <root>/presets/bin/{sd-cli.exe, sd.exe}
+                if pcli is None and eng0 == "zimage_gguf":
+                    try:
+                        pcli = _preferred_sd_cli_from_presets_bin(root_dir)
+                    except Exception:
+                        pcli = None
+
+                if pcli is not None:
+                    _env = _os.environ.copy()
+                    _env["SD_CLI_PATH"] = str(pcli)
+                    _env["SD_CLI"] = str(pcli)
             except Exception:
                 _env = None
 
-            proc = subprocess.Popen(
-                args,
+            _popen_kwargs = dict(
                 stdout=subprocess.PIPE,
                 stderr=subprocess.STDOUT,
                 text=True,
                 encoding="utf-8",
                 errors="replace",
+            )
+            try:
+                if _env is not None:
+                    _popen_kwargs["env"] = _env
+            except Exception:
+                pass
+
+            proc = subprocess.Popen(
+                args,
+                **_popen_kwargs,
             )
 
             if proc.stdout:
@@ -5481,7 +5526,8 @@ def _gen_via_qwen2512(job: dict, out_dir: Path, progress_cb=None, cancel_event: 
         return None
 
     try:
-        sd_cli = _qwen._find_sd_cli(root_dir)
+        _pref = _preferred_sd_cli_from_presets_bin(root_dir)
+        sd_cli = _pref if _pref else _qwen._find_sd_cli(root_dir)
         # Optional UI/job override: allow selecting an explicit sd-cli.exe path
         try:
             sel_cli = str(job.get("sd_cli_path") or "").strip()

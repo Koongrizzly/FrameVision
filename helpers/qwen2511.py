@@ -25,7 +25,7 @@ from dataclasses import dataclass
 from typing import Dict, List, Optional, Tuple
 
 from PySide6 import QtCore, QtWidgets
-from PySide6.QtGui import QImage
+from PySide6.QtGui import QImage, QTextCursor
 
 
 APP_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
@@ -133,6 +133,10 @@ class SdCliCaps:
 
     input_image: Optional[str] = None
     mask: Optional[str] = None
+    ref_image: Optional[str] = None
+    increase_ref_index: Optional[str] = None
+    disable_auto_resize_ref_image: Optional[str] = None
+
     output: Optional[str] = None
 
     steps: Optional[str] = None
@@ -195,13 +199,24 @@ def detect_sdcli_caps(sdcli_path: str) -> SdCliCaps:
     if has("--vae"):
         caps.vae = "--vae"
 
-    for cand in ["--init-img", "--init_image", "--image", "--input", "-i", "--ref", "-r", "--reference"]:
+    for cand in ["--init-img", "--init_image", "--image", "--input", "-i", "--ref", "--reference"]:
         if has(cand):
             caps.input_image = cand
             break
 
     if has("--mask"):
         caps.mask = "--mask"
+
+    # Multi-reference images (for "image 1 / image 2 / image 3" prompting)
+    if has("--ref-image"):
+        caps.ref_image = "--ref-image"
+    elif has("-r, --ref-image") or has("-r,--ref-image") or has("-r"):
+        caps.ref_image = "--ref-image"
+
+    if has("--increase-ref-index"):
+        caps.increase_ref_index = "--increase-ref-index"
+    if has("--disable-auto-resize-ref-image"):
+        caps.disable_auto_resize_ref_image = "--disable-auto-resize-ref-image"
 
     for cand in ["--output", "--out", "-o", "--output-path", "--output_path"]:
         if has(cand):
@@ -304,6 +319,9 @@ def build_sdcli_cmd(
     caps: SdCliCaps,
     init_img: str,
     mask_path: str,
+    ref_images: List[str],
+    use_increase_ref_index: bool,
+    disable_auto_resize_ref_images: bool,
     prompt: str,
     negative: str,
     unet_path: str,
@@ -334,6 +352,16 @@ def build_sdcli_cmd(
 
     if caps.input_image and init_img:
         cmd += [caps.input_image, init_img]
+
+    # Optional multi-reference images (image 2, image 3, ...)
+    if ref_images and caps.ref_image:
+        if use_increase_ref_index and caps.increase_ref_index:
+            cmd += [caps.increase_ref_index]
+        if disable_auto_resize_ref_images and caps.disable_auto_resize_ref_image:
+            cmd += [caps.disable_auto_resize_ref_image]
+        for rp in ref_images:
+            if rp:
+                cmd += [caps.ref_image, rp]
 
     if mask_path and caps.mask:
         cmd += [caps.mask, mask_path]
@@ -407,6 +435,12 @@ class Qwen2511Pane(QtWidgets.QWidget):
         self._load_defaults()
         self._apply_settings_to_ui()
 
+        # Async process runner (prevents UI freeze while sd-cli runs)
+        self._proc: Optional[QtCore.QProcess] = None
+        self._proc_kind: str = ""
+        self._proc_buf: str = ""
+        self._proc_expected_out: Optional[str] = None
+
         self._append_log(self._caps_summary())
         self._append_log(
             "\nWhy you got a different woman + blurry output:\n"
@@ -420,7 +454,25 @@ class Qwen2511Pane(QtWidgets.QWidget):
         )
 
     def _append_log(self, s: str):
-        self.log.appendPlainText(s.rstrip())
+        # Newest-first log: insert at the top.
+        if not hasattr(self, "log") or self.log is None:
+            return
+        txt = (s or "").rstrip()
+        if not txt:
+            return
+        cur = self.log.textCursor()
+        cur.movePosition(QTextCursor.Start)
+        cur.insertText(txt + "\n")
+        self.log.setTextCursor(cur)
+        try:
+            self.log.verticalScrollBar().setValue(0)
+        except Exception:
+            pass
+
+    def _clear_log(self):
+        if hasattr(self, "log") and self.log is not None:
+            self.log.clear()
+
 
     def _caps_summary(self) -> str:
         c = self.caps
@@ -429,6 +481,9 @@ class Qwen2511Pane(QtWidgets.QWidget):
             f"  mode: {c.mode_imggen}\n"
             f"  input_image flag: {c.input_image}\n"
             f"  mask flag: {c.mask}\n"
+            f"  ref-image flag: {c.ref_image}\n"
+            f"  increase-ref-index flag: {c.increase_ref_index}\n"
+            f"  disable-auto-resize-ref-image flag: {c.disable_auto_resize_ref_image}\n"
             f"  diffusion_model flag: {c.diffusion_model}\n"
             f"  llm/text-encoder flag: {c.llm}\n"
             f"  mmproj flag: {c.mmproj}\n"
@@ -443,9 +498,27 @@ class Qwen2511Pane(QtWidgets.QWidget):
         )
 
     def _build_ui(self):
-        layout = QtWidgets.QVBoxLayout(self)
+        # Wrap controls in a scroll area so small screens don't force layouts to compress/overlap.
+        outer = QtWidgets.QVBoxLayout(self)
+        outer.setContentsMargins(0, 0, 0, 0)
+        outer.setSpacing(8)
+
+        scroll = QtWidgets.QScrollArea()
+        scroll.setToolTip("Scroll to access all settings on smaller screens.")
+        scroll.setWidgetResizable(True)
+        scroll.setHorizontalScrollBarPolicy(QtCore.Qt.ScrollBarAsNeeded)
+        scroll.setVerticalScrollBarPolicy(QtCore.Qt.ScrollBarAsNeeded)
+        scroll.setFrameShape(QtWidgets.QFrame.NoFrame)
+
+        content = QtWidgets.QWidget()
+        scroll.setWidget(content)
+
+        layout = QtWidgets.QVBoxLayout(content)
         layout.setContentsMargins(12, 12, 12, 12)
         layout.setSpacing(10)
+        layout.setSizeConstraint(QtWidgets.QLayout.SetMinAndMaxSize)
+
+        outer.addWidget(scroll, 1)
 
         title = QtWidgets.QLabel("Qwen Image Edit 2511 (GGUF)")
         f = title.font()
@@ -456,54 +529,106 @@ class Qwen2511Pane(QtWidgets.QWidget):
 
         # Paths
         g_paths = QtWidgets.QGroupBox("Paths")
+        g_paths.setToolTip("Pick input images and model paths.")
         gl = QtWidgets.QFormLayout(g_paths)
         gl.setLabelAlignment(QtCore.Qt.AlignRight)
 
         self.ed_sdcli = QtWidgets.QLineEdit(DEFAULT_SDCLI)
+        self.ed_sdcli.setToolTip("Path to sd-cli.exe (stable-diffusion.cpp). Leave default unless you installed it elsewhere.")
         btn_sdcli = QtWidgets.QToolButton(); btn_sdcli.setText("…"); btn_sdcli.clicked.connect(self._pick_sdcli)
+        btn_sdcli.setToolTip("Browse for sd-cli.exe")
         h_sd = QtWidgets.QHBoxLayout(); h_sd.addWidget(self.ed_sdcli, 1); h_sd.addWidget(btn_sdcli)
         gl.addRow("sd-cli.exe", h_sd)
 
         self.ed_initimg = QtWidgets.QLineEdit()
+        self.ed_initimg.setToolTip("The image you want to edit. Tip: Use a reasonably high-res input (720p+) for cleaner cutouts/edits.")
         self.ed_initimg.setPlaceholderText("Select an input image…")
         btn_img = QtWidgets.QToolButton(); btn_img.setText("…"); btn_img.clicked.connect(self._pick_image)
+        btn_img.setToolTip("Browse for an input image")
         h_img = QtWidgets.QHBoxLayout(); h_img.addWidget(self.ed_initimg, 1); h_img.addWidget(btn_img)
         gl.addRow("Input image", h_img)
 
         self.lbl_imginfo = QtWidgets.QLabel("")
+        self.lbl_imginfo.setToolTip("Shows detected input resolution and a reminder to keep Width/Height aspect similar to avoid crops.")
         self.lbl_imginfo.setStyleSheet("color: #888;")
         gl.addRow("", self.lbl_imginfo)
 
         self.ed_mask = QtWidgets.QLineEdit()
+        self.ed_mask.setToolTip("Optional mask for targeted edits. White = editable area (typical). If it behaves backwards, enable Invert mask.")
         self.ed_mask.setPlaceholderText("Optional: mask image (white/black) …")
         btn_mask = QtWidgets.QToolButton(); btn_mask.setText("…"); btn_mask.clicked.connect(self._pick_mask)
+        btn_mask.setToolTip("Browse for a mask image")
         h_mask = QtWidgets.QHBoxLayout(); h_mask.addWidget(self.ed_mask, 1); h_mask.addWidget(btn_mask)
         gl.addRow("Mask", h_mask)
 
         self.chk_invert_mask = QtWidgets.QCheckBox("Invert mask")
+        self.chk_invert_mask.setToolTip("Inverts the mask before running. Useful when your mask selection is reversed.")
         self.chk_invert_mask.setToolTip("If your mask behaves backwards, enable this. It writes a temporary inverted mask PNG.")
         gl.addRow("", self.chk_invert_mask)
+
+        # Reference images (multi-image edit)
+        self.ed_ref1 = QtWidgets.QLineEdit()
+        self.ed_ref1.setToolTip("Optional extra reference image (image 2). Use this to inject a specific face/clothing/prop while editing the main image.")
+        self.ed_ref1.setPlaceholderText("Optional: reference image 2 (clothes/face/prop)…")
+        btn_ref1 = QtWidgets.QToolButton(); btn_ref1.setText("…"); btn_ref1.clicked.connect(lambda: self._pick_ref(self.ed_ref1))
+        btn_ref1.setToolTip("Browse for reference image 2")
+        h_ref1 = QtWidgets.QHBoxLayout(); h_ref1.addWidget(self.ed_ref1, 1); h_ref1.addWidget(btn_ref1)
+        gl.addRow("Ref image 2", h_ref1)
+
+        self.ed_ref2 = QtWidgets.QLineEdit()
+        self.ed_ref2.setToolTip("Optional reference image (image 3).")
+        self.ed_ref2.setPlaceholderText("Optional: reference image 3 …")
+        btn_ref2 = QtWidgets.QToolButton(); btn_ref2.setText("…"); btn_ref2.clicked.connect(lambda: self._pick_ref(self.ed_ref2))
+        btn_ref2.setToolTip("Browse for reference image 3")
+        h_ref2 = QtWidgets.QHBoxLayout(); h_ref2.addWidget(self.ed_ref2, 1); h_ref2.addWidget(btn_ref2)
+        gl.addRow("Ref image 3", h_ref2)
+
+        self.ed_ref3 = QtWidgets.QLineEdit()
+        self.ed_ref3.setToolTip("Optional reference image (image 4).")
+        self.ed_ref3.setPlaceholderText("Optional: reference image 4 …")
+        btn_ref3 = QtWidgets.QToolButton(); btn_ref3.setText("…"); btn_ref3.clicked.connect(lambda: self._pick_ref(self.ed_ref3))
+        btn_ref3.setToolTip("Browse for reference image 4")
+        h_ref3 = QtWidgets.QHBoxLayout(); h_ref3.addWidget(self.ed_ref3, 1); h_ref3.addWidget(btn_ref3)
+        gl.addRow("Ref image 4", h_ref3)
+
+        self.chk_ref_increase_index = QtWidgets.QCheckBox("Auto index refs (image 2, image 3, …)")
+        self.chk_ref_increase_index.setToolTip("Adds --increase-ref-index so you can say \'image 2\' / \'image 3\' in the prompt.")
+        self.chk_ref_increase_index.setToolTip("Adds --increase-ref-index so you can refer to refs as image 2 / image 3 / … in the prompt.")
+        gl.addRow("", self.chk_ref_increase_index)
+
+        self.chk_disable_ref_resize = QtWidgets.QCheckBox("Disable auto resize ref images")
+        self.chk_disable_ref_resize.setToolTip("Prevents sd-cli from resizing ref images automatically (if supported by your build).")
+        self.chk_disable_ref_resize.setToolTip("Adds --disable-auto-resize-ref-image (if supported).")
+        gl.addRow("", self.chk_disable_ref_resize)
 
         layout.addWidget(g_paths)
 
         # Prompt
         g_prompt = QtWidgets.QGroupBox("Prompt")
+        g_prompt.setToolTip("Your edit instruction and an optional negative prompt.")
         pl = QtWidgets.QVBoxLayout(g_prompt)
         self.ed_prompt = QtWidgets.QPlainTextEdit()
+        self.ed_prompt.setToolTip("What should change? Be explicit: \'keep everything the same, only…\'. For best results: use a mask + lower Strength.")
         self.ed_prompt.setPlaceholderText("Describe the edit… (example: keep everything the same, only change dress color to red)")
         self.ed_neg = QtWidgets.QLineEdit(); self.ed_neg.setPlaceholderText("Negative prompt (optional)")
+        self.ed_neg.setToolTip("Optional: things you do NOT want. Keep short and practical (e.g., \'blurry, extra fingers\').")
         pl.addWidget(self.ed_prompt, 1)
         pl.addWidget(self.ed_neg)
         layout.addWidget(g_prompt, 2)
 
         # Models
         g_models = QtWidgets.QGroupBox("Models")
+        g_models.setToolTip("Select the GGUF and VAE files used by sd-cli.")
         ml = QtWidgets.QFormLayout(g_models)
         ml.setLabelAlignment(QtCore.Qt.AlignRight)
         self.cb_unet = QtWidgets.QComboBox()
+        self.cb_unet.setToolTip("Select the UNet GGUF file. If you just downloaded models, click \'Reload models list\'.")
         self.cb_llm = QtWidgets.QComboBox()
+        self.cb_llm.setToolTip("Select the text encoder (LLM) GGUF file.")
         self.cb_mmproj = QtWidgets.QComboBox()
+        self.cb_mmproj.setToolTip("Select the mmproj/vision projection model (GGUF).")
         self.cb_vae = QtWidgets.QComboBox()
+        self.cb_vae.setToolTip("Select the VAE file used for decoding/encoding.")
         ml.addRow("UNet", self.cb_unet)
         ml.addRow("Text encoder", self.cb_llm)
         ml.addRow("mmproj", self.cb_mmproj)
@@ -512,10 +637,13 @@ class Qwen2511Pane(QtWidgets.QWidget):
 
         # Settings
         g_set = QtWidgets.QGroupBox("Settings")
+        g_set.setToolTip("Quality, size, and performance options.")
         sl = QtWidgets.QGridLayout(g_set)
 
         self.sp_steps = QtWidgets.QSpinBox(); self.sp_steps.setRange(1, 200); self.sp_steps.setValue(28)
+        self.sp_steps.setToolTip("Number of diffusion steps. More steps = slower, sometimes cleaner. 24–40 is a common range.")
         self.sp_cfg = QtWidgets.QDoubleSpinBox(); self.sp_cfg.setRange(0.0, 30.0); self.sp_cfg.setDecimals(2); self.sp_cfg.setSingleStep(0.25); self.sp_cfg.setValue(4.5)
+        self.sp_cfg.setToolTip("Text guidance scale (CFG). Higher follows the prompt more, but can drift away from the source image.")
 
         self.sp_imgcfg = QtWidgets.QDoubleSpinBox()
         self.sp_imgcfg.setRange(0.0, 30.0)
@@ -525,23 +653,31 @@ class Qwen2511Pane(QtWidgets.QWidget):
         self.sp_imgcfg.setToolTip("Image guidance scale (if supported). Helps preserve the init image structure for edits.")
 
         self.sp_seed = QtWidgets.QSpinBox(); self.sp_seed.setRange(-1, 2**31 - 1); self.sp_seed.setValue(-1)
+        self.sp_seed.setToolTip("Random seed. -1 = random each run. Set a fixed value to reproduce results.")
 
         self.sp_w = QtWidgets.QSpinBox(); self.sp_w.setRange(64, 4096); self.sp_w.setSingleStep(64); self.sp_w.setValue(1024)
+        self.sp_w.setToolTip("Output width (multiple of 64). Keep aspect similar to input to avoid crop.")
         self.sp_h = QtWidgets.QSpinBox(); self.sp_h.setRange(64, 4096); self.sp_h.setSingleStep(64); self.sp_h.setValue(576)
+        self.sp_h.setToolTip("Output height (multiple of 64). Keep aspect similar to input to avoid crop.")
 
         self.sp_strength = QtWidgets.QDoubleSpinBox(); self.sp_strength.setRange(0.0, 1.0); self.sp_strength.setDecimals(2); self.sp_strength.setSingleStep(0.05); self.sp_strength.setValue(0.35)
+        self.sp_strength.setToolTip("How much the model is allowed to change the image. Lower = preserves more. For small edits try ~0.25–0.45.")
 
         self.cb_sampling = QtWidgets.QComboBox()
+        self.cb_sampling.setToolTip("Sampler / sampling method. If results look unstable, try euler or heun.")
         self.cb_sampling.addItems(["euler","euler_a","heun","dpm2","dpm++2s_a","dpm++2m","dpm++2mv2","ipndm","ipndm_v","lcm","ddim_trailing","tcd"])
         self.cb_sampling.setCurrentText("euler_a")
 
         # Aspect helper
         self.chk_auto_aspect = QtWidgets.QCheckBox("Auto size from input aspect")
+        self.chk_auto_aspect.setToolTip("Automatically matches Width/Height to the input image aspect ratio (snapped to 64).")
         self.chk_auto_aspect.setToolTip("Prevents square-crop. Uses the input image aspect ratio and snaps to multiples of 64.")
         self.cb_base = QtWidgets.QComboBox()
+        self.cb_base.setToolTip("Base size used by Auto size helper. Larger base = larger output (and more VRAM/time).")
         self.cb_base.addItems(["512", "768", "1024"])
         self.cb_base.setCurrentText("1024")
         self.btn_apply_aspect = QtWidgets.QPushButton("Apply")
+        self.btn_apply_aspect.setToolTip("Apply Auto size now using the current input image.")
         self.btn_apply_aspect.clicked.connect(self._apply_aspect_now)
         aspect_row = QtWidgets.QHBoxLayout()
         aspect_row.addWidget(self.chk_auto_aspect)
@@ -551,18 +687,27 @@ class Qwen2511Pane(QtWidgets.QWidget):
         aspect_row.addStretch(1)
 
         self.sp_shift = QtWidgets.QDoubleSpinBox(); self.sp_shift.setRange(0.0, 30.0); self.sp_shift.setDecimals(2); self.sp_shift.setSingleStep(0.25); self.sp_shift.setValue(12.5)
+        self.sp_shift.setToolTip("Flow/shift parameter (if your sd-cli build supports it). Default is usually fine.")
 
         # Low VRAM options
         self.chk_vae_tiling = QtWidgets.QCheckBox("VAE tiling (low VRAM)")
+        self.chk_vae_tiling.setToolTip("Reduces VRAM usage during VAE decode/encode. Slightly slower, can avoid out-of-memory.")
         self.ed_vae_tile_size = QtWidgets.QLineEdit("32x32")
+        self.ed_vae_tile_size.setToolTip("Tile size for VAE tiling, e.g. 32x32 or 64x64. Smaller = lower VRAM, slower.")
         self.sp_vae_tile_overlap = QtWidgets.QDoubleSpinBox()
+        self.sp_vae_tile_overlap.setToolTip("Overlap between VAE tiles. Higher overlap can reduce seams, but costs time.")
         self.sp_vae_tile_overlap.setRange(0.0, 0.95); self.sp_vae_tile_overlap.setDecimals(2); self.sp_vae_tile_overlap.setSingleStep(0.05); self.sp_vae_tile_overlap.setValue(0.50)
 
         self.chk_offload = QtWidgets.QCheckBox("Offload weights to CPU (very slow)")
+        self.chk_offload.setToolTip("Moves model weights to CPU to save VRAM. Expect a big speed hit.")
         self.chk_mmap = QtWidgets.QCheckBox("mmap")
+        self.chk_mmap.setToolTip("Memory-map model files from disk. Can reduce RAM spikes and speed up startup on some systems.")
         self.chk_vae_on_cpu = QtWidgets.QCheckBox("VAE on CPU (slow)")
+        self.chk_vae_on_cpu.setToolTip("Runs VAE on CPU to save VRAM. Slower.")
         self.chk_clip_on_cpu = QtWidgets.QCheckBox("CLIP on CPU (if available)")
+        self.chk_clip_on_cpu.setToolTip("Runs CLIP/text encoder parts on CPU (if supported). Saves VRAM, may be slower.")
         self.chk_diffusion_fa = QtWidgets.QCheckBox("Diffusion flash-attn (if available)")
+        self.chk_diffusion_fa.setToolTip("Enables flash-attention in diffusion if your sd-cli build supports it. Can speed up.")
 
         r = 0
         sl.addWidget(QtWidgets.QLabel("Steps"), r, 0); sl.addWidget(self.sp_steps, r, 1)
@@ -601,26 +746,42 @@ class Qwen2511Pane(QtWidgets.QWidget):
         # Buttons
         btn_row = QtWidgets.QHBoxLayout()
         self.btn_download = QtWidgets.QPushButton("Download models")
+        self.btn_download.setToolTip("Downloads the required Qwen2511 GGUF files into the models folder.")
         self.btn_reload = QtWidgets.QPushButton("Reload models list")
+        self.btn_reload.setToolTip("Rescans the models folders and refreshes the dropdowns.")
+        self.btn_clear_log = QtWidgets.QPushButton("Clear log")
+        self.btn_clear_log.setToolTip("Clears the log output below (new messages will still appear at the top).")
         self.btn_save = QtWidgets.QPushButton("Save settings")
+        self.btn_save.setToolTip("Saves all current settings to the preset file so they persist after restart.")
         self.btn_run = QtWidgets.QPushButton("Run sd-cli")
+        self.btn_run.setToolTip("Runs sd-cli with the current settings. Output will be saved to output/qwen2511/.")
+        self.btn_cancel = QtWidgets.QPushButton("Cancel")
+        self.btn_cancel.setToolTip("Stops the currently running process (downloader or sd-cli).")
+        self.btn_cancel.setEnabled(False)
 
         self.btn_download.clicked.connect(self._run_downloader)
         self.btn_reload.clicked.connect(self._reload_model_lists)
+        self.btn_clear_log.clicked.connect(self._clear_log)
         self.btn_save.clicked.connect(self._save_settings)
         self.btn_run.clicked.connect(self._run_sdcli)
+        self.btn_cancel.clicked.connect(self._cancel_running_process)
 
         btn_row.addWidget(self.btn_download)
         btn_row.addWidget(self.btn_reload)
         btn_row.addStretch(1)
+        btn_row.addWidget(self.btn_clear_log)
         btn_row.addWidget(self.btn_save)
         btn_row.addWidget(self.btn_run)
+        btn_row.addWidget(self.btn_cancel)
         layout.addLayout(btn_row)
 
+        # Log (kept outside the scroll area so it stays visible)
         self.log = QtWidgets.QPlainTextEdit()
+        self.log.setToolTip("Process log (newest messages appear at the top). If something fails, copy the top section into a bug report.")
         self.log.setReadOnly(True)
         self.log.setMaximumBlockCount(8000)
-        layout.addWidget(self.log, 2)
+        self.log.setMinimumHeight(180)
+        outer.addWidget(self.log, 0)
 
     def _update_imginfo(self, path: str):
         if not path or not os.path.isfile(path):
@@ -672,6 +833,11 @@ class Qwen2511Pane(QtWidgets.QWidget):
         if fn:
             self.ed_mask.setText(fn)
 
+    def _pick_ref(self, target: QtWidgets.QLineEdit):
+        fn, _ = QtWidgets.QFileDialog.getOpenFileName(self, "Select reference image", APP_ROOT, "Images (*.png *.jpg *.jpeg *.webp)")
+        if fn and target is not None:
+            target.setText(fn)
+
     def _reload_model_lists(self):
         self.cb_unet.clear(); self.cb_llm.clear(); self.cb_mmproj.clear(); self.cb_vae.clear()
 
@@ -700,6 +866,11 @@ class Qwen2511Pane(QtWidgets.QWidget):
         self._settings.setdefault("last_init_img", "")
         self._settings.setdefault("last_mask_img", "")
         self._settings.setdefault("invert_mask", False)
+        self._settings.setdefault("ref_img_2", "")
+        self._settings.setdefault("ref_img_3", "")
+        self._settings.setdefault("ref_img_4", "")
+        self._settings.setdefault("ref_increase_index", True)
+        self._settings.setdefault("ref_disable_auto_resize", False)
         self._settings.setdefault("prompt", "")
         self._settings.setdefault("negative_prompt", "")
         self._settings.setdefault("unet_path", d["unet"] or "")
@@ -735,6 +906,11 @@ class Qwen2511Pane(QtWidgets.QWidget):
         self._update_imginfo(self.ed_initimg.text().strip())
         self.ed_mask.setText(s.get("last_mask_img", ""))
         self.chk_invert_mask.setChecked(bool(s.get("invert_mask", False)))
+        self.ed_ref1.setText(s.get("ref_img_2", ""))
+        self.ed_ref2.setText(s.get("ref_img_3", ""))
+        self.ed_ref3.setText(s.get("ref_img_4", ""))
+        self.chk_ref_increase_index.setChecked(bool(s.get("ref_increase_index", True)))
+        self.chk_disable_ref_resize.setChecked(bool(s.get("ref_disable_auto_resize", False)))
 
         self.ed_prompt.setPlainText(s.get("prompt", ""))
         self.ed_neg.setText(s.get("negative_prompt", ""))
@@ -781,6 +957,11 @@ class Qwen2511Pane(QtWidgets.QWidget):
             "last_init_img": self.ed_initimg.text().strip(),
             "last_mask_img": self.ed_mask.text().strip(),
             "invert_mask": bool(self.chk_invert_mask.isChecked()),
+            "ref_img_2": self.ed_ref1.text().strip(),
+            "ref_img_3": self.ed_ref2.text().strip(),
+            "ref_img_4": self.ed_ref3.text().strip(),
+            "ref_increase_index": bool(self.chk_ref_increase_index.isChecked()),
+            "ref_disable_auto_resize": bool(self.chk_disable_ref_resize.isChecked()),
             "prompt": self.ed_prompt.toPlainText().strip(),
             "negative_prompt": self.ed_neg.text().strip(),
             "unet_path": self.cb_unet.currentData(),
@@ -811,7 +992,124 @@ class Qwen2511Pane(QtWidgets.QWidget):
         _write_json(SETSAVE_PATH, self._settings)
         self._append_log(f"\nSaved settings -> {SETSAVE_PATH}")
 
+
+    def _set_ui_busy(self, busy: bool, label: str = ""):
+        # Disable controls while a process runs so we don't start multiple heavy jobs at once.
+        self.btn_run.setEnabled(not busy)
+        self.btn_download.setEnabled(not busy)
+        self.btn_reload.setEnabled(not busy)
+        self.btn_save.setEnabled(not busy)
+        self.btn_cancel.setEnabled(busy)
+
+        if busy:
+            self._append_log(f"\n[{label}] started…")
+        else:
+            self._append_log(f"\n[{label}] done.")
+
+    def _start_process(self, program: str, args: List[str], kind: str, expected_out: Optional[str]):
+        # QProcess keeps the GUI responsive (no blocking stdout.readline loops).
+        self._proc_kind = kind
+        self._proc_expected_out = expected_out
+        self._proc_buf = ""
+
+        proc = QtCore.QProcess(self)
+        proc.setWorkingDirectory(APP_ROOT)
+        proc.setProcessChannelMode(QtCore.QProcess.MergedChannels)
+
+        proc.readyReadStandardOutput.connect(self._on_proc_ready_read)
+        proc.finished.connect(self._on_proc_finished)
+        proc.errorOccurred.connect(self._on_proc_error)
+
+        self._proc = proc
+        self._set_ui_busy(True, kind)
+
+        proc.start(program, args)
+
+        if not proc.waitForStarted(1500):
+            # If it cannot even start, release UI immediately.
+            self._append_log(f"\nERROR: failed to start process: {program}")
+            self._cleanup_process_ui()
+
+    def _on_proc_ready_read(self):
+        if not self._proc:
+            return
+        try:
+            data = bytes(self._proc.readAllStandardOutput())
+        except Exception:
+            data = b""
+        if not data:
+            return
+
+        chunk = data.decode("utf-8", errors="replace")
+        self._proc_buf += chunk
+
+        # Flush full lines to the log; keep partial line buffered.
+        while "\n" in self._proc_buf:
+            line, self._proc_buf = self._proc_buf.split("\n", 1)
+            if line.strip():
+                self._append_log(line.rstrip())
+
+    def _on_proc_error(self, err: QtCore.QProcess.ProcessError):
+        # Non-fatal in some cases (e.g., user cancelled), but log it.
+        self._append_log(f"\nProcess error ({self._proc_kind}): {err}")
+
+    def _on_proc_finished(self, exit_code: int, exit_status: QtCore.QProcess.ExitStatus):
+        # Flush any remaining buffered output.
+        if self._proc_buf.strip():
+            self._append_log(self._proc_buf.rstrip())
+        self._proc_buf = ""
+
+        self._append_log(f"\n{self._proc_kind} finished (exit {exit_code}, status {exit_status})")
+
+        if self._proc_kind == "downloader":
+            self._reload_model_lists()
+
+        if self._proc_kind == "sd-cli":
+            out_file = self._proc_expected_out or ""
+            if out_file and os.path.isfile(out_file):
+                self._append_log(f"Output written: {out_file}")
+            else:
+                self._append_log("Output file not found at expected path. If it crashed, check logs above.")
+
+        self._cleanup_process_ui()
+
+    def _cleanup_process_ui(self):
+        kind = self._proc_kind or "process"
+        self._proc_kind = ""
+        self._proc_expected_out = None
+
+        if self._proc is not None:
+            try:
+                self._proc.deleteLater()
+            except Exception:
+                pass
+            self._proc = None
+
+        self._set_ui_busy(False, kind)
+
+    def _cancel_running_process(self):
+        if self._proc is None or self._proc.state() == QtCore.QProcess.NotRunning:
+            self._append_log("\nNo running process to cancel.")
+            return
+
+        self._append_log(f"\nCancelling {self._proc_kind}…")
+        self._proc.terminate()
+
+        # If it doesn't stop quickly, force kill.
+        QtCore.QTimer.singleShot(2000, self._kill_if_still_running)
+
+    def _kill_if_still_running(self):
+        if self._proc is None:
+            return
+        if self._proc.state() != QtCore.QProcess.NotRunning:
+            self._append_log(f"\nForce killing {self._proc_kind}…")
+            self._proc.kill()
+
     def _run_downloader(self):
+        if self._proc is not None and self._proc.state() != QtCore.QProcess.NotRunning:
+            self._append_log("\nA process is already running. Cancel it first.")
+            return
+
         py = os.path.join(APP_ROOT, ".qwen2512", "venv", "Scripts", "python.exe")
         if not os.path.isfile(py):
             py = sys.executable
@@ -823,24 +1121,13 @@ class Qwen2511Pane(QtWidgets.QWidget):
         cmd = [py, DOWNLOAD_SCRIPT]
         self._append_log("\nRunning downloader:\n" + " ".join(shlex.quote(x) for x in cmd))
 
-        try:
-            p = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
-            out_lines = []
-            while True:
-                line = p.stdout.readline() if p.stdout else ""
-                if not line and p.poll() is not None:
-                    break
-                if line:
-                    out_lines.append(line.rstrip())
-                    QtWidgets.QApplication.processEvents()
-            rc = p.wait()
-            self._append_log("\n".join(out_lines))
-            self._append_log(f"\nDownloader finished (code {rc})")
-            self._reload_model_lists()
-        except Exception as e:
-            self._append_log(f"\nDownloader error: {e}")
+        self._start_process(program=cmd[0], args=cmd[1:], kind="downloader", expected_out=None)
 
     def _run_sdcli(self):
+        if self._proc is not None and self._proc.state() != QtCore.QProcess.NotRunning:
+            self._append_log("\nA process is already running. Cancel it first.")
+            return
+
         sdcli = self.ed_sdcli.text().strip()
         init_img = self.ed_initimg.text().strip()
         mask_img = self.ed_mask.text().strip()
@@ -862,6 +1149,17 @@ class Qwen2511Pane(QtWidgets.QWidget):
         if mask_img and not self.caps.mask:
             self._append_log("\nWARNING: Your sd-cli build does not advertise --mask in --help. Mask will be ignored.")
             mask_img = ""
+
+        # Reference images (image 2 / image 3 / image 4)
+        ref_imgs = [self.ed_ref1.text().strip(), self.ed_ref2.text().strip(), self.ed_ref3.text().strip()]
+        ref_imgs = [p for p in ref_imgs if p]
+        for rp in ref_imgs:
+            if not os.path.isfile(rp):
+                self._append_log("\nERROR: Reference image file not found: " + rp)
+                return
+        if ref_imgs and not self.caps.ref_image:
+            self._append_log("\nWARNING: Your sd-cli build does not advertise --ref-image in --help. Reference images will be ignored.")
+            ref_imgs = []
 
         unet = self.cb_unet.currentData()
         llm = self.cb_llm.currentData()
@@ -890,6 +1188,9 @@ class Qwen2511Pane(QtWidgets.QWidget):
             caps=self.caps,
             init_img=init_img,
             mask_path=mask_img,
+            ref_images=ref_imgs,
+            use_increase_ref_index=bool(self.chk_ref_increase_index.isChecked()),
+            disable_auto_resize_ref_images=bool(self.chk_disable_ref_resize.isChecked()),
             prompt=self.ed_prompt.toPlainText().strip(),
             negative=self.ed_neg.text().strip(),
             unet_path=unet,
@@ -917,27 +1218,8 @@ class Qwen2511Pane(QtWidgets.QWidget):
         )
 
         self._append_log("\nRunning sd-cli:\n" + " ".join(shlex.quote(x) for x in cmd))
+        self._start_process(program=cmd[0], args=cmd[1:], kind="sd-cli", expected_out=out_file)
 
-        try:
-            p = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
-            out_lines = []
-            while True:
-                line = p.stdout.readline() if p.stdout else ""
-                if not line and p.poll() is not None:
-                    break
-                if line:
-                    out_lines.append(line.rstrip())
-                    QtWidgets.QApplication.processEvents()
-            rc = p.wait()
-            self._append_log("\n".join(out_lines))
-            self._append_log(f"\nsd-cli finished (code {rc})")
-
-            if os.path.isfile(out_file):
-                self._append_log(f"Output written: {out_file}")
-            else:
-                self._append_log("Output file not found at expected path. If it crashed, check logs above.")
-        except Exception as e:
-            self._append_log(f"\nsd-cli error: {e}")
 
 
 def _standalone_main():

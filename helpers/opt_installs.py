@@ -23,6 +23,13 @@ from typing import Callable, List, Optional, Tuple, Dict
 
 from PySide6 import QtCore, QtGui, QtWidgets
 
+# Optional: licenses viewer
+try:
+    from helpers.licenses_viewer import show_3rd_party_licenses
+except Exception:
+    show_3rd_party_licenses = None  # type: ignore
+
+
 
 # -----------------------------
 # Models / Tasks
@@ -673,6 +680,11 @@ class OptionalInstallsDialog(QtWidgets.QDialog):
         self.save_log_chk.setToolTip("Write the full optional-installs log to a file in <root>/logs/.")
 
         self.open_logs_btn = QtWidgets.QPushButton("Open logs folder")
+
+        self.licenses_btn = QtWidgets.QPushButton("Third-party licenses")
+        self.licenses_btn.setToolTip("Open the third-party licenses list (presets/info/3rd_party_licenses.json)")
+        self.licenses_btn.clicked.connect(self._open_licenses_viewer)
+
         self.open_logs_btn.setToolTip("Open the FrameVision logs folder.")
         self.open_logs_btn.clicked.connect(self._open_logs_folder)
 
@@ -683,6 +695,7 @@ class OptionalInstallsDialog(QtWidgets.QDialog):
         log_tools.addWidget(self.save_log_chk)
         log_tools.addStretch(1)
         log_tools.addWidget(self.open_logs_btn)
+        log_tools.addWidget(self.licenses_btn)
 
         # Buttons
         self.start_btn = QtWidgets.QPushButton("Start optional installs")
@@ -785,6 +798,15 @@ class OptionalInstallsDialog(QtWidgets.QDialog):
             # If log file fails, continue without it.
             self._log_fp = None
             self._log_file_path = None
+
+    def _open_licenses_viewer(self) -> None:
+        """Open the third-party licenses viewer (JSON-backed)."""
+        try:
+            from helpers.licenses_viewer import LicensesViewerDialog
+            dlg = LicensesViewerDialog(parent=self, root_dir=self.root_dir)
+            dlg.exec()
+        except Exception as e:
+            QtWidgets.QMessageBox.warning(self, "Third-party licenses", f"Failed to open licenses viewer:\n{e}")
 
     def _close_log_file(self) -> None:
         try:
