@@ -77,6 +77,15 @@ def _project_root() -> Path:
     return Path(__file__).resolve().parents[2]
 
 
+
+def _shared_sdcli_dir(root: Path) -> Path:
+    return (root / "presets" / "bin").resolve()
+
+
+def _sdcli_present(bin_dir: Path) -> bool:
+    return (bin_dir / "sd-cli.exe").exists() and ((bin_dir / "stable-diffusion.dll").exists() or (bin_dir / "diffusers.dll").exists())
+
+
 def _models_root() -> Path:
     return _project_root() / "models" / "qwen2511gguf"
 
@@ -258,6 +267,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                    help="Comma-separated UNet variants to download, e.g. Q4_K_M,Q5_K_S (default: Q4_K_M).")
     p.add_argument("--list", action="store_true", help="List available variants and exit.")
     p.add_argument("--models-dir", type=str, default="", help="Override destination folder.")
+    p.add_argument("--ensure-cli", action="store_true", help="Check shared sd-cli/dlls exist in <root>/presets/bin (no download).")
+    p.add_argument("--bin-dir", type=str, default="", help="Override shared bin dir for sd-cli check.")
     args = p.parse_args(list(argv) if argv is not None else None)
 
     if args.list:
@@ -271,6 +282,15 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     print("Destination:", models_dir if models_dir else _models_root())
     print("Variants:", ", ".join(variants))
     print()
+
+    if args.ensure_cli:
+        root = _project_root()
+        bin_dir = Path(args.bin_dir).resolve() if args.bin_dir else _shared_sdcli_dir(root)
+        if _sdcli_present(bin_dir):
+            print(f"[QWEN2511] OK  sd-cli present: {bin_dir / 'sd-cli.exe'}")
+        else:
+            print(f"[QWEN2511] WARN  sd-cli not found in: {bin_dir}")
+            print("[QWEN2511]       (Install it once via Z-Image GGUF installer or Qwen2512 installer; it is shared.)")
 
     try:
         ensure_download(variants, models_dir=models_dir, progress=_cli_progress)

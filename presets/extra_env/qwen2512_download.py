@@ -420,8 +420,8 @@ def main(argv: Optional[list[str]] = None) -> int:
     # NOTE: Optional-installs runner historically called this script without --ensure-cli.
     # We now ensure the CLI by default unless the caller explicitly requests --no-cli.
     if not args.no_cli:
-        # Default bin dir: <root>/.qwen2512/bin
-        bin_dir = Path(args.bin_dir).resolve() if args.bin_dir else (root / ".qwen2512" / "bin")
+        # Default bin dir: <root>/presets/bin (shared)
+        bin_dir = Path(args.bin_dir).resolve() if args.bin_dir else (root / "presets" / "bin")
         print(f"[QWEN2512] Bin dir:   {bin_dir}")
         ensure_sd_cli(bin_dir, backend=args.cli_backend)
 

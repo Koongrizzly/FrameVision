@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 import argparse
+import hashlib
 import json
 import os
 import re
@@ -82,6 +83,101 @@ MATCHING_QWEN_FOR_DIFF = {
 
 def log(msg: str) -> None:
     print(msg, flush=True)
+
+def _shared_sdcli_dir(root: Path) -> Path:
+    # Shared location for stable-diffusion.cpp CLI + DLLs used by multiple model installers.
+    return (root / "presets" / "bin").resolve()
+
+def _sdcli_present(bin_dir: Path) -> bool:
+    sdcli = bin_dir / "sd-cli.exe"
+    dll_ok = (bin_dir / "stable-diffusion.dll").exists() or (bin_dir / "diffusers.dll").exists()
+    return sdcli.exists() and dll_ok
+
+def _sha256_file(p: Path, chunk: int = 1024 * 1024) -> str:
+    h = hashlib.sha256()
+    with open(p, "rb") as f:
+        while True:
+            b = f.read(chunk)
+            if not b:
+                break
+            h.update(b)
+    return h.hexdigest()
+
+def _utc_now_iso() -> str:
+    # Simple UTC timestamp without pulling in datetime (keeps deps tiny)
+    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+
+def _safe_write_text(path: Path, text: str) -> None:
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_suffix(path.suffix + ".tmp")
+        tmp.write_text(text, encoding="utf-8", errors="replace")
+        try:
+            if path.exists():
+                try:
+                    os.chmod(path, 0o666)
+                except Exception:
+                    pass
+                path.unlink()
+        except Exception:
+            pass
+        os.replace(tmp, path)
+    except Exception as e:
+        log(f"[zimage-gguf] warn: could not write {path}: {e}")
+
+def _update_3rd_party_licenses_json(root: Path, item_id: str, updates: dict) -> None:
+    """Best-effort update of presets/info/3rd_party_licenses.json.
+
+    Adds 'installed_*' fields so the License Viewer can show what was actually installed
+    when using a moving 'latest' download.
+    """
+    try:
+        lic_path = (root / "presets" / "info" / "3rd_party_licenses.json").resolve()
+        if not lic_path.exists():
+            log(f"[zimage-gguf] warn: licenses json not found: {lic_path}")
+            return
+
+        data = json.loads(lic_path.read_text(encoding="utf-8", errors="replace"))
+        items = data.get("items") or []
+        hit = None
+        for it in items:
+            if it.get("id") == item_id:
+                hit = it
+                break
+        if hit is None:
+            log(f"[zimage-gguf] warn: license item id not found: {item_id}")
+            return
+
+        for k, v in updates.items():
+            hit[k] = v
+
+        data["generated_at_utc"] = _utc_now_iso()
+        _safe_write_text(lic_path, json.dumps(data, indent=2, ensure_ascii=False) + "\n")
+    except Exception as e:
+        log(f"[zimage-gguf] warn: could not update 3rd_party_licenses.json: {e}")
+
+def _collect_sdcpp_build_text(exe: Path) -> str:
+    """Try to collect a human-readable version blob from sd-cli.exe."""
+    import subprocess
+
+    def _run(args: list[str]) -> tuple[int, str, str]:
+        kwargs = dict(stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=10)
+        if os.name == "nt":
+            kwargs["creationflags"] = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+        p = subprocess.run([str(exe), *args], **kwargs)
+        out = (p.stdout or b"").decode("utf-8", errors="replace")
+        err = (p.stderr or b"").decode("utf-8", errors="replace")
+        return p.returncode, out, err
+
+    for args in (["--version"], ["-v"], ["--help"]):
+        try:
+            rc, out, err = _run(args)
+            blob = (out.strip() + "\n" + err.strip()).strip()
+            if blob:
+                return f"$ {exe.name} {' '.join(args)}\n{blob}\n(returncode={rc})\n"
+        except Exception:
+            pass
+    return f"$ {exe.name} --help\n(no output)\n"
 
 def _token_headers() -> dict:
     tok = os.environ.get("HF_TOKEN") or os.environ.get("HUGGINGFACE_TOKEN") or os.environ.get("HUGGINGFACEHUB_API_TOKEN")
@@ -348,9 +444,12 @@ def _probe_sdcpp_exe(exe: Path) -> tuple[bool, str]:
             return _run_probe()
         except OSError as e:
             return False, f"oserror: {e}"
-def _copy_sdcpp_bins(extracted: Path, target: Path) -> None:
-    target.mkdir(parents=True, exist_ok=True)
-    bin_dir = target / "bin"
+def _copy_sdcpp_bins(extracted: Path, bin_dir: Path) -> None:
+    """Install stable-diffusion.cpp runtime files into a shared bin folder.
+
+    We keep this shared so Z-Image GGUF + Qwen2512 (+ future Qwen2511) don't each
+    download/extract their own copy.
+    """
     bin_dir.mkdir(parents=True, exist_ok=True)
 
     def _atomic_copy(src: Path, dest: Path, retries: int = 10) -> None:
@@ -359,7 +458,6 @@ def _copy_sdcpp_bins(extracted: Path, target: Path) -> None:
         last = None
         for i in range(retries):
             try:
-                # If destination exists, clear read-only and try to delete first.
                 if dest.exists():
                     try:
                         os.chmod(dest, 0o666)
@@ -370,7 +468,6 @@ def _copy_sdcpp_bins(extracted: Path, target: Path) -> None:
                     except Exception:
                         pass
 
-                # Write to temp then replace.
                 with open(src, "rb") as rf, open(tmp, "wb") as wf:
                     shutil.copyfileobj(rf, wf, length=1024 * 1024)
                 os.replace(tmp, dest)
@@ -403,29 +500,34 @@ def _copy_sdcpp_bins(extracted: Path, target: Path) -> None:
         raise RuntimeError("sd-cli.exe (or sd.exe) not found in extracted archive. Found exes: " + ", ".join(exes[:50]))
     log(f"[zimage-gguf] sdcpp exe: {exe}")
 
-    # Always ensure we have a usable cli in bin/. Root copy is best-effort (Windows can lock executables).
     _atomic_copy(exe, bin_dir / "sd-cli.exe")
-    _best_effort_copy(exe, target / "sd-cli.exe", "sd-cli.exe (root)")
+    if not (bin_dir / "sd.exe").exists():
+        _best_effort_copy(exe, bin_dir / "sd.exe", "sd.exe")
 
     exe_dir = exe.parent
     dlls = list(exe_dir.glob("*.dll"))
     if not dlls:
         dlls = list(extracted.rglob("*.dll"))
 
-    copied_any_root = False
     for d in dlls:
-        _best_effort_copy(d, bin_dir / d.name, f"dll {d.name} (bin)")
-        copied_any_root = _best_effort_copy(d, target / d.name, f"dll {d.name} (root)") or copied_any_root
+        _best_effort_copy(d, bin_dir / d.name, f"dll {d.name}")
 
-    # Try to ensure stable-diffusion.dll exists at least in bin/.
-    if not (bin_dir / "stable-diffusion.dll").exists():
+    stabledll = bin_dir / "stable-diffusion.dll"
+    if not stabledll.exists():
         for d in extracted.rglob("stable-diffusion.dll"):
-            _best_effort_copy(d, bin_dir / "stable-diffusion.dll", "stable-diffusion.dll (bin)")
-            _best_effort_copy(d, target / "stable-diffusion.dll", "stable-diffusion.dll (root)")
+            _best_effort_copy(d, stabledll, "stable-diffusion.dll")
             break
 
-    if not (bin_dir / "stable-diffusion.dll").exists():
+    if not stabledll.exists():
         raise RuntimeError("stable-diffusion.dll not found after extraction/copy. Antivirus may have quarantined it.")
+
+    diffdll = bin_dir / "diffusers.dll"
+    if not diffdll.exists() and stabledll.exists():
+        try:
+            shutil.copy2(stabledll, diffdll)
+            log("[zimage-gguf] ok: created diffusers.dll from stable-diffusion.dll")
+        except Exception as e:
+            log(f"[zimage-gguf] warn: could not create diffusers.dll: {e}")
 
 def _nvidia_present() -> bool:
     try:
@@ -461,7 +563,7 @@ def _score_asset(name: str, want_cuda: bool):
 
 
 
-def _select_and_install_sdcpp(latest: dict, want_cuda: bool, tmp: Path, target: Path) -> None:
+def _select_and_install_sdcpp(latest: dict, want_cuda: bool, tmp: Path, bin_dir: Path) -> dict:
     assets = latest.get("assets") or []
     if not assets:
         raise RuntimeError("No assets in stable-diffusion.cpp latest release JSON.")
@@ -523,9 +625,12 @@ def _select_and_install_sdcpp(latest: dict, want_cuda: bool, tmp: Path, target: 
 
         try:
             log("[zimage-gguf] Installing sdcpp binaries...")
-            _copy_sdcpp_bins(extract_dir, target)
+            _copy_sdcpp_bins(extract_dir, bin_dir)
             log(f"[zimage-gguf] installed from: {name}")
-            return
+            return {
+                "asset_name": name,
+                "asset_url": url,
+            }
         except Exception as e:
             log(f"[zimage-gguf]   install failed for {name}: {e}")
             continue
@@ -664,26 +769,80 @@ def main() -> int:
         log("[zimage-safe] ok")
         return 0
 
-    tmp = target / "_tmp"
+    shared_bin = _shared_sdcli_dir(root)
+    shared_bin.mkdir(parents=True, exist_ok=True)
+
+    tmp = shared_bin / "_tmp_sdcpp"
     tmp.mkdir(parents=True, exist_ok=True)
 
     log(f"[zimage-gguf] Root  : {root}")
     log(f"[zimage-gguf] Target: {target}")
+    log(f"[zimage-gguf] Shared bin: {shared_bin}")
 
-    api = SDCPP_LATEST_API
-    latest = json.loads(http_get(api).decode("utf-8", errors="replace"))
+    # Shared sd-cli/dlls: if already installed, don't download again.
+    latest = None
+    if _sdcli_present(shared_bin):
+        log("[zimage-gguf] sdcpp already present in shared bin; skipping download")
+    else:
+        api = SDCPP_LATEST_API
+        latest = json.loads(http_get(api).decode("utf-8", errors="replace"))
 
     want_cuda = _nvidia_present()
     log(f"[zimage-gguf] NVIDIA detected: {want_cuda}")
 
+    sdcpp_meta = None
+
     sdcpp_ok = True
     try:
-        _select_and_install_sdcpp(latest, want_cuda=want_cuda, tmp=tmp, target=target)
+        sdcpp_meta = _select_and_install_sdcpp(latest, want_cuda=want_cuda, tmp=tmp, bin_dir=shared_bin)
     except Exception as e:
         sdcpp_ok = False
         log(f"[zimage-gguf] WARN: GGUF backend (sd-cli.exe) could not be installed: {e}")
         _print_sdcpp_requirements_hint()
         # Continue anyway: model files can still be downloaded.
+
+
+    # Record exactly which sd-cli.exe binary was installed (important when using the moving 'latest' URL).
+    if sdcpp_ok:
+        try:
+            exe_path = (target / "bin" / "sd-cli.exe")
+            if exe_path.exists():
+                build_text = _collect_sdcpp_build_text(exe_path)
+                info_path = (root / "presets" / "info" / "sd_cli_build_info.txt").resolve()
+                header = "\n".join(
+                    [
+                        "stable-diffusion.cpp (sd-cli.exe) install receipt",
+                        f"installed_at_utc: {_utc_now_iso()}",
+                        f"release_tag: {latest.get('tag_name', '')}",
+                        f"release_published_at: {latest.get('published_at', '')}",
+                        f"release_html_url: {latest.get('html_url', '')}",
+                        f"asset_name: {(sdcpp_meta or {}).get('asset_name', '')}",
+                        f"asset_url: {(sdcpp_meta or {}).get('asset_url', '')}",
+                        f"sha256(sd-cli.exe): {_sha256_file(exe_path)}",
+                        "",
+                    ]
+                )
+                _safe_write_text(info_path, header + build_text)
+
+                _update_3rd_party_licenses_json(
+                    root,
+                    item_id="sd_cli_stable_diffusion_cpp",
+                    updates={
+                        "installed_at_utc": _utc_now_iso(),
+                        "installed_release_tag": latest.get("tag_name", ""),
+                        "installed_release_published_at": latest.get("published_at", ""),
+                        "installed_release_html_url": latest.get("html_url", ""),
+                        "installed_asset_name": (sdcpp_meta or {}).get("asset_name", ""),
+                        "installed_asset_url": (sdcpp_meta or {}).get("asset_url", ""),
+                        "installed_sdcli_sha256": _sha256_file(exe_path),
+                        "build_info_path": str(info_path.relative_to(root)).replace('\\', '/'),
+                    },
+                )
+                log(f"[zimage-gguf] wrote sd-cli build receipt: {info_path}")
+            else:
+                log("[zimage-gguf] warn: sd-cli.exe not found after install (no receipt written)")
+        except Exception as e:
+            log(f"[zimage-gguf] warn: could not write sd-cli receipt: {e}")
 
     log("[zimage-gguf] Downloading model files...")
 
