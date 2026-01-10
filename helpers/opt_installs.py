@@ -277,6 +277,70 @@ def _run_qwen2512_q8(root: Path) -> Optional[Tuple[str, List[str], Path]]:
 
 
 
+
+def _find_qwen2511_downloader_script(root: Path) -> Optional[Path]:
+    """Try common locations for the Qwen2511 (Image Edit) GGUF downloader script."""
+    candidates = [
+        root / "presets" / "extra_env" / "qwen2511_download.py",
+        root / "scripts" / "qwen2511_download.py",
+        root / "qwen2511_download.py",
+    ]
+    for c in candidates:
+        if c.exists():
+            return c
+    return None
+
+
+def _run_qwen2511_gguf(root: Path, variant: str) -> Optional[Tuple[str, List[str], Path]]:
+    """
+    Qwen-Image-Edit-2511 GGUF model downloader.
+
+    NOTE: Before downloading models we ensure the shared Qwen2512 environment folder exists:
+    <root>/.qwen2512/  (Qwen2511 and Qwen2512 share the same stable-diffusion.cpp setup.)
+    """
+    script = _find_qwen2511_downloader_script(root)
+    if script is None:
+        return None
+
+    py = _venv_python(root)
+    if not py:
+        return None
+
+    target = (root / "models" / "qwen2511gguf").resolve()
+
+    args = [
+        "-u",
+        str(script),
+        "--variants",
+        variant,
+        "--root",
+        str(root),
+        "--models-dir",
+        str(target),
+    ]
+    return (str(py), args, root)
+
+
+def _run_qwen2511_q3(root: Path) -> Optional[Tuple[str, List[str], Path]]:
+    return _run_qwen2511_gguf(root, "Q3_K_S")
+
+
+def _run_qwen2511_q4km(root: Path) -> Optional[Tuple[str, List[str], Path]]:
+    return _run_qwen2511_gguf(root, "Q4_K_M")
+
+
+def _run_qwen2511_q5km(root: Path) -> Optional[Tuple[str, List[str], Path]]:
+    return _run_qwen2511_gguf(root, "Q5_K_M")
+
+
+def _run_qwen2511_q6k(root: Path) -> Optional[Tuple[str, List[str], Path]]:
+    return _run_qwen2511_gguf(root, "Q6_K")
+
+
+def _run_qwen2511_q8(root: Path) -> Optional[Tuple[str, List[str], Path]]:
+    return _run_qwen2511_gguf(root, "Q8_0")
+
+
 def _run_sdxl_juggernaut(root: Path) -> Optional[Tuple[str, List[str], Path]]:
     script = root / "scripts" / "download_sd_models.py"
     py = _venv_python(root)
@@ -363,6 +427,36 @@ def _default_installs() -> List[OptionalInstall]:
             title="Qwen2512 GGUF (Q8)",
             description="Best quality / largest GGUF. Needs the most VRAM.",
             runner=_run_qwen2512_q8,
+        ),
+        OptionalInstall(
+            key="qwen2511_q3",
+            title="Qwen2511 Image Edit GGUF (Q3_K_S)",
+            description="Low VRAM / smaller download. Good starter for editing.",
+            runner=_run_qwen2511_q3,
+        ),
+        OptionalInstall(
+            key="qwen2511_q4km",
+            title="Qwen2511 Image Edit GGUF (Q4_K_M)",
+            description="Balanced size/quality. Recommended starting point for editing.",
+            runner=_run_qwen2511_q4km,
+        ),
+        OptionalInstall(
+            key="qwen2511_q5km",
+            title="Qwen2511 Image Edit GGUF (Q5_K_M)",
+            description="Higher quality / larger download. Good if you have more VRAM.",
+            runner=_run_qwen2511_q5km,
+        ),
+        OptionalInstall(
+            key="qwen2511_q6k",
+            title="Qwen2511 Image Edit GGUF (Q6_K)",
+            description="High quality / larger. Needs more VRAM.",
+            runner=_run_qwen2511_q6k,
+        ),
+        OptionalInstall(
+            key="qwen2511_q8",
+            title="Qwen2511 Image Edit GGUF (Q8_0)",
+            description="Best quality / largest GGUF. Needs the most VRAM.",
+            runner=_run_qwen2511_q8,
         ),
 
         OptionalInstall(
@@ -635,12 +729,16 @@ class OptionalInstallsDialog(QtWidgets.QDialog):
         for opt in self.installs:
             # Indent model download options consistently.
             is_zimage_extra = opt.key.startswith("zimage_") and opt.key != "zimage"
-            is_qwen_extra = opt.key.startswith("qwen2512_") and opt.key != "qwen2512"
+            is_qwen2512_extra = opt.key.startswith("qwen2512_") and opt.key != "qwen2512"
+            is_qwen2511_extra = opt.key.startswith("qwen2511_")
+            is_qwen_extra = is_qwen2512_extra or is_qwen2511_extra
             row = _OptionRow(opt, indent=(26 if (is_zimage_extra or is_qwen_extra) else 0))
             if is_zimage_extra:
                 row.toggled.connect(lambda checked, k=opt.key: self._on_zimage_model_toggled(k, checked))
-            if is_qwen_extra:
+            if is_qwen2512_extra:
                 row.toggled.connect(lambda checked, k=opt.key: self._on_qwen2512_model_toggled(k, checked))
+            if is_qwen2511_extra:
+                row.toggled.connect(lambda checked, k=opt.key: self._on_qwen2511_model_toggled(k, checked))
             self.rows.append(row)
             row_by_key[opt.key] = row
             opts_lay.addWidget(row)
@@ -1041,6 +1139,30 @@ class OptionalInstallsDialog(QtWidgets.QDialog):
 
 
 
+
+
+    def _on_qwen2511_model_toggled(self, key: str, checked: bool) -> None:
+        """Warn when Qwen2511 model prerequisites are missing."""
+        if not checked:
+            return
+
+        script = _find_qwen2511_downloader_script(self.root_dir)
+        if script is None:
+            self._toast("Missing downloader: qwen2511_download.py")
+            return
+
+        py = _venv_python(self.root_dir)
+        if py is None or (not py.exists()):
+            self._toast("Python .venv not found. Run the main installer first so FrameVision creates .venv.")
+            return
+
+        # Qwen2511 re-uses the Qwen2512 environment (stable-diffusion.cpp setup).
+        env_dir = (self.root_dir / ".qwen2512").resolve()
+        if not env_dir.exists():
+            self._toast("Qwen2512 environment not found — it will be installed first.")
+
+        self._toast("Qwen2511 GGUF model will download when you press Start (env install only needed once).")
+
     def selected_installs(self) -> List[OptionalInstall]:
         # Preserve install order from self.installs.
         checked_keys = [row.opt.key for row in self.rows if row.is_checked()]
@@ -1072,6 +1194,33 @@ class OptionalInstallsDialog(QtWidgets.QDialog):
                             else:
                                 ordered.insert(first_idx, opt)
                             self._auto_added_qwen2512_env = True
+                            break
+        except Exception:
+            pass
+
+
+        # Qwen2511 Edit:
+        # If user selects a Qwen2511 GGUF model, ensure the shared Qwen2512 environment exists first.
+        # (Requested check: <root>/.qwen2512/)
+        self._auto_added_qwen2511_env = False
+        try:
+            wants_qwen2511_models = any(k.startswith("qwen2511_") for k in checked_set)
+            if wants_qwen2511_models:
+                env_dir = (self.root_dir / ".qwen2512").resolve()
+                if not env_dir.exists():
+                    # Insert the existing Qwen2512 env install right before the first selected qwen2511 model.
+                    first_idx = None
+                    for i, opt in enumerate(ordered):
+                        if opt.key.startswith("qwen2511_"):
+                            first_idx = i
+                            break
+                    for opt in self.installs:
+                        if opt.key == "qwen2512":
+                            if first_idx is None:
+                                ordered.insert(0, opt)
+                            else:
+                                ordered.insert(first_idx, opt)
+                            self._auto_added_qwen2511_env = True
                             break
         except Exception:
             pass
@@ -1156,6 +1305,8 @@ class OptionalInstallsDialog(QtWidgets.QDialog):
             self._append_line("[INFO] Z-image env not found — installing it first so Z-image can run after model download.")
         if getattr(self, "_auto_added_qwen2512_env", False):
             self._append_line("[INFO] Qwen2512 env not found — installing it first because you selected a GGUF model.")
+        if getattr(self, "_auto_added_qwen2511_env", False):
+            self._append_line("[INFO] Qwen2512 env not found — installing it first because you selected a Qwen2511 edit model.")
         if getattr(self, "_auto_added_sdxl_inpaint_env", False):
             self._append_line("[INFO] Background remover + inpainter selected — running SDXL inpaint env install first.")
 

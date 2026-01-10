@@ -21,6 +21,7 @@ import time
 import shlex
 import subprocess
 import re
+from pathlib import Path
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Tuple
 
@@ -422,6 +423,12 @@ class Qwen2511Pane(QtWidgets.QWidget):
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setObjectName("Qwen2511Pane")
+        self.setSizePolicy(QtWidgets.QSizePolicy.Expanding, QtWidgets.QSizePolicy.Expanding)
+        # Prefer a reference to the main window if our parent exposes it (Tools tab does).
+        try:
+            self.main = getattr(parent, "main", None)
+        except Exception:
+            self.main = None
         self.caps: SdCliCaps = detect_sdcli_caps(DEFAULT_SDCLI)
         self._settings = _read_jsonish(SETSAVE_PATH)
 
@@ -429,6 +436,9 @@ class Qwen2511Pane(QtWidgets.QWidget):
         self._load_defaults()
         self._apply_settings_to_ui()
 
+
+        # Track most recent output for quick preview.
+        self._last_out_file: Optional[str] = None
         # Async process runner (prevents UI freeze while sd-cli runs)
         self._proc: Optional[QtCore.QProcess] = None
         self._proc_kind: str = ""
@@ -468,6 +478,143 @@ class Qwen2511Pane(QtWidgets.QWidget):
             self.log.clear()
 
 
+    def _open_results_folder(self):
+        """Open Qwen2511 output folder in the app Media Explorer (no OS Explorer button)."""
+        try:
+            _ensure_dir(OUTPUT_DIR)
+        except Exception:
+            pass
+
+        # Prefer Media Explorer (single shared entry-point) if available on the main window.
+        main = None
+        try:
+            main = getattr(self, "main", None)
+        except Exception:
+            main = None
+        if main is None:
+            try:
+                p = self.parent() if hasattr(self, "parent") else None
+                main = getattr(p, "main", None) if p is not None else None
+            except Exception:
+                main = None
+        if main is None:
+            try:
+                main = self.window() if hasattr(self, "window") else None
+            except Exception:
+                main = None
+
+        if main is not None and hasattr(main, "open_media_explorer_folder"):
+            try:
+                # Use the most common signature in FrameVision, but fall back if it differs.
+                main.open_media_explorer_folder(str(OUTPUT_DIR), preset="images", include_subfolders=False)
+                return
+            except TypeError:
+                try:
+                    main.open_media_explorer_folder(str(OUTPUT_DIR))
+                    return
+                except Exception:
+                    pass
+            except Exception:
+                pass
+
+        # No OS-Explorer fallback here (user request). Just show an info box.
+        try:
+            QtWidgets.QMessageBox.information(
+                self,
+                "View results",
+                f"Media Explorer entry-point not available.\nFolder: {OUTPUT_DIR}"
+            )
+        except Exception:
+            try:
+                self._append_log(f"\nMedia Explorer entry-point not available. Folder: {OUTPUT_DIR}")
+            except Exception:
+                pass
+
+    def _get_newest_output_file(self) -> Optional[str]:
+        """Return newest file path in OUTPUT_DIR (best-effort)."""
+        try:
+            if not os.path.isdir(OUTPUT_DIR):
+                return None
+            best = None
+            best_m = -1.0
+            for name in os.listdir(OUTPUT_DIR):
+                fp = os.path.join(OUTPUT_DIR, name)
+                if not os.path.isfile(fp):
+                    continue
+                try:
+                    m = os.path.getmtime(fp)
+                except Exception:
+                    m = 0.0
+                if m > best_m:
+                    best_m = m
+                    best = fp
+            return best
+        except Exception:
+            return None
+
+    def _play_file_in_main_player(self, fp: str) -> bool:
+        """Play/open a file in the internal VideoPane if running inside FrameVision."""
+        if not fp:
+            return False
+        main = None
+        try:
+            main = getattr(self, "main", None)
+        except Exception:
+            main = None
+        if main is None:
+            try:
+                main = self.window()
+            except Exception:
+                main = None
+        if main is None:
+            return False
+        try:
+            video = getattr(main, "video", None)
+        except Exception:
+            video = None
+        if video is None or not hasattr(video, "open"):
+            return False
+        try:
+            video.open(Path(fp))
+            return True
+        except Exception:
+            try:
+                video.open(fp)
+                return True
+            except Exception:
+                return False
+
+    def _play_last_result(self):
+        """Play newest output in internal media player (no external player)."""
+        fp = None
+        try:
+            fp = self._last_out_file if (hasattr(self, "_last_out_file") and self._last_out_file) else None
+            if fp and not os.path.isfile(fp):
+                fp = None
+        except Exception:
+            fp = None
+
+        if not fp:
+            fp = self._get_newest_output_file()
+
+        if not fp:
+            try:
+                QtWidgets.QMessageBox.information(self, "Play last result", "No outputs found yet in output/qwen2511.")
+            except Exception:
+                pass
+            return
+
+        ok = self._play_file_in_main_player(fp)
+        if not ok:
+            try:
+                QtWidgets.QMessageBox.information(
+                    self,
+                    "Play last result",
+                    "Could not find the internal Media Player host. (This button works inside FrameVision.)",
+                )
+            except Exception:
+                pass
+
     def _caps_summary(self) -> str:
         c = self.caps
         return (
@@ -491,10 +638,16 @@ class Qwen2511Pane(QtWidgets.QWidget):
         )
 
     def _build_ui(self):
-        # Wrap controls in a scroll area so small screens don't force layouts to compress/overlap.
+        # Responsive layout:
+        # - Scroll area for all controls (prevents overlap on small windows)
+        # - Vertical splitter between controls and the log (lets the log grow/shrink)
         outer = QtWidgets.QVBoxLayout(self)
         outer.setContentsMargins(0, 0, 0, 0)
-        outer.setSpacing(8)
+        outer.setSpacing(0)
+
+        split = QtWidgets.QSplitter(QtCore.Qt.Vertical)
+        split.setChildrenCollapsible(False)
+        outer.addWidget(split, 1)
 
         scroll = QtWidgets.QScrollArea()
         scroll.setToolTip("Scroll to access all settings on smaller screens.")
@@ -502,6 +655,7 @@ class Qwen2511Pane(QtWidgets.QWidget):
         scroll.setHorizontalScrollBarPolicy(QtCore.Qt.ScrollBarAsNeeded)
         scroll.setVerticalScrollBarPolicy(QtCore.Qt.ScrollBarAsNeeded)
         scroll.setFrameShape(QtWidgets.QFrame.NoFrame)
+        scroll.setSizePolicy(QtWidgets.QSizePolicy.Expanding, QtWidgets.QSizePolicy.Expanding)
 
         content = QtWidgets.QWidget()
         scroll.setWidget(content)
@@ -509,9 +663,9 @@ class Qwen2511Pane(QtWidgets.QWidget):
         layout = QtWidgets.QVBoxLayout(content)
         layout.setContentsMargins(12, 12, 12, 12)
         layout.setSpacing(10)
-        layout.setSizeConstraint(QtWidgets.QLayout.SetMinAndMaxSize)
+        layout.setSizeConstraint(QtWidgets.QLayout.SetMinimumSize)
 
-        outer.addWidget(scroll, 1)
+        split.addWidget(scroll)
 
         title = QtWidgets.QLabel("Qwen Image Edit 2511 (GGUF)")
         f = title.font()
@@ -519,26 +673,70 @@ class Qwen2511Pane(QtWidgets.QWidget):
         f.setBold(True)
         title.setFont(f)
         layout.addWidget(title)
+        # Models (collapsible)
+        self.g_models = QtWidgets.QGroupBox("Models")
+        self.g_models.setToolTip("Select the GGUF / VAE files used by sd-cli. Collapse this box if you want a cleaner UI.")
+        self.g_models.setCheckable(True)
+        self.g_models.setChecked(True)
+        self.g_models.toggled.connect(self._on_models_toggled_slot)
 
-        # Paths
-        g_paths = QtWidgets.QGroupBox("Paths")
-        g_paths.setToolTip("Pick input images and model paths.")
-        gl = QtWidgets.QFormLayout(g_paths)
-        gl.setLabelAlignment(QtCore.Qt.AlignRight)
+        mv = QtWidgets.QVBoxLayout(self.g_models)
+        mv.setContentsMargins(8, 8, 8, 8)
 
+        self.models_content = QtWidgets.QWidget()
+        ml = QtWidgets.QFormLayout(self.models_content)
+        ml.setLabelAlignment(QtCore.Qt.AlignRight)
+        ml.setRowWrapPolicy(QtWidgets.QFormLayout.WrapAllRows)
+        ml.setFieldGrowthPolicy(QtWidgets.QFormLayout.ExpandingFieldsGrow)
+
+        # sd-cli.exe (moved here from Paths)
         self.ed_sdcli = QtWidgets.QLineEdit(DEFAULT_SDCLI)
         self.ed_sdcli.setToolTip("Path to sd-cli.exe (stable-diffusion.cpp). Leave default unless you installed it elsewhere.")
         btn_sdcli = QtWidgets.QToolButton(); btn_sdcli.setText("…"); btn_sdcli.clicked.connect(self._pick_sdcli)
         btn_sdcli.setToolTip("Browse for sd-cli.exe")
-        h_sd = QtWidgets.QHBoxLayout(); h_sd.addWidget(self.ed_sdcli, 1); h_sd.addWidget(btn_sdcli)
-        gl.addRow("sd-cli.exe", h_sd)
+        h_sd = QtWidgets.QHBoxLayout(); h_sd.addWidget(btn_sdcli); h_sd.addWidget(self.ed_sdcli, 1)
+        ml.addRow("sd-cli.exe", h_sd)
+
+        self.cb_unet = QtWidgets.QComboBox()
+        self.cb_unet.setToolTip("Select the UNet GGUF file. If you just downloaded models, click 'Reload models list'.")
+        self.cb_llm = QtWidgets.QComboBox()
+        self.cb_llm.setToolTip("Select the text encoder (LLM) GGUF file.")
+        self.cb_mmproj = QtWidgets.QComboBox()
+        self.cb_mmproj.setToolTip("Select the mmproj/vision projection model (GGUF).")
+        self.cb_vae = QtWidgets.QComboBox()
+        self.cb_vae.setToolTip("Select the VAE file used for decoding/encoding.")
+
+        ml.addRow("UNet", self.cb_unet)
+        ml.addRow("Text encoder", self.cb_llm)
+        ml.addRow("mmproj", self.cb_mmproj)
+        ml.addRow("VAE", self.cb_vae)
+
+        mv.addWidget(self.models_content)
+        layout.addWidget(self.g_models)
+
+
+        # Paths (collapsible)
+        self.g_paths = QtWidgets.QGroupBox("Paths")
+        self.g_paths.setToolTip("Pick input images and other paths. Collapse this box if you want a cleaner UI.")
+        self.g_paths.setCheckable(True)
+        self.g_paths.setChecked(True)
+        self.g_paths.toggled.connect(self._on_paths_toggled_slot)
+
+        pv = QtWidgets.QVBoxLayout(self.g_paths)
+        pv.setContentsMargins(8, 8, 8, 8)
+
+        self.paths_content = QtWidgets.QWidget()
+        gl = QtWidgets.QFormLayout(self.paths_content)
+        gl.setLabelAlignment(QtCore.Qt.AlignRight)
+        gl.setRowWrapPolicy(QtWidgets.QFormLayout.WrapAllRows)
+        gl.setFieldGrowthPolicy(QtWidgets.QFormLayout.ExpandingFieldsGrow)
 
         self.ed_initimg = QtWidgets.QLineEdit()
         self.ed_initimg.setToolTip("The image you want to edit. Tip: Use a reasonably high-res input (720p+) for cleaner cutouts/edits.")
         self.ed_initimg.setPlaceholderText("Select an input image…")
         btn_img = QtWidgets.QToolButton(); btn_img.setText("…"); btn_img.clicked.connect(self._pick_image)
         btn_img.setToolTip("Browse for an input image")
-        h_img = QtWidgets.QHBoxLayout(); h_img.addWidget(self.ed_initimg, 1); h_img.addWidget(btn_img)
+        h_img = QtWidgets.QHBoxLayout(); h_img.addWidget(btn_img); h_img.addWidget(self.ed_initimg, 1)
         gl.addRow("Input image", h_img)
 
         self.lbl_imginfo = QtWidgets.QLabel("")
@@ -551,11 +749,10 @@ class Qwen2511Pane(QtWidgets.QWidget):
         self.ed_mask.setPlaceholderText("Optional: mask image (white/black) …")
         btn_mask = QtWidgets.QToolButton(); btn_mask.setText("…"); btn_mask.clicked.connect(self._pick_mask)
         btn_mask.setToolTip("Browse for a mask image")
-        h_mask = QtWidgets.QHBoxLayout(); h_mask.addWidget(self.ed_mask, 1); h_mask.addWidget(btn_mask)
+        h_mask = QtWidgets.QHBoxLayout(); h_mask.addWidget(btn_mask); h_mask.addWidget(self.ed_mask, 1)
         gl.addRow("Mask", h_mask)
 
         self.chk_invert_mask = QtWidgets.QCheckBox("Invert mask")
-        self.chk_invert_mask.setToolTip("Inverts the mask before running. Useful when your mask selection is reversed.")
         self.chk_invert_mask.setToolTip("If your mask behaves backwards, enable this. It writes a temporary inverted mask PNG.")
         gl.addRow("", self.chk_invert_mask)
 
@@ -565,7 +762,7 @@ class Qwen2511Pane(QtWidgets.QWidget):
         self.ed_ref1.setPlaceholderText("Optional: reference image 2 (clothes/face/prop)…")
         btn_ref1 = QtWidgets.QToolButton(); btn_ref1.setText("…"); btn_ref1.clicked.connect(lambda: self._pick_ref(self.ed_ref1))
         btn_ref1.setToolTip("Browse for reference image 2")
-        h_ref1 = QtWidgets.QHBoxLayout(); h_ref1.addWidget(self.ed_ref1, 1); h_ref1.addWidget(btn_ref1)
+        h_ref1 = QtWidgets.QHBoxLayout(); h_ref1.addWidget(btn_ref1); h_ref1.addWidget(self.ed_ref1, 1)
         gl.addRow("Ref image 2", h_ref1)
 
         self.ed_ref2 = QtWidgets.QLineEdit()
@@ -573,7 +770,7 @@ class Qwen2511Pane(QtWidgets.QWidget):
         self.ed_ref2.setPlaceholderText("Optional: reference image 3 …")
         btn_ref2 = QtWidgets.QToolButton(); btn_ref2.setText("…"); btn_ref2.clicked.connect(lambda: self._pick_ref(self.ed_ref2))
         btn_ref2.setToolTip("Browse for reference image 3")
-        h_ref2 = QtWidgets.QHBoxLayout(); h_ref2.addWidget(self.ed_ref2, 1); h_ref2.addWidget(btn_ref2)
+        h_ref2 = QtWidgets.QHBoxLayout(); h_ref2.addWidget(btn_ref2); h_ref2.addWidget(self.ed_ref2, 1)
         gl.addRow("Ref image 3", h_ref2)
 
         self.ed_ref3 = QtWidgets.QLineEdit()
@@ -581,20 +778,19 @@ class Qwen2511Pane(QtWidgets.QWidget):
         self.ed_ref3.setPlaceholderText("Optional: reference image 4 …")
         btn_ref3 = QtWidgets.QToolButton(); btn_ref3.setText("…"); btn_ref3.clicked.connect(lambda: self._pick_ref(self.ed_ref3))
         btn_ref3.setToolTip("Browse for reference image 4")
-        h_ref3 = QtWidgets.QHBoxLayout(); h_ref3.addWidget(self.ed_ref3, 1); h_ref3.addWidget(btn_ref3)
+        h_ref3 = QtWidgets.QHBoxLayout(); h_ref3.addWidget(btn_ref3); h_ref3.addWidget(self.ed_ref3, 1)
         gl.addRow("Ref image 4", h_ref3)
 
         self.chk_ref_increase_index = QtWidgets.QCheckBox("Auto index refs (image 2, image 3, …)")
-        self.chk_ref_increase_index.setToolTip("Adds --increase-ref-index so you can say \'image 2\' / \'image 3\' in the prompt.")
         self.chk_ref_increase_index.setToolTip("Adds --increase-ref-index so you can refer to refs as image 2 / image 3 / … in the prompt.")
         gl.addRow("", self.chk_ref_increase_index)
 
         self.chk_disable_ref_resize = QtWidgets.QCheckBox("Disable auto resize ref images")
-        self.chk_disable_ref_resize.setToolTip("Prevents sd-cli from resizing ref images automatically (if supported by your build).")
         self.chk_disable_ref_resize.setToolTip("Adds --disable-auto-resize-ref-image (if supported).")
         gl.addRow("", self.chk_disable_ref_resize)
 
-        layout.addWidget(g_paths)
+        pv.addWidget(self.paths_content)
+        layout.addWidget(self.g_paths)
 
         # Prompt
         g_prompt = QtWidgets.QGroupBox("Prompt")
@@ -609,29 +805,12 @@ class Qwen2511Pane(QtWidgets.QWidget):
         pl.addWidget(self.ed_neg)
         layout.addWidget(g_prompt, 2)
 
-        # Models
-        g_models = QtWidgets.QGroupBox("Models")
-        g_models.setToolTip("Select the GGUF and VAE files used by sd-cli.")
-        ml = QtWidgets.QFormLayout(g_models)
-        ml.setLabelAlignment(QtCore.Qt.AlignRight)
-        self.cb_unet = QtWidgets.QComboBox()
-        self.cb_unet.setToolTip("Select the UNet GGUF file. If you just downloaded models, click \'Reload models list\'.")
-        self.cb_llm = QtWidgets.QComboBox()
-        self.cb_llm.setToolTip("Select the text encoder (LLM) GGUF file.")
-        self.cb_mmproj = QtWidgets.QComboBox()
-        self.cb_mmproj.setToolTip("Select the mmproj/vision projection model (GGUF).")
-        self.cb_vae = QtWidgets.QComboBox()
-        self.cb_vae.setToolTip("Select the VAE file used for decoding/encoding.")
-        ml.addRow("UNet", self.cb_unet)
-        ml.addRow("Text encoder", self.cb_llm)
-        ml.addRow("mmproj", self.cb_mmproj)
-        ml.addRow("VAE", self.cb_vae)
-        layout.addWidget(g_models)
-
         # Settings
         g_set = QtWidgets.QGroupBox("Settings")
         g_set.setToolTip("Quality, size, and performance options.")
         sl = QtWidgets.QGridLayout(g_set)
+        sl.setColumnStretch(1, 1)
+        sl.setColumnStretch(3, 1)
 
         self.sp_steps = QtWidgets.QSpinBox(); self.sp_steps.setRange(1, 200); self.sp_steps.setValue(28)
         self.sp_steps.setToolTip("Number of diffusion steps. More steps = slower, sometimes cleaner. 24–40 is a common range.")
@@ -709,34 +888,70 @@ class Qwen2511Pane(QtWidgets.QWidget):
         r += 1
         sl.addWidget(QtWidgets.QLabel("Width"), r, 0); sl.addWidget(self.sp_w, r, 1)
         sl.addWidget(QtWidgets.QLabel("Height"), r, 2); sl.addWidget(self.sp_h, r, 3)
+
         r += 1
         sl.addWidget(QtWidgets.QLabel("Flow shift"), r, 0); sl.addWidget(self.sp_shift, r, 1)
-        sl.addLayout(aspect_row, r, 2, 1, 2)
 
+        # Advanced (collapsible): aspect helper + low-VRAM / performance flags
         r += 1
-        sl.addWidget(self.chk_vae_tiling, r, 0, 1, 2)
-        sl.addWidget(QtWidgets.QLabel("Tile size"), r, 2); sl.addWidget(self.cb_vae_tile_size, r, 3)
+        self.g_adv = QtWidgets.QGroupBox("Advanced")
+        self.g_adv.setToolTip("Low-VRAM and performance options. Collapse this box for a cleaner UI.")
+        self.g_adv.setCheckable(True)
+        self.g_adv.setChecked(False)
+        self.g_adv.toggled.connect(self._on_adv_toggled_slot)
 
-        r += 1
-        sl.addWidget(self.chk_mmap, r, 0, 1, 2)
-        sl.addWidget(QtWidgets.QLabel("Tile overlap"), r, 2); sl.addWidget(self.sp_vae_tile_overlap, r, 3)
+        av = QtWidgets.QVBoxLayout(self.g_adv)
+        av.setContentsMargins(8, 8, 8, 8)
 
-        r += 1
-        sl.addWidget(self.chk_offload, r, 0, 1, 2)
-        sl.addWidget(self.chk_vae_on_cpu, r, 2, 1, 2)
+        self.adv_content = QtWidgets.QWidget()
+        al = QtWidgets.QGridLayout(self.adv_content)
+        al.setColumnStretch(0, 1)
+        al.setColumnStretch(1, 1)
+        al.setColumnStretch(2, 0)
+        al.setColumnStretch(3, 1)
 
-        r += 1
-        sl.addWidget(self.chk_clip_on_cpu, r, 0, 1, 2)
-        sl.addWidget(self.chk_diffusion_fa, r, 2, 1, 2)
+        # Aspect helper
+        al.addLayout(aspect_row, 0, 0, 1, 4)
+
+        ar = 1
+        al.addWidget(self.chk_vae_tiling, ar, 0, 1, 2)
+        al.addWidget(QtWidgets.QLabel("Tile size"), ar, 2); al.addWidget(self.cb_vae_tile_size, ar, 3)
+
+        ar += 1
+        al.addWidget(self.chk_mmap, ar, 0, 1, 2)
+        al.addWidget(QtWidgets.QLabel("Tile overlap"), ar, 2); al.addWidget(self.sp_vae_tile_overlap, ar, 3)
+
+        ar += 1
+        al.addWidget(self.chk_offload, ar, 0, 1, 2)
+        al.addWidget(self.chk_vae_on_cpu, ar, 2, 1, 2)
+
+        ar += 1
+        al.addWidget(self.chk_clip_on_cpu, ar, 0, 1, 2)
+        al.addWidget(self.chk_diffusion_fa, ar, 2, 1, 2)
+
+        av.addWidget(self.adv_content)
+        sl.addWidget(self.g_adv, r, 0, 1, 4)
 
         layout.addWidget(g_set)
 
-        # Buttons
-        btn_row = QtWidgets.QHBoxLayout()
+        # Buttons (2-row layout so it stays usable on narrow windows)
+        btn_v = QtWidgets.QVBoxLayout()
+        btn_v.setContentsMargins(0, 0, 0, 0)
+        btn_v.setSpacing(6)
+
+        top_row = QtWidgets.QHBoxLayout()
+        bottom_row = QtWidgets.QHBoxLayout()
+
         self.btn_download = QtWidgets.QPushButton("Download models")
         self.btn_download.setToolTip("Downloads the required Qwen2511 GGUF files into the models folder.")
         self.btn_reload = QtWidgets.QPushButton("Reload models list")
         self.btn_reload.setToolTip("Rescans the models folders and refreshes the dropdowns.")
+        self.btn_view_results = QtWidgets.QPushButton("View results")
+        self.btn_view_results.setToolTip("Open output/qwen2511 in Media Explorer.")
+        self.btn_play_last = QtWidgets.QPushButton("Play last result")
+        self.btn_play_last.setToolTip("Plays the newest file in output/qwen2511 using the internal media player.")
+        self.chk_auto_show_results = QtWidgets.QCheckBox("Auto show results after run")
+        self.chk_auto_show_results.setToolTip("When enabled, automatically opens Media Explorer on output/qwen2511 after a successful run.")
         self.btn_clear_log = QtWidgets.QPushButton("Clear log")
         self.btn_clear_log.setToolTip("Clears the log output below (new messages will still appear at the top).")
         self.btn_save = QtWidgets.QPushButton("Save settings")
@@ -749,27 +964,104 @@ class Qwen2511Pane(QtWidgets.QWidget):
 
         self.btn_download.clicked.connect(self._run_downloader)
         self.btn_reload.clicked.connect(self._reload_model_lists)
+        self.btn_view_results.clicked.connect(self._open_results_folder)
+        self.btn_play_last.clicked.connect(self._play_last_result)
         self.btn_clear_log.clicked.connect(self._clear_log)
         self.btn_save.clicked.connect(self._save_settings)
         self.btn_run.clicked.connect(self._run_sdcli)
         self.btn_cancel.clicked.connect(self._cancel_running_process)
 
-        btn_row.addWidget(self.btn_download)
-        btn_row.addWidget(self.btn_reload)
-        btn_row.addStretch(1)
-        btn_row.addWidget(self.btn_clear_log)
-        btn_row.addWidget(self.btn_save)
-        btn_row.addWidget(self.btn_run)
-        btn_row.addWidget(self.btn_cancel)
-        layout.addLayout(btn_row)
+        top_row.addWidget(self.btn_download)
+        top_row.addWidget(self.btn_reload)
+        top_row.addWidget(self.btn_view_results)
+        top_row.addWidget(self.btn_play_last)
+        top_row.addWidget(self.chk_auto_show_results)
+        top_row.addStretch(1)
 
-        # Log (kept outside the scroll area so it stays visible)
+        bottom_row.addWidget(self.btn_clear_log)
+        bottom_row.addWidget(self.btn_save)
+        bottom_row.addStretch(1)
+        bottom_row.addWidget(self.btn_run)
+        bottom_row.addWidget(self.btn_cancel)
+
+        btn_v.addLayout(top_row)
+        btn_v.addLayout(bottom_row)
+        layout.addLayout(btn_v)
+
+        # Log (kept separate from the scroll area so it stays reachable)
         self.log = QtWidgets.QPlainTextEdit()
         self.log.setToolTip("Process log (newest messages appear at the top). If something fails, copy the top section into a bug report.")
         self.log.setReadOnly(True)
         self.log.setMaximumBlockCount(8000)
         self.log.setMinimumHeight(180)
-        outer.addWidget(self.log, 0)
+        self.log.setSizePolicy(QtWidgets.QSizePolicy.Expanding, QtWidgets.QSizePolicy.Expanding)
+        split.addWidget(self.log)
+
+        # Give the controls more space by default, but let the user resize via the splitter.
+        try:
+            split.setStretchFactor(0, 3)
+            split.setStretchFactor(1, 1)
+            split.setSizes([750, 250])
+        except Exception:
+            pass
+
+    def _on_models_toggled_slot(self, checked: bool):
+        self._on_models_toggled(bool(checked), persist=True)
+
+    def _on_models_toggled(self, checked: bool, persist: bool = False):
+        # Collapse/expand the Models group and persist the open/close state.
+        try:
+            if hasattr(self, "models_content") and self.models_content is not None:
+                self.models_content.setVisible(bool(checked))
+        except Exception:
+            pass
+
+        try:
+            self._settings["models_box_open"] = bool(checked)
+            if persist:
+                _write_json(SETSAVE_PATH, self._settings)
+        except Exception:
+            pass
+
+
+
+
+    def _on_paths_toggled_slot(self, checked: bool):
+        self._on_paths_toggled(bool(checked), persist=True)
+
+    def _on_paths_toggled(self, checked: bool, persist: bool = False):
+        # Collapse/expand the Paths group and persist the open/close state.
+        try:
+            if hasattr(self, "paths_content") and self.paths_content is not None:
+                self.paths_content.setVisible(bool(checked))
+        except Exception:
+            pass
+
+        try:
+            self._settings["paths_box_open"] = bool(checked)
+            if persist:
+                _write_json(SETSAVE_PATH, self._settings)
+        except Exception:
+            pass
+
+
+    def _on_adv_toggled_slot(self, checked: bool):
+        self._on_adv_toggled(bool(checked), persist=True)
+
+    def _on_adv_toggled(self, checked: bool, persist: bool = False):
+        # Collapse/expand the Advanced group and persist the open/close state.
+        try:
+            if hasattr(self, "adv_content") and self.adv_content is not None:
+                self.adv_content.setVisible(bool(checked))
+        except Exception:
+            pass
+
+        try:
+            self._settings["advanced_box_open"] = bool(checked)
+            if persist:
+                _write_json(SETSAVE_PATH, self._settings)
+        except Exception:
+            pass
 
     def _update_imginfo(self, path: str):
         if not path or not os.path.isfile(path):
@@ -780,6 +1072,7 @@ class Qwen2511Pane(QtWidgets.QWidget):
             self.lbl_imginfo.setText("")
             return
         self.lbl_imginfo.setText(f"Input size: {img.width()}x{img.height()}  (Tip: keep Width/Height similar aspect to avoid crop)")
+
 
     def _apply_aspect_now(self):
         path = self.ed_initimg.text().strip()
@@ -851,6 +1144,9 @@ class Qwen2511Pane(QtWidgets.QWidget):
         self._reload_model_lists()
         d = default_model_paths()
         self._settings.setdefault("sdcli_path", DEFAULT_SDCLI)
+        self._settings.setdefault("models_box_open", True)
+        self._settings.setdefault("paths_box_open", True)
+        self._settings.setdefault("advanced_box_open", False)
         self._settings.setdefault("last_init_img", "")
         self._settings.setdefault("last_mask_img", "")
         self._settings.setdefault("invert_mask", False)
@@ -874,6 +1170,7 @@ class Qwen2511Pane(QtWidgets.QWidget):
         self._settings.setdefault("shift", 12.5)
         self._settings.setdefault("auto_aspect", True)
         self._settings.setdefault("auto_aspect_base", 1024)
+        self._settings.setdefault("auto_show_results", False)
 
         # low-vram defaults
         self._settings.setdefault("vae_tiling", True)
@@ -887,6 +1184,39 @@ class Qwen2511Pane(QtWidgets.QWidget):
 
     def _apply_settings_to_ui(self):
         s = self._settings
+        checked = bool(s.get("models_box_open", True))
+        if hasattr(self, "g_models") and self.g_models is not None:
+            try:
+                self.g_models.blockSignals(True)
+                self.g_models.setChecked(checked)
+                self.g_models.blockSignals(False)
+            except Exception:
+                pass
+            self._on_models_toggled(checked, persist=False)
+
+
+
+        paths_checked = bool(s.get("paths_box_open", True))
+        if hasattr(self, "g_paths") and self.g_paths is not None:
+            try:
+                self.g_paths.blockSignals(True)
+                self.g_paths.setChecked(paths_checked)
+                self.g_paths.blockSignals(False)
+            except Exception:
+                pass
+            self._on_paths_toggled(paths_checked, persist=False)
+
+
+        adv_checked = bool(s.get("advanced_box_open", False))
+        if hasattr(self, "g_adv") and self.g_adv is not None:
+            try:
+                self.g_adv.blockSignals(True)
+                self.g_adv.setChecked(adv_checked)
+                self.g_adv.blockSignals(False)
+            except Exception:
+                pass
+            self._on_adv_toggled(adv_checked, persist=False)
+
         self.ed_sdcli.setText(s.get("sdcli_path", DEFAULT_SDCLI))
         self.ed_initimg.setText(s.get("last_init_img", ""))
         self._update_imginfo(self.ed_initimg.text().strip())
@@ -910,6 +1240,11 @@ class Qwen2511Pane(QtWidgets.QWidget):
         self.sp_shift.setValue(float(s.get("shift", 12.5)))
 
         self.chk_auto_aspect.setChecked(bool(s.get("auto_aspect", True)))
+        if hasattr(self, "chk_auto_show_results"):
+            try:
+                self.chk_auto_show_results.setChecked(bool(s.get("auto_show_results", False)))
+            except Exception:
+                pass
         base = int(s.get("auto_aspect_base", 1024))
         self.cb_base.setCurrentText(str(base))
 
@@ -938,6 +1273,9 @@ class Qwen2511Pane(QtWidgets.QWidget):
     def _save_settings(self):
         s = {
             "sdcli_path": self.ed_sdcli.text().strip(),
+            "models_box_open": bool(getattr(self, "g_models", None).isChecked() if getattr(self, "g_models", None) is not None else True),
+            "paths_box_open": bool(getattr(self, "g_paths", None).isChecked() if getattr(self, "g_paths", None) is not None else True),
+            "advanced_box_open": bool(getattr(self, "g_adv", None).isChecked() if getattr(self, "g_adv", None) is not None else False),
             "last_init_img": self.ed_initimg.text().strip(),
             "last_mask_img": self.ed_mask.text().strip(),
             "invert_mask": bool(self.chk_invert_mask.isChecked()),
@@ -961,6 +1299,7 @@ class Qwen2511Pane(QtWidgets.QWidget):
             "shift": float(self.sp_shift.value()),
             "auto_aspect": bool(self.chk_auto_aspect.isChecked()),
             "auto_aspect_base": int(self.cb_base.currentText()),
+            "auto_show_results": bool(getattr(self, "chk_auto_show_results", None).isChecked() if getattr(self, "chk_auto_show_results", None) is not None else False),
             "vae_tiling": bool(self.chk_vae_tiling.isChecked()),
             "vae_tile_size": self.cb_vae_tile_size.currentText().strip(),
             "vae_tile_overlap": float(self.sp_vae_tile_overlap.value()),
@@ -1050,6 +1389,16 @@ class Qwen2511Pane(QtWidgets.QWidget):
             out_file = self._proc_expected_out or ""
             if out_file and os.path.isfile(out_file):
                 self._append_log(f"Output written: {out_file}")
+                try:
+                    self._last_out_file = out_file
+                except Exception:
+                    pass
+                # Optional: auto-open Media Explorer to show outputs.
+                try:
+                    if hasattr(self, "chk_auto_show_results") and self.chk_auto_show_results.isChecked():
+                        self._open_results_folder()
+                except Exception:
+                    pass
             else:
                 self._append_log("Output file not found at expected path. If it crashed, check logs above.")
 
