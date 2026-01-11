@@ -3036,10 +3036,10 @@ class Txt2ImgPane(QWidget):
             # LoRA labels: show engine-specific text
             lora_label = getattr(self, "lora_label", None)
             if lora_label is not None:
-                lora_label.setText("LoRA (Z-Image)" if is_zimage else "LoRA (SDXL)")
+                lora_label.setText("LoRA (Z-Image)" if is_zimage else ("LoRA (Qwen)" if is_qwen else "LoRA (SDXL)"))
             lora2_label = getattr(self, "lora2_label", None)
             if lora2_label is not None:
-                lora2_label.setText("LoRA 2 (Z-Image)" if is_zimage else "LoRA 2 (SDXL)")
+                lora2_label.setText("LoRA 2 (Z-Image)" if is_zimage else ("LoRA 2 (Qwen)" if is_qwen else "LoRA 2 (SDXL)"))
 
             # GGUF selectors: visible only for GGUF engine
             for _w in (
@@ -3230,20 +3230,20 @@ class Txt2ImgPane(QWidget):
                     except Exception:
                         pass
                 elif is_qwen:
-                    # qwen 2.5 12B GGUF: wider range; default 40
+                    # qwen 2.5 12B GGUF: wider range; default 25
                     try:
                         ss.blockSignals(True)
                     except Exception:
                         pass
                     ss.setRange(1, 200)
-                    ss.setValue(40)
+                    ss.setValue(25)
                     try:
                         ss.blockSignals(False)
                     except Exception:
                         pass
                     try:
                         if sv is not None:
-                            sv.setText("40")
+                            sv.setText("25")
                     except Exception:
                         pass
                 else:

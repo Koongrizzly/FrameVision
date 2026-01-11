@@ -3898,6 +3898,20 @@ class BackgroundPane(QWidget):
 
         try:
             install_background_tool(self, self)
+            # Default to the Inpaint sub-tab (and keep it stable across tab switches)
+            try:
+                _tabs = getattr(self, '_bg_tool_tabs', None)
+                if _tabs is not None:
+                    for _i in range(_tabs.count()):
+                        try:
+                            _t = str(_tabs.tabText(_i) or '').strip().lower()
+                        except Exception:
+                            _t = ''
+                        if _t.startswith('inpaint'):
+                            _tabs.setCurrentIndex(_i)
+                            break
+            except Exception:
+                pass
         except Exception as _e:
             try:
                 lbl = QLabel(f"Background tool failed to load: {_e}")
@@ -4312,10 +4326,19 @@ class MainWindow(QMainWindow):
                         return str(x).strip().lower()
                 if name_saved:
                     target = _norm(name_saved)
+                    targets = {target}
+                    try:
+                        # Backward-compatible tab name aliases
+                        if target == "background":
+                            targets.add("a.i. image edit")
+                        elif target == "a.i. image edit":
+                            targets.add("background")
+                    except Exception:
+                        pass
                     found = -1
                     try:
                         for _i in range(self.tabs.count()):
-                            if _norm(self.tabs.tabText(_i)) == target:
+                            if _norm(self.tabs.tabText(_i)) in targets:
                                 found = _i
                                 break
                     except Exception:
@@ -4705,6 +4728,11 @@ class MainWindow(QMainWindow):
         self.tools = InstantToolsPane(self)
         self.describe = DescribePane(self)
         self.background = BackgroundPane(self)
+        try:
+            if getattr(self, "background", None) is not None and not str(self.background.objectName() or ""):
+                self.background.setObjectName("tab_background")
+        except Exception:
+            pass
         self.models = ModelsPane(self, {
             'MODELS_DIR': MODELS_DIR,
             'MANIFEST_PATH': MANIFEST_PATH,
@@ -4774,7 +4802,7 @@ class MainWindow(QMainWindow):
             pass
         # <<< FRAMEVISION_MEDIA_EXPLORER_INIT_END
 
-        _main_tabs = [("Edit", self.edit),("Background", self.background),("Media Explorer", self.media_explorer),("Tools", self.tools),("Describe", self.describe),("Queue", self.queue),("Models", self.models),("Presets", self.presets_tab),("Settings", self.settings)]
+        _main_tabs = [("Edit", self.edit),("A.i. Image Edit", self.background),("Media Explorer", self.media_explorer),("Tools", self.tools),("Describe", self.describe),("Queue", self.queue),("Models", self.models),("Presets", self.presets_tab),("Settings", self.settings)]
         try:
             if getattr(self, "music_clip_creator", None) is not None:
                 # Insert right after Media Explorer so it sits near other creation tools.
@@ -4901,7 +4929,7 @@ class MainWindow(QMainWindow):
 
         # --- Hide legacy Upscale / RIFE tabs (now embedded in Tools tab) ---
         try:
-            _hide = {"upscale", "rife fps", "rife_fps", "rife", "edit", "background", "bg", "background remover", "background/inpainter", "inpainter", "inpaint"}
+            _hide = {"upscale", "rife fps", "rife_fps", "rife"}
             for _i in range(self.tabs.count() - 1, -1, -1):
                 try:
                     _t = (self.tabs.tabText(_i) or "").strip().lower()

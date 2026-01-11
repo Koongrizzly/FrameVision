@@ -30,10 +30,11 @@ from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
 from PySide6.QtCore import (QMutex, QObject, QPoint, QRect, QSize, Qt, QThread,
+                            QEvent,
                             QTimer, Signal, Slot)
 from PySide6.QtGui import (QAction, QBrush, QColor, QImage, QPainter, QPen,
                            QPixmap)
-from PySide6.QtWidgets import (QAbstractItemView, QApplication, QCheckBox,
+from PySide6.QtWidgets import (QAbstractItemView, QAbstractScrollArea, QApplication, QCheckBox,
                                QComboBox, QDialog, QFileDialog, QFormLayout,
                                QFrame, QGridLayout, QGroupBox, QHBoxLayout,
                                QLabel, QLineEdit, QMessageBox, QPushButton,
@@ -1307,6 +1308,16 @@ class SDXLInpaintPane(QWidget):
     def __init__(self, parent: Optional[QWidget] = None):
         super().__init__(parent)
 
+        # FV: prevent parent scroll from hijacking the whole app when this tab is active.
+        # Make this pane report a minimal size and let the parent layout decide the final height.
+        # FV: prevent parent scroll (sizeHint)
+        try:
+            self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
+            self.setMinimumSize(0, 0)
+        except Exception:
+            pass
+
+
         # Settings persistence (requested):
         # Store all UI state in: <project_root>/presets/setsave/sdxl_inpaint_settings.json
         self._settings_path = inpaint_settings_path()
@@ -1396,6 +1407,9 @@ class SDXLInpaintPane(QWidget):
         self.chk_match_image = QCheckBox("Match size to loaded image")
         self.chk_match_image.setChecked(True)
 
+        self.chk_mix_mask_preview = QCheckBox("Mix image & mask in preview")
+        self.chk_mix_mask_preview.setChecked(False)
+
         self.cmb_device = QComboBox()
         self.cmb_device.addItems(["auto", "cuda", "cpu"])
 
@@ -1422,13 +1436,6 @@ class SDXLInpaintPane(QWidget):
 
         self.lbl_status = QLabel("Ready.")
         self.lbl_status.setWordWrap(True)
-
-        self.preview = QLabel()
-        self.preview.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.preview.setMinimumSize(320, 320)
-        self.preview.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
-        self.preview.setStyleSheet("background: #111; border: 1px solid #333;")
-        self.preview.setText("Output preview")
 
         self.btn_save_as = QPushButton("Save as…")
         self.btn_open_folder = QPushButton("Open folder")
@@ -1471,8 +1478,10 @@ class SDXLInpaintPane(QWidget):
 
         io.addWidget(self.chk_match_image, 3, 1, 1, 2)
 
-        io.addWidget(QLabel("Effective mask:"), 4, 0)
-        io.addWidget(self.mask_preview, 4, 1, 1, 2)
+        io.addWidget(self.chk_mix_mask_preview, 4, 1, 1, 2)
+
+        io.addWidget(QLabel("Effective mask:"), 5, 0)
+        io.addWidget(self.mask_preview, 5, 1, 1, 2)
 
         lf.addWidget(gb_io)
 
@@ -1511,13 +1520,25 @@ class SDXLInpaintPane(QWidget):
         # This avoids the "dead space" issue where a global QSS breaks QScrollBar geometry,
 
 
-        # and it also keeps the preview pane stable while you scroll controls.
+        # and it also keeps the footer stable while you scroll controls.
 
 
         left_scroll = QScrollArea()
 
 
         left_scroll.setWidgetResizable(True)
+
+        # Prevent the inner scroll area from advertising its full content height as a sizeHint.
+        # This stops the host (Tools tab) scroll container from scrolling the *entire* UI (including tabs).
+        try:
+            left_scroll.setSizeAdjustPolicy(QAbstractScrollArea.SizeAdjustPolicy.AdjustIgnored)
+        except Exception:
+            pass
+        try:
+            left_scroll.setMinimumHeight(0)
+        except Exception:
+            pass
+
 
 
         left_scroll.setFrameShape(QFrame.NoFrame)
@@ -1581,83 +1602,50 @@ class SDXLInpaintPane(QWidget):
 
 
 
-        header = QWidget()
-
-
-        hl = QVBoxLayout(header)
-
-
-        hl.setContentsMargins(8, 8, 8, 8)
-
-
-        hl.setSpacing(6)
-
-
-
-        btn_row = QHBoxLayout()
-
-
-        btn_row.setSpacing(8)
-
-
-        btn_row.addWidget(self.btn_run)
-
-
-        btn_row.addWidget(self.btn_cancel)
-
-
-        btn_row.addStretch(1)
-
-
-        btn_row.addWidget(self.btn_save_as)
-
-
-        btn_row.addWidget(self.btn_open_folder)
-
-
-        hl.addLayout(btn_row)
-
-
-        hl.addWidget(self.progress)
-
-
-        hl.addWidget(self.lbl_status)
-
-
-
-        layout.addWidget(header, 0)
-
-
-
-        # Output preview sits directly under the progress/log area,
-
-
-        # and above the Model section (requested).
-
-
-        try:
-
-
-            self.preview.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
-
-
-            self.preview.setMinimumHeight(260)
-
-
-            self.preview.setMaximumHeight(560)
-
-
-        except Exception:
-
-
-            pass
-
-
-        layout.addWidget(self.preview, 0)
 
 
 
         layout.addWidget(left_scroll, 1)
+        # --- Footer (action bar) — pinned at the bottom (does not scroll)
+        footer = QWidget(self)
+        footer.setObjectName("sdxl_inpaint_footer")
+        footer_v = QVBoxLayout(footer)
+        footer_v.setContentsMargins(8, 8, 8, 8)
+        footer_v.setSpacing(6)
+
+        sep = QFrame()
+        sep.setFrameShape(QFrame.Shape.HLine)
+        sep.setFrameShadow(QFrame.Shadow.Sunken)
+        footer_v.addWidget(sep)
+
+        footer_v.addWidget(self.progress)
+        footer_v.addWidget(self.lbl_status)
+
+        btn_row = QHBoxLayout()
+        btn_row.setSpacing(8)
+        btn_row.addWidget(self.btn_run)
+        btn_row.addWidget(self.btn_cancel)
+        btn_row.addStretch(1)
+        btn_row.addWidget(self.btn_save_as)
+        btn_row.addWidget(self.btn_open_folder)
+        footer_v.addLayout(btn_row)
+
+        layout.addWidget(footer, 0)
+
+
+        # Slightly larger UI font (requested)
+
+        try:
+            f = self.font()
+            if f.pixelSize() and f.pixelSize() > 0:
+                f.setPixelSize(f.pixelSize() + 3)
+            elif f.pointSize() and f.pointSize() > 0:
+                # ~3px-ish bump on typical DPI
+                f.setPointSize(f.pointSize() + 2)
+            self.setFont(f)
+        except Exception:
+            pass
+
 
         # --- Signals
         self.btn_refresh_models.clicked.connect(self.refresh_models)
@@ -1679,6 +1667,7 @@ class SDXLInpaintPane(QWidget):
         self.sp_w.valueChanged.connect(self._update_mask_preview)
         self.sp_h.valueChanged.connect(self._update_mask_preview)
         self.chk_match_image.toggled.connect(self._update_mask_preview)
+        self.chk_mix_mask_preview.toggled.connect(self._update_mask_preview)
 
         # Settings persistence hooks
         self.cmb_model.currentIndexChanged.connect(self._schedule_save)
@@ -1695,6 +1684,7 @@ class SDXLInpaintPane(QWidget):
         self.sp_h.valueChanged.connect(self._schedule_save)
 
         self.chk_match_image.toggled.connect(self._schedule_save)
+        self.chk_mix_mask_preview.toggled.connect(self._schedule_save)
         self.cmb_device.currentIndexChanged.connect(self._schedule_save)
         self.chk_cpu_offload.toggled.connect(self._schedule_save)
         self.chk_attention_slicing.toggled.connect(self._schedule_save)
@@ -1727,11 +1717,94 @@ class SDXLInpaintPane(QWidget):
         # Apply persisted settings AFTER the UI is fully constructed.
         QTimer.singleShot(0, self._apply_loaded_settings)
 
-    # -------------------------
     # UI events
     # -------------------------
 
     @Slot()
+    # -------------------------
+    # Host scroll isolation
+    # -------------------------
+    def _nearest_outer_scroll_area(self) -> Optional[QScrollArea]:
+        w = self.parentWidget()
+        while w is not None:
+            if isinstance(w, QScrollArea):
+                return w
+            w = w.parentWidget()
+        return None
+
+    def _outer_scroll_enable_passthrough(self, enable: bool):
+        """
+        This pane contains its own internal scroll. If the host wraps the entire tab stack in a QScrollArea
+        (widgetResizable=False), the whole app (including tab bars) can start scrolling when this pane is shown.
+        We temporarily force that nearest host scroll area to behave like a normal container, and restore on hide.
+        """
+        scroll = self._nearest_outer_scroll_area()
+        if scroll is None:
+            return
+
+        if enable:
+            # Snapshot once per-show so we can restore on hide.
+            if getattr(self, '_outer_scroll_prev', None) is None or self._outer_scroll_prev[0] is not scroll:
+                try:
+                    self._outer_scroll_prev = (
+                        scroll,
+                        bool(scroll.widgetResizable()),
+                        scroll.verticalScrollBarPolicy(),
+                        scroll.horizontalScrollBarPolicy(),
+                        scroll.frameShape(),
+                    )
+                except Exception:
+                    self._outer_scroll_prev = (scroll, False, Qt.ScrollBarPolicy.ScrollBarAsNeeded, Qt.ScrollBarPolicy.ScrollBarAsNeeded, QFrame.Shape.StyledPanel)
+
+            try:
+                scroll.setWidgetResizable(True)
+            except Exception:
+                pass
+            # Hide host scrollbars so only our internal scroll is used.
+            try:
+                scroll.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+                scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+            except Exception:
+                pass
+            try:
+                scroll.setFrameShape(QFrame.NoFrame)
+            except Exception:
+                pass
+        else:
+            prev = getattr(self, '_outer_scroll_prev', None)
+            if not prev:
+                return
+            try:
+                prev_scroll, widget_resizable, vpol, hpol, frame = prev
+                if prev_scroll is scroll:
+                    scroll.setWidgetResizable(widget_resizable)
+                    scroll.setVerticalScrollBarPolicy(vpol)
+                    scroll.setHorizontalScrollBarPolicy(hpol)
+                    scroll.setFrameShape(frame)
+            except Exception:
+                pass
+
+    def showEvent(self, event):
+        try:
+            super().showEvent(event)
+        except Exception:
+            pass
+        # Defer until parented + laid out.
+        try:
+            QTimer.singleShot(0, lambda: self._outer_scroll_enable_passthrough(True))
+        except Exception:
+            pass
+
+    def hideEvent(self, event):
+        try:
+            self._outer_scroll_enable_passthrough(False)
+        except Exception:
+            pass
+        try:
+            super().hideEvent(event)
+        except Exception:
+            pass
+
     def refresh_models(self):
         self._model_items = scan_inpaint_models()
         self.cmb_model.blockSignals(True)
@@ -1964,9 +2037,35 @@ class SDXLInpaintPane(QWidget):
         if self.btn_invert_mask.isChecked():
             mask_pil = ImageOps.invert(mask_pil)
 
-        # Render preview (show effective mask as grayscale)
-        qimg = qimage_from_pil(mask_pil.convert("RGB"))
+        # Render preview
+        preview_pil = mask_pil.convert("RGB")
+
+        # Optional: show the source image behind the mask, but keep ONLY the black mask parts visible.
+        # (white parts become "transparent" and reveal the image)
+        try:
+            if getattr(self, "chk_mix_mask_preview", None) is not None and self.chk_mix_mask_preview.isChecked():
+                ip = Path(self.ed_image.text().strip())
+                if ip.exists():
+                    img_pil = Image.open(ip).convert("RGB")
+                    # Match preview size
+                    if img_pil.size != (w, h):
+                        try:
+                            res_lanczos = Image.Resampling.LANCZOS  # Pillow>=9
+                        except Exception:
+                            res_lanczos = Image.LANCZOS  # type: ignore
+                        img_pil = img_pil.resize((w, h), resample=res_lanczos)
+
+                    # Build a binary mask where original BLACK pixels become opaque (255)
+                    mask_black = mask_pil.point(lambda v: 255 if v < 128 else 0)
+                    black = Image.new("RGB", (w, h), 0)
+                    preview_pil = Image.composite(black, img_pil, mask_black)
+        except Exception:
+            # Fall back to normal grayscale preview
+            preview_pil = mask_pil.convert("RGB")
+
+        qimg = qimage_from_pil(preview_pil)
         pix = QPixmap.fromImage(qimg)
+
         pix = pix.scaled(self.mask_preview.size(), Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation)
         self.mask_preview.setPixmap(pix)
         self.mask_preview.setText("")
@@ -2056,7 +2155,6 @@ class SDXLInpaintPane(QWidget):
 
         self.progress.setValue(0)
         self.lbl_status.setText("Starting…")
-        self.preview.setText("Running…")
         self._last_output_path = None
         self.btn_save_as.setEnabled(False)
         self.btn_open_folder.setEnabled(False)
@@ -2097,19 +2195,14 @@ class SDXLInpaintPane(QWidget):
             pil_image.save(fn)
             self._last_output_path = fn
             self.lbl_status.setText(f"Saved: {fn}")
-            qimg = qimage_from_pil(pil_image)
-            pix = QPixmap.fromImage(qimg)
-            self.preview.setPixmap(pix.scaled(self.preview.size(), Qt.AspectRatioMode.KeepAspectRatio,
-                                              Qt.TransformationMode.SmoothTransformation))
             self.btn_save_as.setEnabled(True)
             self.btn_open_folder.setEnabled(True)
         except Exception as e:
-            self._on_failed(f"Failed to save/display output:\n{e}")
+            self._on_failed(f"Failed to save output:\n{e}")
 
     @Slot(str)
     def _on_failed(self, err: str):
         self.progress.setValue(0)
-        self.preview.setText("Failed.")
         self.lbl_status.setText("Failed.")
         QMessageBox.critical(self, "SDXL Inpaint failed", err)
 
@@ -2206,6 +2299,7 @@ class SDXLInpaintPane(QWidget):
             "width": int(self.sp_w.value()),
             "height": int(self.sp_h.value()),
             "match_image": bool(self.chk_match_image.isChecked()),
+            "mix_mask_preview": bool(self.chk_mix_mask_preview.isChecked()),
             "invert_mask": bool(self.btn_invert_mask.isChecked()),
 
             # Runtime options
@@ -2345,6 +2439,11 @@ class SDXLInpaintPane(QWidget):
 
             try:
                 self.chk_match_image.setChecked(bool(s.get("match_image", True)))
+            except Exception:
+                pass
+
+            try:
+                self.chk_mix_mask_preview.setChecked(bool(s.get("mix_mask_preview", False)))
             except Exception:
                 pass
 

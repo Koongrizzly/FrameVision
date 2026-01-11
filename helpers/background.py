@@ -705,9 +705,8 @@ class BgRemovePane(QtWidgets.QWidget):
         main.setContentsMargins(8, 8, 8, 8)
         main.setSpacing(8)
 
-        # Top bar (two lines)
-        # Line 1: Open/Run + Fit
-        # Line 2: Save actions (and optional injected "View results")
+        # Top bar
+        # (Mode + Save actions. The main Open/Run button row is docked at the bottom.)
         top_box = QtWidgets.QWidget()
         top_v = QtWidgets.QVBoxLayout(top_box)
         top_v.setContentsMargins(0, 0, 0, 0)
@@ -816,7 +815,6 @@ class BgRemovePane(QtWidgets.QWidget):
         row2.addWidget(self.cmb_mask_export)
         row2.addWidget(self.btn_save_mask)
 
-        top_v.addLayout(row1)
         top_v.addLayout(row_mode)
         top_v.addLayout(row2)
         main.addWidget(top_box)
@@ -836,15 +834,15 @@ class BgRemovePane(QtWidgets.QWidget):
         pv.setContentsMargins(0, 0, 0, 0)
         pv.setSpacing(6)
 
-        titles = QtWidgets.QHBoxLayout()
-        self.lbl_left = QtWidgets.QLabel("Original")
-        self.lbl_right = QtWidgets.QLabel("Result")
-        self.lbl_left.setStyleSheet("font-weight: 600;")
-        self.lbl_right.setStyleSheet("font-weight: 600;")
-        titles.addWidget(self.lbl_left)
-        titles.addStretch(1)
-        titles.addWidget(self.lbl_right)
-        pv.addLayout(titles)
+ #       titles = QtWidgets.QHBoxLayout()
+  #      self.lbl_left = QtWidgets.QLabel("Original")
+   #     self.lbl_right = QtWidgets.QLabel("Result")
+    #    self.lbl_left.setStyleSheet("font-weight: 600;")
+     #   self.lbl_right.setStyleSheet("font-weight: 600;")
+ #       titles.addWidget(self.lbl_left)
+  #      titles.addStretch(1)
+   #     titles.addWidget(self.lbl_right)
+    #    pv.addLayout(titles)
 
         zoom_row = QtWidgets.QHBoxLayout()
         zoom_row.setSpacing(6)
@@ -987,6 +985,20 @@ class BgRemovePane(QtWidgets.QWidget):
         self.lbl_status = QtWidgets.QLabel("")
         self.lbl_status.setStyleSheet("color: #888;")
         main.addWidget(self.lbl_status)
+
+        # Bottom dock: main action buttons (kept fixed while settings scroll).
+        sep = QtWidgets.QFrame()
+        sep.setFrameShape(QtWidgets.QFrame.HLine)
+        sep.setFrameShadow(QtWidgets.QFrame.Sunken)
+        main.addWidget(sep)
+
+        bottom_box = QtWidgets.QWidget()
+        bottom_box.setObjectName("BgRemoveBottomBar")
+        bottom_box.setLayout(row1)
+        main.addWidget(bottom_box)
+
+        # Expose the bottom bar widget too (useful for host apps).
+        self._bottom_bar = bottom_box
 
         self._pix_a: Optional[QtWidgets.QGraphicsPixmapItem] = None
         self._pix_b: Optional[QtWidgets.QGraphicsPixmapItem] = None
@@ -2594,11 +2606,59 @@ def _create_sdxl_inpaint_pane(parent=None):
     return w
 
 
+def _create_qwen2511_pane(parent=None):
+    """Best-effort: create the Qwen2511Pane widget.
+
+    We try a few import paths so this works both when running inside FrameVision
+    (helpers.* package) and when running this file standalone.
+    """
+    try:
+        from PySide6 import QtWidgets as _QtW  # type: ignore
+    except Exception:
+        return None
+
+    import importlib
+
+    candidates = (
+        "helpers.qwen2511",  # expected
+        "qwen2511",          # standalone / direct import
+    )
+
+    last_err = None
+    for mod_name in candidates:
+        try:
+            mod = importlib.import_module(mod_name)
+            Pane = getattr(mod, "Qwen2511Pane", None)
+            if Pane is None:
+                continue
+            return Pane(parent)
+        except Exception as e:
+            last_err = e
+            continue
+
+    # Placeholder pane if file isn't available in this build.
+    w = _QtW.QWidget(parent)
+    lay = _QtW.QVBoxLayout(w)
+    lay.setContentsMargins(12, 12, 12, 12)
+    lay.setSpacing(8)
+    lbl = _QtW.QLabel(
+        "Qwen 2511 Image Edit tab unavailable.\n"
+        "Missing qwen2511.py or an import failed.\n\n"
+        f"Last error: {last_err}"
+    )
+    lbl.setWordWrap(True)
+    lbl.setStyleSheet("color:#888;")
+    lay.addWidget(lbl)
+    lay.addStretch(1)
+    return w
+
+
 def install_background_tool(pane, section_widget) -> None:
     """Tools-tab entry point expected by helpers.tools_tab.
 
     Adds a tab UI so you can quickly switch between:
       - Removal (ONNX background remover)
+      - Qwen 2511 Image Edit
       - Inpaint (SDXL inpaint pane)
     """
     try:
@@ -2637,14 +2697,20 @@ def install_background_tool(pane, section_widget) -> None:
     tabs.setObjectName("BackgroundToolTabs")
 
     bg_pane = BgRemovePane(tabs)
+    qwen_pane = _create_qwen2511_pane(tabs)
     inpaint_pane = _create_sdxl_inpaint_pane(tabs)
 
-    tabs.addTab(bg_pane, "Removal")
+    tabs.addTab(bg_pane, "Background Removal")
+    if qwen_pane is not None:
+        tabs.addTab(qwen_pane, "Qwen 2511 Image Edit")
+    else:
+        tabs.addTab(_QtW.QLabel("Qwen 2511 tab unavailable (PySide6 not loaded)."), "Qwen 2511")
     if inpaint_pane is not None:
-        tabs.addTab(inpaint_pane, "Inpaint")
+        tabs.addTab(inpaint_pane, "SDXL (Low Vram) Inpainter")
     else:
         # Should not happen, but keep tool usable.
         tabs.addTab(_QtW.QLabel("Inpaint tab unavailable (PySide6 not loaded)."), "Inpaint")
+
 
     # Inject "Use current" + "View results" buttons into the removal pane's top bar.
     btn_use_current = _QtW.QPushButton("Use current")

@@ -32,7 +32,7 @@ from PySide6.QtGui import QImage, QTextCursor
 APP_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 DEFAULT_SDCLI = os.path.join(APP_ROOT, ".qwen2512", "bin", "sd-cli.exe")
 
-SETSAVE_PATH = os.path.join(APP_ROOT, "presets", "setsave", "qwen2511.hson")
+SETSAVE_PATH = os.path.join(APP_ROOT, "presets", "setsave", "qwen2511.json")
 DOWNLOAD_SCRIPT = os.path.join(APP_ROOT, "presets", "extra_env", "qwen2511_download.py")
 
 MODELS_ROOT = os.path.join(APP_ROOT, "models", "qwen2511gguf")
@@ -445,6 +445,10 @@ class Qwen2511Pane(QtWidgets.QWidget):
         self._proc_buf: str = ""
         self._proc_expected_out: Optional[str] = None
 
+        # Lightweight toast notifications (non-blocking).
+        self._toast_label: Optional[QtWidgets.QLabel] = None
+        self._toast_timer: Optional[QtCore.QTimer] = None
+
         self._append_log(self._caps_summary())
         self._append_log(
             "\nWhy you got a different woman + blurry output:\n"
@@ -477,6 +481,101 @@ class Qwen2511Pane(QtWidgets.QWidget):
         if hasattr(self, "log") and self.log is not None:
             self.log.clear()
 
+
+    def _toast(self, message: str, msec: int = 2000) -> None:
+        """Show a non-blocking toast notification (best-effort).
+
+        Priority:
+          1) If the FrameVision host provides a toast API, use that.
+          2) Otherwise, render a small in-window overlay label that auto-hides.
+        """
+        msg = (message or "").strip()
+        if not msg:
+            return
+
+        # 1) Use host app toast helper if available.
+        host = None
+        try:
+            host = getattr(self, "main", None)
+        except Exception:
+            host = None
+        if host is None:
+            try:
+                host = self.window()
+            except Exception:
+                host = None
+
+        if host is not None:
+            for attr in ("toast", "show_toast", "notify_toast", "toast_message", "notify"):
+                if hasattr(host, attr):
+                    fn = getattr(host, attr, None)
+                    if callable(fn):
+                        try:
+                            fn(msg)
+                            return
+                        except TypeError:
+                            try:
+                                fn(msg, msec)
+                                return
+                            except Exception:
+                                pass
+                        except Exception:
+                            pass
+
+        # 2) Fallback: overlay label inside the current top-level window.
+        try:
+            win = self.window()
+            if win is None:
+                return
+
+            if self._toast_label is None:
+                lbl = QtWidgets.QLabel(win)
+                lbl.setObjectName("toastLabel")
+                lbl.setWordWrap(True)
+                lbl.setAlignment(QtCore.Qt.AlignLeft | QtCore.Qt.AlignVCenter)
+                lbl.setStyleSheet(
+                    "QLabel#toastLabel {"
+                    "background: rgba(30, 30, 30, 210);"
+                    "color: white;"
+                    "padding: 8px 10px;"
+                    "border-radius: 10px;"
+                    "}"
+                )
+                lbl.setAttribute(QtCore.Qt.WA_TransparentForMouseEvents, True)
+                lbl.hide()
+                self._toast_label = lbl
+
+            if self._toast_timer is None:
+                t = QtCore.QTimer(self)
+                t.setSingleShot(True)
+                t.timeout.connect(lambda: self._toast_label.hide() if self._toast_label else None)
+                self._toast_timer = t
+
+            self._toast_label.setText(msg)
+            self._toast_label.adjustSize()
+
+            margin = 14
+            w = win.width()
+            h = win.height()
+            tw = self._toast_label.width()
+            th = self._toast_label.height()
+            x = max(margin, w - tw - margin)
+            y = max(margin, h - th - margin)
+            self._toast_label.move(x, y)
+            self._toast_label.raise_()
+            self._toast_label.show()
+
+            try:
+                self._toast_timer.stop()
+            except Exception:
+                pass
+            self._toast_timer.start(max(500, int(msec)))
+        except Exception:
+            # Last resort: write it to the log.
+            try:
+                self._append_log("\n" + msg)
+            except Exception:
+                pass
 
     def _open_results_folder(self):
         """Open Qwen2511 output folder in the app Media Explorer (no OS Explorer button)."""
@@ -638,17 +737,14 @@ class Qwen2511Pane(QtWidgets.QWidget):
         )
 
     def _build_ui(self):
-        # Responsive layout:
-        # - Scroll area for all controls (prevents overlap on small windows)
-        # - Vertical splitter between controls and the log (lets the log grow/shrink)
+        # Layout goals:
+        # - Main controls + log live INSIDE the scroll area (so they scroll normally).
+        # - Action buttons stick at the bottom (always visible, do not scroll).
         outer = QtWidgets.QVBoxLayout(self)
         outer.setContentsMargins(0, 0, 0, 0)
         outer.setSpacing(0)
 
-        split = QtWidgets.QSplitter(QtCore.Qt.Vertical)
-        split.setChildrenCollapsible(False)
-        outer.addWidget(split, 1)
-
+        # Scroll area for the whole pane content (except the sticky bottom buttons bar).
         scroll = QtWidgets.QScrollArea()
         scroll.setToolTip("Scroll to access all settings on smaller screens.")
         scroll.setWidgetResizable(True)
@@ -656,6 +752,7 @@ class Qwen2511Pane(QtWidgets.QWidget):
         scroll.setVerticalScrollBarPolicy(QtCore.Qt.ScrollBarAsNeeded)
         scroll.setFrameShape(QtWidgets.QFrame.NoFrame)
         scroll.setSizePolicy(QtWidgets.QSizePolicy.Expanding, QtWidgets.QSizePolicy.Expanding)
+        outer.addWidget(scroll, 1)
 
         content = QtWidgets.QWidget()
         scroll.setWidget(content)
@@ -665,14 +762,13 @@ class Qwen2511Pane(QtWidgets.QWidget):
         layout.setSpacing(10)
         layout.setSizeConstraint(QtWidgets.QLayout.SetMinimumSize)
 
-        split.addWidget(scroll)
-
         title = QtWidgets.QLabel("Qwen Image Edit 2511 (GGUF)")
         f = title.font()
         f.setPointSize(max(10, f.pointSize() + 3))
         f.setBold(True)
         title.setFont(f)
         layout.addWidget(title)
+
         # Models (collapsible)
         self.g_models = QtWidgets.QGroupBox("Models")
         self.g_models.setToolTip("Select the GGUF / VAE files used by sd-cli. Collapse this box if you want a cleaner UI.")
@@ -712,8 +808,27 @@ class Qwen2511Pane(QtWidgets.QWidget):
         ml.addRow("VAE", self.cb_vae)
 
         mv.addWidget(self.models_content)
-        layout.addWidget(self.g_models)
 
+        # Models actions (kept inside the Models section)
+        self.models_buttons = QtWidgets.QWidget()
+        mb = QtWidgets.QHBoxLayout(self.models_buttons)
+        mb.setContentsMargins(0, 6, 0, 0)
+        mb.setSpacing(6)
+
+        self.btn_download = QtWidgets.QPushButton("Download models")
+        self.btn_download.setToolTip("Downloads the required Qwen2511 GGUF files into the models folder.")
+        self.btn_reload = QtWidgets.QPushButton("Reload models list")
+        self.btn_reload.setToolTip("Rescans the models folders and refreshes the dropdowns.")
+
+        self.btn_download.clicked.connect(self._run_downloader)
+        self.btn_reload.clicked.connect(self._reload_model_lists)
+
+        mb.addWidget(self.btn_download)
+        mb.addWidget(self.btn_reload)
+        mb.addStretch(1)
+
+        mv.addWidget(self.models_buttons)
+        layout.addWidget(self.g_models)
 
         # Paths (collapsible)
         self.g_paths = QtWidgets.QGroupBox("Paths")
@@ -797,10 +912,10 @@ class Qwen2511Pane(QtWidgets.QWidget):
         g_prompt.setToolTip("Your edit instruction and an optional negative prompt.")
         pl = QtWidgets.QVBoxLayout(g_prompt)
         self.ed_prompt = QtWidgets.QPlainTextEdit()
-        self.ed_prompt.setToolTip("What should change? Be explicit: \'keep everything the same, only…\'. For best results: use a mask + lower Strength.")
+        self.ed_prompt.setToolTip("What should change? Be explicit: 'keep everything the same, only…'. For best results: use a mask + lower Strength.")
         self.ed_prompt.setPlaceholderText("Describe the edit… (example: keep everything the same, only change dress color to red)")
         self.ed_neg = QtWidgets.QLineEdit(); self.ed_neg.setPlaceholderText("Negative prompt (optional)")
-        self.ed_neg.setToolTip("Optional: things you do NOT want. Keep short and practical (e.g., \'blurry, extra fingers\').")
+        self.ed_neg.setToolTip("Optional: things you do NOT want. Keep short and practical (e.g., 'blurry, extra fingers').")
         pl.addWidget(self.ed_prompt, 1)
         pl.addWidget(self.ed_neg)
         layout.addWidget(g_prompt, 2)
@@ -817,7 +932,6 @@ class Qwen2511Pane(QtWidgets.QWidget):
         self.sp_cfg = QtWidgets.QDoubleSpinBox(); self.sp_cfg.setRange(0.0, 30.0); self.sp_cfg.setDecimals(2); self.sp_cfg.setSingleStep(0.25); self.sp_cfg.setValue(4.5)
         self.sp_cfg.setToolTip("Text guidance scale (CFG). Higher follows the prompt more, but can drift away from the source image.")
 
-
         self.sp_seed = QtWidgets.QSpinBox(); self.sp_seed.setRange(-1, 2**31 - 1); self.sp_seed.setValue(-1)
         self.lbl_strength = QtWidgets.QLabel("1.00 (locked)")
         self.lbl_strength.setToolTip("Strength is locked to 1.00 because lower values frequently ignore the ref image and collapse the edit. If you want a lighter touch edit, use masks / inpaint or lower CFG/steps instead.")
@@ -828,7 +942,6 @@ class Qwen2511Pane(QtWidgets.QWidget):
         self.sp_h = QtWidgets.QSpinBox(); self.sp_h.setRange(64, 4096); self.sp_h.setSingleStep(64); self.sp_h.setValue(576)
         self.sp_h.setToolTip("Output height (multiple of 64). Keep aspect similar to input to avoid crop.")
 
-
         self.cb_sampling = QtWidgets.QComboBox()
         self.cb_sampling.setToolTip("Sampler / sampling method. If results look unstable, try euler or heun.")
         self.cb_sampling.addItems(["euler","euler_a","heun","dpm2","dpm++2s_a","dpm++2m","dpm++2mv2","ipndm","ipndm_v","lcm","ddim_trailing","tcd"])
@@ -836,7 +949,6 @@ class Qwen2511Pane(QtWidgets.QWidget):
 
         # Aspect helper
         self.chk_auto_aspect = QtWidgets.QCheckBox("Auto size from input aspect")
-        self.chk_auto_aspect.setToolTip("Automatically matches Width/Height to the input image aspect ratio (snapped to 64).")
         self.chk_auto_aspect.setToolTip("Prevents square-crop. Uses the input image aspect ratio and snaps to multiples of 64.")
         self.cb_base = QtWidgets.QComboBox()
         self.cb_base.setToolTip("Base size used by Auto size helper. Larger base = larger output (and more VRAM/time).")
@@ -934,26 +1046,60 @@ class Qwen2511Pane(QtWidgets.QWidget):
 
         layout.addWidget(g_set)
 
-        # Buttons (2-row layout so it stays usable on narrow windows)
-        btn_v = QtWidgets.QVBoxLayout()
-        btn_v.setContentsMargins(0, 0, 0, 0)
-        btn_v.setSpacing(6)
+        # Log (collapsible) – inside the scroll area, above the sticky buttons.
+        self.g_log = QtWidgets.QGroupBox("Log")
+        self.g_log.setToolTip("Process log (newest messages appear at the top). Collapse this box for a cleaner UI.")
+        self.g_log.setCheckable(True)
+        self.g_log.setChecked(True)
+        self.g_log.toggled.connect(self._on_log_toggled_slot)
+
+        lv = QtWidgets.QVBoxLayout(self.g_log)
+        lv.setContentsMargins(8, 8, 8, 8)
+
+        self.log_content = QtWidgets.QWidget()
+        lcl = QtWidgets.QVBoxLayout(self.log_content)
+        lcl.setContentsMargins(0, 0, 0, 0)
+        lcl.setSpacing(6)
+
+        self.log = QtWidgets.QPlainTextEdit()
+        self.log.setToolTip("Process log (newest messages appear at the top). If something fails, copy the top section into a bug report.")
+        self.log.setReadOnly(True)
+        self.log.setMaximumBlockCount(8000)
+        self.log.setMinimumHeight(220)
+        # Keep the log from consuming the entire scroll area (it has its own scrollbar).
+        self.log.setSizePolicy(QtWidgets.QSizePolicy.Expanding, QtWidgets.QSizePolicy.Fixed)
+
+        lcl.addWidget(self.log)
+        lv.addWidget(self.log_content)
+        layout.addWidget(self.g_log)
+
+        # A bit of padding at the bottom so the last controls aren't hidden by the sticky bar.
+        layout.addSpacing(8)
+
+        # Sticky bottom buttons bar (always visible, does not scroll).
+        self.button_bar = QtWidgets.QWidget()
+        outer.addWidget(self.button_bar, 0)
+
+        bar = QtWidgets.QVBoxLayout(self.button_bar)
+        bar.setContentsMargins(12, 8, 12, 12)
+        bar.setSpacing(6)
 
         top_row = QtWidgets.QHBoxLayout()
         bottom_row = QtWidgets.QHBoxLayout()
 
-        self.btn_download = QtWidgets.QPushButton("Download models")
-        self.btn_download.setToolTip("Downloads the required Qwen2511 GGUF files into the models folder.")
-        self.btn_reload = QtWidgets.QPushButton("Reload models list")
-        self.btn_reload.setToolTip("Rescans the models folders and refreshes the dropdowns.")
         self.btn_view_results = QtWidgets.QPushButton("View results")
         self.btn_view_results.setToolTip("Open output/qwen2511 in Media Explorer.")
         self.btn_play_last = QtWidgets.QPushButton("Play last result")
         self.btn_play_last.setToolTip("Plays the newest file in output/qwen2511 using the internal media player.")
-        self.chk_auto_show_results = QtWidgets.QCheckBox("Auto show results after run")
-        self.chk_auto_show_results.setToolTip("When enabled, automatically opens Media Explorer on output/qwen2511 after a successful run.")
+        self.chk_auto_show_results = QtWidgets.QCheckBox("Auto play result after run")
+        self.chk_auto_show_results.setToolTip("When enabled, automatically plays the produced file in the internal media player after a successful run (same as \"Play last result\").")
+        self.chk_use_queue = QtWidgets.QCheckBox("Use queue")
+        self.chk_use_queue.setToolTip("When enabled, clicking Run will add this job to the Queue instead of running sd-cli immediately.")
+        self.chk_use_queue.toggled.connect(self._on_use_queue_toggled)
+
+
         self.btn_clear_log = QtWidgets.QPushButton("Clear log")
-        self.btn_clear_log.setToolTip("Clears the log output below (new messages will still appear at the top).")
+        self.btn_clear_log.setToolTip("Clears the log output (new messages will still appear at the top).")
         self.btn_save = QtWidgets.QPushButton("Save settings")
         self.btn_save.setToolTip("Saves all current settings to the preset file so they persist after restart.")
         self.btn_run = QtWidgets.QPushButton("Run sd-cli")
@@ -962,8 +1108,6 @@ class Qwen2511Pane(QtWidgets.QWidget):
         self.btn_cancel.setToolTip("Stops the currently running process (downloader or sd-cli).")
         self.btn_cancel.setEnabled(False)
 
-        self.btn_download.clicked.connect(self._run_downloader)
-        self.btn_reload.clicked.connect(self._reload_model_lists)
         self.btn_view_results.clicked.connect(self._open_results_folder)
         self.btn_play_last.clicked.connect(self._play_last_result)
         self.btn_clear_log.clicked.connect(self._clear_log)
@@ -971,8 +1115,6 @@ class Qwen2511Pane(QtWidgets.QWidget):
         self.btn_run.clicked.connect(self._run_sdcli)
         self.btn_cancel.clicked.connect(self._cancel_running_process)
 
-        top_row.addWidget(self.btn_download)
-        top_row.addWidget(self.btn_reload)
         top_row.addWidget(self.btn_view_results)
         top_row.addWidget(self.btn_play_last)
         top_row.addWidget(self.chk_auto_show_results)
@@ -981,29 +1123,12 @@ class Qwen2511Pane(QtWidgets.QWidget):
         bottom_row.addWidget(self.btn_clear_log)
         bottom_row.addWidget(self.btn_save)
         bottom_row.addStretch(1)
+        bottom_row.addWidget(self.chk_use_queue)
         bottom_row.addWidget(self.btn_run)
         bottom_row.addWidget(self.btn_cancel)
 
-        btn_v.addLayout(top_row)
-        btn_v.addLayout(bottom_row)
-        layout.addLayout(btn_v)
-
-        # Log (kept separate from the scroll area so it stays reachable)
-        self.log = QtWidgets.QPlainTextEdit()
-        self.log.setToolTip("Process log (newest messages appear at the top). If something fails, copy the top section into a bug report.")
-        self.log.setReadOnly(True)
-        self.log.setMaximumBlockCount(8000)
-        self.log.setMinimumHeight(180)
-        self.log.setSizePolicy(QtWidgets.QSizePolicy.Expanding, QtWidgets.QSizePolicy.Expanding)
-        split.addWidget(self.log)
-
-        # Give the controls more space by default, but let the user resize via the splitter.
-        try:
-            split.setStretchFactor(0, 3)
-            split.setStretchFactor(1, 1)
-            split.setSizes([750, 250])
-        except Exception:
-            pass
+        bar.addLayout(top_row)
+        bar.addLayout(bottom_row)
 
     def _on_models_toggled_slot(self, checked: bool):
         self._on_models_toggled(bool(checked), persist=True)
@@ -1013,6 +1138,8 @@ class Qwen2511Pane(QtWidgets.QWidget):
         try:
             if hasattr(self, "models_content") and self.models_content is not None:
                 self.models_content.setVisible(bool(checked))
+            if hasattr(self, "models_buttons") and self.models_buttons is not None:
+                self.models_buttons.setVisible(bool(checked))
         except Exception:
             pass
 
@@ -1058,6 +1185,25 @@ class Qwen2511Pane(QtWidgets.QWidget):
 
         try:
             self._settings["advanced_box_open"] = bool(checked)
+            if persist:
+                _write_json(SETSAVE_PATH, self._settings)
+        except Exception:
+            pass
+
+
+    def _on_log_toggled_slot(self, checked: bool):
+        self._on_log_toggled(bool(checked), persist=True)
+
+    def _on_log_toggled(self, checked: bool, persist: bool = False):
+        # Collapse/expand the Log group and persist the open/close state.
+        try:
+            if hasattr(self, "log_content") and self.log_content is not None:
+                self.log_content.setVisible(bool(checked))
+        except Exception:
+            pass
+
+        try:
+            self._settings["log_box_open"] = bool(checked)
             if persist:
                 _write_json(SETSAVE_PATH, self._settings)
         except Exception:
@@ -1147,6 +1293,7 @@ class Qwen2511Pane(QtWidgets.QWidget):
         self._settings.setdefault("models_box_open", True)
         self._settings.setdefault("paths_box_open", True)
         self._settings.setdefault("advanced_box_open", False)
+        self._settings.setdefault("log_box_open", True)
         self._settings.setdefault("last_init_img", "")
         self._settings.setdefault("last_mask_img", "")
         self._settings.setdefault("invert_mask", False)
@@ -1171,6 +1318,7 @@ class Qwen2511Pane(QtWidgets.QWidget):
         self._settings.setdefault("auto_aspect", True)
         self._settings.setdefault("auto_aspect_base", 1024)
         self._settings.setdefault("auto_show_results", False)
+        self._settings.setdefault("use_queue", False)
 
         # low-vram defaults
         self._settings.setdefault("vae_tiling", True)
@@ -1217,6 +1365,17 @@ class Qwen2511Pane(QtWidgets.QWidget):
                 pass
             self._on_adv_toggled(adv_checked, persist=False)
 
+
+        log_checked = bool(s.get("log_box_open", True))
+        if hasattr(self, "g_log") and self.g_log is not None:
+            try:
+                self.g_log.blockSignals(True)
+                self.g_log.setChecked(log_checked)
+                self.g_log.blockSignals(False)
+            except Exception:
+                pass
+            self._on_log_toggled(log_checked, persist=False)
+
         self.ed_sdcli.setText(s.get("sdcli_path", DEFAULT_SDCLI))
         self.ed_initimg.setText(s.get("last_init_img", ""))
         self._update_imginfo(self.ed_initimg.text().strip())
@@ -1245,6 +1404,16 @@ class Qwen2511Pane(QtWidgets.QWidget):
                 self.chk_auto_show_results.setChecked(bool(s.get("auto_show_results", False)))
             except Exception:
                 pass
+        if hasattr(self, "chk_use_queue"):
+            try:
+                self.chk_use_queue.setChecked(bool(s.get("use_queue", False)))
+            except Exception:
+                pass
+            try:
+                self._on_use_queue_toggled(bool(self.chk_use_queue.isChecked()))
+            except Exception:
+                pass
+        
         base = int(s.get("auto_aspect_base", 1024))
         self.cb_base.setCurrentText(str(base))
 
@@ -1276,6 +1445,7 @@ class Qwen2511Pane(QtWidgets.QWidget):
             "models_box_open": bool(getattr(self, "g_models", None).isChecked() if getattr(self, "g_models", None) is not None else True),
             "paths_box_open": bool(getattr(self, "g_paths", None).isChecked() if getattr(self, "g_paths", None) is not None else True),
             "advanced_box_open": bool(getattr(self, "g_adv", None).isChecked() if getattr(self, "g_adv", None) is not None else False),
+            "log_box_open": bool(getattr(self, "g_log", None).isChecked() if getattr(self, "g_log", None) is not None else True),
             "last_init_img": self.ed_initimg.text().strip(),
             "last_mask_img": self.ed_mask.text().strip(),
             "invert_mask": bool(self.chk_invert_mask.isChecked()),
@@ -1314,6 +1484,27 @@ class Qwen2511Pane(QtWidgets.QWidget):
         self._append_log(f"\nSaved settings -> {SETSAVE_PATH}")
 
 
+
+    def _on_use_queue_toggled(self, checked: bool):
+        # Update Run button label/tooltip based on queue mode.
+        try:
+            useq = bool(checked)
+        except Exception:
+            useq = False
+        try:
+            self._settings["use_queue"] = useq
+        except Exception:
+            pass
+        try:
+            if useq:
+                self.btn_run.setText("Add to queue")
+                self.btn_run.setToolTip("Adds this Qwen2511 image edit job to the Queue (jobs/pending) to be processed by the worker.")
+            else:
+                self.btn_run.setText("Run sd-cli")
+                self.btn_run.setToolTip("Runs sd-cli with the current settings. Output will be saved to output/qwen2511/.")
+        except Exception:
+            pass
+
     def _set_ui_busy(self, busy: bool, label: str = ""):
         # Disable controls while a process runs so we don't start multiple heavy jobs at once.
         self.btn_run.setEnabled(not busy)
@@ -1321,6 +1512,10 @@ class Qwen2511Pane(QtWidgets.QWidget):
         self.btn_reload.setEnabled(not busy)
         self.btn_save.setEnabled(not busy)
         self.btn_cancel.setEnabled(busy)
+        try:
+            self.chk_use_queue.setEnabled(not busy)
+        except Exception:
+            pass
 
         if busy:
             self._append_log(f"\n[{label}] started…")
@@ -1393,10 +1588,12 @@ class Qwen2511Pane(QtWidgets.QWidget):
                     self._last_out_file = out_file
                 except Exception:
                     pass
-                # Optional: auto-open Media Explorer to show outputs.
+                # Optional: auto-play result after run.
                 try:
                     if hasattr(self, "chk_auto_show_results") and self.chk_auto_show_results.isChecked():
-                        self._open_results_folder()
+                        ok = self._play_file_in_main_player(out_file)
+                        if not ok:
+                            self._append_log("Auto play result: internal Media Player host not available.")
                 except Exception:
                     pass
             else:
@@ -1460,6 +1657,40 @@ class Qwen2511Pane(QtWidgets.QWidget):
             return
 
         sdcli = self.ed_sdcli.text().strip()
+        # Queue mode: add a job to the app queue instead of running sd-cli inline.
+        try:
+            if hasattr(self, "chk_use_queue") and self.chk_use_queue.isChecked():
+                try:
+                    try:
+                        from helpers.queue_adapter import enqueue_qwen2511_from_widget as _enq
+                    except Exception:
+                        from queue_adapter import enqueue_qwen2511_from_widget as _enq
+                    jid = _enq(self)
+                    try:
+                        self._toast(f"Job queued to jobs/pending: {jid}")
+                    except Exception:
+                        pass
+                    # Switch to Queue tab (best-effort)
+                    try:
+                        win = self.window()
+                        tabs = win.findChild(QtWidgets.QTabWidget)
+                        if tabs:
+                            for i in range(tabs.count()):
+                                if tabs.tabText(i).strip().lower() == "queue":
+                                    tabs.setCurrentIndex(i)
+                                    break
+                    except Exception:
+                        pass
+                except Exception as e:
+                    try:
+                        self._toast(f"Queue error: {e}", msec=3500)
+                    except Exception:
+                        self._append_log("\nQueue error: " + str(e))
+                return
+        except Exception:
+            pass
+
+
         init_img = self.ed_initimg.text().strip()
         mask_img = self.ed_mask.text().strip()
 
@@ -1549,7 +1780,6 @@ class Qwen2511Pane(QtWidgets.QWidget):
 
         self._append_log("\nRunning sd-cli:\n" + " ".join(shlex.quote(x) for x in cmd))
         self._start_process(program=cmd[0], args=cmd[1:], kind="sd-cli", expected_out=out_file)
-
 
 
 def _standalone_main():

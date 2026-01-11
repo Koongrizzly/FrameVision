@@ -3371,6 +3371,189 @@ def wan22_generate(job, cfg, mani):
     return code
 
 
+
+def qwen2511_image_edit(job, cfg, mani):
+    """Run a Qwen2511 (stable-diffusion.cpp sd-cli) image edit job via the queue.
+
+    This builds an sd-cli command using helpers.qwen2511.build_sdcli_cmd and executes it
+    through tools_ffmpeg so we reuse streaming + cancel + progress handling.
+    """
+    import os
+    import time as _time
+    from pathlib import Path as _P
+
+    args = job.get("args", {}) or {}
+
+    # Resolve output dir
+    try:
+        out_dir = job.get("out_dir") or str((ROOT / "output" / "qwen2511"))
+    except Exception:
+        out_dir = str(_P(".").resolve() / "output" / "qwen2511")
+    try:
+        _P(out_dir).mkdir(parents=True, exist_ok=True)
+    except Exception:
+        pass
+
+    # Input image
+    init_img = args.get("init_img") or job.get("input") or ""
+    init_img = str(init_img).strip()
+    if not init_img or not _P(init_img).is_file():
+        _mark_error(job, "Qwen2511: input image missing or not found.")
+        return 2
+
+    # Mask
+    mask_img = str(args.get("mask_img") or args.get("mask") or "").strip()
+    invert_mask = bool(args.get("invert_mask") or False)
+
+    # Invert mask in the worker (no Qt dependency)
+    if mask_img and invert_mask and _P(mask_img).is_file():
+        try:
+            from PIL import Image, ImageOps
+            im = Image.open(mask_img)
+            # force grayscale
+            im = im.convert("L")
+            im = ImageOps.invert(im)
+            tmp = _P(out_dir) / f"_mask_inverted_{job.get('id','job')}_{int(_time.time())}.png"
+            im.save(tmp)
+            mask_img = str(tmp)
+            try:
+                args["mask_img_inverted"] = mask_img
+            except Exception:
+                pass
+        except Exception:
+            # If inversion fails, continue with original mask
+            pass
+
+    # Reference images
+    ref_images = []
+    try:
+        ref_images = args.get("ref_images") or []
+        if isinstance(ref_images, str):
+            ref_images = [ref_images]
+        ref_images = [str(x).strip() for x in ref_images if str(x).strip()]
+    except Exception:
+        ref_images = []
+    # allow legacy keys
+    for k in ("ref_img_2", "ref_img_3", "ref_img_4"):
+        try:
+            p = str(args.get(k) or "").strip()
+        except Exception:
+            p = ""
+        if p:
+            ref_images.append(p)
+
+    # sd-cli path
+    sdcli_path = str(args.get("sdcli_path") or args.get("sdcli") or "").strip()
+    if not sdcli_path:
+        try:
+            sdcli_path = str((ROOT / ".qwen2512" / "bin" / "sd-cli.exe"))
+        except Exception:
+            sdcli_path = "sd-cli.exe"
+
+    # Output file
+    out_file = str(args.get("out_file") or args.get("outfile") or "").strip()
+    if not out_file:
+        out_file = str(_P(out_dir) / f"qwen_image_edit_2511_{int(_time.time())}.png")
+
+    # Models
+    unet_path = str(args.get("unet_path") or "").strip()
+    llm_path = str(args.get("llm_path") or "").strip()
+    mmproj_path = str(args.get("mmproj_path") or "").strip()
+    vae_path = str(args.get("vae_path") or "").strip()
+
+    # Prompts / settings
+    prompt = str(args.get("prompt") or "").strip()
+    negative = str(args.get("negative") or "").strip()
+    steps = int(args.get("steps") or 28)
+    cfg_scale = float(args.get("cfg") or 4.5)
+    seed = int(args.get("seed") if args.get("seed") is not None else -1)
+    width = int(args.get("width") or 1024)
+    height = int(args.get("height") or 576)
+    strength = float(args.get("strength") or 1.0)
+    sampling_method = str(args.get("sampling_method") or "euler_a")
+    shift = float(args.get("shift") or 12.5)
+
+    # Options
+    use_increase_ref_index = bool(args.get("use_increase_ref_index") or False)
+    disable_auto_resize_ref_images = bool(args.get("disable_auto_resize_ref_images") or False)
+
+    use_vae_tiling = bool(args.get("use_vae_tiling") or False)
+    vae_tile_size = str(args.get("vae_tile_size") or "256x256").strip()
+    vae_tile_overlap = float(args.get("vae_tile_overlap") or 0.50)
+    use_offload = bool(args.get("use_offload") or False)
+    use_mmap = bool(args.get("use_mmap") or False)
+    use_vae_on_cpu = bool(args.get("use_vae_on_cpu") or False)
+    use_clip_on_cpu = bool(args.get("use_clip_on_cpu") or False)
+    use_diffusion_fa = bool(args.get("use_diffusion_fa") or False)
+
+    # Build command
+    try:
+        try:
+            from helpers.qwen2511 import detect_sdcli_caps, build_sdcli_cmd
+        except Exception:
+            from qwen2511 import detect_sdcli_caps, build_sdcli_cmd
+        caps = detect_sdcli_caps(sdcli_path)
+        cmd = build_sdcli_cmd(
+            sdcli_path=sdcli_path,
+            caps=caps,
+            init_img=init_img,
+            mask_path=mask_img,
+            ref_images=ref_images,
+            use_increase_ref_index=use_increase_ref_index,
+            disable_auto_resize_ref_images=disable_auto_resize_ref_images,
+            prompt=prompt,
+            negative=negative,
+            unet_path=unet_path,
+            llm_path=llm_path,
+            mmproj_path=mmproj_path,
+            vae_path=vae_path,
+            steps=steps,
+            cfg=cfg_scale,
+            seed=seed,
+            width=width,
+            height=height,
+            strength=strength,
+            sampling_method=sampling_method,
+            shift=shift,
+            out_file=out_file,
+            use_vae_tiling=use_vae_tiling,
+            vae_tile_size=vae_tile_size,
+            vae_tile_overlap=vae_tile_overlap,
+            use_offload=use_offload,
+            use_mmap=use_mmap,
+            use_vae_on_cpu=use_vae_on_cpu,
+            use_clip_on_cpu=use_clip_on_cpu,
+            use_diffusion_fa=use_diffusion_fa,
+        )
+    except Exception as e:
+        _mark_error(job, "Qwen2511: failed to build sd-cli command: " + str(e))
+        return 2
+
+    # Populate args for tools_ffmpeg executor
+    try:
+        label = args.get("label") or ("Qwen2511: " + (prompt.replace("\n", " ").strip()[:80] if prompt else "image edit"))
+        args["label"] = label
+        args["cmd"] = cmd
+        args["cwd"] = str(ROOT)
+        args["outfile"] = out_file
+        args["out_file"] = out_file
+        job["args"] = args
+    except Exception:
+        pass
+
+    # Metadata for UI
+    try:
+        job["backend"] = "qwen2511"
+    except Exception:
+        pass
+    try:
+        if unet_path:
+            job["model"] = os.path.basename(unet_path)
+    except Exception:
+        pass
+
+    return tools_ffmpeg(job, cfg, mani)
+
 def handle_job(jpath: Path):
     job = json.loads(jpath.read_text(encoding="utf-8"))
     cfg = load_config(); mani = manifest()
@@ -3421,6 +3604,8 @@ def handle_job(jpath: Path):
             code = rife_interpolate(job, cfg, mani)
         elif t in ('txt2img','txt2img_qwen'):
             code = txt2img_generate(job, cfg, mani)
+        elif t in ("qwen2511_image_edit","qwen2511_edit","qwen2511"):
+            code = qwen2511_image_edit(job, cfg, mani)
         elif t in ("wan22_text2video","wan22_image2video","wan22_ti2v","wan22"):
             code = wan22_generate(job, cfg, mani)
         elif t in ("ace_text2music","ace_audio2audio","ace","ace_step","ace_music"):

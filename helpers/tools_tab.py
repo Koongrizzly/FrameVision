@@ -109,13 +109,6 @@ except Exception as _e:
     print("[framevision] videotext tool import failed:", _e)
     videotextPane = None
 
-
-try:
-    from helpers.qwen2511 import Qwen2511Pane
-except Exception as _e:
-    print("[framevision] qwen2511 tool import failed:", _e)
-    Qwen2511Pane = None
-
 def ffprobe_path():
     """Resolve ffprobe, preferring app-local presets/bin first, then bin, then PATH."""
     exe = 'ffprobe.exe' if os.name=='nt' else 'ffprobe'
@@ -786,41 +779,6 @@ class InstantToolsPane(QWidget):
         except Exception:
             pass
 
-
-        # ---- Qwen Image Edit 2511 (GGUF) ----
-        sec_qwen2511 = CollapsibleSection("Qwen 2511 edit", expanded=False)
-        _qwen_wrap = QWidget(); _qwen_l = QVBoxLayout(_qwen_wrap); _qwen_l.setContentsMargins(0,0,0,0)
-        _qwen_l.setSpacing(6)
-        _qwen = None
-        if Qwen2511Pane is not None:
-            try:
-                _qwen = Qwen2511Pane(self)
-            except Exception:
-                try:
-                    _qwen = Qwen2511Pane(None)
-                except Exception:
-                    _qwen = None
-        if _qwen is not None:
-            try:
-                _qwen.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
-            except Exception:
-                pass
-            try:
-                _qwen.setMinimumHeight(640)
-            except Exception:
-                pass
-            _qwen_l.addWidget(_qwen, 1)
-        else:
-            _qwen_fallback = QLabel("Qwen 2511 edit tool is unavailable (missing or failed helpers/qwen2511.py).")
-            _qwen_fallback.setWordWrap(True)
-            _qwen_l.addWidget(_qwen_fallback)
-        sec_qwen2511.setContentLayout(_qwen_l)
-        try:
-            sec_qwen2511.content.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
-        except Exception:
-            pass
-
-
         sec_upscale = CollapsibleSection("Upscale Video and images", expanded=False)
         _upsc_wrap = QWidget(); _upscl = QVBoxLayout(_upsc_wrap); _upscl.setContentsMargins(0,0,0,0)
         _upscl.setSpacing(6)
@@ -999,14 +957,14 @@ class InstantToolsPane(QWidget):
                 pass
 
 
-        # ---- Background Remover/SDXL inpainter ----
-        sec_bg = CollapsibleSection("Background Remover/SDXL inpainter", expanded=False)
+        # ---- Background Remover / Inpainter ----
+        sec_bg = CollapsibleSection("Background Remover / Inpainter", expanded=False)
         try:
             install_background_tool(self, sec_bg)
         except Exception:
             try:
                 _bg_wrap = QWidget(); _bg_l = QVBoxLayout(_bg_wrap); _bg_l.setContentsMargins(0,0,0,0)
-                _bg_l.addWidget(QLabel("Background Remover/SDXL inpainter tool failed to load (missing helpers/background.py)."))
+                _bg_l.addWidget(QLabel("Background Remover tool failed to load (missing helpers/background.py)."))
                 sec_bg.setContentLayout(_bg_l)
             except Exception:
                 pass
@@ -1349,7 +1307,7 @@ class InstantToolsPane(QWidget):
             _vt_layout.addWidget(_lbl)
         sec_videotext.setContentLayout(_vt_layout)
 
-        default_sections = [sec_prompt, sec_bg, sec_ace, sec_describe, sec_qwen2511, sec_meme, sec_music, sec_audio, sec_speed, sec_reverse, sec_upscale, sec_rife,
+        default_sections = [sec_prompt, sec_bg, sec_ace, sec_describe, sec_meme, sec_music, sec_audio, sec_speed, sec_reverse, sec_upscale, sec_rife,
                             sec_resize, sec_trim, sec_crop, sec_videotext, sec_splitglue, sec_gif, sec_extract, sec_rename, sec_metadata]
 
 # sec_musicclip,  # to re add put this back in default_sections
@@ -1394,8 +1352,7 @@ class InstantToolsPane(QWidget):
 
                 "Thumbnail / Meme Creator": sec_meme,
                 "Prompt Enhancement": sec_prompt,
-                "Qwen 2511 edit": sec_qwen2511,
-                "Background Remover/SDXL inpainter": sec_bg,
+                "Background Remover": sec_bg,
                 "Ace Step Music creation": sec_ace,
                 "Multi Rename": sec_rename,
                 "Whisper Lab": sec_whisper,

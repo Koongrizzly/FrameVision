@@ -243,6 +243,117 @@ def _open_kb_dialog(parent):
     dlg.exec()
 
 
+
+def _open_license_info(parent):
+    """Open the license viewer (licenses_viewer.py) as a closable popup.
+
+    Uses the existing dialog classes from licenses_viewer.py and shows the dialog
+    non-modally. A reference is kept on the main window so it does not get
+    garbage-collected (which can look like nothing happens).
+    """
+    try:
+        import importlib
+
+        lv = None
+        for modname in ("licenses_viewer", "helpers.licenses_viewer"):
+            try:
+                lv = importlib.import_module(modname)
+                break
+            except Exception:
+                lv = None
+
+        if lv is None:
+            raise ImportError("Could not import licenses_viewer")
+
+        dlg_cls = None
+        for name in ("ThirdPartyLicensesDialog", "LicensesViewerDialog", "LicenseDialog", "LicensesDialog"):
+            c = getattr(lv, name, None)
+            if c is not None:
+                dlg_cls = c
+                break
+
+        # If no dialog class is exported, try common entrypoints.
+        if dlg_cls is None:
+            for fn_name in ("open_dialog", "show_dialog", "open", "show", "run", "main", "launch"):
+                fn = getattr(lv, fn_name, None)
+                if callable(fn):
+                    try:
+                        fn(parent)
+                    except TypeError:
+                        fn()
+                    return
+            raise RuntimeError("licenses_viewer has no dialog class or callable entrypoint.")
+
+        dlg = dlg_cls(parent)
+
+        # Ensure it behaves like a popup (non-blocking) and is closable.
+        try:
+            dlg.setModal(False)
+        except Exception:
+            pass
+        try:
+            # Some builds expose this via QtCore.Qt.WindowModality
+            from PySide6.QtCore import Qt
+            try:
+                dlg.setWindowModality(Qt.NonModal)
+            except Exception:
+                try:
+                    dlg.setWindowModality(Qt.WindowModality.NonModal)
+                except Exception:
+                    pass
+        except Exception:
+            pass
+        try:
+            from PySide6.QtCore import Qt
+            try:
+                dlg.setAttribute(Qt.WA_DeleteOnClose, True)
+            except Exception:
+                try:
+                    dlg.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose, True)
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
+        # Keep a reference so the dialog doesn't instantly disappear.
+        try:
+            prev = getattr(parent, "_license_info_dialog", None)
+            if prev is not None and prev is not dlg:
+                try:
+                    prev.close()
+                except Exception:
+                    pass
+            setattr(parent, "_license_info_dialog", dlg)
+
+            def _clear_ref(*_args):
+                try:
+                    if getattr(parent, "_license_info_dialog", None) is dlg:
+                        setattr(parent, "_license_info_dialog", None)
+                except Exception:
+                    pass
+
+            try:
+                dlg.destroyed.connect(_clear_ref)
+            except Exception:
+                pass
+        except Exception:
+            pass
+
+        dlg.show()
+        try:
+            dlg.raise_()
+            dlg.activateWindow()
+        except Exception:
+            pass
+        return
+
+    except Exception as e:
+        try:
+            QMessageBox.warning(parent, "License info", f"Could not open the license viewer.\n\n{e}")
+        except Exception:
+            pass
+
+
 def install_info_menu(main_window):
     """Create the Info menu with 'Knowledge & Q&A' and 'Feature Guide (HTML)'.
     Safe to call multiple times.
@@ -269,9 +380,9 @@ def install_info_menu(main_window):
     act_html = QAction("Feature Guide (HTML)…", main_window)
     act_html.triggered.connect(_open_html_guide)
 
-    act_update = QAction("Updates…", main_window)
-    act_update.setToolTip("Update from GitHub (Stable release or Beta branch)")
-    act_update.triggered.connect(lambda: _open_update_dialog(main_window))
+    act_lic = QAction("License info", main_window)
+    act_lic.setToolTip("View third‑party licenses (MIT/Apache/etc.)")
+    act_lic.triggered.connect(lambda: _open_license_info(main_window))
     
     act_update = QAction("Updates…", main_window)
     act_update.setToolTip("Update from GitHub (helpers/presets or full app)")
@@ -282,8 +393,8 @@ def install_info_menu(main_window):
         info_menu.addAction(act_kb)
     if act_html.text() not in existing:
         info_menu.addAction(act_html)
-    if act_update.text() not in existing:
-        info_menu.addAction(act_update)
+    if act_lic.text() not in existing:
+        info_menu.addAction(act_lic)
     if act_update.text() not in existing:
         info_menu.addAction(act_update)
 

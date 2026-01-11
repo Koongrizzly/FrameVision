@@ -216,6 +216,136 @@ def enqueue_txt2img_qwen(job_args: dict):
         return False
 
 
+
+def default_qwen2511_outdir():
+    from pathlib import Path
+    base = Path('.').resolve()
+    d = base/'output'/'qwen2511'
+    d.mkdir(parents=True, exist_ok=True)
+    return str(d)
+
+
+def enqueue_qwen2511_from_widget(inner):
+    """Enqueue a Qwen2511 (image edit) job from the Qwen2511Pane UI.
+
+    Uses output/qwen2511 to match the pane's 'View results' / 'Play last result'.
+    """
+    import time as _time
+    from pathlib import Path as _P
+    try:
+        from helpers.job_helper import make_job_json
+        from helpers.queue_adapter import jobs_dirs
+    except Exception:
+        from job_helper import make_job_json
+        from queue_adapter import jobs_dirs
+
+    d = jobs_dirs()
+    out_dir = default_qwen2511_outdir()
+
+    # Required: input image
+    init_img = str(getattr(getattr(inner, 'ed_initimg', None), 'text', lambda: '')()).strip()
+    if not init_img:
+        raise RuntimeError("Input image missing.")
+    if not _P(init_img).is_file():
+        raise RuntimeError("Input image not found: " + init_img)
+
+    # Optional mask and refs
+    mask_img = str(getattr(getattr(inner, 'ed_mask', None), 'text', lambda: '')()).strip()
+    invert_mask = bool(getattr(getattr(inner, 'chk_invert_mask', None), 'isChecked', lambda: False)())
+    ref_imgs = []
+    for attr in ('ed_ref1', 'ed_ref2', 'ed_ref3'):
+        try:
+            p = str(getattr(getattr(inner, attr, None), 'text', lambda: '')()).strip()
+        except Exception:
+            p = ''
+        if p:
+            if not _P(p).is_file():
+                raise RuntimeError("Reference image not found: " + p)
+            ref_imgs.append(p)
+
+    use_increase_ref_index = bool(getattr(getattr(inner, 'chk_ref_increase_index', None), 'isChecked', lambda: True)())
+    disable_auto_resize_ref_images = bool(getattr(getattr(inner, 'chk_disable_ref_resize', None), 'isChecked', lambda: False)())
+
+    # Models / paths
+    sdcli_path = str(getattr(getattr(inner, 'ed_sdcli', None), 'text', lambda: '')()).strip()
+    try:
+        unet_path = getattr(getattr(inner, 'cb_unet', None), 'currentData', lambda: '')()
+        llm_path = getattr(getattr(inner, 'cb_llm', None), 'currentData', lambda: '')()
+        mmproj_path = getattr(getattr(inner, 'cb_mmproj', None), 'currentData', lambda: '')()
+        vae_path = getattr(getattr(inner, 'cb_vae', None), 'currentData', lambda: '')()
+    except Exception:
+        unet_path = llm_path = mmproj_path = vae_path = ''
+
+    # Prompts
+    try:
+        prompt = str(getattr(getattr(inner, 'ed_prompt', None), 'toPlainText', lambda: '')()).strip()
+    except Exception:
+        prompt = ''
+    negative = str(getattr(getattr(inner, 'ed_neg', None), 'text', lambda: '')()).strip()
+
+    # Settings
+    steps = int(getattr(getattr(inner, 'sp_steps', None), 'value', lambda: 28)())
+    cfg = float(getattr(getattr(inner, 'sp_cfg', None), 'value', lambda: 4.5)())
+    seed = int(getattr(getattr(inner, 'sp_seed', None), 'value', lambda: -1)())
+    width = int(getattr(getattr(inner, 'sp_w', None), 'value', lambda: 1024)())
+    height = int(getattr(getattr(inner, 'sp_h', None), 'value', lambda: 576)())
+    sampling_method = str(getattr(getattr(inner, 'cb_sampling', None), 'currentText', lambda: 'euler_a')())
+    shift = float(getattr(getattr(inner, 'sp_shift', None), 'value', lambda: 12.5)())
+
+    # Low VRAM / perf
+    use_vae_tiling = bool(getattr(getattr(inner, 'chk_vae_tiling', None), 'isChecked', lambda: False)())
+    vae_tile_size = str(getattr(getattr(inner, 'cb_vae_tile_size', None), 'currentText', lambda: '256x256')()).strip()
+    vae_tile_overlap = float(getattr(getattr(inner, 'sp_vae_tile_overlap', None), 'value', lambda: 0.50)())
+    use_offload = bool(getattr(getattr(inner, 'chk_offload', None), 'isChecked', lambda: False)())
+    use_mmap = bool(getattr(getattr(inner, 'chk_mmap', None), 'isChecked', lambda: False)())
+    use_vae_on_cpu = bool(getattr(getattr(inner, 'chk_vae_on_cpu', None), 'isChecked', lambda: False)())
+    use_clip_on_cpu = bool(getattr(getattr(inner, 'chk_clip_on_cpu', None), 'isChecked', lambda: False)())
+    use_diffusion_fa = bool(getattr(getattr(inner, 'chk_diffusion_fa', None), 'isChecked', lambda: False)())
+
+    # Output file (precomputed so the queue can display a deterministic target)
+    ts = int(_time.time())
+    out_file = str(_P(out_dir) / f"qwen_image_edit_2511_{ts}.png")
+    label = "Qwen2511 image edit"
+    if prompt:
+        label = "Qwen2511: " + (prompt.replace("\n", " ").strip()[:80])
+
+    args = {
+        "label": label,
+        "sdcli_path": sdcli_path,
+        "init_img": init_img,
+        "mask_img": mask_img,
+        "invert_mask": invert_mask,
+        "ref_images": ref_imgs,
+        "use_increase_ref_index": use_increase_ref_index,
+        "disable_auto_resize_ref_images": disable_auto_resize_ref_images,
+        "prompt": prompt,
+        "negative": negative,
+        "unet_path": unet_path,
+        "llm_path": llm_path,
+        "mmproj_path": mmproj_path,
+        "vae_path": vae_path,
+        "steps": steps,
+        "cfg": cfg,
+        "seed": seed,
+        "width": width,
+        "height": height,
+        "strength": 1.0,
+        "sampling_method": sampling_method,
+        "shift": shift,
+        "use_vae_tiling": use_vae_tiling,
+        "vae_tile_size": vae_tile_size,
+        "vae_tile_overlap": vae_tile_overlap,
+        "use_offload": use_offload,
+        "use_mmap": use_mmap,
+        "use_vae_on_cpu": use_vae_on_cpu,
+        "use_clip_on_cpu": use_clip_on_cpu,
+        "use_diffusion_fa": use_diffusion_fa,
+        "out_file": out_file,
+        "outfile": out_file,
+    }
+
+    return make_job_json("qwen2511_image_edit", init_img, out_dir, args, str(d["pending"]), priority=500)
+
 # --- FrameVision: queue helpers for Upsc & external commands ---
 
 def _is_video_path(p: str) -> bool:
