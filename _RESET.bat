@@ -6,9 +6,9 @@ rem Prevent double-entry if the script calls itself or jumps around
 if "%__RESET_CONFIRM_DONE__%"=="1" goto :PROCEED_WITH_RESET
 
 echo.
-echo #############################################################
+echo ##############################################################
 echo   W A R N I N G   -   T H I S   W I L L   D E L E T E   E V E R Y T H I N G!
-echo #############################################################
+echo ##############################################################
 echo This will DELETE all app settings, caches, models, and local changes,
 echo and restore the project to a clean GitHub state (fresh user install).
 echo.
