@@ -1,0 +1,38 @@
+{
+  "overlays": [
+    {
+      "uid": "c38eaa556cf8",
+      "text": "Made with FrameVision",
+      "font_family": "Bahnschrift SemiBold Condensed",
+      "font_size": 20,
+      "color_rgba": [
+        255,
+        255,
+        255,
+        255
+      ],
+      "effect": "none",
+      "effect_hz": 2.0,
+      "effect_color2_rgba": [
+        255,
+        64,
+        64,
+        255
+      ],
+      "font_file": "test text",
+      "anchor": "bottom_center",
+      "offset_x": 0,
+      "offset_y": 0,
+      "start_ms": 2227,
+      "duration_ms": 50,
+      "fade_in_ms": 0,
+      "fade_out_ms": 1,
+      "enabled": false
+    }
+  ],
+  "selected_uid": "c38eaa556cf8",
+  "zoom": 1.4578897565651487,
+  "last_video_path": "",
+  "preview_always_show": false,
+  "preview_hidden": false
+}

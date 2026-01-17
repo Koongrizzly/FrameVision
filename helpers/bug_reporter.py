@@ -66,7 +66,7 @@ from PySide6.QtWidgets import (
     QMessageBox, QSplitter, QSizePolicy, QComboBox, QToolButton, QFrame, QWidget, QFormLayout, QSpinBox
 )
 
-APP_EMAIL = "frame.vision@mail.com"
+APP_EMAIL = "framevision.mail@mail.com"
 
 def _safe_import_psutil():
     try:
@@ -168,8 +168,12 @@ class BugReporter(QDialog):
 
         opts = QHBoxLayout()
         self.chk_snapshot = QCheckBox("Include system snapshot"); self.chk_snapshot.setChecked(False)  # default removed; will restore via UI
-        self.chk_logs = QCheckBox("Include logs folder"); self.chk_logs.setChecked(False)  # default removed; will restore via UI
-        opts.addWidget(self.chk_snapshot); opts.addWidget(self.chk_logs); opts.addStretch(1)
+        self.chk_logs = QCheckBox("Include log file"); self.chk_logs.setChecked(False)  # default removed; will restore via UI
+        self.cb_log = QComboBox(); self.cb_log.setMinimumWidth(320); self.cb_log.setEnabled(False)
+        self.cb_log.setToolTip("Select a log file to paste into the email body (and optionally include in the ZIP).")
+        self.btn_refresh_logs = QToolButton(); self.btn_refresh_logs.setText("↻"); self.btn_refresh_logs.setToolTip("Refresh log list")
+        self.btn_refresh_logs.setEnabled(False)
+        opts.addWidget(self.chk_snapshot); opts.addWidget(self.chk_logs); opts.addWidget(self.cb_log); opts.addWidget(self.btn_refresh_logs); opts.addStretch(1)
         top_l.addLayout(opts)
         splitter.addWidget(top)
 
@@ -198,6 +202,10 @@ class BugReporter(QDialog):
         self.btn_remove.clicked.connect(self._remove_files)
         self.btn_zip.clicked.connect(self._create_zip)
         self.btn_email.clicked.connect(self._email_zip)
+        # Log selection
+        self._refresh_log_choices()
+        self.chk_logs.toggled.connect(self._on_log_toggle)
+        self.btn_refresh_logs.clicked.connect(self._refresh_log_choices)
         self.btn_close.clicked.connect(self.close)
 
         self._zip_path: pathlib.Path | None = None
@@ -211,25 +219,295 @@ class BugReporter(QDialog):
         for it in self.file_list.selectedItems():
             self.file_list.takeItem(self.file_list.row(it))
 
+
+    def _refresh_log_choices(self):
+        """Populate the log selector with recent *log* files (not ZIPs)."""
+        try:
+            self.cb_log.blockSignals(True)
+            self.cb_log.clear()
+            logs_dir = ensure_logs_dir()
+            files = []
+            try:
+                for p in logs_dir.iterdir():
+                    if not p.is_file():
+                        continue
+                    # Exclude bugreport ZIPs and temp staging folders/files
+                    name = p.name.lower()
+                    if name.endswith(".zip"):
+                        continue
+                    if name.startswith("bugreport_") or name.startswith("_tmp_"):
+                        continue
+                    files.append(p)
+            except Exception:
+                files = []
+
+            def _key(p: pathlib.Path):
+                try:
+                    return p.stat().st_mtime
+                except Exception:
+                    return 0
+
+            files.sort(key=_key, reverse=True)
+
+            if not files:
+                self.cb_log.addItem("(no logs found)", None)
+                self.cb_log.setEnabled(False)
+                self.btn_refresh_logs.setEnabled(False)
+                return
+
+            for p in files[:200]:
+                try:
+                    size_kb = int(p.stat().st_size / 1024)
+                except Exception:
+                    size_kb = 0
+                self.cb_log.addItem(f"{p.name}  ({size_kb} KB)", str(p))
+
+            en = bool(self.chk_logs.isChecked())
+            self.cb_log.setEnabled(en)
+            self.btn_refresh_logs.setEnabled(en)
+        finally:
+            try:
+                self.cb_log.blockSignals(False)
+            except Exception:
+                pass
+
+    def _on_log_toggle(self, checked: bool):
+        self.cb_log.setEnabled(bool(checked))
+        self.btn_refresh_logs.setEnabled(bool(checked))
+        if checked and self.cb_log.count() == 0:
+            self._refresh_log_choices()
+
+    def _get_selected_log_path(self) -> pathlib.Path | None:
+        try:
+            data = self.cb_log.currentData()
+            if not data:
+                return None
+            return pathlib.Path(str(data))
+        except Exception:
+            return None
+
+    def _unique_dest(self, folder: pathlib.Path, filename: str) -> pathlib.Path:
+        base = pathlib.Path(filename).name
+        cand = folder / base
+        if not cand.exists():
+            return cand
+        stem = cand.stem
+        suf = cand.suffix
+        for i in range(2, 9999):
+            cand2 = folder / f"{stem}_{i}{suf}"
+            if not cand2.exists():
+                return cand2
+        return folder / f"{stem}_{datetime.now().strftime('%H%M%S')}{suf}"
+
+    def _included_summary_lines(self) -> list[str]:
+        lines = []
+        lines.append(f"Include system snapshot: {'Yes' if self.chk_snapshot.isChecked() else 'No'}")
+        if self.chk_logs.isChecked():
+            lp = self._get_selected_log_path()
+            lines.append(f"Include log file: {lp.name if lp else '(none selected)'}")
+        else:
+            lines.append("Include log file: No")
+        extra = []
+        for i in range(self.file_list.count()):
+            try:
+                extra.append(pathlib.Path(self.file_list.item(i).text()).name)
+            except Exception:
+                pass
+        if extra:
+            lines.append("Extra attachments: " + ", ".join(extra))
+        return lines
+
     def _stage_zip_files(self, temp_stage: pathlib.Path):
         # snapshot
         if self.chk_snapshot.isChecked():
             snap = self.txt.toPlainText().strip() or build_snapshot_text()
             (temp_stage / "snapshot.txt").write_text(snap, encoding="utf-8")
-        # logs
+        # logs (single file)
         if self.chk_logs.isChecked():
-            logs_dir = pathlib.Path("logs")
-            if logs_dir.exists():
-                for p in logs_dir.rglob("*"):
-                    if p.is_file():
-                        try: shutil.copy2(p, temp_stage / p.name)
-                        except Exception: pass
+            lp = self._get_selected_log_path()
+            if lp and lp.exists() and lp.is_file():
+                try:
+                    shutil.copy2(lp, self._unique_dest(temp_stage, lp.name))
+                except Exception:
+                    pass
+
         # attachments
         for i in range(self.file_list.count()):
             p = pathlib.Path(self.file_list.item(i).text())
             if p.exists() and p.is_file():
                 try: shutil.copy2(p, temp_stage / p.name)
                 except Exception: pass
+
+
+    def _read_text_tail(self, path: pathlib.Path, *, max_bytes: int = 180_000, max_lines: int = 220) -> str:
+        """Read the tail of a text file, safely."""
+        try:
+            if not path or not path.exists() or not path.is_file():
+                return ""
+            size = path.stat().st_size
+            with open(path, "rb") as f:
+                if size > max_bytes:
+                    try:
+                        f.seek(max(0, size - max_bytes))
+                    except Exception:
+                        pass
+                data = f.read()
+            txt = data.decode("utf-8", errors="ignore")
+            lines = txt.splitlines()
+            if len(lines) > max_lines:
+                lines = lines[-max_lines:]
+            return "\n".join(lines).strip() + "\n"
+        except Exception:
+            return ""
+
+    def _extract_traceback_blocks(self, text: str, *, max_blocks: int = 2, max_lines: int = 90, max_chars: int = 2600) -> list[str]:
+        """Extract recent Python traceback blocks from text."""
+        if not text:
+            return []
+        marker = "Traceback (most recent call last):"
+        idxs = []
+        start = 0
+        while True:
+            i = text.find(marker, start)
+            if i < 0:
+                break
+            idxs.append(i)
+            start = i + len(marker)
+        if not idxs:
+            return []
+
+        blocks = []
+        for a, b in zip(idxs, idxs[1:] + [len(text)]):
+            chunk = text[a:b].strip()
+            if not chunk:
+                continue
+            lines = chunk.splitlines()
+            if len(lines) > max_lines:
+                lines = lines[:max_lines]
+                lines.append("...(traceback truncated)")
+            chunk2 = "\n".join(lines).strip()
+            if len(chunk2) > max_chars:
+                chunk2 = chunk2[: max_chars - 80].rstrip() + "\n...(traceback truncated)"
+            blocks.append(chunk2)
+
+        # Most recent first
+        blocks = list(reversed(blocks))[:max_blocks]
+        return blocks
+
+    def _iter_recent_log_files(self, *, limit: int = 5) -> list[pathlib.Path]:
+        logs_dir = ensure_logs_dir()
+        files = []
+        try:
+            for p in logs_dir.iterdir():
+                if not p.is_file():
+                    continue
+                name = p.name.lower()
+                if name.endswith(".zip"):
+                    continue
+                if name.startswith("bugreport_") or name.startswith("_tmp_"):
+                    continue
+                files.append(p)
+        except Exception:
+            return []
+        files.sort(key=lambda p: getattr(p.stat(), "st_mtime", 0), reverse=True)
+        return files[:limit]
+
+    def _compose_email_body(self, zip_abs: str) -> tuple[str, str, bool]:
+        """Return (full_body, mailto_body, was_truncated_for_mailto)."""
+        subject = self.ed_subject.text().strip() or "FrameVision bug report"
+        notes = (self.txt.toPlainText() or "").strip()
+        from_name = self.ed_from.text().strip()
+        hi = self.cb_hi.currentText()
+
+        lines = []
+        lines += ["Hi,", ""]
+        lines += ["Bug report pasted below (most email apps cannot auto-attach files via a mailto link).", ""]
+        lines += [f"Subject: {subject}"]
+        if from_name:
+            lines += [f"From: {from_name}"]
+        lines += ["", "Included:"]
+        lines += ["- " + s for s in self._included_summary_lines()]
+        lines += ["", f"ZIP path on disk: {zip_abs}"]
+
+        # Snapshot section (fresh snapshot text). Avoid duplicating if Notes already starts with the snapshot.
+        snap_already = False
+        try:
+            snap_already = notes.lstrip().startswith("=== FrameVision Snapshot ===")
+        except Exception:
+            snap_already = False
+        if self.chk_snapshot.isChecked() and not snap_already:
+            snap = build_snapshot_text().strip()
+            if snap:
+                lines += ["", "=== System snapshot ===", snap]
+
+        # Log section (paste tail)
+        log_tail = ""
+        selected_log = None
+        if self.chk_logs.isChecked():
+            selected_log = self._get_selected_log_path()
+            if selected_log and selected_log.exists() and selected_log.is_file():
+                log_tail = self._read_text_tail(selected_log)
+
+        if log_tail:
+            lines += ["", f"=== Log excerpt (tail): {selected_log.name} ===", log_tail.rstrip()]
+
+        # Tracebacks section
+        tb_blocks = []
+        tb_source = None
+        if log_tail:
+            tb_blocks = self._extract_traceback_blocks(log_tail)
+            tb_source = selected_log
+        else:
+            # If no log selected, try recent logs for tracebacks (useful when snapshot is enabled)
+            for p in self._iter_recent_log_files(limit=5):
+                tail = self._read_text_tail(p)
+                blocks = self._extract_traceback_blocks(tail)
+                if blocks:
+                    tb_blocks = blocks
+                    tb_source = p
+                    break
+
+        if tb_blocks:
+            header = "=== Recent tracebacks (most recent first) ==="
+            if tb_source:
+                header += f"  [{tb_source.name}]"
+            lines += ["", header]
+            for i, b in enumerate(tb_blocks, 1):
+                lines += [f"\n--- Traceback #{i} ---", b.strip()]
+
+        if notes:
+            lines += ["", "=== Notes ===", notes]
+
+        # Signature
+        if from_name or (hi and hi != "—"):
+            sig = (from_name or "user") + ((" " + hi) if hi and hi != "—" else "")
+            lines += ["", "— " + sig]
+
+        full_body = "\n".join(lines).strip() + "\n"
+
+        # Build mailto-safe body (keep shorter) but always copy the full body to clipboard.
+        mailto_body = full_body
+        was_trunc = False
+
+        # Hard cap plain length
+        max_plain = 8500
+        if len(mailto_body) > max_plain:
+            mailto_body = mailto_body[: max_plain - 200].rstrip() + "\n\n...(truncated for email body; full report copied to clipboard)\n"
+            was_trunc = True
+
+        # Cap encoded length (mailto URL)
+        try:
+            enc = urllib.parse.quote(mailto_body)
+            max_enc = 12000
+            if len(enc) > max_enc:
+                cut = 6000
+                mailto_body = mailto_body[: cut - 200].rstrip() + "\n\n...(truncated for email body; full report copied to clipboard)\n"
+                was_trunc = True
+        except Exception:
+            pass
+
+        return full_body, mailto_body, was_trunc
+
 
     def _create_zip(self):
         logs_root = ensure_logs_dir()
@@ -250,19 +528,138 @@ class BugReporter(QDialog):
         finally:
             try: shutil.rmtree(temp_stage, ignore_errors=True)
             except Exception: pass
-
     def _email_zip(self):
+        # Ensure ZIP exists (useful for manual attach and for SMTP sending)
+        if not self._zip_path or not self._zip_path.exists():
+            self._create_zip()
+            if not self._zip_path or not self._zip_path.exists():
+                QMessageBox.warning(self, "Bug report", "Please create a ZIP first.")
+                return
+
         subject = self.ed_subject.text().strip() or "FrameVision bug report"
-        notes = self.txt.toPlainText().strip()
-        from_name = self.ed_from.text().strip()
-        hi = self.cb_hi.currentText()
-        body_lines = ["Hi,","", "Please find my bug report attached."]
-        if self._zip_path: body_lines += ["", f"ZIP path on disk: {self._zip_path}"]
-        if from_name or (hi and hi != "—"): body_lines += ["", "— " + (from_name or "user") + (" " + hi if hi and hi != "—" else "")]
-        if notes: body_lines += ["", "Notes:", notes]
-        body = "\\n".join(body_lines)
-        url = f"mailto:{APP_EMAIL}?subject={urllib.parse.quote(subject)}&body={urllib.parse.quote(body)}"
+        zip_abs = str(self._zip_path.resolve())
+
+        # Compose body (and a mailto-safe version)
+        full_body, mailto_body, was_trunc = self._compose_email_body(zip_abs)
+
+        # Offer SMTP (attach ZIP) vs mail app (body only)
+        mb = QMessageBox(self)
+        mb.setWindowTitle("Email report")
+        mb.setIcon(QMessageBox.Information)
+        mb.setText(
+            "Choose how you want to send your report:\n\n"
+            "• Open email app: pastes details into the email body (ZIP cannot be auto-attached).\n"
+            "• Send via SMTP: sends the email directly and attaches the ZIP."
+        )
+        btn_smtp = mb.addButton("Send via SMTP (attach ZIP)", QMessageBox.AcceptRole)
+        btn_mail = mb.addButton("Open email app (body only)", QMessageBox.ActionRole)
+        btn_cancel = mb.addButton(QMessageBox.Cancel)
+        mb.setDefaultButton(btn_mail)
+        mb.exec()
+
+        clicked = mb.clickedButton()
+        if clicked == btn_cancel:
+            return
+
+        if clicked == btn_smtp:
+            dlg = QDialog(self)
+            dlg.setWindowTitle("SMTP settings")
+            dlg.resize(520, 260)
+            v = QVBoxLayout(dlg)
+
+            info = QLabel(
+                "Enter your SMTP details to send the report with the ZIP attached.\n"
+                "Tip: Gmail/Outlook may require an app password."
+            )
+            info.setWordWrap(True)
+            v.addWidget(info)
+
+            smtpw = SmtpSettings(dlg)
+            v.addWidget(smtpw, 1)
+
+            row = QHBoxLayout()
+            btn_send = QPushButton("Send")
+            btn_close = QPushButton("Cancel")
+            row.addStretch(1)
+            row.addWidget(btn_send)
+            row.addWidget(btn_close)
+            v.addLayout(row)
+
+            def do_send():
+                cfg = smtpw.values()
+                if not cfg.get("host") or not cfg.get("user"):
+                    QMessageBox.warning(dlg, "SMTP", "Please enter at least SMTP server and user/email.")
+                    return
+                try:
+                    msg = EmailMessage()
+                    msg["From"] = cfg["user"]
+                    msg["To"] = APP_EMAIL
+                    msg["Subject"] = subject
+                    msg.set_content(full_body)
+
+                    with open(zip_abs, "rb") as f:
+                        msg.add_attachment(
+                            f.read(),
+                            maintype="application",
+                            subtype="zip",
+                            filename=self._zip_path.name,
+                        )
+
+                    if cfg.get("use_ssl"):
+                        server = smtplib.SMTP_SSL(cfg["host"], cfg["port"], timeout=25)
+                    else:
+                        server = smtplib.SMTP(cfg["host"], cfg["port"], timeout=25)
+
+                    try:
+                        server.ehlo()
+                        if cfg.get("use_tls") and not cfg.get("use_ssl"):
+                            server.starttls()
+                            server.ehlo()
+                        server.login(cfg["user"], cfg.get("password", ""))
+                        server.send_message(msg)
+                    finally:
+                        try:
+                            server.quit()
+                        except Exception:
+                            pass
+
+                    self.lbl_status.setText(f"Sent via SMTP to: {APP_EMAIL} (attached: {self._zip_path.name})")
+                    QMessageBox.information(dlg, "Bug report", "Sent! The ZIP was attached.")
+                    dlg.accept()
+
+                except Exception as e:
+                    QMessageBox.critical(dlg, "Bug report", f"SMTP send failed:\n{e}")
+
+            btn_send.clicked.connect(do_send)
+            btn_close.clicked.connect(dlg.reject)
+            dlg.exec()
+            return
+
+        # Open email client and paste details into body.
+        # Copy full body to clipboard in case the mailto body is truncated by the email client.
+        try:
+            QGuiApplication.clipboard().setText(full_body)
+        except Exception:
+            pass
+
+        # Also open ZIP folder for quick manual attach if desired
+        try:
+            QDesktopServices.openUrl(QUrl.fromLocalFile(str(self._zip_path.parent.resolve())))
+        except Exception:
+            pass
+
+        url = f"mailto:{APP_EMAIL}?subject={urllib.parse.quote(subject)}&body={urllib.parse.quote(mailto_body)}"
         QDesktopServices.openUrl(QUrl(url))
+
+        msg = (
+            "Your email client was opened.\n\n"
+            "Most mail apps can't auto-attach files from a mailto link.\n"
+            "The full report text was copied to your clipboard (paste if needed).\n\n"
+            f"ZIP on disk (attach manually if you want):\n{zip_abs}"
+        )
+        if was_trunc:
+            msg += "\n\nNote: The email body may be truncated by your email client. Paste from clipboard to restore the full text."
+        QMessageBox.information(self, "Bug report", msg)
 
 def open_bug_reporter(parent=None):
     try:

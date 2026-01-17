@@ -28,15 +28,15 @@ EVE_BTN_PRESSED = "#172554"
 EVE_SLIDER = "#38bdf8"       # cyan-ish handle for visibility
 
 # Night palette
-NIGHT_BG = "#000000"
-NIGHT_GROUP_BG = "#0A0A0A"
+NIGHT_BG = "#030303"
+NIGHT_GROUP_BG = "#4C0202"
 NIGHT_HEADER = "#00D6F7"
 NIGHT_TEXT = "#EAEFF5"
-NIGHT_BORDER = "#1F2A3A"
+NIGHT_BORDER = "#360000"
 NIGHT_TAB_BG = "#121829"
-NIGHT_TAB_HOVER = "#192136"
-NIGHT_BTN_HOVER = "#182034"
-NIGHT_SLIDER = "#00F708"
+NIGHT_TAB_HOVER = "#610202"
+NIGHT_BTN_HOVER = "#610202"
+NIGHT_SLIDER = "#610202"
 
 QSS_DAY = f"""
 QAbstractScrollArea {{ background: {DAY_BG}; }}
@@ -167,6 +167,23 @@ def qss_for_theme(name: str) -> str:
         "cloud gray": QSS_CLOUD_GREY,
         "signal grey": QSS_SIGNAL_GREY,
         "signal gray": QSS_SIGNAL_GREY,
+
+        # "In the Dark" family (same greys, different accent colors)
+        "blue in the dark": QSS_VERDANT_GREY,
+        "blue in dark": QSS_VERDANT_GREY,
+        "green in the dark": QSS_GREEN_IN_THE_DARK,
+        "green in dark": QSS_GREEN_IN_THE_DARK,
+        "orange in the dark": QSS_ORANGE_IN_THE_DARK,
+        "orange in dark": QSS_ORANGE_IN_THE_DARK,
+        "red in the dark": QSS_RED_IN_THE_DARK,
+        "red in dark": QSS_RED_IN_THE_DARK,
+
+        # legacy / aliases
+        "verdant grey": QSS_VERDANT_GREY,
+        "verdant gray": QSS_VERDANT_GREY,
+        "verdant": QSS_VERDANT_GREY,
+        "green grey": QSS_VERDANT_GREY,
+        "green gray": QSS_VERDANT_GREY,
     }
 
     # Exact mapping first
@@ -187,11 +204,19 @@ def qss_for_theme(name: str) -> str:
     if "tropic" in s or "fiesta" in s: return QSS_TROPICAL_FIESTA
     if "color" in s and "mix" in s: return QSS_COLOR_MIX
     if "aurora" in s: return QSS_AURORA
-    if "mardi" in s: return QSS_MARDI_GRAS
+    if "mardi" in s or ("purple" in s and "life" in s) or s == "purplelife": return QSS_MARDI_GRAS
     if "sunburst" in s: return QSS_SUNBURST
     if "pastel" in s: return QSS_PASTEL_LIGHT
     if "cloud" in s: return QSS_CLOUD_GREY
     if "signal" in s: return QSS_SIGNAL_GREY
+    if ("blue in the dark" in s) or ("blue in dark" in s) or ("verdant" in s) or ("green" in s and ("grey" in s or "gray" in s)):
+        return QSS_VERDANT_GREY
+    if ("green in the dark" in s) or ("green in dark" in s):
+        return QSS_GREEN_IN_THE_DARK
+    if ("orange in the dark" in s) or ("orange in dark" in s):
+        return QSS_ORANGE_IN_THE_DARK
+    if ("red in the dark" in s) or ("red in dark" in s):
+        return QSS_RED_IN_THE_DARK
     if "graphite" in s or s.endswith("dusk"): return QSS_GRAPHITE_DUSK
 
     # Fallback
@@ -216,6 +241,16 @@ def _menu_qss(name: str) -> str:
         parts.append(f"QMenuBar::item:selected {{ background: {hover_bg}; }}")
         parts.append(f"QMenuBar::item:pressed {{ background: {pressed_bg}; }}")
         return "\n".join(parts) + "\n"
+
+    # "In the Dark" family — user-specified hover accents (same greys, different accent colors)
+    if ("blue in the dark" in s) or ("blue in dark" in s) or ("verdant" in s):
+        return rule("#033F5C", "#01283B", panel_bg="#636363", separator="#0298E0")
+    if ("green in the dark" in s) or ("green in dark" in s):
+        return rule("#0F3B1D", "#082413", panel_bg="#636363", separator="#22c55e")
+    if ("orange in the dark" in s) or ("orange in dark" in s):
+        return rule("#5C2F03", "#3B1D01", panel_bg="#636363", separator="#f97316")
+    if ("red in the dark" in s) or ("red in dark" in s):
+        return rule("#5C0303", "#3B0101", panel_bg="#636363", separator="#ef4444")
 
     # Colorful themes (explicit request)
     if 'color mix' in s or 'colormix' in s:
@@ -242,7 +277,7 @@ def _menu_qss(name: str) -> str:
         return rule('#FFE8D1', '#E2F0FF')
 
     # Dark-ish themes — provide lighter, clearer hover states
-    # Evening, Night, Slate, Graphite Dusk, High Contrast, Neon, Ocean, CRT, Aurora, Mardi Gras, Tropical Fiesta
+    # Evening, Night, Slate, Graphite Dusk, High Contrast, Neon, Ocean, CRT, Aurora, Purple Life, Tropical Fiesta
     return rule('#1f2937', '#172554')
 
 
@@ -260,6 +295,52 @@ def _button_hover_qss(name: str) -> str:
     # Skip themes that already define flashy hover borders in their own QSS
     if any(key in s for key in ("cyber", "rainbow riot", "candy pop", "candypop", "color mix", "colormix")):
         return ""
+
+
+    # "In the Dark" family
+    if ("blue in the dark" in s) or ("blue in dark" in s) or ("verdant" in s):
+        return """
+QPushButton:hover, QToolButton:hover {
+    border-color: #0084D9;
+    color: #00BAFF;
+}
+QPushButton:pressed, QToolButton:pressed {
+    border-color: #00719C;
+}
+"""
+
+    if ("green in the dark" in s) or ("green in dark" in s):
+        return """
+QPushButton:hover, QToolButton:hover {
+    border-color: #00D96A;
+    color: #00FF66;
+}
+QPushButton:pressed, QToolButton:pressed {
+    border-color: #007C3A;
+}
+"""
+
+    if ("orange in the dark" in s) or ("orange in dark" in s):
+        return """
+QPushButton:hover, QToolButton:hover {
+    border-color: #D98000;
+    color: #FFB000;
+}
+QPushButton:pressed, QToolButton:pressed {
+    border-color: #9C5A00;
+}
+"""
+
+    if ("red in the dark" in s) or ("red in dark" in s):
+        return """
+QPushButton:hover, QToolButton:hover {
+    border-color: #D90000;
+    color: #FF4040;
+}
+QPushButton:pressed, QToolButton:pressed {
+    border-color: #9C1A1A;
+}
+"""
 
     # --- Light / day-like themes ------------------------------------------------------
     if s.startswith("day"):
@@ -440,7 +521,7 @@ QPushButton:pressed {{
 }}
 """
 
-    if "mardi" in s:
+    if "mardi" in s or ("purple" in s and "life" in s) or "purplelife" in s:
         return f"""
 QPushButton:hover {{
     border-color: {MARDI_ACCENT};
@@ -475,7 +556,12 @@ def apply_theme(app: QApplication, name: str) -> None:
     if s == "random":
         try:
             import random as _rand
-            _pool = ["Day","Solarized Light","Sunburst","Cloud Grey","Signal Grey","Evening","Night","Slate","High Contrast","Cyberpunk","Neon","Ocean","CRT","Aurora","Mardi Gras","Tropical Fiesta","Color Mix"]
+            _pool = [
+                "Day","Pastel Light","Solarized Light","Sunburst","Cloud Grey","Signal Grey",
+                "Blue in the dark","Green in the Dark","Orange in the Dark","Red in the Dark",
+                "Evening","Night","Graphite Dusk","Slate","High Contrast","Cyberpunk","Neon","Ocean","CRT","Aurora",
+                "Purple Life","Tropical Fiesta","Color Mix","Candy Pop","Rainbow Riot",
+            ]
             name = _rand.choice(_pool)
         except Exception:
             name = "Evening"
@@ -501,6 +587,30 @@ def apply_theme(app: QApplication, name: str) -> None:
             pal.setColor(QPalette.Button, QColor(DAY_TAB_BG))
             pal.setColor(QPalette.Text, QColor(DAY_TEXT))
             pal.setColor(QPalette.WindowText, QColor(DAY_TEXT))
+        elif ("blue in the dark" in name.lower() or "blue in dark" in name.lower() or "verdant" in name.lower() or ("green" in name.lower() and ("grey" in name.lower() or "gray" in name.lower()))):
+            pal.setColor(QPalette.Window, QColor(VERD_BG))
+            pal.setColor(QPalette.Base, QColor(VERD_GROUP_BG))
+            pal.setColor(QPalette.Button, QColor(VERD_TAB_BG))
+            pal.setColor(QPalette.Text, QColor(VERD_TEXT))
+            pal.setColor(QPalette.WindowText, QColor(VERD_TEXT))
+        elif ("green in the dark" in name.lower() or "green in dark" in name.lower()):
+            pal.setColor(QPalette.Window, QColor(GREEN_DARK_BG))
+            pal.setColor(QPalette.Base, QColor(GREEN_DARK_GROUP_BG))
+            pal.setColor(QPalette.Button, QColor(GREEN_DARK_TAB_BG))
+            pal.setColor(QPalette.Text, QColor(GREEN_DARK_TEXT))
+            pal.setColor(QPalette.WindowText, QColor(GREEN_DARK_TEXT))
+        elif ("orange in the dark" in name.lower() or "orange in dark" in name.lower()):
+            pal.setColor(QPalette.Window, QColor(ORANGE_DARK_BG))
+            pal.setColor(QPalette.Base, QColor(ORANGE_DARK_GROUP_BG))
+            pal.setColor(QPalette.Button, QColor(ORANGE_DARK_TAB_BG))
+            pal.setColor(QPalette.Text, QColor(ORANGE_DARK_TEXT))
+            pal.setColor(QPalette.WindowText, QColor(ORANGE_DARK_TEXT))
+        elif ("red in the dark" in name.lower() or "red in dark" in name.lower()):
+            pal.setColor(QPalette.Window, QColor(RED_DARK_BG))
+            pal.setColor(QPalette.Base, QColor(RED_DARK_GROUP_BG))
+            pal.setColor(QPalette.Button, QColor(RED_DARK_TAB_BG))
+            pal.setColor(QPalette.Text, QColor(RED_DARK_TEXT))
+            pal.setColor(QPalette.WindowText, QColor(RED_DARK_TEXT))
         elif ("graphite" in name.lower() or "dusk" in name.lower()):
             pal.setColor(QPalette.Window, QColor(GRA_BG))
             pal.setColor(QPalette.Base, QColor(GRA_GROUP_BG))
@@ -519,7 +629,7 @@ def apply_theme(app: QApplication, name: str) -> None:
         # Updating top-level widgets is typically enough; Qt will propagate style changes to children.
         for w in app.topLevelWidgets():
             try:
-                w.style().unpolish(w); w.style().polish(w); w.update()
+                w.update()
             except Exception:
                 pass
     except Exception:
@@ -736,6 +846,438 @@ QScrollBar:vertical {{
 }}
 QScrollBar::handle:vertical {{
     background: {SIG_BORDER};
+    border-radius: 6px;
+}}
+"""
+
+
+# --- Blue in the dark (user palette: grey base + blue borders + blue text) -------------------
+VERD_BG = "#262626"           # main background
+VERD_GROUP_BG = "#363434"     # panels / groups
+VERD_INPUT_BG = "#475656"     # inputs
+VERD_TEXT = "#00BAFF"         # font color
+VERD_BORDER = "#00719C"       # borders + tab base
+VERD_TAB_BG = "#01548A"       # tab background
+VERD_TAB_SELECTED = "#0084D9" # selected tab
+VERD_MENU_HOVER = "#0074BF"   # extra accent hover
+VERD_MENU_PRESSED = "#6E23F7" # extra accent pressed
+
+QSS_VERDANT_GREY = f"""
+QAbstractScrollArea {{ background: {VERD_BG}; }}
+QScrollArea QWidget#qt_scrollarea_viewport {{ background: {VERD_BG}; }}
+QWidget {{ background: {VERD_BG}; color: {VERD_TEXT}; }}
+QMainWindow, QDialog {{ background: {VERD_BG}; }}
+
+QGroupBox {{
+    background: {VERD_GROUP_BG};
+    border: 2px solid {VERD_BORDER};
+    border-radius: 8px;
+    margin-top: 14px;
+}}
+QGroupBox::title {{
+    subcontrol-origin: margin;
+    left: 10px;
+    padding: 3px 8px;
+    background: {VERD_TAB_BG};
+    color: {VERD_TEXT};
+    border-radius: 6px;
+    font-weight: 800;
+}}
+
+QTabWidget::pane {{
+    border: 2px solid {VERD_BORDER};
+    top: -2px;
+    background: {VERD_GROUP_BG};
+}}
+QTabBar::tab {{
+    background: {VERD_TAB_BG};
+    padding: 7px 14px;
+    border: 2px solid {VERD_BORDER};
+    border-bottom: none;
+    border-top-left-radius: 8px;
+    border-top-right-radius: 8px;
+    color: {VERD_TEXT};
+    font-weight: 800;
+}}
+QTabBar::tab:hover {{ background: #0074BF; }}
+QTabBar::tab:selected {{
+    background: {VERD_TAB_SELECTED};
+    color: {VERD_TEXT};
+    font-weight: 900;
+}}
+
+QPushButton {{
+    background: {VERD_TAB_BG};
+    border: 2px solid {VERD_BORDER};
+    border-radius: 8px;
+    padding: 6px 12px;
+    color: {VERD_TEXT};
+    font-weight: 800;
+}}
+QPushButton:hover {{ background: {VERD_TAB_SELECTED}; }}
+QPushButton:pressed {{ background: #0074BF; }}
+
+QLineEdit, QComboBox, QTextEdit, QSpinBox, QDoubleSpinBox {{
+    background: {VERD_INPUT_BG};
+    border: 2px solid {VERD_BORDER};
+    border-radius: 8px;
+    padding: 5px 8px;
+    color: {VERD_TEXT};
+}}
+QComboBox::drop-down {{ width: 24px; }}
+
+QCheckBox, QRadioButton {{
+    background: transparent;
+    border: none;
+    color: {VERD_TEXT};
+}}
+
+QSlider::groove:horizontal {{
+    height: 6px;
+    background: {VERD_BORDER};
+    border-radius: 3px;
+}}
+QSlider::handle:horizontal {{
+    width: 16px;
+    background: {VERD_TAB_SELECTED};
+    border: 2px solid {VERD_BORDER};
+    border-radius: 8px;
+    margin: -6px 0;
+}}
+
+QScrollBar:vertical {{
+    width: 12px;
+    background: {VERD_GROUP_BG};
+    border: 2px solid {VERD_BORDER};
+    border-radius: 6px;
+}}
+QScrollBar::handle:vertical {{
+    background: {VERD_TAB_BG};
+    border-radius: 6px;
+}}
+"""
+
+
+# --- "In the Dark" variants (same greys, swapped accent hues) ----------------------------
+# Per user request: keep all greys identical to "Blue in the Dark" and replace the blue accents
+# with a single hue (no mixing): Green / Orange / Red.
+
+# Green in the Dark
+GREEN_DARK_BG = VERD_BG
+GREEN_DARK_GROUP_BG = VERD_GROUP_BG
+GREEN_DARK_INPUT_BG = VERD_INPUT_BG
+GREEN_DARK_TEXT = "#00FF66"
+GREEN_DARK_BORDER = "#007C3A"
+GREEN_DARK_TAB_BG = "#015A30"
+GREEN_DARK_TAB_SELECTED = "#00D96A"
+GREEN_DARK_MENU_HOVER = "#00BF5E"
+GREEN_DARK_MENU_PRESSED = "#008A43"
+
+QSS_GREEN_IN_THE_DARK = f"""
+QAbstractScrollArea {{ background: {GREEN_DARK_BG}; }}
+QScrollArea QWidget#qt_scrollarea_viewport {{ background: {GREEN_DARK_BG}; }}
+QWidget {{ background: {GREEN_DARK_BG}; color: {GREEN_DARK_TEXT}; }}
+QMainWindow, QDialog {{ background: {GREEN_DARK_BG}; }}
+
+QGroupBox {{
+    background: {GREEN_DARK_GROUP_BG};
+    border: 2px solid {GREEN_DARK_BORDER};
+    border-radius: 8px;
+    margin-top: 14px;
+}}
+QGroupBox::title {{
+    subcontrol-origin: margin;
+    left: 10px;
+    padding: 3px 8px;
+    background: {GREEN_DARK_TAB_BG};
+    color: {GREEN_DARK_TEXT};
+    border-radius: 6px;
+    font-weight: 800;
+}}
+
+QTabWidget::pane {{
+    border: 2px solid {GREEN_DARK_BORDER};
+    top: -2px;
+    background: {GREEN_DARK_GROUP_BG};
+}}
+QTabBar::tab {{
+    background: {GREEN_DARK_TAB_BG};
+    padding: 7px 14px;
+    border: 2px solid {GREEN_DARK_BORDER};
+    border-bottom: none;
+    border-top-left-radius: 8px;
+    border-top-right-radius: 8px;
+    color: {GREEN_DARK_TEXT};
+    font-weight: 800;
+}}
+QTabBar::tab:hover {{ background: {GREEN_DARK_MENU_HOVER}; }}
+QTabBar::tab:selected {{
+    background: {GREEN_DARK_TAB_SELECTED};
+    color: {GREEN_DARK_TEXT};
+    font-weight: 900;
+}}
+
+QPushButton {{
+    background: {GREEN_DARK_TAB_BG};
+    border: 2px solid {GREEN_DARK_BORDER};
+    border-radius: 8px;
+    padding: 6px 12px;
+    color: {GREEN_DARK_TEXT};
+    font-weight: 800;
+}}
+QPushButton:hover {{ background: {GREEN_DARK_TAB_SELECTED}; }}
+QPushButton:pressed {{ background: {GREEN_DARK_MENU_HOVER}; }}
+
+QLineEdit, QComboBox, QTextEdit, QSpinBox, QDoubleSpinBox {{
+    background: {GREEN_DARK_INPUT_BG};
+    border: 2px solid {GREEN_DARK_BORDER};
+    border-radius: 8px;
+    padding: 5px 8px;
+    color: {GREEN_DARK_TEXT};
+}}
+QComboBox::drop-down {{ width: 24px; }}
+
+QCheckBox, QRadioButton {{
+    background: transparent;
+    border: none;
+    color: {GREEN_DARK_TEXT};
+}}
+
+QSlider::groove:horizontal {{
+    height: 6px;
+    background: {GREEN_DARK_BORDER};
+    border-radius: 3px;
+}}
+QSlider::handle:horizontal {{
+    width: 16px;
+    background: {GREEN_DARK_TAB_SELECTED};
+    border: 2px solid {GREEN_DARK_BORDER};
+    border-radius: 8px;
+    margin: -6px 0;
+}}
+
+QScrollBar:vertical {{
+    width: 12px;
+    background: {GREEN_DARK_GROUP_BG};
+    border: 2px solid {GREEN_DARK_BORDER};
+    border-radius: 6px;
+}}
+QScrollBar::handle:vertical {{
+    background: {GREEN_DARK_TAB_BG};
+    border-radius: 6px;
+}}
+"""
+
+
+# Orange in the Dark
+ORANGE_DARK_BG = VERD_BG
+ORANGE_DARK_GROUP_BG = VERD_GROUP_BG
+ORANGE_DARK_INPUT_BG = VERD_INPUT_BG
+ORANGE_DARK_TEXT = "#FFB000"
+ORANGE_DARK_BORDER = "#9C5A00"
+ORANGE_DARK_TAB_BG = "#8A3E01"
+ORANGE_DARK_TAB_SELECTED = "#D98000"
+ORANGE_DARK_MENU_HOVER = "#BF6A00"
+ORANGE_DARK_MENU_PRESSED = "#8A4700"
+
+QSS_ORANGE_IN_THE_DARK = f"""
+QAbstractScrollArea {{ background: {ORANGE_DARK_BG}; }}
+QScrollArea QWidget#qt_scrollarea_viewport {{ background: {ORANGE_DARK_BG}; }}
+QWidget {{ background: {ORANGE_DARK_BG}; color: {ORANGE_DARK_TEXT}; }}
+QMainWindow, QDialog {{ background: {ORANGE_DARK_BG}; }}
+
+QGroupBox {{
+    background: {ORANGE_DARK_GROUP_BG};
+    border: 2px solid {ORANGE_DARK_BORDER};
+    border-radius: 8px;
+    margin-top: 14px;
+}}
+QGroupBox::title {{
+    subcontrol-origin: margin;
+    left: 10px;
+    padding: 3px 8px;
+    background: {ORANGE_DARK_TAB_BG};
+    color: {ORANGE_DARK_TEXT};
+    border-radius: 6px;
+    font-weight: 800;
+}}
+
+QTabWidget::pane {{
+    border: 2px solid {ORANGE_DARK_BORDER};
+    top: -2px;
+    background: {ORANGE_DARK_GROUP_BG};
+}}
+QTabBar::tab {{
+    background: {ORANGE_DARK_TAB_BG};
+    padding: 7px 14px;
+    border: 2px solid {ORANGE_DARK_BORDER};
+    border-bottom: none;
+    border-top-left-radius: 8px;
+    border-top-right-radius: 8px;
+    color: {ORANGE_DARK_TEXT};
+    font-weight: 800;
+}}
+QTabBar::tab:hover {{ background: {ORANGE_DARK_MENU_HOVER}; }}
+QTabBar::tab:selected {{
+    background: {ORANGE_DARK_TAB_SELECTED};
+    color: {ORANGE_DARK_TEXT};
+    font-weight: 900;
+}}
+
+QPushButton {{
+    background: {ORANGE_DARK_TAB_BG};
+    border: 2px solid {ORANGE_DARK_BORDER};
+    border-radius: 8px;
+    padding: 6px 12px;
+    color: {ORANGE_DARK_TEXT};
+    font-weight: 800;
+}}
+QPushButton:hover {{ background: {ORANGE_DARK_TAB_SELECTED}; }}
+QPushButton:pressed {{ background: {ORANGE_DARK_MENU_HOVER}; }}
+
+QLineEdit, QComboBox, QTextEdit, QSpinBox, QDoubleSpinBox {{
+    background: {ORANGE_DARK_INPUT_BG};
+    border: 2px solid {ORANGE_DARK_BORDER};
+    border-radius: 8px;
+    padding: 5px 8px;
+    color: {ORANGE_DARK_TEXT};
+}}
+QComboBox::drop-down {{ width: 24px; }}
+
+QCheckBox, QRadioButton {{
+    background: transparent;
+    border: none;
+    color: {ORANGE_DARK_TEXT};
+}}
+
+QSlider::groove:horizontal {{
+    height: 6px;
+    background: {ORANGE_DARK_BORDER};
+    border-radius: 3px;
+}}
+QSlider::handle:horizontal {{
+    width: 16px;
+    background: {ORANGE_DARK_TAB_SELECTED};
+    border: 2px solid {ORANGE_DARK_BORDER};
+    border-radius: 8px;
+    margin: -6px 0;
+}}
+
+QScrollBar:vertical {{
+    width: 12px;
+    background: {ORANGE_DARK_GROUP_BG};
+    border: 2px solid {ORANGE_DARK_BORDER};
+    border-radius: 6px;
+}}
+QScrollBar::handle:vertical {{
+    background: {ORANGE_DARK_TAB_BG};
+    border-radius: 6px;
+}}
+"""
+
+
+# Red in the Dark
+RED_DARK_BG = VERD_BG
+RED_DARK_GROUP_BG = VERD_GROUP_BG
+RED_DARK_INPUT_BG = VERD_INPUT_BG
+RED_DARK_TEXT = "#FF4040"
+RED_DARK_BORDER = "#9C1A1A"
+RED_DARK_TAB_BG = "#8A0101"
+RED_DARK_TAB_SELECTED = "#D90000"
+RED_DARK_MENU_HOVER = "#BF0000"
+RED_DARK_MENU_PRESSED = "#8A0000"
+
+QSS_RED_IN_THE_DARK = f"""
+QAbstractScrollArea {{ background: {RED_DARK_BG}; }}
+QScrollArea QWidget#qt_scrollarea_viewport {{ background: {RED_DARK_BG}; }}
+QWidget {{ background: {RED_DARK_BG}; color: {RED_DARK_TEXT}; }}
+QMainWindow, QDialog {{ background: {RED_DARK_BG}; }}
+
+QGroupBox {{
+    background: {RED_DARK_GROUP_BG};
+    border: 2px solid {RED_DARK_BORDER};
+    border-radius: 8px;
+    margin-top: 14px;
+}}
+QGroupBox::title {{
+    subcontrol-origin: margin;
+    left: 10px;
+    padding: 3px 8px;
+    background: {RED_DARK_TAB_BG};
+    color: {RED_DARK_TEXT};
+    border-radius: 6px;
+    font-weight: 800;
+}}
+
+QTabWidget::pane {{
+    border: 2px solid {RED_DARK_BORDER};
+    top: -2px;
+    background: {RED_DARK_GROUP_BG};
+}}
+QTabBar::tab {{
+    background: {RED_DARK_TAB_BG};
+    padding: 7px 14px;
+    border: 2px solid {RED_DARK_BORDER};
+    border-bottom: none;
+    border-top-left-radius: 8px;
+    border-top-right-radius: 8px;
+    color: {RED_DARK_TEXT};
+    font-weight: 800;
+}}
+QTabBar::tab:hover {{ background: {RED_DARK_MENU_HOVER}; }}
+QTabBar::tab:selected {{
+    background: {RED_DARK_TAB_SELECTED};
+    color: {RED_DARK_TEXT};
+    font-weight: 900;
+}}
+
+QPushButton {{
+    background: {RED_DARK_TAB_BG};
+    border: 2px solid {RED_DARK_BORDER};
+    border-radius: 8px;
+    padding: 6px 12px;
+    color: {RED_DARK_TEXT};
+    font-weight: 800;
+}}
+QPushButton:hover {{ background: {RED_DARK_TAB_SELECTED}; }}
+QPushButton:pressed {{ background: {RED_DARK_MENU_HOVER}; }}
+
+QLineEdit, QComboBox, QTextEdit, QSpinBox, QDoubleSpinBox {{
+    background: {RED_DARK_INPUT_BG};
+    border: 2px solid {RED_DARK_BORDER};
+    border-radius: 8px;
+    padding: 5px 8px;
+    color: {RED_DARK_TEXT};
+}}
+QComboBox::drop-down {{ width: 24px; }}
+
+QCheckBox, QRadioButton {{
+    background: transparent;
+    border: none;
+    color: {RED_DARK_TEXT};
+}}
+
+QSlider::groove:horizontal {{
+    height: 6px;
+    background: {RED_DARK_BORDER};
+    border-radius: 3px;
+}}
+QSlider::handle:horizontal {{
+    width: 16px;
+    background: {RED_DARK_TAB_SELECTED};
+    border: 2px solid {RED_DARK_BORDER};
+    border-radius: 8px;
+    margin: -6px 0;
+}}
+
+QScrollBar:vertical {{
+    width: 12px;
+    background: {RED_DARK_GROUP_BG};
+    border: 2px solid {RED_DARK_BORDER};
+    border-radius: 6px;
+}}
+QScrollBar::handle:vertical {{
+    background: {RED_DARK_TAB_BG};
     border-radius: 6px;
 }}
 """
@@ -1227,7 +1769,7 @@ QScrollBar::handle:vertical {{ background: {AURORA_BORDER}; border-radius: 6px; 
 
 
 
-# --- Mardi Gras theme (purple/green/gold) --------------------------------------------------
+# --- Purple Life theme (purple/green/gold) --------------------------------------------------
 MARDI_BG = "#1B0F2A"
 MARDI_GROUP_BG = "#24123A"
 MARDI_TEXT = "#FDE68A"

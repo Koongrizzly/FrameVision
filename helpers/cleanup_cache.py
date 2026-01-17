@@ -53,15 +53,11 @@ def _is_under_any(path: Path, roots: list[Path]) -> bool:
             return True
     return False
 
-
 def _is_older_than(path: Path, cutoff_ts: float) -> bool:
     try:
         return path.stat().st_mtime < cutoff_ts
     except OSError:
         return False
-
-
-
 
 def _clear_dir_contents(base_dir: Path) -> int:
     """Remove everything inside base_dir (keeps base_dir itself)."""
@@ -144,6 +140,8 @@ def run_cleanup(
             (base / ".venv"),
             (base / ".ace_env"),
             (base / "models"),
+            (base / ".qwen2512"),
+            (base / ".sdxl_inpaint"),
             (base / ".comfy_env"),
             (base / ".zimage_env"),
             (base / ".wan_env"),
@@ -162,8 +160,8 @@ def run_cleanup(
             removed["pyc_pyo"] += _rm(p)
 
     if clean_logs:
-        # Remove log files older than 24 hours
-        cutoff = time.time() - 24 * 60 * 60
+        # Remove log files older than 72 hours
+        cutoff = time.time() - 72 * 60 * 60
 
         # 1) root /logs/ directory
         logs_dir = base / "logs"
@@ -191,10 +189,10 @@ def run_cleanup(
                 continue
             removed["thumbs"] += _rm(p)
 
-        # Also clear items older than 24 hours inside a top-level /temp/ folder under the project root, if present
+        # Also clear items older than 48 hours inside a top-level /temp/ folder under the project root, if present
         temp_dir = base / "temp"
         if temp_dir.exists() and temp_dir.is_dir():
-            cutoff = time.time() - 24 * 60 * 60
+            cutoff = time.time() - 48 * 60 * 60
             removed["thumbs"] += _clear_dir_older_than(temp_dir, cutoff)
 
     if clean_qt_cache:

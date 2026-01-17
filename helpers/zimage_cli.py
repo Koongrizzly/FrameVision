@@ -29,6 +29,8 @@ import traceback
 from pathlib import Path
 import sys
 import inspect
+import unicodedata
+import re
 
 
 def _unique_path(p: Path) -> Path:
@@ -51,6 +53,50 @@ def _unique_path(p: Path) -> Path:
 def _root_dir() -> "Path":
     # helpers/zimage_cli.py -> <root>/helpers
     return Path(__file__).resolve().parent.parent
+
+
+def _sanitize_sdcli_text(s: str) -> str:
+    """
+    sd-cli.exe (stable-diffusion.cpp) can crash in MSVC debug builds when
+    argv contains non-ASCII bytes and it uses ctype() on signed chars.
+    To keep GGUF mode stable, we sanitize prompt/negative to plain ASCII.
+    """
+    try:
+        if s is None:
+            return ""
+        s = str(s)
+
+        # Normalize common Unicode punctuation to ASCII equivalents first.
+        trans = {
+            "\u2018": "'", "\u2019": "'", "\u201a": "'", "\u201b": "'",
+            "\u2032": "'", "\u2035": "'",
+            "\u201c": '"', "\u201d": '"', "\u201e": '"', "\u201f": '"',
+            "\u00ab": '"', "\u00bb": '"',
+            "\u2013": "-", "\u2014": "-", "\u2212": "-", "\u00ad": "-",
+            "\u2026": "...",
+            "\u00a0": " ",  # nbsp
+        }
+        s = s.translate(str.maketrans(trans))
+
+        # Remove zero-width/invisible characters.
+        s = re.sub(r"[\u200B-\u200D\uFEFF]", "", s)
+
+        # Strip control chars that can confuse parsers.
+        s = s.replace("\r", " ").replace("\n", " ").replace("\t", " ")
+
+        # Best-effort transliteration to ASCII (e.g., Beyoncé -> Beyonce).
+        s = unicodedata.normalize("NFKD", s)
+        s = s.encode("ascii", "ignore").decode("ascii", "ignore")
+
+        # Collapse excessive whitespace.
+        s = re.sub(r"\s+", " ", s).strip()
+        return s
+    except Exception:
+        # Last resort: ensure we never crash the wrapper.
+        try:
+            return str(s).encode("ascii", "ignore").decode("ascii", "ignore")
+        except Exception:
+            return ""
 
 
 def _run_gguf(args) -> dict:
@@ -129,8 +175,20 @@ def _run_gguf(args) -> dict:
             fname = f"z_img_{seed}_{idx:03d}.png"
         fpath = outdir / fname
 
-        prompt = str(getattr(args, "prompt", ""))
-        neg = str(getattr(args, "negative", "") or "")
+        prompt_raw = str(getattr(args, "prompt", ""))
+        neg_raw = str(getattr(args, "negative", "") or "")
+
+        # IMPORTANT: sd-cli.exe may crash on non-ASCII text in prompts (MSVC debug assertion).
+        prompt = _sanitize_sdcli_text(prompt_raw)
+        neg = _sanitize_sdcli_text(neg_raw)
+
+        if (prompt != prompt_raw) or (neg != neg_raw):
+            try:
+                msg = "[zimage_cli][gguf] Sanitized prompt/negative to ASCII for sd-cli compatibility."
+                _log(msg)
+                print(msg, flush=True)
+            except Exception:
+                pass
         h = int(getattr(args, "height", 1024))
         w = int(getattr(args, "width", 1024))
         steps = int(getattr(args, "steps", 20))
@@ -154,6 +212,22 @@ def _run_gguf(args) -> dict:
             "--guidance", str(guidance),
         ]
 
+
+        # Optional img2img: if an init image is provided, switch sd-cli to img2img mode
+        try:
+            init_img = str(getattr(args, "init_image", "") or "").strip()
+        except Exception:
+            init_img = ""
+        if init_img:
+            try:
+                strength = float(getattr(args, "strength", 0.35))
+            except Exception:
+                strength = 0.35
+            try:
+                strength = max(0.0, min(1.0, strength))
+            except Exception:
+                strength = 0.35
+            cmd += ["--mode", "img2img", "--init-img", init_img, "--strength", str(strength)]
         if getattr(args, "attn_slicing", False):
             # Use as "low-vram mode" for gguf backend
             cmd += ["--vae-tiling", "--offload-to-cpu", "--clip-on-cpu", "--vae-on-cpu"]
@@ -204,6 +278,10 @@ def main(argv=None) -> int:
     parser.add_argument("--outdir", required=True)
     parser.add_argument("--fmt", default="png")
     parser.add_argument("--filename_template", default="zimage_{seed}_{idx:03d}.png")
+
+    # Optional img2img: pass an init image and strength to generate variations
+    parser.add_argument("--init-image", dest="init_image", default="")
+    parser.add_argument("--strength", type=float, default=0.35)
     # Optional: explicit attention-slicing flag from UI / caller.
     parser.add_argument("--attn-slicing", action="store_true", default=False)
     # Seed variance enhancer (Turbo): optional prompt-embedding noise.
@@ -231,7 +309,7 @@ def main(argv=None) -> int:
 
     try:
         import torch  # type: ignore
-        from diffusers import ZImagePipeline  # type: ignore
+        from diffusers import ZImagePipeline, ZImageImg2ImgPipeline  # type: ignore
     except Exception as e:
         payload = {"files": [], "error": f"import_failed: {e}"}
         print(json.dumps(payload))
@@ -280,7 +358,14 @@ def main(argv=None) -> int:
         if not model_dir.exists():
             raise RuntimeError(f"model_dir_not_found: {model_dir}")
 
-        pipe = ZImagePipeline.from_pretrained(
+        init_img_path = ""
+        try:
+            init_img_path = str(getattr(args, "init_image", "") or "").strip()
+        except Exception:
+            init_img_path = ""
+        pipe_cls = ZImageImg2ImgPipeline if init_img_path else ZImagePipeline
+
+        pipe = pipe_cls.from_pretrained(
             str(model_dir),
             torch_dtype=dtype if device == "cuda" else torch.float32,
             low_cpu_mem_usage=True,
@@ -541,6 +626,28 @@ def main(argv=None) -> int:
             neg = (args.negative or "").strip()
             if neg:
                 kwargs["negative_prompt"] = neg
+            # Optional img2img: add init image + strength
+            if init_img_path:
+                try:
+                    from PIL import Image  # type: ignore
+                    img0 = Image.open(init_img_path).convert("RGB")
+                    # Match requested output size; the pipeline expects a PIL image
+                    try:
+                        img0 = img0.resize((int(args.width), int(args.height)), resample=getattr(Image, "LANCZOS", 1))
+                    except Exception:
+                        pass
+                    kwargs["image"] = img0
+                    try:
+                        s = float(getattr(args, "strength", 0.35))
+                    except Exception:
+                        s = 0.35
+                    try:
+                        s = max(0.0, min(1.0, s))
+                    except Exception:
+                        s = 0.35
+                    kwargs["strength"] = s
+                except Exception:
+                    pass
             # Optional: seed variance enhancer (Turbo)
             if sv_enabled and sv_strength > 0:
                 try:

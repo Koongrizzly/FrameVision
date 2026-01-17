@@ -147,8 +147,6 @@ if __name__ == '__main__':
     main()
 """
 # Extend-chain merge seam fix (Hunyuan 1.5)
-# Hunyuan segments can "pause" for a split second at the start of each new chunk.
-# These settings help hide the join by trimming the start of appended chunks before merging.
 # - DROP_FRAMES: frames removed from the START of every appended segment (not the first).
 # - BLEND_FRAMES: optional micro crossfade length in frames (0 disables; concat-only).
 EXTEND_JOIN_DROP_FRAMES = 1
@@ -323,6 +321,7 @@ class Hunyuan15ToolWidget(QWidget):
 
         # Video-to-video state (use last frame of a chosen source video as the start image)
         self._video2video_path: Path | None = None
+        self._v2v_last_frame: Path | None = None
         self._extend_auto_merge: bool = False
         self._extend_pending_output: Path | None = None
         self._extend_base_out: Path | None = None
@@ -332,6 +331,9 @@ class Hunyuan15ToolWidget(QWidget):
 
         # Remember exact output path used for the last direct run (helps extend bookkeeping)
         self._last_run_out_path: Path | None = None
+
+        # Last completed Direct run result (used for optional auto-play)
+        self._last_direct_result_path: Path | None = None
 
         # Track what the current QProcess was launched for (install/download/generate)
         self._current_task: str | None = None
@@ -373,6 +375,23 @@ class Hunyuan15ToolWidget(QWidget):
         self.btn_open_out.setToolTip("Open Media Explorer and scan the current output folder.")
         self.btn_clear_log = QPushButton("Clear Log")
         self.btn_clear_log.setToolTip("Clear the log output in this panel.")
+        self.btn_play_last = QPushButton("Play last result")
+        self.btn_play_last.setCheckable(True)
+        self.btn_play_last.setChecked(False)
+        try:
+            self._update_play_last_btn_text()
+        except Exception:
+            pass
+        try:
+            self.btn_play_last.setToolTip(
+                "When enabled (Direct run / Extend mode), the last finished result will auto-play in the Media Player."
+            )
+        except Exception:
+            pass
+        try:
+            self.btn_play_last.setVisible(False)
+        except Exception:
+            pass
         self.btn_stop.setEnabled(False)
         self.btn_stop.setToolTip("Stop the currently running process (if any).")
         self.btn_queue.setToolTip(
@@ -526,6 +545,92 @@ class Hunyuan15ToolWidget(QWidget):
         self.extend_merge.setToolTip(
             "After all segments are generated, merge them into a single MP4 using ffmpeg concat (fast copy when possible)."
         )
+
+        # Extend join seam-fix controls (visible only when Extend > 0)
+        # 1) Remove frames from the START of every appended segment before merging (0 disables)
+        self.extend_join_drop_slider = QSlider(Qt.Horizontal)
+        self.extend_join_drop_slider.setRange(0, 10)
+        self.extend_join_drop_slider.setSingleStep(1)
+        self.extend_join_drop_spin = QSpinBox()
+        self.extend_join_drop_spin.setRange(0, 10)
+        try:
+            self.extend_join_drop_spin.setValue(int(globals().get("EXTEND_JOIN_DROP_FRAMES", 0) or 0))
+        except Exception:
+            self.extend_join_drop_spin.setValue(0)
+
+        try:
+            tip = (
+                "Extend seam fix — remove frames from the START of every appended segment before merging.\n"
+                "0 = disabled.\n"
+                "Higher values can hide the tiny 'pause' seam, but may cut motion at the join."
+            )
+            self.extend_join_drop_slider.setToolTip(tip)
+            self.extend_join_drop_spin.setToolTip(tip)
+        except Exception:
+            pass
+
+        self.extend_join_drop_row = QWidget()
+        _dj_lay = QHBoxLayout(self.extend_join_drop_row)
+        _dj_lay.setContentsMargins(0, 0, 0, 0)
+        _dj_lay.addWidget(self.extend_join_drop_slider, 1)
+        _dj_lay.addWidget(self.extend_join_drop_spin, 0)
+        self.extend_join_drop_row.setVisible(False)
+
+        # 2) Blend frames across joins (micro crossfade) during auto-merge (0 disables)
+        self.extend_join_blend_slider = QSlider(Qt.Horizontal)
+        self.extend_join_blend_slider.setRange(0, 15)
+        self.extend_join_blend_slider.setSingleStep(1)
+        self.extend_join_blend_spin = QSpinBox()
+        self.extend_join_blend_spin.setRange(0, 15)
+        try:
+            self.extend_join_blend_spin.setValue(int(globals().get("EXTEND_JOIN_BLEND_FRAMES", 0) or 0))
+        except Exception:
+            self.extend_join_blend_spin.setValue(0)
+
+        try:
+            tip = (
+                "Extend seam fix — blend (crossfade) this many frames across joins when auto-merging.\n"
+                "0 = disabled (concat-only).\n"
+                "Uses ffmpeg xfade and requires ffprobe for accurate timing."
+            )
+            self.extend_join_blend_slider.setToolTip(tip)
+            self.extend_join_blend_spin.setToolTip(tip)
+        except Exception:
+            pass
+
+        self.extend_join_blend_row = QWidget()
+        _bj_lay = QHBoxLayout(self.extend_join_blend_row)
+        _bj_lay.setContentsMargins(0, 0, 0, 0)
+        _bj_lay.addWidget(self.extend_join_blend_slider, 1)
+        _bj_lay.addWidget(self.extend_join_blend_spin, 0)
+        self.extend_join_blend_row.setVisible(False)
+
+        # Wire seam-fix sliders <-> number boxes
+        try:
+            self._set_extend_join_drop(int(self.extend_join_drop_spin.value()))
+        except Exception:
+            pass
+        try:
+            self._set_extend_join_blend(int(self.extend_join_blend_spin.value()))
+        except Exception:
+            pass
+        try:
+            self.extend_join_drop_slider.valueChanged.connect(self._on_extend_join_drop_slider_changed)
+        except Exception:
+            pass
+        try:
+            self.extend_join_drop_spin.valueChanged.connect(self._on_extend_join_drop_spin_changed)
+        except Exception:
+            pass
+        try:
+            self.extend_join_blend_slider.valueChanged.connect(self._on_extend_join_blend_slider_changed)
+        except Exception:
+            pass
+        try:
+            self.extend_join_blend_spin.valueChanged.connect(self._on_extend_join_blend_spin_changed)
+        except Exception:
+            pass
+
 
         self.offload = QCheckBox("Enable model CPU offload")
         try:
@@ -829,6 +934,16 @@ class Hunyuan15ToolWidget(QWidget):
         h_ext.addStretch(1)
         form.addRow(h_ext)
 
+        self.lbl_extend_join_drop = QLabel("Remove frames (seam fix):")
+        self.lbl_extend_join_blend = QLabel("Merge blend frames:")
+        try:
+            self.lbl_extend_join_drop.setVisible(False)
+            self.lbl_extend_join_blend.setVisible(False)
+        except Exception:
+            pass
+        form.addRow(self.lbl_extend_join_drop, self.extend_join_drop_row)
+        form.addRow(self.lbl_extend_join_blend, self.extend_join_blend_row)
+
         form.addRow(QLabel("Output filename:"), self.output_name)
         form.addRow(self.adv_box)
 
@@ -843,6 +958,7 @@ class Hunyuan15ToolWidget(QWidget):
         btns2.addWidget(self.btn_stop)
         btns2.addWidget(self.btn_open_out)
         btns2.addWidget(self.btn_clear_log)
+        btns2.addWidget(self.btn_play_last)
         btns2.addStretch(1)
 
         # Scrollable content: settings + logs
@@ -869,6 +985,12 @@ class Hunyuan15ToolWidget(QWidget):
         self.btn_stop.clicked.connect(self.on_stop)
         self.btn_open_out.clicked.connect(self.on_view_results)
         self.btn_clear_log.clicked.connect(self.on_clear_log)
+        try:
+            # Keep a very obvious ON/OFF indicator in the button text (themes may not style :checked).
+            self.btn_play_last.toggled.connect(self._on_play_last_toggled)
+            self.btn_play_last.toggled.connect(self._schedule_persist)
+        except Exception:
+            pass
         self.btn_pick_image.clicked.connect(self.on_pick_image)
         self.btn_clear_image.clicked.connect(self.on_clear_image)
 
@@ -925,18 +1047,43 @@ class Hunyuan15ToolWidget(QWidget):
         except Exception:
             pass
         self.seed.setValue(int(s.get("seed", self.seed.value())))
+        # Extend is a one-shot mode; always start at 0 after restart.
         try:
-            self.extend.setValue(int(s.get("extend", self.extend.value())))
-        except Exception:
             self.extend.setValue(0)
+        except Exception:
+            pass
         try:
             self.extend_merge.setChecked(bool(s.get("extend_merge", self.extend_merge.isChecked())))
         except Exception:
             pass
+
+        # Extend seam-fix sliders
+        try:
+            drop = s.get("extend_join_drop_frames", None)
+            if drop is None:
+                drop = int(globals().get("EXTEND_JOIN_DROP_FRAMES", 0) or 0)
+            self._set_extend_join_drop(int(drop))
+        except Exception:
+            try:
+                self._set_extend_join_drop(int(globals().get("EXTEND_JOIN_DROP_FRAMES", 0) or 0))
+            except Exception:
+                pass
+        try:
+            blend = s.get("extend_join_blend_frames", None)
+            if blend is None:
+                blend = int(globals().get("EXTEND_JOIN_BLEND_FRAMES", 0) or 0)
+            self._set_extend_join_blend(int(blend))
+        except Exception:
+            try:
+                self._set_extend_join_blend(int(globals().get("EXTEND_JOIN_BLEND_FRAMES", 0) or 0))
+            except Exception:
+                pass
+
         try:
             self._on_extend_value_changed(int(self.extend.value()))
         except Exception:
             pass
+
         self.offload.setChecked(bool(s.get("offload", True)))
         self.attn_slicing.setChecked(bool(s.get("attn_slicing", False)))
         self.vae_slicing.setChecked(bool(s.get("vae_slicing", False)))
@@ -1005,36 +1152,50 @@ class Hunyuan15ToolWidget(QWidget):
         except Exception:
             pass
 
-        # Restore Video→Video
+        # Video→Video is a one-shot mode; always start OFF after restart.
         try:
-            self.chk_video2video.setChecked(bool(s.get("v2v_enabled", False)))
+            self.chk_video2video.setChecked(False)
         except Exception:
             pass
         try:
-            src = (s.get("v2v_source", "") or "").strip()
-            if src:
-                p = Path(src)
-                if p.exists():
-                    self._video2video_path = p
-                    try:
-                        size_mb = p.stat().st_size / (1024 * 1024)
-                        self.lbl_video2_info.setText(f"{p.name}  ({size_mb:.1f} MB)")
-                    except Exception:
-                        self.lbl_video2_info.setText(p.name)
-                else:
-                    self._video2video_path = None
+            self._video2video_path = None
+            self._v2v_last_frame = None
         except Exception:
             pass
         try:
-            self.btn_pick_v2v.setEnabled(self.chk_video2video.isChecked())
-            self.btn_use_last_v2v.setEnabled(self.chk_video2video.isChecked())
+            self.lbl_video2_info.setText("No source selected")
+        except Exception:
+            pass
+
+        # If Start image points to an auto-extracted V2V/extend frame, clear it so it can't stay active.
+        try:
+            cur_img = self._start_image_path()
+            if cur_img:
+                p = Path(cur_img)
+                if p.parent == _extend_frames_dir():
+                    self.start_image.setText("")
+        except Exception:
+            pass
+
+        try:
+            self.btn_pick_v2v.setEnabled(False)
+            self.btn_use_last_v2v.setEnabled(False)
         except Exception:
             pass
 
 
-        # Restore Queue toggle (Use Queue) — forced OFF when Extend > 0
+# Restore Queue toggle (Use Queue) — forced OFF when Extend > 0
         try:
             self._set_queue_enabled(bool(s.get("use_queue", False)), persist=False, quiet=True)
+            try:
+                if getattr(self, "btn_play_last", None) is not None:
+                    self.btn_play_last.setChecked(bool(s.get("play_last_result", False)))
+                    try:
+                        self._update_play_last_btn_text()
+                    except Exception:
+                        pass
+            except Exception:
+                pass
         except Exception:
             pass
 
@@ -1131,7 +1292,7 @@ class Hunyuan15ToolWidget(QWidget):
                 pass
 
         # spinboxes
-        for sb_name in ("frames", "steps", "fps", "bitrate_kbps", "seed", "extend"):
+        for sb_name in ("frames", "steps", "fps", "bitrate_kbps", "seed", "extend", "extend_join_drop_spin", "extend_join_blend_spin"):
             try:
                 sb = getattr(self, sb_name, None)
                 if sb is not None:
@@ -1169,6 +1330,8 @@ class Hunyuan15ToolWidget(QWidget):
             seed=int(self.seed.value()),
             extend=int(self.extend.value()),
             extend_merge=bool(self.extend_merge.isChecked()),
+            extend_join_drop_frames=int(getattr(self, "extend_join_drop_spin", None).value() if getattr(self, "extend_join_drop_spin", None) is not None else int(globals().get("EXTEND_JOIN_DROP_FRAMES", 0) or 0)),
+            extend_join_blend_frames=int(getattr(self, "extend_join_blend_spin", None).value() if getattr(self, "extend_join_blend_spin", None) is not None else int(globals().get("EXTEND_JOIN_BLEND_FRAMES", 0) or 0)),
             offload=bool(self.offload.isChecked()),
             group_offload=bool(getattr(self, 'group_offload', None) and self.group_offload.isChecked()),
             first_block_cache=bool(getattr(self, 'first_block_cache', None) and self.first_block_cache.isChecked()),
@@ -1184,6 +1347,7 @@ class Hunyuan15ToolWidget(QWidget):
             v2v_enabled=bool(getattr(self, 'chk_video2video', None) and self.chk_video2video.isChecked()),
             v2v_source=str(getattr(self, '_video2video_path', '') or ''),
             use_queue=bool(getattr(self, 'btn_queue', None) and self.btn_queue.isChecked()),
+            play_last_result=bool(getattr(self, 'btn_play_last', None) and self.btn_play_last.isChecked()),
             prompt_preset=str(getattr(self, 'combo_prompt_preset', None).currentText() if getattr(self, 'combo_prompt_preset', None) is not None else "Default"),
         )
         save_settings(s)
@@ -1290,46 +1454,175 @@ class Hunyuan15ToolWidget(QWidget):
             pass
 
     def _on_extend_value_changed(self, v: int) -> None:
-        """UI helper: enable auto-merge only when Extend is > 0."""
+        """UI helper for Extend mode.
+
+        Requirements:
+        - Seam-fix sliders + Cancel/Clear Log only visible when Extend > 0.
+        - Queue is forced:
+            * Extend == 0  → Queue ON (user cannot change)
+            * Extend > 0   → Queue OFF (user cannot change)
+        """
         try:
             v = int(v)
         except Exception:
             v = 0
+
         try:
             self.extend_merge.setEnabled(v > 0)
         except Exception:
             pass
 
-        # Extend is Direct-run only; disable Queue while Extend > 0.
         try:
-            ext_now = int(v)
+            if getattr(self, "extend_join_drop_row", None) is not None:
+                self.extend_join_drop_row.setVisible(v > 0)
+                try:
+                    if getattr(self, "lbl_extend_join_drop", None) is not None:
+                        self.lbl_extend_join_drop.setVisible(v > 0)
+                except Exception:
+                    pass
         except Exception:
-            ext_now = 0
+            pass
         try:
-            if ext_now > 0:
-                self._set_queue_enabled(False, persist=True, quiet=True)
+            if getattr(self, "extend_join_blend_row", None) is not None:
+                self.extend_join_blend_row.setVisible(v > 0)
                 try:
-                    self.btn_queue.setEnabled(False)
-                except Exception:
-                    pass
-            else:
-                try:
-                    self.btn_queue.setEnabled(True)
-                except Exception:
-                    pass
-                # Refresh text/tooltips (state may be unchanged)
-                try:
-                    self._set_queue_enabled(bool(self.btn_queue.isChecked()), persist=False, quiet=True)
+                    if getattr(self, "lbl_extend_join_blend", None) is not None:
+                        self.lbl_extend_join_blend.setVisible(v > 0)
                 except Exception:
                     pass
         except Exception:
             pass
 
-        # Debounced autosave
+        try:
+            if getattr(self, "btn_stop", None) is not None:
+                self.btn_stop.setVisible(v > 0)
+        except Exception:
+            pass
+        try:
+            if getattr(self, "btn_clear_log", None) is not None:
+                self.btn_clear_log.setVisible(v > 0)
+            if getattr(self, "btn_play_last", None) is not None:
+                self.btn_play_last.setVisible(v > 0)
+                try:
+                    self._update_play_last_btn_text()
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
+        forced_queue = (v <= 0)
+        try:
+            self._set_queue_enabled(bool(forced_queue), persist=True, quiet=True)
+        except Exception:
+            pass
+
         try:
             self._schedule_persist()
         except Exception:
             pass
+
+
+    def _update_play_last_btn_text(self) -> None:
+        """Keep the button state visually obvious even if the theme doesn't style :checked."""
+        btn = getattr(self, 'btn_play_last', None)
+        if btn is None:
+            return
+        try:
+            on = bool(btn.isChecked())
+        except Exception:
+            on = False
+        try:
+            btn.setText('Play last result: ON' if on else 'Play last result: OFF')
+        except Exception:
+            pass
+
+    def _on_play_last_toggled(self, checked: bool) -> None:
+        try:
+            self._update_play_last_btn_text()
+        except Exception:
+            pass
+
+
+    # ---------- Extend seam-fix slider helpers ----------
+
+    def _set_extend_join_drop(self, v: int) -> None:
+        try:
+            v = int(v)
+        except Exception:
+            v = 0
+        v = max(0, min(10, v))
+        try:
+            self.extend_join_drop_slider.blockSignals(True)
+            self.extend_join_drop_spin.blockSignals(True)
+            self.extend_join_drop_slider.setValue(v)
+            self.extend_join_drop_spin.setValue(v)
+        except Exception:
+            pass
+        try:
+            self.extend_join_drop_slider.blockSignals(False)
+            self.extend_join_drop_spin.blockSignals(False)
+        except Exception:
+            pass
+
+    def _set_extend_join_blend(self, v: int) -> None:
+        try:
+            v = int(v)
+        except Exception:
+            v = 0
+        v = max(0, min(15, v))
+        try:
+            self.extend_join_blend_slider.blockSignals(True)
+            self.extend_join_blend_spin.blockSignals(True)
+            self.extend_join_blend_slider.setValue(v)
+            self.extend_join_blend_spin.setValue(v)
+        except Exception:
+            pass
+        try:
+            self.extend_join_blend_slider.blockSignals(False)
+            self.extend_join_blend_spin.blockSignals(False)
+        except Exception:
+            pass
+
+    def _on_extend_join_drop_slider_changed(self, v: int) -> None:
+        try:
+            self._set_extend_join_drop(int(v))
+        except Exception:
+            pass
+        try:
+            self._schedule_persist()
+        except Exception:
+            pass
+
+    def _on_extend_join_drop_spin_changed(self, v: int) -> None:
+        try:
+            self._set_extend_join_drop(int(v))
+        except Exception:
+            pass
+        try:
+            self._schedule_persist()
+        except Exception:
+            pass
+
+    def _on_extend_join_blend_slider_changed(self, v: int) -> None:
+        try:
+            self._set_extend_join_blend(int(v))
+        except Exception:
+            pass
+        try:
+            self._schedule_persist()
+        except Exception:
+            pass
+
+    def _on_extend_join_blend_spin_changed(self, v: int) -> None:
+        try:
+            self._set_extend_join_blend(int(v))
+        except Exception:
+            pass
+        try:
+            self._schedule_persist()
+        except Exception:
+            pass
+
 
     # ---------- Queue toggle helpers ----------
 
@@ -1340,26 +1633,23 @@ class Hunyuan15ToolWidget(QWidget):
             return False
 
     def _set_queue_enabled(self, enabled: bool, persist: bool = True, quiet: bool = False) -> None:
-        """Apply Queue toggle state, update UI, and optionally persist.
+        """Apply Queue state and update UI.
 
-        Rule:
-        - If Extend > 0, Queue is forced OFF and the toggle is disabled.
+        Forced behavior:
+        - Extend == 0  → Queue ON (Generate Video queues)
+        - Extend > 0   → Queue OFF (Direct run)
+        The toggle is always non-interactive (user cannot change it).
         """
-        # Enforce Extend rule
         try:
             ext = int(self.extend.value())
         except Exception:
             ext = 0
-        if ext > 0:
-            enabled = False
 
-        # Apply checked state without recursion
+        enabled = bool(ext <= 0)
+
         try:
             self.btn_queue.blockSignals(True)
-        except Exception:
-            pass
-        try:
-            self.btn_queue.setChecked(bool(enabled))
+            self.btn_queue.setChecked(enabled)
         except Exception:
             pass
         try:
@@ -1367,30 +1657,26 @@ class Hunyuan15ToolWidget(QWidget):
         except Exception:
             pass
 
-        # Update text (simple visual hint)
+        try:
+            self.btn_queue.setEnabled(False)
+        except Exception:
+            pass
+
         try:
             self.btn_queue.setText("Use Queue ✓" if enabled else "Use Queue")
         except Exception:
             pass
 
-
-        # Update main action label based on Queue
         try:
             self.btn_generate.setText("Generate Video" if enabled else "Direct run")
         except Exception:
             pass
-        # Enable/disable toggle based on Extend
-        try:
-            self.btn_queue.setEnabled(ext <= 0)
-        except Exception:
-            pass
 
-        # Tooltips (include your requested warnings)
         try:
             q_tip = (
-                "Toggle Queue mode.\n"
-                "ON: clicking \"Generate Video\" will queue the job to the Queue tab.\n\n"
-                "Tip: Extend (extra segments) requires Direct run, so Queue is disabled while Extend > 0."
+                "Queue mode is automatic.\n\n"
+                "Extend == 0  → Queue ON (jobs go to the Queue tab).\n"
+                "Extend > 0   → Queue OFF (Direct run / extend-chain)."
             )
             self.btn_queue.setToolTip(q_tip)
         except Exception:
@@ -1399,11 +1685,10 @@ class Hunyuan15ToolWidget(QWidget):
         try:
             run_tip = (
                 "Generate Video will queue the job to the Queue tab.\n"
-                "Tip: avoid running other heavy VRAM apps at the same time.\n"
-                "Extend requires Direct run (Queue OFF)."
+                "Queue is forced ON when Extend == 0."
             ) if enabled else (
                 "Direct run starts immediately (no Queue).\n"
-                "Tip: avoid running other heavy VRAM apps at the same time."
+                "Queue is forced OFF while Extend > 0."
             )
             self.btn_generate.setToolTip(run_tip)
         except Exception:
@@ -1416,13 +1701,21 @@ class Hunyuan15ToolWidget(QWidget):
                 pass
         if (not quiet) and ext > 0:
             try:
-                self._append("[ui] Extend > 0: Queue has been disabled (Extend is Direct-run only).")
+                self._append("[ui] Extend > 0: Queue is forced OFF (Direct-run only).")
             except Exception:
                 pass
 
     def on_queue_toggled(self, checked: bool) -> None:
-        """Slot: Use Queue toggle changed."""
-        self._set_queue_enabled(bool(checked), persist=True, quiet=False)
+        """Slot: Use Queue toggle changed.
+
+        Queue is forced based on Extend, so we simply re-apply the rule.
+        """
+        try:
+            self._set_queue_enabled(bool(checked), persist=True, quiet=True)
+        except Exception:
+            pass
+
+
     # ---------- output sidecar (.json) ----------
     def _build_sidecar_meta(self, prompt: str, out_path: Path, seed: int, mode: str = "direct", extra: dict | None = None) -> dict:
         meta: dict = {}
@@ -1456,6 +1749,8 @@ class Hunyuan15ToolWidget(QWidget):
             meta["steps"] = int(self.steps.value())
             meta["fps"] = int(self.fps.value())
             meta["bitrate_kbps"] = int(self.bitrate_kbps.value())
+            meta["extend_join_drop_frames"] = int(getattr(self, "extend_join_drop_spin", None).value() if getattr(self, "extend_join_drop_spin", None) is not None else int(globals().get("EXTEND_JOIN_DROP_FRAMES", 0) or 0))
+            meta["extend_join_blend_frames"] = int(getattr(self, "extend_join_blend_spin", None).value() if getattr(self, "extend_join_blend_spin", None) is not None else int(globals().get("EXTEND_JOIN_BLEND_FRAMES", 0) or 0))
         except Exception:
             pass
 
@@ -2174,15 +2469,21 @@ class Hunyuan15ToolWidget(QWidget):
         except Exception:
             merged = root_dir() / "output" / "video" / "hunyuan15" / f"h15_extend_merged_{ts}.mp4"
 
-        # Read settings
+        # Read settings (from UI; fallback to module defaults)
         try:
-            drop_frames = int(globals().get("EXTEND_JOIN_DROP_FRAMES", 0) or 0)
+            drop_frames = int(getattr(self, "extend_join_drop_spin", None).value()) if getattr(self, "extend_join_drop_spin", None) is not None else int(globals().get("EXTEND_JOIN_DROP_FRAMES", 0) or 0)
         except Exception:
-            drop_frames = 0
+            try:
+                drop_frames = int(globals().get("EXTEND_JOIN_DROP_FRAMES", 0) or 0)
+            except Exception:
+                drop_frames = 0
         try:
-            blend_frames = int(globals().get("EXTEND_JOIN_BLEND_FRAMES", 0) or 0)
+            blend_frames = int(getattr(self, "extend_join_blend_spin", None).value()) if getattr(self, "extend_join_blend_spin", None) is not None else int(globals().get("EXTEND_JOIN_BLEND_FRAMES", 0) or 0)
         except Exception:
-            blend_frames = 0
+            try:
+                blend_frames = int(globals().get("EXTEND_JOIN_BLEND_FRAMES", 0) or 0)
+            except Exception:
+                blend_frames = 0
         try:
             fps = int(getattr(self, "fps", None).value()) if getattr(self, "fps", None) is not None else 15
         except Exception:
@@ -2485,6 +2786,11 @@ class Hunyuan15ToolWidget(QWidget):
         except Exception:
             pass
 
+        try:
+            self._last_direct_result_path = segment_path
+        except Exception:
+            pass
+
         if self._extend_remaining > 0:
             return self._start_extend_segment(segment_path)
 
@@ -2497,6 +2803,10 @@ class Hunyuan15ToolWidget(QWidget):
                 merged = None
 
             if isinstance(merged, Path) and merged.is_file():
+                try:
+                    self._last_direct_result_path = merged
+                except Exception:
+                    pass
                 try:
                     segs = []
                     try:
@@ -2627,7 +2937,27 @@ class Hunyuan15ToolWidget(QWidget):
         except Exception:
             pass
 
-        # Stop the direct-run log timer and reset UI state.
+        
+        # Auto-play last Direct run result in the internal Media Player (Direct run / Extend only)
+        try:
+            if code == 0 and (getattr(self, "_current_task", None) == "generate"):
+                try:
+                    ext_now = int(self.extend.value())
+                except Exception:
+                    ext_now = 0
+                if ext_now > 0:
+                    try:
+                        if getattr(self, "btn_play_last", None) is not None and self.btn_play_last.isChecked():
+                            p = getattr(self, "_last_direct_result_path", None)
+                            if isinstance(p, Path) and p.exists():
+                                if self._play_in_main_player(p):
+                                    self._append(f"[ui] Playing last result in Media Player:\n{p}")
+                    except Exception:
+                        pass
+        except Exception:
+            pass
+
+# Stop the direct-run log timer and reset UI state.
         try:
             self._log_flush_timer.stop()
         except Exception:
@@ -2833,6 +3163,82 @@ Pick a Start image, or enable Video→Video and pick a source video.""",
                 continue
 
         return None
+
+    def _play_in_main_player(self, media_path: Path) -> bool:
+        """Best-effort: open and play a media file in the app's internal Media Player."""
+        try:
+            p = Path(str(media_path)).expanduser()
+        except Exception:
+            return False
+        try:
+            if not p.exists():
+                return False
+        except Exception:
+            return False
+
+        main = None
+        try:
+            main = self._find_main_with_video()
+        except Exception:
+            main = None
+        if main is None:
+            return False
+
+        # Try main-window helper methods first (if present).
+        for name in ("play_path", "play_file", "open_media", "open_file", "open_path", "load_media", "load_file"):
+            try:
+                fn = getattr(main, name, None)
+                if callable(fn):
+                    fn(str(p))
+                    return True
+            except Exception:
+                pass
+
+        # Fall back to the shared video widget.
+        try:
+            video = getattr(main, "video", None)
+        except Exception:
+            video = None
+        if video is None:
+            return False
+
+        # Keep the app's tracked current_path in sync.
+        try:
+            setattr(main, "current_path", str(p))
+        except Exception:
+            pass
+
+        opened = False
+        for name in ("open", "load", "set_source", "setSource", "set_media", "setMedia"):
+            try:
+                fn = getattr(video, name, None)
+                if callable(fn):
+                    fn(str(p))
+                    opened = True
+                    break
+            except Exception:
+                pass
+        if not opened:
+            try:
+                setattr(video, "current_path", str(p))
+                opened = True
+            except Exception:
+                pass
+
+        # Start playback if possible (non-fatal if missing; some players auto-play on open()).
+        for obj in (video, getattr(video, "player", None), getattr(video, "mediaPlayer", None), getattr(video, "mp", None)):
+            if obj is None:
+                continue
+            for name in ("play", "toggle_play", "togglePlay", "start"):
+                try:
+                    fn = getattr(obj, name, None)
+                    if callable(fn):
+                        fn()
+                        return True
+                except Exception:
+                    pass
+
+        return opened
 
     def _player_position_seconds(self, video_obj) -> float | None:
         """Best-effort: extract current playback position as seconds (float)."""
@@ -3176,7 +3582,11 @@ Pick a Start image, or enable Video→Video and pick a source video.""",
         return False
 
     def _apply_v2v_source(self, video: Path, silent: bool = False) -> bool:
-        """Set Video→Video source, extract last frame, and fill Start image."""
+        """Set Video→Video source, extract last frame, and fill Start image.
+
+        Note: switching the V2V source should never keep using an old auto-extracted frame.
+        We clear the previous auto frame first so a failed extract cannot silently reuse it.
+        """
         try:
             p = Path(video)
         except Exception:
@@ -3194,6 +3604,36 @@ Pick a Start image, or enable Video→Video and pick a source video.""",
                 self.chk_video2video.setChecked(True)
         except Exception:
             pass
+
+        # If Start image currently points to an auto-extracted V2V frame, clear it before switching sources.
+        # This prevents an old V2V frame from being reused if extracting the new frame fails.
+        should_clear_old = False
+        try:
+            cur_img = self._start_image_path()
+        except Exception:
+            cur_img = ""
+        try:
+            prev_frame = getattr(self, "_v2v_last_frame", None)
+        except Exception:
+            prev_frame = None
+        try:
+            if cur_img:
+                curp = Path(cur_img)
+                if prev_frame and Path(str(prev_frame)) == curp:
+                    should_clear_old = True
+                else:
+                    try:
+                        if curp.parent == _extend_frames_dir():
+                            should_clear_old = True
+                    except Exception:
+                        pass
+        except Exception:
+            pass
+        if should_clear_old:
+            try:
+                self.start_image.setText("")
+            except Exception:
+                pass
 
         self._video2video_path = p
 
@@ -3216,11 +3656,29 @@ Pick a Start image, or enable Video→Video and pick a source video.""",
             frame_path = self._next_extend_frame_path()
             ok = self._extract_last_frame(p, frame_path)
             if not ok:
+                # Make sure we don't keep the old V2V auto-frame if we cleared it.
+                try:
+                    if should_clear_old:
+                        self.start_image.setText("")
+                except Exception:
+                    pass
+                try:
+                    self._v2v_last_frame = None
+                except Exception:
+                    pass
                 if not silent:
-                    QMessageBox.warning(self, "Video→Video", "Failed to extract last frame from the source video.")
+                    try:
+                        QMessageBox.warning(self, "Video→Video", "Failed to extract last frame from the source video.")
+                    except Exception:
+                        pass
                 return False
+
             try:
                 self.start_image.setText(str(frame_path))
+            except Exception:
+                pass
+            try:
+                self._v2v_last_frame = frame_path
             except Exception:
                 pass
             try:
@@ -3239,6 +3697,7 @@ Pick a Start image, or enable Video→Video and pick a source video.""",
                 except Exception:
                     pass
             return False
+
 
 
     def on_download(self):
@@ -3291,9 +3750,11 @@ Pick a Start image, or enable Video→Video and pick a source video.""",
 
         venv_py = self._env_python()
         model_key = self.model.currentData()
-        out_path = self._apply_autoname(prompt, int(self.seed.value()), extra=("i2v" if (self._model_is_i2v() and self._start_image_path()) else None))
+        seed_req = int(self.seed.value())
+        seed_use = self._resolve_seed(seed_req)
+        out_path = self._apply_autoname(prompt, seed_use, extra=("i2v" if (self._model_is_i2v() and self._start_image_path()) else None))
 
-        args = self._build_generate_args(prompt=prompt, out_path=out_path, seed_override=self.seed.value())
+        args = self._build_generate_args(prompt=prompt, out_path=out_path, seed_override=seed_use)
 
         # Prepare extend-chain state (Direct run only)
         try:
@@ -3315,14 +3776,20 @@ Pick a Start image, or enable Video→Video and pick a source video.""",
         self._extend_base_out = out_path
         self._extend_base_model = str(model_key) if model_key is not None else None
         self._extend_base_prompt = str(prompt)
-        self._extend_base_seed = int(self.seed.value())
+        self._extend_base_seed = int(seed_use)
         self._last_run_out_path = out_path
         self._current_task = "generate"
+        try:
+            self._last_prompt = str(prompt)
+            self._last_seed = int(seed_use)
+        except Exception:
+            pass
+
 
         # Prepare sidecar metadata for this run (written when the process finishes successfully)
         try:
             self._pending_sidecar_out = out_path
-            self._pending_sidecar_meta = self._build_sidecar_meta(prompt=prompt, out_path=out_path, seed=int(self.seed.value()), mode="direct", extra={"extend": int(ext)})
+            self._pending_sidecar_meta = self._build_sidecar_meta(prompt=prompt, out_path=out_path, seed=int(seed_use), mode="direct", extra={"extend": int(ext)})
         except Exception:
             self._pending_sidecar_out = out_path
             self._pending_sidecar_meta = None
@@ -3355,9 +3822,12 @@ Pick a Start image, or enable Video→Video and pick a source video.""",
         if not self._validate_i2v():
             return
 
-        out_path = self._apply_autoname(prompt, int(self.seed.value()), extra=("i2v" if (self._model_is_i2v() and self._start_image_path()) else None))
-        args = self._build_generate_args(prompt=prompt, out_path=out_path, seed_override=self.seed.value())
-        meta = self._build_sidecar_meta(prompt=prompt, out_path=out_path, seed=int(self.seed.value()), mode="queue", extra={"label": f"hunyuan15: {prompt[:64]}", "queued": True})
+        seed_req = int(self.seed.value())
+        seed_use = self._resolve_seed(seed_req)
+
+        out_path = self._apply_autoname(prompt, seed_use, extra=("i2v" if (self._model_is_i2v() and self._start_image_path()) else None))
+        args = self._build_generate_args(prompt=prompt, out_path=out_path, seed_override=seed_use)
+        meta = self._build_sidecar_meta(prompt=prompt, out_path=out_path, seed=int(seed_use), mode="queue", extra={"label": f"hunyuan15: {prompt[:64]}", "queued": True})
         self._queue_job(args=args, outfile=out_path, label=f"hunyuan15: {prompt[:64]}", sidecar_meta=meta)
 
     def on_batch_queue(self):
@@ -3414,18 +3884,16 @@ Pick a Start image, or enable Video→Video and pick a source video.""",
         queued = 0
         for i in range(int(n)):
             # Seed: increment if user set an explicit seed; otherwise keep random (-1)
-            seed_override = -1
-            if base_seed >= 0:
-                seed_override = base_seed + i
+            seed_use = (base_seed + i) if base_seed >= 0 else self._resolve_seed(-1)
 
-            extra = f"b{i+1:02d}" if seed_override < 0 else None
-            out_path = self._apply_autoname(prompt, seed_override, extra=extra)
+            extra = f"b{i+1:02d}" if base_seed < 0 else None
+            out_path = self._apply_autoname(prompt, seed_use, extra=extra)
 
-            args = self._build_generate_args(prompt=prompt, out_path=out_path, seed_override=seed_override)
+            args = self._build_generate_args(prompt=prompt, out_path=out_path, seed_override=seed_use)
             meta = self._build_sidecar_meta(
                 prompt=prompt,
                 out_path=out_path,
-                seed=int(seed_override),
+                seed=int(seed_use),
                 mode="queue",
                 extra={
                     "label": f"hunyuan15(b{i+1:02d}): {prompt[:48]}",
@@ -3578,33 +4046,32 @@ Pick a Start image, or enable Video→Video and pick a source video.""",
             slug = self._first3_words_slug(prompt)
         except Exception:
             slug = "prompt"
-        ts = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+        ts = datetime.now().strftime("%y%m%d")
 
         total = len(image_paths)
         queued = 0
 
         for i, imgp in enumerate(image_paths):
             try:
-                seed_override = -1
-                if base_seed >= 0:
-                    seed_override = base_seed + i
+                seed_use = (base_seed + i) if base_seed >= 0 else self._resolve_seed(-1)
 
-                seed_part = str(seed_override) if seed_override >= 0 else "rand"
+                seed_part = str(seed_use)
                 img_stem = imgp.stem[:48]
                 fname = f"H15_{slug}_{seed_part}_{ts}_i2v_{img_stem}_b{i+1:02d}.mp4"
+                fname = self._ensure_unique_output_name(fname)
                 out_path = self._output_path_for_name(fname)
 
                 args = self._build_generate_args(
                     prompt=prompt,
                     out_path=out_path,
-                    seed_override=seed_override,
+                    seed_override=seed_use,
                     image_override=str(imgp),
                 )
 
                 meta = self._build_sidecar_meta(
                     prompt=prompt,
                     out_path=out_path,
-                    seed=int(seed_override),
+                    seed=int(seed_use),
                     mode="queue",
                     extra={
                         "queued": True,
@@ -3752,10 +4219,52 @@ Pick a Start image, or enable Video→Video and pick a source video.""",
             except Exception:
                 pass
 
+
+    def _pick_random_seed(self) -> int:
+        """Pick a random positive integer seed (used when UI seed is -1)."""
+        try:
+            import secrets
+            return int(secrets.randbelow(2147483647))
+        except Exception:
+            try:
+                import random
+                return int(random.randint(0, 2147483646))
+            except Exception:
+                return 0
+
+    def _resolve_seed(self, seed: int) -> int:
+        try:
+            s = int(seed)
+        except Exception:
+            s = -1
+        return s if s >= 0 else self._pick_random_seed()
+
+    def _ensure_unique_output_name(self, name: str) -> str:
+        """If the resolved output path already exists, append _02/_03… to avoid overwriting."""
+        try:
+            p = self._output_path_for_name(name)
+        except Exception:
+            return name
+        if not p.exists():
+            return name
+        stem = p.stem
+        suf = p.suffix or ""
+        for i in range(2, 1000):
+            cand = f"{stem}_{i:02d}{suf}"
+            try:
+                if not self._output_path_for_name(cand).exists():
+                    return cand
+            except Exception:
+                continue
+        try:
+            return f"{stem}_{datetime.now().strftime('%H%M%S')}{suf}"
+        except Exception:
+            return f"{stem}_new{suf}"
+
     def _make_autoname(self, prompt: str, seed: int, extra: str | None = None) -> str:
         slug = self._first3_words_slug(prompt)
-        seed_part = str(seed) if seed >= 0 else "rand"
-        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+        seed_part = str(int(seed))
+        ts = datetime.now().strftime("%y%m%d")
         base = f"H15_{slug}_{seed_part}_{ts}"
         if extra:
             base = f"{base}_{extra}"
@@ -3763,6 +4272,7 @@ Pick a Start image, or enable Video→Video and pick a source video.""",
 
     def _apply_autoname(self, prompt: str, seed: int, extra: str | None = None) -> Path:
         name = self._make_autoname(prompt, seed, extra=extra)
+        name = self._ensure_unique_output_name(name)
         try:
             self.output_name.setText(name)
         except Exception:

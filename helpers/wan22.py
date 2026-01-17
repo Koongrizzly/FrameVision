@@ -306,13 +306,13 @@ class Wan22Pane(QWidget):
         self.cmb_size = QComboBox()
         self.cmb_size.addItems([
 
-            "640*384",
-            "736*432",
-            "832*480",
-            "480*832",
-            "896*512",
+       #     "640*384",
+       #     "736*432",
+       #     "832*480, not working well",
+       #     "480*832, not working well",
+            "896*512, gives many artifacts",
             "512*896",
-            "960*544",
+            "960*544, still not good quality",
             "1024*704",            
             "1280*544", 
             "1280*704",    # Landscape 704p (primary)

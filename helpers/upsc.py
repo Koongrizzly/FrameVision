@@ -169,23 +169,104 @@ def scan_realsr_ncnn_models() -> List[str]:
 
 
 def _parse_fps(src: Path) -> Optional[str]:
-    try:
-        out = subprocess.check_output(
-            [FFPROBE, "-v", "0", "-select_streams", "v:0", "-show_entries", "stream=r_frame_rate",
-             "-of", "default=noprint_wrappers=1:nokey=1", str(src)],
-            cwd=str(ROOT), universal_newlines=True
-        )
-        rat = out.strip() or "0/0"
-        if "/" in rat:
-            a, b = rat.split("/", 1)
-            a = float(a)
-            b = float(b) if float(b) != 0 else 1.0
-            fps = a / b
-        else:
-            fps = float(rat)
-        if fps <= 0:
+    """Return best-effort source FPS (as an ffmpeg-friendly value).
+
+    Why this exists:
+      - r_frame_rate can be misleading (often 30/1) for VFR or certain encodes.
+      - avg_frame_rate is usually closer to real playback timing.
+      - As a fallback, derive FPS from nb_frames / duration when available.
+    """
+    def _parse_ratio(s: str) -> Optional[tuple[int,int]]:
+        try:
+            s = (s or "").strip()
+            if not s or s in ("0/0", "0", "N/A"):
+                return None
+            if "/" in s:
+                a, b = s.split("/", 1)
+                a_i = int(float(a))
+                b_i = int(float(b))
+                if b_i == 0:
+                    return None
+                return (a_i, b_i)
+            # decimal
+            f = float(s)
+            if f <= 0:
+                return None
+            # represent as ratio with 1e6 precision
+            den = 1_000_000
+            num = int(round(f * den))
+            if num <= 0:
+                return None
+            return (num, den)
+        except Exception:
             return None
-        return f"{fps:.6f}".rstrip("0").rstrip(".")
+
+    def _ratio_to_str(r: tuple[int,int]) -> str:
+        n, d = r
+        if d == 1:
+            return str(n)
+        return f"{n}/{d}"
+
+    def _fps_from_ratio(r: tuple[int,int]) -> float:
+        try:
+            n, d = r
+            return float(n) / float(d) if d else 0.0
+        except Exception:
+            return 0.0
+
+    try:
+        # Pull multiple fields at once (JSON) so we can pick the best.
+        out = subprocess.check_output(
+            [FFPROBE, "-v", "error",
+             "-select_streams", "v:0",
+             "-show_entries", "stream=avg_frame_rate,r_frame_rate,nb_frames,duration,time_base",
+             "-show_entries", "format=duration",
+             "-of", "json",
+             str(src)],
+            cwd=str(ROOT),
+            universal_newlines=True
+        )
+        j = json.loads(out or "{}")
+        streams = j.get("streams") or []
+        s0 = streams[0] if streams else {}
+        fmt = j.get("format") or {}
+
+        avg = _parse_ratio(str(s0.get("avg_frame_rate") or ""))
+        rfr = _parse_ratio(str(s0.get("r_frame_rate") or ""))
+        nb_frames = s0.get("nb_frames")
+        try:
+            nb = int(nb_frames) if nb_frames not in (None, "", "N/A") else None
+        except Exception:
+            nb = None
+
+        # Prefer stream.duration, fallback to format.duration
+        dur_s = s0.get("duration")
+        if dur_s in (None, "", "N/A"):
+            dur_s = fmt.get("duration")
+        try:
+            dur = float(dur_s) if dur_s not in (None, "", "N/A") else None
+        except Exception:
+            dur = None
+
+        candidates: list[tuple[str, float]] = []
+
+        if avg:
+            candidates.append((_ratio_to_str(avg), _fps_from_ratio(avg)))
+        if nb and dur and dur > 0:
+            candidates.append((f"{(nb/dur):.6f}".rstrip("0").rstrip("."), float(nb) / float(dur)))
+        if rfr:
+            candidates.append((_ratio_to_str(rfr), _fps_from_ratio(rfr)))
+
+        # Pick the first sane candidate (avg > derived > r_frame_rate).
+        for val_str, fps in candidates:
+            if fps and 1.0 <= fps <= 240.0:
+                return val_str
+
+        # If nothing sane, last resort: try r_frame_rate as-is.
+        if rfr:
+            return _ratio_to_str(rfr)
+
+        return None
     except Exception:
         return None
 
@@ -1531,9 +1612,57 @@ class UpscPane(QtWidgets.QWidget):
                 i += 1
             return cand
         return base
+    def _sanitize_realsr_model(self, model: str, scale: int) -> str:
+        """Best-effort cleanup for Real-ESRGAN model names.
+        Fixes common issues:
+          - model accidentally passed as a full path
+          - model auto-suffixed with _x{scale} / -x{scale} when only the base file exists
+        """
+        n = (model or "").strip().strip('"').strip("'")
+        # If it looks like a path, keep only the basename (without extension)
+        try:
+            if ":" in n or "/" in n or "\\" in n:
+                base = os.path.basename(n.replace("\\", "/"))
+                n = os.path.splitext(base)[0]
+        except Exception:
+            pass
+
+        # If the selected model doesn't exist, but a stripped suffix variant does, fall back.
+        try:
+            cand_param = REALSR_DIR / f"{n}.param"
+            cand_bin = REALSR_DIR / f"{n}.bin"
+            if (not cand_param.exists()) and (not cand_bin.exists()):
+                mm = re.match(r"^(.*?)(?:[_-]x([234]))$", n, flags=re.IGNORECASE)
+                if mm:
+                    base = (mm.group(1) or "").strip()
+                    if base:
+                        b_param = REALSR_DIR / f"{base}.param"
+                        b_bin = REALSR_DIR / f"{base}.bin"
+                        if b_param.exists() or b_bin.exists():
+                            n = base
+        except Exception:
+            pass
+
+        return n
+
     def _realsr_cmd_dir(self, exe: str, indir: Path, outdir: Path, model: str, scale: int) -> List[str]:
-        n = model[:-3] if model.endswith(("-x2", "-x3", "-x4")) else model
+        n = (model or "").strip()
+        n = self._sanitize_realsr_model(n, scale)
         cmd = [exe, "-i", str(indir), "-o", str(outdir), "-n", n, "-s", str(scale), "-m", str(REALSR_DIR), "-f", "png"]
+        # Force GPU selection for Real-ESRGAN (ncnn-vulkan).
+        # Default to GPU 0 (usually the discrete NVIDIA GPU). Override with FV_REALSR_GPU_ID.
+        try:
+            gid = os.environ.get("FV_REALSR_GPU_ID", "").strip() or "0"
+            cmd += ["-g", str(gid)]
+        except Exception:
+            pass
+        # Optional thread tuning: FV_REALSR_JOBS like "1:2:2" (load:proc:save).
+        try:
+            jobs = os.environ.get("FV_REALSR_JOBS", "").strip()
+            if jobs:
+                cmd += ["-j", str(jobs)]
+        except Exception:
+            pass
         try:
             t = int(self.spin_tile.value()) if hasattr(self, "spin_tile") else 0
             if t > 0:
@@ -1543,8 +1672,23 @@ class UpscPane(QtWidgets.QWidget):
         return cmd
 
     def _realsr_cmd_file(self, exe: str, infile: Path, outfile: Path, model: str, scale: int) -> List[str]:
-        n = model[:-3] if model.endswith(("-x2", "-x3", "-x4")) else model
+        n = (model or "").strip()
+        n = self._sanitize_realsr_model(n, scale)
         cmd = [exe, "-i", str(infile), "-o", str(outfile), "-n", n, "-s", str(scale), "-m", str(REALSR_DIR)]
+        # Force GPU selection for Real-ESRGAN (ncnn-vulkan).
+        # Default to GPU 0 (usually the discrete NVIDIA GPU). Override with FV_REALSR_GPU_ID.
+        try:
+            gid = os.environ.get("FV_REALSR_GPU_ID", "").strip() or "0"
+            cmd += ["-g", str(gid)]
+        except Exception:
+            pass
+        # Optional thread tuning: FV_REALSR_JOBS like "1:2:2" (load:proc:save).
+        try:
+            jobs = os.environ.get("FV_REALSR_JOBS", "").strip()
+            if jobs:
+                cmd += ["-j", str(jobs)]
+        except Exception:
+            pass
         try:
             t = int(self.spin_tile.value()) if hasattr(self, "spin_tile") else 0
             if t > 0:
@@ -1622,8 +1766,17 @@ class UpscPane(QtWidgets.QWidget):
                     self._append_log("GFPGAN selected for a video — blocked (images only).")
                     return
     
-                model = self.combo_model_realsr.currentText()
-                fps = "30"
+                # Pick model from the currently active engine/page (important for UltraSharp/SRMD, etc.)
+                try:
+                    model = (self._fv_current_model_text() or "").strip()
+                except Exception:
+                    model = ""
+                if not model:
+                    try:
+                        model = self.combo_model_realsr.currentText()
+                    except Exception:
+                        model = ""
+                fps = _parse_fps(src) or "30"
                 work = outd / f"{src.stem}_x{scale}_work"
                 in_dir = work / "in"
                 out_dir = work / "out"
@@ -1656,9 +1809,9 @@ class UpscPane(QtWidgets.QWidget):
                 if int(self.spin_keyint.value() or 0) > 0:
                     cmd_encode += ["-g", str(int(self.spin_keyint.value()))]
                 if post:
-                    cmd_encode += ["-vf", f"fps={fps}," + post]
-                else:
-                    cmd_encode += ["-vf", f"fps={fps}"]
+                    cmd_encode += ["-vf", post]
+                
+                
                 if self.radio_a_mute.isChecked():
                     cmd_encode += ["-an"]
                 elif self.radio_a_copy.isChecked():
@@ -2060,25 +2213,64 @@ def _fv_call_enqueue(self, enq, where_label, cmds, open_on_success):
             elif isinstance(txt, str) and 'x2' in txt: factor = 2
         except Exception:
             pass
+    # Model: prefer helper that knows which dropdown is active.
+    # This prevents the "always picks the first model" bug when multiple model combos exist.
     model_name = ''
     try:
-        eng_label = getattr(self, 'combo_engine', None).currentText()
+        fn = getattr(self, "_fv_current_model_text", None)
+        if callable(fn):
+            model_name = str(fn() or "").strip()
     except Exception:
-        eng_label = ''
-    try:
-        if isinstance(eng_label, str) and 'Waifu2x' in eng_label:
-            cmw = getattr(self, 'combo_model_w2x', None)
-            if cmw and hasattr(cmw, 'currentText'):
-                model_name = cmw.currentText()
-        else:
-            cmr = getattr(self, 'combo_model_realsr', None)
-            if cmr and hasattr(cmr, 'currentText'):
-                model_name = cmr.currentText()
-    except Exception:
+        model_name = ''
+
+    if not model_name:
+        # Fallback: choose by stacked-models page (what the user is actually looking at)
         try:
-            model_name = getattr(self, 'combo_model', None).currentText()
+            stk = getattr(self, "stk_models", None)
+            page = int(stk.currentIndex()) if stk is not None else -1
         except Exception:
-            pass
+            page = -1
+
+        def _ct(attr: str) -> str:
+            w = getattr(self, attr, None)
+            try:
+                return str(w.currentText()).strip() if (w is not None and hasattr(w, "currentText")) else ""
+            except Exception:
+                return ""
+
+        if page == 1:
+            model_name = _ct("combo_model_w2x")
+        elif page == 2:
+            model_name = _ct("combo_model_srmd")
+        elif page == 3:
+            model_name = _ct("combo_model_realsr_ncnn")
+        elif page == 4:
+            model_name = _ct("combo_model_ultrasharp")
+        elif page == 5:
+            model_name = _ct("combo_model_srmd_realsr")
+        elif page == 6:
+            model_name = _ct("combo_model_gfpgan")
+        else:
+            # page 0 or unknown: use engine label mapping as best-effort
+            eng_label = _ct("combo_engine")
+            if "waifu2x" in eng_label.lower():
+                model_name = _ct("combo_model_w2x")
+            elif "ultrasharp" in eng_label.lower():
+                model_name = _ct("combo_model_ultrasharp")
+            elif "srmd (ncnn via realesrgan" in eng_label.lower():
+                model_name = _ct("combo_model_srmd_realsr")
+            elif "srmd" in eng_label.lower():
+                model_name = _ct("combo_model_srmd")
+            elif "realsr" in eng_label.lower():
+                model_name = _ct("combo_model_realsr_ncnn")
+            elif "gfpgan" in eng_label.lower():
+                model_name = _ct("combo_model_gfpgan")
+            else:
+                model_name = _ct("combo_model_realsr") or _ct("combo_model")
+
+        if not model_name:
+            model_name = _ct("combo_model_realsr") or _ct("combo_model")
+
 
     # If signature wants plain args, call with those
     if sig:
@@ -2304,11 +2496,49 @@ def _fv_r11_wrap_file(orig):
             in_p = __P(src); out_p = __P(outfile)
             if in_p.exists() and in_p.is_dir():
                 out_p.mkdir(parents=True, exist_ok=True)
-                return [engine_exe, "-i", str(in_p), "-o", str(out_p), "-s", str(sc), "-n", base, "-m", dstr]
+                cmd = [engine_exe, "-i", str(in_p), "-o", str(out_p), "-s", str(sc), "-n", base, "-m", dstr]
+                # Force GPU selection + tuning for Upscayl/ESRGAN models (realesrgan-ncnn-vulkan)
+                try:
+                    gid = os.environ.get("FV_REALSR_GPU_ID", "").strip() or "0"
+                    cmd += ["-g", str(gid)]
+                except Exception:
+                    pass
+                try:
+                    jobs = os.environ.get("FV_REALSR_JOBS", "").strip()
+                    if jobs:
+                        cmd += ["-j", str(jobs)]
+                except Exception:
+                    pass
+                try:
+                    t = int(self.spin_tile.value()) if hasattr(self, "spin_tile") else 0
+                    if t > 0:
+                        cmd += ["-t", str(t)]
+                except Exception:
+                    pass
+                return cmd
             if (not out_p.suffix) or (out_p.exists() and out_p.is_dir()):
                 out_p.mkdir(parents=True, exist_ok=True)
                 out_p = out_p / (in_p.stem + ".png")
-            return [engine_exe, "-i", str(in_p), "-o", str(out_p), "-s", str(sc), "-n", base, "-m", dstr]
+            cmd = [engine_exe, "-i", str(in_p), "-o", str(out_p), "-s", str(sc), "-n", base, "-m", dstr]
+            # Force GPU selection + tuning for Upscayl/ESRGAN models (realesrgan-ncnn-vulkan)
+            try:
+                gid = os.environ.get("FV_REALSR_GPU_ID", "").strip() or "0"
+                cmd += ["-g", str(gid)]
+            except Exception:
+                pass
+            try:
+                jobs = os.environ.get("FV_REALSR_JOBS", "").strip()
+                if jobs:
+                    cmd += ["-j", str(jobs)]
+            except Exception:
+                pass
+            try:
+                t = int(self.spin_tile.value()) if hasattr(self, "spin_tile") else 0
+                if t > 0:
+                    cmd += ["-t", str(t)]
+            except Exception:
+                pass
+            return cmd
         return orig(self, engine_exe, src, outfile, model, scale)
     return _wrapped
 
@@ -2324,7 +2554,26 @@ def _fv_r11_wrap_dir(orig):
         if isinstance(data, dict) and data.get("fv") == "upsc-model":
             base = data["base"]; dstr = data["dir"]; sc = int(data["scale"])
             in_p = __P(in_dir); out_p = __P(out_dir); out_p.mkdir(parents=True, exist_ok=True)
-            return [engine_exe, "-i", str(in_p), "-o", str(out_p), "-s", str(sc), "-n", base, "-m", dstr]
+            cmd = [engine_exe, "-i", str(in_p), "-o", str(out_p), "-s", str(sc), "-n", base, "-m", dstr]
+            # Force GPU selection + tuning for Upscayl/ESRGAN models (realesrgan-ncnn-vulkan)
+            try:
+                gid = os.environ.get("FV_REALSR_GPU_ID", "").strip() or "0"
+                cmd += ["-g", str(gid)]
+            except Exception:
+                pass
+            try:
+                jobs = os.environ.get("FV_REALSR_JOBS", "").strip()
+                if jobs:
+                    cmd += ["-j", str(jobs)]
+            except Exception:
+                pass
+            try:
+                t = int(self.spin_tile.value()) if hasattr(self, "spin_tile") else 0
+                if t > 0:
+                    cmd += ["-t", str(t)]
+            except Exception:
+                pass
+            return cmd
         return orig(self, engine_exe, in_dir, out_dir, model, scale)
     return _wrapped
 

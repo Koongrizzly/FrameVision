@@ -1,14 +1,17 @@
 #!/usr/bin/env python3
 """
-background_download.py — v1.0
+background_download.py — v1.1
 
-Extracted from downloadbg.py (v3.9) and kept ONLY the background + inpaint models
-that end up in: project_root/models/bg
+Extracted from downloadbg.py (v3.9) and kept ONLY the background-removal + inpaint models.
+
+Final locations (project root):
+- Background models:  models/bg
+- Inpaint models:     models/inpaint
 
 Downloads:
 - MODNet ONNX (required)
 - BiRefNet ONNX (optional via --pro, or included in --all/default)
-- SD 1.5 Inpainting safetensors (optional via --sd15-inpaint, or included in --all/default)
+- SDXL Juggernaut Inpaint safetensors (optional via --sd15-inpaint, or included in --all/default)
 
 Notes:
 - Pre-check destination folders BEFORE any download (prevents re-fetching huge files)
@@ -17,6 +20,7 @@ Notes:
 """
 
 import argparse
+import fnmatch
 import hashlib
 import math
 import os
@@ -27,7 +31,17 @@ import time
 import urllib.error
 import urllib.request
 
-VERSION = "v1.0"
+# Ensure Windows consoles using cp1252 don't crash on Unicode output
+try:
+    if hasattr(sys.stdout, "reconfigure"):
+        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+    if hasattr(sys.stderr, "reconfigure"):
+        sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+except Exception:
+    pass
+
+
+VERSION = "v1.1"
 
 # ------------------------------
 # Paths and helpers
@@ -45,9 +59,11 @@ def _get_project_root() -> pathlib.Path:
 ROOT = _get_project_root()
 ROOT_MODELS = ROOT / "models"
 ROOT_BG = ROOT_MODELS / "bg"
+ROOT_INPAINT = ROOT_MODELS / "inpaint"
 
 # Legacy location used by some older layouts (scripts/models/*)
 SCRIPTS_MODELS = pathlib.Path(__file__).resolve().parent / "models"
+
 
 def _human(n_bytes: int) -> str:
     units = ["B", "KB", "MB", "GB", "TB"]
@@ -168,33 +184,6 @@ def fetch_with_fallback(url_or_list, dest_path: pathlib.Path, expected_sha256: s
     if last_err:
         raise last_err
 
-def move_all_to(temp_dest: pathlib.Path, final_root: pathlib.Path) -> int:
-    final_root.mkdir(parents=True, exist_ok=True)
-
-    try:
-        if temp_dest.resolve() == final_root.resolve():
-            return 0
-    except Exception:
-        pass
-
-    moved = 0
-    for p in temp_dest.glob("*"):
-        if not p.is_file():
-            continue
-        target = final_root / p.name
-        try:
-            if target.exists():
-                try:
-                    target.unlink()
-                except Exception:
-                    os.chmod(target, 0o666)
-                    target.unlink()
-            shutil.move(str(p), str(target))
-            moved += 1
-        except Exception as e:
-            print(f"[warn] Move failed for {p.name}: {e}")
-    return moved
-
 def exists_any(root: pathlib.Path, patterns: list[str]) -> bool:
     for pat in patterns:
         for _ in root.glob(pat):
@@ -209,59 +198,14 @@ def list_matches(root: pathlib.Path, patterns: list[str]) -> list[str]:
                 hits.append(p.name)
     return sorted(set(hits))
 
-def reconcile_legacy_background_models() -> None:
-    """
-    Move legacy background model files from scripts/models (or scripts/models/bg) into project_root/models/bg.
-    This is deliberately conservative: it only migrates background files.
-    """
-    legacy = SCRIPTS_MODELS
-    if not legacy.exists():
-        return
-
-    ROOT_MODELS.mkdir(parents=True, exist_ok=True)
-    ROOT_BG.mkdir(parents=True, exist_ok=True)
-
-    legacy_bg = legacy / "bg"
-    candidates = []
-
-    if legacy_bg.exists() and legacy_bg.is_dir():
-        candidates.extend([p for p in legacy_bg.glob("*") if p.is_file()])
-    else:
-        candidates.extend([p for p in legacy.glob("*") if p.is_file()])
-
-    for p in candidates:
-        dest = ROOT_BG / p.name
-        try:
-            if dest.exists():
-                print(f"[skip] {dest} already present")
-                continue
-            shutil.move(str(p), str(dest))
-            print(f"[move] {p} -> {dest}")
-        except Exception as e:
-            print(f"[warn] Could not reconcile {p}: {e}")
-
-    # Best-effort cleanup
-    try:
-        # Remove empty bg subdir first
-        if legacy_bg.exists():
-            try:
-                legacy_bg.rmdir()
-            except Exception:
-                pass
-        # Remove legacy folder if empty
-        legacy.rmdir()
-        print(f"[clean] Deleted folder {legacy}")
-    except Exception:
-        # Leave it alone if not empty.
-        pass
-
 
 # ------------------------------
-# Background + inpaint model sources (models/bg)
+# Background + inpaint model sources
 # ------------------------------
 
 MODELS = {
     "modnet_onnx": {
+        "target": "bg",
         "url": [
             "https://huggingface.co/DavG25/modnet-pretrained-models/resolve/main/modnet_photographic_portrait_matting.onnx?download=true",
             "https://github.com/Technopagan/ai-assets/releases/download/models/modnet_photographic_portrait_matting.onnx",
@@ -269,26 +213,186 @@ MODELS = {
         ],
         "sha256": "07c308cf0fc7e6e8b2065a12ed7fc07e1de8febb7dc7839d7b7f15dd66584df9",
         "filename": "modnet_photographic_portrait_matting.onnx",
-        "size_hint": "≈ 100 MB",
+        "size_hint": "~ 100 MB",
         "optional": False,
     },
     "birefnet_onnx": {
+        "target": "bg",
         "url": "https://github.com/ZhengPeng7/BiRefNet/releases/download/v1/BiRefNet-COD-epoch_125.onnx",
         "sha256": None,
         "filename": "BiRefNet-COD-epoch_125.onnx",
-        "size_hint": "≈ 900 MB",
+        "size_hint": "~ 900 MB",
         "optional": True,
     },
+    # Note: the flag name stays --sd15-inpaint for backward compatibility.
     "sd15_inpaint_fp16": {
-        "url": "https://huggingface.co/webui/stable-diffusion-inpainting/resolve/main/sd-v1-5-inpainting.safetensors?download=true",
+        "target": "inpaint",
+        "url": "https://civitai.com/api/download/models/449759?type=Model&format=SafeTensor&size=pruned&fp=fp16",
         "sha256": None,
-        "filename": "sd-v1-5-inpainting.safetensors",
-        "size_hint": "≈ 4.0 GB",
+        "filename": "SDXL-Juggernaut-V9RDphoto2-inpaint.safetensors",
+        "size_hint": "~ 6.5 GB",
         "optional": True,
-        # treat alt names as present
-        "present_globs": ["sd-v1-5-inpainting*.*"],
+        "present_globs": ["SDXL-Juggernaut-V9RDphoto2*.*"],
     },
 }
+
+
+def _target_root_for_model(m: dict) -> pathlib.Path:
+    return ROOT_INPAINT if str(m.get("target", "bg")).lower() == "inpaint" else ROOT_BG
+
+def _other_root(target_root: pathlib.Path) -> pathlib.Path:
+    return ROOT_BG if target_root.resolve() == ROOT_INPAINT.resolve() else ROOT_INPAINT
+
+def _safe_move(src: pathlib.Path, dst: pathlib.Path) -> bool:
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        if dst.exists():
+            try:
+                dst.unlink()
+            except Exception:
+                os.chmod(dst, 0o666)
+                dst.unlink()
+        shutil.move(str(src), str(dst))
+        return True
+    except Exception as e:
+        print(f"[warn] Move failed for {src.name}: {e}")
+        return False
+
+def _build_known_patterns() -> list[tuple[str, pathlib.Path]]:
+    """Return [(pattern, target_root), ...] for strict filenames + present_globs."""
+    pats: list[tuple[str, pathlib.Path]] = []
+    for m in MODELS.values():
+        target = _target_root_for_model(m)
+        pats.append((m["filename"], target))
+        for pat in m.get("present_globs", []) or []:
+            pats.append((pat, target))
+    return pats
+
+KNOWN_PATTERNS = _build_known_patterns()
+
+
+def reconcile_legacy_models() -> None:
+    """
+    Move legacy model files from scripts/models (or scripts/models/bg|inpaint) into
+    project_root/models/bg or project_root/models/inpaint, but ONLY for files that match
+    MODELS' filenames/patterns. This avoids moving unrelated files.
+    """
+    legacy = SCRIPTS_MODELS
+    if not legacy.exists():
+        return
+
+    ROOT_MODELS.mkdir(parents=True, exist_ok=True)
+    ROOT_BG.mkdir(parents=True, exist_ok=True)
+    ROOT_INPAINT.mkdir(parents=True, exist_ok=True)
+
+    # Collect candidate files from:
+    # - scripts/models/*
+    # - scripts/models/bg/*
+    # - scripts/models/inpaint/*
+    candidates: list[pathlib.Path] = []
+    for d in [legacy, legacy / "bg", legacy / "inpaint"]:
+        if d.exists() and d.is_dir():
+            candidates.extend([p for p in d.glob("*") if p.is_file()])
+
+    moved_any = False
+    for p in candidates:
+        target_root = None
+        for pat, trg in KNOWN_PATTERNS:
+            if fnmatch.fnmatch(p.name, pat):
+                target_root = trg
+                break
+        if target_root is None:
+            continue
+
+        dest = target_root / p.name
+        if dest.exists():
+            print(f"[skip] {dest} already present")
+            continue
+
+        if _safe_move(p, dest):
+            print(f"[move] {p} -> {dest}")
+            moved_any = True
+
+    # Best-effort cleanup (only if empty after moves)
+    try:
+        for d in [legacy / "bg", legacy / "inpaint"]:
+            if d.exists():
+                try:
+                    d.rmdir()
+                except Exception:
+                    pass
+        legacy.rmdir()
+        if moved_any:
+            print(f"[clean] Deleted folder {legacy}")
+    except Exception:
+        pass
+
+
+def reconcile_wrong_folder_models() -> None:
+    """
+    If a known model was downloaded into the wrong final folder (bg vs inpaint),
+    move it to the correct one.
+    """
+    ROOT_BG.mkdir(parents=True, exist_ok=True)
+    ROOT_INPAINT.mkdir(parents=True, exist_ok=True)
+
+    for m in MODELS.values():
+        target = _target_root_for_model(m)
+        other = _other_root(target)
+
+        # exact filename
+        src = other / m["filename"]
+        dst = target / m["filename"]
+        if src.exists() and not dst.exists():
+            if _safe_move(src, dst):
+                print(f"[move] {src} -> {dst}")
+
+        # glob variants
+        pats = m.get("present_globs", []) or []
+        if pats:
+            if exists_any(target, pats):
+                continue
+            for pat in pats:
+                for p in other.glob(pat):
+                    if not p.is_file():
+                        continue
+                    dstp = target / p.name
+                    if dstp.exists():
+                        continue
+                    if _safe_move(p, dstp):
+                        print(f"[move] {p} -> {dstp}")
+
+
+def sweep_temp_to_targets(temp_dest: pathlib.Path) -> int:
+    """Move any known model files found in temp_dest into their correct final folder."""
+    if not temp_dest.exists():
+        return 0
+
+    moved = 0
+    for p in temp_dest.glob("*"):
+        if not p.is_file():
+            continue
+
+        target_root = None
+        for pat, trg in KNOWN_PATTERNS:
+            if fnmatch.fnmatch(p.name, pat):
+                target_root = trg
+                break
+        if target_root is None:
+            continue
+
+        dst = target_root / p.name
+        if dst.exists():
+            try:
+                p.unlink()
+            except Exception:
+                pass
+            continue
+
+        if _safe_move(p, dst):
+            moved += 1
+    return moved
+
 
 # ------------------------------
 # Main
@@ -299,10 +403,10 @@ def main() -> int:
     ap.add_argument(
         "--dest",
         default="models/bg",
-        help="Temporary download folder (files will be moved to project-root models/bg at the end)",
+        help="Temporary download folder (files are moved into models/bg and/or models/inpaint at the end)",
     )
-    ap.add_argument("--pro", action="store_true", help="Include BiRefNet (≈900 MB) when not using --all/--only")
-    ap.add_argument("--sd15-inpaint", action="store_true", help="Include SD 1.5 Inpainting (≈4.0 GB) when not using --all/--only")
+    ap.add_argument("--pro", action="store_true", help="Include BiRefNet (~900 MB) when not using --all/--only")
+    ap.add_argument("--sd15-inpaint", action="store_true", help="Include SDXL-Juggernaut-V9RDphoto2-inpaint (~6.5 GB) when not using --all/--only")
     ap.add_argument("--all", action="store_true", help="Download ALL background/inpaint models (also the default when no flags are passed)")
     ap.add_argument("--only", nargs="+", choices=list(MODELS.keys()), help="Download only these model keys (space-separated)")
     ap.add_argument("--hf-token", default=None, help="Hugging Face access token (overrides HF_TOKEN/HUGGINGFACE_TOKEN env vars)")
@@ -313,12 +417,14 @@ def main() -> int:
     print(f"[background_download] {VERSION}")
     print(f"[root] {ROOT.resolve()}")
 
-    # Reconcile any legacy background model locations before presence checks
-    reconcile_legacy_background_models()
+    # Reconcile any legacy model locations before presence checks
+    reconcile_legacy_models()
+    reconcile_wrong_folder_models()
 
-    dest = pathlib.Path(args.dest)
-    dest.mkdir(parents=True, exist_ok=True)
+    temp_dest = pathlib.Path(args.dest)
+    temp_dest.mkdir(parents=True, exist_ok=True)
     ROOT_BG.mkdir(parents=True, exist_ok=True)
+    ROOT_INPAINT.mkdir(parents=True, exist_ok=True)
 
     token = args.hf_token or os.getenv("HF_TOKEN") or os.getenv("HUGGINGFACE_TOKEN")
 
@@ -354,46 +460,79 @@ def main() -> int:
 
     for key in to_get:
         m = MODELS[key]
-        out = dest / m["filename"]
+        target_root = _target_root_for_model(m)
+        other_root = _other_root(target_root)
+        target_root.mkdir(parents=True, exist_ok=True)
+
+        out = temp_dest / m["filename"]
+        final_exact = target_root / m["filename"]
 
         if not args.force:
             # temp dest present
             if out.exists():
-                print(f"[skip] {out.name} already exists in {dest}")
+                print(f"[skip] {out.name} already exists in {temp_dest}")
                 continue
 
-            # exact file present at final bg folder
-            final_exact = ROOT_BG / m["filename"]
+            # exact file present at correct final folder
             if final_exact.exists():
-                print(f"[skip] {final_exact.name} already exists in models/bg")
+                print(f"[skip] {final_exact.name} already exists in {target_root.relative_to(ROOT)}")
                 continue
 
-            # extra globs for certain models (e.g., sd-v1-5-inpainting*.*)
-            present_globs = m.get("present_globs", [])
-            if present_globs and exists_any(ROOT_BG, present_globs):
-                hits = list_matches(ROOT_BG, present_globs)
-                print(f"[skip] Found existing files in models/bg matching {present_globs}: {hits}")
-                continue
+            # exact file present in the wrong folder -> move it and continue
+            wrong_exact = other_root / m["filename"]
+            if wrong_exact.exists() and not final_exact.exists():
+                if _safe_move(wrong_exact, final_exact):
+                    print(f"[move] Fixed location: {wrong_exact} -> {final_exact}")
+                    continue
 
-        print(f"[get ] {out.name}  {m['size_hint']}")
+            # extra globs for certain models (e.g., Juggernaut variants)
+            present_globs = m.get("present_globs", []) or []
+            if present_globs:
+                if exists_any(target_root, present_globs):
+                    hits = list_matches(target_root, present_globs)
+                    print(f"[skip] Found existing files in {target_root.relative_to(ROOT)} matching {present_globs}: {hits}")
+                    continue
+                # if found in the wrong folder, move the first match (and continue)
+                if exists_any(other_root, present_globs):
+                    hits = list_matches(other_root, present_globs)
+                    moved_one = False
+                    for name in hits:
+                        src = other_root / name
+                        dst = target_root / name
+                        if src.exists() and not dst.exists():
+                            if _safe_move(src, dst):
+                                print(f"[move] Fixed location: {src} -> {dst}")
+                                moved_one = True
+                    if moved_one:
+                        continue
+
+        print(f"[get ] {m['filename']}  {m['size_hint']}  -> {target_root.relative_to(ROOT)}")
         try:
             fetch_with_fallback(m["url"], out, expected_sha256=m["sha256"], token=token)
-            print(f"[ ok ] Saved to {out}")
+            # Move into correct final folder if temp_dest isn't already the target folder.
+            if out.resolve() != final_exact.resolve():
+                if _safe_move(out, final_exact):
+                    print(f"[ ok ] Saved to {final_exact}")
+                else:
+                    raise RuntimeError(f"Downloaded but failed to move into {final_exact}")
+            else:
+                print(f"[ ok ] Saved to {out}")
         except Exception as e:
             any_fail = True
-            print(f"[fail] {out.name}: {e}")
+            print(f"[fail] {m['filename']}: {e}")
 
-    moved_bg = move_all_to(dest, ROOT_BG)
-    if moved_bg:
-        print(f"[move] Moved {moved_bg} file(s) to {ROOT_BG.resolve()}")
-    else:
-        print(f"[move] No move step needed or files already in place at {ROOT_BG.resolve()}")
+    # Sweep any known leftovers from temp_dest into the proper final folders
+    moved = sweep_temp_to_targets(temp_dest)
+    if moved:
+        print(f"[move] Swept {moved} file(s) from {temp_dest} into final model folders")
 
     if any_fail and not args.ignore_errors:
         print("[done] Completed with errors.", file=sys.stderr)
         return 1
 
-    print("[done] Background + inpaint models ready in", ROOT_BG.resolve())
+    print("[done] Models ready:")
+    print("       bg     =", ROOT_BG.resolve())
+    print("       inpaint=", ROOT_INPAINT.resolve())
     return 0
 
 if __name__ == "__main__":

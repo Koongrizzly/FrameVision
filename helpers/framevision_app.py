@@ -129,7 +129,7 @@ def _open_compare_page():
 
 
 
-# FrameVision V2.1 — Full-classic UI + NCNN upscalers + branding
+# FrameVision — Full-classic UI + NCNN upscalers + branding
 # Classic layout (big player, control bar, seek slider, fullscreen) + click-to-play/pause
 # Auto Theme (Day/Evening/Night), Session Restore, Instant Tools, Presets, Describe-on-Pause,
 # Queue + Worker, Models Manager, Upscale Video/Photo buttons (queue) wired to NCNN CLIs.
@@ -141,6 +141,12 @@ from helpers.ask_popup import AskPopup
 from helpers import state_persist
 from helpers.img_fallback import load_pixmap
 from helpers.worker_led import WorkerStatusWidget
+
+try:
+    from helpers.queue_pane import QueuePane
+except Exception:
+    from queue_pane import QueuePane
+
 from helpers.tools_tab import CollapsibleSection as ToolsCollapsibleSection
 from pathlib import Path
 # ---- Begin: Quiet specific Qt warnings ----
@@ -204,7 +210,7 @@ except Exception:
     pass
 # --- END: Image allocation limit bump ---
 
-from PySide6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QGridLayout, QLabel, QPushButton, QFileDialog, QTabWidget, QSplitter, QListWidget, QListWidgetItem, QLineEdit, QFormLayout, QMessageBox, QComboBox, QSpinBox, QDoubleSpinBox, QTextEdit, QCheckBox, QTreeWidget, QTreeWidgetItem, QHeaderView, QStyle, QSlider, QToolButton, QSizePolicy, QScrollArea, QFrame, QGroupBox, QScrollArea, QFrame)
+from PySide6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QGridLayout, QLabel, QPushButton, QFileDialog, QTabWidget, QSplitter, QStackedWidget, QListWidget, QListWidgetItem, QLineEdit, QFormLayout, QMessageBox, QComboBox, QSpinBox, QDoubleSpinBox, QTextEdit, QCheckBox, QTreeWidget, QTreeWidgetItem, QHeaderView, QStyle, QSlider, QToolButton, QSizePolicy, QScrollArea, QFrame, QGroupBox, QScrollArea, QFrame)
 from PySide6.QtMultimedia import QMediaPlayer, QAudioOutput, QVideoSink
 from helpers.tools_tab import InstantToolsPane
 from helpers.themes import QSS_DAY, QSS_EVENING, QSS_NIGHT
@@ -258,6 +264,26 @@ except Exception as _e:
     print("[framevision] WAN22 tab import failed:", _e)
     Wan22Pane = None
 # <<< FRAMEVISION_WAN22_END
+
+# >>> FRAMEVISION_QWEN2511_BEGIN
+# Safe import of the Qwen2511 pane; never crash app on failure.
+# We import the module first so that a class name mismatch is easier to debug,
+# and we try a few common pane class names before giving up.
+Qwen2511Pane = None
+try:
+    import helpers.qwen2511 as _qwen2511_mod
+    for _name in ("Qwen2511Pane", "Qwen2511Tab", "QwenPane", "Qwen2511Widget"):
+        Qwen2511Pane = getattr(_qwen2511_mod, _name, None)
+        if Qwen2511Pane is not None:
+            break
+    if Qwen2511Pane is None:
+        print("[framevision] Qwen2511: module imported but no suitable pane class found. "
+              "Expected one of Qwen2511Pane/Qwen2511Tab/QwenPane/Qwen2511Widget.")
+except Exception as _e:
+    print("[framevision] Qwen2511 tab import failed:", _e)
+    Qwen2511Pane = None
+# <<< FRAMEVISION_QWEN2511_END
+
 
 
 # >>> FRAMEVISION_ace_BEGIN
@@ -862,6 +888,21 @@ class VideoPane(QWidget):
             self.player.setAudioOutput(self.audio)
             self.sink = QVideoSink(self)
             self.player.setVideoSink(self.sink)
+            # If a tool has redirected video output, honor it after rebuild.
+            try:
+                ov = getattr(self, "_video_output_override", None)
+                if ov:
+                    mode, target = ov
+                    if str(mode) == "sink":
+                        self.player.setVideoSink(target)
+                    elif str(mode) == "output":
+                        try:
+                            self.player.setVideoSink(None)
+                        except Exception:
+                            pass
+                        self.player.setVideoOutput(target)
+            except Exception:
+                pass
             self.sink.videoFrameChanged.connect(self._on_frame)
             self.player.positionChanged.connect(self.on_pos)
             self.player.durationChanged.connect(self.on_dur)
@@ -877,14 +918,13 @@ class VideoPane(QWidget):
         except Exception:
             pass
 
-        # Inform QueuePane that the player instance was rebuilt so it can re-bind playback hooks.
+        # Inform MainWindow that the internal player was rebuilt so global hooks can rebind safely.
         try:
-            q = getattr(self.main, "queue", None)
-            if q is not None and hasattr(q, "bind_video_player"):
-                q.bind_video_player(self.player)
+            hook = getattr(self.main, "_hook_video_player", None)
+            if callable(hook):
+                hook(self.player)
         except Exception:
             pass
-
     def _open_ask_popup(self):
         """Open the Ask chat popup (lazy-create)."""
         if not hasattr(self, "_ask_popup") or self._ask_popup is None:
@@ -900,6 +940,11 @@ class VideoPane(QWidget):
         try:
             if hasattr(self, 'btn_repeat'):
                 self.btn_repeat.setVisible(bool(is_video))
+                try:
+                    from PySide6.QtCore import QTimer as _QTimer
+                    _QTimer.singleShot(0, self._update_compact_button_labels)
+                except Exception:
+                    pass
         except Exception:
             pass
 
@@ -908,6 +953,11 @@ class VideoPane(QWidget):
             enabled = bool(getattr(self, '_repeat_enabled', False))
             if not hasattr(self, 'btn_repeat') or self.btn_repeat is None:
                 return
+
+            compact = bool(getattr(self.btn_repeat, "_fv_compact_label", False))
+            pad = "4px 10px" if compact else "4px 14px"
+            fw  = "900" if compact else "600"
+
             base = self.palette().button().color()
             hi = self.palette().highlight().color()
             txt_base = self.palette().buttonText().color()
@@ -915,7 +965,7 @@ class VideoPane(QWidget):
             bg = hi if enabled else base
             fg = txt_hi if enabled else txt_base
             css = (
-                "QPushButton#btn_repeat { padding:4px 14px; border-radius:8px; font-weight:600;"
+                f"QPushButton#btn_repeat {{ padding:{pad}; border-radius:8px; font-weight:{fw};"
                 f" background: rgba({bg.red()},{bg.green()},{bg.blue()},255);"
                 f" color: rgba({fg.red()},{fg.green()},{fg.blue()},255); }}"
                 "QPushButton#btn_repeat:hover { opacity: 0.9; }"
@@ -965,12 +1015,16 @@ class VideoPane(QWidget):
             pass
 
     def _update_compact_button_labels(self):
-        """Swap Upscale/Ask Framie to single-letter mode when there isn't room for the full label."""
+        """Swap Upscale/Ask Framie/Repeat to single-letter mode when there isn't room for the full labels."""
         try:
             bu = getattr(self, "btn_upscale", None)
             ba = getattr(self, "btn_ask", None)
+            br = getattr(self, "btn_repeat", None)
+
             if bu is None or ba is None:
                 return
+
+            include_repeat = bool(br is not None and br.isVisible())
 
             # Layout can report 0 sizes early in init; retry once we're laid out.
             if self.width() <= 10:
@@ -983,6 +1037,7 @@ class VideoPane(QWidget):
 
             full_u = getattr(self, "_btn_upscale_full_text", "Upscale")
             full_a = getattr(self, "_btn_ask_full_text", "Ask Framie")
+            full_r = getattr(self, "_btn_repeat_full_text", "Repeat")
 
             fm_u = bu.fontMetrics()
             fm_a = ba.fontMetrics()
@@ -990,6 +1045,14 @@ class VideoPane(QWidget):
             # Approximate full-label width as (text + padding/border).
             need_u = int(fm_u.horizontalAdvance(full_u)) + 28
             need_a = int(fm_a.horizontalAdvance(full_a)) + 28
+
+            need_r = 0
+            if include_repeat:
+                try:
+                    fm_r = br.fontMetrics()
+                    need_r = int(fm_r.horizontalAdvance(full_r)) + 28
+                except Exception:
+                    need_r = 0
 
             # IMPORTANT:
             # Don't decide compactness based on *current* button width.
@@ -1014,7 +1077,7 @@ class VideoPane(QWidget):
                     if spacing < 0:
                         spacing = 6
 
-                    # Sum size hints of everything else on the row (excluding the two label-switching buttons).
+                    # Sum size hints of everything else on the row (excluding the label-switching buttons).
                     vis_widgets = []
                     total_vis = 0
                     for i in range(lay.count()):
@@ -1023,7 +1086,7 @@ class VideoPane(QWidget):
                         if w is None or (not w.isVisible()):
                             continue
                         total_vis += 1
-                        if (w is bu) or (w is ba):
+                        if (w is bu) or (w is ba) or (include_repeat and (w is br)):
                             continue
                         vis_widgets.append(w)
 
@@ -1042,9 +1105,9 @@ class VideoPane(QWidget):
             except Exception:
                 pass
 
-            # If full labels fit, force full; otherwise force compact (both together).
+            # If full labels fit, force full; otherwise force compact (all together).
             cushion = 8
-            want_full = (avail >= (fixed + need_u + need_a + cushion))
+            want_full = (avail >= (fixed + need_u + need_a + need_r + cushion))
             compact_u = not want_full
             compact_a = not want_full
 
@@ -1064,10 +1127,34 @@ class VideoPane(QWidget):
                 getattr(self, "_btn_ask_style_full", ""),
                 getattr(self, "_btn_ask_style_compact", ""),
             )
+
+            # Repeat uses palette-driven styling, so we only switch the label flag + text and then refresh its style.
+            if include_repeat:
+                try:
+                    want = bool(not want_full)
+                    cur = bool(getattr(br, "_fv_compact_label", False))
+                    if want != cur:
+                        br._fv_compact_label = want
+                        if want:
+                            br.setText(str(getattr(self, "_btn_repeat_compact_text", "R") or "R")[:1].upper())
+                            try:
+                                br.setToolTip(full_r)
+                            except Exception:
+                                pass
+                        else:
+                            br.setText(full_r)
+                            try:
+                                br.setToolTip("")
+                            except Exception:
+                                pass
+                        try:
+                            self._update_repeat_style()
+                        except Exception:
+                            pass
+                except Exception:
+                    pass
         except Exception:
             pass
-
-
 
     frameCaptured = Signal(QImage)
     # --- zoom/pan helpers ---
@@ -1198,12 +1285,60 @@ class VideoPane(QWidget):
         except Exception:
             pass
 
+    # --- Tool video output override (for temporary UI takeovers) ---
+    def set_video_output_override(self, mode: str, target) -> None:
+        """mode='sink' uses QVideoSink. mode='output' uses Qt's video output (e.g., QGraphicsVideoItem)."""
+        try:
+            self._video_output_override = (str(mode or ""), target)
+        except Exception:
+            self._video_output_override = None
+        try:
+            m = str(mode or "")
+            if m == "sink":
+                try:
+                    self.player.setVideoOutput(None)
+                except Exception:
+                    pass
+                self.player.setVideoSink(target)
+            elif m == "output":
+                try:
+                    self.player.setVideoSink(None)
+                except Exception:
+                    pass
+                self.player.setVideoOutput(target)
+        except Exception:
+            pass
+
+    def clear_video_output_override(self) -> None:
+        try:
+            self._video_output_override = None
+        except Exception:
+            pass
+        try:
+            try:
+                self.player.setVideoOutput(None)
+            except Exception:
+                pass
+            self.player.setVideoSink(self.sink)
+        except Exception:
+            pass
+
+
     def __init__(self,parent=None):
         # TODO: Future: audio visualizer / track info / thumbnail for audio-only playback
         # FPS throttle stripped — keep inert placeholders
         self._render_timer = None
         self._target_fps = None
+        # Playback FPS cap: keep original FPS for info display, but cap render/processing.
+        self._fps_cap = 30.0
+        self._fps_target = 30.0
+        self._src_fps = None
+        self._last_frame_accept_ts = 0.0
+        self._last_present_ts = 0.0
+        self._compare_last_accept_ts = 0.0
+        self._compare_last_present_ts = 0.0
         super().__init__(parent)
+        self._video_output_override = None
         self.player = QMediaPlayer(self); self.audio = QAudioOutput(self); self.player.setAudioOutput(self.audio)
         self.sink = QVideoSink(self); self.player.setVideoSink(self.sink); self.sink.videoFrameChanged.connect(self._on_frame)
         # Autoplay state
@@ -1290,6 +1425,8 @@ class VideoPane(QWidget):
             # Swap to a single bold capital letter (U/A) until there's room again.
             self._btn_upscale_full_text = "Upscale"
             self._btn_ask_full_text = "Ask Framie"
+            self._btn_repeat_full_text = "Repeat"
+            self._btn_repeat_compact_text = "R"
             self._btn_upscale_compact_text = "U"
             self._btn_ask_compact_text = "A"
 
@@ -1373,11 +1510,46 @@ class VideoPane(QWidget):
 
 
         bar.addStretch(1)
-        lay = QVBoxLayout(self); lay.addWidget(self.label,1); self.info_label=QLabel("—"); self.info_label.setObjectName("videoInfo"); f=self.info_label.font(); f.setPointSize(max(10, f.pointSize())); self.info_label.setFont(f); lay.addWidget(self.info_label); self.time_label=QLabel("—"); self.time_label.setObjectName("videoTime"); self.time_label.setFont(f); lay.addWidget(self.time_label); lay.addWidget(self.slider); lay.addWidget(self.compare_slider); lay.addLayout(bar)
+        lay = QVBoxLayout(self)
+        lay.addWidget(self.label, 1)
+
+        self.info_label = QLabel("—")
+        self.info_label.setObjectName("videoInfo")
+        f = self.info_label.font()
+        f.setPointSize(max(10, f.pointSize()))
+        self.info_label.setFont(f)
+        lay.addWidget(self.info_label)
+
+        # Compare info (only visible in compare mode)
+        self.compare_info_label = QLabel("")
+        self.compare_info_label.setObjectName("compareInfo")
+        try:
+            f2 = self.compare_info_label.font()
+            f2.setPointSize(max(9, f2.pointSize() - 1))
+            self.compare_info_label.setFont(f2)
+        except Exception:
+            pass
+        try:
+            self.compare_info_label.setWordWrap(True)
+        except Exception:
+            pass
+        try:
+            self.compare_info_label.hide()
+        except Exception:
+            pass
+        lay.addWidget(self.compare_info_label)
+
+        self.time_label = QLabel("—")
+        self.time_label.setObjectName("videoTime")
+        self.time_label.setFont(f)
+        lay.addWidget(self.time_label)
+
+        lay.addWidget(self.slider)
+        lay.addWidget(self.compare_slider)
+        lay.addLayout(bar)
         self.btn_open.clicked.connect(self._open_via_dialog, Qt.ConnectionType.UniqueConnection); self.btn_play.clicked.connect(self._toggle_play_pause, Qt.ConnectionType.UniqueConnection)
         # pause button hidden; no click
-        self.btn_stop.clicked.connect(self.player.stop, Qt.ConnectionType.UniqueConnection)
-        self.btn_stop.clicked.connect(self._handle_stop)
+        self.btn_stop.clicked.connect(self._handle_stop, Qt.ConnectionType.UniqueConnection)
         self.btn_info.clicked.connect(self._show_info_popup, Qt.ConnectionType.UniqueConnection)
         # ratio button removed
                 # compare button: open in-app dialog (replaces external HTML page)
@@ -1439,6 +1611,20 @@ class VideoPane(QWidget):
             self._present_pending = False
         if not hasattr(self, '_present_busy'):
             self._present_busy = False
+        # Early FPS cap: drop frames BEFORE converting to QImage (prevents 60/120fps stutter).
+        try:
+            import time as _t
+            _tgt = float(getattr(self, '_fps_target', 30.0) or 30.0)
+            if _tgt > 0:
+                if not hasattr(self, '_last_frame_accept_ts'):
+                    self._last_frame_accept_ts = 0.0
+                _now = _t.perf_counter()
+                _interval = max(0.001, 1.0 / float(_tgt))
+                if (_now - float(self._last_frame_accept_ts or 0.0)) < _interval:
+                    return
+                self._last_frame_accept_ts = _now
+        except Exception:
+            pass
 
         # Use existing render timer if present for FPS cap
         try:
@@ -1540,7 +1726,16 @@ class VideoPane(QWidget):
                 return
             p = getattr(self, '_bg_logo_path', None)
             if not p:
-                # still allow plain text fallback, do nothing
+                # Text-only fallback so the player never goes blank.
+                try:
+                    self.label.setMovie(None)
+                except Exception:
+                    pass
+                try:
+                    # Setting text clears any pixmap (if present).
+                    self.label.setText("Drop a media file here")
+                except Exception:
+                    pass
                 return
             pm = load_pixmap(p)
             if not pm or pm.isNull():
@@ -1577,6 +1772,13 @@ class VideoPane(QWidget):
             pass
 
     def _handle_stop(self):
+        # Guard against EndOfMedia callbacks triggering Repeat while we are intentionally stopping/unloading.
+        try:
+            self._fv_stop_intent = True
+            from PySide6.QtCore import QTimer
+            QTimer.singleShot(3500, lambda: setattr(self, "_fv_stop_intent", False))
+        except Exception:
+            pass
         try:
             self.player.stop()
         except Exception:
@@ -1591,8 +1793,22 @@ class VideoPane(QWidget):
             pass
         self._clear_video_sink()
         self._show_empty_background()
+        # Keep Repeat button in sync with the currently loaded media (don't hide it on Stop).
         try:
-            self._set_repeat_available(False)
+            main = self.window()
+            cp = getattr(main, "current_path", None)
+            is_vid = False
+            if cp:
+                try:
+                    from pathlib import Path as _P
+                    ext = _P(str(cp)).suffix.lower()
+                    try:
+                        is_vid = ext in set([str(x).lower() for x in list(VIDEO_EXTS)])
+                    except Exception:
+                        is_vid = ext in {".mp4",".mov",".mkv",".avi",".webm",".m4v"}
+                except Exception:
+                    is_vid = False
+            self._set_repeat_available(bool(is_vid))
         except Exception:
             pass
 
@@ -1600,6 +1816,11 @@ class VideoPane(QWidget):
         try:
             from PySide6.QtMultimedia import QMediaPlayer as _QMediaPlayer
             if status == _QMediaPlayer.EndOfMedia:
+                try:
+                    if bool(getattr(self, "_fv_stop_intent", False)):
+                        return
+                except Exception:
+                    pass
                 try:
                     if bool(getattr(self, "_repeat_enabled", False)) and getattr(self, "_mode", None) == "video":
                         self.player.setPosition(0)
@@ -1635,6 +1856,11 @@ class VideoPane(QWidget):
                 rp = getattr(self, "_compare_right_player", None)
                 if rp is not None:
                     rp.setPosition(pos)
+                    try:
+                        import time as _t
+                        self._compare_sync_soft_until = float(_t.perf_counter()) + 1.2
+                    except Exception:
+                        pass
         except Exception:
             pass
 
@@ -1937,7 +2163,68 @@ class VideoPane(QWidget):
             pass
 
 
-    def _open_via_dialog(self): self.parent().parent().parent().open_file()
+    def _open_via_dialog(self):
+            """Open File dialog via MainWindow (robust to layout changes)."""
+            # Prefer the top-level window (MainWindow)
+            try:
+                w = self.window()
+                if w is not None and hasattr(w, "open_file"):
+                    return w.open_file()
+            except Exception:
+                pass
+
+            # Fall back to stored main reference (some tools attach self.main)
+            try:
+                m = getattr(self, "main", None)
+                if m is not None and hasattr(m, "open_file"):
+                    return m.open_file()
+            except Exception:
+                pass
+
+            # Walk parent chain (handles reparented layouts/splitters)
+            try:
+                p = self.parent()
+                hops = 0
+                while p is not None and hops < 16:
+                    if hasattr(p, "open_file"):
+                        try:
+                            return p.open_file()
+                        except Exception:
+                            pass
+                    p = p.parent()
+                    hops += 1
+            except Exception:
+                pass
+
+            # Last resort: open directly and route into this VideoPane
+            try:
+                d = config.get("last_open_dir", str(ROOT))
+                flt = ("Media files (*.mp4 *.mov *.mkv *.avi *.webm *.png *.jpg *.jpeg *.bmp *.webp "
+                       "*.mp3 *.wav *.flac *.m4a *.aac *.ogg *.opus *.wma *.aif *.aiff);;"
+                       "Video files (*.mp4 *.mov *.mkv *.avi *.webm);;"
+                       "Images (*.png *.jpg *.jpeg *.bmp *.webp);;"
+                       "Audio files (*.mp3 *.wav *.flac *.m4a *.aac *.ogg *.opus *.wma *.aif *.aiff);;"
+                       "All files (*.*)")
+                fn, _ = QFileDialog.getOpenFileName(self, "Open media", d, flt)
+                if fn:
+                    p = Path(fn)
+                    config["last_open_dir"] = str(p.parent)
+                    try:
+                        save_config()
+                    except Exception:
+                        pass
+                    try:
+                        w = self.window()
+                        if w is not None and hasattr(w, "current_path"):
+                            w.current_path = p
+                    except Exception:
+                        pass
+                    try:
+                        self.open(p)
+                    except Exception:
+                        pass
+            except Exception:
+                pass
     
     def open(self, path: Path):
         # Unified open: images -> QPixmap (GIF -> QMovie), audio -> QMediaPlayer, video -> QMediaPlayer
@@ -1947,10 +2234,34 @@ class VideoPane(QWidget):
             from pathlib import Path as _P
             p = _P(str(path))
         ext = p.suffix.lower()
-        # If compare mode is active, opening a new file should exit compare
+        # If compare mode is active, opening a new file should exit compare.
+        # IMPORTANT: stop/clear first, then defer the open to the next tick. This avoids
+        # QtMultimedia backend stalls/crashes when swapping sources while the compare
+        # right-player is still winding down.
         try:
             if getattr(self, "_compare_active", False) and not getattr(self, "_compare_opening", False):
-                self.close_compare()
+                try:
+                    # Matches the manual workaround ("Stop" first), but automatic.
+                    self._handle_stop()
+                except Exception:
+                    try:
+                        self.player.stop()
+                    except Exception:
+                        pass
+                try:
+                    self.close_compare()
+                except Exception:
+                    try:
+                        self._compare_active = False
+                    except Exception:
+                        pass
+                try:
+                    from PySide6.QtCore import QTimer
+                    _pp = str(path)
+                    QTimer.singleShot(0, lambda _p=_pp: self.open(_p))
+                    return
+                except Exception:
+                    pass
         except Exception:
             pass
 
@@ -2112,14 +2423,60 @@ class VideoPane(QWidget):
         
         try: self._mode = 'video'
         except Exception: pass
+        # --- Playback FPS cap (max 30fps) ---
+        try:
+            info = probe_media(p)
+            _src = info.get('fps', None)
+            try:
+                self._src_fps = float(_src) if _src is not None else None
+            except Exception:
+                self._src_fps = None
+            cap = float(getattr(self, '_fps_cap', 30.0) or 30.0)
+            tgt = cap
+            try:
+                if self._src_fps is not None and float(self._src_fps) > 0:
+                    tgt = min(cap, float(self._src_fps))
+            except Exception:
+                tgt = cap
+            try:
+                self._fps_target = float(tgt) if tgt else cap
+            except Exception:
+                self._fps_target = cap
+            try:
+                self._target_fps = int(round(float(self._fps_target)))
+            except Exception:
+                self._target_fps = 30
+            # Reset throttle timestamps so the new cap applies immediately.
+            try: self._last_frame_accept_ts = 0.0
+            except Exception: pass
+            try: self._last_present_ts = 0.0
+            except Exception: pass
+            try: self._compare_last_accept_ts = 0.0
+            except Exception: pass
+            try: self._compare_last_present_ts = 0.0
+            except Exception: pass
+        except Exception:
+            try:
+                self._fps_target = float(getattr(self, '_fps_cap', 30.0) or 30.0)
+            except Exception:
+                self._fps_target = 30.0
         try:
             # Ensure label is not stuck on a previous still/GIF overlay
             self.label.setMovie(None)
         except Exception: pass
         try:
             from PySide6.QtGui import QPixmap as _QPM
-            self.label.setPixmap(_QPM())  # clear old still image
-        except Exception: pass
+            # Clear old still/GIF frame and show a background while the first video frame arrives.
+            self.label.setPixmap(_QPM())
+            try:
+                self._render_background_logo()
+            except Exception:
+                try:
+                    self.label.setText("Loading…")
+                except Exception:
+                    pass
+        except Exception:
+            pass
         # Stop any active GIF/QMovie to prevent an overlay from sticking
         try:
             if hasattr(self, "_gif_movie") and self._gif_movie:
@@ -2132,6 +2489,54 @@ class VideoPane(QWidget):
         self.player.setSource(QUrl.fromLocalFile(str(p)))
         try: self.player.play()
         except Exception: pass
+    def play(self):
+        """Play the main media; if compare-video is active, keep the right player in lockstep."""
+        try:
+            self.player.play()
+        except Exception:
+            pass
+        try:
+            if getattr(self, "_compare_active", False) and getattr(self, "_compare_kind", None) == "video":
+                rp = getattr(self, "_compare_right_player", None)
+                if rp is not None:
+                    try:
+                        rp.setPlaybackRate(self.player.playbackRate())
+                    except Exception:
+                        pass
+                    try:
+                        rp.setPosition(self.player.position())
+                    except Exception:
+                        pass
+                    try:
+                        rp.play()
+                    except Exception:
+                        pass
+                    try:
+                        from PySide6.QtCore import QTimer
+                        import time as _t
+                        # Tighten sync for the first moments after (re)start; QMediaPlayer often starts a few frames late.
+                        self._compare_sync_soft_until = float(_t.perf_counter()) + 1.6
+                        def _nudge_sync():
+                            try:
+                                if getattr(self, "_compare_active", False) and getattr(self, "_compare_kind", None) == "video":
+                                    _rp2 = getattr(self, "_compare_right_player", None)
+                                    if _rp2 is not None:
+                                        _rp2.setPosition(int(self.player.position() or 0))
+                            except Exception:
+                                pass
+                        QTimer.singleShot(60, _nudge_sync)
+                        QTimer.singleShot(140, _nudge_sync)
+                        QTimer.singleShot(260, _nudge_sync)
+                    except Exception:
+                        pass
+
+                try:
+                    self._compare_begin_video_sync()
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
 
     def pause(self):
         self.player.pause()
@@ -2182,7 +2587,7 @@ class VideoPane(QWidget):
             if self.player.playbackState() == QMediaPlayer.PlayingState:
                 self.pause()
             else:
-                self.player.play()
+                self.play()
             try: self._mode = 'video'
             except Exception: pass
             try: self.label.setMovie(None)
@@ -2363,7 +2768,7 @@ class VideoPane(QWidget):
                         if self.player.playbackState()==QMediaPlayer.PlayingState:
                             self.pause()
                         else:
-                            self.player.play()
+                            self.play()
                         _fs_sync_pp()
                     except Exception:
                         pass
@@ -2493,7 +2898,7 @@ class VideoPane(QWidget):
                         if self.player.playbackState()==QMediaPlayer.PlayingState:
                             self.pause()
                         else:
-                            self.player.play()
+                            self.play()
                         return
                 except Exception:
                     pass
@@ -2768,6 +3173,74 @@ class VideoPane(QWidget):
     # -----------------------------
     # Compare tool (in-app)
     # -----------------------------
+
+
+    def _compare_media_text(self, pth: str) -> str:
+        """Return 'filename • WxH' for compare panes (works for images/videos)."""
+        try:
+            p = Path(str(pth))
+            name = p.name
+        except Exception:
+            return "— • ?x?"
+        w = h = None
+        try:
+            info = probe_media(p)
+            w = info.get("width", None)
+            h = info.get("height", None)
+        except Exception:
+            pass
+        # Fallback: if probe failed and it's an image, try pixmap dimensions
+        try:
+            if (w is None or h is None) and p.suffix.lower() in IMAGE_EXTS:
+                pm = QPixmap(str(p))
+                if not pm.isNull():
+                    w, h = pm.width(), pm.height()
+        except Exception:
+            pass
+        try:
+            if w is None or h is None:
+                return f"{name} • ?x?"
+            return f"{name} • {int(w)}x{int(h)}"
+        except Exception:
+            return f"{name} • ?x?"
+
+    def _update_compare_info_labels(self):
+        """Show/hide the compare info label (left/right file + resolution)."""
+        try:
+            lbl = getattr(self, "compare_info_label", None)
+            if lbl is None:
+                return
+
+            # Hide the normal single-line info while Compare is active (avoids duplicate info).
+            try:
+                info_lbl = getattr(self, "info_label", None)
+                if info_lbl is not None:
+                    if getattr(self, "_compare_active", False):
+                        info_lbl.hide()
+                    else:
+                        info_lbl.show()
+            except Exception:
+                pass
+
+            if not getattr(self, "_compare_active", False):
+                try:
+                    lbl.hide()
+                    lbl.setText("")
+                except Exception:
+                    pass
+                return
+
+            l = str(getattr(self, "_compare_left_path", "") or "")
+            r = str(getattr(self, "_compare_right_path", "") or "")
+            lt = self._compare_media_text(l) if l else "— • ?x?"
+            rt = self._compare_media_text(r) if r else "— • ?x?"
+            try:
+                lbl.setText(f"Left: {lt}\nRight: {rt}")
+                lbl.show()
+            except Exception:
+                pass
+        except Exception:
+            pass
     def _open_compare_dialog(self):
         try:
             from PySide6.QtWidgets import QDialog
@@ -2808,6 +3281,21 @@ class VideoPane(QWidget):
             pass
 
     def _on_compare_right_frame(self, frame):
+
+        # Early FPS cap: drop compare frames BEFORE converting to QImage.
+        try:
+            import time as _t
+            _tgt = float(getattr(self, '_fps_target', 30.0) or 30.0)
+            if _tgt > 0:
+                if not hasattr(self, '_compare_last_accept_ts'):
+                    self._compare_last_accept_ts = 0.0
+                _now = _t.perf_counter()
+                _interval = max(0.001, 1.0 / float(_tgt))
+                if (_now - float(self._compare_last_accept_ts or 0.0)) < _interval:
+                    return
+                self._compare_last_accept_ts = _now
+        except Exception:
+            pass
         try:
             img = frame.toImage()
             if img and not img.isNull():
@@ -2829,14 +3317,141 @@ class VideoPane(QWidget):
                 pass
 
     def _present_compare_frame(self):
+        # Present compare frame; throttle to the same FPS cap as the main presenter.
         try:
             self._compare_present_pending = False
         except Exception:
             pass
+
+        # --- FPS throttle ---
+        try:
+            from PySide6.QtCore import QTimer
+            import time as _t
+            if not hasattr(self, '_fps_target') or not self._fps_target:
+                self._fps_target = 30  # default cap
+            if not hasattr(self, '_compare_last_present_ts'):
+                self._compare_last_present_ts = 0.0
+            _now = _t.perf_counter()
+            _interval = max(0.001, 1.0 / float(self._fps_target))
+            _elapsed = _now - float(self._compare_last_present_ts or 0.0)
+            if _elapsed < _interval:
+                _ms = int((_interval - _elapsed) * 1000)
+                if _ms > 0:
+                    # Coalesce: schedule a later present and don't spam the UI thread.
+                    if not getattr(self, "_compare_present_pending", False):
+                        self._compare_present_pending = True
+                        QTimer.singleShot(max(0, _ms), self._present_compare_frame)
+                    return
+            self._compare_last_present_ts = _now
+        except Exception:
+            pass
+
         try:
             self._refresh_label_pixmap()
         except Exception:
             pass
+
+    def _compare_begin_video_sync(self):
+        """Start a lightweight timer that keeps compare-right video synced to the main player."""
+        try:
+            if not getattr(self, "_compare_active", False) or getattr(self, "_compare_kind", None) != "video":
+                return
+            from PySide6.QtCore import QTimer
+            try:
+                import time as _t
+                # After opening/resuming compare-video, be more aggressive about drift correction for a short window.
+                self._compare_sync_soft_until = float(_t.perf_counter()) + 1.6
+            except Exception:
+                pass
+            t = getattr(self, "_compare_sync_timer", None)
+            if t is None:
+                t = QTimer(self)
+                try:
+                    t.setInterval(80)
+                except Exception:
+                    pass
+                try:
+                    t.timeout.connect(self._compare_sync_tick)
+                except Exception:
+                    pass
+                self._compare_sync_timer = t
+            if not t.isActive():
+                t.start()
+        except Exception:
+            pass
+
+    def _compare_end_video_sync(self):
+        try:
+            t = getattr(self, "_compare_sync_timer", None)
+            if t is not None and t.isActive():
+                t.stop()
+        except Exception:
+            pass
+
+    def _compare_sync_tick(self):
+        try:
+            if not getattr(self, "_compare_active", False) or getattr(self, "_compare_kind", None) != "video":
+                try:
+                    self._compare_end_video_sync()
+                except Exception:
+                    pass
+                return
+
+            rp = getattr(self, "_compare_right_player", None)
+            if rp is None:
+                return
+
+            # Keep playback rate in sync.
+            try:
+                rp.setPlaybackRate(self.player.playbackRate())
+            except Exception:
+                pass
+
+            # Mirror play/pause state.
+            try:
+                from PySide6.QtMultimedia import QMediaPlayer as _QMP
+                lp_state = self.player.playbackState()
+                rp_state = rp.playbackState()
+                if lp_state == _QMP.PlayingState and rp_state != _QMP.PlayingState:
+                    rp.play()
+                    try:
+                        import time as _t
+                        self._compare_sync_soft_until = float(_t.perf_counter()) + 1.6
+                    except Exception:
+                        pass
+                elif lp_state != _QMP.PlayingState and rp_state == _QMP.PlayingState:
+                    rp.pause()
+            except Exception:
+                pass
+
+            # Drift correction (skip while the user is scrubbing).
+            try:
+                if hasattr(self, "slider") and self.slider.isSliderDown():
+                    return
+            except Exception:
+                pass
+            try:
+                import time as _t
+                lp = int(self.player.position() or 0)
+                rp_pos = int(rp.position() or 0)
+                delta = rp_pos - lp
+                now = float(_t.perf_counter())
+                soft_until = float(getattr(self, "_compare_sync_soft_until", 0.0) or 0.0)
+                thr = 12 if now <= soft_until else 25
+                if abs(delta) >= thr:
+                    rp.setPosition(lp)
+                    # Some backends can "stick" after a position snap; re-issue play if needed.
+                    try:
+                        from PySide6.QtMultimedia import QMediaPlayer as _QMP
+                        if self.player.playbackState() == _QMP.PlayingState:
+                            rp.play()
+                    except Exception:
+                        pass
+            except Exception:
+                pass
+        except Exception:
+            pass
+
 
     def open_compare(self, left_path: str, right_path: str, kind: str):
         try:
@@ -2852,7 +3467,7 @@ class VideoPane(QWidget):
                 self._compare_opening = False
 
             self._compare_active = True
-            self._compare_kind = str(kind)
+            self._compare_kind = str(kind).strip().lower()
             self._compare_left_path = str(left_path)
             self._compare_right_path = str(right_path)
             self._compare_wipe = 500
@@ -2861,6 +3476,11 @@ class VideoPane(QWidget):
                 self.compare_slider.setValue(500)
                 self.compare_slider.show()
                 self.compare_slider.setEnabled(True)
+            except Exception:
+                pass
+
+            try:
+                self._update_compare_info_labels()
             except Exception:
                 pass
 
@@ -2886,12 +3506,7 @@ class VideoPane(QWidget):
                 self._compare_right_frame = None
                 try:
                     self._compare_right_player = QMediaPlayer(self)
-                    self._compare_right_audio = QAudioOutput(self)
-                    try:
-                        self._compare_right_audio.setVolume(0.0)
-                    except Exception:
-                        pass
-                    self._compare_right_player.setAudioOutput(self._compare_right_audio)
+                    self._compare_right_audio = None  # compare-right is silent (prevents audio clock drift)
 
                     self._compare_right_sink = QVideoSink(self)
                     self._compare_right_player.setVideoSink(self._compare_right_sink)
@@ -2902,8 +3517,51 @@ class VideoPane(QWidget):
 
                     rp = Path(str(right_path))
                     self._compare_right_player.setSource(QUrl.fromLocalFile(str(rp)))
+                    # Ensure initial alignment happens after the backend has actually loaded the media.
+                    try:
+                        def _rp_loaded(st):
+                            try:
+                                from PySide6.QtMultimedia import QMediaPlayer as _QMP
+                                if st == _QMP.LoadedMedia:
+                                    try:
+                                        self._compare_right_player.setPosition(int(self.player.position() or 0))
+                                    except Exception:
+                                        pass
+                                    try:
+                                        self._compare_right_player.setPlaybackRate(self.player.playbackRate())
+                                    except Exception:
+                                        pass
+                                    try:
+                                        if self.player.playbackState() == _QMP.PlayingState:
+                                            self._compare_right_player.play()
+                                    except Exception:
+                                        pass
+                                    try:
+                                        self._compare_right_player.mediaStatusChanged.disconnect(_rp_loaded)
+                                    except Exception:
+                                        pass
+                            except Exception:
+                                pass
+                        self._compare_right_player.mediaStatusChanged.connect(_rp_loaded)
+                    except Exception:
+                        pass
+
                     try:
                         self._compare_right_player.setPosition(self.player.position())
+                    except Exception:
+                        pass
+                    try:
+                        import time as _t
+                        self._compare_sync_soft_until = float(_t.perf_counter()) + 1.6
+                    except Exception:
+                        pass
+                    try:
+                        self._compare_right_player.setPlaybackRate(self.player.playbackRate())
+                    except Exception:
+                        pass
+                    try:
+                        if self.player.playbackState() == QMediaPlayer.PlayingState:
+                            self._compare_right_player.play()
                     except Exception:
                         pass
                 except Exception:
@@ -2915,6 +3573,12 @@ class VideoPane(QWidget):
                 self._refresh_label_pixmap()
             except Exception:
                 pass
+
+            try:
+                if getattr(self, "_compare_kind", None) == "video":
+                    self._compare_begin_video_sync()
+            except Exception:
+                pass
         except Exception:
             pass
 
@@ -2922,6 +3586,18 @@ class VideoPane(QWidget):
         try:
             self._compare_active = False
             self._compare_kind = None
+        except Exception:
+            pass
+
+
+        try:
+            self._update_compare_info_labels()
+        except Exception:
+            pass
+
+
+        try:
+            self._compare_end_video_sync()
         except Exception:
             pass
 
@@ -2948,6 +3624,31 @@ class VideoPane(QWidget):
                     pass
         except Exception:
             pass
+
+
+        # Fully dispose compare-right multimedia objects (avoids leaks / backend freezes).
+        try:
+            rp = getattr(self, "_compare_right_player", None)
+            rs = getattr(self, "_compare_right_sink", None)
+            ra = getattr(self, "_compare_right_audio", None)
+            if rp is not None:
+                try:
+                    rp.setVideoSink(None)
+                except Exception:
+                    pass
+                try:
+                    rp.setAudioOutput(None)
+                except Exception:
+                    pass
+            for obj in (rs, ra, rp):
+                try:
+                    if obj is not None:
+                        obj.deleteLater()
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
 
         for k in ["_compare_right_player","_compare_right_audio","_compare_right_sink",
                   "_compare_right_frame","_compare_right_image_pm_orig",
@@ -3239,956 +3940,8 @@ class DescribePane(QWidget):
         fname=OUT_DESCR / f"{datetime.now().strftime('%Y%m%d_%H%M%S')}_{first}.txt"; fname.write_text(text, encoding="utf-8")
         QMessageBox.information(self,"Saved", str(fname))
 
-# --- Queue Pane
+# --- Queue Pane (moved to helpers/queue_pane.py)
 
-
-class QueuePane(QWidget):
-    """
-    Queue tab with vertical-only scrolling, responsive header (3 rows), worker LED, and live counters.
-    """
-
-    # --- Queue list limits ---
-
-    MAX_PENDING_SHOW = 99
-
-    MAX_DONE_KEEP    = 50
-
-    MAX_DONE_SHOW    = 50
-
-    MAX_FAILED_KEEP  = 50
-
-    MAX_FAILED_SHOW  = 50
-
-
-    def __init__(self, main, parent=None):
-        super().__init__(parent); self.main = main
-        from PySide6.QtCore import QUrl, QFileSystemWatcher
-
-        # Timers (keep internal refresh cadence intact)
-        self.auto_timer = QTimer(self); self.auto_timer.setInterval(3000); self.auto_timer.timeout.connect(self.request_refresh)
-        self.watch_timer = QTimer(self); self.watch_timer.setInterval(1300); self.watch_timer.timeout.connect(self.request_refresh)
-        self.worker_timer = QTimer(self); self.worker_timer.setInterval(2500); self.worker_timer.timeout.connect(self._update_worker_led)
-        # Pause queue refreshing while video is playing to prevent playback stutter.
-        # (Queue refresh runs on the GUI thread; any filesystem + thumbnail work can hitch QMediaPlayer.)
-        self._bound_video_player = None
-        self._q_refresh_paused_for_playback = False
-        try:
-            v = getattr(self.main, "video", None)
-            p = getattr(v, "player", None) if v is not None else None
-            self.bind_video_player(p)
-        except Exception:
-            pass
-
-
-        # Queue system and paths
-        try:
-            from helpers.queue_system import QueueSystem
-        except Exception:
-            from queue_system import QueueSystem
-        self.qs = QueueSystem(BASE)
-
-        # Root layout and scroll container
-        root = QVBoxLayout(self)
-        root.setContentsMargins(6, 6, 6, 6)
-        root.setSpacing(8)
-
-        # Fancy banner at the top of the Queue tab
-        self.queue_banner = QLabel('Advanced Queue System')
-        self.queue_banner.setObjectName('queueBanner')
-        self.queue_banner.setAlignment(Qt.AlignCenter)
-        self.queue_banner.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
-        self.queue_banner.setFixedHeight(45)
-        self.queue_banner.setStyleSheet(
-            "#queueBanner {"
-            " font-size: 15px;"
-            " font-weight: 600;"
-            " padding: 8px 17px;"
-            " border-radius: 12px;"
-            " margin: 0 0 6px 0;"
-            " color: #1a2500;"
-            " background: qlineargradient("
-            "   x1:0, y1:0, x2:1, y2:0,"
-            "   stop:0 #d4ff66,"
-            "   stop:0.5 #a9ff28,"
-            "   stop:1 #7acb1f"
-            " );"
-            " letter-spacing: 0.5px;"
-            "}"
-        )
-        root.addWidget(self.queue_banner)
-        root.addSpacing(4)
-        topw = QWidget()
-        grid = QGridLayout(topw)
-        grid.setContentsMargins(0, 0, 0, 0)
-        grid.setHorizontalSpacing(8)
-        grid.setVerticalSpacing(6)
-
-        # Header layout: compact + balanced after hiding some legacy buttons.
-        # Columns: [left controls] [left controls] [stretch spacer] [right status]
-        try:
-            grid.setColumnStretch(0, 0)
-            grid.setColumnStretch(1, 0)
-            grid.setColumnStretch(2, 1)
-            grid.setColumnStretch(3, 0)
-        except Exception:
-            pass
-
-        # Row 1: Refresh · Clear finished/failed (left) · Worker LED (right)
-        self.btn_refresh = QPushButton("Refresh")
-        self.btn_remove_done = QPushButton("Clear Finished")
-        self.btn_remove_failed = QPushButton("Clear Failed")
-        clearw = QWidget()
-        cl = QHBoxLayout(clearw)
-        cl.setContentsMargins(0, 0, 0, 0)
-        cl.setSpacing(6)
-        cl.addWidget(self.btn_remove_done)
-        cl.addWidget(self.btn_remove_failed)
-
-        self.worker_status = WorkerStatusWidget()
-        self.lbl_worker = self.worker_status.label
-
-        grid.addWidget(self.btn_refresh, 0, 0)
-        grid.addWidget(clearw, 0, 1)
-        grid.addWidget(self.worker_status, 0, 3, 1, 1, Qt.AlignRight)
-
-        # Row 2: Repair tools (left) · Delete Selected (right)
-        self.btn_mark_running_failed = QPushButton("Cancel running job(s)")
-        self.btn_reset_running = QPushButton("Move to Pending")
-        self.btn_delete_sel = QPushButton("Delete Selected")
-        grid.addWidget(self.btn_mark_running_failed, 1, 0)
-        grid.addWidget(self.btn_reset_running, 1, 1)
-        grid.addWidget(self.btn_delete_sel, 1, 3, 1, 1, Qt.AlignRight)
-
-        # Legacy re-order buttons (kept for compatibility but hidden)
-        self.btn_move_up = QPushButton("Move Upwards")
-        self.btn_move_down = QPushButton("Move Down")
-        self.btn_move_up.setVisible(False); self.btn_move_up.setEnabled(False)
-        self.btn_move_down.setVisible(False); self.btn_move_down.setEnabled(False)
-
-        # Row 3: Counters (left) · last refresh timestamp (right)
-        self.counts = QLabel("Running 0 | Pending 0 | Done 0 | Failed 0")
-        self.last_updated = QLabel("--:--:--")
-        grid.addWidget(self.counts, 2, 0, 1, 3, Qt.AlignLeft)
-        grid.addWidget(self.last_updated, 2, 3, 1, 1, Qt.AlignRight)
-
-        __import__("helpers.queue_widgets", fromlist=["install_queue_toggle_play_last"]).install_queue_toggle_play_last(
-            self, grid, config, save_config, JOBS_DIRS["done"]
-        )
-        root.addWidget(topw)
-
-        # Scroll area with sections
-        sc = QScrollArea(); sc.setWidgetResizable(True); sc.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff); sc.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
-        content = QWidget(); v = QVBoxLayout(content); v.setContentsMargins(0,0,0,0); v.setSpacing(8)
-
-        # Lists (5-row viewport, vertical only)
-        self.lst_running = QListWidget(); self._apply_policies(self.lst_running)
-        try:
-            _h3 = 56*3 + 8
-            self.lst_running.setMinimumHeight(_h3)
-            self.lst_running.setMaximumHeight(_h3)
-        except Exception:
-            pass
-        self.lst_pending = QListWidget(); self._apply_policies(self.lst_pending)
-        self.lst_done = QListWidget(); self._apply_policies(self.lst_done)
-        self.lst_failed = QListWidget(); self._apply_policies(self.lst_failed)
-
-        sec_running = ToolsCollapsibleSection("Running", expanded=True)
-        lay_sec_running = QVBoxLayout(); lay_sec_running.setContentsMargins(0,0,0,0); lay_sec_running.setSpacing(6)
-        lay_sec_running.addWidget(self.lst_running)
-        try:
-            sec_running.setContentLayout(lay_sec_running)
-        except Exception:
-            # Fallback if API differs
-            sec_running.content = QWidget(); sec_running.content.setLayout(lay_sec_running)
-        v.addWidget(sec_running)
-        sec_pending = ToolsCollapsibleSection("Pending", expanded=False)
-        lay_sec_pending = QVBoxLayout(); lay_sec_pending.setContentsMargins(0,0,0,0); lay_sec_pending.setSpacing(6)
-        lay_sec_pending.addWidget(self.lst_pending)
-        try:
-            sec_pending.setContentLayout(lay_sec_pending)
-        except Exception:
-            # Fallback if API differs
-            sec_pending.content = QWidget(); sec_pending.content.setLayout(lay_sec_pending)
-        v.addWidget(sec_pending)
-        sec_done = ToolsCollapsibleSection("Finished", expanded=False)
-        lay_sec_done = QVBoxLayout(); lay_sec_done.setContentsMargins(0,0,0,0); lay_sec_done.setSpacing(6)
-        lay_sec_done.addWidget(self.lst_done)
-        try:
-            sec_done.setContentLayout(lay_sec_done)
-        except Exception:
-            # Fallback if API differs
-            sec_done.content = QWidget(); sec_done.content.setLayout(lay_sec_done)
-        v.addWidget(sec_done)
-        sec_failed = ToolsCollapsibleSection("Failed", expanded=False)
-        lay_sec_failed = QVBoxLayout(); lay_sec_failed.setContentsMargins(0,0,0,0); lay_sec_failed.setSpacing(6)
-        lay_sec_failed.addWidget(self.lst_failed)
-        try:
-            sec_failed.setContentLayout(lay_sec_failed)
-        except Exception:
-            # Fallback if API differs
-            sec_failed.content = QWidget(); sec_failed.content.setLayout(lay_sec_failed)
-        v.addWidget(sec_failed)
-        sc.setWidget(content); root.addWidget(sc)
-
-        # File-system watcher for live counters + inserts (debounced <=5 Hz)
-        self._fsw = QFileSystemWatcher(self)
-        for k in ("pending","running","done","failed"):
-            self._fsw.addPath(str(JOBS_DIRS[k]))
-        self._debounce = QTimer(self); self._debounce.setInterval(180); self._debounce.setSingleShot(True)
-        self._fsw.directoryChanged.connect(lambda _: self._debounce.start())
-        self._debounce.timeout.connect(self._on_queue_changed)
-
-        # Wire actions
-        self.btn_refresh.clicked.connect(self.refresh)
-        self.btn_remove_done.clicked.connect(self.clear_done)
-        self.btn_remove_failed.clicked.connect(self.clear_failed)
-        self.btn_move_up.clicked.connect(self.move_up)
-        self.btn_move_down.clicked.connect(self.move_down)
-        self.btn_delete_sel.clicked.connect(self.delete_selected)
-        self.btn_reset_running.clicked.connect(self.recover_running_to_pending)
-        self.btn_mark_running_failed.clicked.connect(self.cancel_running_jobs)
-
-        # First refresh and timers
-        self.refresh()
-        self.auto_timer.start(); self.worker_timer.start()
-
-    def _apply_policies(self, w: QListWidget):
-        try:
-            w.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
-            w.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
-            min_h = 56 * 5 + 8  # ~5 rows
-            w.setMinimumHeight(min_h)
-            w.setMaximumHeight(16777215)
-        except Exception:
-            pass
-
-
-    def _is_main_job_json(self, p: Path) -> bool:
-        name = p.name
-        if not name.endswith(".json"):
-            return False
-        if name.endswith(".progress.json") or name.endswith(".json.progress") or name.endswith(".meta.json") or name.startswith("_"):
-            return False
-        return True
-
-
-    def _populate(self, folder: Path, widget: QListWidget, status: str):
-        from helpers.queue_widgets import JobRowWidget
-        # In-place diff to minimize flicker
-        try:
-            from PySide6.QtCore import QUrl, Qt
-        except Exception:
-            pass
-        existing_keys = {}
-        try:
-            for i in range(widget.count()):
-                it = widget.item(i)
-                key = it.data(Qt.UserRole) if 'Qt' in globals() else None
-                w = widget.itemWidget(it) if key is None else None
-                if not key and w is not None:
-                    key = getattr(w, 'path', None) or getattr(w, 'job_path', None) or getattr(w, 'json_path', None)
-                if key:
-                    existing_keys[str(key)] = i
-        except Exception:
-            existing_keys = {}
-        
-        # Build desired file list first (path + sort key)
-        files = []
-        try:
-            for p in folder.glob('*.json'):
-                name = p.name
-                if (name.endswith('.progress.json') or name.endswith('.json.progress') or name.endswith('.progress')
-                    or name.endswith('.meta.json') or name.startswith('_')):
-                    continue
-                try:
-                    d = json.loads(p.read_text(encoding='utf-8') or '{}')
-                    if not isinstance(d, dict) or (not d.get('type')) or ((not d.get('input') and not d.get('frames')) and d.get('type')!='txt2img'):
-                        continue
-                except Exception:
-                    continue
-                sort_ts = p.stat().st_mtime
-                try:
-                    from datetime import datetime
-                    def _parse(s):
-                        if not s: return None
-                        for fmt in ("%Y-%m-%d %H:%M:%S","%Y-%m-%d %H:%M:%S.%f"):
-                            try:
-                                return datetime.strptime(s, fmt).timestamp()
-                            except Exception:
-                                pass
-                        return None
-                    if status == "pending":
-                        sort_ts = _parse(d.get("enqueued_at") or d.get("created_at") or d.get("added_at")) or sort_ts
-                    elif status == "running":
-                        sort_ts = _parse(d.get("started_at")) or sort_ts
-                    elif status in ("done","failed"):
-                        sort_ts = _parse(d.get("finished_at")) or sort_ts
-                except Exception:
-                    pass
-                files.append((sort_ts, p))
-        except Exception:
-            files = []
-
-        
-        # Apply per-status limits (keep vs show) and stable ordering (newest first)
-        max_keep = None
-        max_show = None
-        if status == "pending":
-            max_show = getattr(self, "MAX_PENDING_SHOW", 99)
-        elif status == "done":
-            max_keep = getattr(self, "MAX_DONE_KEEP", 30)
-            max_show = getattr(self, "MAX_DONE_SHOW", 20)
-        elif status == "failed":
-            max_keep = getattr(self, "MAX_FAILED_KEEP", 25)
-            max_show = getattr(self, "MAX_FAILED_SHOW", 25)
-
-        if files:
-            try:
-                files_sorted = sorted(files, key=lambda t_p: t_p[0], reverse=True)
-            except Exception:
-                files_sorted = list(files)
-        else:
-            files_sorted = []
-
-        # For finished/failed queues, prune/move extra JSON files on disk.
-        # When "Auto clean-up queue" is enabled, we *move* old job JSONs to:
-        #   (root)\jobs\done\old_jobs
-        # and we start doing so slightly before hitting the max, to keep the UI fast.
-        if max_keep is not None and status in ("done", "failed"):
-            try:
-                auto_cleanup = bool(config.get("queue_auto_cleanup", False))
-            except Exception:
-                auto_cleanup = False
-
-            if auto_cleanup:
-                try:
-                    trigger_at = max(1, int(max_keep) - 1)  # e.g. 25 -> start at 24
-                except Exception:
-                    trigger_at = max_keep
-
-                # Move a few per refresh (bounded) so we don't stall the UI.
-                moved = 0
-                try:
-                    import shutil as _shutil
-                    import time as _time
-                    old_dir = (BASE / "jobs" / "done" / "old_jobs")
-                    old_dir.mkdir(parents=True, exist_ok=True)
-
-                    while len(files_sorted) >= trigger_at and files_sorted and moved < 3:
-                        victim = files_sorted[-1][1]  # oldest (files_sorted is newest-first)
-                        if victim is None:
-                            break
-                        try:
-                            dest = old_dir / victim.name
-                            if dest.exists():
-                                dest = old_dir / f"{victim.stem}_{int(_time.time())}{victim.suffix}"
-                            _shutil.move(str(victim), str(dest))
-                            files_sorted.pop(-1)
-                            moved += 1
-                        except Exception:
-                            break
-                except Exception:
-                    pass
-            else:
-                # Legacy behavior: hard-delete beyond max_keep
-                if len(files_sorted) > max_keep:
-                    try:
-                        for _ts, p in files_sorted[max_keep:]:
-                            try:
-                                p.unlink()
-                            except Exception:
-                                pass
-                    except Exception:
-                        pass
-
-        if max_show is not None and len(files_sorted) > max_show:
-            files = files_sorted[:max_show]
-        else:
-            files = files_sorted
-
-
-        # Remove stale items not in target set (in-place, from bottom)
-        try:
-            from PySide6.QtCore import QUrl, Qt
-            target = {str(p) for _, p in files}
-            i = widget.count() - 1
-            while i >= 0:
-                it = widget.item(i)
-                key = None
-                try:
-                    key = it.data(Qt.UserRole)
-                except Exception:
-                    key = None
-                if key is None:
-                    w = widget.itemWidget(it)
-                    key = getattr(w, 'path', None) if w is not None else None
-                if (key is None) or (str(key) not in target):
-                    widget.takeItem(i)
-                i -= 1
-        except Exception:
-            pass
-
-        
-        # Add or refresh rows (preserve order by newest first) — and **reposition** to keep newest on top live.
-        for idx, (_ts, p) in enumerate(files):
-            try:
-                from PySide6.QtCore import QUrl, Qt
-            except Exception:
-                pass
-
-            found = False
-            found_item = None
-            found_widget = None
-            found_row = None
-
-            # Locate existing row for this path (if any)
-            try:
-                for _i in range(widget.count()):
-                    _it = widget.item(_i)
-                    _key = _it.data(Qt.UserRole)
-                    if _key is None:
-                        _w = widget.itemWidget(_it)
-                        _key = getattr(_w, 'path', None) if _w is not None else None
-                    if str(_key) == str(p):
-                        found = True
-                        found_item = _it
-                        found_widget = widget.itemWidget(_it)
-                        found_row = _i
-                        break
-            except Exception:
-                found = False
-
-            if found:
-                # Refresh existing row's contents
-                try:
-                    if hasattr(found_widget, 'refresh'):
-                        found_widget.refresh()
-                except Exception:
-                    pass
-                # Reposition item if order changed
-                try:
-                    if found_row is not None and found_row != idx:
-                        it_take = widget.takeItem(found_row)
-                        # Reinsert at the correct index and reattach the widget
-                        widget.insertItem(idx, it_take)
-                        if found_widget is not None:
-                            widget.setItemWidget(it_take, found_widget)
-                        try:
-                            it_take.setData(Qt.UserRole, str(p))
-                        except Exception:
-                            pass
-                except Exception:
-                    pass
-                continue
-
-            # If not found, create a new row and insert at the correct position
-            it = QListWidgetItem("")
-            w = JobRowWidget(str(p), status)
-            try:
-                hint = w.sizeHint()
-                if hint.height() < 56:
-                    from PySide6.QtCore import QUrl, QSize
-                    hint.setHeight(56)
-                it.setSizeHint(hint)
-            except Exception:
-                it.setSizeHint(w.sizeHint())
-            try:
-                widget.insertItem(idx, it)
-            except Exception:
-                widget.addItem(it)  # fallback
-            widget.setItemWidget(it, w)
-            try:
-                from PySide6.QtCore import QUrl, Qt
-                it.setData(Qt.UserRole, str(p))
-            except Exception:
-                pass
-
-    def bind_video_player(self, player):
-        """(Re)bind the queue's playback hook to the current internal player instance.
-
-        The VideoPane can rebuild QMediaPlayer to avoid backend deadlocks; when that happens,
-        previously connected signals point to the old player object and queue refresh won't pause
-        during playback anymore.
-        """
-        try:
-            # Disconnect from the previous player if any
-            old = getattr(self, "_bound_video_player", None)
-            if old is not None and hasattr(old, "playbackStateChanged"):
-                try:
-                    old.playbackStateChanged.disconnect(self._on_video_playback_state)
-                except Exception:
-                    pass
-            self._bound_video_player = player
-            if player is not None and hasattr(player, "playbackStateChanged"):
-                try:
-                    player.playbackStateChanged.connect(self._on_video_playback_state)
-                except Exception:
-                    pass
-                # Apply current state immediately
-                try:
-                    self._on_video_playback_state(player.playbackState())
-                except Exception:
-                    pass
-        except Exception:
-            pass
-
-    def _is_video_playing(self):
-        """Best-effort check of current playback state (robust against player rebuilds)."""
-        try:
-            from PySide6.QtMultimedia import QMediaPlayer as _QMP
-            v = getattr(self.main, "video", None)
-            p = getattr(v, "player", None) if v is not None else None
-            if p is None:
-                return False
-            return (p.playbackState() == _QMP.PlayingState)
-        except Exception:
-            return False
-
-    def request_refresh(self):
-        try:
-            # Optional safeguard: pause queue refresh while video is playing (prevents playback stutter).
-            try:
-                _pause_on_play = bool(config.get("queue_pause_refresh_while_playing", True))
-            except Exception:
-                _pause_on_play = True
-
-            if _pause_on_play:
-                # If video is currently playing, keep the queue refresh paused.
-                # (This is robust against VideoPane rebuilding the QMediaPlayer instance.)
-                if self._is_video_playing():
-                    try:
-                        if not bool(getattr(self, "_q_refresh_paused_for_playback", False)):
-                            self._q_refresh_paused_for_playback = True
-                            self.stop_auto()
-                    except Exception:
-                        pass
-                    return
-
-                # If we were paused due to playback but the player isn't playing now, unpause.
-                if bool(getattr(self, "_q_refresh_paused_for_playback", False)):
-                    try:
-                        self._q_refresh_paused_for_playback = False
-                        self.start_auto()
-                    except Exception:
-                        pass
-            else:
-                # Safeguard disabled: ensure we are not stuck in a paused state.
-                if bool(getattr(self, "_q_refresh_paused_for_playback", False)):
-                    try:
-                        self._q_refresh_paused_for_playback = False
-                        self.start_auto()
-                    except Exception:
-                        pass
-
-
-            # Debounce/coalesce refresh calls
-
-            if not hasattr(self, '_refresh_coalesce'):
-
-                from PySide6.QtCore import QUrl, QTimer
-
-                self._refresh_coalesce = QTimer(self)
-
-                self._refresh_coalesce.setSingleShot(True)
-
-                self._refresh_coalesce.setInterval(350)
-
-                self._refresh_coalesce.timeout.connect(self._do_refresh)
-
-            self._refresh_coalesce.start()
-
-        except Exception:
-
-            # Fallback: direct refresh
-
-            self.refresh()
-
-
-    def _do_refresh(self):
-
-        try:
-
-            self.refresh()
-
-        except Exception:
-
-            pass
-    def refresh(self):
-        # Avoid UI hitches: block repaints while we rebuild lists.
-        try:
-            self.setUpdatesEnabled(False)
-            for _lst in (getattr(self, "lst_running", None), getattr(self, "lst_pending", None),
-                         getattr(self, "lst_done", None), getattr(self, "lst_failed", None)):
-                try:
-                    if _lst is not None:
-                        _lst.setUpdatesEnabled(False)
-                except Exception:
-                    pass
-
-            self._populate(JOBS_DIRS['running'], self.lst_running, 'running')
-            self._populate(JOBS_DIRS['pending'], self.lst_pending, 'pending')
-            self._populate(JOBS_DIRS['done'], self.lst_done, 'done')
-            self._populate(JOBS_DIRS['failed'], self.lst_failed, 'failed')
-            self._update_counts_label()
-            self._update_worker_led()
-            try:
-                from datetime import datetime as _dt
-                if hasattr(self, 'last_updated'):
-                    self.last_updated.setText(_dt.now().strftime("%H:%M:%S"))
-            except Exception:
-                pass
-        finally:
-            try:
-                for _lst in (getattr(self, "lst_running", None), getattr(self, "lst_pending", None),
-                             getattr(self, "lst_done", None), getattr(self, "lst_failed", None)):
-                    try:
-                        if _lst is not None:
-                            _lst.setUpdatesEnabled(True)
-                    except Exception:
-                        pass
-                self.setUpdatesEnabled(True)
-            except Exception:
-                pass
-
-    def _update_counts_label(self):
-        try:
-            r = sum(1 for pth in JOBS_DIRS["running"].glob("*.json") if self._is_main_job_json(pth))
-            p = sum(1 for pth in JOBS_DIRS["pending"].glob("*.json") if self._is_main_job_json(pth))
-            d = sum(1 for pth in JOBS_DIRS["done"].glob("*.json") if self._is_main_job_json(pth))
-            f = sum(1 for pth in JOBS_DIRS["failed"].glob("*.json") if self._is_main_job_json(pth))
-            done_show = getattr(self, "MAX_DONE_SHOW", 20)
-            done_txt = f"Done {d}" if d <= done_show else f"Done {d} (showing {done_show})"
-            self.counts.setText(f"Running {r} | Pending {p} | {done_txt} | Failed {f}")
-        except Exception:
-            self.counts.setText("Running ? | Pending ? | Done ? | Failed ?")
-
-    def _watch_tick(self):
-        try:
-            self.refresh()
-        except Exception:
-            pass
-
-    def _on_queue_changed(self):
-        # Use debounced refresh to avoid thrash
-        self.request_refresh()
-
-    # --- Queue actions (filesystem-based; minimal and safe) ---
-    def _selected_job_path(self):
-        # Return (bucket, Path) for the currently selected row; None if nothing selected
-        try_lists = [
-            ("running", self.lst_running),
-            ("pending", self.lst_pending),
-            ("done", self.lst_done),
-            ("failed", self.lst_failed),
-        ]
-        for bucket, lst in try_lists:
-            it = lst.currentItem()
-            if it is None:
-                continue
-            try:
-                w = lst.itemWidget(it)
-                p = Path(getattr(w, "path", "") or getattr(w, "job_path", ""))
-                if p and p.exists():
-                    return bucket, p
-            except Exception:
-                pass
-        return None, None
-
-    def clear_done(self):
-        try:
-            for p in list(JOBS_DIRS["done"].glob("*.json")):
-                try: p.unlink()
-                except Exception: pass
-        except Exception:
-            pass
-        self.refresh()
-
-    def clear_failed(self):
-        try:
-            try:
-                self.qs.remove_failed()
-            except Exception:
-                for p in list(JOBS_DIRS["failed"].glob("*.json")):
-                    try: p.unlink()
-                    except Exception: pass
-        except Exception:
-            pass
-        self.refresh()
-
-    def clear_done_failed(self):
-        try:
-            try:
-                self.qs.clear_finished_failed()
-            except Exception:
-                for p in list(JOBS_DIRS["done"].glob("*.json")):
-                    try: p.unlink()
-                    except Exception: pass
-                for p in list(JOBS_DIRS["failed"].glob("*.json")):
-                    try: p.unlink()
-                    except Exception: pass
-        except Exception:
-            pass
-        self.refresh()
-
-    def delete_selected(self):
-        bucket, p = self._selected_job_path()
-        if not p:
-            return
-        try:
-            p.unlink()
-        except Exception:
-            pass
-        self.refresh()
-
-    def move_up(self):
-        bucket, p = self._selected_job_path()
-        if bucket != "pending" or not p:
-            return
-        try:
-            now = time.time()
-            os.utime(p, (now, now + 60))
-        except Exception:
-            pass
-        self.refresh()
-
-    def move_down(self):
-        bucket, p = self._selected_job_path()
-        if bucket != "pending" or not p:
-            return
-        try:
-            now = time.time()
-            os.utime(p, (now, now - 60))
-        except Exception:
-            pass
-        self.refresh()
-
-    def recover_running_to_pending(self):
-        bucket, p = self._selected_job_path()
-        if bucket != "running" or not p:
-            return
-        try:
-            dest = JOBS_DIRS["pending"] / p.name
-            try:
-                d = json.loads(p.read_text(encoding="utf-8") or "{}")
-                for k in ("started_at","finished_at","ended_at","duration_sec","error"):
-                    if k in d: d.pop(k, None)
-                p.write_text(json.dumps(d, ensure_ascii=False, indent=2))
-            except Exception:
-                pass
-            import shutil as _shutil
-            _shutil.move(str(p), str(dest))
-            try:
-                self.qs.nudge_pending()
-            except Exception:
-                pass
-        except Exception:
-            pass
-        self.refresh()
-
-
-    def cancel_running_jobs(self):
-        """Cancel selected running job(s) (or all running jobs if none selected).
-
-        This mirrors the Running-row right-click 'Cancel job' action:
-          - Write <job>.json.cancel marker
-          - Set job['cancel_requested'] = True
-
-        The worker is responsible for killing the underlying process and moving the job to failed.
-        """
-        try:
-            from pathlib import Path
-            from PySide6.QtCore import Qt
-        except Exception:
-            Path = None
-            Qt = None
-
-        paths = []
-        # Prefer selected items in the Running list
-        try:
-            if Qt is not None:
-                for it in self.lst_running.selectedItems():
-                    k = it.data(Qt.UserRole)
-                    if k:
-                        paths.append(Path(str(k)))
-        except Exception:
-            paths = []
-
-        # Fallback: cancel all running jobs
-        if not paths:
-            try:
-                paths = [p for p in JOBS_DIRS["running"].glob("*.json")
-                         if getattr(self, "_is_main_job_json", lambda x: True)(p)]
-            except Exception:
-                paths = []
-
-        for p in paths:
-            try:
-                if not p or (not p.exists()):
-                    continue
-            except Exception:
-                continue
-
-            # Marker file: <job>.json.cancel
-            try:
-                marker = p.with_suffix(p.suffix + ".cancel")
-                marker.write_text("cancel", encoding="utf-8")
-            except Exception:
-                pass
-
-            # JSON flag: cancel_requested = True
-            try:
-                d = {}
-                try:
-                    d = json.loads(p.read_text(encoding="utf-8") or "{}")
-                except Exception:
-                    d = {}
-                d["cancel_requested"] = True
-                try:
-                    p.write_text(json.dumps(d, ensure_ascii=False, indent=2), encoding="utf-8")
-                except Exception:
-                    p.write_text(json.dumps(d, ensure_ascii=False, indent=2))
-            except Exception:
-                pass
-
-        self.refresh()
-
-
-    def mark_running_failed(self):
-        bucket, p = self._selected_job_path()
-        if bucket != "running" or not p:
-            return
-        try:
-            d = {}
-            try:
-                d = json.loads(p.read_text(encoding="utf-8") or "{}")
-            except Exception:
-                d = {}
-            try:
-                from datetime import datetime
-                d["finished_at"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-            except Exception:
-                pass
-            d["error"] = d.get("error") or "Manually marked as failed"
-            p.write_text(json.dumps(d, ensure_ascii=False, indent=2))
-            import shutil as _shutil
-            dest = JOBS_DIRS["failed"] / p.name
-            _shutil.move(str(p), str(dest))
-        except Exception:
-            pass
-        self.refresh()
-
-    def _update_worker_led(self):
-        try:
-            try:
-                running_count = sum(1 for pth in JOBS_DIRS["running"].glob("*.json")
-                                    if getattr(self, "_is_main_job_json", lambda p: True)(pth))
-            except Exception:
-                running_count = 0
-
-            import time
-            hb = globals().get('HEARTBEAT_PATH', BASE / 'logs' / 'worker_heartbeat.txt')
-            age = None
-            if hb.exists():
-                try:
-                    age = time.time() - hb.stat().st_mtime
-                except Exception:
-                    age = None
-
-            if running_count > 0:
-                self.worker_status.set_state("running", f"{running_count} active job(s)")
-            elif age is not None and age < 12.0:
-                self.worker_status.set_state("idle", f"Heartbeat {int(age)}s ago")
-            elif age is not None:
-                self.worker_status.set_state("stopped", f"No heartbeat for {int(age)}s")
-            else:
-                self.worker_status.set_state("stopped", "No heartbeat file")
-        except Exception as e:
-            try:
-                self.worker_status.set_state("error", str(e))
-            except Exception:
-                pass
-    def _on_video_playback_state(self, state):
-        """Stop queue timers while the internal video player is playing (prevents periodic stutter)."""
-        try:
-            from PySide6.QtMultimedia import QMediaPlayer as _QMP
-            playing = (state == _QMP.PlayingState)
-        except Exception:
-            playing = False
-
-        try:
-            try:
-                _pause_on_play = bool(config.get("queue_pause_refresh_while_playing", True))
-            except Exception:
-                _pause_on_play = True
-
-            if not _pause_on_play:
-                # Safeguard disabled: ensure we are not stuck paused from a previous session.
-                if bool(getattr(self, "_q_refresh_paused_for_playback", False)):
-                    self._q_refresh_paused_for_playback = False
-                    self.start_auto()
-                return
-
-            if playing:
-                self._q_refresh_paused_for_playback = True
-                self.stop_auto()
-            else:
-                # Only restart if we paused it due to playback
-                if bool(getattr(self, "_q_refresh_paused_for_playback", False)):
-                    self._q_refresh_paused_for_playback = False
-                    self.start_auto()
-        except Exception:
-            pass
-
-    def stop_auto(self):
-        try:
-            self.auto_timer.stop()
-        except Exception:
-            pass
-        try:
-            self.watch_timer.stop()
-        except Exception:
-            pass
-        try:
-            self.worker_timer.stop()
-        except Exception:
-            pass
-
-    def start_auto(self):
-        # Start/Restart timers safely and schedule a debounced refresh
-        try:
-            self.auto_timer.start()
-        except Exception:
-            pass
-        try:
-            self.watch_timer.start()
-        except Exception:
-            pass
-        try:
-            self.worker_timer.start()
-        except Exception:
-            pass
-        try:
-            self.request_refresh()
-        except Exception:
-            try:
-                self.refresh()
-            except Exception:
-                pass
-
-
-    def closeEvent(self, e):
-        try:
-            state_persist.save_all(self)
-        except Exception:
-            pass
-        try:
-            self.stop_auto()
-        except Exception:
-            pass
-        try:
-            super().closeEvent(e)
-        except Exception:
-            pass
 
 class SettingsPane(QWidget):
     def __init__(self, main, parent=None):
@@ -4203,7 +3956,7 @@ class SettingsPane(QWidget):
         row2=QHBoxLayout()
         btn.clicked.connect(lambda: (config.update({"theme":self.cmb.currentText()}), save_config(), apply_theme(QApplication.instance(), config["theme"])))
         # About area
-        about = QLabel(f"<h2>{APP_NAME}</h2><p>{TAGLINE}</p><p>© {datetime.now().year}</p><p>Placeholder splash — your logo can go here.</p>")
+        about = QLabel(f"<h2>{APP_NAME}</h2><p>{TAGLINE}</p><p>© {datetime.now().year}</p><p>Placeholder — Settings_tab.py did not load or import.</p>")
         v.addWidget(about)
 
 # --- Main Window
@@ -4538,6 +4291,50 @@ class MainWindow(QMainWindow):
         except Exception:
             pass
 
+
+
+    def _on_global_video_playback_state(self, state):
+        """Global playback hook (owned by MainWindow). Keeps QueuePane passive."""
+        try:
+            from PySide6.QtMultimedia import QMediaPlayer as _QMP
+            playing = (state == _QMP.PlayingState)
+        except Exception:
+            playing = False
+        try:
+            q = getattr(self, "queue", None)
+            if q is not None and hasattr(q, "set_playback_active"):
+                q.set_playback_active(bool(playing))
+        except Exception:
+            pass
+
+    def _hook_video_player(self, player):
+        """(Re)bind MainWindow playback hooks to the current QMediaPlayer instance."""
+        # Disconnect previous binding if any
+        try:
+            old = getattr(self, "_bound_video_player", None)
+            if old is not None and hasattr(old, "playbackStateChanged"):
+                try:
+                    old.playbackStateChanged.disconnect(self._on_global_video_playback_state)
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
+        self._bound_video_player = player
+        try:
+            if player is not None and hasattr(player, "playbackStateChanged"):
+                try:
+                    player.playbackStateChanged.connect(self._on_global_video_playback_state)
+                except Exception:
+                    pass
+                try:
+                    self._on_global_video_playback_state(player.playbackState())
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
+
     def _install_tab_reorder_behavior(self):
         """Wire up movable tabs + persistence."""
         try:
@@ -4772,15 +4569,40 @@ class MainWindow(QMainWindow):
                 pass
             return
 
-        # Locate the Media Explorer tab index by name (robust to future widget wrapping).
+        # Locate the Media Explorer tab index WITHOUT relying on the visible tab text.
         idx = -1
+        tab_ref = None
         try:
-            for i in range(self.tabs.count()):
-                if (self.tabs.tabText(i) or "").strip().lower() == "media explorer":
-                    idx = i
-                    break
+            tab_ref = getattr(self, "media_explorer", None)
+        except Exception:
+            tab_ref = None
+
+        # Preferred: direct widget reference.
+        try:
+            if tab_ref is not None:
+                idx = int(self.tabs.indexOf(tab_ref))
         except Exception:
             idx = -1
+
+        # Fallback: stable objectName.
+        if idx < 0:
+            try:
+                found = self._find_tab_index_by_id("tab_media_explorer")
+                if found is not None:
+                    idx = int(found)
+            except Exception:
+                pass
+
+        # Last-resort: normalize tabText and match a stable slug.
+        if idx < 0:
+            try:
+                target = "media_explorer"
+                for i in range(self.tabs.count()):
+                    if self._slug_tab_name(self.tabs.tabText(i)) == target:
+                        idx = i
+                        break
+            except Exception:
+                pass
 
         if activate and idx >= 0:
             try:
@@ -4865,9 +4687,66 @@ class MainWindow(QMainWindow):
 
 
 
+    # --- Left pane override: allow tools to temporarily occupy the big left media area ---
+    def set_left_override_widget(self, w: QWidget, owner: str = "tool") -> None:
+        """Show a tool-provided widget in the left pane (temporarily replacing the VideoPane visually)."""
+        try:
+            if w is None:
+                self.clear_left_override_widget(owner=owner)
+                return
+            stack = getattr(self, "left_stack", None)
+            if stack is None:
+                return
+            try:
+                self._left_override_owner = owner or "tool"
+                self._left_override_widget = w
+            except Exception:
+                pass
+            try:
+                idx = stack.indexOf(w)
+            except Exception:
+                idx = -1
+            if idx is None or idx < 0:
+                try:
+                    stack.addWidget(w)
+                except Exception:
+                    pass
+            try:
+                stack.setCurrentWidget(w)
+            except Exception:
+                pass
+        except Exception:
+            pass
+
+    def clear_left_override_widget(self, owner=None) -> None:
+        """Return left pane to the normal VideoPane. If owner is set, only clears if it matches."""
+        try:
+            if owner:
+                cur_owner = getattr(self, "_left_override_owner", None)
+                if cur_owner and str(cur_owner) != str(owner):
+                    return
+        except Exception:
+            pass
+        try:
+            stack = getattr(self, "left_stack", None)
+            if stack is None:
+                return
+            try:
+                stack.setCurrentWidget(self.video)
+            except Exception:
+                pass
+        except Exception:
+            pass
+        try:
+            self._left_override_owner = None
+            self._left_override_widget = None
+        except Exception:
+            pass
+
+
     def __init__(self):
         super().__init__()
-        self.setWindowTitle(APP_NAME + " V2.1 " + TAGLINE)
+        self.setWindowTitle(APP_NAME + " V2.2 " + TAGLINE)
         self.resize(1280, 800)
         self.setMinimumSize(700, 500)
         self.current_path = None
@@ -4925,7 +4804,23 @@ class MainWindow(QMainWindow):
             'MANIFEST_PATH': MANIFEST_PATH,
             'config': config
         })
-        self.queue = QueuePane(self)
+        self.queue = QueuePane(self, {'BASE': BASE, 'JOBS_DIRS': JOBS_DIRS, 'config': config, 'save_config': save_config})
+        
+        # Expose shared config/paths on MainWindow (helps keep panes decoupled)
+        try:
+            self.config = config
+            self.BASE = BASE
+            self.JOBS_DIRS = JOBS_DIRS
+            self.save_config = save_config
+        except Exception:
+            pass
+
+        # Hook playback state so the queue can pause its own refresh timers without touching the player.
+        try:
+            self._hook_video_player(getattr(self.video, 'player', None))
+        except Exception:
+            pass
+
         self.presets_tab = PresetsPane(self)
         self.settings = SettingsPane(self)
 
@@ -4947,20 +4842,30 @@ class MainWindow(QMainWindow):
 
 # >>> FRAMEVISION_EDITOR_INIT_BEGIN
         # Create Editor tab instance if available
-        # try:
-         #   if 'EditorPane' in globals() and EditorPane is not None:
-          #      self.editor = EditorPane(self)
-           # else:
-            #    self.editor = None
-      #  except Exception as _e:
-       #     print("[framevision] editor init failed:", _e)
-        #    self.editor = None
+#        try:
+ #           if 'EditorPane' in globals() and EditorPane is not None:
+  #              self.editor = EditorPane(self)
+   #         else:
+    #            self.editor = None
+     #   except Exception as _e:
+      #      print("[framevision] editor init failed:", _e)
+       #     self.editor = None
 # <<< FRAMEVISION_EDITOR_INIT_END
 
         self.video.frameCaptured.connect(self.describe.on_pause_capture)
         # >>> FRAMEVISION_MEDIA_EXPLORER_INIT_BEGIN
         # Media Explorer is optional: if it fails to load we show a placeholder tab and keep running.
         self.media_explorer = self._init_media_explorer_hardfail()
+        try:
+            # Stable internal id (do NOT depend on tab label text, which may be emoji-only).
+            if getattr(self, "media_explorer", None) is not None:
+                try:
+                    if not str(self.media_explorer.objectName() or ""):
+                        self.media_explorer.setObjectName("tab_media_explorer")
+                except Exception:
+                    pass
+        except Exception:
+            pass
         # <<< FRAMEVISION_MEDIA_EXPLORER_INIT_END
 
         _main_tabs = [("Edit", self.edit),("Background", self.background),("Media Explorer", self.media_explorer),("Tools", self.tools),("Describe", self.describe),("Queue", self.queue),("Models", self.models),("Presets", self.presets_tab),("Settings", self.settings)]
@@ -4976,12 +4881,27 @@ class MainWindow(QMainWindow):
 
         # >>> FRAMEVISION_MEDIA_EXPLORER_POSTCHECK_BEGIN
         # Crash loudly if the tab still isn't present (so we don't silently fail).
+        # IMPORTANT: Do NOT depend on the visible label text (it may include emojis or be empty).
         try:
             ok = False
-            for _i in range(self.tabs.count()):
-                if (self.tabs.tabText(_i) or "").strip().lower() == "media explorer":
-                    ok = True
-                    break
+            try:
+                if getattr(self, "media_explorer", None) is not None:
+                    ok = (self.tabs.indexOf(self.media_explorer) >= 0)
+            except Exception:
+                ok = False
+            if not ok:
+                try:
+                    ok = (self._find_tab_index_by_id("tab_media_explorer") is not None)
+                except Exception:
+                    ok = False
+            if not ok:
+                try:
+                    for _i in range(self.tabs.count()):
+                        if self._slug_tab_name(self.tabs.tabText(_i)) == "media_explorer":
+                            ok = True
+                            break
+                except Exception:
+                    pass
             if not ok:
                 raise RuntimeError("Media Explorer tab was not added to the main tabs.")
         except Exception as _e:
@@ -5044,6 +4964,77 @@ class MainWindow(QMainWindow):
             print("[framevision] WAN22 init failed:", _e)
         # <<< FRAMEVISION_WAN22_INIT_END
 
+        # >>> FRAMEVISION_QWEN2511_INIT_BEGIN
+        try:
+            if 'Qwen2511Pane' in globals() and Qwen2511Pane is not None:
+                try:
+                    self.qwen2511 = Qwen2511Pane(self)
+                except Exception as _e:
+                    # If the pane itself raises, show a friendly error tab instead of hiding it.
+                    print("[framevision] Qwen2511 init failed in pane constructor:", _e)
+                    err = QWidget(self)
+                    lay = QVBoxLayout(err)
+                    lab = QLabel(f"Qwen2511 failed to load:\n{_e}", err)
+                    lab.setWordWrap(True)
+                    lay.addWidget(lab)
+                    self.qwen2511 = err
+            else:
+                # Module imported but no usable pane class, or import failed completely.
+                err = QWidget(self)
+                lay = QVBoxLayout(err)
+                txt = (
+                    "Qwen2511 module not found or no Qwen2511Pane class defined.\n"
+                    "Make sure helpers/qwen2511.py defines a QWidget subclass named 'Qwen2511Pane'."
+                )
+                lab = QLabel(txt, err)
+                lab.setWordWrap(True)
+                lay.addWidget(lab)
+                self.qwen2511 = err
+
+            # Give the pane a reference to the main window (enables Media Explorer + internal player helpers).
+            try:
+                setattr(self.qwen2511, 'main', self)
+            except Exception:
+                pass
+
+            # Stable internal id (avoid depending on tab label text).
+            try:
+                if getattr(self, 'qwen2511', None) is not None:
+                    if not str(getattr(self.qwen2511, 'objectName', lambda: '')() or ''):
+                        self.qwen2511.setObjectName('tab_qwen2511')
+            except Exception:
+                pass
+
+            # Insert Qwen2511 tab just after WAN 2.2 if present; otherwise after TXT to IMG; otherwise append.
+            try:
+                idx_wan = -1
+                try:
+                    idx_wan = self.tabs.indexOf(getattr(self, 'wan22', None))
+                except Exception:
+                    idx_wan = -1
+
+                if idx_wan is not None and idx_wan >= 0:
+                    self.tabs.insertTab(idx_wan + 1, self.qwen2511, 'Qwen Edit  2511')
+                else:
+                    idx_txt = -1
+                    try:
+                        idx_txt = self.tabs.indexOf(getattr(self, '_txt2img_qwen', None))
+                    except Exception:
+                        idx_txt = -1
+                    if idx_txt is not None and idx_txt >= 0:
+                        self.tabs.insertTab(idx_txt + 1, self.qwen2511, 'Qwen Edit  2511')
+                    else:
+                        self.tabs.addTab(self.qwen2511, 'Qwen Edit  2511')
+            except Exception as _attach_e:
+                try:
+                    self.tabs.addTab(self.qwen2511, 'Qwen Edit  2511')
+                except Exception as _e2:
+                    print('[framevision] Qwen2511 tab attach failed:', _e2)
+        except Exception as _e:
+            print('[framevision] Qwen2511 init failed:', _e)
+        # <<< FRAMEVISION_QWEN2511_INIT_END
+
+
                 # >>> FRAMEVISION_ace_INIT_BEGIN
         # Create ace tab if available and the AceMusic environment is present
 #        try:
@@ -5094,7 +5085,26 @@ class MainWindow(QMainWindow):
             splitter.setObjectName('main_splitter')
         except Exception:
             pass
-        left = QWidget(); lv = QVBoxLayout(left); lv.addWidget(self.video)
+        self.left_stack = QStackedWidget()
+        try:
+            self.left_stack.setObjectName('left_stack')
+        except Exception:
+            pass
+        try:
+            self.left_stack.addWidget(self.video)
+            self.left_stack.setCurrentWidget(self.video)
+        except Exception:
+            pass
+        self._left_override_widget = None
+        self._left_override_owner = None
+
+        left = QWidget(); lv = QVBoxLayout(left)
+        try:
+            lv.setContentsMargins(0, 0, 0, 0)
+            lv.setSpacing(0)
+        except Exception:
+            pass
+        lv.addWidget(self.left_stack)
         right = QWidget(); rv = QVBoxLayout(right); rv.addWidget(self.hud); rv.addWidget(self.tabs)
         left.setMinimumSize(320, 240); right.setMinimumSize(360, 240)
         self.tabs.setMinimumWidth(360)
@@ -5195,6 +5205,131 @@ class MainWindow(QMainWindow):
         openAct = QAction("&Open", self); openAct.setShortcut(QKeySequence.Open); openAct.triggered.connect(self.open_file)
         try:
             self._install_optional_downloads_menu()
+        except Exception:
+            pass
+
+
+    # --- Startup layout settle (auto-resize/relayout) ----------------------------
+    def showEvent(self, ev):
+        # Some complex tabs (nested scroll areas / splitters) may not finalize their
+        # geometry until the user manually resizes the window. We do a small, safe
+        # one-time relayout after first show to make the UI correct immediately.
+        try:
+            super().showEvent(ev)
+        except Exception:
+            try:
+                QMainWindow.showEvent(self, ev)
+            except Exception:
+                pass
+        try:
+            if getattr(self, "_did_startup_layout_fix", False):
+                return
+            self._did_startup_layout_fix = True
+        except Exception:
+            return
+
+        # Multiple passes to catch late-created widgets / style polish.
+        try:
+            QTimer.singleShot(0,  lambda: self._startup_layout_fix_pass(0))
+            QTimer.singleShot(50, lambda: self._startup_layout_fix_pass(1))
+            QTimer.singleShot(200, lambda: self._startup_layout_fix_pass(2))
+        except Exception:
+            pass
+
+    def _startup_layout_fix_pass(self, pass_no: int = 0):
+        try:
+            if not self.isVisible():
+                return
+        except Exception:
+            pass
+
+        try:
+            st = self.windowState()
+            is_max = bool(st & Qt.WindowMaximized) or bool(getattr(self, "isMaximized", lambda: False)())
+            is_fs  = bool(st & Qt.WindowFullScreen) or bool(getattr(self, "isFullScreen", lambda: False)())
+        except Exception:
+            is_max = False
+            is_fs = False
+
+        # 1) Force polish + layout activation
+        try:
+            self.ensurePolished()
+        except Exception:
+            pass
+        try:
+            cw = self.centralWidget()
+            if cw is not None:
+                try:
+                    cw.ensurePolished()
+                except Exception:
+                    pass
+                try:
+                    cw.updateGeometry()
+                except Exception:
+                    pass
+                try:
+                    lay = cw.layout()
+                    if lay is not None:
+                        lay.invalidate()
+                        lay.activate()
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
+        # 2) Current tab may contain scroll areas with late size hints
+        try:
+            if hasattr(self, "tabs") and self.tabs is not None:
+                try:
+                    self.tabs.updateGeometry()
+                except Exception:
+                    pass
+                try:
+                    cur = self.tabs.currentWidget()
+                except Exception:
+                    cur = None
+                if cur is not None:
+                    try:
+                        cur.ensurePolished()
+                    except Exception:
+                        pass
+                    try:
+                        cur.updateGeometry()
+                    except Exception:
+                        pass
+                    try:
+                        lay2 = cur.layout()
+                        if lay2 is not None:
+                            lay2.invalidate()
+                            lay2.activate()
+                    except Exception:
+                        pass
+        except Exception:
+            pass
+
+        # 3) Give Qt one chance to process queued layout events
+        try:
+            QApplication.processEvents()
+        except Exception:
+            pass
+
+        # 4) Pixel-nudge (only when not maximized/fullscreen) to trigger a real resize event
+        #    This mimics the user "making it bigger then smaller" without noticeable change.
+        if (pass_no >= 1) and (not is_max) and (not is_fs):
+            try:
+                w0 = int(self.width())
+                h0 = int(self.height())
+                self.resize(w0 + 1, h0 + 1)
+                self.resize(w0, h0)
+            except Exception:
+                pass
+
+        try:
+            self.updateGeometry()
+        except Exception:
+            pass
+        try:
+            self.repaint()
         except Exception:
             pass
 

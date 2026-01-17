@@ -1,4 +1,5 @@
 import os
+import re
 from pathlib import Path
 def default_outdir(is_video: bool=False, purpose: str='upscale') -> str:
     base = _base_root()
@@ -60,17 +61,84 @@ def _read_field(w, names, getter='text'):
         except Exception: pass
     return ''
 def infer_upscale_args(inner):
+    # Input / output
     inp = _read_field(inner, ['edit_input','edit_input_path','line_input','input_path','edit_source'])
     outdir = _read_field(inner, ['edit_outdir','edit_output','line_output','output_dir'])
+
+    # Scale
     scale = _read_field(inner, ['spin_scale','spin_factor'], getter='value')
-    if not scale: scale = _safe_int(_read_field(inner, ['edit_scale','line_scale'], getter='text'), 4)
-    model = _read_field(inner, ['edit_model','line_model'], getter='text') or _read_field(inner, ['combo_model'], getter='currentText') or 'RealESRGAN-general-x4v3'
-    inp = os.path.abspath(inp) if inp else ''; outdir = os.path.abspath(outdir) if outdir else ''
+    if not scale:
+        scale = _safe_int(_read_field(inner, ['edit_scale','line_scale'], getter='text'), 4)
+
+    # Model: pick the *active* model dropdown based on the selected engine.
+    # (Many UIs keep other model combos instantiated; reading the wrong one yields "first item always".)
+    engine = _read_field(inner, ['combo_engine','engine_combo','combo_upscale_engine'], getter='currentText').lower()
+
+    model = ""
+    # Best-case: Upscaler pane exposes a helper that returns the currently selected model text.
+    try:
+        fn = getattr(inner, "_fv_current_model_text", None)
+        if callable(fn):
+            model = str(fn() or "").strip()
+    except Exception:
+        model = ""
+
+    # Engine-specific combo boxes (FrameVision Upscaler)
+    if not model:
+        if "waifu" in engine or "w2x" in engine:
+            model = _read_field(inner, ['combo_model_w2x','combo_model_waifu','combo_model_waifu2x'], getter='currentText')
+        elif "ultrasharp" in engine:
+            model = _read_field(inner, ['combo_model_ultrasharp'], getter='currentText')
+        elif "srmd" in engine:
+            # Some builds use SRMD models via Real-ESRGAN naming; prefer that combo if present.
+            model = _read_field(inner, ['combo_model_srmd_realsr','combo_model_srmd_realesr','combo_model_srmd_realesrgan'], getter='currentText')
+            if not model:
+                model = _read_field(inner, ['combo_model_srmd'], getter='currentText')
+        elif "ncnn" in engine and "realsr" in engine:
+            model = _read_field(inner, ['combo_model_realsr_ncnn','combo_model_realsrgan_ncnn'], getter='currentText')
+        elif "realsr" in engine or "realesrgan" in engine or "real-esrgan" in engine or "esrgan" in engine:
+            model = _read_field(inner, ['combo_model_realsr','combo_model_realesrgan','combo_model_esrgan'], getter='currentText')
+
+    # Fallback: try any known model combo
+    if not model:
+        model = _read_field(inner, [
+            'combo_model_realsr',
+            'combo_model_realsr_ncnn',
+            'combo_model_ultrasharp',
+            'combo_model_srmd_realsr',
+            'combo_model_srmd',
+            'combo_model_w2x',
+            'combo_model',
+        ], getter='currentText')
+
+    # Last resort: free-text fields
+    if not model:
+        model = _read_field(inner, ['edit_model','line_model'], getter='text')
+
+    if not model:
+        model = 'RealESRGAN-general-x4v3'
+
+    inp = os.path.abspath(inp) if inp else ''
+    outdir = os.path.abspath(outdir) if outdir else ''
     return inp, outdir, _safe_int(scale, 4), model
+
 def enqueue(job_type, input_path, out_dir, factor, model, fmt='png'):
     from helpers.job_helper import make_job_json
     d = jobs_dirs()
+    # Keep factor consistent with model suffix when using fixed-scale Real-ESRGAN style models.
+    try:
+        _ms = re.search(r"(?i)-x(\d+)\s*$", str(model or ""))
+        if _ms:
+            factor = int(_ms.group(1))
+    except Exception:
+        pass
     args = {'factor': int(factor), 'model': model}
+    try:
+        _ms = re.search(r"(?i)-x(\d+)\s*$", str(model or ""))
+        if _ms:
+            args['model_scale'] = int(_ms.group(1))
+    except Exception:
+        pass
     if job_type == 'upscale_photo': args['format'] = fmt
     return make_job_json(job_type, input_path, out_dir, args, str(d['pending']), priority=500)
 def enqueue_from_widget(inner, is_video: bool):
@@ -148,6 +216,186 @@ def enqueue_txt2img_qwen(job_args: dict):
         return False
 
 
+
+def default_qwen2511_outdir():
+    from pathlib import Path
+    base = Path('.').resolve()
+    d = base/'output'/'qwen2511'
+    d.mkdir(parents=True, exist_ok=True)
+    return str(d)
+
+
+def enqueue_qwen2511_from_widget(inner):
+    """Enqueue a Qwen2511 (image edit) job from the Qwen2511Pane UI.
+
+    Uses output/qwen2511 to match the pane's 'View results' / 'Play last result'.
+    """
+    import time as _time
+    from pathlib import Path as _P
+    try:
+        from helpers.job_helper import make_job_json
+        from helpers.queue_adapter import jobs_dirs
+    except Exception:
+        from job_helper import make_job_json
+        from queue_adapter import jobs_dirs
+
+    d = jobs_dirs()
+    out_dir = default_qwen2511_outdir()
+
+    # Required: input image
+    init_img = str(getattr(getattr(inner, 'ed_initimg', None), 'text', lambda: '')()).strip()
+    if not init_img:
+        raise RuntimeError("Input image missing.")
+    if not _P(init_img).is_file():
+        raise RuntimeError("Input image not found: " + init_img)
+
+    # Optional mask and refs
+    mask_img = str(getattr(getattr(inner, 'ed_mask', None), 'text', lambda: '')()).strip()
+    invert_mask = bool(getattr(getattr(inner, 'chk_invert_mask', None), 'isChecked', lambda: False)())
+    ref_imgs = []
+    for attr in ('ed_ref1', 'ed_ref2', 'ed_ref3'):
+        try:
+            p = str(getattr(getattr(inner, attr, None), 'text', lambda: '')()).strip()
+        except Exception:
+            p = ''
+        if p:
+            if not _P(p).is_file():
+                raise RuntimeError("Reference image not found: " + p)
+            ref_imgs.append(p)
+
+    use_increase_ref_index = bool(getattr(getattr(inner, 'chk_ref_increase_index', None), 'isChecked', lambda: True)())
+    disable_auto_resize_ref_images = bool(getattr(getattr(inner, 'chk_disable_ref_resize', None), 'isChecked', lambda: False)())
+
+    # Models / paths
+    sdcli_path = str(getattr(getattr(inner, 'ed_sdcli', None), 'text', lambda: '')()).strip()
+    try:
+        unet_path = getattr(getattr(inner, 'cb_unet', None), 'currentData', lambda: '')()
+        llm_path = getattr(getattr(inner, 'cb_llm', None), 'currentData', lambda: '')()
+        mmproj_path = getattr(getattr(inner, 'cb_mmproj', None), 'currentData', lambda: '')()
+        vae_path = getattr(getattr(inner, 'cb_vae', None), 'currentData', lambda: '')()
+    except Exception:
+        unet_path = llm_path = mmproj_path = vae_path = ''
+
+    # Prompts
+    try:
+        prompt = str(getattr(getattr(inner, 'ed_prompt', None), 'toPlainText', lambda: '')()).strip()
+    except Exception:
+        prompt = ''
+    negative = str(getattr(getattr(inner, 'ed_neg', None), 'text', lambda: '')()).strip()
+
+    # LoRA
+    try:
+        lora_dir = str(getattr(getattr(inner, 'ed_lora_dir', None), 'text', lambda: '')()).strip()
+    except Exception:
+        lora_dir = ''
+    if not lora_dir:
+        # Reasonable default matches Qwen2511 pane default.
+        lora_dir = os.path.join(_P('.').resolve(), 'models', 'lora', 'qwen2511')
+    try:
+        lora_name = str(getattr(getattr(inner, 'cb_lora', None), 'currentText', lambda: '')()).strip()
+    except Exception:
+        lora_name = ''
+    if str(lora_name).strip().lower() in ('(none)', 'none'):
+        lora_name = ''
+    try:
+        lora_strength = float(getattr(getattr(inner, 'sp_lora_strength', None), 'value', lambda: 1.0)())
+    except Exception:
+        lora_strength = 1.0
+
+    # Settings
+    steps = int(getattr(getattr(inner, 'sp_steps', None), 'value', lambda: 28)())
+    cfg = float(getattr(getattr(inner, 'sp_cfg', None), 'value', lambda: 4.5)())
+    seed = int(getattr(getattr(inner, 'sp_seed', None), 'value', lambda: -1)())
+    width = int(getattr(getattr(inner, 'sp_w', None), 'value', lambda: 1024)())
+    height = int(getattr(getattr(inner, 'sp_h', None), 'value', lambda: 576)())
+
+    # Strength (mirror direct-run behavior: read from UI and store into the queued job)
+    strength = None
+    try:
+        strength = float(getattr(getattr(inner, 'sp_strength', None), 'value', lambda: None)())
+    except Exception:
+        strength = None
+    if strength is None:
+        try:
+            strength = float(getattr(getattr(inner, 'lbl_strength', None), 'value', lambda: None)())
+        except Exception:
+            strength = None
+    if strength is None:
+        try:
+            strength = float(getattr(getattr(inner, 'sl_strength', None), 'value', lambda: 100)()) / 100.0
+        except Exception:
+            strength = 1.0
+    try:
+        # NaN guard
+        if strength != strength:
+            strength = 1.0
+    except Exception:
+        strength = 1.0
+    try:
+        strength = max(0.0, min(1.0, float(strength)))
+    except Exception:
+        strength = 1.0
+
+    sampling_method = str(getattr(getattr(inner, 'cb_sampling', None), 'currentText', lambda: 'euler_a')())
+    shift = float(getattr(getattr(inner, 'sp_shift', None), 'value', lambda: 12.5)())
+
+    # Low VRAM / perf
+    use_vae_tiling = bool(getattr(getattr(inner, 'chk_vae_tiling', None), 'isChecked', lambda: False)())
+    vae_tile_size = str(getattr(getattr(inner, 'cb_vae_tile_size', None), 'currentText', lambda: '256x256')()).strip()
+    vae_tile_overlap = float(getattr(getattr(inner, 'sp_vae_tile_overlap', None), 'value', lambda: 0.50)())
+    use_offload = bool(getattr(getattr(inner, 'chk_offload', None), 'isChecked', lambda: False)())
+    use_mmap = bool(getattr(getattr(inner, 'chk_mmap', None), 'isChecked', lambda: False)())
+    use_vae_on_cpu = bool(getattr(getattr(inner, 'chk_vae_on_cpu', None), 'isChecked', lambda: False)())
+    use_clip_on_cpu = bool(getattr(getattr(inner, 'chk_clip_on_cpu', None), 'isChecked', lambda: False)())
+    use_diffusion_fa = bool(getattr(getattr(inner, 'chk_diffusion_fa', None), 'isChecked', lambda: False)())
+
+    # Output file (precomputed so the queue can display a deterministic target)
+    ts = int(_time.time())
+    out_file = str(_P(out_dir) / f"qwen_image_edit_2511_{ts}.png")
+    label = "Qwen2511 image edit"
+    if prompt:
+        label = "Qwen2511: " + (prompt.replace("\n", " ").strip()[:80])
+
+    args = {
+        "label": label,
+        "sdcli_path": sdcli_path,
+        "init_img": init_img,
+        "mask_img": mask_img,
+        "invert_mask": invert_mask,
+        "ref_images": ref_imgs,
+        "use_increase_ref_index": use_increase_ref_index,
+        "disable_auto_resize_ref_images": disable_auto_resize_ref_images,
+        "prompt": prompt,
+        "negative": negative,
+        "lora_dir": lora_dir,
+        "lora_name": lora_name,
+        "lora_strength": lora_strength,
+        "unet_path": unet_path,
+        "llm_path": llm_path,
+        "mmproj_path": mmproj_path,
+        "vae_path": vae_path,
+        "steps": steps,
+        "cfg": cfg,
+        "seed": seed,
+        "width": width,
+        "height": height,
+        "strength": strength,
+        "sampling_method": sampling_method,
+        "shift": shift,
+        "use_vae_tiling": use_vae_tiling,
+        "vae_tile_size": vae_tile_size,
+        "vae_tile_overlap": vae_tile_overlap,
+        "use_offload": use_offload,
+        "use_mmap": use_mmap,
+        "use_vae_on_cpu": use_vae_on_cpu,
+        "use_clip_on_cpu": use_clip_on_cpu,
+        "use_diffusion_fa": use_diffusion_fa,
+        "out_file": out_file,
+        "outfile": out_file,
+    }
+
+    return make_job_json("qwen2511_image_edit", init_img, out_dir, args, str(d["pending"]), priority=500)
+
 # --- FrameVision: queue helpers for Upsc & external commands ---
 
 def _is_video_path(p: str) -> bool:
@@ -215,7 +463,7 @@ def enqueue_txt2img(job: dict) -> bool:
         # Keys to pass to worker
         keys = [
             "prompt","negative","seed","seed_policy","batch","cfg_scale",
-            "width","height","steps","sampler","model_path",
+            "width","height","steps","sampler","flow_shift","offload_cpu","model_path",
             "lora_path","lora_scale","lora2_path","lora2_scale",
             "attn_slicing","vae_device","gpu_index","threads",
             "format","filename_template","hires_helper","fit_check",

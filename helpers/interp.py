@@ -12,7 +12,7 @@ from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton, QSlider,
     QCheckBox, QMessageBox, QFileDialog, QComboBox, QSizePolicy, QScrollArea, QFrame
 )
-from PySide6.QtWidgets import QProgressBar, QMenu, QInputDialog
+from PySide6.QtWidgets import QProgressBar, QMenu, QInputDialog, QLineEdit
 
 # ---- Local FFmpeg/FFprobe discovery (prefer presets/bin) ----
 try:
@@ -189,14 +189,55 @@ def _count_frames_fast(path: Path) -> int:
 
 
 def _probe_video_meta(path: Path) -> dict:
-    """Return basic video metadata via ffprobe: width, height, duration, bitrate, codec."""
+    """Return basic video metadata via ffprobe.
+
+    Keys:
+      - width, height, duration, codec, bitrate (overall/format)
+      - v_bitrate, pix_fmt, v_profile
+      - a_codec, a_bitrate, a_channels, a_sample_rate
+    """
     info = {
         "width": None,
         "height": None,
         "duration": None,
-        "bitrate": None,
-        "codec": None,
+        "bitrate": None,      # overall/format bitrate (bits/s)
+        "codec": None,        # video codec name (e.g. h264/hevc)
+        "v_bitrate": None,    # video stream bitrate (bits/s)
+        "pix_fmt": None,      # video pixel format (e.g. yuv420p/yuv420p10le)
+        "v_profile": None,    # e.g. High, Main10
+        "a_codec": None,
+        "a_bitrate": None,
+        "a_channels": None,
+        "a_sample_rate": None,
     }
+
+    def _to_int(x):
+        try:
+            if x is None:
+                return None
+            if isinstance(x, (int, float)):
+                return int(x)
+            s = str(x).strip()
+            if not s:
+                return None
+            return int(float(s))
+        except Exception:
+            return None
+
+    def _to_float(x):
+        try:
+            if x is None:
+                return None
+            if isinstance(x, (int, float)):
+                return float(x)
+            s = str(x).strip()
+            if not s:
+                return None
+            return float(s)
+        except Exception:
+            return None
+
+    # --- video + container ---
     try:
         proc = QProcess()
         proc.start(
@@ -204,7 +245,7 @@ def _probe_video_meta(path: Path) -> dict:
             [
                 "-v", "error",
                 "-select_streams", "v:0",
-                "-show_entries", "stream=width,height,codec_name,bit_rate",
+                "-show_entries", "stream=width,height,codec_name,bit_rate,pix_fmt,profile",
                 "-show_entries", "format=duration,bit_rate",
                 "-of", "json",
                 str(path),
@@ -212,54 +253,113 @@ def _probe_video_meta(path: Path) -> dict:
         )
         proc.waitForFinished(2500)
         raw = proc.readAllStandardOutput().data().decode("utf-8", "ignore")
-        if not raw.strip():
-            return info
-        data = json.loads(raw)
-        stream = None
-        try:
-            streams = data.get("streams") or []
-            if streams:
-                stream = streams[0]
-        except Exception:
+        if raw.strip():
+            data = json.loads(raw)
             stream = None
-        fmt = data.get("format") or {}
+            try:
+                streams = data.get("streams") or []
+                if streams:
+                    stream = streams[0]
+            except Exception:
+                stream = None
+            fmt = data.get("format") or {}
 
-        if stream is not None:
-            try:
-                info["width"] = int(stream.get("width") or 0) or None
-            except Exception:
-                pass
-            try:
-                info["height"] = int(stream.get("height") or 0) or None
-            except Exception:
-                pass
-            try:
-                codec = stream.get("codec_name")
-                if codec:
-                    info["codec"] = str(codec)
-            except Exception:
-                pass
-            try:
-                br = stream.get("bit_rate")
-                if br is not None:
-                    info["bitrate"] = float(br)
-            except Exception:
-                pass
+            if stream is not None:
+                info["width"] = _to_int(stream.get("width")) or None
+                info["height"] = _to_int(stream.get("height")) or None
+                try:
+                    c = stream.get("codec_name")
+                    if c:
+                        info["codec"] = str(c)
+                except Exception:
+                    pass
+                vb = _to_int(stream.get("bit_rate"))
+                if vb and vb > 0:
+                    info["v_bitrate"] = float(vb)
+                try:
+                    pf = stream.get("pix_fmt")
+                    if pf:
+                        info["pix_fmt"] = str(pf)
+                except Exception:
+                    pass
+                try:
+                    pr = stream.get("profile")
+                    if pr:
+                        info["v_profile"] = str(pr)
+                except Exception:
+                    pass
 
-        try:
-            dur = fmt.get("duration")
-            if dur is not None:
+            dur = _to_float(fmt.get("duration"))
+            if dur and dur > 0:
                 info["duration"] = float(dur)
-        except Exception:
-            pass
-        try:
-            brf = fmt.get("bit_rate")
-            if brf is not None:
+            brf = _to_int(fmt.get("bit_rate"))
+            if brf and brf > 0:
                 info["bitrate"] = float(brf)
-        except Exception:
-            pass
     except Exception:
-        return info
+        pass
+
+    # If overall bitrate is missing, approximate from size/duration.
+    try:
+        if (not info.get("bitrate")) and info.get("duration") and info["duration"] > 0:
+            sz = path.stat().st_size
+            info["bitrate"] = float((sz * 8.0) / float(info["duration"]))
+    except Exception:
+        pass
+
+    # --- audio (optional) ---
+    try:
+        proc = QProcess()
+        proc.start(
+            FFPROBE,
+            [
+                "-v", "error",
+                "-select_streams", "a:0",
+                "-show_entries", "stream=codec_name,bit_rate,channels,sample_rate",
+                "-of", "json",
+                str(path),
+            ],
+        )
+        proc.waitForFinished(2000)
+        raw = proc.readAllStandardOutput().data().decode("utf-8", "ignore")
+        if raw.strip():
+            data = json.loads(raw)
+            stream = None
+            try:
+                streams = data.get("streams") or []
+                if streams:
+                    stream = streams[0]
+            except Exception:
+                stream = None
+            if stream is not None:
+                try:
+                    c = stream.get("codec_name")
+                    if c:
+                        info["a_codec"] = str(c)
+                except Exception:
+                    pass
+                ab = _to_int(stream.get("bit_rate"))
+                if ab and ab > 0:
+                    info["a_bitrate"] = float(ab)
+                ch = _to_int(stream.get("channels"))
+                if ch and ch > 0:
+                    info["a_channels"] = int(ch)
+                sr = _to_int(stream.get("sample_rate"))
+                if sr and sr > 0:
+                    info["a_sample_rate"] = int(sr)
+    except Exception:
+        pass
+
+    # If we don't know video bitrate but we know overall+audio, approximate video bitrate.
+    try:
+        if (not info.get("v_bitrate")) and info.get("bitrate"):
+            br = float(info["bitrate"] or 0)
+            abr = float(info.get("a_bitrate") or 0)
+            vb = br - abr
+            if vb > 50_000:  # ignore nonsense
+                info["v_bitrate"] = vb
+    except Exception:
+        pass
+
     return info
 
 def _extract_first_frame(src: Path, dst: Path) -> bool:
@@ -438,9 +538,13 @@ class InterpPane(QWidget):
         self.slider.setFixedHeight(28)
         self.slider.setStyleSheet("QSlider::groove:horizontal{height:10px;border-radius:5px;} QSlider::handle:horizontal{width:18px;height:18px;margin:-6px 0;border-radius:9px;}")
         row.addWidget(self.slider)
-        self.lbl_mult = QLabel("2.00×"); row.addWidget(self.lbl_mult)
-        self.btn_2x = QPushButton("2×"); self.btn_4x = QPushButton("4×")
-        row.addWidget(self.btn_2x); row.addWidget(self.btn_4x)
+        self.edit_mult = QLineEdit("2.00×")
+        self.edit_mult.setFixedWidth(72)
+        self.edit_mult.setMaximumHeight(28)
+        self.edit_mult.setAlignment(Qt.AlignRight)
+        row.addWidget(self.edit_mult)
+        self.btn_2x = QPushButton("2×"); self.btn_3x = QPushButton("3×"); self.btn_4x = QPushButton("4×")
+        row.addWidget(self.btn_2x); row.addWidget(self.btn_3x); row.addWidget(self.btn_4x)
         row.addStretch(1); lay.addLayout(row)
 
         lay.addSpacing(8)
@@ -585,8 +689,8 @@ class InterpPane(QWidget):
 
         # tooltips
         self.slider.setToolTip("FPS multiplier (0.15×–4.00×). ≥1.0× raises FPS. <1.0× makes slow motion.")
-        self.lbl_mult.setToolTip("Current multiplier applied to input FPS.")
-        self.btn_2x.setToolTip("Set multiplier to 2×."); self.btn_4x.setToolTip("Set multiplier to 4×.")
+        self.edit_mult.setToolTip("Type a multiplier (max 4×). The slider will match the number you enter.")
+        self.btn_2x.setToolTip("Set multiplier to 2×."); self.btn_3x.setToolTip("Set multiplier to 3×."); self.btn_4x.setToolTip("Set multiplier to 4×.")
         self.cb_stream.setToolTip("Low‑memory streaming path (for the ONNX backend).")
         self.combo_speed.setToolTip("Processing profile for FFmpeg path.")
         self.cb_speed_default.setToolTip("Reset to a safe default (Balanced).")
@@ -598,7 +702,13 @@ class InterpPane(QWidget):
 
         # wiring
         self.btn_2x.clicked.connect(lambda: self.slider.setValue(200))
+        self.btn_3x.clicked.connect(lambda: self.slider.setValue(300))
         self.btn_4x.clicked.connect(lambda: self.slider.setValue(400))
+        self.edit_mult.editingFinished.connect(self._on_mult_edit_finished)
+        try:
+            self.edit_mult.returnPressed.connect(self._on_mult_edit_finished)
+        except Exception:
+            pass
         self.slider.valueChanged.connect(self._on_slider_changed)
         self.btn_start.clicked.connect(self._on_start_clicked)
         self.btn_batch.clicked.connect(self._on_batch_clicked)
@@ -885,19 +995,73 @@ class InterpPane(QWidget):
         if i==2:   return ("minterpolate=fps={fps}:mi_mode=mci:mc_mode=aobmc:me_mode=bidir:vsbmc=1", ["-preset","fast","-threads","0"])
         if i==3:   return ("minterpolate=fps={fps}:mi_mode=mci:mc_mode=aobmc:me_mode=bidir:vsbmc=1:me=umh", ["-preset","medium","-threads","0"])
         return ("minterpolate=fps={fps}:mi_mode=dup", ["-preset","ultrafast","-threads","0"])
-
     def _build_ffmpeg_cmd(self, src: Path, mult: float, in_fps: float, out_path: Path, progress_file: Path | None = None)->list[str]:
         vf_tmpl, preset = self._filters_for_speed()
+
+        meta = _probe_video_meta(src)
+        v_codec = (meta.get("codec") or "").lower()
+        a_codec = (meta.get("a_codec") or "").lower()
+        pix_fmt = meta.get("pix_fmt")
+        v_bitrate = meta.get("v_bitrate") or meta.get("bitrate")
+
+        # Try to keep source "quality"/size by matching source bitrate instead of CRF (which can shrink a lot).
+        vb = int(v_bitrate) if isinstance(v_bitrate, (int, float)) and v_bitrate > 0 else 0
+
+        # Preserve codec family when reasonable (still re-encode; interpolation cannot stream-copy video).
+        v_enc = "libx265" if v_codec in ("hevc", "h265") else "libx264"
+
+        v_rate_args: list[str]
+        if vb > 0:
+            # Slight headroom on maxrate to avoid VBV starvation on complex scenes.
+            v_rate_args = ["-b:v", str(vb), "-maxrate", str(int(vb * 1.10)), "-bufsize", str(int(vb * 2.0))]
+        else:
+            v_rate_args = ["-crf", "18"]
+
+        v_fmt_args: list[str] = []
+        if pix_fmt:
+            v_fmt_args += ["-pix_fmt", str(pix_fmt)]
+            # If source is 10-bit, ensure the encoder profile matches the pixel format.
+            if "10" in str(pix_fmt):
+                if v_enc == "libx264":
+                    v_fmt_args += ["-profile:v", "high10"]
+                elif v_enc == "libx265":
+                    v_fmt_args += ["-profile:v", "main10"]
+
+        out_suffix = out_path.suffix.lower()
+        mp4_flags = ["-movflags", "+faststart"] if out_suffix in (".mp4", ".m4v") else []
+
+        # Audio: copy only when safe for the target container and when no tempo filter is needed.
+        copy_ok = a_codec in ("aac", "mp3", "alac")
+
+        def _aac_bitrate() -> str:
+            ab = meta.get("a_bitrate")
+            if isinstance(ab, (int, float)) and ab > 0:
+                return str(int(ab))
+            return str(192_000)
+
+        base = [FFMPEG, "-hide_banner", "-y"] + (["-progress", str(progress_file)] if progress_file else []) + ["-i", str(src)]
+
         if mult >= 1.0:
             target = in_fps * mult
             vf = vf_tmpl.format(fps=f"{target:.3f}")
-            base = [FFMPEG,"-hide_banner","-y"] + (["-progress", str(progress_file)] if progress_file else []) + ["-i", str(src)]
-            return base + ["-vf", vf, "-c:a","copy","-c:v","libx264", *preset, "-crf","18", str(out_path)]
+
+            if a_codec:
+                audio_args = (["-c:a", "copy"] if copy_ok else ["-c:a", "aac", "-b:a", _aac_bitrate()])
+            else:
+                audio_args = ["-an"]
+
+            return base + ["-vf", vf, "-c:v", v_enc, *preset, *v_rate_args, *v_fmt_args, *mp4_flags, *audio_args, str(out_path)]
         else:
             vf = vf_tmpl.format(fps=f"{in_fps:.3f}") + f",setpts=PTS/({max(0.01,mult):.4f})"
             atempo = _atempo_chain(mult)
-            base = [FFMPEG,"-hide_banner","-y"] + (["-progress", str(progress_file)] if progress_file else []) + ["-i", str(src)]
-            return base + ["-vf", vf, "-af", atempo, "-c:v","libx264", *preset, "-crf","18", str(out_path)]
+
+            if a_codec:
+                audio_args = ["-af", atempo, "-c:a", "aac", "-b:a", _aac_bitrate()]
+            else:
+                audio_args = ["-an"]
+
+            return base + ["-vf", vf, *audio_args, "-c:v", v_enc, *preset, *v_rate_args, *v_fmt_args, *mp4_flags, str(out_path)]
+
 
     
     def _versioned_path(self, path: Path) -> Path:
@@ -985,7 +1149,7 @@ class InterpPane(QWidget):
 
         # extract audio
         audio = tmp / "audio.m4a"
-        p1 = QProcess(self); p1.start(FFMPEG, ["-hide_banner","-y","-i", str(src), "-vn","-acodec","copy", str(audio)]); p1.waitForFinished(-1)
+        p1 = QProcess(self); p1.start(FFMPEG, ["-hide_banner","-y","-i", str(src), "-vn","-c:a","aac","-b:a","192000", str(audio)]); p1.waitForFinished(-1)
         if getattr(self, '_cancel_flag', False): self._progress_end(); self._set_result_state('idle', 'Result: —'); shutil.rmtree(tmp, ignore_errors=True); return
         self._progress_set(3)
 
@@ -1049,16 +1213,57 @@ class InterpPane(QWidget):
             return
         if getattr(self, '_cancel_flag', False): self._progress_end(); self._set_result_state('idle', 'Result: —'); shutil.rmtree(tmp, ignore_errors=True); return
         self._progress_set(95, self._progress_total_frames)
+        # encode (keeps source-ish quality/size)
+        meta = _probe_video_meta(src)
+        v_codec = (meta.get("codec") or "").lower()
+        a_codec = (meta.get("a_codec") or "").lower()
+        pix_fmt = meta.get("pix_fmt")
+        v_bitrate = meta.get("v_bitrate") or meta.get("bitrate")
+        vb = int(v_bitrate) if isinstance(v_bitrate, (int, float)) and v_bitrate > 0 else 0
 
-        # encode
+        v_enc = "libx265" if v_codec in ("hevc", "h265") else "libx264"
+        if vb > 0:
+            v_rate_args = ["-b:v", str(vb), "-maxrate", str(int(vb * 1.10)), "-bufsize", str(int(vb * 2.0))]
+        else:
+            v_rate_args = ["-crf", "18"]
+
+        v_fmt_args = []
+        if pix_fmt:
+            v_fmt_args += ["-pix_fmt", str(pix_fmt)]
+            if "10" in str(pix_fmt):
+                if v_enc == "libx264":
+                    v_fmt_args += ["-profile:v", "high10"]
+                elif v_enc == "libx265":
+                    v_fmt_args += ["-profile:v", "main10"]
+
+        out_suffix = out_path.suffix.lower()
+        mp4_flags = ["-movflags", "+faststart"] if out_suffix in (".mp4", ".m4v") else []
+
+        def _aac_bitrate() -> str:
+            ab = meta.get("a_bitrate")
+            if isinstance(ab, (int, float)) and ab > 0:
+                return str(int(ab))
+            return str(192_000)
+
         if mult >= 1.0:
             out_fps = int(round(in_fps * mult))
             enc = ["-framerate", str(out_fps), "-i", str(frames_out / "%08d.png")]
-            cmd = [FFMPEG,"-hide_banner","-y", *enc, "-i", str(audio), "-c:a","copy","-crf","18","-c:v","libx264","-pix_fmt","yuv420p", str(out_path)]
+            if a_codec:
+                cmd = [FFMPEG,"-hide_banner","-y", *enc, "-i", str(audio), "-c:a","copy",
+                       "-c:v", v_enc, "-preset","veryfast", *v_rate_args, *v_fmt_args, *mp4_flags, str(out_path)]
+            else:
+                cmd = [FFMPEG,"-hide_banner","-y", *enc,
+                       "-c:v", v_enc, "-preset","veryfast", *v_rate_args, *v_fmt_args, *mp4_flags, str(out_path)]
         else:
             enc = ["-framerate", str(int(round(in_fps))), "-i", str(frames_out / "%08d.png")]
             atempo = _atempo_chain(mult)
-            cmd = [FFMPEG,"-hide_banner","-y", *enc, "-i", str(audio), "-af", atempo, "-c:v","libx264","-crf","18","-pix_fmt","yuv420p", str(out_path)]
+            if a_codec:
+                cmd = [FFMPEG,"-hide_banner","-y", *enc, "-i", str(audio), "-af", atempo,
+                       "-c:a","aac","-b:a", _aac_bitrate(),
+                       "-c:v", v_enc, "-preset","veryfast", *v_rate_args, *v_fmt_args, *mp4_flags, str(out_path)]
+            else:
+                cmd = [FFMPEG,"-hide_banner","-y", *enc,
+                       "-c:v", v_enc, "-preset","veryfast", *v_rate_args, *v_fmt_args, *mp4_flags, str(out_path)]
         p4 = QProcess(self); p4.start(cmd[0], cmd[1:]); p4.waitForFinished(-1)
         if getattr(self, '_cancel_flag', False): self._progress_end(); self._set_result_state('idle', 'Result: —'); shutil.rmtree(tmp, ignore_errors=True); return
         self._progress_set(100, self._progress_total_frames)
@@ -1190,9 +1395,65 @@ class InterpPane(QWidget):
         return
 
 
+    def _set_mult_edit_text(self, mult: float):
+        """Update multiplier text box without re-triggering handlers."""
+        try:
+            self.edit_mult.blockSignals(True)
+            self.edit_mult.setText(f"{mult:.2f}×")
+        except Exception:
+            pass
+        finally:
+            try:
+                self.edit_mult.blockSignals(False)
+            except Exception:
+                pass
+
+    def _parse_mult_text(self, txt: str):
+        try:
+            t = (txt or "").strip()
+            t = t.replace("×", "").replace("x", "").replace("X", "")
+            t = re.sub(r"[^0-9.+-]", "", t)
+            if not t:
+                return None
+            return float(t)
+        except Exception:
+            return None
+
+    def _on_mult_edit_finished(self):
+        """User typed a multiplier; clamp to [0.15, 4.0] and move the slider."""
+        try:
+            val = self._parse_mult_text(self.edit_mult.text())
+        except Exception:
+            val = None
+        if val is None:
+            # revert to slider value
+            try:
+                mult = max(0.15, min(4.0, self.slider.value()/100.0))
+                self._set_mult_edit_text(mult)
+            except Exception:
+                pass
+            return
+        mult = max(0.15, min(4.0, float(val)))
+        try:
+            self._mult_sync_from_slider = True
+            self.slider.setValue(int(round(mult * 100)))
+        finally:
+            self._mult_sync_from_slider = False
+        try:
+            self._set_mult_edit_text(mult)
+        except Exception:
+            pass
+
     def _on_slider_changed(self, v: int):
         mult = max(0.15, min(4.0, v/100.0))
-        self.lbl_mult.setText(f"{mult:.2f}×")
+        try:
+            # Don't fight the user while they're typing.
+            if self.edit_mult.hasFocus() and not getattr(self, '_mult_sync_from_slider', False):
+                pass
+            else:
+                self._set_mult_edit_text(mult)
+        except Exception:
+            pass
         self._update_result_info()
 
     def _poll_ffmpeg_progress(self):

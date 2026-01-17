@@ -1,14 +1,15 @@
 {
   "remember": true,
-  "scale": 2.0,
+  "scale": 4.0,
   "engine_index": 0,
-  "model_realsr": "realesr-animevideov3-x2",
+  "model_realsr": "realesrgan-x4plus",
   "model_w2x": "models-upconv_7_photo",
+  "model_gfpgan": "GFPGANv1.4",
   "outdir": "C:\\FrameVision-main\\output\\upscaled",
   "vcodec": "libx264",
-  "use_crf": false,
-  "crf": 18,
-  "use_bitrate": true,
+  "use_crf": true,
+  "crf": 20,
+  "use_bitrate": false,
   "bitrate": 3000,
   "preset": "ultrafast",
   "keyint": 0,
@@ -21,7 +22,5 @@
     "advanced": false
   },
   "video_thumbs": true,
-  "streaming_lowmem": true,
-  "recents_thumb_size": 108,
-  "recents_sort": "newest"
+  "streaming_lowmem": true
 }

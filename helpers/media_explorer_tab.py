@@ -105,25 +105,163 @@ class FolderPickDialog(QtWidgets.QDialog):
         self.accept()
 
 
-class FolderTreeDialog(QtWidgets.QDialog):
-    """Show a simple directory-only tree view for a chosen root folder."""
+class FolderFavoritesDialog(QtWidgets.QDialog):
+    """List of favorite folders for the Tree view dialog.
 
-    def __init__(self, root_folder: str, parent: Optional[QtWidgets.QWidget] = None) -> None:
+    - Double-click: scan that folder.
+    - Right-click: remove from favorites.
+    """
+
+    def __init__(
+        self,
+        folders: List[str],
+        on_scan: Any,
+        on_remove: Any,
+        parent: Optional[QtWidgets.QWidget] = None,
+    ) -> None:
         super().__init__(parent)
-        self.setWindowTitle("Tree view")
-        self.setModal(False)
-        self.resize(720, 520)
+        self.setWindowTitle("Favorites")
+        self.setModal(True)
+        self.resize(720, 420)
 
-        root_folder = (root_folder or "").strip()
+        self._on_scan = on_scan
+        self._on_remove = on_remove
 
         l = QtWidgets.QVBoxLayout(self)
         l.setContentsMargins(10, 10, 10, 10)
         l.setSpacing(8)
 
-        self.lbl = QtWidgets.QLabel(root_folder, self)
-        self.lbl.setTextInteractionFlags(QtCore.Qt.TextInteractionFlag.TextSelectableByMouse)
+        self.lbl = QtWidgets.QLabel(
+            "Double-click a folder to scan it. Right-click to remove from favorites.",
+            self,
+        )
         self.lbl.setWordWrap(True)
         l.addWidget(self.lbl, 0)
+
+        self.list = QtWidgets.QListWidget(self)
+        self.list.setSelectionMode(QtWidgets.QAbstractItemView.SelectionMode.SingleSelection)
+        self.list.setContextMenuPolicy(QtCore.Qt.ContextMenuPolicy.CustomContextMenu)
+        self.list.customContextMenuRequested.connect(self._on_context_menu)
+        self.list.itemActivated.connect(self._on_item_activated)
+        l.addWidget(self.list, 1)
+
+        self.btn_close = QtWidgets.QPushButton("Close", self)
+        self.btn_close.clicked.connect(self.reject)
+
+        btn_row = QtWidgets.QHBoxLayout()
+        btn_row.setContentsMargins(0, 0, 0, 0)
+        btn_row.addStretch(1)
+        btn_row.addWidget(self.btn_close, 0)
+        l.addLayout(btn_row, 0)
+
+        self.set_folders(folders)
+
+    def set_folders(self, folders: List[str]) -> None:
+        self.list.clear()
+        clean: List[str] = []
+        for f in (folders or []):
+            ff = (f or "").strip()
+            if not ff:
+                continue
+            clean.append(ff)
+        # Stable-ish ordering (case-insensitive)
+        try:
+            clean.sort(key=lambda s: s.lower())
+        except Exception:
+            pass
+        for f in clean:
+            it = QtWidgets.QListWidgetItem(f)
+            it.setToolTip(f)
+            self.list.addItem(it)
+
+        if self.list.count() > 0:
+            try:
+                self.list.setCurrentRow(0)
+            except Exception:
+                pass
+
+    def _selected_folder(self) -> str:
+        it = self.list.currentItem()
+        if not it:
+            return ""
+        return (it.text() or "").strip()
+
+    def _on_item_activated(self, it: QtWidgets.QListWidgetItem) -> None:
+        folder = (it.text() or "").strip() if it else ""
+        if not folder:
+            return
+        if callable(self._on_scan):
+            self._on_scan(folder)
+        self.accept()
+
+    def _on_context_menu(self, pos: QtCore.QPoint) -> None:
+        it = self.list.itemAt(pos)
+        folder = (it.text() or "").strip() if it else ""
+        if not folder:
+            return
+
+        menu = QtWidgets.QMenu(self)
+        act_remove = menu.addAction("★ Remove from favorites")
+        act_remove.setToolTip("Remove this folder from favorites.")
+
+        chosen = menu.exec(self.list.viewport().mapToGlobal(pos))
+        if chosen != act_remove:
+            return
+
+        if callable(self._on_remove):
+            self._on_remove(folder)
+
+        # Remove from UI list immediately
+        try:
+            row = self.list.row(it)
+            if row >= 0:
+                self.list.takeItem(row)
+        except Exception:
+            # Fallback: full refresh
+            pass
+
+
+class FolderTreeDialog(QtWidgets.QDialog):
+    """Browse folders in a simple tree and let the user scan the selected folder.
+
+    Goals:
+    - No extra 'pick a folder first' step: open at the last used folder.
+    - One clear action: select a folder -> click 'Scan folder'.
+    """
+
+    def __init__(
+        self,
+        root_folder: str,
+        start_folder: str = "",
+        parent: Optional[QtWidgets.QWidget] = None,
+    ) -> None:
+        super().__init__(parent)
+        self.setWindowTitle("Tree view")
+        self.setModal(True)
+        self.resize(760, 560)
+
+        root_folder = (root_folder or "").strip()
+        start_folder = (start_folder or "").strip()
+        self._selected_folder: str = ""
+        # Folder favorites (tree view)
+        self._folder_favs: Dict[str, str] = self._load_folder_favs_map()
+
+
+        l = QtWidgets.QVBoxLayout(self)
+        l.setContentsMargins(10, 10, 10, 10)
+        l.setSpacing(8)
+
+        self.lbl_root = QtWidgets.QLabel(self)
+        self.lbl_root.setWordWrap(True)
+        self.lbl_root.setTextInteractionFlags(QtCore.Qt.TextInteractionFlag.TextSelectableByMouse)
+        self.lbl_root.setText(f"Root: {root_folder}" if root_folder else "Root: (auto)")
+        l.addWidget(self.lbl_root, 0)
+
+        self.lbl_selected = QtWidgets.QLabel(self)
+        self.lbl_selected.setWordWrap(True)
+        self.lbl_selected.setTextInteractionFlags(QtCore.Qt.TextInteractionFlag.TextSelectableByMouse)
+        self.lbl_selected.setText("Selected: (none)")
+        l.addWidget(self.lbl_selected, 0)
 
         self.tree = QtWidgets.QTreeView(self)
         self.tree.setHeaderHidden(True)
@@ -131,63 +269,546 @@ class FolderTreeDialog(QtWidgets.QDialog):
         self.tree.setIndentation(18)
         self.tree.setEditTriggers(QtWidgets.QAbstractItemView.EditTrigger.NoEditTriggers)
         self.tree.setSelectionMode(QtWidgets.QAbstractItemView.SelectionMode.SingleSelection)
+        self.tree.setUniformRowHeights(True)
+        l.addWidget(self.tree, 1)
 
-        # Right-click: allow quickly opening & scanning a subfolder in Media Explorer.
-        self.tree.setContextMenuPolicy(QtCore.Qt.ContextMenuPolicy.CustomContextMenu)
-        self.tree.customContextMenuRequested.connect(self._on_tree_context_menu)
+        # Right-click options (favorites)
+        try:
+            self.tree.setContextMenuPolicy(QtCore.Qt.ContextMenuPolicy.CustomContextMenu)
+            self.tree.customContextMenuRequested.connect(self._tree_context_menu)
+        except Exception:
+            pass
 
         self.fs_model = QtWidgets.QFileSystemModel(self)
-        self.fs_model.setFilter(
-            QtCore.QDir.Filter.AllDirs | QtCore.QDir.Filter.NoDotAndDotDot
-        )
+        self.fs_model.setFilter(QtCore.QDir.Filter.AllDirs | QtCore.QDir.Filter.NoDotAndDotDot)
+
+        # QFileSystemModel wants a root path; use QDir.rootPath() when not provided.
+        if not root_folder:
+            try:
+                root_folder = QtCore.QDir.rootPath()
+            except Exception:
+                root_folder = str(Path.home())
+        
+        # Persist + show current root (drive).
+        self._root_folder = root_folder
+        try:
+            self.lbl_root.setText(f"Root: {root_folder}" if root_folder else "Root: (auto)")
+        except Exception:
+            pass
+
         self.fs_model.setRootPath(root_folder)
 
         self.tree.setModel(self.fs_model)
-        # Show only the name column.
         for c in range(1, self.fs_model.columnCount()):
             self.tree.setColumnHidden(c, True)
 
         try:
-            idx = self.fs_model.index(root_folder)
-            self.tree.setRootIndex(idx)
+            root_idx = self.fs_model.index(root_folder)
+            if root_idx.isValid():
+                self.tree.setRootIndex(root_idx)
         except Exception:
             pass
 
-        l.addWidget(self.tree, 1)
+        # Bottom buttons
+        btn_row = QtWidgets.QHBoxLayout()
+        btn_row.setContentsMargins(0, 0, 0, 0)
+        btn_row.setSpacing(8)
 
-        buttons = QtWidgets.QDialogButtonBox(QtWidgets.QDialogButtonBox.StandardButton.Close, parent=self)
-        buttons.rejected.connect(self.reject)
-        buttons.accepted.connect(self.accept)
-        l.addWidget(buttons, 0)
+        self.btn_scan = QtWidgets.QPushButton("Scan folder", self)
+        self.btn_scan.setEnabled(False)
+        self.btn_scan.setToolTip("Scan the selected folder in Media Explorer.")
+        self.btn_close = QtWidgets.QPushButton("Close", self)
 
-    def _on_tree_context_menu(self, pos: QtCore.QPoint) -> None:
+        self.btn_drive = QtWidgets.QPushButton("Change drive", self)
+        self.btn_drive.setToolTip("Switch to a different drive/root in the tree view.")
+        # If there's only one drive/root available, disable the button.
+        try:
+            self.btn_drive.setEnabled(len(self._list_available_roots()) > 1)
+        except Exception:
+            pass
+
+
+        self.btn_open_favs = QtWidgets.QPushButton("Open favorites", self)
+        self.btn_open_favs.setToolTip(
+            "Open favorite folders. Tip: right-click a folder to add/remove favorites."
+        )
+        try:
+            self.btn_open_favs.clicked.connect(self._open_favorites)
+        except Exception:
+            pass
+
+        btn_row.addWidget(self.btn_drive, 0)
+        btn_row.addWidget(self.btn_open_favs, 0)
+        btn_row.addStretch(1)
+        btn_row.addWidget(self.btn_scan, 0)
+        btn_row.addWidget(self.btn_close, 0)
+
+        l.addLayout(btn_row, 0)
+
+        self.btn_close.clicked.connect(self.reject)
+        try:
+            self.btn_drive.clicked.connect(self._on_change_drive)
+        except Exception:
+            pass
+
+        self.btn_scan.clicked.connect(self._scan_selected)
+
+        # Selection wiring
+        try:
+            sel = self.tree.selectionModel()
+            sel.currentChanged.connect(self._on_current_changed)
+        except Exception:
+            pass
+
+        # Convenience: double-click / Enter scans the current folder.
+        try:
+            self.tree.activated.connect(lambda _idx: self._scan_selected())
+        except Exception:
+            pass
+
+        # Auto-select last used folder (or the root).
+        self._pending_select = start_folder or root_folder
+        self._select_tries = 0
+        QtCore.QTimer.singleShot(0, self._try_select_pending)
+
+    def selected_folder(self) -> str:
+        return self._selected_folder
+
+    def _on_current_changed(self, current: QtCore.QModelIndex, _prev: QtCore.QModelIndex) -> None:
+        try:
+            folder = self.fs_model.filePath(current)
+        except Exception:
+            folder = ""
+        folder = (folder or "").strip()
+
+        if folder and Path(folder).is_dir():
+            self._selected_folder = folder
+            self.lbl_selected.setText(f"Selected: {folder}")
+            self.btn_scan.setEnabled(True)
+        else:
+            self._selected_folder = ""
+            self.lbl_selected.setText("Selected: (none)")
+            self.btn_scan.setEnabled(False)
+
+    def _scan_selected(self) -> None:
+        folder = (self._selected_folder or "").strip()
+        if not folder:
+            # If nothing is selected yet, try using the current index.
+            try:
+                idx = self.tree.currentIndex()
+                if idx.isValid():
+                    folder = (self.fs_model.filePath(idx) or "").strip()
+            except Exception:
+                folder = ""
+        if not folder or not Path(folder).is_dir():
+            return
+
+        cb = None
+        try:
+            cb = getattr(self.parent(), "open_and_scan", None)
+        except Exception:
+            cb = None
+
+        if callable(cb):
+            cb(folder)
+
+        self.accept()
+
+    def _try_select_pending(self) -> None:
+        """QFileSystemModel populates asynchronously; retry a few times."""
+        try:
+            target = (getattr(self, "_pending_select", "") or "").strip()
+            if not target:
+                return
+            self._select_tries = int(getattr(self, "_select_tries", 0)) + 1
+
+            idx = self.fs_model.index(target)
+            if idx.isValid():
+                # Expand parents so the selection is visible.
+                try:
+                    p = idx.parent()
+                    while p.isValid():
+                        self.tree.expand(p)
+                        p = p.parent()
+                except Exception:
+                    pass
+
+                self.tree.setCurrentIndex(idx)
+                try:
+                    self.tree.scrollTo(idx, QtWidgets.QAbstractItemView.ScrollHint.PositionAtCenter)
+                except Exception:
+                    pass
+
+                # Update selection state/UI.
+                try:
+                    self._on_current_changed(idx, QtCore.QModelIndex())
+                except Exception:
+                    pass
+                return
+
+            # Retry a bit (drives can be slow to enumerate).
+            if self._select_tries < 25:
+                QtCore.QTimer.singleShot(120, self._try_select_pending)
+        except Exception:
+            pass
+
+
+
+
+    # ---------- Drive / root selection ----------
+
+    # ---------- Folder favorites (tree view) ----------
+
+    def _fav_json_path(self) -> Path:
+        """Return <root>/presets/setsave/explorerfav.json (best-effort)."""
+        root: Optional[Path] = None
+
+        # Best signal: if presets/bin exists, the app root is its grand-parent.
+        try:
+            bin_dir = resolve_presets_bin()
+            if bin_dir and bin_dir.exists():
+                root = bin_dir.parent.parent
+        except Exception:
+            root = None
+
+        # Fallback: search upward for a 'presets' folder.
+        if root is None:
+            candidates: List[Path] = []
+            try:
+                candidates.append(Path.cwd())
+            except Exception:
+                pass
+            try:
+                candidates.append(Path(__file__).resolve().parent)
+            except Exception:
+                pass
+            try:
+                env_root = os.environ.get("APP_ROOT") or os.environ.get("FRAMEVISION_ROOT") or os.environ.get("FRAMELAB_ROOT")
+                if env_root:
+                    candidates.insert(0, Path(env_root))
+            except Exception:
+                pass
+
+            for base in candidates:
+                try:
+                    b = base.resolve()
+                except Exception:
+                    b = base
+                for _ in range(8):
+                    try:
+                        if (b / "presets").is_dir():
+                            root = b
+                            break
+                    except Exception:
+                        pass
+                    if b.parent == b:
+                        break
+                    b = b.parent
+                if root is not None:
+                    break
+
+        if root is None:
+            root = Path.cwd()
+
+        return root / "presets" / "setsave" / "explorerfav.json"
+
+    def _load_folder_favs_map(self) -> Dict[str, str]:
+        """Load favorite folders from explorerfav.json into a norm->canon dict."""
+        path = self._fav_json_path()
+        out: Dict[str, str] = {}
+        try:
+            if not path.exists():
+                return out
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except Exception:
+            return out
+
+        folders: List[str] = []
+        try:
+            if isinstance(data, list):
+                folders = [str(x) for x in data]
+            elif isinstance(data, dict):
+                raw = data.get("folders")
+                if isinstance(raw, list):
+                    folders = [str(x) for x in raw]
+                else:
+                    raw2 = data.get("favorites")
+                    if isinstance(raw2, list):
+                        folders = [str(x) for x in raw2]
+        except Exception:
+            folders = []
+
+        for f in folders:
+            ff = (f or "").strip()
+            if not ff:
+                continue
+            c = canon_path(ff)
+            k = norm_path(c)
+            if k not in out:
+                out[k] = c
+        return out
+
+    def _save_folder_favs_map(self) -> None:
+        path = self._fav_json_path()
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+        except Exception:
+            return
+
+        try:
+            folders = list(self._folder_favs.values())
+        except Exception:
+            folders = []
+
+        # stable ordering
+        try:
+            folders = sorted(set(folders), key=lambda s: (s or "").lower())
+        except Exception:
+            pass
+
+        try:
+            path.write_text(json.dumps({"folders": folders}, indent=2), encoding="utf-8")
+        except Exception:
+            pass
+
+    def _is_folder_fav(self, folder: str) -> bool:
+        try:
+            return norm_path(folder) in self._folder_favs
+        except Exception:
+            return False
+
+    def _add_folder_fav(self, folder: str) -> None:
+        folder = (folder or "").strip()
+        if not folder:
+            return
+        c = canon_path(folder)
+        k = norm_path(c)
+        try:
+            if k in self._folder_favs:
+                return
+            self._folder_favs[k] = c
+            self._save_folder_favs_map()
+        except Exception:
+            pass
+
+    def _remove_folder_fav(self, folder: str) -> None:
+        folder = (folder or "").strip()
+        if not folder:
+            return
+        k = norm_path(folder)
+        try:
+            if k in self._folder_favs:
+                del self._folder_favs[k]
+                self._save_folder_favs_map()
+        except Exception:
+            pass
+
+    def _tree_context_menu(self, pos: QtCore.QPoint) -> None:
+        """Right-click menu on folders in the tree: add/remove favorites."""
         try:
             idx = self.tree.indexAt(pos)
-            if not idx.isValid():
-                return
-            folder = self.fs_model.filePath(idx)
-            if not folder:
-                return
-            # Only allow folders.
-            if not Path(folder).is_dir():
-                return
+        except Exception:
+            idx = QtCore.QModelIndex()
 
-            menu = QtWidgets.QMenu(self)
-            act_open_scan = menu.addAction("Open && Scan in Media Explorer")
-            chosen = menu.exec(self.tree.viewport().mapToGlobal(pos))
-            if chosen == act_open_scan:
-                cb = None
-                try:
-                    cb = getattr(self.parent(), "open_and_scan", None)
-                except Exception:
-                    cb = None
-                if callable(cb):
-                    cb(folder)
-                self.close()
+        if not idx or not idx.isValid():
+            return
+
+        # Select the item under cursor to make behavior feel predictable.
+        try:
+            self.tree.setCurrentIndex(idx)
         except Exception:
             pass
 
+        try:
+            folder = (self.fs_model.filePath(idx) or "").strip()
+        except Exception:
+            folder = ""
+        if not folder:
+            return
 
+        menu = QtWidgets.QMenu(self)
+        is_fav = self._is_folder_fav(folder)
+
+        act_add = menu.addAction("★ Add folder to favorites")
+        act_add.setToolTip("Add this folder to favorites (saved to presets/setsave/explorerfav.json).")
+        act_add.setEnabled(not is_fav)
+
+        act_remove = menu.addAction("★ Remove folder from favorites")
+        act_remove.setToolTip("Remove this folder from favorites.")
+        act_remove.setEnabled(is_fav)
+
+        chosen = menu.exec(self.tree.viewport().mapToGlobal(pos))
+        if chosen == act_add:
+            self._add_folder_fav(folder)
+        elif chosen == act_remove:
+            self._remove_folder_fav(folder)
+
+    def _open_favorites(self) -> None:
+        try:
+            folders = list(self._folder_favs.values())
+        except Exception:
+            folders = []
+
+        if not folders:
+            QtWidgets.QMessageBox.information(
+                self,
+                "Favorites",
+                "No favorite folders yet.\n\nRight-click a folder in the tree to add it to favorites.",
+            )
+            return
+
+        dlg = FolderFavoritesDialog(
+            folders=folders,
+            on_scan=self._scan_folder,
+            on_remove=self._remove_folder_fav,
+            parent=self,
+        )
+        dlg.exec()
+
+    def _scan_folder(self, folder: str) -> None:
+        folder = (folder or "").strip()
+        if not folder or not Path(folder).is_dir():
+            return
+
+        cb = None
+        try:
+            cb = getattr(self.parent(), "open_and_scan", None)
+        except Exception:
+            cb = None
+
+        if callable(cb):
+            cb(folder)
+
+        self.accept()
+
+    def _list_available_roots(self) -> List[str]:
+        """Return available top-level roots (drives on Windows)."""
+        roots: List[str] = []
+        if os.name == "nt":
+            try:
+                mask = ctypes.windll.kernel32.GetLogicalDrives()
+                for i in range(26):
+                    if mask & (1 << i):
+                        d = f"{chr(65 + i)}:\\"
+                        try:
+                            if Path(d).exists():
+                                roots.append(d)
+                        except Exception:
+                            roots.append(d)
+            except Exception:
+                pass
+
+            if not roots:
+                # Fallback brute-force (still fast).
+                for i in range(26):
+                    d = f"{chr(65 + i)}:\\"
+                    try:
+                        if Path(d).exists():
+                            roots.append(d)
+                    except Exception:
+                        pass
+        else:
+            try:
+                roots = [QtCore.QDir.rootPath()]
+            except Exception:
+                roots = ["/"]
+
+        # De-dup, stable.
+        seen: set[str] = set()
+        out: List[str] = []
+        for r in roots:
+            rr = (r or "").strip()
+            if not rr:
+                continue
+            if os.name == "nt":
+                rr = rr.replace("/", "\\")
+                if not rr.endswith("\\"):
+                    rr += "\\"
+            key = rr.lower()
+            if key in seen:
+                continue
+            seen.add(key)
+            out.append(rr)
+        return out
+
+    def _on_change_drive(self) -> None:
+        roots = self._list_available_roots()
+        if not roots:
+            return
+
+        cur = (getattr(self, "_root_folder", "") or "").strip()
+        try:
+            cur = Path(cur).anchor or cur
+        except Exception:
+            pass
+        if os.name == "nt":
+            cur = cur.replace("/", "\\")
+            if cur and not cur.endswith("\\"):
+                cur += "\\"
+
+        idx0 = 0
+        try:
+            if cur and cur in roots:
+                idx0 = roots.index(cur)
+        except Exception:
+            idx0 = 0
+
+        choice, ok = QtWidgets.QInputDialog.getItem(self, "Change drive", "Drive:", roots, idx0, False)
+        if not ok:
+            return
+
+        choice = (choice or "").strip()
+        if not choice:
+            return
+
+        self._set_tree_root(choice)
+
+    def _set_tree_root(self, root_folder: str) -> None:
+        root_folder = (root_folder or "").strip()
+        if not root_folder:
+            return
+
+        # Normalize (Windows drive roots).
+        if os.name == "nt":
+            root_folder = root_folder.replace("/", "\\")
+            if not root_folder.endswith("\\"):
+                root_folder += "\\"
+
+        self._root_folder = root_folder
+
+        try:
+            self.lbl_root.setText(f"Root: {root_folder}")
+        except Exception:
+            pass
+
+        # Reset selection state.
+        self._selected_folder = ""
+        try:
+            self.lbl_selected.setText("Selected: (none)")
+        except Exception:
+            pass
+        try:
+            self.btn_scan.setEnabled(False)
+        except Exception:
+            pass
+
+        # Update model and view.
+        try:
+            self.fs_model.setRootPath(root_folder)
+        except Exception:
+            pass
+
+        try:
+            root_idx = self.fs_model.index(root_folder)
+            if root_idx.isValid():
+                self.tree.setRootIndex(root_idx)
+        except Exception:
+            pass
+
+        # Re-select root when model finishes populating.
+        self._pending_select = root_folder
+        self._select_tries = 0
+        QtCore.QTimer.singleShot(0, self._try_select_pending)
 # -----------------------------
 # Utilities
 # -----------------------------
@@ -669,20 +1290,11 @@ class ScanWorker(QtCore.QThread):
         except Exception:
             pass
 
-        # Images: use QImageReader to get size quickly without decoding full image.
+                # Images: FAST PATH.
+        # QImageReader is normally cheap, but on some Windows setups it can become very slow
+        # (especially with large libraries / WIC/codec interactions). To keep Media Explorer responsive,
+        # skip probing image dimensions here. Width/height will be blank unless filled elsewhere.
         if media_type == "image":
-            try:
-                reader = QtGui.QImageReader(str(p))
-                sz = reader.size()
-                if sz.isValid():
-                    item.width = sz.width()
-                    item.height = sz.height()
-                # codec for image = format if available
-                fmt = bytes(reader.format()).decode("ascii", errors="ignore").strip().upper()
-                if fmt:
-                    item.codec = fmt
-            except Exception:
-                pass
             return item
 
         # Video/Audio: use ffprobe if available
@@ -736,6 +1348,11 @@ class MediaTableModel(QtCore.QAbstractTableModel):
         self._items: List[MediaItem] = []
         # Favorites are stored as a set of normalized absolute paths.
         self._favorites_norm: set[str] = set()
+
+        # Icon cache (critical for performance). Qt may ask for DecorationRole
+        # many times during scrolling/sorting; calling style.standardIcon repeatedly
+        # can be surprisingly expensive on Windows for file icons.
+        self._icon_cache: dict[str, QtGui.QIcon] = {}
 
     def set_favorites(self, favorites_norm: set[str]) -> None:
         self._favorites_norm = set(favorites_norm or set())
@@ -852,17 +1469,29 @@ class MediaTableModel(QtCore.QAbstractTableModel):
         return None
 
     def _icon_for(self, item: MediaItem) -> QtGui.QIcon:
-        # Use standard Qt icons; caller style controls look.
+        # Cached icons: Qt may request DecorationRole very frequently during view updates.
+        # Avoid calling style.standardIcon() per cell, which can be expensive on Windows.
+        mt = (item.media_type or "other").lower()
+        ico = self._icon_cache.get(mt)
+        if ico is not None:
+            return ico
+
         style = QtWidgets.QApplication.instance().style() if QtWidgets.QApplication.instance() else None
         if not style:
-            return QtGui.QIcon()
-        if item.media_type == "image":
-            return style.standardIcon(QtWidgets.QStyle.StandardPixmap.SP_FileIcon)
-        if item.media_type == "video":
-            return style.standardIcon(QtWidgets.QStyle.StandardPixmap.SP_MediaPlay)
-        if item.media_type == "audio":
-            return style.standardIcon(QtWidgets.QStyle.StandardPixmap.SP_MediaVolume)
-        return style.standardIcon(QtWidgets.QStyle.StandardPixmap.SP_FileIcon)
+            ico = QtGui.QIcon()
+            self._icon_cache[mt] = ico
+            return ico
+
+        if mt == "video":
+            ico = style.standardIcon(QtWidgets.QStyle.StandardPixmap.SP_MediaPlay)
+        elif mt == "audio":
+            ico = style.standardIcon(QtWidgets.QStyle.StandardPixmap.SP_MediaVolume)
+        else:
+            # Treat images + unknowns as generic file icons (but cached).
+            ico = style.standardIcon(QtWidgets.QStyle.StandardPixmap.SP_FileIcon)
+
+        self._icon_cache[mt] = ico
+        return ico
 
     def _data_for(self, item: MediaItem, col: int, role: int):
         # Display strings
@@ -1177,10 +1806,17 @@ class MediaExplorerTab(QtWidgets.QWidget):
 
         self._connect()
         self._ensure_default_sort_newest_first()
+        self._update_empty_help()
+
         # Tools are auto-discovered; UI does not expose a manual refresh/status row.
 
-        # Nice-to-have: remember last folder in-session (you can swap to QSettings later)
-        self._last_folder: Optional[str] = None
+        # Remember last scanned folder between runs (QSettings).
+        self._last_folder: Optional[str] = self._load_last_folder()
+        try:
+            if self._last_folder and not (self.ed_folder.text() or "").strip():
+                self.ed_folder.setText(self._last_folder)
+        except Exception:
+            pass
 
         # In-app clipboard for Copy/Cut/Paste between folders.
         self._clip_mode: Optional[str] = None  # 'copy' or 'cut'
@@ -1193,6 +1829,31 @@ class MediaExplorerTab(QtWidgets.QWidget):
         layout = QtWidgets.QVBoxLayout(self)
         layout.setContentsMargins(8, 8, 8, 8)
         layout.setSpacing(6)
+
+        # Fancy banner at the top (same concept as Tools tab)
+        self.banner = QtWidgets.QLabel("Media & Json Explorer", self)
+        self.banner.setObjectName("mediaExplorerBanner")
+        self.banner.setAlignment(QtCore.Qt.AlignmentFlag.AlignCenter)
+        self.banner.setSizePolicy(QtWidgets.QSizePolicy.Policy.Expanding, QtWidgets.QSizePolicy.Policy.Fixed)
+        self.banner.setFixedHeight(48)
+        self.banner.setStyleSheet(
+            "#mediaExplorerBanner {"
+            " font-size: 15px;"
+            " font-weight: 600;"
+            " padding: 8px 17px;"
+            " border-radius: 12px;"
+            " margin: 0 0 6px 0;"
+            " color: #e8f5e9;"
+            " background: qlineargradient("
+            "   x1:0, y1:0, x2:1, y2:0,"
+            "   stop:0 #ff6f00,"
+            "   stop:1 #1b5e20"
+            " );"
+            " letter-spacing: 0.5px;"
+            "}"
+        )
+        layout.addWidget(self.banner)
+        layout.addSpacing(4)
 
         # Top controls
         top = QtWidgets.QFrame(self)
@@ -1221,7 +1882,7 @@ class MediaExplorerTab(QtWidgets.QWidget):
 
         self.btn_tree_view = QtWidgets.QToolButton(top)
         self.btn_tree_view.setText("Tree view")
-        self.btn_tree_view.setToolTip("Pick a folder and show its subfolder tree.")
+        self.btn_tree_view.setToolTip("Browse folders and scan quickly (opens at last used folder).")
 
         self.cb_subfolders = QtWidgets.QCheckBox("Include subfolders", top)
         self.cb_subfolders.setChecked(True)
@@ -1298,6 +1959,32 @@ class MediaExplorerTab(QtWidgets.QWidget):
         self.table.horizontalHeader().setDefaultAlignment(QtCore.Qt.AlignmentFlag.AlignLeft | QtCore.Qt.AlignmentFlag.AlignVCenter)
         self.table.setContextMenuPolicy(QtCore.Qt.ContextMenuPolicy.CustomContextMenu)
         self.table.setToolTip("Right click for actions. Double click to open in player.")
+        # Empty-state help (shown when the list is empty and no scan is running).
+        # This reduces confusion for first-time users.
+        self._empty_help = QtWidgets.QLabel(self.table.viewport())
+        self._empty_help.setText(self._empty_help_text())
+        self._empty_help.setWordWrap(True)
+        self._empty_help.setAlignment(QtCore.Qt.AlignmentFlag.AlignCenter)
+        try:
+            self._empty_help.setMargin(14)
+        except Exception:
+            pass
+        self._empty_help.setStyleSheet(
+            "QLabel{"
+            "background-color: palette(base);"
+            "color: palette(text);"
+            "border: 1px dashed palette(mid);"
+            "border-radius: 12px;"
+            "padding: 14px;"
+            "}"
+        )
+        self._empty_help.setVisible(True)
+        try:
+            self.table.viewport().installEventFilter(self)
+        except Exception:
+            pass
+        self._position_empty_help()
+
 
         # Column sizing
         self.table.setColumnWidth(Column.ICON, 26)
@@ -1591,6 +2278,10 @@ class MediaExplorerTab(QtWidgets.QWidget):
         except Exception:
             pass
         try:
+            self._remember_last_folder(folder)
+        except Exception:
+            pass
+        try:
             self.rescan()
         except Exception:
             pass
@@ -1622,6 +2313,12 @@ class MediaExplorerTab(QtWidgets.QWidget):
         if not p.exists() or not p.is_dir():
             QtWidgets.QMessageBox.warning(self, "Media Explorer", "Folder does not exist.")
             return
+
+        # Remember last folder (used as default start for Tree view).
+        try:
+            self._remember_last_folder(str(p))
+        except Exception:
+            pass
 
         # Reset
         self.model.clear()
@@ -1675,6 +2372,8 @@ class MediaExplorerTab(QtWidgets.QWidget):
 
         self._scanner.start()
 
+        self._update_empty_help()
+
     # ---------- Scan callbacks ----------
 
     @QtCore.Slot(object)
@@ -1691,12 +2390,14 @@ class MediaExplorerTab(QtWidgets.QWidget):
             except Exception:
                 pass
         self._update_counts(defer=True)
+        self._update_empty_help()
 
     # Backward compatibility (unused by default)
     @QtCore.Slot(object)
     def _on_item_ready(self, item: MediaItem) -> None:
         self.model.add_item(item)
         self._update_counts(defer=True)
+        self._update_empty_help()
 
     @QtCore.Slot(int, int)
     def _on_progress(self, cur: int, total: int) -> None:
@@ -1713,6 +2414,7 @@ class MediaExplorerTab(QtWidgets.QWidget):
         self.btn_rescan.setEnabled(True)
         self.progress.setVisible(False)
         self._update_counts()
+        self._update_empty_help()
         self._restore_sorting_after_scan()
         # Default sort: newest first (Modified desc) unless the user has a saved sort preference.
         # Only apply if sorting is enabled.
@@ -1752,8 +2454,18 @@ class MediaExplorerTab(QtWidgets.QWidget):
         self.btn_stop.setEnabled(False)
         self.btn_rescan.setEnabled(True)
         self.progress.setVisible(False)
+        try:
+            self._update_counts()
+        except Exception:
+            pass
+        self._update_empty_help()
         self._restore_sorting_after_scan()
         self.lbl_status.setText(f"Error: {msg}")
+        try:
+            self._update_counts()
+        except Exception:
+            pass
+        self._update_empty_help()
         QtWidgets.QMessageBox.warning(self, "Media Explorer", msg)
 
     def _stop_scan(self) -> None:
@@ -2680,6 +3392,36 @@ class MediaExplorerTab(QtWidgets.QWidget):
         except Exception:
             return str(Path(folder).expanduser())
 
+    def _last_folder_settings_key(self) -> str:
+        return f"{self._settings_group}/last_folder"
+
+    def _load_last_folder(self) -> Optional[str]:
+        try:
+            v = self._settings.value(self._last_folder_settings_key(), "")
+            v = (v or "").strip()
+            if v and Path(v).expanduser().is_dir():
+                return v
+        except Exception:
+            pass
+        return None
+
+    def _remember_last_folder(self, folder: str) -> None:
+        folder = (folder or "").strip()
+        if not folder:
+            return
+        try:
+            folder = str(Path(folder).expanduser().resolve())
+        except Exception:
+            try:
+                folder = str(Path(folder).expanduser())
+            except Exception:
+                pass
+        self._last_folder = folder
+        try:
+            self._settings.setValue(self._last_folder_settings_key(), folder)
+        except Exception:
+            pass
+
     def _clipboard_copy_selected(self) -> None:
         items = self._selected_items()
         if not items:
@@ -3064,6 +3806,36 @@ class MediaExplorerTab(QtWidgets.QWidget):
 
         menu.addSeparator()
 
+        # Sort submenu (quick access)
+        sort_actions = {}
+        try:
+            sort_menu = menu.addMenu("Sort")
+            sort_menu.setToolTip("Sort the table by common fields.")
+
+            def _add_sort_group(title: str, col: int) -> None:
+                sub = sort_menu.addMenu(title)
+                act_up = sub.addAction("Up")
+                act_down = sub.addAction("Down")
+                try:
+                    act_up.setToolTip("Sort ascending.")
+                    act_down.setToolTip("Sort descending.")
+                except Exception:
+                    pass
+                sort_actions[act_up] = (col, QtCore.Qt.SortOrder.AscendingOrder)
+                sort_actions[act_down] = (col, QtCore.Qt.SortOrder.DescendingOrder)
+
+            _add_sort_group("By date", Column.MODIFIED)
+            _add_sort_group("By duration", Column.DURATION)
+            _add_sort_group("By folder", Column.FOUND_IN)
+            _add_sort_group("By name", Column.NAME)
+            _add_sort_group("By resolution", Column.RESOLUTION)
+            _add_sort_group("By size", Column.SIZE)
+            _add_sort_group("By type", Column.TYPE)
+        except Exception:
+            sort_actions = {}
+
+        menu.addSeparator()
+
         # Open / play actions
         act_open_player = menu.addAction("Open in player")
         act_open_player.setToolTip("Open the file inside FrameVision's built-in player.")
@@ -3110,6 +3882,22 @@ class MediaExplorerTab(QtWidgets.QWidget):
         chosen = menu.exec(self.table.viewport().mapToGlobal(pos))
         if not chosen:
             return
+
+        # Sort actions
+        try:
+            if chosen in sort_actions:
+                col, order = sort_actions[chosen]
+                try:
+                    self.table.sortByColumn(int(col), order)
+                except Exception:
+                    pass
+                try:
+                    self._schedule_save_table_state()
+                except Exception:
+                    pass
+                return
+        except Exception:
+            pass
 
         # Favorites actions (if present)
         try:
@@ -3158,27 +3946,37 @@ class MediaExplorerTab(QtWidgets.QWidget):
     # ---------- Misc ----------
 
     def _open_tree_view(self) -> None:
-        """Ask for a folder (OK/Cancel) then show its subfolder tree."""
+        """Open a folder tree starting at the last used folder.
+
+        Select a folder once, then click 'Scan folder' in the dialog.
+        """
+        # Prefer current box, then last used folder (persisted), then home.
+        start = ""
         try:
-            start = self.ed_folder.text().strip() or self._last_folder or ""
+            start = (self.ed_folder.text() or "").strip() or (self._last_folder or "").strip()
         except Exception:
-            start = ""
+            start = (self._last_folder or "").strip()
 
-        pick = FolderPickDialog(self, title="Tree view")
+        if not start or not Path(start).expanduser().is_dir():
+            try:
+                start = str(Path.home())
+            except Exception:
+                start = ""
+
+        # Root the tree at the drive/root, then auto-select the last folder.
+        root_folder = ""
         try:
-            if start:
-                pick.ed.setText(start)
+            root_folder = Path(start).anchor or ""
         except Exception:
-            pass
+            root_folder = ""
 
-        if pick.exec() != QtWidgets.QDialog.DialogCode.Accepted:
-            return
+        if not root_folder:
+            try:
+                root_folder = QtCore.QDir.rootPath()
+            except Exception:
+                root_folder = start or ""
 
-        folder = pick.folder()
-        if not folder:
-            return
-
-        dlg = FolderTreeDialog(folder, self)
+        dlg = FolderTreeDialog(root_folder=root_folder, start_folder=start, parent=self)
         dlg.exec()
 
     def _browse_folder(self) -> None:
@@ -3186,6 +3984,10 @@ class MediaExplorerTab(QtWidgets.QWidget):
         folder = QtWidgets.QFileDialog.getExistingDirectory(self, "Select folder", start)
         if folder:
             self.ed_folder.setText(folder)
+            try:
+                self._remember_last_folder(folder)
+            except Exception:
+                pass
 
     def _update_counts(self, defer: bool = False) -> None:
         # Defer updating often during scan to reduce UI overhead.
@@ -3197,8 +3999,35 @@ class MediaExplorerTab(QtWidgets.QWidget):
                 self._count_timer.timeout.connect(self._update_counts)
             self._count_timer.start(120)
             return
-        total = self.proxy.rowCount()
-        self.lbl_count.setText(f"{total} items")
+
+        shown = 0
+        total = 0
+        try:
+            shown = int(self.proxy.rowCount())
+        except Exception:
+            shown = 0
+        try:
+            total = int(self.model.rowCount())
+        except Exception:
+            total = shown
+
+        if total <= 0:
+            self.lbl_count.setText("0 items")
+        elif shown == total:
+            self.lbl_count.setText(f"{shown} items")
+        else:
+            self.lbl_count.setText(f"{shown} shown ({total} total)")
+
+        try:
+            self._update_empty_help()
+        except Exception:
+            pass
+
+
+
+
+
+
 
 
     def _ensure_default_sort_newest_first(self) -> None:
@@ -3238,6 +4067,86 @@ class MediaExplorerTab(QtWidgets.QWidget):
             )
         except Exception:
             pass
+
+    # ---------- Empty state help ----------
+
+    def _empty_help_text(self) -> str:
+        return (
+            "No media files listed yet.\n\n"
+            "1. Select type of media files to be searched for (Images / Video / Sound)\n"
+            "2. Enable/disable search in subfolders\n"
+            "3. Click 'Browse…' to select a folder (or open Tree view and select a folder)\n"
+            "4. Click 'Scan'\n\n"
+            "Depending on the amount of files and availability of .json files this may take a while, "
+            "especially for video files."
+        )
+
+    def _no_results_help_text(self) -> str:
+        active = []
+        try:
+            if (self.ed_search.text() or "").strip():
+                active.append("Search")
+        except Exception:
+            pass
+        try:
+            if self.btn_favs_only.isChecked():
+                active.append("★ Only")
+        except Exception:
+            pass
+
+        a = ", ".join(active) if active else "Filters"
+        return (
+            "No results shown.\n\n"
+            f"Active: {a}\n\n"
+            "• Clear the Search box\n"
+            "• Turn off ★ Only\n"
+            "• Or scan another folder"
+        )
+
+
+    def _position_empty_help(self) -> None:
+        try:
+            if not getattr(self, "_empty_help", None):
+                return
+            vp = self.table.viewport()
+            r = vp.rect().adjusted(14, 14, -14, -14)
+            self._empty_help.setGeometry(r)
+        except Exception:
+            pass
+
+    def _update_empty_help(self) -> None:
+        try:
+            w = getattr(self, "_empty_help", None)
+            if not w:
+                return
+            running = bool(self._scanner and self._scanner.isRunning())
+            # Show the overlay when nothing is visible in the table (proxy is empty),
+            # even if the underlying model has items that are currently filtered out.
+            show = (self.proxy.rowCount() == 0) and (not running)
+            w.setVisible(bool(show))
+            if show:
+                try:
+                    if self.model.rowCount() == 0:
+                        msg = self._empty_help_text()
+                    else:
+                        msg = self._no_results_help_text()
+                    if w.text() != msg:
+                        w.setText(msg)
+                except Exception:
+                    pass
+                self._position_empty_help()
+        except Exception:
+            pass
+
+
+    def eventFilter(self, obj: QtCore.QObject, event: QtCore.QEvent) -> bool:
+        try:
+            if hasattr(self, "table") and obj == self.table.viewport():
+                if event.type() == QtCore.QEvent.Type.Resize:
+                    self._position_empty_help()
+        except Exception:
+            pass
+        return super().eventFilter(obj, event)
 
     def changeEvent(self, event: QtCore.QEvent) -> None:
         super().changeEvent(event)
