@@ -4,7 +4,7 @@
 ---
 Video Walktrough (most is speedup x2 to show much in less time)
 
-[![Watch the video](https://img.youtube.com/vi/QLIaL4uAFlE/hqdefault.jpg)](https://youtu.be/QLIaL4uAFlE)
+[![Watch the video](https://img.youtube.com/vi/QLIaL4uAFlE/hqdefault.jpg)](https://www.youtube.com/watch?v=_0j3CiXFheQ)
 
 ---
 <details>
