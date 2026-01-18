@@ -2244,6 +2244,13 @@ class VideoPane(QWidget):
         try:
             if getattr(self, "_compare_active", False) and not getattr(self, "_compare_opening", False):
                 try:
+                    import time as _t
+                    if float(_t.perf_counter()) < float(getattr(self, "_compare_lock_until", 0.0) or 0.0):
+                        # Short lock set by MainWindow auto-compare to prevent immediate close from other opens.
+                        return
+                except Exception:
+                    pass
+                try:
                     # Matches the manual workaround ("Stop" first), but automatic.
                     self._handle_stop()
                 except Exception:
@@ -4694,6 +4701,15 @@ class MainWindow(QMainWindow):
     def set_left_override_widget(self, w: QWidget, owner: str = "tool") -> None:
         """Show a tool-provided widget in the left pane (temporarily replacing the VideoPane visually)."""
         try:
+            # If compare is being opened from a finished job, keep the left pane stable briefly.
+            try:
+                import time as _t
+                vp = getattr(self, 'video', None)
+                if vp is not None and bool(getattr(vp, '_compare_active', False)):
+                    if float(_t.perf_counter()) < float(getattr(vp, '_compare_lock_until', 0.0) or 0.0):
+                        return
+            except Exception:
+                pass
             if w is None:
                 self.clear_left_override_widget(owner=owner)
                 return
@@ -5205,6 +5221,15 @@ class MainWindow(QMainWindow):
         # Auto Compare (Before / After): poll finished jobs and open Compare when requested.
         try:
             self._auto_compare_seen = set()
+            try:
+                import time as _t
+                self._auto_compare_start_ts = float(_t.time())
+            except Exception:
+                self._auto_compare_start_ts = 0.0
+            try:
+                self._auto_compare_pending = {}
+            except Exception:
+                self._auto_compare_pending = {}
             self._auto_compare_timer = QTimer(self)
             self._auto_compare_timer.setInterval(750)
             self._auto_compare_timer.timeout.connect(self._auto_compare_poll_done_jobs)
@@ -5222,18 +5247,12 @@ class MainWindow(QMainWindow):
             pass
 
     def _auto_compare_poll_done_jobs(self):
-        """Open Compare automatically when a job reaches DONE.
+        """Poll recently-finished jobs and open Compare when requested.
 
-        Two paths:
-        1) Generic: finished jobs may request compare via auto_compare fields.
-        2) Qwen2511 queue: if the existing Qwen2511 "auto compare" toggle is enabled,
-           open Compare for queue-finished Qwen2511 jobs using:
-              BEFORE = first ref image (args['ref_images'][0])
-              AFTER  = output file
-           Fallback to scene image only if no ref images exist.
+        Supports:
+        - Legacy manifests that explicitly set job['auto_compare']=True
+        - Qwen2511 queue jobs (no worker changes): respects the Qwen2511 auto-compare toggle
         """
-        # NOTE: Queue jobs may land in DONE slightly before the output file is visible on disk.
-        # We retry a handful of times for Qwen2511 jobs before giving up.
         try:
             done_dir = JOBS_DIRS.get("done", None)
             if not done_dir:
@@ -5244,221 +5263,224 @@ class MainWindow(QMainWindow):
         except Exception:
             return
 
-        try:
-            if not hasattr(self, "_auto_compare_seen"):
-                self._auto_compare_seen = set()
-            if not hasattr(self, "_auto_compare_pending"):
-                self._auto_compare_pending = {}  # jid -> attempts
-        except Exception:
-            return
-
         # Only scan a small window of the most recent job manifests.
         try:
-            files = [p for p in done_dir.glob("*") if p.is_file()]
+            files = list(done_dir.glob("*.json"))
             files.sort(key=lambda p: p.stat().st_mtime, reverse=True)
             files = files[:120]
         except Exception:
             return
 
-        qwen_enabled = bool(self._qwen2511_autocompare_enabled())
+        # Don't trigger compares for old finished jobs when the app starts.
+        try:
+            import time as _t
+            start_ts = float(getattr(self, "_auto_compare_start_ts", 0.0) or 0.0)
+            now_ts = float(_t.time())
+        except Exception:
+            start_ts = 0.0
+            now_ts = 0.0
+
+        seen = getattr(self, "_auto_compare_seen", set())
+        pending = getattr(self, "_auto_compare_pending", {})
 
         for jf in files:
-            jid = ""
             try:
-                jid = jf.stem
+                st = jf.stat()
             except Exception:
                 continue
 
-            # If already completed (either succeeded or exhausted retries), skip.
             try:
-                if jid in self._auto_compare_seen:
+                # Skip anything that completed before this session.
+                if start_ts > 0.0 and float(st.st_mtime) < (start_ts - 1.0):
                     continue
             except Exception:
                 pass
 
-            try:
-                job = self._auto_compare_load_job_manifest(jf)
-                if not isinstance(job, dict) or not job:
-                    continue
-            except Exception:
+            jid = jf.stem
+            if jid in seen:
                 continue
 
-            # 1) Generic explicit request from a job manifest.
+            # Pending retries (e.g. DONE json written slightly before output file exists)
+            info = pending.get(jid)
+            if info is None:
+                pending[jid] = {"t0": now_ts, "n": 0}
+                info = pending[jid]
+
+            # Give up after a short window to avoid infinite retries.
+            try:
+                if float(now_ts - float(info.get("t0", now_ts))) > 10.0 or int(info.get("n", 0)) > 16:
+                    seen.add(jid)
+                    pending.pop(jid, None)
+                    continue
+            except Exception:
+                pass
+
+            job = load_json(str(jf), default={})
+            if not isinstance(job, dict):
+                seen.add(jid)
+                pending.pop(jid, None)
+                continue
+
+            want = False
+            left = right = ""
+
+            # 1) Legacy explicit request (some UI paths set these fields)
             try:
                 if bool(job.get("auto_compare", False)):
+                    want = True
                     left, right = self._auto_compare_extract_paths(job)
-                    if left and right:
-                        from helpers.compare_dialog import open_with_files
-                        # Pass MainWindow as parent (Compare dialog can route to .video as needed).
-                        if open_with_files(self, left, right)[2] is not None:
-                            self._auto_compare_seen.add(jid)
-                    # Whether it worked or not, don't loop forever on explicit requests.
-                    self._auto_compare_seen.add(jid)
-                    continue
             except Exception:
                 pass
 
-            # 2) Qwen2511 queue finished jobs (no worker changes).
+            # 2) Qwen2511 queue jobs: infer + use the Qwen2511 toggle
             try:
-                if (not qwen_enabled) or (not self._auto_compare_is_qwen2511_job(job)):
-                    # Not a Qwen job, and no explicit request => ignore.
-                    self._auto_compare_seen.add(jid)
-                    continue
-
-                left, right = self._auto_compare_extract_qwen2511_paths(job)
-                if left and right:
-                    from helpers.compare_dialog import open_with_files
-                    if open_with_files(self, left, right)[2] is not None:
-                        self._auto_compare_seen.add(jid)
-                        try:
-                            if jid in self._auto_compare_pending:
-                                self._auto_compare_pending.pop(jid, None)
-                        except Exception:
-                            pass
-                        continue
-
-                # Retry a few times to allow output file to appear.
-                tries = int(self._auto_compare_pending.get(jid, 0) or 0) + 1
-                self._auto_compare_pending[jid] = tries
-                if tries >= 14:
-                    # Give up after ~10 seconds.
-                    self._auto_compare_seen.add(jid)
-                    self._auto_compare_pending.pop(jid, None)
+                if not want and self._auto_compare_is_qwen2511(job) and self._auto_compare_qwen_enabled():
+                    want = True
+                    left, right = self._auto_compare_extract_qwen_paths(job)
             except Exception:
-                # Fail-safe: never let auto-compare break the UI.
+                pass
+
+            if not want:
+                # Mark as seen so we don't keep re-processing non-relevant manifests.
+                seen.add(jid)
+                pending.pop(jid, None)
+                continue
+
+            if not left or not right:
+                # Retry soon; do not mark as seen yet.
                 try:
-                    self._auto_compare_seen.add(jid)
+                    info["n"] = int(info.get("n", 0)) + 1
                 except Exception:
                     pass
                 continue
 
-    def _auto_compare_load_job_manifest(self, path: Path):
-        """Load a job manifest file, regardless of extension (best-effort)."""
-        try:
-            # Prefer the existing helper (creates file if missing); but for non-json files use raw read.
-            if str(path).lower().endswith(".json"):
-                return load_json(Path(str(path)), default={})
-        except Exception:
-            pass
-        try:
-            txt = path.read_text(encoding="utf-8", errors="ignore")
-            return json.loads(txt)
-        except Exception:
-            return {}
-
-    def _qwen2511_autocompare_enabled(self) -> bool:
-        """Best-effort: read the existing Qwen2511 auto-compare toggle (no hard dependency)."""
-        def _cb_checked(obj):
+            # If compare is opened, keep it visible briefly even if a background UI path
+            # tries to "open the output" again (which would normally close compare).
             try:
-                if obj is None:
-                    return None
-                if hasattr(obj, "isChecked"):
-                    return bool(obj.isChecked())
+                import time as _t
+                self.video._compare_lock_until = float(_t.perf_counter()) + 2.0
             except Exception:
-                return None
-            return None
+                pass
 
-        # 1) Look for a checkbox in the Qwen2511 pane.
-        try:
-            pane = getattr(self, "qwen2511", None)
-            if pane is not None:
-                # Common attribute names first (fast + reliable).
-                for nm in (
-                    "chk_auto_compare", "cb_auto_compare", "auto_compare_cb",
-                    "auto_compare_checkbox", "autocompare_cb", "chk_autocompare",
-                    "autoCompare", "auto_compare",
-                ):
-                    try:
-                        v = _cb_checked(getattr(pane, nm, None))
-                        if v is not None:
-                            return v
-                    except Exception:
-                        pass
+            # Ensure the VideoPane is visible in the left stack.
+            try:
+                self.clear_left_override_widget()
+            except Exception:
+                pass
 
-                # Common getter methods.
-                for nm in ("is_auto_compare_enabled", "get_auto_compare", "auto_compare_enabled"):
-                    try:
-                        fn = getattr(pane, nm, None)
-                        if callable(fn):
-                            vv = fn()
-                            if isinstance(vv, bool):
-                                return vv
-                    except Exception:
-                        pass
-
+            # Open compare (defer slightly to run after any UI refresh that might open the result).
+            try:
+                from PySide6.QtCore import QTimer
+                from helpers.compare_dialog import open_with_files
+                QTimer.singleShot(120, lambda _l=left, _r=right: open_with_files(self, _l, _r))
+            except Exception:
                 try:
-                    from PySide6.QtWidgets import QCheckBox
-                    for cb in pane.findChildren(QCheckBox):
-                        try:
-                            txt = (cb.text() or "").strip().lower()
-                            obj = (cb.objectName() or "").strip().lower()
-                            if ("compare" in txt and "auto" in txt) or ("auto" in obj and "compare" in obj):
-                                return bool(cb.isChecked())
-                        except Exception:
-                            continue
+                    from helpers.compare_dialog import open_with_files
+                    open_with_files(self, left, right)
                 except Exception:
                     pass
+
+            # Trigger once per job.
+            seen.add(jid)
+            pending.pop(jid, None)
+
+        try:
+            self._auto_compare_seen = seen
+        except Exception:
+            pass
+        try:
+            self._auto_compare_pending = pending
         except Exception:
             pass
 
-        # 2) Look for a config key containing qwen + auto + compare.
-        try:
-            for k, v in (config or {}).items():
-                ks = str(k).lower()
-                if "qwen" in ks and "compare" in ks and "auto" in ks:
-                    return bool(v)
-        except Exception:
-            pass
 
-        return False
-
-    def _auto_compare_is_qwen2511_job(self, job: dict) -> bool:
-        """Detect Qwen2511 jobs from queue manifests (best-effort)."""
+    def _auto_compare_is_qwen2511(self, job: dict) -> bool:
+        """Best-effort detection of Qwen2511 finished jobs from queue manifests."""
         try:
-            # Common fields
-            for k in ("tool", "kind", "type", "name", "title", "engine", "model"):
-                try:
-                    s = str(job.get(k, "") or "").lower()
-                    # Be permissive: queue manifests vary (sometimes only 'qwen' is present).
-                    if "qwen" in s and ("2511" in s or "edit" in s or "gguf" in s or "qwen" in s):
-                        return True
-                except Exception:
-                    pass
-            # Command list
+            def _s(x):
+                return str(x or "").lower()
+            # Look across common fields
+            hay = []
+            for k in ("tool", "name", "tab", "engine", "model", "kind", "type", "task"):
+                if k in job:
+                    hay.append(_s(job.get(k)))
             cmd = job.get("cmd")
             if isinstance(cmd, list):
-                joined = " ".join([str(x) for x in cmd]).lower()
-                if "qwen" in joined and ("2511" in joined or "edit" in joined or "gguf" in joined):
-                    return True
-            # Args often carry ref_images for Qwen edits.
-            args = self._auto_compare_get_args(job)
+                hay.append(" ".join([_s(x) for x in cmd]))
+            args = job.get("args")
             if isinstance(args, dict):
-                # Presence of ref_images + typical Qwen edit keys.
-                if "ref_images" in args and ("prompt" in args or "edit" in str(job).lower() or "qwen" in str(job).lower()):
+                hay.append(_s(args.get("model")))
+                hay.append(_s(args.get("engine")))
+                hay.append(_s(args.get("tool")))
+                hay.append(_s(args.get("name")))
+                try:
+                    hay.append(_s(args))
+                except Exception:
+                    pass
+            elif isinstance(args, str) and args.strip().startswith("{"):
+                hay.append(_s(args))
+            blob = "\n".join([h for h in hay if h])
+            # Primary detection by explicit identifiers
+            if ("qwen2511" in blob) or ("qwen 2511" in blob) or ("qwen_edit" in blob) or ("qwen edit" in blob):
+                return True
+            # Fallback: Qwen2511 queue manifests may not carry a stable name;
+            # ref_images is characteristic of this tab
+            try:
+                import json
+                ad = None
+                if isinstance(args, dict):
+                    ad = args
+                elif isinstance(args, str) and args.strip().startswith("{"):
+                    ad2 = json.loads(args)
+                    if isinstance(ad2, dict):
+                        ad = ad2
+                if isinstance(ad, dict) and ad.get("ref_images") is not None:
                     return True
+            except Exception:
+                pass
+            return False
+        except Exception:
+            return False
+
+
+    def _auto_compare_qwen_enabled(self) -> bool:
+        """Read the existing Qwen2511 auto-compare toggle (best-effort)."""
+        try:
+            pane = getattr(self, "qwen2511", None)
+            if pane is None:
+                return False
+            # Common attribute names
+            for attr in ("chk_auto_compare", "check_auto_compare", "auto_compare", "cb_auto_compare", "autoCompare"):
+                try:
+                    w = getattr(pane, attr, None)
+                    if w is not None and hasattr(w, "isChecked"):
+                        return bool(w.isChecked())
+                except Exception:
+                    pass
+            # Search checkbox children by label / objectName
+            try:
+                from PySide6.QtWidgets import QCheckBox
+                for cb in pane.findChildren(QCheckBox):
+                    try:
+                        t = (cb.text() or "").lower()
+                        on = (cb.objectName() or "").lower()
+                        if ("auto" in t and "compare" in t) or ("auto" in on and "compare" in on):
+                            return bool(cb.isChecked())
+                    except Exception:
+                        pass
+            except Exception:
+                pass
         except Exception:
             pass
-        # Final fallback: accept any manifest containing 'qwen' (queue jobs can omit the exact model id).
-        return "qwen" in str(job).lower()
+        return False
 
-    def _auto_compare_get_args(self, job: dict) -> dict:
-        """Return args dict from job manifest (handles dict or JSON string)."""
-        for k in ("args", "kwargs", "params", "payload"):
-            try:
-                a = job.get(k)
-                if isinstance(a, dict):
-                    return a
-                if isinstance(a, str) and a.strip().startswith("{"):
-                    return json.loads(a)
-            except Exception:
-                continue
-        return {}
 
-    def _auto_compare_extract_qwen2511_paths(self, job: dict):
-        """Extract BEFORE/AFTER for Qwen2511 queue job.
+    def _auto_compare_extract_qwen_paths(self, job: dict):
+        """Extract BEFORE/AFTER for Qwen2511 finished jobs.
 
-        BEFORE: first ref image (args['ref_images'][0]); fallback to scene only if no ref images exist.
-        AFTER:  output file.
+        BEFORE: first ref image used (args['ref_images'][0])
+        AFTER: output file
+        Fallback: scene image only if no ref images exist
         """
         def _s(x):
             try:
@@ -5466,70 +5488,72 @@ class MainWindow(QMainWindow):
             except Exception:
                 return ""
 
-        args = self._auto_compare_get_args(job)
+        args = job.get("args")
+        if isinstance(args, str):
+            # Some manifests store args as JSON string
+            try:
+                import json
+                args2 = json.loads(args)
+                if isinstance(args2, dict):
+                    args = args2
+            except Exception:
+                args = {}
+        if not isinstance(args, dict):
+            args = {}
 
         # BEFORE
         left = ""
-        try:
-            ref_images = args.get("ref_images", None)
-            if isinstance(ref_images, (list, tuple)) and len(ref_images) > 0:
-                it = ref_images[0]
-                if isinstance(it, dict):
-                    left = _s(it.get("path") or it.get("file") or it.get("filepath") or it.get("image"))
-                else:
-                    left = _s(it)
-        except Exception:
-            left = ""
+        ref_images = args.get("ref_images")
+        if isinstance(ref_images, (list, tuple)) and len(ref_images) > 0:
+            first = ref_images[0]
+            if isinstance(first, dict):
+                left = _s(first.get("path") or first.get("file") or first.get("name") or first.get("value"))
+            else:
+                left = _s(first)
+        elif isinstance(ref_images, str) and ref_images.strip():
+            left = _s(ref_images)
 
         if not left:
-            # Fallback to scene image only if no ref images exist.
-            try:
-                left = _s(args.get("scene_image") or args.get("scene") or args.get("image") or args.get("init_image"))
-            except Exception:
-                left = ""
-            if not left:
-                for k in ("input", "input_path", "src", "source", "image"):
-                    left = _s(job.get(k))
-                    if left:
-                        break
+            # Fallback to scene image only if there are NO ref images
+            for k in ("scene_image", "scene", "scene_path", "image", "init_image", "input", "input_path", "source", "source_path"):
+                left = _s(args.get(k) or job.get(k))
+                if left:
+                    break
 
         # AFTER
         right = ""
-        # Prefer job output fields
-        for k in ("output", "output_path", "result", "result_path", "outfile", "final", "final_path"):
-            right = _s(job.get(k))
+        for k in ("output", "output_path", "result", "result_path", "final", "final_path", "outfile", "out"):
+            right = _s(job.get(k) or args.get(k))
             if right:
                 break
-        # Then args
-        if not right:
-            for k in ("output", "output_path", "result", "result_path", "outfile", "out_path", "save_path"):
-                right = _s(args.get(k))
-                if right:
-                    break
-        # Common list fields
-        if not right:
-            for k in ("outputs", "result_files", "files"):
-                try:
-                    arr = job.get(k) or args.get(k)
-                    if isinstance(arr, (list, tuple)) and arr:
-                        right = _s(arr[-1])
-                        break
-                except Exception:
-                    pass
 
-        # If output is a directory, pick newest image/video.
+        if not right:
+            outs = args.get("outputs") or job.get("outputs") or args.get("result_files") or job.get("result_files")
+            if isinstance(outs, (list, tuple)) and outs:
+                right = _s(outs[-1])
+
+        # If output is a directory, pick newest media file.
         try:
+            import os
+            from pathlib import Path
             if right and os.path.isdir(right):
                 exts = (".png", ".jpg", ".jpeg", ".webp", ".bmp", ".tif", ".tiff", ".gif")
-                cand = [p for p in Path(right).glob("*") if p.is_file() and p.suffix.lower() in exts]
+                cand = []
+                for pp in Path(right).glob("*"):
+                    try:
+                        if pp.is_file() and pp.suffix.lower() in exts:
+                            cand.append(pp)
+                    except Exception:
+                        pass
                 if cand:
-                    cand.sort(key=lambda p: p.stat().st_mtime, reverse=True)
+                    cand.sort(key=lambda q: q.stat().st_mtime, reverse=True)
                     right = str(cand[0])
         except Exception:
             pass
 
         # Validate existence
         try:
+            import os
             if left and not os.path.isfile(left):
                 left = ""
             if right and not os.path.isfile(right):
@@ -5539,7 +5563,9 @@ class MainWindow(QMainWindow):
 
         return left, right
 
+
     def _auto_compare_extract_paths(self, job: dict):
+
         """Best-effort extraction of left/right paths from a finished job manifest."""
         def _s(x):
             try:

@@ -109,6 +109,13 @@ except Exception as _e:
     print("[framevision] videotext tool import failed:", _e)
     videotextPane = None
 
+# --- HeartMuLa (heartlib) music generator ---
+try:
+    from helpers.heartmula import HeartMuLaUI
+except Exception as _e:
+    print("[framevision] HeartMuLa tool import failed:", _e)
+    HeartMuLaUI = None
+
 def ffprobe_path():
     """Resolve ffprobe, preferring app-local presets/bin first, then bin, then PATH."""
     exe = 'ffprobe.exe' if os.name=='nt' else 'ffprobe'
@@ -1027,6 +1034,56 @@ class InstantToolsPane(QWidget):
         except Exception:
             pass
 
+        # ---- HeartMuLa (heartlib) Music Generator ----
+        sec_mula = CollapsibleSection("HeartMuLa Music Generator", expanded=False)
+        _mula_wrap = QWidget(); _mula_layout = QVBoxLayout(_mula_wrap); _mula_layout.setContentsMargins(0,0,0,0)
+        _mula_layout.setSpacing(6)
+        _mula_widget = None
+        if HeartMuLaUI is not None:
+            try:
+                _mula_widget = HeartMuLaUI()
+                try:
+                    _mula_widget.setParent(self)
+                except Exception:
+                    pass
+            except Exception:
+                _mula_widget = None
+        if _mula_widget is not None:
+            try:
+                _mula_widget.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+            except Exception:
+                pass
+            try:
+                _mula_widget.setMinimumHeight(720)
+            except Exception:
+                pass
+            _mula_layout.addWidget(_mula_widget, 1)
+            try:
+                self._mula_widget = _mula_widget
+            except Exception:
+                pass
+
+            # Extra: use the same "View results" behavior as other Tools (Media Explorer)
+            try:
+                row_mula = QHBoxLayout()
+                row_mula.addStretch(1)
+                self.btn_mula_open_folder = QPushButton("View results")
+                self.btn_mula_open_folder.setToolTip("Open HeartMuLa outputs in Media Explorer.")
+                row_mula.addWidget(self.btn_mula_open_folder)
+                _mula_layout.addLayout(row_mula)
+                self.btn_mula_open_folder.clicked.connect(self._mula_open_folder)
+            except Exception:
+                pass
+        else:
+            _mula_fallback = QLabel("HeartMuLa tool failed to load (missing helpers/heartmula.py).")
+            _mula_fallback.setWordWrap(True)
+            _mula_layout.addWidget(_mula_fallback)
+        sec_mula.setContentLayout(_mula_layout)
+        try:
+            sec_mula.content.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+        except Exception:
+            pass
+
         # ---- Multi Rename (moved to helpers/renam.py) ----
         sec_rename = CollapsibleSection("Multi Rename/Replace", expanded=False)
         _rn_wrap = QWidget(); _rn_layout = QVBoxLayout(_rn_wrap); _rn_layout.setContentsMargins(0,0,0,0)
@@ -1307,7 +1364,7 @@ class InstantToolsPane(QWidget):
             _vt_layout.addWidget(_lbl)
         sec_videotext.setContentLayout(_vt_layout)
 
-        default_sections = [sec_prompt, sec_bg, sec_ace, sec_describe, sec_meme, sec_music, sec_audio, sec_speed, sec_reverse, sec_upscale, sec_rife,
+        default_sections = [sec_prompt, sec_bg, sec_ace, sec_mula, sec_describe, sec_meme, sec_music, sec_audio, sec_speed, sec_reverse, sec_upscale, sec_rife,
                             sec_resize, sec_trim, sec_crop, sec_videotext, sec_splitglue, sec_gif, sec_extract, sec_rename, sec_metadata]
 
 # sec_musicclip,  # to re add put this back in default_sections
@@ -1354,6 +1411,7 @@ class InstantToolsPane(QWidget):
                 "Prompt Enhancement": sec_prompt,
                 "Background Remover": sec_bg,
                 "Ace Step Music creation": sec_ace,
+                "HeartMuLa Music Generator": sec_mula,
                 "Multi Rename": sec_rename,
                 "Whisper Lab": sec_whisper,
                 "Metadata editor": sec_metadata
@@ -2273,6 +2331,61 @@ class InstantToolsPane(QWidget):
                 pass
 
         # Fallback: open in OS file browser
+        if fp is not None:
+            self._open_folder_in_os(fp)
+
+    def _mula_open_folder(self):
+        """Open HeartMuLa results in Media Explorer (fallback: OS folder)."""
+        folder = None
+        try:
+            # Prefer the tool's current Output folder field (if the widget exists)
+            w = getattr(self, "_mula_widget", None)
+            if w is not None and hasattr(w, "output_dir"):
+                folder = str(w.output_dir.text()).strip()
+        except Exception:
+            folder = None
+
+        if not folder:
+            try:
+                folder = str((ROOT / "output" / "music" / "heartmula").resolve())
+            except Exception:
+                folder = "output/music/heartmula"
+
+        try:
+            from pathlib import Path as _P
+            fp = _P(str(folder))
+            try:
+                fp.mkdir(parents=True, exist_ok=True)
+            except Exception:
+                pass
+        except Exception:
+            fp = None
+
+        # Prefer Media Explorer if available
+        main = None
+        try:
+            main = getattr(self, "main", None)
+        except Exception:
+            main = None
+        if main is None:
+            try:
+                main = self.window() if hasattr(self, "window") else None
+            except Exception:
+                main = None
+
+        if main is not None and hasattr(main, "open_media_explorer_folder") and fp is not None:
+            try:
+                main.open_media_explorer_folder(str(fp), preset="music", include_subfolders=False)
+                return
+            except TypeError:
+                try:
+                    main.open_media_explorer_folder(str(fp))
+                    return
+                except Exception:
+                    pass
+            except Exception:
+                pass
+
         if fp is not None:
             self._open_folder_in_os(fp)
 

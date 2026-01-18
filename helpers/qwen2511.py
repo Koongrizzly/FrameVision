@@ -3323,7 +3323,65 @@ class Qwen2511Pane(QtWidgets.QWidget):
                         from helpers.queue_adapter import enqueue_qwen2511_from_widget as _enq
                     except Exception:
                         from queue_adapter import enqueue_qwen2511_from_widget as _enq
-                    jid = _enq(self)
+
+                    # Queue mode: if scene image is disabled or empty, feed a blank canvas as image 1
+                    # so the queue adapter/worker doesn't require a real scene file.
+                    _restore_scene_path = None
+                    _restore_use_scene = None
+                    try:
+                        try:
+                            use_scene_q = bool(getattr(self, 'chk_use_scene', None).isChecked())
+                        except Exception:
+                            use_scene_q = True
+                        try:
+                            init_q = self.ed_initimg.text().strip()
+                        except Exception:
+                            init_q = ''
+
+                        # Gather refs early (we need at least one when no scene).
+                        ref_q = [self.ed_ref1.text().strip(), self.ed_ref2.text().strip(), self.ed_ref3.text().strip()]
+                        ref_q = [pp for pp in ref_q if pp]
+
+                        if (not use_scene_q) or (not init_q):
+                            if not ref_q:
+                                raise Exception('No scene image and no reference images. Load at least 1 ref image (or pick a scene image).')
+                            _ensure_dir(OUTPUT_DIR)
+                            tsq = int(time.time())
+                            blank_scene = os.path.join(OUTPUT_DIR, f"_blank_scene_{tsq}.png")
+                            _write_blank_png(blank_scene, int(self.sp_w.value()), int(self.sp_h.value()), rgba=(255, 255, 255, 255))
+                            _restore_scene_path = init_q
+                            _restore_use_scene = use_scene_q
+                            try:
+                                self.ed_initimg.setText(blank_scene)
+                            except Exception:
+                                pass
+                            # Force 'Use scene image' ON for the queued job so image indexing is stable (blank is image 1).
+                            try:
+                                if getattr(self, 'chk_use_scene', None) is not None:
+                                    self.chk_use_scene.setChecked(True)
+                            except Exception:
+                                pass
+                            try:
+                                self._append_log(f"\nQueue: scene missing/disabled -> using blank canvas as image 1: {blank_scene}")
+                            except Exception:
+                                pass
+                        else:
+                            if init_q and not os.path.isfile(init_q):
+                                raise Exception('Scene image file not found: ' + init_q)
+
+                        jid = _enq(self)
+                    finally:
+                        if _restore_use_scene is not None:
+                            try:
+                                if getattr(self, 'chk_use_scene', None) is not None:
+                                    self.chk_use_scene.setChecked(bool(_restore_use_scene))
+                            except Exception:
+                                pass
+                        if _restore_scene_path is not None:
+                            try:
+                                self.ed_initimg.setText(_restore_scene_path)
+                            except Exception:
+                                pass
                     try:
                         self._toast(f"Job queued to jobs/pending: {jid}")
                     except Exception:
@@ -3378,8 +3436,12 @@ class Qwen2511Pane(QtWidgets.QWidget):
         self.caps = detect_sdcli_caps(sdcli)
 
         if use_scene:
-            if not init_img or not os.path.isfile(init_img):
-                self._append_log("\nERROR: Scene image missing. Pick a scene image or turn OFF 'Use scene image' to use a blank canvas.")
+            if not init_img:
+                # Treat empty scene as 'disabled' and fall back to a blank canvas.
+                use_scene = False
+                self._append_log("\nScene image is empty: using a blank canvas as image 1.")
+            elif not os.path.isfile(init_img):
+                self._append_log("\nERROR: Scene image file not found: " + init_img)
                 return
 
         if mask_img and not os.path.isfile(mask_img):
@@ -3397,6 +3459,12 @@ class Qwen2511Pane(QtWidgets.QWidget):
             if not os.path.isfile(rp):
                 self._append_log("\nERROR: Reference image file not found: " + rp)
                 return
+
+
+        # If we are not using a scene image (or it's empty), we need at least one reference image.
+        if not use_scene and len(ref_imgs) == 0:
+            self._append_log("\nERROR: No scene image and no reference images. Load at least 1 ref image (or enable 'Use scene image' and pick an image).")
+            return
         if ref_imgs and not self.caps.ref_image:
             self._append_log("\nWARNING: Your sd-cli build does not advertise --ref-image in --help. Reference images will be ignored.")
             ref_imgs = []
@@ -3687,7 +3755,65 @@ def _on_use_mask_toggled(self, checked: bool, persist: bool = True):
                         from helpers.queue_adapter import enqueue_qwen2511_from_widget as _enq
                     except Exception:
                         from queue_adapter import enqueue_qwen2511_from_widget as _enq
-                    jid = _enq(self)
+
+                    # Queue mode: if scene image is disabled or empty, feed a blank canvas as image 1
+                    # so the queue adapter/worker doesn't require a real scene file.
+                    _restore_scene_path = None
+                    _restore_use_scene = None
+                    try:
+                        try:
+                            use_scene_q = bool(getattr(self, 'chk_use_scene', None).isChecked())
+                        except Exception:
+                            use_scene_q = True
+                        try:
+                            init_q = self.ed_initimg.text().strip()
+                        except Exception:
+                            init_q = ''
+
+                        # Gather refs early (we need at least one when no scene).
+                        ref_q = [self.ed_ref1.text().strip(), self.ed_ref2.text().strip(), self.ed_ref3.text().strip()]
+                        ref_q = [pp for pp in ref_q if pp]
+
+                        if (not use_scene_q) or (not init_q):
+                            if not ref_q:
+                                raise Exception('No scene image and no reference images. Load at least 1 ref image (or pick a scene image).')
+                            _ensure_dir(OUTPUT_DIR)
+                            tsq = int(time.time())
+                            blank_scene = os.path.join(OUTPUT_DIR, f"_blank_scene_{tsq}.png")
+                            _write_blank_png(blank_scene, int(self.sp_w.value()), int(self.sp_h.value()), rgba=(255, 255, 255, 255))
+                            _restore_scene_path = init_q
+                            _restore_use_scene = use_scene_q
+                            try:
+                                self.ed_initimg.setText(blank_scene)
+                            except Exception:
+                                pass
+                            # Force 'Use scene image' ON for the queued job so image indexing is stable (blank is image 1).
+                            try:
+                                if getattr(self, 'chk_use_scene', None) is not None:
+                                    self.chk_use_scene.setChecked(True)
+                            except Exception:
+                                pass
+                            try:
+                                self._append_log(f"\nQueue: scene missing/disabled -> using blank canvas as image 1: {blank_scene}")
+                            except Exception:
+                                pass
+                        else:
+                            if init_q and not os.path.isfile(init_q):
+                                raise Exception('Scene image file not found: ' + init_q)
+
+                        jid = _enq(self)
+                    finally:
+                        if _restore_use_scene is not None:
+                            try:
+                                if getattr(self, 'chk_use_scene', None) is not None:
+                                    self.chk_use_scene.setChecked(bool(_restore_use_scene))
+                            except Exception:
+                                pass
+                        if _restore_scene_path is not None:
+                            try:
+                                self.ed_initimg.setText(_restore_scene_path)
+                            except Exception:
+                                pass
                     try:
                         self._toast(f"Job queued to jobs/pending: {jid}")
                     except Exception:
@@ -3736,8 +3862,12 @@ def _on_use_mask_toggled(self, checked: bool, persist: bool = True):
         self.caps = detect_sdcli_caps(sdcli)
 
         if use_scene:
-            if not init_img or not os.path.isfile(init_img):
-                self._append_log("\nERROR: Scene image missing. Pick a scene image or turn OFF 'Use scene image' to use a blank canvas.")
+            if not init_img:
+                # Treat empty scene as 'disabled' and fall back to a blank canvas.
+                use_scene = False
+                self._append_log("\nScene image is empty: using a blank canvas as image 1.")
+            elif not os.path.isfile(init_img):
+                self._append_log("\nERROR: Scene image file not found: " + init_img)
                 return
 
         if mask_img and not os.path.isfile(mask_img):
@@ -3755,6 +3885,12 @@ def _on_use_mask_toggled(self, checked: bool, persist: bool = True):
             if not os.path.isfile(rp):
                 self._append_log("\nERROR: Reference image file not found: " + rp)
                 return
+
+
+        # If we are not using a scene image (or it's empty), we need at least one reference image.
+        if not use_scene and len(ref_imgs) == 0:
+            self._append_log("\nERROR: No scene image and no reference images. Load at least 1 ref image (or enable 'Use scene image' and pick an image).")
+            return
         if ref_imgs and not self.caps.ref_image:
             self._append_log("\nWARNING: Your sd-cli build does not advertise --ref-image in --help. Reference images will be ignored.")
             ref_imgs = []

@@ -1515,6 +1515,29 @@ def tools_ffmpeg(job, cfg, mani):
         env.setdefault("PYTHONUTF8", "1")
         env.setdefault("PYTHONIOENCODING", "utf-8")
 
+        # Optional env overrides from job args (useful for tools that need custom PATH/vars)
+        try:
+            extra_env = args.get("env")
+            if isinstance(extra_env, dict):
+                for k, v in extra_env.items():
+                    if k is None or v is None:
+                        continue
+                    env[str(k)] = str(v)
+        except Exception:
+            pass
+
+        # Optional PATH prepend (string or list/tuple of paths)
+        try:
+            pp = args.get("prepend_path") or args.get("prepend_PATH")
+            if pp:
+                if isinstance(pp, (list, tuple)):
+                    pp = _os.pathsep.join([str(x) for x in pp if x])
+                pp = str(pp)
+                oldp = env.get("PATH", "")
+                env["PATH"] = pp + (_os.pathsep + oldp if oldp else "")
+        except Exception:
+            pass
+
         # Start
         try:
             _progress_set(0)
@@ -3570,6 +3593,74 @@ def qwen2511_image_edit(job, cfg, mani):
 
     return tools_ffmpeg(job, cfg, mani)
 
+
+
+def heartmula_generate(job, cfg, mani):
+    """Run a HeartMuLa music generation job via the queue.
+
+    The UI enqueues this as type=heartmula_generate with args.cmd built
+    to call the upstream heartlib example script. We execute through
+    tools_ffmpeg so we reuse streaming logs + cancel support.
+    """
+    try:
+        from pathlib import Path as _P
+        import time as _time
+        import os as _os
+    except Exception:
+        return 1
+
+    args = job.get("args", {}) or {}
+
+    # Output folder fallback
+    try:
+        out_dir = job.get("out_dir") or str((_P(".").resolve() / "output" / "music" / "heartmula"))
+    except Exception:
+        out_dir = str(_P("output") / "music" / "heartmula")
+    try:
+        _P(out_dir).mkdir(parents=True, exist_ok=True)
+    except Exception:
+        pass
+
+    # Label + metadata
+    try:
+        tags = str(args.get("tags") or "").strip()
+    except Exception:
+        tags = ""
+    label = args.get("label") or ("HeartMuLa: " + (tags[:60] if tags else "music"))
+    args["label"] = label
+    job["title"] = label
+    try:
+        job["backend"] = "heartmula"
+    except Exception:
+        pass
+    try:
+        job["model"] = str(args.get("version") or "3B")
+    except Exception:
+        pass
+
+    # Ensure cmd exists
+    cmd = args.get("cmd") or args.get("ffmpeg_cmd") or job.get("cmd")
+    if not cmd:
+        _mark_error(job, "HeartMuLa job missing args.cmd")
+        return 2
+
+    # Expected outfile
+    outfile = args.get("outfile") or args.get("save_path") or None
+    if not outfile:
+        stamp = _time.strftime("%Y%m%d_%H%M%S")
+        outfile = str(_P(out_dir) / f"heartmula_{stamp}.mp3")
+    args["outfile"] = str(outfile)
+    args["cwd"] = args.get("cwd") or str(_P(".").resolve())
+    # Make bundled binaries discoverable
+    if not args.get("prepend_path"):
+        try:
+            args["prepend_path"] = str((_P(args["cwd"]) / "presets" / "bin").resolve())
+        except Exception:
+            pass
+    args["cmd"] = cmd
+    job["args"] = args
+
+    return tools_ffmpeg(job, cfg, mani)
 def handle_job(jpath: Path):
     job = json.loads(jpath.read_text(encoding="utf-8"))
     cfg = load_config(); mani = manifest()
@@ -3626,6 +3717,8 @@ def handle_job(jpath: Path):
             code = wan22_generate(job, cfg, mani)
         elif t in ("ace_text2music","ace_audio2audio","ace","ace_step","ace_music"):
             code = ace_generate(job, cfg, mani)
+        elif t in ("heartmula_generate","heartmula","heartmula_music"):
+            code = heartmula_generate(job, cfg, mani)
         else:
             _mark_error(job, f"Unknown job type: {t}")
             code = 2

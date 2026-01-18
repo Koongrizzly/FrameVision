@@ -190,6 +190,36 @@ def _run_hunyuan15(root: Path) -> Optional[Tuple[str, List[str], Path]]:
 
 
 
+def _run_mula_env(root: Path) -> Optional[Tuple[str, List[str], Path]]:
+    script = root / "presets" / "extra_env" / "mula_install.bat"
+    if not script.exists():
+        return None
+    return _cmd_call_bat(script, root)
+
+
+def _run_mula_models(root: Path) -> Optional[Tuple[str, List[str], Path]]:
+    # Download only: repo + models.
+    # Runs inside FrameVision .venv like other downloaders.
+    script = root / "presets" / "extra_env" / "mula_download_models.py"
+    if not script.exists():
+        return None
+
+    # If the HearMula env is missing, fall back to running the installer.
+    env_rel = _ENV_DIR_BY_KEY.get("mula")
+    if env_rel is not None:
+        env_dir = (root / env_rel).resolve()
+        if not env_dir.exists():
+            bat = root / "presets" / "extra_env" / "mula_install.bat"
+            if bat.exists():
+                return _cmd_call_bat(bat, root)
+
+    py = _venv_python(root)
+    if py is None or (not py.exists()):
+        return None
+
+    return (str(py), ["-u", str(script)], root)
+
+
 def _run_qwen2512_env(root: Path) -> Optional[Tuple[str, List[str], Path]]:
     """
     Install the Qwen-Image-2512 GGUF environment.
@@ -496,6 +526,20 @@ def _default_installs() -> List[OptionalInstall]:
             runner=_run_zimage_gguf8,
         ),
 
+        OptionalInstall(
+            key="mula",
+            title="HearMula Music creation",
+            description="VRAM: 21GB needed without offloading. Download: ~25GiB total.",
+            runner=_run_mula_env,
+        ),
+        OptionalInstall(
+            key="mula_models",
+            title="HearMula (download repo + models only)",
+            description="Downloads the HearMula repo + models (~25GiB). If the HearMula environment is missing, it will be installed first.",
+            runner=_run_mula_models,
+        ),
+
+
 
         OptionalInstall(
             key="ace",
@@ -536,6 +580,7 @@ _ENV_DIR_BY_KEY = {
     "gfpgan": Path("models") / "gfpgan" / ".GFPGAN",
     "wan22": Path(".wan_venv"),
     "zimage": Path(".zimage_env"),
+    "mula": Path(".mula_env"),
     "sdxl_inpaint_env": Path(".sdxl_inpaint"),
     # Not on the UI list yet, but reserved for future use.
     "comfui": Path(".comfui_env"),
@@ -732,7 +777,8 @@ class OptionalInstallsDialog(QtWidgets.QDialog):
             is_qwen2512_extra = opt.key.startswith("qwen2512_") and opt.key != "qwen2512"
             is_qwen2511_extra = opt.key.startswith("qwen2511_")
             is_qwen_extra = is_qwen2512_extra or is_qwen2511_extra
-            row = _OptionRow(opt, indent=(26 if (is_zimage_extra or is_qwen_extra) else 0))
+            is_mula_extra = opt.key.startswith("mula_") and opt.key != "mula"
+            row = _OptionRow(opt, indent=(26 if (is_zimage_extra or is_qwen_extra or is_mula_extra) else 0))
             if is_zimage_extra:
                 row.toggled.connect(lambda checked, k=opt.key: self._on_zimage_model_toggled(k, checked))
             if is_qwen2512_extra:
@@ -1226,6 +1272,32 @@ class OptionalInstallsDialog(QtWidgets.QDialog):
             pass
 
 
+
+        # HearMula:
+        # If user selects the models-only downloader, ensure the HearMula environment exists first.
+        self._auto_added_mula_env = False
+        try:
+            wants_mula_models = ("mula_models" in checked_set)
+            if wants_mula_models and ("mula" not in checked_set):
+                env_rel = _ENV_DIR_BY_KEY.get("mula")
+                env_dir = (self.root_dir / env_rel).resolve() if env_rel is not None else None
+                if env_dir is not None and (not env_dir.exists()):
+                    first_idx = None
+                    for i, opt in enumerate(ordered):
+                        if opt.key == "mula_models":
+                            first_idx = i
+                            break
+                    for opt in self.installs:
+                        if opt.key == "mula":
+                            if first_idx is None:
+                                ordered.insert(0, opt)
+                            else:
+                                ordered.insert(first_idx, opt)
+                            self._auto_added_mula_env = True
+                            break
+        except Exception:
+            pass
+
         #  install the env first.
         # This is silent: we only auto-add the env step when it is missing, so no "existing env"
         # prompt will appear.
@@ -1309,6 +1381,9 @@ class OptionalInstallsDialog(QtWidgets.QDialog):
             self._append_line("[INFO] Qwen2512 env not found — installing it first because you selected a Qwen2511 edit model.")
         if getattr(self, "_auto_added_sdxl_inpaint_env", False):
             self._append_line("[INFO] Background remover + inpainter selected — running SDXL inpaint env install first.")
+
+        if getattr(self, "_auto_added_mula_env", False):
+            self._append_line("[INFO] HearMula env not found — installing it first because you selected the models-only download.")
 
         self.progress.setRange(0, len(selected))
         self.progress.setValue(0)
