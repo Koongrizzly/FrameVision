@@ -21,6 +21,55 @@ def _kind(path: str) -> str:
     return "image"
 
 
+def open_with_files(parent, left_path: str, right_path: str):
+    """Programmatic entry path: validate, detect media type, and open compare immediately.
+
+    - Detect media type (image/video)
+    - Validate both sides exist and are same type
+    - Bypass manual selection UI
+    - Load viewer immediately (delegates to the parent VideoPane's open_compare)
+
+    Returns (left, right, kind) on success; otherwise returns ("", "", None).
+    """
+    left = (left_path or "").strip()
+    right = (right_path or "").strip()
+
+    try:
+        if not left or not right:
+            return "", "", None
+        if not os.path.isfile(left) or not os.path.isfile(right):
+            return "", "", None
+        k1 = _kind(left)
+        k2 = _kind(right)
+        if k1 != k2:
+            return "", "", None
+        # Close any existing compare instance to avoid stale video state/sync.
+        try:
+            if parent is not None and hasattr(parent, "close_compare"):
+                parent.close_compare()
+        except Exception:
+            pass
+        # Open compare immediately.
+        try:
+            if parent is not None and hasattr(parent, "open_compare"):
+                parent.open_compare(left, right, k1)
+            else:
+                # Fallback: parent may be MainWindow
+                vp = getattr(parent, "video", None)
+                if vp is not None and hasattr(vp, "open_compare"):
+                    try:
+                        if hasattr(vp, "close_compare"):
+                            vp.close_compare()
+                    except Exception:
+                        pass
+                    vp.open_compare(left, right, k1)
+        except Exception:
+            return "", "", None
+        return left, right, k1
+    except Exception:
+        return "", "", None
+
+
 class ComparePickDialog(QDialog):
     """
     Simple picker dialog:
@@ -130,36 +179,3 @@ class ComparePickDialog(QDialog):
 
     def get_selection(self):
         return self._left, self._right, self._kind
-
-
-
-def open_with_files(parent, left_path: str, right_path: str):
-    """Programmatic entry path.
-
-    - Detect media type (image/video)
-    - Validate both sides exist and are same type
-    - Load viewer immediately (bypass manual selection UI)
-
-    Returns True when opened, False otherwise.
-    """
-    try:
-        left = str(left_path or '').strip()
-        right = str(right_path or '').strip()
-        if not left or not right:
-            return False
-        if not os.path.exists(left) or not os.path.exists(right):
-            return False
-        k1 = _kind(left)
-        k2 = _kind(right)
-        if k1 != k2:
-            return False
-        # Open immediately using the existing viewer hook (parent is expected to implement open_compare).
-        if parent is not None and hasattr(parent, 'open_compare'):
-            try:
-                parent.open_compare(left, right, k1)
-                return True
-            except Exception:
-                return False
-        return False
-    except Exception:
-        return False

@@ -42,7 +42,11 @@ class ClickableLabel(QtWidgets.QLabel):
                 return
         except Exception:
             pass
-        return super().mousePressEvent(event)
+
+        try:
+            return super().mousePressEvent(event)
+        except Exception:
+            return
 
 
 class ImagePreviewPopup(QtWidgets.QDialog):
@@ -823,6 +827,82 @@ class Qwen2511Pane(QtWidgets.QWidget):
                 self._append_log("\n" + msg)
             except Exception:
                 pass
+
+    def _tag_job_auto_compare(self, jid: str) -> None:
+        """Best-effort: write the auto-compare flag into the queued job json (pending dir)."""
+        try:
+            if not jid:
+                return
+            win = None
+            try:
+                win = self.window()
+            except Exception:
+                win = None
+
+            pending_dir = None
+            try:
+                jd = getattr(win, "JOBS_DIRS", None)
+                if isinstance(jd, dict):
+                    pending_dir = jd.get("pending", None)
+            except Exception:
+                pending_dir = None
+
+            if pending_dir is None:
+                try:
+                    pending_dir = Path(APP_ROOT) / "jobs" / "pending"
+                except Exception:
+                    pending_dir = None
+            if pending_dir is None:
+                return
+
+            try:
+                pending_dir = Path(str(pending_dir))
+            except Exception:
+                return
+
+            # Auto-compare left side: prefer Ref image 1 (ignore the scene image),
+            # then fall back to the scene/init image if Ref1 is not set.
+            left = ""
+            try:
+                if getattr(self, "ed_ref1", None) is not None:
+                    left = str(self.ed_ref1.text()).strip()
+            except Exception:
+                left = ""
+            if not left:
+                try:
+                    left = str(self.ed_initimg.text()).strip()
+                except Exception:
+                    left = ""
+
+            # Try the most common naming patterns.
+            cand = []
+            try:
+                cand.append(pending_dir / f"{jid}.json")
+            except Exception:
+                pass
+            try:
+                for p in pending_dir.glob(f"*{jid}*.json"):
+                    cand.append(p)
+            except Exception:
+                pass
+
+            for p in cand:
+                try:
+                    if not p or not p.exists():
+                        continue
+                    txt = p.read_text(encoding="utf-8")
+                    job = json.loads(txt) if txt else {}
+                    if not isinstance(job, dict):
+                        continue
+                    job["auto_compare"] = True
+                    if left:
+                        job.setdefault("auto_compare_left", left)
+                    p.write_text(json.dumps(job, indent=2), encoding="utf-8")
+                    return
+                except Exception:
+                    continue
+        except Exception:
+            return
 
     def _open_results_folder(self):
         """Open Qwen2511 output folder in the app Media Explorer (no OS Explorer button)."""
@@ -1686,9 +1766,9 @@ class Qwen2511Pane(QtWidgets.QWidget):
         self.btn_play_last.setToolTip("Plays the newest file in output/qwen2511 using the internal media player.")
         self.chk_auto_show_results = QtWidgets.QCheckBox("Auto play result after run")
         self.chk_auto_show_results.setToolTip("When enabled, automatically plays the produced file in the internal media player after a successful run (same as 'Play last result').")
-        self.chk_auto_compare = QtWidgets.QCheckBox("Compare before / after")
+        self.chk_auto_compare = QtWidgets.QCheckBox("Compare before / after when done")
+        self.chk_auto_compare.setToolTip("Automatically open a before/after comparison when the job finishes.(It will compare against Ref image 1)")
         self.chk_auto_compare.setChecked(False)
-        self.chk_auto_compare.setToolTip("Automatically open a before/after comparison when the job finishes.")
         self.chk_use_queue = QtWidgets.QCheckBox("Use queue")
         self.chk_use_queue.setToolTip("When enabled, clicking Run will add this job to the Queue instead of running sd-cli immediately.")
         self.chk_use_queue.toggled.connect(self._on_use_queue_toggled)
@@ -2793,8 +2873,8 @@ class Qwen2511Pane(QtWidgets.QWidget):
         # Checkboxes / toggles
         for w in [getattr(self, "chk_use_scene", None), getattr(self, "chk_use_mask", None), getattr(self, "chk_invert_mask", None), getattr(self, "chk_ref_increase_index", None),
                   getattr(self, "chk_disable_ref_resize", None), getattr(self, "chk_auto_aspect", None),
-                  getattr(self, "chk_auto_show_results", None), getattr(self, "chk_use_queue", None),
-                  getattr(self, "chk_auto_compare", None),                  getattr(self, "chk_multi_angle", None),
+                  getattr(self, "chk_auto_show_results", None), getattr(self, "chk_auto_compare", None), getattr(self, "chk_use_queue", None),
+                  getattr(self, "chk_multi_angle", None),
                   getattr(self, "chk_ma_auto_apply", None),
                   getattr(self, "chk_vae_tiling", None), getattr(self, "chk_offload", None), getattr(self, "chk_mmap", None),
                   getattr(self, "chk_vae_on_cpu", None), getattr(self, "chk_clip_on_cpu", None),
@@ -2885,6 +2965,25 @@ class Qwen2511Pane(QtWidgets.QWidget):
             useq = False
         try:
             self._settings["use_queue"] = useq
+        except Exception:
+            pass
+
+        # Queue mode UI rules:
+        # - "Auto play result after run" only applies to direct runs (no queue).
+        # - "Cancel" is mainly for direct runs; however, if a process is currently
+        #   running (e.g., downloader), keep Cancel visible so the user can stop it.
+        try:
+            if hasattr(self, "chk_auto_show_results") and self.chk_auto_show_results is not None:
+                self.chk_auto_show_results.setVisible(not useq)
+        except Exception:
+            pass
+        try:
+            if hasattr(self, "btn_cancel") and self.btn_cancel is not None:
+                if useq:
+                    # Only show if something is actively running.
+                    self.btn_cancel.setVisible(bool(getattr(self.btn_cancel, "isEnabled", lambda: False)()))
+                else:
+                    self.btn_cancel.setVisible(True)
         except Exception:
             pass
         try:
@@ -3031,6 +3130,20 @@ class Qwen2511Pane(QtWidgets.QWidget):
         except Exception:
             pass
 
+        # Keep Cancel reachable whenever a process is actually running,
+        # even if the pane is in Queue mode (downloader uses the same cancel).
+        try:
+            useq = bool(getattr(self, "chk_use_queue", None).isChecked() if getattr(self, "chk_use_queue", None) is not None else False)
+        except Exception:
+            useq = False
+        try:
+            if busy:
+                self.btn_cancel.setVisible(True)
+            else:
+                self.btn_cancel.setVisible(not useq)
+        except Exception:
+            pass
+
         if busy:
             self._append_log(f"\n[{label}] started…")
         else:
@@ -3106,6 +3219,40 @@ class Qwen2511Pane(QtWidgets.QWidget):
                             self._append_log("Auto play result: internal Media Player host not available.")
                 except Exception:
                     pass
+
+                # Optional: auto compare before/after (uses Compare tool, skips pickers).
+                try:
+                    if hasattr(self, "chk_auto_compare") and self.chk_auto_compare.isChecked():
+                        left = ""
+                        try:
+                            # Prefer Ref image 1 as the "before" side (ignore scene image).
+                            if getattr(self, "ed_ref1", None) is not None:
+                                left = str(self.ed_ref1.text()).strip()
+                        except Exception:
+                            left = ""
+                        if not left:
+                            try:
+                                left = str(self.ed_initimg.text()).strip()
+                            except Exception:
+                                left = ""
+                        if left and os.path.isfile(left):
+                            try:
+                                from helpers.compare_dialog import open_with_files as _open_with_files
+                            except Exception:
+                                try:
+                                    from compare_dialog import open_with_files as _open_with_files
+                                except Exception:
+                                    _open_with_files = None
+                            if _open_with_files is not None:
+                                try:
+                                    win = self.window()
+                                    vp = getattr(win, "video", None)
+                                    if vp is not None:
+                                        _open_with_files(vp, left, out_file)
+                                except Exception:
+                                    pass
+                except Exception:
+                    pass
             else:
                 self._append_log("Output file not found at expected path. If it crashed, check logs above.")
 
@@ -3179,6 +3326,12 @@ class Qwen2511Pane(QtWidgets.QWidget):
                     jid = _enq(self)
                     try:
                         self._toast(f"Job queued to jobs/pending: {jid}")
+                    except Exception:
+                        pass
+                    # Tag queued job with auto-compare preference (best-effort; used by job-finished hook).
+                    try:
+                        if hasattr(self, "chk_auto_compare") and self.chk_auto_compare.isChecked():
+                            self._tag_job_auto_compare(jid)
                     except Exception:
                         pass
                     # Switch to Queue tab (best-effort)
