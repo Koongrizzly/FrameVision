@@ -1957,7 +1957,6 @@ _EMOJI_MAP = {
     "clip": "🎬",
     "info": "💡",
     "txt2img": "📸",
-    "image": "📸",
     "loader": "📸",
     "txt to img": "📸",
     "Run": "🏃️",
@@ -2167,19 +2166,74 @@ def install_settings_tab(main_window: QWidget) -> None:
         if not page:
             return
 
+        def _make_settings_banner(parent: QWidget) -> QLabel:
+            """Create the Settings tab banner label (fixed-height)."""
+            banner = QLabel("Settings", parent)
+            banner.setObjectName("settingsBanner")
+            banner.setAlignment(Qt.AlignCenter)
+            banner.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+            banner.setFixedHeight(48)
+            banner.setStyleSheet(
+                "#settingsBanner {"
+                " font-size: 15px;"
+                " font-weight: 600;"
+                " padding: 8px 17px;"
+                " border-radius: 12px;"
+                " margin: 0 0 6px 0;"
+                " color: white;"
+                " background: qlineargradient(x1:0, y1:0, x2:1, y2:0,"
+                "   stop:0 rgba(255,75,75,255), stop:1 rgba(200,35,35,255)"
+                " );"
+                " letter-spacing: 0.5px;"
+                "}"
+            )
+            return banner
+
         # Prevent double-install (can happen if called from multiple places).
         if getattr(page, "_fv_settings_installed", False):
             return
         setattr(page, "_fv_settings_installed", True)
 
-        # Prepare a scroll area + a dedicated content widget.
+        # Prepare a sticky banner + a dedicated scroll area/content widget.
+        # The banner lives OUTSIDE the scroll area so it always stays visible.
+        banner_host = None
         if isinstance(page, QScrollArea):
-            scroll = page
+            # If the tab page itself is already a scroll area, convert it into a
+            # simple container (no scrollbars) and place our own inner scroll area.
+            scroll_outer = page
+            scroll_outer.setWidgetResizable(True)
+            try:
+                scroll_outer.setFrameShape(QtWidgets.QFrame.NoFrame)
+            except Exception:
+                pass
+            try:
+                scroll_outer.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+                scroll_outer.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+            except Exception:
+                pass
+
+            wrapper = QWidget(scroll_outer)
+            wlay = QVBoxLayout(wrapper)
+            wlay.setContentsMargins(0, 0, 0, 0)
+            wlay.setSpacing(0)
+
+            header = QWidget(wrapper)
+            hlay = QVBoxLayout(header)
+            hlay.setContentsMargins(12, 12, 12, 8)
+            hlay.setSpacing(0)
+            banner = _make_settings_banner(header)
+            hlay.addWidget(banner)
+            wlay.addWidget(header)
+            banner_host = header
+
+            scroll = QScrollArea(wrapper)
             scroll.setWidgetResizable(True)
-            content = scroll.widget()
-            if content is None:
-                content = QWidget(scroll)
-                scroll.setWidget(content)
+            scroll.setFrameShape(QtWidgets.QFrame.NoFrame)
+            content = QWidget(scroll)
+            scroll.setWidget(content)
+            wlay.addWidget(scroll, 1)
+
+            scroll_outer.setWidget(wrapper)
         else:
             # Wipe the entire tab page so we don't keep legacy placeholder UI above our banner.
             outer_lay = page.layout()
@@ -2190,13 +2244,38 @@ def install_settings_tab(main_window: QWidget) -> None:
             outer_lay.setContentsMargins(0, 0, 0, 0)
             outer_lay.setSpacing(0)
 
+            header = QWidget(page)
+            hlay = QVBoxLayout(header)
+            hlay.setContentsMargins(12, 12, 12, 8)
+            hlay.setSpacing(0)
+            banner = _make_settings_banner(header)
+            hlay.addWidget(banner)
+            outer_lay.addWidget(header)
+            banner_host = header
+
             scroll = QScrollArea(page)
             scroll.setWidgetResizable(True)
             scroll.setFrameShape(QtWidgets.QFrame.NoFrame)
 
             content = QWidget(scroll)
             scroll.setWidget(content)
-            outer_lay.addWidget(scroll)
+            outer_lay.addWidget(scroll, 1)
+
+        # Respect the saved banner enabled state immediately (avoid a 1-frame flash).
+        try:
+            _s = QSettings("FrameVision", "FrameVision")
+            en = bool(_s.value("banner_enabled", True, type=bool))
+            try:
+                banner.setVisible(en)
+            except Exception:
+                pass
+            if banner_host is not None:
+                try:
+                    banner_host.setVisible(en)
+                except Exception:
+                    pass
+        except Exception:
+            pass
 
         # settings_more expects to be able to find this widget reliably.
         try:
@@ -2215,7 +2294,8 @@ def install_settings_tab(main_window: QWidget) -> None:
             lay = QVBoxLayout(content)
             content.setLayout(lay)
         _wipe_layout(lay)
-        lay.setContentsMargins(12, 12, 12, 12)
+        # Top margin is handled by the sticky banner above.
+        lay.setContentsMargins(12, 0, 12, 12)
         lay.setSpacing(12)
 
         content.setStyleSheet(
@@ -2223,28 +2303,7 @@ def install_settings_tab(main_window: QWidget) -> None:
             "QGroupBox::title { subcontrol-origin: margin; left: 10px; padding: 0 6px; }"
         )
 
-        # Fancy red banner at the top of Settings
-        banner = QLabel("Settings", content)
-        banner.setObjectName("settingsBanner")
-        banner.setAlignment(Qt.AlignCenter)
-        banner.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
-        banner.setFixedHeight(48)
-        banner.setStyleSheet(
-            "#settingsBanner {"
-            " font-size: 15px;"
-            " font-weight: 600;"
-            " padding: 8px 17px;"
-            " border-radius: 12px;"
-            " margin: 0 0 6px 0;"
-            " color: white;"
-            " background: qlineargradient(x1:0, y1:0, x2:1, y2:0,"
-            "   stop:0 rgba(255,75,75,255), stop:1 rgba(200,35,35,255)"
-            " );"
-            " letter-spacing: 0.5px;"
-            "}"
-        )
-        lay.addWidget(banner)
-        lay.addSpacing(6)
+        # (Banner is created above the scroll area so it stays sticky.)
 
         lay.addWidget(_theme_row(content))
         lay.addWidget(_options_group(content))

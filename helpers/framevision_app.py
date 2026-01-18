@@ -2014,25 +2014,28 @@ class VideoPane(QWidget):
                         oxR = int((tw - sp_right.width()) / 2)
                         oyR = int((th - sp_right.height()) / 2)
 
-                        p.drawPixmap(oxL, oyL, sp_left)
+                        # Base: RIGHT on the canvas
+                        p.drawPixmap(oxR, oyR, sp_right)
 
+                        # Reveal: LEFT from the left edge (so Left stays on the left, Right on the right)
                         wipe = int(getattr(self, "_compare_wipe", 500) or 500)
                         wipe = max(0, min(1000, wipe))
-                        reveal = int(round(sp_right.width() * (wipe / 1000.0)))
+                        reveal = int(round(sp_left.width() * (wipe / 1000.0)))
 
                         p.save()
-                        p.setClipRect(QRect(oxR, oyR, reveal, sp_right.height()))
-                        p.drawPixmap(oxR, oyR, sp_right)
+                        p.setClipRect(QRect(oxL, oyL, reveal, sp_left.height()))
+                        p.drawPixmap(oxL, oyL, sp_left)
                         p.restore()
 
-                        x = oxR + reveal
+                        x = oxL + reveal
                         # Cache divider geometry for hover/drag hit-testing
                         try:
                             self._compare_divider_x = int(x)
-                            self._compare_right_ox = int(oxR)
-                            self._compare_right_oy = int(oyR)
-                            self._compare_right_w = int(max(1, sp_right.width()))
-                            self._compare_right_h = int(max(1, sp_right.height()))
+                            # Reuse existing variable names; these now represent the LEFT (revealed) pane.
+                            self._compare_right_ox = int(oxL)
+                            self._compare_right_oy = int(oyL)
+                            self._compare_right_w = int(max(1, sp_left.width()))
+                            self._compare_right_h = int(max(1, sp_left.height()))
                         except Exception:
                             pass
                         try:
@@ -5134,6 +5137,18 @@ class MainWindow(QMainWindow):
             pass
         self.setCentralWidget(splitter)
 
+        # --- Auto Compare (Before / After): poll completed jobs (best-effort) ---
+        try:
+            from PySide6.QtCore import QTimer
+            self._auto_compare_seen = set()
+            self._auto_compare_timer = QTimer(self)
+            self._auto_compare_timer.setInterval(750)
+            self._auto_compare_timer.timeout.connect(self._auto_compare_poll_done_jobs)
+            self._auto_compare_timer.start()
+        except Exception:
+            pass
+
+
         # --- Shortcut: ESC exits fullscreen (video overlay or window) ---
         try:
             esc_shortcut = QShortcut(QKeySequence(Qt.Key_Escape), self)
@@ -5565,6 +5580,247 @@ class MainWindow(QMainWindow):
                     self.tools.maybe_auto_sync_meme_preview()
             except Exception:
                 pass
+        except Exception:
+            pass
+
+
+    def _auto_compare_qwen2511_enabled(self) -> bool:
+        try:
+            sp = (ROOT / 'presets' / 'setsave' / 'qwen2511.json')
+            if not sp.exists():
+                return False
+            import json as _json
+            d = _json.loads(sp.read_text(encoding='utf-8'))
+            return bool(d.get('auto_compare', False))
+        except Exception:
+            return False
+
+    def _auto_compare_upsc_enabled(self) -> bool:
+        try:
+            sp = (ROOT / 'presets' / 'setsave' / 'upsc_settings.json')
+            if not sp.exists():
+                return False
+            import json as _json
+            d = _json.loads(sp.read_text(encoding='utf-8'))
+            return bool(d.get('auto_compare', False))
+        except Exception:
+            return False
+
+    def _auto_compare_job_successful(self, job: dict) -> bool:
+        try:
+            if not isinstance(job, dict):
+                return False
+            if job.get('error'):
+                return False
+            for k in ('exit_code','returncode','ret','rc'):
+                if k in job:
+                    try:
+                        if int(job.get(k) or 0) != 0:
+                            return False
+                    except Exception:
+                        pass
+            if str(job.get('status','')).strip().lower() in ('failed','error'):
+                return False
+            return True
+        except Exception:
+            return False
+
+    def _auto_compare_is_qwen2511_job(self, job: dict) -> bool:
+        try:
+            if not isinstance(job, dict):
+                return False
+            def _s(x):
+                try:
+                    return str(x or '').lower()
+                except Exception:
+                    return ''
+            hay = ' '.join([
+                _s(job.get('category')),
+                _s(job.get('job_type')),
+                _s(job.get('type')),
+                _s(job.get('name')),
+            ])
+            if 'qwen' in hay:
+                return True
+            cmd = job.get('cmd')
+            if isinstance(cmd, (list, tuple)):
+                ch = ' '.join([_s(x) for x in cmd])
+                if 'qwen' in ch or 'sd-cli' in ch and 'qwen' in ch:
+                    return True
+            return False
+        except Exception:
+            return False
+
+    def _auto_compare_is_upsc_job(self, job: dict) -> bool:
+        try:
+            if not isinstance(job, dict):
+                return False
+            def _s(x):
+                try:
+                    return str(x or '').lower()
+                except Exception:
+                    return ''
+            hay = ' '.join([
+                _s(job.get('category')),
+                _s(job.get('job_type')),
+                _s(job.get('type')),
+                _s(job.get('name')),
+            ])
+            if 'upscale' in hay or 'upsc' in hay or 'realesrgan' in hay or 'waifu2x' in hay or 'srmd' in hay:
+                return True
+            cmd = job.get('cmd')
+            if isinstance(cmd, (list, tuple)):
+                ch = ' '.join([_s(x) for x in cmd])
+                if 'realesrgan' in ch or 'waifu2x' in ch or 'srmd' in ch or 'ultrasharp' in ch or 'realsr' in ch:
+                    return True
+            return False
+        except Exception:
+            return False
+
+    def _auto_compare_find_existing_media(self, job: dict, prefer: str = 'input'):
+        try:
+            from pathlib import Path as _P
+            media_exts = {'.png','.jpg','.jpeg','.webp','.bmp','.tif','.tiff','.gif','.mp4','.mkv','.mov','.webm','.avi','.m4v','.mpg','.mpeg','.wmv'}
+
+            def _is_media_path(s: str) -> bool:
+                try:
+                    pp = _P(s)
+                    return pp.exists() and pp.is_file() and pp.suffix.lower() in media_exts
+                except Exception:
+                    return False
+
+            def _first_from_keys(keys):
+                for k in keys:
+                    try:
+                        v = job.get(k)
+                    except Exception:
+                        v = None
+                    if isinstance(v, str) and v.strip() and _is_media_path(v.strip()):
+                        return v.strip()
+                return None
+
+            in_keys = ['input_path','input','src','source','source_path','file','infile','path','init_img','init_image','image','video','before','left']
+            out_keys = ['output','output_path','out','out_path','out_file','outfile','result','dst','dest','target','right','after']
+
+            if prefer == 'output':
+                got = _first_from_keys(out_keys)
+                if got:
+                    return got
+            else:
+                got = _first_from_keys(in_keys)
+                if got:
+                    return got
+
+            # Scan nested args dict if present
+            try:
+                args = job.get('args')
+                if isinstance(args, dict):
+                    for keys in (out_keys if prefer=='output' else in_keys, in_keys if prefer=='output' else out_keys):
+                        for k in keys:
+                            v = args.get(k)
+                            if isinstance(v, str) and v.strip() and _is_media_path(v.strip()):
+                                return v.strip()
+            except Exception:
+                pass
+
+            # Parse cmd list for media paths
+            cmd = job.get('cmd')
+            if isinstance(cmd, (list, tuple)):
+                paths = []
+                for tok in cmd:
+                    if not isinstance(tok, str):
+                        continue
+                    st = tok.strip().strip('"')
+                    if st and _is_media_path(st):
+                        paths.append(st)
+                if paths:
+                    if prefer == 'output':
+                        return paths[-1]
+                    else:
+                        return paths[0]
+            return None
+        except Exception:
+            return None
+
+    def _auto_compare_poll_done_jobs(self):
+        try:
+            done_dir = JOBS_DIRS.get('done')
+            if done_dir is None:
+                return
+            from pathlib import Path as _P
+            dd = _P(done_dir)
+            if not dd.exists():
+                return
+
+            files = []
+            try:
+                files = list(dd.glob('*.json'))
+            except Exception:
+                files = []
+            if not files:
+                return
+
+            # Limit scan to most recent jobs to keep this light.
+            try:
+                files.sort(key=lambda x: x.stat().st_mtime, reverse=True)
+            except Exception:
+                pass
+            files = files[:80]
+
+            for fp in files:
+                key = str(fp)
+                if key in getattr(self, '_auto_compare_seen', set()):
+                    continue
+
+                try:
+                    job = load_json(fp, {})
+                except Exception:
+                    job = {}
+
+                # If the file is still being written or the job is not complete, re-check later.
+                if not self._auto_compare_job_successful(job):
+                    continue
+
+                enabled = False
+                try:
+                    enabled = bool(job.get('auto_compare', False))
+                except Exception:
+                    enabled = False
+
+                if not enabled and self._auto_compare_is_qwen2511_job(job):
+                    enabled = self._auto_compare_qwen2511_enabled()
+                if not enabled and self._auto_compare_is_upsc_job(job):
+                    enabled = self._auto_compare_upsc_enabled()
+
+                # If toggle is off, consider this job handled.
+                if not enabled:
+                    try:
+                        self._auto_compare_seen.add(key)
+                    except Exception:
+                        pass
+                    continue
+
+                left = self._auto_compare_find_existing_media(job, prefer='input')
+                right = self._auto_compare_find_existing_media(job, prefer='output')
+
+                # If paths aren't ready yet, re-check next tick.
+                if not left or not right:
+                    continue
+
+                opened = False
+                try:
+                    from helpers.compare_dialog import open_with_files as _open_cmp
+                    opened = bool(_open_cmp(self, left, right))
+                except Exception:
+                    opened = False
+
+                if opened:
+                    try:
+                        self._auto_compare_seen.add(key)
+                    except Exception:
+                        pass
+                    # Only open one compare per tick.
+                    break
         except Exception:
             pass
     def restore_session(self):

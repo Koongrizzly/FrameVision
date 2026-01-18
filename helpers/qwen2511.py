@@ -135,6 +135,42 @@ def _ensure_dir(p: str) -> None:
     os.makedirs(p, exist_ok=True)
 
 
+def _ffmpeg_path() -> str:
+    win = os.name == 'nt'
+    names = ['ffmpeg.exe'] if win else ['ffmpeg']
+    roots = [
+        Path(APP_ROOT) / 'presets' / 'bin',
+        Path(APP_ROOT) / 'presets' / 'tools',
+        Path(APP_ROOT) / 'bin',
+        Path(APP_ROOT),
+    ]
+    for base in roots:
+        for n in names:
+            cand = base / n
+            try:
+                if cand.exists():
+                    return str(cand)
+            except Exception:
+                pass
+    return names[0]
+
+
+def _extract_video_frame_to_png(video_path: Path, out_png: Path, time_s: float = 0.0) -> bool:
+    """Best-effort ffmpeg frame grab to a PNG path."""
+    try:
+        cmd = [
+            _ffmpeg_path(), '-y',
+            '-ss', f"{max(0.0, float(time_s)):.3f}",
+            '-i', str(video_path),
+            '-frames:v', '1',
+            str(out_png),
+        ]
+        subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True)
+        return out_png.exists() and out_png.stat().st_size > 0
+    except Exception:
+        return False
+
+
 def _read_jsonish(path: str) -> Dict:
     if not os.path.isfile(path):
         return {}
@@ -628,6 +664,9 @@ class Qwen2511Pane(QtWidgets.QWidget):
         self._autosave_suspended = 0
         self._autosave_timer: Optional[QtCore.QTimer] = None
 
+        # Temp files used by 'Use current' buttons (separate per ref to avoid mixing).
+        self._tmp_ref_files: Dict[int, str] = {}
+
         self._build_ui()
         self._load_defaults()
         self._apply_settings_to_ui()
@@ -948,9 +987,40 @@ class Qwen2511Pane(QtWidgets.QWidget):
         # Layout goals:
         # - Main controls + log live INSIDE the scroll area (so they scroll normally).
         # - Action buttons stick at the bottom (always visible, do not scroll).
+        # - Fancy banner stays pinned at the top (does not scroll).
         outer = QtWidgets.QVBoxLayout(self)
         outer.setContentsMargins(0, 0, 0, 0)
         outer.setSpacing(0)
+
+        # Fancy banner (pinned to the top; does not scroll)
+        banner_wrap = QtWidgets.QWidget(self)
+        bw = QtWidgets.QVBoxLayout(banner_wrap)
+        bw.setContentsMargins(12, 12, 12, 6)
+        bw.setSpacing(0)
+
+        self.banner = QtWidgets.QLabel("Qwen Edit 2511")
+        self.banner.setObjectName("qwenEditBanner")
+        self.banner.setAlignment(QtCore.Qt.AlignCenter)
+        self.banner.setSizePolicy(QtWidgets.QSizePolicy.Expanding, QtWidgets.QSizePolicy.Fixed)
+        self.banner.setFixedHeight(48)
+        self.banner.setStyleSheet(
+            "#qwenEditBanner {"
+            " font-size: 15px;"
+            " font-weight: 600;"
+            " padding: 8px 17px;"
+            " border-radius: 12px;"
+            " color: #eef7ff;"
+            " background: qlineargradient("
+            "   x1:0, y1:0, x2:1, y2:0,"
+            "   stop:0 #bfe9ff,"
+            "   stop:0.55 #55b6ff,"
+            "   stop:1 #0b3d91"
+            " );"
+            " letter-spacing: 0.5px;"
+            "}"
+        )
+        bw.addWidget(self.banner)
+        outer.addWidget(banner_wrap, 0)
 
         # Scroll area for the whole pane content (except the sticky bottom buttons bar).
         scroll = QtWidgets.QScrollArea()
@@ -966,36 +1036,10 @@ class Qwen2511Pane(QtWidgets.QWidget):
         scroll.setWidget(content)
 
         layout = QtWidgets.QVBoxLayout(content)
-        layout.setContentsMargins(12, 12, 12, 12)
+        # Top margin is handled by the pinned banner.
+        layout.setContentsMargins(12, 0, 12, 12)
         layout.setSpacing(10)
         layout.setSizeConstraint(QtWidgets.QLayout.SetMinimumSize)
-
-
-        # Fancy banner (ported from Tools tab)
-        self.banner = QtWidgets.QLabel("Qwen Edit 2511")
-        self.banner.setObjectName("qwenEditBanner")
-        self.banner.setAlignment(QtCore.Qt.AlignCenter)
-        self.banner.setSizePolicy(QtWidgets.QSizePolicy.Expanding, QtWidgets.QSizePolicy.Fixed)
-        self.banner.setFixedHeight(48)
-        self.banner.setStyleSheet(
-            "#qwenEditBanner {"
-            " font-size: 15px;"
-            " font-weight: 600;"
-            " padding: 8px 17px;"
-            " border-radius: 12px;"
-            " margin: 0 0 6px 0;"
-            " color: #eef7ff;"
-            " background: qlineargradient("
-            "   x1:0, y1:0, x2:1, y2:0,"
-            "   stop:0 #bfe9ff,"
-            "   stop:0.55 #55b6ff,"
-            "   stop:1 #0b3d91"
-            " );"
-            " letter-spacing: 0.5px;"
-            "}"
-        )
-        layout.addWidget(self.banner)
-        layout.addSpacing(4)
 
 
         # Models (collapsible)
@@ -1312,6 +1356,11 @@ class Qwen2511Pane(QtWidgets.QWidget):
         btn_ref1 = QtWidgets.QToolButton(); btn_ref1.setText("…"); btn_ref1.clicked.connect(lambda: self._pick_ref(self.ed_ref1))
         btn_ref1.setToolTip("Browse for reference image 1")
 
+        # Use-current (loads the currently shown image/frame into THIS ref only)
+        self.btn_usecur_ref1 = QtWidgets.QToolButton(); self.btn_usecur_ref1.setText("Use current")
+        self.btn_usecur_ref1.setToolTip("Use the current image (or current video frame) from the media player as Ref image 1.")
+        self.btn_usecur_ref1.clicked.connect(lambda: self._use_current_for_ref(1, self.ed_ref1))
+
         self.thumb_ref1 = ClickableLabel()
         self._init_thumb_label(self.thumb_ref1, self.ed_ref1)
 
@@ -1319,13 +1368,24 @@ class Qwen2511Pane(QtWidgets.QWidget):
         h_ref1.addWidget(btn_ref1)
         h_ref1.addWidget(self.thumb_ref1)
         h_ref1.addWidget(self.ed_ref1, 1)
-        gl.addRow("Ref image 1", h_ref1)
+
+        lbl_ref1 = QtWidgets.QWidget()
+        _lr1 = QtWidgets.QHBoxLayout(lbl_ref1)
+        _lr1.setContentsMargins(0, 0, 0, 0)
+        _lr1.setSpacing(6)
+        _lr1.addWidget(QtWidgets.QLabel("Ref image 1"))
+        _lr1.addWidget(self.btn_usecur_ref1)
+        gl.addRow(lbl_ref1, h_ref1)
 
         self.ed_ref2 = QtWidgets.QLineEdit()
         self.ed_ref2.setToolTip("Optional reference image 2 (image 3 in prompt when scene is used).")
         self.ed_ref2.setPlaceholderText("Optional: reference image 2 …")
         btn_ref2 = QtWidgets.QToolButton(); btn_ref2.setText("…"); btn_ref2.clicked.connect(lambda: self._pick_ref(self.ed_ref2))
         btn_ref2.setToolTip("Browse for reference image 2")
+
+        self.btn_usecur_ref2 = QtWidgets.QToolButton(); self.btn_usecur_ref2.setText("Use current")
+        self.btn_usecur_ref2.setToolTip("Use the current image (or current video frame) from the media player as Ref image 2.")
+        self.btn_usecur_ref2.clicked.connect(lambda: self._use_current_for_ref(2, self.ed_ref2))
 
         self.thumb_ref2 = ClickableLabel()
         self._init_thumb_label(self.thumb_ref2, self.ed_ref2)
@@ -1334,13 +1394,24 @@ class Qwen2511Pane(QtWidgets.QWidget):
         h_ref2.addWidget(btn_ref2)
         h_ref2.addWidget(self.thumb_ref2)
         h_ref2.addWidget(self.ed_ref2, 1)
-        gl.addRow("Ref image 2", h_ref2)
+
+        lbl_ref2 = QtWidgets.QWidget()
+        _lr2 = QtWidgets.QHBoxLayout(lbl_ref2)
+        _lr2.setContentsMargins(0, 0, 0, 0)
+        _lr2.setSpacing(6)
+        _lr2.addWidget(QtWidgets.QLabel("Ref image 2"))
+        _lr2.addWidget(self.btn_usecur_ref2)
+        gl.addRow(lbl_ref2, h_ref2)
 
         self.ed_ref3 = QtWidgets.QLineEdit()
         self.ed_ref3.setToolTip("Optional reference image 3 (image 4 in prompt when scene is used).")
         self.ed_ref3.setPlaceholderText("Optional: reference image 3 …")
         btn_ref3 = QtWidgets.QToolButton(); btn_ref3.setText("…"); btn_ref3.clicked.connect(lambda: self._pick_ref(self.ed_ref3))
         btn_ref3.setToolTip("Browse for reference image 3")
+
+        self.btn_usecur_ref3 = QtWidgets.QToolButton(); self.btn_usecur_ref3.setText("Use current")
+        self.btn_usecur_ref3.setToolTip("Use the current image (or current video frame) from the media player as Ref image 3.")
+        self.btn_usecur_ref3.clicked.connect(lambda: self._use_current_for_ref(3, self.ed_ref3))
 
         self.thumb_ref3 = ClickableLabel()
         self._init_thumb_label(self.thumb_ref3, self.ed_ref3)
@@ -1349,7 +1420,14 @@ class Qwen2511Pane(QtWidgets.QWidget):
         h_ref3.addWidget(btn_ref3)
         h_ref3.addWidget(self.thumb_ref3)
         h_ref3.addWidget(self.ed_ref3, 1)
-        gl.addRow("Ref image 3", h_ref3)
+
+        lbl_ref3 = QtWidgets.QWidget()
+        _lr3 = QtWidgets.QHBoxLayout(lbl_ref3)
+        _lr3.setContentsMargins(0, 0, 0, 0)
+        _lr3.setSpacing(6)
+        _lr3.addWidget(QtWidgets.QLabel("Ref image 3"))
+        _lr3.addWidget(self.btn_usecur_ref3)
+        gl.addRow(lbl_ref3, h_ref3)
 
         self.lbl_ref_hint = QtWidgets.QLabel("Prompt numbering: Scene=image 1, Ref1=image 2, Ref2=image 3, Ref3=image 4.")
         self.lbl_ref_hint.setStyleSheet("color: #888;")
@@ -1608,6 +1686,9 @@ class Qwen2511Pane(QtWidgets.QWidget):
         self.btn_play_last.setToolTip("Plays the newest file in output/qwen2511 using the internal media player.")
         self.chk_auto_show_results = QtWidgets.QCheckBox("Auto play result after run")
         self.chk_auto_show_results.setToolTip("When enabled, automatically plays the produced file in the internal media player after a successful run (same as 'Play last result').")
+        self.chk_auto_compare = QtWidgets.QCheckBox("Compare before / after")
+        self.chk_auto_compare.setChecked(False)
+        self.chk_auto_compare.setToolTip("Automatically open a before/after comparison when the job finishes.")
         self.chk_use_queue = QtWidgets.QCheckBox("Use queue")
         self.chk_use_queue.setToolTip("When enabled, clicking Run will add this job to the Queue instead of running sd-cli immediately.")
         self.chk_use_queue.toggled.connect(self._on_use_queue_toggled)
@@ -1625,6 +1706,7 @@ class Qwen2511Pane(QtWidgets.QWidget):
         top_row.addWidget(self.btn_view_results)
         top_row.addWidget(self.btn_play_last)
         top_row.addWidget(self.chk_auto_show_results)
+        top_row.addWidget(self.chk_auto_compare)
         top_row.addStretch(1)
 
         bottom_row.addWidget(self.chk_use_queue)
@@ -2086,6 +2168,234 @@ class Qwen2511Pane(QtWidgets.QWidget):
         if fn and target is not None:
             target.setText(fn)
 
+
+    # --- Use current (Ref images) ---
+
+    def _use_current_for_ref(self, idx: int, target: QtWidgets.QLineEdit) -> None:
+        """Load the current media (image or current video frame) into a specific ref image slot.
+
+        Important: each ref index gets its own temp file so slots never overwrite each other.
+        """
+        try:
+            idx_i = int(idx)
+        except Exception:
+            idx_i = 1
+        idx_i = 1 if idx_i < 1 else (3 if idx_i > 3 else idx_i)
+
+        if target is None:
+            return
+
+        # Resolve current media from the host (FrameVision).
+        media_path, time_s = self._current_media_from_host()
+
+        img_exts = {'.png', '.jpg', '.jpeg', '.bmp', '.tif', '.tiff', '.webp'}
+        vid_exts = {'.mp4', '.mkv', '.mov', '.avi', '.webm', '.m4v', '.wmv', '.mpg', '.mpeg'}
+
+        # 1) If the current media is an image file, use it directly (full resolution).
+        if media_path is not None:
+            try:
+                if media_path.suffix.lower() in img_exts and media_path.exists():
+                    target.setText(str(media_path))
+                    try:
+                        self._toast(f"Ref image {idx_i}: set to current image ({media_path.name})")
+                    except Exception:
+                        pass
+                    return
+            except Exception:
+                pass
+
+        # 2) For video (or unknown), we save the currently shown frame to a per-ref temp PNG.
+        tmp_png = self._tmp_ref_png_path(idx_i)
+
+        # Prefer grabbing the current shown QImage (exact moment).
+        qimg = self._try_grab_qimage_from_host()
+        if qimg is not None:
+            try:
+                QPixmap.fromImage(qimg).save(tmp_png, 'PNG')
+                if os.path.isfile(tmp_png):
+                    target.setText(tmp_png)
+                    try:
+                        self._toast(f"Ref image {idx_i}: set to current frame")
+                    except Exception:
+                        pass
+                    return
+            except Exception:
+                pass
+
+        # Fallback to ffmpeg extraction if we have a video path.
+        if media_path is not None:
+            try:
+                if media_path.suffix.lower() in vid_exts and media_path.exists():
+                    outp = Path(tmp_png)
+                    ok = False
+                    try:
+                        if float(time_s) >= 0.0:
+                            ok = _extract_video_frame_to_png(media_path, outp, time_s=float(time_s))
+                    except Exception:
+                        ok = False
+                    if not ok:
+                        ok = _extract_video_frame_to_png(media_path, outp, time_s=0.0)
+                    if ok:
+                        target.setText(str(outp))
+                        try:
+                            label = f"{media_path.name} @ {float(time_s):.2f}s" if float(time_s) >= 0.0 else f"{media_path.name} @ 0.00s"
+                            self._toast(f"Ref image {idx_i}: set to {label}")
+                        except Exception:
+                            pass
+                        return
+            except Exception:
+                pass
+
+        # 3) Last fallback: nothing found.
+        try:
+            QtWidgets.QMessageBox.information(self, 'Use current', 'Open an image or video in the player first.')
+        except Exception:
+            try:
+                self._toast('Open an image or video in the player first.')
+            except Exception:
+                pass
+
+
+    def _tmp_ref_png_path(self, idx: int) -> str:
+        """Return a stable per-ref temp PNG path (separate per ref index)."""
+        try:
+            idx_i = int(idx)
+        except Exception:
+            idx_i = 1
+        idx_i = 1 if idx_i < 1 else (3 if idx_i > 3 else idx_i)
+
+        # Cache so the slot keeps pointing to the same file until the user changes it.
+        try:
+            if idx_i in self._tmp_ref_files and self._tmp_ref_files[idx_i]:
+                return self._tmp_ref_files[idx_i]
+        except Exception:
+            pass
+
+        import tempfile
+        base = Path(tempfile.gettempdir())
+        fn = f"fv_qwen2511_ref{idx_i}_{os.getpid()}.png"
+        out = str(base / fn)
+        try:
+            self._tmp_ref_files[idx_i] = out
+        except Exception:
+            pass
+        return out
+
+
+    def _current_media_from_host(self) -> Tuple[Optional[Path], float]:
+        """Best-effort: find current media path + playhead time in seconds from FrameVision host."""
+        # Path
+        pth: Optional[Path] = None
+        for c in (getattr(self, 'current_path', None), getattr(getattr(self, 'main', None), 'current_path', None)):
+            if c:
+                try:
+                    pp = Path(str(c))
+                    if pp.exists():
+                        pth = pp
+                        break
+                except Exception:
+                    pass
+
+        # Time (seconds). -1 means unknown
+        t = -1.0
+
+        def _as_float(v) -> Optional[float]:
+            try:
+                if callable(v):
+                    v = v()
+                if v is None:
+                    return None
+                return float(v)
+            except Exception:
+                return None
+
+        def _try_seconds(obj) -> Optional[float]:
+            if obj is None:
+                return None
+            for attr in ('current_time_s', 'time_s', 'pos_s', 'position_s', 'playhead_s', 'cursor_s'):
+                if hasattr(obj, attr):
+                    vv = _as_float(getattr(obj, attr))
+                    if vv is not None:
+                        return max(0.0, vv)
+            for meth in ('current_time_s', 'time_s', 'pos_s', 'position_s'):
+                if hasattr(obj, meth) and callable(getattr(obj, meth)):
+                    vv = _as_float(getattr(obj, meth))
+                    if vv is not None:
+                        return max(0.0, vv)
+            return None
+
+        def _try_millis(obj) -> Optional[float]:
+            if obj is None:
+                return None
+            for attr in ('position_ms', 'pos_ms', 'current_time_ms', 'time_ms'):
+                if hasattr(obj, attr):
+                    vv = _as_float(getattr(obj, attr))
+                    if vv is not None:
+                        return max(0.0, vv) / 1000.0
+            for meth in ('position',):
+                if hasattr(obj, meth) and callable(getattr(obj, meth)):
+                    vv = _as_float(getattr(obj, meth))
+                    if vv is not None:
+                        return max(0.0, vv) / 1000.0
+            return None
+
+        try:
+            main = getattr(self, 'main', None)
+            vid = getattr(main, 'video', None) if main is not None else None
+
+            vv = _try_seconds(vid)
+            if vv is not None:
+                t = vv
+            else:
+                player_candidates = [
+                    vid,
+                    getattr(vid, 'player', None) if vid is not None else None,
+                    getattr(vid, '_player', None) if vid is not None else None,
+                    getattr(vid, 'mediaPlayer', None) if vid is not None else None,
+                    getattr(vid, 'mediaplayer', None) if vid is not None else None,
+                    getattr(main, 'player', None) if main is not None else None,
+                    getattr(main, '_player', None) if main is not None else None,
+                    getattr(main, 'mediaPlayer', None) if main is not None else None,
+                    getattr(main, 'mediaplayer', None) if main is not None else None,
+                ]
+                for pc in player_candidates:
+                    vv = _try_millis(pc)
+                    if vv is not None:
+                        t = vv
+                        break
+        except Exception:
+            pass
+
+        return pth, t
+
+
+    def _try_grab_qimage_from_host(self) -> Optional[QImage]:
+        """Try to grab the currently shown video frame as a QImage (if the host exposes one)."""
+        try:
+            main = getattr(self, 'main', None)
+            vid = getattr(main, 'video', None) if main is not None else None
+            if vid is None:
+                return None
+
+            qimg = getattr(vid, 'currentFrame', None)
+            if qimg is not None:
+                try:
+                    if hasattr(qimg, 'isNull') and qimg.isNull():
+                        qimg = None
+                except Exception:
+                    pass
+                if qimg is not None:
+                    return qimg
+
+            lab = getattr(vid, 'label', None)
+            if lab is not None and hasattr(lab, 'pixmap'):
+                pm = lab.pixmap()
+                if pm is not None:
+                    return pm.toImage()
+        except Exception:
+            pass
+        return None
+
     def _reload_model_lists(self):
         # Reload dropdowns without accidentally overwriting saved selections.
         prev_unet = self.cb_unet.currentData() if hasattr(self, "cb_unet") else None
@@ -2371,6 +2681,11 @@ class Qwen2511Pane(QtWidgets.QWidget):
                 self.chk_auto_show_results.setChecked(bool(s.get("auto_show_results", False)))
             except Exception:
                 pass
+        if hasattr(self, "chk_auto_compare"):
+            try:
+                self.chk_auto_compare.setChecked(bool(s.get("auto_compare", False)))
+            except Exception:
+                pass
         if hasattr(self, "chk_use_queue"):
             try:
                 self.chk_use_queue.setChecked(bool(s.get("use_queue", False)))
@@ -2479,7 +2794,7 @@ class Qwen2511Pane(QtWidgets.QWidget):
         for w in [getattr(self, "chk_use_scene", None), getattr(self, "chk_use_mask", None), getattr(self, "chk_invert_mask", None), getattr(self, "chk_ref_increase_index", None),
                   getattr(self, "chk_disable_ref_resize", None), getattr(self, "chk_auto_aspect", None),
                   getattr(self, "chk_auto_show_results", None), getattr(self, "chk_use_queue", None),
-                  getattr(self, "chk_multi_angle", None),
+                  getattr(self, "chk_auto_compare", None),                  getattr(self, "chk_multi_angle", None),
                   getattr(self, "chk_ma_auto_apply", None),
                   getattr(self, "chk_vae_tiling", None), getattr(self, "chk_offload", None), getattr(self, "chk_mmap", None),
                   getattr(self, "chk_vae_on_cpu", None), getattr(self, "chk_clip_on_cpu", None),
@@ -2544,6 +2859,7 @@ class Qwen2511Pane(QtWidgets.QWidget):
             "auto_aspect": bool(self.chk_auto_aspect.isChecked()),
             "auto_aspect_base": int(self.cb_base.currentText()),
             "auto_show_results": bool(getattr(self, "chk_auto_show_results", None).isChecked() if getattr(self, "chk_auto_show_results", None) is not None else False),
+            "auto_compare": bool(getattr(self, "chk_auto_compare", None).isChecked() if getattr(self, "chk_auto_compare", None) is not None else False),
             "use_queue": bool(getattr(self, "chk_use_queue", None).isChecked() if getattr(self, "chk_use_queue", None) is not None else False),
             "vae_tiling": bool(self.chk_vae_tiling.isChecked()),
             "vae_tile_size": self.cb_vae_tile_size.currentText().strip(),

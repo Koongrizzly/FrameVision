@@ -396,6 +396,12 @@ class UpscPane(QtWidgets.QWidget):
         self.chk_streaming_lowmem.setToolTip("Process in a streaming, low-memory mode using smaller buffers. Good default for stability.")
         prefs_grid.addWidget(self.chk_streaming_lowmem, 1, 2, 1, 2)
 
+        self.chk_auto_compare = QtWidgets.QCheckBox("Compare before / after", self)
+        self.chk_auto_compare.setChecked(False)
+        self.chk_auto_compare.setToolTip("Automatically open a before/after comparison when the job finishes.")
+        prefs_grid.addWidget(self.chk_auto_compare, 0, 0, 1, 2)
+
+
         prefs_grid.setColumnStretch(3, 1)
         v.addLayout(prefs_grid)
 
@@ -921,6 +927,7 @@ class UpscPane(QtWidgets.QWidget):
             ("chk_denoise", "toggled"),
             ("chk_deband", "toggled"),
             ("sld_sharpen", "valueChanged"),
+            ("chk_auto_compare", "toggled"),
                     ]
 
         connected = 0
@@ -1043,6 +1050,9 @@ class UpscPane(QtWidgets.QWidget):
         try: d["streaming_lowmem"] = bool(self.chk_streaming_lowmem.isChecked())
         except Exception: d["streaming_lowmem"] = True
 
+        try: d["auto_compare"] = bool(getattr(self, "chk_auto_compare", None).isChecked() if getattr(self, "chk_auto_compare", None) is not None else False)
+        except Exception: d["auto_compare"] = False
+
         return d
 
     def _apply_settings(self, d: dict):
@@ -1090,6 +1100,11 @@ class UpscPane(QtWidgets.QWidget):
         try:
             self.chk_play_internal.setChecked(bool(d.get("play_internal", True)))
             self.chk_replace_in_player.setChecked(bool(d.get("replace_in_player", True)))
+        except Exception:
+            pass
+        try:
+            if getattr(self, 'chk_auto_compare', None) is not None:
+                self.chk_auto_compare.setChecked(bool(d.get('auto_compare', False)))
         except Exception:
             pass
         try:
@@ -2293,8 +2308,10 @@ def _fv_call_enqueue(self, enq, where_label, cmds, open_on_success):
             "name": "Upscale" if len(cmds) == 1 else f"Upscale ({i}/{len(cmds)})",
             "category": "upscale",
             "cmd": c,
+            "input_path": input_path,
             "cwd": str(globals().get("ROOT", ".")),
             "open_on_success": bool(open_on_success and i == len(cmds)),
+            "auto_compare": bool((getattr(self, "chk_auto_compare", None) is not None and self.chk_auto_compare.isChecked()) and i == len(cmds)),
             "output": str(getattr(self, "_last_outfile", "")),
         }
         try:

@@ -130,3 +130,36 @@ class ComparePickDialog(QDialog):
 
     def get_selection(self):
         return self._left, self._right, self._kind
+
+
+
+def open_with_files(parent, left_path: str, right_path: str):
+    """Programmatic entry path.
+
+    - Detect media type (image/video)
+    - Validate both sides exist and are same type
+    - Load viewer immediately (bypass manual selection UI)
+
+    Returns True when opened, False otherwise.
+    """
+    try:
+        left = str(left_path or '').strip()
+        right = str(right_path or '').strip()
+        if not left or not right:
+            return False
+        if not os.path.exists(left) or not os.path.exists(right):
+            return False
+        k1 = _kind(left)
+        k2 = _kind(right)
+        if k1 != k2:
+            return False
+        # Open immediately using the existing viewer hook (parent is expected to implement open_compare).
+        if parent is not None and hasattr(parent, 'open_compare'):
+            try:
+                parent.open_compare(left, right, k1)
+                return True
+            except Exception:
+                return False
+        return False
+    except Exception:
+        return False
