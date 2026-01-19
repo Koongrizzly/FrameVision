@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import sys
 from dataclasses import dataclass
 from datetime import datetime
@@ -77,6 +78,19 @@ def _ensure_dirs() -> None:
     (root / "models" / "HeartMuLa").mkdir(parents=True, exist_ok=True)
     (root / "output" / "music" / "heartmula").mkdir(parents=True, exist_ok=True)
     (root / "presets" / "setsave").mkdir(parents=True, exist_ok=True)
+
+
+def _slugify(text: str, max_len: int = 42) -> str:
+    """Make a filesystem-friendly slug (lowercase, underscores)."""
+    s = (text or '').strip().lower()
+    # normalize common dash variants
+    s = s.replace('–', '-').replace('—', '-')
+    # keep alnum, convert everything else to underscores
+    s = re.sub(r'[^a-z0-9]+', '_', s)
+    s = re.sub(r'_+', '_', s).strip('_')
+    if max_len and len(s) > max_len:
+        s = s[:max_len].rstrip('_')
+    return s
 
 
 def _default_mula_presets() -> dict:
@@ -388,7 +402,7 @@ class HeartMuLaUI(QWidget):
         self.btn_browse_out.clicked.connect(self._browse_output)
 
         self.output_name = QLineEdit("")
-        self.output_name.setPlaceholderText("Optional filename (blank = auto timestamp)")
+        self.output_name.setPlaceholderText("Optional filename (blank = auto preset + timestamp)")
 
         self.lyrics = QPlainTextEdit(self.settings.lyrics_text)
         self.lyrics.setPlaceholderText("Paste lyrics here. Use section headers like [Verse], [Chorus], etc.")
@@ -599,6 +613,30 @@ class HeartMuLaUI(QWidget):
         out_dir = (_root_dir() / self.output_dir.text()).resolve()
         out_dir.mkdir(parents=True, exist_ok=True)
         QDesktopServices.openUrl(QUrl.fromLocalFile(str(out_dir)))
+
+
+    def _auto_name_slug(self) -> str:
+        """Best-effort slug for the auto filename based on preset/genre."""
+        # Prefer selected preset (sub-genre / style).
+        try:
+            data = self.preset_combo.currentData(Qt.UserRole)
+            if isinstance(data, dict):
+                pname = str(data.get('name', '')).strip()
+                if pname:
+                    return _slugify(pname)
+        except Exception:
+            pass
+
+        # Fallback to selected genre (if not All).
+        try:
+            g = (self.genre_combo.currentText() or '').strip()
+            if g and g.lower() != 'all':
+                return _slugify(g)
+        except Exception:
+            pass
+
+        return ''
+
 
     # --------------------- presets ---------------------
 
@@ -829,10 +867,14 @@ class HeartMuLaUI(QWidget):
 
         out_dir = (root / (self.output_dir.text().strip() or "output/music/heartmula")).resolve()
         out_dir.mkdir(parents=True, exist_ok=True)
-
         name = self.output_name.text().strip()
         if not name:
-            name = f"heartmula_{datetime.now().strftime('%Y%m%d_%H%M%S')}.mp3"
+            ts = datetime.now().strftime('%Y%m%d_%H%M%S')
+            slug = self._auto_name_slug()
+            if slug:
+                name = f"heartmula_{slug}_{ts}.mp3"
+            else:
+                name = f"heartmula_{ts}.mp3"
         if not name.lower().endswith(".mp3"):
             name += ".mp3"
         out_path = out_dir / name

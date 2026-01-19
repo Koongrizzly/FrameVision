@@ -2977,6 +2977,14 @@ class Qwen2511Pane(QtWidgets.QWidget):
                 self.chk_auto_show_results.setVisible(not useq)
         except Exception:
             pass
+
+        # Match the behavior of "Auto play result" (direct-run only):
+        # hide the Compare toggle when Queue is enabled.
+        try:
+            if hasattr(self, "chk_auto_compare") and self.chk_auto_compare is not None:
+                self.chk_auto_compare.setVisible(not useq)
+        except Exception:
+            pass
         try:
             if hasattr(self, "btn_cancel") and self.btn_cancel is not None:
                 if useq:
