@@ -48,6 +48,68 @@ except Exception:
     OUT_SHOTS  = BASE/'output'/'screenshots'
     OUT_TEMP   = BASE/'output'/'_temp'
 
+# --- Optional installs hide state (managed by helpers/remove_hide.py) ---
+# We read the same JSON state file used by remove_hide.py so the state stays user-visible.
+
+_opt_hide_cache = None
+
+def _optional_hide_state():
+    global _opt_hide_cache
+    try:
+        if _opt_hide_cache is not None:
+            return _opt_hide_cache
+    except Exception:
+        pass
+    try:
+        from helpers.remove_hide import get_state_path as _get_state_path, load_state as _load_state
+        _opt_hide_cache = _load_state(_get_state_path())
+        return _opt_hide_cache
+    except Exception:
+        _opt_hide_cache = {"hidden_ids": []}
+        return _opt_hide_cache
+
+
+def _optional_hide_is_hidden(entry_id: str) -> bool:
+    try:
+        st = _optional_hide_state() or {}
+        hid = st.get("hidden_ids", [])
+        return bool(entry_id in (hid or []))
+    except Exception:
+        return False
+
+
+
+# --- Optional installs hide state (managed by helpers/remove_hide.py) ---
+# We read the same JSON state file used by remove_hide.py so the state stays user-visible/editable.
+
+_opt_hide_cache = None
+
+def _optional_hide_state():
+    global _opt_hide_cache
+    try:
+        if _opt_hide_cache is not None:
+            return _opt_hide_cache
+    except Exception:
+        pass
+    try:
+        from helpers.remove_hide import get_state_path as _get_state_path, load_state as _load_state
+        st = _load_state(_get_state_path())
+        if not isinstance(st, dict):
+            st = {}
+        _opt_hide_cache = st
+        return st
+    except Exception:
+        _opt_hide_cache = {"hidden_ids": []}
+        return _opt_hide_cache
+
+def _optional_hide_is_hidden(entry_id: str) -> bool:
+    try:
+        st = _optional_hide_state() or {}
+        hidden = st.get("hidden_ids") or []
+        return entry_id in hidden
+    except Exception:
+        return False
+
 # --- Normalize trims output folder (new default) ---
 try:
     OUT_TRIMS = (OUT_VIDEOS / 'trims')
@@ -997,92 +1059,102 @@ class InstantToolsPane(QWidget):
                 _hy_l.addWidget(QLabel("HunyuanVideo 1.5 tool failed to load."))
                 sec_hunyuan15.setContentLayout(_hy_l)
 
-        # ---- Ace-Step Music creation ----
-        sec_ace = CollapsibleSection("Ace Step Music creation", expanded=False)
-        _ace_wrap = QWidget(); _ace_layout = QVBoxLayout(_ace_wrap); _ace_layout.setContentsMargins(0,0,0,0)
-        _ace_layout.setSpacing(6)
-        try:
-            from helpers.ace import acePane as _AcePane
-        except Exception:
-            _AcePane = None
-        _ace_widget = None
-        if _AcePane is not None:
+        sec_ace = None
+        if not _optional_hide_is_hidden("ace_step_music"):
+            # ---- Ace-Step Music creation ----
+            sec_ace = CollapsibleSection("Ace Step Music creation", expanded=False)
+            _ace_wrap = QWidget(); _ace_layout = QVBoxLayout(_ace_wrap); _ace_layout.setContentsMargins(0,0,0,0)
+            _ace_layout.setSpacing(6)
             try:
-                _ace_widget = _AcePane(self)
+                from helpers.ace import acePane as _AcePane
             except Exception:
+                _AcePane = None
+            _ace_widget = None
+            if _AcePane is not None:
                 try:
-                    _ace_widget = _AcePane(None)
+                    _ace_widget = _AcePane(self)
                 except Exception:
-                    _ace_widget = None
-        if _ace_widget is not None:
-            try:
-                _ace_widget.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
-            except Exception:
-                pass
-            try:
-                _ace_widget.setMinimumHeight(640)
-            except Exception:
-                pass
-            _ace_layout.addWidget(_ace_widget, 1)
-        else:
-            _ace_fallback = QLabel("Ace-Step tool failed to load (missing helpers/ace.py).")
-            _ace_fallback.setWordWrap(True)
-            _ace_layout.addWidget(_ace_fallback)
-        sec_ace.setContentLayout(_ace_layout)
-        try:
-            sec_ace.content.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
-        except Exception:
-            pass
-
-        # ---- HeartMuLa (heartlib) Music Generator ----
-        sec_mula = CollapsibleSection("HeartMuLa Music Generator", expanded=False)
-        _mula_wrap = QWidget(); _mula_layout = QVBoxLayout(_mula_wrap); _mula_layout.setContentsMargins(0,0,0,0)
-        _mula_layout.setSpacing(6)
-        _mula_widget = None
-        if HeartMuLaUI is not None:
-            try:
-                _mula_widget = HeartMuLaUI()
+                    try:
+                        _ace_widget = _AcePane(None)
+                    except Exception:
+                        _ace_widget = None
+            if _ace_widget is not None:
                 try:
-                    _mula_widget.setParent(self)
+                    _ace_widget.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
                 except Exception:
                     pass
-            except Exception:
-                _mula_widget = None
-        if _mula_widget is not None:
+                try:
+                    _ace_widget.setMinimumHeight(640)
+                except Exception:
+                    pass
+                _ace_layout.addWidget(_ace_widget, 1)
+            else:
+                _ace_fallback = QLabel("Ace-Step tool failed to load (missing helpers/ace.py).")
+                _ace_fallback.setWordWrap(True)
+                _ace_layout.addWidget(_ace_fallback)
+            sec_ace.setContentLayout(_ace_layout)
             try:
-                _mula_widget.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
-            except Exception:
-                pass
-            try:
-                _mula_widget.setMinimumHeight(720)
-            except Exception:
-                pass
-            _mula_layout.addWidget(_mula_widget, 1)
-            try:
-                self._mula_widget = _mula_widget
+                sec_ace.content.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
             except Exception:
                 pass
 
-            # Extra: use the same "View results" behavior as other Tools (Media Explorer)
+        else:
+            sec_ace = None
+
+        sec_mula = None
+        if not _optional_hide_is_hidden("heartmula"):
+            # ---- HeartMuLa (heartlib) Music Generator ----
+            sec_mula = CollapsibleSection("HeartMuLa Music Generator", expanded=False)
+            _mula_wrap = QWidget(); _mula_layout = QVBoxLayout(_mula_wrap); _mula_layout.setContentsMargins(0,0,0,0)
+            _mula_layout.setSpacing(6)
+            _mula_widget = None
+            if HeartMuLaUI is not None:
+                try:
+                    _mula_widget = HeartMuLaUI()
+                    try:
+                        _mula_widget.setParent(self)
+                    except Exception:
+                        pass
+                except Exception:
+                    _mula_widget = None
+            if _mula_widget is not None:
+                try:
+                    _mula_widget.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+                except Exception:
+                    pass
+                try:
+                    _mula_widget.setMinimumHeight(720)
+                except Exception:
+                    pass
+                _mula_layout.addWidget(_mula_widget, 1)
+                try:
+                    self._mula_widget = _mula_widget
+                except Exception:
+                    pass
+
+                # Extra: use the same "View results" behavior as other Tools (Media Explorer)
+                try:
+                    row_mula = QHBoxLayout()
+                    row_mula.addStretch(1)
+                    self.btn_mula_open_folder = QPushButton("View results")
+                    self.btn_mula_open_folder.setToolTip("Open HeartMuLa outputs in Media Explorer.")
+                    row_mula.addWidget(self.btn_mula_open_folder)
+                    _mula_layout.addLayout(row_mula)
+                    self.btn_mula_open_folder.clicked.connect(self._mula_open_folder)
+                except Exception:
+                    pass
+            else:
+                _mula_fallback = QLabel("HeartMuLa tool failed to load (missing helpers/heartmula.py).")
+                _mula_fallback.setWordWrap(True)
+                _mula_layout.addWidget(_mula_fallback)
+            sec_mula.setContentLayout(_mula_layout)
             try:
-                row_mula = QHBoxLayout()
-                row_mula.addStretch(1)
-                self.btn_mula_open_folder = QPushButton("View results")
-                self.btn_mula_open_folder.setToolTip("Open HeartMuLa outputs in Media Explorer.")
-                row_mula.addWidget(self.btn_mula_open_folder)
-                _mula_layout.addLayout(row_mula)
-                self.btn_mula_open_folder.clicked.connect(self._mula_open_folder)
+                sec_mula.content.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
             except Exception:
                 pass
+
         else:
-            _mula_fallback = QLabel("HeartMuLa tool failed to load (missing helpers/heartmula.py).")
-            _mula_fallback.setWordWrap(True)
-            _mula_layout.addWidget(_mula_fallback)
-        sec_mula.setContentLayout(_mula_layout)
-        try:
-            sec_mula.content.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
-        except Exception:
-            pass
+            sec_mula = None
 
         # ---- Multi Rename (moved to helpers/renam.py) ----
         sec_rename = CollapsibleSection("Multi Rename/Replace", expanded=False)
@@ -1364,8 +1436,8 @@ class InstantToolsPane(QWidget):
             _vt_layout.addWidget(_lbl)
         sec_videotext.setContentLayout(_vt_layout)
 
-        default_sections = [sec_prompt, sec_bg, sec_ace, sec_mula, sec_describe, sec_meme, sec_music, sec_audio, sec_speed, sec_reverse, sec_upscale, sec_rife,
-                            sec_resize, sec_trim, sec_crop, sec_videotext, sec_splitglue, sec_gif, sec_extract, sec_rename, sec_metadata]
+        default_sections = [s for s in [sec_prompt, sec_bg, sec_ace, sec_mula, sec_describe, sec_meme, sec_music, sec_audio, sec_speed, sec_reverse, sec_upscale, sec_rife,
+                            sec_resize, sec_trim, sec_crop, sec_videotext, sec_splitglue, sec_gif, sec_extract, sec_rename, sec_metadata] if s is not None]
 
 # sec_musicclip,  # to re add put this back in default_sections
 
@@ -1416,6 +1488,17 @@ class InstantToolsPane(QWidget):
                 "Whisper Lab": sec_whisper,
                 "Metadata editor": sec_metadata
             }
+            # Optional installs: hide sections when hidden by user
+            if sec_ace is None:
+                try:
+                    d.pop("Ace Step Music creation", None)
+                except Exception:
+                    pass
+            if sec_mula is None:
+                try:
+                    d.pop("HeartMuLa Music Generator", None)
+                except Exception:
+                    pass
             if sec_hunyuan15 is not None:
                 # Keep it near prompt-related tools in the menu ordering.
                 try:

@@ -4783,21 +4783,53 @@ class MainWindow(QMainWindow):
         except Exception:
             pass
 
+        # --- Optional hide state (from helpers/remove_hide.py JSON) ---
+        try:
+            self._optional_hidden_ids = set()
+            try:
+                try:
+                    from helpers import remove_hide as _rh
+                except Exception:
+                    import remove_hide as _rh
+                try:
+                    _st = _rh.load_state(_rh.get_state_path())
+                except Exception:
+                    _st = {}
+                _hid = _st.get('hidden_ids', []) if isinstance(_st, dict) else []
+                if isinstance(_hid, list):
+                    self._optional_hidden_ids = set(str(x) for x in _hid if isinstance(x, str))
+            except Exception:
+                self._optional_hidden_ids = set()
+        except Exception:
+            self._optional_hidden_ids = set()
+
 
 
         # >>> FRAMEVISION_TXT2IMG_BEGIN
         # Insert txt2img tab as the leftmost tab; label exactly "TXT to IMG".
         try:
-            if 'Txt2ImgPane' in globals() and Txt2ImgPane is not None:
-                self._txt2img_qwen = Txt2ImgPane(self)
-                self.tabs.insertTab(0, self._txt2img_qwen, "TXT to IMG")
-                # Wire to player: open resulting image in the left player
-                try:
-                    self._txt2img_qwen.fileReady.connect(self.video.open)
-                except Exception:
-                    pass
-        except Exception as _e:
-            print("[framevision] txt2img tab insert failed:", _e)
+            _hid = getattr(self, '_optional_hidden_ids', set()) or set()
+            _txt2img_all_hidden = set(['sdxl_txt2img', 'zimage_turbo_fp16', 'zimage_turbo_gguf', 'qwen_image_2512']).issubset(_hid)
+        except Exception:
+            _txt2img_all_hidden = False
+
+        if not _txt2img_all_hidden:
+            try:
+                if 'Txt2ImgPane' in globals() and Txt2ImgPane is not None:
+                    self._txt2img_qwen = Txt2ImgPane(self)
+                    self.tabs.insertTab(0, self._txt2img_qwen, "TXT to IMG")
+                    # Wire to player: open resulting image in the left player
+                    try:
+                        self._txt2img_qwen.fileReady.connect(self.video.open)
+                    except Exception:
+                        pass
+            except Exception as _e:
+                print("[framevision] txt2img tab insert failed:", _e)
+        else:
+            try:
+                self._txt2img_qwen = None
+            except Exception:
+                pass
         # <<< FRAMEVISION_TXT2IMG_END
         # The analyzer integration was disabled to avoid runtime errors.
         # (Previously initialized QuickActionDriver and installed it here.)
@@ -4933,118 +4965,142 @@ class MainWindow(QMainWindow):
 
         # >>> FRAMEVISION_WAN22_INIT_BEGIN
         try:
-            if 'Wan22Pane' in globals() and Wan22Pane is not None:
-                try:
-                    self.wan22 = Wan22Pane(self)
-                except Exception as _e:
-                    # If the pane itself raises, show a friendly error tab instead of hiding it.
-                    print("[framevision] WAN22 init failed in pane constructor:", _e)
+            _hid = getattr(self, '_optional_hidden_ids', set()) or set()
+            _wan_all_hidden = set(['wan22', 'hunyuan15']).issubset(_hid)
+        except Exception:
+            _wan_all_hidden = False
+
+        if _wan_all_hidden:
+            try:
+                self.wan22 = None
+            except Exception:
+                pass
+        else:
+            try:
+                if 'Wan22Pane' in globals() and Wan22Pane is not None:
+                    try:
+                        self.wan22 = Wan22Pane(self)
+                    except Exception as _e:
+                        # If the pane itself raises, show a friendly error tab instead of hiding it.
+                        print("[framevision] WAN22 init failed in pane constructor:", _e)
+                        err = QWidget(self)
+                        lay = QVBoxLayout(err)
+                        lab = QLabel(f"WAN 2.2 failed to load:\n{_e}", err)
+                        lab.setWordWrap(True)
+                        lay.addWidget(lab)
+                        self.wan22 = err
+                else:
+                    # Module imported but no usable pane class, or import failed completely.
                     err = QWidget(self)
                     lay = QVBoxLayout(err)
-                    lab = QLabel(f"WAN 2.2 failed to load:\n{_e}", err)
+                    txt = (
+                        "WAN 2.2 module not found or no Wan22Pane class defined.\n"
+                        "Make sure helpers/wan22.py defines a QWidget subclass named 'Wan22Pane'."
+                    )
+                    lab = QLabel(txt, err)
                     lab.setWordWrap(True)
                     lay.addWidget(lab)
                     self.wan22 = err
-            else:
-                # Module imported but no usable pane class, or import failed completely.
-                err = QWidget(self)
-                lay = QVBoxLayout(err)
-                txt = (
-                    "WAN 2.2 module not found or no Wan22Pane class defined.\n"
-                    "Make sure helpers/wan22.py defines a QWidget subclass named 'Wan22Pane'."
-                )
-                lab = QLabel(txt, err)
-                lab.setWordWrap(True)
-                lay.addWidget(lab)
-                self.wan22 = err
-            # Insert WAN 2.2 tab just after TXT to IMG if present; otherwise append.
-            try:
-                idx_txt = -1
+                # Insert WAN 2.2 tab just after TXT to IMG if present; otherwise append.
                 try:
-                    idx_txt = self.tabs.indexOf(getattr(self, "_txt2img_qwen", None))
-                except Exception:
                     idx_txt = -1
-                if idx_txt is not None and idx_txt >= 0:
-                    self.tabs.insertTab(idx_txt + 1, self.wan22, "TXT/IMG/VID to Video")
-                else:
-                    self.tabs.addTab(self.wan22, "WAN 2.2")
-            except Exception as _attach_e:
-                try:
-                    self.tabs.addTab(self.wan22, "WAN 2.2")
-                except Exception as _e2:
-                    print("[framevision] WAN22 tab attach failed:", _e2)
-        except Exception as _e:
-            print("[framevision] WAN22 init failed:", _e)
+                    try:
+                        idx_txt = self.tabs.indexOf(getattr(self, "_txt2img_qwen", None))
+                    except Exception:
+                        idx_txt = -1
+                    if idx_txt is not None and idx_txt >= 0:
+                        self.tabs.insertTab(idx_txt + 1, self.wan22, "TXT/IMG/VID to Video")
+                    else:
+                        self.tabs.addTab(self.wan22, "TXT/IMG/VID to Video")
+                except Exception as _attach_e:
+                    try:
+                        self.tabs.addTab(self.wan22, "TXT/IMG/VID to Video")
+                    except Exception as _e2:
+                        print("[framevision] WAN22 tab attach failed:", _e2)
+            except Exception as _e:
+                print("[framevision] WAN22 init failed:", _e)
         # <<< FRAMEVISION_WAN22_INIT_END
 
         # >>> FRAMEVISION_QWEN2511_INIT_BEGIN
         try:
-            if 'Qwen2511Pane' in globals() and Qwen2511Pane is not None:
-                try:
-                    self.qwen2511 = Qwen2511Pane(self)
-                except Exception as _e:
-                    # If the pane itself raises, show a friendly error tab instead of hiding it.
-                    print("[framevision] Qwen2511 init failed in pane constructor:", _e)
+            _hid = getattr(self, '_optional_hidden_ids', set()) or set()
+            _qwen_hidden = ('qwen_edit_2511' in _hid)
+        except Exception:
+            _qwen_hidden = False
+
+        if _qwen_hidden:
+            try:
+                self.qwen2511 = None
+            except Exception:
+                pass
+        else:
+            try:
+                if 'Qwen2511Pane' in globals() and Qwen2511Pane is not None:
+                    try:
+                        self.qwen2511 = Qwen2511Pane(self)
+                    except Exception as _e:
+                        # If the pane itself raises, show a friendly error tab instead of hiding it.
+                        print("[framevision] Qwen2511 init failed in pane constructor:", _e)
+                        err = QWidget(self)
+                        lay = QVBoxLayout(err)
+                        lab = QLabel(f"Qwen2511 failed to load:\n{_e}", err)
+                        lab.setWordWrap(True)
+                        lay.addWidget(lab)
+                        self.qwen2511 = err
+                else:
+                    # Module imported but no usable pane class, or import failed completely.
                     err = QWidget(self)
                     lay = QVBoxLayout(err)
-                    lab = QLabel(f"Qwen2511 failed to load:\n{_e}", err)
+                    txt = (
+                        "Qwen2511 module not found or no Qwen2511Pane class defined.\n"
+                        "Make sure helpers/qwen2511.py defines a QWidget subclass named 'Qwen2511Pane'."
+                    )
+                    lab = QLabel(txt, err)
                     lab.setWordWrap(True)
                     lay.addWidget(lab)
                     self.qwen2511 = err
-            else:
-                # Module imported but no usable pane class, or import failed completely.
-                err = QWidget(self)
-                lay = QVBoxLayout(err)
-                txt = (
-                    "Qwen2511 module not found or no Qwen2511Pane class defined.\n"
-                    "Make sure helpers/qwen2511.py defines a QWidget subclass named 'Qwen2511Pane'."
-                )
-                lab = QLabel(txt, err)
-                lab.setWordWrap(True)
-                lay.addWidget(lab)
-                self.qwen2511 = err
 
-            # Give the pane a reference to the main window (enables Media Explorer + internal player helpers).
-            try:
-                setattr(self.qwen2511, 'main', self)
-            except Exception:
-                pass
-
-            # Stable internal id (avoid depending on tab label text).
-            try:
-                if getattr(self, 'qwen2511', None) is not None:
-                    if not str(getattr(self.qwen2511, 'objectName', lambda: '')() or ''):
-                        self.qwen2511.setObjectName('tab_qwen2511')
-            except Exception:
-                pass
-
-            # Insert Qwen2511 tab just after WAN 2.2 if present; otherwise after TXT to IMG; otherwise append.
-            try:
-                idx_wan = -1
+                # Give the pane a reference to the main window (enables Media Explorer + internal player helpers).
                 try:
-                    idx_wan = self.tabs.indexOf(getattr(self, 'wan22', None))
+                    setattr(self.qwen2511, 'main', self)
                 except Exception:
-                    idx_wan = -1
+                    pass
 
-                if idx_wan is not None and idx_wan >= 0:
-                    self.tabs.insertTab(idx_wan + 1, self.qwen2511, 'Qwen Edit  2511')
-                else:
-                    idx_txt = -1
-                    try:
-                        idx_txt = self.tabs.indexOf(getattr(self, '_txt2img_qwen', None))
-                    except Exception:
-                        idx_txt = -1
-                    if idx_txt is not None and idx_txt >= 0:
-                        self.tabs.insertTab(idx_txt + 1, self.qwen2511, 'Qwen Edit  2511')
-                    else:
-                        self.tabs.addTab(self.qwen2511, 'Qwen Edit  2511')
-            except Exception as _attach_e:
+                # Stable internal id (avoid depending on tab label text).
                 try:
-                    self.tabs.addTab(self.qwen2511, 'Qwen Edit  2511')
-                except Exception as _e2:
-                    print('[framevision] Qwen2511 tab attach failed:', _e2)
-        except Exception as _e:
-            print('[framevision] Qwen2511 init failed:', _e)
+                    if getattr(self, 'qwen2511', None) is not None:
+                        if not str(getattr(self.qwen2511, 'objectName', lambda: '')() or ''):
+                            self.qwen2511.setObjectName('tab_qwen2511')
+                except Exception:
+                    pass
+
+                # Insert Qwen2511 tab just after WAN 2.2 if present; otherwise after TXT to IMG; otherwise append.
+                try:
+                    idx_wan = -1
+                    try:
+                        idx_wan = self.tabs.indexOf(getattr(self, 'wan22', None))
+                    except Exception:
+                        idx_wan = -1
+
+                    if idx_wan is not None and idx_wan >= 0:
+                        self.tabs.insertTab(idx_wan + 1, self.qwen2511, 'Qwen Edit  2511')
+                    else:
+                        idx_txt = -1
+                        try:
+                            idx_txt = self.tabs.indexOf(getattr(self, '_txt2img_qwen', None))
+                        except Exception:
+                            idx_txt = -1
+                        if idx_txt is not None and idx_txt >= 0:
+                            self.tabs.insertTab(idx_txt + 1, self.qwen2511, 'Qwen Edit  2511')
+                        else:
+                            self.tabs.addTab(self.qwen2511, 'Qwen Edit  2511')
+                except Exception as _attach_e:
+                    try:
+                        self.tabs.addTab(self.qwen2511, 'Qwen Edit  2511')
+                    except Exception as _e2:
+                        print('[framevision] Qwen2511 tab attach failed:', _e2)
+            except Exception as _e:
+                print('[framevision] Qwen2511 init failed:', _e)
         # <<< FRAMEVISION_QWEN2511_INIT_END
 
 
@@ -5904,6 +5960,71 @@ class MainWindow(QMainWindow):
                 pass
 
 
+    def open_remove_optional_installs(self):
+        """Open the Remove/Hide manager UI (helpers.remove_hide)."""
+        try:
+            from helpers.remove_hide import RemoveHidePane, get_state_path
+        except Exception as _e:
+            try:
+                QMessageBox.warning(self, "Optional downloads", f"Remove/Hide tool not found: {_e}")
+            except Exception:
+                pass
+            return
+
+        try:
+            import os as _os
+            app_root = str(ROOT) if 'ROOT' in globals() else _os.getcwd()
+        except Exception:
+            app_root = os.getcwd() if 'os' in globals() else '.'
+
+        try:
+            state_path = get_state_path("FrameVision")
+        except Exception:
+            state_path = None
+
+        try:
+            win = getattr(self, "_remove_hide_win", None)
+        except Exception:
+            win = None
+
+        try:
+            if win is None:
+                win = QMainWindow(self)
+                try:
+                    win.setWindowTitle("Remove / Hide Optional Installs")
+                except Exception:
+                    pass
+                try:
+                    win.resize(1000, 750)
+                except Exception:
+                    pass
+                try:
+                    pane = RemoveHidePane(app_root=app_root, state_path=state_path)
+                    win.setCentralWidget(pane)
+                except Exception as _e:
+                    try:
+                        QMessageBox.warning(self, "Optional downloads", f"Failed to build Remove/Hide UI: {_e}")
+                    except Exception:
+                        pass
+                    return
+                try:
+                    self._remove_hide_win = win
+                except Exception:
+                    pass
+
+            try:
+                win.show()
+                win.raise_()
+                win.activateWindow()
+            except Exception:
+                pass
+        except Exception as _e:
+            try:
+                QMessageBox.warning(self, "Optional downloads", f"Failed to open Remove optional installs: {_e}")
+            except Exception:
+                pass
+
+
     def _install_optional_downloads_menu(self):
         """Add/ensure the 'Optional downloads' menu exists in the menubar."""
         try:
@@ -5928,22 +6049,28 @@ class MainWindow(QMainWindow):
             if opt_menu is None:
                 opt_menu = mb.addMenu("Optional downloads")
 
-            # Avoid duplicate entries
+            # Avoid duplicate entries (allow adding new items over time)
+            has_open = False
+            has_remove = False
             for a in opt_menu.actions():
                 try:
-                    if _norm(a.text()) == _norm("Open optional installs..."):
-                        # Still make sure ordering is correct
-                        try:
-                            self._start_optional_downloads_menu_reorder()
-                        except Exception:
-                            pass
-                        return
+                    t = _norm(a.text())
                 except Exception:
                     continue
+                if t == _norm("Open optional installs..."):
+                    has_open = True
+                if t == _norm("Remove optional installs") or t == _norm("Remove optional installs..."):
+                    has_remove = True
 
-            a_open = QAction("Open optional installs...", self)
-            a_open.triggered.connect(self.open_optional_downloads)
-            opt_menu.addAction(a_open)
+            if not has_open:
+                a_open = QAction("Open optional installs...", self)
+                a_open.triggered.connect(self.open_optional_downloads)
+                opt_menu.addAction(a_open)
+
+            if not has_remove:
+                a_rm = QAction("Remove / Hide optional installs", self)
+                a_rm.triggered.connect(self.open_remove_optional_installs)
+                opt_menu.addAction(a_rm)
 
             # Ensure top-level menu order: File | Info | Optional downloads
             try:

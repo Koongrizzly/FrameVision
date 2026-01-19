@@ -351,6 +351,21 @@ class HeartMuLaUI(QWidget):
         self.setWindowTitle("HeartMuLa (offline) – Music Generator")
         self.setMinimumWidth(920)
 
+        # Put spinbox/combobox arrows on the LEFT so controls stay usable on small widths.
+        self.setStyleSheet(
+            (self.styleSheet() or "")
+            + """
+/* HeartMuLa: left-side steppers & dropdown arrows for small screens */
+QAbstractSpinBox { padding-left: 26px; padding-right: 6px; }
+QAbstractSpinBox::up-button { subcontrol-origin: border; subcontrol-position: top left; width: 22px; }
+QAbstractSpinBox::down-button { subcontrol-origin: border; subcontrol-position: bottom left; width: 22px; }
+QAbstractSpinBox::up-arrow, QAbstractSpinBox::down-arrow { width: 8px; height: 8px; }
+QComboBox { padding-left: 24px; padding-right: 6px; }
+QComboBox::drop-down { subcontrol-origin: padding; subcontrol-position: top left; width: 22px; }
+QComboBox::down-arrow { width: 8px; height: 8px; }
+"""
+        )
+
         self.settings_path = _settings_path()
         self.settings = MulaSettings.load(self.settings_path)
 
@@ -384,18 +399,33 @@ class HeartMuLaUI(QWidget):
         self.topk = QSpinBox()
         self.topk.setRange(1, 200)
         self.topk.setValue(int(self.settings.topk))
+        self.topk.setToolTip(
+            "Top-k: how many candidate tokens it samples from. Default 50. "
+            "Try 30–60 for safer/more consistent results. "
+            "Try 80–150 for more novelty (but can get weirder)."
+        )
 
         self.temperature = QDoubleSpinBox()
         self.temperature.setRange(0.1, 3.0)
         self.temperature.setSingleStep(0.05)
         self.temperature.setDecimals(2)
         self.temperature.setValue(float(self.settings.temperature))
+        self.temperature.setToolTip(
+            "Temperature: randomness. Default 1.0. "
+            "Try 0.7–0.95 for more stable/coherent outputs. "
+            "Try 1.05–1.25 for more variety."
+        )
 
         self.cfg_scale = QDoubleSpinBox()
         self.cfg_scale.setRange(0.0, 10.0)
         self.cfg_scale.setSingleStep(0.1)
         self.cfg_scale.setDecimals(2)
         self.cfg_scale.setValue(float(self.settings.cfg_scale))
+        self.cfg_scale.setToolTip(
+            "CFG scale: how strongly it follows your conditioning (tags/lyrics). Default is 1.5. "
+            "Try 2.0–3.0 if it keeps drifting. "
+            "Try 1.0–1.5 if it feels too rigid/repetitive or artifacts increase."
+        )
 
         self.output_dir = QLineEdit(self.settings.output_dir)
         self.btn_browse_out = QPushButton("Browse…")
@@ -414,7 +444,7 @@ class HeartMuLaUI(QWidget):
         self.genre_combo = QComboBox()
         self.preset_combo = QComboBox()
         self.btn_preset_add = QPushButton("Add")
-        self.btn_preset_remove = QPushButton("Remove")
+        self.btn_preset_remove = QPushButton("Delete")
 
         self.genre_combo.currentIndexChanged.connect(self._on_genre_changed)
         self.preset_combo.currentIndexChanged.connect(self._on_preset_changed)
@@ -445,8 +475,8 @@ class HeartMuLaUI(QWidget):
         form = QFormLayout(cfg)
 
         row_model = QHBoxLayout()
-        row_model.addWidget(self.model_path, 1)
         row_model.addWidget(self.btn_browse_model)
+        row_model.addWidget(self.model_path, 1)
         form.addRow("Model folder", row_model)
 
         form.addRow("Model version", self.version)
@@ -456,8 +486,8 @@ class HeartMuLaUI(QWidget):
         form.addRow("CFG scale", self.cfg_scale)
 
         row_out = QHBoxLayout()
-        row_out.addWidget(self.output_dir, 1)
         row_out.addWidget(self.btn_browse_out)
+        row_out.addWidget(self.output_dir, 1)
         form.addRow("Output folder", row_out)
 
         form.addRow("Output filename", self.output_name)
@@ -482,9 +512,9 @@ class HeartMuLaUI(QWidget):
         presets_form.addRow("Genre", self.genre_combo)
 
         row_p = QHBoxLayout()
-        row_p.addWidget(self.preset_combo, 1)
         row_p.addWidget(self.btn_preset_add)
         row_p.addWidget(self.btn_preset_remove)
+        row_p.addWidget(self.preset_combo, 1)
         presets_form.addRow("Preset", row_p)
 
         main.addWidget(presets_box)

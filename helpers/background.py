@@ -31,6 +31,57 @@ from PySide6 import QtCore, QtGui, QtWidgets
 
 
 # -------------------------
+# Optional-installs hide state (remove_hide)
+# -------------------------
+
+def _remove_hide_state_path() -> str:
+    """Match helpers/remove_hide.py storage location (AppDataLocation)."""
+    try:
+        env_dir = os.environ.get("FRAMEVISION_STATE_DIR", "").strip()
+        if env_dir:
+            try:
+                os.makedirs(env_dir, exist_ok=True)
+            except Exception:
+                pass
+            return str(Path(env_dir) / "remove_hide_state.json")
+    except Exception:
+        pass
+
+    try:
+        base = QtCore.QStandardPaths.writableLocation(QtCore.QStandardPaths.AppDataLocation)
+        if base:
+            try:
+                os.makedirs(base, exist_ok=True)
+            except Exception:
+                pass
+            return str(Path(base) / "remove_hide_state.json")
+    except Exception:
+        pass
+
+    # Fallback: project root
+    try:
+        return str(_project_root() / "remove_hide_state.json")
+    except Exception:
+        return os.path.abspath("remove_hide_state.json")
+
+
+def _hidden_ids() -> set:
+    """Return hidden ids set; best-effort (never raises)."""
+    sp = _remove_hide_state_path()
+    try:
+        if not os.path.exists(sp):
+            return set()
+        raw = Path(sp).read_text(encoding="utf-8", errors="replace")
+        data = json.loads(raw) if raw.strip() else {}
+        ids = data.get("hidden_ids", []) if isinstance(data, dict) else []
+        if not isinstance(ids, list):
+            return set()
+        return set(str(x) for x in ids)
+    except Exception:
+        return set()
+
+
+# -------------------------
 # Paths / Settings
 # -------------------------
 
@@ -2642,7 +2693,8 @@ def install_background_tool(pane, section_widget) -> None:
     tabs.setObjectName("BackgroundToolTabs")
 
     bg_pane = BgRemovePane(tabs)
-    inpaint_pane = _create_sdxl_inpaint_pane(tabs)
+    _hide_inpaint = ("sdxl_inpaint" in _hidden_ids())
+    inpaint_pane = None if _hide_inpaint else _create_sdxl_inpaint_pane(tabs)
 
     # Tools-tab "Remember settings" uses a generic snapshot/restore that can accidentally
     # shuffle values across unrelated widgets when layouts change. These panes have their
@@ -2657,11 +2709,12 @@ def install_background_tool(pane, section_widget) -> None:
 
 
     tabs.addTab(bg_pane, "Background Removal")
-    if inpaint_pane is not None:
-        tabs.addTab(inpaint_pane, "SDXL (Low Vram) Inpainter")
-    else:
-        # Should not happen, but keep tool usable.
-        tabs.addTab(_QtW.QLabel("Inpaint tab unavailable (PySide6 not loaded)."), "Inpaint")
+    if not _hide_inpaint:
+        if inpaint_pane is not None:
+            tabs.addTab(inpaint_pane, "SDXL (Low Vram) Inpainter")
+        else:
+            # Should not happen, but keep tool usable.
+            tabs.addTab(_QtW.QLabel("Inpaint tab unavailable (PySide6 not loaded)."), "Inpaint")
 
 
     # Inject "Use current" + "View results" buttons into the removal pane's top bar.
@@ -2854,13 +2907,15 @@ class BgRemoveWindow(QtWidgets.QMainWindow):
 
         self.tabs = QtWidgets.QTabWidget(self)
         self.pane = BgRemovePane(self.tabs)  # keep .pane for existing menu actions
-        self.inpaint = _create_sdxl_inpaint_pane(self.tabs)
+        self._hide_inpaint = ("sdxl_inpaint" in _hidden_ids())
+        self.inpaint = None if self._hide_inpaint else _create_sdxl_inpaint_pane(self.tabs)
 
         self.tabs.addTab(self.pane, "Removal")
-        if self.inpaint is not None:
-            self.tabs.addTab(self.inpaint, "Inpaint")
-        else:
-            self.tabs.addTab(QtWidgets.QLabel("Inpaint tab unavailable."), "Inpaint")
+        if not self._hide_inpaint:
+            if self.inpaint is not None:
+                self.tabs.addTab(self.inpaint, "Inpaint")
+            else:
+                self.tabs.addTab(QtWidgets.QLabel("Inpaint tab unavailable."), "Inpaint")
 
         self.setCentralWidget(self.tabs)
 

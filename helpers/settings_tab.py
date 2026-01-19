@@ -1929,6 +1929,132 @@ def _banner_apply_gradient(root: QWidget, enabled: bool, speed: int = 20) -> Non
     except Exception:
         pass
 
+# --- Fancy banner startup sync --------------------------------------------------
+
+def _banner_apply_from_qsettings(root: QWidget) -> bool:
+    """Apply banner settings from QSettings to all *Banner labels.
+
+    This is intentionally safe + idempotent so it can run during startup even
+    when the Settings tab UI has never been opened.
+
+    Returns True if at least one banner was found/applied.
+    """
+    try:
+        s = QSettings("FrameVision", "FrameVision")
+        enabled = bool(s.value("banner_enabled", True, type=bool))
+        colored = bool(s.value("banner_colored", True, type=bool))
+        grad_en = bool(s.value("banner_gradient_enabled", False, type=bool))
+        speed = int(s.value("banner_gradient_speed", 20, type=int) or 20)
+        if speed < 1:
+            speed = 1
+        if speed > 50:
+            speed = 50
+    except Exception:
+        enabled, colored, grad_en, speed = True, True, False, 20
+
+    # Capture the *current* banner stylesheet as "orig" before we mutate it.
+    found = False
+    try:
+        for lab in _banner__iter_banners(root):
+            found = True
+            try:
+                cur = lab.styleSheet() or ""
+                orig = lab.property("fv_banner_orig_style")
+                if orig is None or not str(orig).strip():
+                    lab.setProperty("fv_banner_orig_style", cur)
+            except Exception:
+                pass
+    except Exception:
+        pass
+
+    if not found:
+        return False
+
+    # Apply state.
+    try:
+        _banner_apply_visibility(root, bool(enabled))
+    except Exception:
+        pass
+
+    # Gradient overrides colored/grey.
+    try:
+        if not bool(enabled):
+            _banner_apply_gradient(root, False, int(speed))
+            return True
+
+        if bool(grad_en):
+            _banner_apply_gradient(root, True, int(speed))
+        else:
+            _banner_apply_gradient(root, False, int(speed))
+            _banner_apply_colored(root, bool(colored))
+    except Exception:
+        pass
+
+    return True
+
+
+def _banner_install_startup_sync() -> None:
+    """Apply banner settings shortly after the UI exists.
+
+    Fixes the case where banner preferences only "stick" after the Settings tab
+    is opened (because the Options group is lazily built).
+    """
+    try:
+        app = QtWidgets.QApplication.instance()
+        if app is None:
+            return
+
+        state = {"tries": 0, "done": False}
+
+        def _pick_main_window():
+            try:
+                wins = list(app.topLevelWidgets())
+            except Exception:
+                wins = []
+            for w in wins:
+                if not isinstance(w, QWidget):
+                    continue
+                try:
+                    tabs = w.findChild(QTabWidget, "main_tabs") or getattr(w, "tabs", None)
+                except Exception:
+                    tabs = None
+                if isinstance(tabs, QTabWidget):
+                    return w
+            # fallback: any widget with banners
+            for w in wins:
+                if not isinstance(w, QWidget):
+                    continue
+                try:
+                    for _ in _banner__iter_banners(w):
+                        return w
+                except Exception:
+                    pass
+            return None
+
+        def _tick():
+            if state["done"]:
+                return
+            state["tries"] += 1
+
+            win = _pick_main_window()
+            if win is not None:
+                try:
+                    if _banner_apply_from_qsettings(win):
+                        state["done"] = True
+                        return
+                except Exception:
+                    pass
+
+            # keep trying briefly; banners may be created a few frames later
+            if state["tries"] < 80:
+                QTimer.singleShot(75, _tick)
+
+        # kick once the event loop starts
+        QTimer.singleShot(0, _tick)
+    except Exception:
+        pass
+
+
 
 # === Emoji Labels (single-file implementation) ===========================================
 # Borderless emoji set & mappers (no boxed symbols). Replaces tab titles with emoji-only

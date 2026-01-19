@@ -1291,6 +1291,69 @@ class Txt2ImgPane(QWidget):
             self.engine_combo.addItem("Z-Image Turbo")
             self.engine_combo.addItem("Z-Image Turbo (GGUF Low VRAM)")
             self.engine_combo.addItem("qwen 2.5 12B GGUF (Low VRAM)")
+
+
+        # Optional installs hide wiring (remove_hide.py state)
+        # If the user hid an optional engine entry, remove it from the engine list.
+        try:
+            try:
+                from helpers import remove_hide as _rh  # type: ignore
+            except Exception:
+                import remove_hide as _rh  # type: ignore
+        except Exception:
+            _rh = None  # type: ignore
+
+        try:
+            if _rh is not None:
+                _st = _rh.load_state(_rh.get_state_path())
+                _hidden = set([str(x) for x in (_st.get("hidden_ids") or [])])
+                _hide_map = {
+                    "sdxl_txt2img": "diffusers",
+                    "zimage_turbo_fp16": "zimage",
+                    "zimage_turbo_gguf": "zimage_gguf",
+                    "qwen_image_2512": "qwen2512",
+                }
+                _hide_keys = set()
+                for _hid, _ek in _hide_map.items():
+                    if _hid in _hidden:
+                        _hide_keys.add(_ek)
+
+                if _hide_keys:
+                    for _i in range(self.engine_combo.count() - 1, -1, -1):
+                        try:
+                            _data = self.engine_combo.itemData(_i)
+                        except Exception:
+                            _data = None
+                        try:
+                            _d = (str(_data).strip().lower() if _data is not None else "")
+                        except Exception:
+                            _d = ""
+                        if not _d:
+                            try:
+                                _d = (self.engine_combo.itemText(_i) or "").lower()
+                            except Exception:
+                                _d = ""
+                        if _d in _hide_keys:
+                            try:
+                                self.engine_combo.removeItem(_i)
+                            except Exception:
+                                pass
+
+                # If everything is hidden, leave a disabled placeholder.
+                if self.engine_combo.count() <= 0:
+                    try:
+                        self.engine_combo.addItem("All engines hidden by user", "none")
+                    except Exception:
+                        try:
+                            self.engine_combo.addItem("All engines hidden by user")
+                        except Exception:
+                            pass
+                    try:
+                        self.engine_combo.setEnabled(False)
+                    except Exception:
+                        pass
+        except Exception:
+            pass
         self.engine_label = QLabel("Engine:")
         engine_row.addWidget(self.engine_label)
         engine_row.addWidget(self.engine_combo, 1)
