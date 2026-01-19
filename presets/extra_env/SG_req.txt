@@ -1,0 +1,18 @@
+# Minimal, Windows-friendly deps for Tencent SongGeneration (LeVo)
+# NOTE: Python 3.11 requires newer hydra-core (older versions can trigger a dataclasses ValueError).
+numpy
+omegaconf>=2.3.0
+pyyaml
+tqdm
+einops
+sentencepiece
+transformers
+accelerate
+safetensors
+huggingface_hub
+hf_transfer
+soundfile
+librosa
+scipy
+regex
+hydra-core>=1.3.2
