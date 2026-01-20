@@ -391,11 +391,6 @@ class UpscPane(QtWidgets.QWidget):
         self.chk_video_thumbs.setToolTip("Generate first-frame thumbnails for videos. Uses more CPU/RAM. Disabled while jobs run.")
         prefs_grid.addWidget(self.chk_video_thumbs, 0, 2, 1, 2)
 
-        self.chk_auto_compare = QtWidgets.QCheckBox("Compare before / after", self)
-        self.chk_auto_compare.setChecked(False)
-        self.chk_auto_compare.setToolTip("Automatically open a before/after comparison when the job finishes.")
-        prefs_grid.addWidget(self.chk_auto_compare, 0, 0, 1, 2)
-
         self.chk_streaming_lowmem = getattr(self, "chk_streaming_lowmem", None) or QtWidgets.QCheckBox("Streaming (low memory)", self)
         self.chk_streaming_lowmem.setChecked(True)
         self.chk_streaming_lowmem.setToolTip("Process in a streaming, low-memory mode using smaller buffers. Good default for stability.")
@@ -904,7 +899,6 @@ class UpscPane(QtWidgets.QWidget):
             ("combo_model_w2x", "currentTextChanged"),
             ("combo_model_gfpgan", "currentTextChanged"),
             ("edit_outdir", "textChanged"),
-            ("chk_auto_compare", "toggled"),
             ("chk_play_internal", "toggled"),
             ("chk_replace_in_player", "toggled"),
             ("combo_vcodec", "currentTextChanged"),
@@ -973,8 +967,6 @@ class UpscPane(QtWidgets.QWidget):
         try: d["model_gfpgan"] = getattr(self, "combo_model_gfpgan", None).currentText() if getattr(self, "combo_model_gfpgan", None) else ""
         except Exception: pass
         try: d["outdir"] = self.edit_outdir.text().strip()
-        except Exception: pass
-        try: d["auto_compare"] = bool(getattr(self, "chk_auto_compare", None).isChecked()) if getattr(self, "chk_auto_compare", None) else False
         except Exception: pass
         try:
             d["play_internal"] = bool(self.chk_play_internal.isChecked())
@@ -1093,11 +1085,6 @@ class UpscPane(QtWidgets.QWidget):
         try:
             out = d.get("outdir")
             if out: self.edit_outdir.setText(out)
-        except Exception:
-            pass
-        try:
-            if getattr(self, "chk_auto_compare", None) is not None:
-                self.chk_auto_compare.setChecked(bool(d.get("auto_compare", False)))
         except Exception:
             pass
         try:
@@ -2302,32 +2289,6 @@ def _fv_call_enqueue(self, enq, where_label, cmds, open_on_success):
 
     # Else, fallback to job dicts (one per command)
     for i, c in enumerate(cmds, 1):
-        ac = False
-        try:
-            ac = bool(getattr(self, "chk_auto_compare", None).isChecked()) if getattr(self, "chk_auto_compare", None) else False
-        except Exception:
-            ac = False
-        left_path = input_path or ""
-        right_path = ""
-        if isinstance(c, list):
-            try:
-                if "-i" in c:
-                    idx = c.index("-i")
-                    if idx + 1 < len(c):
-                        lp = str(c[idx + 1]).strip()
-                        if lp:
-                            left_path = lp
-            except Exception:
-                pass
-            try:
-                if "-o" in c:
-                    idx = c.index("-o")
-                    if idx + 1 < len(c):
-                        rp = str(c[idx + 1]).strip()
-                        if rp:
-                            right_path = rp
-            except Exception:
-                pass
         job = {
             "name": "Upscale" if len(cmds) == 1 else f"Upscale ({i}/{len(cmds)})",
             "category": "upscale",
@@ -2335,9 +2296,6 @@ def _fv_call_enqueue(self, enq, where_label, cmds, open_on_success):
             "cwd": str(globals().get("ROOT", ".")),
             "open_on_success": bool(open_on_success and i == len(cmds)),
             "output": str(getattr(self, "_last_outfile", "")),
-            "auto_compare": ac,
-            "auto_compare_left": left_path,
-            "auto_compare_right": right_path,
         }
         try:
             enq(job)
