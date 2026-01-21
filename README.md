@@ -8,6 +8,20 @@ Video Walktrough (most is speedup x2 to show much in less time)
 
 ---
 <details>
+  <summary>Januari 19, 2026. V2.2.1 small update adds HeartMula Music creation</summary>
+  - HeartMula
+  Create music offline
+  Good for vocal pop, rock, R&B (and more genres)
+  Good sound quality with default settings
+  Create up to 4 minutes of music in minutes
+  
+UI Improvements
+  Optional Installs: Remove / Hide manager
+  Quickly remove installed/unused models / repos / environments
+  Options: Delete, Hide, or both
+  Detailed info per model: paths (folders/files), size on disk, etc.
+</details>
+<details>
   <summary>Januari 17, 2026. V2.2 update adds qwen2511 & 2512</summary>
   New Features
 
