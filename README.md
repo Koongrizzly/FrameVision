@@ -302,11 +302,11 @@ FrameVision feature list
 ### 🧪 Upscaler with model loader (15+ open source upscale models for photo & video)
 ### ⏱️ RIFE Interpolation
 ### 📝 Describe in detail with Qwen3 VL 2B
-### 🖌️ TXT → IMG (SD15/SDXL/Z-Image fp16/gguf q4-q8)
+### 🖌️ TXT → IMG (SD15/SDXL/Z-Image/Qwen 2512 fp16/gguf q4-q8)
 ### 🎬 txt/img/video to video with WAN 2.2 5B and/or HunyuanVideo 1.5 (video extender included)
 ### 🎵 Ace Music creation
 ### 📁 Media Explorer
-### 🖌 Remove Background + basic (sd15) inpainting
+### 🖌 Remove Background + basic (sdXL) inpainting + Qwen edit 2511
 ### 👽 Ask Framie, little offline chatbot, works with Qwen3VL 2B
 ### ⏳ Batch tools for almost all tools
 ### 📋 Advanced Queue with seperate worker for most tools
