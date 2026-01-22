@@ -17,7 +17,7 @@ Video Walktrough (most is speedup x2 to show much in less time)
     - Create up to 4 minutes of music in minutes
 - UI Improvements
 
-    - Optional Installs: Remove / Hide manager
+  - Optional Installs: Remove / Hide manager
     - Quickly remove installed/unused models / repos / environments
     - Options: Delete, Hide, or both
     - Detailed info per model: paths (folders/files), size on disk, etc.
