@@ -314,14 +314,16 @@ _Metadata Tool_ – edit or delete metadata from videos and images (with batch s
 ---
 FrameVision feature list
 ---
-### 🎵 (music) videoclip creator
+### 🖌️ TXT → IMG (SD15/SDXL/Z-Image/Qwen 2512 fp16/gguf q4-q8)
+### 🎬 txt/img/video to video with WAN 2.2 5B and/or HunyuanVideo 1.5 (video extender included for direct runs)
 ### 🧪 Upscaler with model loader (15+ open source upscale models for photo & video)
 ### ⏱️ RIFE Interpolation
-### 📝 Describe in detail with Qwen3 VL 2B
-### 🖌️ TXT → IMG (SD15/SDXL/Z-Image/Qwen 2512 fp16/gguf q4-q8)
-### 🎬 txt/img/video to video with WAN 2.2 5B and/or HunyuanVideo 1.5 (video extender included)
+### 📝 Describe in detail with Qwen3 VL
+### 🎙️ Text to speech with Qwen 3 (full model pack includes voice cloning and creating own style voices)
+### 🎵 (music) videoclip creator
 ### 🎵 Ace Music creation
-### 📁 Media Explorer
+### 🎵 HeartMula Music creation
+### 📁 Media Explorer with Json viewer
 ### 🖌 Remove Background + basic (sdXL) inpainting + Qwen edit 2511
 ### 👽 Ask Framie, little offline chatbot, works with Qwen3VL 2B
 ### ⏳ Batch tools for almost all tools
@@ -330,7 +332,7 @@ FrameVision feature list
 ### 🕹️ EASTER EGGS : use the app to unlock them
 ### 📺 in app resizable Multi media player
 ### 🎶 Music player with playlist & 250+ beat synced visuals
-### 🧰 Other Tools
+### 🧰 More Tools
 - Change speed for videos (with audio sync).
 - Prompt enhancer (Qwen3VL)
 - Reverse video / boomerang
@@ -342,9 +344,10 @@ FrameVision feature list
 - Extract/join frames
 - Trim videos with preview
 - Crop videos/images
+- Whisper voice to text with option to bake subtitles into video
 - Multi rename/replace filenames
 - Metadata/date editor/remover
-### All kinds of extra's i forgot to mention such as a file menu with recents/favorites/converter, many random 'open app' screens with visual overlays, 20+ themes, an in app updater (to latest stable release or to latest files on github), a huge Knowledge base with q&a etc etc.
+### All kinds of extra's i forgot to mention such as a file menu with recents/favorites/converter, license viewer, uninstaller, compare a/b, many random 'open app' screens with visual overlays, 25 themes, an in app updater (to latest stable release or to latest files on github), a huge Knowledge base with q&a etc etc.
 ---
 
 ## 🛠 Installation
