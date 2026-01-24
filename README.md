@@ -8,8 +8,24 @@ Video Walktrough (most is speedup x2 to show much in less time)
 
 ---
 <details>
-  <summary>Januari 19, 2026. V2.2.1 small update adds HeartMula Music creation</summary>
-- HeartMula
+  <summary>Januari 24, 2026. V2.2.2 small update adds Qwen3 Text to speech and Whisper speech to text</summary>
+
+Qwen 3 Text-to-Speech
+- Base
+- Custom voice (uses built-in speech models)
+- Clone voice (upload a sample to create cloned voices)
+- Voice design (create your own voice with prompts)
+
+Whisper
+- Voice → text (subtitles / transcript)
+- Burn subtitles directly into the video (hardcoded subtitles)
+- Multilingual speech recognition
+- Optional translation of transcript/subtitles to English  
+</details>
+  
+<details>
+  <summary>Januari 19, 2026. V2.2.1 small update adds HearMula Music creation</summary>
+- HearMula
   
     - Create music offline
     - Good for vocal pop, rock, R&B (and more genres)
