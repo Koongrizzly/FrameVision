@@ -24,8 +24,8 @@ Whisper
 </details>
   
 <details>
-  <summary>Januari 19, 2026. V2.2.1 small update adds HearMula Music creation</summary>
-- HearMula
+  <summary>Januari 19, 2026. V2.2.1 small update adds HeartMula Music creation</summary>
+- HeartMula
   
     - Create music offline
     - Good for vocal pop, rock, R&B (and more genres)
