@@ -220,6 +220,34 @@ def _run_mula_models(root: Path) -> Optional[Tuple[str, List[str], Path]]:
     return (str(py), ["-u", str(script)], root)
 
 
+
+
+
+
+def _run_whisper(root: Path) -> Optional[Tuple[str, List[str], Path]]:
+    """Install Whisper (Faster-Whisper) env + download default model."""
+    script = root / "presets" / "extra_env" / "whisper_install.bat"
+    if not script.exists():
+        return None
+    return _cmd_call_bat(script, root)
+
+def _run_qwen3tts(root: Path) -> Optional[Tuple[str, List[str], Path]]:
+    """Install Qwen3-TTS environment + base model(s)."""
+    script = root / "presets" / "extra_env" / "install_qwentts.bat"
+    if not script.exists():
+        return None
+    return _cmd_call_bat(script, root)
+
+
+def _run_qwen3tts_models(root: Path) -> Optional[Tuple[str, List[str], Path]]:
+    """Download extra Qwen3-TTS models (uses the existing Qwen3-TTS env)."""
+    script = root / "presets" / "extra_env" / "download_qwentts_models.bat"
+    if not script.exists():
+        return None
+    return _cmd_call_bat(script, root)
+
+
+
 def _run_qwen2512_env(root: Path) -> Optional[Tuple[str, List[str], Path]]:
     """
     Install the Qwen-Image-2512 GGUF environment.
@@ -405,6 +433,19 @@ def _default_installs() -> List[OptionalInstall]:
     # Titles/descriptions copied from install_menu.bat "extra options" page.
     return [
         OptionalInstall(
+            key="qwen3tts",
+            title="Qwen3-TTS-12Hz-1.7B-CustomVoice",
+            description="Qwen 3 Text to speech. Installs environment + Qwen TTS Custom Voice model.",
+            runner=_run_qwen3tts,
+        ),
+        OptionalInstall(
+            key="qwen3tts_models",
+            title="installs only Qwen TTS Custom Voice model. More models can be downloaded inside the tool.",
+            description="If the environment is missing, it will be installed first.",
+            runner=_run_qwen3tts_models,
+        ),
+
+        OptionalInstall(
             key="wan22",
             title="WAN 2.2 5B. Text/image/video to Video with extender",
             description="VRAM: 24GB recommended for 720p (offloading works with less, but very slow). Disk: +30GB.",
@@ -413,7 +454,7 @@ def _default_installs() -> List[OptionalInstall]:
         OptionalInstall(
             key="hunyuan15",
             title="HunyuanVideo 1.5, text/image/video to Video with extender",
-            description="VRAM: 16GB recommended for 480p. Distilled I2V 480p included; up to ~35GiB more for extra models.",
+            description="VRAM: 16GB recommended for 480p. Distilled I2V 480p included; More models can be downloaded inside the tool.",
             runner=_run_hunyuan15,
         ),
         OptionalInstall(
@@ -553,6 +594,12 @@ def _default_installs() -> List[OptionalInstall]:
             description="VRAM: optional (CPU works). Download <400MB; env uses ~5GiB disk.",
             runner=_run_gfpgan,
         ),
+        OptionalInstall(
+            key="whisper",
+            title="Whisper (voice to text / subtitles / transcript)",
+            description="Offline speech-to-text with Faster-Whisper. Runs on any PC. Installs environment + downloads the default model (~1.7 GB).",
+            runner=_run_whisper,
+        ),
                 OptionalInstall(
             key="bgrem_inpaint",
             title="Background remover and inpainter",
@@ -574,6 +621,8 @@ OptionalInstall(
 # These folders are safe to delete when re-installing an optional component:
 # they contain only the Python environment, not the downloaded model weights.
 _ENV_DIR_BY_KEY = {
+    "qwen3tts": Path("environments") / ".qwen3tts",
+    "whisper": Path("environments") / ".whisper",
     "ace": Path("presets") / "extra_env" / ".ace_env",
     "hunyuan15": Path(".hunyuan15_env"),
     "qwen2512": Path(".qwen2512") / "venv",
@@ -778,13 +827,16 @@ class OptionalInstallsDialog(QtWidgets.QDialog):
             is_qwen2511_extra = opt.key.startswith("qwen2511_")
             is_qwen_extra = is_qwen2512_extra or is_qwen2511_extra
             is_mula_extra = opt.key.startswith("mula_") and opt.key != "mula"
-            row = _OptionRow(opt, indent=(26 if (is_zimage_extra or is_qwen_extra or is_mula_extra) else 0))
+            is_qwen3tts_extra = opt.key.startswith("qwen3tts_") and opt.key != "qwen3tts"
+            row = _OptionRow(opt, indent=(26 if (is_zimage_extra or is_qwen_extra or is_mula_extra or is_qwen3tts_extra) else 0))
             if is_zimage_extra:
                 row.toggled.connect(lambda checked, k=opt.key: self._on_zimage_model_toggled(k, checked))
             if is_qwen2512_extra:
                 row.toggled.connect(lambda checked, k=opt.key: self._on_qwen2512_model_toggled(k, checked))
             if is_qwen2511_extra:
                 row.toggled.connect(lambda checked, k=opt.key: self._on_qwen2511_model_toggled(k, checked))
+            if is_qwen3tts_extra:
+                row.toggled.connect(lambda checked, k=opt.key: self._on_qwen3tts_model_toggled(k, checked))
             self.rows.append(row)
             row_by_key[opt.key] = row
             opts_lay.addWidget(row)
@@ -1209,6 +1261,25 @@ class OptionalInstallsDialog(QtWidgets.QDialog):
 
         self._toast("Qwen2511 GGUF model will download when you press Start (env install only needed once).")
 
+
+    def _on_qwen3tts_model_toggled(self, key: str, checked: bool) -> None:
+        """Warn when Qwen3-TTS model downloader prerequisites are missing."""
+        if not checked:
+            return
+
+        bat = self.root_dir / "presets" / "extra_env" / "download_qwentts_models.bat"
+        if not bat.exists():
+            self._toast("Missing downloader: download_qwentts_models.bat")
+            return
+
+        # Qwen3-TTS uses its own environment folder.
+        env_dir = (self.root_dir / "environments" / ".qwen3tts").resolve()
+        if not env_dir.exists():
+            self._toast("Qwen 3 TTS environment not found — it will be installed first.")
+
+        self._toast("Qwen 3 TTS models will download when you press Start (env install only needed once).")
+
+
     def selected_installs(self) -> List[OptionalInstall]:
         # Preserve install order from self.installs.
         checked_keys = [row.opt.key for row in self.rows if row.is_checked()]
@@ -1298,6 +1369,32 @@ class OptionalInstallsDialog(QtWidgets.QDialog):
         except Exception:
             pass
 
+
+        # Qwen3-TTS:
+        # If user selects the models-only downloader, ensure the Qwen3-TTS environment exists first.
+        self._auto_added_qwen3tts_env = False
+        try:
+            wants_qwen3tts_models = ("qwen3tts_models" in checked_set)
+            if wants_qwen3tts_models and ("qwen3tts" not in checked_set):
+                env_dir = (self.root_dir / "environments" / ".qwen3tts").resolve()
+                if not env_dir.exists():
+                    first_idx = None
+                    for i, opt in enumerate(ordered):
+                        if opt.key == "qwen3tts_models":
+                            first_idx = i
+                            break
+                    for opt in self.installs:
+                        if opt.key == "qwen3tts":
+                            if first_idx is None:
+                                ordered.insert(0, opt)
+                            else:
+                                ordered.insert(first_idx, opt)
+                            self._auto_added_qwen3tts_env = True
+                            break
+        except Exception:
+            pass
+
+
         #  install the env first.
         # This is silent: we only auto-add the env step when it is missing, so no "existing env"
         # prompt will appear.
@@ -1382,6 +1479,9 @@ class OptionalInstallsDialog(QtWidgets.QDialog):
         if getattr(self, "_auto_added_sdxl_inpaint_env", False):
             self._append_line("[INFO] Background remover + inpainter selected — running SDXL inpaint env install first.")
 
+        if getattr(self, "_auto_added_qwen3tts_env", False):
+            self._append_line("[INFO] Qwen3-TTS env not found — installing it first because you selected extra model downloads.")
+
         if getattr(self, "_auto_added_mula_env", False):
             self._append_line("[INFO] HearMula env not found — installing it first because you selected the models-only download.")
 
@@ -1456,6 +1556,18 @@ class OptionalInstallsDialog(QtWidgets.QDialog):
             self._running = None
             self._run_next()
             return
+
+        # Special case:
+        # Whisper installer always recreates the env; if the user chooses to keep an existing env,
+        # we should skip running whisper_install.bat to avoid deleting it again.
+        if decision == "keep" and self._running.key == "whisper":
+            self._append_line("[INFO] Skipping Whisper install (keeping existing env).")
+            self._toast("Whisper env kept. Skipping reinstall.")
+            self.progress.setValue(idx_done + 1)
+            self._running = None
+            self._run_next()
+            return
+
 
         program, args, cwd = cmd
 

@@ -135,6 +135,8 @@ DEFAULT_LORA_DIR = os.path.join(APP_ROOT, "models", "lora", "qwen2511")
 OUTPUT_DIR = os.path.join(APP_ROOT, "output", "qwen2511")
 
 
+
+TMP_INPUT_DIR = os.path.join(APP_ROOT, "jobs", "_tmp_inputs")
 def _ensure_dir(p: str) -> None:
     os.makedirs(p, exist_ok=True)
 
@@ -690,6 +692,9 @@ class Qwen2511Pane(QtWidgets.QWidget):
         self._proc_kind: str = ""
         self._proc_buf: str = ""
         self._proc_expected_out: Optional[str] = None
+
+        # Temp files we may want to delete after sd-cli finishes (e.g. blank canvas)
+        self._tmp_files_to_cleanup: List[str] = []
 
         # Lightweight toast notifications (non-blocking).
         self._toast_label: Optional[QtWidgets.QLabel] = None
@@ -3264,6 +3269,22 @@ class Qwen2511Pane(QtWidgets.QWidget):
             else:
                 self._append_log("Output file not found at expected path. If it crashed, check logs above.")
 
+        # Clean up any temp inputs we created (e.g. blank canvas). Never touch user files.
+        try:
+            tmp_list = list(getattr(self, "_tmp_files_to_cleanup", []) or [])
+            for p in tmp_list:
+                try:
+                    if p and os.path.isfile(p):
+                        os.remove(p)
+                except Exception:
+                    pass
+            try:
+                self._tmp_files_to_cleanup = []
+            except Exception:
+                pass
+        except Exception:
+            pass
+
         self._cleanup_process_ui()
     def _cleanup_process_ui(self):
         kind = self._proc_kind or "process"
@@ -3353,9 +3374,9 @@ class Qwen2511Pane(QtWidgets.QWidget):
                         if (not use_scene_q) or (not init_q):
                             if not ref_q:
                                 raise Exception('No scene image and no reference images. Load at least 1 ref image (or pick a scene image).')
-                            _ensure_dir(OUTPUT_DIR)
+                            _ensure_dir(TMP_INPUT_DIR)
                             tsq = int(time.time())
-                            blank_scene = os.path.join(OUTPUT_DIR, f"_blank_scene_{tsq}.png")
+                            blank_scene = os.path.join(TMP_INPUT_DIR, f"_blank_scene_{tsq}_{os.getpid()}.png")
                             _write_blank_png(blank_scene, int(self.sp_w.value()), int(self.sp_h.value()), rgba=(255, 255, 255, 255))
                             _restore_scene_path = init_q
                             _restore_use_scene = use_scene_q
@@ -3493,10 +3514,15 @@ class Qwen2511Pane(QtWidgets.QWidget):
 
         if not use_scene:
             try:
-                blank_scene = os.path.join(OUTPUT_DIR, f"_blank_scene_{ts}.png")
+                _ensure_dir(TMP_INPUT_DIR)
+                blank_scene = os.path.join(TMP_INPUT_DIR, f"_blank_scene_{ts}_{os.getpid()}.png")
                 _write_blank_png(blank_scene, int(self.sp_w.value()), int(self.sp_h.value()), rgba=(255, 255, 255, 255))
                 init_img = blank_scene
                 self._append_log(f"\nScene disabled: using blank canvas -> {blank_scene}")
+                try:
+                    self._tmp_files_to_cleanup.append(blank_scene)
+                except Exception:
+                    pass
             except Exception as e:
                 self._append_log(f"\nERROR: Failed to create blank scene image: {e}")
                 return
@@ -3785,9 +3811,9 @@ def _on_use_mask_toggled(self, checked: bool, persist: bool = True):
                         if (not use_scene_q) or (not init_q):
                             if not ref_q:
                                 raise Exception('No scene image and no reference images. Load at least 1 ref image (or pick a scene image).')
-                            _ensure_dir(OUTPUT_DIR)
+                            _ensure_dir(TMP_INPUT_DIR)
                             tsq = int(time.time())
-                            blank_scene = os.path.join(OUTPUT_DIR, f"_blank_scene_{tsq}.png")
+                            blank_scene = os.path.join(TMP_INPUT_DIR, f"_blank_scene_{tsq}_{os.getpid()}.png")
                             _write_blank_png(blank_scene, int(self.sp_w.value()), int(self.sp_h.value()), rgba=(255, 255, 255, 255))
                             _restore_scene_path = init_q
                             _restore_use_scene = use_scene_q
@@ -3919,10 +3945,15 @@ def _on_use_mask_toggled(self, checked: bool, persist: bool = True):
 
         if not use_scene:
             try:
-                blank_scene = os.path.join(OUTPUT_DIR, f"_blank_scene_{ts}.png")
+                _ensure_dir(TMP_INPUT_DIR)
+                blank_scene = os.path.join(TMP_INPUT_DIR, f"_blank_scene_{ts}_{os.getpid()}.png")
                 _write_blank_png(blank_scene, int(self.sp_w.value()), int(self.sp_h.value()), rgba=(255, 255, 255, 255))
                 init_img = blank_scene
                 self._append_log(f"\nScene disabled: using blank canvas -> {blank_scene}")
+                try:
+                    self._tmp_files_to_cleanup.append(blank_scene)
+                except Exception:
+                    pass
             except Exception as e:
                 self._append_log(f"\nERROR: Failed to create blank scene image: {e}")
                 return

@@ -135,6 +135,20 @@ def build_registry() -> List[Entry]:
             helper_paths=["/helpers/heartmula.py"],
         ),
         Entry(
+            id="qwentts",
+            title="Qwen3 TTS",
+            env_paths=["/environments/.qwen3tts/"],
+            model_paths=["/models/Qwen3-TTS*"],
+            helper_paths=["/helpers/qwentts_ui.py"],
+        ),
+        Entry(
+            id="whisper",
+            title="Whisper Lab",
+            env_paths=["/environments/.whisper/"],
+            model_paths=["/models/faster_whisper/"],
+            helper_paths=["/helpers/whisper.py"],
+        ),
+        Entry(
             id="gfpgan",
             title="GFPGAN (face upscale)",
             # GFPGAN stores its Python env inside the model folder.

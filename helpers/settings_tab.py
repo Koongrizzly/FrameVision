@@ -2077,7 +2077,8 @@ _EMOJI_MAP = {
     "log": "📝",
     "steps": "👣",
     "folder": "🗂️",
-#    "explorer": "🗂️",
+#    "explorer": "🗂️"
+    "speech": "🎙️",
     "generate": "✨",
     "batch": "📦",
     "clip": "🎬",
