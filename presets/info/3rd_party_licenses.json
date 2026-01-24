@@ -1,6 +1,6 @@
 {
   "schema_version": 2,
-  "generated_at_utc": "2026-01-18T19:13:46Z",
+  "generated_at_utc": "2026-01-24T14:02:11Z",
   "generated_from": [
     "ace_setup.bat",
     "background_download.py",
@@ -14,7 +14,8 @@
     "wan22_setup.bat",
     "zimage_gguf_install.py",
     "auto-migrated: add source_url landing pages; keep download_url as non-click reference",
-    "manual-edit: add HearMula Music entry"
+    "manual-edit: add HearMula Music entry",
+    "manual-edit: add Whisper (STT) and Qwen3-TTS (TTS) entries"
   ],
   "items": [
     {
@@ -380,6 +381,66 @@
       "license_url": "https://github.com/leejet/stable-diffusion.cpp/blob/master/LICENSE",
       "notes": "",
       "source_url": "https://github.com/leejet/stable-diffusion.cpp/releases/tag/master-445-860a78e"
+    },
+    {
+      "id": "openai_whisper_stt",
+      "name": "Whisper (speech-to-text / transcription) - optional install",
+      "category": "optional",
+      "installed_by": "optional",
+      "source": "openai/whisper (GitHub)",
+      "download_url": "https://github.com/openai/whisper",
+      "license": "MIT",
+      "license_url": "https://github.com/openai/whisper/blob/main/LICENSE",
+      "notes": "Whisper's code and model weights are released under the MIT License. No additional (non-commercial/private) restrictions noted in upstream license; see LICENSE.",
+      "source_url": "https://github.com/openai/whisper"
+    },
+    {
+      "id": "qwen3_tts_12hz_17b_base",
+      "name": "Qwen3-TTS-12Hz-1.7B-Base (voice clone / base) - optional install",
+      "category": "model",
+      "installed_by": "optional (1.7B)",
+      "source": "Qwen/Qwen3-TTS-12Hz-1.7B-Base (Hugging Face)",
+      "download_url": "https://huggingface.co/Qwen/Qwen3-TTS-12Hz-1.7B-Base",
+      "license": "Apache-2.0",
+      "license_url": "https://www.apache.org/licenses/LICENSE-2.0",
+      "notes": "Qwen3-TTS 1.7B variant (Base): used for voice cloning / fine-tuning. Uses the shared Qwen3-TTS-Tokenizer-12Hz tokenizer. No extra non-commercial/private-only restriction stated; model card lists Apache-2.0.",
+      "source_url": "https://huggingface.co/Qwen/Qwen3-TTS-12Hz-1.7B-Base"
+    },
+    {
+      "id": "qwen3_tts_12hz_17b_customvoice",
+      "name": "Qwen3-TTS-12Hz-1.7B-CustomVoice (preset voices) - optional install",
+      "category": "model",
+      "installed_by": "optional (1.7B)",
+      "source": "Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice (Hugging Face)",
+      "download_url": "https://huggingface.co/Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice",
+      "license": "Apache-2.0",
+      "license_url": "https://www.apache.org/licenses/LICENSE-2.0",
+      "notes": "Qwen3-TTS 1.7B variant (CustomVoice): uses built-in/preset speakers. Uses the shared Qwen3-TTS-Tokenizer-12Hz tokenizer. No extra non-commercial/private-only restriction stated; model card lists Apache-2.0.",
+      "source_url": "https://huggingface.co/Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice"
+    },
+    {
+      "id": "qwen3_tts_12hz_17b_voicedesign",
+      "name": "Qwen3-TTS-12Hz-1.7B-VoiceDesign (voice design via prompt) - optional install",
+      "category": "model",
+      "installed_by": "optional (1.7B)",
+      "source": "Qwen/Qwen3-TTS-12Hz-1.7B-VoiceDesign (Hugging Face)",
+      "download_url": "https://huggingface.co/Qwen/Qwen3-TTS-12Hz-1.7B-VoiceDesign",
+      "license": "Apache-2.0",
+      "license_url": "https://www.apache.org/licenses/LICENSE-2.0",
+      "notes": "Qwen3-TTS 1.7B variant (VoiceDesign): create voices from natural-language description. Uses the shared Qwen3-TTS-Tokenizer-12Hz tokenizer. No extra non-commercial/private-only restriction stated; model card lists Apache-2.0.",
+      "source_url": "https://huggingface.co/Qwen/Qwen3-TTS-12Hz-1.7B-VoiceDesign"
+    },
+    {
+      "id": "qwen3_tts_tokenizer_12hz",
+      "name": "Qwen3-TTS-Tokenizer-12Hz (speech tokenizer for Qwen3-TTS) - optional install",
+      "category": "model",
+      "installed_by": "optional (shared)",
+      "source": "Qwen/Qwen3-TTS-Tokenizer-12Hz (Hugging Face)",
+      "download_url": "https://huggingface.co/Qwen/Qwen3-TTS-Tokenizer-12Hz",
+      "license": "Apache-2.0",
+      "license_url": "https://www.apache.org/licenses/LICENSE-2.0",
+      "notes": "Shared speech tokenizer used by Qwen3-TTS models (including all 1.7B variants in the Qwen3-TTS collection). No extra non-commercial/private-only restriction stated; model card lists Apache-2.0.",
+      "source_url": "https://huggingface.co/Qwen/Qwen3-TTS-Tokenizer-12Hz"
     }
   ]
 }

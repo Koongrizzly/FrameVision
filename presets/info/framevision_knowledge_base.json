@@ -946,6 +946,74 @@
         }
       ]
     },
+    "HeartMila_Music_creation": {
+      "description": "Offline music generation powered by <b>HeartMuLa</b> (FrameVision’s built‑in “HeartMula” tool). Generates complete music tracks locally in minutes, with simple creative controls and one‑click presets. Best suited for <b>vocal pop, rock, R&amp;B</b> and other song‑structured genres. Outputs land in <code>output/music/heartmula/</code> and are visible in Media Explorer.<br><br>",
+      "key_terms": [
+        "HeartMuLa (local music generator)",
+        "One‑click presets",
+        "Prompt / lyrics guidance (optional)",
+        "Duration",
+        "Seed (repeatability)",
+        "Model path: models/HeartMuLa",
+        "Environment: .mula_env",
+        "Output: output/music/heartmula"
+      ],
+      "overview": "HeartMuLa is a research‑driven open music generation model that can synthesize song‑like audio locally. In FrameVision it’s packaged as a fast, offline “make me a track” tool: choose a preset (or tweak a few parameters), hit generate, and you’ll get a new music file you can immediately preview, loop, or use as a base for a videoclip. It’s designed for creators who want quick iteration without relying on cloud services.",
+      "features": [
+        "<b>Offline music creation</b>: generate full tracks locally (no cloud).",
+        "<b>One‑click presets</b>: fast style starting points for different genres/vibes.",
+        "<b>Repeatability</b>: seeds allow you to recreate a run (or slightly explore around it).",
+        "<b>Creator‑friendly workflow</b>: results appear in Media Explorer and can be used directly in other tools (e.g., Videoclip Creator).",
+        "<b>Windows‑first packaging</b>: runs inside its own environment (<code>.mula_env</code>) managed by FrameVision."
+      ],
+      "notes": [
+        "Default output folder: <code>output/music/heartmula/</code>.",
+        "Models live under <code>models/HeartMuLa/</code> (downloaded via Optional Installs in FrameVision builds that include HeartMula).",
+        "The generation runner is invoked from the HeartMuLa repo scripts (examples runner)."
+      ],
+      "hints_tips": [
+        "Start with a preset and only tweak one thing at a time (duration first, then prompt/lyrics, then seed).",
+        "If the result feels “busy”, try a calmer preset and shorter duration (quick iterations are the point).",
+        "For vocals: keep lyrics short and rhythmically simple; long, dense text can reduce intelligibility in many music generators.",
+        "If you like a vibe, re‑run with the same seed and small prompt changes to “steer” without losing identity."
+      ],
+      "qa_pairs": [
+        {
+          "question": "Where are HeartMula tracks saved?",
+          "answer": "By default: <code>output/music/heartmula/</code>. Use <b>View results</b> / Media Explorer to find them quickly."
+        },
+        {
+          "question": "Does it work offline?",
+          "answer": "Yes — it’s designed to run locally inside FrameVision’s HeartMula environment (<code>.mula_env</code>)."
+        },
+        {
+          "question": "What’s the fastest way to get a good result?",
+          "answer": "Pick a preset that matches the vibe, set a short duration for test runs, generate 3–5 variations, then lock a seed and iterate with small prompt/lyrics tweaks."
+        },
+        {
+          "question": "Why does it sometimes sound ‘muddy’ or low quality?",
+          "answer": "Music generation quality varies with settings and the underlying model. Try a different preset, shorten duration, and avoid overly complex prompts/lyrics; then do a final upscale/mix pass externally if needed."
+        }
+      ],
+      "controls": [
+        "Control: Preset — dropdown. Does: Applies a bundle of settings designed for a genre/vibe.",
+        "Control: Prompt / Lyrics — text fields (if present). Does: Steer mood, theme, and vocal content.",
+        "Control: Duration — input. Does: Set track length (shorter is faster for iteration).",
+        "Control: Seed — input. Does: Repeat a generation or explore variations.",
+        "Control: Generate — button. Does: Runs HeartMuLa and writes results to <code>output/music/heartmula/</code>.",
+        "Control: View results — button. Does: Opens the HeartMula output folder in Media Explorer."
+      ],
+      "install": [
+        "HeartMula is installed via Optional Installs (models under <code>models/HeartMuLa/</code>, environment under <code>.mula_env</code>).",
+        "Settings/presets are stored under <code>presets/setsave/</code> (HeartMula tool uses its own JSON settings file)."
+      ],
+      "troubleshoot": [
+        "If generation fails instantly: confirm the HeartMula environment exists (<code>.mula_env</code>) and the models folder isn’t empty.",
+        "If it’s extremely slow: reduce duration and try a lighter preset; run on a GPU if available.",
+        "If outputs aren’t visible in Media Explorer: open the folder manually at <code>output/music/heartmula/</code> and refresh."
+      ],
+      "_layout": "overview/features/notes/hints_tips/controls/install/troubleshoot"
+    },
     "HUD_Colorizer": {
       "description": "HUD Colorizer is a tiny helper that automatically <b>colorizes the HUD/header stats</b> so hot or high‑load numbers pop out at a glance. It finds the header <code>QLabel</code> containing <b>GPU / DDR / CPU</b>, switches it to <b>RichText</b>, and periodically rewrites the text with <code>&lt;span&gt;</code> tags.<br><br><b>What it colorizes</b><br><ul><li><b>Temperatures</b> like <code>62°C</code>, <code>62 C</code>, or <code>62c</code> (text‑only; no flashing/background).</li><li><b>GPU %</b> and <b>CPU %</b> (orange/red thresholds).</li><li><b>DDR / VRAM</b>: both the <b>% token</b> and the <b>used/total amount</b> like <code>DDR 5.3/24.0 GB</code> (VRAM‑specific thresholds).</li><li><b>Network speed</b> tokens like <code>DL 12.3 MB/s</code> or <code>UL 456 KB/s</code>.</li></ul><br><br><b>Default refresh</b>: every <b>2500 ms</b> (configurable via <code>auto_install_hud_colorizer(interval_ms=...)</code>).<br>This version intentionally avoids hysteresis and background highlights to keep the HUD <b>flash‑free</b> even at ≥70°C.",
       "key_terms": [
@@ -1614,6 +1682,83 @@
       ],
       "overview": "Central job manager for Upscaler/Tools. Uses on‑disk state folders (jobs/pending|running|done|failed), per‑job logs in logs/, and outputs under output/. Supports reordering and cancel.",
       "_layout": "overview/features/install/troubleshoot"
+    },
+    "Qwen_txt_to_speech": {
+      "description": "Offline text‑to‑speech powered by Qwen3‑TTS. Generates WAV files locally with 3 modes: <b>CustomVoice</b> (built‑in speakers), <b>Voice Clone</b> (copy a voice from a reference clip), and <b>Voice Design</b> (create a new voice from a written description). Includes a small model manager that downloads the required Hugging Face repos into <code>models/</code> and a <b>View results</b> button that jumps straight to the output folder.<br><br>",
+      "key_terms": [
+        "Qwen3‑TTS (12Hz tokenizer)",
+        "CustomVoice (speaker presets)",
+        "Voice Clone (reference audio + optional transcript)",
+        "Voice Design (voice description prompt)",
+        "Tokenizer model (required)",
+        "Environment: environments/.qwen3tts/",
+        "Device: auto / cpu / cuda",
+        "dtype: bfloat16 / float16 / float32",
+        "Attention: SDPA / FlashAttention2 (optional)",
+        "temperature / top_p / top_k / max_new_tokens",
+        "Output name + timestamp",
+        "Last state: presets/setsave/_last_state.json",
+        "Presets: presets/setsave/*.json"
+      ],
+      "overview": "Qwen3‑TTS is an open model family for multilingual speech synthesis. In FrameVision, it’s wrapped as a simple desktop tool: pick a mode (speaker preset, clone, or designed voice), type text, and export a clean <code>.wav</code>. If you want consistent narration, start with <b>CustomVoice</b>. If you want “this exact person”, use <b>Voice Clone</b> with a short, clean reference clip. If you want a brand‑new character voice, use <b>Voice Design</b> and describe identity (age, accent, energy) in plain language.",
+      "features": [
+        "<b>Model manager</b>: downloads Tokenizer + selected voice models (CustomVoice / Base / VoiceDesign) into <code>models/</code> via Hugging Face.",
+        "<b>Three generation modes</b>: CustomVoice, Voice Clone, Voice Design.",
+        "<b>GPU/CPU friendly</b>: choose device (auto/cpu/cuda) + dtype; SDPA attention as safe default; FlashAttention2 when available.",
+        "<b>Style instruction</b>: add delivery notes (e.g., “slow, warm, conversational”) without changing identity.",
+        "<b>Presets</b>: save/load settings to <code>presets/setsave/</code> for repeatable voices and exports.",
+        "<b>View results</b>: opens the output folder directly in Media Explorer (audio preset) when available."
+      ],
+      "notes": [
+        "The tool runs inside its own venv: <code>environments/.qwen3tts/</code> (it will relaunch itself into that Python when needed).",
+        "Outputs are WAV files saved under <code>output/</code> (filename uses Output name + optional timestamp).",
+        "Model folders default to: <code>models/Qwen3-TTS-Tokenizer-12Hz</code> plus the selected voice model repo(s).",
+        "UI state is remembered via <code>presets/setsave/_last_state.json</code> (delete it to reset)."
+      ],
+      "hints_tips": [
+        "For the best clone: use a mono reference, minimal reverb, consistent speaking volume, and no background music.",
+        "If the voice sounds “right” but the delivery is wrong, change <b>Style instruction</b> first (don’t rewrite the voice description).",
+        "If you see weird artifacts on CPU, lower <b>max_new_tokens</b> and keep temperature around <b>0.7–0.9</b>.",
+        "Want speed: try CUDA + float16. Want stability: SDPA attention + slightly lower temperature.",
+        "If you get random speaker name issues, click <b>Refresh speakers from model</b> (it queries the model for supported speakers/languages)."
+      ],
+      "qa_pairs": [
+        {
+          "question": "Which mode should I use?",
+          "answer": "<b>CustomVoice</b> for fast, consistent narration; <b>Voice Clone</b> to mimic a specific speaker; <b>Voice Design</b> to invent a new voice from a description."
+        },
+        {
+          "question": "Where are results saved?",
+          "answer": "WAV files are written to <code>output/</code>. Use <b>View results</b> to jump to the folder in Media Explorer."
+        },
+        {
+          "question": "My cloned voice doesn’t sound like the reference. What’s the first fix?",
+          "answer": "Use a cleaner 5–20s reference clip and (if possible) fill in <b>Reference text</b> with the exact transcript. If needed, disable <b>x_vector_only_mode</b> and re‑run."
+        },
+        {
+          "question": "It crashes or fails to load the model. What do I do?",
+          "answer": "Try <b>dtype=float16</b> and <b>Attention=SDPA</b>. Also confirm the selected model folder exists and is not empty in <code>models/</code>."
+        }
+      ],
+      "controls": [
+        "Control: Tokenizer / CustomVoice / Base / VoiceDesign — checkboxes. Does: Select which Hugging Face repos to download for this tool.",
+        "Control: Download selected — button. Does: Downloads chosen repos into <code>models/</code> (uses <code>HF_TOKEN</code> if set).",
+        "Control: Common generation settings — panel. Does: Device/dtype/attention and sampling parameters used across all modes.",
+        "Control: Generate WAV (current tab) — button. Does: Runs TTS for the active mode and writes a WAV to <code>output/</code>.",
+        "Control: View results — button. Does: Opens the output folder in Media Explorer (audio preset) or your OS file browser.",
+        "Control: Save preset / Load preset — buttons. Does: Save or restore settings JSON files from <code>presets/setsave/</code>."
+      ],
+      "install": [
+        "Install the Qwen3‑TTS environment via Optional Installs (creates <code>environments/.qwen3tts/</code>) and download the models into <code>models/</code>.",
+        "UI state is saved to <code>presets/setsave/_last_state.json</code>. You can also save your own presets as JSON files in <code>presets/setsave/</code>."
+      ],
+      "troubleshoot": [
+        "“Model folder missing”: download the required repos first (Tokenizer + the model for your chosen mode).",
+        "CUDA out of memory: switch dtype to float16, reduce max_new_tokens, or run on CPU for the generation step.",
+        "“FlashAttention” import/runtime error: set Attention to SDPA and retry.",
+        "Clone sounds noisy or unstable: use a cleaner reference clip; lower temperature a bit; avoid extreme top_k values."
+      ],
+      "_layout": "overview/features/notes/hints_tips/controls/install/troubleshoot"
     },
     "RIFE_Interpolation": {
       "key_terms": [
@@ -2916,7 +3061,7 @@
           "question": "Can I use Wuli-Qwen-Image-2512-Turbo-LoRA-4steps LoRA with Qwen-Image-2512?",
           "answer": "Yes. we tested but did not include the lora by default. Download the lora and add it in /models/lora/ ."
         },
-		{
+        {
           "question": "Can I use LoRAs to with Qwen-Image-2512?",
           "answer": "Yes. The Tools runner applies LoRA at runtime by injecting a prompt tag like <code>&lt;lora:NAME:W&gt;</code> and passing <code>--lora-model-dir</code> to sd-cli. TXT→IMG’s LoRA slots can also be used when the Qwen backend is selected."
         },
@@ -3659,6 +3804,87 @@
         "If output plays black/no frames: reduce Steps/Frames first and retry; also avoid running other VRAM-heavy jobs simultaneously (especially in direct mode)."
       ],
       "_layout": "overview/features/install/troubleshoot"
+    },
+    "Whisper": {
+      "description": "Offline speech‑to‑text using <b>Faster‑Whisper</b> (a CTranslate2‑accelerated Whisper implementation). Works on both CPU and CUDA, can detect language automatically, and can optionally <b>translate the transcript to English</b>. Exports <code>.srt</code> subtitles, <code>.vtt</code> web captions, and a plain text lyrics/transcript file. Also includes a <b>Subtitle burn‑in</b> tool (hardcode subtitles into a video) using bundled FFmpeg.<br><br>",
+      "key_terms": [
+        "Faster‑Whisper (CTranslate2 backend)",
+        "Model sizes (tiny/base/small/medium/large‑v3*)",
+        "Models folder: models/faster_whisper/",
+        "Whisper env: environments/.whisper/",
+        "Language: Auto or fixed code",
+        "Translate to English",
+        "SRT / VTT / TXT outputs",
+        "Segment table (preview)",
+        "ffmpeg / ffprobe (presets/bin)",
+        "Burn-in subtitles (hardcoded subs)",
+        "Output folder: output/whisper",
+        "Settings: presets/whisper_settings.json"
+      ],
+      "overview": "Whisper is a general‑purpose speech recognition model that can transcribe audio and video into text with timestamps. FrameVision wraps it as a practical “subtitle & transcript lab”: pick a file, choose language (or Auto), run transcription, then export SRT/VTT/TXT in one click. If you need a video with permanent subtitles (for socials), use <b>Subtitle burn‑in</b> to create a new MP4 with the SRT embedded.",
+      "features": [
+        "<b>Fast local transcription</b> via Faster‑Whisper (CTranslate2) on CPU or CUDA.",
+        "<b>Auto language detection</b> (or force a language code for consistency).",
+        "<b>Optional translation to English</b> for bilingual subtitles.",
+        "<b>Multiple export formats</b>: SRT, VTT, and plain‑text transcript/lyrics.",
+        "<b>Subtitle burn‑in</b>: uses FFmpeg to generate <code>*_subtitled.mp4</code> with hardcoded subtitles.",
+        "<b>Large transcript safety</b>: UI only shows the first N segments for responsiveness, but outputs include the full transcript."
+      ],
+      "notes": [
+        "Default output directory is <code>output/whisper/</code>.",
+        "Settings persist to <code>presets/whisper_settings.json</code>.",
+        "FrameVision can keep Whisper in an isolated env at <code>environments/.whisper/</code> and (for stability) prefers running transcription via that env’s <code>python.exe</code>.",
+        "Subtitle burn‑in requires FFmpeg in <code>presets/bin/</code>. If FFmpeg isn’t found, the burn‑in button will warn and stop."
+      ],
+      "hints_tips": [
+        "For best timing: transcribe the original (unsped‑up) audio/video first; change speed later if needed.",
+        "If subtitles drift: make sure the source video has constant frame rate; if not, re‑encode to CFR before burning subs.",
+        "If you only need a quick lyrics extract: keep language Auto and enable TXT export.",
+        "On CPU, start with a smaller model. On CUDA, medium/large usually becomes practical.",
+        "If a transcript looks wrong, force the correct language code instead of Auto."
+      ],
+      "qa_pairs": [
+        {
+          "question": "Where are the files saved?",
+          "answer": "By default: <code>output/whisper/</code>. Exports are named after your media file (e.g., <code>video.srt</code>, <code>video.vtt</code>, <code>video_lyrics.txt</code>)."
+        },
+        {
+          "question": "What’s the difference between SRT and VTT?",
+          "answer": "<b>SRT</b> is the classic subtitle format (widely supported); <b>VTT</b> is common for web players and some editors. FrameVision can export both."
+        },
+        {
+          "question": "What does “Translate to English” do?",
+          "answer": "It keeps the timing but outputs English text instead of the original spoken language (useful for bilingual captions)."
+        },
+        {
+          "question": "Why does the segment table show only part of the transcript?",
+          "answer": "To keep the app responsive on long audio. The exported files still include the full transcript."
+        },
+        {
+          "question": "Burn-in subtitles failed. What’s the usual cause?",
+          "answer": "Most common: FFmpeg not found in <code>presets/bin/</code> or the SRT path is invalid. Also ensure the subtitle file is <code>.srt</code> and the video path exists."
+        }
+      ],
+      "controls": [
+        "Control: Browse… (Audio/Video) — button. Does: Select input media for transcription.",
+        "Control: Language — dropdown. Does: Auto detect or force a language code (en/de/fr/…); forcing improves consistency.",
+        "Control: Translate to English — checkbox. Does: Outputs English text while keeping timestamps.",
+        "Control: Generate .srt / .vtt / .txt — checkboxes. Does: Choose which outputs to write.",
+        "Control: Transcribe / Extract Lyrics — button. Does: Runs Faster‑Whisper and writes outputs to the chosen folder.",
+        "Control: Subtitle burn‑in (video + srt) — controls. Does: Creates a new MP4 with hardcoded subtitles via FFmpeg."
+      ],
+      "install": [
+        "Optional Installs typically sets up an isolated venv at <code>environments/.whisper/</code> to avoid dependency conflicts with the main app.",
+        "Models are expected under <code>models/faster_whisper/</code> (FrameVision defaults to <code>models/faster_whisper/medium</code> when present).",
+        "FFmpeg/ffprobe should be present in <code>presets/bin/</code> (bundled by the installer)."
+      ],
+      "troubleshoot": [
+        "Slow on CPU: pick a smaller model size and keep language forced when possible.",
+        "Bad language detection: set Language to the correct code instead of Auto.",
+        "Burn-in subtitles creates a video but subtitles are missing: confirm the SRT actually contains timestamps and is referenced correctly in the burn‑in panel.",
+        "If the output video won’t play smoothly: try a different encoder or re‑encode the source first (some exotic sources can trip up FFmpeg)."
+      ],
+      "_layout": "overview/features/notes/hints_tips/controls/install/troubleshoot"
     },
     "Worker": {
       "description": "The Worker is a separate process that executes Queue jobs. This keeps the UI responsive and lets jobs keep running even if the main app is closed.<br><br>How jobs run<br><ul><li>Watches jobs/pending/ for *.json jobs.</li><li>Picks the oldest file first (FIFO by file modification time). Queue Move Up/Down works by changing that timestamp.</li><li>Moves the job into jobs/running/ and stamps started_at.</li><li>Creates/updates a sidecar &lt;job&gt;.progress.json with { &quot;pct&quot;: 0..100 }.</li><li>Patches the running job JSON with live fields when available: pct, elapsed_sec, eta_sec, stage, step, total, active_pid, active_cmd.</li><li>On completion stamps finished_at and duration_sec, merges produced/files back into the JSON, and moves the job to jobs/done/ or jobs/failed/.</li><li>Updates logs/worker_heartbeat.txt once per loop so the app can detect a stuck worker.</li></ul><br><br>Canceling a running job<br><ul><li>Set cancel_requested: true in the running job JSON, or create a.cancel file next to the running job JSON.</li><li>The worker will try to stop the active subprocess (Windows: taskkill /T /F; others: SIGTERM) and mark the job as canceled/failed.</li></ul><br><br>Job types supported (job[&quot;type&quot;])<br><ul><li>upscale_photo: Upscale a single image using NCNN upscalers (RealESR-general-x4v3, SwinIR-x4, LapSRN-x4). If a model exe isn’t found, it falls back to FFmpeg scale (Lanczos). Output names are made unique with _001, _002,...</li><li>upscale_video: Extracts frames, upscales, then re-encodes. Falls back to FFmpeg scale when needed. Output names are made unique with _001, _002,...</li><li>rife_interpolate: RIFE NCNN interpolation. If the RIFE exe is missing, it falls back to FFmpeg minterpolate. Supports preview_seconds, overwrite modes (overwrite / ask / skip), and will pick a unique output name when overwrite=ask.</li><li>tools_ffmpeg: Runs a caller-provided command (usually FFmpeg) from args.cmd or args.ffmpeg_cmd, with best-effort progress parsing. Can mark args.outfile as produced.</li><li>txt2img / txt2img_qwen: SD15 / SDXL / Z-Image through helpers.txt2img. If engine is zimage, it is strict (no legacy fallback). Other engines may fall back to the legacy Diffusers path.</li><li>wan22_text2video / wan22_image2video / wan22_ti2v / wan22: Runs models/wan22/generate.py (prefers.wan_venv Python if present) and parses stdout for step/progress/ETA when possible.</li><li>ace_text2music / ace_audio2audio / ace / ace_step / ace_music: Runs ACE-Step using presets/setsave/ace.json and parses stdout for progress/ETA when possible.</li></ul><br><br>Models, tools, and legacy migration<br><ul><li>Reads ROOT/models_manifest.json when present to resolve tool paths; otherwise tries common locations (tools_dir, models folder).</li><li>On startup, migrates legacy output/, jobs/, and logs/ from older FrameVision folder layouts into the current tree (renaming collisions with _migrated).</li></ul><br><br>Logs<br><ul><li>logs/run_&lt;timestamp&gt;.log: default log used by simple command runners.</li><li>logs/tools_&lt;jobid&gt;_&lt;timestamp&gt;.log: tools_ffmpeg output.</li><li>logs/wan22_&lt;timestamp&gt;.log: WAN 2.2 output.</li><li>logs/ace_&lt;timestamp&gt;.log: ACE-Step output.</li><li>Exit codes are appended at the bottom of each log.</li></ul><br><br>Quiet mode (less spammy logs)<br><ul><li>Disables some HuggingFace / diffusers progress bars and filters common warnings (for example the CLIP 77-token warning) so real errors stand out.</li></ul><br><br>Safety note<br><ul><li>Because it is a separate process, jobs can continue even if the main FrameVision UI closes; stopping the worker stops jobs.</li></ul>",
