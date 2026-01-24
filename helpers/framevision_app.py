@@ -4759,7 +4759,7 @@ class MainWindow(QMainWindow):
 
     def __init__(self):
         super().__init__()
-        self.setWindowTitle(APP_NAME + " V2.2 " + TAGLINE)
+        self.setWindowTitle(APP_NAME + " V2.2.2 " + TAGLINE)
         self.resize(1280, 800)
         self.setMinimumSize(700, 500)
         self.current_path = None
