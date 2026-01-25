@@ -343,6 +343,38 @@ class MainWindow(QtWidgets.QMainWindow):
         mm_layout.addWidget(self.btn_open_models, 1, 2, 1, 1)
         mm_layout.addWidget(self.lbl_model_status, 2, 0, 1, 3)
 
+        # --- Models section (paths) ---
+        # Move per-tab model/tokenizer paths into this section (keeps tabs cleaner).
+        self.tokenizer_path = QtWidgets.QLineEdit(DEFAULT_TOKENIZER_DIR)
+
+        self.cv_model_path = QtWidgets.QLineEdit(DEFAULT_CUSTOMVOICE_DIR)
+        self.vc_model_path = QtWidgets.QLineEdit(DEFAULT_BASE_DIR)
+        self.vd_model_path = QtWidgets.QLineEdit(DEFAULT_VOICEDESIGN_DIR)
+
+        self.models_tabs = QtWidgets.QTabWidget()
+        self.models_tabs.setDocumentMode(True)
+        self.models_tabs.setTabPosition(QtWidgets.QTabWidget.North)
+
+        def _mk_model_tab(label: str, le: QtWidgets.QLineEdit) -> QtWidgets.QWidget:
+            w = QtWidgets.QWidget()
+            f = QtWidgets.QFormLayout(w)
+            f.setContentsMargins(0, 0, 0, 0)
+            f.addRow("Model path", le)
+            return w
+
+        self.models_tabs.addTab(_mk_model_tab("CustomVoice", self.cv_model_path), "CustomVoice")
+        self.models_tabs.addTab(_mk_model_tab("Voice Clone (Base)", self.vc_model_path), "Voice Clone (Base)")
+        self.models_tabs.addTab(_mk_model_tab("Voice Design", self.vd_model_path), "Voice Design")
+
+        models_form = QtWidgets.QFormLayout()
+        models_form.setContentsMargins(0, 6, 0, 0)
+        models_form.addRow("Tokenizer path", self.tokenizer_path)
+        models_form.addRow("", self.models_tabs)
+        models_wrap = QtWidgets.QWidget()
+        models_wrap.setLayout(models_form)
+
+        mm_layout.addWidget(models_wrap, 3, 0, 1, 3)
+
         self.section_mm = CollapsibleSection("Model Manager", mm_content, collapsed=True)
         layout.addWidget(self.section_mm)
 
@@ -482,6 +514,15 @@ class MainWindow(QtWidgets.QMainWindow):
         self.btn_open_models.setToolTip("Open the local /models/ folder in Explorer.")
         self.lbl_model_status.setToolTip("Quick check: whether each model folder exists and is non-empty.")
 
+        # Model / tokenizer paths (inside Model Manager)
+        self.tokenizer_path.setToolTip("Folder for the Tokenizer model (downloaded into /models/).")
+        self.cv_model_path.setToolTip(
+            "Folder for the CustomVoice model (downloaded into /models/).\n"
+            "Default is the expected local folder name."
+        )
+        self.vc_model_path.setToolTip("Folder for the Base model (needed for voice cloning).")
+        self.vd_model_path.setToolTip("Folder for the VoiceDesign model (downloaded into /models/).")
+
         # Generate + GPU
         self.btn_generate.setToolTip(
             "Generate a WAV using the currently selected tab.\n"
@@ -538,11 +579,6 @@ class MainWindow(QtWidgets.QMainWindow):
         )
 
         # CustomVoice tab
-        self.cv_model_path.setToolTip(
-            "Folder for the CustomVoice model (downloaded into /models/).\n"
-            "Default is the expected local folder name."
-        )
-        self.cv_tokenizer_path.setToolTip("Folder for the Tokenizer model (downloaded into /models/).")
         self.cv_text.setToolTip(
             "Text to speak.\n"
             "Tip: for natural speech, use punctuation and short sentences."
@@ -565,8 +601,6 @@ class MainWindow(QtWidgets.QMainWindow):
         )
 
         # Voice Clone tab
-        self.vc_model_path.setToolTip("Folder for the Base model (needed for voice cloning).")
-        self.vc_tokenizer_path.setToolTip("Folder for the Tokenizer model.")
         self.vc_text.setToolTip("Text you want spoken by the cloned voice.")
         self.vc_language.setToolTip("Language hint for the target speech.")
         self.vc_ref_audio.setToolTip(
@@ -587,8 +621,6 @@ class MainWindow(QtWidgets.QMainWindow):
         )
 
         # Voice Design tab
-        self.vd_model_path.setToolTip("Folder for the VoiceDesign model (downloaded into /models/).")
-        self.vd_tokenizer_path.setToolTip("Folder for the Tokenizer model.")
         self.vd_text.setToolTip("Text to speak using the designed voice.")
         self.vd_language.setToolTip("Language hint for the generated speech.")
         self.vd_desc.setToolTip(
@@ -604,9 +636,6 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def _build_custom_tab(self):
         lay = QtWidgets.QFormLayout(self.tab_custom)
-
-        self.cv_model_path = QtWidgets.QLineEdit(DEFAULT_CUSTOMVOICE_DIR)
-        self.cv_tokenizer_path = QtWidgets.QLineEdit(DEFAULT_TOKENIZER_DIR)
 
         self.cv_text = QtWidgets.QPlainTextEdit()
         self.cv_text.setPlainText("Okay, quick test: the rain taps the window like tiny drums. If you can hear this clearly, it works.")
@@ -629,8 +658,6 @@ class MainWindow(QtWidgets.QMainWindow):
         row.addWidget(self.cv_speaker, 2)
         row.addWidget(self.btn_cv_refresh, 1)
 
-        lay.addRow("Model path", self.cv_model_path)
-        lay.addRow("Tokenizer path", self.cv_tokenizer_path)
         lay.addRow("Text", self.cv_text)
         lay.addRow("Language", self.cv_language)
         lay.addRow("Speaker", row)
@@ -638,9 +665,6 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def _build_clone_tab(self):
         lay = QtWidgets.QFormLayout(self.tab_clone)
-
-        self.vc_model_path = QtWidgets.QLineEdit(DEFAULT_BASE_DIR)
-        self.vc_tokenizer_path = QtWidgets.QLineEdit(DEFAULT_TOKENIZER_DIR)
 
         self.vc_text = QtWidgets.QPlainTextEdit()
         self.vc_text.setPlainText("Hey—this is a quick voice clone test. If this sounds like the reference speaker, it worked.")
@@ -662,8 +686,6 @@ class MainWindow(QtWidgets.QMainWindow):
 
         self.vc_instruct = QtWidgets.QLineEdit("")
 
-        lay.addRow("Model path", self.vc_model_path)
-        lay.addRow("Tokenizer path", self.vc_tokenizer_path)
         lay.addRow("Text", self.vc_text)
         lay.addRow("Language", self.vc_language)
         lay.addRow("Reference audio", ref_row)
@@ -673,9 +695,6 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def _build_design_tab(self):
         lay = QtWidgets.QFormLayout(self.tab_design)
-
-        self.vd_model_path = QtWidgets.QLineEdit(DEFAULT_VOICEDESIGN_DIR)
-        self.vd_tokenizer_path = QtWidgets.QLineEdit(DEFAULT_TOKENIZER_DIR)
 
         self.vd_text = QtWidgets.QPlainTextEdit()
         self.vd_text.setPlainText("Hello. This is voice design. If the voice matches the description, it worked.")
@@ -687,8 +706,6 @@ class MainWindow(QtWidgets.QMainWindow):
         self.vd_desc = QtWidgets.QPlainTextEdit()
         self.vd_desc.setPlainText("A calm, friendly voice, slightly smiling, clear pronunciation.")
 
-        lay.addRow("Model path", self.vd_model_path)
-        lay.addRow("Tokenizer path", self.vd_tokenizer_path)
         lay.addRow("Text", self.vd_text)
         lay.addRow("Language", self.vd_language)
         lay.addRow("Voice description", self.vd_desc)
@@ -727,7 +744,7 @@ class MainWindow(QtWidgets.QMainWindow):
 
         # CustomVoice
         c(self.cv_model_path.textChanged)
-        c(self.cv_tokenizer_path.textChanged)
+        c(self.tokenizer_path.textChanged)
         c(self.cv_text.textChanged)
         c(self.cv_language.currentTextChanged)
         c(self.cv_speaker.currentTextChanged)
@@ -736,7 +753,6 @@ class MainWindow(QtWidgets.QMainWindow):
 
         # Voice Clone
         c(self.vc_model_path.textChanged)
-        c(self.vc_tokenizer_path.textChanged)
         c(self.vc_text.textChanged)
         c(self.vc_language.currentTextChanged)
         c(self.vc_ref_audio.textChanged)
@@ -746,7 +762,6 @@ class MainWindow(QtWidgets.QMainWindow):
 
         # Voice Design
         c(self.vd_model_path.textChanged)
-        c(self.vd_tokenizer_path.textChanged)
         c(self.vd_text.textChanged)
         c(self.vd_language.currentTextChanged)
         c(self.vd_desc.textChanged)
@@ -808,6 +823,8 @@ class MainWindow(QtWidgets.QMainWindow):
         common = self._collect_common()
         tab = self.tabs.currentWidget()
 
+        tok = self.tokenizer_path.text().strip()
+
         if tab is self.tab_custom:
             return "custom", {
                 "text": self.cv_text.toPlainText(),
@@ -815,7 +832,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 "speaker": self.cv_speaker.currentText(),
                 "instruct": self.cv_instruct.text(),
                 "model_path": self.cv_model_path.text().strip(),
-                "tokenizer_path": self.cv_tokenizer_path.text().strip(),
+                "tokenizer_path": tok,
                 "common": common,
             }
 
@@ -828,7 +845,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 "x_vector_only_mode": bool(self.vc_xvector.isChecked()),
                 "instruct": self.vc_instruct.text(),
                 "model_path": self.vc_model_path.text().strip(),
-                "tokenizer_path": self.vc_tokenizer_path.text().strip(),
+                "tokenizer_path": tok,
                 "common": common,
             }
 
@@ -837,7 +854,7 @@ class MainWindow(QtWidgets.QMainWindow):
             "language": self.vd_language.currentText(),
             "voice_description": self.vd_desc.toPlainText(),
             "model_path": self.vd_model_path.text().strip(),
-            "tokenizer_path": self.vd_tokenizer_path.text().strip(),
+            "tokenizer_path": tok,
             "common": common,
         }
 
@@ -852,17 +869,19 @@ class MainWindow(QtWidgets.QMainWindow):
                     "logs_collapsed": bool(self.section_logs.isCollapsed()),
                 },
                 "common": self._collect_common(),
+                "models": {
+                    "tokenizer_path": self.tokenizer_path.text(),
+                    "custom_model_path": self.cv_model_path.text(),
+                    "base_model_path": self.vc_model_path.text(),
+                    "voicedesign_model_path": self.vd_model_path.text(),
+                },
                 "custom": {
-                    "model_path": self.cv_model_path.text(),
-                    "tokenizer_path": self.cv_tokenizer_path.text(),
                     "text": self.cv_text.toPlainText(),
                     "language": self.cv_language.currentText(),
                     "speaker": self.cv_speaker.currentText(),
                     "instruct": self.cv_instruct.text(),
                 },
                 "clone": {
-                    "model_path": self.vc_model_path.text(),
-                    "tokenizer_path": self.vc_tokenizer_path.text(),
                     "text": self.vc_text.toPlainText(),
                     "language": self.vc_language.currentText(),
                     "ref_audio_path": self.vc_ref_audio.text(),
@@ -871,8 +890,6 @@ class MainWindow(QtWidgets.QMainWindow):
                     "instruct": self.vc_instruct.text(),
                 },
                 "design": {
-                    "model_path": self.vd_model_path.text(),
-                    "tokenizer_path": self.vd_tokenizer_path.text(),
                     "text": self.vd_text.toPlainText(),
                     "language": self.vd_language.currentText(),
                     "voice_description": self.vd_desc.toPlainText(),
@@ -910,10 +927,20 @@ class MainWindow(QtWidgets.QMainWindow):
                 self.output_name.setText(c.get("output_name", "qwen_tts"))
                 self.add_timestamp.setChecked(bool(c.get("add_timestamp", True)))
 
+            # New format (preferred)
+            m = state.get("models", {}) or {}
+            if m:
+                self.tokenizer_path.setText(m.get("tokenizer_path", DEFAULT_TOKENIZER_DIR))
+                self.cv_model_path.setText(m.get("custom_model_path", DEFAULT_CUSTOMVOICE_DIR))
+                self.vc_model_path.setText(m.get("base_model_path", DEFAULT_BASE_DIR))
+                self.vd_model_path.setText(m.get("voicedesign_model_path", DEFAULT_VOICEDESIGN_DIR))
+
             cv = state.get("custom", {})
             if cv:
-                self.cv_model_path.setText(cv.get("model_path", DEFAULT_CUSTOMVOICE_DIR))
-                self.cv_tokenizer_path.setText(cv.get("tokenizer_path", DEFAULT_TOKENIZER_DIR))
+                # Back-compat: older state files stored paths here
+                if not m:
+                    self.cv_model_path.setText(cv.get("model_path", DEFAULT_CUSTOMVOICE_DIR))
+                    self.tokenizer_path.setText(cv.get("tokenizer_path", DEFAULT_TOKENIZER_DIR))
                 self.cv_text.setPlainText(cv.get("text", ""))
                 self.cv_language.setCurrentText(cv.get("language", "English"))
                 self.cv_speaker.setCurrentText(safe_lower_speaker(cv.get("speaker", "ryan")))
@@ -921,8 +948,9 @@ class MainWindow(QtWidgets.QMainWindow):
 
             vc = state.get("clone", {})
             if vc:
-                self.vc_model_path.setText(vc.get("model_path", DEFAULT_BASE_DIR))
-                self.vc_tokenizer_path.setText(vc.get("tokenizer_path", DEFAULT_TOKENIZER_DIR))
+                if not m:
+                    self.vc_model_path.setText(vc.get("model_path", DEFAULT_BASE_DIR))
+                    # tokenizer already taken from custom in older format
                 self.vc_text.setPlainText(vc.get("text", ""))
                 self.vc_language.setCurrentText(vc.get("language", "English"))
                 self.vc_ref_audio.setText(vc.get("ref_audio_path", ""))
@@ -932,8 +960,8 @@ class MainWindow(QtWidgets.QMainWindow):
 
             vd = state.get("design", {})
             if vd:
-                self.vd_model_path.setText(vd.get("model_path", DEFAULT_VOICEDESIGN_DIR))
-                self.vd_tokenizer_path.setText(vd.get("tokenizer_path", DEFAULT_TOKENIZER_DIR))
+                if not m:
+                    self.vd_model_path.setText(vd.get("model_path", DEFAULT_VOICEDESIGN_DIR))
                 self.vd_text.setPlainText(vd.get("text", ""))
                 self.vd_language.setCurrentText(vd.get("language", "English"))
                 self.vd_desc.setPlainText(vd.get("voice_description", ""))
@@ -1000,7 +1028,7 @@ class MainWindow(QtWidgets.QMainWindow):
         common = self._collect_common()
         payload = {
             "model_path": model_dir,
-            "tokenizer_path": self.cv_tokenizer_path.text().strip(),
+            "tokenizer_path": self.tokenizer_path.text().strip(),
             "common": common,
         }
         self._run_env_task(task="supported", payload=payload, on_ok=self._on_supported_lists)

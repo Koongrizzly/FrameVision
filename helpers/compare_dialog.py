@@ -2,7 +2,7 @@
 import os
 from PySide6.QtCore import Qt
 from PySide6.QtWidgets import (
-    QDialog, QVBoxLayout, QHBoxLayout, QLabel, QPushButton, QLineEdit,
+    QDialog, QVBoxLayout, QHBoxLayout, QLabel, QPushButton, QLineEdit, QComboBox,
     QFileDialog, QMessageBox
 )
 
@@ -86,6 +86,7 @@ class ComparePickDialog(QDialog):
         self._left = ""
         self._right = ""
         self._kind = None
+        self._scale_mode = "fill"
 
         root = QVBoxLayout(self)
 
@@ -114,6 +115,29 @@ class ComparePickDialog(QDialog):
         self.btn_right.clicked.connect(self._pick_right)
         row2.addWidget(self.btn_right)
         root.addLayout(row2)
+
+        # Scaling / normalization (helps when resolutions or aspect ratios differ)
+        row3 = QHBoxLayout()
+        row3.addWidget(QLabel("Scaling:"))
+        self.scale_combo = QComboBox()
+        self.scale_combo.addItem("Fill (crop) — easiest compare", "fill")
+        self.scale_combo.addItem("Fit (letterbox) — show full image", "fit")
+        self.scale_combo.addItem("Stretch (distort) — last resort", "stretch")
+        # Default to last used mode (if parent provides one)
+        try:
+            default_mode = getattr(parent, "_compare_scale_mode_default", None)
+        except Exception:
+            default_mode = None
+        if default_mode in ("fill","fit","stretch"):
+            try:
+                ix = self.scale_combo.findData(default_mode)
+                if ix >= 0:
+                    self.scale_combo.setCurrentIndex(ix)
+            except Exception:
+                pass
+        row3.addWidget(self.scale_combo, 1)
+        root.addLayout(row3)
+
 
         self.status = QLabel("")
         self.status.setWordWrap(True)
@@ -175,7 +199,11 @@ class ComparePickDialog(QDialog):
         if not self._left or not self._right or not self._kind:
             QMessageBox.warning(self, "Compare", "Please select two files of the same type.")
             return
+        try:
+            self._scale_mode = str(self.scale_combo.currentData() or "fill")
+        except Exception:
+            self._scale_mode = "fill"
         self.accept()
 
     def get_selection(self):
-        return self._left, self._right, self._kind
+        return self._left, self._right, self._kind, (self._scale_mode or "fill")

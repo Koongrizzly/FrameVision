@@ -1338,6 +1338,11 @@ class VideoPane(QWidget):
         self._compare_last_accept_ts = 0.0
         self._compare_last_present_ts = 0.0
         super().__init__(parent)
+        # Compare: default scaling mode (used by the picker dialog)
+        try:
+            self._compare_scale_mode_default = str(config.get("compare_scale_mode", "fill") or "fill").strip().lower()
+        except Exception:
+            self._compare_scale_mode_default = "fill"
         self._video_output_override = None
         self.player = QMediaPlayer(self); self.audio = QAudioOutput(self); self.player.setAudioOutput(self.audio)
         self.sink = QVideoSink(self); self.player.setVideoSink(self.sink); self.sink.videoFrameChanged.connect(self._on_frame)
@@ -3256,10 +3261,14 @@ class VideoPane(QWidget):
             dlg = ComparePickDialog(self, start_dir=start_dir)
             if dlg.exec() != QDialog.Accepted:
                 return
-            left, right, kind = dlg.get_selection()
+            left, right, kind, scale_mode = dlg.get_selection()
             if not left or not right or not kind:
                 return
-            self.open_compare(left, right, kind)
+            try:
+                self._compare_scale_mode_default = str(scale_mode or "fill")
+            except Exception:
+                self._compare_scale_mode_default = "fill"
+            self.open_compare(left, right, kind, scale_mode=scale_mode)
         except Exception:
             pass
 
@@ -3456,7 +3465,7 @@ class VideoPane(QWidget):
             pass
 
 
-    def open_compare(self, left_path: str, right_path: str, kind: str):
+    def open_compare(self, left_path: str, right_path: str, kind: str, scale_mode: str = None):
         try:
             try:
                 self.close_compare()
@@ -3474,6 +3483,26 @@ class VideoPane(QWidget):
             self._compare_left_path = str(left_path)
             self._compare_right_path = str(right_path)
             self._compare_wipe = 500
+
+            # Compare scaling mode (normalizes mismatched resolutions/aspect ratios into the same canvas)
+            try:
+                sm = str(scale_mode or "").strip().lower()
+            except Exception:
+                sm = ""
+            if sm not in ("fill","fit","stretch"):
+                try:
+                    sm = str(config.get("compare_scale_mode", "fill") or "fill").strip().lower()
+                except Exception:
+                    sm = "fill"
+            if sm not in ("fill","fit","stretch"):
+                sm = "fill"
+            self._compare_scale_mode = sm
+            try:
+                config["compare_scale_mode"] = sm
+                save_config()
+            except Exception:
+                pass
+
 
             try:
                 self.compare_slider.setValue(500)

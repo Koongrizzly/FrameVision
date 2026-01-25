@@ -13,7 +13,6 @@ from helpers.renam import RenamPane
 from helpers.batch import BatchSelectDialog
 from helpers.frames import install_frames_tool
 from helpers.musicedit import MusicEditWidget
-from helpers.split_glue_video import SpliglueVideoTool
 from helpers.whisper import WhisperWidget
 from helpers.metadata import MetadataEditorWidget
 
@@ -1366,12 +1365,13 @@ class InstantToolsPane(QWidget):
         _sg_layout = QVBoxLayout(_sg_wrap)
         _sg_layout.setContentsMargins(0, 0, 0, 0)
         try:
-            _sg_widget = SpliglueVideoTool(self)
-        except Exception:
+            from helpers.split_glue_video import SpliglueVideoTool
             try:
-                _sg_widget = SpliglueVideoTool(None)
+                _sg_widget = SpliglueVideoTool(self)
             except Exception:
-                _sg_widget = QLabel("Split & Glue tool failed to load.")
+                _sg_widget = SpliglueVideoTool(None)
+        except Exception:
+            _sg_widget = QLabel("Split & Glue tool failed to load.")
         _sg_layout.addWidget(_sg_widget)
         sec_splitglue.setContentLayout(_sg_layout)
 

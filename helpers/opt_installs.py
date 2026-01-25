@@ -248,6 +248,15 @@ def _run_qwen3tts_models(root: Path) -> Optional[Tuple[str, List[str], Path]]:
 
 
 
+def _run_qwen3tts_flashattn(root: Path) -> Optional[Tuple[str, List[str], Path]]:
+    """Install FlashAttention for Qwen3-TTS (optional speed-up)."""
+    script = root / "presets" / "extra_env" / "install_flashattn_optional.bat"
+    if not script.exists():
+        return None
+    return _cmd_call_bat(script, root)
+
+
+
 def _run_qwen2512_env(root: Path) -> Optional[Tuple[str, List[str], Path]]:
     """
     Install the Qwen-Image-2512 GGUF environment.
@@ -445,7 +454,14 @@ def _default_installs() -> List[OptionalInstall]:
             runner=_run_qwen3tts_models,
         ),
 
+        
         OptionalInstall(
+            key="qwen3tts_flashattn",
+            title="Install flash attention",
+            description="optional but advised for faster generation, credits to Get Going Fast (https://www.youtube.com/@cognibuild)  for the help",
+            runner=_run_qwen3tts_flashattn,
+        ),
+OptionalInstall(
             key="wan22",
             title="WAN 2.2 5B. Text/image/video to Video with extender",
             description="VRAM: 24GB recommended for 720p (offloading works with less, but very slow). Disk: +30GB.",
@@ -1267,6 +1283,21 @@ class OptionalInstallsDialog(QtWidgets.QDialog):
         if not checked:
             return
 
+        # FlashAttention add-on (optional)
+        if key == "qwen3tts_flashattn":
+            bat = self.root_dir / "presets" / "extra_env" / "install_flashattn_optional.bat"
+            if not bat.exists():
+                self._toast("Missing installer: install_flashattn_optional.bat")
+                return
+
+            env_dir = (self.root_dir / "environments" / ".qwen3tts").resolve()
+            if not env_dir.exists():
+                self._toast("Qwen 3 TTS environment not found — it will be installed first.")
+
+            self._toast("FlashAttention will install when you press Start (env install only needed once).")
+            return
+
+
         bat = self.root_dir / "presets" / "extra_env" / "download_qwentts_models.bat"
         if not bat.exists():
             self._toast("Missing downloader: download_qwentts_models.bat")
@@ -1374,13 +1405,13 @@ class OptionalInstallsDialog(QtWidgets.QDialog):
         # If user selects the models-only downloader, ensure the Qwen3-TTS environment exists first.
         self._auto_added_qwen3tts_env = False
         try:
-            wants_qwen3tts_models = ("qwen3tts_models" in checked_set)
-            if wants_qwen3tts_models and ("qwen3tts" not in checked_set):
+            wants_qwen3tts_extras = ("qwen3tts_models" in checked_set) or ("qwen3tts_flashattn" in checked_set)
+            if wants_qwen3tts_extras and ("qwen3tts" not in checked_set):
                 env_dir = (self.root_dir / "environments" / ".qwen3tts").resolve()
                 if not env_dir.exists():
                     first_idx = None
                     for i, opt in enumerate(ordered):
-                        if opt.key == "qwen3tts_models":
+                        if opt.key in ("qwen3tts_models", "qwen3tts_flashattn"):
                             first_idx = i
                             break
                     for opt in self.installs:

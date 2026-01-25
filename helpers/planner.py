@@ -29,6 +29,7 @@ import io
 import contextlib
 import traceback
 import random
+import re
 from pathlib import Path
 from dataclasses import dataclass, asdict
 from typing import Dict, List, Optional, Any, Callable, Tuple
@@ -111,6 +112,76 @@ _WAN22_PRESETS = {
 
 def _normalize_key(s: str) -> str:
     return (s or "").strip().lower().replace(" ", "_")
+
+
+def _seed_to_int(seed: str) -> int:
+    """Deterministically convert any seed string into a stable 32-bit positive int."""
+    try:
+        s = (seed or "").encode("utf-8", errors="ignore")
+        h = hashlib.sha256(s).digest()
+        # Use 4 bytes; mask to signed-safe positive range
+        return int.from_bytes(h[:4], "little", signed=False) & 0x7FFFFFFF
+    except Exception:
+        try:
+            return abs(hash(seed)) & 0x7FFFFFFF
+        except Exception:
+            return 0
+
+def _parse_vnum(name: str) -> Tuple[int, int, int]:
+    """Parse versions like V3.0, v2, V10.1.2 from a filename."""
+    n = name or ""
+    m = re.search(r"[\-_\s]v(\d+)(?:\.(\d+))?(?:\.(\d+))?", n, flags=re.IGNORECASE)
+    if not m:
+        m = re.search(r"\bV(\d+)(?:\.(\d+))?(?:\.(\d+))?\b", n, flags=re.IGNORECASE)
+    if not m:
+        return (0, 0, 0)
+    a = int(m.group(1) or 0)
+    b = int(m.group(2) or 0)
+    c = int(m.group(3) or 0)
+    return (a, b, c)
+
+def _find_newest_qwen2512_turbo_lora() -> Optional[str]:
+    """Find newest Wuli Qwen-Image-2512 Turbo LoRA under <root>/models/loras/** by highest V number."""
+    base = _root() / "models" / "loras"
+    if not base.exists():
+        return None
+    target = "wuli-qwen-image-2512-turbo-lora"
+    best = None
+    best_v = (0, 0, 0)
+    # prefer files over folders if both exist; but accept either (some loras are folders)
+    for dirpath, dirnames, filenames in os.walk(str(base)):
+        for name in list(filenames) + list(dirnames):
+            if target not in name.lower():
+                continue
+            v = _parse_vnum(name)
+            if v > best_v:
+                best_v = v
+                best = os.path.join(dirpath, name)
+            elif v == best_v and best is not None:
+                # tie-break: prefer '4steps', then bf16, then shorter path
+                cur = name.lower()
+                old = os.path.basename(best).lower()
+                score = (("4steps" in cur), ("bf16" in cur), -len(os.path.join(dirpath, name)))
+                score_old = (("4steps" in old), ("bf16" in old), -len(best))
+                if score > score_old:
+                    best = os.path.join(dirpath, name)
+    return best
+
+
+
+def _load_shots_list(shots_json_path: str) -> List[Dict[str, Any]]:
+    """Read shots.json supporting both top-level list and legacy {"shots": [...]} wrapper."""
+    try:
+        obj = _safe_read_json(shots_json_path)
+    except Exception:
+        obj = None
+    if isinstance(obj, list):
+        return [x for x in obj if isinstance(x, dict)]
+    if isinstance(obj, dict):
+        v = obj.get("shots")
+        if isinstance(v, list):
+            return [x for x in v if isinstance(x, dict)]
+    return []
 
 def _video_model_key(label: str) -> str:
     l = (label or "").lower()
@@ -250,21 +321,6 @@ def _safe_read_json(path: str) -> Optional[dict]:
             return json.load(f)
     except Exception:
         return None
-
-
-def _read_shots_list(path: str) -> List[Dict[str, Any]]:
-    """Read shots.json accepting either:
-    - top-level list of shot dicts (preferred)
-    - legacy wrapper: { "shots": [ ... ] }
-    """
-    obj = _safe_read_json(path)
-    if isinstance(obj, list):
-        return [x for x in obj if isinstance(x, dict)]
-    if isinstance(obj, dict):
-        v = obj.get("shots")
-        if isinstance(v, list):
-            return [x for x in v if isinstance(x, dict)]
-    return []
 
 
 def _file_ok(path: str, min_bytes: int = 2) -> bool:
@@ -519,12 +575,6 @@ class PipelineWorker(QThread):
                 "silent": self.job.silent,
                 "storytelling_volume": self.job.storytelling_volume,
                 "music_volume": self.job.music_volume,
-
-                "image_model": self.job.encoding.get("image_model"),
-                "video_model": self.job.encoding.get("video_model"),
-                "gen_quality_preset": self.job.encoding.get("gen_quality_preset"),
-                "videoclip_preset": self.job.encoding.get("videoclip_preset"),
-                "generation_profile": self.job.encoding.get("generation_profile"),
             })
             manifest["paths"].update({
                 "story_dir": story_dir,
@@ -676,7 +726,11 @@ class PipelineWorker(QThread):
                     srec.update({
                         "status": "failed",
                         "fingerprint": plan_fingerprint,
-                        "debug": {"raw": plan_raw_path, "prompts_used": qwen_prompts_used, **({"error": qwen_plan_err} if _file_ok(qwen_plan_err, 1) else {})},
+                        "debug": {
+                            "raw": plan_raw_path,
+                            "prompts_used": qwen_prompts_used,
+                            "error": qwen_plan_err,
+                        },
                         "note": "Qwen JSON failed; wrote placeholder plan.json",
                         "ts": time.time(),
                     })
@@ -684,7 +738,7 @@ class PipelineWorker(QThread):
                     _safe_write_json(manifest_path, manifest)
                     return
 
-                # Merge resolved settings into plan
+                # Merge resolved settings into plan.
                 parsed.setdefault("title", f"Planner plan {self.job.job_id}")
                 parsed["prompt"] = self.job.prompt
                 parsed["extra_info"] = self.job.extra_info
@@ -716,17 +770,19 @@ class PipelineWorker(QThread):
                 manifest["paths"]["plan_json"] = plan_path
                 manifest["paths"]["plan_raw_txt"] = plan_raw_path
                 manifest["paths"]["qwen_prompts_used_txt"] = qwen_prompts_used
-                # Only store error path if an error file exists
-                if _file_ok(qwen_plan_err, 1):
+                # Clear prior error path if success
+                if os.path.isfile(qwen_plan_err):
                     manifest["paths"]["qwen_plan_error_txt"] = qwen_plan_err
-                else:
-                    manifest["paths"].pop("qwen_plan_error_txt", None)
 
                 srec = manifest["steps"].get("Plan (story + constraints)") or {}
                 srec.update({
                     "status": "done",
                     "fingerprint": plan_fingerprint,
-                    "debug": {"raw": plan_raw_path, "prompts_used": qwen_prompts_used, **({"error": qwen_plan_err} if _file_ok(qwen_plan_err, 1) else {})},
+                    "debug": {
+                        "raw": plan_raw_path,
+                        "prompts_used": qwen_prompts_used,
+                        "error": qwen_plan_err,
+                    },
                     "note": "Generated with Qwen (JSON enforced).",
                     "ts": time.time(),
                 })
@@ -766,14 +822,14 @@ class PipelineWorker(QThread):
                 sys_p = (
                     "You are a shot-list generator for an offline video pipeline. "
                     "Return ONLY valid JSON. No markdown, no commentary, no code fences. "
-                    "The JSON must be a single ARRAY (top-level list) of shot objects. "
+                    "The JSON must be a single object with key 'shots' as an array. "
                     "Each shot MUST include fields: id, seed, camera, mood, lighting, notes."
                 )
                 user_p = (
                     "Generate a concise seeded shot list for the plan below.\n"
                     "Rules:\n"
                     "- Output MUST be JSON only.\n"
-                    "- Output a top-level JSON array of {id, seed, camera, mood, lighting, notes} objects.\n"
+                    "- Provide exactly 'shots' array with {id, seed, camera, mood, lighting, notes}.\n"
                     "- Use ids like S01, S02, ... up to the requested count.\n"
                     "- Keep each shot to ONE clear action and ONE subject.\n"
                     "- Keep continuity across shots.\n\n"
@@ -827,7 +883,11 @@ class PipelineWorker(QThread):
                     srec.update({
                         "status": "failed",
                         "fingerprint": shots_fingerprint,
-                        "debug": {"raw": shots_raw_path, "prompts_used": qwen_prompts_used, **({"error": qwen_shots_err} if _file_ok(qwen_shots_err, 1) else {})},
+                        "debug": {
+                            "raw": shots_raw_path,
+                            "prompts_used": qwen_prompts_used,
+                            "error": qwen_shots_err,
+                        },
                         "note": "Qwen JSON failed; wrote placeholder shots.json",
                         "ts": time.time(),
                     })
@@ -850,7 +910,7 @@ class PipelineWorker(QThread):
                     out_shots.append({
                         "id": str(sid),
                         "seed": str(seed),
-                        "seed_int": int(_sha1_text(str(seed))[:8], 16) % 2147483647,
+                        "seed_int": _seed_to_int(str(seed)),
                         "camera": str(cam),
                         "mood": str(mood),
                         "lighting": str(light),
@@ -867,11 +927,6 @@ class PipelineWorker(QThread):
                 manifest["paths"]["shots_json"] = shots_path
                 manifest["paths"]["shots_raw_txt"] = shots_raw_path
                 manifest["paths"]["qwen_prompts_used_txt"] = qwen_prompts_used
-                # Only store error path if an error file exists
-                if _file_ok(qwen_shots_err, 1):
-                    manifest["paths"]["qwen_shots_error_txt"] = qwen_shots_err
-                else:
-                    manifest["paths"].pop("qwen_shots_error_txt", None)
                 # Only set n_shots if we have list
                 manifest["settings"]["n_shots"] = len(out_shots)
 
@@ -881,7 +936,11 @@ class PipelineWorker(QThread):
                     srec.update({
                         "status": "done",
                         "fingerprint": shots_fingerprint,
-                        "debug": {"raw": shots_raw_path, "prompts_used": qwen_prompts_used, **({"error": qwen_shots_err} if _file_ok(qwen_shots_err, 1) else {})},
+                        "debug": {
+                            "raw": shots_raw_path,
+                            "prompts_used": qwen_prompts_used,
+                            "error": qwen_shots_err,
+                        },
                         "note": "Generated with Qwen (JSON enforced).",
                         "ts": time.time(),
                     })
@@ -906,7 +965,7 @@ class PipelineWorker(QThread):
 # Step C: Image prompts
             image_prompts_path = os.path.join(prompts_dir, "image_prompts.txt")
             def step_image_prompts() -> None:
-                shots = _read_shots_list(shots_path)
+                shots = _load_shots_list(shots_path)
                 base_style = "Cinematic, detailed, consistent character design, clean composition."
                 if self.job.extra_info.strip():
                     base_style += f" Extra notes: {self.job.extra_info.strip()}"
@@ -929,7 +988,176 @@ class PipelineWorker(QThread):
             else:
                 _run("Image prompts (from shots)", step_image_prompts, 44)
 
-            # Step D: Transcript (optional)
+            
+                        # Step C2: Render REAL images for all shots using Txt2Img engine selection
+            images_dir = os.path.join(self.out_dir, "images")
+            os.makedirs(images_dir, exist_ok=True)
+
+            def step_render_all_images() -> None:
+                shots = _load_shots_list(shots_path)
+                if not shots:
+                    raise RuntimeError("shots.json is empty; cannot render images")
+
+                # Load user's last Txt2Img settings if available (respects their engine/model selection)
+                t2i_settings_path = str((_root() / "presets" / "setsave" / "txt2img.json").resolve())
+                base_job = _safe_read_json(t2i_settings_path) if os.path.exists(t2i_settings_path) else {}
+                if not isinstance(base_job, dict):
+                    base_job = {}
+
+                image_records: List[Dict[str, Any]] = []
+                total = len(shots)
+
+                for i, sh in enumerate(shots, start=1):
+                    sid = str(sh.get("id") or f"S{i:02d}")
+                    seed_txt = str(sh.get("seed", "") or "")
+                    camera = str(sh.get("camera", "medium shot") or "medium shot")
+                    lighting = str(sh.get("lighting", "cinematic lighting") or "cinematic lighting")
+                    mood = str(sh.get("mood", "neutral") or "neutral")
+
+                    # Build an image prompt similar to image_prompts.txt but per-shot
+                    base_style = "Cinematic, detailed, consistent character design, clean composition."
+                    if self.job.extra_info.strip():
+                        base_style += f" Extra notes: {self.job.extra_info.strip()}"
+                    prompt = f"{seed_txt}. {camera}. {lighting}. Mood: {mood}. High detail, sharp focus. {base_style}"
+
+                    t2i_job = dict(base_job)
+
+                    # Force "one image" and override the prompt/seed
+                    t2i_job["prompt"] = prompt
+                    t2i_job["seed"] = int(sh.get("seed_int") or _seed_to_int(seed_txt) or 0)
+                    t2i_job["batch"] = 1
+
+                    # Planner defaults: keep user's engine/model, but stabilize Qwen 2512 with known-good settings.
+                    _eng = str(t2i_job.get("engine") or "").lower().strip()
+                    if not _eng:
+                        _eng = "qwen2512"
+
+                    if "qwen" in _eng:
+                        # Locked-in for Qwen 2512 (Turbo LoRA friendly): Euler, 9 steps, CFG 2.5, 1408x792
+                        t2i_job["width"] = 1408
+                        t2i_job["height"] = 792
+                        t2i_job["sampler"] = "Euler"
+                        t2i_job["steps"] = 9
+                        t2i_job["cfg_scale"] = 2.5
+                        t2i_job["cfg"] = 2.5
+                    else:
+                        # Other engines: keep UI size when present, otherwise fall back to 1080p
+                        try:
+                            w = int(t2i_job.get("width") or 0)
+                            h = int(t2i_job.get("height") or 0)
+                        except Exception:
+                            w = 0
+                            h = 0
+                        if w <= 0 or h <= 0:
+                            t2i_job["width"] = 1920
+                            t2i_job["height"] = 1080
+
+                    # Ensure engine key exists for downstream dispatcher
+                    t2i_job.setdefault("engine", "qwen2512")
+
+                    # Output folder for the generator (txt2img uses 'output' key)
+                    t2i_job["output"] = images_dir
+                    # Give a predictable filename if backend supports it
+                    t2i_job.setdefault("filename_template", f"{self.job.job_id}_{sid}.png")
+                    t2i_job.setdefault("format", "png")
+
+                    # Safety: only use ultra-low steps (4–8) when Turbo LoRA is actually present.
+                    try:
+                        engine = str(t2i_job.get("engine") or "").lower()
+                        steps_val = t2i_job.get("steps", t2i_job.get("num_steps", None))
+                        cfg_val = t2i_job.get("cfg", t2i_job.get("guidance", None))
+                        steps = int(steps_val) if steps_val is not None else None
+                        cfg = float(cfg_val) if cfg_val is not None else None
+
+                        if "qwen" in engine:
+                            has_lora = bool(t2i_job.get("lora_path") or t2i_job.get("loras") or t2i_job.get("lora"))
+                            turbo_path = None
+                            turbo_used = False
+
+                            if (steps is not None and steps <= 8) and not has_lora:
+                                turbo_path = _find_newest_qwen2512_turbo_lora()
+                                if turbo_path:
+                                    t2i_job["lora_path"] = turbo_path
+                                    t2i_job.setdefault("lora_scale", 1.0)
+                                    t2i_job["steps"] = int(steps if steps is not None else 5)
+                                    turbo_used = True
+                                    if cfg is not None and cfg > 3.0:
+                                        t2i_job["cfg"] = 2.0
+                                        t2i_job["cfg_scale"] = 2.0
+                                else:
+                                    t2i_job["steps"] = 20
+
+                            # record into manifest for traceability (best-effort)
+                            manifest.setdefault("settings", {})
+                            if turbo_path:
+                                manifest["settings"]["qwen2512_turbo_lora_path"] = turbo_path
+                                manifest["settings"]["qwen2512_turbo_lora_used"] = bool(turbo_used)
+                            manifest["settings"]["image_sampler"] = str(t2i_job.get("sampler") or "")
+                            manifest["settings"]["image_steps"] = int(t2i_job.get("steps") or 0)
+                            try:
+                                manifest["settings"]["image_cfg"] = float(t2i_job.get("cfg") or t2i_job.get("cfg_scale") or 0)
+                            except Exception:
+                                pass
+                            manifest["settings"]["image_width"] = int(t2i_job.get("width") or 0)
+                            manifest["settings"]["image_height"] = int(t2i_job.get("height") or 0)
+                    except Exception:
+                        pass
+
+                    # Call into helpers/txt2img.py
+                    try:
+                        from helpers import txt2img as _t2i  # type: ignore
+                    except Exception:
+                        import txt2img as _t2i  # type: ignore
+
+                    self.signals.log.emit(f"[IMG] {sid} ({i}/{total})")
+                    res = None
+                    if hasattr(_t2i, "generate_one_from_job"):
+                        res = _t2i.generate_one_from_job(t2i_job, images_dir)
+                    elif hasattr(_t2i, "generate_qwen_images"):
+                        res = _t2i.generate_qwen_images(t2i_job)
+                    else:
+                        raise RuntimeError("txt2img generator entrypoint not found")
+
+                    out_file = None
+                    try:
+                        if isinstance(res, dict) and res.get("files"):
+                            out_file = res["files"][0]
+                    except Exception:
+                        out_file = None
+
+                    image_records.append({"id": sid, "file": out_file, "seed": t2i_job.get("seed")})
+
+                    # Update manifest incrementally so a partial run is still useful
+                    try:
+                        manifest.setdefault("paths", {})["images_dir"] = images_dir
+                        manifest["paths"]["images"] = image_records
+                        if out_file and not manifest["paths"].get("first_image"):
+                            manifest["paths"]["first_image"] = out_file
+                        manifest.setdefault("settings", {})["image_engine"] = str(res.get("backend") or t2i_job.get("engine") or "") if isinstance(res, dict) else str(t2i_job.get("engine") or "")
+                        manifest["settings"]["image_model"] = str(res.get("model") or "") if isinstance(res, dict) else str(t2i_job.get("model") or "")
+                        _safe_write_json(manifest_path, manifest)
+                    except Exception:
+                        pass
+
+                # Final write
+                manifest.setdefault("paths", {})["images_dir"] = images_dir
+                manifest["paths"]["images"] = image_records
+                _safe_write_json(manifest_path, manifest)
+
+            # Skip if images already exist for all shots
+            try:
+                _shots_n = len(_load_shots_list(shots_path))
+                _existing = []
+                for _ext in ("*.png", "*.jpg", "*.jpeg", "*.webp", "*.bmp"):
+                    _existing.extend(list(Path(images_dir).glob(_ext)))
+                if _shots_n > 0 and len(_existing) >= _shots_n:
+                    _skip("Images (all shots)", f"{len(_existing)}/{_shots_n} images already exist")
+                else:
+                    _run("Images (all shots)", step_render_all_images, 52)
+            except Exception:
+                _run("Images (all shots)", step_render_all_images, 52)
+
+# Step D: Transcript (optional)
             transcript_path = os.path.join(audio_dir, "transcript.txt")
             def step_transcript() -> None:
                 if self.job.storytelling and not self.job.silent:
@@ -952,7 +1180,7 @@ class PipelineWorker(QThread):
             # Step E: I2V prompts
             i2v_prompts_path = os.path.join(prompts_dir, "i2v_prompts.txt")
             def step_i2v_prompts() -> None:
-                shots = _read_shots_list(shots_path)
+                shots = _load_shots_list(shots_path)
                 lines = []
                 for sh in shots:
                     sid = sh.get("id", "S??")

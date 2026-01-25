@@ -90,6 +90,7 @@ def _merge_neg_csv(base: str, extra: str) -> str:
 
 # --- Quiet mode: suppress harmless logs/warnings for end users ---
 import os, warnings
+import re
 # Progress bars & banners
 os.environ.setdefault("HF_HUB_DISABLE_PROGRESS_BARS", "1")
 os.environ.setdefault("BITSANDBYTES_NOWELCOME", "1")
@@ -1592,6 +1593,7 @@ class Txt2ImgPane(QWidget):
             ("1280x720 (16:9)", 1280, 720),
             ("1280x704 (16:9, WAN specific size)", 1280, 704),
             ("1344x768 (16:9)", 1344, 768),
+            ("1408×792 (16:9)", 1408, 792),
             ("1536x864 (16:9, max advised for SDXL)", 1536, 864),
             ("1792x1008 (16:9)", 1792, 1008),
             ("1920x1080 (16:9), Qwen2512 only", 1920, 1080),
@@ -5799,6 +5801,106 @@ def _gen_via_qwen2512(job: dict, out_dir: Path, progress_cb=None, cancel_event: 
     if not files:
         return None
     return {"files": files, "backend": "qwen2512", "model": f"qwen 2.5 12B GGUF — {_P(str(diffusion)).name}"}
+
+
+def _find_latest_qwen2512_turbo_lora(root_dir: Path) -> str:
+    """Auto-pick newest Wuli Qwen Image 2512 Turbo LoRA by highest Vx.y(.z) in name, scanning models/loras recursively."""
+    try:
+        base = (Path(root_dir) / "models" / "loras").resolve()
+    except Exception:
+        base = Path("models/loras").resolve()
+    if not base.exists():
+        return ""
+    pats = []
+    try:
+        for p in base.rglob("*"):
+            try:
+                if not p.is_file():
+                    continue
+                name = p.name.lower()
+                if "wuli-qwen-image-2512-turbo-lora" in name:
+                    pats.append(p)
+            except Exception:
+                continue
+    except Exception:
+        return ""
+    if not pats:
+        return ""
+    def _ver_tuple(p: Path):
+        nm = p.name
+        m = re.search(r"[\-_ ]v(\d+)(?:\.(\d+))?(?:\.(\d+))?", nm, flags=re.IGNORECASE)
+        if not m:
+            return (0, 0, 0)
+        a = int(m.group(1) or 0)
+        b = int(m.group(2) or 0) if m.group(2) is not None else 0
+        c = int(m.group(3) or 0) if m.group(3) is not None else 0
+        return (a, b, c)
+    # Highest version first; tie-breaker prefers 4steps then bf16 then shortest path
+    pats.sort(key=lambda p: (_ver_tuple(p),
+                             ("4steps" in p.name.lower()),
+                             ("bf16" in p.name.lower())),
+              reverse=True)
+    return str(pats[0])
+
+def generate_one_from_job(job: dict, out_dir: str | Path, progress_cb=None, cancel_event: Optional[threading.Event] = None):
+    """Minimal public entrypoint for non-UI callers (e.g. Planner). Dispatches to the selected engine and returns metadata."""
+    try:
+        od = Path(out_dir)
+        od.mkdir(parents=True, exist_ok=True)
+    except Exception:
+        od = Path(".")
+    try:
+        root_dir = Path(__file__).resolve().parents[1]
+    except Exception:
+        root_dir = Path(".").resolve()
+
+    ek = str(job.get("engine") or "").strip().lower() or "qwen2512"
+
+    # Auto Turbo LoRA for Qwen 2512 if not explicitly provided
+    if ek == "qwen2512":
+        try:
+            lp = str(job.get("lora_path") or "").strip()
+            if not lp:
+                tl = _find_latest_qwen2512_turbo_lora(root_dir)
+                if tl:
+                    job["lora_path"] = tl
+                    # Turbo defaults: 4-8 steps; pick 5 for testing unless user already set <= 8
+                    try:
+                        st = int(job.get("steps", 40))
+                        if st > 8:
+                            job["steps"] = 5
+                    except Exception:
+                        job["steps"] = 5
+                    # Lower CFG a bit for turbo if too high
+                    try:
+                        cfg = float(job.get("cfg_scale", 2.5))
+                        if cfg > 4.0:
+                            job["cfg_scale"] = 3.0
+                    except Exception:
+                        pass
+                    job["turbo_lora_used"] = True
+        except Exception:
+            pass
+
+    # Force single image batch for this entrypoint
+    try:
+        job["batch"] = int(job.get("batch", 1)) if int(job.get("batch", 1)) > 0 else 1
+    except Exception:
+        job["batch"] = 1
+
+    if ek == "qwen2512":
+        res = _gen_via_qwen2512(job, od, progress_cb=progress_cb, cancel_event=cancel_event)
+        return res
+    if ek.startswith("zimage"):
+        res = _gen_via_zimage(job, od, progress_cb=progress_cb, cancel_event=cancel_event)
+        return res
+    if ek == "diffusers":
+        res = _gen_via_diffusers(job, od, progress_cb=progress_cb, cancel_event=cancel_event)
+        return res
+    if ek == "a1111":
+        res = _gen_via_a1111(job, od, progress_cb=progress_cb, cancel_event=cancel_event)
+        return res
+    return None
 
 def generate_qwen_images(job: dict, progress_cb: Optional[Callable[[float], None]] = None, cancel_event: Optional[threading.Event] = None):
     """Generator that saves images and returns metadata. Uses CPU fallback to validate pipeline end-to-end."""
