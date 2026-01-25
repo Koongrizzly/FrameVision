@@ -636,6 +636,42 @@ class SpliglueVideoTool(QWidget):
             self.glue_list.insertItem(row + 1, item)
             self.glue_list.setCurrentRow(row + 1)
 
+    @staticmethod
+    def _try_resolve_video_path(p: str) -> Path | None:
+        """Resolve a UI entry into an actual existing video file path.
+        - Requires a real file (not a folder)
+        - If the entry has no extension, try common video extensions
+        """
+        if not p:
+            return None
+        pp = Path(p)
+
+        # If the user accidentally added a folder, reject it (ffmpeg concat needs files).
+        if pp.exists() and pp.is_dir():
+            return None
+
+        if pp.is_file():
+            return pp
+
+        # If missing extension, try to find the real file next to it.
+        if pp.suffix == "":
+            for ext in (".mp4", ".mkv", ".mov", ".avi", ".webm", ".m4v"):
+                cand = pp.with_suffix(ext)
+                if cand.is_file():
+                    return cand
+
+        return None
+
+    @staticmethod
+    def _concat_line_for(path: Path) -> str:
+        # ffmpeg concat demuxer: prefer single quotes; if path contains a single quote, use double quotes.
+        s = path.resolve().as_posix()
+        if "'" not in s:
+            return f"file '{s}'"
+        # Escape any double quotes if we have to fall back to double quotes
+        s2 = s.replace('"', r'\"')
+        return f'file "{s2}"'
+
     def _start_glue(self):
         if self.glue_list.count() < 2:
             QMessageBox.warning(
@@ -645,15 +681,28 @@ class SpliglueVideoTool(QWidget):
             )
             return
 
-        paths = [self.glue_list.item(i).text().strip() for i in range(self.glue_list.count())]
-        for p in paths:
-            if not p or not Path(p).exists():
+        raw_paths = [self.glue_list.item(i).text().strip() for i in range(self.glue_list.count())]
+        resolved: list[Path] = []
+        for i, raw in enumerate(raw_paths):
+            rp = self._try_resolve_video_path(raw)
+            if rp is None:
                 QMessageBox.warning(
                     self,
                     "Invalid input",
-                    "One or more selected videos do not exist.",
+                    f"Entry #{i+1} is not a valid video file.\n\nPath: {raw or '(empty)'}\n\n"
+                    "Tip: Make sure you selected actual video files (not folders). "
+                    "If your file has no extension, rename it to .mp4 (or similar) and try again.",
                 )
                 return
+            resolved.append(rp)
+
+            # If we auto-fixed a missing extension, update the UI entry so it stays correct.
+            if raw and Path(raw) != rp:
+                try:
+                    self.glue_list.item(i).setText(str(rp))
+                    self._log(f"Auto-fixed input #{i+1}: {raw} -> {rp}")
+                except Exception:
+                    pass
 
         out_dir = Path(self.glue_output_edit.text().strip()) if self.glue_output_edit.text().strip() else DEFAULT_OUTPUT_DIR
         out_dir.mkdir(parents=True, exist_ok=True)
@@ -661,20 +710,17 @@ class SpliglueVideoTool(QWidget):
 
         name = self.glue_output_name_edit.text().strip()
         if not name:
-            # Use name of first file with _glued suffix
-            first = Path(paths[0])
+            first = resolved[0]
             name = f"{first.stem}_glued"
 
-        # Use extension from the first file
-        ext = Path(paths[0]).suffix or ".mp4"
+        ext = resolved[0].suffix or ".mp4"
         output_file = out_dir / f"{name}{ext}"
 
         # Create a temporary concat list file
         concat_list_path = out_dir / f"_splitglue_concat_{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt"
-        with concat_list_path.open("w", encoding="utf-8") as f:
-            for p in paths:
-                # ffmpeg concat demuxer expects paths in single quotes
-                f.write(f"file '{Path(p).as_posix()}'\n")  # use forward slashes
+        with concat_list_path.open("w", encoding="utf-8", newline="\n") as f:
+            for p in resolved:
+                f.write(self._concat_line_for(p) + "\n")
 
         cmd = [
             self.ffmpeg_path,
@@ -691,7 +737,6 @@ class SpliglueVideoTool(QWidget):
         ]
 
         self._run_batch([cmd], [str(output_file)], operation="glue", extra_files=[concat_list_path])
-
 
     # --------------------------- Batch & zip ---------------------------
 

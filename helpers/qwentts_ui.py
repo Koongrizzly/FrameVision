@@ -3,61 +3,72 @@ import sys
 import json
 import time
 import traceback
+import subprocess
 import importlib.util
-from dataclasses import dataclass, asdict, field
+from dataclasses import dataclass, field
 from pathlib import Path
-# ---------- FrameVision tool layout ----------
-# This file lives in: <root>/helpers/qwentts_ui.py
+
+# ---------------------------------------------------------------------
+# FrameVision tool layout
+# This file should live in: <root>/helpers/qwentts_ui.py
 # Expected folders:
 #   <root>/environments/.qwen3tts/
-#   <root>/presets/extra_env/
 #   <root>/presets/setsave/        (settings/presets)
 #   <root>/models/
-#   <root>/output/
-ROOT_DIR = Path(__file__).resolve().parents[1]
+#   <root>/output/audio/qwen3tts/
+#
+# FrameVision integration goals:
+#  - UI runs in the host (FrameVision) Python process (no self-relaunch).
+#  - NO model preloading in the UI process (no torch / qwen_tts imports here).
+#  - All heavy work (downloads, torch, model load, generation) happens in a
+#    one-shot subprocess using:
+#      <root>/environments/.qwen3tts/Scripts/python.exe
+# ---------------------------------------------------------------------
 
+ROOT_DIR = Path(__file__).resolve().parents[1]
 ENV_PY = ROOT_DIR / "environments" / ".qwen3tts" / "Scripts" / "python.exe"
 
-def _relaunch_in_env() -> None:
-    """If launched with the wrong Python, relaunch using the tool venv."""
-    try:
-        if ENV_PY.exists():
-            cur = Path(sys.executable).resolve()
-            tgt = ENV_PY.resolve()
-            if cur != tgt:
-                os.execv(str(tgt), [str(tgt), str(Path(__file__).resolve()), *sys.argv[1:]])
-    except Exception:
-        # If anything goes wrong, continue; the UI will show import errors later.
-        pass
+HELPERS_DIR = Path(__file__).resolve().parent
+MODELS_DIR = ROOT_DIR / "models"
+OUTPUT_DIR = ROOT_DIR / "output" / "audio" / "qwen3tts"
+PRESETS_DIR = ROOT_DIR / "presets" / "setsave"
 
-_relaunch_in_env()
+# Hugging Face repos we support in this UI
+HF_MODELS = {
+    "Tokenizer": "Qwen/Qwen3-TTS-Tokenizer-12Hz",
+    "CustomVoice": "Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice",
+    "Base (for Voice Clone)": "Qwen/Qwen3-TTS-12Hz-1.7B-Base",
+    "VoiceDesign": "Qwen/Qwen3-TTS-12Hz-1.7B-VoiceDesign",
+}
 
-def _try_inject_repo_path() -> None:
-    """Fallback if qwen_tts isn't installed: add a nearby repo folder to sys.path."""
-    candidates = [
-        ROOT_DIR / "repo",
-        ROOT_DIR / "repos" / "Qwen3-TTS",
-        ROOT_DIR / "Qwen3-TTS",
-        ROOT_DIR / "presets" / "extra_env" / "repo",
-        ROOT_DIR / "presets" / "extra_env" / "Qwen3-TTS",
-    ]
-    for c in candidates:
-        try:
-            if (c / "qwen_tts").exists():
-                sys.path.insert(0, str(c))
-                return
-        except Exception:
-            pass
+SUPPORTED_SPEAKERS_FALLBACK = ["aiden", "dylan", "eric", "ono_anna", "ryan", "serena", "sohee", "uncle_fu", "vivian"]
+SUPPORTED_LANGS_FALLBACK = ["Auto", "Chinese", "English", "Japanese", "Korean", "French", "German", "Spanish", "Portuguese", "Russian", "Italian", "Arabic"]
 
-# Make SoX discoverable for qwen-tts (Windows friendly, no system install needed)
-try:
-    import static_sox  # type: ignore
-    static_sox.add_paths(weak=True)
-except Exception:
-    pass
 
-import torch
-from PySide6 import QtCore, QtWidgets
+def ensure_dirs():
+    MODELS_DIR.mkdir(parents=True, exist_ok=True)
+    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+    PRESETS_DIR.mkdir(parents=True, exist_ok=True)
+
+
+def repo_to_local_dir(repo_id: str) -> str:
+    return str(MODELS_DIR / repo_id.split("/")[-1])
+
+
+DEFAULT_TOKENIZER_DIR = repo_to_local_dir(HF_MODELS["Tokenizer"])
+DEFAULT_CUSTOMVOICE_DIR = repo_to_local_dir(HF_MODELS["CustomVoice"])
+DEFAULT_BASE_DIR = repo_to_local_dir(HF_MODELS["Base (for Voice Clone)"])
+DEFAULT_VOICEDESIGN_DIR = repo_to_local_dir(HF_MODELS["VoiceDesign"])
+
+
+def safe_lower_speaker(s: str) -> str:
+    return (s or "").strip().lower()
+
+
+# -----------------------------
+# Qt imports (lightweight)
+# -----------------------------
+from PySide6 import QtCore, QtWidgets  # noqa: E402
 
 
 class CollapsibleSection(QtWidgets.QWidget):
@@ -109,48 +120,9 @@ class CollapsibleSection(QtWidgets.QWidget):
         self.toggled.emit(collapsed)
 
 
-# qwen-tts entrypoint (robust across package layouts)
-_try_inject_repo_path()
-try:
-    from qwen_tts import Qwen3TTSModel  # type: ignore
-except Exception:
-    from qwen_tts.inference import Qwen3TTSModel  # type: ignore
-
-# Optional deps used only for some features
-HAS_FLASH_ATTN = importlib.util.find_spec("flash_attn") is not None
-
-HELPERS_DIR = Path(__file__).resolve().parent
-MODELS_DIR = ROOT_DIR / "models"
-OUTPUT_DIR = ROOT_DIR / "output"
-PRESETS_DIR = ROOT_DIR / "presets" / "setsave"
-
-# Hugging Face repos we support in this UI
-HF_MODELS = {
-    "Tokenizer": "Qwen/Qwen3-TTS-Tokenizer-12Hz",
-    "CustomVoice": "Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice",
-    "Base (for Voice Clone)": "Qwen/Qwen3-TTS-12Hz-1.7B-Base",
-    "VoiceDesign": "Qwen/Qwen3-TTS-12Hz-1.7B-VoiceDesign",
-}
-
-def repo_to_local_dir(repo_id: str) -> str:
-    return str(MODELS_DIR / repo_id.split("/")[-1])
-
-DEFAULT_TOKENIZER_DIR = repo_to_local_dir(HF_MODELS["Tokenizer"])
-DEFAULT_CUSTOMVOICE_DIR = repo_to_local_dir(HF_MODELS["CustomVoice"])
-DEFAULT_BASE_DIR = repo_to_local_dir(HF_MODELS["Base (for Voice Clone)"])
-DEFAULT_VOICEDESIGN_DIR = repo_to_local_dir(HF_MODELS["VoiceDesign"])
-
-SUPPORTED_SPEAKERS_FALLBACK = ["aiden","dylan","eric","ono_anna","ryan","serena","sohee","uncle_fu","vivian"]
-SUPPORTED_LANGS_FALLBACK = ["Auto","Chinese","English","Japanese","Korean","French","German","Spanish","Portuguese","Russian","Italian","Arabic"]
-
-def ensure_dirs():
-    MODELS_DIR.mkdir(parents=True, exist_ok=True)
-    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
-    PRESETS_DIR.mkdir(parents=True, exist_ok=True)
-
-def safe_lower_speaker(s: str) -> str:
-    return (s or "").strip().lower()
-
+# -----------------------------
+# Preset dataclasses (UI only)
+# -----------------------------
 @dataclass
 class CommonSettings:
     device: str = "auto"  # auto / cpu / cuda:0 ...
@@ -163,6 +135,7 @@ class CommonSettings:
     output_name: str = "qwen_tts"
     add_timestamp: bool = True
 
+
 @dataclass
 class CustomVoicePreset:
     text: str = "Hello from Qwen3 TTS."
@@ -172,6 +145,7 @@ class CustomVoicePreset:
     model_path: str = DEFAULT_CUSTOMVOICE_DIR
     tokenizer_path: str = DEFAULT_TOKENIZER_DIR
     common: CommonSettings = field(default_factory=CommonSettings)
+
 
 @dataclass
 class VoiceClonePreset:
@@ -185,6 +159,7 @@ class VoiceClonePreset:
     tokenizer_path: str = DEFAULT_TOKENIZER_DIR
     common: CommonSettings = field(default_factory=CommonSettings)
 
+
 @dataclass
 class VoiceDesignPreset:
     text: str = "Hello. This is a voice design test."
@@ -195,218 +170,126 @@ class VoiceDesignPreset:
     common: CommonSettings = field(default_factory=CommonSettings)
 
 
-class HFDownloadWorker(QtCore.QObject):
+# -----------------------------
+# Subprocess bridge
+# -----------------------------
+def _env_ok() -> bool:
+    return ENV_PY.exists()
+
+
+def _subproc_cmd(task: str) -> list[str]:
+    # Run this same file in "worker mode" under the qwen3tts environment python.
+    return [str(ENV_PY), "-u", str(Path(__file__).resolve()), "--worker", "--task", task]
+
+
+class EnvTaskWorker(QtCore.QObject):
+    """
+    Runs a task in the qwen3tts environment python.
+    - Sends one JSON payload via stdin
+    - Receives streaming log lines and a final JSON result
+    """
+
     log = QtCore.Signal(str)
-    done = QtCore.Signal(bool)
-
-    def __init__(self, items: list[tuple[str, str]], token: str | None = None):
-        super().__init__()
-        self.items = items
-        self.token = token
-
-    @QtCore.Slot()
-    def run(self):
-        try:
-            # Disable hf_transfer if user has it enabled globally (prevents the "hf_transfer not installed" crash).
-            os.environ["HF_HUB_ENABLE_HF_TRANSFER"] = "0"
-            from huggingface_hub import snapshot_download  # type: ignore
-
-            for label, repo_id in self.items:
-                local_dir = Path(repo_to_local_dir(repo_id))
-                if local_dir.exists() and any(local_dir.iterdir()):
-                    self.log.emit(f"✓ Already present: {label}")
-                    continue
-
-                self.log.emit(f"Downloading: {label} ({repo_id}) ...")
-                snapshot_download(
-                    repo_id=repo_id,
-                    local_dir=str(local_dir),
-                    local_dir_use_symlinks=False,
-                    token=self.token,
-                    resume_download=True,
-                )
-                self.log.emit(f"✓ Downloaded: {label}")
-
-            self.done.emit(True)
-        except Exception:
-            self.log.emit("ERROR during download:\n" + traceback.format_exc())
-            self.done.emit(False)
-
-
-class ModelCache(QtCore.QObject):
-    status = QtCore.Signal(str)
-
-    def __init__(self):
-        super().__init__()
-        self._model = None
-        self._loaded_key = None
-
-    def _resolve_device(self, device_choice: str):
-        if device_choice == "auto":
-            return "cuda" if torch.cuda.is_available() else "cpu"
-        return device_choice
-
-    def _resolve_dtype(self, dtype_choice: str):
-        if dtype_choice == "bfloat16":
-            return torch.bfloat16
-        if dtype_choice == "float16":
-            return torch.float16
-        return torch.float32
-
-    def _resolve_attn(self, attn_choice: str):
-        if attn_choice == "none":
-            return None
-        return attn_choice
-
-    def load_if_needed(self, model_path_or_id: str, device_choice: str, dtype_choice: str, attn_choice: str):
-        device = self._resolve_device(device_choice)
-
-        # Guard: FlashAttention2 cannot be used unless flash_attn is installed.
-        if attn_choice == "flash_attention_2" and not HAS_FLASH_ATTN:
-            self.status.emit("FlashAttention2 selected but flash_attn is not installed; falling back to SDPA.")
-            attn_choice = "sdpa"
-
-        dtype = self._resolve_dtype(dtype_choice)
-        attn_impl = self._resolve_attn(attn_choice)
-
-        key = (model_path_or_id, device, str(dtype), str(attn_impl))
-        if self._model is not None and self._loaded_key == key:
-            return self._model
-
-        self.status.emit("Loading model (first time can take a while)...")
-
-        kwargs = {
-            "device_map": device,
-            "dtype": dtype,
-        }
-        if attn_impl is not None:
-            kwargs["attn_implementation"] = attn_impl
-
-        try:
-            model = Qwen3TTSModel.from_pretrained(model_path_or_id, **kwargs)
-        except Exception as e:
-            msg = str(e)
-            if ("flash_attn" in msg.lower()) or ("flashattention2" in msg.lower()):
-                self.status.emit("FlashAttention2 is not usable here; retrying with SDPA...")
-                kwargs.pop("attn_implementation", None)
-                kwargs["attn_implementation"] = "sdpa"
-                try:
-                    model = Qwen3TTSModel.from_pretrained(model_path_or_id, **kwargs)
-                except Exception:
-                    kwargs.pop("attn_implementation", None)
-                    model = Qwen3TTSModel.from_pretrained(model_path_or_id, **kwargs)
-            elif dtype_choice == "bfloat16":
-                self.status.emit("bfloat16 load failed; retrying with float16...")
-                kwargs["dtype"] = torch.float16
-                model = Qwen3TTSModel.from_pretrained(model_path_or_id, **kwargs)
-            else:
-                raise
-
-        self._model = model
-        self._loaded_key = key
-        self.status.emit("Model loaded.")
-        return self._model
-
-
-class TTSWorker(QtCore.QObject):
-    finished = QtCore.Signal(str)
+    done = QtCore.Signal(dict)
     failed = QtCore.Signal(str)
-    log = QtCore.Signal(str)
 
-    def __init__(self, mode: str, payload: dict, cache: ModelCache):
+    def __init__(self, task: str, payload: dict):
         super().__init__()
-        self.mode = mode
+        self.task = task
         self.payload = payload
-        self.cache = cache
-
-    def _out_path(self, base_name: str, add_ts: bool) -> Path:
-        name = (base_name or "qwen_tts").strip()
-        if add_ts:
-            name = f"{name}_{time.strftime('%Y%m%d_%H%M%S')}"
-        return OUTPUT_DIR / f"{name}.wav"
 
     @QtCore.Slot()
     def run(self):
+        if not _env_ok():
+            self.failed.emit(f"Missing environment python: {ENV_PY}")
+            return
+
         try:
-            common = self.payload["common"]
-            model_path = self.payload["model_path"]
-            model = self.cache.load_if_needed(model_path, common["device"], common["dtype"], common["attn_impl"])
+            env = os.environ.copy()
+            env.setdefault("HF_HUB_ENABLE_HF_TRANSFER", "0")
 
-            gen_kwargs = {
-                "max_new_tokens": int(common["max_new_tokens"]),
-                "temperature": float(common["temperature"]),
-                "top_p": float(common["top_p"]),
-                "top_k": int(common["top_k"]),
-            }
+            p = subprocess.Popen(
+                _subproc_cmd(self.task),
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                cwd=str(ROOT_DIR),
+                env=env,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                bufsize=1,
+            )
 
-            out_wav = self._out_path(common["output_name"], bool(common["add_timestamp"]))
+            try:
+                payload_str = json.dumps(self.payload, ensure_ascii=False)
+            except Exception:
+                payload_str = "{}"
 
-            import soundfile as sf
+            if p.stdin:
+                p.stdin.write(payload_str)
+                p.stdin.close()
 
-            if self.mode == "custom":
-                wavs, sr = model.generate_custom_voice(
-                    text=self.payload["text"],
-                    language=self.payload["language"],
-                    speaker=safe_lower_speaker(self.payload["speaker"]),
-                    instruct=self.payload["instruct"].strip() if self.payload["instruct"] else None,
-                    non_streaming_mode=True,
-                    **gen_kwargs,
-                )
-                sf.write(str(out_wav), wavs[0], sr)
+            result = None
+            # Stream output. Worker prints lines, and ends with: __RESULT__{json}
+            if p.stdout:
+                for line in p.stdout:
+                    line = (line or "").rstrip("\n")
+                    if not line:
+                        continue
+                    if line.startswith("__LOG__"):
+                        self.log.emit(line[len("__LOG__"):].lstrip())
+                    elif line.startswith("__RESULT__"):
+                        js = line[len("__RESULT__"):].strip()
+                        try:
+                            result = json.loads(js)
+                        except Exception:
+                            result = {"ok": False, "error": f"Failed to parse result JSON: {js}"}
+                    else:
+                        # Pass through unknown lines
+                        self.log.emit(line)
 
-            elif self.mode == "clone":
-                ref_audio_path = self.payload["ref_audio_path"].strip()
-                if not ref_audio_path:
-                    raise ValueError("Please choose a reference audio file.")
-                # qwen-tts supports passing a path directly
-                wavs, sr = model.generate_voice_clone(
-                    text=self.payload["text"],
-                    language=self.payload["language"],
-                    ref_audio=ref_audio_path,
-                    ref_text=self.payload["ref_text"].strip() if self.payload["ref_text"] else None,
-                    x_vector_only_mode=bool(self.payload["x_vector_only_mode"]),
-                    instruct=self.payload["instruct"].strip() if self.payload["instruct"] else None,
-                    non_streaming_mode=True,
-                    **gen_kwargs,
-                )
-                sf.write(str(out_wav), wavs[0], sr)
+            rc = p.wait()
+            if rc != 0 and (result is None):
+                self.failed.emit(f"Worker exited with code {rc}.")
+                return
 
-            elif self.mode == "design":
-                wavs, sr = model.generate_voice_design(
-                    text=self.payload["text"],
-                    language=self.payload["language"],
-                    instruct=self.payload["voice_description"].strip(),
-                    non_streaming_mode=True,
-                    **gen_kwargs,
-                )
-                sf.write(str(out_wav), wavs[0], sr)
+            if result is None:
+                result = {"ok": False, "error": "No result returned from worker."}
 
+            if result.get("ok", False):
+                self.done.emit(result)
             else:
-                raise ValueError(f"Unknown mode: {self.mode}")
-
-            self.finished.emit(str(out_wav))
+                self.failed.emit(result.get("error", "Unknown error (worker returned ok=false)."))
         except Exception:
             self.failed.emit(traceback.format_exc())
 
 
+# -----------------------------
+# Main UI
+# -----------------------------
 class MainWindow(QtWidgets.QMainWindow):
     def __init__(self):
         super().__init__()
         ensure_dirs()
-        self.setWindowTitle("Qwen3-TTS Desktop UI (CustomVoice / Voice Clone / Voice Design)")
+        self.setWindowTitle("Qwen3-TTS (FrameVision tool)")
         self.resize(1040, 800)
 
-        self.cache = ModelCache()
-        self.cache.status.connect(self._log)
+        # Autosave (debounced) to presets/setsave/qwentts.json
+        self._autosave_timer = QtCore.QTimer(self)
+        self._autosave_timer.setSingleShot(True)
+        self._autosave_timer.setInterval(250)
+        self._autosave_timer.timeout.connect(self._save_last_state)
 
         self._build_ui()
+        self._wire_autosave_signals()
         self._load_last_state()
-        self._update_gpu_info()
         self._update_model_status()
+        self._update_env_status()
+        self._refresh_gpu_info_async()
 
     # ---------- UI ----------
     def _build_ui(self):
-        # Wrap the whole UI in a scroll area so smaller windows don't cause widgets to collide.
         outer = QtWidgets.QWidget()
         self.setCentralWidget(outer)
         outer_layout = QtWidgets.QVBoxLayout(outer)
@@ -421,7 +304,21 @@ class MainWindow(QtWidgets.QMainWindow):
         cw = QtWidgets.QWidget()
         scroll.setWidget(cw)
         layout = QtWidgets.QVBoxLayout(cw)
-        # Top: model manager (collapsible)
+
+        # Environment status
+        env_content = QtWidgets.QWidget()
+        env_lay = QtWidgets.QHBoxLayout(env_content)
+        env_lay.setContentsMargins(0, 0, 0, 0)
+        self.lbl_env = QtWidgets.QLabel("")
+        self.btn_env_refresh = QtWidgets.QPushButton("Refresh")
+        self.btn_env_refresh.clicked.connect(self._update_env_status)
+        env_lay.addWidget(self.lbl_env, 1)
+        env_lay.addWidget(self.btn_env_refresh, 0)
+
+        self.section_env = CollapsibleSection("Environment", env_content, collapsed=False)
+        layout.addWidget(self.section_env)
+
+        # Model manager (download only; no preloading)
         mm_content = QtWidgets.QWidget()
         mm_layout = QtWidgets.QGridLayout(mm_content)
 
@@ -434,11 +331,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.chk_custom.setChecked(True)
 
         self.btn_download = QtWidgets.QPushButton("Download selected")
-        self.btn_download.setToolTip("Downloads via Hugging Face into models/.\n"
-                                     "If you see auth errors, set HF_TOKEN in your environment.")
         self.btn_open_models = QtWidgets.QPushButton("Open models folder")
-        self.btn_open_models.setToolTip("Open the local models folder.")
-
         self.lbl_model_status = QtWidgets.QLabel("")
         self.lbl_model_status.setWordWrap(True)
 
@@ -451,67 +344,48 @@ class MainWindow(QtWidgets.QMainWindow):
         mm_layout.addWidget(self.lbl_model_status, 2, 0, 1, 3)
 
         self.section_mm = CollapsibleSection("Model Manager", mm_content, collapsed=True)
-        self.section_mm.setToolTip("Download the models this UI supports into the local 'models' folder.\n"
-                                   "This does NOT require admin rights and does not touch system Python.\n"
-                                   "If a model already exists, it will be skipped.")
         layout.addWidget(self.section_mm)
 
         self.tabs = QtWidgets.QTabWidget()
         layout.addWidget(self.tabs, 1)
-        # Common settings (collapsible; used by all tabs)
+
+        # Common settings (collapsible)
         common_content = QtWidgets.QWidget()
         common_layout = QtWidgets.QFormLayout(common_content)
 
         self.device = QtWidgets.QComboBox()
-        devs = ["auto", "cpu"]
-        if torch.cuda.is_available():
-            devs += [f"cuda:{i}" for i in range(torch.cuda.device_count())]
-        self.device.addItems(devs)
-        self.device.setToolTip("Where to run the model.\n"
-                               "Auto uses CUDA if available, otherwise CPU.")
+        self.device.addItems(["auto", "cpu", "cuda:0", "cuda:1", "cuda:2", "cuda:3"])
+        self.device.setToolTip("Where to run the model (resolved inside the qwen3tts environment).")
 
         self.dtype = QtWidgets.QComboBox()
         self.dtype.addItems(["bfloat16", "float16", "float32"])
-        self.dtype.setToolTip("Precision. bfloat16 is fastest on some GPUs, but not all.\n"
-                              "If you see load errors, pick float16.")
 
         self.attn = QtWidgets.QComboBox()
-        opts = ["flash_attention_2", "sdpa", "none"]
-        if not HAS_FLASH_ATTN:
-            opts.remove("flash_attention_2")
-        self.attn.addItems(opts)
+        self.attn.addItems(["sdpa", "flash_attention_2", "none"])
         self.attn.setCurrentText("sdpa")
-        self.attn.setToolTip("Attention implementation.\n"
-                             "SDPA is the safe default. FlashAttention2 needs flash_attn installed.")
 
         self.temperature = QtWidgets.QDoubleSpinBox()
         self.temperature.setRange(0.05, 2.0)
         self.temperature.setSingleStep(0.05)
         self.temperature.setValue(0.8)
-        self.temperature.setToolTip("Higher = more variation, lower = more stable.")
 
         self.top_p = QtWidgets.QDoubleSpinBox()
         self.top_p.setRange(0.05, 1.0)
         self.top_p.setSingleStep(0.01)
         self.top_p.setValue(0.95)
-        self.top_p.setToolTip("Nucleus sampling cutoff (probability mass).")
 
         self.top_k = QtWidgets.QSpinBox()
         self.top_k.setRange(0, 200)
         self.top_k.setValue(50)
-        self.top_k.setToolTip("Top-k sampling. 0 disables top-k.")
 
         self.max_new_tokens = QtWidgets.QSpinBox()
         self.max_new_tokens.setRange(64, 8192)
         self.max_new_tokens.setValue(2048)
-        self.max_new_tokens.setToolTip("Upper bound for generation length. Too high may slow things down.")
 
         out_row = QtWidgets.QHBoxLayout()
         self.output_name = QtWidgets.QLineEdit("qwen_tts")
-        self.output_name.setToolTip("Base filename (without extension).")
         self.add_timestamp = QtWidgets.QCheckBox("Add timestamp")
         self.add_timestamp.setChecked(True)
-        self.add_timestamp.setToolTip("Appends YYYYMMDD_HHMMSS to avoid overwriting.")
         out_row.addWidget(self.output_name, 2)
         out_row.addWidget(self.add_timestamp, 1)
 
@@ -525,41 +399,31 @@ class MainWindow(QtWidgets.QMainWindow):
         common_layout.addRow("Output name", out_row)
 
         self.section_common = CollapsibleSection("Common generation settings", common_content, collapsed=True)
-        self.section_common.setToolTip("These settings apply to ALL modes.\n"
-                                       "If something fails to load, try dtype=float16 and attention=sdpa.")
         layout.addWidget(self.section_common)
 
-        # Tab: CustomVoice
+        # Tabs
         self.tab_custom = QtWidgets.QWidget()
         self.tabs.addTab(self.tab_custom, "CustomVoice")
         self._build_custom_tab()
 
-        # Tab: Voice Clone
         self.tab_clone = QtWidgets.QWidget()
         self.tabs.addTab(self.tab_clone, "Voice Clone (Base)")
         self._build_clone_tab()
 
-        # Tab: Voice Design
         self.tab_design = QtWidgets.QWidget()
         self.tabs.addTab(self.tab_design, "Voice Design")
         self._build_design_tab()
 
-        # Bottom: buttons + log
+        # Bottom buttons + log
         btn_row = QtWidgets.QHBoxLayout()
         self.btn_generate = QtWidgets.QPushButton("Generate WAV (current tab)")
-        self.btn_generate.setToolTip("Generates audio using the currently selected mode/tab.")
-        self.btn_open_output = QtWidgets.QPushButton("Open output folder")
-        self.btn_open_output.setToolTip("Open output/ where WAVs are saved.")
-        self.btn_save_preset = QtWidgets.QPushButton("Save preset")
-        self.btn_load_preset = QtWidgets.QPushButton("Load preset")
-
+        self.btn_refresh_gpu = QtWidgets.QPushButton("Refresh GPU info")
         btn_row.addWidget(self.btn_generate)
-        btn_row.addWidget(self.btn_open_output)
-        btn_row.addWidget(self.btn_save_preset)
-        btn_row.addWidget(self.btn_load_preset)
-
+        btn_row.addWidget(self.btn_refresh_gpu)
+        btn_row.addStretch(1)
         layout.addLayout(btn_row)
-        self.lbl_gpu = QtWidgets.QLabel("")
+
+        self.lbl_gpu = QtWidgets.QLabel("GPU: (checking...)")
 
         self.log = QtWidgets.QPlainTextEdit()
         self.log.setReadOnly(True)
@@ -574,51 +438,192 @@ class MainWindow(QtWidgets.QMainWindow):
         self.section_logs = CollapsibleSection("Logs", logs_content, collapsed=True)
         layout.addWidget(self.section_logs, 1)
 
+        # Tooltips (help text)
+        self._apply_tooltips()
+
         # Signals
         self.btn_generate.clicked.connect(self._on_generate)
-        self.btn_open_output.clicked.connect(self._open_output)
-        self.btn_save_preset.clicked.connect(self._save_preset)
-        self.btn_load_preset.clicked.connect(self._load_preset)
         self.btn_open_models.clicked.connect(self._open_models)
         self.btn_download.clicked.connect(self._download_selected)
+        self.btn_refresh_gpu.clicked.connect(self._refresh_gpu_info_async)
 
-        # Remember collapse state immediately
-        self.section_mm.toggled.connect(lambda _c: self._save_last_state())
-        self.section_common.toggled.connect(lambda _c: self._save_last_state())
-        self.section_logs.toggled.connect(lambda _c: self._save_last_state())
+    def _apply_tooltips(self):
+        """Set help tooltips for all controls (kept in one place for easy editing)."""
+
+        # Environment
+        self.lbl_env.setToolTip(
+            "Shows whether the dedicated Qwen3-TTS Python environment is installed.\n"
+            "If missing, installs/optional-installs need to create: environments/.qwen3tts/."
+        )
+        self.btn_env_refresh.setToolTip("Re-check if the qwen3tts environment Python exists.")
+
+        # Model Manager
+        self.section_mm.setToolTip("Download the model folders into /models/. No model is loaded in the UI process.")
+        self.chk_tokenizer.setToolTip(
+            "Tokenizer (required).\n"
+            "Without this, generation will fail even if the model weights are present."
+        )
+        self.chk_custom.setToolTip(
+            "CustomVoice model (recommended default).\n"
+            "Includes a small set of built-in speakers (e.g., ryan, serena)."
+        )
+        self.chk_base.setToolTip(
+            "Base model used for Voice Clone.\n"
+            "Download this if you want to clone a voice from a reference audio file."
+        )
+        self.chk_design.setToolTip(
+            "VoiceDesign model.\n"
+            "Lets you create a new voice from a text description (no reference audio)."
+        )
+        self.btn_download.setToolTip(
+            "Download the selected repos from Hugging Face into /models/.\n"
+            "Tip: set HF_TOKEN / HUGGINGFACEHUB_API_TOKEN if you hit rate limits."
+        )
+        self.btn_open_models.setToolTip("Open the local /models/ folder in Explorer.")
+        self.lbl_model_status.setToolTip("Quick check: whether each model folder exists and is non-empty.")
+
+        # Generate + GPU
+        self.btn_generate.setToolTip(
+            "Generate a WAV using the currently selected tab.\n"
+            "Output goes to: output/audio/qwen3tts/."
+        )
+        self.btn_refresh_gpu.setToolTip("Queries CUDA/GPU availability inside the qwen3tts environment.")
+        self.lbl_gpu.setToolTip("Detected GPU(s) reported by the qwen3tts environment.")
+
+        # Common generation settings
+        self.section_common.setToolTip("Sampling + runtime settings shared by all tabs.")
+        self.device.setToolTip(
+            "Where to run the model.\n"
+            "• auto (default): uses CUDA if available, otherwise CPU\n"
+            "• cpu: safest but slow\n"
+            "• cuda:0 / cuda:1 ...: pick a specific GPU"
+        )
+        self.dtype.setToolTip(
+            "Compute precision.\n"
+            "• bfloat16 (default): good quality, stable on modern GPUs\n"
+            "• float16: lower VRAM, sometimes less stable\n"
+            "• float32: best compatibility (especially CPU), slowest"
+        )
+        self.attn.setToolTip(
+            "Attention backend.\n"
+            "• sdpa (default): good speed/compat\n"
+            "• flash_attention_2: fastest + lower VRAM, requires flash_attn installed\n"
+            "• none: most compatible fallback, usually slower"
+        )
+        self.temperature.setToolTip(
+            "Randomness / expressiveness. Default: 0.80\n"
+            "Lower (0.50–0.75) = more consistent, less surprise\n"
+            "Higher (0.90–1.20) = more variation/energy, more risk of odd phrasing"
+        )
+        self.top_p.setToolTip(
+            "Nucleus sampling cutoff. Default: 0.95\n"
+            "Lower (0.85–0.92) = safer/more deterministic\n"
+            "Higher (0.96–0.99) = more creative, can get messy if too high"
+        )
+        self.top_k.setToolTip(
+            "Top-k sampling. Default: 50\n"
+            "0 = disable top-k (use only top-p)\n"
+            "20–80 is a practical range; lower = safer, higher = more variety."
+        )
+        self.max_new_tokens.setToolTip(
+            "Upper limit for generated tokens (affects max audio length). Default: 2048\n"
+            "If output cuts off early, increase this. If generation is slow, reduce it."
+        )
+        self.output_name.setToolTip(
+            "Base filename for the output WAV.\n"
+            "If 'Add timestamp' is enabled, the timestamp is appended automatically."
+        )
+        self.add_timestamp.setToolTip(
+            "When enabled (default), outputs won't overwrite each other because a timestamp is added."
+        )
+
+        # CustomVoice tab
+        self.cv_model_path.setToolTip(
+            "Folder for the CustomVoice model (downloaded into /models/).\n"
+            "Default is the expected local folder name."
+        )
+        self.cv_tokenizer_path.setToolTip("Folder for the Tokenizer model (downloaded into /models/).")
+        self.cv_text.setToolTip(
+            "Text to speak.\n"
+            "Tip: for natural speech, use punctuation and short sentences."
+        )
+        self.cv_language.setToolTip(
+            "Language hint (Auto may work, but setting the correct language usually improves pronunciation)."
+        )
+        self.cv_speaker.setToolTip(
+            "Speaker ID (built-in voices).\n"
+            "Tip: click 'Refresh speakers/languages' after downloading the model to get the exact list."
+        )
+        self.btn_cv_refresh.setToolTip(
+            "Reads the supported speaker/language list from the model (runs in the environment)."
+        )
+        self.cv_instruct.setToolTip(
+            "Optional style instruction (works like a short direction). Examples:\n"
+            "• 'calm and warm, medium pace'\n"
+            "• 'excited, smiling, faster delivery'\n"
+            "Keep it short; too much can reduce clarity."
+        )
+
+        # Voice Clone tab
+        self.vc_model_path.setToolTip("Folder for the Base model (needed for voice cloning).")
+        self.vc_tokenizer_path.setToolTip("Folder for the Tokenizer model.")
+        self.vc_text.setToolTip("Text you want spoken by the cloned voice.")
+        self.vc_language.setToolTip("Language hint for the target speech.")
+        self.vc_ref_audio.setToolTip(
+            "Reference audio file (WAV/MP3/FLAC/M4A).\n"
+            "Best results: clean, single speaker, minimal background noise, 5–20 seconds."
+        )
+        self.btn_pick_audio.setToolTip("Pick a reference audio file for cloning.")
+        self.vc_ref_text.setToolTip(
+            "Optional transcript of the reference audio.\n"
+            "Providing this can improve cloning accuracy when the reference is long or unclear."
+        )
+        self.vc_xvector.setToolTip(
+            "If enabled, uses only speaker embedding (x-vector) and ignores ref_text.\n"
+            "Useful when you don't know the exact transcript."
+        )
+        self.vc_instruct.setToolTip(
+            "Optional style direction for the generated speech (pace, emotion, emphasis)."
+        )
+
+        # Voice Design tab
+        self.vd_model_path.setToolTip("Folder for the VoiceDesign model (downloaded into /models/).")
+        self.vd_tokenizer_path.setToolTip("Folder for the Tokenizer model.")
+        self.vd_text.setToolTip("Text to speak using the designed voice.")
+        self.vd_language.setToolTip("Language hint for the generated speech.")
+        self.vd_desc.setToolTip(
+            "Describe the voice you want. Keep it concrete. Examples:\n"
+            "• 'deep, gentle, slow-paced, radio host'\n"
+            "• 'young, bright, playful, slight laugh'\n"
+            "Add pronunciation hints like 'clear enunciation' if needed."
+        )
+
+        # Logs
+        self.section_logs.setToolTip("Shows streaming logs from the worker subprocess.")
+        self.log.setToolTip("Worker output. If something fails, scroll here for the traceback.")
 
     def _build_custom_tab(self):
         lay = QtWidgets.QFormLayout(self.tab_custom)
 
         self.cv_model_path = QtWidgets.QLineEdit(DEFAULT_CUSTOMVOICE_DIR)
-        self.cv_model_path.setToolTip("Folder for the CustomVoice model. Default is models/Qwen3-TTS-12Hz-1.7B-CustomVoice")
         self.cv_tokenizer_path = QtWidgets.QLineEdit(DEFAULT_TOKENIZER_DIR)
-        self.cv_tokenizer_path.setToolTip("Folder for the tokenizer. Default is models/Qwen3-TTS-Tokenizer")
 
         self.cv_text = QtWidgets.QPlainTextEdit()
         self.cv_text.setPlainText("Okay, quick test: the rain taps the window like tiny drums. If you can hear this clearly, it works.")
-        self.cv_text.setToolTip("The text to speak.")
 
         self.cv_language = QtWidgets.QComboBox()
         self.cv_language.addItems(SUPPORTED_LANGS_FALLBACK)
         self.cv_language.setCurrentText("English")
-        self.cv_language.setToolTip("Language label. Auto is fine if unsure.")
 
         self.cv_speaker = QtWidgets.QComboBox()
         self.cv_speaker.setEditable(True)
         self.cv_speaker.addItems(SUPPORTED_SPEAKERS_FALLBACK)
         self.cv_speaker.setCurrentText("ryan")
-        self.cv_speaker.setToolTip("Built-in speakers supported by CustomVoice.\n"
-                                   "If you type an unsupported name, generation will fail.")
 
         self.cv_instruct = QtWidgets.QLineEdit("")
-        self.cv_instruct.setToolTip("Style instruction (delivery). Example:\n"
-                                    "\"casual, friendly, short pauses, slightly amused\"")
 
-        self.btn_cv_refresh = QtWidgets.QPushButton("Refresh speakers from model")
-        self.btn_cv_refresh.setToolTip("Loads the model quickly (once) to ask it for supported speakers/languages,\n"
-                                       "then updates the dropdowns.")
-        self.btn_cv_refresh.clicked.connect(self._refresh_supported_from_model)
+        self.btn_cv_refresh = QtWidgets.QPushButton("Refresh speakers/languages from model")
+        self.btn_cv_refresh.clicked.connect(self._refresh_supported_from_model_async)
 
         row = QtWidgets.QHBoxLayout()
         row.addWidget(self.cv_speaker, 2)
@@ -635,11 +640,11 @@ class MainWindow(QtWidgets.QMainWindow):
         lay = QtWidgets.QFormLayout(self.tab_clone)
 
         self.vc_model_path = QtWidgets.QLineEdit(DEFAULT_BASE_DIR)
-        self.vc_model_path.setToolTip("Folder for the Base model (needed for voice cloning).")
         self.vc_tokenizer_path = QtWidgets.QLineEdit(DEFAULT_TOKENIZER_DIR)
 
         self.vc_text = QtWidgets.QPlainTextEdit()
         self.vc_text.setPlainText("Hey—this is a quick voice clone test. If this sounds like the reference speaker, it worked.")
+
         self.vc_language = QtWidgets.QComboBox()
         self.vc_language.addItems(SUPPORTED_LANGS_FALLBACK)
         self.vc_language.setCurrentText("English")
@@ -647,22 +652,15 @@ class MainWindow(QtWidgets.QMainWindow):
         ref_row = QtWidgets.QHBoxLayout()
         self.vc_ref_audio = QtWidgets.QLineEdit("")
         self.vc_ref_audio.setPlaceholderText("Select a reference WAV/MP3…")
-        self.vc_ref_audio.setToolTip("Reference audio file. Short, clean speech works best (5–20 seconds).")
         self.btn_pick_audio = QtWidgets.QPushButton("Browse…")
-        self.btn_pick_audio.setToolTip("Choose a reference audio file for cloning.")
         self.btn_pick_audio.clicked.connect(self._pick_ref_audio)
         ref_row.addWidget(self.vc_ref_audio, 3)
         ref_row.addWidget(self.btn_pick_audio, 1)
 
         self.vc_ref_text = QtWidgets.QLineEdit("")
-        self.vc_ref_text.setToolTip("Optional but recommended: exact transcript of the reference audio.\n"
-                                    "Helps the clone match identity more reliably.")
         self.vc_xvector = QtWidgets.QCheckBox("x_vector_only_mode (no ref_text)")
-        self.vc_xvector.setToolTip("If enabled, the model won't require ref_text.\n"
-                                   "Quality may be worse than using a transcript.")
 
         self.vc_instruct = QtWidgets.QLineEdit("")
-        self.vc_instruct.setToolTip("Delivery instruction (not identity). Example: \"slow, warm, conversational\"")
 
         lay.addRow("Model path", self.vc_model_path)
         lay.addRow("Tokenizer path", self.vc_tokenizer_path)
@@ -677,19 +675,17 @@ class MainWindow(QtWidgets.QMainWindow):
         lay = QtWidgets.QFormLayout(self.tab_design)
 
         self.vd_model_path = QtWidgets.QLineEdit(DEFAULT_VOICEDESIGN_DIR)
-        self.vd_model_path.setToolTip("Folder for the VoiceDesign model (prompt-created voices).")
         self.vd_tokenizer_path = QtWidgets.QLineEdit(DEFAULT_TOKENIZER_DIR)
 
         self.vd_text = QtWidgets.QPlainTextEdit()
         self.vd_text.setPlainText("Hello. This is voice design. If the voice matches the description, it worked.")
+
         self.vd_language = QtWidgets.QComboBox()
         self.vd_language.addItems(SUPPORTED_LANGS_FALLBACK)
         self.vd_language.setCurrentText("English")
 
         self.vd_desc = QtWidgets.QPlainTextEdit()
         self.vd_desc.setPlainText("A calm, friendly voice, slightly smiling, clear pronunciation.")
-        self.vd_desc.setToolTip("Describe the voice identity here (age, tone, accent, energy).\n"
-                                "Example: \"young adult, gentle British accent, playful and curious\"")
 
         lay.addRow("Model path", self.vd_model_path)
         lay.addRow("Tokenizer path", self.vd_tokenizer_path)
@@ -697,138 +693,103 @@ class MainWindow(QtWidgets.QMainWindow):
         lay.addRow("Language", self.vd_language)
         lay.addRow("Voice description", self.vd_desc)
 
+    # ---------- Autosave ----------
+    def _schedule_autosave(self):
+        try:
+            self._autosave_timer.start()
+        except Exception:
+            pass
+
+    def _wire_autosave_signals(self):
+        def c(sig):
+            try:
+                sig.connect(lambda *args, **kwargs: self._schedule_autosave())
+            except Exception:
+                pass
+
+        # Common
+        c(self.tabs.currentChanged)
+        c(self.device.currentTextChanged)
+        c(self.dtype.currentTextChanged)
+        c(self.attn.currentTextChanged)
+        c(self.temperature.valueChanged)
+        c(self.top_p.valueChanged)
+        c(self.top_k.valueChanged)
+        c(self.max_new_tokens.valueChanged)
+        c(self.output_name.textChanged)
+        c(self.add_timestamp.toggled)
+
+        # Collapse states
+        c(self.section_mm.toggled)
+        c(self.section_common.toggled)
+        c(self.section_logs.toggled)
+        c(self.section_env.toggled)
+
+        # CustomVoice
+        c(self.cv_model_path.textChanged)
+        c(self.cv_tokenizer_path.textChanged)
+        c(self.cv_text.textChanged)
+        c(self.cv_language.currentTextChanged)
+        c(self.cv_speaker.currentTextChanged)
+        c(self.cv_speaker.editTextChanged)
+        c(self.cv_instruct.textChanged)
+
+        # Voice Clone
+        c(self.vc_model_path.textChanged)
+        c(self.vc_tokenizer_path.textChanged)
+        c(self.vc_text.textChanged)
+        c(self.vc_language.currentTextChanged)
+        c(self.vc_ref_audio.textChanged)
+        c(self.vc_ref_text.textChanged)
+        c(self.vc_xvector.toggled)
+        c(self.vc_instruct.textChanged)
+
+        # Voice Design
+        c(self.vd_model_path.textChanged)
+        c(self.vd_tokenizer_path.textChanged)
+        c(self.vd_text.textChanged)
+        c(self.vd_language.currentTextChanged)
+        c(self.vd_desc.textChanged)
+
     # ---------- Helpers ----------
     def _log(self, s: str):
         self.log.appendPlainText(s)
 
-    def _update_gpu_info(self):
-        if torch.cuda.is_available():
-            parts = []
-            for i in range(torch.cuda.device_count()):
-                name = torch.cuda.get_device_name(i)
-                parts.append(f"cuda:{i} = {name}")
-            self.lbl_gpu.setText("GPU: " + " | ".join(parts))
+    def _update_env_status(self):
+        if _env_ok():
+            self.lbl_env.setText(f"✓ Env python found: {ENV_PY}")
+            self.btn_download.setEnabled(True)
+            self.btn_generate.setEnabled(True)
         else:
-            self.lbl_gpu.setText("GPU: none (CPU mode)")
-
-    def _open_output(self):
-        OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
-        os.startfile(str(OUTPUT_DIR))
+            self.lbl_env.setText(f"✗ Missing env python: {ENV_PY}")
+            self.btn_download.setEnabled(False)
+            self.btn_generate.setEnabled(False)
 
     def _open_models(self):
         MODELS_DIR.mkdir(parents=True, exist_ok=True)
-        os.startfile(str(MODELS_DIR))
+        try:
+            os.startfile(str(MODELS_DIR))
+        except Exception:
+            pass
 
     def _update_model_status(self):
         def ok(p: str) -> bool:
             d = Path(p)
             return d.exists() and any(d.iterdir())
 
-        rows = []
-        rows.append(("Tokenizer", ok(DEFAULT_TOKENIZER_DIR), DEFAULT_TOKENIZER_DIR))
-        rows.append(("CustomVoice", ok(DEFAULT_CUSTOMVOICE_DIR), DEFAULT_CUSTOMVOICE_DIR))
-        rows.append(("Base", ok(DEFAULT_BASE_DIR), DEFAULT_BASE_DIR))
-        rows.append(("VoiceDesign", ok(DEFAULT_VOICEDESIGN_DIR), DEFAULT_VOICEDESIGN_DIR))
-
+        rows = [
+            ("Tokenizer", ok(DEFAULT_TOKENIZER_DIR), DEFAULT_TOKENIZER_DIR),
+            ("CustomVoice", ok(DEFAULT_CUSTOMVOICE_DIR), DEFAULT_CUSTOMVOICE_DIR),
+            ("Base", ok(DEFAULT_BASE_DIR), DEFAULT_BASE_DIR),
+            ("VoiceDesign", ok(DEFAULT_VOICEDESIGN_DIR), DEFAULT_VOICEDESIGN_DIR),
+        ]
         msg = []
         for name, present, path in rows:
             msg.append(f"{'✓' if present else '✗'} {name}: {Path(path).name}")
         self.lbl_model_status.setText(" | ".join(msg))
 
-    def _download_selected(self):
-        items = []
-        if self.chk_tokenizer.isChecked():
-            items.append(("Tokenizer", HF_MODELS["Tokenizer"]))
-        if self.chk_custom.isChecked():
-            items.append(("CustomVoice", HF_MODELS["CustomVoice"]))
-        if self.chk_base.isChecked():
-            items.append(("Base", HF_MODELS["Base (for Voice Clone)"]))
-        if self.chk_design.isChecked():
-            items.append(("VoiceDesign", HF_MODELS["VoiceDesign"]))
-
-        if not items:
-            self._log("Nothing selected for download.")
-            return
-
-        self.btn_download.setEnabled(False)
-        self._log("Starting downloads...")
-        token = os.environ.get("HF_TOKEN") or os.environ.get("HUGGINGFACEHUB_API_TOKEN")
-
-        self.dl_thread = QtCore.QThread()
-        self.dl_worker = HFDownloadWorker(items, token=token)
-        self.dl_worker.moveToThread(self.dl_thread)
-        self.dl_thread.started.connect(self.dl_worker.run)
-        self.dl_worker.log.connect(self._log)
-        self.dl_worker.done.connect(self._on_download_done)
-        self.dl_worker.done.connect(self.dl_thread.quit)
-        self.dl_thread.finished.connect(self.dl_thread.deleteLater)
-        self.dl_thread.start()
-
-    def _on_download_done(self, ok: bool):
-        self.btn_download.setEnabled(True)
-        self._update_model_status()
-        if ok:
-            self._log("Downloads completed.")
-        else:
-            self._log("Downloads finished with errors (see above).")
-
-    def _pick_ref_audio(self):
-        path, _ = QtWidgets.QFileDialog.getOpenFileName(self, "Select reference audio", "", "Audio (*.wav *.mp3 *.flac *.m4a);;All files (*.*)")
-        if path:
-            self.vc_ref_audio.setText(path)
-
-    def _refresh_supported_from_model(self):
-        # This loads the CustomVoice model if available, then queries supported speakers/languages.
-        try:
-            model_dir = self.cv_model_path.text().strip()
-            if not (Path(model_dir).exists() and any(Path(model_dir).iterdir())):
-                self._log("CustomVoice model folder not found. Download it in Model Manager first.")
-                return
-
-            common = self._collect_common()
-            model = self.cache.load_if_needed(model_dir, common["device"], common["dtype"], common["attn_impl"])
-
-            speakers = []
-            langs = []
-            try:
-                speakers = list(model.get_supported_speakers())
-            except Exception:
-                speakers = SUPPORTED_SPEAKERS_FALLBACK
-            try:
-                langs = list(model.get_supported_languages())
-            except Exception:
-                langs = SUPPORTED_LANGS_FALLBACK
-
-            if speakers:
-                cur = self.cv_speaker.currentText()
-                self.cv_speaker.blockSignals(True)
-                self.cv_speaker.clear()
-                self.cv_speaker.addItems([safe_lower_speaker(x) for x in speakers])
-                self.cv_speaker.setEditable(True)
-                self.cv_speaker.setCurrentText(safe_lower_speaker(cur) if safe_lower_speaker(cur) in [safe_lower_speaker(x) for x in speakers] else safe_lower_speaker(speakers[0]))
-                self.cv_speaker.blockSignals(False)
-
-            if langs:
-                cur = self.cv_language.currentText()
-                self.cv_language.blockSignals(True)
-                self.cv_language.clear()
-                self.cv_language.addItems([str(x) for x in langs])
-                self.cv_language.setCurrentText(cur if cur in langs else str(langs[0]))
-                self.cv_language.blockSignals(False)
-
-            self._log("Refreshed supported speakers/languages from model.")
-        except Exception:
-            self._log("ERROR refreshing supported lists:\n" + traceback.format_exc())
-
-    # ---------- Presets ----------
-    def _preset_path(self, name: str) -> Path:
-        safe = "".join(c for c in name if c.isalnum() or c in ("-", "_", " ")).strip().replace(" ", "_")
-        if not safe:
-            safe = "preset"
-        return PRESETS_DIR / f"{safe}.json"
-
     def _state_file(self) -> Path:
-        return PRESETS_DIR / "_last_state.json"
+        return PRESETS_DIR / "qwentts.json"
 
     def _collect_common(self) -> dict:
         return {
@@ -845,8 +806,8 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def _collect_payload(self) -> tuple[str, dict]:
         common = self._collect_common()
-
         tab = self.tabs.currentWidget()
+
         if tab is self.tab_custom:
             return "custom", {
                 "text": self.cv_text.toPlainText(),
@@ -857,6 +818,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 "tokenizer_path": self.cv_tokenizer_path.text().strip(),
                 "common": common,
             }
+
         if tab is self.tab_clone:
             return "clone", {
                 "text": self.vc_text.toPlainText(),
@@ -869,6 +831,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 "tokenizer_path": self.vc_tokenizer_path.text().strip(),
                 "common": common,
             }
+
         return "design", {
             "text": self.vd_text.toPlainText(),
             "language": self.vd_language.currentText(),
@@ -883,6 +846,7 @@ class MainWindow(QtWidgets.QMainWindow):
             state = {
                 "tab": self.tabs.currentIndex(),
                 "ui": {
+                    "env_collapsed": bool(self.section_env.isCollapsed()),
                     "mm_collapsed": bool(self.section_mm.isCollapsed()),
                     "common_collapsed": bool(self.section_common.isCollapsed()),
                     "logs_collapsed": bool(self.section_logs.isCollapsed()),
@@ -925,17 +889,15 @@ class MainWindow(QtWidgets.QMainWindow):
                 return
             state = json.loads(f.read_text(encoding="utf-8"))
 
-            # UI (collapse state)
             ui = state.get("ui", {}) or {}
-            # Default is collapsed; only expand if state says so.
             try:
+                self.section_env.setCollapsed(bool(ui.get("env_collapsed", False)))
                 self.section_mm.setCollapsed(bool(ui.get("mm_collapsed", True)))
                 self.section_common.setCollapsed(bool(ui.get("common_collapsed", True)))
                 self.section_logs.setCollapsed(bool(ui.get("logs_collapsed", True)))
             except Exception:
                 pass
 
-            # common
             c = state.get("common", {})
             if c:
                 self.device.setCurrentText(c.get("device", "auto"))
@@ -980,32 +942,97 @@ class MainWindow(QtWidgets.QMainWindow):
         except Exception:
             pass
 
-    def _save_preset(self):
-        name, ok = QtWidgets.QInputDialog.getText(self, "Save preset", "Preset name:")
-        if not ok:
-            return
-        path = self._preset_path(name)
-        state = json.loads(self._state_file().read_text(encoding="utf-8")) if self._state_file().exists() else {}
-        self._save_last_state()
-        state = json.loads(self._state_file().read_text(encoding="utf-8"))
-        path.write_text(json.dumps(state, indent=2), encoding="utf-8")
-        self._log(f"Saved preset: {path.name}")
+    # ---------- Downloads ----------
+    def _download_selected(self):
+        items = []
+        if self.chk_tokenizer.isChecked():
+            items.append(("Tokenizer", HF_MODELS["Tokenizer"]))
+        if self.chk_custom.isChecked():
+            items.append(("CustomVoice", HF_MODELS["CustomVoice"]))
+        if self.chk_base.isChecked():
+            items.append(("Base", HF_MODELS["Base (for Voice Clone)"]))
+        if self.chk_design.isChecked():
+            items.append(("VoiceDesign", HF_MODELS["VoiceDesign"]))
 
-    def _load_preset(self):
-        files = sorted(PRESETS_DIR.glob("*.json"))
-        files = [f for f in files if f.name != "_last_state.json"]
-        if not files:
-            self._log("No presets found in presets/setsave/.")
+        if not items:
+            self._log("Nothing selected for download.")
             return
-        items = [f.name for f in files]
-        choice, ok = QtWidgets.QInputDialog.getItem(self, "Load preset", "Choose preset:", items, 0, False)
-        if not ok:
+
+        self.btn_download.setEnabled(False)
+        self._log("Starting downloads...")
+        token = os.environ.get("HF_TOKEN") or os.environ.get("HUGGINGFACEHUB_API_TOKEN") or ""
+
+        self._run_env_task(
+            task="download",
+            payload={"items": items, "token": token},
+            on_ok=self._on_download_done,
+        )
+
+    def _on_download_done(self, result: dict):
+        self.btn_download.setEnabled(True)
+        self._update_model_status()
+        self._log("Downloads completed.")
+        if result.get("warnings"):
+            for w in result["warnings"]:
+                self._log(w)
+
+    # ---------- GPU info ----------
+    def _refresh_gpu_info_async(self):
+        self._run_env_task(task="gpuinfo", payload={}, on_ok=self._on_gpuinfo)
+
+    def _on_gpuinfo(self, result: dict):
+        if result.get("cuda_available"):
+            gpus = result.get("gpus", [])
+            if gpus:
+                self.lbl_gpu.setText("GPU: " + " | ".join(gpus))
+            else:
+                self.lbl_gpu.setText("GPU: cuda available (no names returned)")
+        else:
+            self.lbl_gpu.setText("GPU: none (CPU mode)")
+
+    # ---------- Supported lists ----------
+    def _refresh_supported_from_model_async(self):
+        model_dir = self.cv_model_path.text().strip()
+        if not (Path(model_dir).exists() and any(Path(model_dir).iterdir())):
+            self._log("CustomVoice model folder not found. Download it in Model Manager first.")
             return
-        data = json.loads((PRESETS_DIR / choice).read_text(encoding="utf-8"))
-        # Write to last state then load
-        self._state_file().write_text(json.dumps(data, indent=2), encoding="utf-8")
-        self._load_last_state()
-        self._log(f"Loaded preset: {choice}")
+
+        common = self._collect_common()
+        payload = {
+            "model_path": model_dir,
+            "tokenizer_path": self.cv_tokenizer_path.text().strip(),
+            "common": common,
+        }
+        self._run_env_task(task="supported", payload=payload, on_ok=self._on_supported_lists)
+
+    def _on_supported_lists(self, result: dict):
+        speakers = result.get("speakers") or SUPPORTED_SPEAKERS_FALLBACK
+        langs = result.get("languages") or SUPPORTED_LANGS_FALLBACK
+
+        try:
+            cur = self.cv_speaker.currentText()
+            self.cv_speaker.blockSignals(True)
+            self.cv_speaker.clear()
+            self.cv_speaker.addItems([safe_lower_speaker(x) for x in speakers])
+            self.cv_speaker.setEditable(True)
+            cur2 = safe_lower_speaker(cur)
+            normalized = [safe_lower_speaker(x) for x in speakers]
+            self.cv_speaker.setCurrentText(cur2 if cur2 in normalized else safe_lower_speaker(speakers[0]))
+            self.cv_speaker.blockSignals(False)
+        except Exception:
+            pass
+
+        try:
+            cur = self.cv_language.currentText()
+            self.cv_language.blockSignals(True)
+            self.cv_language.clear()
+            self.cv_language.addItems([str(x) for x in langs])
+            self.cv_language.setCurrentText(cur if cur in langs else str(langs[0]))
+            self.cv_language.blockSignals(False)
+        except Exception:
+            pass
+
+        self._log("Refreshed supported speakers/languages from model.")
 
     # ---------- Generate ----------
     def _on_generate(self):
@@ -1013,7 +1040,6 @@ class MainWindow(QtWidgets.QMainWindow):
 
         mode, payload = self._collect_payload()
 
-        # quick checks
         mpath = payload.get("model_path", "")
         if not (mpath and Path(mpath).exists() and any(Path(mpath).iterdir())):
             self._log("Model folder missing. Use Model Manager to download it first.")
@@ -1022,26 +1048,66 @@ class MainWindow(QtWidgets.QMainWindow):
         self._log(f"Starting generation ({mode})...")
         self.btn_generate.setEnabled(False)
 
-        self.thread = QtCore.QThread()
-        self.worker = TTSWorker(mode, payload, self.cache)
-        self.worker.moveToThread(self.thread)
-        self.thread.started.connect(self.worker.run)
-        self.worker.finished.connect(self._on_done)
-        self.worker.failed.connect(self._on_failed)
-        self.worker.finished.connect(self.thread.quit)
-        self.worker.failed.connect(self.thread.quit)
-        self.thread.finished.connect(self.thread.deleteLater)
-        self.thread.start()
+        self._run_env_task(
+            task="generate",
+            payload={"mode": mode, "payload": payload},
+            on_ok=self._on_generate_done,
+            on_fail=self._on_generate_fail,
+            reenable_generate=True,
+        )
 
-    def _on_done(self, out_path: str):
+    def _on_generate_done(self, result: dict):
+        out_path = result.get("out_path", "")
         self._log(f"Done: {out_path}")
         self.btn_generate.setEnabled(True)
         self._update_model_status()
 
-    def _on_failed(self, tb: str):
-        self._log("ERROR:\n" + tb)
+    def _on_generate_fail(self, err: str):
+        self._log("ERROR:\n" + err)
         self.btn_generate.setEnabled(True)
 
+    # ---------- Utility ----------
+    def _pick_ref_audio(self):
+        path, _ = QtWidgets.QFileDialog.getOpenFileName(self, "Select reference audio", "", "Audio (*.wav *.mp3 *.flac *.m4a);;All files (*.*)")
+        if path:
+            self.vc_ref_audio.setText(path)
+
+    def _update_env_status_logonly(self, result: dict):
+        # Used by tasks that don't otherwise touch UI
+        pass
+
+    def _run_env_task(self, task: str, payload: dict, on_ok=None, on_fail=None, reenable_generate: bool = False):
+        """
+        Run an environment task via QThread so the UI stays responsive.
+        """
+
+        def _fail(msg: str):
+            if on_fail is not None:
+                on_fail(msg)
+            else:
+                self._log("ERROR:\n" + msg)
+            if reenable_generate:
+                self.btn_generate.setEnabled(True)
+            self.btn_download.setEnabled(True)
+
+        def _ok(res: dict):
+            if on_ok is not None:
+                on_ok(res)
+            if reenable_generate:
+                self.btn_generate.setEnabled(True)
+            self.btn_download.setEnabled(True)
+
+        self._thread = QtCore.QThread()
+        self._worker = EnvTaskWorker(task=task, payload=payload)
+        self._worker.moveToThread(self._thread)
+        self._thread.started.connect(self._worker.run)
+        self._worker.log.connect(self._log)
+        self._worker.done.connect(_ok)
+        self._worker.failed.connect(_fail)
+        self._worker.done.connect(self._thread.quit)
+        self._worker.failed.connect(self._thread.quit)
+        self._thread.finished.connect(self._thread.deleteLater)
+        self._thread.start()
 
     def closeEvent(self, event):
         try:
@@ -1051,11 +1117,391 @@ class MainWindow(QtWidgets.QMainWindow):
         return super().closeEvent(event)
 
 
-def main():
+# -----------------------------
+# Worker-mode implementation
+# -----------------------------
+def _try_inject_repo_path(root: Path) -> None:
+    """
+    Fallback if qwen_tts isn't installed in the environment:
+    add a nearby repo folder to sys.path.
+    """
+    candidates = [
+        root / "repo",
+        root / "repos" / "Qwen3-TTS",
+        root / "Qwen3-TTS",
+        root / "presets" / "extra_env" / "repo",
+        root / "presets" / "extra_env" / "Qwen3-TTS",
+    ]
+    for c in candidates:
+        try:
+            if (c / "qwen_tts").exists():
+                sys.path.insert(0, str(c))
+                return
+        except Exception:
+            pass
+
+
+def _worker_log(s: str):
+    try:
+        print("__LOG__ " + str(s), flush=True)
+    except Exception:
+        pass
+
+
+def _worker_result(ok: bool, **kw):
+    obj = {"ok": bool(ok), **kw}
+    try:
+        print("__RESULT__" + json.dumps(obj, ensure_ascii=False), flush=True)
+    except Exception:
+        # last resort
+        try:
+            print("__RESULT__" + json.dumps({"ok": False, "error": "Failed to encode result JSON"}, ensure_ascii=False), flush=True)
+        except Exception:
+            pass
+
+
+def _resolve_device(torch_mod, device_choice: str):
+    if device_choice == "auto":
+        return "cuda" if torch_mod.cuda.is_available() else "cpu"
+    return device_choice
+
+
+def _resolve_dtype(torch_mod, dtype_choice: str):
+    if dtype_choice == "bfloat16":
+        return torch_mod.bfloat16
+    if dtype_choice == "float16":
+        return torch_mod.float16
+    return torch_mod.float32
+
+
+def _resolve_attn(attn_choice: str):
+    if attn_choice == "none":
+        return None
+    return attn_choice
+
+
+def _has_flash_attn() -> bool:
+    return importlib.util.find_spec("flash_attn") is not None
+
+
+def _load_model(Qwen3TTSModel, model_path_or_id: str, tokenizer_path: str, common: dict):
+    import torch  # local import (worker only)
+
+    device = _resolve_device(torch, common.get("device", "auto"))
+    dtype_choice = common.get("dtype", "bfloat16")
+    dtype = _resolve_dtype(torch, dtype_choice)
+    attn_choice = common.get("attn_impl", "sdpa")
+    attn_impl = _resolve_attn(attn_choice)
+
+    # Guard: FlashAttention2 can't be used unless installed
+    if attn_choice == "flash_attention_2" and not _has_flash_attn():
+        _worker_log("FlashAttention2 selected but flash_attn is not installed; falling back to SDPA.")
+        attn_choice = "sdpa"
+        attn_impl = "sdpa"
+
+    kwargs = {"device_map": device, "dtype": dtype}
+    if attn_impl is not None:
+        kwargs["attn_implementation"] = attn_impl
+
+    # Some package versions may accept a tokenizer path. Try it, then fall back.
+    if tokenizer_path:
+        for key in ("tokenizer_path", "tokenizer_dir", "tokenizer"):
+            try:
+                _worker_log(f"Loading model with {key}=... (if supported)")
+                return Qwen3TTSModel.from_pretrained(model_path_or_id, **{key: tokenizer_path}, **kwargs)
+            except TypeError:
+                continue
+            except Exception as e:
+                msg = str(e).lower()
+                if "unexpected keyword" in msg:
+                    continue
+                # If it failed for another reason, try without tokenizer key later.
+                break
+
+    _worker_log("Loading model...")
+    try:
+        return Qwen3TTSModel.from_pretrained(model_path_or_id, **kwargs)
+    except Exception as e:
+        msg = str(e).lower()
+        if ("flash_attn" in msg) or ("flashattention2" in msg):
+            _worker_log("FlashAttention2 not usable here; retrying with SDPA...")
+            kwargs["attn_implementation"] = "sdpa"
+            try:
+                return Qwen3TTSModel.from_pretrained(model_path_or_id, **kwargs)
+            except Exception:
+                kwargs.pop("attn_implementation", None)
+                return Qwen3TTSModel.from_pretrained(model_path_or_id, **kwargs)
+        if dtype_choice == "bfloat16":
+            _worker_log("bfloat16 load failed; retrying with float16...")
+            kwargs["dtype"] = torch.float16
+            return Qwen3TTSModel.from_pretrained(model_path_or_id, **kwargs)
+        raise
+
+
+def _worker_task_gpuinfo():
+    try:
+        import torch  # type: ignore
+        if torch.cuda.is_available():
+            gpus = []
+            for i in range(torch.cuda.device_count()):
+                try:
+                    gpus.append(f"cuda:{i} = {torch.cuda.get_device_name(i)}")
+                except Exception:
+                    gpus.append(f"cuda:{i}")
+            _worker_result(True, cuda_available=True, gpus=gpus)
+        else:
+            _worker_result(True, cuda_available=False, gpus=[])
+    except Exception:
+        _worker_result(False, error=traceback.format_exc())
+
+
+def _worker_task_download(payload: dict):
+    try:
+        os.environ["HF_HUB_ENABLE_HF_TRANSFER"] = "0"
+        from huggingface_hub import snapshot_download  # type: ignore
+
+        items = payload.get("items") or []
+        token = payload.get("token") or None
+
+        warnings = []
+        for label, repo_id in items:
+            local_dir = Path(repo_to_local_dir(repo_id))
+            local_dir.mkdir(parents=True, exist_ok=True)
+            if local_dir.exists() and any(local_dir.iterdir()):
+                _worker_log(f"✓ Already present: {label}")
+                continue
+
+            _worker_log(f"Downloading: {label} ({repo_id}) ...")
+            snapshot_download(
+                repo_id=repo_id,
+                local_dir=str(local_dir),
+                local_dir_use_symlinks=False,
+                token=token,
+                resume_download=True,
+            )
+            _worker_log(f"✓ Downloaded: {label}")
+
+        _worker_result(True, warnings=warnings)
+    except Exception:
+        _worker_result(False, error=traceback.format_exc())
+
+
+def _out_path(base_name: str, add_ts: bool) -> Path:
+    name = (base_name or "qwen_tts").strip()
+    if add_ts:
+        name = f"{name}_{time.strftime('%Y%m%d_%H%M%S')}"
+    return OUTPUT_DIR / f"{name}.wav"
+
+
+def _worker_task_supported(payload: dict):
+    try:
+        # Optional: make SoX discoverable for qwen-tts (Windows friendly)
+        try:
+            import static_sox  # type: ignore
+            static_sox.add_paths(weak=True)
+        except Exception:
+            pass
+
+        _try_inject_repo_path(ROOT_DIR)
+
+        try:
+            from qwen_tts import Qwen3TTSModel  # type: ignore
+        except Exception:
+            from qwen_tts.inference import Qwen3TTSModel  # type: ignore
+
+        model_path = payload.get("model_path", "")
+        tokenizer_path = payload.get("tokenizer_path", "") or ""
+        common = payload.get("common") or {}
+
+        model = _load_model(Qwen3TTSModel, model_path, tokenizer_path, common)
+
+        speakers = []
+        languages = []
+        try:
+            speakers = list(model.get_supported_speakers())
+        except Exception:
+            speakers = SUPPORTED_SPEAKERS_FALLBACK
+        try:
+            languages = list(model.get_supported_languages())
+        except Exception:
+            languages = SUPPORTED_LANGS_FALLBACK
+
+        _worker_result(True, speakers=speakers, languages=languages)
+    except Exception:
+        _worker_result(False, error=traceback.format_exc())
+
+
+def _worker_task_generate(payload: dict):
+    try:
+        # Optional: make SoX discoverable for qwen-tts (Windows friendly)
+        try:
+            import static_sox  # type: ignore
+            static_sox.add_paths(weak=True)
+        except Exception:
+            pass
+
+        _try_inject_repo_path(ROOT_DIR)
+
+        try:
+            from qwen_tts import Qwen3TTSModel  # type: ignore
+        except Exception:
+            from qwen_tts.inference import Qwen3TTSModel  # type: ignore
+
+        mode = payload.get("mode", "")
+        p = payload.get("payload") or {}
+        common = p.get("common") or {}
+
+        model_path = p.get("model_path", "")
+        tokenizer_path = p.get("tokenizer_path", "") or ""
+
+        model = _load_model(Qwen3TTSModel, model_path, tokenizer_path, common)
+
+        gen_kwargs = {
+            "max_new_tokens": int(common.get("max_new_tokens", 2048)),
+            "temperature": float(common.get("temperature", 0.8)),
+            "top_p": float(common.get("top_p", 0.95)),
+            "top_k": int(common.get("top_k", 50)),
+        }
+
+        out_wav = _out_path(common.get("output_name", "qwen_tts"), bool(common.get("add_timestamp", True)))
+        OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+
+        import soundfile as sf  # type: ignore
+
+        if mode == "custom":
+            wavs, sr = model.generate_custom_voice(
+                text=p.get("text", ""),
+                language=p.get("language", "English"),
+                speaker=safe_lower_speaker(p.get("speaker", "")),
+                instruct=(p.get("instruct", "").strip() or None),
+                non_streaming_mode=True,
+                **gen_kwargs,
+            )
+            sf.write(str(out_wav), wavs[0], sr)
+
+        elif mode == "clone":
+            ref_audio_path = (p.get("ref_audio_path") or "").strip()
+            if not ref_audio_path:
+                raise ValueError("Please choose a reference audio file.")
+            wavs, sr = model.generate_voice_clone(
+                text=p.get("text", ""),
+                language=p.get("language", "English"),
+                ref_audio=ref_audio_path,
+                ref_text=(p.get("ref_text", "").strip() or None),
+                x_vector_only_mode=bool(p.get("x_vector_only_mode", False)),
+                instruct=(p.get("instruct", "").strip() or None),
+                non_streaming_mode=True,
+                **gen_kwargs,
+            )
+            sf.write(str(out_wav), wavs[0], sr)
+
+        elif mode == "design":
+            wavs, sr = model.generate_voice_design(
+                text=p.get("text", ""),
+                language=p.get("language", "English"),
+                instruct=(p.get("voice_description", "").strip() or ""),
+                non_streaming_mode=True,
+                **gen_kwargs,
+            )
+            sf.write(str(out_wav), wavs[0], sr)
+
+        else:
+            raise ValueError(f"Unknown mode: {mode}")
+
+        _worker_result(True, out_path=str(out_wav))
+    except Exception:
+        _worker_result(False, error=traceback.format_exc())
+
+
+def worker_main(argv=None):
+    import argparse
+
+    ap = argparse.ArgumentParser(add_help=False)
+    ap.add_argument("--worker", action="store_true")
+    ap.add_argument("--task", default="")
+    args = ap.parse_args(argv if argv is not None else sys.argv[1:])
+
+    # Read JSON payload from stdin (single blob)
+    try:
+        raw = sys.stdin.read()
+        payload = json.loads(raw) if raw.strip() else {}
+    except Exception:
+        payload = {}
+
+    # Ensure basic dirs exist
     ensure_dirs()
-    app = QtWidgets.QApplication(sys.argv)
+
+    if args.task == "gpuinfo":
+        _worker_task_gpuinfo()
+    elif args.task == "download":
+        _worker_task_download(payload)
+    elif args.task == "supported":
+        _worker_task_supported(payload)
+    elif args.task == "generate":
+        _worker_task_generate(payload)
+    else:
+        _worker_result(False, error=f"Unknown task: {args.task}")
+
+
+# -----------------------------
+# Entrypoint
+# -----------------------------
+def main(argv=None):
+    ensure_dirs()
+
+    import argparse
+    ap = argparse.ArgumentParser(add_help=False)
+    ap.add_argument("--embedded", action="store_true")
+    ap.add_argument("--embed-token", default="")
+    ap.add_argument("--print-hwnd", action="store_true")
+    ap.add_argument("--worker", action="store_true")
+    ap.add_argument("--task", default="")
+    args, qt_argv = ap.parse_known_args(argv if argv is not None else sys.argv[1:])
+
+    if args.worker:
+        # Worker mode should run in the qwen3tts environment python.
+        worker_main(["--worker", "--task", args.task])
+        return
+
+    # UI mode
+    app = QtWidgets.QApplication([sys.argv[0], *qt_argv])
     w = MainWindow()
+
+    if args.embed_token:
+        try:
+            w.setWindowTitle(f"Qwen3-TTS::{args.embed_token}")
+        except Exception:
+            pass
+
+    if args.embedded:
+        # Helps avoid a second taskbar entry when the host reparents the window.
+        try:
+            w.setWindowFlag(QtCore.Qt.Tool, True)
+        except Exception:
+            pass
+        try:
+            w.setWindowFlag(QtCore.Qt.FramelessWindowHint, True)
+        except Exception:
+            pass
+
     w.show()
+
+    if args.print_hwnd or args.embedded:
+        def _emit_hwnd():
+            try:
+                hwnd = int(w.winId())
+            except Exception:
+                hwnd = 0
+            try:
+                print(json.dumps({"hwnd": hwnd, "token": args.embed_token}), flush=True)
+            except Exception:
+                pass
+
+        try:
+            QtCore.QTimer.singleShot(0, _emit_hwnd)
+        except Exception:
+            _emit_hwnd()
+
     sys.exit(app.exec())
 
 

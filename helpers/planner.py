@@ -24,9 +24,14 @@ import json
 import time
 import uuid
 import hashlib
+import sys
+import io
+import contextlib
+import traceback
+import random
 from pathlib import Path
 from dataclasses import dataclass, asdict
-from typing import Dict, List, Optional, Any
+from typing import Dict, List, Optional, Any, Callable, Tuple
 
 
 # -----------------------------
@@ -54,6 +59,86 @@ def _abspath_from_root(p: str) -> str:
 
 def _qwen_model_dir() -> str:
     return str((_root() / "models" / "describe" / "default" / "qwen3vl2b").resolve())
+
+
+# -----------------------------
+# Qwen3-VL text generation helper (reuse helpers.prompt)
+# -----------------------------
+# Ensure project root and helpers are importable even when this file is run standalone.
+for _p in (str(_root()), str((_root() / "helpers"))):
+    try:
+        if _p not in sys.path:
+            sys.path.insert(0, _p)
+    except Exception:
+        pass
+
+_HAVE_QWEN_TEXT = False
+_QWEN_IMPORT_ERROR: Optional[Exception] = None
+try:
+    # Preferred path (same one used by Prompt tab / CLI)
+    from helpers.prompt import _generate_with_qwen_text as _qwen_generate_text  # type: ignore
+    _HAVE_QWEN_TEXT = True
+except Exception as _e1:
+    try:
+        from prompt import _generate_with_qwen_text as _qwen_generate_text  # type: ignore
+        _HAVE_QWEN_TEXT = True
+    except Exception as _e2:
+        _QWEN_IMPORT_ERROR = _e2 or _e1
+        _qwen_generate_text = None  # type: ignore
+
+
+
+
+# -----------------------------
+# Video generation presets (placeholders, but real numbers)
+# -----------------------------
+# These represent "generation targets" (proxy). Final export resolution/quality is handled later (upscale/encode).
+_HUNYUAN_PRESETS = {
+    "low":    {"model": "hunyuan", "quality": "low",    "res": "368p", "fps": 15, "steps": 9, "min_sec": 2.5, "max_sec": 7.0,
+               "model_variant": "distilled_8step", "note": "Fast proxy, longer clips possible"},
+    "medium": {"model": "hunyuan", "quality": "medium", "res": "384p", "fps": 20, "steps": 9, "min_sec": 2.5, "max_sec": 5.0,
+               "model_variant": "distilled_8step", "note": "Default proxy"},
+    "high":   {"model": "hunyuan", "quality": "high",   "res": "432p", "fps": 18, "steps": 9, "min_sec": 2.5, "max_sec": 4.0,
+               "model_variant": "distilled_8step", "note": "Heavier proxy, shorter clips"},
+}
+
+_WAN22_PRESETS = {
+    "normal": {"model": "wan22", "quality": "normal", "res": "704p", "fps": 15, "steps": 25, "min_sec": 2.5, "max_sec": 5.0,
+               "note": "Practical proxy (interpolate later)"},
+    "high":   {"model": "wan22", "quality": "high",   "res": "704p", "fps": 24, "steps": 30, "min_sec": 2.5, "max_sec": 3.5,
+               "note": "Best native motion, heavier"},
+}
+
+def _normalize_key(s: str) -> str:
+    return (s or "").strip().lower().replace(" ", "_")
+
+def _video_model_key(label: str) -> str:
+    l = (label or "").lower()
+    if "wan" in l and "2.2" in l:
+        return "wan22"
+    if "hunyuan" in l:
+        return "hunyuan"
+    # default (also for Auto / Qwen entries for now)
+    return "hunyuan"
+
+def _resolve_generation_profile(video_model_label: str, gen_quality_label: str) -> Dict[str, Any]:
+    mk = _video_model_key(video_model_label)
+    gk = _normalize_key(gen_quality_label)
+    if mk == "wan22":
+        if gk not in _WAN22_PRESETS:
+            gk = "normal"
+        return dict(_WAN22_PRESETS[gk])
+    # hunyuan default
+    if gk not in _HUNYUAN_PRESETS:
+        gk = "medium"
+    return dict(_HUNYUAN_PRESETS[gk])
+
+def _stable_uniform(seed_text: str, lo: float, hi: float) -> float:
+    # deterministic float in [lo, hi]
+    r = random.Random(_sha1_text(seed_text))
+    if hi <= lo:
+        return float(lo)
+    return lo + (hi - lo) * r.random()
 
 
 from PySide6.QtCore import Qt, QObject, Signal, Slot, QThread
@@ -167,11 +252,163 @@ def _safe_read_json(path: str) -> Optional[dict]:
         return None
 
 
+def _read_shots_list(path: str) -> List[Dict[str, Any]]:
+    """Read shots.json accepting either:
+    - top-level list of shot dicts (preferred)
+    - legacy wrapper: { "shots": [ ... ] }
+    """
+    obj = _safe_read_json(path)
+    if isinstance(obj, list):
+        return [x for x in obj if isinstance(x, dict)]
+    if isinstance(obj, dict):
+        v = obj.get("shots")
+        if isinstance(v, list):
+            return [x for x in v if isinstance(x, dict)]
+    return []
+
+
 def _file_ok(path: str, min_bytes: int = 2) -> bool:
     try:
         return os.path.isfile(path) and os.path.getsize(path) >= min_bytes
     except Exception:
         return False
+
+def _extract_first_json(raw: str) -> Optional[Any]:
+    """Robustly extract the first JSON object/array from a model response."""
+    if not raw:
+        return None
+    s = raw.strip()
+    # Strip fenced blocks if present
+    if "```" in s:
+        # try to keep content inside the first fence
+        parts = s.split("```")
+        if len(parts) >= 3:
+            s = parts[1] if parts[1].strip() else parts[2]
+            s = s.strip()
+            if s.lower().startswith("json"):
+                s = s[4:].strip()
+
+    # Find first { or [
+    start = None
+    for k,ch in enumerate(s):
+        if ch in "{[":
+            start = k
+            break
+    if start is None:
+        return None
+
+    def _balanced_extract(ss: str, st: int) -> Optional[str]:
+        depth = 0
+        in_str = False
+        esc = False
+        open_ch = ss[st]
+        close_ch = "}" if open_ch == "{" else "]"
+        for i in range(st, len(ss)):
+            ch = ss[i]
+            if in_str:
+                if esc:
+                    esc = False
+                elif ch == "\\":
+                    esc = True
+                elif ch == '"':
+                    in_str = False
+                continue
+            else:
+                if ch == '"':
+                    in_str = True
+                    continue
+                if ch == open_ch:
+                    depth += 1
+                elif ch == close_ch:
+                    depth -= 1
+                    if depth == 0:
+                        return ss[st:i+1]
+        return None
+
+    cand = _balanced_extract(s, start)
+    if cand:
+        try:
+            return json.loads(cand)
+        except Exception:
+            pass
+
+    # Fallback: try progressively from start
+    for end in range(len(s), start+1, -1):
+        chunk = s[start:end].strip()
+        try:
+            return json.loads(chunk)
+        except Exception:
+            continue
+    return None
+
+
+def _append_prompt_used(path: str, title: str, system_prompt: str, user_prompt: str) -> None:
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "a", encoding="utf-8") as f:
+        f.write("="*80 + "\n")
+        f.write(f"{title}\n")
+        f.write("-"*80 + "\n")
+        f.write("SYSTEM:\n" + (system_prompt or "") + "\n\n")
+        f.write("USER:\n" + (user_prompt or "") + "\n")
+        f.write("="*80 + "\n\n")
+
+
+def _qwen_json_call(step_name: str, system_prompt: str, user_prompt: str, raw_path: str, prompts_used_path: str,
+                    error_path: str, temperature: float = 0.2, max_new_tokens: int = 2048) -> Tuple[Optional[Any], str]:
+    """Call local Qwen3-VL text path and force JSON-only. Returns (parsed_json_or_none, raw_text).
+
+    Reliability rules:
+    - Always writes raw_path (plan_raw/shots_raw) even if parsing fails.
+    - Writes prompts_used_path with system/user prompts.
+    - Writes error_path with traceback on failure.
+    - Robust JSON extraction: first parseable {...} or [...] block.
+    """
+    _append_prompt_used(prompts_used_path, step_name, system_prompt, user_prompt)
+    raw_text = ""
+    try:
+        if not _HAVE_QWEN_TEXT or _qwen_generate_text is None:
+            raise RuntimeError(f"Qwen text generator not available: {_QWEN_IMPORT_ERROR!r}")
+        model_path = Path(_qwen_model_dir())
+        if not (model_path.exists() and any(model_path.iterdir())):
+            raise RuntimeError(f"Qwen3-VL model folder not found or empty: {model_path}")
+        # Prevent model/transformers prints from spamming logs; capture for debug.
+        cap_out = io.StringIO()
+        cap_err = io.StringIO()
+        with contextlib.redirect_stdout(cap_out), contextlib.redirect_stderr(cap_err):
+            txt = _qwen_generate_text(
+                model_path=model_path,
+                system_prompt=system_prompt,
+                user_prompt=user_prompt,
+                temperature=float(temperature),
+                max_new_tokens=int(max_new_tokens),
+                cancel_check=None,
+            )  # type: ignore
+        raw_text = (txt or "").strip()
+        stderr_txt = (cap_err.getvalue() or "").strip()
+
+        # Save raw (optionally append stderr without affecting JSON extraction)
+        save_blob = raw_text
+        if stderr_txt:
+            save_blob = (save_blob + "\n\n[stderr]\n" + stderr_txt).strip()
+        _safe_write_text(raw_path, save_blob + ("\n" if save_blob else ""))
+
+        parsed = _extract_first_json(raw_text)
+        if parsed is None:
+            raise RuntimeError("Model response did not contain parseable JSON.")
+        return parsed, raw_text
+
+    except Exception:
+        # Always write whatever we have + error traceback
+        try:
+            if raw_text:
+                _safe_write_text(raw_path, raw_text + "\n")
+        except Exception:
+            pass
+        _safe_write_text(error_path, traceback.format_exc())
+        return None, raw_text
+
+
+
 
 # -----------------------------
 # Pipeline runner (placeholder)
@@ -197,6 +434,8 @@ class PipelineWorker(QThread):
         self.out_dir = out_dir
         self.signals = PipelineSignals()
         self._stop_requested = False
+        self._last_pct = 0  # last emitted progress percent (for skip logs)
+
 
     def request_stop(self) -> None:
         self._stop_requested = True
@@ -205,6 +444,7 @@ class PipelineWorker(QThread):
         if self._stop_requested:
             raise RuntimeError("Cancelled by user.")
         self.signals.log.emit(msg)
+        self._last_pct = int(pct)
         self.signals.progress.emit(pct)
         time.sleep(sleep_s)
 
@@ -212,68 +452,17 @@ class PipelineWorker(QThread):
         try:
             os.makedirs(self.out_dir, exist_ok=True)
 
-            stages = [
-                ("Plan story + image prompts", 10),
-                ("Create transcript (optional)", 22),
-                ("Create voice (optional)", 30),
-                ("Generate images", 50),
-                ("Describe images -> image-to-video prompts", 62),
-                ("Generate video clips", 82),
-                ("Assemble in Videoclip Creator preset", 95),
-                ("Finalize output", 100),
-            ]
+            # NOTE:
+            # The Planner originally simulated the full pipeline with placeholder stage logs.
+            # Plan + Shots are now real (Qwen3-VL JSON), so we drive progress from the
+            # stepwise artifact pipeline below and avoid misleading "not wired" messages.
 
             self.signals.stage.emit("Starting")
             self.signals.log.emit(f"Job: {self.job.job_id}")
             self.signals.log.emit(f"Project root: {_root()}")
             self.signals.log.emit(f"Output directory: {self.out_dir}")
             self.signals.log.emit("----")
-
-            # Stage 1: story + prompts
-            self.signals.stage.emit(stages[0][0])
-            self._tick("Creating story outline and per-shot image prompts (placeholder)...", 5)
-            self._tick("Using model: Qwen3-VL (planned) — not wired yet.", 10)
-
-            # Stage 2: transcript if storytelling enabled
-            self.signals.stage.emit(stages[1][0])
-            if self.job.storytelling and not self.job.silent:
-                self._tick("Generating transcript from story (placeholder)...", 16)
-                self._tick("Using model: Whisper (planned) — not wired yet.", 22)
-            else:
-                self._tick("Skipping transcript generation (storytelling off or silent).", 22, 0.10)
-
-            # Stage 3: voice if storytelling enabled
-            self.signals.stage.emit(stages[2][0])
-            if self.job.storytelling and not self.job.silent:
-                self._tick("Generating TTS voice-over from transcript (placeholder)...", 26)
-                self._tick("Using model: Qwen3 TTS (planned) — not wired yet.", 30)
-            else:
-                self._tick("Skipping TTS (storytelling off or silent).", 30, 0.10)
-
-            # Stage 4: images
-            self.signals.stage.emit(stages[3][0])
-            self._tick("Generating images from prompts (placeholder)...", 38)
-            self._tick("Image model options planned: Z-Image / Qwen 2512 / SDXL (not wired).", 50)
-
-            # Stage 5: describe images -> i2v prompts
-            self.signals.stage.emit(stages[4][0])
-            self._tick("Describing created images to refine motion prompts (placeholder)...", 56)
-            self._tick("Using model: Qwen3 Describe feature (planned) — not wired yet.", 62)
-
-            # Stage 6: generate video clips
-            self.signals.stage.emit(stages[5][0])
-            self._tick("Creating short video clips from images + prompts (placeholder)...", 72)
-            self._tick("Video model options planned: Qwen 2.2 5B / HunyuanVideo (not wired).", 82)
-
-            # Stage 7: assemble in videoclip creator
-            self.signals.stage.emit(stages[6][0])
-            self._tick("Handing off clips + audio + resolution to Videoclip Creator preset (placeholder)...", 90)
-            self._tick("Preset runner will be wired later. For now, we only simulate output paths.", 95)
-
-            # Stage 8: finalize
-            self.signals.stage.emit(stages[7][0])
-            
-            
+            self.signals.progress.emit(0)
             # -----------------------------
             # Stepwise, idempotent artifact pipeline (placeholder)
             # Each step writes its own output. Future wiring simply replaces a step body.
@@ -304,6 +493,13 @@ class PipelineWorker(QThread):
                 "silent": self.job.silent,
                 "storytelling_volume": self.job.storytelling_volume,
                 "music_volume": self.job.music_volume,
+                "image_model": self.job.encoding.get("image_model"),
+                "video_model": self.job.encoding.get("video_model"),
+                "gen_quality_preset": self.job.encoding.get("gen_quality_preset"),
+                "generation_profile": self.job.encoding.get("generation_profile"),
+                "image_model": self.job.encoding.get("image_model"),
+                "video_model": self.job.encoding.get("video_model"),
+                "gen_quality_preset": self.job.encoding.get("gen_quality_preset"),
             }, sort_keys=True))
 
             manifest = _safe_read_json(manifest_path) or {}
@@ -323,6 +519,12 @@ class PipelineWorker(QThread):
                 "silent": self.job.silent,
                 "storytelling_volume": self.job.storytelling_volume,
                 "music_volume": self.job.music_volume,
+
+                "image_model": self.job.encoding.get("image_model"),
+                "video_model": self.job.encoding.get("video_model"),
+                "gen_quality_preset": self.job.encoding.get("gen_quality_preset"),
+                "videoclip_preset": self.job.encoding.get("videoclip_preset"),
+                "generation_profile": self.job.encoding.get("generation_profile"),
             })
             manifest["paths"].update({
                 "story_dir": story_dir,
@@ -335,15 +537,17 @@ class PipelineWorker(QThread):
             })
 
             def _set_step(name: str, status: str, note: str = "") -> None:
-                manifest["steps"][name] = {
+                cur = manifest["steps"].get(name) or {}
+                cur.update({
                     "status": status,
                     "ts": time.time(),
-                    "note": note
-                }
+                    "note": note,
+                })
+                manifest["steps"][name] = cur
                 _safe_write_json(manifest_path, manifest)
 
             def _skip(name: str, why: str) -> None:
-                self._tick(f"[SKIP] {name}: {why}", self.progress.value(), 0.05)
+                self._tick(f"[SKIP] {name}: {why}", self._last_pct, 0.05)
                 _set_step(name, "skipped", why)
 
             def _run(name: str, fn, pct: int) -> None:
@@ -354,7 +558,10 @@ class PipelineWorker(QThread):
                 _set_step(name, "running")
                 try:
                     fn()
-                    _set_step(name, "done")
+                    # Don't overwrite a step that marked itself as failed/stale.
+                    cur = manifest["steps"].get(name) or {}
+                    if cur.get("status") == "running":
+                        _set_step(name, "done")
                 except Exception as e:
                     err_path = os.path.join(errors_dir, f"{name.replace(' ', '_').lower()}.txt")
                     _safe_write_text(err_path, str(e))
@@ -363,79 +570,343 @@ class PipelineWorker(QThread):
 
             # Step A: Plan
             plan_path = os.path.join(story_dir, "plan.json")
+            plan_raw_path = os.path.join(story_dir, "plan_raw.txt")
+            qwen_prompts_used = os.path.join(story_dir, "qwen_prompts_used.txt")
+            qwen_plan_err = os.path.join(errors_dir, "qwen_plan_error.txt")
+
+            # Resolve generation profile (proxy targets)
+            gen_profile = self.job.encoding.get("generation_profile")
+            if not isinstance(gen_profile, dict):
+                gen_profile = _resolve_generation_profile(
+                    self.job.encoding.get("video_model") or "",
+                    self.job.encoding.get("gen_quality_preset") or "",
+                )
+                self.job.encoding["generation_profile"] = gen_profile
+
+            plan_fingerprint = _sha1_text(json.dumps({
+                "prompt": self.job.prompt,
+                "extra_info": self.job.extra_info,
+                "duration_sec": self.job.approx_duration_sec,
+                "audio": {
+                    "storytelling": self.job.storytelling,
+                    "music_background": self.job.music_background,
+                    "silent": self.job.silent,
+                    "storytelling_volume": self.job.storytelling_volume,
+                    "music_volume": self.job.music_volume,
+                },
+                "models": {
+                    "image_model": self.job.encoding.get("image_model"),
+                    "video_model": self.job.encoding.get("video_model"),
+                    "gen_quality_preset": self.job.encoding.get("gen_quality_preset"),
+                },
+                "generation_profile": gen_profile,
+                "final_export": {
+                    "resolution_preset": self.job.resolution_preset,
+                    "quality_preset": self.job.quality_preset,
+                    "encode": self.job.encoding,
+                },
+            }, sort_keys=True))
+
             def step_plan() -> None:
-                # Placeholder plan (future: Qwen VL plan)
+                # Determine audio mode for story
                 audio_mode = ("silent" if self.job.silent else
                               ("both" if (self.job.storytelling and self.job.music_background) else
                                ("storytelling" if self.job.storytelling else
                                 ("music" if self.job.music_background else "none"))))
-                plan = {
-                    "title": f"Planner plan {self.job.job_id}",
-                    "prompt": self.job.prompt,
-                    "extra_info": self.job.extra_info,
-                    "duration_sec": self.job.approx_duration_sec,
+
+                # Force JSON-only plan from Qwen
+                sys_p = (
+                    "You are a planning assistant for an offline video generator. "
+                    "Return ONLY valid JSON. No markdown, no commentary, no code fences. "
+                    "The JSON must be a single object."
+                )
+                user_p = (
+                    "Create a concise but useful story plan and constraints for this video project.\n"
+                    "Requirements:\n"
+                    "- Output MUST be JSON only.\n"
+                    "- Include: title, logline, setting, characters (list), tone, continuity_rules (list), beats (list).\n"
+                    "- Keep it short and actionable for prompt generation.\n\n"
+                    f"PROMPT: {self.job.prompt}\n"
+                    + (f"EXTRA_INFO: {self.job.extra_info}\n" if (self.job.extra_info or '').strip() else "")
+                    + f"TARGET_DURATION_SEC: {self.job.approx_duration_sec}\n"
+                    + f"AUDIO_MODE: {audio_mode}\n"
+                    + f"VIDEO_MODEL: {self.job.encoding.get('video_model')}\n"
+                    + f"GEN_QUALITY: {self.job.encoding.get('gen_quality_preset')}\n"
+                    + f"GEN_PROFILE: {json.dumps(gen_profile, ensure_ascii=False)}\n"
+                )
+
+                parsed, raw = _qwen_json_call(
+                    step_name="Plan (Qwen3-VL JSON)",
+                    system_prompt=sys_p,
+                    user_prompt=user_p,
+                    raw_path=plan_raw_path,
+                    prompts_used_path=qwen_prompts_used,
+                    error_path=qwen_plan_err,
+                    temperature=0.2,
+                    max_new_tokens=1800,
+                )
+
+                if not isinstance(parsed, dict):
+                    # Fallback placeholder, but mark failed and keep debug files
+                    plan = {
+                        "title": f"Planner plan {self.job.job_id}",
+                        "prompt": self.job.prompt,
+                        "extra_info": self.job.extra_info,
+                        "logline": self.job.prompt,
+                        "setting": "",
+                        "characters": [],
+                        "tone": "",
+                        "continuity_rules": [
+                            "Keep characters, outfits, and key props consistent across shots.",
+                            "Keep the main location style consistent unless the shot says otherwise.",
+                        ],
+                        "beats": [
+                            {"index": 1, "purpose": "setup", "moment": "Introduce the scene and main subject."},
+                            {"index": 2, "purpose": "escalation", "moment": "Increase energy and visual novelty."},
+                            {"index": 3, "purpose": "payoff", "moment": "Deliver a satisfying highlight moment."},
+                        ],
+                    }
+                    _safe_write_json(plan_path, plan)
+                    manifest["paths"]["plan_json"] = plan_path
+                    # Record debug paths + fingerprint and mark as failed
+                    manifest["paths"]["plan_raw_txt"] = plan_raw_path
+                    manifest["paths"]["qwen_prompts_used_txt"] = qwen_prompts_used
+                    manifest["paths"]["qwen_plan_error_txt"] = qwen_plan_err
+                    srec = manifest["steps"].get("Plan (story + constraints)") or {}
+                    srec.update({
+                        "status": "failed",
+                        "fingerprint": plan_fingerprint,
+                        "debug": {"raw": plan_raw_path, "prompts_used": qwen_prompts_used, **({"error": qwen_plan_err} if _file_ok(qwen_plan_err, 1) else {})},
+                        "note": "Qwen JSON failed; wrote placeholder plan.json",
+                        "ts": time.time(),
+                    })
+                    manifest["steps"]["Plan (story + constraints)"] = srec
+                    _safe_write_json(manifest_path, manifest)
+                    return
+
+                # Merge resolved settings into plan
+                parsed.setdefault("title", f"Planner plan {self.job.job_id}")
+                parsed["prompt"] = self.job.prompt
+                parsed["extra_info"] = self.job.extra_info
+                parsed["duration_sec"] = int(self.job.approx_duration_sec)
+                parsed["audio_mode"] = audio_mode
+                parsed["generation"] = {
+                    "video_model": self.job.encoding.get("video_model"),
+                    "gen_quality_preset": self.job.encoding.get("gen_quality_preset"),
+                    "profile": gen_profile,
+                }
+                parsed["final_export"] = {
                     "resolution_preset": self.job.resolution_preset,
                     "quality_preset": self.job.quality_preset,
-                    "audio_mode": audio_mode,
-                    "style_notes": {
-                        "image_model": self.job.encoding.get("image_model"),
-                        "video_model": self.job.encoding.get("video_model"),
-                        "videoclip_preset": self.job.encoding.get("videoclip_preset"),
+                    "encode": {
+                        "mode": self.job.encoding.get("mode"),
+                        "crf": self.job.encoding.get("crf"),
+                        "bitrate_kbps": self.job.encoding.get("bitrate_kbps"),
+                        "note": self.job.encoding.get("note"),
                     },
-                    "continuity_rules": [
-                        "Keep characters, outfits, and key props consistent across shots.",
-                        "Keep the main location style consistent unless the shot says otherwise.",
-                    ],
-                    "beats": [
-                        {"index": 1, "purpose": "setup", "moment": "Introduce the scene and main subject."},
-                        {"index": 2, "purpose": "escalation", "moment": "Increase energy and visual novelty."},
-                        {"index": 3, "purpose": "payoff", "moment": "Deliver a satisfying highlight moment."},
-                    ],
                 }
-                _safe_write_json(plan_path, plan)
+                parsed["style_notes"] = {
+                    "image_model": self.job.encoding.get("image_model"),
+                    "video_model": self.job.encoding.get("video_model"),
+                    "videoclip_preset": self.job.encoding.get("videoclip_preset"),
+                }
+                parsed["planner_plan_fingerprint"] = plan_fingerprint
+
+                _safe_write_json(plan_path, parsed)
                 manifest["paths"]["plan_json"] = plan_path
+                manifest["paths"]["plan_raw_txt"] = plan_raw_path
+                manifest["paths"]["qwen_prompts_used_txt"] = qwen_prompts_used
+                # Only store error path if an error file exists
+                if _file_ok(qwen_plan_err, 1):
+                    manifest["paths"]["qwen_plan_error_txt"] = qwen_plan_err
+                else:
+                    manifest["paths"].pop("qwen_plan_error_txt", None)
+
+                srec = manifest["steps"].get("Plan (story + constraints)") or {}
+                srec.update({
+                    "status": "done",
+                    "fingerprint": plan_fingerprint,
+                    "debug": {"raw": plan_raw_path, "prompts_used": qwen_prompts_used, **({"error": qwen_plan_err} if _file_ok(qwen_plan_err, 1) else {})},
+                    "note": "Generated with Qwen (JSON enforced).",
+                    "ts": time.time(),
+                })
+                manifest["steps"]["Plan (story + constraints)"] = srec
                 _safe_write_json(manifest_path, manifest)
 
-            if _file_ok(plan_path, 10):
-                _skip("Plan (story + constraints)", "plan.json already exists")
+            # Idempotency: skip only if plan exists AND fingerprint matches AND last status was done
+            plan_prev = (manifest.get("steps") or {}).get("Plan (story + constraints)") or {}
+            if _file_ok(plan_path, 10) and plan_prev.get("fingerprint") == plan_fingerprint and plan_prev.get("status") == "done":
+                _skip("Plan (story + constraints)", "plan.json up-to-date (fingerprint match)")
+                plan_changed = False
             else:
                 _run("Plan (story + constraints)", step_plan, 12)
+                plan_changed = True
 
-            # Step B: Shots
+# Step B: Shots
             shots_path = os.path.join(story_dir, "shots.json")
+            shots_raw_path = os.path.join(story_dir, "shots_raw.txt")
+            qwen_shots_err = os.path.join(errors_dir, "qwen_shots_error.txt")
+
+            # Shots fingerprint depends on plan fingerprint + generation profile
+            shots_fingerprint = _sha1_text(json.dumps({
+                "plan_fingerprint": plan_fingerprint,
+                "video_model": self.job.encoding.get("video_model"),
+                "gen_quality_preset": self.job.encoding.get("gen_quality_preset"),
+                "generation_profile": gen_profile,
+            }, sort_keys=True))
+
             def step_shots() -> None:
-                # Placeholder shot planner (future: Qwen VL shots)
-                n_shots = max(8, min(48, int(max(1, self.job.approx_duration_sec) / 3)))
-                shots = []
-                for i in range(1, n_shots + 1):
-                    sid = f"S{i:02d}"
-                    seed = f"{self.job.prompt} — moment {i} of {n_shots}"
-                    camera = "wide establishing shot" if i == 1 else ("close-up" if i % 5 == 0 else "medium shot")
-                    mood = "excited" if i % 3 == 0 else ("playful" if i % 3 == 1 else "curious")
-                    lighting = "neon club lighting" if "club" in self.job.prompt.lower() else "cinematic lighting"
-                    shots.append({
-                        "id": sid,
-                        "seed": seed,
-                        "camera": camera,
-                        "mood": mood,
-                        "lighting": lighting,
-                        "notes": "One clear action, one subject. Keep continuity with prior shots."
+                # Load plan for context (best effort)
+                plan_obj = _safe_read_json(plan_path) or {}
+                # Choose approximate number of shots based on desired duration
+                # (avg duration chosen from generation preset; stable per job)
+                avg_sec = float((gen_profile.get("min_sec", 2.5) + gen_profile.get("max_sec", 5.0)) / 2.0)
+                n_shots = max(6, min(80, int(max(1, self.job.approx_duration_sec) / max(1.5, avg_sec))))
+
+                sys_p = (
+                    "You are a shot-list generator for an offline video pipeline. "
+                    "Return ONLY valid JSON. No markdown, no commentary, no code fences. "
+                    "The JSON must be a single ARRAY (top-level list) of shot objects. "
+                    "Each shot MUST include fields: id, seed, camera, mood, lighting, notes."
+                )
+                user_p = (
+                    "Generate a concise seeded shot list for the plan below.\n"
+                    "Rules:\n"
+                    "- Output MUST be JSON only.\n"
+                    "- Output a top-level JSON array of {id, seed, camera, mood, lighting, notes} objects.\n"
+                    "- Use ids like S01, S02, ... up to the requested count.\n"
+                    "- Keep each shot to ONE clear action and ONE subject.\n"
+                    "- Keep continuity across shots.\n\n"
+                    f"REQUESTED_SHOTS: {n_shots}\n"
+                    f"GEN_PROFILE: {json.dumps(gen_profile, ensure_ascii=False)}\n"
+                    "PLAN_JSON:\n"
+                    + json.dumps(plan_obj, ensure_ascii=False)
+                )
+
+                parsed, raw = _qwen_json_call(
+                    step_name="Shots (Qwen3-VL JSON)",
+                    system_prompt=sys_p,
+                    user_prompt=user_p,
+                    raw_path=shots_raw_path,
+                    prompts_used_path=qwen_prompts_used,
+                    error_path=qwen_shots_err,
+                    temperature=0.25,
+                    max_new_tokens=2400,
+                )
+
+                shots_list: List[Dict[str, Any]] = []
+
+                if isinstance(parsed, list):
+                    shots_list = [x for x in parsed if isinstance(x, dict)]
+                elif isinstance(parsed, dict):
+                    v = parsed.get("shots")
+                    if isinstance(v, list):
+                        shots_list = [x for x in v if isinstance(x, dict)]
+                    else:
+                        # try treat dict itself as shot map (unlikely)
+                        pass
+
+                if not shots_list:
+                    # Fallback placeholder list
+                    shots_list = []
+                    for i in range(1, n_shots + 1):
+                        sid = f"S{i:02d}"
+                        shots_list.append({
+                            "id": sid,
+                            "seed": f"{self.job.prompt} — moment {i} of {n_shots}",
+                            "camera": "medium shot",
+                            "mood": "neutral",
+                            "lighting": "cinematic lighting",
+                            "notes": "One clear action, one subject. Keep continuity with prior shots.",
+                        })
+                    # mark failed but continue
+                    manifest["paths"]["shots_raw_txt"] = shots_raw_path
+                    manifest["paths"]["qwen_shots_error_txt"] = qwen_shots_err
+
+                    srec = manifest["steps"].get("Shots (seeded shot list)") or {}
+                    srec.update({
+                        "status": "failed",
+                        "fingerprint": shots_fingerprint,
+                        "debug": {"raw": shots_raw_path, "prompts_used": qwen_prompts_used, **({"error": qwen_shots_err} if _file_ok(qwen_shots_err, 1) else {})},
+                        "note": "Qwen JSON failed; wrote placeholder shots.json",
+                        "ts": time.time(),
                     })
-                _safe_write_json(shots_path, {"shots": shots})
+                    manifest["steps"]["Shots (seeded shot list)"] = srec
+
+                # Normalize + add generation intent fields
+                out_shots: List[Dict[str, Any]] = []
+                for idx, sh in enumerate(shots_list, start=1):
+                    sid = sh.get("id") or f"S{idx:02d}"
+                    seed = sh.get("seed") or f"{self.job.prompt} — moment {idx}"
+                    cam = sh.get("camera") or "medium shot"
+                    mood = sh.get("mood") or "neutral"
+                    light = sh.get("lighting") or "cinematic lighting"
+                    notes = sh.get("notes") or "One clear action, one subject. Keep continuity."
+
+                    # deterministic duration per shot within preset range
+                    dur = _stable_uniform(str(seed), float(gen_profile.get("min_sec", 2.5)), float(gen_profile.get("max_sec", 5.0)))
+                    dur = round(dur, 2)
+
+                    out_shots.append({
+                        "id": str(sid),
+                        "seed": str(seed),
+                        "seed_int": int(_sha1_text(str(seed))[:8], 16) % 2147483647,
+                        "camera": str(cam),
+                        "mood": str(mood),
+                        "lighting": str(light),
+                        "notes": str(notes),
+                        # placeholders for downstream compilers
+                        "duration_sec": dur,
+                        "gen_fps": int(gen_profile.get("fps", 20)),
+                        "gen_res": str(gen_profile.get("res", "384p")),
+                        "steps": int(gen_profile.get("steps", 9)),
+                        "video_model_key": str(gen_profile.get("model", "hunyuan")),
+                    })
+
+                _safe_write_json(shots_path, out_shots)
                 manifest["paths"]["shots_json"] = shots_path
-                manifest["settings"]["n_shots"] = len(shots)
+                manifest["paths"]["shots_raw_txt"] = shots_raw_path
+                manifest["paths"]["qwen_prompts_used_txt"] = qwen_prompts_used
+                # Only store error path if an error file exists
+                if _file_ok(qwen_shots_err, 1):
+                    manifest["paths"]["qwen_shots_error_txt"] = qwen_shots_err
+                else:
+                    manifest["paths"].pop("qwen_shots_error_txt", None)
+                # Only set n_shots if we have list
+                manifest["settings"]["n_shots"] = len(out_shots)
+
+                # If step not already marked failed above, mark done now
+                srec = manifest["steps"].get("Shots (seeded shot list)") or {}
+                if srec.get("status") != "failed":
+                    srec.update({
+                        "status": "done",
+                        "fingerprint": shots_fingerprint,
+                        "debug": {"raw": shots_raw_path, "prompts_used": qwen_prompts_used, **({"error": qwen_shots_err} if _file_ok(qwen_shots_err, 1) else {})},
+                        "note": "Generated with Qwen (JSON enforced).",
+                        "ts": time.time(),
+                    })
+                    manifest["steps"]["Shots (seeded shot list)"] = srec
+
                 _safe_write_json(manifest_path, manifest)
 
-            if _file_ok(shots_path, 10):
-                _skip("Shots (seeded shot list)", "shots.json already exists")
+            shots_prev = (manifest.get("steps") or {}).get("Shots (seeded shot list)") or {}
+
+            # Shots depend on plan: if plan changed, always regenerate shots
+            if not plan_changed and _file_ok(shots_path, 10) and shots_prev.get("fingerprint") == shots_fingerprint and shots_prev.get("status") == "done":
+                _skip("Shots (seeded shot list)", "shots.json up-to-date (fingerprint match)")
             else:
+                if plan_changed and _file_ok(shots_path, 10):
+                    # Mark stale in manifest
+                    srec = manifest["steps"].get("Shots (seeded shot list)") or {}
+                    srec.update({"status": "stale", "note": "Plan changed; regenerating shots", "ts": time.time()})
+                    manifest["steps"]["Shots (seeded shot list)"] = srec
+                    _safe_write_json(manifest_path, manifest)
                 _run("Shots (seeded shot list)", step_shots, 28)
 
-            # Step C: Image prompts
+# Step C: Image prompts
             image_prompts_path = os.path.join(prompts_dir, "image_prompts.txt")
             def step_image_prompts() -> None:
-                data = _safe_read_json(shots_path) or {}
-                shots = data.get("shots", [])
+                shots = _read_shots_list(shots_path)
                 base_style = "Cinematic, detailed, consistent character design, clean composition."
                 if self.job.extra_info.strip():
                     base_style += f" Extra notes: {self.job.extra_info.strip()}"
@@ -481,8 +952,7 @@ class PipelineWorker(QThread):
             # Step E: I2V prompts
             i2v_prompts_path = os.path.join(prompts_dir, "i2v_prompts.txt")
             def step_i2v_prompts() -> None:
-                data = _safe_read_json(shots_path) or {}
-                shots = data.get("shots", [])
+                shots = _read_shots_list(shots_path)
                 lines = []
                 for sh in shots:
                     sid = sh.get("id", "S??")
@@ -818,13 +1288,44 @@ class PlaceholdrPane(QWidget):
         self.cmb_video_model = QComboBox()
         self.cmb_video_model.addItems([
             "Auto (later)",
-            "Qwen 2.2 5B (planned)",
+            "WAN 2.2 (planned)",
             "HunyuanVideo 1.5 (planned)",
+            "Qwen 2.2 5B (planned)",
         ])
         self.cmb_video_model.setCurrentIndex(0)
         grid.addWidget(self.cmb_video_model, 1, 1)
 
-        grid.addWidget(QLabel("Videoclip Creator preset"), 2, 0)
+        grid.addWidget(QLabel("Generation quality"), 2, 0)
+        self.cmb_gen_quality = QComboBox()
+        # populated dynamically based on video model selection
+        grid.addWidget(self.cmb_gen_quality, 2, 1)
+
+        def _refresh_gen_quality() -> None:
+            vm = (self.cmb_video_model.currentText() or "").lower()
+            cur = (self.cmb_gen_quality.currentText() or "").strip()
+            self.cmb_gen_quality.blockSignals(True)
+            self.cmb_gen_quality.clear()
+            if "wan" in vm and "2.2" in vm:
+                self.cmb_gen_quality.addItems(["Normal (default)", "High"])
+                if cur.lower().startswith("high"):
+                    self.cmb_gen_quality.setCurrentIndex(1)
+                else:
+                    self.cmb_gen_quality.setCurrentIndex(0)
+            else:
+                # hunyuan + fallback
+                self.cmb_gen_quality.addItems(["Low", "Medium (default)", "High"])
+                if cur.lower().startswith("low"):
+                    self.cmb_gen_quality.setCurrentIndex(0)
+                elif cur.lower().startswith("high"):
+                    self.cmb_gen_quality.setCurrentIndex(2)
+                else:
+                    self.cmb_gen_quality.setCurrentIndex(1)
+            self.cmb_gen_quality.blockSignals(False)
+
+        self.cmb_video_model.currentIndexChanged.connect(lambda _=None: _refresh_gen_quality())
+        _refresh_gen_quality()
+
+        grid.addWidget(QLabel("Videoclip Creator preset"), 3, 0)
         self.cmb_videoclip_preset = QComboBox()
         self.cmb_videoclip_preset.addItems([
             "Preset A (placeholder)",
@@ -832,7 +1333,7 @@ class PlaceholdrPane(QWidget):
             "Preset C (placeholder)",
         ])
         self.cmb_videoclip_preset.setCurrentIndex(0)
-        grid.addWidget(self.cmb_videoclip_preset, 2, 1)
+        grid.addWidget(self.cmb_videoclip_preset, 3, 1)
 
         lay.addLayout(grid)
 
@@ -1013,7 +1514,14 @@ class PlaceholdrPane(QWidget):
             "image_model": self.cmb_image_model.currentText(),
             "video_model": self.cmb_video_model.currentText(),
             "videoclip_preset": self.cmb_videoclip_preset.currentText(),
+            "gen_quality_preset": (self.cmb_gen_quality.currentText() if hasattr(self, "cmb_gen_quality") else ""),
         })
+        # Resolve generation profile (proxy targets) now so fingerprints stay stable
+        try:
+            enc["generation_profile"] = _resolve_generation_profile(enc.get("video_model",""), enc.get("gen_quality_preset",""))
+        except Exception:
+            enc["generation_profile"] = {}
+
 
         job = PlaceholdrJob(
             job_id=str(uuid.uuid4())[:8],
