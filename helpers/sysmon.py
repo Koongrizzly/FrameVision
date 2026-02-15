@@ -59,7 +59,7 @@ K_FIRST_RUN_TS   = "first_run_epoch"
 # Other envs to probe for CUDA/Torch/TVision/Transformers (relative to ROOT)
 # NOTE: We keep this list Windows-friendly, but we still probe common POSIX venv layouts.
 OTHER_ENV_DEFS: List[Tuple[str, str]] = [
-    ("Ace Music", r"presets\\extra_env\\.ace_env"),
+    ("Ace Music", r"environments\.ace_15"),
     ("Comfui", r".comfy_env"),
     ("HunyuanVideo 1.5", r".hunyuan15_env"),
     ("Z-image Turbo", r".zimage_env"),
@@ -445,11 +445,8 @@ def _tool_ready_status(models_dir: str) -> Dict[str, Optional[str]]:
             if has_models:
                 upscayl = base
 
-
-    # Ace Music — checks if ROOT/.ace_env exists
-    ace_music = _exists_any([
-        os.path.join(ROOT, ".ace_env"),
-    ])
+    # Ace Music — checks if ROOT/environments/.ace_15 exists (folder)
+    ace_music = os.path.isdir(os.path.join(ROOT, "environments", ".ace_15"))
 
     # Z-image — checks if any folder/file matching models/z-image*.* exists
     z_image = None
@@ -505,49 +502,89 @@ def _tools_line(status: Dict[str, Optional[str]]) -> str:
     return _fmt(group1) + "\n" + _fmt(group2)
 
 
-# ---- BG/Inpaint/SD models check --------------------------------------------
-def _has_file_bigger_than(path: str, gib: float) -> Optional[str]:
-    """Return a file path if any file in 'path' is larger than `gib` GiB, else None."""
+
+# ---- Qwen Edit/Image models check --------------------------------------------
+
+def _find_models_subdir(models_dir: str, preferred_names: List[str], fallback_tokens: List[str]) -> Optional[str]:
+    """Find a matching subdirectory under models_dir.
+
+    1) Exact folder names (case-insensitive) from preferred_names.
+    2) Any folder name containing any fallback token (case-insensitive).
+    """
     try:
-        thresh = gib * (1024**3)
-        if not os.path.isdir(path):
+        if not models_dir or not os.path.isdir(models_dir):
             return None
-        for root, _dirs, files in os.walk(path):
-            for fn in files:
-                fp = os.path.join(root, fn)
-                try:
-                    if os.path.getsize(fp) > thresh:
-                        return fp
-                except Exception:
-                    continue
     except Exception:
-        pass
+        return None
+
+    try:
+        entries = list(os.listdir(models_dir))
+    except Exception:
+        entries = []
+
+    lower_map = {e.lower(): e for e in entries}
+
+    # 1) Preferred names (exact / case-insensitive)
+    for name in (preferred_names or []):
+        if not name:
+            continue
+        try:
+            cand = os.path.join(models_dir, name)
+            if os.path.isdir(cand):
+                return cand
+        except Exception:
+            pass
+        real = lower_map.get(str(name).lower())
+        if real:
+            cand2 = os.path.join(models_dir, real)
+            try:
+                if os.path.isdir(cand2):
+                    return cand2
+            except Exception:
+                pass
+
+    # 2) Fallback token scan (e.g. '2511', '2512')
+    toks = [str(t).lower() for t in (fallback_tokens or []) if t]
+    if toks:
+        for e in entries:
+            try:
+                full = os.path.join(models_dir, e)
+                if not os.path.isdir(full):
+                    continue
+                el = e.lower()
+                if any(t in el for t in toks):
+                    return full
+            except Exception:
+                continue
     return None
 
-def _bg_models_status(models_dir: str) -> Dict[str, Optional[str]]:
-    """Check presence of BG + Inpaint + SD15/SDXL models."""
-    bg_dir = os.path.join(models_dir, "bg")
-    biref = os.path.join(bg_dir, "BiRefNet-COD-epoch_125.onnx")
-    modnet = os.path.join(bg_dir, "modnet_photographic_portrait_matting.onnx")
-    inpaint_file = _has_file_bigger_than(bg_dir, 1.1)  # any >1.1 GiB in /bg
-    sd15_dir = os.path.join(models_dir, "sd15")
-    sdxl_dir = os.path.join(models_dir, "sdxl")
-    sd_big = _has_file_bigger_than(sd15_dir, 1.0) or _has_file_bigger_than(sdxl_dir, 1.0)
+
+def _qwen_models_status(models_dir: str) -> Dict[str, Optional[str]]:
+    """Check presence of Qwen Edit 2511 and Qwen Image 2512 (GGUF) folders in /models."""
+    qwen_edit_2511 = _find_models_subdir(
+        models_dir,
+        preferred_names=['qwen2511gguf'],
+        fallback_tokens=['2511'],
+    )
+    qwen_img_2512 = _find_models_subdir(
+        models_dir,
+        preferred_names=['Qwen-Image-2512 GGUF'],
+        fallback_tokens=['2512'],
+    )
     return {
-        "BiRefNet": biref if os.path.isfile(biref) else None,
-        "modnet": modnet if os.path.isfile(modnet) else None,
-        "Inpaint": inpaint_file,
-        "SD15/SDXL": sd_big,
+        'Qwen Edit 2511': qwen_edit_2511,
+        'Qwen Image 2512': qwen_img_2512,
     }
 
-def _bg_models_line(status: Dict[str, Optional[str]]) -> str:
-    order = ["BiRefNet", "modnet", "Inpaint", "SD15/SDXL"]
+
+def _qwen_models_line(status: Dict[str, Optional[str]]) -> str:
+    order = ['Qwen Edit 2511', 'Qwen Image 2512']
     parts = []
     for name in order:
         ok = bool(status.get(name))
-        check = "✅" if ok else "❌"
-        parts.append(f"{name} {check}")
-    return " • ".join(parts)
+        check = '✅' if ok else '❌'
+        parts.append(f'{name} {check}')
+    return ' • '.join(parts)
 
 # ---- HUD visibility helpers --------------------------------------------------
 def _apply_hud_visibility(enable: bool):
@@ -724,12 +761,12 @@ class SysMonPanel(QWidget):
         self.lbl_tools = QLabel(_tools_line(self._tools_status))
         self.lbl_tools.setTextFormat(Qt.PlainText)
         self.lbl_tools.setWordWrap(True)
-        self.lbl_tools.setToolTip("Checks FFmpeg, Qwen3-VL (describe), RIFE, Real-ESRGAN, Waifu2x, UpScayl(er), Ace Music, Z-image, Wan 2.2, HunyuanVideo 1.5")
+        self.lbl_tools.setToolTip("Checks if models are installed in the app")
 
-        self._bg_status = _bg_models_status(paths["models"]) 
-        self.lbl_bg = QLabel(" " + _bg_models_line(self._bg_status))
+        self._qwen_status = _qwen_models_status(paths["models"]) 
+        self.lbl_bg = QLabel(" " + _qwen_models_line(self._qwen_status))
         self.lbl_bg.setTextFormat(Qt.PlainText)
-        self.lbl_bg.setToolTip("Checks bg models: BiRefNet, MODNet, Inpaint (>1.1 GiB), SD15/SDXL (>1 GiB)")
+        self.lbl_bg.setToolTip("Checks /models for Qwen Edit 2511 (qwen2511gguf) and Qwen Image 2512 (Qwen-Image-2512 GGUF)")
 
         # Uptime lines
         self.lbl_uptime_session = QLabel("Time online (this session): —")
@@ -749,7 +786,7 @@ class SysMonPanel(QWidget):
         self.btn_rescan.clicked.connect(self._refresh_disk)
         self.btn_rescan.clicked.connect(self._kick_env_probe)
 
-        self.btn_rescan.clicked.connect(self._refresh_bg_models)
+        self.btn_rescan.clicked.connect(self._refresh_qwen_models)
         # Reset session timer button
         self.btn_reset = QPushButton("Reset session timer")
         self.btn_reset.setToolTip("Reset the 'Time online (this session)' counter to 0.")
@@ -842,7 +879,7 @@ class SysMonPanel(QWidget):
         QSettings(ORG, APP).setValue(K_SYSMON_ENABLED, self.enabled)
         if self.enabled:
             self.session_start_ts = time.time()
-            self.timer.start(); self._kick_dir_scan(); self._kick_env_probe(); self._refresh_tools(); self._refresh_disk(); self._refresh_bg_models()
+            self.timer.start(); self._kick_dir_scan(); self._kick_env_probe(); self._refresh_tools(); self._refresh_disk(); self._refresh_qwen_models()
         else:
             self.timer.stop()
 
@@ -923,11 +960,11 @@ class SysMonPanel(QWidget):
         models_dir = _settings_paths()["models"]
         self._tools_status = _tool_ready_status(models_dir)
         self.lbl_tools.setText(_tools_line(self._tools_status))
-    def _refresh_bg_models(self):
+    def _refresh_qwen_models(self):
         models_dir = _settings_paths()["models"]
-        self._bg_status = _bg_models_status(models_dir)
+        self._qwen_status = _qwen_models_status(models_dir)
         try:
-            self.lbl_bg.setText(" " + _bg_models_line(self._bg_status))
+            self.lbl_bg.setText(" " + _qwen_models_line(self._qwen_status))
         except Exception:
             pass
 

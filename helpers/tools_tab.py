@@ -3,18 +3,17 @@ import subprocess
 # helpers/tools_tab.py — extracted Tools pane (modular)
 import os, re, subprocess, sys
 from pathlib import Path
+from helpers.background import install_background_tool
 from helpers.meme_tool import MemeToolPane
 from helpers.trim_tool import install_trim_tool
 from helpers.cropper import install_cropper_tool
 from helpers.audiotool import install_audio_tool
 from helpers.prompt import install_prompt_tool
-from helpers.background import install_background_tool
 from helpers.renam import RenamPane
 from helpers.batch import BatchSelectDialog
 from helpers.frames import install_frames_tool
 from helpers.musicedit import MusicEditWidget
-from helpers.split_glue_video import SpliglueVideoTool
-# from helpers.whisper import WhisperWidget
+from helpers.whisper import WhisperWidget
 from helpers.metadata import MetadataEditorWidget
 
 import re
@@ -48,6 +47,68 @@ except Exception:
     OUT_SHOTS  = BASE/'output'/'screenshots'
     OUT_TEMP   = BASE/'output'/'_temp'
 
+# --- Optional installs hide state (managed by helpers/remove_hide.py) ---
+# We read the same JSON state file used by remove_hide.py so the state stays user-visible.
+
+_opt_hide_cache = None
+
+def _optional_hide_state():
+    global _opt_hide_cache
+    try:
+        if _opt_hide_cache is not None:
+            return _opt_hide_cache
+    except Exception:
+        pass
+    try:
+        from helpers.remove_hide import get_state_path as _get_state_path, load_state as _load_state
+        _opt_hide_cache = _load_state(_get_state_path())
+        return _opt_hide_cache
+    except Exception:
+        _opt_hide_cache = {"hidden_ids": []}
+        return _opt_hide_cache
+
+
+def _optional_hide_is_hidden(entry_id: str) -> bool:
+    try:
+        st = _optional_hide_state() or {}
+        hid = st.get("hidden_ids", [])
+        return bool(entry_id in (hid or []))
+    except Exception:
+        return False
+
+
+
+# --- Optional installs hide state (managed by helpers/remove_hide.py) ---
+# We read the same JSON state file used by remove_hide.py so the state stays user-visible/editable.
+
+_opt_hide_cache = None
+
+def _optional_hide_state():
+    global _opt_hide_cache
+    try:
+        if _opt_hide_cache is not None:
+            return _opt_hide_cache
+    except Exception:
+        pass
+    try:
+        from helpers.remove_hide import get_state_path as _get_state_path, load_state as _load_state
+        st = _load_state(_get_state_path())
+        if not isinstance(st, dict):
+            st = {}
+        _opt_hide_cache = st
+        return st
+    except Exception:
+        _opt_hide_cache = {"hidden_ids": []}
+        return _opt_hide_cache
+
+def _optional_hide_is_hidden(entry_id: str) -> bool:
+    try:
+        st = _optional_hide_state() or {}
+        hidden = st.get("hidden_ids") or []
+        return entry_id in hidden
+    except Exception:
+        return False
+
 # --- Normalize trims output folder (new default) ---
 try:
     OUT_TRIMS = (OUT_VIDEOS / 'trims')
@@ -71,6 +132,21 @@ except Exception:
         OUT_REVERSE = _Path('output')/'video'/'reverse'
 
 
+try:
+    OUT_SLOW_FAST
+except Exception:
+    try:
+        OUT_SLOW_FAST = ROOT/'output'/'video'/'slow_fast'
+    except Exception:
+        from pathlib import Path as _Path
+        OUT_SLOW_FAST = _Path('output')/'video'/'slow_fast'
+
+try:
+    OUT_SLOW_FAST.mkdir(parents=True, exist_ok=True)
+except Exception:
+    pass
+
+
 def ffmpeg_path():
     """Resolve ffmpeg, preferring app-local presets/bin first, then bin, then PATH."""
     exe = "ffmpeg.exe" if os.name=="nt" else "ffmpeg"
@@ -87,6 +163,15 @@ def ffmpeg_path():
             continue
     return "ffmpeg"
 
+
+try:
+    from helpers.videotext import videotextPane
+except Exception as _e:
+    print("[framevision] videotext tool import failed:", _e)
+    videotextPane = None
+
+# --- HeartMuLa (removed from Tools tab) ---
+HeartMuLaUI = None
 
 def ffprobe_path():
     """Resolve ffprobe, preferring app-local presets/bin first, then bin, then PATH."""
@@ -724,6 +809,7 @@ class InstantToolsPane(QWidget):
         sec_extract = CollapsibleSection("Extract frames", expanded=False)
         sec_trim = CollapsibleSection("Video Trim Lab", expanded=False)
         sec_crop = CollapsibleSection("Cropping", expanded=False)
+        sec_videotext = CollapsibleSection("Video Text Overlay", expanded=False)
         sec_describe = CollapsibleSection("Describe anything with Qwen3 VL", expanded=False)
         _desc_wrap = QWidget(); _descl = QVBoxLayout(_desc_wrap); _descl.setContentsMargins(0,0,0,0)
         _descl.setSpacing(6)
@@ -757,18 +843,96 @@ class InstantToolsPane(QWidget):
         except Exception:
             pass
 
+        # ---- Qwen 3 Text to Speech ----
+        sec_qwen3tts = None
+        if not _optional_hide_is_hidden("qwen3_tts"):
+            sec_qwen3tts = CollapsibleSection("Qwen 3 Text to Speech", expanded=False)
+            _tts_wrap = QWidget(); _tts_l = QVBoxLayout(_tts_wrap); _tts_l.setContentsMargins(0,0,0,0)
+            _tts_l.setSpacing(6)
+            _tts = None
+            try:
+                from helpers.qwentts_ui import MainWindow as _Qwen3TTSWindow
+                _tts = _Qwen3TTSWindow()
+                try:
+                    _tts.setParent(self)
+                except Exception:
+                    pass
+            except Exception:
+                _tts = None
+            if _tts is not None:
+                try:
+                    _tts.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+                except Exception:
+                    pass
+                try:
+                    _tts.setMinimumHeight(680)
+                except Exception:
+                    pass
+                _tts_l.addWidget(_tts, 1)
+            else:
+                _fallback = QLabel("Qwen 3 TTS tool is unavailable (missing helpers/qwentts_ui.py).")
+                _fallback.setWordWrap(True)
+                _tts_l.addWidget(_fallback)
+            sec_qwen3tts.setContentLayout(_tts_l)
+            try:
+                sec_qwen3tts.content.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+            except Exception:
+                pass
+
         sec_upscale = CollapsibleSection("Upscale Video and images", expanded=False)
         _upsc_wrap = QWidget(); _upscl = QVBoxLayout(_upsc_wrap); _upscl.setContentsMargins(0,0,0,0)
         _upscl.setSpacing(6)
+
+        # IMPORTANT:
+        # We used to have Upscale as a main tab. If a legacy "Upscale" tab still exists (even hidden),
+        # it can fight with this Tools-embedded instance and cause settings/engine/model to appear stale.
+        # So: if we find a legacy Upscale tab, we *move the existing upscaler pane here* and remove the tab.
+        _upsc = None
         try:
-            from helpers.upsc import UpscPane
-            _upsc = UpscPane(self)
+            tabs = getattr(self.main, "tabs", None)
+            if tabs is not None:
+                for _i in range(tabs.count()):
+                    try:
+                        _nm = (tabs.tabText(_i) or "").strip().lower()
+                    except Exception:
+                        _nm = ""
+                    if _nm == "upscale":
+                        _w = tabs.widget(_i)
+                        try:
+                            tabs.removeTab(_i)
+                        except Exception:
+                            pass
+                        # Extract actual pane (UpscTab wrapper uses .inner)
+                        _inner = getattr(_w, "inner", None)
+                        if _inner is not None:
+                            try:
+                                _inner.setParent(None)
+                            except Exception:
+                                pass
+                            _upsc = _inner
+                            try:
+                                _w.setParent(None)
+                                _w.deleteLater()
+                            except Exception:
+                                pass
+                        else:
+                            _upsc = _w
+                        break
         except Exception:
+            _upsc = None
+
+        # If no legacy tab pane exists, create a fresh UpscPane as before.
+        if _upsc is None:
             try:
                 from helpers.upsc import UpscPane
-                _upsc = UpscPane(None)
+                _upsc = UpscPane(self)
             except Exception:
-                _upsc = None
+                try:
+                    from helpers.upsc import UpscPane
+                    _upsc = UpscPane(None)
+                except Exception:
+                    _upsc = None
+
         # Wire the main-window "Upscale" button to this embedded Upscale tool.
         # (This prevents the old legacy quick-upscale popup from firing.)
         try:
@@ -893,8 +1057,8 @@ class InstantToolsPane(QWidget):
                 pass
 
 
-        # ---- Background Remover / Inpainter ----
-        sec_bg = CollapsibleSection("Background Remover / Inpainter", expanded=False)
+        # ---- Background Remover / SDXL Mask Inpaint ----
+        sec_bg = CollapsibleSection("Background Remover / SDXL Mask Inpaint", expanded=False)
         try:
             install_background_tool(self, sec_bg)
         except Exception:
@@ -925,44 +1089,8 @@ class InstantToolsPane(QWidget):
                 _hy_wrap = QWidget(); _hy_l = QVBoxLayout(_hy_wrap); _hy_l.setContentsMargins(0,0,0,0)
                 _hy_l.addWidget(QLabel("HunyuanVideo 1.5 tool failed to load."))
                 sec_hunyuan15.setContentLayout(_hy_l)
-
-        # ---- Ace-Step Music creation ----
-        sec_ace = CollapsibleSection("Ace Step Music creation", expanded=False)
-        _ace_wrap = QWidget(); _ace_layout = QVBoxLayout(_ace_wrap); _ace_layout.setContentsMargins(0,0,0,0)
-        _ace_layout.setSpacing(6)
-        try:
-            from helpers.ace import acePane as _AcePane
-        except Exception:
-            _AcePane = None
-        _ace_widget = None
-        if _AcePane is not None:
-            try:
-                _ace_widget = _AcePane(self)
-            except Exception:
-                try:
-                    _ace_widget = _AcePane(None)
-                except Exception:
-                    _ace_widget = None
-        if _ace_widget is not None:
-            try:
-                _ace_widget.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
-            except Exception:
-                pass
-            try:
-                _ace_widget.setMinimumHeight(640)
-            except Exception:
-                pass
-            _ace_layout.addWidget(_ace_widget, 1)
-        else:
-            _ace_fallback = QLabel("Ace-Step tool failed to load (missing helpers/ace.py).")
-            _ace_fallback.setWordWrap(True)
-            _ace_layout.addWidget(_ace_fallback)
-        sec_ace.setContentLayout(_ace_layout)
-        try:
-            sec_ace.content.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
-        except Exception:
-            pass
-
+        sec_ace = None  # removed
+        sec_mula = None  # removed
         # ---- Multi Rename (moved to helpers/renam.py) ----
         sec_rename = CollapsibleSection("Multi Rename/Replace", expanded=False)
         _rn_wrap = QWidget(); _rn_layout = QVBoxLayout(_rn_wrap); _rn_layout.setContentsMargins(0,0,0,0)
@@ -1011,8 +1139,14 @@ class InstantToolsPane(QWidget):
         self.speed.valueChanged.connect(lambda v: self.spin_speed.setValue(round(v/100.0,2)))
         self.spin_speed.valueChanged.connect(lambda val: self.speed.setValue(int(round(val*100))))
         self.btn_speed = QPushButton("Change Speed"); self.btn_speed.setToolTip("Change playback speed. If Sound sync is on, audio pitch is preserved."); self.btn_speed.setToolTip("Change playback speed. 1.00x keeps pitch if Sound sync is on."); self.btn_speed_batch = QPushButton("Batch…"); self.btn_speed_batch.setToolTip("Batch with current Speed settings."); self.btn_speed_batch.setToolTip("Select multiple videos or a folder; one job per file using current Speed settings.")
+        self.btn_speed_open_folder = QPushButton("View results")
+        self.btn_speed_open_folder.setToolTip("Open these results in Media Explorer.")
         lay_speed = QFormLayout();
         row_speed = QHBoxLayout(); row_speed.addWidget(self.speed); row_speed.addWidget(self.spin_speed); lay_speed.addRow("Speed factor", row_speed); lay_speed.addRow("", self.lbl_speed); row_b = QHBoxLayout(); row_b.addWidget(self.btn_speed); row_b.addWidget(self.btn_speed_batch); lay_speed.addRow(row_b)
+        try:
+            row_b.addWidget(self.btn_speed_open_folder)
+        except Exception:
+            pass
 
         # Audio options
         try:
@@ -1131,12 +1265,13 @@ class InstantToolsPane(QWidget):
         _sg_layout = QVBoxLayout(_sg_wrap)
         _sg_layout.setContentsMargins(0, 0, 0, 0)
         try:
-            _sg_widget = SpliglueVideoTool(self)
-        except Exception:
+            from helpers.split_glue_video import SpliglueVideoTool
             try:
-                _sg_widget = SpliglueVideoTool(None)
+                _sg_widget = SpliglueVideoTool(self)
             except Exception:
-                _sg_widget = QLabel("Split & Glue tool failed to load.")
+                _sg_widget = SpliglueVideoTool(None)
+        except Exception:
+            _sg_widget = QLabel("Split & Glue tool failed to load.")
         _sg_layout.addWidget(_sg_widget)
         sec_splitglue.setContentLayout(_sg_layout)
 
@@ -1216,8 +1351,29 @@ class InstantToolsPane(QWidget):
             install_cropper_tool(self, sec_crop)
         except Exception:
             pass
-        default_sections = [sec_prompt, sec_bg, sec_ace, sec_describe, sec_meme, sec_music, sec_audio, sec_speed, sec_reverse, sec_upscale, sec_rife,
-                            sec_resize, sec_trim, sec_crop, sec_splitglue, sec_gif, sec_extract, sec_rename, sec_metadata]
+
+        # Video Text Overlay
+        _vt_wrap = QWidget(); _vt_layout = QVBoxLayout(_vt_wrap); _vt_layout.setContentsMargins(0,0,0,0)
+        _vt_layout.setSpacing(6)
+        try:
+            if videotextPane is not None:
+                try:
+                    _vt_widget = videotextPane(self)
+                except Exception:
+                    _vt_widget = videotextPane(None)
+                _vt_layout.addWidget(_vt_widget, 1)
+            else:
+                _lbl = QLabel("Video Text tool is unavailable (missing or failed helpers/videotext.py).")
+                _lbl.setWordWrap(True)
+                _vt_layout.addWidget(_lbl)
+        except Exception:
+            _lbl = QLabel("Video Text tool failed to load.")
+            _lbl.setWordWrap(True)
+            _vt_layout.addWidget(_lbl)
+        sec_videotext.setContentLayout(_vt_layout)
+
+        default_sections = [s for s in [sec_prompt, sec_bg, sec_describe, sec_qwen3tts, sec_meme, sec_music, sec_audio, sec_speed, sec_reverse, sec_upscale, sec_rife,
+                            sec_resize, sec_trim, sec_crop, sec_videotext, sec_splitglue, sec_gif, sec_extract, sec_whisper, sec_rename, sec_metadata] if s is not None]
 
 # sec_musicclip,  # to re add put this back in default_sections
 
@@ -1257,10 +1413,12 @@ class InstantToolsPane(QWidget):
                 "Trim Lab": sec_trim,
                 "Cropping": sec_crop,
 
+                "Video Text Overlay": sec_videotext,
+
                 "Thumbnail / Meme Creator": sec_meme,
                 "Prompt Enhancement": sec_prompt,
                 "Background Remover": sec_bg,
-                "Ace Step Music creation": sec_ace,
+
                 "Multi Rename": sec_rename,
                 "Whisper Lab": sec_whisper,
                 "Metadata editor": sec_metadata
@@ -1286,14 +1444,45 @@ class InstantToolsPane(QWidget):
         except Exception:
             pass
         # Build default whitelist (all except Trim and Audio)
-        default_whitelist = [k for k in self._sections_map.keys() if k not in ("Trim Lab","Sound Lab")]
+        default_whitelist = [k for k in self._sections_map.keys() if k not in ("Trim Lab","Sound Lab","Background Remover")]
         try:
             import json as _json
             wl_txt = self._qs.value("ToolsPane/remember_whitelist_json", "", type=str) or ""
             self._remember_whitelist = set(_json.loads(wl_txt)) if wl_txt else set(default_whitelist)
         except Exception:
             self._remember_whitelist = set(default_whitelist)
-        # populate menu
+        # Helper: live read of the global "remember" toggle (checkbox if available, else QSettings)
+        def _remember_enabled_now() -> bool:
+            try:
+                cb = getattr(self, "cb_remember", None)
+                if cb is not None:
+                    return bool(cb.isChecked())
+            except Exception:
+                pass
+            try:
+                return bool(self._qs.value("ToolsPane/remember_enabled", True, type=bool))
+            except Exception:
+                return True
+
+        # Helper: skip snapshot/restore if widget (or any ancestor) opts out.
+        def _has_skip_ancestor(w, prop_name: str) -> bool:
+            try:
+                cur = w
+                while cur is not None:
+                    try:
+                        if bool(cur.property(prop_name)):
+                            return True
+                    except Exception:
+                        pass
+                    try:
+                        cur = cur.parent()
+                    except Exception:
+                        break
+            except Exception:
+                pass
+            return False
+
+# populate menu
         try:
             if self.remember_menu:
                 self.remember_menu.clear()
@@ -1320,6 +1509,8 @@ class InstantToolsPane(QWidget):
                 for cls in classes:
                     children = w.findChildren(cls)
                     for idx, child in enumerate(children):
+                        if _has_skip_ancestor(child, "_fv_skip_snapshot") or _has_skip_ancestor(child, "_fv_skip_restore"):
+                            continue
                         name = child.objectName() or ""
                         try:
                             if isinstance(child, QLineEdit):
@@ -1383,6 +1574,8 @@ class InstantToolsPane(QWidget):
                         target = children[idx_i]
                 if target is None:
                     continue
+                if _has_skip_ancestor(target, "_fv_skip_restore") or _has_skip_ancestor(target, "_fv_skip_snapshot"):
+                    continue
                 try:
                     if isinstance(target, QLineEdit):
                         target.setText(str(val))
@@ -1393,6 +1586,9 @@ class InstantToolsPane(QWidget):
                     elif isinstance(target, QDoubleSpinBox):
                         target.setValue(float(val))
                     elif isinstance(target, QComboBox):
+                        # Skip comboboxes marked by other tabs (e.g., upscaler engine/model)
+                        if target.property("_fv_skip_restore"):
+                            continue
                         target.setCurrentIndex(int(val))
                     elif isinstance(target, (QCheckBox, QRadioButton)):
                         target.setChecked(bool(val))
@@ -1409,6 +1605,8 @@ class InstantToolsPane(QWidget):
                     continue
 
         def _save_all_tools():
+            if not _remember_enabled_now():
+                return
             try:
                 import json as _json
                 data = {"sections": {}}
@@ -1418,12 +1616,17 @@ class InstantToolsPane(QWidget):
                     except Exception:
                         expanded = True
                     content = getattr(sec, "content", sec)
-                    data["sections"][name] = {"expanded": bool(expanded), "snap": _widget_snapshot(content)}
+                    entry = {"expanded": bool(expanded)}
+                    if name in self._remember_whitelist:
+                        entry["snap"] = _widget_snapshot(content)
+                    data["sections"][name] = entry
                 self._qs.setValue("ToolsPane/saved_json", _json.dumps(data))
             except Exception:
                 pass
 
         def _apply_saved():
+            if not _remember_enabled_now():
+                return
             try:
                 import json as _json
                 txt = self._qs.value("ToolsPane/saved_json", "", type=str) or ""
@@ -1435,7 +1638,7 @@ class InstantToolsPane(QWidget):
                     if not entry:
                         continue
                     snap = entry.get("snap")
-                    if snap:
+                    if snap and (name in self._remember_whitelist):
                         content = getattr(sec, "content", sec)
                         _widget_restore(content, snap)
                     if "expanded" in entry:
@@ -1539,6 +1742,10 @@ class InstantToolsPane(QWidget):
             pass
         self.btn_speed.clicked.connect(self.run_speed)
         self.btn_speed_batch.clicked.connect(self.run_speed_batch)
+        try:
+            self.btn_speed_open_folder.clicked.connect(self._speed_open_folder)
+        except Exception:
+            pass
         self.btn_gif.clicked.connect(self.run_gif)
         self.btn_gif_batch.clicked.connect(self.run_gif_batch)
 
@@ -1792,10 +1999,21 @@ class InstantToolsPane(QWidget):
             return
         factor = self.speed.value() / 100.0
         try:
-            out_dir = OUT_VIDEOS
+            out_dir = OUT_SLOW_FAST
         except Exception:
             out_dir = Path('.')
+        try:
+            from pathlib import Path as _P
+            _P(str(out_dir)).mkdir(parents=True, exist_ok=True)
+        except Exception:
+            pass
+
         out = out_dir / f"{inp.stem}_spd_{factor:.2f}x.mp4"
+        try:
+            from pathlib import Path as _P
+            self._speed_last_out_dir = _P(str(out)).parent
+        except Exception:
+            pass
         setpts = 1.0 / float(factor if factor != 0 else 1.0)
         mute = False
         sync = True
@@ -2068,6 +2286,113 @@ class InstantToolsPane(QWidget):
                 pass
 
         # Fallback: open in OS file browser
+        if fp is not None:
+            self._open_folder_in_os(fp)
+
+    def _speed_open_folder(self):
+        """Open Speed tool results in Media Explorer (fallback: OS folder)."""
+        folder = None
+        try:
+            folder = getattr(self, "_speed_last_out_dir", None)
+        except Exception:
+            folder = None
+        if not folder:
+            try:
+                folder = OUT_SLOW_FAST
+            except Exception:
+                try:
+                    from pathlib import Path as _P
+                    folder = _P(".")
+                except Exception:
+                    folder = None
+
+        try:
+            from pathlib import Path as _P
+            fp = _P(str(folder)) if folder else None
+        except Exception:
+            fp = None
+
+        # Prefer Media Explorer if available
+        main = None
+        try:
+            main = getattr(self, "main", None)
+        except Exception:
+            main = None
+        if main is None:
+            try:
+                main = self.window() if hasattr(self, "window") else None
+            except Exception:
+                main = None
+
+        if main is not None and hasattr(main, "open_media_explorer_folder") and fp is not None:
+            try:
+                main.open_media_explorer_folder(str(fp), preset="videos", include_subfolders=False)
+                return
+            except TypeError:
+                try:
+                    main.open_media_explorer_folder(str(fp))
+                    return
+                except Exception:
+                    pass
+            except Exception:
+                pass
+
+        # Fallback: open in OS file browser
+        if fp is not None:
+            self._open_folder_in_os(fp)
+
+    def _mula_open_folder(self):
+        """Open HeartMuLa results in Media Explorer (fallback: OS folder)."""
+        folder = None
+        try:
+            # Prefer the tool's current Output folder field (if the widget exists)
+            w = getattr(self, "_mula_widget", None)
+            if w is not None and hasattr(w, "output_dir"):
+                folder = str(w.output_dir.text()).strip()
+        except Exception:
+            folder = None
+
+        if not folder:
+            try:
+                folder = str((ROOT / "output" / "music" / "heartmula").resolve())
+            except Exception:
+                folder = "output/music/heartmula"
+
+        try:
+            from pathlib import Path as _P
+            fp = _P(str(folder))
+            try:
+                fp.mkdir(parents=True, exist_ok=True)
+            except Exception:
+                pass
+        except Exception:
+            fp = None
+
+        # Prefer Media Explorer if available
+        main = None
+        try:
+            main = getattr(self, "main", None)
+        except Exception:
+            main = None
+        if main is None:
+            try:
+                main = self.window() if hasattr(self, "window") else None
+            except Exception:
+                main = None
+
+        if main is not None and hasattr(main, "open_media_explorer_folder") and fp is not None:
+            try:
+                main.open_media_explorer_folder(str(fp), preset="music", include_subfolders=False)
+                return
+            except TypeError:
+                try:
+                    main.open_media_explorer_folder(str(fp))
+                    return
+                except Exception:
+                    pass
+            except Exception:
+                pass
+
         if fp is not None:
             self._open_folder_in_os(fp)
 
@@ -2914,6 +3239,16 @@ class InstantToolsPane(QWidget):
                 return
         except Exception:
             pass
+        try:
+            from pathlib import Path as _P
+            self._speed_last_out_dir = _P(str(OUT_SLOW_FAST))
+        except Exception:
+            pass
+        try:
+            from pathlib import Path as _P
+            _P(str(OUT_SLOW_FAST)).mkdir(parents=True, exist_ok=True)
+        except Exception:
+            pass
         for p in paths:
             try:
                 from pathlib import Path as _P
@@ -2922,7 +3257,7 @@ class InstantToolsPane(QWidget):
                 setpts = 1.0 / float(factor if factor != 0 else 1.0)
                 mute = bool(self.cb_speed_mute.isChecked()) if hasattr(self, "cb_speed_mute") else False
                 sync = bool(self.cb_speed_sync.isChecked()) if hasattr(self, "cb_speed_sync") else True
-                out = OUT_VIDEOS / f"{inp.stem}_spd_{factor:.2f}x.mp4"
+                out = OUT_SLOW_FAST / f"{inp.stem}_spd_{factor:.2f}x.mp4"
                 cmd = [ffmpeg_path(), "-y", "-i", str(inp), "-vf", f"setpts={setpts:.6f}*PTS"]
                 if mute:
                     cmd += ["-an"]

@@ -2,6 +2,8 @@ import os
 import sys
 import subprocess
 import json
+import traceback
+import importlib.util
 from pathlib import Path
 from datetime import datetime
 
@@ -625,9 +627,86 @@ class MetadataEditorWidget(QWidget):
         self.tabs.addTab(self.image_tab, "Images")
         self.tabs.addTab(self.video_tab, "Videos")
 
+
+        # Optional: load date_changer.py as an extra tab.
+        # Note: Qt uses '&' for mnemonics; '&&' renders a literal '&' in the label.
+        date_widget = self._try_load_date_changer_tab()
+        if date_widget is not None:
+            self.tabs.addTab(date_widget, "change date && time")
+
         main_layout.addWidget(self.tabs)
         main_layout.addWidget(QLabel("Log:"))
         main_layout.addWidget(self.log_widget, stretch=1)
+    def _try_load_date_changer_tab(self) -> QWidget | None:
+        """
+        Loads date_changer.py (sitting next to this metadata file) and embeds its UI as a QWidget tab.
+        We support:
+          - DateChangerWidget / DateChangerTab / DateChangerPane (QWidget)
+          - build_widget() factory returning QWidget
+          - MainWindow (QMainWindow) hosted as a child widget
+        """
+        try:
+            candidates = [
+                ROOT_DIR / "date_changer.py",
+                ROOT_DIR.parent / "date_changer.py",
+            ]
+            candidate = next((p for p in candidates if p.exists()), None)
+            if candidate is None:
+                raise FileNotFoundError("Missing file: date_changer.py (looked in helpers/ and project root)")
+
+            spec = importlib.util.spec_from_file_location("date_changer_embedded", str(candidate))
+            if spec is None or spec.loader is None:
+                raise ImportError("Could not create import spec for date_changer.py")
+
+            mod = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(mod)  # type: ignore
+
+            # 1) Preferred: a dedicated QWidget class
+            for cls_name in ("DateChangerWidget", "DateChangerTab", "DateChangerPane"):
+                if hasattr(mod, cls_name):
+                    cls = getattr(mod, cls_name)
+                    w = cls()  # noqa
+                    if isinstance(w, QWidget):
+                        return w
+
+            # 2) Factory function
+            if hasattr(mod, "build_widget"):
+                w = mod.build_widget()  # type: ignore
+                if isinstance(w, QWidget):
+                    return w
+
+            # 3) Fallback: host the provided MainWindow as a child widget
+            if hasattr(mod, "MainWindow"):
+                mw = mod.MainWindow()  # type: ignore
+                if isinstance(mw, QWidget):
+                    mw.setWindowFlags(Qt.Widget)
+                    container = QWidget(self)
+                    lay = QVBoxLayout(container)
+                    lay.setContentsMargins(0, 0, 0, 0)
+                    lay.addWidget(mw)
+
+                    # Keep a ref so it doesn't get GC'd
+                    self._date_changer_window = mw  # type: ignore[attr-defined]
+                    return container
+
+            raise ImportError("date_changer.py loaded, but no embeddable widget was found.")
+
+        except Exception:
+            tb = traceback.format_exc()
+            try:
+                self.log_widget.append("---- date_changer tab load error ----")
+                self.log_widget.append(tb)
+            except Exception:
+                pass
+
+            w = QWidget(self)
+            lay = QVBoxLayout(w)
+            lay.setContentsMargins(16, 16, 16, 16)
+            msg = QLabel("❌ Failed to load date_changer.py (missing file or import error).\n\nSee Log for details.")
+            msg.setWordWrap(True)
+            lay.addWidget(msg)
+            lay.addStretch(1)
+            return w
 
 
 class MetadataEditorMainWindow(QMainWindow):

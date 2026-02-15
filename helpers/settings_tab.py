@@ -5,7 +5,7 @@ from PySide6.QtCore import Qt, QSettings, QTimer
 from PySide6.QtWidgets import (
     QWidget, QTabWidget, QScrollArea, QVBoxLayout, QHBoxLayout, QLabel,
     QGroupBox, QComboBox, QPushButton, QCheckBox, QSizePolicy, QAbstractButton,
-    QToolButton
+    QToolButton, QSlider
 )
 
 try:
@@ -23,7 +23,88 @@ except Exception:
         @staticmethod
         def is_enabled() -> bool: return True
 
+
+# AnimatedButtonsManager import (safe fallback so Settings never crashes)
+try:
+    from helpers.animated_buttons import AnimatedButtonsManager
+except Exception:
+    class AnimatedButtonsManager:  # fallback no-op if file missing
+        @staticmethod
+        def install(_app=None): 
+            return None
+        @staticmethod
+        def apply_from_settings(_app=None): 
+            return None
+
 import os, shutil, sys, time, json
+
+
+# ---- Global font size (px delta) helpers -----------------------------------------------
+def _font_size__orig_font(app: QtWidgets.QApplication) -> QtGui.QFont:
+    """Get or store the original application font (used to restore later)."""
+    try:
+        orig = app.property("fv_orig_app_font")
+        if isinstance(orig, QtGui.QFont):
+            return QtGui.QFont(orig)
+        f = QtGui.QFont(app.font())
+        app.setProperty("fv_orig_app_font", QtGui.QFont(f))
+        return QtGui.QFont(f)
+    except Exception:
+        return QtGui.QFont()
+
+def _font_size_apply(app: Optional[QtWidgets.QApplication], enabled: bool, delta_px: int) -> None:
+    """Apply a global font size delta in *pixels* using QApplication.setFont()."""
+    try:
+        if app is None:
+            app = QtWidgets.QApplication.instance()
+        if app is None:
+            return
+
+        orig = _font_size__orig_font(app)
+
+        if not enabled:
+            app.setFont(orig)
+            return
+
+        try:
+            delta_px = int(delta_px)
+        except Exception:
+            delta_px = 0
+
+        # Determine actual rendered pixel size (works even if font uses pointSize internally).
+        try:
+            base_px = int(QtGui.QFontInfo(orig).pixelSize())
+        except Exception:
+            base_px = -1
+
+        if base_px <= 0:
+            # Fallback: use font metrics height (approx) if pixelSize is unavailable.
+            try:
+                base_px = int(QtGui.QFontMetrics(orig).height())
+            except Exception:
+                base_px = 14
+
+        new_px = max(8, base_px + delta_px)
+
+        f = QtGui.QFont(orig)
+        f.setPixelSize(int(new_px))
+        app.setFont(f)
+    except Exception:
+        pass
+
+def _font_size_apply_from_qsettings(app: Optional[QtWidgets.QApplication] = None) -> None:
+    """Apply the saved font size settings on startup/UI build."""
+    try:
+        s = QSettings("FrameVision", "FrameVision")
+        en = bool(s.value("ui_font_size_enabled", False, type=bool))
+        delta = s.value("ui_font_size_delta_px", 0)
+        try:
+            delta = int(delta)
+        except Exception:
+            delta = 0
+        _font_size_apply(app or QtWidgets.QApplication.instance(), en, delta)
+    except Exception:
+        pass
 
 
 # ---- small filesystem helpers ------------------------------------------------------------
@@ -132,58 +213,313 @@ def _wipe_layout(lay: QtWidgets.QLayout) -> None:
     except Exception:
         pass
 
+def _force_theme_refresh(app: Optional[QtWidgets.QApplication]) -> None:
+    """Force a full style repolish across existing widgets.
+
+    This helps when switching between light/dark themes where some widgets keep old palette roles
+    or cached stylesheet colors (e.g., text becomes low-contrast until a repolish).
+    """
+    try:
+        if app is None:
+            app = QtWidgets.QApplication.instance()
+        if app is None:
+            return
+
+        widgets = list(app.allWidgets() or [])
+        # Pause updates briefly to reduce flicker while repolishing.
+        for w in widgets:
+            try:
+                w.setUpdatesEnabled(False)
+            except Exception:
+                pass
+
+        # Repolish + push the current app palette everywhere.
+        pal = app.palette()
+        for w in widgets:
+            try:
+                st = w.style()
+                st.unpolish(w)
+                st.polish(w)
+            except Exception:
+                pass
+            try:
+                w.setPalette(pal)
+            except Exception:
+                pass
+            try:
+                w.update()
+                vp = getattr(w, "viewport", None)
+                if callable(vp):
+                    v = vp()
+                    if v is not None:
+                        v.update()
+            except Exception:
+                pass
+
+        for w in widgets:
+            try:
+                w.setUpdatesEnabled(True)
+            except Exception:
+                pass
+
+        # Nudge top-level windows.
+        for w in app.topLevelWidgets() or []:
+            try:
+                w.update()
+                w.repaint()
+            except Exception:
+                pass
+    except Exception:
+        pass
+
 def _theme_row(page: QWidget) -> QWidget:
     container = QWidget(page)
     v = QVBoxLayout(container)
-    v.setContentsMargins(0,0,0,0)
+    v.setContentsMargins(0, 0, 0, 0)
     v.setSpacing(6)
 
+    # --- Theme row ------------------------------------------------------------
     top = QWidget(container)
-    h = QHBoxLayout(top); h.setContentsMargins(0,0,0,0); h.setSpacing(8)
+    h = QHBoxLayout(top)
+    h.setContentsMargins(0, 0, 0, 0)
+    h.setSpacing(8)
+
     lab = QLabel("Theme:")
-    box = QComboBox(); box.addItems([
-        "Day","Pastel Light","Solarized Light","Sunburst","Cloud Grey","Signal Grey",
-        "Evening","Night","Graphite Dusk","Slate","High Contrast","Cyberpunk","Neon","Ocean","CRT","Aurora",
-        "Mardi Gras","Tropical Fiesta","Color Mix","Candy Pop","Rainbow Riot","Random","Auto"
+    box = QComboBox()
+    box.addItems([
+        "Day", "Pastel Light", "Solarized Light", "Sunburst", "Cloud Grey", "Signal Grey",
+        "Blue in the Dark", "Green in the Dark", "Orange in the Dark", "Red in the Dark",
+        "Evening", "Night", "Graphite Dusk", "Slate", "High Contrast", "NeonGreen", "Ocean", "CRT", "Aurora",
+        "Purple Life", "Tropical Fiesta", "Cyberpunk", "Color Mix", "Candy Pop", "Rainbow Riot", "Random"
     ])
+
+    # "Just enough" width: size to the longest theme name + padding (avoid huge popup).
     try:
-        cur = (config.get("theme") or "Auto"); idx = box.findText(cur); box.setCurrentIndex(max(0, idx))
+        fm = box.fontMetrics()
+        longest_px = 0
+        for i in range(box.count()):
+            t = box.itemText(i)
+            try:
+                longest_px = max(longest_px, int(fm.horizontalAdvance(t)))
+            except Exception:
+                pass
+
+        extra_px = 60  # arrow/margins/scrollbar safety padding
+        try:
+            st = box.style()
+            if st is not None:
+                extra_px = int(
+                    st.pixelMetric(QtWidgets.QStyle.PM_ScrollBarExtent)
+                    + st.pixelMetric(QtWidgets.QStyle.PM_DefaultFrameWidth) * 2
+                    + 44
+                )
+        except Exception:
+            pass
+
+        w = max(220, min(420, longest_px + extra_px))
+        box.setMinimumWidth(int(w))
+        box.setMaximumWidth(int(w))
+        box.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Fixed)
+
+        if box.view() is not None:
+            box.view().setMinimumWidth(int(w))
     except Exception:
         pass
-    btn = QPushButton("Apply")
-    def do_apply():
+
+    try:
+        cur = (config.get("theme") or "Auto")
+
+        # Backwards compatibility: older builds used "Mardi Gras".
         try:
-            t = box.currentText(); config["theme"] = t
+            if isinstance(cur, str):
+                _n = cur.strip().lower()
+                if _n in ("mardi gras", "mardi grass", "mardigras", "mardigrass"):
+                    cur = "Purple Life"
+                    try:
+                        config["theme"] = cur
+                    except Exception:
+                        pass
+        except Exception:
+            pass
+
+        idx = box.findText(cur)
+        if idx < 0:
+            # Extra fallback for odd stored variants.
+            try:
+                if isinstance(cur, str) and cur.strip().lower() in ("purplelife",):
+                    idx = box.findText("Purple Life")
+            except Exception:
+                pass
+
+        box.setCurrentIndex(max(0, idx))
+    except Exception:
+        pass
+
+    btn = QPushButton("Apply")
+    safe_btn = QPushButton("Safe apply")
+
+    # Tooltips (rich text supported)
+    btn.setToolTip("<b>Apply</b><br>Applies the theme directly, but may freeze the app until it finishes.")
+    safe_btn.setToolTip("<b>Safe apply</b><br>Applies the theme by restarting the UI, so it won’t freeze while applying.")
+
+    _busy = {"on": False}
+
+    def _set_busy(on: bool) -> None:
+        on = bool(on)
+        if _busy.get("on") == on:
+            return
+        _busy["on"] = on
+        try:
+            if on:
+                btn.setProperty("_fv_prev_text", btn.text() or "Apply")
+                safe_btn.setProperty("_fv_prev_text", safe_btn.text() or "Safe apply")
+                btn.setText("Applying…")
+                safe_btn.setText("Applying…")
+                btn.setEnabled(False)
+                safe_btn.setEnabled(False)
+                box.setEnabled(False)
+            else:
+                prev = btn.property("_fv_prev_text") or "Apply"
+                btn.setText(str(prev))
+                prev2 = safe_btn.property("_fv_prev_text") or "Safe apply"
+                safe_btn.setText(str(prev2))
+                btn.setEnabled(True)
+                safe_btn.setEnabled(True)
+                box.setEnabled(True)
+        except Exception:
+            pass
+
+    def do_apply() -> None:
+        if _busy.get("on"):
+            return
+        _set_busy(True)
+        try:
+            t = box.currentText()
+            config["theme"] = t
+
             app = QtWidgets.QApplication.instance()
-            if apply_theme and app:
-                apply_theme(app, t)
+
+            # Let the UI paint the button state before the heavier work.
+            try:
+                if app:
+                    app.processEvents(QtCore.QEventLoop.AllEvents, 50)
+            except Exception:
+                pass
+
+            # Clear any previous global QSS first to avoid "layered" styles / mixed palettes.
+            try:
+                if app:
+                    app.setStyleSheet("")
+            except Exception:
+                pass
+
+            # Apply theme (in-process). This may freeze briefly on some systems.
+            try:
+                if apply_theme and app:
+                    apply_theme(app, t)
+            except Exception:
+                pass
+
+            # Force a repolish so existing widgets (like System monitor) pick up the new palette/QSS.
+            try:
+                _force_theme_refresh(app)
+            except Exception:
+                pass
+
             try:
                 save_config()
             except Exception:
                 pass
         except Exception:
             pass
-    btn.clicked.connect(do_apply); box.currentIndexChanged.connect(lambda _i: do_apply())
-    h.addWidget(lab); h.addWidget(box); h.addWidget(btn); h.addStretch(1)
+        finally:
+            _set_busy(False)
+
+    def do_safe_apply() -> None:
+        if _busy.get("on"):
+            return
+        _set_busy(True)
+        try:
+            t = box.currentText()
+            config["theme"] = t
+
+            # Mark restart intent (optional; some builds restore focus/state based on this)
+            try:
+                ss = config.setdefault("session_restore", {})
+                ss["restart_from_settings"] = True
+            except Exception:
+                pass
+
+            try:
+                save_config()
+            except Exception:
+                pass
+
+            # Small event pump so UI shows the state before we exit.
+            try:
+                app = QtWidgets.QApplication.instance()
+                if app:
+                    app.processEvents(QtCore.QEventLoop.AllEvents, 50)
+            except Exception:
+                pass
+
+            # Restart the app shell/UI.
+            try:
+                QtCore.QProcess.startDetached(sys.executable, sys.argv)
+            except Exception:
+                try:
+                    QtCore.QProcess.startDetached(sys.executable, sys.argv, os.getcwd())
+                except Exception:
+                    pass
+
+            try:
+                app = QtWidgets.QApplication.instance()
+                if app:
+                    app.quit()
+            except Exception:
+                pass
+        except Exception:
+            # If restart fails, restore UI state.
+            pass
+        finally:
+            # If we didn't quit, re-enable UI.
+            _set_busy(False)
+
+    btn.clicked.connect(do_apply)
+    safe_btn.clicked.connect(do_safe_apply)
+
+    h.addWidget(lab)
+    h.addWidget(box)
+    h.addWidget(btn)
+    h.addWidget(safe_btn)
+    h.addStretch(1)
     v.addWidget(top)
 
+    # --- Intro overlay row ----------------------------------------------------
     bottom = QWidget(container)
-    h2 = QHBoxLayout(bottom); h2.setContentsMargins(0,0,0,0); h2.setSpacing(8)
+    h2 = QHBoxLayout(bottom)
+    h2.setContentsMargins(0, 0, 0, 0)
+    h2.setSpacing(8)
 
     ov_toggle = QCheckBox("Intro overlay")
     ov_toggle.setToolTip("Enable a visual overlay during the startup intro image (e.g., Matrix rain).")
 
     ov_combo = QComboBox()
-    ov_combo.addItems(["Random","Matrix (Green)","Matrix (Blue)","Bokeh","Rain","Fireworks","FirefliesParallax","Glitch Shards","LightningStrike","StarfieldHyperjump","Warp in","CometTrails","AuroraFlow"])
+    ov_combo.addItems([
+        "Random", "Matrix (Green)", "Matrix (Blue)", "Bokeh", "Rain", "Fireworks",
+        "FirefliesParallax", "Glitch Shards", "LightningStrike", "StarfieldHyperjump",
+        "Warp in", "CometTrails", "AuroraFlow"
+    ])
 
     ov_preview = QCheckBox("Preview")
     ov_preview.setToolTip("If enabled, shows the intro overlay briefly in the Settings preview.")
 
     _s = QSettings("FrameVision", "FrameVision")
-    ov_toggle.setChecked(_s.value("intro_overlay_enabled", False, type=bool))
-    mode = _s.value("intro_overlay_mode", "Random", type=str) or "Random"
-    idx = ov_combo.findText(mode); ov_combo.setCurrentIndex(max(0, idx))
-    ov_preview.setChecked(_s.value("intro_overlay_preview_enabled", True, type=bool))
+    ov_toggle.setChecked(_s.value("intro_overlay_enabled", True, type=bool))
+    mode = _s.value("intro_overlay_mode", "Fireworks", type=str) or "Random"
+    idx = ov_combo.findText(mode)
+    ov_combo.setCurrentIndex(max(0, idx))
+    ov_preview.setChecked(_s.value("intro_overlay_preview_enabled", False, type=bool))
 
     ov_toggle.toggled.connect(lambda b: _s.setValue("intro_overlay_enabled", bool(b)))
     ov_combo.currentTextChanged.connect(lambda t: _s.setValue("intro_overlay_mode", t))
@@ -367,7 +703,7 @@ def _options_group(page: QWidget) -> QGroupBox:
         # -- Diagnostic logging checkbox -------------------------------------------------
         cb_diag = QCheckBox("Enable diagnostic logging (restart to apply)")
         cb_diag.setToolTip("Turn this off to disable FrameVision's background diagnostics logs.")
-        diag_default = s.value("diag_probe_enabled", True, type=bool)
+        diag_default = s.value("diag_probe_enabled", False, type=bool)
         cb_diag.setChecked(diag_default)
 
         # mirror value into config so headless/worker processes (no Qt) can read it
@@ -390,6 +726,31 @@ def _options_group(page: QWidget) -> QGroupBox:
         cb_banner_color.setChecked(banner_color_default)
         cb_banner_color.setVisible(bool(banner_default))
 
+        # Gradient animated banner mode (disables 'Colored' while active)
+        cb_banner_gradient = QCheckBox("Gradient")
+        cb_banner_gradient.setToolTip("Animated rainbow gradient for tab banners. Disables 'Colored' while active.")
+        banner_grad_default = s.value("banner_gradient_enabled", False, type=bool)
+        cb_banner_gradient.setChecked(bool(banner_grad_default))
+        cb_banner_gradient.setVisible(bool(banner_default))
+
+        lab_banner_speed = QLabel("Speed")
+        lab_banner_speed.setAlignment(Qt.AlignVCenter | Qt.AlignLeft)
+        lab_banner_speed.setVisible(bool(banner_default) and bool(banner_grad_default))
+
+        slider_banner_speed = QSlider(Qt.Horizontal)
+        slider_banner_speed.setRange(1, 50)
+        speed_default = int(s.value("banner_gradient_speed", 20, type=int) or 20)
+        if speed_default < 1: speed_default = 1
+        if speed_default > 50: speed_default = 50
+        slider_banner_speed.setValue(speed_default)
+        slider_banner_speed.setToolTip("Gradient animation speed (higher = faster).")
+        slider_banner_speed.setVisible(bool(banner_default) and bool(banner_grad_default))
+        slider_banner_speed.setFixedWidth(220)
+        try:
+            cb_banner_color.setEnabled(not bool(banner_grad_default))
+        except Exception:
+            pass
+
         # initial grey states
         _sync_grey_state(cb_clear_pyc, bool(clear_default))
         _sync_grey_state(cb_tooltips, bool(tooltips_default))
@@ -397,6 +758,10 @@ def _options_group(page: QWidget) -> QGroupBox:
         _sync_grey_state(cb_diag, bool(diag_default))
         _sync_grey_state(cb_banner, bool(banner_default))
         _sync_grey_state(cb_banner_color, bool(banner_color_default))
+        _sync_grey_state(cb_banner_gradient, bool(banner_grad_default))
+
+        # Apply banner settings to the whole main window (not just the Settings tab widget).
+        root_for_banners = page.window() if hasattr(page, 'window') else page
 
         # ---- handlers + persistence ---------------------------------------------------
         def _on_clear_pyc_toggle(b: bool):
@@ -430,18 +795,79 @@ def _options_group(page: QWidget) -> QGroupBox:
             _sync_grey_state(cb_banner, bool(b))
             try:
                 cb_banner_color.setVisible(bool(b))
+                cb_banner_gradient.setVisible(bool(b))
             except Exception:
                 pass
             try:
-                _banner_apply_visibility(page, bool(b))
+                lab_banner_speed.setVisible(bool(b) and bool(cb_banner_gradient.isChecked()))
+                slider_banner_speed.setVisible(bool(b) and bool(cb_banner_gradient.isChecked()))
+            except Exception:
+                pass
+            try:
+                _banner_apply_visibility(root_for_banners, bool(b))
+            except Exception:
+                pass
+
+            # Start/stop the animated gradient as needed
+            try:
+                if not bool(b):
+                    _banner_apply_gradient(root_for_banners, False, int(slider_banner_speed.value()))
+                else:
+                    if bool(cb_banner_gradient.isChecked()):
+                        _banner_apply_gradient(root_for_banners, True, int(slider_banner_speed.value()))
+                    else:
+                        _banner_apply_gradient(root_for_banners, False, int(slider_banner_speed.value()))
+                        _banner_apply_colored(root_for_banners, bool(cb_banner_color.isChecked()))
             except Exception:
                 pass
 
         def _on_banner_color_toggle(b: bool):
             s.setValue("banner_colored", bool(b))
             _sync_grey_state(cb_banner_color, bool(b))
+            # If gradient mode is active, remember this setting but don't force a recolor now.
             try:
-                _banner_apply_colored(page, bool(b))
+                if cb_banner_gradient.isChecked():
+                    return
+            except Exception:
+                pass
+            try:
+                _banner_apply_colored(root_for_banners, bool(b))
+            except Exception:
+                pass
+
+        def _on_banner_gradient_toggle(b: bool):
+            s.setValue("banner_gradient_enabled", bool(b))
+            _sync_grey_state(cb_banner_gradient, bool(b))
+            try:
+                cb_banner_color.setEnabled(not bool(b))
+            except Exception:
+                pass
+            try:
+                lab_banner_speed.setVisible(bool(cb_banner.isChecked()) and bool(b))
+                slider_banner_speed.setVisible(bool(cb_banner.isChecked()) and bool(b))
+            except Exception:
+                pass
+            try:
+                if bool(cb_banner.isChecked()) and bool(b):
+                    _banner_apply_gradient(root_for_banners, True, int(slider_banner_speed.value()))
+                else:
+                    _banner_apply_gradient(root_for_banners, False, int(slider_banner_speed.value()))
+                    if bool(cb_banner.isChecked()):
+                        _banner_apply_colored(root_for_banners, bool(cb_banner_color.isChecked()))
+            except Exception:
+                pass
+
+        def _on_banner_gradient_speed(v: int):
+            try:
+                v = int(v)
+            except Exception:
+                v = 20
+            if v < 1: v = 1
+            if v > 50: v = 50
+            s.setValue("banner_gradient_speed", int(v))
+            try:
+                if bool(cb_banner.isChecked()) and bool(cb_banner_gradient.isChecked()):
+                    _banner_apply_gradient(root_for_banners, True, int(v))
             except Exception:
                 pass
 
@@ -451,6 +877,8 @@ def _options_group(page: QWidget) -> QGroupBox:
         cb_diag.toggled.connect(lambda b: _on_diag_toggle(b))
         cb_banner.toggled.connect(lambda b: _on_banner_toggle(b))
         cb_banner_color.toggled.connect(lambda b: _on_banner_color_toggle(b))
+        cb_banner_gradient.toggled.connect(lambda b: _on_banner_gradient_toggle(b))
+        slider_banner_speed.valueChanged.connect(lambda v: _on_banner_gradient_speed(v))
 
         v.addWidget(cb_clear_pyc)
         v.addWidget(cb_tooltips)
@@ -463,14 +891,267 @@ def _options_group(page: QWidget) -> QGroupBox:
         h_banner.setSpacing(12)
         h_banner.addWidget(cb_banner)
         h_banner.addWidget(cb_banner_color)
+        h_banner.addWidget(cb_banner_gradient)
+        h_banner.addWidget(lab_banner_speed)
+        h_banner.addWidget(slider_banner_speed)
         h_banner.addStretch(1)
         v.addWidget(row_banner)
+        # -- Animated buttons ----------------------------------------------------------
+        cb_animbtn = QCheckBox("Animated buttons")
+        cb_animbtn.setToolTip("If enabled, 'Generate' and 'View results' buttons will animate on hover.")
+        animbtn_default = s.value("animated_buttons_enabled", False, type=bool)
+        cb_animbtn.setChecked(animbtn_default)
+        _sync_grey_state(cb_animbtn, bool(animbtn_default))
+
+        # Style modes (only one can be enabled at a time)
+        cb_anim_glow = QCheckBox("Glow")
+        cb_anim_shift = QCheckBox("Color shift")
+        cb_anim_boom = QCheckBox("Boomerang")
+        cb_anim_outline = QCheckBox("Neon outline")
+        cb_anim_scanline = QCheckBox("Scanline")
+        cb_anim_shimmer = QCheckBox("Shimmer")
+        cb_anim_pop = QCheckBox("Pop")
+        cb_anim_rand = QCheckBox("Random (each hover)")
+
+        cb_anim_glow.setToolTip("Soft glowing hover effect.")
+        cb_anim_shift.setToolTip("Smooth color cycling on hover.")
+        cb_anim_boom.setToolTip("Animated left-right-left gradient sweep on hover.")
+        cb_anim_outline.setToolTip("Pulsing neon outline while hovered.")
+        cb_anim_scanline.setToolTip("A bright scanline band sweeps top-to-bottom on hover.")
+        cb_anim_shimmer.setToolTip("Diagonal shine that sweeps across the button.")
+        cb_anim_pop.setToolTip("Micro pop feeling via center highlight and lift shadow.")
+        cb_anim_rand.setToolTip("Pick a different effect each time you hover (all effects).")
+
+        mode_default = (s.value("animated_buttons_mode", "glow", type=str) or "glow").strip().lower()
+        if mode_default not in ("glow", "shift", "boomerang", "outline", "scanline", "shimmer", "pop", "random"):
+            mode_default = "glow"
+
+        row_anim = QWidget(content)
+        h_anim = QHBoxLayout(row_anim)
+        h_anim.setContentsMargins(0, 0, 0, 0)
+        h_anim.setSpacing(12)
+        h_anim.addWidget(cb_animbtn)
+        h_anim.addStretch(1)
+        v.addWidget(row_anim)
+
+        row_anim_modes = QWidget(content)
+        v_anim2 = QVBoxLayout(row_anim_modes)
+        v_anim2.setContentsMargins(18, 0, 0, 0)
+        v_anim2.setSpacing(6)
+
+        row_anim_modes_1 = QWidget(row_anim_modes)
+        h_anim2_1 = QHBoxLayout(row_anim_modes_1)
+        h_anim2_1.setContentsMargins(0, 0, 0, 0)
+        h_anim2_1.setSpacing(12)
+        h_anim2_1.addWidget(cb_anim_glow)
+        h_anim2_1.addWidget(cb_anim_shift)
+        h_anim2_1.addWidget(cb_anim_boom)
+        h_anim2_1.addStretch(1)
+        v_anim2.addWidget(row_anim_modes_1)
+
+        row_anim_modes_2 = QWidget(row_anim_modes)
+        h_anim2_2 = QHBoxLayout(row_anim_modes_2)
+        h_anim2_2.setContentsMargins(0, 0, 0, 0)
+        h_anim2_2.setSpacing(12)
+        h_anim2_2.addWidget(cb_anim_outline)
+        h_anim2_2.addWidget(cb_anim_scanline)
+        h_anim2_2.addStretch(1)
+        v_anim2.addWidget(row_anim_modes_2)
+
+        row_anim_modes_3 = QWidget(row_anim_modes)
+        h_anim2_3 = QHBoxLayout(row_anim_modes_3)
+        h_anim2_3.setContentsMargins(0, 0, 0, 0)
+        h_anim2_3.setSpacing(12)
+        h_anim2_3.addWidget(cb_anim_shimmer)
+        h_anim2_3.addWidget(cb_anim_pop)
+        h_anim2_3.addWidget(cb_anim_rand)
+        h_anim2_3.addStretch(1)
+        v_anim2.addWidget(row_anim_modes_3)
+
+        row_anim_modes.setVisible(bool(animbtn_default))
+        v.addWidget(row_anim_modes)
+
+        def _anim_apply_to_app():
+            try:
+                app = QtWidgets.QApplication.instance()
+                AnimatedButtonsManager.install(app)
+                AnimatedButtonsManager.apply_from_settings(app)
+            except Exception:
+                pass
+
+        def _anim_set_mode(mode: str):
+            mode = (mode or "").strip().lower()
+            if mode not in ("glow", "shift", "boomerang", "outline", "scanline", "shimmer", "pop", "random"):
+                mode = "glow"
+            try:
+                s.setValue("animated_buttons_mode", mode)
+            except Exception:
+                pass
+
+            # Ensure only one is active (checkbox look, radio behavior)
+            items = [
+                (cb_anim_glow, mode == "glow"),
+                (cb_anim_shift, mode == "shift"),
+                (cb_anim_boom, mode == "boomerang"),
+                (cb_anim_outline, mode == "outline"),
+                (cb_anim_scanline, mode == "scanline"),
+                (cb_anim_shimmer, mode == "shimmer"),
+                (cb_anim_pop, mode == "pop"),
+                (cb_anim_rand, mode == "random"),
+            ]
+            for w, on in items:
+                try:
+                    w.blockSignals(True)
+                    w.setChecked(bool(on))
+                except Exception:
+                    pass
+                try:
+                    w.blockSignals(False)
+                except Exception:
+                    pass
+                _sync_grey_state(w, bool(on))
+
+            _anim_apply_to_app()
+
+        def _anim_on_main_toggle(b: bool):
+            try:
+                s.setValue("animated_buttons_enabled", bool(b))
+            except Exception:
+                pass
+            _sync_grey_state(cb_animbtn, bool(b))
+            try:
+                row_anim_modes.setVisible(bool(b))
+            except Exception:
+                pass
+
+            # If turning ON, ensure a mode is selected.
+            if b:
+                cur = (s.value("animated_buttons_mode", "glow", type=str) or "glow").strip().lower()
+                if cur not in ("glow", "shift", "boomerang", "outline", "scanline", "shimmer", "pop", "random"):
+                    cur = "glow"
+                _anim_set_mode(cur)
+            else:
+                _anim_apply_to_app()
+
+        cb_animbtn.toggled.connect(_anim_on_main_toggle)
+
+        def _anim_on_sub_toggle(mode: str, b: bool):
+            if not cb_animbtn.isChecked():
+                return
+            if b:
+                _anim_set_mode(mode)
+            else:
+                # Prevent ending up with zero mode selected while enabled.
+                cur = (s.value("animated_buttons_mode", "glow", type=str) or "glow").strip().lower()
+                if cur == (mode or "").strip().lower():
+                    QTimer.singleShot(0, lambda: _anim_set_mode(cur))
+
+        cb_anim_glow.toggled.connect(lambda b: _anim_on_sub_toggle("glow", b))
+        cb_anim_shift.toggled.connect(lambda b: _anim_on_sub_toggle("shift", b))
+        cb_anim_boom.toggled.connect(lambda b: _anim_on_sub_toggle("boomerang", b))
+        cb_anim_outline.toggled.connect(lambda b: _anim_on_sub_toggle("outline", b))
+        cb_anim_scanline.toggled.connect(lambda b: _anim_on_sub_toggle("scanline", b))
+        cb_anim_shimmer.toggled.connect(lambda b: _anim_on_sub_toggle("shimmer", b))
+        cb_anim_pop.toggled.connect(lambda b: _anim_on_sub_toggle("pop", b))
+        cb_anim_rand.toggled.connect(lambda b: _anim_on_sub_toggle("random", b))
+
+        # Apply initial mode states
+        _anim_set_mode(mode_default)
+
+        # -- Font size (global) ----------------------------------------------------------
+        cb_font = QCheckBox("Change font size")
+        cb_font.setToolTip("Adjust the global UI font size. Turn on to reveal the slider (in pixels).")
+        font_enabled_default = s.value("ui_font_size_enabled", False, type=bool)
+        cb_font.setChecked(font_enabled_default)
+        _sync_grey_state(cb_font, bool(font_enabled_default))
+
+        # Slider row (only visible when enabled)
+        row_font = QWidget(content)
+        h_font = QHBoxLayout(row_font)
+        h_font.setContentsMargins(18, 0, 0, 0)
+        h_font.setSpacing(10)
+
+        lab_font = QLabel("Font size: (click 'apply' theme change the font size)")
+        slider_font = QtWidgets.QSlider(Qt.Horizontal, row_font)
+        slider_font.setRange(-5, 5)
+        slider_font.setSingleStep(1)
+        slider_font.setPageStep(1)
+        slider_font.setTickInterval(1)
+        slider_font.setTickPosition(QtWidgets.QSlider.TicksBelow)
+
+        delta_default = s.value("ui_font_size_delta_px", 0)
+        try:
+            delta_default = int(delta_default)
+        except Exception:
+            delta_default = 0
+        if delta_default < -5:
+            delta_default = -5
+        if delta_default > 5:
+            delta_default = 5
+        slider_font.setValue(delta_default)
+
+        lab_font_val = QLabel(f"{int(slider_font.value()):+d} px")
+        lab_font_val.setMinimumWidth(52)
+
+        h_font.addWidget(lab_font)
+        h_font.addWidget(slider_font, 1)
+        h_font.addWidget(lab_font_val)
+        h_font.addStretch(1)
+
+        row_font.setVisible(bool(font_enabled_default))
+
+        def _font_apply_now():
+            try:
+                app = QtWidgets.QApplication.instance()
+                _font_size_apply(app, bool(cb_font.isChecked()), int(slider_font.value()))
+            except Exception:
+                pass
+
+        def _on_font_toggle(b: bool):
+            try:
+                s.setValue("ui_font_size_enabled", bool(b))
+            except Exception:
+                pass
+            _sync_grey_state(cb_font, bool(b))
+            try:
+                row_font.setVisible(bool(b))
+            except Exception:
+                pass
+            _font_apply_now()
+
+        def _on_font_slider(vv: int):
+            try:
+                vv = int(vv)
+            except Exception:
+                vv = 0
+            try:
+                s.setValue("ui_font_size_delta_px", int(vv))
+            except Exception:
+                pass
+            try:
+                lab_font_val.setText(f"{int(vv):+d} px")
+            except Exception:
+                pass
+            if cb_font.isChecked():
+                _font_apply_now()
+
+        cb_font.toggled.connect(_on_font_toggle)
+        slider_font.valueChanged.connect(_on_font_slider)
+
+        v.addWidget(cb_font)
+        v.addWidget(row_font)
+
+        # Apply initial setting once the UI exists (safe if already applied elsewhere).
+        try:
+            _font_apply_now()
+        except Exception:
+            pass
 
         # -- Emoji labels toggle --------------------------------------------------------
         cb_emoji = QCheckBox("Emoji labels")
         cb_emoji.setToolTip("Replace feature labels with emoji like 🔍 ⏱️ 📝 📸 🖌️ 🤖 ⏳ ⚙️/⚒️. "
                             "Turn off if your system font renders emoji poorly.")
-        emoji_default = s.value("emoji_labels_enabled", False, type=bool)
+        emoji_default = s.value("emoji_labels_enabled", True, type=bool)
         cb_emoji.setChecked(emoji_default)
         _sync_grey_state(cb_emoji, bool(emoji_default))
 
@@ -491,7 +1172,7 @@ def _options_group(page: QWidget) -> QGroupBox:
 
         cb_emoji_tabs = QCheckBox("Show labels with emojis on the tabs")
         cb_emoji_tabs.setToolTip("When Emoji labels are enabled, show both the emoji and the text on tab titles.")
-        emoji_tabs_default = s.value("emoji_tabs_show_labels", False, type=bool)
+        emoji_tabs_default = s.value("emoji_tabs_show_labels", True, type=bool)
         cb_emoji_tabs.setChecked(emoji_tabs_default)
         _sync_grey_state(cb_emoji_tabs, bool(emoji_tabs_default))
         cb_emoji_tabs.setVisible(bool(emoji_default))
@@ -577,7 +1258,7 @@ def _options_group(page: QWidget) -> QGroupBox:
         # -- Reorder tabs ---------------------------------------------------------------
         cb_tabloc = QCheckBox("Reorder tabs")
         cb_tabloc.setToolTip("When enabled, you can drag tabs to rearrange them.")
-        tabloc_default = s.value("tabs_reorder_enabled", False, type=bool)
+        tabloc_default = s.value("tabs_reorder_enabled", True, type=bool)
         cb_tabloc.setChecked(tabloc_default)
         _sync_grey_state(cb_tabloc, bool(tabloc_default))
 
@@ -632,8 +1313,13 @@ def _options_group(page: QWidget) -> QGroupBox:
 
         # Apply persisted banner settings once now that the UI exists
         try:
-            _banner_apply_visibility(page, bool(banner_default))
-            _banner_apply_colored(page, bool(banner_color_default))
+            _banner_apply_visibility(root_for_banners, bool(banner_default))
+            # Gradient overrides the colored/grey switch
+            if bool(banner_default) and bool(banner_grad_default):
+                _banner_apply_gradient(root_for_banners, True, int(speed_default))
+            else:
+                _banner_apply_gradient(root_for_banners, False, int(speed_default))
+                _banner_apply_colored(root_for_banners, bool(banner_color_default))
         except Exception:
             pass
 
@@ -989,8 +1675,8 @@ def _logo_group(page: QWidget) -> QWidget:
             pass
         try:
             s = QSettings('FrameVision','FrameVision')
-            en = s.value('intro_overlay_enabled', False, type=bool)
-            prev_ok = s.value('intro_overlay_preview_enabled', True, type=bool)
+            en = s.value('intro_overlay_enabled', True, type=bool)
+            prev_ok = s.value('intro_overlay_preview_enabled', False, type=bool)
             theme = s.value('theme','Auto')
             st = getattr(lab, "_fv_overlay_state", None)
             if st is None:
@@ -1122,6 +1808,254 @@ def _banner_apply_colored(root: QWidget, colored: bool) -> None:
     except Exception:
         pass
 
+
+# --- Fancy banner gradient animation -----------------------------------------------
+_FV_BANNER_GRADIENT_ANIM = None
+
+def _banner_style_with_bg(style: str, bg_block: str) -> str:
+    """Replace the first 'background:' block in a stylesheet with bg_block."""
+    try:
+        style = style or ""
+        key = "background:"
+        idx = style.find(key)
+        if idx == -1:
+            return style + bg_block
+        semi = style.find(";", idx)
+        if semi == -1:
+            semi = len(style)
+        return style[:idx] + bg_block + style[semi+1:]
+    except Exception:
+        return style or ""
+
+class _BannerGradientAnimator(QtCore.QObject):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._root = None
+        self._phase = 0.0
+        self._speed = 20
+        self._timer = QTimer(self)
+        self._timer.setInterval(55)  # smooth, lightweight
+        self._timer.timeout.connect(self._tick)
+
+    def set_root(self, root: QWidget):
+        try:
+            self._root = root.window() if isinstance(root, QWidget) else root
+        except Exception:
+            self._root = root
+
+    def set_speed(self, v: int):
+        try:
+            v = int(v)
+        except Exception:
+            v = 20
+        if v < 1: v = 1
+        if v > 50: v = 50
+        self._speed = v
+
+    def start(self):
+        if not self._timer.isActive():
+            self._timer.start()
+        self._tick()
+
+    def stop(self):
+        try:
+            if self._timer.isActive():
+                self._timer.stop()
+        except Exception:
+            pass
+        # Restore original styles so normal colored/grey logic can take over
+        try:
+            if self._root is None:
+                return
+            for lab in _banner__iter_banners(self._root):
+                try:
+                    orig = lab.property("fv_banner_orig_style")
+                    if orig is None:
+                        orig = lab.styleSheet() or ""
+                        lab.setProperty("fv_banner_orig_style", orig)
+                    lab.setStyleSheet(orig)
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
+    def _tick(self):
+        root = self._root
+        if root is None:
+            return
+        # speed maps to degrees-per-tick; keep it smooth without CPU spikes
+        self._phase = (self._phase + (float(self._speed) * 0.18)) % 360.0
+
+        def _rgba(qc):
+            return f"rgba({qc.red()},{qc.green()},{qc.blue()},255)"
+
+        try:
+            c1 = QtGui.QColor.fromHsvF((self._phase % 360.0) / 360.0, 0.85, 0.95)
+            c2 = QtGui.QColor.fromHsvF(((self._phase + 60.0) % 360.0) / 360.0, 0.85, 0.95)
+            c3 = QtGui.QColor.fromHsvF(((self._phase + 120.0) % 360.0) / 360.0, 0.85, 0.95)
+            bg = (
+                " background: qlineargradient("
+                "   x1:0, y1:0, x2:1, y2:0,"
+                f"   stop:0 {_rgba(c1)},"
+                f"   stop:0.5 {_rgba(c2)},"
+                f"   stop:1 {_rgba(c3)}"
+                " );"
+            )
+        except Exception:
+            return
+
+        for lab in _banner__iter_banners(root):
+            try:
+                orig = lab.property("fv_banner_orig_style")
+                if orig is None:
+                    orig = lab.styleSheet() or ""
+                    lab.setProperty("fv_banner_orig_style", orig)
+                lab.setStyleSheet(_banner_style_with_bg(orig, bg))
+            except Exception:
+                pass
+
+def _banner_apply_gradient(root: QWidget, enabled: bool, speed: int = 20) -> None:
+    """Enable/disable animated banner gradients for all *Banner labels."""
+    global _FV_BANNER_GRADIENT_ANIM
+    try:
+        if _FV_BANNER_GRADIENT_ANIM is None:
+            _FV_BANNER_GRADIENT_ANIM = _BannerGradientAnimator()
+        _FV_BANNER_GRADIENT_ANIM.set_root(root)
+        _FV_BANNER_GRADIENT_ANIM.set_speed(int(speed))
+        if bool(enabled):
+            _FV_BANNER_GRADIENT_ANIM.start()
+        else:
+            _FV_BANNER_GRADIENT_ANIM.stop()
+    except Exception:
+        pass
+
+# --- Fancy banner startup sync --------------------------------------------------
+
+def _banner_apply_from_qsettings(root: QWidget) -> bool:
+    """Apply banner settings from QSettings to all *Banner labels.
+
+    This is intentionally safe + idempotent so it can run during startup even
+    when the Settings tab UI has never been opened.
+
+    Returns True if at least one banner was found/applied.
+    """
+    try:
+        s = QSettings("FrameVision", "FrameVision")
+        enabled = bool(s.value("banner_enabled", True, type=bool))
+        colored = bool(s.value("banner_colored", True, type=bool))
+        grad_en = bool(s.value("banner_gradient_enabled", False, type=bool))
+        speed = int(s.value("banner_gradient_speed", 20, type=int) or 20)
+        if speed < 1:
+            speed = 1
+        if speed > 50:
+            speed = 50
+    except Exception:
+        enabled, colored, grad_en, speed = True, True, False, 20
+
+    # Capture the *current* banner stylesheet as "orig" before we mutate it.
+    found = False
+    try:
+        for lab in _banner__iter_banners(root):
+            found = True
+            try:
+                cur = lab.styleSheet() or ""
+                orig = lab.property("fv_banner_orig_style")
+                if orig is None or not str(orig).strip():
+                    lab.setProperty("fv_banner_orig_style", cur)
+            except Exception:
+                pass
+    except Exception:
+        pass
+
+    if not found:
+        return False
+
+    # Apply state.
+    try:
+        _banner_apply_visibility(root, bool(enabled))
+    except Exception:
+        pass
+
+    # Gradient overrides colored/grey.
+    try:
+        if not bool(enabled):
+            _banner_apply_gradient(root, False, int(speed))
+            return True
+
+        if bool(grad_en):
+            _banner_apply_gradient(root, True, int(speed))
+        else:
+            _banner_apply_gradient(root, False, int(speed))
+            _banner_apply_colored(root, bool(colored))
+    except Exception:
+        pass
+
+    return True
+
+
+def _banner_install_startup_sync() -> None:
+    """Apply banner settings shortly after the UI exists.
+
+    Fixes the case where banner preferences only "stick" after the Settings tab
+    is opened (because the Options group is lazily built).
+    """
+    try:
+        app = QtWidgets.QApplication.instance()
+        if app is None:
+            return
+
+        state = {"tries": 0, "done": False}
+
+        def _pick_main_window():
+            try:
+                wins = list(app.topLevelWidgets())
+            except Exception:
+                wins = []
+            for w in wins:
+                if not isinstance(w, QWidget):
+                    continue
+                try:
+                    tabs = w.findChild(QTabWidget, "main_tabs") or getattr(w, "tabs", None)
+                except Exception:
+                    tabs = None
+                if isinstance(tabs, QTabWidget):
+                    return w
+            # fallback: any widget with banners
+            for w in wins:
+                if not isinstance(w, QWidget):
+                    continue
+                try:
+                    for _ in _banner__iter_banners(w):
+                        return w
+                except Exception:
+                    pass
+            return None
+
+        def _tick():
+            if state["done"]:
+                return
+            state["tries"] += 1
+
+            win = _pick_main_window()
+            if win is not None:
+                try:
+                    if _banner_apply_from_qsettings(win):
+                        state["done"] = True
+                        return
+                except Exception:
+                    pass
+
+            # keep trying briefly; banners may be created a few frames later
+            if state["tries"] < 80:
+                QTimer.singleShot(75, _tick)
+
+        # kick once the event loop starts
+        QTimer.singleShot(0, _tick)
+    except Exception:
+        pass
+
+
+
 # === Emoji Labels (single-file implementation) ===========================================
 # Borderless emoji set & mappers (no boxed symbols). Replaces tab titles with emoji-only
 # and prefixes matching buttons/labels with an emoji. Restores originals when toggled off.
@@ -1138,12 +2072,20 @@ _EMOJI_MAP = {
     "fps": "⏱️",
     "model": "🧩️",
     "cancel": "❌️",
-    # "describer": "📝",
+    "planner": "📝",
+    "character": "🎭",
+    "storymode": "🐉",
+    "generation": "🏡",
+    "format": "🖼️",   
     "describe": "🖋️",
     "log": "📝",
     "steps": "👣",
     "folder": "🗂️",
+#    "explorer": "🗂️"
+    "speech": "🎙️",
+    "generate": "✨",
     "batch": "📦",
+    "clip": "🎬",
     "info": "💡",
     "txt2img": "📸",
     "loader": "📸",
@@ -1185,10 +2127,12 @@ _EMOJI_MAP = {
     "file": "📂",
     "rifefps": "⏱️",
     "interpolation": "⏱️",
-    "acemusic": "🎵️",
+    "ace": "🎵️",
     "seed": "🌱️",
     "rife fps": "⏱️",
     "cpu": "⚡️",
+    "2511": "⚡️",
+    "edit": "🖼️",
     "memory": "🧮",
     "askframie": "👽",
     "failed": "❌️",
@@ -1312,7 +2256,7 @@ def restore_emoji_labels_globally(root: QWidget) -> None:
 def _emoji_enabled_qsettings() -> bool:
     try:
         s = QSettings("FrameVision","FrameVision")
-        return bool(s.value("emoji_labels_enabled", False, type=bool))
+        return bool(s.value("emoji_labels_enabled", True, type=bool))
     except Exception:
         return False
 def _emoji_set_enabled_qsettings(val: bool) -> None:
@@ -1326,7 +2270,7 @@ def _emoji_tabs_show_labels_qsettings() -> bool:
     """Return whether tabs should show both emoji and label text when emoji mode is on."""
     try:
         s = QSettings("FrameVision","FrameVision")
-        return bool(s.value("emoji_tabs_show_labels", False, type=bool))
+        return bool(s.value("emoji_tabs_show_labels", True, type=bool))
     except Exception:
         return False
 def _apply_emoji_on_start(root: QWidget) -> None:
@@ -1353,19 +2297,74 @@ def install_settings_tab(main_window: QWidget) -> None:
         if not page:
             return
 
+        def _make_settings_banner(parent: QWidget) -> QLabel:
+            """Create the Settings tab banner label (fixed-height)."""
+            banner = QLabel("Settings", parent)
+            banner.setObjectName("settingsBanner")
+            banner.setAlignment(Qt.AlignCenter)
+            banner.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+            banner.setFixedHeight(48)
+            banner.setStyleSheet(
+                "#settingsBanner {"
+                " font-size: 15px;"
+                " font-weight: 600;"
+                " padding: 8px 17px;"
+                " border-radius: 12px;"
+                " margin: 0 0 6px 0;"
+                " color: white;"
+                " background: qlineargradient(x1:0, y1:0, x2:1, y2:0,"
+                "   stop:0 rgba(255,75,75,255), stop:1 rgba(200,35,35,255)"
+                " );"
+                " letter-spacing: 0.5px;"
+                "}"
+            )
+            return banner
+
         # Prevent double-install (can happen if called from multiple places).
         if getattr(page, "_fv_settings_installed", False):
             return
         setattr(page, "_fv_settings_installed", True)
 
-        # Prepare a scroll area + a dedicated content widget.
+        # Prepare a sticky banner + a dedicated scroll area/content widget.
+        # The banner lives OUTSIDE the scroll area so it always stays visible.
+        banner_host = None
         if isinstance(page, QScrollArea):
-            scroll = page
+            # If the tab page itself is already a scroll area, convert it into a
+            # simple container (no scrollbars) and place our own inner scroll area.
+            scroll_outer = page
+            scroll_outer.setWidgetResizable(True)
+            try:
+                scroll_outer.setFrameShape(QtWidgets.QFrame.NoFrame)
+            except Exception:
+                pass
+            try:
+                scroll_outer.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+                scroll_outer.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+            except Exception:
+                pass
+
+            wrapper = QWidget(scroll_outer)
+            wlay = QVBoxLayout(wrapper)
+            wlay.setContentsMargins(0, 0, 0, 0)
+            wlay.setSpacing(0)
+
+            header = QWidget(wrapper)
+            hlay = QVBoxLayout(header)
+            hlay.setContentsMargins(12, 12, 12, 8)
+            hlay.setSpacing(0)
+            banner = _make_settings_banner(header)
+            hlay.addWidget(banner)
+            wlay.addWidget(header)
+            banner_host = header
+
+            scroll = QScrollArea(wrapper)
             scroll.setWidgetResizable(True)
-            content = scroll.widget()
-            if content is None:
-                content = QWidget(scroll)
-                scroll.setWidget(content)
+            scroll.setFrameShape(QtWidgets.QFrame.NoFrame)
+            content = QWidget(scroll)
+            scroll.setWidget(content)
+            wlay.addWidget(scroll, 1)
+
+            scroll_outer.setWidget(wrapper)
         else:
             # Wipe the entire tab page so we don't keep legacy placeholder UI above our banner.
             outer_lay = page.layout()
@@ -1376,13 +2375,38 @@ def install_settings_tab(main_window: QWidget) -> None:
             outer_lay.setContentsMargins(0, 0, 0, 0)
             outer_lay.setSpacing(0)
 
+            header = QWidget(page)
+            hlay = QVBoxLayout(header)
+            hlay.setContentsMargins(12, 12, 12, 8)
+            hlay.setSpacing(0)
+            banner = _make_settings_banner(header)
+            hlay.addWidget(banner)
+            outer_lay.addWidget(header)
+            banner_host = header
+
             scroll = QScrollArea(page)
             scroll.setWidgetResizable(True)
             scroll.setFrameShape(QtWidgets.QFrame.NoFrame)
 
             content = QWidget(scroll)
             scroll.setWidget(content)
-            outer_lay.addWidget(scroll)
+            outer_lay.addWidget(scroll, 1)
+
+        # Respect the saved banner enabled state immediately (avoid a 1-frame flash).
+        try:
+            _s = QSettings("FrameVision", "FrameVision")
+            en = bool(_s.value("banner_enabled", True, type=bool))
+            try:
+                banner.setVisible(en)
+            except Exception:
+                pass
+            if banner_host is not None:
+                try:
+                    banner_host.setVisible(en)
+                except Exception:
+                    pass
+        except Exception:
+            pass
 
         # settings_more expects to be able to find this widget reliably.
         try:
@@ -1401,7 +2425,8 @@ def install_settings_tab(main_window: QWidget) -> None:
             lay = QVBoxLayout(content)
             content.setLayout(lay)
         _wipe_layout(lay)
-        lay.setContentsMargins(12, 12, 12, 12)
+        # Top margin is handled by the sticky banner above.
+        lay.setContentsMargins(12, 0, 12, 12)
         lay.setSpacing(12)
 
         content.setStyleSheet(
@@ -1409,28 +2434,7 @@ def install_settings_tab(main_window: QWidget) -> None:
             "QGroupBox::title { subcontrol-origin: margin; left: 10px; padding: 0 6px; }"
         )
 
-        # Fancy red banner at the top of Settings
-        banner = QLabel("Settings", content)
-        banner.setObjectName("settingsBanner")
-        banner.setAlignment(Qt.AlignCenter)
-        banner.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
-        banner.setFixedHeight(48)
-        banner.setStyleSheet(
-            "#settingsBanner {"
-            " font-size: 15px;"
-            " font-weight: 600;"
-            " padding: 8px 17px;"
-            " border-radius: 12px;"
-            " margin: 0 0 6px 0;"
-            " color: white;"
-            " background: qlineargradient(x1:0, y1:0, x2:1, y2:0,"
-            "   stop:0 rgba(255,75,75,255), stop:1 rgba(200,35,35,255)"
-            " );"
-            " letter-spacing: 0.5px;"
-            "}"
-        )
-        lay.addWidget(banner)
-        lay.addSpacing(6)
+        # (Banner is created above the scroll area so it stays sticky.)
 
         lay.addWidget(_theme_row(content))
         lay.addWidget(_options_group(content))
@@ -1451,6 +2455,23 @@ def install_settings_tab(main_window: QWidget) -> None:
             _apply_emoji_on_start(main_window)
         except Exception:
             pass
+
+
+        # Auto-apply font size from saved settings
+        try:
+            _font_size_apply_from_qsettings(QtWidgets.QApplication.instance())
+        except Exception:
+            pass
+
+
+# Auto-install animated buttons manager (applies saved settings)
+        try:
+            app = QtWidgets.QApplication.instance()
+            AnimatedButtonsManager.install(app)
+            AnimatedButtonsManager.apply_from_settings(app)
+        except Exception:
+            pass
+
 
         # Minimal wiring: delegate Easter Eggs UI injection + tracker to settings_more
         try:
@@ -1483,3 +2504,11 @@ def install_settings_tab(main_window: QWidget) -> None:
     except Exception:
         pass
 
+
+
+# Ensure banner settings (including gradient mode) are applied during startup
+# even before the Settings tab is opened.
+try:
+    _banner_install_startup_sync()
+except Exception:
+    pass

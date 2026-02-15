@@ -261,8 +261,7 @@ def install_audio_tool(pane, sec_audio):
         audio_list.setToolTip(_tip(
             "audiotool.audio_list",
             "Step 1: your audio files (music, voiceover, etc.) that will go into the video.\\n\\n"
-            "Click an item to preview its waveform and tweak settings. Use ↑ / ↓ to reorder. "
-            "The first item is chosen by default in 'Replace' mode."
+            "Click an item to preview its waveform and tweak settings. Use ↑ / ↓ to reorder."
         ))
     except Exception:
         pass
@@ -292,7 +291,6 @@ def install_audio_tool(pane, sec_audio):
         btn_up.setToolTip(_tip(
             "audiotool.btn_up",
             "Move the selected audio UP in the list.\\n\\n"
-            "Tip: The top item is used automatically if you choose 'Replace with selected track'."
         ))
     except Exception:
         pass
@@ -308,29 +306,71 @@ def install_audio_tool(pane, sec_audio):
 
     waveform = _Waveform()
 
-    # Mode
-    rb_replace = QRadioButton("Replace with selected track")
-    rb_mix = QRadioButton("Mix added tracks")
-    cb_include_original = QCheckBox("Include original video audio in mix")
+    # Mode (Mix)
+    lbl_mode = QLabel("Mix added tracks")
     try:
-        rb_mix.setToolTip(_tip(
-            "audiotool.mode_mix",
-            "Blend all added audio files together.\\n\\n"
-            "Great for background music under dialogue or voiceover."
-        ))
+        lbl_mode.setStyleSheet("font-weight:600;")
+    except Exception:
+        pass
+    cb_include_original = QCheckBox("Include original video audio in mix")
+
+    # Mix sub-mode (only applies when "Mix added tracks" is selected)
+    rb_mix_all = QRadioButton("All (stack)")
+    rb_mix_seq = QRadioButton("One by one (playlist)")
+    rb_mix_all.setChecked(True)
+
+    xfade_slider = QSlider(Qt.Horizontal); xfade_slider.setRange(1, 20); xfade_slider.setValue(3)
+    xfade_label = QLabel("Fade between tracks: 3 s")
+    xfade_slider.valueChanged.connect(lambda v: xfade_label.setText(f"Fade between tracks: {v} s"))
+
+    # Put sub-mode radios into their own container (Qt auto-groups radio buttons by parent widget.)
+    fade_row = QWidget()
+    _fade_row_l = QHBoxLayout(fade_row)
+    _fade_row_l.setContentsMargins(0, 0, 0, 0)
+    _fade_row_l.addWidget(xfade_label)
+    _fade_row_l.addWidget(xfade_slider)
+
+    submode_box = QWidget()
+    _sub_l = QVBoxLayout(submode_box)
+    _sub_l.setContentsMargins(16, 0, 0, 0)  # visual indent
+    _sub_l.addWidget(rb_mix_all)
+    _sub_l.addWidget(rb_mix_seq)
+    _sub_l.addWidget(fade_row)
+
+    try:
         cb_include_original.setToolTip(_tip(
             "audiotool.include_original",
             "Keep the video's original audio (camera voice / game sounds) in the final result.\\n\\n"
             "Turn this OFF if you want only the new music / voiceover."
         ))
-        rb_replace.setToolTip(_tip(
-            "audiotool.mode_replace",
-            "Throw away the video's original audio and use ONLY one selected track from the list "
-            "(full soundtrack swap)."
+        rb_mix_all.setToolTip(_tip(
+            "audiotool.mix_all",
+            "All (stack): put every added track on top of each other (great for voice + background music)."
+        ))
+        rb_mix_seq.setToolTip(_tip(
+            "audiotool.mix_onebyone",
+            "One by one (playlist): play the added tracks in order. Use the fade slider to crossfade between them."
+        ))
+        xfade_slider.setToolTip(_tip(
+            "audiotool.mix_fade",
+            "Fade length (seconds) used between tracks when 'One by one' is selected."
+        ))
+        xfade_label.setToolTip(_tip(
+            "audiotool.mix_fade",
+            "Fade length (seconds) used between tracks when 'One by one' is selected."
         ))
     except Exception:
         pass
-    rb_mix.setChecked(True)
+
+    def _update_mix_submode_ui():
+        # Always in mix mode now
+        submode_box.setVisible(True)
+        fade_row.setVisible(rb_mix_seq.isChecked())
+
+    # Keep the UI clean: show the fade slider only when it matters
+    rb_mix_all.toggled.connect(_update_mix_submode_ui)
+    rb_mix_seq.toggled.connect(_update_mix_submode_ui)
+    _update_mix_submode_ui()
 
     # Controls
     vol_slider = QSlider(Qt.Horizontal); vol_slider.setRange(0, 300); vol_slider.setValue(100)
@@ -351,20 +391,15 @@ def install_audio_tool(pane, sec_audio):
     vol_slider.valueChanged.connect(lambda v: vol_label.setText(f"Volume: {v/100.0:.2f}x"))
 
     spin_fadein = QSpinBox(); spin_fadein.setRange(0, 3600); spin_fadein.setSuffix(" s")
-    spin_fadeout_st = QSpinBox(); spin_fadeout_st.setRange(0, 24*3600); spin_fadeout_st.setSuffix(" s")
     spin_fadeout_d = QSpinBox(); spin_fadeout_d.setRange(0, 3600); spin_fadeout_d.setSuffix(" s")
     try:
         spin_fadein.setToolTip(_tip(
             "audiotool.fadein",
-            "Fade in (seconds): how long the added audio takes to go from silent to full volume at the start."
-        ))
-        spin_fadeout_st.setToolTip(_tip(
-            "audiotool.fadeout_start",
-            "Fade out start (seconds): when the fade-out should BEGIN in the added audio timeline."
+            "Fade in (seconds): how long the final audio takes to go from silent to full volume at the start of the video."
         ))
         spin_fadeout_d.setToolTip(_tip(
             "audiotool.fadeout_dur",
-            "Fade out dur (seconds): how long the fade-out lasts once it starts."
+            "Fade out dur (seconds): how long the fade-out lasts at the END of the video."
         ))
     except Exception:
         pass
@@ -430,6 +465,12 @@ def install_audio_tool(pane, sec_audio):
         pass
 
     btn_audio = QPushButton("Add Audio to Video")
+
+    # Hover: green background for quick visual feedback
+    try:
+        btn_audio.setStyleSheet("QPushButton:hover{background-color: rgb(46, 204, 113);}")
+    except Exception:
+        pass
     try:
         btn_audio.setToolTip(_tip(
             "audiotool.render",
@@ -474,18 +515,21 @@ def install_audio_tool(pane, sec_audio):
     try:
         grp_mode.setToolTip(_tip(
             "audiotool.grp_mode",
-            "Step 3: Tell FrameVision how to use the audio:\\n"
-            "• Mix added tracks (background music under dialogue)\\n"
-            "• Replace with selected track (full soundtrack swap)"
+            "Step 3: Audio mode\\n"
+            "• All (stack): put added tracks on top of each other\\n"
+            "• One by one (playlist): play them in order with a crossfade\\n"
+            "Use the toggle below to keep or remove the original video audio."
         ))
     except Exception:
         pass
-    lm = QVBoxLayout(grp_mode); lm.addWidget(rb_mix); lm.addWidget(cb_include_original); lm.addWidget(rb_replace)
+    lm = QVBoxLayout(grp_mode)
+    lm.addWidget(lbl_mode)
+    lm.addWidget(submode_box)
+    lm.addWidget(cb_include_original)
 
     form = QFormLayout()
     form.addRow(vol_label, vol_slider)
-    form.addRow("Fade in", spin_fadein)
-    form.addRow("Fade out start", spin_fadeout_st)
+    form.addRow("Fade in dur", spin_fadein)
     form.addRow("Fade out dur", spin_fadeout_d)
     form.addRow("Trim start", edit_ss)
     form.addRow("Trim end", edit_to)
@@ -519,15 +563,29 @@ def install_audio_tool(pane, sec_audio):
         left.setStretch(1, 1)
     except Exception:
         pass
-    right = QVBoxLayout(); right.addWidget(grp_mode); right.addLayout(form); right.addWidget(ffgrp); right.addStretch(1); right.addWidget(btn_audio)
+    right = QVBoxLayout()
+    right.addWidget(grp_mode)
+    right.addLayout(form)
+    right.addWidget(ffgrp)
+    right.addStretch(1)
 
-    root = QHBoxLayout()
-    root.addLayout(left, 1); root.addLayout(right, 1)
+    # Action button at the very top of the tool (above everything else)
+    top_row = QHBoxLayout()
+    top_row.addStretch(1)
+    top_row.addWidget(btn_audio)
+
+    cols = QHBoxLayout()
+    cols.addLayout(left, 1); cols.addLayout(right, 1)
     try:
-        root.setStretch(0,1); root.setStretch(1,1)
+        cols.setStretch(0,1); cols.setStretch(1,1)
     except Exception:
         pass
-    container = QWidget(); container.setLayout(root)
+
+    root_outer = QVBoxLayout()
+    root_outer.addLayout(top_row)
+    root_outer.addLayout(cols)
+
+    container = QWidget(); container.setLayout(root_outer)
     try:
         sp = container.sizePolicy()
         sp.setHorizontalStretch(0); sp.setVerticalStretch(0)
@@ -543,7 +601,7 @@ def install_audio_tool(pane, sec_audio):
             "audiotool.section",
             "Audio Tool workflow:\\n"
             "1. Add your music / voiceover.\\n"
-            "2. Pick Mix or Replace.\\n"
+            "2. Choose stack or playlist, and optionally keep the original video audio.\\n"
             "3. Adjust volume, fades, etc.\\n"
             "4. Click 'Add Audio to Video' to render a NEW file."
         ))
@@ -555,15 +613,17 @@ def install_audio_tool(pane, sec_audio):
     def _load_settings():
         vol_slider.setValue(int(settings.value("volume_pct", 100)))
         spin_fadein.setValue(int(settings.value("fadein", 0)))
-        spin_fadeout_st.setValue(int(settings.value("fadeout_st", 0)))
         spin_fadeout_d.setValue(int(settings.value("fadeout_d", 0)))
         edit_ss.setText(settings.value("trim_ss", ""))
         edit_to.setText(settings.value("trim_to", ""))
         spin_delay.setValue(int(settings.value("delay_ms", 0)))
         cb_loudnorm.setChecked(bool(int(settings.value("loudnorm", 0))))
         fmt.setCurrentText(settings.value("fmt", "mp4"))
-        rb_mix.setChecked(bool(int(settings.value("rb_mix", 1))))
-        rb_replace.setChecked(bool(int(settings.value("rb_replace", 0))))
+        onebyone = bool(int(settings.value("mix_onebyone", 0)))
+        rb_mix_seq.setChecked(onebyone)
+        rb_mix_all.setChecked(not onebyone)
+        xfade_slider.setValue(int(settings.value("mix_fade_sec", 3)))
+        _update_mix_submode_ui()
         cb_include_original.setChecked(bool(int(settings.value("include_orig", 1))))
         edit_ffpath.setText(settings.value("ffmpeg_path", ""))
         edit_fbpath.setText(settings.value("ffprobe_path", ""))
@@ -576,16 +636,15 @@ def install_audio_tool(pane, sec_audio):
     def _save_settings():
         settings.setValue("volume_pct", vol_slider.value())
         settings.setValue("fadein", spin_fadein.value())
-        settings.setValue("fadeout_st", spin_fadeout_st.value())
         settings.setValue("fadeout_d", spin_fadeout_d.value())
         settings.setValue("trim_ss", edit_ss.text())
         settings.setValue("trim_to", edit_to.text())
         settings.setValue("delay_ms", spin_delay.value())
         settings.setValue("loudnorm", int(cb_loudnorm.isChecked()))
         settings.setValue("fmt", fmt.currentText())
-        settings.setValue("rb_mix", int(rb_mix.isChecked()))
-        settings.setValue("rb_replace", int(rb_replace.isChecked()))
         settings.setValue("include_orig", int(cb_include_original.isChecked()))
+        settings.setValue("mix_onebyone", int(rb_mix_seq.isChecked()))
+        settings.setValue("mix_fade_sec", int(xfade_slider.value()))
         settings.setValue("ffmpeg_path", edit_ffpath.text().strip())
         settings.setValue("ffprobe_path", edit_fbpath.text().strip())
         files = [audio_list.item(i).text() for i in range(audio_list.count())]
@@ -596,11 +655,16 @@ def install_audio_tool(pane, sec_audio):
     # File actions
     def _add_file():
         start_dir = settings.value("last_dir", "")
-        path, _ = QFileDialog.getOpenFileName(pane, "Choose audio file.", start_dir,
+        paths, _ = QFileDialog.getOpenFileNames(pane, "Choose audio file(s).", start_dir,
                     "Audio files (*.mp3 *.wav *.m4a *.aac *.flac *.ogg *.opus);All files (*)")
-        if path:
-            settings.setValue("last_dir", str(Path(path).parent))
-            audio_list.addItem(path)
+        if paths:
+            try:
+                settings.setValue("last_dir", str(Path(paths[0]).parent))
+            except Exception:
+                pass
+            for p in paths:
+                if p:
+                    audio_list.addItem(p)
     def _remove_selected():
         row = audio_list.currentRow()
         if row >= 0:
@@ -667,14 +731,31 @@ def install_audio_tool(pane, sec_audio):
 
         vol = vol_slider.value()/100.0
         fadein = int(spin_fadein.value())
-        fadeout_st = int(spin_fadeout_st.value())
         fadeout_d = int(spin_fadeout_d.value())
+
+        # Probe input video duration (seconds) so fade-out can always happen at the END of the video.
+        vid_dur = 0.0
+        if fadeout_d > 0:
+            try:
+                fp = ffprobe_path(settings)
+                outdur = subprocess.check_output([
+                    fp, "-v", "error",
+                    "-show_entries", "format=duration",
+                    "-of", "default=noprint_wrappers=1:nokey=1",
+                    str(inp)
+                ], stderr=subprocess.STDOUT)
+                txtdur = outdur.decode("utf-8", "ignore").strip().splitlines()[0].strip()
+                vid_dur = float(txtdur) if txtdur else 0.0
+            except Exception:
+                vid_dur = 0.0
         trim_ss = _hms_to_seconds(edit_ss.text().strip())
         trim_to = _hms_to_seconds(edit_to.text().strip())
         delay_ms = int(spin_delay.value())
         use_loudnorm = cb_loudnorm.isChecked()
-        mode_mix = rb_mix.isChecked()
+        mode_mix = True  # Replace mode removed; always mix
         include_orig = cb_include_original.isChecked()
+        mix_onebyone = rb_mix_seq.isChecked()
+        mix_fade_sec = int(xfade_slider.value())
 
         cmd = [ff, "-y", "-i", str(inp)]
         for f in files:
@@ -695,50 +776,80 @@ def install_audio_tool(pane, sec_audio):
                 chain.append(f"adelay={delay_ms}|{delay_ms}")
             if vol!=1.0:
                 chain.append(f"volume={vol}")
-            if fadein>0:
-                chain.append(f"afade=t=in:ss=0:d={fadein}")
-            if fadeout_d>0 and fadeout_st>0:
-                chain.append(f"afade=t=out:st={fadeout_st}:d={fadeout_d}")
             chain.append(f"anull[{label_out}]")
             filter_parts.append(chain[0] + ",".join(chain[1:]))
 
         if mode_mix:
-            if include_orig:
-                filter_parts.append("[0:a]anull[orig]")
-                audio_labels.append("orig")
-            for i in range(len(files)):
-                lab = f"a{i}"
-                process_added(i+1, lab)
-                audio_labels.append(lab)
-            if len(audio_labels) < 1:
-                try: QMessageBox.warning(pane, "Add Audio", "Nothing to mix. Add audio files or include the original audio.")
-                except Exception: pass
-                return
-            mix_label = "mixout"
-            amix = "[" + "][".join(audio_labels) + "]"
-            amix += f"amix=inputs={len(audio_labels)}:duration=shortest:dropout_transition=0[{mix_label}]"
-            filter_parts.append(amix)
-            final_audio = mix_label
-            if use_loudnorm:
-                filter_parts.append(f"[{final_audio}]loudnorm=I=-16:TP=-1.5:LRA=11:linear=true[normout]")
-                final_audio = "normout"
-            cmd += ["-filter_complex", ";".join(filter_parts),
-                    "-map", "0:v:0", "-map", f"[{final_audio}]"]
-            cmd += vcodec + acodec + ["-shortest", str(out)]
-        else:
-            idx = audio_list.currentRow()
-            if idx < 0: idx = 0
-            if idx >= len(files): idx = 0
-            sel = idx + 1
-            process_added(sel, "selout")
-            final_audio = "selout"
-            if use_loudnorm:
-                filter_parts.append(f"[{final_audio}]loudnorm=I=-16:TP=-1.5:LRA=11:linear=true[normout]")
-                final_audio = "normout"
-            cmd += ["-filter_complex", ";".join(filter_parts),
-                    "-map", "0:v:0", "-map", f"[{final_audio}]"]
-            cmd += vcodec + acodec + ["-shortest", str(out)]
+            # Mix mode: either stack all tracks ("All") or play them as a playlist ("One by one").
+            if mix_onebyone:
+                seq_labels = []
+                for i in range(len(files)):
+                    lab = f"a{i}"
+                    process_added(i+1, lab)
+                    seq_labels.append(lab)
 
+                if not seq_labels and include_orig:
+                    filter_parts.append("[0:a]anull[orig]")
+                    final_audio = "orig"
+                elif not seq_labels:
+                    try: QMessageBox.warning(pane, "Add Audio", "Nothing to mix. Add audio files or include the original audio.")
+                    except Exception: pass
+                    return
+                else:
+                    prev = seq_labels[0]
+                    for j in range(1, len(seq_labels)):
+                        nxt = seq_labels[j]
+                        outlab = f"xf{j}"
+                        # Crossfade between tracks (fade out/in) for a smooth playlist.
+                        filter_parts.append(f"[{prev}][{nxt}]acrossfade=d={mix_fade_sec}:c1=tri:c2=tri[{outlab}]")
+                        prev = outlab
+                    playlist = prev
+                    final_audio = playlist
+                    if include_orig:
+                        filter_parts.append("[0:a]anull[orig]")
+                        filter_parts.append(f"[orig][{playlist}]amix=inputs=2:duration=longest:dropout_transition=0[mixout]")
+                        final_audio = "mixout"
+            else:
+                if include_orig:
+                    filter_parts.append("[0:a]anull[orig]")
+                    audio_labels.append("orig")
+                for i in range(len(files)):
+                    lab = f"a{i}"
+                    process_added(i+1, lab)
+                    audio_labels.append(lab)
+                if len(audio_labels) < 1:
+                    try: QMessageBox.warning(pane, "Add Audio", "Nothing to mix. Add audio files or include the original audio.")
+                    except Exception: pass
+                    return
+                mix_label = "mixout"
+                amix = "[" + "][".join(audio_labels) + "]"
+                # Important: use LONGEST so audio does not truncate the output video.
+                amix += f"amix=inputs={len(audio_labels)}:duration=longest:dropout_transition=0[{mix_label}]"
+                filter_parts.append(amix)
+                final_audio = mix_label
+
+            if use_loudnorm:
+                filter_parts.append(f"[{final_audio}]loudnorm=I=-16:TP=-1.5:LRA=11:linear=true[normout]")
+                final_audio = "normout"
+
+
+            # Apply global fades to the FINAL audio stream (not a start time — just durations).
+            if fadein > 0:
+                filter_parts.append(f"[{final_audio}]afade=t=in:ss=0:d={fadein}[fadein_out]")
+                final_audio = "fadein_out"
+            if fadeout_d > 0 and vid_dur > 0:
+                st = max(0.0, float(vid_dur) - float(fadeout_d))
+                # Keep a few decimals so very short clips still fade correctly.
+                filter_parts.append(f"[{final_audio}]afade=t=out:st={st:.3f}:d={fadeout_d}[fadeout_out]")
+                final_audio = "fadeout_out"
+
+            # Important: pad with silence so the VIDEO decides the final length.
+            filter_parts.append(f"[{final_audio}]apad[audpad]")
+            final_audio = "audpad"
+
+            cmd += ["-filter_complex", ";".join(filter_parts),
+                    "-map", "0:v:0", "-map", f"[{final_audio}]"]
+            cmd += vcodec + acodec + ["-shortest", str(out)]
         _save_settings()
         pane._run(cmd, out)
 

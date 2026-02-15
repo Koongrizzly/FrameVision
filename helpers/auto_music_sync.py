@@ -19,11 +19,12 @@ import random
 import shutil
 import subprocess
 import tempfile
+import re
 from datetime import datetime
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, replace, field
 from typing import List, Optional, Tuple, Dict
 
-from PySide6.QtCore import Qt, QThread, Signal, QSettings
+from PySide6.QtCore import Qt, QThread, Signal, QSettings, QTimer, QPropertyAnimation, QEasingCurve
 from PySide6.QtWidgets import (
     QWidget,
     QVBoxLayout,
@@ -37,6 +38,7 @@ from PySide6.QtWidgets import (
     QCheckBox,
     QProgressBar,
     QMessageBox,
+    QGraphicsOpacityEffect,
     QSizePolicy,
     QGroupBox,
     QSlider,
@@ -149,6 +151,56 @@ def _cine_grid_layout(screen_count: int, target_w: int, target_h: int):
     if n > 9:
         n = 9
 
+    # Keep targets encoder-friendly (yuv420p / nvenc can be picky),
+    # and avoid edge cases where padding ends up 1px smaller than the
+    # scaled input due to rounding / SAR.
+    try:
+        target_w = int(target_w)
+        target_h = int(target_h)
+    except Exception:
+        pass
+    if target_w % 2:
+        target_w += 1
+    if target_h % 2:
+        target_h += 1
+
+    def _evenize_sizes(sizes: list[int], total: int) -> list[int]:
+        """Make a list of sizes that sum to total, with each entry >= 2 and even."""
+        if total % 2:
+            total += 1
+        if not sizes:
+            return sizes
+        if len(sizes) == 1:
+            v = max(2, int(total))
+            if v % 2:
+                v += 1
+            return [v]
+
+        out = []
+        for s in sizes[:-1]:
+            v = max(2, int(s))
+            if v % 2:
+                v -= 1
+            v = max(2, v)
+            out.append(v)
+
+        last = int(total) - sum(out)
+        last = max(2, last)
+        # Since total and sum(out) are both even, last should already be even.
+        if last % 2:
+            last -= 1
+            if last < 2:
+                last = 2
+        out.append(last)
+
+        # Final guard: fix any drift by adjusting the last cell.
+        drift = int(total) - sum(out)
+        if drift != 0:
+            out[-1] = max(2, out[-1] + drift)
+            if out[-1] % 2:
+                out[-1] += 1
+        return out
+
     # Rows are described as "how many tiles in this row", top to bottom.
     row_patterns = {
         1: [1],
@@ -173,6 +225,8 @@ def _cine_grid_layout(screen_count: int, target_w: int, target_h: int):
     if remainder_h != 0 and heights:
         heights[-1] = max(1, heights[-1] + remainder_h)
 
+    heights = _evenize_sizes(heights, target_h)
+
     layout = []
     y = 0
     idx_tile = 0
@@ -187,6 +241,8 @@ def _cine_grid_layout(screen_count: int, target_w: int, target_h: int):
         remainder_w = target_w - used_w
         if remainder_w != 0 and widths:
             widths[-1] = max(1, widths[-1] + remainder_w)
+
+        widths = _evenize_sizes(widths, target_w)
 
         x = 0
         for col in range(cols_in_row):
@@ -263,6 +319,59 @@ def _ffprobe_resolution(ffprobe: str, path: str) -> Optional[Tuple[int, int]]:
 def _ensure_dir(path: str) -> None:
     os.makedirs(path, exist_ok=True)
 
+
+
+
+# ------------------------------------------------------------------
+# Filename sanitizers (Windows-safe)
+# ------------------------------------------------------------------
+
+_INVALID_FILENAME_CHARS = set('<>:"/\\|?*')
+
+def _sanitize_stem(stem: str, fallback: str = "output") -> str:
+    """Return a filesystem-safe filename stem (no extension)."""
+    try:
+        s = str(stem)
+    except Exception:
+        s = fallback
+    s = s.strip().replace(" ", "_")
+    # Replace control chars and Windows-forbidden characters.
+    out = []
+    for ch in s:
+        o = ord(ch)
+        if o < 32 or ch in _INVALID_FILENAME_CHARS:
+            out.append("_")
+        else:
+            out.append(ch)
+    s = "".join(out)
+    s = re.sub(r"_+", "_", s).strip(" ._")
+    if not s:
+        s = fallback
+    # Keep it reasonably short to avoid path length issues.
+    if len(s) > 120:
+        s = s[:120].rstrip(" ._")
+        if not s:
+            s = fallback
+    return s
+
+def _sanitize_filename(name: str, fallback: str = "output.mp4") -> str:
+    """Return a filesystem-safe filename (keeps extension if present)."""
+    try:
+        n = str(name)
+    except Exception:
+        return fallback
+    n = n.strip()
+    stem, ext = os.path.splitext(n)
+    safe_stem = _sanitize_stem(stem, fallback=os.path.splitext(fallback)[0] or "output")
+    safe_ext = ext
+    # If extension has forbidden chars, drop it.
+    if any((ch in _INVALID_FILENAME_CHARS or ord(ch) < 32) for ch in safe_ext):
+        safe_ext = ""
+    out = safe_stem + safe_ext
+    # Avoid empty result
+    if not out or out.strip(" ._") == "":
+        out = fallback
+    return out
 
 
 def _load_clip_presets() -> List[Tuple[str, str, str]]:
@@ -395,9 +504,9 @@ class TimelineSegment:
     cine_freeze: bool = False
     cine_stutter: bool = False
     cine_reverse: bool = False
-    # Screen tear (vertical 3-slice)
+    # Prism whip (horizontal drift)
     cine_tear_v: bool = False
-    # Screen tear (horizontal 3-slice)
+    # Prism whip (vertical drift)
     cine_tear_h: bool = False
     # Speedup hits (play the source forward/backwards faster and repeat if needed)
     cine_speedup_forward: bool = False
@@ -409,6 +518,9 @@ class TimelineSegment:
     cine_freeze_zoom: float = 0.0
     cine_tear_v_strength: float = 0.0
     cine_tear_h_strength: float = 0.0
+    # Color-cycle glitch (cinematic)
+    cine_color_cycle: bool = False
+    cine_color_cycle_speed_ms: int = 400
     cine_stutter_repeats: int = 0
     cine_reverse_len: float = 0.0
     cine_reverse_window: float = 0.0
@@ -458,6 +570,8 @@ class TimelineSegment:
     impact_fire_gold_intensity: float = 0.0
     impact_fire_multi_intensity: float = 0.0
     impact_color_cycle_speed: float = 0.0
+    # Timed strobe: list of offsets (seconds within this segment) where Flash strobe should fire.
+    strobe_on_time_offsets: List[float] = field(default_factory=list)
     # Absolute position on the music timeline (seconds)
     timeline_start: float = 0.0
     timeline_end: float = 0.0
@@ -474,6 +588,174 @@ class MusicAnalysisResult:
     beats: List[Beat]
     sections: List[Section]
     duration: float
+
+
+
+
+# --------------------------- queue/headless helpers ------------------------
+
+def _analysis_to_dict(a: "MusicAnalysisResult") -> dict:
+    try:
+        from dataclasses import asdict
+        return asdict(a)
+    except Exception:
+        # Fallback: best-effort manual
+        return {
+            "beats": [getattr(b, "__dict__", {}) for b in (getattr(a, "beats", []) or [])],
+            "sections": [getattr(s, "__dict__", {}) for s in (getattr(a, "sections", []) or [])],
+            "duration": float(getattr(a, "duration", 0.0) or 0.0),
+        }
+
+def _analysis_from_dict(d: dict) -> "MusicAnalysisResult":
+    beats = [Beat(**b) for b in (d.get("beats") or [])]
+    sections = [Section(**s) for s in (d.get("sections") or [])]
+    return MusicAnalysisResult(beats=beats, sections=sections, duration=float(d.get("duration") or 0.0))
+
+def _segments_to_list(segments: list) -> list:
+    try:
+        from dataclasses import asdict
+        return [asdict(s) for s in (segments or [])]
+    except Exception:
+        out = []
+        for s in (segments or []):
+            try:
+                out.append(dict(getattr(s, "__dict__", {})))
+            except Exception:
+                pass
+        return out
+
+def _segments_from_list(items: list) -> list:
+    out = []
+    for d in (items or []):
+        try:
+            out.append(TimelineSegment(**d))
+        except Exception:
+            try:
+                # tolerate missing keys
+                out.append(TimelineSegment(
+                    clip_path=str(d.get("clip_path","")),
+                    clip_start=float(d.get("clip_start") or 0.0),
+                    duration=float(d.get("duration") or 0.0),
+                    effect=str(d.get("effect") or "none"),
+                    energy_class=str(d.get("energy_class") or "mid"),
+                    transition=str(d.get("transition") or "none"),
+                    slow_factor=float(d.get("slow_factor") or 1.0),
+                ))
+            except Exception:
+                pass
+    return out
+
+def run_queue_payload(payload_path: str) -> int:
+    """Headless entrypoint used by queued jobs.
+
+    This is intentionally dependency-light: it reuses RenderWorker's pipeline
+    but swaps Qt signals for simple stdout progress lines so worker.tools_ffmpeg
+    can parse percentages.
+    """
+    try:
+        with open(payload_path, "r", encoding="utf-8") as f:
+            payload = json.load(f)
+    except Exception as e:
+        try:
+            print(f"ERROR: failed to read payload: {e}")
+        except Exception:
+            pass
+        return 2
+
+    try:
+        analysis = _analysis_from_dict(payload.get("analysis") or {})
+        segments = _segments_from_list(payload.get("segments") or [])
+        audio_path = str(payload.get("audio_path") or "")
+        output_dir = str(payload.get("output_dir") or "")
+        ffmpeg = str(payload.get("ffmpeg") or ffmpeg_path())
+        ffprobe = str(payload.get("ffprobe") or ffprobe_path())
+        tr = payload.get("target_resolution")
+        target_resolution = None
+        if isinstance(tr, (list, tuple)) and len(tr) == 2:
+            try:
+                target_resolution = (int(tr[0]), int(tr[1]))
+            except Exception:
+                target_resolution = None
+        fit_mode = int(payload.get("fit_mode") or 0)
+        transition_mode = int(payload.get("transition_mode") or 0)
+        intro_fade = bool(payload.get("intro_fade", True))
+        outro_fade = bool(payload.get("outro_fade", True))
+        use_visual_overlay = bool(payload.get("use_visual_overlay", False))
+        visual_strategy = int(payload.get("visual_strategy") or 0)
+        visual_section_overrides = payload.get("visual_section_overrides") or None
+        visual_overlay_opacity = float(payload.get("visual_overlay_opacity") or 0.25)
+        out_name_override = payload.get("out_name_override") or None
+        strobe_on_time_times = payload.get("strobe_on_time_times") or None
+        try:
+            strobe_flash_strength = float(payload.get("strobe_flash_strength") or 0.0)
+        except Exception:
+            strobe_flash_strength = 0.0
+        try:
+            strobe_flash_speed_ms = int(payload.get("strobe_flash_speed_ms") or 250)
+        except Exception:
+            strobe_flash_speed_ms = 250
+    except Exception as e:
+        try:
+            print(f"ERROR: invalid payload fields: {e}")
+        except Exception:
+            pass
+        return 3
+
+    # Create worker and monkeypatch progress signal to stdout
+    rw = RenderWorker(
+        audio_path=audio_path,
+        output_dir=output_dir,
+        analysis=analysis,
+        segments=segments,
+        ffmpeg=ffmpeg,
+        ffprobe=ffprobe,
+        target_resolution=target_resolution,
+        fit_mode=fit_mode,
+        transition_mode=transition_mode,
+        intro_fade=intro_fade,
+        outro_fade=outro_fade,
+        use_visual_overlay=use_visual_overlay,
+        visual_strategy=visual_strategy,
+        visual_section_overrides=visual_section_overrides,
+        visual_overlay_opacity=visual_overlay_opacity,
+        out_name_override=out_name_override,
+        strobe_on_time_times=strobe_on_time_times,
+        strobe_flash_strength=strobe_flash_strength,
+        strobe_flash_speed_ms=strobe_flash_speed_ms,
+    )
+
+    class _DummySig:
+        def emit(self, pct, msg=""):
+            try:
+                ip = int(pct)
+            except Exception:
+                ip = pct
+            try:
+                print(f"{ip}% {msg}".strip())
+            except Exception:
+                try:
+                    print(f"{ip}%")
+                except Exception:
+                    pass
+
+    try:
+        rw.progress = _DummySig()
+    except Exception:
+        pass
+
+    try:
+        rw._run_impl()
+        try:
+            print("100% Done.")
+        except Exception:
+            pass
+        return 0
+    except Exception as e:
+        try:
+            print(f"ERROR: {e}")
+        except Exception:
+            pass
+        return 1
 
 
 # --------------------------- music analysis --------------------------------
@@ -770,6 +1052,8 @@ def build_timeline(
     cine_tear_v_strength: float = 0.7,
     cine_tear_h: bool = False,
     cine_tear_h_strength: float = 0.7,
+    cine_color_cycle: bool = False,
+    cine_color_cycle_speed_ms: int = 400,
     cine_reverse: bool = False,
     cine_speedup_forward: bool = False,
     cine_speedup_forward_factor: float = 1.5,
@@ -828,6 +1112,8 @@ def build_timeline(
     impact_fire_gold_intensity: float = 0.75,
     impact_fire_multi_intensity: float = 0.8,
     impact_color_cycle_speed: float = 0.7,
+    strobe_on_time: bool = False,
+    strobe_on_time_times: Optional[List[float]] = None,
     image_sources: Optional[List[ClipSource]] = None,
     section_overrides: Optional[Dict[int, ClipSource]] = None,
     image_segment_interval: int = 0,
@@ -987,6 +1273,9 @@ def build_timeline(
         if cine_tear_h:
             enabled_effects.append("tear_h")
 
+        if cine_color_cycle:
+            enabled_effects.append("color_cycle")
+
         if cine_stutter:
             enabled_effects.append("stutter")
         if cine_reverse:
@@ -1049,11 +1338,10 @@ def build_timeline(
                 if effect_name == "freeze":
                     seg.cine_freeze = True
                     seg.cine_freeze_len = float(max(0.10, min(1.0, cine_freeze_len)))
-                    # Clamp zoom factor to a safe 0.0–0.5 range (0–50%% punch-in).
+                    # Slider stays the same (0.0–0.5), but now drives the Shutter-pop intensity.
                     seg.cine_freeze_zoom = float(max(0.0, min(0.5, cine_freeze_zoom)))
-                    # Optionally clamp the logical segment duration to the freeze window
-                    # so the pacing stays snappy.
-                    seg.duration = min(seg.duration, seg.cine_freeze_len)
+                    # Random left/right chroma direction so repeats feel less samey.
+                    seg.cine_freeze_dir = random.choice([-1, 1])
                 elif effect_name == "stutter":
                     seg.cine_stutter = True
                     seg.cine_stutter_repeats = int(max(2, min(5, cine_stutter_repeats)))
@@ -1083,6 +1371,16 @@ def build_timeline(
                     # Per-event direction (top slice goes up OR down, bottom slice mirrors)
                     # We store it on the segment; no dataclass change required.
                     seg.cine_tear_h_dir = random.choice([-1, 1])
+                elif effect_name == "color_cycle":
+                    seg.cine_color_cycle = True
+                    try:
+                        ms = int(cine_color_cycle_speed_ms)
+                    except Exception:
+                        ms = 400
+                    ms = max(100, min(1000, ms))
+                    # Snap to 50ms steps like the other speed sliders.
+                    ms = int(round(ms / 50.0) * 50)
+                    seg.cine_color_cycle_speed_ms = ms
                 elif effect_name == "reverse":
                     seg.cine_reverse = True
                     seg.cine_reverse_len = float(max(0.10, min(1.5, cine_reverse_len)))
@@ -1569,7 +1867,7 @@ def build_timeline(
     allowed_modes: List[int] = []
     if transition_modes_enabled:
         for m in transition_modes_enabled:
-            if 0 <= m <= 10 and m not in allowed_modes:
+            if 0 <= m <= 14 and m not in allowed_modes:
                 allowed_modes.append(m)
     if not allowed_modes:
         allowed_modes.append(transition_mode)
@@ -1888,7 +2186,7 @@ def build_timeline(
         # Transition style mapping (must match the UI order in "Transitions" + "Manage transitions")
         # 0  Soft film dissolves           -> real between-clip dissolve (stitched later)
         # 1  Hard cuts                     -> no transition
-        # 2  Scale punch (zoom)            -> in-clip zoom pulse
+        # 2  Scale punch (zoom)            -> real xfade punch (stitched later)
         # 3  Shimmer blur (shiny)           -> real blurred crossfade (stitched later)
 
         # 4  Iris reveal (circle)          -> real stitched iris transition (xfade)
@@ -1898,6 +2196,10 @@ def build_timeline(
         # 8  Directional push (slide)      -> real between-clip push/slide (stitched later)
         # 9  Wipe                          -> real between-clip wipe (stitched later)
         # 10 Smooth zoom crossfade         -> in-clip smooth zoom
+        # 11 Curtain open (doors)         -> real between-clip curtain/doors open (stitched later)
+        # 12 Pixelize                      -> real between-clip pixelize (stitched later)
+        # 13 Distance (liquid blend)          -> real xfade distance (stitched later)
+        # 14 Wind smears                    -> real xfade wind smears (stitched later)
         if mode_for_segment == 1:  # Hard cuts
             transition = "none"
 
@@ -1905,7 +2207,7 @@ def build_timeline(
             transition = "t_exposure_dissolve"
 
         elif mode_for_segment == 2:  # Scale punch (zoom)
-            transition = "t_smooth_zoom"
+            transition = "t_scale_punch"
 
         elif mode_for_segment == 3:  # Shimmer blur (shiny)
             transition = "t_shimmer_blur"
@@ -1931,6 +2233,18 @@ def build_timeline(
 
         elif mode_for_segment == 10:  # Smooth zoom crossfade
             transition = "t_smooth_zoom"
+
+        elif mode_for_segment == 11:  # Curtain open (doors)
+            transition = "t_curtain_open"
+
+        elif mode_for_segment == 12:  # Pixelize
+            transition = "t_pixelize"
+
+        elif mode_for_segment == 13:  # Distance (liquid blend)
+            transition = "t_distance"
+
+        elif mode_for_segment == 14:  # Wind smears
+            transition = "t_wind_smears"
 
         else:
             transition = "none"
@@ -2058,16 +2372,40 @@ def build_timeline(
                 else:
                     mode_for_segment = transition_mode
 
-                if mode_for_segment == 1:
+                if mode_for_segment == 1:  # Hard cuts
                     transition = "none"
-                elif mode_for_segment == 2:
-                    if energy == "high" and random.random() < 0.4:
+                elif mode_for_segment == 0:  # Soft film dissolves (stitched later)
+                    transition = "t_exposure_dissolve"
+                elif mode_for_segment == 2:  # Scale punch (zoom)
+                    # Keep a tiny chance of a flashcut on high energy to avoid "too smooth" late filler.
+                    if energy == "high" and random.random() < 0.22:
                         transition = "flashcut"
                     else:
-                        transition = "none"
+                        transition = "t_scale_punch"
                 elif mode_for_segment == 3:  # Shimmer blur (shiny)
-                    # Shimmer blur (shiny)
-                    transition = "none"
+                    transition = "t_shimmer_blur"
+                elif mode_for_segment == 4:  # Iris reveal (circle)
+                    transition = "t_iris"
+                elif mode_for_segment == 5:  # Motion blur whip-cuts
+                    transition = "t_motion_blur"
+                elif mode_for_segment == 6:  # Slit-scan smear push (stitched later)
+                    transition = "t_slitscan_push"
+                elif mode_for_segment == 7:  # Radial burst reveal (stitched later)
+                    transition = "t_radial_burst"
+                elif mode_for_segment == 8:  # Directional push (stitched later)
+                    transition = "t_push"
+                elif mode_for_segment == 9:  # Wipe (stitched later)
+                    transition = "t_wipe"
+                elif mode_for_segment == 10:  # Smooth zoom crossfade
+                    transition = "t_smooth_zoom"
+                elif mode_for_segment == 11:  # Curtain open (stitched later)
+                    transition = "t_curtain_open"
+                elif mode_for_segment == 12:  # Pixelize (stitched later)
+                    transition = "t_pixelize"
+                elif mode_for_segment == 13:  # Distance (stitched later)
+                    transition = "t_distance"
+                elif mode_for_segment == 14:  # Wind smears (stitched later)
+                    transition = "t_wind_smears"
                 else:
                     transition = "none"
                 seg = TimelineSegment(
@@ -2267,6 +2605,72 @@ def build_timeline(
             if lbl == "intro":
                 _reset_fx_on_segment(seg)
 
+    # Timed strobe: map user timestamps to segment-local offsets so the Flash strobe can fire on time.
+    if strobe_on_time and strobe_on_time_times and segments:
+        times: List[float] = []
+        for v in strobe_on_time_times:
+            try:
+                fv = float(v)
+            except Exception:
+                continue
+            if fv < 0.0:
+                continue
+            times.append(fv)
+        # De-dup + sort
+        uniq: List[float] = []
+        for t in sorted(times):
+            if not uniq or abs(uniq[-1] - t) >= 0.01:
+                uniq.append(t)
+
+        for t in uniq:
+            # Find the segment that covers this timestamp (output timeline seconds).
+            best_idx: Optional[int] = None
+            for i, seg in enumerate(segments):
+                try:
+                    st = float(getattr(seg, "timeline_start", 0.0) or 0.0)
+                    en = float(getattr(seg, "timeline_end", st) or st)
+                except Exception:
+                    continue
+                if st <= t < en or (i == len(segments) - 1 and st <= t <= en):
+                    best_idx = i
+                    break
+            if best_idx is None:
+                continue
+
+            seg = segments[best_idx]
+            try:
+                st = float(getattr(seg, "timeline_start", 0.0) or 0.0)
+                en = float(getattr(seg, "timeline_end", st) or st)
+            except Exception:
+                st, en = 0.0, 0.0
+            seg_len = max(0.0, en - st)
+            if seg_len <= 0.0:
+                continue
+
+            off = max(0.0, min(seg_len, t - st))
+            try:
+                seg.strobe_on_time_offsets.append(off)
+            except Exception:
+                try:
+                    setattr(seg, "strobe_on_time_offsets", [off])
+                except Exception:
+                    pass
+
+            # Reuse the Flash strobe settings (strength/speed) even if the break-impact toggles are off.
+            try:
+                cur = float(getattr(seg, "impact_flash_strength", 0.0) or 0.0)
+            except Exception:
+                cur = 0.0
+            try:
+                setattr(seg, "impact_flash_strength", max(cur, float(impact_flash_strength)))
+            except Exception:
+                pass
+            try:
+                setattr(seg, "impact_flash_speed_ms", int(impact_flash_speed_ms))
+            except Exception:
+                pass
+
+
     return segments
 
 
@@ -2441,6 +2845,10 @@ class RenderWorker(QThread):
         visual_strategy: int = 0,
         visual_section_overrides: Optional[Dict[str, Optional[str]]] = None,
         visual_overlay_opacity: float = 0.25,
+        out_name_override: Optional[str] = None,
+        strobe_on_time_times: Optional[List[float]] = None,
+        strobe_flash_strength: float = 0.0,
+        strobe_flash_speed_ms: int = 250,
         parent=None,
     ) -> None:
         super().__init__(parent)
@@ -2467,6 +2875,22 @@ class RenderWorker(QThread):
             self.visual_overlay_opacity = float(visual_overlay_opacity)
         except Exception:
             self.visual_overlay_opacity = 0.25
+        self.out_name_override = out_name_override
+
+        # Timed strobe (global): keep these on the worker so we can apply the strobe
+        # after any duration correction / overlays, guaranteeing accurate timestamps.
+        try:
+            self.strobe_on_time_times = list(strobe_on_time_times) if strobe_on_time_times else []
+        except Exception:
+            self.strobe_on_time_times = []
+        try:
+            self.strobe_flash_strength = float(strobe_flash_strength or 0.0)
+        except Exception:
+            self.strobe_flash_strength = 0.0
+        try:
+            self.strobe_flash_speed_ms = int(strobe_flash_speed_ms or 250)
+        except Exception:
+            self.strobe_flash_speed_ms = 250
 
 
     def run(self) -> None:
@@ -2499,13 +2923,18 @@ class RenderWorker(QThread):
             # - extend that segment by exactly the overlap at render time (prevents end-freeze padding)
             # - reuse the same duration during stitching (stable timing)
             dissolve_ids = {"t_exposure_dissolve", "t_luma_fade"}
+            scale_punch_ids = {"t_scale_punch"}
             push_ids = {"t_push"}
             slitscan_ids = {"t_slitscan_push"}
             wipe_ids = {"t_wipe"}
+            curtain_ids = {"t_curtain_open"}
+            pixelize_ids = {"t_pixelize"}
             iris_ids = {"t_iris"}
             radial_ids = {"t_radial_burst"}
             shimmer_ids = {"t_shimmer_blur"}
-            stitch_ids = dissolve_ids | push_ids | slitscan_ids | wipe_ids | iris_ids | radial_ids | shimmer_ids
+            distance_ids = {"t_distance"}
+            wind_ids = {"t_wind_smears"}
+            stitch_ids = dissolve_ids | push_ids | slitscan_ids | wipe_ids | curtain_ids | pixelize_ids | iris_ids | radial_ids | shimmer_ids | distance_ids | wind_ids | scale_punch_ids
 
             def _seg_expected_out_len(s: TimelineSegment) -> float:
                 try:
@@ -2657,37 +3086,62 @@ class RenderWorker(QThread):
                     # Mild motion blur via temporal blend
                     vf_parts.append("tblend=all_mode=average,framestep=1")
 
-                # Cinematic one-off effects
+                cine_start = len(vf_parts)
+                # Cinematic one-off effects                # Cinematic one-off effects
                 if getattr(seg, "cine_freeze", False):
-                    # Freeze the first frame and gently zoom in over the freeze duration.
+                    # Shutter-pop: quick punch + glossy smear (no speed change).
+                    # (This replaces the old freeze-frame effect; it never pauses or slows time.)
 
-                    zoom = float(getattr(seg, "cine_freeze_zoom", 0.0) or 0.0)
                     try:
-                        freeze_len = float(getattr(seg, "cine_freeze_len", 0.0) or 0.0)
+                        punch = float(getattr(seg, "cine_freeze_zoom", 0.0) or 0.0)
                     except Exception:
-                        freeze_len = 0.0
-                    if freeze_len <= 0.0:
-                        # Fallback: use the segment duration or a small default
-                        try:
-                            freeze_len = float(getattr(seg, "duration", 0.0) or 0.5)
-                        except Exception:
-                            freeze_len = 0.5
+                        punch = 0.0
 
-                    # 1) Freeze: repeat a single frame for the whole (short) segment.
-                    vf_parts.append("loop=loop=-1:size=1:start=0")
+                    # Map the old "zoom %" slider (stored as 0.0–0.5) into a 0.0–1.0 intensity.
+                    intensity = max(0.0, min(1.0, punch / 0.30 if 0.30 > 0 else punch))
 
-                    # 2) Optional zoom: animate from 1.0x to (1.0 + zoom) over freeze_len.
-                    if zoom > 0.0:
-                        # Clamp to avoid div-by-zero and excessively long ramps.
-                        dur = max(0.05, min(5.0, freeze_len))
-                        # Scale factor grows with time t in [0, dur], then stays at max.
-                        z_expr = f"1+{zoom:.3f}*min(t/{dur:.3f},1)"
+                    try:
+                        hit_d = float(getattr(seg, "cine_freeze_len", 0.0) or 0.0)
+                    except Exception:
+                        hit_d = 0.0
+                    if hit_d <= 0.0:
+                        hit_d = 0.35
+                    hit_d = max(0.08, min(1.0, hit_d))
 
-                        vf_parts.append(
-                            f"scale=iw*({z_expr}):ih*({z_expr}):eval=frame,"
-                            f"crop=iw/({z_expr}):ih/({z_expr})"
-                        )
+                    # Smooth envelope: 0 -> 1 -> 0 over the hit window.
+                    env_expr = f"if(lt(t,{hit_d:.3f}),sin(PI*t/{hit_d:.3f}),0)"
+                    z_amp = max(0.02, min(0.18, 0.02 + 0.16 * intensity))
+                    z_expr = f"(1+{z_amp:.4f}*({env_expr}))"
+
+                    try:
+                        dir_sign = int(getattr(seg, "cine_freeze_dir", 1) or 1)
+                    except Exception:
+                        dir_sign = 1
+                    dir_sign = -1 if dir_sign < 0 else 1
+
+                    # Pixel-level chroma offset.
+                    px = int(round(2 + 8 * intensity)) * dir_sign
+                    px = max(-18, min(18, px))
+
+                    alpha = max(0.35, min(0.88, 0.48 + 0.40 * intensity))
+                    con = 1.02 + 0.16 * intensity
+                    sat = 1.00 + 0.10 * intensity
+                    sharp = 0.25 + 0.70 * intensity
+
+                    vf_parts.append(
+                        "split=2[psrc][pbase];"
+                        f"[psrc]tmix=frames=5:weights='1 0.90 0.72 0.52 0.35',"
+                        f"rgbashift=rh={px}:bh={-px}:edge=smear,"
+                        f"eq=contrast={con:.3f}:saturation={sat:.3f},"
+                        f"scale=w='iw*({z_expr})':h='ih*({z_expr})':eval=frame,"
+                        f"crop=w='iw/({z_expr})':h='ih/({z_expr})',"
+                        f"unsharp=5:5:{sharp:.3f}:5:5:0,"
+                        f"format=rgba,colorchannelmixer=aa={alpha:.3f}[pfx];"
+                        f"[pbase][pfx]overlay=shortest=1:enable='lt(t,{hit_d:.3f})',format=yuv420p"
+                    )
+
                 if getattr(seg, "cine_stutter", False):
+
                     # Stutter / triple-frame style slice: drop interim frames so motion
                     # feels jittery. We keep duration the same, only the cadence changes.
                     repeats = int(getattr(seg, "cine_stutter_repeats", 3) or 3)
@@ -2696,15 +3150,14 @@ class RenderWorker(QThread):
                     vf_parts.append(f"framestep={step}")
 
                 if getattr(seg, "cine_tear_v", False):
-                    # Vertical screen tear (3-slice): briefly offset left/right slices.
+                    # Prism whip (horizontal drift): a short chroma-smeared whip + micro-zoom.
+                    # (Replaces the old 3-slice "screen tear" which looked harsh.)
                     try:
                         s = float(getattr(seg, "cine_tear_v_strength", 0.7) or 0.7)
                     except Exception:
                         s = 0.7
                     s = max(0.1, min(1.0, s))
-                    tear_d = 0.75
-                    # Fraction of width to shift slices during the tear.
-                    shift_frac = 0.04 + 0.08 * s
+
                     # Direction picked per event in _apply_cinematic_effects
                     try:
                         dir_sign = int(getattr(seg, "cine_tear_v_dir", 1) or 1)
@@ -2712,32 +3165,51 @@ class RenderWorker(QThread):
                         dir_sign = 1
                     dir_sign = -1 if dir_sign < 0 else 1
 
-                    signed_shift = shift_frac * dir_sign
+                    # Short hit window (seconds)
+                    hit_d = 0.22 + 0.28 * s
 
-                    # We keep this as a single filtergraph chunk so it can live inside vf_parts.
-                    # The graph:
-                    #   1) split into 3
-                    #   2) crop each third with a tiny time-gated x-offset
-                    #   3) hstack back into a full frame
+                    # Envelope (0 -> 1 -> 0) for the hit.
+                    env_expr = f"if(lt(t,{hit_d:.3f}),sin(PI*t/{hit_d:.3f}),0)"
+
+                    # Micro zoom + drift
+                    z_amp = 0.030 + 0.070 * s
+                    z_expr = f"(1+{z_amp:.4f}*({env_expr}))"
+                    drift_x = (0.012 + 0.030 * s) * dir_sign
+                    drift_y = (0.004 + 0.010 * s) * (-dir_sign)
+
+                    x_expr = f"iw*{drift_x:.5f}*({env_expr})"
+                    y_expr = f"ih*{drift_y:.5f}*({env_expr})"
+
+                    # Chromatic offset (pixels)
+                    try:
+                        px = int(round(2 + 7 * s)) * dir_sign
+                    except Exception:
+                        px = 5 * dir_sign
+                    px = max(-18, min(18, px))
+
+                    alpha = max(0.35, min(0.95, 0.55 + 0.35 * s))
+
                     vf_parts.append(
-                        "split=3[a][b][c];"
-                        f"[a]crop=w=iw/3:h=ih:x='0+iw*{signed_shift:.3f}*between(t,0,{tear_d:.3f})':y=0[a0];"
-                        f"[b]crop=w=iw/3:h=ih:x='iw/3':y=0[b0];"
-                        f"[c]crop=w=iw/3:h=ih:x='2*iw/3-iw*{signed_shift:.3f}*between(t,0,{tear_d:.3f})':y=0[c0];"
-                        "[a0][b0][c0]hstack=inputs=3"
+                        "split=2[tvsrc][tvbase];"
+                        f"[tvsrc]tmix=frames=3:weights='1 2 1',"
+                        f"rgbashift=rh={px}:bh={-px}:edge=smear,"
+                        f"eq=contrast={1.00 + 0.18*s:.3f}:saturation={1.00 + 0.10*s:.3f},"
+                        f"scale=w='iw*({z_expr})':h='ih*({z_expr})':eval=frame,"
+                        f"crop=w='iw/({z_expr})':h='ih/({z_expr})':x='{x_expr}':y='{y_expr}',"
+                        f"unsharp=5:5:{0.35 + 0.55*s:.3f}:5:5:0,"
+                        f"format=rgba,colorchannelmixer=aa={alpha:.3f}[tvfx];"
+                        f"[tvbase][tvfx]overlay=shortest=1:enable='lt(t,{hit_d:.3f})',format=yuv420p"
                     )
 
-                    
+
                 if getattr(seg, "cine_tear_h", False):
-                    # Horizontal screen tear (3-slice): briefly offset up/down slices.
+                    # Prism whip (vertical drift): same as above but drifting vertically.
                     try:
                         s = float(getattr(seg, "cine_tear_h_strength", 0.7) or 0.7)
                     except Exception:
                         s = 0.7
                     s = max(0.1, min(1.0, s))
-                    tear_d = 0.50
-                    # Fraction of height to shift slices during the tear.
-                    shift_frac = 0.05 + 0.10 * s
+
                     # Direction picked per event in _apply_cinematic_effects
                     try:
                         dir_sign = int(getattr(seg, "cine_tear_h_dir", 1) or 1)
@@ -2745,19 +3217,52 @@ class RenderWorker(QThread):
                         dir_sign = 1
                     dir_sign = -1 if dir_sign < 0 else 1
 
-                    signed_shift = shift_frac * dir_sign
+                    hit_d = 0.18 + 0.26 * s
+                    env_expr = f"if(lt(t,{hit_d:.3f}),sin(PI*t/{hit_d:.3f}),0)"
 
-                    # The graph:
-                    #   1) split into 3
-                    #   2) crop each third with a tiny time-gated y-offset
-                    #   3) vstack back into a full frame
+                    z_amp = 0.028 + 0.060 * s
+                    z_expr = f"(1+{z_amp:.4f}*({env_expr}))"
+
+                    drift_x = (0.004 + 0.012 * s) * (dir_sign)
+                    drift_y = (0.014 + 0.034 * s) * (dir_sign)
+
+                    x_expr = f"iw*{drift_x:.5f}*({env_expr})"
+                    y_expr = f"ih*{drift_y:.5f}*({env_expr})"
+
+                    try:
+                        py = int(round(2 + 7 * s)) * dir_sign
+                    except Exception:
+                        py = 5 * dir_sign
+                    py = max(-18, min(18, py))
+
+                    alpha = max(0.35, min(0.95, 0.55 + 0.35 * s))
+
                     vf_parts.append(
-                        "split=3[a][b][c];"
-                        f"[a]crop=w=iw:h=ih/3:x=0:y='0+ih*{signed_shift:.3f}*between(t,0,{tear_d:.3f})'[a0];"
-                        f"[b]crop=w=iw:h=ih/3:x=0:y='ih/3'[b0];"
-                        f"[c]crop=w=iw:h=ih/3:x=0:y='2*ih/3-ih*{signed_shift:.3f}*between(t,0,{tear_d:.3f})'[c0];"
-                        "[a0][b0][c0]vstack=inputs=3"
+                        "split=2[thsrc][thbase];"
+                        f"[thsrc]tmix=frames=3:weights='1 2 1',"
+                        f"rgbashift=rv={py}:bv={-py}:edge=smear,"
+                        f"eq=contrast={1.00 + 0.18*s:.3f}:saturation={1.00 + 0.10*s:.3f},"
+                        f"scale=w='iw*({z_expr})':h='ih*({z_expr})':eval=frame,"
+                        f"crop=w='iw/({z_expr})':h='ih/({z_expr})':x='{x_expr}':y='{y_expr}',"
+                        f"unsharp=5:5:{0.35 + 0.55*s:.3f}:5:5:0,"
+                        f"format=rgba,colorchannelmixer=aa={alpha:.3f}[thfx];"
+                        f"[thbase][thfx]overlay=shortest=1:enable='lt(t,{hit_d:.3f})',format=yuv420p"
                     )
+
+                if getattr(seg, "cine_color_cycle", False):
+                    # Color-cycle glitch (cinematic): full-spectrum hue rotation.
+                    # Speed is interpreted as milliseconds per full 360° cycle.
+                    try:
+                        ms = int(getattr(seg, "cine_color_cycle_speed_ms", 400) or 400)
+                    except Exception:
+                        ms = 400
+                    ms = max(100, min(1000, ms))
+                    # Convert ms-per-cycle into degrees-per-second.
+                    rate = 360000.0 / float(ms)
+                    # Use mod() to keep hue stable on all ffmpeg builds.
+                    vf_parts.append(f"hue=h='mod(t*{rate:.3f},360)':s=1.35")
+                    vf_parts.append("eq=contrast=1.06:saturation=1.18")
+
 
                 if getattr(seg, "cine_reverse", False):
                     # Reverse-bounce: optionally repeat a short reversed window
@@ -3009,6 +3514,10 @@ class RenderWorker(QThread):
                             f"crop=iw/{pan_zoom:.3f}:ih/{pan_zoom:.3f}:{x_expr}:{y_expr}"
                         )
 
+                cine_end = len(vf_parts)
+
+                impact_start = len(vf_parts)
+
                 # Break impact FX (first beat after a break)
                 if getattr(seg, "is_break_impact", False):
                     # Flash strobe: short white flashes at the very start (club strobe style).
@@ -3173,6 +3682,70 @@ class RenderWorker(QThread):
                             "eq=contrast=1.06:saturation=1.18"
                         )
 
+                # Timed strobe: user-specified timestamps (within this segment).
+                strobe_offsets = getattr(seg, "strobe_on_time_offsets", None) if not getattr(self, "strobe_on_time_times", None) else None
+                if strobe_offsets:
+                    try:
+                        flash_s = float(getattr(seg, "impact_flash_strength", 0.0) or 0.0)
+                    except Exception:
+                        flash_s = 0.0
+                    if flash_s > 0.0:
+                        s = max(0.1, min(1.0, flash_s))
+                        try:
+                            speed_ms = int(getattr(seg, "impact_flash_speed_ms", 250) or 250)
+                        except Exception:
+                            speed_ms = 250
+                        speed_ms = max(100, min(1000, speed_ms))
+                        period_s = speed_ms / 1000.0
+                        pulse_s = max(0.02, min(0.08, period_s * 0.35))
+
+                        # Use output-time segment length when available, so offsets stay correct even with slow motion.
+                        try:
+                            st = float(getattr(seg, "timeline_start", 0.0) or 0.0)
+                            en = float(getattr(seg, "timeline_end", st) or st)
+                            seg_len = max(0.0, en - st)
+                        except Exception:
+                            seg_len = 0.0
+                        if seg_len <= 0.0:
+                            try:
+                                seg_len = float(getattr(seg, "duration", 0.0) or 0.0)
+                            except Exception:
+                                seg_len = 0.0
+                        seg_len = max(0.0, seg_len)
+
+                        flash_a = 0.30 + 0.55 * s  # 0.30–0.85
+
+                        # Add one drawbox strobe per timestamp (offset).
+                        try:
+                            offs = sorted(set([float(x) for x in strobe_offsets]))
+                        except Exception:
+                            offs = []
+                        for off in offs:
+                            try:
+                                off_f = float(off)
+                            except Exception:
+                                continue
+                            if off_f < 0.0:
+                                continue
+                            if seg_len > 0.0:
+                                off_f = max(0.0, min(seg_len, off_f))
+                            # Strobe window: up to 0.9s starting from the offset (clamped to segment).
+                            max_window = 0.9
+                            if seg_len > 0.0:
+                                max_window = min(0.9, max(0.02, seg_len - off_f))
+                            end_t = off_f + max_window
+                            if seg_len > 0.0:
+                                end_t = min(seg_len, end_t)
+
+                            vf_parts.append(
+                                "drawbox=x=0:y=0:w=iw:h=ih:"
+                                f"color=white@{flash_a:.2f}:t=fill:"
+                                f"enable='between(t,{off_f:.3f},{end_t:.3f})*lt(mod(t-{off_f:.3f},{period_s:.3f}),{pulse_s:.3f})'"
+                            )
+
+
+                impact_end = len(vf_parts)
+
                 # Transitions using a small effect library (all short and fade-safe)
                 if seg.transition == "flashcut":
                     # White flash: short brightness pop at the start (~30–60ms).
@@ -3243,7 +3816,7 @@ class RenderWorker(QThread):
                     # Directional push / slit-scan smear push are real between-clip transitions.
                     # It is applied later during stitching, so we do nothing here.
                     pass
-                elif seg.transition in ("t_luma_fade", "t_exposure_dissolve", "t_wipe"):
+                elif seg.transition in ("t_luma_fade", "t_exposure_dissolve", "t_scale_punch", "t_wipe", "t_curtain_open", "t_pixelize", "t_distance", "t_wind_smears"):
                     # Wipe / exposure dissolve are real between-clip transitions.
                     # It is applied later during the stitching step so we do NOT fade to black here.
                     pass
@@ -3322,8 +3895,46 @@ class RenderWorker(QThread):
                         if base_vf_parts:
                             base_vf_parts = base_vf_parts + [f"setpts=PTS/{sf}"]
 
-                vf_arg = ",".join(vf_parts) if vf_parts else None
-                safe_vf_arg = ",".join(base_vf_parts) if base_vf_parts else None
+                def _vf_join(parts):
+                    if not parts:
+                        return None
+                    p = list(parts)
+                    # Make NVENC happy / keep stitching stable.
+                    # Only add a final format if the chain doesn't already end in yuv420p.
+                    tail = ",".join(p[-3:]) if len(p) >= 3 else ",".join(p)
+                    if "format=yuv420p" not in tail:
+                        p.append("format=yuv420p")
+                    return ",".join(p)
+
+                vf_arg = _vf_join(vf_parts)
+                safe_vf_arg = _vf_join(base_vf_parts)
+
+                vf_no_cine_arg = None
+                vf_no_impact_arg = None
+                vf_no_cine_no_impact_arg = None
+                try:
+                    if "cine_start" in locals() and "cine_end" in locals():
+                        if isinstance(cine_start, int) and isinstance(cine_end, int) and cine_end > cine_start:
+                            parts_no_cine = vf_parts[:cine_start] + vf_parts[cine_end:]
+                            vf_no_cine_arg = _vf_join(parts_no_cine)
+                except Exception:
+                    vf_no_cine_arg = None
+                try:
+                    if "impact_start" in locals() and "impact_end" in locals():
+                        if isinstance(impact_start, int) and isinstance(impact_end, int) and impact_end > impact_start:
+                            parts_no_impact = vf_parts[:impact_start] + vf_parts[impact_end:]
+                            vf_no_impact_arg = _vf_join(parts_no_impact)
+
+                            if "cine_start" in locals() and "cine_end" in locals():
+                                if isinstance(cine_start, int) and isinstance(cine_end, int) and cine_end >= cine_start:
+                                    # Impact section comes after cinematic section in this filter build.
+                                    a = vf_parts[:cine_start]
+                                    b = vf_parts[cine_end:impact_start]
+                                    c = vf_parts[impact_end:]
+                                    vf_no_cine_no_impact_arg = _vf_join(a + b + c)
+                except Exception:
+                    vf_no_impact_arg = None
+                    vf_no_cine_no_impact_arg = None
 
 
                 # Base ffmpeg command for this segment (input, trim, no audio)
@@ -3426,7 +4037,9 @@ class RenderWorker(QThread):
                         "0",
                         "-r",
                         "30",
-                        out_part,
+                        "-pix_fmt",
+                    "yuv420p",
+                    out_part,
                     ]
                     code, out = _run_ffmpeg(cmd)
                     if code != 0 or not os.path.exists(out_part):
@@ -3449,6 +4062,18 @@ class RenderWorker(QThread):
                         target_w, target_h = self.target_resolution
                     else:
                         target_w, target_h = 1920, 1080
+
+                    # Make targets stable for yuv420p / NVENC (even sizes),
+                    # and keep tile math consistent with pad/scale.
+                    try:
+                        target_w = int(target_w)
+                        target_h = int(target_h)
+                    except Exception:
+                        pass
+                    if target_w % 2:
+                        target_w += 1
+                    if target_h % 2:
+                        target_h += 1
 
                     # Compute a deterministic layout and per-tile placement that fully covers the frame.
                     cols, rows = _cine_grid_dims(screens)
@@ -3560,10 +4185,22 @@ class RenderWorker(QThread):
                             chosen_paths = [random.choice(all_video_paths) for _ in range(screens)]
 
                         # Target resolution for the grid (fall back to 1920x1080 if not specified).
-                        if self.target_resolution:
-                            target_w, target_h = self.target_resolution
-                        else:
-                            target_w, target_h = 1920, 1080
+                    if self.target_resolution:
+                        target_w, target_h = self.target_resolution
+                    else:
+                        target_w, target_h = 1920, 1080
+
+                    # Make targets stable for yuv420p / NVENC (even sizes),
+                    # and keep tile math consistent with pad/scale.
+                    try:
+                        target_w = int(target_w)
+                        target_h = int(target_h)
+                    except Exception:
+                        pass
+                    if target_w % 2:
+                        target_w += 1
+                    if target_h % 2:
+                        target_h += 1
 
                         # Compute a deterministic (cols, rows) layout that fully covers the frame.
                         cols, rows = _cine_grid_dims(screens)
@@ -3750,28 +4387,48 @@ class RenderWorker(QThread):
                     out_part,
                 ]
 
-                # First attempt: full filter chain (resolution + FX + transitions)
-                cmd = list(base_cmd)
+                                # Attempt filter chains in a safe order:
+                # 1) full chain
+                # 2) without cinematic one-offs (keeps other FX)
+                # 3) without cinematic + impact FX
+                # 4) safe chain (resolution-only)
+                attempts = []
                 if vf_arg:
-                    cmd += ["-vf", vf_arg]
-                cmd += encode_args
-                code, out = _run_ffmpeg(cmd)
+                    attempts.append(("full", vf_arg))
+                if vf_no_cine_arg and vf_no_cine_arg != vf_arg:
+                    attempts.append(("no_cine", vf_no_cine_arg))
+                if vf_no_cine_no_impact_arg and vf_no_cine_no_impact_arg not in (vf_arg, vf_no_cine_arg):
+                    attempts.append(("no_cine_no_impact", vf_no_cine_no_impact_arg))
+                if safe_vf_arg and safe_vf_arg not in (vf_arg, vf_no_cine_arg, vf_no_cine_no_impact_arg):
+                    attempts.append(("safe", safe_vf_arg))
+                if not attempts:
+                    attempts.append(("none", None))
 
-                # Second attempt: only resolution scaling/padding (if any)
-                if (code != 0 or not os.path.exists(out_part)) and safe_vf_arg and safe_vf_arg != vf_arg:
-                    try:
-                        if os.path.exists(out_part):
-                            os.remove(out_part)
-                    except Exception:
-                        pass
+                code = 1
+                out = ""
+                for ai, (aname, avf) in enumerate(attempts):
                     cmd = list(base_cmd)
-                    cmd += ["-vf", safe_vf_arg]
+                    if avf:
+                        cmd += ["-vf", avf]
                     cmd += encode_args
                     code, out = _run_ffmpeg(cmd)
 
-                # Final attempt: minimal, ultra-safe scaling/padding only.
-                # We still try to honor the requested target resolution if one
-                # was set, but drop all cinematic FX/transition filters.
+                    if code == 0 and os.path.exists(out_part):
+                        break
+
+                    if ai < len(attempts) - 1:
+                        # Re-try with a safer chain, but keep the segment alive.
+                        try:
+                            tail = (out or "").splitlines()[-1] if out else ""
+                            print(f"[Videoclip_creator] Segment {i+1}: FX effect filter failed; defaulting to safe chain, error is harmless. {tail}")
+                        except Exception:
+                            pass
+                        try:
+                            if os.path.exists(out_part):
+                                os.remove(out_part)
+                        except Exception:
+                            pass
+
                 if code != 0 or not os.path.exists(out_part):
                     try:
                         if os.path.exists(out_part):
@@ -3883,13 +4540,18 @@ class RenderWorker(QThread):
                     concat_video = parts[0]
             else:
                 dissolve_ids = {"t_exposure_dissolve", "t_luma_fade"}
+                scale_punch_ids = {"t_scale_punch"}
                 push_ids = {"t_push"}
                 slitscan_ids = {"t_slitscan_push"}
                 wipe_ids = {"t_wipe"}
+                curtain_ids = {"t_curtain_open"}
+                pixelize_ids = {"t_pixelize"}
                 iris_ids = {"t_iris"}
                 radial_ids = {"t_radial_burst"}
                 shimmer_ids = {"t_shimmer_blur"}
-                stitch_ids = dissolve_ids | push_ids | slitscan_ids | wipe_ids | iris_ids | radial_ids | shimmer_ids
+                distance_ids = {"t_distance"}
+                wind_ids = {"t_wind_smears"}
+                stitch_ids = dissolve_ids | push_ids | slitscan_ids | wipe_ids | curtain_ids | pixelize_ids | iris_ids | radial_ids | shimmer_ids | distance_ids | wind_ids | scale_punch_ids
                 use_stitch = False
                 total_overlap = 0.0
 
@@ -3922,7 +4584,7 @@ class RenderWorker(QThread):
                     use_stitch = False
 
                 if use_stitch:
-                    self.progress.emit(90, "Stitching transitions (exposure dissolve)...")
+                    self.progress.emit(90, "Stitching transitions (xfade)...")
                     try:
                         cur = parts[0]
                         for j in range(1, len(parts)):
@@ -4043,6 +4705,143 @@ class RenderWorker(QThread):
                                     use_stitch = True
                                     total_overlap += float(d)
 
+
+                            elif trans in scale_punch_ids:
+
+                                # "Scale punch" (zoom-burst) transition:
+                                # a punchy zoom-in at the cut, with a short flash + motion smear,
+                                # while still being a *real* xfade overlap (editor-style).
+                                dur_a = _ffprobe_duration(self.ffprobe, cur) or 0.0
+                                dur_b = _ffprobe_duration(self.ffprobe, parts[j]) or 0.0
+
+                                try:
+                                    d = float(getattr(self.segments[j], "_stitch_dur", 0.0) or 0.0)
+                                except Exception:
+                                    d = 0.0
+
+                                if d <= 0.0:
+                                    d = random.uniform(0.22, 0.48)
+
+                                if dur_a > 0.0 and dur_b > 0.0:
+                                    max_allowed = max(0.12, min(dur_a, dur_b) * 0.28)
+                                    d = min(d, max_allowed)
+
+                                d = max(0.12, min(1.0, float(d)))
+                                offset = max(0.0, (dur_a if dur_a > 0.0 else 0.0) - d)
+
+                                # Strength varies slightly so it doesn't feel copy/pasted.
+                                z0 = random.uniform(1.12, 1.22)
+                                z_amp = max(0.01, z0 - 1.0)
+
+                                # Apply the "punch" ONLY inside the overlap window by trimming.
+                                t0 = offset
+                                t1 = offset + d
+
+                                z_expr = f"max(1.0\\, {z0:.4f} - ({z_amp:.4f})*t/{d:.4f})"
+
+                                mid_fx = (
+                                    # Pop + tiny flash at the start
+                                    "eq=contrast=1.06:brightness=0.02:saturation=1.10,"
+                                    "eq=brightness=0.14:contrast=1.12:enable='lt(t,0.060)',"
+                                    # Motion smear for the first fraction of the overlap (adds energy)
+                                    "tmix=frames=5:weights='1 0.85 0.65 0.45 0.25':enable='between(t,0,0.180)',"
+                                    # Zoom-burst (scale up then settle) + center crop back to output size
+                                    f"scale=iw*({z_expr}):ih*({z_expr}):eval=frame,"
+                                    f"crop={stitch_w}:{stitch_h}:(iw-{stitch_w})/2:(ih-{stitch_h})/2"
+                                )
+
+                                fc = (
+                                    f"[0:v]{stitch_norm}[a];"
+                                    f"[1:v]{stitch_norm}[b];"
+                                    f"[a][b]xfade=transition=fade:duration={d:.3f}:offset={offset:.3f}[x];"
+                                    f"[x]split=3[x0][x1][x2];"
+                                    f"[x0]trim=0:{t0:.3f},setpts=PTS-STARTPTS[pre];"
+                                    f"[x1]trim={t0:.3f}:{t1:.3f},setpts=PTS-STARTPTS,{mid_fx}[mid];"
+                                    f"[x2]trim={t1:.3f},setpts=PTS-STARTPTS[post];"
+                                    f"[pre][mid][post]concat=n=3:v=1:a=0,format=yuv420p[v]"
+                                )
+
+                                cmd = [
+                                    self.ffmpeg,
+                                    "-y",
+                                    "-i",
+                                    cur,
+                                    "-i",
+                                    parts[j],
+                                    "-filter_complex",
+                                    fc,
+                                    "-map",
+                                    "[v]",
+                                    "-c:v",
+                                    "h264_nvenc",
+                                    "-preset",
+                                    "p3",
+                                    "-cq",
+                                    "19",
+                                    "-pix_fmt",
+                                    "yuv420p",
+                                    out_tmp,
+                                ]
+                                code, out = _run_ffmpeg(cmd)
+
+                                if code != 0 or not os.path.exists(out_tmp):
+                                    cmd = [
+                                        self.ffmpeg,
+                                        "-y",
+                                        "-i",
+                                        cur,
+                                        "-i",
+                                        parts[j],
+                                        "-filter_complex",
+                                        fc,
+                                        "-map",
+                                        "[v]",
+                                        "-c:v",
+                                        "libx264",
+                                        "-preset",
+                                        "veryfast",
+                                        "-crf",
+                                        "18",
+                                        "-pix_fmt",
+                                        "yuv420p",
+                                        out_tmp,
+                                    ]
+                                    code, out = _run_ffmpeg(cmd)
+
+                                # Last resort: if this punch filter chain isn't supported in this ffmpeg build,
+                                # fall back to a normal fade dissolve so the run still completes.
+                                if code != 0 or not os.path.exists(out_tmp):
+                                    fc2 = (
+                                        f"[0:v]{stitch_norm}[a];"
+                                        f"[1:v]{stitch_norm}[b];"
+                                        f"[a][b]xfade=transition=fade:duration={d:.3f}:offset={offset:.3f},format=yuv420p[v]"
+                                    )
+                                    cmd = [
+                                        self.ffmpeg,
+                                        "-y",
+                                        "-i",
+                                        cur,
+                                        "-i",
+                                        parts[j],
+                                        "-filter_complex",
+                                        fc2,
+                                        "-map",
+                                        "[v]",
+                                        "-c:v",
+                                        "libx264",
+                                        "-preset",
+                                        "veryfast",
+                                        "-crf",
+                                        "18",
+                                        "-pix_fmt",
+                                        "yuv420p",
+                                        out_tmp,
+                                    ]
+                                    code, out = _run_ffmpeg(cmd)
+
+                                if code == 0 and os.path.exists(out_tmp):
+                                    use_stitch = True
+                                    total_overlap += float(d)
                             elif trans in slitscan_ids:
 
                                 # Slit-scan smear push: real stitched push with a modern smear over the overlap window.
@@ -4213,7 +5012,7 @@ class RenderWorker(QThread):
                                 offset = max(0.0, (dur_a if dur_a > 0.0 else 0.0) - d)
 
                                 # Alternate wipe directions so it doesn't feel repetitive.
-                                wipe_modes = ["wipeleft", "wiperight", "wipeup", "wipedown"]
+                                wipe_modes = ["wipeleft", "wiperight", "wipeup", "wipedown", "diagtl", "diagbr"]
                                 mode = wipe_modes[int(j) % len(wipe_modes)]
 
                                 fc = (
@@ -4389,6 +5188,158 @@ class RenderWorker(QThread):
                                     use_stitch = True
                                     total_overlap += float(d)
 
+
+                            elif trans in curtain_ids:
+
+                                # Curtain/doors open transition using xfade (center opening).
+                                dur_a = _ffprobe_duration(self.ffprobe, cur) or 0.0
+                                dur_b = _ffprobe_duration(self.ffprobe, parts[j]) or 0.0
+
+                                try:
+                                    d = float(getattr(self.segments[j], "_stitch_dur", 0.0) or 0.0)
+                                except Exception:
+                                    d = 0.0
+                                if d <= 0.0:
+                                    d = random.uniform(0.25, 0.6)
+                                if dur_a > 0.0 and dur_b > 0.0:
+                                    max_allowed = max(0.12, min(dur_a, dur_b) * 0.25)
+                                    d = min(d, max_allowed)
+                                d = max(0.12, min(1.0, float(d)))
+                                offset = max(0.0, (dur_a if dur_a > 0.0 else 0.0) - d)
+
+                                # Alternate between horizontal and vertical opening to avoid repetition.
+                                curtain_modes = ["horzopen", "vertopen"]
+                                mode = curtain_modes[int(j) % len(curtain_modes)]
+
+                                fc = (
+                                    f"[0:v]{stitch_norm}[a];"
+                                    f"[1:v]{stitch_norm}[b];"
+                                    f"[a][b]xfade=transition={mode}:duration={d:.3f}:offset={offset:.3f},format=yuv420p[v]"
+                                )
+
+                                cmd = [
+                                    self.ffmpeg,
+                                    "-y",
+                                    "-i",
+                                    cur,
+                                    "-i",
+                                    parts[j],
+                                    "-filter_complex",
+                                    fc,
+                                    "-map",
+                                    "[v]",
+                                    "-c:v",
+                                    "h264_nvenc",
+                                    "-preset",
+                                    "p3",
+                                    "-cq",
+                                    "19",
+                                    "-pix_fmt",
+                                    "yuv420p",
+                                    out_tmp,
+                                ]
+                                code, out = _run_ffmpeg(cmd)
+                                if code != 0 or not os.path.exists(out_tmp):
+                                    cmd = [
+                                        self.ffmpeg,
+                                        "-y",
+                                        "-i",
+                                        cur,
+                                        "-i",
+                                        parts[j],
+                                        "-filter_complex",
+                                        fc,
+                                        "-map",
+                                        "[v]",
+                                        "-c:v",
+                                        "libx264",
+                                        "-preset",
+                                        "veryfast",
+                                        "-crf",
+                                        "18",
+                                        "-pix_fmt",
+                                        "yuv420p",
+                                        out_tmp,
+                                    ]
+                                    code, out = _run_ffmpeg(cmd)
+
+                                if code == 0 and os.path.exists(out_tmp):
+                                    use_stitch = True
+                                    total_overlap += float(d)
+
+                            elif trans in pixelize_ids:
+
+                                # Pixelize transition using xfade (chunky pixel blocks).
+                                dur_a = _ffprobe_duration(self.ffprobe, cur) or 0.0
+                                dur_b = _ffprobe_duration(self.ffprobe, parts[j]) or 0.0
+
+                                try:
+                                    d = float(getattr(self.segments[j], "_stitch_dur", 0.0) or 0.0)
+                                except Exception:
+                                    d = 0.0
+                                if d <= 0.0:
+                                    d = random.uniform(0.22, 0.55)
+                                if dur_a > 0.0 and dur_b > 0.0:
+                                    max_allowed = max(0.12, min(dur_a, dur_b) * 0.25)
+                                    d = min(d, max_allowed)
+                                d = max(0.12, min(1.0, float(d)))
+                                offset = max(0.0, (dur_a if dur_a > 0.0 else 0.0) - d)
+
+                                fc = (
+                                    f"[0:v]{stitch_norm}[a];"
+                                    f"[1:v]{stitch_norm}[b];"
+                                    f"[a][b]xfade=transition=pixelize:duration={d:.3f}:offset={offset:.3f},format=yuv420p[v]"
+                                )
+
+                                cmd = [
+                                    self.ffmpeg,
+                                    "-y",
+                                    "-i",
+                                    cur,
+                                    "-i",
+                                    parts[j],
+                                    "-filter_complex",
+                                    fc,
+                                    "-map",
+                                    "[v]",
+                                    "-c:v",
+                                    "h264_nvenc",
+                                    "-preset",
+                                    "p3",
+                                    "-cq",
+                                    "19",
+                                    "-pix_fmt",
+                                    "yuv420p",
+                                    out_tmp,
+                                ]
+                                code, out = _run_ffmpeg(cmd)
+                                if code != 0 or not os.path.exists(out_tmp):
+                                    cmd = [
+                                        self.ffmpeg,
+                                        "-y",
+                                        "-i",
+                                        cur,
+                                        "-i",
+                                        parts[j],
+                                        "-filter_complex",
+                                        fc,
+                                        "-map",
+                                        "[v]",
+                                        "-c:v",
+                                        "libx264",
+                                        "-preset",
+                                        "veryfast",
+                                        "-crf",
+                                        "18",
+                                        "-pix_fmt",
+                                        "yuv420p",
+                                        out_tmp,
+                                    ]
+                                    code, out = _run_ffmpeg(cmd)
+
+                                if code == 0 and os.path.exists(out_tmp):
+                                    use_stitch = True
+                                    total_overlap += float(d)
 
                             elif trans in iris_ids:
 
@@ -4607,6 +5558,226 @@ class RenderWorker(QThread):
                                 if code == 0 and os.path.exists(out_tmp):
                                     use_stitch = True
                                     total_overlap += float(d)
+
+                            elif trans in distance_ids:
+
+                                # "Distance" transition (pseudo-morph / liquid blend feel) using xfade.
+
+                                dur_a = _ffprobe_duration(self.ffprobe, cur) or 0.0
+
+                                dur_b = _ffprobe_duration(self.ffprobe, parts[j]) or 0.0
+
+
+                                try:
+
+                                    d = float(getattr(self.segments[j], "_stitch_dur", 0.0) or 0.0)
+
+                                except Exception:
+
+                                    d = 0.0
+
+                                if d <= 0.0:
+
+                                    d = random.uniform(0.25, 0.55)
+
+                                if dur_a > 0.0 and dur_b > 0.0:
+
+                                    max_allowed = max(0.12, min(dur_a, dur_b) * 0.25)
+
+                                    d = min(d, max_allowed)
+
+                                d = max(0.12, min(1.0, float(d)))
+
+                                offset = max(0.0, (dur_a if dur_a > 0.0 else 0.0) - d)
+
+
+                                fc = (
+
+                                    f"[0:v]{stitch_norm}[a];"
+
+                                    f"[1:v]{stitch_norm}[b];"
+
+                                    f"[a][b]xfade=transition=distance:duration={d:.3f}:offset={offset:.3f},format=yuv420p[v]"
+
+                                )
+
+
+                                cmd = [
+
+                                    self.ffmpeg,
+
+                                    "-y",
+
+                                    "-i",
+
+                                    cur,
+
+                                    "-i",
+
+                                    parts[j],
+
+                                    "-filter_complex",
+
+                                    fc,
+
+                                    "-map",
+
+                                    "[v]",
+
+                                    "-c:v",
+
+                                    "h264_nvenc",
+
+                                    "-preset",
+
+                                    "p3",
+
+                                    "-cq",
+
+                                    "19",
+
+                                    "-pix_fmt",
+
+                                    "yuv420p",
+
+                                    out_tmp,
+
+                                ]
+
+                                code, out = _run_ffmpeg(cmd)
+
+                                if code != 0 or not os.path.exists(out_tmp):
+
+                                    cmd = [
+
+                                        self.ffmpeg,
+
+                                        "-y",
+
+                                        "-i",
+
+                                        cur,
+
+                                        "-i",
+
+                                        parts[j],
+
+                                        "-filter_complex",
+
+                                        fc,
+
+                                        "-map",
+
+                                        "[v]",
+
+                                        "-c:v",
+
+                                        "libx264",
+
+                                        "-crf",
+
+                                        "18",
+
+                                        "-pix_fmt",
+
+                                        "yuv420p",
+
+                                        out_tmp,
+
+                                    ]
+
+                                    code, out = _run_ffmpeg(cmd)
+
+
+                                if code == 0 and os.path.exists(out_tmp):
+
+                                    use_stitch = True
+
+                                    total_overlap += float(d)
+
+
+                            elif trans in wind_ids:
+
+                                # "Wind smears" transition (directional streaky blend) using xfade wind modes.
+
+                                dur_a = _ffprobe_duration(self.ffprobe, cur) or 0.0
+                                dur_b = _ffprobe_duration(self.ffprobe, parts[j]) or 0.0
+
+                                try:
+                                    d = float(getattr(self.segments[j], "_stitch_dur", 0.0) or 0.0)
+                                except Exception:
+                                    d = 0.0
+
+                                if d <= 0.0:
+                                    d = random.uniform(0.25, 0.60)
+
+                                if dur_a > 0.0 and dur_b > 0.0:
+                                    max_allowed = max(0.12, min(dur_a, dur_b) * 0.25)
+                                    d = min(d, max_allowed)
+
+                                d = max(0.12, min(1.0, float(d)))
+                                offset = max(0.0, (dur_a if dur_a > 0.0 else 0.0) - d)
+
+                                wind_modes = ["hlwind", "hrwind", "vuwind", "vdwind"]
+                                mode = random.choice(wind_modes)
+
+                                fc = (
+                                    f"[0:v]{stitch_norm}[a];"
+                                    f"[1:v]{stitch_norm}[b];"
+                                    f"[a][b]xfade=transition={mode}:duration={d:.3f}:offset={offset:.3f},format=yuv420p[v]"
+                                )
+
+                                cmd = [
+                                    self.ffmpeg,
+                                    "-y",
+                                    "-i",
+                                    cur,
+                                    "-i",
+                                    parts[j],
+                                    "-filter_complex",
+                                    fc,
+                                    "-map",
+                                    "[v]",
+                                    "-c:v",
+                                    "h264_nvenc",
+                                    "-preset",
+                                    "p3",
+                                    "-cq",
+                                    "19",
+                                    "-pix_fmt",
+                                    "yuv420p",
+                                    out_tmp,
+                                ]
+                                code, out = _run_ffmpeg(cmd)
+
+                                if code != 0 or not os.path.exists(out_tmp):
+                                    cmd = [
+                                        self.ffmpeg,
+                                        "-y",
+                                        "-i",
+                                        cur,
+                                        "-i",
+                                        parts[j],
+                                        "-filter_complex",
+                                        fc,
+                                        "-map",
+                                        "[v]",
+                                        "-c:v",
+                                        "libx264",
+                                        "-preset",
+                                        "veryfast",
+                                        "-crf",
+                                        "18",
+                                        "-pix_fmt",
+                                        "yuv420p",
+                                        out_tmp,
+                                    ]
+                                    code, out = _run_ffmpeg(cmd)
+
+                                if code == 0 and os.path.exists(out_tmp):
+                                    use_stitch = True
+                                    total_overlap += float(d)
+
 
                             elif trans in dissolve_ids:
                                 # Real dissolve using xfade (no black frames).
@@ -5048,13 +6219,104 @@ class RenderWorker(QThread):
                     # Visual overlay is cosmetic; ignore failures.
                     pass
 
+
+            # Timed strobe (global): apply AFTER duration correction and overlays so timestamps stay accurate.
+            if getattr(self, "strobe_on_time_times", None):
+                try:
+                    raw_times = self.strobe_on_time_times or []
+                    times: List[float] = []
+                    for v in raw_times:
+                        try:
+                            fv = float(v)
+                        except Exception:
+                            continue
+                        if fv < 0.0:
+                            continue
+                        times.append(fv)
+
+                    # De-dup + sort
+                    uniq: List[float] = []
+                    for t in sorted(times):
+                        if not uniq or abs(uniq[-1] - t) >= 0.01:
+                            uniq.append(t)
+
+                    if uniq:
+                        try:
+                            s_val = float(getattr(self, "strobe_flash_strength", 0.0) or 0.0)
+                        except Exception:
+                            s_val = 0.0
+                        if s_val > 0.0:
+                            s = max(0.1, min(1.0, s_val))
+
+                            try:
+                                speed_ms = int(getattr(self, "strobe_flash_speed_ms", 250) or 250)
+                            except Exception:
+                                speed_ms = 250
+                            speed_ms = max(100, min(1000, speed_ms))
+                            period_s = speed_ms / 1000.0
+                            pulse_s = max(0.02, min(0.08, period_s * 0.35))
+
+                            flash_a = 0.30 + 0.55 * s  # 0.30–0.85
+
+                            try:
+                                total_dur = float(getattr(self.analysis, "duration", 0.0) or 0.0)
+                            except Exception:
+                                total_dur = 0.0
+
+                            vf_parts: List[str] = []
+                            for t0 in uniq:
+                                if total_dur > 0.0 and t0 > total_dur + 0.01:
+                                    continue
+                                end_t = t0 + 0.9
+                                if total_dur > 0.0:
+                                    end_t = min(total_dur, end_t)
+                                if end_t <= t0 + 0.01:
+                                    continue
+
+                                vf_parts.append(
+                                    "drawbox=x=0:y=0:w=iw:h=ih:"
+                                    f"color=white@{flash_a:.2f}:t=fill:"
+                                    f"enable='between(t,{t0:.3f},{end_t:.3f})*lt(mod(t-{t0:.3f},{period_s:.3f}),{pulse_s:.3f})'"
+                                )
+
+                            if vf_parts:
+                                self.progress.emit(94, "Applying timed strobe...")
+                                strobe_video = os.path.join(tmpdir, "video_timed_strobe.mp4")
+                                vf = ",".join(vf_parts)
+                                cmd = [
+                                    self.ffmpeg,
+                                    "-y",
+                                    "-i",
+                                    video_for_mux,
+                                    "-vf",
+                                    vf,
+                                    "-c:v",
+                                    "libx264",
+                                    "-preset",
+                                    "veryfast",
+                                    "-crf",
+                                    "18",
+                                    "-pix_fmt",
+                                    "yuv420p",
+                                    strobe_video,
+                                ]
+                                code, out = _run_ffmpeg(cmd)
+                                if code == 0 and os.path.exists(strobe_video):
+                                    video_for_mux = strobe_video
+                except Exception:
+                    # Cosmetic only — ignore failures
+                    pass
+
             # mux with audio
             self.progress.emit(95, "Merging with audio...")
-            base = os.path.splitext(os.path.basename(self.audio_path))[0]
-            ts = datetime.now().strftime("%d%m%H%M")  # ddmmhhmm to avoid overwrites
-            safe_base = base.strip().replace(" ", "_")
-            out_name = f"{safe_base}_clip_{ts}.mp4"
-            out_final = os.path.join(self.output_dir, out_name)
+            if self.out_name_override:
+                out_final = os.path.join(self.output_dir, _sanitize_filename(str(self.out_name_override)))
+            else:
+                base = os.path.splitext(os.path.basename(self.audio_path))[0]
+                ts = datetime.now().strftime("%d%m%H%M")  # ddmmhhmm to avoid overwrites
+                safe_base = _sanitize_stem(base)
+                out_name = f"{safe_base}_clip_{ts}.mp4"
+                out_final = os.path.join(self.output_dir, out_name)
             cmd = [
                 self.ffmpeg,
                 "-y",
@@ -5085,6 +6347,8 @@ class AutoMusicSyncWidget(QWidget):
     def __init__(self, parent=None, sticky_footer: bool = False) -> None:
         super().__init__(parent)
         self._sticky_footer = bool(sticky_footer)
+        self._queue_requested = False
+        self._direct_run_active = False
         self._ffmpeg = _find_ffmpeg_from_env()
         self._ffprobe = _find_ffprobe_from_env()
         self._analysis: Optional[MusicAnalysisResult] = None
@@ -5101,9 +6365,12 @@ class AutoMusicSyncWidget(QWidget):
         # Optional per-section media overrides chosen from the timeline tab
         self._section_media: Dict[int, ClipSource] = {}
         # Enabled transition styles for randomization (indices of combo_transitions)
-        self._enabled_transition_modes = {0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10}
+        self._enabled_transition_modes = {0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14}
         # Guard flag used when toggling No FX programmatically so we don't immediately undo it
         self._nofx_guard = False
+
+        # Timed strobe (flash strobe at user-specified timeline seconds)
+        self._strobe_on_time_times: List[float] = []
 
         # Per-section music-player visual overrides (intro/verse/chorus/break/drop/outro)
         self._visual_section_overrides = {}
@@ -5119,6 +6386,106 @@ class AutoMusicSyncWidget(QWidget):
 
         # Hide still-image UI block (images in generator)
         self._hide_image_sources_block()
+
+
+    # ----------------------------- UI toast ---------------------------------
+    def _show_toast(self, message: str, duration_ms: int = 2200, fade_ms: int = 650) -> None:
+        """Show a small non-blocking toast near the bottom of the window."""
+        try:
+            parent = self.window() if self.window() is not None else self
+        except Exception:
+            parent = self
+
+        # Close previous toast if still visible
+        try:
+            old = getattr(self, "_active_toast", None)
+            if old is not None:
+                try:
+                    old.close()
+                except Exception:
+                    pass
+                try:
+                    old.deleteLater()
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
+        try:
+            toast = QFrame(parent)
+            toast.setObjectName("FVToast")
+            toast.setWindowFlags(Qt.FramelessWindowHint | Qt.ToolTip)
+            toast.setAttribute(Qt.WA_ShowWithoutActivating, True)
+            toast.setAttribute(Qt.WA_TransparentForMouseEvents, True)
+            lay = QVBoxLayout(toast)
+            lay.setContentsMargins(14, 10, 14, 10)
+            lay.setSpacing(0)
+            lbl = QLabel(str(message), toast)
+            lbl.setWordWrap(True)
+            lbl.setAlignment(Qt.AlignCenter)
+            lay.addWidget(lbl)
+
+            # Minimal styling (keeps working even if no app stylesheet is loaded)
+            toast.setStyleSheet(
+                "#FVToast {"
+                " background: rgba(0,0,0,190);"
+                " color: white;"
+                " border: 1px solid rgba(255,255,255,70);"
+                " border-radius: 10px;"
+                " }"
+            )
+
+            toast.adjustSize()
+
+            # Position: bottom-center of the parent window
+            try:
+                g = parent.frameGeometry()
+            except Exception:
+                g = parent.geometry()
+            x = int(g.x() + (g.width() - toast.width()) * 0.5)
+            y = int(g.y() + g.height() - toast.height() - 80)
+            toast.move(x, y)
+
+            eff = QGraphicsOpacityEffect(toast)
+            eff.setOpacity(1.0)
+            toast.setGraphicsEffect(eff)
+
+            anim = QPropertyAnimation(eff, b"opacity", toast)
+            anim.setDuration(int(max(120, fade_ms)))
+            anim.setStartValue(1.0)
+            anim.setEndValue(0.0)
+            anim.setEasingCurve(QEasingCurve.InOutQuad)
+
+            def _finish():
+                try:
+                    toast.close()
+                except Exception:
+                    pass
+                try:
+                    toast.deleteLater()
+                except Exception:
+                    pass
+                try:
+                    if getattr(self, "_active_toast", None) is toast:
+                        self._active_toast = None
+                except Exception:
+                    pass
+
+            anim.finished.connect(_finish)
+
+            # Keep references alive
+            toast._toast_anim = anim  # type: ignore[attr-defined]
+            self._active_toast = toast
+
+            toast.show()
+            toast.raise_()
+
+            # Start fade after the on-screen duration
+            QTimer.singleShot(int(max(300, duration_ms)), anim.start)
+        except Exception:
+            # Toast is best-effort; never break workflows if it fails.
+            pass
+
 
     def _build_ui(self) -> None:
         self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
@@ -5155,12 +6522,18 @@ class AutoMusicSyncWidget(QWidget):
         btn_vf = QPushButton("Video file...", self)
         btn_vd = QPushButton("Clip folder...", self)
         btn_vmf = QPushButton("Clip files...", self)
-        row_v = QHBoxLayout()
-        row_v.addWidget(self.edit_video, 1)
-        row_v.addWidget(btn_vf)
-        row_v.addWidget(btn_vd)
-        row_v.addWidget(btn_vmf)
-        form.addRow("Video input:", row_v)
+
+        # Put the pickers on the first row, and the resulting path(s) on the next row
+        # so the selected input can use the full width.
+        row_v_btns = QHBoxLayout()
+        row_v_btns.setContentsMargins(0, 0, 0, 0)
+        row_v_btns.setSpacing(6)
+        row_v_btns.addWidget(btn_vf)
+        row_v_btns.addWidget(btn_vd)
+        row_v_btns.addWidget(btn_vmf)
+        row_v_btns.addStretch(1)
+        form.addRow("", row_v_btns)
+        form.addRow("", self.edit_video)
 
         # Optional loader for image sources (hidden by default)
         self.image_sources_row = QWidget(self)
@@ -5299,6 +6672,12 @@ class AutoMusicSyncWidget(QWidget):
             "- Fixed 16:9: scale everything to 480p / 720p / 1080p landscape.\n"
             "- Fixed 9:16: scale everything to 480p / 720p / 1080p vertical."
         )
+        # Default output resolution: Fixed 720p (1280×720)
+        # (Only used when there are no saved settings yet.)
+        try:
+            self.combo_res.setCurrentIndex(4)
+        except Exception:
+            pass
         row_res.addWidget(self.combo_res, 1)
         form.addRow(row_res)
 
@@ -5472,9 +6851,14 @@ class AutoMusicSyncWidget(QWidget):
         row_cine_master = QHBoxLayout()
         self.check_cine_enable = QCheckBox("Enable cinematic effects", self)
         self.check_cine_enable.setToolTip(
-            "Enable a few rare, high-impact visual effects (freeze-frame, stutter, "
+            "Enable a few rare, high-impact visual effects (shutter-pop, stutter, "
             "reverse-bounce, ramps). Effects are placed automatically "
         )
+        # Default ON (matches UI defaults in the screenshot)
+        try:
+            self.check_cine_enable.setChecked(True)
+        except Exception:
+            pass
         row_cine_master.addWidget(self.check_cine_enable)
         row_cine_master.addStretch(1)
         opts.addLayout(row_cine_master)
@@ -5492,15 +6876,15 @@ class AutoMusicSyncWidget(QWidget):
         row_cine_all.addStretch(1)
         cine_layout.addLayout(row_cine_all)
 
-        # Freeze-frame effect
+        # Shutter-pop effect
         row_cine_freeze = QHBoxLayout()
-        self.check_cine_freeze = QCheckBox("Freeze-frame (pause + zoom-in)", self.cine_options)
+        self.check_cine_freeze = QCheckBox("Shutter-pop (punch + smear)", self.cine_options)
         self.check_cine_freeze.setToolTip(
-            "Occasionally pause the video on a single frame with a gentle zoom-in, "
-            "then snap back to normal motion."
+            "Occasionally add a quick camera-shutter style punch: micro-zoom + glossy motion smear.\n"
+            "No speed change, no freezing."
         )
         row_cine_freeze.addWidget(self.check_cine_freeze)
-        label_freeze_len = QLabel("Length:", self.cine_options)
+        label_freeze_len = QLabel("Hit:", self.cine_options)
         row_cine_freeze.addWidget(label_freeze_len)
         self.slider_cine_freeze_len = QSlider(Qt.Horizontal, self.cine_options)
         self.slider_cine_freeze_len.setMinimum(10)   # 0.10 s
@@ -5514,7 +6898,7 @@ class AutoMusicSyncWidget(QWidget):
         cine_layout.addLayout(row_cine_freeze)
 
         row_cine_freeze_zoom = QHBoxLayout()
-        label_freeze_zoom = QLabel("Freeze zoom:", self.cine_options)
+        label_freeze_zoom = QLabel("Punch:", self.cine_options)
         row_cine_freeze_zoom.addWidget(label_freeze_zoom)
         self.slider_cine_freeze_zoom = QSlider(Qt.Horizontal, self.cine_options)
         self.slider_cine_freeze_zoom.setMinimum(5)    # 5%%
@@ -5527,12 +6911,17 @@ class AutoMusicSyncWidget(QWidget):
         row_cine_freeze_zoom.addWidget(self.label_cine_freeze_zoom)
         cine_layout.addLayout(row_cine_freeze_zoom)
 
-        # Vertical screen tear (3 stripes)
+        # Prism whip (horizontal drift)
         row_cine_tear_v = QHBoxLayout()
-        self.check_cine_tear_v = QCheckBox("Screen tear (vertical 3-slice)", self.cine_options)
+        self.check_cine_tear_v = QCheckBox("Prism whip (horizontal drift)", self.cine_options)
         self.check_cine_tear_v.setToolTip(
-            "A quick glitch-like tear that offsets three vertical slices, then snaps back."
+            "A short, eye-catching whip: micro-zoom + chroma smear + soft motion trail (horizontal drift)."
         )
+        # Default ON (matches UI defaults in the screenshot)
+        try:
+            self.check_cine_tear_v.setChecked(True)
+        except Exception:
+            pass
         row_cine_tear_v.addWidget(self.check_cine_tear_v)
         label_cine_tear_v = QLabel("Strength:", self.cine_options)
         row_cine_tear_v.addWidget(label_cine_tear_v)
@@ -5547,12 +6936,17 @@ class AutoMusicSyncWidget(QWidget):
         row_cine_tear_v.addWidget(self.label_cine_tear_v_strength)
         cine_layout.addLayout(row_cine_tear_v)
 
-        # Horizontal screen tear (3 stripes)
+        # Prism whip (vertical drift)
         row_cine_tear_h = QHBoxLayout()
-        self.check_cine_tear_h = QCheckBox("Screen tear (horizontal 3-slice)", self.cine_options)
+        self.check_cine_tear_h = QCheckBox("Prism whip (vertical drift)", self.cine_options)
         self.check_cine_tear_h.setToolTip(
-            "A quick glitch-like tear that offsets three horizontal slices, then snaps back."
+            "A short, eye-catching whip: micro-zoom + chroma smear + soft motion trail (vertical drift)."
         )
+        # Default ON (matches UI defaults in the screenshot)
+        try:
+            self.check_cine_tear_h.setChecked(True)
+        except Exception:
+            pass
         row_cine_tear_h.addWidget(self.check_cine_tear_h)
         label_cine_tear_h = QLabel("Strength:", self.cine_options)
         row_cine_tear_h.addWidget(label_cine_tear_h)
@@ -5566,6 +6960,29 @@ class AutoMusicSyncWidget(QWidget):
         self.label_cine_tear_h_strength.setMinimumWidth(40)
         row_cine_tear_h.addWidget(self.label_cine_tear_h_strength)
         cine_layout.addLayout(row_cine_tear_h)
+
+        # Color-cycle glitch (cinematic)
+        row_cine_color_cycle = QHBoxLayout()
+        self.check_cine_color_cycle = QCheckBox("Color-cycle glitch", self.cine_options)
+        self.check_cine_color_cycle.setToolTip(
+            "Occasionally add a short hue-cycle glitch (like the break/drop Color-cycle),\n"
+            "but as a cinematic one-off effect.\n"
+            "Speed controls how fast the hue cycles: 100ms = very fast, 1000ms = slow."
+        )
+        row_cine_color_cycle.addWidget(self.check_cine_color_cycle)
+        label_cine_color_cycle = QLabel("Speed:", self.cine_options)
+        row_cine_color_cycle.addWidget(label_cine_color_cycle)
+        self.slider_cine_color_cycle_speed = QSlider(Qt.Horizontal, self.cine_options)
+        self.slider_cine_color_cycle_speed.setMinimum(100)
+        self.slider_cine_color_cycle_speed.setMaximum(1000)
+        self.slider_cine_color_cycle_speed.setSingleStep(50)
+        self.slider_cine_color_cycle_speed.setPageStep(100)
+        self.slider_cine_color_cycle_speed.setValue(400)
+        row_cine_color_cycle.addWidget(self.slider_cine_color_cycle_speed, 1)
+        self.label_cine_color_cycle_speed = QLabel("400 ms", self.cine_options)
+        self.label_cine_color_cycle_speed.setMinimumWidth(55)
+        row_cine_color_cycle.addWidget(self.label_cine_color_cycle_speed)
+        cine_layout.addLayout(row_cine_color_cycle)
 
         # Stutter slice
         row_cine_stutter = QHBoxLayout()
@@ -5636,12 +7053,18 @@ class AutoMusicSyncWidget(QWidget):
         cine_layout.addLayout(row_cine_dim)
 
         # 9:16 pan crop (boomerang)
+        # Main row: enable + speed
         row_cine_pan916 = QHBoxLayout()
         self.check_cine_pan916 = QCheckBox("Slice reveal (boomerang)", self.cine_options)
         self.check_cine_pan916.setToolTip(
             "Shows only a part of the frame at a time on a black/transparent canvas: left → middle → right → middle → ...\n"
             "Repeats automatically for long segments. Looks great on 16:9 output."
         )
+        # Default ON (matches UI defaults in the screenshot)
+        try:
+            self.check_cine_pan916.setChecked(True)
+        except Exception:
+            pass
         row_cine_pan916.addWidget(self.check_cine_pan916)
         label_cine_pan916 = QLabel("Step:", self.cine_options)
         row_cine_pan916.addWidget(label_cine_pan916)
@@ -5654,9 +7077,14 @@ class AutoMusicSyncWidget(QWidget):
         self.label_cine_pan916_speed = QLabel("400 ms", self.cine_options)
         self.label_cine_pan916_speed.setMinimumWidth(70)
         row_cine_pan916.addWidget(self.label_cine_pan916_speed)
-        # Extra options: number of slices and background transparency
+        row_cine_pan916.addStretch(1)
+        cine_layout.addLayout(row_cine_pan916)
+
+        # Options row (moved under the setting): parts slider + transparent + random
+        row_cine_pan916_opts = QHBoxLayout()
+        row_cine_pan916_opts.addSpacing(22)  # indent under the checkbox label
         label_cine_pan916_parts = QLabel("Parts:", self.cine_options)
-        row_cine_pan916.addWidget(label_cine_pan916_parts)
+        row_cine_pan916_opts.addWidget(label_cine_pan916_parts)
 
         self.slider_cine_pan916_parts = QSlider(Qt.Horizontal, self.cine_options)
         self.slider_cine_pan916_parts.setRange(2, 6)
@@ -5665,28 +7093,37 @@ class AutoMusicSyncWidget(QWidget):
         self.slider_cine_pan916_parts.setFixedWidth(90)
         self.slider_cine_pan916_parts.setValue(3)
         self.slider_cine_pan916_parts.valueChanged.connect(self._on_cine_pan916_parts_changed)
-        row_cine_pan916.addWidget(self.slider_cine_pan916_parts)
+        row_cine_pan916_opts.addWidget(self.slider_cine_pan916_parts)
 
         self.label_cine_pan916_parts = QLabel("3", self.cine_options)
         self.label_cine_pan916_parts.setMinimumWidth(85)
-        row_cine_pan916.addWidget(self.label_cine_pan916_parts)
+        row_cine_pan916_opts.addWidget(self.label_cine_pan916_parts)
 
         self.check_cine_pan916_transparent = QCheckBox("Transparent", self.cine_options)
         self.check_cine_pan916_transparent.setToolTip(
             "When enabled, the hidden area shows the same video at 50% opacity instead of solid black."
         )
-        row_cine_pan916.addWidget(self.check_cine_pan916_transparent)
+        # Default ON (matches UI defaults in the screenshot)
+        try:
+            self.check_cine_pan916_transparent.setChecked(True)
+        except Exception:
+            pass
+        row_cine_pan916_opts.addWidget(self.check_cine_pan916_transparent)
 
         self.check_cine_pan916_random = QCheckBox("Random", self.cine_options)
         self.check_cine_pan916_random.setToolTip(
             "Randomizes the slice count (2–6), starting slice, and direction each time this effect is used.\n"
             "(If you use a seed, it will stay reproducible.)"
         )
+        # Default ON (matches UI defaults in the screenshot)
+        try:
+            self.check_cine_pan916_random.setChecked(True)
+        except Exception:
+            pass
         self.check_cine_pan916_random.stateChanged.connect(self._on_cine_pan916_random_changed)
-
-        row_cine_pan916.addWidget(self.check_cine_pan916_random)
-        row_cine_pan916.addStretch(1)
-        cine_layout.addLayout(row_cine_pan916)
+        row_cine_pan916_opts.addWidget(self.check_cine_pan916_random)
+        row_cine_pan916_opts.addStretch(1)
+        cine_layout.addLayout(row_cine_pan916_opts)
 
         # Mosaic multi-screen effect
         row_cine_mosaic = QHBoxLayout()
@@ -5694,11 +7131,21 @@ class AutoMusicSyncWidget(QWidget):
         self.check_cine_mosaic.setToolTip(
             "Occasionally replace a segment with a grid of multiple clips from the source folder."
         )
+        # Default ON (matches UI defaults in the screenshot)
+        try:
+            self.check_cine_mosaic.setChecked(True)
+        except Exception:
+            pass
         row_cine_mosaic.addWidget(self.check_cine_mosaic)
         self.check_cine_mosaic_random = QCheckBox("Random", self.cine_options)
         self.check_cine_mosaic_random.setToolTip(
             "Pick a random layout (2–9 screens) each time Mosaic is used."
         )
+        # Default ON (matches UI defaults in the screenshot)
+        try:
+            self.check_cine_mosaic_random.setChecked(True)
+        except Exception:
+            pass
         row_cine_mosaic.addWidget(self.check_cine_mosaic_random)
         label_cine_mosaic = QLabel("Screens:", self.cine_options)
         row_cine_mosaic.addWidget(label_cine_mosaic)
@@ -5729,6 +7176,11 @@ class AutoMusicSyncWidget(QWidget):
         self.check_cine_rotate.setToolTip(
             "Occasionally apply a short rotating-screen hit (small spin) on strong musical moments."
         )
+        # Default ON (matches UI defaults in the screenshot)
+        try:
+            self.check_cine_rotate.setChecked(True)
+        except Exception:
+            pass
         row_cine_rotate.addWidget(self.check_cine_rotate)
         label_cine_rotate = QLabel("Max angle:", self.cine_options)
         row_cine_rotate.addWidget(label_cine_rotate)
@@ -5749,11 +7201,21 @@ class AutoMusicSyncWidget(QWidget):
         self.check_cine_multiply.setToolTip(
             "Occasionally split the screen into a grid that shows multiple copies of the *same* clip."
         )
+        # Default ON (matches UI defaults in the screenshot)
+        try:
+            self.check_cine_multiply.setChecked(True)
+        except Exception:
+            pass
         row_cine_multiply.addWidget(self.check_cine_multiply)
         self.check_cine_multiply_random = QCheckBox("Random", self.cine_options)
         self.check_cine_multiply_random.setToolTip(
             "Pick a random layout (2–9 screens) each time Multiply is used."
         )
+        # Default ON (matches UI defaults in the screenshot)
+        try:
+            self.check_cine_multiply_random.setChecked(True)
+        except Exception:
+            pass
         row_cine_multiply.addWidget(self.check_cine_multiply_random)
         label_cine_multiply = QLabel("Copies:", self.cine_options)
         row_cine_multiply.addWidget(label_cine_multiply)
@@ -5889,7 +7351,9 @@ class AutoMusicSyncWidget(QWidget):
         cine_layout.addLayout(row_cine_ramp_times)
 
         opts.addWidget(self.cine_options)
-        self.cine_options.setVisible(False)
+        # Defaults to visible because "Enable cinematic effects" defaults to ON.
+        # (Saved settings can still override this during _load_settings.)
+        self.cine_options.setVisible(True)
 
         # break impact FX options (first beat after a break)
         row_impact_master = QHBoxLayout()
@@ -6155,6 +7619,52 @@ class AutoMusicSyncWidget(QWidget):
         opts.addWidget(self.impact_options)
         self.impact_options.setVisible(False)
 
+        # Timed strobe: trigger the Flash strobe at custom time(s) in the song/video timeline.
+        row_strobe_on_time = QHBoxLayout()
+        self.check_strobe_on_time = QCheckBox("Strobe on time", self)
+        self.check_strobe_on_time.setToolTip(
+            "When enabled, you can add one or more timestamps (seconds) where the Flash strobe should fire."
+        )
+        row_strobe_on_time.addWidget(self.check_strobe_on_time)
+        row_strobe_on_time.addStretch(1)
+        opts.addLayout(row_strobe_on_time)
+
+        self.strobe_time_options = QWidget(self)
+        strobe_layout = QVBoxLayout(self.strobe_time_options)
+        strobe_layout.setContentsMargins(26, 0, 0, 0)
+        strobe_layout.setSpacing(4)
+
+        row_strobe_add = QHBoxLayout()
+        label_strobe_time = QLabel("Time (s):", self.strobe_time_options)
+        row_strobe_add.addWidget(label_strobe_time)
+
+        self.spin_strobe_time = QDoubleSpinBox(self.strobe_time_options)
+        self.spin_strobe_time.setDecimals(2)
+        self.spin_strobe_time.setSingleStep(0.25)
+        self.spin_strobe_time.setRange(0.0, 99999.0)
+        self.spin_strobe_time.setValue(0.0)
+        row_strobe_add.addWidget(self.spin_strobe_time)
+
+        self.btn_strobe_time_add = QPushButton("Add", self.strobe_time_options)
+        row_strobe_add.addWidget(self.btn_strobe_time_add)
+
+        self.btn_strobe_time_remove = QPushButton("Remove selected", self.strobe_time_options)
+        row_strobe_add.addWidget(self.btn_strobe_time_remove)
+
+        self.btn_strobe_time_clear = QPushButton("Remove all", self.strobe_time_options)
+        row_strobe_add.addWidget(self.btn_strobe_time_clear)
+
+        row_strobe_add.addStretch(1)
+        strobe_layout.addLayout(row_strobe_add)
+
+        self.list_strobe_times = QListWidget(self.strobe_time_options)
+        self.list_strobe_times.setToolTip("Strobe timestamps (seconds).")
+        self.list_strobe_times.setMaximumHeight(110)
+        strobe_layout.addWidget(self.list_strobe_times)
+
+        opts.addWidget(self.strobe_time_options)
+        self.strobe_time_options.setVisible(False)
+
         # Master FX kill-switch
         row_nofx = QHBoxLayout()
         self.check_nofx = QCheckBox("Disable ALL video FX (No FX mode)", self)
@@ -6260,21 +7770,32 @@ class AutoMusicSyncWidget(QWidget):
                 "Directional push (slide)",
                 "Wipe",
                 "Smooth zoom crossfade",
+                "Curtain open (doors)",
+                "Pixelize",
+                "Distance (liquid blend)",
+                "Wind smears",
             ]
         )
+        # Default transition preset: Hard cuts
+        self.combo_transitions.setCurrentIndex(1)
         self.combo_transitions.setToolTip(
             "High-level transition look:\n"
+            "\n"
             "- Soft film dissolves: gentle, low-key transitions (currently clean cuts).\n"
             "- Hard cuts: straight, no-frills cuts.\n"
-            "- Scale punch (zoom): rhythmic zoom pulses on cuts.\n"
+            "- Scale punch (zoom): punchy zoom-burst crossfade with a tiny flash.\n"
             "- Shimmer blur (shiny): fast blurred crossfade (glossy, editor-style).\n"
             "- Iris reveal (circle): real stitched iris transition between clips.\n"
             "- Motion blur whip-cuts: extra blur on fast cuts.\n"
             "- Slit-scan smear push: modern smear + push (real stitched transition).\n"
             "- Radial burst reveal: quick expanding burst reveal (real stitched transition).\n"
             "- Directional push: smooth slide-style motion across the cut.\n"
-            "- Wipe: real dissolve between clips without black frames.\n"
+            "- Wipe: real between-clip wipe (stitched transition).\n"
             "- Smooth zoom crossfade: continuous, gentle zoom across the cut.\n"
+            "- Curtain open (doors): center-opening curtain/doors (real stitched transition).\n"
+            "- Pixelize: chunky pixel-block transition (real stitched transition).\n"
+            "- Distance (liquid blend): pseudo-morph / liquid blend feel (real stitched transition).\n"
+            "- Wind smears: wind-like streaky crossfade (real stitched transition)."
         )
         row_trans.addWidget(self.combo_transitions, 1)
         row_trans.addStretch(1)
@@ -6305,7 +7826,7 @@ class AutoMusicSyncWidget(QWidget):
         # advanced
         box_adv = QGroupBox("Advanced", self)
         box_adv.setCheckable(True)
-        box_adv.setChecked(False)
+        box_adv.setChecked(True)
         adv = QFormLayout(box_adv)
         adv.setLabelAlignment(Qt.AlignRight | Qt.AlignVCenter)
         adv.setSpacing(4)
@@ -6326,11 +7847,11 @@ class AutoMusicSyncWidget(QWidget):
         adv.addRow("Beat sensitivity:", self.slider_sens)
 
         self.spin_beats_per_seg = QSpinBox(self)
-        self.spin_beats_per_seg.setRange(1, 64)
-        self.spin_beats_per_seg.setValue(2)
+        self.spin_beats_per_seg.setRange(1, 256)
+        self.spin_beats_per_seg.setValue(8)
         self.spin_beats_per_seg.setToolTip(
             "Number of beats grouped into one base video segment.\n"
-            "1 = very fast cuts, 2 = default, 4+ = slower cuts."
+            "1 = very fast cuts, 4 = default, 8+ = slower cuts. You can go up to 256 when you want long clips in very fast music (eg. DnB 170bpm"
         )
         adv.addRow("Beats per base segment:", self.spin_beats_per_seg)
 
@@ -6356,12 +7877,46 @@ class AutoMusicSyncWidget(QWidget):
         # footer button bar (embedded by default; can be 'sticky' when wrapped in a scroll area)
         self.footer_bar = QWidget(self)
         self.footer_bar.setObjectName("MusicClipCreatorFooter")
-        footer_lay = QHBoxLayout(self.footer_bar)
-        footer_lay.setContentsMargins(0, 0, 0, 0)
-        footer_lay.setSpacing(6)
+        footer_outer = QVBoxLayout(self.footer_bar)
+        footer_outer.setContentsMargins(0, 0, 0, 0)
+        footer_outer.setSpacing(4)
+
+        footer_row_top = QHBoxLayout()
+        footer_row_top.setContentsMargins(0, 0, 0, 0)
+        footer_row_top.setSpacing(6)
+
+        footer_row_bottom = QHBoxLayout()
+        footer_row_bottom.setContentsMargins(0, 0, 0, 0)
+        footer_row_bottom.setSpacing(6)
 
         self.btn_analyze = QPushButton("Analyze", self.footer_bar)
         self.btn_generate = QPushButton("Generate Clip", self.footer_bar)
+
+        self.btn_queue = QPushButton("Queue Clip", self.footer_bar)
+        try:
+            self.btn_queue.setToolTip("Queue this Music Clip Creator job to the Queue tab instead of rendering immediately.")
+        except Exception:
+            pass
+
+        # Hover style for the "Generate Clip" button: match the top banner gradient.
+        try:
+            self.btn_generate.setObjectName("mvGenerate")
+            self.btn_generate.setStyleSheet(
+                "#mvGenerate:hover {"
+                " color: white;"
+                " border: 1px solid rgba(255, 255, 255, 70);"
+                " background: qlineargradient(x1:0, y1:0, x2:1, y2:0,"
+                "   stop:0 #cd28ff, stop:0.5 #9f4df2, stop:1 #28ffbb);"
+                "}"
+                "#mvGenerate:pressed {"
+                " color: white;"
+                " border: 1px solid rgba(255, 255, 255, 90);"
+                " background: qlineargradient(x1:0, y1:0, x2:1, y2:0,"
+                "   stop:0 #b020e6, stop:0.5 #8440d6, stop:1 #20d6a0);"
+                "}"
+            )
+        except Exception:
+            pass
 
         # New: View results (open Media Explorer on output folder)
         self.btn_view_results = QPushButton("View results", self.footer_bar)
@@ -6386,13 +7941,25 @@ class AutoMusicSyncWidget(QWidget):
             "Stop any running job, clear loaded sources and reset all settings to defaults."
         )
 
-        footer_lay.addWidget(self.btn_analyze)
-        footer_lay.addWidget(self.btn_generate)
-        footer_lay.addWidget(self.btn_view_results)
-        footer_lay.addWidget(self.btn_presets)
-        footer_lay.addWidget(self.btn_cancel)
-        footer_lay.addWidget(self.btn_reset_all)
-        footer_lay.addStretch(1)
+        # Row 1: main actions
+        footer_row_top.addWidget(self.btn_analyze)
+        footer_row_top.addWidget(self.btn_generate)
+        try:
+            footer_row_top.addWidget(self.btn_queue)
+        except Exception:
+            pass
+        footer_row_top.addStretch(1)
+
+        # Row 2: secondary actions
+        footer_row_bottom.addWidget(self.btn_view_results)
+        footer_row_bottom.addWidget(self.btn_presets)
+        footer_row_bottom.addWidget(self.btn_cancel)
+        footer_row_bottom.addWidget(self.btn_reset_all)
+        footer_row_bottom.addStretch(1)
+
+        footer_outer.addLayout(footer_row_top)
+        footer_outer.addLayout(footer_row_bottom)
+
 
         if not self._sticky_footer:
             main.addWidget(self.footer_bar)
@@ -6437,6 +8004,10 @@ class AutoMusicSyncWidget(QWidget):
         self.btn_analyze.clicked.connect(self._on_analyze)
         self.btn_generate.clicked.connect(self._on_generate)
         try:
+            self.btn_queue.clicked.connect(self._on_queue_generate)
+        except Exception:
+            pass
+        try:
             self.btn_view_results.clicked.connect(self._open_output_in_media_explorer)
         except Exception:
             pass
@@ -6462,6 +8033,7 @@ class AutoMusicSyncWidget(QWidget):
         self.slider_cine_freeze_zoom.valueChanged.connect(self._on_cine_freeze_zoom_changed)
         self.slider_cine_tear_v_strength.valueChanged.connect(self._on_cine_tear_v_strength_changed)
         self.slider_cine_tear_h_strength.valueChanged.connect(self._on_cine_tear_h_strength_changed)
+        self.slider_cine_color_cycle_speed.valueChanged.connect(self._on_cine_color_cycle_speed_changed)
         self.slider_cine_reverse_len.valueChanged.connect(self._on_cine_reverse_len_changed)
         self.slider_cine_ramp_in.valueChanged.connect(self._on_cine_ramp_in_changed)
         self.slider_cine_ramp_out.valueChanged.connect(self._on_cine_ramp_out_changed)
@@ -6510,6 +8082,17 @@ class AutoMusicSyncWidget(QWidget):
         self.check_impact_enable.stateChanged.connect(lambda s: self._maybe_release_nofx() if s else None)
 # Global 'No FX' master switch
         self.check_nofx.stateChanged.connect(self._on_nofx_toggled)
+        # Timed strobe signals
+        try:
+            self.check_strobe_on_time.stateChanged.connect(self._on_strobe_on_time_toggle)
+        except Exception:
+            pass
+        try:
+            self.btn_strobe_time_add.clicked.connect(self._on_strobe_time_add)
+            self.btn_strobe_time_remove.clicked.connect(self._on_strobe_time_remove_selected)
+            self.btn_strobe_time_clear.clicked.connect(self._on_strobe_time_clear_all)
+        except Exception:
+            pass
 
         # If visuals overlay or its strategies are enabled, automatically release No FX.
         if hasattr(self, "check_visual_overlay"):
@@ -6889,6 +8472,10 @@ class AutoMusicSyncWidget(QWidget):
             "Directional push (slide)",
             "Wipe",
             "Smooth zoom crossfade",
+            "Curtain open (doors)",
+            "Pixelize",
+            "Distance (liquid blend)",
+            "Wind smears",
         ]
         dlg = QDialog(self)
         dlg.setWindowTitle("Manage transitions")
@@ -6924,6 +8511,12 @@ class AutoMusicSyncWidget(QWidget):
 
 
 
+
+        # Persist immediately so it survives app restart even if the user doesn't render right away.
+        try:
+            self._save_settings()
+        except Exception:
+            pass
     def _update_transition_visibility(self) -> None:
         """Show or hide the transitions dropdown row based on random mode."""
         # If random transitions are enabled, hide the label + dropdown since
@@ -6966,6 +8559,17 @@ class AutoMusicSyncWidget(QWidget):
 
 
 
+
+        # Reset UI state
+        try:
+            self._queue_requested = False
+        except Exception:
+            pass
+        try:
+            if getattr(self, "_direct_run_active", False):
+                self._set_direct_run_active(False)
+        except Exception:
+            pass
     def _on_reset_all(self) -> None:
         """Fully reset the Music Clip Creator state and clear loaded sources."""
         # Stop any running render or background scan.
@@ -6985,6 +8589,18 @@ class AutoMusicSyncWidget(QWidget):
                 except Exception:
                     pass
                 self._scan_worker = None
+        except Exception:
+            pass
+
+
+        # Reset UI state (DIRECT RUN label / queued flag)
+        try:
+            self._queue_requested = False
+        except Exception:
+            pass
+        try:
+            if getattr(self, "_direct_run_active", False):
+                self._set_direct_run_active(False)
         except Exception:
             pass
 
@@ -7089,7 +8705,7 @@ class AutoMusicSyncWidget(QWidget):
     def _on_presets_clicked(self) -> None:
         """
         Show a small dialog with the built-in presets, apply the choice and
-        immediately start a render.
+        immediately queue a render.
 
         Important: presets ONLY touch visual / FX options. They do not
         change which audio/clip paths are selected, the output folder or
@@ -7119,7 +8735,7 @@ class AutoMusicSyncWidget(QWidget):
             "  • the output folder or output resolution.\n\n"
             "Set those first, then pick a preset and press OK.\n"
             "After you confirm, the preset is applied and the normal\n"
-            "'Generate Music Clip' flow is started.",
+            "'Queue Clip' flow is started (check the Queue tab).",
             dlg,
         )
         info.setWordWrap(True)
@@ -7150,8 +8766,8 @@ class AutoMusicSyncWidget(QWidget):
         preset_id, preset_name, _ = presets[row]
         self._apply_preset(preset_id, preset_name)
 
-        # Fire off the normal generate logic with the chosen preset.
-        self._on_generate()
+        # Queue the clip with the chosen preset.
+        self._on_queue_generate()
 
     def _apply_preset(self, preset_id: str, preset_name: str) -> None:
         """
@@ -7229,7 +8845,7 @@ class AutoMusicSyncWidget(QWidget):
         # Transitions + beats baseline
         self.combo_transitions.setCurrentIndex(1)  # Hard cuts
         self.check_trans_random.setChecked(False)
-        self.spin_beats_per_seg.setValue(2)        # mid-speed by default
+        self.spin_beats_per_seg.setValue(8)        # mid-speed by default
         self.combo_fx.setCurrentIndex(1)           # Moderate by default
 
         # ---------- JSON‑driven preset body ----------
@@ -7385,6 +9001,39 @@ class AutoMusicSyncWidget(QWidget):
         self.combo_clip_order.setCurrentIndex(int(s.value("clip_order", self.combo_clip_order.currentIndex())))
         self.combo_transitions.setCurrentIndex(int(s.value("transitions_mode", self.combo_transitions.currentIndex())))
         self.check_trans_random.setChecked(bool(int(s.value("transitions_random", int(self.check_trans_random.isChecked())))))
+        # Restore the allowed transition styles for Random transitions
+        try:
+            raw = s.value("transitions_random_enabled_modes", "", str)
+        except Exception:
+            raw = ""
+        modes = []
+        if raw:
+            try:
+                data = json.loads(raw)
+                if isinstance(data, (list, tuple)):
+                    modes = [int(x) for x in data]
+                else:
+                    modes = [int(x.strip()) for x in str(raw).split(",") if x.strip()]
+            except Exception:
+                try:
+                    modes = [int(x.strip()) for x in str(raw).split(",") if x.strip()]
+                except Exception:
+                    modes = []
+        cleaned = []
+        for x in modes:
+            try:
+                xi = int(x)
+            except Exception:
+                continue
+            if 0 <= xi <= 14 and xi not in cleaned:
+                cleaned.append(xi)
+        if cleaned:
+            self._enabled_transition_modes = set(cleaned)
+        else:
+            # If nothing was saved yet, keep the current default (all enabled)
+            if not getattr(self, "_enabled_transition_modes", None):
+                self._enabled_transition_modes = {0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14}
+
         self.spin_seed.setValue(int(s.value("seed_value", self.spin_seed.value())))
         self.check_use_seed.setChecked(bool(int(s.value("use_seed", int(self.check_use_seed.isChecked())))))
         self.combo_res.setCurrentIndex(int(s.value("res_mode", self.combo_res.currentIndex())))
@@ -7436,6 +9085,8 @@ class AutoMusicSyncWidget(QWidget):
         self.slider_cine_tear_v_strength.setValue(int(s.value("cine_tear_v_strength", self.slider_cine_tear_v_strength.value())))
         self.check_cine_tear_h.setChecked(bool(int(s.value("cine_tear_h", int(self.check_cine_tear_h.isChecked())))))
         self.slider_cine_tear_h_strength.setValue(int(s.value("cine_tear_h_strength", self.slider_cine_tear_h_strength.value())))
+        self.check_cine_color_cycle.setChecked(bool(int(s.value("cine_color_cycle", int(self.check_cine_color_cycle.isChecked())))))
+        self.slider_cine_color_cycle_speed.setValue(int(s.value("cine_color_cycle_speed_ms", int(self.slider_cine_color_cycle_speed.value()))))
 
         self.check_cine_stutter.setChecked(bool(int(s.value("cine_stutter", int(self.check_cine_stutter.isChecked())))))
         self.spin_cine_stutter_repeats.setValue(int(s.value("cine_stutter_repeats", self.spin_cine_stutter_repeats.value())))
@@ -7522,6 +9173,41 @@ class AutoMusicSyncWidget(QWidget):
         self.check_impact_fire_multi.setChecked(bool(int(s.value("impact_fire_multi", int(self.check_impact_fire_multi.isChecked())))))
         self.slider_impact_fire_multi.setValue(int(s.value("impact_fire_multi_intensity", self.slider_impact_fire_multi.value())))
         self.check_impact_random.setChecked(bool(int(s.value("impact_random", int(self.check_impact_random.isChecked())))))
+        # Timed strobe (flash on time)
+        try:
+            self.check_strobe_on_time.setChecked(bool(int(s.value("strobe_on_time", int(self.check_strobe_on_time.isChecked())))))
+        except Exception:
+            try:
+                self.check_strobe_on_time.setChecked(False)
+            except Exception:
+                pass
+
+        times: List[float] = []
+        try:
+            raw = s.value("strobe_on_time_times", "", str)
+        except Exception:
+            raw = ""
+        if raw:
+            try:
+                data = json.loads(raw)
+                if isinstance(data, list):
+                    for v in data:
+                        try:
+                            fv = float(v)
+                        except Exception:
+                            continue
+                        if fv >= 0.0:
+                            times.append(fv)
+            except Exception:
+                times = []
+        try:
+            self._set_strobe_times(times)
+        except Exception:
+            pass
+        try:
+            self._on_strobe_on_time_toggle(int(self.check_strobe_on_time.isChecked()))
+        except Exception:
+            pass
 
         # Hidden break-impact FX rows are always disabled, even if older settings had them on.
         for cb in (
@@ -7544,6 +9230,7 @@ class AutoMusicSyncWidget(QWidget):
         self._on_cine_toggle(int(self.check_cine_enable.isChecked()))
         self._on_cine_freeze_len_changed(self.slider_cine_freeze_len.value())
         self._on_cine_freeze_zoom_changed(self.slider_cine_freeze_zoom.value())
+        self._on_cine_color_cycle_speed_changed(self.slider_cine_color_cycle_speed.value())
         self._on_cine_reverse_len_changed(self.slider_cine_reverse_len.value())
         self._on_cine_ramp_in_changed(self.slider_cine_ramp_in.value())
         self._on_cine_ramp_out_changed(self.slider_cine_ramp_out.value())
@@ -7662,6 +9349,11 @@ class AutoMusicSyncWidget(QWidget):
         s.setValue("clip_order", self.combo_clip_order.currentIndex())
         s.setValue("transitions_mode", self.combo_transitions.currentIndex())
         s.setValue("transitions_random", int(self.check_trans_random.isChecked()))
+        # Remember which transition styles are enabled for Random transitions
+        try:
+            s.setValue("transitions_random_enabled_modes", json.dumps(sorted(getattr(self, "_enabled_transition_modes", []))))
+        except Exception:
+            pass
         s.setValue("seed_value", self.spin_seed.value())
         s.setValue("use_seed", int(self.check_use_seed.isChecked()))
         s.setValue("res_mode", self.combo_res.currentIndex())
@@ -7694,6 +9386,8 @@ class AutoMusicSyncWidget(QWidget):
         s.setValue("cine_tear_v_strength", int(self.slider_cine_tear_v_strength.value()))
         s.setValue("cine_tear_h", int(self.check_cine_tear_h.isChecked()))
         s.setValue("cine_tear_h_strength", int(self.slider_cine_tear_h_strength.value()))
+        s.setValue("cine_color_cycle", int(self.check_cine_color_cycle.isChecked()))
+        s.setValue("cine_color_cycle_speed_ms", int(self.slider_cine_color_cycle_speed.value()))
         s.setValue("cine_stutter", int(self.check_cine_stutter.isChecked()))
         s.setValue("cine_stutter_repeats", int(self.spin_cine_stutter_repeats.value()))
         s.setValue("cine_reverse", int(self.check_cine_reverse.isChecked()))
@@ -7755,6 +9449,14 @@ class AutoMusicSyncWidget(QWidget):
         s.setValue("impact_fire_multi", int(self.check_impact_fire_multi.isChecked()))
         s.setValue("impact_fire_multi_intensity", int(self.slider_impact_fire_multi.value()))
         s.setValue("impact_random", int(self.check_impact_random.isChecked()))
+
+        # Timed strobe (flash on time)
+        if hasattr(self, "check_strobe_on_time"):
+            s.setValue("strobe_on_time", int(self.check_strobe_on_time.isChecked()))
+            try:
+                s.setValue("strobe_on_time_times", json.dumps(self._get_strobe_times()))
+            except Exception:
+                s.setValue("strobe_on_time_times", "[]")
 
     # dialogs / helpers
 
@@ -8220,6 +9922,19 @@ class AutoMusicSyncWidget(QWidget):
         except Exception:
             pass
 
+    def _on_cine_color_cycle_speed_changed(self, value: int) -> None:
+        try:
+            v = int(value)
+        except Exception:
+            v = 400
+        # Clamp and snap to 50ms steps
+        v = max(100, min(1000, v))
+        v = int(round(v / 50.0) * 50)
+        try:
+            self.label_cine_color_cycle_speed.setText(f"{v:d} ms")
+        except Exception:
+            pass
+
     def _on_cine_reverse_len_changed(self, value: int) -> None:
         seconds = value / 100.0
         try:
@@ -8470,6 +10185,7 @@ class AutoMusicSyncWidget(QWidget):
             "check_cine_freeze",
             "check_cine_tear_v",
             "check_cine_tear_h",
+            "check_cine_color_cycle",
             "check_cine_stutter",
             "check_cine_reverse",
             "check_cine_speedup_forward",
@@ -8506,6 +10222,7 @@ class AutoMusicSyncWidget(QWidget):
             getattr(self, "check_cine_freeze", None),
             getattr(self, "check_cine_tear_v", None),
             getattr(self, "check_cine_tear_h", None),
+            getattr(self, "check_cine_color_cycle", None),
             getattr(self, "check_cine_stutter", None),
             getattr(self, "check_cine_reverse", None),
             getattr(self, "check_cine_speedup_forward", None),
@@ -8597,6 +10314,93 @@ class AutoMusicSyncWidget(QWidget):
         if not any_cb:
             return
         self._set_all_impact_toggles(not all_on)
+
+
+    # --- timed strobe (flash on time) helpers -----------------------------
+    def _strobe_times_sorted_unique(self, values: List[float]) -> List[float]:
+        out: List[float] = []
+        for v in values:
+            try:
+                fv = float(v)
+            except Exception:
+                continue
+            if fv < 0.0:
+                continue
+            # de-dup with small tolerance
+            dup = False
+            for ex in out:
+                if abs(ex - fv) < 0.01:
+                    dup = True
+                    break
+            if not dup:
+                out.append(fv)
+        out.sort()
+        return out
+
+    def _set_strobe_times(self, times: List[float]) -> None:
+        self._strobe_on_time_times = self._strobe_times_sorted_unique(times)
+        try:
+            self.list_strobe_times.clear()
+        except Exception:
+            return
+        for t in self._strobe_on_time_times:
+            item = QListWidgetItem(f"{t:.2f} s")
+            item.setData(Qt.UserRole, float(t))
+            self.list_strobe_times.addItem(item)
+
+    def _get_strobe_times(self) -> List[float]:
+        # Source of truth: internal list (kept in sync with the list widget).
+        try:
+            return list(self._strobe_on_time_times)
+        except Exception:
+            return []
+
+    def _on_strobe_on_time_toggle(self, state: int) -> None:
+        enabled = bool(state)
+        try:
+            self.strobe_time_options.setVisible(enabled)
+        except Exception:
+            pass
+        if enabled:
+            # Turning this on implies FX, so auto-release No FX.
+            try:
+                self._maybe_release_nofx()
+            except Exception:
+                pass
+
+    def _on_strobe_time_add(self) -> None:
+        try:
+            t = float(self.spin_strobe_time.value())
+        except Exception:
+            t = 0.0
+        times = self._get_strobe_times()
+        times.append(t)
+        self._set_strobe_times(times)
+        try:
+            self._maybe_release_nofx()
+        except Exception:
+            pass
+
+    def _on_strobe_time_remove_selected(self) -> None:
+        try:
+            sel = self.list_strobe_times.selectedItems()
+        except Exception:
+            sel = []
+        if not sel:
+            return
+        cur = self._get_strobe_times()
+        rem = set()
+        for it in sel:
+            try:
+                rem.add(float(it.data(Qt.UserRole)))
+            except Exception:
+                pass
+        new = [t for t in cur if all(abs(t - r) >= 0.01 for r in rem)]
+        self._set_strobe_times(new)
+
+    def _on_strobe_time_clear_all(self) -> None:
+        self._set_strobe_times([])
+
 
 
 
@@ -8752,6 +10556,12 @@ class AutoMusicSyncWidget(QWidget):
             # Turn off break impact FX
             try:
                 self.check_impact_enable.setChecked(False)
+            except Exception:
+                pass
+            # Turn off timed strobe
+            try:
+                if hasattr(self, "check_strobe_on_time"):
+                    self.check_strobe_on_time.setChecked(False)
             except Exception:
                 pass
             # Disable random transitions to avoid surprise flash / creative modes.
@@ -9051,6 +10861,19 @@ class AutoMusicSyncWidget(QWidget):
         return None
 
 
+    def _set_direct_run_active(self, active: bool) -> None:
+        """Update the Generate button label while a DIRECT RUN is in progress."""
+        try:
+            self._direct_run_active = bool(active)
+        except Exception:
+            pass
+        try:
+            btn = getattr(self, "btn_generate", None)
+            if btn is not None:
+                btn.setText("Generating Clip" if active else "Generate Clip")
+        except Exception:
+            pass
+
 
     def _get_fixed_resolution(self) -> Tuple[int, int] | None:
         text = self.combo_res.currentText()
@@ -9082,13 +10905,30 @@ class AutoMusicSyncWidget(QWidget):
             return
         audio, video, out_dir = resolved
 
+
+        # DIRECT RUN UX: toast + button label while render is running.
+        direct_run = not bool(getattr(self, "_queue_requested", False))
+        if direct_run:
+            try:
+                self._set_direct_run_active(True)
+            except Exception:
+                pass
+            try:
+                self._show_toast("DIRECT RUN started, don't start other heavy CPU jobs while it is running.")
+            except Exception:
+                pass
+
         # Always analyze fresh for every creation so we never reuse
         # segments from a previous music track, even if paths and
         # settings look the same.
         self._on_analyze()
         if self._analysis is None:
+            try:
+                if getattr(self, "_direct_run_active", False):
+                    self._set_direct_run_active(False)
+            except Exception:
+                pass
             return
-
         # Stash paths so we can continue once the clip scan finishes.
         self._pending_audio = audio
         self._pending_video = video
@@ -9117,6 +10957,17 @@ class AutoMusicSyncWidget(QWidget):
         self._scan_worker.finished_ok.connect(self._on_scan_finished)
         self._scan_worker.failed.connect(self._on_scan_failed)
         self._scan_worker.start()
+
+    
+    def _on_queue_generate(self) -> None:
+        """Queue the current Music Clip Creator job instead of rendering immediately."""
+        try:
+            self._queue_requested = True
+        except Exception:
+            pass
+        # Reuse the same pipeline as Generate (analyze + scan + build timeline),
+        # but the final step will enqueue a headless render job.
+        self._on_generate()
 
     def _continue_generate_with_sources(
         self,
@@ -9277,6 +11128,8 @@ class AutoMusicSyncWidget(QWidget):
             cine_tear_v_strength=self.slider_cine_tear_v_strength.value() / 100.0,
             cine_tear_h=bool(self.check_cine_tear_h.isChecked()),
             cine_tear_h_strength=self.slider_cine_tear_h_strength.value() / 100.0,
+            cine_color_cycle=bool(self.check_cine_color_cycle.isChecked()),
+            cine_color_cycle_speed_ms=int(self.slider_cine_color_cycle_speed.value()),
             cine_stutter_repeats=int(self.spin_cine_stutter_repeats.value()),
             cine_reverse_len=self.slider_cine_reverse_len.value() / 100.0,
             cine_ramp_in=self.slider_cine_ramp_in.value() / 100.0,
@@ -9318,6 +11171,8 @@ class AutoMusicSyncWidget(QWidget):
             impact_random=impact_random,
             impact_flash_strength=impact_flash_strength,
             impact_flash_speed_ms=impact_flash_speed_ms,
+            strobe_on_time=bool(getattr(self, 'check_strobe_on_time', None) and self.check_strobe_on_time.isChecked() and not nofx),
+            strobe_on_time_times=self._get_strobe_times() if (getattr(self, 'check_strobe_on_time', None) and self.check_strobe_on_time.isChecked() and not nofx) else None,
             impact_shock_strength=impact_shock_strength,
             impact_echo_trail_strength=impact_echo_trail_strength,
             impact_confetti_density=impact_confetti_density,
@@ -9333,8 +11188,12 @@ class AutoMusicSyncWidget(QWidget):
         )
         if not segments:
             self._error("Timeline empty", "Failed to build a video timeline.")
+            try:
+                if getattr(self, "_direct_run_active", False):
+                    self._set_direct_run_active(False)
+            except Exception:
+                pass
             return
-
         fixed = self._get_fixed_resolution()
 
 
@@ -9369,6 +11228,33 @@ class AutoMusicSyncWidget(QWidget):
         elif getattr(self, "check_visual_strategy_section", None) and self.check_visual_strategy_section.isChecked():
             visual_strategy = 2
 
+        
+        # If requested, enqueue instead of render-now.
+        if getattr(self, "_queue_requested", False):
+            try:
+                self._queue_requested = False
+            except Exception:
+                pass
+            try:
+                self._enqueue_render_job(
+                    audio=audio,
+                    out_dir=out_dir,
+                    analysis=self._analysis,
+                    segments=segments,
+                    target_res=target_res,
+                    transition_mode=transition_mode,
+                    use_visual_overlay=bool(getattr(self, "check_visual_overlay", None) and self.check_visual_overlay.isChecked()),
+                    visual_strategy=visual_strategy,
+                    visual_section_overrides=getattr(self, "_visual_section_overrides", None) if visual_strategy == 2 else None,
+                    visual_overlay_opacity=float(getattr(self, "visual_overlay_opacity", 0.25)),
+                )
+            except Exception as e:
+                try:
+                    self._error("Queue error", str(e))
+                except Exception:
+                    pass
+            return
+
         self._worker = RenderWorker(
             audio_path=audio,
             output_dir=out_dir,
@@ -9385,12 +11271,125 @@ class AutoMusicSyncWidget(QWidget):
             visual_strategy=visual_strategy,
             visual_section_overrides=getattr(self, "_visual_section_overrides", None) if visual_strategy == 2 else None,
             visual_overlay_opacity=float(getattr(self, "visual_overlay_opacity", 0.25)),
+            strobe_on_time_times=self._get_strobe_times() if (getattr(self, "check_strobe_on_time", None) and self.check_strobe_on_time.isChecked() and not nofx) else None,
+            strobe_flash_strength=float(getattr(self, "slider_impact_flash", None).value() / 100.0) if hasattr(self, "slider_impact_flash") else 0.0,
+            strobe_flash_speed_ms=int(getattr(self, "slider_impact_flash_speed", None).value()) if hasattr(self, "slider_impact_flash_speed") else 250,
         )
         self._worker.progress.connect(self._on_worker_progress)
         self._worker.finished_ok.connect(self._on_worker_finished)
         self._worker.failed.connect(self._on_worker_failed)
         self._worker.start()
 
+
+    
+    def _enqueue_render_job(
+        self,
+        audio: str,
+        out_dir: str,
+        analysis: "MusicAnalysisResult",
+        segments: List["TimelineSegment"],
+        target_res: Optional[Tuple[int, int]],
+        transition_mode: int,
+        use_visual_overlay: bool,
+        visual_strategy: int,
+        visual_section_overrides: Optional[Dict[str, Optional[str]]],
+        visual_overlay_opacity: float,
+    ) -> None:
+        """Serialize the current timeline and enqueue a headless render job in Queue."""
+        try:
+            from helpers.queue_adapter import enqueue_tool_job
+        except Exception:
+            # Fallback when helpers is not a package (dev runs)
+            from queue_adapter import enqueue_tool_job  # type: ignore
+
+        # Deterministic output name for the queued job (so the Queue can point to the produced file).
+        base = os.path.splitext(os.path.basename(audio))[0]
+        safe_base = _sanitize_stem(base)
+        ts = datetime.now().strftime("%d%m%H%M%S")
+        out_name = f"{safe_base}_clip_{ts}.mp4"
+        out_final = os.path.join(out_dir, out_name)
+
+        payload_dir = os.path.join(out_dir, "_payloads")
+        _ensure_dir(payload_dir)
+        payload_path = os.path.join(payload_dir, f"mclip_job_{ts}.json")
+
+        payload = {
+            "audio_path": audio,
+            "output_dir": out_dir,
+            "ffmpeg": self._ffmpeg,
+            "ffprobe": self._ffprobe,
+            "target_resolution": list(target_res) if target_res else None,
+            "fit_mode": int(self.combo_fit.currentIndex()),
+            "transition_mode": int(transition_mode),
+            "intro_fade": bool(self.check_intro_fade.isChecked()),
+            "outro_fade": bool(self.check_outro_fade.isChecked()),
+            "use_visual_overlay": bool(use_visual_overlay),
+            "visual_strategy": int(visual_strategy),
+            "visual_section_overrides": visual_section_overrides,
+            "visual_overlay_opacity": float(visual_overlay_opacity),
+            "out_name_override": out_name,
+            "strobe_on_time_times": self._get_strobe_times() if (getattr(self, "check_strobe_on_time", None) and self.check_strobe_on_time.isChecked() and not (getattr(self, "check_nofx", None) and self.check_nofx.isChecked())) else None,
+            "strobe_flash_strength": float(getattr(self, "slider_impact_flash", None).value() / 100.0) if hasattr(self, "slider_impact_flash") else 0.0,
+            "strobe_flash_speed_ms": int(getattr(self, "slider_impact_flash_speed", None).value()) if hasattr(self, "slider_impact_flash_speed") else 250,
+            "analysis": _analysis_to_dict(analysis),
+            "segments": _segments_to_list(segments),
+        }
+        with open(payload_path, "w", encoding="utf-8") as f:
+            json.dump(payload, f, indent=2)
+
+        # Build a portable python command to run the headless job.
+        py = sys.executable or "python"
+        payload_path_esc = payload_path.replace("\\", "\\\\").replace("'", "\\'")
+        cmd_code = (
+            "import sys\n"
+            f"p=r'{payload_path_esc}'\n"
+            "try:\n"
+            "    import helpers.auto_music_sync as m\n"
+            "except Exception:\n"
+            "    import auto_music_sync as m\n"
+            "sys.exit(m.run_queue_payload(p))\n"
+        )
+        cmd = [py, "-u", "-c", cmd_code]
+
+        args = {
+            "cmd": cmd,
+            "outfile": out_final,
+            "label": f"Music Clip Creator: {safe_base}",
+        }
+        try:
+            # Ensure the command runs from app root so imports resolve.
+            args["cwd"] = str(Path(".").resolve())
+        except Exception:
+            pass
+
+        # Enqueue as a tools_ffmpeg job so the existing worker logic can run it.
+        ok = enqueue_tool_job("tools_ffmpeg", audio, out_dir, args, priority=560)
+        if not ok:
+            raise RuntimeError("Failed to enqueue job (job file could not be written).")
+
+        try:
+            self.progress.setValue(0)
+            self.progress.setFormat("Queued.")
+        except Exception:
+            pass
+
+        # Switch to Queue tab automatically (same behavior as Tools tab).
+        try:
+            tabs = self.parent()
+            while tabs is not None and not isinstance(tabs, QTabWidget):
+                tabs = tabs.parent()
+            if isinstance(tabs, QTabWidget):
+                for i in range(tabs.count()):
+                    if str(tabs.tabText(i)).lower().startswith("queue"):
+                        tabs.setCurrentIndex(i)
+                        break
+        except Exception:
+            pass
+
+        try:
+            self._show_toast("Added to Queue, follow progress in the worker or the Queue Tab")
+        except Exception:
+            pass
 
     def _update_sources_list(self) -> None:
         if not hasattr(self, "list_sources"):
@@ -9422,6 +11421,11 @@ class AutoMusicSyncWidget(QWidget):
             self._pending_audio = None
             self._pending_video = None
             self._pending_out_dir = None
+            try:
+                if getattr(self, "_direct_run_active", False):
+                    self._set_direct_run_active(False)
+            except Exception:
+                pass
             return
 
         if not (self._pending_audio and self._pending_video and self._pending_out_dir):
@@ -9432,6 +11436,11 @@ class AutoMusicSyncWidget(QWidget):
             self._pending_audio = None
             self._pending_video = None
             self._pending_out_dir = None
+            try:
+                if getattr(self, "_direct_run_active", False):
+                    self._set_direct_run_active(False)
+            except Exception:
+                pass
             return
 
         # Cache discovered sources for the UI list
@@ -9462,6 +11471,18 @@ class AutoMusicSyncWidget(QWidget):
         self._pending_video = None
         self._pending_out_dir = None
 
+
+        # Reset UI state (DIRECT RUN label / queued flag) after scan errors.
+        try:
+            self._queue_requested = False
+        except Exception:
+            pass
+        try:
+            if getattr(self, "_direct_run_active", False):
+                self._set_direct_run_active(False)
+        except Exception:
+            pass
+
         if msg.startswith("__no_clips__"):
             self._error("No video clips", "Could not find any usable video sources.")
         elif msg.startswith("__all_short__"):
@@ -9490,6 +11511,12 @@ class AutoMusicSyncWidget(QWidget):
             self.progress.setFormat(msg)
 
     def _on_worker_finished(self, out_path: str) -> None:
+        try:
+            if getattr(self, "_direct_run_active", False):
+                self._set_direct_run_active(False)
+        except Exception:
+            pass
+
         self.progress.setValue(100)
         self.progress.setFormat("Done.")
         QMessageBox.information(
@@ -9501,6 +11528,12 @@ class AutoMusicSyncWidget(QWidget):
         self._worker = None
 
     def _on_worker_failed(self, msg: str) -> None:
+        try:
+            if getattr(self, "_direct_run_active", False):
+                self._set_direct_run_active(False)
+        except Exception:
+            pass
+
         self.progress.setValue(0)
         self.progress.setFormat("Failed.")
         self._error("Music Clip Creator failed", msg)
@@ -9517,6 +11550,78 @@ class OneClickVideoClipTab(QWidget):
 
         outer = QVBoxLayout(self)
         outer.setContentsMargins(0, 0, 0, 0)
+
+        # --- Fancy banner at the top ---
+        banner_wrap = QWidget(self)
+        bw = QVBoxLayout(banner_wrap)
+        bw.setContentsMargins(6, 4, 6, 0)
+        bw.setSpacing(0)
+
+        banner = QLabel('Create a music videoclip', banner_wrap)
+        banner.setObjectName('mvBanner')
+        banner.setAlignment(Qt.AlignCenter)
+        banner.setFixedHeight(48)
+        banner.setStyleSheet(
+            "#mvBanner {"
+            " font-size: 15px;"
+            " font-weight: 600;"
+            " padding: 8px 17px;"
+            " border-radius: 12px;"
+            " margin: 0 0 6px 0;"
+            " color: white;"
+            " background: qlineargradient("
+            "   x1:0, y1:0, x2:1, y2:0,"
+            "   stop:0 #cd28ff,"
+            "   stop:0.5 #9f4df2,"
+            "   stop:1 #28ffbb"
+            " );"
+            " letter-spacing: 0.5px;"
+            "}"
+        )
+        bw.addWidget(banner)
+
+        # Apply persisted banner settings (hide / greyscale) immediately.
+        try:
+            s = QSettings("FrameVision", "FrameVision")
+            en = bool(s.value("banner_enabled", True, type=bool))
+            col = bool(s.value("banner_colored", True, type=bool))
+            try:
+                banner_wrap.setVisible(en)
+            except Exception:
+                pass
+            try:
+                banner.setVisible(en)
+            except Exception:
+                pass
+            if not col:
+                try:
+                    orig = banner.styleSheet() or ""
+                    banner.setProperty("fv_banner_orig_style", orig)
+                    # Force grey gradient (same logic as Settings tab helper)
+                    key = "background:"
+                    idx2 = orig.find(key)
+                    grey_block = (
+                        " background: qlineargradient("
+                        "   x1:0, y1:0, x2:1, y2:0,"
+                        "   stop:0 #e0e0e0,"
+                        "   stop:0.5 #b0b0b0,"
+                        "   stop:1 #707070"
+                        " );"
+                    )
+                    if idx2 == -1:
+                        banner.setStyleSheet(orig + grey_block)
+                    else:
+                        semi = orig.find(";", idx2)
+                        if semi == -1:
+                            semi = len(orig)
+                        banner.setStyleSheet(orig[:idx2] + grey_block + orig[semi+1:])
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
+        outer.addWidget(banner_wrap)
+        outer.addSpacing(4)
 
         sc = QScrollArea(self)
         sc.setWidgetResizable(True)

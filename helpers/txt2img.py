@@ -17,6 +17,29 @@ def _unique_path(p: _P) -> _P:
     except Exception:
         return _P(p)
 
+
+# --- sd-cli.exe / sd.exe preferred location (GGUF engines) ---
+def _preferred_sd_cli_from_presets_bin(root_dir: _P):
+    """Prefer <root>/presets/bin/{sd-cli.exe, sd.exe} for GGUF engines, fall back elsewhere."""
+    try:
+        rd = _P(root_dir)
+    except Exception:
+        rd = _P('.')
+    cand = [
+        rd / 'presets' / 'bin' / 'sd-cli.exe',
+        rd / 'presets' / 'bin' / 'sd.exe',
+        rd / 'presets' / 'bin' / 'sd-cli',
+        rd / 'presets' / 'bin' / 'sd',
+    ]
+    for c in cand:
+        try:
+            if c.exists() and c.is_file():
+                return c
+        except Exception:
+            continue
+    return None
+
+
 # === QImageIO maxalloc disabled by patch ===
 import os as _qt_img_os
 _qt_img_os.environ["QT_IMAGEIO_MAXALLOC"] = "0"  # Disable env-based cap (0 = no limit)
@@ -67,6 +90,7 @@ def _merge_neg_csv(base: str, extra: str) -> str:
 
 # --- Quiet mode: suppress harmless logs/warnings for end users ---
 import os, warnings
+import re
 # Progress bars & banners
 os.environ.setdefault("HF_HUB_DISABLE_PROGRESS_BARS", "1")
 os.environ.setdefault("BITSANDBYTES_NOWELCOME", "1")
@@ -415,6 +439,18 @@ class Txt2ImgPane(QWidget):
             except Exception:
                 pass
             try:
+                if hasattr(self, "zimg_init_enable") and "init_image_enabled" in s:
+                    self.zimg_init_enable.setChecked(bool(s.get("init_image_enabled", False)))
+                if hasattr(self, "zimg_init_path") and "init_image" in s:
+                    self.zimg_init_path.setText(str(s.get("init_image") or ""))
+                if hasattr(self, "zimg_strength") and "img2img_strength" in s:
+                    try:
+                        self.zimg_strength.setValue(float(s.get("img2img_strength") or 0.35))
+                    except Exception:
+                        pass
+            except Exception:
+                pass
+            try:
                 if hasattr(self, 'seed') and 'seed' in s:
                     self.seed.setValue(int(s.get('seed') or 0))
                 sp = (s.get('seed_policy') or '').lower()
@@ -481,6 +517,11 @@ class Txt2ImgPane(QWidget):
                     self.vram_profile.setCurrentText(s.get('vram_profile'))
                 if hasattr(self,'sampler') and 'sampler' in s:
                     self.sampler.setCurrentText(s.get('sampler'))
+                if hasattr(self,'qwen_flow_shift') and 'flow_shift' in s:
+                    try:
+                        self.qwen_flow_shift.setValue(int(s.get('flow_shift', 3)))
+                    except Exception:
+                        pass
                 if hasattr(self,'attn_slicing') and 'attn_slicing' in s:
                     self.attn_slicing.setChecked(bool(s.get('attn_slicing')))
                 if hasattr(self,'vae_device') and 'vae_device' in s:
@@ -749,6 +790,13 @@ class Txt2ImgPane(QWidget):
         except Exception:
             pass
     def _apply_preset(self, name: str):
+        # Presets only apply to SD (diffusers) engine; ignore for Z-Image and Qwen
+        try:
+            ek = self._engine_key_selected() if hasattr(self, '_engine_key_selected') else 'diffusers'
+        except Exception:
+            ek = 'diffusers'
+        if str(ek).lower().strip() != 'diffusers':
+            return
         presets = {
             "Fashion Illustration": {"sampler":"DPM++ 2M (Karras)","steps":32,"cfg":5.5,"size":(768,768),
                                   "neg":"blurry, watermark, logo, text"},
@@ -973,6 +1021,9 @@ class Txt2ImgPane(QWidget):
                 return "zimage_gguf"
             return "zimage"
 
+        if ("qwen" in key) and (("2512" in key) or ("2.5" in key) or ("12b" in key)):
+            return "qwen2512"
+
         if ("diffusers" in key) or ("sd models" in key) or ("sd15" in key) or ("sdxl" in key):
             return "diffusers"
 
@@ -1000,6 +1051,25 @@ class Txt2ImgPane(QWidget):
         try:
             root = self._app_root()
             d = (root / "models" / "Z-Image-Turbo GGUF")
+            if not (d.exists() and d.is_dir()):
+                return False
+            min_bytes = 3 * 1024 * 1024 * 1024
+            for p in d.rglob("*"):
+                try:
+                    if p.is_file() and p.stat().st_size >= min_bytes:
+                        return True
+                except Exception:
+                    continue
+        except Exception:
+            return False
+        return False
+
+    
+    def _qwen2512_models_installed(self) -> bool:
+        """True if root/models/Qwen-Image-2512 GGUF contains a .gguf (or any file) >=3 GiB."""
+        try:
+            root = self._app_root()
+            d = (root / "models" / "Qwen-Image-2512 GGUF")
             if not (d.exists() and d.is_dir()):
                 return False
             min_bytes = 3 * 1024 * 1024 * 1024
@@ -1091,6 +1161,16 @@ class Txt2ImgPane(QWidget):
                     "'optional downloads' menu to download the correct model for this tool"
                 )
                 title = "Z-Image GGUF models missing"
+
+            # qwen 2.5 12B GGUF requires a >=3 GiB file in models/Qwen-Image-2512 GGUF
+            elif ek == "qwen2512":
+                if self._qwen2512_models_installed():
+                    return True
+                msg = (
+                    "Models are not installed yet, please select 'qwen 2.5 12B GGUF' from the "
+                    "'optional downloads' menu to download the correct model for this tool"
+                )
+                title = "qwen 2.5 12B GGUF models missing"
 
             # Diffusers SD engine: only block when SDXL is selected and the folder lacks a real model file (>=2 GiB)
             else:
@@ -1203,13 +1283,78 @@ class Txt2ImgPane(QWidget):
         _compact_combo(self.engine_combo, 10)
         try:
             self.engine_combo.addItem("SD models (SD15/SDXL)", "diffusers")
-            self.engine_combo.addItem("Z-Image Turbo", "zimage")
+            self.engine_combo.addItem("Z-Image Turbo (FP16)", "zimage")
             self.engine_combo.addItem("Z-Image Turbo (GGUF Low VRAM)", "zimage_gguf")
+            self.engine_combo.addItem("Qwen 2.5 12B GGUF (Low VRAM)", "qwen2512")
         except Exception:
             # Fallback without userData support
             self.engine_combo.addItem("SD models (SD15/SDXL)")
-            self.engine_combo.addItem("Z-Image Turbo")
+            self.engine_combo.addItem("Z-Image Turbo (FP16)")
             self.engine_combo.addItem("Z-Image Turbo (GGUF Low VRAM)")
+            self.engine_combo.addItem("qwen 2.5 12B GGUF (Low VRAM)")
+
+
+        # Optional installs hide wiring (remove_hide.py state)
+        # If the user hid an optional engine entry, remove it from the engine list.
+        try:
+            try:
+                from helpers import remove_hide as _rh  # type: ignore
+            except Exception:
+                import remove_hide as _rh  # type: ignore
+        except Exception:
+            _rh = None  # type: ignore
+
+        try:
+            if _rh is not None:
+                _st = _rh.load_state(_rh.get_state_path())
+                _hidden = set([str(x) for x in (_st.get("hidden_ids") or [])])
+                _hide_map = {
+                    "sdxl_txt2img": "diffusers",
+                    "zimage_turbo_fp16": "zimage",
+                    "zimage_turbo_gguf": "zimage_gguf",
+                    "qwen_image_2512": "qwen2512",
+                }
+                _hide_keys = set()
+                for _hid, _ek in _hide_map.items():
+                    if _hid in _hidden:
+                        _hide_keys.add(_ek)
+
+                if _hide_keys:
+                    for _i in range(self.engine_combo.count() - 1, -1, -1):
+                        try:
+                            _data = self.engine_combo.itemData(_i)
+                        except Exception:
+                            _data = None
+                        try:
+                            _d = (str(_data).strip().lower() if _data is not None else "")
+                        except Exception:
+                            _d = ""
+                        if not _d:
+                            try:
+                                _d = (self.engine_combo.itemText(_i) or "").lower()
+                            except Exception:
+                                _d = ""
+                        if _d in _hide_keys:
+                            try:
+                                self.engine_combo.removeItem(_i)
+                            except Exception:
+                                pass
+
+                # If everything is hidden, leave a disabled placeholder.
+                if self.engine_combo.count() <= 0:
+                    try:
+                        self.engine_combo.addItem("All engines hidden by user", "none")
+                    except Exception:
+                        try:
+                            self.engine_combo.addItem("All engines hidden by user")
+                        except Exception:
+                            pass
+                    try:
+                        self.engine_combo.setEnabled(False)
+                    except Exception:
+                        pass
+        except Exception:
+            pass
         self.engine_label = QLabel("Engine:")
         engine_row.addWidget(self.engine_label)
         engine_row.addWidget(self.engine_combo, 1)
@@ -1303,6 +1448,99 @@ class Txt2ImgPane(QWidget):
 
         form.addRow("Negative", self.negative)
 
+        # Z-Image: optional image-to-image (init image) to help keep the same person/composition
+        try:
+            self.zimg_init_enable = QCheckBox("Use init image (img2img)")
+            try:
+                self.zimg_init_enable.setToolTip("Optional (FP16 only): provide an initial image and Z-Image will generate a variation of it. Useful for keeping the same person.")
+            except Exception:
+                pass
+            self.zimg_init_path = QLineEdit()
+            try:
+                self.zimg_init_path.setPlaceholderText("Choose an image (optional)…")
+            except Exception:
+                pass
+            self.zimg_init_browse = QPushButton("Browse")
+            self.zimg_init_clear = QPushButton("Clear")
+            self.zimg_strength = QDoubleSpinBox()
+            try:
+                self.zimg_strength.setRange(0.0, 1.0)
+                self.zimg_strength.setSingleStep(0.05)
+                self.zimg_strength.setDecimals(2)
+                self.zimg_strength.setValue(0.35)
+                self.zimg_strength.setToolTip("Denoising strength: lower = closer to the input image; higher = more change.")
+            except Exception:
+                pass
+
+            def _zimg_i2i_sync_enabled(*_):
+                try:
+                    en = bool(self.zimg_init_enable.isChecked())
+                except Exception:
+                    en = False
+                for _w in (getattr(self, "zimg_init_path", None),
+                           getattr(self, "zimg_init_browse", None),
+                           getattr(self, "zimg_init_clear", None),
+                           getattr(self, "zimg_strength", None)):
+                    try:
+                        if _w is not None:
+                            _w.setEnabled(en)
+                    except Exception:
+                        pass
+
+            try:
+                self.zimg_init_enable.toggled.connect(_zimg_i2i_sync_enabled)
+            except Exception:
+                pass
+
+            def _zimg_pick_init_image():
+                try:
+                    fn, _ = QFileDialog.getOpenFileName(
+                        self,
+                        "Select init image",
+                        "",
+                        "Images (*.png *.jpg *.jpeg *.webp *.bmp)"
+                    )
+                except Exception:
+                    fn = ""
+                if fn:
+                    try:
+                        self.zimg_init_path.setText(fn)
+                        self.zimg_init_enable.setChecked(True)
+                    except Exception:
+                        pass
+
+            def _zimg_clear_init_image():
+                try:
+                    self.zimg_init_path.setText("")
+                except Exception:
+                    pass
+
+            try:
+                self.zimg_init_browse.clicked.connect(_zimg_pick_init_image)
+                self.zimg_init_clear.clicked.connect(_zimg_clear_init_image)
+            except Exception:
+                pass
+
+            zimg_i2i_wrap = QWidget()
+            zimg_i2i_row = QHBoxLayout(zimg_i2i_wrap)
+            zimg_i2i_row.setContentsMargins(0, 0, 0, 0)
+            zimg_i2i_row.addWidget(self.zimg_init_enable, 0)
+            zimg_i2i_row.addWidget(self.zimg_init_path, 1)
+            zimg_i2i_row.addWidget(QLabel("Strength"), 0)
+            zimg_i2i_row.addWidget(self.zimg_strength, 0)
+            zimg_i2i_row.addWidget(self.zimg_init_browse, 0)
+            zimg_i2i_row.addWidget(self.zimg_init_clear, 0)
+
+            self.zimg_i2i_label = QLabel("Init image")
+            self.zimg_i2i_wrap = zimg_i2i_wrap
+            form.addRow(self.zimg_i2i_label, self.zimg_i2i_wrap)
+
+            _zimg_i2i_sync_enabled()
+        except Exception:
+            # UI is best-effort; older builds may not have all widgets available
+            self.zimg_i2i_label = None
+            self.zimg_i2i_wrap = None
+
         # Seed + seed policy (Batch moved next to Generate button)
         row = QHBoxLayout()
         self.seed = QSpinBox(); self.seed.setRange(0, 2_147_483_647); self.seed.setValue(0)
@@ -1355,8 +1593,10 @@ class Txt2ImgPane(QWidget):
             ("1280x720 (16:9)", 1280, 720),
             ("1280x704 (16:9, WAN specific size)", 1280, 704),
             ("1344x768 (16:9)", 1344, 768),
+            ("1408×792 (16:9)", 1408, 792),
             ("1536x864 (16:9, max advised for SDXL)", 1536, 864),
             ("1792x1008 (16:9)", 1792, 1008),
+            ("1920x1080 (16:9), Qwen2512 only", 1920, 1080),
             ("1920x1088 (16:9)", 1920, 1088),
             ("2048x1152 (16:9)", 2048, 1152),
             ("2560x1440 (16:9)", 2560, 1440),
@@ -1371,6 +1611,7 @@ class Txt2ImgPane(QWidget):
             ("864x1536 (9:16, max advised for SDXL)", 864, 1536),
             ("972x1728 (9:16)", 972, 1728),
             ("1088x1920 (9:16)", 1088, 1920),
+            ("1080x1920 (9:16), qwen 2512 only", 1080, 1920),
             ("1152x2048 (9:16)", 1152, 2048),
             ("1440x2560 (9:16)", 1440, 2560),
             ("2560x4096 (9:16)", 2560, 4096),
@@ -1506,12 +1747,26 @@ class Txt2ImgPane(QWidget):
                 pass
         self.size_manual_w.valueChanged.connect(_sync_manual_w)
         self.size_manual_h.valueChanged.connect(_sync_manual_h)
+
         size_row.addWidget(self.size_combo, 2)
-        size_row.addWidget(QLabel("W:"), 0)
-        size_row.addWidget(self.size_manual_w, 0)
-        size_row.addWidget(QLabel("H:"), 0)
-        size_row.addWidget(self.size_manual_h, 0)
-        size_row.addWidget(self.size_lock, 0)
+
+        # Manual W/H + Lock aspect (advanced) — hidden by default per UX request
+        # Keep widgets alive for internal size bookkeeping / persistence, but do not show them.
+        self.size_manual_w_label = QLabel("W:")
+        self.size_manual_h_label = QLabel("H:")
+        try:
+            self.size_lock.setChecked(False)
+        except Exception:
+            pass
+        for _w in (self.size_manual_w_label, self.size_manual_w,
+                   self.size_manual_h_label, self.size_manual_h,
+                   self.size_lock):
+            try:
+                _w.setVisible(False)
+            except Exception:
+                pass
+        # (Intentionally not added to the layout)
+
         form.addRow(size_row)
         self.size_warning_label = QLabel("Higher resolutions can create 'clones' in the image")
         self.size_warning_label.setWordWrap(True)
@@ -1720,10 +1975,114 @@ class Txt2ImgPane(QWidget):
         self.gguf_vae_label = QLabel("GGUF VAE")
         mdl_form.addRow(self.gguf_vae_label, rowv)
 
+        # qwen 2.5 12B GGUF selector (diffusion model)
+        self.qwen_model_combo = QComboBox()
+        try:
+            _compact_combo(self.qwen_model_combo, 12)
+        except Exception:
+            pass
+        self.qwen_model_refresh = QPushButton("Refresh")
+        self.qwen_model_browse = QPushButton("Browse…")
+        roww = QHBoxLayout()
+        roww.addWidget(self.qwen_model_combo, 1)
+        roww.addWidget(self.qwen_model_refresh, 0)
+        roww.addWidget(self.qwen_model_browse, 0)
+        self.qwen_model_label = QLabel("qwen model")
+        mdl_form.addRow(self.qwen_model_label, roww)
+
+        # sd-cli.exe selector (used for GGUF engines: Z-Image Turbo GGUF and qwen 2.5 12B GGUF)
+        self.sd_cli_path = QLineEdit()
+        try:
+            self.sd_cli_path.setPlaceholderText("Auto (detect bundled sd-cli.exe)")
+        except Exception:
+            pass
+        self.sd_cli_browse = QPushButton("Browse…")
+        self.sd_cli_clear = QPushButton("Clear")
+        row_sdcli = QHBoxLayout()
+        row_sdcli.addWidget(self.sd_cli_path, 1)
+        row_sdcli.addWidget(self.sd_cli_browse, 0)
+        row_sdcli.addWidget(self.sd_cli_clear, 0)
+        self.sd_cli_label = QLabel("sd-cli.exe")
+        mdl_form.addRow(self.sd_cli_label, row_sdcli)
+
+        # Restore + persist sd-cli path
+        def _save_sd_cli_path():
+            try:
+                if hasattr(self, "_persist_settings"):
+                    self._persist_settings.setValue("sd_cli_path", self.sd_cli_path.text().strip())
+            except Exception:
+                pass
+
+        def _browse_sd_cli_path():
+            try:
+                start_dir = ""
+                try:
+                    from pathlib import Path as _P
+                    # Prefer last used folder, then ./tools, then app root
+                    prev = ""
+                    try:
+                        prev = self.sd_cli_path.text().strip()
+                    except Exception:
+                        prev = ""
+                    if prev:
+                        try:
+                            start_dir = str(_P(prev).resolve().parent)
+                        except Exception:
+                            start_dir = ""
+                    if not start_dir:
+                        cand = _P("./tools").resolve()
+                        if cand.exists() and cand.is_dir():
+                            start_dir = str(cand)
+                    if not start_dir:
+                        try:
+                            start_dir = str(_P(__file__).resolve().parents[1])
+                        except Exception:
+                            start_dir = str(_P(".").resolve())
+                except Exception:
+                    start_dir = ""
+
+                path, _ = QFileDialog.getOpenFileName(
+                    self,
+                    "Choose sd-cli.exe",
+                    start_dir or str(Path(".").resolve()),
+                    "sd-cli.exe (sd-cli.exe);;Executables (*.exe);;All files (*.*)"
+                )
+                if not path:
+                    return
+                self.sd_cli_path.setText(path)
+                _save_sd_cli_path()
+            except Exception as e:
+                try:
+                    print("[txt2img] browse sd-cli failed:", e)
+                except Exception:
+                    pass
+
+        def _clear_sd_cli_path():
+            try:
+                self.sd_cli_path.setText("")
+                _save_sd_cli_path()
+            except Exception:
+                pass
+
+        try:
+            self.sd_cli_browse.clicked.connect(_browse_sd_cli_path)
+            self.sd_cli_clear.clicked.connect(_clear_sd_cli_path)
+            self.sd_cli_path.textChanged.connect(lambda *_: _save_sd_cli_path())
+        except Exception:
+            pass
+
+        try:
+            if hasattr(self, "_persist_settings"):
+                _saved = self._persist_settings.value("sd_cli_path", "") or ""
+                if str(_saved).strip():
+                    self.sd_cli_path.setText(str(_saved).strip())
+        except Exception:
+            pass
+
         # Default hidden until GGUF engine is selected
         try:
             for _w in (self.gguf_model_label, self.gguf_model_combo, self.gguf_model_refresh, self.gguf_model_browse,
-                       self.gguf_vae_label, self.gguf_vae_combo, self.gguf_vae_refresh, self.gguf_vae_browse):
+                       self.gguf_vae_label, self.gguf_vae_combo, self.gguf_vae_refresh, self.gguf_vae_browse, self.qwen_model_label, self.qwen_model_combo, self.qwen_model_refresh, self.qwen_model_browse, self.sd_cli_label, self.sd_cli_path, self.sd_cli_browse, self.sd_cli_clear):
                 _w.setVisible(False)
         except Exception:
             pass
@@ -1762,6 +2121,16 @@ class Txt2ImgPane(QWidget):
         _populate_models()
         self.model_refresh.clicked.connect(_populate_models)
         self.model_browse.clicked.connect(_browse_model)
+
+        # Update LoRA visibility when switching between SDXL and SD15 models
+        try:
+            self.model_combo.currentIndexChanged.connect(lambda *_: self._apply_lora_visibility())
+        except Exception:
+            pass
+        try:
+            self.model_combo.currentTextChanged.connect(lambda *_: self._apply_lora_visibility())
+        except Exception:
+            pass
 
         def _populate_gguf_models():
             try:
@@ -1886,6 +2255,138 @@ class Txt2ImgPane(QWidget):
         except Exception:
             pass
 
+        # qwen 2.5 12B GGUF selector: choose diffusion GGUF from the same folder as the default qwen GGUF
+        def _populate_qwen_models():
+            try:
+                from pathlib import Path as _P
+                scan_dir = None
+
+                # Prefer the folder that contains the default qwen diffusion model (same folder as the first qwen GGUF file)
+                try:
+                    from helpers import qwen2512 as _qwen
+                except Exception:
+                    try:
+                        import qwen2512 as _qwen
+                    except Exception:
+                        _qwen = None
+
+                if _qwen is not None:
+                    try:
+                        _root_dir = _P(__file__).resolve().parents[1]
+                    except Exception:
+                        _root_dir = _P(".").resolve()
+                    try:
+                        d0, _llm0, _vae0 = _qwen._model_paths(_root_dir)
+                        if d0:
+                            scan_dir = _P(str(d0)).resolve().parent
+                    except Exception:
+                        scan_dir = None
+
+                if scan_dir is None:
+                    # Fallback folders (optional downloads may use one of these)
+                    for cand in (
+                        _P("./models") / "QWEN 2.5 12B GGUF",
+                        _P("./models") / "qwen2512gguf",
+                        _P("./models") / "qwen2512GGUF",
+                    ):
+                        try:
+                            if cand.exists() and cand.is_dir():
+                                scan_dir = cand
+                                break
+                        except Exception:
+                            continue
+
+                if scan_dir is None:
+                    scan_dir = _P("./models")
+
+                self.qwen_model_combo.blockSignals(True)
+                self.qwen_model_combo.clear()
+                self.qwen_model_combo.addItem("Auto (default)", "")
+
+                ggufs = []
+                try:
+                    if scan_dir.exists():
+                        ggufs = sorted(scan_dir.glob("*.gguf"))
+                except Exception:
+                    ggufs = []
+
+                def _looks_like_diffusion(name: str) -> bool:
+                    n = (name or "").lower()
+                    # Avoid showing obvious text/llm/tokenizer files by default
+                    bad = ("llm", "qwen", "text", "t5", "clip", "encoder", "token", "vocab")
+                    if any(b in n for b in bad):
+                        return False
+                    return True
+
+                shown = 0
+                for f in ggufs:
+                    if not _looks_like_diffusion(f.name):
+                        continue
+                    self.qwen_model_combo.addItem(f.name, str(f.resolve()))
+                    shown += 1
+
+                # If nothing showed up due to filtering, show all ggufs in that folder
+                if shown == 0:
+                    for f in ggufs:
+                        self.qwen_model_combo.addItem(f.name, str(f.resolve()))
+
+                # Restore last selection (persisted)
+                try:
+                    saved = self._persist_settings.value("qwen2512_model_path", "") if hasattr(self, "_persist_settings") else ""
+                except Exception:
+                    saved = ""
+                if saved:
+                    idx = self.qwen_model_combo.findData(saved)
+                    if idx < 0:
+                        self.qwen_model_combo.addItem(_P(saved).name, saved)
+                        idx = self.qwen_model_combo.findData(saved)
+                    if idx >= 0:
+                        self.qwen_model_combo.setCurrentIndex(idx)
+
+                self.qwen_model_combo.blockSignals(False)
+            except Exception as e:
+                try:
+                    self.qwen_model_combo.blockSignals(False)
+                except Exception:
+                    pass
+                print("[txt2img] qwen model scan failed:", e)
+
+        def _browse_qwen_model():
+            try:
+                path, _ = QFileDialog.getOpenFileName(self, "Choose qwen GGUF diffusion model", str(Path("./models").resolve()), "GGUF (*.gguf)")
+                if not path:
+                    return
+                from pathlib import Path as _P
+                idx = self.qwen_model_combo.findData(path)
+                if idx < 0:
+                    self.qwen_model_combo.addItem(_P(path).name, path)
+                    idx = self.qwen_model_combo.findData(path)
+                if idx >= 0:
+                    self.qwen_model_combo.setCurrentIndex(idx)
+            except Exception as e:
+                print("[txt2img] browse qwen model failed:", e)
+
+        # Populate once and hook up actions
+        try:
+            _populate_qwen_models()
+            self.qwen_model_refresh.clicked.connect(_populate_qwen_models)
+            self.qwen_model_browse.clicked.connect(_browse_qwen_model)
+
+            def _save_qwen_sel():
+                try:
+                    if hasattr(self, "_persist_settings"):
+                        self._persist_settings.setValue("qwen2512_model_path", self.qwen_model_combo.currentData() or "")
+                except Exception:
+                    pass
+
+            try:
+                self.qwen_model_combo.currentIndexChanged.connect(lambda *_: _save_qwen_sel())
+            except Exception:
+                pass
+        except Exception:
+            pass
+
+
 
         # Helper: where to scan for LoRA files
         def _get_lora_root():
@@ -1970,7 +2471,7 @@ class Txt2ImgPane(QWidget):
         rowl.addWidget(self.lora_path_btn, 0)
         rowl.addWidget(self.lora_refresh, 0)
         rowl.addWidget(self.lora_combo, 1)
-        self.lora_label = QLabel("LoRA (SDXL)")
+        self.lora_label = QLabel("LoRA")
         mdl_form.addRow(self.lora_label, rowl)
         try:
             self.lora_path_btn.clicked.connect(_browse_lora_root)
@@ -1987,7 +2488,8 @@ class Txt2ImgPane(QWidget):
         self.lora_strength_slider.setValue(100)
         self.lora_strength = QDoubleSpinBox(); self.lora_strength.setRange(0.0, 1.5); self.lora_strength.setSingleStep(0.05); self.lora_strength.setDecimals(2); self.lora_strength.setValue(1.0)
         rowls = QHBoxLayout()
-        rowls.addWidget(QLabel("LoRA 1 Strength:"))
+        self.lora_strength_label = QLabel("LoRA 1 Strength:")
+        rowls.addWidget(self.lora_strength_label)
         rowls.addWidget(self.lora_strength, 0)
         rowls.addWidget(self.lora_strength_slider, 1)
         mdl_form.addRow(rowls)
@@ -2021,7 +2523,7 @@ class Txt2ImgPane(QWidget):
         rowl2 = QHBoxLayout()
         rowl2.addWidget(self.lora2_refresh, 0)
         rowl2.addWidget(self.lora2_combo, 1)
-        self.lora2_label = QLabel("LoRA 2 (SDXL)")
+        self.lora2_label = QLabel("LoRA 2")
         mdl_form.addRow(self.lora2_label, rowl2)
 
         def _populate_loras2():
@@ -2090,7 +2592,8 @@ class Txt2ImgPane(QWidget):
         self.lora2_strength_slider.setValue(100)
         self.lora2_strength = QDoubleSpinBox(); self.lora2_strength.setRange(0.0, 1.5); self.lora2_strength.setSingleStep(0.05); self.lora2_strength.setDecimals(2); self.lora2_strength.setValue(1.0)
         rowls2 = QHBoxLayout()
-        rowls2.addWidget(QLabel("LoRA 2 Strength:"))
+        self.lora2_strength_label = QLabel("LoRA 2 Strength:")
+        rowls2.addWidget(self.lora2_strength_label)
         rowls2.addWidget(self.lora2_strength, 0)
         rowls2.addWidget(self.lora2_strength_slider, 1)
         mdl_form.addRow(rowls2)
@@ -2156,6 +2659,20 @@ class Txt2ImgPane(QWidget):
             pass
         self.sampler.addItems(["auto","DPM++ 2M (Karras)","Euler a","Euler","Heun","UniPC","DDIM"])
         self.attn_slicing = QCheckBox("Attention slicing")
+        # Qwen-only: CPU offload (stable-diffusion.cpp --offload-to-cpu)
+        self.qwen_offload_cpu = QCheckBox("CPU offload")
+        try:
+            _off0 = False
+            if hasattr(self, "_persist_settings"):
+                _off0 = bool(int(self._persist_settings.value("qwen2512_offload_cpu", 0) or 0))
+            self.qwen_offload_cpu.setChecked(bool(_off0))
+        except Exception:
+            pass
+        try:
+            self.qwen_offload_cpu.setToolTip("Qwen-Image: offload model to CPU (saves VRAM, slower).")
+        except Exception:
+            pass
+
         self.vae_device = QComboBox()
         try:
             _compact_combo(self.vae_device, 6)
@@ -2184,7 +2701,61 @@ class Txt2ImgPane(QWidget):
             pass
         self.fit_check = QCheckBox("Fit-check")
         adv_form.addRow("Sampler", self.sampler)
-        adv_form.addRow(self.attn_slicing)
+        # Qwen-only (Qwen-Image / stable-diffusion.cpp): flow-shift value
+        self.qwen_flow_label = QLabel("Flow")
+        self.qwen_flow_shift = QSpinBox()
+        try:
+            self.qwen_flow_shift.setRange(0, 20)
+        except Exception:
+            pass
+        _flow0 = 3
+        try:
+            if hasattr(self, "_persist_settings"):
+                _flow0 = int(self._persist_settings.value("qwen2512_flow_shift", 3))
+        except Exception:
+            _flow0 = 3
+        try:
+            self.qwen_flow_shift.setValue(int(_flow0))
+        except Exception:
+            pass
+        try:
+            self.qwen_flow_shift.setToolTip("Qwen-Image flow-shift value (Unsloth example uses 3).")
+        except Exception:
+            pass
+        adv_form.addRow(self.qwen_flow_label, self.qwen_flow_shift)
+        try:
+            self.qwen_flow_label.setVisible(False)
+            self.qwen_flow_shift.setVisible(False)
+            try:
+                self.qwen_offload_cpu.setVisible(False)
+            except Exception:
+                pass
+        except Exception:
+            pass
+        try:
+            def _save_qwen_flow():
+                try:
+                    if hasattr(self, "_persist_settings"):
+                        self._persist_settings.setValue("qwen2512_flow_shift", int(self.qwen_flow_shift.value()))
+                except Exception:
+                    pass
+            self.qwen_flow_shift.valueChanged.connect(lambda *_: _save_qwen_flow())
+        except Exception:
+            pass
+        
+        # Combine Attention slicing + Qwen CPU offload on one row (Qwen toggle auto-hides)
+        self._adv_row_attn_qwen = QWidget()
+        _adv_row_lay = QHBoxLayout(self._adv_row_attn_qwen)
+        _adv_row_lay.setContentsMargins(0,0,0,0)
+        _adv_row_lay.setSpacing(12)
+        _adv_row_lay.addWidget(self.attn_slicing)
+        try:
+            _adv_row_lay.addWidget(self.qwen_offload_cpu)
+        except Exception:
+            pass
+        _adv_row_lay.addStretch(1)
+        adv_form.addRow(self._adv_row_attn_qwen)
+
         adv_form.addRow("VAE device", self.vae_device)
         adv_form.addRow("GPU index", self.gpu_index)
         adv_form.addRow("Threads", self.threads)
@@ -2354,6 +2925,57 @@ class Txt2ImgPane(QWidget):
         btns.addWidget(self.add_and_run)
         outer.addLayout(btns)
 
+    def _apply_lora_visibility(self):
+        """LoRA UI is relevant for SDXL (diffusers), Z-Image FP16, and Qwen2512."""
+        try:
+            key = self._engine_key_selected() if hasattr(self, "_engine_key_selected") else ""
+        except Exception:
+            key = ""
+        try:
+            key = str(key or "").lower().strip() or "diffusers"
+        except Exception:
+            key = "diffusers"
+
+        show_lora = False
+        try:
+            if key in ("zimage", "qwen2512"):
+                show_lora = True
+            elif key == "diffusers":
+                mp = ""
+                try:
+                    if hasattr(self, "model_combo") and self.model_combo is not None:
+                        mp = f"{self.model_combo.currentText() or ''} {self.model_combo.currentData() or ''}"
+                except Exception:
+                    mp = ""
+                mp = (mp or "").lower()
+                show_lora = ("sdxl" in mp) or ("sd_xl" in mp) or ("sd-xl" in mp)
+        except Exception:
+            show_lora = False
+
+        try:
+            for _w in (
+                getattr(self, "lora_label", None),
+                getattr(self, "lora_path_btn", None),
+                getattr(self, "lora_combo", None),
+                getattr(self, "lora_refresh", None),
+                getattr(self, "lora_strength_label", None),
+                getattr(self, "lora_strength", None),
+                getattr(self, "lora_strength_slider", None),
+                getattr(self, "lora_a_strength", None),
+                getattr(self, "lora_b_strength", None),
+                getattr(self, "lora2_label", None),
+                getattr(self, "lora2_combo", None),
+                getattr(self, "lora2_refresh", None),
+                getattr(self, "lora2_strength_label", None),
+                getattr(self, "lora2_strength", None),
+                getattr(self, "lora2_strength_slider", None),
+            ):
+                if _w is not None:
+                    _w.setVisible(bool(show_lora))
+        except Exception:
+            pass
+
+
     def _on_engine_changed(self, *_):
         """
         Toggle banner text and show/hide the SD model/LoRA picker
@@ -2392,7 +3014,9 @@ class Txt2ImgPane(QWidget):
                 key = str(data).lower().strip()
             else:
                 text = (cb.currentText() or "").lower()
-                if "gguf" in text:
+                if ("qwen" in text) and (("2512" in text) or ("2.5" in text) or ("12b" in text)):
+                    key = "qwen2512"
+                elif "gguf" in text:
                     key = "zimage_gguf"
                 elif "z-image" in text or "zimage" in text:
                     key = "zimage"
@@ -2402,9 +3026,27 @@ class Txt2ImgPane(QWidget):
             key = "diffusers"
         is_zimage = key.startswith("zimage")
         is_gguf = (key == "zimage_gguf")
+        is_qwen = (key == "qwen2512")
 
-        # If switching to Z-Image, aggressively try to free CUDA VRAM
-        if is_zimage:
+        # Z-Image-only UI: init-image (img2img) row (FP16 only; GGUF does not support init images)
+        try:
+            _show_i2i = bool(key == "zimage")
+            for _w in (getattr(self, "zimg_i2i_label", None), getattr(self, "zimg_i2i_wrap", None)):
+                if _w is not None:
+                    _w.setVisible(_show_i2i)
+
+            # Safety: if user previously enabled init-image, force-disable it for GGUF / qwen (no init-image support)
+            if bool(key in ("zimage_gguf", "qwen2512")):
+                try:
+                    if getattr(self, "zimg_init_enable", None) is not None:
+                        self.zimg_init_enable.setChecked(False)
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
+        # If switching to Z-Image / qwen, aggressively try to free CUDA VRAM
+        if is_zimage or is_qwen:
             try:
                 _aggressive_free_cuda_vram()
             except Exception:
@@ -2419,6 +3061,8 @@ class Txt2ImgPane(QWidget):
             if hasattr(self, "banner") and self.banner is not None:
                 if is_zimage:
                     self.banner.setText("Text to image with Z-image Turbo")
+                elif is_qwen:
+                    self.banner.setText("Text to image with qwen 2.5 12B GGUF")
                 else:
                     self.banner.setText(base or "Text to Image with SDXL Loader")
         except Exception:
@@ -2437,7 +3081,7 @@ class Txt2ImgPane(QWidget):
                 try:
                     btn = getattr(picker, "_btn", None)
                     if btn is not None:
-                        btn.setText("GGUF" if is_gguf else ("LoRA" if is_zimage else "Model"))
+                        btn.setText("qwen models" if is_qwen else ("GGUF" if is_gguf else ("LoRA" if is_zimage else "Model")))
                 except Exception:
                     pass
         except Exception:
@@ -2452,15 +3096,15 @@ class Txt2ImgPane(QWidget):
                        getattr(self, "model_refresh", None),
                        getattr(self, "model_browse", None)):
                 if _w is not None:
-                    _w.setVisible(not is_zimage)
+                    _w.setVisible(not (is_zimage or is_qwen))
 
             # LoRA labels: show engine-specific text
             lora_label = getattr(self, "lora_label", None)
             if lora_label is not None:
-                lora_label.setText("LoRA (Z-Image)" if is_zimage else "LoRA (SDXL)")
+                lora_label.setText("LoRA (Z-Image)" if is_zimage else ("LoRA (Qwen)" if is_qwen else "LoRA (SDXL)"))
             lora2_label = getattr(self, "lora2_label", None)
             if lora2_label is not None:
-                lora2_label.setText("LoRA 2 (Z-Image)" if is_zimage else "LoRA 2 (SDXL)")
+                lora2_label.setText("LoRA 2 (Z-Image)" if is_zimage else ("LoRA 2 (Qwen)" if is_qwen else "LoRA 2 (SDXL)"))
 
             # GGUF selectors: visible only for GGUF engine
             for _w in (
@@ -2476,22 +3120,39 @@ class Txt2ImgPane(QWidget):
                 if _w is not None:
                     _w.setVisible(bool(is_gguf))
 
-            # LoRA controls are not supported by the GGUF backend; hide them in GGUF mode
+            # qwen selector: visible only for qwen engine
             for _w in (
-                getattr(self, "lora_label", None),
-                getattr(self, "lora_path_btn", None),
-                getattr(self, "lora_combo", None),
-                getattr(self, "lora_refresh", None),
-                getattr(self, "lora_strength", None),
-                getattr(self, "lora_a_strength", None),
-                getattr(self, "lora_b_strength", None),
-                getattr(self, "lora2_label", None),
-                getattr(self, "lora2_combo", None),
-                getattr(self, "lora2_refresh", None),
-                getattr(self, "lora2_strength", None),
+                getattr(self, "qwen_model_label", None),
+                getattr(self, "qwen_model_combo", None),
+                getattr(self, "qwen_model_refresh", None),
+                getattr(self, "qwen_model_browse", None),
             ):
                 if _w is not None:
-                    _w.setVisible(not bool(is_gguf))
+                    _w.setVisible(bool(is_qwen))
+
+            # sd-cli.exe selector: visible for GGUF engines (Z-Image GGUF + qwen GGUF)
+            _need_sdcli = bool(is_gguf or is_qwen)
+            for _w in (
+                getattr(self, "sd_cli_label", None),
+                getattr(self, "sd_cli_path", None),
+                getattr(self, "sd_cli_browse", None),
+                getattr(self, "sd_cli_clear", None),
+            ):
+                if _w is not None:
+                    _w.setVisible(_need_sdcli)
+            # LoRA UI: only for Z-Image FP16 and SDXL (diffusers)
+            try:
+                self._apply_lora_visibility()
+            except Exception:
+                pass
+            # Qwen-only UI: show Flow setting only for qwen2512
+            for _w in (
+                getattr(self, "qwen_flow_label", None),
+                getattr(self, "qwen_flow_shift", None),
+                getattr(self, "qwen_offload_cpu", None),
+            ):
+                if _w is not None:
+                    _w.setVisible(bool(is_qwen))
         except Exception:
             pass
 
@@ -2499,7 +3160,7 @@ class Txt2ImgPane(QWidget):
         try:
             lab = getattr(self, "preset_label", None)
             combo = getattr(self, "preset_combo", None)
-            visible = not is_zimage
+            visible = not (is_zimage or is_qwen)
             if lab is not None:
                 lab.setVisible(visible)
             if combo is not None:
@@ -2556,10 +3217,29 @@ class Txt2ImgPane(QWidget):
                         fname_edit.blockSignals(False)
                     except Exception:
                         pass
-                else:
-                    # Switching back to SD15/SDXL: restore original or default
+                elif is_qwen:
+                    # Store previous template once when entering qwen
+                    if prev_engine != "qwen2512":
+                        try:
+                            self._filename_template_before_qwen = fname_edit.text()
+                        except Exception:
+                            pass
                     try:
-                        orig = getattr(self, "_filename_template_before_zimage", "") or ""
+                        fname_edit.blockSignals(True)
+                    except Exception:
+                        pass
+                    fname_edit.setText(f"qwen_{{seed}}_{{idx:03d}}.{fmt}")
+                    try:
+                        fname_edit.blockSignals(False)
+                    except Exception:
+                        pass
+                else:
+                    # Switching back to SD15/SDXL: restore original or default (from whichever special engine we came from)
+                    try:
+                        if prev_engine == "qwen2512":
+                            orig = getattr(self, "_filename_template_before_qwen", "") or ""
+                        else:
+                            orig = getattr(self, "_filename_template_before_zimage", "") or ""
                     except Exception:
                         orig = ""
                     if not orig:
@@ -2582,7 +3262,12 @@ class Txt2ImgPane(QWidget):
             except Exception:
                 pass
             try:
-                self._last_engine_key = ("zimage" if is_zimage else "diffusers")
+                if is_zimage:
+                    self._last_engine_key = "zimage"
+                elif is_qwen:
+                    self._last_engine_key = "qwen2512"
+                else:
+                    self._last_engine_key = "diffusers"
             except Exception:
                 pass
 
@@ -2593,20 +3278,52 @@ class Txt2ImgPane(QWidget):
             sv = getattr(self, "steps_value", None)
             if ss is not None:
                 if is_zimage:
-                    # Z-Image prefers very low steps; force 9 steps on switch
+                    # Z-Image prefers low steps; set range but do NOT hard-force value
+                    try:
+                        _cur = int(ss.value())
+                    except Exception:
+                        _cur = 9
                     try:
                         ss.blockSignals(True)
                     except Exception:
                         pass
                     ss.setRange(1, 50)
-                    ss.setValue(9)
+                    # Only apply the Z-Image "help" default if current value is out of range
+                    try:
+                        if _cur < 1 or _cur > 50:
+                            _cur = 9
+                            ss.setValue(_cur)
+                    except Exception:
+                        try:
+                            ss.setValue(9)
+                            _cur = 9
+                        except Exception:
+                            _cur = 9
                     try:
                         ss.blockSignals(False)
                     except Exception:
                         pass
                     try:
                         if sv is not None:
-                            sv.setText("9")
+                            sv.setText(str(int(_cur)))
+                    except Exception:
+                        pass
+
+                elif is_qwen:
+                    # qwen 2.5 12B GGUF: wider range; default 25
+                    try:
+                        ss.blockSignals(True)
+                    except Exception:
+                        pass
+                    ss.setRange(1, 200)
+                    ss.setValue(25)
+                    try:
+                        ss.blockSignals(False)
+                    except Exception:
+                        pass
+                    try:
+                        if sv is not None:
+                            sv.setText("25")
                     except Exception:
                         pass
                 else:
@@ -2634,14 +3351,42 @@ class Txt2ImgPane(QWidget):
             cs = getattr(self, "cfg_scale", None)
             if cs is not None:
                 if is_zimage:
-                    # Z-Image: CFG 0.0–5.0, force 0.0 on switch
+                    # Z-Image: CFG 0.0–5.0. Set range but do NOT hard-force value.
+                    try:
+                        _cur = float(cs.value())
+                    except Exception:
+                        _cur = 0.0
                     try:
                         cs.blockSignals(True)
                     except Exception:
                         pass
                     cs.setRange(0.0, 5.0)
                     cs.setSingleStep(0.1)
-                    cs.setValue(0.0)
+                    # Only apply default if current value is out of range
+                    try:
+                        if _cur < 0.0 or _cur > 5.0:
+                            _cur = 0.0
+                            cs.setValue(_cur)
+                    except Exception:
+                        try:
+                            cs.setValue(0.0)
+                            _cur = 0.0
+                        except Exception:
+                            _cur = 0.0
+                    try:
+                        cs.blockSignals(False)
+                    except Exception:
+                        pass
+
+                elif is_qwen:
+                    # qwen 2.5 12B GGUF: typical low CFG; default 2.5
+                    try:
+                        cs.blockSignals(True)
+                    except Exception:
+                        pass
+                    cs.setRange(0.0, 20.0)
+                    cs.setSingleStep(0.1)
+                    cs.setValue(2.5)
                     try:
                         cs.blockSignals(False)
                     except Exception:
@@ -2733,7 +3478,7 @@ class Txt2ImgPane(QWidget):
             # Manual spinbox ranges:
             # - SDXL/diffusers: clamp to SDXL-safe max (1536px)
             # - Z-Image: allow up to full 4K (4096px)
-            max_dim = 4096 if is_zimage else 1536
+            max_dim = 4096 if (is_zimage or is_qwen) else 1536
             for sp in (w_spin, h_spin):
                 if sp is not None:
                     try:
@@ -3480,6 +4225,9 @@ class Txt2ImgPane(QWidget):
             "engine": engine_key,
             "prompt": self.prompt.toPlainText().strip(),
             "negative": self.negative.toPlainText().strip(),
+            "init_image_enabled": bool(getattr(self, "zimg_init_enable", None).isChecked()) if getattr(self, "zimg_init_enable", None) is not None else False,
+            "init_image": (getattr(self, "zimg_init_path", None).text().strip() if getattr(self, "zimg_init_path", None) is not None else ""),
+            "img2img_strength": float(getattr(self, "zimg_strength", None).value()) if getattr(self, "zimg_strength", None) is not None else 0.35,
             "seed": seed,
             "seed_policy": ["fixed","random","increment"][self.seed_policy.currentIndex()],
             "batch": int(self.batch.value()),
@@ -3488,7 +4236,10 @@ class Txt2ImgPane(QWidget):
             "show_in_player": self.show_in_player.isChecked(),
             "use_queue": bool(self.use_queue.isChecked()),
             "vram_profile": self.vram_profile.currentText(),
+            "sd_cli_path": (self.sd_cli_path.text().strip() if hasattr(self, "sd_cli_path") else ""),
             "sampler": self.sampler.currentText(),
+            "flow_shift": (int(self.qwen_flow_shift.value()) if hasattr(self, "qwen_flow_shift") else 3),
+            "offload_cpu": (bool(self.qwen_offload_cpu.isChecked()) if hasattr(self, "qwen_offload_cpu") else False),
             "model_path": (self.model_combo.currentData() if hasattr(self, "model_combo") else "auto"),
             "lora_path": (self.lora_combo.currentData() if hasattr(self, "lora_combo") else ""),
             "lora_a_scale": (self.lora_a_strength.value() if hasattr(self, "lora_a_strength") else 1.0),
@@ -3512,8 +4263,8 @@ class Txt2ImgPane(QWidget):
             "width": int(w_ui),
             "height": int(h_ui),
 
-            "preset": (self.preset_combo.currentText() if hasattr(self, "preset_combo") else ""),
-            "preset_index": (int(self.preset_combo.currentIndex()) if hasattr(self, "preset_combo") else -1),
+            "preset": (self.preset_combo.currentText() if (engine_key == "diffusers" and hasattr(self, "preset_combo")) else ""),
+            "preset_index": (int(self.preset_combo.currentIndex()) if (engine_key == "diffusers" and hasattr(self, "preset_combo")) else -1),
             "a1111_url": self._a1111_url_removed.text().strip() if hasattr(self, "_a1111_url_removed") else "http://127.0.0.1:7860",
                     }
         # Engine-specific queue metadata to avoid SDXL model bleed into Z-Image jobs
@@ -3534,10 +4285,34 @@ class Txt2ImgPane(QWidget):
                         # Reuse lora/lora2 fields as transport to zimage_cli (GGUF backend ignores actual LoRA)
                         job["lora_path"] = gm
                         job["lora2_path"] = gv
+                        # GGUF backend does not support init images (img2img); force-disable to avoid checkerboards
+                        try:
+                            job["init_image_enabled"] = False
+                            job["init_image"] = ""
+                            job["img2img_strength"] = 0.35
+                        except Exception:
+                            pass
                     except Exception:
                         pass
                 job.setdefault("model_name", "Z-Image-Turbo")
                 job.setdefault("model", "Z-Image-Turbo")
+            elif ek == "qwen2512":
+                # qwen uses its own GGUF diffusion model; don't carry SDXL model_path
+                job.pop("model_path", None)
+                try:
+                    wm = (self.qwen_model_combo.currentData() if hasattr(self, "qwen_model_combo") else "") or ""
+                    job["qwen_model_path"] = wm
+                except Exception:
+                    pass
+                try:
+                    job["init_image_enabled"] = False
+                    job["init_image"] = ""
+                    job["img2img_strength"] = 0.35
+                except Exception:
+                    pass
+                job.setdefault("model_name", "qwen 2.5 12B GGUF")
+                job.setdefault("model", "qwen 2.5 12B GGUF")
+
         except Exception:
             pass
 
@@ -3680,6 +4455,12 @@ class Txt2ImgPane(QWidget):
         except Exception: pass
         try: d["negative"] = self.negative.toPlainText().strip()
         except Exception: pass
+        try: d["init_image_enabled"] = bool(getattr(self, "zimg_init_enable", None).isChecked()) if getattr(self, "zimg_init_enable", None) is not None else False
+        except Exception: pass
+        try: d["init_image"] = getattr(self, "zimg_init_path", None).text().strip() if getattr(self, "zimg_init_path", None) is not None else ""
+        except Exception: pass
+        try: d["img2img_strength"] = float(getattr(self, "zimg_strength", None).value()) if getattr(self, "zimg_strength", None) is not None else 0.35
+        except Exception: pass
         try: d["seed"] = int(self.seed.value())
         except Exception: pass
         try:
@@ -3701,6 +4482,10 @@ class Txt2ImgPane(QWidget):
         try: d["cfg_scale"] = float(self.cfg_scale.value())
         except Exception: pass
         try: d["sampler"] = self.sampler.currentText()
+        except Exception: pass
+        try:
+            if hasattr(self, "qwen_flow_shift"):
+                d["flow_shift"] = int(self.qwen_flow_shift.value())
         except Exception: pass
         try:
             if hasattr(self,'model_combo'): d["model_path"] = self.model_combo.currentData()
@@ -3765,9 +4550,25 @@ class Txt2ImgPane(QWidget):
         except Exception: pass
         try: d["qwen_cli_template"] = self._qwen_cli_template_removed.text().strip()
         except Exception: pass
-        try: d["preset"] = self.preset_combo.currentText()
+        # Only persist image-gen presets for SD (diffusers). Z-Image/Qwen ignore them.
+        try:
+            ek = None
+            try:
+                ek = self.engine_combo.currentData() if hasattr(self, "engine_combo") else None
+            except Exception:
+                ek = None
+            if not ek:
+                try:
+                    ek = self.engine_combo.currentText() if hasattr(self, "engine_combo") else None
+                except Exception:
+                    ek = None
+            ek = str(ek or "").lower().strip()
+            is_diff = (ek == "diffusers") or ("sd" in ek and "zimage" not in ek and "qwen" not in ek)
+        except Exception:
+            is_diff = True
+        try: d["preset"] = (self.preset_combo.currentText() if is_diff else "")
         except Exception: pass
-        try: d["preset_index"] = int(self.preset_combo.currentIndex())
+        try: d["preset_index"] = (int(self.preset_combo.currentIndex()) if is_diff else -1)
         except Exception: pass
 
         try:
@@ -3803,6 +4604,7 @@ class Txt2ImgPane(QWidget):
             (self.steps_slider, 'valueChanged'),
             (self.cfg_scale, 'valueChanged'),
             (self.sampler, 'currentIndexChanged'),
+            (getattr(self,'qwen_flow_shift', None), 'valueChanged'),
             (getattr(self,'model_combo', None), 'currentIndexChanged'),
             (getattr(self,'lora_combo', None), 'currentIndexChanged'),
             (getattr(self,'lora_strength', None), 'valueChanged'),
@@ -4109,10 +4911,17 @@ def _draw_text_image(text: str, size=(1024,1024), seed: int = 0) -> QImage:
 
 
 
-def _gen_via_diffusers(job: dict, out_dir: Path, progress_cb=None):
+def _gen_via_diffusers(job: dict, out_dir: Path, progress_cb=None, cancel_event=None):
     """
     Diffusers backend with detailed error reporting and CPU fallback.
     """
+
+    # Cooperative cancel (optional)
+    try:
+        if cancel_event is not None and getattr(cancel_event, 'is_set', None) and cancel_event.is_set():
+            return None
+    except Exception:
+        pass
 
     # Ensure PyTorch uses non-Flash SDPA kernels on Windows builds (avoid 'not compiled with flash attention' warnings)
     try:
@@ -4433,7 +5242,7 @@ def _gen_via_a1111(job: dict, out_dir: Path, base_url: str, progress_cb=None):
     except Exception:
         return None
 
-def _gen_via_zimage(job: dict, out_dir: Path, progress_cb=None):
+def _gen_via_zimage(job: dict, out_dir: Path, progress_cb=None, cancel_event=None):
     """
     Z-Image Turbo backend that runs in its own virtualenv (.zimage_env) as an
     external process, so it can have independent deps (torch/diffusers).
@@ -4524,6 +5333,33 @@ def _gen_via_zimage(job: dict, out_dir: Path, progress_cb=None):
         "--fmt", fmt,
         "--filename_template", fname_tmpl,
     ]
+
+    # Optional: image-to-image (init image) for Z-Image (FP16 only) to keep identity/composition
+    try:
+        init_img = (job.get("init_image") or "").strip()
+    except Exception:
+        init_img = ""
+    try:
+        init_enabled = bool(job.get("init_image_enabled", True))
+    except Exception:
+        init_enabled = True
+    # GGUF backend: init images are not supported; force-disable
+    try:
+        if str(job.get("engine") or "").strip().lower() == "zimage_gguf":
+            init_enabled = False
+    except Exception:
+        pass
+    if init_enabled and init_img:
+        try:
+            strength = float(job.get("img2img_strength", 0.35))
+        except Exception:
+            strength = 0.35
+        # Clamp to sane range
+        try:
+            strength = max(0.0, min(1.0, strength))
+        except Exception:
+            strength = 0.35
+        args += ["--init-image", str(init_img), "--strength", str(strength)]
 
     # Backend switch: Diffusers (default) vs GGUF (stable-diffusion.cpp)
     try:
@@ -4624,13 +5460,56 @@ def _gen_via_zimage(job: dict, out_dir: Path, progress_cb=None):
             except Exception:
                 pass
 
-            proc = subprocess.Popen(
-                args,
+            # Optional: pass sd-cli.exe / sd.exe override to the Z-Image CLI for GGUF backend
+            _env = None
+            try:
+                import os as _os
+                eng0 = str(job.get("engine") or "").strip().lower()
+                sel_cli = str(job.get("sd_cli_path") or "").strip()
+                pcli = None
+
+                if sel_cli:
+                    from pathlib import Path as _P2
+                    pcli = _P2(sel_cli)
+                    if not pcli.is_absolute():
+                        try:
+                            _root = _P2(__file__).resolve().parents[1]
+                        except Exception:
+                            _root = _P2(".").resolve()
+                        pcli = (_root / pcli).resolve()
+                    if not (pcli.exists() and pcli.is_file()):
+                        pcli = None
+
+                # Auto default for GGUF engines: <root>/presets/bin/{sd-cli.exe, sd.exe}
+                if pcli is None and eng0 == "zimage_gguf":
+                    try:
+                        pcli = _preferred_sd_cli_from_presets_bin(root_dir)
+                    except Exception:
+                        pcli = None
+
+                if pcli is not None:
+                    _env = _os.environ.copy()
+                    _env["SD_CLI_PATH"] = str(pcli)
+                    _env["SD_CLI"] = str(pcli)
+            except Exception:
+                _env = None
+
+            _popen_kwargs = dict(
                 stdout=subprocess.PIPE,
                 stderr=subprocess.STDOUT,
                 text=True,
                 encoding="utf-8",
                 errors="replace",
+            )
+            try:
+                if _env is not None:
+                    _popen_kwargs["env"] = _env
+            except Exception:
+                pass
+
+            proc = subprocess.Popen(
+                args,
+                **_popen_kwargs,
             )
 
             if proc.stdout:
@@ -4720,6 +5599,346 @@ def _gen_via_zimage(job: dict, out_dir: Path, progress_cb=None):
     }
 
 
+
+def _gen_via_qwen2512(job: dict, out_dir: Path, progress_cb=None, cancel_event: Optional[threading.Event] = None):
+    """qwen 2.5 12B GGUF backend (stable-diffusion.cpp sd-cli)."""
+    try:
+        _aggressive_free_cuda_vram()
+    except Exception:
+        pass
+
+    import subprocess
+    import random
+    import time
+    from pathlib import Path as _P
+
+    try:
+        root_dir = _P(__file__).resolve().parents[1]
+    except Exception:
+        root_dir = _P(".").resolve()
+
+    try:
+        from helpers import qwen2512 as _qwen
+    except Exception:
+        try:
+            import qwen2512 as _qwen
+        except Exception:
+            _qwen = None
+    if _qwen is None:
+        return None
+
+    try:
+        _pref = _preferred_sd_cli_from_presets_bin(root_dir)
+        sd_cli = _pref if _pref else _qwen._find_sd_cli(root_dir)
+        # Optional UI/job override: allow selecting an explicit sd-cli.exe path
+        try:
+            sel_cli = str(job.get("sd_cli_path") or "").strip()
+            if sel_cli:
+                pcli = _P(sel_cli)
+                if not pcli.is_absolute():
+                    pcli = (root_dir / pcli).resolve()
+                if pcli.exists() and pcli.is_file():
+                    sd_cli = pcli
+        except Exception:
+            pass
+        diffusion, llm, vae = _qwen._model_paths(root_dir)
+        if not (sd_cli and diffusion and llm and vae):
+            return None
+        # Optional UI/job override: allow selecting an alternate qwen diffusion GGUF
+        try:
+            sel = str(job.get("qwen_model_path") or "").strip()
+            if sel:
+                psel = _P(sel)
+                if not psel.is_absolute():
+                    psel = (root_dir / psel).resolve()
+                if psel.exists() and psel.is_file() and psel.suffix.lower() == ".gguf":
+                    diffusion = psel
+        except Exception:
+            pass
+
+    except Exception:
+        return None
+
+    prompt = str(job.get("prompt", "") or "")
+
+    # Optional LoRA support: sd-cli parses <lora:NAME:W> tags when --lora-model-dir is set.
+    lora_path = str(job.get("lora_path", "") or "").strip()
+    lora2_path = str(job.get("lora2_path", "") or "").strip()
+    lora_scale = job.get("lora_scale", None)
+    lora2_scale = job.get("lora2_scale", None)
+    lora_apply_mode = str(job.get("lora_apply_mode", "") or "at_runtime").strip() or "at_runtime"
+    lora_model_dir = ""
+    def _fmt_lora_tag(_path: str, _scale) -> str:
+        if not _path:
+            return ""
+        try:
+            _w = float(_scale) if _scale is not None else 1.0
+        except Exception:
+            _w = 1.0
+        _name = Path(_path).stem
+        # Use :g to avoid '1.0' style spam in the prompt, but keep precision when needed.
+        try:
+            _w_s = (f"{_w:g}")
+        except Exception:
+            _w_s = str(_w)
+        return f"<lora:{_name}:{_w_s}>"
+    try:
+        _dirs = []
+        for _lp in (lora_path, lora2_path):
+            if _lp:
+                try:
+                    _dirs.append(str(Path(_lp).resolve().parent))
+                except Exception:
+                    _dirs.append(str(Path(_lp).parent))
+        if _dirs:
+            import os as _os
+            _common = _os.path.commonpath(_dirs)
+            if _common and Path(_common).exists():
+                lora_model_dir = _common
+            else:
+                lora_model_dir = _dirs[0]
+    except Exception:
+        lora_model_dir = str(Path(lora_path).parent) if lora_path else (str(Path(lora2_path).parent) if lora2_path else "")
+    try:
+        _tags = []
+        _t1 = _fmt_lora_tag(lora_path, lora_scale)
+        _t2 = _fmt_lora_tag(lora2_path, lora2_scale)
+        if _t1: _tags.append(_t1)
+        if _t2: _tags.append(_t2)
+        if _tags:
+            prompt = " ".join(_tags) + " " + prompt
+    except Exception:
+        pass
+
+    # Some sd-cli Windows builds assert/crash on non-ASCII bytes in -p.
+    try:
+        _sp = getattr(_qwen, "_sanitize_prompt_ascii", None)
+        prompt_cli = _sp(prompt) if callable(_sp) else prompt.encode("ascii", "ignore").decode("ascii", "ignore")
+    except Exception:
+        prompt_cli = prompt
+
+    w = int(job.get("width", 1024)); h = int(job.get("height", 1024))
+    steps = int(job.get("steps", 40))
+    cfg = float(job.get("cfg_scale", 2.5))
+    seed_policy = str(job.get("seed_policy", "fixed") or "fixed").lower().strip()
+    batch = int(job.get("batch", 1))
+    fmt = str(job.get("format", "png") or "png").lower().strip()
+    fname_tmpl = str(job.get("filename_template") or f"qwen_{{seed}}_{{idx:03d}}.{fmt}")
+
+    ui_sampler = str(job.get("sampler", "") or "").strip()
+    sampler_map = {
+        "Euler a": "euler_a",
+        "Euler": "euler",
+        "Heun": "heun",
+        "DPM++ 2M (Karras)": "dpm++2m",
+        "DPM++ 2M": "dpm++2m",
+        "DPM++ 2M SDE (Karras)": "dpm++2m_sde",
+        "DPM++ 2M SDE": "dpm++2m_sde",
+        "auto": "euler",
+        "UniPC": "euler",
+        "DDIM": "euler",
+    }
+    sampler = sampler_map.get(ui_sampler, "euler")
+
+    try:
+        flow_shift = int(job.get("flow_shift", 3) or 3)
+    except Exception:
+        flow_shift = 3
+
+    try:
+        # Respect explicit Qwen toggle when present; otherwise infer from VRAM profile
+        if "offload_cpu" in job:
+            offload_cpu = bool(job.get("offload_cpu"))
+        else:
+            vp = str(job.get("vram_profile", "") or "").lower()
+            offload_cpu = ("low" in vp) or ("very" in vp)
+    except Exception:
+        offload_cpu = False
+
+    seeds_list = job.get("seeds")
+    if not seeds_list:
+        seed0 = int(job.get("seed", 0) or 0)
+        if seed_policy == "fixed":
+            seeds_list = [seed0 for _ in range(batch)]
+        elif seed_policy == "increment":
+            seeds_list = [seed0 + i for i in range(batch)]
+        else:
+            rng = random.Random(seed0 if seed0 else int(time.time()))
+            seeds_list = [rng.randint(0, 2_147_483_647) for _ in range(batch)]
+
+    files = []
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    for i in range(int(batch)):
+        if cancel_event is not None and cancel_event.is_set():
+            break
+        s0 = int(seeds_list[i] if i < len(seeds_list) else job.get("seed", 0) or 0)
+        try:
+            fname = fname_tmpl.format(seed=s0, idx=i)
+        except Exception:
+            fname = f"qwen_{s0}_{i:03d}.{fmt}"
+        if not str(fname).lower().endswith(("png", "jpg", "jpeg", "webp")):
+            fname = str(fname).rstrip(".") + f".{fmt}"
+        out_path = _unique_path(out_dir / fname)
+
+        cmd = [
+            str(sd_cli),
+            "--diffusion-model", str(diffusion),
+            "--vae", str(vae),
+            "--llm", str(llm),
+            "--sampling-method", str(sampler),
+            "--cfg-scale", str(cfg),
+            "--steps", str(steps),
+            "-W", str(w),
+            "-H", str(h),
+            "--diffusion-fa",
+            "--flow-shift", str(flow_shift),
+            "-p", prompt_cli,
+            "-o", str(out_path),
+            "--seed", str(s0),
+        ]
+        # LoRA flags (optional)
+        if lora_model_dir and (lora_path or lora2_path):
+            cmd += ["--lora-model-dir", str(lora_model_dir), "--lora-apply-mode", str(lora_apply_mode)]
+        if offload_cpu:
+            cmd.append("--offload-to-cpu")
+
+        try:
+            proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1)
+        except Exception:
+            return None
+
+        try:
+            if proc.stdout is not None:
+                for _line in proc.stdout:
+                    if cancel_event is not None and cancel_event.is_set():
+                        try:
+                            proc.terminate()
+                        except Exception:
+                            pass
+                        break
+        except Exception:
+            pass
+
+        try:
+            code = proc.wait()
+        except Exception:
+            code = 1
+        if int(code) != 0:
+            return None
+        if not out_path.exists():
+            return None
+        files.append(str(out_path))
+        if progress_cb:
+            try:
+                progress_cb({"step": i + 1, "total": max(1, batch)})
+            except Exception:
+                pass
+
+    if not files:
+        return None
+    return {"files": files, "backend": "qwen2512", "model": f"qwen 2.5 12B GGUF — {_P(str(diffusion)).name}"}
+
+
+def _find_latest_qwen2512_turbo_lora(root_dir: Path) -> str:
+    """Auto-pick newest Wuli Qwen Image 2512 Turbo LoRA by highest Vx.y(.z) in name, scanning models/loras recursively."""
+    try:
+        base = (Path(root_dir) / "models" / "loras").resolve()
+    except Exception:
+        base = Path("models/loras").resolve()
+    if not base.exists():
+        return ""
+    pats = []
+    try:
+        for p in base.rglob("*"):
+            try:
+                if not p.is_file():
+                    continue
+                name = p.name.lower()
+                if "wuli-qwen-image-2512-turbo-lora" in name:
+                    pats.append(p)
+            except Exception:
+                continue
+    except Exception:
+        return ""
+    if not pats:
+        return ""
+    def _ver_tuple(p: Path):
+        nm = p.name
+        m = re.search(r"[\-_ ]v(\d+)(?:\.(\d+))?(?:\.(\d+))?", nm, flags=re.IGNORECASE)
+        if not m:
+            return (0, 0, 0)
+        a = int(m.group(1) or 0)
+        b = int(m.group(2) or 0) if m.group(2) is not None else 0
+        c = int(m.group(3) or 0) if m.group(3) is not None else 0
+        return (a, b, c)
+    # Highest version first; tie-breaker prefers 4steps then bf16 then shortest path
+    pats.sort(key=lambda p: (_ver_tuple(p),
+                             ("4steps" in p.name.lower()),
+                             ("bf16" in p.name.lower())),
+              reverse=True)
+    return str(pats[0])
+
+def generate_one_from_job(job: dict, out_dir: str | Path, progress_cb=None, cancel_event: Optional[threading.Event] = None):
+    """Minimal public entrypoint for non-UI callers (e.g. Planner). Dispatches to the selected engine and returns metadata."""
+    try:
+        od = Path(out_dir)
+        od.mkdir(parents=True, exist_ok=True)
+    except Exception:
+        od = Path(".")
+    try:
+        root_dir = Path(__file__).resolve().parents[1]
+    except Exception:
+        root_dir = Path(".").resolve()
+
+    ek = str(job.get("engine") or "").strip().lower() or "qwen2512"
+
+    # Auto Turbo LoRA for Qwen 2512 if not explicitly provided
+    if ek == "qwen2512":
+        try:
+            lp = str(job.get("lora_path") or "").strip()
+            if not lp:
+                tl = _find_latest_qwen2512_turbo_lora(root_dir)
+                if tl:
+                    job["lora_path"] = tl
+                    # Turbo defaults: 4-8 steps; pick 5 for testing unless user already set <= 8
+                    try:
+                        st = int(job.get("steps", 40))
+                        if st > 8:
+                            job["steps"] = 5
+                    except Exception:
+                        job["steps"] = 5
+                    # Lower CFG a bit for turbo if too high
+                    try:
+                        cfg = float(job.get("cfg_scale", 2.5))
+                        if cfg > 4.0:
+                            job["cfg_scale"] = 3.0
+                    except Exception:
+                        pass
+                    job["turbo_lora_used"] = True
+        except Exception:
+            pass
+
+    # Force single image batch for this entrypoint
+    try:
+        job["batch"] = int(job.get("batch", 1)) if int(job.get("batch", 1)) > 0 else 1
+    except Exception:
+        job["batch"] = 1
+
+    if ek == "qwen2512":
+        res = _gen_via_qwen2512(job, od, progress_cb=progress_cb, cancel_event=cancel_event)
+        return res
+    if ek.startswith("zimage"):
+        res = _gen_via_zimage(job, od, progress_cb=progress_cb, cancel_event=cancel_event)
+        return res
+    if ek == "diffusers":
+        res = _gen_via_diffusers(job, od, progress_cb=progress_cb, cancel_event=cancel_event)
+        return res
+    if ek == "a1111":
+        res = _gen_via_a1111(job, od, progress_cb=progress_cb, cancel_event=cancel_event)
+        return res
+    return None
+
 def generate_qwen_images(job: dict, progress_cb: Optional[Callable[[float], None]] = None, cancel_event: Optional[threading.Event] = None):
     """Generator that saves images and returns metadata. Uses CPU fallback to validate pipeline end-to-end."""
     out_dir = Path(job.get("output") or "./output/images"); out_dir.mkdir(parents=True, exist_ok=True)
@@ -4761,8 +5980,18 @@ def generate_qwen_images(job: dict, progress_cb: Optional[Callable[[float], None
     try:
         if engine in ("zimage","zimage_gguf"):
             diff = _gen_via_zimage(job, out_dir, progress_cb)
+        elif engine == "qwen2512":
+            # Use snapped safe sizes to keep CLI stable
+            try:
+                job2 = dict(job)
+                job2["width"] = int(safe_w)
+                job2["height"] = int(safe_h)
+            except Exception:
+                job2 = job
+            diff = _gen_via_qwen2512(job2, out_dir, progress_cb, cancel_event)
         else:
             diff = _gen_via_diffusers(job, out_dir, progress_cb)
+
         if diff and diff.get('files'):
             files = diff['files']
             meta_backend = diff.get('backend') or 'diffusers'
@@ -4819,7 +6048,7 @@ except Exception:
 def _play_in_player(self, p):
     """Try to open a media path in the app's internal player if available; return True on success.
 
-    This mirrors the internal-player behavior used by the Wan2.2 tab:
+    This mirrors the internal-player behavior used by the qwen2.2 tab:
     - Prefer main.video.open(...)
     - Fall back to main.open_video(...)
     - Keep main.current_path and media info in sync when possible.
@@ -5128,6 +6357,49 @@ try:
                     self.model_combo.setCurrentIndex(idxm)
                     try: self.model_combo.blockSignals(False)
                     except Exception: pass
+
+            # --- qwen GGUF model restore ---
+            wmp = s.get('qwen_model_path') or s.get('qwen2512_model_path')
+            if wmp and hasattr(self, 'qwen_model_combo'):
+                idxw = -1
+                try:
+                    for i in range(self.qwen_model_combo.count()):
+                        if (self.qwen_model_combo.itemData(i) or '') == wmp:
+                            idxw = i; break
+                except Exception:
+                    idxw = -1
+                if idxw < 0:
+                    try:
+                        from pathlib import Path as _P
+                        self.qwen_model_combo.addItem(_P(str(wmp)).name, str(wmp))
+                        idxw = self.qwen_model_combo.findData(str(wmp))
+                    except Exception:
+                        idxw = -1
+                if idxw >= 0:
+                    try: self.qwen_model_combo.blockSignals(True)
+                    except Exception: pass
+                    self.qwen_model_combo.setCurrentIndex(idxw)
+                    try: self.qwen_model_combo.blockSignals(False)
+                    except Exception: pass
+
+            # --- sd-cli.exe restore (GGUF engines) ---
+            try:
+                sdc = s.get('sd_cli_path') or s.get('sdcli_path') or s.get('sd_cli')
+                if sdc and hasattr(self, 'sd_cli_path'):
+                    try:
+                        self.sd_cli_path.blockSignals(True)
+                    except Exception:
+                        pass
+                    try:
+                        self.sd_cli_path.setText(str(sdc))
+                    except Exception:
+                        pass
+                    try:
+                        self.sd_cli_path.blockSignals(False)
+                    except Exception:
+                        pass
+            except Exception:
+                pass
 
             # --- Seed policy restore ---
             if hasattr(self, 'seed_policy') and 'seed_policy' in s:

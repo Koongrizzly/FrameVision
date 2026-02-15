@@ -2,17 +2,53 @@
 #!/usr/bin/env python3
 
 """
-downloadbg.py — v3.9
+downloadbg.py — v3.10
 - Pre-check destination folders BEFORE any download (prevents re-fetching huge files)
 - Reconciliation FIRST: move scripts/models -> project root models/, then clean
 - Adds --force to re-download even if destination already has the file
 - UltraSharp NCNN (Hugging Face) + SRMD (GitHub) upscaler downloads to models/realesrgan
-- Default = ALL models when no flags passed
-- NEW v3.9: Faster-Whisper "medium" model downloader to models/faster_whisper/medium
+- Default = ALL models when no flags passed (except Faster-Whisper)
+- Faster-Whisper "medium" model downloader is opt-in via --fw-medium (downloads to models/faster_whisper/medium)
 """
 import argparse, hashlib, os, sys, urllib.request, urllib.error, pathlib, shutil, time, math, zipfile, io
 
-VERSION = "v3.9"
+VERSION = "v3.10"
+
+# ------------------------------
+# Model registries
+# ------------------------------
+# NOTE:
+# - Zip-based packages live in MODELS and are referenced by --only / --realsr.
+# - File-based extras (UltraSharp / SRMD / RealESRGAN extras / Faster-Whisper) are handled by dedicated functions below.
+
+# Zip-based packages (downloaded into --dest, optionally extracted)
+MODELS = {
+    # RealSR 2x/4x package (nihui/realsr-ncnn-vulkan) — Windows build
+    # The GitHub release page lists this asset as ~61 MB. 
+    "realsr_ncnn_zip": {
+        "filename": "realsr-ncnn-vulkan-20220728-windows.zip",
+        "url": "https://github.com/nihui/realsr-ncnn-vulkan/releases/download/20220728/realsr-ncnn-vulkan-20220728-windows.zip",
+        "sha256": None,          # optional; leave None to skip hash check
+        "size_hint": "≈61 MB",
+        # Extract under models/ so the app can keep everything self-contained.
+        "extract_to": "models/realsr_ncnn_vulkan",
+        # Presence check (best-effort; different zips sometimes vary slightly)
+        "exists_path": [
+            "models/realsr_ncnn_vulkan/realsr-ncnn-vulkan.exe",
+            "models/realsr_ncnn_vulkan/realsr-ncnn-vulkan",
+        ],
+    },
+}
+
+# UltraSharp NCNN model files (Kim2091/UltraSharp on Hugging Face) 
+ULTRASHARP_BASE = "https://huggingface.co/Kim2091/UltraSharp/resolve/main/NCNN"
+ULTRASHARP_FILES = [
+    "4x-UltraSharp-fp16.bin",
+    "4x-UltraSharp-fp16.param",
+    "4x-UltraSharp-fp32.bin",
+    "4x-UltraSharp-fp32.param",
+]
+
 
 # ------------------------------
 # Paths and helpers
@@ -402,8 +438,9 @@ def main():
     ap.add_argument("--ultrasharp", action="store_true", help="Download UltraSharp NCNN files to models/realesrgan")
     ap.add_argument("--srmd", action="store_true", help="Download SRMD models (nihui) to models/realesrgan")
     ap.add_argument("--fw-medium", action="store_true", help="Download Faster-Whisper medium model (≈1.6 GB) to models/faster_whisper/medium")
-    ap.add_argument("--all", action="store_true", help="Download ALL supported models (includes UltraSharp+SRMD+Faster-Whisper medium)")
-    ap.add_argument("--only", nargs="+", choices=list(MODELS.keys()), help="Download only these model keys (space-separated)")
+    ap.add_argument("--all", action="store_true", help="Download ALL supported models (includes UltraSharp+SRMD+RealESRGAN extras; excludes Faster-Whisper unless --fw-medium)")
+    only_choices = list(MODELS.keys()) if isinstance(globals().get("MODELS"), dict) else None
+    ap.add_argument("--only", nargs="+", choices=only_choices, help="Download only these model keys (space-separated)")
     ap.add_argument("--hf-token", default=None, help="Hugging Face access token (overrides HF_TOKEN/HUGGINGFACE_TOKEN env vars)")
     ap.add_argument("--ignore-errors", action="store_true", help="Return success even if some downloads fail")
     ap.add_argument("--force", action="store_true", help="Re-download files even if they seem present already")
@@ -418,6 +455,8 @@ def main():
     dest.mkdir(parents=True, exist_ok=True)
 
     token = args.hf_token or os.getenv("HF_TOKEN") or os.getenv("HUGGINGFACE_TOKEN")
+
+    any_fail = False
 
     # 2) Determine selection for zip-based tools (e.g., RealSR package)
     all_keys = list(MODELS.keys())
@@ -440,9 +479,12 @@ def main():
     if args.realsr and "realsr_ncnn_zip" not in to_get:
         to_get.append("realsr_ncnn_zip")
         reason += "+realsr"
-
     for key in to_get:
-        m = MODELS[key]
+        m = MODELS.get(key) if isinstance(MODELS, dict) else None
+        if not m:
+            any_fail = True
+            print(f"[fail] Unknown model key: {key}")
+            continue
         out = dest / m["filename"]
 
         # Skip logic (unless --force)
@@ -450,14 +492,20 @@ def main():
             # temp dest present
             if out.exists():
                 print(f"[skip] {out.name} already exists in {dest}")
-                continue
-
-            # extracted path present (e.g., RealSR extracted folder)
+                continue            # extracted path present (e.g., RealSR extracted folder)
             exists_path = m.get("exists_path")
             if exists_path:
-                exists_path_p = (ROOT / exists_path) if not pathlib.Path(exists_path).is_absolute() else pathlib.Path(exists_path)
-                if exists_path_p.exists():
-                    print(f"[skip] {exists_path_p} already present")
+                candidates = exists_path if isinstance(exists_path, (list, tuple)) else [exists_path]
+                exists_found = False
+                for c in candidates:
+                    if not c:
+                        continue
+                    exists_path_p = (ROOT / c) if not pathlib.Path(c).is_absolute() else pathlib.Path(c)
+                    if exists_path_p.exists():
+                        print(f"[skip] {exists_path_p} already present")
+                        exists_found = True
+                        break
+                if exists_found:
                     continue
 
         # If we arrive here, proceed with fetching
@@ -515,7 +563,7 @@ def main():
             pass
 
     # 6) Faster-Whisper medium model
-    include_fw_medium = args.fw_medium or selected_default_all or args.all
+    include_fw_medium = args.fw_medium
     fw_tmp = pathlib.Path("scripts") / "_tmp_fasterwhisper"
     try:
         if include_fw_medium:
@@ -534,7 +582,12 @@ def main():
         print("[done] Completed with errors.", file=sys.stderr)
         return 1
 
-    print("[done] Upscaler models + Faster-Whisper medium ready in", ROOT_MODELS.resolve(), ",", ROOT_REALESRGAN.resolve(), "and", ROOT_FWHISPER_MEDIUM.resolve())
+    parts = [str(ROOT_MODELS.resolve()), str(ROOT_REALESRGAN.resolve())]
+    if include_fw_medium:
+        parts.append(str(ROOT_FWHISPER_MEDIUM.resolve()))
+        print("[done] Models ready in " + ", ".join(parts))
+    else:
+        print("[done] Models ready in " + ", ".join(parts) + " (Faster-Whisper skipped; use --fw-medium to download)")
     return 0
 
 if __name__ == "__main__":

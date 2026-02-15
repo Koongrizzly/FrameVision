@@ -2,7 +2,7 @@
 import os
 from PySide6.QtCore import Qt
 from PySide6.QtWidgets import (
-    QDialog, QVBoxLayout, QHBoxLayout, QLabel, QPushButton, QLineEdit,
+    QDialog, QVBoxLayout, QHBoxLayout, QLabel, QPushButton, QLineEdit, QComboBox,
     QFileDialog, QMessageBox
 )
 
@@ -21,6 +21,55 @@ def _kind(path: str) -> str:
     return "image"
 
 
+def open_with_files(parent, left_path: str, right_path: str):
+    """Programmatic entry path: validate, detect media type, and open compare immediately.
+
+    - Detect media type (image/video)
+    - Validate both sides exist and are same type
+    - Bypass manual selection UI
+    - Load viewer immediately (delegates to the parent VideoPane's open_compare)
+
+    Returns (left, right, kind) on success; otherwise returns ("", "", None).
+    """
+    left = (left_path or "").strip()
+    right = (right_path or "").strip()
+
+    try:
+        if not left or not right:
+            return "", "", None
+        if not os.path.isfile(left) or not os.path.isfile(right):
+            return "", "", None
+        k1 = _kind(left)
+        k2 = _kind(right)
+        if k1 != k2:
+            return "", "", None
+        # Close any existing compare instance to avoid stale video state/sync.
+        try:
+            if parent is not None and hasattr(parent, "close_compare"):
+                parent.close_compare()
+        except Exception:
+            pass
+        # Open compare immediately.
+        try:
+            if parent is not None and hasattr(parent, "open_compare"):
+                parent.open_compare(left, right, k1)
+            else:
+                # Fallback: parent may be MainWindow
+                vp = getattr(parent, "video", None)
+                if vp is not None and hasattr(vp, "open_compare"):
+                    try:
+                        if hasattr(vp, "close_compare"):
+                            vp.close_compare()
+                    except Exception:
+                        pass
+                    vp.open_compare(left, right, k1)
+        except Exception:
+            return "", "", None
+        return left, right, k1
+    except Exception:
+        return "", "", None
+
+
 class ComparePickDialog(QDialog):
     """
     Simple picker dialog:
@@ -37,6 +86,7 @@ class ComparePickDialog(QDialog):
         self._left = ""
         self._right = ""
         self._kind = None
+        self._scale_mode = "fill"
 
         root = QVBoxLayout(self)
 
@@ -65,6 +115,29 @@ class ComparePickDialog(QDialog):
         self.btn_right.clicked.connect(self._pick_right)
         row2.addWidget(self.btn_right)
         root.addLayout(row2)
+
+        # Scaling / normalization (helps when resolutions or aspect ratios differ)
+        row3 = QHBoxLayout()
+        row3.addWidget(QLabel("Scaling:"))
+        self.scale_combo = QComboBox()
+        self.scale_combo.addItem("Fill (crop) — easiest compare", "fill")
+        self.scale_combo.addItem("Fit (letterbox) — show full image", "fit")
+        self.scale_combo.addItem("Stretch (distort) — last resort", "stretch")
+        # Default to last used mode (if parent provides one)
+        try:
+            default_mode = getattr(parent, "_compare_scale_mode_default", None)
+        except Exception:
+            default_mode = None
+        if default_mode in ("fill","fit","stretch"):
+            try:
+                ix = self.scale_combo.findData(default_mode)
+                if ix >= 0:
+                    self.scale_combo.setCurrentIndex(ix)
+            except Exception:
+                pass
+        row3.addWidget(self.scale_combo, 1)
+        root.addLayout(row3)
+
 
         self.status = QLabel("")
         self.status.setWordWrap(True)
@@ -126,7 +199,11 @@ class ComparePickDialog(QDialog):
         if not self._left or not self._right or not self._kind:
             QMessageBox.warning(self, "Compare", "Please select two files of the same type.")
             return
+        try:
+            self._scale_mode = str(self.scale_combo.currentData() or "fill")
+        except Exception:
+            self._scale_mode = "fill"
         self.accept()
 
     def get_selection(self):
-        return self._left, self._right, self._kind
+        return self._left, self._right, self._kind, (self._scale_mode or "fill")

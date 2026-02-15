@@ -1,0 +1,42 @@
+# HeartMuLa (heartlib) requirements for FrameVision integration
+# NOTE: CUDA PyTorch (torch/torchvision/torchaudio) is installed by mula_install.bat.
+# Do NOT list torch here.
+
+# Core pins from heartlib
+numpy==2.0.2
+torchao==0.9.0
+torchtune==0.4.0
+
+# HF / transformers stack (heartlib pins transformers==4.57.0, tokenizers==0.22.1)
+# transformers 4.57.0 is yanked on PyPI but still installable; we pin it to match heartlib.
+huggingface_hub==0.36.0
+transformers==4.57.0
+tokenizers==0.22.1
+accelerate==1.12.0
+safetensors==0.7.0
+
+# Audio + utils
+sentencepiece==0.2.1
+soundfile==0.13.1
+scipy==1.17.0
+tqdm==4.67.1
+
+# Dataset stack (avoid fsspec backtracking)
+datasets==4.5.0
+fsspec[http]>=2023.1.0,<=2025.10.0
+
+# heartlib extras (installed explicitly to avoid pip backtracking during editable install)
+traitlets==5.7.1
+traittypes==0.2.3
+ipykernel==6.17.1
+einops==0.8.1
+bitsandbytes==0.49.0
+vector-quantize-pytorch==1.27.15
+einx>=0.3.0
+modelscope==1.33.0
+
+# UI
+PySide6==6.10.1
+
+# Windows Triton wheels (fixes: "No module named 'triton'")
+triton-windows<3.6

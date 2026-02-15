@@ -12,7 +12,7 @@ def _infer_image_format_from_input(job_args):
     except Exception:
         pass
     return None
-# FrameVision worker V2.0 — NCNN wiring
+# FrameVision worker - NCNN wiring
 import json, time, subprocess, os, re, shutil, sys
 from pathlib import Path
 try:
@@ -35,6 +35,51 @@ def _unique_path(p: Path) -> Path:
             i += 1
     except Exception:
         return Path(p)
+
+
+# --- Salvage helper: treat non-zero exit as success if output exists ---
+def _salvage_nonzero_output(code, outfile, job, label="Command"):
+    """If a tool exits non-zero but the expected output file exists and looks non-empty,
+    treat it as success (queue UX) and attach a warning + original exit code."""
+    try:
+        code_i = int(code)
+    except Exception:
+        code_i = 1
+    try:
+        if code_i in (0, 130):
+            return code_i
+        if not outfile:
+            return code_i
+        op = Path(str(outfile))
+        if not op.exists():
+            return code_i
+        try:
+            sz = int(op.stat().st_size or 0)
+        except Exception:
+            sz = 0
+        if sz <= 4096:
+            return code_i
+
+        # Mark as salvaged success
+        try:
+            job["exit_code"] = int(code_i)
+        except Exception:
+            pass
+        try:
+            prev_err = job.get("error")
+            msg = f"{label} exited with code {code_i} but output exists; marking job as done."
+            if prev_err:
+                msg = f"{msg}  (original error: {prev_err})"
+            job["warning"] = msg
+            try:
+                job.pop("error", None)
+            except Exception:
+                job["error"] = ""
+        except Exception:
+            pass
+        return 0
+    except Exception:
+        return code_i
 
 
 
@@ -685,32 +730,230 @@ def _ffprobe_bin():
     return "ffprobe"
 
 def _probe_src_fps(p: Path) -> str:
+    """Best-effort source FPS for video->frames->encode pipelines.
+
+    Prefer avg_frame_rate; fall back to nb_frames/duration; last resort r_frame_rate; default 30.
+    Returns an ffmpeg-friendly value (ratio like 24000/1001 or decimal string).
+    """
+    def _parse_ratio(s: str):
+        try:
+            s = (s or "").strip()
+            if not s or s in ("0/0", "0", "N/A"):
+                return None
+            if "/" in s:
+                a, b = s.split("/", 1)
+                a_i = int(float(a))
+                b_i = int(float(b))
+                if b_i == 0:
+                    return None
+                return (a_i, b_i)
+            f = float(s)
+            if f <= 0:
+                return None
+            den = 1_000_000
+            num = int(round(f * den))
+            if num <= 0:
+                return None
+            return (num, den)
+        except Exception:
+            return None
+
+    def _ratio_to_str(r):
+        try:
+            n, d = r
+            return str(n) if d == 1 else f"{n}/{d}"
+        except Exception:
+            return ""
+
+    def _fps_from_ratio(r):
+        try:
+            n, d = r
+            return float(n) / float(d) if d else 0.0
+        except Exception:
+            return 0.0
+
     try:
         FP = _ffprobe_bin()
         out = subprocess.check_output(
-            [FP, "-v", "error", "-select_streams", "v:0",
-             "-show_entries", "stream=avg_frame_rate,r_frame_rate",
-             "-of", "csv=p=0", str(p)], stderr=subprocess.STDOUT
-        ).decode("utf-8","ignore").strip().splitlines()
-        for val in out:
-            val = (val or "").strip()
-            if not val or val in ("0/0","0","N/A"):
-                continue
-            if "/" in val:
-                a,b = val.split("/",1)
-                try:
-                    if float(b) != 0:
-                        return val
-                except Exception:
-                    pass
-            try:
-                f = float(val)
-                if f > 0: return f"{f:g}"
-            except Exception:
-                pass
+            [FP, "-v", "error",
+             "-select_streams", "v:0",
+             "-show_entries", "stream=avg_frame_rate,r_frame_rate,nb_frames,duration",
+             "-show_entries", "format=duration",
+             "-of", "json",
+             str(p)],
+            stderr=subprocess.STDOUT
+        ).decode("utf-8", "ignore").strip()
+
+        j = {}
+        try:
+            j = json.loads(out or "{}")
+        except Exception:
+            j = {}
+        streams = j.get("streams") or []
+        s0 = streams[0] if streams else {}
+        fmt = j.get("format") or {}
+
+        avg = _parse_ratio(str(s0.get("avg_frame_rate") or ""))
+        rfr = _parse_ratio(str(s0.get("r_frame_rate") or ""))
+        nb_frames = s0.get("nb_frames")
+        try:
+            nb = int(nb_frames) if nb_frames not in (None, "", "N/A") else None
+        except Exception:
+            nb = None
+        dur_s = s0.get("duration")
+        if dur_s in (None, "", "N/A"):
+            dur_s = fmt.get("duration")
+        try:
+            dur = float(dur_s) if dur_s not in (None, "", "N/A") else None
+        except Exception:
+            dur = None
+
+        candidates = []
+        if avg:
+            candidates.append((_ratio_to_str(avg), _fps_from_ratio(avg)))
+        if nb and dur and dur > 0:
+            f = float(nb) / float(dur)
+            candidates.append((f"{f:.6f}".rstrip("0").rstrip("."), f))
+        if rfr:
+            candidates.append((_ratio_to_str(rfr), _fps_from_ratio(rfr)))
+
+        for val_str, fps in candidates:
+            if fps and 1.0 <= fps <= 240.0:
+                return val_str or "30"
     except Exception:
         pass
     return "30"
+
+
+
+def _bytes_human(n: int | float | None) -> str:
+    try:
+        if n is None:
+            return ""
+        n = float(n)
+        if n < 1024:
+            return f"{int(n)} B"
+        for unit in ["KB","MB","GB","TB"]:
+            n /= 1024.0
+            if n < 1024.0:
+                return f"{n:.2f} {unit}"
+        return f"{n:.2f} PB"
+    except Exception:
+        try:
+            return str(n)
+        except Exception:
+            return ""
+
+def _probe_video_info(p: Path) -> dict:
+    """Best-effort ffprobe info for video files.
+    Returns dict with: width,height,duration,fps_str,fps,nb_frames,vcodec,acodec,bit_rate,a_channels,a_rate
+    """
+    info = {}
+    try:
+        FP = _ffprobe_bin()
+        out = subprocess.check_output(
+            [FP, "-v", "error",
+             "-show_streams", "-show_format",
+             "-of", "json",
+             str(p)],
+            stderr=subprocess.STDOUT
+        ).decode("utf-8", "ignore").strip()
+        j = json.loads(out or "{}")
+        streams = j.get("streams") or []
+        fmt = j.get("format") or {}
+
+        v0 = None
+        a0 = None
+        for s in streams:
+            if not isinstance(s, dict):
+                continue
+            if s.get("codec_type") == "video" and v0 is None:
+                v0 = s
+            elif s.get("codec_type") == "audio" and a0 is None:
+                a0 = s
+
+        if v0:
+            try: info["width"] = int(v0.get("width") or 0)
+            except Exception: pass
+            try: info["height"] = int(v0.get("height") or 0)
+            except Exception: pass
+            try: info["vcodec"] = str(v0.get("codec_name") or "")
+            except Exception: pass
+            try:
+                afr = str(v0.get("avg_frame_rate") or "") or ""
+                info["fps_str"] = afr
+                # Convert to float if possible
+                if "/" in afr:
+                    a,b = afr.split("/",1)
+                    a = float(a); b = float(b)
+                    if b:
+                        info["fps"] = a/b
+                else:
+                    f = float(afr) if afr else 0.0
+                    if f:
+                        info["fps"] = f
+            except Exception:
+                pass
+            try:
+                nb = v0.get("nb_frames")
+                if nb not in (None, "", "N/A"):
+                    info["nb_frames"] = int(float(nb))
+            except Exception:
+                pass
+            try:
+                br = v0.get("bit_rate")
+                if br not in (None, "", "N/A"):
+                    info["v_bit_rate"] = int(float(br))
+            except Exception:
+                pass
+
+        if a0:
+            try: info["acodec"] = str(a0.get("codec_name") or "")
+            except Exception: pass
+            try:
+                ch = a0.get("channels")
+                if ch not in (None,"","N/A"):
+                    info["a_channels"] = int(float(ch))
+            except Exception:
+                pass
+            try:
+                sr = a0.get("sample_rate")
+                if sr not in (None,"","N/A"):
+                    info["a_rate"] = int(float(sr))
+            except Exception:
+                pass
+            try:
+                br = a0.get("bit_rate")
+                if br not in (None,"","N/A"):
+                    info["a_bit_rate"] = int(float(br))
+            except Exception:
+                pass
+
+        try:
+            dur = fmt.get("duration")
+            if dur not in (None,"","N/A"):
+                info["duration"] = float(dur)
+        except Exception:
+            pass
+        try:
+            br = fmt.get("bit_rate")
+            if br not in (None,"","N/A"):
+                info["bit_rate"] = int(float(br))
+        except Exception:
+            pass
+    except Exception:
+        return info
+
+    # Fill nb_frames estimate if missing
+    try:
+        if not info.get("nb_frames"):
+            fps = float(info.get("fps") or 0.0)
+            dur = float(info.get("duration") or 0.0)
+            if fps > 0 and dur > 0:
+                info["nb_frames"] = int(round(fps * dur))
+    except Exception:
+        pass
+    return info
 
 
 
@@ -759,17 +1002,107 @@ def build_lapsrn_cmd(exe, inp, out, factor):
 
 def upscale_video(job, cfg, mani):
     print("[worker] upscale_video: start", job.get("input"))
-    inp = Path(job["input"]); out_dir = Path(job["out_dir"]); out_dir.mkdir(parents=True, exist_ok=True)
-    factor = int(job["args"].get("factor", 4))
-    model_name = job["args"].get("model","RealESRGAN-x4plus")
-    model_name, exe_path = resolve_upscaler_exe(cfg, mani, model_name)
-    out = out_dir / f"{inp.stem}_x{factor}.mp4"
+    inp = Path(job["input"])
+    out_dir = Path(job["out_dir"])
+    out_dir.mkdir(parents=True, exist_ok=True)
 
+    args = (job.get("args") or {})
+    # If UI provided a model-specific scale, honor it (prevents mismatched x2/x4 models).
+    factor = int(args.get("model_scale") or args.get("factor") or 4)
+    model_name_req = args.get("model", "RealESRGAN-x4plus")
+    model_name, exe_path = resolve_upscaler_exe(cfg, mani, model_name_req)
+
+    out = out_dir / f"{inp.stem}_x{factor}.mp4"
     out = _unique_path(out)
+
     # Prepare potential temp dirs (some may not be used; we'll still try to delete them in finally)
     frames = out_dir / f"{inp.stem}_x{factor}_frames"
     up = out_dir / f"{inp.stem}_x{factor}_up"
     work = out_dir / f"{inp.stem}_x{factor}_work"  # also clean UI-created temp dirs if present
+
+    # --- Helpful upfront info ---
+    src = {}
+    try:
+        if is_video_path(inp):
+            src = _probe_video_info(inp)
+    except Exception:
+        src = {}
+
+    try:
+        in_size = int(inp.stat().st_size or 0)
+    except Exception:
+        in_size = 0
+
+    iw = int(src.get("width") or 0) if isinstance(src, dict) else 0
+    ih = int(src.get("height") or 0) if isinstance(src, dict) else 0
+    ow = iw * factor if iw else 0
+    oh = ih * factor if ih else 0
+
+    try:
+        fps_str = _probe_src_fps(inp)
+    except Exception:
+        fps_str = "30"
+
+    try:
+        dur = float(src.get("duration") or 0.0)
+    except Exception:
+        dur = 0.0
+
+    try:
+        nb_est = int(src.get("nb_frames") or 0)
+    except Exception:
+        nb_est = 0
+
+    try:
+        vcodec = (src.get("vcodec") or "").strip()
+        acodec = (src.get("acodec") or "").strip()
+    except Exception:
+        vcodec = ""
+        acodec = ""
+
+    try:
+        print(
+            "[worker][upscale_video] input:",
+            str(inp),
+            "| size",
+            _bytes_human(in_size),
+            "| src",
+            (f"{iw}x{ih}" if iw and ih else "unknown"),
+            "| fps",
+            fps_str,
+            "| dur",
+            (f"{dur:.2f}s" if dur else "unknown"),
+            "| vcodec",
+            (vcodec or "unknown"),
+            "| audio",
+            (acodec or "none"),
+        )
+        if ow and oh:
+            print(f"[worker][upscale_video] output: {ow}x{oh}  |  factor x{factor}  |  out_file: {out.name}")
+    except Exception:
+        pass
+
+    # Patch queue JSON with richer metadata (best-effort)
+    try:
+        _patch_running_json({
+            "stage": "Preparing video upscale",
+            "input_path": str(inp),
+            "out_path": str(out),
+            "factor": int(factor),
+            "model": str(model_name),
+            "src_w": iw,
+            "src_h": ih,
+            "out_w": ow,
+            "out_h": oh,
+            "src_fps": str(fps_str),
+            "duration_sec": float(dur) if dur else None,
+            "frames_est": int(nb_est) if nb_est else None,
+            "src_size_bytes": int(in_size) if in_size else None,
+            "vcodec": vcodec or None,
+            "acodec": acodec or None,
+        })
+    except Exception:
+        pass
 
     _hb_thr = None
     _hb_stop = {"run": False}
@@ -782,21 +1115,58 @@ def upscale_video(job, cfg, mani):
         except Exception:
             pass
 
+    def _count_pngs(d: Path) -> int:
+        try:
+            c = 0
+            with os.scandir(str(d)) as it:
+                for e in it:
+                    try:
+                        if e.is_file() and e.name.lower().endswith(".png"):
+                            c += 1
+                    except Exception:
+                        continue
+            return int(c)
+        except Exception:
+            try:
+                return len(list(Path(d).glob("*.png")))
+            except Exception:
+                return 0
+
     try:
         if exe_path and exe_path.exists() and exe_path.is_file():
             print(f"[worker] Using model '{model_name}' at {exe_path}")
+
             # 1) Extract frames
+            try:
+                _patch_running_json({"stage": "Extracting frames"})
+            except Exception:
+                pass
+            print("[worker][upscale_video] Stage 1/3: extracting frames...")
+
             frames.mkdir(parents=True, exist_ok=True)
-            code = run([FFMPEG,"-y","-i",str(inp), str(frames/"%06d.png")])
+            code = run([FFMPEG, "-y", "-i", str(inp), str(frames / "%06d.png")])
             if code != 0:
                 return 1
 
-            # 2) Upscale frames (batch dir-mode for RealESRGAN; per-frame for others)
-            up.mkdir(parents=True, exist_ok=True)
+            # 2) Upscale frames
             try:
-                total_frames = len(list(frames.glob("*.png")))
+                _patch_running_json({"stage": "Counting frames"})
+            except Exception:
+                pass
+
+            try:
+                total_frames = int(nb_est) if nb_est else 0
             except Exception:
                 total_frames = 0
+            if total_frames <= 0:
+                total_frames = _count_pngs(frames)
+
+            try:
+                print(f"[worker][upscale_video] extracted frames: {total_frames}")
+            except Exception:
+                pass
+
+            up.mkdir(parents=True, exist_ok=True)
             try:
                 _progress_set(10)
             except Exception:
@@ -804,75 +1174,201 @@ def upscale_video(job, cfg, mani):
 
             import threading as _th, time as _time
             _hb_stop["run"] = True
-            _hb_state = {"last": -1}
+            _hb_state = {
+                "last_pct": -1,
+                "last_bucket": -1,
+                "last_done": 0,
+                "last_ts": _time.time(),
+                "t0": _time.time(),
+                "last_json_ts": 0.0,
+            }
+
             def _hb_loop():
                 while _hb_stop.get("run", False):
                     try:
-                        done = len(list(up.glob("*.png")))
+                        done = _count_pngs(up)
+                        now = _time.time()
+                        dt = max(0.001, now - float(_hb_state.get("last_ts") or now))
+                        dframes = max(0, int(done) - int(_hb_state.get("last_done") or 0))
+                        speed = float(dframes) / float(dt) if dt > 0 else 0.0
+                        _hb_state["last_done"] = int(done)
+                        _hb_state["last_ts"] = now
+
                         if total_frames > 0:
-                            pct = 10.0 + min(85.0, (done / total_frames) * 85.0)
+                            pct = 10.0 + min(85.0, (float(done) / float(total_frames)) * 85.0)
                             ipct = int(pct)
-                            if ipct != _hb_state["last"]:
+                            if ipct != int(_hb_state.get("last_pct") or -1):
                                 _progress_set(ipct)
-                                _hb_state["last"] = ipct
+                                _hb_state["last_pct"] = ipct
+
+                            # Print every 10% bucket so the console stays readable
+                            bucket = int(ipct / 10)
+                            if bucket != int(_hb_state.get("last_bucket") or -1):
+                                _hb_state["last_bucket"] = bucket
+                                eta_s = None
+                                if speed > 0 and done < total_frames:
+                                    eta_s = float(total_frames - done) / float(speed)
+                                msg = f"[worker][upscale_video] upscaling: {done}/{total_frames}  |  {speed:.2f} frames/s"
+                                if eta_s is not None:
+                                    msg += f"  |  eta {_fmt_dur_short(eta_s)}"
+                                try:
+                                    print(msg)
+                                except Exception:
+                                    pass
+
+                        # Patch running JSON at most ~2 Hz
+                        if (now - float(_hb_state.get("last_json_ts") or 0.0)) >= 0.5:
+                            _hb_state["last_json_ts"] = now
+                            try:
+                                eta_s = None
+                                if total_frames > 0 and speed > 0 and done < total_frames:
+                                    eta_s = float(total_frames - done) / float(speed)
+                                _patch_running_json({
+                                    "stage": "Upscaling frames",
+                                    "done_frames": int(done),
+                                    "total_frames": int(total_frames) if total_frames else None,
+                                    "speed_fps": float(speed) if speed else None,
+                                    "eta_frames_sec": float(eta_s) if eta_s is not None else None,
+                                })
+                            except Exception:
+                                pass
                     except Exception:
                         pass
                     _time.sleep(1.0)
+
             _hb_thr = _th.Thread(target=_hb_loop, daemon=True)
             try:
                 _hb_thr.start()
             except Exception:
                 pass
 
+            try:
+                _patch_running_json({"stage": "Upscaling frames", "total_frames": int(total_frames) if total_frames else None})
+            except Exception:
+                pass
+            print("[worker][upscale_video] Stage 2/3: upscaling frames...")
+
             m = str(model_name).lower()
             if ("realesr" in m) or ("realesrgan" in m):
-                cmd = build_realesrgan_cmd(str(exe_path), frames, up, factor, model_name, models_dir=Path(exe_path).parent, is_dir=True)
-                if run(cmd)!=0:
+                cmd = build_realesrgan_cmd(
+                    str(exe_path),
+                    frames,
+                    up,
+                    factor,
+                    model_name,
+                    models_dir=Path((job.get('args') or {}).get('models_dir') or Path(exe_path).parent),
+                    is_dir=True
+                )
+                if run(cmd) != 0:
                     return 1
             else:
+                # Per-frame upscale for other engines / fallback
                 for png in sorted(frames.glob("*.png")):
+                    if _cancel_requested():
+                        _note_cancel("Cancelled by user")
+                        return 130
                     if "swinir" in m:
-                        cmd = build_swinir_cmd(str(exe_path), png, up/png.name, factor)
+                        cmd = build_swinir_cmd(str(exe_path), png, up / png.name, factor)
                     elif "lapsrn" in m:
-                        cmd = build_lapsrn_cmd(str(exe_path), png, up/png.name, factor)
+                        cmd = build_lapsrn_cmd(str(exe_path), png, up / png.name, factor)
                     else:
-                        cmd = [FFMPEG,"-y","-i",str(png),"-vf",f"scale=iw*{factor}:ih*{factor}:flags=lanczos","-frames:v","1",str(up/png.name)]
-                    if run(cmd)!=0:
+                        cmd = [
+                            FFMPEG, "-y", "-i", str(png),
+                            "-vf", f"scale=iw*{factor}:ih*{factor}:flags=lanczos",
+                            "-frames:v", "1",
+                            str(up / png.name)
+                        ]
+                    if run(cmd) != 0:
                         return 1
 
             # 3) Re-encode
             _stop_hb()
             try:
+                _patch_running_json({"stage": "Encoding video"})
+            except Exception:
+                pass
+
+            try:
                 _progress_set(90)
             except Exception:
                 pass
 
-            enc = [FFMPEG,"-y","-framerate", _probe_src_fps(inp), "-i", str(up/"%06d.png"),"-i",str(inp),"-map","0:v:0","-map","1:a:0?","-c:a","copy","-c:v","libx264","-preset","veryfast","-pix_fmt","yuv420p","-vsync","cfr","-r",_probe_src_fps(inp),"-movflags","+faststart",str(out)]
-            if run(enc)!=0:
+            src_fps = fps_str or _probe_src_fps(inp)
+            print("[worker][upscale_video] Stage 3/3: encoding video...")
+            try:
+                print(f"[worker][upscale_video] encoder: libx264 preset=veryfast | fps={src_fps} | audio=copy")
+            except Exception:
+                pass
+
+            enc = [
+                FFMPEG, "-y",
+                "-framerate", str(src_fps),
+                "-i", str(up / "%06d.png"),
+                "-i", str(inp),
+                "-map", "0:v:0",
+                "-map", "1:a:0?",
+                "-c:a", "copy",
+                "-c:v", "libx264",
+                "-preset", "veryfast",
+                "-pix_fmt", "yuv420p",
+                "-vsync", "cfr",
+                "-r", str(src_fps),
+                "-movflags", "+faststart",
+                str(out)
+            ]
+            code = run(enc)
+            try:
+                code = _salvage_nonzero_output(code, out, job, label="FFmpeg encode")
+            except Exception:
+                pass
+            if int(code) != 0:
                 return 1
+
             try:
                 _progress_set(100)
             except Exception:
                 pass
             try:
-                job['produced'] = str(out)
+                job["produced"] = str(out)
+            except Exception:
+                pass
+            try:
+                _patch_running_json({"stage": "Done", "produced": str(out)})
             except Exception:
                 pass
             return 0
-        else:
-            # Fallback: ffmpeg scale (no model)
-            print("[worker] No model exe found, using ffmpeg scale fallback")
-            code = run([FFMPEG,"-y","-i",str(inp),"-vf",f"scale=iw*{factor}:ih*{factor}:flags=lanczos", str(out)])
+
+        # Fallback: ffmpeg scale (no model)
+        print("[worker] No model exe found, using ffmpeg scale fallback")
+        try:
+            _patch_running_json({"stage": "FFmpeg scale fallback", "model": None})
+        except Exception:
+            pass
+
+        cmd = [FFMPEG, "-y", "-i", str(inp), "-vf", f"scale=iw*{factor}:ih*{factor}:flags=lanczos", str(out)]
+        code = run(cmd)
+
+        try:
+            code = _salvage_nonzero_output(code, out, job, label="FFmpeg scale")
+        except Exception:
+            pass
+
+        try:
+            _progress_set(100)
+        except Exception:
+            pass
+
+        if code == 0:
             try:
-                _progress_set(100)
+                job["produced"] = str(out)
             except Exception:
                 pass
-            if code == 0:
-                try:
-                    job['produced'] = str(out)
-                except Exception:
-                    pass
-            return code
+            try:
+                _patch_running_json({"stage": "Done", "produced": str(out)})
+            except Exception:
+                pass
+        return int(code)
+
     finally:
         # Always try to clean temp dirs; ignore errors
         _stop_hb()
@@ -882,6 +1378,7 @@ def upscale_video(job, cfg, mani):
                     _safe_rmtree(d)
             except Exception:
                 pass
+
 
 def tools_ffmpeg(job, cfg, mani):
     """Run an external command job (legacy job_type name: tools_ffmpeg).
@@ -1018,9 +1515,52 @@ def tools_ffmpeg(job, cfg, mani):
         env.setdefault("PYTHONUTF8", "1")
         env.setdefault("PYTHONIOENCODING", "utf-8")
 
+        # Optional env overrides from job args (useful for tools that need custom PATH/vars)
+        try:
+            extra_env = args.get("env")
+            if isinstance(extra_env, dict):
+                for k, v in extra_env.items():
+                    if k is None or v is None:
+                        continue
+                    env[str(k)] = str(v)
+        except Exception:
+            pass
+
+        # Optional PATH prepend (string or list/tuple of paths)
+        try:
+            pp = args.get("prepend_path") or args.get("prepend_PATH")
+            if pp:
+                if isinstance(pp, (list, tuple)):
+                    pp = _os.pathsep.join([str(x) for x in pp if x])
+                pp = str(pp)
+                oldp = env.get("PATH", "")
+                env["PATH"] = pp + (_os.pathsep + oldp if oldp else "")
+        except Exception:
+            pass
+
         # Start
         try:
             _progress_set(0)
+        except Exception:
+            pass
+
+
+        # Fix for planner queue-lock: python -c cannot contain a 'while' compound statement after semicolons.
+        # If cmd looks like: python -c "import ...;...;while not os.path.exists(done_flag): time.sleep(0.5);..."
+        # rewrite the script arg into a multiline program so Python can execute it.
+        try:
+            if isinstance(cmd, (list, tuple)) and len(cmd) >= 3:
+                exe = str(cmd[0]).lower()
+                if (exe.endswith("python") or exe.endswith("python.exe")) and str(cmd[1]) == "-c":
+                    script = str(cmd[2])
+                    if ";while " in script and "os.path.exists(done_flag)" in script:
+                        script = _re.sub(
+                            r";while\s+not\s+os\.path\.exists\(done_flag\):\s*time\.sleep\(0\.5\);",
+                            "\nwhile not os.path.exists(done_flag):\n    time.sleep(0.5)\n",
+                            script,
+                        )
+                        cmd = list(cmd)
+                        cmd[2] = script
         except Exception:
             pass
 
@@ -1159,21 +1699,91 @@ def tools_ffmpeg(job, cfg, mani):
         except Exception:
             pass
 
-        if int(code) == 0:
+        # Normalize return code
+        try:
+            code_i = int(code)
+        except Exception:
+            code_i = 1
+
+        # Salvage: some helper scripts exit non-zero even though the expected output was produced.
+        # For queue UX, it's more useful to mark these as DONE (with a warning) than FAILED.
+        salvaged = False
+        try:
+            if code_i not in (0, 130) and outfile:
+                op = pathlib.Path(str(outfile))
+                if op.exists():
+                    try:
+                        sz = int(op.stat().st_size or 0)
+                    except Exception:
+                        sz = 0
+                    # Small threshold avoids "empty placeholder file" false-positives.
+                    if sz > 4096:
+                        salvaged = True
+        except Exception:
+            salvaged = False
+
+        if salvaged:
+            try:
+                job["exit_code"] = int(code_i)
+            except Exception:
+                pass
+            try:
+                prev_err = job.get("error")
+                msg = f"Command exited with code {code_i} but output exists; marking job as done."
+                if prev_err:
+                    msg = f"{msg}  (original error: {prev_err})"
+                job["warning"] = msg
+                try:
+                    job.pop("error", None)
+                except Exception:
+                    job["error"] = ""
+            except Exception:
+                pass
+            code_i = 0
+
+        if int(code_i) == 0:
             # Mark produced output if known
             try:
                 if outfile and pathlib.Path(str(outfile)).exists():
                     job["produced"] = str(outfile)
-            except Exception:
-                pass
-        else:
-            try:
-                if not job.get("error"):
-                    job["error"] = f"tools_ffmpeg failed (code {code})."
+                    job["files"] = [str(outfile)]
             except Exception:
                 pass
 
-        return int(code)
+            # Planner lock / generic tools jobs: if caller provided a scan_dir + scan_ext,
+            # pick the newest matching file and mark it as produced so Queue's "Play last result" works.
+            try:
+                scan_dir = args.get("scan_dir") or args.get("out_scan_dir")
+                scan_ext = args.get("scan_ext") or args.get("out_scan_ext") or ".mp4"
+                if scan_dir:
+                    sd = pathlib.Path(str(scan_dir))
+                    if sd.exists() and sd.is_dir():
+                        ext = str(scan_ext).lower()
+                        if not ext.startswith("."):
+                            ext = "." + ext
+                        cand = list(sd.glob(f"*{ext}"))
+                        if cand:
+                            newest = max(cand, key=lambda p: p.stat().st_mtime)
+                            job["produced"] = str(newest)
+                            job["files"] = [str(newest)]
+                            # also set outfile for UI/compat
+                            try:
+                                args["outfile"] = str(newest)
+                                job["args"] = args
+                            except Exception:
+                                pass
+            except Exception:
+                pass
+
+        else:
+            try:
+                if not job.get("error"):
+                    job["error"] = f"tools_ffmpeg failed (code {code_i})."
+            except Exception:
+                pass
+
+        return int(code_i)
+
     except Exception as e:
         try:
             job["error"] = f"tools_ffmpeg exception: {e}"
@@ -1184,9 +1794,15 @@ def tools_ffmpeg(job, cfg, mani):
 
 def upscale_photo(job, cfg, mani):
     print("[worker] upscale_photo: start", job.get("input"))
-    inp = Path(job["input"]); out_dir = Path(job["out_dir"]); out_dir.mkdir(parents=True, exist_ok=True)
-    factor = int(job["args"].get("factor", 4)); fmt = (job["args"].get("format") or _infer_image_format_from_input(job["args"]) or "png").lower()
-    model_name = job["args"].get("model","RealESRGAN-x4plus")
+    inp = Path(job["input"])
+    out_dir = Path(job["out_dir"])
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    args = job.get("args") or {}
+    # If UI provided a model-specific scale, honor it (prevents mismatched x2/x4 models).
+    factor = int(args.get("model_scale") or args.get("factor") or 4)
+    fmt = (args.get("format") or _infer_image_format_from_input(args) or "png").lower()
+    model_name = args.get("model", "RealESRGAN-x4plus")
     model_name, exe_path = resolve_upscaler_exe(cfg, mani, model_name)
     out = out_dir / f"{inp.stem}_x{factor}.{fmt}"
     out = _unique_path(out)
@@ -1248,6 +1864,11 @@ def upscale_photo(job, cfg, mani):
                 job['cmd'] = ' '.join([str(x) for x in cmd])
             except Exception:
                 pass
+            try:
+                code = _salvage_nonzero_output(code, out, job, label="Upscaler")
+            except Exception:
+                pass
+
             # ## PATCH set produced after model-exe
             try:
                 if code == 0:
@@ -1267,6 +1888,11 @@ def upscale_photo(job, cfg, mani):
             job['cmd'] = ' '.join(str(x) for x in cmd)
         except Exception:
             pass
+        try:
+            code = _salvage_nonzero_output(code, out, job, label="Upscaler")
+        except Exception:
+            pass
+
         if code == 0:
             try: job['produced'] = str(out)
             except Exception: pass
@@ -1551,45 +2177,354 @@ def txt2img_generate(job, cfg, mani):
     else:
         # Non-Z-Image engines: allow helper + legacy Diffusers fallback
         try:
-            def _zprog(p):
-                """Progress callback for txt2img engines (pct or step/total dict)."""
+            # Special: Qwen-Image-2512 (GGUF via sd-cli) — print richer debug info like the Z-Image path does.
+            if engine in ("qwen2512", "qwen_2512", "qwenimage2512", "qwen-image-2512"):
+                _q_state = {"t0": _now_ts(), "last_stage": None, "last_step": None, "last_pct": -1, "last_line": None}
+
+                # Pull common settings (best-effort; keys vary a bit across UI versions).
                 try:
-                    if isinstance(p, (int, float)):
-                        _progress_set(int(p))
-                        return
-                    if not isinstance(p, dict):
-                        return
-                    if 'pct' in p:
+                    _steps = int(args.get("steps") or helper_job.get("steps") or 0)
+                except Exception:
+                    _steps = 0
+                try:
+                    _w = int(args.get("width") or args.get("w") or helper_job.get("width") or helper_job.get("w") or 0)
+                    _h = int(args.get("height") or args.get("h") or helper_job.get("height") or helper_job.get("h") or 0)
+                except Exception:
+                    _w = _h = 0
+                try:
+                    _cfg = float(args.get("cfg") or args.get("cfg_scale") or helper_job.get("cfg") or helper_job.get("cfg_scale") or 0.0)
+                except Exception:
+                    _cfg = 0.0
+                try:
+                    _sampler = (args.get("sampler") or helper_job.get("sampler") or "").strip()
+                except Exception:
+                    _sampler = ""
+                try:
+                    _flow = int(args.get("flow_shift", helper_job.get("flow_shift", 0)) or 0)
+                except Exception:
+                    _flow = 0
+                try:
+                    _seed = args.get("seed") or helper_job.get("seed")
+                except Exception:
+                    _seed = None
+                try:
+                    _offload_raw = args.get("offload_cpu", None)
+                    if _offload_raw is None:
+                        _offload_raw = args.get("offload_to_cpu", None)
+                    if _offload_raw is None:
+                        _offload_raw = helper_job.get("offload_cpu", None)
+                    if _offload_raw is None:
+                        _offload_raw = helper_job.get("offload_to_cpu", None)
+                    _offload = bool(_offload_raw)
+                except Exception:
+                    _offload = False
+                try:
+                    _batch = int(args.get("batch") or helper_job.get("batch") or 1)
+                except Exception:
+                    _batch = 1
+
+                # Prompt visibility (trimmed so we don't spam the console).
+                try:
+                    _prompt = str(args.get("prompt") or helper_job.get("prompt") or "").strip()
+                except Exception:
+                    _prompt = ""
+                _prompt_short = (_prompt[:120] + "…") if (len(_prompt) > 120) else _prompt
+
+                try:
+                    print(f"[txt2img][Qwen2512] start  |  {_w}x{_h}  |  steps={_steps}  |  cfg={_cfg}  |  batch={_batch}  |  seed={_seed if str(_seed).strip() else 'random'}")
+                except Exception:
+                    pass
+                try:
+                    if _sampler or _flow or _offload:
+                        print(f"[txt2img][Qwen2512] sampler={_sampler or 'default'}  |  flow_shift={_flow}  |  offload_cpu={_offload}")
+                except Exception:
+                    pass
+                try:
+                    if _prompt_short:
+                        print(f"[txt2img][Qwen2512] prompt: {_prompt_short}")
+                        # LoRA (optional)
                         try:
-                            _progress_set(int(p.get('pct') or 0))
+                            _lp = (args.get("lora_path") or helper_job.get("lora_path") or "").strip()
+                            _ls = args.get("lora_scale", None)
+                            if _ls is None:
+                                _ls = helper_job.get("lora_scale", None)
+                            _lp2 = (args.get("lora2_path") or helper_job.get("lora2_path") or "").strip()
+                            _ls2 = args.get("lora2_scale", None)
+                            if _ls2 is None:
+                                _ls2 = helper_job.get("lora2_scale", None)
+                            if _lp:
+                                print(f"[txt2img][Qwen2512] LoRA1: {_lp}  |  scale={_ls if _ls is not None else 1.0}")
+                            if _lp2:
+                                print(f"[txt2img][Qwen2512] LoRA2: {_lp2}  |  scale={_ls2 if _ls2 is not None else 1.0}")
                         except Exception:
                             pass
-                    elif 'step' in p and 'total' in p:
-                        try:
-                            step = float(p.get('step') or 0)
-                            total = float(p.get('total') or 0)
-                            if total > 0:
-                                _progress_set(int(100.0 * step / total))
-                        except Exception:
-                            pass
-                    # Patch running job JSON with richer fields (best-effort)
+                except Exception:
+                    pass
+
+                # Try to resolve sd-cli + model file paths (best-effort) so you can spot wrong installs immediately.
+                try:
+                    sd_cli = None
+                    diffusion = llm = vae = None
                     try:
-                        if RUNNING_JSON_FILE:
-                            rj = Path(RUNNING_JSON_FILE)
-                            j = json.loads(rj.read_text(encoding='utf-8')) if rj.exists() else {}
-                            changed = False
-                            for k in ('step','total','status','stage'):
-                                if k in p and j.get(k) != p.get(k):
-                                    j[k] = p.get(k)
-                                    changed = True
-                            if changed:
-                                j['status_at'] = time.strftime('%Y-%m-%d %H:%M:%S')
-                                rj.write_text(json.dumps(j, indent=2), encoding='utf-8')
+                        from helpers import qwen2512 as _qtool  # type: ignore
+                        try:
+                            sd_cli = _qtool._find_sd_cli(BASE)  # type: ignore[attr-defined]
+                        except Exception:
+                            sd_cli = None
+                        try:
+                            diffusion, llm, vae = _qtool._model_paths(BASE)  # type: ignore[attr-defined]
+                        except Exception:
+                            diffusion = llm = vae = None
+                    except Exception:
+                        sd_cli = None
+                        diffusion = llm = vae = None
+
+                    def _pinfo(pth):
+                        try:
+                            if not pth:
+                                return None
+                            pp = Path(str(pth))
+                            if not pp.exists():
+                                return str(pp)
+                            sz = int(pp.stat().st_size or 0)
+                            return f"{pp} ({_bytes_human(sz)})"
+                        except Exception:
+                            try:
+                                return str(pth)
+                            except Exception:
+                                return None
+
+                    if sd_cli:
+                        try:
+                            print(f"[txt2img][Qwen2512] sd-cli: {sd_cli}")
+                        except Exception:
+                            pass
+                    if diffusion or llm or vae:
+                        try:
+                            print("[txt2img][Qwen2512] models:",
+                                  "\n  diffusion:", _pinfo(diffusion),
+                                  "\n  llm:", _pinfo(llm),
+                                  "\n  vae:", _pinfo(vae))
+                        except Exception:
+                            pass
+
+                    # Patch running JSON so the Queue row can show more than just a percent.
+                    try:
+                        _patch_running_json({
+                            "stage": "Preparing (Qwen2512)",
+                            "engine": "qwen2512",
+                            "w": _w or None,
+                            "h": _h or None,
+                            "steps": _steps or None,
+                            "cfg": _cfg or None,
+                            "sampler": _sampler or None,
+                            "flow_shift": _flow or None,
+                            "seed": _seed if str(_seed).strip() else None,
+                            "batch": _batch or None,
+                            "offload_cpu": bool(_offload),
+                            "sd_cli": str(sd_cli) if sd_cli else None,
+                            "diffusion_model": str(diffusion) if diffusion else None,
+                            "llm_model": str(llm) if llm else None,
+                            "vae_model": str(vae) if vae else None,
+
+"lora_path": str(args.get("lora_path") or helper_job.get("lora_path") or "") or None,
+"lora_scale": (args.get("lora_scale") if args.get("lora_scale", None) is not None else helper_job.get("lora_scale", None)),
+"lora2_path": str(args.get("lora2_path") or helper_job.get("lora2_path") or "") or None,
+"lora2_scale": (args.get("lora2_scale") if args.get("lora2_scale", None) is not None else helper_job.get("lora2_scale", None)),
+                        })
                     except Exception:
                         pass
                 except Exception:
-                    return
-            res = _txt2img.generate_qwen_images(helper_job, progress_cb=_zprog, cancel_event=None)
+                    pass
+
+                def _qprog(p):
+                    """Progress callback for Qwen2512 txt2img (pct or step/total dict)."""
+                    try:
+                        elapsed = None
+                        try:
+                            elapsed = _now_ts() - float(_q_state.get("t0") or _now_ts())
+                        except Exception:
+                            elapsed = None
+
+                        # ---- Numeric progress ----
+                        if isinstance(p, (int, float)):
+                            ip = int(p)
+                            _progress_set(ip)
+                            # Print every 10% or on finish
+                            try:
+                                lastp = int(_q_state.get("last_pct") or -999)
+                            except Exception:
+                                lastp = -999
+                            if ip >= 100 or (ip - lastp) >= 10:
+                                _q_state["last_pct"] = ip
+                                msg = f"[txt2img][Qwen2512] {ip}%"
+                                if elapsed is not None:
+                                    msg += f"  |  elapsed {_fmt_dur_short(elapsed)}"
+                                _print_once("last_line", _q_state, msg)
+                            return
+
+                        if not isinstance(p, dict):
+                            return
+
+                        stage = (p.get("stage") or p.get("status") or "").strip()
+                        status = (p.get("status") or "").strip()
+                        line = (p.get("line") or p.get("msg") or p.get("message") or "").strip()
+
+                        pct = None
+                        if "pct" in p:
+                            try:
+                                pct = int(float(p.get("pct") or 0))
+                            except Exception:
+                                pct = None
+                            if pct is not None:
+                                _progress_set(pct)
+
+                        step = None
+                        total = None
+                        if "step" in p and "total" in p:
+                            try:
+                                step = int(float(p.get("step") or 0))
+                                total = int(float(p.get("total") or 0))
+                            except Exception:
+                                step = None
+                                total = None
+                            if total and total > 0:
+                                if pct is None:
+                                    try:
+                                        pct = int(100.0 * float(step) / float(total))
+                                    except Exception:
+                                        pct = None
+                                try:
+                                    _progress_set(int(100.0 * float(step) / float(total)))
+                                except Exception:
+                                    pass
+
+                        # Reasonable stage inference
+                        if not stage:
+                            if step is not None and total is not None:
+                                stage = "Denoising"
+                            elif pct is not None and pct < 5:
+                                stage = "Preparing"
+                            elif pct is not None and pct >= 95:
+                                stage = "Saving"
+                            else:
+                                stage = "Working"
+
+                        # Print only on stage changes, or every ~10% bucket, or when we get a meaningful line.
+                        should_print = False
+                        try:
+                            last_stage = _q_state.get("last_stage")
+                            if stage and stage != last_stage:
+                                should_print = True
+                                _q_state["last_stage"] = stage
+                        except Exception:
+                            pass
+                        try:
+                            lastp = int(_q_state.get("last_pct") or -999)
+                        except Exception:
+                            lastp = -999
+                        if pct is not None:
+                            bucket = int(max(0, min(100, int(pct))) / 10)
+                            last_bucket = int(max(0, min(100, int(lastp))) / 10) if lastp >= 0 else -999
+                            if bucket != last_bucket:
+                                should_print = True
+                                _q_state["last_pct"] = int(pct)
+
+                        if line:
+                            # Avoid printing identical lines over and over.
+                            if line != _q_state.get("last_line"):
+                                _q_state["last_line"] = line
+                                # Keep this conservative: only print short-ish lines.
+                                if len(line) <= 180:
+                                    should_print = True
+
+                        if not should_print:
+                            return
+
+                        parts = [f"[txt2img][Qwen2512] {stage}"]
+                        if step is not None and total is not None and total > 0:
+                            parts.append(f"{step}/{total}")
+                        elif pct is not None:
+                            parts.append(f"{pct}%")
+                        if status and status != stage:
+                            parts.append(status)
+                        if line and line not in (stage, status):
+                            parts.append(line)
+
+                        msg = "  |  ".join([str(x) for x in parts if x])
+                        if elapsed is not None:
+                            msg += f"  |  elapsed {_fmt_dur_short(elapsed)}"
+                        _print_once("last_line", _q_state, msg)
+
+                        # Patch running job JSON with richer fields (best-effort)
+                        try:
+                            if RUNNING_JSON_FILE:
+                                rj = Path(RUNNING_JSON_FILE)
+                                j = json.loads(rj.read_text(encoding='utf-8')) if rj.exists() else {}
+                                changed = False
+                                for k in ('step','total','status','stage','pct'):
+                                    if k in p and j.get(k) != p.get(k):
+                                        j[k] = p.get(k)
+                                        changed = True
+                                if stage and j.get("stage") != stage:
+                                    j["stage"] = stage
+                                    changed = True
+                                if pct is not None and j.get("pct") != int(pct):
+                                    j["pct"] = int(pct)
+                                    changed = True
+                                if line and j.get("last_line") != line:
+                                    j["last_line"] = line
+                                    changed = True
+                                if changed:
+                                    j['status_at'] = time.strftime('%Y-%m-%d %H:%M:%S')
+                                    rj.write_text(json.dumps(j, indent=2), encoding='utf-8')
+                        except Exception:
+                            pass
+                    except Exception:
+                        return
+
+                res = _txt2img.generate_qwen_images(helper_job, progress_cb=_qprog, cancel_event=None)
+
+            else:
+                def _zprog(p):
+                    """Progress callback for txt2img engines (pct or step/total dict)."""
+                    try:
+                        if isinstance(p, (int, float)):
+                            _progress_set(int(p))
+                            return
+                        if not isinstance(p, dict):
+                            return
+                        if 'pct' in p:
+                            try:
+                                _progress_set(int(p.get('pct') or 0))
+                            except Exception:
+                                pass
+                        elif 'step' in p and 'total' in p:
+                            try:
+                                step = float(p.get('step') or 0)
+                                total = float(p.get('total') or 0)
+                                if total > 0:
+                                    _progress_set(int(100.0 * step / total))
+                            except Exception:
+                                pass
+                        # Patch running job JSON with richer fields (best-effort)
+                        try:
+                            if RUNNING_JSON_FILE:
+                                rj = Path(RUNNING_JSON_FILE)
+                                j = json.loads(rj.read_text(encoding='utf-8')) if rj.exists() else {}
+                                changed = False
+                                for k in ('step','total','status','stage'):
+                                    if k in p and j.get(k) != p.get(k):
+                                        j[k] = p.get(k)
+                                        changed = True
+                                if changed:
+                                    j['status_at'] = time.strftime('%Y-%m-%d %H:%M:%S')
+                                    rj.write_text(json.dumps(j, indent=2), encoding='utf-8')
+                        except Exception:
+                            pass
+                    except Exception:
+                        return
+                res = _txt2img.generate_qwen_images(helper_job, progress_cb=_zprog, cancel_event=None)
         except Exception as e:
             try:
                 _mark_error(job, f"txt2img helper failed: {e}")
@@ -2506,6 +3441,339 @@ def wan22_generate(job, cfg, mani):
     return code
 
 
+
+def qwen2511_image_edit(job, cfg, mani):
+    """Run a Qwen2511 (stable-diffusion.cpp sd-cli) image edit job via the queue.
+
+    This builds an sd-cli command using helpers.qwen2511.build_sdcli_cmd and executes it
+    through tools_ffmpeg so we reuse streaming + cancel + progress handling.
+    """
+    import os
+    import time as _time
+    from pathlib import Path as _P
+
+    args = job.get("args", {}) or {}
+
+    # Resolve output dir
+    try:
+        out_dir = job.get("out_dir") or str((ROOT / "output" / "qwen2511"))
+    except Exception:
+        out_dir = str(_P(".").resolve() / "output" / "qwen2511")
+    try:
+        _P(out_dir).mkdir(parents=True, exist_ok=True)
+    except Exception:
+        pass
+
+    # Input image
+    init_img = args.get("init_img") or job.get("input") or ""
+    init_img = str(init_img).strip()
+    if not init_img or not _P(init_img).is_file():
+        _mark_error(job, "Qwen2511: input image missing or not found.")
+        return 2
+
+    # Mask
+    mask_img = str(args.get("mask_img") or args.get("mask") or "").strip()
+    invert_mask = bool(args.get("invert_mask") or False)
+
+    # Invert mask in the worker (no Qt dependency)
+    if mask_img and invert_mask and _P(mask_img).is_file():
+        try:
+            from PIL import Image, ImageOps
+            im = Image.open(mask_img)
+            # force grayscale
+            im = im.convert("L")
+            im = ImageOps.invert(im)
+            tmp = _P(out_dir) / f"_mask_inverted_{job.get('id','job')}_{int(_time.time())}.png"
+            im.save(tmp)
+            mask_img = str(tmp)
+            try:
+                args["mask_img_inverted"] = mask_img
+            except Exception:
+                pass
+        except Exception:
+            # If inversion fails, continue with original mask
+            pass
+
+    # Reference images
+    ref_images = []
+    try:
+        ref_images = args.get("ref_images") or []
+        if isinstance(ref_images, str):
+            ref_images = [ref_images]
+        ref_images = [str(x).strip() for x in ref_images if str(x).strip()]
+    except Exception:
+        ref_images = []
+    # allow legacy keys
+    for k in ("ref_img_2", "ref_img_3", "ref_img_4"):
+        try:
+            p = str(args.get(k) or "").strip()
+        except Exception:
+            p = ""
+        if p:
+            ref_images.append(p)
+
+    # sd-cli path
+    sdcli_path = str(args.get("sdcli_path") or args.get("sdcli") or "").strip()
+    if not sdcli_path:
+        try:
+            sdcli_path = str((ROOT / ".qwen2512" / "bin" / "sd-cli.exe"))
+        except Exception:
+            sdcli_path = "sd-cli.exe"
+
+    # Output file
+    out_file = str(args.get("out_file") or args.get("outfile") or "").strip()
+    if not out_file:
+        out_file = str(_P(out_dir) / f"qwen_image_edit_2511_{int(_time.time())}.png")
+
+    # Models
+    unet_path = str(args.get("unet_path") or "").strip()
+    llm_path = str(args.get("llm_path") or "").strip()
+    mmproj_path = str(args.get("mmproj_path") or "").strip()
+    vae_path = str(args.get("vae_path") or "").strip()
+
+    # Prompts / settings
+    prompt = str(args.get("prompt") or "").strip()
+    negative = str(args.get("negative") or "").strip()
+    steps = int(args.get("steps") or 28)
+    cfg_scale = float(args.get("cfg") or 4.5)
+    seed = int(args.get("seed") if args.get("seed") is not None else -1)
+    width = int(args.get("width") or 1024)
+    height = int(args.get("height") or 576)
+    strength = float(args.get("strength") or 1.0)
+    sampling_method = str(args.get("sampling_method") or "euler_a")
+    shift = float(args.get("shift") or 12.5)
+
+    # Options
+    use_increase_ref_index = bool(args.get("use_increase_ref_index") or False)
+    disable_auto_resize_ref_images = bool(args.get("disable_auto_resize_ref_images") or False)
+
+    use_vae_tiling = bool(args.get("use_vae_tiling") or False)
+    vae_tile_size = str(args.get("vae_tile_size") or "256x256").strip()
+    vae_tile_overlap = float(args.get("vae_tile_overlap") or 0.50)
+    use_offload = bool(args.get("use_offload") or False)
+    use_mmap = bool(args.get("use_mmap") or False)
+    use_vae_on_cpu = bool(args.get("use_vae_on_cpu") or False)
+    use_clip_on_cpu = bool(args.get("use_clip_on_cpu") or False)
+    use_diffusion_fa = bool(args.get("use_diffusion_fa") or False)
+
+    # LoRA
+    lora_dir = str(args.get("lora_dir") or "").strip()
+    if not lora_dir:
+        try:
+            lora_dir = str((ROOT / "models" / "lora" / "qwen2511"))
+        except Exception:
+            lora_dir = ""
+    lora_name = str(args.get("lora_name") or "").strip()
+    try:
+        lora_strength = float(args.get("lora_strength") if args.get("lora_strength") is not None else 1.0)
+    except Exception:
+        lora_strength = 1.0
+
+    # Build command
+    try:
+        try:
+            from helpers.qwen2511 import detect_sdcli_caps, build_sdcli_cmd
+        except Exception:
+            from qwen2511 import detect_sdcli_caps, build_sdcli_cmd
+        caps = detect_sdcli_caps(sdcli_path)
+        cmd = build_sdcli_cmd(
+            sdcli_path=sdcli_path,
+            caps=caps,
+            init_img=init_img,
+            mask_path=mask_img,
+            ref_images=ref_images,
+            use_increase_ref_index=use_increase_ref_index,
+            disable_auto_resize_ref_images=disable_auto_resize_ref_images,
+            prompt=prompt,
+            negative=negative,
+            unet_path=unet_path,
+            llm_path=llm_path,
+            mmproj_path=mmproj_path,
+            vae_path=vae_path,
+            steps=steps,
+            cfg=cfg_scale,
+            seed=seed,
+            width=width,
+            height=height,
+            strength=strength,
+            sampling_method=sampling_method,
+            shift=shift,
+            out_file=out_file,
+            lora_model_dir=lora_dir,
+            lora_name=lora_name,
+            lora_strength=lora_strength,
+            use_vae_tiling=use_vae_tiling,
+            vae_tile_size=vae_tile_size,
+            vae_tile_overlap=vae_tile_overlap,
+            use_offload=use_offload,
+            use_mmap=use_mmap,
+            use_vae_on_cpu=use_vae_on_cpu,
+            use_clip_on_cpu=use_clip_on_cpu,
+            use_diffusion_fa=use_diffusion_fa,
+        )
+    except Exception as e:
+        _mark_error(job, "Qwen2511: failed to build sd-cli command: " + str(e))
+        return 2
+
+    # Populate args for tools_ffmpeg executor
+    try:
+        label = args.get("label") or ("Qwen2511: " + (prompt.replace("\n", " ").strip()[:80] if prompt else "image edit"))
+        args["label"] = label
+        args["cmd"] = cmd
+        args["cwd"] = str(ROOT)
+        args["outfile"] = out_file
+        args["out_file"] = out_file
+        job["args"] = args
+    except Exception:
+        pass
+
+    # Metadata for UI
+    try:
+        job["backend"] = "qwen2511"
+    except Exception:
+        pass
+    try:
+        if unet_path:
+            job["model"] = os.path.basename(unet_path)
+    except Exception:
+        pass
+
+    return tools_ffmpeg(job, cfg, mani)
+
+
+
+def heartmula_generate(job, cfg, mani):
+    """Run a HeartMuLa music generation job via the queue.
+
+    The UI enqueues this as type=heartmula_generate with args.cmd built
+    to call the upstream heartlib example script. We execute through
+    tools_ffmpeg so we reuse streaming logs + cancel support.
+    """
+    try:
+        from pathlib import Path as _P
+        import time as _time
+        import os as _os
+    except Exception:
+        return 1
+
+    args = job.get("args", {}) or {}
+
+    # Output folder fallback
+    try:
+        out_dir = job.get("out_dir") or str((_P(".").resolve() / "output" / "music" / "heartmula"))
+    except Exception:
+        out_dir = str(_P("output") / "music" / "heartmula")
+    try:
+        _P(out_dir).mkdir(parents=True, exist_ok=True)
+    except Exception:
+        pass
+
+    # Label + metadata
+    try:
+        tags = str(args.get("tags") or "").strip()
+    except Exception:
+        tags = ""
+    label = args.get("label") or ("HeartMuLa: " + (tags[:60] if tags else "music"))
+    args["label"] = label
+    job["title"] = label
+    try:
+        job["backend"] = "heartmula"
+    except Exception:
+        pass
+    try:
+        job["model"] = str(args.get("version") or "3B")
+    except Exception:
+        pass
+
+    # Ensure cmd exists
+    cmd = args.get("cmd") or args.get("ffmpeg_cmd") or job.get("cmd")
+    if not cmd:
+        _mark_error(job, "HeartMuLa job missing args.cmd")
+        return 2
+
+    # Expected outfile
+    outfile = args.get("outfile") or args.get("save_path") or None
+    if not outfile:
+        stamp = _time.strftime("%Y%m%d_%H%M%S")
+        outfile = str(_P(out_dir) / f"heartmula_{stamp}.mp3")
+    args["outfile"] = str(outfile)
+    args["cwd"] = args.get("cwd") or str(_P(".").resolve())
+    # Make bundled binaries discoverable
+    if not args.get("prepend_path"):
+        try:
+            args["prepend_path"] = str((_P(args["cwd"]) / "presets" / "bin").resolve())
+        except Exception:
+            pass
+    args["cmd"] = cmd
+    job["args"] = args
+
+    return tools_ffmpeg(job, cfg, mani)
+
+def planner_lock(job: dict, cfg: dict, mani: dict):
+    """
+    Queue lock job used by Planner to reserve the worker while the Planner runs locally in the app.
+    The Planner enqueues this job, then runs its pipeline locally, and finally writes args.done_flag.
+
+    args:
+      done_flag: path to a flag file that will be created by the Planner when finished
+      scan_dir: directory to scan for newest .mp4 output (optional)
+      scan_ext: extension to scan (default .mp4)
+    """
+    args = job.get("args") or {}
+    done_flag = str(args.get("done_flag") or "").strip()
+    if not done_flag:
+        _mark_error(job, "planner_lock missing args.done_flag")
+        return 2
+    scan_dir = str(args.get("scan_dir") or job.get("out_dir") or "").strip()
+    scan_ext = str(args.get("scan_ext") or ".mp4").strip().lower()
+    tail_lines = int(args.get("log_tail_lines") or 120)
+
+    # Wait loop
+    start = time.time()
+    while True:
+        # Cancel marker support
+        try:
+            mk = Path(RUNNING_JSON_FILE).with_suffix(Path(RUNNING_JSON_FILE).suffix + ".cancel")
+            if mk.exists():
+                _mark_error(job, "Cancelled")
+                return 130
+        except Exception:
+            pass
+        if Path(done_flag).exists():
+            break
+        # update a tiny heartbeat/log tail
+        try:
+            job["waiting_for"] = done_flag
+            job["elapsed_sec"] = int(time.time() - start)
+            Path(RUNNING_JSON_FILE).write_text(json.dumps(job, indent=2), encoding="utf-8")
+        except Exception:
+            pass
+        time.sleep(0.5)
+
+    # Planner finished; try to locate final video
+    final_video = ""
+    newest = None
+    newest_mtime = -1.0
+    try:
+        if scan_dir and Path(scan_dir).exists():
+            for p in Path(scan_dir).rglob(f"*{scan_ext}"):
+                try:
+                    mt = p.stat().st_mtime
+                    if mt > newest_mtime:
+                        newest_mtime = mt
+                        newest = p
+                except Exception:
+                    continue
+    except Exception:
+        newest = None
+
+    if newest and newest.exists():
+        final_video = str(newest)
+        job["produced"] = final_video
+        job["files"] = [final_video]
+    return 0
+
+
 def handle_job(jpath: Path):
     job = json.loads(jpath.read_text(encoding="utf-8"))
     cfg = load_config(); mani = manifest()
@@ -2552,14 +3820,25 @@ def handle_job(jpath: Path):
         if t=="upscale_video": code = upscale_video(job, cfg, mani)
         elif t=="upscale_photo": code = upscale_photo(job, cfg, mani)
         elif t=='tools_ffmpeg': code = tools_ffmpeg(job, cfg, mani)
+        # SeedVR2: external CLI runner (python inference_cli.py ...)
+        # Queue writes type="seedvr2" with args.cmd + args.outfile.
+        # Reuse the robust external runner (progress parsing + log capture).
+        elif t in ('seedvr2','seedvr2_upscale','seedvr2_video'):
+            code = tools_ffmpeg(job, cfg, mani)
         elif t=='rife_interpolate':
             code = rife_interpolate(job, cfg, mani)
         elif t in ('txt2img','txt2img_qwen'):
             code = txt2img_generate(job, cfg, mani)
+        elif t in ("qwen2511_image_edit","qwen2511_edit","qwen2511"):
+            code = qwen2511_image_edit(job, cfg, mani)
         elif t in ("wan22_text2video","wan22_image2video","wan22_ti2v","wan22"):
             code = wan22_generate(job, cfg, mani)
         elif t in ("ace_text2music","ace_audio2audio","ace","ace_step","ace_music"):
             code = ace_generate(job, cfg, mani)
+        elif t in ("heartmula_generate","heartmula","heartmula_music"):
+            code = heartmula_generate(job, cfg, mani)
+        elif t in ('planner_lock',):
+            code = planner_lock(job, cfg, mani)
         else:
             _mark_error(job, f"Unknown job type: {t}")
             code = 2
@@ -2670,13 +3949,24 @@ def handle_job(jpath: Path):
         return 1
 
 def main():
-    print("FrameVision Worker V2.1 Waiting for jobs in", JOBS["pending"])
+    print("FrameVision Worker V2.3 Waiting for jobs in", JOBS["pending"])
     while True:
         try:
             HEARTBEAT.write_text(time.strftime("%Y-%m-%d %H:%M:%S"), encoding="utf-8")
         except Exception:
             pass
-        items = sorted(JOBS["pending"].glob("*.json"))
+        items = []
+        try:
+            cand = [p for p in JOBS["pending"].glob("*.json") if p.is_file()]
+            for p in cand:
+                n = p.name
+                if (n.endswith(".progress.json") or n.endswith(".json.progress") or n.endswith(".meta.json") or n.startswith("_")):
+                    continue
+                items.append(p)
+            # Oldest first = FIFO (matches UI + supports reordering via file mtime)
+            items.sort(key=lambda p: (p.stat().st_mtime if p.exists() else 0.0, p.name))
+        except Exception:
+            items = []
         if not items:
             time.sleep(1.0)
             continue

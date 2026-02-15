@@ -1,10 +1,10 @@
 @echo off
 setlocal EnableExtensions EnableDelayedExpansion
 
-rem ============================================================
+rem =============================================================
 rem FrameVision Updater - "Framevision_update.bat"
 rem Repo: https://github.com/Koongrizzly/FrameVision (branch: main)
-rem ============================================================
+rem =============================================================
 
 rem --- ensure we run from the script's own folder ---
 pushd "%~dp0"

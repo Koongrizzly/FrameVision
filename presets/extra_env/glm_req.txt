@@ -1,0 +1,21 @@
+# FrameVision optional env: GLM-Image (SDNQ 4bit quantized)
+# This matches the original one-click bundle dependencies.
+
+typing-extensions
+
+# CUDA 12.6 torch build (matches original installer)
+torch --index-url https://download.pytorch.org/whl/cu126
+
+# Use latest diffusers/transformers from source like the original
+git+https://github.com/huggingface/diffusers.git
+git+https://github.com/huggingface/transformers.git
+
+# SDNQ pipeline + accel
+sdnq
+accelerate
+
+# Optional UI deps (not required for FrameVision worker, but harmless)
+gradio
+
+# Optional speed-up (safe to fail on some systems)
+triton-windows

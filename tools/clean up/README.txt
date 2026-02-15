@@ -1,5 +1,8 @@
-Repo Sanity Kit (fixed)
------------------------
+Don't use this !
+for debugginbg only
+
+Repo Sanity Kit
+---------------
 If you have a venv at .\.venv it will use it. Otherwise it will try your system Python.
 Run:
   tools\diagnostics\run_repo_sanity.bat

@@ -1,4 +1,5 @@
 import os
+import re
 from pathlib import Path
 def default_outdir(is_video: bool=False, purpose: str='upscale') -> str:
     base = _base_root()
@@ -60,18 +61,114 @@ def _read_field(w, names, getter='text'):
         except Exception: pass
     return ''
 def infer_upscale_args(inner):
+    # Input / output
     inp = _read_field(inner, ['edit_input','edit_input_path','line_input','input_path','edit_source'])
     outdir = _read_field(inner, ['edit_outdir','edit_output','line_output','output_dir'])
+
+    # Scale
     scale = _read_field(inner, ['spin_scale','spin_factor'], getter='value')
-    if not scale: scale = _safe_int(_read_field(inner, ['edit_scale','line_scale'], getter='text'), 4)
-    model = _read_field(inner, ['edit_model','line_model'], getter='text') or _read_field(inner, ['combo_model'], getter='currentText') or 'RealESRGAN-general-x4v3'
-    inp = os.path.abspath(inp) if inp else ''; outdir = os.path.abspath(outdir) if outdir else ''
+    if not scale:
+        scale = _safe_int(_read_field(inner, ['edit_scale','line_scale'], getter='text'), 4)
+
+    # Model: pick the *active* model dropdown based on the selected engine.
+    # (Many UIs keep other model combos instantiated; reading the wrong one yields "first item always".)
+    engine = _read_field(inner, ['combo_engine','engine_combo','combo_upscale_engine'], getter='currentText').lower()
+
+    model = ""
+    # Best-case: Upscaler pane exposes a helper that returns the currently selected model text.
+    try:
+        fn = getattr(inner, "_fv_current_model_text", None)
+        if callable(fn):
+            model = str(fn() or "").strip()
+    except Exception:
+        model = ""
+
+    # Engine-specific combo boxes (FrameVision Upscaler)
+    if not model:
+        if "waifu" in engine or "w2x" in engine:
+            model = _read_field(inner, ['combo_model_w2x','combo_model_waifu','combo_model_waifu2x'], getter='currentText')
+        elif "ultrasharp" in engine:
+            model = _read_field(inner, ['combo_model_ultrasharp'], getter='currentText')
+        elif "srmd" in engine:
+            # Some builds use SRMD models via Real-ESRGAN naming; prefer that combo if present.
+            model = _read_field(inner, ['combo_model_srmd_realsr','combo_model_srmd_realesr','combo_model_srmd_realesrgan'], getter='currentText')
+            if not model:
+                model = _read_field(inner, ['combo_model_srmd'], getter='currentText')
+        elif "ncnn" in engine and "realsr" in engine:
+            model = _read_field(inner, ['combo_model_realsr_ncnn','combo_model_realsrgan_ncnn'], getter='currentText')
+        elif "realsr" in engine or "realesrgan" in engine or "real-esrgan" in engine or "esrgan" in engine:
+            model = _read_field(inner, ['combo_model_realsr','combo_model_realesrgan','combo_model_esrgan'], getter='currentText')
+
+    # Fallback: try any known model combo
+    if not model:
+        model = _read_field(inner, [
+            'combo_model_realsr',
+            'combo_model_realsr_ncnn',
+            'combo_model_ultrasharp',
+            'combo_model_srmd_realsr',
+            'combo_model_srmd',
+            'combo_model_w2x',
+            'combo_model',
+        ], getter='currentText')
+
+    # Last resort: free-text fields
+    if not model:
+        model = _read_field(inner, ['edit_model','line_model'], getter='text')
+
+    if not model:
+        model = 'RealESRGAN-general-x4v3'
+
+    inp = os.path.abspath(inp) if inp else ''
+    outdir = os.path.abspath(outdir) if outdir else ''
     return inp, outdir, _safe_int(scale, 4), model
-def enqueue(job_type, input_path, out_dir, factor, model, fmt='png'):
+
+def enqueue(job_type, input_path=None, out_dir=None, factor=None, model=None, fmt='png'):
+    """Create a queue job JSON.
+
+    Backward-compatible:
+      - enqueue(job_type, input_path, out_dir, factor, model, fmt='png')
+      - enqueue(job_dict)  (external/seedvr2 jobs)
+    """
+    # Allow callers to pass a full job dict (e.g. SeedVR2 integration from upsc.py).
+    if isinstance(job_type, dict) and input_path is None:
+        job = job_type
+        try:
+            # Detect SeedVR2 jobs (prefer explicit engine)
+            eng = str(job.get('engine') or '').lower().strip()
+            cmd = job.get('cmd') or job.get('command') or job.get('ffmpeg_cmd')
+            cmd_txt = ''
+            try:
+                if isinstance(cmd, (list, tuple)):
+                    cmd_txt = ' '.join(map(str, cmd)).lower()
+                elif isinstance(cmd, str):
+                    cmd_txt = cmd.lower()
+            except Exception:
+                cmd_txt = ''
+            if eng == 'seedvr2' or ('seedvr2' in cmd_txt) or ('inference_cli.py' in cmd_txt and 'seedvr2' in cmd_txt):
+                return enqueue_seedvr2(job)
+        except Exception:
+            pass
+        # Default: treat as external command job
+        return enqueue_external(job)
+
     from helpers.job_helper import make_job_json
     d = jobs_dirs()
+    # Keep factor consistent with model suffix when using fixed-scale Real-ESRGAN style models.
+    try:
+        _ms = re.search(r"(?i)-x(\d+)\s*$", str(model or ""))
+        if _ms:
+            factor = int(_ms.group(1))
+    except Exception:
+        pass
     args = {'factor': int(factor), 'model': model}
-    if job_type == 'upscale_photo': args['format'] = fmt
+    try:
+        _ms = re.search(r"(?i)-x(\d+)\s*$", str(model or ""))
+        if _ms:
+            args['model_scale'] = int(_ms.group(1))
+    except Exception:
+        pass
+    if job_type == 'upscale_photo':
+        args['format'] = fmt
     return make_job_json(job_type, input_path, out_dir, args, str(d['pending']), priority=500)
 def enqueue_from_widget(inner, is_video: bool):
     inp, outdir, scale, model = infer_upscale_args(inner)
@@ -148,6 +245,186 @@ def enqueue_txt2img_qwen(job_args: dict):
         return False
 
 
+
+def default_qwen2511_outdir():
+    from pathlib import Path
+    base = Path('.').resolve()
+    d = base/'output'/'qwen2511'
+    d.mkdir(parents=True, exist_ok=True)
+    return str(d)
+
+
+def enqueue_qwen2511_from_widget(inner):
+    """Enqueue a Qwen2511 (image edit) job from the Qwen2511Pane UI.
+
+    Uses output/qwen2511 to match the pane's 'View results' / 'Play last result'.
+    """
+    import time as _time
+    from pathlib import Path as _P
+    try:
+        from helpers.job_helper import make_job_json
+        from helpers.queue_adapter import jobs_dirs
+    except Exception:
+        from job_helper import make_job_json
+        from queue_adapter import jobs_dirs
+
+    d = jobs_dirs()
+    out_dir = default_qwen2511_outdir()
+
+    # Required: input image
+    init_img = str(getattr(getattr(inner, 'ed_initimg', None), 'text', lambda: '')()).strip()
+    if not init_img:
+        raise RuntimeError("Input image missing.")
+    if not _P(init_img).is_file():
+        raise RuntimeError("Input image not found: " + init_img)
+
+    # Optional mask and refs
+    mask_img = str(getattr(getattr(inner, 'ed_mask', None), 'text', lambda: '')()).strip()
+    invert_mask = bool(getattr(getattr(inner, 'chk_invert_mask', None), 'isChecked', lambda: False)())
+    ref_imgs = []
+    for attr in ('ed_ref1', 'ed_ref2', 'ed_ref3'):
+        try:
+            p = str(getattr(getattr(inner, attr, None), 'text', lambda: '')()).strip()
+        except Exception:
+            p = ''
+        if p:
+            if not _P(p).is_file():
+                raise RuntimeError("Reference image not found: " + p)
+            ref_imgs.append(p)
+
+    use_increase_ref_index = bool(getattr(getattr(inner, 'chk_ref_increase_index', None), 'isChecked', lambda: True)())
+    disable_auto_resize_ref_images = bool(getattr(getattr(inner, 'chk_disable_ref_resize', None), 'isChecked', lambda: False)())
+
+    # Models / paths
+    sdcli_path = str(getattr(getattr(inner, 'ed_sdcli', None), 'text', lambda: '')()).strip()
+    try:
+        unet_path = getattr(getattr(inner, 'cb_unet', None), 'currentData', lambda: '')()
+        llm_path = getattr(getattr(inner, 'cb_llm', None), 'currentData', lambda: '')()
+        mmproj_path = getattr(getattr(inner, 'cb_mmproj', None), 'currentData', lambda: '')()
+        vae_path = getattr(getattr(inner, 'cb_vae', None), 'currentData', lambda: '')()
+    except Exception:
+        unet_path = llm_path = mmproj_path = vae_path = ''
+
+    # Prompts
+    try:
+        prompt = str(getattr(getattr(inner, 'ed_prompt', None), 'toPlainText', lambda: '')()).strip()
+    except Exception:
+        prompt = ''
+    negative = str(getattr(getattr(inner, 'ed_neg', None), 'text', lambda: '')()).strip()
+
+    # LoRA
+    try:
+        lora_dir = str(getattr(getattr(inner, 'ed_lora_dir', None), 'text', lambda: '')()).strip()
+    except Exception:
+        lora_dir = ''
+    if not lora_dir:
+        # Reasonable default matches Qwen2511 pane default.
+        lora_dir = os.path.join(_P('.').resolve(), 'models', 'lora', 'qwen2511')
+    try:
+        lora_name = str(getattr(getattr(inner, 'cb_lora', None), 'currentText', lambda: '')()).strip()
+    except Exception:
+        lora_name = ''
+    if str(lora_name).strip().lower() in ('(none)', 'none'):
+        lora_name = ''
+    try:
+        lora_strength = float(getattr(getattr(inner, 'sp_lora_strength', None), 'value', lambda: 1.0)())
+    except Exception:
+        lora_strength = 1.0
+
+    # Settings
+    steps = int(getattr(getattr(inner, 'sp_steps', None), 'value', lambda: 28)())
+    cfg = float(getattr(getattr(inner, 'sp_cfg', None), 'value', lambda: 4.5)())
+    seed = int(getattr(getattr(inner, 'sp_seed', None), 'value', lambda: -1)())
+    width = int(getattr(getattr(inner, 'sp_w', None), 'value', lambda: 1024)())
+    height = int(getattr(getattr(inner, 'sp_h', None), 'value', lambda: 576)())
+
+    # Strength (mirror direct-run behavior: read from UI and store into the queued job)
+    strength = None
+    try:
+        strength = float(getattr(getattr(inner, 'sp_strength', None), 'value', lambda: None)())
+    except Exception:
+        strength = None
+    if strength is None:
+        try:
+            strength = float(getattr(getattr(inner, 'lbl_strength', None), 'value', lambda: None)())
+        except Exception:
+            strength = None
+    if strength is None:
+        try:
+            strength = float(getattr(getattr(inner, 'sl_strength', None), 'value', lambda: 100)()) / 100.0
+        except Exception:
+            strength = 1.0
+    try:
+        # NaN guard
+        if strength != strength:
+            strength = 1.0
+    except Exception:
+        strength = 1.0
+    try:
+        strength = max(0.0, min(1.0, float(strength)))
+    except Exception:
+        strength = 1.0
+
+    sampling_method = str(getattr(getattr(inner, 'cb_sampling', None), 'currentText', lambda: 'euler_a')())
+    shift = float(getattr(getattr(inner, 'sp_shift', None), 'value', lambda: 12.5)())
+
+    # Low VRAM / perf
+    use_vae_tiling = bool(getattr(getattr(inner, 'chk_vae_tiling', None), 'isChecked', lambda: False)())
+    vae_tile_size = str(getattr(getattr(inner, 'cb_vae_tile_size', None), 'currentText', lambda: '256x256')()).strip()
+    vae_tile_overlap = float(getattr(getattr(inner, 'sp_vae_tile_overlap', None), 'value', lambda: 0.50)())
+    use_offload = bool(getattr(getattr(inner, 'chk_offload', None), 'isChecked', lambda: False)())
+    use_mmap = bool(getattr(getattr(inner, 'chk_mmap', None), 'isChecked', lambda: False)())
+    use_vae_on_cpu = bool(getattr(getattr(inner, 'chk_vae_on_cpu', None), 'isChecked', lambda: False)())
+    use_clip_on_cpu = bool(getattr(getattr(inner, 'chk_clip_on_cpu', None), 'isChecked', lambda: False)())
+    use_diffusion_fa = bool(getattr(getattr(inner, 'chk_diffusion_fa', None), 'isChecked', lambda: False)())
+
+    # Output file (precomputed so the queue can display a deterministic target)
+    ts = int(_time.time())
+    out_file = str(_P(out_dir) / f"qwen_image_edit_2511_{ts}.png")
+    label = "Qwen2511 image edit"
+    if prompt:
+        label = "Qwen2511: " + (prompt.replace("\n", " ").strip()[:80])
+
+    args = {
+        "label": label,
+        "sdcli_path": sdcli_path,
+        "init_img": init_img,
+        "mask_img": mask_img,
+        "invert_mask": invert_mask,
+        "ref_images": ref_imgs,
+        "use_increase_ref_index": use_increase_ref_index,
+        "disable_auto_resize_ref_images": disable_auto_resize_ref_images,
+        "prompt": prompt,
+        "negative": negative,
+        "lora_dir": lora_dir,
+        "lora_name": lora_name,
+        "lora_strength": lora_strength,
+        "unet_path": unet_path,
+        "llm_path": llm_path,
+        "mmproj_path": mmproj_path,
+        "vae_path": vae_path,
+        "steps": steps,
+        "cfg": cfg,
+        "seed": seed,
+        "width": width,
+        "height": height,
+        "strength": strength,
+        "sampling_method": sampling_method,
+        "shift": shift,
+        "use_vae_tiling": use_vae_tiling,
+        "vae_tile_size": vae_tile_size,
+        "vae_tile_overlap": vae_tile_overlap,
+        "use_offload": use_offload,
+        "use_mmap": use_mmap,
+        "use_vae_on_cpu": use_vae_on_cpu,
+        "use_clip_on_cpu": use_clip_on_cpu,
+        "use_diffusion_fa": use_diffusion_fa,
+        "out_file": out_file,
+        "outfile": out_file,
+    }
+
+    return make_job_json("qwen2511_image_edit", init_img, out_dir, args, str(d["pending"]), priority=500)
+
 # --- FrameVision: queue helpers for Upsc & external commands ---
 
 def _is_video_path(p: str) -> bool:
@@ -169,6 +446,71 @@ def enqueue_job(input_path: str, out_dir: str, factor: int, model: str):
 def add_job(input_path: str, out_dir: str, factor: int, model: str):
     return enqueue_job(input_path, out_dir, factor, model)
 
+
+def _infer_seedvr2_input_from_cmd(cmd):
+    try:
+        if isinstance(cmd, (list, tuple)):
+            parts=list(cmd)
+        elif isinstance(cmd, str):
+            import shlex
+            parts=shlex.split(cmd)
+        else:
+            return ''
+        # heuristic: input is first argument after inference_cli.py
+        for i, part in enumerate(parts):
+            if isinstance(part, str) and part.lower().endswith('inference_cli.py'):
+                if i+1 < len(parts):
+                    return str(parts[i+1])
+        # fallback: first existing file path in args
+        import os
+        for part in parts:
+            if isinstance(part, str) and os.path.exists(part):
+                return part
+    except Exception:
+        pass
+    return ''
+
+
+def enqueue_seedvr2(job: dict):
+    """Enqueue a SeedVR2 job as a first-class queue entry (type='seedvr2').
+
+    Accepts a dict with keys like: cmd, cwd, env, output/outfile, input, out_dir, engine.
+    """
+    from helpers.job_helper import make_job_json
+    d = jobs_dirs()
+
+    args = dict(job) if isinstance(job, dict) else {'job': job}
+    cmd = args.get('cmd') or args.get('command')
+    if not cmd:
+        raise RuntimeError('enqueue_seedvr2: missing job["cmd"]')
+
+    inp = str(job.get('input') or '').strip()
+    if not inp:
+        inp = _infer_seedvr2_input_from_cmd(cmd)
+
+    out_file = str(job.get('output') or job.get('outfile') or job.get('out_file') or '').strip()
+    out_dir = str(job.get('out_dir') or '').strip()
+    if not out_dir:
+        try:
+            import os
+            if out_file:
+                out_dir = os.path.dirname(out_file)
+        except Exception:
+            out_dir = ''
+    if not out_dir:
+        # SeedVR2 is mostly video; default to video upscale folder
+        out_dir = default_outdir(True, 'upscale')
+
+    # Ensure UI and worker have the fields they expect
+    args.setdefault('engine', 'seedvr2')
+    args.setdefault('outfile', out_file)
+    args.setdefault('output', out_file)
+    args.setdefault('cwd', job.get('cwd'))
+    if job.get('env') is not None:
+        args['env'] = job.get('env')
+
+    return make_job_json('seedvr2', inp, out_dir, args, str(d['pending']), priority=500)
+
 def enqueue_external(job: dict):
     """Enqueue a single external command job via tools_ffmpeg.
 
@@ -186,10 +528,55 @@ def enqueue_external(job: dict):
     cmd = args.get('cmd') or args.get('ffmpeg_cmd')
     if not cmd:
         raise RuntimeError('enqueue_external: missing job["cmd"]')
+
+    # --- Fix common Python -c one-liner issue (while after ';') ---
+    # Some planner lock jobs pass python code like: "...;while cond: ..." which
+    # is invalid syntax. Python requires 'while' to start a new statement.
+    try:
+        if isinstance(cmd, (list, tuple)):
+            cmd = list(cmd)
+            if '-c' in cmd:
+                i = cmd.index('-c')
+                if i + 1 < len(cmd) and isinstance(cmd[i + 1], str):
+                    code = cmd[i + 1]
+                    if ';while' in code:
+                        code = code.replace(';while ', '\nwhile ').replace(';while\n', '\nwhile\n')
+                        code = code.replace(';while not', '\nwhile not')
+                        cmd[i + 1] = code
+                        args['cmd'] = cmd
+        elif isinstance(cmd, str):
+            # nothing to do (string cmds are opaque)
+            pass
+    except Exception:
+        pass
+
+    # --- Make tools jobs visible in the Queue UI ---
+    # Many queue UIs assume job['input'] points to an existing file (for
+    # thumbnails / labels). tools_ffmpeg jobs often have empty input.
+    # Create a tiny marker file in out_dir and use it as input.
+    input_path = ''
+    try:
+        from pathlib import Path as _P
+        od = _P(out_dir)
+        od.mkdir(parents=True, exist_ok=True)
+        marker = od / '_tools_job.txt'
+        if not marker.exists():
+            label = ''
+            try:
+                label = str(args.get('label') or args.get('title') or 'Tools job')
+            except Exception:
+                label = 'Tools job'
+            try:
+                marker.write_text(label[:200], encoding='utf-8')
+            except Exception:
+                # best-effort only
+                pass
+        input_path = str(marker)
+    except Exception:
+        input_path = ''
     # out_dir is carried separately in the job JSON; don't duplicate it in args
     args.pop('out_dir', None)
-    # input_path not required for tools job
-    return enqueue_tool_job('tools_ffmpeg', '', out_dir, args, priority=550)
+    return enqueue_tool_job('tools_ffmpeg', input_path, out_dir, args, priority=550)
 # <<< FRAMEVISION_QWEN_END
 
 
@@ -215,7 +602,7 @@ def enqueue_txt2img(job: dict) -> bool:
         # Keys to pass to worker
         keys = [
             "prompt","negative","seed","seed_policy","batch","cfg_scale",
-            "width","height","steps","sampler","model_path",
+            "width","height","steps","sampler","flow_shift","offload_cpu","model_path",
             "lora_path","lora_scale","lora2_path","lora2_scale",
             "attn_slicing","vae_device","gpu_index","threads",
             "format","filename_template","hires_helper","fit_check",

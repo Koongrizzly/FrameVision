@@ -1,8 +1,8 @@
 
 import sys
+import os
 import subprocess
 from pathlib import Path
-import zipfile
 from datetime import datetime
 
 from PySide6.QtCore import Qt, QThread, Signal
@@ -149,6 +149,48 @@ class SpliglueVideoTool(QWidget):
 
     # --------------------------- UI SETUP ---------------------------
 
+    def _open_results_folder(self, folder: Path):
+        """Open a folder in Media Explorer if available, else OS file manager."""
+        try:
+            folder.mkdir(parents=True, exist_ok=True)
+        except Exception:
+            pass
+
+        main = None
+        try:
+            main = getattr(self, "main", None)
+        except Exception:
+            main = None
+        if main is None:
+            try:
+                main = self.window() if hasattr(self, "window") else None
+            except Exception:
+                main = None
+
+        if main is not None and hasattr(main, "open_media_explorer_folder"):
+            try:
+                main.open_media_explorer_folder(str(folder), preset="videos", include_subfolders=False)
+                return
+            except TypeError:
+                try:
+                    main.open_media_explorer_folder(str(folder))
+                    return
+                except Exception:
+                    pass
+            except Exception:
+                pass
+
+        # Fallback: OS open
+        try:
+            if sys.platform.startswith("win"):
+                os.startfile(str(folder))  # type: ignore[attr-defined]
+            elif sys.platform == "darwin":
+                subprocess.Popen(["open", str(folder)])
+            else:
+                subprocess.Popen(["xdg-open", str(folder)])
+        except Exception:
+            pass
+
     def _build_ui(self):
         layout = QVBoxLayout(self)
         self.tabs = QTabWidget(self)
@@ -197,11 +239,16 @@ class SpliglueVideoTool(QWidget):
         browse_out.clicked.connect(self._browse_split_output)
         use_default = QPushButton("Use default", tab)
         use_default.clicked.connect(self._use_default_split_output)
+        view_results = QPushButton("View results", tab)
+        view_results.setToolTip("Open these results in Media Explorer.")
+        view_results.clicked.connect(lambda: self._open_results_folder(Path(self.split_output_edit.text().strip() or str(DEFAULT_OUTPUT_DIR))))
 
         row2.addWidget(QLabel("Output folder:", tab))
         row2.addWidget(self.split_output_edit)
         row2.addWidget(browse_out)
         row2.addWidget(use_default)
+        row2.addWidget(view_results)
+        row2.addWidget(view_results)
         v.addLayout(row2)
 
         # Auto-generate equal segments
@@ -286,11 +333,15 @@ class SpliglueVideoTool(QWidget):
         browse_out.clicked.connect(self._browse_glue_output)
         use_default = QPushButton("Use default", tab)
         use_default.clicked.connect(self._use_default_glue_output)
+        view_results = QPushButton("View results", tab)
+        view_results.setToolTip("Open these results in Media Explorer.")
+        view_results.clicked.connect(lambda: self._open_results_folder(Path(self.glue_output_edit.text().strip() or str(DEFAULT_OUTPUT_DIR))))
 
         row2.addWidget(QLabel("Output folder:", tab))
         row2.addWidget(self.glue_output_edit)
         row2.addWidget(browse_out)
         row2.addWidget(use_default)
+        row2.addWidget(view_results)
         v.addLayout(row2)
 
         # Output file name
@@ -699,38 +750,29 @@ class SpliglueVideoTool(QWidget):
             QMessageBox.information(self, "Done", "No output files were created.")
             return
 
-        # Create a zip with the new files
+        # Report results (no zip creation)
         out_dir = Path(output_files[0]).parent
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        if operation == "split":
-            base = Path(output_files[0]).stem
-            zip_name = out_dir / f"{base}_splits_{timestamp}.zip"
-        elif operation == "glue":
-            base = Path(output_files[0]).stem
-            zip_name = out_dir / f"{base}_glued_{timestamp}.zip"
-        else:
-            zip_name = out_dir / f"splitglue_{timestamp}.zip"
-
         try:
-            with zipfile.ZipFile(zip_name, "w", zipfile.ZIP_DEFLATED) as zf:
-                for f in output_files:
-                    fpath = Path(f)
-                    if fpath.exists():
-                        zf.write(fpath, arcname=fpath.name)
-        except Exception as e:
-            QMessageBox.warning(
-                self,
-                "Zip error",
-                f"Outputs created, but failed to create zip: {e}",
-            )
-            return
+            out_dir.mkdir(parents=True, exist_ok=True)
+        except Exception:
+            pass
 
-        self._log(f"Created zip: {zip_name}")
+        names = [Path(p).name for p in output_files]
+        max_show = 10
+        shown = names[:max_show]
+        extra = len(names) - len(shown)
+
+        lines = "\n".join(f"- {n}" for n in shown)
+        if extra > 0:
+            lines += f"\n... (+{extra} more)"
+
+        self._log(f"Created {len(names)} file(s) in: {out_dir}")
         QMessageBox.information(
             self,
             "Done",
-            f"Job finished successfully.\nCreated zip:\n{zip_name}",
+            f"Job finished successfully.\nCreated {len(names)} file(s) in:\n{out_dir}\n\n{lines}",
         )
+
 
     def _log(self, text: str):
         self.log.append(text)

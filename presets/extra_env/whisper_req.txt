@@ -1,0 +1,4 @@
+# FrameVision Optional Install: Whisper (Faster-Whisper)
+# Minimal requirements for offline speech-to-text + local model downloads.
+faster-whisper
+huggingface_hub

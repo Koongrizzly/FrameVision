@@ -1,14 +1,215 @@
-### 🌟 FrameVision 2.1 
-**All-in-one sound/mage/Video Tool**  
-✨ *Create, Upscale, edit, describe, play — in one streamlined app.*
+### ✨ FrameVision 2.3 ✨
+**All-in-one Sound/Image/Video Tool**  
+*Create, Upscale, edit, describe, play — in one streamlined app.*
 ---
-**December 24 2025 V2.1**
+Video Walktrough (most is speedup x2 to show much in less time)
+
+[![Watch the video](https://img.youtube.com/vi/QLIaL4uAFlE/hqdefault.jpg)](https://www.youtube.com/watch?v=_0j3CiXFheQ)
+
+---
+
+<details>
+<summary>February 15, 2026. V2.3 new Planner : Go from prompt to finished video with narration and/or music (with Ace Step 1.5!) in a couple of clicks</summary>
+  
+🧠 The Planner (Idea → Finished Video)
+
+End-to-end creation (idea → finished video)
+
+- Turns a single idea/prompt into a structured video plan (story beats + shot list)
+- Generates shot-by-shot prompts with a natural flow (hook → build → payoff)
+- Produces a complete output: clips + narration + music + final cut + export
+- Exports a run as a reproducible job (so you can rerun or improve it later)
+
+Automated story & character control
+- 📖 Character Bible: define up to 2 detailed characters used across story + prompts
+- 🧩 Own Storyline mode: paste your own numbered beats ((01)…(02)…); each becomes the next beat
+- Disables automatic character-bible/storyline creation so your manual story stays in control
+- 🛡️ Alternative Storyline mode: safer story mode for animals/aliens/creatures to reduce “too human” drift (hands, faces, body language)
+
+Reference / identity mode (character consistency strategy)
+- 🎨 Reference-based repaint: uses reference images to “repaint/guide” shots so the subject stays consistent while scenes/actions change
+- 🧬 Qwen Edit 2511 identity mode (best consistency): keeps character identity as stable as possible across shots when normal prompting drifts
+
+Per-shot generation + regeneration
+- 🎬 Generates video clips per shot
+- 🔁 Regenerate individual shots/clips (no need to restart the whole job)
+
+Narration + music + final assembly
+- 🗣️ Generates narration text from the story plan
+- 🎵 Music via Ace Step 1.5 with ~50 genres (instrumental, your own lyrics, or AI lyrics based on storyline)
+- 🎛️ Can use Music Clip Creator for the final video
+
+🧱 Auto-assembles a final-cut timeline
+- 🎚️ Aligns narration + music and exports a finished video in one workflow
+
+ Optional post / workflow controls
+- 🆙 Upscale final output (optional) — currently SeedVR2 is the only configured/working option
+- ⚡ Interpolate to higher FPS (optional) with RIFE for smoother motion
+- 👀 Optional review checkpoints to inspect/edit results mid-run
+- 🎲 Optional retry with new seed when the result is close but not perfect
+
+Results / History + Resume (core workflow)
+- 🗂️ Results browser / job history for finished, failed, and cancelled runs
+- ▶️ Resume button continues the pipeline from where it stopped
+
+
+🎶 Ace Step 1.5 — Music Creation
+
+- 📦 Install via Optional Installs: downloads/installs the environment + repo + Turbo model
+- ⏳ Other checkpoints download on first use (expect the first run to be slow)
+- 🧾 Simple view: Prompt + Negatives + Lyrics, many 'auto' options for one click generation 
+- 🎚️ Full settings control: duration, BPM, seed, etc. (many include Auto / “let Ace decide”) + advanced settings for model selection etc
+- 🧰 Genre preset manager: add/edit/remove presets — includes 60+ example genre presets, edit, remove or add (sub) genres
+
+
+🎨 UI Improvements
+
+- ➕ Added Ace Step 1.5 to Optional Installs, System Monitor, and the Remove/Hide menu
+- 💾 Music player overlay now remembers whether visuals are ON/OFF after restarting the app
+- 🧩 Various small UI improvements
+
+
+🛠️ Bugfixes
+
+- 📝 Whisper: fixed a crash when extracting subtitles from video
+ 
+
+🧹 Removed
+
+- ❌ Removed cpu install from the installer, wasn't updated for a long time and no longer working properly
+- ❌ Old Ace Step model removed from the installers and the app
+- ❌ HeartMula removed from the installers and the app
+( 🧽 If you’re updating from an older version, you can manually remove the old Ace Step and HeartMula environment + model folders)
+
+</details>
+<details>
+  <summary>Januari 24, 2026. V2.2.2 small update adds Qwen3 Text to speech and Whisper speech to text</summary>
+
+Qwen 3 Text-to-Speech
+- Base
+- Custom voice (uses built-in speech models)
+- Clone voice (upload a sample to create cloned voices)
+- Voice design (create your own voice with prompts)
+
+Whisper
+- Voice → text (subtitles / transcript)
+- Burn subtitles directly into the video (hardcoded subtitles)
+- Multilingual speech recognition
+- Optional translation of transcript/subtitles to English  
+</details>
+  
+<details>
+  <summary>Januari 19, 2026. V2.2.1 small update adds HeartMula Music creation</summary>
+- HeartMula
+  
+    - Create music offline
+    - Good for vocal pop, rock, R&B (and more genres)
+    - Good sound quality with default settings
+    - Create up to 4 minutes of music in minutes
+- UI Improvements
+
+  - Optional Installs: Remove / Hide manager
+    - Quickly remove installed/unused models / repos / environments
+    - Options: Delete, Hide, or both
+    - Detailed info per model: paths (folders/files), size on disk, etc.
+</details>
+<details>
+  <summary>Januari 17, 2026. V2.2 update adds qwen2511 & 2512</summary>
+  New Features
+
+  Qwen 2512 GGUF loader
+  - Install from Optional Installs
+  - Find it in txt2img with the other txt2img models
+  - Added support for Turbo LoRA (and other LoRAs) — get images in only 4 steps
+   
+  Qwen2511
+  - GGUF loader, download extra models via Optional Installs menu
+  - Mainly for testing / not fully working like in ComfyUI yet
+  - Use reference images + prompt for edits
+  - Offload options
+  - Flash Attention
+  - LoRA support (tested with the multi angle LoRA)
+  - 96 angle toggle for easy use of the multi angle LoRA
+  
+  New Background Remover + SDXL Inpaint (with model loader)
+  - Removed the old all in one background remover / (bad) SD15 inpainter
+  - Replaced with 2 complete new (separated) tools
+  - Background Remover is more user friendly and simplified (recommend 720p+ start images to avoid bad cutouts)
+  - Pan/zoom + brush for high detail background removal
+  - User can load an image as new background; original cutout/mask can be moved + resized to fit the new background
+  - Inpainter now loads SDXL instead of SD15 models (one included in Optional Installs)
+  - Easy flow: load image → load mask → enter prompt → done
+  - Background remover works on any PC
+  - SDXL inpaint works on GPU as low as 6GB VRAM (8GB recommended) — use this if Qwen Edit 2511 is too VRAM hungry
+  
+  UI Improvements
+  - Interpolator: added “interpolate x3” shortcut + manual number input; compression removed so output files now keep source quality
+  - License viewer (MIT, Apache, …) added for all tools — find it in Info menu or in Optional Installs
+  - 4 new themes: Blue / Orange / Green / Red in the dark
+  - Banner: new function — gradient rainbow colors with slider for speed
+  - Better defaults for new user installs (Settings + Videoclip Creator)
+  
+  Bugfixes
+  - Fixed Media Explorer bug where it would become slow after image(s) got scanned
+  - Fixed banner showing up after restart in Settings
+  - Fixed banner not hiding in Videoclip Creator
+</details>
+<details>
+  <summary>Januari 1, 2026. V2.1.2 Happy Newyear and another update</summary>
+  
+  
+- fixed themes freezing app for 5 seconds after applying (added a 'safe apply' button in case freezing comes back)
+- fixed trim tool freezing ui while generating preview
+- fixed upscaler defaulting to 30fps
+- fixed tab integration still thinking upscaler was a main tab (finaly found why upscaler needed restart to apply new upscaler engine/model)
+- fixed compare tool crash when loading new media file while repeat button was on.
+- fixed compare tool sync problems for video (85% lol)
+- added a date/time changer to the metadata editor
+- added a couple of simple effects to the text on top of video overlay tool
+- added 'strobe on time' in the video clip creator, now you can pick the perfect moment for a strobe effect
+- Behind the scenes upgrade : Moved queue to it's own python file, no longer inside the big main framevision python file. This may come with new bugs, i will fix them as i run into them  
+
+</details>
+  <details>
+  <summary>December 28, 2025. V2.1.1 mini update</summary>
+
+Bugfixes
+- fixed optional installs: background model + Z-image fp16 installer
+- fixed move up/down in queue (pending) + right click options restored for moving
+- fixed shrink feature for repeat button
+- fixed adding Music Clip Creator jobs to the queue, queue-ing button restored
+- fixed filename for random seeds in Hunyuan
+- not 100% fixed yet: queue finished results — if video playback or visuals from music player stutter: clear finished results in queue
+---
+UI improvements
+- more “View Result” buttons (most tools now have it)
+- new Settings toggles ;
+- animated hover effects on some buttons (6 animations + random)
+- Change font size
+- moved buttons to front in queue (finished)
+- simplified treeview in Media Explorer
+- updated Features HTML + a big part of the Knowledge Base in the Info menu
+
+New features
+- VideoText (beta test)
+  - allows adding text to video
+  - choice of font, size, position
+  - unlimited text adding
+  - adjustable fade in/out
+  - preview toggle to always show all text
+  - preview timeline with zoom/pan/drag/drop
+  - text effects
+  - load/play/pause/stop/save
+</details>
+<details>
+  <summary>December 25, 2025 — v2.1 release notes</summary>
+
 **✨ New Features**
----
+
 - Music Videoclip Creator
   - Added more transitions, cinematic effects, and drop/chorus effects
   - a couple of extra settings such as 'skip Fx in intro'
-  - new 1 clisk preset : 'get it done FAST' (3 minute videoclip in less then a minute, only uses easy to render effects and transitions)
+  - new 1 click preset : 'get it done FAST' (3 minute videoclip in less then a minute, only uses easy to render effects and transitions)
 - Reverse video tool
   - Simple tool to fix AI videos that run backwards
   - Supports batch, queue, use currently playing video, and load video
@@ -21,31 +222,30 @@
   - Aspect ratio for all resolutions (192p–720p): 1:1 / 16:9 / 9:16
 - Media explorer tab
   - Replaces the buggy “last result” screens from every model,
-  - Most tools now have a 'view results' button which will open the folder, scan for json files and show all results in the media folder.
+  - Most tools now have a 'view results' button which will open the folder, scan for json files and show all results in the media explorer.
   - Double click plays them in the app multi mediaplayer, right click give extra options such as :
-  - Search/sort/play/preview/cut/copy/paste/delete/rename/favorite
-  - User can scan any folder + subfolders and scan directly or open tree view and select folder.
-  - adds a 'view results' button with the tools that auto scans their folder in the media explorer when clicked
+  - Search/sort/play/preview/cut/copy/paste/delete/rename/favorite+...
+  - User can scan any folder + subfolders (or open basic tree view) (Huge drives with video can take longtime)
 - Z-Image Turbo GGUF Model loader
   - Get FP16 or a GGuf variant for the Z-image Turbo image creator
   - use them in a model loader, queue allows combining any model
   - Q4–Q8 variants allow fast image creation on virtually any VRAM
+  - may give an error for missing dll on some computers, popup will point to windows file for install of visual studio
 - Optional downloads
   - a new menu for optional installs (moved from the installer into a new part of the app, so user can decide later what to install
-  - Currently includes : Z-image fp16 + gguf model downloader, Hunyuanvideo 1.5, wan2.2 5b, a model for SDXL, background/inpaint models, ace step music and a face restorer These are no longer installed with the app by default and can be installed in here
----
+  - Currently includes : Z-image fp16 + gguf model downloader, Hunyuanvideo 1.5, wan2.2 5b, a model for SDXL, background/inpaint models, ace step music and a face restorer These are no longer installed with the app by default and can be skipped/installed in here to save time on first time install of the app
+
 **🎨 UI Improvements**
 
-- Music video creator beat-synced visuals now come with a preview thumbnail, i included a thumbnail pack lso (to avoid long wait at first time use)
-- Repeat button for video files (shows u when a video file is loaded, hides again when images are loaded)
-- Right mouse button in queue for running & pendingget a couple of options (cancel running job, move back to pending, delete job from pending, show JSON info)
+- Music video creator beat-synced visuals now come with a preview thumbnail, i included ready thumbnail pack (to avoid long wait at first time use)
+- Repeat button for video files (shows up when a video file is loaded, hides again when images are loaded, music player already has it's own repeat features)
+- Right mouse button in queue for running & pending get a couple of options (cancel running job, move back to pending, delete job from pending, show JSON info)
 - Prompt enhancers directly under prompt box in WAN 2.2 / Hunyuan 1.5 & Z-image / SDXL
 - Wheel guard: avoids accidentally changing settings while scrolling over something with mouse
 - Reorder tabs & tools (upscaling, Rife, Qwen describe, background remover and Ace Music now are in tools tab)
 - Settings have a new toggle that allows reordering the main tabs, Tools tab also gets a reorder toggle.
 - HUD now also shows internet traffic up/down (when above 50kb/s) to be able to follow 'silent downloads' of some models 
 
----
 **✅ Bugfixes**
 
 - Z-image
@@ -82,15 +282,14 @@
   - Resize bug fixed
 - Misc
   - Fixed a bug in one of the easter eggs
+</details>
 
----
----
-December 1, 2025 V2.0 is finally ready
-### 🌟 Release Notes
----
+<details>
+  <summary>December 01, 2025 — v2.0 full release notes</summary>
+  
 **🧩 NEW Features**
----
-_Music Video Clip Creator_
+
+Music Video Clip Creator_
 - [ ] Works with every CPU or Gpu.
 - [ ] Load one or multiple clips and/or images, add your music track, and create a complete music video in a couple of minutes*.
 - [ ] Three settings for FX intensity or FX OFF (only hardcuts).
@@ -150,7 +349,6 @@ _Ace Music creation_
 - [ ] Recents list with Play/Delete options.
 - [ ] Various fine-tuning controls.
 
-
 ### Audio Edit – mini Audacity-style editor
 
 - [ ] Basic tool to edit sound files
@@ -186,67 +384,78 @@ _Metadata Tool_ – edit or delete metadata from videos and images (with batch s
 - [ ] Ace Music AI reference track fix – stable alignment and output.
 - [ ] RIFE fixed for systems without FFmpeg on PATH.
 - [ ] Frame Extractor fix – proper saving for single and batch modes.
+</details>
 
 ---
+FrameVision feature list
 ---
-
-FrameVision All in one sound/image/video tool FULL feature list
----
+### 🖌️ TXT → IMG (SD15/SDXL/Z-Image/Qwen 2512 fp16/gguf q4-q8)
+### 🎬 txt/img/video to video with WAN 2.2 5B and/or HunyuanVideo 1.5 (video extender included for direct runs)
 ### 🧪 Upscaler with model loader (15+ open source upscale models for photo & video)
 ### ⏱️ RIFE Interpolation
-### 📝 Describe in detail with Qwen3 VL 2B
-### 🖌️ TXT → IMG (SD15/SDXL/Z-Image)
-### 🎬 txt/img/video to video with WAN 2.2 5B (video extender included)
+### 📝 Describe in detail with Qwen3 VL
+### 🎙️ Text to speech with Qwen 3 (full model pack includes voice cloning and creating own style voices)
+### 🎵 (music) videoclip creator
 ### 🎵 Ace Music creation
-### 🖌 Remove Background + basic (sd15) inpainting
+### 🎵 HeartMula Music creation
+### 📁 Media Explorer with Json viewer
+### 🖌 Remove Background + basic (sdXL) inpainting + Qwen edit 2511
 ### 👽 Ask Framie, little offline chatbot, works with Qwen3VL 2B
-### 🧰 Tools
-- Change speed for videos (with audio sync).
-- Prompt enhancer (Qwen3VL)
-- Thumbnail/meme creator
-- Sound edit (mini audacity)
-- sound mixer
-- (music) videoclip creator
-- Resize image/video 
-- Create Gif files :2 sections : use currently playing video or load images from a folder
-- Extract/join frames
-- Trim videos
-- Crop videos/images
-- Multi rename/replace 
-- Metadata editor/remover
 ### ⏳ Batch tools for almost all tools
 ### 📋 Advanced Queue with seperate worker for most tools
 ### 🧮 System Monitor with Hud
 ### 🕹️ EASTER EGGS : use the app to unlock them
 ### 📺 in app resizable Multi media player
-### 🎶 Music player with playlist & 200+ beat synced visuals
-### All kinds of extra's i forgot to mention such as random 'open app' screens with visual overlays or 20+ themes.
+### 🎶 Music player with playlist & 250+ beat synced visuals
+### 🧰 More Tools
+- Change speed for videos (with audio sync).
+- Prompt enhancer (Qwen3VL)
+- Reverse video / boomerang
+- Thumbnail/meme creator for easy adding text with effects to an image
+- Sound edit (mini audacity)
+- sound mixer for adding extra sound to video
+- Resize image/video 
+- Create Gif files : 2 sections -> use currently playing video or load images from a folder
+- Extract/join frames
+- Trim videos with preview
+- Crop videos/images
+- Whisper voice to text with option to bake subtitles into video
+- Multi rename/replace filenames
+- Metadata/date editor/remover
+### All kinds of extra's i forgot to mention such as a file menu with recents/favorites/converter, license viewer, uninstaller, compare a/b, many random 'open app' screens with visual overlays, 25 themes, an in app updater (to latest stable release or to latest files on github), a huge Knowledge base with q&a etc etc.
 ---
 
 ## 🛠 Installation
 Run **`framevision.exe`** — it automatically:
-1. Opens the installer menu if setup is incomplete.
-2. Repairs missing components (like `psutil`).
-3. Starts the app and background worker.
+1. Opens the installer menu if setup is incomplete. (give 1 time approval in windows to use an unknown app)
+2. select 'check requirements' if you never installed something A.i. related before to have environment, git, python,... installed
+3. This app is mainly created for RTX Nvidea users but an option for cpu install is also included (expect big models to not work or take forever to create a video or image)
+4. After install it starts the app and background worker. (keep the background worker open when using queue)
+5. select an optional install in the app (optional downloads menu) to get the model(s) you need (wan 2.2, hunyuan, z-image,..)
 
 ### Installer Menu Options
 - 1 **check requirements** + basic 'first time ai' installer.
-- 2 **Core Install:** App only (minimal).
+- 2 **Core Install:** App only (minimal).use this if app stops working after install to get a quick reset
 - 3 **Full CPU Install:** Torch CPU + models/binaries.
 - 4 **Full CUDA Install:** Torch CUDA + models/binaries.
-- 5 **optional install** list with extra tools that have their own environment (wan 2.2, z-image,...
-    These kan be skipped, or when installed, deleting their model folder and environment folder wikk safely remove them again from the app
 ---
-Portable & offline
-(install must go to c:\framevision-main, once everything is installed no more internet is needed and you can move it to any other location on the drive
-One click install tries to make everything work out of the box, even for 'new to ai' users
+User friendly, Portable & offline
+(install must go to c:\framevision-main, once everything is installed no more internet is needed and you can move the folder to any other location on the drive.
+One click install tries to make everything work out of the box (git, python, environment..) even for 'new to ai' users (Z-image gguf models may need extra install of visual studio (when you get error of missing dll files.)
 Tooltips everywhere (can be turned of in settings tab)
-Draggable middle splitter & swap ui to make the app look the way user wants
+Draggable middle splitter & swap ui to make the app look the way user wants. (Drag completely to one side to get a full screen for the tabs or the media player)
+---
+
+**Not working/bugs/todo:**
+---
+- To many finished results in queue still makes video stutter, clean finished results manually when you see it happen.
+- image selection disabled in music video clip creator (needs to much re writing code to get it to work properly again, maybe one day
+- timeline editing in music video ceator is not working properly anymore after adding to many new features, is on todo list to fix this.
+- more ? let me know :-)
 ---
 
 ## 🤝 Contributing
-Pull requests and feature suggestions are welcome!  
-If you encounter bugs, please open an issue or use the **Bug Report** button in the app's Settings tab.
+bug reports or feature suggestions are welcome!  
 
 ---
 
@@ -256,6 +465,6 @@ If you encounter bugs, please open an issue or use the **Bug Report** button in 
 ---
 
 > Built by **Contrinsan**  
-> installer help by **ChatGPT**  
-> *This project is a living work — details evolve with releases.*
+> Debug help by **ChatGPT**  
+> *This project is a living work — details evolve with releases. Features can come and go as the app matures*
 

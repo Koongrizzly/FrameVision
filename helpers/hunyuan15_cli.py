@@ -415,7 +415,7 @@ def cmd_generate(args):
     # I2V resolution override:
     # Diffusers' HunyuanVideo15ImageToVideoPipeline does not accept height/width kwargs.
     # Instead it uses pipe.target_size to decide the internal working resolution.
-    if model_is_i2v and (args.height or args.width):
+    if model_is_i2v and ((args.height or args.width) or (getattr(args, 'target_size', 0) and int(getattr(args, 'target_size', 0) or 0) > 0)):
         req_h = int(args.height) if args.height else None
         req_w = int(args.width) if args.width else None
 

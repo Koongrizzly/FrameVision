@@ -3,6 +3,7 @@ import os
 import urllib.request, urllib.error, sys, io, json, time, shutil, zipfile, argparse, urllib.request, glob
 from pathlib import Path
 from typing import Optional, Any, List
+import subprocess, hashlib, datetime, re
 # --- begin: FFmpeg & RIFE installers (minimal) ---
 import zipfile as _zipfile
 import urllib.request as _url
@@ -27,25 +28,33 @@ def ensure_ffmpeg_bins():
     bin_dir = root / "presets" / "bin"
     bin_dir.mkdir(parents=True, exist_ok=True)
     targets = ["ffmpeg.exe", "ffplay.exe", "ffprobe.exe"]
-    if all((bin_dir / t).exists() for t in targets):
-        print("[externals] ffmpeg bins already present")
-        return
+
     cache = root / ".dl_cache"
     cache.mkdir(parents=True, exist_ok=True)
-    url = "https://github.com/BtbN/FFmpeg-Builds/releases/latest/download/ffmpeg-master-latest-win64-gpl.zip"
-    zpath = cache / "ffmpeg-master-latest-win64-gpl.zip"
-    if not zpath.exists() and not _fv_dl(url, zpath):
-        print("[externals] FFmpeg ZIP fetch failed; skipping")
-        return
-    with _zipfile.ZipFile(zpath, "r") as z:
-        names = z.namelist()
-        for w in targets:
-            cand = [n for n in names if n.lower().endswith("/"+w) or n.lower().endswith("\\"+w) or n.lower().endswith(w)]
 
-            if cand:
-                with z.open(cand[0]) as src, open(bin_dir / w, "wb") as out:
-                    out.write(src.read())
-    print("[externals] ffmpeg bins installed to", bin_dir)
+    # Keep this as "latest" if you prefer always-up-to-date builds.
+    # Note: the installer records the exact build info (ffmpeg -version + sha256) into presets/info/
+    url = "https://github.com/BtbN/FFmpeg-Builds/releases/latest/download/ffmpeg-master-latest-win64-gpl.zip"
+    zpath = cache / Path(url).name
+
+    # Install bins if missing
+    if not all((bin_dir / t).exists() for t in targets):
+        if not zpath.exists() and not _fv_dl(url, zpath):
+            print("[externals] FFmpeg ZIP fetch failed; skipping")
+            return
+        with _zipfile.ZipFile(zpath, "r") as z:
+            names = z.namelist()
+            for w in targets:
+                cand = [n for n in names if n.lower().endswith("/" + w) or n.lower().endswith("\\" + w) or n.lower().endswith(w)]
+                if cand:
+                    with z.open(cand[0]) as src, open(bin_dir / w, "wb") as out:
+                        out.write(src.read())
+        print("[externals] ffmpeg bins installed to", bin_dir)
+    else:
+        print("[externals] ffmpeg bins already present")
+
+    # Always record build info + update license metadata
+    _fv_record_ffmpeg_build(root=root, bin_dir=bin_dir, ffmpeg_url=url, zip_path=zpath if zpath.exists() else None)
 
 def ensure_rife_pack():
     root = (globals().get("ROOT") or _P(__file__).resolve().parent.parent)
@@ -85,6 +94,112 @@ def ensure_rife_pack():
                         f.write(src.read())
                     break
     print("[externals] RIFE pack installed to", target)
+
+def _fv_sha256(p: _P) -> str:
+    h = hashlib.sha256()
+    with open(p, "rb") as f:
+        for chunk in iter(lambda: f.read(1024 * 1024), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+def _fv_record_ffmpeg_build(root: _P, bin_dir: _P, ffmpeg_url: str, zip_path: Optional[_P] = None) -> None:
+    """
+    Writes presets/info/ffmpeg_build_info.txt and updates presets/info/3rd_party_licenses.json
+    with the exact installed FFmpeg build info (version + sha256).
+    Safe to call repeatedly.
+    """
+    try:
+        ffmpeg_exe = bin_dir / "ffmpeg.exe"
+        if not ffmpeg_exe.exists():
+            return
+
+        info_dir = root / "presets" / "info"
+        info_dir.mkdir(parents=True, exist_ok=True)
+        build_info_path = info_dir / "ffmpeg_build_info.txt"
+
+        # Capture "ffmpeg -version" output
+        try:
+            cp = subprocess.run(
+                [str(ffmpeg_exe), "-version"],
+                capture_output=True,
+                text=True,
+                errors="replace",
+                timeout=20,
+                creationflags=(subprocess.CREATE_NO_WINDOW if hasattr(subprocess, "CREATE_NO_WINDOW") else 0),
+            )
+            out = (cp.stdout or "") + ("\n" + cp.stderr if cp.stderr else "")
+        except Exception as e:
+            out = f"[error] failed to run ffmpeg -version: {e}\n"
+
+        # Write build info log (always overwrite with latest info)
+        stamp = datetime.datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ")
+        header = f"Captured at (UTC): {stamp}\nFFmpeg URL: {ffmpeg_url}\n"
+        if zip_path and zip_path.exists():
+            header += f"ZIP SHA256: {_fv_sha256(zip_path)}\nZIP Path: {zip_path}\n"
+        header += f"ffmpeg.exe SHA256: {_fv_sha256(ffmpeg_exe)}\n\n"
+        build_info_path.write_text(header + out, encoding="utf-8", errors="replace")
+
+        # Parse the version token from first line
+        version_token = ""
+        first_line = (out.splitlines()[0] if out else "").strip()
+        m = re.search(r"ffmpeg\\s+version\\s+(\\S+)", first_line, flags=re.IGNORECASE)
+        if m:
+            version_token = m.group(1)
+
+        # Update 3rd_party_licenses.json if present
+        candidates = [
+            root / "presets" / "info" / "3rd_party_licenses.json",
+            root / "presets" / "info" / "3rd_party_licences.json",
+            root / "3rd_party_licenses.json",
+            root / "3rd_party_licences.json",
+        ]
+        lic_path = next((p for p in candidates if p.exists()), None)
+        if not lic_path:
+            print("[externals] (info) no 3rd_party_licenses.json found to update")
+            return
+
+        try:
+            data = json.loads(lic_path.read_text(encoding="utf-8", errors="replace"))
+        except Exception as e:
+            print("[externals] (warn) failed to parse licenses json:", e)
+            return
+
+        items = data.get("items") if isinstance(data, dict) else None
+        if not isinstance(items, list):
+            print("[externals] (warn) licenses json missing 'items' list:", lic_path)
+            return
+
+        # Locate FFmpeg entry (by id/name)
+        entry = None
+        for it in items:
+            if not isinstance(it, dict):
+                continue
+            _id = str(it.get("id", "")).lower()
+            _name = str(it.get("name", "")).lower()
+            if "ffmpeg" in _id or _name.startswith("ffmpeg"):
+                entry = it
+                break
+        if not entry:
+            print("[externals] (warn) no FFmpeg entry found in licenses json:", lic_path)
+            return
+
+        entry["download_url"] = ffmpeg_url
+        entry["source_url"] = ffmpeg_url
+        if version_token:
+            entry["installed_version"] = version_token
+        entry["installed_at_utc"] = stamp
+        entry["installed_ffmpeg_sha256"] = _fv_sha256(ffmpeg_exe)
+        entry["build_info_path"] = str(build_info_path.relative_to(root)).replace("\\\\", "/")
+
+        # Touch generator timestamp if present
+        if isinstance(data, dict):
+            data["generated_at_utc"] = stamp
+
+        lic_path.write_text(json.dumps(data, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+        print("[externals] updated license info:", lic_path)
+    except Exception as e:
+        print("[externals] (warn) failed recording FFmpeg build info:", e)
+
 # --- end: FFmpeg & RIFE installers (minimal) ---
 
 def move_folders_to_models():
@@ -847,28 +962,9 @@ if __name__ == "__main__":
     move_to_models()
 # --- end: Move folders to models ---
 
-# --- begin: TXT->IMG model families (SD1.5 / SDXL) --------------------------------------------
-# Moved to separate module: download_sd_models.py
-# Keeping download_externals.py focused on non-SD externals, while TXT->IMG (SD15/SDXL) remains optional.
-try:
-    # When executed as scripts/download_externals.py
-    from download_sd_models import run_txt2img_auto as _fv_run_txt2img_auto
-except Exception:
-    try:
-        # When executed as a module package (rare)
-        from .download_sd_models import run_txt2img_auto as _fv_run_txt2img_auto
-    except Exception:
-        _fv_run_txt2img_auto = None
-
-if __name__ == "__main__":
-    if _fv_run_txt2img_auto is None:
-        print("[externals][txt2img] download_sd_models.py not found; skipping TXT→IMG downloads")
-    else:
-        try:
-            _fv_run_txt2img_auto()
-        except Exception as e:
-            print("[externals][txt2img] error:", e)
-# --- end: TXT->IMG model families -------------------------------------------------------------
+# --- TXT->IMG model families (SD1.5 / SDXL) ---
+# NOTE: Auto-run of download_sd_models.py has been removed.
+# If you want TXT→IMG model downloads, run download_sd_models.py manually.
 # --- begin: run downloadbg.py at the very end ----------------------------------
 def _run_downloadbg_after_all():
     try:

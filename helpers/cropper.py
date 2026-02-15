@@ -1,5 +1,5 @@
 # helpers/cropper.py — Crop tool (Video & Image) with working buttons
-import os, json, subprocess
+import os, sys, json, subprocess
 from pathlib import Path
 from PySide6.QtWidgets import (
     QLabel, QSlider, QPushButton, QFormLayout, QHBoxLayout, QVBoxLayout,
@@ -163,6 +163,8 @@ def install_cropper_tool(host, section_widget):
     host.btn_crop_batch = QPushButton("Batch…")
     host.btn_use_current = QPushButton("Use current")
     host.btn_add = QPushButton("Add")
+    host.btn_crop_open_folder = QPushButton("View results")
+    host.btn_crop_open_folder.setToolTip("Open these results in Media Explorer.")
     btn_sc = QPushButton("Save preset"); btn_lc = QPushButton("Load preset")
 
     # Layout
@@ -176,7 +178,7 @@ def install_cropper_tool(host, section_widget):
 
     row_cb = QHBoxLayout()
     row_cb.addWidget(host.btn_crop); row_cb.addWidget(host.btn_crop_batch)
-    row_cb.addWidget(host.btn_use_current); row_cb.addWidget(host.btn_add)
+    row_cb.addWidget(host.btn_use_current); row_cb.addWidget(host.btn_add); row_cb.addWidget(host.btn_crop_open_folder)
     lay.addRow(row_cb)
 
     lay.addRow("Video options", host.vid_opts)
@@ -297,6 +299,8 @@ def install_cropper_tool(host, section_widget):
         cmd = [ffmpeg_path(), "-y", "-i", str(inp), "-vf", filter_str,
                "-c:v", "libx264", "-preset", preset, "-movflags", "+faststart", str(out)]
         host._run(cmd, out)
+        try: host._cropper_last_out_dir = out.parent
+        except Exception: pass
 
     def run_crop_image(inp: Path):
         iw, ih = _sync_ranges_to_media(inp)
@@ -318,6 +322,8 @@ def install_cropper_tool(host, section_widget):
             comp = max(0, min(9, comp))
             cmd = [ffmpeg_path(), "-y", "-i", str(inp), "-vf", filter_str, "-compression_level", str(comp), str(out)]
         host._run(cmd, out)
+        try: host._cropper_last_out_dir = out.parent
+        except Exception: pass
 
     def run_crop():
         inp = host._cropper_selected_path
@@ -379,6 +385,8 @@ def install_cropper_tool(host, section_widget):
                         comp = max(0, min(9, comp))
                         cmd = [ffmpeg_path(), "-y", "-i", str(_p), "-vf", filter_str, "-compression_level", str(comp), str(out)]
                 host._enqueue_cmd_for_input(_p, cmd, out); ok += 1
+                try: host._cropper_last_out_dir = out.parent
+                except Exception: pass
             except Exception:
                 continue
         try:
@@ -429,13 +437,88 @@ def install_cropper_tool(host, section_widget):
             try: QMessageBox.critical(host, "Preset error", str(e))
             except Exception: pass
 
-    # --- Wiring ---
+    
+    # --- View results (Media Explorer preferred) ---
+    def _open_folder_in_os(folder_path: Path):
+        try:
+            folder_path.mkdir(parents=True, exist_ok=True)
+        except Exception:
+            pass
+        try:
+            if os.name == "nt":
+                os.startfile(str(folder_path))  # type: ignore[attr-defined]
+                return
+        except Exception:
+            pass
+        try:
+            if sys.platform == "darwin":
+                subprocess.Popen(["open", str(folder_path)])
+            else:
+                subprocess.Popen(["xdg-open", str(folder_path)])
+        except Exception:
+            pass
+
+    def _crop_open_folder():
+        # Prefer last output dir if known; else mode-based default
+        try:
+            folder = getattr(host, "_cropper_last_out_dir", None)
+        except Exception:
+            folder = None
+        if not folder:
+            try:
+                is_img = (host.mode_combo.currentText().lower() == "image")
+            except Exception:
+                is_img = False
+            folder = (OUT_PHOTOS if is_img else OUT_VIDEOS)
+
+        try:
+            fp = folder if isinstance(folder, Path) else Path(str(folder))
+        except Exception:
+            fp = None
+
+        # Prefer Media Explorer on main window if available
+        main = None
+        try:
+            main = getattr(host, "main", None)
+        except Exception:
+            main = None
+        if main is None:
+            try:
+                main = host.window() if hasattr(host, "window") else None
+            except Exception:
+                main = None
+
+        if fp is not None and main is not None and hasattr(main, "open_media_explorer_folder"):
+            try:
+                preset = "images" if (host.mode_combo.currentText().lower() == "image") else "videos"
+            except Exception:
+                preset = "videos"
+            try:
+                main.open_media_explorer_folder(str(fp), preset=preset, include_subfolders=False)
+                return
+            except TypeError:
+                try:
+                    main.open_media_explorer_folder(str(fp))
+                    return
+                except Exception:
+                    pass
+            except Exception:
+                pass
+
+        if fp is not None:
+            _open_folder_in_os(fp)
+
+# --- Wiring ---
     host.btn_crop.clicked.connect(run_crop)
     host.btn_crop_batch.clicked.connect(run_crop_batch)
     host.btn_use_current.clicked.connect(use_current)
     host.btn_add.clicked.connect(add_media)
     btn_sc.clicked.connect(save_preset_crop)
     btn_lc.clicked.connect(load_preset_crop)
+    try:
+        host.btn_crop_open_folder.clicked.connect(_crop_open_folder)
+    except Exception:
+        pass
 
     # Compatibility exposure
     try:
@@ -481,6 +564,8 @@ def install_cropper_tool(host, section_widget):
                         comp = max(0, min(9, comp))
                         cmd = [ffmpeg_path(), "-y", "-i", str(_p), "-vf", filter_str, "-compression_level", str(comp), str(out)]
                 host._enqueue_cmd_for_input(_p, cmd, out); ok += 1
+                try: host._cropper_last_out_dir = out.parent
+                except Exception: pass
             except Exception:
                 continue
         try:
@@ -533,11 +618,86 @@ def install_cropper_tool(host, section_widget):
             try: QMessageBox.critical(host, "Preset error", str(e))
             except Exception: pass
 
-    # --- Wiring ---
+    
+    # --- View results (Media Explorer preferred) ---
+    def _open_folder_in_os(folder_path: Path):
+        try:
+            folder_path.mkdir(parents=True, exist_ok=True)
+        except Exception:
+            pass
+        try:
+            if os.name == "nt":
+                os.startfile(str(folder_path))  # type: ignore[attr-defined]
+                return
+        except Exception:
+            pass
+        try:
+            if sys.platform == "darwin":
+                subprocess.Popen(["open", str(folder_path)])
+            else:
+                subprocess.Popen(["xdg-open", str(folder_path)])
+        except Exception:
+            pass
+
+    def _crop_open_folder():
+        # Prefer last output dir if known; else mode-based default
+        try:
+            folder = getattr(host, "_cropper_last_out_dir", None)
+        except Exception:
+            folder = None
+        if not folder:
+            try:
+                is_img = (host.mode_combo.currentText().lower() == "image")
+            except Exception:
+                is_img = False
+            folder = (OUT_PHOTOS if is_img else OUT_VIDEOS)
+
+        try:
+            fp = folder if isinstance(folder, Path) else Path(str(folder))
+        except Exception:
+            fp = None
+
+        # Prefer Media Explorer on main window if available
+        main = None
+        try:
+            main = getattr(host, "main", None)
+        except Exception:
+            main = None
+        if main is None:
+            try:
+                main = host.window() if hasattr(host, "window") else None
+            except Exception:
+                main = None
+
+        if fp is not None and main is not None and hasattr(main, "open_media_explorer_folder"):
+            try:
+                preset = "images" if (host.mode_combo.currentText().lower() == "image") else "videos"
+            except Exception:
+                preset = "videos"
+            try:
+                main.open_media_explorer_folder(str(fp), preset=preset, include_subfolders=False)
+                return
+            except TypeError:
+                try:
+                    main.open_media_explorer_folder(str(fp))
+                    return
+                except Exception:
+                    pass
+            except Exception:
+                pass
+
+        if fp is not None:
+            _open_folder_in_os(fp)
+
+# --- Wiring ---
     host.btn_crop.clicked.connect(run_crop)
     host.btn_crop_batch.clicked.connect(run_crop_batch)
     btn_sc.clicked.connect(save_preset_crop)
     btn_lc.clicked.connect(load_preset_crop)
+    try:
+        host.btn_crop_open_folder.clicked.connect(_crop_open_folder)
+    except Exception:
+        pass
     # Compatibility exposure
     try:
         host.run_crop = run_crop

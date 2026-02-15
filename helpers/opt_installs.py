@@ -23,6 +23,13 @@ from typing import Callable, List, Optional, Tuple, Dict
 
 from PySide6 import QtCore, QtGui, QtWidgets
 
+# Optional: licenses viewer
+try:
+    from helpers.licenses_viewer import show_3rd_party_licenses
+except Exception:
+    show_3rd_party_licenses = None  # type: ignore
+
+
 
 # -----------------------------
 # Models / Tasks
@@ -159,8 +166,62 @@ def _run_zimage_gguf8(root: Path) -> Optional[Tuple[str, List[str], Path]]:
     return _run_zimage_gguf(root, "Q8_0")
 
 
+def _run_zimage_base_gguf(root: Path, quant: str) -> Optional[Tuple[str, List[str], Path]]:
+    """Download Z-Image (base) GGUF for the selected quant + required VAE + text encoder."""
+    script = root / "presets" / "extra_env" / "z-image_base_gguf_download.py"
+    if not script.exists():
+        return None
+    py = _venv_python(root)
+    if py is None or (not py.exists()):
+        return None
+
+    target = (root / "models" / "z-image_base_GGuf").resolve()
+    args = [
+        "-u",
+        str(script),
+        str(root),
+        str(target),
+        "--quant",
+        str(quant),
+    ]
+    return (str(py), args, root)
+
+
+def _run_zimage_base_q2k(root: Path) -> Optional[Tuple[str, List[str], Path]]:
+    return _run_zimage_base_gguf(root, "Q2_K")
+
+
+def _run_zimage_base_q3kl(root: Path) -> Optional[Tuple[str, List[str], Path]]:
+    return _run_zimage_base_gguf(root, "Q3_K_L")
+
+
+def _run_zimage_base_q4km(root: Path) -> Optional[Tuple[str, List[str], Path]]:
+    return _run_zimage_base_gguf(root, "Q4_K_M")
+
+
+def _run_zimage_base_q5km(root: Path) -> Optional[Tuple[str, List[str], Path]]:
+    return _run_zimage_base_gguf(root, "Q5_K_M")
+
+
+def _run_zimage_base_q6k(root: Path) -> Optional[Tuple[str, List[str], Path]]:
+    return _run_zimage_base_gguf(root, "Q6_K")
+
+
+def _run_zimage_base_q8(root: Path) -> Optional[Tuple[str, List[str], Path]]:
+    return _run_zimage_base_gguf(root, "Q8_0")
+
+
+
 def _run_ace(root: Path) -> Optional[Tuple[str, List[str], Path]]:
     script = root / "presets" / "extra_env" / "ace_setup.bat"
+    if not script.exists():
+        return None
+    return _cmd_call_bat(script, root)
+
+
+def _run_ace15(root: Path) -> Optional[Tuple[str, List[str], Path]]:
+    """Ace Step 1.5 Music Creation (turbo repo installer)."""
+    script = root / "presets" / "extra_env" / "install_ace_step_15.bat"
     if not script.exists():
         return None
     return _cmd_call_bat(script, root)
@@ -173,12 +234,244 @@ def _run_gfpgan(root: Path) -> Optional[Tuple[str, List[str], Path]]:
     return _cmd_call_bat(script, root)
 
 
+def _run_seedvr2_env(root: Path) -> Optional[Tuple[str, List[str], Path]]:
+    """Install / update SeedVR2 GGUF environment and dependencies (no model downloads)."""
+    script = root / "presets" / "extra_env" / "seedvr2_gguf_installer.py"
+    if not script.exists():
+        return None
+    py = _venv_python(root)
+    if py is None or (not py.exists()):
+        return None
+    args = ["-u", str(script), "--skip-models"]
+    return (str(py), args, root)
+
+
+def _run_seedvr2_gguf(root: Path, quant: str) -> Optional[Tuple[str, List[str], Path]]:
+    """Download SeedVR2 3B GGUF for a given quant (will create/reuse env as needed)."""
+    script = root / "presets" / "extra_env" / "seedvr2_gguf_installer.py"
+    if not script.exists():
+        return None
+    py = _venv_python(root)
+    if py is None or (not py.exists()):
+        return None
+    args = ["-u", str(script), "--quant", str(quant)]
+    return (str(py), args, root)
+
+
+def _run_seedvr2_q3(root: Path) -> Optional[Tuple[str, List[str], Path]]:
+    return _run_seedvr2_gguf(root, "Q3")
+
+
+def _run_seedvr2_q4(root: Path) -> Optional[Tuple[str, List[str], Path]]:
+    return _run_seedvr2_gguf(root, "Q4")
+
+
+def _run_seedvr2_q5(root: Path) -> Optional[Tuple[str, List[str], Path]]:
+    return _run_seedvr2_gguf(root, "Q5")
+
+
+def _run_seedvr2_q6(root: Path) -> Optional[Tuple[str, List[str], Path]]:
+    return _run_seedvr2_gguf(root, "Q6")
+
+
+def _run_seedvr2_q8(root: Path) -> Optional[Tuple[str, List[str], Path]]:
+    return _run_seedvr2_gguf(root, "Q8")
+
+
 def _run_hunyuan15(root: Path) -> Optional[Tuple[str, List[str], Path]]:
-    # Note: matches install_menu.bat spelling: hunuyan15_install.bat
-    script = root / "presets" / "extra_env" / "hunuyan15_install.bat"
+    # Note: matches install_menu.bat spelling: hunyuan15_install.bat
+    script = root / "presets" / "extra_env" / "hunyuan15_install.bat"
     if not script.exists():
         return None
     return _cmd_call_bat(script, root)
+
+
+
+
+# (HeartMula optional installs removed)
+
+def _run_whisper(root: Path) -> Optional[Tuple[str, List[str], Path]]:
+    """Install Whisper (Faster-Whisper) env + download default model."""
+    script = root / "presets" / "extra_env" / "whisper_install.bat"
+    if not script.exists():
+        return None
+    return _cmd_call_bat(script, root)
+
+def _run_qwen3tts(root: Path) -> Optional[Tuple[str, List[str], Path]]:
+    """Install Qwen3-TTS environment + base model(s)."""
+    script = root / "presets" / "extra_env" / "install_qwentts.bat"
+    if not script.exists():
+        return None
+    return _cmd_call_bat(script, root)
+
+
+def _run_qwen3tts_models(root: Path) -> Optional[Tuple[str, List[str], Path]]:
+    """Download extra Qwen3-TTS models (uses the existing Qwen3-TTS env)."""
+    script = root / "presets" / "extra_env" / "download_qwentts_models.bat"
+    if not script.exists():
+        return None
+    return _cmd_call_bat(script, root)
+
+
+
+def _run_qwen3tts_flashattn(root: Path) -> Optional[Tuple[str, List[str], Path]]:
+    """Install FlashAttention for Qwen3-TTS (optional speed-up)."""
+    script = root / "presets" / "extra_env" / "install_flashattn_optional.bat"
+    if not script.exists():
+        return None
+    return _cmd_call_bat(script, root)
+
+
+
+def _run_qwen2512_env(root: Path) -> Optional[Tuple[str, List[str], Path]]:
+    """
+    Install the Qwen-Image-2512 GGUF environment.
+    Expected to create: <root>/.qwen2512/venv/
+    """
+    script = root / "presets" / "extra_env" / "qwen2512_install.bat"
+    if not script.exists():
+        return None
+    return _cmd_call_bat(script, root)
+
+
+def _find_qwen2512_downloader_script(root: Path) -> Optional[Path]:
+    """
+    Try common locations for the Qwen2512 downloader script.
+    """
+    candidates = [
+        root / "scripts" / "qwen2512_download.py",
+        root / "qwen2512_download.py",
+        root / "presets" / "extra_env" / "qwen2512_download.py",
+        root / "presets" / "extra_env" / "qwen2512_download_quants.py",
+    ]
+    for c in candidates:
+        if c.exists():
+            return c
+    return None
+
+
+def _run_qwen2512_gguf(root: Path, quant: str) -> Optional[Tuple[str, List[str], Path]]:
+    """
+    Qwen-Image-2512 GGUF model downloader.
+
+    Note: This runs inside FrameVision's .venv (same as the Z-image GGUF downloader),
+    so it does NOT require re-installing the Qwen2512 env.
+    """
+    script = _find_qwen2512_downloader_script(root)
+    if script is None:
+        return None
+
+    py = _venv_python(root)
+    if not py:
+        return None
+
+    target = (root / "models" / "Qwen-Image-2512 GGUF").resolve()
+
+    # Support both the newer quant-selectable downloader and the older baseline downloader.
+    # Newer: supports --qwen-quant (q2/q3/q4/q5/q6/q8)
+    # Older: downloads the default bundle without quant selection.
+    try:
+        src = script.read_text(encoding="utf-8", errors="ignore").lower()
+    except Exception:
+        src = ""
+
+    args = ["-u", str(script)]
+    if "--qwen-quant" in src or "qwen-quant" in src:
+        # Newer script signature (preferred)
+        args += ["--qwen-quant", quant]
+    # Common args (existing in the original downloader)
+    args += ["--root", str(root), "--models-dir", str(target)]
+
+    return (str(py), args, root)
+
+
+def _run_qwen2512_q2(root: Path) -> Optional[Tuple[str, List[str], Path]]:
+    return _run_qwen2512_gguf(root, "q2")
+
+
+def _run_qwen2512_q3(root: Path) -> Optional[Tuple[str, List[str], Path]]:
+    return _run_qwen2512_gguf(root, "q3")
+
+
+def _run_qwen2512_q4(root: Path) -> Optional[Tuple[str, List[str], Path]]:
+    return _run_qwen2512_gguf(root, "q4")
+
+
+def _run_qwen2512_q5(root: Path) -> Optional[Tuple[str, List[str], Path]]:
+    return _run_qwen2512_gguf(root, "q5")
+
+
+def _run_qwen2512_q6(root: Path) -> Optional[Tuple[str, List[str], Path]]:
+    return _run_qwen2512_gguf(root, "q6")
+
+
+def _run_qwen2512_q8(root: Path) -> Optional[Tuple[str, List[str], Path]]:
+    return _run_qwen2512_gguf(root, "q8")
+
+
+
+
+def _find_qwen2511_downloader_script(root: Path) -> Optional[Path]:
+    """Try common locations for the Qwen2511 (Image Edit) GGUF downloader script."""
+    candidates = [
+        root / "presets" / "extra_env" / "qwen2511_download.py",
+        root / "scripts" / "qwen2511_download.py",
+        root / "qwen2511_download.py",
+    ]
+    for c in candidates:
+        if c.exists():
+            return c
+    return None
+
+
+def _run_qwen2511_gguf(root: Path, variant: str) -> Optional[Tuple[str, List[str], Path]]:
+    """
+    Qwen-Image-Edit-2511 GGUF model downloader.
+
+    NOTE: Before downloading models we ensure the shared Qwen2512 environment folder exists:
+    <root>/.qwen2512/  (Qwen2511 and Qwen2512 share the same stable-diffusion.cpp setup.)
+    """
+    script = _find_qwen2511_downloader_script(root)
+    if script is None:
+        return None
+
+    py = _venv_python(root)
+    if not py:
+        return None
+
+    target = (root / "models" / "qwen2511gguf").resolve()
+
+    args = [
+        "-u",
+        str(script),
+        "--variants",
+        variant,
+        "--root",
+        str(root),
+        "--models-dir",
+        str(target),
+    ]
+    return (str(py), args, root)
+
+
+def _run_qwen2511_q3(root: Path) -> Optional[Tuple[str, List[str], Path]]:
+    return _run_qwen2511_gguf(root, "Q3_K_S")
+
+
+def _run_qwen2511_q4km(root: Path) -> Optional[Tuple[str, List[str], Path]]:
+    return _run_qwen2511_gguf(root, "Q4_K_M")
+
+
+def _run_qwen2511_q5km(root: Path) -> Optional[Tuple[str, List[str], Path]]:
+    return _run_qwen2511_gguf(root, "Q5_K_M")
+
+
+def _run_qwen2511_q6k(root: Path) -> Optional[Tuple[str, List[str], Path]]:
+    return _run_qwen2511_gguf(root, "Q6_K")
+
+
+def _run_qwen2511_q8(root: Path) -> Optional[Tuple[str, List[str], Path]]:
+    return _run_qwen2511_gguf(root, "Q8_0")
 
 
 def _run_sdxl_juggernaut(root: Path) -> Optional[Tuple[str, List[str], Path]]:
@@ -198,25 +491,131 @@ def _run_background_remover_inpainter(root: Path) -> Optional[Tuple[str, List[st
     return (str(py), ["-u", str(script)], root)
 
 
+def _run_sdxl_inpaint_env(root: Path) -> Optional[Tuple[str, List[str], Path]]:
+    """
+    Install the SDXL inpaint environment used by the Background Remover + SDXL Inpaint tool.
+
+    Expected to create: <root>/.sdxl_inpaint/
+    """
+    script = root / "presets" / "extra_env" / "sdxl_inpaint_install.bat"
+    if not script.exists():
+        return None
+    return _cmd_call_bat(script, root)
+
+
+
 def _default_installs() -> List[OptionalInstall]:
     # Titles/descriptions copied from install_menu.bat "extra options" page.
     return [
         OptionalInstall(
+            key="qwen3tts",
+            title="Qwen3-TTS-12Hz-1.7B-CustomVoice",
+            description="Qwen 3 Text to speech. Installs environment + Qwen TTS Custom Voice model.",
+            runner=_run_qwen3tts,
+        ),
+        OptionalInstall(
+            key="qwen3tts_models",
+            title="installs only Qwen TTS Custom Voice model. More models can be downloaded inside the tool.",
+            description="If the environment is missing, it will be installed first.",
+            runner=_run_qwen3tts_models,
+        ),
+
+        
+        OptionalInstall(
+            key="qwen3tts_flashattn",
+            title="Install flash attention",
+            description="optional but advised for faster generation, credits to Get Going Fast (https://www.youtube.com/@cognibuild)  for the help",
+            runner=_run_qwen3tts_flashattn,
+        ),
+OptionalInstall(
             key="wan22",
             title="WAN 2.2 5B. Text/image/video to Video with extender",
-            description="VRAM: 24GB recommended (offloading works with less, but very slow). Disk: +30GB.",
+            description="VRAM: 24GB recommended for 720p (offloading works with less, but very slow). Disk: +30GB.",
             runner=_run_wan22,
         ),
         OptionalInstall(
             key="hunyuan15",
             title="HunyuanVideo 1.5, text/image/video to Video with extender",
-            description="VRAM: 16GB recommended for 480p. Disk: distilled I2V 480p included; up to ~35GiB more for extra models.",
+            description="VRAM: 16GB recommended for 480p. Distilled I2V 480p included; More models can be downloaded inside the tool.",
             runner=_run_hunyuan15,
         ),
         OptionalInstall(
+            key="qwen2512",
+            title="Qwen2512 Text to Image environment install",
+            description="Installs the Qwen-Image-2512 GGUF environment. Creates: .qwen2512/venv/.",
+            runner=_run_qwen2512_env,
+        ),
+        OptionalInstall(
+            key="qwen2512_q2",
+            title="Qwen2512 GGUF (Q2)",
+            description="Lowest VRAM / smallest. Fastest download, lowest quality.",
+            runner=_run_qwen2512_q2,
+        ),
+        OptionalInstall(
+            key="qwen2512_q3",
+            title="Qwen2512 GGUF (Q3)",
+            description="Low VRAM / small. Better than Q2, still lightweight.",
+            runner=_run_qwen2512_q3,
+        ),
+        OptionalInstall(
+            key="qwen2512_q4",
+            title="Qwen2512 GGUF (Q4)",
+            description="Balanced size/quality. Recommended starting point.",
+            runner=_run_qwen2512_q4,
+        ),
+        OptionalInstall(
+            key="qwen2512_q5",
+            title="Qwen2512 GGUF (Q5)",
+            description="Higher quality / larger download.",
+            runner=_run_qwen2512_q5,
+        ),
+        OptionalInstall(
+            key="qwen2512_q6",
+            title="Qwen2512 GGUF (Q6)",
+            description="High quality / larger. Needs more VRAM.",
+            runner=_run_qwen2512_q6,
+        ),
+        OptionalInstall(
+            key="qwen2512_q8",
+            title="Qwen2512 GGUF (Q8)",
+            description="Best quality / largest GGUF. Needs the most VRAM.",
+            runner=_run_qwen2512_q8,
+        ),
+        OptionalInstall(
+            key="qwen2511_q3",
+            title="Qwen2511 Image Edit GGUF (Q3_K_S)",
+            description="Low VRAM / Don't expect perfect results.",
+            runner=_run_qwen2511_q3,
+        ),
+        OptionalInstall(
+            key="qwen2511_q4km",
+            title="Qwen2511 Image Edit GGUF (Q4_K_M)",
+            description="runs in 10-12 gig vram, still not great quality.",
+            runner=_run_qwen2511_q4km,
+        ),
+        OptionalInstall(
+            key="qwen2511_q5km",
+            title="Qwen2511 Image Edit GGUF (Q5_K_M)",
+            description="16 gig vram advised, quality is better.",
+            runner=_run_qwen2511_q5km,
+        ),
+        OptionalInstall(
+            key="qwen2511_q6k",
+            title="Qwen2511 Image Edit GGUF (Q6_K)",
+            description="High quality / 24 gog vram without offloading",
+            runner=_run_qwen2511_q6k,
+        ),
+        OptionalInstall(
+            key="qwen2511_q8",
+            title="Qwen2511 Image Edit GGUF (Q8_0)",
+            description="Quality almost identical to original model.",
+            runner=_run_qwen2511_q8,
+        ),
+
+        OptionalInstall(
             key="zimage",
             title="Z-image Turbo Text to Image",
-            description="VRAM: 16GB+ for best quality (FP16). If you have <16GB, use the GGUF options (Q4–Q8).",
+            description="VRAM: 16GB+ for best quality (FP16). If you have less then 16GB, use the GGUF options (Q4–Q8).",
             runner=_run_zimage,
         ),
         OptionalInstall(
@@ -228,34 +627,35 @@ def _default_installs() -> List[OptionalInstall]:
         OptionalInstall(
             key="zimage_gguf4",
             title="Z-Image Turbo GGUF (Q4_0)",
-            description="VRAM: ~6GB+. Smallest/fastest. Installs diffusion Q4_0 + matching Qwen3 text encoder.",
+            description="VRAM: ~6GB+. Smallest/fastest.",
             runner=_run_zimage_gguf4,
         ),
         OptionalInstall(
             key="zimage_gguf5",
             title="Z-Image Turbo GGUF (Q5_0)",
-            description="VRAM: ~8GB+. Balanced size/quality. Installs diffusion Q5_0 + matching Qwen3 text encoder.",
+            description="VRAM: ~8GB+. Balanced size/quality.",
             runner=_run_zimage_gguf5,
         ),
         OptionalInstall(
             key="zimage_gguf6",
             title="Z-Image Turbo GGUF (Q6_K)",
-            description="VRAM: ~10–12GB+. Higher quality. Installs diffusion Q6_K + matching Qwen3 text encoder.",
+            description="VRAM: ~10–12GB+. Higher quality.",
             runner=_run_zimage_gguf6,
         ),
         OptionalInstall(
             key="zimage_gguf8",
             title="Z-Image Turbo GGUF (Q8_0)",
-            description="VRAM: ~12–16GB+. Best quality / largest. Installs diffusion Q8_0 + matching Qwen3 text encoder.",
+            description="VRAM: ~12–16GB+ for 1080p. Best quality / largest. almost same like fp16 but a little faster",
             runner=_run_zimage_gguf8,
         ),
-
-
         OptionalInstall(
-            key="ace",
-            title="Ace step Music Creation",
-            description="VRAM: 6GB+ recommended for speed (runs on any machine). Disk: ~6GiB. Hit-or-miss results—batch a bunch and keep the best.",
-            runner=_run_ace,
+            key="ace15",
+            title="Ace Step 1.5 Music Creation",
+            description=(
+                "Downloads and installs the Ace Step 1.5 repo with the turbo model. "
+                "All other models can be used and will be downloaded at first use."
+            ),
+            runner=_run_ace15,
         ),
         OptionalInstall(
             key="gfpgan",
@@ -263,16 +663,58 @@ def _default_installs() -> List[OptionalInstall]:
             description="VRAM: optional (CPU works). Download <400MB; env uses ~5GiB disk.",
             runner=_run_gfpgan,
         ),
+        OptionalInstall(
+            key="seedvr2_env",
+            title="SeedVR2 (GGUF) environment install",
+            description="Installs the SeedVR2 GGUF environment + dependencies. Creates: environments/.seedvr2/",
+            runner=_run_seedvr2_env,
+        ),
+        OptionalInstall(
+            key="seedvr2_gguf_q3",
+            title="SeedVR2 3B GGUF (Q3_K_M)",
+            description="Lowest VRAM / smallest. If the env is missing, it will be installed first.",
+            runner=_run_seedvr2_q3,
+        ),
+        OptionalInstall(
+            key="seedvr2_gguf_q4",
+            title="SeedVR2 3B GGUF (Q4_K_M)",
+            description="Balanced size/quality. Recommended starting point. If the env is missing, it will be installed first.",
+            runner=_run_seedvr2_q4,
+        ),
+        OptionalInstall(
+            key="seedvr2_gguf_q5",
+            title="SeedVR2 3B GGUF (Q5_K_M)",
+            description="Higher quality / larger. If the env is missing, it will be installed first.",
+            runner=_run_seedvr2_q5,
+        ),
+        OptionalInstall(
+            key="seedvr2_gguf_q6",
+            title="SeedVR2 3B GGUF (Q6_K)",
+            description="High quality / large. If the env is missing, it will be installed first.",
+            runner=_run_seedvr2_q6,
+        ),
+        OptionalInstall(
+            key="seedvr2_gguf_q8",
+            title="SeedVR2 3B GGUF (Q8_0)",
+            description="Best quality / largest GGUF. If the env is missing, it will be installed first.",
+            runner=_run_seedvr2_q8,
+        ),
+        OptionalInstall(
+            key="whisper",
+            title="Whisper (voice to text / subtitles / transcript)",
+            description="Offline speech-to-text with Faster-Whisper. Runs on any PC. Installs environment + downloads the default model (~1.7 GB).",
+            runner=_run_whisper,
+        ),
                 OptionalInstall(
             key="bgrem_inpaint",
             title="Background remover and inpainter",
-            description="VRAM: 4–6GB recommended. Downloads 2 background removers + an SD1.5 inpaint base model (~5GB disk).",
+            description="VRAM: 6–8GB recommended. Downloads sdxl Juggernaut inpaint model (~6.5GB disk).",
             runner=_run_background_remover_inpainter,
         ),
 OptionalInstall(
             key="sdxljugg",
             title="Juggernaut XL V9. Model for SDXL Text to image",
-            description="VRAM: 6–12GB. Disk: ~6.5GB. SDXL model for txt2img. find more (CyberRealisticXL, DreamshaperXL,EpicRealismXL,...) at https://civitai.com/",
+            description="VRAM: 6–12GB. Disk: ~6.5GB. SDXL model for txt2img. find more (CyberRealisticXL, DreamshaperXL, EpicRealismXL,...) at https://civitai.com/",
             runner=_run_sdxl_juggernaut,
         ),
     ]
@@ -284,11 +726,16 @@ OptionalInstall(
 # These folders are safe to delete when re-installing an optional component:
 # they contain only the Python environment, not the downloaded model weights.
 _ENV_DIR_BY_KEY = {
-    "ace": Path("presets") / "extra_env" / ".ace_env",
+    "qwen3tts": Path("environments") / ".qwen3tts",
+    "whisper": Path("environments") / ".whisper",
+    "ace15": Path("environments") / ".ace_15",
     "hunyuan15": Path(".hunyuan15_env"),
+    "qwen2512": Path(".qwen2512") / "venv",
     "gfpgan": Path("models") / "gfpgan" / ".GFPGAN",
+    "seedvr2_env": Path("environments") / ".seedvr2",
     "wan22": Path(".wan_venv"),
     "zimage": Path(".zimage_env"),
+    "sdxl_inpaint_env": Path(".sdxl_inpaint"),
     # Not on the UI list yet, but reserved for future use.
     "comfui": Path(".comfui_env"),
 }
@@ -386,6 +833,66 @@ class _ToastWidget(QtWidgets.QFrame):
 
 
 
+
+class _CollapsibleSection(QtWidgets.QWidget):
+    """Simple collapsible container for grouping optional installs."""
+
+    def __init__(self, title: str, parent: Optional[QtWidgets.QWidget] = None, *, start_collapsed: bool = False) -> None:
+        super().__init__(parent)
+
+        self._btn = QtWidgets.QToolButton()
+        self._btn.setText(title)
+        self._btn.setCheckable(True)
+        self._btn.setChecked(not start_collapsed)
+        self._btn.setToolButtonStyle(QtCore.Qt.ToolButtonTextBesideIcon)
+        self._btn.setArrowType(QtCore.Qt.DownArrow if (not start_collapsed) else QtCore.Qt.RightArrow)
+        self._btn.clicked.connect(self._on_toggled)
+
+        f = self._btn.font()
+        f.setBold(True)
+        self._btn.setFont(f)
+
+        self._content = QtWidgets.QWidget()
+        self._content_lay = QtWidgets.QVBoxLayout(self._content)
+        self._content_lay.setContentsMargins(12, 6, 0, 0)
+        self._content_lay.setSpacing(10)
+
+        outer = QtWidgets.QVBoxLayout(self)
+        outer.setContentsMargins(0, 0, 0, 0)
+        outer.setSpacing(6)
+        outer.addWidget(self._btn)
+        outer.addWidget(self._content)
+
+        self._content.setVisible(not start_collapsed)
+
+        # Subtle divider + padding
+        self.setObjectName("CollapsibleSection")
+        self.setStyleSheet("""
+        QWidget#CollapsibleSection {
+            border: 1px solid rgba(255,255,255,0.06);
+            border-radius: 12px;
+            padding: 10px;
+        }
+        QToolButton {
+            border: none;
+            padding: 6px 6px;
+        }
+        QToolButton:hover {
+            background: rgba(255,255,255,0.06);
+            border-radius: 8px;
+        }
+        """)
+
+    def layout_content(self) -> QtWidgets.QVBoxLayout:
+        return self._content_lay
+
+    def _on_toggled(self) -> None:
+        expanded = self._btn.isChecked()
+        self._btn.setArrowType(QtCore.Qt.DownArrow if expanded else QtCore.Qt.RightArrow)
+        self._content.setVisible(expanded)
+
+
+
 class OptionalInstallsDialog(QtWidgets.QDialog):
     """
     Standalone dialog that runs selected optional installs sequentially and shows live logs.
@@ -468,31 +975,154 @@ class OptionalInstallsDialog(QtWidgets.QDialog):
             QPushButton:pressed { background: rgba(255, 60, 60, 0.75); }
         """)
 
-        # Options list
+        
+        # Options list (grouped)
         self.rows: List[_OptionRow] = []
         opts_box = QtWidgets.QWidget()
         opts_lay = QtWidgets.QVBoxLayout(opts_box)
         opts_lay.setContentsMargins(0, 0, 0, 0)
         opts_lay.setSpacing(10)
 
-        by_key = {i.key: i for i in self.installs}
         row_by_key: Dict[str, _OptionRow] = {}
 
-        for opt in self.installs:
-            # Indent *all* Z-image model download options consistently (avoid alternating rows).
+        def _mk_section_label(txt: str) -> QtWidgets.QLabel:
+            lbl = QtWidgets.QLabel(txt)
+            f = lbl.font()
+            f.setBold(True)
+            f.setPointSize(f.pointSize() + 1)
+            lbl.setFont(f)
+            lbl.setStyleSheet("padding: 6px 2px;")
+            return lbl
+
+        def _add_opt(opt: OptionalInstall, parent_lay: QtWidgets.QVBoxLayout) -> None:
+            # Indent model download options consistently.
             is_zimage_extra = opt.key.startswith("zimage_") and opt.key != "zimage"
-            row = _OptionRow(opt, indent=(26 if is_zimage_extra else 0))
-            if opt.key.startswith("zimage_") and opt.key != "zimage":
+            is_qwen2512_extra = opt.key.startswith("qwen2512_") and opt.key != "qwen2512"
+            is_qwen2511_extra = opt.key.startswith("qwen2511_")
+            is_qwen_extra = is_qwen2512_extra or is_qwen2511_extra
+            is_qwen3tts_extra = opt.key.startswith("qwen3tts_") and opt.key != "qwen3tts"
+            is_seedvr2_extra = opt.key.startswith("seedvr2_gguf_")
+
+            row = _OptionRow(
+                opt,
+                indent=(26 if (is_zimage_extra or is_qwen_extra or is_qwen3tts_extra or is_seedvr2_extra) else 0),
+            )
+
+            if is_zimage_extra:
                 row.toggled.connect(lambda checked, k=opt.key: self._on_zimage_model_toggled(k, checked))
+            if is_qwen2512_extra:
+                row.toggled.connect(lambda checked, k=opt.key: self._on_qwen2512_model_toggled(k, checked))
+            if is_qwen2511_extra:
+                row.toggled.connect(lambda checked, k=opt.key: self._on_qwen2511_model_toggled(k, checked))
+            if is_qwen3tts_extra:
+                row.toggled.connect(lambda checked, k=opt.key: self._on_qwen3tts_model_toggled(k, checked))
+
+            if is_seedvr2_extra:
+                row.toggled.connect(lambda checked, k=opt.key: self._on_seedvr2_model_toggled(k, checked))
+
             self.rows.append(row)
             row_by_key[opt.key] = row
-            opts_lay.addWidget(row)
+            parent_lay.addWidget(row)
+
+        def _add_group_label(txt: str, parent_lay: QtWidgets.QVBoxLayout) -> None:
+            lbl = QtWidgets.QLabel(txt)
+            f = lbl.font()
+            f.setBold(True)
+            lbl.setFont(f)
+            lbl.setStyleSheet("color: rgba(255,255,255,0.88); padding: 4px 2px;")
+            parent_lay.addWidget(lbl)
+
+        # Build a quick lookup for installs by key
+        by_key = {i.key: i for i in self.installs}
+
+        # ---- Video models
+        opts_lay.addWidget(_mk_section_label("Video models"))
+
+        for k in ("wan22", "hunyuan15"):
+            opt = by_key.get(k)
+            if opt:
+                _add_opt(opt, opts_lay)
+
+        # ---- Image models
+        opts_lay.addWidget(_mk_section_label("Image models"))
+
+        # Qwen group (collapsible)
+        qwen_sec = _CollapsibleSection("Qwen models", start_collapsed=True)
+        qwen_lay = qwen_sec.layout_content()
+
+        # Qwen Edit 2511
+        _add_group_label("Qwen Edit 2511", qwen_lay)
+        for k in ("qwen2511_q3", "qwen2511_q4km", "qwen2511_q5km", "qwen2511_q6k", "qwen2511_q8"):
+            opt = by_key.get(k)
+            if opt:
+                _add_opt(opt, qwen_lay)
+
+        # Qwen Image 2512
+        _add_group_label("Qwen Image 2512", qwen_lay)
+        for k in ("qwen2512", "qwen2512_q2", "qwen2512_q3", "qwen2512_q4", "qwen2512_q5", "qwen2512_q6", "qwen2512_q8"):
+            opt = by_key.get(k)
+            if opt:
+                _add_opt(opt, qwen_lay)
+
+        opts_lay.addWidget(qwen_sec)
+
+        # Z-Image group (collapsible)
+        zimg_sec = _CollapsibleSection("Z-Image models", start_collapsed=True)
+        zimg_lay = zimg_sec.layout_content()
+
+        _add_group_label("Z-Image Turbo (full fp16)", zimg_lay)
+        for k in ("zimage", "zimage_fp16"):
+            opt = by_key.get(k)
+            if opt:
+                _add_opt(opt, zimg_lay)
+
+        _add_group_label("Z-Image Turbo GGUF (low VRAM)", zimg_lay)
+        for k in ("zimage_gguf4", "zimage_gguf5", "zimage_gguf6", "zimage_gguf8"):
+            opt = by_key.get(k)
+            if opt:
+                _add_opt(opt, zimg_lay)
+
+        opts_lay.addWidget(zimg_sec)
+
+        # Other image-related installs
+        # Keep SeedVR2 close to GFPGAN (requested: "bottom" grouping).
+        for k in (
+            "bgrem_inpaint",
+            "sdxljugg",
+            "gfpgan",
+            "seedvr2_env",
+            "seedvr2_gguf_q3",
+            "seedvr2_gguf_q4",
+            "seedvr2_gguf_q5",
+            "seedvr2_gguf_q6",
+            "seedvr2_gguf_q8",
+        ):
+            opt = by_key.get(k)
+            if opt:
+                _add_opt(opt, opts_lay)
+
+        # ---- Audio models
+        opts_lay.addWidget(_mk_section_label("Audio models"))
+
+        for k in ("qwen3tts", "qwen3tts_models", "qwen3tts_flashattn", "ace15"):
+            opt = by_key.get(k)
+            if opt:
+                _add_opt(opt, opts_lay)
+
+        # ---- Utilities
+        opts_lay.addWidget(_mk_section_label("Utilities"))
+
+        for k in ("whisper",):
+            opt = by_key.get(k)
+            if opt:
+                _add_opt(opt, opts_lay)
 
         self._row_by_key = row_by_key
 
         opts_lay.addStretch(1)
 
         scroll = QtWidgets.QScrollArea()
+
         scroll.setWidgetResizable(True)
         scroll.setFrameShape(QtWidgets.QFrame.NoFrame)
         scroll.setWidget(opts_box)
@@ -523,6 +1153,11 @@ class OptionalInstallsDialog(QtWidgets.QDialog):
         self.save_log_chk.setToolTip("Write the full optional-installs log to a file in <root>/logs/.")
 
         self.open_logs_btn = QtWidgets.QPushButton("Open logs folder")
+
+        self.licenses_btn = QtWidgets.QPushButton("Third-party licenses")
+        self.licenses_btn.setToolTip("Open the third-party licenses list (presets/info/3rd_party_licenses.json)")
+        self.licenses_btn.clicked.connect(self._open_licenses_viewer)
+
         self.open_logs_btn.setToolTip("Open the FrameVision logs folder.")
         self.open_logs_btn.clicked.connect(self._open_logs_folder)
 
@@ -533,6 +1168,7 @@ class OptionalInstallsDialog(QtWidgets.QDialog):
         log_tools.addWidget(self.save_log_chk)
         log_tools.addStretch(1)
         log_tools.addWidget(self.open_logs_btn)
+        log_tools.addWidget(self.licenses_btn)
 
         # Buttons
         self.start_btn = QtWidgets.QPushButton("Start optional installs")
@@ -635,6 +1271,15 @@ class OptionalInstallsDialog(QtWidgets.QDialog):
             # If log file fails, continue without it.
             self._log_fp = None
             self._log_file_path = None
+
+    def _open_licenses_viewer(self) -> None:
+        """Open the third-party licenses viewer (JSON-backed)."""
+        try:
+            from helpers.licenses_viewer import LicensesViewerDialog
+            dlg = LicensesViewerDialog(parent=self, root_dir=self.root_dir)
+            dlg.exec()
+        except Exception as e:
+            QtWidgets.QMessageBox.warning(self, "Third-party licenses", f"Failed to open licenses viewer:\n{e}")
 
     def _close_log_file(self) -> None:
         try:
@@ -822,7 +1467,8 @@ class OptionalInstallsDialog(QtWidgets.QDialog):
         if not checked:
             return
 
-        # Make GGUF quants mutually exclusive to avoid accidentally downloading 2–4 large models.
+
+        # Make Turbo GGUF quants mutually exclusive to avoid accidentally downloading 2–4 large models.
         if key.startswith("zimage_gguf"):
             try:
                 for k, row in getattr(self, "_row_by_key", {}).items():
@@ -831,10 +1477,37 @@ class OptionalInstallsDialog(QtWidgets.QDialog):
             except Exception:
                 pass
 
-        # Prereqs for the model downloader.
+        # Prereqs for the Turbo model downloader.
         script = self.root_dir / "presets" / "extra_env" / "zimage_gguf_install.py"
         if not script.exists():
-            self._toast("Missing installer: presets/extra_env/zimage_gguf_install.py")
+            self._toast(
+                "Z-Image downloader missing: presets/extra_env/zimage_gguf_install.py. "
+                "Update your FrameVision install or reinstall optional installs scripts."
+            )
+            return
+
+
+    def _on_seedvr2_model_toggled(self, key: str, checked: bool) -> None:
+        """Keep SeedVR2 GGUF selections sane and warn when prerequisites are missing."""
+        if not checked:
+            return
+
+        # Make GGUF quants mutually exclusive (big downloads).
+        if key.startswith("seedvr2_gguf_"):
+            try:
+                for k, row in getattr(self, "_row_by_key", {}).items():
+                    if k.startswith("seedvr2_gguf_") and k != key and row.is_checked():
+                        row.set_checked(False)
+            except Exception:
+                pass
+
+        # Prereqs for the installer.
+        script = self.root_dir / "presets" / "extra_env" / "seedvr2_gguf_installer.py"
+        if not script.exists():
+            self._toast(
+                "SeedVR2 installer missing: presets/extra_env/seedvr2_gguf_installer.py. "
+                "Update your FrameVision install or reinstall optional installs scripts."
+            )
             return
 
         py = _venv_python(self.root_dir)
@@ -842,11 +1515,89 @@ class OptionalInstallsDialog(QtWidgets.QDialog):
             self._toast("Python .venv not found. Run the main installer first so FrameVision creates .venv.")
             return
 
-        # Important: GGUF + safetensors downloads run inside FrameVision's .venv and do NOT require rebuilding the Z-image env.
-        if key.startswith("zimage_gguf"):
-            self._toast("GGUF model will download when you press Start (no env reinstall needed).")
-        elif key == "zimage_fp16":
-            self._toast("Full FP16 model will download when you press Start (no env reinstall needed).")
+        env_dir = (self.root_dir / "environments" / ".seedvr2").resolve()
+        if not env_dir.exists():
+            self._toast("SeedVR2 environment not found — it will be installed first.")
+        else:
+            self._toast("SeedVR2 GGUF model will download when you press Start.")
+
+    def _on_qwen2512_model_toggled(self, key: str, checked: bool) -> None:
+        """Warn when Qwen2512 model prerequisites are missing."""
+        if not checked:
+            return
+
+        # Prereqs for the downloader.
+        script = _find_qwen2512_downloader_script(self.root_dir)
+        if script is None:
+            self._toast("Missing downloader: qwen2512_download.py")
+            return
+
+        py = _venv_python(self.root_dir)
+        if py is None or (not py.exists()):
+            self._toast("Python .venv not found. Run the main installer first so FrameVision creates .venv.")
+            return
+
+        # Info toast
+        self._toast("Qwen2512 GGUF model will download when you press Start (env install only needed once).")
+
+
+
+
+
+    def _on_qwen2511_model_toggled(self, key: str, checked: bool) -> None:
+        """Warn when Qwen2511 model prerequisites are missing."""
+        if not checked:
+            return
+
+        script = _find_qwen2511_downloader_script(self.root_dir)
+        if script is None:
+            self._toast("Missing downloader: qwen2511_download.py")
+            return
+
+        py = _venv_python(self.root_dir)
+        if py is None or (not py.exists()):
+            self._toast("Python .venv not found. Run the main installer first so FrameVision creates .venv.")
+            return
+
+        # Qwen2511 re-uses the Qwen2512 environment (stable-diffusion.cpp setup).
+        env_dir = (self.root_dir / ".qwen2512").resolve()
+        if not env_dir.exists():
+            self._toast("Qwen2512 environment not found — it will be installed first.")
+
+        self._toast("Qwen2511 GGUF model will download when you press Start (env install only needed once).")
+
+
+    def _on_qwen3tts_model_toggled(self, key: str, checked: bool) -> None:
+        """Warn when Qwen3-TTS model downloader prerequisites are missing."""
+        if not checked:
+            return
+
+        # FlashAttention add-on (optional)
+        if key == "qwen3tts_flashattn":
+            bat = self.root_dir / "presets" / "extra_env" / "install_flashattn_optional.bat"
+            if not bat.exists():
+                self._toast("Missing installer: install_flashattn_optional.bat")
+                return
+
+            env_dir = (self.root_dir / "environments" / ".qwen3tts").resolve()
+            if not env_dir.exists():
+                self._toast("Qwen 3 TTS environment not found — it will be installed first.")
+
+            self._toast("FlashAttention will install when you press Start (env install only needed once).")
+            return
+
+
+        bat = self.root_dir / "presets" / "extra_env" / "download_qwentts_models.bat"
+        if not bat.exists():
+            self._toast("Missing downloader: download_qwentts_models.bat")
+            return
+
+        # Qwen3-TTS uses its own environment folder.
+        env_dir = (self.root_dir / "environments" / ".qwen3tts").resolve()
+        if not env_dir.exists():
+            self._toast("Qwen 3 TTS environment not found — it will be installed first.")
+
+        self._toast("Qwen 3 TTS models will download when you press Start (env install only needed once).")
 
 
     def selected_installs(self) -> List[OptionalInstall]:
@@ -859,8 +1610,85 @@ class OptionalInstallsDialog(QtWidgets.QDialog):
             if opt.key in checked_set:
                 ordered.append(opt)
 
-        # Z-image is a bit fragile for first-time users: if someone selects a model download
-        # (GGUF / FP16) but does NOT have the Z-image runtime env yet, install the env first.
+        # Qwen2512: if user only selects a GGUF quant (without the env toggle),
+        # silently add the env installer when missing.
+        self._auto_added_qwen2512_env = False
+        try:
+            wants_qwen_models = any(k.startswith("qwen2512_") and k != "qwen2512" for k in checked_set)
+            if wants_qwen_models and ("qwen2512" not in checked_set):
+                env_dir = (self.root_dir / ".qwen2512" / "venv").resolve()
+                if not env_dir.exists():
+                    # Insert env install right before the first selected qwen model (keeps overall order).
+                    first_idx = None
+                    for i, opt in enumerate(ordered):
+                        if opt.key.startswith("qwen2512_") and opt.key != "qwen2512":
+                            first_idx = i
+                            break
+                    for opt in self.installs:
+                        if opt.key == "qwen2512":
+                            if first_idx is None:
+                                ordered.insert(0, opt)
+                            else:
+                                ordered.insert(first_idx, opt)
+                            self._auto_added_qwen2512_env = True
+                            break
+        except Exception:
+            pass
+
+
+        # Qwen2511 Edit:
+        # If user selects a Qwen2511 GGUF model, ensure the shared Qwen2512 environment exists first.
+        # (Requested check: <root>/.qwen2512/)
+        self._auto_added_qwen2511_env = False
+        try:
+            wants_qwen2511_models = any(k.startswith("qwen2511_") for k in checked_set)
+            if wants_qwen2511_models:
+                env_dir = (self.root_dir / ".qwen2512").resolve()
+                if not env_dir.exists():
+                    # Insert the existing Qwen2512 env install right before the first selected qwen2511 model.
+                    first_idx = None
+                    for i, opt in enumerate(ordered):
+                        if opt.key.startswith("qwen2511_"):
+                            first_idx = i
+                            break
+                    for opt in self.installs:
+                        if opt.key == "qwen2512":
+                            if first_idx is None:
+                                ordered.insert(0, opt)
+                            else:
+                                ordered.insert(first_idx, opt)
+                            self._auto_added_qwen2511_env = True
+                            break
+        except Exception:
+            pass
+
+
+        # Qwen3-TTS:
+        # If user selects the models-only downloader, ensure the Qwen3-TTS environment exists first.
+        self._auto_added_qwen3tts_env = False
+        try:
+            wants_qwen3tts_extras = ("qwen3tts_models" in checked_set) or ("qwen3tts_flashattn" in checked_set)
+            if wants_qwen3tts_extras and ("qwen3tts" not in checked_set):
+                env_dir = (self.root_dir / "environments" / ".qwen3tts").resolve()
+                if not env_dir.exists():
+                    first_idx = None
+                    for i, opt in enumerate(ordered):
+                        if opt.key in ("qwen3tts_models", "qwen3tts_flashattn"):
+                            first_idx = i
+                            break
+                    for opt in self.installs:
+                        if opt.key == "qwen3tts":
+                            if first_idx is None:
+                                ordered.insert(0, opt)
+                            else:
+                                ordered.insert(first_idx, opt)
+                            self._auto_added_qwen3tts_env = True
+                            break
+        except Exception:
+            pass
+
+
+        #  install the env first.
         # This is silent: we only auto-add the env step when it is missing, so no "existing env"
         # prompt will appear.
         self._auto_added_zimage_env = False
@@ -875,6 +1703,63 @@ class OptionalInstallsDialog(QtWidgets.QDialog):
                             ordered.insert(0, opt)
                             self._auto_added_zimage_env = True
                             break
+        except Exception:
+            pass
+
+
+        # SeedVR2 GGUF:
+        # If user selects a SeedVR2 GGUF quant without selecting the env toggle,
+        # silently add the env install when missing.
+        # (Requested behavior: if env isn't there, always install it even when only GGUF is selected.)
+        self._auto_added_seedvr2_env = False
+        try:
+            wants_seedvr2_models = any(k.startswith("seedvr2_gguf_") for k in checked_set)
+            if wants_seedvr2_models and ("seedvr2_env" not in checked_set):
+                env_dir = (self.root_dir / "environments" / ".seedvr2").resolve()
+                if not env_dir.exists():
+                    # Insert env install right before the first selected SeedVR2 model.
+                    first_idx = None
+                    for i, opt in enumerate(ordered):
+                        if opt.key.startswith("seedvr2_gguf_"):
+                            first_idx = i
+                            break
+                    for opt in self.installs:
+                        if opt.key == "seedvr2_env":
+                            if first_idx is None:
+                                ordered.insert(0, opt)
+                            else:
+                                ordered.insert(first_idx, opt)
+                            self._auto_added_seedvr2_env = True
+                            break
+        except Exception:
+            pass
+
+
+        # SDXL inpaint env:
+        # If the user selects the Background remover + inpainter optional install,
+        # run the SDXL inpaint environment installer first (so dependencies exist),
+        # and use the same env "keep / delete & reinstall" strategy as other installs.
+        self._auto_added_sdxl_inpaint_env = False
+        try:
+            if "bgrem_inpaint" in checked_set:
+                if not any(o.key == "sdxl_inpaint_env" for o in ordered):
+                    env_opt = OptionalInstall(
+                        key="sdxl_inpaint_env",
+                        title="SDXL Inpaint environment (required)",
+                        description="Creates: .sdxl_inpaint/ (python env + dependencies for SDXL inpaint).",
+                        runner=_run_sdxl_inpaint_env,
+                    )
+                    # Insert right before the bgrem_inpaint step (keeps the run order obvious).
+                    first_idx = None
+                    for i, opt in enumerate(ordered):
+                        if opt.key == "bgrem_inpaint":
+                            first_idx = i
+                            break
+                    if first_idx is None:
+                        ordered.insert(0, env_opt)
+                    else:
+                        ordered.insert(first_idx, env_opt)
+                    self._auto_added_sdxl_inpaint_env = True
         except Exception:
             pass
 
@@ -908,6 +1793,18 @@ class OptionalInstallsDialog(QtWidgets.QDialog):
         self._append_line("=== Starting optional installs ===")
         if getattr(self, "_auto_added_zimage_env", False):
             self._append_line("[INFO] Z-image env not found — installing it first so Z-image can run after model download.")
+        if getattr(self, "_auto_added_qwen2512_env", False):
+            self._append_line("[INFO] Qwen2512 env not found — installing it first because you selected a GGUF model.")
+        if getattr(self, "_auto_added_qwen2511_env", False):
+            self._append_line("[INFO] Qwen2512 env not found — installing it first because you selected a Qwen2511 edit model.")
+        if getattr(self, "_auto_added_sdxl_inpaint_env", False):
+            self._append_line("[INFO] Background remover + inpainter selected — running SDXL inpaint env install first.")
+
+        if getattr(self, "_auto_added_qwen3tts_env", False):
+            self._append_line("[INFO] Qwen3-TTS env not found — installing it first because you selected extra model downloads.")
+
+        if getattr(self, "_auto_added_seedvr2_env", False):
+            self._append_line("[INFO] SeedVR2 env not found — installing it first because you selected a GGUF quant.")
 
         self.progress.setRange(0, len(selected))
         self.progress.setValue(0)
@@ -969,6 +1866,38 @@ class OptionalInstallsDialog(QtWidgets.QDialog):
             self._running = None
             self._run_next()
             return
+
+        # Same idea for SeedVR2 env: "keep" means do NOT rerun pip installs.
+        if decision == "keep" and self._running.key == "seedvr2_env":
+            self._append_line("[INFO] Skipping SeedVR2 environment install (keeping existing env).")
+            self._toast("SeedVR2 env kept. Continuing…")
+            self.progress.setValue(idx_done + 1)
+            self._running = None
+            self._run_next()
+            return
+
+        # Special case:
+        # If the user chooses to keep an existing SDXL inpaint env, do NOT re-run sdxl_inpaint_install.bat.
+        # Keeping means we skip env reinstall and proceed to model download / next steps.
+        if decision == "keep" and self._running.key == "sdxl_inpaint_env":
+            self._append_line("[INFO] Skipping SDXL inpaint environment install (keeping existing env).")
+            self._toast("SDXL inpaint env kept. Continuing…")
+            self.progress.setValue(idx_done + 1)
+            self._running = None
+            self._run_next()
+            return
+
+        # Special case:
+        # Whisper installer always recreates the env; if the user chooses to keep an existing env,
+        # we should skip running whisper_install.bat to avoid deleting it again.
+        if decision == "keep" and self._running.key == "whisper":
+            self._append_line("[INFO] Skipping Whisper install (keeping existing env).")
+            self._toast("Whisper env kept. Skipping reinstall.")
+            self.progress.setValue(idx_done + 1)
+            self._running = None
+            self._run_next()
+            return
+
 
         program, args, cwd = cmd
 

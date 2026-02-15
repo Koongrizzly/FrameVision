@@ -1,0 +1,5 @@
+PySide6
+qwen-tts
+soundfile
+huggingface_hub
+static-sox

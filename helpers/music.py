@@ -3257,10 +3257,13 @@ class MusicRuntime(QObject):
         # load state
         st = _load_state()
         try:
+            # Remember visuals on/off across restarts
             vis_on = bool(st.get('visuals_on', False))
-            # OVERRIDE: always start OFF on app launch (analysis still runs when playback starts)
-            self.overlay.btn_visuals.setChecked(False)
-            self.visual.set_enabled(False)
+            self.overlay.btn_visuals.setChecked(bool(vis_on))
+            try:
+                self.visual.set_enabled(bool(vis_on))
+            except Exception:
+                pass
             last_mode = st.get('visual_mode_name')
             if last_mode:
                 # find index

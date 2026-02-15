@@ -1,24 +1,25 @@
 {
-  "models_folder": "C:\\FrameVision-1.0.6\\models",
-  "last_open_dir": "C:\\FrameVision-main\\output\\videoclips",
+  "models_folder": "C:\\FrameVision-main\\models",
+  "last_open_dir": "E:\\Music",
   "caption_model": "Model 1",
   "auto_on_pause": true,
   "models_status": {},
   "show_toasts": true,
   "theme": "Graphite Dusk",
   "session_restore": {
-    "last_file": "C:\\FrameVision-main\\output\\videoclips\\track_1651977615_hip_hop_trap_clip_01120317.mp4",
+    "last_file": "C:\\Music\\Dedication to the DJ - Stones & Bones (Udamusik Remix).mp3",
     "last_position_ms": 0,
-    "active_tab": 7,
+    "active_tab": 6,
     "win_geometry_b64": "AdnQywADAAAAAAABAAAAAAAABP4AAALOAAAAAQAAABwAAAT+AAACzgAAAAAAAAAABQAAAAABAAAAHAAABP4AAALO",
-    "splitter_state_b64": "AAAA/wAAAAEAAAAC//////////8AAAAACAEAAAACAA==",
+    "splitter_state_b64": "AAAA/wAAAAEAAAACAAAA/gAAAHMB/////wEAAAACAA==",
     "restart_from_settings": true,
     "is_maximized": true,
     "is_fullscreen": false,
-    "active_tab_name": "\ud83e\uddf1 Tools"
+    "active_tab_name": "\ufe0f\u2699\ufe0f Settings"
   },
   "queue_play_last": true,
   "logo_cycle_index": 0,
   "diag_probe_enabled": false,
-  "temp_units": "C"
+  "temp_units": "C",
+  "queue_auto_cleanup": true
 }

@@ -21,6 +21,30 @@ from PySide6.QtWidgets import QScrollArea
 from PySide6.QtGui import QImage, QDesktopServices
 from helpers.mediainfo import refresh_info_now
 
+# Optional installs hide state (managed by helpers/remove_hide.py)
+try:
+    from helpers.remove_hide import get_state_path as _rh_get_state_path, load_state as _rh_load_state  # type: ignore
+except Exception:
+    _rh_get_state_path = None
+    _rh_load_state = None
+
+
+def _optional_hidden_ids() -> set[str]:
+    """Return the set of hidden optional-install ids.
+
+    This uses the JSON state created by helpers/remove_hide.py.
+    """
+    try:
+        if _rh_get_state_path is None or _rh_load_state is None:
+            return set()
+        st = _rh_load_state(_rh_get_state_path())
+        ids = st.get("hidden_ids") or []
+        if isinstance(ids, list):
+            return {str(x) for x in ids}
+        return set()
+    except Exception:
+        return set()
+
 SCRIPT_DIR = Path(__file__).resolve().parent
 APP_ROOT = SCRIPT_DIR.parent
 SETTINGS_FILE = APP_ROOT / "presets" / "setsave" / "wan22.json"
@@ -171,8 +195,23 @@ class Wan22Pane(QWidget):
         # --- Engine selector -----------------------------------------------------
         engine_row = QHBoxLayout()
         self.cmb_engine = QComboBox()
-        self.cmb_engine.addItem("WAN 2.2", "wan22")
-        self.cmb_engine.addItem("HunyuanVideo 1.5", "hunyuan15")
+        # Hide optional engines by user choice (remove_hide.py)
+        _hidden = _optional_hidden_ids()
+        self._hide_wan22 = ("wan22" in _hidden)
+        self._hide_hunyuan15 = ("hunyuan15" in _hidden)
+        self._all_engines_hidden = bool(self._hide_wan22 and self._hide_hunyuan15)
+
+        if not self._hide_wan22:
+            self.cmb_engine.addItem("WAN 2.2", "wan22")
+        if not self._hide_hunyuan15:
+            self.cmb_engine.addItem("HunyuanVideo 1.5", "hunyuan15")
+        if self.cmb_engine.count() == 0:
+            # Keep UI stable even if both engines are hidden.
+            self.cmb_engine.addItem("All engines hidden by user", "none")
+            try:
+                self.cmb_engine.setEnabled(False)
+            except Exception:
+                pass
         engine_row.addWidget(QLabel("Engine:"))
         engine_row.addWidget(self.cmb_engine)
         engine_row.addStretch(1)
@@ -256,7 +295,25 @@ class Wan22Pane(QWidget):
         self.ed_image = QLineEdit()
         self.ed_image.setToolTip("Path to the starting image for image-to-video generation")
         btn_img = QPushButton("Browse")
+        self.btn_img_clear = QPushButton("Clear")
+        try:
+            self.btn_img_clear.setToolTip("Clear the currently selected start image so you can switch back to text-only runs.")
+        except Exception:
+            pass
 
+        def _clear_image():
+            try:
+                self.ed_image.clear()
+            except Exception:
+                try:
+                    self.ed_image.setText("")
+                except Exception:
+                    pass
+
+        try:
+            self.btn_img_clear.clicked.connect(_clear_image)
+        except Exception:
+            pass
         def _pick_image():
             fn, _ = QFileDialog.getOpenFileName(
                 self,
@@ -266,10 +323,21 @@ class Wan22Pane(QWidget):
             )
             if fn:
                 self.ed_image.setText(fn)
-
         btn_img.clicked.connect(_pick_image)
+        try:
+            self.ed_image.textChanged.connect(
+                lambda _t: self.btn_img_clear.setEnabled(bool(self.ed_image.text().strip()))
+            )
+        except Exception:
+            pass
+        try:
+            self.btn_img_clear.setEnabled(bool(self.ed_image.text().strip()))
+        except Exception:
+            pass
+
         img_row.addWidget(self.ed_image)
         img_row.addWidget(btn_img)
+        img_row.addWidget(self.btn_img_clear)
         img_widget = QWidget()
         img_widget.setLayout(img_row)
         form.addRow("Start image:", img_widget)
@@ -306,13 +374,13 @@ class Wan22Pane(QWidget):
         self.cmb_size = QComboBox()
         self.cmb_size.addItems([
 
-            "640*384",
-            "736*432",
-            "832*480",
-            "480*832",
-            "896*512",
+       #     "640*384",
+       #     "736*432",
+       #     "832*480, not working well",
+       #     "480*832, not working well",
+            "896*512, gives many artifacts",
             "512*896",
-            "960*544",
+            "960*544, still not good quality",
             "1024*704",            
             "1280*544", 
             "1280*704",    # Landscape 704p (primary)
@@ -654,24 +722,23 @@ class Wan22Pane(QWidget):
         wan_layout.addWidget(self.log, stretch=1)
 
         # --- Buttons ------------------------------------------------------------
-        btn_row = QHBoxLayout()
-
-        # Queue toggle: run via worker queue vs direct QProcess
+        # Controls that should scroll with settings (NOT in the sticky bottom bar)
         self.chk_use_queue = QCheckBox("Use queue")
         self.chk_use_queue.setToolTip("Tip : DISABLE queue if you want to EXTEND a video,Do not start other vram heavy jobs while queue is off")
 
-        # Use Current button: grab current frame from Media Player
+        self.btn_play_last = QPushButton("Play last")
+        self.btn_play_last.setToolTip("Open the last generated Wan2.2 video")
+
+        # Sticky bottom bar buttons
         self.btn_use_current = QPushButton("Use Current")
         self.btn_use_current.setToolTip(
             "Switch to image2video and use the current Media Player frame as the start image."
         )
 
-        # Probe button (kept for possible future use, but hidden from the layout)
         self.btn_probe = QPushButton("Probe")
         self.btn_probe.setToolTip("Check if Wan2.2 is properly installed and configured")
         self.btn_probe.setVisible(False)
 
-        # Main RUN button: more prominent + hover color
         self.btn_run = QPushButton("Generate Video")
         self.btn_run.setToolTip("Start video generation")
         self.btn_run.setObjectName("wanRunButton")
@@ -688,36 +755,37 @@ class Wan22Pane(QWidget):
             "}"
         )
 
-        # Match font size/weight of the RUN button for the rest of the row
         shared_btn_font = "font-size: 16px; font-weight: 600;"
         self.chk_use_queue.setStyleSheet(shared_btn_font)
         self.btn_use_current.setStyleSheet(shared_btn_font)
-
-        # "Play last" button: opens the most recently generated video
-        self.btn_play_last = QPushButton("Play last")
-        self.btn_play_last.setToolTip("Open the last generated Wan2.2 video")
         self.btn_play_last.setStyleSheet(shared_btn_font)
-
-        # Order: RUN button first, then Play last, then queue toggle, then Use Current
-        btn_row.addWidget(self.btn_run)
-        btn_row.addWidget(self.btn_play_last)
-        btn_row.addWidget(self.chk_use_queue)
-        btn_row.addStretch(1)
-        wan_layout.addLayout(btn_row)
-        # Second row: tool helpers (right-aligned)
-        btn_row2 = QHBoxLayout()
 
         self.btn_view_results = QPushButton("View results")
         self.btn_view_results.setToolTip("Open Media Explorer and scan this tool's output folder.")
         self.btn_view_results.setStyleSheet(shared_btn_font)
 
-        btn_row2.addStretch(1)
-        btn_row2.addWidget(self.btn_use_current)
-        btn_row2.addWidget(self.btn_view_results)
-        wan_layout.addLayout(btn_row2)
+        # Add non-sticky controls to the scroll area (below settings)
+        try:
+            _opt_row = QHBoxLayout()
+            _opt_row.addWidget(self.btn_play_last)
+            _opt_row.addWidget(self.chk_use_queue)
+            _opt_row.addStretch(1)
+            _opt_wrap = QWidget()
+            _opt_wrap.setLayout(_opt_row)
+            scroll_layout.addWidget(_opt_wrap)
+        except Exception:
+            pass
+
+        # Bottom sticky bar (all remaining buttons on ONE line)
+        btn_row = QHBoxLayout()
+        btn_row.addWidget(self.btn_run)
+        btn_row.addStretch(1)
+        btn_row.addWidget(self.btn_use_current)
+        btn_row.addWidget(self.btn_view_results)
+        wan_layout.addLayout(btn_row)
 
 
-        # --- Process handling ---------------------------------------------------
+# --- Process handling ---------------------------------------------------
         self.proc = QProcess(self)
         self.proc.setProcessChannelMode(QProcess.MergedChannels)
         self.proc.readyReadStandardOutput.connect(self._read_proc)
@@ -744,17 +812,22 @@ class Wan22Pane(QWidget):
         huny_layout.setContentsMargins(0, 0, 0, 0)
         huny_layout.setSpacing(0)
         self._hunyuan_widget = None
-        try:
-            try:
-                from helpers.hunyuan15 import Hunyuan15ToolWidget  # type: ignore
-            except Exception:
-                from hunyuan15 import Hunyuan15ToolWidget  # type: ignore
-            self._hunyuan_widget = Hunyuan15ToolWidget(parent=self._huny_page, standalone=False)
-            huny_layout.addWidget(self._hunyuan_widget)
-        except Exception:
-            lbl = QLabel("HunyuanVideo 1.5 UI not available (missing hunyuan15.py).")
+        if getattr(self, "_hide_hunyuan15", False):
+            lbl = QLabel("HunyuanVideo 1.5 is hidden by user.")
             lbl.setWordWrap(True)
             huny_layout.addWidget(lbl)
+        else:
+            try:
+                try:
+                    from helpers.hunyuan15 import Hunyuan15ToolWidget  # type: ignore
+                except Exception:
+                    from hunyuan15 import Hunyuan15ToolWidget  # type: ignore
+                self._hunyuan_widget = Hunyuan15ToolWidget(parent=self._huny_page, standalone=False)
+                huny_layout.addWidget(self._hunyuan_widget)
+            except Exception:
+                lbl = QLabel("HunyuanVideo 1.5 UI not available (missing hunyuan15.py).")
+                lbl.setWordWrap(True)
+                huny_layout.addWidget(lbl)
 
         try:
             self._engine_stack.addWidget(self._huny_page)
@@ -772,6 +845,29 @@ class Wan22Pane(QWidget):
         self.btn_play_last.clicked.connect(self._on_play_last)
         self.btn_use_current.clicked.connect(self._on_use_current)
         self.btn_view_results.clicked.connect(self._on_view_results)
+
+        # If the user hid both engines, keep this pane inert.
+        if getattr(self, "_all_engines_hidden", False):
+            try:
+                self.btn_run.setEnabled(False)
+            except Exception:
+                pass
+            try:
+                self.btn_play_last.setEnabled(False)
+            except Exception:
+                pass
+            try:
+                self.btn_use_current.setEnabled(False)
+            except Exception:
+                pass
+            try:
+                self.btn_view_results.setEnabled(False)
+            except Exception:
+                pass
+            try:
+                self.chk_use_queue.setEnabled(False)
+            except Exception:
+                pass
         
         # Queue/T5 CPU safety:
         # When running direct (Use queue unchecked), T5-on-CPU can stall on some rigs.
@@ -1518,6 +1614,24 @@ class Wan22Pane(QWidget):
         except Exception:
             key = "wan22"
 
+        # If both engines are hidden, a placeholder item with data "none" is shown.
+        if key not in ("wan22", "hunyuan15"):
+            try:
+                if getattr(self, "_engine_stack", None) is not None:
+                    self._engine_stack.setCurrentIndex(0)
+            except Exception:
+                pass
+            try:
+                self.banner.setText("All engines hidden by user")
+            except Exception:
+                pass
+            if save:
+                try:
+                    self._save_settings()
+                except Exception:
+                    pass
+            return
+
         try:
             if getattr(self, "_engine_stack", None) is not None:
                 self._engine_stack.setCurrentIndex(0 if key == "wan22" else 1)
@@ -2179,7 +2293,24 @@ class Wan22Pane(QWidget):
 
     def _update_mode(self):
         is_img = self.cmb_mode.currentText() == "image2video"
-        self.ed_image.setEnabled(is_img)
+        # Keep the field visible in both modes so users can clear it.
+        # In text2video mode we make it read-only (so it does not look editable),
+        # but still allow "Clear" to reset it.
+        try:
+            self.ed_image.setEnabled(True)
+        except Exception:
+            pass
+        try:
+            self.ed_image.setReadOnly(not is_img)
+        except Exception:
+            pass
+        try:
+            if hasattr(self, "btn_img_clear"):
+                self.btn_img_clear.setEnabled(bool(self.ed_image.text().strip()))
+        except Exception:
+            pass
+
+
 
         # Batch is only used in text2video mode
         show_batch = not is_img

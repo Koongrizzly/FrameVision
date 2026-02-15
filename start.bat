@@ -3,6 +3,10 @@ setlocal EnableExtensions
 set "ROOT=%~dp0"
 cd /d "%ROOT%"
 
+set FV_REALSR_GPU_ID=0
+set FV_REALSR_JOBS=1:2:2
+
+
 rem --- Ensure legacy .\bin points to .\presets\bin (ffmpeg etc.) ---
 if exist "presets\bin" (
   if not exist "bin" (

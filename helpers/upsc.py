@@ -6,6 +6,7 @@ import sys
 import shutil
 import subprocess
 import json, tempfile, time
+import re
 from pathlib import Path
 from typing import List, Tuple, Optional
 from helpers.mediainfo import refresh_info_now
@@ -35,6 +36,27 @@ GFPGAN_DIR = MODELS_DIR / "gfpgan"
 GFPGAN_ENV_DIR = GFPGAN_DIR / ".GFPGAN"
 GFPGAN_MODEL_V14 = GFPGAN_DIR / "GFPGANv1.4.pth"
 GFPGAN_MODEL_V13 = GFPGAN_DIR / "GFPGANv1.3.pth"
+
+# SeedVR2 (video upscaler) paths
+SEEDVR2_MODELS_DIR = MODELS_DIR / "SEEDVR2"
+SEEDVR2_CLI = ROOT / "presets" / "extra_env" / "seedvr2_src" / "ComfyUI-SeedVR2_VideoUpscaler" / "inference_cli.py"
+if os.name == "nt":
+    SEEDVR2_ENV_PY = ROOT / "environments" / ".seedvr2" / "Scripts" / "python.exe"
+else:
+    SEEDVR2_ENV_PY = ROOT / "environments" / ".seedvr2" / "bin" / "python"
+
+def scan_seedvr2_gguf() -> List[str]:
+    """Return GGUF filenames found under models/SEEDVR2 (recursively)."""
+    names: List[str] = []
+    try:
+        if SEEDVR2_MODELS_DIR.exists():
+            for p in sorted(SEEDVR2_MODELS_DIR.rglob("*.gguf")):
+                # The CLI typically expects just the filename (argparse choices)
+                names.append(p.name)
+    except Exception:
+        pass
+    # Reasonable defaults if none found yet
+    return names or ["seedvr2_ema_3b-Q4_K_M.gguf"]
 
 def _gfpgan_python() -> Optional[Path]:
     try:
@@ -169,23 +191,104 @@ def scan_realsr_ncnn_models() -> List[str]:
 
 
 def _parse_fps(src: Path) -> Optional[str]:
-    try:
-        out = subprocess.check_output(
-            [FFPROBE, "-v", "0", "-select_streams", "v:0", "-show_entries", "stream=r_frame_rate",
-             "-of", "default=noprint_wrappers=1:nokey=1", str(src)],
-            cwd=str(ROOT), universal_newlines=True
-        )
-        rat = out.strip() or "0/0"
-        if "/" in rat:
-            a, b = rat.split("/", 1)
-            a = float(a)
-            b = float(b) if float(b) != 0 else 1.0
-            fps = a / b
-        else:
-            fps = float(rat)
-        if fps <= 0:
+    """Return best-effort source FPS (as an ffmpeg-friendly value).
+
+    Why this exists:
+      - r_frame_rate can be misleading (often 30/1) for VFR or certain encodes.
+      - avg_frame_rate is usually closer to real playback timing.
+      - As a fallback, derive FPS from nb_frames / duration when available.
+    """
+    def _parse_ratio(s: str) -> Optional[tuple[int,int]]:
+        try:
+            s = (s or "").strip()
+            if not s or s in ("0/0", "0", "N/A"):
+                return None
+            if "/" in s:
+                a, b = s.split("/", 1)
+                a_i = int(float(a))
+                b_i = int(float(b))
+                if b_i == 0:
+                    return None
+                return (a_i, b_i)
+            # decimal
+            f = float(s)
+            if f <= 0:
+                return None
+            # represent as ratio with 1e6 precision
+            den = 1_000_000
+            num = int(round(f * den))
+            if num <= 0:
+                return None
+            return (num, den)
+        except Exception:
             return None
-        return f"{fps:.6f}".rstrip("0").rstrip(".")
+
+    def _ratio_to_str(r: tuple[int,int]) -> str:
+        n, d = r
+        if d == 1:
+            return str(n)
+        return f"{n}/{d}"
+
+    def _fps_from_ratio(r: tuple[int,int]) -> float:
+        try:
+            n, d = r
+            return float(n) / float(d) if d else 0.0
+        except Exception:
+            return 0.0
+
+    try:
+        # Pull multiple fields at once (JSON) so we can pick the best.
+        out = subprocess.check_output(
+            [FFPROBE, "-v", "error",
+             "-select_streams", "v:0",
+             "-show_entries", "stream=avg_frame_rate,r_frame_rate,nb_frames,duration,time_base",
+             "-show_entries", "format=duration",
+             "-of", "json",
+             str(src)],
+            cwd=str(ROOT),
+            universal_newlines=True
+        )
+        j = json.loads(out or "{}")
+        streams = j.get("streams") or []
+        s0 = streams[0] if streams else {}
+        fmt = j.get("format") or {}
+
+        avg = _parse_ratio(str(s0.get("avg_frame_rate") or ""))
+        rfr = _parse_ratio(str(s0.get("r_frame_rate") or ""))
+        nb_frames = s0.get("nb_frames")
+        try:
+            nb = int(nb_frames) if nb_frames not in (None, "", "N/A") else None
+        except Exception:
+            nb = None
+
+        # Prefer stream.duration, fallback to format.duration
+        dur_s = s0.get("duration")
+        if dur_s in (None, "", "N/A"):
+            dur_s = fmt.get("duration")
+        try:
+            dur = float(dur_s) if dur_s not in (None, "", "N/A") else None
+        except Exception:
+            dur = None
+
+        candidates: list[tuple[str, float]] = []
+
+        if avg:
+            candidates.append((_ratio_to_str(avg), _fps_from_ratio(avg)))
+        if nb and dur and dur > 0:
+            candidates.append((f"{(nb/dur):.6f}".rstrip("0").rstrip("."), float(nb) / float(dur)))
+        if rfr:
+            candidates.append((_ratio_to_str(rfr), _fps_from_ratio(rfr)))
+
+        # Pick the first sane candidate (avg > derived > r_frame_rate).
+        for val_str, fps in candidates:
+            if fps and 1.0 <= fps <= 240.0:
+                return val_str
+
+        # If nothing sane, last resort: try r_frame_rate as-is.
+        if rfr:
+            return _ratio_to_str(rfr)
+
+        return None
     except Exception:
         return None
 
@@ -194,12 +297,13 @@ class _RunThread(QtCore.QThread):
     progress = Signal(str)
     done = Signal(int, str)
 
-    def __init__(self, cmds: List[List[str]], cwd: Optional[Path] = None, parent=None):
+    def __init__(self, cmds: List[List[str]], cwd: Optional[Path] = None, env: Optional[dict] = None, parent=None):
         super().__init__(parent)
         if cmds and isinstance(cmds[0], str):
             cmds = [cmds]
         self.cmds = cmds
         self.cwd = cwd
+        self.env = env
 
     def run(self):
         last_cmd = ""
@@ -211,6 +315,7 @@ class _RunThread(QtCore.QThread):
                 proc = subprocess.Popen(
                     cmd,
                     cwd=str(self.cwd) if self.cwd else None,
+                    env=self.env,
                     stdout=subprocess.PIPE,
                     stderr=subprocess.STDOUT,
                     universal_newlines=True,
@@ -330,6 +435,10 @@ class UpscPane(QtWidgets.QWidget):
         
         v.addLayout(row)
 
+        # SeedVR2 (optional upscaler)
+        self.chk_seedvr2 = QtWidgets.QCheckBox("Use seedVR2", self)
+        v.addWidget(self.chk_seedvr2)
+
         scale_lay = QtWidgets.QHBoxLayout()
         scale_lay.addWidget(QtWidgets.QLabel("Scale:", self))
         self.spin_scale = QtWidgets.QDoubleSpinBox(self)
@@ -345,10 +454,138 @@ class UpscPane(QtWidgets.QWidget):
         self.slider_scale.setValue(20)
         scale_lay.addWidget(self.spin_scale)
         scale_lay.addWidget(self.slider_scale, 1)
-        v.addLayout(scale_lay)
+        # Wrap scale row so we can hide/disable it when SeedVR2 is enabled
+        self._w_scale = QtWidgets.QWidget(self)
+        self._w_scale.setLayout(scale_lay)
+        v.addWidget(self._w_scale)
 
         from helpers.collapsible_compat import CollapsibleSection
         # Models (inline, no collapsible)
+
+        # SeedVR2 settings (shown only when toggle is ON)
+        self.box_seedvr2 = QtWidgets.QWidget(self)
+        self.box_seedvr2.setVisible(False)
+        lay_seed = QtWidgets.QVBoxLayout(self.box_seedvr2)
+        lay_seed.setContentsMargins(6, 2, 6, 6)
+        lay_seed.setSpacing(6)
+
+        # Friendly warning / guidance (visible only when SeedVR2 is enabled)
+        self.lbl_seedvr2_note = QtWidgets.QLabel(
+            "SeedVR2 is not a fast upscale model, it can take more then an hour to upscale 1 minute of video to 1080p ! "
+            "Use this model for realistic video footage, use realsrgan for animated video footage",
+            self,
+        )
+        self.lbl_seedvr2_note.setWordWrap(True)
+        self.lbl_seedvr2_note.setStyleSheet("color:#b9c3cf;font-size:12px;")
+        lay_seed.addWidget(self.lbl_seedvr2_note)
+
+        # GGUF model picker + refresh
+        row_m = QtWidgets.QHBoxLayout()
+        row_m.addWidget(QtWidgets.QLabel("GGUF model:", self))
+        self.combo_seedvr2_gguf = QtWidgets.QComboBox(self)
+        for m in scan_seedvr2_gguf():
+            self.combo_seedvr2_gguf.addItem(m)
+        row_m.addWidget(self.combo_seedvr2_gguf, 1)
+        self.btn_seedvr2_refresh = QtWidgets.QPushButton("Refresh", self)
+        self.btn_seedvr2_refresh.setFixedWidth(90)
+        row_m.addWidget(self.btn_seedvr2_refresh)
+        lay_seed.addLayout(row_m)
+
+        # Resolution (Upscale to)
+        row_r = QtWidgets.QHBoxLayout()
+        row_r.addWidget(QtWidgets.QLabel("Upscale to:", self))
+        self.combo_seedvr2_res = QtWidgets.QComboBox(self)
+        for _r in ("720", "1080", "1440", "2160"):
+            self.combo_seedvr2_res.addItem(_r)
+        self.combo_seedvr2_res.setCurrentText("1440")
+        row_r.addWidget(self.combo_seedvr2_res, 1)
+        lay_seed.addLayout(row_r)
+
+        self.lbl_seedvr2_2160_warn = QtWidgets.QLabel("⚠ 2160: use only for image upscaling (videos may be too heavy).", self)
+        self.lbl_seedvr2_2160_warn.setStyleSheet("color:#ffcc66;font-size:12px;")
+        self.lbl_seedvr2_2160_warn.setVisible(False)
+        lay_seed.addWidget(self.lbl_seedvr2_2160_warn)
+
+        # Temporal overlap
+        self.chk_seedvr2_temporal = QtWidgets.QCheckBox("Temporal overlap", self)
+        self.chk_seedvr2_temporal.setChecked(True)
+        lay_seed.addWidget(self.chk_seedvr2_temporal)
+
+        # Color correction
+        row_c = QtWidgets.QHBoxLayout()
+        row_c.addWidget(QtWidgets.QLabel("Color correction:", self))
+        self.combo_seedvr2_color = QtWidgets.QComboBox(self)
+        for _cc in ("lab", "none"):
+            self.combo_seedvr2_color.addItem(_cc)
+        self.combo_seedvr2_color.setCurrentText("lab")
+        row_c.addWidget(self.combo_seedvr2_color, 1)
+        lay_seed.addLayout(row_c)
+
+        # Advanced settings (collapsed by default)
+        self.grp_seedvr2_adv = QtWidgets.QGroupBox("Advanced settings", self)
+        self.grp_seedvr2_adv.setCheckable(True)
+        self.grp_seedvr2_adv.setChecked(False)
+        adv = QtWidgets.QGridLayout(self.grp_seedvr2_adv)
+        adv.setHorizontalSpacing(12)
+        adv.setVerticalSpacing(6)
+
+        adv.addWidget(QtWidgets.QLabel("Batch size:", self), 0, 0)
+        self.spin_seedvr2_batch = QtWidgets.QSpinBox(self)
+        self.spin_seedvr2_batch.setRange(1, 16)
+        self.spin_seedvr2_batch.setValue(1)
+        adv.addWidget(self.spin_seedvr2_batch, 0, 1)
+
+        adv.addWidget(QtWidgets.QLabel("Chunk size:", self), 1, 0)
+        self.spin_seedvr2_chunk = QtWidgets.QSpinBox(self)
+        self.spin_seedvr2_chunk.setRange(1, 999)
+        self.spin_seedvr2_chunk.setValue(20)
+        adv.addWidget(self.spin_seedvr2_chunk, 1, 1)
+
+        adv.addWidget(QtWidgets.QLabel("Attention mode:", self), 2, 0)
+        self.combo_seedvr2_attn = QtWidgets.QComboBox(self)
+        for _am in ("sdpa", "xformers", "flash_attn"):
+            self.combo_seedvr2_attn.addItem(_am)
+        self.combo_seedvr2_attn.setCurrentText("sdpa")
+        adv.addWidget(self.combo_seedvr2_attn, 2, 1)
+
+        self.lbl_seedvr2_attn_warn = QtWidgets.QLabel("Note: xformers / flash_attn must be installed in the SeedVR2 environment, or the run may fail.", self)
+        self.lbl_seedvr2_attn_warn.setStyleSheet("color:#9fb3c8;font-size:12px;")
+        self.lbl_seedvr2_attn_warn.setWordWrap(True)
+        self.lbl_seedvr2_attn_warn.setVisible(False)
+        adv.addWidget(self.lbl_seedvr2_attn_warn, 3, 0, 1, 2)
+
+        # Offload options (tiled VAE)
+        self.chk_seedvr2_vae_enc = QtWidgets.QCheckBox("VAE encode tiled", self)
+        self.chk_seedvr2_vae_dec = QtWidgets.QCheckBox("VAE decode tiled", self)
+        adv.addWidget(self.chk_seedvr2_vae_enc, 4, 0, 1, 2)
+        adv.addWidget(self.chk_seedvr2_vae_dec, 5, 0, 1, 2)
+
+        adv.addWidget(QtWidgets.QLabel("Encode tile size:", self), 6, 0)
+        self.spin_seedvr2_enc_tile = QtWidgets.QSpinBox(self)
+        self.spin_seedvr2_enc_tile.setRange(128, 4096)
+        self.spin_seedvr2_enc_tile.setValue(1024)
+        adv.addWidget(self.spin_seedvr2_enc_tile, 6, 1)
+
+        adv.addWidget(QtWidgets.QLabel("Encode overlap:", self), 7, 0)
+        self.spin_seedvr2_enc_ov = QtWidgets.QSpinBox(self)
+        self.spin_seedvr2_enc_ov.setRange(0, 1024)
+        self.spin_seedvr2_enc_ov.setValue(64)
+        adv.addWidget(self.spin_seedvr2_enc_ov, 7, 1)
+
+        adv.addWidget(QtWidgets.QLabel("Decode tile size:", self), 8, 0)
+        self.spin_seedvr2_dec_tile = QtWidgets.QSpinBox(self)
+        self.spin_seedvr2_dec_tile.setRange(128, 4096)
+        self.spin_seedvr2_dec_tile.setValue(1024)
+        adv.addWidget(self.spin_seedvr2_dec_tile, 8, 1)
+
+        adv.addWidget(QtWidgets.QLabel("Decode overlap:", self), 9, 0)
+        self.spin_seedvr2_dec_ov = QtWidgets.QSpinBox(self)
+        self.spin_seedvr2_dec_ov.setRange(0, 1024)
+        self.spin_seedvr2_dec_ov.setValue(64)
+        adv.addWidget(self.spin_seedvr2_dec_ov, 9, 1)
+
+        lay_seed.addWidget(self.grp_seedvr2_adv)
+        v.addWidget(self.box_seedvr2)
         self.box_models = QtWidgets.QWidget(self)
         inner = QtWidgets.QVBoxLayout(self.box_models)
         inner.setContentsMargins(6, 2, 6, 6)
@@ -696,6 +933,49 @@ class UpscPane(QtWidgets.QWidget):
         self.slider_scale.valueChanged.connect(self._sync_scale_from_slider)
         self.combo_engine.currentIndexChanged.connect(self._update_engine_ui)
         self._update_engine_ui()
+        # SeedVR2 wiring
+        try:
+            self.chk_seedvr2.toggled.connect(self._update_seedvr2_mode)
+        except Exception:
+            pass
+        try:
+            self.btn_seedvr2_refresh.clicked.connect(self._seedvr2_refresh_models)
+        except Exception:
+            pass
+        try:
+            self.combo_seedvr2_res.currentTextChanged.connect(self._update_seedvr2_warnings)
+        except Exception:
+            pass
+        try:
+            self.combo_seedvr2_attn.currentTextChanged.connect(self._update_seedvr2_warnings)
+        except Exception:
+            pass
+        try:
+            self._update_seedvr2_mode(self.chk_seedvr2.isChecked())
+        except Exception:
+            pass
+
+        try:
+            self.chk_seedvr2.toggled.connect(self._update_seedvr2_mode)
+        except Exception:
+            pass
+        try:
+            self.btn_seedvr2_refresh.clicked.connect(self._seedvr2_refresh_models)
+        except Exception:
+            pass
+        try:
+            self.combo_seedvr2_res.currentTextChanged.connect(self._update_seedvr2_warnings)
+        except Exception:
+            pass
+        try:
+            self.combo_seedvr2_attn.currentTextChanged.connect(self._update_seedvr2_warnings)
+        except Exception:
+            pass
+        # apply initial mode
+        try:
+            self._update_seedvr2_mode(bool(self.chk_seedvr2.isChecked()))
+        except Exception:
+            pass
         try:
             self.combo_model_realsr.currentTextChanged.connect(self._update_engine_ui)
         except Exception:
@@ -840,6 +1120,20 @@ class UpscPane(QtWidgets.QWidget):
             ("chk_denoise", "toggled"),
             ("chk_deband", "toggled"),
             ("sld_sharpen", "valueChanged"),
+            ("chk_seedvr2", "toggled"),
+            ("combo_seedvr2_gguf", "currentTextChanged"),
+            ("combo_seedvr2_res", "currentTextChanged"),
+            ("chk_seedvr2_temporal", "toggled"),
+            ("combo_seedvr2_color", "currentTextChanged"),
+            ("spin_seedvr2_batch", "valueChanged"),
+            ("spin_seedvr2_chunk", "valueChanged"),
+            ("combo_seedvr2_attn", "currentTextChanged"),
+            ("chk_seedvr2_vae_enc", "toggled"),
+            ("chk_seedvr2_vae_dec", "toggled"),
+            ("spin_seedvr2_enc_tile", "valueChanged"),
+            ("spin_seedvr2_enc_ov", "valueChanged"),
+            ("spin_seedvr2_dec_tile", "valueChanged"),
+            ("spin_seedvr2_dec_ov", "valueChanged"),
                     ]
 
         connected = 0
@@ -933,7 +1227,31 @@ class UpscPane(QtWidgets.QWidget):
         except Exception: pass
         try: d["sharpen"] = int(self.sld_sharpen.value())
         except Exception: pass
-        # Sections collapsed state
+                # SeedVR2
+        try: d["seedvr2_enabled"] = bool(self.chk_seedvr2.isChecked())
+        except Exception: pass
+        try: d["seedvr2_gguf"] = self.combo_seedvr2_gguf.currentText()
+        except Exception: pass
+        try: d["seedvr2_res"] = self.combo_seedvr2_res.currentText()
+        except Exception: pass
+        try: d["seedvr2_temporal"] = bool(self.chk_seedvr2_temporal.isChecked())
+        except Exception: pass
+        try: d["seedvr2_color"] = self.combo_seedvr2_color.currentText()
+        except Exception: pass
+        try:
+            d["seedvr2_batch"] = int(self.spin_seedvr2_batch.value())
+            d["seedvr2_chunk"] = int(self.spin_seedvr2_chunk.value())
+            d["seedvr2_attn"] = self.combo_seedvr2_attn.currentText()
+            d["seedvr2_vae_enc"] = bool(self.chk_seedvr2_vae_enc.isChecked())
+            d["seedvr2_vae_dec"] = bool(self.chk_seedvr2_vae_dec.isChecked())
+            d["seedvr2_enc_tile"] = int(self.spin_seedvr2_enc_tile.value())
+            d["seedvr2_enc_ov"] = int(self.spin_seedvr2_enc_ov.value())
+            d["seedvr2_dec_tile"] = int(self.spin_seedvr2_dec_tile.value())
+            d["seedvr2_dec_ov"] = int(self.spin_seedvr2_dec_ov.value())
+        except Exception:
+            pass
+
+# Sections collapsed state
         d["sections"] = {}
         try:
             d["sections"]["models"] = bool(self.box_models.toggle.isChecked())
@@ -1006,6 +1324,57 @@ class UpscPane(QtWidgets.QWidget):
             if out: self.edit_outdir.setText(out)
         except Exception:
             pass
+
+        # SeedVR2
+        try:
+            self.chk_seedvr2.setChecked(bool(d.get("seedvr2_enabled", False)))
+        except Exception:
+            pass
+        try:
+            gg = d.get("seedvr2_gguf")
+            if gg:
+                i = self.combo_seedvr2_gguf.findText(gg)
+                if i >= 0: self.combo_seedvr2_gguf.setCurrentIndex(i)
+        except Exception:
+            pass
+        try:
+            rs = str(d.get("seedvr2_res") or "")
+            if rs:
+                i = self.combo_seedvr2_res.findText(rs)
+                if i >= 0: self.combo_seedvr2_res.setCurrentIndex(i)
+        except Exception:
+            pass
+        try:
+            self.chk_seedvr2_temporal.setChecked(bool(d.get("seedvr2_temporal", True)))
+        except Exception:
+            pass
+        try:
+            cc = d.get("seedvr2_color")
+            if cc:
+                i = self.combo_seedvr2_color.findText(cc)
+                if i >= 0: self.combo_seedvr2_color.setCurrentIndex(i)
+        except Exception:
+            pass
+        try:
+            self.spin_seedvr2_batch.setValue(int(d.get("seedvr2_batch", 1)))
+            self.spin_seedvr2_chunk.setValue(int(d.get("seedvr2_chunk", 20)))
+            am = d.get("seedvr2_attn")
+            if am:
+                i = self.combo_seedvr2_attn.findText(am)
+                if i >= 0: self.combo_seedvr2_attn.setCurrentIndex(i)
+            self.chk_seedvr2_vae_enc.setChecked(bool(d.get("seedvr2_vae_enc", False)))
+            self.chk_seedvr2_vae_dec.setChecked(bool(d.get("seedvr2_vae_dec", False)))
+            self.spin_seedvr2_enc_tile.setValue(int(d.get("seedvr2_enc_tile", 1024)))
+            self.spin_seedvr2_enc_ov.setValue(int(d.get("seedvr2_enc_ov", 64)))
+            self.spin_seedvr2_dec_tile.setValue(int(d.get("seedvr2_dec_tile", 1024)))
+            self.spin_seedvr2_dec_ov.setValue(int(d.get("seedvr2_dec_ov", 64)))
+        except Exception:
+            pass
+        try:
+            self._update_seedvr2_mode(self.chk_seedvr2.isChecked())
+        except Exception:
+            pass
+
         try:
             self.chk_play_internal.setChecked(bool(d.get("play_internal", True)))
             self.chk_replace_in_player.setChecked(bool(d.get("replace_in_player", True)))
@@ -1265,6 +1634,69 @@ class UpscPane(QtWidgets.QWidget):
                 pass
         # Re-apply page
         self.stk_models.setCurrentIndex(page)
+
+    # ---------------------------
+    # SeedVR2 UI helpers
+    # ---------------------------
+    def _seedvr2_refresh_models(self):
+        try:
+            cur = self.combo_seedvr2_gguf.currentText() if hasattr(self, "combo_seedvr2_gguf") else ""
+        except Exception:
+            cur = ""
+        try:
+            items = scan_seedvr2_gguf()
+            self.combo_seedvr2_gguf.blockSignals(True)
+            self.combo_seedvr2_gguf.clear()
+            for it in items:
+                self.combo_seedvr2_gguf.addItem(it)
+            if cur:
+                i = self.combo_seedvr2_gguf.findText(cur)
+                if i >= 0:
+                    self.combo_seedvr2_gguf.setCurrentIndex(i)
+            self.combo_seedvr2_gguf.blockSignals(False)
+        except Exception:
+            try:
+                self.combo_seedvr2_gguf.blockSignals(False)
+            except Exception:
+                pass
+
+    def _update_seedvr2_warnings(self):
+        try:
+            res = (self.combo_seedvr2_res.currentText() or "").strip()
+            self.lbl_seedvr2_2160_warn.setVisible(res == "2160")
+        except Exception:
+            pass
+        try:
+            am = (self.combo_seedvr2_attn.currentText() or "").strip().lower()
+            self.lbl_seedvr2_attn_warn.setVisible(am in ("xformers", "flash_attn"))
+        except Exception:
+            pass
+
+    def _update_seedvr2_mode(self, on: bool | None = None):
+        try:
+            enabled = bool(self.chk_seedvr2.isChecked()) if on is None else bool(on)
+        except Exception:
+            enabled = False
+        # Show SeedVR2 panel and hide normal controls when enabled
+        try:
+            self.box_seedvr2.setVisible(enabled)
+            self.box_seedvr2.setEnabled(enabled)
+        except Exception:
+            pass
+        for w in (getattr(self, "_w_scale", None), getattr(self, "box_models", None), getattr(self, "box_encoder", None), getattr(self, "box_advanced", None)):
+            try:
+                if w is None:
+                    continue
+                w.setVisible(not enabled)
+                w.setEnabled(not enabled)
+            except Exception:
+                pass
+        # Keep warnings in sync
+        try:
+            self._update_seedvr2_warnings()
+        except Exception:
+            pass
+
     def _sync_scale_from_spin(self, v: float):
         self.slider_scale.blockSignals(True)
         self.slider_scale.setValue(int(round(v * 10)))
@@ -1531,9 +1963,57 @@ class UpscPane(QtWidgets.QWidget):
                 i += 1
             return cand
         return base
+    def _sanitize_realsr_model(self, model: str, scale: int) -> str:
+        """Best-effort cleanup for Real-ESRGAN model names.
+        Fixes common issues:
+          - model accidentally passed as a full path
+          - model auto-suffixed with _x{scale} / -x{scale} when only the base file exists
+        """
+        n = (model or "").strip().strip('"').strip("'")
+        # If it looks like a path, keep only the basename (without extension)
+        try:
+            if ":" in n or "/" in n or "\\" in n:
+                base = os.path.basename(n.replace("\\", "/"))
+                n = os.path.splitext(base)[0]
+        except Exception:
+            pass
+
+        # If the selected model doesn't exist, but a stripped suffix variant does, fall back.
+        try:
+            cand_param = REALSR_DIR / f"{n}.param"
+            cand_bin = REALSR_DIR / f"{n}.bin"
+            if (not cand_param.exists()) and (not cand_bin.exists()):
+                mm = re.match(r"^(.*?)(?:[_-]x([234]))$", n, flags=re.IGNORECASE)
+                if mm:
+                    base = (mm.group(1) or "").strip()
+                    if base:
+                        b_param = REALSR_DIR / f"{base}.param"
+                        b_bin = REALSR_DIR / f"{base}.bin"
+                        if b_param.exists() or b_bin.exists():
+                            n = base
+        except Exception:
+            pass
+
+        return n
+
     def _realsr_cmd_dir(self, exe: str, indir: Path, outdir: Path, model: str, scale: int) -> List[str]:
-        n = model[:-3] if model.endswith(("-x2", "-x3", "-x4")) else model
+        n = (model or "").strip()
+        n = self._sanitize_realsr_model(n, scale)
         cmd = [exe, "-i", str(indir), "-o", str(outdir), "-n", n, "-s", str(scale), "-m", str(REALSR_DIR), "-f", "png"]
+        # Force GPU selection for Real-ESRGAN (ncnn-vulkan).
+        # Default to GPU 0 (usually the discrete NVIDIA GPU). Override with FV_REALSR_GPU_ID.
+        try:
+            gid = os.environ.get("FV_REALSR_GPU_ID", "").strip() or "0"
+            cmd += ["-g", str(gid)]
+        except Exception:
+            pass
+        # Optional thread tuning: FV_REALSR_JOBS like "1:2:2" (load:proc:save).
+        try:
+            jobs = os.environ.get("FV_REALSR_JOBS", "").strip()
+            if jobs:
+                cmd += ["-j", str(jobs)]
+        except Exception:
+            pass
         try:
             t = int(self.spin_tile.value()) if hasattr(self, "spin_tile") else 0
             if t > 0:
@@ -1543,8 +2023,23 @@ class UpscPane(QtWidgets.QWidget):
         return cmd
 
     def _realsr_cmd_file(self, exe: str, infile: Path, outfile: Path, model: str, scale: int) -> List[str]:
-        n = model[:-3] if model.endswith(("-x2", "-x3", "-x4")) else model
+        n = (model or "").strip()
+        n = self._sanitize_realsr_model(n, scale)
         cmd = [exe, "-i", str(infile), "-o", str(outfile), "-n", n, "-s", str(scale), "-m", str(REALSR_DIR)]
+        # Force GPU selection for Real-ESRGAN (ncnn-vulkan).
+        # Default to GPU 0 (usually the discrete NVIDIA GPU). Override with FV_REALSR_GPU_ID.
+        try:
+            gid = os.environ.get("FV_REALSR_GPU_ID", "").strip() or "0"
+            cmd += ["-g", str(gid)]
+        except Exception:
+            pass
+        # Optional thread tuning: FV_REALSR_JOBS like "1:2:2" (load:proc:save).
+        try:
+            jobs = os.environ.get("FV_REALSR_JOBS", "").strip()
+            if jobs:
+                cmd += ["-j", str(jobs)]
+        except Exception:
+            pass
         try:
             t = int(self.spin_tile.value()) if hasattr(self, "spin_tile") else 0
             if t > 0:
@@ -1592,6 +2087,140 @@ class UpscPane(QtWidgets.QWidget):
             is_video = ext in _VIDEO_EXTS
             is_image = ext in _IMAGE_EXTS
     
+            # SeedVR2 path (overrides all other engines when enabled)
+            try:
+                if getattr(self, "chk_seedvr2", None) is not None and self.chk_seedvr2.isChecked():
+                    # Basic validation
+                    if not SEEDVR2_ENV_PY.exists():
+                        QtWidgets.QMessageBox.critical(self, "SeedVR2 missing", f"SeedVR2 environment python was not found:\n{SEEDVR2_ENV_PY}")
+                        return
+                    if not SEEDVR2_CLI.exists():
+                        QtWidgets.QMessageBox.critical(self, "SeedVR2 missing", f"SeedVR2 CLI was not found:\n{SEEDVR2_CLI}")
+                        return
+                    if not SEEDVR2_MODELS_DIR.exists():
+                        QtWidgets.QMessageBox.critical(self, "SeedVR2 missing", f"SeedVR2 model folder was not found:\n{SEEDVR2_MODELS_DIR}")
+                        return
+
+                    gguf_name = (self.combo_seedvr2_gguf.currentText() or "").strip()
+                    if not gguf_name:
+                        QtWidgets.QMessageBox.warning(self, "SeedVR2", "Please select a GGUF model.")
+                        return
+                    gguf_path = None
+                    try:
+                        for p in SEEDVR2_MODELS_DIR.rglob("*.gguf"):
+                            if p.name == gguf_name:
+                                gguf_path = p
+                                break
+                    except Exception:
+                        gguf_path = None
+                    if gguf_path is None or not gguf_path.exists():
+                        QtWidgets.QMessageBox.critical(self, "SeedVR2 missing", f"Selected GGUF model was not found in models/SEEDVR2:\n{gguf_name}")
+                        return
+
+                    res = int((self.combo_seedvr2_res.currentText() or "1440").strip() or 1440)
+                    if is_video and res >= 2160:
+                        QtWidgets.QMessageBox.warning(self, "SeedVR2", "2160 is intended for image upscaling only. Please choose 1440 or lower for videos.")
+                        return
+
+                    outd = Path(self.edit_outdir.text().strip()) if self.edit_outdir.text().strip() else (OUT_VIDEOS if is_video else OUT_SHOTS)
+                    outd.mkdir(parents=True, exist_ok=True)
+
+                    # Output naming (no overwrites):
+                    # <orig15>_seedVR2_<res>_<yymmdd>.ext
+                    # If the file exists, add _01, _02, ...
+                    try:
+                        raw_stem = (src.stem or "video")[:15]
+                        safe = re.sub(r"[^A-Za-z0-9_-]+", "_", raw_stem).strip("_")
+                        if not safe:
+                            safe = "video"
+                        stamp = time.strftime("%y%m%d", time.localtime())
+                        tag = f"{safe}_seedVR2_{res}_{stamp}"
+                    except Exception:
+                        tag = f"{src.stem}_seedVR2_{res}"
+
+                    if is_video:
+                        out_fmt = "mp4"
+                        outfile = outd / f"{tag}.mp4"
+                    else:
+                        out_fmt = "png"
+                        outfile = outd / f"{tag}.png"
+
+                    # Ensure we never overwrite previous results
+                    try:
+                        if outfile.exists():
+                            n = 1
+                            while True:
+                                cand = outd / f"{tag}_{n:02d}{outfile.suffix}"
+                                if not cand.exists():
+                                    outfile = cand
+                                    break
+                                n += 1
+                    except Exception:
+                        pass
+
+                    self._last_outfile = outfile
+
+                    temporal = 1 if bool(self.chk_seedvr2_temporal.isChecked()) else 0
+                    cc = (self.combo_seedvr2_color.currentText() or "").strip() or "lab"
+                    attn = (self.combo_seedvr2_attn.currentText() or "sdpa").strip() or "sdpa"
+
+                    cmd = [str(SEEDVR2_ENV_PY), "-X", "utf8", str(SEEDVR2_CLI), str(src),
+                           "--output", str(outfile),
+                           "--output_format", out_fmt,
+                           "--video_backend", "ffmpeg",
+                           "--model_dir", str(SEEDVR2_MODELS_DIR),
+                           "--dit_model", gguf_path.name,
+                           "--resolution", str(res),
+                           "--batch_size", str(int(self.spin_seedvr2_batch.value())),
+                           "--chunk_size", str(int(self.spin_seedvr2_chunk.value())),
+                           "--temporal_overlap", str(int(temporal)),
+                           "--color_correction", str(cc),
+                           "--attention_mode", str(attn),
+                           ]
+
+                    # Offload options (tiled VAE)
+                    try:
+                        if self.chk_seedvr2_vae_enc.isChecked():
+                            cmd.append("--vae_encode_tiled")
+                            cmd += ["--vae_encode_tile_size", str(int(self.spin_seedvr2_enc_tile.value()))]
+                            cmd += ["--vae_encode_tile_overlap", str(int(self.spin_seedvr2_enc_ov.value()))]
+                        if self.chk_seedvr2_vae_dec.isChecked():
+                            cmd.append("--vae_decode_tiled")
+                            cmd += ["--vae_decode_tile_size", str(int(self.spin_seedvr2_dec_tile.value()))]
+                            cmd += ["--vae_decode_tile_overlap", str(int(self.spin_seedvr2_dec_ov.value()))]
+                    except Exception:
+                        pass
+
+                    # Env: make sure FrameVision bins are on PATH (ffmpeg backend)
+                    env = os.environ.copy()
+                    try:
+                        if os.name == "nt":
+                            env["PATH"] = str(PRESETS_BIN) + ";" + env.get("PATH", "")
+                        else:
+                            env["PATH"] = str(PRESETS_BIN) + ":" + env.get("PATH", "")
+                    except Exception:
+                        pass
+                    env.setdefault("PYTHONUTF8", "1")
+                    env.setdefault("PYTHONIOENCODING", "utf-8")
+
+                    self._append_log("Engine: SeedVR2")
+                    self._append_log(f"Python: {SEEDVR2_ENV_PY}")
+                    self._append_log(f"CLI: {SEEDVR2_CLI}")
+                    self._append_log(f"Model dir: {SEEDVR2_MODELS_DIR}")
+                    self._append_log(f"GGUF: {gguf_path.name}")
+                    self._append_log(f"Upscale to: {res}")
+                    self._append_log(f"Temporal overlap: {temporal}")
+                    self._append_log(f"Color correction: {cc}")
+                    self._append_log(f"Attention: {attn}")
+                    self._append_log(f"Input: {src}")
+                    self._append_log(f"Output: {outfile}")
+
+                    self._run_cmd([cmd], open_on_success=True, cwd=SEEDVR2_CLI.parent, env=env)
+                    return
+            except Exception:
+                # If SeedVR2 block fails unexpectedly, fall back to normal engines
+                pass
+
             engine_label = self.combo_engine.currentText()
             do_gfpgan = ("gfpgan" in (engine_label or "").lower())
             engine_exe = self.combo_engine.currentData()
@@ -1622,8 +2251,17 @@ class UpscPane(QtWidgets.QWidget):
                     self._append_log("GFPGAN selected for a video — blocked (images only).")
                     return
     
-                model = self.combo_model_realsr.currentText()
-                fps = "30"
+                # Pick model from the currently active engine/page (important for UltraSharp/SRMD, etc.)
+                try:
+                    model = (self._fv_current_model_text() or "").strip()
+                except Exception:
+                    model = ""
+                if not model:
+                    try:
+                        model = self.combo_model_realsr.currentText()
+                    except Exception:
+                        model = ""
+                fps = _parse_fps(src) or "30"
                 work = outd / f"{src.stem}_x{scale}_work"
                 in_dir = work / "in"
                 out_dir = work / "out"
@@ -1656,9 +2294,9 @@ class UpscPane(QtWidgets.QWidget):
                 if int(self.spin_keyint.value() or 0) > 0:
                     cmd_encode += ["-g", str(int(self.spin_keyint.value()))]
                 if post:
-                    cmd_encode += ["-vf", f"fps={fps}," + post]
-                else:
-                    cmd_encode += ["-vf", f"fps={fps}"]
+                    cmd_encode += ["-vf", post]
+                
+                
                 if self.radio_a_mute.isChecked():
                     cmd_encode += ["-an"]
                 elif self.radio_a_copy.isChecked():
@@ -1722,10 +2360,10 @@ class UpscPane(QtWidgets.QWidget):
             self._job_running = False
 
     
-    def _run_cmd(self, cmds: List[List[str]], open_on_success: bool = False, cleanup_dirs: Optional[List[Path]] = None):
+    def _run_cmd(self, cmds: List[List[str]], open_on_success: bool = False, cleanup_dirs: Optional[List[Path]] = None, cwd: Optional[Path] = None, env: Optional[dict] = None):
             self.btn_upscale.setEnabled(False)
             self.btn_batch.setEnabled(False)
-            self._thr = _RunThread(cmds, cwd=ROOT, parent=self)
+            self._thr = _RunThread(cmds, cwd=(cwd or ROOT), env=env, parent=self)
             self._thr.progress.connect(self._append_log)
 
             def on_done(code: int, last: str):
@@ -2033,7 +2671,7 @@ def _fv_find_enqueue(self):
                 return fn, label
     return candidates[0] if candidates else (None, "")
 
-def _fv_call_enqueue(self, enq, where_label, cmds, open_on_success):
+def _fv_call_enqueue(self, enq, where_label, cmds, open_on_success, **_kwargs):
     """Try to call enqueue either with a job dict, or with signature (input_path, out_dir, factor, model)."""
     sig = None
     try:
@@ -2060,27 +2698,107 @@ def _fv_call_enqueue(self, enq, where_label, cmds, open_on_success):
             elif isinstance(txt, str) and 'x2' in txt: factor = 2
         except Exception:
             pass
+    # Model: prefer helper that knows which dropdown is active.
+    # This prevents the "always picks the first model" bug when multiple model combos exist.
     model_name = ''
     try:
-        eng_label = getattr(self, 'combo_engine', None).currentText()
+        fn = getattr(self, "_fv_current_model_text", None)
+        if callable(fn):
+            model_name = str(fn() or "").strip()
     except Exception:
-        eng_label = ''
-    try:
-        if isinstance(eng_label, str) and 'Waifu2x' in eng_label:
-            cmw = getattr(self, 'combo_model_w2x', None)
-            if cmw and hasattr(cmw, 'currentText'):
-                model_name = cmw.currentText()
-        else:
-            cmr = getattr(self, 'combo_model_realsr', None)
-            if cmr and hasattr(cmr, 'currentText'):
-                model_name = cmr.currentText()
-    except Exception:
-        try:
-            model_name = getattr(self, 'combo_model', None).currentText()
-        except Exception:
-            pass
+        model_name = ''
 
-    # If signature wants plain args, call with those
+    if not model_name:
+        # Fallback: choose by stacked-models page (what the user is actually looking at)
+        try:
+            stk = getattr(self, "stk_models", None)
+            page = int(stk.currentIndex()) if stk is not None else -1
+        except Exception:
+            page = -1
+
+        def _ct(attr: str) -> str:
+            w = getattr(self, attr, None)
+            try:
+                return str(w.currentText()).strip() if (w is not None and hasattr(w, "currentText")) else ""
+            except Exception:
+                return ""
+
+        if page == 1:
+            model_name = _ct("combo_model_w2x")
+        elif page == 2:
+            model_name = _ct("combo_model_srmd")
+        elif page == 3:
+            model_name = _ct("combo_model_realsr_ncnn")
+        elif page == 4:
+            model_name = _ct("combo_model_ultrasharp")
+        elif page == 5:
+            model_name = _ct("combo_model_srmd_realsr")
+        elif page == 6:
+            model_name = _ct("combo_model_gfpgan")
+        else:
+            # page 0 or unknown: use engine label mapping as best-effort
+            eng_label = _ct("combo_engine")
+            if "waifu2x" in eng_label.lower():
+                model_name = _ct("combo_model_w2x")
+            elif "ultrasharp" in eng_label.lower():
+                model_name = _ct("combo_model_ultrasharp")
+            elif "srmd (ncnn via realesrgan" in eng_label.lower():
+                model_name = _ct("combo_model_srmd_realsr")
+            elif "srmd" in eng_label.lower():
+                model_name = _ct("combo_model_srmd")
+            elif "realsr" in eng_label.lower():
+                model_name = _ct("combo_model_realsr_ncnn")
+            elif "gfpgan" in eng_label.lower():
+                model_name = _ct("combo_model_gfpgan")
+            else:
+                model_name = _ct("combo_model_realsr") or _ct("combo_model")
+
+        if not model_name:
+            model_name = _ct("combo_model_realsr") or _ct("combo_model")
+
+
+    
+    # SeedVR2: when enabled, never use the 4-arg enqueue signature (it would lose the custom CLI cmd).
+    # Always enqueue a job dict that contains the exact command + cwd/env.
+    try:
+        if getattr(self, "chk_seedvr2", None) is not None and getattr(self, "chk_seedvr2").isChecked():
+            if cmds:
+                c0 = cmds[0]
+                txt0 = " ".join(map(str, c0)).lower()
+                if "seedvr2" in txt0 or "inference_cli.py" in txt0:
+                    job = {
+                        "name": "Upscale (seedVR2)",
+                        "category": "upscale",
+                        "engine": "seedvr2",
+                        "cmd": c0,
+                        "cwd": str((_kwargs.get("cwd") or globals().get("ROOT", "."))),
+                        "open_on_success": bool(open_on_success),
+                        "output": str(getattr(self, "_last_outfile", "")),
+                    }
+                    # pass env through if the queue/worker supports it
+                    try:
+                        if _kwargs.get("env"):
+                            job["env"] = _kwargs.get("env")
+                    except Exception:
+                        pass
+                    try:
+                        enq(job)
+                        try:
+                            self._append_log(f"Queued SeedVR2 via {where_label}.")
+                        except Exception:
+                            pass
+                        return True
+                    except Exception as e:
+                        try:
+                            self._append_log(f"Queue error (SeedVR2) via {where_label}: {e}")
+                        except Exception:
+                            pass
+                        return False
+    except Exception:
+        pass
+
+
+# If signature wants plain args, call with those
     if sig:
         params = list(sig.parameters.keys())
         if params[:4] == ["input_path", "out_dir", "factor", "model"] or set(("input_path","out_dir","factor","model")).issubset(set(params)):
@@ -2101,7 +2819,8 @@ def _fv_call_enqueue(self, enq, where_label, cmds, open_on_success):
             "name": "Upscale" if len(cmds) == 1 else f"Upscale ({i}/{len(cmds)})",
             "category": "upscale",
             "cmd": c,
-            "cwd": str(globals().get("ROOT", ".")),
+            "cwd": str(_kwargs.get("cwd") or globals().get("ROOT", ".")),
+            "env": _kwargs.get("env"),
             "open_on_success": bool(open_on_success and i == len(cmds)),
             "output": str(getattr(self, "_last_outfile", "")),
         }
@@ -2126,14 +2845,14 @@ try:
 
     if _UpscClass is not None:
         _orig_run_cmd = getattr(_UpscClass, "_run_cmd", None)
-        def _patched_run_cmd(self, cmds, open_on_success: bool = False, cleanup_dirs=None):
+        def _patched_run_cmd(self, cmds, open_on_success: bool = False, cleanup_dirs=None, **_kwargs):
             enq, where = _fv_find_enqueue(self)
             if callable(enq) and cmds:
-                if _fv_call_enqueue(self, enq, where, cmds, open_on_success):
+                if _fv_call_enqueue(self, enq, where, cmds, open_on_success, **_kwargs):
                     return
             # Fallback to original implementation
             if callable(_orig_run_cmd):
-                return _orig_run_cmd(self, cmds, open_on_success=open_on_success, cleanup_dirs=cleanup_dirs)
+                return _orig_run_cmd(self, cmds, open_on_success=open_on_success, cleanup_dirs=cleanup_dirs, **_kwargs)
 
         setattr(_UpscClass, "_run_cmd", _patched_run_cmd)
 
@@ -2304,11 +3023,49 @@ def _fv_r11_wrap_file(orig):
             in_p = __P(src); out_p = __P(outfile)
             if in_p.exists() and in_p.is_dir():
                 out_p.mkdir(parents=True, exist_ok=True)
-                return [engine_exe, "-i", str(in_p), "-o", str(out_p), "-s", str(sc), "-n", base, "-m", dstr]
+                cmd = [engine_exe, "-i", str(in_p), "-o", str(out_p), "-s", str(sc), "-n", base, "-m", dstr]
+                # Force GPU selection + tuning for Upscayl/ESRGAN models (realesrgan-ncnn-vulkan)
+                try:
+                    gid = os.environ.get("FV_REALSR_GPU_ID", "").strip() or "0"
+                    cmd += ["-g", str(gid)]
+                except Exception:
+                    pass
+                try:
+                    jobs = os.environ.get("FV_REALSR_JOBS", "").strip()
+                    if jobs:
+                        cmd += ["-j", str(jobs)]
+                except Exception:
+                    pass
+                try:
+                    t = int(self.spin_tile.value()) if hasattr(self, "spin_tile") else 0
+                    if t > 0:
+                        cmd += ["-t", str(t)]
+                except Exception:
+                    pass
+                return cmd
             if (not out_p.suffix) or (out_p.exists() and out_p.is_dir()):
                 out_p.mkdir(parents=True, exist_ok=True)
                 out_p = out_p / (in_p.stem + ".png")
-            return [engine_exe, "-i", str(in_p), "-o", str(out_p), "-s", str(sc), "-n", base, "-m", dstr]
+            cmd = [engine_exe, "-i", str(in_p), "-o", str(out_p), "-s", str(sc), "-n", base, "-m", dstr]
+            # Force GPU selection + tuning for Upscayl/ESRGAN models (realesrgan-ncnn-vulkan)
+            try:
+                gid = os.environ.get("FV_REALSR_GPU_ID", "").strip() or "0"
+                cmd += ["-g", str(gid)]
+            except Exception:
+                pass
+            try:
+                jobs = os.environ.get("FV_REALSR_JOBS", "").strip()
+                if jobs:
+                    cmd += ["-j", str(jobs)]
+            except Exception:
+                pass
+            try:
+                t = int(self.spin_tile.value()) if hasattr(self, "spin_tile") else 0
+                if t > 0:
+                    cmd += ["-t", str(t)]
+            except Exception:
+                pass
+            return cmd
         return orig(self, engine_exe, src, outfile, model, scale)
     return _wrapped
 
@@ -2324,7 +3081,26 @@ def _fv_r11_wrap_dir(orig):
         if isinstance(data, dict) and data.get("fv") == "upsc-model":
             base = data["base"]; dstr = data["dir"]; sc = int(data["scale"])
             in_p = __P(in_dir); out_p = __P(out_dir); out_p.mkdir(parents=True, exist_ok=True)
-            return [engine_exe, "-i", str(in_p), "-o", str(out_p), "-s", str(sc), "-n", base, "-m", dstr]
+            cmd = [engine_exe, "-i", str(in_p), "-o", str(out_p), "-s", str(sc), "-n", base, "-m", dstr]
+            # Force GPU selection + tuning for Upscayl/ESRGAN models (realesrgan-ncnn-vulkan)
+            try:
+                gid = os.environ.get("FV_REALSR_GPU_ID", "").strip() or "0"
+                cmd += ["-g", str(gid)]
+            except Exception:
+                pass
+            try:
+                jobs = os.environ.get("FV_REALSR_JOBS", "").strip()
+                if jobs:
+                    cmd += ["-j", str(jobs)]
+            except Exception:
+                pass
+            try:
+                t = int(self.spin_tile.value()) if hasattr(self, "spin_tile") else 0
+                if t > 0:
+                    cmd += ["-t", str(t)]
+            except Exception:
+                pass
+            return cmd
         return orig(self, engine_exe, in_dir, out_dir, model, scale)
     return _wrapped
 

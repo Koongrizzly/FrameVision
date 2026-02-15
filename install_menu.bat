@@ -65,26 +65,21 @@ echo %RST%      Creates/updates .venv and installs FrameVision without
 echo %RST%      dependencies or model downloads.
 echo %BLUE%      Good for a quick repair when the app no longer starts.
 echo. 
-echo %ITEM% 3^)  Full install %ORANGE%(CPU / non-CUDA)
-echo %RST%      Installs the app plus CPU-only ML dependencies.
-echo %BLUE%      Works on any machine; use this up to 6gig of Vram.
-echo.
-echo %ITEM% 4^)  Full install %ORANGE%(CUDA GPU)
+echo %ITEM% 3^)  Full install %ORANGE%(CUDA GPU)
 echo %RST%      Installs the app plus CUDA-enabled ML dependencies
 echo %BLUE%      for NVIDIA GPUs. 8 gig Vram or more is advised 
 echo.
-echo %ITEM% 5^)  Exit
+echo %ITEM% 4^)  Exit
 echo. %RST%
 
-choice /C 12345 /N /M "Choose an option [1-5]: "
+choice /C 1234 /N /M "Choose an option [1-4]: "
 set "CHOICE=%ERRORLEVEL%"
 echo.
 
 if "%CHOICE%"=="1" goto check
 if "%CHOICE%"=="2" goto core
-if "%CHOICE%"=="3" goto cpu
-if "%CHOICE%"=="4" goto cuda
-if "%CHOICE%"=="5" goto end
+if "%CHOICE%"=="3" goto cuda
+if "%CHOICE%"=="4" goto end
 :invalid_choice
 echo.
 echo %BRIGHT_YELLOW%Invalid selection or CHOICE error. Returning to menu...%RST%
@@ -260,6 +255,7 @@ REM --- Qt/graph/MPV bindings ---
 if exist ".venv\Scripts\python.exe" call ".venv\Scripts\python.exe" -m pip install --prefer-binary "PyQt5==5.15.*" || goto pip_fail
 if exist ".venv\Scripts\python.exe" call ".venv\Scripts\python.exe" -m pip install --prefer-binary "pyqtgraph>=0.13,<1.0" || goto pip_fail
 if exist ".venv\Scripts\python.exe" call ".venv\Scripts\python.exe" -m pip install --prefer-binary "python-mpv>=1.0.6" || goto pip_fail
+if exist ".venv\Scripts\python.exe" call ".venv\Scripts\python.exe" -m pip install --prefer-binary "PyQtWebEngine==5.15.*" || goto pip_fail
 
 rem ignore failures
 exit /b 0
@@ -398,16 +394,16 @@ echo( Free space on drive %CD:~0,3% : !FREE_GB! GiB
 
 echo(
 rem --- Estimated required space (edit if needed) ---
-set "BASE_REQ_GB=5"
-set "MODELS_REQ_GB=30"
+set "BASE_REQ_GB=6"
+set "MODELS_REQ_GB=15"
 for /f "usebackq delims=" %%R in (`powershell -NoProfile -Command "[math]::Round([double](%BASE_REQ_GB% + %MODELS_REQ_GB%),1).ToString([System.Globalization.CultureInfo]::InvariantCulture)"`) do set "REQ_GB=%%R"
 if not defined REQ_GB set "REQ_GB=%BASE_REQ_GB%"
 echo( Estimated required (optional installs not included): ~!REQ_GB! GiB  ^(Base app+venv ~!BASE_REQ_GB! GiB  + Models/Zips ~!MODELS_REQ_GB! GiB^)
 
 echo(
 rem --- Recommendation ---
-set "RECO=CPU install (option 3)"
-if /I "!CUDA_CAPABLE!"=="YES" set "RECO=GPU install (option 4)"
+set "RECO=Core install (option 2)"
+if /I "!CUDA_CAPABLE!"=="YES" set "RECO=GPU install (option 3)"
 echo( Suggested: !RECO!
 
 echo(
@@ -640,11 +636,11 @@ echo.
 
 rem --- Recommendation ---
 
-set "RECO=CPU install (option 3)"
+set "RECO=Core install (option 2)"
 
 for /f "delims=" %%K in ('powershell -NoProfile -Command "$v='%GPU_VRAM_GB%'; if($v -and [double]$v -ge 4){'OK'}"') do set "VRAM_OK=%%K"
 
-if /I "%CUDA_CAPABLE%"=="YES" if "%VRAM_OK%"=="OK" set "RECO=GPU install (option 4)"
+if /I "%CUDA_CAPABLE%"=="YES" if "%VRAM_OK%"=="OK" set "RECO=GPU install (option 3)"
 
 echo( Suggested: !RECO!
 
@@ -871,11 +867,11 @@ echo.
 
 rem --- Recommendation ---
 
-set "RECO=CPU install (option 3)"
+set "RECO=Core install (option 2)"
 
 for /f "delims=" %%K in ('powershell -NoProfile -Command "$v='%GPU_VRAM_GB%'; if($v -and [double]$v -ge 4){'OK'}"') do set "VRAM_OK=%%K"
 
-if /I "%CUDA_CAPABLE%"=="YES" if "%VRAM_OK%"=="OK" set "RECO=GPU install (option 4)"
+if /I "%CUDA_CAPABLE%"=="YES" if "%VRAM_OK%"=="OK" set "RECO=GPU install (option 3)"
 
 echo Suggested: !RECO!
 
@@ -1096,11 +1092,11 @@ echo.
 
 rem --- Recommendation ---
 
-set "RECO=CPU install (option 3)"
+set "RECO=Core install (option 2)"
 
 for /f "usebackq delims=" %%K in (`powershell -NoProfile -Command "$v='%GPU_VRAM_GB%'; if($v -and [double]$v -ge 4){'OK'}"` ) do set "VRAM_OK=%%K"
 
-if /I "%CUDA_CAPABLE%"=="YES" if "%VRAM_OK%"=="OK" set "RECO=GPU install (option 4)"
+if /I "%CUDA_CAPABLE%"=="YES" if "%VRAM_OK%"=="OK" set "RECO=GPU install (option 3)"
 
 echo Suggested: !RECO!
 
