@@ -17831,7 +17831,7 @@ If the planner sees a marker like [02] or (02), it becomes the next image prompt
 
         # Allow queuing new jobs while one is running.
         can_generate = prompt_ok and (not bool(ui_block))
-try:
+        try:
             self.btn_generate.setEnabled(bool(can_generate))
         except Exception:
             pass
