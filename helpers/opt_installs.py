@@ -1355,7 +1355,30 @@ class OptionalInstallsDialog(QtWidgets.QDialog):
     # ---- env folder safety (optional installs)
 
     def _env_dir_for(self, opt: OptionalInstall) -> Optional[Path]:
-        rel = _ENV_DIR_BY_KEY.get(opt.key)
+        """Return the environment folder for an optional install.
+
+        Some optional installs share environments (e.g. Qwen2511 re-uses Qwen2512),
+        and some UI keys represent model downloads (qwen2512_q4, seedvr2_gguf_q4, ...)
+        that still belong to a single environment.
+
+        This function centralizes that mapping so the "keep / delete env" prompt always
+        points at the correct folder.
+        """
+
+        k = (getattr(opt, "key", "") or "").strip()
+
+        # Qwen: Qwen2511 and Qwen2512 share the same stable-diffusion.cpp environment.
+        # Always point env prompts to: <root>/.qwen2512/venv/
+        if k == "qwen2512" or k.startswith("qwen2512_") or k.startswith("qwen2511_"):
+            return (self.root_dir / Path(".qwen2512") / "venv").resolve()
+
+        # SeedVR2: GGUF downloads use the SeedVR2 env.
+        if k.startswith("seedvr2_gguf_"):
+            rel_seed = _ENV_DIR_BY_KEY.get("seedvr2_env", Path("environments") / ".seedvr2")
+            return (self.root_dir / rel_seed).resolve()
+
+        # Default: direct mapping.
+        rel = _ENV_DIR_BY_KEY.get(k)
         if rel is None:
             return None
         return (self.root_dir / rel).resolve()
