@@ -5486,7 +5486,7 @@ class PipelineWorker(QThread):
                         _vp = str((getattr(self.job, 'encoding', {}) or {}).get('videoclip_preset') or '').strip()
                     except Exception:
                         _vp = ""
-                    _needs_time_fit = _vp in ("Storyline Preset (Hardcuts)", "Storyline Music videoclip")
+                    _needs_time_fit = True  # always respect Duration slider in Own storymode
 
                     # Normalize prompt list (keep order; strip newlines; ignore empties)
                     plist = _own_storyline_prompts if isinstance(_own_storyline_prompts, list) else []
@@ -16772,15 +16772,65 @@ If the planner sees a marker like [02] or (02), it becomes the next image prompt
                 if n <= 0:
                     self.lbl_own_storyline_count.setText("Detected prompts: 0")
                 else:
-                    self.lbl_own_storyline_count.setText(f"Detected prompts: {n} → {n} images will be generated")
+                    # Preview respects Duration slider: Own storymode will downsample prompts if too many.
+                    dur = 0
+                    try:
+                        dur = int(self.sld_duration.value()) if hasattr(self, "sld_duration") else 0
+                    except Exception:
+                        dur = 0
+
+                    min_sec_preview = 2.5
+                    try:
+                        vm = str(self.cmb_video_model.currentText() if hasattr(self, "cmb_video_model") else "")
+                        gq = str(self.cmb_gen_quality.currentText() if hasattr(self, "cmb_gen_quality") else "")
+                        prof = _resolve_generation_profile(vm, gq) or {}
+                        min_sec_preview = float(prof.get("min_sec", min_sec_preview) or min_sec_preview)
+                    except Exception:
+                        pass
+
+                    k = int(n)
+                    if dur > 0 and n > 0:
+                        try:
+                            k = int(max(1, min(int(n), int(float(dur) / max(0.1, float(min_sec_preview))))))
+                        except Exception:
+                            k = int(n)
+
+                    if k < int(n):
+                        self.lbl_own_storyline_count.setText(f"Detected prompts: {n} → using {k} (Duration fit)")
+                    else:
+                        self.lbl_own_storyline_count.setText(f"Detected prompts: {n} → {n} images will be generated")
         except Exception:
             pass
 
-        # show a gentle warning only for the most ambiguous fallback
+        # show gentle warnings (parser fallback + duration fit)
         try:
             if hasattr(self, "lbl_own_storyline_warn") and self.lbl_own_storyline_warn is not None:
+                msgs: List[str] = []
                 if n > 0 and str(mode) == "paragraph":
-                    self.lbl_own_storyline_warn.setText("No markers found — using paragraphs.")
+                    msgs.append("No markers found — using paragraphs.")
+
+                # Duration fit warning: if too many prompts for the current duration, some will be skipped.
+                try:
+                    dur = int(self.sld_duration.value()) if hasattr(self, "sld_duration") else 0
+                except Exception:
+                    dur = 0
+                min_sec_preview = 2.5
+                try:
+                    vm = str(self.cmb_video_model.currentText() if hasattr(self, "cmb_video_model") else "")
+                    gq = str(self.cmb_gen_quality.currentText() if hasattr(self, "cmb_gen_quality") else "")
+                    prof = _resolve_generation_profile(vm, gq) or {}
+                    min_sec_preview = float(prof.get("min_sec", min_sec_preview) or min_sec_preview)
+                except Exception:
+                    pass
+                try:
+                    k = int(max(1, min(int(n), int(float(dur) / max(0.1, float(min_sec_preview)))))) if (dur > 0 and n > 0) else int(n)
+                except Exception:
+                    k = int(n)
+                if int(k) < int(n):
+                    msgs.append("Duration fit: some prompts will be skipped to match the duration slider.")
+
+                if msgs:
+                    self.lbl_own_storyline_warn.setText("\n".join(msgs))
                     self.lbl_own_storyline_warn.setVisible(True)
                 else:
                     self.lbl_own_storyline_warn.setVisible(False)
