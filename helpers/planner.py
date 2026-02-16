@@ -9814,6 +9814,7 @@ class PipelineWorker(QThread):
                 }, sort_keys=True))
 
             def step_music_ace15_7a() -> None:
+                nonlocal music_file
                 # Only run if background music is enabled AND the user selected Ace Step 1.5.
                 if (not bool(getattr(self.job, "music_background", False))) or (str(getattr(self.job, "music_mode", "") or "") != "ace15"):
                     raise RuntimeError("internal: step called but music mode is not ace15")
@@ -9828,6 +9829,12 @@ class PipelineWorker(QThread):
                         dur_s = float(getattr(self.job, "approx_duration_sec", 0) or 0.0)
                     except Exception:
                         dur_s = 0.0
+                # When Videoclip Creator is the assembly step, we must follow the intended project duration (not the placeholder pre-assembly output).
+                try:
+                    if bool(_use_videoclip_creator):
+                        dur_s = float(getattr(self.job, "approx_duration_sec", dur_s) or dur_s)
+                except Exception:
+                    pass
                 # Final safety clamp (ACE expects a sensible positive duration in seconds)
                 if dur_s <= 0.1:
                     dur_s = 15.0
@@ -9860,6 +9867,7 @@ class PipelineWorker(QThread):
                     ace_fmt = "wav"
 
                 audio_out = os.path.join(audio_dir, f"music_ace15.{ace_fmt}")
+                music_file = str(audio_out)
                 ace_log = os.path.join(audio_dir, "ace15_log.txt")
                 ace_meta = os.path.join(audio_dir, "ace15_meta.json")
 
@@ -10199,6 +10207,31 @@ class PipelineWorker(QThread):
                 if bool(getattr(self.job, "music_background", False)) and str(getattr(self.job, "music_mode", "") or "") == "ace15":
                     _ace15_step_name = "Music (Ace Step 1.5)"
                     _run(_ace15_step_name, step_music_ace15_7a, _tail_pct_fn(_ace15_step_name))
+                    # If Videoclip Creator assembly was chosen, it likely ran earlier using a silent bed (because music didn't exist yet).
+                    # Now that Ace15 music exists, re-run Videoclip Creator so it can segment + pick clips across the full music duration.
+                    try:
+                        if bool(_use_videoclip_creator):
+                            preset_path2 = os.path.join(str(_root()), 'presets', 'setsave', 'plannerclip.json')
+                            music_now = str((manifest.get('paths') or {}).get('music_file') or '')
+                            if music_now and os.path.exists(music_now):
+                                fp2 = _compute_mclip_fingerprint(music_now, preset_path2)
+                                prev2 = (manifest.get('steps') or {}).get(_mclip_step_name) or {}
+                                if (prev2.get('fingerprint') != fp2):
+                                    _log('[INFO] Re-running Videoclip Creator now that Ace Step 1.5 music is available...')
+                                    _run(_mclip_step_name, step_videoclip_creator_10a, _tail_pct_fn(_mclip_step_name))
+                                    # Update step record
+                                    try:
+                                        srec3 = (manifest.get('steps') or {}).get(_mclip_step_name) or {}
+                                        srec3['fingerprint'] = fp2
+                                        srec3.setdefault('debug', {}).update({'timeline_json': timeline_json, 'rerun_after_ace15': True})
+                                        srec3['ts'] = time.time()
+                                        manifest.setdefault('steps', {})[_mclip_step_name] = srec3
+                                        _safe_write_json(manifest_path, manifest)
+                                    except Exception:
+                                        pass
+                    except Exception:
+                        # Never fail the whole job because of this rerun; the user still has the first assembly output.
+                        pass
             except Exception:
                 raise
 
@@ -11112,7 +11145,7 @@ class PipelineWorker(QThread):
                 # Decide audio sources:
                 # Decide audio sources:
                 # HeartMula (and any explicit music mode) must include music even if the Background music toggle is off.
-                force_music = str(getattr(self.job, "music_mode", "") or "").strip() in ("ace", "heartmula", "file")
+                force_music = str(getattr(self.job, "music_mode", "") or "").strip() in ("ace", "ace15", "heartmula", "file")
                 have_music = bool((not bool(getattr(self.job, "silent", False))) and bool(music_file) and os.path.exists(music_file) and (bool(getattr(self.job, "music_background", False)) or force_music))
                 have_narr = bool(narr_wav_ready and os.path.exists(narration_wav))
 
@@ -11282,7 +11315,7 @@ class PipelineWorker(QThread):
                     raise RuntimeError(f"Clips folder not found: {clips_dir}")
                 
                 # Choose audio for videoclip creator
-                force_music = str(getattr(self.job, 'music_mode', '') or '').strip() in ('ace', 'heartmula', 'file')
+                force_music = str(getattr(self.job, 'music_mode', '') or '').strip() in ('ace', 'ace15', 'heartmula', 'file')
                 have_music = bool((not bool(getattr(self.job, 'silent', False))) and bool(music_file) and os.path.exists(music_file) and (bool(getattr(self.job, 'music_background', False)) or force_music))
                 have_narr = bool((not bool(getattr(self.job, 'silent', False))) and bool(getattr(self.job, 'narration_enabled', False)) and _file_ok(narration_wav, 512))
                 audio_for_creator = ''
@@ -12448,7 +12481,7 @@ class PipelineWorker(QThread):
                     return
 
                 # SeedVR2 runner (HQ / slow)
-                if engine_key == "seedvr2":
+                elif engine_key == "seedvr2":
                     # Resolve settings with safe defaults
                     resolution = int(settings.get("seedvr2_resolution") or 1080)
                     temporal_overlap = 1 if int(settings.get("seedvr2_temporal_overlap") or 0) else 0
@@ -12575,9 +12608,13 @@ class PipelineWorker(QThread):
                         srec["ts"] = time.time()
                     except Exception:
                         pass
-                    
+
+                    manifest.setdefault("steps", {})[_upscale_step_name] = srec
+                    _safe_write_json(manifest_path, manifest)
+                    return
+
                 # Anime upscaler (Real-ESRGAN x4plus-anime)
-                if engine_key == "anime":
+                elif engine_key == "anime":
                     rootp = str(_root())
                     mdir = os.path.join(rootp, "models", "realesrgan")
                     exe = os.path.join(mdir, "realesrgan-ncnn-vulkan.exe")
@@ -17378,12 +17415,20 @@ If the planner sees a marker like [02] or (02), it becomes the next image prompt
 
     def _build_job(self) -> PlannerJob:
         prompt = (self.prompt_edit.toPlainText() or "").strip()
-        if not prompt:
+        own_story = False
+        try:
+            own_story = bool(getattr(self, "chk_own_storyline", None) and self.chk_own_storyline.isChecked())
+        except Exception:
+            own_story = False
+        if not prompt and not own_story:
             raise ValueError("Prompt is empty.")
+        # Own storymode does not require an extra prompt; keep a small placeholder for titles/folders.
+        if not prompt and own_story:
+            prompt = "Own storyline"
 
         negatives = (self.negatives_edit.toPlainText() or "").strip()
 
-                # Collect attachments once (used for music file detection + ref images)
+        # Collect attachments once (used for music file detection + ref images)
         attachments = self._collect_attachments()
 
         storytelling = self.chk_story.isChecked()
