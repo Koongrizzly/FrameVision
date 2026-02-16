@@ -19392,6 +19392,9 @@ class ImageReviewDialog(QDialog):
 
         self._manifest_path = str(self._payload.get("manifest_path") or "")
         self._images_dir = str(self._payload.get("images_dir") or "")
+        # For resume / history workflows: we may need to invalidate / regenerate clips
+        # after an image was regenerated.
+        self._clips_dir = str(self._payload.get("clips_dir") or "")
 
         root = QVBoxLayout(self)
         root.setContentsMargins(10, 10, 10, 10)
@@ -19724,7 +19727,149 @@ class ImageReviewDialog(QDialog):
                 it.setToolTip((self.prompt_edit.toPlainText() or "").strip())
         except Exception:
             pass
+
+        # If this image was regenerated during a resume, the existing clip (if any)
+        # is now potentially stale. Offer to delete it so the workflow regenerates it.
+        try:
+            self._offer_clip_regen_for_image(str(sid))
+        except Exception:
+            pass
         self._set_busy(False, f"Done: {sid}")
+
+    def _resolve_clip_for_sid(self, sid: str) -> str:
+        """Find an existing clip file for this shot id (best-effort)."""
+        sid = str(sid or "").strip()
+        if not sid:
+            return ""
+
+        # 1) manifest paths.clips
+        try:
+            manifest = self._read_manifest()
+            items = (manifest.get("paths") or {}).get("clips") or []
+            if isinstance(items, list):
+                for it in items:
+                    if isinstance(it, dict) and str(it.get("id") or "").strip() == sid:
+                        fp = str(it.get("file") or "").strip()
+                        if fp and os.path.isfile(fp):
+                            return fp
+        except Exception:
+            pass
+
+        # 2) conventional <clips_dir>/<sid>.mp4
+        try:
+            if self._clips_dir and os.path.isdir(self._clips_dir):
+                cand = os.path.join(self._clips_dir, f"{sid}.mp4")
+                if os.path.isfile(cand):
+                    return cand
+                # 3) legacy naming: shot_###_<sid>.mp4
+                cands = sorted([str(p) for p in Path(self._clips_dir).glob(f"*_{sid}.mp4") if p.is_file()])
+                if cands:
+                    return cands[-1]
+        except Exception:
+            pass
+        return ""
+
+    def _invalidate_clips_cache(self) -> None:
+        """Prevent clip stage from skipping due to a stale fingerprint/manifest.
+
+        The clip stage may fast-skip based on clips_manifest.json and a coarse
+        directory fingerprint. When an image is overwritten in-place, the images
+        directory mtime may not change (notably on Windows), so we explicitly
+        invalidate the clip manifest here when the user wants a new clip.
+        """
+        try:
+            if not self._clips_dir:
+                return
+            cm = os.path.join(self._clips_dir, "clips_manifest.json")
+            if os.path.exists(cm):
+                os.remove(cm)
+        except Exception:
+            pass
+
+        # Also create a "touch" marker in images_dir by delete+create to force a
+        # directory mtime update in the common case.
+        try:
+            if not self._images_dir or not os.path.isdir(self._images_dir):
+                return
+            touch = os.path.join(self._images_dir, "_regen_touch.flag")
+            try:
+                if os.path.exists(touch):
+                    os.remove(touch)
+            except Exception:
+                pass
+            try:
+                with open(touch, "w", encoding="utf-8") as f:
+                    f.write(str(time.time()))
+            except Exception:
+                pass
+        except Exception:
+            pass
+
+    def _remove_clip_from_manifest(self, sid: str) -> None:
+        sid = str(sid or "").strip()
+        if not sid or not self._manifest_path:
+            return
+        try:
+            manifest = self._read_manifest()
+            paths = manifest.get("paths") if isinstance(manifest.get("paths"), dict) else {}
+            clips = paths.get("clips") if isinstance(paths.get("clips"), list) else []
+            if clips:
+                new = []
+                for it in clips:
+                    if isinstance(it, dict) and str(it.get("id") or "").strip() == sid:
+                        continue
+                    new.append(it)
+                paths["clips"] = new
+                manifest["paths"] = paths
+                _safe_write_json(self._manifest_path, manifest)
+        except Exception:
+            pass
+
+    def _offer_clip_regen_for_image(self, sid: str) -> None:
+        sid = str(sid or "").strip()
+        if not sid:
+            return
+        clip = self._resolve_clip_for_sid(sid)
+        if not clip:
+            return
+        if not os.path.isfile(clip):
+            return
+
+        # Popup: image was recreated, offer to create a new clip.
+        try:
+            ans = QMessageBox.question(
+                self,
+                "Image recreated",
+                "Image was re-created. Do you want to create a new clip with this image?\n\n"
+                "Yes: delete the existing clip so the workflow can recreate it.\n"
+                "No: keep the existing clip.",
+                QMessageBox.Yes | QMessageBox.No,
+                QMessageBox.Yes,
+            )
+        except Exception:
+            ans = QMessageBox.Yes
+
+        if ans != QMessageBox.Yes:
+            return
+
+        # Delete clip so it will be recreated when the workflow continues.
+        try:
+            os.remove(clip)
+        except Exception:
+            # If deletion fails, don't crash the review UI.
+            pass
+
+        # Ensure the clip stage won't skip due to cached manifests/fingerprints.
+        try:
+            self._invalidate_clips_cache()
+        except Exception:
+            pass
+
+        # Keep manifest consistent (optional best-effort).
+        try:
+            self._remove_clip_from_manifest(sid)
+        except Exception:
+            pass
 
     def on_regen_failed(self, sid: str, err: str) -> None:
         self._regen_busy = False
