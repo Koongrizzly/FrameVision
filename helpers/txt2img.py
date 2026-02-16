@@ -1961,6 +1961,21 @@ class Txt2ImgPane(QWidget):
         self.gguf_model_label = QLabel("GGUF model")
         mdl_form.addRow(self.gguf_model_label, rowg)
 
+        # GGUF instruct (LLM) selector (used only for Z-Image Turbo GGUF engine)
+        self.gguf_instruct_combo = QComboBox()
+        try:
+            _compact_combo(self.gguf_instruct_combo, 12)
+        except Exception:
+            pass
+        self.gguf_instruct_refresh = QPushButton("Refresh")
+        self.gguf_instruct_browse = QPushButton("Browse…")
+        rowi = QHBoxLayout()
+        rowi.addWidget(self.gguf_instruct_combo, 1)
+        rowi.addWidget(self.gguf_instruct_refresh, 0)
+        rowi.addWidget(self.gguf_instruct_browse, 0)
+        self.gguf_instruct_label = QLabel("GGUF instruct")
+        mdl_form.addRow(self.gguf_instruct_label, rowi)
+
         self.gguf_vae_combo = QComboBox()
         try:
             _compact_combo(self.gguf_vae_combo, 12)
@@ -2082,6 +2097,7 @@ class Txt2ImgPane(QWidget):
         # Default hidden until GGUF engine is selected
         try:
             for _w in (self.gguf_model_label, self.gguf_model_combo, self.gguf_model_refresh, self.gguf_model_browse,
+                       self.gguf_instruct_label, self.gguf_instruct_combo, self.gguf_instruct_refresh, self.gguf_instruct_browse,
                        self.gguf_vae_label, self.gguf_vae_combo, self.gguf_vae_refresh, self.gguf_vae_browse, self.qwen_model_label, self.qwen_model_combo, self.qwen_model_refresh, self.qwen_model_browse, self.sd_cli_label, self.sd_cli_path, self.sd_cli_browse, self.sd_cli_clear):
                 _w.setVisible(False)
         except Exception:
@@ -2166,6 +2182,64 @@ class Txt2ImgPane(QWidget):
                     pass
                 print("[txt2img] gguf model scan failed:", e)
 
+
+        def _populate_gguf_instructs():
+            try:
+                from pathlib import Path as _P
+                ggdir = _P("./models") / "Z-Image-Turbo GGUF"
+                self.gguf_instruct_combo.blockSignals(True)
+                self.gguf_instruct_combo.clear()
+                self.gguf_instruct_combo.addItem("Auto (pick any Instruct GGUF)", "")
+                if ggdir.exists():
+                    for f in sorted(ggdir.glob("*.gguf")):
+                        n = f.name.lower()
+                        # Show likely LLM/instruct models (avoid the diffusion GGUF itself)
+                        if (('z_image' in n) or ('zimage' in n) or ('z-image' in n) or ('zimg' in n)):
+                            continue
+                        if not (('instruct' in n) or ('qwen' in n) or ('llm' in n) or ('chat' in n)):
+                            continue
+                        self.gguf_instruct_combo.addItem(f.name, str(f.resolve()))
+                # Restore last selection
+                try:
+                    saved = self._persist_settings.value("zimage_gguf_instruct_path", "") if hasattr(self, "_persist_settings") else ""
+                except Exception:
+                    saved = ""
+                if saved:
+                    idx = self.gguf_instruct_combo.findData(saved)
+                    if idx < 0:
+                        self.gguf_instruct_combo.addItem(_P(saved).name, saved)
+                        idx = self.gguf_instruct_combo.findData(saved)
+                    if idx >= 0:
+                        self.gguf_instruct_combo.setCurrentIndex(idx)
+                self.gguf_instruct_combo.blockSignals(False)
+            except Exception as e:
+                try:
+                    self.gguf_instruct_combo.blockSignals(False)
+                except Exception:
+                    pass
+                print("[txt2img] gguf instruct scan failed:", e)
+
+        def _browse_gguf_instruct():
+            try:
+                from pathlib import Path as _P
+                start = _P("./models") / "Z-Image-Turbo GGUF"
+                try:
+                    from PySide6.QtWidgets import QFileDialog
+                    path, _ = QFileDialog.getOpenFileName(self, "Select GGUF instruct (LLM)", str(start), "GGUF (*.gguf);;All files (*)")
+                except Exception:
+                    path = ""
+                if not path:
+                    return
+                path = str(_P(path).resolve())
+                idx = self.gguf_instruct_combo.findData(path)
+                if idx < 0:
+                    self.gguf_instruct_combo.addItem(_P(path).name, path)
+                    idx = self.gguf_instruct_combo.findData(path)
+                if idx >= 0:
+                    self.gguf_instruct_combo.setCurrentIndex(idx)
+            except Exception as e:
+                print("[txt2img] browse gguf instruct failed:", e)
+
         def _populate_gguf_vaes():
             try:
                 from pathlib import Path as _P
@@ -2233,22 +2307,27 @@ class Txt2ImgPane(QWidget):
         # Populate once and hook up actions
         try:
             _populate_gguf_models()
+            _populate_gguf_instructs()
             _populate_gguf_vaes()
             self.gguf_model_refresh.clicked.connect(_populate_gguf_models)
+            self.gguf_instruct_refresh.clicked.connect(_populate_gguf_instructs)
             self.gguf_vae_refresh.clicked.connect(_populate_gguf_vaes)
             self.gguf_model_browse.clicked.connect(_browse_gguf_model)
+            self.gguf_instruct_browse.clicked.connect(_browse_gguf_instruct)
             self.gguf_vae_browse.clicked.connect(_browse_gguf_vae)
 
             def _save_gguf_sel():
                 try:
                     if hasattr(self, "_persist_settings"):
                         self._persist_settings.setValue("zimage_gguf_model_path", self.gguf_model_combo.currentData() or "")
+                        self._persist_settings.setValue("zimage_gguf_instruct_path", self.gguf_instruct_combo.currentData() or "")
                         self._persist_settings.setValue("zimage_gguf_vae_path", self.gguf_vae_combo.currentData() or "")
                 except Exception:
                     pass
 
             try:
                 self.gguf_model_combo.currentIndexChanged.connect(lambda *_: _save_gguf_sel())
+                self.gguf_instruct_combo.currentIndexChanged.connect(lambda *_: _save_gguf_sel())
                 self.gguf_vae_combo.currentIndexChanged.connect(lambda *_: _save_gguf_sel())
             except Exception:
                 pass
@@ -3112,6 +3191,10 @@ class Txt2ImgPane(QWidget):
                 getattr(self, "gguf_model_combo", None),
                 getattr(self, "gguf_model_refresh", None),
                 getattr(self, "gguf_model_browse", None),
+                getattr(self, "gguf_instruct_label", None),
+                getattr(self, "gguf_instruct_combo", None),
+                getattr(self, "gguf_instruct_refresh", None),
+                getattr(self, "gguf_instruct_browse", None),
                 getattr(self, "gguf_vae_label", None),
                 getattr(self, "gguf_vae_combo", None),
                 getattr(self, "gguf_vae_refresh", None),
@@ -4278,9 +4361,11 @@ class Txt2ImgPane(QWidget):
                 if ek == "zimage_gguf":
                     try:
                         gm = (self.gguf_model_combo.currentData() if hasattr(self, "gguf_model_combo") else "") or ""
+                        gi = (self.gguf_instruct_combo.currentData() if hasattr(self, "gguf_instruct_combo") else "") or ""
                         gv = (self.gguf_vae_combo.currentData() if hasattr(self, "gguf_vae_combo") else "") or ""
                         # Store for debugging/JSON display
                         job["gguf_model_path"] = gm
+                        job["gguf_instruct_path"] = gi
                         job["gguf_vae_path"] = gv
                         # Reuse lora/lora2 fields as transport to zimage_cli (GGUF backend ignores actual LoRA)
                         job["lora_path"] = gm
@@ -5491,6 +5576,30 @@ def _gen_via_zimage(job: dict, out_dir: Path, progress_cb=None, cancel_event=Non
                     _env = _os.environ.copy()
                     _env["SD_CLI_PATH"] = str(pcli)
                     _env["SD_CLI"] = str(pcli)
+
+                # Optional: pass GGUF instruct (LLM) path through env so zimage_cli can pick it up.
+                try:
+                    sel_llm = str(job.get("gguf_instruct_path") or "").strip()
+                except Exception:
+                    sel_llm = ""
+                if sel_llm:
+                    try:
+                        from pathlib import Path as _P3
+                        pll = _P3(sel_llm)
+                        if not pll.is_absolute():
+                            try:
+                                _root = _P3(__file__).resolve().parents[1]
+                            except Exception:
+                                _root = _P3(".").resolve()
+                            pll = (_root / pll).resolve()
+                        if pll.exists() and pll.is_file():
+                            if _env is None:
+                                _env = _os.environ.copy()
+                            _env["ZIMAGE_GGUF_INSTRUCT_PATH"] = str(pll)
+                            _env["ZIMAGE_LLM_PATH"] = str(pll)
+                            _env["LLM_PATH"] = str(pll)
+                    except Exception:
+                        pass
             except Exception:
                 _env = None
 

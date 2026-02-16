@@ -33,6 +33,19 @@ import unicodedata
 import re
 
 
+def _safe_print(line: str) -> None:
+    """Print UTF-8 safely on Windows consoles (avoid cp1252 encode crashes)."""
+    try:
+        # Bypass sys.stdout encoding by writing bytes directly.
+        sys.stdout.buffer.write((str(line) + "\n").encode("utf-8", "replace"))
+        sys.stdout.flush()
+    except Exception:
+        try:
+            print(str(line))
+        except Exception:
+            pass
+
+
 def _unique_path(p: Path) -> Path:
     """Return a unique path by appending _### if needed."""
     try:
@@ -107,11 +120,26 @@ def _run_gguf(args) -> dict:
     root = _root_dir()
     gguf_dir = root / "models" / "Z-Image-Turbo GGUF"
 
-    exe = gguf_dir / "sd-cli.exe"
-    if not exe.exists():
-        exe = gguf_dir / "bin" / "sd-cli.exe"
-    if not exe.exists():
-        return {"files": [], "error": f"gguf_missing_sdcli: {exe} not found. Re-run the GGUF installer."}
+    # stable-diffusion.cpp executable (sd-cli.exe)
+    # Older installers placed this under:
+    #   models/Z-Image-Turbo GGUF/bin/sd-cli.exe
+    # Newer FrameVision bundles may place it under:
+    #   presets/bin/sd-cli.exe
+    # We accept either location.
+    candidates = [
+        gguf_dir / "sd-cli.exe",
+        gguf_dir / "bin" / "sd-cli.exe",
+        root / "presets" / "bin" / "sd-cli.exe",
+    ]
+    exe = None
+    for c in candidates:
+        if c.exists():
+            exe = c
+            break
+    if exe is None:
+        tried = ", ".join(str(c) for c in candidates)
+        return {"files": [], "error": f"gguf_missing_sdcli: tried [{tried}]. Copy sd-cli.exe into presets/bin/ or models/Z-Image-Turbo GGUF/bin/ (or re-run the GGUF installer)."}
+
 
     default_diffusion = gguf_dir / "z_image_turbo-Q5_0.gguf"
     default_vae = gguf_dir / "ae.safetensors"
@@ -186,7 +214,7 @@ def _run_gguf(args) -> dict:
             try:
                 msg = "[zimage_cli][gguf] Sanitized prompt/negative to ASCII for sd-cli compatibility."
                 _log(msg)
-                print(msg, flush=True)
+                _safe_print(msg)
             except Exception:
                 pass
         h = int(getattr(args, "height", 1024))
@@ -233,7 +261,7 @@ def _run_gguf(args) -> dict:
             cmd += ["--vae-tiling", "--offload-to-cpu", "--clip-on-cpu", "--vae-on-cpu"]
 
         _log("CMD: " + " ".join(cmd))
-        print("[zimage_cli][gguf] " + " ".join(cmd), flush=True)
+        _safe_print("[zimage_cli][gguf] " + " ".join(cmd))
 
         try:
             p = subprocess.Popen(
@@ -247,7 +275,7 @@ def _run_gguf(args) -> dict:
             assert p.stdout is not None
             for line in p.stdout:
                 _log(line)
-                print(line.rstrip("\\n"), flush=True)
+                _safe_print(line.rstrip("\\n"))
             rc = p.wait()
         except Exception as e:
             _log(f"EXCEPTION: {e}")
@@ -300,11 +328,11 @@ def main(argv=None) -> int:
     if getattr(args, 'backend', 'diffusers') == 'gguf':
         try:
             payload = _run_gguf(args)
-            print(json.dumps(payload))
+            _safe_print(json.dumps(payload))
             return 0 if payload.get('files') else 1
         except Exception as e:
             payload = {'files': [], 'error': f'gguf_exception: {e}', 'trace': traceback.format_exc()}
-            print(json.dumps(payload))
+            _safe_print(json.dumps(payload))
             return 1
 
     try:
