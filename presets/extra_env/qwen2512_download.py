@@ -401,6 +401,17 @@ def main(argv: Optional[list[str]] = None) -> int:
     models_dir = Path(args.models_dir).resolve()
     models_dir.mkdir(parents=True, exist_ok=True)
 
+    # Canonicalize models-dir:
+    # Some older callers accidentally pass the Qwen-Edit-2511 folder or the generic qwen2512gguf folder.
+    # FrameVision expects all Qwen-Image-2512 GGUF assets to live under:
+    #   <root>/models/Qwen-Image-2512 GGUF
+    # To keep installs consistent, auto-redirect those legacy folders.
+    legacy_names = {"qwen2511gguf", "qwen2512gguf", "qwen2512"}
+    if models_dir.name.lower() in legacy_names:
+        models_dir = root / "models" / "Qwen-Image-2512 GGUF"
+        models_dir.mkdir(parents=True, exist_ok=True)
+        print(f"[QWEN2512] NOTE Redirected models-dir to: {models_dir}")
+
     print(f"[QWEN2512] Root:       {root}")
     print(f"[QWEN2512] Models dir: {models_dir}")
 
