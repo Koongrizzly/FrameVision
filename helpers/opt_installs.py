@@ -669,30 +669,14 @@ OptionalInstall(
             description="Installs the SeedVR2 GGUF environment + dependencies. Creates: environments/.seedvr2/",
             runner=_run_seedvr2_env,
         ),
-        OptionalInstall(
-            key="seedvr2_gguf_q3",
-            title="SeedVR2 3B GGUF (Q3_K_M)",
-            description="Lowest VRAM / smallest. If the env is missing, it will be installed first.",
-            runner=_run_seedvr2_q3,
-        ),
+
         OptionalInstall(
             key="seedvr2_gguf_q4",
             title="SeedVR2 3B GGUF (Q4_K_M)",
             description="Balanced size/quality. Recommended starting point. If the env is missing, it will be installed first.",
             runner=_run_seedvr2_q4,
         ),
-        OptionalInstall(
-            key="seedvr2_gguf_q5",
-            title="SeedVR2 3B GGUF (Q5_K_M)",
-            description="Higher quality / larger. If the env is missing, it will be installed first.",
-            runner=_run_seedvr2_q5,
-        ),
-        OptionalInstall(
-            key="seedvr2_gguf_q6",
-            title="SeedVR2 3B GGUF (Q6_K)",
-            description="High quality / large. If the env is missing, it will be installed first.",
-            runner=_run_seedvr2_q6,
-        ),
+
         OptionalInstall(
             key="seedvr2_gguf_q8",
             title="SeedVR2 3B GGUF (Q8_0)",
