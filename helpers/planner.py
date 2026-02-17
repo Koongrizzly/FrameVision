@@ -10,6 +10,7 @@ Goal:
   - Ace step and Heartmula, for instrumental background music (ace) or full tracks (HeartMula)
   - Image generation (Z-Image, Qwen 2512, SDXL, etc.)
   - Video generation (Qwen 2.2 5B, HunyuanVideo, etc.)
+  - Videoclip Creator preset runner (FrameVision internal tool)
 
 This file focuses on:
 - being user friendly : little work for users, a lot of work behind the scenes with hardcoded 'best settings' for most tools
@@ -155,25 +156,6 @@ _PLANNER_SETTINGS_PATH = _root() / "presets" / "setsave" / "planner_settings.jso
 
 # Chunk 9B1: Planner-only upscaling settings (per-project folder)
 _PLANNER_UPSCALE_JSON_NAME = "planner_upscale.json"
-
-def _read_planner_upscale_settings(project_dir: str) -> Dict[str, Any]:
-    """Read per-project Planner upscaling settings.
-
-    Stored as <project_dir>/{name}. Returns {} when missing/invalid.
-    """
-    try:
-        p = os.path.join(str(project_dir or ""), _PLANNER_UPSCALE_JSON_NAME)
-    except Exception:
-        p = ""
-    try:
-        if (not p) or (not os.path.isfile(p)):
-            return {}
-        with open(p, "r", encoding="utf-8", errors="ignore") as f:
-            obj = json.load(f)
-        return obj if isinstance(obj, dict) else {}
-    except Exception:
-        return {}
-
 
 
 def _load_planner_settings() -> Dict[str, Any]:
@@ -4011,59 +3993,102 @@ class PipelineWorker(QThread):
                     vae_path = str(d.get("vae") or "")
                     # Qwen Edit 2511 UNet GGUF auto-pick (prefer Q5, then Q4, then any).
                     # Models are expected under: <root>/models/qwen2511gguf/unet/*.gguf
-
                     try:
-                        # Prefer models under <root>/models/qwen2511gguf/unet/, but be tolerant:
-                        # some installs place GGUFs in nested folders or directly under models/qwen2511gguf/.
-                        _base_dir = (_root() / "models" / "qwen2511gguf").resolve()
-                        _unet_dir = (_base_dir / "unet").resolve()
-                        _candidates = []
-
-                        def _add_candidates(_dir):
-                            try:
-                                if _dir.exists():
-                                    for x in _dir.glob("**/*.gguf"):
-                                        if x.is_file():
-                                            _candidates.append(str(x))
-                            except Exception:
-                                pass
-
-                        _add_candidates(_unet_dir)
-                        if not _candidates:
-                            _add_candidates(_base_dir)
-
-                        if _candidates:
+                        _unet_dir = _root() / "models" / "qwen2511gguf" / "unet"
+                        _ggufs = []
+                        try:
+                            if _unet_dir.exists():
+                                _ggufs = [str(x) for x in _unet_dir.glob("*.gguf") if x.is_file()]
+                        except Exception:
+                            _ggufs = []
+                        if _ggufs:
                             def _qwen2511_prio(_p: str):
                                 _n = os.path.basename(_p).lower()
-                                # Strongly prefer UNet-ish filenames if mixed content exists
-                                score0 = 0
-                                if ("unet" in _n) or ("qwen-image-edit-2511" in _n) or ("image-edit-2511" in _n):
-                                    score0 -= 10
-                                # Prefer Q5, then Q4, then anything else
+                                # Common names: ...-Q5_K_M.gguf / ...-Q4_K_M.gguf
                                 if re.search(r"(?:^|[-_\s])q5(?:$|[-_\s])", _n) or ("q5" in _n):
-                                    return (score0, 0, _n)
+                                    return (0, _n)
                                 if re.search(r"(?:^|[-_\s])q4(?:$|[-_\s])", _n) or ("q4" in _n):
-                                    return (score0, 1, _n)
-                                return (score0, 2, _n)
-
-                            # De-dupe while keeping sort stable
-                            _candidates = sorted(list(dict.fromkeys(_candidates)), key=_qwen2511_prio)
-                            unet_path = str(_candidates[0])
-
-                        # If we still don't have a valid UNet path, hard fail with a clear popup.
-                        if not (unet_path and os.path.exists(unet_path)):
-                            QMessageBox.warning(
-                                self,
-                                "Qwen Edit 2511 missing model",
-                                "Qwen Edit 2511 cannot run because no UNet GGUF was found.\n\n"
-                                "Looked in:\n"
-                                "models/qwen2511gguf/unet/  (recursive)\n"
-                                "models/qwen2511gguf/       (recursive)\n\n"
-                                "Recommended: qwen-image-edit-2511-Q5_K_M.gguf"
-                            )
-                            raise RuntimeError("Qwen2511: no UNet GGUF found in models/qwen2511gguf")
+                                    return (1, _n)
+                                return (2, _n)
+                            _ggufs = sorted(_ggufs, key=_qwen2511_prio)
+                            unet_path = str(_ggufs[0])
+                        else:
+                            # If helper defaults didn't provide a valid UNet either, hard fail with a clear popup.
+                            if not (unet_path and os.path.exists(unet_path)):
+                                QMessageBox.warning(
+                                    self,
+                                    "Qwen Edit 2511 missing model",
+                                    "Qwen Edit 2511 cannot run because no UNet GGUF was found.\n\n"
+                                    "Please download at least one model to:\n"
+                                    "models/qwen2511gguf/unet/\n\n"
+                                    "Recommended: qwen-image-edit-2511-Q5_K_M.gguf"
+                                )
+                                raise RuntimeError("Qwen2511: no UNet GGUF found in models/qwen2511gguf/unet")
                     except Exception:
                         # Let the caller decide whether to fall back; we only guarantee we don't crash here.
+                        pass
+
+                    tmp_blank = os.path.join(images_dir, f"_blank_{self.job.job_id}_{sid}_{int(time.time()*1000)}.png")
+
+                    try:
+                        if hasattr(_q2511, "_write_blank_png"):
+                                            _q2511._write_blank_png(tmp_blank, int(q_job.get("width") or 1024), int(q_job.get("height") or 576))
+                    except Exception:
+                        tmp_blank = ""
+
+                    cmd = _q2511.build_sdcli_cmd(
+                        sdcli_path=sdcli_path,
+                        caps=caps,
+                        init_img=tmp_blank,
+                        mask_path="",
+                        ref_images=refs,
+                        use_increase_ref_index=True,
+                        disable_auto_resize_ref_images=False,
+                        prompt=str(q_job.get("prompt") or ""),
+                        negative=str(q_job.get("negative_prompt") or q_job.get("negative") or ""),
+                        unet_path=unet_path,
+                        llm_path=llm_path,
+                        mmproj_path=mmproj_path,
+                        vae_path=vae_path,
+                        steps=int(q_job.get("steps") or 20),
+                        cfg=float(q_job.get("cfg") or 4.0),
+                        seed=int(q_job.get("seed") or 0),
+                        width=int(q_job.get("width") or 1024),
+
+                                        height=int(q_job.get("height") or 576),
+                        strength=1.0,
+                        sampling_method="euler",
+                        shift=2.3,
+                        out_file=str(q_job.get("out_file") or ""),
+                        use_vae_tiling=False,
+                        vae_tile_size="",
+                        vae_tile_overlap=0.0,
+                        use_offload=False,
+                        use_mmap=False,
+                        use_vae_on_cpu=True,
+                        use_clip_on_cpu=False,
+                        use_diffusion_fa=True,
+                        lora_model_dir="",
+                        lora_name=str(q_job.get("lora") or q_job.get("lora_path") or ""),
+                        lora_strength=float(q_job.get("lora_strength") or q_job.get("lora_scale") or 1.0),
+                    )
+
+                    rc = 1
+                    try:
+                        if hasattr(_q2511, "_run_capture"):
+                            rc, _out_text = _q2511._run_capture(cmd)
+                        else:
+                            rc = os.system(" ".join([str(x) for x in cmd]))
+                    except Exception:
+                        rc = 1
+
+                    ok = (rc == 0 and os.path.exists(target))
+                    res = {"ok": bool(ok), "files": ([target] if ok else []), "out_file": target, "rc": int(rc)}
+
+                    try:
+                        if tmp_blank and os.path.exists(tmp_blank):
+                            os.remove(tmp_blank)
+                    except Exception:
                         pass
                 else:
                     raise RuntimeError("sd-cli builder not available")
@@ -5454,7 +5479,8 @@ class PipelineWorker(QThread):
 
                                 # Own storyline: build a minimal seeded shot list directly from the user's prompt blocks.
                 if bool(_own_storyline_enabled):
-                    # Own Storyline: always respect the Duration slider (time-fit prompts to target duration).
+                    # info: Chunk 10 side quest — Step 4 (time fit + strongest preset constraints)
+                    # Own Storyline is the strongest input: for some presets we must reconcile prompt count vs duration.                    # Own Storyline: always respect the Duration slider in this mode.
                     _needs_time_fit = True  # always respect Duration slider in Own storymode
 
                     # Normalize prompt list (keep order; strip newlines; ignore empties)
@@ -5614,7 +5640,7 @@ class PipelineWorker(QThread):
                             else:
                                 middle = list(range(1, n_total - 1))
                                 need = max(0, int(k) - 2)
-                                # Deterministic sample (seeded by job_id + storyline digest)
+                                # Deterministic sample (seeded by job_id + storyline digest + preset)
                                 seed_basis = f"{getattr(self.job, 'job_id', '')}|{_own_storyline_digest}"
                                 try:
                                     _r = random.Random(int(_seed_to_int(seed_basis) or 0))
@@ -7928,9 +7954,6 @@ class PipelineWorker(QThread):
                                     lora_strength=float(q_job.get("lora_strength") or q_job.get("lora_scale") or 1.0),
                                 )
                         
-                                _run_start_ts = time.time()
-                                _out_text = ""
-                                _debug_path = os.path.join(images_dir, f"_debug_qwen2511_{sid}.txt")
                                 rc = 1
                                 try:
                                     if hasattr(_q2511, "_run_capture"):
@@ -7943,77 +7966,6 @@ class PipelineWorker(QThread):
                                 out_file = str(q_job.get("out_file") or "")
                                 ok = (rc == 0 and out_file and os.path.exists(out_file))
                                 res = {"ok": bool(ok), "files": ([out_file] if ok else []), "out_file": out_file, "rc": int(rc)}
-                                try:
-                                    _want_dbg = (not ok) or bool(self.job.encoding.get('debug_qwen2511') or False)
-                                    if _want_dbg:
-                                        try:
-                                            _cmd_s = " ".join([str(x) for x in (cmd or [])])
-                                        except Exception:
-                                            _cmd_s = str(cmd)
-                                        # Collect a quick directory listing for this shot
-                                        try:
-                                            _files = []
-                                            for _p in sorted(Path(images_dir).glob('*')):
-                                                if _p.is_file():
-                                                    try:
-                                                        _st = _p.stat()
-                                                        _files.append((float(_st.st_mtime), _p.name, int(_st.st_size)))
-                                                    except Exception:
-                                                        pass
-                                            _files.sort(key=lambda t: t[0], reverse=True)
-                                        except Exception:
-                                            _files = []
-                                        try:
-                                            with open(_debug_path, 'w', encoding='utf-8', errors='replace') as _df:
-                                                _df.write('QWEN2511 DEBUG\n')
-                                                _df.write('time=' + time.strftime('%Y-%m-%d %H:%M:%S') + '\n')
-                                                _df.write('cwd=' + os.getcwd() + '\n')
-                                                _df.write('images_dir=' + str(images_dir) + '\n')
-                                                _df.write('sid=' + str(sid) + '\n')
-                                                _df.write('expected_out=' + str(out_file) + '\n')
-                                                _df.write('expected_exists=' + str(bool(out_file and os.path.exists(out_file))) + '\n')
-                                                _df.write('rc=' + str(rc) + '\n')
-                                                _df.write('cmd=' + _cmd_s + '\n\n')
-                                                if _out_text:
-                                                    _df.write('--- captured output (tail) ---\n')
-                                                    _df.write(str(_out_text)[-12000:])
-                                                    _df.write('\n\n')
-                                                _df.write('--- recent files in images_dir (mtime desc) ---\n')
-                                                for _mt, _name, _sz in _files[:40]:
-                                                    _df.write(time.strftime('%H:%M:%S', time.localtime(_mt)) + f"  {_sz:>10}  {_name}\n")
-                                        except Exception:
-                                            pass
-                                        try:
-                                            if (not ok) and os.path.exists(_debug_path):
-                                                self.signals.log.emit(f"[qwen2511][debug] wrote {os.path.basename(_debug_path)}")
-                                        except Exception:
-                                            pass
-                                except Exception:
-                                    pass
-
-                                # Extra safety: if sd-cli returned nonzero but did write an image, pick it up.
-                                if (not ok) and (out_file and (not os.path.exists(out_file))):
-                                    try:
-                                        _recent = []
-                                        for _ext in ('.png', '.jpg', '.jpeg', '.webp', '.bmp'):
-                                            for _p in Path(images_dir).glob('*' + _ext):
-                                                try:
-                                                    if _p.is_file() and _p.stat().st_size >= 1024 and _p.stat().st_mtime >= (_run_start_ts - 1.0):
-                                                        _recent.append((float(_p.stat().st_mtime), str(_p)))
-                                                except Exception:
-                                                    pass
-                                        if _recent:
-                                            _recent.sort(key=lambda t: t[0], reverse=True)
-                                            out_file = _recent[0][1]
-                                            if out_file and os.path.exists(out_file):
-                                                ok = True
-                                                res = {'ok': True, 'files': [out_file], 'out_file': out_file, 'rc': int(rc), 'note': 'picked_recent_file'}
-                                                try:
-                                                    self.signals.log.emit(f"[qwen2511] picked recent output: {os.path.basename(out_file)}")
-                                                except Exception:
-                                                    pass
-                                    except Exception:
-                                        pass
                         
                                 try:
                                     if tmp_blank and os.path.exists(tmp_blank):
@@ -9025,326 +8977,6 @@ class PipelineWorker(QThread):
             # Progress window for the Assemble step is computed later based on which post-steps are enabled.
             _assemble_progress_win = {"start": 95, "end": 99}
 
-            # Step 2: alternate final assembly path (Music Clip Creator presets)
-            _vc_kind = ""
-            _vc_pid = ""
-            _vc_label = ""
-            try:
-                _vc_kind = str((self.job.encoding or {}).get("videoclip_preset_kind") or "").strip().lower()
-                _vc_pid = str((self.job.encoding or {}).get("videoclip_preset_id") or "").strip()
-                _vc_label = str((self.job.encoding or {}).get("videoclip_preset") or "").strip()
-            except Exception:
-                _vc_kind, _vc_pid, _vc_label = "", "", ""
-
-            _use_mclip = bool(_vc_kind == "mclip" and _vc_pid)
-
-            def step_final_videoclip() -> None:
-                """Assemble the final video using Music Clip Creator (1-click presets) instead of hardcuts."""
-                # Preconditions
-                _paths = (manifest.get("paths") or {})
-                _music = str(_paths.get("music_file") or "").strip()
-                _clips_dir = str(_paths.get("clips_dir") or "").strip()
-                if not _music or (not os.path.isfile(_music)):
-                    raise RuntimeError("Music Clip Creator assembly requires a valid music file, but none was found.")
-                if not _clips_dir or (not os.path.isdir(_clips_dir)):
-                    raise RuntimeError("Music Clip Creator assembly requires a clips folder, but none was found.")
-
-                # Resolve ffmpeg/ffprobe (use tool-bundled binaries when available)
-                def _tool(exe_name: str) -> str:
-                    b = _root() / "presets" / "bin"
-                    cands = []
-                    if os.name == "nt":
-                        cands += [b / f"{exe_name}.exe", b / f"{exe_name}.bat", b / exe_name]
-                    else:
-                        cands += [b / exe_name]
-                    for p in cands:
-                        try:
-                            if p.exists():
-                                return str(p)
-                        except Exception:
-                            pass
-                    return exe_name
-
-                ffprobe2 = _tool("ffprobe")
-                ffmpeg2 = _tool("ffmpeg")
-
-                try:
-                    from helpers import auto_music_sync as mclip  # type: ignore
-                except Exception:
-                    import auto_music_sync as mclip  # type: ignore
-
-                # Load preset settings (same JSON used by Music Clip Creator)
-                try:
-                    preset_settings = mclip._get_clip_preset_settings(_vc_pid) or {}  # type: ignore[attr-defined]
-                except Exception:
-                    preset_settings = {}
-
-                s = (preset_settings.get("settings") if isinstance(preset_settings, dict) else {}) or {}
-                if not isinstance(s, dict):
-                    s = {}
-
-                # Discover sources from the clips folder
-                sources = mclip.discover_video_sources(_clips_dir, ffprobe2)
-                if not sources:
-                    raise RuntimeError("No usable video clips found for Music Clip Creator assembly.")
-
-                # Analyze music and build timeline
-                analysis = mclip.analyze_music(_music, ffmpeg2)
-
-                def _b(key: str, default: bool = False) -> bool:
-                    try:
-                        v = s.get(key, default)
-                        if isinstance(v, bool):
-                            return v
-                        if isinstance(v, (int, float)):
-                            return bool(int(v))
-                        return str(v).strip().lower() in ("1", "true", "yes", "on")
-                    except Exception:
-                        return default
-
-                def _i(key: str, default: int = 0) -> int:
-                    try:
-                        return int(s.get(key, default))
-                    except Exception:
-                        return int(default)
-
-                def _f(key: str, default: float = 0.0) -> float:
-                    try:
-                        return float(s.get(key, default))
-                    except Exception:
-                        return float(default)
-
-                # No-FX / FX level
-                nofx = _b("check_nofx", False)
-                fx_idx = _i("combo_fx", 0)
-                if nofx:
-                    fx_level = "none"
-                elif fx_idx == 0:
-                    fx_level = "minimal"
-                elif fx_idx == 1:
-                    fx_level = "moderate"
-                else:
-                    fx_level = "high"
-
-                # Microclip mode
-                if _b("check_micro_chorus", False):
-                    micro_mode = 1
-                elif _b("check_micro_all", False):
-                    micro_mode = 2
-                elif _b("check_micro_verses", False):
-                    micro_mode = 3
-                else:
-                    micro_mode = 0
-
-                beats_per = max(1, _i("spin_beats_per_seg", 8))
-
-                transition_mode = _i("combo_transitions", 1)
-                if nofx:
-                    transition_mode = 1  # force hard cuts
-
-                clip_order_mode = _i("combo_clip_order", 1)  # Shuffle (no repeats) default
-
-                force_full_length = _b("check_full_length", True)
-
-                # Seed handling: always deterministic-ish per run, but stable when Use fixed seed exists
-                seed_value = _i("spin_seed", random.randint(0, 999999999))
-                seed_enabled = True
-
-                transition_random_enabled = (_b("check_trans_random", False) and (not nofx))
-                enabled_transition_modes = list(range(15))  # keep it simple (UI manager can refine later)
-
-                # Slow motion
-                slow_enabled = (_b("check_slow_enable", False) and (not nofx))
-                slow_sections = []
-                if slow_enabled:
-                    if _b("check_slow_intro", False): slow_sections.append("intro")
-                    if _b("check_slow_break", False): slow_sections.append("break")
-                    if _b("check_slow_chorus", False): slow_sections.append("chorus")
-                    if _b("check_slow_drop", False): slow_sections.append("drop")
-                    if _b("check_slow_outro", False): slow_sections.append("outro")
-                slow_factor = max(0.10, min(1.0, _i("slider_slow_factor", 50) / 100.0)) if slow_enabled else 1.0
-                slow_random = (_b("check_slow_random", False) if slow_enabled else False)
-
-                # Visual overlay strategy
-                use_visual_overlay = _b("check_visual_overlay", False)
-                if use_visual_overlay and _b("check_visual_strategy_section", False):
-                    visual_strategy = 2
-                elif use_visual_overlay and _b("check_visual_strategy_segment", False):
-                    visual_strategy = 1
-                else:
-                    visual_strategy = 0
-                visual_overlay_opacity = max(0.0, min(1.0, _i("slider_visual_opacity", 25) / 100.0))
-
-                # Cinematic effects
-                cine_enable = (_b("check_cine_enable", False) and (not nofx))
-
-                segments = mclip.build_timeline(
-                    analysis,
-                    sources,
-                    fx_level=fx_level,
-                    microclip_mode=micro_mode,
-                    beats_per_segment=beats_per,
-                    transition_mode=transition_mode,
-                    clip_order_mode=clip_order_mode,
-                    force_full_length=force_full_length,
-                    seed_enabled=seed_enabled,
-                    seed_value=int(seed_value),
-                    transition_random=transition_random_enabled,
-                    transition_modes_enabled=enabled_transition_modes,
-                    intro_transitions_only=_b("check_intro_transitions_only", False),
-                    slow_motion_enabled=slow_enabled,
-                    slow_motion_factor=float(slow_factor),
-                    slow_motion_sections=slow_sections,
-                    slow_motion_random=slow_random,
-                    cine_enable=cine_enable,
-                    cine_freeze=_b("check_cine_freeze", False),
-                    cine_stutter=_b("check_cine_stutter", False),
-                    cine_reverse=_b("check_cine_reverse", False),
-                    cine_speedup_forward=_b("check_cine_speedup_forward", False),
-                    cine_speedup_forward_factor=_f("spin_cine_speedup_forward", 1.5),
-                    cine_speedup_backward=_b("check_cine_speedup_backward", False),
-                    cine_speedup_backward_factor=_f("spin_cine_speedup_backward", 1.5),
-                    cine_speed_ramp=_b("check_cine_speed_ramp", False),
-                    cine_freeze_len=_i("slider_cine_freeze_len", 50) / 100.0,
-                    cine_freeze_zoom=_i("slider_cine_freeze_zoom", 15) / 100.0,
-                    cine_tear_v=_b("check_cine_tear_v", False),
-                    cine_tear_v_strength=_i("slider_cine_tear_v_strength", 70) / 100.0,
-                    cine_tear_h=_b("check_cine_tear_h", False),
-                    cine_tear_h_strength=_i("slider_cine_tear_h_strength", 70) / 100.0,
-                    cine_color_cycle=_b("check_cine_color_cycle", False),
-                    cine_color_cycle_speed_ms=_i("slider_cine_color_cycle_speed", 400),
-                    cine_stutter_repeats=_i("spin_cine_stutter_repeats", 3),
-                    cine_reverse_len=_i("slider_cine_reverse_len", 50) / 100.0,
-                    cine_ramp_in=_i("slider_cine_ramp_in", 25) / 100.0,
-                    cine_ramp_out=_i("slider_cine_ramp_out", 25) / 100.0,
-                    cine_boomerang=_b("check_cine_boomerang", False),
-                    cine_boomerang_bounces=_i("slider_cine_boomerang_bounces", 2),
-                    cine_dimension=_b("check_cine_dimension", False),
-                    cine_pan916=_b("check_cine_pan916", False),
-                    cine_pan916_speed_ms=_i("slider_cine_pan916_speed", 400),
-                    cine_pan916_parts=_i("slider_cine_pan916_parts", 3),
-                    cine_pan916_transparent=_b("check_cine_pan916_transparent", False),
-                    cine_pan916_random=_b("check_cine_pan916_random", False),
-                    cine_mosaic=_b("check_cine_mosaic", False),
-                    cine_mosaic_screens=_i("slider_cine_mosaic_screens", 4),
-                    cine_mosaic_random=_b("check_cine_mosaic_random", False),
-                    cine_flip=_b("check_cine_flip", False),
-                    cine_rotate=_b("check_cine_rotate", False),
-                    cine_rotate_max_degrees=_f("slider_cine_rotate_degrees", 20.0),
-                    cine_multiply=_b("check_cine_multiply", False),
-                    cine_multiply_screens=_i("slider_cine_multiply_screens", 4),
-                    cine_multiply_random=_b("check_cine_multiply_random", False),
-                    cine_dolly=_b("check_cine_dolly", False),
-                    cine_dolly_strength=_i("slider_cine_dolly_strength", 40) / 100.0,
-                    cine_kenburns=_b("check_cine_kenburns", False),
-                    cine_kenburns_strength=_i("slider_cine_kenburns_strength", 35) / 100.0,
-                    cine_motion_dir=_i("combo_cine_motion_dir", 0),
-                    audio_duration=_ffprobe_duration(ffprobe2, _music),
-                    impact_enable=_b("check_impact_enable", False) and (not nofx),
-                    impact_flash=_b("check_impact_flash", False),
-                    impact_shock=_b("check_impact_shock", False),
-                    impact_echo_trail=_b("check_impact_echo", False),
-                    impact_confetti=_b("check_impact_confetti", False),
-                    impact_zoom=_b("check_impact_zoom", False),
-                    impact_shake=_b("check_impact_shake", False),
-                    impact_fog=False,
-                    impact_fire_gold=False,
-                    impact_fire_multi=False,
-                    impact_color_cycle=_b("check_impact_color_cycle", False),
-                    impact_random=_b("check_impact_random", False),
-                    impact_flash_strength=_i("slider_impact_flash", 80) / 100.0,
-                    impact_flash_speed_ms=_i("slider_impact_flash_speed", 250),
-                    impact_shock_strength=_i("slider_impact_shock", 75) / 100.0,
-                    impact_echo_trail_strength=_i("slider_impact_echo", 70) / 100.0,
-                    impact_confetti_density=_i("slider_impact_confetti", 70) / 100.0,
-                    impact_zoom_amount=_i("slider_impact_zoom", 20) / 100.0,
-                    impact_shake_strength=_i("slider_impact_shake", 60) / 100.0,
-                    impact_fog_density=0.0,
-                    impact_fire_gold_intensity=0.0,
-                    impact_fire_multi_intensity=0.0,
-                    impact_color_cycle_speed=_i("slider_impact_colorcycle", 70) / 100.0,
-                    strobe_on_time=_b("check_strobe_on_time", False) and (not nofx),
-                    strobe_on_time_times=None,
-                    image_sources=None,
-                    section_overrides=None,
-                    image_segment_interval=_i("spin_image_interval", 0),
-                )
-
-                # Render directly (keep source resolution; original letterbox)
-                out_name = "final_cut.mp4"
-                out_final = os.path.join(final_dir, out_name)
-
-                rw = mclip.RenderWorker(
-                    audio_path=_music,
-                    output_dir=final_dir,
-                    analysis=analysis,
-                    segments=segments,
-                    ffmpeg=ffmpeg2,
-                    ffprobe=ffprobe2,
-                    target_resolution=None,
-                    fit_mode=0,
-                    transition_mode=int(transition_mode),
-                    intro_fade=_b("check_intro_fade", True),
-                    outro_fade=_b("check_outro_fade", True),
-                    use_visual_overlay=bool(use_visual_overlay),
-                    visual_strategy=int(visual_strategy),
-                    visual_section_overrides=None,
-                    visual_overlay_opacity=float(visual_overlay_opacity),
-                    out_name_override=out_name,
-                    strobe_on_time_times=None,
-                    strobe_flash_strength=_i("slider_impact_flash", 80) / 100.0,
-                    strobe_flash_speed_ms=_i("slider_impact_flash_speed", 250),
-                )
-
-                _outer = self
-
-                class _P:
-                    def emit(self, pct, msg=""):
-                        try:
-                            self_outer = rw  # noqa
-                            # Map 0..100 to the assemble window for better UI feel
-                            try:
-                                ip = int(pct)
-                            except Exception:
-                                ip = 0
-                            span = max(1, int(_assemble_progress_win["end"] - _assemble_progress_win["start"]))
-                            mapped = int(_assemble_progress_win["start"] + (ip / 100.0) * span)
-                            try:
-                                _outer.signals.progress.emit(mapped)
-                            except Exception:
-                                pass
-                            try:
-                                if msg:
-                                    _outer.signals.stage.emit(f"Videoclip assembly: {msg}")
-                            except Exception:
-                                pass
-                        except Exception:
-                            pass
-
-                try:
-                    rw.progress = _P()
-                except Exception:
-                    pass
-
-                rw._run_impl()
-
-                if not _file_ok(out_final, 1024):
-                    raise RuntimeError(f"Music Clip Creator output missing/too small: {out_final}")
-
-                # Wire manifest for downstream post-steps (upscale/interp)
-                manifest.setdefault("paths", {})["final_video"] = out_final
-                manifest.setdefault("paths", {})["final_cut_path"] = out_final
-                manifest.setdefault("final_assembly", {})
-                try:
-                    manifest["final_assembly"].update({
-                        "mode": "music_videoclip",
-                        "preset_id": str(_vc_pid),
-                        "preset_label": str(_vc_label),
-                    })
-                except Exception:
-                    pass
-                _safe_write_json(manifest_path, manifest)
-
             def step_final() -> None:
                 # NOTE: This step does NOT add audio yet (Chunk 6B). It creates a stable visual "final cut".
                 clips = (manifest.get("paths") or {}).get("clips")
@@ -9633,27 +9265,6 @@ class PipelineWorker(QThread):
                 })
                 manifest["steps"][_assemble_step_name] = srec
                 _safe_write_json(manifest_path, manifest)
-
-
-            # Run/skip Assemble step (Chunk 6)
-            _prev = {}
-            try:
-                _prev = manifest.get("steps", {}).get(_assemble_step_name) or {}
-            except Exception:
-                _prev = {}
-            try:
-                _prev_fp = str(_prev.get("fingerprint") or "")
-            except Exception:
-                _prev_fp = ""
-            try:
-                _final_ok = os.path.isfile(final_video) and os.path.getsize(final_video) > 1024
-            except Exception:
-                _final_ok = False
-
-            if _final_ok and (_prev_fp == str(_assembly_fingerprint or "")) and str((_prev.get("status") or "")).lower() == "done":
-                _skip(_assemble_step_name, "final cut already up to date")
-            else:
-                _run(_assemble_step_name, (step_final_videoclip if _use_mclip else step_final), int((_assemble_progress_win or {}).get("end", 99)))
 
             # Step H: Narration + optional user music (Chunk 6B)
             # - Generate narration script (Qwen3 text/VL JSON path)
@@ -10213,6 +9824,17 @@ class PipelineWorker(QThread):
                         dur_s = float(getattr(self.job, "approx_duration_sec", 0) or 0.0)
                     except Exception:
                         dur_s = 0.0
+                # When Videoclip Creator is selected, the user already chose the final duration at job start.
+                try:
+                    _vp = str((self.job.encoding or {}).get("videoclip_preset") or "Storyline Preset (Hardcuts)")
+                    _use_vp = bool(_vp) and (not str(_vp).lower().startswith("storyline preset"))
+                except Exception:
+                    _use_vp = False
+                if _use_vp:
+                    try:
+                        dur_s = float(getattr(self.job, "approx_duration_sec", dur_s) or dur_s)
+                    except Exception:
+                        pass
                 # Final safety clamp (ACE expects a sensible positive duration in seconds)
                 if dur_s <= 0.1:
                     dur_s = 15.0
@@ -11494,19 +11116,7 @@ class PipelineWorker(QThread):
                     manifest.setdefault("paths", {})["narration_txt"] = narration_txt
                     _safe_write_json(manifest_path, manifest)
 
-                                # If we assembled via Music Clip Creator, the output already includes the music track.
-                # Keep the workflow connected (upscale/interp will use final_cut.mp4), but skip audio muxing here.
-                if bool(_use_mclip):
-                    try:
-                        # Ensure manifest points at the already-muxed final cut.
-                        manifest.setdefault("paths", {})["final_video"] = final_cut_mp4
-                        manifest.setdefault("paths", {})["final_cut_path"] = final_cut_mp4
-                        _safe_write_json(manifest_path, manifest)
-                    except Exception:
-                        pass
-                    return
-
-# 2) Mix/mux audio into final_cut.mp4
+                # 2) Mix/mux audio into final_cut.mp4
                 # Decide audio sources:
                 # Decide audio sources:
                 # HeartMula (and any explicit music mode) must include music even if the Background music toggle is off.
@@ -11632,6 +11242,1010 @@ class PipelineWorker(QThread):
                 }
                 _safe_write_json(timeline_json, tl)
                 _safe_write_json(manifest_path, manifest)
+
+            # Step 2: Videoclip Creator assembly is enabled when a JSON preset is selected.
+            try:
+                _vp = str((self.job.encoding or {}).get('videoclip_preset') or 'Storyline Preset (Hardcuts)')
+            except Exception:
+                _vp = 'Storyline Preset (Hardcuts)'
+            _use_videoclip_creator = bool(_vp) and (not str(_vp).lower().startswith('storyline preset'))
+            
+            _mclip_step_name = "Videoclip Creator assembly "
+            
+            def _fingerprint_clips_dir(_d: str) -> Dict[str, Any]:
+                try:
+                    items = []
+                    if _d and os.path.isdir(_d):
+                        for fn in sorted(os.listdir(_d)):
+                            if not fn.lower().endswith(".mp4"):
+                                continue
+                            p = os.path.join(_d, fn)
+                            try:
+                                st = os.stat(p)
+                                items.append({'name': fn, 'size': int(st.st_size), 'mtime': float(st.st_mtime)})
+                            except Exception:
+                                continue
+                    return {'count': len(items), 'items': items[:200]}  # cap to avoid huge manifests
+                except Exception:
+                    return {'count': 0, 'items': []}
+
+            def _compute_mclip_fingerprint(audio_path: str, preset_path: str) -> str:
+                try:
+                    return _sha1_text(json.dumps({
+                        'audio': _file_fingerprint(audio_path),
+                        'preset': _file_fingerprint(preset_path),
+                        'vp': str(_vp),
+                        'clips_dir': _fingerprint_clips_dir(str(clips_dir)),
+                        'job_id': str(getattr(self.job, 'job_id', '') or ''),
+                    }, sort_keys=True))
+                except Exception:
+                    return _sha1_text(str(time.time()))
+            
+            def step_videoclip_creator_10a() -> None:
+                nonlocal final_cut_mp4, final_video, music_file
+                # Safety checks
+                if not os.path.isdir(str(clips_dir)):
+                    raise RuntimeError(f"Clips folder not found: {clips_dir}")
+                
+                # Choose audio for videoclip creator
+                force_music = str(getattr(self.job, 'music_mode', '') or '').strip() in ('ace', 'ace15', 'heartmula', 'file')
+                have_music = bool((not bool(getattr(self.job, 'silent', False))) and bool(music_file) and os.path.exists(music_file) and (bool(getattr(self.job, 'music_background', False)) or force_music))
+                have_narr = bool((not bool(getattr(self.job, 'silent', False))) and bool(getattr(self.job, 'narration_enabled', False)) and _file_ok(narration_wav, 512))
+                audio_for_creator = ''
+                mix_audio_path = os.path.join(audio_dir, '_planner_videoclip_audio.m4a')
+                mix_log2 = os.path.join(audio_dir, '_planner_videoclip_audio_mix.log')
+                if have_music and (not have_narr):
+                    audio_for_creator = str(music_file)
+                elif have_narr and (not have_music):
+                    audio_for_creator = str(narration_wav)
+                elif have_music and have_narr:
+                    # Mix narration over music into a single audio file (duration follows music).
+                    try:
+                        music_dur = float(_probe_duration_sec(music_file) or 0.0)
+                    except Exception:
+                        music_dur = 0.0
+                    if music_dur <= 0.01:
+                        # Fallback: just use music if duration cannot be probed.
+                        audio_for_creator = str(music_file)
+                    else:
+                        story_gain = max(0.0, min(2.0, float(int(self.job.storytelling_volume)) / 100.0))
+                        music_gain = max(0.0, min(2.0, float(int(self.job.music_volume)) / 100.0))
+                        cmd = [
+                            ffmpeg2, '-y',
+                            '-i', str(music_file),
+                            '-i', str(narration_wav),
+                            '-filter_complex', f"[0:a]volume={music_gain}[m];[1:a]volume={story_gain},apad,atrim=0:{music_dur}[n];[m][n]amix=inputs=2:duration=first:dropout_transition=2[a]",
+                            '-map', '[a]',
+                            '-c:a', 'aac', '-b:a', '192k',
+                            str(mix_audio_path),
+                        ]
+                        with open(mix_log2, 'w', encoding='utf-8', errors='replace') as lf:
+                            lf.write('[cmd] ' + ' '.join([str(x) for x in cmd]) + '\n')
+                            cp = subprocess.run(cmd, cwd=str(_root()), capture_output=True, text=True)
+                            lf.write(cp.stdout or '')
+                            if cp.stderr:
+                                lf.write('\n[stderr]\n' + cp.stderr + '\n')
+                        if cp.returncode == 0 and _file_ok(mix_audio_path, 1024):
+                            audio_for_creator = str(mix_audio_path)
+                        else:
+                            # Fallback to music only if mix failed
+                            audio_for_creator = str(music_file)
+                else:
+                    # No music/narration available. Videoclip Creator still needs an audio track to segment.
+                    # Generate a silent audio bed matching the total clip duration (best-effort) so preset 2/3 can run.
+                    try:
+                        total_dur = 0.0
+                        # Sum durations of the generated clips (mp4) in clips_dir.
+                        for fn in sorted(os.listdir(str(clips_dir))):
+                            if not fn.lower().endswith(".mp4"):
+                                continue
+                            p = os.path.join(str(clips_dir), fn)
+                            try:
+                                d = float(_probe_duration_sec(p) or 0.0)
+                            except Exception:
+                                d = 0.0
+                            if d > 0.01:
+                                total_dur += d
+                        if total_dur <= 0.01:
+                            total_dur = 10.0
+                        # Clamp to a sane range to avoid accidental giant silent beds.
+                        total_dur = max(1.0, min(total_dur, 60.0 * 60.0))
+                        cmd = [
+                            ffmpeg2, "-y",
+                            "-f", "lavfi",
+                            "-i", "anullsrc=channel_layout=stereo:sample_rate=44100",
+                            "-t", str(total_dur),
+                            "-c:a", "aac",
+                            "-b:a", "192k",
+                            str(mix_audio_path),
+                        ]
+                        with open(mix_log2, "w", encoding="utf-8", errors="replace") as lf:
+                            lf.write("[cmd] " + " ".join([str(x) for x in cmd]) + "\n")
+                            cp = subprocess.run(cmd, cwd=str(_root()), capture_output=True, text=True)
+                            lf.write(cp.stdout or "")
+                            if cp.stderr:
+                                lf.write("\n[stderr]\n" + cp.stderr + "\n")
+                        if cp.returncode == 0 and _file_ok(mix_audio_path, 1024):
+                            audio_for_creator = str(mix_audio_path)
+                            try:
+                                _log(f"[INFO] No music/narration provided; generated silent audio bed ({total_dur:.2f}s) for Videoclip Creator.")
+                            except Exception:
+                                pass
+                        else:
+                            raise RuntimeError("Failed to generate silent audio for Videoclip Creator. See: " + str(mix_log2))
+                    except Exception as e:
+                        raise RuntimeError("Videoclip Creator preset selected but no audio is available, and silent-bed generation failed.") from e
+
+                # Load preset settings from JSON preset manager.
+                root = str(_root())
+                preset_path = os.path.join(root, 'presets', 'setsave', 'clip_presets.json')
+                if not os.path.isfile(preset_path):
+                    # Compatibility fallback for older internal builds
+                    preset_path = os.path.join(root, 'presets', 'setsave', 'plannerclip.json')
+                if not os.path.isfile(preset_path):
+                    raise RuntimeError(f"Videoclip preset file not found: {preset_path}")
+
+                preset_obj = _safe_read_json(preset_path) if os.path.isfile(preset_path) else {}
+                if not isinstance(preset_obj, dict):
+                    preset_obj = {}
+                presets_list = preset_obj.get('presets') or []
+                if not isinstance(presets_list, list) or (not presets_list):
+                    raise RuntimeError('Videoclip preset file has no presets.')
+
+                # Choose preset by id (preferred) or by name (combo label)
+                chosen = None
+                try:
+                    want_id = str((self.job.encoding or {}).get('videoclip_preset_id') or '').strip()
+                except Exception:
+                    want_id = ''
+                want_name = str(_vp or '').strip()
+                if want_id:
+                    for p in presets_list:
+                        if isinstance(p, dict) and str(p.get('id') or '').strip() == want_id:
+                            chosen = p
+                            break
+                if chosen is None and want_name:
+                    for p in presets_list:
+                        if isinstance(p, dict) and str(p.get('name') or '').strip() == want_name:
+                            chosen = p
+                            break
+                if chosen is None:
+                    chosen = presets_list[0] if isinstance(presets_list[0], dict) else {}
+
+                preset_id = str(chosen.get('id') or '')
+                settings = chosen.get('settings') or {}
+                if not isinstance(settings, dict):
+                    settings = {}
+                # Enforce planner defaults for Videoclip presets: keep source + keep source letterbox + order mode
+                settings.setdefault('combo_res', 0)
+                settings.setdefault('combo_fit', 0)                # Planner default when using Videoclip Creator: sequential clip order.
+                settings['combo_clip_order'] = 1
+                # Analyze audio + build segments
+                try:
+                    from helpers import auto_music_sync as _ams  # type: ignore
+                except Exception:
+                    import auto_music_sync as _ams  # type: ignore
+
+                # Some older auto_music_sync builds validate payload fields using
+                # unquoted global name constants (e.g. ffmpeg_path) and may forget
+                # to define one of them, causing NameError. Some builds also treat these
+                # names as callables (e.g. ffmpeg_path()), so we define keys that behave
+                # as both strings and no-arg callables.
+                try:
+                    class _AMSKey(str):
+                        def __call__(self):
+                            return str(self)
+                    for _k in ("analysis", "segments", "audio_path", "output_dir", "ffmpeg_path", "ffprobe_path"):
+                        _cur = getattr(_ams, _k, None)
+                        if _cur is None:
+                            setattr(_ams, _k, _AMSKey(_k))
+                        elif isinstance(_cur, str) and (not callable(_cur)):
+                            setattr(_ams, _k, _AMSKey(_cur))
+                except Exception:
+                    pass
+                sens = int(settings.get('slider_sens', 10) or 10)
+                try:
+                    cfg = _ams.MusicAnalysisConfig(sensitivity=sens)
+                except Exception:
+                    cfg = None
+                analysis = _ams.analyze_music(str(audio_for_creator), ffmpeg2, cfg) if cfg is not None else _ams.analyze_music(str(audio_for_creator), ffmpeg2, _ams.MusicAnalysisConfig())
+                # NOTE: Older auto_music_sync versions may not expose scan_sources().
+                # Provide a robust fallback scanner to keep Chunk 10A working across versions.
+                # Prefer the tool's own discovery helper when available (most robust duration probing).
+                if hasattr(_ams, "discover_video_sources"):
+                    try:
+                        sources = _ams.discover_video_sources(str(clips_dir), ffprobe2)
+                    except Exception:
+                        sources = []
+                elif hasattr(_ams, "scan_sources"):
+                    sources = _ams.scan_sources(str(clips_dir), ffprobe2)
+                else:
+                    def _scan_sources_fallback(_folder: str, _ffprobe: str):
+                        exts = {".mp4", ".mov", ".mkv", ".webm", ".avi", ".m4v"}
+                        out = []
+                        try:
+                            from pathlib import Path as _Path
+                        except Exception:
+                            _Path = None
+                        for _r, _ds, _fs in os.walk(_folder):
+                            _fs_sorted = sorted(_fs)
+                            for _fn in _fs_sorted:
+                                try:
+                                    _p = (_Path(_r) / _fn) if _Path is not None else os.path.join(_r, _fn)
+                                    _suf = str(_p).lower()
+                                    if not any(_suf.endswith(e) for e in exts):
+                                        continue
+                                    _pp = str(_p)
+                                    _dur = float(_probe_duration_sec(_pp) or 0.0)
+                                    _w = 0; _h = 0; _fps = 0.0
+                                    try:
+                                        args = [_ffprobe, "-v", "error", "-print_format", "json", "-select_streams", "v:0", "-show_streams", _pp]
+                                        cp = subprocess.run(args, cwd=str(_root()), capture_output=True, text=True)
+                                        if cp.returncode == 0:
+                                            obj = json.loads(cp.stdout or "{}")
+                                            st = (obj.get("streams") or [{}])[0] or {}
+                                            _w = int(st.get("width") or 0)
+                                            _h = int(st.get("height") or 0)
+                                            rr = st.get("avg_frame_rate") or st.get("r_frame_rate") or "0/1"
+                                            try:
+                                                n, d = rr.split("/")
+                                                d2 = float(d)
+                                                _fps = (float(n) / d2) if d2 != 0 else float(n)
+                                            except Exception:
+                                                _fps = 0.0
+                                    except Exception:
+                                        pass
+                                    out.append({
+                                        "path": _pp,
+                                        "filepath": _pp,
+                                        "duration_sec": _dur,
+                                        "duration": _dur,
+                                        "width": _w,
+                                        "height": _h,
+                                        "fps": _fps,
+                                    })
+                                except Exception:
+                                    continue
+                        return out
+                    # Try a few likely legacy function names before using the built-in fallback.
+                    if hasattr(_ams, "scan_clips"):
+                        sources = _ams.scan_clips(str(clips_dir), ffprobe2)
+                    elif hasattr(_ams, "scan_folder"):
+                        sources = _ams.scan_folder(str(clips_dir), ffprobe2)
+                    elif hasattr(_ams, "list_sources"):
+                        sources = _ams.list_sources(str(clips_dir), ffprobe2)
+                    else:
+                        sources = _scan_sources_fallback(str(clips_dir), ffprobe2)
+
+                # Normalize sources to support both dict-style and attribute-style access.
+                # Some auto_music_sync versions expect objects with .duration/.path attributes,
+                # while others return dicts from scan_sources(). We wrap dicts into a proxy that
+                # supports both access patterns.
+                class _SourceProxy(dict):
+                    __slots__ = ()
+                    def __getattr__(self, k):
+                        try:
+                            return self[k]
+                        except KeyError:
+                            raise AttributeError(k)
+                    def __setattr__(self, k, v):
+                        self[k] = v
+                def _normalize_sources(_srcs):
+                    out = []
+                    for s in (_srcs or []):
+                        if isinstance(s, dict) and not isinstance(s, _SourceProxy):
+                            sp = _SourceProxy(s)
+                            # Ensure common fields exist
+                            if 'duration' not in sp:
+                                if 'duration_sec' in sp:
+                                    sp['duration'] = sp.get('duration_sec')
+                            if 'duration_sec' not in sp:
+                                if 'duration' in sp:
+                                    sp['duration_sec'] = sp.get('duration')
+                            if 'path' not in sp:
+                                sp['path'] = sp.get('filepath') or sp.get('file') or sp.get('src') or ''
+                            out.append(sp)
+                        else:
+                            # best-effort: add a .duration attribute if missing
+                            try:
+                                if (not hasattr(s, 'duration')) and hasattr(s, 'duration_sec'):
+                                    try:
+                                        setattr(s, 'duration', getattr(s, 'duration_sec'))
+                                    except Exception:
+                                        pass
+                            except Exception:
+                                pass
+                            out.append(s)
+                    return out
+                sources = _normalize_sources(sources)
+
+                if not sources:
+                    raise RuntimeError('No source clips found for videoclip creator.')
+                
+                nofx = bool(settings.get('check_nofx', False))
+                fx_idx = int(settings.get('combo_fx', 0) or 0)
+                if nofx:
+                    fx_level = 'none'
+                elif fx_idx == 0:
+                    fx_level = 'minimal'
+                elif fx_idx == 1:
+                    fx_level = 'moderate'
+                else:
+                    fx_level = 'high'
+                
+                micro_mode = 0
+                if bool(settings.get('check_micro_chorus', False)):
+                    micro_mode = 1
+                elif bool(settings.get('check_micro_all', False)):
+                    micro_mode = 2
+                elif bool(settings.get('check_micro_verses', False)):
+                    micro_mode = 3
+                beats_per = max(1, int(settings.get('spin_beats_per_seg', 8) or 8))
+                transition_mode = int(settings.get('combo_transitions', 1) or 1)
+                if nofx:
+                    transition_mode = 1
+                clip_order_mode = int(settings.get('combo_clip_order', 2) or 2)
+                force_full_length = bool(settings.get('check_full_length', False))
+                seed_enabled = bool(settings.get('check_use_seed', False))
+                seed_value = int(settings.get('spin_seed', 0) or 0)
+                transition_random = bool(settings.get('check_trans_random', False)) and (not nofx)
+                transition_modes_enabled = [transition_mode] if transition_random else []
+                
+                slow_enabled = bool(settings.get('check_slow_enable', False)) and (not nofx)
+                slow_sections = []
+                if slow_enabled:
+                    if bool(settings.get('check_slow_intro', False)): slow_sections.append('intro')
+                    if bool(settings.get('check_slow_break', False)): slow_sections.append('break')
+                    if bool(settings.get('check_slow_chorus', False)): slow_sections.append('chorus')
+                    if bool(settings.get('check_slow_drop', False)): slow_sections.append('drop')
+                    if bool(settings.get('check_slow_outro', False)): slow_sections.append('outro')
+                slow_factor = max(0.10, min(1.0, float(int(settings.get('slider_slow_factor', 50) or 50)) / 100.0)) if slow_enabled else 1.0
+                slow_random = bool(settings.get('check_slow_random', False)) if slow_enabled else False
+                
+                # Cine (most are optional; pass through defaults if missing)
+                cine_enable = bool(settings.get('check_cine_enable', False)) and (not nofx)
+                cine_freeze = bool(settings.get('check_cine_freeze', False))
+                cine_stutter = bool(settings.get('check_cine_stutter', False))
+                cine_reverse = bool(settings.get('check_cine_reverse', False))
+                cine_speedup_forward = bool(settings.get('check_cine_speedup_forward', False))
+                cine_speedup_backward = bool(settings.get('check_cine_speedup_backward', False))
+                cine_speed_ramp = bool(settings.get('check_cine_speed_ramp', False))
+                cine_speedup_forward_factor = float(settings.get('spin_cine_speedup_forward', 2.0) or 2.0)
+                cine_speedup_backward_factor = float(settings.get('spin_cine_speedup_backward', 2.0) or 2.0)
+                cine_freeze_len = float(int(settings.get('slider_cine_freeze_len', 40) or 40)) / 100.0
+                cine_freeze_zoom = float(int(settings.get('slider_cine_freeze_zoom', 20) or 20)) / 100.0
+                cine_tear_v = bool(settings.get('check_cine_tear_v', False))
+                cine_tear_h = bool(settings.get('check_cine_tear_h', False))
+                cine_tear_v_strength = float(int(settings.get('slider_cine_tear_v_strength', 40) or 40)) / 100.0
+                cine_tear_h_strength = float(int(settings.get('slider_cine_tear_h_strength', 40) or 40)) / 100.0
+                cine_color_cycle = bool(settings.get('check_cine_color_cycle', False))
+                cine_color_cycle_speed_ms = int(settings.get('slider_cine_color_cycle_speed', 250) or 250)
+                cine_stutter_repeats = int(settings.get('spin_cine_stutter_repeats', 3) or 3)
+                cine_reverse_len = float(int(settings.get('slider_cine_reverse_len', 40) or 40)) / 100.0
+                cine_ramp_in = float(int(settings.get('slider_cine_ramp_in', 15) or 15)) / 100.0
+                cine_ramp_out = float(int(settings.get('slider_cine_ramp_out', 15) or 15)) / 100.0
+                cine_boomerang = bool(settings.get('check_cine_boomerang', False))
+                cine_boomerang_bounces = int(settings.get('slider_cine_boomerang_bounces', 2) or 2)
+                cine_dimension = bool(settings.get('check_cine_dimension', False))
+                cine_pan916 = bool(settings.get('check_cine_pan916', False))
+                cine_pan916_speed_ms = int(settings.get('slider_cine_pan916_speed', 150) or 150)
+                cine_pan916_parts = int(settings.get('slider_cine_pan916_parts', 4) or 4)
+                cine_pan916_transparent = bool(settings.get('check_cine_pan916_transparent', False))
+                cine_pan916_random = bool(settings.get('check_cine_pan916_random', False))
+                cine_mosaic = bool(settings.get('check_cine_mosaic', False))
+                cine_mosaic_screens = int(settings.get('slider_cine_mosaic_screens', 9) or 9)
+                cine_mosaic_random = bool(settings.get('check_cine_mosaic_random', False))
+                cine_flip = bool(settings.get('check_cine_flip', False))
+                cine_rotate = bool(settings.get('check_cine_rotate', False))
+                cine_rotate_max_degrees = float(settings.get('slider_cine_rotate_degrees', 90) or 90)
+                cine_multiply = bool(settings.get('check_cine_multiply', False))
+                cine_multiply_screens = int(settings.get('slider_cine_multiply_screens', 6) or 6)
+                cine_multiply_random = bool(settings.get('check_cine_multiply_random', False))
+                cine_dolly = bool(settings.get('check_cine_dolly', False))
+                cine_dolly_strength = float(int(settings.get('slider_cine_dolly_strength', 70) or 70)) / 100.0
+                cine_kenburns = bool(settings.get('check_cine_kenburns', False))
+                cine_kenburns_strength = float(int(settings.get('slider_cine_kenburns_strength', 55) or 55)) / 100.0
+                cine_motion_dir = int(settings.get('combo_cine_motion_dir', 0) or 0)
+                
+                # Impact FX
+                impact_enable = bool(settings.get('check_impact_enable', False)) and (not nofx)
+                impact_flash = bool(settings.get('check_impact_flash', False))
+                impact_shock = bool(settings.get('check_impact_shock', False))
+                impact_echo_trail = bool(settings.get('check_impact_echo', False))
+                impact_confetti = bool(settings.get('check_impact_confetti', False))
+                impact_color_cycle = bool(settings.get('check_impact_colorcycle', False))
+                impact_zoom = bool(settings.get('check_impact_zoom', False))
+                impact_shake = bool(settings.get('check_impact_shake', False))
+                impact_fog = bool(settings.get('check_impact_fog', False))
+                impact_fire_gold = bool(settings.get('check_impact_fire_gold', False))
+                impact_fire_multi = bool(settings.get('check_impact_fire_multi', False))
+                impact_random = bool(settings.get('check_impact_random', False))
+                impact_flash_strength = float(int(settings.get('slider_impact_flash', 80) or 80)) / 100.0
+                impact_flash_speed_ms = int(settings.get('slider_impact_flash_speed', 250) or 250)
+                impact_shock_strength = float(int(settings.get('slider_impact_shock', 75) or 75)) / 100.0
+                impact_echo_trail_strength = float(int(settings.get('slider_impact_echo', 80) or 80)) / 100.0
+                impact_confetti_density = float(int(settings.get('slider_impact_confetti', 70) or 70)) / 100.0
+                impact_color_cycle_speed = float(int(settings.get('slider_impact_colorcycle', 75) or 75)) / 100.0
+                impact_zoom_amount = float(int(settings.get('slider_impact_zoom', 25) or 25)) / 100.0
+                impact_shake_strength = float(int(settings.get('slider_impact_shake', 70) or 70)) / 100.0
+                impact_fog_density = float(int(settings.get('slider_impact_fog', 0) or 0)) / 100.0
+                impact_fire_gold_intensity = float(int(settings.get('slider_impact_fire_gold', 0) or 0)) / 100.0
+                impact_fire_multi_intensity = float(int(settings.get('slider_impact_fire_multi', 0) or 0)) / 100.0
+                
+                audio_duration = float(_probe_duration_sec(str(audio_for_creator)) or 0.0)
+                segments = _ams.build_timeline(
+                    analysis,
+                    sources,
+                    fx_level=fx_level,
+                    microclip_mode=micro_mode,
+                    beats_per_segment=beats_per,
+                    transition_mode=transition_mode,
+                    clip_order_mode=clip_order_mode,
+                    force_full_length=force_full_length,
+                    seed_enabled=seed_enabled,
+                    seed_value=seed_value,
+                    transition_random=transition_random,
+                    transition_modes_enabled=transition_modes_enabled,
+                    intro_transitions_only=True,
+                    slow_motion_enabled=slow_enabled,
+                    slow_motion_factor=slow_factor,
+                    slow_motion_sections=slow_sections,
+                    slow_motion_random=slow_random,
+                    cine_enable=cine_enable,
+                    cine_freeze=cine_freeze,
+                    cine_stutter=cine_stutter,
+                    cine_reverse=cine_reverse,
+                    cine_speedup_forward=cine_speedup_forward,
+                    cine_speedup_forward_factor=cine_speedup_forward_factor,
+                    cine_speedup_backward=cine_speedup_backward,
+                    cine_speedup_backward_factor=cine_speedup_backward_factor,
+                    cine_speed_ramp=cine_speed_ramp,
+                    cine_freeze_len=cine_freeze_len,
+                    cine_freeze_zoom=cine_freeze_zoom,
+                    cine_tear_v=cine_tear_v,
+                    cine_tear_v_strength=cine_tear_v_strength,
+                    cine_tear_h=cine_tear_h,
+                    cine_tear_h_strength=cine_tear_h_strength,
+                    cine_color_cycle=cine_color_cycle,
+                    cine_color_cycle_speed_ms=cine_color_cycle_speed_ms,
+                    cine_stutter_repeats=cine_stutter_repeats,
+                    cine_reverse_len=cine_reverse_len,
+                    cine_ramp_in=cine_ramp_in,
+                    cine_ramp_out=cine_ramp_out,
+                    cine_boomerang=cine_boomerang,
+                    cine_boomerang_bounces=cine_boomerang_bounces,
+                    cine_dimension=cine_dimension,
+                    cine_pan916=cine_pan916,
+                    cine_pan916_speed_ms=cine_pan916_speed_ms,
+                    cine_pan916_parts=cine_pan916_parts,
+                    cine_pan916_transparent=cine_pan916_transparent,
+                    cine_pan916_random=cine_pan916_random,
+                    cine_mosaic=cine_mosaic,
+                    cine_mosaic_screens=cine_mosaic_screens,
+                    cine_mosaic_random=cine_mosaic_random,
+                    cine_flip=cine_flip,
+                    cine_rotate=cine_rotate,
+                    cine_rotate_max_degrees=cine_rotate_max_degrees,
+                    cine_multiply=cine_multiply,
+                    cine_multiply_screens=cine_multiply_screens,
+                    cine_multiply_random=cine_multiply_random,
+                    cine_dolly=cine_dolly,
+                    cine_dolly_strength=cine_dolly_strength,
+                    cine_kenburns=cine_kenburns,
+                    cine_kenburns_strength=cine_kenburns_strength,
+                    cine_motion_dir=cine_motion_dir,
+                    audio_duration=audio_duration,
+                    impact_enable=impact_enable,
+                    impact_flash=impact_flash,
+                    impact_shock=impact_shock,
+                    impact_echo_trail=impact_echo_trail,
+                    impact_confetti=impact_confetti,
+                    impact_color_cycle=impact_color_cycle,
+                    impact_zoom=impact_zoom,
+                    impact_shake=impact_shake,
+                    impact_fog=impact_fog,
+                    impact_fire_gold=impact_fire_gold,
+                    impact_fire_multi=impact_fire_multi,
+                    impact_random=impact_random,
+                    impact_flash_strength=impact_flash_strength,
+                    impact_flash_speed_ms=impact_flash_speed_ms,
+                    impact_shock_strength=impact_shock_strength,
+                    impact_echo_trail_strength=impact_echo_trail_strength,
+                    impact_confetti_density=impact_confetti_density,
+                    impact_color_cycle_speed=impact_color_cycle_speed,
+                    impact_zoom_amount=impact_zoom_amount,
+                    impact_shake_strength=impact_shake_strength,
+                    impact_fog_density=impact_fog_density,
+                    impact_fire_gold_intensity=impact_fire_gold_intensity,
+                    impact_fire_multi_intensity=impact_fire_multi_intensity,
+                    image_sources=[],
+                    section_overrides=None,
+                    image_segment_interval=0,
+                )
+                if not segments:
+                    raise RuntimeError('Videoclip Creator timeline is empty.')
+                
+                # Target resolution + fit mode (we enforce keep-source defaults)
+                target_res = None
+                fit_mode = int(settings.get('combo_fit', 0) or 0)
+                
+                # Visual overlay
+                use_visual_overlay = bool(settings.get('check_visual_overlay', False)) and (not nofx)
+                visual_overlay_opacity = float(int(settings.get('slider_visual_opacity', 40) or 40)) / 100.0
+                
+                # Visual strategy
+                visual_strategy = 0
+                if bool(settings.get('check_visual_strategy_segment', False)):
+                    visual_strategy = 1
+                elif bool(settings.get('check_visual_strategy_section', False)):
+                    visual_strategy = 2
+                
+                intro_fade = bool(settings.get('check_intro_fade', True)) and (not nofx)
+                outro_fade = bool(settings.get('check_outro_fade', True)) and (not nofx)
+                
+                out_name = os.path.basename(str(final_video))
+                
+                payload = {
+                    'analysis': getattr(_ams, '_analysis_to_dict')(analysis),
+                    'segments': getattr(_ams, '_segments_to_list')(segments),
+                    'audio_path': str(audio_for_creator),
+                    'output_dir': str(final_dir),
+                    'ffmpeg': str(ffmpeg2),
+                    'ffprobe': str(ffprobe2),
+                    'target_resolution': target_res,
+                    'fit_mode': fit_mode,
+                    'transition_mode': transition_mode,
+                    'intro_fade': intro_fade,
+                    'outro_fade': outro_fade,
+                    'use_visual_overlay': use_visual_overlay,
+                    'visual_overlay_opacity': visual_overlay_opacity,
+                    'visual_strategy': visual_strategy,
+                    'out_name_override': out_name,
+                }
+                
+                # Persist payload for debug/resume
+                payload_path = os.path.join(final_dir, '_planner_videoclip_payload.json')
+                try:
+                    _safe_write_json(payload_path, payload)
+                except Exception:
+                    pass
+                
+                # Run render synchronously using tool's headless queue entry.
+                # Some builds of auto_music_sync expect a JSON *path* rather than a dict payload.
+                _log('[RUN] Music Videoclip Creator ')
+                try:
+                    _ams.run_queue_payload(payload_path)
+                except Exception as e:
+                    raise RuntimeError('Videoclip Creator failed.') from e
+
+                # Some Videoclip Creator builds may ignore out_name_override or output_dir.
+                # If the expected output isn't present, try to locate the newest mp4 produced in/near the output_dir
+                # and adopt it as the produced output.
+                produced_mp4 = str(final_video)
+                if not _file_ok(produced_mp4, 1024):
+                    try:
+                        cand_dirs = [str(final_dir), str(_root() / "output" / "planner"), str(_root() / "output")]
+                        newest = None
+                        newest_mtime = 0.0
+                        for d in cand_dirs:
+                            if not d or (not os.path.isdir(d)):
+                                continue
+                            for r, _ds, fs in os.walk(d):
+                                for fn in fs:
+                                    if not fn.lower().endswith(".mp4"):
+                                        continue
+                                    p = os.path.join(r, fn)
+                                    try:
+                                        if not _file_ok(p, 1024):
+                                            continue
+                                        mt = os.path.getmtime(p)
+                                        if mt > newest_mtime:
+                                            newest_mtime = mt
+                                            newest = p
+                                    except Exception:
+                                        continue
+                        if newest and _file_ok(newest, 1024):
+                            try:
+                                os.makedirs(str(final_dir), exist_ok=True)
+                                shutil.copy2(newest, produced_mp4)
+                            except Exception:
+                                produced_mp4 = newest
+                    except Exception:
+                        pass
+
+                if not _file_ok(str(produced_mp4), 1024):
+                    raise RuntimeError(f'Videoclip Creator output not created: {final_video}')
+                
+                # Normalize output: Videoclip Creator typically writes a job-specific name (e.g. <jobid>_final.mp4).
+                # Planner also maintains a stable "final_cut.mp4" for UI + downstream tools.
+                produced_mp4 = str(final_video)
+                stable_final_cut = os.path.join(str(final_dir), "final_cut.mp4")
+                try:
+                    if os.path.abspath(produced_mp4) != os.path.abspath(stable_final_cut):
+                        # Copy (not move) so the original remains for debugging.
+                        shutil.copy2(produced_mp4, stable_final_cut)
+                except Exception:
+                    # Best-effort: if copy fails, keep using the produced file.
+                    stable_final_cut = produced_mp4
+
+                final_cut_mp4 = str(stable_final_cut)
+                manifest.setdefault('paths', {})['final_video'] = str(final_cut_mp4)
+                manifest.setdefault('paths', {})['final_cut_path'] = str(final_cut_mp4)
+                try:
+                    _log(f"[OK] Videoclip Creator output: {produced_mp4}")
+                    if os.path.abspath(produced_mp4) != os.path.abspath(final_cut_mp4):
+                        _log(f"[OK] Copied to stable final cut: {final_cut_mp4}")
+                except Exception:
+                    pass
+                try:
+                    tl = _safe_read_json(timeline_json) if os.path.exists(timeline_json) else {}
+                except Exception:
+                    tl = {}
+                if not isinstance(tl, dict):
+                    tl = {}
+                tl['videoclip_creator'] = {
+                    'enabled': True,
+                    'preset_id': preset_id,
+                    'preset_file': preset_path,
+                    'audio_path': str(audio_for_creator),
+                    'clips_dir': str(clips_dir),
+                    'payload_path': payload_path,
+                }
+                _safe_write_json(timeline_json, tl)
+                _safe_write_json(manifest_path, manifest)
+                
+
+            # -----------------------------
+            # Tail progress planning (more realistic % after first final cut)
+            #
+            # Problem:
+            # - The UI could reach 100% immediately after the first visual final cut is created,
+            #   even though optional post-steps may still run (narration, music generation/mix,
+            #   upscaling, interpolation, etc.).
+            #
+            # Fix:
+            # - Build a small "tail plan" of remaining steps and reserve 95–99 for them.
+            # - Each tail step gets its own % target; 100 is only emitted at the very end.
+            # -----------------------------
+            def _peek_planner_upscale_settings(job_dir2: str) -> dict:
+                try:
+                    p2 = os.path.join(str(job_dir2), _PLANNER_UPSCALE_JSON_NAME)
+                    if not p2 or (not os.path.isfile(p2)):
+                        return {}
+                    with open(p2, "r", encoding="utf-8", errors="ignore") as f:
+                        obj2 = json.load(f)
+                    return obj2 if isinstance(obj2, dict) else {}
+                except Exception:
+                    return {}
+
+            def _build_tail_targets(step_names: List[str], start_pct: int = 95, end_pct: int = 99) -> Tuple[Dict[str, int], Dict[str, Tuple[int, int]]]:
+                names = [s for s in (step_names or []) if isinstance(s, str) and s.strip()]
+                if not names:
+                    return {}, {}
+                start_pct = int(max(0, min(99, start_pct)))
+                end_pct = int(max(start_pct, min(99, end_pct)))
+                n = len(names)
+                targets: Dict[str, int] = {}
+                windows: Dict[str, Tuple[int, int]] = {}
+                for i, nm in enumerate(names):
+                    if n == 1:
+                        t = end_pct
+                    else:
+                        t = start_pct + int(round((i / max(1, (n - 1))) * (end_pct - start_pct)))
+                    targets[nm] = int(max(start_pct, min(end_pct, t)))
+                for i, nm in enumerate(names):
+                    a = targets.get(nm, start_pct)
+                    if i + 1 < n:
+                        b = targets.get(names[i + 1], end_pct)
+                    else:
+                        b = end_pct
+                    windows[nm] = (int(a), int(max(a, b)))
+                return targets, windows
+
+            _pre_up = _peek_planner_upscale_settings(str(self.out_dir or ""))
+            _pre_want_up = bool((_pre_up or {}).get("enabled", False))
+            _pre_have_engine = bool(str((_pre_up or {}).get("engine_key") or "").strip())
+            _pre_want_interp = bool((_pre_up or {}).get("interpolate_60fps_fast", False))
+
+            _tail_steps: List[str] = []
+            if bool(_use_videoclip_creator):
+                _tail_steps.append(str(_mclip_step_name))
+            else:
+                _tail_steps.append(str(_assemble_step_name))
+                try:
+                    if bool(getattr(self.job, "music_background", False)) and str(getattr(self.job, "music_mode", "") or "") == "ace":
+                        _tail_steps.append(str(_ace_step_name))
+                except Exception:
+                    pass
+                try:
+                    if str(getattr(self.job, "music_mode", "") or "") == "heartmula":
+                        _tail_steps.append(str(_heartmula_step_name))
+                except Exception:
+                    pass
+                _tail_steps.append(str(_audio_step_name))
+
+            if bool(_pre_want_up and _pre_have_engine):
+                _tail_steps.append("Upscale final cut ")
+            if bool(_pre_want_interp):
+                _tail_steps.append("Interpolate to 60fps ")
+
+            _tail_targets, _tail_windows = _build_tail_targets(_tail_steps, start_pct=95, end_pct=99)
+
+            def _tail_pct(step_name: str, fallback: int = 99) -> int:
+                try:
+                    return int(_tail_targets.get(str(step_name), int(fallback)))
+                except Exception:
+                    return int(fallback)
+
+            try:
+                if str(_assemble_step_name) in _tail_windows:
+                    a, b = _tail_windows.get(str(_assemble_step_name), (95, 99))
+                    _assemble_progress_win["start"] = int(a)
+                    _assemble_progress_win["end"] = int(b)
+            except Exception:
+                pass
+
+            _tail_pct_fn = _tail_pct
+            # Run assemble/audio depending on preset selection
+            did_videoclip = False
+            if _use_videoclip_creator:
+                # Even if no music/narration is available, we can still run Videoclip Creator by generating a silent audio bed.
+                # Do NOT disable videoclip creator here; let step_videoclip_creator_10a handle the silent-audio fallback.
+                try:
+                    pass
+                except Exception:
+                    pass
+                if _use_videoclip_creator:
+                    preset_path2 = os.path.join(str(_root()), 'presets', 'setsave', 'plannerclip.json')
+                    fp = _compute_mclip_fingerprint(str((manifest.get('paths') or {}).get('music_file') or narration_wav), preset_path2)
+                    prev = (manifest.get('steps') or {}).get(_mclip_step_name) or {}
+                    if _file_ok(final_video, 1024) and prev.get('fingerprint') == fp and prev.get('status') == 'done':
+                        _skip(_mclip_step_name, 'videoclip creator output up-to-date (fingerprint match)')
+                    else:
+                        _run(_mclip_step_name, step_videoclip_creator_10a, _tail_pct_fn(_mclip_step_name))
+                    # Mark step record
+                    try:
+                        srec2 = (manifest.get('steps') or {}).get(_mclip_step_name) or {}
+                        srec2['fingerprint'] = fp
+                        srec2.setdefault('debug', {}).update({'timeline_json': timeline_json})
+                        srec2['ts'] = time.time()
+                        manifest.setdefault('steps', {})[_mclip_step_name] = srec2
+                        _safe_write_json(manifest_path, manifest)
+                    except Exception:
+                        pass
+                
+                # Verify/ensure stable output exists before skipping hardcuts.
+                stable_final_cut = os.path.join(str(final_dir), "final_cut.mp4")
+                try:
+                    if (not _file_ok(stable_final_cut, 1024)) and _file_ok(final_video, 1024):
+                        shutil.copy2(final_video, stable_final_cut)
+                except Exception:
+                    pass
+                did_videoclip = _file_ok(stable_final_cut, 1024) or _file_ok(final_video, 1024)
+
+                if did_videoclip:
+                    # Skip the standard assemble + audio mux steps because videoclip creator already outputs a final mp4 with audio.
+                    _log('[OK] Videoclip Creator finished; skipping hardcuts assembly + audio mux.')
+                else:
+                    _log('[WARN] Videoclip Creator was selected but produced no output; falling back to hardcuts assembly + audio mux.')
+            if not did_videoclip:
+                assemble_prev = (manifest.get("steps") or {}).get(_assemble_step_name) or {}
+                if _file_ok(final_video, 1024) and _file_ok(timeline_json, 10) and assemble_prev.get("fingerprint") == _assembly_fingerprint and assemble_prev.get("status") == "done":
+                    _skip(_assemble_step_name, "final cut up-to-date (fingerprint match)")
+                else:
+                    _run(_assemble_step_name, step_final, _tail_pct_fn(_assemble_step_name))
+
+
+
+                # Skip / run audio step using fingerprint
+                _audio_fingerprint = _compute_audio_fingerprint()
+                audio_prev = (manifest.get("steps") or {}).get(_audio_step_name) or {}
+
+                # If narration is enabled, do not skip the audio step unless the job-local narration.wav exists.
+                _need_narr = bool(getattr(self.job, "narration_enabled", False)) and (not bool(getattr(self.job, "silent", False)))
+                if _need_narr and (not _file_ok(narration_wav, 512)):
+                    _run(_audio_step_name, step_audio_mix, _tail_pct_fn(_audio_step_name))
+                elif _file_ok(final_cut_mp4, 1024) and audio_prev.get("fingerprint") == _audio_fingerprint and audio_prev.get("status") == "done":
+                    _skip(_audio_step_name, "audio mix up-to-date (fingerprint match)")
+                else:
+                    _run(_audio_step_name, step_audio_mix, _tail_pct_fn(_audio_step_name))
+                # Ensure audio step fingerprint is recorded for idempotency
+                srec = (manifest.get("steps") or {}).get(_audio_step_name) or {}
+                try:
+                    srec["fingerprint"] = _audio_fingerprint
+                    srec.setdefault("debug", {}).update({
+                        "tts_log": tts_log,
+                        "mix_log": mix_log,
+                        "narration_txt": narration_txt,
+                        "narration_wav": narration_wav,
+                        "final_cut": final_cut_mp4,
+                    })
+                    srec.setdefault("note", "Narration + optional music mix.")
+                    srec["ts"] = time.time()
+                except Exception:
+                    pass
+                manifest.setdefault("steps", {})[_audio_step_name] = srec
+                _safe_write_json(manifest_path, manifest)
+
+
+            # Step I: Upscale final cut (Chunk 9B2) — post-processing only (no interpolation)
+            # Conditions:
+            # - Planner upscaling toggle enabled (planner_upscale.json -> enabled)
+            # - Engine + model selected (Settings → Upscaling)
+            _upscale_step_name = "Upscale final cut "
+
+            def _read_planner_upscale_settings(job_dir2: str) -> dict:
+                try:
+                    p2 = os.path.join(str(job_dir2), _PLANNER_UPSCALE_JSON_NAME)
+                    if not p2 or (not os.path.isfile(p2)):
+                        return {}
+                    with open(p2, "r", encoding="utf-8", errors="ignore") as f:
+                        obj2 = json.load(f)
+                    return obj2 if isinstance(obj2, dict) else {}
+                except Exception:
+                    return {}
+
+            def _infer_model_scale(engine_label: str, model_text: str) -> int:
+                s = (model_text or "").lower().replace(" ", "")
+                # common patterns: x2 / 2x / _x4 / -x4-
+                for pat in (r"x2", r"2x"):
+                    if pat in s:
+                        return 2
+                for pat in (r"x4", r"4x"):
+                    if pat in s:
+                        return 4
+                # Some engines imply 4× defaults; keep conservative and assume 2× when unknown
+                # (we'll still resize to target factor afterward).
+                lab = (engine_label or "").lower()
+                if "4x" in lab or "x4" in lab:
+                    return 4
+                return 2
+
+            def _probe_video_meta(video_path: str) -> dict:
+                try:
+                    args = [ffprobe2, "-v", "error", "-print_format", "json", "-show_streams", "-show_format", str(video_path)]
+                    cp = subprocess.run(args, cwd=str(_root()), capture_output=True, text=True)
+                    if cp.returncode != 0:
+                        return {}
+                    obj = json.loads(cp.stdout or "{}")
+                    return obj if isinstance(obj, dict) else {}
+                except Exception:
+                    return {}
+
+            def _even2(n: int) -> int:
+                try:
+                    n = int(n)
+                except Exception:
+                    n = 0
+                return max(2, int(n) // 2 * 2)
+
+            def _src_video_bitrate_kbps(meta: dict) -> int:
+                # Prefer container bit_rate; fallback: 0 (unknown)
+                try:
+                    br = int(float(((meta.get("format") or {}).get("bit_rate") or 0.0)))
+                    if br <= 0:
+                        return 0
+                    return max(1, int(round(br / 1000.0)))
+                except Exception:
+                    return 0
+
+            def _choose_target_bitrate_kbps(src_kbps: int, default_kbps: int = 3500) -> int:
+                # "use source when it is already close to 3500"
+                try:
+                    src_kbps = int(src_kbps or 0)
+                except Exception:
+                    src_kbps = 0
+                if src_kbps > 0:
+                    if abs(src_kbps - int(default_kbps)) <= 500:
+                        return int(src_kbps)
+                return int(default_kbps)
+
+            def _try_run_upsc_module(job_dict: dict) -> bool:
+                # Best-effort: reuse helpers/upsc.py if it exposes a run API.
+                try:
+                    from helpers import upsc as _upsc  # type: ignore
+                except Exception:
+                    try:
+                        import upsc as _upsc  # type: ignore
+                    except Exception:
+                        _upsc = None  # type: ignore
+
+                if _upsc is None:
+                    return False
+
+                # Candidate function names used across versions
+                candidates = [
+                    "run_job",
+                    "run_upscale_job",
+                    "execute_job",
+                    "process_job",
+                    "run",
+                    "upscale_video",
+                    "run_video_upscale",
+                    "run_video",
+                    "upscale",
+                ]
+
+                for name in candidates:
+                    fn = getattr(_upsc, name, None)
+                    if not callable(fn):
+                        continue
+
+                    # Try a few common call signatures.
+                    for mode in ("job", "kwargs", "args"):
+                        try:
+                            if mode == "job":
+                                res = fn(job_dict)
+                            elif mode == "kwargs":
+                                res = fn(**job_dict)
+                            else:
+                                res = fn(
+                                    job_dict.get("input_path") or job_dict.get("in_path"),
+                                    job_dict.get("output_path") or job_dict.get("out_path"),
+                                    job_dict.get("engine_label") or job_dict.get("engine"),
+                                    job_dict.get("model_text") or job_dict.get("model"),
+                                    job_dict.get("scale") or job_dict.get("factor") or 1,
+                                )
+                            # Interpret result
+                            if isinstance(res, bool):
+                                return bool(res)
+                            if isinstance(res, int):
+                                return int(res) == 0
+                            if isinstance(res, dict):
+                                if bool(res.get("ok")):
+                                    return True
+                                if "returncode" in res:
+                                    return int(res.get("returncode") or 1) == 0
+                            # Non-standard truthy result
+                            if res is None:
+                                # Some runners return None on success; treat as success if output exists.
+                                outp = str(job_dict.get("output_path") or "")
+                                if outp and os.path.exists(outp) and os.path.getsize(outp) > 1024:
+                                    return True
+                        except TypeError:
+                            continue
+                        except Exception:
+                            # Don't fail the whole pipeline just because one candidate signature didn't match.
+                            continue
+                return False
+
+            def _run_ncnn_folder_engine(engine_exe: str, engine_label: str, model_text: str, in_dir: str, out_dir2: str, scale: int, log_path: str) -> None:
+                # Fallback runner for the common NCNN Vulkan CLIs (Real-ESRGAN / RealSR / SRMD family).
+                # This is used only if helpers/upsc.py doesn't expose a usable run API.
+                exe = str(engine_exe or "")
+                if not exe:
+                    raise RuntimeError("Upscale engine exe is empty.")
+                if not os.path.exists(exe):
+                    raise RuntimeError(f"Upscale engine exe not found: {exe}")
+
+                args = [exe]
+
+                # Most supported tools follow: -i <in> -o <out> -n <model> -s <scale> -f <ext>
+                args += ["-i", str(in_dir), "-o", str(out_dir2)]
+
+                # Some engines may not require a model flag; keep it when provided.
+                if model_text and model_text.strip() and model_text.strip() != "(default)":
+                    args += ["-n", str(model_text).strip()]
+
+                if scale and int(scale) > 1:
+                    args += ["-s", str(int(scale))]
+
+                # Prefer PNG outputs for reliable ffmpeg ingest.
+                args += ["-f", "png"]
+
+                cp = subprocess.run(args, cwd=str(_root()), capture_output=True, text=True)
+                try:
+                    _safe_write_text(
+                        log_path,
+                        "[cmd] " + " ".join([str(x) for x in args]) + "\n\n"
+                        + "--- STDOUT ---\n" + (cp.stdout or "") + "\n\n"
+                        + "--- STDERR ---\n" + (cp.stderr or "") + "\n"
+                    )
+                except Exception:
+                    pass
+                if cp.returncode != 0:
+                    tail = (cp.stderr or "")[-2000:] if (cp.stderr or "") else "Unknown error"
+                    raise RuntimeError(f"Upscale engine failed (exit={cp.returncode}).\n{tail}")
 
             def step_upscale_final_cut_9b2() -> None:
                 # Always retain raw final_cut path
@@ -12311,10 +12925,6 @@ class PipelineWorker(QThread):
                     _skip(_fade_step_name, "failed (non-fatal)")
                 except Exception:
                     pass
-
-            # Step I: Optional Upscale (Chunk 9B2)
-            # NOTE: This step label is used in the manifest + UI progress log.
-            _upscale_step_name = "Upscale final cut "
 
 # Decide whether to run Chunk 9B2 upscaling
             try:
@@ -13520,7 +14130,7 @@ class PlannerPane(QWidget):
             pass
 
         # End of user work note
-        end_note = QLabel("When you press Generate, the planner will run the full pipeline (story creation → images → clips → narration/music → assembly → Upscale → Interpolate).")
+        end_note = QLabel("When you press Generate, the app will run the full pipeline (story → images → video clips → assembly).")
         end_note.setWordWrap(True)
         end_note.setStyleSheet("opacity: 0.9;")
         lay.addWidget(end_note)
@@ -14076,26 +14686,23 @@ If the planner sees a marker like [02] or (02), it becomes the next image prompt
         self.cmb_video_model.currentIndexChanged.connect(lambda _=None: _refresh_gen_quality())
         _refresh_gen_quality()
 
-        grid.addWidget(QLabel("Final assembly preset"), 3, 0)
+        grid.addWidget(QLabel("Videoclip Creator preset"), 3, 0)
         self.cmb_videoclip_preset = QComboBox()
-
-        # Step 2: Preset manager (Hardcuts + Music Clip Creator 1-click presets from JSON)
-        # ItemData stores {"kind": "hardcuts"|"mclip", "preset_id": "..."} for pipeline binding.
-        self.cmb_videoclip_preset.clear()
-        try:
-            self.cmb_videoclip_preset.addItem("Storyline Preset (Hardcuts)", {"kind": "hardcuts", "preset_id": ""})
-        except Exception:
-            self.cmb_videoclip_preset.addItem("Storyline Preset (Hardcuts)")
-
-        try:
-            self._load_videoclip_presets_combo(self.cmb_videoclip_preset)
-        except Exception:
-            pass
-
         try:
             self.cmb_videoclip_preset.currentIndexChanged.connect(self._on_videoclip_creator_preset_changed)
         except Exception:
             pass
+
+        # Step 2: Load presets from clip_presets.json (plus Preset 1 = Hardcuts)
+        try:
+            self._load_videoclip_preset_combo()
+        except Exception:
+            try:
+                self.cmb_videoclip_preset.clear()
+                self.cmb_videoclip_preset.addItem("Storyline Preset (Hardcuts)")
+                self.cmb_videoclip_preset.setCurrentIndex(0)
+            except Exception:
+                pass
 
         grid.addWidget(self.cmb_videoclip_preset, 3, 1)
 
@@ -16290,7 +16897,7 @@ If the planner sees a marker like [02] or (02), it becomes the next image prompt
 
     
     def _on_videoclip_creator_preset_changed(self, _=None) -> None:
-        """Chunk 10A: Persist Final assembly preset dropdown selection."""
+        """Chunk 10A: Persist Videoclip Creator preset dropdown selection."""
         try:
             try:
                 choice = self.cmb_videoclip_preset.currentText()
@@ -16299,6 +16906,84 @@ If the planner sees a marker like [02] or (02), it becomes the next image prompt
             s = _load_planner_settings()
             s["videoclip_creator_preset"] = str(choice or "")
             _save_planner_settings(s)
+        except Exception:
+            pass
+
+    def _load_videoclip_preset_combo(self) -> None:
+        """Step 2: Load Videoclip Creator one-click presets from JSON.
+
+        Expected file: <root>/presets/setsave/clip_presets.json
+        Shape: {"version": 1, "presets": [{"id","name","description","settings"}, ...]}
+        """
+        self._videoclip_preset_items = []  # list of dicts
+        try:
+            root = str(_root())
+            p = os.path.join(root, 'presets', 'setsave', 'clip_presets.json')
+            if not os.path.isfile(p):
+                # Compatibility fallback (older internal builds)
+                p2 = os.path.join(root, 'presets', 'setsave', 'plannerclip.json')
+                if os.path.isfile(p2):
+                    p = p2
+            obj = _safe_read_json(p) if os.path.isfile(p) else {}
+            if not isinstance(obj, dict):
+                obj = {}
+            items = obj.get('presets') or []
+            if not isinstance(items, list):
+                items = []
+            cleaned = []
+            for it in items:
+                if not isinstance(it, dict):
+                    continue
+                pid = str(it.get('id') or '').strip()
+                name = str(it.get('name') or '').strip()
+                desc = str(it.get('description') or '').strip()
+                settings = it.get('settings') or {}
+                if not isinstance(settings, dict):
+                    settings = {}
+                if not name:
+                    continue
+                cleaned.append({'id': pid, 'name': name, 'description': desc, 'settings': settings})
+            self._videoclip_preset_items = cleaned
+        except Exception:
+            self._videoclip_preset_items = []
+
+        # Populate combo
+        try:
+            self.cmb_videoclip_preset.blockSignals(True)
+        except Exception:
+            pass
+        try:
+            self.cmb_videoclip_preset.clear()
+            self.cmb_videoclip_preset.addItem("Storyline Preset (Hardcuts)")
+            for it in (self._videoclip_preset_items or []):
+                self.cmb_videoclip_preset.addItem(str(it.get('name') or ''))
+
+            # Enable only if there are presets to choose from
+            self.cmb_videoclip_preset.setEnabled(bool(self._videoclip_preset_items))
+            self.cmb_videoclip_preset.setToolTip("Select Videoclip Creator preset (loaded from clip_presets.json)")
+        except Exception:
+            pass
+
+        # Restore persisted choice
+        try:
+            s = _load_planner_settings()
+            want = str(s.get('videoclip_creator_preset') or '').strip()
+            if want:
+                idx = self.cmb_videoclip_preset.findText(want)
+                if idx >= 0:
+                    self.cmb_videoclip_preset.setCurrentIndex(idx)
+                else:
+                    self.cmb_videoclip_preset.setCurrentIndex(0)
+            else:
+                self.cmb_videoclip_preset.setCurrentIndex(0)
+        except Exception:
+            try:
+                self.cmb_videoclip_preset.setCurrentIndex(0)
+            except Exception:
+                pass
+
+        try:
+            self.cmb_videoclip_preset.blockSignals(False)
         except Exception:
             pass
 
@@ -16414,81 +17099,6 @@ If the planner sees a marker like [02] or (02), it becomes the next image prompt
                 combo.addItem("Default", "default")
             except Exception:
                 pass
-    def _load_videoclip_presets_combo(self, combo: "QComboBox") -> None:
-        """Load Music Clip Creator 1-click presets into the Planner's Final assembly preset dropdown.
-
-        Sources:
-          1) Built-in hardcuts preset (already inserted by caller)
-          2) JSON presets: <root>/presets/setsave/clip_presets.json (same file used by Music Clip Creator)
-
-        We add items as: "Videoclip: <name>" and store:
-            itemData = {"kind": "mclip", "preset_id": <id>}
-        """
-        try:
-            # Defer import so Planner can still open even if the tool file isn't present in dev builds.
-            try:
-                from helpers import auto_music_sync as mclip  # type: ignore
-            except Exception:
-                import auto_music_sync as mclip  # type: ignore
-        except Exception:
-            # Tool not available; keep hardcuts only.
-            try:
-                combo.setEnabled(False)
-                combo.setToolTip("Music Clip Creator presets not available (missing helpers/auto_music_sync.py).")
-            except Exception:
-                pass
-            return
-
-        # Load preset list (id, name, desc)
-        try:
-            presets = list(mclip._load_clip_presets() or [])  # type: ignore[attr-defined]
-        except Exception:
-            presets = []
-
-        # Add JSON presets after the built-in hardcuts item (index 0)
-        for pid, name, desc in presets:
-            try:
-                label = f"Videoclip: {str(name).strip()}"
-            except Exception:
-                label = "Videoclip preset"
-            try:
-                combo.addItem(label, {"kind": "mclip", "preset_id": str(pid or "")})
-                if desc:
-                    combo.setItemData(combo.count() - 1, str(desc), Qt.ToolTipRole)
-            except Exception:
-                try:
-                    combo.addItem(label)
-                except Exception:
-                    pass
-
-        # Enable dropdown if we have more than one choice
-        try:
-            combo.setEnabled(combo.count() > 1)
-            if combo.count() > 1:
-                combo.setToolTip("Choose Hardcuts or a Music Clip Creator 1-click preset.")
-        except Exception:
-            pass
-
-        # Restore persisted choice by label (best-effort)
-        try:
-            s = _load_planner_settings()
-            want = str(s.get("videoclip_creator_preset") or "").strip()
-        except Exception:
-            want = ""
-        if want:
-            try:
-                for i in range(combo.count()):
-                    if str(combo.itemText(i) or "").strip() == want:
-                        combo.setCurrentIndex(i)
-                        break
-            except Exception:
-                pass
-        else:
-            try:
-                combo.setCurrentIndex(0)
-            except Exception:
-                pass
-
 
 
     def _toggle_music_block(self, checked: bool) -> None:
@@ -17043,11 +17653,7 @@ If the planner sees a marker like [02] or (02), it becomes the next image prompt
 
             "image_model": self.cmb_image_model.currentText(),
             "video_model": self.cmb_video_model.currentText(),
-            # Final assembly preset selection (Step 2)
             "videoclip_preset": (self.cmb_videoclip_preset.currentText() if hasattr(self, "cmb_videoclip_preset") else "Storyline Preset (Hardcuts)"),
-            "videoclip_preset_kind": (str((self.cmb_videoclip_preset.currentData() or {}).get("kind") or "hardcuts") if hasattr(self, "cmb_videoclip_preset") else "hardcuts"),
-            "videoclip_preset_id": (str((self.cmb_videoclip_preset.currentData() or {}).get("preset_id") or "") if hasattr(self, "cmb_videoclip_preset") else ""),
-
             "gen_quality_preset": (self.cmb_gen_quality.currentText() if hasattr(self, "cmb_gen_quality") else ""),
             "allow_edit_while_running": bool(getattr(self, "chk_allow_edit_while_running", None) and self.chk_allow_edit_while_running.isChecked()),
             "character_bible_enabled": bool(getattr(self, "chk_character_bible", None) and self.chk_character_bible.isChecked()),
@@ -17055,6 +17661,19 @@ If the planner sees a marker like [02] or (02), it becomes the next image prompt
             "alternative_storymode": bool(getattr(self, "chk_alternative_storymode", None) and self.chk_alternative_storymode.isChecked()),
             "own_storyline_enabled": bool(getattr(self, "chk_own_storyline", None) and self.chk_own_storyline.isChecked()),
         })
+
+        # Store selected videoclip preset id (if it came from JSON) for robust matching later.
+        try:
+            vp_name = str(enc.get('videoclip_preset') or '').strip()
+            vp_id = ''
+            for it in (getattr(self, '_videoclip_preset_items', None) or []):
+                if str(it.get('name') or '').strip() == vp_name:
+                    vp_id = str(it.get('id') or '').strip()
+                    break
+            if vp_id:
+                enc['videoclip_preset_id'] = vp_id
+        except Exception:
+            pass
 
         # info: Chunk 10 side quest — Own storyline payload (Step 3: pipeline binding)
         try:
