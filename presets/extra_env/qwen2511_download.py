@@ -22,6 +22,8 @@ import sys
 import time
 import urllib.request
 import urllib.error
+import shutil
+import zipfile
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Dict, Iterable, List, Optional, Sequence, Tuple
@@ -37,6 +39,10 @@ _ROOT_OVERRIDE: Optional[Path] = None
 UNET_REPO = "https://huggingface.co/unsloth/Qwen-Image-Edit-2511-GGUF/resolve/main/"
 TEXT_ENCODER_REPO = "https://huggingface.co/unsloth/Qwen2.5-VL-7B-Instruct-GGUF/resolve/main/"
 VAE_REPO = "https://huggingface.co/Comfy-Org/Qwen-Image_ComfyUI/resolve/main/split_files/vae/"
+
+# stable-diffusion.cpp (sd-cli) bundle
+SDCPP_ZIP_URL = "https://github.com/leejet/stable-diffusion.cpp/releases/download/master-492-f957fa3/sd-master-f957fa3-bin-win-noavx-x64.zip"
+SDCPP_ZIP_NAME = "sd-master-f957fa3-bin-win-noavx-x64.zip"
 
 # Required shared files (download once)
 REQUIRED_TEXT_ENCODER = "Qwen2.5-VL-7B-Instruct-UD-Q4_K_XL.gguf"
@@ -96,6 +102,104 @@ def _shared_sdcli_dir(root: Path) -> Path:
 def _sdcli_present(bin_dir: Path) -> bool:
     return (bin_dir / "sd-cli.exe").exists() and ((bin_dir / "stable-diffusion.dll").exists() or (bin_dir / "diffusers.dll").exists())
 
+
+
+def _qwen2511_models_bin_dir(root: Path) -> Path:
+    return (root / "models" / "qwen2511gguf" / "bin").resolve()
+
+
+def _download_file(url: str, dst: Path, progress: Optional[ProgressCb] = None) -> None:
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    tmp = dst.with_suffix(dst.suffix + ".part")
+    if tmp.exists():
+        try:
+            tmp.unlink()
+        except Exception:
+            pass
+
+    req = urllib.request.Request(url, headers={"User-Agent": "FrameVision"})
+    with urllib.request.urlopen(req, timeout=60) as r, tmp.open("wb") as f:
+        total = r.headers.get("Content-Length")
+        total_i = int(total) if total and total.isdigit() else None
+        done = 0
+        while True:
+            chunk = r.read(1024 * 256)
+            if not chunk:
+                break
+            f.write(chunk)
+            done += len(chunk)
+            if progress:
+                progress(f"download {dst.name}", done, total_i)
+    tmp.replace(dst)
+
+
+def _extract_zip(zip_path: Path, dst_dir: Path) -> Path:
+    dst_dir.mkdir(parents=True, exist_ok=True)
+    with zipfile.ZipFile(zip_path, "r") as z:
+        z.extractall(dst_dir)
+    return dst_dir
+
+
+def _copy_sd_bundle(from_dir: Path, to_dir: Path) -> int:
+    """Copy sd-cli bundle files from from_dir to to_dir. Returns number of files copied."""
+    to_dir.mkdir(parents=True, exist_ok=True)
+    copied = 0
+    # Copy only the likely runtime files; avoid dragging unrelated items.
+    exts = {".exe", ".dll"}
+    for p in from_dir.iterdir():
+        if not p.is_file():
+            continue
+        if p.suffix.lower() not in exts:
+            continue
+        name = p.name.lower()
+        if name in ("sd-cli.exe", "sd.exe", "stable-diffusion.dll", "diffusers.dll") or name.startswith(("ggml", "cublas", "cudart", "cuda", "zlib", "vulkan", "onnx")):
+            shutil.copy2(p, to_dir / p.name)
+            copied += 1
+    return copied
+
+
+def ensure_sdcli_bundle(root: Path, progress: Optional[ProgressCb] = None, force: bool = False) -> Tuple[bool, List[Path]]:
+    """Ensure sd-cli.exe + runtime DLLs exist in both presets/bin and models/qwen2511gguf/bin.
+
+    Returns (installed, [target_dirs]).
+    """
+    presets_bin = _shared_sdcli_dir(root)
+    models_bin = _qwen2511_models_bin_dir(root)
+
+    need = force or (not _sdcli_present(presets_bin)) or (not _sdcli_present(models_bin))
+    if not need:
+        return (False, [presets_bin, models_bin])
+
+    cache_dir = (_models_root() / "_sdcpp_cache").resolve()
+    zip_path = cache_dir / SDCPP_ZIP_NAME
+    if force or not zip_path.exists():
+        _download_file(SDCPP_ZIP_URL, zip_path, progress=progress)
+
+    extract_dir = cache_dir / "extracted"
+    if force and extract_dir.exists():
+        shutil.rmtree(extract_dir, ignore_errors=True)
+    _extract_zip(zip_path, extract_dir)
+
+    # Find the folder that actually contains sd-cli.exe
+    cand = None
+    for d in [extract_dir] + [p for p in extract_dir.rglob("*") if p.is_dir()]:
+        if (d / "sd-cli.exe").exists():
+            cand = d
+            break
+    if cand is None:
+        raise RuntimeError(f"sd-cli.exe not found after extracting: {zip_path}")
+
+    c1 = _copy_sd_bundle(cand, presets_bin)
+    c2 = _copy_sd_bundle(cand, models_bin)
+
+    # Final sanity: ensure sd-cli.exe exists at least
+    if not (presets_bin / "sd-cli.exe").exists():
+        raise RuntimeError(f"sd-cli.exe still missing in {presets_bin}")
+    if not (models_bin / "sd-cli.exe").exists():
+        # copy direct if filtered copy skipped it (shouldn't)
+        shutil.copy2(presets_bin / "sd-cli.exe", models_bin / "sd-cli.exe")
+
+    return (True, [presets_bin, models_bin])
 
 def _models_root() -> Path:
     return _project_root() / "models" / "qwen2511gguf"
@@ -301,12 +405,22 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
 
     if args.ensure_cli:
         root = _project_root()
-        bin_dir = Path(args.bin_dir).resolve() if args.bin_dir else _shared_sdcli_dir(root)
-        if _sdcli_present(bin_dir):
-            print(f"[QWEN2511] OK  sd-cli present: {bin_dir / 'sd-cli.exe'}")
-        else:
-            print(f"[QWEN2511] WARN  sd-cli not found in: {bin_dir}")
-            print("[QWEN2511]       (Install it once via Z-Image GGUF installer or Qwen2512 installer; it is shared.)")
+        try:
+            installed, targets = ensure_sdcli_bundle(
+                root,
+                progress=_cli_progress,
+                force=bool(getattr(args, "force_cli", False))
+            )
+            if installed:
+                print("[QWEN2511] Installed sd-cli bundle into:")
+            else:
+                print("[QWEN2511] OK  sd-cli present in:")
+            for t in targets:
+                print(f"           - {t}")
+        except Exception as e:
+            print(f"[QWEN2511] ERROR ensuring sd-cli bundle: {e}")
+            return 1
+
 
     try:
         ensure_download(variants, models_dir=models_dir, progress=_cli_progress)
