@@ -11,11 +11,18 @@
           "thinking": true,
           "use_cot_caption": true,
           "use_cot_language": true,
-          "use_cot_metas": false,
+          "use_cot_metas": true,
           "instrumental": false,
           "use_cot_lyrics": false,
           "lm_negative_prompt": "lofi, jazz, acoustic, orchestral, ambient drone",
-          "bpm": 128
+          "bpm": 128,
+          "enable_lm": true,
+          "parallel_thinking": true,
+          "lm_enhance_prompt": true,
+          "main_model": "acestep-v15-sft",
+          "main_model_path": "acestep-v15-sft",
+          "lm_model": "acestep-5HZ-lm-1.7B",
+          "lm_model_path": "acestep-5HZ-lm-1.7B"
         },
         "Deep House": {
           "backend": "vllm",
@@ -25,11 +32,18 @@
           "thinking": true,
           "use_cot_caption": true,
           "use_cot_language": true,
-          "use_cot_metas": false,
+          "use_cot_metas": true,
           "instrumental": false,
           "use_cot_lyrics": false,
           "lm_negative_prompt": "trap, dubstep, heavy distortion, screech leads",
-          "bpm": 122
+          "bpm": 122,
+          "enable_lm": true,
+          "parallel_thinking": true,
+          "lm_enhance_prompt": true,
+          "main_model": "acestep-v15-sft",
+          "main_model_path": "acestep-v15-sft",
+          "lm_model": "acestep-5HZ-lm-1.7B",
+          "lm_model_path": "acestep-5HZ-lm-1.7B"
         },
         "Melodic Techno": {
           "backend": "vllm",
@@ -39,11 +53,18 @@
           "thinking": true,
           "use_cot_caption": true,
           "use_cot_language": true,
-          "use_cot_metas": false,
+          "use_cot_metas": true,
           "instrumental": false,
           "use_cot_lyrics": false,
           "lm_negative_prompt": "dubstep drops, trap hats, acoustic drums, lo-fi cassette noise, cheesy pop topline",
-          "bpm": 126
+          "bpm": 126,
+          "enable_lm": true,
+          "parallel_thinking": true,
+          "lm_enhance_prompt": true,
+          "main_model": "acestep-v15-sft",
+          "main_model_path": "acestep-v15-sft",
+          "lm_model": "acestep-5HZ-lm-1.7B",
+          "lm_model_path": "acestep-5HZ-lm-1.7B"
         },
         "Peak-Time Techno": {
           "backend": "vllm",
@@ -53,11 +74,18 @@
           "thinking": true,
           "use_cot_caption": true,
           "use_cot_language": true,
-          "use_cot_metas": false,
+          "use_cot_metas": true,
           "instrumental": false,
           "use_cot_lyrics": false,
           "lm_negative_prompt": "bright pop chords, major-key euphoric anthem, guitar rock, reggae skank, jazz swing",
-          "bpm": 130
+          "bpm": 130,
+          "enable_lm": true,
+          "parallel_thinking": true,
+          "lm_enhance_prompt": true,
+          "main_model": "acestep-v15-sft",
+          "main_model_path": "acestep-v15-sft",
+          "lm_model": "acestep-5HZ-lm-1.7B",
+          "lm_model_path": "acestep-5HZ-lm-1.7B"
         },
         "Organic House": {
           "backend": "vllm",
@@ -67,31 +95,49 @@
           "thinking": true,
           "use_cot_caption": true,
           "use_cot_language": true,
-          "use_cot_metas": false,
+          "use_cot_metas": true,
           "instrumental": false,
           "use_cot_lyrics": false,
           "lm_negative_prompt": "drum & bass tempo, heavy metal guitars, harsh screech leads, orchestral symphony",
-          "bpm": 120
+          "bpm": 120,
+          "enable_lm": true,
+          "parallel_thinking": true,
+          "lm_enhance_prompt": true,
+          "main_model": "acestep-v15-sft",
+          "main_model_path": "acestep-v15-sft",
+          "lm_model": "acestep-5HZ-lm-1.7B",
+          "lm_model_path": "acestep-5HZ-lm-1.7B"
         },
         "Uplifting Techno": {
-          "backend": "mlx",
-          "device": "auto",
-          "task_type": "text2music",
           "caption": "Hard-driving peak-time techno, 136 BPM, dark warehouse / festival mainstage energy. Relentless four-on-the-floor kick (tight, punchy, slightly distorted), rumbling offbeat bass with subtle acid movement, sharp 909 hats and metallic rides, short dark clap, minimal melodic content. Hypnotic 2–4 note synth stab motif, gritty industrial texture, filtered noise sweeps, tension risers, short vocal chop used sparingly as a percussive hook. Arrangement: DJ-friendly 16-bar intro → groove → big tension break with filter build → explosive drop → second break shorter → final driving outro. Mix: loud, clean, club-ready, strong sidechain, wide but not washed.",
-          "audio_format": "mp3",
-          "seed": -1,
-          "thinking": false,
-          "instrumental": false,
-          "use_cot_lyrics": false,
-          "time_sig": "auto",
+          "negatives": "bright pop chords, major-key euphoric anthem, guitar rock, reggae skank, jazz swing,No trance supersaws, big uplifting chords,  EDM pop melodies, trap rhythms, tropical/Latin elements, happy major key.",
           "bpm": 135,
+          "instrumental": true,
+          "thinking": true,
+          "enable_lm": true,
+          "lm_enhance_prompt": true,
+          "backend": "mlx",
+          "shift": 3.0,
+          "lm_temperature": 0.85,
+          "lm_top_p": 0.95,
+          "lm_top_k": 0,
+          "time_sig": "auto",
+          "key_scale": "auto",
+          "vocal_language": "",
+          "guidance": 0.0,
+          "infer_method": "ode",
+          "steps": 0,
+          "main_model": "acestep-v15-sft",
+          "lm_model": "acestep-5HZ-lm-1.7B",
           "lm_negative_prompt": "bright pop chords, major-key euphoric anthem, guitar rock, reggae skank, jazz swing,No trance supersaws, big uplifting chords,  EDM pop melodies, trap rhythms, tropical/Latin elements, happy major key.",
-          "use_cot_caption": false,
-          "use_cot_language": false,
-          "use_cot_metas": false,
-          "main_model_path": "acestep-v15-turbo",
-          "lm_model_path": "acestep-5Hz-lm-1.7B",
-          "lyrics": "[Verse 1]\ntonight in the lights, we come alive\nBass in the chest, let it decide\n\n[Chorus]\ntonight, tonight, one more time\nHands up, hands up, feel the drive\n\n[Chorus]\ntonight, tonight, one more time\nHands up, hands up, feel the drive\n\n[Chorus]\ntonight, tonight, one more time\nHands up, hands up, feel the drive\n\n[Chorus]\ntonight, tonight, one more time\nHands up, hands up, feel the drive"
+          "timesignature": "auto",
+          "keyscale": "auto",
+          "use_cot_caption": true,
+          "use_cot_language": true,
+          "use_cot_metas": true,
+          "main_model_path": "acestep-v15-sft",
+          "lm_model_path": "acestep-5HZ-lm-1.7B",
+          "parallel_thinking": true
         },
         "Belgium Nineties Newbeat": {
           "caption": "Dark Belgian New Beat track (late 80s / early 90s club sound) at 115 BPM, 4/4. Slow, heavy, hypnotic groove with a stomping kick, snappy gated snare/clap, tight hats, and a rolling EBM-style bassline. Cold, metallic synth stabs and eerie minor-key chords, with occasional acid squelch and industrial textures. Add chopped vocal shouts or spoken phrases with lots of reverb/delay (detached, menacing, not melodic), plus subtle scratch/sample flair like old Belgian club records. Arrangement should feel repetitive and trance-like, building tension through filter sweeps and drum fills, not big modern EDM drops. Mix: gritty, analog-ish saturation, dark low end, roomy drums, no glossy polish.",
@@ -99,6 +145,7 @@
           "bpm": 115,
           "instrumental": false,
           "thinking": true,
+          "parallel_thinking": true,
           "enable_lm": true,
           "lm_enhance_prompt": true,
           "backend": "pt",
@@ -113,7 +160,7 @@
           "infer_method": "ode",
           "steps": 0,
           "main_model": "acestep-v15-sft",
-          "lm_model": "acestep-5Hz-lm-1.7B",
+          "lm_model": "acestep-5HZ-lm-1.7B",
           "lm_negative_prompt": "modern big-room EDM drop, future bass chords, bright pop melodies, tropical vibes, shiny autotune lead, trap 808 rolls, modern dubstep wobble.",
           "timesignature": "auto",
           "keyscale": "auto",
@@ -121,31 +168,38 @@
           "use_cot_language": true,
           "use_cot_metas": true,
           "main_model_path": "acestep-v15-sft",
-          "lm_model_path": "acestep-5Hz-lm-1.7B"
+          "lm_model_path": "acestep-5HZ-lm-1.7B"
         },
-        "House @ 135 BPM": {
+        "Techno": {
           "caption": "hard hitting techno",
           "negatives": "bright pop chords, major-key euphoric anthem, guitar rock, reggae skank, jazz swing",
           "bpm": 135,
           "instrumental": true,
           "thinking": true,
+          "parallel_thinking": true,
           "enable_lm": true,
           "lm_enhance_prompt": true,
-          "backend": "mlx",
+          "backend": "pt",
+          "shift": 3.0,
+          "lm_temperature": 0.85,
+          "lm_top_p": 0.95,
+          "lm_top_k": 0,
           "time_sig": "auto",
           "key_scale": "D# minor",
+          "vocal_language": "",
           "guidance": 0.0,
           "infer_method": "auto",
           "steps": 0,
-          "main_model": "acestep-v15-turbo",
-          "lm_model": "acestep-5Hz-lm-1.7B",
+          "main_model": "acestep-v15-sft",
+          "lm_model": "acestep-5HZ-lm-1.7B",
           "lm_negative_prompt": "bright pop chords, major-key euphoric anthem, guitar rock, reggae skank, jazz swing",
+          "timesignature": "auto",
           "keyscale": "D# minor",
           "use_cot_caption": true,
           "use_cot_language": true,
           "use_cot_metas": true,
-          "main_model_path": "acestep-v15-turbo",
-          "lm_model_path": "acestep-5Hz-lm-1.7B"
+          "main_model_path": "acestep-v15-sft",
+          "lm_model_path": "acestep-5HZ-lm-1.7B"
         }
       }
     },
@@ -163,7 +217,14 @@
           "instrumental": false,
           "use_cot_lyrics": false,
           "lm_negative_prompt": "EDM, four-on-the-floor club kick, synthwave",
-          "bpm": 130
+          "bpm": 130,
+          "enable_lm": true,
+          "parallel_thinking": true,
+          "lm_enhance_prompt": true,
+          "main_model": "acestep-v15-sft",
+          "main_model_path": "acestep-v15-sft",
+          "lm_model": "acestep-5HZ-lm-1.7B",
+          "lm_model_path": "acestep-5HZ-lm-1.7B"
         },
         "Indie Rock": {
           "backend": "vllm",
@@ -177,7 +238,14 @@
           "instrumental": false,
           "use_cot_lyrics": false,
           "lm_negative_prompt": "EDM club kick, dubstep wobble bass, trap 808 dominance",
-          "bpm": 120
+          "bpm": 120,
+          "enable_lm": true,
+          "parallel_thinking": true,
+          "lm_enhance_prompt": true,
+          "main_model": "acestep-v15-sft",
+          "main_model_path": "acestep-v15-sft",
+          "lm_model": "acestep-5HZ-lm-1.7B",
+          "lm_model_path": "acestep-5HZ-lm-1.7B"
         },
         "Hard Rock": {
           "backend": "vllm",
@@ -191,7 +259,14 @@
           "instrumental": false,
           "use_cot_lyrics": false,
           "lm_negative_prompt": "chill ambient, reggae one-drop, orchestral strings as main focus, soft jazz",
-          "bpm": 140
+          "bpm": 140,
+          "enable_lm": true,
+          "parallel_thinking": true,
+          "lm_enhance_prompt": true,
+          "main_model": "acestep-v15-sft",
+          "main_model_path": "acestep-v15-sft",
+          "lm_model": "acestep-5HZ-lm-1.7B",
+          "lm_model_path": "acestep-5HZ-lm-1.7B"
         },
         "Punk Rock": {
           "backend": "vllm",
@@ -205,7 +280,14 @@
           "instrumental": false,
           "use_cot_lyrics": false,
           "lm_negative_prompt": "slow ballad, polished pop sheen, EDM risers and drops, trap triplets",
-          "bpm": 160
+          "bpm": 160,
+          "enable_lm": true,
+          "parallel_thinking": true,
+          "lm_enhance_prompt": true,
+          "main_model": "acestep-v15-sft",
+          "main_model_path": "acestep-v15-sft",
+          "lm_model": "acestep-5HZ-lm-1.7B",
+          "lm_model_path": "acestep-5HZ-lm-1.7B"
         },
         "Post Rock": {
           "backend": "vllm",
@@ -219,7 +301,14 @@
           "instrumental": false,
           "use_cot_lyrics": false,
           "lm_negative_prompt": "four-on-the-floor club mix, rap verses, bright disco funk, jump-up DnB",
-          "bpm": 110
+          "bpm": 110,
+          "enable_lm": true,
+          "parallel_thinking": true,
+          "lm_enhance_prompt": true,
+          "main_model": "acestep-v15-sft",
+          "main_model_path": "acestep-v15-sft",
+          "lm_model": "acestep-5HZ-lm-1.7B",
+          "lm_model_path": "acestep-5HZ-lm-1.7B"
         },
         "Crunge Rock": {
           "caption": "Raw 90s grunge/crunch rock track with loud-quiet-loud dynamics and an angry, cathartic mood. Dirty overdriven guitars with thick, crunchy power chords and gritty pick attack, slightly detuned, occasional feedback swells. Bass is heavy and simple, locked to the kick. Drums are punchy and human: tight snare crack, aggressive hi-hats, explosive fills into choruses. Vocals are raspy, worn, and emotional—half-sung, half-shouted—melody is simple and unforgettable, with occasional double-tracking in the chorus. Structure: tense verse, massive chorus, raw bridge, final chorus meltdown. Mix is lo-fi but powerful: saturated guitars, limited polish, room ambience on drums, no glossy pop sheen, no EDM sidechain, no orchestral strings. Negative prompt: pop hook, modern trap hats, shiny autotune lead, EDM supersaw, bright uplifting chord progressions, smooth R&B runs.",
@@ -236,14 +325,47 @@
           "infer_method": "auto",
           "steps": 0,
           "main_model": "acestep-v15-sft",
-          "lm_model": "",
+          "lm_model": "acestep-5HZ-lm-1.7B",
           "lm_negative_prompt": "bright pop harmony, liquid DnB, funky disco groove, reggae skank",
           "timesignature": "auto",
           "keyscale": "auto",
           "use_cot_caption": true,
           "use_cot_language": true,
           "use_cot_metas": true,
-          "main_model_path": "acestep-v15-sft"
+          "main_model_path": "acestep-v15-sft",
+          "parallel_thinking": true,
+          "lm_model_path": "acestep-5HZ-lm-1.7B"
+        },
+        "Metal": {
+          "caption": "A high-tempo thrash metal track driven by aggressive palm-muted rhythm guitars in D tuning, sharp stop-start chugs, and rapid alternate picking. Drums are fast and tight with relentless double-kick bursts, occasional half-time breakdowns, and hard snare accents. Bass follows the guitar tightly with added grit and distortion.\n\nVocals alternate between harsh growls, barked shouts, and feral howls, with gang vocals on the chorus for maximum impact. Overall mood is confrontational, mechanical, and empowering, with an industrial edge and a sense of rapid acceleration, efficiency, and controlled chaos. Perfect for high-energy, no-nonsense intensity.",
+          "negatives": "pop sparkle, autotune R&B runs, reggae groove, jazz swing, orchestral waltz, tropical house, dubstep drops, lo-fi chill",
+          "bpm": 150,
+          "instrumental": false,
+          "thinking": true,
+          "parallel_thinking": true,
+          "enable_lm": true,
+          "lm_enhance_prompt": true,
+          "backend": "vllm",
+          "shift": 3.0,
+          "lm_temperature": 0.85,
+          "lm_top_p": 0.95,
+          "lm_top_k": 0,
+          "time_sig": "auto",
+          "key_scale": "auto",
+          "vocal_language": "",
+          "guidance": 0.0,
+          "infer_method": "ode",
+          "steps": 0,
+          "main_model": "acestep-v15-sft",
+          "lm_model": "acestep-5Hz-lm-1.7B",
+          "lm_negative_prompt": "pop sparkle, autotune R&B runs, reggae groove, jazz swing, orchestral waltz, tropical house, dubstep drops, lo-fi chill",
+          "timesignature": "auto",
+          "keyscale": "auto",
+          "use_cot_caption": true,
+          "use_cot_language": true,
+          "use_cot_metas": true,
+          "main_model_path": "acestep-v15-sft",
+          "lm_model_path": "acestep-5Hz-lm-1.7B"
         }
       }
     },
@@ -257,11 +379,18 @@
           "thinking": true,
           "use_cot_caption": true,
           "use_cot_language": true,
-          "use_cot_metas": false,
+          "use_cot_metas": true,
           "instrumental": false,
           "use_cot_lyrics": false,
           "lm_negative_prompt": "metal, harsh screaming, aggressive distortion",
-          "bpm": 76
+          "bpm": 76,
+          "enable_lm": true,
+          "parallel_thinking": true,
+          "lm_enhance_prompt": true,
+          "main_model": "acestep-v15-sft",
+          "main_model_path": "acestep-v15-sft",
+          "lm_model": "acestep-5HZ-lm-1.7B",
+          "lm_model_path": "acestep-5HZ-lm-1.7B"
         },
         "Dub": {
           "backend": "vllm",
@@ -271,11 +400,18 @@
           "thinking": true,
           "use_cot_caption": true,
           "use_cot_language": true,
-          "use_cot_metas": false,
+          "use_cot_metas": true,
           "instrumental": false,
           "use_cot_lyrics": false,
           "lm_negative_prompt": "metal screaming, EDM supersaw drops, fast breakbeats, glossy pop chorus",
-          "bpm": 75
+          "bpm": 75,
+          "enable_lm": true,
+          "parallel_thinking": true,
+          "lm_enhance_prompt": true,
+          "main_model": "acestep-v15-sft",
+          "main_model_path": "acestep-v15-sft",
+          "lm_model": "acestep-5HZ-lm-1.7B",
+          "lm_model_path": "acestep-5HZ-lm-1.7B"
         },
         "Dancehall": {
           "backend": "vllm",
@@ -285,11 +421,18 @@
           "thinking": true,
           "use_cot_caption": true,
           "use_cot_language": true,
-          "use_cot_metas": false,
+          "use_cot_metas": true,
           "instrumental": false,
           "use_cot_lyrics": false,
           "lm_negative_prompt": "orchestral symphony, jazz improvisation, slow ambient drone, heavy rock guitars",
-          "bpm": 100
+          "bpm": 100,
+          "enable_lm": true,
+          "parallel_thinking": true,
+          "lm_enhance_prompt": true,
+          "main_model": "acestep-v15-sft",
+          "main_model_path": "acestep-v15-sft",
+          "lm_model": "acestep-5HZ-lm-1.7B",
+          "lm_model_path": "acestep-5HZ-lm-1.7B"
         },
         "Lovers Rock": {
           "backend": "vllm",
@@ -299,11 +442,18 @@
           "thinking": true,
           "use_cot_caption": true,
           "use_cot_language": true,
-          "use_cot_metas": false,
+          "use_cot_metas": true,
           "instrumental": false,
           "use_cot_lyrics": false,
           "lm_negative_prompt": "aggressive trap 808, harsh industrial, fast punk, dubstep growls",
-          "bpm": 80
+          "bpm": 80,
+          "enable_lm": true,
+          "parallel_thinking": true,
+          "lm_enhance_prompt": true,
+          "main_model": "acestep-v15-sft",
+          "main_model_path": "acestep-v15-sft",
+          "lm_model": "acestep-5HZ-lm-1.7B",
+          "lm_model_path": "acestep-5HZ-lm-1.7B"
         },
         "Reggae Fusion": {
           "backend": "vllm",
@@ -313,11 +463,18 @@
           "thinking": true,
           "use_cot_caption": true,
           "use_cot_language": true,
-          "use_cot_metas": false,
+          "use_cot_metas": true,
           "instrumental": false,
           "use_cot_lyrics": false,
           "lm_negative_prompt": "speed metal, extreme distortion, dark techno, drum & bass tempo",
-          "bpm": 95
+          "bpm": 95,
+          "enable_lm": true,
+          "parallel_thinking": true,
+          "lm_enhance_prompt": true,
+          "main_model": "acestep-v15-sft",
+          "main_model_path": "acestep-v15-sft",
+          "lm_model": "acestep-5HZ-lm-1.7B",
+          "lm_model_path": "acestep-5HZ-lm-1.7B"
         }
       }
     },
@@ -335,7 +492,14 @@
           "instrumental": false,
           "use_cot_lyrics": false,
           "lm_negative_prompt": "pop hook, R&B runs, melodic crooning, bright chord progressions, pretty harmonies, shiny autotune lead.",
-          "bpm": 95
+          "bpm": 95,
+          "enable_lm": true,
+          "parallel_thinking": true,
+          "lm_enhance_prompt": true,
+          "main_model": "acestep-v15-sft",
+          "main_model_path": "acestep-v15-sft",
+          "lm_model": "acestep-5HZ-lm-1.7B",
+          "lm_model_path": "acestep-5HZ-lm-1.7B"
         },
         "Boom Bap": {
           "backend": "vllm",
@@ -349,7 +513,14 @@
           "instrumental": false,
           "use_cot_lyrics": false,
           "lm_negative_prompt": "EDM four-on-the-floor, dubstep drops, glossy pop chorus, ambient drone",
-          "bpm": 90
+          "bpm": 90,
+          "enable_lm": true,
+          "parallel_thinking": true,
+          "lm_enhance_prompt": true,
+          "main_model": "acestep-v15-sft",
+          "main_model_path": "acestep-v15-sft",
+          "lm_model": "acestep-5HZ-lm-1.7B",
+          "lm_model_path": "acestep-5HZ-lm-1.7B"
         },
         "Trap": {
           "backend": "vllm",
@@ -363,7 +534,14 @@
           "instrumental": false,
           "use_cot_lyrics": false,
           "lm_negative_prompt": "jazz chords, acoustic band, reggae groove, orchestral symphony",
-          "bpm": 140
+          "bpm": 140,
+          "enable_lm": true,
+          "parallel_thinking": true,
+          "lm_enhance_prompt": true,
+          "main_model": "acestep-v15-sft",
+          "main_model_path": "acestep-v15-sft",
+          "lm_model": "acestep-5HZ-lm-1.7B",
+          "lm_model_path": "acestep-5HZ-lm-1.7B"
         },
         "UK Drill": {
           "backend": "vllm",
@@ -377,7 +555,14 @@
           "instrumental": false,
           "use_cot_lyrics": false,
           "lm_negative_prompt": "bright pop harmony, liquid DnB, funky disco groove, reggae skank",
-          "bpm": 142
+          "bpm": 142,
+          "enable_lm": true,
+          "parallel_thinking": true,
+          "lm_enhance_prompt": true,
+          "main_model": "acestep-v15-sft",
+          "main_model_path": "acestep-v15-sft",
+          "lm_model": "acestep-5HZ-lm-1.7B",
+          "lm_model_path": "acestep-5HZ-lm-1.7B"
         },
         "Conscious Rap": {
           "backend": "vllm",
@@ -391,7 +576,14 @@
           "instrumental": false,
           "use_cot_lyrics": false,
           "lm_negative_prompt": "party EDM, heavy autotune singing hook, extreme distortion, horror ambience",
-          "bpm": 88
+          "bpm": 88,
+          "enable_lm": true,
+          "parallel_thinking": true,
+          "lm_enhance_prompt": true,
+          "main_model": "acestep-v15-sft",
+          "main_model_path": "acestep-v15-sft",
+          "lm_model": "acestep-5HZ-lm-1.7B",
+          "lm_model_path": "acestep-5HZ-lm-1.7B"
         },
         "Gangsta Rap": {
           "caption": "Gangsta rap inspired by late-80s/90s West Coast and Memphis: tense street-life storytelling with a hard, gritty male rap voice—cold, direct delivery, sharp consonants, tight rhythmic phrasing, no singing. Minimal ad-libs: low threats, short barks, quick doubles on punchlines. Beat: dark minor-key sample or synth stab, heavy kick/snare, crisp hats, and a thick sub/808 that hits hard but stays controlled. Mix: close, dry vocal, light saturation, strong compression, minimal room reverb—raw and intimidating.",
@@ -413,7 +605,7 @@
           "infer_method": "ode",
           "steps": 0,
           "main_model": "acestep-v15-sft",
-          "lm_model": "acestep-5Hz-lm-1.7B",
+          "lm_model": "acestep-5HZ-lm-1.7B",
           "lm_negative_prompt": "pop hook, R&B singing runs, glossy autotune lead, bright happy chords, EDM four-on-the-floor, airy ambient pads",
           "timesignature": "auto",
           "keyscale": "auto",
@@ -421,7 +613,8 @@
           "use_cot_language": true,
           "use_cot_metas": true,
           "main_model_path": "acestep-v15-sft",
-          "lm_model_path": "acestep-5Hz-lm-1.7B"
+          "lm_model_path": "acestep-5HZ-lm-1.7B",
+          "parallel_thinking": true
         },
         "Conscious/Political Hip-Hop": {
           "backend": "vllm",
@@ -435,7 +628,14 @@
           "instrumental": false,
           "use_cot_lyrics": false,
           "lm_negative_prompt": "club EDM drop, pop chorus hook, trap hi-hat spam, horror ambience, extreme distortion, cheesy motivational choir",
-          "bpm": 90
+          "bpm": 90,
+          "enable_lm": true,
+          "parallel_thinking": true,
+          "lm_enhance_prompt": true,
+          "main_model": "acestep-v15-sft",
+          "main_model_path": "acestep-v15-sft",
+          "lm_model": "acestep-5HZ-lm-1.7B",
+          "lm_model_path": "acestep-5HZ-lm-1.7B"
         },
         "Street Rap": {
           "caption": "Hard-hitting street rap track with a deep, olad and angry, raspy, smoker-worn male rap voice. Delivery is spoken rap, cold and direct, with sharp consonants, gritty breath, and occasional short barks on emphasis. No singing. Minimal ad-libs: low murmurs, scoffs, quick doubles on last words. Lyrics focus on street pressure, paranoia, loyalty, consequences, survival.\n\nBeat: dark minor-key loop (cold piano or tense strings), heavy kick/snare, tight rolling hi-hats, and a subby 808 that slides but stays controlled. Mix: close-mic dry vocal, light saturation for throat grit, strong compression, minimal room reverb only, no glossy stereo chorus. Mood is grim, determined, intimidating—raw and realistic.",
@@ -457,7 +657,7 @@
           "infer_method": "ode",
           "steps": 0,
           "main_model": "acestep-v15-sft",
-          "lm_model": "acestep-5Hz-lm-1.7B",
+          "lm_model": "acestep-5HZ-lm-1.7B",
           "lm_negative_prompt": "pop hook, R&B runs, melodic crooning, bright chord progressions, pretty harmonies, shiny autotune lead.",
           "timesignature": "auto",
           "keyscale": "auto",
@@ -465,7 +665,8 @@
           "use_cot_language": true,
           "use_cot_metas": true,
           "main_model_path": "acestep-v15-sft",
-          "lm_model_path": "acestep-5Hz-lm-1.7B"
+          "lm_model_path": "acestep-5HZ-lm-1.7B",
+          "parallel_thinking": true
         }
       }
     },
@@ -479,11 +680,18 @@
           "thinking": true,
           "use_cot_caption": true,
           "use_cot_language": true,
-          "use_cot_metas": false,
+          "use_cot_metas": true,
           "instrumental": false,
           "use_cot_lyrics": false,
           "lm_negative_prompt": "metal riffs, lo-fi haze, harsh industrial noise, jazz improvisation",
-          "bpm": 124
+          "bpm": 124,
+          "enable_lm": true,
+          "parallel_thinking": true,
+          "lm_enhance_prompt": true,
+          "main_model": "acestep-v15-sft",
+          "main_model_path": "acestep-v15-sft",
+          "lm_model": "acestep-5HZ-lm-1.7B",
+          "lm_model_path": "acestep-5HZ-lm-1.7B"
         },
         "Synthpop": {
           "backend": "vllm",
@@ -493,11 +701,18 @@
           "thinking": true,
           "use_cot_caption": true,
           "use_cot_language": true,
-          "use_cot_metas": false,
+          "use_cot_metas": true,
           "instrumental": false,
           "use_cot_lyrics": false,
           "lm_negative_prompt": "trap 808 dominance, extreme guitar distortion, reggae one-drop, orchestral epic",
-          "bpm": 120
+          "bpm": 120,
+          "enable_lm": true,
+          "parallel_thinking": true,
+          "lm_enhance_prompt": true,
+          "main_model": "acestep-v15-sft",
+          "main_model_path": "acestep-v15-sft",
+          "lm_model": "acestep-5HZ-lm-1.7B",
+          "lm_model_path": "acestep-5HZ-lm-1.7B"
         },
         "Indie Pop": {
           "backend": "vllm",
@@ -507,11 +722,18 @@
           "thinking": true,
           "use_cot_caption": true,
           "use_cot_language": true,
-          "use_cot_metas": false,
+          "use_cot_metas": true,
           "instrumental": false,
           "use_cot_lyrics": false,
           "lm_negative_prompt": "EDM festival drop, dubstep growls, death metal screams, dark ambient drone",
-          "bpm": 110
+          "bpm": 110,
+          "enable_lm": true,
+          "parallel_thinking": true,
+          "lm_enhance_prompt": true,
+          "main_model": "acestep-v15-sft",
+          "main_model_path": "acestep-v15-sft",
+          "lm_model": "acestep-5HZ-lm-1.7B",
+          "lm_model_path": "acestep-5HZ-lm-1.7B"
         },
         "Electro Pop": {
           "backend": "vllm",
@@ -521,11 +743,18 @@
           "thinking": true,
           "use_cot_caption": true,
           "use_cot_language": true,
-          "use_cot_metas": false,
+          "use_cot_metas": true,
           "instrumental": false,
           "use_cot_lyrics": false,
           "lm_negative_prompt": "acoustic folk, jazz trio, reggae skank, orchestral symphony",
-          "bpm": 115
+          "bpm": 115,
+          "enable_lm": true,
+          "parallel_thinking": true,
+          "lm_enhance_prompt": true,
+          "main_model": "acestep-v15-sft",
+          "main_model_path": "acestep-v15-sft",
+          "lm_model": "acestep-5HZ-lm-1.7B",
+          "lm_model_path": "acestep-5HZ-lm-1.7B"
         },
         "Pop Ballad": {
           "backend": "vllm",
@@ -535,11 +764,18 @@
           "thinking": true,
           "use_cot_caption": true,
           "use_cot_language": true,
-          "use_cot_metas": false,
+          "use_cot_metas": true,
           "instrumental": false,
           "use_cot_lyrics": false,
           "lm_negative_prompt": "club kick, trap hats, heavy distortion guitars, fast drum & bass breakbeats",
-          "bpm": 72
+          "bpm": 72,
+          "enable_lm": true,
+          "parallel_thinking": true,
+          "lm_enhance_prompt": true,
+          "main_model": "acestep-v15-sft",
+          "main_model_path": "acestep-v15-sft",
+          "lm_model": "acestep-5HZ-lm-1.7B",
+          "lm_model_path": "acestep-5HZ-lm-1.7B"
         }
       }
     },
@@ -553,11 +789,18 @@
           "thinking": true,
           "use_cot_caption": true,
           "use_cot_language": true,
-          "use_cot_metas": false,
+          "use_cot_metas": true,
           "instrumental": false,
           "use_cot_lyrics": false,
           "lm_negative_prompt": "EDM, trap 808, heavy metal distortion, reggae one-drop",
-          "bpm": 180
+          "bpm": 180,
+          "enable_lm": true,
+          "parallel_thinking": true,
+          "lm_enhance_prompt": true,
+          "main_model": "acestep-v15-sft",
+          "main_model_path": "acestep-v15-sft",
+          "lm_model": "acestep-5HZ-lm-1.7B",
+          "lm_model_path": "acestep-5HZ-lm-1.7B"
         },
         "Smooth Jazz": {
           "backend": "vllm",
@@ -567,11 +810,18 @@
           "thinking": true,
           "use_cot_caption": true,
           "use_cot_language": true,
-          "use_cot_metas": false,
+          "use_cot_metas": true,
           "instrumental": false,
           "use_cot_lyrics": false,
           "lm_negative_prompt": "punk, aggressive techno, harsh screaming vocals, noisy lo-fi",
-          "bpm": 90
+          "bpm": 90,
+          "enable_lm": true,
+          "parallel_thinking": true,
+          "lm_enhance_prompt": true,
+          "main_model": "acestep-v15-sft",
+          "main_model_path": "acestep-v15-sft",
+          "lm_model": "acestep-5HZ-lm-1.7B",
+          "lm_model_path": "acestep-5HZ-lm-1.7B"
         },
         "Jazz Fusion": {
           "backend": "vllm",
@@ -581,11 +831,18 @@
           "thinking": true,
           "use_cot_caption": true,
           "use_cot_language": true,
-          "use_cot_metas": false,
+          "use_cot_metas": true,
           "instrumental": false,
           "use_cot_lyrics": false,
           "lm_negative_prompt": "four-on-the-floor club, trap hats, orchestral symphony, reggae skank",
-          "bpm": 110
+          "bpm": 110,
+          "enable_lm": true,
+          "parallel_thinking": true,
+          "lm_enhance_prompt": true,
+          "main_model": "acestep-v15-sft",
+          "main_model_path": "acestep-v15-sft",
+          "lm_model": "acestep-5HZ-lm-1.7B",
+          "lm_model_path": "acestep-5HZ-lm-1.7B"
         },
         "Vocal Jazz": {
           "backend": "vllm",
@@ -595,11 +852,18 @@
           "thinking": true,
           "use_cot_caption": true,
           "use_cot_language": true,
-          "use_cot_metas": false,
+          "use_cot_metas": true,
           "instrumental": false,
           "use_cot_lyrics": false,
           "lm_negative_prompt": "autotuned pop chorus, dubstep drops, heavy distortion, fast DnB",
-          "bpm": 85
+          "bpm": 85,
+          "enable_lm": true,
+          "parallel_thinking": true,
+          "lm_enhance_prompt": true,
+          "main_model": "acestep-v15-sft",
+          "main_model_path": "acestep-v15-sft",
+          "lm_model": "acestep-5HZ-lm-1.7B",
+          "lm_model_path": "acestep-5HZ-lm-1.7B"
         },
         "Nu Jazz": {
           "backend": "vllm",
@@ -609,11 +873,18 @@
           "thinking": true,
           "use_cot_caption": true,
           "use_cot_language": true,
-          "use_cot_metas": false,
+          "use_cot_metas": true,
           "instrumental": false,
           "use_cot_lyrics": false,
           "lm_negative_prompt": "metal guitars, strict classical orchestra, bright teen pop, reggae one-drop",
-          "bpm": 105
+          "bpm": 105,
+          "enable_lm": true,
+          "parallel_thinking": true,
+          "lm_enhance_prompt": true,
+          "main_model": "acestep-v15-sft",
+          "main_model_path": "acestep-v15-sft",
+          "lm_model": "acestep-5HZ-lm-1.7B",
+          "lm_model_path": "acestep-5HZ-lm-1.7B"
         }
       }
     },
@@ -627,11 +898,18 @@
           "thinking": true,
           "use_cot_caption": true,
           "use_cot_language": true,
-          "use_cot_metas": false,
+          "use_cot_metas": true,
           "instrumental": true,
           "use_cot_lyrics": false,
           "lm_negative_prompt": "drum machine, trap 808, EDM drop, rock guitars, rap vocals",
-          "bpm": 90
+          "bpm": 90,
+          "enable_lm": true,
+          "parallel_thinking": true,
+          "lm_enhance_prompt": true,
+          "main_model": "acestep-v15-sft",
+          "main_model_path": "acestep-v15-sft",
+          "lm_model": "acestep-5HZ-lm-1.7B",
+          "lm_model_path": "acestep-5HZ-lm-1.7B"
         },
         "Baroque": {
           "backend": "vllm",
@@ -641,11 +919,18 @@
           "thinking": true,
           "use_cot_caption": true,
           "use_cot_language": true,
-          "use_cot_metas": false,
+          "use_cot_metas": true,
           "instrumental": true,
           "use_cot_lyrics": false,
           "lm_negative_prompt": "modern synth bass, heavy drums, distorted guitars, rap vocals",
-          "bpm": 100
+          "bpm": 100,
+          "enable_lm": true,
+          "parallel_thinking": true,
+          "lm_enhance_prompt": true,
+          "main_model": "acestep-v15-sft",
+          "main_model_path": "acestep-v15-sft",
+          "lm_model": "acestep-5HZ-lm-1.7B",
+          "lm_model_path": "acestep-5HZ-lm-1.7B"
         },
         "Minimalism": {
           "backend": "vllm",
@@ -655,11 +940,18 @@
           "thinking": true,
           "use_cot_caption": true,
           "use_cot_language": true,
-          "use_cot_metas": false,
+          "use_cot_metas": true,
           "instrumental": true,
           "use_cot_lyrics": false,
           "lm_negative_prompt": "big EDM risers, trap drums, metal riffs, vocal hooks",
-          "bpm": 120
+          "bpm": 120,
+          "enable_lm": true,
+          "parallel_thinking": true,
+          "lm_enhance_prompt": true,
+          "main_model": "acestep-v15-sft",
+          "main_model_path": "acestep-v15-sft",
+          "lm_model": "acestep-5HZ-lm-1.7B",
+          "lm_model_path": "acestep-5HZ-lm-1.7B"
         },
         "Chamber Music": {
           "backend": "vllm",
@@ -669,11 +961,18 @@
           "thinking": true,
           "use_cot_caption": true,
           "use_cot_language": true,
-          "use_cot_metas": false,
+          "use_cot_metas": true,
           "instrumental": true,
           "use_cot_lyrics": false,
           "lm_negative_prompt": "club kick, electronic bass drops, rap verses, heavy distortion",
-          "bpm": 90
+          "bpm": 90,
+          "enable_lm": true,
+          "parallel_thinking": true,
+          "lm_enhance_prompt": true,
+          "main_model": "acestep-v15-sft",
+          "main_model_path": "acestep-v15-sft",
+          "lm_model": "acestep-5HZ-lm-1.7B",
+          "lm_model_path": "acestep-5HZ-lm-1.7B"
         },
         "Choral": {
           "backend": "vllm",
@@ -683,11 +982,18 @@
           "thinking": true,
           "use_cot_caption": true,
           "use_cot_language": true,
-          "use_cot_metas": false,
+          "use_cot_metas": true,
           "instrumental": false,
           "use_cot_lyrics": false,
           "lm_negative_prompt": "trap beats, EDM synth leads, rock band drums, rap vocals",
-          "bpm": 80
+          "bpm": 80,
+          "enable_lm": true,
+          "parallel_thinking": true,
+          "lm_enhance_prompt": true,
+          "main_model": "acestep-v15-sft",
+          "main_model_path": "acestep-v15-sft",
+          "lm_model": "acestep-5HZ-lm-1.7B",
+          "lm_model_path": "acestep-5HZ-lm-1.7B"
         }
       }
     },
@@ -701,11 +1007,18 @@
           "thinking": true,
           "use_cot_caption": true,
           "use_cot_language": true,
-          "use_cot_metas": false,
+          "use_cot_metas": true,
           "instrumental": false,
           "use_cot_lyrics": false,
           "lm_negative_prompt": "dubstep halftime, metal guitars, reggae swing, orchestral symphony",
-          "bpm": 174
+          "bpm": 174,
+          "enable_lm": true,
+          "parallel_thinking": true,
+          "lm_enhance_prompt": true,
+          "main_model": "acestep-v15-sft",
+          "main_model_path": "acestep-v15-sft",
+          "lm_model": "acestep-5HZ-lm-1.7B",
+          "lm_model_path": "acestep-5HZ-lm-1.7B"
         },
         "Neurofunk": {
           "backend": "vllm",
@@ -715,11 +1028,18 @@
           "thinking": true,
           "use_cot_caption": true,
           "use_cot_language": true,
-          "use_cot_metas": false,
+          "use_cot_metas": true,
           "instrumental": false,
           "use_cot_lyrics": false,
           "lm_negative_prompt": "pop ballad, acoustic folk, reggae skank, bright major chords",
-          "bpm": 174
+          "bpm": 174,
+          "enable_lm": true,
+          "parallel_thinking": true,
+          "lm_enhance_prompt": true,
+          "main_model": "acestep-v15-sft",
+          "main_model_path": "acestep-v15-sft",
+          "lm_model": "acestep-5HZ-lm-1.7B",
+          "lm_model_path": "acestep-5HZ-lm-1.7B"
         },
         "Jump Up": {
           "backend": "vllm",
@@ -729,11 +1049,18 @@
           "thinking": true,
           "use_cot_caption": true,
           "use_cot_language": true,
-          "use_cot_metas": false,
+          "use_cot_metas": true,
           "instrumental": false,
           "use_cot_lyrics": false,
           "lm_negative_prompt": "smooth jazz, classical orchestra, slow ambient, heavy metal",
-          "bpm": 175
+          "bpm": 175,
+          "enable_lm": true,
+          "parallel_thinking": true,
+          "lm_enhance_prompt": true,
+          "main_model": "acestep-v15-sft",
+          "main_model_path": "acestep-v15-sft",
+          "lm_model": "acestep-5HZ-lm-1.7B",
+          "lm_model_path": "acestep-5HZ-lm-1.7B"
         },
         "Jungle": {
           "backend": "vllm",
@@ -743,11 +1070,18 @@
           "thinking": true,
           "use_cot_caption": true,
           "use_cot_language": true,
-          "use_cot_metas": false,
+          "use_cot_metas": true,
           "instrumental": false,
           "use_cot_lyrics": false,
           "lm_negative_prompt": "four-on-the-floor house, pop chorus, orchestral cinematic score",
-          "bpm": 165
+          "bpm": 165,
+          "enable_lm": true,
+          "parallel_thinking": true,
+          "lm_enhance_prompt": true,
+          "main_model": "acestep-v15-sft",
+          "main_model_path": "acestep-v15-sft",
+          "lm_model": "acestep-5HZ-lm-1.7B",
+          "lm_model_path": "acestep-5HZ-lm-1.7B"
         },
         "Darkstep": {
           "backend": "vllm",
@@ -757,11 +1091,18 @@
           "thinking": true,
           "use_cot_caption": true,
           "use_cot_language": true,
-          "use_cot_metas": false,
+          "use_cot_metas": true,
           "instrumental": false,
           "use_cot_lyrics": false,
           "lm_negative_prompt": "uplifting trance, reggae sunshine vibe, smooth R&B singing, acoustic jazz trio",
-          "bpm": 175
+          "bpm": 175,
+          "enable_lm": true,
+          "parallel_thinking": true,
+          "lm_enhance_prompt": true,
+          "main_model": "acestep-v15-sft",
+          "main_model_path": "acestep-v15-sft",
+          "lm_model": "acestep-5HZ-lm-1.7B",
+          "lm_model_path": "acestep-5HZ-lm-1.7B"
         }
       }
     },
@@ -775,11 +1116,18 @@
           "thinking": true,
           "use_cot_caption": true,
           "use_cot_language": true,
-          "use_cot_metas": false,
+          "use_cot_metas": true,
           "instrumental": false,
           "use_cot_lyrics": false,
           "lm_negative_prompt": "metal distortion, dark techno rumble, fast drum & bass, orchestral symphony",
-          "bpm": 105
+          "bpm": 105,
+          "enable_lm": true,
+          "parallel_thinking": true,
+          "lm_enhance_prompt": true,
+          "main_model": "acestep-v15-sft",
+          "main_model_path": "acestep-v15-sft",
+          "lm_model": "acestep-5HZ-lm-1.7B",
+          "lm_model_path": "acestep-5HZ-lm-1.7B"
         },
         "Amapiano": {
           "backend": "vllm",
@@ -789,11 +1137,18 @@
           "thinking": true,
           "use_cot_caption": true,
           "use_cot_language": true,
-          "use_cot_metas": false,
+          "use_cot_metas": true,
           "instrumental": false,
           "use_cot_lyrics": false,
           "lm_negative_prompt": "aggressive punk, harsh industrial, fast breakbeats, heavy guitar rock",
-          "bpm": 112
+          "bpm": 112,
+          "enable_lm": true,
+          "parallel_thinking": true,
+          "lm_enhance_prompt": true,
+          "main_model": "acestep-v15-sft",
+          "main_model_path": "acestep-v15-sft",
+          "lm_model": "acestep-5HZ-lm-1.7B",
+          "lm_model_path": "acestep-5HZ-lm-1.7B"
         },
         "Highlife": {
           "backend": "vllm",
@@ -803,11 +1158,18 @@
           "thinking": true,
           "use_cot_caption": true,
           "use_cot_language": true,
-          "use_cot_metas": false,
+          "use_cot_metas": true,
           "instrumental": false,
           "use_cot_lyrics": false,
           "lm_negative_prompt": "trap 808, dubstep growls, dark cinematic horror, extreme metal",
-          "bpm": 100
+          "bpm": 100,
+          "enable_lm": true,
+          "parallel_thinking": true,
+          "lm_enhance_prompt": true,
+          "main_model": "acestep-v15-sft",
+          "main_model_path": "acestep-v15-sft",
+          "lm_model": "acestep-5HZ-lm-1.7B",
+          "lm_model_path": "acestep-5HZ-lm-1.7B"
         },
         "Afro Fusion": {
           "backend": "vllm",
@@ -817,11 +1179,18 @@
           "thinking": true,
           "use_cot_caption": true,
           "use_cot_language": true,
-          "use_cot_metas": false,
+          "use_cot_metas": true,
           "instrumental": false,
           "use_cot_lyrics": false,
           "lm_negative_prompt": "hard techno, drum & bass tempo, heavy distortion guitars, baroque harpsichord",
-          "bpm": 100
+          "bpm": 100,
+          "enable_lm": true,
+          "parallel_thinking": true,
+          "lm_enhance_prompt": true,
+          "main_model": "acestep-v15-sft",
+          "main_model_path": "acestep-v15-sft",
+          "lm_model": "acestep-5HZ-lm-1.7B",
+          "lm_model_path": "acestep-5HZ-lm-1.7B"
         },
         "Afro House": {
           "backend": "vllm",
@@ -831,11 +1200,18 @@
           "thinking": true,
           "use_cot_caption": true,
           "use_cot_language": true,
-          "use_cot_metas": false,
+          "use_cot_metas": true,
           "instrumental": false,
           "use_cot_lyrics": false,
           "lm_negative_prompt": "punk rock, orchestral symphony, fast jungle breaks, glossy teen pop",
-          "bpm": 120
+          "bpm": 120,
+          "enable_lm": true,
+          "parallel_thinking": true,
+          "lm_enhance_prompt": true,
+          "main_model": "acestep-v15-sft",
+          "main_model_path": "acestep-v15-sft",
+          "lm_model": "acestep-5HZ-lm-1.7B",
+          "lm_model_path": "acestep-5HZ-lm-1.7B"
         }
       }
     },
@@ -849,11 +1225,18 @@
           "thinking": true,
           "use_cot_caption": true,
           "use_cot_language": true,
-          "use_cot_metas": false,
+          "use_cot_metas": true,
           "instrumental": true,
           "use_cot_lyrics": false,
           "lm_negative_prompt": "rap vocals, pop chorus, trap hats, cheesy EDM drop",
-          "bpm": 90
+          "bpm": 90,
+          "enable_lm": true,
+          "parallel_thinking": true,
+          "lm_enhance_prompt": true,
+          "main_model": "acestep-v15-sft",
+          "main_model_path": "acestep-v15-sft",
+          "lm_model": "acestep-5HZ-lm-1.7B",
+          "lm_model_path": "acestep-5HZ-lm-1.7B"
         },
         "Ambient": {
           "backend": "vllm",
@@ -863,11 +1246,18 @@
           "thinking": true,
           "use_cot_caption": true,
           "use_cot_language": true,
-          "use_cot_metas": false,
+          "use_cot_metas": true,
           "instrumental": true,
           "use_cot_lyrics": false,
           "lm_negative_prompt": "busy drums, rap verses, catchy pop hook, harsh distortion",
-          "bpm": 70
+          "bpm": 70,
+          "enable_lm": true,
+          "parallel_thinking": true,
+          "lm_enhance_prompt": true,
+          "main_model": "acestep-v15-sft",
+          "main_model_path": "acestep-v15-sft",
+          "lm_model": "acestep-5HZ-lm-1.7B",
+          "lm_model_path": "acestep-5HZ-lm-1.7B"
         },
         "Lo-fi Instrumental": {
           "backend": "vllm",
@@ -877,11 +1267,18 @@
           "thinking": true,
           "use_cot_caption": true,
           "use_cot_language": true,
-          "use_cot_metas": false,
+          "use_cot_metas": true,
           "instrumental": true,
           "use_cot_lyrics": false,
           "lm_negative_prompt": "festival EDM, aggressive metal, bright pop singing, intense neurofunk",
-          "bpm": 85
+          "bpm": 85,
+          "enable_lm": true,
+          "parallel_thinking": true,
+          "lm_enhance_prompt": true,
+          "main_model": "acestep-v15-sft",
+          "main_model_path": "acestep-v15-sft",
+          "lm_model": "acestep-5HZ-lm-1.7B",
+          "lm_model_path": "acestep-5HZ-lm-1.7B"
         },
         "Post-Rock Instrumental": {
           "backend": "vllm",
@@ -891,11 +1288,18 @@
           "thinking": true,
           "use_cot_caption": true,
           "use_cot_language": true,
-          "use_cot_metas": false,
+          "use_cot_metas": true,
           "instrumental": true,
           "use_cot_lyrics": false,
           "lm_negative_prompt": "rap vocal, trap drums, four-on-the-floor club kick, cheesy synthpop",
-          "bpm": 110
+          "bpm": 110,
+          "enable_lm": true,
+          "parallel_thinking": true,
+          "lm_enhance_prompt": true,
+          "main_model": "acestep-v15-sft",
+          "main_model_path": "acestep-v15-sft",
+          "lm_model": "acestep-5HZ-lm-1.7B",
+          "lm_model_path": "acestep-5HZ-lm-1.7B"
         },
         "Drone Soundscape": {
           "backend": "vllm",
@@ -905,11 +1309,18 @@
           "thinking": true,
           "use_cot_caption": true,
           "use_cot_language": true,
-          "use_cot_metas": false,
+          "use_cot_metas": true,
           "instrumental": true,
           "use_cot_lyrics": false,
           "lm_negative_prompt": "pop structure, rap lyrics, upbeat dance groove, bright major-key hooks",
-          "bpm": 60
+          "bpm": 60,
+          "enable_lm": true,
+          "parallel_thinking": true,
+          "lm_enhance_prompt": true,
+          "main_model": "acestep-v15-sft",
+          "main_model_path": "acestep-v15-sft",
+          "lm_model": "acestep-5HZ-lm-1.7B",
+          "lm_model_path": "acestep-5HZ-lm-1.7B"
         }
       }
     },
@@ -927,7 +1338,14 @@
           "instrumental": true,
           "use_cot_lyrics": false,
           "lm_negative_prompt": "modern EDM drop, trap hats, glossy pop chorus, lush orchestra, bright uplifting synths, dubstep wobble, house four-on-the-floor club mix",
-          "bpm": 100
+          "bpm": 100,
+          "enable_lm": true,
+          "parallel_thinking": true,
+          "lm_enhance_prompt": true,
+          "main_model": "acestep-v15-sft",
+          "main_model_path": "acestep-v15-sft",
+          "lm_model": "acestep-5HZ-lm-1.7B",
+          "lm_model_path": "acestep-5HZ-lm-1.7B"
         },
         "Country": {
           "backend": "vllm",
@@ -941,7 +1359,14 @@
           "instrumental": false,
           "use_cot_lyrics": false,
           "lm_negative_prompt": "trap 808s, autotune pop lead, EDM supersaws, heavy distortion metal guitars, jazzy bebop chords, opera vibrato, reggae offbeat skank",
-          "bpm": 110
+          "bpm": 110,
+          "enable_lm": true,
+          "parallel_thinking": true,
+          "lm_enhance_prompt": true,
+          "main_model": "acestep-v15-sft",
+          "main_model_path": "acestep-v15-sft",
+          "lm_model": "acestep-5HZ-lm-1.7B",
+          "lm_model_path": "acestep-5HZ-lm-1.7B"
         },
         "Opera": {
           "backend": "vllm",
@@ -955,7 +1380,14 @@
           "instrumental": false,
           "use_cot_lyrics": false,
           "lm_negative_prompt": "hip hop beat, EDM drop, trap hats, pop hook, rock drums, lo-fi distortion, synthwave pads, country twang",
-          "bpm": 76
+          "bpm": 76,
+          "enable_lm": true,
+          "parallel_thinking": true,
+          "lm_enhance_prompt": true,
+          "main_model": "acestep-v15-sft",
+          "main_model_path": "acestep-v15-sft",
+          "lm_model": "acestep-5HZ-lm-1.7B",
+          "lm_model_path": "acestep-5HZ-lm-1.7B"
         },
         "Metal": {
           "backend": "vllm",
@@ -969,7 +1401,14 @@
           "instrumental": false,
           "use_cot_lyrics": false,
           "lm_negative_prompt": "pop sparkle, autotune R&B runs, reggae groove, jazz swing, orchestral waltz, tropical house, dubstep drops, lo-fi chill",
-          "bpm": 150
+          "bpm": 150,
+          "enable_lm": true,
+          "parallel_thinking": true,
+          "lm_enhance_prompt": true,
+          "main_model": "acestep-v15-sft",
+          "main_model_path": "acestep-v15-sft",
+          "lm_model": "acestep-5HZ-lm-1.7B",
+          "lm_model_path": "acestep-5HZ-lm-1.7B"
         },
         "Funk": {
           "backend": "vllm",
@@ -983,7 +1422,14 @@
           "instrumental": false,
           "use_cot_lyrics": false,
           "lm_negative_prompt": "heavy metal distortion, trap 808 rolls, EDM sidechain, ambient drone, orchestral score, reggae one-drop, fast drum & bass breakbeats",
-          "bpm": 110
+          "bpm": 110,
+          "enable_lm": true,
+          "parallel_thinking": true,
+          "lm_enhance_prompt": true,
+          "main_model": "acestep-v15-sft",
+          "main_model_path": "acestep-v15-sft",
+          "lm_model": "acestep-5HZ-lm-1.7B",
+          "lm_model_path": "acestep-5HZ-lm-1.7B"
         },
         "Blues": {
           "backend": "vllm",
@@ -997,7 +1443,14 @@
           "instrumental": false,
           "use_cot_lyrics": false,
           "lm_negative_prompt": "EDM drop, trap hats, glossy pop chorus, orchestral epic, synthwave arps, reggae skank, fast punk tempo",
-          "bpm": 90
+          "bpm": 90,
+          "enable_lm": true,
+          "parallel_thinking": true,
+          "lm_enhance_prompt": true,
+          "main_model": "acestep-v15-sft",
+          "main_model_path": "acestep-v15-sft",
+          "lm_model": "acestep-5HZ-lm-1.7B",
+          "lm_model_path": "acestep-5HZ-lm-1.7B"
         },
         "Gospel": {
           "backend": "vllm",
@@ -1011,7 +1464,14 @@
           "instrumental": false,
           "use_cot_lyrics": false,
           "lm_negative_prompt": "dark trap mood, explicit gangsta themes, EDM supersaws, metal screams, opera aria, reggae riddim, ultra-dry lo-fi minimal",
-          "bpm": 82
+          "bpm": 82,
+          "enable_lm": true,
+          "parallel_thinking": true,
+          "lm_enhance_prompt": true,
+          "main_model": "acestep-v15-sft",
+          "main_model_path": "acestep-v15-sft",
+          "lm_model": "acestep-5HZ-lm-1.7B",
+          "lm_model_path": "acestep-5HZ-lm-1.7B"
         },
         "Salsa": {
           "backend": "vllm",
@@ -1025,7 +1485,14 @@
           "instrumental": false,
           "use_cot_lyrics": false,
           "lm_negative_prompt": "EDM drop, trap 808s, rock distortion guitars, orchestral symphony, ambient pads, reggae one-drop, slow ballad pop",
-          "bpm": 190
+          "bpm": 190,
+          "enable_lm": true,
+          "parallel_thinking": true,
+          "lm_enhance_prompt": true,
+          "main_model": "acestep-v15-sft",
+          "main_model_path": "acestep-v15-sft",
+          "lm_model": "acestep-5HZ-lm-1.7B",
+          "lm_model_path": "acestep-5HZ-lm-1.7B"
         },
         "Synthwave": {
           "backend": "vllm",
@@ -1039,7 +1506,14 @@
           "instrumental": true,
           "use_cot_lyrics": false,
           "lm_negative_prompt": "acoustic folk strumming, jazz swing, metal guitars, reggae groove, trap hats, orchestral scoring, big-room EDM drop",
-          "bpm": 95
+          "bpm": 95,
+          "enable_lm": true,
+          "parallel_thinking": true,
+          "lm_enhance_prompt": true,
+          "main_model": "acestep-v15-sft",
+          "main_model_path": "acestep-v15-sft",
+          "lm_model": "acestep-5HZ-lm-1.7B",
+          "lm_model_path": "acestep-5HZ-lm-1.7B"
         },
         "Chiptune": {
           "backend": "vllm",
@@ -1053,7 +1527,14 @@
           "instrumental": true,
           "use_cot_lyrics": false,
           "lm_negative_prompt": "realistic acoustic drums, orchestral strings, trap 808s, autotune pop vocal, metal distortion guitars, reggae skank, ambient drone",
-          "bpm": 140
+          "bpm": 140,
+          "enable_lm": true,
+          "parallel_thinking": true,
+          "lm_enhance_prompt": true,
+          "main_model": "acestep-v15-sft",
+          "main_model_path": "acestep-v15-sft",
+          "lm_model": "acestep-5HZ-lm-1.7B",
+          "lm_model_path": "acestep-5HZ-lm-1.7B"
         }
       }
     }
