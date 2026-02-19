@@ -506,6 +506,12 @@ class PresetManagerDialog(QtWidgets.QDialog):
             QtWidgets.QMessageBox.Yes,
         ) != QtWidgets.QMessageBox.Yes:
             return
+        # Remember which preset the user applied, so we can name outputs nicely.
+        try:
+            self._mw._ace15_last_preset_genre = str(g or "").strip()
+            self._mw._ace15_last_preset_subgenre = str(s or "").strip()
+        except Exception:
+            pass
         self._mw._ace15_apply_preset_payload(pd)
 
 
@@ -676,6 +682,9 @@ class Settings:
     # ISO 639-1 language code for vocals. Empty/auto lets ACE decide.
     vocal_language: str = ""  # e.g., "en", "es", "ja"; empty = auto
     thinking: bool = False
+    # Gradio feature: run multiple LM "thinking" branches in parallel and pick the best.
+    # Only meaningful when Enable LM is on.
+    parallel_thinking: bool = False
     enable_lm: bool = False
     offload_to_cpu: bool = False
     offload_dit_to_cpu: bool = False
@@ -803,6 +812,12 @@ class MainWindow(QtWidgets.QMainWindow):
         self._thread: Optional[QtCore.QThread] = None
         self._runner: Optional[Runner] = None
 
+        # Naming context for results
+        self._ace15_last_preset_genre: str = ""
+        self._ace15_last_preset_subgenre: str = ""
+        self._ace15_out_snapshot: set[str] = set()
+        self._ace15_run_started_epoch: float = 0.0
+
         # Remember last run context so we can archive/move instruction.txt next to outputs.
         self._last_out_dir: Optional[Path] = None
         self._last_cfg_path: Optional[Path] = None
@@ -891,7 +906,7 @@ class MainWindow(QtWidgets.QMainWindow):
 
         row_ly = QtWidgets.QHBoxLayout()
         row_ly.addWidget(QtWidgets.QLabel("Lyrics (optional)"))
-        self.btn_gen_lyrics = QtWidgets.QPushButton("Generate lyrics")
+        self.btn_gen_lyrics = QtWidgets.QPushButton("random lyric")
         self.btn_gen_lyrics.setToolTip("Generate quick placeholder lyrics for testing (does not change caption/BPM/duration).")
         self.btn_gen_lyrics.clicked.connect(self._generate_lyrics_clicked)
         row_ly.addStretch(1)
@@ -926,6 +941,13 @@ class MainWindow(QtWidgets.QMainWindow):
         self.chk_thinking_mode = QtWidgets.QCheckBox("Thinking")
         self.chk_thinking_mode.setToolTip("Enables ACE 'thinking' (LM reasoning) when LM is enabled.")
 
+        self.chk_parallel_thinking = QtWidgets.QCheckBox("Parallel thinking")
+        self.chk_parallel_thinking.setToolTip(
+            "Runs multiple LM 'thinking' branches in parallel and selects the best result.\n"
+            "Only applies when Enable LM is ON.\n"
+            "May use more CPU/RAM while generating."
+        )
+
         lbl_vlang = QtWidgets.QLabel("Vocal language")
         self.cmb_vocal_language = QtWidgets.QComboBox()
         self.cmb_vocal_language.setToolTip("Vocal language (ISO 639-1). 'auto' lets ACE decide / auto-detect.")
@@ -951,7 +973,8 @@ class MainWindow(QtWidgets.QMainWindow):
         self.cmb_vocal_language.addItem("Vietnamese (vi)", "vi")
 
         grid.addWidget(self.chk_instrumental, r, 0, 1, 2)
-        grid.addWidget(self.chk_thinking_mode, r, 2, 1, 2)
+        grid.addWidget(self.chk_thinking_mode, r, 2)
+        grid.addWidget(self.chk_parallel_thinking, r, 3)
         grid.addWidget(lbl_vlang, r, 4)
         grid.addWidget(self.cmb_vocal_language, r, 5)
         r += 1
@@ -1573,6 +1596,7 @@ class MainWindow(QtWidgets.QMainWindow):
             s.vocal_language = vl
         s.enable_lm = self.chk_thinking.isChecked()
         s.thinking = self.chk_thinking_mode.isChecked() if hasattr(self, 'chk_thinking_mode') else False
+        s.parallel_thinking = self.chk_parallel_thinking.isChecked() if hasattr(self, 'chk_parallel_thinking') else False
         if hasattr(self, 'chk_lm_enhance'):
             s.lm_enhance = self.chk_lm_enhance.isChecked()
 
@@ -1676,6 +1700,8 @@ class MainWindow(QtWidgets.QMainWindow):
         self.chk_thinking.setChecked(bool(getattr(s, 'enable_lm', False)))
         if hasattr(self, 'chk_thinking_mode'):
             self.chk_thinking_mode.setChecked(bool(getattr(s, 'thinking', False)))
+        if hasattr(self, 'chk_parallel_thinking'):
+            self.chk_parallel_thinking.setChecked(bool(getattr(s, 'parallel_thinking', False)))
         if hasattr(self, 'chk_lm_enhance'):
             self.chk_lm_enhance.setChecked(bool(getattr(s, 'lm_enhance', False)))
 
@@ -1746,6 +1772,13 @@ class MainWindow(QtWidgets.QMainWindow):
             on = bool(self.chk_thinking.isChecked()) if hasattr(self, "chk_thinking") else False
         except Exception:
             on = False
+
+        # Parallel thinking only makes sense if LM is enabled.
+        if hasattr(self, "chk_parallel_thinking"):
+            try:
+                self.chk_parallel_thinking.setEnabled(on)
+            except Exception:
+                pass
         for attr in ("spin_lm_temp", "spin_lm_top_p", "spin_lm_top_k"):
             w = getattr(self, attr, None)
             if w is not None:
@@ -1917,6 +1950,7 @@ class MainWindow(QtWidgets.QMainWindow):
             lm_top_k = 0
         enable_lm = bool(self.chk_thinking.isChecked()) if hasattr(self, "chk_thinking") else False
         thinking = bool(self.chk_thinking_mode.isChecked()) if hasattr(self, "chk_thinking_mode") else False
+        parallel_thinking = bool(self.chk_parallel_thinking.isChecked()) if hasattr(self, "chk_parallel_thinking") else False
         enhance = bool(self.chk_lm_enhance.isChecked()) if hasattr(self, "chk_lm_enhance") else False
 
         # Optional generation controls
@@ -1964,6 +1998,7 @@ class MainWindow(QtWidgets.QMainWindow):
             "bpm": bpm_val,
             "instrumental": instrumental,
             "thinking": thinking,           # Ace CLI name
+            "parallel_thinking": parallel_thinking,
             "enable_lm": enable_lm,         # UI-friendly flag
             "lm_enhance_prompt": enhance,   # UI-friendly flag
             "backend": backend,
@@ -2186,6 +2221,16 @@ class MainWindow(QtWidgets.QMainWindow):
                 thinking_val = preset.get("enable_lm")
             if hasattr(self, 'chk_thinking_mode'):
                 self.chk_thinking_mode.setChecked(bool(thinking_val))
+        except Exception:
+            pass
+
+        # Parallel thinking
+        try:
+            pt_val = preset.get("parallel_thinking")
+            if pt_val is None:
+                pt_val = preset.get("parallelthinking")
+            if hasattr(self, 'chk_parallel_thinking'):
+                self.chk_parallel_thinking.setChecked(bool(pt_val))
         except Exception:
             pass
         try:
@@ -2572,6 +2617,14 @@ class MainWindow(QtWidgets.QMainWindow):
         thinking = bool(self.chk_thinking_mode.isChecked()) if hasattr(self, 'chk_thinking_mode') else False
         config["thinking"] = (thinking if enable_lm else False)
 
+        # Gradio feature: parallel thinking (safe extra key; ignored by older ACE builds)
+        try:
+            pt = bool(self.chk_parallel_thinking.isChecked()) if hasattr(self, 'chk_parallel_thinking') else False
+            if enable_lm and pt:
+                config["parallel_thinking"] = True
+        except Exception:
+            pass
+
         # Negative prompt for LM guidance (optional)
         if neg_prompt:
             config["lm_negative_prompt"] = neg_prompt
@@ -2658,6 +2711,14 @@ class MainWindow(QtWidgets.QMainWindow):
 
         out_dir = Path(self.ed_outdir.text().strip())
         ensure_dir(out_dir)
+
+        # Snapshot outputs before the run so we can identify what was generated.
+        try:
+            self._ace15_out_snapshot = {str(p.resolve()) for p in list_audio_files(out_dir)}
+        except Exception:
+            self._ace15_out_snapshot = set()
+        self._ace15_run_started_epoch = time.time()
+
         cfg_path = self._make_config(out_dir)
         self._log(f"Saved config:\n  {cfg_path}")
 
@@ -2701,6 +2762,13 @@ class MainWindow(QtWidgets.QMainWindow):
         self._thread = None
         self._runner = None
 
+        # Post-process: rename newly generated outputs to a human-friendly name.
+        try:
+            if code == 0:
+                self._ace15_rename_new_outputs()
+        except Exception as e:
+            self._log(f"NOTE: Could not rename outputs: {e!r}")
+
         self._refresh_outputs()
 
         # Move repo instruction.txt into the output folder so it can be reused later,
@@ -2712,6 +2780,120 @@ class MainWindow(QtWidgets.QMainWindow):
 
         if code == 0 and self.chk_auto_open.isChecked():
             self._open_output_folder()
+
+    # -----------------------------
+    # Output naming
+    # -----------------------------
+    def _ace15_sanitize_filename_part(self, s: str) -> str:
+        s = (s or "").strip()
+        if not s:
+            return ""
+        # Windows-safe filename chunk: keep ascii-ish, replace spaces, drop odd chars.
+        out = []
+        for ch in s:
+            if ch.isalnum() or ch in {"-", "_"}:
+                out.append(ch)
+            elif ch.isspace() or ch in {"/", "\\", ":", "|", "*", "?", "\"", "<", ">"}:
+                out.append("_")
+            else:
+                out.append("_")
+        cleaned = "".join(out)
+        while "__" in cleaned:
+            cleaned = cleaned.replace("__", "_")
+        return cleaned.strip("._ ")
+
+    def _ace15_pick_subgenre_for_naming(self) -> str:
+        sub = (self._ace15_last_preset_subgenre or "").strip()
+        if sub:
+            return sub
+        # Fallback: try to infer from caption first line if it looks like a tag.
+        try:
+            cap = self.ed_caption.toPlainText().strip()
+            if cap:
+                first = cap.splitlines()[0].strip()
+                if 2 <= len(first) <= 48 and all(c.isprintable() for c in first):
+                    return first
+        except Exception:
+            pass
+        return "Custom"
+
+    def _ace15_seed_for_naming(self) -> str:
+        try:
+            seed = int(self.spin_seed.value())
+            if seed < 0:
+                return "AUTO"
+            return str(seed)
+        except Exception:
+            return "AUTO"
+
+    def _ace15_rename_new_outputs(self) -> None:
+        out_dir = Path(self.ed_outdir.text().strip())
+        if not out_dir.exists():
+            return
+
+        all_audio = list_audio_files(out_dir)
+        new_files: List[Path] = []
+
+        snap = self._ace15_out_snapshot or set()
+        if snap:
+            for p in all_audio:
+                try:
+                    if str(p.resolve()) not in snap:
+                        new_files.append(p)
+                except Exception:
+                    pass
+        if not new_files:
+            started = float(self._ace15_run_started_epoch or 0.0)
+            if started > 0:
+                for p in all_audio:
+                    try:
+                        if p.stat().st_mtime >= (started - 2.0):
+                            new_files.append(p)
+                    except Exception:
+                        pass
+
+        if not new_files:
+            return
+
+        def _mtime(p: Path) -> float:
+            try:
+                return float(p.stat().st_mtime)
+            except Exception:
+                return 0.0
+        new_files = sorted(new_files, key=_mtime)
+
+        subgenre = self._ace15_sanitize_filename_part(self._ace15_pick_subgenre_for_naming()) or "Custom"
+        seed_s = self._ace15_sanitize_filename_part(self._ace15_seed_for_naming()) or "AUTO"
+        stamp = time.strftime("%Y%m%d_%H%M%S", time.localtime())
+
+        renamed_any = False
+        for idx, src in enumerate(new_files, start=1):
+            ext = src.suffix or ""
+            counter = f"_{idx}" if len(new_files) > 1 else ""
+            base = f"{subgenre}__seed{seed_s}__{stamp}{counter}{ext}"
+            dst = out_dir / base
+
+            if dst.exists():
+                i = 2
+                while True:
+                    cand = out_dir / f"{dst.stem}_{i}{dst.suffix}"
+                    if not cand.exists():
+                        dst = cand
+                        break
+                    i += 1
+
+            try:
+                src.rename(dst)
+                renamed_any = True
+                self._log(f"Renamed output: {src.name} -> {dst.name}")
+            except Exception as e:
+                self._log(f"NOTE: Could not rename '{src.name}': {e!r}")
+
+        if renamed_any:
+            try:
+                self._ace15_out_snapshot = {str(p.resolve()) for p in list_audio_files(out_dir)}
+            except Exception:
+                pass
 
     def _move_instruction_txt_to_output(self, exit_code: int) -> None:
         proj = self._last_proj_root
