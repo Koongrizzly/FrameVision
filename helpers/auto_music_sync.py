@@ -51,6 +51,7 @@ from PySide6.QtWidgets import (
     QListWidgetItem,
     QScrollArea,
     QFrame,
+    QTextEdit,
 )
 from PySide6.QtGui import QIcon
 from .visual_thumbs import VisualThumbManager
@@ -466,6 +467,334 @@ def _get_clip_preset_settings(preset_id: str) -> dict | None:
         return None
     return None
 
+
+
+
+def _clip_presets_json_path() -> str:
+    """Return absolute path to presets/setsave/clip_presets.json."""
+    here = os.path.dirname(os.path.abspath(__file__))
+    return os.path.join(here, "..", "presets", "setsave", "clip_presets.json")
+
+
+def _read_clip_presets_json() -> dict:
+    """Read clip_presets.json. If missing/broken, return an empty structure."""
+    path = _clip_presets_json_path()
+    try:
+        if not os.path.exists(path):
+            return {"version": 1, "presets": []}
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        if not isinstance(data, dict):
+            return {"version": 1, "presets": []}
+        if "version" not in data:
+            data["version"] = 1
+        if not isinstance(data.get("presets"), list):
+            data["presets"] = []
+        return data
+    except Exception:
+        return {"version": 1, "presets": []}
+
+
+def _atomic_write_json(path: str, data: dict) -> None:
+    """Atomic JSON write with .tmp and .bak (best-effort)."""
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    tmp = path + ".tmp"
+    bak = path + ".bak"
+    payload = json.dumps(data, ensure_ascii=False, indent=2)
+    with open(tmp, "w", encoding="utf-8") as f:
+        f.write(payload)
+        f.flush()
+        try:
+            os.fsync(f.fileno())
+        except Exception:
+            pass
+    # backup old
+    try:
+        if os.path.exists(path):
+            try:
+                if os.path.exists(bak):
+                    os.remove(bak)
+            except Exception:
+                pass
+            try:
+                os.replace(path, bak)
+            except Exception:
+                # fallback: copy
+                try:
+                    shutil.copy2(path, bak)
+                except Exception:
+                    pass
+    except Exception:
+        pass
+    os.replace(tmp, path)
+
+
+def _write_clip_presets_json(data: dict) -> Tuple[bool, str]:
+    """Validate and write clip_presets.json. Returns (ok, message)."""
+    try:
+        if not isinstance(data, dict):
+            return False, "Invalid data (not a dict)."
+        presets = data.get("presets")
+        if not isinstance(presets, list):
+            return False, "Invalid presets list."
+        seen = set()
+        for item in presets:
+            if not isinstance(item, dict):
+                return False, "Preset item is not an object."
+            pid = str(item.get("id") or "").strip()
+            if not pid:
+                return False, "Preset id cannot be empty."
+            if pid in seen:
+                return False, f"Duplicate preset id: {pid}"
+            seen.add(pid)
+            if not isinstance(item.get("settings", {}), dict):
+                return False, f"Preset '{pid}' settings must be an object."
+        if "version" not in data:
+            data["version"] = 1
+        path = _clip_presets_json_path()
+        _atomic_write_json(path, data)
+        return True, "Saved."
+    except Exception as e:
+        return False, f"Failed to save: {e}"
+
+
+class ClipPresetManagerDialog(QDialog):
+    """Edit clip_presets.json without touching the 1-click 'run videoclip' flow."""
+
+    def __init__(self, parent: QWidget, capture_fx_cb, apply_fx_cb):
+        super().__init__(parent)
+        self.setWindowTitle("Preset manager")
+        self.resize(860, 520)
+        self._capture_fx_cb = capture_fx_cb
+        self._apply_fx_cb = apply_fx_cb
+        self._data = _read_clip_presets_json()
+        self._current_index: int | None = None
+
+        root = QHBoxLayout(self)
+
+        # left: list + actions
+        left = QVBoxLayout()
+        self.list = QListWidget(self)
+        left.addWidget(self.list, 1)
+
+        row_btns = QHBoxLayout()
+        self.btn_new = QPushButton("New", self)
+        self.btn_dup = QPushButton("Duplicate", self)
+        self.btn_del = QPushButton("Delete", self)
+        row_btns.addWidget(self.btn_new)
+        row_btns.addWidget(self.btn_dup)
+        row_btns.addWidget(self.btn_del)
+        row_btns.addStretch(1)
+        left.addLayout(row_btns)
+
+        root.addLayout(left, 1)
+
+        # right: editor
+        right = QVBoxLayout()
+
+        form = QFormLayout()
+        self.edit_id = QLineEdit(self)
+        self.edit_name = QLineEdit(self)
+        self.edit_desc = QLineEdit(self)
+        form.addRow("ID:", self.edit_id)
+        form.addRow("Name:", self.edit_name)
+        form.addRow("Description:", self.edit_desc)
+        right.addLayout(form)
+
+        self.btn_capture = QPushButton("Capture current Options + Advanced", self)
+        self.btn_capture.setToolTip("Save current FX/transitions/effects settings into this preset.")
+        right.addWidget(self.btn_capture)
+
+        right.addWidget(QLabel("Settings (FX-only):", self))
+        self.text_settings = QTextEdit(self)
+        self.text_settings.setReadOnly(True)
+        right.addWidget(self.text_settings, 1)
+
+        self.btn_save_item = QPushButton("Apply edits to this preset", self)
+        right.addWidget(self.btn_save_item)
+
+        buttons = QDialogButtonBox(QDialogButtonBox.Apply | QDialogButtonBox.Save | QDialogButtonBox.Cancel, self)
+        right.addWidget(buttons)
+
+        try:
+            btn_use = buttons.button(QDialogButtonBox.Apply)
+            if btn_use is not None:
+                btn_use.setText("Use this preset")
+                btn_use.setToolTip("Apply this preset to the main UI (does not save the JSON file).")
+        except Exception:
+            pass
+
+        root.addLayout(right, 2)
+
+        # signals
+        self.list.currentRowChanged.connect(self._on_select)
+        self.btn_new.clicked.connect(self._on_new)
+        self.btn_dup.clicked.connect(self._on_dup)
+        self.btn_del.clicked.connect(self._on_del)
+        self.btn_capture.clicked.connect(self._on_capture)
+        self.btn_save_item.clicked.connect(self._on_save_item)
+        buttons.accepted.connect(self._on_save_all)
+        buttons.rejected.connect(self.reject)
+        try:
+            btn_use = buttons.button(QDialogButtonBox.Apply)
+            if btn_use is not None:
+                btn_use.clicked.connect(self._on_use_preset)
+        except Exception:
+            pass
+
+        self._refresh_list(select_first=True)
+
+    def _presets(self) -> list:
+        items = self._data.get("presets")
+        return items if isinstance(items, list) else []
+
+    def _refresh_list(self, select_first: bool = False) -> None:
+        self.list.blockSignals(True)
+        self.list.clear()
+        for item in self._presets():
+            pid = str(item.get("id") or "")
+            name = str(item.get("name") or pid)
+            it = QListWidgetItem(f"{name}  [{pid}]", self.list)
+            it.setData(Qt.UserRole, pid)
+        self.list.blockSignals(False)
+        if select_first and self.list.count() > 0:
+            self.list.setCurrentRow(0)
+        elif self.list.count() == 0:
+            self._current_index = None
+            self.edit_id.setText("")
+            self.edit_name.setText("")
+            self.edit_desc.setText("")
+            self.text_settings.setPlainText("{}")
+
+    def _load_into_editor(self, idx: int) -> None:
+        presets = self._presets()
+        if idx < 0 or idx >= len(presets):
+            return
+        self._current_index = idx
+        item = presets[idx]
+        self.edit_id.setText(str(item.get("id") or ""))
+        self.edit_name.setText(str(item.get("name") or ""))
+        self.edit_desc.setText(str(item.get("description") or ""))
+        settings = item.get("settings") if isinstance(item.get("settings"), dict) else {}
+        self.text_settings.setPlainText(json.dumps(settings, ensure_ascii=False, indent=2))
+
+    def _on_select(self, row: int) -> None:
+        self._load_into_editor(row)
+
+    def _message(self, title: str, text: str, icon=QMessageBox.Information) -> None:
+        m = QMessageBox(self)
+        m.setIcon(icon)
+        m.setWindowTitle(title)
+        m.setText(text)
+        m.exec()
+
+    def _on_new(self) -> None:
+        presets = self._presets()
+        base_id = "new_preset"
+        n = 1
+        ids = {str(p.get('id') or '') for p in presets}
+        pid = base_id
+        while pid in ids:
+            n += 1
+            pid = f"{base_id}_{n}"
+        presets.append({"id": pid, "name": "New preset", "description": "", "settings": {}})
+        self._refresh_list()
+        self.list.setCurrentRow(len(presets) - 1)
+
+    def _on_dup(self) -> None:
+        idx = self.list.currentRow()
+        presets = self._presets()
+        if idx < 0 or idx >= len(presets):
+            return
+        src = presets[idx]
+        ids = {str(p.get('id') or '') for p in presets}
+        pid0 = str(src.get('id') or 'preset').strip() or 'preset'
+        pid = pid0 + "_copy"
+        n = 1
+        while pid in ids:
+            n += 1
+            pid = f"{pid0}_copy{n}"
+        presets.append({
+            "id": pid,
+            "name": str(src.get('name') or pid) + " (copy)",
+            "description": str(src.get('description') or ""),
+            "settings": dict(src.get('settings') or {}),
+        })
+        self._refresh_list()
+        self.list.setCurrentRow(len(presets) - 1)
+
+    def _on_del(self) -> None:
+        idx = self.list.currentRow()
+        presets = self._presets()
+        if idx < 0 or idx >= len(presets):
+            return
+        pid = str(presets[idx].get('id') or '')
+        resp = QMessageBox.question(self, "Delete preset", f"Delete preset '{pid}'?", QMessageBox.Yes | QMessageBox.No)
+        if resp != QMessageBox.Yes:
+            return
+        presets.pop(idx)
+        self._refresh_list(select_first=True)
+
+    def _on_capture(self) -> None:
+        idx = self.list.currentRow()
+        presets = self._presets()
+        if idx < 0 or idx >= len(presets):
+            return
+        try:
+            settings = self._capture_fx_cb() or {}
+            if not isinstance(settings, dict):
+                settings = {}
+            presets[idx]["settings"] = settings
+            self.text_settings.setPlainText(json.dumps(settings, ensure_ascii=False, indent=2))
+        except Exception as e:
+            self._message("Capture failed", str(e), QMessageBox.Warning)
+
+    
+    def _on_use_preset(self) -> None:
+        """Apply the selected preset to the main UI without saving JSON."""
+        idx = self.list.currentRow()
+        presets = self._presets()
+        if idx < 0 or idx >= len(presets):
+            return
+        # keep in-memory edits (id/name/desc) in sync
+        try:
+            self._on_save_item()
+        except Exception:
+            pass
+        settings = presets[idx].get("settings") or {}
+        if not isinstance(settings, dict):
+            settings = {}
+        try:
+            if callable(self._apply_fx_cb):
+                self._apply_fx_cb(settings)
+        except Exception as e:
+            try:
+                self._message("Use preset failed", str(e), QMessageBox.Warning)
+            except Exception:
+                pass
+
+    def _on_save_item(self) -> None:
+        idx = self.list.currentRow()
+        presets = self._presets()
+        if idx < 0 or idx >= len(presets):
+            return
+        presets[idx]["id"] = self.edit_id.text().strip()
+        presets[idx]["name"] = self.edit_name.text().strip()
+        presets[idx]["description"] = self.edit_desc.text().strip()
+        self._refresh_list()
+        self.list.setCurrentRow(idx)
+
+    def _on_save_all(self) -> None:
+        # apply current edits to selected first
+        try:
+            self._on_save_item()
+        except Exception:
+            pass
+        ok, msg = _write_clip_presets_json(self._data)
+        if not ok:
+            self._message("Save failed", msg, QMessageBox.Warning)
+            return
+        self.accept()
 
 # --------------------------- data classes ----------------------------------
 
@@ -6704,8 +7033,8 @@ class AutoMusicSyncWidget(QWidget):
         main.addLayout(form)
 
         # options
-        box_opts = QGroupBox("Options", self)
-        opts = QVBoxLayout(box_opts)
+        self.box_opts = QGroupBox("Options", self)
+        opts = QVBoxLayout(self.box_opts)
 
         # FX level
         row_fx = QHBoxLayout()
@@ -7821,13 +8150,13 @@ class AutoMusicSyncWidget(QWidget):
         opts.addLayout(row_trans_ctrl)
 
 
-        main.addWidget(box_opts)
+        main.addWidget(self.box_opts)
 
         # advanced
-        box_adv = QGroupBox("Advanced", self)
-        box_adv.setCheckable(True)
-        box_adv.setChecked(True)
-        adv = QFormLayout(box_adv)
+        self.box_adv = QGroupBox("Advanced", self)
+        self.box_adv.setCheckable(True)
+        self.box_adv.setChecked(True)
+        adv = QFormLayout(self.box_adv)
         adv.setLabelAlignment(Qt.AlignRight | Qt.AlignVCenter)
         adv.setSpacing(4)
 
@@ -7855,7 +8184,7 @@ class AutoMusicSyncWidget(QWidget):
         )
         adv.addRow("Beats per base segment:", self.spin_beats_per_seg)
 
-        main.addWidget(box_adv)
+        main.addWidget(self.box_adv)
 
         # progress + buttons
         self.progress = QProgressBar(self)
@@ -7927,6 +8256,10 @@ class AutoMusicSyncWidget(QWidget):
 
         # New: 1-click presets button
         self.btn_presets = QPushButton("1-click presets", self.footer_bar)
+        self.btn_edit_presets = QPushButton("Edit presets", self.footer_bar)
+        self.btn_edit_presets.setToolTip("Open preset manager (edit clip_presets.json).\nThis never starts a videoclip run.")
+
+        
         self.btn_presets.setToolTip(
             "Open 1-click presets for FX and timing.\n"
             "Presets do NOT change which clips, music track, output folder\n"
@@ -7953,6 +8286,7 @@ class AutoMusicSyncWidget(QWidget):
         # Row 2: secondary actions
         footer_row_bottom.addWidget(self.btn_view_results)
         footer_row_bottom.addWidget(self.btn_presets)
+        footer_row_bottom.addWidget(self.btn_edit_presets)
         footer_row_bottom.addWidget(self.btn_cancel)
         footer_row_bottom.addWidget(self.btn_reset_all)
         footer_row_bottom.addStretch(1)
@@ -8012,6 +8346,10 @@ class AutoMusicSyncWidget(QWidget):
         except Exception:
             pass
         self.btn_presets.clicked.connect(self._on_presets_clicked)
+        try:
+            self.btn_edit_presets.clicked.connect(self._on_edit_presets_clicked)
+        except Exception:
+            pass
         self.btn_cancel.clicked.connect(self._on_cancel)
         self.btn_reset_all.clicked.connect(self._on_reset_all)
         self.btn_check_timeline.clicked.connect(self._on_check_timeline)
@@ -8914,6 +9252,89 @@ class AutoMusicSyncWidget(QWidget):
             self.label_summary.setText(f"Preset applied: {preset_name}")
         except Exception:
             pass
+
+
+    # ------------------------------------------------------------------
+    # Preset manager (edits clip_presets.json only; never starts a run)
+    # ------------------------------------------------------------------
+
+    def _on_edit_presets_clicked(self) -> None:
+        """Open the preset manager dialog.
+
+        This is intentionally separated from the 1-click preset flow so we
+        don't risk breaking the "pick preset -> immediately make videoclip"
+        pipeline.
+        """
+        try:
+            dlg = ClipPresetManagerDialog(self, self._capture_options_advanced_settings, self._apply_preset_from_settings_dict)
+            dlg.exec()
+        except Exception as e:
+            try:
+                self._error("Preset manager", f"Failed to open preset manager:\n{e}")
+            except Exception:
+                pass
+
+    def _capture_options_advanced_settings(self) -> dict:
+        """Capture ALL settings inside the Options + Advanced UI sections.
+
+        The resulting dict is compatible with _apply_preset_from_settings_dict,
+        i.e. it uses widget attribute names as keys.
+        """
+        out: dict = {}
+
+        box_opts = getattr(self, "box_opts", None)
+        box_adv = getattr(self, "box_adv", None)
+        if box_opts is None and box_adv is None:
+            return out
+
+        # Map widget object id -> attribute name on this instance.
+        id_to_attr: dict[int, str] = {}
+        for k, v in getattr(self, "__dict__", {}).items():
+            try:
+                if isinstance(v, QWidget):
+                    id_to_attr[id(v)] = k
+            except Exception:
+                continue
+
+        def add_widget(w: QWidget) -> None:
+            key = id_to_attr.get(id(w))
+            if not key:
+                return
+            # Skip obvious non-settings widgets.
+            try:
+                if isinstance(w, (QLabel, QPushButton, QTextEdit, QListWidget, QProgressBar)):
+                    return
+            except Exception:
+                pass
+
+            try:
+                # QGroupBox can be checkable (Advanced)
+                if hasattr(w, "isChecked") and hasattr(w, "setChecked"):
+                    out[key] = bool(w.isChecked())
+                    return
+                # Combos store index (matches _apply_preset_from_settings_dict)
+                if isinstance(w, QComboBox):
+                    out[key] = int(w.currentIndex())
+                    return
+                # Sliders / spinboxes etc.
+                if hasattr(w, "value") and hasattr(w, "setValue"):
+                    out[key] = w.value()
+                    return
+            except Exception:
+                return
+
+        for root in (box_opts, box_adv):
+            if root is None:
+                continue
+            try:
+                if isinstance(root, QWidget):
+                    add_widget(root)
+                    for child in root.findChildren(QWidget):
+                        add_widget(child)
+            except Exception:
+                continue
+
+        return out
 
 
     def _apply_preset_from_settings_dict(self, settings: dict) -> None:
