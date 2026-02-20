@@ -43,7 +43,7 @@ Narration + music + final assembly
 - 🎚️ Aligns narration + music and exports a finished video in one workflow
 
  Optional post / workflow controls
-- 🆙 Upscale final output (optional) — currently SeedVR2 is the only configured/working option
+- 🆙 Upscale final output (optional) — chose between SeedVR2 or realesrgan 
 - ⚡ Interpolate to higher FPS (optional) with RIFE for smoother motion
 - 👀 Optional review checkpoints to inspect/edit results mid-run
 - 🎲 Optional retry with new seed when the result is close but not perfect
