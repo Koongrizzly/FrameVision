@@ -674,6 +674,7 @@ class Settings:
     duration: float = 60.0
     batch_size: int = 1
     seed: int = -1
+    seed_random: bool = True  # remember Random seed toggle
 
 
     bpm: int = 0  # 0 = auto
@@ -723,13 +724,73 @@ class Runner(QtCore.QObject):
     started = QtCore.Signal()
     finished = QtCore.Signal(int)
 
-    def __init__(self, args: List[str], cwd: Path, hide_console: bool):
+    def __init__(self, args, cwd: Path, hide_console: bool):
+        """Run one or many commands.
+
+        args can be:
+          - List[str] for a single command
+          - List[List[str]] for multiple sequential commands
+        """
         super().__init__()
-        self.args = args
+        if args and isinstance(args[0], (list, tuple)):
+            self.args_runs = [list(a) for a in args]
+        else:
+            self.args_runs = [list(args)]
         self.cwd = cwd
         self.hide_console = hide_console
         self._proc: Optional[subprocess.Popen] = None
         self._stop = False
+
+    def _run_one(self, cmd: List[str], creationflags: int) -> int:
+        self.log.emit("Command:\n  " + " ".join(shlex.quote(a) for a in cmd))
+        self.log.emit(f"Working dir:\n  {self.cwd}")
+
+        env = os.environ.copy()
+        # Force UTF-8 so cli.py can print emojis (✅) without crashing on cp1252.
+        env.setdefault("PYTHONIOENCODING", "utf-8")
+        env.setdefault("PYTHONUTF8", "1")
+        env.setdefault("LANG", "C.UTF-8")
+        env.setdefault("LC_ALL", "C.UTF-8")
+
+        self._proc = subprocess.Popen(
+            cmd,
+            cwd=str(self.cwd),
+            stdout=subprocess.PIPE,
+            stdin=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            bufsize=1,
+            creationflags=creationflags,
+            env=env,
+        )
+        assert self._proc.stdout is not None
+        assert self._proc.stdin is not None
+
+        for line in self._proc.stdout:
+            if self._stop:
+                break
+            self.log.emit(line.rstrip("\n"))
+
+            # Auto-continue for ACE-Step interactive draft prompt (it writes instruction.txt and waits for Enter).
+            if "Press Enter when ready to continue." in line and self._proc and self._proc.stdin:
+                try:
+                    self.log.emit("NOTE: Auto-pressed Enter to continue.")
+                    self._proc.stdin.write("\n")
+                    self._proc.stdin.flush()
+                except Exception:
+                    pass
+
+        if self._stop and self._proc and self._proc.poll() is None:
+            self.log.emit("Stop requested. Terminating...")
+            self._proc.terminate()
+            try:
+                self._proc.wait(timeout=5)
+            except Exception:
+                self._proc.kill()
+
+        return int(self._proc.wait())
 
     @QtCore.Slot()
     def run(self):
@@ -739,63 +800,25 @@ class Runner(QtCore.QObject):
             if is_windows() and self.hide_console:
                 creationflags = subprocess.CREATE_NO_WINDOW  # type: ignore[attr-defined]
 
-            self.log.emit("Command:\n  " + " ".join(shlex.quote(a) for a in self.args))
-            self.log.emit(f"Working dir:\n  {self.cwd}")
-
-            env = os.environ.copy()
-            # Force UTF-8 so cli.py can print emojis (✅) without crashing on cp1252.
-            env.setdefault("PYTHONIOENCODING", "utf-8")
-            env.setdefault("PYTHONUTF8", "1")
-            env.setdefault("LANG", "C.UTF-8")
-            env.setdefault("LC_ALL", "C.UTF-8")
-            self._proc = subprocess.Popen(
-                self.args,
-                cwd=str(self.cwd),
-                stdout=subprocess.PIPE,
-                stdin=subprocess.PIPE,
-                stderr=subprocess.STDOUT,
-                text=True,
-                encoding="utf-8",
-                errors="replace",
-                bufsize=1,
-                creationflags=creationflags,
-                env=env,
-            )
-            assert self._proc.stdout is not None
-            # stdin is used to auto-continue interactive prompts
-            assert self._proc.stdin is not None
-            for line in self._proc.stdout:
+            final_code = 0
+            total = len(self.args_runs)
+            for idx, cmd in enumerate(self.args_runs, start=1):
                 if self._stop:
+                    final_code = 130
                     break
-                self.log.emit(line.rstrip("\n"))
+                if total > 1:
+                    self.log.emit(f"---- Run {idx}/{total} ----")
+                final_code = self._run_one(cmd, creationflags)
+                if final_code != 0:
+                    break
 
-                # Auto-continue for ACE-Step interactive draft prompt (it writes instruction.txt and waits for Enter).
-                if "Press Enter when ready to continue." in line and self._proc and self._proc.stdin:
-                    try:
-                        self.log.emit("NOTE: Auto-pressed Enter to continue.")
-                        self._proc.stdin.write("\n")
-                        self._proc.stdin.flush()
-                    except Exception:
-                        pass
-
-
-            if self._stop and self._proc and self._proc.poll() is None:
-                self.log.emit("Stop requested. Terminating...")
-                self._proc.terminate()
-                try:
-                    self._proc.wait(timeout=5)
-                except Exception:
-                    self._proc.kill()
-
-            code = self._proc.wait()
-            self.finished.emit(int(code))
+            self.finished.emit(int(final_code))
         except Exception as e:
             self.log.emit(f"ERROR: {e!r}")
             self.finished.emit(999)
 
     def stop(self):
         self._stop = True
-
 
 
 
@@ -1045,16 +1068,37 @@ class MainWindow(QtWidgets.QMainWindow):
         )
 
         self.spin_seed = QtWidgets.QSpinBox()
-        self.spin_seed.setRange(-1, 2_147_483_647)
-        self.spin_seed.setToolTip("-1 = random")
+        self.spin_seed.setRange(0, 2_147_483_647)
+        self.spin_seed.setToolTip("Seed used for generation.")
+
+        self.chk_seed_random = QtWidgets.QCheckBox("Random")
+        self.chk_seed_random.setToolTip(
+            "When enabled, a new random seed is generated for every run.\n"
+            "The seed box shows the exact seed used for the last run."
+        )
 
         grid.addWidget(QtWidgets.QLabel("Duration (s)"), r, 0)
         grid.addWidget(self.spin_duration, r, 1)
         grid.addWidget(QtWidgets.QLabel("Outputs"), r, 2)
         grid.addWidget(self.spin_batch, r, 3)
         grid.addWidget(QtWidgets.QLabel("Seed"), r, 4)
-        grid.addWidget(self.spin_seed, r, 5)
+        # Put seed + random toggle side-by-side.
+        seed_row = QtWidgets.QHBoxLayout()
+        seed_row.setContentsMargins(0, 0, 0, 0)
+        seed_row.setSpacing(8)
+        seed_row.addWidget(self.spin_seed, 1)
+        seed_row.addWidget(self.chk_seed_random, 0)
+        seed_wrap = QtWidgets.QWidget()
+        seed_wrap.setLayout(seed_row)
+        grid.addWidget(seed_wrap, r, 5)
         r += 1
+
+        # Random seed behavior: when enabled, we generate a new seed per run and
+        # keep the seed box display in sync.
+        try:
+            self.chk_seed_random.toggled.connect(self._on_seed_random_toggled)
+        except Exception:
+            pass
 
         self.spin_bpm = QtWidgets.QSpinBox()
         self.spin_bpm.setRange(0, 300)
@@ -1481,6 +1525,15 @@ class MainWindow(QtWidgets.QMainWindow):
                 s.output_dir = new_default
         except Exception:
             pass
+
+        # Migration: older builds used seed=-1 to mean random.
+        # New builds use a dedicated Random toggle and keep the visible seed non-negative.
+        try:
+            if int(getattr(s, 'seed', 0) or 0) < 0:
+                s.seed = 0
+                s.seed_random = True
+        except Exception:
+            pass
         return s
 
     def _auto_detect_paths(self):
@@ -1580,6 +1633,8 @@ class MainWindow(QtWidgets.QMainWindow):
         s.duration = float(self.spin_duration.value())
         s.batch_size = int(self.spin_batch.value())
         s.seed = int(self.spin_seed.value())
+        if hasattr(self, 'chk_seed_random'):
+            s.seed_random = bool(self.chk_seed_random.isChecked())
         s.bpm = int(self.spin_bpm.value()) if hasattr(self, 'spin_bpm') else 0
         s.timesignature = int(self.cmb_timesig.currentData() or 0) if hasattr(self, 'cmb_timesig') else 0
         ks = self.cmb_keyscale.currentData() if hasattr(self, 'cmb_keyscale') else ""
@@ -1654,6 +1709,22 @@ class MainWindow(QtWidgets.QMainWindow):
         self.spin_duration.setValue(float(s.duration))
         self.spin_batch.setValue(int(s.batch_size))
         self.spin_seed.setValue(int(s.seed))
+        if hasattr(self, 'chk_seed_random'):
+            # Legacy migration: older builds used seed=-1 to mean random.
+            try:
+                legacy_random = (int(getattr(s, 'seed', 0) or 0) < 0)
+            except Exception:
+                legacy_random = False
+            use_random = bool(getattr(s, 'seed_random', False) or legacy_random)
+            try:
+                self.chk_seed_random.blockSignals(True)
+                self.chk_seed_random.setChecked(use_random)
+            finally:
+                self.chk_seed_random.blockSignals(False)
+            try:
+                self.spin_seed.setEnabled(not bool(use_random))
+            except Exception:
+                pass
 
         # Negatives (LM guidance)
         if hasattr(self, 'ed_negatives'):
@@ -1834,6 +1905,32 @@ class MainWindow(QtWidgets.QMainWindow):
                     "It will be ignored automatically to avoid broken output.\n\n"
                     "(Switch Main model back to a Base model to enable.)"
                 )
+        except Exception:
+            pass
+
+
+        # Auto steps presets based on selected Main model:
+        # - Turbo models: 8 steps
+        # - Base/SFT (and everything else): 50 steps
+        try:
+            if hasattr(self, "spin_steps") and self.spin_steps is not None:
+                sel = ""
+                try:
+                    sel = str(self.cmb_main_model.currentData() or "").strip()
+                except Exception:
+                    sel = ""
+                if not sel:
+                    try:
+                        sel = str(self.cmb_main_model.currentText() or "").strip()
+                    except Exception:
+                        sel = ""
+                ssel = sel.lower()
+                target_steps = 8 if "turbo" in ssel else 50
+                try:
+                    if int(self.spin_steps.value()) != int(target_steps):
+                        self.spin_steps.setValue(int(target_steps))
+                except Exception:
+                    pass
         except Exception:
             pass
 
@@ -2167,7 +2264,15 @@ class MainWindow(QtWidgets.QMainWindow):
             pass
         try:
             if "seed" in preset:
-                self.spin_seed.setValue(int(preset.get("seed") or -1))
+                sval = int(preset.get("seed") or 0)
+                # Legacy preset: seed=-1 meant random.
+                use_random = bool(preset.get("seed_random")) or (sval < 0)
+                if hasattr(self, 'chk_seed_random'):
+                    self.chk_seed_random.setChecked(use_random)
+                    self._on_seed_random_toggled(use_random)
+                if sval < 0:
+                    sval = 0
+                self.spin_seed.setValue(int(sval))
         except Exception:
             pass
         try:
@@ -2515,7 +2620,40 @@ class MainWindow(QtWidgets.QMainWindow):
 
         return None
 
-    def _make_config(self, out_dir: Path) -> Path:
+    # -----------------------------
+    # Seed handling
+    # -----------------------------
+    def _ace15_generate_seed(self) -> int:
+        """Generate a random seed within the UI spinbox range."""
+        try:
+            # Keep seeds in a compact, human-friendly range.
+            # Requested: 0 .. 1,000,000
+            return int(random.randint(0, 1_000_000))
+        except Exception:
+            return int(time.time()) & 0x7FFFFFFF
+
+    def _on_seed_random_toggled(self, on: bool):
+        """UI handler: enable/disable manual seed entry."""
+        try:
+            self.spin_seed.setEnabled(not bool(on))
+        except Exception:
+            pass
+        if on:
+            # Immediately show a valid random seed (so the user never sees "-1").
+            try:
+                self.spin_seed.setValue(self._ace15_generate_seed())
+            except Exception:
+                pass
+
+    def _ace15_prepare_seed_for_run(self):
+        """If Random is enabled, generate a fresh seed and show it in the UI."""
+        try:
+            if hasattr(self, 'chk_seed_random') and self.chk_seed_random.isChecked():
+                self.spin_seed.setValue(self._ace15_generate_seed())
+        except Exception:
+            pass
+
+    def _make_config(self, out_dir: Path, *, seed_override: Optional[int] = None, batch_override: Optional[int] = None) -> Path:
         ts = time.strftime("%Y%m%d_%H%M%S")
         cfg_path = out_dir / f"ace_step_run_{ts}.toml"
 
@@ -2553,10 +2691,12 @@ class MainWindow(QtWidgets.QMainWindow):
             "task_type": task,
             "caption": caption,
             "duration": float(self.spin_duration.value()),
-            "batch_size": int(self.spin_batch.value()),
+            "batch_size": int(batch_override) if batch_override is not None else int(self.spin_batch.value()),
 
-            "seed": int(self.spin_seed.value()),
-            "use_random_seed": True if int(self.spin_seed.value()) < 0 else False,
+            # We always pass an explicit seed value.
+            # If the UI Random toggle is enabled, we generate a new seed per run
+            # (see _ace15_prepare_seed_for_run) and show it in the seed box.
+            "seed": int(seed_override) if seed_override is not None else int(self.spin_seed.value()),
         }
 
         # Vocal language (ISO 639-1). Empty/auto lets ACE decide.
@@ -2706,6 +2846,9 @@ class MainWindow(QtWidgets.QMainWindow):
             QtWidgets.QMessageBox.warning(self, "Fix this first", err)
             return
 
+        # If Random is enabled, generate a fresh seed and show it (instead of -1).
+        self._ace15_prepare_seed_for_run()
+
         self._pull_ui_to_settings()
         self._save_settings()
 
@@ -2719,25 +2862,53 @@ class MainWindow(QtWidgets.QMainWindow):
             self._ace15_out_snapshot = set()
         self._ace15_run_started_epoch = time.time()
 
-        cfg_path = self._make_config(out_dir)
-        self._log(f"Saved config:\n  {cfg_path}")
-
-        # Remember run context for post-run housekeeping.
-        self._last_out_dir = out_dir
-        self._last_cfg_path = cfg_path
-
+        # Build one or multiple runs (Outputs).
         envpy = Path(self.ed_envpy.text().strip())
         clipy = Path(self.ed_clipypy.text().strip())
         proj = Path(self.ed_projectroot.text().strip())
         self._last_proj_root = proj
 
-        args = [str(envpy), str(clipy), "-c", str(cfg_path)]
+        runs_n = int(self.spin_batch.value())
+        args_runs: List[List[str]] = []
+        last_cfg: Optional[Path] = None
+
+        if runs_n <= 1:
+            cfg_path = self._make_config(out_dir)
+            last_cfg = cfg_path
+            self._log(f"Saved config:\n  {cfg_path}")
+            args_runs = [[str(envpy), str(clipy), "-c", str(cfg_path)]]
+        else:
+            # Many users expect "Outputs" to mean multiple separate audio files.
+            # Some ACE-Step builds generate a batch internally but only write one file,
+            # so we run multiple times with batch_size=1 to guarantee N outputs.
+            seeds: List[int] = []
+            random_on = bool(self.chk_seed_random.isChecked()) if hasattr(self, "chk_seed_random") else False
+            if random_on:
+                for _ in range(runs_n):
+                    seeds.append(random.randint(0, 1_000_000))
+            else:
+                base_seed = int(self.spin_seed.value())
+                for i in range(runs_n):
+                    seeds.append(base_seed + i)
+
+            self._log(f"Outputs: running {runs_n} sequential runs (batch_size=1 each).")
+            for i, seed in enumerate(seeds, start=1):
+                cfg_path = self._make_config(out_dir, seed_override=seed, batch_override=1)
+                last_cfg = cfg_path
+                self._log(f"Saved config {i}/{runs_n}:\n  {cfg_path} (seed={seed})")
+                args_runs.append([str(envpy), str(clipy), "-c", str(cfg_path)])
+
+        # Remember run context for post-run housekeeping.
+        self._last_out_dir = out_dir
+        self._last_cfg_path = last_cfg
+
+
 
         self._set_busy(True)
         self.lbl_status.setText("Running…")
 
         self._thread = QtCore.QThread()
-        self._runner = Runner(args=args, cwd=proj, hide_console=self.chk_hide_console.isChecked())
+        self._runner = Runner(args=args_runs, cwd=proj, hide_console=self.chk_hide_console.isChecked())
         self._runner.moveToThread(self._thread)
 
         self._thread.started.connect(self._runner.run)
@@ -2819,10 +2990,7 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def _ace15_seed_for_naming(self) -> str:
         try:
-            seed = int(self.spin_seed.value())
-            if seed < 0:
-                return "AUTO"
-            return str(seed)
+            return str(int(self.spin_seed.value()))
         except Exception:
             return "AUTO"
 
