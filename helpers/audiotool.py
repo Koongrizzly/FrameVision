@@ -5,7 +5,7 @@
 import os, re, sys, subprocess, tempfile, wave, json
 from pathlib import Path
 
-from PySide6.QtCore import Qt, QSettings
+from PySide6.QtCore import Qt, QSettings, QTimer
 from PySide6.QtWidgets import (
     QWidget, QLineEdit, QToolButton, QCheckBox, QPushButton, QFormLayout,
     QHBoxLayout, QVBoxLayout, QFileDialog, QMessageBox, QLabel, QComboBox,
@@ -143,6 +143,33 @@ def ffmpeg_path(settings:QSettings):
 def ffprobe_path(settings:QSettings):
     p = _first_ok(_candidate_probe_bins(settings))
     return p or "ffprobe"
+
+
+def _probe_video_has_audio(settings:QSettings, video_path) -> tuple:
+    """Return (has_audio_or_none, message). None means probe failed/unknown."""
+    try:
+        vp = str(video_path or "").strip()
+        if not vp:
+            return (None, "")
+        fp = ffprobe_path(settings)
+        out = subprocess.check_output([
+            fp, "-v", "error",
+            "-select_streams", "a",
+            "-show_entries", "stream=index",
+            "-of", "json",
+            vp
+        ], stderr=subprocess.STDOUT)
+        data = json.loads(out.decode("utf-8", "ignore") or "{}")
+        streams = data.get("streams") or []
+        if streams:
+            return (True, "")
+        return (False, "Source video has no audio stream")
+    except Exception as e:
+        try:
+            return (None, f"Could not inspect source audio: {type(e).__name__}")
+        except Exception:
+            return (None, "Could not inspect source audio")
+
 
 class _Waveform(QWidget):
     """Waveform preview via pyqtgraph. Falls back gracefully if pyqtgraph missing."""
@@ -361,6 +388,69 @@ def install_audio_tool(pane, sec_audio):
         ))
     except Exception:
         pass
+
+    _cb_include_original_tip_default = cb_include_original.toolTip() or ""
+    _last_src_probe_path = {"value": ""}
+
+    def _get_current_input_path_nonintrusive():
+        """Best-effort lookup of the current source video path without opening dialogs."""
+        try:
+            for name in (
+                "current_input_path", "current_media_path", "media_path", "current_path",
+                "_current_input_path", "_current_media_path", "_media_path", "_current_path",
+                "last_input_path", "input_path"
+            ):
+                v = getattr(pane, name, None)
+                if isinstance(v, Path):
+                    v = str(v)
+                if isinstance(v, str) and v.strip():
+                    return v.strip()
+            for name in (
+                "get_current_input_path", "get_current_media_path", "current_media_path",
+                "current_input", "current_media", "media_source_path"
+            ):
+                fn = getattr(pane, name, None)
+                if callable(fn):
+                    try:
+                        v = fn()
+                    except TypeError:
+                        continue
+                    if isinstance(v, Path):
+                        v = str(v)
+                    if isinstance(v, str) and v.strip():
+                        return v.strip()
+        except Exception:
+            pass
+        return ""
+
+    def _set_include_original_state(enabled:bool, why:str=""):
+        try:
+            if not enabled:
+                cb_include_original.setChecked(False)
+                cb_include_original.setEnabled(False)
+                tip = (_cb_include_original_tip_default + "\n\n" + (why or "Source video has no audio stream")).strip()
+                cb_include_original.setToolTip(tip)
+            else:
+                cb_include_original.setEnabled(True)
+                cb_include_original.setToolTip(_cb_include_original_tip_default)
+        except Exception:
+            pass
+
+    def _refresh_include_original_for_source(path_hint:str=""):
+        pth = str(path_hint or _get_current_input_path_nonintrusive() or "").strip()
+        if not pth:
+            # Unknown source yet -> keep option available, but don't force-check it.
+            _last_src_probe_path["value"] = ""
+            _set_include_original_state(True)
+            return
+        if _last_src_probe_path.get("value") == pth:
+            return
+        _last_src_probe_path["value"] = pth
+        has_audio, msg = _probe_video_has_audio(settings, pth)
+        if has_audio is False:
+            _set_include_original_state(False, msg or "Source video has no audio stream")
+        else:
+            _set_include_original_state(True)
 
     def _update_mix_submode_ui():
         # Always in mix mode now
@@ -696,6 +786,12 @@ def install_audio_tool(pane, sec_audio):
         if not inp:
             return
 
+        # Refresh source-audio availability now that we know the exact input.
+        try:
+            _refresh_include_original_for_source(str(inp))
+        except Exception:
+            pass
+
         # preflight ffmpeg presence
         ff = ffmpeg_path(settings)
         try:
@@ -854,6 +950,17 @@ def install_audio_tool(pane, sec_audio):
         pane._run(cmd, out)
 
     btn_audio.clicked.connect(_build_and_run)
+
+    # Keep the 'include original audio' checkbox in sync with the currently selected source video.
+    try:
+        _refresh_include_original_for_source()
+        _src_audio_timer = QTimer(pane)
+        _src_audio_timer.setInterval(1000)
+        _src_audio_timer.timeout.connect(_refresh_include_original_for_source)
+        _src_audio_timer.start()
+        pane._audiotool_src_audio_timer = _src_audio_timer
+    except Exception:
+        pass
 
     # Expose a couple of widgets (optional)
     try:

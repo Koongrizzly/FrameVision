@@ -724,73 +724,13 @@ class Runner(QtCore.QObject):
     started = QtCore.Signal()
     finished = QtCore.Signal(int)
 
-    def __init__(self, args, cwd: Path, hide_console: bool):
-        """Run one or many commands.
-
-        args can be:
-          - List[str] for a single command
-          - List[List[str]] for multiple sequential commands
-        """
+    def __init__(self, args: List[str], cwd: Path, hide_console: bool):
         super().__init__()
-        if args and isinstance(args[0], (list, tuple)):
-            self.args_runs = [list(a) for a in args]
-        else:
-            self.args_runs = [list(args)]
+        self.args = args
         self.cwd = cwd
         self.hide_console = hide_console
         self._proc: Optional[subprocess.Popen] = None
         self._stop = False
-
-    def _run_one(self, cmd: List[str], creationflags: int) -> int:
-        self.log.emit("Command:\n  " + " ".join(shlex.quote(a) for a in cmd))
-        self.log.emit(f"Working dir:\n  {self.cwd}")
-
-        env = os.environ.copy()
-        # Force UTF-8 so cli.py can print emojis (✅) without crashing on cp1252.
-        env.setdefault("PYTHONIOENCODING", "utf-8")
-        env.setdefault("PYTHONUTF8", "1")
-        env.setdefault("LANG", "C.UTF-8")
-        env.setdefault("LC_ALL", "C.UTF-8")
-
-        self._proc = subprocess.Popen(
-            cmd,
-            cwd=str(self.cwd),
-            stdout=subprocess.PIPE,
-            stdin=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-            bufsize=1,
-            creationflags=creationflags,
-            env=env,
-        )
-        assert self._proc.stdout is not None
-        assert self._proc.stdin is not None
-
-        for line in self._proc.stdout:
-            if self._stop:
-                break
-            self.log.emit(line.rstrip("\n"))
-
-            # Auto-continue for ACE-Step interactive draft prompt (it writes instruction.txt and waits for Enter).
-            if "Press Enter when ready to continue." in line and self._proc and self._proc.stdin:
-                try:
-                    self.log.emit("NOTE: Auto-pressed Enter to continue.")
-                    self._proc.stdin.write("\n")
-                    self._proc.stdin.flush()
-                except Exception:
-                    pass
-
-        if self._stop and self._proc and self._proc.poll() is None:
-            self.log.emit("Stop requested. Terminating...")
-            self._proc.terminate()
-            try:
-                self._proc.wait(timeout=5)
-            except Exception:
-                self._proc.kill()
-
-        return int(self._proc.wait())
 
     @QtCore.Slot()
     def run(self):
@@ -800,25 +740,63 @@ class Runner(QtCore.QObject):
             if is_windows() and self.hide_console:
                 creationflags = subprocess.CREATE_NO_WINDOW  # type: ignore[attr-defined]
 
-            final_code = 0
-            total = len(self.args_runs)
-            for idx, cmd in enumerate(self.args_runs, start=1):
-                if self._stop:
-                    final_code = 130
-                    break
-                if total > 1:
-                    self.log.emit(f"---- Run {idx}/{total} ----")
-                final_code = self._run_one(cmd, creationflags)
-                if final_code != 0:
-                    break
+            self.log.emit("Command:\n  " + " ".join(shlex.quote(a) for a in self.args))
+            self.log.emit(f"Working dir:\n  {self.cwd}")
 
-            self.finished.emit(int(final_code))
+            env = os.environ.copy()
+            # Force UTF-8 so cli.py can print emojis (✅) without crashing on cp1252.
+            env.setdefault("PYTHONIOENCODING", "utf-8")
+            env.setdefault("PYTHONUTF8", "1")
+            env.setdefault("LANG", "C.UTF-8")
+            env.setdefault("LC_ALL", "C.UTF-8")
+            self._proc = subprocess.Popen(
+                self.args,
+                cwd=str(self.cwd),
+                stdout=subprocess.PIPE,
+                stdin=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                bufsize=1,
+                creationflags=creationflags,
+                env=env,
+            )
+            assert self._proc.stdout is not None
+            # stdin is used to auto-continue interactive prompts
+            assert self._proc.stdin is not None
+            for line in self._proc.stdout:
+                if self._stop:
+                    break
+                self.log.emit(line.rstrip("\n"))
+
+                # Auto-continue for ACE-Step interactive draft prompt (it writes instruction.txt and waits for Enter).
+                if "Press Enter when ready to continue." in line and self._proc and self._proc.stdin:
+                    try:
+                        self.log.emit("NOTE: Auto-pressed Enter to continue.")
+                        self._proc.stdin.write("\n")
+                        self._proc.stdin.flush()
+                    except Exception:
+                        pass
+
+
+            if self._stop and self._proc and self._proc.poll() is None:
+                self.log.emit("Stop requested. Terminating...")
+                self._proc.terminate()
+                try:
+                    self._proc.wait(timeout=5)
+                except Exception:
+                    self._proc.kill()
+
+            code = self._proc.wait()
+            self.finished.emit(int(code))
         except Exception as e:
             self.log.emit(f"ERROR: {e!r}")
             self.finished.emit(999)
 
     def stop(self):
         self._stop = True
+
 
 
 
@@ -1908,32 +1886,6 @@ class MainWindow(QtWidgets.QMainWindow):
         except Exception:
             pass
 
-
-        # Auto steps presets based on selected Main model:
-        # - Turbo models: 8 steps
-        # - Base/SFT (and everything else): 50 steps
-        try:
-            if hasattr(self, "spin_steps") and self.spin_steps is not None:
-                sel = ""
-                try:
-                    sel = str(self.cmb_main_model.currentData() or "").strip()
-                except Exception:
-                    sel = ""
-                if not sel:
-                    try:
-                        sel = str(self.cmb_main_model.currentText() or "").strip()
-                    except Exception:
-                        sel = ""
-                ssel = sel.lower()
-                target_steps = 8 if "turbo" in ssel else 50
-                try:
-                    if int(self.spin_steps.value()) != int(target_steps):
-                        self.spin_steps.setValue(int(target_steps))
-                except Exception:
-                    pass
-        except Exception:
-            pass
-
     def _set_combo(self, cmb: QtWidgets.QComboBox, value: str):
         idx = cmb.findText(value)
         if idx >= 0:
@@ -2653,7 +2605,7 @@ class MainWindow(QtWidgets.QMainWindow):
         except Exception:
             pass
 
-    def _make_config(self, out_dir: Path, *, seed_override: Optional[int] = None, batch_override: Optional[int] = None) -> Path:
+    def _make_config(self, out_dir: Path) -> Path:
         ts = time.strftime("%Y%m%d_%H%M%S")
         cfg_path = out_dir / f"ace_step_run_{ts}.toml"
 
@@ -2691,12 +2643,12 @@ class MainWindow(QtWidgets.QMainWindow):
             "task_type": task,
             "caption": caption,
             "duration": float(self.spin_duration.value()),
-            "batch_size": int(batch_override) if batch_override is not None else int(self.spin_batch.value()),
+            "batch_size": int(self.spin_batch.value()),
 
             # We always pass an explicit seed value.
             # If the UI Random toggle is enabled, we generate a new seed per run
             # (see _ace15_prepare_seed_for_run) and show it in the seed box.
-            "seed": int(seed_override) if seed_override is not None else int(self.spin_seed.value()),
+            "seed": int(self.spin_seed.value()),
         }
 
         # Vocal language (ISO 639-1). Empty/auto lets ACE decide.
@@ -2862,53 +2814,25 @@ class MainWindow(QtWidgets.QMainWindow):
             self._ace15_out_snapshot = set()
         self._ace15_run_started_epoch = time.time()
 
-        # Build one or multiple runs (Outputs).
+        cfg_path = self._make_config(out_dir)
+        self._log(f"Saved config:\n  {cfg_path}")
+
+        # Remember run context for post-run housekeeping.
+        self._last_out_dir = out_dir
+        self._last_cfg_path = cfg_path
+
         envpy = Path(self.ed_envpy.text().strip())
         clipy = Path(self.ed_clipypy.text().strip())
         proj = Path(self.ed_projectroot.text().strip())
         self._last_proj_root = proj
 
-        runs_n = int(self.spin_batch.value())
-        args_runs: List[List[str]] = []
-        last_cfg: Optional[Path] = None
-
-        if runs_n <= 1:
-            cfg_path = self._make_config(out_dir)
-            last_cfg = cfg_path
-            self._log(f"Saved config:\n  {cfg_path}")
-            args_runs = [[str(envpy), str(clipy), "-c", str(cfg_path)]]
-        else:
-            # Many users expect "Outputs" to mean multiple separate audio files.
-            # Some ACE-Step builds generate a batch internally but only write one file,
-            # so we run multiple times with batch_size=1 to guarantee N outputs.
-            seeds: List[int] = []
-            random_on = bool(self.chk_seed_random.isChecked()) if hasattr(self, "chk_seed_random") else False
-            if random_on:
-                for _ in range(runs_n):
-                    seeds.append(random.randint(0, 1_000_000))
-            else:
-                base_seed = int(self.spin_seed.value())
-                for i in range(runs_n):
-                    seeds.append(base_seed + i)
-
-            self._log(f"Outputs: running {runs_n} sequential runs (batch_size=1 each).")
-            for i, seed in enumerate(seeds, start=1):
-                cfg_path = self._make_config(out_dir, seed_override=seed, batch_override=1)
-                last_cfg = cfg_path
-                self._log(f"Saved config {i}/{runs_n}:\n  {cfg_path} (seed={seed})")
-                args_runs.append([str(envpy), str(clipy), "-c", str(cfg_path)])
-
-        # Remember run context for post-run housekeeping.
-        self._last_out_dir = out_dir
-        self._last_cfg_path = last_cfg
-
-
+        args = [str(envpy), str(clipy), "-c", str(cfg_path)]
 
         self._set_busy(True)
         self.lbl_status.setText("Running…")
 
         self._thread = QtCore.QThread()
-        self._runner = Runner(args=args_runs, cwd=proj, hide_console=self.chk_hide_console.isChecked())
+        self._runner = Runner(args=args, cwd=proj, hide_console=self.chk_hide_console.isChecked())
         self._runner.moveToThread(self._thread)
 
         self._thread.started.connect(self._runner.run)

@@ -74,12 +74,102 @@ def _run_cmd(cmd: List[str], cwd: Optional[Path], root: Path) -> int:
     cmd = _ensure_utf8_flag(list(cmd))
     _write_log(root, "RUN: " + " ".join(shlex.quote(x) for x in cmd))
     try:
+        # Stream child output so FrameVision worker/progress parsers can see live logs.
+        p = subprocess.Popen(
+            cmd,
+            cwd=str(cwd) if cwd else None,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            env=_utf8_env(),
+            text=True,
+            errors="replace",
+            bufsize=1,
+            universal_newlines=True,
+        )
+        out_lines: List[str] = []
+        assert p.stdout is not None
+        for line in p.stdout:
+            line = line.rstrip("\r\n")
+            if not line:
+                continue
+            out_lines.append(line)
+            try:
+                print(line, flush=True)
+            except Exception:
+                pass
+        p.wait()
+        if out_lines:
+            _write_log(root, "STDOUT/ERR:\n" + "\n".join(out_lines))
+        _write_log(root, f"EXIT: {p.returncode}")
+        return int(p.returncode or 0)
+    except Exception as e:
+        _write_log(root, f"EXCEPTION while running subprocess: {e!r}")
+        return 1
+def _ffprobe_json(ffprobe: str, path: Path, root: Path) -> Dict[str, Any]:
+    try:
+        cmd = [ffprobe, "-v", "error", "-show_streams", "-show_format", "-of", "json", str(path)]
+        p = subprocess.run(cmd, cwd=str(root), stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, errors="replace")
+        if p.returncode != 0:
+            if p.stderr:
+                _write_log(root, f"ffprobe failed for {path}: {p.stderr.strip()}")
+            return {}
+        return json.loads(p.stdout or "{}") if (p.stdout or "").strip() else {}
+    except Exception as e:
+        _write_log(root, f"ffprobe exception for {path}: {e!r}")
+        return {}
+
+
+def _media_meta(ffprobe: str, path: Path, root: Path) -> Dict[str, Any]:
+    j = _ffprobe_json(ffprobe, path, root)
+    streams = j.get("streams") or []
+    fmt = j.get("format") or {}
+    v = next((st for st in streams if st.get("codec_type") == "video"), {})
+    a = next((st for st in streams if st.get("codec_type") == "audio"), None)
+
+    def _to_float(x: Any) -> Optional[float]:
+        try:
+            if x in (None, "", "N/A"):
+                return None
+            return float(x)
+        except Exception:
+            return None
+
+    def _ratio_to_float(x: Any) -> Optional[float]:
+        try:
+            s = str(x or "").strip()
+            if not s or s in ("0/0", "0", "N/A"):
+                return None
+            if "/" in s:
+                a1, b1 = s.split("/", 1)
+                a1f = float(a1); b1f = float(b1)
+                if b1f == 0:
+                    return None
+                return a1f / b1f
+            return float(s)
+        except Exception:
+            return None
+
+    dur = _to_float(v.get("duration")) or _to_float(fmt.get("duration"))
+    avg_fps = _ratio_to_float(v.get("avg_frame_rate")) or _ratio_to_float(v.get("r_frame_rate"))
+    return {
+        "duration": dur,
+        "fps": avg_fps,
+        "has_audio": bool(a),
+        "audio_codec": (a or {}).get("codec_name") if a else None,
+        "video_codec": v.get("codec_name"),
+    }
+
+
+def _run_cmd_env(cmd: List[str], cwd: Optional[Path], root: Path, env: Optional[dict] = None) -> int:
+    cmd = _ensure_utf8_flag(list(cmd))
+    _write_log(root, "RUN: " + " ".join(shlex.quote(x) for x in cmd))
+    try:
         p = subprocess.run(
             cmd,
             cwd=str(cwd) if cwd else None,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
-            env=_utf8_env(),
+            env=_utf8_env(env),
             text=True,
             errors="replace",
         )
@@ -94,9 +184,133 @@ def _run_cmd(cmd: List[str], cwd: Optional[Path], root: Path) -> int:
         return 1
 
 
+def _repair_video_output(root: Path, src: Path, out_path: Path, ffmpeg_path: Optional[str], ffprobe_path: Optional[str]) -> None:
+    try:
+        if not src.exists() or not out_path.exists():
+            return
+        if src.suffix.lower() not in {".mp4", ".mov", ".mkv", ".webm", ".avi", ".m4v", ".mpg", ".mpeg", ".wmv"}:
+            return
+        ffmpeg = str(ffmpeg_path or "ffmpeg")
+        ffprobe = str(ffprobe_path or "ffprobe")
+        src_meta = _media_meta(ffprobe, src, root)
+        out_meta = _media_meta(ffprobe, out_path, root)
+        _write_log(root, f"SRC META: {src_meta}")
+        _write_log(root, f"OUT META: {out_meta}")
+
+        src_d = src_meta.get("duration") or 0.0
+        out_d = out_meta.get("duration") or 0.0
+        dur_delta = abs(float(src_d) - float(out_d)) if (src_d and out_d) else 0.0
+        need_audio = bool(src_meta.get("has_audio")) and not bool(out_meta.get("has_audio"))
+        need_duration_fix = bool(src_d and out_d and dur_delta > 1.0)
+
+        if not need_audio and not need_duration_fix:
+            _write_log(root, "Post-fix: no repair needed.")
+            return
+
+        tmp = out_path.with_name(out_path.stem + "_postfix" + out_path.suffix)
+        if tmp.exists():
+            try: tmp.unlink()
+            except Exception: pass
+
+        cmd = [ffmpeg, "-hide_banner", "-loglevel", "warning", "-y", "-i", str(out_path), "-i", str(src), "-map", "0:v:0"]
+        if src_meta.get("has_audio"):
+            cmd += ["-map", "1:a?"]
+
+        # If duration drift is large, retime video to source duration. Re-encode video only then.
+        if need_duration_fix and src_d and out_d and out_d > 0:
+            factor = float(src_d) / float(out_d)
+            # Bound to avoid absurd values on corrupt probes.
+            if factor < 0.25 or factor > 4.0:
+                _write_log(root, f"Post-fix skipped retime due to suspicious factor={factor}")
+                need_duration_fix = False
+            else:
+                _write_log(root, f"Post-fix retime enabled: src={src_d:.3f}s out={out_d:.3f}s factor={factor:.9f}")
+                cmd += ["-vf", f"setpts={factor:.9f}*PTS"]
+                src_fps = src_meta.get("fps")
+                if src_fps and 1.0 <= float(src_fps) <= 240.0:
+                    fps_txt = (f"{float(src_fps):.6f}").rstrip("0").rstrip(".")
+                    cmd += ["-r", fps_txt]
+                cmd += ["-c:v", "libx264", "-crf", "18", "-preset", "medium", "-pix_fmt", "yuv420p"]
+        if not need_duration_fix:
+            cmd += ["-c:v", "copy"]
+
+        if src_meta.get("has_audio"):
+            cmd += ["-c:a", "copy", "-shortest"]
+        cmd += [str(tmp)]
+
+        rc = _run_cmd_env(cmd, cwd=root, root=root)
+        if rc != 0 or not tmp.exists() or tmp.stat().st_size <= 0:
+            _write_log(root, f"Post-fix failed rc={rc}; keeping original output")
+            try:
+                if tmp.exists():
+                    tmp.unlink()
+            except Exception:
+                pass
+            return
+
+        bak = out_path.with_name(out_path.stem + "_prepostfix" + out_path.suffix)
+        try:
+            if bak.exists():
+                bak.unlink()
+        except Exception:
+            pass
+        try:
+            out_path.replace(bak)
+            tmp.replace(out_path)
+            try:
+                if bak.exists() and bak.stat().st_size > 0:
+                    bak.unlink()
+            except Exception:
+                pass
+            _write_log(root, "Post-fix applied successfully (audio/duration repair).")
+        except Exception as e:
+            _write_log(root, f"Post-fix replace failed: {e!r}")
+            try:
+                if tmp.exists():
+                    tmp.unlink()
+            except Exception:
+                pass
+    except Exception as e:
+        _write_log(root, f"Post-fix exception: {e!r}")
+
+
+def _detect_root_from_args_or_env(root_value: str) -> Path:
+    # Accept explicit root when provided; otherwise try common FrameVision locations relative to this file/cwd.
+    if str(root_value or "").strip():
+        try:
+            return Path(root_value).resolve()
+        except Exception:
+            pass
+    candidates = []
+    try:
+        here = Path(__file__).resolve()
+        candidates += [here.parent.parent, here.parent]
+    except Exception:
+        pass
+    try:
+        candidates.append(Path.cwd())
+    except Exception:
+        pass
+    # Prefer a folder that looks like FrameVision root.
+    for c in candidates:
+        try:
+            if (c / "presets" / "bin").exists() or (c / "helpers").exists() or (c / "output").exists():
+                return c.resolve()
+        except Exception:
+            continue
+    # Last resort
+    try:
+        return candidates[0].resolve()
+    except Exception:
+        return Path(".").resolve()
+
 def _legacy_mode(args: argparse.Namespace) -> int:
-    root = Path(args.root).resolve()
+    root = _detect_root_from_args_or_env(getattr(args, 'root', ''))
     _write_log(root, f"MODE: legacy; py={sys.executable}; cwd={os.getcwd()}")
+    try:
+        print(f"[seedvr2_runner] input={args.input}", flush=True)
+    except Exception:
+        pass
     try:
         seed_cfg = json.loads(args.seed_cmd_json) if args.seed_cmd_json else {}
     except Exception as e:
@@ -131,7 +345,10 @@ def _legacy_mode(args: argparse.Namespace) -> int:
             cwd = None
 
         _write_log(root, "legacy JSON was a command list; executing directly")
-        return _run_cmd(cmd, cwd=cwd, root=root)
+        rc = _run_cmd(cmd, cwd=cwd, root=root)
+        if rc == 0 and str(args.is_video).strip() not in ("0", "false", "False", "") and args.output:
+            _repair_video_output(root, Path(args.input), Path(args.output), None, None)
+        return rc
 
     # Normalize dict-based config.
     if not isinstance(seed_cfg, dict):
@@ -213,12 +430,19 @@ def _legacy_mode(args: argparse.Namespace) -> int:
     # Choose cwd as repo root (where inference_cli.py lives)
     cwd = cli.parent
 
-    return _run_cmd(cmd, cwd=cwd, root=root)
+    rc = _run_cmd(cmd, cwd=cwd, root=root)
+    if rc == 0 and str(args.is_video).strip() not in ("0", "false", "False", "") and out_path:
+        _repair_video_output(root, Path(args.input), Path(str(out_path)), None, None)
+    return rc
 
 
 def _new_mode(args: argparse.Namespace) -> int:
     root = Path(args.work_root).resolve()
     _write_log(root, f"MODE: new; py={sys.executable}; cwd={os.getcwd()}")
+    try:
+        print(f"[seedvr2_runner] input={args.input}", flush=True)
+    except Exception:
+        pass
 
     cli = Path(args.cli)
     if not cli.exists():
@@ -242,22 +466,33 @@ def _new_mode(args: argparse.Namespace) -> int:
     _write_log(root, "PATH+ (ffmpeg): " + ";".join(extra_paths))
 
     try:
-        p = subprocess.run(
+        p = subprocess.Popen(
             cmd,
             cwd=str(cli.parent),
-            env=env,
             stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            env=_utf8_env(),
+            stderr=subprocess.STDOUT,
+            env=_utf8_env(env),
             text=True,
             errors="replace",
+            bufsize=1,
+            universal_newlines=True,
         )
-        if p.stdout:
-            _write_log(root, "STDOUT:\n" + p.stdout.strip())
-        if p.stderr:
-            _write_log(root, "STDERR:\n" + p.stderr.strip())
+        out_lines: List[str] = []
+        assert p.stdout is not None
+        for line in p.stdout:
+            line = line.rstrip("\r\n")
+            if not line:
+                continue
+            out_lines.append(line)
+            try:
+                print(line, flush=True)
+            except Exception:
+                pass
+        p.wait()
+        if out_lines:
+            _write_log(root, "STDOUT/ERR:\n" + "\n".join(out_lines))
         _write_log(root, f"EXIT: {p.returncode}")
-        return int(p.returncode)
+        return int(p.returncode or 0)
     except Exception as e:
         _write_log(root, f"EXCEPTION while running subprocess: {e!r}")
         return 1
@@ -267,11 +502,13 @@ def main(argv: Optional[List[str]] = None) -> int:
     argv = list(sys.argv[1:] if argv is None else argv)
 
     # Detect legacy mode by presence of --seed_cmd_json or --root or --is_video
-    is_legacy = any(a in argv for a in ["--seed_cmd_json", "--root", "--is_video", "--output"])
+    is_legacy = any(a in argv for a in ["--seed_cmd_json", "--root", "--is_video"])
+    if (not is_legacy) and ("--input" in argv) and ("--cli" not in argv) and ("--work_root" not in argv):
+        is_legacy = True
     if is_legacy:
         ap = argparse.ArgumentParser(prog="seedvr2_runner.py (legacy)")
         ap.add_argument("--seed_cmd_json", default="")
-        ap.add_argument("--root", required=True)
+        ap.add_argument("--root", default="")
         ap.add_argument("--input", required=True)
         ap.add_argument("--output", default="")
         ap.add_argument("--is_video", default="0")

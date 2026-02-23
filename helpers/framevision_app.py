@@ -296,14 +296,6 @@ except Exception as _e:
 
 
 
-# >>> FRAMEVISION_ace_BEGIN
-# Safe import of the ace pane; never crash app on failure.
-try:
-    from helpers.ace import acePane
-except Exception as _e:
-    print("[framevision] ace tab import failed:", _e)
-    acePane = None
-# <<< FRAMEVISION_ace_END
 
 # >>> FRAMEVISION_ACE_STEP_15_BEGIN
 # Safe import of Ace-Step 1.5 pane; never crash app on failure.
@@ -5160,8 +5152,6 @@ class MainWindow(QMainWindow):
    #         except Exception:
     #            from pathlib import Path as _Path
      #           ace_enabled = _Path(".").resolve().joinpath(".ace_env").exists()
-      #      if ace_enabled and 'acePane' in globals() and acePane is not None:
-       #         self.ace = acePane(self)
         #        try:
          #           idx_tools = self.tabs.indexOf(self.tools)
           #      except Exception:

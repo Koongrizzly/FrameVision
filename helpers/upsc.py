@@ -44,6 +44,7 @@ if os.name == "nt":
     SEEDVR2_ENV_PY = ROOT / "environments" / ".seedvr2" / "Scripts" / "python.exe"
 else:
     SEEDVR2_ENV_PY = ROOT / "environments" / ".seedvr2" / "bin" / "python"
+SEEDVR2_RUNNER = Path(__file__).resolve().with_name("seedvr2_runner.py")
 
 def scan_seedvr2_gguf() -> List[str]:
     """Return GGUF filenames found under models/SEEDVR2 (recursively)."""
@@ -2164,7 +2165,7 @@ class UpscPane(QtWidgets.QWidget):
                     cc = (self.combo_seedvr2_color.currentText() or "").strip() or "lab"
                     attn = (self.combo_seedvr2_attn.currentText() or "sdpa").strip() or "sdpa"
 
-                    cmd = [str(SEEDVR2_ENV_PY), "-X", "utf8", str(SEEDVR2_CLI), str(src),
+                    seed_forward = [
                            "--output", str(outfile),
                            "--output_format", out_fmt,
                            "--video_backend", "ffmpeg",
@@ -2181,13 +2182,13 @@ class UpscPane(QtWidgets.QWidget):
                     # Offload options (tiled VAE)
                     try:
                         if self.chk_seedvr2_vae_enc.isChecked():
-                            cmd.append("--vae_encode_tiled")
-                            cmd += ["--vae_encode_tile_size", str(int(self.spin_seedvr2_enc_tile.value()))]
-                            cmd += ["--vae_encode_tile_overlap", str(int(self.spin_seedvr2_enc_ov.value()))]
+                            seed_forward.append("--vae_encode_tiled")
+                            seed_forward += ["--vae_encode_tile_size", str(int(self.spin_seedvr2_enc_tile.value()))]
+                            seed_forward += ["--vae_encode_tile_overlap", str(int(self.spin_seedvr2_enc_ov.value()))]
                         if self.chk_seedvr2_vae_dec.isChecked():
-                            cmd.append("--vae_decode_tiled")
-                            cmd += ["--vae_decode_tile_size", str(int(self.spin_seedvr2_dec_tile.value()))]
-                            cmd += ["--vae_decode_tile_overlap", str(int(self.spin_seedvr2_dec_ov.value()))]
+                            seed_forward.append("--vae_decode_tiled")
+                            seed_forward += ["--vae_decode_tile_size", str(int(self.spin_seedvr2_dec_tile.value()))]
+                            seed_forward += ["--vae_decode_tile_overlap", str(int(self.spin_seedvr2_dec_ov.value()))]
                     except Exception:
                         pass
 
@@ -2202,6 +2203,18 @@ class UpscPane(QtWidgets.QWidget):
                         pass
                     env.setdefault("PYTHONUTF8", "1")
                     env.setdefault("PYTHONIOENCODING", "utf-8")
+
+                    if SEEDVR2_RUNNER.exists():
+                        cmd = [str(SEEDVR2_ENV_PY), "-X", "utf8", str(SEEDVR2_RUNNER),
+                               "--cli", str(SEEDVR2_CLI),
+                               "--input", str(src),
+                               "--ffmpeg", str(FFMPEG),
+                               "--ffprobe", str(FFPROBE),
+                               "--work_root", str(ROOT),
+                               "--"] + seed_forward
+                    else:
+                        # Fallback to direct CLI call if runner is missing.
+                        cmd = [str(SEEDVR2_ENV_PY), "-X", "utf8", str(SEEDVR2_CLI), str(src)] + seed_forward
 
                     self._append_log("Engine: SeedVR2")
                     self._append_log(f"Python: {SEEDVR2_ENV_PY}")
