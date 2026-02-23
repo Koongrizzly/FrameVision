@@ -184,28 +184,56 @@ def _save_planner_settings(obj: Dict[str, Any]) -> None:
 #   3) Paragraph mode: split on blank lines
 
 def _parse_own_storyline_prompts(text: str) -> Tuple[List[Dict[str, Any]], str]:
+    # Normalize newlines and strip invisible BOM/ZWSP chars that often appear at the very start of pasted text.
     src = (text or "").replace("\r\n", "\n").replace("\r", "\n")
+    try:
+        src = _ZWSP_RE.sub("", src)
+    except Exception:
+        pass
     lines = src.split("\n")
 
-    marker_re = re.compile(r"^\s*[\[\(]\s*(?:prompt\s*)?(\d{1,3})\s*[\]\)]\s*[:\-–—]?\s*(.*)$", re.IGNORECASE)
+    # Marker mode:
+    #   [01] ... , (01) ... , [prompt 01] ... , (prompt 01) ...
+    # Also accepts common variants that users paste:
+    #   [S01] ... (or [s01] ...) and double-open brackets like [[01] ...
+    marker_re = re.compile(
+        r"^\s*[\[\(]{1,2}\s*(?:prompt\s*)?(?:s\s*)?(\d{1,3})\s*[\]\)]\s*[:\-–—]?\s*(.*)$",
+        re.IGNORECASE,
+    )
     bullet_re = re.compile(r"^\s*(?:[-*•]|\d+[\.)])\s+(.*)$")
 
     prompts: List[Dict[str, Any]] = []
 
     # --- Tier 1: marker mode ---
     found_marker = False
+    pre_lines: List[str] = []  # any non-empty text before the first detected marker
     cur_num: Optional[int] = None
     cur_lines: List[str] = []
 
     for ln in lines:
+        # Remove any lingering zero-width chars per-line too (defensive: some editors insert them mid-text).
+        try:
+            ln = _ZWSP_RE.sub("", ln)
+        except Exception:
+            pass
+
         mm = marker_re.match(ln)
         if mm:
-            found_marker = True
+            if not found_marker:
+                found_marker = True
+                # If the user had text before the first marker (or the first marker line failed to match due to paste quirks),
+                # treat it as prompt #1 rather than silently dropping it.
+                pre_body = "\n".join([x for x in pre_lines if (x or "").strip()]).strip()
+                if pre_body:
+                    prompts.append({"index": 1, "text": pre_body})
+                pre_lines = []
+
             # flush previous
             if cur_lines:
                 body = "\n".join(cur_lines).strip()
                 if body:
                     prompts.append({"index": int(cur_num) if cur_num is not None else (len(prompts) + 1), "text": body})
+
             # start new
             try:
                 cur_num = int(mm.group(1))
@@ -215,9 +243,14 @@ def _parse_own_storyline_prompts(text: str) -> Tuple[List[Dict[str, Any]], str]:
             cur_lines = [remainder] if remainder else []
             continue
 
-        if found_marker:
-            # continuation line (can include blanks)
-            cur_lines.append(ln)
+        if not found_marker:
+            # Accumulate any leading non-empty lines; if marker mode kicks in later we won't lose these.
+            if (ln or "").strip():
+                pre_lines.append(ln)
+            continue
+
+        # continuation line (can include blanks)
+        cur_lines.append(ln)
 
     if found_marker:
         if cur_lines:
@@ -239,6 +272,10 @@ def _parse_own_storyline_prompts(text: str) -> Tuple[List[Dict[str, Any]], str]:
             prompts.append({"index": len(prompts) + 1, "text": body})
 
     for ln in lines:
+        try:
+            ln = _ZWSP_RE.sub("", ln)
+        except Exception:
+            pass
         bm = bullet_re.match(ln)
         if bm:
             found_list = True
@@ -279,6 +316,48 @@ def _parse_own_storyline_prompts(text: str) -> Tuple[List[Dict[str, Any]], str]:
             prompts.append({"index": len(prompts) + 1, "text": s})
 
     return prompts, "paragraph"
+
+
+# Own Storyline helpers
+_ZWSP_RE = re.compile(r"[\u200B\u200C\u200D\uFEFF]")
+
+
+def _own_storyline_extract_text(it: Any) -> str:
+    """Best-effort extraction of a prompt line from various UI shapes.
+
+    Supports:
+      - dicts with keys: text/prompt/line/value
+      - raw strings
+    Also strips invisible zero-width chars that can make the first entry look empty.
+    """
+    try:
+        if isinstance(it, dict):
+            for k in ("text", "prompt", "line", "value"):
+                v = it.get(k)
+                if v is not None:
+                    return str(v)
+            return ""
+        if isinstance(it, str):
+            return it
+        return str(it) if it is not None else ""
+    except Exception:
+        return ""
+
+
+def _clean_own_story_prompt(s: str) -> str:
+    try:
+        s = str(s or "")
+    except Exception:
+        s = ""
+    # remove BOM / zero-width chars that can make a line *look* non-empty but compile as blank
+    try:
+        s = _ZWSP_RE.sub("", s)
+    except Exception:
+        pass
+    s = s.replace("\r\n", "\n").replace("\r", "\n").strip()
+    if not s:
+        return ""
+    return s
 
 
 
@@ -2660,7 +2739,7 @@ def _stable_uniform(seed_text: str, lo: float, hi: float) -> float:
     return lo + (hi - lo) * r.random()
 
 
-from PySide6.QtCore import Qt, QObject, Signal, Slot, QThread, QSize, QTimer
+from PySide6.QtCore import Qt, QObject, Signal, Slot, QThread, QSize, QTimer, qInstallMessageHandler, QtMsgType
 from PySide6.QtGui import QFont, QAction, QPixmap, QIcon, QStandardItemModel, QStandardItem, QColor, QPainter
 from PySide6.QtWidgets import (
     QApplication,
@@ -2721,6 +2800,41 @@ except Exception:
 
 
 # -----------------------------
+# Qt warning filter (startup)
+# -----------------------------
+def _install_qt_message_filter() -> None:
+    """Filter a noisy Qt Windows geometry warning that can appear on some displays.
+
+    This warning is harmless (Qt clamps the geometry to the monitor work area), but it
+    clutters the console on every start. We only filter this one specific message and
+    leave all other Qt warnings intact.
+    """
+    try:
+        def _handler(msg_type, context, message):  # type: ignore[no-redef]
+            try:
+                s = str(message or "")
+            except Exception:
+                s = ""
+
+            # Only silence this one known, harmless warning.
+            if s.startswith("QWindowsWindow::setGeometry: Unable to set geometry"):
+                return
+
+            # Forward everything else to stderr (similar to Qt default).
+            try:
+                sys.stderr.write(s + "\n")
+            except Exception:
+                pass
+
+        qInstallMessageHandler(_handler)
+    except Exception:
+        pass
+
+
+_install_qt_message_filter()
+
+
+# -----------------------------
 # Data model
 # -----------------------------
 
@@ -2756,7 +2870,10 @@ class PlannerJob:
     narration_sample_path: str # clone only
     narration_language: str    # e.g. auto
 
-    approx_duration_sec: int  # 5 .. 240
+    # Final polish
+    bake_subtitles: bool  # hard-burn subtitles into finished video (requires narration and/or lyrics)
+
+    approx_duration_sec: int  # 5 .. 480
     resolution_preset: str    # Format label (e.g. "Landscape (16:9)")
     quality_preset: str       # Legacy: kept for job.json compatibility (always "1×" now)
     extra_info: str
@@ -3843,7 +3960,7 @@ class PipelineWorker(QThread):
 
         # Own Character Bible — final injection at dispatch-time (protect against truncation/distillers)
         try:
-            if (not bool(_alt_storymode)) and bool(_own_active) and str(_own_prose or "").strip():
+            if (not bool(_own_storyline_enabled)) and (not bool(_alt_storymode)) and bool(_own_active) and str(_own_prose or "").strip():
                 _p0 = str(new_prompt or "").strip()
                 if _p0 and ("OWN CHARACTER BIBLE" not in _p0) and ("Main characters (keep consistent):" not in _p0):
                     new_prompt = (_p0 + " Main characters (keep consistent): " + str(_own_prose).strip() + ".").strip()
@@ -5483,34 +5600,14 @@ class PipelineWorker(QThread):
                     # Own Storyline is the strongest input: for some presets we must reconcile prompt count vs duration.                    # Own Storyline: always respect the Duration slider in this mode.
                     _needs_time_fit = True  # always respect Duration slider in Own storymode
 
-                    # Normalize prompt list (keep order; strip newlines; ignore empties)
+                    # Normalize prompt list (keep order; keep user text verbatim; ignore empties)
                     plist = _own_storyline_prompts if isinstance(_own_storyline_prompts, list) else []
                     clean_prompts: List[str] = []
                     for it in plist:
-                        try:
-                            txt = str((it or {}).get("text") or "").strip()
-                        except Exception:
-                            txt = ""
-                        txt = txt.replace("\r", " ").replace("\n", " ")
-                        txt = " ".join(txt.split()).strip()
-                        if txt:
-                            clean_prompts.append(txt)
-
-                    # If Own Character Bible is enabled, force the characters into each prompt block
-                    # so Own Storyline runs still keep character consistency.
-                    try:
-                        if bool(_own_active) and str(_own_prose or "").strip():
-                            cp2: List[str] = []
-                            pref = str(_own_prose or "").strip()
-                            for p in clean_prompts:
-                                pp = str(p or "").strip()
-                                if not pp:
-                                    continue
-                                cp2.append(f"{pref}. {pp}")
-                            if cp2:
-                                clean_prompts = cp2
-                    except Exception:
-                        pass
+                        raw_txt = _own_storyline_extract_text(it)
+                        raw_txt = _clean_own_story_prompt(raw_txt)
+                        if raw_txt:
+                            clean_prompts.append(raw_txt)
 
                     if not clean_prompts:
                         raise RuntimeError("Own storyline is enabled but no usable prompts were found.")
@@ -5536,87 +5633,14 @@ class PipelineWorker(QThread):
 
                     shortened = False
                     if _needs_time_fit and eff_target > max_possible + 1e-3:
-                        # Not enough prompts to cover the requested duration at the preset max clip length.
-                        # Prefer generating NEW prompts (so we create new images) rather than shortening the video
-                        # or repeating the last image.
-                        try:
-                            import math as _math
-                            need_total = int(_math.ceil(float(eff_target) / max(0.1, float(_max_s))))
-                        except Exception:
-                            need_total = int(float(eff_target) / max(0.1, float(_max_s)) + 0.999)
-
-                        extra = max(0, int(need_total) - int(n_total))
-                        if extra > 0:
-                            # Best-effort: ask Qwen to continue the storyline with extra prompt blocks.
-                            # If Qwen fails, fall back to deterministic "new angle" variants.
-                            new_prompts: List[str] = []
-                            try:
-                                plan_obj2 = plan_obj if isinstance(plan_obj, dict) else {}
-                                title2 = str(plan_obj2.get('title') or '').strip()
-                                setting2 = str(plan_obj2.get('setting') or '').strip()
-                                tone2 = str(plan_obj2.get('tone') or '').strip()
-                                last2 = str(clean_prompts[-1] if clean_prompts else '').strip()
-                                sys_p = (
-                                    "You extend a user-provided storyline for an AI video planner. "
-                                    "Return STRICT JSON only.\n\n"
-                                    "You MUST output a JSON object: {\"prompts\": [..]} where each item is a single prompt string.\n"
-                                    "Rules:\n"
-                                    "- Keep continuity with the given storyline and last prompt.\n"
-                                    "- Each prompt should describe ONE clear image moment.\n"
-                                    "- Avoid repeating the exact same image; change angle, action, or detail.\n"
-                                    "- No numbering, no extra keys, no commentary."
-                                )
-                                user_p = (
-                                    f"Title: {title2}\n"
-                                    f"Setting: {setting2}\n"
-                                    f"Tone: {tone2}\n\n"
-                                    "Existing storyline prompts (in order):\n"
-                                    + "\n".join([f"- {p}" for p in clean_prompts[-min(12, len(clean_prompts)) :]])
-                                    + "\n\n"
-                                    f"Last prompt: {last2}\n\n"
-                                    f"Create {extra} NEW follow-up prompts to extend the storyline. "
-                                    "Return JSON: {\"prompts\": [..]}"
-                                )
-                                parsed2, _raw2 = _qwen_json_call(
-                                    step_name="Own Storyline (extend prompts)",
-                                    system_prompt=sys_p,
-                                    user_prompt=user_p,
-                                    raw_path=shots_raw_path,
-                                    prompts_used_path=qwen_prompts_used,
-                                    error_path=qwen_shots_err,
-                                    temperature=0.4,
-                                    max_new_tokens=1024,
-                                )
-                                if isinstance(parsed2, dict):
-                                    arr = parsed2.get('prompts')
-                                    if isinstance(arr, list):
-                                        for x in arr:
-                                            s = str(x or '').replace("\r", " ").replace("\n", " ")
-                                            s = " ".join(s.split()).strip()
-                                            if s:
-                                                new_prompts.append(s)
-                            except Exception:
-                                new_prompts = []
-
-                            if len(new_prompts) < extra:
-                                # Deterministic fallback variants (still NEW images, not duplicates)
-                                base = clean_prompts[-1] if clean_prompts else ""
-                                for i in range(extra - len(new_prompts)):
-                                    k2 = len(new_prompts) + i + 1
-                                    new_prompts.append(
-                                        f"New angle {k2}: {base}. Different camera angle, lighting, and one small new detail.".strip()
-                                    )
-
-                            # Extend prompt list
-                            clean_prompts.extend(new_prompts[:extra])
-                            n_total = int(len(clean_prompts))
-                            max_possible = float(n_total) * float(_max_s)
-                            eff_target = float(target_total)
-                        else:
-                            # No extra prompts needed; keep target.
-                            eff_target = float(target_total)
+                        # Own Storyline rule: NEVER invent or extend prompts. If the user provided
+                        # fewer prompts than needed to reach the requested duration, shorten the
+                        # effective target duration to what is possible with the preset max clip length.
+                        eff_target = float(max_possible)
+                        shortened = True
 
                     # If we have too many prompts to fit even at minimum per-clip duration, deterministically skip middle prompts.
+
                     prompts_used = list(clean_prompts)
                     if _needs_time_fit:
                         try:
@@ -5714,24 +5738,32 @@ class PipelineWorker(QThread):
                             except Exception:
                                 _sh["duration_sec"] = round(float(_min_v), 2)
 
-                    for i, txt in enumerate(prompts_used, start=1):
+                    for i, prompt_txt in enumerate(prompts_used, start=1):
                         sid = f"S{i:02d}"
                         # Base duration: stable but within bounds
                         if _needs_time_fit and shortened:
                             dur = float(_max_s)
                         else:
                             try:
-                                dur = float(_stable_uniform(str(txt), float(_min_s), float(_max_s)))
+                                dur = float(_stable_uniform(str(prompt_txt), float(_min_s), float(_max_s)))
                             except Exception:
                                 dur = float(max(float(_min_s), min(float(_max_s), float(_avg_s))))
                         dur = float(max(float(_min_s), min(float(_max_s), float(dur))))
+
+                        # Seeds must be single-line for stability, but do NOT rewrite the user's prompt text.
+                        try:
+                            _seed_txt = str(prompt_txt or "").replace("\r", " ").replace("\n", " ")
+                            _seed_txt = " ".join(_seed_txt.split()).strip()
+                        except Exception:
+                            _seed_txt = str(prompt_txt or "").strip()
+
                         out_shots.append({
                             "id": sid,
                             "index": int(i),
                             "phase": _phase_for_index(i, max(1, n_used)),
-                            "visual_description": str(txt),
-                            "seed": str(txt),
-                            "seed_int": int(_seed_to_int(str(txt)) or 0),
+                            "visual_description": str(prompt_txt),
+                            "seed": str(_seed_txt),
+                            "seed_int": int(_seed_to_int(str(_seed_txt)) or 0),
                             "duration_sec": float(round(dur, 2)),
                             "source": "own_storyline",
                         })
@@ -5750,6 +5782,30 @@ class PipelineWorker(QThread):
                         pass
 
                     _safe_write_json(shots_path, out_shots)
+                    # Ensure inspector always has the verbatim prompt text, even if image generation is skipped
+                    # (e.g., cached outputs). Own Storymode must remain 100% user-provided text.
+                    try:
+                        _shot_map0 = manifest.setdefault("shots", {})
+                        if isinstance(_shot_map0, dict):
+                            for _sh0 in out_shots:
+                                try:
+                                    _sid0 = str((_sh0 or {}).get("id") or "").strip()
+                                    _p0 = str((_sh0 or {}).get("visual_description") or "").replace("\r\n", "\n").replace("\r", "\n").strip()
+                                except Exception:
+                                    _sid0, _p0 = "", ""
+                                if not _sid0:
+                                    continue
+                                _rec0 = _shot_map0.get(_sid0)
+                                if not isinstance(_rec0, dict):
+                                    _rec0 = {}
+                                if _p0:
+                                    _rec0["prompt_used"] = _p0
+                                    _rec0["prompt_compiled"] = _p0
+                                    _rec0["prompt_spec"] = _p0
+                                _shot_map0[_sid0] = _rec0
+                    except Exception:
+                        pass
+
                     manifest["paths"]["shots_json"] = shots_path
                     manifest["paths"]["shots_raw_txt"] = shots_raw_path
                     manifest["paths"]["qwen_prompts_used_txt"] = qwen_prompts_used
@@ -6344,12 +6400,19 @@ class PipelineWorker(QThread):
                             raise RuntimeError("Own storyline is enabled but shots.json is empty and no prompts were found.")
                         shots = []
                         for i, it in enumerate(plist, start=1):
+                            # Accept multiple UI save shapes; keep user text verbatim.
                             try:
-                                txt = str((it or {}).get("text") or "").strip()
+                                txt = _own_storyline_extract_text(it)
                             except Exception:
                                 txt = ""
-                            txt = txt.replace("\r", " ").replace("\n", " ")
-                            txt = " ".join(txt.split()).strip()
+                            txt = _clean_own_story_prompt(txt)
+                            # One-line seed for stability, but keep visual_description verbatim.
+                            seed_txt = ""
+                            try:
+                                seed_txt = str(txt or "").replace("\r", " ").replace("\n", " ")
+                                seed_txt = " ".join(seed_txt.split()).strip()
+                            except Exception:
+                                seed_txt = str(txt or "").strip()
                             if not txt:
                                 continue
                             shots.append({
@@ -6367,36 +6430,101 @@ class PipelineWorker(QThread):
                     base_negative = _adjust_text_negatives_csv(base_negative, bool(wants_text))
                     base_negative = _sanitize_negative_list(base_negative)
 
+                    # Own Storyline rule: do NOT add any automatic helper text.
+                    # Only these optional user inputs may be prepended (as-is):
+                    # - Prompt (main box)
+                    # - Extra info (free text)
+                    # - Own Character Bible (manual 1–2)
+                    prefix_parts: List[str] = []
+                    try:
+                        _pfx_prompt = str(self.job.prompt or "").strip()
+                    except Exception:
+                        _pfx_prompt = ""
+                    # Avoid polluting prompts with the internal placeholder used when the prompt box is empty.
+                    if _pfx_prompt and _pfx_prompt.strip().lower() not in ("own storyline", "own storymode"):
+                        prefix_parts.append(_pfx_prompt)
+                    try:
+                        _pfx_extra = str(self.job.extra_info or "").strip()
+                    except Exception:
+                        _pfx_extra = ""
+                    if _pfx_extra:
+                        prefix_parts.append(_pfx_extra)
+                    # Own Character Bible: include ONLY when enabled.
+                    try:
+                        if bool((self.job.encoding or {}).get("own_character_bible_enabled")):
+                            _oc1 = str((self.job.encoding or {}).get("own_character_1_prompt") or "").strip()
+                            _oc2 = str((self.job.encoding or {}).get("own_character_2_prompt") or "").strip()
+                            if _oc1:
+                                prefix_parts.append(_oc1)
+                            if _oc2:
+                                prefix_parts.append(_oc2)
+                    except Exception:
+                        pass
+                    own_prefix = "\n".join([p for p in prefix_parts if str(p).strip()]).strip()
+
                     out = []
                     shot_map = manifest.setdefault("shots", {})
 
+                    # Best-effort: load verbatim prompts from shots_raw.txt (written in Own Storyline mode)
+                    raw_prompt_map: Dict[str, str] = {}
+                    try:
+                        if _file_ok(shots_raw_path, 2):
+                            raw_txt = _safe_read_text(shots_raw_path) or ""
+                            for ln in str(raw_txt).splitlines():
+                                m0 = re.match(r"^\s*\[(\d{1,3})\]\s*(.*)$", ln.strip())
+                                if not m0:
+                                    continue
+                                try:
+                                    n0 = int(m0.group(1))
+                                except Exception:
+                                    n0 = 0
+                                body0 = _clean_own_story_prompt(m0.group(2) or "")
+                                if not body0:
+                                    continue
+                                raw_prompt_map[f"S{n0:02d}"] = body0
+                    except Exception:
+                        raw_prompt_map = {}
+
                     for i, sh in enumerate(shots, start=1):
                         sid = str(sh.get("id") or f"S{i:02d}")
-                        pr = str(sh.get("visual_description") or "").strip()
-                        pr = pr.replace("\r", " ").replace("\n", " ")
-                        pr = " ".join(pr.split()).strip()
-                        # If Own Character Bible is enabled, inject it directly into the prompt text
-                        # so Own Storyline stays compatible with manual character locking.
-                        try:
-                            if bool(_own_active) and str(_own_prose or "").strip() and pr:
-                                pr = f"{str(_own_prose).strip()}. {pr}".strip()
-                        except Exception:
-                            pass
+                        # VERBATIM user prompt text (no rewriting, no helper tags).
+                        # VERBATIM user prompt text (no rewriting, no helper tags).
+                        pr = _clean_own_story_prompt(_own_storyline_extract_text(sh.get("visual_description") or ""))
                         if not pr:
-                            # fallback: try direct prompt list by index
+                            # fallback 1: prompt persisted earlier in manifest (from step_shots)
                             try:
-                                pr = str((_own_storyline_prompts[i - 1] or {}).get("text") or "").strip()
-                                pr = pr.replace("\r", " ").replace("\n", " ")
-                                pr = " ".join(pr.split()).strip()
+                                _rec_prev = shot_map.get(sid) if isinstance(shot_map.get(sid), dict) else {}
+                            except Exception:
+                                _rec_prev = {}
+                            try:
+                                pr = _clean_own_story_prompt(_own_storyline_extract_text(_rec_prev.get("prompt_used") or _rec_prev.get("prompt_spec") or _rec_prev.get("prompt_compiled") or ""))
                             except Exception:
                                 pr = ""
-                        try:
-                            if bool(_own_active) and str(_own_prose or "").strip() and pr and (str(_own_prose).strip() not in pr):
-                                pr = f"{str(_own_prose).strip()}. {pr}".strip()
-                        except Exception:
-                            pass
                         if not pr:
-                            continue
+                            # fallback 2: shots_raw map
+                            try:
+                                pr = _clean_own_story_prompt(raw_prompt_map.get(sid) or "")
+                            except Exception:
+                                pr = ""
+                        if not pr:
+                            # fallback 3: direct prompt list by (shot index) if available, else enumerate index
+                            try:
+                                idx0 = int(sh.get("index") or i)
+                            except Exception:
+                                idx0 = int(i)
+                            try:
+                                pr = _own_storyline_extract_text((_own_storyline_prompts[idx0 - 1] if (idx0 - 1) < len(_own_storyline_prompts) else ""))
+                                pr = _clean_own_story_prompt(pr)
+                            except Exception:
+                                pr = ""
+                        if not pr:
+                            # Do not silently generate empty prompts — fail loudly so user can fix inputs.
+                            raise RuntimeError(f"Own storyline: missing prompt text for {sid}")
+
+                        # Apply optional prefix (prompt/extra/own character bible) without adding any new words.
+                        pr_final = pr
+                        if own_prefix:
+                            pr_final = (own_prefix + "\n" + pr).strip()
 
                         try:
                             _LOGGER.log_probe(f"t2i_prompt_compiled {sid}: {pr}")
@@ -6408,11 +6536,11 @@ class PipelineWorker(QThread):
                             "id": sid,
                             "seed": str(sh.get("seed") or pr).strip(),
                             "seed_int": int(sh.get("seed_int") or _seed_to_int(pr) or 0),
-                            "prompt_spec": pr,
+                            "prompt_spec": pr_final,
                             "negative_spec": base_negative,
-                            "prompt_compiled": pr,
+                            "prompt_compiled": pr_final,
                             "negative_compiled": base_negative,
-                            "prompt_used": pr,
+                            "prompt_used": pr_final,
                             "negative_used": base_negative,
                             "lint": [],
                             "subject_guard": "",
@@ -6422,7 +6550,7 @@ class PipelineWorker(QThread):
                         })
                         shot_map[sid] = rec
 
-                        block = [f"--- {sid} ---", "PROMPT:", pr, "", "NEGATIVE:", base_negative, "", "LINT: (none)"]
+                        block = [f"--- {sid} ---", "PROMPT:", pr_final, "", "NEGATIVE:", base_negative, "", "LINT: (none)"]
                         out.append("\n".join(block).strip())
 
                     if not out:
@@ -6862,10 +6990,15 @@ class PipelineWorker(QThread):
                 manifest["paths"]["image_prompts_txt"] = image_prompts_path
                 _safe_write_json(manifest_path, manifest)
 
-            if _file_ok(image_prompts_path, 10):
-                _skip("Image prompts (from shots)", "image_prompts.txt already exists")
-            else:
+            # IMPORTANT: Own storyline must always rebuild prompts so edits in the textbox
+            # immediately affect the run (never reuse stale compiled prompts).
+            if bool(_own_storyline_enabled):
                 _run("Image prompts (from shots)", step_image_prompts, 44)
+            else:
+                if _file_ok(image_prompts_path, 10):
+                    _skip("Image prompts (from shots)", "image_prompts.txt already exists")
+                else:
+                    _run("Image prompts (from shots)", step_image_prompts, 44)
 
             
                         # Step C2: Render REAL images for all shots using Txt2Img engine selection
@@ -7220,9 +7353,89 @@ class PipelineWorker(QThread):
 
                     # Alternative storymode: use the direct Qwen prompt list compiled in step_image_prompts
 
+                    __use_own = bool(_own_storyline_enabled)
                     __use_alt = bool(_alt_storymode)
 
-                    if __use_alt:
+                    # Own storyline: use the verbatim prompt blocks compiled in step_image_prompts.
+                    # Absolutely no auto prompt assembly in this mode.
+                    if __use_own:
+                        try:
+                            _rec_own = shot_map.get(sid) if isinstance(shot_map, dict) else {}
+                            if not isinstance(_rec_own, dict):
+                                _rec_own = {}
+                            prompt = str(
+                                _rec_own.get("prompt_user_override")
+                                or _rec_own.get("prompt_used")
+                                or _rec_own.get("prompt_compiled")
+                                or _rec_own.get("prompt_spec")
+                                or ""
+                            ).strip()
+                            negative = str(
+                                _rec_own.get("negative_used")
+                                or _rec_own.get("negative_compiled")
+                                or self.job.negatives
+                                or ""
+                            ).strip()
+                        except Exception:
+                            prompt = ""
+                            negative = str(self.job.negatives or "").strip()
+
+                        # Keep dispatch prompt single-line to avoid accidental multi-prompt parsing by engines.
+                        prompt = str(prompt or "").replace("\n", " ").replace("\r", " ").replace("\\n", " ").strip()
+                        prompt = " ".join(prompt.split())
+
+                        # Hard fallback: if manifest fields were not populated for any reason,
+                        # use the shot's own visual_description/seed so S01 can never dispatch blank.
+                        if not prompt:
+                            try:
+                                prompt = str(sh.get("visual_description") or sh.get("seed") or seed_txt or "").strip()
+                            except Exception:
+                                prompt = str(seed_txt or "").strip()
+                            prompt = str(prompt or "").replace("\n", " ").replace("\r", " ").replace("\\n", " ").strip()
+                            prompt = " ".join(prompt.split())
+
+
+                        negative = _ascii_only(str(negative or ""))
+                        negative = _adjust_text_negatives_csv(negative, bool(wants_text))
+                        negative = _sanitize_negative_list(negative)
+
+                        lint = []
+                        _sg = ""
+
+                        # Probe logger: capture every txt2img prompt before dispatch.
+                        try:
+                            if prompt:
+                                _p1 = str(prompt).replace("\n", " ").strip()
+                                _LOGGER.log_probe(f"t2i_prompt_dispatch {sid}: {_p1}")
+                        except Exception:
+                            pass
+
+                        # Store prompt/negative into manifest records
+                        try:
+                            shot_map2 = manifest.setdefault("shots", {})
+                            rec = shot_map2.get(sid) if isinstance(shot_map2.get(sid), dict) else {}
+                            rec.update({
+                                "id": sid,
+                                "seed": seed_txt,
+                                "seed_int": int(sh.get("seed_int") or _seed_to_int(seed_txt) or 0),
+                                "camera": camera,
+                                "lighting": lighting,
+                                "mood": mood,
+                                "phase": str(sh.get("phase") or ""),
+                                "prompt_used": prompt,
+                                "prompt_compiled": prompt,
+                                "negative_compiled": negative,
+                                "subject_guard": _sg,
+                                "subject_fidelity": _sg,
+                                "negative_used": negative,
+                                "lint": lint,
+                                "ts_prompt": time.time(),
+                            })
+                            shot_map2[sid] = rec
+                        except Exception:
+                            pass
+
+                    elif __use_alt:
 
                         try:
 
@@ -7576,7 +7789,7 @@ class PipelineWorker(QThread):
                     # Force "one image" and override the prompt/seed
                     # Own Character Bible — final injection for this prompt
                     try:
-                        if bool(_own_active) and str(_own_prose or "").strip():
+                        if (not bool(_own_storyline_enabled)) and bool(_own_active) and str(_own_prose or "").strip():
                             _p0 = str(prompt or "").strip()
                             if _p0 and ("OWN CHARACTER BIBLE" not in _p0) and ("Main characters (keep consistent):" not in _p0):
                                 prompt = (_p0 + " Main characters (keep consistent): " + str(_own_prose).strip() + ".").strip()
@@ -8250,7 +8463,13 @@ class PipelineWorker(QThread):
                     dist_fp = ""
                     rec0 = shot_map.get(sid) if isinstance(shot_map.get(sid), dict) else {}
                     rec = shot_map.get(sid) if isinstance(shot_map, dict) else {}
-                    compiled = str((rec.get("prompt_compiled") if isinstance(rec, dict) else "") or "").strip()
+                    compiled = str(
+                        (rec.get("prompt_compiled") if isinstance(rec, dict) else "")
+                        or (rec.get("prompt_used") if isinstance(rec, dict) else "")
+                        or (rec.get("prompt_spec") if isinstance(rec, dict) else "")
+                        or str(sh.get("visual_description") or "").strip()
+                        or str(sh.get("seed") or "").strip()
+                    ).strip()
                     neg = str((rec.get("negative_compiled") if isinstance(rec, dict) else "") or "").strip()
 
                     # I2V: reuse compiled prompt + add a tight motion directive.
@@ -8478,7 +8697,7 @@ class PipelineWorker(QThread):
 
                     # Own Character Bible — final injection for video prompt (i2v)
                     try:
-                        if bool(_own_active) and str(_own_prose or "").strip():
+                        if (not bool(_own_storyline_enabled)) and bool(_own_active) and str(_own_prose or "").strip():
                             _p0 = str(prompt or "").strip()
                             if _p0 and ("OWN CHARACTER BIBLE" not in _p0) and ("Main characters (keep consistent):" not in _p0):
                                 prompt = (_p0 + " Main characters (keep consistent): " + str(_own_prose).strip() + ".").strip()
@@ -9838,7 +10057,7 @@ class PipelineWorker(QThread):
                 # Final safety clamp (ACE expects a sensible positive duration in seconds)
                 if dur_s <= 0.1:
                     dur_s = 15.0
-                dur_s = float(max(5.0, min(240.0, dur_s)))
+                dur_s = float(max(5.0, min(480.0, dur_s)))
 
                 preset_key = str(getattr(self.job, "ace15_preset_id", "") or "").strip()
                 payload = _ace15_load_preset_payload(preset_key)
@@ -11968,6 +12187,11 @@ class PipelineWorker(QThread):
                 _tail_steps.append("Upscale final cut ")
             if bool(_pre_want_interp):
                 _tail_steps.append("Interpolate to 60fps ")
+            try:
+                if bool(getattr(self.job, "bake_subtitles", False)):
+                    _tail_steps.append("Bake subtitles ")
+            except Exception:
+                pass
 
             _tail_targets, _tail_windows = _build_tail_targets(_tail_steps, start_pct=95, end_pct=99)
 
@@ -13140,6 +13364,233 @@ class PipelineWorker(QThread):
             else:
                 _skip(_interp_step_name, "toggle is off")
 
+            # Step J: Bake subtitles into final video (Whisper + ffmpeg burn-in)
+            _bake_step_name = "Bake subtitles "
+            try:
+                _want_bake = bool(getattr(self.job, "bake_subtitles", False))
+            except Exception:
+                _want_bake = False
+
+            # Gate: only if narration and/or lyrics is enabled.
+            try:
+                _gate_ok = bool(getattr(self.job, "narration_enabled", False)) or bool(getattr(self.job, "ace15_lyrics_enabled", False)) or (str(_lyrics_mode or "").strip().lower() == "lyrics")
+            except Exception:
+                _gate_ok = False
+
+            def _step_bake_subtitles() -> None:
+                # Determine source video
+                src_video = str((manifest.get("paths") or {}).get("final_video") or final_video or "")
+                if not src_video or (not os.path.isfile(src_video)):
+                    raise RuntimeError(f"Bake subtitles: missing final video: {src_video}")
+
+                # Import helper (kept in its own venv + subprocess to avoid DLL conflicts)
+                try:
+                    from helpers import whisper as _wh  # type: ignore
+                except Exception as e:
+                    raise RuntimeError(f"Bake subtitles: cannot import helpers/whisper.py: {e}")
+
+                env_py = None
+                try:
+                    env_py = _wh._whisper_env_python()
+                except Exception:
+                    env_py = None
+                if not env_py or not os.path.isfile(str(env_py)):
+                    raise RuntimeError(
+                        "Whisper environment not found. Expected: environments/.whisper. "
+                        "Install Whisper via Optional Installs."
+                    )
+
+                runner = _wh._ensure_whisper_runner_file()
+                model_dir = _find_whisper_model_dir()
+                if not model_dir:
+                    raise RuntimeError(
+                        "Whisper model folder not found. Expected /models/whisper/ (preferred) "
+                        "or /models/faster_whisper/medium/."
+                    )
+
+                try:
+                    device = _wh._guess_device()
+                except Exception:
+                    device = "cpu"
+                compute_type = "float16" if device == "cuda" else "int8"
+
+                ffprobe_path = None
+                try:
+                    ffprobe_path = _wh._find_binary("ffprobe")
+                except Exception:
+                    ffprobe_path = None
+
+                out_temp = os.path.join(str(_root()), "output", "_temp")
+                os.makedirs(out_temp, exist_ok=True)
+
+                payload = {
+                    "root": str(_root()),
+                    "media_path": str(src_video),
+                    "model_dir": str(model_dir),
+                    "device": device,
+                    "compute_type": compute_type,
+                    "language": "auto",
+                    "task": "transcribe",
+                    "ffprobe_path": str(ffprobe_path) if ffprobe_path else "",
+                }
+
+                payload_file = os.path.join(out_temp, f"_whisper_payload_subs_{int(time.time()*1000)}.json")
+                _safe_write_text(payload_file, json.dumps(payload, indent=2, ensure_ascii=False))
+
+                cmd = [str(env_py), str(runner), str(payload_file)]
+                self.signals.log.emit("[whisper] transcribing final video for subtitles")
+
+                proc = subprocess.Popen(
+                    cmd,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.STDOUT,
+                    cwd=str(_root()),
+                    text=True,
+                    bufsize=1,
+                )
+
+                last_result = None
+                if proc.stdout:
+                    for line in proc.stdout:
+                        if self._stop_requested:
+                            try:
+                                proc.terminate()
+                            except Exception:
+                                pass
+                            try:
+                                proc.kill()
+                            except Exception:
+                                pass
+                            raise RuntimeError("Cancelled by user.")
+                        line = (line or "").strip()
+                        if not line:
+                            continue
+                        if line.startswith("{") and line.endswith("}"):
+                            try:
+                                msg = json.loads(line)
+                                t = msg.get("type")
+                                if t == "result":
+                                    last_result = msg.get("data") or {}
+                                elif t == "error":
+                                    raise RuntimeError(str(msg.get("message", "")))
+                            except Exception:
+                                self.signals.log.emit(f"[whisper] {line}")
+                        else:
+                            self.signals.log.emit(f"[whisper] {line}")
+
+                rc = proc.wait()
+                if rc != 0:
+                    raise RuntimeError(f"Whisper runner failed (exit code {rc}).")
+                if not last_result:
+                    raise RuntimeError("Whisper runner returned no result.")
+
+                seg_json_tmp = str(last_result.get("segments_json") or "")
+                if not seg_json_tmp or not os.path.isfile(seg_json_tmp):
+                    raise RuntimeError(f"Whisper missing segments JSON: {seg_json_tmp}")
+
+                # Write SRT into final/ (stable, user-friendly)
+                srt_path = os.path.join(final_dir, "subtitles.srt")
+                try:
+                    seg_obj = _safe_read_json(seg_json_tmp) or {}
+                except Exception:
+                    seg_obj = {}
+                segs_in = seg_obj.get("segments") if isinstance(seg_obj, dict) else None
+                if not isinstance(segs_in, list):
+                    segs_in = []
+                segments = []
+                for s in segs_in:
+                    if not isinstance(s, dict):
+                        continue
+                    try:
+                        segments.append(_wh.WhisperSegment(
+                            start=float(s.get("start", 0.0) or 0.0),
+                            end=float(s.get("end", 0.0) or 0.0),
+                            text=str(s.get("text", "") or "").strip(),
+                        ))
+                    except Exception:
+                        continue
+                if not segments:
+                    raise RuntimeError("Whisper returned no segments for subtitles.")
+                try:
+                    _wh._write_srt(segments, srt_path)
+                except Exception as e:
+                    raise RuntimeError(f"Failed to write SRT: {e}")
+
+                # Burn in subtitles with ffmpeg
+                try:
+                    ffmpeg3 = _wh._find_binary("ffmpeg")
+                except Exception:
+                    ffmpeg3 = "ffmpeg"
+
+                base = os.path.splitext(os.path.basename(src_video))[0]
+                out_sub = os.path.join(final_dir, f"{base}_subtitled.mp4")
+                # Escape path for ffmpeg subtitles filter (Windows safe)
+                srt_filter_path = str(srt_path).replace('\\', '\\\\').replace(':', '\\:')
+                vf = f"subtitles='{srt_filter_path}'"
+
+                args = [
+                    str(ffmpeg3),
+                    "-y",
+                    "-hide_banner",
+                    "-loglevel",
+                    "error",
+                    "-i",
+                    str(src_video),
+                    "-vf",
+                    vf,
+                    "-c:v",
+                    "libx264",
+                    "-crf",
+                    "18",
+                    "-preset",
+                    "veryfast",
+                    "-c:a",
+                    "copy",
+                    str(out_sub),
+                ]
+                cp = subprocess.run(args, cwd=str(_root()), capture_output=True, text=True)
+                if cp.returncode != 0 or (not _file_ok(out_sub, 1024)):
+                    raise RuntimeError((cp.stderr or cp.stdout or "").strip() or "ffmpeg failed to bake subtitles")
+
+                # Update manifest pointers
+                manifest.setdefault("paths", {})["final_video_before_subtitles"] = str(src_video)
+                manifest["paths"]["subtitles_srt"] = str(srt_path)
+                manifest["paths"]["final_subtitled_path"] = str(out_sub)
+                manifest["paths"]["final_video"] = str(out_sub)
+                manifest["final_video"] = str(out_sub)
+                _safe_write_json(manifest_path, manifest)
+
+            if (not _want_bake):
+                _skip(_bake_step_name, "toggle is off")
+            elif (not _gate_ok):
+                _skip(_bake_step_name, "requires Narration and/or Lyrics")
+            else:
+                # Fingerprint: source video hash + srt settings
+                try:
+                    src_video = str((manifest.get("paths") or {}).get("final_video") or final_video or "")
+                    src_sha1 = _sha1_file(src_video) if src_video and os.path.isfile(src_video) else ""
+                except Exception:
+                    src_sha1 = ""
+                try:
+                    _bake_meta = {"v": 1, "src": os.path.basename(src_video), "src_sha1": src_sha1, "lang": "auto"}
+                    _bake_fp = _sha1_text(json.dumps(_bake_meta, sort_keys=True))
+                except Exception:
+                    _bake_fp = ""
+                srec = (manifest.get("steps") or {}).get(_bake_step_name) or {}
+                if _file_ok(str((manifest.get("paths") or {}).get("final_subtitled_path") or ""), 1024) and (str(srec.get("fingerprint") or "") == _bake_fp) and (str(srec.get("status") or "") == "done"):
+                    _skip(_bake_step_name, "already up-to-date")
+                else:
+                    _run(_bake_step_name, _step_bake_subtitles, 99)
+                    try:
+                        srec = (manifest.get("steps") or {}).get(_bake_step_name) or {}
+                        srec["fingerprint"] = _bake_fp
+                        srec["ts"] = time.time()
+                        srec["settings"] = _bake_meta
+                        manifest.setdefault("steps", {})[_bake_step_name] = srec
+                        _safe_write_json(manifest_path, manifest)
+                    except Exception:
+                        pass
+
 # README (always refresh, tiny)
             _safe_write_text(
                 readme_path,
@@ -14005,15 +14456,19 @@ class PlannerPane(QWidget):
         self.chk_story = QCheckBox("Narration")
         self.chk_music = QCheckBox("Music background")
         self.chk_silent = QCheckBox("Silent")
+        self.chk_bake_subtitles = QCheckBox("Bake subtitles")
+        self.chk_bake_subtitles.setToolTip("Hard-bake subtitles into the finished video (runs at the very end). Requires Narration and/or Lyrics.")
 
         self.chk_story.toggled.connect(self._sync_toggle_visibility)
         self.chk_story.toggled.connect(lambda _=None: self._apply_auto_music_volume_default())
         self.chk_music.toggled.connect(self._sync_toggle_visibility)
         self.chk_silent.toggled.connect(self._sync_silent_logic)
+        self.chk_bake_subtitles.toggled.connect(self._sync_toggle_visibility)
 
         toggles.addWidget(self.chk_story)
         toggles.addWidget(self.chk_music)
         toggles.addWidget(self.chk_silent)
+        toggles.addWidget(self.chk_bake_subtitles)
         toggles.addStretch(1)
 
         lay.addLayout(toggles)
@@ -14102,7 +14557,7 @@ class PlannerPane(QWidget):
         lay.addWidget(self.voice_sample_row)
         lay.addWidget(self.music_vol_row)
 
-        # Duration slider (5s - 4 min)
+        # Duration slider (5s - 8 min)
         duration_row = QWidget()
         dr = QHBoxLayout(duration_row)
         dr.setContentsMargins(0, 0, 0, 0)
@@ -14110,7 +14565,7 @@ class PlannerPane(QWidget):
         dr.addWidget(QLabel("Approx duration"))
 
         self.sld_duration = QSlider(Qt.Horizontal)
-        self.sld_duration.setRange(5, 240)
+        self.sld_duration.setRange(5, 480)
         # Keep label in sync immediately on startup.
         # (Previously it defaulted to 30s until the user moved the slider.)
         self.lbl_duration = QLabel("")
@@ -14266,6 +14721,10 @@ class PlannerPane(QWidget):
         row_lyrics.setSpacing(8)
         self.chk_ace15_lyrics = QCheckBox("Lyrics")
         self.chk_ace15_lyrics.setToolTip("When enabled, you can provide lyrics. If empty, the planner will auto-create lyrics from the storyline (later step).")
+        try:
+            self.chk_ace15_lyrics.toggled.connect(self._sync_toggle_visibility)
+        except Exception:
+            pass
         row_lyrics.addWidget(self.chk_ace15_lyrics)
         row_lyrics.addStretch(1)
         ace15_lay.addLayout(row_lyrics)
@@ -14705,6 +15164,19 @@ If the planner sees a marker like [02] or (02), it becomes the next image prompt
                 pass
 
         grid.addWidget(self.cmb_videoclip_preset, 3, 1)
+
+        # Safeguard: Videoclip Creator presets are not compatible with Narration.
+        self.lbl_videoclip_preset_hint = QLabel("Disable narration to have more presets")
+        try:
+            self.lbl_videoclip_preset_hint.setStyleSheet("opacity: 0.8;")
+            self.lbl_videoclip_preset_hint.setWordWrap(True)
+        except Exception:
+            pass
+        try:
+            self.lbl_videoclip_preset_hint.setVisible(False)
+        except Exception:
+            pass
+        grid.addWidget(self.lbl_videoclip_preset_hint, 4, 0, 1, 2)
 
         lay.addLayout(grid)
 
@@ -16396,6 +16868,34 @@ If the planner sees a marker like [02] or (02), it becomes the next image prompt
         self.story_vol_row.setVisible(self.chk_story.isChecked())
         self.music_vol_row.setVisible(self.chk_music.isChecked())
         self._sync_narration_ui()
+        self._sync_videoclip_creator_lock_for_narration()
+        self._sync_bake_subtitles_gate()
+
+    def _sync_bake_subtitles_gate(self) -> None:
+        """Bake subtitles toggle is only available when Narration and/or Lyrics is enabled."""
+        if not hasattr(self, "chk_bake_subtitles"):
+            return
+        try:
+            narr_on = bool(self.chk_story.isChecked())
+        except Exception:
+            narr_on = False
+        try:
+            lyr_on = bool(hasattr(self, "chk_ace15_lyrics") and self.chk_ace15_lyrics.isChecked())
+        except Exception:
+            lyr_on = False
+        allowed = bool(narr_on or lyr_on)
+        try:
+            if not allowed:
+                self.chk_bake_subtitles.blockSignals(True)
+                self.chk_bake_subtitles.setChecked(False)
+                self.chk_bake_subtitles.blockSignals(False)
+                self.chk_bake_subtitles.setEnabled(False)
+                self.chk_bake_subtitles.setToolTip("Enable Narration and/or Lyrics to use Bake subtitles")
+            else:
+                self.chk_bake_subtitles.setEnabled(True)
+                self.chk_bake_subtitles.setToolTip("Hard-bake subtitles into the finished video (runs at the very end)")
+        except Exception:
+            pass
 
     def _sync_narration_ui(self) -> None:
         """Chunk 6B: keep narration UI minimal and consistent."""
@@ -16418,6 +16918,72 @@ If the planner sees a marker like [02] or (02), it becomes the next image prompt
         except Exception:
             pass
     
+
+    def _sync_videoclip_creator_lock_for_narration(self) -> None:
+        """Safeguard: Videoclip Creator presets don't support narration over music.
+
+        When Narration is enabled, force the assembler to the default Fastcut/Hardcuts
+        storyline and disable the preset dropdown, showing a hint message.
+        """
+        try:
+            narr_on = bool(self.chk_story.isChecked())
+        except Exception:
+            narr_on = False
+
+        # If the UI isn't built yet, bail safely.
+        if not hasattr(self, "cmb_videoclip_preset"):
+            return
+
+        if narr_on:
+            # Force the default storyboard preset
+            try:
+                self.cmb_videoclip_preset.blockSignals(True)
+            except Exception:
+                pass
+            try:
+                self.cmb_videoclip_preset.setCurrentIndex(0)  # Storyline Preset (Hardcuts)
+            except Exception:
+                pass
+            try:
+                self.cmb_videoclip_preset.blockSignals(False)
+            except Exception:
+                pass
+
+            # Persist choice so job building stays consistent
+            try:
+                s = _load_planner_settings()
+                s["videoclip_creator_preset"] = "Storyline Preset (Hardcuts)"
+                _save_planner_settings(s)
+            except Exception:
+                pass
+
+            try:
+                self.cmb_videoclip_preset.setEnabled(False)
+            except Exception:
+                pass
+
+            try:
+                if hasattr(self, "lbl_videoclip_preset_hint"):
+                    self.lbl_videoclip_preset_hint.setText("Disable narration to have more presets")
+                    self.lbl_videoclip_preset_hint.setVisible(True)
+            except Exception:
+                pass
+        else:
+            # Restore normal behavior: enable only when presets exist
+            try:
+                has_presets = bool(getattr(self, "_videoclip_preset_items", None))
+            except Exception:
+                has_presets = False
+            try:
+                self.cmb_videoclip_preset.setEnabled(bool(has_presets))
+            except Exception:
+                pass
+            try:
+                if hasattr(self, "lbl_videoclip_preset_hint"):
+                    self.lbl_videoclip_preset_hint.setVisible(False)
+            except Exception:
+                pass
+
     def _browse_voice_sample(self) -> None:
         try:
             fn, _ = QFileDialog.getOpenFileName(
@@ -16602,8 +17168,8 @@ If the planner sees a marker like [02] or (02), it becomes the next image prompt
         Rules:
         - Alternative storymode: forced OFF + disabled.
         - Auto Character Bible: forced OFF + disabled.
-        - Own Character Bible: forced OFF each time Own storyline turns ON, but stays ENABLED
-          so the user can opt back in manually if they really want it.
+        - Own Character Bible: allowed (stays enabled). Own storyline requires verbatim prompts,
+          but user-provided character bible text may be prepended (as-is) if the user wants.
         """
 
         # Always-disable targets when Own storyline is ON
@@ -16629,18 +17195,10 @@ If the planner sees a marker like [02] or (02), it becomes the next image prompt
                 except Exception:
                     pass
 
-            # Own Character Bible: force OFF, but keep enabled
+            # Own Character Bible remains user-controlled in Own storyline (do not force OFF).
             try:
                 if hasattr(self, "chk_own_character_bible"):
-                    w = getattr(self, "chk_own_character_bible")
-                    try:
-                        w.setChecked(False)
-                    except Exception:
-                        pass
-                    try:
-                        w.setEnabled(True)
-                    except Exception:
-                        pass
+                    getattr(self, "chk_own_character_bible").setEnabled(True)
             except Exception:
                 pass
         else:
@@ -16984,6 +17542,12 @@ If the planner sees a marker like [02] or (02), it becomes the next image prompt
 
         try:
             self.cmb_videoclip_preset.blockSignals(False)
+        except Exception:
+            pass
+
+        # Apply Narration safeguard after restoring the selection
+        try:
+            self._sync_videoclip_creator_lock_for_narration()
         except Exception:
             pass
 
@@ -17625,6 +18189,18 @@ If the planner sees a marker like [02] or (02), it becomes the next image prompt
 
         if bool(narration_enabled) and narration_mode == "clone" and not narration_sample_path:
             raise ValueError("Narration is set to 'add your own…' but no voice sample file was provided.")
+
+        # Final polish: bake subtitles only when narration and/or lyrics is enabled.
+        bake_subtitles = False
+        try:
+            bake_subtitles = bool(hasattr(self, "chk_bake_subtitles") and self.chk_bake_subtitles.isChecked())
+        except Exception:
+            bake_subtitles = False
+        # Gate (UI should already enforce this, but keep job config safe)
+        if not (bool(narration_enabled) or bool(ace15_lyrics_enabled)):
+            bake_subtitles = False
+        if bool(silent):
+            bake_subtitles = False
         # Chunk 9A: format (stored in job config)
         aspect_label = "Landscape (16:9)"
         try:
@@ -17709,7 +18285,6 @@ If the planner sees a marker like [02] or (02), it becomes the next image prompt
         if bool(_own_storyline_on):
             # Own storyline bypasses planner-side prompt creation features (kept as metadata for later chunks).
             enc["character_bible_enabled"] = False
-            enc["own_character_bible_enabled"] = False
             enc["alternative_storymode"] = False
 
         # Own Character Bible prompts (manual 1–2)
@@ -17791,6 +18366,7 @@ If the planner sees a marker like [02] or (02), it becomes the next image prompt
             narration_voice=str(narration_voice),
             narration_sample_path=str(narration_sample_path),
             narration_language=str(narration_language),
+            bake_subtitles=bool(bake_subtitles),
             approx_duration_sec=int(self.sld_duration.value()),
             resolution_preset=str(aspect_label),
             quality_preset=f"{int(upscale_factor)}×",
