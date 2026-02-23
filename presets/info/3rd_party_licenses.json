@@ -1,6 +1,6 @@
 {
   "schema_version": 2,
-  "generated_at_utc": "2026-02-15T19:13:17Z",
+  "generated_at_utc": "2026-02-15T21:39:57Z",
   "generated_from": [
     "ace_setup.bat",
     "background_download.py",
@@ -43,9 +43,9 @@
       "notes": "FFmpeg binary used by the app. See the license link for legal details.",
       "source_url": "https://github.com/BtbN/FFmpeg-Builds/releases/latest/download/ffmpeg-master-latest-win64-gpl.zip",
       "installed_version": "",
-      "installed_at_utc": "",
-      "installed_ffmpeg_sha256": "",
-      "build_info_path": "presets/info/ffmpeg_build_info.txt"
+      "installed_at_utc": "2026-02-15T21:39:57Z",
+      "installed_ffmpeg_sha256": "4b6dd5e140af6faccfdf8789c67af0498a88df4085a9c81606bd626a63bd7bba",
+      "build_info_path": "presets\\info\\ffmpeg_build_info.txt"
     },
     {
       "id": "modnet_onnx",
