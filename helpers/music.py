@@ -731,7 +731,7 @@ class HybridAnalyzer(QObject):
             self._kick_window(0)
 
     def start(self):
-        self._timer.start(90)
+        self._timer.start(40)
 
     def stop(self):
         self._timer.stop()

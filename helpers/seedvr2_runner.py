@@ -101,7 +101,24 @@ def _run_cmd(cmd: List[str], cwd: Optional[Path], root: Path) -> int:
         if out_lines:
             _write_log(root, "STDOUT/ERR:\n" + "\n".join(out_lines))
         _write_log(root, f"EXIT: {p.returncode}")
-        return int(p.returncode or 0)
+        rc = int(p.returncode or 0)
+
+        # New-mode post-fix (audio reattach + duration/fps repair) for video inputs.
+        # SeedVR2 typically writes video-only output, so we must mux audio back in here.
+        if rc == 0:
+            try:
+                src_path = Path(args.input)
+                out_path = _extract_output_from_forward_args(getattr(args, 'forward_args', []), cli.parent)
+                _write_log(root, f"NEW MODE parsed output: {out_path}")
+                if src_path.exists() and _video_suffix(src_path) and out_path and out_path.exists():
+                    _repair_video_output(root, src_path, out_path, getattr(args, 'ffmpeg', None), getattr(args, 'ffprobe', None))
+                elif src_path.exists() and _video_suffix(src_path) and not out_path:
+                    _write_log(root, "New-mode post-fix skipped: could not parse --output from forwarded args")
+                elif src_path.exists() and _video_suffix(src_path) and out_path and not out_path.exists():
+                    _write_log(root, f"New-mode post-fix skipped: parsed output missing: {out_path}")
+            except Exception as e:
+                _write_log(root, f"New-mode post-fix exception: {e!r}")
+        return rc
     except Exception as e:
         _write_log(root, f"EXCEPTION while running subprocess: {e!r}")
         return 1
@@ -160,6 +177,38 @@ def _media_meta(ffprobe: str, path: Path, root: Path) -> Dict[str, Any]:
     }
 
 
+
+
+def _video_suffix(path: Path) -> bool:
+    try:
+        return path.suffix.lower() in {".mp4", ".mov", ".mkv", ".webm", ".avi", ".m4v", ".mpg", ".mpeg", ".wmv"}
+    except Exception:
+        return False
+
+
+def _extract_output_from_forward_args(forward: List[str], cli_cwd: Path) -> Optional[Path]:
+    """Best-effort parser for inference_cli forwarded args to find output path."""
+    try:
+        toks = list(forward or [])
+        out_val: Optional[str] = None
+        i = 0
+        while i < len(toks):
+            t = str(toks[i])
+            if t == '--output' and (i + 1) < len(toks):
+                out_val = toks[i + 1]
+                i += 2
+                continue
+            if t.startswith('--output='):
+                out_val = t.split('=', 1)[1]
+            i += 1
+        if not out_val:
+            return None
+        p = Path(out_val)
+        if not p.is_absolute():
+            p = (cli_cwd / p).resolve()
+        return p
+    except Exception:
+        return None
 def _run_cmd_env(cmd: List[str], cwd: Optional[Path], root: Path, env: Optional[dict] = None) -> int:
     cmd = _ensure_utf8_flag(list(cmd))
     _write_log(root, "RUN: " + " ".join(shlex.quote(x) for x in cmd))

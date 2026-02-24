@@ -176,6 +176,71 @@ def _save_planner_settings(obj: Dict[str, Any]) -> None:
     except Exception:
         pass
 
+
+def _planner_get_own_character_entries(enc: Optional[Dict[str, Any]]) -> List[Dict[str, str]]:
+    """Read manual Own Character Bible entries (prompt + optional codeword triggers)."""
+    out: List[Dict[str, str]] = []
+    try:
+        e = enc if isinstance(enc, dict) else {}
+    except Exception:
+        e = {}
+    for i in (1, 2):
+        try:
+            prompt = str(e.get(f"own_character_{i}_prompt") or "").strip()
+        except Exception:
+            prompt = ""
+        try:
+            codeword = str(e.get(f"own_character_{i}_codeword") or "").strip()
+        except Exception:
+            codeword = ""
+        if prompt:
+            out.append({"prompt": prompt, "codeword": codeword})
+    return out
+
+
+def _apply_own_character_codeword_replacements(prompt_text: str, enc: Optional[Dict[str, Any]]) -> str:
+    """Replace manual character codewords with the corresponding character bible text.
+
+    - Only entries with BOTH prompt and codeword are applied.
+    - Case-insensitive whole-word/phrase matching.
+    - No codeword => no injection (prevents global prompt pollution).
+    """
+    try:
+        text = str(prompt_text or "")
+    except Exception:
+        text = ""
+    if not text.strip():
+        return text
+
+    try:
+        entries = _planner_get_own_character_entries(enc)
+    except Exception:
+        entries = []
+    if not entries:
+        return text
+
+    # Longest phrase first to avoid partial collisions (e.g. "Alien" vs "The alien").
+    try:
+        entries = sorted(entries, key=lambda d: len(str(d.get('codeword') or '')), reverse=True)
+    except Exception:
+        pass
+
+    out = text
+    for rec in entries:
+        try:
+            codeword = str(rec.get("codeword") or "").strip()
+            repl = str(rec.get("prompt") or "").strip()
+        except Exception:
+            codeword, repl = "", ""
+        if not codeword or not repl:
+            continue
+        try:
+            pat = re.compile(rf"(?<!\w){re.escape(codeword)}(?!\w)", re.IGNORECASE)
+            out = pat.sub(repl, out)
+        except Exception:
+            continue
+    return out
+
 # info: Chunk 10 side quest — Own storyline prompt parser (Step 2: preview only)
 # Splits the user-pasted storyline into a list of prompts.
 # Deterministic rules (no "smart" NLP):
@@ -596,7 +661,7 @@ _HUNYUAN_PRESETS = {
         "quality": "medium",
         "res": "368p",
         "target_size": 480,
-        "fps": 15,
+        "fps": 20,
         "steps": 10,
         "min_sec": 2.5,
         "max_sec": 4.0,
@@ -3638,6 +3703,12 @@ class PipelineWorker(QThread):
         if not cli.exists():
             raise RuntimeError(f"Missing CLI: {cli}")
 
+        try:
+            regen_bitrate_kbps = int((self.job.encoding or {}).get("video_bitrate_kbps") or (self.job.encoding or {}).get("bitrate_kbps") or 3500)
+        except Exception:
+            regen_bitrate_kbps = 3500
+        regen_bitrate_kbps = max(500, int(regen_bitrate_kbps))
+
         args = [
             str(py),
             str(cli),
@@ -3650,7 +3721,7 @@ class PipelineWorker(QThread):
             "--fps", str(int(fps)),
             "--frames", str(int(frames)),
             "--steps", str(int(steps)),
-            "--bitrate-kbps", str(int(2000)),
+            "--bitrate-kbps", str(int(regen_bitrate_kbps)),
             "--auto-aspect",
         ]
         if int(target_size) > 0:
@@ -3958,14 +4029,10 @@ class PipelineWorker(QThread):
         except Exception:
             image_model_sel = ""
 
-        # Own Character Bible — final injection at dispatch-time (protect against truncation/distillers)
+        # Own Character Bible — codeword-triggered replacement only (no forced global injection)
         try:
-            if (not bool(_own_storyline_enabled)) and (not bool(_alt_storymode)) and bool(_own_active) and str(_own_prose or "").strip():
-                _p0 = str(new_prompt or "").strip()
-                if _p0 and ("OWN CHARACTER BIBLE" not in _p0) and ("Main characters (keep consistent):" not in _p0):
-                    new_prompt = (_p0 + " Main characters (keep consistent): " + str(_own_prose).strip() + ".").strip()
-                else:
-                    new_prompt = _p0
+            if (not bool(_own_storyline_enabled)) and bool(_own_active):
+                new_prompt = _apply_own_character_codeword_replacements(str(new_prompt or ""), getattr(self.job, "encoding", {}))
         except Exception:
             pass
 
@@ -6302,12 +6369,14 @@ class PipelineWorker(QThread):
                 def step_own_character_bible() -> None:
                     try:
                         bible_list: List[Dict[str, Any]] = []
-                        for i, p in enumerate(list(_own_prompts or [])[:2]):
-                            pp = str(p or "").strip()
+                        _own_entries = _planner_get_own_character_entries(self.job.encoding if isinstance(getattr(self.job, "encoding", None), dict) else {})
+                        for i, rec0 in enumerate(list(_own_entries or [])[:2]):
+                            pp = str((rec0 or {}).get("prompt") or "").strip()
                             if not pp:
                                 continue
+                            _cw = str((rec0 or {}).get("codeword") or "").strip()
                             bible_list.append({
-                                "name": f"Character {i+1}",
+                                "name": (_cw if _cw else f"Character {i+1}"),
                                 "role": "",
                                 "taxonomy": "human",
                                 # Put the user's description into face_traits so it reliably shows up in prompt blocks.
@@ -6449,17 +6518,7 @@ class PipelineWorker(QThread):
                         _pfx_extra = ""
                     if _pfx_extra:
                         prefix_parts.append(_pfx_extra)
-                    # Own Character Bible: include ONLY when enabled.
-                    try:
-                        if bool((self.job.encoding or {}).get("own_character_bible_enabled")):
-                            _oc1 = str((self.job.encoding or {}).get("own_character_1_prompt") or "").strip()
-                            _oc2 = str((self.job.encoding or {}).get("own_character_2_prompt") or "").strip()
-                            if _oc1:
-                                prefix_parts.append(_oc1)
-                            if _oc2:
-                                prefix_parts.append(_oc2)
-                    except Exception:
-                        pass
+                    # Own Character Bible is codeword-triggered (no global prefix injection).
                     own_prefix = "\n".join([p for p in prefix_parts if str(p).strip()]).strip()
 
                     out = []
@@ -6525,6 +6584,11 @@ class PipelineWorker(QThread):
                         pr_final = pr
                         if own_prefix:
                             pr_final = (own_prefix + "\n" + pr).strip()
+                        try:
+                            if bool((self.job.encoding or {}).get("own_character_bible_enabled")):
+                                pr_final = _apply_own_character_codeword_replacements(pr_final, self.job.encoding)
+                        except Exception:
+                            pass
 
                         try:
                             _LOGGER.log_probe(f"t2i_prompt_compiled {sid}: {pr}")
@@ -7787,14 +7851,10 @@ class PipelineWorker(QThread):
                     t2i_job = dict(base_job)
 
                     # Force "one image" and override the prompt/seed
-                    # Own Character Bible — final injection for this prompt
+                    # Own Character Bible — codeword-triggered replacement only (no forced global injection)
                     try:
-                        if (not bool(_own_storyline_enabled)) and bool(_own_active) and str(_own_prose or "").strip():
-                            _p0 = str(prompt or "").strip()
-                            if _p0 and ("OWN CHARACTER BIBLE" not in _p0) and ("Main characters (keep consistent):" not in _p0):
-                                prompt = (_p0 + " Main characters (keep consistent): " + str(_own_prose).strip() + ".").strip()
-                            else:
-                                prompt = _p0
+                        if (not bool(_own_storyline_enabled)) and bool(_own_active):
+                            prompt = _apply_own_character_codeword_replacements(str(prompt or ""), getattr(self.job, "encoding", {}))
                     except Exception:
                         pass
                     
@@ -8514,7 +8574,7 @@ class PipelineWorker(QThread):
 
             def _run_hunyuan15_clip(*, prompt: str, negative: str, image_path: str, out_path: str,
                                     fps: int, frames: int, steps: int, seed: Optional[int],
-                                    target_size: int, model_key: str, bitrate_kbps: int = 2000,
+                                    target_size: int, model_key: str, bitrate_kbps: int = 3500,
                                     attn_backend: str = "auto", cpu_offload: bool = True, vae_tiling: bool = True) -> None:
                 py = _hunyuan15_env_python()
                 if not py.exists():
@@ -8583,6 +8643,12 @@ class PipelineWorker(QThread):
                 max_frames = int(prof.get("max_frames") or 61)
                 target_size = int(prof.get("target_size") or 0)
                 model_key = str(prof.get("model_key") or "480p_i2v_step_distilled")
+
+                try:
+                    planner_clip_bitrate_kbps = int((self.job.encoding or {}).get("video_bitrate_kbps") or (self.job.encoding or {}).get("bitrate_kbps") or 3500)
+                except Exception:
+                    planner_clip_bitrate_kbps = 3500
+                planner_clip_bitrate_kbps = max(500, int(planner_clip_bitrate_kbps))
 
                 # Clip fingerprint (stable skip when unchanged)
                 shots_blob = json.dumps(shots, sort_keys=True)
@@ -8695,14 +8761,10 @@ class PipelineWorker(QThread):
                         # Fallback: basic motion-only prompt
                         prompt = "Slow camera move, subtle parallax, keep subject stable. Match the image exactly."
 
-                    # Own Character Bible — final injection for video prompt (i2v)
+                    # Own Character Bible — codeword-triggered replacement only (no forced global injection)
                     try:
-                        if (not bool(_own_storyline_enabled)) and bool(_own_active) and str(_own_prose or "").strip():
-                            _p0 = str(prompt or "").strip()
-                            if _p0 and ("OWN CHARACTER BIBLE" not in _p0) and ("Main characters (keep consistent):" not in _p0):
-                                prompt = (_p0 + " Main characters (keep consistent): " + str(_own_prose).strip() + ".").strip()
-                            else:
-                                prompt = _p0
+                        if (not bool(_own_storyline_enabled)) and bool(_own_active):
+                            prompt = _apply_own_character_codeword_replacements(str(prompt or ""), getattr(self.job, "encoding", {}))
                     except Exception:
                         pass
                     img_path = id_to_img.get(sid, "")
@@ -8855,6 +8917,7 @@ class PipelineWorker(QThread):
                                 seed=seed,
                                 target_size=target_size,
                                 model_key=model_key,
+                                bitrate_kbps=planner_clip_bitrate_kbps,
                                 attn_backend=str(prof.get("attn_backend") or "auto"),
                                 cpu_offload=bool(prof.get("cpu_offload", True)),
                                 vae_tiling=bool(prof.get("vae_tiling", True)),
@@ -15016,6 +15079,12 @@ If the planner sees a marker like [02] or (02), it becomes the next image prompt
         own_lay.setSpacing(6)
 
         lbl1 = QLabel("Character 1 prompt")
+        self.own_char_1_codeword = QLineEdit()
+        self.own_char_1_codeword.setPlaceholderText("Codeword / trigger (example: The alien)")
+        try:
+            self.own_char_1_codeword.setToolTip("Only when this word/phrase appears in a shot prompt, the Character 1 prompt is inserted.")
+        except Exception:
+            pass
         self.own_char_1 = QTextEdit()
         self.own_char_1.setPlaceholderText(
             "Describe the character for consistency (appearance, outfit, vibe, signature details).\n"
@@ -15024,6 +15093,12 @@ If the planner sees a marker like [02] or (02), it becomes the next image prompt
         self.own_char_1.setFixedHeight(84)
 
         lbl2 = QLabel("Character 2 prompt (optional)")
+        self.own_char_2_codeword = QLineEdit()
+        self.own_char_2_codeword.setPlaceholderText("Codeword / trigger (example: Megan)")
+        try:
+            self.own_char_2_codeword.setToolTip("Only when this word/phrase appears in a shot prompt, the Character 2 prompt is inserted.")
+        except Exception:
+            pass
         self.own_char_2 = QTextEdit()
         self.own_char_2.setPlaceholderText(
             "Optional second character (kept consistent across all prompts).\n"
@@ -15035,18 +15110,24 @@ If the planner sees a marker like [02] or (02), it becomes the next image prompt
             s = _load_planner_settings()
             self.own_char_1.setPlainText(str(s.get("own_character_1_prompt", "") or ""))
             self.own_char_2.setPlainText(str(s.get("own_character_2_prompt", "") or ""))
+            self.own_char_1_codeword.setText(str(s.get("own_character_1_codeword", "") or ""))
+            self.own_char_2_codeword.setText(str(s.get("own_character_2_codeword", "") or ""))
         except Exception:
             pass
 
         try:
             self.own_char_1.textChanged.connect(self._on_own_character_prompt_changed)
             self.own_char_2.textChanged.connect(self._on_own_character_prompt_changed)
+            self.own_char_1_codeword.textChanged.connect(self._on_own_character_prompt_changed)
+            self.own_char_2_codeword.textChanged.connect(self._on_own_character_prompt_changed)
         except Exception:
             pass
 
         own_lay.addWidget(lbl1)
+        own_lay.addWidget(self.own_char_1_codeword)
         own_lay.addWidget(self.own_char_1)
         own_lay.addWidget(lbl2)
+        own_lay.addWidget(self.own_char_2_codeword)
         own_lay.addWidget(self.own_char_2)
 
         self.own_character_bible_block.setVisible(bool(self.chk_own_character_bible.isChecked()))
@@ -17368,12 +17449,16 @@ If the planner sees a marker like [02] or (02), it becomes the next image prompt
         try:
             c1 = (self.own_char_1.toPlainText() or "").strip() if hasattr(self, "own_char_1") else ""
             c2 = (self.own_char_2.toPlainText() or "").strip() if hasattr(self, "own_char_2") else ""
+            cw1 = (self.own_char_1_codeword.text() or "").strip() if hasattr(self, "own_char_1_codeword") else ""
+            cw2 = (self.own_char_2_codeword.text() or "").strip() if hasattr(self, "own_char_2_codeword") else ""
         except Exception:
-            c1, c2 = "", ""
+            c1, c2, cw1, cw2 = "", "", "", ""
         try:
             s = _load_planner_settings()
             s["own_character_1_prompt"] = str(c1)
             s["own_character_2_prompt"] = str(c2)
+            s["own_character_1_codeword"] = str(cw1)
+            s["own_character_2_codeword"] = str(cw2)
             _save_planner_settings(s)
         except Exception:
             pass
@@ -18295,6 +18380,12 @@ If the planner sees a marker like [02] or (02), it becomes the next image prompt
             c1, c2 = "", ""
         enc["own_character_1_prompt"] = str(c1)
         enc["own_character_2_prompt"] = str(c2)
+        try:
+            enc["own_character_1_codeword"] = str((self.own_char_1_codeword.text() or "").strip()) if hasattr(self, "own_char_1_codeword") else ""
+            enc["own_character_2_codeword"] = str((self.own_char_2_codeword.text() or "").strip()) if hasattr(self, "own_char_2_codeword") else ""
+        except Exception:
+            enc["own_character_1_codeword"] = ""
+            enc["own_character_2_codeword"] = ""
 
         # If Own Character Bible is enabled and at least one prompt exists, force-disable auto Character Bible for this run.
         try:
@@ -18474,6 +18565,8 @@ If the planner sees a marker like [02] or (02), it becomes the next image prompt
                         enc["own_character_bible_enabled"] = bool(self.chk_own_character_bible.isChecked())
                         enc["own_character_1_prompt"] = str(self.own_char_1.toPlainText() or "")
                         enc["own_character_2_prompt"] = str(self.own_char_2.toPlainText() or "")
+                        enc["own_character_1_codeword"] = str(self.own_char_1_codeword.text() or "") if hasattr(self, "own_char_1_codeword") else ""
+                        enc["own_character_2_codeword"] = str(self.own_char_2_codeword.text() or "") if hasattr(self, "own_char_2_codeword") else ""
                 except Exception:
                     pass
 
