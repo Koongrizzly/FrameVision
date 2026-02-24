@@ -15,8 +15,10 @@ Then run: python seedvr2_gguf_installer.py
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import platform
+import re
 import shutil
 import subprocess
 import sys
@@ -63,13 +65,13 @@ def _pip(venv_dir: Path, args: List[str]) -> None:
     py = _venv_python(venv_dir)
     _run([str(py), "-m", "pip"] + args)
 
-def _try_install_torch(venv_dir: Path) -> None:
+def _try_install_torch(venv_dir: Path) -> str:
     """
-    Install PyTorch.
-    Preference: CUDA wheels if an NVIDIA GPU seems present; fallback to CPU wheels.
+    Install a *matching* PyTorch/torchvision/torchaudio set.
+    We pin companion versions to avoid pip backtracking into incompatible newer wheels.
+    Returns torch index tag string (e.g. "cu124", "cu121", "cpu").
     """
     _print_header("Installing PyTorch")
-    # Heuristic: if nvidia-smi exists and returns 0, assume CUDA-capable GPU
     has_nvidia = False
     try:
         p = subprocess.run(["nvidia-smi"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
@@ -77,21 +79,123 @@ def _try_install_torch(venv_dir: Path) -> None:
     except Exception:
         has_nvidia = False
 
-    # Try CUDA 12.1 wheels first when NVIDIA present, else CPU wheels.
-    # (Keeps the installer simple and avoids requiring local CUDA toolkits.)
+    # torch 2.5.1 companion versions
+    trio = ["torch==2.5.1", "torchvision==0.20.1", "torchaudio==2.5.1"]
+
     if has_nvidia:
-        print("Detected NVIDIA GPU (via nvidia-smi). Trying CUDA PyTorch wheels (cu121).")
-        try:
-            _pip(venv_dir, ["install", "--upgrade", "torch", "torchvision", "torchaudio",
-                            "--index-url", "https://download.pytorch.org/whl/cu121"])
-            return
-        except subprocess.CalledProcessError:
-            print("CUDA wheel install failed; falling back to CPU wheels.")
+        print("Detected NVIDIA GPU (via nvidia-smi). Trying CUDA PyTorch wheels (preferred order: cu128 -> cu124 -> cu121).")
+        for tag in ("cu128", "cu124", "cu121"):
+            try:
+                _pip(venv_dir, [
+                    "install", "--upgrade", "--force-reinstall",
+                    *trio,
+                    "--index-url", f"https://download.pytorch.org/whl/{tag}"
+                ])
+                return tag
+            except subprocess.CalledProcessError:
+                print(f"PyTorch install failed for {tag}; trying next option...")
     else:
         print("No NVIDIA GPU detected. Installing CPU PyTorch wheels.")
 
-    _pip(venv_dir, ["install", "--upgrade", "torch", "torchvision", "torchaudio",
+    _pip(venv_dir, ["install", "--upgrade", "--force-reinstall", *trio,
                     "--index-url", "https://download.pytorch.org/whl/cpu"])
+    return "cpu"
+
+
+def _detect_torch_env(venv_dir: Path) -> dict:
+    py = _venv_python(venv_dir)
+    code = (
+        "import json, sys\n"
+        "try:\n"
+        " import torch\n"
+        " d={\"python\":sys.version.split()[0],\"torch\":getattr(torch,\"__version__\",None),"
+        "\"torch_cuda\":getattr(torch.version,\"cuda\",None),\"cuda_available\":bool(torch.cuda.is_available())}\n"
+        " print(json.dumps(d))\n"
+        "except Exception as e:\n"
+        " print(json.dumps({\"error\":str(e),\"python\":sys.version.split()[0]}))\n"
+    )
+    cp = subprocess.run([str(py), "-c", code], capture_output=True, text=True)
+    out = (cp.stdout or "").strip().splitlines()
+    if not out:
+        return {"error": (cp.stderr or "No output").strip()}
+    try:
+        return json.loads(out[-1])
+    except Exception:
+        return {"raw": out[-1], "stderr": (cp.stderr or "").strip()}
+
+
+def _try_install_flash_attn(venv_dir: Path) -> bool:
+    """
+    Best-effort FlashAttention install using DIRECT prebuilt wheel URLs only.
+    No generic pip package fallback and no source-build attempts.
+    If no known wheel matches the current combo, we skip quietly (non-fatal).
+    """
+    _print_header("Attempting FlashAttention install (best-effort)")
+    info = _detect_torch_env(venv_dir)
+    print("Torch env info:", info)
+    if info.get("error"):
+        print("Skipping flash-attn install (could not inspect torch env).")
+        return False
+    if not info.get("cuda_available") or not info.get("torch_cuda"):
+        print("Skipping flash-attn install (CUDA torch runtime not detected).")
+        return False
+
+    pyver = str(info.get("python", ""))
+    tor = str(info.get("torch", ""))
+    tcu = str(info.get("torch_cuda", ""))
+
+    def _norm_digits(v: str) -> str:
+        """Return major+minor digits (e.g. 3.11 -> 311, 12.4 -> 124)."""
+        m = re.search(r"(\d+)\.(\d+)", v or "")
+        return f"{m.group(1)}{m.group(2)}" if m else ""
+
+    def _maj_min(v: str) -> str:
+        """Return major.minor (e.g. 2.5.1+cu124 -> 2.5)."""
+        m = re.search(r"(\d+)\.(\d+)", v or "")
+        return f"{m.group(1)}.{m.group(2)}" if m else ""
+
+    py_digits = _norm_digits(pyver)        # 3.11 -> 311
+    cu_digits = _norm_digits(tcu)          # 12.4 -> 124
+    tor_tag = _maj_min(tor)                # 2.5.1+cu124 -> 2.5
+
+    if not (_is_windows() and py_digits and tor_tag and cu_digits):
+        print("No direct prebuilt flash-attn wheel rule for this platform/combo. Skipping (non-fatal).")
+        return False
+
+    # Direct wheel(s) only. User requested no generic pip fallback because it causes noisy source-build failures.
+    wheel_candidates = []
+
+    # Exact combo from the prebuilt wheels repo (mjun0812). This is the preferred path.
+    # NOTE: The wheel naming uses torch<major.minor> (e.g. torch2.5), not torch25.
+    exact = f"flash_attn-2.8.3+cu{cu_digits}torch{tor_tag}-cp{py_digits}-cp{py_digits}-win_amd64.whl"
+    wheel_candidates.append(
+        "https://github.com/mjun0812/flash-attention-prebuild-wheels/releases/download/v0.4.19/" + exact.replace("+", "%2B")
+    )
+
+    # Optional compatibility alias if torch digit parsing yields same major.minor but local version tags differ.
+    # (Still direct URL only; no pip package names.)
+
+    py = _venv_python(venv_dir)
+    for url in wheel_candidates:
+        try:
+            print(f"Trying direct prebuilt FlashAttention wheel: {url}")
+            # Clean any previous partial/bad installs first.
+            _pip(venv_dir, ["uninstall", "-y", "flash-attn", "flash_attn"])
+            _pip(venv_dir, ["install", "--upgrade", url])
+            cp = subprocess.run(
+                [str(py), "-c", "import flash_attn; print(getattr(flash_attn,'__version__','unknown'))"],
+                capture_output=True, text=True
+            )
+            if cp.returncode == 0:
+                print("flash-attn installed OK (direct wheel):", (cp.stdout or "").strip())
+                return True
+            print("flash-attn import check failed after direct wheel install:", (cp.stderr or "").strip())
+        except subprocess.CalledProcessError:
+            print("Direct prebuilt FlashAttention wheel install failed for this URL.")
+
+    print("FlashAttention direct-wheel install not available for this exact combo (non-fatal).")
+    print("Skipping generic pip package attempts by design (avoids source-build error spam).")
+    return False
 
 def _download_file(url: str, dest: Path) -> None:
     """
@@ -120,20 +224,26 @@ def _detect_framevision_root() -> Path:
     # .../presets/extra_env/<this_file>
     return here.parents[2]
 
-def _install_requirements(venv_dir: Path, req_path: Path) -> None:
+def _install_requirements(venv_dir: Path, req_path: Path, *, try_flash_attn: bool = True) -> dict:
     _print_header("Installing Python requirements")
     _pip(venv_dir, ["install", "--upgrade", "pip", "setuptools", "wheel"])
-    _try_install_torch(venv_dir)
+    torch_tag = _try_install_torch(venv_dir)
     _pip(venv_dir, ["install", "--upgrade",
                     "numpy", "tqdm", "pillow", "opencv-python", "safetensors",
                     "einops", "huggingface_hub", "requests", "packaging"])
     # gguf package is used by ComfyUI-GGUF and SeedVR2 GGUF flows
     _pip(venv_dir, ["install", "--upgrade", "gguf"])
 
+    flash_ok = False
+    if try_flash_attn:
+        flash_ok = _try_install_flash_attn(venv_dir)
+
     if req_path.exists():
         _pip(venv_dir, ["install", "-r", str(req_path)])
     else:
         print("WARNING: requirements.txt not found; skipping -r install.")
+
+    return {"torch_tag": torch_tag, "flash_attn": flash_ok, "torch_info": _detect_torch_env(venv_dir)}
 
 
 def _hf_download(venv_dir: Path, repo_id: str, filename: str, dest_dir: Path) -> Path:
@@ -261,7 +371,7 @@ def _clone_or_download_seedvr2_src(src_dir: Path) -> Tuple[Path, Path]:
             pass
     return repo_root, req
 
-def _write_marker(root_dir: Path, models_dir: Path, venv_dir: Path, src_dir: Path, quant: str) -> None:
+def _write_marker(root_dir: Path, models_dir: Path, venv_dir: Path, src_dir: Path, quant: str, install_info: Optional[dict] = None) -> None:
     marker = root_dir / "presets" / "extra_env" / "seedvr2_gguf_install.json"
     marker.parent.mkdir(parents=True, exist_ok=True)
     marker.write_text(
@@ -273,7 +383,8 @@ def _write_marker(root_dir: Path, models_dir: Path, venv_dir: Path, src_dir: Pat
           "models_dir": "{models_dir.as_posix()}",
           "env_dir": "{venv_dir.as_posix()}",
           "src_dir": "{src_dir.as_posix()}",
-          "note": "Created by seedvr2_gguf_installer.py"
+          "install_info": {json.dumps(install_info or {}, ensure_ascii=False)},
+          "note": "Created by seedvr2_cu128_gguf_installer.py"
         }}
         """),
         encoding="utf-8"
@@ -290,6 +401,7 @@ def main() -> int:
                         help="GGUF quant level for the 3B model (default: Q4).")
     parser.add_argument("--skip-models", action="store_true", help="Skip model downloads (env + deps only).")
     parser.add_argument("--force", action="store_true", help="Recreate venv even if it already exists.")
+    parser.add_argument("--skip-flash-attn", action="store_true", help="Skip best-effort flash-attn installation attempt.")
     args = parser.parse_args()
 
     _print_header("SeedVR2 GGUF Installer")
@@ -322,7 +434,7 @@ def main() -> int:
     repo_root, req_path = _clone_or_download_seedvr2_src(src_dir)
 
     # Install deps
-    _install_requirements(env_dir, req_path)
+    install_info = _install_requirements(env_dir, req_path, try_flash_attn=not args.skip_flash_attn)
 
     # Models
     if not args.skip_models:
@@ -339,7 +451,7 @@ def main() -> int:
         except Exception:
             print("Could not download lcpp-seedvr.patch (non-fatal).")
 
-    _write_marker(root_dir, models_dir, env_dir, src_dir, args.quant)
+    _write_marker(root_dir, models_dir, env_dir, src_dir, args.quant, install_info=install_info)
 
     _print_header("Done")
     print("Next steps (manual test idea):")
