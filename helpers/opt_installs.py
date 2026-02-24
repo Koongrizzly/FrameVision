@@ -286,6 +286,16 @@ def _run_hunyuan15(root: Path) -> Optional[Tuple[str, List[str], Path]]:
     return _cmd_call_bat(script, root)
 
 
+def _run_hunyuan15_flashattn(root: Path) -> Optional[Tuple[str, List[str], Path]]:
+    """Install optional FlashAttention wheel into the Hunyuan 1.5 environment."""
+    py = root / ".hunyuan15_env" / "Scripts" / "python.exe"
+    if not py.exists():
+        return None
+    wheel_url = (
+        "https://github.com/mjun0812/flash-attention-prebuild-wheels/releases/download/v0.4.19/"
+        "flash_attn-2.8.3%2Bcu124torch2.5-cp311-cp311-win_amd64.whl"
+    )
+    return (str(py), ["-m", "pip", "install", wheel_url], root)
 
 
 # (HeartMula optional installs removed)
@@ -538,6 +548,12 @@ OptionalInstall(
             title="HunyuanVideo 1.5, text/image/video to Video with extender",
             description="VRAM: 16GB recommended for 480p. Distilled I2V 480p included; More models can be downloaded inside the tool.",
             runner=_run_hunyuan15,
+        ),
+        OptionalInstall(
+            key="hunyuan15_flashattn",
+            title="Hunyuan : Install Flash attention",
+            description="(info) can speedup video generation. If the Hunyuan 1.5 environment is missing, it will be installed first.",
+            runner=_run_hunyuan15_flashattn,
         ),
         OptionalInstall(
             key="qwen2512",
@@ -986,10 +1002,11 @@ class OptionalInstallsDialog(QtWidgets.QDialog):
             is_qwen_extra = is_qwen2512_extra or is_qwen2511_extra
             is_qwen3tts_extra = opt.key.startswith("qwen3tts_") and opt.key != "qwen3tts"
             is_seedvr2_extra = opt.key.startswith("seedvr2_gguf_")
+            is_hunyuan15_extra = opt.key.startswith("hunyuan15_") and opt.key != "hunyuan15"
 
             row = _OptionRow(
                 opt,
-                indent=(26 if (is_zimage_extra or is_qwen_extra or is_qwen3tts_extra or is_seedvr2_extra) else 0),
+                indent=(26 if (is_zimage_extra or is_qwen_extra or is_qwen3tts_extra or is_seedvr2_extra or is_hunyuan15_extra) else 0),
             )
 
             if is_zimage_extra:
@@ -1003,6 +1020,8 @@ class OptionalInstallsDialog(QtWidgets.QDialog):
 
             if is_seedvr2_extra:
                 row.toggled.connect(lambda checked, k=opt.key: self._on_seedvr2_model_toggled(k, checked))
+            if is_hunyuan15_extra:
+                row.toggled.connect(lambda checked, k=opt.key: self._on_hunyuan15_extra_toggled(k, checked))
 
             self.rows.append(row)
             row_by_key[opt.key] = row
@@ -1022,7 +1041,7 @@ class OptionalInstallsDialog(QtWidgets.QDialog):
         # ---- Video models
         opts_lay.addWidget(_mk_section_label("Video models"))
 
-        for k in ("wan22", "hunyuan15"):
+        for k in ("wan22", "hunyuan15", "hunyuan15_flashattn"):
             opt = by_key.get(k)
             if opt:
                 _add_opt(opt, opts_lay)
@@ -1607,6 +1626,19 @@ class OptionalInstallsDialog(QtWidgets.QDialog):
         self._toast("Qwen 3 TTS models will download when you press Start (env install only needed once).")
 
 
+    def _on_hunyuan15_extra_toggled(self, key: str, checked: bool) -> None:
+        """Warn when Hunyuan 1.5 optional add-ons are selected without the env."""
+        if not checked:
+            return
+
+        if key == "hunyuan15_flashattn":
+            env_dir = (self.root_dir / ".hunyuan15_env").resolve()
+            if not env_dir.exists():
+                self._toast("Hunyuan 1.5 environment not found — it will be installed first.")
+            self._toast("Hunyuan FlashAttention will install when you press Start (env install only needed once).")
+            return
+
+
     def selected_installs(self) -> List[OptionalInstall]:
         # Preserve install order from self.installs.
         checked_keys = [row.opt.key for row in self.rows if row.is_checked()]
@@ -1690,6 +1722,31 @@ class OptionalInstallsDialog(QtWidgets.QDialog):
                             else:
                                 ordered.insert(first_idx, opt)
                             self._auto_added_qwen3tts_env = True
+                            break
+        except Exception:
+            pass
+
+
+        # Hunyuan 1.5 optional extras:
+        # If user selects Hunyuan extras (e.g. FlashAttention), ensure the Hunyuan env exists first.
+        self._auto_added_hunyuan15_env = False
+        try:
+            wants_hunyuan15_extras = ("hunyuan15_flashattn" in checked_set)
+            if wants_hunyuan15_extras and ("hunyuan15" not in checked_set):
+                env_dir = (self.root_dir / ".hunyuan15_env").resolve()
+                if not env_dir.exists():
+                    first_idx = None
+                    for i, opt in enumerate(ordered):
+                        if opt.key == "hunyuan15_flashattn":
+                            first_idx = i
+                            break
+                    for opt in self.installs:
+                        if opt.key == "hunyuan15":
+                            if first_idx is None:
+                                ordered.insert(0, opt)
+                            else:
+                                ordered.insert(first_idx, opt)
+                            self._auto_added_hunyuan15_env = True
                             break
         except Exception:
             pass
@@ -1809,6 +1866,9 @@ class OptionalInstallsDialog(QtWidgets.QDialog):
 
         if getattr(self, "_auto_added_qwen3tts_env", False):
             self._append_line("[INFO] Qwen3-TTS env not found — installing it first because you selected extra model downloads.")
+
+        if getattr(self, "_auto_added_hunyuan15_env", False):
+            self._append_line("[INFO] Hunyuan 1.5 env not found — installing it first because you selected FlashAttention.")
 
         if getattr(self, "_auto_added_seedvr2_env", False):
             self._append_line("[INFO] SeedVR2 env not found — installing it first because you selected a GGUF quant.")

@@ -3704,9 +3704,9 @@ class PipelineWorker(QThread):
             raise RuntimeError(f"Missing CLI: {cli}")
 
         try:
-            regen_bitrate_kbps = int((self.job.encoding or {}).get("video_bitrate_kbps") or (self.job.encoding or {}).get("bitrate_kbps") or 3500)
+            regen_bitrate_kbps = int((self.job.encoding or {}).get("video_bitrate_kbps") or (self.job.encoding or {}).get("bitrate_kbps") or 5000)
         except Exception:
-            regen_bitrate_kbps = 3500
+            regen_bitrate_kbps = 5000
         regen_bitrate_kbps = max(500, int(regen_bitrate_kbps))
 
         args = [
@@ -8574,7 +8574,7 @@ class PipelineWorker(QThread):
 
             def _run_hunyuan15_clip(*, prompt: str, negative: str, image_path: str, out_path: str,
                                     fps: int, frames: int, steps: int, seed: Optional[int],
-                                    target_size: int, model_key: str, bitrate_kbps: int = 3500,
+                                    target_size: int, model_key: str, bitrate_kbps: int = 5000,
                                     attn_backend: str = "auto", cpu_offload: bool = True, vae_tiling: bool = True) -> None:
                 py = _hunyuan15_env_python()
                 if not py.exists():
@@ -8645,9 +8645,9 @@ class PipelineWorker(QThread):
                 model_key = str(prof.get("model_key") or "480p_i2v_step_distilled")
 
                 try:
-                    planner_clip_bitrate_kbps = int((self.job.encoding or {}).get("video_bitrate_kbps") or (self.job.encoding or {}).get("bitrate_kbps") or 3500)
+                    planner_clip_bitrate_kbps = int((self.job.encoding or {}).get("video_bitrate_kbps") or (self.job.encoding or {}).get("bitrate_kbps") or 5000)
                 except Exception:
-                    planner_clip_bitrate_kbps = 3500
+                    planner_clip_bitrate_kbps = 5000
                 planner_clip_bitrate_kbps = max(500, int(planner_clip_bitrate_kbps))
 
                 # Clip fingerprint (stable skip when unchanged)
@@ -12416,8 +12416,8 @@ class PipelineWorker(QThread):
                 except Exception:
                     return 0
 
-            def _choose_target_bitrate_kbps(src_kbps: int, default_kbps: int = 3500) -> int:
-                # "use source when it is already close to 3500"
+            def _choose_target_bitrate_kbps(src_kbps: int, default_kbps: int = 5000) -> int:
+                # "use source when it is already close to 5000"
                 try:
                     src_kbps = int(src_kbps or 0)
                 except Exception:
@@ -13322,7 +13322,7 @@ class PipelineWorker(QThread):
                     "-map", "0:v:0", "-map", "0:a?",
                     "-vf", vf,
                     "-c:v", "libx264", "-preset", "veryfast", "-threads", "0",
-                    "-b:v", "3500k", "-maxrate", "3500k", "-bufsize", "7000k",
+                    "-b:v", "5000k", "-maxrate", "5000k", "-bufsize", "7000k",
                     "-pix_fmt", "yuv420p",
                     "-c:a", "copy",
                     "-movflags", "+faststart",
@@ -13355,7 +13355,7 @@ class PipelineWorker(QThread):
                             "-map", "0:v:0", "-map", "0:a?",
                             "-vf", vf,
                             "-c:v", "libx264", "-preset", "veryfast", "-threads", "0",
-                            "-b:v", "3500k", "-maxrate", "3500k", "-bufsize", "7000k",
+                            "-b:v", "5000k", "-maxrate", "5000k", "-bufsize", "7000k",
                             "-pix_fmt", "yuv420p",
                             "-c:a", "aac", "-b:a", "192k",
                             "-movflags", "+faststart",
@@ -13397,7 +13397,7 @@ class PipelineWorker(QThread):
                     "preset": "veryfast",
                     "fps_in": 20,
                     "fps_out": 60,
-                    "vb_kbps": 3500,
+                    "vb_kbps": 5000,
                 }
                 _interp_fp = _sha1_text(json.dumps(_interp_meta, sort_keys=True))
 
@@ -15147,7 +15147,7 @@ If the planner sees a marker like [02] or (02), it becomes the next image prompt
         self.cmb_aspect.addItems(["Landscape (16:9)", "Portrait (9:16)", "1:1"])
         self.cmb_aspect.setCurrentIndex(0)
         fmt.addWidget(self.cmb_aspect, 0, 1)
-#        self.lbl_bitrate_info = QLabel("Video bitrate: 3500k (fixed)")
+#        self.lbl_bitrate_info = QLabel("Video bitrate: 5000k (fixed)")
 #        self.lbl_bitrate_info.setStyleSheet("opacity: 0.8;")
 #        fmt.addWidget(self.lbl_bitrate_info, 1, 0, 1, 2)
 
@@ -18299,7 +18299,7 @@ If the planner sees a marker like [02] or (02), it becomes the next image prompt
         upscale_factor = 1
 
         # Fixed bitrate policy (no UI)
-        video_bitrate_kbps = 3500
+        video_bitrate_kbps = 5000
 
         # Keep CRF as a fallback, but default to bitrate mode
         enc = {"mode": "bitrate", "crf": 18, "bitrate_kbps": int(video_bitrate_kbps), "note": "Fixed bitrate policy"}

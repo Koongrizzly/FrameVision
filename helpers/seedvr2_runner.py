@@ -101,27 +101,28 @@ def _run_cmd(cmd: List[str], cwd: Optional[Path], root: Path) -> int:
         if out_lines:
             _write_log(root, "STDOUT/ERR:\n" + "\n".join(out_lines))
         _write_log(root, f"EXIT: {p.returncode}")
-        rc = int(p.returncode or 0)
 
-        # New-mode post-fix (audio reattach + duration/fps repair) for video inputs.
-        # SeedVR2 typically writes video-only output, so we must mux audio back in here.
+        rc = int(p.returncode or 0)
         if rc == 0:
             try:
-                src_path = Path(args.input)
-                out_path = _extract_output_from_forward_args(getattr(args, 'forward_args', []), cli.parent)
-                _write_log(root, f"NEW MODE parsed output: {out_path}")
-                if src_path.exists() and _video_suffix(src_path) and out_path and out_path.exists():
-                    _repair_video_output(root, src_path, out_path, getattr(args, 'ffmpeg', None), getattr(args, 'ffprobe', None))
-                elif src_path.exists() and _video_suffix(src_path) and not out_path:
-                    _write_log(root, "New-mode post-fix skipped: could not parse --output from forwarded args")
-                elif src_path.exists() and _video_suffix(src_path) and out_path and not out_path.exists():
-                    _write_log(root, f"New-mode post-fix skipped: parsed output missing: {out_path}")
+                out_s = _parse_output_from_forward_args(forward)
+                if out_s:
+                    out_p = Path(out_s)
+                    if not out_p.is_absolute():
+                        out_p = (cli.parent / out_p).resolve()
+                    _write_log(root, f"NEW MODE parsed output: {out_p}")
+                    src_p = Path(args.input)
+                    if _looks_video_path(src_p) or _looks_video_path(out_p):
+                        _repair_video_output(root, src_p, out_p, args.ffmpeg, args.ffprobe)
+                else:
+                    _write_log(root, "NEW MODE post-fix skipped: --output not found in forwarded args")
             except Exception as e:
-                _write_log(root, f"New-mode post-fix exception: {e!r}")
+                _write_log(root, f"NEW MODE post-fix exception: {e!r}")
         return rc
     except Exception as e:
         _write_log(root, f"EXCEPTION while running subprocess: {e!r}")
         return 1
+
 def _ffprobe_json(ffprobe: str, path: Path, root: Path) -> Dict[str, Any]:
     try:
         cmd = [ffprobe, "-v", "error", "-show_streams", "-show_format", "-of", "json", str(path)]
@@ -177,38 +178,6 @@ def _media_meta(ffprobe: str, path: Path, root: Path) -> Dict[str, Any]:
     }
 
 
-
-
-def _video_suffix(path: Path) -> bool:
-    try:
-        return path.suffix.lower() in {".mp4", ".mov", ".mkv", ".webm", ".avi", ".m4v", ".mpg", ".mpeg", ".wmv"}
-    except Exception:
-        return False
-
-
-def _extract_output_from_forward_args(forward: List[str], cli_cwd: Path) -> Optional[Path]:
-    """Best-effort parser for inference_cli forwarded args to find output path."""
-    try:
-        toks = list(forward or [])
-        out_val: Optional[str] = None
-        i = 0
-        while i < len(toks):
-            t = str(toks[i])
-            if t == '--output' and (i + 1) < len(toks):
-                out_val = toks[i + 1]
-                i += 2
-                continue
-            if t.startswith('--output='):
-                out_val = t.split('=', 1)[1]
-            i += 1
-        if not out_val:
-            return None
-        p = Path(out_val)
-        if not p.is_absolute():
-            p = (cli_cwd / p).resolve()
-        return p
-    except Exception:
-        return None
 def _run_cmd_env(cmd: List[str], cwd: Optional[Path], root: Path, env: Optional[dict] = None) -> int:
     cmd = _ensure_utf8_flag(list(cmd))
     _write_log(root, "RUN: " + " ".join(shlex.quote(x) for x in cmd))
@@ -250,9 +219,18 @@ def _repair_video_output(root: Path, src: Path, out_path: Path, ffmpeg_path: Opt
         out_d = out_meta.get("duration") or 0.0
         dur_delta = abs(float(src_d) - float(out_d)) if (src_d and out_d) else 0.0
         need_audio = bool(src_meta.get("has_audio")) and not bool(out_meta.get("has_audio"))
-        need_duration_fix = bool(src_d and out_d and dur_delta > 1.0)
 
-        if not need_audio and not need_duration_fix:
+        src_fps = src_meta.get("fps") or 0.0
+        out_fps = out_meta.get("fps") or 0.0
+        fps_delta = abs(float(src_fps) - float(out_fps)) if (src_fps and out_fps) else 0.0
+        # Use a tighter threshold than 1s so short test clips also get repaired.
+        # Trigger on either absolute duration drift (>100ms), relative drift (>0.5%), or fps mismatch (>0.01 fps).
+        dur_rel = (dur_delta / float(src_d)) if (src_d and dur_delta is not None) else 0.0
+        need_duration_fix = bool(src_d and out_d and (dur_delta > 0.10 or dur_rel > 0.005))
+        need_fps_fix = bool(src_fps and out_fps and fps_delta > 0.01)
+
+        _write_log(root, f"DURATION CHECK: src={src_d:.3f}s out={out_d:.3f}s delta={dur_delta:.3f}s rel={dur_rel:.4f} src_fps={src_fps} out_fps={out_fps} fps_delta={fps_delta}")
+        if not need_audio and not need_duration_fix and not need_fps_fix:
             _write_log(root, "Post-fix: no repair needed.")
             return
 
@@ -265,8 +243,8 @@ def _repair_video_output(root: Path, src: Path, out_path: Path, ffmpeg_path: Opt
         if src_meta.get("has_audio"):
             cmd += ["-map", "1:a?"]
 
-        # If duration drift is large, retime video to source duration. Re-encode video only then.
-        if need_duration_fix and src_d and out_d and out_d > 0:
+        # If duration/fps drift exists, retime video to source duration / fps and re-encode video.
+        if (need_duration_fix or need_fps_fix) and src_d and out_d and out_d > 0:
             factor = float(src_d) / float(out_d)
             # Bound to avoid absurd values on corrupt probes.
             if factor < 0.25 or factor > 4.0:
@@ -275,12 +253,11 @@ def _repair_video_output(root: Path, src: Path, out_path: Path, ffmpeg_path: Opt
             else:
                 _write_log(root, f"Post-fix retime enabled: src={src_d:.3f}s out={out_d:.3f}s factor={factor:.9f}")
                 cmd += ["-vf", f"setpts={factor:.9f}*PTS"]
-                src_fps = src_meta.get("fps")
                 if src_fps and 1.0 <= float(src_fps) <= 240.0:
                     fps_txt = (f"{float(src_fps):.6f}").rstrip("0").rstrip(".")
                     cmd += ["-r", fps_txt]
                 cmd += ["-c:v", "libx264", "-crf", "18", "-preset", "medium", "-pix_fmt", "yuv420p"]
-        if not need_duration_fix:
+        if not (need_duration_fix or need_fps_fix):
             cmd += ["-c:v", "copy"]
 
         if src_meta.get("has_audio"):
@@ -485,9 +462,27 @@ def _legacy_mode(args: argparse.Namespace) -> int:
     return rc
 
 
+
+
+def _parse_output_from_forward_args(forward: List[str]) -> Optional[str]:
+    """Extract --output path from forwarded CLI args."""
+    try:
+        for i, a in enumerate(forward or []):
+            if a == "--output" and i + 1 < len(forward):
+                return str(forward[i + 1])
+            if isinstance(a, str) and a.startswith("--output="):
+                return a.split("=", 1)[1]
+    except Exception:
+        pass
+    return None
+
+
+def _looks_video_path(p: Path) -> bool:
+    return p.suffix.lower() in {".mp4", ".mov", ".mkv", ".webm", ".avi", ".m4v", ".mpg", ".mpeg", ".wmv"}
+
 def _new_mode(args: argparse.Namespace) -> int:
     root = Path(args.work_root).resolve()
-    _write_log(root, f"MODE: new; py={sys.executable}; cwd={os.getcwd()}")
+    _write_log(root, f"MODE: new; py={sys.executable}; cwd={os.getcwd()} [PATCH active newmode-postfix-v2]")
     try:
         print(f"[seedvr2_runner] input={args.input}", flush=True)
     except Exception:
