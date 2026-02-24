@@ -103,21 +103,6 @@ def _run_cmd(cmd: List[str], cwd: Optional[Path], root: Path) -> int:
         _write_log(root, f"EXIT: {p.returncode}")
 
         rc = int(p.returncode or 0)
-        if rc == 0:
-            try:
-                out_s = _parse_output_from_forward_args(forward)
-                if out_s:
-                    out_p = Path(out_s)
-                    if not out_p.is_absolute():
-                        out_p = (cli.parent / out_p).resolve()
-                    _write_log(root, f"NEW MODE parsed output: {out_p}")
-                    src_p = Path(args.input)
-                    if _looks_video_path(src_p) or _looks_video_path(out_p):
-                        _repair_video_output(root, src_p, out_p, args.ffmpeg, args.ffprobe)
-                else:
-                    _write_log(root, "NEW MODE post-fix skipped: --output not found in forwarded args")
-            except Exception as e:
-                _write_log(root, f"NEW MODE post-fix exception: {e!r}")
         return rc
     except Exception as e:
         _write_log(root, f"EXCEPTION while running subprocess: {e!r}")
@@ -480,6 +465,54 @@ def _parse_output_from_forward_args(forward: List[str]) -> Optional[str]:
 def _looks_video_path(p: Path) -> bool:
     return p.suffix.lower() in {".mp4", ".mov", ".mkv", ".webm", ".avi", ".m4v", ".mpg", ".mpeg", ".wmv"}
 
+def _normalize_forward_args(forward: List[str]) -> List[str]:
+    """Normalize FrameVision shorthand values to inference_cli.py choices.
+
+    SeedVR2 CLI expects:
+      sdpa | flash_attn_2 | flash_attn_3 | sageattn_2 | sageattn_3
+
+    Some callers/settings may pass shorthand like "flash_attn" or "sage".
+    We map those here to avoid CLI choice errors.
+    """
+    if not forward:
+        return forward
+    out = list(forward)
+    mapping = {
+        'flash_attn': 'flash_attn_2',
+        'flash': 'flash_attn_2',
+        'flash2': 'flash_attn_2',
+        'flash_attn2': 'flash_attn_2',
+        'flash_attn_2': 'flash_attn_2',
+        'flash3': 'flash_attn_3',
+        'flash_attn3': 'flash_attn_3',
+        'flash_attn_3': 'flash_attn_3',
+        'sage': 'sageattn_2',
+        'sageattn': 'sageattn_2',
+        'sage2': 'sageattn_2',
+        'sage_attn': 'sageattn_2',
+        'sageattn_2': 'sageattn_2',
+        'sage3': 'sageattn_3',
+        'sageattn_3': 'sageattn_3',
+    }
+    i = 0
+    while i < len(out):
+        tok = out[i]
+        if tok == '--attention_mode' and i + 1 < len(out):
+            raw = str(out[i + 1]).strip()
+            key = raw.lower()
+            norm = mapping.get(key)
+            if norm and norm != raw:
+                out[i + 1] = norm
+        elif tok.startswith('--attention_mode='):
+            raw = tok.split('=', 1)[1].strip()
+            key = raw.lower()
+            norm = mapping.get(key)
+            if norm and norm != raw:
+                out[i] = f'--attention_mode={norm}'
+        i += 1
+    return out
+
+
 def _new_mode(args: argparse.Namespace) -> int:
     root = Path(args.work_root).resolve()
     _write_log(root, f"MODE: new; py={sys.executable}; cwd={os.getcwd()} [PATCH active newmode-postfix-v2]")
@@ -494,7 +527,12 @@ def _new_mode(args: argparse.Namespace) -> int:
         return 2
 
     # Remaining args after '--' are forwarded to inference_cli.py (except output which may be present there)
-    forward = list(args.forward_args or [])
+    forward = _normalize_forward_args(list(args.forward_args or []))
+    try:
+        _write_log(root, "Forward args (normalized): " + " ".join(forward))
+    except Exception:
+        pass
+
     # Ensure input is first positional for inference_cli.py
     cmd = _ensure_utf8_flag([sys.executable, str(cli), str(args.input)] + forward)
 

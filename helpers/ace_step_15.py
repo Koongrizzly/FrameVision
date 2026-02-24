@@ -1358,6 +1358,10 @@ class MainWindow(QtWidgets.QMainWindow):
             self.cmb_main_model.currentIndexChanged.connect(self._update_shift_ui)
         except Exception:
             pass
+        try:
+            self.cmb_main_model.currentIndexChanged.connect(self._on_main_model_changed)
+        except Exception:
+            pass
         form.addRow("Main model", self._row(self.cmb_main_model, self.btn_refresh_main))
 
         self.cmb_lm_model = QtWidgets.QComboBox()
@@ -2364,6 +2368,15 @@ class MainWindow(QtWidgets.QMainWindow):
         except Exception:
             pass
 
+        # Re-apply model-based default steps after preset apply.
+        # Presets may contain a saved steps value, but if the preset also changes
+        # the main model (Base/SFT/Turbo), we want the UI to reflect the current
+        # model recommendation exactly like manual model selection does.
+        try:
+            self._on_main_model_changed()
+        except Exception:
+            pass
+
         # Optional: persist after apply
         try:
             self._save_settings()
@@ -2458,6 +2471,32 @@ class MainWindow(QtWidgets.QMainWindow):
                "Hands up, hands up, feel the drive\n")
         self.ed_lyrics.setPlainText(txt)
 
+
+    def _ace15_main_model_default_steps(self, main_sel: str) -> int:
+        """Return recommended inference steps for selected main model.
+
+        Turbo variants default to 8 steps. Base/SFT variants default to 50 steps.
+        Unknown/auto keeps the current user value unchanged (returns 0 sentinel).
+        """
+        s = (main_sel or "").strip().lower()
+        if not s:
+            return 0
+        if "turbo" in s:
+            return 8
+        if "base" in s or "sft" in s:
+            return 50
+        return 0
+
+    def _on_main_model_changed(self, *_args):
+        try:
+            if not hasattr(self, 'cmb_main_model') or not hasattr(self, 'spin_steps'):
+                return
+            main_sel = str(self.cmb_main_model.currentData() or "").strip()
+            recommended = self._ace15_main_model_default_steps(main_sel)
+            if recommended > 0:
+                self.spin_steps.setValue(recommended)
+        except Exception:
+            pass
 
     def _refresh_main_models(self):
         """Populate the main model dropdown (Base/Turbo) based on what’s available (and what can be downloaded)."""
@@ -2644,6 +2683,10 @@ class MainWindow(QtWidgets.QMainWindow):
             "caption": caption,
             "duration": float(self.spin_duration.value()),
             "batch_size": int(self.spin_batch.value()),
+            # Compatibility aliases: different ACE-Step builds may read different keys.
+            "num_outputs": int(self.spin_batch.value()),
+            "output_count": int(self.spin_batch.value()),
+            "num_samples": int(self.spin_batch.value()),
 
             # We always pass an explicit seed value.
             # If the UI Random toggle is enabled, we generate a new seed per run
