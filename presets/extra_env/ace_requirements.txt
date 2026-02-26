@@ -1,5 +1,0 @@
-PySide6
-fastapi
-uvicorn[standard]
-requests
-soundfile
