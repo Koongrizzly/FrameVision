@@ -1633,7 +1633,7 @@
           "infer_method": "auto",
           "steps": 8,
           "main_model": "acestep-v15-sft",
-          "lm_model": "acestep-5Hz-lm-4B",
+          "lm_model": "acestep-5HZ-lm-1.7B",
           "lm_negative_prompt": "pop ballad, acoustic folk, reggae skank, bright major chords",
           "timesignature": "4",
           "keyscale": "D minor",
@@ -1642,7 +1642,7 @@
           "use_cot_language": true,
           "use_cot_metas": true,
           "main_model_path": "acestep-v15-sft",
-          "lm_model_path": "acestep-5Hz-lm-4B"
+          "lm_model_path": "acestep-5HZ-lm-1.7B"
         },
         "Riddim (Minimal, hypnotic)": {
           "caption": "A stripped, hypnotic riddim track at ~140 BPM with a hard, simple drum pocket: weighty kick, thick snare, and minimal hats that leave room for the bass rhythm to speak. The signature is the repetitive, syncopated bass “chop”—short, percussive stabs with tight gating, small pitch steps, and subtle filter movement that creates a bouncy, trance-like loop. Sound design is clean but heavy: square-wave grit, resonant low-mids, and occasional laser zaps or “yoink” fills for emphasis. The drop stays focused and relentless, using micro-variations, switch-ups, and small fills rather than big melodic changes—pure dancefloor hypnosis.",
@@ -1665,7 +1665,7 @@
           "infer_method": "auto",
           "steps": 8,
           "main_model": "acestep-v15-sft",
-          "lm_model": "acestep-5Hz-lm-4B",
+          "lm_model": "acestep-5HZ-lm-1.7B",
           "lm_negative_prompt": "pop ballad, acoustic folk, reggae skank, bright major chords",
           "timesignature": "4",
           "keyscale": "D minor",
@@ -1674,7 +1674,7 @@
           "use_cot_language": true,
           "use_cot_metas": true,
           "main_model_path": "acestep-v15-sft",
-          "lm_model_path": "acestep-5Hz-lm-4B"
+          "lm_model_path": "acestep-5HZ-lm-1.7B"
         },
         "Tearout / Heavy Dubstep": {
           "caption": "A savage tearout-style dubstep track at ~140 BPM built for maximum aggression and movement. Drums are huge and relentless: thick kick, smashing snare, and rapid hat patterns with sharp fills that constantly push forward. The drop is a wall of violent bass modulation—screeching FM leads, distorted reese layers, metallic grinders, and pitch dives that feel like machinery tearing apart. Frequent switch-ups keep it unpredictable: quick bar-to-bar bass changes, stop-start silences, and impact hits that reset the energy before slamming back in. The mix is intentionally mean: saturated midrange, clipped transients, and massive sub hits—pure “crowd goes feral” pressure.",
@@ -1697,7 +1697,7 @@
           "infer_method": "auto",
           "steps": 8,
           "main_model": "acestep-v15-sft",
-          "lm_model": "acestep-5Hz-lm-4B",
+          "lm_model": "acestep-5HZ-lm-1.7B",
           "lm_negative_prompt": "",
           "timesignature": "4",
           "keyscale": "D minor",
@@ -1706,7 +1706,7 @@
           "use_cot_language": true,
           "use_cot_metas": true,
           "main_model_path": "acestep-v15-sft",
-          "lm_model_path": "acestep-5Hz-lm-4B"
+          "lm_model_path": "acestep-5HZ-lm-1.7B"
         },
         "Drumstep/Dnb Step": {
           "caption": "A high-energy drumstep / DnB–dubstep hybrid track built around ~170–175 BPM with a half-time drop feel and DnB momentum in the tops. Drums hit hard: a tight, punchy kick, a heavy snare on the 3 for the drop sections, and fast 16th-note hats and rolling percussion to keep it driving like drum & bass. The bass is aggressive but controlled—layered reese pressure, gritty FM growls, and short wobble stabs that lock to the snare hits, with a deep sub underpinning everything. Builds use snare rolls, pitch risers, and quick fills, then slam into drops with call-and-response bass phrases, quick mutes, and impact hits. Breakdowns bring back atmospheric pads and melodic fragments before ramping into a second drop that switches patterns (more DnB-style drum rolls or a faster “two-step” variation) for a final peak.",
@@ -1729,7 +1729,7 @@
           "infer_method": "auto",
           "steps": 8,
           "main_model": "acestep-v15-sft",
-          "lm_model": "acestep-5Hz-lm-4B",
+          "lm_model": "acestep-5HZ-lm-1.7B",
           "lm_negative_prompt": "pop ballad, acoustic folk, reggae skank, bright major chords",
           "timesignature": "4",
           "keyscale": "D minor",
@@ -1738,7 +1738,7 @@
           "use_cot_language": true,
           "use_cot_metas": true,
           "main_model_path": "acestep-v15-sft",
-          "lm_model_path": "acestep-5Hz-lm-4B"
+          "lm_model_path": "acestep-5HZ-lm-1.7B"
         }
       }
     }
