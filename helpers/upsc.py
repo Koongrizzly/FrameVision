@@ -44,7 +44,55 @@ if os.name == "nt":
     SEEDVR2_ENV_PY = ROOT / "environments" / ".seedvr2" / "Scripts" / "python.exe"
 else:
     SEEDVR2_ENV_PY = ROOT / "environments" / ".seedvr2" / "bin" / "python"
-SEEDVR2_RUNNER = Path(__file__).resolve().with_name("seedvr2_runner.py")
+def _seedvr2_runner_path() -> Optional[Path]:
+    """Best-effort locate helpers/seedvr2_runner.py across dev + frozen layouts.
+
+    Why: when packaged (e.g. PyInstaller), this module may live under _internal/ or
+    a temp extraction folder, so Path(__file__).parent is not the on-disk helpers/.
+    """
+    candidates: List[Path] = []
+
+    try:
+        # 1) Next to this file (dev / non-frozen)
+        candidates.append(Path(__file__).resolve().with_name("seedvr2_runner.py"))
+    except Exception:
+        pass
+
+    try:
+        # 2) Portable layout: <ROOT>/helpers/seedvr2_runner.py
+        candidates.append((ROOT / "helpers" / "seedvr2_runner.py").resolve())
+    except Exception:
+        pass
+
+    try:
+        # 3) Frozen EXE layout: <exe_dir>/helpers/seedvr2_runner.py
+        if getattr(sys, "frozen", False) and getattr(sys, "executable", None):
+            candidates.append((Path(sys.executable).resolve().parent / "helpers" / "seedvr2_runner.py"))
+    except Exception:
+        pass
+
+    try:
+        # 4) PyInstaller extraction dir (if used)
+        meipass = getattr(sys, "_MEIPASS", None)
+        if meipass:
+            candidates.append(Path(meipass) / "helpers" / "seedvr2_runner.py")
+    except Exception:
+        pass
+
+    try:
+        # 5) Current working dir fallback
+        candidates.append(Path.cwd() / "helpers" / "seedvr2_runner.py")
+    except Exception:
+        pass
+
+    for p in candidates:
+        try:
+            if p and p.exists():
+                return p
+        except Exception:
+            pass
+    return None
+
 
 def scan_seedvr2_gguf() -> List[str]:
     """Return GGUF filenames found under models/SEEDVR2 (recursively)."""
@@ -1662,6 +1710,13 @@ class UpscPane(QtWidgets.QWidget):
                 pass
 
     def _update_seedvr2_warnings(self):
+        # Apply resolution-based presets for SeedVR2 advanced settings.
+        # 720p: faster/lighter defaults.
+        # 1080p+ (1080/1440/2160 etc): enable tiled VAE decode + heavier defaults.
+        try:
+            self._apply_seedvr2_resolution_preset()
+        except Exception:
+            pass
         try:
             res = (self.combo_seedvr2_res.currentText() or "").strip()
             self.lbl_seedvr2_2160_warn.setVisible(res == "2160")
@@ -1672,6 +1727,54 @@ class UpscPane(QtWidgets.QWidget):
             self.lbl_seedvr2_attn_warn.setVisible(am in ("xformers", "flash_attn"))
         except Exception:
             pass
+
+    def _apply_seedvr2_resolution_preset(self):
+        """Auto-tune SeedVR2 advanced settings based on target resolution.
+
+        Rules:
+        - 720p: VAE decode tiled OFF, batch=4, chunk=40
+        - 1080p or higher: VAE decode tiled ON, batch=8, chunk=80,
+          decode tile size=1024, decode overlap=64
+        """
+        try:
+            res_txt = (self.combo_seedvr2_res.currentText() or "").strip()
+            res = int(res_txt) if res_txt.isdigit() else 0
+        except Exception:
+            res = 0
+
+        # Guard: if widgets don't exist yet
+        if not all(hasattr(self, a) for a in (
+            "chk_seedvr2_vae_dec",
+            "spin_seedvr2_batch",
+            "spin_seedvr2_chunk",
+            "spin_seedvr2_dec_tile",
+            "spin_seedvr2_dec_ov",
+        )):
+            return
+
+        def _set(widget, fn, value):
+            try:
+                widget.blockSignals(True)
+            except Exception:
+                pass
+            try:
+                fn(value)
+            finally:
+                try:
+                    widget.blockSignals(False)
+                except Exception:
+                    pass
+
+        if res >= 1080:
+            _set(self.chk_seedvr2_vae_dec, self.chk_seedvr2_vae_dec.setChecked, True)
+            _set(self.spin_seedvr2_batch, self.spin_seedvr2_batch.setValue, 8)
+            _set(self.spin_seedvr2_chunk, self.spin_seedvr2_chunk.setValue, 80)
+            _set(self.spin_seedvr2_dec_tile, self.spin_seedvr2_dec_tile.setValue, 1024)
+            _set(self.spin_seedvr2_dec_ov, self.spin_seedvr2_dec_ov.setValue, 64)
+        elif res == 720:
+            _set(self.chk_seedvr2_vae_dec, self.chk_seedvr2_vae_dec.setChecked, False)
+            _set(self.spin_seedvr2_batch, self.spin_seedvr2_batch.setValue, 4)
+            _set(self.spin_seedvr2_chunk, self.spin_seedvr2_chunk.setValue, 40)
 
     def _update_seedvr2_mode(self, on: bool | None = None):
         try:
@@ -2204,8 +2307,9 @@ class UpscPane(QtWidgets.QWidget):
                     env.setdefault("PYTHONUTF8", "1")
                     env.setdefault("PYTHONIOENCODING", "utf-8")
 
-                    if SEEDVR2_RUNNER.exists():
-                        cmd = [str(SEEDVR2_ENV_PY), "-X", "utf8", str(SEEDVR2_RUNNER),
+                    runner = _seedvr2_runner_path()
+                    if runner:
+                        cmd = [str(SEEDVR2_ENV_PY), "-X", "utf8", str(runner),
                                "--cli", str(SEEDVR2_CLI),
                                "--input", str(src),
                                "--ffmpeg", str(FFMPEG),
@@ -2219,6 +2323,7 @@ class UpscPane(QtWidgets.QWidget):
                     self._append_log("Engine: SeedVR2")
                     self._append_log(f"Python: {SEEDVR2_ENV_PY}")
                     self._append_log(f"CLI: {SEEDVR2_CLI}")
+                    self._append_log(f"Runner: {runner if runner else '(missing — using CLI directly)'}")
                     self._append_log(f"Model dir: {SEEDVR2_MODELS_DIR}")
                     self._append_log(f"GGUF: {gguf_path.name}")
                     self._append_log(f"Upscale to: {res}")
