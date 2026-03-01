@@ -5,7 +5,7 @@ ACE-Step 1.5 one-click installer for FrameVision (Windows).
 
 BAT does one thing: runs this file.
 This script auto-detects FrameVisionRoot based on its own location:
-  FrameVisionRoot\presets\extra_env\ace_step_15_installer.py
+  FrameVisionRoot\presets\extra_env\ace_15_with_flash_install.py
 
 It then installs (portable/offline runtime expectations):
 - venv:    FrameVisionRoot\environments\.ace_15
@@ -23,8 +23,10 @@ from __future__ import annotations
 import os, sys, subprocess, shutil, textwrap, argparse, zipfile, urllib.request, re
 from pathlib import Path
 
-TORCH_INDEX_CU129 = "https://download.pytorch.org/whl/cu129"
-TORCH_PIN = "2.8.0"
+TORCH_INDEX_CU128 = "https://download.pytorch.org/whl/cu128"
+TORCH_PIN = "2.9.0"
+
+FLASH_ATTN_WHEEL_URL = "https://github.com/mjun0812/flash-attention-prebuild-wheels/releases/download/v0.7.13/flash_attn-2.8.3%2Bcu128torch2.9-cp311-cp311-win_amd64.whl"
 NANO_VLLM_GIT_URL = "https://github.com/GeeeekExplorer/nano-vllm.git"
 NANO_VLLM_ZIP_URL = "https://github.com/GeeeekExplorer/nano-vllm/archive/refs/heads/main.zip"
 
@@ -109,7 +111,7 @@ def patch_ace_pyproject_windows_compat(repo_dir: Path) -> None:
     - Remove nano-vllm dependency (pulls official triton>=3 and other deps that break pip on Windows).
     - Remove gradio / fastapi (not required for FrameVision headless subprocess runner).
     - Remove strict torch pin like 'torch==2.7.1+cu128; sys_platform == "win32"' so it won't fight our pinned Torch.
-    We install our Torch stack explicitly (cu129) before installing ACE-Step.
+    We install our Torch stack explicitly (cu128) before installing ACE-Step.
     """
     pyproject = repo_dir / "pyproject.toml"
     if not pyproject.exists():
@@ -237,7 +239,7 @@ def main() -> int:
     if not (root / "models").exists():
         log("[ERROR] Root detection failed (missing 'models' folder).")
         log("Make sure this installer is located at:")
-        log(r"  <FrameVisionRoot>\presets\extra_env\ace_step_15_installer.py")
+        log(r"  <FrameVisionRoot>\presets\extra_env\ace_15_with_flash_install.py")
         return 2
 
     env = portable_cache_env(root)
@@ -282,20 +284,20 @@ def main() -> int:
         run(vpip + ["uninstall", "-y", "torch", "torchvision", "torchaudio"], env=env)
     except Exception:
         pass
-    # Install pinned torch stack from CUDA 12.9 index
-    run(vpip + ["install", f"torch=={TORCH_PIN}", "torchvision", "torchaudio", "--index-url", TORCH_INDEX_CU129], env=env)
+    # Install pinned torch stack from CUDA 12.8 index
+    run(vpip + ["install", f"torch=={TORCH_PIN}", "torchvision", "torchaudio", "--index-url", TORCH_INDEX_CU128], env=env)
     # Extra deps commonly needed by Triton/nano-vllm stacks
     run(vpip + ["install", "torchsde"], env=env)
     run(vpip + ["install", f"triton-windows<3.5"], env=env)
 
     log("[STEP] Installing ACE-Step (pip, editable)...")
     try:
-        run(vpip + ["install", "--extra-index-url", TORCH_INDEX_CU129, "-e", "."], cwd=repo_dir, env=env)
+        run(vpip + ["install", "--extra-index-url", TORCH_INDEX_CU128, "-e", "."], cwd=repo_dir, env=env)
     except Exception:
         log("[WARN] Editable install failed. Trying to install torch CUDA stack first, then retry...")
         # best-effort torch install (cu128 index)
-        run(vpip + ["install", "--index-url", TORCH_INDEX_CU129, "torch", "torchvision", "torchaudio"], env=env)
-        run(vpip + ["install", "--extra-index-url", TORCH_INDEX_CU129, "-e", "."], cwd=repo_dir, env=env)
+        run(vpip + ["install", "--index-url", TORCH_INDEX_CU128, "torch", "torchvision", "torchaudio"], env=env)
+        run(vpip + ["install", "--extra-index-url", TORCH_INDEX_CU128, "-e", "."], cwd=repo_dir, env=env)
 
     # 4b) Stabilize Diffusers/TorchAO on Windows.
     # Recent Diffusers releases introduced a TorchAO quantizer import path that can crash at import-time
@@ -337,6 +339,11 @@ def main() -> int:
     # 6) headless verify
     log("[STEP] Headless verification (no Gradio)...")
     verify(root, vpy, env)
+
+    # 7) Optional speed-up extension (installed last, after env + core deps + ACE + models + verify)
+    if sys.platform.startswith("win"):
+        log("[STEP] Installing FlashAttention wheel (Windows, cu128/torch2.9, installed last)...")
+        run(vpip + ["install", FLASH_ATTN_WHEEL_URL], env=env)
 
     log("\n[OK] ACE-Step 1.5 install complete.")
     return 0
