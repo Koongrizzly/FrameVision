@@ -1,9 +1,0 @@
-{
-  "engine": "SeedVR2",
-  "format": "GGUF",
-  "quant": "Q6",
-  "models_dir": "C:/FrameVision-main/models/SEEDVR2",
-  "env_dir": "C:/FrameVision-main/environments/.seedvr2",
-  "src_dir": "C:/FrameVision-main/presets/extra_env/seedvr2_src",
-  "note": "Created by seedvr2_gguf_installer.py"
-}
