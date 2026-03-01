@@ -94,11 +94,28 @@ def probe_media_all(path: Path):
         info["kind"] = "video"
         w = v_stream.get("width"); h = v_stream.get("height")
         fps = _fps_from(v_stream.get("avg_frame_rate") or v_stream.get("r_frame_rate"))
+        # Total frames (best-effort): prefer ffprobe's nb_frames when available.
+        frames = None
+        try:
+            nf = v_stream.get("nb_frames")
+            if nf is None:
+                nf = v_stream.get("nb_read_frames")
+            if nf is not None and str(nf).strip() != "N/A":
+                frames = int(str(nf).strip())
+        except Exception:
+            frames = None
+        if frames is None:
+            try:
+                if info.get("duration") and fps:
+                    frames = int(round(float(info["duration"]) * float(fps)))
+            except Exception:
+                frames = None
         info["video"] = {
             "codec": v_stream.get("codec_name"),
             "width": w,
             "height": h,
             "fps": fps,
+            "frames": frames,
             "pix_fmt": v_stream.get("pix_fmt"),
             "profile": v_stream.get("profile"),
         }
@@ -164,11 +181,13 @@ def build_info_text(info: dict) -> str:
         res = (f"{v.get('width','?')}x{v.get('height','?')}" if (v.get('width') and v.get('height')) else '—')
         fps = v.get('fps')
         lines.append(f"Video      : {v.get('codec','—')} | {res} | {(str(fps)+' fps') if fps else 'fps —'}")
+        fr = v.get('frames')
+        if fr is not None:
+            lines.append(f"Frames     : {fr}")
     a = info.get("audio") or {}
     if a:
         sr = a.get('sample_rate_hz'); ch = a.get('channels')
         br = a.get('bit_rate_kbps')
-        lines.append(f"Audio      : {a.get('codec','—')} | {int(sr) if sr else '—'} Hz | {ch if ch else '—'} ch | {br if br else '—'} kbps")
         lines.append(f"Audio      : {a.get('codec','—')} | {int(sr) if sr else '—'} Hz | {ch if ch else '—'} ch | {br if br else '—'} kbps")
     tags = info.get("tags") or {}
     if tags:

@@ -245,11 +245,49 @@ def _repair_video_output(root: Path, src: Path, out_path: Path, ffmpeg_path: Opt
         if not (need_duration_fix or need_fps_fix):
             cmd += ["-c:v", "copy"]
 
-        if src_meta.get("has_audio"):
-            cmd += ["-c:a", "copy", "-shortest"]
-        cmd += [str(tmp)]
+        # Audio mux: try stream copy first; if that fails, fall back to a safe re-encode
+        # (needed when source audio codec isn't compatible with the chosen container, e.g. Opus -> MP4).
+        audio_present = bool(src_meta.get("has_audio"))
+        if audio_present:
+            # Decide a sensible fallback codec based on target container
+            ext = out_path.suffix.lower()
+            fallback_a = None
+            if ext in {".mp4", ".m4v", ".mov"}:
+                fallback_a = ["-c:a", "aac", "-b:a", "192k"]
+            elif ext in {".webm"}:
+                fallback_a = ["-c:a", "libopus", "-b:a", "160k"]
+            else:
+                # MKV/AVI etc. usually allow many codecs, but still provide a fallback.
+                fallback_a = ["-c:a", "aac", "-b:a", "192k"]
 
-        rc = _run_cmd_env(cmd, cwd=root, root=root)
+            # Attempt 1: copy audio
+            cmd1 = list(cmd) + ["-c:a", "copy", "-shortest", str(tmp)]
+            _write_log(root, "Post-fix audio mux attempt 1: -c:a copy")
+            try:
+                print("[seedvr2_runner] post-fix: mux audio (copy)", flush=True)
+            except Exception:
+                pass
+            rc = _run_cmd_env(cmd1, cwd=root, root=root)
+
+            # If copy failed, attempt 2: re-encode audio
+            if rc != 0 or not tmp.exists() or tmp.stat().st_size <= 0:
+                try:
+                    if tmp.exists():
+                        tmp.unlink()
+                except Exception:
+                    pass
+                cmd2 = list(cmd) + (fallback_a or []) + ["-shortest", str(tmp)]
+                _write_log(root, "Post-fix audio mux attempt 2: re-encode audio")
+                try:
+                    print("[seedvr2_runner] post-fix: mux audio (re-encode)", flush=True)
+                except Exception:
+                    pass
+                rc = _run_cmd_env(cmd2, cwd=root, root=root)
+        else:
+            # No audio to bring over; just finalize the container (video copy or retime re-encode chosen above).
+            cmd1 = list(cmd) + [str(tmp)]
+            rc = _run_cmd_env(cmd1, cwd=root, root=root)
+
         if rc != 0 or not tmp.exists() or tmp.stat().st_size <= 0:
             _write_log(root, f"Post-fix failed rc={rc}; keeping original output")
             try:
@@ -574,7 +612,36 @@ def _new_mode(args: argparse.Namespace) -> int:
         if out_lines:
             _write_log(root, "STDOUT/ERR:\n" + "\n".join(out_lines))
         _write_log(root, f"EXIT: {p.returncode}")
-        return int(p.returncode or 0)
+
+        rc = int(p.returncode or 0)
+        if rc == 0:
+            try:
+                out_path_str = _parse_output_from_forward_args(forward)
+                if out_path_str:
+                    out_p = Path(out_path_str)
+                    if not out_p.is_absolute():
+                        out_p = (Path.cwd() / out_p).resolve()
+                    else:
+                        out_p = out_p.resolve()
+                    _write_log(root, f"POSTFIX new-mode repair candidate: {out_p}")
+                    try:
+                        print(f"[seedvr2_runner] post-fix: attempting to add audio/repair timing -> {out_p}", flush=True)
+                    except Exception:
+                        pass
+                    _repair_video_output(root, Path(args.input), out_p, args.ffmpeg, args.ffprobe)
+                else:
+                    _write_log(root, "POSTFIX new-mode repair skipped: no --output in forwarded args")
+                    try:
+                        print("[seedvr2_runner] post-fix skipped (no --output in args)", flush=True)
+                    except Exception:
+                        pass
+            except Exception as e:
+                _write_log(root, f"POSTFIX new-mode repair error: {e!r}")
+                try:
+                    print(f"[seedvr2_runner] post-fix error: {e!r}", flush=True)
+                except Exception:
+                    pass
+        return rc
     except Exception as e:
         _write_log(root, f"EXCEPTION while running subprocess: {e!r}")
         return 1

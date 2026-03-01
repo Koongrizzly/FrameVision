@@ -11867,6 +11867,15 @@ class PipelineWorker(QThread):
                 if nofx:
                     transition_mode = 1
                 clip_order_mode = int(settings.get('combo_clip_order', 2) or 2)
+                # Planner override: sequential/shuffle toggle (only shown for external presets)
+                try:
+                    _oc = str((self.job.encoding or {}).get('videoclip_creator_clip_order') or '').strip().lower()
+                except Exception:
+                    _oc = ''
+                if _oc.startswith('shuff'):
+                    clip_order_mode = 2  # shuffle
+                else:
+                    clip_order_mode = 1  # sequential
                 force_full_length = bool(settings.get('check_full_length', False))
                 seed_enabled = bool(settings.get('check_use_seed', False))
                 seed_value = int(settings.get('spin_seed', 0) or 0)
@@ -12809,6 +12818,14 @@ class PipelineWorker(QThread):
                         "--color_correction", str(color_corr),
                         "--attention_mode", str(attn_mode),
                     ]
+                    try:
+                        vae_dec = 1 if int(settings.get("seedvr2_vae_decode_tiled", 1) or 0) else 0
+                    except Exception:
+                        vae_dec = 1
+                    if int(vae_dec) != 0:
+                        # Use sane defaults matching the original upscaler (upsc.py): tile_size=1024, overlap=64
+                        cmd += ["--vae_decode_tiled", "--vae_decode_tile_size", "1024", "--vae_decode_tile_overlap", "64"]
+
 
                     self._tick("[upscale] SeedVR2 upscaling…", self._last_pct, 0.02)
                     cp = subprocess.run(
@@ -15246,6 +15263,21 @@ If the planner sees a marker like [02] or (02), it becomes the next image prompt
 
         grid.addWidget(self.cmb_videoclip_preset, 3, 1)
 
+        # External Videoclip Creator: clip order (only visible for JSON presets)
+        self.lbl_videoclip_clip_order = QLabel("Clip order")
+        self.cmb_videoclip_clip_order = QComboBox()
+        self.cmb_videoclip_clip_order.addItems(["Sequential (default)", "Shuffle"])
+        try:
+            self.cmb_videoclip_clip_order.setToolTip("Only used for external Videoclip Creator presets.")
+        except Exception:
+            pass
+        try:
+            self.cmb_videoclip_clip_order.currentIndexChanged.connect(self._on_videoclip_creator_clip_order_changed)
+        except Exception:
+            pass
+        grid.addWidget(self.lbl_videoclip_clip_order, 4, 0)
+        grid.addWidget(self.cmb_videoclip_clip_order, 4, 1)
+
         # Safeguard: Videoclip Creator presets are not compatible with Narration.
         self.lbl_videoclip_preset_hint = QLabel("Disable narration to have more presets")
         try:
@@ -15257,7 +15289,7 @@ If the planner sees a marker like [02] or (02), it becomes the next image prompt
             self.lbl_videoclip_preset_hint.setVisible(False)
         except Exception:
             pass
-        grid.addWidget(self.lbl_videoclip_preset_hint, 4, 0, 1, 2)
+        grid.addWidget(self.lbl_videoclip_preset_hint, 5, 0, 1, 2)
 
         lay.addLayout(grid)
 
@@ -15485,11 +15517,13 @@ If the planner sees a marker like [02] or (02), it becomes the next image prompt
 
         sg.addWidget(QLabel("Resolution"), 0, 0)
         self.cmb_seedvr2_resolution = QComboBox()
+        self.cmb_seedvr2_resolution.addItem("720p (6–10 GB VRAM typical)", 720)
         self.cmb_seedvr2_resolution.addItem("1080p (8–12 GB VRAM typical)", 1080)
         self.cmb_seedvr2_resolution.addItem("1440p (10–16 GB VRAM typical)", 1440)
         # default 1080p (1920 width)
         try:
-            self.cmb_seedvr2_resolution.setCurrentIndex(0)
+            # keep the default on 1080p
+            self.cmb_seedvr2_resolution.setCurrentIndex(1)
         except Exception:
             pass
         sg.addWidget(self.cmb_seedvr2_resolution, 0, 1)
@@ -15532,25 +15566,32 @@ If the planner sees a marker like [02] or (02), it becomes the next image prompt
         self.spin_seedvr2_chunk.setValue(20)
         adv.addWidget(self.spin_seedvr2_chunk, 1, 1)
 
-        adv.addWidget(QLabel("Color correction"), 2, 0)
+        # Helps lower VRAM cards by decoding the VAE in tiles (slower, but avoids OOM).
+        self.chk_seedvr2_vae_decode_tiled = QCheckBox("VAE decode tiled")
+        self.chk_seedvr2_vae_decode_tiled.setChecked(True)
+        self.chk_seedvr2_vae_decode_tiled.setToolTip("Decodes the VAE in smaller tiles. Can help avoid out-of-memory on lower VRAM GPUs, but may be slower.")
+        adv.addWidget(self.chk_seedvr2_vae_decode_tiled, 2, 0, 1, 2)
+
+
+        adv.addWidget(QLabel("Color correction"), 3, 0)
         self.cmb_seedvr2_color = QComboBox()
         for cc in ["lab", "wavelet", "wavelet_adaptive", "hsv", "adain", "none"]:
             self.cmb_seedvr2_color.addItem(cc)
         self.cmb_seedvr2_color.setCurrentText("lab")
-        adv.addWidget(self.cmb_seedvr2_color, 2, 1)
+        adv.addWidget(self.cmb_seedvr2_color, 3, 1)
 
-        adv.addWidget(QLabel("Attention"), 3, 0)
+        adv.addWidget(QLabel("Attention"), 4, 0)
         self.cmb_seedvr2_attention = QComboBox()
         for am in ["sdpa", "flash_attn_2", "flash_attn_3", "sageattn_2", "sageattn_3"]:
             self.cmb_seedvr2_attention.addItem(am)
         self.cmb_seedvr2_attention.setCurrentText("sdpa")
-        adv.addWidget(self.cmb_seedvr2_attention, 3, 1)
+        adv.addWidget(self.cmb_seedvr2_attention, 4, 1)
 
-        adv.addWidget(QLabel("DiT model"), 4, 0)
+        adv.addWidget(QLabel("DiT model"), 5, 0)
         self.cmb_seedvr2_dit = QComboBox()
         # Placeholder for later auto-selection / catalogs.
         self.cmb_seedvr2_dit.addItem("seedvr2_ema_3b-Q4_K_M.gguf")
-        adv.addWidget(self.cmb_seedvr2_dit, 4, 1)
+        adv.addWidget(self.cmb_seedvr2_dit, 5, 1)
 
         sg.addWidget(self.seedvr2_adv_widget, 4, 0, 1, 2)
         self.seedvr2_adv_widget.setVisible(False)
@@ -15700,10 +15741,16 @@ If the planner sees a marker like [02] or (02), it becomes the next image prompt
             except Exception:
                 res = 1080
 
-            # Based on user-reported speeds:
-            # - 1080p: ~37 min for 15 sec (~2.5 min per 1 sec video)
-            # - 1440p: ~30 min for 15 sec (~2.0 min per 1 sec video)
-            per_sec = 120.0 if res >= 1440 else 150.0
+            # Based on rough user-reported speeds (very approximate):
+            # - 720p : ~12 min for 15 sec
+            # - 1080p: ~25 min for 15 sec (~2.5 min per 1 sec video)
+            # - 1440p: ~35 min for 15 sec (~2.0 min per 1 sec video)
+            if res >= 1440:
+                per_sec = 150.0
+            elif res >= 1080:
+                per_sec = 120.0
+            else:
+                per_sec = 90.0
             min_per_sec = per_sec / 60.0
             min_per_min = per_sec * 60.0 / 60.0  # equals per_sec
             hrs_per_min = min_per_min / 60.0
@@ -15719,10 +15766,14 @@ If the planner sees a marker like [02] or (02), it becomes the next image prompt
                 pass
 
         try:
-            self.cmb_seedvr2_resolution.currentIndexChanged.connect(lambda _i: _persist_seedvr2())
+            self.cmb_seedvr2_resolution.currentIndexChanged.connect(self._on_seedvr2_resolution_changed)
             self.chk_seedvr2_temporal.toggled.connect(lambda _on: _persist_seedvr2())
             self.spin_seedvr2_batch.valueChanged.connect(lambda _v: _persist_seedvr2())
             self.spin_seedvr2_chunk.valueChanged.connect(lambda _v: _persist_seedvr2())
+            try:
+                self.chk_seedvr2_vae_decode_tiled.toggled.connect(lambda _on: _persist_seedvr2())
+            except Exception:
+                pass
             self.cmb_seedvr2_color.currentIndexChanged.connect(lambda _i: _persist_seedvr2())
             self.cmb_seedvr2_attention.currentIndexChanged.connect(lambda _i: _persist_seedvr2())
             self.cmb_seedvr2_dit.currentIndexChanged.connect(lambda _i: _persist_seedvr2())
@@ -15890,6 +15941,10 @@ If the planner sees a marker like [02] or (02), it becomes the next image prompt
                 payload["seedvr2_chunk_size"] = int(self.spin_seedvr2_chunk.value())
             except Exception:
                 payload["seedvr2_chunk_size"] = 20
+            try:
+                payload["seedvr2_vae_decode_tiled"] = 1 if bool(self.chk_seedvr2_vae_decode_tiled.isChecked()) else 0
+            except Exception:
+                payload["seedvr2_vae_decode_tiled"] = 1
             try:
                 payload["seedvr2_color_correction"] = str(self.cmb_seedvr2_color.currentText() or "lab")
             except Exception:
@@ -16110,6 +16165,11 @@ If the planner sees a marker like [02] or (02), it becomes the next image prompt
             except Exception:
                 pass
             try:
+                if hasattr(self, "chk_seedvr2_vae_decode_tiled"):
+                    self.chk_seedvr2_vae_decode_tiled.setChecked(bool(int(obj.get("seedvr2_vae_decode_tiled", 1)) != 0))
+            except Exception:
+                pass
+            try:
                 self.cmb_seedvr2_color.setCurrentText(str(obj.get("seedvr2_color_correction", "lab")))
             except Exception:
                 pass
@@ -16121,6 +16181,77 @@ If the planner sees a marker like [02] or (02), it becomes the next image prompt
                 self.cmb_seedvr2_dit.setCurrentText(str(obj.get("seedvr2_dit_model", "seedvr2_ema_3b-Q4_K_M.gguf")))
             except Exception:
                 pass
+
+
+    
+    @Slot(int)
+    def _on_seedvr2_resolution_changed(self, _i: int = 0) -> None:
+        """Auto-tune SeedVR2 batch/chunk for the selected resolution.
+
+        Requirement:
+          - 720p: batch=2, chunk=40
+          - 1080p/1440p: batch=1, chunk=20
+        """
+        try:
+            res = int(self.cmb_seedvr2_resolution.currentData() or 1080)
+        except Exception:
+            res = 1080
+
+        try:
+            if res <= 720:
+                if hasattr(self, "spin_seedvr2_batch"):
+                    self.spin_seedvr2_batch.blockSignals(True)
+                    self.spin_seedvr2_batch.setValue(2)
+                    self.spin_seedvr2_batch.blockSignals(False)
+                if hasattr(self, "spin_seedvr2_chunk"):
+                    self.spin_seedvr2_chunk.blockSignals(True)
+                    self.spin_seedvr2_chunk.setValue(40)
+                    self.spin_seedvr2_chunk.blockSignals(False)
+            else:
+                if hasattr(self, "spin_seedvr2_batch"):
+                    self.spin_seedvr2_batch.blockSignals(True)
+                    self.spin_seedvr2_batch.setValue(1)
+                    self.spin_seedvr2_batch.blockSignals(False)
+                if hasattr(self, "spin_seedvr2_chunk"):
+                    self.spin_seedvr2_chunk.blockSignals(True)
+                    self.spin_seedvr2_chunk.setValue(20)
+                    self.spin_seedvr2_chunk.blockSignals(False)
+        except Exception:
+            pass
+
+        # Update the estimate label (best-effort; heuristic)
+        try:
+            if hasattr(self, "lbl_seedvr2_estimate"):
+                if res >= 1440:
+                    per_sec = 150.0
+                elif res >= 1080:
+                    per_sec = 120.0
+                else:
+                    per_sec = 90.0
+                min_per_sec = per_sec / 60.0
+                min_per_min = per_sec
+                hrs_per_min = min_per_min / 60.0
+                txt = (
+                    f"Estimate (very rough): ~{min_per_sec:.1f} min render per 1s video "
+                    f"(~{int(per_sec)}× realtime). 1 min ≈ {int(min_per_min)} min (~{hrs_per_min:.1f} h). "
+                    f"Varies by GPU/settings."
+                )
+                self.lbl_seedvr2_estimate.setText(txt)
+        except Exception:
+            pass
+
+        # Persist + refresh summary
+        try:
+            proj = str(getattr(self, "_active_project_dir", "") or "")
+            if proj:
+                self._persist_upscale_settings_for_project(proj, force_write=True)
+        except Exception:
+            pass
+        try:
+            self._sync_settings_summary()
+        except Exception:
+            pass
+
 
     @Slot(bool)
     def _on_planner_upscale_toggled(self, on: bool) -> None:
@@ -17552,6 +17683,43 @@ If the planner sees a marker like [02] or (02), it becomes the next image prompt
         except Exception:
             pass
 
+        try:
+            self._sync_videoclip_creator_external_options_visibility()
+        except Exception:
+            pass
+
+    
+    def _on_videoclip_creator_clip_order_changed(self, _=None) -> None:
+        """Persist external Videoclip Creator clip order selection (sequential/shuffle)."""
+        try:
+            choice = self.cmb_videoclip_clip_order.currentText() if hasattr(self, "cmb_videoclip_clip_order") else ""
+        except Exception:
+            choice = ""
+        try:
+            s = _load_planner_settings()
+            s["videoclip_creator_clip_order"] = str(choice or "")
+            _save_planner_settings(s)
+        except Exception:
+            pass
+
+    def _sync_videoclip_creator_external_options_visibility(self) -> None:
+        """Show extra options only when an external Videoclip Creator preset is selected."""
+        try:
+            vp = self.cmb_videoclip_preset.currentText() if hasattr(self, "cmb_videoclip_preset") else ""
+        except Exception:
+            vp = ""
+        is_external = bool(vp) and (not str(vp).lower().startswith("storyline preset"))
+        try:
+            if hasattr(self, "lbl_videoclip_clip_order"):
+                self.lbl_videoclip_clip_order.setVisible(bool(is_external))
+        except Exception:
+            pass
+        try:
+            if hasattr(self, "cmb_videoclip_clip_order"):
+                self.cmb_videoclip_clip_order.setVisible(bool(is_external))
+        except Exception:
+            pass
+
     def _load_videoclip_preset_combo(self) -> None:
         """Step 2: Load Videoclip Creator one-click presets from JSON.
 
@@ -17635,6 +17803,33 @@ If the planner sees a marker like [02] or (02), it becomes the next image prompt
             self._sync_videoclip_creator_lock_for_narration()
         except Exception:
             pass
+
+    
+        # Restore persisted clip-order choice (sequential/shuffle)
+        try:
+            if hasattr(self, "cmb_videoclip_clip_order"):
+                s = _load_planner_settings()
+                want2 = str(s.get("videoclip_creator_clip_order") or "").strip()
+                if not want2:
+                    want2 = "Sequential (default)"
+                idx2 = self.cmb_videoclip_clip_order.findText(want2)
+                if idx2 >= 0:
+                    self.cmb_videoclip_clip_order.setCurrentIndex(idx2)
+                else:
+                    self.cmb_videoclip_clip_order.setCurrentIndex(0)
+        except Exception:
+            try:
+                if hasattr(self, "cmb_videoclip_clip_order"):
+                    self.cmb_videoclip_clip_order.setCurrentIndex(0)
+            except Exception:
+                pass
+
+        # Ensure external-only rows are correctly shown/hidden
+        try:
+            self._sync_videoclip_creator_external_options_visibility()
+        except Exception:
+            pass
+
 
     def _browse_out_dir(self) -> None:
         d = QFileDialog.getExistingDirectory(self, "Select Output Folder")
@@ -18315,6 +18510,7 @@ If the planner sees a marker like [02] or (02), it becomes the next image prompt
             "image_model": self.cmb_image_model.currentText(),
             "video_model": self.cmb_video_model.currentText(),
             "videoclip_preset": (self.cmb_videoclip_preset.currentText() if hasattr(self, "cmb_videoclip_preset") else "Storyline Preset (Hardcuts)"),
+            "videoclip_creator_clip_order": (self.cmb_videoclip_clip_order.currentText() if hasattr(self, "cmb_videoclip_clip_order") else "Sequential (default)"),
             "gen_quality_preset": (self.cmb_gen_quality.currentText() if hasattr(self, "cmb_gen_quality") else ""),
             "allow_edit_while_running": bool(getattr(self, "chk_allow_edit_while_running", None) and self.chk_allow_edit_while_running.isChecked()),
             "character_bible_enabled": bool(getattr(self, "chk_character_bible", None) and self.chk_character_bible.isChecked()),

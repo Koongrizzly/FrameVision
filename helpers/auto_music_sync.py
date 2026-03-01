@@ -317,6 +317,122 @@ def _ffprobe_resolution(ffprobe: str, path: str) -> Optional[Tuple[int, int]]:
         return None
     return None
 
+
+def _ffprobe_video_bitrate(ffprobe: str, path: str) -> Optional[int]:
+    """Return approximate *video* bitrate in bits/sec, or None.
+
+    Tries stream bit_rate, then format bit_rate minus audio, then size/duration estimate.
+    """
+    cmd = [
+        ffprobe,
+        "-v",
+        "error",
+        "-show_entries",
+        "format=duration,bit_rate,size:stream=index,codec_type,bit_rate",
+        "-of",
+        "json",
+        path,
+    ]
+    try:
+        raw = subprocess.check_output(cmd, stderr=subprocess.STDOUT, text=True)
+        data = json.loads(raw or "{}")
+    except Exception:
+        return None
+
+    streams = data.get("streams") or []
+    fmt = data.get("format") or {}
+
+    def _to_int(v) -> int:
+        try:
+            if v is None:
+                return 0
+            s = str(v).strip()
+            if not s or s.lower() in ("n/a", "nan"):
+                return 0
+            return int(float(s))
+        except Exception:
+            return 0
+
+    def _to_float(v) -> float:
+        try:
+            if v is None:
+                return 0.0
+            s = str(v).strip()
+            if not s or s.lower() in ("n/a", "nan"):
+                return 0.0
+            return float(s)
+        except Exception:
+            return 0.0
+
+    v_br = 0
+    a_br = 0
+    for st in streams:
+        ct = (st.get("codec_type") or "").lower()
+        if ct == "video" and v_br <= 0:
+            v_br = _to_int(st.get("bit_rate"))
+        elif ct == "audio" and a_br <= 0:
+            a_br = _to_int(st.get("bit_rate"))
+
+    if v_br > 0:
+        return v_br
+
+    fmt_br = _to_int(fmt.get("bit_rate"))
+    if fmt_br > 0:
+        if a_br > 0 and fmt_br > a_br:
+            return int(fmt_br - a_br)
+        return fmt_br
+
+    dur = _to_float(fmt.get("duration"))
+    size = _to_int(fmt.get("size"))
+    if dur > 0.01 and size > 0:
+        est_total = int((size * 8) / dur)
+        if a_br > 0 and est_total > a_br:
+            return int(est_total - a_br)
+        return est_total
+
+    return None
+
+
+def _ffprobe_fps_expr(ffprobe: str, path: str) -> Optional[str]:
+    """Return an ffmpeg-friendly FPS expression (e.g. '30000/1001') for v:0, or None."""
+    cmd = [
+        ffprobe,
+        "-v",
+        "error",
+        "-select_streams",
+        "v:0",
+        "-show_entries",
+        "stream=avg_frame_rate,r_frame_rate",
+        "-of",
+        "default=noprint_wrappers=1:nokey=0",
+        path,
+    ]
+    try:
+        out = subprocess.check_output(cmd, stderr=subprocess.STDOUT, text=True)
+    except Exception:
+        return None
+
+    avg = None
+    rfr = None
+    for line in out.splitlines():
+        line = line.strip()
+        if line.startswith("avg_frame_rate="):
+            avg = line.split("=", 1)[1].strip()
+        elif line.startswith("r_frame_rate="):
+            rfr = line.split("=", 1)[1].strip()
+
+    def _clean(expr: Optional[str]) -> Optional[str]:
+        if not expr:
+            return None
+        expr = expr.strip()
+        if expr in ("0/0", "0", "N/A", "nan"):
+            return None
+        return expr
+
+    avg = _clean(avg)
+    rfr = _clean(rfr)
+    return avg or rfr
+
 def _ensure_dir(path: str) -> None:
     os.makedirs(path, exist_ok=True)
 
@@ -601,9 +717,15 @@ class ClipPresetManagerDialog(QDialog):
         form.addRow("Description:", self.edit_desc)
         right.addLayout(form)
 
+        # capture + edit controls
+        row_caps = QHBoxLayout()
         self.btn_capture = QPushButton("Capture current Options + Advanced", self)
         self.btn_capture.setToolTip("Save current FX/transitions/effects settings into this preset.")
-        right.addWidget(self.btn_capture)
+        self.btn_edit = QPushButton("Edit", self)
+        self.btn_edit.setToolTip("Unlock Settings JSON for manual editing (advanced).")
+        row_caps.addWidget(self.btn_capture, 1)
+        row_caps.addWidget(self.btn_edit, 0)
+        right.addLayout(row_caps)
 
         right.addWidget(QLabel("Settings (FX-only):", self))
         self.text_settings = QTextEdit(self)
@@ -632,6 +754,7 @@ class ClipPresetManagerDialog(QDialog):
         self.btn_dup.clicked.connect(self._on_dup)
         self.btn_del.clicked.connect(self._on_del)
         self.btn_capture.clicked.connect(self._on_capture)
+        self.btn_edit.clicked.connect(self._on_toggle_edit)
         self.btn_save_item.clicked.connect(self._on_save_item)
         buttons.accepted.connect(self._on_save_all)
         buttons.rejected.connect(self.reject)
@@ -643,6 +766,30 @@ class ClipPresetManagerDialog(QDialog):
             pass
 
         self._refresh_list(select_first=True)
+
+    def _set_settings_editable(self, editable: bool) -> None:
+        try:
+            self.text_settings.setReadOnly(not editable)
+        except Exception:
+            pass
+        try:
+            self.btn_edit.setText("Lock" if editable else "Edit")
+            self.btn_edit.setToolTip(
+                "Lock Settings JSON (recommended)." if editable else "Unlock Settings JSON for manual editing (advanced)."
+            )
+        except Exception:
+            pass
+
+    def _on_toggle_edit(self) -> None:
+        try:
+            self._set_settings_editable(self.text_settings.isReadOnly())
+        except Exception:
+            # safest fallback
+            try:
+                self.text_settings.setReadOnly(False)
+                self.btn_edit.setText("Lock")
+            except Exception:
+                pass
 
     def _presets(self) -> list:
         items = self._data.get("presets")
@@ -677,6 +824,8 @@ class ClipPresetManagerDialog(QDialog):
         self.edit_desc.setText(str(item.get("description") or ""))
         settings = item.get("settings") if isinstance(item.get("settings"), dict) else {}
         self.text_settings.setPlainText(json.dumps(settings, ensure_ascii=False, indent=2))
+        # default to locked when switching presets
+        self._set_settings_editable(False)
 
     def _on_select(self, row: int) -> None:
         self._load_into_editor(row)
@@ -778,9 +927,35 @@ class ClipPresetManagerDialog(QDialog):
         presets = self._presets()
         if idx < 0 or idx >= len(presets):
             return
-        presets[idx]["id"] = self.edit_id.text().strip()
+
+        # validate id
+        new_id = self.edit_id.text().strip()
+        if not new_id:
+            self._message("Invalid preset", "Preset ID cannot be empty.", QMessageBox.Warning)
+            return
+
+        # prevent duplicate ids (except for the current row)
+        for j, p in enumerate(presets):
+            if j == idx:
+                continue
+            if str(p.get("id") or "").strip() == new_id:
+                self._message("Invalid preset", f"Preset ID '{new_id}' already exists.", QMessageBox.Warning)
+                return
+
+        # parse settings JSON (always, so edits actually persist)
+        raw = self.text_settings.toPlainText().strip() or "{}"
+        try:
+            parsed = json.loads(raw)
+            if not isinstance(parsed, dict):
+                raise ValueError("Settings must be a JSON object (dictionary).")
+        except Exception as e:
+            self._message("Invalid settings JSON", f"Could not parse Settings JSON:\n{e}", QMessageBox.Warning)
+            return
+
+        presets[idx]["id"] = new_id
         presets[idx]["name"] = self.edit_name.text().strip()
         presets[idx]["description"] = self.edit_desc.text().strip()
+        presets[idx]["settings"] = parsed
         self._refresh_list()
         self.list.setCurrentRow(idx)
 
@@ -1009,6 +1184,7 @@ def run_queue_payload(payload_path: str) -> int:
         transition_mode = int(payload.get("transition_mode") or 0)
         intro_fade = bool(payload.get("intro_fade", True))
         outro_fade = bool(payload.get("outro_fade", True))
+        keep_source_bitrate = bool(payload.get("keep_source_bitrate", False))
         use_visual_overlay = bool(payload.get("use_visual_overlay", False))
         visual_strategy = int(payload.get("visual_strategy") or 0)
         visual_section_overrides = payload.get("visual_section_overrides") or None
@@ -1043,6 +1219,7 @@ def run_queue_payload(payload_path: str) -> int:
         transition_mode=transition_mode,
         intro_fade=intro_fade,
         outro_fade=outro_fade,
+        keep_source_bitrate=keep_source_bitrate,
         use_visual_overlay=use_visual_overlay,
         visual_strategy=visual_strategy,
         visual_section_overrides=visual_section_overrides,
@@ -3170,6 +3347,7 @@ class RenderWorker(QThread):
         transition_mode: int,
         intro_fade: bool,
         outro_fade: bool,
+        keep_source_bitrate: bool = False,
         use_visual_overlay: bool = False,
         visual_strategy: int = 0,
         visual_section_overrides: Optional[Dict[str, Optional[str]]] = None,
@@ -3192,6 +3370,7 @@ class RenderWorker(QThread):
         self.transition_mode = transition_mode
         self.intro_fade = intro_fade
         self.outro_fade = outro_fade
+        self.keep_source_bitrate = bool(keep_source_bitrate)
         # When True, render a music-player visual track and overlay it.
         self.use_visual_overlay = bool(use_visual_overlay)
         # 0 = single visual, 1 = per segment, 2 = per section type
@@ -3234,6 +3413,100 @@ class RenderWorker(QThread):
 
         _ensure_dir(self.output_dir)
         tmpdir = tempfile.mkdtemp(prefix="fv_mclip_render_")
+        # If enabled, probe an approximate source bitrate so we can preserve quality.
+        # For multi-clip projects we take the max bitrate across a small sample of unique clips.
+        self._keep_bitrate_kbps = 0
+        if getattr(self, "keep_source_bitrate", False):
+            try:
+                seen = []
+                for seg in (self.segments or []):
+                    pth = getattr(seg, "clip_path", None)
+                    if not pth or not isinstance(pth, str):
+                        continue
+                    if getattr(seg, "is_image", False):
+                        continue
+                    if pth not in seen:
+                        seen.append(pth)
+                    if len(seen) >= 20:
+                        break
+
+                best_bps = 0
+                for pth in seen:
+                    br = _ffprobe_video_bitrate(self.ffprobe, pth)
+                    if br and br > best_bps:
+                        best_bps = int(br)
+
+                kbps = int(round(best_bps / 1000.0)) if best_bps > 0 else 0
+                # Clamp to a sensible range; ignore obviously wrong values.
+                if kbps < 250:
+                    kbps = 0
+                if kbps > 200000:
+                    kbps = 200000
+                self._keep_bitrate_kbps = kbps
+            except Exception:
+                self._keep_bitrate_kbps = 0
+
+
+        # Default render FPS is 30 for multi-clip projects (normalizes mixed sources).
+        # If the project is effectively a single-source video (one unique clip path),
+        # keep the source FPS to avoid forcing 30fps on export.
+        self._target_fps_expr = "30"
+        self._target_fps_float = 30.0
+        try:
+            uniq_paths = []
+            for seg in (self.segments or []):
+                pth = getattr(seg, "clip_path", None)
+                if not pth or not isinstance(pth, str):
+                    continue
+                if getattr(seg, "is_image", False):
+                    continue
+                if pth not in uniq_paths:
+                    uniq_paths.append(pth)
+                if len(uniq_paths) > 1:
+                    break
+
+            if len(uniq_paths) == 1:
+                fps_src = _ffprobe_fps_expr(self.ffprobe, uniq_paths[0])
+                if fps_src:
+                    self._target_fps_expr = str(fps_src)
+                    try:
+                        if "/" in fps_src:
+                            a, b = fps_src.split("/", 1)
+                            self._target_fps_float = float(a) / max(1.0, float(b))
+                        else:
+                            self._target_fps_float = float(fps_src)
+                    except Exception:
+                        self._target_fps_float = 30.0
+        except Exception:
+            pass
+
+        fps_expr = self._target_fps_expr
+        fps_float = float(getattr(self, "_target_fps_float", 30.0) or 30.0)
+
+        def _x264_bitrate_args() -> list[str]:
+            kb = int(getattr(self, "_keep_bitrate_kbps", 0) or 0)
+            if kb <= 0:
+                return []
+            # Constrained VBR around the source bitrate.
+            return [
+                "-b:v", f"{kb}k",
+                "-maxrate", f"{kb}k",
+                "-bufsize", f"{max(1, kb*2)}k",
+            ]
+
+        self._x264_bitrate_args = _x264_bitrate_args
+
+
+        def _x264_encode_args() -> list[str]:
+            kb = int(getattr(self, "_keep_bitrate_kbps", 0) or 0)
+            if kb <= 0:
+                return ["-crf", "18"]
+            maxr = int(max(1, round(kb * 1.05)))
+            buf = int(max(1, kb * 2))
+            return ["-b:v", f"{kb}k", "-maxrate", f"{maxr}k", "-bufsize", f"{buf}k"]
+
+        self._x264_encode_args = _x264_encode_args
+
 
         try:
             # Collect all available video source paths once for Mosaic effects.
@@ -3395,7 +3668,7 @@ class RenderWorker(QThread):
                     kb_frames = max(1, int(seg_dur * 30.0))
                     zoom_dir = "zoom+0.0025" if random.random() < 0.5 else "zoom-0.0025"
                     vf_parts.append(
-                        f"zoompan=z='{zoom_dir}':d={kb_frames}:s={w}x{h}:fps=30"
+                        f"zoompan=z='{zoom_dir}':d={kb_frames}:s={w}x{h}:fps={fps_expr}"
                     )
 
                 # Segment-level FX (per-segment visual styles)
@@ -4340,7 +4613,7 @@ class RenderWorker(QThread):
                         "[fwd][rev]concat=n=2:v=1:a=0[pair]",
                         f"[pair]loop=loop={max(0, cycles-1)}:size={pair_frames}:start=0[boom]",
                         f"[boom]trim=duration={target_len:.3f},setpts=PTS-STARTPTS[boomtrim]",
-                        f"[boomtrim]setpts=PTS/{seg_sf},fps=fps=30,scale={target_w}:{target_h}:force_original_aspect_ratio=decrease,"
+                        f"[boomtrim]setpts=PTS/{seg_sf},fps=fps={fps_expr},scale={target_w}:{target_h}:force_original_aspect_ratio=decrease,"
                         f"pad={target_w}:{target_h}:(ow-iw)/2:(oh-ih)/2:black[vout]",
                     ]
                     filter_complex = ";".join(filter_graph_parts)
@@ -4459,13 +4732,13 @@ class RenderWorker(QThread):
                         slow_factor = float(getattr(seg, "slow_factor", 1.0) or 1.0)
                         if slow_factor != 1.0:
                             final = (
-                                f"[vs]setpts=PTS/{slow_factor},fps=fps=30,"
+                                f"[vs]setpts=PTS/{slow_factor},fps=fps={fps_expr},"
                                 f"scale={target_w}:{target_h}:force_original_aspect_ratio=decrease,"
                                 f"pad={target_w}:{target_h}:(ow-iw)/2:(oh-ih)/2:black[vout]"
                             )
                         else:
                             final = (
-                                f"[vs]fps=fps=30,scale={target_w}:{target_h}:force_original_aspect_ratio=decrease,"
+                                f"[vs]fps=fps={fps_expr},scale={target_w}:{target_h}:force_original_aspect_ratio=decrease,"
                                 f"pad={target_w}:{target_h}:(ow-iw)/2:(oh-ih)/2:black[vout]"
                             )
 
@@ -4588,13 +4861,13 @@ class RenderWorker(QThread):
                             slow_factor = float(getattr(seg, "slow_factor", 1.0) or 1.0)
                             if slow_factor != 1.0:
                                 final = (
-                                    f"[vs]setpts=PTS/{slow_factor},fps=fps=30,"
+                                    f"[vs]setpts=PTS/{slow_factor},fps=fps={fps_expr},"
                                     f"scale={target_w}:{target_h}:force_original_aspect_ratio=decrease,"
                                     f"pad={target_w}:{target_h}:(ow-iw)/2:(oh-ih)/2:black[vout]"
                                 )
                             else:
                                 final = (
-                                    f"[vs]fps=fps=30,scale={target_w}:{target_h}:force_original_aspect_ratio=decrease,"
+                                    f"[vs]fps=fps={fps_expr},scale={target_w}:{target_h}:force_original_aspect_ratio=decrease,"
                                     f"pad={target_w}:{target_h}:(ow-iw)/2:(oh-ih)/2:black[vout]"
                                 )
 
@@ -4819,7 +5092,7 @@ class RenderWorker(QThread):
             if stitch_h % 2:
                 stitch_h += 1
             stitch_norm = (
-                f"settb=AVTB,setpts=PTS-STARTPTS,fps=30,"
+                f"settb=AVTB,setpts=PTS-STARTPTS,fps={fps_expr},"
                 f"scale={stitch_w}:{stitch_h}:force_original_aspect_ratio=decrease,"
                 f"pad={stitch_w}:{stitch_h}:(ow-iw)/2:(oh-ih)/2:black,"
                 f"setsar=1,"
@@ -4846,8 +5119,7 @@ class RenderWorker(QThread):
                     "libx264",
                     "-preset",
                     "veryfast",
-                    "-crf",
-                    "18",
+                    *self._x264_encode_args(),
                     "-pix_fmt",
                     "yuv420p",
                     out_path,
@@ -4991,8 +5263,7 @@ class RenderWorker(QThread):
                                         "libx264",
                                         "-preset",
                                         "veryfast",
-                                        "-crf",
-                                        "18",
+                                        *self._x264_encode_args(),
                                         "-pix_fmt",
                                         "yuv420p",
                                         out_tmp,
@@ -5022,8 +5293,7 @@ class RenderWorker(QThread):
                                         "libx264",
                                         "-preset",
                                         "veryfast",
-                                        "-crf",
-                                        "18",
+                                        *self._x264_encode_args(),
                                         "-pix_fmt",
                                         "yuv420p",
                                         out_tmp,
@@ -5129,8 +5399,7 @@ class RenderWorker(QThread):
                                         "libx264",
                                         "-preset",
                                         "veryfast",
-                                        "-crf",
-                                        "18",
+                                        *self._x264_encode_args(),
                                         "-pix_fmt",
                                         "yuv420p",
                                         out_tmp,
@@ -5160,8 +5429,7 @@ class RenderWorker(QThread):
                                         "libx264",
                                         "-preset",
                                         "veryfast",
-                                        "-crf",
-                                        "18",
+                                        *self._x264_encode_args(),
                                         "-pix_fmt",
                                         "yuv420p",
                                         out_tmp,
@@ -5249,8 +5517,7 @@ class RenderWorker(QThread):
                                         "libx264",
                                         "-preset",
                                         "veryfast",
-                                        "-crf",
-                                        "18",
+                                        *self._x264_encode_args(),
                                         "-pix_fmt",
                                         "yuv420p",
                                         out_tmp,
@@ -5279,8 +5546,7 @@ class RenderWorker(QThread):
                                         "libx264",
                                         "-preset",
                                         "veryfast",
-                                        "-crf",
-                                        "18",
+                                        *self._x264_encode_args(),
                                         "-pix_fmt",
                                         "yuv420p",
                                         out_tmp,
@@ -5309,8 +5575,7 @@ class RenderWorker(QThread):
                                         "libx264",
                                         "-preset",
                                         "veryfast",
-                                        "-crf",
-                                        "18",
+                                        *self._x264_encode_args(),
                                         "-pix_fmt",
                                         "yuv420p",
                                         out_tmp,
@@ -5389,8 +5654,7 @@ class RenderWorker(QThread):
                                         "libx264",
                                         "-preset",
                                         "veryfast",
-                                        "-crf",
-                                        "18",
+                                        *self._x264_encode_args(),
                                         "-pix_fmt",
                                         "yuv420p",
                                         out_tmp,
@@ -5420,8 +5684,7 @@ class RenderWorker(QThread):
                                         "libx264",
                                         "-preset",
                                         "veryfast",
-                                        "-crf",
-                                        "18",
+                                        *self._x264_encode_args(),
                                         "-pix_fmt",
                                         "yuv420p",
                                         out_tmp,
@@ -5505,8 +5768,7 @@ class RenderWorker(QThread):
                                         "libx264",
                                         "-preset",
                                         "veryfast",
-                                        "-crf",
-                                        "18",
+                                        *self._x264_encode_args(),
                                         "-pix_fmt",
                                         "yuv420p",
                                         out_tmp,
@@ -5584,8 +5846,7 @@ class RenderWorker(QThread):
                                         "libx264",
                                         "-preset",
                                         "veryfast",
-                                        "-crf",
-                                        "18",
+                                        *self._x264_encode_args(),
                                         "-pix_fmt",
                                         "yuv420p",
                                         out_tmp,
@@ -5658,8 +5919,7 @@ class RenderWorker(QThread):
                                         "libx264",
                                         "-preset",
                                         "veryfast",
-                                        "-crf",
-                                        "18",
+                                        *self._x264_encode_args(),
                                         "-pix_fmt",
                                         "yuv420p",
                                         out_tmp,
@@ -5737,8 +5997,7 @@ class RenderWorker(QThread):
                                         "libx264",
                                         "-preset",
                                         "veryfast",
-                                        "-crf",
-                                        "18",
+                                        *self._x264_encode_args(),
                                         "-pix_fmt",
                                         "yuv420p",
                                         out_tmp,
@@ -5768,8 +6027,7 @@ class RenderWorker(QThread):
                                         "libx264",
                                         "-preset",
                                         "veryfast",
-                                        "-crf",
-                                        "18",
+                                        *self._x264_encode_args(),
                                         "-pix_fmt",
                                         "yuv420p",
                                         out_tmp,
@@ -5846,8 +6104,7 @@ class RenderWorker(QThread):
                                         "libx264",
                                         "-preset",
                                         "veryfast",
-                                        "-crf",
-                                        "18",
+                                        *self._x264_encode_args(),
                                         "-pix_fmt",
                                         "yuv420p",
                                         out_tmp,
@@ -5876,8 +6133,7 @@ class RenderWorker(QThread):
                                         "libx264",
                                         "-preset",
                                         "veryfast",
-                                        "-crf",
-                                        "18",
+                                        *self._x264_encode_args(),
                                         "-pix_fmt",
                                         "yuv420p",
                                         out_tmp,
@@ -6003,10 +6259,7 @@ class RenderWorker(QThread):
 
                                         "libx264",
 
-                                        "-crf",
-
-                                        "18",
-
+                                        *self._x264_encode_args(),
                                         "-pix_fmt",
 
                                         "yuv420p",
@@ -6095,8 +6348,7 @@ class RenderWorker(QThread):
                                         "libx264",
                                         "-preset",
                                         "veryfast",
-                                        "-crf",
-                                        "18",
+                                        *self._x264_encode_args(),
                                         "-pix_fmt",
                                         "yuv420p",
                                         out_tmp,
@@ -6179,8 +6431,7 @@ class RenderWorker(QThread):
                                         "libx264",
                                         "-preset",
                                         "veryfast",
-                                        "-crf",
-                                        "18",
+                                        *self._x264_encode_args(),
                                         "-pix_fmt",
                                         "yuv420p",
                                         out_tmp,
@@ -6230,8 +6481,7 @@ class RenderWorker(QThread):
                                         "libx264",
                                         "-preset",
                                         "veryfast",
-                                        "-crf",
-                                        "18",
+                                        *self._x264_encode_args(),
                                         "-pix_fmt",
                                         "yuv420p",
                                         out_tmp,
@@ -6312,8 +6562,7 @@ class RenderWorker(QThread):
                             "libx264",
                             "-preset",
                             "veryfast",
-                            "-crf",
-                            "18",
+                            *self._x264_encode_args(),
                             "-pix_fmt",
                             "yuv420p",
                             styled_video,
@@ -6330,16 +6579,16 @@ class RenderWorker(QThread):
 
             audio_dur = self.analysis.duration
 
-            if abs(video_dur - audio_dur) > 0.02:  # more than 1 frame off at 30 fps
+            if abs(video_dur - audio_dur) > max(0.02, (1.0 / max(1.0, fps_float))):  # more than ~1 frame off
                 adjusted_video = os.path.join(tmpdir, "video_exact_duration.mp4")
                 multiplier = audio_dur / video_dur
-                vf = f"setpts={multiplier:.10f}*PTS,fps=fps=30"
+                vf = f"setpts={multiplier:.10f}*PTS,fps=fps={fps_expr}"
                 
                 cmd = [
                     self.ffmpeg, "-y",
                     "-i", video_for_mux,
                     "-vf", vf,
-                    "-c:v", "libx264", "-preset", "veryfast", "-crf", "18",
+                    "-c:v", "libx264", "-preset", "veryfast", *self._x264_encode_args(),
                     adjusted_video
                 ]
                 code, out = _run_ffmpeg(cmd)
@@ -6391,8 +6640,7 @@ class RenderWorker(QThread):
                         "libx264",
                         "-preset",
                         "veryfast",
-                        "-crf",
-                        "18",
+                        *self._x264_encode_args(),
                         "-pix_fmt",
                         "yuv420p",
                         overlayed_video,
@@ -6453,7 +6701,7 @@ class RenderWorker(QThread):
                         out_video=visuals_path,
                         ffmpeg_bin=self.ffmpeg,
                         resolution=(int(vw), int(vh)),
-                        fps=30,
+                        fps=int(round(fps_float)),
                         strategy=strategy,
                         segment_boundaries=segment_boundaries,
                         section_map=section_map,
@@ -6535,8 +6783,7 @@ class RenderWorker(QThread):
                             "libx264",
                             "-preset",
                             "veryfast",
-                            "-crf",
-                            "18",
+                            *self._x264_encode_args(),
                             "-pix_fmt",
                             "yuv420p",
                             overlayed_video_viz,
@@ -6623,8 +6870,7 @@ class RenderWorker(QThread):
                                     "libx264",
                                     "-preset",
                                     "veryfast",
-                                    "-crf",
-                                    "18",
+                                    *self._x264_encode_args(),
                                     "-pix_fmt",
                                     "yuv420p",
                                     strobe_video,
@@ -7009,6 +7255,19 @@ class AutoMusicSyncWidget(QWidget):
             pass
         row_res.addWidget(self.combo_res, 1)
         form.addRow(row_res)
+
+        # bitrate
+        row_br = QHBoxLayout()
+        self.check_keep_source_bitrate = QCheckBox("Keep Source Bitrate", self)
+        self.check_keep_source_bitrate.setChecked(False)
+        self.check_keep_source_bitrate.setToolTip(
+            "When enabled, the final render will try to keep the source video bitrate\n"
+            "(or the highest bitrate among a sample of your clips) to preserve quality.\n"
+            "This can increase output file size."
+        )
+        row_br.addWidget(self.check_keep_source_bitrate)
+        row_br.addStretch(1)
+        form.addRow(row_br)
 
         # frame fit mode
         row_fit = QHBoxLayout()
@@ -9459,6 +9718,8 @@ class AutoMusicSyncWidget(QWidget):
         self.check_use_seed.setChecked(bool(int(s.value("use_seed", int(self.check_use_seed.isChecked())))))
         self.combo_res.setCurrentIndex(int(s.value("res_mode", self.combo_res.currentIndex())))
         self.combo_fit.setCurrentIndex(int(s.value("fit_mode", self.combo_fit.currentIndex())))
+        if hasattr(self, "check_keep_source_bitrate"):
+            self.check_keep_source_bitrate.setChecked(bool(int(s.value("keep_source_bitrate", int(self.check_keep_source_bitrate.isChecked())))))
 
         self.slider_sens.setValue(int(s.value("beat_sensitivity", self.slider_sens.value())))
         self.spin_beats_per_seg.setValue(int(s.value("beats_per_segment", self.spin_beats_per_seg.value())))
@@ -9779,6 +10040,8 @@ class AutoMusicSyncWidget(QWidget):
         s.setValue("use_seed", int(self.check_use_seed.isChecked()))
         s.setValue("res_mode", self.combo_res.currentIndex())
         s.setValue("fit_mode", self.combo_fit.currentIndex())
+        if hasattr(self, "check_keep_source_bitrate"):
+            s.setValue("keep_source_bitrate", int(self.check_keep_source_bitrate.isChecked()))
 
         s.setValue("beat_sensitivity", self.slider_sens.value())
         s.setValue("beats_per_segment", self.spin_beats_per_seg.value())
@@ -11688,6 +11951,7 @@ class AutoMusicSyncWidget(QWidget):
             transition_mode=transition_mode,
             intro_fade=self.check_intro_fade.isChecked(),
             outro_fade=self.check_outro_fade.isChecked(),
+            keep_source_bitrate=bool(getattr(self, "check_keep_source_bitrate", None) and self.check_keep_source_bitrate.isChecked()),
             use_visual_overlay=bool(getattr(self, "check_visual_overlay", None) and self.check_visual_overlay.isChecked()),
             visual_strategy=visual_strategy,
             visual_section_overrides=getattr(self, "_visual_section_overrides", None) if visual_strategy == 2 else None,
@@ -11744,6 +12008,7 @@ class AutoMusicSyncWidget(QWidget):
             "transition_mode": int(transition_mode),
             "intro_fade": bool(self.check_intro_fade.isChecked()),
             "outro_fade": bool(self.check_outro_fade.isChecked()),
+            "keep_source_bitrate": bool(getattr(self, "check_keep_source_bitrate", None) and self.check_keep_source_bitrate.isChecked()),
             "use_visual_overlay": bool(use_visual_overlay),
             "visual_strategy": int(visual_strategy),
             "visual_section_overrides": visual_section_overrides,
