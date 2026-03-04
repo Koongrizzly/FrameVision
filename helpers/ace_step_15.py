@@ -36,6 +36,9 @@ SETTINGS_JSON = "ace_step_15_ui.settings.json"
 # Preset Manager
 ACE15_PRESET_MANAGER_JSON = "presetmanager.json"
 
+# Saved Lyrics (Ace Step 1.5)
+ACE15_LYRICS_JSON = "lyrics.json"
+
 
 # ACE-Step 1.5 diffusion inference methods (per upstream docs / Gradio UI)
 # Gradio labels these as ODE and SDE. The CLI expects "ode" or "sde".
@@ -99,6 +102,10 @@ def settings_path_for_root(framevision_root: Path) -> Path:
 
 def preset_manager_path_for_root(framevision_root: Path) -> Path:
     return framevision_root / "presets" / "setsave" / "ace15presets" / ACE15_PRESET_MANAGER_JSON
+
+
+def lyrics_path_for_root(framevision_root: Path) -> Path:
+    return framevision_root / "presets" / "setsave" / "ace15presets" / ACE15_LYRICS_JSON
 
 
 def _ace15_default_preset_manager_data() -> dict:
@@ -798,6 +805,183 @@ class Runner(QtCore.QObject):
         self._stop = True
 
 
+class LyricsManagerDialog(QtWidgets.QDialog):
+    """Saved Lyrics manager for Ace-Step 1.5.
+
+    Left: saved lyric names
+    Right: editable name + lyrics text
+    Supports edit/save/delete and loading into the main Lyrics box.
+    """
+
+    def __init__(self, parent: "MainWindow", lyrics_path: Path):
+        super().__init__(parent)
+        self.setWindowTitle("Ace-Step 1.5 — Saved Lyrics")
+        self.resize(980, 560)
+
+        self._mw = parent
+        self._path = lyrics_path
+        self._data = self._mw._ace15_lyrics_load(self._path)
+
+        root = QtWidgets.QVBoxLayout(self)
+        root.setContentsMargins(12, 12, 12, 12)
+        root.setSpacing(10)
+
+        splitter = QtWidgets.QSplitter(QtCore.Qt.Horizontal)
+        root.addWidget(splitter, 1)
+
+        # Left
+        left = QtWidgets.QWidget()
+        left_l = QtWidgets.QVBoxLayout(left)
+        left_l.setContentsMargins(0, 0, 0, 0)
+        left_l.setSpacing(8)
+        self.lst = QtWidgets.QListWidget()
+        self.lst.setToolTip("Saved lyric names")
+        left_l.addWidget(QtWidgets.QLabel("Saved"))
+        left_l.addWidget(self.lst, 1)
+
+        btn_row_left = QtWidgets.QHBoxLayout()
+        self.btn_new = QtWidgets.QPushButton("New")
+        self.btn_delete = QtWidgets.QPushButton("Delete")
+        btn_row_left.addWidget(self.btn_new)
+        btn_row_left.addWidget(self.btn_delete)
+        btn_row_left.addStretch(1)
+        left_l.addLayout(btn_row_left)
+        splitter.addWidget(left)
+
+        # Right
+        right = QtWidgets.QWidget()
+        right_l = QtWidgets.QVBoxLayout(right)
+        right_l.setContentsMargins(0, 0, 0, 0)
+        right_l.setSpacing(8)
+
+        self.ed_name = QtWidgets.QLineEdit()
+        self.ed_name.setPlaceholderText("Name")
+        right_l.addWidget(QtWidgets.QLabel("Name"))
+        right_l.addWidget(self.ed_name)
+
+        self.ed_text = QtWidgets.QPlainTextEdit()
+        self.ed_text.setPlaceholderText("Lyrics")
+        right_l.addWidget(QtWidgets.QLabel("Lyrics"))
+        right_l.addWidget(self.ed_text, 1)
+
+        btn_row = QtWidgets.QHBoxLayout()
+        self.btn_save = QtWidgets.QPushButton("Save")
+        self.btn_use = QtWidgets.QPushButton("Use in main UI")
+        self.btn_close = QtWidgets.QPushButton("Close")
+        btn_row.addWidget(self.btn_save)
+        btn_row.addWidget(self.btn_use)
+        btn_row.addStretch(1)
+        btn_row.addWidget(self.btn_close)
+        right_l.addLayout(btn_row)
+
+        splitter.addWidget(right)
+        splitter.setStretchFactor(0, 0)
+        splitter.setStretchFactor(1, 1)
+
+        # Signals
+        self.lst.currentItemChanged.connect(self._on_select)
+        self.lst.itemDoubleClicked.connect(self._use_selected)
+        self.btn_new.clicked.connect(self._new)
+        self.btn_delete.clicked.connect(self._delete)
+        self.btn_save.clicked.connect(self._save)
+        self.btn_use.clicked.connect(self._use_selected)
+        self.btn_close.clicked.connect(self.reject)
+
+        self._refresh_list(select_first=True)
+
+    def _lyrics_map(self) -> dict:
+        return dict((self._data or {}).get("lyrics", {}) or {})
+
+    def _set_lyrics_map(self, m: dict) -> None:
+        if self._data is None:
+            self._data = {"version": 1, "lyrics": {}}
+        self._data["version"] = int(self._data.get("version", 1) or 1)
+        self._data["lyrics"] = dict(m)
+
+    def _refresh_list(self, select_first: bool = False, select_name: str | None = None) -> None:
+        self.lst.blockSignals(True)
+        try:
+            self.lst.clear()
+            names = sorted(self._lyrics_map().keys(), key=lambda s: s.lower())
+            for n in names:
+                self.lst.addItem(n)
+        finally:
+            self.lst.blockSignals(False)
+
+        if select_name:
+            items = self.lst.findItems(select_name, QtCore.Qt.MatchExactly)
+            if items:
+                self.lst.setCurrentItem(items[0])
+                return
+        if select_first and self.lst.count() > 0:
+            self.lst.setCurrentRow(0)
+        else:
+            self.ed_name.setText("")
+            self.ed_text.setPlainText("")
+
+    def _on_select(self, cur: QtWidgets.QListWidgetItem, prev: QtWidgets.QListWidgetItem):
+        if not cur:
+            return
+        name = cur.text().strip()
+        text = (self._lyrics_map().get(name) or "")
+        self.ed_name.setText(name)
+        self.ed_text.setPlainText(text)
+
+    def _new(self):
+        self.lst.clearSelection()
+        self.ed_name.setText("")
+        self.ed_text.setPlainText("")
+        self.ed_name.setFocus()
+
+    def _delete(self):
+        item = self.lst.currentItem()
+        if not item:
+            return
+        name = item.text().strip()
+        if not name:
+            return
+        resp = QtWidgets.QMessageBox.question(
+            self,
+            "Delete saved lyrics",
+            f"Delete '{name}'?",
+            QtWidgets.QMessageBox.Yes | QtWidgets.QMessageBox.No,
+            QtWidgets.QMessageBox.No,
+        )
+        if resp != QtWidgets.QMessageBox.Yes:
+            return
+        m = self._lyrics_map()
+        if name in m:
+            del m[name]
+            self._set_lyrics_map(m)
+            self._mw._ace15_lyrics_save(self._path, self._data)
+            self._refresh_list(select_first=True)
+
+    def _save(self):
+        name = self.ed_name.text().strip()
+        text = self.ed_text.toPlainText().rstrip() + "\n" if self.ed_text.toPlainText().rstrip() else ""
+        if not name:
+            QtWidgets.QMessageBox.warning(self, "Name required", "Please enter a name.")
+            return
+
+        m = self._lyrics_map()
+
+        # Handle rename: if a different item is selected, and the new name differs.
+        selected = self.lst.currentItem().text().strip() if self.lst.currentItem() else ""
+        if selected and selected != name and selected in m:
+            del m[selected]
+
+        m[name] = text
+        self._set_lyrics_map(m)
+        self._mw._ace15_lyrics_save(self._path, self._data)
+        self._refresh_list(select_name=name)
+
+    def _use_selected(self):
+        # Use current editor fields, not strictly current selection.
+        text = self.ed_text.toPlainText()
+        self._mw.ed_lyrics.setPlainText(text)
+        self.accept()
+
+
 
 
 class MainWindow(QtWidgets.QMainWindow):
@@ -819,6 +1003,10 @@ class MainWindow(QtWidgets.QMainWindow):
         self._ace15_out_snapshot: set[str] = set()
         self._ace15_run_started_epoch: float = 0.0
 
+        # Toast notifications (non-blocking)
+        self._toast_frame: Optional[QtWidgets.QFrame] = None
+        self._toast_anim: Optional[QtCore.QPropertyAnimation] = None
+
         # Remember last run context so we can archive/move instruction.txt next to outputs.
         self._last_out_dir: Optional[Path] = None
         self._last_cfg_path: Optional[Path] = None
@@ -837,6 +1025,115 @@ class MainWindow(QtWidgets.QMainWindow):
         except Exception:
             pass
         self._refresh_outputs()
+
+    # -----------------------------
+    # Toast notifications
+    # -----------------------------
+    def _show_toast(self, text: str, duration_ms: int = 2200):
+        """Show a small non-blocking toast message (no OK button)."""
+        try:
+            if self._toast_anim is not None:
+                self._toast_anim.stop()
+            if self._toast_frame is not None:
+                self._toast_frame.hide()
+                self._toast_frame.deleteLater()
+        except Exception:
+            pass
+
+        frame = QtWidgets.QFrame(self)
+        frame.setObjectName("ace15_toast")
+        frame.setAttribute(QtCore.Qt.WA_StyledBackground, True)
+
+        lyt = QtWidgets.QHBoxLayout(frame)
+        lyt.setContentsMargins(12, 10, 12, 10)
+        lyt.setSpacing(10)
+
+        lbl = QtWidgets.QLabel(text)
+        lbl.setWordWrap(True)
+        lbl.setTextInteractionFlags(QtCore.Qt.NoTextInteraction)
+        lyt.addWidget(lbl)
+
+        frame.setStyleSheet(
+            "#ace15_toast {"
+            "  border-radius: 10px;"
+            "  background: rgba(30, 30, 30, 220);"
+            "  color: white;"
+            "}"
+        )
+        lbl.setStyleSheet("color: white;")
+
+        frame.adjustSize()
+        frame.setFixedWidth(min(420, max(240, frame.sizeHint().width())))
+        frame.adjustSize()
+
+        # Bottom-right placement with padding.
+        margin = 16
+        x = max(margin, self.width() - frame.width() - margin)
+        y = max(margin, self.height() - frame.height() - margin)
+        frame.move(x, y)
+        frame.raise_()
+        frame.show()
+
+        eff = QtWidgets.QGraphicsOpacityEffect(frame)
+        frame.setGraphicsEffect(eff)
+        eff.setOpacity(0.0)
+
+        anim = QtCore.QPropertyAnimation(eff, b"opacity", frame)
+        anim.setDuration(180)
+        anim.setStartValue(0.0)
+        anim.setEndValue(1.0)
+        anim.start(QtCore.QAbstractAnimation.DeleteWhenStopped)
+
+        self._toast_frame = frame
+        self._toast_anim = anim
+
+        def _fade_out():
+            try:
+                if frame is None:
+                    return
+                eff2 = frame.graphicsEffect()
+                if eff2 is None:
+                    frame.hide()
+                    frame.deleteLater()
+                    return
+                anim2 = QtCore.QPropertyAnimation(eff2, b"opacity", frame)
+                anim2.setDuration(220)
+                try:
+                    cur_op = float(eff2.opacity())
+                except Exception:
+                    cur_op = 1.0
+                anim2.setStartValue(cur_op)
+                anim2.setEndValue(0.0)
+
+                def _cleanup():
+                    try:
+                        frame.hide()
+                        frame.deleteLater()
+                    except Exception:
+                        pass
+
+                anim2.finished.connect(_cleanup)
+                anim2.start(QtCore.QAbstractAnimation.DeleteWhenStopped)
+            except Exception:
+                try:
+                    frame.hide()
+                    frame.deleteLater()
+                except Exception:
+                    pass
+
+        QtCore.QTimer.singleShot(max(800, int(duration_ms)), _fade_out)
+
+    def resizeEvent(self, event: QtGui.QResizeEvent):
+        super().resizeEvent(event)
+        # Keep toast anchored to bottom-right on window resize.
+        try:
+            if self._toast_frame and self._toast_frame.isVisible():
+                margin = 16
+                x = max(margin, self.width() - self._toast_frame.width() - margin)
+                y = max(margin, self.height() - self._toast_frame.height() - margin)
+                self._toast_frame.move(x, y)
+        except Exception:
+            pass
 
     def _build_ui(self):
         central = QtWidgets.QWidget()
@@ -907,10 +1204,20 @@ class MainWindow(QtWidgets.QMainWindow):
 
         row_ly = QtWidgets.QHBoxLayout()
         row_ly.addWidget(QtWidgets.QLabel("Lyrics (optional)"))
+        self.btn_save_lyrics = QtWidgets.QPushButton("save lyrics")
+        self.btn_save_lyrics.setToolTip("Save the current lyrics text under a name (stored in presets/setsave/ace15presets/lyrics.json).")
+        self.btn_save_lyrics.clicked.connect(self._save_lyrics_clicked)
+
+        self.btn_load_lyrics = QtWidgets.QPushButton("load lyrics")
+        self.btn_load_lyrics.setToolTip("Open your saved lyrics library (edit / save / delete / load into the main UI).")
+        self.btn_load_lyrics.clicked.connect(self._load_lyrics_clicked)
+
         self.btn_gen_lyrics = QtWidgets.QPushButton("random lyric")
         self.btn_gen_lyrics.setToolTip("Generate quick placeholder lyrics for testing (does not change caption/BPM/duration).")
         self.btn_gen_lyrics.clicked.connect(self._generate_lyrics_clicked)
         row_ly.addStretch(1)
+        row_ly.addWidget(self.btn_save_lyrics)
+        row_ly.addWidget(self.btn_load_lyrics)
         row_ly.addWidget(self.btn_gen_lyrics)
         v.addLayout(row_ly)
 
@@ -1192,7 +1499,13 @@ class MainWindow(QtWidgets.QMainWindow):
         self.btn_save.clicked.connect(self._save_settings)
         self.btn_run = QtWidgets.QPushButton("Generate")
         self.btn_run.setObjectName("ace15_btn_generate")
+        self.btn_run.setToolTip("don\'t use this while other models are running")
         self.btn_run.clicked.connect(self._start)
+
+        # FrameVision queue integration: enqueue for worker execution
+        self.btn_queue = QtWidgets.QPushButton("Add to Queue")
+        self.btn_queue.setObjectName("ace15_btn_queue")
+        self.btn_queue.clicked.connect(self._enqueue)
         self.btn_stop = QtWidgets.QPushButton("Stop")
         self.btn_stop.setEnabled(False)
         self.btn_stop.clicked.connect(self._stop)
@@ -1217,7 +1530,7 @@ class MainWindow(QtWidgets.QMainWindow):
         footer.setSpacing(10)
 
         # Match the user's request: +3px font size for these buttons.
-        for b in (self.btn_presets, self.btn_save, self.btn_run, self.btn_stop):
+        for b in (self.btn_presets, self.btn_save, self.btn_queue, self.btn_stop):
             _bump_font_px(b, 3)
             b.setSizePolicy(QtWidgets.QSizePolicy.Preferred, QtWidgets.QSizePolicy.Fixed)
             # Let buttons grow if the font makes them taller.
@@ -1233,8 +1546,7 @@ class MainWindow(QtWidgets.QMainWindow):
         )
 
         footer.addStretch(1)
-        # User request: put Generate first.
-        footer.addWidget(self.btn_run)
+        footer.addWidget(self.btn_queue)
         footer.addWidget(self.btn_presets)
         footer.addWidget(self.btn_save)
         footer.addWidget(self.btn_stop)
@@ -1443,6 +1755,7 @@ class MainWindow(QtWidgets.QMainWindow):
         row_ll.addWidget(QtWidgets.QLabel("Log level"))
         row_ll.addWidget(self.cmb_loglevel)
         row_ll.addStretch(1)
+        row_ll.addWidget(self.btn_run)
         logs_l.addLayout(row_ll)
 
         self.lbl_status = QtWidgets.QLabel("Idle")
@@ -1942,6 +2255,75 @@ class MainWindow(QtWidgets.QMainWindow):
     def _ace15_preset_mgr_save(self, path: Path, data: dict) -> None:
         ensure_dir(path.parent)
         path.write_text(json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8")
+
+
+    # ------------------------
+    # Saved Lyrics (Ace-Step 1.5)
+    # ------------------------
+    def _ace15_lyrics_path(self) -> Path:
+        fv = Path((self.settings.framevision_root or "").strip()) if (self.settings.framevision_root or "").strip() else getattr(self, "fv_root_guess", guess_framevision_root())
+        return lyrics_path_for_root(fv)
+
+    def _ace15_lyrics_load(self, path: Path) -> dict:
+        """Load lyrics database.
+
+        Format:
+          {"version": 1, "lyrics": {"Name": "...\n"}}
+        """
+        try:
+            ensure_dir(path.parent)
+            if not path.exists():
+                data = {"version": 1, "lyrics": {}}
+                path.write_text(json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8")
+                return data
+            data = json.loads(path.read_text(encoding="utf-8") or "{}")
+            if isinstance(data, dict) and "lyrics" in data:
+                data.setdefault("version", 1)
+                if not isinstance(data.get("lyrics"), dict):
+                    data["lyrics"] = {}
+                return data
+            # Back-compat: plain mapping {name: text}
+            if isinstance(data, dict):
+                return {"version": 1, "lyrics": data}
+        except Exception:
+            pass
+        return {"version": 1, "lyrics": {}}
+
+    def _ace15_lyrics_save(self, path: Path, data: dict) -> None:
+        ensure_dir(path.parent)
+        if not isinstance(data, dict):
+            data = {"version": 1, "lyrics": {}}
+        data.setdefault("version", 1)
+        data.setdefault("lyrics", {})
+        if not isinstance(data.get("lyrics"), dict):
+            data["lyrics"] = {}
+        path.write_text(json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8")
+
+    def _save_lyrics_clicked(self):
+        """Save current main Lyrics box into the lyrics DB."""
+        name, ok = QtWidgets.QInputDialog.getText(self, "Save lyrics", "Name:")
+        if not ok:
+            return
+        name = (name or "").strip()
+        if not name:
+            return
+        text = self.ed_lyrics.toPlainText().rstrip()
+        if text:
+            text = text + "\n"
+
+        path = self._ace15_lyrics_path()
+        data = self._ace15_lyrics_load(path)
+        m = dict((data or {}).get("lyrics", {}) or {})
+        m[name] = text
+        data["lyrics"] = m
+        self._ace15_lyrics_save(path, data)
+        self._log(f"Saved lyrics '{name}' -> {path}")
+
+    def _load_lyrics_clicked(self):
+        """Open lyrics manager popup."""
+        path = self._ace15_lyrics_path()
+        dlg = LyricsManagerDialog(self, path)
+        dlg.exec()
 
     
     def _ace15_current_preset_payload(self) -> dict:
@@ -2884,6 +3266,75 @@ class MainWindow(QtWidgets.QMainWindow):
 
         self._thread.start()
 
+    # -----------------------------
+    # Queue integration (FrameVision)
+    # -----------------------------
+    def _enqueue(self):
+        """Add an ACE-Step 1.5 job to the FrameVision queue (worker-run)."""
+        err = self._validate()
+        if err:
+            QtWidgets.QMessageBox.warning(self, "Fix this first", err)
+            return
+
+        # If Random is enabled, generate a fresh seed and show it.
+        self._ace15_prepare_seed_for_run()
+
+        self._pull_ui_to_settings()
+        self._save_settings()
+
+        out_dir = Path(self.ed_outdir.text().strip())
+        ensure_dir(out_dir)
+
+        # Write a stable config TOML now; the worker will reuse it later.
+        cfg_path = self._make_config(out_dir)
+        self._log(f"Saved config (for queue job):\n  {cfg_path}")
+
+        envpy = str(Path(self.ed_envpy.text().strip()).resolve())
+        clipy = str(Path(self.ed_clipypy.text().strip()).resolve())
+        proj = str(Path(self.ed_projectroot.text().strip()).resolve())
+
+        # Friendly queue label
+        try:
+            sub = self._ace15_sanitize_filename_part(self._ace15_pick_subgenre_for_naming()) or "Custom"
+        except Exception:
+            sub = "Custom"
+        try:
+            seed_s = str(int(self.spin_seed.value()))
+        except Exception:
+            seed_s = "AUTO"
+        label = f"Ace-Step 1.5: {sub} (seed {seed_s})"
+
+        try:
+            from helpers.queue_adapter import enqueue_tool_job
+            enqueue_tool_job(
+                job_type="ace_step_15",
+                input_path="",
+                out_dir=str(out_dir.resolve()),
+                args={
+                    "label": label,
+                    "env_python": envpy,
+                    "cli_py": clipy,
+                    "project_root": proj,
+                    "cfg_path": str(cfg_path.resolve()),
+                    "hide_console": bool(self.chk_hide_console.isChecked()),
+                },
+                priority=620,
+            )
+            self._log("Added to queue. Track it in the Queue tab.")
+            try:
+                self._show_toast("Added to queue — track it in the Queue tab.")
+            except Exception:
+                pass
+        except Exception as e:
+            self._log(f"ERROR: Could not enqueue: {e!r}")
+            QtWidgets.QMessageBox.warning(
+                self,
+                "Queue unavailable",
+                "Could not add to the queue.\n\n"
+                "Make sure this is running inside FrameVision and that the queue system is available.\n\n"
+                f"Details: {e!r}",
+            )
+
     def _stop(self):
         if self._runner:
             self._runner.stop()
@@ -3071,6 +3522,10 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def _set_busy(self, busy: bool):
         self.btn_run.setEnabled(not busy)
+        try:
+            self.btn_queue.setEnabled(not busy)
+        except Exception:
+            pass
         self.btn_stop.setEnabled(busy)
 
     def _log(self, line: str):

@@ -212,6 +212,105 @@ def _run_zimage_base_q8(root: Path) -> Optional[Tuple[str, List[str], Path]]:
 
 
 
+
+def _klein4b_script(root: Path) -> Optional[Path]:
+    """Return the Klein 4B downloader script when present."""
+    script = root / "presets" / "extra_env" / "klein4b_gguf_download.py"
+    return script if script.exists() else None
+
+
+def _klein4b_has_vae(root: Path) -> bool:
+    """
+    The downloader stores the VAE under:
+      <root>/models/klein4b_gguf/vae/split_files/vae/flux2-vae.safetensors
+    """
+    p = root / "models" / "klein4b_gguf" / "vae" / "split_files" / "vae" / "flux2-vae.safetensors"
+    return p.exists()
+
+
+def _run_klein4b_unet(root: Path, quant_token: str) -> Optional[Tuple[str, List[str], Path]]:
+    """
+    Download a single FLUX.2-klein-4B UNet GGUF by substring token (e.g. Q4_K_M).
+    Auto-downloads the required VAE if it's not present yet.
+    """
+    script = _klein4b_script(root)
+    if not script:
+        return None
+
+    py = _venv_python(root)
+    if py is None or (not py.exists()):
+        return None
+
+    args = ["-u", str(script), "--download-unet", str(quant_token)]
+    if not _klein4b_has_vae(root):
+        args.append("--download-vae")
+
+    return (str(py), args, root)
+
+
+def _run_klein4b_textenc(root: Path, source: str, token: str) -> Optional[Tuple[str, List[str], Path]]:
+    """
+    Download a text encoder for Klein 4B. Source must be: comfy / gguf / cordux.
+    Token can be an index (e.g. "1") or a substring (e.g. "Q4_K_M") depending on source.
+    """
+    script = _klein4b_script(root)
+    if not script:
+        return None
+
+    py = _venv_python(root)
+    if py is None or (not py.exists()):
+        return None
+
+    args = ["-u", str(script), "--download-textenc", f"{source}:{token}"]
+    return (str(py), args, root)
+
+
+def _run_klein4b_unet_q2k(root: Path) -> Optional[Tuple[str, List[str], Path]]:
+    return _run_klein4b_unet(root, "Q2_K")
+
+
+def _run_klein4b_unet_q3kl(root: Path) -> Optional[Tuple[str, List[str], Path]]:
+    return _run_klein4b_unet(root, "Q3_K_L")
+
+
+def _run_klein4b_unet_q4km(root: Path) -> Optional[Tuple[str, List[str], Path]]:
+    return _run_klein4b_unet(root, "Q4_K_M")
+
+
+def _run_klein4b_unet_q5km(root: Path) -> Optional[Tuple[str, List[str], Path]]:
+    return _run_klein4b_unet(root, "Q5_K_M")
+
+
+def _run_klein4b_unet_q6k(root: Path) -> Optional[Tuple[str, List[str], Path]]:
+    return _run_klein4b_unet(root, "Q6_K")
+
+
+def _run_klein4b_unet_q8(root: Path) -> Optional[Tuple[str, List[str], Path]]:
+    return _run_klein4b_unet(root, "Q8_0")
+
+
+def _run_klein4b_te_comfy(root: Path) -> Optional[Tuple[str, List[str], Path]]:
+    # Comfy bundle typically has a single safetensors weight; use index 1.
+    return _run_klein4b_textenc(root, "comfy", "1")
+
+
+def _run_klein4b_te_qwen_gguf_q4km(root: Path) -> Optional[Tuple[str, List[str], Path]]:
+    return _run_klein4b_textenc(root, "gguf", "Q4_K_M")
+
+
+def _run_klein4b_te_qwen_gguf_q5km(root: Path) -> Optional[Tuple[str, List[str], Path]]:
+    return _run_klein4b_textenc(root, "gguf", "Q5_K_M")
+
+
+def _run_klein4b_te_qwen_gguf_q8(root: Path) -> Optional[Tuple[str, List[str], Path]]:
+    return _run_klein4b_textenc(root, "gguf", "Q8_0")
+
+
+def _run_klein4b_te_cordux(root: Path) -> Optional[Tuple[str, List[str], Path]]:
+    # Gated repo – may require accepting terms on Hugging Face. Use index 1.
+    return _run_klein4b_textenc(root, "cordux", "1")
+
+
 def _run_ace(root: Path) -> Optional[Tuple[str, List[str], Path]]:
     script = root / "presets" / "extra_env" / "ace_setup.bat"
     if not script.exists():
@@ -664,7 +763,75 @@ OptionalInstall(
             description="VRAM: ~12–16GB+ for 1080p. Best quality / largest. almost same like fp16 but a little faster",
             runner=_run_zimage_gguf8,
         ),
+        
         OptionalInstall(
+            key="klein4b_unet_q2k",
+            title="Flux Klein edit 4B UNet GGUF (Q2_K)",
+            description="Smallest/fastest. Auto-downloads the required VAE if missing.",
+            runner=_run_klein4b_unet_q2k,
+        ),
+        OptionalInstall(
+            key="klein4b_unet_q3kl",
+            title="Flux Klein edit 4B UNet GGUF (Q3_K_L)",
+            description="Low VRAM / small. Auto-downloads the required VAE if missing.",
+            runner=_run_klein4b_unet_q3kl,
+        ),
+        OptionalInstall(
+            key="klein4b_unet_q4km",
+            title="Flux Klein edit 4B UNet GGUF (Q4_K_M)",
+            description="Balanced size/quality. Auto-downloads the required VAE if missing.",
+            runner=_run_klein4b_unet_q4km,
+        ),
+        OptionalInstall(
+            key="klein4b_unet_q5km",
+            title="Flux Klein edit 4B UNet GGUF (Q5_K_M)",
+            description="Higher quality / larger download. Auto-downloads the required VAE if missing.",
+            runner=_run_klein4b_unet_q5km,
+        ),
+        OptionalInstall(
+            key="klein4b_unet_q6k",
+            title="Flux Klein edit 4B UNet GGUF (Q6_K)",
+            description="High quality / larger. Auto-downloads the required VAE if missing.",
+            runner=_run_klein4b_unet_q6k,
+        ),
+        OptionalInstall(
+            key="klein4b_unet_q8",
+            title="Flux Klein edit 4B UNet GGUF (Q8_0)",
+            description="Best quality / largest. Auto-downloads the required VAE if missing.",
+            runner=_run_klein4b_unet_q8,
+        ),
+
+        OptionalInstall(
+            key="klein4b_te_comfy",
+            title="Flux Klein edit 4B Text Encoder (Comfy-Org safetensors)",
+            description="Recommended default text encoder download (safetensors).",
+            runner=_run_klein4b_te_comfy,
+        ),
+        OptionalInstall(
+            key="klein4b_te_qwen_gguf_q4km",
+            title="Flux Klein edit 4B Text Encoder (Qwen3-4B GGUF Q4_K_M)",
+            description="Lower VRAM text encoder (GGUF).",
+            runner=_run_klein4b_te_qwen_gguf_q4km,
+        ),
+        OptionalInstall(
+            key="klein4b_te_qwen_gguf_q5km",
+            title="Flux Klein edit 4B Text Encoder (Qwen3-4B GGUF Q5_K_M)",
+            description="Balanced GGUF text encoder.",
+            runner=_run_klein4b_te_qwen_gguf_q5km,
+        ),
+        OptionalInstall(
+            key="klein4b_te_qwen_gguf_q8",
+            title="Flux Klein edit 4B Text Encoder (Qwen3-4B GGUF Q8_0)",
+            description="Best quality / largest GGUF text encoder.",
+            runner=_run_klein4b_te_qwen_gguf_q8,
+        ),
+        OptionalInstall(
+            key="klein4b_te_cordux",
+            title="Flux Klein edit 4B Text Encoder (Cordux uncensored - gated)",
+            description="Gated Hugging Face repo. You may need to accept terms and set HF_TOKEN.",
+            runner=_run_klein4b_te_cordux,
+        ),
+OptionalInstall(
             key="ace15",
             title="Ace Step 1.5 Music Creation",
             description=(
@@ -1086,6 +1253,25 @@ class OptionalInstallsDialog(QtWidgets.QDialog):
                 _add_opt(opt, zimg_lay)
 
         opts_lay.addWidget(zimg_sec)
+
+        # Flux Klein edit 4B group (collapsible)
+        klein_sec = _CollapsibleSection("Flux Klein edit 4B", start_collapsed=True)
+        klein_lay = klein_sec.layout_content()
+
+        _add_group_label("UNet GGUF (choose one)", klein_lay)
+        for k in ("klein4b_unet_q2k", "klein4b_unet_q3kl", "klein4b_unet_q4km", "klein4b_unet_q5km", "klein4b_unet_q6k", "klein4b_unet_q8"):
+            opt = by_key.get(k)
+            if opt:
+                _add_opt(opt, klein_lay)
+
+        _add_group_label("Text encoder (choose one)", klein_lay)
+        for k in ("klein4b_te_comfy", "klein4b_te_qwen_gguf_q4km", "klein4b_te_qwen_gguf_q5km", "klein4b_te_qwen_gguf_q8", "klein4b_te_cordux"):
+            opt = by_key.get(k)
+            if opt:
+                _add_opt(opt, klein_lay)
+
+        opts_lay.addWidget(klein_sec)
+
 
         # Other image-related installs
         # Keep SeedVR2 close to GFPGAN (requested: "bottom" grouping).

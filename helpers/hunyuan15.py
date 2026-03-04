@@ -8,7 +8,7 @@ from pathlib import Path
 
 from PySide6.QtCore import Qt, QProcess, QTimer, QProcessEnvironment
 from PySide6.QtWidgets import (
-    QApplication, QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton,
+    QApplication, QWidget, QVBoxLayout, QHBoxLayout, QGridLayout, QLabel, QPushButton,
     QTextEdit, QLineEdit, QComboBox, QSpinBox, QDoubleSpinBox, QSlider, QCheckBox, QToolButton, QFileDialog,
     QMessageBox, QGroupBox, QFormLayout, QInputDialog, QTabWidget, QPlainTextEdit, QScrollArea, QLayout
 )
@@ -520,7 +520,7 @@ class Hunyuan15ToolWidget(QWidget):
 
         self.bitrate_kbps = QSpinBox()
         self.bitrate_kbps.setRange(0, 50000)
-        self.bitrate_kbps.setValue(2000)
+        self.bitrate_kbps.setValue(3500)
         self.bitrate_kbps.setToolTip(
             "Target bitrate for the final MP4 encode in kbps (uses ffmpeg). "
             "Set to 0 to disable re-encode and keep the raw export."
@@ -760,12 +760,13 @@ class Hunyuan15ToolWidget(QWidget):
 
         # Offload / performance toggles (top)
         adv_form.addRow(self.offload)
-        adv_form.addRow(self.group_offload)
 
-        # Diffusers hook toggles
-        adv_form.addRow(self.first_block_cache)
-        adv_form.addRow(QLabel("FBC threshold:"), self.fbc_thresh_row)
-        adv_form.addRow(self.pab)
+        # Hidden advanced toggles (kept for compatibility; not shown in UI)
+        for _w in (self.group_offload, self.first_block_cache, self.pab, self.fbc_thresh_row):
+            try:
+                _w.setVisible(False)
+            except Exception:
+                pass
 
         # Memory savers
         adv_form.addRow(self.attn_slicing)
@@ -824,8 +825,16 @@ class Hunyuan15ToolWidget(QWidget):
             pass
 
         grp = QGroupBox("Settings")
-        form = QFormLayout(grp)
-        form.addRow(QLabel("Prompt:"), self.prompt)
+        grp_outer = QVBoxLayout(grp)
+        grp_outer.setContentsMargins(8, 10, 8, 10)
+        grp_outer.setSpacing(10)
+
+        # --- Prompt ---
+        gb_prompt = QGroupBox("Prompt")
+        prompt_form = QFormLayout(gb_prompt)
+        prompt_form.setContentsMargins(10, 8, 10, 8)
+        prompt_form.setVerticalSpacing(8)
+        prompt_form.addRow(QLabel("Prompt:"), self.prompt)
         # Prompt helper row (Enhance + Clear)
         prompt_btn_row = QHBoxLayout()
         self.btn_prompt_enhance = QPushButton("Enhance prompt (Qwen)")
@@ -874,15 +883,21 @@ class Hunyuan15ToolWidget(QWidget):
             prompt_btn_row.addStretch(1)
             prompt_btn_wrap = QWidget(self)
             prompt_btn_wrap.setLayout(prompt_btn_row)
-            form.addRow("", prompt_btn_wrap)
+            prompt_form.addRow("", prompt_btn_wrap)
         except Exception:
             pass
 
         # Negative prompt
         try:
-            form.addRow(QLabel("Negative prompt:"), self.negative_prompt)
+            prompt_form.addRow(QLabel("Negative prompt:"), self.negative_prompt)
         except Exception:
             pass
+
+        # --- Source ---
+        gb_source = QGroupBox("Source")
+        source_form = QFormLayout(gb_source)
+        source_form.setContentsMargins(10, 8, 10, 8)
+        source_form.setVerticalSpacing(8)
 
         img_row = QWidget()
         img_lay = QHBoxLayout(img_row)
@@ -890,7 +905,7 @@ class Hunyuan15ToolWidget(QWidget):
         img_lay.addWidget(self.start_image, 1)
         img_lay.addWidget(self.btn_pick_image)
         img_lay.addWidget(self.btn_clear_image)
-        form.addRow(QLabel("Start image (I2V):"), img_row)
+        source_form.addRow(QLabel("Start image (I2V):"), img_row)
 
         v2v_row = QWidget()
         v2v_lay = QHBoxLayout(v2v_row)
@@ -899,40 +914,50 @@ class Hunyuan15ToolWidget(QWidget):
         v2v_lay.addWidget(self.btn_pick_v2v)
         v2v_lay.addWidget(self.btn_use_last_v2v)
         v2v_lay.addWidget(self.lbl_video2_info, 1)
-        form.addRow(QLabel("Video→Video:"), v2v_row)
+        source_form.addRow(QLabel("Video→Video:"), v2v_row)
+
+        # --- Video ---
+        gb_video = QGroupBox("Video")
+        video_grid = QGridLayout(gb_video)
+        video_grid.setContentsMargins(10, 8, 10, 8)
+        video_grid.setHorizontalSpacing(10)
+        video_grid.setVerticalSpacing(8)
+
         self._lbl_aspect = QLabel("Aspect:")
-        form.addRow(self._lbl_aspect, self.aspect)
         self._lbl_resolution = QLabel("Resolution:")
-        form.addRow(self._lbl_resolution, self.resolution)
 
-        h1 = QHBoxLayout()
-        h1.addWidget(QLabel("Frames"))
-        h1.addWidget(self.frames)
-        h1.addSpacing(12)
-        h1.addWidget(QLabel("Steps"))
-        h1.addWidget(self.steps)
-        h1.addSpacing(12)
-        h1.addWidget(QLabel("FPS"))
-        h1.addWidget(self.fps)
-        h1.addSpacing(12)
-        h1.addWidget(QLabel("Seed (-1=random)"))
-        h1.addWidget(self.seed)
-        form.addRow(h1)
+        r = 0
+        video_grid.addWidget(self._lbl_aspect, r, 0)
+        video_grid.addWidget(self.aspect, r, 1)
+        video_grid.addWidget(self._lbl_resolution, r, 2)
+        video_grid.addWidget(self.resolution, r, 3)
 
-        h_br = QHBoxLayout()
-        h_br.addWidget(QLabel("Bitrate (kbps)"))
-        h_br.addWidget(self.bitrate_kbps)
-        h_br.addStretch(1)
-        form.addRow(h_br)
+        r += 1
+        video_grid.addWidget(QLabel("Frames"), r, 0)
+        video_grid.addWidget(self.frames, r, 1)
+        video_grid.addWidget(QLabel("Steps"), r, 2)
+        video_grid.addWidget(self.steps, r, 3)
 
-        h_ext = QHBoxLayout()
-        h_ext.addWidget(QLabel("Extend"))
-        h_ext.addWidget(self.extend)
-        h_ext.addWidget(QLabel("extra segments"))
-        h_ext.addSpacing(12)
-        h_ext.addWidget(self.extend_merge)
-        h_ext.addStretch(1)
-        form.addRow(h_ext)
+        r += 1
+        video_grid.addWidget(QLabel("FPS"), r, 0)
+        video_grid.addWidget(self.fps, r, 1)
+        video_grid.addWidget(QLabel("Seed (-1=random)"), r, 2)
+        video_grid.addWidget(self.seed, r, 3)
+
+        r += 1
+        video_grid.addWidget(QLabel("Bitrate (kbps)"), r, 0)
+        video_grid.addWidget(self.bitrate_kbps, r, 1)
+        video_grid.addWidget(QLabel("Extend"), r, 2)
+
+        ext_row = QWidget()
+        ext_lay = QHBoxLayout(ext_row)
+        ext_lay.setContentsMargins(0, 0, 0, 0)
+        ext_lay.addWidget(self.extend)
+        ext_lay.addWidget(QLabel("extra segments"))
+        ext_lay.addSpacing(10)
+        ext_lay.addWidget(self.extend_merge)
+        ext_lay.addStretch(1)
+        video_grid.addWidget(ext_row, r, 3)
 
         self.lbl_extend_join_drop = QLabel("Remove frames (seam fix):")
         self.lbl_extend_join_blend = QLabel("Merge blend frames:")
@@ -941,11 +966,26 @@ class Hunyuan15ToolWidget(QWidget):
             self.lbl_extend_join_blend.setVisible(False)
         except Exception:
             pass
-        form.addRow(self.lbl_extend_join_drop, self.extend_join_drop_row)
-        form.addRow(self.lbl_extend_join_blend, self.extend_join_blend_row)
+        r += 1
+        video_grid.addWidget(self.lbl_extend_join_drop, r, 0)
+        video_grid.addWidget(self.extend_join_drop_row, r, 1, 1, 3)
+        r += 1
+        video_grid.addWidget(self.lbl_extend_join_blend, r, 0)
+        video_grid.addWidget(self.extend_join_blend_row, r, 1, 1, 3)
 
-        form.addRow(QLabel("Output filename:"), self.output_name)
-        form.addRow(self.adv_box)
+        # --- Output ---
+        gb_output = QGroupBox("Output")
+        out_form = QFormLayout(gb_output)
+        out_form.setContentsMargins(10, 8, 10, 8)
+        out_form.setVerticalSpacing(8)
+        out_form.addRow(QLabel("Output filename:"), self.output_name)
+        out_form.addRow(self.adv_box)
+
+        # Pack the Settings sections in a clean order (Ace Step style)
+        grp_outer.addWidget(gb_prompt)
+        grp_outer.addWidget(gb_source)
+        grp_outer.addWidget(gb_video)
+        grp_outer.addWidget(gb_output)
 
         btns1 = QHBoxLayout()
         btns1.addWidget(self.btn_generate)
@@ -1209,7 +1249,7 @@ class Hunyuan15ToolWidget(QWidget):
             self.offload.setChecked(True)
         if "bitrate_kbps" not in s:
             try:
-                self.bitrate_kbps.setValue(2000)
+                self.bitrate_kbps.setValue(3500)
             except Exception:
                 pass
         if "tiling" not in s:

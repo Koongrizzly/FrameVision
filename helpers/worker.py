@@ -3088,6 +3088,376 @@ def ace_generate(job, cfg, mani):
     return 0
 
 
+def ace15_generate(job, cfg, mani):
+    """Queue worker entry for Ace-Step 1.5 (runs cli.py with a generated TOML).
+
+    Expected job shape (from helpers/ace_step_15.py queue button):
+      type: "ace_step_15"
+      out_dir: output folder (defaults to presets config if missing)
+      args: {
+        "env_python": ".../environments/.ace_15/Scripts/python.exe",
+        "cli_py": ".../ACE-Step/cli.py",
+        "project_root": ".../ACE-Step",
+        "cfg_path": ".../output/.../ace_step_run_YYYYmmdd_HHMMSS.toml",
+        "hide_console": bool,
+        "label": str (optional)
+      }
+
+    This function is intentionally independent from PySide so it can run inside the worker.
+    """
+    import subprocess as _subprocess
+    import time as _time
+    import tempfile as _tempfile
+    from pathlib import Path as _Path
+
+    try:
+        args = job.get("args") or {}
+    except Exception:
+        args = {}
+
+    # Friendly title in queue row
+    try:
+        title = args.get("label") or "Ace-Step 1.5"
+        job["title"] = title
+        try:
+            job["label"] = title
+        except Exception:
+            pass
+        try:
+            a = job.get("args") or {}
+            if not a.get("label"):
+                a["label"] = title
+            job["args"] = a
+        except Exception:
+            pass
+    except Exception:
+        pass
+
+    env_python = str(args.get("env_python") or "").strip()
+    cli_py = str(args.get("cli_py") or "").strip()
+    project_root = str(args.get("project_root") or "").strip()
+    cfg_path = str(args.get("cfg_path") or "").strip()
+
+    if not env_python or not _Path(env_python).exists():
+        _mark_error(job, f"Ace-Step 1.5 env python not found: {env_python}")
+        return 2
+    if not cli_py or not _Path(cli_py).exists():
+        _mark_error(job, f"Ace-Step 1.5 cli.py not found: {cli_py}")
+        return 2
+    if not project_root or not _Path(project_root).exists():
+        # Some installs pass a file path; recover its parent.
+        try:
+            pr = _Path(project_root)
+            project_root = str(pr.parent if pr.is_file() else pr)
+        except Exception:
+            pass
+    if not project_root or not _Path(project_root).exists():
+        _mark_error(job, f"Ace-Step 1.5 project_root not found: {project_root}")
+        return 2
+
+    # Output folder
+    try:
+        out_dir = _Path(job.get("out_dir") or "").resolve()
+    except Exception:
+        out_dir = _Path(BASE / "output" / "audio" / "ace15").resolve()
+    try:
+        out_dir.mkdir(parents=True, exist_ok=True)
+    except Exception:
+        pass
+
+    # Config path must exist; if not, fail (keeps job reproducible)
+    if not cfg_path or not _Path(cfg_path).exists():
+        _mark_error(job, f"Ace-Step 1.5 config TOML not found: {cfg_path}")
+        return 2
+
+
+    # --- Post-processing helpers (matches ace_step_15.py behavior) ---
+    def _sanitize_part(s: str) -> str:
+        try:
+            s = (s or "").strip()
+        except Exception:
+            s = ""
+        if not s:
+            return ""
+        out = []
+        for ch in s:
+            if ch.isalnum() or ch in {"-", "_"}:
+                out.append(ch)
+            elif ch.isspace() or ch in {"/", "\\", ":", "|", "*", "?", '"', "<", ">"}:
+                out.append("_")
+            else:
+                out.append("_")
+        cleaned = "".join(out)
+        while "__" in cleaned:
+            cleaned = cleaned.replace("__", "_")
+        return cleaned.strip("._ ")
+
+    def _derive_stamp(cfg_path_s: str) -> str:
+        try:
+            stem = _Path(cfg_path_s).stem
+        except Exception:
+            stem = ""
+        stamp = ""
+        if stem:
+            if stem.startswith("ace_step_run_"):
+                stamp = stem.replace("ace_step_run_", "", 1)
+            else:
+                stamp = stem
+        if not stamp:
+            stamp = _time.strftime("%Y%m%d_%H%M%S", _time.localtime())
+        return stamp
+
+    def _extract_sub_seed(label_s: str):
+        # label: "Ace-Step 1.5: <sub> (seed <seed>)"
+        sub = "Custom"
+        seed = "AUTO"
+        try:
+            s = str(label_s or "")
+        except Exception:
+            s = ""
+        try:
+            mm = re.search(r"^\s*Ace-Step\s*1\.5\s*:\s*(.*?)\s*\(\s*seed\s+([^\)]+)\)\s*$", s, re.IGNORECASE)
+            if mm:
+                sub = (mm.group(1) or "").strip() or sub
+                seed = (mm.group(2) or "").strip() or seed
+        except Exception:
+            pass
+        return sub, seed
+
+    def _move_instruction_txt(project_root_s: str, out_dir_p: _Path, stamp: str, exit_code: int) -> None:
+        try:
+            proj = _Path(project_root_s)
+            instr = proj / "instruction.txt"
+            if not instr.exists() or (not instr.is_file()):
+                return
+            try:
+                out_dir_p.mkdir(parents=True, exist_ok=True)
+            except Exception:
+                pass
+            base_name = f"instruction_used_{stamp}.txt" if exit_code == 0 else f"instruction_error_{stamp}.txt"
+            dst = out_dir_p / base_name
+            if dst.exists():
+                i = 2
+                while True:
+                    cand = out_dir_p / f"{dst.stem}_{i}{dst.suffix}"
+                    if not cand.exists():
+                        dst = cand
+                        break
+                    i += 1
+            try:
+                shutil.move(str(instr), str(dst))
+            except Exception:
+                # Fall back to copy+delete if move fails across volumes.
+                try:
+                    shutil.copy2(str(instr), str(dst))
+                    _safe_unlink(instr)
+                except Exception:
+                    pass
+        except Exception:
+            return
+
+    def _rename_outputs(out_dir_p: _Path, files_list: list, sub: str, seed: str, stamp: str) -> list:
+        if not files_list:
+            return files_list
+        sub_s = _sanitize_part(sub) or "Custom"
+        seed_s = _sanitize_part(seed) or "AUTO"
+        renamed = []
+        multi = len(files_list) > 1
+        for idx2, fp in enumerate(files_list, start=1):
+            try:
+                src = _Path(fp)
+                if not src.exists():
+                    continue
+                ext = src.suffix or ""
+                counter = f"_{idx2}" if multi else ""
+                dst = out_dir_p / f"{sub_s}__seed{seed_s}__{stamp}{counter}{ext}"
+                dst = _unique_path(dst)
+                try:
+                    src.rename(dst)
+                    renamed.append(str(dst.resolve()))
+                except Exception:
+                    renamed.append(str(src.resolve()))
+            except Exception:
+                continue
+        return renamed
+
+    # Snapshot existing audio outputs
+    def _list_audio(d: _Path):
+        exts = {".wav", ".mp3", ".flac", ".ogg", ".m4a"}
+        try:
+            return [p for p in d.glob("*") if p.is_file() and p.suffix.lower() in exts]
+        except Exception:
+            return []
+
+    before = {str(p.resolve()): float(getattr(p.stat(), "st_mtime", 0.0)) for p in _list_audio(out_dir)}
+    start_ts = _time.time()
+
+    cmd = [str(env_python), str(cli_py), "-c", str(cfg_path)]
+
+    # Console hiding flag (Windows only)
+    creationflags = 0
+    try:
+        if os.name == "nt" and bool(args.get("hide_console")):
+            creationflags = _subprocess.CREATE_NO_WINDOW  # type: ignore[attr-defined]
+    except Exception:
+        creationflags = 0
+
+    env = os.environ.copy()
+    env.setdefault("PYTHONIOENCODING", "utf-8")
+    env.setdefault("PYTHONUTF8", "1")
+    env.setdefault("LANG", "C.UTF-8")
+    env.setdefault("LC_ALL", "C.UTF-8")
+
+    try:
+        _progress_set(5)
+    except Exception:
+        pass
+
+    # Lightweight time-based progress ramp until process exits.
+    last_pct = -1
+    def _update_progress():
+        nonlocal last_pct
+        elapsed = max(0.0, _time.time() - start_ts)
+        pct = 5.0 + min(90.0, (elapsed / 60.0) * 90.0)  # ~60s to reach 95%
+        ipct = int(max(5, min(95, round(pct))))
+        if ipct != last_pct:
+            try:
+                _progress_set(ipct)
+            except Exception:
+                pass
+            last_pct = ipct
+
+    # Run
+    try:
+        p = _subprocess.Popen(
+            cmd,
+            cwd=str(_Path(project_root)),
+            stdout=_subprocess.PIPE,
+            stdin=_subprocess.PIPE,
+            stderr=_subprocess.STDOUT,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            bufsize=1,
+            creationflags=creationflags,
+            env=env,
+        )
+        try:
+            _patch_running_json({'active_pid': int(getattr(p,'pid',0) or 0), 'active_cmd': ' '.join([str(x) for x in cmd])})
+        except Exception:
+            pass
+
+        q, _t = _start_proc_reader(p)
+        was_cancel = False
+        while True:
+            if _cancel_requested():
+                was_cancel = True
+                _note_cancel("Cancelled by user")
+                try:
+                    _kill_process_tree(getattr(p, 'pid', 0) or 0)
+                except Exception:
+                    pass
+                break
+
+            try:
+                item = q.get_nowait()
+            except _queue.Empty:
+                item = None
+
+            if item is None:
+                if p.poll() is not None:
+                    break
+                _update_progress()
+                _time.sleep(0.3)
+                continue
+
+            if item is _EOF:
+                break
+
+            line = item
+            if not line:
+                continue
+
+            try:
+                print("[ACE15]", line, end="")
+            except Exception:
+                pass
+
+            # Auto-continue interactive draft prompt
+            if "Press Enter when ready to continue." in line:
+                try:
+                    if p.stdin:
+                        p.stdin.write("\n")
+                        p.stdin.flush()
+                except Exception:
+                    pass
+
+            _update_progress()
+
+        code = p.wait()
+        if was_cancel:
+            code = 130
+    except Exception as e:
+        _mark_error(job, f"Ace-Step 1.5 runner exception: {e}")
+        return 2
+
+    stamp = _derive_stamp(cfg_path)
+    sub_for_name, seed_for_name = _extract_sub_seed(job.get('title') or job.get('label') or (args.get('label') if isinstance(args, dict) else '') or '')
+
+    if code != 0:
+        # Always move instruction.txt so the next run doesn't re-use it.
+        try:
+            _move_instruction_txt(project_root, out_dir, stamp, int(code))
+        except Exception:
+            pass
+        _mark_error(job, f"Ace-Step 1.5 failed (code {code}).")
+        return 2
+
+    # Detect produced audio files
+    after = _list_audio(out_dir)
+    new_files = []
+    for pth in after:
+        try:
+            rp = str(pth.resolve())
+            mt = float(pth.stat().st_mtime)
+            if rp not in before or mt > (before.get(rp, 0.0) + 0.0001):
+                new_files.append((mt, rp))
+        except Exception:
+            continue
+    new_files.sort(key=lambda t: t[0])
+    files = [rp for _mt, rp in new_files]
+    if not files and after:
+        # Fallback: newest file in folder
+        try:
+            newest = max(after, key=lambda p: p.stat().st_mtime)
+            files = [str(newest.resolve())]
+        except Exception:
+            files = []
+
+    # Post-process: rename newly generated outputs to a human-friendly name (matches direct-run UI).
+    try:
+        if files:
+            files = _rename_outputs(out_dir, files, sub_for_name, seed_for_name, stamp)
+    except Exception:
+        pass
+
+    # Always move instruction.txt so the next run doesn't re-use it.
+    try:
+        _move_instruction_txt(project_root, out_dir, stamp, 0)
+    except Exception:
+        pass
+
+    if files:
+        job["files"] = files
+        job["produced"] = files[-1]
+
+    try:
+        _progress_set(100)
+    except Exception:
+        pass
+    return 0
+
+
 def wan22_generate(job, cfg, mani):
     """
     Queue worker entry for Wan 2.2 TI2V (text2video / image2video) with
@@ -3833,6 +4203,8 @@ def handle_job(jpath: Path):
             code = qwen2511_image_edit(job, cfg, mani)
         elif t in ("wan22_text2video","wan22_image2video","wan22_ti2v","wan22"):
             code = wan22_generate(job, cfg, mani)
+        elif t in ("ace_step_15","ace_step15","ace15"):
+            code = ace15_generate(job, cfg, mani)
         elif t in ("ace_text2music","ace_audio2audio","ace","ace_step","ace_music"):
             code = ace_generate(job, cfg, mani)
         elif t in ("heartmula_generate","heartmula","heartmula_music"):

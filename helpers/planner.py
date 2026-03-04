@@ -71,6 +71,103 @@ def _qwen_model_dir() -> str:
 
 
 
+# -----------------------------
+# FLUX.2 Klein (GGUF) helpers
+# -----------------------------
+def _pick_flux_klein_models_highest() -> Dict[str, str]:
+    """Auto-pick FLUX.2 Klein GGUF wiring for stable-diffusion.cpp sd-cli.
+
+    Expected folder layout:
+      <root>/models/klein4b_gguf/
+        - diffusion: flux2-klein-4b*.gguf
+        - llm/text encoder: qwen3-4b*.gguf
+        - vae: flux2_ae.safetensors (or similar)
+      sd-cli:
+        <root>/presets/bin/sd-cli.exe
+
+    Picking rule:
+      - Prefer highest quant (largest Q number in filename, e.g. Q8 > Q6 > Q4).
+      - Tie-break by file size (bigger wins).
+    """
+    root = _root()
+    model_dir = (root / "models" / "klein4b_gguf").resolve()
+    sdcli = (root / "presets" / "bin" / ("sd-cli.exe" if os.name == "nt" else "sd-cli")).resolve()
+
+    def _score_gguf(p: Path) -> Tuple[int, int, str]:
+        name = p.name
+        m = re.search(r"\bQ(\d+)\b", name, flags=re.IGNORECASE)
+        qn = int(m.group(1)) if m else -1
+        try:
+            sz = int(p.stat().st_size)
+        except Exception:
+            sz = 0
+        return (qn, sz, str(p))
+
+    diffusion = ""
+    llm = ""
+    vae = ""
+
+    # diffusion gguf
+    try:
+        cands: List[Path] = []
+        if model_dir.exists():
+            for p in model_dir.rglob("*.gguf"):
+                if not p.is_file():
+                    continue
+                n = p.name.lower()
+                # Flux diffusion model (exclude qwen/llm)
+                if "flux" in n and "klein" in n and "4b" in n and ("qwen" not in n) and ("llm" not in n):
+                    cands.append(p)
+        if cands:
+            cands = sorted(cands, key=_score_gguf, reverse=True)
+            diffusion = str(cands[0])
+    except Exception:
+        diffusion = ""
+
+    # llm gguf (text encoder)
+    try:
+        cands = []
+        if model_dir.exists():
+            for p in model_dir.rglob("*.gguf"):
+                if not p.is_file():
+                    continue
+                n = p.name.lower()
+                if "qwen" in n and "4b" in n:
+                    cands.append(p)
+        if cands:
+            cands = sorted(cands, key=_score_gguf, reverse=True)
+            llm = str(cands[0])
+    except Exception:
+        llm = ""
+
+    # vae safetensors
+    try:
+        cands_st: List[Path] = []
+        if model_dir.exists():
+            for p in model_dir.rglob("*.safetensors"):
+                if not p.is_file():
+                    continue
+                n = p.name.lower()
+                if ("flux" in n) and (("ae" in n) or ("vae" in n)):
+                    cands_st.append(p)
+        if not cands_st and model_dir.exists():
+            cands_st = [p for p in model_dir.rglob("*.safetensors") if p.is_file()]
+        if cands_st:
+            # biggest file tends to be the real VAE
+            cands_st = sorted(cands_st, key=lambda p: (int(p.stat().st_size) if p.exists() else 0, str(p)), reverse=True)
+            vae = str(cands_st[0])
+    except Exception:
+        vae = ""
+
+    return {
+        "sd_cli": str(sdcli),
+        "model_dir": str(model_dir),
+        "diffusion": diffusion,
+        "llm": llm,
+        "vae": vae,
+    }
+
+
 def _qwen3tts_tokenizer_path() -> str:
     # Qwen3 TTS expects these model folders under <root>/models/
     return str((_root() / "models" / "Qwen3-TTS-Tokenizer-12Hz").resolve())
@@ -2831,6 +2928,7 @@ from PySide6.QtWidgets import (
     QListWidgetItem,
     QProgressBar,
     QMessageBox,
+    QInputDialog,
     QSplitter,
     QToolButton,
     QMenu,
@@ -4072,6 +4170,8 @@ class PipelineWorker(QThread):
             _eng = "qwen2512"
         elif "sdxl" in _sel:
             _eng = "diffusers"
+        elif "flux klein" in _sel or ("flux" in _sel and "klein" in _sel):
+            _eng = "flux_klein"
         if not _eng:
             _eng = "zimage_gguf"
         t2i_job["engine"] = _eng
@@ -4099,6 +4199,21 @@ class PipelineWorker(QThread):
                     t2i_job["lora_path"] = gguf_path
                 else:
                     raise RuntimeError("Z-image Low VRAM selected but no diffusion .gguf was found in models/Z-Image-Turbo GGUF")
+
+        elif str(_eng).lower().strip() == "flux_klein":
+            # Locked-in for Flux Klein: 4 steps, CFG 1, Euler, 1344x768, diffusion-fa ON
+            bw, bh = 1344, 768
+            ww, hh = _apply_aspect_to_size(bw, bh, aspect_mode)
+            t2i_job["width"] = int(ww)
+            t2i_job["height"] = int(hh)
+            t2i_job["sampler"] = "euler"
+            t2i_job["sampling_method"] = "euler"
+            t2i_job["steps"] = 4
+            t2i_job["cfg_scale"] = 1.0
+            t2i_job["cfg"] = 1.0
+            t2i_job["diffusion_fa"] = True
+            t2i_job["use_diffusion_fa"] = True
+
         else:
             try:
                 w = int(t2i_job.get("width") or 0)
@@ -4289,72 +4404,160 @@ class PipelineWorker(QThread):
             out_file = target if os.path.exists(target) else None
 
         else:
-            try:
-                from helpers import txt2img as _t2i  # type: ignore
-            except Exception:
-                import txt2img as _t2i  # type: ignore
+            # Flux Klein regen path (sd-cli). Must NOT fall through to txt2img backend.
+            if str(t2i_job.get("engine") or "").lower().strip() == "flux_klein":
+                _fm = _pick_flux_klein_models_highest()
+                sdcli_path = str(_fm.get("sd_cli") or "")
+                diffusion = str(t2i_job.get("flux_diffusion_model") or _fm.get("diffusion") or "")
+                llm = str(t2i_job.get("flux_llm_model") or _fm.get("llm") or "")
+                vae = str(t2i_job.get("flux_vae") or _fm.get("vae") or "")
+                if (not sdcli_path) or (not os.path.exists(sdcli_path)):
+                    raise RuntimeError("Flux Klein selected but sd-cli.exe was not found at presets/bin/sd-cli.exe")
+                if (not diffusion) or (not os.path.exists(diffusion)):
+                    raise RuntimeError("Flux Klein selected but no diffusion GGUF was found in models/klein4b_gguf/")
+                if (not llm) or (not os.path.exists(llm)):
+                    raise RuntimeError("Flux Klein selected but no Qwen3 4B GGUF was found in models/klein4b_gguf/")
+                if (not vae) or (not os.path.exists(vae)):
+                    raise RuntimeError("Flux Klein selected but no VAE safetensors was found in models/klein4b_gguf/")
 
-            if not hasattr(_t2i, "generate_one_from_job"):
-                raise RuntimeError("txt2img generator entrypoint not found (generate_one_from_job)")
-
-            _t2i_job = dict(t2i_job)
-
-            # For SDXL/Diffusers we WANT deterministic filenames and we DO support filename_template/format.
-            # (Some older backends crash on unknown keys, so we only strip these for non-diffusers engines.)
-            try:
-                _eng0 = str(_t2i_job.get("engine") or "").lower().strip()
-            except Exception:
-                _eng0 = ""
-            if "diffusers" in _eng0:
-                # Write directly into the Planner images_dir as {sid}.png
-                _t2i_job["filename_template"] = f"{sid}.png"
-                _t2i_job["format"] = "png"
-            else:
-                for _k in ("filename_template", "format"):
-                    _t2i_job.pop(_k, None)
-
-            # Some txt2img backends forward cancel_event into diffusers internals;
-            # older builds of _gen_via_diffusers don't accept it. Planner already
-            # supports cancellation via self._stop_requested, so strip it here.
-            _t2i_job.pop("cancel_event", None)
-
-            _max_strips = 64
-            _stripped = []
-            while True:
-                if self._stop_requested:
-                    raise RuntimeError("Cancelled by user.")
+                out_path = str(target).strip() or os.path.join(images_dir, f"{sid}.png")
+                if (not out_path) or ("{" in out_path) or ("}" in out_path):
+                    out_path = os.path.join(images_dir, f"{sid}.png")
+                if not os.path.splitext(out_path)[1]:
+                    out_path = out_path + ".png"
+                os.makedirs(os.path.dirname(out_path), exist_ok=True)
                 try:
-                    res = _t2i.generate_one_from_job(_t2i_job, images_dir)
-                    break
-                except TypeError as _te:
-                    _msg = str(_te)
-                    _m = re.search(r"unexpected keyword argument ['\"]([^'\"]+)['\"]", _msg)
-                    if _m:
-                        _bad = _m.group(1)
-                        if _bad in _t2i_job and len(_stripped) < _max_strips:
-                            _t2i_job.pop(_bad, None)
-                            _stripped.append(_bad)
-                            try:
-                                self.signals.log.emit(f"[IMG] backend stripped unsupported key: {_bad}")
-                            except Exception:
-                                pass
-                            continue
-                    raise
-
-            try:
-                if isinstance(res, dict) and res.get("files"):
-                    out_file = res["files"][0]
-            except Exception:
-                out_file = None
-
-            if not out_file or not os.path.exists(out_file):
-                err = ""
-                try:
-                    if isinstance(res, dict):
-                        err = str(res.get("error") or res.get("err") or res.get("message") or "")
+                    if os.path.exists(out_path):
+                        os.remove(out_path)
                 except Exception:
+                    pass
+
+                cmd = [sdcli_path]
+                cmd += ["--diffusion-model", diffusion]
+                cmd += ["--vae", vae]
+                cmd += ["--llm", llm]
+                cmd += ["-p", str(t2i_job.get("prompt") or "").strip()]
+                _neg = str(t2i_job.get("negative_prompt") or t2i_job.get("negative") or "").strip()
+                if _neg:
+                    cmd += ["-n", _neg]
+                cmd += ["-W", str(int(t2i_job.get("width") or 1344)), "-H", str(int(t2i_job.get("height") or 768))]
+                cmd += ["--steps", str(int(t2i_job.get("steps") or 4))]
+                cmd += ["--cfg-scale", str(float(t2i_job.get("cfg") or t2i_job.get("cfg_scale") or 1.0))]
+                cmd += ["--sampling-method", str(t2i_job.get("sampling_method") or t2i_job.get("sampler") or "euler").strip().lower() or "euler"]
+                cmd += ["-s", str(int(t2i_job.get("seed") or 0))]
+                if bool(t2i_job.get("diffusion_fa") or t2i_job.get("use_diffusion_fa")):
+                    cmd += ["--diffusion-fa"]
+                cmd += ["-o", out_path, "-v"]
+
+                try:
+                    self.signals.log.emit(f"[IMG] regen {sid} [Flux Klein]")
+                except Exception:
+                    pass
+
+                rc = 1
+                try:
+                    p = subprocess.Popen(
+                        cmd,
+                        cwd=str(_root()),
+                        stdout=subprocess.PIPE,
+                        stderr=subprocess.STDOUT,
+                        bufsize=1,
+                    )
+                    if p.stdout:
+                        for _raw in p.stdout:
+                            if self._stop_requested:
+                                try:
+                                    p.kill()
+                                except Exception:
+                                    pass
+                                raise RuntimeError("Cancelled by user.")
+                            try:
+                                _line = _raw.decode("utf-8", errors="replace").rstrip()
+                            except Exception:
+                                _line = str(_raw).rstrip()
+                            if _line:
+                                try:
+                                    self.signals.log.emit(_line)
+                                except Exception:
+                                    pass
+                    rc = int(p.wait())
+                except Exception as _e:
+                    raise RuntimeError(f"Flux Klein sd-cli run failed: {_e}")
+
+                if rc != 0:
+                    raise RuntimeError(f"Flux Klein sd-cli failed (exit code {rc}). See log for details.")
+                if (not os.path.exists(out_path)) or (os.path.getsize(out_path) <= 0):
+                    raise RuntimeError("generator returned no output file")
+
+                out_file = out_path
+
+            else:
+                try:
+                    from helpers import txt2img as _t2i  # type: ignore
+                except Exception:
+                    import txt2img as _t2i  # type: ignore
+
+                if not hasattr(_t2i, "generate_one_from_job"):
+                    raise RuntimeError("txt2img generator entrypoint not found (generate_one_from_job)")
+    
+                _t2i_job = dict(t2i_job)
+    
+                # For SDXL/Diffusers we WANT deterministic filenames and we DO support filename_template/format.
+                # (Some older backends crash on unknown keys, so we only strip these for non-diffusers engines.)
+                try:
+                    _eng0 = str(_t2i_job.get("engine") or "").lower().strip()
+                except Exception:
+                    _eng0 = ""
+                if "diffusers" in _eng0:
+                    # Write directly into the Planner images_dir as {sid}.png
+                    _t2i_job["filename_template"] = f"{sid}.png"
+                    _t2i_job["format"] = "png"
+                else:
+                    for _k in ("filename_template", "format"):
+                        _t2i_job.pop(_k, None)
+    
+                # Some txt2img backends forward cancel_event into diffusers internals;
+                # older builds of _gen_via_diffusers don't accept it. Planner already
+                # supports cancellation via self._stop_requested, so strip it here.
+                _t2i_job.pop("cancel_event", None)
+    
+                _max_strips = 64
+                _stripped = []
+                while True:
+                    if self._stop_requested:
+                        raise RuntimeError("Cancelled by user.")
+                    try:
+                        res = _t2i.generate_one_from_job(_t2i_job, images_dir)
+                        break
+                    except TypeError as _te:
+                        _msg = str(_te)
+                        _m = re.search(r"unexpected keyword argument ['\"]([^'\"]+)['\"]", _msg)
+                        if _m:
+                            _bad = _m.group(1)
+                            if _bad in _t2i_job and len(_stripped) < _max_strips:
+                                _t2i_job.pop(_bad, None)
+                                _stripped.append(_bad)
+                                try:
+                                    self.signals.log.emit(f"[IMG] backend stripped unsupported key: {_bad}")
+                                except Exception:
+                                    pass
+                                continue
+                        raise
+    
+                try:
+                    if isinstance(res, dict) and res.get("files"):
+                        out_file = res["files"][0]
+                except Exception:
+                    out_file = None
+    
+                if not out_file or not os.path.exists(out_file):
                     err = ""
-                raise RuntimeError(err or "generator returned no output file")
+                    try:
+                        if isinstance(res, dict):
+                            err = str(res.get("error") or res.get("err") or res.get("message") or "")
+                    except Exception:
+                        err = ""
+                    raise RuntimeError(err or "generator returned no output file")
 
             try:
                 ext = os.path.splitext(out_file)[1] or ".png"
@@ -7306,6 +7509,7 @@ class PipelineWorker(QThread):
                     ref_strategy = ""
 
                 use_qwen2511 = (ref_strategy == "qwen2511_best" and bool(ref_files))
+                use_flux_klein_edit = (ref_strategy == "flux_klein_edit" and bool(ref_files))
                 used_ref_files = list(ref_files[:2]) if use_qwen2511 else list(ref_files)
 
                 try:
@@ -7317,6 +7521,8 @@ class PipelineWorker(QThread):
                     self.signals.log.emit(f"[REF] Using Qwen Edit 2511 for images (refs: {len(used_ref_files)}).")
                     if multi_lora:
                         self.signals.log.emit("[REF] Multi-angle LoRA detected; planner will apply it on a cadence.")
+                if use_flux_klein_edit:
+                    self.signals.log.emit(f"[REF] Using Flux Klein Edit for images (refs: {len(used_ref_files)}).")
                 if use_qwen2511:
                     bible = []  # Qwen2511 must use storyline/shot prompts only (no Character Bible lock).
                 image_records: List[Dict[str, Any]] = []
@@ -7926,10 +8132,21 @@ class PipelineWorker(QThread):
                     # SDXL via Diffusers
                     elif "sdxl" in _sel:
                         _eng = "diffusers"
+                    # Flux Klein (sd-cli, GGUF)
+                    elif ("flux" in _sel) and ("klein" in _sel):
+                        _eng = "flux_klein"
                     # (GMT Image is planned; not wired here yet)
 
                     if not _eng:
                         _eng = "zimage_gguf"
+
+                    # Chunk 4: reference-image edit workflows can override the chosen engine.
+                    # Keep workflow names distinct so later expansions don't collide.
+                    try:
+                        if bool(use_flux_klein_edit):
+                            _eng = "flux_klein_edit"
+                    except Exception:
+                        pass
 
                     # Ensure downstream sees the engine we decided on
                     t2i_job["engine"] = _eng
@@ -7973,6 +8190,20 @@ class PipelineWorker(QThread):
                             else:
                                 raise RuntimeError("Z-image Low Vram selected but no diffusion .gguf was found in models/Z-Image-Turbo GGUF")
                     
+                    elif str(_eng).lower().strip() in ("flux_klein", "flux_klein_edit"):
+                        # Locked-in for Flux Klein: 4 steps, CFG 1, Euler, 1344x768, diffusion-fa ON
+                        bw, bh = 1344, 768
+                        ww, hh = _apply_aspect_to_size(bw, bh, aspect_mode)
+                        t2i_job["width"] = int(ww)
+                        t2i_job["height"] = int(hh)
+                        t2i_job["sampler"] = "euler"
+                        t2i_job["sampling_method"] = "euler"
+                        t2i_job["steps"] = 4
+                        t2i_job["cfg_scale"] = 1.0
+                        t2i_job["cfg"] = 1.0
+                        t2i_job["diffusion_fa"] = True
+                        t2i_job["use_diffusion_fa"] = True
+
                     elif "diffusers" in _eng:
                         # SDXL via Diffusers:
                         # - Prefer Juggernaut in /models/sdxl/ when present
@@ -8269,49 +8500,162 @@ class PipelineWorker(QThread):
                                 raise RuntimeError("qwen2511 entrypoint not found (expected build_sdcli_cmd or generate_one_from_job/run_job/run)")
 
                     else:
-                        # Call into helpers/txt2img.py
-                        try:
-                            from helpers import txt2img as _t2i  # type: ignore
-                        except Exception:
-                            import txt2img as _t2i  # type: ignore
+                        # Flux Klein (stable-diffusion.cpp sd-cli)
+                        _eng_now = str(t2i_job.get("engine") or "").lower().strip()
+                        if _eng_now in ("flux_klein", "flux_klein_edit"):
+                            _fm = _pick_flux_klein_models_highest()
+                            sdcli_path = str(_fm.get("sd_cli") or "")
+                            diffusion = str(t2i_job.get("flux_diffusion_model") or _fm.get("diffusion") or "")
+                            llm = str(t2i_job.get("flux_llm_model") or _fm.get("llm") or "")
+                            vae = str(t2i_job.get("flux_vae") or _fm.get("vae") or "")
+                            if (not sdcli_path) or (not os.path.exists(sdcli_path)):
+                                raise RuntimeError("Flux Klein selected but sd-cli.exe was not found at presets/bin/sd-cli.exe")
+                            if (not diffusion) or (not os.path.exists(diffusion)):
+                                raise RuntimeError("Flux Klein selected but no diffusion GGUF was found in models/klein4b_gguf/")
+                            if (not llm) or (not os.path.exists(llm)):
+                                raise RuntimeError("Flux Klein selected but no Qwen3 4B GGUF was found in models/klein4b_gguf/")
+                            if (not vae) or (not os.path.exists(vae)):
+                                raise RuntimeError("Flux Klein selected but no VAE safetensors was found in models/klein4b_gguf/")
+                    
+                            # NOTE:
+                            # Planner historically uses Z-image filename templates like "z_img_{seed}_{idx}".
+                            # sd-cli does NOT expand those templates. If we pass them through, it will literally
+                            # try to write to a path containing braces (often resulting in a 0-byte file).
+                            # So for Flux Klein we force a clean, deterministic filename.
+                            out_path = str(t2i_job.get("out_file") or t2i_job.get("target") or "").strip()
+                            if (not out_path) or ("{" in out_path) or ("}" in out_path):
+                                out_path = os.path.join(images_dir, f"{sid}.png")
+                            # Ensure extension (sd-cli will happily write without one, but the app expects PNGs)
+                            if not os.path.splitext(out_path)[1]:
+                                out_path = out_path + ".png"
+                            os.makedirs(os.path.dirname(out_path), exist_ok=True)
+                            try:
+                                # Remove stale/placeholder file from previous failed attempts.
+                                if os.path.exists(out_path):
+                                    os.remove(out_path)
+                            except Exception:
+                                pass
+                    
+                            cmd = [sdcli_path]
+                            cmd += ["--diffusion-model", diffusion]
+                            cmd += ["--vae", vae]
+                            cmd += ["--llm", llm]
+                            cmd += ["-p", str(t2i_job.get("prompt") or "").strip()]
+                            _neg = str(t2i_job.get("negative_prompt") or t2i_job.get("negative") or "").strip()
+                            if _neg:
+                                cmd += ["-n", _neg]
 
-                        self.signals.log.emit(f"[IMG] {sid} ({i}/{total})")
-                        if hasattr(_t2i, "generate_one_from_job"):
-                            # Safety: some txt2img backends pass job keys as **kwargs into engine-specific functions.
-                            # Older Z-image implementations can crash on any unexpected key.
-                            # Strategy:
-                            # 1) strip a couple of known planner-only keys
-                            # 2) if we still hit a TypeError for an unexpected keyword, remove that key and retry
-                            _t2i_job = dict(t2i_job)
-                            for _k in ("filename_template", "format"):
-                                _t2i_job.pop(_k, None)
-
-                            # Retry loop that progressively strips unsupported keyword args.
-                            # This keeps the planner compatible with older txt2img backends without forcing tight allow-lists.
-                            _max_strips = 64
-                            _stripped = []
-                            while True:
+                            # Flux Klein Edit: add repeated -r args for reference images (Flux Kontext style).
+                            if _eng_now == "flux_klein_edit":
                                 try:
-                                    res = _t2i.generate_one_from_job(_t2i_job, images_dir)
-                                    break
-                                except TypeError as _te:
-                                    _msg = str(_te)
-                                    _m = re.search(r"unexpected keyword argument ['\"]([^'\"]+)['\"]", _msg)
-                                    if _m:
-                                        _bad = _m.group(1)
-                                        if _bad in _t2i_job and len(_stripped) < _max_strips:
-                                            _t2i_job.pop(_bad, None)
-                                            _stripped.append(_bad)
-                                            try:
-                                                self.signals.log.emit(f"[IMG] backend stripped unsupported key: {_bad}")
-                                            except Exception:
-                                                pass
-                                            continue
-                                    raise
-                        elif hasattr(_t2i, "generate_qwen_images"):
-                            res = _t2i.generate_qwen_images(t2i_job)
+                                    for _r in (used_ref_files or []):
+                                        if _r and os.path.exists(_r):
+                                            cmd += ["-r", str(_r)]
+                                except Exception:
+                                    pass
+                            cmd += ["-W", str(int(t2i_job.get("width") or 1344)), "-H", str(int(t2i_job.get("height") or 768))]
+                            cmd += ["--steps", str(int(t2i_job.get("steps") or 4))]
+                            cmd += ["--cfg-scale", str(float(t2i_job.get("cfg") or t2i_job.get("cfg_scale") or 1.0))]
+                            cmd += ["--sampling-method", str(t2i_job.get("sampling_method") or t2i_job.get("sampler") or "euler").strip().lower() or "euler"]
+                            cmd += ["-s", str(int(t2i_job.get("seed") or 0))]
+                            if bool(t2i_job.get("diffusion_fa") or t2i_job.get("use_diffusion_fa")):
+                                cmd += ["--diffusion-fa"]
+                            cmd += ["-o", out_path, "-v"]
+                    
+                            if _eng_now == "flux_klein_edit":
+                                self.signals.log.emit(f"[IMG] {sid} ({i}/{total}) [Flux Klein Edit]")
+                            else:
+                                self.signals.log.emit(f"[IMG] {sid} ({i}/{total}) [Flux Klein]")
+                            rc = 1
+                            try:
+                                # IMPORTANT (Windows): sd-cli can output UTF-8 bytes that are not decodable under the
+                                # default system codepage (cp1252/"charmap"), which crashes when text=True.
+                                # Read bytes and decode safely.
+                                p = subprocess.Popen(
+                                    cmd,
+                                    cwd=str(_root()),
+                                    stdout=subprocess.PIPE,
+                                    stderr=subprocess.STDOUT,
+                                    bufsize=1,
+                                )
+                                if p.stdout:
+                                    for _raw in p.stdout:
+                                        try:
+                                            if isinstance(_raw, bytes):
+                                                line = _raw.decode("utf-8", errors="replace")
+                                            else:
+                                                # Should not happen, but keep safe.
+                                                line = str(_raw)
+                                            self.signals.log.emit(line.rstrip())
+                                        except Exception:
+                                            pass
+                                rc = int(p.wait() or 0)
+                            except Exception as _e:
+                                raise RuntimeError(f"Flux Klein sd-cli run failed: {_e}")
+                    
+                            ok = (rc == 0 and os.path.exists(out_path) and os.path.getsize(out_path) >= 1024)
+                            res = {"ok": bool(ok), "files": ([out_path] if ok else []), "out_file": out_path, "rc": int(rc), "model": ("Flux Klein Edit" if _eng_now == "flux_klein_edit" else "Flux Klein")}
+
+                            # Update manifest per-shot record with ref info (best-effort)
+                            if _eng_now == "flux_klein_edit":
+                                try:
+                                    shot_map = manifest.setdefault("shots", {})
+                                    rec = shot_map.get(sid) if isinstance(shot_map.get(sid), dict) else {}
+                                    rec["ref_strategy"] = "flux_klein_edit"
+                                    rec["refs_used"] = list(used_ref_files)
+                                    shot_map[sid] = rec
+                                except Exception:
+                                    pass
+                            # If we produced a placeholder/empty file, clean it up so the output folder stays sane.
+                            try:
+                                if (not ok) and os.path.exists(out_path) and os.path.getsize(out_path) == 0:
+                                    os.remove(out_path)
+                            except Exception:
+                                pass
                         else:
-                            raise RuntimeError("txt2img generator entrypoint not found")
+                            # Call into helpers/txt2img.py
+                            try:
+                                from helpers import txt2img as _t2i  # type: ignore
+                            except Exception:
+                                import txt2img as _t2i  # type: ignore
+
+                            self.signals.log.emit(f"[IMG] {sid} ({i}/{total})")
+                            if hasattr(_t2i, "generate_one_from_job"):
+                                # Safety: some txt2img backends pass job keys as **kwargs into engine-specific functions.
+                                # Older Z-image implementations can crash on any unexpected key.
+                                # Strategy:
+                                # 1) strip a couple of known planner-only keys
+                                # 2) if we still hit a TypeError for an unexpected keyword, remove that key and retry
+                                _t2i_job = dict(t2i_job)
+                                for _k in ("filename_template", "format"):
+                                    _t2i_job.pop(_k, None)
+
+                                # Retry loop that progressively strips unsupported keyword args.
+                                # This keeps the planner compatible with older txt2img backends without forcing tight allow-lists.
+                                _max_strips = 64
+                                _stripped = []
+                                while True:
+                                    try:
+                                        res = _t2i.generate_one_from_job(_t2i_job, images_dir)
+                                        break
+                                    except TypeError as _te:
+                                        _msg = str(_te)
+                                        _m = re.search(r"unexpected keyword argument ['\"]([^'\"]+)['\"]", _msg)
+                                        if _m:
+                                            _bad = _m.group(1)
+                                            if _bad in _t2i_job and len(_stripped) < _max_strips:
+                                                _t2i_job.pop(_bad, None)
+                                                _stripped.append(_bad)
+                                                try:
+                                                    self.signals.log.emit(f"[IMG] backend stripped unsupported key: {_bad}")
+                                                except Exception:
+                                                    pass
+                                                continue
+                                        raise
+                            elif hasattr(_t2i, "generate_qwen_images"):
+                                res = _t2i.generate_qwen_images(t2i_job)
+                            else:
+                                raise RuntimeError("txt2img generator entrypoint not found")
 
                     out_file = None
                     try:
@@ -14040,6 +14384,7 @@ class _HeaderPreviewDialog(QDialog):
                 ph = QLabel("Cannot preview video on this build.")
                 ph.setAlignment(Qt.AlignCenter)
                 lay.addWidget(ph, 1)
+
         else:
             img = QLabel()
             img.setAlignment(Qt.AlignCenter)
@@ -14117,7 +14462,7 @@ class PlannerPane(QWidget):
         self._pending_jobs: List[dict] = []
 
         # Chunk 4: reference images strategy
-        self._ref_strategy: str = ""  # qwen3vl_describe | qwen2511_best | qwenvl_reuse
+        self._ref_strategy: str = ""  # qwen3vl_describe | qwen2511_best | flux_klein_edit | qwenvl_reuse
         self._ref_multi_angle_lora: str = ""  # auto-detected path when available
         self._ref_qwen2511_high_quality: bool = False  # Chunk 4: Qwen 2511 HQ toggle (1280x720)
 
@@ -15189,6 +15534,7 @@ If the planner sees a marker like [02] or (02), it becomes the next image prompt
             "SDXL (Lowest vram, fast, low quality)",
             "Z-image Turbo (FP16 High VRAM)",
             "Z-image Turbo (GGUF Low VRAM)",
+            "Flux Klein (Very Fast, low vram, no NSFW).",
             "More (Maybe later)",
         ])
         # Default text-to-image engine: Z-image Turbo (GGUF Low VRAM)
@@ -16422,6 +16768,13 @@ If the planner sees a marker like [02] or (02), it becomes the next image prompt
 
         self.results_view.selectionModel().selectionChanged.connect(self._on_results_selection_changed)
 
+        # Right-click menu on rows
+        try:
+            self.results_view.setContextMenuPolicy(Qt.CustomContextMenu)
+            self.results_view.customContextMenuRequested.connect(self._on_results_context_menu)
+        except Exception:
+            pass
+
         root.addWidget(self.results_view, 1)
 
         # Actions row
@@ -16614,10 +16967,16 @@ If the planner sees a marker like [02] or (02), it becomes the next image prompt
         if not job_dir:
             return
 
+
+        # Allow deleting while other jobs run, but never delete an active (running/queued) job folder.
         try:
-            if getattr(self, "_worker", None) is not None and self._worker.isRunning():
-                QMessageBox.information(self, "Busy", "A pipeline job is currently running. Stop it before deleting folders.")
-                return
+            idxs = self.results_view.selectionModel().selectedRows()
+            if idxs:
+                row = idxs[0].row()
+                status = str(self.results_model.item(row, 2).text() or "")
+                if self._is_active_job_status(status):
+                    QMessageBox.information(self, "Remove folder", "This job is running or queued. You can't delete its folder right now.")
+                    return
         except Exception:
             pass
 
@@ -16718,6 +17077,274 @@ If the planner sees a marker like [02] or (02), it becomes the next image prompt
         self._worker.start()
 
     @Slot()
+
+    # -------------------------
+    # Results: favorites + RMB menu
+    # -------------------------
+
+    def _planner_fav_path(self) -> str:
+        return str((_root() / "presets" / "setsave" / "planner_fav.json").resolve())
+
+    def _load_planner_favs(self) -> List[str]:
+        try:
+            obj = _safe_read_json(self._planner_fav_path()) or {}
+            order = obj.get("order") if isinstance(obj, dict) else None
+            if isinstance(order, list):
+                return [str(x) for x in order if str(x).strip()]
+        except Exception:
+            pass
+        return []
+
+    def _save_planner_favs(self, order: List[str]) -> None:
+        try:
+            _safe_write_json(self._planner_fav_path(), {"order": list(order or [])})
+        except Exception:
+            pass
+
+    def _fav_key_for_dir(self, job_dir: str) -> str:
+        try:
+            p = Path(str(job_dir)).resolve()
+            try:
+                return str(p.relative_to(_root()))
+            except Exception:
+                return str(p)
+        except Exception:
+            return str(job_dir or "")
+
+    def _is_favorited(self, job_dir: str) -> bool:
+        key = self._fav_key_for_dir(job_dir)
+        favs = self._load_planner_favs()
+        return key in favs
+
+    def _toggle_favorite(self, job_dir: str) -> None:
+        key = self._fav_key_for_dir(job_dir)
+        favs = self._load_planner_favs()
+        if key in favs:
+            favs = [x for x in favs if x != key]
+        else:
+            favs.insert(0, key)  # newest favorite at top
+        self._save_planner_favs(favs)
+        try:
+            self._refresh_results()
+        except Exception:
+            pass
+
+    def _move_favorite_to_top(self, job_dir: str) -> None:
+        key = self._fav_key_for_dir(job_dir)
+        favs = self._load_planner_favs()
+        if key not in favs:
+            return
+        favs = [x for x in favs if x != key]
+        favs.insert(0, key)
+        self._save_planner_favs(favs)
+        try:
+            self._refresh_results()
+        except Exception:
+            pass
+
+    def _on_results_context_menu(self, pos) -> None:
+        try:
+            idx = self.results_view.indexAt(pos)
+            if not idx.isValid():
+                return
+            row = idx.row()
+            try:
+                self.results_view.selectRow(row)
+            except Exception:
+                pass
+
+            job_dir = str(self.results_model.item(row, 0).data(Qt.UserRole) or "")
+            status = str(self.results_model.item(row, 2).text() or "")
+            is_fav = self._is_favorited(job_dir)
+
+            menu = QMenu(self.results_view)
+
+            act_fav = QAction("Unfavorite" if is_fav else "Favorite", menu)
+            act_fav.triggered.connect(lambda _=None, jd=job_dir: self._toggle_favorite(jd))
+            menu.addAction(act_fav)
+
+            act_move = QAction("Move favorite to the top", menu)
+            act_move.setEnabled(bool(is_fav))
+            act_move.triggered.connect(lambda _=None, jd=job_dir: self._move_favorite_to_top(jd))
+            menu.addAction(act_move)
+
+            menu.addSeparator()
+
+            act_open = QAction("Open job folder", menu)
+            act_open.triggered.connect(lambda _=None: self._res_open_folder())
+            menu.addAction(act_open)
+
+            act_rename = QAction("Rename folder of the job", menu)
+            act_rename.triggered.connect(lambda _=None: self._res_rename_selected_job_folder())
+            menu.addAction(act_rename)
+
+            act_info = QAction("Show folder info", menu)
+            act_info.triggered.connect(lambda _=None: self._res_show_selected_folder_info())
+            menu.addAction(act_info)
+
+            menu.addSeparator()
+
+            act_remove = QAction("Remove folder", menu)
+            # allow only if NOT active
+            if self._is_active_job_status(status):
+                act_remove.setEnabled(False)
+                act_remove.setToolTip("This job is running or queued.")
+            act_remove.triggered.connect(lambda _=None: self._res_remove_folder())
+            menu.addAction(act_remove)
+
+            menu.exec(self.results_view.viewport().mapToGlobal(pos))
+        except Exception:
+            return
+
+    def _is_active_job_status(self, status: str) -> bool:
+        s = str(status or "").strip().lower()
+        if not s:
+            return False
+        # conservative: block deletion if it looks active
+        active_words = ("running", "queued", "queue", "pending", "working", "in progress", "processing")
+        return any(w in s for w in active_words)
+
+    def _res_rename_selected_job_folder(self) -> None:
+        p = self._get_selected_result_paths()
+        job_dir = str(p.get("job_dir") or "")
+        if not job_dir or not os.path.isdir(job_dir):
+            QMessageBox.information(self, "Rename folder", "No job folder selected.")
+            return
+
+        base = os.path.dirname(job_dir)
+        old_name = os.path.basename(job_dir)
+
+        new_name, ok = QInputDialog.getText(self, "Rename folder", "New folder name:", text=old_name)
+        if not ok:
+            return
+        new_name = str(new_name or "").strip()
+        if not new_name or new_name == old_name:
+            return
+
+        # basic sanitization (Windows)
+        bad = '<>:"/\|?*'
+        if any(c in new_name for c in bad):
+            QMessageBox.warning(self, "Rename folder", f"Invalid folder name. Avoid: {bad}")
+            return
+
+        new_dir = os.path.join(base, new_name)
+        if os.path.exists(new_dir):
+            QMessageBox.warning(self, "Rename folder", "A folder with that name already exists.")
+            return
+
+        try:
+            os.rename(job_dir, new_dir)
+        except Exception as e:
+            QMessageBox.warning(self, "Rename folder", f"Failed to rename folder:\n{e}")
+            return
+
+        # update favorites key if present
+        try:
+            old_key = self._fav_key_for_dir(job_dir)
+            new_key = self._fav_key_for_dir(new_dir)
+            favs = self._load_planner_favs()
+            if old_key in favs:
+                favs = [new_key if x == old_key else x for x in favs]
+                self._save_planner_favs(favs)
+        except Exception:
+            pass
+
+        try:
+            self._refresh_results()
+        except Exception:
+            pass
+
+        # try to reselect the renamed folder
+        try:
+            self._select_result_by_job_dir(new_dir)
+        except Exception:
+            pass
+
+    def _select_result_by_job_dir(self, job_dir: str) -> None:
+        jd = str(job_dir or "")
+        if not jd:
+            return
+        for row in range(self.results_model.rowCount()):
+            try:
+                rjd = str(self.results_model.item(row, 0).data(Qt.UserRole) or "")
+                if os.path.normpath(rjd) == os.path.normpath(jd):
+                    self.results_view.selectRow(row)
+                    try:
+                        self.results_view.scrollTo(self.results_model.index(row, 0))
+                    except Exception:
+                        pass
+                    return
+            except Exception:
+                continue
+
+    def _res_show_selected_folder_info(self) -> None:
+        p = self._get_selected_result_paths()
+        job_dir = str(p.get("job_dir") or "")
+        if not job_dir or not os.path.isdir(job_dir):
+            QMessageBox.information(self, "Folder info", "No job folder selected.")
+            return
+
+        img_ext = {".png", ".jpg", ".jpeg", ".webp", ".bmp", ".gif", ".tiff", ".tif"}
+        vid_ext = {".mp4", ".mov", ".mkv", ".webm", ".avi", ".m4v"}
+
+        img_n = 0
+        vid_n = 0
+        total_bytes = 0
+
+        try:
+            for root_dir, _dirs, files in os.walk(job_dir):
+                for fn in files:
+                    fp = os.path.join(root_dir, fn)
+                    ext = os.path.splitext(fn)[1].lower()
+                    if ext in img_ext:
+                        img_n += 1
+                    if ext in vid_ext:
+                        vid_n += 1
+                    try:
+                        total_bytes += os.path.getsize(fp)
+                    except Exception:
+                        pass
+        except Exception:
+            pass
+
+        def _fmt_bytes(n: int) -> str:
+            try:
+                n = float(n)
+                for unit in ["B", "KB", "MB", "GB", "TB"]:
+                    if n < 1024.0:
+                        return f"{n:.1f} {unit}"
+                    n /= 1024.0
+                return f"{n:.1f} PB"
+            except Exception:
+                return str(total_bytes)
+
+        # best-effort: show last modified + final video if present
+        last_mod = ""
+        try:
+            ts = os.path.getmtime(job_dir)
+            last_mod = datetime.datetime.fromtimestamp(ts).strftime("%Y-%m-%d %H:%M:%S")
+        except Exception:
+            last_mod = ""
+
+        final_video = ""
+        try:
+            final_video = str(p.get("final_video") or "")
+        except Exception:
+            final_video = ""
+
+        msg = (
+            f"Folder:\n{job_dir}\n\n"
+            f"Images: {img_n}\n"
+            f"Videos: {vid_n}\n"
+            f"Total size: {_fmt_bytes(total_bytes)}"
+        )
+        if last_mod:
+            msg += f"\nLast modified: {last_mod}"
+        if final_video:
+            msg += f"\nFinal video: {final_video}"
+
+        QMessageBox.information(self, "Folder info", msg)
+
     def _refresh_results(self) -> None:
         try:
             base = self._get_output_base()
@@ -16773,8 +17400,31 @@ If the planner sees a marker like [02] or (02), it becomes the next image prompt
         except Exception:
             return []
 
-        # newest first
-        subdirs.sort(key=lambda p: p.stat().st_mtime if p.exists() else 0, reverse=True)
+        # Favorites first (ordered by planner_fav.json), then newest first.
+        fav_order = []
+        try:
+            fav_obj = _safe_read_json(str((_root() / "presets" / "setsave" / "planner_fav.json").resolve())) or {}
+            if isinstance(fav_obj, dict) and isinstance(fav_obj.get("order"), list):
+                fav_order = [str(x) for x in fav_obj.get("order") if str(x).strip()]
+        except Exception:
+            fav_order = []
+
+        def _fav_idx(p: Path) -> int:
+            try:
+                rp = str(p.resolve())
+                try:
+                    key = str(p.resolve().relative_to(_root()))
+                except Exception:
+                    key = rp
+                if key in fav_order:
+                    return fav_order.index(key)
+            except Exception:
+                pass
+            return 10**9
+
+        subdirs.sort(
+            key=lambda p: (_fav_idx(p), -(p.stat().st_mtime if p.exists() else 0)),
+        )
 
         for d in subdirs:
             mpath = d / "manifest.json"
@@ -16783,6 +17433,17 @@ If the planner sees a marker like [02] or (02), it becomes the next image prompt
 
             manifest = _safe_read_json(str(mpath)) or {}
             title = str(manifest.get("title") or d.name)
+            try:
+                # show a subtle star for favorites (sorting is handled above)
+                key = ""
+                try:
+                    key = str(d.resolve().relative_to(_root()))
+                except Exception:
+                    key = str(d.resolve())
+                if key in fav_order:
+                    title = "★ " + title
+            except Exception:
+                pass
             status = self._derive_job_status(str(d), manifest)
             updated_ts = self._derive_job_updated_ts(str(d), manifest)
             updated = updated_ts
@@ -18007,7 +18668,7 @@ If the planner sees a marker like [02] or (02), it becomes the next image prompt
                 pass
 
     def _sync_image_model_lock_for_qwen2511_refs(self) -> None:
-        "Disable Image model selection when Qwen Edit 2511 is actively driving image creation via reference images."
+        "Disable Image model selection when a ref-workflow drives image creation (Qwen 2511 or Flux Klein Edit)."
         try:
             has_refs = bool(getattr(self, "ref_list", None) and int(self.ref_list.count()) > 0)
         except Exception:
@@ -18017,13 +18678,17 @@ If the planner sees a marker like [02] or (02), it becomes the next image prompt
         except Exception:
             strat = ""
 
-        lock = bool(has_refs and strat == "qwen2511_best")
+        lock = bool(has_refs and strat in ("qwen2511_best", "flux_klein_edit"))
 
         # The combo lives in Settings; guard for early calls during init.
         cmb = getattr(self, "cmb_image_model", None)
 
-        hint = "Using Qwen Edit for reference image creation"
-        hint_key = "__QWEN2511_REF_LOCK__"
+        if strat == "flux_klein_edit":
+            hint = "Using Flux Klein Edit for reference image creation"
+            hint_key = "__FLUX_KLEIN_EDIT_REF_LOCK__"
+        else:
+            hint = "Using Qwen Edit for reference image creation"
+            hint_key = "__QWEN2511_REF_LOCK__"
 
         if lock:
             try:
@@ -18181,11 +18846,13 @@ If the planner sees a marker like [02] or (02), it becomes the next image prompt
             f"{n} reference image(s) added. Choose how to use them:\n\n"
             'A) Use image(s) as reference → Qwen3-VL Describe generates story prompt guidance (fast)\n'
             'B) Best attempt consistency → Qwen Edit 2511 (max 2 refs, slower; 16GB+ VRAM recommended)\n'
+            'C) Fast reference consistency → Flux Klein Edit (less precise than Qwen 2511, but >10× faster; 12–16GB VRAM)\n'
             'Cancel → lightweight reuse (Qwen-VL look & reuse obvious objects)\n'
         )
 
         btn_a = msg.addButton('A) Qwen3-VL Describe', QMessageBox.AcceptRole)
         btn_b = msg.addButton('B) Qwen Edit 2511', QMessageBox.AcceptRole)
+        btn_fx = msg.addButton('C) Flux Klein Edit', QMessageBox.AcceptRole)
         btn_c = msg.addButton('Cancel (lightweight reuse)', QMessageBox.RejectRole)
         msg.setDefaultButton(btn_c)
         msg.exec()
@@ -18237,6 +18904,11 @@ If the planner sees a marker like [02] or (02), it becomes the next image prompt
                     )
             except Exception:
                 self._ref_multi_angle_lora = ''
+
+        elif clicked == btn_fx:
+            self._ref_strategy = 'flux_klein_edit'
+            self._ref_multi_angle_lora = ''
+            self._ref_qwen2511_high_quality = False
 
         else:
             self._ref_strategy = 'qwenvl_reuse'

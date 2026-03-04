@@ -186,6 +186,23 @@ def enqueue_tool_job(job_type: str, input_path: str, out_dir: str, args: dict, p
     d = jobs_dirs()
     return make_job_json(job_type, input_path, out_dir, args or {}, str(d['pending']), priority=int(priority))
 
+
+def enqueue_ace_step15(cfg_path: str, out_dir: str, env_python: str, cli_py: str, project_root: str, label: str="Ace-Step 1.5", hide_console: bool=True, priority: int=620):
+    """Convenience wrapper to enqueue an Ace-Step 1.5 job.
+
+    The Ace-Step 1.5 UI writes a TOML config first, then enqueues the job so it is
+    reproducible when the worker picks it up.
+    """
+    args = {
+        "label": label,
+        "env_python": env_python,
+        "cli_py": cli_py,
+        "project_root": project_root,
+        "cfg_path": cfg_path,
+        "hide_console": bool(hide_console),
+    }
+    return enqueue_tool_job("ace_step_15", "", out_dir, args, priority=int(priority))
+
 def enqueue_rife_from_widget(inner):
     """Read fields from RifeWidget and enqueue a rife_interpolate job."""
     # Pull values with best-effort getattr

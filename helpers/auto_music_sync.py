@@ -1826,22 +1826,49 @@ def build_timeline(
             eligible_idx = [i for i in eligible_idx if (section_labels[i] or "").lower() != "intro"]
 
         if enabled_effects and cumulative > 0.0:
+            # Use a cooldown so cinematic effects don't spam: once an effect triggers,
+            # wait at least 10 seconds (timeline time) before allowing another.
+            CINE_COOLDOWN_SEC = 10.0
+
+            # Shuffle-bag: cycle through all enabled cinematic effects once before repeating.
+            effect_bag: List[str] = []
+
+            def _pick_effect_name() -> str:
+                nonlocal effect_bag
+                if not effect_bag:
+                    effect_bag = list(enabled_effects)
+                    random.shuffle(effect_bag)
+                try:
+                    return str(effect_bag.pop())
+                except Exception:
+                    return str(random.choice(enabled_effects))
+
             buckets: dict[int, List[int]] = {}
             for idx in eligible_idx:
                 t = centers[idx]
-                block = int(t // 5.0) # change speed of change
+                # Group by 10-second blocks to keep selection efficient, but enforce
+                # a strict cooldown based on the exact selected time.
+                block = int(t // CINE_COOLDOWN_SEC)
                 buckets.setdefault(block, []).append(idx)
 
+            last_cine_time = -1e9
             for block_idx in sorted(buckets.keys()):
                 idx_list = buckets[block_idx]
 
                 if not idx_list:
                     continue
-                # One cinematic event per 5-second block at most.
-                seg_idx = random.choice(idx_list)
+
+                # Only pick segments that satisfy the cooldown vs the previous cinematic event.
+                ok = [i for i in idx_list if (centers[i] - last_cine_time) >= CINE_COOLDOWN_SEC]
+                if not ok:
+                    continue
+
+                seg_idx = random.choice(ok)
                 seg = segments[seg_idx]
-                effect_name = random.choice(enabled_effects)
+                effect_name = _pick_effect_name()
+                last_cine_time = float(centers[seg_idx])
                 if effect_name == "freeze":
+
                     seg.cine_freeze = True
                     seg.cine_freeze_len = float(max(0.10, min(1.0, cine_freeze_len)))
                     # Slider stays the same (0.0–0.5), but now drives the Shutter-pop intensity.
@@ -4769,7 +4796,7 @@ class RenderWorker(QThread):
                         continue
 
 
-                # Mosaic cinematic effect: replace this segment with a grid of multiple clips.
+                                # Mosaic cinematic effect: replace this segment with a grid of multiple clips.
                 if getattr(seg, "cine_mosaic", False):
                     # Number of screens requested (clamped 2–9).
                     try:
@@ -4777,7 +4804,7 @@ class RenderWorker(QThread):
                     except Exception:
                         screens = 4
                     screens = max(2, min(9, screens))
-
+                
                     if all_video_paths:
                         # Choose random source clips for the mosaic.
                         if len(all_video_paths) >= screens:
@@ -4785,30 +4812,25 @@ class RenderWorker(QThread):
                         else:
                             # Sample with replacement when there are fewer unique clips than screens.
                             chosen_paths = [random.choice(all_video_paths) for _ in range(screens)]
-
+                
                         # Target resolution for the grid (fall back to 1920x1080 if not specified).
-                    if self.target_resolution:
-                        target_w, target_h = self.target_resolution
-                    else:
-                        target_w, target_h = 1920, 1080
-
-                    # Make targets stable for yuv420p / NVENC (even sizes),
-                    # and keep tile math consistent with pad/scale.
-                    try:
-                        target_w = int(target_w)
-                        target_h = int(target_h)
-                    except Exception:
-                        pass
-                    if target_w % 2:
-                        target_w += 1
-                    if target_h % 2:
-                        target_h += 1
-
-                        # Compute a deterministic (cols, rows) layout that fully covers the frame.
-                        cols, rows = _cine_grid_dims(screens)
-                        tile_w = max(1, target_w // cols)
-                        tile_h = max(1, target_h // rows)
-
+                        if self.target_resolution:
+                            target_w, target_h = self.target_resolution
+                        else:
+                            target_w, target_h = 1920, 1080
+                
+                        # Make targets stable for yuv420p / NVENC (even sizes),
+                        # and keep tile math consistent with pad/scale.
+                        try:
+                            target_w = int(target_w)
+                            target_h = int(target_h)
+                        except Exception:
+                            pass
+                        if target_w % 2:
+                            target_w += 1
+                        if target_h % 2:
+                            target_h += 1
+                
                         # Build input list with per-source seek & duration, using cached durations.
                         seg_duration = float(seg_trim_dur) or 1.0
                         input_args = []
@@ -4817,27 +4839,18 @@ class RenderWorker(QThread):
                             dur = duration_cache.get(path)
                             if dur is None:
                                 dur = _ffprobe_duration(self.ffprobe, path)
+                                # If ffprobe fails (missing/broken), don't kill the effect — just start at 0.
                                 if dur is None or dur <= 0.0:
-                                    continue
+                                    dur = seg_duration
                                 duration_cache[path] = dur
                             max_start = max(0.0, dur - seg_duration)
                             start = random.uniform(0.0, max_start) if max_start > 0 else 0.0
-                            input_args.extend(
-                                [
-                                    "-ss",
-                                    f"{start:.3f}",
-                                    "-t",
-                                    f"{seg_duration:.3f}",
-                                    "-i",
-                                    path,
-                                ]
-                            )
+                            input_args.extend(["-ss", f"{start:.3f}", "-t", f"{seg_duration:.3f}", "-i", path])
                             valid_inputs += 1
-
+                
                         if valid_inputs > 0:
                             # Build filter_complex: scale/pad each tile, stack with xstack, then fit to target.
-                            # Use a smarter layout so that 5 ⇒ 3+2 and 7 ⇒ 4+3 etc.,
-                            # and rows always fill the full frame height.
+                            # Use a smarter layout so that 5 ⇒ 3+2 and 7 ⇒ 4+3 etc.
                             layout = _cine_grid_layout(valid_inputs, target_w, target_h)
                             per_inputs = []
                             layout_entries = []
@@ -4848,15 +4861,12 @@ class RenderWorker(QThread):
                                     f"pad={tile_w_i}:{tile_h_i}:(ow-iw)/2:(oh-ih)/2:black[v{idx_m}]"
                                 )
                                 layout_entries.append(f"{pos_x}_{pos_y}")
-
-                            
+                
                             xstack = (
                                 "".join(f"[v{idx_m}]" for idx_m in range(valid_inputs))
-                                + f"xstack=inputs={valid_inputs}:layout="
-                                + "|".join(layout_entries)
-                                + ":fill=black[vs]"
+                                + f"xstack=inputs={valid_inputs}:layout=" + "|".join(layout_entries) + ":fill=black[vs]"
                             )
-
+                
                             # Optional slow-motion factor: keep behaviour consistent with other segments.
                             slow_factor = float(getattr(seg, "slow_factor", 1.0) or 1.0)
                             if slow_factor != 1.0:
@@ -4870,25 +4880,19 @@ class RenderWorker(QThread):
                                     f"[vs]fps=fps={fps_expr},scale={target_w}:{target_h}:force_original_aspect_ratio=decrease,"
                                     f"pad={target_w}:{target_h}:(ow-iw)/2:(oh-ih)/2:black[vout]"
                                 )
-
+                
                             filter_complex = ";".join(per_inputs + [xstack, final])
-
+                
                             out_part = os.path.join(tmpdir, f"part_{i:04d}.mp4")
                             cmd = [
-                                self.ffmpeg,
-                                "-y",
+                                self.ffmpeg, "-y",
                                 *input_args,
                                 "-an",
-                                "-filter_complex",
-                                filter_complex,
-                                "-map",
-                                "[vout]",
-                                "-c:v",
-                                "h264_nvenc",
-                                "-preset",
-                                "fast",
-                                "-pix_fmt",
-                                "yuv420p",
+                                "-filter_complex", filter_complex,
+                                "-map", "[vout]",
+                                "-c:v", "h264_nvenc",
+                                "-preset", "fast",
+                                "-pix_fmt", "yuv420p",
                                 out_part,
                             ]
                             code, out = _run_ffmpeg(cmd)
@@ -4896,9 +4900,9 @@ class RenderWorker(QThread):
                                 raise RuntimeError(f"ffmpeg failed for mosaic segment {i+1}:\n{out}")
                             parts.append(out_part)
                             continue
-                        # If we couldn't build a valid mosaic, fall back to standard rendering.
-
-                # For still images, loop the single frame so it lasts the full segment duration.
+                    # If we couldn't build a valid mosaic (no clip pool / no inputs), fall back to standard rendering.
+                
+# For still images, loop the single frame so it lasts the full segment duration.
                 if getattr(seg, "is_image", False):
                     base_cmd = [
                         self.ffmpeg,

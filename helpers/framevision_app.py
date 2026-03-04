@@ -1019,29 +1019,59 @@ class VideoPane(QWidget):
             pass
 
     # --- Compact label logic (auto) ---
-    def _apply_compact_label(self, btn, compact: bool, full_text: str, compact_text: str, style_full: str, style_compact: str):
+    def _apply_compact_label(self, btn, compact: bool, full_text: str, compact_text: str):
+        """Toggle a QPushButton between full text and 1-letter compact mode.
+
+        Compact mode:
+          - Shows a single bold capital letter.
+          - Adds tooltip with the full label.
+        """
         try:
             if btn is None:
                 return
             want = bool(compact)
+
+            # Cache original font/text once.
+            if not hasattr(btn, "_fv_full_font"):
+                try:
+                    btn._fv_full_font = btn.font()
+                except Exception:
+                    btn._fv_full_font = None
+            if not hasattr(btn, "_fv_full_text"):
+                btn._fv_full_text = str(full_text)
+
             cur = bool(getattr(btn, "_fv_compact_label", False))
             if want == cur:
                 return
+
             btn._fv_compact_label = want
+
             if want:
-                btn.setText(str(compact_text or "")[:1].upper())
+                # 1-letter label
+                letter = (str(compact_text or "")[:1] or str(full_text or "")[:1] or "?").upper()
+                btn.setText(letter)
+                # Bold
                 try:
-                    btn.setStyleSheet(style_compact)
+                    f = btn.font()
+                    f.setBold(True)
+                    btn.setFont(f)
                 except Exception:
                     pass
+                # Tooltip
                 try:
-                    btn.setToolTip(full_text)
+                    btn.setToolTip(str(full_text))
                 except Exception:
                     pass
             else:
-                btn.setText(full_text)
+                btn.setText(str(full_text))
+                # Restore original font
                 try:
-                    btn.setStyleSheet(style_full)
+                    if getattr(btn, "_fv_full_font", None) is not None:
+                        btn.setFont(btn._fv_full_font)
+                    else:
+                        f = btn.font()
+                        f.setBold(False)
+                        btn.setFont(f)
                 except Exception:
                     pass
                 try:
@@ -1052,14 +1082,21 @@ class VideoPane(QWidget):
             pass
 
     def _update_compact_button_labels(self):
-        """Swap Upscale/Ask Framie/Repeat to single-letter mode when there isn't room for full labels."""
+        """Auto-switch the bottom action buttons to bold single letters when space is tight.
+
+        IMPORTANT: Avoid a feedback loop where compact text reduces sizeHint(), the layout shrinks the
+        button, and then it can never grow back. We decide compact/full based on *available bar width*
+        (and font metrics), not the button's current width.
+        """
         try:
             bu = getattr(self, "btn_upscale", None)
             ba = getattr(self, "btn_ask", None)
             br = getattr(self, "btn_repeat", None)
-            if bu is None or ba is None:
+
+            if bu is None or ba is None or getattr(self, "_controls_bar_layout", None) is None:
                 return
-            include_repeat = bool(br is not None and br.isVisible())
+
+            bar = self._controls_bar_layout
 
             # Layout can report 0 sizes early in init; retry once we're laid out.
             if self.width() <= 10:
@@ -1074,74 +1111,105 @@ class VideoPane(QWidget):
             full_a = getattr(self, "_btn_ask_full_text", "Ask Framie")
             full_r = getattr(self, "_btn_repeat_full_text", "Repeat")
 
-            fm_u = bu.fontMetrics()
-            fm_a = ba.fontMetrics()
-
-            # Approximate full-label width as (text + padding/border).
-            need_u = int(fm_u.horizontalAdvance(full_u)) + 28
-            need_a = int(fm_a.horizontalAdvance(full_a)) + 28
-
-            need_r = 0
-            if include_repeat:
+            # Estimate required width for a given label on a given button.
+            def _need_w(btn, label: str, bold: bool) -> int:
                 try:
-                    fm_r = br.fontMetrics()
-                    need_r = int(fm_r.horizontalAdvance(full_r)) + 28
+                    from PySide6.QtGui import QFontMetrics
+                    f = btn.font()
+                    f.setBold(bool(bold))
+                    fm = QFontMetrics(f)
+                    # Conservative padding (Qt styles vary). Keep this a little generous to avoid clipping.
+                    pad = 28
+                    return int(fm.horizontalAdvance(str(label))) + pad
                 except Exception:
-                    need_r = 0
+                    return 0
 
-            # Available width in the bar: subtract some spacing/margins.
-            avail = int(self.width()) - 40
+            # We decide compact/full for visible action buttons using a greedy "compact from right" rule.
+            actions = []
+            actions.append(("up", bu, full_u, "U"))
+            actions.append(("ask", ba, full_a, "A"))
+            if br is not None and br.isVisible():
+                actions.append(("rep", br, full_r, "R"))
 
-            need_full = need_u + need_a + (need_r if include_repeat else 0)
-
-            want_compact = need_full > avail
-
-            # Cache styles for toggle (only once).
+            # Compute the bar width available after accounting for other widgets/spacers.
             try:
-                if not hasattr(self, "_btn_upscale_style_full"):
-                    self._btn_upscale_style_full = bu.styleSheet() or ""
-                if not hasattr(self, "_btn_ask_style_full"):
-                    self._btn_ask_style_full = ba.styleSheet() or ""
-                if include_repeat and br is not None and not hasattr(self, "_btn_repeat_style_full"):
-                    self._btn_repeat_style_full = br.styleSheet() or ""
+                margins = bar.contentsMargins()
+                bar_w = int(self.width()) - int(margins.left()) - int(margins.right())
+                bar_w = max(0, bar_w)
+            except Exception:
+                bar_w = int(self.width())
+
+            other_w = 0
+            try:
+                spacing = int(bar.spacing()) if bar.spacing() is not None else 6
+            except Exception:
+                spacing = 6
+
+            # Sum widths of all items in the bar except our action buttons, and ignore stretch/spacers.
+            try:
+                n = bar.count()
+                widgets_counted = 0
+                for i in range(n):
+                    it = bar.itemAt(i)
+                    if it is None:
+                        continue
+                    w = it.widget()
+                    if w is not None:
+                        if w in (bu, ba, br):
+                            continue
+                        if not w.isVisible():
+                            continue
+                        other_w += int(w.sizeHint().width())
+                        widgets_counted += 1
+                    else:
+                        # Spacers/stretch: ignore (they are the leftover space sink)
+                        pass
+                # Account for spacing between the non-action widgets (roughly).
+                if widgets_counted > 1:
+                    other_w += spacing * (widgets_counted - 1)
             except Exception:
                 pass
 
-            if want_compact:
-                try:
-                    bu.setText(getattr(self, "_btn_upscale_compact_text", "U"))
-                    ba.setText(getattr(self, "_btn_ask_compact_text", "A"))
-                    if include_repeat and br is not None:
-                        br.setText(getattr(self, "_btn_repeat_compact_text", "R"))
-                except Exception:
-                    pass
-                # Optional compact styles (if present)
-                try:
-                    if hasattr(self, "_btn_upscale_style_compact"):
-                        bu.setStyleSheet(getattr(self, "_btn_upscale_style_compact", ""))
-                    if hasattr(self, "_btn_ask_style_compact"):
-                        ba.setStyleSheet(getattr(self, "_btn_ask_style_compact", ""))
-                    if include_repeat and br is not None and hasattr(self, "_btn_repeat_style_compact"):
-                        br.setStyleSheet(getattr(self, "_btn_repeat_style_compact", ""))
-                except Exception:
-                    pass
-            else:
-                try:
-                    bu.setText(full_u)
-                    ba.setText(full_a)
-                    if include_repeat and br is not None:
-                        br.setText(full_r)
-                except Exception:
-                    pass
-                try:
-                    bu.setStyleSheet(getattr(self, "_btn_upscale_style_full", bu.styleSheet()))
-                    ba.setStyleSheet(getattr(self, "_btn_ask_style_full", ba.styleSheet()))
-                    if include_repeat and br is not None:
-                        br.setStyleSheet(getattr(self, "_btn_repeat_style_full", br.styleSheet()))
-                except Exception:
-                    pass
+            # Available for action buttons (and spacing between them).
+            avail = max(0, bar_w - other_w - 8)
+
+            # Start with all FULL, then compact from the right until it fits.
+            state = {key: "full" for key, *_ in actions}
+
+            def _total_needed() -> int:
+                tot = 0
+                visible_actions = [a for a in actions if a[1] is not None and a[1].isVisible()]
+                for idx, (key, btn, full, letter) in enumerate(visible_actions):
+                    if state.get(key) == "full":
+                        tot += _need_w(btn, full, bold=False)
+                    else:
+                        tot += _need_w(btn, letter, bold=True)
+                    if idx < len(visible_actions) - 1:
+                        tot += spacing
+                return tot
+
+            # Greedy compaction: repeat -> ask -> upscale
+            order = [a[0] for a in reversed(actions)]
+            guard = 0
+            while _total_needed() > avail and guard < 10:
+                guard += 1
+                changed = False
+                for key in order:
+                    if state.get(key) == "full":
+                        state[key] = "compact"
+                        changed = True
+                        break
+                if not changed:
+                    break
+
+            # Apply.
+            for key, btn, full, letter in actions:
+                want_compact = (state.get(key) == "compact")
+                self._apply_compact_label(btn, want_compact, full, letter)
+
         except Exception:
             pass
+
 
     def _set_zoom(self, new_zoom: float):
         try:
@@ -5123,7 +5191,7 @@ class MainWindow(QMainWindow):
                         idx_wan = -1
 
                     if idx_wan is not None and idx_wan >= 0:
-                        self.tabs.insertTab(idx_wan + 1, self.qwen2511, 'Qwen Edit  2511')
+                        self.tabs.insertTab(idx_wan + 1, self.qwen2511, ' Image Edit')
                     else:
                         idx_txt = -1
                         try:
@@ -5131,12 +5199,12 @@ class MainWindow(QMainWindow):
                         except Exception:
                             idx_txt = -1
                         if idx_txt is not None and idx_txt >= 0:
-                            self.tabs.insertTab(idx_txt + 1, self.qwen2511, 'Qwen Edit  2511')
+                            self.tabs.insertTab(idx_txt + 1, self.qwen2511, ' Image Edit')
                         else:
-                            self.tabs.addTab(self.qwen2511, 'Qwen Edit  2511')
+                            self.tabs.addTab(self.qwen2511, ' Image Edit')
                 except Exception as _attach_e:
                     try:
-                        self.tabs.addTab(self.qwen2511, 'Qwen Edit  2511')
+                        self.tabs.addTab(self.qwen2511, ' Image Edit')
                     except Exception as _e2:
                         print('[framevision] Qwen2511 tab attach failed:', _e2)
             except Exception as _e:

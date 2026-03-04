@@ -114,6 +114,12 @@ class MusicEditSettings:
     meta_bpm: str = ""
     meta_extra: str = ""
 
+    # Fade options (export-time)
+    fade_in_enabled: bool = False
+    fade_in_sec: float = 1.0
+    fade_out_enabled: bool = False
+    fade_out_sec: float = 1.0
+
 
 class WaveformWidget(QWidget):
     """
@@ -137,6 +143,7 @@ class WaveformWidget(QWidget):
         self._plot = None
         self._curve = None
         self._region = None
+        self._playhead = None
         self._duration_ms = 0
         self._has_waveform = False
         self._selection_clipboard: Optional[Tuple[float, float]] = None
@@ -154,13 +161,31 @@ class WaveformWidget(QWidget):
                 pass
             self._layout.addWidget(label)
         else:
-            self._plot = _pg.PlotWidget(self)
+            # Time ruler axis (bottom) so users can see where they are.
+            class _TimeAxisItem(_pg.AxisItem):
+                def tickStrings(self, values, scale, spacing):  # type: ignore
+                    out = []
+                    for v in values:
+                        try:
+                            ms = int(round(float(v)))
+                            out.append(_ms_to_time_str(ms))
+                        except Exception:
+                            out.append("")
+                    return out
+
+            self._plot = _pg.PlotWidget(self, axisItems={"bottom": _TimeAxisItem(orientation="bottom")})
             try:
                 self._plot.setBackground(None)  # inherit theme (light/dark)
                 self._plot.hideButtons()
                 self._plot.showGrid(x=False, y=False)
                 self._plot.getPlotItem().hideAxis("left")
-                self._plot.getPlotItem().hideAxis("bottom")
+                # Show bottom axis as a ruler (time in mm:ss.mmm)
+                self._plot.getPlotItem().showAxis("bottom")
+                try:
+                    ax = self._plot.getPlotItem().getAxis("bottom")
+                    ax.setHeight(22)
+                except Exception:
+                    pass
                 vb = self._plot.getViewBox()
                 # Horizontal pan/zoom only
                 vb.setMouseEnabled(x=True, y=False)
@@ -177,6 +202,16 @@ class WaveformWidget(QWidget):
                     pen = None
 
             self._curve = self._plot.plot([], [], pen=pen)
+
+            # Playhead indicator (vertical line) to show live playback position.
+            try:
+                self._playhead = _pg.InfiniteLine(angle=90, movable=False)
+                self._playhead.setZValue(20)
+                self._playhead.hide()
+                self._plot.addItem(self._playhead)
+            except Exception:
+                self._playhead = None
+
             self._layout.addWidget(self._plot)
             try:
                 self._plot.setContextMenuPolicy(Qt.CustomContextMenu)
@@ -201,12 +236,31 @@ class WaveformWidget(QWidget):
         self._has_waveform = False
         if self._curve is not None:
             self._curve.setData([], [])
+        if self._playhead is not None:
+            try:
+                self._playhead.hide()
+                self._playhead.setValue(0)
+            except Exception:
+                pass
         if self._region is not None:
             self._region.hide()
             try:
                 self._region.setRegion((0, 0))
             except Exception:
                 pass
+
+    def set_playhead_ms(self, pos_ms: int):
+        """Update the playhead indicator to the given time in ms."""
+        if self._playhead is None or not self._has_waveform:
+            return
+        try:
+            x = float(max(0, int(pos_ms)))
+            if self._duration_ms > 0:
+                x = min(x, float(self._duration_ms))
+            self._playhead.setValue(x)
+            self._playhead.show()
+        except Exception:
+            pass
 
     def set_duration_ms(self, duration_ms: int):
         """Optional: override duration if needed."""
@@ -581,8 +635,16 @@ class MusicEditWidget(QWidget):
         self._waveform_needs_update: bool = False
         self._is_loading: bool = False  # guard against re-entrancy
         self._play_selection_end_ms: int = 0
+        self._play_selection_start_ms: int = 0
         self._edit_clipboard_path: Optional[str] = None
         self._open_file_dir: str = ""
+
+        # Undo/Redo (persisted)
+        self._undo_dir, self._undo_state_path = self._compute_undo_paths()
+        self._undo_stack: list[str] = []
+        self._redo_stack: list[str] = []
+        self._undo_counter: int = 0
+        self._load_undo_state()
 
         # Media player for preview
         self._audio_output: Optional[QAudioOutput] = None
@@ -591,6 +653,7 @@ class MusicEditWidget(QWidget):
 
         self._build_ui()
         self._apply_settings_to_ui()
+        self._refresh_undo_buttons()
 
     # ----- Player lifecycle -----
     def _setup_player(self):
@@ -642,6 +705,74 @@ class MusicEditWidget(QWidget):
         # The user requested this exact filename (note the extension).
         return os.path.join(setsave_dir, "musicedit.json")
 
+    def _compute_undo_paths(self) -> Tuple[str, str]:
+        here = os.path.dirname(os.path.abspath(__file__))
+        root = os.path.abspath(os.path.join(here, os.pardir))
+        undo_dir = os.path.join(root, "presets", "setsave", "undo")
+        os.makedirs(undo_dir, exist_ok=True)
+        return undo_dir, os.path.join(undo_dir, "musicedit_undo.json")
+
+    def _load_undo_state(self):
+        try:
+            if os.path.isfile(self._undo_state_path):
+                with open(self._undo_state_path, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                self._undo_stack = [p for p in data.get("undo", []) if isinstance(p, str)]
+                self._redo_stack = [p for p in data.get("redo", []) if isinstance(p, str)]
+                self._undo_counter = int(data.get("counter", 0) or 0)
+        except Exception:
+            self._undo_stack = []
+            self._redo_stack = []
+            self._undo_counter = 0
+
+    def _save_undo_state(self):
+        try:
+            data = {
+                "undo": self._undo_stack,
+                "redo": self._redo_stack,
+                "counter": int(self._undo_counter),
+            }
+            with open(self._undo_state_path, "w", encoding="utf-8") as f:
+                json.dump(data, f, indent=2)
+        except Exception:
+            pass
+
+    def _reset_undo(self):
+        self._undo_stack = []
+        self._redo_stack = []
+        self._save_undo_state()
+        self._refresh_undo_buttons()
+
+    def _snapshot_current_to_undo(self, prefix: str) -> Optional[str]:
+        if not self._current_file or not os.path.isfile(self._current_file):
+            return None
+        try:
+            self._undo_counter += 1
+            ext = os.path.splitext(self._current_file)[1].lower() or ".wav"
+            name = f"{prefix}_{self._undo_counter:05d}{ext}"
+            dst = os.path.join(self._undo_dir, name)
+            shutil.copy2(self._current_file, dst)
+            return dst
+        except Exception:
+            return None
+
+    def _push_undo_point(self, label: str = "edit"):
+        """Save the current state as an undo point before a destructive edit."""
+        snap = self._snapshot_current_to_undo("undo")
+        if snap:
+            self._undo_stack.append(snap)
+            self._redo_stack = []  # new edit invalidates redo
+            if len(self._undo_stack) > 100:
+                self._undo_stack = self._undo_stack[-100:]
+            self._save_undo_state()
+        self._refresh_undo_buttons()
+
+    def _refresh_undo_buttons(self):
+        if hasattr(self, "btn_undo"):
+            self.btn_undo.setEnabled(len(self._undo_stack) > 0)
+        if hasattr(self, "btn_redo"):
+            self.btn_redo.setEnabled(len(self._redo_stack) > 0)
+
     def _load_settings(self) -> MusicEditSettings:
         try:
             if os.path.isfile(self._settings_path):
@@ -670,8 +801,10 @@ class MusicEditWidget(QWidget):
         # File row
         file_row = QHBoxLayout()
         self.btn_open = QPushButton("Open audio…", self)
+        self.btn_open.setToolTip("Open an audio file to edit (WAV/MP3 and other formats supported via FFmpeg).")
         self.btn_open.clicked.connect(self._on_open_clicked)
         self.lbl_file = QLabel("No file loaded", self)
+        self.lbl_file.setToolTip("Currently loaded file path. You can select and copy this text.")
         self.lbl_file.setTextInteractionFlags(Qt.TextSelectableByMouse)
 
         file_row.addWidget(self.btn_open)
@@ -680,6 +813,7 @@ class MusicEditWidget(QWidget):
 
         # Waveform + selection info
         self.waveform_view = WaveformWidget(self)
+        self.waveform_view.setToolTip("Waveform view. Drag the handles to select a region. Right-click for Cut/Copy/Paste/Zoom. Double-click empty space to reset selection to full track.")
         # Give waveform extra vertical space so it's easier to read
         try:
             self.waveform_view.setMinimumHeight(160)
@@ -693,57 +827,131 @@ class MusicEditWidget(QWidget):
         main_layout.addWidget(self.waveform_view, 1)
 
         self.lbl_selection = QLabel("Selection: full track", self)
+        self.lbl_selection.setToolTip("Shows the current selection range. If no region is selected, the full track is used.")
         main_layout.addWidget(self.lbl_selection)
 
         # Playback controls
-        playback_row = QHBoxLayout()
+        # Row 1: transport + loop + timeline
+        playback_row1 = QHBoxLayout()
         self.btn_play_pause = QPushButton("Play", self)
+        self.btn_play_pause.setToolTip("Play or pause the current track.")
         self.btn_stop = QPushButton("Stop", self)
+        self.btn_stop.setToolTip("Stop playback and return to the start of the current selection (or track).")
         self.btn_play_selection = QPushButton("Play selection", self)
+        self.btn_play_selection.setToolTip("Play only the selected region. If Loop selection is enabled, it will repeat until you stop.")
+
+        self.chk_loop_selection = QCheckBox("Loop selection", self)
+        self.chk_loop_selection.setToolTip("When enabled, Play selection will loop the selected region.")
+        self.chk_loop_selection.setChecked(False)
 
         self.btn_play_pause.clicked.connect(self._on_play_pause_clicked)
         self.btn_stop.clicked.connect(self._on_stop_clicked)
         self.btn_play_selection.clicked.connect(self._on_play_selection_clicked)
 
         self.position_slider = QSlider(Qt.Horizontal, self)
+        self.position_slider.setToolTip("Scrub playback position.")
         self.position_slider.setRange(0, 0)
         self.position_slider.sliderMoved.connect(self._on_slider_moved)
 
         self.lbl_time = QLabel("00:00.000 / 00:00.000", self)
+        self.lbl_time.setToolTip("Current playback time / total duration.")
 
-        playback_row.addWidget(self.btn_play_pause)
-        playback_row.addWidget(self.btn_stop)
-        playback_row.addWidget(self.btn_play_selection)
-        playback_row.addWidget(self.position_slider, 1)
-        playback_row.addWidget(self.lbl_time)
-        main_layout.addLayout(playback_row)
+        playback_row1.addWidget(self.btn_play_pause)
+        playback_row1.addWidget(self.btn_stop)
+        playback_row1.addWidget(self.btn_play_selection)
+        playback_row1.addWidget(self.chk_loop_selection)
+        playback_row1.addWidget(self.position_slider, 1)
+        playback_row1.addWidget(self.lbl_time)
+        main_layout.addLayout(playback_row1)
+
+        # Row 2: edit tools (kept on a separate line so labels never get truncated)
+        playback_row2 = QHBoxLayout()
+        self.btn_split = QPushButton("Split", self)
+        self.btn_split.setToolTip("Split at the current playhead position. Useful for cutting a track into parts.")
+        self.btn_delete_sel = QPushButton("Delete selection", self)
+        self.btn_delete_sel.setToolTip("Delete the selected region from the working audio.")
+        self.btn_undo = QPushButton("Undo", self)
+        self.btn_undo.setToolTip("Undo the last edit. History is saved in presets/setsave/undo/.")
+        self.btn_redo = QPushButton("Redo", self)
+        self.btn_redo.setToolTip("Redo the last undone edit.")
+
+        self.btn_split.clicked.connect(self._on_split_at_playhead)
+        self.btn_delete_sel.clicked.connect(self._on_delete_selection)
+        self.btn_undo.clicked.connect(self._on_undo)
+        self.btn_redo.clicked.connect(self._on_redo)
+
+        playback_row2.addWidget(self.btn_split)
+        playback_row2.addWidget(self.btn_delete_sel)
+        playback_row2.addWidget(self.btn_undo)
+        playback_row2.addWidget(self.btn_redo)
+        playback_row2.addStretch(1)
+        main_layout.addLayout(playback_row2)
 
         # Export options
         export_group = QGroupBox("Export / Save As", self)
         export_layout = QFormLayout(export_group)
 
         self.combo_format = QComboBox(self)
+        self.combo_format.setToolTip("Choose output format for Save As.")
         self.combo_format.addItem("MP3", userData="mp3")
         self.combo_format.addItem("WAV", userData="wav")
         self.combo_format.currentIndexChanged.connect(self._on_format_changed)
 
         self.combo_mp3_bitrate = QComboBox(self)
+        self.combo_mp3_bitrate.setToolTip("MP3 bitrate for exported MP3 files.")
         for br in [24, 32, 40, 48, 56, 64, 80, 96, 112, 128, 160, 192, 224, 256, 320]:
             self.combo_mp3_bitrate.addItem(f"{br} kbps", userData=br)
 
         self.combo_wav_samplerate = QComboBox(self)
+        self.combo_wav_samplerate.setToolTip("Sample rate for exported WAV files.")
         for sr in [8000, 16000, 22050, 32000, 44100, 48000]:
             self.combo_wav_samplerate.addItem(f"{sr} Hz", userData=sr)
 
         self.chk_use_selection = QCheckBox("Export selection only", self)
+        self.chk_use_selection.setToolTip("If enabled, exports only the selected region; otherwise exports the full track.")
         self.chk_use_selection.setChecked(True)
+
+        # Fade in/out controls
+        self.chk_fade_in = QCheckBox("Enable", self)
+        self.chk_fade_in.setToolTip("Apply a fade-in at the start of the exported audio (or selection).")
+        self.chk_fade_out = QCheckBox("Enable", self)
+        self.chk_fade_out.setToolTip("Apply a fade-out at the end of the exported audio (or selection).")
+
+        self.combo_fade_in = QComboBox(self)
+        self.combo_fade_in.setToolTip("Fade-in duration.")
+        self.combo_fade_out = QComboBox(self)
+        self.combo_fade_out.setToolTip("Fade-out duration.")
+        for sec in [0.10, 0.25, 0.50, 1.0, 1.5, 2.0, 3.0, 5.0, 8.0, 10.0]:
+            label = f"{sec:g} s"
+            self.combo_fade_in.addItem(label, userData=float(sec))
+            self.combo_fade_out.addItem(label, userData=float(sec))
+
+        fade_in_row = QHBoxLayout()
+        fade_in_row.setContentsMargins(0, 0, 0, 0)
+        fade_in_row.addWidget(self.chk_fade_in)
+        fade_in_row.addWidget(self.combo_fade_in)
+        fade_in_w = QWidget(self)
+        fade_in_w.setLayout(fade_in_row)
+
+        fade_out_row = QHBoxLayout()
+        fade_out_row.setContentsMargins(0, 0, 0, 0)
+        fade_out_row.addWidget(self.chk_fade_out)
+        fade_out_row.addWidget(self.combo_fade_out)
+        fade_out_w = QWidget(self)
+        fade_out_w.setLayout(fade_out_row)
+
+        self.chk_fade_in.toggled.connect(self._on_fade_toggle)
+        self.chk_fade_out.toggled.connect(self._on_fade_toggle)
 
         export_layout.addRow("Format:", self.combo_format)
         export_layout.addRow("MP3 bitrate:", self.combo_mp3_bitrate)
         export_layout.addRow("WAV sample rate:", self.combo_wav_samplerate)
         export_layout.addRow("", self.chk_use_selection)
+        export_layout.addRow("Fade in:", fade_in_w)
+        export_layout.addRow("Fade out:", fade_out_w)
 
         self.btn_save_as = QPushButton("Save As…", self)
+        self.btn_save_as.setToolTip("Export the current track (or selection) using the settings above.")
         self.btn_save_as.clicked.connect(self._on_save_as_clicked)
         export_layout.addRow("", self.btn_save_as)
 
@@ -754,15 +962,23 @@ class MusicEditWidget(QWidget):
         meta_layout = QFormLayout(meta_group)
 
         self.edit_artist = QLineEdit(self)
+        self.edit_artist.setToolTip("MP3 tag: Artist (optional).")
         self.edit_album = QLineEdit(self)
+        self.edit_album.setToolTip("MP3 tag: Album (optional).")
         self.edit_title = QLineEdit(self)
+        self.edit_title.setToolTip("MP3 tag: Track title (optional).")
         self.edit_year = QLineEdit(self)
+        self.edit_year.setToolTip("MP3 tag: Year (optional).")
         self.edit_bpm = QLineEdit(self)
+        self.edit_bpm.setToolTip("MP3 tag: BPM (optional). You can type it manually or use Detect BPM.")
         self.edit_extra = QLineEdit(self)
+        self.edit_extra.setToolTip("Extra info tag (optional).")
 
         # BPM detection UI
         self.lbl_bpm_detect = QLabel("Detected BPM: –", self)
+        self.lbl_bpm_detect.setToolTip("Shows the last detected BPM result.")
         self.btn_detect_bpm = QPushButton("Detect BPM", self)
+        self.btn_detect_bpm.setToolTip("Analyze the audio and estimate BPM. This may take a few seconds.")
         self.btn_detect_bpm.clicked.connect(self._on_detect_bpm_clicked)
 
         bpm_row_layout = QHBoxLayout()
@@ -786,6 +1002,7 @@ class MusicEditWidget(QWidget):
         main_layout.addStretch(0)
 
         self._on_format_changed()  # show/hide bitrate/sample rate appropriately
+        self._on_fade_toggle()  # enable/disable fade duration controls
 
     def _apply_settings_to_ui(self):
         # Format
@@ -823,6 +1040,31 @@ class MusicEditWidget(QWidget):
         self.edit_bpm.setText("")  # start empty each session
         self.edit_extra.setText(self._settings.meta_extra)
 
+        # Fade settings
+        self.chk_fade_in.setChecked(bool(getattr(self._settings, "fade_in_enabled", False)))
+        self.chk_fade_out.setChecked(bool(getattr(self._settings, "fade_out_enabled", False)))
+
+        # Select closest duration value in combo boxes
+        def _select_fade_combo(combo: QComboBox, target: float):
+            try:
+                best_i = 0
+                best_d = None
+                for i in range(combo.count()):
+                    v = combo.itemData(i)
+                    if v is None:
+                        continue
+                    d = abs(float(v) - float(target))
+                    if best_d is None or d < best_d:
+                        best_d = d
+                        best_i = i
+                combo.setCurrentIndex(best_i)
+            except Exception:
+                pass
+
+        _select_fade_combo(self.combo_fade_in, float(getattr(self._settings, "fade_in_sec", 1.0)))
+        _select_fade_combo(self.combo_fade_out, float(getattr(self._settings, "fade_out_sec", 1.0)))
+        self._on_fade_toggle()
+
         # Detected BPM label always resets
         self.lbl_bpm_detect.setText("Detected BPM: –")
 
@@ -853,10 +1095,13 @@ class MusicEditWidget(QWidget):
             return
         self._settings.last_input_dir = os.path.dirname(path)
         self._save_settings()
-        self.load_file(path)
+        self._load_file_impl(path, reset_undo=True)
 
     def load_file(self, path: str):
         """Load an audio file into the preview/player."""
+        self._load_file_impl(path, reset_undo=False)
+
+    def _load_file_impl(self, path: str, reset_undo: bool = False):
         if self._is_loading:
             return
         self._is_loading = True
@@ -874,6 +1119,10 @@ class MusicEditWidget(QWidget):
             self._duration_ms = 0
             self._waveform_needs_update = True
             self._play_selection_end_ms = 0
+            self._play_selection_start_ms = 0
+
+            if reset_undo:
+                self._reset_undo()
 
             # Reset UI
             self.waveform_view.clear_waveform()
@@ -916,6 +1165,7 @@ class MusicEditWidget(QWidget):
         except Exception:
             pass
         # Remember where to stop if we have a real selection.
+        self._play_selection_start_ms = start_ms
         self._play_selection_end_ms = end_ms if end_ms > start_ms else 0
         self._player.play()
 
@@ -925,6 +1175,7 @@ class MusicEditWidget(QWidget):
         if self._player is None:
             return
         self._play_selection_end_ms = 0
+        self._play_selection_start_ms = 0
         self._player.stop()
         self._player.setPosition(0)
 
@@ -932,6 +1183,10 @@ class MusicEditWidget(QWidget):
     def _on_slider_moved(self, value: int):
         if self._duration_ms > 0 and self._player is not None:
             self._player.setPosition(value)
+            try:
+                self.waveform_view.set_playhead_ms(int(value))
+            except Exception:
+                pass
 
     @Slot(int)
     def _on_duration_changed(self, duration: int):
@@ -951,12 +1206,26 @@ class MusicEditWidget(QWidget):
             return
         if self._play_selection_end_ms > 0 and position >= self._play_selection_end_ms:
             if self._player is not None and self._player.playbackState() == QMediaPlayer.PlayingState:
-                self._player.pause()
-            self._play_selection_end_ms = 0
+                try:
+                    if hasattr(self, "chk_loop_selection") and self.chk_loop_selection.isChecked():
+                        self._player.setPosition(max(0, int(self._play_selection_start_ms)))
+                        self._player.play()
+                    else:
+                        self._player.pause()
+                        self._play_selection_end_ms = 0
+                        self._play_selection_start_ms = 0
+                except Exception:
+                    self._player.pause()
+                    self._play_selection_end_ms = 0
+                    self._play_selection_start_ms = 0
         self.position_slider.blockSignals(True)
         self.position_slider.setValue(position)
         self.position_slider.blockSignals(False)
         self._update_time_label(position)
+        try:
+            self.waveform_view.set_playhead_ms(int(position))
+        except Exception:
+            pass
 
     @Slot()
     def _on_state_changed(self, *args):
@@ -1067,6 +1336,7 @@ class MusicEditWidget(QWidget):
     
     def _on_cut_selection(self):
         """Cut selection from the current track and copy it to clipboard."""
+        self._push_undo_point("cut")
         # First copy selection into clipboard
         self._on_copy_selection()
         if not self._current_file or self._duration_ms <= 0:
@@ -1121,11 +1391,150 @@ class MusicEditWidget(QWidget):
             return
         # Load the edited file as the new current file
         self.load_file(out_path)
+
+
+    def _on_delete_selection(self):
+        """Delete the current selection from the track (no clipboard)."""
+        if not self._current_file or self._duration_ms <= 0:
+            return
+        ff = self._get_ffmpeg_for_edit()
+        if not ff:
+            return
+        start_ms, end_ms = self.waveform_view.get_selection_ms()
+        if end_ms <= start_ms:
+            return
+
+        self._push_undo_point("delete")
+
+        start_sec = start_ms / 1000.0
+        end_sec = end_ms / 1000.0
+        out_path = self._make_edit_temp_path()
+        ext = os.path.splitext(self._current_file)[1].lower()
+
+        filter_complex = (
+            f"[0:a]atrim=start=0:end={start_sec:.6f},asetpts=N/SR/TB[a0];"
+            f"[0:a]atrim=start={end_sec:.6f},asetpts=N/SR/TB[a1];"
+            f"[a0][a1]concat=n=2:v=0:a=1[aout]"
+        )
+        cmd = [
+            ff,
+            "-y",
+            "-i",
+            self._current_file,
+            "-filter_complex",
+            filter_complex,
+            "-map",
+            "[aout]",
+        ]
+        if ext == ".mp3":
+            cmd += ["-c:a", "libmp3lame", "-b:a", "320k"]
+        else:
+            cmd += ["-c:a", "pcm_s16le"]
+        cmd.append(out_path)
+
+        try:
+            proc = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        except Exception as e:
+            QMessageBox.critical(self, "Delete selection failed", f"Failed to run ffmpeg:\n{e}")
+            return
+        if proc.returncode != 0:
+            QMessageBox.critical(
+                self,
+                "Delete selection failed",
+                "ffmpeg reported an error while deleting the selection.\n\n"
+                f"Command:\n{' '.join(cmd)}\n\nError:\n{proc.stderr}",
+            )
+            return
+
+        self.load_file(out_path)
+
+
+    def _on_split_at_playhead(self):
+        """Split the track at the playhead.
+
+        Loads the LEFT part as the current track, and stores the RIGHT part into the clipboard.
+        """
+        if not self._current_file or self._duration_ms <= 0 or self._player is None:
+            return
+        ff = self._get_ffmpeg_for_edit()
+        if not ff:
+            return
+
+        pos_ms = int(self._player.position() or 0)
+        if pos_ms <= 0 or pos_ms >= self._duration_ms:
+            return
+
+        self._push_undo_point("split")
+
+        split_sec = pos_ms / 1000.0
+        ext = os.path.splitext(self._current_file)[1].lower()
+
+        left_path = self._make_edit_temp_path()
+        right_path = self._make_edit_temp_path()
+
+        cmd_left = [ff, "-y", "-i", self._current_file, "-ss", "0", "-t", f"{split_sec:.3f}"]
+        cmd_right = [ff, "-y", "-i", self._current_file, "-ss", f"{split_sec:.3f}"]
+        if ext == ".mp3":
+            cmd_left += ["-vn", "-c:a", "libmp3lame", "-b:a", "320k"]
+            cmd_right += ["-vn", "-c:a", "libmp3lame", "-b:a", "320k"]
+        else:
+            cmd_left += ["-vn", "-c:a", "pcm_s16le"]
+            cmd_right += ["-vn", "-c:a", "pcm_s16le"]
+        cmd_left.append(left_path)
+        cmd_right.append(right_path)
+
+        try:
+            p1 = subprocess.run(cmd_left, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+            if p1.returncode != 0:
+                raise RuntimeError(p1.stderr)
+            p2 = subprocess.run(cmd_right, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+            if p2.returncode != 0:
+                raise RuntimeError(p2.stderr)
+        except Exception as e:
+            QMessageBox.critical(self, "Split failed", f"ffmpeg reported an error while splitting.\n\n{e}")
+            return
+
+        # Replace previous clipboard file if any
+        if self._edit_clipboard_path and os.path.isfile(self._edit_clipboard_path):
+            try:
+                os.remove(self._edit_clipboard_path)
+            except Exception:
+                pass
+        self._edit_clipboard_path = right_path
+
+        self.load_file(left_path)
+
+
+    def _on_undo(self):
+        if len(self._undo_stack) <= 0:
+            return
+        snap = self._snapshot_current_to_undo("redo")
+        if snap:
+            self._redo_stack.append(snap)
+        path = self._undo_stack.pop()
+        self._save_undo_state()
+        self._refresh_undo_buttons()
+        if os.path.isfile(path):
+            self.load_file(path)
+
+
+    def _on_redo(self):
+        if len(self._redo_stack) <= 0:
+            return
+        snap = self._snapshot_current_to_undo("undo")
+        if snap:
+            self._undo_stack.append(snap)
+        path = self._redo_stack.pop()
+        self._save_undo_state()
+        self._refresh_undo_buttons()
+        if os.path.isfile(path):
+            self.load_file(path)
     
     def _on_paste_selection(self):
         """Paste the clipboard audio into the current track by inserting it (no audio is removed)."""
         if not self._current_file or not self._edit_clipboard_path or self._duration_ms <= 0:
             return
+        self._push_undo_point("paste")
         ff = self._get_ffmpeg_for_edit()
         if not ff:
             return
@@ -1200,6 +1609,15 @@ class MusicEditWidget(QWidget):
         else:
             self.combo_mp3_bitrate.setEnabled(False)
             self.combo_wav_samplerate.setEnabled(True)
+
+    @Slot()
+    def _on_fade_toggle(self):
+        """Enable/disable fade duration widgets based on checkboxes."""
+        try:
+            self.combo_fade_in.setEnabled(bool(self.chk_fade_in.isChecked()))
+            self.combo_fade_out.setEnabled(bool(self.chk_fade_out.isChecked()))
+        except Exception:
+            pass
 
     @Slot()
     def _on_save_as_clicked(self):
@@ -1445,6 +1863,19 @@ class MusicEditWidget(QWidget):
         start_sec = start_ms / 1000.0
         duration_sec = (end_ms - start_ms) / 1000.0 if end_ms > start_ms else 0.0
 
+        # Fade options apply to the exported segment (selection or full track)
+        seg_dur = max(0.0, duration_sec)
+        fade_in_enabled = bool(self.chk_fade_in.isChecked())
+        fade_out_enabled = bool(self.chk_fade_out.isChecked())
+        fade_in_sec = float(self.combo_fade_in.currentData() or 1.0)
+        fade_out_sec = float(self.combo_fade_out.currentData() or 1.0)
+
+        # Persist fade settings
+        self._settings.fade_in_enabled = fade_in_enabled
+        self._settings.fade_out_enabled = fade_out_enabled
+        self._settings.fade_in_sec = fade_in_sec
+        self._settings.fade_out_sec = fade_out_sec
+
         cmd = [ff, "-y"]
 
         # Start offset & input
@@ -1454,6 +1885,21 @@ class MusicEditWidget(QWidget):
 
         if duration_sec > 0 and end_ms < self._duration_ms:
             cmd += ["-t", f"{duration_sec:.3f}"]
+
+        # Audio filters (fade in/out)
+        filters = []
+        if seg_dur > 0.001:
+            if fade_in_enabled:
+                d = max(0.0, min(fade_in_sec, seg_dur))
+                if d > 0.001:
+                    filters.append(f"afade=t=in:st=0:d={d:.3f}")
+            if fade_out_enabled:
+                d = max(0.0, min(fade_out_sec, seg_dur))
+                st = max(0.0, seg_dur - d)
+                if d > 0.001:
+                    filters.append(f"afade=t=out:st={st:.3f}:d={d:.3f}")
+        if filters:
+            cmd += ["-af", ",".join(filters)]
 
         # Audio encoding options
         if fmt == "mp3":

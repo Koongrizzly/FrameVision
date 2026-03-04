@@ -1267,6 +1267,20 @@ class Qwen2511Pane(QtWidgets.QWidget):
         bw.addWidget(self.banner)
         outer.addWidget(banner_wrap, 0)
 
+        # Tabs (Qwen Edit + Flux Klein)
+        self.tabs = QtWidgets.QTabWidget(self)
+        self.tabs.setDocumentMode(True)
+        self.tabs.setMovable(False)
+        self.tabs.setToolTip("Switch between Qwen Edit 2511 and Flux Klein Edit.")
+        self.tabs.currentChanged.connect(self._on_tab_changed)
+        outer.addWidget(self.tabs, 1)
+
+        # --- Qwen Edit page (existing UI) ---
+        qwen_page = QtWidgets.QWidget(self)
+        q_outer = QtWidgets.QVBoxLayout(qwen_page)
+        q_outer.setContentsMargins(0, 0, 0, 0)
+        q_outer.setSpacing(0)
+
         # Scroll area for the whole pane content (except the sticky bottom buttons bar).
         scroll = QtWidgets.QScrollArea()
         scroll.setToolTip("Scroll to access all settings on smaller screens.")
@@ -1275,7 +1289,7 @@ class Qwen2511Pane(QtWidgets.QWidget):
         scroll.setVerticalScrollBarPolicy(QtCore.Qt.ScrollBarAsNeeded)
         scroll.setFrameShape(QtWidgets.QFrame.NoFrame)
         scroll.setSizePolicy(QtWidgets.QSizePolicy.Expanding, QtWidgets.QSizePolicy.Expanding)
-        outer.addWidget(scroll, 1)
+        q_outer.addWidget(scroll, 1)
 
         content = QtWidgets.QWidget()
         scroll.setWidget(content)
@@ -1916,7 +1930,7 @@ class Qwen2511Pane(QtWidgets.QWidget):
 
         # Sticky bottom buttons bar (always visible, does not scroll).
         self.button_bar = QtWidgets.QWidget()
-        outer.addWidget(self.button_bar, 0)
+        q_outer.addWidget(self.button_bar, 0)
 
         bar = QtWidgets.QVBoxLayout(self.button_bar)
         bar.setContentsMargins(12, 8, 12, 12)
@@ -1961,6 +1975,51 @@ class Qwen2511Pane(QtWidgets.QWidget):
 
         bar.addLayout(top_row)
         bar.addLayout(bottom_row)
+
+        self.tabs.addTab(qwen_page, "Qwen Edit")
+
+        # --- Flux Klein page ---
+        flux_page: QtWidgets.QWidget
+        try:
+            # Local import so Qwen Edit keeps working even if Flux dependencies are missing.
+            import flux_klein_editor_ui as fluxui  # type: ignore
+
+            flux_page = fluxui.MainWindow()
+            try:
+                flux_page.setWindowTitle("")
+            except Exception:
+                pass
+        except Exception as e:
+            flux_page = QtWidgets.QWidget(self)
+            fl = QtWidgets.QVBoxLayout(flux_page)
+            fl.setContentsMargins(14, 14, 14, 14)
+            msg = QtWidgets.QLabel(
+                "Flux Klein UI could not be loaded.\n\n"
+                "Reason:\n"
+                f"{e}\n\n"
+                "Tip: Flux Klein uses Pillow (PIL). If this is a missing dependency, install/update it in the app's Python environment."
+            )
+            msg.setWordWrap(True)
+            msg.setTextInteractionFlags(QtCore.Qt.TextSelectableByMouse)
+            fl.addWidget(msg)
+            fl.addStretch(1)
+
+        self.tabs.addTab(flux_page, "Flux Klein")
+
+        # Ensure banner text matches the default selected tab.
+        self._on_tab_changed(self.tabs.currentIndex())
+
+    def _on_tab_changed(self, idx: int):
+        """Update the pinned banner based on the selected tab."""
+        try:
+            if not hasattr(self, "banner") or self.banner is None:
+                return
+            if idx == 1:
+                self.banner.setText("Flux Klein Edit")
+            else:
+                self.banner.setText("Qwen Edit 2511")
+        except Exception:
+            pass
 
     def _on_models_toggled_slot(self, checked: bool):
         self._on_models_toggled(bool(checked), persist=True)

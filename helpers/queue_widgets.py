@@ -166,8 +166,52 @@ class _AutoPlayLastController(QObject):
         try:
             # Resolve media using JobRowWidget logic
             w = JobRowWidget(job_json, "done")
+
+            # Prefer multi-output playback for audio jobs (Ace Step can generate multiple tracks).
+            # Backwards compatible: if only one file is detected, we fall back to single-file open.
+            audio_exts = {".mp3", ".wav", ".flac", ".m4a", ".aac", ".ogg"}
+
+            def _norm_paths(seq):
+                out = []
+                if not isinstance(seq, (list, tuple)):
+                    return out
+                d = getattr(w, "data", None) or {}
+                args = d.get("args") if isinstance(d.get("args"), dict) else {}
+                out_dir = d.get("out_dir") or args.get("out_dir")
+                for item in seq:
+                    try:
+                        p = Path(str(item)).expanduser()
+                        if out_dir and not p.is_absolute():
+                            p = Path(str(out_dir)).expanduser() / p
+                        if p.exists() and p.is_file():
+                            out.append(p)
+                    except Exception:
+                        continue
+                return out
+
+            files = []
+            try:
+                d = getattr(w, "data", None) or {}
+                args = d.get("args") if isinstance(d.get("args"), dict) else {}
+                seq = d.get("files") or args.get("files")
+                files = _norm_paths(seq)
+            except Exception:
+                files = []
+
+            # If we have multiple audio outputs, open them one-by-one so the music player
+            # can auto-build a playlist.
+            multi_audio = [p for p in files if p.suffix.lower() in audio_exts]
+            if len(multi_audio) >= 2:
+                # Stable ordering: filename first (track_01, track_02, ...)
+                try:
+                    multi_audio = sorted(multi_audio, key=lambda p: (p.name.lower(), str(p).lower()))
+                except Exception:
+                    pass
+            else:
+                multi_audio = []
+
             media = w._resolve_output_file()
-            if not (media and media.exists()):
+            if not (media and Path(media).exists()):
                 return
             path_obj = Path(media)
 
@@ -181,7 +225,18 @@ class _AutoPlayLastController(QObject):
                     try:
                         v = getattr(h, attr, None)
                         if v and hasattr(v, "open"):
-                            v.open(path_obj)
+                            # Multi-track (audio) autoplay: open each file sequentially.
+                            if multi_audio:
+                                for i, p in enumerate(multi_audio):
+                                    try:
+                                        QTimer.singleShot(40 * i, lambda pp=p: v.open(pp))
+                                    except Exception:
+                                        try:
+                                            v.open(p)
+                                        except Exception:
+                                            pass
+                            else:
+                                v.open(path_obj)
                             # Optional HUD/info if present; best-effort
                             try:
                                 if hasattr(h, "hud"):
