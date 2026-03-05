@@ -1,6 +1,6 @@
 {
   "schema_version": 2,
-  "generated_at_utc": "2026-02-15T21:39:57Z",
+  "generated_at_utc": "2026-03-05T01:49:33Z",
   "generated_from": [
     "ace_setup.bat",
     "background_download.py",
@@ -43,7 +43,7 @@
       "notes": "FFmpeg binary used by the app. See the license link for legal details.",
       "source_url": "https://github.com/BtbN/FFmpeg-Builds/releases/latest/download/ffmpeg-master-latest-win64-gpl.zip",
       "installed_version": "",
-      "installed_at_utc": "2026-02-15T21:39:57Z",
+      "installed_at_utc": "2026-03-02T08:02:30Z",
       "installed_ffmpeg_sha256": "4b6dd5e140af6faccfdf8789c67af0498a88df4085a9c81606bd626a63bd7bba",
       "build_info_path": "presets\\info\\ffmpeg_build_info.txt"
     },
@@ -430,6 +430,42 @@
       "license_url": "https://github.com/ByteDance-Seed/SeedVR/blob/main/LICENSE",
       "notes": "Model weights; see the model card and upstream repo for usage and terms.",
       "source_url": "https://github.com/ByteDance-Seed/SeedVR"
+    },
+    {
+      "id": "flux2_klein_4b_gguf",
+      "name": "FLUX.2 [klein] 4B (GGUF) model weights",
+      "category": "model",
+      "installed_by": "optional_installs",
+      "source": "unsloth/FLUX.2-klein-4B-GGUF (Hugging Face)",
+      "download_url": "https://huggingface.co/unsloth/FLUX.2-klein-4B-GGUF/tree/main",
+      "license": "Apache-2.0",
+      "license_url": "https://huggingface.co/unsloth/FLUX.2-klein-4B-GGUF/blob/main/LICENSE.md",
+      "notes": "Quantized GGUF variants for FLUX.2 [klein] 4B.",
+      "source_url": "https://huggingface.co/unsloth/FLUX.2-klein-4B-GGUF"
+    },
+    {
+      "id": "flux2_klein_9b_gguf",
+      "name": "FLUX.2 [klein] 9B (GGUF) model weights",
+      "category": "model",
+      "installed_by": "optional_installs",
+      "source": "unsloth/FLUX.2-klein-9B-GGUF (Hugging Face)",
+      "download_url": "https://huggingface.co/unsloth/FLUX.2-klein-9B-GGUF/tree/main",
+      "license": "FLUX Non-Commercial License v2.1",
+      "license_url": "https://huggingface.co/unsloth/FLUX.2-klein-9B-GGUF/blob/main/LICENSE.md",
+      "notes": "Quantized GGUF variants for FLUX.2 [klein] 9B. License is non-commercial / non-production.",
+      "source_url": "https://huggingface.co/unsloth/FLUX.2-klein-9B-GGUF"
+    },
+    {
+      "id": "qwen35_gguf",
+      "name": "Qwen 3.5 (GGUF) model weights",
+      "category": "model",
+      "installed_by": "optional_installs",
+      "source": "Unsloth Dynamic 2.0 quants (Hugging Face collection)",
+      "download_url": "https://huggingface.co/collections/unsloth/unsloth-dynamic-20-quants",
+      "license": "Apache-2.0",
+      "license_url": "https://huggingface.co/Qwen/Qwen3.5-0.8B/blob/main/LICENSE",
+      "notes": "GGUF quantized variants of Qwen 3.5 (e.g., 0.8B, 4B, 9B, 27B, 35B) used by FrameVision as text encoder / LLM backends when downloaded via Optional Installs.",
+      "source_url": "https://huggingface.co/collections/unsloth/unsloth-dynamic-20-quants"
     }
   ]
 }
