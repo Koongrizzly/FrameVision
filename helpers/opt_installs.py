@@ -213,21 +213,52 @@ def _run_zimage_base_q8(root: Path) -> Optional[Tuple[str, List[str], Path]]:
 
 
 
-def _klein4b_script(root: Path) -> Optional[Path]:
-    """Return the Klein 4B downloader script when present."""
-    script = root / "presets" / "extra_env" / "klein4b_gguf_download.py"
-    return script if script.exists() else None
+def _klein_script(root: Path) -> Optional[Path]:
+    """Return the Klein GGUF downloader script when present.
+
+    Supported script filenames (preferred order):
+      - presets/extra_env/klein_gguf_download.py   (unified 4B/9B)
+      - presets/extra_env/klein4b_gguf_download.py (legacy 4B-only)
+    """
+    candidates = [
+        root / "presets" / "extra_env" / "klein_gguf_download.py",
+        root / "presets" / "extra_env" / "klein4b_gguf_download.py",
+    ]
+    for c in candidates:
+        if c.exists():
+            return c
+    return None
 
 
-def _klein4b_has_vae(root: Path) -> bool:
-    """
-    The downloader stores the VAE under:
-      <root>/models/klein4b_gguf/vae/split_files/vae/flux2-vae.safetensors
-    """
-    p = root / "models" / "klein4b_gguf" / "vae" / "split_files" / "vae" / "flux2-vae.safetensors"
+def _klein_script_supports_variant(script: Path) -> bool:
+    # Unified script supports --variant (4b/9b)
+    return script.name.lower() == "klein_gguf_download.py"
+
+
+def _klein_base_dir(root: Path, variant: str, script: Path) -> Path:
+    """Return the models base folder used by the downloader."""
+    if _klein_script_supports_variant(script):
+        v = variant.lower().strip()
+        if v in ("9b", "9", "klein9b"):
+            return root / "models" / "klein9b_gguf"
+        return root / "models" / "klein4b_gguf"
+    # Legacy script: always uses klein4b_gguf
+    return root / "models" / "klein4b_gguf"
+
+
+def _klein_has_vae(root: Path, variant: str) -> bool:
+    """Check whether the FLUX2 VAE is already present for the given variant."""
+    script = _klein_script(root)
+    if not script:
+        return False
+    base = _klein_base_dir(root, variant, script)
+    p = base / "vae" / "split_files" / "vae" / "flux2-vae.safetensors"
     return p.exists()
 
 
+def _klein4b_script(root: Path) -> Optional[Path]:
+    """Return a Klein downloader script usable for 4B installs."""
+    return _klein_script(root)
 def _run_klein4b_unet(root: Path, quant_token: str) -> Optional[Tuple[str, List[str], Path]]:
     """
     Download a single FLUX.2-klein-4B UNet GGUF by substring token (e.g. Q4_K_M).
@@ -241,8 +272,11 @@ def _run_klein4b_unet(root: Path, quant_token: str) -> Optional[Tuple[str, List[
     if py is None or (not py.exists()):
         return None
 
-    args = ["-u", str(script), "--download-unet", str(quant_token)]
-    if not _klein4b_has_vae(root):
+    args = ["-u", str(script)]
+    if _klein_script_supports_variant(script):
+        args += ["--variant", "4b"]
+    args += ["--download-unet", str(quant_token)]
+    if not _klein_has_vae(root, "4b"):
         args.append("--download-vae")
 
     return (str(py), args, root)
@@ -261,7 +295,11 @@ def _run_klein4b_textenc(root: Path, source: str, token: str) -> Optional[Tuple[
     if py is None or (not py.exists()):
         return None
 
-    args = ["-u", str(script), "--download-textenc", f"{source}:{token}"]
+    args = ["-u", str(script)]
+    if _klein_script_supports_variant(script):
+        args += ["--variant", "4b"]
+    args += ["--download-textenc", f"{source}:{token}"]
+
     return (str(py), args, root)
 
 
@@ -309,6 +347,86 @@ def _run_klein4b_te_qwen_gguf_q8(root: Path) -> Optional[Tuple[str, List[str], P
 def _run_klein4b_te_cordux(root: Path) -> Optional[Tuple[str, List[str], Path]]:
     # Gated repo – may require accepting terms on Hugging Face. Use index 1.
     return _run_klein4b_textenc(root, "cordux", "1")
+
+
+def _run_klein9b_unet(root: Path, quant_token: str) -> Optional[Tuple[str, List[str], Path]]:
+    """Download a single FLUX.2-klein-9B UNet GGUF by substring token (e.g. Q4_K_M).
+
+    Requires the unified downloader script (klein_gguf_download.py) that supports --variant 9b.
+    Auto-downloads the required VAE if it's not present yet.
+    """
+    script = _klein_script(root)
+    if not script or (not _klein_script_supports_variant(script)):
+        return None
+
+    py = _venv_python(root)
+    if py is None or (not py.exists()):
+        return None
+
+    args = ["-u", str(script), "--variant", "9b", "--download-unet", str(quant_token)]
+    if not _klein_has_vae(root, "9b"):
+        args.append("--download-vae")
+
+    return (str(py), args, root)
+
+
+def _run_klein9b_textenc(root: Path, token: str) -> Optional[Tuple[str, List[str], Path]]:
+    """Download a Klein 9B text encoder (Qwen3-8B GGUF) by substring token."""
+    script = _klein_script(root)
+    if not script or (not _klein_script_supports_variant(script)):
+        return None
+
+    py = _venv_python(root)
+    if py is None or (not py.exists()):
+        return None
+
+    args = ["-u", str(script), "--variant", "9b", "--download-textenc", f"gguf:{token}"]
+    return (str(py), args, root)
+
+
+def _run_klein9b_unet_q2k(root: Path) -> Optional[Tuple[str, List[str], Path]]:
+    return _run_klein9b_unet(root, "Q2_K")
+
+
+def _run_klein9b_unet_q3km(root: Path) -> Optional[Tuple[str, List[str], Path]]:
+    return _run_klein9b_unet(root, "Q3_K_M")
+
+
+def _run_klein9b_unet_q4km(root: Path) -> Optional[Tuple[str, List[str], Path]]:
+    return _run_klein9b_unet(root, "Q4_K_M")
+
+
+def _run_klein9b_unet_q5km(root: Path) -> Optional[Tuple[str, List[str], Path]]:
+    return _run_klein9b_unet(root, "Q5_K_M")
+
+
+def _run_klein9b_unet_q6k(root: Path) -> Optional[Tuple[str, List[str], Path]]:
+    return _run_klein9b_unet(root, "Q6_K")
+
+
+def _run_klein9b_unet_q8(root: Path) -> Optional[Tuple[str, List[str], Path]]:
+    return _run_klein9b_unet(root, "Q8_0")
+
+
+def _run_klein9b_te_q2k(root: Path) -> Optional[Tuple[str, List[str], Path]]:
+    return _run_klein9b_textenc(root, "Q2_K")
+
+
+def _run_klein9b_te_q4km(root: Path) -> Optional[Tuple[str, List[str], Path]]:
+    return _run_klein9b_textenc(root, "Q4_K_M")
+
+
+def _run_klein9b_te_q5km(root: Path) -> Optional[Tuple[str, List[str], Path]]:
+    return _run_klein9b_textenc(root, "Q5_K_M")
+
+
+def _run_klein9b_te_q6k(root: Path) -> Optional[Tuple[str, List[str], Path]]:
+    return _run_klein9b_textenc(root, "Q6_K")
+
+
+def _run_klein9b_te_q8(root: Path) -> Optional[Tuple[str, List[str], Path]]:
+    return _run_klein9b_textenc(root, "Q8_0")
+
 
 
 def _run_ace(root: Path) -> Optional[Tuple[str, List[str], Path]]:
@@ -831,6 +949,74 @@ OptionalInstall(
             description="Gated Hugging Face repo. You may need to accept terms and set HF_TOKEN.",
             runner=_run_klein4b_te_cordux,
         ),
+
+OptionalInstall(
+    key="klein9b_unet_q2k",
+    title="Flux Klein edit 9B UNet GGUF (Q2_K)",
+    description="Smallest setup. Needs at least ~8GB VRAM for 1024×1024. Auto-downloads the required VAE if missing.",
+    runner=_run_klein9b_unet_q2k,
+),
+OptionalInstall(
+    key="klein9b_unet_q3km",
+    title="Flux Klein edit 9B UNet GGUF (Q3_K_M)",
+    description="Low VRAM / small. Auto-downloads the required VAE if missing.",
+    runner=_run_klein9b_unet_q3km,
+),
+OptionalInstall(
+    key="klein9b_unet_q4km",
+    title="Flux Klein edit 9B UNet GGUF (Q4_K_M)",
+    description="Balanced size/quality. Auto-downloads the required VAE if missing.",
+    runner=_run_klein9b_unet_q4km,
+),
+OptionalInstall(
+    key="klein9b_unet_q5km",
+    title="Flux Klein edit 9B UNet GGUF (Q5_K_M)",
+    description="Higher quality / larger download. Auto-downloads the required VAE if missing.",
+    runner=_run_klein9b_unet_q5km,
+),
+OptionalInstall(
+    key="klein9b_unet_q6k",
+    title="Flux Klein edit 9B UNet GGUF (Q6_K)",
+    description="High quality / larger. Auto-downloads the required VAE if missing.",
+    runner=_run_klein9b_unet_q6k,
+),
+OptionalInstall(
+    key="klein9b_unet_q8",
+    title="Flux Klein edit 9B UNet GGUF (Q8_0)",
+    description="Best quality / largest. Needs about ~22GB VRAM for a 1024×1024 edit. Auto-downloads the required VAE if missing.",
+    runner=_run_klein9b_unet_q8,
+),
+
+OptionalInstall(
+    key="klein9b_te_q2k",
+    title="Flux Klein edit 9B Text Encoder (Qwen3-8B GGUF Q2_K)",
+    description="Smallest/fastest GGUF text encoder.",
+    runner=_run_klein9b_te_q2k,
+),
+OptionalInstall(
+    key="klein9b_te_q4km",
+    title="Flux Klein edit 9B Text Encoder (Qwen3-8B GGUF Q4_K_M)",
+    description="Balanced GGUF text encoder.",
+    runner=_run_klein9b_te_q4km,
+),
+OptionalInstall(
+    key="klein9b_te_q5km",
+    title="Flux Klein edit 9B Text Encoder (Qwen3-8B GGUF Q5_K_M)",
+    description="Higher quality GGUF text encoder.",
+    runner=_run_klein9b_te_q5km,
+),
+OptionalInstall(
+    key="klein9b_te_q6k",
+    title="Flux Klein edit 9B Text Encoder (Qwen3-8B GGUF Q6_K)",
+    description="High quality GGUF text encoder.",
+    runner=_run_klein9b_te_q6k,
+),
+OptionalInstall(
+    key="klein9b_te_q8",
+    title="Flux Klein edit 9B Text Encoder (Qwen3-8B GGUF Q8_0)",
+    description="Best quality / largest GGUF text encoder.",
+    runner=_run_klein9b_te_q8,
+),
 OptionalInstall(
             key="ace15",
             title="Ace Step 1.5 Music Creation",
@@ -1271,6 +1457,26 @@ class OptionalInstallsDialog(QtWidgets.QDialog):
                 _add_opt(opt, klein_lay)
 
         opts_lay.addWidget(klein_sec)
+
+
+        # Flux Klein edit 9B group (collapsible)
+        klein9_sec = _CollapsibleSection("Flux Klein edit 9B", start_collapsed=True)
+        klein9_lay = klein9_sec.layout_content()
+
+        _add_group_label("UNet GGUF (choose one)", klein9_lay)
+        for k in ("klein9b_unet_q2k", "klein9b_unet_q3km", "klein9b_unet_q4km", "klein9b_unet_q5km", "klein9b_unet_q6k", "klein9b_unet_q8"):
+            opt = by_key.get(k)
+            if opt:
+                _add_opt(opt, klein9_lay)
+
+        _add_group_label("Text encoder (choose one)", klein9_lay)
+        for k in ("klein9b_te_q2k", "klein9b_te_q4km", "klein9b_te_q5km", "klein9b_te_q6k", "klein9b_te_q8"):
+            opt = by_key.get(k)
+            if opt:
+                _add_opt(opt, klein9_lay)
+
+        opts_lay.addWidget(klein9_sec)
+
 
 
         # Other image-related installs
