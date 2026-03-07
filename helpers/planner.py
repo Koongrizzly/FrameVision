@@ -74,97 +74,171 @@ def _qwen_model_dir() -> str:
 # -----------------------------
 # FLUX.2 Klein (GGUF) helpers
 # -----------------------------
-def _pick_flux_klein_models_highest() -> Dict[str, str]:
+def _pick_flux_klein_models_highest(force_klein_b: int = 0) -> Dict[str, str]:
     """Auto-pick FLUX.2 Klein GGUF wiring for stable-diffusion.cpp sd-cli.
 
-    Expected folder layout:
-      <root>/models/klein4b_gguf/
-        - diffusion: flux2-klein-4b*.gguf
-        - llm/text encoder: qwen3-4b*.gguf
-        - vae: flux2_ae.safetensors (or similar)
-      sd-cli:
-        <root>/presets/bin/sd-cli.exe
+    Supports both Klein 4B and 9B packs. Picks the *highest available* diffusion model,
+    preferring:
+      1) Larger Klein family (9B > 4B)
+      2) Higher quant (Q8 > Q6 > Q4; supports Q8_0, Q5_K_M, etc.)
+      3) Larger file size as tie-breaker
 
-    Picking rule:
-      - Prefer highest quant (largest Q number in filename, e.g. Q8 > Q6 > Q4).
-      - Tie-break by file size (bigger wins).
+    Text encoder (LLM) preference:
+      - If diffusion is Klein 9B -> prefer Qwen3 8B GGUF (highest quant)
+      - If diffusion is Klein 4B -> prefer Qwen3 4B GGUF (highest quant)
+      - Fallback: best available Qwen3 GGUF found
+
+    Expected default folders (but scanning is flexible):
+      <root>/models/klein9b_gguf/
+      <root>/models/klein4b_gguf/
     """
     root = _root()
-    model_dir = (root / "models" / "klein4b_gguf").resolve()
     sdcli = (root / "presets" / "bin" / ("sd-cli.exe" if os.name == "nt" else "sd-cli")).resolve()
 
-    def _score_gguf(p: Path) -> Tuple[int, int, str]:
-        name = p.name
-        m = re.search(r"\bQ(\d+)\b", name, flags=re.IGNORECASE)
-        qn = int(m.group(1)) if m else -1
+    # candidate model dirs
+    models_root = (root / "models").resolve()
+    preferred_dirs: List[Path] = []
+    for dname in ("klein9b_gguf", "klein4b_gguf"):
+        d = (models_root / dname).resolve()
+        if d.exists():
+            preferred_dirs.append(d)
+
+    # also accept any folder matching "*klein*gguf*"
+    try:
+        if models_root.exists():
+            for d in models_root.iterdir():
+                if not d.is_dir():
+                    continue
+                dn = d.name.lower()
+                if ("klein" in dn) and ("gguf" in dn) and (d not in preferred_dirs):
+                    preferred_dirs.append(d.resolve())
+    except Exception:
+        pass
+
+    def _parse_qnum(name: str) -> int:
+        # supports Q8_0, Q5_K_M, etc.
+        m = re.search(r"(?i)\bQ(\d+)", name)
+        return int(m.group(1)) if m else -1
+
+    def _parse_klein_b(name: str) -> int:
+        m = re.search(r"(?i)klein[-_ ]?(\d+)b", name)
+        return int(m.group(1)) if m else -1
+
+    def _parse_qwen_b(name: str) -> int:
+        m = re.search(r"(?i)qwen\s*3[-_ ]?(\d+)b", name)
+        return int(m.group(1)) if m else -1
+
+    def _safe_size(pp: Path) -> int:
         try:
-            sz = int(p.stat().st_size)
+            return int(pp.stat().st_size)
         except Exception:
-            sz = 0
-        return (qn, sz, str(p))
+            return 0
 
     diffusion = ""
     llm = ""
     vae = ""
+    chosen_model_dir = ""
 
-    # diffusion gguf
-    try:
-        cands: List[Path] = []
-        if model_dir.exists():
-            for p in model_dir.rglob("*.gguf"):
-                if not p.is_file():
+    diffusion_cands: List[tuple] = []
+    for d in preferred_dirs:
+        try:
+            for pp in d.rglob("*.gguf"):
+                if not pp.is_file():
                     continue
-                n = p.name.lower()
-                # Flux diffusion model (exclude qwen/llm)
-                if "flux" in n and "klein" in n and "4b" in n and ("qwen" not in n) and ("llm" not in n):
-                    cands.append(p)
-        if cands:
-            cands = sorted(cands, key=_score_gguf, reverse=True)
-            diffusion = str(cands[0])
-    except Exception:
-        diffusion = ""
+                n = pp.name.lower()
+                if ("flux" in n) and ("klein" in n) and ("qwen" not in n) and ("llm" not in n):
+                    kb = _parse_klein_b(pp.name)
+                    qn = _parse_qnum(pp.name)
+                    sz = _safe_size(pp)
+                    # Optional family lock: 4B vs 9B
+                    try:
+                        if int(force_klein_b or 0) > 0:
+                            if (kb < 0) or (int(kb) != int(force_klein_b)):
+                                continue
+                    except Exception:
+                        pass
+                    diffusion_cands.append((kb, qn, sz, str(pp), d))
+        except Exception:
+            continue
 
-    # llm gguf (text encoder)
-    try:
-        cands = []
-        if model_dir.exists():
-            for p in model_dir.rglob("*.gguf"):
-                if not p.is_file():
-                    continue
-                n = p.name.lower()
-                if "qwen" in n and "4b" in n:
-                    cands.append(p)
-        if cands:
-            cands = sorted(cands, key=_score_gguf, reverse=True)
-            llm = str(cands[0])
-    except Exception:
-        llm = ""
+    if diffusion_cands:
+        diffusion_cands.sort(key=lambda t: (t[0], t[1], t[2], t[3]), reverse=True)
+        kb, qn, sz, best_path, best_dir = diffusion_cands[0]
+        diffusion = best_path
+        chosen_model_dir = str(best_dir)
+        preferred_qwen_b = 8 if kb >= 9 else 4
+        try:
+            if int(force_klein_b or 0) == 9:
+                preferred_qwen_b = 8
+            elif int(force_klein_b or 0) == 4:
+                preferred_qwen_b = 4
+        except Exception:
+            pass
+    else:
+        try:
+            if int(force_klein_b or 0) == 9:
+                preferred_qwen_b = 8
+            else:
+                preferred_qwen_b = 4
+        except Exception:
+            preferred_qwen_b = 4
 
-    # vae safetensors
-    try:
-        cands_st: List[Path] = []
-        if model_dir.exists():
-            for p in model_dir.rglob("*.safetensors"):
-                if not p.is_file():
+    llm_cands: List[tuple] = []
+    for d in preferred_dirs:
+        try:
+            for pp in d.rglob("*.gguf"):
+                if not pp.is_file():
                     continue
-                n = p.name.lower()
-                if ("flux" in n) and (("ae" in n) or ("vae" in n)):
-                    cands_st.append(p)
-        if not cands_st and model_dir.exists():
-            cands_st = [p for p in model_dir.rglob("*.safetensors") if p.is_file()]
-        if cands_st:
-            # biggest file tends to be the real VAE
-            cands_st = sorted(cands_st, key=lambda p: (int(p.stat().st_size) if p.exists() else 0, str(p)), reverse=True)
-            vae = str(cands_st[0])
+                n = pp.name.lower()
+                if ("qwen" in n) and ("3" in n):
+                    qb = _parse_qwen_b(pp.name)
+                    qn = _parse_qnum(pp.name)
+                    sz = _safe_size(pp)
+                    pref = 1 if qb == preferred_qwen_b else 0
+                    llm_cands.append((pref, qb, qn, sz, str(pp)))
+        except Exception:
+            continue
+
+    if llm_cands:
+        llm_cands.sort(key=lambda t: (t[0], t[1], t[2], t[3], t[4]), reverse=True)
+        llm = llm_cands[0][4]
+
+    vae_dirs: List[Path] = []
+    try:
+        if diffusion and Path(diffusion).exists():
+            vae_dirs.append(Path(diffusion).resolve().parent)
     except Exception:
-        vae = ""
+        pass
+    for d in preferred_dirs:
+        if d not in vae_dirs:
+            vae_dirs.append(d)
+
+    vae_cands: List[tuple] = []
+    for d in vae_dirs:
+        try:
+            for pp in d.rglob("*.safetensors"):
+                if not pp.is_file():
+                    continue
+                n = pp.name.lower()
+                is_flux_vae = 1 if (("flux" in n) and (("ae" in n) or ("vae" in n))) else 0
+                vae_cands.append((is_flux_vae, _safe_size(pp), str(pp)))
+        except Exception:
+            continue
+
+    if vae_cands:
+        vae_cands.sort(key=lambda t: (t[0], t[1], t[2]), reverse=True)
+        vae = vae_cands[0][2]
+
+    if not chosen_model_dir and preferred_dirs:
+        chosen_model_dir = str(preferred_dirs[0])
 
     return {
         "sd_cli": str(sdcli),
-        "model_dir": str(model_dir),
+        "model_dir": str(chosen_model_dir),
         "diffusion": diffusion,
         "llm": llm,
         "vae": vae,
+        "searched_dirs": ";".join([str(d) for d in preferred_dirs]),
     }
 
 
@@ -174,7 +248,7 @@ def _qwen3tts_tokenizer_path() -> str:
 
 
 def _qwen3tts_model_path_for_mode(mode: str) -> str:
-    m = (mode or "").strip().lower()
+    m = (mode or '').strip().lower()
     root_dir = _root() / "models"
     if m == "custom":
         return str((root_dir / "Qwen3-TTS-12Hz-1.7B-CustomVoice").resolve())
@@ -254,6 +328,9 @@ _PLANNER_SETTINGS_PATH = _root() / "presets" / "setsave" / "planner_settings.jso
 # Chunk 9B1: Planner-only upscaling settings (per-project folder)
 _PLANNER_UPSCALE_JSON_NAME = "planner_upscale.json"
 
+# Planner image-to-video prompt schema version
+_PLANNER_I2V_SCHEMA_VERSION = 2
+
 
 def _load_planner_settings() -> Dict[str, Any]:
     try:
@@ -283,11 +360,11 @@ def _planner_get_own_character_entries(enc: Optional[Dict[str, Any]]) -> List[Di
         e = {}
     for i in (1, 2):
         try:
-            prompt = str(e.get(f"own_character_{i}_prompt") or "").strip()
+            prompt = str(e.get(f"own_character_{i}_prompt") or '').strip()
         except Exception:
             prompt = ""
         try:
-            codeword = str(e.get(f"own_character_{i}_codeword") or "").strip()
+            codeword = str(e.get(f"own_character_{i}_codeword") or '').strip()
         except Exception:
             codeword = ""
         if prompt:
@@ -303,7 +380,7 @@ def _apply_own_character_codeword_replacements(prompt_text: str, enc: Optional[D
     - No codeword => no injection (prevents global prompt pollution).
     """
     try:
-        text = str(prompt_text or "")
+        text = str(prompt_text or '')
     except Exception:
         text = ""
     if not text.strip():
@@ -325,8 +402,8 @@ def _apply_own_character_codeword_replacements(prompt_text: str, enc: Optional[D
     out = text
     for rec in entries:
         try:
-            codeword = str(rec.get("codeword") or "").strip()
-            repl = str(rec.get("prompt") or "").strip()
+            codeword = str(rec.get("codeword") or '').strip()
+            repl = str(rec.get("prompt") or '').strip()
         except Exception:
             codeword, repl = "", ""
         if not codeword or not repl:
@@ -347,7 +424,7 @@ def _apply_own_character_codeword_replacements(prompt_text: str, enc: Optional[D
 
 def _parse_own_storyline_prompts(text: str) -> Tuple[List[Dict[str, Any]], str]:
     # Normalize newlines and strip invisible BOM/ZWSP chars that often appear at the very start of pasted text.
-    src = (text or "").replace("\r\n", "\n").replace("\r", "\n")
+    src = (text or '').replace("\r\n", "\n").replace("\r", "\n")
     try:
         src = _ZWSP_RE.sub("", src)
     except Exception:
@@ -385,7 +462,7 @@ def _parse_own_storyline_prompts(text: str) -> Tuple[List[Dict[str, Any]], str]:
                 found_marker = True
                 # If the user had text before the first marker (or the first marker line failed to match due to paste quirks),
                 # treat it as prompt #1 rather than silently dropping it.
-                pre_body = "\n".join([x for x in pre_lines if (x or "").strip()]).strip()
+                pre_body = "\n".join([x for x in pre_lines if (x or '').strip()]).strip()
                 if pre_body:
                     prompts.append({"index": 1, "text": pre_body})
                 pre_lines = []
@@ -401,13 +478,13 @@ def _parse_own_storyline_prompts(text: str) -> Tuple[List[Dict[str, Any]], str]:
                 cur_num = int(mm.group(1))
             except Exception:
                 cur_num = None
-            remainder = (mm.group(2) or "").strip()
+            remainder = (mm.group(2) or '').strip()
             cur_lines = [remainder] if remainder else []
             continue
 
         if not found_marker:
             # Accumulate any leading non-empty lines; if marker mode kicks in later we won't lose these.
-            if (ln or "").strip():
+            if (ln or '').strip():
                 pre_lines.append(ln)
             continue
 
@@ -444,7 +521,7 @@ def _parse_own_storyline_prompts(text: str) -> Tuple[List[Dict[str, Any]], str]:
             if cur_has_item:
                 flush_list()
             cur_has_item = True
-            cur_lines = [(bm.group(1) or "").strip()]
+            cur_lines = [(bm.group(1) or '').strip()]
             continue
         if not found_list:
             continue
@@ -469,7 +546,7 @@ def _parse_own_storyline_prompts(text: str) -> Tuple[List[Dict[str, Any]], str]:
 
     parts = re.split(r"\n\s*\n+", raw)
     for part in parts:
-        s = (part or "").strip()
+        s = (part or '').strip()
         if not s:
             continue
         # collapse internal newlines to spaces for prompt friendliness
@@ -508,7 +585,7 @@ def _own_storyline_extract_text(it: Any) -> str:
 
 def _clean_own_story_prompt(s: str) -> str:
     try:
-        s = str(s or "")
+        s = str(s or '')
     except Exception:
         s = ""
     # remove BOM / zero-width chars that can make a line *look* non-empty but compile as blank
@@ -539,10 +616,10 @@ _DEFAULT_UI_NEGATIVES = (
                 )
 
 def _parse_negative_text(t: str) -> List[str]:
-    raw = (t or "").replace(";", ",")
+    raw = (t or '').replace(";", ",")
     parts: List[str] = []
     for chunk in re.split(r"[,\n\r]+", raw):
-        s = (chunk or "").strip()
+        s = (chunk or '').strip()
         if s:
             parts.append(s)
     # de-dupe while preserving order
@@ -613,7 +690,7 @@ class _PlannerLogManager:
         if not self.enabled or not self._job_fp:
             return
         try:
-            jid = (job_id or "").strip() or "-"
+            jid = (job_id or '').strip() or "-"
             self._job_fp.write(f"[{self._ts()}] [{jid}] {msg}\n")
         except Exception:
             pass
@@ -655,9 +732,9 @@ def _qwen_generate_text(*, model_path: Path, system_prompt: str, user_prompt: st
         temperature=float(temperature),
         max_new_tokens=int(max_new_tokens),
     )
-    if int(rc) != 0 and not (out or "").strip():
+    if int(rc) != 0 and not (out or '').strip():
         raise RuntimeError(f"Qwen subprocess failed (rc={rc}).\\n{err}")
-    return (out or "")
+    return (out or '')
 
 def _run_qwen_text_subprocess(*,
                              model_path: str,
@@ -704,7 +781,7 @@ try:
         max_new_tokens=int(req.get("max_new_tokens",1024)),
         cancel_check=None,
     )
-    sys.stdout.write((out or "").strip())
+    sys.stdout.write((out or '').strip())
 except Exception:
     traceback.print_exc()
     sys.exit(2)
@@ -718,8 +795,8 @@ except Exception:
 
     try:
         p = subprocess.run(cmd, capture_output=True, text=True, env=env)
-        out = (p.stdout or "").strip()
-        err = (p.stderr or "").strip()
+        out = (p.stdout or '').strip()
+        err = (p.stderr or '').strip()
         rc = int(p.returncode)
         return out, err, rc
     finally:
@@ -798,7 +875,7 @@ _WAN22_PRESETS = {
 
 
 def _normalize_key(s: str) -> str:
-    s0 = (s or "").strip().lower()
+    s0 = (s or '').strip().lower()
     # UI labels often include "(default)"; normalize to the base key
     if "(" in s0:
         s0 = s0.split("(", 1)[0].strip()
@@ -811,7 +888,7 @@ def _normalize_key(s: str) -> str:
 def _seed_to_int(seed: str) -> int:
     """Deterministically convert any seed string into a stable 32-bit positive int."""
     try:
-        s = (seed or "").encode("utf-8", errors="ignore")
+        s = (seed or '').encode("utf-8", errors="ignore")
         h = hashlib.sha256(s).digest()
         # Use 4 bytes; mask to signed-safe positive range
         return int.from_bytes(h[:4], "little", signed=False) & 0x7FFFFFFF
@@ -951,8 +1028,8 @@ def _plan_characters(plan_obj: Any) -> List[Dict[str, Any]]:
         if isinstance(chars, list):
             for c in chars:
                 if isinstance(c, dict):
-                    name = str(c.get("name") or c.get("id") or "").strip()
-                    role = str(c.get("role") or c.get("type") or "").strip()
+                    name = str(c.get("name") or c.get("id") or '').strip()
+                    role = str(c.get("role") or c.get("type") or '').strip()
                     if name:
                         out.append({"name": name, "role": role})
                 elif isinstance(c, str) and c.strip():
@@ -960,7 +1037,7 @@ def _plan_characters(plan_obj: Any) -> List[Dict[str, Any]]:
     return out
 
 def _normalize_no_item(s: str) -> str:
-    s = (s or "").strip()
+    s = (s or '').strip()
     if not s:
         return ""
     low = s.lower().strip()
@@ -1005,6 +1082,9 @@ def _sanitize_visual_description(text: str) -> str:
 
     # Remove standalone technical terms at start
     text = re.sub(r'^\s*(?:wide|close|medium|establishing|high|low)\s*[,.]?\s*', '', text, flags=re.IGNORECASE)
+
+    # Strip placeholder suffixes that should never reach the final visual seed.
+    text = re.sub(r'(?i)(?:\s*[—–-]\s*|\s+)?moment\s+\d+\s+of\s+\d+\.?\s*$', '', text).strip(' ,.;:-')
 
     # Normalize whitespace
     text = re.sub(r'\s+', ' ', text).strip()
@@ -1059,8 +1139,8 @@ def _ensure_character_bible(manifest: Dict[str, Any], plan_obj: Any) -> List[Dic
     if not bible_list:
         # Create characters based on plan characters with taxonomy detection
         for c in _plan_characters(plan_obj):
-            name = str(c.get("name") or "").strip() or "Character"
-            role = str(c.get("role") or "").strip()
+            name = str(c.get("name") or '').strip() or "Character"
+            role = str(c.get("role") or '').strip()
             desc = f"{role} {c.get('description', '')}"
             taxonomy = _detect_character_taxonomy(desc)
             
@@ -1096,32 +1176,32 @@ def _ensure_character_bible(manifest: Dict[str, Any], plan_obj: Any) -> List[Dic
         
         if taxonomy == "animal":
             norm.append({
-                "name": str(c.get("name") or "").strip() or "Character",
-                "role": str(c.get("role") or "").strip(),
+                "name": str(c.get("name") or '').strip() or "Character",
+                "role": str(c.get("role") or '').strip(),
                 "taxonomy": "animal",
-                "species": str(c.get("species") or "").strip(),
+                "species": str(c.get("species") or '').strip(),
                 "anatomy": {
-                    "body_type": str(c.get("anatomy", {}).get("body_type") or "").strip(),
-                    "size_relative": str(c.get("anatomy", {}).get("size_relative") or "").strip(),
+                    "body_type": str(c.get("anatomy", {}).get("body_type") or '').strip(),
+                    "size_relative": str(c.get("anatomy", {}).get("size_relative") or '').strip(),
                     "distinctive_features": [str(x).strip() for x in (c.get("anatomy", {}).get("distinctive_features") or []) if str(x).strip()],
                 },
                 "coat": {
                     "type": str(c.get("coat", {}).get("type") or "fur").strip(),
-                    "color_primary": str(c.get("coat", {}).get("color_primary") or "").strip(),
-                    "color_secondary": str(c.get("coat", {}).get("color_secondary") or "").strip(),
-                    "texture": str(c.get("coat", {}).get("texture") or "").strip(),
+                    "color_primary": str(c.get("coat", {}).get("color_primary") or '').strip(),
+                    "color_secondary": str(c.get("coat", {}).get("color_secondary") or '').strip(),
+                    "texture": str(c.get("coat", {}).get("texture") or '').strip(),
                     "patterns": [str(x).strip() for x in (c.get("coat", {}).get("patterns") or []) if str(x).strip()],
                 },
                 "facial": {
-                    "snout_shape": str(c.get("facial", {}).get("snout_shape") or "").strip(),
-                    "ears": str(c.get("facial", {}).get("ears") or "").strip(),
-                    "eyes": str(c.get("facial", {}).get("eyes") or "").strip(),
+                    "snout_shape": str(c.get("facial", {}).get("snout_shape") or '').strip(),
+                    "ears": str(c.get("facial", {}).get("ears") or '').strip(),
+                    "eyes": str(c.get("facial", {}).get("eyes") or '').strip(),
                     "distinctive": [str(x).strip() for x in (c.get("facial", {}).get("distinctive") or []) if str(x).strip()],
                 },
                 "limbs": {
-                    "paws_hooves": str(c.get("limbs", {}).get("paws_hooves") or "").strip(),
-                    "tail": str(c.get("limbs", {}).get("tail") or "").strip(),
-                    "wings": str(c.get("limbs", {}).get("wings") or "").strip(),
+                    "paws_hooves": str(c.get("limbs", {}).get("paws_hooves") or '').strip(),
+                    "tail": str(c.get("limbs", {}).get("tail") or '').strip(),
+                    "wings": str(c.get("limbs", {}).get("wings") or '').strip(),
                 },
                 "posture_movement": [str(x).strip() for x in (c.get("posture_movement") or []) if str(x).strip()][:3],
                 "palette": [str(x).strip() for x in (c.get("palette") or []) if str(x).strip()],
@@ -1131,14 +1211,14 @@ def _ensure_character_bible(manifest: Dict[str, Any], plan_obj: Any) -> List[Dic
             })
         elif taxonomy == "creature":
             norm.append({
-                "name": str(c.get("name") or "").strip() or "Character",
-                "role": str(c.get("role") or "").strip(),
+                "name": str(c.get("name") or '').strip() or "Character",
+                "role": str(c.get("role") or '').strip(),
                 "taxonomy": "creature",
-                "base_anatomy": str(c.get("base_anatomy") or "").strip(),
+                "base_anatomy": str(c.get("base_anatomy") or '').strip(),
                 "skin_coat": {
-                    "covering": str(c.get("skin_coat", {}).get("covering") or "").strip(),
+                    "covering": str(c.get("skin_coat", {}).get("covering") or '').strip(),
                     "colors": [str(x).strip() for x in (c.get("skin_coat", {}).get("colors") or []) if str(x).strip()],
-                    "texture": str(c.get("skin_coat", {}).get("texture") or "").strip(),
+                    "texture": str(c.get("skin_coat", {}).get("texture") or '').strip(),
                 },
                 "distinctive_features": [str(x).strip() for x in (c.get("distinctive_features") or []) if str(x).strip()],
                 "face_head": [str(x).strip() for x in (c.get("face_head") or []) if str(x).strip()],
@@ -1148,12 +1228,12 @@ def _ensure_character_bible(manifest: Dict[str, Any], plan_obj: Any) -> List[Dic
             })
         else:  # human
             norm.append({
-                "name": str(c.get("name") or "").strip() or "Character",
-                "role": str(c.get("role") or "").strip(),
+                "name": str(c.get("name") or '').strip() or "Character",
+                "role": str(c.get("role") or '').strip(),
                 "taxonomy": "human",
                 "face_traits": [str(x).strip() for x in (c.get("face_traits") or []) if str(x).strip()],
-                "hair": str(c.get("hair") or "").strip(),
-                "outfit": str(c.get("outfit") or "").strip(),
+                "hair": str(c.get("hair") or '').strip(),
+                "outfit": str(c.get("outfit") or '').strip(),
                 "palette": [str(x).strip() for x in (c.get("palette") or []) if str(x).strip()],
                 "vibe": [str(x).strip() for x in (c.get("vibe") or []) if str(x).strip()],
                 "do_not_change": [str(x).strip() for x in (c.get("do_not_change") or []) if str(x).strip()],
@@ -1173,8 +1253,8 @@ def _ensure_character_bible(manifest: Dict[str, Any], plan_obj: Any) -> List[Dic
         # Create characters based on plan characters (editable later).
         for c in _plan_characters(plan_obj):
             bible_list.append({
-                "name": str(c.get("name") or "").strip() or "Character",
-                "role": str(c.get("role") or "").strip(),
+                "name": str(c.get("name") or '').strip() or "Character",
+                "role": str(c.get("role") or '').strip(),
                 "face_traits": [],
                 "hair": "",
                 "outfit": "",
@@ -1190,11 +1270,11 @@ def _ensure_character_bible(manifest: Dict[str, Any], plan_obj: Any) -> List[Dic
         if not isinstance(c, dict):
             continue
         norm.append({
-            "name": str(c.get("name") or "").strip() or "Character",
-            "role": str(c.get("role") or "").strip(),
+            "name": str(c.get("name") or '').strip() or "Character",
+            "role": str(c.get("role") or '').strip(),
             "face_traits": [str(x).strip() for x in (c.get("face_traits") or []) if str(x).strip()],
-            "hair": str(c.get("hair") or "").strip(),
-            "outfit": str(c.get("outfit") or "").strip(),
+            "hair": str(c.get("hair") or '').strip(),
+            "outfit": str(c.get("outfit") or '').strip(),
             "palette": [str(x).strip() for x in (c.get("palette") or []) if str(x).strip()],
             "vibe": [str(x).strip() for x in (c.get("vibe") or []) if str(x).strip()],
             "do_not_change": [str(x).strip() for x in (c.get("do_not_change") or []) if str(x).strip()],
@@ -1212,7 +1292,7 @@ def _pick_relevant_characters(bible: List[Dict[str, Any]], shot_text: str) -> Li
     if not bible:
         return []
 
-    st = (shot_text or "").lower()
+    st = (shot_text or '').lower()
 
     # Safety: never match ultra-common tokens as "names"
     stop = {
@@ -1221,7 +1301,7 @@ def _pick_relevant_characters(bible: List[Dict[str, Any]], shot_text: str) -> Li
 
     picked: List[Dict[str, Any]] = []
     for c in bible:
-        nm = str(c.get("name") or "").strip()
+        nm = str(c.get("name") or '').strip()
         if not nm:
             continue
         nml = nm.lower()
@@ -1240,10 +1320,287 @@ def _pick_relevant_characters(bible: List[Dict[str, Any]], shot_text: str) -> Li
     # cap to avoid huge prompts
     return picked[:2]
 
+
+def _planner_compact_text(text: Any, max_len: int = 260) -> str:
+    try:
+        s = str(text or '')
+    except Exception:
+        s = ''
+    s = s.replace("\r\n", "\n").replace("\r", "\n")
+    s = re.sub(r'\s+', ' ', s).strip(" \t\n-–—,;:")
+    if len(s) > int(max(32, max_len)):
+        cut = s[: int(max(32, max_len))].rsplit(' ', 1)[0].strip()
+        s = (cut if cut else s[: int(max(32, max_len))].strip()) + '…'
+    return s
+
+
+def _planner_sentence_chunks(text: Any) -> List[str]:
+    try:
+        s = str(text or '')
+    except Exception:
+        s = ''
+    s = s.replace("\r\n", "\n").replace("\r", "\n").strip()
+    if not s:
+        return []
+    parts = re.split(r'(?<=[.!?])\s+|\n+', s)
+    out: List[str] = []
+    for part in parts:
+        part = _planner_compact_text(part, 240)
+        if part:
+            out.append(part)
+    return out
+
+
+def _planner_camera_motion_from_hint(camera_hint: Any) -> str:
+    c = str(camera_hint or '').strip().lower()
+    if not c:
+        return 'slow controlled camera drift with stable framing and no sudden reframing'
+    if any(k in c for k in ('close', 'close-up', 'portrait', 'macro')):
+        return 'very slight push-in or breathing handheld drift while keeping the subject framed almost exactly the same'
+    if any(k in c for k in ('wide', 'establishing', 'full body', 'long shot')):
+        return 'slow dolly or pan that reveals depth while keeping the spatial layout readable and stable'
+    if any(k in c for k in ('overhead', 'top down', 'bird', 'aerial')):
+        return 'gentle overhead glide with the composition held steady and easy to read'
+    if any(k in c for k in ('low angle', 'high angle', 'profile', 'side')):
+        return 'subtle perspective drift that preserves the current angle and keeps the pose readable'
+    if any(k in c for k in ('handheld', 'shaky')):
+        return 'soft handheld float only, with controlled micro-movement and no abrupt shake spikes'
+    return 'slow push or lateral drift that matches the current framing and keeps the composition stable'
+
+
+def _planner_i2v_end_state_hint(phase: Any, notes: Any, next_text: Any) -> str:
+    ph = str(phase or '').strip().lower()
+    nt = _planner_compact_text(next_text, 180)
+    base = 'finish the shot with a small readable progression of the same action, landing in a pose that can cut cleanly to the next shot'
+    if ph in ('hook', 'intro', 'setup', 'opening'):
+        base = 'end with the subject slightly deeper into the moment, as if the scene has just started to come alive'
+    elif ph in ('build', 'middle', 'obstacle', 'escalation'):
+        base = 'end with the action clearly advanced but still controlled, preserving the same location and staging'
+    elif ph in ('climax', 'payoff', 'twist'):
+        base = 'end on the strongest readable beat of the action without breaking identity, layout, or scene logic'
+    elif ph in ('ending', 'resolve', 'resolution', 'outro'):
+        base = 'end in a settled resolved pose with the energy gently landing, ready for a final cut or hold'
+    try:
+        n = str(notes or '').strip().lower()
+    except Exception:
+        n = ''
+    if 'loop' in n:
+        base = 'end in a pose and framing that can loop cleanly back into the opening moment without a visible jump'
+    if nt:
+        base += f'; bridge naturally toward the next beat: {nt}'
+    return base
+
+
+def _planner_character_lock_lines(manifest: Dict[str, Any], shot_text: Any, enc: Optional[Dict[str, Any]] = None, own_active: bool = False) -> List[str]:
+    locks: List[str] = []
+
+    # Manual own-character entries must always be considered when enabled.
+    if bool(own_active):
+        try:
+            for i, rec in enumerate(_planner_get_own_character_entries(enc)[:2], start=1):
+                prompt = _planner_compact_text((rec or {}).get('prompt') or '', 220)
+                codeword = _planner_compact_text((rec or {}).get('codeword') or '', 60)
+                if prompt:
+                    label = codeword if codeword else f'character {i}'
+                    locks.append(f'{label}: {prompt}')
+        except Exception:
+            pass
+
+    # Also add normalized Character Bible locks when available.
+    try:
+        bible = (manifest.get('project') or {}).get('character_bible')
+        bible = [x for x in (bible or []) if isinstance(x, dict)] if isinstance(bible, list) else []
+    except Exception:
+        bible = []
+
+    relevant: List[Dict[str, Any]] = []
+    if bible:
+        try:
+            relevant = _pick_relevant_characters(bible, str(shot_text or ''))
+        except Exception:
+            relevant = []
+        if not relevant and bool(own_active):
+            relevant = bible[:2]
+
+    for c in relevant[:2]:
+        try:
+            nm = _planner_compact_text(c.get('name') or 'character', 60)
+            taxonomy = str(c.get('taxonomy') or 'human').strip().lower()
+            bits: List[str] = []
+            if taxonomy == 'animal':
+                bits.extend([
+                    _planner_compact_text(c.get('species') or '', 60),
+                    _planner_compact_text(((c.get('coat') or {}).get('color_primary') if isinstance(c.get('coat'), dict) else ''), 50),
+                    _planner_compact_text(((c.get('coat') or {}).get('texture') if isinstance(c.get('coat'), dict) else ''), 50),
+                ])
+                bits.extend([_planner_compact_text(x, 50) for x in (((c.get('anatomy') or {}).get('distinctive_features') if isinstance(c.get('anatomy'), dict) else []) or [])[:2]])
+            elif taxonomy == 'creature':
+                bits.extend([
+                    _planner_compact_text(c.get('base_anatomy') or '', 60),
+                    _planner_compact_text(((c.get('skin_coat') or {}).get('texture') if isinstance(c.get('skin_coat'), dict) else ''), 50),
+                ])
+                bits.extend([_planner_compact_text(x, 50) for x in (c.get('distinctive_features') or [])[:2]])
+            else:
+                bits.extend([_planner_compact_text(x, 50) for x in (c.get('face_traits') or [])[:2]])
+                bits.append(_planner_compact_text(c.get('hair') or '', 60))
+                bits.append(_planner_compact_text(c.get('outfit') or '', 80))
+            bits.extend([_planner_compact_text(x, 40) for x in (c.get('do_not_change') or [])[:2]])
+            bits = [b for b in bits if b]
+            if bits:
+                locks.append(f'{nm}: ' + '; '.join(bits[:4]))
+            else:
+                locks.append(f'{nm}: keep identity unchanged')
+        except Exception:
+            continue
+
+    # De-duplicate while keeping order.
+    seen = set()
+    out: List[str] = []
+    for item in locks:
+        k = item.strip().lower()
+        if not item or k in seen:
+            continue
+        seen.add(k)
+        out.append(item)
+    return out[:4]
+
+
+def _planner_build_i2v_schema(
+    manifest: Dict[str, Any],
+    shot: Dict[str, Any],
+    rec: Dict[str, Any],
+    prev_shot: Optional[Dict[str, Any]] = None,
+    next_shot: Optional[Dict[str, Any]] = None,
+    enc: Optional[Dict[str, Any]] = None,
+    own_active: bool = False,
+) -> Dict[str, Any]:
+    stage = shot.get('stage_directions') if isinstance(shot.get('stage_directions'), dict) else {}
+    camera = _planner_compact_text(stage.get('camera') or shot.get('camera') or '', 120)
+    purpose = _planner_compact_text(stage.get('purpose') or shot.get('notes') or shot.get('purpose') or '', 180)
+    mood = _planner_compact_text(stage.get('mood') or shot.get('mood') or '', 80)
+    lighting = _planner_compact_text(stage.get('lighting') or shot.get('lighting') or '', 80)
+
+    visual = _planner_compact_text(shot.get('visual_description') or shot.get('seed') or '', 280)
+    compiled = _planner_compact_text(
+        rec.get('prompt_user_override')
+        or rec.get('prompt_compiled')
+        or rec.get('prompt_used')
+        or rec.get('prompt_spec')
+        or visual,
+        320,
+    )
+
+    prev_text = _planner_compact_text((prev_shot or {}).get('visual_description') or (prev_shot or {}).get('seed') or '', 160)
+    next_text = _planner_compact_text((next_shot or {}).get('visual_description') or (next_shot or {}).get('seed') or '', 160)
+
+    subject_tokens: List[str] = []
+    subs = shot.get('subjects')
+    if isinstance(subs, list):
+        for s in subs[:3]:
+            if isinstance(s, dict):
+                label = _planner_compact_text(s.get('name') or s.get('label') or s.get('id') or '', 60)
+            else:
+                label = _planner_compact_text(s, 60)
+            if label:
+                subject_tokens.append(label)
+
+    subject_label = ', '.join(subject_tokens[:3]).strip()
+    if not subject_label:
+        subject_label = 'the visible subject in the source image'
+
+    sent_visual = _planner_sentence_chunks(visual)
+    sent_compiled = _planner_sentence_chunks(compiled)
+    scene_anchor = sent_visual[0] if sent_visual else (sent_compiled[0] if sent_compiled else visual or compiled)
+
+    if purpose:
+        subject_motion = f'{subject_label} performs one clear readable continuation of the current beat; {purpose.lower()}'
+    else:
+        subject_motion = f'{subject_label} continues the exact moment shown in the source image with one small natural action only'
+
+    environment_bits: List[str] = []
+    if scene_anchor:
+        environment_bits.append(f'preserve the same setting and layout from the input image: {scene_anchor}')
+    if mood:
+        environment_bits.append(f'hold the same mood: {mood}')
+    if lighting:
+        environment_bits.append(f'keep the same lighting feel: {lighting}')
+    environment_bits.append('allow only subtle natural scene motion such as drifting atmosphere, cloth or hair sway, moving reflections, or tiny background activity that fits the location')
+    environment_motion = '; '.join([b for b in environment_bits if b])
+
+    camera_motion = _planner_camera_motion_from_hint(camera)
+    shot_intent = purpose or (f'play the {str(shot.get("phase") or "current").strip()} beat clearly and simply' if str(shot.get('phase') or '').strip() else 'deliver a simple controlled continuation of the image without introducing a new beat')
+
+    start_parts = ['frame 1 must match the source image exactly']
+    if compiled:
+        start_parts.append(f'use the image as the hard visual anchor: {compiled}')
+    if prev_text:
+        start_parts.append(f'keep continuity with the previous beat: {prev_text}')
+    start_state = '; '.join(start_parts)
+
+    end_state = _planner_i2v_end_state_hint(shot.get('phase') or purpose, shot.get('notes') or purpose, next_text)
+
+    continuity_locks: List[str] = [
+        'exact match to the input image on the first frame',
+        'same subject identity, face, body, outfit, colors, props, and scene layout throughout the clip',
+        'no new characters, no new objects, no text, no logos, no split-screen, no collage, no mosaic',
+    ]
+    if subject_tokens:
+        continuity_locks.append('keep only these main visible subjects consistent: ' + ', '.join(subject_tokens[:3]))
+    continuity_locks.extend(_planner_character_lock_lines(manifest, ' '.join([visual, compiled, scene_anchor]), enc=enc, own_active=own_active))
+
+    # De-duplicate continuity locks while keeping order.
+    _seen = set()
+    continuity_locks = [x for x in continuity_locks if x and not (x.lower() in _seen or _seen.add(x.lower()))]
+
+    return {
+        'schema_version': int(_PLANNER_I2V_SCHEMA_VERSION),
+        'subject_motion': _planner_compact_text(subject_motion, 260),
+        'environment_motion': _planner_compact_text(environment_motion, 320),
+        'camera_motion': _planner_compact_text(camera_motion, 220),
+        'shot_intent': _planner_compact_text(shot_intent, 220),
+        'start_state': _planner_compact_text(start_state, 360),
+        'end_state': _planner_compact_text(end_state, 280),
+        'continuity_locks': continuity_locks[:6],
+    }
+
+
+def _planner_format_i2v_prompt(schema: Dict[str, Any]) -> str:
+    locks = schema.get('continuity_locks') if isinstance(schema.get('continuity_locks'), list) else []
+    lock_text = '; '.join([_planner_compact_text(x, 140) for x in locks if _planner_compact_text(x, 140)])
+    parts = [
+        f"Subject motion: {_planner_compact_text(schema.get('subject_motion') or '', 260)}",
+        f"Environment motion: {_planner_compact_text(schema.get('environment_motion') or '', 320)}",
+        f"Camera motion: {_planner_compact_text(schema.get('camera_motion') or '', 220)}",
+        f"Shot intent: {_planner_compact_text(schema.get('shot_intent') or '', 220)}",
+        f"Start state: {_planner_compact_text(schema.get('start_state') or '', 360)}",
+        f"End state: {_planner_compact_text(schema.get('end_state') or '', 280)}",
+        f"Continuity locks: {lock_text}",
+    ]
+    return "\n".join([p for p in parts if p.strip()])
+
+
+def _planner_i2v_prompts_are_current(path: str) -> bool:
+    try:
+        obj = _safe_read_json(path) if path and os.path.isfile(path) else {}
+        if not isinstance(obj, dict):
+            return False
+        if int(obj.get('schema_version') or 0) < int(_PLANNER_I2V_SCHEMA_VERSION):
+            return False
+        shots = obj.get('shots')
+        if not isinstance(shots, list) or not shots:
+            return False
+        first = shots[0] if isinstance(shots[0], dict) else {}
+        prompt = str(first.get('prompt') or '').strip()
+        schema = first.get('schema') if isinstance(first.get('schema'), dict) else {}
+        return ('Subject motion:' in prompt) and bool(schema)
+    except Exception:
+        return False
+
+
 # --- AUTO Character Bible v2 (ID binding + identity anchors) -----------------
 
 def _shot_has_people_hint(text: str) -> bool:
-    t = (text or "").lower()
+    t = (text or '').lower()
     # Conservative heuristic: if these appear, we assume humans are present
     kws = [
         " man", " woman", " people", " person", " couple", " boy", " girl", " child", " kid",
@@ -1275,7 +1632,7 @@ def _auto_cb_v2_char_map(manifest: Dict[str, Any]) -> Dict[str, Dict[str, Any]]:
     for c in chars:
         if not isinstance(c, dict):
             continue
-        cid = str(c.get("id") or "").strip()
+        cid = str(c.get("id") or '').strip()
         if cid:
             out[cid] = c
     return out
@@ -1307,7 +1664,7 @@ def _auto_cb_v2_append_anchors(prompt: str, present_ids: List[str], char_map: Di
     except Exception:
         re = None  # type: ignore
 
-    p = str(prompt or "").strip()
+    p = str(prompt or '').strip()
     if not p:
         return p
 
@@ -1326,7 +1683,7 @@ def _auto_cb_v2_append_anchors(prompt: str, present_ids: List[str], char_map: Di
 
     # Helper: aggressively compress an identity anchor into a short, high-signal fragment.
     def _compress_anchor(anchor: str, max_parts: int = 4, max_chars: int = 120) -> str:
-        a = str(anchor or "").strip()
+        a = str(anchor or '').strip()
         if not a:
             return ""
         # Split by commas; keep early items which tend to be the strongest identity cues.
@@ -1358,11 +1715,11 @@ def _auto_cb_v2_append_anchors(prompt: str, present_ids: List[str], char_map: Di
         c = char_map.get(str(cid))
         if not isinstance(c, dict):
             continue
-        ia = str(c.get("identity_anchor") or "").strip()
+        ia = str(c.get("identity_anchor") or '').strip()
         if not ia:
             continue
         role = _role_label(c)
-        dn = str(c.get("display_name") or "").strip()
+        dn = str(c.get("display_name") or '').strip()
         present_chars.append((str(cid), role, ia, dn))
 
     if not present_chars:
@@ -1432,7 +1789,7 @@ def _auto_cb_v2_append_anchors(prompt: str, present_ids: List[str], char_map: Di
 
     # 5) Anti-clone guard for engines that tend to duplicate subjects when the prompt is verbose.
     try:
-        eh = str(engine_hint or "").lower()
+        eh = str(engine_hint or '').lower()
         is_z = ("z-image" in eh) or ("zimage" in eh) or ("z_image" in eh)
         if is_z and len(present_chars) >= 2:
             p = (p + " Exactly two people: one man and one woman. No duplicates, no extra faces.").strip()
@@ -1457,8 +1814,8 @@ def _auto_cb_v2_validate(payload: Any, shots: List[Dict[str, Any]]) -> Tuple[boo
     for c in chars:
         if not isinstance(c, dict):
             return False, "characters[] must contain objects."
-        cid = str(c.get("id") or "").strip()
-        ia = str(c.get("identity_anchor") or "").strip()
+        cid = str(c.get("id") or '').strip()
+        ia = str(c.get("identity_anchor") or '').strip()
         if not cid:
             return False, "A character is missing id."
         if not re.match(r"^C\d+$", cid):
@@ -1472,14 +1829,14 @@ def _auto_cb_v2_validate(payload: Any, shots: List[Dict[str, Any]]) -> Tuple[boo
     if len(set(ids)) != len(ids):
         return False, "Duplicate character ids."
     # Validate shot bindings
-    s_map = {str(s.get("id") or "").strip(): s for s in shots if isinstance(s, dict)}
+    s_map = {str(s.get("id") or '').strip(): s for s in shots if isinstance(s, dict)}
     binds = payload.get("shots") or payload.get("shot_bindings")
     # We accept either: shots[] with id+present_characters OR shot_bindings{} mapping.
     if isinstance(binds, list):
         for sh in binds:
             if not isinstance(sh, dict):
                 return False, "shots[] must contain objects."
-            sid = str(sh.get("id") or "").strip()
+            sid = str(sh.get("id") or '').strip()
             pcs = sh.get("present_characters")
             if not sid or sid not in s_map:
                 return False, f"shots[] contains unknown or missing shot id: {sid}"
@@ -1493,7 +1850,7 @@ def _auto_cb_v2_validate(payload: Any, shots: List[Dict[str, Any]]) -> Tuple[boo
                     return False, f"Shot {sid} references unknown character id {cid}."
     elif isinstance(binds, dict):
         for sid, pcs in binds.items():
-            sid2 = str(sid or "").strip()
+            sid2 = str(sid or '').strip()
             if not sid2:
                 continue
             if sid2 not in s_map:
@@ -1523,14 +1880,14 @@ def _auto_cb_v2_normalize(payload: Dict[str, Any], shots: List[Dict[str, Any]]) 
         for sh in payload.get("shots") or []:
             if not isinstance(sh, dict):
                 continue
-            sid = str(sh.get("id") or "").strip()
+            sid = str(sh.get("id") or '').strip()
             pcs = sh.get("present_characters")
             if sid and isinstance(pcs, list):
                 out["shot_bindings"][sid] = [str(x).strip() for x in pcs if str(x).strip()]
     # Ensure every shot id exists as key (empty list ok)
     for s in shots:
         if isinstance(s, dict):
-            sid = str(s.get("id") or "").strip()
+            sid = str(s.get("id") or '').strip()
             if sid and sid not in out["shot_bindings"]:
                 out["shot_bindings"][sid] = []
     return out
@@ -1548,11 +1905,11 @@ def _identity_lock_block(chars: List[Dict[str, Any]]) -> str:
     has_human = any(str(c.get("taxonomy") or "human").strip().lower() == "human" for c in chars)
 
     for c in chars:
-        name = (c.get("name") or "").strip() or "Character"
+        name = (c.get("name") or '').strip() or "Character"
         taxonomy = c.get("taxonomy", "human")
         
         if taxonomy == "animal":
-            species = (c.get("species") or "").strip() or "Animal"
+            species = (c.get("species") or '').strip() or "Animal"
             parts = [
                 f"{name} ({species}).",
             ]
@@ -1603,11 +1960,11 @@ def _identity_lock_block(chars: List[Dict[str, Any]]) -> str:
             lines.append(" ".join(parts))
             
         else:  # human
-            role = (c.get("role") or "").strip()
+            role = (c.get("role") or '').strip()
             tag = f"{name}" + (f" ({role})" if role else "")
             face = ", ".join([x for x in (c.get("face_traits") or []) if x]) or "(face traits pending)"
-            hair = (c.get("hair") or "").strip() or "(hair pending)"
-            outfit = (c.get("outfit") or "").strip() or "(outfit pending)"
+            hair = (c.get("hair") or '').strip() or "(hair pending)"
+            outfit = (c.get("outfit") or '').strip() or "(outfit pending)"
             vibe = ", ".join([x for x in (c.get("vibe") or []) if x]) or "(vibe pending)"
             
             lines.append(f"{tag}. Face: {face}. Hair: {hair}. Vibe: {vibe}.")
@@ -1681,8 +2038,788 @@ def _phase_for_index(i: int, n: int) -> str:
     # otherwise build
     return "Build"
 
+
+_STORY_SECTION_DEFAULTS: Dict[str, Dict[str, Any]] = {
+    "setup": {
+        "label": "Setup",
+        "job": "introduce who wants what and establish the world",
+        "change": "reveal new info",
+        "emotion": "curiosity becomes focus",
+        "purposes": ["introduce", "introduce", "transition"],
+        "progression": {
+            "different_now": "the goal and baseline world are now visible",
+            "harder_now": "the mission still lacks a clear path",
+            "revealed_now": "who wants what",
+            "prepares_payoff": "planting the first expectation",
+        },
+    },
+    "discovery": {
+        "label": "Discovery",
+        "job": "uncover a clue, opportunity, or path forward",
+        "change": "reveal new info",
+        "emotion": "curiosity turns into momentum",
+        "purposes": ["reveal clue", "introduce", "transition"],
+        "progression": {
+            "different_now": "the story has a direction instead of just a premise",
+            "harder_now": "the path forward is incomplete or risky",
+            "revealed_now": "a clue, target, or opening",
+            "prepares_payoff": "setting up the next obstacle or move",
+        },
+    },
+    "escalation": {
+        "label": "Escalation",
+        "job": "make the path harder and increase pressure",
+        "change": "increase danger",
+        "emotion": "momentum becomes tension",
+        "purposes": ["build tension", "show obstacle", "transition"],
+        "progression": {
+            "different_now": "the mission is more difficult than before",
+            "harder_now": "pressure, danger, or cost has increased",
+            "revealed_now": "what the real obstacle looks like",
+            "prepares_payoff": "loading the setback or confrontation",
+        },
+    },
+    "setback": {
+        "label": "Setback",
+        "job": "show the cost of failure and force a new choice",
+        "change": "force a decision",
+        "emotion": "confidence drops into doubt",
+        "purposes": ["show obstacle", "force a decision", "transition"],
+        "progression": {
+            "different_now": "the original plan is no longer enough",
+            "harder_now": "failure now feels close or expensive",
+            "revealed_now": "what will happen if the character fails",
+            "prepares_payoff": "driving the final choice",
+        },
+    },
+    "climax": {
+        "label": "Climax",
+        "job": "deliver the decisive action or confrontation",
+        "change": "force a decision",
+        "emotion": "tension peaks into release",
+        "purposes": ["build tension", "payoff", "force a decision"],
+        "progression": {
+            "different_now": "the story reaches its decisive moment",
+            "harder_now": "there is no clean escape from the choice",
+            "revealed_now": "whether the goal can actually be won",
+            "prepares_payoff": "setting up the visible outcome",
+        },
+    },
+    "ending": {
+        "label": "Ending",
+        "job": "show the outcome and let the story land",
+        "change": "shift emotion",
+        "emotion": "release settles into resolution",
+        "purposes": ["payoff", "transition", "payoff"],
+        "progression": {
+            "different_now": "the outcome is now visible",
+            "harder_now": "the cost or consequence is now clear",
+            "revealed_now": "what changed because of the climax",
+            "prepares_payoff": "closing the final emotional beat",
+        },
+    },
+}
+
+_STORY_SECTION_ALIASES = {
+    "intro": "setup",
+    "opening": "setup",
+    "inciting": "discovery",
+    "discovery": "discovery",
+    "complication": "escalation",
+    "rise": "escalation",
+    "build": "escalation",
+    "escalation": "escalation",
+    "obstacle": "setback",
+    "reversal": "setback",
+    "twist": "setback",
+    "setback": "setback",
+    "climax": "climax",
+    "peak": "climax",
+    "ending": "ending",
+    "resolution": "ending",
+    "resolve": "ending",
+    "payoff": "ending",
+    "outro": "ending",
+}
+
+_SHOT_PURPOSE_ALIASES = {
+    "intro": "introduce",
+    "introduce": "introduce",
+    "introduction": "introduce",
+    "setup": "introduce",
+    "tension": "build tension",
+    "build": "build tension",
+    "build tension": "build tension",
+    "obstacle": "show obstacle",
+    "show obstacle": "show obstacle",
+    "clue": "reveal clue",
+    "reveal": "reveal clue",
+    "reveal clue": "reveal clue",
+    "transition": "transition",
+    "decision": "force a decision",
+    "force decision": "force a decision",
+    "force a decision": "force a decision",
+    "payoff": "payoff",
+    "resolve": "payoff",
+}
+
+_SECTION_CHANGE_ALIASES = {
+    "new info": "reveal new info",
+    "reveal": "reveal new info",
+    "reveal new info": "reveal new info",
+    "danger": "increase danger",
+    "increase danger": "increase danger",
+    "location": "change location",
+    "change location": "change location",
+    "emotion": "shift emotion",
+    "shift emotion": "shift emotion",
+    "decision": "force a decision",
+    "force a decision": "force a decision",
+}
+
+def _story_section_key(value: Any) -> str:
+    raw = str(value or "").strip().lower()
+    if not raw:
+        return "setup"
+    compact = re.sub(r"[^a-z]+", " ", raw).strip()
+    if compact in _STORY_SECTION_ALIASES:
+        return _STORY_SECTION_ALIASES[compact]
+    for k, v in _STORY_SECTION_ALIASES.items():
+        if k and k in compact:
+            return v
+    if compact in _STORY_SECTION_DEFAULTS:
+        return compact
+    return "setup"
+
+def _story_section_defaults(key: str) -> Dict[str, Any]:
+    return dict(_STORY_SECTION_DEFAULTS.get(_story_section_key(key), _STORY_SECTION_DEFAULTS["setup"]))
+
+def _story_arc_template_keys(duration_sec: float, n_shots: int = 0) -> List[str]:
+    try:
+        duration_sec = float(duration_sec or 0.0)
+    except Exception:
+        duration_sec = 0.0
+    try:
+        n_shots = int(n_shots or 0)
+    except Exception:
+        n_shots = 0
+    if duration_sec > 30.0:
+        if n_shots >= 10:
+            return ["setup", "discovery", "escalation", "setback", "climax", "ending"]
+        if n_shots >= 8:
+            return ["setup", "discovery", "escalation", "climax", "ending"]
+        return ["setup", "escalation", "setback", "climax", "ending"]
+    if n_shots >= 6:
+        return ["setup", "discovery", "climax", "ending"]
+    return ["setup", "escalation", "ending"]
+
+def _compact_story_text(text: Any, max_len: int = 120) -> str:
+    s = str(text or "").replace("\r", " ").replace("\n", " ").strip()
+    s = re.sub(r"\s{2,}", " ", s).strip()
+    if len(s) > int(max_len):
+        s = s[: max(0, int(max_len) - 1)].rstrip(" ,;:-") + "…"
+    return s
+
+def _normalize_section_change(value: Any, fallback: str = "reveal new info") -> str:
+    raw = str(value or "").strip().lower()
+    if not raw:
+        return str(fallback or "reveal new info").strip()
+    compact = re.sub(r"[^a-z]+", " ", raw).strip()
+    if compact in _SECTION_CHANGE_ALIASES:
+        return _SECTION_CHANGE_ALIASES[compact]
+    for k, v in _SECTION_CHANGE_ALIASES.items():
+        if k and k in compact:
+            return v
+    return str(fallback or "reveal new info").strip()
+
+def _normalize_shot_purpose(value: Any, section_key: str, idx_in_section: int, section_len: int) -> str:
+    raw = str(value or "").strip().lower()
+    compact = re.sub(r"[^a-z]+", " ", raw).strip() if raw else ""
+    if compact in _SHOT_PURPOSE_ALIASES:
+        return _SHOT_PURPOSE_ALIASES[compact]
+    for k, v in _SHOT_PURPOSE_ALIASES.items():
+        if k and k in compact:
+            return v
+    defaults = _story_section_defaults(section_key).get("purposes") or ["introduce", "transition", "payoff"]
+    if not isinstance(defaults, list) or not defaults:
+        defaults = ["introduce", "transition", "payoff"]
+    section_len = max(1, int(section_len or 1))
+    idx_in_section = max(1, int(idx_in_section or 1))
+    if section_len <= 1:
+        return str(defaults[min(len(defaults) - 1, 1)] if len(defaults) > 1 else defaults[0])
+    if idx_in_section == 1:
+        return str(defaults[0])
+    if idx_in_section >= section_len:
+        return str(defaults[-1])
+    mid_idx = min(len(defaults) - 1, 1)
+    return str(defaults[mid_idx])
+
+def _distribute_counts(total: int, buckets: int) -> List[int]:
+    try:
+        total = int(total or 0)
+        buckets = int(buckets or 0)
+    except Exception:
+        return []
+    if total <= 0 or buckets <= 0:
+        return []
+    buckets = min(total, buckets)
+    base = total // buckets
+    rem = total % buckets
+    out = []
+    for i in range(buckets):
+        out.append(base + (1 if i < rem else 0))
+    return out
+
+def _normalize_story_arc(plan_obj: Any, duration_sec: float = 0.0, n_shots: int = 0) -> Dict[str, Any]:
+    plan = dict(plan_obj or {}) if isinstance(plan_obj, dict) else {}
+    try:
+        duration_sec = float(duration_sec or plan.get("duration_sec") or 0.0)
+    except Exception:
+        duration_sec = 0.0
+    try:
+        n_shots = int(n_shots or 0)
+    except Exception:
+        n_shots = 0
+
+    engine_raw = plan.get("story_engine") if isinstance(plan.get("story_engine"), dict) else {}
+    protagonist_goal = _compact_story_text(
+        engine_raw.get("who_wants_what")
+        or engine_raw.get("goal")
+        or engine_raw.get("want")
+        or plan.get("logline")
+        or plan.get("prompt")
+        or "the main subject wants something important",
+        180,
+    )
+    obstacle = _compact_story_text(
+        engine_raw.get("what_blocks_them")
+        or engine_raw.get("obstacle")
+        or engine_raw.get("conflict")
+        or "something meaningful blocks progress",
+        160,
+    )
+    stakes = _compact_story_text(
+        engine_raw.get("what_happens_if_they_fail")
+        or engine_raw.get("stakes_if_fail")
+        or engine_raw.get("stakes")
+        or "the goal is lost and the ending lands weaker",
+        160,
+    )
+    plan["story_engine"] = {
+        "who_wants_what": protagonist_goal,
+        "what_blocks_them": obstacle,
+        "what_happens_if_they_fail": stakes,
+    }
+
+    raw_sections = plan.get("arc_sections")
+    if not isinstance(raw_sections, list) or not raw_sections:
+        raw_sections = plan.get("story_arc")
+    norm_sections: List[Dict[str, Any]] = []
+    if isinstance(raw_sections, list):
+        for idx, sec in enumerate(raw_sections, start=1):
+            if isinstance(sec, str):
+                sec = {"label": sec}
+            if not isinstance(sec, dict):
+                continue
+            sec_key = _story_section_key(sec.get("key") or sec.get("label") or sec.get("name") or sec.get("section"))
+            defaults = _story_section_defaults(sec_key)
+            norm_sections.append({
+                "index": int(sec.get("index") or idx),
+                "key": sec_key,
+                "label": _compact_story_text(sec.get("label") or sec.get("name") or defaults.get("label") or sec_key.title(), 40) or defaults.get("label") or sec_key.title(),
+                "job": _compact_story_text(sec.get("job") or sec.get("goal") or sec.get("summary") or defaults.get("job") or "", 140),
+                "change": _normalize_section_change(sec.get("change") or sec.get("turn") or sec.get("change_type") or defaults.get("change")),
+                "emotion_shift": _compact_story_text(sec.get("emotion_shift") or sec.get("emotion") or defaults.get("emotion") or "", 120),
+            })
+    if not norm_sections:
+        keys = _story_arc_template_keys(duration_sec, n_shots)
+        norm_sections = []
+        for idx, sec_key in enumerate(keys, start=1):
+            defaults = _story_section_defaults(sec_key)
+            norm_sections.append({
+                "index": idx,
+                "key": sec_key,
+                "label": defaults.get("label") or sec_key.title(),
+                "job": defaults.get("job") or "",
+                "change": defaults.get("change") or "reveal new info",
+                "emotion_shift": defaults.get("emotion") or "",
+            })
+
+    max_sections = min(6, max(1, len(norm_sections)))
+    if n_shots > 0:
+        max_sections = min(max_sections, max(1, n_shots))
+    norm_sections = norm_sections[:max_sections]
+
+    counts = _distribute_counts(max(1, n_shots or len(norm_sections)), len(norm_sections))
+    cursor = 1
+    for i, sec in enumerate(norm_sections):
+        defaults = _story_section_defaults(sec.get("key"))
+        count_i = counts[i] if i < len(counts) else 1
+        sec["index"] = i + 1
+        sec["label"] = _compact_story_text(sec.get("label") or defaults.get("label") or "", 40) or defaults.get("label") or f"Section {i+1}"
+        sec["job"] = _compact_story_text(sec.get("job") or defaults.get("job") or "", 140)
+        sec["change"] = _normalize_section_change(sec.get("change") or defaults.get("change"), defaults.get("change"))
+        sec["emotion_shift"] = _compact_story_text(sec.get("emotion_shift") or defaults.get("emotion") or "", 120)
+        sec["start_shot"] = int(sec.get("start_shot") or cursor)
+        sec["end_shot"] = int(sec.get("end_shot") or (cursor + count_i - 1))
+        cursor = sec["end_shot"] + 1
+
+    plan["arc_sections"] = norm_sections
+    plan["story_arc"] = [
+        f"{sec.get('label')}: {sec.get('job')}. Change: {sec.get('change')}."
+        for sec in norm_sections
+        if isinstance(sec, dict)
+    ]
+
+    beats = plan.get("beats")
+    if not isinstance(beats, list) or not beats:
+        plan["beats"] = [
+            f"{sec.get('label')}: {sec.get('job')}"
+            for sec in norm_sections
+            if isinstance(sec, dict)
+        ]
+
+    plan["story_progression_checks"] = [
+        "What is different now from 5 shots ago?",
+        "What has become harder?",
+        "What has been revealed?",
+        "What payoff is being prepared next?",
+    ]
+    return plan
+
+def _progression_defaults_for_section(section_key: str) -> Dict[str, str]:
+    defaults = _story_section_defaults(section_key).get("progression") or {}
+    if not isinstance(defaults, dict):
+        defaults = {}
+    return {
+        "different_now": _compact_story_text(defaults.get("different_now") or "", 120),
+        "harder_now": _compact_story_text(defaults.get("harder_now") or "", 120),
+        "revealed_now": _compact_story_text(defaults.get("revealed_now") or "", 120),
+        "prepares_payoff": _compact_story_text(defaults.get("prepares_payoff") or "", 120),
+    }
+
+def _apply_story_arc_to_shots(shots: List[Dict[str, Any]], plan_obj: Any, duration_sec: float = 0.0) -> Dict[str, Any]:
+    if not shots:
+        return _normalize_story_arc(plan_obj, duration_sec, 0)
+    plan = _normalize_story_arc(plan_obj, duration_sec, len(shots))
+    sections = [s for s in (plan.get("arc_sections") or []) if isinstance(s, dict)]
+    if not sections:
+        return plan
+
+    def _section_for_shot(i: int) -> Dict[str, Any]:
+        for sec in sections:
+            try:
+                st = int(sec.get("start_shot") or 1)
+                en = int(sec.get("end_shot") or st)
+            except Exception:
+                st, en = 1, len(shots)
+            if st <= i <= en:
+                return sec
+        return sections[-1]
+
+    for i, sh in enumerate(shots, start=1):
+        if not isinstance(sh, dict):
+            continue
+        sec = _section_for_shot(i)
+        sec_key = _story_section_key(sec.get("key"))
+        st = int(sec.get("start_shot") or i)
+        en = int(sec.get("end_shot") or i)
+        idx_in_sec = max(1, i - st + 1)
+        sec_len = max(1, en - st + 1)
+        stage = sh.get("stage_directions")
+        if not isinstance(stage, dict):
+            stage = {}
+        purpose_existing = stage.get("purpose") or sh.get("shot_purpose") or sh.get("purpose") or ""
+        shot_purpose = _normalize_shot_purpose(purpose_existing, sec_key, idx_in_sec, sec_len)
+        section_change = _normalize_section_change(sh.get("section_change") or sec.get("change") or "", sec.get("change") or "reveal new info")
+
+        prog_raw = sh.get("story_progression") if isinstance(sh.get("story_progression"), dict) else {}
+        prog_defaults = _progression_defaults_for_section(sec_key)
+        progression = {
+            "different_now": _compact_story_text(prog_raw.get("different_now") or prog_defaults.get("different_now") or "", 120),
+            "harder_now": _compact_story_text(prog_raw.get("harder_now") or prog_defaults.get("harder_now") or "", 120),
+            "revealed_now": _compact_story_text(prog_raw.get("revealed_now") or prog_defaults.get("revealed_now") or "", 120),
+            "prepares_payoff": _compact_story_text(prog_raw.get("prepares_payoff") or prog_defaults.get("prepares_payoff") or "", 120),
+        }
+
+        story_role = _compact_story_text(
+            sh.get("story_role")
+            or f"{shot_purpose}; {section_change}; {sec.get('job')}",
+            180,
+        )
+
+        stage["purpose"] = _compact_story_text(
+            stage.get("purpose")
+            or f"{shot_purpose}; {section_change}",
+            120,
+        )
+        sh["stage_directions"] = stage
+        sh["story_section"] = sec.get("label") or _story_section_defaults(sec_key).get("label") or sec_key.title()
+        sh["story_section_key"] = sec_key
+        sh["story_section_index"] = int(sec.get("index") or 1)
+        sh["section_change"] = section_change
+        sh["section_job"] = _compact_story_text(sec.get("job") or _story_section_defaults(sec_key).get("job") or "", 140)
+        sh["shot_purpose"] = shot_purpose
+        sh["story_role"] = story_role
+        sh["story_progression"] = progression
+
+        notes_existing = _compact_story_text(sh.get("notes") or "", 220)
+        if not notes_existing:
+            notes_existing = story_role
+        elif story_role.lower() not in notes_existing.lower():
+            notes_existing = _compact_story_text(f"{notes_existing} {story_role}", 220)
+        sh["notes"] = notes_existing
+
+    return plan
+
+_STORY_FALLBACK_VISUAL_CUES: Dict[str, Dict[str, List[str]]] = {
+    "setup": {
+        "locations": [
+            "at the threshold of the location",
+            "in the first readable part of the setting",
+            "beside the clearest path deeper into the place",
+        ],
+        "actions": [
+            "arriving and taking in the world for the first time",
+            "pausing before the next move",
+            "looking toward the destination that matters most",
+        ],
+        "details": [
+            "open foreground space, layered midground depth, a clear landmark in the background, and light that makes the setting feel fresh",
+            "clean surfaces, readable architecture, distant activity in the background, and one strong prop that anchors the place",
+            "a quiet entry point, clear lines leading inward, reflective materials, and enough empty space to make the world easy to read",
+        ],
+    },
+    "discovery": {
+        "locations": [
+            "near a newly revealed part of the setting",
+            "where the next clue or opportunity comes into view",
+            "at the edge of a space that promises a way forward",
+        ],
+        "actions": [
+            "noticing something that opens the path ahead",
+            "leaning toward a new clue or opportunity",
+            "moving closer to a detail that changes the direction of the scene",
+        ],
+        "details": [
+            "a newly visible layer in the midground, reflected highlights, a route deeper into the space, and one detail that now feels important",
+            "open sightlines, depth behind the subject, a distinct object or landmark, and atmosphere that turns curiosity into momentum",
+            "a clearer destination, small visual hints in the surroundings, stronger contrast, and background shapes that suggest the next move",
+        ],
+    },
+    "escalation": {
+        "locations": [
+            "in a part of the setting where movement now feels tighter",
+            "along the most pressured route through the location",
+            "where the environment itself starts working against the subject",
+        ],
+        "actions": [
+            "pushing forward even as the scene becomes harder",
+            "trying to stay in control while pressure rises",
+            "meeting the first version of the real obstacle head-on",
+        ],
+        "details": [
+            "less open space, more visual pressure in the frame, motion deeper in the background, and surfaces that feel sharper or less forgiving",
+            "a narrower path, stronger contrast, unstable background activity, and clear signs that the easy version of the plan is over",
+            "compressed depth, busier surroundings, a route that no longer feels safe, and visual tension that keeps building",
+        ],
+    },
+    "setback": {
+        "locations": [
+            "at the point where the original plan starts failing",
+            "in a part of the setting that now feels exposed or blocked",
+            "where there is no easy way to keep going as before",
+        ],
+        "actions": [
+            "hesitating as the cost of failure becomes visible",
+            "stopping short and reassessing the next move",
+            "facing the moment where the old approach is no longer enough",
+        ],
+        "details": [
+            "signs of disruption, lost control, an interrupted route, and a frame that feels heavier than before",
+            "damaged order, visual dead ends, tense stillness in the air, and background details that underline the setback",
+            "a blocked path, unsettled surroundings, a dropped or displaced detail, and a mood that turns doubt into urgency",
+        ],
+    },
+    "climax": {
+        "locations": [
+            "at the most decisive point of the setting",
+            "where all attention collapses onto the central action",
+            "in the clearest possible space for the final move",
+        ],
+        "actions": [
+            "committing to the decisive move",
+            "making the choice that the whole sequence has been building toward",
+            "driving straight into the highest-pressure moment",
+        ],
+        "details": [
+            "strong contrast, clear lines of action, compressed tension, and a background that supports the main decision instead of distracting from it",
+            "high visual energy, a readable center of focus, sharp environmental stakes, and motion that feels irreversible",
+            "the most concentrated version of the setting, a dominant landmark or obstacle, and atmosphere that peaks instead of wandering",
+        ],
+    },
+    "ending": {
+        "locations": [
+            "in the changed aftermath of the main action",
+            "where the result of the decisive moment can finally be seen",
+            "in a calmer version of the world after the turning point",
+        ],
+        "actions": [
+            "holding still long enough for the outcome to land",
+            "moving through the aftermath of what just changed",
+            "taking in the visible result of the final choice",
+        ],
+        "details": [
+            "settled motion, clearer breathing room, visible traces of what changed, and one final landmark that makes the ending readable",
+            "quieter background activity, a changed atmosphere, resolved spacing in the frame, and details that make the outcome feel real",
+            "lingering environmental clues, calmer contrast, room for the emotion to land, and a final image that feels complete",
+        ],
+    },
+}
+
+
+def _story_prompt_overlap_key(text: Any) -> str:
+    s = _compact_story_text(text, 320).lower()
+    if not s:
+        return ""
+    s = re.sub(r"\bmoment\s+\d+\s+of\s+\d+\b", " ", s)
+    s = re.sub(r"\b(?:shot|scene|frame)\s+\d+\s+of\s+\d+\b", " ", s)
+    s = re.sub(r"[^a-z0-9]+", " ", s)
+    stop = {
+        "the", "and", "with", "from", "into", "that", "this", "then", "than", "there", "here",
+        "their", "them", "they", "just", "very", "over", "under", "near", "after", "before",
+        "about", "while", "where", "when", "your", "into", "onto", "inside", "outside",
+    }
+    toks = [t for t in s.split() if len(t) > 2 and t not in stop]
+    return " ".join(toks[:32]).strip()
+
+
+def _story_prompt_texts_overlap(a: Any, b: Any) -> bool:
+    aa = _story_prompt_overlap_key(a)
+    bb = _story_prompt_overlap_key(b)
+    if not aa or not bb:
+        return False
+    if aa == bb:
+        return True
+    if (len(aa) >= 18 and aa in bb) or (len(bb) >= 18 and bb in aa):
+        return True
+    sa = set(aa.split())
+    sb = set(bb.split())
+    if not sa or not sb:
+        return False
+    overlap = len(sa & sb) / float(max(1, min(len(sa), len(sb))))
+    return overlap >= 0.72
+
+
+def _story_fallback_pick(options: List[str], seed_text: str) -> str:
+    vals = [str(x or '').strip() for x in (options or []) if str(x or '').strip()]
+    if not vals:
+        return ""
+    try:
+        idx = int(_seed_to_int(seed_text) or 0) % len(vals)
+    except Exception:
+        idx = 0
+    return vals[idx]
+
+
+def _story_stage_defaults(section_key: str, purpose: str = "") -> Dict[str, str]:
+    sk = _story_section_key(section_key)
+    purpose_l = str(purpose or '').strip().lower()
+    camera_map = {
+        "setup": "wide shot",
+        "discovery": "medium shot",
+        "escalation": "tracking medium shot",
+        "setback": "medium close shot",
+        "climax": "dynamic medium shot",
+        "ending": "wide shot",
+    }
+    mood_map = {
+        "setup": "curious",
+        "discovery": "focused",
+        "escalation": "tense",
+        "setback": "uncertain",
+        "climax": "urgent",
+        "ending": "resolved",
+    }
+    if "payoff" in purpose_l and sk not in ("climax", "ending"):
+        camera = "medium shot"
+    else:
+        camera = camera_map.get(sk, "medium shot")
+    return {
+        "camera": camera,
+        "lighting": "cinematic lighting",
+        "mood": mood_map.get(sk, "neutral"),
+        "purpose": str(purpose or '').strip(),
+    }
+
+
+def _parse_story_shot_lines(blob: str, n_shots: int, plan_obj: Any, duration_sec: float = 0.0) -> List[Dict[str, Any]]:
+    if not blob:
+        return []
+    try:
+        n_shots = max(1, int(n_shots or 0))
+    except Exception:
+        n_shots = 1
+    plan = _normalize_story_arc(plan_obj, duration_sec, n_shots)
+    sections = [s for s in (plan.get("arc_sections") or []) if isinstance(s, dict)]
+    if not sections:
+        sections = [{"index": 1, "key": "setup", "label": "Setup", "job": "introduce the world", "change": "reveal new info", "start_shot": 1, "end_shot": n_shots}]
+
+    def _section_for_shot(i: int) -> Dict[str, Any]:
+        for sec in sections:
+            try:
+                st = int(sec.get("start_shot") or 1)
+                en = int(sec.get("end_shot") or st)
+            except Exception:
+                st, en = 1, n_shots
+            if st <= i <= en:
+                return sec
+        return sections[-1]
+
+    lines: List[str] = []
+    for raw_ln in str(blob).splitlines():
+        s = str(raw_ln or '').strip()
+        if not s:
+            continue
+        s = re.sub(r"^\s*(?:\d+\s*[\.)]|[-*•])\s*", "", s).strip()
+        s = re.sub(r"(?i)^\s*(?:shot|scene|frame)\s*\d+\s*[:\-]\s*", "", s).strip()
+        s = _sanitize_visual_description(s)
+        if s:
+            lines.append(s)
+        if len(lines) >= n_shots:
+            break
+
+    out: List[Dict[str, Any]] = []
+    for i, visual in enumerate(lines[:n_shots], start=1):
+        sec = _section_for_shot(i)
+        sec_key = _story_section_key(sec.get("key"))
+        st = int(sec.get("start_shot") or i)
+        en = int(sec.get("end_shot") or i)
+        idx_in_sec = max(1, i - st + 1)
+        sec_len = max(1, en - st + 1)
+        purpose = _normalize_shot_purpose("", sec_key, idx_in_sec, sec_len)
+        stage = _story_stage_defaults(sec_key, purpose)
+        out.append({
+            "id": f"S{i:02d}",
+            "stage_directions": stage,
+            "visual_description": visual,
+            "subjects": [],
+            "seed": visual,
+            "camera": stage.get("camera") or "medium shot",
+            "lighting": stage.get("lighting") or "cinematic lighting",
+            "mood": stage.get("mood") or "neutral",
+            "notes": f"{purpose}; {str(sec.get('job') or '').strip()}".strip(" ;"),
+            "story_section": str(sec.get("label") or "").strip(),
+            "section_change": str(sec.get("change") or "").strip(),
+            "shot_purpose": purpose,
+            "story_progression": _progression_defaults_for_section(sec_key),
+        })
+    return out
+
+
+def _build_local_story_fallback_shots(plan_obj: Any, user_prompt: str, extra_info: str, n_shots: int, duration_sec: float = 0.0) -> List[Dict[str, Any]]:
+    try:
+        n_shots = max(1, int(n_shots or 0))
+    except Exception:
+        n_shots = 1
+    plan = _normalize_story_arc(plan_obj, duration_sec, n_shots)
+    sections = [s for s in (plan.get("arc_sections") or []) if isinstance(s, dict)]
+    if not sections:
+        sections = [{"index": 1, "key": "setup", "label": "Setup", "job": "introduce the world", "change": "reveal new info", "emotion_shift": "curiosity becomes focus", "start_shot": 1, "end_shot": n_shots}]
+
+    base_prompt = _compact_story_text(user_prompt or plan.get("prompt") or ((plan.get("story_engine") or {}).get("who_wants_what") if isinstance(plan.get("story_engine"), dict) else "") or "the main subject is in motion", 220).strip(" .")
+    extra = _compact_story_text(extra_info or plan.get("extra_info") or "", 140).strip(" .")
+
+    def _section_for_shot(i: int) -> Dict[str, Any]:
+        for sec in sections:
+            try:
+                st = int(sec.get("start_shot") or 1)
+                en = int(sec.get("end_shot") or st)
+            except Exception:
+                st, en = 1, n_shots
+            if st <= i <= en:
+                return sec
+        return sections[-1]
+
+    out: List[Dict[str, Any]] = []
+    for i in range(1, n_shots + 1):
+        sec = _section_for_shot(i)
+        sec_key = _story_section_key(sec.get("key"))
+        defaults = _story_section_defaults(sec_key)
+        st = int(sec.get("start_shot") or i)
+        en = int(sec.get("end_shot") or i)
+        idx_in_sec = max(1, i - st + 1)
+        sec_len = max(1, en - st + 1)
+        purpose = _normalize_shot_purpose("", sec_key, idx_in_sec, sec_len)
+        progression = _progression_defaults_for_section(sec_key)
+        cues = _STORY_FALLBACK_VISUAL_CUES.get(sec_key, _STORY_FALLBACK_VISUAL_CUES["setup"])
+        seed_base = f"{base_prompt}|{sec_key}|{purpose}|{i}/{n_shots}"
+        action = _story_fallback_pick(cues.get("actions") or [], seed_base + "|action") or "moving through the next readable beat"
+        location = _story_fallback_pick(cues.get("locations") or [], seed_base + "|location") or "in the active part of the setting"
+        details = _story_fallback_pick(cues.get("details") or [], seed_base + "|details") or "layered surroundings, readable depth, a clear landmark, and atmosphere that supports the action"
+        emotion = _compact_story_text(sec.get("emotion_shift") or defaults.get("emotion") or "", 80)
+        reveal = _compact_story_text(progression.get("revealed_now") or progression.get("different_now") or "", 100)
+        harder = _compact_story_text(progression.get("harder_now") or progression.get("prepares_payoff") or "", 100)
+
+        sentence1 = f"{base_prompt}, {action} {location}.".strip()
+        if extra and not _story_prompt_texts_overlap(sentence1, extra):
+            sentence1 = f"{sentence1[:-1]} while {extra}." if sentence1.endswith('.') else f"{sentence1} while {extra}."
+        sentence2 = f"{details}."
+        if emotion or reveal or harder:
+            tail_parts = []
+            if emotion:
+                tail_parts.append(f"the feeling shifts toward {emotion}")
+            if reveal:
+                tail_parts.append(reveal)
+            elif harder:
+                tail_parts.append(harder)
+            if tail_parts:
+                sentence2 = f"{details}, and {', '.join(tail_parts)}."
+
+        visual = _sanitize_visual_description(f"{sentence1} {sentence2}")
+        stage = _story_stage_defaults(sec_key, purpose)
+        out.append({
+            "id": f"S{i:02d}",
+            "stage_directions": stage,
+            "visual_description": visual,
+            "subjects": [],
+            "seed": visual,
+            "camera": stage.get("camera") or "medium shot",
+            "lighting": stage.get("lighting") or "cinematic lighting",
+            "mood": stage.get("mood") or "neutral",
+            "notes": f"{purpose}; {str(sec.get('job') or defaults.get('job') or '').strip()}".strip(" ;"),
+            "story_section": str(sec.get("label") or defaults.get("label") or sec_key.title()).strip(),
+            "section_change": str(sec.get("change") or defaults.get("change") or "reveal new info").strip(),
+            "shot_purpose": purpose,
+            "story_progression": progression,
+        })
+    return out
+
+
+def _story_shots_look_flat(shots: List[Dict[str, Any]]) -> bool:
+    if not isinstance(shots, list) or len(shots) < 2:
+        return False
+    sigs: List[str] = []
+    placeholder_hits = 0
+    for sh in shots:
+        if not isinstance(sh, dict):
+            continue
+        txt = str(sh.get("visual_description") or sh.get("seed") or '').strip()
+        if re.search(r"(?i)moment\s+\d+\s+of\s+\d+", txt):
+            placeholder_hits += 1
+        sig = _story_prompt_overlap_key(txt)
+        if sig:
+            sigs.append(sig)
+    if len(sigs) < 2:
+        return False
+    unique_ratio = len(set(sigs)) / float(len(sigs))
+    if placeholder_hits >= max(2, len(sigs) // 2):
+        return True
+    return unique_ratio <= 0.45
+
+
 def _normalize_camera_type(camera: str) -> str:
-    c = (camera or "").lower()
+    c = (camera or '').lower()
     if any(k in c for k in ("establish", "wide establishing", "master shot")):
         return "establishing"
     if any(k in c for k in ("wide", "long shot")):
@@ -1701,7 +2838,7 @@ def _normalize_camera_type(camera: str) -> str:
     return "medium"
 
 def _camera_phrase_for_type(t: str) -> str:
-    t = (t or "").strip()
+    t = (t or '').strip()
     if t == "establishing":
         return "establishing wide shot"
     if t == "wide":
@@ -1731,11 +2868,11 @@ def _choose_alt_camera_type(prev_type: str, seed_text: str, phase: str) -> str:
     elif phase == "Resolve":
         menu = ["medium", "wide", "moving", "close_up", "establishing", "ots", "pov", "aerial"]
 
-    prev_type = (prev_type or "").strip()
+    prev_type = (prev_type or '').strip()
     candidates = [x for x in menu if x != prev_type]
     if not candidates:
         candidates = ["medium"]
-    r = random.Random(_sha1_text(seed_text or ""))
+    r = random.Random(_sha1_text(seed_text or ''))
     return candidates[int(r.random() * len(candidates)) % len(candidates)]
 
 def _looks_like_location_change(seed_txt: str, notes: str) -> bool:
@@ -1755,8 +2892,8 @@ def _enforce_shot_language(shots: List[Dict[str, Any]]) -> None:
     n = len(shots)
     prev_type = ""
     for idx, sh in enumerate(shots, start=1):
-        seed_txt = str(sh.get("seed") or "")
-        notes = str(sh.get("notes") or "")
+        seed_txt = str(sh.get("seed") or '')
+        notes = str(sh.get("notes") or '')
         cam = str(sh.get("camera") or "medium shot")
         phase = str(sh.get("phase") or _phase_for_index(idx, n))
 
@@ -1787,7 +2924,7 @@ def _enforce_shot_language(shots: List[Dict[str, Any]]) -> None:
             sln.append(f"Downshifted late establishing shot to '{new_cam}' (no location change detected).")
 
         # Rule: close-ups must be meaningful
-        cam2 = str(sh.get("camera") or "")
+        cam2 = str(sh.get("camera") or '')
         if _normalize_camera_type(cam2) == "close_up":
             blob = f"{seed_txt}\n{notes}".lower()
             meaningful = any(k in blob for k in ("emotion", "reaction", "tear", "smile", "eyes", "hands", "detail", "reveal", "clue", "turn", "shock"))
@@ -1795,7 +2932,7 @@ def _enforce_shot_language(shots: List[Dict[str, Any]]) -> None:
                 sh["notes"] = (notes + " " if notes else "") + "Make the close-up meaningful (emotion or key detail reveal)."
                 sln.append("Close-up flagged: added meaning cue to notes.")
 
-        prev_type = _normalize_camera_type(str(sh.get("camera") or ""))
+        prev_type = _normalize_camera_type(str(sh.get("camera") or ''))
 
 def _ensure_project_motifs(manifest: Dict[str, Any], plan_obj: Any, stable_key: str) -> Dict[str, Any]:
     """Create or load simple project motifs (no color palette feature).
@@ -1855,8 +2992,8 @@ def _lint_shot_prompt(chars: List[Dict[str, Any]], seed_txt: str, notes: str, fi
     for c in chars:
         nm = (c.get("name") or "Character").strip()
         face = c.get("face_traits") or []
-        hair = (c.get("hair") or "").strip()
-        outfit = (c.get("outfit") or "").strip()
+        hair = (c.get("hair") or '').strip()
+        outfit = (c.get("outfit") or '').strip()
         if len(face) < 3:
             notes_out.append(f"WARN: {nm} face_traits has <3 items (lock weak).")
 
@@ -1868,7 +3005,7 @@ def _lint_shot_prompt(chars: List[Dict[str, Any]], seed_txt: str, notes: str, fi
 
     
     # Chunk 2 checks: drama/motifs block presence
-    if "Narrative beat:" not in (final_prompt or ""):
+    if "Narrative beat:" not in (final_prompt or ''):
         notes_out.append("WARN: Narrative beat missing from prompt.")
     return notes_out
 
@@ -1876,23 +3013,23 @@ def _lint_shot_prompt(chars: List[Dict[str, Any]], seed_txt: str, notes: str, fi
 def _cb_compact_identity_phrase(c: Dict[str, Any]) -> str:
     """Compact, positive-only identity phrase for prompt (avoid clone-inducing repetition)."""
     try:
-        taxonomy = str(c.get("taxonomy") or "").strip().lower()
+        taxonomy = str(c.get("taxonomy") or '').strip().lower()
     except Exception:
         taxonomy = ""
-    name = str(c.get("name") or "").strip()
-    role = str(c.get("role") or "").strip()
+    name = str(c.get("name") or '').strip()
+    role = str(c.get("role") or '').strip()
 
     face = c.get("face_traits") or []
     if not isinstance(face, list):
         face = []
     face = [str(x).strip() for x in face if str(x).strip()]
-    hair = str(c.get("hair") or "").strip()
-    outfit = str(c.get("outfit") or "").strip()
-    age = str(c.get("age") or "").strip()
+    hair = str(c.get("hair") or '').strip()
+    outfit = str(c.get("outfit") or '').strip()
+    age = str(c.get("age") or '').strip()
 
-    species = str(c.get("species") or "").strip()
-    markings = str(c.get("markings") or "").strip()
-    accessories = str(c.get("accessories") or "").strip()
+    species = str(c.get("species") or '').strip()
+    markings = str(c.get("markings") or '').strip()
+    accessories = str(c.get("accessories") or '').strip()
 
     parts: List[str] = []
 
@@ -1933,7 +3070,7 @@ def _cb_compact_identity_phrase(c: Dict[str, Any]) -> str:
 
 def _people_policy_clause(chars: List[Dict[str, Any]], blob: str) -> str:
     """Positive-only clause that prevents accidental extra people/clones (works even when negatives are ignored)."""
-    human_chars = [c for c in (chars or []) if str(c.get("taxonomy") or "").strip().lower() == "human"]
+    human_chars = [c for c in (chars or []) if str(c.get("taxonomy") or '').strip().lower() == "human"]
     if human_chars:
         descs = [_cb_compact_identity_phrase(c) for c in human_chars]
         descs = [d for d in descs if d]
@@ -1942,7 +3079,7 @@ def _people_policy_clause(chars: List[Dict[str, Any]], blob: str) -> str:
             return f"Scene contains exactly one person: {descs[0]}."
         return f"Scene contains exactly {n} people: " + "; ".join(descs) + "."
     try:
-        has_people = _shot_has_people_hint(blob or "")
+        has_people = _shot_has_people_hint(blob or '')
     except Exception:
         has_people = False
     if not has_people:
@@ -1991,7 +3128,7 @@ _HITWORD_NEGATIVE_APPEND: List[str] = [
     "halo", "ring above head",
 ]
 def _sanitize_prompt_text(s: str) -> str:
-    s = (s or "").replace("\r", "").strip()
+    s = (s or '').replace("\r", "").strip()
     if not s:
         return ""
     out = s
@@ -2003,7 +3140,7 @@ def _sanitize_prompt_text(s: str) -> str:
         paragraphs = re.split(r"\n{2,}", out)
         cleaned = []
         for para in paragraphs:
-            t = (para or "").strip()
+            t = (para or '').strip()
             if not t:
                 continue
 
@@ -2055,13 +3192,13 @@ def _sanitize_prompt_text(s: str) -> str:
 
 
 def _sanitize_negative_list(neg_csv: str) -> str:
-    base = _parse_negative_text(neg_csv or "")
+    base = _parse_negative_text(neg_csv or '')
     base_l = {x.lower() for x in base}
     for tok in _HITWORD_NEGATIVE_APPEND:
         if tok and tok.lower() not in base_l:
             base.append(tok)
             base_l.add(tok.lower())
-    return ", ".join([x for x in base if (x or "").strip()])
+    return ", ".join([x for x in base if (x or '').strip()])
 
 
 # Render-prompt hygiene helpers (prevents caption/watermark text when shot specs contain internal tokens)
@@ -2070,13 +3207,13 @@ _STANDALONE_MARKER_LINE_RX = re.compile(r"^\s*[a-z0-9_\-]{3,}\s*$", re.IGNORECAS
 
 def _ascii_only(s: str) -> str:
     try:
-        return (s or "").encode("ascii", "ignore").decode("ascii")
+        return (s or '').encode("ascii", "ignore").decode("ascii")
     except Exception:
-        return str(s or "")
+        return str(s or '')
 
 def _strip_nonvisual_markers(s: str) -> str:
     """Remove internal marker tokens (underscores/ids) that image models often render as on-screen text."""
-    s = (s or "").replace("\r", "")
+    s = (s or '').replace("\r", "")
     if not s.strip():
         return ""
     # Drop standalone marker lines like "exit_store" / "pp_snop_foo_2"
@@ -2248,8 +3385,8 @@ _SUBJECT_GUARD_KEEP_HINTS = {
 }
 
 def _seed_mentions_word(seed0: str, word: str) -> bool:
-    s = (seed0 or "").lower()
-    w = (word or "").strip().lower()
+    s = (seed0 or '').lower()
+    w = (word or '').strip().lower()
     if not s or not w:
         return False
     if " " in w or "-" in w:
@@ -2257,7 +3394,7 @@ def _seed_mentions_word(seed0: str, word: str) -> bool:
     return bool(re.search(r"\b" + re.escape(w) + r"\b", s))
 
 def _subject_guard_keywords(seed_text: str) -> List[str]:
-    seed0 = _strip_nonvisual_markers(_ascii_only(seed_text or "")).lower().strip()
+    seed0 = _strip_nonvisual_markers(_ascii_only(seed_text or '')).lower().strip()
     if not seed0:
         return []
     toks = re.findall(r"[a-z0-9]+", seed0)
@@ -2280,7 +3417,7 @@ def _subject_guard_keywords(seed_text: str) -> List[str]:
     return out
 
 def _subject_guard_strip(seed0: str, prompt_text: str) -> str:
-    body = (prompt_text or "").strip()
+    body = (prompt_text or '').strip()
     if not body:
         return ""
 
@@ -2307,7 +3444,7 @@ def _subject_guard_strip(seed0: str, prompt_text: str) -> str:
     return body
 
 def _apply_subject_guard(seed_text: str, prompt_text: str, negative_text: str) -> Tuple[str, str, Dict[str, Any]]:
-    seed0 = _strip_nonvisual_markers(_ascii_only(seed_text or "")).strip()
+    seed0 = _strip_nonvisual_markers(_ascii_only(seed_text or '')).strip()
     seed0_low = seed0.lower().strip()
 
     kws = _subject_guard_keywords(seed0)
@@ -2317,14 +3454,14 @@ def _apply_subject_guard(seed_text: str, prompt_text: str, negative_text: str) -
     fallback_used = False
     hits: List[str] = []
 
-    pcheck = (stripped or prompt_text or "").lower()
+    pcheck = (stripped or prompt_text or '').lower()
     if kws:
         for kw in kws:
             if kw and re.search(r"\b" + re.escape(kw) + r"\b", pcheck):
                 hits.append(kw)
         validated = bool(hits)
 
-    out_prompt = (stripped or prompt_text or "").strip()
+    out_prompt = (stripped or prompt_text or '').strip()
 
     if kws and not validated:
         fallback_used = True
@@ -2336,20 +3473,20 @@ def _apply_subject_guard(seed_text: str, prompt_text: str, negative_text: str) -
         "seed_keywords": int(len(kws)),
         "keyword_hits": hits[:8],
     }
-    return out_prompt.strip(), (negative_text or "").strip(), dbg
+    return out_prompt.strip(), (negative_text or '').strip(), dbg
 
 def _strip_keyword_sentences(text: str, keywords: List[str]) -> str:
     """Remove sentence-like chunks containing any of the given keywords (case-insensitive)."""
-    body = (text or "").strip()
+    body = (text or '').strip()
     if not body:
         return ""
-    kws = [k.strip().lower() for k in (keywords or []) if str(k or "").strip()]
+    kws = [k.strip().lower() for k in (keywords or []) if str(k or '').strip()]
     if not kws:
         return body
     chunks = re.split(r"(?<=[.!?])\s+|\n+", body)
     out: List[str] = []
     for ch in chunks:
-        t = (ch or "").strip()
+        t = (ch or '').strip()
         if not t:
             continue
         low = t.lower()
@@ -2361,11 +3498,11 @@ def _strip_keyword_sentences(text: str, keywords: List[str]) -> str:
     return res
 
 def _seed_has_cat(seed: str) -> bool:
-    s = (seed or "").lower()
+    s = (seed or '').lower()
     return bool(re.search(r"\b(cat|kitten|cats|kittens)\b", s))
 
 def _seed_has_dog(seed: str) -> bool:
-    s = (seed or "").lower()
+    s = (seed or '').lower()
     return bool(re.search(r"\b(dog|puppy|dogs|puppies)\b", s))
 
 _COUNT_WORDS = {
@@ -2375,7 +3512,7 @@ _COUNT_WORDS = {
 
 def _parse_species_count(seed: str, species: str) -> Optional[int]:
     """Best-effort count extraction for a single species word (e.g. cat/dog)."""
-    s = (seed or "").lower()
+    s = (seed or '').lower()
     if not s.strip():
         return None
 
@@ -2403,7 +3540,7 @@ def _parse_species_count(seed: str, species: str) -> Optional[int]:
 
 def _animal_mode_meta(seed_text: str) -> Dict[str, Any]:
     """Return animal-mode flags + expectations derived from the ORIGINAL shot seed."""
-    seed0 = _strip_nonvisual_markers(seed_text or "")
+    seed0 = _strip_nonvisual_markers(seed_text or '')
     seed0 = _ascii_only(seed0).strip()
     animals = _detect_animals_in_seed(seed0)
     animal_mode = bool(animals)
@@ -2415,7 +3552,7 @@ def _animal_mode_meta(seed_text: str) -> Dict[str, Any]:
     if animal_mode and _seed_has_cat(seed0) and _seed_has_dog(seed0):
         other = []
         for a in animals:
-            al = str(a or "").lower()
+            al = str(a or '').lower()
             if al in ("cat", "kitten", "dog", "puppy"):
                 continue
             other.append(al)
@@ -2433,7 +3570,7 @@ def _animal_mode_meta(seed_text: str) -> Dict[str, Any]:
     }
 
 def _build_animal_anchor(meta: Dict[str, Any]) -> str:
-    seed0 = str(meta.get("seed") or "").strip()
+    seed0 = str(meta.get("seed") or '').strip()
     if not seed0:
         return ""
 
@@ -2462,7 +3599,7 @@ def _validate_animal_prompt(meta: Dict[str, Any], prompt_text: str) -> bool:
     if not bool(meta.get("animal_mode")):
         return True
 
-    raw = (prompt_text or "").strip()
+    raw = (prompt_text or '').strip()
     if not raw:
         return False
 
@@ -2470,7 +3607,7 @@ def _validate_animal_prompt(meta: Dict[str, Any], prompt_text: str) -> bool:
     chunks = re.split(r"(?<=[.!?])\s+|\n+", raw)
     body_parts: List[str] = []
     for ch in chunks:
-        t = (ch or "").strip()
+        t = (ch or '').strip()
         if not t:
             continue
         low = t.lower()
@@ -2496,7 +3633,7 @@ def _validate_animal_prompt(meta: Dict[str, Any], prompt_text: str) -> bool:
 
 def _apply_subject_fidelity_v2(seed_text: str, prompt_text: str, negative_text: str) -> Tuple[str, str, Dict[str, Any]]:
     """Animal-shot subject fidelity + drift guards + post-build validation with fallback."""
-    meta = _animal_mode_meta(seed_text or "")
+    meta = _animal_mode_meta(seed_text or '')
     animal_mode = bool(meta.get("animal_mode"))
 
     debug = {
@@ -2506,12 +3643,12 @@ def _apply_subject_fidelity_v2(seed_text: str, prompt_text: str, negative_text: 
     }
 
     if not animal_mode:
-        return (prompt_text or "").strip(), (negative_text or "").strip(), debug
+        return (prompt_text or '').strip(), (negative_text or '').strip(), debug
 
-    seed0 = str(meta.get("seed") or "").strip()
+    seed0 = str(meta.get("seed") or '').strip()
     anchor = _build_animal_anchor(meta)
 
-    body = _strip_human_language_from_prompt(prompt_text or "")
+    body = _strip_human_language_from_prompt(prompt_text or '')
     body = _strip_keyword_sentences(body, _GLASS_WORDS + _SYMBOL_GRID_WORDS)
 
     constraints: List[str] = []
@@ -2533,11 +3670,11 @@ def _apply_subject_fidelity_v2(seed_text: str, prompt_text: str, negative_text: 
         parts.append(body)
     parts.extend(constraints)
 
-    final_prompt = " ".join([p.strip() for p in parts if str(p or "").strip()]).strip()
+    final_prompt = " ".join([p.strip() for p in parts if str(p or '').strip()]).strip()
     final_prompt = re.sub(r"\s{2,}", " ", final_prompt).strip()
 
     # Reinforce negatives
-    neg = (negative_text or "").strip()
+    neg = (negative_text or '').strip()
     neg_parts = _parse_negative_text(neg)
     have = {p.lower() for p in neg_parts}
 
@@ -2567,13 +3704,13 @@ def _apply_subject_fidelity_v2(seed_text: str, prompt_text: str, negative_text: 
             fb_parts.append("SUBJECT: animals.")
         fb_parts.append(minimal)
         fb_parts.extend(constraints)
-        final_prompt = " ".join([p.strip() for p in fb_parts if str(p or "").strip()]).strip()
+        final_prompt = " ".join([p.strip() for p in fb_parts if str(p or '').strip()]).strip()
         final_prompt = re.sub(r"\s{2,}", " ", final_prompt).strip()
 
     return final_prompt, final_negative, debug
 def _detect_animals_in_seed(seed_text: str) -> List[str]:
     """Return a de-duplicated list of animal keywords present in the seed_text."""
-    s = (seed_text or "").lower()
+    s = (seed_text or '').lower()
     if not s.strip():
         return []
     found: List[str] = []
@@ -2598,7 +3735,7 @@ def _detect_animals_in_seed(seed_text: str) -> List[str]:
 
 def _strip_human_language_from_prompt(prompt_body: str) -> str:
     """Remove sentences that introduce humans/people language."""
-    body = (prompt_body or "").strip()
+    body = (prompt_body or '').strip()
     if not body:
         return ""
 
@@ -2610,7 +3747,7 @@ def _strip_human_language_from_prompt(prompt_body: str) -> str:
     kept: List[str] = []
     human_rx = re.compile(r"\b(?:" + "|".join([re.escape(w) for w in _HUMAN_WORDS]) + r")\b", re.IGNORECASE)
     for ch in chunks:
-        t = (ch or "").strip()
+        t = (ch or '').strip()
         if not t:
             continue
         if human_rx.search(t):
@@ -2636,7 +3773,7 @@ def _prompt_requests_text(*chunks: str) -> bool:
     Return True if the user prompt explicitly asks for text/signage/logos/captions.
     This is intentionally conservative: only opt-in when there are strong hints.
     """
-    blob = " ".join([(c or "") for c in chunks]).strip().lower()
+    blob = " ".join([(c or '') for c in chunks]).strip().lower()
     if not blob:
         return False
 
@@ -2659,7 +3796,7 @@ def _prompt_requests_text(*chunks: str) -> bool:
 def _filter_text_negatives_list(items: List[str]) -> List[str]:
     out: List[str] = []
     for it in (items or []):
-        low = (it or "").strip().lower()
+        low = (it or '').strip().lower()
         if not low:
             continue
         if any(k in low for k in _TEXT_NEGATIVE_KEYWORDS):
@@ -2668,7 +3805,7 @@ def _filter_text_negatives_list(items: List[str]) -> List[str]:
     return out
 
 def _adjust_text_negatives_csv(neg_csv: str, allow_text: bool) -> str:
-    items = _parse_negative_text(neg_csv or "")
+    items = _parse_negative_text(neg_csv or '')
     if allow_text:
         items = _filter_text_negatives_list(items)
         return ", ".join(items).strip()
@@ -2684,12 +3821,12 @@ def _proseify_prompt(s: str) -> str:
     """
     Convert label-heavy multi-line specs into natural prose to reduce accidental caption rendering.
     """
-    s = (s or "").replace("\r", "")
+    s = (s or '').replace("\r", "")
     if not s.strip():
         return ""
     lines: List[str] = []
     for ln in s.split("\n"):
-        t = (ln or "").strip()
+        t = (ln or '').strip()
         if not t:
             continue
         # Strip known label prefixes
@@ -2702,9 +3839,9 @@ def _proseify_prompt(s: str) -> str:
     return out.strip()
 
 def _finalize_render_prompt(render_prompt: str, spec_prompt: str, allow_text: bool) -> str:
-    rp = (render_prompt or "").strip()
+    rp = (render_prompt or '').strip()
     if not rp:
-        rp = (spec_prompt or "").strip()
+        rp = (spec_prompt or '').strip()
     rp = _strip_nonvisual_markers(_ascii_only(rp))
     # If prompt still looks like a labeled spec, prose-ify it
     if "\n" in rp or ":" in rp:
@@ -2740,9 +3877,10 @@ def _assemble_shot_prompt(
         stage_raw = {}
 
     # Shot visual seed (already generated upstream)
-    visual_raw = str(shot.get("visual_description") or "").strip()
+    visual_raw = str(shot.get("visual_description") or '').strip()
     visual_raw = _sanitize_visual_description(visual_raw) if visual_raw else ""
-    seed_txt = (visual_raw or str(shot.get("seed") or "").strip())
+    seed_txt = (visual_raw or str(shot.get("seed") or '').strip())
+    seed_txt = re.sub(r'(?i)(?:\s*[—–-]\s*|\s+)?moment\s+\d+\s+of\s+\d+\.?\s*$', '', seed_txt).strip(' ,.;:-')
     seed_txt = _strip_nonvisual_markers(seed_txt)
 
     # Default subject is humans; only strip human language for clearly animal-only shots.
@@ -2754,8 +3892,8 @@ def _assemble_shot_prompt(
 
 
     # Producer notes / purpose are useful, but often include guidelines; sanitize aggressively.
-    purpose = str(stage_raw.get("purpose") or "").strip()
-    notes = (purpose or str(shot.get("notes") or "").strip())
+    purpose = str(stage_raw.get("purpose") or '').strip()
+    notes = (purpose or str(shot.get("notes") or '').strip())
     notes = _strip_nonvisual_markers(notes)
     if _is_animal_shot:
         notes = _strip_human_language_from_prompt(notes)
@@ -2766,15 +3904,15 @@ def _assemble_shot_prompt(
     mood = str(stage_raw.get("mood") or shot.get("mood") or "neutral").strip()
 
     # User start prompt & extra box (style/details)
-    up = _strip_nonvisual_markers(str(user_prompt or "").strip())
+    up = _strip_nonvisual_markers(str(user_prompt or '').strip())
     if _is_animal_shot:
         up = _strip_human_language_from_prompt(up)
-    ex = _strip_nonvisual_markers(str(extra_info or "").strip())
+    ex = _strip_nonvisual_markers(str(extra_info or '').strip())
     if _is_animal_shot:
         ex = _strip_human_language_from_prompt(ex)
 
     # Own Character Bible (manual 1–2): keep as plain prose only (no headers/bullets)
-    own_prompts = [str(x or "").strip() for x in (own_character_prompts or []) if str(x or "").strip()]
+    own_prompts = [str(x or '').strip() for x in (own_character_prompts or []) if str(x or '').strip()]
     own_lock_prose = ""
     if own_prompts:
         cleaned: List[str] = []
@@ -2803,10 +3941,14 @@ def _assemble_shot_prompt(
         if b:
             bits.append(b)
 
-    # Core intent: user prompt → shot visual seed → brief notes
+    # Core intent: user prompt → shot visual seed → brief notes.
+    # Avoid repeating the same premise twice when the shot seed already contains the user's base prompt.
     for b in [up, seed_txt, notes]:
-        if b:
-            bits.append(b)
+        if not b:
+            continue
+        if any(_story_prompt_texts_overlap(b, prev) for prev in bits):
+            continue
+        bits.append(b)
 
     # Auto character/subject anchors: include compact identity phrases (plain prose, no IDs/labels).
     # This helps models that ignore negatives stay on the intended subjects.
@@ -2823,7 +3965,7 @@ def _assemble_shot_prompt(
     if own_lock_prose:
         bits.append(own_lock_prose)
 
-    if ex:
+    if ex and not any(_story_prompt_texts_overlap(ex, prev) for prev in bits):
         bits.append(ex)
 
     # Add a small quality/style tail (positive-only)
@@ -2837,7 +3979,7 @@ def _assemble_shot_prompt(
     if allow_text:
         ui_negs = _filter_text_negatives_list(ui_negs)
 
-    model_l = (image_model or "").lower()
+    model_l = (image_model or '').lower()
     is_qwen_img = ("qwen" in model_l) or ("2512" in model_l)
 
     base_negs = [
@@ -2863,7 +4005,7 @@ def _assemble_shot_prompt(
         except Exception:
             neg_list = base_negs
 
-    final_negative = ", ".join([x for x in (neg_list + ui_negs) if (x or "").strip()])
+    final_negative = ", ".join([x for x in (neg_list + ui_negs) if (x or '').strip()])
     final_negative = _adjust_text_negatives_csv(final_negative, allow_text)
     final_negative = _sanitize_negative_list(final_negative)
 
@@ -2873,7 +4015,7 @@ def _assemble_shot_prompt(
     return final_prompt, final_negative, lint
 
 def _video_model_key(label: str) -> str:
-    l = (label or "").lower()
+    l = (label or '').lower()
     if "wan" in l and "2.2" in l:
         return "wan22"
     if "hunyuan" in l:
@@ -2975,7 +4117,7 @@ def _install_qt_message_filter() -> None:
     try:
         def _handler(msg_type, context, message):  # type: ignore[no-redef]
             try:
-                s = str(message or "")
+                s = str(message or '')
             except Exception:
                 s = ""
 
@@ -3058,7 +4200,7 @@ def _quality_defaults(name: str) -> Dict[str, Any]:
     - Medium: default-ish: CRF 18 OR ~3000k
     - High: close to max but not extreme: CRF 16 OR ~6000k
     """
-    n = (name or "").strip().lower()
+    n = (name or '').strip().lower()
     if n == "low":
         return {"mode": "crf", "crf": 22, "bitrate_kbps": 1500, "note": "Small files, faster encode"}
     if n == "high":
@@ -3080,7 +4222,7 @@ def _duration_label(seconds: int) -> str:
 # -----------------------------
 
 def _aspect_mode_key(label_or_key: str) -> str:
-    s = (label_or_key or "").strip().lower()
+    s = (label_or_key or '').strip().lower()
     if "portrait" in s or "9:16" in s:
         return "portrait"
     if "1:1" in s or "square" in s:
@@ -3096,7 +4238,7 @@ def _aspect_mode_display(mode: str) -> str:
     return "Landscape"
 
 def _upscale_factor_from_label(label: str) -> int:
-    s = (label or "").strip().lower()
+    s = (label or '').strip().lower()
     if "4" in s:
         return 4
     if "2" in s:
@@ -3124,7 +4266,7 @@ def _apply_aspect_to_size(base_w: int, base_h: int, aspect_mode: str) -> Tuple[i
 
 
 def _sha1_text(t: str) -> str:
-    return hashlib.sha1((t or "").encode("utf-8", errors="ignore")).hexdigest()
+    return hashlib.sha1((t or '').encode("utf-8", errors="ignore")).hexdigest()
 
 
 def _sha1_file(path: str, chunk_size: int = 1024 * 1024) -> str:
@@ -3146,7 +4288,7 @@ def _sha1_file(path: str, chunk_size: int = 1024 * 1024) -> str:
 def _auto_title_from_prompt(prompt: str) -> str:
     """Derive a human-friendly title from the user's main prompt (first 6–10 words, cleaned)."""
     try:
-        s = (prompt or "").replace("\n", " ").strip()
+        s = (prompt or '').replace("\n", " ").strip()
     except Exception:
         s = ""
     # Remove some noisy punctuation while keeping readable spacing
@@ -3173,7 +4315,7 @@ def _auto_title_from_prompt(prompt: str) -> str:
 def _slugify_title(title: str) -> str:
     """Lowercase, spaces→dash, remove non [a-z0-9-], collapse dashes, trim."""
     try:
-        s = (title or "").strip().lower()
+        s = (title or '').strip().lower()
     except Exception:
         s = ""
     s = re.sub(r"\s+", "-", s)
@@ -3186,7 +4328,7 @@ def _slugify_title(title: str) -> str:
 def _next_slug_counter(output_base: str, slug: str) -> int:
     """Scan only output_base for folders starting with f"{slug}_" and return next counter (1-based)."""
     try:
-        base = str(output_base or "").strip()
+        base = str(output_base or '').strip()
         if not base:
             return 1
         if not os.path.isdir(base):
@@ -3324,8 +4466,8 @@ def _append_prompt_used(path: str, title: str, system_prompt: str, user_prompt: 
         f.write("="*80 + "\n")
         f.write(f"{title}\n")
         f.write("-"*80 + "\n")
-        f.write("SYSTEM:\n" + (system_prompt or "") + "\n\n")
-        f.write("USER:\n" + (user_prompt or "") + "\n")
+        f.write("SYSTEM:\n" + (system_prompt or '') + "\n\n")
+        f.write("USER:\n" + (user_prompt or '') + "\n")
         f.write("="*80 + "\n\n")
 
 
@@ -3358,11 +4500,11 @@ def _qwen_json_call(step_name: str, system_prompt: str, user_prompt: str, raw_pa
             temperature=float(temperature),
             max_new_tokens=int(max_new_tokens),
         )
-        raw_text = (out or "").strip()
+        raw_text = (out or '').strip()
 
         # Save raw (optionally append stderr without affecting JSON extraction)
         save_blob = raw_text
-        err = (err or "").strip()
+        err = (err or '').strip()
         if err:
             save_blob = (save_blob + "\n\n[stderr]\n" + err).strip()
         _safe_write_text(raw_path, save_blob + ("\n" if save_blob else ""))
@@ -3429,6 +4571,13 @@ class PipelineWorker(QThread):
         self.job = job
         self.out_dir = out_dir
         self.signals = PipelineSignals()
+        try:
+            # Review popups and other UI updates are triggered from the worker thread.
+            # Give the signal object worker-thread affinity so Qt will reliably queue
+            # deliveries back to the GUI thread instead of risking direct GUI work here.
+            self.signals.moveToThread(self)
+        except Exception:
+            pass
         self._stop_requested = False
         self._last_pct = 0  # last emitted progress percent (for skip logs)
         self._review_cmd_q: "queue.Queue[dict]" = queue.Queue()
@@ -3449,6 +4598,10 @@ class PipelineWorker(QThread):
 
     def _image_review_gate(self, *, output_dir: str, manifest_path: str, images_dir: str) -> None:
         """Pause after images and optionally allow per-shot regeneration."""
+        try:
+            self.signals.log.emit('[REVIEW] Waiting for image review…')
+        except Exception:
+            pass
         payload = {
             "job_id": str(self.job.job_id),
             "output_dir": str(output_dir),
@@ -3479,7 +4632,7 @@ class PipelineWorker(QThread):
             except Exception:
                 continue
 
-            ctype = str((cmd or {}).get("type") or "").strip().lower()
+            ctype = str((cmd or {}).get("type") or '').strip().lower()
             if ctype in ("continue", "resume", "ok"):
                 self._in_review_gate = False
                 return
@@ -3487,8 +4640,8 @@ class PipelineWorker(QThread):
                 self._stop_requested = True
                 raise RuntimeError("Cancelled by user.")
             if ctype in ("regen", "recreate"):
-                sid = str((cmd or {}).get("sid") or "").strip()
-                new_prompt = str((cmd or {}).get("prompt") or "").strip()
+                sid = str((cmd or {}).get("sid") or '').strip()
+                new_prompt = str((cmd or {}).get("prompt") or '').strip()
                 if not sid or not new_prompt:
                     continue
                 try:
@@ -3524,6 +4677,10 @@ class PipelineWorker(QThread):
 
     def _clip_review_gate(self, *, output_dir: str, manifest_path: str, clips_dir: str, shots_path: str, images_dir: str) -> None:
         """Chunk 8B: pause after clips and optionally allow per-shot clip regeneration."""
+        try:
+            self.signals.log.emit('[REVIEW] Waiting for clip review…')
+        except Exception:
+            pass
         # VRAM guard: free any in-process model VRAM before opening the clip reviewer
         _vram_release("before clip review")
         payload = {
@@ -3558,7 +4715,7 @@ class PipelineWorker(QThread):
             except Exception:
                 continue
 
-            ctype = str((cmd or {}).get("type") or "").strip().lower()
+            ctype = str((cmd or {}).get("type") or '').strip().lower()
             if ctype in ("continue", "resume", "ok"):
                 self._in_review_gate = False
                 return
@@ -3572,7 +4729,7 @@ class PipelineWorker(QThread):
                     pass
                 continue
             if ctype in ("clip_regen", "regen_clip", "recreate_clip", "regen_video", "recreate"):
-                sid = str((cmd or {}).get("sid") or "").strip()
+                sid = str((cmd or {}).get("sid") or '').strip()
                 if not sid:
                     continue
                 try:
@@ -3580,7 +4737,7 @@ class PipelineWorker(QThread):
                 except Exception:
                     pass
                 try:
-                    new_prompt = str((cmd or {}).get("prompt") or "").strip()
+                    new_prompt = str((cmd or {}).get("prompt") or '').strip()
 
                     seed_override = None
                     try:
@@ -3622,7 +4779,7 @@ class PipelineWorker(QThread):
 
     def _regen_one_clip(self, *, sid: str, new_prompt: Optional[str] = None, seed_override: Optional[int] = None, manifest_path: str, clips_dir: str, shots_path: str, images_dir: str) -> str:
         """Regenerate a single shot clip in the worker thread, using the currently selected/approved image."""
-        sid = str(sid or "").strip()
+        sid = str(sid or '').strip()
         if not sid:
             raise ValueError("Missing shot id (sid).")
 
@@ -3641,11 +4798,11 @@ class PipelineWorker(QThread):
 
         clip_entry = None
         for it in clips_list:
-            if isinstance(it, dict) and str(it.get("id") or "") == sid:
+            if isinstance(it, dict) and str(it.get("id") or '') == sid:
                 clip_entry = it
                 break
 
-        out_file = str((clip_entry or {}).get("file") or "").strip()
+        out_file = str((clip_entry or {}).get("file") or '').strip()
         if not out_file and clips_dir and os.path.isdir(clips_dir):
             try:
                 cands = sorted([str(p) for p in Path(clips_dir).glob(f"*_{sid}.mp4") if p.is_file()])
@@ -3692,7 +4849,7 @@ class PipelineWorker(QThread):
         if not isinstance(rec, dict):
             rec = {}
 
-        img_path = str(rec.get("file") or "").strip()
+        img_path = str(rec.get("file") or '').strip()
         if not img_path:
             try:
                 imgs = (manifest.get("paths") or {}).get("images") or []
@@ -3700,7 +4857,7 @@ class PipelineWorker(QThread):
                 imgs = []
             if isinstance(imgs, list):
                 for it in imgs:
-                    if isinstance(it, dict) and str(it.get("id") or "") == sid and it.get("file"):
+                    if isinstance(it, dict) and str(it.get("id") or '') == sid and it.get("file"):
                         img_path = str(it.get("file"))
                         break
         if not img_path and images_dir:
@@ -3712,15 +4869,15 @@ class PipelineWorker(QThread):
             raise RuntimeError(f"Missing start image for {sid}: {img_path}")
 
         # Prompt/negative: allow override from review UI; otherwise reuse existing compiled i2v prompt
-        prompt_override = str(new_prompt or "").strip() if new_prompt is not None else ""
-        negative = str(rec.get("i2v_negative") or "").strip()
-        prompt = (prompt_override or str(rec.get("i2v_prompt") or "").strip())
+        prompt_override = str(new_prompt or '').strip() if new_prompt is not None else ""
+        negative = str(rec.get("i2v_negative") or '').strip()
+        prompt = (prompt_override or str(rec.get("i2v_prompt") or '').strip())
         if not prompt:
             prompt = "Slow camera move, subtle parallax, keep subject stable. Match the image exactly."
         if prompt_override:
             # Persist prompt override into the shot record for debugging and future reruns
             try:
-                oldp = str(rec.get("i2v_prompt") or "").strip()
+                oldp = str(rec.get("i2v_prompt") or '').strip()
                 if oldp and oldp != prompt_override and "i2v_prompt_original" not in rec:
                     rec["i2v_prompt_original"] = oldp
                 rec["i2v_prompt"] = prompt_override
@@ -3769,7 +4926,7 @@ class PipelineWorker(QThread):
             try:
                 shots = _load_shots_list(shots_path) if shots_path else []
                 for sh in shots:
-                    if isinstance(sh, dict) and str(sh.get("id") or "") == sid:
+                    if isinstance(sh, dict) and str(sh.get("id") or '') == sid:
                         try:
                             dur = float(sh.get("duration_sec") or 0.0)
                         except Exception:
@@ -3787,7 +4944,7 @@ class PipelineWorker(QThread):
         vae_tiling = bool(prof.get("vae_tiling", True))
 
         # Only HunyuanVideo is wired right now (Chunk 5). Keep behavior identical.
-        if _video_model_key(self.job.encoding.get("video_model") or "") != "hunyuan":
+        if _video_model_key(self.job.encoding.get("video_model") or '') != "hunyuan":
             raise RuntimeError("Clip regeneration is only supported for HunyuanVideo 1.5 in the current build.")
 
         # Run the exact same CLI call as initial clip generation
@@ -3813,7 +4970,7 @@ class PipelineWorker(QThread):
             "generate",
             "--model", str(model_key),
             "--prompt", str(prompt),
-            "--negative", str(negative or ""),
+            "--negative", str(negative or ''),
             "--image", str(img_path),
             "--output", str(out_file),
             "--fps", str(int(fps)),
@@ -3901,7 +5058,7 @@ class PipelineWorker(QThread):
 
     def _regen_one_image(self, *, sid: str, new_prompt: str, seed_override: Optional[int] = None, manifest_path: str, images_dir: str) -> str:
         """Regenerate a single shot image in the worker thread and persist prompt override into manifest."""
-        sid = str(sid or "").strip()
+        sid = str(sid or '').strip()
         if not sid:
             raise ValueError("Missing shot id (sid).")
 
@@ -3915,7 +5072,7 @@ class PipelineWorker(QThread):
             rec = {}
 
         # Resolve target file
-        target = str(rec.get("file") or "").strip()
+        target = str(rec.get("file") or '').strip()
         if not target:
             # Try manifest paths list
             try:
@@ -3924,7 +5081,7 @@ class PipelineWorker(QThread):
                 imgs = []
             if isinstance(imgs, list):
                 for it in imgs:
-                    if isinstance(it, dict) and str(it.get("id") or "") == sid and it.get("file"):
+                    if isinstance(it, dict) and str(it.get("id") or '') == sid and it.get("file"):
                         target = str(it.get("file"))
                         break
         if not target:
@@ -3958,7 +5115,7 @@ class PipelineWorker(QThread):
         # Persist prompt override in manifest BEFORE rendering
         try:
             if "prompt_compiled_original" not in rec:
-                rec["prompt_compiled_original"] = str(rec.get("prompt_compiled") or "").strip()
+                rec["prompt_compiled_original"] = str(rec.get("prompt_compiled") or '').strip()
             rec["prompt_user_override"] = str(new_prompt).strip()
             rec["prompt_compiled"] = str(new_prompt).strip()
             rec["prompt_used"] = str(new_prompt).strip()
@@ -3984,7 +5141,7 @@ class PipelineWorker(QThread):
                     paths = manifest.get("paths") if isinstance(manifest.get("paths"), dict) else {}
                     imgs = paths.get("images") if isinstance(paths.get("images"), list) else []
                     for it in imgs:
-                        if isinstance(it, dict) and str(it.get("id") or "") == sid:
+                        if isinstance(it, dict) and str(it.get("id") or '') == sid:
                             it["seed"] = int(seed_int or 0)
                             it["ts_seed_override"] = time.time()
                             break
@@ -4002,9 +5159,9 @@ class PipelineWorker(QThread):
         if not isinstance(base_job, dict):
             base_job = {}
 
-        negative = str(rec.get("negative_compiled") or rec.get("negative_used") or "").strip()
+        negative = str(rec.get("negative_compiled") or rec.get("negative_used") or '').strip()
         if not negative:
-            negative = _ascii_only(str(self.job.negatives or "").strip())
+            negative = _ascii_only(str(self.job.negatives or '').strip())
 
         seed_val = rec.get("seed_int")
         if seed_val is None:
@@ -4027,7 +5184,7 @@ class PipelineWorker(QThread):
         # Determine if this shot used qwen2511 ref-strategy
         use_qwen2511 = False
         try:
-            if str(rec.get("ref_strategy") or "").strip() == "qwen2511_best":
+            if str(rec.get("ref_strategy") or '').strip() == "qwen2511_best":
                 use_qwen2511 = True
         except Exception:
             use_qwen2511 = False
@@ -4042,7 +5199,7 @@ class PipelineWorker(QThread):
             except Exception:
                 ref_files = []
             try:
-                rs = str(self.job.encoding.get("ref_strategy") or "").strip()
+                rs = str(self.job.encoding.get("ref_strategy") or '').strip()
             except Exception:
                 rs = ""
             if rs == "qwen2511_best" and bool(ref_files):
@@ -4058,7 +5215,7 @@ class PipelineWorker(QThread):
             - Unknown quant names are de-prioritized and used only as a last resort.
             """
             try:
-                gq = str(self.job.encoding.get("gen_quality_preset") or "").lower().strip()
+                gq = str(self.job.encoding.get("gen_quality_preset") or '').lower().strip()
                 mode = "medium"
                 if "high" in gq:
                     mode = "high"
@@ -4123,14 +5280,14 @@ class PipelineWorker(QThread):
 
         image_model_sel = ""
         try:
-            image_model_sel = str(self.job.encoding.get("image_model") or "").strip()
+            image_model_sel = str(self.job.encoding.get("image_model") or '').strip()
         except Exception:
             image_model_sel = ""
 
         # Own Character Bible — codeword-triggered replacement only (no forced global injection)
         try:
             if (not bool(_own_storyline_enabled)) and bool(_own_active):
-                new_prompt = _apply_own_character_codeword_replacements(str(new_prompt or ""), getattr(self.job, "encoding", {}))
+                new_prompt = _apply_own_character_codeword_replacements(str(new_prompt or ''), getattr(self.job, "encoding", {}))
         except Exception:
             pass
 
@@ -4144,7 +5301,7 @@ class PipelineWorker(QThread):
         # Probe logger: capture regen prompt (after any final injection).
         try:
             if t2i_job.get("prompt"):
-                _p1 = str(t2i_job.get("prompt") or "").replace("\n", " ").strip()
+                _p1 = str(t2i_job.get("prompt") or '').replace("\n", " ").strip()
                 _LOGGER.log_probe(f"t2i_prompt_regen {sid}: {_p1}")
         except Exception:
             pass
@@ -4158,8 +5315,8 @@ class PipelineWorker(QThread):
 
 
         aspect_mode = str(self.job.encoding.get("aspect_mode") or "landscape")
-        _eng = str(t2i_job.get("engine") or manifest.get("settings", {}).get("image_engine") or "").lower().strip()
-        _sel = (image_model_sel or "").lower().strip()
+        _eng = str(t2i_job.get("engine") or manifest.get("settings", {}).get("image_engine") or '').lower().strip()
+        _sel = (image_model_sel or '').lower().strip()
         if _sel.startswith("auto"):
             pass
         elif "z-image" in _sel and "low" in _sel:
@@ -4170,6 +5327,8 @@ class PipelineWorker(QThread):
             _eng = "qwen2512"
         elif "sdxl" in _sel:
             _eng = "diffusers"
+        elif ("flux klein" in _sel and "9b" in _sel) or ("flux" in _sel and "klein" in _sel and "9b" in _sel):
+            _eng = "flux_klein_9b"
         elif "flux klein" in _sel or ("flux" in _sel and "klein" in _sel):
             _eng = "flux_klein"
         if not _eng:
@@ -4200,7 +5359,7 @@ class PipelineWorker(QThread):
                 else:
                     raise RuntimeError("Z-image Low VRAM selected but no diffusion .gguf was found in models/Z-Image-Turbo GGUF")
 
-        elif str(_eng).lower().strip() == "flux_klein":
+        elif str(_eng).lower().strip() in ("flux_klein", "flux_klein_9b"):
             # Locked-in for Flux Klein: 4 steps, CFG 1, Euler, 1344x768, diffusion-fa ON
             bw, bh = 1344, 768
             ww, hh = _apply_aspect_to_size(bw, bh, aspect_mode)
@@ -4246,7 +5405,7 @@ class PipelineWorker(QThread):
                 ref_files = []
             refs = list(ref_files[:2])
 
-            aspect_mode = str(self.job.encoding.get("aspect_mode") or "")
+            aspect_mode = str(self.job.encoding.get("aspect_mode") or '')
             _hq = bool(self.job.encoding.get("qwen2511_high_quality") or False)
 
             bw, bh = (1280, 720) if _hq else (1024, 576)
@@ -4286,10 +5445,10 @@ class PipelineWorker(QThread):
                         d = _q2511.default_model_paths() if hasattr(_q2511, "default_model_paths") else {}
                     except Exception:
                         d = {}
-                    unet_path = str(d.get("unet") or "")
-                    llm_path = str(d.get("llm") or "")
-                    mmproj_path = str(d.get("mmproj") or "")
-                    vae_path = str(d.get("vae") or "")
+                    unet_path = str(d.get("unet") or '')
+                    llm_path = str(d.get("llm") or '')
+                    mmproj_path = str(d.get("mmproj") or '')
+                    vae_path = str(d.get("vae") or '')
                     # Qwen Edit 2511 UNet GGUF auto-pick (prefer Q5, then Q4, then any).
                     # Models are expected under: <root>/models/qwen2511gguf/unet/*.gguf
                     try:
@@ -4343,8 +5502,8 @@ class PipelineWorker(QThread):
                         ref_images=refs,
                         use_increase_ref_index=True,
                         disable_auto_resize_ref_images=False,
-                        prompt=str(q_job.get("prompt") or ""),
-                        negative=str(q_job.get("negative_prompt") or q_job.get("negative") or ""),
+                        prompt=str(q_job.get("prompt") or ''),
+                        negative=str(q_job.get("negative_prompt") or q_job.get("negative") or ''),
                         unet_path=unet_path,
                         llm_path=llm_path,
                         mmproj_path=mmproj_path,
@@ -4358,7 +5517,7 @@ class PipelineWorker(QThread):
                         strength=1.0,
                         sampling_method="euler",
                         shift=2.3,
-                        out_file=str(q_job.get("out_file") or ""),
+                        out_file=str(q_job.get("out_file") or ''),
                         use_vae_tiling=False,
                         vae_tile_size="",
                         vae_tile_overlap=0.0,
@@ -4368,7 +5527,7 @@ class PipelineWorker(QThread):
                         use_clip_on_cpu=False,
                         use_diffusion_fa=True,
                         lora_model_dir="",
-                        lora_name=str(q_job.get("lora") or q_job.get("lora_path") or ""),
+                        lora_name=str(q_job.get("lora") or q_job.get("lora_path") or ''),
                         lora_strength=float(q_job.get("lora_strength") or q_job.get("lora_scale") or 1.0),
                     )
 
@@ -4405,20 +5564,21 @@ class PipelineWorker(QThread):
 
         else:
             # Flux Klein regen path (sd-cli). Must NOT fall through to txt2img backend.
-            if str(t2i_job.get("engine") or "").lower().strip() == "flux_klein":
-                _fm = _pick_flux_klein_models_highest()
-                sdcli_path = str(_fm.get("sd_cli") or "")
-                diffusion = str(t2i_job.get("flux_diffusion_model") or _fm.get("diffusion") or "")
-                llm = str(t2i_job.get("flux_llm_model") or _fm.get("llm") or "")
-                vae = str(t2i_job.get("flux_vae") or _fm.get("vae") or "")
+            if str(t2i_job.get("engine") or '').lower().strip() in ("flux_klein", "flux_klein_9b"):
+                _force_kb = 9 if str(t2i_job.get('engine') or '').lower().strip() == 'flux_klein_9b' else 4
+                _fm = _pick_flux_klein_models_highest(force_klein_b=_force_kb)
+                sdcli_path = str(_fm.get("sd_cli") or '')
+                diffusion = str(t2i_job.get("flux_diffusion_model") or _fm.get("diffusion") or '')
+                llm = str(t2i_job.get("flux_llm_model") or _fm.get("llm") or '')
+                vae = str(t2i_job.get("flux_vae") or _fm.get("vae") or '')
                 if (not sdcli_path) or (not os.path.exists(sdcli_path)):
                     raise RuntimeError("Flux Klein selected but sd-cli.exe was not found at presets/bin/sd-cli.exe")
                 if (not diffusion) or (not os.path.exists(diffusion)):
-                    raise RuntimeError("Flux Klein selected but no diffusion GGUF was found in models/klein4b_gguf/")
+                    raise RuntimeError(f"Flux Klein selected but no diffusion GGUF was found in any Klein GGUF folder (searched: {str(_fm.get('searched_dirs') or '')} )")
                 if (not llm) or (not os.path.exists(llm)):
-                    raise RuntimeError("Flux Klein selected but no Qwen3 4B GGUF was found in models/klein4b_gguf/")
+                    raise RuntimeError(f"Flux Klein selected but no Qwen3 GGUF was found in any Klein GGUF folder (searched: {str(_fm.get('searched_dirs') or '')} )")
                 if (not vae) or (not os.path.exists(vae)):
-                    raise RuntimeError("Flux Klein selected but no VAE safetensors was found in models/klein4b_gguf/")
+                    raise RuntimeError(f"Flux Klein selected but no VAE safetensors was found in any Klein GGUF folder (searched: {str(_fm.get('searched_dirs') or '')} )")
 
                 out_path = str(target).strip() or os.path.join(images_dir, f"{sid}.png")
                 if (not out_path) or ("{" in out_path) or ("}" in out_path):
@@ -4436,8 +5596,8 @@ class PipelineWorker(QThread):
                 cmd += ["--diffusion-model", diffusion]
                 cmd += ["--vae", vae]
                 cmd += ["--llm", llm]
-                cmd += ["-p", str(t2i_job.get("prompt") or "").strip()]
-                _neg = str(t2i_job.get("negative_prompt") or t2i_job.get("negative") or "").strip()
+                cmd += ["-p", str(t2i_job.get("prompt") or '').strip()]
+                _neg = str(t2i_job.get("negative_prompt") or t2i_job.get("negative") or '').strip()
                 if _neg:
                     cmd += ["-n", _neg]
                 cmd += ["-W", str(int(t2i_job.get("width") or 1344)), "-H", str(int(t2i_job.get("height") or 768))]
@@ -4505,7 +5665,7 @@ class PipelineWorker(QThread):
                 # For SDXL/Diffusers we WANT deterministic filenames and we DO support filename_template/format.
                 # (Some older backends crash on unknown keys, so we only strip these for non-diffusers engines.)
                 try:
-                    _eng0 = str(_t2i_job.get("engine") or "").lower().strip()
+                    _eng0 = str(_t2i_job.get("engine") or '').lower().strip()
                 except Exception:
                     _eng0 = ""
                 if "diffusers" in _eng0:
@@ -4554,7 +5714,7 @@ class PipelineWorker(QThread):
                     err = ""
                     try:
                         if isinstance(res, dict):
-                            err = str(res.get("error") or res.get("err") or res.get("message") or "")
+                            err = str(res.get("error") or res.get("err") or res.get("message") or '')
                     except Exception:
                         err = ""
                     raise RuntimeError(err or "generator returned no output file")
@@ -4598,7 +5758,7 @@ class PipelineWorker(QThread):
             if isinstance(imgs, list):
                 found = False
                 for it in imgs:
-                    if isinstance(it, dict) and str(it.get("id") or "") == sid:
+                    if isinstance(it, dict) and str(it.get("id") or '') == sid:
                         it["file"] = str(out_file)
                         found = True
                 if not found:
@@ -4637,7 +5797,7 @@ class PipelineWorker(QThread):
         Where prefix is derived from the job folder name.
         """
         try:
-            job_dir_name = os.path.basename(os.path.normpath(str(output_dir or ""))) or "job"
+            job_dir_name = os.path.basename(os.path.normpath(str(output_dir or ''))) or "job"
             # prefix: first 15 chars, sanitize for Windows filenames
             prefix = job_dir_name.strip()[:15] or "job"
             prefix = re.sub(r"[\\/:*?\"<>|]", "_", prefix)
@@ -4745,7 +5905,7 @@ class PipelineWorker(QThread):
                     _own_storyline_prompts = []
                 if not _own_storyline_prompts:
                     try:
-                        _txt = str((self.job.encoding or {}).get("own_storyline_text") or "")
+                        _txt = str((self.job.encoding or {}).get("own_storyline_text") or '')
                     except Exception:
                         _txt = ""
                     try:
@@ -4951,16 +6111,16 @@ class PipelineWorker(QThread):
                 except Exception:
                     pass
 
-            elif bool(getattr(self.job, "music_background", False)) and str(getattr(self.job, "music_mode", "") or "") in ("ace", "ace15"):
+            elif bool(getattr(self.job, "music_background", False)) and str(getattr(self.job, "music_mode", "") or '') in ("ace", "ace15"):
                 # Ace-Step background music (legacy "ace" or new "ace15"): reserve slot; generation runs after assembly (duration locked).
-                mm = str(getattr(self.job, "music_mode", "") or "")
+                mm = str(getattr(self.job, "music_mode", "") or '')
                 manifest.setdefault("project", {}).setdefault("audio", {})
                 manifest["project"]["audio"].update({
                     "source": ("ace_step_15" if mm == "ace15" else "ace_step"),
                     "status": "pending_generation",
                     # Keep legacy field for old jobs; new jobs store ace15_preset_id too.
                     "preset": str(getattr(self.job, "music_preset", "") or "Cinematic"),
-                    "ace15_preset_id": str(getattr(self.job, "ace15_preset_id", "") or ""),
+                    "ace15_preset_id": str(getattr(self.job, "ace15_preset_id", "") or ''),
                     "ace15_lyrics_enabled": bool(getattr(self.job, "ace15_lyrics_enabled", False)),
                 })
                 notes_path = os.path.join(audio_dir, "music_pending.txt")
@@ -4976,7 +6136,7 @@ class PipelineWorker(QThread):
                 except Exception:
                     pass
 
-            elif str(getattr(self.job, "music_mode", "") or "") == "heartmula":
+            elif str(getattr(self.job, "music_mode", "") or '') == "heartmula":
                 # HeartMula music with lyrics (Chunk 7B): reserve slot; generation runs after assembly (duration locked).
                 manifest.setdefault("project", {}).setdefault("audio", {})
                 manifest["project"]["audio"].update({
@@ -5031,12 +6191,12 @@ class PipelineWorker(QThread):
                 at = {}
 
             try:
-                ref_strategy = str(self.job.encoding.get("ref_strategy") or "").strip()
+                ref_strategy = str(self.job.encoding.get("ref_strategy") or '').strip()
             except Exception:
                 ref_strategy = ""
 
             try:
-                ref_lora = str(self.job.encoding.get("ref_multi_angle_lora") or "").strip()
+                ref_lora = str(self.job.encoding.get("ref_multi_angle_lora") or '').strip()
             except Exception:
                 ref_lora = ""
 
@@ -5139,7 +6299,7 @@ class PipelineWorker(QThread):
             def _count_words(_s: str) -> int:
                 try:
                     import re as _re
-                    return len(_re.findall(r"[A-Za-z0-9']+", _s or ""))
+                    return len(_re.findall(r"[A-Za-z0-9']+", _s or ''))
                 except Exception:
                     return 0
 
@@ -5270,7 +6430,7 @@ class PipelineWorker(QThread):
                             except Exception:
                                 pass
                             raise RuntimeError("Cancelled by user.")
-                        line = (line or "").strip()
+                        line = (line or '').strip()
                         if not line:
                             continue
                         # runner uses JSON-lines protocol
@@ -5300,8 +6460,8 @@ class PipelineWorker(QThread):
                 if not last_result:
                     raise RuntimeError("Whisper runner returned no result.")
 
-                seg_json_tmp = str(last_result.get("segments_json") or "")
-                txt_tmp = str(last_result.get("text_path") or "")
+                seg_json_tmp = str(last_result.get("segments_json") or '')
+                txt_tmp = str(last_result.get("text_path") or '')
                 info = last_result.get("info") or {}
 
                 if not seg_json_tmp or not os.path.isfile(seg_json_tmp):
@@ -5327,7 +6487,7 @@ class PipelineWorker(QThread):
                 except Exception:
                     _safe_write_text(transcript_path, _safe_read_text(txt_tmp))
 
-                transcript_text = (_safe_read_text(transcript_path) or "").strip()
+                transcript_text = (_safe_read_text(transcript_path) or '').strip()
                 wc = _count_words(transcript_text)
                 lyrics_mode = "lyrics" if wc >= 25 else "instrumental"
 
@@ -5386,7 +6546,7 @@ class PipelineWorker(QThread):
             _transcript_sha1 = ""
             try:
                 if _file_ok(_transcript_txt, 2):
-                    _transcript_text_full = (_safe_read_text(_transcript_txt) or "").strip()
+                    _transcript_text_full = (_safe_read_text(_transcript_txt) or '').strip()
                     _transcript_wc = _count_words(_transcript_text_full)
                     _lyrics_mode = "lyrics" if _transcript_wc >= 25 else "instrumental"
                     _transcript_sha1 = _sha1_text(_transcript_text_full) if _transcript_text_full else ""
@@ -5403,7 +6563,7 @@ class PipelineWorker(QThread):
             _ref_strategy = ""
             _copied_refs: List[str] = []
             try:
-                _ref_strategy = str(self.job.encoding.get("ref_strategy") or "").strip()
+                _ref_strategy = str(self.job.encoding.get("ref_strategy") or '').strip()
             except Exception:
                 _ref_strategy = ""
             try:
@@ -5545,7 +6705,7 @@ class PipelineWorker(QThread):
                         _file_ok(refs_guidance_path, 50)
                         and _file_ok(refs_describe_path, 50)
                         and _refs_prev.get("status") == "done"
-                        and (_refs_prev.get("fingerprint") or "") == (_ref_fp or "")
+                        and (_refs_prev.get("fingerprint") or '') == (_ref_fp or '')
                     )
                     if up_to_date:
                         _skip("Refs (Qwen3-VL Describe)", "refs_guidance.txt up-to-date (fingerprint match)")
@@ -5566,7 +6726,7 @@ class PipelineWorker(QThread):
             _refs_guidance_excerpt = ""
             try:
                 if _file_ok(refs_guidance_path, 10):
-                    _refs_guidance_excerpt = (_safe_read_text(refs_guidance_path) or "").strip()
+                    _refs_guidance_excerpt = (_safe_read_text(refs_guidance_path) or '').strip()
                     if len(_refs_guidance_excerpt) > 5000:
                         _refs_guidance_excerpt = _refs_guidance_excerpt[:5000] + "..."
             except Exception:
@@ -5622,9 +6782,9 @@ class PipelineWorker(QThread):
             except Exception:
                 _own_enabled = False
             try:
-                p1 = str(self.job.encoding.get("own_character_1_prompt") or "").strip()
-                p2 = str(self.job.encoding.get("own_character_2_prompt") or "").strip()
-                _own_prompts = [p for p in (p1, p2) if (p or "").strip()]
+                p1 = str(self.job.encoding.get("own_character_1_prompt") or '').strip()
+                p2 = str(self.job.encoding.get("own_character_2_prompt") or '').strip()
+                _own_prompts = [p for p in (p1, p2) if (p or '').strip()]
             except Exception:
                 _own_prompts = []
             _own_active = bool(_own_enabled and _own_prompts)
@@ -5633,7 +6793,7 @@ class PipelineWorker(QThread):
                 try:
                     ps = []
                     for p in prompts:
-                        tt = _strip_nonvisual_markers(str(p or "").strip())
+                        tt = _strip_nonvisual_markers(str(p or '').strip())
                         tt = re.sub(r"[\r\n\t]+", " ", tt)
                         tt = re.sub(r"[ ]{2,}", " ", tt).strip()
                         if tt:
@@ -5662,6 +6822,7 @@ class PipelineWorker(QThread):
                         "beats": [],
                         "source": "own_storyline",
                     }
+                    plan = _normalize_story_arc(plan, float(getattr(self.job, "approx_duration_sec", 0) or 0.0), 0)
                     _safe_write_json(plan_path, plan)
                     manifest["paths"]["plan_json"] = plan_path
                     manifest["paths"]["plan_raw_txt"] = plan_raw_path
@@ -5684,6 +6845,15 @@ class PipelineWorker(QThread):
                                 ("music" if self.job.music_background else "none"))))
 
                 default_taxonomy = _infer_default_subject_taxonomy(self.job.prompt, self.job.extra_info)
+                try:
+                    _plan_avg_sec = float((gen_profile.get("min_sec", 2.5) + gen_profile.get("max_sec", 5.0)) / 2.0)
+                except Exception:
+                    _plan_avg_sec = 3.5
+                try:
+                    _plan_shot_hint = max(3, int(round(float(getattr(self.job, "approx_duration_sec", 0) or 0.0) / max(1.0, float(_plan_avg_sec)))))
+                except Exception:
+                    _plan_shot_hint = 6
+                _plan_section_hint = ", ".join([str(x).title() for x in _story_arc_template_keys(float(getattr(self.job, "approx_duration_sec", 0) or 0.0), int(_plan_shot_hint))])
 
                 # Force JSON-only plan from Qwen with strict visual/stage separation
                 sys_p = (
@@ -5699,6 +6869,10 @@ class PipelineWorker(QThread):
                     "6. visual_description must NEVER contain technical cinematography terms\n"
                     "7. If you use character names, keep identity consistent in every beat/shot (name + taxonomy/species) and do not change species.\n"
                     "8. If OWN_CHARACTERS is provided, use ONLY those characters as recurring characters and ensure every beat/shot includes them (do not invent new protagonists)\n"
+                    "9. Every plan MUST include a simple story engine with: who_wants_what, what_blocks_them, what_happens_if_they_fail\n"
+                    "10. For videos longer than 30 seconds, use 4-6 arc_sections chosen from Setup, Discovery, Escalation, Setback, Climax, Ending\n"
+                    "11. Every arc section must say what changes: reveal new info, increase danger, change location, shift emotion, or force a decision\n"
+                    "12. beats should describe progression, not random variety\n"
                     "\n"
                     "Example BAD visual_description (will break generation):\n"
                     "'Camera: static, Lighting: cool. Cut to the scene.'\n"
@@ -5708,7 +6882,11 @@ class PipelineWorker(QThread):
                     "Create a concise but useful story plan and constraints for this video project.\n"
                     "Requirements:\n"
                     "- Output MUST be JSON only.\n"
-                    "- Include: title, logline, setting, characters (list), tone, continuity_rules (list), beats (list).\n"
+                    "- Include: title, logline, setting, characters (list), tone, continuity_rules (list), story_engine (object), arc_sections (list), beats (list).\n"
+                    "- story_engine keys: who_wants_what, what_blocks_them, what_happens_if_they_fail.\n"
+                    "- arc_sections item keys: key, label, job, change, emotion_shift.\n"
+                    "- If TARGET_DURATION_SEC > 30, produce 4-6 arc_sections. Otherwise produce 3-4 arc_sections.\n"
+                    "- beats should summarize progression across the arc, not just visual variety.\n"
                     "- Keep it short and actionable for prompt generation.\n\n"
                     f"PROMPT: {self.job.prompt}\n"
                     + (f"DEFAULT_SUBJECT_TAXONOMY: {default_taxonomy}\n")
@@ -5716,8 +6894,10 @@ class PipelineWorker(QThread):
                     + (f"OWN_CHARACTER_BIBLE_ENABLED: true\nOWN_CHARACTERS:\n{_own_prose}\n" if bool(_own_active) else "")
                     + (f"REFERENCE_GUIDANCE:\n{_refs_guidance_excerpt}\n" if (_refs_guidance_excerpt or '').strip() else "")
                     + (f"LYRICS_MODE: {_lyrics_mode}\n" if self.job.music_background else "")
-                    + (f"LYRICS_TRANSCRIPT:\n{_transcript_excerpt}\n" if (_lyrics_mode == "lyrics" and (_transcript_excerpt or "").strip()) else "")
+                    + (f"LYRICS_TRANSCRIPT:\n{_transcript_excerpt}\n" if (_lyrics_mode == "lyrics" and (_transcript_excerpt or '').strip()) else "")
                     + f"TARGET_DURATION_SEC: {self.job.approx_duration_sec}\n"
+                    + f"SHOT_COUNT_HINT: {_plan_shot_hint}\n"
+                    + f"SECTION_LABEL_HINTS: {_plan_section_hint}\n"
                     + f"AUDIO_MODE: {audio_mode}\n"
                     + f"VIDEO_MODEL: {self.job.encoding.get('video_model')}\n"
                     + f"GEN_QUALITY: {self.job.encoding.get('gen_quality_preset')}\n"
@@ -5755,6 +6935,7 @@ class PipelineWorker(QThread):
                             {"index": 3, "purpose": "payoff", "moment": "Deliver a satisfying highlight moment."},
                         ],
                     }
+                    plan = _normalize_story_arc(plan, float(getattr(self.job, "approx_duration_sec", 0) or 0.0), 0)
                     _safe_write_json(plan_path, plan)
                     manifest["paths"]["plan_json"] = plan_path
                     # Record debug paths + fingerprint and mark as failed
@@ -5804,6 +6985,7 @@ class PipelineWorker(QThread):
                     "videoclip_preset": self.job.encoding.get("videoclip_preset"),
                 }
                 parsed["planner_plan_fingerprint"] = plan_fingerprint
+                parsed = _normalize_story_arc(parsed, float(getattr(self.job, "approx_duration_sec", 0) or 0.0), 0)
 
                 _safe_write_json(plan_path, parsed)
                 manifest["paths"]["plan_json"] = plan_path
@@ -6022,10 +7204,10 @@ class PipelineWorker(QThread):
 
                         # Seeds must be single-line for stability, but do NOT rewrite the user's prompt text.
                         try:
-                            _seed_txt = str(prompt_txt or "").replace("\r", " ").replace("\n", " ")
+                            _seed_txt = str(prompt_txt or '').replace("\r", " ").replace("\n", " ")
                             _seed_txt = " ".join(_seed_txt.split()).strip()
                         except Exception:
-                            _seed_txt = str(prompt_txt or "").strip()
+                            _seed_txt = str(prompt_txt or '').strip()
 
                         out_shots.append({
                             "id": sid,
@@ -6051,6 +7233,12 @@ class PipelineWorker(QThread):
                     except Exception:
                         pass
 
+                    plan_obj = _apply_story_arc_to_shots(out_shots, plan_obj, float(target_total))
+                    try:
+                        if isinstance(plan_obj, dict) and os.path.exists(plan_path):
+                            _safe_write_json(plan_path, plan_obj)
+                    except Exception:
+                        pass
                     _safe_write_json(shots_path, out_shots)
                     # Ensure inspector always has the verbatim prompt text, even if image generation is skipped
                     # (e.g., cached outputs). Own Storymode must remain 100% user-provided text.
@@ -6059,8 +7247,8 @@ class PipelineWorker(QThread):
                         if isinstance(_shot_map0, dict):
                             for _sh0 in out_shots:
                                 try:
-                                    _sid0 = str((_sh0 or {}).get("id") or "").strip()
-                                    _p0 = str((_sh0 or {}).get("visual_description") or "").replace("\r\n", "\n").replace("\r", "\n").strip()
+                                    _sid0 = str((_sh0 or {}).get("id") or '').strip()
+                                    _p0 = str((_sh0 or {}).get("visual_description") or '').replace("\r\n", "\n").replace("\r", "\n").strip()
                                 except Exception:
                                     _sid0, _p0 = "", ""
                                 if not _sid0:
@@ -6127,35 +7315,49 @@ class PipelineWorker(QThread):
                 except Exception:
                     n_shots = max(1, min(80, int(target_total / max(1.5, avg_sec))))
 
+                plan_obj = _normalize_story_arc(plan_obj, float(target_total), int(n_shots))
+                try:
+                    if isinstance(plan_obj, dict) and os.path.exists(plan_path):
+                        _safe_write_json(plan_path, plan_obj)
+                except Exception:
+                    pass
+
                 sys_p = (
                     "You are a shot-list generator for an offline video pipeline. "
                     "Return ONLY valid JSON. No markdown, no commentary, no code fences. "
                     "The JSON must be a single object with key 'shots' as an array. "
-                    "Each shot MUST include fields: id, stage_directions, visual_description, subjects. "
-                    "CRITICAL: visual_description must be 2-3 sentences of pure visual content with NO technical cinematography terms. It MUST include surroundings: clearly state the setting/location and add 3-7 concrete environmental details (foreground/midground/background cues, materials or objects, time of day, and atmosphere). It MUST NOT contain: Camera:, Shot:, Lighting:, Cut to, Fade. The overall sequence should tell a coherent mini-adventure with a clear goal, obstacles, escalation, a twist, and a payoff near the end. Default to humans unless the plan/prompt explicitly indicates animals or creatures; do not introduce animal protagonists unless requested." + " If OWN_CHARACTERS is provided, every shot MUST include those characters in subjects and visual_description, and you must not introduce new named protagonists."
+                    "Each shot MUST include fields: id, stage_directions, visual_description, subjects, story_section, shot_purpose, story_progression. "
+                    "story_progression must be an object with keys: different_now, harder_now, revealed_now, prepares_payoff. "
+                    "CRITICAL: visual_description must be 2-3 sentences of pure visual content with NO technical cinematography terms. It MUST include surroundings: clearly state the setting/location and add 3-7 concrete environmental details (foreground/midground/background cues, materials or objects, time of day, and atmosphere). It MUST NOT contain: Camera:, Shot:, Lighting:, Cut to, Fade. The sequence must follow the plan's story_engine and arc_sections, so the middle never becomes filler. Every section must change something real: reveal new info, increase danger, change location, shift emotion, or force a decision. Every shot must have a clear job such as introduce, build tension, show obstacle, reveal clue, transition, or payoff. Default to humans unless the plan/prompt explicitly indicates animals or creatures; do not introduce animal protagonists unless requested." + " If OWN_CHARACTERS is provided, every shot MUST include those characters in subjects and visual_description, and you must not introduce new named protagonists."
                 )
                 user_p = (
                     "Generate a concise seeded shot list for the plan below.\n"
                     "Rules:\n"
                     "- Output MUST be JSON only.\n"
-                    "- Provide exactly 'shots' array with {id, stage_directions, visual_description, subjects}.\n"
+                    "- Provide exactly 'shots' array with {id, stage_directions, visual_description, subjects, story_section, shot_purpose, story_progression}.\n"
                     "- stage_directions: {camera, lighting, mood, purpose}\n"
+                    "- story_progression: {different_now, harder_now, revealed_now, prepares_payoff}\n"
                     "- visual_description: 2-3 sentences of pure visual content, NO technical terms\n- visual_description MUST include setting + surroundings (location plus 3-7 concrete environmental details; include foreground/midground/background cues, time of day, weather/atmosphere, and a distinctive prop/landmark when relevant).\n"
                     "- Use ids like S01, S02, ... up to the requested count.\n"
                     "- Keep each shot to ONE clear action and ONE main subject (the subject can be one or two characters if needed).\n"
-                    "- Keep continuity across shots.\n- Across the full shot list, create a clear adventure arc: early shots establish the mission/goal, mid shots introduce obstacles and escalation, late shots deliver a twist and a climax, and the final shots resolve with a satisfying payoff.\n\n"
+                    "- Keep continuity across shots.\n"
+                    "- Follow PLAN_JSON.story_engine and PLAN_JSON.arc_sections.\n"
+                    "- story_section must use the relevant arc section label for that shot.\n"
+                    "- stage_directions.purpose and shot_purpose must describe why the shot exists: introduce, build tension, show obstacle, reveal clue, transition, payoff, or force a decision.\n"
+                    "- Make the middle progress: each section must reveal something, raise pressure, move somewhere new, shift emotion, or force a choice.\n"
+                    "- Across the full shot list, progression must be visible: what changed, what got harder, what was revealed, and what payoff is being prepared next.\n\n"
                     f"REQUESTED_SHOTS: {n_shots}\n"
                     f"DEFAULT_SUBJECT_TAXONOMY: {default_taxonomy}\n"
                     f"TARGET_TOTAL_DURATION_SEC: {target_total:.1f}\n"
+                    f"SECTION_LABEL_HINTS: {', '.join([str(x.get('label') or x.get('key') or '') for x in (plan_obj.get('arc_sections') or []) if isinstance(x, dict)])}\n"
                     f"GEN_PROFILE: {json.dumps(gen_profile, ensure_ascii=False)}\n"
                     + (f"LYRICS_MODE: {_lyrics_mode}\n" if self.job.music_background else "")
-                    + (f"LYRICS_TRANSCRIPT:\n{_transcript_excerpt}\n" if (_lyrics_mode == "lyrics" and (_transcript_excerpt or "").strip()) else "")
+                    + (f"LYRICS_TRANSCRIPT:\n{_transcript_excerpt}\n" if (_lyrics_mode == "lyrics" and (_transcript_excerpt or '').strip()) else "")
                     + (f"REFERENCE_GUIDANCE:\n{_refs_guidance_excerpt}\n" if (_refs_guidance_excerpt or '').strip() else "")
                     + (f"OWN_CHARACTER_BIBLE_ENABLED: true\nOWN_CHARACTERS:\n{_own_prose}\n\nRULES_FOR_OWN_CHARACTERS:\n- Use ONLY these characters as recurring characters.\n- Every shot MUST include them in subjects and visual_description.\n- Do not introduce new named protagonists.\n\n" if bool(_own_active) else "")
                     + "PLAN_JSON:\n"
                     + json.dumps(plan_obj, ensure_ascii=False)
                 )
-
                 parsed, raw = _qwen_json_call(
                     step_name="Shots (Qwen3-VL JSON)",
                     system_prompt=sys_p,
@@ -6179,36 +7381,69 @@ class PipelineWorker(QThread):
                         # try treat dict itself as shot map (unlikely)
                         pass
 
+                shots_generation_note = "Generated with Qwen (JSON enforced)."
+                shots_used_fallback = False
+
                 if not shots_list:
-                    # Fallback placeholder list
-                    shots_list = []
-                    for i in range(1, n_shots + 1):
-                        sid = f"S{i:02d}"
-                        shots_list.append({
-                            "id": sid,
-                            "stage_directions": {"camera": "medium shot", "lighting": "cinematic lighting", "mood": "neutral", "purpose": "continuity"},
-                            "visual_description": f"{self.job.prompt} — moment {i} of {n_shots}.",
-                            "subjects": [],
-                            "seed": f"{self.job.prompt} — moment {i} of {n_shots}",
-                            "camera": "medium shot",
-                            "mood": "neutral",
-                            "lighting": "cinematic lighting",
-                            "notes": "One clear action, one subject. Keep continuity with prior shots.",
-                        })
-                    # mark failed but continue
+                    # Retry once with a much simpler line-based format before falling back locally.
+                    try:
+                        retry_log = os.path.join(story_dir, "shots_retry_lines.txt")
+                        retry_sys = (
+                            "You write unique visual shot descriptions for an offline planner. "
+                            "Return exactly N lines. One shot per line. No numbering, no commentary. "
+                            "Each line must describe a different visual beat with a different place, action, or emotional turn."
+                        )
+                        retry_user = (
+                            f"Write exactly {n_shots} lines for the shot list below.\n"
+                            "Rules:\n"
+                            "- One shot per line, no numbering.\n"
+                            "- Keep continuity, but make each line visually different from the others.\n"
+                            "- The middle must progress instead of repeating the setup.\n"
+                            "- Use the plan's arc sections and section changes.\n"
+                            "- No camera labels, no shot labels, no technical prefixes.\n\n"
+                            "PLAN_JSON:\n" + json.dumps(plan_obj, ensure_ascii=False)
+                        )
+                        retry_raw = _qwen_text_call(
+                            step_name="Shots retry (Qwen3-VL lines)",
+                            system_prompt=retry_sys,
+                            user_prompt=retry_user,
+                            log_path=retry_log,
+                            temperature=0.25,
+                            max_new_tokens=int(max(700, n_shots * 80)),
+                        )
+                        shots_list = _parse_story_shot_lines(retry_raw, int(n_shots), plan_obj, float(target_total))
+                        if shots_list:
+                            shots_generation_note = "Recovered shot list from line-based Qwen retry."
+                            manifest["paths"]["shots_retry_lines_txt"] = retry_log
+                    except Exception:
+                        pass
+
+                if shots_list and _story_shots_look_flat(shots_list):
+                    shots_list = _build_local_story_fallback_shots(plan_obj, self.job.prompt, self.job.extra_info, int(n_shots), float(target_total))
+                    shots_generation_note = "Rebuilt a section-aware fallback shot list because the generated shots were too repetitive."
+                    shots_used_fallback = True
+                    try:
+                        _log("[WARN] Generated shot list looked repetitive; rebuilt local section-aware fallback shots.")
+                    except Exception:
+                        pass
+
+                if not shots_list:
+                    shots_list = _build_local_story_fallback_shots(plan_obj, self.job.prompt, self.job.extra_info, int(n_shots), float(target_total))
+                    shots_generation_note = "Qwen shot generation failed; wrote a local section-aware fallback shot list instead of flat moment placeholders."
+                    shots_used_fallback = True
                     manifest["paths"]["shots_raw_txt"] = shots_raw_path
                     manifest["paths"]["qwen_shots_error_txt"] = qwen_shots_err
 
                     srec = manifest["steps"].get("Shots (seeded shot list)") or {}
                     srec.update({
-                        "status": "failed",
+                        "status": "done",
                         "fingerprint": shots_fingerprint,
                         "debug": {
                             "raw": shots_raw_path,
                             "prompts_used": qwen_prompts_used,
                             "error": qwen_shots_err,
                         },
-                        "note": "Qwen JSON failed; wrote placeholder shots.json",
+                        "note": shots_generation_note,
                         "ts": time.time(),
                     })
                     manifest["steps"]["Shots (seeded shot list)"] = srec
@@ -6249,6 +7484,11 @@ class PipelineWorker(QThread):
                         "stage_directions": stage,
                         "visual_description": str(visual_clean),
                         "subjects": subjects,
+                        "story_section": str(sh.get("story_section") or sh.get("section") or "").strip(),
+                        "section_change": str(sh.get("section_change") or sh.get("change") or "").strip(),
+                        "shot_purpose": str(sh.get("shot_purpose") or sh.get("purpose") or "").strip(),
+                        "story_progression": sh.get("story_progression") if isinstance(sh.get("story_progression"), dict) else {},
+                        "story_role": str(sh.get("story_role") or "").strip(),
                         # placeholders for downstream compilers
                         "duration_sec": dur,
                         "gen_fps": int(gen_profile.get("fps", 20)),
@@ -6323,6 +7563,12 @@ class PipelineWorker(QThread):
                     _enforce_shot_language(out_shots)
                 except Exception:
                     pass
+                plan_obj = _apply_story_arc_to_shots(out_shots, plan_obj, float(target_total))
+                try:
+                    if isinstance(plan_obj, dict) and os.path.exists(plan_path):
+                        _safe_write_json(plan_path, plan_obj)
+                except Exception:
+                    pass
                 _safe_write_json(shots_path, out_shots)
                 manifest["paths"]["shots_json"] = shots_path
                 manifest["paths"]["shots_raw_txt"] = shots_raw_path
@@ -6341,7 +7587,7 @@ class PipelineWorker(QThread):
                             "prompts_used": qwen_prompts_used,
                             "error": qwen_shots_err,
                         },
-                        "note": "Generated with Qwen (JSON enforced).",
+                        "note": shots_generation_note,
                         "ts": time.time(),
                     })
                     manifest["steps"]["Shots (seeded shot list)"] = srec
@@ -6373,7 +7619,7 @@ class PipelineWorker(QThread):
             except Exception:
                 _ref_files = []
             try:
-                _ref_strategy = str(self.job.encoding.get("ref_strategy") or "").strip()
+                _ref_strategy = str(self.job.encoding.get("ref_strategy") or '').strip()
             except Exception:
                 _ref_strategy = ""
             _planner_use_qwen2511_refs = bool(_ref_strategy == "qwen2511_best" and bool(_ref_files))
@@ -6574,10 +7820,10 @@ class PipelineWorker(QThread):
                         bible_list: List[Dict[str, Any]] = []
                         _own_entries = _planner_get_own_character_entries(self.job.encoding if isinstance(getattr(self.job, "encoding", None), dict) else {})
                         for i, rec0 in enumerate(list(_own_entries or [])[:2]):
-                            pp = str((rec0 or {}).get("prompt") or "").strip()
+                            pp = str((rec0 or {}).get("prompt") or '').strip()
                             if not pp:
                                 continue
-                            _cw = str((rec0 or {}).get("codeword") or "").strip()
+                            _cw = str((rec0 or {}).get("codeword") or '').strip()
                             bible_list.append({
                                 "name": (_cw if _cw else f"Character {i+1}"),
                                 "role": "",
@@ -6611,8 +7857,8 @@ class PipelineWorker(QThread):
                 # Explain why Character Bible is skipped (auto bible off vs empty own bible)
                 try:
                     _own_enabled = bool(self.job.encoding.get("own_character_bible_enabled", False))
-                    _own_p1 = str(self.job.encoding.get("own_character_1_prompt", "") or "").strip()
-                    _own_p2 = str(self.job.encoding.get("own_character_2_prompt", "") or "").strip()
+                    _own_p1 = str(self.job.encoding.get("own_character_1_prompt", "") or '').strip()
+                    _own_p2 = str(self.job.encoding.get("own_character_2_prompt", "") or '').strip()
                     _own_has_any = bool(_own_p1 or _own_p2)
                 except Exception:
                     _own_enabled = False
@@ -6681,10 +7927,10 @@ class PipelineWorker(QThread):
                             # One-line seed for stability, but keep visual_description verbatim.
                             seed_txt = ""
                             try:
-                                seed_txt = str(txt or "").replace("\r", " ").replace("\n", " ")
+                                seed_txt = str(txt or '').replace("\r", " ").replace("\n", " ")
                                 seed_txt = " ".join(seed_txt.split()).strip()
                             except Exception:
-                                seed_txt = str(txt or "").strip()
+                                seed_txt = str(txt or '').strip()
                             if not txt:
                                 continue
                             shots.append({
@@ -6698,7 +7944,7 @@ class PipelineWorker(QThread):
                                 "source": "own_storyline",
                             })
 
-                    base_negative = _ascii_only(str(self.job.negatives or ""))
+                    base_negative = _ascii_only(str(self.job.negatives or ''))
                     base_negative = _adjust_text_negatives_csv(base_negative, bool(wants_text))
                     base_negative = _sanitize_negative_list(base_negative)
 
@@ -6709,14 +7955,14 @@ class PipelineWorker(QThread):
                     # - Own Character Bible (manual 1–2)
                     prefix_parts: List[str] = []
                     try:
-                        _pfx_prompt = str(self.job.prompt or "").strip()
+                        _pfx_prompt = str(self.job.prompt or '').strip()
                     except Exception:
                         _pfx_prompt = ""
                     # Avoid polluting prompts with the internal placeholder used when the prompt box is empty.
                     if _pfx_prompt and _pfx_prompt.strip().lower() not in ("own storyline", "own storymode"):
                         prefix_parts.append(_pfx_prompt)
                     try:
-                        _pfx_extra = str(self.job.extra_info or "").strip()
+                        _pfx_extra = str(self.job.extra_info or '').strip()
                     except Exception:
                         _pfx_extra = ""
                     if _pfx_extra:
@@ -6740,7 +7986,7 @@ class PipelineWorker(QThread):
                                     n0 = int(m0.group(1))
                                 except Exception:
                                     n0 = 0
-                                body0 = _clean_own_story_prompt(m0.group(2) or "")
+                                body0 = _clean_own_story_prompt(m0.group(2) or '')
                                 if not body0:
                                     continue
                                 raw_prompt_map[f"S{n0:02d}"] = body0
@@ -6751,7 +7997,7 @@ class PipelineWorker(QThread):
                         sid = str(sh.get("id") or f"S{i:02d}")
                         # VERBATIM user prompt text (no rewriting, no helper tags).
                         # VERBATIM user prompt text (no rewriting, no helper tags).
-                        pr = _clean_own_story_prompt(_own_storyline_extract_text(sh.get("visual_description") or ""))
+                        pr = _clean_own_story_prompt(_own_storyline_extract_text(sh.get("visual_description") or ''))
                         if not pr:
                             # fallback 1: prompt persisted earlier in manifest (from step_shots)
                             try:
@@ -6759,13 +8005,13 @@ class PipelineWorker(QThread):
                             except Exception:
                                 _rec_prev = {}
                             try:
-                                pr = _clean_own_story_prompt(_own_storyline_extract_text(_rec_prev.get("prompt_used") or _rec_prev.get("prompt_spec") or _rec_prev.get("prompt_compiled") or ""))
+                                pr = _clean_own_story_prompt(_own_storyline_extract_text(_rec_prev.get("prompt_used") or _rec_prev.get("prompt_spec") or _rec_prev.get("prompt_compiled") or ''))
                             except Exception:
                                 pr = ""
                         if not pr:
                             # fallback 2: shots_raw map
                             try:
-                                pr = _clean_own_story_prompt(raw_prompt_map.get(sid) or "")
+                                pr = _clean_own_story_prompt(raw_prompt_map.get(sid) or '')
                             except Exception:
                                 pr = ""
                         if not pr:
@@ -6835,7 +8081,7 @@ class PipelineWorker(QThread):
 
                     def _one_line(s: str) -> str:
                         try:
-                            s = str(s or "")
+                            s = str(s or '')
                         except Exception:
                             s = ""
                         s = s.replace("\r", " ").replace("\n", " ")
@@ -6851,12 +8097,12 @@ class PipelineWorker(QThread):
                     except Exception:
                         own_on = False
                     try:
-                        char1 = _one_line(str((self.job.encoding or {}).get("own_character_1_prompt") or ""))
-                        char2 = _one_line(str((self.job.encoding or {}).get("own_character_2_prompt") or ""))
+                        char1 = _one_line(str((self.job.encoding or {}).get("own_character_1_prompt") or ''))
+                        char2 = _one_line(str((self.job.encoding or {}).get("own_character_2_prompt") or ''))
                     except Exception:
                         char1, char2 = "", ""
 
-                    user_subject = _one_line(str(self.job.prompt or ""))
+                    user_subject = _one_line(str(self.job.prompt or ''))
 
                     # If Own Character Bible is active, use Character 1/2 as the verbatim prefix (only once).
                     if bool(own_on) and bool(char1):
@@ -6914,7 +8160,7 @@ class PipelineWorker(QThread):
 
                     def _parse_prompt_lines(blob: str, n: int, prefix_text: str) -> List[str]:
                         def _clean_line(s: str) -> str:
-                            s = str(s or "")
+                            s = str(s or '')
                             s = s.replace("\r", " ").replace("\n", " ")
                             s = " ".join(s.split()).strip()
                             # Strip common numbering/bullets
@@ -6983,7 +8229,7 @@ class PipelineWorker(QThread):
                         except Exception:
                             pass
 
-                    base_negative = _ascii_only(str(self.job.negatives or ""))
+                    base_negative = _ascii_only(str(self.job.negatives or ''))
                     base_negative = _adjust_text_negatives_csv(base_negative, bool(wants_text))
                     base_negative = _sanitize_negative_list(base_negative)
 
@@ -6992,12 +8238,12 @@ class PipelineWorker(QThread):
 
                     for i, sh in enumerate(shots, start=1):
                         sid = str(sh.get("id") or f"S{i:02d}")
-                        seed0 = (str(sh.get("visual_description") or "").strip() or str(sh.get("seed") or "").strip())
+                        seed0 = (str(sh.get("visual_description") or '').strip() or str(sh.get("seed") or '').strip())
                         pr = prompts[i - 1] if (i - 1) < len(prompts) else seed
-                        pr = str(pr or "").replace("\n", " ").replace("\r", " ").strip()
+                        pr = str(pr or '').replace("\n", " ").replace("\r", " ").strip()
                         pr = " ".join(pr.split())
                         if not pr:
-                            pr = str(seed or "").strip()
+                            pr = str(seed or '').strip()
                         # Final guard: enforce exact prefix once (no repeats)
                         if seed:
                             if not pr.startswith(seed):
@@ -7056,9 +8302,9 @@ class PipelineWorker(QThread):
                     try:
                         _shot_map_existing = manifest.get("shots") if isinstance(manifest.get("shots"), dict) else {}
                         _rec_existing = _shot_map_existing.get(sid) if isinstance(_shot_map_existing.get(sid), dict) else {}
-                        _existing_file = str(_rec_existing.get("file") or "").strip()
+                        _existing_file = str(_rec_existing.get("file") or '').strip()
                         _existing_ok = (
-                            str(_rec_existing.get("status") or "") == "done"
+                            str(_rec_existing.get("status") or '') == "done"
                             and _existing_file
                             and os.path.exists(_existing_file)
                             and os.path.getsize(_existing_file) >= 1024
@@ -7116,7 +8362,7 @@ class PipelineWorker(QThread):
                     except Exception:
                         pass
 
-                    seed0 = (str(sh.get("visual_description") or "").strip() or str(sh.get("seed") or "").strip())
+                    seed0 = (str(sh.get("visual_description") or '').strip() or str(sh.get("seed") or '').strip())
                     dist_fp = ""
                     rec0 = shot_map.get(sid) if isinstance(shot_map.get(sid), dict) else {}
                     spec_prompt, spec_negative, lint = _assemble_shot_prompt(
@@ -7136,9 +8382,9 @@ class PipelineWorker(QThread):
                             # Fingerprint to avoid re-distilling if already done for this exact spec/model combo
                             model_key = str(self.job.encoding.get('image_model') or '')
                             dist_fp = _sha1_text(json.dumps({"spec": spec_prompt, "neg": spec_negative, "model": model_key}, sort_keys=True))
-                            prev_fp = str(rec0.get("render_fingerprint") or "")
-                            prev_rp = str(rec0.get("render_prompt") or "")
-                            prev_rn = str(rec0.get("render_negative") or "")
+                            prev_fp = str(rec0.get("render_fingerprint") or '')
+                            prev_rp = str(rec0.get("render_prompt") or '')
+                            prev_rn = str(rec0.get("render_negative") or '')
 
                             if prev_fp and prev_fp == dist_fp and prev_rp.strip():
                                 render_prompt = prev_rp
@@ -7182,8 +8428,8 @@ class PipelineWorker(QThread):
                                     max_new_tokens=800,
                                 )
                                 if isinstance(parsed, dict):
-                                    rp = str(parsed.get("prompt") or "").strip()
-                                    rn = str(parsed.get("negative") or "").strip()
+                                    rp = str(parsed.get("prompt") or '').strip()
+                                    rn = str(parsed.get("negative") or '').strip()
                                     if rp:
                                         render_prompt = rp
                                     if rn:
@@ -7205,15 +8451,15 @@ class PipelineWorker(QThread):
                     try:
                         if dist_fp and isinstance(rec0, dict):
                             rec0["render_fingerprint"] = dist_fp
-                            rec0["render_prompt"] = str(render_prompt or "").strip()
-                            rec0["render_negative"] = str(render_negative or "").strip()
+                            rec0["render_prompt"] = str(render_prompt or '').strip()
+                            rec0["render_negative"] = str(render_negative or '').strip()
                             shot_map[sid] = rec0
                     except Exception:
                         pass
 
                     # Use distilled render prompt for txt2img (keep SPEC_PROMPT separately in logs/manifest)
-                    prompt = str(render_prompt or spec_prompt or "").strip()
-                    negative = str(render_negative or spec_negative or "").strip()
+                    prompt = str(render_prompt or spec_prompt or '').strip()
+                    negative = str(render_negative or spec_negative or '').strip()
 
                     # Probe logger: capture every txt2img prompt that the planner compiles.
                     try:
@@ -7230,10 +8476,10 @@ class PipelineWorker(QThread):
                         "id": sid,
                         "seed": seed0,
                         "seed_int": int(sh.get("seed_int") or _seed_to_int(seed0) or 0),
-                        "camera": str(sh.get("camera") or ""),
-                        "lighting": str(sh.get("lighting") or ""),
-                        "mood": str(sh.get("mood") or ""),
-                        "phase": str(sh.get("phase") or ""),
+                        "camera": str(sh.get("camera") or ''),
+                        "lighting": str(sh.get("lighting") or ''),
+                        "mood": str(sh.get("mood") or ''),
+                        "phase": str(sh.get("phase") or ''),
                         "prompt_spec": spec_prompt,
                         "negative_spec": spec_negative,
                         "prompt_compiled": render_prompt,
@@ -7257,15 +8503,9 @@ class PipelineWorker(QThread):
                 manifest["paths"]["image_prompts_txt"] = image_prompts_path
                 _safe_write_json(manifest_path, manifest)
 
-            # IMPORTANT: Own storyline must always rebuild prompts so edits in the textbox
-            # immediately affect the run (never reuse stale compiled prompts).
-            if bool(_own_storyline_enabled):
-                _run("Image prompts (from shots)", step_image_prompts, 44)
-            else:
-                if _file_ok(image_prompts_path, 10):
-                    _skip("Image prompts (from shots)", "image_prompts.txt already exists")
-                else:
-                    _run("Image prompts (from shots)", step_image_prompts, 44)
+            # Always rebuild image prompts from the current shots.
+            # Reusing stale compiled prompts can preserve bad placeholder output even after the shot list changed.
+            _run("Image prompts (from shots)", step_image_prompts, 44)
 
             
                         # Step C2: Render REAL images for all shots using Txt2Img engine selection
@@ -7291,7 +8531,7 @@ class PipelineWorker(QThread):
                 # Planner-selected image model (overrides base txt2img settings when set)
                 image_model_sel = ""
                 try:
-                    image_model_sel = str(self.job.encoding.get("image_model") or "").strip()
+                    image_model_sel = str(self.job.encoding.get("image_model") or '').strip()
                 except Exception:
                     image_model_sel = ""
 
@@ -7303,7 +8543,7 @@ class PipelineWorker(QThread):
                     IMPORTANT: ignore non-diffusion GGUFs (e.g. LLMs) so we don't pass the wrong file.
                     """
                     try:
-                        gq = str(self.job.encoding.get("gen_quality_preset") or "").lower().strip()
+                        gq = str(self.job.encoding.get("gen_quality_preset") or '').lower().strip()
                         mode = "medium"
                         if "high" in gq:
                             mode = "high"
@@ -7413,14 +8653,14 @@ class PipelineWorker(QThread):
                             acb = {}
                         # Fingerprint: shots content + plan fingerprint (best effort)
                         try:
-                            _shots_sig = [{"id": str(s.get("id") or ""), "t": str(s.get("visual_description") or s.get("seed") or "")[:200]} for s in shots if isinstance(s, dict)]
+                            _shots_sig = [{"id": str(s.get("id") or ''), "t": str(s.get("visual_description") or s.get("seed") or '')[:200]} for s in shots if isinstance(s, dict)]
                         except Exception:
                             _shots_sig = []
                         _acb_fp = _sha1_text(json.dumps({
-                            "plan": str((plan_obj or {}).get("planner_plan_fingerprint") or ""),
+                            "plan": str((plan_obj or {}).get("planner_plan_fingerprint") or ''),
                             "shots": _shots_sig,
                         }, sort_keys=True))
-                        if str(acb.get("fingerprint") or "") != _acb_fp:
+                        if str(acb.get("fingerprint") or '') != _acb_fp:
                             # Build strict Qwen prompt
                             raw_path = os.path.join(prompts_dir, "auto_character_bible_v2_raw.txt")
                             err_path = os.path.join(errors_dir, "auto_character_bible_v2_error.txt")
@@ -7439,13 +8679,13 @@ class PipelineWorker(QThread):
                             for s in shots:
                                 if not isinstance(s, dict):
                                     continue
-                                sid = str(s.get("id") or "").strip()
-                                st = str(s.get("visual_description") or s.get("seed") or "").strip()
+                                sid = str(s.get("id") or '').strip()
+                                st = str(s.get("visual_description") or s.get("seed") or '').strip()
                                 st = " ".join(st.replace("\n", " ").replace("\r", " ").split())
                                 if sid:
                                     shot_lines.append({"id": sid, "text": st})
                             user_p_base = (
-                                "STORYLINE (context):\n" + str(self.job.prompt or "").strip() + "\n\n"
+                                "STORYLINE (context):\n" + str(self.job.prompt or '').strip() + "\n\n"
                                 "SHOTS (id + text):\n" + json.dumps(shot_lines, ensure_ascii=True) + "\n\n"
                                 "Return JSON with keys: characters, shots.\n"
                                 "shots must be an array of objects: {id, present_characters:[...]}.\n"
@@ -7504,7 +8744,7 @@ class PipelineWorker(QThread):
                     ref_files = []
 
                 try:
-                    ref_strategy = str(self.job.encoding.get("ref_strategy") or "").strip()
+                    ref_strategy = str(self.job.encoding.get("ref_strategy") or '').strip()
                 except Exception:
                     ref_strategy = ""
 
@@ -7513,7 +8753,7 @@ class PipelineWorker(QThread):
                 used_ref_files = list(ref_files[:2]) if use_qwen2511 else list(ref_files)
 
                 try:
-                    multi_lora = str(self.job.encoding.get("ref_multi_angle_lora") or "").strip()
+                    multi_lora = str(self.job.encoding.get("ref_multi_angle_lora") or '').strip()
                 except Exception:
                     multi_lora = ""
 
@@ -7558,7 +8798,7 @@ class PipelineWorker(QThread):
                     try:
                         _rec0 = shot_map.get(sid) if isinstance(shot_map, dict) else {}
                         if isinstance(_rec0, dict):
-                            _p0 = str(_rec0.get("file") or _rec0.get("img_file") or "").strip()
+                            _p0 = str(_rec0.get("file") or _rec0.get("img_file") or '').strip()
                             if _p0 and os.path.isfile(_p0) and os.path.getsize(_p0) >= 1024:
                                 _existing_img = _p0
                         if not _existing_img:
@@ -7616,7 +8856,7 @@ class PipelineWorker(QThread):
                     except Exception:
                         pass
 
-                    seed_txt = (str(sh.get("visual_description") or "").strip() or str(sh.get("seed", "") or "").strip())
+                    seed_txt = (str(sh.get("visual_description") or '').strip() or str(sh.get("seed", "") or '').strip())
                     camera = str(sh.get("camera", "medium shot") or "medium shot")
                     lighting = str(sh.get("lighting", "cinematic lighting") or "cinematic lighting")
                     mood = str(sh.get("mood", "neutral") or "neutral")
@@ -7648,24 +8888,24 @@ class PipelineWorker(QThread):
                             ).strip()
                         except Exception:
                             prompt = ""
-                            negative = str(self.job.negatives or "").strip()
+                            negative = str(self.job.negatives or '').strip()
 
                         # Keep dispatch prompt single-line to avoid accidental multi-prompt parsing by engines.
-                        prompt = str(prompt or "").replace("\n", " ").replace("\r", " ").replace("\\n", " ").strip()
+                        prompt = str(prompt or '').replace("\n", " ").replace("\r", " ").replace("\\n", " ").strip()
                         prompt = " ".join(prompt.split())
 
                         # Hard fallback: if manifest fields were not populated for any reason,
                         # use the shot's own visual_description/seed so S01 can never dispatch blank.
                         if not prompt:
                             try:
-                                prompt = str(sh.get("visual_description") or sh.get("seed") or seed_txt or "").strip()
+                                prompt = str(sh.get("visual_description") or sh.get("seed") or seed_txt or '').strip()
                             except Exception:
-                                prompt = str(seed_txt or "").strip()
-                            prompt = str(prompt or "").replace("\n", " ").replace("\r", " ").replace("\\n", " ").strip()
+                                prompt = str(seed_txt or '').strip()
+                            prompt = str(prompt or '').replace("\n", " ").replace("\r", " ").replace("\\n", " ").strip()
                             prompt = " ".join(prompt.split())
 
 
-                        negative = _ascii_only(str(negative or ""))
+                        negative = _ascii_only(str(negative or ''))
                         negative = _adjust_text_negatives_csv(negative, bool(wants_text))
                         negative = _sanitize_negative_list(negative)
 
@@ -7691,7 +8931,7 @@ class PipelineWorker(QThread):
                                 "camera": camera,
                                 "lighting": lighting,
                                 "mood": mood,
-                                "phase": str(sh.get("phase") or ""),
+                                "phase": str(sh.get("phase") or ''),
                                 "prompt_used": prompt,
                                 "prompt_compiled": prompt,
                                 "negative_compiled": negative,
@@ -7715,23 +8955,23 @@ class PipelineWorker(QThread):
 
                                 _rec_alt = {}
 
-                            prompt = str(_rec_alt.get("prompt_user_override") or _rec_alt.get("prompt_compiled") or _rec_alt.get("prompt_used") or _rec_alt.get("prompt_spec") or "").strip()
+                            prompt = str(_rec_alt.get("prompt_user_override") or _rec_alt.get("prompt_compiled") or _rec_alt.get("prompt_used") or _rec_alt.get("prompt_spec") or '').strip()
 
-                            negative = str(_rec_alt.get("negative_compiled") or _rec_alt.get("negative_used") or self.job.negatives or "").strip()
+                            negative = str(_rec_alt.get("negative_compiled") or _rec_alt.get("negative_used") or self.job.negatives or '').strip()
 
                         except Exception:
 
                             prompt = ""
 
-                            negative = str(self.job.negatives or "").strip()
+                            negative = str(self.job.negatives or '').strip()
 
                         # Ensure single-line prompts to avoid multi-prompt parsing by engines
 
-                        prompt = str(prompt or "").replace("\n", " ").replace("\r", " ").replace("\\n", " ").strip()
+                        prompt = str(prompt or '').replace("\n", " ").replace("\r", " ").replace("\\n", " ").strip()
 
                         prompt = " ".join(prompt.split())
 
-                        negative = _ascii_only(str(negative or ""))
+                        negative = _ascii_only(str(negative or ''))
 
                         negative = _adjust_text_negatives_csv(negative, bool(wants_text))
 
@@ -7777,7 +9017,7 @@ class PipelineWorker(QThread):
 
                                 "mood": mood,
 
-                                "phase": str(sh.get("phase") or ""),
+                                "phase": str(sh.get("phase") or ''),
 
                                 "prompt_used": prompt,
 
@@ -7844,11 +9084,11 @@ class PipelineWorker(QThread):
 
                                                     dist_fp = _sha1_text(json.dumps({"spec": spec_prompt, "neg": spec_negative, "model": model_key}, sort_keys=True))
 
-                                                    prev_fp = str(rec0.get("render_fingerprint") or "")
+                                                    prev_fp = str(rec0.get("render_fingerprint") or '')
 
-                                                    prev_rp = str(rec0.get("render_prompt") or "")
+                                                    prev_rp = str(rec0.get("render_prompt") or '')
 
-                                                    prev_rn = str(rec0.get("render_negative") or "")
+                                                    prev_rn = str(rec0.get("render_negative") or '')
 
                         
 
@@ -7936,9 +9176,9 @@ class PipelineWorker(QThread):
 
                                                         if isinstance(parsed, dict):
 
-                                                            rp = str(parsed.get("prompt") or "").strip()
+                                                            rp = str(parsed.get("prompt") or '').strip()
 
-                                                            rn = str(parsed.get("negative") or "").strip()
+                                                            rn = str(parsed.get("negative") or '').strip()
 
                                                             if rp:
 
@@ -8018,7 +9258,7 @@ class PipelineWorker(QThread):
 
                                                     "mood": mood,
 
-                                                    "phase": str(sh.get("phase") or ""),
+                                                    "phase": str(sh.get("phase") or ''),
 
                                                     "prompt_used": prompt,
 
@@ -8060,7 +9300,7 @@ class PipelineWorker(QThread):
                     # Own Character Bible — codeword-triggered replacement only (no forced global injection)
                     try:
                         if (not bool(_own_storyline_enabled)) and bool(_own_active):
-                            prompt = _apply_own_character_codeword_replacements(str(prompt or ""), getattr(self.job, "encoding", {}))
+                            prompt = _apply_own_character_codeword_replacements(str(prompt or ''), getattr(self.job, "encoding", {}))
                     except Exception:
                         pass
                     
@@ -8078,13 +9318,13 @@ class PipelineWorker(QThread):
                                 _present = _sb.get(str(sid)) or []
                             _present = [str(x).strip() for x in (_present or []) if str(x).strip()]
                             if _present and _cm:
-                                prompt = _auto_cb_v2_append_anchors(str(prompt or ""), _present, _cm, str(base_job.get("engine") or base_job.get("model") or base_job.get("model_id") or base_job.get("pipeline") or ""))
+                                prompt = _auto_cb_v2_append_anchors(str(prompt or ''), _present, _cm, str(base_job.get("engine") or base_job.get("model") or base_job.get("model_id") or base_job.get("pipeline") or ''))
                     except Exception:
                         pass
 
                     # Auto Character Bible v2: for clone-prone engines (Z-Image), strengthen negative prompt too.
                     try:
-                        _eh = str(base_job.get("engine") or base_job.get("model") or base_job.get("model_id") or base_job.get("pipeline") or "").lower()
+                        _eh = str(base_job.get("engine") or base_job.get("model") or base_job.get("model_id") or base_job.get("pipeline") or '').lower()
                         if ("z-image" in _eh) or ("zimage" in _eh) or ("z_image" in _eh):
                             _neg_add = "extra people, duplicate person, clone, twin, multiple faces, extra face, extra head"
                             if isinstance(negative, str) and negative.strip():
@@ -8109,16 +9349,16 @@ class PipelineWorker(QThread):
                         if isinstance(shot_map2, dict):
                             rec2 = shot_map2.get(sid) if isinstance(shot_map2.get(sid), dict) else None
                             if isinstance(rec2, dict):
-                                rec2["prompt_used"] = str(prompt or "").strip()
-                                rec2["prompt_compiled"] = str(prompt or "").strip()
+                                rec2["prompt_used"] = str(prompt or '').strip()
+                                rec2["prompt_compiled"] = str(prompt or '').strip()
                                 shot_map2[sid] = rec2
                     except Exception:
                         pass
 
 
                     # Planner defaults: allow Planner image model override; otherwise keep user's last txt2img engine.
-                    _eng = str(t2i_job.get("engine") or "").lower().strip()
-                    _sel = (image_model_sel or "").lower().strip()
+                    _eng = str(t2i_job.get("engine") or '').lower().strip()
+                    _sel = (image_model_sel or '').lower().strip()
 
                     if _sel.startswith("auto"):
                         # Auto: keep user's last engine if available, otherwise default to Z-image GGUF
@@ -8151,7 +9391,7 @@ class PipelineWorker(QThread):
                     # Ensure downstream sees the engine we decided on
                     t2i_job["engine"] = _eng
 
-                    aspect_mode = str(self.job.encoding.get("aspect_mode") or "")
+                    aspect_mode = str(self.job.encoding.get("aspect_mode") or '')
 
                     if use_qwen2511:
                         # Qwen Edit 2511 ref-image mode: hardcode a lower res to reduce VRAM use.
@@ -8212,7 +9452,7 @@ class PipelineWorker(QThread):
                         t2i_job["cfg_scale"] = 5.0
                         t2i_job["cfg"] = 5.0
                         try:
-                            mp = str(t2i_job.get("model_path") or "").strip()
+                            mp = str(t2i_job.get("model_path") or '').strip()
                         except Exception:
                             mp = ""
                         try:
@@ -8259,7 +9499,7 @@ class PipelineWorker(QThread):
 
                     # Safety: only use ultra-low steps (4–8) when Turbo LoRA is actually present.
                     try:
-                        engine = str(t2i_job.get("engine") or "").lower()
+                        engine = str(t2i_job.get("engine") or '').lower()
                         steps_val = t2i_job.get("steps", t2i_job.get("num_steps", None))
                         cfg_val = t2i_job.get("cfg", t2i_job.get("guidance", None))
                         steps = int(steps_val) if steps_val is not None else None
@@ -8288,7 +9528,7 @@ class PipelineWorker(QThread):
                             if turbo_path:
                                 manifest["settings"]["qwen2512_turbo_lora_path"] = turbo_path
                                 manifest["settings"]["qwen2512_turbo_lora_used"] = bool(turbo_used)
-                            manifest["settings"]["image_sampler"] = str(t2i_job.get("sampler") or "")
+                            manifest["settings"]["image_sampler"] = str(t2i_job.get("sampler") or '')
                             manifest["settings"]["image_steps"] = int(t2i_job.get("steps") or 0)
                             try:
                                 manifest["settings"]["image_cfg"] = float(t2i_job.get("cfg") or t2i_job.get("cfg_scale") or 0)
@@ -8310,7 +9550,7 @@ class PipelineWorker(QThread):
                             import qwen2511 as _q2511  # type: ignore
 
                         # Default test/output resolution for this chunk: 1024x576 (16:9)
-                        aspect_mode = str(self.job.encoding.get("aspect_mode") or "")
+                        aspect_mode = str(self.job.encoding.get("aspect_mode") or '')
                         _hq = bool(self.job.encoding.get("qwen2511_high_quality") or False)
 
                         bw, bh = (1280, 720) if _hq else (1024, 576)
@@ -8340,7 +9580,7 @@ class PipelineWorker(QThread):
                             q_job["lora_path"] = multi_lora
                             q_job["lora"] = multi_lora
                             q_job["multi_angle"] = True
-                            q_job["prompt"] = (q_job["prompt"] or "") + "\\n\\nMulti-angle variant: different camera angle of the same subject."
+                            q_job["prompt"] = (q_job["prompt"] or '') + "\\n\\nMulti-angle variant: different camera angle of the same subject."
 
                         # Update manifest per-shot record with ref info
                         try:
@@ -8375,10 +9615,10 @@ class PipelineWorker(QThread):
                                     d = _q2511.default_model_paths() if hasattr(_q2511, "default_model_paths") else {}
                                 except Exception:
                                     d = {}
-                                unet_path = str(d.get("unet") or "")
-                                llm_path = str(d.get("llm") or "")
-                                mmproj_path = str(d.get("mmproj") or "")
-                                vae_path = str(d.get("vae") or "")
+                                unet_path = str(d.get("unet") or '')
+                                llm_path = str(d.get("llm") or '')
+                                mmproj_path = str(d.get("mmproj") or '')
+                                vae_path = str(d.get("vae") or '')
                                 # Prefer Q5, then Q4, then any other UNet GGUF in models/qwen2511gguf/unet
                                 try:
                                     _unet_dir = _root() / "models" / "qwen2511gguf" / "unet"
@@ -8426,12 +9666,12 @@ class PipelineWorker(QThread):
                                     sdcli_path=sdcli_path,
                                     caps=caps,
                                     init_img=tmp_blank,
-                                    mask_path=str(q_job.get("mask_path") or ""),
+                                    mask_path=str(q_job.get("mask_path") or ''),
                                     ref_images=refs,
                                     use_increase_ref_index=True,
                                     disable_auto_resize_ref_images=False,
-                                    prompt=str(q_job.get("prompt") or ""),
-                                    negative=str(q_job.get("negative_prompt") or q_job.get("negative") or ""),
+                                    prompt=str(q_job.get("prompt") or ''),
+                                    negative=str(q_job.get("negative_prompt") or q_job.get("negative") or ''),
                                     unet_path=unet_path,
                                     llm_path=llm_path,
                                     mmproj_path=mmproj_path,
@@ -8444,7 +9684,7 @@ class PipelineWorker(QThread):
                                     strength=float(q_job.get("strength") or 1.0),
                                     sampling_method=_sm,
                                     shift=float(q_job.get("shift") or q_job.get("flow") or 2.3),
-                                    out_file=str(q_job.get("out_file") or ""),
+                                    out_file=str(q_job.get("out_file") or ''),
                                     use_vae_tiling=False,
                                     vae_tile_size="",
                                     vae_tile_overlap=0.0,
@@ -8453,8 +9693,8 @@ class PipelineWorker(QThread):
                                     use_vae_on_cpu=_use_vae_cpu,
                                     use_clip_on_cpu=False,
                                     use_diffusion_fa=True,
-                                    lora_model_dir=str(q_job.get("lora_model_dir") or ""),
-                                    lora_name=str(q_job.get("lora_name") or q_job.get("lora") or q_job.get("lora_path") or ""),
+                                    lora_model_dir=str(q_job.get("lora_model_dir") or ''),
+                                    lora_name=str(q_job.get("lora_name") or q_job.get("lora") or q_job.get("lora_path") or ''),
                                     lora_strength=float(q_job.get("lora_strength") or q_job.get("lora_scale") or 1.0),
                                 )
                         
@@ -8467,7 +9707,7 @@ class PipelineWorker(QThread):
                                 except Exception:
                                     rc = 1
                         
-                                out_file = str(q_job.get("out_file") or "")
+                                out_file = str(q_job.get("out_file") or '')
                                 ok = (rc == 0 and out_file and os.path.exists(out_file))
                                 res = {"ok": bool(ok), "files": ([out_file] if ok else []), "out_file": out_file, "rc": int(rc)}
                         
@@ -8501,28 +9741,36 @@ class PipelineWorker(QThread):
 
                     else:
                         # Flux Klein (stable-diffusion.cpp sd-cli)
-                        _eng_now = str(t2i_job.get("engine") or "").lower().strip()
-                        if _eng_now in ("flux_klein", "flux_klein_edit"):
-                            _fm = _pick_flux_klein_models_highest()
-                            sdcli_path = str(_fm.get("sd_cli") or "")
-                            diffusion = str(t2i_job.get("flux_diffusion_model") or _fm.get("diffusion") or "")
-                            llm = str(t2i_job.get("flux_llm_model") or _fm.get("llm") or "")
-                            vae = str(t2i_job.get("flux_vae") or _fm.get("vae") or "")
+                        _eng_now = str(t2i_job.get("engine") or '').lower().strip()
+                        if _eng_now in ("flux_klein", "flux_klein_9b", "flux_klein_edit"):
+                            _force_kb = 0
+                            try:
+                                if _eng_now == 'flux_klein_9b':
+                                    _force_kb = 9
+                                elif _eng_now == 'flux_klein':
+                                    _force_kb = 4
+                            except Exception:
+                                _force_kb = 0
+                            _fm = _pick_flux_klein_models_highest(force_klein_b=_force_kb)
+                            sdcli_path = str(_fm.get("sd_cli") or '')
+                            diffusion = str(t2i_job.get("flux_diffusion_model") or _fm.get("diffusion") or '')
+                            llm = str(t2i_job.get("flux_llm_model") or _fm.get("llm") or '')
+                            vae = str(t2i_job.get("flux_vae") or _fm.get("vae") or '')
                             if (not sdcli_path) or (not os.path.exists(sdcli_path)):
                                 raise RuntimeError("Flux Klein selected but sd-cli.exe was not found at presets/bin/sd-cli.exe")
                             if (not diffusion) or (not os.path.exists(diffusion)):
-                                raise RuntimeError("Flux Klein selected but no diffusion GGUF was found in models/klein4b_gguf/")
+                                raise RuntimeError(f"Flux Klein selected but no diffusion GGUF was found in any Klein GGUF folder (searched: {str(_fm.get('searched_dirs') or '')} )")
                             if (not llm) or (not os.path.exists(llm)):
-                                raise RuntimeError("Flux Klein selected but no Qwen3 4B GGUF was found in models/klein4b_gguf/")
+                                raise RuntimeError(f"Flux Klein selected but no Qwen3 GGUF was found in any Klein GGUF folder (searched: {str(_fm.get('searched_dirs') or '')} )")
                             if (not vae) or (not os.path.exists(vae)):
-                                raise RuntimeError("Flux Klein selected but no VAE safetensors was found in models/klein4b_gguf/")
+                                raise RuntimeError(f"Flux Klein selected but no VAE safetensors was found in any Klein GGUF folder (searched: {str(_fm.get('searched_dirs') or '')} )")
                     
                             # NOTE:
                             # Planner historically uses Z-image filename templates like "z_img_{seed}_{idx}".
                             # sd-cli does NOT expand those templates. If we pass them through, it will literally
                             # try to write to a path containing braces (often resulting in a 0-byte file).
                             # So for Flux Klein we force a clean, deterministic filename.
-                            out_path = str(t2i_job.get("out_file") or t2i_job.get("target") or "").strip()
+                            out_path = str(t2i_job.get("out_file") or t2i_job.get("target") or '').strip()
                             if (not out_path) or ("{" in out_path) or ("}" in out_path):
                                 out_path = os.path.join(images_dir, f"{sid}.png")
                             # Ensure extension (sd-cli will happily write without one, but the app expects PNGs)
@@ -8540,8 +9788,8 @@ class PipelineWorker(QThread):
                             cmd += ["--diffusion-model", diffusion]
                             cmd += ["--vae", vae]
                             cmd += ["--llm", llm]
-                            cmd += ["-p", str(t2i_job.get("prompt") or "").strip()]
-                            _neg = str(t2i_job.get("negative_prompt") or t2i_job.get("negative") or "").strip()
+                            cmd += ["-p", str(t2i_job.get("prompt") or '').strip()]
+                            _neg = str(t2i_job.get("negative_prompt") or t2i_job.get("negative") or '').strip()
                             if _neg:
                                 cmd += ["-n", _neg]
 
@@ -8667,7 +9915,7 @@ class PipelineWorker(QThread):
                     # Fallbacks: some backends may save a file but not return a 'files' list.
                     try:
                         if (not out_file) and isinstance(_t2i_job, dict):
-                            _ft = str(_t2i_job.get("filename_template") or "").strip()
+                            _ft = str(_t2i_job.get("filename_template") or '').strip()
                             if _ft:
                                 _cand = os.path.join(images_dir, _ft)
                                 if os.path.isfile(_cand) and os.path.getsize(_cand) >= 1024:
@@ -8794,8 +10042,8 @@ class PipelineWorker(QThread):
                         manifest["paths"]["images"] = image_records
                         if out_file and not manifest["paths"].get("first_image"):
                             manifest["paths"]["first_image"] = out_file
-                        manifest.setdefault("settings", {})["image_engine"] = str(res.get("backend") or t2i_job.get("engine") or "") if isinstance(res, dict) else str(t2i_job.get("engine") or "")
-                        manifest["settings"]["image_model"] = str(res.get("model") or "") if isinstance(res, dict) else str(t2i_job.get("model") or "")
+                        manifest.setdefault("settings", {})["image_engine"] = str(res.get("backend") or t2i_job.get("engine") or '') if isinstance(res, dict) else str(t2i_job.get("engine") or '')
+                        manifest["settings"]["image_model"] = str(res.get("model") or '') if isinstance(res, dict) else str(t2i_job.get("model") or '')
                         _safe_write_json(manifest_path, manifest)
                     except Exception:
                         pass
@@ -8860,50 +10108,57 @@ class PipelineWorker(QThread):
                 shot_map = manifest.get("shots") if isinstance(manifest.get("shots"), dict) else {}
                 out_txt: List[str] = []
                 out_list: List[Dict[str, Any]] = []
+                enc0 = self.job.encoding if isinstance(getattr(self.job, "encoding", None), dict) else {}
+                try:
+                    own_active0 = bool((enc0 or {}).get("own_character_bible_enabled"))
+                except Exception:
+                    own_active0 = False
 
-                for sh in shots:
-                    sid = str(sh.get("id") or "S??")
-                    seed0 = (str(sh.get("visual_description") or "").strip() or str(sh.get("seed") or "").strip())
-                    dist_fp = ""
-                    rec0 = shot_map.get(sid) if isinstance(shot_map.get(sid), dict) else {}
-                    rec = shot_map.get(sid) if isinstance(shot_map, dict) else {}
-                    compiled = str(
-                        (rec.get("prompt_compiled") if isinstance(rec, dict) else "")
-                        or (rec.get("prompt_used") if isinstance(rec, dict) else "")
-                        or (rec.get("prompt_spec") if isinstance(rec, dict) else "")
-                        or str(sh.get("visual_description") or "").strip()
-                        or str(sh.get("seed") or "").strip()
-                    ).strip()
-                    neg = str((rec.get("negative_compiled") if isinstance(rec, dict) else "") or "").strip()
+                for idx, sh in enumerate(shots):
+                    sid = str(sh.get("id") or f"S{idx + 1:02d}")
+                    rec = shot_map.get(sid) if isinstance(shot_map.get(sid), dict) else {}
+                    neg = str((rec.get("negative_compiled") if isinstance(rec, dict) else "") or '').strip()
 
-                    # I2V: reuse compiled prompt + add a tight motion directive.
-                    motion = (
-                        "Motion: slow camera move, subtle parallax, gentle atmospheric movement. "
-                        "Keep the subject stable and match the start image exactly. "
-                        "No new objects, no extra characters, no collage/mosaic."
+                    prev_sh = shots[idx - 1] if idx > 0 and idx - 1 < len(shots) else None
+                    next_sh = shots[idx + 1] if (idx + 1) < len(shots) else None
+                    schema = _planner_build_i2v_schema(
+                        manifest,
+                        sh if isinstance(sh, dict) else {},
+                        rec if isinstance(rec, dict) else {},
+                        prev_shot=(prev_sh if isinstance(prev_sh, dict) else None),
+                        next_shot=(next_sh if isinstance(next_sh, dict) else None),
+                        enc=enc0,
+                        own_active=bool(own_active0),
                     )
-                    i2v_prompt = (compiled + "\\n\\n" + motion).strip() if compiled else motion
+                    i2v_prompt = _planner_format_i2v_prompt(schema)
                     i2v_negative = neg
 
-                    # Store on per-shot record for downstream engines
                     if isinstance(rec, dict):
                         rec["i2v_prompt"] = i2v_prompt
                         rec["i2v_negative"] = i2v_negative
+                        rec["i2v_schema"] = schema
+                        rec["i2v_schema_version"] = int(_PLANNER_I2V_SCHEMA_VERSION)
                         rec["ts_i2v"] = time.time()
                         shot_map[sid] = rec
 
-                    out_txt.append(f"{sid}: {i2v_prompt}")
-                    out_list.append({"id": sid, "prompt": i2v_prompt, "negative": i2v_negative})
+                    out_txt.append(f"{sid}:\n{i2v_prompt}")
+                    out_list.append({
+                        "id": sid,
+                        "prompt": i2v_prompt,
+                        "negative": i2v_negative,
+                        "schema": schema,
+                    })
 
-                _safe_write_text(i2v_prompts_path, "\n".join(out_txt).strip() + "\n")
-                _safe_write_json(i2v_prompts_json, {"shots": out_list})
+                _safe_write_text(i2v_prompts_path, "\n\n".join(out_txt).strip() + "\n")
+                _safe_write_json(i2v_prompts_json, {"schema_version": int(_PLANNER_I2V_SCHEMA_VERSION), "shots": out_list})
 
                 manifest["paths"]["i2v_prompts_txt"] = i2v_prompts_path
                 manifest["paths"]["i2v_prompts_json"] = i2v_prompts_json
+                manifest.setdefault("settings", {})["i2v_schema_version"] = int(_PLANNER_I2V_SCHEMA_VERSION)
                 manifest["shots"] = shot_map
                 _safe_write_json(manifest_path, manifest)
 
-            if _file_ok(i2v_prompts_path, 10) and _file_ok(i2v_prompts_json, 10):
+            if _file_ok(i2v_prompts_path, 10) and _file_ok(i2v_prompts_json, 10) and _planner_i2v_prompts_are_current(i2v_prompts_json):
                 _skip("I2V prompts (from shots)", "i2v prompts already exist")
             else:
                 _run("I2V prompts (from shots)", step_i2v_prompts, 70)
@@ -8937,7 +10192,7 @@ class PipelineWorker(QThread):
                     "generate",
                     "--model", str(model_key),
                     "--prompt", str(prompt),
-                    "--negative", str(negative or ""),
+                    "--negative", str(negative or ''),
                     "--image", str(image_path),
                     "--output", str(out_path),
                     "--fps", str(int(fps)),
@@ -9079,7 +10334,7 @@ class PipelineWorker(QThread):
                                 _p0 = str(_rec0.get("clip_file"))
                                 if _p0 and os.path.isfile(_p0) and os.path.getsize(_p0) >= 1024:
                                     if str(_sid0) not in existing_by_id:
-                                        existing_by_id[str(_sid0)] = {"id": str(_sid0), "file": _p0, "intent_fp": str(_rec0.get("clip_intent_fp") or "")}
+                                        existing_by_id[str(_sid0)] = {"id": str(_sid0), "file": _p0, "intent_fp": str(_rec0.get("clip_intent_fp") or '')}
                 except Exception:
                     pass
 
@@ -9099,8 +10354,8 @@ class PipelineWorker(QThread):
 
                     sid = str(sh.get("id") or f"S{i:02d}")
                     rec = shot_map.get(sid) if isinstance(shot_map, dict) else {}
-                    prompt = str((rec.get("i2v_prompt") if isinstance(rec, dict) else "") or "").strip()
-                    negative = str((rec.get("i2v_negative") if isinstance(rec, dict) else "") or "").strip()
+                    prompt = str((rec.get("i2v_prompt") if isinstance(rec, dict) else "") or '').strip()
+                    negative = str((rec.get("i2v_negative") if isinstance(rec, dict) else "") or '').strip()
                     if not prompt:
                         # Fallback: basic motion-only prompt
                         prompt = "Slow camera move, subtle parallax, keep subject stable. Match the image exactly."
@@ -9108,7 +10363,7 @@ class PipelineWorker(QThread):
                     # Own Character Bible — codeword-triggered replacement only (no forced global injection)
                     try:
                         if (not bool(_own_storyline_enabled)) and bool(_own_active):
-                            prompt = _apply_own_character_codeword_replacements(str(prompt or ""), getattr(self.job, "encoding", {}))
+                            prompt = _apply_own_character_codeword_replacements(str(prompt or ''), getattr(self.job, "encoding", {}))
                     except Exception:
                         pass
                     img_path = id_to_img.get(sid, "")
@@ -9171,8 +10426,8 @@ class PipelineWorker(QThread):
                     try:
                         if os.path.isfile(out_file) and os.path.getsize(out_file) >= 1024:
                             _ex = existing_by_id.get(sid) if isinstance(existing_by_id, dict) else None
-                            _ex_fp = str(_ex.get("intent_fp") or "") if isinstance(_ex, dict) else ""
-                            _rec_fp = str(rec.get("clip_intent_fp") or "") if isinstance(rec, dict) else ""
+                            _ex_fp = str(_ex.get("intent_fp") or '') if isinstance(_ex, dict) else ""
+                            _rec_fp = str(rec.get("clip_intent_fp") or '') if isinstance(rec, dict) else ""
                             try:
                                 _clip_mtime = float(os.path.getmtime(out_file))
                             except Exception:
@@ -9328,10 +10583,10 @@ class PipelineWorker(QThread):
             def step_video_clips_wan22() -> None:
                 shots = _load_shots_list(shots_path)
                 shot_map = manifest.get("shots") if isinstance(manifest.get("shots"), dict) else {}
-                prof = _resolve_generation_profile(self.job.encoding.get("video_model") or "", self.job.encoding.get("gen_quality_preset") or "")
+                prof = _resolve_generation_profile(self.job.encoding.get("video_model") or "", self.job.encoding.get("gen_quality_preset") or '')
 
                 # Select size string based on aspect (WAN uses explicit WxH strings)
-                aspect = str(self.job.encoding.get("aspect") or "")
+                aspect = str(self.job.encoding.get("aspect") or '')
                 size_land = str(prof.get("size_landscape") or "1280*704")
                 size_port = str(prof.get("size_portrait") or "704*1280")
                 if "portrait" in aspect.lower():
@@ -9357,7 +10612,7 @@ class PipelineWorker(QThread):
                 try:
                     if os.path.exists(clips_manifest_path):
                         cm = _safe_read_json(clips_manifest_path)
-                        if isinstance(cm, dict) and str(cm.get("fingerprint") or "") == clip_fingerprint:
+                        if isinstance(cm, dict) and str(cm.get("fingerprint") or '') == clip_fingerprint:
                             # Ensure clips list is also present in main manifest
                             clips_out = cm.get("clips") if isinstance(cm.get("clips"), list) else []
                             manifest.setdefault("paths", {})["clips_dir"] = clips_dir
@@ -9387,7 +10642,7 @@ class PipelineWorker(QThread):
                 for i, sh in enumerate(shots, start=1):
                     if not isinstance(sh, dict):
                         continue
-                    sid = str(sh.get("id") or "").strip()
+                    sid = str(sh.get("id") or '').strip()
                     if not sid:
                         continue
 
@@ -9414,8 +10669,8 @@ class PipelineWorker(QThread):
                     rec = shot_map.get(sid) if isinstance(shot_map, dict) else {}
                     if not isinstance(rec, dict):
                         rec = {}
-                    prompt = str(rec.get("i2v_prompt") or "").strip()
-                    negative = str(rec.get("i2v_negative") or "").strip()
+                    prompt = str(rec.get("i2v_prompt") or '').strip()
+                    negative = str(rec.get("i2v_negative") or '').strip()
 
                     # Duration → frames
                     try:
@@ -9449,7 +10704,7 @@ class PipelineWorker(QThread):
 
                     # Skip if output exists and intent matches previous
                     if os.path.isfile(out_file) and os.path.getsize(out_file) > 1024:
-                        prev = existing_intents.get(sid) or str(rec.get("clip_intent_fp") or "")
+                        prev = existing_intents.get(sid) or str(rec.get("clip_intent_fp") or '')
                         if prev and prev == intent_fp:
                             self.signals.log.emit(f"[wan22] {sid}: reusing existing clip (intent match)")
                             clips_out.append({
@@ -9541,7 +10796,7 @@ class PipelineWorker(QThread):
                 _safe_write_json(manifest_path, manifest)
 
             # Run or skip based on selected video model
-            mk = _video_model_key(self.job.encoding.get("video_model") or "")
+            mk = _video_model_key(self.job.encoding.get("video_model") or '')
             if mk == "wan22":
                 _run("Video clips (WAN 2.2)", step_video_clips_wan22, 95)
             elif mk == "hunyuan":
@@ -9569,7 +10824,7 @@ class PipelineWorker(QThread):
             try:
                 _cm = _safe_read_json(clips_manifest_path) if os.path.exists(clips_manifest_path) else {}
                 if isinstance(_cm, dict):
-                    _clip_fingerprint = str(_cm.get("fingerprint") or "")
+                    _clip_fingerprint = str(_cm.get("fingerprint") or '')
             except Exception:
                 _clip_fingerprint = ""
 
@@ -9614,7 +10869,7 @@ class PipelineWorker(QThread):
                 for sh in shots:
                     if not isinstance(sh, dict):
                         continue
-                    sid = str(sh.get("id") or "").strip()
+                    sid = str(sh.get("id") or '').strip()
                     if not sid:
                         continue
                     try:
@@ -9654,14 +10909,14 @@ class PipelineWorker(QThread):
                     if cp.returncode != 0:
                         raise RuntimeError(f"ffprobe failed for: {media_path}\n{cp.stderr.strip()}")
                     try:
-                        obj = json.loads(cp.stdout or "")
+                        obj = json.loads(cp.stdout or '')
                         return obj if isinstance(obj, dict) else {}
                     except Exception:
                         return {}
 
                 def _parse_rate(s: str) -> float:
                     # "20/1" -> 20.0
-                    s = (s or "").strip()
+                    s = (s or '').strip()
                     if not s:
                         return 0.0
                     if "/" in s:
@@ -9687,7 +10942,7 @@ class PipelineWorker(QThread):
                     return max(2, int(n) // 2 * 2)
 
                 # Target format = first clip
-                first_path = str((clips[0] or {}).get("file") or "")
+                first_path = str((clips[0] or {}).get("file") or '')
                 if not first_path or not os.path.isfile(first_path):
                     raise RuntimeError(f"First clip missing: {first_path}")
 
@@ -9702,7 +10957,7 @@ class PipelineWorker(QThread):
 
                 tw = _even(int(vstream.get("width") or 0))
                 th = _even(int(vstream.get("height") or 0))
-                fps = _parse_rate(str(vstream.get("avg_frame_rate") or vstream.get("r_frame_rate") or ""))
+                fps = _parse_rate(str(vstream.get("avg_frame_rate") or vstream.get("r_frame_rate") or ''))
                 if fps <= 0.0:
                     fps = 20.0
                 target_fps = int(round(fps))
@@ -9735,7 +10990,7 @@ class PipelineWorker(QThread):
                     if not isinstance(it, dict):
                         continue
                     sid = str(it.get("id") or f"S{idx:02d}")
-                    src = str(it.get("file") or "")
+                    src = str(it.get("file") or '')
                     if not src or not os.path.isfile(src):
                         raise RuntimeError(f"Missing clip for {sid}: {src}")
 
@@ -9824,7 +11079,7 @@ class PipelineWorker(QThread):
                     "target": {"width": int(tw), "height": int(th), "fps": int(target_fps)},
                     "timeline": timeline,
                     "audio": {
-                        "music_file": str((manifest.get("paths") or {}).get("music_file") or ""),
+                        "music_file": str((manifest.get("paths") or {}).get("music_file") or ''),
                         "note": "Audio muxing not done yet"
                     },
                 })
@@ -9955,7 +11210,7 @@ class PipelineWorker(QThread):
                         obj = json.loads(cp.stdout or "{}")
                         for st in (obj.get("streams") or []):
                             try:
-                                if str((st or {}).get("codec_type") or "").lower() == "audio":
+                                if str((st or {}).get("codec_type") or '').lower() == "audio":
                                     return True
                             except Exception:
                                 continue
@@ -9982,7 +11237,7 @@ class PipelineWorker(QThread):
                     args2 = [ffprobe2, "-v", "error", "-show_entries", "format=duration", "-of", "default=noprint_wrappers=1:nokey=1", str(video_path)]
                     cp2 = subprocess.run(args2, cwd=str(_root()), capture_output=True, text=True)
                     if cp2.returncode == 0:
-                        s = (cp2.stdout or "").strip().splitlines()[-1].strip() if (cp2.stdout or "").strip() else ""
+                        s = (cp2.stdout or '').strip().splitlines()[-1].strip() if (cp2.stdout or '').strip() else ""
                         dur2 = float(s) if s else 0.0
                         if dur2 > 0.0:
                             return float(dur2)
@@ -9994,7 +11249,7 @@ class PipelineWorker(QThread):
                     args3 = [ffprobe2, "-v", "error", "-select_streams", "v:0", "-show_entries", "stream=duration", "-of", "default=noprint_wrappers=1:nokey=1", str(video_path)]
                     cp3 = subprocess.run(args3, cwd=str(_root()), capture_output=True, text=True)
                     if cp3.returncode == 0:
-                        s = (cp3.stdout or "").strip().splitlines()[-1].strip() if (cp3.stdout or "").strip() else ""
+                        s = (cp3.stdout or '').strip().splitlines()[-1].strip() if (cp3.stdout or '').strip() else ""
                         dur3 = float(s) if s else 0.0
                         if dur3 > 0.0:
                             return float(dur3)
@@ -10107,7 +11362,7 @@ class PipelineWorker(QThread):
 
             def step_music_ace_7a() -> None:
                 # Only run if background music is enabled AND the user selected Ace.
-                if (not bool(getattr(self.job, "music_background", False))) or (str(getattr(self.job, "music_mode", "") or "") != "ace"):
+                if (not bool(getattr(self.job, "music_background", False))) or (str(getattr(self.job, "music_mode", "") or '') != "ace"):
                     raise RuntimeError("internal: step called but music mode is not ace")
 
                 audio_out = os.path.join(audio_dir, "music_ace.wav")
@@ -10127,8 +11382,8 @@ class PipelineWorker(QThread):
                     ace_state = (manifest.get("music") or {}).get("ace") or {}
                 except Exception:
                     ace_state = {}
-                prev_preset = str(ace_state.get("preset") or "")
-                prev_style = str(ace_state.get("style_text") or "")
+                prev_preset = str(ace_state.get("preset") or '')
+                prev_style = str(ace_state.get("style_text") or '')
                 try:
                     prev_dur = float(ace_state.get("duration_sec") or 0.0)
                 except Exception:
@@ -10164,7 +11419,7 @@ class PipelineWorker(QThread):
                 if _file_ok(audio_out, 1024) and _file_ok(ace_meta, 10):
                     try:
                         prev = json.loads(_safe_read_text(ace_meta) or "{}")
-                        if str(prev.get("fingerprint") or "") == fingerprint:
+                        if str(prev.get("fingerprint") or '') == fingerprint:
                             # Ensure manifest wiring
                             manifest.setdefault("paths", {})["music_file"] = audio_out
                             manifest.setdefault("music", {})
@@ -10192,7 +11447,7 @@ class PipelineWorker(QThread):
                 except Exception:
                     cfg = {}
                 try:
-                    rel = str(cfg.get("checkpoint_path") or "").strip()
+                    rel = str(cfg.get("checkpoint_path") or '').strip()
                     if rel:
                         p = (_root() / rel).resolve()
                         if p.exists():
@@ -10227,7 +11482,7 @@ class PipelineWorker(QThread):
                     "use_erg_tag": bool(cfg.get("use_erg_tag", True)),
                     "use_erg_lyric": bool(cfg.get("use_erg_lyric", False)),
                     "use_erg_diffusion": bool(cfg.get("use_erg_diffusion", True)),
-                    "oss_steps": ", ".join(str(x) for x in (cfg.get("oss_steps") or [])) if isinstance(cfg.get("oss_steps"), (list, tuple)) else str(cfg.get("oss_steps") or ""),
+                    "oss_steps": ", ".join(str(x) for x in (cfg.get("oss_steps") or [])) if isinstance(cfg.get("oss_steps"), (list, tuple)) else str(cfg.get("oss_steps") or ''),
                     "guidance_scale_text": float(cfg.get("guidance_scale_text", 5.0) or 5.0),
                     "guidance_scale_lyric": float(cfg.get("guidance_scale_lyric", 1.5) or 1.5),
                     "audio2audio_enable": False,
@@ -10267,16 +11522,16 @@ class PipelineWorker(QThread):
                     log_txt.append("CMD: " + " ".join(cmd))
                     log_txt.append("")
                     log_txt.append("--- STDOUT ---")
-                    log_txt.append(cp.stdout or "")
+                    log_txt.append(cp.stdout or '')
                     log_txt.append("")
                     log_txt.append("--- STDERR ---")
-                    log_txt.append(cp.stderr or "")
+                    log_txt.append(cp.stderr or '')
                     _safe_write_text(ace_log, "\n".join(log_txt).strip() + "\n")
                 except Exception:
                     pass
 
                 if cp.returncode != 0:
-                    tail = (cp.stderr or "")[-2000:] if (cp.stderr or "") else "Unknown error"
+                    tail = (cp.stderr or '')[-2000:] if (cp.stderr or '') else "Unknown error"
                     raise RuntimeError(f"ACE-Step runner failed (code {cp.returncode}):\n{tail}")
 
                 if not _audio_file_ok_lenient(audio_out):
@@ -10361,7 +11616,7 @@ class PipelineWorker(QThread):
                     return {}
 
                 # Pick default if missing/unknown
-                pid = (preset_id or "").strip()
+                pid = (preset_id or '').strip()
                 if "::" in pid:
                     gk, sk = pid.split("::", 1)
                 elif " / " in pid:
@@ -10391,7 +11646,7 @@ class PipelineWorker(QThread):
                 return _first_payload()
 
             def _ace15_toml_escape_str(s: str) -> str:
-                s = (s or "").replace("\r\n", "\n").replace("\r", "\n")
+                s = (s or '').replace("\r\n", "\n").replace("\r", "\n")
                 s = s.replace("\\", "\\\\").replace('"', '\\"')
                 s = s.replace("\n", "\\n")
                 return s
@@ -10437,7 +11692,7 @@ class PipelineWorker(QThread):
             def step_music_ace15_7a() -> None:
                 nonlocal music_file
                 # Only run if background music is enabled AND the user selected Ace Step 1.5.
-                if (not bool(getattr(self.job, "music_background", False))) or (str(getattr(self.job, "music_mode", "") or "") != "ace15"):
+                if (not bool(getattr(self.job, "music_background", False))) or (str(getattr(self.job, "music_mode", "") or '') != "ace15"):
                     raise RuntimeError("internal: step called but music mode is not ace15")
 
                 # Duration: prefer the computed pipeline duration if available; otherwise fall back to the user’s requested approx duration.
@@ -10466,7 +11721,7 @@ class PipelineWorker(QThread):
                     dur_s = 15.0
                 dur_s = float(max(5.0, min(480.0, dur_s)))
 
-                preset_key = str(getattr(self.job, "ace15_preset_id", "") or "").strip()
+                preset_key = str(getattr(self.job, "ace15_preset_id", "") or '').strip()
                 payload = _ace15_load_preset_payload(preset_key)
                 if not payload:
                     raise RuntimeError("Ace Step 1.5: presetmanager.json missing or empty. Create presets first in the Ace Step 1.5 tool.")
@@ -10499,7 +11754,7 @@ class PipelineWorker(QThread):
 
                 # Lyrics wiring
                 lyrics_enabled = bool(getattr(self.job, "ace15_lyrics_enabled", False))
-                lyrics_text = str(getattr(self.job, "ace15_lyrics_text", "") or "").strip()
+                lyrics_text = str(getattr(self.job, "ace15_lyrics_text", "") or '').strip()
 
                 # Seed handling (resume friendly)
                 manifest.setdefault("music", {})
@@ -10523,7 +11778,7 @@ class PipelineWorker(QThread):
                 if _file_ok(audio_out, 1024) and _file_ok(ace_meta, 10):
                     try:
                         prev = json.loads(_safe_read_text(ace_meta) or "{}")
-                        if str(prev.get("fingerprint") or "") == fingerprint:
+                        if str(prev.get("fingerprint") or '') == fingerprint:
                             manifest.setdefault("paths", {})["music_file"] = audio_out
                             manifest.setdefault("music", {})
                             manifest["music"].setdefault("ace15", {})
@@ -10554,7 +11809,7 @@ class PipelineWorker(QThread):
 
                 # Preset payload mapping (best-effort, keys vary by build)
                 # Caption / prompt
-                caption = str(payload.get("caption") or "").strip()
+                caption = str(payload.get("caption") or '').strip()
                 if caption:
                     cfg["caption"] = caption
 
@@ -10574,7 +11829,7 @@ class PipelineWorker(QThread):
                     cfg["keyscale"] = ks
 
                 # Backend and LM toggles
-                backend = str(payload.get("backend") or "").strip()
+                backend = str(payload.get("backend") or '').strip()
                 if backend:
                     cfg["backend"] = backend
 
@@ -10582,7 +11837,7 @@ class PipelineWorker(QThread):
                 cfg["thinking"] = bool(thinking)
 
                 # Negative prompt for LM guidance
-                neg = str(payload.get("lm_negative_prompt") or payload.get("negatives") or "").strip()
+                neg = str(payload.get("lm_negative_prompt") or payload.get("negatives") or '').strip()
                 if neg:
                     cfg["lm_negative_prompt"] = neg
 
@@ -10592,7 +11847,7 @@ class PipelineWorker(QThread):
                         cfg[k] = bool(payload.get(k))
 
                 # Model selections
-                main_sel = str(payload.get("main_model_path") or payload.get("main_model") or payload.get("dit_model") or "").strip()
+                main_sel = str(payload.get("main_model_path") or payload.get("main_model") or payload.get("dit_model") or '').strip()
                 if main_sel:
                     cfg["main_model_path"] = main_sel
                     # Important: some ACE builds route DiT selection through config_path (SFT fix)
@@ -10601,7 +11856,7 @@ class PipelineWorker(QThread):
                     cfg["main_model"] = main_sel
                     cfg["dit_model"] = main_sel
 
-                lm_sel = str(payload.get("lm_model_path") or payload.get("lm_model") or "").strip()
+                lm_sel = str(payload.get("lm_model_path") or payload.get("lm_model") or '').strip()
                 if lm_sel:
                     cfg["lm_model_path"] = lm_sel
                     cfg["lm_model"] = lm_sel
@@ -10614,7 +11869,7 @@ class PipelineWorker(QThread):
                 if gs and gs > 0.0:
                     cfg["guidance_scale"] = float(gs)
 
-                im = str(payload.get("infer_method") or payload.get("infer_method") or "").strip()
+                im = str(payload.get("infer_method") or payload.get("infer_method") or '').strip()
                 if im and im.lower() != "auto":
                     cfg["infer_method"] = im
 
@@ -10680,7 +11935,7 @@ class PipelineWorker(QThread):
                             except Exception:
                                 pass
                             raise RuntimeError("Cancelled by user.")
-                        out_lines.append((line or "").rstrip("\n"))
+                        out_lines.append((line or '').rstrip("\n"))
 
                         # Auto-continue for ACE-Step interactive draft prompt (it writes instruction.txt and waits for Enter).
                         if "Press Enter when ready to continue." in line:
@@ -10828,9 +12083,9 @@ class PipelineWorker(QThread):
 
 # Run ace generation as its own step (after assembly duration is locked, before audio mux)
             try:
-                if bool(getattr(self.job, "music_background", False)) and str(getattr(self.job, "music_mode", "") or "") == "ace":
+                if bool(getattr(self.job, "music_background", False)) and str(getattr(self.job, "music_mode", "") or '') == "ace":
                     _run(_ace_step_name, step_music_ace_7a, _tail_pct_fn(_ace_step_name))
-                if bool(getattr(self.job, "music_background", False)) and str(getattr(self.job, "music_mode", "") or "") == "ace15":
+                if bool(getattr(self.job, "music_background", False)) and str(getattr(self.job, "music_mode", "") or '') == "ace15":
                     _ace15_step_name = "Music (Ace Step 1.5)"
                     _run(_ace15_step_name, step_music_ace15_7a, _tail_pct_fn(_ace15_step_name))
             except Exception:
@@ -10862,7 +12117,7 @@ class PipelineWorker(QThread):
                 return env_dir / "bin" / "python"
 
             def _clean_lyrics_text(s: str) -> str:
-                t = (s or "").strip()
+                t = (s or '').strip()
                 # Strip common wrappers
                 t = t.replace("```", "").strip()
                 if t.lower().startswith("lyrics:"):
@@ -10896,8 +12151,8 @@ class PipelineWorker(QThread):
                     "spoken", "narration",
                 )
                 keep: list[str] = []
-                for ln in (t or "").splitlines():
-                    s = (ln or "").strip()
+                for ln in (t or '').splitlines():
+                    s = (ln or '').strip()
                     if not s:
                         continue
                     low = s.lower().strip()
@@ -10994,7 +12249,7 @@ class PipelineWorker(QThread):
                 own_story_brief = ""
                 if bool(_os_enabled_for_music):
                     try:
-                        _os_text = str((self.job.encoding or {}).get("own_storyline_text") or "").strip()
+                        _os_text = str((self.job.encoding or {}).get("own_storyline_text") or '').strip()
                     except Exception:
                         _os_text = ""
                     try:
@@ -11005,8 +12260,8 @@ class PipelineWorker(QThread):
                     try:
                         for p in list(_os_prompts)[:24]:
                             if isinstance(p, dict):
-                                idx = str(p.get("index") or "").strip()
-                                txt = str(p.get("text") or "").strip()
+                                idx = str(p.get("index") or '').strip()
+                                txt = str(p.get("text") or '').strip()
                             else:
                                 idx = ""
                                 txt = str(p).strip()
@@ -11031,10 +12286,10 @@ class PipelineWorker(QThread):
                     except Exception:
                         pass
 
-                title = str(plan_obj.get("title", "") or "").strip()
-                logline = str(plan_obj.get("logline", "") or "").strip()
-                setting = str(plan_obj.get("setting", "") or "").strip()
-                tone = str(plan_obj.get("tone", "") or "").strip()
+                title = str(plan_obj.get("title", "") or '').strip()
+                logline = str(plan_obj.get("logline", "") or '').strip()
+                setting = str(plan_obj.get("setting", "") or '').strip()
+                tone = str(plan_obj.get("tone", "") or '').strip()
                 beats = plan_obj.get("beats") or []
                 beats_lines = []
                 try:
@@ -11055,8 +12310,8 @@ class PipelineWorker(QThread):
 
                 # info: Chunk 10 side quest — HeartMula lyrics: use Own Storyline brief when available
                 try:
-                    if (own_story_brief or "").strip():
-                        about = (own_story_brief or "").strip()
+                    if (own_story_brief or '').strip():
+                        about = (own_story_brief or '').strip()
                 except Exception:
                     pass
 
@@ -11081,7 +12336,7 @@ class PipelineWorker(QThread):
                 try:
                     if _file_ok(meta_probe_path, 2):
                         _m = _safe_read_json(meta_probe_path) or {}
-                        _stored_story_hash = str(((_m.get("fingerprint") or {}).get("storyline_hash")) or "").strip()
+                        _stored_story_hash = str(((_m.get("fingerprint") or {}).get("storyline_hash")) or '').strip()
                 except Exception:
                     _stored_story_hash = ""
                 _reuse_lyrics_ok = False
@@ -11150,7 +12405,7 @@ class PipelineWorker(QThread):
                             parts.append("=== ATTEMPT 1 ===\n" + _safe_read_text(qwen_log_1).strip())
                         if _file_ok(qwen_log_2, 2):
                             parts.append("=== ATTEMPT 2 ===\n" + _safe_read_text(qwen_log_2).strip())
-                        parts.append("=== CLEANED LYRICS USED ===\n" + (lyrics_txt or "").strip())
+                        parts.append("=== CLEANED LYRICS USED ===\n" + (lyrics_txt or '').strip())
                         _safe_write_text(qwen_log_path, "\n\n".join(parts).strip() + "\n")
                     except Exception:
                         pass
@@ -11245,7 +12500,7 @@ class PipelineWorker(QThread):
                                     pass
                                 raise RuntimeError("Cancelled by user.")
                             lf.write(line)
-                            s = (line or "").strip()
+                            s = (line or '').strip()
                             if s.startswith("{") and s.endswith("}"):
                                 try:
                                     last_json = json.loads(s)
@@ -11255,7 +12510,7 @@ class PipelineWorker(QThread):
                         if rc != 0:
                             raise RuntimeError(f"HeartMula runner failed with code {rc}. See: {log_path}")
                         if isinstance(last_json, dict) and last_json.get("out_path"):
-                            out_path2 = str(last_json.get("out_path") or "").strip()
+                            out_path2 = str(last_json.get("out_path") or '').strip()
                             if out_path2:
                                 out_path = out_path2
                 except Exception:
@@ -11283,7 +12538,7 @@ class PipelineWorker(QThread):
                 })
 
             try:
-                if str(getattr(self.job, "music_mode", "") or "") == "heartmula":
+                if str(getattr(self.job, "music_mode", "") or '') == "heartmula":
                     # HeartMula should run even if Background music is off.
                     # Also force "silent" off and disable narration by default (music videoclip).
                     try:
@@ -11301,7 +12556,7 @@ class PipelineWorker(QThread):
             # Collect music path if available (already copied into job/audio earlier)
             music_file = ""
             try:
-                music_file = str((manifest.get("paths") or {}).get("music_file") or "").strip()
+                music_file = str((manifest.get("paths") or {}).get("music_file") or '').strip()
             except Exception:
                 music_file = ""
             if music_file and (not os.path.exists(music_file)):
@@ -11315,7 +12570,7 @@ class PipelineWorker(QThread):
                     "enabled": bool(self.job.narration_enabled),
                     "mode": str(self.job.narration_mode or "builtin"),
                     "voice": str(self.job.narration_voice or "ryan"),
-                    "sample_path": str(self.job.narration_sample_path or ""),
+                    "sample_path": str(self.job.narration_sample_path or ''),
                     "language": str(self.job.narration_language or "auto"),
                 })
             except Exception:
@@ -11323,7 +12578,7 @@ class PipelineWorker(QThread):
             try:
                 manifest["music"].update({
                     "enabled": bool(self.job.music_background and bool(music_file)),
-                    "file_path": str(music_file or ""),
+                    "file_path": str(music_file or ''),
                     "volume": int(self.job.music_volume),
                 })
             except Exception:
@@ -11348,8 +12603,8 @@ class PipelineWorker(QThread):
             def step_audio_mix() -> None:
                 nonlocal music_file
                 # Safety: if clone is selected but sample missing, block with a clear error
-                if bool(self.job.narration_enabled) and str(self.job.narration_mode or "") == "clone":
-                    sp = str(self.job.narration_sample_path or "").strip()
+                if bool(self.job.narration_enabled) and str(self.job.narration_mode or '') == "clone":
+                    sp = str(self.job.narration_sample_path or '').strip()
                     if not sp:
                         raise RuntimeError("Narration is set to 'add your own…' but no voice sample file was provided.")
                     # Copy sample into job/audio for resume-friendly stability
@@ -11382,7 +12637,7 @@ class PipelineWorker(QThread):
                         _reuse = _file_ok(_transcript_path, 2) and ((not _prev_fp) or (_prev_fp == _sample_fp))
                         _generated = False
                         if _reuse:
-                            if not (_safe_read_text(_transcript_path) or "").strip():
+                            if not (_safe_read_text(_transcript_path) or '').strip():
                                 _reuse = False
                         if not _reuse:
                             _generated = True
@@ -11400,7 +12655,7 @@ class PipelineWorker(QThread):
                                 device = "cpu"
                             compute_type = "float16" if device == "cuda" else "int8"
                             try:
-                                ffprobe_path = str(_wh._find_binary("ffprobe") or "")
+                                ffprobe_path = str(_wh._find_binary("ffprobe") or '')
                             except Exception:
                                 ffprobe_path = ""
                             out_temp = os.path.join(str(_root()), "output", "_temp")
@@ -11427,7 +12682,7 @@ class PipelineWorker(QThread):
                             except Exception:
                                 pass
                             cpw = subprocess.run(cmd_whisper, cwd=str(_root()), capture_output=True, text=True)
-                            out_all = (cpw.stdout or "") + ((("\n" + cpw.stderr) if cpw.stderr else ""))
+                            out_all = (cpw.stdout or '') + ((("\n" + cpw.stderr) if cpw.stderr else ""))
                             if cpw.returncode != 0:
                                 try:
                                     with open(tts_log, "a", encoding="utf-8", errors="replace") as lf:
@@ -11438,8 +12693,8 @@ class PipelineWorker(QThread):
                                     pass
                                 raise RuntimeError("Whisper transcription subprocess failed.")
                             last_result = None
-                            for _line in (out_all or "").splitlines():
-                                s = (_line or "").strip()
+                            for _line in (out_all or '').splitlines():
+                                s = (_line or '').strip()
                                 if not (s.startswith("{") and s.endswith("}")):
                                     continue
                                 try:
@@ -11457,7 +12712,7 @@ class PipelineWorker(QThread):
                                 except Exception:
                                     pass
                                 raise RuntimeError("Whisper transcription returned no result.")
-                            txt_tmp = str(last_result.get("text_path") or "").strip()
+                            txt_tmp = str(last_result.get("text_path") or '').strip()
                             if (not txt_tmp) or (not os.path.isfile(txt_tmp)):
                                 raise RuntimeError(f"Whisper missing transcript text: {txt_tmp}")
                             try:
@@ -11465,7 +12720,7 @@ class PipelineWorker(QThread):
                                 _shutil.copy2(txt_tmp, _transcript_path)
                             except Exception:
                                 _safe_write_text(_transcript_path, _safe_read_text(txt_tmp))
-                        _ref_text = (_safe_read_text(_transcript_path) or "").strip() if os.path.exists(_transcript_path) else ""
+                        _ref_text = (_safe_read_text(_transcript_path) or '').strip() if os.path.exists(_transcript_path) else ""
                         if not _ref_text:
                             raise RuntimeError("Whisper produced empty transcript for voice sample.")
                         manifest.setdefault("narration", {})
@@ -11533,12 +12788,12 @@ class PipelineWorker(QThread):
                     narration_text = ""
                     try:
                         if isinstance(narr_json_obj, dict):
-                            narration_text = str(narr_json_obj.get("narration_text") or "").strip()
+                            narration_text = str(narr_json_obj.get("narration_text") or '').strip()
                     except Exception:
                         narration_text = ""
                     if not narration_text:
                         # fallback: use raw text
-                        narration_text = (raw_text or "").strip()
+                        narration_text = (raw_text or '').strip()
                     if not narration_text:
                         raise RuntimeError("Narration script generation returned empty text.")
                     _safe_write_text(narration_txt, narration_text)
@@ -11564,14 +12819,14 @@ class PipelineWorker(QThread):
                     ref_text = ""
                     if mode == "clone":
                         try:
-                            ref_text = str((manifest.get("narration") or {}).get("ref_text") or "").strip()
+                            ref_text = str((manifest.get("narration") or {}).get("ref_text") or '').strip()
                         except Exception:
                             ref_text = ""
                         if not ref_text:
                             try:
                                 _tp = os.path.join(audio_dir, "voice_sample_transcript.txt")
                                 if os.path.exists(_tp):
-                                    ref_text = (_safe_read_text(_tp) or "").strip()
+                                    ref_text = (_safe_read_text(_tp) or '').strip()
                             except Exception:
                                 ref_text = ""
                     payload = {
@@ -11582,7 +12837,7 @@ class PipelineWorker(QThread):
                             "text": narr_text,
                             "language": str(self.job.narration_language or "auto"),
                             "speaker": str(self.job.narration_voice or "ryan"),
-                            "ref_audio_path": str(self.job.narration_sample_path or ""),
+                            "ref_audio_path": str(self.job.narration_sample_path or ''),
                             "common": {
                                 "output_name": f"narration_{self.job.job_id}",
                                 "add_timestamp": False,
@@ -11601,7 +12856,7 @@ class PipelineWorker(QThread):
                     with open(tts_log, "a", encoding="utf-8", errors="replace") as lf:
                         lf.write("[cmd] " + " ".join(cmd) + "\n")
                         cp = subprocess.run(cmd, cwd=str(root_dir), input=json.dumps(payload), text=True, capture_output=True)
-                        lf.write(cp.stdout or "")
+                        lf.write(cp.stdout or '')
                         if cp.stderr:
                             lf.write("\n[stderr]\n" + cp.stderr + "\n")
                     if cp.returncode != 0:
@@ -11610,7 +12865,7 @@ class PipelineWorker(QThread):
                     out_path = ""
                     try:
                         import re as _re
-                        stdout_text = (cp.stdout or "")
+                        stdout_text = (cp.stdout or '')
                         # Look for the last __RESULT__{...} block in stdout (worker prints it on success).
                         m_all = _re.findall(r"__RESULT__\s*(\{.*\})", stdout_text)
                         if m_all:
@@ -11746,7 +13001,7 @@ class PipelineWorker(QThread):
                 # Decide audio sources:
                 # Decide audio sources:
                 # HeartMula (and any explicit music mode) must include music even if the Background music toggle is off.
-                force_music = str(getattr(self.job, "music_mode", "") or "").strip() in ("ace", "ace15", "heartmula", "file")
+                force_music = str(getattr(self.job, "music_mode", "") or '').strip() in ("ace", "ace15", "heartmula", "file")
                 have_music = bool((not bool(getattr(self.job, "silent", False))) and bool(music_file) and os.path.exists(music_file) and (bool(getattr(self.job, "music_background", False)) or force_music))
                 have_narr = bool(narr_wav_ready and os.path.exists(narration_wav))
 
@@ -11803,11 +13058,11 @@ class PipelineWorker(QThread):
                         music_dur = 0.0
                     need_loop = (music_dur <= 0.01) or ((music_dur + 1.0) < float(dur))
 
-                    if need_loop and str(getattr(self.job, "music_mode", "") or "").strip() == "heartmula":
+                    if need_loop and str(getattr(self.job, "music_mode", "") or '').strip() == "heartmula":
                         try:
                             step_music_heartmula_7b()
                             # Reload path from manifest (HeartMula writes it there)
-                            _mf2 = str((manifest.get("paths") or {}).get("music_file") or "").strip()
+                            _mf2 = str((manifest.get("paths") or {}).get("music_file") or '').strip()
                             if _mf2 and os.path.exists(_mf2):
                                 music_file = _mf2
                                 try:
@@ -11847,7 +13102,7 @@ class PipelineWorker(QThread):
                 with open(mix_log, "w", encoding="utf-8", errors="replace") as lf:
                     lf.write("[cmd] " + " ".join([str(x) for x in cmd]) + "\n")
                     cp = subprocess.run(cmd, cwd=str(_root()), capture_output=True, text=True)
-                    lf.write(cp.stdout or "")
+                    lf.write(cp.stdout or '')
                     if cp.stderr:
                         lf.write("\n[stderr]\n" + cp.stderr + "\n")
                 if cp.returncode != 0 or (not os.path.exists(final_cut_mp4)):
@@ -11988,7 +13243,7 @@ class PipelineWorker(QThread):
                         with open(mix_log2, "w", encoding="utf-8", errors="replace") as lf:
                             lf.write("[cmd] " + " ".join([str(x) for x in cmd]) + "\n")
                             cp = subprocess.run(cmd, cwd=str(_root()), capture_output=True, text=True)
-                            lf.write(cp.stdout or "")
+                            lf.write(cp.stdout or '')
                             if cp.stderr:
                                 lf.write("\n[stderr]\n" + cp.stderr + "\n")
                         if cp.returncode == 0 and _file_ok(mix_audio_path, 1024):
@@ -12577,9 +13832,9 @@ class PipelineWorker(QThread):
                     windows[nm] = (int(a), int(max(a, b)))
                 return targets, windows
 
-            _pre_up = _peek_planner_upscale_settings(str(self.out_dir or ""))
+            _pre_up = _peek_planner_upscale_settings(str(self.out_dir or ''))
             _pre_want_up = bool((_pre_up or {}).get("enabled", False))
-            _pre_have_engine = bool(str((_pre_up or {}).get("engine_key") or "").strip())
+            _pre_have_engine = bool(str((_pre_up or {}).get("engine_key") or '').strip())
             _pre_want_interp = bool((_pre_up or {}).get("interpolate_60fps_fast", False))
 
             _tail_steps: List[str] = []
@@ -12588,12 +13843,12 @@ class PipelineWorker(QThread):
             else:
                 _tail_steps.append(str(_assemble_step_name))
                 try:
-                    if bool(getattr(self.job, "music_background", False)) and str(getattr(self.job, "music_mode", "") or "") == "ace":
+                    if bool(getattr(self.job, "music_background", False)) and str(getattr(self.job, "music_mode", "") or '') == "ace":
                         _tail_steps.append(str(_ace_step_name))
                 except Exception:
                     pass
                 try:
-                    if str(getattr(self.job, "music_mode", "") or "") == "heartmula":
+                    if str(getattr(self.job, "music_mode", "") or '') == "heartmula":
                         _tail_steps.append(str(_heartmula_step_name))
                 except Exception:
                     pass
@@ -12726,7 +13981,7 @@ class PipelineWorker(QThread):
                     return {}
 
             def _infer_model_scale(engine_label: str, model_text: str) -> int:
-                s = (model_text or "").lower().replace(" ", "")
+                s = (model_text or '').lower().replace(" ", "")
                 # common patterns: x2 / 2x / _x4 / -x4-
                 for pat in (r"x2", r"2x"):
                     if pat in s:
@@ -12736,7 +13991,7 @@ class PipelineWorker(QThread):
                         return 4
                 # Some engines imply 4× defaults; keep conservative and assume 2× when unknown
                 # (we'll still resize to target factor afterward).
-                lab = (engine_label or "").lower()
+                lab = (engine_label or '').lower()
                 if "4x" in lab or "x4" in lab:
                     return 4
                 return 2
@@ -12839,7 +14094,7 @@ class PipelineWorker(QThread):
                             # Non-standard truthy result
                             if res is None:
                                 # Some runners return None on success; treat as success if output exists.
-                                outp = str(job_dict.get("output_path") or "")
+                                outp = str(job_dict.get("output_path") or '')
                                 if outp and os.path.exists(outp) and os.path.getsize(outp) > 1024:
                                     return True
                         except TypeError:
@@ -12852,7 +14107,7 @@ class PipelineWorker(QThread):
             def _run_ncnn_folder_engine(engine_exe: str, engine_label: str, model_text: str, in_dir: str, out_dir2: str, scale: int, log_path: str) -> None:
                 # Fallback runner for the common NCNN Vulkan CLIs (Real-ESRGAN / RealSR / SRMD family).
                 # This is used only if helpers/upsc.py doesn't expose a usable run API.
-                exe = str(engine_exe or "")
+                exe = str(engine_exe or '')
                 if not exe:
                     raise RuntimeError("Upscale engine exe is empty.")
                 if not os.path.exists(exe):
@@ -12878,25 +14133,25 @@ class PipelineWorker(QThread):
                     _safe_write_text(
                         log_path,
                         "[cmd] " + " ".join([str(x) for x in args]) + "\n\n"
-                        + "--- STDOUT ---\n" + (cp.stdout or "") + "\n\n"
-                        + "--- STDERR ---\n" + (cp.stderr or "") + "\n"
+                        + "--- STDOUT ---\n" + (cp.stdout or '') + "\n\n"
+                        + "--- STDERR ---\n" + (cp.stderr or '') + "\n"
                     )
                 except Exception:
                     pass
                 if cp.returncode != 0:
-                    tail = (cp.stderr or "")[-2000:] if (cp.stderr or "") else "Unknown error"
+                    tail = (cp.stderr or '')[-2000:] if (cp.stderr or '') else "Unknown error"
                     raise RuntimeError(f"Upscale engine failed (exit={cp.returncode}).\n{tail}")
 
             def step_upscale_final_cut_9b2() -> None:
                 # Always retain raw final_cut path
                 manifest.setdefault("paths", {})["final_cut_path"] = final_cut_mp4
 
-                job_dir2 = str(self.out_dir or "")
+                job_dir2 = str(self.out_dir or '')
                 settings = _read_planner_upscale_settings(job_dir2)
                 if not bool(settings.get("enabled", False)):
                     raise RuntimeError("internal: called but planner upscaling is disabled")
 
-                engine_key = str(settings.get("engine_key") or "").strip().lower()
+                engine_key = str(settings.get("engine_key") or '').strip().lower()
 
                 # Input must be the final_cut only (single MP4)
                 if not _file_ok(final_cut_mp4, 1024):
@@ -12931,7 +14186,7 @@ class PipelineWorker(QThread):
                         for st in (src_meta.get("streams") or []):
                             if isinstance(st, dict) and st.get("codec_type") == "video":
                                 r = st.get("avg_frame_rate") or st.get("r_frame_rate") or ""
-                                rr = str(r or "")
+                                rr = str(r or '')
                                 if rr and "/" in rr:
                                     a, b = rr.split("/", 1)
                                     fps = float(a) / float(b) if float(b) != 0.0 else float(a)
@@ -12971,12 +14226,12 @@ class PipelineWorker(QThread):
                         _safe_write_text(
                             log_up,
                             "[extract_cmd] " + " ".join([str(x) for x in cmd_extract]) + "\n\n"
-                            + (cp0.stderr or "") + "\n"
+                            + (cp0.stderr or '') + "\n"
                         )
                     except Exception:
                         pass
                     if cp0.returncode != 0:
-                        tail = (cp0.stderr or cp0.stdout or "")[-2000:]
+                        tail = (cp0.stderr or cp0.stdout or '')[-2000:]
                         raise RuntimeError(f"ffmpeg frame extract failed (exit={cp0.returncode}).\n{tail}")
 
                     # Run Real-ESRGAN on folder
@@ -12995,15 +14250,15 @@ class PipelineWorker(QThread):
                     try:
                         _safe_write_text(
                             log_up,
-                            (_safe_read_text(log_up) or "")
+                            (_safe_read_text(log_up) or '')
                             + "\n\n[upscale_cmd] " + " ".join([str(x) for x in cmd_up]) + "\n\n"
-                            + "--- STDOUT ---\n" + (cp1.stdout or "") + "\n\n"
-                            + "--- STDERR ---\n" + (cp1.stderr or "") + "\n"
+                            + "--- STDOUT ---\n" + (cp1.stdout or '') + "\n\n"
+                            + "--- STDERR ---\n" + (cp1.stderr or '') + "\n"
                         )
                     except Exception:
                         pass
                     if cp1.returncode != 0:
-                        tail = (cp1.stderr or cp1.stdout or "")[-4000:]
+                        tail = (cp1.stderr or cp1.stdout or '')[-4000:]
                         raise RuntimeError(f"RealESRGAN upscaler failed (exit={cp1.returncode}).\n{tail}")
 
                     # Re-encode to MP4 (copy audio when possible)
@@ -13042,24 +14297,24 @@ class PipelineWorker(QThread):
                         try:
                             _safe_write_text(
                                 log_up,
-                                (_safe_read_text(log_up) or "")
+                                (_safe_read_text(log_up) or '')
                                 + "\n\n[encode_cmd] " + " ".join([str(x) for x in cmd_enc]) + "\n"
-                                + (cp2.stderr or "") + "\n\n"
+                                + (cp2.stderr or '') + "\n\n"
                                 + "[encode_fallback_cmd] " + " ".join([str(x) for x in cmd_enc2]) + "\n"
-                                + (cp3.stderr or "") + "\n"
+                                + (cp3.stderr or '') + "\n"
                             )
                         except Exception:
                             pass
                         if cp3.returncode != 0 or (not _file_ok(tmp_out, 1024)):
-                            tail = (cp3.stderr or cp2.stderr or "")[-4000:]
+                            tail = (cp3.stderr or cp2.stderr or '')[-4000:]
                             raise RuntimeError(f"ffmpeg encode failed (exit={cp3.returncode}).\n{tail}")
                     else:
                         try:
                             _safe_write_text(
                                 log_up,
-                                (_safe_read_text(log_up) or "")
+                                (_safe_read_text(log_up) or '')
                                 + "\n\n[encode_cmd] " + " ".join([str(x) for x in cmd_enc]) + "\n"
-                                + (cp2.stderr or "") + "\n"
+                                + (cp2.stderr or '') + "\n"
                             )
                         except Exception:
                             pass
@@ -13133,7 +14388,7 @@ class PipelineWorker(QThread):
                     # Make ffmpeg discoverable (presets/bin)
                     env = dict(os.environ)
                     try:
-                        env["PATH"] = str(os.path.join(str(_root()), "presets", "bin")) + os.pathsep + str(env.get("PATH") or "")
+                        env["PATH"] = str(os.path.join(str(_root()), "presets", "bin")) + os.pathsep + str(env.get("PATH") or '')
                     except Exception:
                         pass
 
@@ -13185,13 +14440,13 @@ class PipelineWorker(QThread):
                         _safe_write_text(
                             log_up,
                             "[cmd] " + " ".join([str(x) for x in cmd]) + "\n\n"
-                            + "--- STDOUT ---\n" + (cp.stdout or "") + "\n\n"
-                            + "--- STDERR ---\n" + (cp.stderr or "") + "\n"
+                            + "--- STDOUT ---\n" + (cp.stdout or '') + "\n\n"
+                            + "--- STDERR ---\n" + (cp.stderr or '') + "\n"
                         )
                     except Exception:
                         pass
                     if cp.returncode != 0:
-                        tail = (cp.stderr or cp.stdout or "")[-4000:]
+                        tail = (cp.stderr or cp.stdout or '')[-4000:]
                         raise RuntimeError(f"SeedVR2 failed (exit={cp.returncode}).\n{tail}")
 
                     if not _file_ok(out_up, 1024):
@@ -13218,7 +14473,7 @@ class PipelineWorker(QThread):
                             ]
                             cp2 = subprocess.run(mux_cmd, cwd=str(_root()), capture_output=True, text=True, env=env)
                             try:
-                                _safe_write_text(log_up, (_safe_read_text(log_up) or "") + "\n\n[audio_remux] " + " ".join(mux_cmd) + "\n" + (cp2.stderr or ""))
+                                _safe_write_text(log_up, (_safe_read_text(log_up) or '') + "\n\n[audio_remux] " + " ".join(mux_cmd) + "\n" + (cp2.stderr or ''))
                             except Exception:
                                 pass
                             if cp2.returncode == 0 and _file_ok(tmp_mux, 1024):
@@ -13273,7 +14528,7 @@ class PipelineWorker(QThread):
                         for st in (src_meta.get("streams") or []):
                             if isinstance(st, dict) and st.get("codec_type") == "video":
                                 r = st.get("avg_frame_rate") or st.get("r_frame_rate") or ""
-                                rr = str(r or "")
+                                rr = str(r or '')
                                 if rr and "/" in rr:
                                     a, b = rr.split("/", 1)
                                     fps = float(a) / float(b) if float(b) != 0.0 else float(a)
@@ -13313,12 +14568,12 @@ class PipelineWorker(QThread):
                         _safe_write_text(
                             log_up,
                             "[extract_cmd] " + " ".join([str(x) for x in cmd_extract]) + "\n\n"
-                            + (cp0.stderr or "") + "\n"
+                            + (cp0.stderr or '') + "\n"
                         )
                     except Exception:
                         pass
                     if cp0.returncode != 0:
-                        tail = (cp0.stderr or cp0.stdout or "")[-2000:]
+                        tail = (cp0.stderr or cp0.stdout or '')[-2000:]
                         raise RuntimeError(f"ffmpeg frame extract failed (exit={cp0.returncode}).\n{tail}")
 
                     # Run Real-ESRGAN on folder
@@ -13337,15 +14592,15 @@ class PipelineWorker(QThread):
                     try:
                         _safe_write_text(
                             log_up,
-                            (_safe_read_text(log_up) or "")
+                            (_safe_read_text(log_up) or '')
                             + "\n\n[upscale_cmd] " + " ".join([str(x) for x in cmd_up]) + "\n\n"
-                            + "--- STDOUT ---\n" + (cp1.stdout or "") + "\n\n"
-                            + "--- STDERR ---\n" + (cp1.stderr or "") + "\n"
+                            + "--- STDOUT ---\n" + (cp1.stdout or '') + "\n\n"
+                            + "--- STDERR ---\n" + (cp1.stderr or '') + "\n"
                         )
                     except Exception:
                         pass
                     if cp1.returncode != 0:
-                        tail = (cp1.stderr or cp1.stdout or "")[-4000:]
+                        tail = (cp1.stderr or cp1.stdout or '')[-4000:]
                         raise RuntimeError(f"Anime upscaler failed (exit={cp1.returncode}).\n{tail}")
 
                     # Re-encode to MP4 (copy audio when possible)
@@ -13384,24 +14639,24 @@ class PipelineWorker(QThread):
                         try:
                             _safe_write_text(
                                 log_up,
-                                (_safe_read_text(log_up) or "")
+                                (_safe_read_text(log_up) or '')
                                 + "\n\n[encode_cmd] " + " ".join([str(x) for x in cmd_enc]) + "\n"
-                                + (cp2.stderr or "") + "\n\n"
+                                + (cp2.stderr or '') + "\n\n"
                                 + "[encode_fallback_cmd] " + " ".join([str(x) for x in cmd_enc2]) + "\n"
-                                + (cp3.stderr or "") + "\n"
+                                + (cp3.stderr or '') + "\n"
                             )
                         except Exception:
                             pass
                         if cp3.returncode != 0 or (not _file_ok(tmp_out, 1024)):
-                            tail = (cp3.stderr or cp2.stderr or "")[-4000:]
+                            tail = (cp3.stderr or cp2.stderr or '')[-4000:]
                             raise RuntimeError(f"ffmpeg encode failed (exit={cp3.returncode}).\n{tail}")
                     else:
                         try:
                             _safe_write_text(
                                 log_up,
-                                (_safe_read_text(log_up) or "")
+                                (_safe_read_text(log_up) or '')
                                 + "\n\n[encode_cmd] " + " ".join([str(x) for x in cmd_enc]) + "\n"
-                                + (cp2.stderr or "") + "\n"
+                                + (cp2.stderr or '') + "\n"
                             )
                         except Exception:
                             pass
@@ -13515,7 +14770,7 @@ class PipelineWorker(QThread):
                 ]
                 cp = subprocess.run(cmd, cwd=str(_root()), capture_output=True, text=True)
                 if cp.returncode != 0 or (not _file_ok(tmp_out, 1024)):
-                    tail = (cp.stderr or "")[-2000:] if (cp.stderr or "") else "Unknown error"
+                    tail = (cp.stderr or '')[-2000:] if (cp.stderr or '') else "Unknown error"
                     raise RuntimeError(f"Audio fade failed (exit={cp.returncode}).\n{tail}")
 
                 # Replace final_cut.mp4 atomically
@@ -13533,7 +14788,7 @@ class PipelineWorker(QThread):
             try:
                 _cur_sha1 = _sha1_file(final_cut_mp4) if os.path.exists(final_cut_mp4) else ""
                 _fade_prev = (manifest.get("steps") or {}).get(_fade_step_name) or {}
-                if _fade_prev.get("status") == "done" and str(_fade_prev.get("post_sha1") or "") == str(_cur_sha1 or "") and _file_ok(final_cut_mp4, 1024):
+                if _fade_prev.get("status") == "done" and str(_fade_prev.get("post_sha1") or '') == str(_cur_sha1 or '') and _file_ok(final_cut_mp4, 1024):
                     _skip(_fade_step_name, "already applied")
                 else:
                     # Determine whether there is audio; if none, skip without failing.
@@ -13557,11 +14812,11 @@ class PipelineWorker(QThread):
                             _post_sha1 = _sha1_file(final_cut_mp4) if os.path.exists(final_cut_mp4) else ""
                             srec = (manifest.get("steps") or {}).get(_fade_step_name) or {}
                             srec["fingerprint"] = _sha1_text(json.dumps({
-                                "pre_sha1": str(_pre_sha1 or ""),
+                                "pre_sha1": str(_pre_sha1 or ''),
                                 "fade_sec": 3.0,
                                 "ffmpeg": str(ffmpeg2),
                             }, sort_keys=True))
-                            srec["post_sha1"] = str(_post_sha1 or "")
+                            srec["post_sha1"] = str(_post_sha1 or '')
                             srec["ts"] = time.time()
                             manifest.setdefault("steps", {})[_fade_step_name] = srec
                             _safe_write_json(manifest_path, manifest)
@@ -13581,15 +14836,15 @@ class PipelineWorker(QThread):
                 _safe_write_json(manifest_path, manifest)
             except Exception:
                 pass
-            _up_settings = _read_planner_upscale_settings(str(self.out_dir or ""))
+            _up_settings = _read_planner_upscale_settings(str(self.out_dir or ''))
             _want_up = bool(_up_settings.get("enabled", False))
-            _have_engine = bool(str(_up_settings.get("engine_key") or "").strip())
+            _have_engine = bool(str(_up_settings.get("engine_key") or '').strip())
 
             _model_scale = 0
             try:
                 # Only meaningful for legacy NCNN scale-based upscalers; SeedVR2 uses absolute resolution.
-                if _have_engine and str(_up_settings.get("engine_key") or "").strip().lower() not in ("seedvr2",):
-                    _model_scale = int(_infer_model_scale(str(_up_settings.get("engine_label") or ""), str(_up_settings.get("model_text") or "")))
+                if _have_engine and str(_up_settings.get("engine_key") or '').strip().lower() not in ("seedvr2",):
+                    _model_scale = int(_infer_model_scale(str(_up_settings.get("engine_label") or ''), str(_up_settings.get("model_text") or '')))
             except Exception:
                 _model_scale = 0
 
@@ -13597,19 +14852,19 @@ class PipelineWorker(QThread):
             _up_fp = _sha1_text(json.dumps({
                 "input_sha1": _sha1_file(final_cut_mp4) if os.path.exists(final_cut_mp4) else "",
                 "enabled": bool(_want_up),
-                "engine_key": str(_up_settings.get("engine_key") or ""),
+                "engine_key": str(_up_settings.get("engine_key") or ''),
                 # legacy fields kept for compatibility / debugging
-                "engine_label": str(_up_settings.get("engine_label") or ""),
-                "engine_exe": str(_up_settings.get("engine_exe") or ""),
-                "model_text": str(_up_settings.get("model_text") or ""),
+                "engine_label": str(_up_settings.get("engine_label") or ''),
+                "engine_exe": str(_up_settings.get("engine_exe") or ''),
+                "model_text": str(_up_settings.get("model_text") or ''),
                 # SeedVR2 knobs
                 "seedvr2_resolution": int(_up_settings.get("seedvr2_resolution") or 0),
                 "seedvr2_temporal_overlap": int(_up_settings.get("seedvr2_temporal_overlap") or 0),
                 "seedvr2_batch_size": int(_up_settings.get("seedvr2_batch_size") or 0),
                 "seedvr2_chunk_size": int(_up_settings.get("seedvr2_chunk_size") or 0),
-                "seedvr2_color_correction": str(_up_settings.get("seedvr2_color_correction") or ""),
-                "seedvr2_attention_mode": str(_up_settings.get("seedvr2_attention_mode") or ""),
-                "seedvr2_dit_model": str(_up_settings.get("seedvr2_dit_model") or ""),
+                "seedvr2_color_correction": str(_up_settings.get("seedvr2_color_correction") or ''),
+                "seedvr2_attention_mode": str(_up_settings.get("seedvr2_attention_mode") or ''),
+                "seedvr2_dit_model": str(_up_settings.get("seedvr2_dit_model") or ''),
                 # legacy scale info
                 "model_scale": int(_model_scale),
                 "ffmpeg": str(ffmpeg2),
@@ -13741,7 +14996,7 @@ class PipelineWorker(QThread):
                 _safe_write_json(manifest_path, manifest)
 
             # Apply interpolation if enabled
-            _up_settings2 = _read_planner_upscale_settings(str(self.out_dir or ""))
+            _up_settings2 = _read_planner_upscale_settings(str(self.out_dir or ''))
             _want_interp = bool((_up_settings2 or {}).get("interpolate_60fps_fast", False))
 
             if _want_interp:
@@ -13763,8 +15018,8 @@ class PipelineWorker(QThread):
                 _interp_fp = _sha1_text(json.dumps(_interp_meta, sort_keys=True))
 
                 srec = (manifest.get("steps") or {}).get(_interp_step_name) or {}
-                prev_fp = str(srec.get("fingerprint") or "")
-                if _file_ok(_interp_out, 1024) and (prev_fp == _interp_fp) and (str(srec.get("status") or "") == "done"):
+                prev_fp = str(srec.get("fingerprint") or '')
+                if _file_ok(_interp_out, 1024) and (prev_fp == _interp_fp) and (str(srec.get("status") or '') == "done"):
                     # Ensure pointers reflect the interpolated output
                     try:
                         manifest.setdefault("paths", {})["final_interpolated_path"] = _interp_out
@@ -13797,13 +15052,13 @@ class PipelineWorker(QThread):
 
             # Gate: only if narration and/or lyrics is enabled.
             try:
-                _gate_ok = bool(getattr(self.job, "narration_enabled", False)) or bool(getattr(self.job, "ace15_lyrics_enabled", False)) or (str(_lyrics_mode or "").strip().lower() == "lyrics")
+                _gate_ok = bool(getattr(self.job, "narration_enabled", False)) or bool(getattr(self.job, "ace15_lyrics_enabled", False)) or (str(_lyrics_mode or '').strip().lower() == "lyrics")
             except Exception:
                 _gate_ok = False
 
             def _step_bake_subtitles() -> None:
                 # Determine source video
-                src_video = str((manifest.get("paths") or {}).get("final_video") or final_video or "")
+                src_video = str((manifest.get("paths") or {}).get("final_video") or final_video or '')
                 if not src_video or (not os.path.isfile(src_video)):
                     raise RuntimeError(f"Bake subtitles: missing final video: {src_video}")
 
@@ -13886,7 +15141,7 @@ class PipelineWorker(QThread):
                             except Exception:
                                 pass
                             raise RuntimeError("Cancelled by user.")
-                        line = (line or "").strip()
+                        line = (line or '').strip()
                         if not line:
                             continue
                         if line.startswith("{") and line.endswith("}"):
@@ -13908,7 +15163,7 @@ class PipelineWorker(QThread):
                 if not last_result:
                     raise RuntimeError("Whisper runner returned no result.")
 
-                seg_json_tmp = str(last_result.get("segments_json") or "")
+                seg_json_tmp = str(last_result.get("segments_json") or '')
                 if not seg_json_tmp or not os.path.isfile(seg_json_tmp):
                     raise RuntimeError(f"Whisper missing segments JSON: {seg_json_tmp}")
 
@@ -13929,7 +15184,7 @@ class PipelineWorker(QThread):
                         segments.append(_wh.WhisperSegment(
                             start=float(s.get("start", 0.0) or 0.0),
                             end=float(s.get("end", 0.0) or 0.0),
-                            text=str(s.get("text", "") or "").strip(),
+                            text=str(s.get("text", "") or '').strip(),
                         ))
                     except Exception:
                         continue
@@ -13974,7 +15229,7 @@ class PipelineWorker(QThread):
                 ]
                 cp = subprocess.run(args, cwd=str(_root()), capture_output=True, text=True)
                 if cp.returncode != 0 or (not _file_ok(out_sub, 1024)):
-                    raise RuntimeError((cp.stderr or cp.stdout or "").strip() or "ffmpeg failed to bake subtitles")
+                    raise RuntimeError((cp.stderr or cp.stdout or '').strip() or "ffmpeg failed to bake subtitles")
 
                 # Update manifest pointers
                 manifest.setdefault("paths", {})["final_video_before_subtitles"] = str(src_video)
@@ -13991,7 +15246,7 @@ class PipelineWorker(QThread):
             else:
                 # Fingerprint: source video hash + srt settings
                 try:
-                    src_video = str((manifest.get("paths") or {}).get("final_video") or final_video or "")
+                    src_video = str((manifest.get("paths") or {}).get("final_video") or final_video or '')
                     src_sha1 = _sha1_file(src_video) if src_video and os.path.isfile(src_video) else ""
                 except Exception:
                     src_sha1 = ""
@@ -14001,7 +15256,7 @@ class PipelineWorker(QThread):
                 except Exception:
                     _bake_fp = ""
                 srec = (manifest.get("steps") or {}).get(_bake_step_name) or {}
-                if _file_ok(str((manifest.get("paths") or {}).get("final_subtitled_path") or ""), 1024) and (str(srec.get("fingerprint") or "") == _bake_fp) and (str(srec.get("status") or "") == "done"):
+                if _file_ok(str((manifest.get("paths") or {}).get("final_subtitled_path") or ''), 1024) and (str(srec.get("fingerprint") or '') == _bake_fp) and (str(srec.get("status") or '') == "done"):
                     _skip(_bake_step_name, "already up-to-date")
                 else:
                     _run(_bake_step_name, _step_bake_subtitles, 99)
@@ -14164,7 +15419,7 @@ class _FinalVideoPreviewDialog(QDialog):
         except Exception:
             pass
 
-        self._video_path = str(video_path or "")
+        self._video_path = str(video_path or '')
         self._dragging = False
 
         lay = QVBoxLayout(self)
@@ -14303,7 +15558,7 @@ class _FinalVideoPreviewDialog(QDialog):
 
 def _is_video_path(p: str) -> bool:
     try:
-        ext = os.path.splitext(str(p or "").lower())[1]
+        ext = os.path.splitext(str(p or '').lower())[1]
     except Exception:
         ext = ""
     return ext in (".mp4", ".mov", ".mkv", ".webm", ".avi", ".m4v", ".gif")
@@ -14321,7 +15576,7 @@ class _HeaderPreviewDialog(QDialog):
         except Exception:
             pass
 
-        self._path = str(media_path or "")
+        self._path = str(media_path or '')
         self._is_video = _is_video_path(self._path)
 
         lay = QVBoxLayout(self)
@@ -14648,7 +15903,7 @@ class PlannerPane(QWidget):
                 _LOGGER.log_job(job.job_id, "Generate clicked")
             except Exception:
                 pass
-            output_base = (self.out_dir_edit.text() or "").strip() or self._default_out_dir()
+            output_base = (self.out_dir_edit.text() or '').strip() or self._default_out_dir()
             output_base = _abspath_from_root(output_base)
             # Human-friendly folder naming: <slug>_<NNN>
             title = _auto_title_from_prompt(job.prompt)
@@ -15397,7 +16652,7 @@ If the planner sees a marker like [02] or (02), it becomes the next image prompt
 
         try:
             s = _load_planner_settings()
-            self.own_storyline_edit.setPlainText(str(s.get("own_storyline_text", "") or ""))
+            self.own_storyline_edit.setPlainText(str(s.get("own_storyline_text", "") or ''))
         except Exception:
             pass
         try:
@@ -15470,10 +16725,10 @@ If the planner sees a marker like [02] or (02), it becomes the next image prompt
 
         try:
             s = _load_planner_settings()
-            self.own_char_1.setPlainText(str(s.get("own_character_1_prompt", "") or ""))
-            self.own_char_2.setPlainText(str(s.get("own_character_2_prompt", "") or ""))
-            self.own_char_1_codeword.setText(str(s.get("own_character_1_codeword", "") or ""))
-            self.own_char_2_codeword.setText(str(s.get("own_character_2_codeword", "") or ""))
+            self.own_char_1.setPlainText(str(s.get("own_character_1_prompt", "") or ''))
+            self.own_char_2.setPlainText(str(s.get("own_character_2_prompt", "") or ''))
+            self.own_char_1_codeword.setText(str(s.get("own_character_1_codeword", "") or ''))
+            self.own_char_2_codeword.setText(str(s.get("own_character_2_codeword", "") or ''))
         except Exception:
             pass
 
@@ -15535,6 +16790,7 @@ If the planner sees a marker like [02] or (02), it becomes the next image prompt
             "Z-image Turbo (FP16 High VRAM)",
             "Z-image Turbo (GGUF Low VRAM)",
             "Flux Klein (Very Fast, low vram, no NSFW).",
+            "Flux Klein 9B (Higher quality, a little slower).",
             "More (Maybe later)",
         ])
         # Default text-to-image engine: Z-image Turbo (GGUF Low VRAM)
@@ -15562,8 +16818,8 @@ If the planner sees a marker like [02] or (02), it becomes the next image prompt
         grid.addWidget(self.cmb_gen_quality, 2, 1)
 
         def _refresh_gen_quality() -> None:
-            vm = (self.cmb_video_model.currentText() or "").lower()
-            cur = (self.cmb_gen_quality.currentText() or "").strip()
+            vm = (self.cmb_video_model.currentText() or '').lower()
+            cur = (self.cmb_gen_quality.currentText() or '').strip()
             self.cmb_gen_quality.blockSignals(True)
             self.cmb_gen_quality.clear()
             if "wan" in vm and "2.2" in vm:
@@ -15708,7 +16964,7 @@ If the planner sees a marker like [02] or (02), it becomes the next image prompt
         try:
             return os.path.join(str(project_dir), _PLANNER_UPSCALE_JSON_NAME)
         except Exception:
-            return str(project_dir or "")
+            return str(project_dir or '')
 
     def _read_upscale_json(self, project_dir: str) -> dict:
         p = self._upscale_json_path(project_dir)
@@ -15768,7 +17024,7 @@ If the planner sees a marker like [02] or (02), it becomes the next image prompt
 
         Returns (model_text_list, optional_model_data_template).
         """
-        lab = (engine_label or "").strip().lower()
+        lab = (engine_label or '').strip().lower()
 
         try:
             from helpers import upsc as _upsc  # type: ignore
@@ -16021,7 +17277,7 @@ If the planner sees a marker like [02] or (02), it becomes the next image prompt
             except Exception:
                 pass
             try:
-                proj = str(getattr(self, "_active_project_dir", "") or "")
+                proj = str(getattr(self, "_active_project_dir", "") or '')
                 if proj:
                     self._persist_upscale_settings_for_project(proj, force_write=True)
             except Exception:
@@ -16053,7 +17309,7 @@ If the planner sees a marker like [02] or (02), it becomes the next image prompt
         # Persist on any SeedVR2 setting change
         def _persist_seedvr2() -> None:
             try:
-                proj = str(getattr(self, "_active_project_dir", "") or "")
+                proj = str(getattr(self, "_active_project_dir", "") or '')
                 if proj:
                     self._persist_upscale_settings_for_project(proj, force_write=True)
             except Exception:
@@ -16197,7 +17453,7 @@ If the planner sees a marker like [02] or (02), it becomes the next image prompt
 
     def _refresh_upscale_models_for_current_engine(self) -> None:
         try:
-            lab = str(self.cmb_planner_upscale_engine.currentText() or "")
+            lab = str(self.cmb_planner_upscale_engine.currentText() or '')
         except Exception:
             lab = ""
         if not lab:
@@ -16218,7 +17474,7 @@ If the planner sees a marker like [02] or (02), it becomes the next image prompt
 
         cur = ""
         try:
-            cur = str(self.cmb_planner_upscale_model.currentText() or "")
+            cur = str(self.cmb_planner_upscale_model.currentText() or '')
         except Exception:
             cur = ""
 
@@ -16330,7 +17586,7 @@ If the planner sees a marker like [02] or (02), it becomes the next image prompt
           - If BOTH toggles are OFF: do nothing unless the file already exists or force_write=True.
           - If ANY toggle is ON: ensure the file exists and store the current selection/state.
         """
-        project_dir = str(project_dir or "")
+        project_dir = str(project_dir or '')
         if not project_dir:
             return
 
@@ -16369,8 +17625,8 @@ If the planner sees a marker like [02] or (02), it becomes the next image prompt
                 # Keep the old keys so existing pipeline code stays compatible.
                 cur["engine_key"] = str(payload_up.get("engine_key") or "seedvr2")
                 cur["engine_label"] = str(payload_up.get("engine_label") or "SeedVR2")
-                cur["engine_exe"] = str(payload_up.get("engine_exe") or "")
-                cur["model_text"] = str(payload_up.get("model_text") or "")
+                cur["engine_exe"] = str(payload_up.get("engine_exe") or '')
+                cur["model_text"] = str(payload_up.get("model_text") or '')
 
                 # SeedVR2 detailed settings (safe to store even if not used yet).
                 for k in [
@@ -16390,7 +17646,7 @@ If the planner sees a marker like [02] or (02), it becomes the next image prompt
         self._write_upscale_json(project_dir, cur)
 
     def _load_upscale_settings_from_project(self, project_dir: str) -> None:
-        project_dir = str(project_dir or "")
+        project_dir = str(project_dir or '')
         if not project_dir:
             return
         obj = self._read_upscale_json(project_dir)
@@ -16444,16 +17700,16 @@ If the planner sees a marker like [02] or (02), it becomes the next image prompt
 
         # Restore selected engine (3-choice UI)
         try:
-            engine_key = str(obj.get("engine_key") or "")
+            engine_key = str(obj.get("engine_key") or '')
         except Exception:
             engine_key = ""
         if not engine_key:
             # Backward-compat: infer from old engine_label
             try:
-                lab = str(obj.get("engine_label") or "")
+                lab = str(obj.get("engine_label") or '')
             except Exception:
                 lab = ""
-            lab_l = (lab or "").strip().lower()
+            lab_l = (lab or '').strip().lower()
             if "anime" in lab_l:
                 engine_key = "anime"
             elif "realesr" in lab_l:
@@ -16588,7 +17844,7 @@ If the planner sees a marker like [02] or (02), it becomes the next image prompt
 
         # Persist + refresh summary
         try:
-            proj = str(getattr(self, "_active_project_dir", "") or "")
+            proj = str(getattr(self, "_active_project_dir", "") or '')
             if proj:
                 self._persist_upscale_settings_for_project(proj, force_write=True)
         except Exception:
@@ -16603,7 +17859,7 @@ If the planner sees a marker like [02] or (02), it becomes the next image prompt
     def _on_planner_upscale_toggled(self, on: bool) -> None:
         self._set_upscale_controls_visible(bool(on))
         try:
-            proj = str(getattr(self, "_active_project_dir", "") or "")
+            proj = str(getattr(self, "_active_project_dir", "") or '')
             if proj:
                 self._persist_upscale_settings_for_project(proj, force_write=True)
         except Exception:
@@ -16617,7 +17873,7 @@ If the planner sees a marker like [02] or (02), it becomes the next image prompt
     @Slot(bool)
     def _on_planner_interp60_toggled(self, on: bool) -> None:
         try:
-            proj = str(getattr(self, "_active_project_dir", "") or "")
+            proj = str(getattr(self, "_active_project_dir", "") or '')
             if proj:
                 self._persist_upscale_settings_for_project(proj, force_write=True)
         except Exception:
@@ -16631,7 +17887,7 @@ If the planner sees a marker like [02] or (02), it becomes the next image prompt
         except Exception:
             pass
         try:
-            proj = str(getattr(self, "_active_project_dir", "") or "")
+            proj = str(getattr(self, "_active_project_dir", "") or '')
             if proj and bool(getattr(self, "chk_planner_upscale", None) and self.chk_planner_upscale.isChecked()):
                 self._persist_upscale_settings_for_project(proj, force_write=True)
         except Exception:
@@ -16645,7 +17901,7 @@ If the planner sees a marker like [02] or (02), it becomes the next image prompt
     @Slot(int)
     def _on_planner_upscale_model_changed(self, _idx: int = 0) -> None:
         try:
-            proj = str(getattr(self, "_active_project_dir", "") or "")
+            proj = str(getattr(self, "_active_project_dir", "") or '')
             if proj and bool(getattr(self, "chk_planner_upscale", None) and self.chk_planner_upscale.isChecked()):
                 self._persist_upscale_settings_for_project(proj, force_write=True)
         except Exception:
@@ -16703,7 +17959,7 @@ If the planner sees a marker like [02] or (02), it becomes the next image prompt
 
     def _get_output_base(self) -> str:
         try:
-            output_base = (self.out_dir_edit.text() or "").strip() or self._default_out_dir()
+            output_base = (self.out_dir_edit.text() or '').strip() or self._default_out_dir()
         except Exception:
             output_base = self._default_out_dir()
         return _abspath_from_root(output_base)
@@ -16847,7 +18103,7 @@ If the planner sees a marker like [02] or (02), it becomes the next image prompt
         # Chunk 9B1: load per-project upscaling settings when selecting a job
         try:
             p = self._get_selected_result_paths()
-            job_dir = str(p.get("job_dir") or "")
+            job_dir = str(p.get("job_dir") or '')
             if job_dir:
                 self._active_project_dir = job_dir
                 self._load_upscale_settings_from_project(job_dir)
@@ -16869,7 +18125,7 @@ If the planner sees a marker like [02] or (02), it becomes the next image prompt
             out["manifest"] = os.path.join(job_dir, "manifest.json")
             try:
                 fv = self.results_model.item(row, 0).data(int(Qt.UserRole) + 1) or ""
-                out["final_video"] = str(fv or "")
+                out["final_video"] = str(fv or '')
             except Exception:
                 out["final_video"] = ""
             out["errors_dir"] = os.path.join(job_dir, "errors")
@@ -16879,7 +18135,7 @@ If the planner sees a marker like [02] or (02), it becomes the next image prompt
         return out
 
     def _open_path_native(self, p: str) -> None:
-        p = str(p or "")
+        p = str(p or '')
         if not p:
             return
         try:
@@ -16895,7 +18151,7 @@ If the planner sees a marker like [02] or (02), it becomes the next image prompt
 
     def _get_selected_final_video_path(self) -> str:
         try:
-            return str(self._get_selected_result_paths().get("final_video") or "")
+            return str(self._get_selected_result_paths().get("final_video") or '')
         except Exception:
             return ""
 
@@ -16963,7 +18219,7 @@ If the planner sees a marker like [02] or (02), it becomes the next image prompt
     @Slot()
     def _res_remove_folder(self) -> None:
         paths = self._get_selected_result_paths()
-        job_dir = str(paths.get("job_dir") or "")
+        job_dir = str(paths.get("job_dir") or '')
         if not job_dir:
             return
 
@@ -16973,7 +18229,7 @@ If the planner sees a marker like [02] or (02), it becomes the next image prompt
             idxs = self.results_view.selectionModel().selectedRows()
             if idxs:
                 row = idxs[0].row()
-                status = str(self.results_model.item(row, 2).text() or "")
+                status = str(self.results_model.item(row, 2).text() or '')
                 if self._is_active_job_status(status):
                     QMessageBox.information(self, "Remove folder", "This job is running or queued. You can't delete its folder right now.")
                     return
@@ -17035,7 +18291,7 @@ If the planner sees a marker like [02] or (02), it becomes the next image prompt
 
                 # Chunk 9B1: restore Planner-only upscaling settings from this project folder
         try:
-            self._active_project_dir = str(out_dir or "")
+            self._active_project_dir = str(out_dir or '')
             self._load_upscale_settings_from_project(out_dir)
         except Exception:
             pass
@@ -17109,7 +18365,7 @@ If the planner sees a marker like [02] or (02), it becomes the next image prompt
             except Exception:
                 return str(p)
         except Exception:
-            return str(job_dir or "")
+            return str(job_dir or '')
 
     def _is_favorited(self, job_dir: str) -> bool:
         key = self._fav_key_for_dir(job_dir)
@@ -17153,8 +18409,8 @@ If the planner sees a marker like [02] or (02), it becomes the next image prompt
             except Exception:
                 pass
 
-            job_dir = str(self.results_model.item(row, 0).data(Qt.UserRole) or "")
-            status = str(self.results_model.item(row, 2).text() or "")
+            job_dir = str(self.results_model.item(row, 0).data(Qt.UserRole) or '')
+            status = str(self.results_model.item(row, 2).text() or '')
             is_fav = self._is_favorited(job_dir)
 
             menu = QMenu(self.results_view)
@@ -17197,7 +18453,7 @@ If the planner sees a marker like [02] or (02), it becomes the next image prompt
             return
 
     def _is_active_job_status(self, status: str) -> bool:
-        s = str(status or "").strip().lower()
+        s = str(status or '').strip().lower()
         if not s:
             return False
         # conservative: block deletion if it looks active
@@ -17206,7 +18462,7 @@ If the planner sees a marker like [02] or (02), it becomes the next image prompt
 
     def _res_rename_selected_job_folder(self) -> None:
         p = self._get_selected_result_paths()
-        job_dir = str(p.get("job_dir") or "")
+        job_dir = str(p.get("job_dir") or '')
         if not job_dir or not os.path.isdir(job_dir):
             QMessageBox.information(self, "Rename folder", "No job folder selected.")
             return
@@ -17217,7 +18473,7 @@ If the planner sees a marker like [02] or (02), it becomes the next image prompt
         new_name, ok = QInputDialog.getText(self, "Rename folder", "New folder name:", text=old_name)
         if not ok:
             return
-        new_name = str(new_name or "").strip()
+        new_name = str(new_name or '').strip()
         if not new_name or new_name == old_name:
             return
 
@@ -17261,12 +18517,12 @@ If the planner sees a marker like [02] or (02), it becomes the next image prompt
             pass
 
     def _select_result_by_job_dir(self, job_dir: str) -> None:
-        jd = str(job_dir or "")
+        jd = str(job_dir or '')
         if not jd:
             return
         for row in range(self.results_model.rowCount()):
             try:
-                rjd = str(self.results_model.item(row, 0).data(Qt.UserRole) or "")
+                rjd = str(self.results_model.item(row, 0).data(Qt.UserRole) or '')
                 if os.path.normpath(rjd) == os.path.normpath(jd):
                     self.results_view.selectRow(row)
                     try:
@@ -17279,7 +18535,7 @@ If the planner sees a marker like [02] or (02), it becomes the next image prompt
 
     def _res_show_selected_folder_info(self) -> None:
         p = self._get_selected_result_paths()
-        job_dir = str(p.get("job_dir") or "")
+        job_dir = str(p.get("job_dir") or '')
         if not job_dir or not os.path.isdir(job_dir):
             QMessageBox.information(self, "Folder info", "No job folder selected.")
             return
@@ -17328,7 +18584,7 @@ If the planner sees a marker like [02] or (02), it becomes the next image prompt
 
         final_video = ""
         try:
-            final_video = str(p.get("final_video") or "")
+            final_video = str(p.get("final_video") or '')
         except Exception:
             final_video = ""
 
@@ -17356,9 +18612,9 @@ If the planner sees a marker like [02] or (02), it becomes the next image prompt
         self.results_model.setRowCount(0)
 
         for r in rows:
-            title = str(r.get("title") or "")
-            status = str(r.get("status") or "")
-            updated = str(r.get("updated") or "")
+            title = str(r.get("title") or '')
+            status = str(r.get("status") or '')
+            updated = str(r.get("updated") or '')
 
             it_title = QStandardItem(title)
             it_assets = QStandardItem("")  # painted by delegate
@@ -17366,15 +18622,15 @@ If the planner sees a marker like [02] or (02), it becomes the next image prompt
             it_updated = QStandardItem(updated)
 
             # Store job_dir on the title item for actions
-            it_title.setData(str(r.get("job_dir") or ""), Qt.UserRole)
+            it_title.setData(str(r.get("job_dir") or ''), Qt.UserRole)
 
             # Store final video path (for Play button)
-            it_title.setData(str(r.get("final_video") or ""), int(Qt.UserRole) + 1)
+            it_title.setData(str(r.get("final_video") or ''), int(Qt.UserRole) + 1)
 
             # Dots mask + tooltip in assets column
             mask = int(r.get("assets_mask") or 0)
             it_assets.setData(mask, _AssetsDotsDelegate.ROLE_MASK)
-            it_assets.setToolTip(str(r.get("assets_tooltip") or ""))
+            it_assets.setToolTip(str(r.get("assets_tooltip") or ''))
 
             self.results_model.appendRow([it_title, it_assets, it_status, it_updated])
 
@@ -17390,7 +18646,7 @@ If the planner sees a marker like [02] or (02), it becomes the next image prompt
             pass
 
     def _scan_results(self, output_base: str) -> List[dict]:
-        base = str(output_base or "").strip()
+        base = str(output_base or '').strip()
         if not base or (not os.path.isdir(base)):
             return []
 
@@ -17504,7 +18760,7 @@ If the planner sees a marker like [02] or (02), it becomes the next image prompt
                 # fallback to manifest path if the /final folder isn't present or empty
                 if not final_video:
                     fp = (manifest.get("paths") or {}).get("final_video") or ""
-                    fp = str(fp or "")
+                    fp = str(fp or '')
                     if fp and os.path.exists(fp) and os.path.getsize(fp) > 1024:
                         final_video = fp
 
@@ -17532,13 +18788,13 @@ If the planner sees a marker like [02] or (02), it becomes the next image prompt
             except Exception:
                 p = {}
             try:
-                up_p = str((p or {}).get("final_upscaled_path") or "")
+                up_p = str((p or {}).get("final_upscaled_path") or '')
                 if up_p and os.path.exists(up_p) and os.path.getsize(up_p) > 1024:
                     upscaled_ok = True
             except Exception:
                 upscaled_ok = False
             try:
-                ip_p = str((p or {}).get("final_interpolated_path") or "")
+                ip_p = str((p or {}).get("final_interpolated_path") or '')
                 if ip_p and os.path.exists(ip_p) and os.path.getsize(ip_p) > 1024:
                     interpolated_ok = True
             except Exception:
@@ -17552,8 +18808,8 @@ If the planner sees a marker like [02] or (02), it becomes the next image prompt
                 if isinstance(steps, dict):
                     for k, rec in steps.items():
                         try:
-                            kk = str(k or "").strip().lower()
-                            st = str((rec or {}).get("status") or "").strip().lower() if isinstance(rec, dict) else ""
+                            kk = str(k or '').strip().lower()
+                            st = str((rec or {}).get("status") or '').strip().lower() if isinstance(rec, dict) else ""
                             if st != "done":
                                 continue
                             if (not upscaled_ok) and ("upscale" in kk):
@@ -17615,7 +18871,7 @@ If the planner sees a marker like [02] or (02), it becomes the next image prompt
             steps = manifest.get("steps") or {}
             if isinstance(steps, dict):
                 for _, rec in steps.items():
-                    if isinstance(rec, dict) and str(rec.get("status") or "").lower() == "failed":
+                    if isinstance(rec, dict) and str(rec.get("status") or '').lower() == "failed":
                         return "Failed"
         except Exception:
             pass
@@ -17654,7 +18910,7 @@ If the planner sees a marker like [02] or (02), it becomes the next image prompt
         try:
             aspect_label = ""
             if hasattr(self, "cmb_aspect"):
-                aspect_label = str(self.cmb_aspect.currentText() or "")
+                aspect_label = str(self.cmb_aspect.currentText() or '')
             disp = _aspect_mode_display(aspect_label or "landscape")
             if hasattr(self, "lbl_summary_format"):
                 self.lbl_summary_format.setText(disp)
@@ -17673,11 +18929,11 @@ If the planner sees a marker like [02] or (02), it becomes the next image prompt
                 eng = ""
                 mod = ""
                 try:
-                    eng = str(self.cmb_planner_upscale_engine.currentText() or "").strip() if hasattr(self, "cmb_planner_upscale_engine") else ""
+                    eng = str(self.cmb_planner_upscale_engine.currentText() or '').strip() if hasattr(self, "cmb_planner_upscale_engine") else ""
                 except Exception:
                     eng = ""
                 try:
-                    mod = str(self.cmb_planner_upscale_model.currentText() or "").strip() if hasattr(self, "cmb_planner_upscale_model") else ""
+                    mod = str(self.cmb_planner_upscale_model.currentText() or '').strip() if hasattr(self, "cmb_planner_upscale_model") else ""
                 except Exception:
                     mod = ""
                 if eng and mod and mod != "(default)":
@@ -17781,7 +19037,7 @@ If the planner sees a marker like [02] or (02), it becomes the next image prompt
     
         voice = ""
         try:
-            voice = str(self.cmb_narr_voice.currentText() or "").strip()
+            voice = str(self.cmb_narr_voice.currentText() or '').strip()
         except Exception:
             voice = ""
     
@@ -17894,14 +19150,14 @@ If the planner sees a marker like [02] or (02), it becomes the next image prompt
             narration_language = "auto"
 
         try:
-            v = str(self.cmb_narr_voice.currentText() or "").strip()
+            v = str(self.cmb_narr_voice.currentText() or '').strip()
         except Exception:
             v = ""
         if v == "add your own…":
             narration_mode = "clone"
             narration_voice = ""
             try:
-                narration_sample_path = str(self.voice_sample_path_edit.text() or "").strip()
+                narration_sample_path = str(self.voice_sample_path_edit.text() or '').strip()
             except Exception:
                 narration_sample_path = ""
         else:
@@ -18124,7 +19380,7 @@ If the planner sees a marker like [02] or (02), it becomes the next image prompt
     def _on_own_storyline_text_changed(self) -> None:
         """Persist the raw own storyline text (best-effort)."""
         try:
-            txt = (self.own_storyline_edit.toPlainText() or "") if hasattr(self, "own_storyline_edit") else ""
+            txt = (self.own_storyline_edit.toPlainText() or '') if hasattr(self, "own_storyline_edit") else ""
         except Exception:
             txt = ""
         try:
@@ -18143,7 +19399,7 @@ If the planner sees a marker like [02] or (02), it becomes the next image prompt
     def _update_own_storyline_prompt_preview(self) -> None:
         """Parse the own storyline textbox and update the live prompt counter (preview only)."""
         try:
-            txt = (self.own_storyline_edit.toPlainText() or "") if hasattr(self, "own_storyline_edit") else ""
+            txt = (self.own_storyline_edit.toPlainText() or '') if hasattr(self, "own_storyline_edit") else ""
         except Exception:
             txt = ""
 
@@ -18239,10 +19495,10 @@ If the planner sees a marker like [02] or (02), it becomes the next image prompt
     def _on_own_character_prompt_changed(self) -> None:
         """Persist manual character prompts (best-effort, UI thread)."""
         try:
-            c1 = (self.own_char_1.toPlainText() or "").strip() if hasattr(self, "own_char_1") else ""
-            c2 = (self.own_char_2.toPlainText() or "").strip() if hasattr(self, "own_char_2") else ""
-            cw1 = (self.own_char_1_codeword.text() or "").strip() if hasattr(self, "own_char_1_codeword") else ""
-            cw2 = (self.own_char_2_codeword.text() or "").strip() if hasattr(self, "own_char_2_codeword") else ""
+            c1 = (self.own_char_1.toPlainText() or '').strip() if hasattr(self, "own_char_1") else ""
+            c2 = (self.own_char_2.toPlainText() or '').strip() if hasattr(self, "own_char_2") else ""
+            cw1 = (self.own_char_1_codeword.text() or '').strip() if hasattr(self, "own_char_1_codeword") else ""
+            cw2 = (self.own_char_2_codeword.text() or '').strip() if hasattr(self, "own_char_2_codeword") else ""
         except Exception:
             c1, c2, cw1, cw2 = "", "", "", ""
         try:
@@ -18339,7 +19595,7 @@ If the planner sees a marker like [02] or (02), it becomes the next image prompt
             except Exception:
                 choice = ""
             s = _load_planner_settings()
-            s["videoclip_creator_preset"] = str(choice or "")
+            s["videoclip_creator_preset"] = str(choice or '')
             _save_planner_settings(s)
         except Exception:
             pass
@@ -18358,7 +19614,7 @@ If the planner sees a marker like [02] or (02), it becomes the next image prompt
             choice = ""
         try:
             s = _load_planner_settings()
-            s["videoclip_creator_clip_order"] = str(choice or "")
+            s["videoclip_creator_clip_order"] = str(choice or '')
             _save_planner_settings(s)
         except Exception:
             pass
@@ -18470,7 +19726,7 @@ If the planner sees a marker like [02] or (02), it becomes the next image prompt
         try:
             if hasattr(self, "cmb_videoclip_clip_order"):
                 s = _load_planner_settings()
-                want2 = str(s.get("videoclip_creator_clip_order") or "").strip()
+                want2 = str(s.get("videoclip_creator_clip_order") or '').strip()
                 if not want2:
                     want2 = "Sequential (default)"
                 idx2 = self.cmb_videoclip_clip_order.findText(want2)
@@ -18650,7 +19906,7 @@ If the planner sees a marker like [02] or (02), it becomes the next image prompt
         except Exception:
             pass
         try:
-            has_file = bool((getattr(self, "_music_file_path", "") or "").strip())
+            has_file = bool((getattr(self, "_music_file_path", "") or '').strip())
         except Exception:
             has_file = False
         try:
@@ -18674,7 +19930,7 @@ If the planner sees a marker like [02] or (02), it becomes the next image prompt
         except Exception:
             has_refs = False
         try:
-            strat = str(getattr(self, "_ref_strategy", "") or "").strip()
+            strat = str(getattr(self, "_ref_strategy", "") or '').strip()
         except Exception:
             strat = ""
 
@@ -18709,7 +19965,7 @@ If the planner sees a marker like [02] or (02), it becomes the next image prompt
                 idx_hint = -1
                 for i in range(int(cmb.count())):
                     try:
-                        if str(cmb.itemData(i) or "") == hint_key:
+                        if str(cmb.itemData(i) or '') == hint_key:
                             idx_hint = i
                             break
                     except Exception:
@@ -18743,7 +19999,7 @@ If the planner sees a marker like [02] or (02), it becomes the next image prompt
                 idx_hint = -1
                 for i in range(int(cmb.count())):
                     try:
-                        if str(cmb.itemData(i) or "") == hint_key:
+                        if str(cmb.itemData(i) or '') == hint_key:
                             idx_hint = i
                             break
                     except Exception:
@@ -18791,7 +20047,7 @@ If the planner sees a marker like [02] or (02), it becomes the next image prompt
 
         # Prompt for strategy once, when the first ref is added
         try:
-            if (not had_any) and (self.ref_list.count() > 0) and not (getattr(self, "_ref_strategy", "") or "").strip():
+            if (not had_any) and (self.ref_list.count() > 0) and not (getattr(self, "_ref_strategy", "") or '').strip():
                 self._prompt_ref_strategy_choice()
         except Exception:
             pass
@@ -19013,7 +20269,7 @@ If the planner sees a marker like [02] or (02), it becomes the next image prompt
             pass
         # Ready-made music file (if present)
         try:
-            p = str(getattr(self, "_music_file_path", "") or "").strip()
+            p = str(getattr(self, "_music_file_path", "") or '').strip()
             if p:
                 out["music"].append(p)
         except Exception:
@@ -19026,7 +20282,7 @@ If the planner sees a marker like [02] or (02), it becomes the next image prompt
         return out
 
     def _build_job(self) -> PlannerJob:
-        prompt = (self.prompt_edit.toPlainText() or "").strip()
+        prompt = (self.prompt_edit.toPlainText() or '').strip()
         own_story = False
         try:
             own_story = bool(getattr(self, "chk_own_storyline", None) and self.chk_own_storyline.isChecked())
@@ -19038,7 +20294,7 @@ If the planner sees a marker like [02] or (02), it becomes the next image prompt
         if not prompt and own_story:
             prompt = "Own storyline"
 
-        negatives = (self.negatives_edit.toPlainText() or "").strip()
+        negatives = (self.negatives_edit.toPlainText() or '').strip()
 
         # Collect attachments once (used for music file detection + ref images)
         attachments = self._collect_attachments()
@@ -19076,14 +20332,14 @@ If the planner sees a marker like [02] or (02), it becomes the next image prompt
             if sel_ace15:
                 music_mode = "ace15"
                 try:
-                    ace15_preset_id = str(self.cmb_ace15_preset.currentData() or "").strip()
+                    ace15_preset_id = str(self.cmb_ace15_preset.currentData() or '').strip()
                     if not ace15_preset_id:
-                        ace15_preset_id = str(self.cmb_ace15_preset.currentText() or "").strip()
+                        ace15_preset_id = str(self.cmb_ace15_preset.currentText() or '').strip()
                 except Exception:
                     ace15_preset_id = ""
                 # Keep legacy field filled with a human readable name for older logs/UIs
                 try:
-                    music_preset = str(self.cmb_ace15_preset.currentText() or "").strip()
+                    music_preset = str(self.cmb_ace15_preset.currentText() or '').strip()
                 except Exception:
                     music_preset = ""
 
@@ -19092,14 +20348,14 @@ If the planner sees a marker like [02] or (02), it becomes the next image prompt
                 except Exception:
                     ace15_lyrics_enabled = False
                 try:
-                    ace15_lyrics_text = (self.txt_ace15_lyrics.toPlainText() or "").strip()
+                    ace15_lyrics_text = (self.txt_ace15_lyrics.toPlainText() or '').strip()
                 except Exception:
                     ace15_lyrics_text = ""
 
                 try:
-                    ace15_audio_format = str(self.cmb_ace15_format.currentData() or "").strip().lower()
+                    ace15_audio_format = str(self.cmb_ace15_format.currentData() or '').strip().lower()
                     if ace15_audio_format not in ("mp3","wav"):
-                        ace15_audio_format = str(self.cmb_ace15_format.currentText() or "").strip().lower()
+                        ace15_audio_format = str(self.cmb_ace15_format.currentText() or '').strip().lower()
                     if ace15_audio_format not in ("mp3","wav"):
                         ace15_audio_format = "wav"
                 except Exception:
@@ -19124,14 +20380,14 @@ If the planner sees a marker like [02] or (02), it becomes the next image prompt
             narration_language = "auto"
 
         try:
-            v = str(self.cmb_narr_voice.currentText() or "").strip()
+            v = str(self.cmb_narr_voice.currentText() or '').strip()
         except Exception:
             v = ""
         if v == "add your own…":
             narration_mode = "clone"
             narration_voice = ""
             try:
-                narration_sample_path = str(self.voice_sample_path_edit.text() or "").strip()
+                narration_sample_path = str(self.voice_sample_path_edit.text() or '').strip()
             except Exception:
                 narration_sample_path = ""
         else:
@@ -19216,7 +20472,7 @@ If the planner sees a marker like [02] or (02), it becomes the next image prompt
 
         if bool(_own_storyline_on):
             try:
-                _own_storyline_text = (self.own_storyline_edit.toPlainText() or "") if hasattr(self, "own_storyline_edit") else ""
+                _own_storyline_text = (self.own_storyline_edit.toPlainText() or '') if hasattr(self, "own_storyline_edit") else ""
             except Exception:
                 _own_storyline_text = ""
             try:
@@ -19231,7 +20487,7 @@ If the planner sees a marker like [02] or (02), it becomes the next image prompt
                 except Exception:
                     _own_storyline_prompts, _own_storyline_mode = [], "paragraph"
 
-        enc["own_storyline_text"] = str(_own_storyline_text or "")
+        enc["own_storyline_text"] = str(_own_storyline_text or '')
         enc["own_storyline_prompts"] = _own_storyline_prompts if isinstance(_own_storyline_prompts, list) else []
         enc["own_storyline_parser_mode"] = str(_own_storyline_mode or "paragraph")
 
@@ -19242,15 +20498,15 @@ If the planner sees a marker like [02] or (02), it becomes the next image prompt
 
         # Own Character Bible prompts (manual 1–2)
         try:
-            c1 = (self.own_char_1.toPlainText() or "").strip() if hasattr(self, "own_char_1") else ""
-            c2 = (self.own_char_2.toPlainText() or "").strip() if hasattr(self, "own_char_2") else ""
+            c1 = (self.own_char_1.toPlainText() or '').strip() if hasattr(self, "own_char_1") else ""
+            c2 = (self.own_char_2.toPlainText() or '').strip() if hasattr(self, "own_char_2") else ""
         except Exception:
             c1, c2 = "", ""
         enc["own_character_1_prompt"] = str(c1)
         enc["own_character_2_prompt"] = str(c2)
         try:
-            enc["own_character_1_codeword"] = str((self.own_char_1_codeword.text() or "").strip()) if hasattr(self, "own_char_1_codeword") else ""
-            enc["own_character_2_codeword"] = str((self.own_char_2_codeword.text() or "").strip()) if hasattr(self, "own_char_2_codeword") else ""
+            enc["own_character_1_codeword"] = str((self.own_char_1_codeword.text() or '').strip()) if hasattr(self, "own_char_1_codeword") else ""
+            enc["own_character_2_codeword"] = str((self.own_char_2_codeword.text() or '').strip()) if hasattr(self, "own_char_2_codeword") else ""
         except Exception:
             enc["own_character_1_codeword"] = ""
             enc["own_character_2_codeword"] = ""
@@ -19277,11 +20533,11 @@ If the planner sees a marker like [02] or (02), it becomes the next image prompt
 
         # Chunk 4: reference strategy (stored in encoding for pipeline behavior)
         try:
-            ref_strategy = (getattr(self, "_ref_strategy", "") or "").strip()
+            ref_strategy = (getattr(self, "_ref_strategy", "") or '').strip()
         except Exception:
             ref_strategy = ""
         try:
-            ref_lora = (getattr(self, "_ref_multi_angle_lora", "") or "").strip()
+            ref_lora = (getattr(self, "_ref_multi_angle_lora", "") or '').strip()
         except Exception:
             ref_lora = ""
 
@@ -19329,7 +20585,7 @@ If the planner sees a marker like [02] or (02), it becomes the next image prompt
             approx_duration_sec=int(self.sld_duration.value()),
             resolution_preset=str(aspect_label),
             quality_preset=f"{int(upscale_factor)}×",
-            extra_info=(self.extra_info.toPlainText() or "").strip(),
+            extra_info=(self.extra_info.toPlainText() or '').strip(),
             attachments=attachments,
             encoding=enc,
         )
@@ -19364,7 +20620,7 @@ If the planner sees a marker like [02] or (02), it becomes the next image prompt
             if lbl is None:
                 return
             start = getattr(self, "_job_started_ts", None)
-            mode = str(getattr(self, "_header_mode", "") or "")
+            mode = str(getattr(self, "_header_mode", "") or '')
             if (mode != "running") or (start is None):
                 if lbl.text():
                     lbl.setText("")
@@ -19387,10 +20643,10 @@ If the planner sees a marker like [02] or (02), it becomes the next image prompt
 
     def _set_header_status(self, text: str, mode: str = "") -> None:
         try:
-            prev = str(getattr(self, "_header_mode", "") or "")
+            prev = str(getattr(self, "_header_mode", "") or '')
             if mode:
                 self._header_mode = str(mode)
-            cur = str(getattr(self, "_header_mode", "") or "")
+            cur = str(getattr(self, "_header_mode", "") or '')
             # Track start time when transitioning into running mode
             if (cur == "running") and (prev != "running"):
                 self._job_started_ts = time.time()
@@ -19412,7 +20668,7 @@ If the planner sees a marker like [02] or (02), it becomes the next image prompt
 
     def _update_header_running_text(self) -> None:
         try:
-            st = str(getattr(self, "_header_stage", "") or "").strip() or "Running"
+            st = str(getattr(self, "_header_stage", "") or '').strip() or "Running"
         except Exception:
             st = "Running"
 
@@ -19431,16 +20687,16 @@ If the planner sees a marker like [02] or (02), it becomes the next image prompt
                 try:
                     if hasattr(self, "chk_own_character_bible") and hasattr(self, "own_char_1") and hasattr(self, "own_char_2"):
                         enc["own_character_bible_enabled"] = bool(self.chk_own_character_bible.isChecked())
-                        enc["own_character_1_prompt"] = str(self.own_char_1.toPlainText() or "")
-                        enc["own_character_2_prompt"] = str(self.own_char_2.toPlainText() or "")
-                        enc["own_character_1_codeword"] = str(self.own_char_1_codeword.text() or "") if hasattr(self, "own_char_1_codeword") else ""
-                        enc["own_character_2_codeword"] = str(self.own_char_2_codeword.text() or "") if hasattr(self, "own_char_2_codeword") else ""
+                        enc["own_character_1_prompt"] = str(self.own_char_1.toPlainText() or '')
+                        enc["own_character_2_prompt"] = str(self.own_char_2.toPlainText() or '')
+                        enc["own_character_1_codeword"] = str(self.own_char_1_codeword.text() or '') if hasattr(self, "own_char_1_codeword") else ""
+                        enc["own_character_2_codeword"] = str(self.own_char_2_codeword.text() or '') if hasattr(self, "own_char_2_codeword") else ""
                 except Exception:
                     pass
 
             own_on = bool(enc.get("own_character_bible_enabled"))
-            c1 = str(enc.get("own_character_1_prompt") or "")
-            c2 = str(enc.get("own_character_2_prompt") or "")
+            c1 = str(enc.get("own_character_1_prompt") or '')
+            c2 = str(enc.get("own_character_2_prompt") or '')
             own_has = bool((c1 or c2).strip())
 
             if own_on and own_has:
@@ -19500,7 +20756,7 @@ If the planner sees a marker like [02] or (02), it becomes the next image prompt
 
         ui_block = ""
         try:
-            ui_block = str(getattr(self, "_ui_block_error", "") or "").strip()
+            ui_block = str(getattr(self, "_ui_block_error", "") or '').strip()
         except Exception:
             ui_block = ""
 
@@ -19508,7 +20764,7 @@ If the planner sees a marker like [02] or (02), it becomes the next image prompt
         prompt_text_ok = False
         own_story_enabled = False
         try:
-            prompt_text_ok = bool((self.prompt_edit.toPlainText() or "").strip())
+            prompt_text_ok = bool((self.prompt_edit.toPlainText() or '').strip())
         except Exception:
             prompt_text_ok = False
 
@@ -19626,7 +20882,7 @@ If the planner sees a marker like [02] or (02), it becomes the next image prompt
         try:
             if self._worker and self._worker.isRunning():
                 job = self._build_job()
-                output_base = (self.out_dir_edit.text() or "").strip() or self._default_out_dir()
+                output_base = (self.out_dir_edit.text() or '').strip() or self._default_out_dir()
                 output_base = _abspath_from_root(output_base)
                 title = _auto_title_from_prompt(job.prompt)
                 slug = _slugify_title(title) or "job"
@@ -19649,7 +20905,7 @@ If the planner sees a marker like [02] or (02), it becomes the next image prompt
         except Exception:
             pass
 
-        output_base = (self.out_dir_edit.text() or "").strip() or self._default_out_dir()
+        output_base = (self.out_dir_edit.text() or '').strip() or self._default_out_dir()
         output_base = _abspath_from_root(output_base)
 
         # Chunk 8C1: Human-friendly folder naming: <slug>_<NNN>
@@ -19670,7 +20926,7 @@ If the planner sees a marker like [02] or (02), it becomes the next image prompt
     def _on_asset_created(self, path: str) -> None:
         """Live preview handler: show each newly created image/clip immediately."""
         try:
-            self._preview_add(str(path or ""))
+            self._preview_add(str(path or ''))
         except Exception:
             pass
 
@@ -19742,7 +20998,7 @@ If the planner sees a marker like [02] or (02), it becomes the next image prompt
 
         try:
             s = _load_planner_settings()
-            last_dir = str(s.get("preview_last_output_dir", "") or "").strip()
+            last_dir = str(s.get("preview_last_output_dir", "") or '').strip()
         except Exception:
             last_dir = ""
 
@@ -19763,7 +21019,7 @@ If the planner sees a marker like [02] or (02), it becomes the next image prompt
     def _preview_add(self, path: str) -> None:
         if not getattr(self, "chk_preview", None) or not self.chk_preview.isChecked():
             return
-        p = str(path or "").strip()
+        p = str(path or '').strip()
         if not p or not os.path.exists(p):
             return
 
@@ -19790,7 +21046,7 @@ If the planner sees a marker like [02] or (02), it becomes the next image prompt
     def _preview_ingest_dir(self, folder: str) -> None:
         if not getattr(self, "chk_preview", None) or not self.chk_preview.isChecked():
             return
-        d = str(folder or "").strip()
+        d = str(folder or '').strip()
         if not d or not os.path.isdir(d):
             return
 
@@ -19827,8 +21083,8 @@ If the planner sees a marker like [02] or (02), it becomes the next image prompt
                 continue
 
             it = items[i] if isinstance(items[i], dict) else {}
-            p = str(it.get("path") or "")
-            k = str(it.get("kind") or "")
+            p = str(it.get("path") or '')
+            k = str(it.get("kind") or '')
             if not p:
                 continue
 
@@ -19867,7 +21123,7 @@ If the planner sees a marker like [02] or (02), it becomes the next image prompt
 
         Returns the thumbnail PNG path, or "" on failure.
         """
-        vp = str(video_path or "").strip()
+        vp = str(video_path or '').strip()
         if not vp or not os.path.exists(vp):
             return ""
 
@@ -19892,7 +21148,7 @@ If the planner sees a marker like [02] or (02), it becomes the next image prompt
         except Exception:
             h = "thumb"
 
-        out_dir = str(getattr(self, "_video_thumb_dir", "") or "")
+        out_dir = str(getattr(self, "_video_thumb_dir", "") or '')
         if not out_dir:
             out_dir = str((_root() / "presets" / "setsave" / "planner_preview_thumbs").resolve())
         try:
@@ -19970,7 +21226,7 @@ If the planner sees a marker like [02] or (02), it becomes the next image prompt
             items = []
         if idx < 0 or idx >= len(items):
             return
-        p = str((items[idx] or {}).get("path") or "")
+        p = str((items[idx] or {}).get("path") or '')
         if not p:
             return
 
@@ -19996,11 +21252,11 @@ If the planner sees a marker like [02] or (02), it becomes the next image prompt
             return
         p = payload if isinstance(payload, dict) else {}
         try:
-            self._preview_ingest_dir(str(p.get("clips_dir") or ""))
+            self._preview_ingest_dir(str(p.get("clips_dir") or ''))
         except Exception:
             pass
         try:
-            self._preview_ingest_dir(str(p.get("images_dir") or ""))
+            self._preview_ingest_dir(str(p.get("images_dir") or ''))
         except Exception:
             pass
         try:
@@ -20021,17 +21277,30 @@ If the planner sees a marker like [02] or (02), it becomes the next image prompt
                 pass
             return
 
-        dlg = ImageReviewDialog(self, worker=self._worker, payload=p)
-        self._image_review_dialog = dlg
-        dlg.exec()
-
-        # If the dialog was closed without an explicit terminal action, continue.
+        dlg = None
         try:
-            if self._worker and self._worker.isRunning() and not getattr(dlg, "_sent_terminal_cmd", False):
-                self._worker.post_review_command({"type": "continue"})
-        except Exception:
-            pass
-        self._image_review_dialog = None
+            dlg = ImageReviewDialog(self, worker=self._worker, payload=p)
+            self._image_review_dialog = dlg
+            dlg.exec()
+
+            # If the dialog was closed without an explicit terminal action, continue.
+            try:
+                if self._worker and self._worker.isRunning() and not getattr(dlg, "_sent_terminal_cmd", False):
+                    self._worker.post_review_command({"type": "continue"})
+            except Exception:
+                pass
+        except Exception as e:
+            try:
+                QMessageBox.warning(self, "Image review failed", str(e))
+            except Exception:
+                pass
+            try:
+                if self._worker and self._worker.isRunning():
+                    self._worker.post_review_command({"type": "continue"})
+            except Exception:
+                pass
+        finally:
+            self._image_review_dialog = None
 
     
 
@@ -20066,17 +21335,30 @@ If the planner sees a marker like [02] or (02), it becomes the next image prompt
         except Exception:
             pass
 
-        dlg = ClipReviewDialog(self, worker=self._worker, payload=p)
-        self._clip_review_dialog = dlg
-        dlg.exec()
-
-        # If the dialog was closed without an explicit terminal action, continue.
+        dlg = None
         try:
-            if self._worker and self._worker.isRunning() and not getattr(dlg, "_sent_terminal_cmd", False):
-                self._worker.post_review_command({"type": "continue"})
-        except Exception:
-            pass
-        self._clip_review_dialog = None
+            dlg = ClipReviewDialog(self, worker=self._worker, payload=p)
+            self._clip_review_dialog = dlg
+            dlg.exec()
+
+            # If the dialog was closed without an explicit terminal action, continue.
+            try:
+                if self._worker and self._worker.isRunning() and not getattr(dlg, "_sent_terminal_cmd", False):
+                    self._worker.post_review_command({"type": "continue"})
+            except Exception:
+                pass
+        except Exception as e:
+            try:
+                QMessageBox.warning(self, "Clip review failed", str(e))
+            except Exception:
+                pass
+            try:
+                if self._worker and self._worker.isRunning():
+                    self._worker.post_review_command({"type": "continue"})
+            except Exception:
+                pass
+        finally:
+            self._clip_review_dialog = None
 
     @Slot(str)
     def _on_image_regen_started(self, sid: str) -> None:
@@ -20205,9 +21487,9 @@ If the planner sees a marker like [02] or (02), it becomes the next image prompt
                     j = item.get("job")
                     state["pending"].append({
                         "job": self._serialize_job(j),
-                        "out_dir": str(item.get("out_dir") or ""),
-                        "title": str(item.get("title") or ""),
-                        "slug": str(item.get("slug") or ""),
+                        "out_dir": str(item.get("out_dir") or ''),
+                        "title": str(item.get("title") or ''),
+                        "slug": str(item.get("slug") or ''),
                     })
                 except Exception:
                     continue
@@ -20391,7 +21673,7 @@ If the planner sees a marker like [02] or (02), it becomes the next image prompt
             items = self._scan_for_external_queue_items() or []
             n = 0
             for it in items:
-                st = str(it.get("status") or "")
+                st = str(it.get("status") or '')
                 if st in ("pending", "running", "unknown"):
                     n += 1
             return int(n)
@@ -20405,15 +21687,15 @@ If the planner sees a marker like [02] or (02), it becomes the next image prompt
             best = None
             best_m = 0.0
             for it in items:
-                st = str(it.get("status") or "")
+                st = str(it.get("status") or '')
                 if st in ("pending", "running", "unknown"):
                     mt = float(it.get("mtime") or 0.0)
                     if mt > best_m:
                         best_m = mt
-                        out_dir = str(it.get("out_dir") or "")
+                        out_dir = str(it.get("out_dir") or '')
                         best = {
                             "out_dir": out_dir,
-                            "done_flag": str(it.get("done_flag") or ""),
+                            "done_flag": str(it.get("done_flag") or ''),
                             "active_flag": str((pathlib.Path(out_dir) / "_planner_active.flag").resolve()),
                         }
             return best
@@ -20475,7 +21757,7 @@ If the planner sees a marker like [02] or (02), it becomes the next image prompt
             info = getattr(self, "_external_running", None)
             if not isinstance(info, dict):
                 return
-            done_flag = str(info.get("done_flag") or "").strip()
+            done_flag = str(info.get("done_flag") or '').strip()
             if done_flag and os.path.exists(done_flag):
                 # External run finished; clear and continue with our queued jobs.
                 self._append_log("----")
@@ -20514,9 +21796,9 @@ If the planner sees a marker like [02] or (02), it becomes the next image prompt
                         continue
                     pending_loaded.append({
                         "job": job,
-                        "out_dir": str(item.get("out_dir") or ""),
-                        "title": str(item.get("title") or ""),
-                        "slug": str(item.get("slug") or ""),
+                        "out_dir": str(item.get("out_dir") or ''),
+                        "title": str(item.get("title") or ''),
+                        "slug": str(item.get("slug") or ''),
                     })
                 except Exception:
                     continue
@@ -20532,7 +21814,7 @@ If the planner sees a marker like [02] or (02), it becomes the next image prompt
         ext = None
         try:
             if isinstance(running, dict):
-                done_flag = str(running.get("done_flag") or "")
+                done_flag = str(running.get("done_flag") or '')
                 if done_flag and os.path.exists(done_flag):
                     running = None
                 else:
@@ -20603,8 +21885,8 @@ If the planner sees a marker like [02] or (02), it becomes the next image prompt
             self._pending_jobs.append({
                 "job": job,
                 "out_dir": str(out_dir),
-                "title": str(title or ""),
-                "slug": str(slug or ""),
+                "title": str(title or ''),
+                "slug": str(slug or ''),
             })
         except Exception:
             pass
@@ -20648,9 +21930,9 @@ If the planner sees a marker like [02] or (02), it becomes the next image prompt
             pass
         try:
             job = nxt.get("job")
-            out_dir = str(nxt.get("out_dir") or "")
-            title = str(nxt.get("title") or "")
-            slug = str(nxt.get("slug") or "")
+            out_dir = str(nxt.get("out_dir") or '')
+            title = str(nxt.get("title") or '')
+            slug = str(nxt.get("slug") or '')
             if job and out_dir:
                 self._append_log("----")
                 self._append_log(f"[QUEUE] Starting next queued job → {out_dir}")
@@ -20670,7 +21952,7 @@ If the planner sees a marker like [02] or (02), it becomes the next image prompt
         # - If Settings → Use FrameVision Queue is OFF, do NOT enqueue anything into the FrameVision queue,
         #   even if FV_PLANNER_QUEUE_LOCK is set in the environment.
         # - If Settings is ON, FV_PLANNER_QUEUE_LOCK may still explicitly force OFF/ON.
-        use_queue_lock_env = str(os.environ.get("FV_PLANNER_QUEUE_LOCK", "") or "").strip().lower()
+        use_queue_lock_env = str(os.environ.get("FV_PLANNER_QUEUE_LOCK", "") or '').strip().lower()
 
         # Master switch: Settings OFF always disables queue lock.
         use_queue_lock_setting = bool(getattr(self, "_use_framevision_queue", True))
@@ -20753,11 +22035,11 @@ If the planner sees a marker like [02] or (02), it becomes the next image prompt
 
             info = {
                 "out_dir": str(out_dir),
-                "job_id": str(getattr(job, "job_id", "") or ""),
-                "title": str(title or ""),
-                "slug": str(slug or ""),
+                "job_id": str(getattr(job, "job_id", "") or ''),
+                "title": str(title or ''),
+                "slug": str(slug or ''),
                 "started_at": float(time.time()),
-                "done_flag": str(getattr(self, "_queue_lock_done_flag", "") or ""),
+                "done_flag": str(getattr(self, "_queue_lock_done_flag", "") or ''),
                 "active_flag": str(active_flag),
             }
             self._persist_running = info
@@ -20864,12 +22146,12 @@ If the planner sees a marker like [02] or (02), it becomes the next image prompt
     def _on_finished(self, result: dict) -> None:
         self._last_result = result
         try:
-            self._active_project_dir = str(result.get("output_dir") or "")
+            self._active_project_dir = str(result.get("output_dir") or '')
         except Exception:
             pass
 
         try:
-            self._preview_add(str(result.get("final_video") or ""))
+            self._preview_add(str(result.get("final_video") or ''))
         except Exception:
             pass
 
@@ -20896,7 +22178,7 @@ If the planner sees a marker like [02] or (02), it becomes the next image prompt
         try:
             info = getattr(self, "_persist_running", None)
             if isinstance(info, dict):
-                af = str(info.get("active_flag") or "")
+                af = str(info.get("active_flag") or '')
                 if af and os.path.exists(af):
                     try:
                         os.remove(af)
@@ -20953,7 +22235,7 @@ If the planner sees a marker like [02] or (02), it becomes the next image prompt
         try:
             info = getattr(self, "_persist_running", None)
             if isinstance(info, dict):
-                af = str(info.get("active_flag") or "")
+                af = str(info.get("active_flag") or '')
                 if af and os.path.exists(af):
                     try:
                         os.remove(af)
@@ -21036,11 +22318,11 @@ class ImageReviewDialog(QDialog):
         self.resize(1180, 760)
         self.setMinimumSize(980, 640)
 
-        self._manifest_path = str(self._payload.get("manifest_path") or "")
-        self._images_dir = str(self._payload.get("images_dir") or "")
+        self._manifest_path = str(self._payload.get("manifest_path") or '')
+        self._images_dir = str(self._payload.get("images_dir") or '')
         # For resume / history workflows: we may need to invalidate / regenerate clips
         # after an image was regenerated.
-        self._clips_dir = str(self._payload.get("clips_dir") or "")
+        self._clips_dir = str(self._payload.get("clips_dir") or '')
 
         root = QVBoxLayout(self)
         root.setContentsMargins(10, 10, 10, 10)
@@ -21172,8 +22454,8 @@ class ImageReviewDialog(QDialog):
         shots = manifest.get("shots") if isinstance(manifest.get("shots"), dict) else {}
 
         for it in images:
-            sid = str(it.get("id") or "").strip()
-            fp = str(it.get("file") or "").strip()
+            sid = str(it.get("id") or '').strip()
+            fp = str(it.get("file") or '').strip()
             if not sid:
                 continue
 
@@ -21191,7 +22473,7 @@ class ImageReviewDialog(QDialog):
             try:
                 rec = shots.get(sid) if isinstance(shots, dict) else {}
                 if isinstance(rec, dict):
-                    tip = str(rec.get("prompt_compiled") or rec.get("prompt_used") or "").strip()
+                    tip = str(rec.get("prompt_compiled") or rec.get("prompt_used") or '').strip()
                     if tip:
                         item.setToolTip(tip)
             except Exception:
@@ -21265,7 +22547,7 @@ class ImageReviewDialog(QDialog):
             data = {}
         if isinstance(data, dict) and data.get("id"):
             return str(data.get("id"))
-        return str(it.text() or "")
+        return str(it.text() or '')
 
     def _on_select(self, _cur: Optional[QListWidgetItem], _prev: Optional[QListWidgetItem]) -> None:
         sid = self._selected_sid()
@@ -21278,7 +22560,7 @@ class ImageReviewDialog(QDialog):
         if not isinstance(rec, dict):
             rec = {}
 
-        prompt = str(rec.get("prompt_compiled") or rec.get("prompt_used") or "").strip()
+        prompt = str(rec.get("prompt_compiled") or rec.get("prompt_used") or '').strip()
         self.prompt_edit.blockSignals(True)
         self.prompt_edit.setPlainText(prompt)
         self.prompt_edit.blockSignals(False)
@@ -21292,7 +22574,7 @@ class ImageReviewDialog(QDialog):
         rec = shots.get(sid) if isinstance(shots, dict) else {}
         if not isinstance(rec, dict):
             rec = {}
-        base = str(rec.get("prompt_compiled_original") or rec.get("prompt_spec") or rec.get("prompt_compiled") or "").strip()
+        base = str(rec.get("prompt_compiled_original") or rec.get("prompt_spec") or rec.get("prompt_compiled") or '').strip()
         if base:
             self.prompt_edit.setPlainText(base)
             self.lbl_status.setText("Prompt reset locally. Click Recreate to apply.")
@@ -21303,7 +22585,7 @@ class ImageReviewDialog(QDialog):
         sid = self._selected_sid()
         if not sid:
             return
-        new_prompt = (self.prompt_edit.toPlainText() or "").strip()
+        new_prompt = (self.prompt_edit.toPlainText() or '').strip()
         if not new_prompt:
             QMessageBox.warning(self, "Empty prompt", "Prompt is empty.")
             return
@@ -21370,7 +22652,7 @@ class ImageReviewDialog(QDialog):
                 if not pm.isNull():
                     it.setIcon(QIcon(pm))
                 it.setData(Qt.UserRole, {"id": str(sid), "file": str(path)})
-                it.setToolTip((self.prompt_edit.toPlainText() or "").strip())
+                it.setToolTip((self.prompt_edit.toPlainText() or '').strip())
         except Exception:
             pass
 
@@ -21384,7 +22666,7 @@ class ImageReviewDialog(QDialog):
 
     def _resolve_clip_for_sid(self, sid: str) -> str:
         """Find an existing clip file for this shot id (best-effort)."""
-        sid = str(sid or "").strip()
+        sid = str(sid or '').strip()
         if not sid:
             return ""
 
@@ -21394,8 +22676,8 @@ class ImageReviewDialog(QDialog):
             items = (manifest.get("paths") or {}).get("clips") or []
             if isinstance(items, list):
                 for it in items:
-                    if isinstance(it, dict) and str(it.get("id") or "").strip() == sid:
-                        fp = str(it.get("file") or "").strip()
+                    if isinstance(it, dict) and str(it.get("id") or '').strip() == sid:
+                        fp = str(it.get("file") or '').strip()
                         if fp and os.path.isfile(fp):
                             return fp
         except Exception:
@@ -21452,7 +22734,7 @@ class ImageReviewDialog(QDialog):
             pass
 
     def _remove_clip_from_manifest(self, sid: str) -> None:
-        sid = str(sid or "").strip()
+        sid = str(sid or '').strip()
         if not sid or not self._manifest_path:
             return
         try:
@@ -21462,7 +22744,7 @@ class ImageReviewDialog(QDialog):
             if clips:
                 new = []
                 for it in clips:
-                    if isinstance(it, dict) and str(it.get("id") or "").strip() == sid:
+                    if isinstance(it, dict) and str(it.get("id") or '').strip() == sid:
                         continue
                     new.append(it)
                 paths["clips"] = new
@@ -21472,7 +22754,7 @@ class ImageReviewDialog(QDialog):
             pass
 
     def _offer_clip_regen_for_image(self, sid: str) -> None:
-        sid = str(sid or "").strip()
+        sid = str(sid or '').strip()
         if not sid:
             return
         clip = self._resolve_clip_for_sid(sid)
@@ -21573,10 +22855,10 @@ class ClipReviewDialog(QDialog):
         self.resize(1180, 760)
         self.setMinimumSize(980, 640)
 
-        self._manifest_path = str(self._payload.get("manifest_path") or "")
-        self._clips_dir = str(self._payload.get("clips_dir") or "")
-        self._shots_path = str(self._payload.get("shots_path") or "")
-        self._images_dir = str(self._payload.get("images_dir") or "")
+        self._manifest_path = str(self._payload.get("manifest_path") or '')
+        self._clips_dir = str(self._payload.get("clips_dir") or '')
+        self._shots_path = str(self._payload.get("shots_path") or '')
+        self._images_dir = str(self._payload.get("images_dir") or '')
 
         self._current_sid: str = ""
         self._current_clip: str = ""
@@ -21785,10 +23067,10 @@ class ClipReviewDialog(QDialog):
             return []
 
     def _shot_label(self, shots: List[Dict[str, Any]], sid: str) -> str:
-        sid = str(sid or "")
+        sid = str(sid or '')
         for sh in shots:
-            if isinstance(sh, dict) and str(sh.get("id") or "") == sid:
-                txt = str(sh.get("visual_description") or sh.get("notes") or "").strip()
+            if isinstance(sh, dict) and str(sh.get("id") or '') == sid:
+                txt = str(sh.get("visual_description") or sh.get("notes") or '').strip()
                 if txt:
                     return txt
         return ""
@@ -21816,11 +23098,11 @@ class ClipReviewDialog(QDialog):
 
     def _persist_prompt_for_sid(self, sid: str) -> None:
         """Persist the prompt editor text into manifest shots[sid].i2v_prompt (lightweight, UI thread)."""
-        sid = str(sid or "").strip()
+        sid = str(sid or '').strip()
         if not sid or not self._manifest_path:
             return
         try:
-            prompt = (self.prompt_edit.toPlainText() or "").strip()
+            prompt = (self.prompt_edit.toPlainText() or '').strip()
         except Exception:
             return
         if not prompt:
@@ -21831,7 +23113,7 @@ class ClipReviewDialog(QDialog):
             rec = shots.get(sid) if isinstance(shots, dict) else {}
             if not isinstance(rec, dict):
                 rec = {}
-            old = str(rec.get("i2v_prompt") or "").strip()
+            old = str(rec.get("i2v_prompt") or '').strip()
             if old and old != prompt and "i2v_prompt_original" not in rec:
                 rec["i2v_prompt_original"] = old
             rec["i2v_prompt"] = prompt
@@ -21858,8 +23140,8 @@ class ClipReviewDialog(QDialog):
         clips = self._resolve_clips(manifest)
 
         for it in clips:
-            sid = str(it.get("id") or "").strip()
-            fp = str(it.get("file") or "").strip()
+            sid = str(it.get("id") or '').strip()
+            fp = str(it.get("file") or '').strip()
             if not sid:
                 continue
             label = self._shot_label(shots, sid)
@@ -21872,7 +23154,7 @@ class ClipReviewDialog(QDialog):
 
             item = QListWidgetItem(display)
             item.setData(Qt.UserRole, {"id": sid, "file": fp, "label": label})
-            item.setToolTip(label or "")
+            item.setToolTip(label or '')
             self.lst.addItem(item)
             self._item_by_sid[sid] = item
 
@@ -21893,9 +23175,9 @@ class ClipReviewDialog(QDialog):
                 pass
 
             data = cur.data(Qt.UserRole) if cur else {}
-            sid = str((data or {}).get("id") or "").strip()
-            fp = str((data or {}).get("file") or "").strip()
-            label = str((data or {}).get("label") or "").strip()
+            sid = str((data or {}).get("id") or '').strip()
+            fp = str((data or {}).get("file") or '').strip()
+            label = str((data or {}).get("label") or '').strip()
 
             self._current_sid = sid
             self._current_clip = fp
@@ -21916,7 +23198,7 @@ class ClipReviewDialog(QDialog):
                 shots = manifest.get("shots") if isinstance(manifest.get("shots"), dict) else {}
                 rec = shots.get(sid) if isinstance(shots, dict) else {}
                 if isinstance(rec, dict):
-                    prompt = str(rec.get("i2v_prompt") or "").strip()
+                    prompt = str(rec.get("i2v_prompt") or '').strip()
             except Exception:
                 prompt = ""
             if not prompt:
@@ -21936,7 +23218,7 @@ class ClipReviewDialog(QDialog):
                 pass
 
     def _on_play(self) -> None:
-        path = str(self._current_clip or "").strip()
+        path = str(self._current_clip or '').strip()
         if not path or not os.path.isfile(path):
             QMessageBox.warning(self, "Missing clip", f"Clip not found:\n{path}")
             return
@@ -21994,7 +23276,7 @@ class ClipReviewDialog(QDialog):
         return exe_name
 
     def _ensure_first_frame_png(self, clip_path: str) -> Optional[str]:
-        clip_path = str(clip_path or "").strip()
+        clip_path = str(clip_path or '').strip()
         if not clip_path or not os.path.isfile(clip_path):
             return None
         try:
@@ -22157,7 +23439,7 @@ def _wan22_help_text(py_exe: str) -> str:
             text=True,
             timeout=25,
         )
-        _WAN22_HELP_CACHE = (p.stdout or "") + "\n" + (p.stderr or "")
+        _WAN22_HELP_CACHE = (p.stdout or '') + "\n" + (p.stderr or '')
     except Exception:
         _WAN22_HELP_CACHE = ""
     return _WAN22_HELP_CACHE or ""
@@ -22219,7 +23501,7 @@ def _run_wan22_clip(*, prompt: str, negative: str, image_path: str, out_path: st
         "--fps", str(int(fps)),
         "--ckpt_dir", str(model_root),
         "--convert_model_dtype",
-        "--prompt", str(prompt or ""),
+        "--prompt", str(prompt or ''),
         "--image", str(image_path),
     ]
 
@@ -22232,7 +23514,7 @@ def _run_wan22_clip(*, prompt: str, negative: str, image_path: str, out_path: st
         args.append("--t5_cpu")
 
     # Negative prompt (best-effort; only if supported)
-    if (negative or "").strip():
+    if (negative or '').strip():
         nf = _wan22_negative_flag(py)
         if nf:
             args += [nf, str(negative)]
@@ -22263,13 +23545,13 @@ def _run_wan22_clip(*, prompt: str, negative: str, image_path: str, out_path: st
 def _clipreview_on_recreate(self) -> None:
     if self._regen_busy:
         return
-    sid = str(self._current_sid or "").strip()
+    sid = str(self._current_sid or '').strip()
     if not sid:
         return
 
     prompt = ""
     try:
-        prompt = (self.prompt_edit.toPlainText() or "").strip()
+        prompt = (self.prompt_edit.toPlainText() or '').strip()
     except Exception:
         prompt = ""
     if not prompt:
@@ -22442,13 +23724,13 @@ def _qwen_text_call(step_name: str, system_prompt: str, user_prompt: str, log_pa
             temperature=float(temperature),
             max_new_tokens=int(max_new_tokens),
         )
-        raw_text = (out or "").strip()
-        err = (err or "").strip()
+        raw_text = (out or '').strip()
+        err = (err or '').strip()
 
         blob = []
-        blob.append("[system]\n" + (system_prompt or "").strip())
-        blob.append("\n[user]\n" + (user_prompt or "").strip())
-        blob.append("\n[output]\n" + (raw_text or "").strip())
+        blob.append("[system]\n" + (system_prompt or '').strip())
+        blob.append("\n[user]\n" + (user_prompt or '').strip())
+        blob.append("\n[output]\n" + (raw_text or '').strip())
         if err:
             blob.append("\n[stderr]\n" + err)
         if rc != 0 and not raw_text:

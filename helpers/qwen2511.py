@@ -132,7 +132,7 @@ VAE_DIR = os.path.join(MODELS_ROOT, "vae")
 # Default folder for Qwen2511 LoRAs (user can override in UI).
 DEFAULT_LORA_DIR = os.path.join(APP_ROOT, "models", "lora", "qwen2511")
 
-OUTPUT_DIR = os.path.join(APP_ROOT, "output", "qwen2511")
+OUTPUT_DIR = os.path.join(APP_ROOT, "output", "edits", "qwen_2511")
 
 
 
@@ -1190,7 +1190,7 @@ class Qwen2511Pane(QtWidgets.QWidget):
 
         if not fp:
             try:
-                QtWidgets.QMessageBox.information(self, "Play last result", "No outputs found yet in output/qwen2511.")
+                QtWidgets.QMessageBox.information(self, "Play last result", "No outputs found yet in output/edits/qwen_2511.")
             except Exception:
                 pass
             return
@@ -1940,9 +1940,9 @@ class Qwen2511Pane(QtWidgets.QWidget):
         bottom_row = QtWidgets.QHBoxLayout()
 
         self.btn_view_results = QtWidgets.QPushButton("View results")
-        self.btn_view_results.setToolTip("Open output/qwen2511 in Media Explorer.")
+        self.btn_view_results.setToolTip("Open output/edits/qwen_2511 in Media Explorer.")
         self.btn_play_last = QtWidgets.QPushButton("Play last result")
-        self.btn_play_last.setToolTip("Plays the newest file in output/qwen2511 using the internal media player.")
+        self.btn_play_last.setToolTip("Plays the newest file in output/edits/qwen_2511 using the internal media player.")
         self.chk_auto_show_results = QtWidgets.QCheckBox("Auto play result after run")
         self.chk_auto_show_results.setToolTip("When enabled, automatically plays the produced file in the internal media player after a successful run (same as 'Play last result').")
         self.chk_auto_compare = QtWidgets.QCheckBox("Compare before / after when done")
@@ -1952,7 +1952,7 @@ class Qwen2511Pane(QtWidgets.QWidget):
         self.chk_use_queue.setToolTip("When enabled, clicking Run will add this job to the Queue instead of running sd-cli immediately.")
         self.chk_use_queue.toggled.connect(self._on_use_queue_toggled)
         self.btn_run = QtWidgets.QPushButton("Run sd-cli")
-        self.btn_run.setToolTip("Runs sd-cli with the current settings. Output will be saved to output/qwen2511/.")
+        self.btn_run.setToolTip("Runs sd-cli with the current settings. Output will be saved to output/edits/qwen_2511/.")
         self.btn_cancel = QtWidgets.QPushButton("Cancel")
         self.btn_cancel.setToolTip("Stops the currently running process (downloader or sd-cli).")
         self.btn_cancel.setEnabled(False)
@@ -3224,7 +3224,7 @@ class Qwen2511Pane(QtWidgets.QWidget):
                 self.btn_run.setToolTip("Adds this Qwen2511 image edit job to the Queue (jobs/pending) to be processed by the worker.")
             else:
                 self.btn_run.setText("Run sd-cli")
-                self.btn_run.setToolTip("Runs sd-cli with the current settings. Output will be saved to output/qwen2511/.")
+                self.btn_run.setToolTip("Runs sd-cli with the current settings. Output will be saved to output/edits/qwen_2511/.")
         except Exception:
             pass
 

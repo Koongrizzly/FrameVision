@@ -216,7 +216,7 @@ def root_dir() -> Path:
 
 
 def settings_path() -> Path:
-    return root_dir() / "presets" / "presets" / "hunyuan15_settings.json"
+    return root_dir() / "presets" / "setsave" / "hunyuan15_settings.json"
 
 
 def _ffmpeg_exe() -> str | None:

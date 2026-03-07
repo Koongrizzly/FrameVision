@@ -6661,7 +6661,7 @@ class RenderWorker(QThread):
                 try:
                     from .viz_offline import render_visual_track
 
-                    self.progress.emit(92, "Rendering music-player visuals...")
+                    self.progress.emit(92, "Rendering music-player visuals, this will take longtime...")
                     visuals_path = os.path.join(tmpdir, "visuals_track.mp4")
                     # Use the target resolution if available; otherwise fall back to 1920x1080.
                     if self.target_resolution is not None:
@@ -6932,6 +6932,8 @@ class AutoMusicSyncWidget(QWidget):
         self._ffprobe = _find_ffprobe_from_env()
         self._analysis: Optional[MusicAnalysisResult] = None
         self._analysis_config = MusicAnalysisConfig()
+        self._analysis_audio_path: str = ""
+        self._analysis_sensitivity: Optional[int] = None
         self._worker: Optional[RenderWorker] = None
         self._scan_worker: Optional[SourceScanWorker] = None
         self._pending_audio: Optional[str] = None
@@ -9220,6 +9222,8 @@ class AutoMusicSyncWidget(QWidget):
         try:
             self._analysis = None
             self._analysis_config = MusicAnalysisConfig()
+            self._analysis_audio_path = ""
+            self._analysis_sensitivity = None
         except Exception:
             pass
 
@@ -11405,14 +11409,14 @@ class AutoMusicSyncWidget(QWidget):
 
     # analysis
 
-    def _on_analyze(self) -> None:
+    def _on_analyze(self, bypass_timeline_guard: bool = False) -> None:
         # If clips or images have been attached to the music timeline,
         # warn that a fresh analysis will wipe those overrides.
         try:
             has_overrides = bool(getattr(self, "_section_media", {}))
         except Exception:
             has_overrides = False
-        if has_overrides:
+        if has_overrides and not bool(bypass_timeline_guard):
             from PySide6.QtWidgets import QMessageBox
             box = QMessageBox(self)
             box.setIcon(QMessageBox.Warning)
@@ -11443,8 +11447,18 @@ class AutoMusicSyncWidget(QWidget):
         self._analysis_config.sensitivity = self.slider_sens.value()
         try:
             self._analysis = analyze_music(audio, self._ffmpeg, self._analysis_config)
+            try:
+                self._analysis_audio_path = os.path.normcase(os.path.abspath(audio))
+            except Exception:
+                self._analysis_audio_path = audio
+            try:
+                self._analysis_sensitivity = int(self._analysis_config.sensitivity)
+            except Exception:
+                self._analysis_sensitivity = None
         except Exception as e:
             self._analysis = None
+            self._analysis_audio_path = ""
+            self._analysis_sensitivity = None
             self.progress.setValue(0)
             self.progress.setFormat("Ready.")
             self._error("Analysis failed", str(e))
@@ -11606,10 +11620,77 @@ class AutoMusicSyncWidget(QWidget):
             except Exception:
                 pass
 
-        # Always analyze fresh for every creation so we never reuse
-        # segments from a previous music track, even if paths and
-        # settings look the same.
-        self._on_analyze()
+        use_existing_analysis = False
+        try:
+            current_audio_path = os.path.normcase(os.path.abspath(audio))
+        except Exception:
+            current_audio_path = audio
+        try:
+            current_sensitivity = int(self.slider_sens.value())
+        except Exception:
+            current_sensitivity = None
+        try:
+            cached_audio_path = str(getattr(self, "_analysis_audio_path", "") or "")
+        except Exception:
+            cached_audio_path = ""
+        try:
+            cached_sensitivity = getattr(self, "_analysis_sensitivity", None)
+            cached_sensitivity = int(cached_sensitivity) if cached_sensitivity is not None else None
+        except Exception:
+            cached_sensitivity = None
+        analysis_matches_current = bool(
+            self._analysis is not None
+            and cached_audio_path
+            and current_audio_path == cached_audio_path
+            and cached_sensitivity == current_sensitivity
+        )
+
+        try:
+            has_overrides = bool(getattr(self, "_section_media", {}))
+        except Exception:
+            has_overrides = False
+
+        if has_overrides and self._analysis is not None:
+            box = QMessageBox(self)
+            box.setIcon(QMessageBox.Question)
+            box.setWindowTitle("Timeline media detected")
+            if analysis_matches_current:
+                box.setText(
+                    "You already have clips/images attached to the timeline.\n\n"
+                    "Keep the current analysis and use those timeline selections, or start a new analysis?"
+                )
+            else:
+                box.setText(
+                    "You already have clips/images attached to the timeline.\n"
+                    "The current analysis does not match the currently selected audio/sensitivity.\n\n"
+                    "Keep the current analysis and use those timeline selections, or start a new analysis?"
+                )
+            btn_keep = box.addButton("Keep current analysis", QMessageBox.AcceptRole)
+            btn_new = box.addButton("Start new analysis", QMessageBox.YesRole)
+            btn_cancel = box.addButton("Cancel", QMessageBox.RejectRole)
+            box.setDefaultButton(btn_keep)
+            box.exec()
+            clicked = box.clickedButton()
+            if clicked is btn_cancel:
+                try:
+                    if getattr(self, "_direct_run_active", False):
+                        self._set_direct_run_active(False)
+                except Exception:
+                    pass
+                return
+            use_existing_analysis = clicked is btn_keep
+        elif analysis_matches_current:
+            use_existing_analysis = True
+
+        if not use_existing_analysis:
+            self._on_analyze(True)
+        else:
+            try:
+                self.progress.setValue(5)
+                self.progress.setFormat("Using existing music analysis...")
+            except Exception:
+                pass
+
         if self._analysis is None:
             try:
                 if getattr(self, "_direct_run_active", False):

@@ -137,7 +137,7 @@ class Paths:
     def from_root(root: Path) -> "Paths":
         sd = root / "presets" / "bin" / ("sd-cli.exe" if os.name == "nt" else "sd-cli")
         model_dir = root / "models" / "klein4b_gguf"
-        out_dir = root / "output" / "klein4b_gguf"
+        out_dir = root / "output" / "edits" / "flux_klein"
         out_dir.mkdir(parents=True, exist_ok=True)
         return Paths(root=str(root), sd_cli=str(sd), model_dir=str(model_dir), out_dir=str(out_dir))
 

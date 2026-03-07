@@ -2221,6 +2221,12 @@ class UpscPane(QtWidgets.QWidget):
                         QtWidgets.QMessageBox.critical(self, "SeedVR2 missing", f"Selected GGUF model was not found in models/SEEDVR2:\n{gguf_name}")
                         return
 
+                    # Use the actual parent folder of the selected GGUF.
+                    # The UI scans recursively, so a nested model can be found
+                    # here, but the CLI will fail if we always pass the top-level
+                    # models/SEEDVR2 folder instead of the file's real location.
+                    seedvr2_model_dir = gguf_path.parent
+
                     res = int((self.combo_seedvr2_res.currentText() or "1440").strip() or 1440)
                     if is_video and res >= 2160:
                         QtWidgets.QMessageBox.warning(self, "SeedVR2", "2160 is intended for image upscaling only. Please choose 1440 or lower for videos.")
@@ -2272,7 +2278,7 @@ class UpscPane(QtWidgets.QWidget):
                            "--output", str(outfile),
                            "--output_format", out_fmt,
                            "--video_backend", "ffmpeg",
-                           "--model_dir", str(SEEDVR2_MODELS_DIR),
+                           "--model_dir", str(seedvr2_model_dir),
                            "--dit_model", gguf_path.name,
                            "--resolution", str(res),
                            "--batch_size", str(int(self.spin_seedvr2_batch.value())),
@@ -2324,7 +2330,7 @@ class UpscPane(QtWidgets.QWidget):
                     self._append_log(f"Python: {SEEDVR2_ENV_PY}")
                     self._append_log(f"CLI: {SEEDVR2_CLI}")
                     self._append_log(f"Runner: {runner if runner else '(missing — using CLI directly)'}")
-                    self._append_log(f"Model dir: {SEEDVR2_MODELS_DIR}")
+                    self._append_log(f"Model dir: {seedvr2_model_dir}")
                     self._append_log(f"GGUF: {gguf_path.name}")
                     self._append_log(f"Upscale to: {res}")
                     self._append_log(f"Temporal overlap: {temporal}")
