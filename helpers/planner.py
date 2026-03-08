@@ -329,7 +329,7 @@ _PLANNER_SETTINGS_PATH = _root() / "presets" / "setsave" / "planner_settings.jso
 _PLANNER_UPSCALE_JSON_NAME = "planner_upscale.json"
 
 # Planner image-to-video prompt schema version
-_PLANNER_I2V_SCHEMA_VERSION = 2
+_PLANNER_I2V_SCHEMA_VERSION = 4
 
 
 def _load_planner_settings() -> Dict[str, Any]:
@@ -814,16 +814,17 @@ except Exception:
 _HUNYUAN_PRESETS = {
     # HunyuanVideo 1.5 proxy targets (used by Planner automation)
     # Tier mapping is driven by UI 'Generation quality' (Low/Medium/High).
-    # All tiers: 20 fps.
+    # Hunyuan high now uses the 720p I2V distilled model with 864x496 / target_size 656 at 15 fps.
+    # Other tiers keep the lighter 480p step-distilled path.
     "low": {
         "model": "hunyuan",
         "quality": "low",
         "res": "304p",
         "target_size": 420,   # aligns to Hunyuan 1.5 auto-bucket
         "fps": 20,
-        "steps": 10,
+        "steps": 8,
         "min_sec": 3.0,
-        "max_sec": 5.0,
+        "max_sec": 6.0,
         "max_frames": 121,
         "model_key": "480p_i2v_step_distilled",
         "attn_backend": "auto",
@@ -836,9 +837,9 @@ _HUNYUAN_PRESETS = {
         "res": "368p",
         "target_size": 480,
         "fps": 20,
-        "steps": 10,
-        "min_sec": 2.5,
-        "max_sec": 4.0,
+        "steps": 8,
+        "min_sec": 2.7,
+        "max_sec": 5.0,
         "max_frames": 97,
         "model_key": "480p_i2v_step_distilled",
         "attn_backend": "auto",
@@ -848,14 +849,14 @@ _HUNYUAN_PRESETS = {
     "high": {
         "model": "hunyuan",
         "quality": "high",
-        "res": "432p",
-        "target_size": 576,
-        "fps": 20,
-        "steps": 10,
-        "min_sec": 2.0,
-        "max_sec": 3.0,
-        "max_frames": 77,
-        "model_key": "480p_i2v_step_distilled",
+        "res": "864x496",
+        "target_size": 656,
+        "fps": 15,
+        "steps": 15,
+        "min_sec": 2.7,
+        "max_sec": 4.6,
+        "max_frames": 70,
+        "model_key": "720p_i2v_distilled",
         "attn_backend": "auto",
         "cpu_offload": True,
         "vae_tiling": True,
@@ -1351,21 +1352,314 @@ def _planner_sentence_chunks(text: Any) -> List[str]:
     return out
 
 
-def _planner_camera_motion_from_hint(camera_hint: Any) -> str:
+_PLANNER_I2V_CAMERA_USE_RATE_DYNAMIC = 0.60
+_PLANNER_I2V_CAMERA_USE_RATE_SLOW = 0.35
+_PLANNER_I2V_CAMERA_RECENT_LIMIT = 3
+_PLANNER_I2V_CAMERA_RECENT: List[str] = []
+_PLANNER_I2V_CAMERA_RECENT_FAMILIES: List[str] = []
+
+_PLANNER_I2V_CAMERA_VARIANTS: List[Dict[str, Any]] = [
+    {
+        'id': 'close_breath',
+        'family': 'close',
+        'weight': 1.0,
+        'buckets': ('close',),
+        'text': 'very slight push-in or breathing handheld drift while keeping the subject framed almost exactly the same',
+    },
+    {
+        'id': 'wide_reveal',
+        'family': 'wide',
+        'weight': 1.0,
+        'buckets': ('wide',),
+        'text': 'slow dolly or pan that reveals depth while keeping the spatial layout readable and stable',
+    },
+    {
+        'id': 'overhead_glide',
+        'family': 'overhead',
+        'weight': 1.0,
+        'buckets': ('overhead',),
+        'text': 'gentle overhead glide with the composition held steady and easy to read',
+    },
+    {
+        'id': 'angle_drift',
+        'family': 'angle',
+        'weight': 1.0,
+        'buckets': ('angle',),
+        'text': 'subtle perspective drift that preserves the current angle and keeps the pose readable',
+    },
+    {
+        'id': 'handheld_float',
+        'family': 'handheld',
+        'weight': 1.0,
+        'buckets': ('handheld',),
+        'text': 'soft handheld float only, with controlled micro-movement and no abrupt shake spikes',
+    },
+    {
+        'id': 'general_drift',
+        'family': 'general',
+        'weight': 1.0,
+        'buckets': ('general', 'close', 'wide', 'angle', 'handheld'),
+        'text': 'slow controlled camera drift with stable framing and no sudden reframing',
+    },
+    {
+        'id': 'general_push_lateral',
+        'family': 'general',
+        'weight': 1.0,
+        'buckets': ('general', 'close', 'wide', 'angle'),
+        'text': 'slow push or lateral drift that matches the current framing and keeps the composition stable',
+    },
+    {
+        'id': 'close_snap_push',
+        'family': 'push',
+        'weight': 0.95,
+        'buckets': ('close', 'angle', 'general'),
+        'text': 'short snap push-in that lands cleanly on the subject and then holds the frame steady',
+    },
+    {
+        'id': 'wide_track_left',
+        'family': 'track',
+        'weight': 0.95,
+        'buckets': ('wide', 'general'),
+        'text': 'smooth lateral track from left to right that keeps the full scene readable and musical',
+    },
+    {
+        'id': 'wide_track_right',
+        'family': 'track',
+        'weight': 0.95,
+        'buckets': ('wide', 'general'),
+        'text': 'smooth lateral track from right to left with the subject staying easy to read in frame',
+    },
+    {
+        'id': 'angle_arc_left',
+        'family': 'arc',
+        'weight': 0.9,
+        'buckets': ('angle', 'wide', 'general'),
+        'text': 'short arcing move around the subject from the left with brisk cinematic energy and a stable finish',
+    },
+    {
+        'id': 'angle_arc_right',
+        'family': 'arc',
+        'weight': 0.9,
+        'buckets': ('angle', 'wide', 'general'),
+        'text': 'short arcing move around the subject from the right, ending in a clean locked composition',
+    },
+    {
+        'id': 'tilt_rise',
+        'family': 'tilt',
+        'weight': 0.85,
+        'buckets': ('general', 'wide', 'angle'),
+        'text': 'controlled upward tilt that catches the subject and settles without breaking the framing',
+    },
+    {
+        'id': 'tilt_drop',
+        'family': 'tilt',
+        'weight': 0.85,
+        'buckets': ('general', 'wide', 'angle'),
+        'text': 'controlled downward tilt that lands on the subject with a quick stable lock at the end',
+    },
+    {
+        'id': 'pedestal_up',
+        'family': 'pedestal',
+        'weight': 0.8,
+        'buckets': ('general', 'wide', 'angle'),
+        'text': 'brief pedestal rise that adds vertical energy while keeping the composition sharp and readable',
+    },
+    {
+        'id': 'pedestal_down',
+        'family': 'pedestal',
+        'weight': 0.8,
+        'buckets': ('general', 'wide', 'angle'),
+        'text': 'brief pedestal drop that lands into the frame with a clean stable finish on the subject',
+    },
+    {
+        'id': 'diagonal_creep',
+        'family': 'diagonal',
+        'weight': 0.75,
+        'buckets': ('general', 'wide', 'angle', 'close'),
+        'text': 'diagonal camera creep with a slight foreground parallax feel, then a steady hold on the beat',
+    },
+    {
+        'id': 'profile_slide',
+        'family': 'profile',
+        'weight': 0.9,
+        'buckets': ('angle', 'general'),
+        'text': 'profile-side slide that keeps the subject readable while the camera glides past with intent',
+    },
+    {
+        'id': 'pull_back_reveal',
+        'family': 'pullback',
+        'weight': 0.8,
+        'buckets': ('wide', 'general'),
+        'text': 'short pull-back reveal that opens the frame and then stabilizes before the next beat',
+    },
+    {
+        'id': 'handheld_surge',
+        'family': 'handheld',
+        'weight': 0.85,
+        'buckets': ('handheld', 'general', 'close'),
+        'text': 'loose handheld surge toward the subject with music-video energy, ending in a controlled settle',
+    },
+    {
+        'id': 'low_angle_surge',
+        'family': 'angle',
+        'weight': 0.8,
+        'buckets': ('angle', 'general'),
+        'text': 'low-angle surge forward that makes the subject feel larger, then locks the frame on the beat',
+    },
+    {
+        'id': 'high_angle_drop',
+        'family': 'angle',
+        'weight': 0.8,
+        'buckets': ('angle', 'general', 'overhead'),
+        'text': 'high-angle drop into the shot that tightens the frame and settles just before the cut',
+    },
+    {
+        'id': 'whip_settle',
+        'family': 'whip',
+        'weight': 0.65,
+        'buckets': ('general', 'wide', 'angle'),
+        'text': 'quick whip-like lateral move that snaps into place and settles fast without losing the subject',
+    },
+    {
+        'id': 'shock_zoom',
+        'family': 'impact',
+        'weight': 0.35,
+        'buckets': ('general', 'close', 'angle', 'wide'),
+        'text': 'sudden shock zoom toward the subject like a falling rock, then a hard stop with a brief vibration before the frame holds',
+    },
+    {
+        'id': 'impact_punch',
+        'family': 'impact',
+        'weight': 0.35,
+        'buckets': ('general', 'close', 'angle'),
+        'text': 'fast punch-in toward the subject, ending in a tight frame with a tiny recoil tremor and stable hold',
+    },
+]
+
+
+_PLANNER_I2V_CAMERA_VARIANTS_SLOW: List[Dict[str, Any]] = [
+    {
+        'id': 'slow_push_in',
+        'family': 'slow_push',
+        'weight': 1.0,
+        'buckets': ('general', 'close', 'angle'),
+        'text': 'very slow cinematic push-in that gently tightens the frame while keeping the composition calm and readable',
+    },
+    {
+        'id': 'slow_pull_back',
+        'family': 'slow_pull',
+        'weight': 0.9,
+        'buckets': ('general', 'wide', 'angle'),
+        'text': 'very slow cinematic pull-back that opens the frame a little without changing the scene rhythm',
+    },
+    {
+        'id': 'slow_pan_left',
+        'family': 'slow_pan',
+        'weight': 0.85,
+        'buckets': ('general', 'wide', 'angle'),
+        'text': 'slow cinematic pan from right to left with stable framing and a calm storytelling feel',
+    },
+    {
+        'id': 'slow_pan_right',
+        'family': 'slow_pan',
+        'weight': 0.85,
+        'buckets': ('general', 'wide', 'angle'),
+        'text': 'slow cinematic pan from left to right, keeping the subject and layout easy to follow',
+    },
+    {
+        'id': 'slow_close_breath',
+        'family': 'slow_close',
+        'weight': 0.8,
+        'buckets': ('close', 'general'),
+        'text': 'near-static close framing with only a tiny cinematic breathing motion to keep the shot alive',
+    },
+    {
+        'id': 'slow_overhead_glide',
+        'family': 'slow_overhead',
+        'weight': 0.75,
+        'buckets': ('overhead', 'general', 'wide'),
+        'text': 'slow overhead glide with a very gentle cinematic drift and no abrupt reframing',
+    },
+]
+
+
+def _planner_reset_i2v_camera_state() -> None:
+    global _PLANNER_I2V_CAMERA_RECENT, _PLANNER_I2V_CAMERA_RECENT_FAMILIES
+    _PLANNER_I2V_CAMERA_RECENT = []
+    _PLANNER_I2V_CAMERA_RECENT_FAMILIES = []
+
+
+def _planner_camera_bucket_from_hint(camera_hint: Any) -> str:
     c = str(camera_hint or '').strip().lower()
     if not c:
-        return 'slow controlled camera drift with stable framing and no sudden reframing'
-    if any(k in c for k in ('close', 'close-up', 'portrait', 'macro')):
-        return 'very slight push-in or breathing handheld drift while keeping the subject framed almost exactly the same'
-    if any(k in c for k in ('wide', 'establishing', 'full body', 'long shot')):
-        return 'slow dolly or pan that reveals depth while keeping the spatial layout readable and stable'
-    if any(k in c for k in ('overhead', 'top down', 'bird', 'aerial')):
-        return 'gentle overhead glide with the composition held steady and easy to read'
-    if any(k in c for k in ('low angle', 'high angle', 'profile', 'side')):
-        return 'subtle perspective drift that preserves the current angle and keeps the pose readable'
+        return 'general'
+    if any(k in c for k in ('close', 'close-up', 'close up', 'portrait', 'macro')):
+        return 'close'
+    if any(k in c for k in ('wide', 'establishing', 'full body', 'long shot', 'full-body')):
+        return 'wide'
+    if any(k in c for k in ('overhead', 'top down', 'top-down', 'bird', 'birds-eye', "bird's-eye", 'aerial')):
+        return 'overhead'
     if any(k in c for k in ('handheld', 'shaky')):
-        return 'soft handheld float only, with controlled micro-movement and no abrupt shake spikes'
-    return 'slow push or lateral drift that matches the current framing and keeps the composition stable'
+        return 'handheld'
+    if any(k in c for k in ('low angle', 'high angle', 'profile', 'side', 'side view', 'profile view', 'three-quarter', '3/4')):
+        return 'angle'
+    return 'general'
+
+
+def _planner_camera_motion_from_hint(camera_hint: Any, dynamic_mode: bool = True) -> str:
+    global _PLANNER_I2V_CAMERA_RECENT, _PLANNER_I2V_CAMERA_RECENT_FAMILIES
+
+    use_rate = float(_PLANNER_I2V_CAMERA_USE_RATE_DYNAMIC if bool(dynamic_mode) else _PLANNER_I2V_CAMERA_USE_RATE_SLOW)
+    variant_pool = _PLANNER_I2V_CAMERA_VARIANTS if bool(dynamic_mode) else _PLANNER_I2V_CAMERA_VARIANTS_SLOW
+
+    if random.random() > use_rate:
+        return ''
+
+    bucket = _planner_camera_bucket_from_hint(camera_hint)
+    candidates = [
+        dict(item)
+        for item in variant_pool
+        if bucket in tuple(item.get('buckets') or ())
+    ]
+    if not candidates:
+        candidates = [dict(item) for item in variant_pool if 'general' in tuple(item.get('buckets') or ())]
+    if not candidates:
+        return ''
+
+    recent_ids = list(_PLANNER_I2V_CAMERA_RECENT[-int(_PLANNER_I2V_CAMERA_RECENT_LIMIT):])
+    recent_families = list(_PLANNER_I2V_CAMERA_RECENT_FAMILIES[-2:])
+
+    filtered = [
+        item for item in candidates
+        if str(item.get('id') or '') not in recent_ids and str(item.get('family') or '') not in recent_families
+    ]
+    if not filtered:
+        filtered = [item for item in candidates if str(item.get('id') or '') not in recent_ids]
+    if not filtered:
+        filtered = candidates[:]
+
+    weights: List[float] = []
+    for item in filtered:
+        weight = float(item.get('weight') or 1.0)
+        if bucket != 'general' and bucket in tuple(item.get('buckets') or ()):
+            weight *= 1.15
+        weights.append(max(0.05, weight))
+
+    try:
+        picked = random.choices(filtered, weights=weights, k=1)[0]
+    except Exception:
+        picked = random.choice(filtered)
+
+    pick_id = str(picked.get('id') or '').strip()
+    family = str(picked.get('family') or '').strip()
+    if pick_id:
+        _PLANNER_I2V_CAMERA_RECENT.append(pick_id)
+        _PLANNER_I2V_CAMERA_RECENT = _PLANNER_I2V_CAMERA_RECENT[-int(_PLANNER_I2V_CAMERA_RECENT_LIMIT):]
+    if family:
+        _PLANNER_I2V_CAMERA_RECENT_FAMILIES.append(family)
+        _PLANNER_I2V_CAMERA_RECENT_FAMILIES = _PLANNER_I2V_CAMERA_RECENT_FAMILIES[-int(_PLANNER_I2V_CAMERA_RECENT_LIMIT):]
+
+    return str(picked.get('text') or '').strip()
 
 
 def _planner_i2v_end_state_hint(phase: Any, notes: Any, next_text: Any) -> str:
@@ -1527,7 +1821,8 @@ def _planner_build_i2v_schema(
     environment_bits.append('allow only subtle natural scene motion such as drifting atmosphere, cloth or hair sway, moving reflections, or tiny background activity that fits the location')
     environment_motion = '; '.join([b for b in environment_bits if b])
 
-    camera_motion = _planner_camera_motion_from_hint(camera)
+    use_dynamic_camera = bool((enc or {}).get('use_20_camera_effects', True))
+    camera_motion = _planner_camera_motion_from_hint(camera, dynamic_mode=use_dynamic_camera)
     shot_intent = purpose or (f'play the {str(shot.get("phase") or "current").strip()} beat clearly and simply' if str(shot.get('phase') or '').strip() else 'deliver a simple controlled continuation of the image without introducing a new beat')
 
     start_parts = ['frame 1 must match the source image exactly']
@@ -1570,12 +1865,16 @@ def _planner_format_i2v_prompt(schema: Dict[str, Any]) -> str:
     parts = [
         f"Subject motion: {_planner_compact_text(schema.get('subject_motion') or '', 260)}",
         f"Environment motion: {_planner_compact_text(schema.get('environment_motion') or '', 320)}",
-        f"Camera motion: {_planner_compact_text(schema.get('camera_motion') or '', 220)}",
+    ]
+    camera_line = _planner_compact_text(schema.get('camera_motion') or '', 220)
+    if camera_line:
+        parts.append(f"Camera motion: {camera_line}")
+    parts.extend([
         f"Shot intent: {_planner_compact_text(schema.get('shot_intent') or '', 220)}",
         f"Start state: {_planner_compact_text(schema.get('start_state') or '', 360)}",
         f"End state: {_planner_compact_text(schema.get('end_state') or '', 280)}",
         f"Continuity locks: {lock_text}",
-    ]
+    ])
     return "\n".join([p for p in parts if p.strip()])
 
 
@@ -4034,6 +4333,36 @@ def _resolve_generation_profile(video_model_label: str, gen_quality_label: str) 
     if gk not in _HUNYUAN_PRESETS:
         gk = "medium"
     return dict(_HUNYUAN_PRESETS[gk])
+
+def _planner_force_interp_for_high(video_model_label: str, gen_quality_label: str) -> bool:
+    try:
+        return (_video_model_key(video_model_label) == "hunyuan") and (_normalize_key(gen_quality_label) == "high")
+    except Exception:
+        return False
+
+def _planner_interp_profile(video_model_label: str, gen_quality_label: str, planner_upscale_settings: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    obj = planner_upscale_settings if isinstance(planner_upscale_settings, dict) else {}
+    manual_enabled = bool(obj.get("interpolate_60fps_fast", False))
+    force_high = _planner_force_interp_for_high(video_model_label, gen_quality_label)
+
+    prof = _resolve_generation_profile(video_model_label, gen_quality_label)
+    try:
+        fps_in = int((prof or {}).get("fps") or 20)
+    except Exception:
+        fps_in = 20
+    fps_in = max(1, int(fps_in))
+
+    factor = 2 if force_high else 3
+    fps_out = max(fps_in + 1, int(fps_in * factor))
+
+    return {
+        "enabled": bool(manual_enabled or force_high),
+        "manual_enabled": bool(manual_enabled),
+        "forced_by_high": bool(force_high),
+        "factor": int(factor),
+        "fps_in": int(fps_in),
+        "fps_out": int(fps_out),
+    }
 
 def _stable_uniform(seed_text: str, lo: float, hi: float) -> float:
     # deterministic float in [lo, hi]
@@ -10113,6 +10442,7 @@ class PipelineWorker(QThread):
                     own_active0 = bool((enc0 or {}).get("own_character_bible_enabled"))
                 except Exception:
                     own_active0 = False
+                _planner_reset_i2v_camera_state()
 
                 for idx, sh in enumerate(shots):
                     sid = str(sh.get("id") or f"S{idx + 1:02d}")
@@ -13835,7 +14165,8 @@ class PipelineWorker(QThread):
             _pre_up = _peek_planner_upscale_settings(str(self.out_dir or ''))
             _pre_want_up = bool((_pre_up or {}).get("enabled", False))
             _pre_have_engine = bool(str((_pre_up or {}).get("engine_key") or '').strip())
-            _pre_want_interp = bool((_pre_up or {}).get("interpolate_60fps_fast", False))
+            _pre_interp_cfg = _planner_interp_profile(self.job.encoding.get("video_model") or "", self.job.encoding.get("gen_quality_preset") or "", _pre_up)
+            _pre_want_interp = bool((_pre_interp_cfg or {}).get("enabled", False))
 
             _tail_steps: List[str] = []
             if bool(_use_videoclip_creator):
@@ -13857,7 +14188,7 @@ class PipelineWorker(QThread):
             if bool(_pre_want_up and _pre_have_engine):
                 _tail_steps.append("Upscale final cut ")
             if bool(_pre_want_interp):
-                _tail_steps.append("Interpolate to 60fps ")
+                _tail_steps.append("Interpolate final output ")
             try:
                 if bool(getattr(self.job, "bake_subtitles", False)):
                     _tail_steps.append("Bake subtitles ")
@@ -14901,36 +15232,48 @@ class PipelineWorker(QThread):
 
             
 
-            # Step J: Interpolate final output to 60fps (Chunk 9C) — post-processing only
+            # Step J: Interpolate final output (Chunk 9C) — post-processing only
             # Conditions:
-            # - Planner interpolation toggle enabled (planner_upscale.json -> interpolate_60fps_fast)
+            # - Planner interpolation toggle enabled, OR forced by Hunyuan High quality
             # - Input selection:
             #     * If an upscaled final exists (from 9B2): interpolate that
             #     * Else: interpolate the raw final cut video
-            # Fixed settings (no UI):
-            # - Assume source FPS is 20
-            # - Interpolate x3 -> output 60fps
-            # - Use interp.py "Fast" profile: FFmpeg minterpolate (MCI), preset fast
-            _interp_step_name = "Interpolate to 60fps "
+            # Settings:
+            # - Manual mode keeps the old x3 interpolation flow
+            # - Hunyuan High forces interpolation ON and uses x2 instead
+            # - Use FFmpeg minterpolate (blend) as the fast post-step
+            _interp_step_name = "Interpolate final output "
+
+            # Apply interpolation if enabled (manual toggle OR forced by Hunyuan high preset)
+            _up_settings2 = _read_planner_upscale_settings(str(self.out_dir or ''))
+            _interp_cfg = _planner_interp_profile(
+                self.job.encoding.get("video_model") or "",
+                self.job.encoding.get("gen_quality_preset") or "",
+                _up_settings2,
+            )
+            _want_interp = bool((_interp_cfg or {}).get("enabled", False))
+
             def _step_interpolate_60fps() -> None:
                 # Input selection
                 src = out_up_path if _file_ok(out_up_path, 1024) else final_cut_mp4
                 if not _file_ok(src, 1024):
                     raise RuntimeError("No valid source video for interpolation.")
 
+                fps_out = max(2, int((_interp_cfg or {}).get("fps_out") or 60))
+                factor = max(1, int((_interp_cfg or {}).get("factor") or 3))
+                fps_in = max(1, int((_interp_cfg or {}).get("fps_in") or 20))
+                fps_tag = f"{fps_out}fps"
+
                 # Output naming (working filenames only)
                 if os.path.basename(src).lower().startswith("final_cut_upscaled"):
-                    out_interp = os.path.join(final_dir, "final_cut_upscaled_60fps.mp4")
+                    out_interp = os.path.join(final_dir, f"final_cut_upscaled_{fps_tag}.mp4")
                 else:
-                    out_interp = os.path.join(final_dir, "final_cut_60fps.mp4")
+                    out_interp = os.path.join(final_dir, f"final_cut_{fps_tag}.mp4")
 
-                log_path = os.path.join(final_dir, "interp_60fps_log.txt")
+                log_path = os.path.join(final_dir, f"interp_{fps_tag}_log.txt")
 
-                # Fast interpolation path (matches interp.py "Fast" profile): FFmpeg minterpolate (MCI)
-                # Fixed settings:
-                # - assume src fps is 20
-                # - target fps is 60 (x3)
-                vf = "minterpolate=fps=60:mi_mode=blend"
+                # Fast interpolation path (matches interp.py fast mode): FFmpeg minterpolate (blend)
+                vf = f"minterpolate=fps={fps_out}:mi_mode=blend"
 
                 cmd = [
                     ffmpeg2, "-hide_banner", "-y",
@@ -14947,7 +15290,7 @@ class PipelineWorker(QThread):
                 ]
 
                 with open(log_path, "a", encoding="utf-8", errors="ignore") as lf:
-                    lf.write(f"\n[ffmpeg] m make the videoplay more smooth (interpolate to 60fps\n")
+                    lf.write(f"\n[ffmpeg] interpolate final output to {fps_out}fps (x{factor}, src fps {fps_in})\n")
                     try:
                         lf.write("\n[cmd] " + " ".join([str(x) for x in cmd]) + "\n")
                     except Exception:
@@ -14979,7 +15322,7 @@ class PipelineWorker(QThread):
                             out_interp
                         ]
                     with open(log_path, "a", encoding="utf-8", errors="ignore") as lf:
-                        lf.write("\n[ffmpeg] encode 60fps (audio aac fallback)\n")
+                        lf.write(f"\n[ffmpeg] encode {fps_out}fps (audio aac fallback)\n")
                         try:
                             lf.write("\n[cmd] " + " ".join([str(x) for x in cmd2]) + "\n")
                         except Exception:
@@ -14995,24 +15338,26 @@ class PipelineWorker(QThread):
                 manifest["final_video"] = out_interp
                 _safe_write_json(manifest_path, manifest)
 
-            # Apply interpolation if enabled
-            _up_settings2 = _read_planner_upscale_settings(str(self.out_dir or ''))
-            _want_interp = bool((_up_settings2 or {}).get("interpolate_60fps_fast", False))
-
             if _want_interp:
                 # Determine current source for fingerprinting
                 _interp_src = out_up_path if _file_ok(out_up_path, 1024) else final_cut_mp4
-                _interp_out = os.path.join(final_dir, "final_cut_upscaled_60fps.mp4") if os.path.basename(_interp_src).lower().startswith("final_cut_upscaled") else os.path.join(final_dir, "final_cut_60fps.mp4")
+                _interp_fps_out = max(2, int((_interp_cfg or {}).get("fps_out") or 60))
+                _interp_fps_in = max(1, int((_interp_cfg or {}).get("fps_in") or 20))
+                _interp_factor = max(1, int((_interp_cfg or {}).get("factor") or 3))
+                _interp_tag = f"{_interp_fps_out}fps"
+                _interp_out = os.path.join(final_dir, f"final_cut_upscaled_{_interp_tag}.mp4") if os.path.basename(_interp_src).lower().startswith("final_cut_upscaled") else os.path.join(final_dir, f"final_cut_{_interp_tag}.mp4")
 
                 _interp_meta = {
-                    "v": 2,
+                    "v": 3,
                     "src": os.path.basename(_interp_src),
                     "src_sha1": _sha1_file(_interp_src),
                     "engine": "ffmpeg-minterpolate",
-                    "vf": "minterpolate=fps=60:mi_mode=blend",
+                    "vf": f"minterpolate=fps={_interp_fps_out}:mi_mode=blend",
                     "preset": "veryfast",
-                    "fps_in": 20,
-                    "fps_out": 60,
+                    "fps_in": _interp_fps_in,
+                    "fps_out": _interp_fps_out,
+                    "factor": _interp_factor,
+                    "forced_by_high": bool((_interp_cfg or {}).get("forced_by_high", False)),
                     "vb_kbps": 5000,
                 }
                 _interp_fp = _sha1_text(json.dumps(_interp_meta, sort_keys=True))
@@ -15283,7 +15628,7 @@ class PipelineWorker(QThread):
                 "- audio/ (music, narration, transcripts when enabled)\n"
                 "- final/<jobid>_final.mp4 (assembled video)\n"
                 "- manifest.json (paths + step statuses)\n"
-                "Note: Upscaling and 60fps interpolation are optional post-steps (when enabled).\n"
+                "Note: Upscaling and interpolation are optional post-steps (when enabled).\n"
             )
 
             try:
@@ -16787,10 +17132,10 @@ If the planner sees a marker like [02] or (02), it becomes the next image prompt
             "Auto",
             "Qwen Image 2512",
             "SDXL (Lowest vram, fast, low quality)",
-            "Z-image Turbo (FP16 High VRAM)",
-            "Z-image Turbo (GGUF Low VRAM)",
-            "Flux Klein (Very Fast, low vram, no NSFW).",
-            "Flux Klein 9B (Higher quality, a little slower).",
+            "Z-image Turbo FP16 (slower, best quality, High VRAM)",
+            "Z-image Turbo GGUF (high quality, fast, Low VRAM)",
+            "Flux Klein 4B (Very Fast, low vram, no NSFW).",
+            "Flux Klein 9B (little higher quality, No NSFW).",
             "More (Maybe later)",
         ])
         # Default text-to-image engine: Z-image Turbo (GGUF Low VRAM)
@@ -16845,7 +17190,28 @@ If the planner sees a marker like [02] or (02), it becomes the next image prompt
         self.cmb_video_model.currentIndexChanged.connect(lambda _=None: _refresh_gen_quality())
         _refresh_gen_quality()
 
-        grid.addWidget(QLabel("Videoclip Creator preset"), 3, 0)
+        lbl_camera_fx = QLabel("Use 20 different camera effects")
+        self.chk_use_20_camera_effects = QCheckBox("Enabled")
+        try:
+            _camera_fx_tip = "Use for music videoclips or footage that allows lots of camera movement. When off, it will use only a couple of cinematic camera moves."
+            lbl_camera_fx.setToolTip(_camera_fx_tip)
+            self.chk_use_20_camera_effects.setToolTip(_camera_fx_tip)
+        except Exception:
+            pass
+        self.chk_use_20_camera_effects.setChecked(True)
+        try:
+            s = _load_planner_settings()
+            self.chk_use_20_camera_effects.setChecked(bool(s.get("use_20_camera_effects", True)))
+        except Exception:
+            pass
+        try:
+            self.chk_use_20_camera_effects.toggled.connect(self._on_toggle_use_20_camera_effects)
+        except Exception:
+            pass
+        grid.addWidget(lbl_camera_fx, 3, 0)
+        grid.addWidget(self.chk_use_20_camera_effects, 3, 1)
+
+        grid.addWidget(QLabel("Videoclip Creator preset"), 4, 0)
         self.cmb_videoclip_preset = QComboBox()
         try:
             self.cmb_videoclip_preset.currentIndexChanged.connect(self._on_videoclip_creator_preset_changed)
@@ -16863,7 +17229,7 @@ If the planner sees a marker like [02] or (02), it becomes the next image prompt
             except Exception:
                 pass
 
-        grid.addWidget(self.cmb_videoclip_preset, 3, 1)
+        grid.addWidget(self.cmb_videoclip_preset, 4, 1)
 
         # External Videoclip Creator: clip order (only visible for JSON presets)
         self.lbl_videoclip_clip_order = QLabel("Clip order")
@@ -16877,8 +17243,8 @@ If the planner sees a marker like [02] or (02), it becomes the next image prompt
             self.cmb_videoclip_clip_order.currentIndexChanged.connect(self._on_videoclip_creator_clip_order_changed)
         except Exception:
             pass
-        grid.addWidget(self.lbl_videoclip_clip_order, 4, 0)
-        grid.addWidget(self.cmb_videoclip_clip_order, 4, 1)
+        grid.addWidget(self.lbl_videoclip_clip_order, 5, 0)
+        grid.addWidget(self.cmb_videoclip_clip_order, 5, 1)
 
         # Safeguard: Videoclip Creator presets are not compatible with Narration.
         self.lbl_videoclip_preset_hint = QLabel("Disable narration to have more presets")
@@ -16891,7 +17257,7 @@ If the planner sees a marker like [02] or (02), it becomes the next image prompt
             self.lbl_videoclip_preset_hint.setVisible(False)
         except Exception:
             pass
-        grid.addWidget(self.lbl_videoclip_preset_hint, 5, 0, 1, 2)
+        grid.addWidget(self.lbl_videoclip_preset_hint, 6, 0, 1, 2)
 
         lay.addLayout(grid)
 
@@ -16910,7 +17276,7 @@ If the planner sees a marker like [02] or (02), it becomes the next image prompt
         # Chunk 9B1: Planner-only Upscaling (no execution yet)
         lay.addWidget(self._build_upscaling_group())
 
-        # Chunk 9C: Optional interpolation post-step (60fps)
+        # Chunk 9C: Optional interpolation post-step
         lay.addWidget(self._build_interpolation_group())
 
 
@@ -17394,8 +17760,8 @@ If the planner sees a marker like [02] or (02), it becomes the next image prompt
 
         row = QHBoxLayout()
         row.setSpacing(8)
-        self.chk_planner_interp60 = QCheckBox("Make video playback more smooth (Interpolate to 60fps)")
-        self.lbl_planner_interp60_hint = QLabel("Interpolation done with Rife.")
+        self.chk_planner_interp60 = QCheckBox("Make video playback more smooth (Interpolate)")
+        self.lbl_planner_interp60_hint = QLabel("Interpolation is applied as a post-step.")
         try:
             self.lbl_planner_interp60_hint.setStyleSheet("opacity: 0.8;")
         except Exception:
@@ -18779,7 +19145,7 @@ If the planner sees a marker like [02] or (02), it becomes the next image prompt
             if final_ok:
                 mask |= _AssetsDotsDelegate.HAS_FINAL
 
-            # Optional post-steps (planner settings): upscaling + 60fps interpolation
+            # Optional post-steps (planner settings): upscaling + interpolation
             # Prefer manifest path pointers, fallback to step status.
             upscaled_ok = False
             interpolated_ok = False
@@ -18814,7 +19180,7 @@ If the planner sees a marker like [02] or (02), it becomes the next image prompt
                                 continue
                             if (not upscaled_ok) and ("upscale" in kk):
                                 upscaled_ok = True
-                            if (not interpolated_ok) and ("interpolate" in kk and "60" in kk):
+                            if (not interpolated_ok) and ("interpolate" in kk):
                                 interpolated_ok = True
                         except Exception:
                             continue
@@ -18830,7 +19196,7 @@ If the planner sees a marker like [02] or (02), it becomes the next image prompt
             tip_lines.append(f"Sound files: {aud_n}")
             tip_lines.append(f"Final cut: {'Yes' if final_ok else 'No'}")
             tip_lines.append(f"Upscaled: {'Yes' if upscaled_ok else 'No'}")
-            tip_lines.append(f"Interpolated (60fps): {'Yes' if interpolated_ok else 'No'}")
+            tip_lines.append(f"Interpolated: {'Yes' if interpolated_ok else 'No'}")
             assets_tip = "\n".join(tip_lines)
 
             out.append({
@@ -19558,6 +19924,15 @@ If the planner sees a marker like [02] or (02), it becomes the next image prompt
                 self._save_planner_queue_state()
             except Exception:
                 pass
+
+    def _on_toggle_use_20_camera_effects(self, on: bool) -> None:
+        """Persist Planner I2V camera-mode toggle (dynamic randomizer vs calm cinematic pool)."""
+        try:
+            s = _load_planner_settings()
+            s["use_20_camera_effects"] = bool(on)
+            _save_planner_settings(s)
+        except Exception:
+            pass
 
     def _on_toggle_allow_edit_while_running(self, on: bool) -> None:
         """Chunk 8A: Persist the interactive review/edit gate toggle."""
@@ -20440,6 +20815,7 @@ If the planner sees a marker like [02] or (02), it becomes the next image prompt
             "videoclip_preset": (self.cmb_videoclip_preset.currentText() if hasattr(self, "cmb_videoclip_preset") else "Storyline Preset (Hardcuts)"),
             "videoclip_creator_clip_order": (self.cmb_videoclip_clip_order.currentText() if hasattr(self, "cmb_videoclip_clip_order") else "Sequential (default)"),
             "gen_quality_preset": (self.cmb_gen_quality.currentText() if hasattr(self, "cmb_gen_quality") else ""),
+            "use_20_camera_effects": bool(getattr(self, "chk_use_20_camera_effects", None) and self.chk_use_20_camera_effects.isChecked()),
             "allow_edit_while_running": bool(getattr(self, "chk_allow_edit_while_running", None) and self.chk_allow_edit_while_running.isChecked()),
             "character_bible_enabled": bool(getattr(self, "chk_character_bible", None) and self.chk_character_bible.isChecked()),
             "own_character_bible_enabled": bool(getattr(self, "chk_own_character_bible", None) and self.chk_own_character_bible.isChecked()),

@@ -7,6 +7,7 @@ import mimetypes
 import os
 import re
 import socket
+import subprocess
 import sys
 import time
 import uuid
@@ -40,6 +41,81 @@ def _find_fv_root() -> str:
 
 def _settings_path(fv_root: str) -> str:
     return os.path.join(fv_root, "presets", "setsave", "llama_chat_ui.json")
+
+
+BUBBLE_COLOR_OPTIONS: List[Tuple[str, str]] = [
+    ("Blue", "#3d6fd6"),
+    ("Teal", "#2d8b8b"),
+    ("Purple", "#7a54d1"),
+    ("Pink", "#ba548e"),
+    ("Green", "#3e8a52"),
+    ("Orange", "#c97a2c"),
+    ("Red", "#b65353"),
+    ("Slate", "#56657f"),
+]
+DEFAULT_BUBBLE_BASE_COLOR = "#56657f"
+DEFAULT_BUBBLE_USER_COLOR = "#33425f"
+DEFAULT_BUBBLE_ASSISTANT_COLOR = "#212734"
+
+
+def _normalize_hex_color(value: str, default: str) -> str:
+    s = str(value or "").strip()
+    if not s:
+        return default
+    if not s.startswith("#"):
+        s = "#" + s
+    if re.fullmatch(r"#[0-9a-fA-F]{6}", s):
+        return s.lower()
+    return default
+
+
+def _hex_to_rgb(value: str) -> Tuple[int, int, int]:
+    color = _normalize_hex_color(value, "#000000")
+    return int(color[1:3], 16), int(color[3:5], 16), int(color[5:7], 16)
+
+
+def _mix_hex(color_a: str, color_b: str, ratio: float) -> str:
+    ratio = max(0.0, min(1.0, float(ratio)))
+    ar, ag, ab = _hex_to_rgb(color_a)
+    br, bg, bb = _hex_to_rgb(color_b)
+    rr = int(round(ar + (br - ar) * ratio))
+    rg = int(round(ag + (bg - ag) * ratio))
+    rb = int(round(ab + (bb - ab) * ratio))
+    return f"#{rr:02x}{rg:02x}{rb:02x}"
+
+
+def _color_luminance(color: str) -> float:
+    r, g, b = _hex_to_rgb(color)
+    return (0.2126 * r + 0.7152 * g + 0.0722 * b) / 255.0
+
+
+def _text_color_for_bg(color: str) -> str:
+    return "#10151e" if _color_luminance(color) >= 0.64 else "#edf2fa"
+
+
+def _role_color_for_bg(color: str) -> str:
+    text = _text_color_for_bg(color)
+    return _mix_hex(text, color, 0.42)
+
+
+def _bubble_colors_from_settings(auto_mode: bool, base_color: str, assistant_color: str, user_color: str) -> Dict[str, str]:
+    base_color = _normalize_hex_color(base_color, DEFAULT_BUBBLE_BASE_COLOR)
+    assistant_color = _normalize_hex_color(assistant_color, DEFAULT_BUBBLE_ASSISTANT_COLOR)
+    user_color = _normalize_hex_color(user_color, DEFAULT_BUBBLE_USER_COLOR)
+    if auto_mode:
+        user_bg = _mix_hex(base_color, "#ffffff", 0.18)
+        assistant_bg = _mix_hex(base_color, "#000000", 0.46)
+    else:
+        user_bg = user_color
+        assistant_bg = assistant_color
+    return {
+        "user_bg": user_bg,
+        "assistant_bg": assistant_bg,
+        "user_text": _text_color_for_bg(user_bg),
+        "assistant_text": _text_color_for_bg(assistant_bg),
+        "user_role": _role_color_for_bg(user_bg),
+        "assistant_role": _role_color_for_bg(assistant_bg),
+    }
 
 
 def _chat_dir(fv_root: str) -> str:
@@ -639,6 +715,211 @@ def _attachment_summary_lines(attachments: List[Dict]) -> List[str]:
         lines.append(_attachment_label(att))
     return lines
 
+
+def _format_file_size(num_bytes: int) -> str:
+    try:
+        num = float(max(0, int(num_bytes)))
+    except Exception:
+        return "0 B"
+    units = ["B", "KB", "MB", "GB", "TB"]
+    idx = 0
+    while num >= 1024.0 and idx < len(units) - 1:
+        num /= 1024.0
+        idx += 1
+    return f"{num:.1f} {units[idx]}" if idx else f"{int(num)} {units[idx]}"
+
+
+def _attachment_display_text(att: Dict) -> str:
+    name = str(att.get("name", "attachment") or "attachment")
+    kind = str(att.get("kind", "file") or "file")
+    try:
+        size_text = _format_file_size(os.path.getsize(str(att.get("path", "") or "")))
+    except Exception:
+        size_text = "missing"
+    label = "Image" if kind == "image" else "Text" if kind == "text" else "File"
+    return f"{name}\n{label} • {size_text}"
+
+
+def _make_attachment_thumbnail(att: Dict, size: int = 56) -> QtGui.QIcon:
+    kind = str(att.get("kind", "file") or "file")
+    path = str(att.get("path", "") or "")
+    name = str(att.get("name", "attachment") or "attachment")
+    canvas = QtGui.QPixmap(size, size)
+    canvas.fill(QtCore.Qt.transparent)
+
+    painter = QtGui.QPainter(canvas)
+    painter.setRenderHint(QtGui.QPainter.Antialiasing, True)
+    painter.setRenderHint(QtGui.QPainter.SmoothPixmapTransform, True)
+
+    rect = QtCore.QRectF(0.5, 0.5, size - 1.0, size - 1.0)
+    path_shape = QtGui.QPainterPath()
+    path_shape.addRoundedRect(rect, 10, 10)
+
+    if kind == "image":
+        painter.fillPath(path_shape, QtGui.QColor(34, 40, 52))
+        pix = QtGui.QPixmap(path) if path and os.path.isfile(path) else QtGui.QPixmap()
+        if not pix.isNull():
+            scaled = pix.scaled(size - 8, size - 8, QtCore.Qt.KeepAspectRatio, QtCore.Qt.SmoothTransformation)
+            clip = QtGui.QPainterPath()
+            clip.addRoundedRect(QtCore.QRectF(2, 2, size - 4, size - 4), 8, 8)
+            painter.setClipPath(clip)
+            painter.drawPixmap(int((size - scaled.width()) / 2), int((size - scaled.height()) / 2), scaled)
+            painter.setClipping(False)
+        else:
+            painter.setPen(QtGui.QPen(QtGui.QColor(196, 208, 231)))
+            font = painter.font()
+            font.setBold(True)
+            font.setPointSize(10)
+            painter.setFont(font)
+            painter.drawText(QtCore.QRect(0, 0, size, size), QtCore.Qt.AlignCenter, "IMG")
+    else:
+        bg = QtGui.QColor(70, 92, 135) if kind == "text" else QtGui.QColor(92, 84, 118)
+        painter.fillPath(path_shape, bg)
+        ext = os.path.splitext(name)[1].lower().lstrip(".")[:4].upper()
+        short = ext or ("TXT" if kind == "text" else "FILE")
+        painter.setPen(QtGui.QPen(QtGui.QColor(245, 247, 252)))
+        font = painter.font()
+        font.setBold(True)
+        font.setPointSize(11 if len(short) <= 3 else 9)
+        painter.setFont(font)
+        painter.drawText(QtCore.QRect(4, 6, size - 8, size - 12), QtCore.Qt.AlignCenter, short)
+
+    painter.setPen(QtGui.QPen(QtGui.QColor(58, 67, 84), 1))
+    painter.drawRoundedRect(QtCore.QRectF(0.5, 0.5, size - 1.0, size - 1.0), 10, 10)
+    painter.end()
+    return QtGui.QIcon(canvas)
+
+
+def _open_local_path(path: str, open_with_dialog: bool = False) -> Tuple[bool, str]:
+    path = os.path.abspath(str(path or ""))
+    if not path or not os.path.exists(path):
+        return False, "File no longer exists on disk."
+    try:
+        if open_with_dialog and sys.platform.startswith("win"):
+            subprocess.Popen(["rundll32.exe", "shell32.dll,OpenAs_RunDLL", path])
+            return True, ""
+        if sys.platform.startswith("win"):
+            os.startfile(path)
+            return True, ""
+        ok = QtGui.QDesktopServices.openUrl(QtCore.QUrl.fromLocalFile(path))
+        return (True, "") if ok else (False, "Could not hand file off to the operating system.")
+    except Exception as e:
+        return False, str(e)
+
+
+class AttachmentPreviewDialog(QtWidgets.QDialog):
+    def __init__(self, att: Dict, parent=None):
+        super().__init__(parent)
+        self.att = dict(att or {})
+        self.path = os.path.abspath(str(self.att.get("path", "") or ""))
+        self.kind = str(self.att.get("kind", "file") or "file")
+        self.name = str(self.att.get("name", "attachment") or "attachment")
+        self.mime = str(self.att.get("mime", "") or mimetypes.guess_type(self.path)[0] or "application/octet-stream")
+
+        self.setWindowTitle(f"Preview - {self.name}")
+        self.resize(920, 720)
+
+        lay = QtWidgets.QVBoxLayout(self)
+        lay.setContentsMargins(14, 14, 14, 14)
+        lay.setSpacing(10)
+
+        hdr = QtWidgets.QFrame()
+        hdr_lay = QtWidgets.QVBoxLayout(hdr)
+        hdr_lay.setContentsMargins(0, 0, 0, 0)
+        hdr_lay.setSpacing(4)
+        lbl_name = QtWidgets.QLabel(self.name)
+        font = lbl_name.font()
+        font.setPointSize(font.pointSize() + 1)
+        font.setBold(True)
+        lbl_name.setFont(font)
+        hdr_lay.addWidget(lbl_name)
+
+        try:
+            size_text = _format_file_size(os.path.getsize(self.path))
+        except Exception:
+            size_text = "missing"
+        lbl_meta = QtWidgets.QLabel(f"{self.kind} • {size_text} • {self.mime}")
+        lbl_meta.setStyleSheet("color:#9aa3b3;")
+        hdr_lay.addWidget(lbl_meta)
+
+        lbl_path = QtWidgets.QLabel(self.path or "")
+        lbl_path.setTextInteractionFlags(QtCore.Qt.TextSelectableByMouse)
+        lbl_path.setWordWrap(True)
+        lbl_path.setStyleSheet("color:#9aa3b3;")
+        hdr_lay.addWidget(lbl_path)
+        lay.addWidget(hdr)
+
+        if self.kind == "image" and self.path and os.path.isfile(self.path):
+            pix = QtGui.QPixmap(self.path)
+            if not pix.isNull():
+                area = QtWidgets.QScrollArea()
+                area.setWidgetResizable(True)
+                holder = QtWidgets.QWidget()
+                holder_lay = QtWidgets.QVBoxLayout(holder)
+                holder_lay.setContentsMargins(10, 10, 10, 10)
+                holder_lay.addStretch(1)
+                lbl_img = QtWidgets.QLabel()
+                lbl_img.setAlignment(QtCore.Qt.AlignCenter)
+                target = pix
+                if pix.width() > 1400 or pix.height() > 900:
+                    target = pix.scaled(1400, 900, QtCore.Qt.KeepAspectRatio, QtCore.Qt.SmoothTransformation)
+                lbl_img.setPixmap(target)
+                holder_lay.addWidget(lbl_img, 0, QtCore.Qt.AlignCenter)
+                holder_lay.addStretch(1)
+                area.setWidget(holder)
+                lay.addWidget(area, 1)
+            else:
+                msg = QtWidgets.QLabel("Could not decode this image for preview.")
+                msg.setAlignment(QtCore.Qt.AlignCenter)
+                lay.addWidget(msg, 1)
+        elif self.kind == "text" and self.path and os.path.isfile(self.path):
+            viewer = QtWidgets.QPlainTextEdit()
+            viewer.setReadOnly(True)
+            viewer.setLineWrapMode(QtWidgets.QPlainTextEdit.NoWrap)
+            try:
+                viewer.setPlainText(_read_text_attachment(self.path, max_chars=120000))
+            except Exception as e:
+                viewer.setPlainText(f"Could not read file:\n{e}")
+            lay.addWidget(viewer, 1)
+        else:
+            info = QtWidgets.QPlainTextEdit()
+            info.setReadOnly(True)
+            info.setPlainText(
+                f"Name: {self.name}\n"
+                f"Kind: {self.kind}\n"
+                f"Mime: {self.mime}\n"
+                f"Path: {self.path}\n"
+                f"Status: {'Found on disk' if self.path and os.path.exists(self.path) else 'Missing'}"
+            )
+            lay.addWidget(info, 1)
+
+        btn_row = QtWidgets.QHBoxLayout()
+        btn_row.addStretch(1)
+        self.btn_open = QtWidgets.QPushButton("Open")
+        self.btn_close = QtWidgets.QPushButton("Close")
+        btn_row.addWidget(self.btn_open)
+        if self.kind in {"text", "file"}:
+            self.btn_open_with = QtWidgets.QPushButton("Open with…")
+            btn_row.addWidget(self.btn_open_with)
+            self.btn_open_with.clicked.connect(self._open_with)
+        self.btn_close.clicked.connect(self.accept)
+        self.btn_open.clicked.connect(self._open_default)
+        btn_row.addWidget(self.btn_close)
+        lay.addLayout(btn_row)
+
+    def _open_default(self):
+        ok, err = _open_local_path(self.path, open_with_dialog=False)
+        if ok:
+            self.accept()
+            return
+        QtWidgets.QMessageBox.warning(self, "Open failed", err or "Could not open file.")
+
+    def _open_with(self):
+        ok, err = _open_local_path(self.path, open_with_dialog=True)
+        if ok:
+            return
+        QtWidgets.QMessageBox.warning(self, "Open with failed", err or "Could not open file chooser.")
+
 # -----------------------------
 # Data models
 # -----------------------------
@@ -787,23 +1068,16 @@ class MessageBubble(QtWidgets.QFrame):
             text_lbl = QtWidgets.QLabel(text)
             if role == "assistant":
                 text_lbl.setObjectName("AnswerText")
+            elif role == "user":
+                text_lbl.setObjectName("UserText")
+            else:
+                text_lbl.setObjectName("InfoText")
             text_lbl.setWordWrap(True)
             text_lbl.setTextInteractionFlags(QtCore.Qt.TextSelectableByMouse)
             bubble_lay.addWidget(text_lbl)
 
-        if role == "user":
-            outer.addStretch(1)
-            outer.addWidget(bubble, 0)
-            bubble.setMaximumWidth(700)
-        elif role == "assistant":
-            outer.addWidget(bubble, 0)
-            outer.addStretch(1)
-            bubble.setMaximumWidth(860)
-        else:
-            outer.addStretch(1)
-            outer.addWidget(bubble, 0)
-            outer.addStretch(1)
-            bubble.setMaximumWidth(860)
+        bubble.setSizePolicy(QtWidgets.QSizePolicy.Expanding, QtWidgets.QSizePolicy.Maximum)
+        outer.addWidget(bubble, 1)
 
 
 class ChatScrollArea(QtWidgets.QScrollArea):
@@ -931,6 +1205,72 @@ class ChatCompletionThread(QtCore.QThread):
             self.failed.emit(str(e))
 
 
+class BubbleColorButton(QtWidgets.QPushButton):
+    colorChanged = QtCore.Signal(str)
+
+    def __init__(self, color: str, title: str, parent=None):
+        super().__init__(parent)
+        self._title = title
+        self._color = _normalize_hex_color(color, DEFAULT_BUBBLE_BASE_COLOR)
+        self.clicked.connect(self._show_picker)
+        self.setMinimumWidth(170)
+        self._refresh_appearance()
+
+    def color(self) -> str:
+        return self._color
+
+    def setColor(self, color: str, emit: bool = False):
+        color = _normalize_hex_color(color, self._color or DEFAULT_BUBBLE_BASE_COLOR)
+        changed = (color != self._color)
+        self._color = color
+        self._refresh_appearance()
+        if emit and changed:
+            self.colorChanged.emit(self._color)
+
+    def _color_name(self) -> str:
+        for label, value in BUBBLE_COLOR_OPTIONS:
+            if value.lower() == self._color.lower():
+                return label
+        return self._color.upper()
+
+    def _refresh_appearance(self):
+        swatch = QtGui.QPixmap(18, 18)
+        swatch.fill(QtCore.Qt.transparent)
+        painter = QtGui.QPainter(swatch)
+        painter.setRenderHint(QtGui.QPainter.Antialiasing, True)
+        painter.setPen(QtGui.QPen(QtGui.QColor("#2a3140"), 1))
+        painter.setBrush(QtGui.QColor(self._color))
+        painter.drawRoundedRect(QtCore.QRectF(0.5, 0.5, 17.0, 17.0), 4, 4)
+        painter.end()
+        self.setIcon(QtGui.QIcon(swatch))
+        self.setText(self._color_name())
+        self.setToolTip(f"{self._title}: {self._color}")
+
+    def _show_picker(self):
+        menu = QtWidgets.QMenu(self)
+        host = QtWidgets.QWidget(menu)
+        grid = QtWidgets.QGridLayout(host)
+        grid.setContentsMargins(8, 8, 8, 8)
+        grid.setHorizontalSpacing(6)
+        grid.setVerticalSpacing(6)
+        for idx, (label, value) in enumerate(BUBBLE_COLOR_OPTIONS):
+            btn = QtWidgets.QToolButton(host)
+            btn.setToolTip(f"{label} {value}")
+            btn.setAutoRaise(True)
+            btn.setFixedSize(34, 34)
+            border = "3px solid #eff3f9" if value.lower() == self._color.lower() else "1px solid #2f3645"
+            btn.setStyleSheet(
+                f"QToolButton {{ background: {value}; border: {border}; border-radius: 9px; }}"
+                "QToolButton:hover { border-color: #ffffff; }"
+            )
+            btn.clicked.connect(lambda _=False, c=value, m=menu: (m.close(), self.setColor(c, emit=True)))
+            grid.addWidget(btn, idx // 4, idx % 4)
+        action = QtWidgets.QWidgetAction(menu)
+        action.setDefaultWidget(host)
+        menu.addAction(action)
+        menu.exec(self.mapToGlobal(QtCore.QPoint(0, self.height())))
+
+
 # -----------------------------
 # Settings dialog
 # -----------------------------
@@ -986,6 +1326,12 @@ class SettingsDialog(QtWidgets.QDialog):
         self.lbl_templates_dir = QtWidgets.QLabel(_templates_root(fv_root))
         self.lbl_templates_dir.setWordWrap(True)
 
+        self.chk_bubble_auto = QtWidgets.QCheckBox("Auto pair")
+        self.chk_bubble_auto.setChecked(False)
+        self.btn_bubble_auto_color = BubbleColorButton(DEFAULT_BUBBLE_BASE_COLOR, "Auto bubble color")
+        self.btn_bubble_assistant_color = BubbleColorButton(DEFAULT_BUBBLE_ASSISTANT_COLOR, "Chat bubble color")
+        self.btn_bubble_user_color = BubbleColorButton(DEFAULT_BUBBLE_USER_COLOR, "User bubble color")
+
         r = 0
         form.addWidget(QtWidgets.QLabel("Runner"), r, 0)
         form.addWidget(self.ed_runner, r, 1)
@@ -1027,6 +1373,23 @@ class SettingsDialog(QtWidgets.QDialog):
         lay.addWidget(QtWidgets.QLabel("Template folder"))
         lay.addWidget(self.lbl_templates_dir)
 
+        bubble_box = QtWidgets.QGroupBox("Chat bubble colors")
+        bubble_lay = QtWidgets.QGridLayout(bubble_box)
+        bubble_lay.setHorizontalSpacing(10)
+        bubble_lay.setVerticalSpacing(8)
+        bubble_lay.addWidget(self.chk_bubble_auto, 0, 0, 1, 2)
+        bubble_lay.addWidget(QtWidgets.QLabel("Auto color"), 1, 0)
+        bubble_lay.addWidget(self.btn_bubble_auto_color, 1, 1)
+        bubble_lay.addWidget(QtWidgets.QLabel("Chat bubble"), 2, 0)
+        bubble_lay.addWidget(self.btn_bubble_assistant_color, 2, 1)
+        bubble_lay.addWidget(QtWidgets.QLabel("User bubble"), 3, 0)
+        bubble_lay.addWidget(self.btn_bubble_user_color, 3, 1)
+        bubble_hint = QtWidgets.QLabel("Auto uses one color and creates a darker chat bubble plus a lighter user bubble.")
+        bubble_hint.setWordWrap(True)
+        bubble_hint.setObjectName("SubtleLabel")
+        bubble_lay.addWidget(bubble_hint, 4, 0, 1, 2)
+        lay.addWidget(bubble_box)
+
         hint = QtWidgets.QLabel(
             "Tip: pick llama-server.exe directly when possible. If you pick another llama.cpp binary, this UI will also look for a sibling llama-server executable in the same folder."
         )
@@ -1042,6 +1405,11 @@ class SettingsDialog(QtWidgets.QDialog):
         self.btn_browse_model_root.clicked.connect(self._browse_model_root)
         self.btn_refresh_models.clicked.connect(self.refresh_models)
         self.ed_model_root.editingFinished.connect(self._on_model_root_edited)
+        self.chk_bubble_auto.toggled.connect(self._update_bubble_color_mode)
+        self.chk_bubble_auto.toggled.connect(lambda *_: self.settingsChanged.emit())
+        self.btn_bubble_auto_color.colorChanged.connect(lambda *_: self.settingsChanged.emit())
+        self.btn_bubble_assistant_color.colorChanged.connect(lambda *_: self.settingsChanged.emit())
+        self.btn_bubble_user_color.colorChanged.connect(lambda *_: self.settingsChanged.emit())
 
         for w in [
             self.ed_runner,
@@ -1060,6 +1428,39 @@ class SettingsDialog(QtWidgets.QDialog):
             elif isinstance(w, (QtWidgets.QSpinBox, QtWidgets.QDoubleSpinBox)):
                 w.valueChanged.connect(self.settingsChanged)
         self.ed_system.textChanged.connect(self.settingsChanged)
+        self._update_bubble_color_mode()
+
+    def _update_bubble_color_mode(self):
+        auto_mode = self.chk_bubble_auto.isChecked()
+        self.btn_bubble_auto_color.setEnabled(auto_mode)
+        self.btn_bubble_assistant_color.setEnabled(not auto_mode)
+        self.btn_bubble_user_color.setEnabled(not auto_mode)
+
+    def bubble_color_settings(self) -> Tuple[bool, str, str, str]:
+        return (
+            bool(self.chk_bubble_auto.isChecked()),
+            self.btn_bubble_auto_color.color(),
+            self.btn_bubble_assistant_color.color(),
+            self.btn_bubble_user_color.color(),
+        )
+
+    def set_bubble_color_settings(self, auto_mode: bool, auto_color: str, assistant_color: str, user_color: str):
+        widgets = [
+            self.chk_bubble_auto,
+            self.btn_bubble_auto_color,
+            self.btn_bubble_assistant_color,
+            self.btn_bubble_user_color,
+        ]
+        blocked = [w.blockSignals(True) for w in widgets]
+        try:
+            self.chk_bubble_auto.setChecked(bool(auto_mode))
+            self.btn_bubble_auto_color.setColor(_normalize_hex_color(auto_color, DEFAULT_BUBBLE_BASE_COLOR), emit=False)
+            self.btn_bubble_assistant_color.setColor(_normalize_hex_color(assistant_color, DEFAULT_BUBBLE_ASSISTANT_COLOR), emit=False)
+            self.btn_bubble_user_color.setColor(_normalize_hex_color(user_color, DEFAULT_BUBBLE_USER_COLOR), emit=False)
+        finally:
+            for w, old_block in zip(widgets, blocked):
+                w.blockSignals(old_block)
+        self._update_bubble_color_mode()
 
     def _browse_runner(self):
         start = self.ed_runner.text().strip()
@@ -1188,6 +1589,10 @@ class LlamaChatWindow(QtWidgets.QMainWindow):
         self.current_session_id: Optional[str] = None
         self._saved_model_path = ""
         self._saved_template = ("auto", "")
+        self._bubble_color_auto = False
+        self._bubble_color_base = DEFAULT_BUBBLE_BASE_COLOR
+        self._bubble_color_assistant = DEFAULT_BUBBLE_ASSISTANT_COLOR
+        self._bubble_color_user = DEFAULT_BUBBLE_USER_COLOR
 
         self.server_process: Optional[QtCore.QProcess] = None
         self.server_boot_thread: Optional[ServerBootThread] = None
@@ -1220,6 +1625,7 @@ class LlamaChatWindow(QtWidgets.QMainWindow):
         self._build_ui()
         self._apply_style()
         self._load_settings()
+        self._apply_style()
         self._load_sessions()
         self.settings_dialog.refresh_models()
         self.settings_dialog.refresh_templates()
@@ -1332,6 +1738,15 @@ class LlamaChatWindow(QtWidgets.QMainWindow):
         self.lst_attachments.setContextMenuPolicy(QtCore.Qt.CustomContextMenu)
         self.lst_attachments.setSelectionMode(QtWidgets.QAbstractItemView.SingleSelection)
         self.lst_attachments.setHorizontalScrollBarPolicy(QtCore.Qt.ScrollBarAlwaysOff)
+        self.lst_attachments.setVerticalScrollMode(QtWidgets.QAbstractItemView.ScrollPerPixel)
+        self.lst_attachments.setIconSize(QtCore.QSize(56, 56))
+        self.lst_attachments.setResizeMode(QtWidgets.QListView.Adjust)
+        self.lst_attachments.setMovement(QtWidgets.QListView.Static)
+        self.lst_attachments.setUniformItemSizes(False)
+        self.lst_attachments.setSpacing(4)
+        self.lst_attachments.setWordWrap(False)
+        self.lst_attachments.setTextElideMode(QtCore.Qt.ElideMiddle)
+        self.lst_attachments.setMaximumHeight(156)
         self.lst_attachments.setVisible(False)
 
         send_row = QtWidgets.QHBoxLayout()
@@ -1380,156 +1795,177 @@ class LlamaChatWindow(QtWidgets.QMainWindow):
         self.cmb_model_quick.currentIndexChanged.connect(self._quick_model_changed)
         self.settings_dialog.btn_refresh_models.clicked.connect(self._sync_models_from_settings)
         self.btn_attach.clicked.connect(self._pick_attachments)
+        self.lst_attachments.itemClicked.connect(self._preview_attachment_item)
         self.lst_attachments.customContextMenuRequested.connect(self._attachment_context_menu)
         self._refresh_attachment_list()
 
     def _apply_style(self):
-        self.setStyleSheet("""
-        QMainWindow, QWidget {
+        auto_mode, auto_color, assistant_color, user_color = self.settings_dialog.bubble_color_settings()
+        bubble_theme = _bubble_colors_from_settings(auto_mode, auto_color, assistant_color, user_color)
+        self.setStyleSheet(f"""
+        QMainWindow, QWidget {{
             background: #16181d;
             color: #e8edf5;
             font-size: 13px;
-        }
-        #Sidebar {
+        }}
+        #Sidebar {{
             background: #171920;
             border-right: 1px solid #252a36;
-        }
-        #TopBar {
+        }}
+        #TopBar {{
             background: #16181d;
             border-bottom: 1px solid #232836;
-        }
-        #ComposerFrame {
+        }}
+        #ComposerFrame {{
             background: #21242d;
             border: 1px solid #323848;
             border-radius: 18px;
-        }
-        #AttachmentList {
+        }}
+        #AttachmentList {{
             background: #1b2029;
             border: 1px solid #31384a;
             border-radius: 10px;
             padding: 4px;
-        }
-        #AttachmentList::item {
+        }}
+        #AttachmentList::item {{
             padding: 6px 8px;
             border-radius: 8px;
-        }
-        #AttachmentList::item:selected {
+        }}
+        #AttachmentList::item:selected {{
             background: #353d4f;
-        }
-        #ChatList {
+        }}
+        #ChatList {{
             background: #1a1d25;
             border: 1px solid #2c3342;
             border-radius: 12px;
             padding: 4px;
-        }
-        #SidebarTitle {
+        }}
+        #SidebarTitle {{
             font-size: 21px;
             font-weight: 600;
-        }
-        #ChatHeader {
+        }}
+        #ChatHeader {{
             font-size: 17px;
             font-weight: 600;
-        }
-        #SubtleLabel, #BubbleRole {
+        }}
+        #SubtleLabel, #BubbleRole {{
             color: #9aa3b3;
-        }
-        QLineEdit, QPlainTextEdit, QComboBox, QSpinBox, QDoubleSpinBox {
+        }}
+        QLineEdit, QPlainTextEdit, QComboBox, QSpinBox, QDoubleSpinBox {{
             background: #1b2029;
             color: #eff3f9;
             border: 1px solid #31384a;
             border-radius: 10px;
             padding: 8px;
-        }
-        QListWidget::item {
+        }}
+        QListWidget::item {{
             padding: 10px 10px;
             border-radius: 8px;
             margin: 2px 0px;
-        }
-        QListWidget::item:selected {
+        }}
+        QListWidget::item:selected {{
             background: #353d4f;
             color: white;
-        }
-        QListWidget::item:hover {
+        }}
+        QListWidget::item:hover {{
             background: #2a3140;
-        }
-        QPushButton {
+        }}
+        QPushButton {{
             background: #2a3140;
             color: #eff3f9;
             border: 1px solid #3b4456;
             border-radius: 10px;
             padding: 9px 14px;
-        }
-        QPushButton:hover {
+        }}
+        QPushButton:hover {{
             background: #34405a;
-        }
-        QPushButton:disabled {
+        }}
+        QPushButton:disabled {{
             color: #868fa0;
             background: #1d2230;
-        }
-        QScrollArea {
+        }}
+        QScrollArea {{
             border: none;
             background: #16181d;
-        }
-        QFrame#Bubble_user {
-            background: #33425f;
+        }}
+        QFrame#Bubble_user {{
+            background: {bubble_theme['user_bg']};
             border-radius: 14px;
-        }
-        QFrame#Bubble_assistant {
-            background: #212734;
+        }}
+        QFrame#Bubble_user QLabel#BubbleRole {{
+            color: {bubble_theme['user_role']};
+        }}
+        QFrame#Bubble_user QLabel#UserText {{
+            color: {bubble_theme['user_text']};
+        }}
+        QFrame#Bubble_assistant {{
+            background: {bubble_theme['assistant_bg']};
             border-radius: 14px;
-        }
-        QFrame#ThinkingFrame {
+        }}
+        QFrame#Bubble_assistant QLabel#BubbleRole {{
+            color: {bubble_theme['assistant_role']};
+        }}
+        QFrame#Bubble_assistant QLabel#AnswerText {{
+            color: {bubble_theme['assistant_text']};
+        }}
+        QFrame#ThinkingFrame {{
             background: #1b2030;
             border: 1px solid #2f3850;
             border-radius: 10px;
-        }
-        QFrame#AttachmentFrame {
+        }}
+        QFrame#AttachmentFrame {{
             background: #202634;
             border: 1px solid #33405a;
             border-radius: 10px;
-        }
-        QLabel#AttachmentTitle {
+        }}
+        QLabel#AttachmentTitle {{
             color: #c4d0e7;
             font-weight: 600;
-        }
-        QLabel#AttachmentText {
+        }}
+        QLabel#AttachmentText {{
             color: #cdd7e8;
-        }
-        QLabel#ThinkingTitle {
+        }}
+        QLabel#ThinkingTitle {{
             color: #aeb7c8;
             font-weight: 600;
-        }
-        QLabel#ThinkingText {
+        }}
+        QLabel#ThinkingText {{
             color: #9aa3b3;
-        }
-        QLabel#AnswerText {
-            color: #edf2fa;
-        }
-        QFrame#Bubble_info {
+        }}
+        QLabel#AnswerText {{
+            color: {bubble_theme['assistant_text']};
+        }}
+        QLabel#UserText {{
+            color: {bubble_theme['user_text']};
+        }}
+        QFrame#Bubble_info {{
             background: #2d3127;
             border-radius: 14px;
-        }
-        QLabel#StatusIdle, QLabel#StatusLoading, QLabel#StatusReady, QLabel#StatusError {
+        }}
+        QLabel#InfoText {{
+            color: #edf2fa;
+        }}
+        QLabel#StatusIdle, QLabel#StatusLoading, QLabel#StatusReady, QLabel#StatusError {{
             border-radius: 12px;
             padding: 6px 10px;
             font-weight: 600;
-        }
-        QLabel#StatusIdle {
+        }}
+        QLabel#StatusIdle {{
             background: #252b38;
             color: #cfd7e6;
-        }
-        QLabel#StatusLoading {
+        }}
+        QLabel#StatusLoading {{
             background: #5a4727;
             color: #ffdf9c;
-        }
-        QLabel#StatusReady {
+        }}
+        QLabel#StatusReady {{
             background: #1d4a36;
             color: #9cf0c8;
-        }
-        QLabel#StatusError {
+        }}
+        QLabel#StatusError {{
             background: #532828;
             color: #ffb1b1;
-        }
+        }}
         """)
 
     # ---------- persistence ----------
@@ -1561,11 +1997,22 @@ class LlamaChatWindow(QtWidgets.QMainWindow):
             self.settings_dialog.ed_model_root.setText(model_root)
         if isinstance(data.get("system_prompt"), str):
             self.settings_dialog.ed_system.setPlainText(data.get("system_prompt", ""))
+        self._bubble_color_auto = bool(data.get("bubble_color_auto", False))
+        self._bubble_color_base = _normalize_hex_color(str(data.get("bubble_color_base", DEFAULT_BUBBLE_BASE_COLOR)), DEFAULT_BUBBLE_BASE_COLOR)
+        self._bubble_color_assistant = _normalize_hex_color(str(data.get("bubble_color_assistant", DEFAULT_BUBBLE_ASSISTANT_COLOR)), DEFAULT_BUBBLE_ASSISTANT_COLOR)
+        self._bubble_color_user = _normalize_hex_color(str(data.get("bubble_color_user", DEFAULT_BUBBLE_USER_COLOR)), DEFAULT_BUBBLE_USER_COLOR)
+        self.settings_dialog.set_bubble_color_settings(
+            self._bubble_color_auto,
+            self._bubble_color_base,
+            self._bubble_color_assistant,
+            self._bubble_color_user,
+        )
         self.current_session_id = data.get("last_session_id") if isinstance(data.get("last_session_id"), str) else None
         self._saved_model_path = data.get("model_path", "") if isinstance(data.get("model_path"), str) else ""
         self._saved_template = (data.get("template_kind", "auto"), data.get("template_value", ""))
 
     def _save_all(self):
+        bubble_auto, bubble_base, bubble_assistant, bubble_user = self.settings_dialog.bubble_color_settings()
         settings = {
             "runner_path": self.settings_dialog.ed_runner.text().strip(),
             "model_root": self.settings_dialog.ed_model_root.text().strip(),
@@ -1577,6 +2024,10 @@ class LlamaChatWindow(QtWidgets.QMainWindow):
             "temp": float(self.settings_dialog.sp_temp.value()),
             "top_p": float(self.settings_dialog.sp_top_p.value()),
             "system_prompt": self.settings_dialog.ed_system.toPlainText(),
+            "bubble_color_auto": bool(bubble_auto),
+            "bubble_color_base": bubble_base,
+            "bubble_color_assistant": bubble_assistant,
+            "bubble_color_user": bubble_user,
             "last_session_id": self.current_session_id or "",
         }
         _save_json_atomic(self.settings_path, settings)
@@ -1615,6 +2066,7 @@ class LlamaChatWindow(QtWidgets.QMainWindow):
             return
         self._maybe_reset_template_after_model_change()
         self._apply_settings_to_current_session()
+        self._apply_style()
         self._rebuild_quick_model_combo()
         self._update_header()
         self._queue_save()
@@ -2331,11 +2783,36 @@ class LlamaChatWindow(QtWidgets.QMainWindow):
     def _refresh_attachment_list(self):
         self.lst_attachments.clear()
         for att in self.pending_attachments:
-            item = QtWidgets.QListWidgetItem(_attachment_label(att))
+            item = QtWidgets.QListWidgetItem(_make_attachment_thumbnail(att), _attachment_display_text(att))
             item.setToolTip(str(att.get("path", "") or att.get("name", "")))
             item.setData(QtCore.Qt.UserRole, dict(att))
+            item.setSizeHint(QtCore.QSize(0, 64))
             self.lst_attachments.addItem(item)
         self.lst_attachments.setVisible(bool(self.pending_attachments))
+
+    def _attachment_from_item(self, item: Optional[QtWidgets.QListWidgetItem]) -> Optional[Dict[str, Any]]:
+        if item is None:
+            return None
+        data = item.data(QtCore.Qt.UserRole)
+        return dict(data) if isinstance(data, dict) else None
+
+    def _preview_attachment(self, att: Optional[Dict[str, Any]]):
+        if not isinstance(att, dict):
+            return
+        dlg = AttachmentPreviewDialog(att, self)
+        dlg.exec()
+
+    def _preview_attachment_item(self, item: Optional[QtWidgets.QListWidgetItem]):
+        att = self._attachment_from_item(item)
+        if att:
+            self._preview_attachment(att)
+
+    def _open_attachment_externally(self, att: Optional[Dict[str, Any]], open_with_dialog: bool = False):
+        if not isinstance(att, dict):
+            return
+        ok, err = _open_local_path(str(att.get("path", "") or ""), open_with_dialog=open_with_dialog)
+        if not ok:
+            self._set_status(err or "Could not open file", "error")
 
     def _add_attachment_paths(self, paths: List[str], announce: bool = True) -> int:
         existing = {str(att.get("path", "") or "") for att in self.pending_attachments}
@@ -2407,13 +2884,26 @@ class LlamaChatWindow(QtWidgets.QMainWindow):
         if not self.pending_attachments:
             return
         row = self.lst_attachments.indexAt(pos).row()
+        att = None
         if row >= 0:
             self.lst_attachments.setCurrentRow(row)
+            att = dict(self.pending_attachments[row])
         menu = QtWidgets.QMenu(self)
-        act_remove = menu.addAction("Remove attachment")
+        act_preview = menu.addAction("Preview") if att else None
+        act_open = menu.addAction("Open") if att else None
+        act_open_with = menu.addAction("Open with…") if att and str(att.get("kind", "file") or "file") in {"text", "file"} else None
+        if att:
+            menu.addSeparator()
+        act_remove = menu.addAction("Remove attachment") if att else None
         act_clear = menu.addAction("Clear all attachments")
         chosen = menu.exec(self.lst_attachments.mapToGlobal(pos))
-        if chosen == act_remove:
+        if chosen == act_preview and att:
+            self._preview_attachment(att)
+        elif chosen == act_open and att:
+            self._open_attachment_externally(att, open_with_dialog=False)
+        elif chosen == act_open_with and att:
+            self._open_attachment_externally(att, open_with_dialog=True)
+        elif chosen == act_remove:
             self._remove_selected_attachment()
         elif chosen == act_clear:
             self.pending_attachments = []
