@@ -13,6 +13,32 @@ Video Walktrough (most is speedup x2 to show much in less time), last update jan
 ---
 
 <details>
+<summary>March 09 2026 V2.3.1 small update brings Flux Klein 4b and 9b GGuf loader</summary>
+__________________________________________________________________________________
+
+Flux Klein (GGUF image + edit + GGUF manager/downloader)
+
+- Choice between 4B and 9B image, download the Q version that fits your vram
+- available both in planner (reference image and image creator) and in the image edit section
+- Create/edit images at blazing speed (not good for text or NSFW)
+  
+  UI improvements / fixes
+  
+- Added new features, tooltips, and improvements in the Sound Editor
+- Reorganized a couple of tabs
+- Added Load/Save lyrics buttons in AceStep 1.5 (with organizer)
+- Added Ace Step to FrameVision internal queue & worker system
+- Loading another model in Ace Step 1.5 now automatically changes needed steps
+- Added a right-click menu in the Planner results page
+- Added 720p in Planner for SeedVR2 upscaler
+- added a toggle to enable 20 (random) camera effects in the planner
+- Various bugfixes and other improvements
+- in helpers folder at the moment there is a 'llama_chat_ui.py' in beta test
+  > it allows you to use your own downloaded (gguf) chat llm's (gemma, gpt, qwen 3.5,..) to use and
+  > interact with them
+</details>
+  
+<details>
 <summary>February 15, 2026. V2.3 new Planner : Go from prompt to finished video with narration and/or music (with Ace Step 1.5!) in a couple of clicks</summary>
   
 🧠 The Planner (Idea → Finished Video)
