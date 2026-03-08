@@ -266,7 +266,7 @@ def enqueue_txt2img_qwen(job_args: dict):
 def default_qwen2511_outdir():
     from pathlib import Path
     base = Path('.').resolve()
-    d = base/'output'/'qwen2511'
+    d = base/'output'/'edits'/'qwen_2511'
     d.mkdir(parents=True, exist_ok=True)
     return str(d)
 
@@ -274,7 +274,7 @@ def default_qwen2511_outdir():
 def enqueue_qwen2511_from_widget(inner):
     """Enqueue a Qwen2511 (image edit) job from the Qwen2511Pane UI.
 
-    Uses output/qwen2511 to match the pane's 'View results' / 'Play last result'.
+    Uses output/edits/qwen_2511 to match the pane's current result folder.
     """
     import time as _time
     from pathlib import Path as _P

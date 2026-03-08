@@ -3826,9 +3826,9 @@ def qwen2511_image_edit(job, cfg, mani):
 
     # Resolve output dir
     try:
-        out_dir = job.get("out_dir") or str((ROOT / "output" / "qwen2511"))
+        out_dir = job.get("out_dir") or str((ROOT / "output" / "edits" / "qwen_2511"))
     except Exception:
-        out_dir = str(_P(".").resolve() / "output" / "qwen2511")
+        out_dir = str(_P(".").resolve() / "output" / "edits" / "qwen_2511")
     try:
         _P(out_dir).mkdir(parents=True, exist_ok=True)
     except Exception:
