@@ -342,6 +342,19 @@ class MainWindow(QtWidgets.QMainWindow):
             self.models = GGUFModels(**data.get("models", asdict(self.models)))
             self.cfg = RunConfig(**data.get("run", asdict(self.cfg)))
 
+            # Migrate older default output folder from /output/klein4b_gguf/
+            # to the newer /output/edits/flux_klein/ location, while still
+            # respecting any custom folder the user may have chosen.
+            try:
+                root = Path(self.paths.root)
+                old_default = root / "output" / "klein4b_gguf"
+                new_default = root / "output" / "edits" / "flux_klein"
+                current_out = Path(self.paths.out_dir)
+                if current_out == old_default:
+                    self.paths.out_dir = str(new_default)
+            except Exception:
+                pass
+
             if p.name.lower() == "klain_settings.json":
                 try:
                     self._save_settings()
