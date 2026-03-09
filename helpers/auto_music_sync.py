@@ -1334,7 +1334,8 @@ def analyze_music(audio_path: str, ffmpeg: str, config: Optional[MusicAnalysisCo
     var = sum((v - mean) ** 2 for v in norm) / len(norm)
     std = math.sqrt(var)
 
-    # Apply beat sensitivity from config (1 = fewer beats, 10 = more beats)
+    # Apply beat sensitivity from config.
+    # Lower = much stricter / fewer beats, higher = looser / more beats.
     if config is not None:
         try:
             raw_val = float(config.sensitivity)
@@ -1342,14 +1343,29 @@ def analyze_music(audio_path: str, ffmpeg: str, config: Optional[MusicAnalysisCo
             raw_val = 10.0
     else:
         raw_val = 10.0
-    # Slider uses 2..20 -> map to 1.0..10.0 in 0.5 steps
-    sens = max(1.0, min(10.0, raw_val / 2.0))
-    # Map sensitivity linearly: 1 -> ~1.24x thresholds (fewer beats), 10 -> ~0.70x (more beats)
-    scale = 1.0 - (sens - 5.0) * 0.06
-    if scale < 0.6:
-        scale = 0.6
-    elif scale > 1.4:
-        scale = 1.4
+
+    # Slider now uses a direct 0..20 scale where:
+    #   0  = ultra strict (barely detect anything except the clearest peaks)
+    #   10 = normal default
+    #   20 = very loose
+    sens = max(0.0, min(20.0, raw_val))
+
+    # Use a deliberately non-linear mapping so the low end becomes much stricter
+    # than before. That gives the user real room to suppress busy sub-second cuts.
+    if sens <= 10.0:
+        # 10 -> 1.00x, 0 -> 3.60x
+        frac = (10.0 - sens) / 10.0
+        scale = 1.0 + (frac ** 1.75) * 2.60
+    else:
+        # 10 -> 1.00x, 20 -> 0.58x
+        frac = (sens - 10.0) / 10.0
+        scale = 1.0 - (frac ** 1.20) * 0.42
+
+    if scale < 0.55:
+        scale = 0.55
+    elif scale > 3.60:
+        scale = 3.60
+
     beat_thr = mean + std * 0.7 * scale
     major_thr = mean + std * 1.4 * scale
 
@@ -2463,6 +2479,25 @@ def build_timeline(
         # Tail segment that didn't reach beats_per_segment; still keep its count.
         grouped.append((cur_start, analysis.duration, max(1, cur_count)))
 
+    # Enforce a practical minimum base segment length so ultra-short beat windows
+    # do not survive as annoying sub-second cuts. This also makes
+    # ``beats_per_segment`` matter more in fast music because tiny grouped windows
+    # are merged forward before per-segment clip lengths are chosen.
+    MIN_SEGMENT_LEN = 1.5
+    if len(grouped) > 1:
+        merged_grouped = []
+        i = 0
+        while i < len(grouped):
+            start_t, end_t, beat_count = grouped[i]
+            while (end_t - start_t) < MIN_SEGMENT_LEN and i < (len(grouped) - 1):
+                i += 1
+                _, next_end_t, next_beat_count = grouped[i]
+                end_t = next_end_t
+                beat_count += next_beat_count
+            merged_grouped.append((start_t, end_t, beat_count))
+            i += 1
+        grouped = merged_grouped
+
     num_sources = len(sources)
     allow_mosaic = num_sources >= 10
     last_source_idx: Optional[int] = None
@@ -2604,6 +2639,13 @@ def build_timeline(
 
         # Safety: never exceed the beat-group window duration.
         seg_len = min(seg_len, dur)
+
+        # Hard floor for visible pacing: when a grouped window is long enough,
+        # keep each rendered segment on screen for at least 1.5 seconds so the
+        # clip and transition can actually register.
+        if dur >= MIN_SEGMENT_LEN:
+            seg_len = max(MIN_SEGMENT_LEN, seg_len)
+            seg_len = min(seg_len, dur)
 
         use_image = False
 
@@ -8426,17 +8468,16 @@ class AutoMusicSyncWidget(QWidget):
         adv.setSpacing(4)
 
         self.slider_sens = QSlider(Qt.Horizontal, self)
-        self.slider_sens.setMinimum(10)   # represents 1.0
-        self.slider_sens.setMaximum(200)  # represents 20.0 (i.e. 2.0 steps *10)
-        self.slider_sens.setValue(50)     # default 5.0
-        self.slider_sens.setSingleStep(5) # 0.5 represented as +5
-        
-        self.slider_sens.setMinimum(2)
+        self.slider_sens.setMinimum(0)
         self.slider_sens.setMaximum(20)
         self.slider_sens.setValue(10)
+        self.slider_sens.setSingleStep(1)
+        self.slider_sens.setPageStep(2)
         self.slider_sens.setToolTip(
-            "Beat sensitivity for the detector (0.5–20.0 internal scale).\n"
-            "Lower = fewer beats (stricter), higher = more beats (looser)."
+            "Beat sensitivity for the detector (0–20).\n"
+            "0 = ultra strict and may barely detect anything.\n"
+            "10 = normal default.\n"
+            "20 = very loose / more beats."
         )
         adv.addRow("Beat sensitivity:", self.slider_sens)
 

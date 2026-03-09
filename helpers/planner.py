@@ -794,7 +794,7 @@ except Exception:
     env["PYTHONPATH"] = os.pathsep.join([str(_root()), str(_root() / "helpers"), env.get("PYTHONPATH","")])
 
     try:
-        p = subprocess.run(cmd, capture_output=True, text=True, env=env)
+        p = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", errors="replace", env=env)
         out = (p.stdout or '').strip()
         err = (p.stderr or '').strip()
         rc = int(p.returncode)
@@ -824,8 +824,8 @@ _HUNYUAN_PRESETS = {
         "fps": 20,
         "steps": 8,
         "min_sec": 3.0,
-        "max_sec": 6.0,
-        "max_frames": 121,
+        "max_sec": 5.4,
+        "max_frames": 111,
         "model_key": "480p_i2v_step_distilled",
         "attn_backend": "auto",
         "cpu_offload": True,
@@ -839,8 +839,8 @@ _HUNYUAN_PRESETS = {
         "fps": 20,
         "steps": 8,
         "min_sec": 2.7,
-        "max_sec": 5.0,
-        "max_frames": 97,
+        "max_sec": 4.8,
+        "max_frames": 96,
         "model_key": "480p_i2v_step_distilled",
         "attn_backend": "auto",
         "cpu_offload": True,
@@ -854,8 +854,8 @@ _HUNYUAN_PRESETS = {
         "fps": 15,
         "steps": 15,
         "min_sec": 2.7,
-        "max_sec": 4.6,
-        "max_frames": 70,
+        "max_sec": 4.5,
+        "max_frames": 68,
         "model_key": "720p_i2v_distilled",
         "attn_backend": "auto",
         "cpu_offload": True,
@@ -2495,24 +2495,14 @@ def _story_section_defaults(key: str) -> Dict[str, Any]:
 
 def _story_arc_template_keys(duration_sec: float, n_shots: int = 0) -> List[str]:
     try:
-        duration_sec = float(duration_sec or 0.0)
-    except Exception:
-        duration_sec = 0.0
-    try:
         n_shots = int(n_shots or 0)
     except Exception:
         n_shots = 0
-    if duration_sec > 30.0:
-        if n_shots >= 10:
-            return ["setup", "discovery", "escalation", "setback", "climax", "ending"]
-        if n_shots >= 8:
-            return ["setup", "discovery", "escalation", "climax", "ending"]
-        return ["setup", "escalation", "setback", "climax", "ending"]
     if n_shots >= 6:
         return ["setup", "discovery", "climax", "ending"]
     return ["setup", "escalation", "ending"]
 
-def _compact_story_text(text: Any, max_len: int = 120) -> str:
+def _compact_story_text(text: Any, max_len: int = 220) -> str:
     s = str(text or "").replace("\r", " ").replace("\n", " ").strip()
     s = re.sub(r"\s{2,}", " ", s).strip()
     if len(s) > int(max_len):
@@ -2921,17 +2911,62 @@ def _story_fallback_pick(options: List[str], seed_text: str) -> str:
     return vals[idx]
 
 
-def _story_stage_defaults(section_key: str, purpose: str = "") -> Dict[str, str]:
+
+
+_STORY_IMAGE_CAMERA_POOL = [
+    "establishing shot",
+    "extreme wide shot",
+    "wide shot",
+    "full shot",
+    "medium shot",
+    "zoomed-out medium shot",
+    "zoomed-out wide shot",
+    "overhead shot",
+    "high angle shot",
+    "low angle shot",
+    "Dutch angle shot",
+    "POV shot",
+    "over-the-shoulder shot",
+    "insert detail shot",
+]
+
+
+def _story_camera_shuffle_pick(seed_text: Any, fallback: str = "medium shot") -> str:
+    vals = [str(v).strip() for v in (_STORY_IMAGE_CAMERA_POOL or []) if str(v).strip()]
+    if not vals:
+        return str(fallback or "medium shot").strip() or "medium shot"
+    try:
+        idx = int(_seed_to_int(str(seed_text or '')) or 0) % len(vals)
+    except Exception:
+        idx = 0
+    return vals[idx]
+
+
+def _story_camera_for_shot(section_key: Any, purpose: Any = "", seed_text: Any = "") -> str:
     sk = _story_section_key(section_key)
     purpose_l = str(purpose or '').strip().lower()
-    camera_map = {
+    default_map = {
         "setup": "wide shot",
         "discovery": "medium shot",
-        "escalation": "tracking medium shot",
-        "setback": "medium close shot",
-        "climax": "dynamic medium shot",
+        "escalation": "wide shot",
+        "setback": "full shot",
+        "climax": "low angle shot",
         "ending": "wide shot",
     }
+    default_cam = default_map.get(sk, "medium shot")
+    if "payoff" in purpose_l and sk not in ("climax", "ending"):
+        default_cam = "medium shot"
+    try:
+        use_shuffle = (int(_seed_to_int(f"{seed_text}|storycam") or 0) % 5) < 3
+    except Exception:
+        use_shuffle = True
+    if use_shuffle:
+        return _story_camera_shuffle_pick(f"{seed_text}|{sk}|{purpose_l}", default_cam)
+    return default_cam
+
+def _story_stage_defaults(section_key: str, purpose: str = "", seed_text: Any = "") -> Dict[str, str]:
+    sk = _story_section_key(section_key)
+    purpose_l = str(purpose or '').strip().lower()
     mood_map = {
         "setup": "curious",
         "discovery": "focused",
@@ -2940,10 +2975,7 @@ def _story_stage_defaults(section_key: str, purpose: str = "") -> Dict[str, str]
         "climax": "urgent",
         "ending": "resolved",
     }
-    if "payoff" in purpose_l and sk not in ("climax", "ending"):
-        camera = "medium shot"
-    else:
-        camera = camera_map.get(sk, "medium shot")
+    camera = _story_camera_for_shot(sk, purpose_l, seed_text or f"{sk}|{purpose_l}")
     return {
         "camera": camera,
         "lighting": "cinematic lighting",
@@ -2997,7 +3029,7 @@ def _parse_story_shot_lines(blob: str, n_shots: int, plan_obj: Any, duration_sec
         idx_in_sec = max(1, i - st + 1)
         sec_len = max(1, en - st + 1)
         purpose = _normalize_shot_purpose("", sec_key, idx_in_sec, sec_len)
-        stage = _story_stage_defaults(sec_key, purpose)
+        stage = _story_stage_defaults(sec_key, purpose, seed_base)
         out.append({
             "id": f"S{i:02d}",
             "stage_directions": stage,
@@ -3060,23 +3092,43 @@ def _build_local_story_fallback_shots(plan_obj: Any, user_prompt: str, extra_inf
         reveal = _compact_story_text(progression.get("revealed_now") or progression.get("different_now") or "", 100)
         harder = _compact_story_text(progression.get("harder_now") or progression.get("prepares_payoff") or "", 100)
 
-        sentence1 = f"{base_prompt}, {action} {location}.".strip()
-        if extra and not _story_prompt_texts_overlap(sentence1, extra):
-            sentence1 = f"{sentence1[:-1]} while {extra}." if sentence1.endswith('.') else f"{sentence1} while {extra}."
-        sentence2 = f"{details}."
-        if emotion or reveal or harder:
-            tail_parts = []
-            if emotion:
-                tail_parts.append(f"the feeling shifts toward {emotion}")
-            if reveal:
-                tail_parts.append(reveal)
-            elif harder:
-                tail_parts.append(harder)
-            if tail_parts:
-                sentence2 = f"{details}, and {', '.join(tail_parts)}."
+        scenic_cutaway = bool((i == 1 and n_shots >= 4) or (purpose in ("transition", "reveal clue", "show obstacle", "payoff") and (i % 4 == 0)))
+        world = _story_world_phrase(plan_obj, user_prompt, extra_info)
+
+        if scenic_cutaway:
+            if purpose == "introduce":
+                sentence1 = f"The setting around {world} opens up {location}, with {details}."
+                sentence2 = f"A clear route deeper into the scene and a strong landmark make {reveal or 'the world itself'} easy to read."
+            elif purpose == "reveal clue":
+                sentence1 = f"A new clue stands out {location} in {world}, with {details}."
+                sentence2 = f"The surroundings make {reveal or 'the next step'} feel newly important while the path ahead stays open."
+            elif purpose == "show obstacle":
+                sentence1 = f"The path ahead {location} in {world} now feels blocked, with {details}."
+                sentence2 = f"Compressed space, visual pressure, and signs of disruption show how {harder or 'the situation'} has become harder."
+            elif purpose == "payoff":
+                sentence1 = f"The aftermath settles {location} in {world}, with {details}."
+                sentence2 = f"The changed atmosphere and visible traces of the previous action make {reveal or 'the outcome'} easy to read."
+            else:
+                sentence1 = f"A route deeper into {world} comes into focus {location}, with {details}."
+                sentence2 = f"The surroundings quietly prepare {reveal or harder or 'the next beat'} without needing the main character in frame."
+        else:
+            sentence1 = f"{base_prompt}, {action} {location}.".strip()
+            if extra and not _story_prompt_texts_overlap(sentence1, extra):
+                sentence1 = f"{sentence1[:-1]} while {extra}." if sentence1.endswith('.') else f"{sentence1} while {extra}."
+            sentence2 = f"{details}."
+            if emotion or reveal or harder:
+                tail_parts = []
+                if emotion:
+                    tail_parts.append(f"the feeling shifts toward {emotion}")
+                if reveal:
+                    tail_parts.append(reveal)
+                elif harder:
+                    tail_parts.append(harder)
+                if tail_parts:
+                    sentence2 = f"{details}, and {', '.join(tail_parts)}."
 
         visual = _sanitize_visual_description(f"{sentence1} {sentence2}")
-        stage = _story_stage_defaults(sec_key, purpose)
+        stage = _story_stage_defaults(sec_key, purpose, f"parse|{i}|{visual}")
         out.append({
             "id": f"S{i:02d}",
             "stage_directions": stage,
@@ -3093,6 +3145,212 @@ def _build_local_story_fallback_shots(plan_obj: Any, user_prompt: str, extra_inf
             "story_progression": progression,
         })
     return out
+
+
+
+def _character_names_from_bible(bible: List[Dict[str, Any]]) -> List[str]:
+    names: List[str] = []
+    seen = set()
+    stop = {"character", "person", "man", "woman", "girl", "boy", "human"}
+    for c in (bible or []):
+        if not isinstance(c, dict):
+            continue
+        nm = str(c.get("name") or '').strip()
+        if not nm:
+            continue
+        low = nm.lower()
+        if low in stop or len(low) < 2 or low in seen:
+            continue
+        seen.add(low)
+        names.append(nm)
+    return names
+
+
+def _strip_named_subjects_from_text(text: Any, names: List[str]) -> str:
+    s = _compact_story_text(text or "", 220)
+    if not s:
+        return ""
+    for nm in (names or []):
+        try:
+            s = re.sub(r"(?<![A-Za-z0-9_])" + re.escape(str(nm)) + r"(?![A-Za-z0-9_])", " ", s, flags=re.IGNORECASE)
+        except Exception:
+            pass
+    s = re.sub(r"\b(?:the\s+same\s+person|the\s+person|the\s+main\s+character|the\s+protagonist)\b", " ", s, flags=re.IGNORECASE)
+    s = re.sub(r"\b(?:and|with|then|while|where)\b\s*$", " ", s, flags=re.IGNORECASE).strip()
+    s = re.sub(r"\s{2,}", " ", s).strip(" ,.;:-")
+    return s
+
+
+def _story_character_names(plan_obj: Any) -> List[str]:
+    out: List[str] = []
+    seen = set()
+    stop = {"character", "person", "man", "woman", "girl", "boy", "human"}
+    for c in _plan_characters(plan_obj):
+        nm = str((c or {}).get("name") or '').strip()
+        if not nm:
+            continue
+        low = nm.lower()
+        if low in stop or len(low) < 2 or low in seen:
+            continue
+        seen.add(low)
+        out.append(nm)
+    return out
+
+
+def _story_world_phrase(plan_obj: Any, user_prompt: str, extra_info: str = "") -> str:
+    names = _story_character_names(plan_obj)
+    candidates: List[str] = []
+    if isinstance(plan_obj, dict):
+        candidates.extend([
+            str(plan_obj.get("setting") or '').strip(),
+            str(plan_obj.get("logline") or '').strip(),
+            str(((plan_obj.get("story_engine") or {}) if isinstance(plan_obj.get("story_engine"), dict) else {}).get("who_wants_what") or '').strip(),
+        ])
+    candidates.extend([str(user_prompt or '').strip(), str(extra_info or '').strip()])
+    for raw in candidates:
+        clean = _strip_named_subjects_from_text(raw, names)
+        clean = _compact_story_text(clean, 120).strip(" .")
+        if len(clean) >= 6:
+            return clean
+    return "the strange setting"
+
+
+def _story_environment_cutaway_update(
+    shot: Dict[str, Any],
+    plan_obj: Any,
+    user_prompt: str,
+    extra_info: str,
+    idx: int,
+    n_shots: int,
+) -> bool:
+    if not isinstance(shot, dict):
+        return False
+    sec_key = _story_section_key(shot.get("story_section_key") or shot.get("story_section") or "setup")
+    defaults = _story_section_defaults(sec_key)
+    purpose = _normalize_shot_purpose(shot.get("shot_purpose") or shot.get("purpose") or "", sec_key, idx, max(1, n_shots))
+    progression = shot.get("story_progression") if isinstance(shot.get("story_progression"), dict) else {}
+    cues = _STORY_FALLBACK_VISUAL_CUES.get(sec_key, _STORY_FALLBACK_VISUAL_CUES["setup"])
+    world = _story_world_phrase(plan_obj, user_prompt, extra_info)
+    seed_base = f"{world}|{sec_key}|{purpose}|{idx}/{n_shots}|cutaway"
+    details = _story_fallback_pick(cues.get("details") or [], seed_base + "|details") or "layered foreground depth, a clear landmark, and atmosphere that carries the beat"
+    location = _story_fallback_pick(cues.get("locations") or [], seed_base + "|location") or "inside the active part of the setting"
+    reveal = _compact_story_text(progression.get("revealed_now") or progression.get("different_now") or defaults.get("change") or "", 110)
+    harder = _compact_story_text(progression.get("harder_now") or progression.get("prepares_payoff") or "", 110)
+
+    if purpose == "introduce":
+        sent1 = f"The setting around {world} opens up {location}, with {details}."
+        sent2 = f"A clear route deeper into the scene and a strong landmark make {reveal or 'the world itself'} easy to read."
+    elif purpose == "reveal clue":
+        sent1 = f"A new clue stands out {location} in {world}, with {details}."
+        sent2 = f"The surroundings make {reveal or 'the next step'} feel newly important while the path ahead stays open."
+    elif purpose == "show obstacle":
+        sent1 = f"The path ahead {location} in {world} now feels blocked, with {details}."
+        sent2 = f"Compressed space, visual pressure, and signs of disruption show how {harder or 'the situation'} has become harder."
+    elif purpose == "payoff":
+        sent1 = f"The aftermath settles {location} in {world}, with {details}."
+        sent2 = f"The changed atmosphere and visible traces of the previous action make {reveal or 'the outcome'} easy to read."
+    else:
+        sent1 = f"A route deeper into {world} comes into focus {location}, with {details}."
+        sent2 = f"The surroundings quietly prepare {reveal or harder or 'the next beat'} without needing the main character in frame."
+
+    camera = _story_camera_for_shot(sec_key, purpose, seed_base)
+
+    visual = _sanitize_visual_description(f"{sent1} {sent2}")
+    stage = shot.get("stage_directions") if isinstance(shot.get("stage_directions"), dict) else {}
+    stage["camera"] = camera
+    stage["lighting"] = str(stage.get("lighting") or shot.get("lighting") or "cinematic lighting")
+    stage["mood"] = str(stage.get("mood") or shot.get("mood") or defaults.get("emotion") or "neutral")
+    stage["purpose"] = str(stage.get("purpose") or purpose or defaults.get("job") or "transition").strip()
+    shot["stage_directions"] = stage
+    shot["camera"] = camera
+    shot["seed"] = visual
+    shot["visual_description"] = visual
+    shot["subjects"] = []
+    shot["present_characters"] = []
+    shot["notes"] = _compact_story_text(f"{purpose}; the setting carries this beat", 120)
+    shot["story_role"] = _compact_story_text(f"{purpose}; environmental story beat in {world}", 160)
+    return True
+
+
+def _story_shots_overfocus_character(shots: List[Dict[str, Any]], plan_obj: Any) -> bool:
+    if not isinstance(shots, list) or len(shots) < 4:
+        return False
+    names = _story_character_names(plan_obj)
+    if not names:
+        return False
+    people_hits = 0
+    named_hits = 0
+    tight_hits = 0
+    valid = 0
+    for sh in shots:
+        if not isinstance(sh, dict):
+            continue
+        valid += 1
+        txt = str(sh.get("visual_description") or sh.get("seed") or '')
+        cam = str(sh.get("camera") or (sh.get("stage_directions") or {}).get("camera") or '')
+        if _shot_has_people_hint(txt):
+            people_hits += 1
+        for nm in names:
+            try:
+                if re.search(r"(?<![A-Za-z0-9_])" + re.escape(str(nm)) + r"(?![A-Za-z0-9_])", txt, flags=re.IGNORECASE):
+                    named_hits += 1
+                    break
+            except Exception:
+                pass
+        cam_low = cam.lower()
+        if any(k in cam_low for k in ("close", "portrait", "head", "bust")) or _normalize_camera_type(cam) == "medium":
+            tight_hits += 1
+    n = max(1, valid)
+    return (people_hits / float(n) >= 0.85) and ((named_hits / float(n) >= 0.65) or (tight_hits / float(n) >= 0.65))
+
+
+def _rebalance_auto_story_presence(shots: List[Dict[str, Any]], plan_obj: Any, user_prompt: str, extra_info: str) -> int:
+    if not _story_shots_overfocus_character(shots, plan_obj):
+        return 0
+    n = len(shots or [])
+    if n < 4:
+        return 0
+
+    targets: List[int] = [1]
+    if n >= 6:
+        targets.append(max(2, min(n - 1, int(round(n * 0.45)))))
+    if n >= 8:
+        targets.append(max(3, min(n, int(round(n * 0.75)))))
+    if n >= 12:
+        targets.append(max(4, min(n, int(round(n * 0.9)))))
+
+    preferred = {"introduce", "transition", "reveal clue", "show obstacle", "payoff"}
+    changed = 0
+    used = set()
+    for tgt in targets:
+        cand_order = [tgt]
+        for radius in range(1, max(2, n // 3)):
+            if tgt - radius >= 1:
+                cand_order.append(tgt - radius)
+            if tgt + radius <= n:
+                cand_order.append(tgt + radius)
+        pick = None
+        for pos in cand_order:
+            if pos in used or pos < 1 or pos > n:
+                continue
+            sh = shots[pos - 1]
+            if not isinstance(sh, dict):
+                continue
+            txt = str(sh.get("visual_description") or sh.get("seed") or '')
+            purpose = _normalize_shot_purpose(sh.get("shot_purpose") or sh.get("purpose") or "", _story_section_key(sh.get("story_section_key") or sh.get("story_section") or "setup"), pos, n)
+            if not _shot_has_people_hint(txt):
+                pick = None
+                break
+            if purpose in preferred:
+                pick = pos
+                break
+            if pick is None:
+                pick = pos
+        if pick and pick not in used:
+            if _story_environment_cutaway_update(shots[pick - 1], plan_obj, user_prompt, extra_info, pick, n):
+                used.add(pick)
+                changed += 1
+    return changed
 
 
 def _story_shots_look_flat(shots: List[Dict[str, Any]]) -> bool:
@@ -4210,6 +4468,17 @@ def _assemble_shot_prompt(
     if _is_animal_shot:
         ex = _strip_human_language_from_prompt(ex)
 
+    scenic_no_people = False
+    try:
+        scenic_no_people = not _shot_has_people_hint(f"{seed_txt}\n{notes}")
+    except Exception:
+        scenic_no_people = False
+    if scenic_no_people:
+        scenic_names = _character_names_from_bible(bible)
+        if scenic_names:
+            up = _strip_named_subjects_from_text(up, scenic_names)
+            ex = _strip_named_subjects_from_text(ex, scenic_names)
+
     # Own Character Bible (manual 1–2): keep as plain prose only (no headers/bullets)
     own_prompts = [str(x or '').strip() for x in (own_character_prompts or []) if str(x or '').strip()]
     own_lock_prose = ""
@@ -4887,6 +5156,44 @@ class PipelineSignals(QObject):
     # UI decides whether to show it (Settings -> Preview on/off).
     asset_created = Signal(str)            # path
 
+
+
+class _TextTaskSignals(QObject):
+    finished = Signal(str)
+    failed = Signal(str)
+
+
+class _Ace15LyricsWorker(QThread):
+    def __init__(self, system_prompt: str, user_prompt: str, log_path: str, temperature: float = 0.9, max_new_tokens: int = 700, parent=None):
+        super().__init__(parent)
+        self.system_prompt = str(system_prompt or '')
+        self.user_prompt = str(user_prompt or '')
+        self.log_path = str(log_path or '')
+        self.temperature = float(temperature)
+        self.max_new_tokens = int(max_new_tokens)
+        self.signals = _TextTaskSignals()
+        try:
+            self.signals.moveToThread(self)
+        except Exception:
+            pass
+
+    def run(self):
+        try:
+            raw = _qwen_text_call(
+                "Ace Step 1.5 lyrics",
+                self.system_prompt,
+                self.user_prompt,
+                self.log_path,
+                temperature=float(self.temperature),
+                max_new_tokens=int(self.max_new_tokens),
+            )
+            self.signals.finished.emit(str(raw or ''))
+        except Exception as e:
+            try:
+                msg = str(e) or traceback.format_exc()
+            except Exception:
+                msg = "Unknown error while generating AI lyrics."
+            self.signals.failed.emit(msg)
 
 
 class PipelineWorker(QThread):
@@ -7199,7 +7506,7 @@ class PipelineWorker(QThread):
                     "7. If you use character names, keep identity consistent in every beat/shot (name + taxonomy/species) and do not change species.\n"
                     "8. If OWN_CHARACTERS is provided, use ONLY those characters as recurring characters and ensure every beat/shot includes them (do not invent new protagonists)\n"
                     "9. Every plan MUST include a simple story engine with: who_wants_what, what_blocks_them, what_happens_if_they_fail\n"
-                    "10. For videos longer than 30 seconds, use 4-6 arc_sections chosen from Setup, Discovery, Escalation, Setback, Climax, Ending\n"
+                    "10. Keep arc_sections compact and simple even for longer videos; do not expand into extra long-form sectioning just because duration is higher\n"
                     "11. Every arc section must say what changes: reveal new info, increase danger, change location, shift emotion, or force a decision\n"
                     "12. beats should describe progression, not random variety\n"
                     "\n"
@@ -7214,7 +7521,7 @@ class PipelineWorker(QThread):
                     "- Include: title, logline, setting, characters (list), tone, continuity_rules (list), story_engine (object), arc_sections (list), beats (list).\n"
                     "- story_engine keys: who_wants_what, what_blocks_them, what_happens_if_they_fail.\n"
                     "- arc_sections item keys: key, label, job, change, emotion_shift.\n"
-                    "- If TARGET_DURATION_SEC > 30, produce 4-6 arc_sections. Otherwise produce 3-4 arc_sections.\n"
+                    "- Produce 3-4 arc_sections only; do not expand section count for longer durations.\n"
                     "- beats should summarize progression across the arc, not just visual variety.\n"
                     "- Keep it short and actionable for prompt generation.\n\n"
                     f"PROMPT: {self.job.prompt}\n"
@@ -7241,7 +7548,7 @@ class PipelineWorker(QThread):
                     prompts_used_path=qwen_prompts_used,
                     error_path=qwen_plan_err,
                     temperature=0.35,
-                    max_new_tokens=2000,
+                    max_new_tokens=4000,
                 )
 
                 if not isinstance(parsed, dict):
@@ -7657,7 +7964,7 @@ class PipelineWorker(QThread):
                     "The JSON must be a single object with key 'shots' as an array. "
                     "Each shot MUST include fields: id, stage_directions, visual_description, subjects, story_section, shot_purpose, story_progression. "
                     "story_progression must be an object with keys: different_now, harder_now, revealed_now, prepares_payoff. "
-                    "CRITICAL: visual_description must be 2-3 sentences of pure visual content with NO technical cinematography terms. It MUST include surroundings: clearly state the setting/location and add 3-7 concrete environmental details (foreground/midground/background cues, materials or objects, time of day, and atmosphere). It MUST NOT contain: Camera:, Shot:, Lighting:, Cut to, Fade. The sequence must follow the plan's story_engine and arc_sections, so the middle never becomes filler. Every section must change something real: reveal new info, increase danger, change location, shift emotion, or force a decision. Every shot must have a clear job such as introduce, build tension, show obstacle, reveal clue, transition, or payoff. Default to humans unless the plan/prompt explicitly indicates animals or creatures; do not introduce animal protagonists unless requested." + " If OWN_CHARACTERS is provided, every shot MUST include those characters in subjects and visual_description, and you must not introduce new named protagonists."
+                    "CRITICAL: visual_description must be 2-3 sentences of pure visual content with NO technical cinematography terms. It MUST include surroundings: clearly state the setting/location and add 3-7 concrete environmental details (foreground/midground/background cues, materials or objects, time of day, and atmosphere). It MUST NOT contain: Camera:, Shot:, Lighting:, Cut to, Fade. The sequence must follow the plan's story_engine and arc_sections, so the middle never becomes filler. Every section must change something real: reveal new info, increase danger, change location, shift emotion, or force a decision. Every shot must have a clear job such as introduce, build tension, show obstacle, reveal clue, transition, or payoff. Not every shot should keep the protagonist on screen: use environment-only or object-led shots whenever they better establish place, reveal a clue, show an obstacle, or show aftermath. Aim for roughly 20-35% of the shot list to be non-portrait story beats focused on location, clue, path, obstacle, or changed world. Avoid front-facing centered portraits unless the beat specifically needs a reaction or payoff. Default to humans unless the plan/prompt explicitly indicates animals or creatures; do not introduce animal protagonists unless requested." + " If OWN_CHARACTERS is provided, every shot MUST include those characters in subjects and visual_description, and you must not introduce new named protagonists."
                 )
                 user_p = (
                     "Generate a concise seeded shot list for the plan below.\n"
@@ -7674,7 +7981,9 @@ class PipelineWorker(QThread):
                     "- story_section must use the relevant arc section label for that shot.\n"
                     "- stage_directions.purpose and shot_purpose must describe why the shot exists: introduce, build tension, show obstacle, reveal clue, transition, payoff, or force a decision.\n"
                     "- Make the middle progress: each section must reveal something, raise pressure, move somewhere new, shift emotion, or force a choice.\n"
-                    "- Across the full shot list, progression must be visible: what changed, what got harder, what was revealed, and what payoff is being prepared next.\n\n"
+                    "- Across the full shot list, progression must be visible: what changed, what got harder, what was revealed, and what payoff is being prepared next.\n"
+                    "- Do not keep the protagonist visible in every shot; use environment-only or object-led beats when they make the story clearer.\n"
+                    "- Avoid portrait-first wording unless a close emotional beat is really needed.\n\n"
                     f"REQUESTED_SHOTS: {n_shots}\n"
                     f"DEFAULT_SUBJECT_TAXONOMY: {default_taxonomy}\n"
                     f"TARGET_TOTAL_DURATION_SEC: {target_total:.1f}\n"
@@ -7695,7 +8004,7 @@ class PipelineWorker(QThread):
                     prompts_used_path=qwen_prompts_used,
                     error_path=qwen_shots_err,
                     temperature=0.4,
-                    max_new_tokens=2600,
+                    max_new_tokens=5200,
                 )
 
                 shots_list: List[Dict[str, Any]] = []
@@ -7728,6 +8037,7 @@ class PipelineWorker(QThread):
                             "- One shot per line, no numbering.\n"
                             "- Keep continuity, but make each line visually different from the others.\n"
                             "- The middle must progress instead of repeating the setup.\n"
+                            "- Do not keep the protagonist visible in every line; use environment-only or clue/obstacle lines when that tells the story better.\n"
                             "- Use the plan's arc sections and section changes.\n"
                             "- No camera labels, no shot labels, no technical prefixes.\n\n"
                             "PLAN_JSON:\n" + json.dumps(plan_obj, ensure_ascii=False)
@@ -7738,7 +8048,7 @@ class PipelineWorker(QThread):
                             user_prompt=retry_user,
                             log_path=retry_log,
                             temperature=0.25,
-                            max_new_tokens=int(max(700, n_shots * 80)),
+                            max_new_tokens=int(max(1400, n_shots * 160)),
                         )
                         shots_list = _parse_story_shot_lines(retry_raw, int(n_shots), plan_obj, float(target_total))
                         if shots_list:
@@ -7894,6 +8204,16 @@ class PipelineWorker(QThread):
                     pass
                 plan_obj = _apply_story_arc_to_shots(out_shots, plan_obj, float(target_total))
                 try:
+                    _rebalance_count = 0
+                    if (not bool(_own_storyline_enabled)) and (not bool(_own_active)):
+                        _rebalance_count = _rebalance_auto_story_presence(out_shots, plan_obj, self.job.prompt, self.job.extra_info)
+                        if _rebalance_count:
+                            shots_generation_note = f"{shots_generation_note.rstrip('.')} Rebalanced {_rebalance_count} environment-led story beats to stop portrait overfocus."
+                    try:
+                        if _rebalance_count:
+                            _log(f"[INFO] Rebalanced {_rebalance_count} environment-led story beats to reduce portrait repetition.")
+                    except Exception:
+                        pass
                     if isinstance(plan_obj, dict) and os.path.exists(plan_path):
                         _safe_write_json(plan_path, plan_obj)
                 except Exception:
@@ -8484,7 +8804,7 @@ class PipelineWorker(QThread):
                         user_prompt=user_p,
                         log_path=list_log,
                         temperature=0.35,
-                        max_new_tokens=int(max(800, N * 140)),
+                        max_new_tokens=int(max(1600, N * 280)),
                     )
 
                     def _parse_prompt_lines(blob: str, n: int, prefix_text: str) -> List[str]:
@@ -8552,7 +8872,7 @@ class PipelineWorker(QThread):
                                 user_prompt=user_p2,
                                 log_path=os.path.join(prompts_dir, "qwen_prompt_list_alt_storymode_retry.txt"),
                                 temperature=0.2,
-                                max_new_tokens=int(max(800, N * 140)),
+                                max_new_tokens=int(max(1600, N * 280)),
                             )
                             prompts = _parse_prompt_lines(raw2, N, seed)
                         except Exception:
@@ -9033,7 +9353,7 @@ class PipelineWorker(QThread):
                                     prompts_used_path=qwen_prompts_used,
                                     error_path=err_path,
                                     temperature=0.2,
-                                    max_new_tokens=1400,
+                                    max_new_tokens=2800,
                                 )
                                 ok, why = _auto_cb_v2_validate(parsed, shots)
                                 if ok:
@@ -12523,6 +12843,73 @@ class PipelineWorker(QThread):
                 out = "\n".join(lines).strip()
                 return out, len([ln for ln in out.splitlines() if ln.strip()])
 
+            def _planner_line_to_lyric_seed(line: str) -> str:
+                import re as _re
+                s = str(line or '').replace("\r", " ").replace("\n", " ").strip()
+                if not s:
+                    return ""
+                junk_patterns = [
+                    r"\bclose\s*up\b", r"\bmedium\s+shot\b", r"\bwide\s+shot\b", r"\bestablishing\s+shot\b",
+                    r"\bover\s+the\s+shoulder\b", r"\bPOV\b", r"\bdutch\s+angle\b", r"\blow\s+angle\b", r"\bhigh\s+angle\b",
+                    r"\bcinematic\b", r"\bhigh\s+detail\b", r"\bsharp\s+focus\b", r"\bclean\s+composition\b",
+                    r"\bcontinuity\b", r"\bstable\s+framing\b", r"\bcamera\s*:\s*[^,.!;:]*", r"\bshot\s*:\s*[^,.!;:]*",
+                    r"\blighting\s*:\s*[^,.!;:]*", r"\bsubject\s+motion\s*:\s*[^,.!;:]*", r"\benvironment\s+motion\s*:\s*[^,.!;:]*",
+                    r"\bstart\s+state\s*:\s*[^,.!;:]*", r"\bframe\s*\d+\b", r"\bmoment\s+\d+\s+of\s+\d+\b",
+                    r"\buse\s+the\s+image\s+as\s+the\s+hard\s+visual\s+anchor\b", r"\bexact\s+same\s+setting\b",
+                    r"\bvisible\s+subject\b", r"\bsource\s+image\b", r"\bpreserve\s+the\s+same\b"
+                ]
+                for pat in junk_patterns:
+                    s = _re.sub(pat, ' ', s, flags=_re.IGNORECASE)
+                s = _re.sub(r"\bS\d{1,3}\b", " ", s, flags=_re.IGNORECASE)
+                s = _re.sub(r"\b\d+\s+of\s+\d+\b", " ", s)
+                s = _re.sub(r"\s*[|/]+\s*", ", ", s)
+                s = _re.sub(r"\s{2,}", " ", s).strip(" ,.-")
+                return s[:240].strip()
+
+            def _build_lyric_brief(title: str, logline: str, setting: str, tone: str, beats_obj: list, own_story_text: str, own_story_prompts: list) -> str:
+                lines = []
+                if title:
+                    lines.append(f"TITLE: {title}")
+                if logline:
+                    lines.append(f"CORE IDEA: {_planner_line_to_lyric_seed(logline)}")
+                if setting:
+                    lines.append(f"SETTING / WORLD: {_planner_line_to_lyric_seed(setting)}")
+                if tone:
+                    lines.append(f"MOOD: {_planner_line_to_lyric_seed(tone)}")
+                beat_lines = []
+                try:
+                    for b in list(beats_obj or [])[:8]:
+                        bb = _planner_line_to_lyric_seed(str(b))
+                        if bb:
+                            beat_lines.append(f"- {bb}")
+                except Exception:
+                    beat_lines = []
+                if beat_lines:
+                    lines.append("STORY BEATS:\n" + "\n".join(beat_lines))
+                own_lines = []
+                try:
+                    for p in list(own_story_prompts or [])[:8]:
+                        if isinstance(p, dict):
+                            txt = str(p.get("text") or '').strip()
+                        else:
+                            txt = str(p or '').strip()
+                        txt = _planner_line_to_lyric_seed(txt)
+                        if txt:
+                            own_lines.append(f"- {txt}")
+                except Exception:
+                    own_lines = []
+                if own_lines:
+                    lines.append("USER STORYLINE HINTS:\n" + "\n".join(own_lines))
+                elif (own_story_text or '').strip():
+                    cleaned = _planner_line_to_lyric_seed(own_story_text)
+                    if cleaned:
+                        lines.append(f"USER STORYLINE HINT: {cleaned}")
+                lines.append(
+                    "LYRIC GOAL: turn the story into a real song lyric with a hook, emotion, and repeatable phrases. "
+                    "Do not narrate camera moves, prompts, or visual instructions."
+                )
+                return "\n".join([x for x in lines if str(x or '').strip()]).strip()
+
             def step_music_heartmula_7b() -> None:
 
                 env_dir = _detect_mula_env_dir2()
@@ -12577,6 +12964,8 @@ class PipelineWorker(QThread):
                 except Exception:
                     _os_enabled_for_music = False
                 own_story_brief = ""
+                _os_text = ""
+                _os_prompts = []
                 if bool(_os_enabled_for_music):
                     try:
                         _os_text = str((self.job.encoding or {}).get("own_storyline_text") or '').strip()
@@ -12586,28 +12975,7 @@ class PipelineWorker(QThread):
                         _os_prompts = (self.job.encoding or {}).get("own_storyline_prompts") or []
                     except Exception:
                         _os_prompts = []
-                    lines_os = []
-                    try:
-                        for p in list(_os_prompts)[:24]:
-                            if isinstance(p, dict):
-                                idx = str(p.get("index") or '').strip()
-                                txt = str(p.get("text") or '').strip()
-                            else:
-                                idx = ""
-                                txt = str(p).strip()
-                            if not txt:
-                                continue
-                            if idx:
-                                lines_os.append(f"- S{int(idx):02d}: {txt}")
-                            else:
-                                lines_os.append(f"- {txt}")
-                    except Exception:
-                        lines_os = []
-                    if lines_os:
-                        own_story_brief = "OWN STORYLINE (user-provided prompts):\n" + "\n".join(lines_os)
-                    elif _os_text:
-                        # Keep it short enough for lyric prompting
-                        own_story_brief = _os_text
+                    own_story_brief = _build_lyric_brief("", "", "", "", [], _os_text, _os_prompts)
                     # Override storyline hash source so HeartMula can detect changes even if plan.json is skipped
                     try:
                         _hash_src = own_story_brief.strip() if own_story_brief.strip() else _os_text.strip()
@@ -12628,15 +12996,7 @@ class PipelineWorker(QThread):
                 except Exception:
                     beats_lines = []
 
-                about = "\n".join(
-                    [x for x in [
-                        f"TITLE: {title}" if title else "",
-                        f"LOGLINE: {logline}" if logline else "",
-                        f"SETTING: {setting}" if setting else "",
-                        f"TONE: {tone}" if tone else "",
-                        "KEY BEATS:\n" + "\n".join(beats_lines) if beats_lines else "",
-                    ] if x]
-                ).strip()
+                about = _build_lyric_brief(title, logline, setting, tone, beats, _os_text, _os_prompts)
 
                 # info: Chunk 10 side quest — HeartMula lyrics: use Own Storyline brief when available
                 try:
@@ -12696,19 +13056,24 @@ class PipelineWorker(QThread):
                         rule = "Output a full song structure sized for the duration, WITHOUT labels like Verse/Chorus."
 
                     used_sys = (
-                        "You are an expert at creating song lyrics with rhymes. Output ONLY the lyrics lines.\n"
+                        "You are a professional topline songwriter for electronic music. Output ONLY finished lyric lines.\n"
                         "Hard rules:\n"
                         "- No explanations, no headings, no markdown.\n"
                         "- Do NOT write section labels (no 'Verse', 'Chorus', 'Bridge', 'Outro', etc).\n"
                         "- Do NOT use parentheses or brackets.\n"
                         "- Do NOT include stage directions (e.g., 'fade out', 'soft synth pulse').\n"
+                        "- Do NOT narrate visuals, camera angles, prompts, scene setup, or image-generation wording.\n"
+                        "- Prioritize hook, repetition, rhyme, emotional clarity, and simple singable lines.\n"
                         "- One lyric line per line. No blank lines."
                     )
                     used_usr = (
                         "Write singable lyrics for an energetic electronic song.\n"
-                        "Theme must match the storyline below and include self-discovery.\n\n"
+                        "Turn the story into a real song, not a scene description.\n"
+                        "Focus on feeling, desire, change, memory, tension, release, and a repeatable hook.\n"
+                        "Include self-discovery only if it fits naturally; never force it.\n\n"
                         f"{about}\n\n"
                         f"Duration target: {dur_gen:.1f} seconds. {rule}\n"
+                        "Avoid literal prompt wording, camera words, shot words, and lists of visual details.\n"
                         "Return ONLY the lyrics text."
                     )
 
@@ -12815,7 +13180,7 @@ class PipelineWorker(QThread):
                 try:
                     with open(log_path, "w", encoding="utf-8", errors="ignore") as lf:
                         lf.write("CMD: " + " ".join(cmd) + "\n\n")
-                        proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1)
+                        proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, encoding="utf-8", errors="replace", bufsize=1)
                         last_json = None
                         assert proc.stdout is not None
                         for line in proc.stdout:
@@ -16745,17 +17110,25 @@ class PlannerPane(QWidget):
         row_lyrics = QHBoxLayout()
         row_lyrics.setSpacing(8)
         self.chk_ace15_lyrics = QCheckBox("Lyrics")
-        self.chk_ace15_lyrics.setToolTip("When enabled, you can provide lyrics. If empty, the planner will auto-create lyrics from the storyline (later step).")
+        self.chk_ace15_lyrics.setToolTip("When enabled, Ace Step 1.5 will use the lyrics in the box. Turn this off for instrumental music.")
         try:
             self.chk_ace15_lyrics.toggled.connect(self._sync_toggle_visibility)
         except Exception:
             pass
         row_lyrics.addWidget(self.chk_ace15_lyrics)
+
+        self.btn_ace15_ai_lyrics = QPushButton("Let AI create lyrics")
+        self.btn_ace15_ai_lyrics.setToolTip("Use the current prompt, extra info, and own storyline to generate lyrics for Ace Step 1.5. Click again to randomize a new lyric.")
+        try:
+            self.btn_ace15_ai_lyrics.clicked.connect(self._generate_ace15_ai_lyrics)
+        except Exception:
+            pass
+        row_lyrics.addWidget(self.btn_ace15_ai_lyrics)
         row_lyrics.addStretch(1)
         ace15_lay.addLayout(row_lyrics)
 
         self.txt_ace15_lyrics = QPlainTextEdit()
-        self.txt_ace15_lyrics.setPlaceholderText("When no lyrics are added the system will create lyrics based on the storyline")
+        self.txt_ace15_lyrics.setPlaceholderText("Use your own lyrics here, or click 'Let AI create lyrics' to fill this box.")
         self.txt_ace15_lyrics.setMinimumHeight(80)
         ace15_lay.addWidget(self.txt_ace15_lyrics)
 
@@ -17190,7 +17563,7 @@ If the planner sees a marker like [02] or (02), it becomes the next image prompt
         self.cmb_video_model.currentIndexChanged.connect(lambda _=None: _refresh_gen_quality())
         _refresh_gen_quality()
 
-        lbl_camera_fx = QLabel("Use 20 different camera effects")
+        lbl_camera_fx = QLabel("Use (+20 random) camera effects")
         self.chk_use_20_camera_effects = QCheckBox("Enabled")
         try:
             _camera_fx_tip = "Use for music videoclips or footage that allows lots of camera movement. When off, it will use only a couple of cinematic camera moves."
@@ -20274,6 +20647,11 @@ If the planner sees a marker like [02] or (02), it becomes the next image prompt
             self.txt_ace15_lyrics.setVisible(show_lyrics)
         except Exception:
             pass
+        try:
+            self.btn_ace15_ai_lyrics.setVisible(show_lyrics)
+            self.btn_ace15_ai_lyrics.setEnabled(bool(show_lyrics) and not bool(getattr(self, "_ace15_ai_lyrics_busy", False)))
+        except Exception:
+            pass
 
         # File picker only relevant for "Use your own"
         try:
@@ -20973,6 +21351,260 @@ If the planner sees a marker like [02] or (02), it becomes the next image prompt
         except Exception:
             pass
 
+    def _ace15_collect_lyric_inputs(self) -> dict:
+        data = {
+            "prompt": "",
+            "extra": "",
+            "own_story_text": "",
+            "own_story_prompts": [],
+            "has_any": False,
+        }
+        try:
+            data["prompt"] = (self.prompt_edit.toPlainText() or '').strip() if hasattr(self, "prompt_edit") else ""
+        except Exception:
+            data["prompt"] = ""
+        try:
+            data["extra"] = (self.extra_info.toPlainText() or '').strip() if hasattr(self, "extra_info") else ""
+        except Exception:
+            data["extra"] = ""
+        try:
+            own_story_enabled = bool(hasattr(self, "chk_own_storyline") and self.chk_own_storyline.isChecked())
+        except Exception:
+            own_story_enabled = False
+        if own_story_enabled:
+            try:
+                data["own_story_text"] = (self.own_storyline_edit.toPlainText() or '').strip() if hasattr(self, "own_storyline_edit") else ""
+            except Exception:
+                data["own_story_text"] = ""
+            try:
+                parsed = getattr(self, "_own_storyline_parsed_prompts", None)
+            except Exception:
+                parsed = None
+            if not isinstance(parsed, list) or not parsed:
+                try:
+                    parsed, _mode = _parse_own_storyline_prompts(data["own_story_text"])
+                except Exception:
+                    parsed = []
+            data["own_story_prompts"] = parsed if isinstance(parsed, list) else []
+        data["has_any"] = bool(
+            str(data.get("prompt") or '').strip()
+            or str(data.get("extra") or '').strip()
+            or str(data.get("own_story_text") or '').strip()
+            or list(data.get("own_story_prompts") or [])
+        )
+        return data
+
+    def _planner_line_to_lyric_seed_ui(self, line: str) -> str:
+        import re as _re
+        s = str(line or '').replace("\r", " ").replace("\n", " ").strip()
+        if not s:
+            return ""
+        junk_patterns = [
+            r"\bclose\s*up\b", r"\bmedium\s+shot\b", r"\bwide\s+shot\b", r"\bestablishing\s+shot\b",
+            r"\bover\s+the\s+shoulder\b", r"\bPOV\b", r"\bdutch\s+angle\b", r"\blow\s+angle\b", r"\bhigh\s+angle\b",
+            r"\bcinematic\b", r"\bhigh\s+detail\b", r"\bsharp\s+focus\b", r"\bclean\s+composition\b",
+            r"\bcontinuity\b", r"\bstable\s+framing\b", r"\bcamera\s*:\s*[^,.!;:]*", r"\bshot\s*:\s*[^,.!;:]*",
+            r"\blighting\s*:\s*[^,.!;:]*", r"\bsubject\s+motion\s*:\s*[^,.!;:]*", r"\benvironment\s+motion\s*:\s*[^,.!;:]*",
+            r"\bstart\s+state\s*:\s*[^,.!;:]*", r"\bframe\s*\d+\b", r"\bmoment\s+\d+\s+of\s+\d+\b",
+            r"\buse\s+the\s+image\s+as\s+the\s+hard\s+visual\s+anchor\b", r"\bexact\s+same\s+setting\b",
+            r"\bvisible\s+subject\b", r"\bsource\s+image\b", r"\bpreserve\s+the\s+same\b",
+        ]
+        for pat in junk_patterns:
+            s = _re.sub(pat, ' ', s, flags=_re.IGNORECASE)
+        s = _re.sub(r"\bS\d{1,3}\b", " ", s, flags=_re.IGNORECASE)
+        s = _re.sub(r"\b\d+\s+of\s+\d+\b", " ", s)
+        s = _re.sub(r"\s*[|/]+\s*", ", ", s)
+        s = _re.sub(r"\s{2,}", " ", s).strip(" ,.-")
+        return s[:240].strip()
+
+    def _build_ace15_lyric_brief(self, payload: dict) -> str:
+        prompt = self._planner_line_to_lyric_seed_ui(str(payload.get("prompt") or ''))
+        extra = self._planner_line_to_lyric_seed_ui(str(payload.get("extra") or ''))
+        own_story_text = str(payload.get("own_story_text") or '').strip()
+        own_story_prompts = payload.get("own_story_prompts") or []
+        lines = []
+        if prompt:
+            lines.append(f"CORE IDEA: {prompt}")
+        if extra:
+            lines.append(f"STYLE / MOOD: {extra}")
+        if own_story_text:
+            lines.append("STORY NOTES:")
+            for ln in [x.strip() for x in own_story_text.replace("\r\n", "\n").replace("\r", "\n").split("\n") if x.strip()][:8]:
+                clean_ln = self._planner_line_to_lyric_seed_ui(ln)
+                if clean_ln:
+                    lines.append(f"- {clean_ln}")
+        if own_story_prompts:
+            lines.append("STORY BEATS:")
+            seen = set()
+            for item in own_story_prompts[:10]:
+                clean_ln = self._planner_line_to_lyric_seed_ui(str(item or ''))
+                key = clean_ln.lower().strip()
+                if not clean_ln or key in seen:
+                    continue
+                seen.add(key)
+                lines.append(f"- {clean_ln}")
+        return "\n".join(lines).strip()
+
+    def _clean_ace15_generated_lyrics(self, raw: str) -> str:
+        t = str(raw or '').replace("\r\n", "\n").replace("\r", "\n").strip()
+        if not t:
+            return ""
+        lines = []
+        for ln in t.split("\n"):
+            s = ln.strip()
+            if not s:
+                continue
+            low = s.lower()
+            if low.startswith(("verse", "chorus", "bridge", "outro", "intro", "hook", "pre-chorus", "pre chorus")):
+                continue
+            if s.startswith("[") and s.endswith("]"):
+                continue
+            s = re.sub(r"^[\-•*\d\.)\s]+", "", s).strip()
+            if not s:
+                continue
+            lines.append(s)
+        cleaned = "\n".join(lines).strip()
+        return cleaned
+
+    def _set_ace15_ai_lyrics_busy(self, busy: bool) -> None:
+        try:
+            self._ace15_ai_lyrics_busy = bool(busy)
+        except Exception:
+            pass
+        btn = getattr(self, "btn_ace15_ai_lyrics", None)
+        if btn is not None:
+            try:
+                btn.setEnabled(not busy)
+                btn.setText("Generating lyrics..." if busy else "Let AI create lyrics")
+            except Exception:
+                pass
+        try:
+            self._sync_music_source_ui()
+        except Exception:
+            pass
+
+    def _on_ace15_ai_lyrics_finished(self, raw: str) -> None:
+        self._set_ace15_ai_lyrics_busy(False)
+        try:
+            cleaned = self._clean_ace15_generated_lyrics(raw)
+            if not cleaned.strip():
+                raise RuntimeError("AI lyrics came back empty.")
+            try:
+                self.chk_ace15_lyrics.setChecked(True)
+            except Exception:
+                pass
+            try:
+                self.txt_ace15_lyrics.setPlainText(cleaned)
+                self.txt_ace15_lyrics.setFocus()
+            except Exception:
+                pass
+            try:
+                self._sync_music_source_ui()
+            except Exception:
+                pass
+        except Exception as e:
+            QMessageBox.warning(self, "AI lyrics failed", str(e))
+        finally:
+            try:
+                self._ace15_lyrics_worker = None
+            except Exception:
+                pass
+
+    def _on_ace15_ai_lyrics_failed(self, msg: str) -> None:
+        self._set_ace15_ai_lyrics_busy(False)
+        try:
+            self._ace15_lyrics_worker = None
+        except Exception:
+            pass
+        QMessageBox.warning(self, "AI lyrics failed", str(msg or "Unknown error while generating AI lyrics."))
+
+    def _generate_ace15_ai_lyrics(self) -> None:
+        try:
+            if bool(getattr(self, "_ace15_ai_lyrics_busy", False)):
+                return
+        except Exception:
+            pass
+
+        payload = self._ace15_collect_lyric_inputs()
+        if not bool(payload.get("has_any")):
+            QMessageBox.information(
+                self,
+                "Nothing to use yet",
+                "Enter a prompt, extra info, or own storyline prompts first so the planner has something to turn into lyrics.",
+            )
+            return
+        brief = self._build_ace15_lyric_brief(payload)
+        if not brief.strip():
+            QMessageBox.information(
+                self,
+                "Nothing to use yet",
+                "The current text is too empty or too prompt-like. Add a prompt, some extra info, or own storyline prompts first.",
+            )
+            return
+
+        seed_hint = int(time.time() % 100000)
+        log_path = os.path.join(_default_output_base(), "planner_ace15_ai_lyrics_log.txt")
+        system_prompt = (
+            "You are a professional topline songwriter for electronic music. Output ONLY finished lyric lines.\n"
+            "Write like a real songwriter, not like a narrator or novelist.\n"
+            "Hard rules:\n"
+            "- No explanations, no headings, no markdown.\n"
+            "- No labels like Verse, Chorus, Bridge, Intro, Outro, Hook.\n"
+            "- No camera words, shot words, image-generation words, or scene-prompt phrasing.\n"
+            "- Do not list what is visible on screen.\n"
+            "- Do not retell the full story beat by beat.\n"
+            "- Favor short memorable lines, internal rhyme, end rhyme, repetition, contrast, and emotional punch.\n"
+            "- Give the lyric a strong central hook people can remember after one listen.\n"
+            "- Be musically creative: you may invent fresher wording, a better hook, a better angle, or a stronger emotional twist than the source notes suggest.\n"
+            "- Keep the meaning/theme, but feel free to simplify, stylize, exaggerate, or reshape it into a better song.\n"
+            "- One lyric line per line. No blank lines."
+        )
+        user_prompt = (
+            "Write lyrics for Ace Step 1.5.\n"
+            "Use the material below as loose inspiration only. Do NOT turn it into a story that reads like a book.\n"
+            "Write a catchy electronic song lyric with a clear repeating hook, natural rhyme, and simple singable lines.\n"
+            "Prioritize groove, hook, rhyme, repetition, and emotional vibe over plot detail.\n"
+            "It is better to write a great chorus idea than to mention every event from the story.\n"
+            "You have freedom to be creative and reshape the idea into a stronger song.\n"
+            "The result should fit electronic music and work as a topline lyric.\n"
+            f"Randomize this version so it is not the same each time. Variation seed: {seed_hint}.\n\n"
+            f"{brief}\n\n"
+            "Return ONLY the lyrics text."
+        )
+        prev_text = ""
+        try:
+            prev_text = (self.txt_ace15_lyrics.toPlainText() or '').strip() if hasattr(self, "txt_ace15_lyrics") else ""
+        except Exception:
+            prev_text = ""
+        if prev_text:
+            user_prompt += (
+                "\n\nDo not closely repeat the previous version below. Keep the theme, but change the wording, hook, and line flow.\n"
+                f"PREVIOUS VERSION TO AVOID COPYING:\n{prev_text[:1500]}"
+            )
+
+        try:
+            self._set_ace15_ai_lyrics_busy(True)
+            worker = _Ace15LyricsWorker(
+                system_prompt=system_prompt,
+                user_prompt=user_prompt,
+                log_path=log_path,
+                temperature=0.9,
+                max_new_tokens=700,
+                parent=self,
+            )
+            worker.signals.finished.connect(self._on_ace15_ai_lyrics_finished)
+            worker.signals.failed.connect(self._on_ace15_ai_lyrics_failed)
+            self._ace15_lyrics_worker = worker
+            worker.start()
+        except Exception as e:
+            self._set_ace15_ai_lyrics_busy(False)
+            try:
+                self._ace15_lyrics_worker = None
+            except Exception:
+                pass
+            QMessageBox.warning(self, "AI lyrics failed", str(e))
+
+
     def _default_out_dir(self) -> str:
         # Default output path at project root
         return _default_output_base()
@@ -21562,7 +22194,7 @@ If the planner sees a marker like [02] or (02), it becomes the next image prompt
         ]
 
         try:
-            cp = subprocess.run(args, capture_output=True, text=True)
+            cp = subprocess.run(args, capture_output=True, text=True, encoding="utf-8", errors="replace")
             if cp.returncode != 0 or not os.path.exists(out_png):
                 # Fallback: try exact first frame (no seek)
                 args2 = [
@@ -21580,7 +22212,7 @@ If the planner sees a marker like [02] or (02), it becomes the next image prompt
                     "-an",
                     out_png,
                 ]
-                cp2 = subprocess.run(args2, capture_output=True, text=True)
+                cp2 = subprocess.run(args2, capture_output=True, text=True, encoding="utf-8", errors="replace")
                 if cp2.returncode != 0 or not os.path.exists(out_png):
                     return ""
         except Exception:

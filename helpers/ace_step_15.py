@@ -984,6 +984,121 @@ class LyricsManagerDialog(QtWidgets.QDialog):
 
 
 
+class LyricsGenDialog(QtWidgets.QDialog):
+    """Collect options for AI lyric generation."""
+
+    LENGTH_OPTIONS = ["Very short", "Short", "Medium", "Long"]
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Generate AI lyrics")
+        self.resize(520, 280)
+
+        root = QtWidgets.QVBoxLayout(self)
+        root.setContentsMargins(12, 12, 12, 12)
+        root.setSpacing(10)
+
+        form = QtWidgets.QFormLayout()
+        form.setLabelAlignment(QtCore.Qt.AlignLeft | QtCore.Qt.AlignVCenter)
+
+        self.ed_mood = QtWidgets.QLineEdit()
+        self.ed_mood.setPlaceholderText("happy club anthem, angry rap, dreamy pop, dark techno...")
+        form.addRow("Mood", self.ed_mood)
+
+        self.cmb_length = QtWidgets.QComboBox()
+        for item in self.LENGTH_OPTIONS:
+            self.cmb_length.addItem(item)
+        self.cmb_length.setCurrentText("Short")
+        form.addRow("Length", self.cmb_length)
+
+        self.ed_other = QtWidgets.QPlainTextEdit()
+        self.ed_other.setPlaceholderText("Extra wishes, theme, topic, artist vibe, words to avoid, structure notes...")
+        self.ed_other.setMinimumHeight(120)
+        form.addRow("Other", self.ed_other)
+
+        root.addLayout(form, 1)
+
+        buttons = QtWidgets.QDialogButtonBox(QtWidgets.QDialogButtonBox.Ok | QtWidgets.QDialogButtonBox.Cancel)
+        buttons.button(QtWidgets.QDialogButtonBox.Ok).setText("Generate")
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        root.addWidget(buttons)
+
+    def values(self) -> dict:
+        return {
+            "mood": self.ed_mood.text().strip(),
+            "length": self.cmb_length.currentText().strip(),
+            "other": self.ed_other.toPlainText().strip(),
+        }
+
+
+class LyricsResultDialog(QtWidgets.QDialog):
+    def __init__(self, lyrics: str, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Generated lyrics")
+        self.resize(760, 640)
+
+        root = QtWidgets.QVBoxLayout(self)
+        root.setContentsMargins(12, 12, 12, 12)
+        root.setSpacing(10)
+
+        root.addWidget(QtWidgets.QLabel("Review the generated lyrics below."))
+
+        self.ed_text = QtWidgets.QPlainTextEdit()
+        self.ed_text.setPlainText((lyrics or "").strip())
+        root.addWidget(self.ed_text, 1)
+
+        buttons = QtWidgets.QDialogButtonBox()
+        self.btn_use = buttons.addButton("Use lyrics", QtWidgets.QDialogButtonBox.AcceptRole)
+        self.btn_close = buttons.addButton("Close", QtWidgets.QDialogButtonBox.RejectRole)
+        self.btn_use.clicked.connect(self.accept)
+        self.btn_close.clicked.connect(self.reject)
+        root.addWidget(buttons)
+
+    def lyrics_text(self) -> str:
+        return self.ed_text.toPlainText().strip()
+
+
+class LyricsGenWorker(QtCore.QObject):
+    finished = QtCore.Signal(str)
+    failed = QtCore.Signal(str)
+
+    def __init__(self, model_folder: Path, system_prompt: str, user_prompt: str, temperature: float, max_new_tokens: int):
+        super().__init__()
+        self._model_folder = Path(model_folder)
+        self._system_prompt = system_prompt
+        self._user_prompt = user_prompt
+        self._temperature = float(temperature)
+        self._max_new_tokens = int(max_new_tokens)
+        self._cancel = False
+
+    def cancel(self):
+        self._cancel = True
+
+    @QtCore.Slot()
+    def run(self):
+        try:
+            try:
+                from helpers.prompt import _generate_with_qwen_text  # type: ignore
+            except Exception:
+                from prompt import _generate_with_qwen_text  # type: ignore
+
+            result = _generate_with_qwen_text(
+                self._model_folder,
+                self._system_prompt,
+                self._user_prompt,
+                self._temperature,
+                self._max_new_tokens,
+                cancel_check=lambda: self._cancel,
+            )
+            if self._cancel:
+                self.failed.emit("Cancelled")
+                return
+            self.finished.emit((result or "").strip())
+        except Exception as e:
+            self.failed.emit(f"{type(e).__name__}: {e}")
+
+
 class MainWindow(QtWidgets.QMainWindow):
     def __init__(self):
         super().__init__()
@@ -996,6 +1111,9 @@ class MainWindow(QtWidgets.QMainWindow):
 
         self._thread: Optional[QtCore.QThread] = None
         self._runner: Optional[Runner] = None
+        self._lyrics_thread: Optional[QtCore.QThread] = None
+        self._lyrics_worker: Optional[LyricsGenWorker] = None
+        self._lyrics_button_idle_text = "ai lyrics"
 
         # Naming context for results
         self._ace15_last_preset_genre: str = ""
@@ -1212,8 +1330,8 @@ class MainWindow(QtWidgets.QMainWindow):
         self.btn_load_lyrics.setToolTip("Open your saved lyrics library (edit / save / delete / load into the main UI).")
         self.btn_load_lyrics.clicked.connect(self._load_lyrics_clicked)
 
-        self.btn_gen_lyrics = QtWidgets.QPushButton("random lyric")
-        self.btn_gen_lyrics.setToolTip("Generate quick placeholder lyrics for testing (does not change caption/BPM/duration).")
+        self.btn_gen_lyrics = QtWidgets.QPushButton(self._lyrics_button_idle_text)
+        self.btn_gen_lyrics.setToolTip("Generate lyrics with Qwen 3 VL using a popup for mood, length and extra wishes.")
         self.btn_gen_lyrics.clicked.connect(self._generate_lyrics_clicked)
         row_ly.addStretch(1)
         row_ly.addWidget(self.btn_save_lyrics)
@@ -2839,20 +2957,186 @@ class MainWindow(QtWidgets.QMainWindow):
 
 
     def _generate_lyrics_clicked(self):
-        # Quick placeholder lyrics for testing (no LM call).
-        if self.chk_instrumental.isChecked():
-            self.chk_instrumental.setChecked(False)
-        import time
-        rnd = random.Random(time.time_ns() & 0xFFFFFFFF)
-        words = [w.strip(".,!?;:()[]{}\"'").lower() for w in self.ed_caption.toPlainText().split()]
-        words = [w for w in words if len(w) >= 4 and w.isascii()]
-        kw = rnd.choice(words) if words else "tonight"
-        txt = ("[Verse 1]\n" + f"{kw} in the lights, we come alive\n" +
-               "Bass in the chest, let it decide\n\n" +
-               "[Chorus]\n" + f"{kw}, {kw}, one more time\n" +
-               "Hands up, hands up, feel the drive\n")
-        self.ed_lyrics.setPlainText(txt)
+        if self._lyrics_thread is not None:
+            return
 
+        dlg = LyricsGenDialog(self)
+        try:
+            caption = self.ed_caption.toPlainText().strip()
+            if caption:
+                dlg.ed_other.setPlainText(f"Song idea/context: {caption}")
+        except Exception:
+            pass
+
+        if dlg.exec() != QtWidgets.QDialog.Accepted:
+            return
+
+        opts = dlg.values()
+        try:
+            payload = self._build_lyrics_generation_payload(opts)
+            model_folder = self._ace15_qwen_model_folder()
+        except Exception as e:
+            QtWidgets.QMessageBox.warning(self, "AI lyrics", str(e))
+            return
+
+        sys_prompt, user_prompt, temperature, max_new_tokens = payload
+        self._start_lyrics_generation(model_folder, sys_prompt, user_prompt, temperature, max_new_tokens)
+
+    def _ace15_qwen_model_folder(self) -> Path:
+        try:
+            from helpers.prompt import _qwen3_local_folder  # type: ignore
+        except Exception:
+            try:
+                from prompt import _qwen3_local_folder  # type: ignore
+            except Exception as e:
+                raise RuntimeError(
+                    "Could not import the Prompt helper. Make sure helpers/prompt.py is available in FrameVision."
+                ) from e
+
+        folder = Path(_qwen3_local_folder())
+        if not folder.exists() or not any(folder.iterdir()):
+            raise RuntimeError(
+                "Qwen 3 VL local model was not found. Open the Prompt tab first and make sure the Qwen 3 VL model is configured."
+            )
+        return folder
+
+    def _build_lyrics_generation_payload(self, opts: dict) -> tuple[str, str, float, int]:
+        mood = (opts.get("mood") or "").strip()
+        length = (opts.get("length") or "Short").strip()
+        other = (opts.get("other") or "").strip()
+        caption = self.ed_caption.toPlainText().strip()
+        current_lyrics = self.ed_lyrics.toPlainText().strip()
+        task = self.cmb_task.currentText().strip() if hasattr(self, "cmb_task") else "text2music"
+
+        if not any([mood, other, caption]):
+            raise RuntimeError("Please add at least a mood, a caption/song idea, or some extra info first.")
+
+        length_map = {
+            "Very short": ("mainly a repeating chorus or hook, around 4 to 8 lines total", 180),
+            "Short": ("a short lyric with a hook and maybe one compact verse, around 8 to 16 lines total", 260),
+            "Medium": ("a full short song lyric with clear sections, around 16 to 28 lines total", 380),
+            "Long": ("a more complete song lyric with multiple sections, around 28 to 48 lines total", 520),
+        }
+        length_desc, max_new_tokens = length_map.get(length, length_map["Short"])
+
+        temperature = 0.85
+        try:
+            try:
+                from helpers.prompt import _load_settings  # type: ignore
+            except Exception:
+                from prompt import _load_settings  # type: ignore
+            temperature = float((_load_settings() or {}).get("temperature", 0.85))
+        except Exception:
+            temperature = 0.85
+
+        instrumental_note = "yes" if self.chk_instrumental.isChecked() else "no"
+        regenerate_note = "Create a fresh alternative and do not repeat earlier wording." if current_lyrics else ""
+
+        system_prompt = (
+            "You are an expert commercial songwriter and lyricist for modern music production. "
+            "Your job is to write lyrics that sound like a real song, not a story, essay, poem, summary, or description. "
+            "The result must be catchy, rhythmic, easy to sing, and built around repetition and rhyme. "
+            "Prefer clear song structure with a strong hook, repeated chorus lines, and short performance-friendly lines. "
+            "Most sections should contain obvious end-rhyme or near-rhyme unless the requested style is intentionally loose. "
+            "Never drift into paragraph prose, scene description, or storytelling exposition. "
+            "Avoid filler, clichés, placeholders, and overly literal narration. "
+            "Return only the final lyrics text, optionally using labels like [Verse], [Chorus], [Bridge], or [Outro]. "
+            "Do not explain anything."
+        )
+
+        requested_mood = mood or "not specified, infer it from the song idea"
+        user_parts = [
+            f"Task context: {task}.",
+            f"Requested mood/style: {requested_mood}.",
+            f"Requested lyric length: {length_desc}.",
+            f"Instrumental toggle currently enabled: {instrumental_note}.",
+        ]
+        if caption:
+            user_parts.append(f"Song idea / prompt: {caption}")
+        if other:
+            user_parts.append(f"Extra wishes from user: {other}")
+        if current_lyrics:
+            user_parts.append("Current lyrics in the box (for variation only, do not copy them):\n" + current_lyrics)
+        if regenerate_note:
+            user_parts.append(regenerate_note)
+        if length == "Very short":
+            user_parts.append(
+                "Target format for VERY SHORT: 1 strong chorus/hook with heavy repetition, around 4 to 8 total lines, "
+                "minimal storytelling, maximum catchiness."
+            )
+        elif length == "Short":
+            user_parts.append(
+                "Target format for SHORT: 1 chorus and 1 short verse, or 2 compact sections. Keep it immediately catchy."
+            )
+        elif length == "Medium":
+            user_parts.append(
+                "Target format for MEDIUM: verse / chorus / verse / chorus or another compact song structure with repeated hook."
+            )
+        else:
+            user_parts.append(
+                "Target format for LONG: full song structure with repeated chorus and at least one contrasting section."
+            )
+        user_parts.append(
+            "Write this as proper song lyrics, not as a story. "
+            "Use short to medium-length lines that are easy to sing or rap. "
+            "Build around a memorable repeated hook and make the chorus the strongest part. "
+            "Use clear rhyme, slant rhyme, internal rhyme, or repeated sound patterns in most sections. "
+            "Each section should feel musical and performable, not descriptive or novel-like. "
+            "Avoid long narrative sentences, exposition, stage directions, and scene-setting paragraphs. "
+            "For very short club-style requests, make it mostly a repeating chorus/hook with maybe one tiny supporting section. "
+            "For pop, dance, house, EDM, and club moods, prioritize chantable lines, repeated phrases, and simple rhyme. "
+            "For rap or aggressive moods, use tighter rhyme, punchier cadence, and sharper bars. "
+            "Keep it concise, strong, and catchy. "
+            "Do not include commentary, titles, markdown fences, or production notes."
+        )
+
+        return system_prompt, "\n\n".join(user_parts).strip(), temperature, max_new_tokens
+
+    def _start_lyrics_generation(self, model_folder: Path, system_prompt: str, user_prompt: str, temperature: float, max_new_tokens: int):
+        self._set_lyrics_busy(True)
+        self._log("AI lyrics: generating with Qwen 3 VL...")
+
+        self._lyrics_thread = QtCore.QThread(self)
+        self._lyrics_worker = LyricsGenWorker(model_folder, system_prompt, user_prompt, temperature, max_new_tokens)
+        self._lyrics_worker.moveToThread(self._lyrics_thread)
+
+        self._lyrics_thread.started.connect(self._lyrics_worker.run)
+        self._lyrics_worker.finished.connect(self._on_lyrics_generated)
+        self._lyrics_worker.failed.connect(self._on_lyrics_generation_failed)
+        self._lyrics_worker.finished.connect(self._cleanup_lyrics_worker)
+        self._lyrics_worker.failed.connect(self._cleanup_lyrics_worker)
+
+        self._lyrics_thread.start()
+
+    def _set_lyrics_busy(self, busy: bool):
+        try:
+            self.btn_gen_lyrics.setEnabled(not busy)
+            self.btn_gen_lyrics.setText("generating" if busy else self._lyrics_button_idle_text)
+        except Exception:
+            pass
+
+    def _on_lyrics_generated(self, text: str):
+        self._log("AI lyrics: generation finished.")
+        dlg = LyricsResultDialog(text, self)
+        if dlg.exec() == QtWidgets.QDialog.Accepted:
+            self.ed_lyrics.setPlainText(dlg.lyrics_text())
+            if self.chk_instrumental.isChecked():
+                self.chk_instrumental.setChecked(False)
+
+    def _on_lyrics_generation_failed(self, err: str):
+        self._log(f"AI lyrics error: {err}")
+        QtWidgets.QMessageBox.warning(self, "AI lyrics", f"Could not generate lyrics.\n\n{err}")
+
+    def _cleanup_lyrics_worker(self, *_args):
+        self._set_lyrics_busy(False)
+        try:
+            if self._lyrics_thread is not None:
+                self._lyrics_thread.quit()
+                self._lyrics_thread.wait(2000)
+        except Exception:
+            pass
+        self._lyrics_thread = None
+        self._lyrics_worker = None
 
     def _ace15_main_model_default_steps(self, main_sel: str) -> int:
         """Return recommended inference steps for selected main model.
@@ -3369,6 +3653,20 @@ class MainWindow(QtWidgets.QMainWindow):
 
         if code == 0 and self.chk_auto_open.isChecked():
             self._open_output_folder()
+
+    def closeEvent(self, event: QtGui.QCloseEvent):
+        try:
+            if self._lyrics_worker:
+                self._lyrics_worker.cancel()
+        except Exception:
+            pass
+        try:
+            if self._lyrics_thread:
+                self._lyrics_thread.quit()
+                self._lyrics_thread.wait(1000)
+        except Exception:
+            pass
+        super().closeEvent(event)
 
     # -----------------------------
     # Output naming
