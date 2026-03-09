@@ -553,9 +553,24 @@ def _normalize_forward_args(forward: List[str]) -> List[str]:
 
 def _new_mode(args: argparse.Namespace) -> int:
     root = Path(args.work_root).resolve()
-    _write_log(root, f"MODE: new; py={sys.executable}; cwd={os.getcwd()} [PATCH active newmode-postfix-v2]")
+    _write_log(root, f"MODE: new; py={sys.executable}; cwd={os.getcwd()} [PATCH active newmode-postfix-v3-input-root-fix]")
+
+    # SeedVR2 CLI is started with cwd set to the repository folder that contains
+    # inference_cli.py. When FrameVision passes a relative media path such as
+    # output\videoclips\file.mp4, that path must be resolved against the
+    # FrameVision root, not against the repo folder, otherwise the CLI reports
+    # "Input path not found" even though the file exists.
     try:
-        print(f"[seedvr2_runner] input={args.input}", flush=True)
+        input_path = Path(args.input)
+        if not input_path.is_absolute():
+            input_path = (root / input_path).resolve()
+        else:
+            input_path = input_path.resolve()
+    except Exception:
+        input_path = Path(args.input)
+
+    try:
+        print(f"[seedvr2_runner] input={input_path}", flush=True)
     except Exception:
         pass
 
@@ -572,7 +587,7 @@ def _new_mode(args: argparse.Namespace) -> int:
         pass
 
     # Ensure input is first positional for inference_cli.py
-    cmd = _ensure_utf8_flag([sys.executable, str(cli), str(args.input)] + forward)
+    cmd = _ensure_utf8_flag([sys.executable, str(cli), str(input_path)] + forward)
 
     # In "new" mode we may need ffmpeg/ffprobe on PATH for --video_backend ffmpeg.
     # We'll prepend their folder to PATH if provided.
@@ -628,7 +643,7 @@ def _new_mode(args: argparse.Namespace) -> int:
                         print(f"[seedvr2_runner] post-fix: attempting to add audio/repair timing -> {out_p}", flush=True)
                     except Exception:
                         pass
-                    _repair_video_output(root, Path(args.input), out_p, args.ffmpeg, args.ffprobe)
+                    _repair_video_output(root, input_path, out_p, args.ffmpeg, args.ffprobe)
                 else:
                     _write_log(root, "POSTFIX new-mode repair skipped: no --output in forwarded args")
                     try:
