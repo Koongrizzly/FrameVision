@@ -3000,6 +3000,83 @@ class MainWindow(QtWidgets.QMainWindow):
             )
         return folder
 
+    def _ace15_detect_lyric_style(self, mood: str, caption: str, other: str) -> tuple[str, str]:
+        """Return (style_label, style_guidance) to steer AI lyrics toward genre-appropriate songwriting.
+
+        The UI already has presets and freeform text, but lyric generation used a single generic songwriter prompt.
+        This helper gently steers Qwen toward the likely genre and writing style without forcing the user to fill
+        in another field.
+        """
+        parts: list[str] = []
+        try:
+            g = str(getattr(self, "_ace15_last_preset_genre", "") or "").strip()
+            s = str(getattr(self, "_ace15_last_preset_subgenre", "") or "").strip()
+            if g or s:
+                parts.append(f"{g} {s}".strip())
+        except Exception:
+            pass
+        for v in (mood, caption, other):
+            if v:
+                parts.append(str(v))
+        hay = " ".join(parts).lower()
+
+        rules = [
+            (
+                "progressive house / melodic EDM",
+                ["progressive house", "melodic house", "melodic techno", "progressive", "edm", "festival", "euphoric", "anthem", "uplifting", "big room", "trance"],
+                "Write chantable, emotional club lyrics with a huge repeated hook. Keep lines short, bright, and memorable. Use simple rhyme, repeated key phrases, and a chorus that can land over a big drop. Do not over-explain the story.",
+            ),
+            (
+                "deep house / underground house",
+                ["deep house", "house", "afro house", "afrobeats", "garage", "club", "dj", "dancefloor", "nightlife", "underground"],
+                "Write sleek, sensual, late-night lyrics with groove and repetition. Favor smooth phrasing, flirtation, desire, movement, and hypnotic repeated lines. Keep the wording cool and singable, not overly busy or literary.",
+            ),
+            (
+                "pop / radio",
+                ["pop", "radio", "chart", "catchy", "commercial", "anthemic", "female vocal", "male vocal", "summer hit"],
+                "Write ultra-catchy pop lyrics with a strong chorus, clean rhyme, and easy-to-remember phrases. Make the hook immediate and repeat-worthy. Keep verses compact and melodic.",
+            ),
+            (
+                "rap / hip-hop",
+                ["rap", "hip hop", "hip-hop", "trap", "bars", "drill"],
+                "Write punchier lyrics with tighter rhyme, internal rhyme, swagger, and sharper cadence. Keep lines rhythmic and performable. Avoid drifting into long prose or novel-like narration.",
+            ),
+            (
+                "rock / alternative",
+                ["rock", "alt rock", "alternative", "indie rock", "punk", "grunge"],
+                "Write bold, direct lyrics with a strong central hook and a little bite. Keep the emotion clear and the lines singable. Let the chorus feel bigger and more anthemic than the verses.",
+            ),
+            (
+                "country / folk",
+                ["country", "folk", "americana", "acoustic", "nashville"],
+                "Write plainspoken, vivid, singable lyrics with strong end rhyme and a memorable chorus. Use concrete emotion and relatable lines, but do not narrate every event beat by beat.",
+            ),
+            (
+                "reggae / reggae-pop",
+                ["reggae", "dancehall", "dub", "island"],
+                "Write relaxed, warm, rhythmic lyrics with bounce, repetition, and easy hooks. Keep it light on exposition and strong on groove, feel, and repeated chorus lines.",
+            ),
+            (
+                "funny / novelty",
+                ["funny", "comedy", "novelty", "silly", "parody", "joke"],
+                "Write playful, witty, catchy lyrics with obvious rhyme and a memorable repeated punchline. Keep it fun, bold, and easy to sing. Let the concept be exaggerated instead of realistic.",
+            ),
+            (
+                "cinematic / melancholic",
+                ["sad", "melancholic", "moody", "cinematic", "emotional", "heartbreak", "dark", "lonely"],
+                "Write emotional, atmospheric lyrics with clear imagery and strong repeated motifs, but keep the lines compact and musical. Let the chorus carry the emotional peak.",
+            ),
+        ]
+
+        for label, keys, guidance in rules:
+            if any(k in hay for k in keys):
+                return label, guidance
+
+        return (
+            "general contemporary song",
+            "Write contemporary, catchy, singable lyrics with clear rhyme or near-rhyme, short lines, and a memorable repeated chorus. Use the provided idea as inspiration, not as a script to retell beat by beat.",
+        )
+
     def _build_lyrics_generation_payload(self, opts: dict) -> tuple[str, str, float, int]:
         mood = (opts.get("mood") or "").strip()
         length = (opts.get("length") or "Short").strip()
@@ -3031,6 +3108,7 @@ class MainWindow(QtWidgets.QMainWindow):
 
         instrumental_note = "yes" if self.chk_instrumental.isChecked() else "no"
         regenerate_note = "Create a fresh alternative and do not repeat earlier wording." if current_lyrics else ""
+        style_label, style_guidance = self._ace15_detect_lyric_style(mood, caption, other)
 
         system_prompt = (
             "You are an expert commercial songwriter and lyricist for modern music production. "
@@ -3040,6 +3118,8 @@ class MainWindow(QtWidgets.QMainWindow):
             "Most sections should contain obvious end-rhyme or near-rhyme unless the requested style is intentionally loose. "
             "Never drift into paragraph prose, scene description, or storytelling exposition. "
             "Avoid filler, clichés, placeholders, and overly literal narration. "
+            "Treat the user idea as inspiration, not as a script you must retell line by line. "
+            "You may simplify, exaggerate, reshape, or invent better lyrical angles if that makes the song catchier. "
             "Return only the final lyrics text, optionally using labels like [Verse], [Chorus], [Bridge], or [Outro]. "
             "Do not explain anything."
         )
@@ -3048,8 +3128,10 @@ class MainWindow(QtWidgets.QMainWindow):
         user_parts = [
             f"Task context: {task}.",
             f"Requested mood/style: {requested_mood}.",
+            f"Detected songwriting lane: {style_label}.",
             f"Requested lyric length: {length_desc}.",
             f"Instrumental toggle currently enabled: {instrumental_note}.",
+            f"Genre/style guidance: {style_guidance}",
         ]
         if caption:
             user_parts.append(f"Song idea / prompt: {caption}")
@@ -3083,10 +3165,13 @@ class MainWindow(QtWidgets.QMainWindow):
             "Use clear rhyme, slant rhyme, internal rhyme, or repeated sound patterns in most sections. "
             "Each section should feel musical and performable, not descriptive or novel-like. "
             "Avoid long narrative sentences, exposition, stage directions, and scene-setting paragraphs. "
+            "Do not just summarize the user prompt or retell every plot beat in order. "
+            "Instead, pull out the strongest emotions, phrases, images, tension, desire, or attitude and turn that into a catchy song concept. "
             "For very short club-style requests, make it mostly a repeating chorus/hook with maybe one tiny supporting section. "
-            "For pop, dance, house, EDM, and club moods, prioritize chantable lines, repeated phrases, and simple rhyme. "
+            "For pop, dance, house, EDM, and club moods, prioritize chantable lines, repeated phrases, simple rhyme, and earworm hooks. "
             "For rap or aggressive moods, use tighter rhyme, punchier cadence, and sharper bars. "
-            "Keep it concise, strong, and catchy. "
+            "Leave some mystery and creative freedom instead of explaining everything literally. "
+            "Keep it concise, strong, catchy, and performance-ready. "
             "Do not include commentary, titles, markdown fences, or production notes."
         )
 
