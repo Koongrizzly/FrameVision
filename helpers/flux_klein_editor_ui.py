@@ -46,6 +46,7 @@ import time
 from dataclasses import dataclass, asdict
 from pathlib import Path
 from typing import List, Optional
+import re
 
 from PIL import Image, ImageQt
 from PySide6 import QtCore, QtGui, QtWidgets
@@ -147,6 +148,7 @@ class GGUFModels:
     diffusion_model: str = ""   # flux gguf
     llm_model: str = ""         # qwen3 4b gguf
     vae_file: str = ""          # flux2_ae.safetensors
+    lora_file: str = ""         # optional LoRA adapter (.safetensors/.ckpt/.pt)
 
 
 @dataclass
@@ -164,12 +166,40 @@ class RunConfig:
     offload_to_cpu: bool = False
     vae_tiling: bool = False
     out_name: str = ""
+    lora_strength: float = 1.0
     # Flux Kontext-style ref images (can be used multiple times)
     ref_images: List[str] = None
 
     def __post_init__(self):
         if self.ref_images is None:
             self.ref_images = []
+
+
+def _rel_lora_name(lora_path: str, lora_model_dir: str) -> str:
+    """Return sd.cpp/webui style LoRA identifier relative to --lora-model-dir, without extension."""
+    if not lora_path:
+        return ""
+    lp = Path(lora_path)
+    try:
+        base = Path(lora_model_dir) if lora_model_dir else lp.parent
+        rel = lp.relative_to(base)
+    except Exception:
+        rel = Path(lp.name)
+    rel_no_ext = rel.with_suffix("")
+    return rel_no_ext.as_posix().strip()
+
+
+def _append_lora_tag(prompt: str, lora_name: str, strength: float) -> str:
+    if not lora_name:
+        return prompt
+    tag = f"<lora:{lora_name}:{strength:g}>"
+    if tag in prompt:
+        return prompt
+    # If the user already typed a LoRA tag manually, leave their prompt alone.
+    if re.search(r"<\s*lora\s*:[^>]+>", prompt, flags=re.IGNORECASE):
+        return prompt
+    prompt = (prompt or "").rstrip()
+    return f"{prompt} {tag}".strip()
 
 
 # -----------------------------
@@ -310,6 +340,7 @@ class MainWindow(QtWidgets.QMainWindow):
         # ensure sd-cli + dropdowns are populated
         self._auto_fill_models()
         self._refresh_ui()
+        self._apply_run_mode_ui()
 
         # Now that the UI reflects the loaded (or first-run default) state,
         # enable autosave and persist once.
@@ -487,6 +518,13 @@ class MainWindow(QtWidgets.QMainWindow):
         self.btn_vae = QtWidgets.QPushButton("Browse…")
         self.llm_combo = QtWidgets.QComboBox()
         self.btn_llm = QtWidgets.QPushButton("Browse…")
+        self.lora_combo = QtWidgets.QComboBox()
+        self.btn_lora = QtWidgets.QPushButton("Browse…")
+        self.lora_strength_spin = QtWidgets.QDoubleSpinBox()
+        self.lora_strength_spin.setRange(-4.0, 4.0)
+        self.lora_strength_spin.setDecimals(2)
+        self.lora_strength_spin.setSingleStep(0.05)
+        self.lora_strength_spin.setValue(1.0)
 
         # Model folder picker (affects dropdown contents)
         self.modeldir_edit = QtWidgets.QLineEdit()
@@ -505,6 +543,8 @@ class MainWindow(QtWidgets.QMainWindow):
         model_form.addRow("Flux GGUF:", row(self.flux_combo, self.btn_flux))
         model_form.addRow("VAE (flux2_ae.safetensors):", row(self.vae_combo, self.btn_vae))
         model_form.addRow("Text encoder (Qwen3 4B):", row(self.llm_combo, self.btn_llm))
+        model_form.addRow("LoRA (optional):", row(self.lora_combo, self.btn_lora))
+        model_form.addRow("LoRA strength:", self.lora_strength_spin)
 
         # Command preview
         self.cmd_preview = QtWidgets.QPlainTextEdit()
@@ -512,15 +552,14 @@ class MainWindow(QtWidgets.QMainWindow):
         self.cmd_preview.setMaximumBlockCount(2000)
         self.cmd_preview.setMinimumHeight(90)
 
-        cmd_group = QtWidgets.QGroupBox("Command preview")
-        cmd_layout = QtWidgets.QVBoxLayout(cmd_group)
+        self.cmd_group = QtWidgets.QGroupBox("Command preview")
+        cmd_layout = QtWidgets.QVBoxLayout(self.cmd_group)
         cmd_layout.addWidget(self.cmd_preview)
 
         # Run controls (moved to sticky bottom bar)
         self.btn_run = QtWidgets.QPushButton("Generate")
-        self.btn_run.setToolTip("Generate (Ctrl+Enter)")
+        self.btn_run.setToolTip("Generate image (Ctrl+Enter)")
         self.btn_run.setMinimumHeight(42)
-        self.btn_stop = QtWidgets.QPushButton("Stop")
 
         # Log
         self.log = QtWidgets.QPlainTextEdit()
@@ -528,8 +567,8 @@ class MainWindow(QtWidgets.QMainWindow):
         self.log.setMaximumBlockCount(8000)
         self.log.setMinimumHeight(180)
 
-        log_group = QtWidgets.QGroupBox("Log")
-        log_layout = QtWidgets.QVBoxLayout(log_group)
+        self.log_group = QtWidgets.QGroupBox("Log")
+        log_layout = QtWidgets.QVBoxLayout(self.log_group)
         log_layout.addWidget(self.log)
 
         # Output helpers
@@ -537,10 +576,13 @@ class MainWindow(QtWidgets.QMainWindow):
         self.btn_open_out = QtWidgets.QPushButton("Open output folder")
         self.btn_save_copy = QtWidgets.QPushButton("Save copy…")
         self.btn_copy_path = QtWidgets.QPushButton("Copy output path")
+        self.chk_use_queue = QtWidgets.QCheckBox("Use queue")
+        self.chk_use_queue.setChecked(True)
         out_row.addWidget(self.btn_open_out)
         out_row.addWidget(self.btn_save_copy)
         out_row.addWidget(self.btn_copy_path)
         out_row.addStretch(1)
+        out_row.addWidget(self.chk_use_queue)
 
         # Left assembly
         left_layout.addWidget(QtWidgets.QLabel("Prompt"))
@@ -550,32 +592,41 @@ class MainWindow(QtWidgets.QMainWindow):
         left_layout.addWidget(ref_group)
         left_layout.addWidget(gen_group)
         left_layout.addWidget(model_group)
-        left_layout.addWidget(cmd_group)
+        left_layout.addWidget(self.cmd_group)
         left_layout.addLayout(out_row)
-        left_layout.addWidget(log_group)
+        left_layout.addWidget(self.log_group)
         left_layout.addStretch(1)
 
         # Right preview
-        right = QtWidgets.QWidget()
-        right_layout = QtWidgets.QVBoxLayout(right)
+        self.right_panel = QtWidgets.QWidget()
+        right_layout = QtWidgets.QVBoxLayout(self.right_panel)
         right_layout.setContentsMargins(0,0,0,0)
         right_layout.setSpacing(8)
 
         top = QtWidgets.QHBoxLayout()
-        self.lbl_status = QtWidgets.QLabel("Idle")
+        self.lbl_status = QtWidgets.QLabel("Idle / not queued")
         self.lbl_status.setStyleSheet("font-weight: 600;")
         self.btn_fit = QtWidgets.QPushButton("Fit")
         top.addWidget(self.lbl_status)
         top.addStretch(1)
         top.addWidget(self.btn_fit)
 
+        self.preview_stack = QtWidgets.QStackedWidget()
         self.preview = ImageView()
+        self.preview_placeholder = QtWidgets.QLabel(
+            "Preview follows direct run only.\n\nTurn off 'Use queue' to see live logs and the finished image here."
+        )
+        self.preview_placeholder.setAlignment(QtCore.Qt.AlignmentFlag.AlignCenter)
+        self.preview_placeholder.setWordWrap(True)
+        self.preview_placeholder.setStyleSheet("padding: 18px; color: #888;")
+        self.preview_stack.addWidget(self.preview)
+        self.preview_stack.addWidget(self.preview_placeholder)
 
         right_layout.addLayout(top)
-        right_layout.addWidget(self.preview, 1)
+        right_layout.addWidget(self.preview_stack, 1)
 
         splitter.addWidget(scroll)
-        splitter.addWidget(right)
+        splitter.addWidget(self.right_panel)
         splitter.setStretchFactor(0, 0)
         splitter.setStretchFactor(1, 1)
         splitter.setSizes([680, 670])
@@ -585,8 +636,7 @@ class MainWindow(QtWidgets.QMainWindow):
         bottom_layout = QtWidgets.QHBoxLayout(bottom)
         bottom_layout.setContentsMargins(0, 0, 0, 0)
         bottom_layout.setSpacing(8)
-        bottom_layout.addWidget(self.btn_run, 3)
-        bottom_layout.addWidget(self.btn_stop, 1)
+        bottom_layout.addWidget(self.btn_run, 1)
         outer.addWidget(bottom, 0)
 
         # Signals
@@ -604,19 +654,20 @@ class MainWindow(QtWidgets.QMainWindow):
         self.btn_flux.clicked.connect(lambda: self._browse_and_set_combo(self.flux_combo, "Flux GGUF", "GGUF (*.gguf);;All files (*.*)"))
         self.btn_llm.clicked.connect(lambda: self._browse_and_set_combo(self.llm_combo, "Qwen3 GGUF", "GGUF (*.gguf);;All files (*.*)"))
         self.btn_vae.clicked.connect(lambda: self._browse_and_set_combo(self.vae_combo, "VAE safetensors", "SafeTensors (*.safetensors);;All files (*.*)"))
+        self.btn_lora.clicked.connect(lambda: self._browse_and_set_combo(self.lora_combo, "LoRA adapter", "LoRA (*.safetensors *.ckpt *.pt);;All files (*.*)"))
 
         self.btn_run.clicked.connect(self._run)
-        self.btn_stop.clicked.connect(self._stop)
         self.btn_open_out.clicked.connect(self._open_output_folder)
         self.btn_save_copy.clicked.connect(self._save_copy)
         self.btn_copy_path.clicked.connect(self._copy_output_path)
         self.btn_fit.clicked.connect(lambda: self.preview.fitInView(self.preview.sceneRect(), QtCore.Qt.AspectRatioMode.KeepAspectRatio))
+        self.chk_use_queue.toggled.connect(lambda _=None: self._apply_run_mode_ui())
 
         # Update cmd preview on edits
         for w in (self.prompt_edit, self.neg_edit, self.width_spin, self.height_spin, self.steps_spin, self.cfg_spin,
-                  self.seed_spin, self.chk_rand_seed, self.sampling_combo,
+                  self.seed_spin, self.chk_rand_seed, self.sampling_combo, self.lora_strength_spin,
                   self.chk_diffusion_fa, self.chk_offload_cpu, self.chk_vae_tiling,
-                  self.out_name_edit, self.sdcli_edit, self.modeldir_edit):
+                  self.out_name_edit, self.sdcli_edit, self.modeldir_edit, self.chk_use_queue):
             if isinstance(w, QtWidgets.QPlainTextEdit):
                 w.textChanged.connect(self._update_cmd_preview)
             elif isinstance(w, QtWidgets.QComboBox):
@@ -629,6 +680,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.flux_combo.currentIndexChanged.connect(lambda _=None: self._update_cmd_preview())
         self.vae_combo.currentIndexChanged.connect(lambda _=None: self._update_cmd_preview())
         self.llm_combo.currentIndexChanged.connect(lambda _=None: self._update_cmd_preview())
+        self.lora_combo.currentIndexChanged.connect(lambda _=None: self._update_cmd_preview())
 
         QtGui.QShortcut(QtGui.QKeySequence("Ctrl+Return"), self, activated=self._run)
         QtGui.QShortcut(QtGui.QKeySequence("Ctrl+Enter"), self, activated=self._run)
@@ -637,6 +689,24 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def _append_log(self, s: str):
         self.log.appendPlainText(s)
+
+    def _apply_run_mode_ui(self):
+        use_queue = bool(self.chk_use_queue.isChecked())
+        self.log_group.setVisible(not use_queue)
+        self.right_panel.setVisible(not use_queue)
+        self.preview_stack.setCurrentWidget(self.preview_placeholder if use_queue else self.preview)
+        self.btn_fit.setEnabled(not use_queue)
+        self.btn_save_copy.setEnabled(not use_queue and self.current_output is not None and self.current_output.exists())
+        self.btn_copy_path.setEnabled(not use_queue and self.current_output is not None)
+        if use_queue:
+            self.lbl_status.setText("Queued")
+            self.lbl_status.setStyleSheet("color: #064; font-weight: 600;")
+        else:
+            if self.current_output and self.current_output.exists():
+                self.lbl_status.setText(f"Ready / last: {self.current_output.name}")
+            else:
+                self.lbl_status.setText("Idle / direct run")
+            self.lbl_status.setStyleSheet("font-weight: 600;")
 
     def _browse_file(self, edit: QtWidgets.QLineEdit, title: str, filt: str):
         cur = edit.text().strip()
@@ -711,27 +781,49 @@ class MainWindow(QtWidgets.QMainWindow):
     def _populate_model_dropdowns(self):
         """Scan model folder recursively and fill dropdowns."""
         base = Path(self.paths.model_dir)
-        ggufs = []
-        safes = []
+        ggufs: List[Path] = []
+        safes: List[Path] = []
+        loras_strict: List[Path] = []
+        loras_fallback: List[Path] = []
         if base.exists():
             for p in base.rglob("*"):
-                if p.is_file():
-                    suf = p.suffix.lower()
-                    if suf == ".gguf":
-                        ggufs.append(p)
-                    elif suf == ".safetensors":
-                        safes.append(p)
+                if not p.is_file():
+                    continue
+                suf = p.suffix.lower()
+                name_l = p.name.lower()
+                full_l = p.as_posix().lower()
+                if suf == ".gguf":
+                    ggufs.append(p)
+                elif suf == ".safetensors":
+                    safes.append(p)
+
+                if suf in (".safetensors", ".ckpt", ".pt"):
+                    if "lora" in full_l or "loras" in full_l or "lora" in name_l:
+                        loras_strict.append(p)
+                    elif "flux" in name_l and "vae" not in name_l:
+                        loras_fallback.append(p)
 
         # Build lists
         flux = [p for p in ggufs if "flux" in p.name.lower() and "klein" in p.name.lower()]
         llm = [p for p in ggufs if "qwen" in p.name.lower() and "4b" in p.name.lower()]
         vae = [p for p in safes if "vae" in p.name.lower() and ("flux2" in p.name.lower() or "flux" in p.name.lower())]
 
-        def refill(combo: QtWidgets.QComboBox, items: List[Path], preferred: str, keep_path: str):
+        loras = loras_strict if loras_strict else loras_fallback
+
+        # Prefer likely LoRA folders / names, but keep it broad enough for custom layouts.
+        def lora_sort_key(x: Path):
+            full_l = x.as_posix().lower()
+            name_l = x.name.lower()
+            pri = 0 if ("/loras/" in full_l or full_l.endswith('/loras') or "\\loras\\" in str(x).lower()) else 1
+            return (pri, name_l)
+
+        def refill(combo: QtWidgets.QComboBox, items: List[Path], preferred: str, keep_path: str, none_label: str | None = None):
             combo.blockSignals(True)
             combo.clear()
+            if none_label is not None:
+                combo.addItem(none_label, "")
             # preferred first
-            items_sorted = sorted(items, key=lambda x: (0 if preferred in x.name.lower() else 1, x.name.lower()))
+            items_sorted = sorted(items, key=lambda x: (0 if preferred and preferred in x.name.lower() else 1, x.name.lower()))
             for pth in items_sorted:
                 rel = str(pth.relative_to(base)) if base.exists() else pth.name
                 combo.addItem(rel, str(pth))
@@ -739,6 +831,8 @@ class MainWindow(QtWidgets.QMainWindow):
             # restore selection
             if keep_path:
                 self._set_combo_to_path(combo, keep_path)
+            elif none_label is not None:
+                combo.setCurrentIndex(0)
             elif combo.count() > 0:
                 combo.setCurrentIndex(0)
 
@@ -747,6 +841,7 @@ class MainWindow(QtWidgets.QMainWindow):
         # prefer flux2_ae
         preferred_vae = "flux2_ae"
         refill(self.vae_combo, vae, preferred_vae, getattr(self.models, "vae_file", ""))
+        refill(self.lora_combo, sorted(set(loras), key=lora_sort_key), "", getattr(self.models, "lora_file", ""), none_label="(None)")
 
 
     def _set_size(self, w: int, h: int):
@@ -769,6 +864,7 @@ class MainWindow(QtWidgets.QMainWindow):
             return
         self.cfg.ref_images.extend([f for f in files if Path(f).exists()])
         self._sync_ref_list()
+        self._apply_run_mode_ui()
 
     def _remove_selected_refs(self):
         rows = sorted({i.row() for i in self.ref_list.selectedIndexes()}, reverse=True)
@@ -883,6 +979,8 @@ class MainWindow(QtWidgets.QMainWindow):
         self.chk_offload_cpu.setChecked(bool(self.cfg.offload_to_cpu))
         self.chk_vae_tiling.setChecked(bool(self.cfg.vae_tiling))
         self.out_name_edit.setText(self.cfg.out_name or "")
+        self.lora_strength_spin.setValue(float(getattr(self.cfg, "lora_strength", 1.0)))
+        self.chk_use_queue.setChecked(bool(getattr(self.cfg, "use_queue", True)))
 
         self._sync_ref_list()
 
@@ -894,6 +992,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.models.diffusion_model = str(self.flux_combo.currentData() or "").strip()
         self.models.vae_file = str(self.vae_combo.currentData() or "").strip()
         self.models.llm_model = str(self.llm_combo.currentData() or "").strip()
+        self.models.lora_file = str(self.lora_combo.currentData() or "").strip()
 
         self.cfg.prompt = self.prompt_edit.toPlainText().strip()
         self.cfg.negative = self.neg_edit.toPlainText().strip()
@@ -908,6 +1007,8 @@ class MainWindow(QtWidgets.QMainWindow):
         self.cfg.offload_to_cpu = bool(self.chk_offload_cpu.isChecked())
         self.cfg.vae_tiling = bool(self.chk_vae_tiling.isChecked())
         self.cfg.out_name = self.out_name_edit.text().strip()
+        self.cfg.lora_strength = float(self.lora_strength_spin.value())
+        self.cfg.use_queue = bool(self.chk_use_queue.isChecked())
 
     def _build_cmd(self, out_path: Path) -> List[str]:
         self._collect_state()
@@ -918,8 +1019,15 @@ class MainWindow(QtWidgets.QMainWindow):
         cmd += ["--vae", self.models.vae_file]
         cmd += ["--llm", self.models.llm_model]
 
+        prompt_for_cmd = self.cfg.prompt
+        if self.models.lora_file:
+            lora_dir = str(Path(self.models.lora_file).parent)
+            lora_name = _rel_lora_name(self.models.lora_file, lora_dir)
+            prompt_for_cmd = _append_lora_tag(prompt_for_cmd, lora_name, float(getattr(self.cfg, "lora_strength", 1.0)))
+            cmd += ["--lora-model-dir", lora_dir]
+
         # prompts
-        cmd += ["-p", self.cfg.prompt]
+        cmd += ["-p", prompt_for_cmd]
         if self.cfg.negative:
             cmd += ["-n", self.cfg.negative]
 
@@ -965,7 +1073,8 @@ class MainWindow(QtWidgets.QMainWindow):
             out_dir.mkdir(parents=True, exist_ok=True)
             preview_out = out_dir / "preview_output.png"
             cmd = self._build_cmd(preview_out)
-            self.cmd_preview.setPlainText(_pretty_cmd(cmd))
+            mode = "queue" if bool(getattr(self.cfg, "use_queue", True)) else "direct run"
+            self.cmd_preview.setPlainText(f"[{mode}]\n" + _pretty_cmd(cmd))
             # autosave on change
             self._save_settings()
         except Exception as e:
@@ -984,9 +1093,24 @@ class MainWindow(QtWidgets.QMainWindow):
             return f"Qwen3 4B GGUF not found:\n{self.models.llm_model}"
         if not Path(self.models.vae_file).exists():
             return f"VAE not found:\n{self.models.vae_file}"
+        if self.models.lora_file and not Path(self.models.lora_file).exists():
+            return f"LoRA not found:\n{self.models.lora_file}"
         if not self.cfg.prompt:
             return "Prompt is empty."
         return None
+
+    def _open_queue_tab(self):
+        try:
+            win = self.window()
+            tabs = win.findChild(QtWidgets.QTabWidget) if win is not None else None
+            if tabs:
+                for i in range(tabs.count()):
+                    if tabs.tabText(i).strip().lower() == "queue":
+                        tabs.setCurrentIndex(i)
+                        return
+        except Exception:
+            pass
+        QtWidgets.QMessageBox.information(self, "Queue", "This editor now adds jobs to the FrameVision queue. Open the Queue tab in the main app to review, run, or cancel jobs.")
 
     def _run(self):
         err = self._validate()
@@ -994,25 +1118,56 @@ class MainWindow(QtWidgets.QMainWindow):
             QtWidgets.QMessageBox.warning(self, "Missing / invalid settings", err)
             return
 
-        # output path
+        self._collect_state()
+        self._save_settings()
+
+        use_queue = bool(getattr(self.cfg, "use_queue", True))
+        if use_queue:
+            try:
+                try:
+                    from helpers.queue_adapter import enqueue_flux_klein_from_widget as _enqueue_flux_klein
+                except Exception:
+                    from queue_adapter import enqueue_flux_klein_from_widget as _enqueue_flux_klein
+
+                jid = _enqueue_flux_klein(self)
+
+                out_file = None
+                try:
+                    out_file = str(Path(self.paths.out_dir) / self.cfg.out_name) if self.cfg.out_name else None
+                except Exception:
+                    out_file = None
+
+                self.lbl_status.setText("Queued")
+                self.lbl_status.setStyleSheet("color: #064; font-weight: 600;")
+                self._append_log(f"[queue] queued Flux Klein job -> {jid}")
+                self._apply_run_mode_ui()
+                if out_file:
+                    self._append_log(f"[queue] target output -> {out_file}")
+            except Exception as e:
+                self.lbl_status.setText("Queue failed")
+                self.lbl_status.setStyleSheet("color: #c00; font-weight: 600;")
+                self.preview_stack.setCurrentWidget(self.preview_placeholder)
+                QtWidgets.QMessageBox.warning(self, "Queue error", str(e))
+            return
+
         out_dir = Path(self.paths.out_dir)
         out_dir.mkdir(parents=True, exist_ok=True)
         if self.cfg.out_name:
             out_path = out_dir / self.cfg.out_name
         else:
-            out_path = out_dir / f"klein_{time.strftime('%Y%m%d_%H%M%S')}.png"
+            stamp = time.strftime("%Y%m%d_%H%M%S")
+            out_path = out_dir / f"flux_klein_{stamp}.png"
 
         cmd = self._build_cmd(out_path)
-        self._save_settings()
-
+        self.current_output = out_path
+        self.preview_stack.setCurrentWidget(self.preview)
+        self.lbl_status.setText("Running")
+        self.lbl_status.setStyleSheet("color: #06c; font-weight: 600;")
         self.btn_run.setEnabled(False)
-        self.lbl_status.setText("Running…")
-        self.lbl_status.setStyleSheet("color: #b60; font-weight: 600;")
-        self.runner.run(cmd, cwd=out_dir, expected_out=out_path)
+        self.runner.run(cmd, Path(self.paths.root), out_path)
 
     def _stop(self):
-        self.runner.stop()
-        self._append_log("[ui] stop requested")
+        self._open_queue_tab()
 
     def _on_finished(self, ok: bool, out_path: str):
         self.btn_run.setEnabled(True)
@@ -1024,11 +1179,13 @@ class MainWindow(QtWidgets.QMainWindow):
             try:
                 img = Image.open(p).convert("RGB")
                 self.preview.set_image(img)
+                self.preview_stack.setCurrentWidget(self.preview)
             except Exception as e:
                 self._append_log(f"[ui] preview failed: {e}")
         else:
             self.lbl_status.setText("Failed")
             self.lbl_status.setStyleSheet("color: #c00; font-weight: 600;")
+        self._apply_run_mode_ui()
 
     # -------- events --------
 

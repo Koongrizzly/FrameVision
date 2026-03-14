@@ -242,6 +242,212 @@ def _pick_flux_klein_models_highest(force_klein_b: int = 0) -> Dict[str, str]:
     }
 
 
+def _firered_settings_paths() -> List[str]:
+    base = _root() / "presets" / "setsave"
+    return [
+        str((base / "fireed.json").resolve()),
+        str((base / "firered.json").resolve()),
+    ]
+
+
+def _norm_path_from_root(value: str) -> str:
+    s = str(value or '').strip().strip('"').strip()
+    if not s:
+        return ""
+    try:
+        s = os.path.expandvars(os.path.expanduser(s))
+    except Exception:
+        pass
+    try:
+        if not os.path.isabs(s):
+            s = str((_root() / s).resolve())
+    except Exception:
+        pass
+    try:
+        return os.path.normpath(s)
+    except Exception:
+        return s
+
+
+def _pick_firered_from_state() -> Dict[str, Any]:
+    """Resolve FireRed Edit wiring from the saved FireRed JSON state.
+
+    The Planner uses the FireRed UI save file only to discover user-selected paths
+    (sd-cli, model folder, VAE, LLM). Render settings stay locked by the Planner.
+    """
+    state_path = ""
+    state: Dict[str, Any] = {}
+    for cand in _firered_settings_paths():
+        if os.path.isfile(cand):
+            state_path = cand
+            try:
+                state = _safe_read_json(cand) or {}
+            except Exception:
+                state = {}
+            break
+
+    def _parse_qnum(name: str) -> int:
+        m = re.search(r"(?i)\bQ(\d+)", str(name or ''))
+        return int(m.group(1)) if m else -1
+
+    def _safe_size(path_str: str) -> int:
+        try:
+            return int(os.path.getsize(path_str))
+        except Exception:
+            return 0
+
+    def _best_existing(paths: List[str]) -> str:
+        for cand in paths:
+            pp = _norm_path_from_root(cand)
+            if pp and os.path.isfile(pp):
+                return pp
+        return ""
+
+    sdcli = _best_existing([
+        str(state.get("sdcli") or ''),
+        str((_root() / "presets" / "bin" / ("sd-cli.exe" if os.name == "nt" else "sd-cli")).resolve()),
+        str((_root() / "bin" / ("sd-cli.exe" if os.name == "nt" else "sd-cli")).resolve()),
+        str((_root() / ("sd-cli.exe" if os.name == "nt" else "sd-cli")).resolve()),
+    ])
+
+    model_json = _norm_path_from_root(str(state.get("model") or ''))
+    model_dir = ""
+    if model_json:
+        try:
+            model_dir = str(Path(model_json).resolve().parent)
+        except Exception:
+            model_dir = str(Path(model_json).parent)
+    if not model_dir:
+        model_dir = str((_root() / "models" / "FireRed-Image-Edit-1.1").resolve())
+
+    diffusion = model_json if os.path.isfile(model_json) else ""
+    try:
+        model_dir_path = Path(model_dir)
+        if model_dir_path.exists():
+            diffusion_cands = []
+            for pp in model_dir_path.rglob("*.gguf"):
+                try:
+                    if not pp.is_file():
+                        continue
+                except Exception:
+                    continue
+                n = pp.name.lower()
+                if any(tok in n for tok in ("qwen", "vl", "instruct", "llm", "mmproj", "text-encoder", "text_encoder")):
+                    continue
+                bonus = 1 if ("firered" in n or "fire-red" in n or "fire_red" in n) else 0
+                diffusion_cands.append((bonus, _parse_qnum(pp.name), _safe_size(str(pp)), str(pp)))
+            if diffusion_cands:
+                diffusion_cands.sort(key=lambda t: (t[0], t[1], t[2], t[3]), reverse=True)
+                diffusion = diffusion_cands[0][3]
+    except Exception:
+        pass
+
+    llm = _norm_path_from_root(str(state.get("llm") or ''))
+    if not llm or not os.path.isfile(llm):
+        try:
+            model_dir_path = Path(model_dir)
+            llm_cands = []
+            if model_dir_path.exists():
+                for pp in model_dir_path.rglob("*.gguf"):
+                    try:
+                        if not pp.is_file():
+                            continue
+                    except Exception:
+                        continue
+                    n = pp.name.lower()
+                    if ("qwen" not in n) and ("vl" not in n) and ("instruct" not in n) and ("llm" not in n):
+                        continue
+                    llm_cands.append((_parse_qnum(pp.name), _safe_size(str(pp)), str(pp)))
+            if llm_cands:
+                llm_cands.sort(key=lambda t: (t[0], t[1], t[2]), reverse=True)
+                llm = llm_cands[0][2]
+        except Exception:
+            pass
+
+    vae = _norm_path_from_root(str(state.get("vae") or ''))
+    if not vae or not os.path.isfile(vae):
+        try:
+            model_dir_path = Path(model_dir)
+            vae_cands = []
+            if model_dir_path.exists():
+                for pp in model_dir_path.rglob("*.safetensors"):
+                    try:
+                        if not pp.is_file():
+                            continue
+                    except Exception:
+                        continue
+                    n = pp.name.lower()
+                    score = 1 if (("vae" in n) or ("qwen_image_vae" in n)) else 0
+                    vae_cands.append((score, _safe_size(str(pp)), str(pp)))
+            if vae_cands:
+                vae_cands.sort(key=lambda t: (t[0], t[1], t[2]), reverse=True)
+                vae = vae_cands[0][2]
+        except Exception:
+            pass
+
+    lora_root = _norm_path_from_root(str((_root() / "models" / "loras").resolve()))
+    lora_path = ""
+    try:
+        lora_root_path = Path(lora_root)
+        if lora_root_path.exists():
+            wanted = "firered-image-edit-covercraft.safetensors"
+            lora_cands = [str(pp) for pp in lora_root_path.rglob("*.safetensors") if pp.is_file() and pp.name.lower() == wanted]
+            if lora_cands:
+                lora_cands.sort()
+                lora_path = lora_cands[0]
+    except Exception:
+        lora_path = ""
+
+    return {
+        "state_path": state_path,
+        "sd_cli": sdcli,
+        "model_dir": model_dir,
+        "diffusion": diffusion,
+        "llm": llm,
+        "vae": vae,
+        "lora": lora_path,
+        "offload_cpu": bool(state.get("offload_cpu", False)),
+        "diffusion_fa": bool(state.get("flash_attn", state.get("diffusion_fa", True))),
+        "verbose": bool(state.get("verbose", False)),
+    }
+
+
+def _firered_identity_guard_text() -> str:
+    return "preserve facial identity"
+
+
+def _firered_environment_guard_text() -> str:
+    return "readable surroundings, clear location details, visible background elements that support the scene, grounded environmental context"
+
+
+def _apply_firered_prompt_addons(prompt: str, add_environment: bool = True) -> str:
+    s = str(prompt or '').replace("\r", " ").replace("\n", " ").strip()
+    s = " ".join(s.split())
+    if not s:
+        return s
+
+    low = s.lower()
+    ident = _firered_identity_guard_text()
+    env = _firered_environment_guard_text()
+
+    identity_terms = (
+        "preserve facial identity", "same person", "preserve identity", "consistent face"
+    )
+    if not any(t in low for t in identity_terms):
+        s = f"{s}, {ident}".strip(" ,")
+        low = s.lower()
+
+    if bool(add_environment):
+        env_terms = (
+            "readable surroundings", "clear location details", "visible background elements",
+            "grounded environmental context", "background", "surroundings", "location", "setting", "environment"
+        )
+        if not any(t in low for t in env_terms):
+            s = f"{s}, {env}".strip(" ,")
+
+    return " ".join(str(s).split()).strip()
+
+
 def _qwen3tts_tokenizer_path() -> str:
     # Qwen3 TTS expects these model folders under <root>/models/
     return str((_root() / "models" / "Qwen3-TTS-Tokenizer-12Hz").resolve())
@@ -349,6 +555,393 @@ def _save_planner_settings(obj: Dict[str, Any]) -> None:
             json.dump(obj, f, indent=2, ensure_ascii=False)
     except Exception:
         pass
+
+
+def _planner_last_frame_chain_enabled(enc: Optional[Dict[str, Any]]) -> bool:
+    try:
+        return bool((enc or {}).get("use_last_frame_as_next_image"))
+    except Exception:
+        return False
+
+
+def _planner_write_wait_image(path: str, sid: str, width: int = 1344, height: int = 768, source_sid: str = "") -> str:
+    """Create a visible placeholder image that will later be overwritten by a previous clip's last frame."""
+    target = str(path or '').strip()
+    if not target:
+        return ""
+    try:
+        os.makedirs(os.path.dirname(target), exist_ok=True)
+    except Exception:
+        pass
+
+    width = max(256, min(int(width or 1344), 4096))
+    height = max(256, min(int(height or 768), 4096))
+    msg = f"{str(sid or '').strip() or 'SHOT'}\nwaiting for previous clip last frame"
+    if str(source_sid or '').strip():
+        msg += f"\nsource: {str(source_sid).strip()}"
+
+    try:
+        from PIL import Image as _PIL_Image, ImageDraw as _PIL_Draw, ImageFont as _PIL_Font  # type: ignore
+        im = _PIL_Image.new("RGB", (width, height), (22, 22, 28))
+        dr = _PIL_Draw.Draw(im)
+        try:
+            font = _PIL_Font.load_default()
+        except Exception:
+            font = None
+        dr.rectangle((18, 18, width - 18, height - 18), outline=(120, 120, 150), width=3)
+        dr.line((0, 0, width, height), fill=(70, 70, 95), width=4)
+        dr.line((0, height, width, 0), fill=(70, 70, 95), width=4)
+        dr.multiline_text((32, 32), msg, fill=(235, 235, 235), font=font, spacing=8)
+        im.save(target)
+        return target if os.path.exists(target) else ""
+    except Exception:
+        try:
+            _png_1x1 = (
+                b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR\x00\x00\x00\x01\x00\x00\x00\x01\x08\x02\x00\x00\x00\x90wS\xde"
+                b"\x00\x00\x00\x0cIDATx\x9cc\xf8\x0f\x00\x01\x01\x01\x00\x18\xdd\x8d\xb5\x00\x00\x00\x00IEND\xaeB`\x82"
+            )
+            with open(target, "wb") as _fp:
+                _fp.write(_png_1x1)
+            return target if os.path.exists(target) else ""
+        except Exception:
+            return ""
+
+
+def _planner_find_media_tool(name: str) -> str:
+    nm = str(name or '').strip()
+    if not nm:
+        return ""
+    try:
+        cand = (_root() / "presets" / "bin" / (nm + ".exe")).resolve()
+        if cand.exists():
+            return str(cand)
+    except Exception:
+        pass
+    try:
+        import shutil as _shutil
+        found = _shutil.which(nm)
+        if found:
+            return str(found)
+    except Exception:
+        pass
+    return nm
+
+
+def _planner_chain_frame_path(base_dir: str, sid: str) -> str:
+    base = str(base_dir or '').strip()
+    shot_id = str(sid or '').strip()
+    if not base or not shot_id:
+        return ""
+    return os.path.join(base, "chain_frames", f"{shot_id}.png")
+
+
+def _planner_extract_last_frame_to_image(video_path: str, out_path: str) -> bool:
+    src = str(video_path or '').strip()
+    dst = str(out_path or '').strip()
+    if not src or not os.path.isfile(src) or not dst:
+        return False
+    try:
+        os.makedirs(os.path.dirname(dst), exist_ok=True)
+    except Exception:
+        pass
+
+    ffmpeg = _planner_find_media_tool("ffmpeg")
+    offsets = [0.04, 0.08, 0.15, 0.25, 0.50]
+    for off in offsets:
+        try:
+            args = [
+                ffmpeg, "-y", "-hide_banner", "-loglevel", "error",
+                "-sseof", f"-{float(off):.2f}", "-i", src,
+                "-frames:v", "1", "-an", dst,
+            ]
+            cp = subprocess.run(args, capture_output=True, text=True, encoding="utf-8", errors="replace")
+            if cp.returncode == 0 and os.path.isfile(dst) and os.path.getsize(dst) >= 64:
+                return True
+        except Exception:
+            continue
+
+    try:
+        args2 = [
+            ffmpeg, "-y", "-hide_banner", "-loglevel", "error",
+            "-i", src,
+            "-vf", "select='eq(n,last)'",
+            "-vsync", "0",
+            "-frames:v", "1", "-an", dst,
+        ]
+        cp2 = subprocess.run(args2, capture_output=True, text=True, encoding="utf-8", errors="replace")
+        if cp2.returncode == 0 and os.path.isfile(dst) and os.path.getsize(dst) >= 64:
+            return True
+    except Exception:
+        pass
+    return False
+
+
+def _planner_overwrite_next_image_from_clip(
+    *,
+    current_sid: str,
+    next_sid: str,
+    clip_path: str,
+    images_dir: str,
+    shot_map: Optional[Dict[str, Any]],
+    image_records: Optional[List[Dict[str, Any]]],
+    manifest: Optional[Dict[str, Any]],
+    manifest_path: str,
+    id_to_img: Optional[Dict[str, str]] = None,
+    log_emit: Optional[Callable[[str], None]] = None,
+    target_path: str = "",
+    mirror_to_images_dir: bool = True,
+) -> str:
+    cur = str(current_sid or '').strip()
+    nxt = str(next_sid or '').strip()
+    clip_file = str(clip_path or '').strip()
+    if not nxt or not clip_file or not os.path.isfile(clip_file):
+        return ""
+
+    target = str(target_path or '').strip() or os.path.join(str(images_dir or '').strip(), f"{nxt}.png")
+    if not _planner_extract_last_frame_to_image(clip_file, target):
+        return ""
+
+    images_target = os.path.join(str(images_dir or '').strip(), f"{nxt}.png") if str(images_dir or '').strip() else ""
+    if bool(mirror_to_images_dir) and images_target and os.path.normcase(os.path.abspath(images_target)) != os.path.normcase(os.path.abspath(target)):
+        try:
+            os.makedirs(os.path.dirname(images_target), exist_ok=True)
+        except Exception:
+            pass
+        try:
+            shutil.copy2(target, images_target)
+        except Exception:
+            try:
+                shutil.copyfile(target, images_target)
+            except Exception:
+                pass
+
+    bookkeeping_target = target
+    try:
+        if images_target and os.path.isfile(images_target):
+            bookkeeping_target = images_target
+    except Exception:
+        pass
+
+    try:
+        sm = shot_map if isinstance(shot_map, dict) else {}
+        rec = sm.get(nxt) if isinstance(sm.get(nxt), dict) else {}
+        if not isinstance(rec, dict):
+            rec = {}
+        rec["file"] = bookkeeping_target
+        rec["chain_file"] = target
+        rec["status"] = "derived_from_prev_clip"
+        rec["source_image_from_clip"] = cur
+        rec["ts_source_image_from_clip"] = time.time()
+        try:
+            rec.pop("placeholder_from_clip_chain", None)
+            rec.pop("placeholder", None)
+        except Exception:
+            pass
+        rec["is_placeholder"] = False
+        sm[nxt] = rec
+        if isinstance(manifest, dict):
+            manifest["shots"] = sm
+    except Exception:
+        pass
+
+    try:
+        imgs = image_records if isinstance(image_records, list) else []
+        found = False
+        for it in imgs:
+            if isinstance(it, dict) and str(it.get("id") or '').strip() == nxt:
+                it["file"] = bookkeeping_target
+                it["chain_file"] = target
+                it["derived_from_prev_clip"] = cur
+                try:
+                    it.pop("placeholder", None)
+                    it.pop("placeholder_from_clip_chain", None)
+                except Exception:
+                    pass
+                it["is_placeholder"] = False
+                found = True
+                break
+        if not found:
+            imgs.append({"id": nxt, "file": bookkeeping_target, "chain_file": target, "seed": None, "derived_from_prev_clip": cur, "is_placeholder": False})
+        if isinstance(manifest, dict):
+            manifest.setdefault("paths", {})["images_dir"] = str(images_dir)
+            manifest["paths"]["images"] = imgs
+    except Exception:
+        pass
+
+    try:
+        if isinstance(id_to_img, dict):
+            id_to_img[nxt] = bookkeeping_target
+    except Exception:
+        pass
+
+    try:
+        if isinstance(manifest, dict):
+            manifest.setdefault("paths", {})["chain_frames_dir"] = os.path.dirname(target) if target else ""
+            manifest.setdefault("paths", {}).setdefault("chain_frames", {})[nxt] = target
+            if manifest_path:
+                _safe_write_json(manifest_path, manifest)
+    except Exception:
+        pass
+
+    try:
+        if callable(log_emit):
+            log_emit(f"[CHAIN] {cur} → {nxt}: extracted last frame to {os.path.basename(target)}")
+    except Exception:
+        pass
+    return target
+
+
+def _planner_force_chain_image_for_shot(
+    *,
+    shots: List[Dict[str, Any]],
+    shot_index: int,
+    images_dir: str,
+    shot_map: Optional[Dict[str, Any]],
+    image_records: Optional[List[Dict[str, Any]]],
+    manifest: Optional[Dict[str, Any]],
+    manifest_path: str,
+    id_to_img: Optional[Dict[str, str]] = None,
+    log_emit: Optional[Callable[[str], None]] = None,
+    chain_frames_dir: str = "",
+) -> str:
+    """For chain mode, refresh the current shot image from the previous shot clip right before rendering."""
+    try:
+        idx = int(shot_index)
+    except Exception:
+        idx = 0
+    if idx <= 1:
+        return ""
+    try:
+        shots_list = shots if isinstance(shots, list) else []
+    except Exception:
+        shots_list = []
+    if idx > len(shots_list):
+        return ""
+
+    try:
+        cur_sid = str((shots_list[idx - 1] or {}).get("id") or f"S{idx:02d}").strip()
+    except Exception:
+        cur_sid = f"S{idx:02d}"
+    try:
+        prev_sid = str((shots_list[idx - 2] or {}).get("id") or f"S{idx-1:02d}").strip()
+    except Exception:
+        prev_sid = f"S{idx-1:02d}"
+    if not cur_sid or not prev_sid:
+        return ""
+
+    forced_target = _planner_chain_frame_path(chain_frames_dir or images_dir, cur_sid)
+    try:
+        sm = shot_map if isinstance(shot_map, dict) else {}
+        cur_rec = sm.get(cur_sid) if isinstance(sm.get(cur_sid), dict) else {}
+        if isinstance(cur_rec, dict):
+            chain_file = str(cur_rec.get("chain_file") or '').strip()
+            if chain_file:
+                forced_target = chain_file
+    except Exception:
+        pass
+    if forced_target and os.path.isfile(forced_target):
+        return forced_target
+
+    prev_clip = ""
+    try:
+        sm = shot_map if isinstance(shot_map, dict) else {}
+        prev_rec = sm.get(prev_sid) if isinstance(sm.get(prev_sid), dict) else {}
+        if isinstance(prev_rec, dict):
+            cand = str(prev_rec.get("clip_file") or '').strip()
+            if cand and os.path.isfile(cand):
+                prev_clip = cand
+    except Exception:
+        prev_clip = ""
+
+    if not prev_clip:
+        try:
+            paths = (manifest or {}).get("paths") if isinstance(manifest, dict) else {}
+            clips = paths.get("clips") if isinstance(paths, dict) else []
+            if isinstance(clips, list):
+                for it in clips:
+                    if isinstance(it, dict) and str(it.get("id") or '').strip() == prev_sid:
+                        cand = str(it.get("file") or '').strip()
+                        if cand and os.path.isfile(cand):
+                            prev_clip = cand
+                            break
+        except Exception:
+            prev_clip = ""
+
+    if not prev_clip:
+        return ""
+
+    return _planner_overwrite_next_image_from_clip(
+        current_sid=prev_sid,
+        next_sid=cur_sid,
+        clip_path=prev_clip,
+        images_dir=images_dir,
+        shot_map=shot_map,
+        image_records=image_records,
+        manifest=manifest,
+        manifest_path=manifest_path,
+        id_to_img=id_to_img,
+        log_emit=log_emit,
+        target_path=forced_target,
+        mirror_to_images_dir=True,
+    )
+
+
+def _planner_chain_image_still_placeholder(
+    *,
+    sid: str,
+    img_path: str,
+    shot_map: Optional[Dict[str, Any]],
+    image_records: Optional[List[Dict[str, Any]]],
+) -> bool:
+    """Best-effort guard: in last-frame chain mode, refuse to render shot 2+ from a waiting placeholder."""
+    sid_s = str(sid or '').strip()
+    path_s = str(img_path or '').strip()
+    rec = {}
+    try:
+        if isinstance(shot_map, dict):
+            _r = shot_map.get(sid_s)
+            if isinstance(_r, dict):
+                rec = _r
+    except Exception:
+        rec = {}
+    try:
+        status = str(rec.get("status") or '').strip().lower()
+    except Exception:
+        status = ""
+    try:
+        if status == "placeholder_waiting_for_prev_clip":
+            return True
+        if bool(rec.get("placeholder_from_clip_chain")):
+            return True
+        if bool(rec.get("placeholder")):
+            return True
+        if str(rec.get("source_image_from_clip") or '').strip():
+            return False
+    except Exception:
+        pass
+    try:
+        if isinstance(image_records, list):
+            for it in image_records:
+                if not isinstance(it, dict):
+                    continue
+                if str(it.get("id") or '').strip() != sid_s:
+                    continue
+                if str(it.get("derived_from_prev_clip") or '').strip():
+                    return False
+                if bool(it.get("placeholder_from_clip_chain")) or bool(it.get("placeholder")):
+                    return True
+                break
+    except Exception:
+        pass
+    try:
+        if path_s and os.path.isfile(path_s):
+            with open(path_s, "rb") as _fp:
+                head = _fp.read(262144)
+            if b"waiting for previous clip last frame" in head:
+                return True
+    except Exception:
+        pass
+    return False
 
 
 def _planner_get_own_character_entries(enc: Optional[Dict[str, Any]]) -> List[Dict[str, str]]:
@@ -815,7 +1408,8 @@ _HUNYUAN_PRESETS = {
     # HunyuanVideo 1.5 proxy targets (used by Planner automation)
     # Tier mapping is driven by UI 'Generation quality' (Low/Medium/High).
     # Hunyuan high now uses the 720p I2V distilled model with 864x496 / target_size 656 at 15 fps.
-    # Other tiers keep the lighter 480p step-distilled path.
+    # Low/Medium keep the lighter 480p step-distilled path at 8 steps.
+    # High uses the 720p distilled path at 15 steps.
     "low": {
         "model": "hunyuan",
         "quality": "low",
@@ -5501,8 +6095,44 @@ class PipelineWorker(QThread):
             if os.path.isfile(guess):
                 img_path = guess
 
+        if _planner_last_frame_chain_enabled(getattr(self.job, "encoding", {})) and shots_path:
+            try:
+                _shots_all = _load_shots_list(shots_path) or []
+            except Exception:
+                _shots_all = []
+            try:
+                _idx_cur = next(((_i + 1) for _i, _sh in enumerate(_shots_all) if isinstance(_sh, dict) and str(_sh.get("id") or '').strip() == sid), 0)
+            except Exception:
+                _idx_cur = 0
+            if _idx_cur and _idx_cur > 1:
+                try:
+                    _image_records = list((manifest.get("paths") or {}).get("images") or [])
+                except Exception:
+                    _image_records = []
+                chain_frames_dir = os.path.join(self.out_dir, "chain_frames")
+                _forced_chain_img = _planner_force_chain_image_for_shot(
+                    shots=_shots_all,
+                    shot_index=_idx_cur,
+                    images_dir=images_dir,
+                    shot_map=shot_map,
+                    image_records=_image_records,
+                    manifest=manifest,
+                    manifest_path=manifest_path,
+                    chain_frames_dir=chain_frames_dir,
+                )
+                if not _forced_chain_img or not os.path.isfile(_forced_chain_img):
+                    raise RuntimeError(f"[CHAIN] {sid}: could not refresh start image from previous clip.")
+                img_path = _forced_chain_img
+
         if not img_path or not os.path.isfile(img_path):
             raise RuntimeError(f"Missing start image for {sid}: {img_path}")
+        if _planner_last_frame_chain_enabled(getattr(self.job, "encoding", {})) and _planner_chain_image_still_placeholder(
+            sid=sid,
+            img_path=img_path,
+            shot_map=shot_map,
+            image_records=(manifest.get("paths") or {}).get("images") if isinstance((manifest.get("paths") or {}).get("images"), list) else [],
+        ):
+            raise RuntimeError(f"[CHAIN] {sid}: start image is still the waiting placeholder instead of the previous clip last frame: {img_path}")
 
         # Prompt/negative: allow override from review UI; otherwise reuse existing compiled i2v prompt
         prompt_override = str(new_prompt or '').strip() if new_prompt is not None else ""
@@ -5690,6 +6320,34 @@ class PipelineWorker(QThread):
         except Exception:
             pass
 
+        if _planner_last_frame_chain_enabled(getattr(self.job, "encoding", {})) and shots_path:
+            _shots_all = _load_shots_list(shots_path) or []
+            _next_sid = ""
+            for _idx, _sh in enumerate(_shots_all):
+                if isinstance(_sh, dict) and str(_sh.get("id") or '').strip() == sid:
+                    if (_idx + 1) < len(_shots_all):
+                        _next_sid = str((_shots_all[_idx + 1] or {}).get("id") or '').strip()
+                    break
+            if _next_sid:
+                try:
+                    _image_records = list((manifest.get("paths") or {}).get("images") or [])
+                except Exception:
+                    _image_records = []
+                _derived = _planner_overwrite_next_image_from_clip(
+                    current_sid=sid,
+                    next_sid=_next_sid,
+                    clip_path=out_file,
+                    images_dir=images_dir,
+                    shot_map=shot_map,
+                    image_records=_image_records,
+                    manifest=manifest,
+                    manifest_path=manifest_path,
+                    target_path=_planner_chain_frame_path(self.out_dir, _next_sid),
+                    mirror_to_images_dir=True,
+                )
+                if not _derived:
+                    raise RuntimeError(f"Could not extract last frame from {sid} to seed {_next_sid}.")
+
         return str(out_file)
 
     def _regen_one_image(self, *, sid: str, new_prompt: str, seed_override: Optional[int] = None, manifest_path: str, images_dir: str) -> str:
@@ -5750,11 +6408,23 @@ class PipelineWorker(QThread):
 
         # Persist prompt override in manifest BEFORE rendering
         try:
+            _new_prompt_norm = str(new_prompt).strip()
+            try:
+                _regen_ref_strategy = str(rec.get("ref_strategy") or '').strip().lower()
+            except Exception:
+                _regen_ref_strategy = ""
+            if _regen_ref_strategy != "fireedit":
+                try:
+                    _regen_ref_strategy = str(self.job.encoding.get("ref_strategy") or '').strip().lower()
+                except Exception:
+                    _regen_ref_strategy = ""
+            if _regen_ref_strategy == "fireedit":
+                _new_prompt_norm = _apply_firered_prompt_addons(_new_prompt_norm, add_environment=True)
             if "prompt_compiled_original" not in rec:
                 rec["prompt_compiled_original"] = str(rec.get("prompt_compiled") or '').strip()
-            rec["prompt_user_override"] = str(new_prompt).strip()
-            rec["prompt_compiled"] = str(new_prompt).strip()
-            rec["prompt_used"] = str(new_prompt).strip()
+            rec["prompt_user_override"] = _new_prompt_norm
+            rec["prompt_compiled"] = _new_prompt_norm
+            rec["prompt_used"] = _new_prompt_norm
             rec["ts_prompt_override"] = time.time()
             # Seed override for regen (optional)
             try:
@@ -5840,6 +6510,40 @@ class PipelineWorker(QThread):
                 rs = ""
             if rs == "qwen2511_best" and bool(ref_files):
                 use_qwen2511 = True
+
+        # FireRed review/recreate path: prefer per-shot refs saved into the manifest,
+        # then fall back to current job attachments. This keeps old reviewed jobs working too.
+        use_fireedit = False
+        fireedit_refs = []
+        try:
+            if str(rec.get("ref_strategy") or '').strip().lower() == "fireedit":
+                use_fireedit = True
+        except Exception:
+            use_fireedit = False
+        try:
+            _saved_refs = rec.get("refs_used") or rec.get("ref_images") or []
+            if isinstance(_saved_refs, list):
+                fireedit_refs = [str(x) for x in _saved_refs if str(x or '').strip()]
+        except Exception:
+            fireedit_refs = []
+        if not fireedit_refs:
+            try:
+                at = self.job.attachments or {}
+            except Exception:
+                at = {}
+            try:
+                _rf = (at.get("ref_images") or []) or (at.get("images") or [])
+                if isinstance(_rf, list):
+                    fireedit_refs = [str(x) for x in _rf if str(x or '').strip()]
+            except Exception:
+                fireedit_refs = []
+        if not use_fireedit:
+            try:
+                rs = str(self.job.encoding.get("ref_strategy") or '').strip().lower()
+            except Exception:
+                rs = ""
+            if rs == "fireedit" and bool(fireedit_refs):
+                use_fireedit = True
 
         def _pick_zimage_gguf_for_quality() -> str:
             """Pick a Z-image diffusion GGUF from models/Z-Image-Turbo GGUF based on Generation quality.
@@ -6006,6 +6710,22 @@ class PipelineWorker(QThread):
             t2i_job["steps"] = 4
             t2i_job["cfg_scale"] = 1.0
             t2i_job["cfg"] = 1.0
+            t2i_job["diffusion_fa"] = True
+            t2i_job["use_diffusion_fa"] = True
+
+        elif use_fireedit:
+            # Locked-in for FireRed Edit recreate: reference-image edit only.
+            bw, bh = 1344, 768
+            ww, hh = _apply_aspect_to_size(bw, bh, aspect_mode)
+            t2i_job["engine"] = "fireedit"
+            t2i_job["width"] = int(ww)
+            t2i_job["height"] = int(hh)
+            t2i_job["sampler"] = "euler"
+            t2i_job["sampling_method"] = "euler"
+            t2i_job["steps"] = 12
+            t2i_job["cfg_scale"] = 4.0
+            t2i_job["cfg"] = 4.0
+            t2i_job["strength"] = 0.75
             t2i_job["diffusion_fa"] = True
             t2i_job["use_diffusion_fa"] = True
 
@@ -6199,8 +6919,134 @@ class PipelineWorker(QThread):
             out_file = target if os.path.exists(target) else None
 
         else:
+            # FireRed Edit regen path (sd-cli). Must NOT fall through to txt2img backend.
+            if use_fireedit or str(t2i_job.get("engine") or '').lower().strip() == "fireedit":
+                _fr = _pick_firered_from_state()
+                sdcli_path = str(_fr.get("sd_cli") or '')
+                diffusion = str(_fr.get("diffusion") or '')
+                llm = str(_fr.get("llm") or '')
+                vae = str(_fr.get("vae") or '')
+                lora_path = str(_fr.get("lora") or '')
+                if (not sdcli_path) or (not os.path.exists(sdcli_path)):
+                    raise RuntimeError("FireRed Edit selected but sd-cli.exe was not found. Check presets/setsave/fireed.json or firered.json.")
+                if (not diffusion) or (not os.path.exists(diffusion)):
+                    raise RuntimeError("FireRed Edit selected but no FireRed GGUF was found from the saved FireRed JSON paths.")
+                if (not llm) or (not os.path.exists(llm)):
+                    raise RuntimeError("FireRed Edit selected but the saved Qwen-image LLM path is missing or invalid.")
+                if (not vae) or (not os.path.exists(vae)):
+                    raise RuntimeError("FireRed Edit selected but the saved Qwen-image VAE path is missing or invalid.")
+                if not fireedit_refs:
+                    raise RuntimeError("FireRed Edit recreate needs the original reference image, but no saved reference image path was found in the manifest.")
+
+                out_path = str(target).strip() or os.path.join(images_dir, f"{sid}.png")
+                if (not out_path) or ("{" in out_path) or ("}" in out_path):
+                    out_path = os.path.join(images_dir, f"{sid}.png")
+                if not os.path.splitext(out_path)[1]:
+                    out_path = out_path + ".png"
+                os.makedirs(os.path.dirname(out_path), exist_ok=True)
+                try:
+                    if os.path.exists(out_path):
+                        os.remove(out_path)
+                except Exception:
+                    pass
+
+                _prompt_now = str(t2i_job.get("prompt") or '').strip()
+                try:
+                    _prompt_now = _apply_firered_prompt_addons(_prompt_now, add_environment=True)
+                except Exception:
+                    pass
+                if lora_path and os.path.exists(lora_path):
+                    try:
+                        _lname = Path(lora_path).stem
+                        _tag = f"<lora:{_lname}:1>"
+                        if (f"<lora:{_lname}:" not in _prompt_now) and (f"<lora:{_lname}>" not in _prompt_now):
+                            _prompt_now = f"{_prompt_now} {_tag}".strip()
+                    except Exception:
+                        pass
+
+                cmd = [sdcli_path]
+                cmd += ["--diffusion-model", diffusion]
+                cmd += ["--vae", vae]
+                cmd += ["--llm", llm]
+                cmd += ["-p", _prompt_now]
+                _neg = str(t2i_job.get("negative_prompt") or t2i_job.get("negative") or '').strip()
+                if _neg:
+                    cmd += ["-n", _neg]
+                for _r in fireedit_refs:
+                    if _r and os.path.exists(_r):
+                        cmd += ["-r", str(_r)]
+                if lora_path and os.path.exists(lora_path):
+                    cmd += ["--lora-model-dir", str(Path(lora_path).parent)]
+                cmd += ["-W", str(int(t2i_job.get("width") or 1344)), "-H", str(int(t2i_job.get("height") or 768))]
+                cmd += ["--steps", str(int(t2i_job.get("steps") or 20))]
+                cmd += ["--cfg-scale", str(float(t2i_job.get("cfg") or t2i_job.get("cfg_scale") or 4.0))]
+                cmd += ["--strength", str(float(t2i_job.get("strength") or 0.75))]
+                cmd += ["--sampling-method", str(t2i_job.get("sampling_method") or t2i_job.get("sampler") or "euler").strip().lower() or "euler"]
+                cmd += ["-s", str(int(t2i_job.get("seed") or 0))]
+                if bool(_fr.get("offload_cpu", False)):
+                    cmd += ["--offload-to-cpu"]
+                if bool(_fr.get("diffusion_fa", True)):
+                    cmd += ["--diffusion-fa"]
+                if bool(_fr.get("verbose", False)):
+                    cmd += ["-v"]
+                cmd += ["-o", out_path]
+
+                try:
+                    self.signals.log.emit(f"[IMG] regen {sid} [FireRed Edit]")
+                except Exception:
+                    pass
+
+                rc = 1
+                try:
+                    p = subprocess.Popen(
+                        cmd,
+                        cwd=str(_root()),
+                        stdout=subprocess.PIPE,
+                        stderr=subprocess.STDOUT,
+                        bufsize=1,
+                    )
+                    if p.stdout:
+                        for _raw in p.stdout:
+                            if self._stop_requested:
+                                try:
+                                    p.kill()
+                                except Exception:
+                                    pass
+                                raise RuntimeError("Cancelled by user.")
+                            try:
+                                _line = _raw.decode("utf-8", errors="replace").rstrip()
+                            except Exception:
+                                _line = str(_raw).rstrip()
+                            if _line:
+                                try:
+                                    self.signals.log.emit(_line)
+                                except Exception:
+                                    pass
+                    rc = int(p.wait())
+                except Exception as _e:
+                    raise RuntimeError(f"FireRed Edit sd-cli run failed: {_e}")
+
+                if rc != 0:
+                    raise RuntimeError(f"FireRed Edit sd-cli failed (exit code {rc}). See log for details.")
+                if (not os.path.exists(out_path)) or (os.path.getsize(out_path) <= 0):
+                    raise RuntimeError("FireRed Edit recreate returned no output file")
+
+                out_file = out_path
+
+                try:
+                    shots_map = manifest.get("shots") if isinstance(manifest.get("shots"), dict) else {}
+                    rec2 = shots_map.get(sid) if isinstance(shots_map, dict) else None
+                    if not isinstance(rec2, dict):
+                        rec2 = {}
+                    rec2["ref_strategy"] = "fireedit"
+                    rec2["refs_used"] = list(fireedit_refs)
+                    shots_map[sid] = rec2
+                    manifest["shots"] = shots_map
+                except Exception:
+                    pass
+
             # Flux Klein regen path (sd-cli). Must NOT fall through to txt2img backend.
-            if str(t2i_job.get("engine") or '').lower().strip() in ("flux_klein", "flux_klein_9b"):
+            elif str(t2i_job.get("engine") or '').lower().strip() in ("flux_klein", "flux_klein_9b"):
                 _force_kb = 9 if str(t2i_job.get('engine') or '').lower().strip() == 'flux_klein_9b' else 4
                 _fm = _pick_flux_klein_models_highest(force_klein_b=_force_kb)
                 sdcli_path = str(_fm.get("sd_cli") or '')
@@ -8687,6 +9533,8 @@ class PipelineWorker(QThread):
                                 pr_final = _apply_own_character_codeword_replacements(pr_final, self.job.encoding)
                         except Exception:
                             pass
+                        if bool(_ref_strategy == "fireedit" and bool(_ref_files)):
+                            pr_final = _apply_firered_prompt_addons(pr_final, add_environment=True)
 
                         try:
                             _LOGGER.log_probe(f"t2i_prompt_compiled {sid}: {pr}")
@@ -8893,6 +9741,8 @@ class PipelineWorker(QThread):
                         pr = " ".join(pr.split())
                         if not pr:
                             pr = str(seed or '').strip()
+                        if bool(_ref_strategy == "fireedit" and bool(_ref_files)):
+                            pr = _apply_firered_prompt_addons(pr, add_environment=True)
                         # Final guard: enforce exact prefix once (no repeats)
                         if seed:
                             if not pr.startswith(seed):
@@ -9089,6 +9939,9 @@ class PipelineWorker(QThread):
 
                     # Final safety: prose-ify prompt and guard against accidental caption rendering
                     render_prompt = _finalize_render_prompt(render_prompt, spec_prompt, bool(wants_text))
+                    if bool(_ref_strategy == "fireedit" and bool(_ref_files)):
+                        spec_prompt = _apply_firered_prompt_addons(spec_prompt, add_environment=True)
+                        render_prompt = _apply_firered_prompt_addons(render_prompt, add_environment=True)
                     render_negative = _ascii_only(render_negative)
                     render_negative = _adjust_text_negatives_csv(render_negative, bool(wants_text))
                     render_negative = _sanitize_negative_list(render_negative)
@@ -9399,6 +10252,7 @@ class PipelineWorker(QThread):
 
                 use_qwen2511 = (ref_strategy == "qwen2511_best" and bool(ref_files))
                 use_flux_klein_edit = (ref_strategy == "flux_klein_edit" and bool(ref_files))
+                use_fireedit = (ref_strategy == "fireedit" and bool(ref_files))
                 used_ref_files = list(ref_files[:2]) if use_qwen2511 else list(ref_files)
 
                 try:
@@ -9412,10 +10266,77 @@ class PipelineWorker(QThread):
                         self.signals.log.emit("[REF] Multi-angle LoRA detected; planner will apply it on a cadence.")
                 if use_flux_klein_edit:
                     self.signals.log.emit(f"[REF] Using Flux Klein Edit for images (refs: {len(used_ref_files)}).")
+                if use_fireedit:
+                    self.signals.log.emit(f"[REF] Using FireRed Edit for images (refs: {len(used_ref_files)}).")
                 if use_qwen2511:
                     bible = []  # Qwen2511 must use storyline/shot prompts only (no Character Bible lock).
                 image_records: List[Dict[str, Any]] = []
                 total = len(shots)
+                use_last_frame_chain = _planner_last_frame_chain_enabled(getattr(self.job, "encoding", {}))
+
+                try:
+                    _enc_now = getattr(self.job, "encoding", {}) or {}
+                except Exception:
+                    _enc_now = {}
+                try:
+                    _chain_user_start_enabled = bool(use_last_frame_chain and bool(_enc_now.get("chain_use_start_image")))
+                except Exception:
+                    _chain_user_start_enabled = False
+                try:
+                    _chain_user_start_src = str(_enc_now.get("chain_start_image_path") or "").strip()
+                except Exception:
+                    _chain_user_start_src = ""
+                if _chain_user_start_enabled and _chain_user_start_src and os.path.isfile(_chain_user_start_src) and shots:
+                    try:
+                        _first_sid = str((shots[0] or {}).get("id") or "S01")
+                    except Exception:
+                        _first_sid = "S01"
+                    try:
+                        _src_ext = os.path.splitext(_chain_user_start_src)[1] or ".png"
+                        _target_first = os.path.join(images_dir, f"{_first_sid}{_src_ext}")
+                        try:
+                            os.makedirs(images_dir, exist_ok=True)
+                        except Exception:
+                            pass
+                        # Remove stale first-shot images from earlier runs so the loaded file wins deterministically.
+                        for _ext in (".png", ".jpg", ".jpeg", ".webp", ".bmp"):
+                            try:
+                                _stale = os.path.join(images_dir, f"{_first_sid}{_ext}")
+                                if os.path.abspath(_stale) != os.path.abspath(_target_first) and os.path.isfile(_stale):
+                                    os.remove(_stale)
+                            except Exception:
+                                pass
+                        if os.path.abspath(_chain_user_start_src) != os.path.abspath(_target_first):
+                            try:
+                                shutil.copy2(_chain_user_start_src, _target_first)
+                            except Exception:
+                                shutil.copyfile(_chain_user_start_src, _target_first)
+                        else:
+                            _target_first = _chain_user_start_src
+                        try:
+                            manifest.setdefault("paths", {})["images_dir"] = images_dir
+                            manifest.setdefault("paths", {})["first_image"] = _target_first
+                            shot_map = manifest.setdefault("shots", {})
+                            _rec_first = shot_map.get(_first_sid) if isinstance(shot_map.get(_first_sid), dict) else {}
+                            if not isinstance(_rec_first, dict):
+                                _rec_first = {}
+                            _rec_first["file"] = _target_first
+                            _rec_first["status"] = "done"
+                            _rec_first["ts_done"] = time.time()
+                            _rec_first["user_supplied_chain_start_image"] = True
+                            shot_map[_first_sid] = _rec_first
+                            _safe_write_json(manifest_path, manifest)
+                        except Exception:
+                            pass
+                        try:
+                            self.signals.log.emit(f"[CHAIN] {_first_sid}: using loaded start image {_target_first}; skipping first image generation")
+                        except Exception:
+                            pass
+                    except Exception as _chain_copy_err:
+                        try:
+                            self.signals.log.emit(f"[CHAIN] failed to prepare loaded start image: {_chain_copy_err}")
+                        except Exception:
+                            pass
 
                 def _img_step_pct(idx: int, total_n: int) -> int:
                     """Map per-shot progress during the Images step into a stable header percent range."""
@@ -9494,6 +10415,49 @@ class PipelineWorker(QThread):
                         try:
                             if _existing_img and os.path.exists(_existing_img):
                                 self.signals.asset_created.emit(_existing_img)
+                        except Exception:
+                            pass
+                        continue
+
+                    if use_last_frame_chain and i > 1:
+                        try:
+                            aspect_mode = str((getattr(self.job, "encoding", {}) or {}).get("aspect_mode") or '')
+                        except Exception:
+                            aspect_mode = ""
+                        try:
+                            pw, ph = _apply_aspect_to_size(1344, 768, aspect_mode)
+                        except Exception:
+                            pw, ph = 1344, 768
+                        placeholder = os.path.join(images_dir, f"{sid}.png")
+                        _planner_write_wait_image(placeholder, sid, int(pw), int(ph), f"S{i-1:02d}")
+                        try:
+                            shot_map = manifest.setdefault("shots", {})
+                            recp = shot_map.get(sid) if isinstance(shot_map.get(sid), dict) else {}
+                            if not isinstance(recp, dict):
+                                recp = {}
+                            recp["file"] = placeholder
+                            recp["status"] = "placeholder_waiting_for_prev_clip"
+                            recp["ts_done"] = time.time()
+                            recp["placeholder_from_clip_chain"] = True
+                            shot_map[sid] = recp
+                        except Exception:
+                            pass
+
+                        image_records.append({"id": sid, "file": placeholder, "seed": None, "placeholder": True})
+
+                        try:
+                            manifest.setdefault("paths", {})["images_dir"] = images_dir
+                            manifest["paths"]["images"] = image_records
+                            if placeholder and not manifest["paths"].get("first_image"):
+                                manifest["paths"]["first_image"] = placeholder
+                            _safe_write_json(manifest_path, manifest)
+                        except Exception:
+                            pass
+
+                        self.signals.stage.emit(f"Images — {sid} (chain placeholder {i}/{total})")
+                        self.signals.log.emit(f"[IMG] {sid}: wrote placeholder, will be replaced by the previous clip last frame")
+                        try:
+                            self.signals.progress.emit(_img_step_pct(i, total))
                         except Exception:
                             pass
                         continue
@@ -10032,7 +10996,9 @@ class PipelineWorker(QThread):
                     # Chunk 4: reference-image edit workflows can override the chosen engine.
                     # Keep workflow names distinct so later expansions don't collide.
                     try:
-                        if bool(use_flux_klein_edit):
+                        if bool(use_fireedit):
+                            _eng = "fireedit"
+                        elif bool(use_flux_klein_edit):
                             _eng = "flux_klein_edit"
                     except Exception:
                         pass
@@ -10079,6 +11045,18 @@ class PipelineWorker(QThread):
                             else:
                                 raise RuntimeError("Z-image Low Vram selected but no diffusion .gguf was found in models/Z-Image-Turbo GGUF")
                     
+                    elif str(_eng).lower().strip() == "fireedit":
+                        # Locked-in for FireRed Edit: 20 steps, CFG 4, strength 0.75, Euler, 1344x768.
+                        bw, bh = 1344, 768
+                        ww, hh = _apply_aspect_to_size(bw, bh, aspect_mode)
+                        t2i_job["width"] = int(ww)
+                        t2i_job["height"] = int(hh)
+                        t2i_job["sampler"] = "euler"
+                        t2i_job["sampling_method"] = "euler"
+                        t2i_job["steps"] = 12
+                        t2i_job["cfg_scale"] = 4.0
+                        t2i_job["cfg"] = 4.0
+                        t2i_job["strength"] = 0.75
                     elif str(_eng).lower().strip() in ("flux_klein", "flux_klein_edit"):
                         # Locked-in for Flux Klein: 4 steps, CFG 1, Euler, 1344x768, diffusion-fa ON
                         bw, bh = 1344, 768
@@ -10389,9 +11367,127 @@ class PipelineWorker(QThread):
                                 raise RuntimeError("qwen2511 entrypoint not found (expected build_sdcli_cmd or generate_one_from_job/run_job/run)")
 
                     else:
-                        # Flux Klein (stable-diffusion.cpp sd-cli)
+                        # stable-diffusion.cpp sd-cli backends (Flux Klein / FireRed Edit)
                         _eng_now = str(t2i_job.get("engine") or '').lower().strip()
-                        if _eng_now in ("flux_klein", "flux_klein_9b", "flux_klein_edit"):
+                        if _eng_now == "fireedit":
+                            _fr = _pick_firered_from_state()
+                            sdcli_path = str(_fr.get("sd_cli") or '')
+                            diffusion = str(_fr.get("diffusion") or '')
+                            llm = str(_fr.get("llm") or '')
+                            vae = str(_fr.get("vae") or '')
+                            lora_path = str(_fr.get("lora") or '')
+                            if (not sdcli_path) or (not os.path.exists(sdcli_path)):
+                                raise RuntimeError("FireRed Edit selected but sd-cli.exe was not found. Check presets/setsave/fireed.json or firered.json.")
+                            if (not diffusion) or (not os.path.exists(diffusion)):
+                                raise RuntimeError("FireRed Edit selected but no FireRed GGUF was found from the saved FireRed JSON paths.")
+                            if (not llm) or (not os.path.exists(llm)):
+                                raise RuntimeError("FireRed Edit selected but the saved Qwen-image LLM path is missing or invalid.")
+                            if (not vae) or (not os.path.exists(vae)):
+                                raise RuntimeError("FireRed Edit selected but the saved Qwen-image VAE path is missing or invalid.")
+
+                            out_path = str(t2i_job.get("out_file") or t2i_job.get("target") or '').strip()
+                            if (not out_path) or ("{" in out_path) or ("}" in out_path):
+                                out_path = os.path.join(images_dir, f"{sid}.png")
+                            if not os.path.splitext(out_path)[1]:
+                                out_path = out_path + ".png"
+                            os.makedirs(os.path.dirname(out_path), exist_ok=True)
+                            try:
+                                if os.path.exists(out_path):
+                                    os.remove(out_path)
+                            except Exception:
+                                pass
+
+                            _prompt_now = str(t2i_job.get("prompt") or '').strip()
+                            _firered_face_guard = (
+                                "preserve facial identity"
+                            )
+                            try:
+                                _pl = _prompt_now.lower()
+                            except Exception:
+                                _pl = ""
+                            if "preserve facial identity" not in _pl:
+                                _prompt_now = f"{_prompt_now}, {_firered_face_guard}".strip(" ,")
+                            if lora_path and os.path.exists(lora_path):
+                                try:
+                                    _lname = Path(lora_path).stem
+                                    _tag = f"<lora:{_lname}:1>"
+                                    if (f"<lora:{_lname}:" not in _prompt_now) and (f"<lora:{_lname}>" not in _prompt_now):
+                                        _prompt_now = f"{_prompt_now} {_tag}".strip()
+                                except Exception:
+                                    pass
+
+                            cmd = [sdcli_path]
+                            cmd += ["--diffusion-model", diffusion]
+                            cmd += ["--vae", vae]
+                            cmd += ["--llm", llm]
+                            cmd += ["-p", _prompt_now]
+                            _neg = str(t2i_job.get("negative_prompt") or t2i_job.get("negative") or '').strip()
+                            if _neg:
+                                cmd += ["-n", _neg]
+                            try:
+                                for _r in (used_ref_files or []):
+                                    if _r and os.path.exists(_r):
+                                        cmd += ["-r", str(_r)]
+                            except Exception:
+                                pass
+                            if lora_path and os.path.exists(lora_path):
+                                cmd += ["--lora-model-dir", str(Path(lora_path).parent)]
+                            cmd += ["-W", str(int(t2i_job.get("width") or 1280)), "-H", str(int(t2i_job.get("height") or 720))]
+                            cmd += ["--steps", str(int(t2i_job.get("steps") or 8))]
+                            cmd += ["--cfg-scale", str(float(t2i_job.get("cfg") or t2i_job.get("cfg_scale") or 3.0))]
+                            cmd += ["--strength", str(float(t2i_job.get("strength") or 0.75))]
+                            cmd += ["--sampling-method", str(t2i_job.get("sampling_method") or t2i_job.get("sampler") or "euler").strip().lower() or "euler"]
+                            cmd += ["-s", str(int(t2i_job.get("seed") or 0))]
+                            if bool(_fr.get("offload_cpu", False)):
+                                cmd += ["--offload-to-cpu"]
+                            if bool(_fr.get("diffusion_fa", True)):
+                                cmd += ["--diffusion-fa"]
+                            if bool(_fr.get("verbose", False)):
+                                cmd += ["-v"]
+                            cmd += ["-o", out_path]
+
+                            self.signals.log.emit(f"[IMG] {sid} ({i}/{total}) [FireRed Edit]")
+                            rc = 1
+                            try:
+                                p = subprocess.Popen(
+                                    cmd,
+                                    cwd=str(_root()),
+                                    stdout=subprocess.PIPE,
+                                    stderr=subprocess.STDOUT,
+                                    bufsize=1,
+                                )
+                                if p.stdout:
+                                    for _raw in p.stdout:
+                                        try:
+                                            if isinstance(_raw, bytes):
+                                                line = _raw.decode("utf-8", errors="replace")
+                                            else:
+                                                line = str(_raw)
+                                            self.signals.log.emit(line.rstrip())
+                                        except Exception:
+                                            pass
+                                rc = int(p.wait() or 0)
+                            except Exception as _e:
+                                raise RuntimeError(f"FireRed Edit sd-cli run failed: {_e}")
+
+                            ok = (rc == 0 and os.path.exists(out_path) and os.path.getsize(out_path) >= 1024)
+                            res = {"ok": bool(ok), "files": ([out_path] if ok else []), "out_file": out_path, "rc": int(rc), "model": "FireRed Edit 1.1"}
+
+                            try:
+                                shot_map = manifest.setdefault("shots", {})
+                                rec = shot_map.get(sid) if isinstance(shot_map.get(sid), dict) else {}
+                                rec["ref_strategy"] = "fireedit"
+                                rec["refs_used"] = list(used_ref_files)
+                                rec["fireedit_state"] = str(_fr.get("state_path") or '')
+                                shot_map[sid] = rec
+                            except Exception:
+                                pass
+                            try:
+                                if (not ok) and os.path.exists(out_path) and os.path.getsize(out_path) == 0:
+                                    os.remove(out_path)
+                            except Exception:
+                                pass
+                        elif _eng_now in ("flux_klein", "flux_klein_9b", "flux_klein_edit"):
                             _force_kb = 0
                             try:
                                 if _eng_now == 'flux_klein_9b':
@@ -10886,6 +11982,11 @@ class PipelineWorker(QThread):
                     pass
 
                 shot_map = manifest.get("shots") if isinstance(manifest.get("shots"), dict) else {}
+                try:
+                    image_records = list((manifest.get("paths") or {}).get("images") or [])
+                except Exception:
+                    image_records = []
+                use_last_frame_chain = _planner_last_frame_chain_enabled(getattr(self.job, "encoding", {}))
                 prof = dict(gen_profile) if isinstance(gen_profile, dict) else {}
                 fps = int(prof.get("fps") or 20)
                 steps = int(prof.get("steps") or 10)
@@ -10907,10 +12008,11 @@ class PipelineWorker(QThread):
                     "images_fp": imgs_fp,
                     "profile": prof,
                     "i2v_prompts_json": _sha1_file(i2v_prompts_json) if os.path.exists(i2v_prompts_json) else "",
+                    "use_last_frame_chain": bool(use_last_frame_chain),
                 }, sort_keys=True))
 
                 prior = _safe_read_json(clips_manifest_path) if os.path.exists(clips_manifest_path) else {}
-                if isinstance(prior, dict) and prior.get("fingerprint") == clip_fingerprint:
+                if (not use_last_frame_chain) and isinstance(prior, dict) and prior.get("fingerprint") == clip_fingerprint:
                     # Verify files exist
                     ok = True
                     lst = prior.get("clips") if isinstance(prior.get("clips"), list) else []
@@ -10961,6 +12063,8 @@ class PipelineWorker(QThread):
                 clips_out: List[Dict[str, Any]] = []
                 logs_dir = os.path.join(self.out_dir, "logs")
                 os.makedirs(logs_dir, exist_ok=True)
+                chain_frames_dir = os.path.join(self.out_dir, "chain_frames")
+                os.makedirs(chain_frames_dir, exist_ok=True)
 
                 # Partial-resume safeguard: keep already-rendered clips and only regenerate missing/stale ones.
                 # Build an index of existing clips from prior manifest and current job manifest.
@@ -11016,7 +12120,36 @@ class PipelineWorker(QThread):
                             prompt = _apply_own_character_codeword_replacements(str(prompt or ''), getattr(self.job, "encoding", {}))
                     except Exception:
                         pass
-                    img_path = id_to_img.get(sid, "")
+                    img_path = ""
+                    if use_last_frame_chain and i > 1:
+                        _forced_chain_img = _planner_force_chain_image_for_shot(
+                            shots=shots,
+                            shot_index=i,
+                            images_dir=images_dir,
+                            shot_map=shot_map,
+                            image_records=image_records,
+                            manifest=manifest,
+                            manifest_path=manifest_path,
+                            id_to_img=id_to_img,
+                            log_emit=self.signals.log.emit,
+                            chain_frames_dir=chain_frames_dir,
+                        )
+                        if not _forced_chain_img or not os.path.isfile(_forced_chain_img):
+                            raise RuntimeError(f"[CHAIN] {sid}: failed to build dedicated chain start image from the previous clip.")
+                        img_path = _forced_chain_img
+                        self.signals.log.emit(f"[CHAIN] {sid}: using dedicated chain start image {img_path}")
+
+                    if not img_path:
+                        img_path = id_to_img.get(sid, "")
+                    if not img_path:
+                        try:
+                            rec_img = shot_map.get(sid) if isinstance(shot_map, dict) else {}
+                            if isinstance(rec_img, dict):
+                                cand = str(rec_img.get("file") or '').strip()
+                                if cand and os.path.isfile(cand):
+                                    img_path = cand
+                        except Exception:
+                            img_path = ""
                     if not img_path:
                         # Try a simple filename guess
                         guess = os.path.join(images_dir, f"{sid}.png")
@@ -11024,6 +12157,13 @@ class PipelineWorker(QThread):
                             img_path = guess
                     if not img_path or not os.path.isfile(img_path):
                         raise RuntimeError(f"Missing start image for {sid}. Expected in {images_dir} or manifest paths.")
+                    if use_last_frame_chain and i > 1 and _planner_chain_image_still_placeholder(
+                        sid=sid,
+                        img_path=img_path,
+                        shot_map=shot_map,
+                        image_records=image_records,
+                    ):
+                        raise RuntimeError(f"[CHAIN] {sid}: start image is still the waiting placeholder instead of the previous clip last frame: {img_path}")
 
                     # Duration -> frames (clamped to tier max)
                     try:
@@ -11074,7 +12214,7 @@ class PipelineWorker(QThread):
 
                     # Skip regeneration if an acceptable existing clip is present (supports manual deletes of specific shots).
                     try:
-                        if os.path.isfile(out_file) and os.path.getsize(out_file) >= 1024:
+                        if (not use_last_frame_chain) and os.path.isfile(out_file) and os.path.getsize(out_file) >= 1024:
                             _ex = existing_by_id.get(sid) if isinstance(existing_by_id, dict) else None
                             _ex_fp = str(_ex.get("intent_fp") or '') if isinstance(_ex, dict) else ""
                             _rec_fp = str(rec.get("clip_intent_fp") or '') if isinstance(rec, dict) else ""
@@ -11087,8 +12227,12 @@ class PipelineWorker(QThread):
                             except Exception:
                                 _img_mtime = 0.0
 
-                            _up_to_date = True
-                            # Existing clip present; keep it (manual delete forces regeneration)
+                            _up_to_date = False
+                            if intent_fp and ((_ex_fp and _ex_fp == intent_fp) or (_rec_fp and _rec_fp == intent_fp)):
+                                _up_to_date = True
+                            elif (not _ex_fp and not _rec_fp) and (_clip_mtime > 0.0):
+                                _up_to_date = (_clip_mtime >= max(_img_mtime, prompts_mtime, shots_mtime))
+                            # Existing clip present; keep it only when it still matches this exact shot intent.
 
                             if _up_to_date:
                                 self.signals.stage.emit(f"Clips (Hunyuan) — {sid} (skip {i}/{len(shots)})")
@@ -11137,12 +12281,35 @@ class PipelineWorker(QThread):
                                         self.signals.asset_created.emit(out_file)
                                 except Exception:
                                     pass
+                                if use_last_frame_chain and i < len(shots):
+                                    try:
+                                        _next_sid = str((shots[i] or {}).get("id") or f"S{i+1:02d}").strip()
+                                    except Exception:
+                                        _next_sid = f"S{i+1:02d}"
+                                    if _next_sid:
+                                        _derived = _planner_overwrite_next_image_from_clip(
+                                            current_sid=sid,
+                                            next_sid=_next_sid,
+                                            clip_path=out_file,
+                                            images_dir=images_dir,
+                                            shot_map=shot_map,
+                                            image_records=image_records,
+                                            manifest=manifest,
+                                            manifest_path=manifest_path,
+                                            id_to_img=id_to_img,
+                                            log_emit=self.signals.log.emit,
+                                            target_path=_planner_chain_frame_path(self.out_dir, _next_sid),
+                                            mirror_to_images_dir=True,
+                                        )
+                                        if not _derived:
+                                            raise RuntimeError(f"Could not extract last frame from {sid} to seed {_next_sid}.")
                                 continue
                     except Exception:
                         pass
 
                     self.signals.stage.emit(f"Clips (Hunyuan) — {sid} ({i}/{len(shots)})")
                     self.signals.log.emit(f"[hunyuan15] {sid}: {frames} frames @ {fps} fps, target_size={target_size}, steps={steps}")
+                    self.signals.log.emit(f"[hunyuan15] {sid}: start image -> {img_path}")
                     self.signals.progress.emit(min(99, 72 + int((i - 1) * (25 / max(1, len(shots))))))
 
                     # Capture stdout/stderr
@@ -11223,6 +12390,29 @@ class PipelineWorker(QThread):
                     except Exception:
                         pass
 
+                    if use_last_frame_chain and i < len(shots):
+                        try:
+                            _next_sid = str((shots[i] or {}).get("id") or f"S{i+1:02d}").strip()
+                        except Exception:
+                            _next_sid = f"S{i+1:02d}"
+                        if _next_sid:
+                            _derived = _planner_overwrite_next_image_from_clip(
+                                current_sid=sid,
+                                next_sid=_next_sid,
+                                clip_path=out_file,
+                                images_dir=images_dir,
+                                shot_map=shot_map,
+                                image_records=image_records,
+                                manifest=manifest,
+                                manifest_path=manifest_path,
+                                id_to_img=id_to_img,
+                                log_emit=self.signals.log.emit,
+                                target_path=_planner_chain_frame_path(self.out_dir, _next_sid),
+                                mirror_to_images_dir=True,
+                            )
+                            if not _derived:
+                                raise RuntimeError(f"Could not extract last frame from {sid} to seed {_next_sid}.")
+
                 # Final clips manifest (for resume/skip)
                 _safe_write_json(clips_manifest_path, {"fingerprint": clip_fingerprint, "clips": clips_out, "profile": prof})
                 manifest.setdefault("paths", {})["clips_dir"] = clips_dir
@@ -11233,6 +12423,13 @@ class PipelineWorker(QThread):
             def step_video_clips_wan22() -> None:
                 shots = _load_shots_list(shots_path)
                 shot_map = manifest.get("shots") if isinstance(manifest.get("shots"), dict) else {}
+                try:
+                    image_records = list((manifest.get("paths") or {}).get("images") or [])
+                except Exception:
+                    image_records = []
+                use_last_frame_chain = _planner_last_frame_chain_enabled(getattr(self.job, "encoding", {}))
+                chain_frames_dir = os.path.join(self.out_dir, "chain_frames")
+                os.makedirs(chain_frames_dir, exist_ok=True)
                 prof = _resolve_generation_profile(self.job.encoding.get("video_model") or "", self.job.encoding.get("gen_quality_preset") or '')
 
                 # Select size string based on aspect (WAN uses explicit WxH strings)
@@ -11256,11 +12453,12 @@ class PipelineWorker(QThread):
                     "shots_sha1": _sha1_file(shots_path) if os.path.exists(shots_path) else "",
                     "i2v_sha1": _sha1_file(i2v_prompts_json) if os.path.exists(i2v_prompts_json) else "",
                     "images_dir_fp": _file_fingerprint(images_dir),
+                    "use_last_frame_chain": bool(use_last_frame_chain),
                 }, sort_keys=True))
 
                 # If clips_manifest exists and matches fingerprint, we can skip
                 try:
-                    if os.path.exists(clips_manifest_path):
+                    if (not use_last_frame_chain) and os.path.exists(clips_manifest_path):
                         cm = _safe_read_json(clips_manifest_path)
                         if isinstance(cm, dict) and str(cm.get("fingerprint") or '') == clip_fingerprint:
                             # Ensure clips list is also present in main manifest
@@ -11298,6 +12496,22 @@ class PipelineWorker(QThread):
 
                     # Input image
                     img_path = ""
+                    if use_last_frame_chain and i > 1:
+                        _forced_chain_img = _planner_force_chain_image_for_shot(
+                            shots=shots,
+                            shot_index=i,
+                            images_dir=images_dir,
+                            shot_map=shot_map,
+                            image_records=image_records,
+                            manifest=manifest,
+                            manifest_path=manifest_path,
+                            log_emit=self.signals.log.emit,
+                            chain_frames_dir=chain_frames_dir,
+                        )
+                        if not _forced_chain_img or not os.path.isfile(_forced_chain_img):
+                            raise RuntimeError(f"[CHAIN] {sid}: failed to build dedicated chain start image from the previous clip.")
+                        img_path = _forced_chain_img
+                        self.signals.log.emit(f"[CHAIN] {sid}: using dedicated chain start image {img_path}")
                     try:
                         # Prefer manifest shot image file if present
                         rec = shot_map.get(sid) if isinstance(shot_map, dict) else {}
@@ -11314,6 +12528,13 @@ class PipelineWorker(QThread):
 
                     if not img_path or not os.path.exists(img_path):
                         raise RuntimeError(f"[wan22] Missing start image for shot {sid}: {img_path}")
+                    if use_last_frame_chain and i > 1 and _planner_chain_image_still_placeholder(
+                        sid=sid,
+                        img_path=img_path,
+                        shot_map=shot_map,
+                        image_records=image_records,
+                    ):
+                        raise RuntimeError(f"[CHAIN] {sid}: start image is still the waiting placeholder instead of the previous clip last frame: {img_path}")
 
                     # Prompts
                     rec = shot_map.get(sid) if isinstance(shot_map, dict) else {}
@@ -11353,7 +12574,7 @@ class PipelineWorker(QThread):
                     }, sort_keys=True))
 
                     # Skip if output exists and intent matches previous
-                    if os.path.isfile(out_file) and os.path.getsize(out_file) > 1024:
+                    if (not use_last_frame_chain) and os.path.isfile(out_file) and os.path.getsize(out_file) > 1024:
                         prev = existing_intents.get(sid) or str(rec.get("clip_intent_fp") or '')
                         if prev and prev == intent_fp:
                             self.signals.log.emit(f"[wan22] {sid}: reusing existing clip (intent match)")
@@ -11374,6 +12595,27 @@ class PipelineWorker(QThread):
                                     self.signals.asset_created.emit(out_file)
                             except Exception:
                                 pass
+                            if use_last_frame_chain and i < len(shots):
+                                try:
+                                    _next_sid = str((shots[i] or {}).get("id") or f"S{i+1:02d}").strip()
+                                except Exception:
+                                    _next_sid = f"S{i+1:02d}"
+                                if _next_sid:
+                                    _derived = _planner_overwrite_next_image_from_clip(
+                                        current_sid=sid,
+                                        next_sid=_next_sid,
+                                        clip_path=out_file,
+                                        images_dir=images_dir,
+                                        shot_map=shot_map,
+                                        image_records=image_records,
+                                        manifest=manifest,
+                                        manifest_path=manifest_path,
+                                        log_emit=self.signals.log.emit,
+                                        target_path=_planner_chain_frame_path(self.out_dir, _next_sid),
+                                        mirror_to_images_dir=True,
+                                    )
+                                    if not _derived:
+                                        raise RuntimeError(f"Could not extract last frame from {sid} to seed {_next_sid}.")
                             continue
 
                     self.signals.stage.emit(f"Clips (WAN 2.2) — {sid} ({i}/{len(shots)})")
@@ -11435,6 +12677,28 @@ class PipelineWorker(QThread):
                             self.signals.asset_created.emit(out_file)
                     except Exception:
                         pass
+
+                    if use_last_frame_chain and i < len(shots):
+                        try:
+                            _next_sid = str((shots[i] or {}).get("id") or f"S{i+1:02d}").strip()
+                        except Exception:
+                            _next_sid = f"S{i+1:02d}"
+                        if _next_sid:
+                            _derived = _planner_overwrite_next_image_from_clip(
+                                current_sid=sid,
+                                next_sid=_next_sid,
+                                clip_path=out_file,
+                                images_dir=images_dir,
+                                shot_map=shot_map,
+                                image_records=image_records,
+                                manifest=manifest,
+                                manifest_path=manifest_path,
+                                log_emit=self.signals.log.emit,
+                                target_path=_planner_chain_frame_path(self.out_dir, _next_sid),
+                                mirror_to_images_dir=True,
+                            )
+                            if not _derived:
+                                raise RuntimeError(f"Could not extract last frame from {sid} to seed {_next_sid}.")
 
                 # Final write
                 _safe_write_json(clips_manifest_path, {"fingerprint": clip_fingerprint, "clips": clips_out, "profile": prof})
@@ -16427,7 +17691,7 @@ class PlannerPane(QWidget):
         self._pending_jobs: List[dict] = []
 
         # Chunk 4: reference images strategy
-        self._ref_strategy: str = ""  # qwen3vl_describe | qwen2511_best | flux_klein_edit | qwenvl_reuse
+        self._ref_strategy: str = ""  # qwen3vl_describe | qwen2511_best | flux_klein_edit | fireedit | qwenvl_reuse
         self._ref_multi_angle_lora: str = ""  # auto-detected path when available
         self._ref_qwen2511_high_quality: bool = False  # Chunk 4: Qwen 2511 HQ toggle (1280x720)
 
@@ -17632,7 +18896,77 @@ If the planner sees a marker like [02] or (02), it becomes the next image prompt
             pass
         grid.addWidget(self.lbl_videoclip_preset_hint, 6, 0, 1, 2)
 
+        lbl_last_frame_chain = QLabel("Use last frame as next start image")
+        self.chk_use_last_frame_as_next_image = QCheckBox("Enabled")
+        try:
+            _lf_chain_tip = "Create only the first real image. The planner fills the rest with placeholders, then after each clip it extracts the last frame and overwrites the next shot image before continuing."
+            lbl_last_frame_chain.setToolTip(_lf_chain_tip)
+            self.chk_use_last_frame_as_next_image.setToolTip(_lf_chain_tip)
+        except Exception:
+            pass
+        self.chk_use_last_frame_as_next_image.setChecked(False)
+        try:
+            s = _load_planner_settings()
+            self.chk_use_last_frame_as_next_image.setChecked(bool(s.get("use_last_frame_as_next_image", False)))
+        except Exception:
+            pass
+        try:
+            self.chk_use_last_frame_as_next_image.toggled.connect(self._on_toggle_use_last_frame_as_next_image)
+        except Exception:
+            pass
+        grid.addWidget(lbl_last_frame_chain, 7, 0)
+        grid.addWidget(self.chk_use_last_frame_as_next_image, 7, 1)
+
+        lbl_chain_use_start = QLabel("Use start image")
+        self.chk_chain_use_start_image = QCheckBox("Enabled")
+        try:
+            _chain_start_tip = "Only shown when last frame → next start image is enabled. When turned on, you can load your own first start image. If no image is loaded, the planner behaves normally and still creates the first image itself."
+            lbl_chain_use_start.setToolTip(_chain_start_tip)
+            self.chk_chain_use_start_image.setToolTip(_chain_start_tip)
+        except Exception:
+            pass
+        self.chk_chain_use_start_image.setChecked(False)
+        try:
+            s = _load_planner_settings()
+            self.chk_chain_use_start_image.setChecked(bool(s.get("chain_use_start_image", False)))
+        except Exception:
+            pass
+        try:
+            self.chk_chain_use_start_image.toggled.connect(self._on_toggle_chain_use_start_image)
+        except Exception:
+            pass
+        grid.addWidget(lbl_chain_use_start, 8, 0)
+        grid.addWidget(self.chk_chain_use_start_image, 8, 1)
+        self.lbl_chain_use_start_image = lbl_chain_use_start
+
+        self.chain_start_image_row = QWidget()
+        _chain_start_row = QHBoxLayout(self.chain_start_image_row)
+        _chain_start_row.setContentsMargins(0, 0, 0, 0)
+        _chain_start_row.setSpacing(8)
+        self.edit_chain_start_image = QLineEdit()
+        self.edit_chain_start_image.setPlaceholderText("Optional first start image for the chain workflow")
+        try:
+            self.edit_chain_start_image.setReadOnly(True)
+        except Exception:
+            pass
+        try:
+            s = _load_planner_settings()
+            self.edit_chain_start_image.setText(str(s.get("chain_start_image_path") or ""))
+        except Exception:
+            pass
+        self.btn_chain_start_image_browse = QPushButton("Browse…")
+        self.btn_chain_start_image_clear = QPushButton("Clear")
+        try:
+            self.btn_chain_start_image_browse.clicked.connect(self._browse_chain_start_image)
+            self.btn_chain_start_image_clear.clicked.connect(self._clear_chain_start_image)
+        except Exception:
+            pass
+        _chain_start_row.addWidget(self.edit_chain_start_image, 1)
+        _chain_start_row.addWidget(self.btn_chain_start_image_browse)
+        _chain_start_row.addWidget(self.btn_chain_start_image_clear)
+
         lay.addLayout(grid)
+        lay.addWidget(self.chain_start_image_row)
 
         # Output folder
         out_row = QHBoxLayout()
@@ -18952,9 +20286,39 @@ If the planner sees a marker like [02] or (02), it becomes the next image prompt
             QMessageBox.warning(self, "Cannot resume", f"Failed to read job.json:\n{e}")
             return
 
+        try:
+            enc = data.get("encoding") if isinstance(data, dict) else {}
+            last_frame_chain = _planner_last_frame_chain_enabled(enc if isinstance(enc, dict) else {})
+        except Exception:
+            last_frame_chain = False
+
+        if last_frame_chain:
+            ans = QMessageBox.question(
+                self,
+                "Restart required",
+                "Resume can not be used to review last frame-first frame workflows, click yes to restart the workflow completely or press cancel",
+                QMessageBox.Yes | QMessageBox.Cancel,
+                QMessageBox.Yes,
+            )
+            if ans != QMessageBox.Yes:
+                return
+            try:
+                output_base = os.path.dirname(str(job_dir).rstrip(os.sep)) or self._default_out_dir()
+                output_base = _abspath_from_root(output_base)
+                title = _auto_title_from_prompt(job.prompt)
+                slug = _slugify_title(title) or "job"
+                run_n = _next_slug_counter(output_base, slug)
+                new_out_dir = os.path.join(output_base, f"{slug}_{run_n:03d}")
+            except Exception:
+                title = _auto_title_from_prompt(job.prompt)
+                slug = _slugify_title(title) or "job"
+                new_out_dir = job_dir
+            self._run_job(job, new_out_dir, title=title, slug=slug, resume_note=f"Restarting full last-frame chain workflow from: {os.path.basename(job_dir)}")
+            return
+
         self._run_job(job, job_dir, resume_note=f"Resuming in-place: {os.path.basename(job_dir)}")
 
-    
+
     @Slot()
     def _res_remove_folder(self) -> None:
         paths = self._get_selected_result_paths()
@@ -19737,6 +21101,7 @@ If the planner sees a marker like [02] or (02), it becomes the next image prompt
         self.music_vol_row.setVisible(self.chk_music.isChecked())
         self._sync_narration_ui()
         self._sync_videoclip_creator_lock_for_narration()
+        self._sync_last_frame_chain_ui_guard()
         self._sync_bake_subtitles_gate()
 
     def _sync_bake_subtitles_gate(self) -> None:
@@ -19786,6 +21151,113 @@ If the planner sees a marker like [02] or (02), it becomes the next image prompt
         except Exception:
             pass
     
+
+    def _sync_chain_start_image_ui(self) -> None:
+        """Show/hide the optional user-supplied first start image controls for the chain workflow."""
+        try:
+            chain_on = bool(getattr(self, "chk_use_last_frame_as_next_image", None) and self.chk_use_last_frame_as_next_image.isChecked())
+        except Exception:
+            chain_on = False
+        try:
+            use_start = bool(getattr(self, "chk_chain_use_start_image", None) and self.chk_chain_use_start_image.isChecked())
+        except Exception:
+            use_start = False
+        try:
+            if hasattr(self, "lbl_chain_use_start_image"):
+                self.lbl_chain_use_start_image.setVisible(bool(chain_on))
+        except Exception:
+            pass
+        try:
+            if hasattr(self, "chk_chain_use_start_image"):
+                self.chk_chain_use_start_image.setVisible(bool(chain_on))
+        except Exception:
+            pass
+        try:
+            if hasattr(self, "chain_start_image_row"):
+                self.chain_start_image_row.setVisible(bool(chain_on and use_start))
+        except Exception:
+            pass
+
+    def _sync_last_frame_chain_ui_guard(self) -> None:
+        """Safeguard: last-frame chaining only supports the default hardcuts storyline in sequential order."""
+        try:
+            chain_on = bool(getattr(self, "chk_use_last_frame_as_next_image", None) and self.chk_use_last_frame_as_next_image.isChecked())
+        except Exception:
+            chain_on = False
+
+        if not hasattr(self, "cmb_videoclip_preset"):
+            return
+
+        if chain_on:
+            try:
+                self.cmb_videoclip_preset.blockSignals(True)
+            except Exception:
+                pass
+            try:
+                self.cmb_videoclip_preset.setCurrentIndex(0)
+            except Exception:
+                pass
+            try:
+                self.cmb_videoclip_preset.blockSignals(False)
+            except Exception:
+                pass
+
+            try:
+                if hasattr(self, "cmb_videoclip_clip_order"):
+                    self.cmb_videoclip_clip_order.blockSignals(True)
+                    self.cmb_videoclip_clip_order.setCurrentIndex(0)
+                    self.cmb_videoclip_clip_order.blockSignals(False)
+            except Exception:
+                pass
+
+            try:
+                self.cmb_videoclip_preset.setEnabled(False)
+            except Exception:
+                pass
+            try:
+                if hasattr(self, "lbl_videoclip_clip_order"):
+                    self.lbl_videoclip_clip_order.setVisible(True)
+                    self.lbl_videoclip_clip_order.setEnabled(False)
+            except Exception:
+                pass
+            try:
+                if hasattr(self, "cmb_videoclip_clip_order"):
+                    self.cmb_videoclip_clip_order.setVisible(True)
+                    self.cmb_videoclip_clip_order.setEnabled(False)
+                    self.cmb_videoclip_clip_order.setToolTip("Locked to Sequential when using last frame as next start image.")
+            except Exception:
+                pass
+            try:
+                self.cmb_videoclip_preset.setToolTip("Locked to Storyline Preset (Hardcuts) when using last frame as next start image.")
+            except Exception:
+                pass
+            try:
+                if hasattr(self, "lbl_videoclip_preset_hint"):
+                    self.lbl_videoclip_preset_hint.setText("Last frame → next start image locks Videoclip Creator to Storyline Preset (Hardcuts) and Sequential order")
+                    self.lbl_videoclip_preset_hint.setVisible(True)
+            except Exception:
+                pass
+            return
+
+        try:
+            self._sync_videoclip_creator_lock_for_narration()
+        except Exception:
+            pass
+        try:
+            if hasattr(self, "lbl_videoclip_clip_order"):
+                self.lbl_videoclip_clip_order.setEnabled(True)
+        except Exception:
+            pass
+        try:
+            if hasattr(self, "cmb_videoclip_clip_order"):
+                self.cmb_videoclip_clip_order.setEnabled(True)
+                self.cmb_videoclip_clip_order.setToolTip("Only used for external Videoclip Creator presets.")
+        except Exception:
+            pass
+        try:
+            self._sync_videoclip_creator_external_options_visibility()
+        except Exception:
+            pass
 
     def _sync_videoclip_creator_lock_for_narration(self) -> None:
         """Safeguard: Videoclip Creator presets don't support narration over music.
@@ -20307,6 +21779,86 @@ If the planner sees a marker like [02] or (02), it becomes the next image prompt
         except Exception:
             pass
 
+    def _on_toggle_use_last_frame_as_next_image(self, on: bool) -> None:
+        """Persist Planner chain-image workflow toggle and apply UI safeguards."""
+        try:
+            s = _load_planner_settings()
+            s["use_last_frame_as_next_image"] = bool(on)
+            if not bool(on):
+                s["chain_use_start_image"] = False
+            if bool(on):
+                s["videoclip_creator_preset"] = "Storyline Preset (Hardcuts)"
+                s["videoclip_creator_clip_order"] = "Sequential (default)"
+            _save_planner_settings(s)
+        except Exception:
+            pass
+        try:
+            if hasattr(self, "chk_chain_use_start_image") and not bool(on):
+                self.chk_chain_use_start_image.blockSignals(True)
+                self.chk_chain_use_start_image.setChecked(False)
+                self.chk_chain_use_start_image.blockSignals(False)
+        except Exception:
+            pass
+        try:
+            self._sync_last_frame_chain_ui_guard()
+        except Exception:
+            pass
+        try:
+            self._sync_chain_start_image_ui()
+        except Exception:
+            pass
+
+    def _on_toggle_chain_use_start_image(self, on: bool) -> None:
+        """Persist the optional user-supplied first start image toggle."""
+        try:
+            s = _load_planner_settings()
+            s["chain_use_start_image"] = bool(on)
+            _save_planner_settings(s)
+        except Exception:
+            pass
+        try:
+            self._sync_chain_start_image_ui()
+        except Exception:
+            pass
+
+    def _browse_chain_start_image(self) -> None:
+        try:
+            fn, _ = QFileDialog.getOpenFileName(self, "Select start image", "", "Images (*.png *.jpg *.jpeg *.webp *.bmp)")
+        except Exception:
+            fn = ""
+        if not fn:
+            return
+        try:
+            if hasattr(self, "edit_chain_start_image"):
+                self.edit_chain_start_image.setText(str(fn))
+                self.edit_chain_start_image.setToolTip(str(fn))
+        except Exception:
+            pass
+        try:
+            s = _load_planner_settings()
+            s["chain_start_image_path"] = str(fn)
+            _save_planner_settings(s)
+        except Exception:
+            pass
+
+    def _clear_chain_start_image(self) -> None:
+        try:
+            if hasattr(self, "edit_chain_start_image"):
+                self.edit_chain_start_image.clear()
+                self.edit_chain_start_image.setToolTip("")
+        except Exception:
+            pass
+        try:
+            s = _load_planner_settings()
+            s["chain_start_image_path"] = ""
+            _save_planner_settings(s)
+        except Exception:
+            pass
+        try:
+            self._sync_chain_start_image_ui()
+        except Exception:
+            pass
+
     def _on_toggle_allow_edit_while_running(self, on: bool) -> None:
         """Chunk 8A: Persist the interactive review/edit gate toggle."""
         try:
@@ -20489,9 +22041,9 @@ If the planner sees a marker like [02] or (02), it becomes the next image prompt
             except Exception:
                 pass
 
-        # Ensure external-only rows are correctly shown/hidden
+        # Ensure external-only rows are correctly shown/hidden and apply chain safeguard
         try:
-            self._sync_videoclip_creator_external_options_visibility()
+            self._sync_last_frame_chain_ui_guard()
         except Exception:
             pass
 
@@ -20677,7 +22229,7 @@ If the planner sees a marker like [02] or (02), it becomes the next image prompt
                 pass
 
     def _sync_image_model_lock_for_qwen2511_refs(self) -> None:
-        "Disable Image model selection when a ref-workflow drives image creation (Qwen 2511 or Flux Klein Edit)."
+        "Disable Image model selection when a ref-workflow drives image creation."
         try:
             has_refs = bool(getattr(self, "ref_list", None) and int(self.ref_list.count()) > 0)
         except Exception:
@@ -20687,17 +22239,31 @@ If the planner sees a marker like [02] or (02), it becomes the next image prompt
         except Exception:
             strat = ""
 
-        lock = bool(has_refs and strat in ("qwen2511_best", "flux_klein_edit"))
+        hint_map = {
+            "qwen2511_best": ("Using Qwen Edit for reference image creation", "__QWEN2511_REF_LOCK__"),
+            "flux_klein_edit": ("Using Flux Klein Edit for reference image creation", "__FLUX_KLEIN_EDIT_REF_LOCK__"),
+            "fireedit": ("Using FireRed Edit for reference image creation", "__FIRERED_EDIT_REF_LOCK__"),
+        }
+        lock = bool(has_refs and strat in hint_map)
 
         # The combo lives in Settings; guard for early calls during init.
         cmb = getattr(self, "cmb_image_model", None)
 
-        if strat == "flux_klein_edit":
-            hint = "Using Flux Klein Edit for reference image creation"
-            hint_key = "__FLUX_KLEIN_EDIT_REF_LOCK__"
-        else:
-            hint = "Using Qwen Edit for reference image creation"
-            hint_key = "__QWEN2511_REF_LOCK__"
+        hint = ""
+        hint_key = ""
+        if lock:
+            hint, hint_key = hint_map.get(strat, ("", ""))
+
+        def _remove_all_hint_items() -> None:
+            if not cmb:
+                return
+            keys = {v[1] for v in hint_map.values()}
+            for i in range(int(cmb.count()) - 1, -1, -1):
+                try:
+                    if str(cmb.itemData(i) or '') in keys:
+                        cmb.removeItem(i)
+                except Exception:
+                    continue
 
         if lock:
             try:
@@ -20713,21 +22279,11 @@ If the planner sees a marker like [02] or (02), it becomes the next image prompt
                 except Exception:
                     self._img_model_prev_index = -1
 
-            # Ensure a visible, stable hint item exists (and is selected).
             try:
-                idx_hint = -1
-                for i in range(int(cmb.count())):
-                    try:
-                        if str(cmb.itemData(i) or '') == hint_key:
-                            idx_hint = i
-                            break
-                    except Exception:
-                        continue
-                if idx_hint < 0:
-                    cmb.insertItem(0, hint)
-                    cmb.setItemData(0, hint_key)
-                    idx_hint = 0
-                cmb.setCurrentIndex(idx_hint)
+                _remove_all_hint_items()
+                cmb.insertItem(0, hint)
+                cmb.setItemData(0, hint_key)
+                cmb.setCurrentIndex(0)
             except Exception:
                 pass
 
@@ -20749,17 +22305,7 @@ If the planner sees a marker like [02] or (02), it becomes the next image prompt
 
         try:
             if cmb:
-                idx_hint = -1
-                for i in range(int(cmb.count())):
-                    try:
-                        if str(cmb.itemData(i) or '') == hint_key:
-                            idx_hint = i
-                            break
-                    except Exception:
-                        continue
-                if idx_hint >= 0:
-                    cmb.removeItem(idx_hint)
-
+                _remove_all_hint_items()
                 cmb.setEnabled(True)
                 cmb.setToolTip("")
 
@@ -20770,7 +22316,6 @@ If the planner sees a marker like [02] or (02), it becomes the next image prompt
             pass
 
         self._img_model_lock_active = False
-
 
 
     def _on_add_ref_images_clicked(self) -> None:
@@ -20856,12 +22401,14 @@ If the planner sees a marker like [02] or (02), it becomes the next image prompt
             'A) Use image(s) as reference → Qwen3-VL Describe generates story prompt guidance (fast)\n'
             'B) Best attempt consistency → Qwen Edit 2511 (max 2 refs, slower; 16GB+ VRAM recommended)\n'
             'C) Fast reference consistency → Flux Klein Edit (less precise than Qwen 2511, but >10× faster; 12–16GB VRAM)\n'
+            'D) FireRed Edit 1.1 → uses FireRed saved paths + settings JSON for model wiring (8 steps, CFG 4, strength 0.75)\n'
             'Cancel → lightweight reuse (Qwen-VL look & reuse obvious objects)\n'
         )
 
         btn_a = msg.addButton('A) Qwen3-VL Describe', QMessageBox.AcceptRole)
         btn_b = msg.addButton('B) Qwen Edit 2511', QMessageBox.AcceptRole)
         btn_fx = msg.addButton('C) Flux Klein Edit', QMessageBox.AcceptRole)
+        btn_fr = msg.addButton('D) FireRed Edit 1.1', QMessageBox.AcceptRole)
         btn_c = msg.addButton('Cancel (lightweight reuse)', QMessageBox.RejectRole)
         msg.setDefaultButton(btn_c)
         msg.exec()
@@ -20916,6 +22463,11 @@ If the planner sees a marker like [02] or (02), it becomes the next image prompt
 
         elif clicked == btn_fx:
             self._ref_strategy = 'flux_klein_edit'
+            self._ref_multi_angle_lora = ''
+            self._ref_qwen2511_high_quality = False
+
+        elif clicked == btn_fr:
+            self._ref_strategy = 'fireedit'
             self._ref_multi_angle_lora = ''
             self._ref_qwen2511_high_quality = False
 
@@ -21194,6 +22746,9 @@ If the planner sees a marker like [02] or (02), it becomes the next image prompt
             "videoclip_creator_clip_order": (self.cmb_videoclip_clip_order.currentText() if hasattr(self, "cmb_videoclip_clip_order") else "Sequential (default)"),
             "gen_quality_preset": (self.cmb_gen_quality.currentText() if hasattr(self, "cmb_gen_quality") else ""),
             "use_20_camera_effects": bool(getattr(self, "chk_use_20_camera_effects", None) and self.chk_use_20_camera_effects.isChecked()),
+            "use_last_frame_as_next_image": bool(getattr(self, "chk_use_last_frame_as_next_image", None) and self.chk_use_last_frame_as_next_image.isChecked()),
+            "chain_use_start_image": bool(getattr(self, "chk_chain_use_start_image", None) and self.chk_chain_use_start_image.isChecked()),
+            "chain_start_image_path": str((getattr(self, "edit_chain_start_image", None).text() if getattr(self, "edit_chain_start_image", None) else "") or '').strip(),
             "allow_edit_while_running": bool(getattr(self, "chk_allow_edit_while_running", None) and self.chk_allow_edit_while_running.isChecked()),
             "character_bible_enabled": bool(getattr(self, "chk_character_bible", None) and self.chk_character_bible.isChecked()),
             "own_character_bible_enabled": bool(getattr(self, "chk_own_character_bible", None) and self.chk_own_character_bible.isChecked()),

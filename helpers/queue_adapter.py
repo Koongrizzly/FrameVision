@@ -271,6 +271,314 @@ def default_qwen2511_outdir():
     return str(d)
 
 
+
+
+def enqueue_flux_klein_from_widget(inner):
+    """Enqueue a Flux Klein GGUF image edit job from the Flux Klein editor UI."""
+    import time as _time
+    from pathlib import Path as _P
+    try:
+        from helpers.queue_adapter import jobs_dirs
+    except Exception:
+        from queue_adapter import jobs_dirs
+    try:
+        from helpers.job_helper import make_job_json
+    except Exception:
+        from job_helper import make_job_json
+
+    d = jobs_dirs()
+
+    def _txt(name, default=''):
+        try:
+            obj = getattr(inner, name, None)
+            if obj is None:
+                return default
+            if hasattr(obj, 'text'):
+                return str(obj.text()).strip()
+            if hasattr(obj, 'toPlainText'):
+                return str(obj.toPlainText()).strip()
+        except Exception:
+            pass
+        return default
+
+    def _val(name, default=None):
+        try:
+            obj = getattr(inner, name, None)
+            if obj is None:
+                return default
+            if hasattr(obj, 'value'):
+                return obj.value()
+        except Exception:
+            pass
+        return default
+
+    def _checked(name, default=False):
+        try:
+            obj = getattr(inner, name, None)
+            if obj is None:
+                return default
+            if hasattr(obj, 'isChecked'):
+                return bool(obj.isChecked())
+        except Exception:
+            pass
+        return default
+
+    def _combo_data(name):
+        try:
+            obj = getattr(inner, name, None)
+            if obj is None:
+                return ''
+            if hasattr(obj, 'currentData'):
+                return str(obj.currentData() or '').strip()
+        except Exception:
+            pass
+        return ''
+
+    def _combo_text(name, default=''):
+        try:
+            obj = getattr(inner, name, None)
+            if obj is None:
+                return default
+            if hasattr(obj, 'currentText'):
+                return str(obj.currentText() or '').strip()
+        except Exception:
+            pass
+        return default
+
+    sdcli_path = _txt('sdcli_edit')
+    model_dir = _txt('modeldir_edit')
+    diffusion_model = _combo_data('flux_combo')
+    llm_model = _combo_data('llm_combo')
+    vae_file = _combo_data('vae_combo')
+    lora_file = _combo_data('lora_combo')
+
+    prompt = _txt('prompt_edit')
+    negative = _txt('neg_edit')
+    width = int(_val('width_spin', 1024) or 1024)
+    height = int(_val('height_spin', 1024) or 1024)
+    steps = int(_val('steps_spin', 4) or 4)
+    cfg_scale = float(_val('cfg_spin', 1.0) or 1.0)
+    seed = int(_val('seed_spin', 0) or 0)
+    random_seed = _checked('chk_rand_seed', True)
+    sampling_method = _combo_text('sampling_combo', 'euler') or 'euler'
+    diffusion_fa = _checked('chk_diffusion_fa', True)
+    offload_to_cpu = _checked('chk_offload_cpu', False)
+    vae_tiling = _checked('chk_vae_tiling', False)
+    out_name = _txt('out_name_edit')
+    lora_strength = float(_val('lora_strength_spin', 1.0) or 1.0)
+
+    ref_images = []
+    try:
+        cfg = getattr(inner, 'cfg', None)
+        ref_images = list(getattr(cfg, 'ref_images', []) or [])
+    except Exception:
+        ref_images = []
+    ref_images = [str(x).strip() for x in ref_images if str(x).strip()]
+
+    if not prompt:
+        raise RuntimeError('Prompt is empty.')
+    if not sdcli_path or not _P(sdcli_path).is_file():
+        raise RuntimeError('sd-cli not found: ' + str(sdcli_path))
+    if not diffusion_model or not _P(diffusion_model).is_file():
+        raise RuntimeError('Flux GGUF not found: ' + str(diffusion_model))
+    if not llm_model or not _P(llm_model).is_file():
+        raise RuntimeError('Qwen GGUF not found: ' + str(llm_model))
+    if not vae_file or not _P(vae_file).is_file():
+        raise RuntimeError('VAE not found: ' + str(vae_file))
+    if lora_file and not _P(lora_file).is_file():
+        raise RuntimeError('LoRA not found: ' + str(lora_file))
+    for rp in ref_images:
+        if not _P(rp).is_file():
+            raise RuntimeError('Reference image not found: ' + rp)
+
+    try:
+        out_dir = getattr(getattr(inner, 'paths', None), 'out_dir', '') or ''
+    except Exception:
+        out_dir = ''
+    if not out_dir:
+        try:
+            root = getattr(getattr(inner, 'paths', None), 'root', '') or ''
+            out_dir = str(_P(root) / 'output' / 'edits' / 'flux_klein') if root else str(_P('.') / 'output' / 'edits' / 'flux_klein')
+        except Exception:
+            out_dir = str(_P('.') / 'output' / 'edits' / 'flux_klein')
+    _P(out_dir).mkdir(parents=True, exist_ok=True)
+
+    if out_name:
+        out_file = str(_P(out_dir) / out_name)
+    else:
+        out_file = str(_P(out_dir) / f"klein_{_time.strftime('%Y%m%d_%H%M%S')}.png")
+
+    label = 'Flux Klein image edit'
+    if prompt:
+        label = 'Flux Klein: ' + prompt.replace('\n', ' ').strip()[:80]
+
+    args = {
+        'label': label,
+        'sdcli_path': sdcli_path,
+        'model_dir': model_dir,
+        'diffusion_model': diffusion_model,
+        'llm_model': llm_model,
+        'vae_file': vae_file,
+        'lora_file': lora_file,
+        'lora_strength': lora_strength,
+        'prompt': prompt,
+        'negative': negative,
+        'ref_images': ref_images,
+        'width': width,
+        'height': height,
+        'steps': steps,
+        'cfg_scale': cfg_scale,
+        'seed': seed,
+        'random_seed': random_seed,
+        'sampling_method': sampling_method,
+        'diffusion_fa': diffusion_fa,
+        'offload_to_cpu': offload_to_cpu,
+        'vae_tiling': vae_tiling,
+        'out_file': out_file,
+        'outfile': out_file,
+    }
+    input_path = ref_images[0] if ref_images else ''
+    return make_job_json('flux_klein_image_edit', input_path, out_dir, args, str(d['pending']), priority=500)
+def enqueue_firered_from_widget(inner):
+    """Enqueue a FireRed image edit job from the FireRed editor UI."""
+    import time as _time
+    from pathlib import Path as _P
+    try:
+        from helpers.queue_adapter import jobs_dirs
+    except Exception:
+        from queue_adapter import jobs_dirs
+    try:
+        from helpers.job_helper import make_job_json
+    except Exception:
+        from job_helper import make_job_json
+
+    d = jobs_dirs()
+
+    def _txt(name, default=''):
+        try:
+            obj = getattr(inner, name, None)
+            if obj is None:
+                return default
+            if hasattr(obj, 'text'):
+                return str(obj.text()).strip()
+            if hasattr(obj, 'toPlainText'):
+                return str(obj.toPlainText()).strip()
+            if hasattr(obj, 'currentText'):
+                return str(obj.currentText() or '').strip()
+        except Exception:
+            pass
+        return default
+
+    def _val(name, default=None):
+        try:
+            obj = getattr(inner, name, None)
+            if obj is None:
+                return default
+            if hasattr(obj, 'value'):
+                return obj.value()
+        except Exception:
+            pass
+        return default
+
+    def _checked(name, default=False):
+        try:
+            obj = getattr(inner, name, None)
+            if obj is None:
+                return default
+            if hasattr(obj, 'isChecked'):
+                return bool(obj.isChecked())
+        except Exception:
+            pass
+        return default
+
+    try:
+        images = list(getattr(inner, '_collect_images', lambda: [])() or [])
+    except Exception:
+        images = []
+    images = [str(x).strip() for x in images if str(x).strip()]
+
+    sdcli_path = _txt('sdcli_edit')
+    model_path = _txt('model_edit')
+    vae_path = _txt('vae_edit')
+    llm_path = _txt('llm_edit')
+    lora_path = _txt('lora_combo')
+
+    prompt = _txt('prompt_edit')
+    negative = _txt('negative_edit')
+    width = int(_val('width_spin', 1024) or 1024)
+    height = int(_val('height_spin', 1024) or 1024)
+    steps = int(_val('steps_spin', 8) or 8)
+    cfg_scale = int(_val('cfg_spin', 4) or 4)
+    strength = float(_val('strength_spin', 0.75) or 0.75)
+    seed = _txt('seed_edit', '-1') or '-1'
+    sampler = _txt('sampler_combo', 'euler') or 'euler'
+    batch = int(_val('batch_spin', 1) or 1)
+    output_dir = _txt('output_dir_edit')
+    prefix = _txt('prefix_edit', 'firered') or 'firered'
+    fmt = _txt('format_combo', 'png') or 'png'
+
+    offload_cpu = _checked('chk_offload_cpu', False)
+    flash_attn = _checked('chk_flash_attn', False)
+    vae_tiling = _checked('chk_vae_tiling', False)
+    verbose = _checked('chk_verbose', True)
+
+    if not prompt:
+        raise RuntimeError('Prompt is empty.')
+    if not images:
+        raise RuntimeError('Add at least one input image. FireRed is an image edit model.')
+    if not sdcli_path or not _P(sdcli_path).is_file():
+        raise RuntimeError('sd-cli not found: ' + str(sdcli_path))
+    if not model_path or not _P(model_path).is_file():
+        raise RuntimeError('FireRed GGUF not found: ' + str(model_path))
+    if not vae_path or not _P(vae_path).is_file():
+        raise RuntimeError('VAE not found: ' + str(vae_path))
+    if not llm_path or not _P(llm_path).is_file():
+        raise RuntimeError('LLM not found: ' + str(llm_path))
+    if lora_path and not _P(lora_path).is_file():
+        raise RuntimeError('LoRA not found: ' + str(lora_path))
+    for rp in images:
+        if not _P(rp).is_file():
+            raise RuntimeError('Input image not found: ' + rp)
+
+    if not output_dir:
+        output_dir = str(_P('.') / 'output' / 'edits' / 'firered')
+    _P(output_dir).mkdir(parents=True, exist_ok=True)
+
+    out_file = str(_P(output_dir) / f"{prefix}_{_time.strftime('%Y%m%d_%H%M%S')}.{fmt}")
+
+    label = 'FireRed image edit'
+    if prompt:
+        label = 'FireRed: ' + prompt.replace('\n', ' ').strip()[:80]
+
+    args = {
+        'label': label,
+        'sdcli_path': sdcli_path,
+        'model_path': model_path,
+        'vae_path': vae_path,
+        'llm_path': llm_path,
+        'lora_path': lora_path,
+        'prompt': prompt,
+        'negative': negative,
+        'images': images,
+        'width': width,
+        'height': height,
+        'steps': steps,
+        'cfg_scale': cfg_scale,
+        'strength': strength,
+        'seed': str(seed),
+        'sampler': sampler,
+        'batch': batch,
+        'offload_cpu': offload_cpu,
+        'flash_attn': flash_attn,
+        'vae_tiling': vae_tiling,
+        'verbose': verbose,
+        'out_file': out_file,
+        'outfile': out_file,
+    }
+    input_path = images[0] if images else ''
+    return make_job_json('firered_image_edit', input_path, output_dir, args, str(d['pending']), priority=500)
+
+
 def enqueue_qwen2511_from_widget(inner):
     """Enqueue a Qwen2511 (image edit) job from the Qwen2511Pane UI.
 

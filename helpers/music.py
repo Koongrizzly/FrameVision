@@ -12,11 +12,54 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional, List, Tuple
 
-from PySide6.QtCore import Qt, QTimer, QRect, QRectF, QSize, Signal, QObject, QEvent, QThread, QPropertyAnimation, QUrl
+from PySide6.QtCore import Qt, QTimer, QRect, QRectF, QSize, Signal, QObject, QEvent, QThread, QPropertyAnimation, QUrl, qInstallMessageHandler
 from PySide6.QtGui import QPixmap, QImage, QPainter, QColor, QFont, QKeySequence, QShortcut
 from PySide6.QtWidgets import (
     QCheckBox, QComboBox, QFileDialog, QGraphicsOpacityEffect, QHBoxLayout, QLabel, QListWidget, QListWidgetItem, QMenu, QMessageBox, QPushButton, QVBoxLayout, QWidget
 )
+
+
+
+# ---------------- Qt warning filter ----------------
+
+def _install_qt_warning_filter() -> None:
+    """Silence repeated non-fatal Qt paint/color warnings that can flood the console."""
+    try:
+        previous = qInstallMessageHandler(None)
+    except Exception:
+        previous = None
+
+    noisy_prefixes = (
+        "QPainter::begin: A paint device can only be painted by one painter at a time.",
+        "QPainter::translate: Painter not active",
+        "QColor::fromHsv: HSV parameters out of range",
+    )
+
+    def _handler(msg_type, context, message):
+        try:
+            msg = str(message or "")
+        except Exception:
+            msg = ""
+        if msg.startswith(noisy_prefixes):
+            return
+        if previous is not None:
+            try:
+                previous(msg_type, context, message)
+                return
+            except Exception:
+                pass
+        try:
+            sys.stderr.write(msg + "\n")
+        except Exception:
+            pass
+
+    try:
+        qInstallMessageHandler(_handler)
+    except Exception:
+        pass
+
+
+_install_qt_warning_filter()
 
 # Optional Qt multimedia probe
 try:
@@ -2543,6 +2586,37 @@ class MusicRuntime(QObject):
 
 
 
+    def _push_frame_to_videopane(self, base: QImage):
+        try:
+            if base is None or base.isNull():
+                return
+            try:
+                self.video.currentFrame = base.copy()
+            except Exception:
+                self.video.currentFrame = base
+            try:
+                self.video._mode = 'video'
+            except Exception:
+                pass
+            try:
+                if getattr(self.video, '_present_busy', False):
+                    return
+                if getattr(self.video, '_present_pending', False):
+                    return
+                self.video._present_pending = True
+            except Exception:
+                pass
+            try:
+                from PySide6.QtCore import QTimer
+                QTimer.singleShot(0, self.video._present_current_frame)
+            except Exception:
+                try:
+                    self.video._present_current_frame()
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
     def _draw_header_once(self):
         try:
             w = max(64, self.video.label.width())
@@ -2565,7 +2639,7 @@ class MusicRuntime(QObject):
                     p.drawText(QRect(160, 86, w - 180, 24), Qt.AlignLeft | Qt.AlignVCenter, self.meta.album)
             finally:
                 p.end()
-            self.video.label.setPixmap(QPixmap.fromImage(base))
+            self._push_frame_to_videopane(base)
         except Exception:
             pass
 
@@ -2576,27 +2650,31 @@ class MusicRuntime(QObject):
         base.fill(QColor(5, 5, 7, 255))
         p = QPainter(base)
         try:
-            pm = None
+            scaled_img = None
             if self.overlay is None or self.overlay.visuals_enabled():
-                pm = QPixmap.fromImage(img)
-                pm = pm.scaled(QSize(w, h), Qt.KeepAspectRatio, Qt.SmoothTransformation)
+                try:
+                    scaled_img = img.scaled(QSize(w, h), Qt.KeepAspectRatio, Qt.SmoothTransformation)
+                except Exception:
+                    scaled_img = img
                 # Crossfade blend if active
-                cx = (w - pm.width()) // 2
-                cy = (h - pm.height()) // 2
+                cx = (w - scaled_img.width()) // 2
+                cy = (h - scaled_img.height()) // 2
                 if getattr(self, "_xfade_active", False) and self._xfade_prev_img is not None and (self.overlay and self.overlay.visuals_enabled()):
                     try:
                         prog = max(0.0, min(1.0, (((_time.time() - float(self._xfade_t0)) * 1000.0) / max(1, int(self._xfade_ms)))))
                     except Exception:
                         prog = 1.0
-                    prev_pm = QPixmap.fromImage(self._xfade_prev_img)
-                    prev_pm = prev_pm.scaled(QSize(w, h), Qt.KeepAspectRatio, Qt.SmoothTransformation)
+                    try:
+                        prev_img = self._xfade_prev_img.scaled(QSize(w, h), Qt.KeepAspectRatio, Qt.SmoothTransformation)
+                    except Exception:
+                        prev_img = self._xfade_prev_img
                     p.save()
                     p.setOpacity(1.0 - prog)
-                    p.drawPixmap((w - prev_pm.width()) // 2, (h - prev_pm.height()) // 2, prev_pm)
+                    p.drawImage((w - prev_img.width()) // 2, (h - prev_img.height()) // 2, prev_img)
                     p.restore()
                     p.save()
                     p.setOpacity(prog)
-                    p.drawPixmap(cx, cy, pm)
+                    p.drawImage(cx, cy, scaled_img)
                     p.restore()
                     if prog >= 1.0:
                         self._xfade_active = False
@@ -2610,12 +2688,16 @@ class MusicRuntime(QObject):
                         except Exception:
                             pass
                 else:
-                    p.drawPixmap(cx, cy, pm)
+                    p.drawImage(cx, cy, scaled_img)
             if not getattr(self, '_ui_hidden', False):
                 p.fillRect(QRect(18, 18, min(520, int(w * 0.7)), 148), QColor(0, 0, 0, 150))
                 if self.cover and not self.cover.isNull():
-                    cpm = self.cover.scaled(QSize(110, 110), Qt.KeepAspectRatio, Qt.SmoothTransformation)
-                    p.drawPixmap(26, 26, cpm)
+                    try:
+                        cover_img = self.cover.toImage().scaled(QSize(110, 110), Qt.KeepAspectRatio, Qt.SmoothTransformation)
+                        p.drawImage(26, 26, cover_img)
+                    except Exception:
+                        cpm = self.cover.scaled(QSize(110, 110), Qt.KeepAspectRatio, Qt.SmoothTransformation)
+                        p.drawPixmap(26, 26, cpm)
                 p.setPen(QColor(255, 255, 255))
                 font = QFont()
                 font.setPointSize(14)
@@ -2631,7 +2713,7 @@ class MusicRuntime(QObject):
                     p.drawText(QRect(160, 86, w - 180, 24), Qt.AlignLeft | Qt.AlignVCenter, self.meta.album)
         finally:
             p.end()
-        self.video.label.setPixmap(QPixmap.fromImage(base))
+        self._push_frame_to_videopane(base)
         try:
             self._last_visual_img = img.copy()
         except Exception:

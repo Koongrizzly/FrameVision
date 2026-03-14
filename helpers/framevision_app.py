@@ -2467,6 +2467,21 @@ class VideoPane(QWidget):
             self._mode = 'video'
             self.label.setMovie(None)
             self._rebuild_player()
+            try:
+                # Audio tracks use the custom music visualizer path; keep Qt's video sink detached
+                # so the backend doesn't race the label presenter with cover/metadata/empty frames.
+                self.player.setVideoSink(None)
+            except Exception:
+                pass
+            try:
+                self.currentFrame = None
+            except Exception:
+                pass
+            try:
+                self._present_pending = False
+                self._present_busy = False
+            except Exception:
+                pass
             self.player.setSource(QUrl.fromLocalFile(str(p)))
             try:
                 self.player.play()

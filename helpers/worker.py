@@ -4012,6 +4012,261 @@ def qwen2511_image_edit(job, cfg, mani):
 
 
 
+
+
+def flux_klein_image_edit(job, cfg, mani):
+    """Run a Flux Klein GGUF image edit job via the queue using sd-cli."""
+    import os
+    import re
+    import time as _time
+    from pathlib import Path as _P
+
+    args = job.get('args', {}) or {}
+
+    try:
+        out_dir = job.get('out_dir') or str((ROOT / 'output' / 'edits' / 'flux_klein'))
+    except Exception:
+        out_dir = str(_P('.').resolve() / 'output' / 'edits' / 'flux_klein')
+    try:
+        _P(out_dir).mkdir(parents=True, exist_ok=True)
+    except Exception:
+        pass
+
+    def _rel_lora_name(lora_path: str, lora_model_dir: str) -> str:
+        if not lora_path:
+            return ''
+        lp = _P(lora_path)
+        try:
+            base = _P(lora_model_dir) if lora_model_dir else lp.parent
+            rel = lp.relative_to(base)
+        except Exception:
+            rel = _P(lp.name)
+        return rel.with_suffix('').as_posix().strip()
+
+    def _append_lora_tag(prompt: str, lora_name: str, strength: float) -> str:
+        if not lora_name:
+            return prompt
+        tag = f'<lora:{lora_name}:{strength:g}>'
+        if tag in (prompt or ''):
+            return prompt
+        if re.search(r'<\s*lora\s*:[^>]+>', prompt or '', flags=re.IGNORECASE):
+            return prompt
+        prompt = (prompt or '').rstrip()
+        return f'{prompt} {tag}'.strip()
+
+    sdcli_path = str(args.get('sdcli_path') or '').strip()
+    diffusion_model = str(args.get('diffusion_model') or '').strip()
+    llm_model = str(args.get('llm_model') or '').strip()
+    vae_file = str(args.get('vae_file') or '').strip()
+    lora_file = str(args.get('lora_file') or '').strip()
+
+    prompt = str(args.get('prompt') or '').strip()
+    negative = str(args.get('negative') or '').strip()
+    ref_images = args.get('ref_images') or []
+    if isinstance(ref_images, str):
+        ref_images = [ref_images]
+    ref_images = [str(x).strip() for x in ref_images if str(x).strip()]
+
+    width = int(args.get('width') or 1024)
+    height = int(args.get('height') or 1024)
+    steps = int(args.get('steps') or 4)
+    cfg_scale = float(args.get('cfg_scale') if args.get('cfg_scale') is not None else 1.0)
+    sampling_method = str(args.get('sampling_method') or 'euler').strip() or 'euler'
+    random_seed = bool(args.get('random_seed') if args.get('random_seed') is not None else True)
+    seed = -1 if random_seed else int(args.get('seed') if args.get('seed') is not None else 0)
+    diffusion_fa = bool(args.get('diffusion_fa') if args.get('diffusion_fa') is not None else True)
+    offload_to_cpu = bool(args.get('offload_to_cpu') or False)
+    vae_tiling = bool(args.get('vae_tiling') or False)
+
+    try:
+        lora_strength = float(args.get('lora_strength') if args.get('lora_strength') is not None else 1.0)
+    except Exception:
+        lora_strength = 1.0
+
+    out_file = str(args.get('out_file') or args.get('outfile') or '').strip()
+    if not out_file:
+        out_file = str(_P(out_dir) / f"klein_{_time.strftime('%Y%m%d_%H%M%S')}.png")
+
+    if not sdcli_path or not _P(sdcli_path).is_file():
+        _mark_error(job, 'Flux Klein: sd-cli missing or not found.')
+        return 2
+    if not diffusion_model or not _P(diffusion_model).is_file():
+        _mark_error(job, 'Flux Klein: diffusion model missing or not found.')
+        return 2
+    if not llm_model or not _P(llm_model).is_file():
+        _mark_error(job, 'Flux Klein: text encoder missing or not found.')
+        return 2
+    if not vae_file or not _P(vae_file).is_file():
+        _mark_error(job, 'Flux Klein: VAE missing or not found.')
+        return 2
+    if lora_file and not _P(lora_file).is_file():
+        _mark_error(job, 'Flux Klein: LoRA file not found.')
+        return 2
+    if not prompt:
+        _mark_error(job, 'Flux Klein: prompt is empty.')
+        return 2
+    for rp in ref_images:
+        if not _P(rp).is_file():
+            _mark_error(job, 'Flux Klein: reference image not found: ' + rp)
+            return 2
+
+    cmd = [sdcli_path]
+    cmd += ['--diffusion-model', diffusion_model]
+    cmd += ['--vae', vae_file]
+    cmd += ['--llm', llm_model]
+
+    prompt_for_cmd = prompt
+    if lora_file:
+        lora_dir = str(_P(lora_file).parent)
+        lora_name = _rel_lora_name(lora_file, lora_dir)
+        prompt_for_cmd = _append_lora_tag(prompt_for_cmd, lora_name, lora_strength)
+        cmd += ['--lora-model-dir', lora_dir]
+
+    cmd += ['-p', prompt_for_cmd]
+    if negative:
+        cmd += ['-n', negative]
+    for r in ref_images:
+        cmd += ['-r', r]
+    cmd += ['-W', str(width), '-H', str(height)]
+    cmd += ['--steps', str(steps)]
+    cmd += ['--cfg-scale', str(cfg_scale)]
+    cmd += ['--sampling-method', sampling_method]
+    cmd += ['-s', str(seed)]
+    if diffusion_fa:
+        cmd += ['--diffusion-fa']
+    if offload_to_cpu:
+        cmd += ['--offload-to-cpu']
+    if vae_tiling:
+        cmd += ['--vae-tiling']
+    cmd += ['-o', str(out_file)]
+    cmd += ['-v']
+
+    try:
+        label = args.get('label') or ('Flux Klein: ' + (prompt.replace('\n', ' ').strip()[:80] if prompt else 'image edit'))
+        args['label'] = label
+        args['cmd'] = cmd
+        args['cwd'] = str(_P(out_dir))
+        args['outfile'] = out_file
+        args['out_file'] = out_file
+        job['args'] = args
+        job['backend'] = 'flux_klein'
+        job['model'] = os.path.basename(diffusion_model) if diffusion_model else 'Flux Klein'
+    except Exception:
+        pass
+
+    return tools_ffmpeg(job, cfg, mani)
+def firered_image_edit(job, cfg, mani):
+    """Run a FireRed image edit job via the queue using sd-cli."""
+    import os
+    from pathlib import Path as _P
+
+    args = job.get('args', {}) or {}
+
+    try:
+        out_dir = job.get('out_dir') or str((ROOT / 'output' / 'edits' / 'firered'))
+    except Exception:
+        out_dir = str(_P('.').resolve() / 'output' / 'edits' / 'firered')
+    try:
+        _P(out_dir).mkdir(parents=True, exist_ok=True)
+    except Exception:
+        pass
+
+    sdcli_path = str(args.get('sdcli_path') or '').strip()
+    model_path = str(args.get('model_path') or '').strip()
+    vae_path = str(args.get('vae_path') or '').strip()
+    llm_path = str(args.get('llm_path') or '').strip()
+    lora_path = str(args.get('lora_path') or '').strip()
+    prompt = str(args.get('prompt') or '').strip()
+    negative = str(args.get('negative') or '').strip()
+    images = [str(x).strip() for x in (args.get('images') or []) if str(x).strip()]
+    width = int(args.get('width') or 1024)
+    height = int(args.get('height') or 1024)
+    steps = int(args.get('steps') or 8)
+    cfg_scale = int(args.get('cfg_scale') or 4)
+    strength = float(args.get('strength') or 0.75)
+    seed = str(args.get('seed') or '-1').strip() or '-1'
+    sampler = str(args.get('sampler') or 'euler').strip() or 'euler'
+    batch = int(args.get('batch') or 1)
+    offload_cpu = bool(args.get('offload_cpu'))
+    flash_attn = bool(args.get('flash_attn'))
+    vae_tiling = bool(args.get('vae_tiling'))
+    verbose = bool(args.get('verbose', True))
+    out_file = str(args.get('out_file') or args.get('outfile') or '').strip()
+
+    if not out_file:
+        out_file = str(_P(out_dir) / 'firered_output.png')
+
+    if not sdcli_path or not _P(sdcli_path).is_file():
+        _mark_error(job, 'FireRed: sd-cli missing or not found.')
+        return 2
+    if not model_path or not _P(model_path).is_file():
+        _mark_error(job, 'FireRed: diffusion model missing or not found.')
+        return 2
+    if not vae_path or not _P(vae_path).is_file():
+        _mark_error(job, 'FireRed: VAE missing or not found.')
+        return 2
+    if not llm_path or not _P(llm_path).is_file():
+        _mark_error(job, 'FireRed: LLM missing or not found.')
+        return 2
+    if lora_path and not _P(lora_path).is_file():
+        _mark_error(job, 'FireRed: LoRA file not found.')
+        return 2
+    if not prompt:
+        _mark_error(job, 'FireRed: prompt is empty.')
+        return 2
+    if not images:
+        _mark_error(job, 'FireRed: no input images were provided.')
+        return 2
+    for rp in images:
+        if not _P(rp).is_file():
+            _mark_error(job, 'FireRed: input image not found: ' + rp)
+            return 2
+
+    cmd = [sdcli_path]
+    cmd += ['--diffusion-model', model_path]
+    cmd += ['--vae', vae_path]
+    cmd += ['--llm', llm_path]
+    cmd += ['-p', prompt]
+    cmd += ['-W', str(width), '-H', str(height)]
+    cmd += ['--steps', str(steps)]
+    cmd += ['--cfg-scale', str(cfg_scale)]
+    cmd += ['--strength', str(strength)]
+    cmd += ['--sampling-method', sampler]
+    cmd += ['-s', seed]
+    cmd += ['-o', str(out_file)]
+    for r in images:
+        cmd += ['-r', r]
+    if lora_path:
+        cmd += ['--lora-model-dir', str(_P(lora_path).parent)]
+    if negative:
+        cmd += ['-n', negative]
+    if offload_cpu:
+        cmd += ['--offload-to-cpu']
+    if flash_attn:
+        cmd += ['--diffusion-fa']
+    if vae_tiling:
+        cmd += ['--vae-tiling']
+    if verbose:
+        cmd += ['-v']
+    if batch > 1:
+        cmd += ['-b', str(batch)]
+
+    try:
+        label = args.get('label') or ('FireRed: ' + (prompt.replace('\n', ' ').strip()[:80] if prompt else 'image edit'))
+        args['label'] = label
+        args['cmd'] = cmd
+        args['cwd'] = str(_P(sdcli_path).parent)
+        args['outfile'] = out_file
+        args['out_file'] = out_file
+        job['args'] = args
+        job['backend'] = 'firered'
+        job['model'] = os.path.basename(model_path) if model_path else 'FireRed'
+    except Exception:
+        pass
+
+    return tools_ffmpeg(job, cfg, mani)
+
+
 def heartmula_generate(job, cfg, mani):
     """Run a HeartMuLa music generation job via the queue.
 
@@ -4201,6 +4456,10 @@ def handle_job(jpath: Path):
             code = txt2img_generate(job, cfg, mani)
         elif t in ("qwen2511_image_edit","qwen2511_edit","qwen2511"):
             code = qwen2511_image_edit(job, cfg, mani)
+        elif t in ("flux_klein_image_edit","flux_klein_edit","flux_klein","klein_image_edit"):
+            code = flux_klein_image_edit(job, cfg, mani)
+        elif t in ("firered_image_edit","firered_edit","firered"):
+            code = firered_image_edit(job, cfg, mani)
         elif t in ("wan22_text2video","wan22_image2video","wan22_ti2v","wan22"):
             code = wan22_generate(job, cfg, mani)
         elif t in ("ace_step_15","ace_step15","ace15"):

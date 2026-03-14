@@ -28,6 +28,13 @@ from typing import Dict, List, Optional, Tuple
 from PySide6 import QtCore, QtWidgets
 from PySide6.QtGui import QImage, QTextCursor, QPixmap
 
+try:
+    from helpers.firered import FireRedPane
+except Exception:
+    try:
+        from firered import FireRedPane
+    except Exception:
+        FireRedPane = None
 
 
 class ClickableLabel(QtWidgets.QLabel):
@@ -1267,11 +1274,11 @@ class Qwen2511Pane(QtWidgets.QWidget):
         bw.addWidget(self.banner)
         outer.addWidget(banner_wrap, 0)
 
-        # Tabs (Qwen Edit + Flux Klein)
+        # Tabs (Qwen Edit + Flux Klein + FireRed 1.1)
         self.tabs = QtWidgets.QTabWidget(self)
         self.tabs.setDocumentMode(True)
         self.tabs.setMovable(False)
-        self.tabs.setToolTip("Switch between Qwen Edit 2511 and Flux Klein Edit.")
+        self.tabs.setToolTip("Switch between Qwen Edit 2511, Flux Klein Edit and FireRed 1.1.")
         self.tabs.currentChanged.connect(self._on_tab_changed)
         outer.addWidget(self.tabs, 1)
 
@@ -2006,6 +2013,32 @@ class Qwen2511Pane(QtWidgets.QWidget):
 
         self.tabs.addTab(flux_page, "Flux Klein")
 
+        if FireRedPane is not None:
+            try:
+                self.fire_red_pane = FireRedPane(self)
+                self.tabs.addTab(self.fire_red_pane, "Firered 1.1")
+            except Exception as exc:
+                self.fire_red_pane = None
+                fire_red_error = QtWidgets.QWidget(self)
+                fr_err_layout = QtWidgets.QVBoxLayout(fire_red_error)
+                fr_err_layout.setContentsMargins(12, 12, 12, 12)
+                fire_red_msg = QtWidgets.QLabel(f"Firered 1.1 could not be loaded.\n\n{exc}")
+                fire_red_msg.setWordWrap(True)
+                fire_red_msg.setTextInteractionFlags(QtCore.Qt.TextSelectableByMouse)
+                fr_err_layout.addWidget(fire_red_msg)
+                fr_err_layout.addStretch(1)
+                self.tabs.addTab(fire_red_error, "Firered 1.1")
+        else:
+            self.fire_red_pane = None
+            fire_red_missing = QtWidgets.QWidget(self)
+            fr_missing_layout = QtWidgets.QVBoxLayout(fire_red_missing)
+            fr_missing_layout.setContentsMargins(12, 12, 12, 12)
+            fire_red_msg = QtWidgets.QLabel("Firered 1.1 is unavailable because firered.py could not be imported.")
+            fire_red_msg.setWordWrap(True)
+            fr_missing_layout.addWidget(fire_red_msg)
+            fr_missing_layout.addStretch(1)
+            self.tabs.addTab(fire_red_missing, "Firered 1.1")
+
         # Ensure banner text matches the default selected tab.
         self._on_tab_changed(self.tabs.currentIndex())
 
@@ -2014,8 +2047,15 @@ class Qwen2511Pane(QtWidgets.QWidget):
         try:
             if not hasattr(self, "banner") or self.banner is None:
                 return
-            if idx == 1:
-                self.banner.setText("Flux Klein Edit")
+            tab_text = ""
+            try:
+                if hasattr(self, "tabs") and self.tabs is not None and 0 <= int(idx) < self.tabs.count():
+                    tab_text = str(self.tabs.tabText(int(idx))).strip()
+            except Exception:
+                tab_text = ""
+
+            if tab_text:
+                self.banner.setText(tab_text)
             else:
                 self.banner.setText("Qwen Edit 2511")
         except Exception:
