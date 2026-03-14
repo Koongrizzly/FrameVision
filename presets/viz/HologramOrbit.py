@@ -1,14 +1,14 @@
 import os, glob
 from math import sin, cos, pi
-from random import random, choice, shuffle
+from random import random, shuffle
 from PySide6.QtGui import (
-    QPainter, QPen, QColor, QBrush, QPixmap, QRadialGradient
+    QPainter, QPen, QColor, QBrush, QImage, QRadialGradient
 )
-from PySide6.QtCore import QPointF, QRectF, Qt
+from PySide6.QtCore import QPointF, Qt
 from helpers.music import register_visualizer, BaseVisualizer
 
 # persistent state
-_logo_pixmaps = []   # list[QPixmap]
+_logo_images = []   # list[QImage]
 _orbs = []           # list of dicts {angle,speed_base,pix_i,trail: list[(x,y,depth)]}
 _last_t = None
 _prev_spec = []
@@ -18,9 +18,9 @@ _env_hi = 0.0
 
 def _load_logos():
     """Load all logo_*.jpg/png/etc. once and cache them for this run."""
-    global _logo_pixmaps
-    if _logo_pixmaps:
-        return _logo_pixmaps
+    global _logo_images
+    if _logo_images:
+        return _logo_images
 
     base_dir = os.path.dirname(os.path.abspath(__file__))
     startup_dir = os.path.normpath(os.path.join(base_dir, "..", "startup"))
@@ -33,17 +33,15 @@ def _load_logos():
     for pat in patterns:
         files.extend(glob.glob(os.path.join(startup_dir, pat)))
 
-    # shuffle so each app start gives different ordering / assignment
     if files:
         shuffle(files)
 
     for pth in files:
-        pm = QPixmap(pth)
-        if not pm.isNull():
-            _logo_pixmaps.append(pm)
+        img = QImage(pth)
+        if not img.isNull():
+            _logo_images.append(img)
 
-    # fallback to older fixed names if nothing matched
-    if not _logo_pixmaps:
+    if not _logo_images:
         names = [
             "logo_1.jpg", "logo_1.png",
             "logo_2.jpg", "logo_2.png",
@@ -51,11 +49,11 @@ def _load_logos():
         for nm in names:
             pth = os.path.join(startup_dir, nm)
             if os.path.exists(pth):
-                pm = QPixmap(pth)
-                if not pm.isNull():
-                    _logo_pixmaps.append(pm)
+                img = QImage(pth)
+                if not img.isNull():
+                    _logo_images.append(img)
 
-    return _logo_pixmaps
+    return _logo_images
 
 def _init_orbs(count=10):
     """Create orbiters once. Each orb keeps its own trail."""
@@ -64,7 +62,6 @@ def _init_orbs(count=10):
         return
     logos = _load_logos()
     if not logos:
-        # create placeholder "ghost" orbs anyway, they won't draw images
         logos = [None]
     for i in range(count):
         _orbs.append({
@@ -123,25 +120,22 @@ class HologramOrbit(BaseVisualizer):
         dt = max(0.0, min(0.05, t - _last_t))
         _last_t = t
 
+        _init_orbs()
         logos = _load_logos()
-        _init_orbs(10)
 
         lo, mid, hi = _split(bands)
         fx = _flux(bands)
-
         _env_lo = _env_step(_env_lo, lo + 0.4 * rms, up=0.45, down=0.22)
         _env_mid = _env_step(_env_mid, mid + 0.4 * fx, up=0.4, down=0.20)
         _env_hi = _env_step(_env_hi, hi + 1.5 * fx, up=0.6, down=0.30)
 
         cx, cy = w * 0.5, h * 0.5
 
-        # background: dark radial glow
         bg_grad = QRadialGradient(QPointF(cx, cy), max(w, h) * 0.8)
         bg_grad.setColorAt(0.0, QColor(5, 8, 16))
         bg_grad.setColorAt(1.0, QColor(0, 0, 0))
         p.fillRect(r, QBrush(bg_grad))
 
-        # subtle HUD crosshair + orbit ring
         p.setRenderHint(QPainter.Antialiasing, True)
         hud_col = QColor(0, 200, 255, 40)
         p.setPen(QPen(hud_col, 1))
@@ -154,7 +148,6 @@ class HologramOrbit(BaseVisualizer):
         p.setPen(QPen(orbit_col, 1))
         p.drawEllipse(QPointF(cx, cy), R, R * 0.4)
 
-        # update orbs physics
         orbs_draw = []
         speed_scale = 0.5 + 2.0 * _env_mid
         for orb in _orbs:
@@ -163,7 +156,7 @@ class HologramOrbit(BaseVisualizer):
             ang = orb["angle"]
             ox = cx + cos(ang) * R
             oy = cy + sin(ang) * R * 0.4
-            depth = 0.5 + 0.5 * sin(ang)  # front when sin(ang) > 0
+            depth = 0.5 + 0.5 * sin(ang)
 
             orb["pos"] = (ox, oy)
             orb["depth"] = depth
@@ -175,7 +168,6 @@ class HologramOrbit(BaseVisualizer):
 
             orbs_draw.append(orb)
 
-        # sort so farther orbs draw first
         orbs_draw.sort(key=lambda o: o["depth"])
 
         hue = int((180 + 120 * _env_hi) % 360)
@@ -186,7 +178,6 @@ class HologramOrbit(BaseVisualizer):
             depth = orb["depth"]
             pix_i = orb["pix_i"]
 
-            # trail lines
             tr = orb["trail"]
             if len(tr) >= 2:
                 for idx in range(1, len(tr)):
@@ -200,21 +191,18 @@ class HologramOrbit(BaseVisualizer):
 
             if not logos or pix_i >= len(logos):
                 continue
-            pm = logos[pix_i]
-            if pm.isNull():
+            img = logos[pix_i]
+            if img is None or img.isNull():
                 continue
 
             base_size = min(w, h) * 0.18
             size_scale = (0.6 + 0.4 * depth) * (1.0 + 0.15 * _env_lo)
-            draw_w = int(pm.width() * (base_size / max(1, pm.height())) * size_scale)
-            draw_h = int(pm.height() * (base_size / max(1, pm.height())) * size_scale)
+            draw_w = int(img.width() * (base_size / max(1, img.height())) * size_scale)
+            draw_h = int(img.height() * (base_size / max(1, img.height())) * size_scale)
             if draw_w < 1 or draw_h < 1:
                 continue
-            scaled_pm = pm.scaled(draw_w, draw_h,
-                                  Qt.KeepAspectRatio,
-                                  Qt.SmoothTransformation)
+            scaled_img = img.scaled(draw_w, draw_h, Qt.KeepAspectRatio, Qt.SmoothTransformation)
 
-            # glow at orb position
             p.save()
             p.translate(ox, oy)
             glow_r = max(draw_w, draw_h) * 0.8
@@ -230,7 +218,5 @@ class HologramOrbit(BaseVisualizer):
                 opacity = 1.0
             p.setOpacity(opacity)
             p.setRenderHint(QPainter.SmoothPixmapTransform, True)
-            p.drawPixmap(-scaled_pm.width() / 2,
-                         -scaled_pm.height() / 2,
-                         scaled_pm)
+            p.drawImage(-scaled_img.width() / 2, -scaled_img.height() / 2, scaled_img)
             p.restore()

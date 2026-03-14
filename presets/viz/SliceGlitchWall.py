@@ -2,12 +2,12 @@ import os, glob
 from math import sin
 from random import random, choice
 from PySide6.QtGui import (
-    QPainter, QPen, QColor, QBrush, QPixmap
+    QPainter, QPen, QColor, QBrush, QImage
 )
 from PySide6.QtCore import QPointF, QRectF, Qt
 from helpers.music import register_visualizer, BaseVisualizer
 
-_logo_pix = None
+_logo_img = None
 _last_t = None
 _prev_spec = []
 _env_lo = 0.0
@@ -18,9 +18,9 @@ _sweep_y = None
 
 def _load_logo():
     """Load ONE random logo from presets/startup/ once per run."""
-    global _logo_pix
-    if _logo_pix is not None:
-        return _logo_pix
+    global _logo_img
+    if _logo_img is not None:
+        return _logo_img
 
     base_dir = os.path.dirname(os.path.abspath(__file__))
     startup_dir = os.path.normpath(os.path.join(base_dir, "..", "startup"))
@@ -36,20 +36,20 @@ def _load_logo():
 
     if candidates:
         pick = choice(candidates)
-        pm = QPixmap(pick)
+        pm = QImage(pick)
         if not pm.isNull():
-            _logo_pix = pm
-            return _logo_pix
+            _logo_img = pm
+            return _logo_img
 
     # fallback original logic
     for nm in ["logo_2.jpg", "logo_2.png", "logo_1.jpg", "logo_1.png"]:
         pth = os.path.join(startup_dir, nm)
         if os.path.exists(pth):
-            pm = QPixmap(pth)
+            pm = QImage(pth)
             if not pm.isNull():
-                _logo_pix = pm
+                _logo_img = pm
                 break
-    return _logo_pix
+    return _logo_img
 
 def _flux(bands):
     global _prev_spec
@@ -100,7 +100,7 @@ class SliceGlitchWall(BaseVisualizer):
         dt = max(0.0, min(0.05, t - _last_t))
         _last_t = t
 
-        logo_pm = _load_logo()
+        logo_img = _load_logo()
 
         lo, mid, hi = _split(bands)
         fx = _flux(bands)
@@ -138,11 +138,11 @@ class SliceGlitchWall(BaseVisualizer):
         p.translate(-cx, -cy)
 
         # draw 3x3 tiled logo wall with horizontal slice glitching
-        if logo_pm is not None and (not logo_pm.isNull()):
+        if logo_img is not None and (not logo_img.isNull()):
             tile_w = w / 3.0
             tile_h = h / 3.0
             # scale once for performance
-            scaled_pm = logo_pm.scaled(int(tile_w), int(tile_h),
+            scaled_img = logo_img.scaled(int(tile_w), int(tile_h),
                                        Qt.KeepAspectRatio,
                                        Qt.SmoothTransformation)
 
@@ -165,12 +165,12 @@ class SliceGlitchWall(BaseVisualizer):
                         p.save()
                         p.setClipRect(QRectF(dest_x, y0, tile_w, h0))
                         # draw one slice of the scaled logo at (dest_x+jitter,dest_y)
-                        p.drawPixmap(QRectF(dest_x + jitter, dest_y,
+                        p.drawImage(QRectF(dest_x + jitter, dest_y,
                                             tile_w, tile_h),
-                                     scaled_pm,
+                                     scaled_img,
                                      QRectF(0, 0,
-                                            scaled_pm.width(),
-                                            scaled_pm.height()))
+                                            scaled_img.width(),
+                                            scaled_img.height()))
                         p.restore()
 
         p.restore()  # end of CRT transform

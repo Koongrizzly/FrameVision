@@ -2,13 +2,13 @@ import os, glob
 from math import sin
 from random import random, choice
 from PySide6.QtGui import (
-    QPainter, QPen, QColor, QBrush, QPixmap, QRadialGradient
+    QPainter, QPen, QColor, QBrush, QImage, QRadialGradient
 )
 from PySide6.QtCore import QPointF, QRectF, Qt
 from helpers.music import register_visualizer, BaseVisualizer
 
 # persistent module-level state
-_logo_pix = None
+_logo_img = None
 _rings = []           # list of {"t0": float}
 _last_t = None
 _prev_spec = []
@@ -20,9 +20,9 @@ _shake_timer = 0.0
 
 def _load_logo():
     """Load ONE random logo from presets/startup/ once, cache it for this run."""
-    global _logo_pix
-    if _logo_pix is not None:
-        return _logo_pix
+    global _logo_img
+    if _logo_img is not None:
+        return _logo_img
 
     base_dir = os.path.dirname(os.path.abspath(__file__))
     startup_dir = os.path.normpath(os.path.join(base_dir, "..", "startup"))
@@ -38,20 +38,20 @@ def _load_logo():
 
     if candidates:
         pick = choice(candidates)
-        pm = QPixmap(pick)
+        pm = QImage(pick)
         if not pm.isNull():
-            _logo_pix = pm
-            return _logo_pix
+            _logo_img = pm
+            return _logo_img
 
     # fallback to older fixed names if no glob match
     for nm in ["logo_1.jpg", "logo_2.jpg", "logo_1.png", "logo_2.png"]:
         candidate = os.path.join(startup_dir, nm)
         if os.path.exists(candidate):
-            pm = QPixmap(candidate)
+            pm = QImage(candidate)
             if not pm.isNull():
-                _logo_pix = pm
+                _logo_img = pm
                 break
-    return _logo_pix
+    return _logo_img
 
 def _flux(bands):
     """Rough 'onset energy' measure = how much spectrum jumped up this frame."""
@@ -131,8 +131,8 @@ class BassLogoPulse(BaseVisualizer):
         p.fillRect(r, QBrush(QColor(5, 5, 8)))
 
         cx, cy = w * 0.5, h * 0.5
-        logo_pm = _load_logo()
-        if logo_pm is None or logo_pm.isNull():
+        logo_img = _load_logo()
+        if logo_img is None or logo_img.isNull():
             # fallback: simple pulsing circle
             rad = min(w, h) * (0.15 + 0.12 * _env_lo)
             glow_col = QColor.fromHsv(int((200 + 120 * _env_hi) % 360), 200, 255, 160)
@@ -148,14 +148,14 @@ class BassLogoPulse(BaseVisualizer):
         else:
             # how big the logo should be on screen
             base_h = min(w, h) * 0.30
-            scale_factor = base_h / max(1, logo_pm.height())
+            scale_factor = base_h / max(1, logo_img.height())
             scale_factor *= (1.0 + 0.20 * _env_lo)
 
-            draw_w = int(logo_pm.width() * scale_factor)
-            draw_h = int(logo_pm.height() * scale_factor)
+            draw_w = int(logo_img.width() * scale_factor)
+            draw_h = int(logo_img.height() * scale_factor)
             if draw_w < 1 or draw_h < 1:
                 return
-            scaled_logo = logo_pm.scaled(draw_w, draw_h,
+            scaled_logo_img = logo_img.scaled(draw_w, draw_h,
                                          Qt.KeepAspectRatio,
                                          Qt.SmoothTransformation)
 
@@ -178,9 +178,9 @@ class BassLogoPulse(BaseVisualizer):
             p.rotate(rot_angle)
             p.setRenderHint(QPainter.SmoothPixmapTransform, True)
             p.setOpacity(1.0)
-            p.drawPixmap(-scaled_logo.width() / 2,
-                         -scaled_logo.height() / 2,
-                         scaled_logo)
+            p.drawImage(-scaled_logo_img.width() / 2,
+                         -scaled_logo_img.height() / 2,
+                         scaled_logo_img)
             p.restore()
 
         # shockwave rings expanding from center on bass
