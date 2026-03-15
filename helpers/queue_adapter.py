@@ -1245,3 +1245,136 @@ def enqueue_ace_from_widget(inner) -> bool:
         except Exception:
             pass
         return False
+
+def enqueue_hiar_from_widget(inner) -> bool:
+    """Read fields from HiARPane and enqueue a queued HiAR video generation job."""
+    try:
+        from pathlib import Path as _P
+
+        def _txt(name, default=""):
+            try:
+                obj = getattr(inner, name)
+                if hasattr(obj, 'text'):
+                    return str(obj.text()).strip()
+            except Exception:
+                pass
+            return default
+
+        def _plain(name, default=""):
+            try:
+                obj = getattr(inner, name)
+                if hasattr(obj, 'toPlainText'):
+                    return str(obj.toPlainText()).strip()
+            except Exception:
+                pass
+            return default
+
+        def _val(name, default=0):
+            try:
+                obj = getattr(inner, name)
+                if hasattr(obj, 'value'):
+                    return obj.value()
+            except Exception:
+                pass
+            return default
+
+        def _checked(name, default=False):
+            try:
+                obj = getattr(inner, name)
+                if hasattr(obj, 'isChecked'):
+                    return bool(obj.isChecked())
+            except Exception:
+                pass
+            return bool(default)
+
+        def _current(name, default=""):
+            try:
+                obj = getattr(inner, name)
+                if hasattr(obj, 'currentText'):
+                    return str(obj.currentText()).strip()
+            except Exception:
+                pass
+            return default
+
+        repo_root = _txt('repo_root_edit')
+        python_path = _txt('python_edit')
+        config_path = _txt('config_edit')
+        checkpoint_path = _txt('checkpoint_edit')
+        prompt_file = _txt('prompt_file_edit')
+        extended_prompt_path = _txt('extended_prompt_edit')
+        output_dir = _txt('output_edit')
+        prompt_text = _plain('prompt_text')
+        negative_prompt = _plain('negative_prompt_box')
+
+        frames = int(_val('frames_spin', 66))
+        seed = int(_val('seed_spin', 0))
+        guidance = float(_val('guidance_spin', 3.0))
+        samples = int(_val('samples_spin', 1))
+        inference_method = _current('inference_method_combo', 'timestep_first') or 'timestep_first'
+        frame_first_blocks = int(_val('frame_first_blocks_spin', 1))
+        use_ema = _checked('use_ema_check', False)
+        save_with_index = _checked('save_with_index_check', True)
+        auto_open_output = _checked('auto_open_output_check', False)
+
+        if not output_dir:
+            try:
+                output_dir = str(getattr(inner, 'default_output_dir'))
+            except Exception:
+                output_dir = str(_P('.') / 'output' / 'hiar')
+        _P(output_dir).mkdir(parents=True, exist_ok=True)
+
+        if not prompt_text and not prompt_file:
+            raise RuntimeError('Provide prompt text or select a prompt file before queueing HiAR.')
+
+        label_source = prompt_text or ''
+        if not label_source and prompt_file:
+            try:
+                label_source = _P(prompt_file).read_text(encoding='utf-8', errors='replace')
+            except Exception:
+                label_source = _P(prompt_file).stem
+        label_source = ' '.join(str(label_source).split())
+        label = (label_source[:80] or 'HiAR video')
+
+        dummy_input = ''
+        if prompt_file and _P(prompt_file).exists():
+            dummy_input = prompt_file
+        else:
+            dummy = _P(output_dir) / 'hiar_prompt.txt'
+            try:
+                if prompt_text:
+                    dummy.write_text((prompt_text[:500] or 'HiAR prompt') + '\n', encoding='utf-8')
+                elif not dummy.exists():
+                    dummy.write_text('HiAR prompt\n', encoding='utf-8')
+                dummy_input = str(dummy)
+            except Exception:
+                dummy_input = ''
+
+        args = {
+            'label': label,
+            'repo_root': repo_root,
+            'python_path': python_path,
+            'config_path': config_path,
+            'checkpoint_path': checkpoint_path,
+            'prompt_file': prompt_file,
+            'prompt_text': prompt_text,
+            'extended_prompt_path': extended_prompt_path,
+            'output_folder': output_dir,
+            'num_output_frames': frames,
+            'seed': seed,
+            'guidance_scale': guidance,
+            'negative_prompt': negative_prompt,
+            'num_samples': samples,
+            'inference_method': inference_method,
+            'num_frame_first_blocks': frame_first_blocks,
+            'use_ema': use_ema,
+            'save_with_index': save_with_index,
+            'auto_open_output': auto_open_output,
+        }
+
+        return bool(enqueue_tool_job('hiar_generate', dummy_input, output_dir, args, priority=550))
+    except Exception as e:
+        try:
+            print('[queue] enqueue_hiar_from_widget failed:', e)
+        except Exception:
+            pass
+        return False

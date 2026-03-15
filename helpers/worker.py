@@ -4399,6 +4399,249 @@ def planner_lock(job: dict, cfg: dict, mani: dict):
     return 0
 
 
+
+
+def hiar_generate(job, cfg, mani):
+    """Run a queued HiAR (Wan 2.1 based) video generation job."""
+    import os
+    import re
+    import json as _json
+    import tempfile as _tempfile
+    import shutil as _shutil
+    import time as _time
+    from datetime import datetime as _dt
+    from pathlib import Path as _P
+
+    args = job.get('args', {}) or {}
+
+    repo_root = _P(str(args.get('repo_root') or '').strip())
+    python_path = _P(str(args.get('python_path') or '').strip())
+    config_path = _P(str(args.get('config_path') or '').strip())
+    checkpoint_path = _P(str(args.get('checkpoint_path') or '').strip())
+    output_folder = _P(str(args.get('output_folder') or (ROOT / 'output' / 'hiar')).strip())
+    prompt_file = str(args.get('prompt_file') or '').strip()
+    prompt_text = str(args.get('prompt_text') or '').strip()
+    extended_prompt_path = str(args.get('extended_prompt_path') or '').strip()
+    negative_prompt = str(args.get('negative_prompt') or '').strip()
+    guidance = float(args.get('guidance_scale') if args.get('guidance_scale') is not None else 3.0)
+    frames = int(args.get('num_output_frames') or 66)
+    seed = int(args.get('seed') or 0)
+    samples = int(args.get('num_samples') or 1)
+    inference_method = str(args.get('inference_method') or 'timestep_first').strip() or 'timestep_first'
+    frame_first_blocks = int(args.get('num_frame_first_blocks') or 1)
+    use_ema = bool(args.get('use_ema'))
+    save_with_index = bool(args.get('save_with_index', True))
+
+    if not repo_root.exists():
+        _mark_error(job, f'HiAR: repo root not found: {repo_root}')
+        return 2
+    if not (repo_root / 'inference.py').exists():
+        _mark_error(job, f'HiAR: inference.py not found in repo root: {repo_root}')
+        return 2
+    if not python_path.exists():
+        _mark_error(job, f'HiAR: Python exe not found: {python_path}')
+        return 2
+    if not config_path.exists():
+        _mark_error(job, f'HiAR: config not found: {config_path}')
+        return 2
+    if not checkpoint_path.exists():
+        _mark_error(job, f'HiAR: checkpoint not found: {checkpoint_path}')
+        return 2
+    if prompt_file and not _P(prompt_file).exists() and not prompt_text:
+        _mark_error(job, f'HiAR: prompt file not found: {prompt_file}')
+        return 2
+    if not prompt_text and not prompt_file:
+        _mark_error(job, 'HiAR: provide prompt text or prompt file.')
+        return 2
+
+    output_folder.mkdir(parents=True, exist_ok=True)
+    run_stamp = _dt.now().strftime('%Y%m%d_%H%M%S_%f')
+    run_temp_output_dir = output_folder / f'_hiar_run_{run_stamp}'
+    run_temp_output_dir.mkdir(parents=True, exist_ok=True)
+    existing_mp4s = {str(x.resolve()) for x in output_folder.glob('*.mp4')}
+
+    temp_paths = []
+
+    def _replace_yaml_scalar(text: str, key: str, value_literal: str) -> str:
+        pattern = rf'^(?P<indent>[ 	]*){re.escape(key)}\s*:\s*(?P<value>.*)$'
+        replacement = rf'\g<indent>{key}: {value_literal}'
+        new_text, count = re.subn(pattern, replacement, text, count=1, flags=re.MULTILINE)
+        if count == 0:
+            new_text = text.rstrip() + f'\n{key}: {value_literal}\n'
+        return new_text
+
+    def _format_yaml_float(value: float) -> str:
+        text = f'{value:.2f}'.rstrip('0').rstrip('.')
+        if '.' not in text:
+            text += '.0'
+        return text
+
+    def _prompt_words_for_filename(source: str, max_words: int = 5) -> str:
+        source = (source or '').replace('\r\n', ' ').replace('\n', ' ').replace('\r', ' ').strip().lower()
+        cleaned = []
+        for part in source.split():
+            word = ''.join(ch for ch in part if ch.isalnum())
+            if word:
+                cleaned.append(word)
+            if len(cleaned) >= max_words:
+                break
+        return '_'.join(cleaned) if cleaned else 'output'
+
+    try:
+        data_path = ''
+        if prompt_text:
+            fd, temp_prompt = _tempfile.mkstemp(prefix='hiar_prompts_', suffix='.txt', dir=str((BASE / 'temp').resolve()))
+            os.close(fd)
+            with open(temp_prompt, 'w', encoding='utf-8', newline='\n') as f:
+                txt = prompt_text.replace('\r\n', '\n').replace('\r', '\n')
+                f.write(txt)
+                if not txt.endswith('\n'):
+                    f.write('\n')
+            data_path = temp_prompt
+            temp_paths.append(temp_prompt)
+        else:
+            data_path = prompt_file
+
+        final_config_path = str(config_path)
+        custom_needed = (abs(guidance - 3.0) > 1e-9) or bool(negative_prompt)
+        if custom_needed:
+            temp_dir = (BASE / 'temp').resolve()
+            temp_dir.mkdir(parents=True, exist_ok=True)
+            fd, temp_cfg = _tempfile.mkstemp(prefix='hiar_config_', suffix='.yaml', dir=str(temp_dir))
+            os.close(fd)
+            original = config_path.read_text(encoding='utf-8')
+            updated = _replace_yaml_scalar(original, 'guidance_scale', _format_yaml_float(guidance))
+            if negative_prompt:
+                updated = _replace_yaml_scalar(updated, 'negative_prompt', _json.dumps(negative_prompt, ensure_ascii=False))
+            with open(temp_cfg, 'w', encoding='utf-8', newline='\n') as f:
+                f.write(updated)
+            final_config_path = temp_cfg
+            temp_paths.append(temp_cfg)
+
+        cmd = [
+            str(python_path), '-u', str(repo_root / 'inference.py'),
+            '--config_path', str(final_config_path),
+            '--checkpoint_path', str(checkpoint_path),
+            '--data_path', str(data_path),
+            '--output_folder', str(run_temp_output_dir),
+            '--num_output_frames', str(frames),
+            '--seed', str(seed),
+            '--num_samples', str(samples),
+            '--inference_method', inference_method,
+        ]
+        if extended_prompt_path:
+            cmd += ['--extended_prompt_path', extended_prompt_path]
+        if use_ema:
+            cmd.append('--use_ema')
+        if save_with_index:
+            cmd.append('--save_with_index')
+        if inference_method == 'hybrid_block0':
+            cmd += ['--num_frame_first_blocks', str(frame_first_blocks)]
+
+        env = os.environ.copy()
+        repo_root_str = str(repo_root)
+        fv_root_str = str(BASE)
+        env['PYTHONPATH'] = repo_root_str + (os.pathsep + env.get('PYTHONPATH', '') if env.get('PYTHONPATH') else '')
+        env['HF_HOME'] = str(BASE / 'models' / 'hiar' / 'hf_cache')
+        env['HUGGINGFACE_HUB_CACHE'] = str(BASE / 'models' / 'hiar' / 'hf_cache' / 'hub')
+        env['TRANSFORMERS_CACHE'] = str(BASE / 'models' / 'hiar' / 'hf_cache' / 'transformers')
+        env['TORCH_HOME'] = str(BASE / 'models' / 'hiar' / 'torch_cache')
+        env['XDG_CACHE_HOME'] = str(BASE / 'models' / 'hiar' / 'cache')
+        env['FRAMEVISION_ROOT'] = fv_root_str
+        env['PYTHONUNBUFFERED'] = '1'
+        env['PYTHONIOENCODING'] = 'utf-8'
+        env['USERNAME'] = env.get('USERNAME', 'FrameVision')
+        env['USER'] = env.get('USER', env.get('USERNAME', 'FrameVision'))
+        env['USERPROFILE'] = env.get('USERPROFILE', fv_root_str)
+        env['HOME'] = env.get('HOME', env.get('USERPROFILE', fv_root_str))
+        env['TEMP'] = env.get('TEMP', str(BASE / 'temp'))
+        env['TMP'] = env.get('TMP', env.get('TEMP', str(BASE / 'temp')))
+
+        try:
+            label = args.get('label') or ('HiAR: ' + _prompt_words_for_filename(prompt_text or prompt_file, max_words=8)[:80])
+            args['label'] = label
+            args['cmd'] = cmd
+            args['cwd'] = str(repo_root)
+            args['env'] = env
+            args['log_file'] = str(LOGS_DIR / f"hiar_{job.get('id','job')}_{_time.strftime('%Y%m%d_%H%M%S')}.log")
+            job['args'] = args
+            job['backend'] = 'hiar'
+            job['model'] = 'HiAR / Wan 2.1'
+        except Exception:
+            pass
+
+        code = tools_ffmpeg(job, cfg, mani)
+
+        new_files = []
+        try:
+            source_dir = run_temp_output_dir
+            if source_dir.exists():
+                new_files = list(source_dir.glob('*.mp4'))
+            if not new_files:
+                new_files = [x for x in output_folder.glob('*.mp4') if str(x.resolve()) not in existing_mp4s]
+        except Exception:
+            new_files = []
+
+        if code != 0 and not new_files:
+            return code
+
+        if not new_files:
+            _mark_error(job, 'HiAR: process finished but no new mp4 output was found.')
+            return 1
+
+        prompt_part = _prompt_words_for_filename(prompt_text or prompt_file)
+        stamp = _dt.now().strftime('%Y%m%d_%H%M%S')
+        prefix = f'hiar_{prompt_part}_{stamp}'
+        produced_files = []
+        new_files = sorted(new_files, key=lambda x: x.stat().st_mtime if x.exists() else 0)
+        for idx, src_path in enumerate(new_files, 1):
+            if len(new_files) == 1:
+                target_name = f'{prefix}.mp4'
+            else:
+                target_name = f'{prefix}_{idx:02d}.mp4'
+            target_path = output_folder / target_name
+            n = 2
+            while target_path.exists():
+                if len(new_files) == 1:
+                    target_path = output_folder / f'{prefix}_{n:02d}.mp4'
+                else:
+                    target_path = output_folder / f'{prefix}_{idx:02d}_{n:02d}.mp4'
+                n += 1
+            try:
+                if src_path.resolve() != target_path.resolve():
+                    src_path.replace(target_path)
+                produced_files.append(str(target_path))
+            except Exception:
+                try:
+                    _shutil.move(str(src_path), str(target_path))
+                    produced_files.append(str(target_path))
+                except Exception:
+                    produced_files.append(str(src_path))
+
+        try:
+            if produced_files:
+                job['files'] = produced_files
+                job['produced'] = produced_files[-1]
+                job.pop('error', None)
+                if code != 0:
+                    job['warning'] = f'HiAR exited with code {code} but output exists; marking job as done.'
+            code = 0
+        except Exception:
+            pass
+        return code
+    finally:
+        try:
+            for tp in temp_paths:
+                try:
+                    _P(tp).unlink(missing_ok=True)
+                except Exception:
+                    pass
+            if run_temp_output_dir.exists() and not any(run_temp_output_dir.iterdir()):
+                run_temp_output_dir.rmdir()
+        except Exception:
+            pass
+
+
 def handle_job(jpath: Path):
     job = json.loads(jpath.read_text(encoding="utf-8"))
     cfg = load_config(); mani = manifest()
@@ -4462,6 +4705,8 @@ def handle_job(jpath: Path):
             code = firered_image_edit(job, cfg, mani)
         elif t in ("wan22_text2video","wan22_image2video","wan22_ti2v","wan22"):
             code = wan22_generate(job, cfg, mani)
+        elif t in ("hiar_generate","hiar","wan21_hiar"):
+            code = hiar_generate(job, cfg, mani)
         elif t in ("ace_step_15","ace_step15","ace15"):
             code = ace15_generate(job, cfg, mani)
         elif t in ("ace_text2music","ace_audio2audio","ace","ace_step","ace_music"):

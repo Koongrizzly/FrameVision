@@ -5185,17 +5185,34 @@ def _video_model_key(label: str) -> str:
     # default (also for Auto / Qwen entries for now)
     return "hunyuan"
 
-def _resolve_generation_profile(video_model_label: str, gen_quality_label: str) -> Dict[str, Any]:
+def _planner_seedvr2_upscale_enabled(planner_upscale_settings: Optional[Dict[str, Any]] = None) -> bool:
+    obj = planner_upscale_settings if isinstance(planner_upscale_settings, dict) else {}
+    try:
+        return bool(obj.get("enabled", False)) and (str(obj.get("engine_key") or '').strip().lower() == "seedvr2")
+    except Exception:
+        return False
+
+
+def _resolve_generation_profile(video_model_label: str, gen_quality_label: str, planner_upscale_settings: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     mk = _video_model_key(video_model_label)
     gk = _normalize_key(gen_quality_label)
     if mk == "wan22":
         if gk not in _WAN22_PRESETS:
             gk = "low"
         return dict(_WAN22_PRESETS[gk])
-    # hunyuan default
+
+    # Hunyuan default
     if gk not in _HUNYUAN_PRESETS:
         gk = "medium"
-    return dict(_HUNYUAN_PRESETS[gk])
+    prof = dict(_HUNYUAN_PRESETS[gk])
+
+    # Planner SeedVR2 post-upscale path prefers 15fps generation for the lighter Hunyuan tiers,
+    # then restores smoothness after upscale with interpolation.
+    if _planner_seedvr2_upscale_enabled(planner_upscale_settings) and gk in ("low", "medium"):
+        prof["fps"] = 15
+
+    return prof
+
 
 def _planner_force_interp_for_high(video_model_label: str, gen_quality_label: str) -> bool:
     try:
@@ -5207,21 +5224,32 @@ def _planner_interp_profile(video_model_label: str, gen_quality_label: str, plan
     obj = planner_upscale_settings if isinstance(planner_upscale_settings, dict) else {}
     manual_enabled = bool(obj.get("interpolate_60fps_fast", False))
     force_high = _planner_force_interp_for_high(video_model_label, gen_quality_label)
+    seedvr2_auto = (_video_model_key(video_model_label) == "hunyuan") and _planner_seedvr2_upscale_enabled(obj)
 
-    prof = _resolve_generation_profile(video_model_label, gen_quality_label)
+    prof = _resolve_generation_profile(video_model_label, gen_quality_label, obj)
     try:
         fps_in = int((prof or {}).get("fps") or 20)
     except Exception:
         fps_in = 20
     fps_in = max(1, int(fps_in))
 
-    factor = 2 if force_high else 3
+    if seedvr2_auto:
+        # SeedVR2 path:
+        # - no manual interpolation toggle -> auto x2 after upscale (15fps -> 30fps)
+        # - manual interpolation toggle on  -> x4 after upscale (15fps -> 60fps)
+        factor = 4 if manual_enabled else 2
+        enabled = True
+    else:
+        factor = 2 if force_high else 3
+        enabled = bool(manual_enabled or force_high)
+
     fps_out = max(fps_in + 1, int(fps_in * factor))
 
     return {
-        "enabled": bool(manual_enabled or force_high),
+        "enabled": bool(enabled),
         "manual_enabled": bool(manual_enabled),
-        "forced_by_high": bool(force_high),
+        "forced_by_high": bool(force_high and (not seedvr2_auto)),
+        "forced_by_seedvr2": bool(seedvr2_auto),
         "factor": int(factor),
         "fps_in": int(fps_in),
         "fps_out": int(fps_out),
@@ -5324,6 +5352,193 @@ def _install_qt_message_filter() -> None:
                 pass
 
         qInstallMessageHandler(_handler)
+    except Exception:
+        pass
+
+
+def _planner_chain_sid_order(shots_path: str, manifest: Optional[Dict[str, Any]]) -> List[str]:
+    out: List[str] = []
+    seen: set = set()
+
+    def _add(v: Any) -> None:
+        s = str(v or '').strip()
+        if not s or s in seen:
+            return
+        seen.add(s)
+        out.append(s)
+
+    try:
+        for sh in (_load_shots_list(shots_path) if shots_path else []):
+            if isinstance(sh, dict):
+                _add(sh.get('id'))
+    except Exception:
+        pass
+
+    try:
+        items = ((manifest or {}).get('paths') or {}).get('images') or []
+        if isinstance(items, list):
+            for it in items:
+                if isinstance(it, dict):
+                    _add(it.get('id'))
+    except Exception:
+        pass
+
+    try:
+        items = ((manifest or {}).get('paths') or {}).get('clips') or []
+        if isinstance(items, list):
+            for it in items:
+                if isinstance(it, dict):
+                    _add(it.get('id'))
+    except Exception:
+        pass
+
+    return out
+
+
+def _planner_warn_chain_regen(parent: QWidget, sid: str) -> bool:
+    sid_s = str(sid or '').strip() or 'this shot'
+    try:
+        ans = QMessageBox.warning(
+            parent,
+            'Warning',
+            'Warning, changing something in this workflow will result in all clips that come later to be re-generated.\n\n'
+            f'Changed shot: {sid_s}\n'
+            'All later clips in the last frame-first frame chain will be removed and generated again.',
+            QMessageBox.Yes | QMessageBox.Cancel,
+            QMessageBox.Cancel,
+        )
+        return ans == QMessageBox.Yes
+    except Exception:
+        return True
+
+
+def _planner_invalidate_chain_from_sid(*, manifest_path: str, shots_path: str, images_dir: str, clips_dir: str, sid: str, include_selected_clip: bool) -> None:
+    sid_s = str(sid or '').strip()
+    if not sid_s:
+        return
+
+    manifest = _safe_read_json(manifest_path) if manifest_path else {}
+    manifest = manifest if isinstance(manifest, dict) else {}
+    order = _planner_chain_sid_order(shots_path, manifest)
+    if not order:
+        return
+    try:
+        start_idx = order.index(sid_s)
+    except ValueError:
+        return
+
+    clip_sids = order[start_idx if bool(include_selected_clip) else start_idx + 1:]
+    image_sids = order[start_idx + 1:]
+
+    paths = manifest.get('paths') if isinstance(manifest.get('paths'), dict) else {}
+    shot_map = manifest.get('shots') if isinstance(manifest.get('shots'), dict) else {}
+    clip_items = paths.get('clips') if isinstance(paths.get('clips'), list) else []
+    image_items = paths.get('images') if isinstance(paths.get('images'), list) else []
+    chain_map = paths.get('chain_frames') if isinstance(paths.get('chain_frames'), dict) else {}
+
+    # Delete stale clips from the selected shot onward (or later shots only when the selected clip was already recreated).
+    kept_clips = []
+    for it in clip_items:
+        if not isinstance(it, dict):
+            continue
+        cur_sid = str(it.get('id') or '').strip()
+        fp = str(it.get('file') or '').strip()
+        if cur_sid in clip_sids:
+            try:
+                if fp and os.path.isfile(fp):
+                    os.remove(fp)
+            except Exception:
+                pass
+            continue
+        kept_clips.append(it)
+    paths['clips'] = kept_clips
+
+    # Drop downstream chain-derived images so the next resume rebuilds them from the new clip chain.
+    kept_images = []
+    for it in image_items:
+        if not isinstance(it, dict):
+            continue
+        cur_sid = str(it.get('id') or '').strip()
+        fp = str(it.get('file') or '').strip()
+        chain_fp = str(it.get('chain_file') or '').strip()
+        if cur_sid in image_sids:
+            for p in (fp, chain_fp):
+                try:
+                    if p and os.path.isfile(p):
+                        os.remove(p)
+                except Exception:
+                    pass
+            continue
+        kept_images.append(it)
+    paths['images'] = kept_images
+
+    for cur_sid in image_sids:
+        try:
+            chain_fp = str(chain_map.get(cur_sid) or '').strip()
+            if chain_fp and os.path.isfile(chain_fp):
+                os.remove(chain_fp)
+        except Exception:
+            pass
+        try:
+            chain_map.pop(cur_sid, None)
+        except Exception:
+            pass
+
+        try:
+            rec = shot_map.get(cur_sid) if isinstance(shot_map.get(cur_sid), dict) else {}
+            if not isinstance(rec, dict):
+                rec = {}
+            for k in ('file', 'chain_file', 'clip_file', 'source_image_from_clip', 'ts_source_image_from_clip', 'clip_intent_fp'):
+                try:
+                    rec.pop(k, None)
+                except Exception:
+                    pass
+            rec['status'] = 'placeholder_waiting_for_prev_clip'
+            rec['placeholder_from_clip_chain'] = True
+            rec['placeholder'] = True
+            rec['is_placeholder'] = True
+            shot_map[cur_sid] = rec
+        except Exception:
+            pass
+
+        try:
+            prev_sid = order[order.index(cur_sid) - 1] if order.index(cur_sid) > 0 else ''
+        except Exception:
+            prev_sid = ''
+        try:
+            if images_dir and os.path.isdir(images_dir):
+                wait_path = os.path.join(images_dir, f'{cur_sid}.png')
+                _planner_write_wait_image(wait_path, cur_sid, source_sid=prev_sid)
+                kept_images.append({'id': cur_sid, 'file': wait_path, 'seed': None, 'placeholder': True, 'placeholder_from_clip_chain': True, 'is_placeholder': True})
+                rec = shot_map.get(cur_sid) if isinstance(shot_map.get(cur_sid), dict) else {}
+                if isinstance(rec, dict):
+                    rec['file'] = wait_path
+                    shot_map[cur_sid] = rec
+        except Exception:
+            pass
+
+    paths['chain_frames'] = chain_map
+    manifest['paths'] = paths
+    manifest['shots'] = shot_map
+
+    try:
+        if clips_dir:
+            cm = os.path.join(clips_dir, 'clips_manifest.json')
+            if os.path.exists(cm):
+                os.remove(cm)
+    except Exception:
+        pass
+
+    try:
+        final_dir = os.path.join(os.path.dirname(clips_dir), 'final') if clips_dir else ''
+        final_cut = os.path.join(final_dir, 'final_cut.mp4') if final_dir else ''
+        if final_cut and os.path.exists(final_cut):
+            os.remove(final_cut)
+    except Exception:
+        pass
+
+    try:
+        _safe_write_json(manifest_path, manifest)
     except Exception:
         pass
 
@@ -8220,14 +8435,15 @@ class PipelineWorker(QThread):
             qwen_prompts_used = os.path.join(story_dir, "qwen_prompts_used.txt")
             qwen_plan_err = os.path.join(errors_dir, "qwen_plan_error.txt")
 
-            # Resolve generation profile (proxy targets)
-            gen_profile = self.job.encoding.get("generation_profile")
-            if not isinstance(gen_profile, dict):
-                gen_profile = _resolve_generation_profile(
-                    self.job.encoding.get("video_model") or "",
-                    self.job.encoding.get("gen_quality_preset") or "",
-                )
-                self.job.encoding["generation_profile"] = gen_profile
+            # Resolve generation profile (proxy targets).
+            # Always recompute from the current encoding so old/stale saved jobs do not
+            # keep a pre-SeedVR2 20fps profile for Hunyuan low/medium.
+            gen_profile = _resolve_generation_profile(
+                self.job.encoding.get("video_model") or "",
+                self.job.encoding.get("gen_quality_preset") or "",
+                self.job.encoding.get("planner_upscale"),
+            )
+            self.job.encoding["generation_profile"] = gen_profile
 
             plan_fingerprint = _sha1_text(json.dumps({
                 "prompt": self.job.prompt,
@@ -12012,7 +12228,7 @@ class PipelineWorker(QThread):
                 }, sort_keys=True))
 
                 prior = _safe_read_json(clips_manifest_path) if os.path.exists(clips_manifest_path) else {}
-                if (not use_last_frame_chain) and isinstance(prior, dict) and prior.get("fingerprint") == clip_fingerprint:
+                if isinstance(prior, dict) and prior.get("fingerprint") == clip_fingerprint:
                     # Verify files exist
                     ok = True
                     lst = prior.get("clips") if isinstance(prior.get("clips"), list) else []
@@ -12214,7 +12430,7 @@ class PipelineWorker(QThread):
 
                     # Skip regeneration if an acceptable existing clip is present (supports manual deletes of specific shots).
                     try:
-                        if (not use_last_frame_chain) and os.path.isfile(out_file) and os.path.getsize(out_file) >= 1024:
+                        if os.path.isfile(out_file) and os.path.getsize(out_file) >= 1024:
                             _ex = existing_by_id.get(sid) if isinstance(existing_by_id, dict) else None
                             _ex_fp = str(_ex.get("intent_fp") or '') if isinstance(_ex, dict) else ""
                             _rec_fp = str(rec.get("clip_intent_fp") or '') if isinstance(rec, dict) else ""
@@ -12430,7 +12646,11 @@ class PipelineWorker(QThread):
                 use_last_frame_chain = _planner_last_frame_chain_enabled(getattr(self.job, "encoding", {}))
                 chain_frames_dir = os.path.join(self.out_dir, "chain_frames")
                 os.makedirs(chain_frames_dir, exist_ok=True)
-                prof = _resolve_generation_profile(self.job.encoding.get("video_model") or "", self.job.encoding.get("gen_quality_preset") or '')
+                prof = _resolve_generation_profile(
+                    self.job.encoding.get("video_model") or "",
+                    self.job.encoding.get("gen_quality_preset") or '',
+                    self.job.encoding.get("planner_upscale"),
+                )
 
                 # Select size string based on aspect (WAN uses explicit WxH strings)
                 aspect = str(self.job.encoding.get("aspect") or '')
@@ -12458,7 +12678,7 @@ class PipelineWorker(QThread):
 
                 # If clips_manifest exists and matches fingerprint, we can skip
                 try:
-                    if (not use_last_frame_chain) and os.path.exists(clips_manifest_path):
+                    if os.path.exists(clips_manifest_path):
                         cm = _safe_read_json(clips_manifest_path)
                         if isinstance(cm, dict) and str(cm.get("fingerprint") or '') == clip_fingerprint:
                             # Ensure clips list is also present in main manifest
@@ -12574,7 +12794,7 @@ class PipelineWorker(QThread):
                     }, sort_keys=True))
 
                     # Skip if output exists and intent matches previous
-                    if (not use_last_frame_chain) and os.path.isfile(out_file) and os.path.getsize(out_file) > 1024:
+                    if os.path.isfile(out_file) and os.path.getsize(out_file) > 1024:
                         prev = existing_intents.get(sid) or str(rec.get("clip_intent_fp") or '')
                         if prev and prev == intent_fp:
                             self.signals.log.emit(f"[wan22] {sid}: reusing existing clip (intent match)")
@@ -12727,6 +12947,38 @@ class PipelineWorker(QThread):
                     shots_path=shots_path,
                     images_dir=images_dir,
                 )
+
+            # In last-frame-first-frame mode, the clip reviewer can prune later clips after a recreate.
+            # Before assembly, rerun the clip stage once so the chain continues from the first missing clip
+            # instead of assuming the later clips are still present. Per-shot skip logic above keeps earlier clips.
+            try:
+                if _planner_last_frame_chain_enabled(getattr(self.job, "encoding", {})):
+                    _need_chain_clip_resume = False
+                    _shots_resume = _load_shots_list(shots_path)
+                    _manifest_resume = _safe_read_json(manifest_path) or {}
+                    _paths_resume = (_manifest_resume.get("paths") or {}) if isinstance(_manifest_resume, dict) else {}
+                    _clips_resume = _paths_resume.get("clips") if isinstance(_paths_resume.get("clips"), list) else []
+                    _clip_by_sid_resume = {}
+                    for _it in _clips_resume:
+                        if isinstance(_it, dict) and _it.get("id"):
+                            _clip_by_sid_resume[str(_it.get("id") or '').strip()] = str(_it.get("file") or '').strip()
+                    for _i_resume, _sh_resume in enumerate(_shots_resume, start=1):
+                        _sid_resume = str((_sh_resume or {}).get("id") or f"S{_i_resume:02d}").strip()
+                        _fp_resume = _clip_by_sid_resume.get(_sid_resume, '')
+                        if not _fp_resume or not os.path.isfile(_fp_resume) or os.path.getsize(_fp_resume) < 1024:
+                            _need_chain_clip_resume = True
+                            break
+                    if _need_chain_clip_resume:
+                        self.signals.log.emit("[CHAIN] Clip review removed later clips; resuming clip generation from the first missing shot before assembly")
+                        if mk == "wan22":
+                            _run("Video clips (WAN 2.2 resume)", step_video_clips_wan22, 95)
+                        elif mk == "hunyuan":
+                            _run("Video clips (HunyuanVideo 1.5 resume)", step_video_clips_hunyuan15, 95)
+            except Exception as _chain_resume_err:
+                try:
+                    self.signals.log.emit(f"[CHAIN] Resume-after-review check failed: {_chain_resume_err}")
+                except Exception:
+                    pass
 
             # Step G: Assemble final video (Chunk 6) — timeline → final_cut
             final_video = os.path.join(final_dir, f"{self.job.job_id}_final.mp4")
@@ -16987,6 +17239,7 @@ class PipelineWorker(QThread):
                     "fps_out": _interp_fps_out,
                     "factor": _interp_factor,
                     "forced_by_high": bool((_interp_cfg or {}).get("forced_by_high", False)),
+                    "forced_by_seedvr2": bool((_interp_cfg or {}).get("forced_by_seedvr2", False)),
                     "vb_kbps": 5000,
                 }
                 _interp_fp = _sha1_text(json.dumps(_interp_meta, sort_keys=True))
@@ -20286,36 +20539,6 @@ If the planner sees a marker like [02] or (02), it becomes the next image prompt
             QMessageBox.warning(self, "Cannot resume", f"Failed to read job.json:\n{e}")
             return
 
-        try:
-            enc = data.get("encoding") if isinstance(data, dict) else {}
-            last_frame_chain = _planner_last_frame_chain_enabled(enc if isinstance(enc, dict) else {})
-        except Exception:
-            last_frame_chain = False
-
-        if last_frame_chain:
-            ans = QMessageBox.question(
-                self,
-                "Restart required",
-                "Resume can not be used to review last frame-first frame workflows, click yes to restart the workflow completely or press cancel",
-                QMessageBox.Yes | QMessageBox.Cancel,
-                QMessageBox.Yes,
-            )
-            if ans != QMessageBox.Yes:
-                return
-            try:
-                output_base = os.path.dirname(str(job_dir).rstrip(os.sep)) or self._default_out_dir()
-                output_base = _abspath_from_root(output_base)
-                title = _auto_title_from_prompt(job.prompt)
-                slug = _slugify_title(title) or "job"
-                run_n = _next_slug_counter(output_base, slug)
-                new_out_dir = os.path.join(output_base, f"{slug}_{run_n:03d}")
-            except Exception:
-                title = _auto_title_from_prompt(job.prompt)
-                slug = _slugify_title(title) or "job"
-                new_out_dir = job_dir
-            self._run_job(job, new_out_dir, title=title, slug=slug, resume_note=f"Restarting full last-frame chain workflow from: {os.path.basename(job_dir)}")
-            return
-
         self._run_job(job, job_dir, resume_note=f"Resuming in-place: {os.path.basename(job_dir)}")
 
 
@@ -21649,7 +21872,7 @@ If the planner sees a marker like [02] or (02), it becomes the next image prompt
                     try:
                         vm = str(self.cmb_video_model.currentText() if hasattr(self, "cmb_video_model") else "")
                         gq = str(self.cmb_gen_quality.currentText() if hasattr(self, "cmb_gen_quality") else "")
-                        prof = _resolve_generation_profile(vm, gq) or {}
+                        prof = _resolve_generation_profile(vm, gq, self._current_upscale_payload()) or {}
                         min_sec_preview = float(prof.get("min_sec", min_sec_preview) or min_sec_preview)
                     except Exception:
                         pass
@@ -21684,7 +21907,7 @@ If the planner sees a marker like [02] or (02), it becomes the next image prompt
                 try:
                     vm = str(self.cmb_video_model.currentText() if hasattr(self, "cmb_video_model") else "")
                     gq = str(self.cmb_gen_quality.currentText() if hasattr(self, "cmb_gen_quality") else "")
-                    prof = _resolve_generation_profile(vm, gq) or {}
+                    prof = _resolve_generation_profile(vm, gq, self._current_upscale_payload()) or {}
                     min_sec_preview = float(prof.get("min_sec", min_sec_preview) or min_sec_preview)
                 except Exception:
                     pass
@@ -22827,18 +23050,23 @@ If the planner sees a marker like [02] or (02), it becomes the next image prompt
         except Exception:
             pass
 
-        # Resolve generation profile (proxy targets) now so fingerprints stay stable
-        try:
-            enc["generation_profile"] = _resolve_generation_profile(enc.get("video_model", ""), enc.get("gen_quality_preset", ""))
-        except Exception:
-            enc["generation_profile"] = {}
-
-
         # Chunk 9B1: Planner-only upscaling settings (saved per project folder; no execution)
         try:
             enc["planner_upscale"] = self._current_upscale_payload()
         except Exception:
             enc["planner_upscale"] = {"enabled": False}
+
+        # Resolve generation profile (proxy targets) now so fingerprints stay stable.
+        # Important: this must run AFTER planner_upscale is stored so SeedVR2 can
+        # lower Hunyuan low/medium from 20fps -> 15fps before the job starts.
+        try:
+            enc["generation_profile"] = _resolve_generation_profile(
+                enc.get("video_model", ""),
+                enc.get("gen_quality_preset", ""),
+                enc.get("planner_upscale"),
+            )
+        except Exception:
+            enc["generation_profile"] = {}
 
         # Chunk 4: reference strategy (stored in encoding for pipeline behavior)
         try:
@@ -24870,6 +25098,7 @@ class ImageReviewDialog(QDialog):
     def __init__(self, parent: QWidget, *, worker: "PipelineWorker", payload: Dict[str, Any]):
         super().__init__(parent)
         self.setWindowTitle("Image Review")
+        self._pending_chain_cascade_sid: str = ""
         self.setModal(True)
         self._worker = worker
         self._payload = dict(payload or {})
@@ -25164,6 +25393,14 @@ class ImageReviewDialog(QDialog):
             seed_override = None
 
         try:
+            if _planner_last_frame_chain_enabled(getattr(getattr(self, "_worker", None), "job", None).encoding if getattr(getattr(self, "_worker", None), "job", None) else {}):
+                if not _planner_warn_chain_regen(self, sid):
+                    self._regen_busy = False
+                    self._set_busy(False, "")
+                    return
+                self._pending_chain_cascade_sid = str(sid)
+            else:
+                self._pending_chain_cascade_sid = ""
             cmd = {"type": "regen", "sid": sid, "prompt": new_prompt}
             if seed_override is not None:
                 cmd["seed"] = int(seed_override)
@@ -25219,10 +25456,20 @@ class ImageReviewDialog(QDialog):
         except Exception:
             pass
 
-        # If this image was regenerated during a resume, the existing clip (if any)
-        # is now potentially stale. Offer to delete it so the workflow regenerates it.
+        # In last-frame chain mode, changing one image invalidates this clip and every later clip.
         try:
-            self._offer_clip_regen_for_image(str(sid))
+            if str(getattr(self, "_pending_chain_cascade_sid", "") or '').strip() == str(sid):
+                _planner_invalidate_chain_from_sid(
+                    manifest_path=str(getattr(self, "_manifest_path", "") or ''),
+                    shots_path=str(((getattr(self, "_payload", {}) or {}).get("shots_path") or '')),
+                    images_dir=str(getattr(self, "_images_dir", "") or ''),
+                    clips_dir=str(getattr(self, "_clips_dir", "") or ''),
+                    sid=str(sid),
+                    include_selected_clip=True,
+                )
+                self._pending_chain_cascade_sid = ""
+            else:
+                self._offer_clip_regen_for_image(str(sid))
         except Exception:
             pass
         self._set_busy(False, f"Done: {sid}")
@@ -25413,6 +25660,7 @@ class ClipReviewDialog(QDialog):
         self._payload = dict(payload or {})
         self._sent_terminal_cmd = False
         self._regen_busy: bool = False
+        self._pending_chain_cascade_sid: str = ""
 
         # Slightly larger default window so everything has breathing room
         self.resize(1180, 760)
@@ -25946,6 +26194,20 @@ class ClipReviewDialog(QDialog):
             except Exception:
                 pass
 
+        try:
+            if str(getattr(self, "_pending_chain_cascade_sid", "") or '').strip() == str(sid):
+                _planner_invalidate_chain_from_sid(
+                    manifest_path=str(getattr(self, "_manifest_path", "") or ''),
+                    shots_path=str(getattr(self, "_shots_path", "") or ''),
+                    images_dir=str(getattr(self, "_images_dir", "") or ''),
+                    clips_dir=str(getattr(self, "_clips_dir", "") or ''),
+                    sid=str(sid),
+                    include_selected_clip=False,
+                )
+                self._pending_chain_cascade_sid = ""
+        except Exception:
+            pass
+
         self._set_busy(False, f"Done: {sid} (recreated)")
 
     def on_regen_failed(self, sid: str, err: str) -> None:
@@ -26137,6 +26399,13 @@ def _clipreview_on_recreate(self) -> None:
         seed_override = None
 
     try:
+        if _planner_last_frame_chain_enabled(getattr(getattr(self, "_worker", None), "job", None).encoding if getattr(getattr(self, "_worker", None), "job", None) else {}):
+            if not _planner_warn_chain_regen(self, sid):
+                self._set_busy(False, "")
+                return
+            self._pending_chain_cascade_sid = str(sid)
+        else:
+            self._pending_chain_cascade_sid = ""
         cmd = {"type": "clip_regen", "sid": sid, "prompt": prompt}
         if seed_override is not None:
             cmd["seed"] = int(seed_override)

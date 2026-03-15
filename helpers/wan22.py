@@ -199,12 +199,15 @@ class Wan22Pane(QWidget):
         _hidden = _optional_hidden_ids()
         self._hide_wan22 = ("wan22" in _hidden)
         self._hide_hunyuan15 = ("hunyuan15" in _hidden)
-        self._all_engines_hidden = bool(self._hide_wan22 and self._hide_hunyuan15)
+        self._hide_hiar = ("hiar" in _hidden)
+        self._all_engines_hidden = bool(self._hide_wan22 and self._hide_hunyuan15 and self._hide_hiar)
 
         if not self._hide_wan22:
             self.cmb_engine.addItem("WAN 2.2", "wan22")
         if not self._hide_hunyuan15:
             self.cmb_engine.addItem("HunyuanVideo 1.5", "hunyuan15")
+        if not self._hide_hiar:
+            self.cmb_engine.addItem("HiAR", "hiar")
         if self.cmb_engine.count() == 0:
             # Keep UI stable even if both engines are hidden.
             self.cmb_engine.addItem("All engines hidden by user", "none")
@@ -831,6 +834,43 @@ class Wan22Pane(QWidget):
 
         try:
             self._engine_stack.addWidget(self._huny_page)
+        except Exception:
+            pass
+
+        # HiAR page (optional)
+        self._hiar_page = QWidget()
+        hiar_layout = QVBoxLayout(self._hiar_page)
+        hiar_layout.setContentsMargins(0, 0, 0, 0)
+        hiar_layout.setSpacing(0)
+        self._hiar_widget = None
+        if getattr(self, "_hide_hiar", False):
+            lbl = QLabel("HiAR is hidden by user.")
+            lbl.setWordWrap(True)
+            hiar_layout.addWidget(lbl)
+        else:
+            try:
+                try:
+                    from helpers.hiar import HiARPane  # type: ignore
+                except Exception:
+                    from hiar import HiARPane  # type: ignore
+                hiar_scroll = QScrollArea(self._hiar_page)
+                hiar_scroll.setWidgetResizable(True)
+                hiar_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+                hiar_scroll.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+                self._hiar_widget = HiARPane(parent=hiar_scroll)
+                hiar_scroll.setWidget(self._hiar_widget)
+                hiar_layout.addWidget(hiar_scroll, 1)
+                try:
+                    hiar_layout.addWidget(self._hiar_widget.build_footer_bar(), 0)
+                except Exception:
+                    pass
+            except Exception:
+                lbl = QLabel("HiAR UI not available (missing hiar.py).")
+                lbl.setWordWrap(True)
+                hiar_layout.addWidget(lbl)
+
+        try:
+            self._engine_stack.addWidget(self._hiar_page)
         except Exception:
             pass
 
@@ -1615,7 +1655,7 @@ class Wan22Pane(QWidget):
             key = "wan22"
 
         # If both engines are hidden, a placeholder item with data "none" is shown.
-        if key not in ("wan22", "hunyuan15"):
+        if key not in ("wan22", "hunyuan15", "hiar"):
             try:
                 if getattr(self, "_engine_stack", None) is not None:
                     self._engine_stack.setCurrentIndex(0)
@@ -1634,15 +1674,23 @@ class Wan22Pane(QWidget):
 
         try:
             if getattr(self, "_engine_stack", None) is not None:
-                self._engine_stack.setCurrentIndex(0 if key == "wan22" else 1)
+                if key == "wan22":
+                    idx = 0
+                elif key == "hunyuan15":
+                    idx = 1
+                else:
+                    idx = 2
+                self._engine_stack.setCurrentIndex(idx)
         except Exception:
             pass
 
         try:
             if key == "wan22":
                 self.banner.setText("Video Creation with Wan 2.2 5B")
-            else:
+            elif key == "hunyuan15":
                 self.banner.setText("Video Creation with HunyuanVideo 1.5")
+            else:
+                self.banner.setText("Long format txt2vid with HiAR & Wan 2.1 ")
         except Exception:
             pass
 
@@ -2211,6 +2259,11 @@ class Wan22Pane(QWidget):
                 cand = APP_ROOT / "output" / "video" / "hunyuan15"
                 if not cand.exists():
                     cand = APP_ROOT / "output" / "video"
+                folder = cand
+            elif "hiar" in key:
+                cand = APP_ROOT / "output" / "hiar"
+                if not cand.exists():
+                    cand = APP_ROOT / "output"
                 folder = cand
             else:
                 folder = self._wan_outputs_dir()

@@ -1278,7 +1278,7 @@ class Qwen2511Pane(QtWidgets.QWidget):
         self.tabs = QtWidgets.QTabWidget(self)
         self.tabs.setDocumentMode(True)
         self.tabs.setMovable(False)
-        self.tabs.setToolTip("Switch between Qwen Edit 2511, Flux Klein Edit and FireRed 1.1.")
+#Y        self.tabs.setToolTip("Switch between Qwen Edit 2511, Flux Klein Edit and FireRed 1.1.")
         self.tabs.currentChanged.connect(self._on_tab_changed)
         outer.addWidget(self.tabs, 1)
 
@@ -2054,10 +2054,12 @@ class Qwen2511Pane(QtWidgets.QWidget):
             except Exception:
                 tab_text = ""
 
-            if tab_text:
-                self.banner.setText(tab_text)
-            else:
-                self.banner.setText("Qwen Edit 2511")
+            banner_map = {
+                "Qwen Edit 2511": "Qwen Edit 2511 (gguf loader)",
+                "Flux Klein": "FLUX Klein 2 Create + Edit (4B & 9B gguf loader)",
+                "Firered 1.1": "Firered 1.1 edit (gguf loader)",
+            }
+            self.banner.setText(banner_map.get(tab_text, tab_text or "Qwen Edit 2511"))
         except Exception:
             pass
 
