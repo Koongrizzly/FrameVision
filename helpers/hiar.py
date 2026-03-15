@@ -184,7 +184,7 @@ class HiARPane(QWidget):
         self.samples_spin.setValue(1)
         self.inference_method_combo.setCurrentText("timestep_first")
         self.frame_first_blocks_spin.setValue(1)
-        self.use_ema_check.setChecked(False)
+        self.use_ema_check.setChecked(True)
         self.save_with_index_check.setChecked(True)
         self.auto_open_output_check.setChecked(False)
         self.prompt_text.setPlainText("")
@@ -258,7 +258,7 @@ class HiARPane(QWidget):
                 saved_method = "timestep_first"
             self.inference_method_combo.setCurrentText(saved_method)
             self.frame_first_blocks_spin.setValue(int(data.get("num_frame_first_blocks", self.frame_first_blocks_spin.value())))
-            self.use_ema_check.setChecked(bool(data.get("use_ema", self.use_ema_check.isChecked())))
+            self.use_ema_check.setChecked(True)
             self.save_with_index_check.setChecked(bool(data.get("save_with_index", self.save_with_index_check.isChecked())))
             self.auto_open_output_check.setChecked(bool(data.get("auto_open_output", self.auto_open_output_check.isChecked())))
             try:
@@ -292,7 +292,7 @@ class HiARPane(QWidget):
                 "num_samples": self.samples_spin.value(),
                 "inference_method": self.inference_method_combo.currentText(),
                 "num_frame_first_blocks": self.frame_first_blocks_spin.value(),
-                "use_ema": self.use_ema_check.isChecked(),
+                "use_ema": True,
                 "save_with_index": self.save_with_index_check.isChecked(),
                 "auto_open_output": self.auto_open_output_check.isChecked(),
                 "use_queue": self.use_queue_check.isChecked(),
@@ -401,6 +401,7 @@ class HiARPane(QWidget):
         self.frame_first_blocks_spin.setValue(1)
 
         self.use_ema_check = QCheckBox("Use EMA")
+        self.use_ema_check.setChecked(True)
         self.save_with_index_check = QCheckBox("Save with index")
         self.auto_open_output_check = QCheckBox("Open output folder when done")
 
@@ -413,9 +414,6 @@ class HiARPane(QWidget):
         )
         self.frame_first_blocks_spin.setToolTip(
             "Only used by hybrid methods. Controls how many early blocks use the frame-first strategy before switching."
-        )
-        self.use_ema_check.setToolTip(
-            "Uses the EMA checkpoint weights. This is usually the safer default for cleaner and more stable results."
         )
         self.save_with_index_check.setToolTip(
             "Adds an index to output filenames so repeated runs do not overwrite earlier results."
@@ -469,7 +467,6 @@ class HiARPane(QWidget):
         content_form.addRow(self._label_with_tip("Samples per prompt", "How many videos to generate for each prompt line. Higher values increase VRAM use and runtime very quickly. On a 24 GB card, keep this at 1 unless you really need multiple variations."), self.samples_spin)
         content_form.addRow(self._label_with_tip("Inference method", "Selects how HiAR handles long-video inference. Different methods trade speed, memory use, and temporal behavior."), self.inference_method_combo)
         content_form.addRow(self._label_with_tip("Hybrid frame-first blocks", "Only used by hybrid methods. Controls how many early blocks use the frame-first strategy before switching."), self.frame_first_blocks_spin)
-        content_form.addRow(self.use_ema_check)
         content_form.addRow(self.save_with_index_check)
         content_form.addRow(self.auto_open_output_check)
         return _CollapsibleSection("Advanced inference and output", content, expanded=False)
@@ -953,8 +950,7 @@ class HiARPane(QWidget):
 
         if extended_prompt_path:
             cmd.extend(["--extended_prompt_path", extended_prompt_path])
-        if self.use_ema_check.isChecked():
-            cmd.append("--use_ema")
+        cmd.append("--use_ema")
         if self.save_with_index_check.isChecked():
             cmd.append("--save_with_index")
         if self.inference_method_combo.currentText() == "hybrid_block0":
