@@ -13,6 +13,13 @@ Video Walktrough (most is speedup x2 to show much in less time), last update jan
 ---
 
 <details>
+<summary>March 15 2026 V2.3.2 small update brings Firered edit GGuf loader & Hiar Long format video generation with wan 2.1</summary>
+__________________________________________________________________________________
+
+
+</details>
+
+<details>
 <summary>March 09 2026 V2.3.1 small update brings Flux Klein 4b and 9b GGuf loader</summary>
 __________________________________________________________________________________
 
