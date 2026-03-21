@@ -987,6 +987,16 @@ class FireRedPane(QWidget):
         row = QHBoxLayout()
         row.setSpacing(8)
 
+        btn_col = QVBoxLayout()
+        btn_browse = QPushButton("Browse")
+        btn_preview = QPushButton("Preview")
+        btn_clear = QPushButton("Clear")
+        btn_col.addWidget(btn_browse)
+        btn_col.addWidget(btn_preview)
+        btn_col.addWidget(btn_clear)
+        btn_col.addStretch(1)
+        row.addLayout(btn_col)
+
         thumb_lbl = QLabel("No image")
         thumb_lbl.setAlignment(Qt.AlignCenter)
         thumb_lbl.setMinimumSize(72, 72)
@@ -1001,15 +1011,6 @@ class FireRedPane(QWidget):
         text_col.addStretch(1)
         row.addLayout(text_col, 1)
 
-        btn_col = QVBoxLayout()
-        btn_browse = QPushButton("Browse")
-        btn_preview = QPushButton("Preview")
-        btn_clear = QPushButton("Clear")
-        btn_col.addWidget(btn_browse)
-        btn_col.addWidget(btn_preview)
-        btn_col.addWidget(btn_clear)
-        btn_col.addStretch(1)
-        row.addLayout(btn_col)
         lay.addLayout(row)
 
         setattr(self, f"{slot_key}_image_thumb", thumb_lbl)
