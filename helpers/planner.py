@@ -635,6 +635,86 @@ def _planner_chain_frame_path(base_dir: str, sid: str) -> str:
     return os.path.join(base, "chain_frames", f"{shot_id}.png")
 
 
+def _planner_sid_aliases(sid: Any) -> List[str]:
+    """Return best-effort aliases for a shot id.
+
+    Helps resume/review flows when clip filenames use a legacy stem like
+    ``shot_003_S03.mp4`` while image records still use the logical shot id
+    ``S03``. The first item is always the original sid.
+    """
+    raw = str(sid or '').strip()
+    if not raw:
+        return []
+    out: List[str] = []
+
+    def _add(v: Any) -> None:
+        t = str(v or '').strip()
+        if t and t not in out:
+            out.append(t)
+
+    _add(raw)
+
+    # Common legacy clip stem: shot_003_S03 -> logical id S03
+    m = re.match(r'^shot_\d+_(.+)$', raw, flags=re.IGNORECASE)
+    if m:
+        _add(m.group(1))
+
+    parts = [p for p in raw.split('_') if p]
+    if len(parts) >= 2:
+        _add(parts[-1])
+        _add('_'.join(parts[-2:]))
+
+    # If the id is already a short code (S03 / 03), also try the other common form.
+    if re.fullmatch(r'[sS]\d{1,4}', raw):
+        try:
+            _n = int(re.sub(r'^[sS]', '', raw))
+            _add(f"shot_{_n:03d}_{raw.upper()}")
+        except Exception:
+            pass
+
+    return out
+
+
+def _planner_pick_existing_image_for_sid(*, sid: Any, shot_map: Any, image_records: Any, images_dir: str = "") -> str:
+    """Best-effort image resolver tolerant to legacy/alternate shot ids."""
+    aliases = _planner_sid_aliases(sid)
+    if not aliases:
+        return ""
+
+    sm = shot_map if isinstance(shot_map, dict) else {}
+    for key in aliases:
+        try:
+            rec = sm.get(key) if isinstance(sm.get(key), dict) else {}
+        except Exception:
+            rec = {}
+        if isinstance(rec, dict):
+            cand = str(rec.get('file') or '').strip()
+            if cand and os.path.isfile(cand):
+                return cand
+
+    if isinstance(image_records, list):
+        for key in aliases:
+            for it in image_records:
+                try:
+                    if isinstance(it, dict) and str(it.get('id') or '').strip() == key:
+                        cand = str(it.get('file') or '').strip()
+                        if cand and os.path.isfile(cand):
+                            return cand
+                except Exception:
+                    continue
+
+    idir = str(images_dir or '').strip()
+    if idir and os.path.isdir(idir):
+        exts = ('.png', '.jpg', '.jpeg', '.webp', '.bmp')
+        for key in aliases:
+            for ext in exts:
+                cand = os.path.join(idir, f"{key}{ext}")
+                if os.path.isfile(cand):
+                    return cand
+
+    return ""
+
+
 def _planner_extract_last_frame_to_image(video_path: str, out_path: str) -> bool:
     src = str(video_path or '').strip()
     dst = str(out_path or '').strip()
@@ -6294,21 +6374,16 @@ class PipelineWorker(QThread):
         if not isinstance(rec, dict):
             rec = {}
 
-        img_path = str(rec.get("file") or '').strip()
-        if not img_path:
-            try:
-                imgs = (manifest.get("paths") or {}).get("images") or []
-            except Exception:
-                imgs = []
-            if isinstance(imgs, list):
-                for it in imgs:
-                    if isinstance(it, dict) and str(it.get("id") or '') == sid and it.get("file"):
-                        img_path = str(it.get("file"))
-                        break
-        if not img_path and images_dir:
-            guess = os.path.join(images_dir, f"{sid}.png")
-            if os.path.isfile(guess):
-                img_path = guess
+        try:
+            imgs = (manifest.get("paths") or {}).get("images") or []
+        except Exception:
+            imgs = []
+        img_path = _planner_pick_existing_image_for_sid(
+            sid=sid,
+            shot_map=shot_map,
+            image_records=imgs if isinstance(imgs, list) else [],
+            images_dir=images_dir,
+        )
 
         if _planner_last_frame_chain_enabled(getattr(self.job, "encoding", {})) and shots_path:
             try:
@@ -12047,8 +12122,10 @@ class PipelineWorker(QThread):
 
 
 
-            # Review gate (Chunk 8A): optionally pause after images for interactive inspection/regeneration
-            if bool((self.job.encoding or {}).get("allow_edit_while_running")):
+            # Review gate after images:
+            # - normal interactive review when the setting is enabled
+            # - resume-only pre-review for partial/failed jobs when Resume asked for it
+            if bool((self.job.encoding or {}).get("allow_edit_while_running")) or bool((self.job.encoding or {}).get("planner_resume_review_existing")):
                 self._image_review_gate(
                     output_dir=self.out_dir,
                     manifest_path=manifest_path,
@@ -12950,6 +13027,31 @@ class PipelineWorker(QThread):
                 manifest.setdefault("settings", {})["video_engine"] = "wan22"
                 manifest["settings"]["video_profile"] = prof
                 _safe_write_json(manifest_path, manifest)
+
+            # Resume-only pre-review for partial/failed jobs:
+            # open the existing clip review BEFORE the planner regenerates missing clips.
+            if bool((self.job.encoding or {}).get("planner_resume_review_existing")):
+                try:
+                    _have_existing_clips = False
+                    _manifest_pre = _safe_read_json(manifest_path) or {}
+                    _paths_pre = (_manifest_pre.get("paths") or {}) if isinstance(_manifest_pre, dict) else {}
+                    _clips_pre = _paths_pre.get("clips") if isinstance(_paths_pre.get("clips"), list) else []
+                    for _it_pre in _clips_pre:
+                        if isinstance(_it_pre, dict):
+                            _fp_pre = str(_it_pre.get("file") or '').strip()
+                            if _fp_pre and os.path.isfile(_fp_pre) and os.path.getsize(_fp_pre) >= 1024:
+                                _have_existing_clips = True
+                                break
+                except Exception:
+                    _have_existing_clips = False
+                if _have_existing_clips:
+                    self._clip_review_gate(
+                        output_dir=self.out_dir,
+                        manifest_path=manifest_path,
+                        clips_dir=clips_dir,
+                        shots_path=shots_path,
+                        images_dir=images_dir,
+                    )
 
             # Run or skip based on selected video model
             mk = _video_model_key(self.job.encoding.get("video_model") or '')
@@ -20338,7 +20440,39 @@ If the planner sees a marker like [02] or (02), it becomes the next image prompt
         self.results_view.setSelectionBehavior(QAbstractItemView.SelectRows)
         self.results_view.setSelectionMode(QAbstractItemView.SingleSelection)
         self.results_view.setEditTriggers(QAbstractItemView.NoEditTriggers)
-        self.results_view.setAlternatingRowColors(True)
+        self.results_view.setAlternatingRowColors(False)
+        try:
+            self.results_view.setStyleSheet("""
+                QTableView {
+                    background-color: #1b1f27;
+                    alternate-background-color: #1b1f27;
+                    color: #f2f4f8;
+                    gridline-color: #2d3440;
+                    selection-background-color: #2f6feb;
+                    selection-color: #ffffff;
+                    border: 1px solid #2d3440;
+                }
+                QTableView::item {
+                    background-color: #1b1f27;
+                    color: #f2f4f8;
+                    padding: 4px;
+                }
+                QTableView::item:selected {
+                    background-color: #2f6feb;
+                    color: #ffffff;
+                }
+                QHeaderView::section {
+                    background-color: #232a35;
+                    color: #f2f4f8;
+                    padding: 6px;
+                    border: 0px;
+                    border-right: 1px solid #2d3440;
+                    border-bottom: 1px solid #2d3440;
+                    font-weight: 600;
+                }
+            """)
+        except Exception:
+            pass
 
         self.results_model = QStandardItemModel(0, 4, self.results_view)
         self.results_model.setHorizontalHeaderLabels(["Title", "Assets", "Status", "Updated"])
@@ -20545,6 +20679,7 @@ If the planner sees a marker like [02] or (02), it becomes the next image prompt
         paths = self._get_selected_result_paths()
         job_dir = paths.get("job_dir", "")
         job_json = paths.get("job_json", "")
+        manifest_path = paths.get("manifest", "")
         if not job_dir:
             return
         if not os.path.exists(job_json):
@@ -20561,10 +20696,49 @@ If the planner sees a marker like [02] or (02), it becomes the next image prompt
             QMessageBox.warning(self, "Cannot resume", f"Failed to read job.json:\n{e}")
             return
 
+        # Done jobs keep the existing behavior.
+        # Partial / failed jobs can optionally open the existing image + clip review popups first.
+        try:
+            manifest = _safe_read_json(manifest_path) or {} if (manifest_path and os.path.exists(manifest_path)) else {}
+        except Exception:
+            manifest = {}
+        try:
+            status = str(self._derive_job_status(str(job_dir), manifest) or '').strip().lower()
+        except Exception:
+            status = ""
+
+        try:
+            enc = dict(getattr(job, "encoding", {}) or {})
+        except Exception:
+            enc = {}
+        enc.pop("planner_resume_review_existing", None)
+
+        if status in ("partial", "failed"):
+            try:
+                msg = (
+                    "This job is partial or failed.\n\n"
+                    "Do you want to open the review popups first?\n\n"
+                    "Yes = review existing images first, then existing clips, before resume continues.\n"
+                    "No = resume normally.\n"
+                    "Cancel = do nothing."
+                )
+                ans = QMessageBox.question(
+                    self,
+                    "Resume job",
+                    msg,
+                    QMessageBox.Yes | QMessageBox.No | QMessageBox.Cancel,
+                    QMessageBox.Yes,
+                )
+                if ans == QMessageBox.Cancel:
+                    return
+                if ans == QMessageBox.Yes:
+                    enc["planner_resume_review_existing"] = True
+            except Exception:
+                pass
+
+        job.encoding = enc
         self._run_job(job, job_dir, resume_note=f"Resuming in-place: {os.path.basename(job_dir)}")
 
-
-    @Slot()
     def _res_remove_folder(self) -> None:
         paths = self._get_selected_result_paths()
         job_dir = str(paths.get("job_dir") or '')
@@ -20968,6 +21142,25 @@ If the planner sees a marker like [02] or (02), it becomes the next image prompt
             it_assets = QStandardItem("")  # painted by delegate
             it_status = QStandardItem(status)
             it_updated = QStandardItem(updated)
+
+            try:
+                base_fg = QBrush(QColor("#f2f4f8"))
+                for _it in (it_title, it_status, it_updated):
+                    _it.setForeground(base_fg)
+                    _it.setBackground(QBrush(QColor("#1b1f27")))
+            except Exception:
+                pass
+
+            try:
+                st_l = status.strip().lower()
+                if st_l == "done":
+                    it_status.setForeground(QBrush(QColor("#7ee787")))
+                elif st_l == "failed":
+                    it_status.setForeground(QBrush(QColor("#ffb3b8")))
+                elif st_l == "partial":
+                    it_status.setForeground(QBrush(QColor("#f2cc60")))
+            except Exception:
+                pass
 
             # Store job_dir on the title item for actions
             it_title.setData(str(r.get("job_dir") or ''), Qt.UserRole)
@@ -25522,13 +25715,14 @@ class ImageReviewDialog(QDialog):
         # 2) conventional <clips_dir>/<sid>.mp4
         try:
             if self._clips_dir and os.path.isdir(self._clips_dir):
-                cand = os.path.join(self._clips_dir, f"{sid}.mp4")
-                if os.path.isfile(cand):
-                    return cand
-                # 3) legacy naming: shot_###_<sid>.mp4
-                cands = sorted([str(p) for p in Path(self._clips_dir).glob(f"*_{sid}.mp4") if p.is_file()])
-                if cands:
-                    return cands[-1]
+                for key in _planner_sid_aliases(sid):
+                    cand = os.path.join(self._clips_dir, f"{key}.mp4")
+                    if os.path.isfile(cand):
+                        return cand
+                for key in _planner_sid_aliases(sid):
+                    cands = sorted([str(p) for p in Path(self._clips_dir).glob(f"*_{key}.mp4") if p.is_file()])
+                    if cands:
+                        return cands[-1]
         except Exception:
             pass
         return ""
@@ -25926,7 +26120,10 @@ class ClipReviewDialog(QDialog):
         if not out and self._clips_dir and os.path.isdir(self._clips_dir):
             try:
                 for p in sorted(Path(self._clips_dir).glob("*.mp4")):
-                    out.append({"id": p.stem, "file": str(p)})
+                    stem = str(p.stem or '').strip()
+                    aliases = _planner_sid_aliases(stem)
+                    logical_sid = aliases[1] if len(aliases) > 1 else stem
+                    out.append({"id": logical_sid, "file": str(p)})
             except Exception:
                 pass
 
@@ -26033,7 +26230,13 @@ class ClipReviewDialog(QDialog):
             try:
                 manifest = self._read_manifest()
                 shots = manifest.get("shots") if isinstance(manifest.get("shots"), dict) else {}
-                rec = shots.get(sid) if isinstance(shots, dict) else {}
+                rec = {}
+                if isinstance(shots, dict):
+                    for key in _planner_sid_aliases(sid):
+                        _rec = shots.get(key) if isinstance(shots.get(key), dict) else {}
+                        if isinstance(_rec, dict) and _rec:
+                            rec = _rec
+                            break
                 if isinstance(rec, dict):
                     prompt = str(rec.get("i2v_prompt") or '').strip()
             except Exception:
@@ -26222,14 +26425,56 @@ class ClipReviewDialog(QDialog):
 
         try:
             if str(getattr(self, "_pending_chain_cascade_sid", "") or '').strip() == str(sid):
+                _manifest_path = str(getattr(self, "_manifest_path", "") or '')
+                _shots_path = str(getattr(self, "_shots_path", "") or '')
+                _images_dir = str(getattr(self, "_images_dir", "") or '')
+                _clips_dir = str(getattr(self, "_clips_dir", "") or '')
+
+                # In last-frame chain mode, deleting downstream state after a recreated clip
+                # must NOT throw away the freshly-derived next start image from the new clip.
                 _planner_invalidate_chain_from_sid(
-                    manifest_path=str(getattr(self, "_manifest_path", "") or ''),
-                    shots_path=str(getattr(self, "_shots_path", "") or ''),
-                    images_dir=str(getattr(self, "_images_dir", "") or ''),
-                    clips_dir=str(getattr(self, "_clips_dir", "") or ''),
+                    manifest_path=_manifest_path,
+                    shots_path=_shots_path,
+                    images_dir=_images_dir,
+                    clips_dir=_clips_dir,
                     sid=str(sid),
                     include_selected_clip=False,
                 )
+
+                try:
+                    _shots_all = _load_shots_list(_shots_path) or []
+                except Exception:
+                    _shots_all = []
+                _next_sid = ""
+                try:
+                    for _idx, _sh in enumerate(_shots_all):
+                        if isinstance(_sh, dict) and str(_sh.get("id") or '').strip() == str(sid):
+                            if (_idx + 1) < len(_shots_all):
+                                _next_sid = str((_shots_all[_idx + 1] or {}).get("id") or '').strip()
+                            break
+                except Exception:
+                    _next_sid = ""
+
+                if _next_sid and path and os.path.isfile(path):
+                    try:
+                        _manifest = _safe_read_json(_manifest_path) or {}
+                        _shot_map = _manifest.get("shots") if isinstance(_manifest.get("shots"), dict) else {}
+                        _image_records = list(((_manifest.get("paths") or {}).get("images") or []))
+                        _planner_overwrite_next_image_from_clip(
+                            current_sid=str(sid),
+                            next_sid=_next_sid,
+                            clip_path=str(path),
+                            images_dir=_images_dir,
+                            shot_map=_shot_map,
+                            image_records=_image_records,
+                            manifest=_manifest,
+                            manifest_path=_manifest_path,
+                            target_path=_planner_chain_frame_path(os.path.join(str(getattr(getattr(self, "_worker", None), "out_dir", "") or ''), "chain_frames"), _next_sid),
+                            mirror_to_images_dir=True,
+                        )
+                    except Exception:
+                        pass
+
                 self._pending_chain_cascade_sid = ""
         except Exception:
             pass
