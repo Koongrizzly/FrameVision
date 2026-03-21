@@ -9306,9 +9306,24 @@ class PipelineWorker(QThread):
                 _safe_write_json(manifest_path, manifest)
 
             shots_prev = (manifest.get("steps") or {}).get("Shots (seeded shot list)") or {}
+            _resume_run = bool((self.job.encoding or {}).get("planner_resume_run"))
+            _resume_shots: List[Dict[str, Any]] = []
+            if _resume_run and _file_ok(shots_path, 10):
+                try:
+                    _resume_shots = _load_shots_list(shots_path)
+                except Exception:
+                    _resume_shots = []
 
+            # Resume button should trust an existing valid seeded shot list and avoid recomputing it.
+            if _resume_run and _resume_shots:
+                manifest["paths"]["shots_json"] = shots_path
+                if _file_ok(shots_raw_path, 1):
+                    manifest["paths"]["shots_raw_txt"] = shots_raw_path
+                manifest["settings"]["n_shots"] = len(_resume_shots)
+                _skip("Shots (seeded shot list)", "resume reused existing shots.json")
+                _set_step("Shots (seeded shot list)", "done", "Resume: reused existing shots.json")
             # Shots depend on plan: if plan changed, always regenerate shots
-            if not plan_changed and _file_ok(shots_path, 10) and shots_prev.get("fingerprint") == shots_fingerprint and shots_prev.get("status") == "done":
+            elif not plan_changed and _file_ok(shots_path, 10) and shots_prev.get("fingerprint") == shots_fingerprint and shots_prev.get("status") == "done":
                 _skip("Shots (seeded shot list)", "shots.json up-to-date (fingerprint match)")
             else:
                 if plan_changed and _file_ok(shots_path, 10):
@@ -12431,6 +12446,8 @@ class PipelineWorker(QThread):
                     # Skip regeneration if an acceptable existing clip is present (supports manual deletes of specific shots).
                     try:
                         if os.path.isfile(out_file) and os.path.getsize(out_file) >= 1024:
+                            _resume_run = bool((self.job.encoding or {}).get("planner_resume_run"))
+                            _normal_resume_file_reuse = bool(_resume_run and (not use_last_frame_chain))
                             _ex = existing_by_id.get(sid) if isinstance(existing_by_id, dict) else None
                             _ex_fp = str(_ex.get("intent_fp") or '') if isinstance(_ex, dict) else ""
                             _rec_fp = str(rec.get("clip_intent_fp") or '') if isinstance(rec, dict) else ""
@@ -12444,7 +12461,9 @@ class PipelineWorker(QThread):
                                 _img_mtime = 0.0
 
                             _up_to_date = False
-                            if intent_fp and ((_ex_fp and _ex_fp == intent_fp) or (_rec_fp and _rec_fp == intent_fp)):
+                            if _normal_resume_file_reuse:
+                                _up_to_date = True
+                            elif intent_fp and ((_ex_fp and _ex_fp == intent_fp) or (_rec_fp and _rec_fp == intent_fp)):
                                 _up_to_date = True
                             elif (not _ex_fp and not _rec_fp) and (_clip_mtime > 0.0):
                                 _up_to_date = (_clip_mtime >= max(_img_mtime, prompts_mtime, shots_mtime))
@@ -12452,7 +12471,10 @@ class PipelineWorker(QThread):
 
                             if _up_to_date:
                                 self.signals.stage.emit(f"Clips (Hunyuan) — {sid} (skip {i}/{len(shots)})")
-                                self.signals.log.emit(f"[hunyuan15] {sid}: existing clip found; skipping regeneration")
+                                if _normal_resume_file_reuse:
+                                    self.signals.log.emit(f"[hunyuan15] {sid}: resume found valid clip file; skipping regeneration")
+                                else:
+                                    self.signals.log.emit(f"[hunyuan15] {sid}: existing clip found; skipping regeneration")
                                 self.signals.progress.emit(min(99, 72 + int((i - 1) * (25 / max(1, len(shots))))))
 
                                 clips_out.append({
@@ -24858,6 +24880,10 @@ If the planner sees a marker like [02] or (02), it becomes the next image prompt
                 job.encoding.setdefault("title", title)
             if slug:
                 job.encoding.setdefault("slug", slug)
+            if resume_note:
+                job.encoding["planner_resume_run"] = True
+            else:
+                job.encoding.pop("planner_resume_run", None)
         except Exception:
             pass
 

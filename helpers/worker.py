@@ -4487,6 +4487,38 @@ def hiar_generate(job, cfg, mani):
                 break
         return '_'.join(cleaned) if cleaned else 'output'
 
+    def _read_prompt_lines_from_source(prompt_text_value: str, prompt_file_value: str) -> list[str]:
+        raw = ''
+        if prompt_text_value:
+            raw = str(prompt_text_value)
+        elif prompt_file_value:
+            try:
+                raw = _P(prompt_file_value).read_text(encoding='utf-8', errors='replace')
+            except Exception:
+                raw = ''
+        lines = []
+        for line in str(raw).replace('\r\n', '\n').replace('\r', '\n').split('\n'):
+            cleaned = ' '.join(str(line).split()).strip()
+            if cleaned:
+                lines.append(cleaned)
+        return lines
+
+    def _build_output_name_bases(prompt_lines: list[str], num_samples: int, file_count: int) -> list[str]:
+        if not prompt_lines:
+            return []
+        prompt_bases = [_prompt_words_for_filename(line) for line in prompt_lines]
+        if file_count == len(prompt_bases):
+            return prompt_bases
+        if num_samples > 1 and file_count == (len(prompt_bases) * num_samples):
+            names = []
+            for base in prompt_bases:
+                for sample_idx in range(1, num_samples + 1):
+                    names.append(f'{base}_{sample_idx:02d}')
+            return names
+        if len(prompt_bases) == 1 and file_count > 1:
+            return [prompt_bases[0]] * file_count
+        return []
+
     try:
         data_path = ''
         if prompt_text:
@@ -4589,23 +4621,28 @@ def hiar_generate(job, cfg, mani):
             _mark_error(job, 'HiAR: process finished but no new mp4 output was found.')
             return 1
 
-        prompt_part = _prompt_words_for_filename(prompt_text or prompt_file)
+        prompt_lines = _read_prompt_lines_from_source(prompt_text, prompt_file)
+        name_bases = _build_output_name_bases(prompt_lines, samples, len(new_files))
+        fallback_prompt_part = _prompt_words_for_filename((prompt_lines[0] if prompt_lines else (prompt_text or prompt_file)))
         stamp = _dt.now().strftime('%Y%m%d_%H%M%S')
-        prefix = f'hiar_{prompt_part}_{stamp}'
         produced_files = []
         new_files = sorted(new_files, key=lambda x: x.stat().st_mtime if x.exists() else 0)
         for idx, src_path in enumerate(new_files, 1):
-            if len(new_files) == 1:
+            if idx - 1 < len(name_bases):
+                prefix = f"hiar_{name_bases[idx - 1]}_{stamp}"
                 target_name = f'{prefix}.mp4'
             else:
-                target_name = f'{prefix}_{idx:02d}.mp4'
+                prefix = f'hiar_{fallback_prompt_part}_{stamp}'
+                if len(new_files) == 1:
+                    target_name = f'{prefix}.mp4'
+                else:
+                    target_name = f'{prefix}_{idx:02d}.mp4'
             target_path = output_folder / target_name
             n = 2
             while target_path.exists():
-                if len(new_files) == 1:
-                    target_path = output_folder / f'{prefix}_{n:02d}.mp4'
-                else:
-                    target_path = output_folder / f'{prefix}_{idx:02d}_{n:02d}.mp4'
+                stem = target_path.stem
+                suff = target_path.suffix
+                target_path = output_folder / f'{stem}_{n:02d}{suff}'
                 n += 1
             try:
                 if src_path.resolve() != target_path.resolve():
@@ -4641,6 +4678,124 @@ def hiar_generate(job, cfg, mani):
         except Exception:
             pass
 
+
+
+
+def qwentts_generate(job, cfg, mani):
+    """Run a queued Qwen TTS job by invoking qwentts_ui.py in --worker mode."""
+    import subprocess as _subprocess
+    from pathlib import Path as _P
+
+    try:
+        args = job.get('args') or {}
+    except Exception:
+        args = {}
+
+    try:
+        title = str(args.get('label') or 'Qwen TTS').strip() or 'Qwen TTS'
+        job['title'] = title
+        job['label'] = title
+        args['label'] = title
+        job['args'] = args
+    except Exception:
+        pass
+
+    env_python = str(args.get('env_python') or '').strip()
+    ui_script = str(args.get('ui_script') or '').strip()
+    mode = str(args.get('mode') or '').strip()
+    payload = args.get('payload') or {}
+
+    if not env_python or not _P(env_python).exists():
+        _mark_error(job, f'Qwen TTS env python not found: {env_python}')
+        return 2
+    if not ui_script or not _P(ui_script).exists():
+        _mark_error(job, f'Qwen TTS ui script not found: {ui_script}')
+        return 2
+    if mode not in ('custom', 'clone', 'design'):
+        _mark_error(job, f'Qwen TTS mode invalid: {mode}')
+        return 2
+
+    try:
+        out_dir = _P(job.get('out_dir') or (BASE / 'output' / 'audio' / 'qwen3tts')).resolve()
+    except Exception:
+        out_dir = _P(BASE / 'output' / 'audio' / 'qwen3tts').resolve()
+    try:
+        out_dir.mkdir(parents=True, exist_ok=True)
+    except Exception:
+        pass
+
+    result = None
+    try:
+        cmd = [env_python, '-u', ui_script, '--worker', '--task', 'generate']
+        env = os.environ.copy()
+        env.setdefault('HF_HUB_ENABLE_HF_TRANSFER', '0')
+        proc = _subprocess.Popen(
+            cmd,
+            stdin=_subprocess.PIPE,
+            stdout=_subprocess.PIPE,
+            stderr=_subprocess.STDOUT,
+            cwd=str(BASE),
+            env=env,
+            text=True,
+            encoding='utf-8',
+            errors='replace',
+            bufsize=1,
+        )
+        payload_str = json.dumps({'mode': mode, 'payload': payload}, ensure_ascii=False)
+        if proc.stdin:
+            proc.stdin.write(payload_str)
+            proc.stdin.close()
+        if proc.stdout:
+            for line in proc.stdout:
+                line = (line or '').rstrip('\n')
+                if not line:
+                    continue
+                if line.startswith('__LOG__'):
+                    print(line[len('__LOG__'):].lstrip())
+                elif line.startswith('__RESULT__'):
+                    js = line[len('__RESULT__'):].strip()
+                    try:
+                        result = json.loads(js)
+                    except Exception:
+                        result = {'ok': False, 'error': f'Failed to parse result JSON: {js}'}
+                else:
+                    print(line)
+        rc = int(proc.wait() or 0)
+    except Exception as e:
+        _mark_error(job, f'Qwen TTS launch failed: {e}')
+        return 2
+
+    if not isinstance(result, dict):
+        result = {'ok': False, 'error': 'No result returned from Qwen TTS worker.'}
+
+    if not result.get('ok', False):
+        _mark_error(job, str(result.get('error') or f'Qwen TTS failed (exit {rc}).'))
+        return rc or 1
+
+    out_path = str(result.get('out_path') or '').strip()
+    if not out_path:
+        _mark_error(job, 'Qwen TTS finished but did not report an output WAV path.')
+        return 1
+
+    try:
+        op = _P(out_path)
+        if not op.is_absolute():
+            op = (BASE / op).resolve()
+        out_path = str(op)
+    except Exception:
+        pass
+
+    if not _P(out_path).exists():
+        _mark_error(job, f'Qwen TTS output not found: {out_path}')
+        return 1
+
+    try:
+        job['produced'] = out_path
+        job['output'] = out_path
+        job['files'] = [out_path]
+    except Exception:
+        pass
+    return 0
 
 def handle_job(jpath: Path):
     job = json.loads(jpath.read_text(encoding="utf-8"))
@@ -4713,6 +4868,8 @@ def handle_job(jpath: Path):
             code = ace_generate(job, cfg, mani)
         elif t in ("heartmula_generate","heartmula","heartmula_music"):
             code = heartmula_generate(job, cfg, mani)
+        elif t in ("qwentts_generate","qwen_tts","qwen3tts"):
+            code = qwentts_generate(job, cfg, mani)
         elif t in ('planner_lock',):
             code = planner_lock(job, cfg, mani)
         else:

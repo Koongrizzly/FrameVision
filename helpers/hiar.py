@@ -376,7 +376,7 @@ class HiARPane(QWidget):
         self.seed_spin.setRange(0, 2_147_483_647)
 
         self.frames_spin = QSpinBox()
-        self.frames_spin.setRange(3, 264)
+        self.frames_spin.setRange(3, 528)
         self.frames_spin.setSingleStep(3)
         self.frames_spin.setValue(66)
         self.frames_spin.setToolTip("Start frames. Fixed to multiples of 3 because HiAR uses KV inference with 3 frames per block.")
@@ -826,20 +826,35 @@ class HiARPane(QWidget):
         return f"{minutes:d}:{seconds:02d}"
 
     def _prompt_words_for_filename(self, max_words: int = 4) -> str:
-        source = self.prompt_text.toPlainText().strip()
-        if not source:
+        prompt_bases = self._prompt_bases_for_batch(max_words=max_words)
+        if prompt_bases:
+            return prompt_bases[0]
+        return "output"
+
+    def _load_prompt_lines_for_batch(self) -> List[str]:
+        prompt_text = self.prompt_text.toPlainText().strip()
+        if prompt_text:
+            raw_text = prompt_text
+        else:
             prompt_file = self.prompt_file_edit.text().strip()
-            if prompt_file and Path(prompt_file).exists():
-                try:
-                    with open(prompt_file, "r", encoding="utf-8") as f:
-                        for line in f:
-                            if line.strip():
-                                source = line.strip()
-                                break
-                except Exception:
-                    source = ""
+            if not prompt_file or not Path(prompt_file).exists():
+                return []
+            try:
+                raw_text = Path(prompt_file).read_text(encoding="utf-8")
+            except Exception:
+                return []
+
+        lines: List[str] = []
+        normalized_text = raw_text.replace("\r\n", "\n").replace("\r", "\n")
+        for line in normalized_text.split("\n"):
+            cleaned = line.strip()
+            if cleaned:
+                lines.append(cleaned)
+        return lines
+
+    def _sanitize_prompt_for_filename(self, source: str, max_words: int = 4) -> str:
         source = source.replace("\r\n", " ").replace("\n", " ").replace("\r", " ").strip().lower()
-        cleaned = []
+        cleaned: List[str] = []
         for part in source.split():
             word = "".join(ch for ch in part if ch.isalnum())
             if word:
@@ -847,6 +862,12 @@ class HiARPane(QWidget):
             if len(cleaned) >= max_words:
                 break
         return "_".join(cleaned) if cleaned else "output"
+
+    def _prompt_bases_for_batch(self, max_words: int = 4) -> List[str]:
+        lines = self._load_prompt_lines_for_batch()
+        if not lines:
+            return []
+        return [self._sanitize_prompt_for_filename(line, max_words=max_words) for line in lines]
 
     def _rename_new_outputs(self) -> None:
         try:
@@ -862,23 +883,53 @@ class HiARPane(QWidget):
             if not new_files:
                 return
 
-            prompt_part = self._prompt_words_for_filename()
+            prompt_parts = self._prompt_bases_for_batch()
             stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-            prefix = f"hiar_{prompt_part}_{stamp}"
+            sample_count = max(1, int(self.samples_spin.value()))
 
             new_files = sorted(new_files, key=lambda x: x.stat().st_mtime)
+            total_files = len(new_files)
+            total_prompts = len(prompt_parts)
+            mismatch_note_logged = False
+
             for idx, src_path in enumerate(new_files, 1):
-                if len(new_files) == 1:
+                prompt_part = None
+                sample_suffix = ""
+
+                if total_prompts == total_files and total_prompts > 0:
+                    prompt_part = prompt_parts[idx - 1]
+                elif total_prompts > 0 and total_files == total_prompts * sample_count:
+                    prompt_index = (idx - 1) // sample_count
+                    sample_index = ((idx - 1) % sample_count) + 1
+                    prompt_part = prompt_parts[prompt_index]
+                    if sample_count > 1:
+                        sample_suffix = f"_{sample_index:02d}"
+                elif total_prompts == 1:
+                    prompt_part = prompt_parts[0]
+                elif total_prompts > 0:
+                    fallback_index = min(max(idx - 1, 0), total_prompts - 1)
+                    prompt_part = prompt_parts[fallback_index]
+                    if not mismatch_note_logged:
+                        self._append_log(
+                            f"[run] rename note: prompt/output count mismatch ({total_prompts} prompts, {total_files} videos); using sequential prompt fallback"
+                        )
+                        mismatch_note_logged = True
+
+                if not prompt_part:
+                    prompt_part = self._prompt_words_for_filename()
+
+                prefix = f"hiar_{prompt_part}_{stamp}"
+                if total_files == 1 and not sample_suffix:
                     target_name = f"{prefix}.mp4"
                 else:
-                    target_name = f"{prefix}_{idx:02d}.mp4"
+                    target_name = f"{prefix}{sample_suffix}.mp4"
                 target_path = output_dir / target_name
                 n = 2
                 while target_path.exists():
-                    if len(new_files) == 1:
+                    if total_files == 1 and not sample_suffix:
                         target_path = output_dir / f"{prefix}_{n:02d}.mp4"
                     else:
-                        target_path = output_dir / f"{prefix}_{idx:02d}_{n:02d}.mp4"
+                        target_path = output_dir / f"{prefix}{sample_suffix}_{n:02d}.mp4"
                     n += 1
                 src_path.replace(target_path)
                 self._append_log(f"[run] renamed output -> {target_path.name}")

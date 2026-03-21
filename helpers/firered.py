@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import random
 import os
 import shlex
 import shutil
@@ -25,10 +26,7 @@ from PySide6.QtWidgets import (
     QHBoxLayout,
     QLabel,
     QLineEdit,
-    QListWidget,
-    QListWidgetItem,
     QMainWindow,
-    QMenu,
     QMessageBox,
     QPushButton,
     QPlainTextEdit,
@@ -239,41 +237,36 @@ class FireRedPane(QWidget):
         # Input images
         images_box = QGroupBox("Input images")
         images_layout = QVBoxLayout(images_box)
-        images_layout.setSpacing(6)
+        images_layout.setSpacing(8)
 
         images_tip = QLabel(
-            "FireRed is a multi-image edit model. Add one image for standard edits or multiple images for identity/reference fusion."
+            "Use dedicated slots: image 1 is the base image that gets edited, image 2 is the donor face/style/object reference, and image 3 can be used for an extra object/background helper. Only slots 2 and 3 are sent as auxiliary references."
         )
         images_tip.setWordWrap(True)
         images_layout.addWidget(images_tip)
 
-        self.images_list = QListWidget()
-        self.images_list.setSelectionMode(QListWidget.ExtendedSelection)
-        self.images_list.setMinimumHeight(130)
-        self.images_list.setIconSize(QSize(56, 56))
-        self.images_list.setUniformItemSizes(False)
-        self.images_list.setWordWrap(False)
-        self.images_list.setContextMenuPolicy(Qt.CustomContextMenu)
-        images_layout.addWidget(self.images_list)
+        self.main_image_path = ""
+        self.ref_image2_path = ""
+        self.ref_image3_path = ""
 
-        images_buttons = QHBoxLayout()
-        self.btn_add_images = QPushButton("Add image(s)")
-        self.btn_add_folder = QPushButton("Add folder")
-        self.btn_remove_images = QPushButton("Remove selected")
-        self.btn_clear_images = QPushButton("Clear")
-        self.btn_move_up = QPushButton("Up")
-        self.btn_move_down = QPushButton("Down")
-        for b in [
-            self.btn_add_images,
-            self.btn_add_folder,
-            self.btn_remove_images,
-            self.btn_clear_images,
-            self.btn_move_up,
-            self.btn_move_down,
-        ]:
-            images_buttons.addWidget(b)
-        images_buttons.addStretch(1)
-        images_layout.addLayout(images_buttons)
+        self.main_image_slot = self._make_image_slot(
+            "1) Base image",
+            "This is the image FireRed should directly edit. It will be passed as the init image.",
+            "main",
+        )
+        self.ref_image2_slot = self._make_image_slot(
+            "2) Reference image 1",
+            "Use this for a face swap, identity hint, style donor, or another strong secondary reference.",
+            "ref2",
+        )
+        self.ref_image3_slot = self._make_image_slot(
+            "3) Reference image 2",
+            "Optional third image for objects, clothing, props, environment, or background guidance.",
+            "ref3",
+        )
+        images_layout.addWidget(self.main_image_slot)
+        images_layout.addWidget(self.ref_image2_slot)
+        images_layout.addWidget(self.ref_image3_slot)
         top_layout.addWidget(images_box)
 
         # Prompt + settings
@@ -322,8 +315,11 @@ class FireRedPane(QWidget):
         self.strength_spin.setValue(0.75)
         self.strength_spin.setToolTip("How strongly the edit should change the source image(s). Lower keeps more of the original; higher changes more.")
 
-        self.seed_edit = QLineEdit("-1")
-        self.seed_edit.setValidator(QIntValidator(-2147483648, 2147483647, self))
+        self.seed_edit = QLineEdit("0")
+        self.seed_edit.setValidator(QIntValidator(0, 2147483647, self))
+        self.chk_random_seed = QCheckBox("Random seed")
+        self.chk_random_seed.setChecked(True)
+        self.chk_random_seed.setToolTip("When enabled, a new real seed is generated at the start of each run or queue job and written into the seed box.")
 
         self.sampler_combo = QComboBox()
         self.sampler_combo.addItems([
@@ -389,7 +385,13 @@ class FireRedPane(QWidget):
         grid.addWidget(QLabel("Strength"), row, 0)
         grid.addWidget(self.strength_spin, row, 1)
         grid.addWidget(QLabel("Seed"), row, 2)
-        grid.addWidget(self.seed_edit, row, 3)
+        seed_wrap = QWidget()
+        seed_lay = QHBoxLayout(seed_wrap)
+        seed_lay.setContentsMargins(0, 0, 0, 0)
+        seed_lay.setSpacing(6)
+        seed_lay.addWidget(self.seed_edit, 1)
+        seed_lay.addWidget(self.chk_random_seed)
+        grid.addWidget(seed_wrap, row, 3)
         row += 1
         grid.addWidget(QLabel("Sampler"), row, 0)
         grid.addWidget(self.sampler_combo, row, 1)
@@ -567,14 +569,15 @@ class FireRedPane(QWidget):
     # ------------------------------------------------------------------
 
     def _wire_signals(self) -> None:
-        self.btn_add_images.clicked.connect(self._add_images)
-        self.btn_add_folder.clicked.connect(self._add_folder)
-        self.btn_remove_images.clicked.connect(self._remove_selected_images)
-        self.btn_clear_images.clicked.connect(self._clear_images)
-        self.btn_move_up.clicked.connect(lambda: self._move_selected(-1))
-        self.btn_move_down.clicked.connect(lambda: self._move_selected(1))
-        self.images_list.customContextMenuRequested.connect(self._images_context_menu)
-        self.images_list.itemDoubleClicked.connect(self._preview_image_item)
+        self.btn_main_image_browse.clicked.connect(lambda: self._choose_image_for_slot("main"))
+        self.btn_main_image_preview.clicked.connect(lambda: self._preview_slot_image("main"))
+        self.btn_main_image_clear.clicked.connect(lambda: self._clear_image_slot("main"))
+        self.btn_ref2_image_browse.clicked.connect(lambda: self._choose_image_for_slot("ref2"))
+        self.btn_ref2_image_preview.clicked.connect(lambda: self._preview_slot_image("ref2"))
+        self.btn_ref2_image_clear.clicked.connect(lambda: self._clear_image_slot("ref2"))
+        self.btn_ref3_image_browse.clicked.connect(lambda: self._choose_image_for_slot("ref3"))
+        self.btn_ref3_image_preview.clicked.connect(lambda: self._preview_slot_image("ref3"))
+        self.btn_ref3_image_clear.clicked.connect(lambda: self._clear_image_slot("ref3"))
         self.btn_browse_output.clicked.connect(self._browse_output)
         self.btn_autodetect.clicked.connect(lambda: self._auto_detect_paths(log_it=True))
         self.btn_preview.clicked.connect(self._refresh_preview)
@@ -583,6 +586,7 @@ class FireRedPane(QWidget):
         self.btn_stop.clicked.connect(self._stop)
         self.btn_clear_logs.clicked.connect(self.logs_edit.clear)
         self.btn_copy_logs.clicked.connect(self._copy_logs)
+        self.chk_random_seed.toggled.connect(self._on_random_seed_toggled)
         self.lora_combo.currentTextChanged.connect(self._update_selected_lora_label)
         try:
             self.lora_combo.lineEdit().textChanged.connect(self._update_selected_lora_label)
@@ -598,6 +602,7 @@ class FireRedPane(QWidget):
             self.cfg_spin,
             self.strength_spin,
             self.seed_edit,
+            self.chk_random_seed,
             self.sampler_combo,
             self.batch_spin,
             self.output_dir_edit,
@@ -651,10 +656,6 @@ class FireRedPane(QWidget):
         self.chk_reuse_last.toggled.connect(self._refresh_preview)
         self.chk_reuse_last.toggled.connect(self._save_state)
 
-        self.images_list.model().rowsInserted.connect(lambda *_: self._save_state())
-        self.images_list.model().rowsRemoved.connect(lambda *_: self._save_state())
-        self.images_list.model().modelReset.connect(lambda *_: self._save_state())
-
         for box in [self.paths_box, self.logs_box]:
             try:
                 box._toggle.toggled.connect(self._save_state)
@@ -673,8 +674,19 @@ class FireRedPane(QWidget):
     # Defaults and autodetect
     # ------------------------------------------------------------------
 
+    def _on_random_seed_toggled(self, checked: bool) -> None:
+        self.seed_edit.setEnabled(not checked)
+        if checked:
+            self.seed_edit.setPlaceholderText("A new seed will be generated on each run")
+        else:
+            if not (self.seed_edit.text() or "").strip():
+                self.seed_edit.setText("0")
+            self.seed_edit.setPlaceholderText("")
+        self._refresh_preview()
+
     def _apply_defaults(self) -> None:
         self.output_dir_edit.setText(str(self.framevision_root / "output" / "firered"))
+        self._on_random_seed_toggled(self.chk_random_seed.isChecked())
         self._refresh_preview()
 
     def _auto_detect_paths(self, log_it: bool = False) -> None:
@@ -843,6 +855,7 @@ class FireRedPane(QWidget):
             "cfg": self.cfg_spin.value(),
             "strength": self.strength_spin.value(),
             "seed": self.seed_edit.text(),
+            "random_seed": self.chk_random_seed.isChecked(),
             "sampler": self.sampler_combo.currentText(),
             "format": self.format_combo.currentText(),
             "batch": self.batch_spin.value(),
@@ -865,7 +878,9 @@ class FireRedPane(QWidget):
             "verbose": self.chk_verbose.isChecked(),
             "keep_aspect": self.chk_keep_aspect.isChecked(),
             "reuse_last": self.chk_reuse_last.isChecked(),
-            "images": [self.images_list.item(i).data(Qt.UserRole) for i in range(self.images_list.count())],
+            "main_image": self.main_image_path,
+            "ref_image2": self.ref_image2_path,
+            "ref_image3": self.ref_image3_path,
             "paths_box_open": self.paths_box._toggle.isChecked(),
             "logs_box_open": self.logs_box._toggle.isChecked(),
             "last_output_file": getattr(self, "_last_output_file", ""),
@@ -898,7 +913,14 @@ class FireRedPane(QWidget):
             self.steps_spin.setValue(int(data.get("steps", self.steps_spin.value())))
             self.cfg_spin.setValue(int(data.get("cfg", self.cfg_spin.value())))
             self.strength_spin.setValue(float(data.get("strength", self.strength_spin.value())))
-            self.seed_edit.setText(str(data.get("seed", self.seed_edit.text())))
+            saved_seed = str(data.get("seed", self.seed_edit.text()))
+            saved_random_seed = data.get("random_seed", None)
+            if saved_random_seed is None:
+                saved_random_seed = str(saved_seed).strip() == "-1"
+                if saved_random_seed:
+                    saved_seed = "0"
+            self.chk_random_seed.setChecked(bool(saved_random_seed))
+            self.seed_edit.setText(str(saved_seed if str(saved_seed).strip() != "-1" else "0"))
             self.sampler_combo.setCurrentText(str(data.get("sampler", self.sampler_combo.currentText())))
             self.format_combo.setCurrentText(str(data.get("format", self.format_combo.currentText())))
             self.batch_spin.setValue(int(data.get("batch", self.batch_spin.value())))
@@ -923,10 +945,10 @@ class FireRedPane(QWidget):
             self.chk_verbose.setChecked(bool(data.get("verbose", self.chk_verbose.isChecked())))
             self.chk_keep_aspect.setChecked(bool(data.get("keep_aspect", self.chk_keep_aspect.isChecked())))
             self.chk_reuse_last.setChecked(bool(data.get("reuse_last", self.chk_reuse_last.isChecked())))
-            self.images_list.clear()
-            for img in data.get("images", []):
-                if img:
-                    self._append_image(str(img))
+            legacy_images = [str(img) for img in data.get("images", []) if img]
+            self._set_image_slot("main", str(data.get("main_image", legacy_images[0] if len(legacy_images) > 0 else "")), refresh=False, save=False)
+            self._set_image_slot("ref2", str(data.get("ref_image2", legacy_images[1] if len(legacy_images) > 1 else "")), refresh=False, save=False)
+            self._set_image_slot("ref3", str(data.get("ref_image3", legacy_images[2] if len(legacy_images) > 2 else "")), refresh=False, save=False)
             self._last_output_file = str(data.get("last_output_file", ""))
             self.paths_box._toggle.setChecked(bool(data.get("paths_box_open", False)))
             self.paths_box._on_toggled(self.paths_box._toggle.isChecked())
@@ -943,128 +965,120 @@ class FireRedPane(QWidget):
         self._save_state()
 
     # ------------------------------------------------------------------
-    # Image list handling
+    # Image slot handling
     # ------------------------------------------------------------------
 
-    def _add_images(self) -> None:
-        files, _ = QFileDialog.getOpenFileNames(
+    def _make_image_slot(self, title: str, subtitle: str, slot_key: str) -> QWidget:
+        box = QFrame()
+        box.setFrameShape(QFrame.StyledPanel)
+        box.setObjectName(f"firered_{slot_key}_slot")
+        lay = QVBoxLayout(box)
+        lay.setContentsMargins(8, 8, 8, 8)
+        lay.setSpacing(6)
+
+        title_lbl = QLabel(title)
+        title_lbl.setStyleSheet("font-weight: 600;")
+        lay.addWidget(title_lbl)
+
+        subtitle_lbl = QLabel(subtitle)
+        subtitle_lbl.setWordWrap(True)
+        lay.addWidget(subtitle_lbl)
+
+        row = QHBoxLayout()
+        row.setSpacing(8)
+
+        thumb_lbl = QLabel("No image")
+        thumb_lbl.setAlignment(Qt.AlignCenter)
+        thumb_lbl.setMinimumSize(72, 72)
+        thumb_lbl.setMaximumSize(72, 72)
+        thumb_lbl.setFrameShape(QFrame.Box)
+        row.addWidget(thumb_lbl)
+
+        text_col = QVBoxLayout()
+        path_lbl = QLabel("Empty")
+        path_lbl.setWordWrap(True)
+        text_col.addWidget(path_lbl)
+        text_col.addStretch(1)
+        row.addLayout(text_col, 1)
+
+        btn_col = QVBoxLayout()
+        btn_browse = QPushButton("Browse")
+        btn_preview = QPushButton("Preview")
+        btn_clear = QPushButton("Clear")
+        btn_col.addWidget(btn_browse)
+        btn_col.addWidget(btn_preview)
+        btn_col.addWidget(btn_clear)
+        btn_col.addStretch(1)
+        row.addLayout(btn_col)
+        lay.addLayout(row)
+
+        setattr(self, f"{slot_key}_image_thumb", thumb_lbl)
+        setattr(self, f"{slot_key}_image_label", path_lbl)
+        setattr(self, f"btn_{slot_key}_image_browse", btn_browse)
+        setattr(self, f"btn_{slot_key}_image_preview", btn_preview)
+        setattr(self, f"btn_{slot_key}_image_clear", btn_clear)
+        return box
+
+    def _slot_path_attr(self, slot_key: str) -> str:
+        return {"main": "main_image_path", "ref2": "ref_image2_path", "ref3": "ref_image3_path"}[slot_key]
+
+    def _slot_path(self, slot_key: str) -> str:
+        return _norm(str(getattr(self, self._slot_path_attr(slot_key), "")))
+
+    def _slot_label_widget(self, slot_key: str) -> QLabel:
+        return getattr(self, f"{slot_key}_image_label")
+
+    def _slot_thumb_widget(self, slot_key: str) -> QLabel:
+        return getattr(self, f"{slot_key}_image_thumb")
+
+    def _update_image_slot_widget(self, slot_key: str) -> None:
+        path = self._slot_path(slot_key)
+        label = self._slot_label_widget(slot_key)
+        thumb = self._slot_thumb_widget(slot_key)
+        if path and os.path.isfile(path):
+            label.setText(f"{Path(path).name}\n{path}")
+            pix = QPixmap(path)
+            if not pix.isNull():
+                thumb.setPixmap(pix.scaled(64, 64, Qt.KeepAspectRatio, Qt.SmoothTransformation))
+                thumb.setText("")
+            else:
+                thumb.clear()
+                thumb.setText("Image")
+        else:
+            label.setText("Empty")
+            thumb.clear()
+            thumb.setText("No image")
+
+    def _set_image_slot(self, slot_key: str, path: str, *, refresh: bool = True, save: bool = True) -> None:
+        norm = _norm(path)
+        setattr(self, self._slot_path_attr(slot_key), norm)
+        self._update_image_slot_widget(slot_key)
+        if slot_key == "main":
+            self._maybe_fit_resolution_to_first_input()
+        if refresh:
+            self._refresh_preview()
+        if save:
+            self._save_state()
+
+    def _clear_image_slot(self, slot_key: str) -> None:
+        self._set_image_slot(slot_key, "")
+
+    def _choose_image_for_slot(self, slot_key: str) -> None:
+        current = self._slot_path(slot_key) or str(self.framevision_root)
+        path, _ = QFileDialog.getOpenFileName(
             self,
-            "Add FireRed input images",
-            str(self.framevision_root),
+            "Select FireRed image",
+            current,
             "Images (*.png *.jpg *.jpeg *.webp *.bmp);;All files (*)",
         )
-        for f in files:
-            self._append_image(f)
-        self._maybe_fit_resolution_to_first_input()
-        self._refresh_preview()
-        self._save_state()
+        if path:
+            self._set_image_slot(slot_key, path)
 
-    def _add_folder(self) -> None:
-        folder = QFileDialog.getExistingDirectory(self, "Add images from folder", str(self.framevision_root))
-        if not folder:
-            return
-        exts = {".png", ".jpg", ".jpeg", ".webp", ".bmp"}
-        added = 0
-        for p in sorted(Path(folder).iterdir()):
-            if p.is_file() and p.suffix.lower() in exts:
-                self._append_image(str(p))
-                added += 1
-        self._log(f"Added {added} image(s) from folder: {folder}")
-        self._maybe_fit_resolution_to_first_input()
-        self._refresh_preview()
-        self._save_state()
+    def _preview_slot_image(self, slot_key: str) -> None:
+        path = self._slot_path(slot_key)
+        self._preview_image_path(path)
 
-    def _append_image(self, path: str) -> None:
-        norm = _norm(path)
-        if not norm:
-            return
-        for i in range(self.images_list.count()):
-            if self.images_list.item(i).data(Qt.UserRole) == norm:
-                return
-        item = QListWidgetItem(Path(norm).name)
-        item.setToolTip(norm)
-        item.setData(Qt.UserRole, norm)
-        thumb = _make_thumb(norm)
-        if thumb is not None:
-            item.setIcon(thumb)
-        self.images_list.addItem(item)
-
-    def _clear_images(self) -> None:
-        self.images_list.clear()
-        self._refresh_preview()
-        self._save_state()
-
-    def _remove_selected_images(self) -> None:
-        for item in self.images_list.selectedItems():
-            self.images_list.takeItem(self.images_list.row(item))
-        self._refresh_preview()
-
-    def _move_selected(self, delta: int) -> None:
-        rows = sorted({self.images_list.row(i) for i in self.images_list.selectedItems()})
-        if not rows:
-            return
-        if delta < 0:
-            rows_iter = rows
-        else:
-            rows_iter = reversed(rows)
-        for row in rows_iter:
-            new_row = row + delta
-            if new_row < 0 or new_row >= self.images_list.count():
-                continue
-            item = self.images_list.takeItem(row)
-            self.images_list.insertItem(new_row, item)
-            item.setSelected(True)
-        self._refresh_preview()
-        self._save_state()
-
-    def _images_context_menu(self, pos) -> None:
-        menu = QMenu(self)
-        act_add = QAction("Add image(s)", self)
-        act_preview = QAction("Preview", self)
-        act_remove = QAction("Remove selected", self)
-        act_open = QAction("Open containing folder", self)
-        act_copy = QAction("Copy selected path(s)", self)
-        act_add.triggered.connect(self._add_images)
-        act_preview.triggered.connect(self._preview_current_image)
-        act_remove.triggered.connect(self._remove_selected_images)
-        act_open.triggered.connect(self._open_selected_parent)
-        act_copy.triggered.connect(self._copy_selected_paths)
-        menu.addAction(act_add)
-        if self.images_list.currentItem() is not None:
-            menu.addAction(act_preview)
-        menu.addAction(act_remove)
-        menu.addSeparator()
-        menu.addAction(act_open)
-        menu.addAction(act_copy)
-        menu.exec(self.images_list.mapToGlobal(pos))
-
-    def _open_selected_parent(self) -> None:
-        item = self.images_list.currentItem()
-        if not item:
-            return
-        path = item.data(Qt.UserRole)
-        if not path:
-            return
-        folder = str(Path(path).parent)
-        if os.path.isdir(folder):
-            os.startfile(folder)  # type: ignore[attr-defined]
-
-    def _copy_selected_paths(self) -> None:
-        selected = [i.data(Qt.UserRole) for i in self.images_list.selectedItems() if i.data(Qt.UserRole)]
-        if not selected:
-            return
-        QApplication.clipboard().setText("\n".join(selected))
-        self._log(f"Copied {len(selected)} path(s) to clipboard.")
-
-    def _preview_current_image(self) -> None:
-        item = self.images_list.currentItem()
-        if item is not None:
-            self._preview_image_item(item)
-
-    def _preview_image_item(self, item: QListWidgetItem) -> None:
-        if not item:
-            return
-        path = item.data(Qt.UserRole)
+    def _preview_image_path(self, path: str) -> None:
         if not path or not os.path.isfile(path):
             QMessageBox.warning(self, "Preview", "Image file not found.")
             return
@@ -1096,12 +1110,30 @@ class FireRedPane(QWidget):
         lay.addLayout(btns)
         dlg.exec()
 
+    def _reference_images(self) -> List[str]:
+        # Only donor/helper slots are passed as auxiliary references.
+        # The main image is sent via -i and should not be duplicated as -r,
+        # otherwise FireRed tends to cling to the base image and ignore the donor.
+        result: List[str] = []
+        for slot_key in ["ref2", "ref3"]:
+            path = self._slot_path(slot_key)
+            if path:
+                result.append(path)
+        out: List[str] = []
+        seen = set()
+        for p in result:
+            if p not in seen:
+                seen.add(p)
+                out.append(p)
+        return out
+
     def _first_input(self) -> Optional[str]:
         if self.chk_reuse_last.isChecked() and hasattr(self, "_last_output_file") and self._last_output_file:
             if os.path.isfile(self._last_output_file):
                 return self._last_output_file
-        if self.images_list.count() > 0:
-            return self.images_list.item(0).data(Qt.UserRole)
+        main_image = self._slot_path("main")
+        if main_image:
+            return main_image
         return None
 
     # ------------------------------------------------------------------
@@ -1138,15 +1170,13 @@ class FireRedPane(QWidget):
     # ------------------------------------------------------------------
 
     def _collect_images(self) -> List[str]:
-        result = []
-        if self.chk_reuse_last.isChecked() and getattr(self, "_last_output_file", ""):
-            if os.path.isfile(self._last_output_file):
-                result.append(self._last_output_file)
-        for i in range(self.images_list.count()):
-            p = self.images_list.item(i).data(Qt.UserRole)
-            if p:
-                result.append(p)
-        # dedupe but preserve order
+        result: List[str] = []
+        init_image = self._first_input()
+        if init_image:
+            result.append(init_image)
+        for ref in self._reference_images():
+            if ref:
+                result.append(ref)
         out: List[str] = []
         seen = set()
         for p in result:
@@ -1156,18 +1186,46 @@ class FireRedPane(QWidget):
                 out.append(n)
         return out
 
-    def _build_command(self) -> FireRedCommand:
+    def _resolve_runtime_seed(self, *, apply_to_ui: bool = False) -> int:
+        use_random = self.chk_random_seed.isChecked()
+        raw = (self.seed_edit.text() or "").strip()
+        try:
+            seed = int(raw)
+        except Exception:
+            seed = 0
+
+        if use_random:
+            seed = random.SystemRandom().randint(0, 2147483647)
+        elif seed < 0:
+            seed = 0
+
+        if apply_to_ui:
+            self.seed_edit.setText(str(seed))
+            self._log(f"Resolved seed: {seed} {'(random)' if use_random else '(manual)'}")
+            if not getattr(self, "_loading_state", False):
+                self._save_state()
+
+        return seed
+
+    def _build_command(self, *, seed_override: Optional[int] = None) -> FireRedCommand:
         exe = _norm(self.sdcli_edit.text())
         model = _norm(self.model_edit.text())
         vae = _norm(self.vae_edit.text())
         llm = _norm(self.llm_edit.text())
         out_dir = _norm(self.output_dir_edit.text())
         prefix = self.prefix_edit.text().strip() or "firered"
-        seed = self.seed_edit.text().strip() or "-1"
+        seed = str(seed_override) if seed_override is not None else (self.seed_edit.text().strip() or "0")
         prompt = self._effective_prompt()
         negative = self.negative_edit.toPlainText().strip()
-        images = self._collect_images()
+        init_image = _norm(self._first_input() or "")
+        ref_images = [_norm(p) for p in self._reference_images() if _norm(p)]
         lora_path = _norm(self.lora_combo.currentText())
+
+        # Make the slot mapping explicit and stable:
+        # - slot 1 / reuse-last output -> main init image (-i)
+        # - slot 2 and slot 3         -> auxiliary references (-r)
+        # Never echo the init image back into the reference list.
+        ref_images = [p for p in ref_images if p and p != init_image]
 
         os.makedirs(out_dir, exist_ok=True)
         stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -1189,10 +1247,11 @@ class FireRedPane(QWidget):
             "-o", output_file,
         ]
 
-        if images:
-            # stable-diffusion.cpp generally accepts repeated -r values for extra images.
-            for img in images:
-                args.extend(["-r", img])
+        if init_image:
+            args.extend(["-i", init_image])
+
+        for img in ref_images:
+            args.extend(["-r", img])
 
         if lora_path and os.path.isfile(lora_path):
             args.extend(["--lora-model-dir", str(Path(lora_path).parent)])
@@ -1229,6 +1288,8 @@ class FireRedPane(QWidget):
         images = self._collect_images()
         if not images:
             errors.append("Add at least one input image. FireRed is an image edit model.")
+        if not self._slot_path("main") and not (self.chk_reuse_last.isChecked() and getattr(self, "_last_output_file", "")):
+            errors.append("Main image slot is empty. Put the image you want to edit in slot 1.")
 
         if not self.model_edit.text().strip() or not os.path.isfile(_norm(self.model_edit.text())):
             errors.append("FireRed GGUF model file is missing or invalid.")
@@ -1291,7 +1352,8 @@ class FireRedPane(QWidget):
     # ------------------------------------------------------------------
 
     def _run(self) -> None:
-        cmd = self._build_command()
+        resolved_seed = self._resolve_runtime_seed(apply_to_ui=True)
+        cmd = self._build_command(seed_override=resolved_seed)
         errors = self._validate_command(cmd)
         if errors:
             QMessageBox.warning(self, "FireRed", "\n".join(errors))
@@ -1319,6 +1381,10 @@ class FireRedPane(QWidget):
         self._log("=" * 80)
         self._log("Starting FireRed process")
         self._log(f"Working dir: {Path(cmd.exe).parent}")
+        self._log(f"Main init image (-i): {self._first_input() or '[none]'}")
+        refs = self._reference_images()
+        self._log(f"Reference images (-r): {', '.join(refs) if refs else '[none]'}")
+        self._log(f"Seed used: {resolved_seed}")
         self._log(f"Command: {cmd.as_shell()}")
         self.run_started.emit(cmd.as_shell())
         self.process.start()
@@ -1371,8 +1437,9 @@ class FireRedPane(QWidget):
     # ------------------------------------------------------------------
 
     def _generate_queue(self) -> None:
+        resolved_seed = self._resolve_runtime_seed(apply_to_ui=True)
         try:
-            cmd = self._build_command()
+            cmd = self._build_command(seed_override=resolved_seed)
         except Exception as exc:
             QMessageBox.warning(self, "FireRed", f"Could not build queue command: {exc}")
             self._log(f"Queue blocked: could not build command: {exc}")
@@ -1391,6 +1458,7 @@ class FireRedPane(QWidget):
                 from helpers.queue_adapter import enqueue_firered_from_widget
             except Exception:
                 from queue_adapter import enqueue_firered_from_widget
+            self._log(f"[queue] seed used: {resolved_seed}")
             ok = bool(enqueue_firered_from_widget(self))
             if ok:
                 self._log("[queue] queued FireRed job")

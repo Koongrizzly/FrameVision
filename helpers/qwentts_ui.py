@@ -450,9 +450,12 @@ class MainWindow(QtWidgets.QMainWindow):
         btn_row = QtWidgets.QHBoxLayout()
         self.btn_generate = QtWidgets.QPushButton("Generate WAV (current tab)")
         self.btn_refresh_gpu = QtWidgets.QPushButton("Refresh GPU info")
+        self.chk_use_queue = QtWidgets.QCheckBox("Use queue")
+        self.chk_use_queue.setChecked(True)
         btn_row.addWidget(self.btn_generate)
         btn_row.addWidget(self.btn_refresh_gpu)
         btn_row.addStretch(1)
+        btn_row.addWidget(self.chk_use_queue)
         layout.addLayout(btn_row)
 
         self.lbl_gpu = QtWidgets.QLabel("GPU: (checking...)")
@@ -529,6 +532,10 @@ class MainWindow(QtWidgets.QMainWindow):
             "Output goes to: output/audio/qwen3tts/."
         )
         self.btn_refresh_gpu.setToolTip("Queries CUDA/GPU availability inside the qwen3tts environment.")
+        self.chk_use_queue.setToolTip(
+            "When enabled (default), Generate WAV adds the current job to the FrameVision queue.\n"
+            "Turn this off to run directly in this window like before."
+        )
         self.lbl_gpu.setToolTip("Detected GPU(s) reported by the qwen3tts environment.")
 
         # Common generation settings
@@ -867,6 +874,7 @@ class MainWindow(QtWidgets.QMainWindow):
                     "mm_collapsed": bool(self.section_mm.isCollapsed()),
                     "common_collapsed": bool(self.section_common.isCollapsed()),
                     "logs_collapsed": bool(self.section_logs.isCollapsed()),
+                    "use_queue": bool(self.chk_use_queue.isChecked()),
                 },
                 "common": self._collect_common(),
                 "models": {
@@ -1073,6 +1081,22 @@ class MainWindow(QtWidgets.QMainWindow):
             self._log("Model folder missing. Use Model Manager to download it first.")
             return
 
+        if bool(getattr(self, 'chk_use_queue', None) and self.chk_use_queue.isChecked()):
+            try:
+                try:
+                    from helpers.queue_adapter import enqueue_qwentts_from_widget
+                except Exception:
+                    from queue_adapter import enqueue_qwentts_from_widget
+                ok = bool(enqueue_qwentts_from_widget(self))
+            except Exception:
+                ok = False
+                self._log("ERROR:\nFailed to add Qwen TTS job to queue:\n" + traceback.format_exc())
+            if ok:
+                self._log(f"Queued Qwen TTS job ({mode}).")
+            else:
+                self._log("ERROR:\nFailed to add Qwen TTS job to queue.")
+            return
+
         self._log(f"Starting generation ({mode})...")
         self.btn_generate.setEnabled(False)
 
@@ -1227,7 +1251,9 @@ def _load_model(Qwen3TTSModel, model_path_or_id: str, tokenizer_path: str, commo
         attn_choice = "sdpa"
         attn_impl = "sdpa"
 
-    kwargs = {"device_map": device, "dtype": dtype}
+    # Some qwen_tts package builds forward `dtype`, others forward `torch_dtype`.
+    # Pass both so the wrapper and the underlying Transformers load path both receive it.
+    kwargs = {"device_map": device, "dtype": dtype, "torch_dtype": dtype}
     if attn_impl is not None:
         kwargs["attn_implementation"] = attn_impl
 
@@ -1262,6 +1288,7 @@ def _load_model(Qwen3TTSModel, model_path_or_id: str, tokenizer_path: str, commo
         if dtype_choice == "bfloat16":
             _worker_log("bfloat16 load failed; retrying with float16...")
             kwargs["dtype"] = torch.float16
+            kwargs["torch_dtype"] = torch.float16
             return Qwen3TTSModel.from_pretrained(model_path_or_id, **kwargs)
         raise
 

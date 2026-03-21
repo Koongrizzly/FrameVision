@@ -1378,3 +1378,77 @@ def enqueue_hiar_from_widget(inner) -> bool:
         except Exception:
             pass
         return False
+
+
+def default_qwentts_outdir() -> str:
+    base = _base_root()
+    d = base / 'output' / 'audio' / 'qwen3tts'
+    d.mkdir(parents=True, exist_ok=True)
+    return str(d)
+
+
+def enqueue_qwentts_from_widget(inner) -> bool:
+    """Read fields from QwenTTSUI and enqueue a queued Qwen TTS generation job."""
+    try:
+        from pathlib import Path as _P
+        try:
+            from helpers.job_helper import make_job_json
+            from helpers.queue_adapter import jobs_dirs
+        except Exception:
+            from job_helper import make_job_json
+            from queue_adapter import jobs_dirs
+
+        d = jobs_dirs()
+
+        try:
+            mode, payload = inner._collect_payload()
+        except Exception as e:
+            raise RuntimeError(f'Failed to collect Qwen TTS payload: {e}')
+
+        model_path = str(payload.get('model_path') or '').strip()
+        if not model_path or not _P(model_path).exists():
+            raise RuntimeError('Qwen TTS model folder missing.')
+
+        out_dir = default_qwentts_outdir()
+        output_name = str(((payload.get('common') or {}).get('output_name')) or 'qwen_tts').strip() or 'qwen_tts'
+        label_mode = {
+            'custom': 'CustomVoice',
+            'clone': 'Voice Clone',
+            'design': 'Voice Design',
+        }.get(str(mode).strip().lower(), 'Qwen TTS')
+        label = f'Qwen TTS - {label_mode} - {output_name}'
+
+        input_path = ''
+        try:
+            if str(mode).strip().lower() == 'clone':
+                input_path = str(payload.get('ref_audio_path') or '').strip()
+        except Exception:
+            input_path = ''
+        if not input_path:
+            dummy = _P(out_dir) / 'qwentts_queue_job.txt'
+            try:
+                if not dummy.exists():
+                    dummy.parent.mkdir(parents=True, exist_ok=True)
+                    snippet = str(payload.get('text') or label)[:160]
+                    dummy.write_text(snippet, encoding='utf-8')
+                input_path = str(dummy)
+            except Exception:
+                input_path = model_path
+
+        env_python = str(_P(__file__).resolve().parents[1] / 'environments' / '.qwen3tts' / 'Scripts' / 'python.exe')
+        ui_script = str(_P(__file__).resolve().parent / 'qwentts_ui.py')
+
+        args = {
+            'mode': mode,
+            'payload': payload,
+            'env_python': env_python,
+            'ui_script': ui_script,
+            'label': label,
+        }
+        return make_job_json('qwentts_generate', input_path, out_dir, args, str(d['pending']))
+    except Exception as e:
+        try:
+            print('[queue] enqueue_qwentts_from_widget failed:', e)
+        except Exception:
+            pass
+        return False
