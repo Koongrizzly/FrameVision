@@ -1280,9 +1280,7 @@ def _clean_own_story_prompt(s: str) -> str:
 # Users can edit/remove them per-session; they will revert on next restart.
 
 _DEFAULT_UI_NEGATIVES = (
-        "duplicate person, cloned face, multiple faces, extra face, "
-    "blurry, low quality, out of frame, jpeg artifacts, "
-    "text, watermark, logo, subtitles, caption, label, "
+        "blurry, low quality, out of frame, jpeg artifacts, "
     "deformed, disfigured, bad anatomy, bad hands, extra fingers, "
     "missing fingers, extra limbs, mutated hands"
 
@@ -18121,16 +18119,17 @@ class PlannerPane(QWidget):
         try:
             header.setObjectName("plannerFooter")
             header.setMinimumHeight(78)
+            header.setAttribute(Qt.WA_StyledBackground, True)
             header.setStyleSheet("""
                 QWidget#plannerFooter {
-                    background: rgba(8, 12, 10, 220);
-	                    /* Remove the visible outline ring (it was only showing on the right side due to overlapping children). */
-	                    border: none;
+                    background: transparent;
+                    border: none;
                     border-radius: 18px;
                     padding: 10px 12px;
                 }
                 QWidget#plannerFooter QLabel {
                     color: rgba(255, 255, 255, 230);
+                    background: transparent;
                 }
                 QWidget#plannerFooter QPushButton {
                     padding: 8px 16px;
@@ -18138,11 +18137,7 @@ class PlannerPane(QWidget):
                     font-weight: 600;
                 }
             """)
-            eff = QGraphicsDropShadowEffect(header)
-            eff.setBlurRadius(28)
-            eff.setOffset(0, 10)
-            eff.setColor(QColor(0, 0, 0, 170))
-            header.setGraphicsEffect(eff)
+            header.setGraphicsEffect(None)
         except Exception:
             pass
 
@@ -24125,7 +24120,11 @@ If the planner sees a marker like [02] or (02), it becomes the next image prompt
                     pass
 
     def _ensure_video_firstframe_thumb(self, video_path: str) -> str:
-        """Create (or reuse) a cached first-frame PNG thumbnail for a video.
+        """Create (or reuse) a cached thumbnail for a video.
+
+        Prefer the true first frame. If that frame decodes as a blank/uniform
+        image (common with some freshly encoded clips), automatically retry a few
+        tiny offsets until we get the first usable visible frame.
 
         Returns the thumbnail PNG path, or "" on failure.
         """
@@ -24164,64 +24163,139 @@ If the planner sees a marker like [02] or (02), it becomes the next image prompt
 
         out_png = os.path.join(out_dir, f"{h}.png")
 
-        # Build ffmpeg command (grab a frame a tiny bit into the clip to avoid black decode frames)
         try:
             ffmpeg = self._ffmpeg_tool("ffmpeg")
         except Exception:
             ffmpeg = "ffmpeg"
 
-        # Target is ~2x the label size for crisp downscale
+        # Target is ~2x the label size for crisp downscale.
+        # Use transparent/edge padding rather than a hardcoded dark fill.
         tw, th = 144, 80
-        vf = f"scale={tw}:{th}:force_original_aspect_ratio=decrease,pad={tw}:{th}:(ow-iw)/2:(oh-ih)/2"
-        args = [
-            ffmpeg,
-            "-y",
-            "-hide_banner",
-            "-loglevel",
-            "error",
-            "-ss",
-            "0.10",
-            "-i",
-            vp,
-            "-frames:v",
-            "1",
-            "-vf",
-            vf,
-            "-an",
-            out_png,
-        ]
+        vf = f"scale={tw}:{th}:force_original_aspect_ratio=decrease:flags=lanczos,pad={tw}:{th}:(ow-iw)/2:(oh-ih)/2:color=black"
 
-        try:
+        def _make_thumb(seek_s: float | None) -> bool:
+            try:
+                if os.path.exists(out_png):
+                    os.remove(out_png)
+            except Exception:
+                pass
+            args = [ffmpeg, "-y", "-hide_banner", "-loglevel", "error"]
+            if seek_s is not None and seek_s > 0:
+                # Put -ss after -i for accurate frame seeking near the clip start.
+                args += ["-i", vp, "-ss", f"{seek_s:.3f}"]
+            else:
+                args += ["-i", vp]
+            args += ["-frames:v", "1", "-vf", vf, "-an", out_png]
             cp = subprocess.run(args, capture_output=True, text=True, encoding="utf-8", errors="replace")
-            if cp.returncode != 0 or not os.path.exists(out_png):
-                # Fallback: try exact first frame (no seek)
-                args2 = [
-                    ffmpeg,
-                    "-y",
-                    "-hide_banner",
-                    "-loglevel",
-                    "error",
-                    "-i",
-                    vp,
-                    "-frames:v",
-                    "1",
-                    "-vf",
-                    vf,
-                    "-an",
-                    out_png,
-                ]
-                cp2 = subprocess.run(args2, capture_output=True, text=True, encoding="utf-8", errors="replace")
-                if cp2.returncode != 0 or not os.path.exists(out_png):
-                    return ""
+            return cp.returncode == 0 and os.path.exists(out_png)
+
+        def _thumb_looks_blank(path: str) -> bool:
+            try:
+                from PySide6.QtGui import QImage
+                img = QImage(path)
+                if img.isNull():
+                    return True
+                w = int(img.width())
+                h = int(img.height())
+                if w <= 0 or h <= 0:
+                    return True
+                step_x = max(1, w // 12)
+                step_y = max(1, h // 8)
+                vals = []
+                for y in range(0, h, step_y):
+                    for x in range(0, w, step_x):
+                        c = img.pixelColor(x, y)
+                        vals.append((int(c.red()) + int(c.green()) + int(c.blue())) / 3.0)
+                if not vals:
+                    return True
+                vmin = min(vals)
+                vmax = max(vals)
+                avg = sum(vals) / float(len(vals))
+                # Near-uniform dark/white/flat thumbs are usually the bad ones we want to skip.
+                return (vmax - vmin) < 10 or avg <= 8 or avg >= 247
+            except Exception:
+                return False
+
+        # Try the real first frame first, then tiny offsets until we get the first useful one.
+        try_offsets = [None, 0.04, 0.08, 0.12, 0.20, 0.33]
+        try:
+            ok = False
+            for off in try_offsets:
+                if not _make_thumb(off):
+                    continue
+                if not _thumb_looks_blank(out_png):
+                    ok = True
+                    break
+            if not ok and os.path.exists(out_png):
+                # Keep the last successful extraction even if it still looks plain.
+                ok = True
+            if not ok:
+                return ""
         except Exception:
             return ""
 
-        # Store cache
         try:
             self._video_thumb_cache[vp] = (mt, out_png)
         except Exception:
             pass
+
+        try:
+            self._cleanup_video_thumb_cache(max_keep=5)
+        except Exception:
+            pass
         return out_png
+
+    def _cleanup_video_thumb_cache(self, max_keep: int = 5) -> None:
+        """Best-effort cleanup so the preview thumb cache does not keep growing forever."""
+        try:
+            cache = dict(getattr(self, "_video_thumb_cache", {}) or {})
+        except Exception:
+            cache = {}
+        if not cache:
+            return
+
+        keep_paths = set()
+        try:
+            for it in list(getattr(self, "_preview_items", []) or []):
+                p = str((it or {}).get("path") or "").strip()
+                if p:
+                    keep_paths.add(p)
+        except Exception:
+            pass
+
+        entries = []
+        for src, value in cache.items():
+            try:
+                c_mt, c_path = value
+                file_mt = os.path.getmtime(c_path) if c_path and os.path.exists(c_path) else 0.0
+                entries.append((float(file_mt), str(src), str(c_path)))
+            except Exception:
+                pass
+
+        entries.sort(key=lambda t: t[0], reverse=True)
+        keep_thumb_files = set()
+        keep_srcs = set()
+        for _, src, c_path in entries:
+            if src in keep_paths or len(keep_srcs) < max_keep:
+                keep_srcs.add(src)
+                if c_path:
+                    keep_thumb_files.add(c_path)
+
+        new_cache = {}
+        for src, value in cache.items():
+            try:
+                c_mt, c_path = value
+                if src in keep_srcs and c_path and os.path.exists(c_path):
+                    new_cache[src] = value
+                elif c_path and os.path.exists(c_path) and c_path not in keep_thumb_files:
+                    os.remove(c_path)
+            except Exception:
+                pass
+
+        try:
+            self._video_thumb_cache = new_cache
+        except Exception:
+            pass
 
     def _on_preview_thumb_clicked(self, idx: int) -> None:
         if not getattr(self, "chk_preview", None) or not self.chk_preview.isChecked():

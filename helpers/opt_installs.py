@@ -515,6 +515,18 @@ def _run_hunyuan15_flashattn(root: Path) -> Optional[Tuple[str, List[str], Path]
     return (str(py), ["-m", "pip", "install", wheel_url], root)
 
 
+def _run_hiar(root: Path) -> Optional[Tuple[str, List[str], Path]]:
+    """Install HiAR Wan 2.1 long-format video environment + repo + model files."""
+    script = root / "presets" / "extra_env" / "hiar_install.py"
+    if not script.exists():
+        return None
+    py = _venv_python(root)
+    if py is None or (not py.exists()):
+        return None
+    args = ["-u", str(script), "--root", str(root)]
+    return (str(py), args, root)
+
+
 # (HeartMula optional installs removed)
 
 def _run_whisper(root: Path) -> Optional[Tuple[str, List[str], Path]]:
@@ -730,6 +742,172 @@ def _run_sdxl_inpaint_env(root: Path) -> Optional[Tuple[str, List[str], Path]]:
     return _cmd_call_bat(script, root)
 
 
+def _run_firered_gguf(root: Path, quant: str) -> Optional[Tuple[str, List[str], Path]]:
+    """
+    Download FireRed Image Edit 1.1 GGUF plus the shared VAE, text encoder and mmproj.
+
+    Files are stored flat in:
+      <root>/models/FireRed-Image-Edit-1.1/
+    """
+    py = _venv_python(root)
+    if py is None or (not py.exists()):
+        return None
+
+    target = (root / "models" / "FireRed-Image-Edit-1.1").resolve()
+
+    downloader = r"""
+import sys
+import time
+import shutil
+import urllib.request
+from pathlib import Path
+
+root = Path(sys.argv[1]).resolve()
+target = Path(sys.argv[2]).resolve()
+quant = sys.argv[3].strip()
+
+GGUF_REPO = "https://huggingface.co/vantagewithai/FireRed-Image-Edit-1.1-GGUF/resolve/main"
+TEXT_ENCODER_URL = "https://huggingface.co/unsloth/Qwen2.5-VL-7B-Instruct-GGUF/resolve/main/Qwen2.5-VL-7B-Instruct-UD-Q4_K_XL.gguf?download=1"
+MMPROJ_URL = "https://huggingface.co/QuantStack/Qwen-Image-Edit-GGUF/resolve/main/mmproj/Qwen2.5-VL-7B-Instruct-mmproj-BF16.gguf?download=1"
+VAE_URL = "https://huggingface.co/Comfy-Org/Qwen-Image_ComfyUI/resolve/main/split_files/vae/qwen_image_vae.safetensors?download=1"
+
+files = [
+    (f"{GGUF_REPO}/FireRed-Image-Edit-1.1-{quant}.gguf?download=1", f"FireRed-Image-Edit-1.1-{quant}.gguf"),
+    (VAE_URL, "qwen_image_vae.safetensors"),
+    (MMPROJ_URL, "Qwen2.5-VL-7B-Instruct-mmproj-BF16.gguf"),
+    (TEXT_ENCODER_URL, "Qwen2.5-VL-7B-Instruct-UD-Q4_K_XL.gguf"),
+]
+
+target.mkdir(parents=True, exist_ok=True)
+headers = {"User-Agent": "FrameVision Optional Installs/1.0"}
+
+def remote_size(url: str):
+    try:
+        req = urllib.request.Request(url, method="HEAD", headers=headers)
+        with urllib.request.urlopen(req, timeout=60) as r:
+            n = r.headers.get("Content-Length")
+            return int(n) if n else None
+    except Exception:
+        return None
+
+def fmt_size(num):
+    if num is None:
+        return "unknown size"
+    units = ["B", "KB", "MB", "GB", "TB"]
+    v = float(num)
+    for u in units:
+        if v < 1024.0 or u == units[-1]:
+            return f"{v:.2f} {u}"
+        v /= 1024.0
+    return f"{num} B"
+
+def download(url: str, dest: Path) -> None:
+    size = remote_size(url)
+    if dest.exists() and size is not None and dest.stat().st_size == size:
+        print(f"[OK] already present: {dest.name} ({fmt_size(size)})", flush=True)
+        return
+    if dest.exists() and size is None and dest.stat().st_size > 0:
+        print(f"[OK] already present: {dest.name}", flush=True)
+        return
+
+    tmp = dest.with_suffix(dest.suffix + ".part")
+    if tmp.exists():
+        try:
+            tmp.unlink()
+        except Exception:
+            pass
+
+    print(f"[DL] {dest.name} -> {dest}", flush=True)
+    if size is not None:
+        print(f"[INFO] expected size: {fmt_size(size)}", flush=True)
+
+    req = urllib.request.Request(url, headers=headers)
+    with urllib.request.urlopen(req, timeout=120) as src, open(tmp, "wb") as out:
+        total = 0
+        last = 0.0
+        while True:
+            chunk = src.read(1024 * 1024 * 4)
+            if not chunk:
+                break
+            out.write(chunk)
+            total += len(chunk)
+            now = time.time()
+            if now - last >= 1.2:
+                if size:
+                    pct = (100.0 * total / size)
+                    print(f"[DL] {dest.name}: {pct:.1f}% ({fmt_size(total)} / {fmt_size(size)})", flush=True)
+                else:
+                    print(f"[DL] {dest.name}: {fmt_size(total)}", flush=True)
+                last = now
+
+    if size is not None and tmp.stat().st_size != size:
+        raise RuntimeError(f"Downloaded size mismatch for {dest.name}: got {tmp.stat().st_size}, expected {size}")
+
+    if dest.exists():
+        dest.unlink()
+    shutil.move(str(tmp), str(dest))
+    print(f"[OK] downloaded: {dest.name}", flush=True)
+
+print("[INFO] FireRed 1.1 GGUF download started", flush=True)
+print(f"[INFO] target folder: {target}", flush=True)
+print(f"[INFO] selected quant: {quant}", flush=True)
+for url, name in files:
+    download(url, target / name)
+print("[DONE] FireRed 1.1 GGUF files are ready.", flush=True)
+"""
+
+    args = ["-u", "-c", downloader, str(root), str(target), str(quant)]
+    return (str(py), args, root)
+
+
+def _run_firered_q3km(root: Path) -> Optional[Tuple[str, List[str], Path]]:
+    return _run_firered_gguf(root, "Q3_K_M")
+
+
+def _run_firered_q3ks(root: Path) -> Optional[Tuple[str, List[str], Path]]:
+    return _run_firered_gguf(root, "Q3_K_S")
+
+
+def _run_firered_q4_0(root: Path) -> Optional[Tuple[str, List[str], Path]]:
+    return _run_firered_gguf(root, "Q4_0")
+
+
+def _run_firered_q4_1(root: Path) -> Optional[Tuple[str, List[str], Path]]:
+    return _run_firered_gguf(root, "Q4_1")
+
+
+def _run_firered_q4ks(root: Path) -> Optional[Tuple[str, List[str], Path]]:
+    return _run_firered_gguf(root, "Q4_K_S")
+
+
+def _run_firered_q4km(root: Path) -> Optional[Tuple[str, List[str], Path]]:
+    return _run_firered_gguf(root, "Q4_K_M")
+
+
+def _run_firered_q5_0(root: Path) -> Optional[Tuple[str, List[str], Path]]:
+    return _run_firered_gguf(root, "Q5_0")
+
+
+def _run_firered_q5_1(root: Path) -> Optional[Tuple[str, List[str], Path]]:
+    return _run_firered_gguf(root, "Q5_1")
+
+
+def _run_firered_q5ks(root: Path) -> Optional[Tuple[str, List[str], Path]]:
+    return _run_firered_gguf(root, "Q5_K_S")
+
+
+def _run_firered_q5km(root: Path) -> Optional[Tuple[str, List[str], Path]]:
+    return _run_firered_gguf(root, "Q5_K_M")
+
+
+def _run_firered_q6k(root: Path) -> Optional[Tuple[str, List[str], Path]]:
+    return _run_firered_gguf(root, "Q6_K")
+
+
+def _run_firered_q8(root: Path) -> Optional[Tuple[str, List[str], Path]]:
+    return _run_firered_gguf(root, "Q8_0")
+
+
 
 def _default_installs() -> List[OptionalInstall]:
     # Titles/descriptions copied from install_menu.bat "extra options" page.
@@ -771,6 +949,12 @@ OptionalInstall(
             title="Hunyuan : Install Flash attention",
             description="(info) can speedup video generation. If the Hunyuan 1.5 environment is missing, it will be installed first.",
             runner=_run_hunyuan15_flashattn,
+        ),
+        OptionalInstall(
+            key="hiar",
+            title="Hiar wan 2.1 long format Video",
+            description="Experimental model for long consistency, about 20 gigabyte for model + repo. Enabling this optional install checks existing files and installs/downloads everything needed to get started.",
+            runner=_run_hiar,
         ),
         OptionalInstall(
             key="qwen2512",
@@ -843,6 +1027,79 @@ OptionalInstall(
             title="Qwen2511 Image Edit GGUF (Q8_0)",
             description="Quality almost identical to original model.",
             runner=_run_qwen2511_q8,
+        ),
+
+        OptionalInstall(
+            key="firered_q3km",
+            title="FireRed 1.1 Edit 20B GGUF (Q3_K_M)",
+            description="Lowest VRAM / smallest. Downloads the main GGUF plus shared VAE, text encoder and mmproj into models/FireRed-Image-Edit-1.1/.",
+            runner=_run_firered_q3km,
+        ),
+        OptionalInstall(
+            key="firered_q3ks",
+            title="FireRed 1.1 Edit 20B GGUF (Q3_K_S)",
+            description="Very low VRAM / smaller. Downloads the main GGUF plus shared VAE, text encoder and mmproj.",
+            runner=_run_firered_q3ks,
+        ),
+        OptionalInstall(
+            key="firered_q4_0",
+            title="FireRed 1.1 Edit 20B GGUF (Q4_0)",
+            description="Balanced lower-memory option. Downloads the main GGUF plus shared VAE, text encoder and mmproj.",
+            runner=_run_firered_q4_0,
+        ),
+        OptionalInstall(
+            key="firered_q4_1",
+            title="FireRed 1.1 Edit 20B GGUF (Q4_1)",
+            description="Balanced lower-memory option with slightly more quality than Q4_0.",
+            runner=_run_firered_q4_1,
+        ),
+        OptionalInstall(
+            key="firered_q4ks",
+            title="FireRed 1.1 Edit 20B GGUF (Q4_K_S)",
+            description="Good starting point for smaller VRAM systems.",
+            runner=_run_firered_q4ks,
+        ),
+        OptionalInstall(
+            key="firered_q4km",
+            title="FireRed 1.1 Edit 20B GGUF (Q4_K_M)",
+            description="Recommended balanced choice. High quality image editor, on average about 20 GB disk space needed once shared files are included.",
+            runner=_run_firered_q4km,
+        ),
+        OptionalInstall(
+            key="firered_q5_0",
+            title="FireRed 1.1 Edit 20B GGUF (Q5_0)",
+            description="Higher quality / larger download.",
+            runner=_run_firered_q5_0,
+        ),
+        OptionalInstall(
+            key="firered_q5_1",
+            title="FireRed 1.1 Edit 20B GGUF (Q5_1)",
+            description="Higher quality / larger download than Q5_0.",
+            runner=_run_firered_q5_1,
+        ),
+        OptionalInstall(
+            key="firered_q5ks",
+            title="FireRed 1.1 Edit 20B GGUF (Q5_K_S)",
+            description="High quality / larger. Downloads the main GGUF plus shared VAE, text encoder and mmproj.",
+            runner=_run_firered_q5ks,
+        ),
+        OptionalInstall(
+            key="firered_q5km",
+            title="FireRed 1.1 Edit 20B GGUF (Q5_K_M)",
+            description="High quality balanced choice. Close to the example layout from your screenshot.",
+            runner=_run_firered_q5km,
+        ),
+        OptionalInstall(
+            key="firered_q6k",
+            title="FireRed 1.1 Edit 20B GGUF (Q6_K)",
+            description="Very high quality / larger. Needs more VRAM and disk.",
+            runner=_run_firered_q6k,
+        ),
+        OptionalInstall(
+            key="firered_q8",
+            title="FireRed 1.1 Edit 20B GGUF (Q8_0)",
+            description="Best quality / largest GGUF. Main file alone is about 21.8 GB.",
+            runner=_run_firered_q8,
         ),
 
         OptionalInstall(
@@ -1083,6 +1340,7 @@ _ENV_DIR_BY_KEY = {
     "whisper": Path("environments") / ".whisper",
     "ace15": Path("environments") / ".ace_15",
     "hunyuan15": Path(".hunyuan15_env"),
+    "hiar": Path("environments") / ".hiar",
     "qwen2512": Path(".qwen2512") / "venv",
     "gfpgan": Path("models") / "gfpgan" / ".GFPGAN",
     "seedvr2_env": Path("environments") / ".seedvr2",
@@ -1370,6 +1628,8 @@ class OptionalInstallsDialog(QtWidgets.QDialog):
                 row.toggled.connect(lambda checked, k=opt.key: self._on_qwen2511_model_toggled(k, checked))
             if is_qwen3tts_extra:
                 row.toggled.connect(lambda checked, k=opt.key: self._on_qwen3tts_model_toggled(k, checked))
+            if opt.key.startswith("firered_"):
+                row.toggled.connect(lambda checked, k=opt.key: self._on_firered_model_toggled(k, checked))
 
             if is_seedvr2_extra:
                 row.toggled.connect(lambda checked, k=opt.key: self._on_seedvr2_model_toggled(k, checked))
@@ -1394,7 +1654,7 @@ class OptionalInstallsDialog(QtWidgets.QDialog):
         # ---- Video models
         opts_lay.addWidget(_mk_section_label("Video models"))
 
-        for k in ("wan22", "hunyuan15", "hunyuan15_flashattn"):
+        for k in ("wan22", "hunyuan15", "hunyuan15_flashattn", "hiar"):
             opt = by_key.get(k)
             if opt:
                 _add_opt(opt, opts_lay)
@@ -1421,6 +1681,31 @@ class OptionalInstallsDialog(QtWidgets.QDialog):
                 _add_opt(opt, qwen_lay)
 
         opts_lay.addWidget(qwen_sec)
+
+        # FireRed group (collapsible)
+        firered_sec = _CollapsibleSection("FireRed 1.1 edit 20B GGUF", start_collapsed=True)
+        firered_lay = firered_sec.layout_content()
+
+        _add_group_label("Main model (choose one)", firered_lay)
+        for k in (
+            "firered_q3km",
+            "firered_q3ks",
+            "firered_q4_0",
+            "firered_q4_1",
+            "firered_q4ks",
+            "firered_q4km",
+            "firered_q5_0",
+            "firered_q5_1",
+            "firered_q5ks",
+            "firered_q5km",
+            "firered_q6k",
+            "firered_q8",
+        ):
+            opt = by_key.get(k)
+            if opt:
+                _add_opt(opt, firered_lay)
+
+        opts_lay.addWidget(firered_sec)
 
         # Z-Image group (collapsible)
         zimg_sec = _CollapsibleSection("Z-Image models", start_collapsed=True)
@@ -1903,6 +2188,26 @@ class OptionalInstallsDialog(QtWidgets.QDialog):
                 "Update your FrameVision install or reinstall optional installs scripts."
             )
             return
+
+
+    def _on_firered_model_toggled(self, key: str, checked: bool) -> None:
+        """Keep FireRed GGUF selections sane and show a short info toast."""
+        if not checked:
+            return
+
+        try:
+            for k, row in getattr(self, "_row_by_key", {}).items():
+                if k.startswith("firered_") and k != key and row.is_checked():
+                    row.set_checked(False)
+        except Exception:
+            pass
+
+        py = _venv_python(self.root_dir)
+        if py is None or (not py.exists()):
+            self._toast("Python .venv not found. Run the main installer first so FrameVision creates .venv.")
+            return
+
+        self._toast("FireRed 1.1 files will be downloaded flat into models/FireRed-Image-Edit-1.1 when you press Start.")
 
 
     def _on_seedvr2_model_toggled(self, key: str, checked: bool) -> None:

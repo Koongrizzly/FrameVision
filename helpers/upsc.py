@@ -560,6 +560,10 @@ class UpscPane(QtWidgets.QWidget):
         self.chk_seedvr2_temporal.setChecked(True)
         lay_seed.addWidget(self.chk_seedvr2_temporal)
 
+        self.chk_seedvr2_prepend = QtWidgets.QCheckBox("Prepend frames", self)
+        self.chk_seedvr2_prepend.setToolTip("Prepends 4 reversed frames at the start to reduce startup artifacts. The helper frames are removed automatically from the final output.")
+        lay_seed.addWidget(self.chk_seedvr2_prepend)
+
         # Color correction
         row_c = QtWidgets.QHBoxLayout()
         row_c.addWidget(QtWidgets.QLabel("Color correction:", self))
@@ -590,48 +594,60 @@ class UpscPane(QtWidgets.QWidget):
         self.spin_seedvr2_chunk.setValue(20)
         adv.addWidget(self.spin_seedvr2_chunk, 1, 1)
 
-        adv.addWidget(QtWidgets.QLabel("Attention mode:", self), 2, 0)
+        self.chk_seedvr2_blockswap = QtWidgets.QCheckBox("BlockSwap (DiT offload to CPU)", self)
+        self.chk_seedvr2_blockswap.setToolTip("Moves part of the SeedVR2 transformer to CPU to save VRAM. Slower, but can help on lower VRAM cards.")
+        adv.addWidget(self.chk_seedvr2_blockswap, 2, 0, 1, 2)
+
+        adv.addWidget(QtWidgets.QLabel("Blocks to swap:", self), 3, 0)
+        self.spin_seedvr2_blocks = QtWidgets.QSpinBox(self)
+        self.spin_seedvr2_blocks.setRange(1, 36)
+        self.spin_seedvr2_blocks.setValue(16)
+        self.spin_seedvr2_blocks.setEnabled(False)
+        self.spin_seedvr2_blocks.setToolTip("How many transformer blocks SeedVR2 swaps out. Higher saves more VRAM but can be slower.")
+        adv.addWidget(self.spin_seedvr2_blocks, 3, 1)
+
+        adv.addWidget(QtWidgets.QLabel("Attention mode:", self), 4, 0)
         self.combo_seedvr2_attn = QtWidgets.QComboBox(self)
         for _am in ("sdpa", "xformers", "flash_attn"):
             self.combo_seedvr2_attn.addItem(_am)
         self.combo_seedvr2_attn.setCurrentText("sdpa")
-        adv.addWidget(self.combo_seedvr2_attn, 2, 1)
+        adv.addWidget(self.combo_seedvr2_attn, 4, 1)
 
         self.lbl_seedvr2_attn_warn = QtWidgets.QLabel("Note: xformers / flash_attn must be installed in the SeedVR2 environment, or the run may fail.", self)
         self.lbl_seedvr2_attn_warn.setStyleSheet("color:#9fb3c8;font-size:12px;")
         self.lbl_seedvr2_attn_warn.setWordWrap(True)
         self.lbl_seedvr2_attn_warn.setVisible(False)
-        adv.addWidget(self.lbl_seedvr2_attn_warn, 3, 0, 1, 2)
+        adv.addWidget(self.lbl_seedvr2_attn_warn, 5, 0, 1, 2)
 
         # Offload options (tiled VAE)
         self.chk_seedvr2_vae_enc = QtWidgets.QCheckBox("VAE encode tiled", self)
         self.chk_seedvr2_vae_dec = QtWidgets.QCheckBox("VAE decode tiled", self)
-        adv.addWidget(self.chk_seedvr2_vae_enc, 4, 0, 1, 2)
-        adv.addWidget(self.chk_seedvr2_vae_dec, 5, 0, 1, 2)
+        adv.addWidget(self.chk_seedvr2_vae_enc, 6, 0, 1, 2)
+        adv.addWidget(self.chk_seedvr2_vae_dec, 7, 0, 1, 2)
 
-        adv.addWidget(QtWidgets.QLabel("Encode tile size:", self), 6, 0)
+        adv.addWidget(QtWidgets.QLabel("Encode tile size:", self), 8, 0)
         self.spin_seedvr2_enc_tile = QtWidgets.QSpinBox(self)
         self.spin_seedvr2_enc_tile.setRange(128, 4096)
         self.spin_seedvr2_enc_tile.setValue(1024)
-        adv.addWidget(self.spin_seedvr2_enc_tile, 6, 1)
+        adv.addWidget(self.spin_seedvr2_enc_tile, 8, 1)
 
-        adv.addWidget(QtWidgets.QLabel("Encode overlap:", self), 7, 0)
+        adv.addWidget(QtWidgets.QLabel("Encode overlap:", self), 9, 0)
         self.spin_seedvr2_enc_ov = QtWidgets.QSpinBox(self)
         self.spin_seedvr2_enc_ov.setRange(0, 1024)
         self.spin_seedvr2_enc_ov.setValue(64)
-        adv.addWidget(self.spin_seedvr2_enc_ov, 7, 1)
+        adv.addWidget(self.spin_seedvr2_enc_ov, 9, 1)
 
-        adv.addWidget(QtWidgets.QLabel("Decode tile size:", self), 8, 0)
+        adv.addWidget(QtWidgets.QLabel("Decode tile size:", self), 10, 0)
         self.spin_seedvr2_dec_tile = QtWidgets.QSpinBox(self)
         self.spin_seedvr2_dec_tile.setRange(128, 4096)
         self.spin_seedvr2_dec_tile.setValue(1024)
-        adv.addWidget(self.spin_seedvr2_dec_tile, 8, 1)
+        adv.addWidget(self.spin_seedvr2_dec_tile, 10, 1)
 
-        adv.addWidget(QtWidgets.QLabel("Decode overlap:", self), 9, 0)
+        adv.addWidget(QtWidgets.QLabel("Decode overlap:", self), 11, 0)
         self.spin_seedvr2_dec_ov = QtWidgets.QSpinBox(self)
         self.spin_seedvr2_dec_ov.setRange(0, 1024)
         self.spin_seedvr2_dec_ov.setValue(64)
-        adv.addWidget(self.spin_seedvr2_dec_ov, 9, 1)
+        adv.addWidget(self.spin_seedvr2_dec_ov, 11, 1)
 
         lay_seed.addWidget(self.grp_seedvr2_adv)
         v.addWidget(self.box_seedvr2)
@@ -1000,6 +1016,10 @@ class UpscPane(QtWidgets.QWidget):
         except Exception:
             pass
         try:
+            self.chk_seedvr2_blockswap.toggled.connect(self.spin_seedvr2_blocks.setEnabled)
+        except Exception:
+            pass
+        try:
             self._update_seedvr2_mode(self.chk_seedvr2.isChecked())
         except Exception:
             pass
@@ -1173,9 +1193,12 @@ class UpscPane(QtWidgets.QWidget):
             ("combo_seedvr2_gguf", "currentTextChanged"),
             ("combo_seedvr2_res", "currentTextChanged"),
             ("chk_seedvr2_temporal", "toggled"),
+            ("chk_seedvr2_prepend", "toggled"),
             ("combo_seedvr2_color", "currentTextChanged"),
             ("spin_seedvr2_batch", "valueChanged"),
             ("spin_seedvr2_chunk", "valueChanged"),
+            ("chk_seedvr2_blockswap", "toggled"),
+            ("spin_seedvr2_blocks", "valueChanged"),
             ("combo_seedvr2_attn", "currentTextChanged"),
             ("chk_seedvr2_vae_enc", "toggled"),
             ("chk_seedvr2_vae_dec", "toggled"),
@@ -1285,11 +1308,15 @@ class UpscPane(QtWidgets.QWidget):
         except Exception: pass
         try: d["seedvr2_temporal"] = bool(self.chk_seedvr2_temporal.isChecked())
         except Exception: pass
+        try: d["seedvr2_prepend"] = bool(self.chk_seedvr2_prepend.isChecked())
+        except Exception: pass
         try: d["seedvr2_color"] = self.combo_seedvr2_color.currentText()
         except Exception: pass
         try:
             d["seedvr2_batch"] = int(self.spin_seedvr2_batch.value())
             d["seedvr2_chunk"] = int(self.spin_seedvr2_chunk.value())
+            d["seedvr2_blockswap"] = bool(self.chk_seedvr2_blockswap.isChecked())
+            d["seedvr2_blocks"] = int(self.spin_seedvr2_blocks.value())
             d["seedvr2_attn"] = self.combo_seedvr2_attn.currentText()
             d["seedvr2_vae_enc"] = bool(self.chk_seedvr2_vae_enc.isChecked())
             d["seedvr2_vae_dec"] = bool(self.chk_seedvr2_vae_dec.isChecked())
@@ -1398,6 +1425,10 @@ class UpscPane(QtWidgets.QWidget):
         except Exception:
             pass
         try:
+            self.chk_seedvr2_prepend.setChecked(bool(d.get("seedvr2_prepend", False)))
+        except Exception:
+            pass
+        try:
             cc = d.get("seedvr2_color")
             if cc:
                 i = self.combo_seedvr2_color.findText(cc)
@@ -1407,6 +1438,9 @@ class UpscPane(QtWidgets.QWidget):
         try:
             self.spin_seedvr2_batch.setValue(int(d.get("seedvr2_batch", 1)))
             self.spin_seedvr2_chunk.setValue(int(d.get("seedvr2_chunk", 20)))
+            self.chk_seedvr2_blockswap.setChecked(bool(d.get("seedvr2_blockswap", False)))
+            self.spin_seedvr2_blocks.setValue(int(d.get("seedvr2_blocks", 16)))
+            self.spin_seedvr2_blocks.setEnabled(bool(self.chk_seedvr2_blockswap.isChecked()))
             am = d.get("seedvr2_attn")
             if am:
                 i = self.combo_seedvr2_attn.findText(am)
@@ -2271,6 +2305,7 @@ class UpscPane(QtWidgets.QWidget):
                     self._last_outfile = outfile
 
                     temporal = 1 if bool(self.chk_seedvr2_temporal.isChecked()) else 0
+                    prepend_frames = 4 if bool(getattr(self, "chk_seedvr2_prepend", None) and self.chk_seedvr2_prepend.isChecked()) else 0
                     cc = (self.combo_seedvr2_color.currentText() or "").strip() or "lab"
                     attn = (self.combo_seedvr2_attn.currentText() or "sdpa").strip() or "sdpa"
 
@@ -2284,9 +2319,17 @@ class UpscPane(QtWidgets.QWidget):
                            "--batch_size", str(int(self.spin_seedvr2_batch.value())),
                            "--chunk_size", str(int(self.spin_seedvr2_chunk.value())),
                            "--temporal_overlap", str(int(temporal)),
+                           "--prepend_frames", str(int(prepend_frames)),
                            "--color_correction", str(cc),
                            "--attention_mode", str(attn),
                            ]
+
+                    try:
+                        if self.chk_seedvr2_blockswap.isChecked():
+                            seed_forward += ["--blocks_to_swap", str(int(self.spin_seedvr2_blocks.value()))]
+                            seed_forward += ["--dit_offload_device", "cpu"]
+                    except Exception:
+                        pass
 
                     # Offload options (tiled VAE)
                     try:

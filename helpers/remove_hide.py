@@ -68,15 +68,21 @@ def build_registry() -> List[Entry]:
             model_paths=["/models/hunyuanvideo-community_HunyuanVideo*.*"],
             helper_paths=["/helpers/hunyuan15.py"],
         ),
-
-Entry(
-    id="ace_step_15",
-    title="Ace Step 1.5 Music creation",
-    env_paths=["/environments/.ace_15/"],
-    model_paths=["/models/ace_step_15/"],
-    repo_paths=["/models/ace_step_15/repo/ACE-Step-1.5/"],
-    helper_paths=[],
-),
+        Entry(
+            id="hiar",
+            title="HiAR WAN 2.1 long format video",
+            env_paths=["/environments/.hiar/"],
+            model_paths=["/models/hiar/"],
+            helper_paths=["/helpers/hiar.py"],
+        ),
+        Entry(
+            id="ace_step_15",
+            title="Ace Step 1.5 Music creation",
+            env_paths=["/environments/.ace_15/"],
+            model_paths=["/models/ace_step_15/"],
+            repo_paths=["/models/ace_step_15/repo/ACE-Step-1.5/"],
+            helper_paths=[],
+        ),
 
         Entry(
             id="sdxl_txt2img",
@@ -129,6 +135,38 @@ Entry(
             shared_env_group="zimage_shared",
             shared_env_path="/.zimage_env",
             shared_helper_note="Shared helper with other models , hiding all will also hide the full tab in the app .",
+        ),
+        Entry(
+            id="firered_11_gguf",
+            title="FireRed 1.1 Edit 20B GGUF",
+            model_paths=["/models/FireRed-Image-Edit-1.1/"],
+            helper_paths=["/helpers/firered.py"],
+        ),
+        Entry(
+            id="flux_klein_4b",
+            title="Flux Klein 4B GGUF",
+            env_paths=["/environments/.klein4B/"],
+            model_paths=["/models/klein4b_gguf/"],
+            shared_env_group="flux_klein_shared",
+            shared_env_path="/environments/.klein4B/",
+            shared_helper_note="Shared Flux Klein environment. It is only removed when both Klein entries are removed.",
+        ),
+        Entry(
+            id="flux_klein_9b",
+            title="Flux Klein 9B GGUF",
+            env_paths=["/environments/.klein4B/"],
+            model_paths=["/models/klein9b_gguf/"],
+            shared_env_group="flux_klein_shared",
+            shared_env_path="/environments/.klein4B/",
+            shared_helper_note="Shared Flux Klein environment. It is only removed when both Klein entries are removed.",
+        ),
+        Entry(
+            id="seedvr2",
+            title="SEEDVR2",
+            env_paths=["/environments/.seedvr2/"],
+            model_paths=["/models/SEEDVR2/"],
+            repo_paths=["/presets/extra_env/seedvr2_src/"],
+            helper_paths=["/helpers/seedvr2_runner.py", "/helpers/upsc.py"],
         ),
 
         Entry(
@@ -468,6 +506,15 @@ def siblings_in_group(registry: List[Entry], group_id: str, exclude_id: str) -> 
 # -------------------------
 
 
+def _is_helpers_path(app_root: str, p: str) -> bool:
+    """Protect everything inside the app's /helpers folder from deletion."""
+    try:
+        helpers_root = resolve_app_path(app_root, "/helpers/")
+        return _is_within(p, helpers_root)
+    except Exception:
+        return False
+
+
 def remove_path(p: str) -> Tuple[bool, str]:
     """Attempt to delete file/folder at p."""
     if not os.path.exists(p):
@@ -489,9 +536,15 @@ def remove_entry(app_root: str, registry: List[Entry], e: Entry) -> List[Tuple[b
 
     # 1) Remove models and repos (always safe)
     for p in r["models"]:
+        if _is_helpers_path(app_root, p):
+            results.append((True, f"Skipped protected helpers path: {p}"))
+            continue
         ok, msg = remove_path(p)
         results.append((ok, msg))
     for p in r["repos"]:
+        if _is_helpers_path(app_root, p):
+            results.append((True, f"Skipped protected helpers path: {p}"))
+            continue
         ok, msg = remove_path(p)
         results.append((ok, msg))
 
@@ -504,8 +557,11 @@ def remove_entry(app_root: str, registry: List[Entry], e: Entry) -> List[Tuple[b
         if sib_installed:
             results.append((True, f"Skipped shared env (still needed): {shared_env_abs}"))
         else:
-            ok, msg = remove_path(shared_env_abs)
-            results.append((ok, msg))
+            if _is_helpers_path(app_root, shared_env_abs):
+                results.append((True, f"Skipped protected helpers path: {shared_env_abs}"))
+            else:
+                ok, msg = remove_path(shared_env_abs)
+                results.append((ok, msg))
 
         # If env_paths include the same shared env, skip individual deletions to avoid duplicates
         # (Still okay if we try again; but keep output tidy.)
@@ -513,10 +569,16 @@ def remove_entry(app_root: str, registry: List[Entry], e: Entry) -> List[Tuple[b
         for p in r["envs"]:
             if p in env_abs_set:
                 continue
+            if _is_helpers_path(app_root, p):
+                results.append((True, f"Skipped protected helpers path: {p}"))
+                continue
             ok, msg = remove_path(p)
             results.append((ok, msg))
     else:
         for p in r["envs"]:
+            if _is_helpers_path(app_root, p):
+                results.append((True, f"Skipped protected helpers path: {p}"))
+                continue
             ok, msg = remove_path(p)
             results.append((ok, msg))
 

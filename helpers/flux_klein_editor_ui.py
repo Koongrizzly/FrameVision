@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-FrameVision – FLUX.2 Klein 4B (GGUF) Editor UI
+FrameVision – FLUX.2 Klein 4B & 9B (GGUF loader) Editor UI
 Backend: stable-diffusion.cpp `sd-cli.exe` (no torch/diffusers)
 
 Uses the official FLUX.2 Klein CLI wiring (Flux2 docs):

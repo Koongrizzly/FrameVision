@@ -1236,6 +1236,41 @@ def _has_flash_attn() -> bool:
     return importlib.util.find_spec("flash_attn") is not None
 
 
+def _install_transformers_flash_dtype_patch(torch_mod, forced_dtype):
+    """
+    Some qwen_tts builds do nested Transformers model loads without forwarding
+    torch_dtype, which triggers the FlashAttention2 warning even when the UI
+    dtype is set correctly. Patch the shared Transformers load path so any
+    nested from_pretrained() call also receives an explicit dtype.
+    """
+    try:
+        from transformers.modeling_utils import PreTrainedModel  # type: ignore
+    except Exception:
+        return
+
+    original = getattr(PreTrainedModel, "_framevision_orig_from_pretrained", None)
+    if original is None:
+        original = PreTrainedModel.from_pretrained
+        setattr(PreTrainedModel, "_framevision_orig_from_pretrained", original)
+
+    def _needs_flash_dtype(kwargs: dict) -> bool:
+        attn = kwargs.get("attn_implementation", None)
+        return attn == "flash_attention_2"
+
+    def _patched(cls, *args, **kwargs):
+        try:
+            if _needs_flash_dtype(kwargs):
+                if kwargs.get("torch_dtype", None) is None:
+                    kwargs["torch_dtype"] = forced_dtype
+                if kwargs.get("dtype", None) is None:
+                    kwargs["dtype"] = kwargs["torch_dtype"]
+        except Exception:
+            pass
+        return original.__get__(cls, cls)(*args, **kwargs)
+
+    PreTrainedModel.from_pretrained = classmethod(_patched)
+
+
 def _load_model(Qwen3TTSModel, model_path_or_id: str, tokenizer_path: str, common: dict):
     import torch  # local import (worker only)
 
@@ -1250,6 +1285,9 @@ def _load_model(Qwen3TTSModel, model_path_or_id: str, tokenizer_path: str, commo
         _worker_log("FlashAttention2 selected but flash_attn is not installed; falling back to SDPA.")
         attn_choice = "sdpa"
         attn_impl = "sdpa"
+
+    if attn_choice == "flash_attention_2":
+        _install_transformers_flash_dtype_patch(torch, dtype)
 
     # Some qwen_tts package builds forward `dtype`, others forward `torch_dtype`.
     # Pass both so the wrapper and the underlying Transformers load path both receive it.
