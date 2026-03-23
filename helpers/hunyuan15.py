@@ -2,6 +2,7 @@ import json
 import os
 import sys
 import re
+import shutil
 import subprocess
 from datetime import datetime
 from pathlib import Path
@@ -240,6 +241,12 @@ def _ffmpeg_exe() -> str | None:
                 return str(p)
         except Exception:
             continue
+    try:
+        found = shutil.which("ffmpeg") or shutil.which("ffmpeg.exe")
+        if found:
+            return str(found)
+    except Exception:
+        pass
     return None
 
 
@@ -2449,27 +2456,153 @@ class Hunyuan15ToolWidget(QWidget):
         return _extend_frames_dir() / f"{prefix}_{ts}_{idx:02d}.png"
 
     def _extract_last_frame(self, video: Path, dest: Path) -> bool:
-        """Extract last frame of a video to dest (used for extend-chain)."""
+        """Extract the actual last decodable video frame to dest (used for extend-chain).
+
+        We first try a fast near-end seek, then a duration-based exact-end seek, and finally
+        a reverse-filter fallback which is slower but reliably yields the true last frame.
+        """
         ff = _ffmpeg_exe()
         if not ff:
+            self._append("[extend] ffmpeg not found; cannot extract last frame.")
             return False
+
+        def _run_capture(cmd: list[str]) -> tuple[bool, str]:
+            try:
+                if dest.exists():
+                    try:
+                        dest.unlink()
+                    except Exception:
+                        pass
+                proc = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False)
+                stderr = (proc.stderr or b"").decode("utf-8", errors="ignore").strip()
+                return bool(proc.returncode == 0 and dest.exists() and dest.stat().st_size > 0), stderr
+            except Exception as e:
+                return False, str(e)
+
+        # Fast path: ask ffmpeg for the last frame near EOF.
+        attempts: list[tuple[str, list[str]]] = [
+            (
+                "near-end seek",
+                [
+                    ff,
+                    "-y",
+                    "-hide_banner",
+                    "-loglevel",
+                    "error",
+                    "-sseof",
+                    "-0.001",
+                    "-i",
+                    str(video),
+                    "-frames:v",
+                    "1",
+                    str(dest),
+                ],
+            )
+        ]
+
+        # More exact path: use ffprobe duration and seek to just before the final frame.
         try:
-            cmd = [
-                ff,
-                "-y",
-                "-hide_banner",
-                "-sseof",
-                "-0.05",
-                "-i",
-                str(video),
-                "-frames:v",
-                "1",
-                str(dest),
-            ]
-            subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=True)
-            return dest.exists()
+            fp = _ffprobe_exe()
+            if fp:
+                dur_cmd = [
+                    fp,
+                    "-v",
+                    "error",
+                    "-select_streams",
+                    "v:0",
+                    "-show_entries",
+                    "stream=avg_frame_rate,duration:format=duration",
+                    "-of",
+                    "json",
+                    str(video),
+                ]
+                probe = subprocess.run(dur_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False)
+                info = json.loads((probe.stdout or b"{}").decode("utf-8", errors="ignore") or "{}")
+                duration = 0.0
+                fps = 24.0
+                try:
+                    duration = float((((info.get("streams") or [{}])[0]).get("duration")) or 0.0)
+                except Exception:
+                    duration = 0.0
+                if duration <= 0.0:
+                    try:
+                        duration = float((info.get("format") or {}).get("duration") or 0.0)
+                    except Exception:
+                        duration = 0.0
+                try:
+                    rate = str((((info.get("streams") or [{}])[0]).get("avg_frame_rate")) or "0/0")
+                    if "/" in rate:
+                        num_s, den_s = rate.split("/", 1)
+                        num = float(num_s or 0)
+                        den = float(den_s or 0)
+                        if num > 0 and den > 0:
+                            fps = num / den
+                    elif float(rate) > 0:
+                        fps = float(rate)
+                except Exception:
+                    fps = 24.0
+                frame_step = max(1.0 / max(fps, 1.0), 0.001)
+                if duration > 0.0:
+                    seek_pos = max(duration - frame_step, 0.0)
+                    attempts.append(
+                        (
+                            "duration-based seek",
+                            [
+                                ff,
+                                "-y",
+                                "-hide_banner",
+                                "-loglevel",
+                                "error",
+                                "-ss",
+                                f"{seek_pos:.6f}",
+                                "-i",
+                                str(video),
+                                "-frames:v",
+                                "1",
+                                str(dest),
+                            ],
+                        )
+                    )
         except Exception:
-            return False
+            pass
+
+        # Slow but robust fallback: reverse the clip and grab the first frame -> original last frame.
+        attempts.append(
+            (
+                "reverse fallback",
+                [
+                    ff,
+                    "-y",
+                    "-hide_banner",
+                    "-loglevel",
+                    "error",
+                    "-i",
+                    str(video),
+                    "-vf",
+                    "reverse",
+                    "-frames:v",
+                    "1",
+                    str(dest),
+                ],
+            )
+        )
+
+        last_err = ""
+        for label, cmd in attempts:
+            ok, err = _run_capture(cmd)
+            if ok:
+                if label != "near-end seek":
+                    self._append(f"[extend] last-frame extraction used {label} for {video.name}.")
+                return True
+            if err:
+                last_err = err
+
+        if last_err:
+            try:
+                self._append(f"[extend] last-frame extraction failed for {video.name}: {last_err[:300]}")
+            except Exception:
+                pass
+        return False
 
     def _auto_merge_extend_segments(self) -> Path | None:
         """Auto-merge all generated extend segments into a single MP4.
@@ -2528,6 +2661,21 @@ class Hunyuan15ToolWidget(QWidget):
             fps = int(getattr(self, "fps", None).value()) if getattr(self, "fps", None) is not None else 15
         except Exception:
             fps = 15
+        try:
+            target_bitrate_kbps = int(getattr(self, "bitrate_kbps", None).value()) if getattr(self, "bitrate_kbps", None) is not None else 0
+        except Exception:
+            target_bitrate_kbps = 0
+        if target_bitrate_kbps < 0:
+            target_bitrate_kbps = 0
+        bitrate_args: list[str] = []
+        if target_bitrate_kbps > 0:
+            kbps = f"{target_bitrate_kbps}k"
+            buf_kbps = f"{max(target_bitrate_kbps * 2, target_bitrate_kbps)}k"
+            bitrate_args = [
+                "-b:v", kbps,
+                "-maxrate", kbps,
+                "-bufsize", buf_kbps,
+            ]
 
         # Normalize / trim segments into temp files (safe, keeps merge stable)
         work_dir = _temp_dir() / f"hunyuan15_extend_merge_{ts}"
@@ -2561,8 +2709,7 @@ class Hunyuan15ToolWidget(QWidget):
                     "libx264",
                     "-preset",
                     "veryfast",
-                    "-crf",
-                    "18",
+                ] + bitrate_args + [
                     "-pix_fmt",
                     "yuv420p",
                     str(out_norm),
@@ -2644,8 +2791,7 @@ class Hunyuan15ToolWidget(QWidget):
                         "libx264",
                         "-preset",
                         "veryfast",
-                        "-crf",
-                        "18",
+                    ] + bitrate_args + [
                         "-pix_fmt",
                         "yuv420p",
                         str(merged),
@@ -2668,6 +2814,10 @@ class Hunyuan15ToolWidget(QWidget):
             self._append(f"[extend] failed to prepare concat list: {e}")
             return None
 
+        if target_bitrate_kbps > 0:
+            self._append(f"[extend] merge target bitrate: {target_bitrate_kbps} kbps")
+        else:
+            self._append("[extend] merge target bitrate: source/default ffmpeg behavior")
         self._append(f"[extend] merging {len(norm_segments)} segments → {merged.name}")
         try:
             cmd = [
@@ -2707,8 +2857,7 @@ class Hunyuan15ToolWidget(QWidget):
                 "libx264",
                 "-preset",
                 "veryfast",
-                "-crf",
-                "18",
+            ] + bitrate_args + [
                 "-pix_fmt",
                 "yuv420p",
                 str(merged),
