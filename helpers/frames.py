@@ -2,6 +2,7 @@ import os
 import json
 import subprocess
 import platform
+import re
 from pathlib import Path
 
 def _frames_get_input(owner):
@@ -294,7 +295,9 @@ def _run_last(owner):
     out = OUT_FRAMES / f"{Path(inp).stem}_lastframe.{ext}"
     _ensure_outdir(out)
     setattr(owner, "_frames_last_dir", out.parent)
-    cmd = [ffmpeg_path(), "-y", "-sseof", "-1", "-i", str(inp)] + _codec_args_for_ext(ext) + ["-update", "1", "-frames:v", "1", str(out)]
+    # Exact last displayed frame: reverse the decoded video stream and grab the first frame.
+    # This is slower than a near-end seek, but it avoids extracting a frame from ~1 second before the end.
+    cmd = [ffmpeg_path(), "-y", "-i", str(inp), "-vf", "reverse"] + _codec_args_for_ext(ext) + ["-frames:v", "1", str(out)]
     getattr(owner, "_run", lambda *_: None)(cmd, out)
     _set_info(owner, f"Queued last-frame extraction → {out}")
 
@@ -354,20 +357,62 @@ def _join_frames(owner):
             pass
 
     p = Path(folder)
-    # Detect which image extension is present
-    candidates = ["*.png", "*.jpg", "*.jpeg", "*.webp", "*.bmp", "*.tif", "*.tiff"]
-    pattern = None
-    for glob_pat in candidates:
-        try:
-            if any(p.glob(glob_pat)):
-                pattern = str(p / glob_pat)
-                break
-        except Exception:
-            continue
 
-    if not pattern:
+    # Detect a real numbered image sequence like frame_000001.png.
+    exts = {".png", ".jpg", ".jpeg", ".webp", ".bmp", ".tif", ".tiff"}
+    seq_re = re.compile(r"^(?P<prefix>.*?)(?P<num>\d+)(?P<suffix>\.[^.]+)$", re.IGNORECASE)
+    groups = {}
+
+    try:
+        files = [f for f in p.iterdir() if f.is_file() and f.suffix.lower() in exts]
+    except Exception:
+        files = []
+
+    for f in files:
+        m = seq_re.match(f.name)
+        if not m:
+            continue
+        prefix = m.group("prefix")
+        num_txt = m.group("num")
+        suffix = m.group("suffix")
+        width = len(num_txt)
+        num = int(num_txt)
+        key = (prefix, suffix.lower(), width)
+        groups.setdefault(key, []).append(num)
+
+    if not groups:
         try:
-            QMessageBox.warning(owner, "Join frames", "No image frames (png/jpg/webp/bmp/tif) were found in that folder.")
+            QMessageBox.warning(
+                owner,
+                "Join frames",
+                "No numbered image frame sequence was found in that folder. Expected names like frame_000001.png."
+            )
+        except Exception:
+            pass
+        return
+
+    # Pick the largest detected sequence.
+    best_key = None
+    best_nums = []
+    for key, nums in groups.items():
+        nums = sorted(set(nums))
+        if len(nums) > len(best_nums):
+            best_key = key
+            best_nums = nums
+
+    prefix, suffix, width = best_key
+    start_number = best_nums[0]
+    expected = list(range(start_number, start_number + len(best_nums)))
+    if best_nums != expected:
+        missing = sorted(set(expected) - set(best_nums))
+        msg = "The frame sequence has gaps, so join was stopped to avoid a broken video."
+        if missing:
+            preview = ", ".join(str(x) for x in missing[:10])
+            if len(missing) > 10:
+                preview += ", ..."
+            msg += f" Missing frame numbers: {preview}"
+        try:
+            QMessageBox.warning(owner, "Join frames", msg)
         except Exception:
             pass
         return
@@ -381,16 +426,19 @@ def _join_frames(owner):
     if fps < 1:
         fps = 1
 
+    input_pattern = p / f"{prefix}%0{width}d{suffix}"
     out = OUT_FRAMES / f"{p.name}_joined.mp4"
     _ensure_outdir(out)
 
     cmd = [
         ffmpeg_path(), "-y",
         "-framerate", str(fps),
-        "-pattern_type", "glob",
-        "-i", pattern,
+        "-start_number", str(start_number),
+        "-i", str(input_pattern),
         "-c:v", "libx264",
-        "-pix_fmt", "yuv420p",
+        "-crf", "0",
+        "-preset", "slow",
+        "-pix_fmt", "yuv444p",
         str(out)
     ]
 

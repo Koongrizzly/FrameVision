@@ -905,6 +905,43 @@ def enqueue_external(job: dict):
 # <<< FRAMEVISION_QWEN_END
 
 
+
+
+def enqueue_resize_job(input_path: str, out_dir: str, cmd, outfile: str = '', label: str = 'Resize') -> bool:
+    """Enqueue a resize/convert FFmpeg job using the generic external runner.
+
+    Uses the real input path so the queue row stays visible and identifiable.
+    """
+    try:
+        from helpers.job_helper import make_job_json
+        from helpers.queue_adapter import jobs_dirs
+    except Exception:
+        from job_helper import make_job_json
+        from queue_adapter import jobs_dirs
+
+    try:
+        d = jobs_dirs()
+        args = {
+            'cmd': list(cmd) if isinstance(cmd, (list, tuple)) else cmd,
+            'label': str(label or 'Resize').strip() or 'Resize',
+            'outfile': str(outfile or '').strip(),
+        }
+        inp = str(input_path or '').strip()
+        if not inp:
+            inp = str((Path(out_dir) / '_resize_job.txt').resolve())
+            try:
+                Path(inp).parent.mkdir(parents=True, exist_ok=True)
+                if not Path(inp).exists():
+                    Path(inp).write_text(args['label'][:200], encoding='utf-8')
+            except Exception:
+                pass
+        return bool(make_job_json('tools_ffmpeg', inp, str(out_dir), args, str(d['pending']), priority=560))
+    except Exception as e:
+        try:
+            print('[queue] enqueue_resize_job failed:', e)
+        except Exception:
+            pass
+        return False
 def default_txt2img_outdir():
     from pathlib import Path
     base = Path('.').resolve()

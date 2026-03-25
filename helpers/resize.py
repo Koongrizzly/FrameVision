@@ -11,11 +11,11 @@
 #   - Video format conversion (MP4/MKV/WebM)
 #   - Image format conversion (Auto/JPG/PNG/WebP/TIFF/BMP)
 #
-import os, re, json, subprocess, math
+import os, re, json, subprocess, math, time
 from dataclasses import dataclass, asdict
 from pathlib import Path
 
-from PySide6.QtCore import Qt, QUrl
+from PySide6.QtCore import Qt, QUrl, QObject, QThread, Signal
 from PySide6.QtGui import QImage, QDesktopServices
 from PySide6.QtWidgets import (
     QWidget, QFormLayout, QLabel, QSlider, QSpinBox, QHBoxLayout, QVBoxLayout,
@@ -38,6 +38,14 @@ def _pick_tool(name: str) -> str:
 
 FFMPEG_BIN = _pick_tool("ffmpeg")
 FFPROBE_BIN = _pick_tool("ffprobe")
+
+try:
+    from helpers.queue_adapter import enqueue_resize_job
+except Exception:
+    try:
+        from queue_adapter import enqueue_resize_job
+    except Exception:
+        enqueue_resize_job = None
 
 
 # Required preset path: root /presets/setsave/resize.json
@@ -69,6 +77,7 @@ class ResizePreset:
 
     # Video-specific
     video_format: str = "MP4 (H.264)"  # MP4 (H.264) | MKV (H.264) | WebM (VP9)
+    keep_source_quality: bool = False
     crf: int = 18
     x264_preset: str = "veryfast"
     audio_copy: bool = True
@@ -78,6 +87,7 @@ class ResizePreset:
     image_format: str = "Auto"   # Auto/JPG/PNG/WebP/TIFF/BMP
     image_quality: int = 90      # 0–100
     output_dir: str = ""
+    use_queue: bool = True
 
     @classmethod
     def load(cls) -> "ResizePreset":
@@ -168,6 +178,30 @@ def _ffprobe_size(path: Path) -> tuple[int,int]:
     except Exception:
         return 0, 0
 
+
+def _ffprobe_video_bitrate(path: Path) -> int:
+    """Best-effort source video bitrate in bits/sec; 0 if unknown."""
+    try:
+        import json as _json
+        cmd = [
+            FFPROBE_BIN, "-v", "error",
+            "-select_streams", "v:0",
+            "-show_entries", "stream=bit_rate:format=bit_rate",
+            "-of", "json", str(path)
+        ]
+        p = subprocess.run(cmd, capture_output=True, text=True)
+        data = _json.loads(p.stdout or "{}")
+        streams = data.get("streams") or []
+        if streams:
+            br = int(streams[0].get("bit_rate") or 0)
+            if br > 0:
+                return br
+        fmt = data.get("format") or {}
+        br = int(fmt.get("bit_rate") or 0)
+        return br if br > 0 else 0
+    except Exception:
+        return 0
+
 def _map_jpeg_q(q_percent: int) -> int:
     """Map 0..100% to FFmpeg mjpeg -q:v (2..31; lower is better)."""
     q_percent = max(0, min(100, q_percent))
@@ -197,6 +231,49 @@ def _video_ext_from_choice(choice: str) -> str:
         "WebM (VP9)": ".webm",
     }
     return mapping.get(choice, ".mp4")
+
+
+class FFmpegWorker(QObject):
+    finished = Signal(bool, str, object)
+
+    def __init__(self, jobs):
+        super().__init__()
+        self.jobs = jobs or []
+
+    def run(self):
+        failures = []
+        success_count = 0
+        try:
+            for idx, job in enumerate(self.jobs):
+                cmd = job.get("cmd") or []
+                label = job.get("label") or f"job_{idx+1}"
+                try:
+                    p = subprocess.run(cmd, capture_output=True, text=True)
+                    if p.returncode == 0:
+                        success_count += 1
+                        continue
+                    err = (p.stderr or '').strip()
+                    tail = "\n".join(err.splitlines()[-15:]) if err else "ffmpeg failed"
+                    failures.append((label, tail))
+                except FileNotFoundError:
+                    msg = "ffmpeg not found. "
+                    if FFMPEG_BIN != "ffmpeg":
+                        msg += f"Looked for: {FFMPEG_BIN}. "
+                    msg += "Please install ffmpeg or add it to PATH, or place it in presets/bin next to the app."
+                    failures.append((label, msg))
+                    break
+                except Exception as e:
+                    failures.append((label, str(e)))
+            payload = {
+                "success_count": success_count,
+                "total": len(self.jobs),
+                "failures": failures,
+            }
+            ok = not failures
+            msg = "" if ok else (failures[0][1] if failures else "Unknown error")
+            self.finished.emit(ok, msg, payload)
+        except Exception as e:
+            self.finished.emit(False, str(e), {"success_count": success_count, "total": len(self.jobs), "failures": failures})
 
 # --------------------------- UI ---------------------------
 class ResizePane(QWidget):
@@ -278,6 +355,10 @@ class ResizePane(QWidget):
         self.cmb_vidfmt.setCurrentText(self.preset.video_format)
         _add_form_row("vidfmt", "Video format", self.cmb_vidfmt)
 
+        self.chk_keep_source = QCheckBox("Keep source quality")
+        self.chk_keep_source.setChecked(getattr(self.preset, "keep_source_quality", False))
+        _add_form_row("keepsource", "", self.chk_keep_source)
+
         self.slider_crf = QSlider(Qt.Horizontal); self.slider_crf.setRange(8, 28); self.slider_crf.setValue(self.preset.crf)
         self.lbl_crf = QLabel(str(self.preset.crf))
         self.slider_crf.valueChanged.connect(lambda v: self.lbl_crf.setText(str(v)))
@@ -309,6 +390,11 @@ class ResizePane(QWidget):
         row_out_widget = _make_row_widget([self.btn_select_outdir, self.btn_open_outdir])
         form.addRow(row_out_widget)
 
+        self.chk_use_queue = QCheckBox("Use queue")
+        self.chk_use_queue.setChecked(bool(getattr(self.preset, "use_queue", True)))
+        row_queue_widget = _make_row_widget([self.chk_use_queue])
+        form.addRow(row_queue_widget)
+
         # Preset buttons (currently hidden – presets kept for back-compat only)
         self.btn_save = QPushButton("Save preset"); self.btn_load = QPushButton("Load preset")
         row_p_widget = _make_row_widget([self.btn_save, self.btn_load])
@@ -325,6 +411,9 @@ class ResizePane(QWidget):
 
         self._src_w = None
         self._src_h = None
+        self._worker_thread = None
+        self._worker = None
+        self._busy_title = ""
 
         # Signals
         self.rad_images.toggled.connect(self._on_media_mode_changed)
@@ -334,6 +423,7 @@ class ResizePane(QWidget):
         self.chk_ar.stateChanged.connect(self._on_ar_lock_changed)
         self.spin_w.valueChanged.connect(self._on_w_changed)
         self.spin_h.valueChanged.connect(self._on_h_changed)
+        self.chk_keep_source.stateChanged.connect(self._on_keep_source_changed)
         self.btn_current.clicked.connect(self._on_resize_current)
         self.btn_one.clicked.connect(self._on_resize_single)
         self.btn_batch.clicked.connect(self._on_resize_batch)
@@ -467,6 +557,7 @@ class ResizePane(QWidget):
         # capture initial lock ratio / visibility
         self._on_ar_lock_changed(self.chk_ar.checkState())
         self._apply_visibility()
+        self._sync_video_quality_controls()
 
     # Tooltip helpers
     def _init_scale_mode_tooltips(self):
@@ -643,6 +734,7 @@ class ResizePane(QWidget):
         # video-only rows
         vid_rows = [
             ("vidfmt",),
+            ("keepsource",),
             ("crf",),
             ("x264",),
             ("acopy",),
@@ -651,11 +743,25 @@ class ResizePane(QWidget):
             getattr(self, f"row_{key}_label").setVisible(not is_image)
             getattr(self, f"row_{key}_widget").setVisible(not is_image)
 
+    def _sync_video_quality_controls(self):
+        keep_source = bool(getattr(self, "chk_keep_source", None) and self.chk_keep_source.isChecked())
+        is_video = not self._is_image_mode()
+        enabled = is_video and (not keep_source)
+        try:
+            self.slider_crf.setEnabled(enabled)
+            self.lbl_crf.setEnabled(enabled)
+        except Exception:
+            pass
+
     def _on_media_mode_changed(self, *args):
         self._apply_visibility()
+        self._sync_video_quality_controls()
 
     def _on_noresize_changed(self, *args):
         self._apply_visibility()
+
+    def _on_keep_source_changed(self, *args):
+        self._sync_video_quality_controls()
 
     # ----------------- Output folder helpers -----------------
     def _build_auto_output_path(self, inp: Path) -> Path:
@@ -759,6 +865,7 @@ class ResizePane(QWidget):
             media_mode="Image" if self._is_image_mode() else "Video",
             no_resize=self.chk_noresize.isChecked(),
             video_format=self.cmb_vidfmt.currentText(),
+            keep_source_quality=self.chk_keep_source.isChecked(),
             crf=self.slider_crf.value(),
             x264_preset=self.cmb_x264.currentText(),
             audio_copy=self.chk_acopy.isChecked(),
@@ -793,6 +900,7 @@ class ResizePane(QWidget):
 
             self.chk_noresize.setChecked(p.no_resize)
             self.cmb_vidfmt.setCurrentText(p.video_format)
+            self.chk_keep_source.setChecked(getattr(p, "keep_source_quality", False))
             self.slider_crf.setValue(p.crf)
             self.cmb_x264.setCurrentText(p.x264_preset)
             self.chk_acopy.setChecked(p.audio_copy)
@@ -803,6 +911,7 @@ class ResizePane(QWidget):
             # refresh vis / AR ratio
             self._apply_visibility()
             self._on_ar_lock_changed(self.chk_ar.checkState())
+            self._sync_video_quality_controls()
 
             self._output_dir = Path(p.output_dir) if p.output_dir else None
             self._update_outdir_tooltips()
@@ -884,13 +993,20 @@ class ResizePane(QWidget):
         if vf_chain:
             cmd += ["-vf", vf_chain]
 
+        keep_source_quality = bool(getattr(self, "chk_keep_source", None) and self.chk_keep_source.isChecked())
+        source_bitrate = _ffprobe_video_bitrate(inp) if keep_source_quality else 0
+
         if is_webm:
             # WebM (VP9 + Opus). audio_copy is ignored.
             cmd += [
                 "-c:v", "libvpx-vp9",
                 "-pix_fmt", "yuv420p",
-                "-b:v", "0",
-                "-crf", str(self.slider_crf.value()),
+            ]
+            if source_bitrate > 0:
+                cmd += ["-b:v", str(source_bitrate)]
+            else:
+                cmd += ["-b:v", "0", "-crf", str(self.slider_crf.value())]
+            cmd += [
                 "-c:a", "libopus",
                 "-b:a", "192k",
             ]
@@ -900,8 +1016,11 @@ class ResizePane(QWidget):
                 "-pix_fmt", "yuv420p",
                 "-c:v", "libx264",
                 "-preset", self.cmb_x264.currentText(),
-                "-crf", str(self.slider_crf.value())
             ]
+            if source_bitrate > 0:
+                cmd += ["-b:v", str(source_bitrate)]
+            else:
+                cmd += ["-crf", str(self.slider_crf.value())]
             if self.chk_acopy.isChecked():
                 cmd += ["-c:a", "copy"]
             else:
@@ -1039,61 +1158,233 @@ class ResizePane(QWidget):
             pass
         return None
 
-    def _on_resize_current(self):
-        """Resize the current visible frame/image from the Media Player as a still image."""
-        # For now we treat this as an image operation.
-        if not self._is_image_mode():
-            QMessageBox.warning(
-                self,
-                "Images mode only",
-                "Resize current works in Images mode.\n\n"
-                "Switch Mode to Images to resize still frames."
-            )
+    def _set_busy(self, busy: bool, title: str = ""):
+        self._busy_title = title if busy else ""
+        for w in [self.btn_current, self.btn_one, self.btn_batch, self.btn_select_outdir, self.btn_open_outdir]:
+            try:
+                w.setEnabled(not busy)
+            except Exception:
+                pass
+        if busy and title:
+            try:
+                self.btn_current.setText(title)
+            except Exception:
+                pass
+        else:
+            try:
+                self.btn_current.setText("Resize/convert current")
+            except Exception:
+                pass
+
+    def _run_jobs_async(self, jobs: list[dict], title: str, on_done):
+        if not jobs:
+            return
+        if self._worker_thread is not None:
+            QMessageBox.warning(self, "Busy", "A resize/convert job is already running.")
             return
 
-        qimg = self._grab_current_qimage()
-        if qimg is None or qimg.isNull():
-            QMessageBox.warning(
-                self,
-                "No current frame",
-                "No current frame or image was found.\n\n"
-                "Load an image or pause a video in the Media Player first."
-            )
-            return
+        self._set_busy(True, title)
+        self._worker_thread = QThread(self)
+        self._worker = FFmpegWorker(jobs)
+        self._worker.moveToThread(self._worker_thread)
+        self._worker_thread.started.connect(self._worker.run)
+        self._worker.finished.connect(on_done)
+        self._worker.finished.connect(self._worker_thread.quit)
+        self._worker.finished.connect(self._worker.deleteLater)
+        self._worker_thread.finished.connect(self._worker_thread.deleteLater)
+        self._worker_thread.finished.connect(self._on_worker_thread_finished)
+        self._worker_thread.start()
 
-        # Save the frame to a temporary PNG so we can reuse the ffmpeg-based pipeline.
+    def _on_worker_thread_finished(self):
+        self._worker = None
+        self._worker_thread = None
+        self._set_busy(False)
+
+    def _find_current_media_path(self) -> Path | None:
+        main = self._find_main_with_video()
+        candidates = []
+
+        def _append_candidate(obj, names):
+            if obj is None:
+                return
+            for name in names:
+                try:
+                    value = getattr(obj, name, None)
+                except Exception:
+                    value = None
+                if value:
+                    candidates.append(value)
+
+        _append_candidate(main, ["current_path", "current_file", "loaded_path", "file_path", "media_path", "path"])
+        video = getattr(main, "video", None) if main is not None else None
+        _append_candidate(video, ["current_path", "current_file", "loaded_path", "file_path", "media_path", "path", "source_path"])
+
         try:
-            import time as _time
-            TEMP_DIR.mkdir(parents=True, exist_ok=True)
-            tmp_inp = TEMP_DIR / f"resize_current_{int(_time.time())}.png"
-            if not qimg.save(str(tmp_inp), "PNG"):
-                raise RuntimeError("Failed to save temporary frame image.")
-        except Exception as e:
-            QMessageBox.critical(self, "Temporary file error", f"Could not create a temporary image file:\n{e}")
-            return
+            player = getattr(video, "player", None)
+            if player is not None and hasattr(player, "source"):
+                src = player.source()
+                if src and hasattr(src, "isLocalFile") and src.isLocalFile():
+                    candidates.append(src.toLocalFile())
+        except Exception:
+            pass
 
-        # Let the user choose where to save the resized result.
-        out = self._pick_output(tmp_inp)
-        if not out:
+        for cand in candidates:
+            try:
+                if isinstance(cand, Path):
+                    path = cand
+                elif hasattr(cand, "toLocalFile"):
+                    local = cand.toLocalFile()
+                    path = Path(local) if local else None
+                else:
+                    path = Path(str(cand))
+                if path and path.exists():
+                    return path
+            except Exception:
+                continue
+        return None
+
+    def _on_async_single_done(self, ok: bool, err: str, payload):
+        out = getattr(self, "_pending_out_path", None)
+        self._pending_out_path = None
+        if ok and out:
+            QMessageBox.information(self, "Done", f"Saved:\n{out}")
+        else:
+            QMessageBox.critical(self, "FFmpeg error", err or "Unknown error")
+
+    def _on_async_batch_done(self, ok: bool, err: str, payload):
+        payload = payload or {}
+        total = int(payload.get("total", 0) or 0)
+        success_count = int(payload.get("success_count", 0) or 0)
+        failures = payload.get("failures", []) or []
+        skipped = getattr(self, "_pending_batch_skipped", []) or []
+        selected = getattr(self, "_pending_batch_selected", total)
+        image_mode = getattr(self, "_pending_batch_image_mode", self._is_image_mode())
+        self._pending_batch_skipped = []
+        self._pending_batch_selected = 0
+        self._pending_batch_image_mode = None
+
+        lines = [
+            f"Processed: {total} / {selected} selected",
+            f"Success: {success_count}",
+            f"Mode: {'Images' if image_mode else 'Video'}",
+        ]
+        if skipped:
+            lines.append(f"Skipped (preflight): {len(skipped)}")
+            for p, r in skipped[:10]:
+                lines.append(f"  - {p.name}: {r}")
+            if len(skipped) > 10:
+                lines.append(f"  … (+{len(skipped)-10} more)")
+        if failures:
+            lines.append(f"Failed during run: {len(failures)}")
+            for p, reason in failures[:10]:
+                lines.append(f"  - {p}: {reason}")
+            if len(failures) > 10:
+                lines.append(f"  … (+{len(failures)-10} more)")
+
+        msg = "\n".join(lines)
+        if failures:
+            QMessageBox.warning(self, "Batch finished with errors", msg)
+        else:
+            QMessageBox.information(self, "Batch finished", msg)
+
+    def _queue_one(self, inp: Path, out: Path, cmd: list[str], label: str = "Resize") -> bool:
+        try:
+            if enqueue_resize_job is None:
+                raise RuntimeError("queue adapter not available")
+            out.parent.mkdir(parents=True, exist_ok=True)
+            return bool(enqueue_resize_job(str(inp), str(out.parent), cmd, str(out), label))
+        except Exception as e:
+            QMessageBox.critical(self, "Queue error", str(e))
+            return False
+
+    def _queue_many(self, jobs: list[dict]) -> int:
+        count = 0
+        for job in jobs or []:
+            try:
+                inp = Path(str(job.get("input") or ""))
+                out = Path(str(job.get("output") or ""))
+                cmd = job.get("cmd") or []
+                label = str(job.get("label") or inp.name or "Resize")
+                if out and self._queue_one(inp, out, cmd, label):
+                    count += 1
+            except Exception:
+                pass
+        return count
+
+    def _on_resize_current(self):
+        """Resize/convert the currently loaded image or video from the Media Player."""
+        if self._is_image_mode():
+            qimg = self._grab_current_qimage()
+            if qimg is None or qimg.isNull():
+                QMessageBox.warning(
+                    self,
+                    "No current frame",
+                    "No current frame or image was found.\n\n"
+                    "Load an image or pause a video in the Media Player first."
+                )
+                return
+
+            try:
+                import time as _time
+                TEMP_DIR.mkdir(parents=True, exist_ok=True)
+                tmp_inp = TEMP_DIR / f"resize_current_{int(_time.time())}.png"
+                if not qimg.save(str(tmp_inp), "PNG"):
+                    raise RuntimeError("Failed to save temporary frame image.")
+            except Exception as e:
+                QMessageBox.critical(self, "Temporary file error", f"Could not create a temporary image file:\n{e}")
+                return
+
+            out = self._pick_output(tmp_inp)
+            if not out:
+                try:
+                    tmp_inp.unlink(missing_ok=True)
+                except Exception:
+                    pass
+                return
+
+            cmd = self._build_cmd_image(tmp_inp, out)
+            ok, err = self._run_ffmpeg(cmd)
+
             try:
                 tmp_inp.unlink(missing_ok=True)
             except Exception:
                 pass
+
+            if ok:
+                QMessageBox.information(self, "Done", f"Saved:\n{out}")
+            else:
+                QMessageBox.critical(self, "FFmpeg error", err or "Unknown error")
             return
 
-        cmd = self._build_cmd_image(tmp_inp, out)
-        ok, err = self._run_ffmpeg(cmd)
+        inp = self._find_current_media_path()
+        if not inp:
+            QMessageBox.warning(
+                self,
+                "No current video",
+                "No current video file was found.\n\n"
+                "Load a video in the Media Player first, then try again."
+            )
+            return
 
-        # Cleanup temp file
-        try:
-            tmp_inp.unlink(missing_ok=True)
-        except Exception:
-            pass
+        ext = inp.suffix.lower()
+        if ext not in VIDEO_EXTS:
+            QMessageBox.warning(self, "Wrong mode", "Current mode is Video but the loaded file is not a supported video.")
+            return
 
-        if ok:
-            QMessageBox.information(self, "Done", f"Saved:\n{out}")
-        else:
-            QMessageBox.critical(self, "FFmpeg error", err or "Unknown error")
+        src_w, src_h = _ffprobe_size(inp)
+        self._src_w, self._src_h = src_w, src_h
+
+        out = self._pick_output(inp)
+        if not out:
+            return
+
+        cmd = self._build_cmd_video(inp, out, src_w, src_h)
+        if self.chk_use_queue.isChecked():
+            self._queue_one(inp, out, cmd, f"Resize current - {inp.name}")
+            return
+        self._pending_out_path = out
+        self._run_jobs_async([{"cmd": cmd, "label": inp.name}], "Processing video…", self._on_async_single_done)
+
     def _on_resize_single(self):
         inp = self._pick_input()
         if not inp:
@@ -1140,62 +1431,109 @@ class ResizePane(QWidget):
             else:
                 files, _conflict = result, "skip"
             if files is None:
-                return  # user cancelled
+                return
             inputs = [Path(f) for f in files]
         else:
             inputs = self._pick_inputs()
             if not inputs:
                 return
 
-        # Preflight filtering & summary
         to_process, skipped = self._preflight_batch(inputs)
         if not to_process and not skipped:
-            return  # user cancelled
+            return
 
-        ok_count = 0
-        fail = []
+        if self._is_image_mode():
+            if self.chk_use_queue.isChecked():
+                jobs = []
+                for inp, out in to_process:
+                    try:
+                        jobs.append({"input": inp, "output": out, "cmd": self._build_cmd_image(inp, out), "label": inp.name})
+                    except Exception as e:
+                        skipped.append((inp, f"error: {e}"))
+                self._queue_many(jobs)
+                return
 
+            ok_count = 0
+            fail = []
+            for inp, out in to_process:
+                try:
+                    cmd = self._build_cmd_image(inp, out)
+                    ok, err = self._run_ffmpeg(cmd)
+                    if ok:
+                        ok_count += 1
+                    else:
+                        fail.append((inp, err or "ffmpeg failed"))
+                except Exception as e:
+                    fail.append((inp, str(e)))
+
+            lines = [
+                f"Processed: {len(to_process)} / {len(inputs)} selected",
+                f"Success: {ok_count}",
+                f"Mode: Images",
+            ]
+            if skipped:
+                lines.append(f"Skipped (preflight): {len(skipped)}")
+                for p, r in skipped[:10]:
+                    lines.append(f"  - {p.name}: {r}")
+                if len(skipped) > 10:
+                    lines.append(f"  … (+{len(skipped)-10} more)")
+            if fail:
+                lines.append(f"Failed during run: {len(fail)}")
+                for p, reason in fail[:10]:
+                    lines.append(f"  - {p.name}: {reason}")
+                if len(fail) > 10:
+                    lines.append(f"  … (+{len(fail)-10} more)")
+
+            msg = "\n".join(lines)
+            if fail:
+                QMessageBox.warning(self, "Batch finished with errors", msg)
+            else:
+                QMessageBox.information(self, "Batch finished", msg)
+            return
+
+        jobs = []
         for inp, out in to_process:
             try:
-                if self._is_image_mode():
-                    cmd = self._build_cmd_image(inp, out)
-                else:
-                    src_w, src_h = _ffprobe_size(inp)
-                    self._src_w, self._src_h = src_w, src_h
-                    cmd = self._build_cmd_video(inp, out, src_w, src_h)
-
-                ok, err = self._run_ffmpeg(cmd)
-                if ok:
-                    ok_count += 1
-                else:
-                    fail.append((inp, err or "ffmpeg failed"))
+                src_w, src_h = _ffprobe_size(inp)
+                self._src_w, self._src_h = src_w, src_h
+                cmd = self._build_cmd_video(inp, out, src_w, src_h)
+                jobs.append({"cmd": cmd, "label": inp.name})
             except Exception as e:
-                fail.append((inp, str(e)))
+                skipped.append((inp, f"error: {e}"))
 
-        # Final summary
-        lines = [
-            f"Processed: {len(to_process)} / {len(inputs)} selected",
-            f"Success: {ok_count}",
-            f"Mode: {'Images' if self._is_image_mode() else 'Video'}",
-        ]
-        if skipped:
-            lines.append(f"Skipped (preflight): {len(skipped)}")
+        if self.chk_use_queue.isChecked() and jobs:
+            queue_jobs = []
+            for i, job in enumerate(jobs):
+                try:
+                    queue_jobs.append({
+                        "input": to_process[i][0],
+                        "output": to_process[i][1],
+                        "cmd": job.get("cmd") or [],
+                        "label": job.get("label") or to_process[i][0].name,
+                    })
+                except Exception:
+                    pass
+            self._queue_many(queue_jobs)
+            return
+
+        if not jobs and skipped:
+            lines = [
+                f"Processed: 0 / {len(inputs)} selected",
+                f"Success: 0",
+                f"Mode: Video",
+                f"Skipped (preflight/build): {len(skipped)}",
+            ]
             for p, r in skipped[:10]:
                 lines.append(f"  - {p.name}: {r}")
             if len(skipped) > 10:
                 lines.append(f"  … (+{len(skipped)-10} more)")
-        if fail:
-            lines.append(f"Failed during run: {len(fail)}")
-            for p, reason in fail[:10]:
-                lines.append(f"  - {p.name}: {reason}")
-            if len(fail) > 10:
-                lines.append(f"  … (+{len(fail)-10} more)")
+            QMessageBox.warning(self, "Batch finished with errors", "\n".join(lines))
+            return
 
-        msg = "\n".join(lines)
-        if fail:
-            QMessageBox.warning(self, "Batch finished with errors", msg)
-        else:
-            QMessageBox.information(self, "Batch finished", msg)
+        self._pending_batch_skipped = skipped
+        self._pending_batch_selected = len(inputs)
+        self._pending_batch_image_mode = False
+        self._run_jobs_async(jobs, "Processing batch…", self._on_async_batch_done)
 
     def _run_ffmpeg(self, cmd: list[str]) -> tuple[bool, str]:
         try:
