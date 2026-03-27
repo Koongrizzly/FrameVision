@@ -4,6 +4,7 @@ import os
 import subprocess
 from pathlib import Path
 from datetime import datetime
+import re
 
 from PySide6.QtCore import Qt, QThread, Signal
 from PySide6.QtWidgets import (
@@ -23,6 +24,7 @@ from PySide6.QtWidgets import (
     QMessageBox,
     QTextEdit,
     QProgressBar,
+    QCheckBox,
 )
 
 # Base paths (assuming this file is in root/helpers/)
@@ -50,6 +52,102 @@ def get_ffprobe_path() -> str:
         if candidate.exists():
             return str(candidate)
     return "ffprobe"
+
+
+def sanitize_filename_part(value: str) -> str:
+    value = (value or '').strip()
+    value = re.sub(r'[\/:*?"<>|]+', '_', value)
+    value = re.sub(r'\s+', '_', value)
+    value = re.sub(r'_+', '_', value).strip('._ ')
+    return value or 'output'
+
+
+def build_unique_output_path(out_dir: Path, base_name: str, ext: str) -> Path:
+    out_dir.mkdir(parents=True, exist_ok=True)
+    safe_base = sanitize_filename_part(base_name)
+    if not ext.startswith('.'):
+        ext = f'.{ext}'
+    candidate = out_dir / f"{safe_base}{ext}"
+    if not candidate.exists():
+        return candidate
+
+    timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+    candidate = out_dir / f"{safe_base}_{timestamp}{ext}"
+    if not candidate.exists():
+        return candidate
+
+    index = 2
+    while True:
+        candidate = out_dir / f"{safe_base}_{timestamp}_{index}{ext}"
+        if not candidate.exists():
+            return candidate
+        index += 1
+
+
+def build_glue_base_name(paths: list[str]) -> str:
+    stems = [sanitize_filename_part(Path(p).stem) for p in paths if p]
+    if not stems:
+        return 'glued_video'
+    if len(stems) == 1:
+        return f"{stems[0]}_glued"
+    if len(stems) == 2:
+        return f"{stems[0]}_to_{stems[1]}_glued"
+    return f"{stems[0]}_to_{stems[-1]}_{len(stems)}clips_glued"
+
+
+def probe_video_fps(ffprobe_path: str, video_path: str) -> float | None:
+    """Return detected fps for a video using ffprobe, preferring avg_frame_rate."""
+    cmd = [
+        ffprobe_path,
+        "-v",
+        "error",
+        "-select_streams",
+        "v:0",
+        "-show_entries",
+        "stream=avg_frame_rate,r_frame_rate",
+        "-of",
+        "default=noprint_wrappers=1:nokey=1",
+        str(video_path),
+    ]
+    try:
+        proc = subprocess.run(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            shell=False,
+        )
+        if proc.returncode != 0:
+            return None
+
+        for line in (proc.stdout or '').splitlines():
+            value = line.strip()
+            if not value or value in {'0/0', 'N/A'}:
+                continue
+            if '/' in value:
+                num, den = value.split('/', 1)
+                num = float(num)
+                den = float(den)
+                if den:
+                    fps = num / den
+                else:
+                    continue
+            else:
+                fps = float(value)
+            if fps > 0:
+                return fps
+    except Exception:
+        return None
+    return None
+
+
+def fps_to_ffmpeg_string(fps: float | None) -> str | None:
+    if not fps or fps <= 0:
+        return None
+    rounded = round(fps)
+    if abs(fps - rounded) < 0.01:
+        return str(int(rounded))
+    return f"{fps:.6f}".rstrip('0').rstrip('.')
 
 
 class FFmpegBatchWorker(QThread):
@@ -352,6 +450,11 @@ class SpliglueVideoTool(QWidget):
         row3.addWidget(self.glue_output_name_edit)
         v.addLayout(row3)
 
+        # Optional safe normalize fallback
+        self.glue_normalize_checkbox = QCheckBox("Normalize and re-encode before glueing (fallback for broken timing / slow output)", tab)
+        self.glue_normalize_checkbox.setToolTip("Use this only when the normal fast glue result is broken. This safer mode re-encodes and resets timing while keeping the source fps from the first input video.")
+        v.addWidget(self.glue_normalize_checkbox)
+
         # Glue button
         row4 = QHBoxLayout()
         glue_btn = QPushButton("Glue videos", tab)
@@ -569,7 +672,8 @@ class SpliglueVideoTool(QWidget):
                 return
 
             duration = end_seconds - start_seconds
-            out_file = out_dir / f"{stem}_{suffix_text}{ext}"
+            base_name = f"{stem}_{suffix_text}"
+            out_file = build_unique_output_path(out_dir, base_name, ext)
             cmd = [
                 self.ffmpeg_path,
                 "-y",
@@ -660,13 +764,11 @@ class SpliglueVideoTool(QWidget):
 
         name = self.glue_output_name_edit.text().strip()
         if not name:
-            # Use name of first file with _glued suffix
-            first = Path(paths[0])
-            name = f"{first.stem}_glued"
+            name = build_glue_base_name(paths)
 
         # Use extension from the first file
         ext = Path(paths[0]).suffix or ".mp4"
-        output_file = out_dir / f"{name}{ext}"
+        output_file = build_unique_output_path(out_dir, name, ext)
 
         # Create a temporary concat list file
         concat_list_path = out_dir / f"_splitglue_concat_{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt"
@@ -675,19 +777,96 @@ class SpliglueVideoTool(QWidget):
                 # ffmpeg concat demuxer expects paths in single quotes
                 f.write(f"file '{Path(p).as_posix()}'\n")  # use forward slashes
 
-        cmd = [
-            self.ffmpeg_path,
-            "-y",
-            "-f",
-            "concat",
-            "-safe",
-            "0",
-            "-i",
-            str(concat_list_path),
-            "-c",
-            "copy",
-            str(output_file),
-        ]
+        if self.glue_normalize_checkbox.isChecked():
+            detected_fps = probe_video_fps(self.ffprobe_path, paths[0])
+            fps_arg = fps_to_ffmpeg_string(detected_fps)
+            if detected_fps:
+                self._log(f"Safe glue enabled. Keeping source fps from first input: {detected_fps:.6f}")
+            else:
+                self._log("Safe glue enabled. Could not detect fps from first input, so ffmpeg will keep its own detected timing.")
+
+            cmd = [
+                self.ffmpeg_path,
+                "-y",
+                "-fflags",
+                "+genpts",
+                "-f",
+                "concat",
+                "-safe",
+                "0",
+                "-i",
+                str(concat_list_path),
+                "-map",
+                "0:v:0",
+            ]
+            has_audio = True
+            try:
+                audio_probe = subprocess.run(
+                    [
+                        self.ffprobe_path,
+                        "-v",
+                        "error",
+                        "-select_streams",
+                        "a:0",
+                        "-show_entries",
+                        "stream=index",
+                        "-of",
+                        "default=noprint_wrappers=1:nokey=1",
+                        str(paths[0]),
+                    ],
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    text=True,
+                    shell=False,
+                )
+                has_audio = bool((audio_probe.stdout or '').strip())
+            except Exception:
+                has_audio = True
+
+            if has_audio:
+                cmd.extend(["-map", "0:a?"])
+
+            if fps_arg:
+                cmd.extend(["-r", fps_arg])
+
+            cmd.extend([
+                "-vsync",
+                "cfr",
+                "-c:v",
+                "libx264",
+                "-preset",
+                "medium",
+                "-crf",
+                "18",
+                "-pix_fmt",
+                "yuv420p",
+            ])
+
+            if has_audio:
+                cmd.extend([
+                    "-c:a",
+                    "aac",
+                    "-b:a",
+                    "320k",
+                ])
+            else:
+                cmd.append("-an")
+
+            cmd.append(str(output_file))
+        else:
+            cmd = [
+                self.ffmpeg_path,
+                "-y",
+                "-f",
+                "concat",
+                "-safe",
+                "0",
+                "-i",
+                str(concat_list_path),
+                "-c",
+                "copy",
+                str(output_file),
+            ]
 
         self._run_batch([cmd], [str(output_file)], operation="glue", extra_files=[concat_list_path])
 
