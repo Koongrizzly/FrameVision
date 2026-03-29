@@ -1489,3 +1489,14 @@ def enqueue_qwentts_from_widget(inner) -> bool:
         except Exception:
             pass
         return False
+
+
+def enqueue_splitglue_ffmpeg(label: str, cmd: list, output_file: str, out_dir: str, input_path: str = '', priority: int = 600):
+    """Queue a Split/Glue ffmpeg command through the generic tools_ffmpeg worker path."""
+    args = {
+        'label': str(label or 'Split/Glue ffmpeg job'),
+        'ffmpeg_cmd': [str(x) for x in (cmd or [])],
+        'outfile': str(output_file or ''),
+        'cwd': str(_base_root()),
+    }
+    return enqueue_tool_job('tools_ffmpeg', str(input_path or ''), str(out_dir or ''), args, priority=int(priority))

@@ -1801,14 +1801,14 @@ class UpscPane(QtWidgets.QWidget):
 
         if res >= 1080:
             _set(self.chk_seedvr2_vae_dec, self.chk_seedvr2_vae_dec.setChecked, True)
-            _set(self.spin_seedvr2_batch, self.spin_seedvr2_batch.setValue, 8)
-            _set(self.spin_seedvr2_chunk, self.spin_seedvr2_chunk.setValue, 80)
+            _set(self.spin_seedvr2_batch, self.spin_seedvr2_batch.setValue, 2)
+            _set(self.spin_seedvr2_chunk, self.spin_seedvr2_chunk.setValue, 20)
             _set(self.spin_seedvr2_dec_tile, self.spin_seedvr2_dec_tile.setValue, 1024)
-            _set(self.spin_seedvr2_dec_ov, self.spin_seedvr2_dec_ov.setValue, 64)
+            _set(self.spin_seedvr2_dec_ov, self.spin_seedvr2_dec_ov.setValue, 128)
         elif res == 720:
             _set(self.chk_seedvr2_vae_dec, self.chk_seedvr2_vae_dec.setChecked, False)
             _set(self.spin_seedvr2_batch, self.spin_seedvr2_batch.setValue, 4)
-            _set(self.spin_seedvr2_chunk, self.spin_seedvr2_chunk.setValue, 40)
+            _set(self.spin_seedvr2_chunk, self.spin_seedvr2_chunk.setValue, 50)
 
     def _update_seedvr2_mode(self, on: bool | None = None):
         try:

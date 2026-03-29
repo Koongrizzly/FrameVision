@@ -2,7 +2,7 @@
 import sys
 import os
 import subprocess
-from pathlib import Path
+from pathlib import Path, PureWindowsPath, PurePosixPath
 from datetime import datetime
 import re
 
@@ -26,6 +26,12 @@ from PySide6.QtWidgets import (
     QProgressBar,
     QCheckBox,
 )
+
+try:
+    from helpers.queue_adapter import enqueue_splitglue_ffmpeg
+except Exception:
+    from queue_adapter import enqueue_splitglue_ffmpeg
+
 
 # Base paths (assuming this file is in root/helpers/)
 ROOT_DIR = Path(__file__).resolve().parent.parent
@@ -54,6 +60,28 @@ def get_ffprobe_path() -> str:
     return "ffprobe"
 
 
+
+
+def extract_filename_stem(value: str) -> str:
+    """Return only the filename stem, even if the user pasted a full Windows/POSIX path."""
+    value = (value or '').strip()
+    if not value:
+        return ''
+
+    win = PureWindowsPath(value)
+    if win.name and win.name != value:
+        return (win.stem or win.name or '').strip()
+
+    posix = PurePosixPath(value)
+    if posix.name and posix.name != value:
+        return (posix.stem or posix.name or '').strip()
+
+    plain = Path(value)
+    if plain.suffix:
+        return (plain.stem or '').strip()
+
+    return value
+
 def sanitize_filename_part(value: str) -> str:
     value = (value or '').strip()
     value = re.sub(r'[\/:*?"<>|]+', '_', value)
@@ -64,7 +92,7 @@ def sanitize_filename_part(value: str) -> str:
 
 def build_unique_output_path(out_dir: Path, base_name: str, ext: str) -> Path:
     out_dir.mkdir(parents=True, exist_ok=True)
-    safe_base = sanitize_filename_part(base_name)
+    safe_base = sanitize_filename_part(extract_filename_stem(base_name))
     if not ext.startswith('.'):
         ext = f'.{ext}'
     candidate = out_dir / f"{safe_base}{ext}"
@@ -297,6 +325,14 @@ class SpliglueVideoTool(QWidget):
         self._build_split_tab()
         self._build_glue_tab()
 
+        queue_row = QHBoxLayout()
+        queue_row.addStretch()
+        self.use_queue_checkbox = QCheckBox("Use queue", self)
+        self.use_queue_checkbox.setChecked(True)
+        self.use_queue_checkbox.setToolTip("When enabled, Split and Glue jobs are added to the FrameVision queue instead of running directly here.")
+        queue_row.addWidget(self.use_queue_checkbox)
+        layout.addLayout(queue_row)
+
         # Simple progress bar
         self.progress_bar = QProgressBar(self)
         self.progress_bar.setRange(0, 1)
@@ -455,6 +491,11 @@ class SpliglueVideoTool(QWidget):
         self.glue_normalize_checkbox.setToolTip("Use this only when the normal fast glue result is broken. This safer mode re-encodes and resets timing while keeping the source fps from the first input video.")
         v.addWidget(self.glue_normalize_checkbox)
 
+        # Optional mute output
+        self.glue_disable_audio_checkbox = QCheckBox("Disable original sound in glued result", tab)
+        self.glue_disable_audio_checkbox.setToolTip("Create the glued video without audio. Useful when one clip has broken or incompatible sound that makes playback stop in the middle.")
+        v.addWidget(self.glue_disable_audio_checkbox)
+
         # Glue button
         row4 = QHBoxLayout()
         glue_btn = QPushButton("Glue videos", tab)
@@ -465,6 +506,44 @@ class SpliglueVideoTool(QWidget):
 
         self.tabs.addTab(tab, "Glue")
 
+
+    # --------------------------- Queue helpers ---------------------------
+
+    def _use_queue(self) -> bool:
+        try:
+            return bool(self.use_queue_checkbox.isChecked())
+        except Exception:
+            return True
+
+    def _enqueue_ffmpeg_job(self, label: str, cmd: list[str], output_file: str, out_dir: str, input_path: str = ""):
+        try:
+            enqueue_splitglue_ffmpeg(
+                label=label,
+                cmd=[str(x) for x in cmd],
+                output_file=str(output_file),
+                out_dir=str(out_dir or ''),
+                input_path=str(input_path or ''),
+                priority=600,
+            )
+            self._log(f"Added to queue: {label}")
+            return True
+        except Exception as e:
+            QMessageBox.critical(self, "Queue error", f"Could not add job to queue:\n{e}")
+            return False
+
+    def _enqueue_split_jobs(self, commands, outputs):
+        total = 0
+        for idx, (cmd, output_file) in enumerate(zip(commands, outputs), start=1):
+            label = f"Split video {idx}/{len(outputs)}: {Path(output_file).name}"
+            if self._enqueue_ffmpeg_job(label, cmd, output_file, str(Path(output_file).parent), str(self.split_input_path or '')):
+                total += 1
+        if total:
+            self._log(f"Queued {total} split job(s).")
+
+    def _enqueue_glue_job(self, cmd, output_file, paths):
+        label = f"Glue videos: {Path(output_file).name}"
+        if self._enqueue_ffmpeg_job(label, cmd, output_file, str(Path(output_file).parent), str(paths[0] if paths else '')):
+            self._log("Queued glue job.")
 
     # --------------------------- Split logic ---------------------------
 
@@ -690,6 +769,10 @@ class SpliglueVideoTool(QWidget):
             commands.append(cmd)
             outputs.append(str(out_file))
 
+        if self._use_queue():
+            self._enqueue_split_jobs(commands, outputs)
+            return
+
         self._run_batch(commands, outputs, operation="split")
 
 
@@ -762,8 +845,13 @@ class SpliglueVideoTool(QWidget):
         out_dir.mkdir(parents=True, exist_ok=True)
         self.glue_output_dir = out_dir
 
-        name = self.glue_output_name_edit.text().strip()
-        if not name:
+        raw_name = self.glue_output_name_edit.text().strip()
+        if raw_name:
+            cleaned_name = extract_filename_stem(raw_name)
+            if cleaned_name != raw_name:
+                self._log(f"Glue output name looked like a path; using only the file name part: {cleaned_name}")
+            name = cleaned_name
+        else:
             name = build_glue_base_name(paths)
 
         # Use extension from the first file
@@ -776,6 +864,10 @@ class SpliglueVideoTool(QWidget):
             for p in paths:
                 # ffmpeg concat demuxer expects paths in single quotes
                 f.write(f"file '{Path(p).as_posix()}'\n")  # use forward slashes
+
+        disable_audio = self.glue_disable_audio_checkbox.isChecked()
+        if disable_audio:
+            self._log("Glue audio disabled: output will be video-only.")
 
         if self.glue_normalize_checkbox.isChecked():
             detected_fps = probe_video_fps(self.ffprobe_path, paths[0])
@@ -823,7 +915,7 @@ class SpliglueVideoTool(QWidget):
             except Exception:
                 has_audio = True
 
-            if has_audio:
+            if has_audio and not disable_audio:
                 cmd.extend(["-map", "0:a?"])
 
             if fps_arg:
@@ -842,7 +934,7 @@ class SpliglueVideoTool(QWidget):
                 "yuv420p",
             ])
 
-            if has_audio:
+            if has_audio and not disable_audio:
                 cmd.extend([
                     "-c:a",
                     "aac",
@@ -863,10 +955,30 @@ class SpliglueVideoTool(QWidget):
                 "0",
                 "-i",
                 str(concat_list_path),
+                "-map",
+                "0:v:0",
+                "-c:v",
+                "copy",
+                "-an",
+                str(output_file),
+            ] if disable_audio else [
+                self.ffmpeg_path,
+                "-y",
+                "-f",
+                "concat",
+                "-safe",
+                "0",
+                "-i",
+                str(concat_list_path),
                 "-c",
                 "copy",
                 str(output_file),
             ]
+
+        if self._use_queue():
+            self._enqueue_glue_job(cmd, str(output_file), paths)
+            self._log(f"Concat list kept for queued job: {concat_list_path.name}")
+            return
 
         self._run_batch([cmd], [str(output_file)], operation="glue", extra_files=[concat_list_path])
 

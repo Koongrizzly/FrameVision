@@ -8,11 +8,13 @@ import subprocess
 import tempfile
 import sys
 import importlib
+import datetime
+import time
 from pathlib import Path
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Tuple
 
-from PySide6.QtCore import Qt, QObject, QThread, Signal
+from PySide6.QtCore import Qt, QObject, QThread, Signal, QTimer
 from PySide6.QtGui import QIcon
 from PySide6.QtWidgets import (
     QApplication,
@@ -30,14 +32,15 @@ from PySide6.QtWidgets import (
     QListWidget,
     QMessageBox,
     QPushButton,
+    QProgressBar,
+    QPlainTextEdit,
     QScrollArea,
     QSizePolicy,
     QSlider,
     QSpinBox,
     QVBoxLayout,
-    QWidget,,
-    QProgressBar,
-    QPlainTextEdit)
+    QWidget,
+)
 
 try:
     from .visual_thumbs import VisualThumbManager
@@ -75,6 +78,10 @@ def _ensure_framevision_import_paths() -> None:
     for path in (root, helpers_dir):
         if path and os.path.isdir(path) and path not in sys.path:
             sys.path.insert(0, path)
+    try:
+        os.chdir(root)
+    except Exception:
+        pass
 
 
 def _find_ffmpeg_from_env() -> str:
@@ -268,6 +275,20 @@ def _video_has_audio(ffprobe: str, path: str) -> bool:
 # ----------------------------- beat analysis ------------------------------
 
 
+def _unique_output_path(out_dir: str, src_video: str, suffix: str = "_beatsync_visuals", ext: str = ".mp4") -> str:
+    os.makedirs(out_dir, exist_ok=True)
+    base_name = os.path.splitext(os.path.basename(src_video))[0]
+    stamp = datetime.datetime.now().strftime("%d%m_%H%M%S")
+    candidate = os.path.join(out_dir, f"{base_name}{suffix}_{stamp}{ext}")
+    if not os.path.exists(candidate):
+        return candidate
+    n = 2
+    while True:
+        cand = os.path.join(out_dir, f"{base_name}{suffix}_{stamp}_{n}{ext}")
+        if not os.path.exists(cand):
+            return cand
+        n += 1
+
 @dataclass
 class Beat:
     time: float
@@ -380,21 +401,25 @@ def _normalize_visual_mode(mode: str) -> str:
 def _list_visual_modes() -> List[str]:
     found: List[str] = []
 
-    # First try the existing backend so we keep the native mode names when possible.
+    # Prefer the actual backend modes. Those are the only mode names we can trust for rendering.
     try:
-        _ensure_framevision_import_paths()
-        _configure_visual_backend()
-        viz_mod = importlib.import_module("helpers.viz_offline")
-        music_mod = importlib.import_module("helpers.music")
-        real_list_visual_modes = getattr(viz_mod, "_list_visual_modes", None)
-        VisualEngine = getattr(music_mod, "VisualEngine", None)
-        if real_list_visual_modes is not None and VisualEngine is not None:
-            engine = VisualEngine(parent=None)
-            modes = real_list_visual_modes(engine)
-            for m in modes or []:
-                s = _normalize_visual_mode(m)
-                if s:
-                    found.append(s)
+        backend_modes = _backend_available_modes()
+        for m in backend_modes or []:
+            s = _normalize_visual_mode(m)
+            if s:
+                found.append(s)
+        # If the backend has real plugin modes, trust that list and stop here.
+        if any(str(x).startswith("viz:") for x in found):
+            out: List[str] = []
+            seen = set()
+            for m in found:
+                s = str(m).strip()
+                if not s:
+                    continue
+                if s not in seen:
+                    seen.add(s)
+                    out.append(s)
+            return out
     except Exception:
         pass
 
@@ -436,54 +461,92 @@ def _configure_visual_backend(ffmpeg_bin: str = "", ffprobe_bin: str = "") -> No
     Force helpers.music / helpers.viz_offline to use the real FrameVision root
     when this helper is launched directly from the helpers folder.
     """
+    _ensure_framevision_import_paths()
+    root = Path(_framevision_root())
     try:
-        _ensure_framevision_import_paths()
-        root = Path(_framevision_root())
+        os.chdir(str(root))
+    except Exception:
+        pass
 
-        music_mod = importlib.import_module("helpers.music")
+    # Drop previously loaded standalone visual plugin modules so they reload from the
+    # correct FrameVision root.
+    try:
+        dead = [name for name in list(sys.modules.keys()) if name.startswith("fv_viz_")]
+        for name in dead:
+            sys.modules.pop(name, None)
+    except Exception:
+        pass
 
-        # Fix the backend's idea of the app root.
-        try:
-            setattr(music_mod, "ROOT", root)
-        except Exception:
-            pass
+    importlib.invalidate_caches()
 
-        # Force ffmpeg/ffprobe helpers to use FrameVision's normal binaries.
-        try:
-            if ffmpeg_bin:
-                setattr(music_mod, "ffmpeg_path", lambda: str(ffmpeg_bin))
-        except Exception:
-            pass
-        try:
-            if ffprobe_bin:
-                setattr(music_mod, "ffprobe_path", lambda: str(ffprobe_bin))
-        except Exception:
-            pass
+    music_mod = importlib.import_module("helpers.music")
+    try:
+        music_mod = importlib.reload(music_mod)
+    except Exception:
+        pass
 
-        # Rebuild visual registry from the correct presets/viz folder.
-        try:
-            reg = getattr(music_mod, "_VISUAL_REGISTRY", None)
-            if isinstance(reg, list):
-                reg.clear()
-        except Exception:
-            pass
+    try:
+        setattr(music_mod, "ROOT", root)
+    except Exception:
+        pass
 
-        try:
-            load_plugins = getattr(music_mod, "_load_visual_plugins", None)
-            if callable(load_plugins):
-                load_plugins()
-        except Exception:
-            pass
+    try:
+        if ffmpeg_bin:
+            setattr(music_mod, "ffmpeg_path", lambda: str(ffmpeg_bin))
+    except Exception:
+        pass
+    try:
+        if ffprobe_bin:
+            setattr(music_mod, "ffprobe_path", lambda: str(ffprobe_bin))
+    except Exception:
+        pass
 
-        # Import viz_offline after music has been corrected.
-        try:
+    try:
+        reg = getattr(music_mod, "_VISUAL_REGISTRY", None)
+        if isinstance(reg, list):
+            reg.clear()
+    except Exception:
+        pass
+
+    try:
+        load_plugins = getattr(music_mod, "_load_visual_plugins", None)
+        if callable(load_plugins):
+            load_plugins()
+    except Exception:
+        pass
+
+    try:
+        if "helpers.viz_offline" in sys.modules:
+            importlib.reload(sys.modules["helpers.viz_offline"])
+        else:
             importlib.import_module("helpers.viz_offline")
-        except Exception:
-            pass
     except Exception:
         pass
 
 
+def _backend_available_modes() -> List[str]:
+    try:
+        _configure_visual_backend()
+        music_mod = importlib.import_module("helpers.music")
+        VisualEngine = getattr(music_mod, "VisualEngine", None)
+        if VisualEngine is None:
+            return ["spectrum"]
+        engine = VisualEngine(parent=None)
+        modes = []
+        try:
+            modes = list(engine.available_modes() or [])
+        except Exception:
+            modes = []
+        out = []
+        seen = set()
+        for m in modes:
+            s = _normalize_visual_mode(m)
+            if s and s not in seen:
+                seen.add(s)
+                out.append(s)
+        return out or ["spectrum"]
+    except Exception:
+        return ["spectrum"]
 
 class SelectedVisualsDialog(QDialog):
     def __init__(self, parent: QWidget, modes: List[str], selected: List[str], ffmpeg: str):
@@ -614,19 +677,25 @@ class SelectedVisualsDialog(QDialog):
 
 
 
+def _portable_temp_root() -> str:
+    root = _framevision_root()
+    path = os.path.join(root, "temp")
+    os.makedirs(path, exist_ok=True)
+    return path
+
 class _RenderWorker(QObject):
     finished = Signal(bool, str)
-    progress = Signal(str)
 
-    def __init__(self, tool: "BeatSyncVisualsTool", video: str, out_dir: str) -> None:
+    def __init__(self, tool: "BeatSyncVisualsTool", video: str, out_dir: str, tmpdir: str) -> None:
         super().__init__()
         self.tool = tool
         self.video = video
         self.out_dir = out_dir
+        self.tmpdir = tmpdir
 
     def run(self) -> None:
         try:
-            out_path = self.tool._render_sync(self.video, self.out_dir, self.progress.emit)
+            out_path = self.tool._render_sync(self.video, self.out_dir, self.tmpdir)
             self.finished.emit(True, str(out_path or ""))
         except Exception as e:
             self.finished.emit(False, str(e))
@@ -643,6 +712,16 @@ class BeatSyncVisualsTool(QWidget):
         self._selected_modes: List[str] = []
         self._render_thread = None
         self._render_worker = None
+        self._progress_timer = QTimer(self)
+        self._progress_timer.setInterval(3000)
+        self._progress_timer.timeout.connect(self._on_progress_timer)
+        self._render_tmpdir: str = ""
+        self._render_total_frames: int = 0
+        self._render_started_at: float = 0.0
+        self._last_progress_check_at: float = 0.0
+        self._last_progress_frames: int = 0
+        self._render_stage: str = "idle"
+        self._last_progress_line: str = ""
         self._build_ui()
         self._load_settings()
         self._refresh_modes()
@@ -772,6 +851,18 @@ class BeatSyncVisualsTool(QWidget):
         self.label_status = QLabel("Ready.", body)
         self.label_status.setWordWrap(True)
         root.addWidget(self.label_status)
+
+        self.progress_bar = QProgressBar(body)
+        self.progress_bar.setTextVisible(True)
+        self.progress_bar.setRange(0, 100)
+        self.progress_bar.setValue(0)
+        root.addWidget(self.progress_bar)
+
+        self.log_box = QPlainTextEdit(body)
+        self.log_box.setReadOnly(True)
+        self.log_box.setMinimumHeight(170)
+        self.log_box.setPlaceholderText("Render details will appear here...")
+        root.addWidget(self.log_box)
 
         # signal wiring
         self.btn_browse_video.clicked.connect(self._browse_video)
@@ -925,29 +1016,13 @@ class BeatSyncVisualsTool(QWidget):
 
     # ----------------------------- state -----------------------------------
     def _set_status(self, text: str) -> None:
-        try:
-            self.label_status.setText(str(text))
-        except Exception:
-            pass
+        self.label_status.setText(str(text))
 
     def _append_log(self, text: str) -> None:
         try:
             self.log_box.appendPlainText(str(text))
         except Exception:
             pass
-
-    def _set_busy_ui(self, busy: bool) -> None:
-        try:
-            if busy:
-                self.progress.setRange(0, 0)
-                self.progress.show()
-            else:
-                self.progress.setRange(0, 1)
-                self.progress.setValue(1)
-                self.progress.hide()
-        except Exception:
-            pass
-        self.label_status.setText(str(text))
 
     def _update_ui_state(self) -> None:
         strategy = str(self.combo_strategy.currentData() or "single")
@@ -1113,6 +1188,15 @@ class BeatSyncVisualsTool(QWidget):
                 f"{e}"
             )
 
+        backend_modes = set(_backend_available_modes() or ["spectrum"])
+        safe_overrides: Dict[str, str] = {}
+        for k, v in (overrides or {}).items():
+            vv = _normalize_visual_mode(v)
+            if vv in backend_modes:
+                safe_overrides[k] = vv
+            else:
+                safe_overrides[k] = "spectrum"
+
         ok = render_visual_track(
             audio_path=audio_path,
             out_video=out_video,
@@ -1122,14 +1206,14 @@ class BeatSyncVisualsTool(QWidget):
             strategy=2,
             segment_boundaries=None,
             section_map=section_map,
-            section_visual_overrides=overrides,
+            section_visual_overrides=safe_overrides,
         )
         if not ok or not os.path.exists(out_video):
             sample = ", ".join(sorted({str(v) for v in (overrides or {}).values()})[:6])
             raise RuntimeError(
                 "The visual track could not be rendered.\n"
                 f"Visual override sample: {sample or '(none)'}\n"
-                "If this still fails, the next thing to inspect is helpers.viz_offline runtime behavior after backend root/path correction."
+                "Backend mode validation/reload was attempted before render."
             )
 
     def _overlay_visuals(self, src_video: str, visuals_video: str, out_video: str, alpha: float) -> None:
@@ -1167,6 +1251,91 @@ class BeatSyncVisualsTool(QWidget):
             raise RuntimeError("Overlay step failed.\n" + out)
 
     # ----------------------------- render ----------------------------------
+    def _start_progress_tracking(self) -> None:
+        self._render_started_at = time.time()
+        self._last_progress_check_at = self._render_started_at
+        self._last_progress_frames = 0
+        self._last_progress_line = ""
+        try:
+            if self._render_total_frames > 0:
+                self.progress_bar.setRange(0, self._render_total_frames)
+                self.progress_bar.setValue(0)
+            else:
+                self.progress_bar.setRange(0, 0)
+            self._progress_timer.start()
+        except Exception:
+            pass
+
+    def _stop_progress_tracking(self) -> None:
+        try:
+            self._progress_timer.stop()
+        except Exception:
+            pass
+
+    def _on_progress_timer(self) -> None:
+        try:
+            stage = str(getattr(self, "_render_stage", "") or "working")
+            total = int(getattr(self, "_render_total_frames", 0) or 0)
+            tmpdir = str(getattr(self, "_render_tmpdir", "") or "")
+            now = time.time()
+
+            if stage == "rendering_visual_track" and tmpdir and os.path.isdir(tmpdir):
+                try:
+                    done = 0
+                    image_exts = (".png", ".jpg", ".jpeg", ".webp", ".bmp")
+                    for root, _, files in os.walk(tmpdir):
+                        for name in files:
+                            if name.lower().endswith(image_exts):
+                                done += 1
+
+                    visuals_path = os.path.join(tmpdir, "visuals_track.mp4")
+                    visuals_size = os.path.getsize(visuals_path) if os.path.exists(visuals_path) else 0
+                except Exception:
+                    done = 0
+                    visuals_size = 0
+
+                elapsed = max(0.001, now - float(getattr(self, "_render_started_at", now) or now))
+                speed = done / elapsed if done > 0 else 0.0
+
+                try:
+                    if total > 0 and done > 0:
+                        self.progress_bar.setRange(0, total)
+                        self.progress_bar.setValue(min(done, total))
+                    else:
+                        self.progress_bar.setRange(0, 0)
+                except Exception:
+                    pass
+
+                if total > 0 and done > 0:
+                    pct = (100.0 * float(done) / float(total)) if total else 0.0
+                    line = f"Rendering visual track: {done} / {total} frames done | speed: {speed:.1f} fps | {pct:.1f}%"
+                elif visuals_size > 0:
+                    mb = visuals_size / (1024.0 * 1024.0)
+                    line = f"Rendering visual track... intermediate video growing ({mb:.1f} MB)"
+                else:
+                    line = "Rendering visual track... scanning temp folder for rendered frames"
+
+                self._set_status(line)
+                if line != getattr(self, "_last_progress_line", ""):
+                    self._append_log(line)
+                    self._last_progress_line = line
+                return
+
+            stage_map = {
+                "building_plan": "Analyzing audio and building visual plan...",
+                "overlaying": "Overlaying visuals onto the source video...",
+                "finishing": "Finishing output...",
+                "idle": "Ready.",
+            }
+            line = stage_map.get(stage, "Working...")
+            self._set_status(line)
+            if line != getattr(self, "_last_progress_line", ""):
+                self._append_log(line)
+                self._last_progress_line = line
+        except Exception:
+            pass
+
+
     def _render(self) -> None:
         err = self._validate()
         if err:
@@ -1177,49 +1346,59 @@ class BeatSyncVisualsTool(QWidget):
         out_dir = self.edit_output.text().strip() or self._default_output_dir()
         _ensure_dir(out_dir)
 
-        self.setEnabled(False)
-        self._set_status("Starting render...")
-        self._append_log("Starting render...")
+        duration = _ffprobe_duration(self._ffprobe, video)
+        fps = _ffprobe_fps(self._ffprobe, video)
+        try:
+            self._render_total_frames = max(1, int(round(float(duration) * float(fps))))
+        except Exception:
+            self._render_total_frames = 0
+
+        self._render_tmpdir = tempfile.mkdtemp(prefix="fv_bsv_", dir=_portable_temp_root())
+        self._render_stage = "building_plan"
+        self.log_box.clear()
         self._append_log(f"Source video: {video}")
         self._append_log(f"Output folder: {out_dir}")
-        self._set_busy_ui(True)
+        self._append_log(f"Working temp folder: {self._render_tmpdir}")
+        if self._render_total_frames > 0:
+            self._append_log(f"Total frames: {self._render_total_frames}")
+            self.progress_bar.setRange(0, self._render_total_frames)
+            self.progress_bar.setValue(0)
+        else:
+            self._append_log("Total frames: unknown")
+            self.progress_bar.setRange(0, 0)
+
+        self.setEnabled(False)
+        self.btn_render.setEnabled(False)
+        self._set_status("Starting render...")
+        self._start_progress_tracking()
 
         self._render_thread = QThread(self)
-        self._render_worker = _RenderWorker(self, video, out_dir)
+        self._render_worker = _RenderWorker(self, video, out_dir, self._render_tmpdir)
         self._render_worker.moveToThread(self._render_thread)
         self._render_thread.started.connect(self._render_worker.run)
-        self._render_worker.progress.connect(self._on_worker_progress)
         self._render_worker.finished.connect(self._on_render_finished)
         self._render_worker.finished.connect(self._render_thread.quit)
         self._render_worker.finished.connect(self._render_worker.deleteLater)
         self._render_thread.finished.connect(self._render_thread.deleteLater)
         self._render_thread.start()
 
-    def _render_sync(self, video: str, out_dir: str, progress_cb=None) -> str:
-                if progress_cb:
-            progress_cb("Reading source video...")
+    def _render_sync(self, video: str, out_dir: str, tmpdir: str) -> str:
         duration = _ffprobe_duration(self._ffprobe, video)
-                if progress_cb:
-            progress_cb("Reading source resolution...")
         res = _ffprobe_resolution(self._ffprobe, video)
-                if progress_cb:
-            progress_cb("Reading source FPS...")
         fps = _ffprobe_fps(self._ffprobe, video)
         if duration is None or duration <= 0:
             raise RuntimeError("Could not read the source video duration.")
         if res is None:
             raise RuntimeError("Could not read the source video resolution.")
 
-                if progress_cb:
-            progress_cb("Analyzing audio and building visual plan...")
+        self._render_stage = "building_plan"
         plan, overrides = self._build_segment_plan(duration, video)
+        self._append_log(f"Visual plan ready: {len(plan)} block(s)")
 
-        tmpdir = tempfile.mkdtemp(prefix="fv_bsv_")
         try:
             visuals_path = os.path.join(tmpdir, "visuals_track.mp4")
             section_map = [(float(st), float(en), str(key)) for st, en, key in plan]
-                        if progress_cb:
-                progress_cb("Rendering visual track...")
+            self._render_stage = "rendering_visual_track"
             self._render_visual_track(
                 audio_path=video,
                 out_video=visuals_path,
@@ -1233,22 +1412,18 @@ class BeatSyncVisualsTool(QWidget):
             if self.check_transparency.isChecked():
                 alpha = max(0.0, min(1.0, float(self.spin_alpha.value()) / 100.0))
 
-            base_name = os.path.splitext(os.path.basename(video))[0]
-            out_path = os.path.join(out_dir, f"{base_name}_beatsync_visuals.mp4")
-                        if progress_cb:
-                progress_cb("Overlaying visuals on the source video...")
+            self._render_stage = "overlaying"
+            out_path = _unique_output_path(out_dir, video, suffix="_beatsync_visuals", ext=".mp4")
             self._overlay_visuals(video, visuals_path, out_path, alpha)
+            self._render_stage = "finishing"
             return out_path
         finally:
             shutil.rmtree(tmpdir, ignore_errors=True)
 
-    def _on_worker_progress(self, message: str) -> None:
-        self._set_status(str(message))
-        self._append_log(str(message))
-
     def _on_render_finished(self, ok: bool, message: str) -> None:
+        self._stop_progress_tracking()
         self.setEnabled(True)
-        self._set_busy_ui(False)
+        self.btn_render.setEnabled(True)
         self._save_settings()
         try:
             self._render_thread = None
@@ -1257,15 +1432,24 @@ class BeatSyncVisualsTool(QWidget):
             pass
 
         if ok:
-            self._set_status(f"Done. Saved to:\n{message}")
+            if self._render_total_frames > 0:
+                self.progress_bar.setRange(0, self._render_total_frames)
+                self.progress_bar.setValue(self._render_total_frames)
             self._append_log("Done.")
             self._append_log(f"Saved to: {message}")
+            self._set_status(f"Done. Saved to:\n{message}")
             QMessageBox.information(self, "Beat-synced visuals", f"Finished.\n\nSaved to:\n{message}", QMessageBox.Ok)
         else:
-            self._set_status(message)
+            self.progress_bar.setRange(0, 1)
+            self.progress_bar.setValue(0)
             self._append_log("Failed.")
             self._append_log(str(message))
+            self._set_status(message)
             QMessageBox.warning(self, "Beat-synced visuals", message, QMessageBox.Ok)
+
+        self._render_tmpdir = ""
+        self._render_total_frames = 0
+        self._render_stage = "idle"
 
 
 # ----------------------------- install hook -------------------------------

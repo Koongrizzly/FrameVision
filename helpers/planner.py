@@ -1524,10 +1524,10 @@ _HUNYUAN_PRESETS = {
         "res": "864x496",
         "target_size": 656,
         "fps": 15,
-        "steps": 15,
-        "min_sec": 2.7,
+        "steps": 20,
+        "min_sec": 2.8,
         "max_sec": 4.5,
-        "max_frames": 68,
+        "max_frames": 66,
         "model_key": "720p_i2v_distilled",
         "attn_backend": "auto",
         "cpu_offload": True,
@@ -19187,7 +19187,7 @@ If the planner sees a marker like [02] or (02), it becomes the next image prompt
             else:
                 # hunyuan + fallback
                 # Default Generation quality: Low
-                self.cmb_gen_quality.addItems(["Low (default)", "Medium", "High"])
+                self.cmb_gen_quality.addItems(["Low (default)", "Medium", "High (slow, needs Hunyuan 720 i2v model)"])
                 if cur.lower().startswith("low"):
                     self.cmb_gen_quality.setCurrentIndex(0)
                 elif cur.lower().startswith("high"):
