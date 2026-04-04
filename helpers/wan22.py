@@ -148,6 +148,16 @@ class Wan22Pane(QWidget):
         # guessing from the recent-results folder.
         self._last_run_out_path: Optional[Path] = None
 
+        # Experimental end-image workflow state (helper-level workaround)
+        self._endimg_active = False
+        self._endimg_stage = ""
+        self._endimg_final_output: Optional[Path] = None
+        self._endimg_primary_output: Optional[Path] = None
+        self._endimg_target_output: Optional[Path] = None
+        self._endimg_tail_output: Optional[Path] = None
+        self._endimg_seconds = 2
+        self._endimg_start_image_before_run: str = ""
+
         # Sidecar JSON metadata (written next to finished outputs)
         self._last_run_meta: dict = {}
         self._sidecar_sync_timer = QTimer(self)
@@ -344,6 +354,68 @@ class Wan22Pane(QWidget):
         img_widget = QWidget()
         img_widget.setLayout(img_row)
         form.addRow("Start image:", img_widget)
+
+        # End image (experimental helper-level workaround)
+        end_row = QHBoxLayout()
+        self.chk_use_end_image = QCheckBox("Use end image (experimental)")
+        self.chk_use_end_image.setToolTip(
+            "Helper-only workaround: Wan 2.2 does not natively expose a true end-image input here. "
+            "When enabled, the helper renders a second pass from the end image and appends a short reversed tail so the clip ends on that image."
+        )
+        self.ed_end_image = QLineEdit()
+        self.ed_end_image.setToolTip("Path to the target end image.")
+        btn_end_img = QPushButton("Browse")
+        self.btn_end_img_clear = QPushButton("Clear")
+        self.btn_end_img_clear.setToolTip("Clear the currently selected end image.")
+        self.spn_end_image_seconds = QSpinBox()
+        self.spn_end_image_seconds.setRange(1, 8)
+        self.spn_end_image_seconds.setValue(2)
+        self.spn_end_image_seconds.setToolTip("How many seconds of the end-image pass should be reversed and appended to land on the end image.")
+
+        def _clear_end_image():
+            try:
+                self.ed_end_image.clear()
+            except Exception:
+                try:
+                    self.ed_end_image.setText("")
+                except Exception:
+                    pass
+
+        def _pick_end_image():
+            fn, _ = QFileDialog.getOpenFileName(
+                self,
+                "Choose end image",
+                "",
+                "Images (*.png *.jpg *.jpeg *.webp);;All files (*.*)",
+            )
+            if fn:
+                self.ed_end_image.setText(fn)
+
+        try:
+            self.btn_end_img_clear.clicked.connect(_clear_end_image)
+        except Exception:
+            pass
+        btn_end_img.clicked.connect(_pick_end_image)
+        try:
+            self.ed_end_image.textChanged.connect(
+                lambda _t: self.btn_end_img_clear.setEnabled(bool(self.ed_end_image.text().strip()))
+            )
+        except Exception:
+            pass
+        try:
+            self.btn_end_img_clear.setEnabled(bool(self.ed_end_image.text().strip()))
+        except Exception:
+            pass
+
+        end_row.addWidget(self.chk_use_end_image)
+        end_row.addWidget(self.ed_end_image, 1)
+        end_row.addWidget(btn_end_img)
+        end_row.addWidget(self.btn_end_img_clear)
+        end_row.addWidget(QLabel("Seconds:"))
+        end_row.addWidget(self.spn_end_image_seconds)
+        end_widget = QWidget()
+        end_widget.setLayout(end_row)
+        form.addRow("End image:", end_widget)
 
         # Video to video (use last frame of an existing video as the start image)
         video2_row = QHBoxLayout()
@@ -1332,6 +1404,12 @@ class Wan22Pane(QWidget):
         if getattr(self, "ed_negative", None):
             self.ed_negative.textChanged.connect(self._save_settings)
         self.ed_image.textChanged.connect(self._save_settings)
+        if getattr(self, "ed_end_image", None):
+            self.ed_end_image.textChanged.connect(self._save_settings)
+        if getattr(self, "chk_use_end_image", None):
+            self.chk_use_end_image.toggled.connect(self._save_settings)
+        if getattr(self, "spn_end_image_seconds", None):
+            self.spn_end_image_seconds.valueChanged.connect(self._save_settings)
         self.cmb_size.currentTextChanged.connect(self._save_settings)
         self.spn_seed.valueChanged.connect(self._save_settings)
         self.chk_random_seed.toggled.connect(self._save_settings)
@@ -1381,6 +1459,9 @@ class Wan22Pane(QWidget):
                 "prompt": self.ed_prompt.toPlainText(),
                 "negative_prompt": self.ed_negative.toPlainText() if getattr(self, "ed_negative", None) else "",
                 "image_path": self.ed_image.text(),
+                "end_image_path": self.ed_end_image.text() if getattr(self, "ed_end_image", None) else "",
+                "use_end_image": bool(getattr(self, "chk_use_end_image", None) and self.chk_use_end_image.isChecked()),
+                "end_image_seconds": int(self.spn_end_image_seconds.value()) if getattr(self, "spn_end_image_seconds", None) else 2,
                 "size": self.cmb_size.currentText(),
                 "seed": self.spn_seed.value(),
                 "random_seed": self.chk_random_seed.isChecked(),
@@ -1464,6 +1545,17 @@ class Wan22Pane(QWidget):
         image_path = settings.get("image_path")
         if image_path is not None:
             self.ed_image.setText(image_path)
+
+        end_image_path = settings.get("end_image_path")
+        if end_image_path is not None and getattr(self, "ed_end_image", None):
+            self.ed_end_image.setText(end_image_path)
+        if "use_end_image" in settings and getattr(self, "chk_use_end_image", None):
+            self.chk_use_end_image.setChecked(bool(settings["use_end_image"]))
+        if "end_image_seconds" in settings and getattr(self, "spn_end_image_seconds", None):
+            try:
+                self.spn_end_image_seconds.setValue(max(1, min(8, int(settings["end_image_seconds"]))))
+            except Exception:
+                pass
 
         size = settings.get("size")
         if size is not None:
@@ -3369,6 +3461,202 @@ class Wan22Pane(QWidget):
                 "Image2video batch does not fall back to direct runs."
             )
 
+    def _end_image_feature_enabled(self) -> bool:
+        try:
+            return bool(getattr(self, "chk_use_end_image", None) and self.chk_use_end_image.isChecked() and getattr(self, "ed_end_image", None) and self.ed_end_image.text().strip())
+        except Exception:
+            return False
+
+    def _resolve_requested_output_path(self, seed_value: int) -> Path:
+        wan_dir = self._wan_outputs_dir()
+        out_hint = self.ed_out.text().strip()
+        if out_hint:
+            out_path = Path(out_hint).expanduser()
+            if not out_path.is_absolute():
+                out_path = wan_dir / out_path
+            if not str(out_path).lower().endswith(".mp4"):
+                out_path = out_path.with_suffix(".mp4")
+        else:
+            try:
+                timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+            except Exception:
+                timestamp = "auto"
+            out_path = wan_dir / f"wan22_{timestamp}_{seed_value}.mp4"
+        try:
+            out_path.parent.mkdir(parents=True, exist_ok=True)
+        except Exception:
+            pass
+        return out_path
+
+    def _reset_end_image_state(self):
+        self._endimg_active = False
+        self._endimg_stage = ""
+        self._endimg_final_output = None
+        self._endimg_primary_output = None
+        self._endimg_target_output = None
+        self._endimg_tail_output = None
+        self._endimg_seconds = 2
+        self._endimg_start_image_before_run = ""
+
+    def _reverse_first_seconds_to_end_image_tail(self, src_video: Path, dst_video: Path, seconds: int) -> bool:
+        ffmpeg = _ffmpeg_exe()
+        if not ffmpeg:
+            self._append_log("End image: ffmpeg not found in presets/bin; cannot build end-image tail.")
+            return False
+        try:
+            if dst_video.exists():
+                dst_video.unlink()
+        except Exception:
+            pass
+        cmd = [
+            ffmpeg, "-y",
+            "-i", str(src_video),
+            "-t", str(max(1, int(seconds))),
+            "-vf", "reverse",
+            "-an",
+            "-c:v", "libx264",
+            "-pix_fmt", "yuv420p",
+            str(dst_video),
+        ]
+        try:
+            self._append_log("End image: building reversed end tail with FFmpeg…")
+            res = subprocess.run(cmd, capture_output=True, text=True)
+            if res.returncode != 0:
+                msg = (res.stderr or res.stdout or "unknown ffmpeg error").strip()
+                self._append_log(f"End image: tail creation failed: {msg[:800]}")
+                return False
+            return dst_video.exists()
+        except Exception as e:
+            self._append_log(f"End image: tail creation failed: {e}")
+            return False
+
+    def _concat_primary_and_end_tail(self, primary_video: Path, tail_video: Path, dst_video: Path) -> bool:
+        ffmpeg = _ffmpeg_exe()
+        if not ffmpeg:
+            self._append_log("End image: ffmpeg not found in presets/bin; cannot merge final video.")
+            return False
+        try:
+            if dst_video.exists():
+                dst_video.unlink()
+        except Exception:
+            pass
+        cmd = [
+            ffmpeg, "-y",
+            "-i", str(primary_video),
+            "-i", str(tail_video),
+            "-filter_complex", "[0:v][1:v]concat=n=2:v=1:a=0[v]",
+            "-map", "[v]",
+            "-c:v", "libx264",
+            "-pix_fmt", "yuv420p",
+            str(dst_video),
+        ]
+        try:
+            self._append_log("End image: merging primary clip with reversed end tail…")
+            res = subprocess.run(cmd, capture_output=True, text=True)
+            if res.returncode != 0:
+                msg = (res.stderr or res.stdout or "unknown ffmpeg error").strip()
+                self._append_log(f"End image: merge failed: {msg[:800]}")
+                return False
+            return dst_video.exists()
+        except Exception as e:
+            self._append_log(f"End image: merge failed: {e}")
+            return False
+
+    def _start_end_image_target_pass(self):
+        if not self._endimg_active or not self._endimg_primary_output or not self._endimg_primary_output.exists():
+            self._append_log("End image: primary pass output is missing; aborting end-image workflow.")
+            self._reset_end_image_state()
+            return
+        end_img = (self.ed_end_image.text().strip() if getattr(self, "ed_end_image", None) else "")
+        if not end_img:
+            self._append_log("End image: no end image selected; aborting end-image workflow.")
+            self._reset_end_image_state()
+            return
+
+        prev_mode = self.cmb_mode.currentText()
+        prev_image = self.ed_image.text()
+        prev_out = self.ed_out.text()
+        try:
+            self.cmb_mode.blockSignals(True)
+            self.cmb_mode.setCurrentText("image2video")
+        finally:
+            try:
+                self.cmb_mode.blockSignals(False)
+            except Exception:
+                pass
+        self.ed_image.setText(end_img)
+        if self._endimg_target_output is not None:
+            self.ed_out.setText(str(self._endimg_target_output))
+
+        try:
+            py, args, cwd = self._build_command()
+        except Exception as e:
+            self._append_log(f"End image: failed to build target pass: {e}")
+            self.ed_image.setText(prev_image)
+            self.ed_out.setText(prev_out)
+            try:
+                self.cmb_mode.blockSignals(True)
+                self.cmb_mode.setCurrentText(prev_mode)
+            finally:
+                try:
+                    self.cmb_mode.blockSignals(False)
+                except Exception:
+                    pass
+            self._reset_end_image_state()
+            return
+
+        self.ed_image.setText(prev_image)
+        self.ed_out.setText(prev_out)
+        try:
+            self.cmb_mode.blockSignals(True)
+            self.cmb_mode.setCurrentText(prev_mode)
+        finally:
+            try:
+                self.cmb_mode.blockSignals(False)
+            except Exception:
+                pass
+
+        self._endimg_stage = "target"
+        self.log.clear()
+        self._append_log(f"Python: {py}")
+        self._append_log(f"Working dir: {cwd}")
+        self._append_log("End image: launching target pass from selected end image…")
+        self.proc.setProgram(py)
+        self.proc.setArguments(args)
+        self.proc.setWorkingDirectory(cwd)
+        self.proc.start()
+
+    def _finish_end_image_workflow(self):
+        primary = self._endimg_primary_output
+        target = self._endimg_target_output
+        tail = self._endimg_tail_output
+        final_out = self._endimg_final_output
+        seconds = max(1, int(self._endimg_seconds or 2))
+        if not primary or not target or not tail or not final_out:
+            self._append_log("End image: internal state incomplete; cannot finalize.")
+            self._reset_end_image_state()
+            return
+        if not primary.exists() or not target.exists():
+            self._append_log("End image: one or more pass outputs are missing; cannot finalize.")
+            self._reset_end_image_state()
+            return
+        if not self._reverse_first_seconds_to_end_image_tail(target, tail, seconds):
+            self._reset_end_image_state()
+            return
+        if not self._concat_primary_and_end_tail(primary, tail, final_out):
+            self._reset_end_image_state()
+            return
+        self._append_log(f"End image: finished merged output → {final_out}")
+        try:
+            self.fileReady.emit(final_out)
+        except Exception:
+            pass
+        try:
+            self._write_sidecar_json(final_out, self._sidecar_payload_direct(final_out))
+        except Exception:
+            pass
+        self._reset_end_image_state()
+
     def _launch(self):
         """Run Wan2.2 either directly or via the background queue."""
         # Safety: ensure WAN 2.2 model files exist before launching.
@@ -3389,6 +3677,9 @@ class Wan22Pane(QWidget):
                 pass
             return
 
+        # Reset helper-level experimental end-image workflow state for this launch
+        self._reset_end_image_state()
+
         # Determine batch count (only meaningful for text2video mode)
         batch_count = 1
         try:
@@ -3408,6 +3699,15 @@ class Wan22Pane(QWidget):
         elif getattr(self, "chk_use_queue", None) and self.chk_use_queue.isChecked():
             use_queue = True
 
+        use_end_image = self._end_image_feature_enabled()
+        if use_end_image:
+            if use_queue:
+                self._append_log("End image: forcing direct mode because this helper-level workaround is not supported through the queue.")
+            if batch_count > 1:
+                self._append_log("End image: batch is not supported together with end-image mode; using a single direct run.")
+            use_queue = False
+            batch_count = 1
+
         # Initialise extend-chain state for this run (direct runs only; queue not supported).
         self._extend_active = False
         self._extend_remaining = 0
@@ -3423,7 +3723,7 @@ class Wan22Pane(QWidget):
                 ext_val = 0
             # Extend only makes sense when we are not using the queue and effectively
             # running a single job at a time.
-            if ext_val > 0 and not use_queue and batch_count == 1:
+            if ext_val > 0 and not use_queue and batch_count == 1 and not use_end_image:
                 self._extend_active = True
                 self._extend_segments = []
                 self._extend_frame_index = 0
@@ -3609,9 +3909,43 @@ class Wan22Pane(QWidget):
             return
 
         try:
-            py, args, cwd = self._build_command()
+            if use_end_image:
+                if not getattr(self, "ed_end_image", None) or not self.ed_end_image.text().strip():
+                    raise RuntimeError("End image is enabled but no end image was selected.")
+                seed_value = self.spn_seed.value()
+                if self.chk_random_seed.isChecked():
+                    seed_value = random.randint(0, 2147483647)
+                final_out = self._resolve_requested_output_path(int(seed_value))
+                stem = final_out.stem or "wan22"
+                suffix = final_out.suffix or ".mp4"
+                primary_out = final_out.with_name(f"{stem}__startpass{suffix}")
+                target_out = final_out.with_name(f"{stem}__endpass{suffix}")
+                tail_out = final_out.with_name(f"{stem}__endtail{suffix}")
+                prev_out = self.ed_out.text()
+                self.ed_out.setText(str(primary_out))
+                try:
+                    py, args, cwd = self._build_command()
+                finally:
+                    self.ed_out.setText(prev_out)
+                self._endimg_active = True
+                self._endimg_stage = "primary"
+                self._endimg_final_output = final_out
+                self._endimg_primary_output = primary_out
+                self._endimg_target_output = target_out
+                self._endimg_tail_output = tail_out
+                self._endimg_seconds = int(self.spn_end_image_seconds.value()) if getattr(self, "spn_end_image_seconds", None) else 2
+                self._endimg_start_image_before_run = self.ed_image.text().strip()
+                self._last_run_out_path = primary_out
+                try:
+                    self._last_run_meta["end_image_path"] = self.ed_end_image.text().strip()
+                    self._last_run_meta["end_image_seconds"] = int(self._endimg_seconds)
+                except Exception:
+                    pass
+            else:
+                py, args, cwd = self._build_command()
         except Exception as e:
             self._append_log(f"Error: {e}")
+            self._reset_end_image_state()
             return
 
         self.log.clear()
@@ -3624,7 +3958,10 @@ class Wan22Pane(QWidget):
         else:
             self._append_log(f"Using manual seed: {self.spn_seed.value()}")
 
-        self._append_log("Launching Wan2.2 generate.py…")
+        if use_end_image:
+            self._append_log("Launching Wan2.2 generate.py (primary pass for end-image workflow)…")
+        else:
+            self._append_log("Launching Wan2.2 generate.py…")
         self._append_log(
             "Note: After finishing steps it starts part 2 of the process which may take about same time like the steps to finish."
         )
@@ -4086,9 +4423,26 @@ class Wan22Pane(QWidget):
     def _on_finished(self, code: int, status):
         self._append_log(f"Process finished with code {code}.")
         segment_path: Optional[Path] = None
+        endimg_stage = getattr(self, "_endimg_stage", "") if getattr(self, "_endimg_active", False) else ""
+        tracked_out = None
+        if endimg_stage == "primary":
+            tracked_out = getattr(self, "_endimg_primary_output", None)
+        elif endimg_stage == "target":
+            tracked_out = getattr(self, "_endimg_target_output", None)
         out_text = self.ed_out.text().strip()
         # Normal explicit-output handling (for UI + NVENC)
-        if out_text:
+        if tracked_out is not None:
+            out_path = Path(tracked_out)
+            if code == 0 and out_path.exists():
+                self._try_nvenc_reencode(out_path)
+            if out_path.exists():
+                if code == 0:
+                    try:
+                        self._write_sidecar_json(out_path, self._sidecar_payload_direct(out_path))
+                    except Exception:
+                        pass
+                segment_path = out_path
+        elif out_text:
             out_path = Path(out_text)
             if code == 0 and out_path.exists():
                 self._try_nvenc_reencode(out_path)
@@ -4145,6 +4499,25 @@ class Wan22Pane(QWidget):
                     self._write_sidecar_json(segment_path, self._sidecar_payload_direct(segment_path))
             except Exception:
                 pass
+
+        # Handle helper-level experimental end-image workflow first
+        if getattr(self, "_endimg_active", False):
+            try:
+                if endimg_stage == "primary":
+                    if code == 0 and isinstance(segment_path, Path) and segment_path.exists():
+                        self._start_end_image_target_pass()
+                    else:
+                        self._append_log("End image: primary pass failed; stopping workflow.")
+                        self._reset_end_image_state()
+                elif endimg_stage == "target":
+                    if code == 0 and isinstance(segment_path, Path) and segment_path.exists():
+                        self._finish_end_image_workflow()
+                    else:
+                        self._append_log("End image: target pass failed; stopping workflow.")
+                        self._reset_end_image_state()
+            except Exception as e:
+                self._append_log(f"End image: internal error: {e}")
+                self._reset_end_image_state()
 
         # Handle extend-chain logic (if enabled)
         try:

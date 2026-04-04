@@ -3226,7 +3226,7 @@ class MainWindow(QtWidgets.QMainWindow):
     def _ace15_main_model_default_steps(self, main_sel: str) -> int:
         """Return recommended inference steps for selected main model.
 
-        Turbo variants default to 8 steps. Base/SFT variants default to 50 steps.
+        Turbo variants default to 8 steps. Base/SFT variants default to 65 steps.
         Unknown/auto keeps the current user value unchanged (returns 0 sentinel).
         """
         s = (main_sel or "").strip().lower()
@@ -3235,7 +3235,7 @@ class MainWindow(QtWidgets.QMainWindow):
         if "turbo" in s:
             return 8
         if "base" in s or "sft" in s:
-            return 50
+            return 65
         return 0
 
     def _on_main_model_changed(self, *_args):

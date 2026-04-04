@@ -401,21 +401,7 @@ def _join_frames(owner):
             best_nums = nums
 
     prefix, suffix, width = best_key
-    start_number = best_nums[0]
-    expected = list(range(start_number, start_number + len(best_nums)))
-    if best_nums != expected:
-        missing = sorted(set(expected) - set(best_nums))
-        msg = "The frame sequence has gaps, so join was stopped to avoid a broken video."
-        if missing:
-            preview = ", ".join(str(x) for x in missing[:10])
-            if len(missing) > 10:
-                preview += ", ..."
-            msg += f" Missing frame numbers: {preview}"
-        try:
-            QMessageBox.warning(owner, "Join frames", msg)
-        except Exception:
-            pass
-        return
+    ordered_nums = sorted(best_nums)
 
     # Determine FPS from UI spinbox if available
     fps_spin = getattr(owner, "frames_join_fps_spin", None)
@@ -426,14 +412,80 @@ def _join_frames(owner):
     if fps < 1:
         fps = 1
 
-    input_pattern = p / f"{prefix}%0{width}d{suffix}"
     out = OUT_FRAMES / f"{p.name}_joined.mp4"
     _ensure_outdir(out)
+
+    # If the user deleted bad frames, allow join anyway by rebuilding the
+    # remaining frames into a contiguous temporary sequence first.
+    start_number = ordered_nums[0]
+    expected = list(range(start_number, ordered_nums[-1] + 1))
+    has_gaps = ordered_nums != expected
+
+    if has_gaps:
+        missing = sorted(set(expected) - set(ordered_nums))
+        tmp_seq_dir = OUT_FRAMES / f"_{p.name}_join_tmp"
+        try:
+            tmp_seq_dir.mkdir(parents=True, exist_ok=True)
+        except Exception:
+            pass
+
+        # Clean only our generated temp sequence files from a previous run.
+        try:
+            for oldf in tmp_seq_dir.glob(f"join_%0*d{suffix}"):
+                try:
+                    oldf.unlink()
+                except Exception:
+                    pass
+        except Exception:
+            pass
+        try:
+            for oldf in tmp_seq_dir.iterdir():
+                if oldf.is_file() and oldf.name.startswith("join_") and oldf.suffix.lower() == suffix.lower():
+                    try:
+                        oldf.unlink()
+                    except Exception:
+                        pass
+        except Exception:
+            pass
+
+        copied = 0
+        for idx, num in enumerate(ordered_nums, start=1):
+            src = p / f"{prefix}{num:0{width}d}{suffix}"
+            dst = tmp_seq_dir / f"join_{idx:0{width}d}{suffix}"
+            if not src.exists():
+                continue
+            try:
+                try:
+                    os.link(src, dst)
+                except Exception:
+                    import shutil
+                    shutil.copy2(src, dst)
+                copied += 1
+            except Exception:
+                pass
+
+        if copied < 1:
+            try:
+                QMessageBox.warning(owner, "Join frames", "Could not rebuild a temporary frame sequence from the remaining frames.")
+            except Exception:
+                pass
+            return
+
+        input_pattern = tmp_seq_dir / f"join_%0{width}d{suffix}"
+        join_note = ""
+        if missing:
+            preview = ", ".join(str(x) for x in missing[:10])
+            if len(missing) > 10:
+                preview += ", ..."
+            join_note = f" (gaps removed: {preview})"
+    else:
+        input_pattern = p / f"{prefix}%0{width}d{suffix}"
+        join_note = ""
 
     cmd = [
         ffmpeg_path(), "-y",
         "-framerate", str(fps),
-        "-start_number", str(start_number),
+        "-start_number", "1" if has_gaps else str(start_number),
         "-i", str(input_pattern),
         "-c:v", "libx264",
         "-crf", "0",
@@ -442,16 +494,24 @@ def _join_frames(owner):
         str(out)
     ]
 
-    runner = getattr(owner, "_run", None)
-    if callable(runner):
-        runner(cmd, out)
-    else:
+    # Do not route this through the app's generic media runner. That path can
+    # wrongly require an opened source video even though joining a frame folder
+    # is a standalone ffmpeg job.
+    try:
+        kwargs = {}
+        if os.name == "nt":
+            try:
+                kwargs["creationflags"] = 0x08000000  # CREATE_NO_WINDOW
+            except Exception:
+                pass
+        subprocess.Popen(cmd, **kwargs)
+        _set_info(owner, f"Started join-frames → video at {fps} fps{join_note} → {out}")
+    except Exception as e:
         try:
-            subprocess.Popen(cmd)
+            QMessageBox.warning(owner, "Join frames", f"Could not start ffmpeg for joining frames.\n\n{e}")
         except Exception:
             pass
-
-    _set_info(owner, f"Queued join-frames → video at {fps} fps → {out}")
+        _set_info(owner, "Could not start join-frames job.")
 
 def _get_current_frame(owner):
     """

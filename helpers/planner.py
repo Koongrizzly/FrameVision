@@ -38,6 +38,9 @@ import subprocess
 import tempfile
 import gc
 import queue
+import socket
+import urllib.request
+import urllib.error
 from pathlib import Path
 from dataclasses import dataclass, asdict
 from typing import Dict, List, Optional, Any, Callable, Tuple
@@ -69,6 +72,361 @@ def _abspath_from_root(p: str) -> str:
 def _qwen_model_dir() -> str:
     return str((_root() / "models" / "describe" / "default" / "qwen3vl2b").resolve())
 
+
+def _planner_default_llama_runner() -> str:
+    root = (_root() / "presets" / "bin").resolve()
+    names = ["llama-server.exe", "llama-server", "server.exe", "server"]
+    try:
+        if root.exists():
+            for name in names:
+                for pp in root.rglob(name):
+                    if pp.is_file():
+                        return str(pp.resolve())
+    except Exception:
+        pass
+    return ""
+
+
+def _planner_resolve_llama_server_executable(path: str) -> str:
+    path = os.path.abspath(str(path or '').strip())
+    if not path:
+        return path
+    base = os.path.basename(path).lower()
+    if "server" in base:
+        return path
+    folder = os.path.dirname(path)
+    for name in ("llama-server.exe", "llama-server", "server.exe", "server"):
+        cand = os.path.join(folder, name)
+        if os.path.isfile(cand):
+            return cand
+    return path
+
+
+def _planner_find_llama_mmproj(model_path: str) -> str:
+    model_path = os.path.abspath(str(model_path or '').strip())
+    if not model_path or not os.path.isfile(model_path):
+        return ""
+    model_dir = os.path.dirname(model_path)
+    model_name = os.path.basename(model_path).lower()
+    parent_dir = os.path.dirname(model_dir)
+    candidate_dirs: List[str] = []
+    seen = set()
+    for d in [model_dir, os.path.join(model_dir, "mmproj"), os.path.join(model_dir, "vision"), parent_dir]:
+        if d and os.path.isdir(d):
+            n = os.path.normcase(os.path.normpath(d))
+            if n not in seen:
+                seen.add(n)
+                candidate_dirs.append(d)
+    tokens = [t for t in re.split(r"[^a-z0-9]+", os.path.splitext(os.path.basename(model_path))[0].lower()) if t and len(t) >= 3]
+    scored: List[Tuple[int, str]] = []
+    for folder in candidate_dirs:
+        try:
+            names = os.listdir(folder)
+        except Exception:
+            continue
+        for fn in names:
+            low = fn.lower()
+            full = os.path.join(folder, fn)
+            if not low.endswith('.gguf'):
+                continue
+            if os.path.normcase(os.path.normpath(full)) == os.path.normcase(os.path.normpath(model_path)):
+                continue
+            score = 0
+            if low.startswith('mmproj') or low.startswith('mm-proj'):
+                score += 80
+            if any(k in low for k in ('mmproj', 'mm-proj', 'vision', 'clip', 'projector', 'proj', 'multimodal')):
+                score += 35
+            if 'proj' in low:
+                score += 15
+            for tok in tokens:
+                if tok in low:
+                    score += 6
+            if any(k in model_name for k in ('vision', 'vl', 'glm-4.1v', 'glm-4v', 'glm4v', 'llava', 'bakllava', 'minicpm-v', 'qwen2-vl', 'qwen-vl', 'internvl', 'moondream')):
+                score += 10
+            if score > 0:
+                scored.append((score, full))
+    if not scored:
+        return ""
+    scored.sort(key=lambda x: (-x[0], len(x[1])))
+    return scored[0][1]
+
+
+def _planner_llama_guess_template(model_path: str) -> Tuple[str, str]:
+    hay = f"{os.path.basename(str(model_path or '')).lower()} {str(model_path or '').lower()}"
+    checks = [
+        (("llama-4", "llama 4", "llama4"), ("builtin", "llama4")),
+        (("llama-3", "llama 3", "llama3", "meta-llama-3"), ("builtin", "llama3")),
+        (("llama-2", "llama 2", "llama2"), ("builtin", "llama2")),
+        (("qwen",), ("builtin", "chatml")),
+        (("deepseek-r1", "deepseek r1", "deepseek-v3", "deepseek v3", "deepseek3"), ("builtin", "deepseek3")),
+        (("deepseek-v2", "deepseek v2", "deepseek2"), ("builtin", "deepseek2")),
+        (("deepseek",), ("builtin", "deepseek")),
+        (("chatglm4", "glm-4", "glm 4", "glmedge", "glm-edge"), ("builtin", "chatglm4")),
+        (("chatglm3", "glm-3", "glm 3"), ("builtin", "chatglm3")),
+        (("gemma",), ("builtin", "gemma")),
+        (("phi-4", "phi 4", "phi4"), ("builtin", "phi4")),
+        (("phi-3", "phi 3", "phi3"), ("builtin", "phi3")),
+        (("mistral", "mixtral", "ministral", "magistral"), ("builtin", "mistral-v7")),
+        (("command-r", "command r", "commandr"), ("builtin", "command-r")),
+        (("vicuna",), ("builtin", "vicuna")),
+        (("zephyr",), ("builtin", "zephyr")),
+        (("openchat",), ("builtin", "openchat")),
+        (("gpt-oss", "gpt_oss", "gpt oss"), ("builtin", "gpt-oss")),
+        (("granite",), ("builtin", "granite")),
+        (("seed-oss", "seed_oss", "seed oss"), ("builtin", "seed_oss")),
+        (("solar",), ("builtin", "solar-open")),
+    ]
+    for needles, result in checks:
+        if any(n in hay for n in needles):
+            return result
+    return ("auto", "")
+
+
+def _planner_llama_effective_template(model_path: str, template_kind: str, template_value: str) -> Tuple[str, str]:
+    kind = str(template_kind or 'smart').strip().lower() or 'smart'
+    value = str(template_value or '').strip()
+    if kind == 'smart':
+        guessed = _planner_llama_guess_template(model_path)
+        if guessed[0] != 'auto':
+            return guessed
+        return ('auto', '')
+    return (kind, value)
+
+
+def _planner_llama_settings(snapshot: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    src = snapshot if isinstance(snapshot, dict) else (_load_planner_settings() or {})
+    runner = str(src.get('own_llama_runner_path') or '').strip()
+    if not runner:
+        runner = _planner_default_llama_runner()
+    return {
+        'enabled': bool(src.get('own_llama_enabled', False)),
+        'runner_path': runner,
+        'model_path': str(src.get('own_llama_model_path') or '').strip(),
+        'template_kind': str(src.get('own_llama_template_kind') or 'smart').strip() or 'smart',
+        'template_value': str(src.get('own_llama_template_value') or '').strip(),
+        'ctx_size': int(src.get('own_llama_ctx_size', 8192) or 8192),
+        'top_p': float(src.get('own_llama_top_p', 0.9) or 0.9),
+    }
+
+
+def _planner_llama_is_enabled(snapshot: Optional[Dict[str, Any]] = None) -> bool:
+    cfg = _planner_llama_settings(snapshot)
+    return bool(cfg.get('enabled'))
+
+
+def _planner_http_get_json(url: str, timeout: float = 10.0) -> Tuple[int, Dict[str, Any]]:
+    req = urllib.request.Request(url, method='GET')
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            raw = resp.read().decode('utf-8', errors='replace')
+            return int(resp.getcode()), json.loads(raw) if raw.strip() else {}
+    except urllib.error.HTTPError as e:
+        raw = e.read().decode('utf-8', errors='replace')
+        try:
+            data = json.loads(raw) if raw.strip() else {}
+        except Exception:
+            data = {'error': {'message': raw or str(e)}}
+        return int(e.code), data
+
+
+def _planner_http_post_json(url: str, payload: Dict[str, Any], timeout: float = 120.0) -> Tuple[int, Dict[str, Any]]:
+    body = json.dumps(payload).encode('utf-8')
+    req = urllib.request.Request(url, data=body, headers={'Content-Type': 'application/json'}, method='POST')
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            raw = resp.read().decode('utf-8', errors='replace')
+            return int(resp.getcode()), json.loads(raw) if raw.strip() else {}
+    except urllib.error.HTTPError as e:
+        raw = e.read().decode('utf-8', errors='replace')
+        try:
+            data = json.loads(raw) if raw.strip() else {}
+        except Exception:
+            data = {'error': {'message': raw or str(e)}}
+        return int(e.code), data
+
+
+def _planner_extract_message_text(message: Any) -> str:
+    content = message.get('content', '') if isinstance(message, dict) else ''
+    if isinstance(content, list):
+        parts: List[str] = []
+        for item in content:
+            if isinstance(item, dict):
+                txt = item.get('text', item.get('content', ''))
+                if txt:
+                    parts.append(str(txt))
+            elif isinstance(item, str):
+                parts.append(item)
+        return '\n'.join([p for p in parts if str(p).strip()]).strip()
+    if isinstance(content, dict):
+        return str(content.get('text', content.get('content', '')) or '').strip()
+    return str(content or '').strip()
+
+
+def _planner_run_llama_text(*, system_prompt: str, user_prompt: str, temperature: float = 0.3, max_new_tokens: int = 1024, planner_llama_settings: Optional[Dict[str, Any]] = None) -> str:
+    cfg = _planner_llama_settings(planner_llama_settings)
+    if not bool(cfg.get('enabled')):
+        raise RuntimeError('Own llama is not enabled.')
+    runner = _planner_resolve_llama_server_executable(str(cfg.get('runner_path') or ''))
+    model = os.path.abspath(str(cfg.get('model_path') or '').strip())
+    if not runner or not os.path.isfile(runner):
+        raise RuntimeError(f"Own llama runner not found: {runner or '[empty]'}")
+    if not model or not os.path.isfile(model):
+        raise RuntimeError(f"Own llama model not found: {model or '[empty]'}")
+
+    def _tail_text(path: str, limit: int = 2400) -> str:
+        try:
+            with open(path, 'rb') as f:
+                f.seek(0, os.SEEK_END)
+                size = f.tell()
+                f.seek(max(0, size - limit), os.SEEK_SET)
+                return f.read().decode('utf-8', errors='replace').strip()
+        except Exception:
+            return ''
+
+    def _arg_attempts(port_value: int) -> List[Tuple[str, List[str]]]:
+        template_kind, template_value = _planner_llama_effective_template(model, str(cfg.get('template_kind') or 'smart'), str(cfg.get('template_value') or ''))
+        base = ['-m', model, '--host', '127.0.0.1', '--port', str(port_value), '-c', str(int(cfg.get('ctx_size') or 8192))]
+        # Planner own-llama integration is text-only for now.
+        # Do not auto-attach mmproj or any multimodal projector here,
+        # even if one is found next to the model, because that makes
+        # text-only GGUF startup fail on llama-server.
+        template_args: List[str] = []
+        if template_kind == 'jinja':
+            template_args.append('--jinja')
+        elif template_kind == 'builtin' and template_value:
+            template_args.extend(['--chat-template', str(template_value)])
+        attempts: List[Tuple[str, List[str]]] = []
+        attempts.append(('preferred', base + ['--reasoning-budget', '0'] + template_args))
+        attempts.append(('no_reasoning_budget', base + template_args))
+        if template_args:
+            attempts.append(('no_template_flags', base))
+            attempts.append(('no_template_no_reasoning_budget', base))
+        out: List[Tuple[str, List[str]]] = []
+        seen = set()
+        for name, arg_list in attempts:
+            key = tuple(arg_list)
+            if key in seen:
+                continue
+            seen.add(key)
+            out.append((name, arg_list))
+        return out
+
+    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    sock.bind(('127.0.0.1', 0))
+    port = int(sock.getsockname()[1])
+    sock.close()
+    base_url = f'http://127.0.0.1:{port}'
+    proc = None
+    log_path = str((_root() / 'logs' / 'planner_own_llama_server.log').resolve())
+    os.makedirs(os.path.dirname(log_path), exist_ok=True)
+    last_msg = 'Starting local llama-server…'
+    last_exit: Optional[int] = None
+    last_tail = ''
+    last_attempt_name = 'preferred'
+    try:
+        creationflags = 0
+        if os.name == 'nt':
+            creationflags = getattr(subprocess, 'CREATE_NO_WINDOW', 0)
+        for attempt_name, args in _arg_attempts(port):
+            last_attempt_name = attempt_name
+            if proc is not None:
+                try:
+                    if proc.poll() is None:
+                        proc.terminate()
+                        proc.wait(timeout=3)
+                except Exception:
+                    try:
+                        proc.kill()
+                    except Exception:
+                        pass
+                proc = None
+            try:
+                with open(log_path, 'w', encoding='utf-8', errors='replace') as _lf:
+                    _lf.write(f'[planner own llama] runner: {runner}\n')
+                    _lf.write(f'[planner own llama] model: {model}\n')
+                    _lf.write(f'[planner own llama] attempt: {attempt_name}\n')
+                    _lf.write(f'[planner own llama] args: {json.dumps(args, ensure_ascii=False)}\n\n')
+            except Exception:
+                pass
+            log_handle = open(log_path, 'a', encoding='utf-8', errors='replace')
+            try:
+                proc = subprocess.Popen(
+                    [runner] + args,
+                    stdout=log_handle,
+                    stderr=subprocess.STDOUT,
+                    cwd=os.path.dirname(runner),
+                    creationflags=creationflags,
+                )
+            finally:
+                try:
+                    log_handle.close()
+                except Exception:
+                    pass
+            start = time.time()
+            last_msg = 'Starting local llama-server…'
+            while (time.time() - start) <= 240.0:
+                if proc.poll() is not None:
+                    last_exit = int(proc.returncode)
+                    last_tail = _tail_text(log_path)
+                    break
+                try:
+                    code, payload = _planner_http_get_json(f'{base_url}/health', timeout=3.0)
+                    if code == 200:
+                        last_tail = ''
+                        break
+                    if code == 503:
+                        last_msg = str(((payload or {}).get('error') or {}).get('message') or 'Loading model…')
+                    else:
+                        last_msg = f'Waiting for server… ({code})'
+                except Exception:
+                    last_msg = 'Starting local llama-server…'
+                time.sleep(0.9)
+            else:
+                raise RuntimeError(f'Timed out while waiting for local llama-server. {last_msg}')
+            if proc.poll() is None:
+                break
+        else:
+            extra = f' Last attempt: {last_attempt_name}.'
+            if last_tail:
+                extra += f' Server log tail:\n{last_tail}'
+            hint = ''
+            low_tail = (last_tail or '').lower()
+            if 'failed to load multimodal model' in low_tail or 'failed to load clip model' in low_tail or 'clip_init:' in low_tail:
+                hint = ' The selected GGUF is being treated like a multimodal model during startup. Planner own-llama text mode should not use mmproj; update planner.py to the latest patch.'
+            raise RuntimeError(f'Local llama-server exited before becoming ready (exit code {last_exit if last_exit is not None else 1}). Check runner/model/template settings or open logs/planner_own_llama_server.log.{hint}{extra}')
+
+        payload = {
+            'model': 'local-model',
+            'messages': [
+                {'role': 'system', 'content': str(system_prompt or '')},
+                {'role': 'user', 'content': str(user_prompt or '')},
+            ],
+            'stream': False,
+            'max_tokens': int(max_new_tokens),
+            'temperature': float(temperature),
+            'top_p': float(cfg.get('top_p') or 0.9),
+            'reasoning_format': 'none',
+        }
+        code, data = _planner_http_post_json(f'{base_url}/v1/chat/completions', payload, timeout=360.0)
+        if code >= 400:
+            msg = ((data or {}).get('error') or {}).get('message') or f'HTTP {code}'
+            raise RuntimeError(str(msg))
+        choices = (data or {}).get('choices') or []
+        if not choices:
+            raise RuntimeError('No choices returned by the local llama server.')
+        message = choices[0].get('message') or {}
+        content = _planner_extract_message_text(message)
+        return str(content or '').strip()
+    finally:
+        if proc is not None:
+            try:
+                proc.terminate()
+                proc.wait(timeout=8)
+            except Exception:
+                try:
+                    proc.kill()
+                except Exception:
+                    pass
 
 
 # -----------------------------
@@ -1024,6 +1382,180 @@ def _planner_chain_image_still_placeholder(
     return False
 
 
+def _planner_use_end_images_enabled(enc: Optional[Dict[str, Any]]) -> bool:
+    try:
+        return bool((enc or {}).get("use_end_images_as_last_frames"))
+    except Exception:
+        return False
+
+
+def _planner_preview_media(parent: "QWidget", media_path: str) -> None:
+    try:
+        p = str(media_path or '').strip()
+    except Exception:
+        p = ""
+    if not p:
+        return
+    try:
+        dlg = _HeaderPreviewDialog(parent, p)
+        dlg.exec()
+    except Exception:
+        try:
+            _open_path(p)
+        except Exception:
+            pass
+
+
+def _planner_prepare_end_image_assignments(
+    *,
+    shots: Optional[List[Dict[str, Any]]],
+    manifest: Optional[Dict[str, Any]],
+    manifest_path: str,
+    out_dir: str,
+    attachments: Optional[Dict[str, List[str]]],
+    enabled: bool,
+) -> Dict[str, str]:
+    """Copy user-supplied end images into the project and map them 1:1 to shot order.
+
+    The mapping is persisted into manifest["shots"][sid]["end_image_file"] so normal runs,
+    clip recreation, and resume all reuse the same target image for the same shot.
+    """
+    if not enabled:
+        return {}
+    shots_list = shots if isinstance(shots, list) else []
+    if not shots_list:
+        return {}
+    m = manifest if isinstance(manifest, dict) else {}
+    shot_map = m.setdefault("shots", {}) if isinstance(m.get("shots"), dict) else {}
+    if not isinstance(shot_map, dict):
+        shot_map = {}
+        m["shots"] = shot_map
+    paths = m.setdefault("paths", {}) if isinstance(m.get("paths"), dict) else {}
+    if not isinstance(paths, dict):
+        paths = {}
+        m["paths"] = paths
+
+    raw_files: List[str] = []
+    try:
+        at = attachments if isinstance(attachments, dict) else {}
+        for p in (at.get("end_images") or []):
+            ps = str(p or '').strip()
+            if ps:
+                raw_files.append(ps)
+    except Exception:
+        raw_files = []
+
+    copied_dir = os.path.join(out_dir, "end_images")
+    try:
+        os.makedirs(copied_dir, exist_ok=True)
+    except Exception:
+        pass
+
+    existing_items = []
+    try:
+        existing_items = paths.get("end_images") if isinstance(paths.get("end_images"), list) else []
+    except Exception:
+        existing_items = []
+
+    copied_items: List[Dict[str, Any]] = []
+    if raw_files:
+        for idx, src in enumerate(raw_files, start=1):
+            src_s = str(src or '').strip()
+            if not src_s:
+                continue
+            ext = os.path.splitext(src_s)[1] or ".png"
+            dst = os.path.join(copied_dir, f"E{idx:02d}{ext.lower()}")
+            if os.path.isfile(src_s):
+                try:
+                    if os.path.abspath(src_s) != os.path.abspath(dst):
+                        shutil.copy2(src_s, dst)
+                    else:
+                        dst = src_s
+                except Exception:
+                    try:
+                        shutil.copyfile(src_s, dst)
+                    except Exception:
+                        dst = src_s if os.path.isfile(src_s) else dst
+            copied_items.append({"index": int(idx), "source": src_s, "file": str(dst)})
+    else:
+        for idx, it in enumerate(existing_items, start=1):
+            if not isinstance(it, dict):
+                continue
+            fp = str(it.get("file") or '').strip()
+            if not fp or not os.path.isfile(fp):
+                continue
+            try:
+                ii = int(it.get("index") or idx)
+            except Exception:
+                ii = idx
+            copied_items.append({"index": int(ii), "source": str(it.get("source") or ''), "file": fp})
+
+    copied_items.sort(key=lambda d: int(d.get("index") or 0))
+    paths["end_images_dir"] = copied_dir
+    paths["end_images"] = copied_items
+    m.setdefault("settings", {})["use_end_images"] = bool(copied_items)
+    m.setdefault("settings", {})["end_image_count"] = int(len(copied_items))
+
+    mapping: Dict[str, str] = {}
+    for idx, sh in enumerate(shots_list, start=1):
+        if not isinstance(sh, dict):
+            continue
+        sid = str(sh.get("id") or f"S{idx:02d}").strip()
+        if not sid:
+            continue
+        rec = shot_map.get(sid) if isinstance(shot_map.get(sid), dict) else {}
+        if not isinstance(rec, dict):
+            rec = {}
+        chosen = ""
+        existing_fp = str(rec.get("end_image_file") or '').strip()
+        if existing_fp and os.path.isfile(existing_fp):
+            chosen = existing_fp
+        elif idx <= len(copied_items):
+            chosen = str(copied_items[idx - 1].get("file") or '').strip()
+        if chosen:
+            rec["end_image_file"] = chosen
+            rec["end_image_index"] = int(idx if idx <= len(copied_items) else rec.get("end_image_index") or idx)
+            rec["ts_end_image_assigned"] = time.time()
+            mapping[sid] = chosen
+        else:
+            rec.pop("end_image_file", None)
+            rec.pop("end_image_index", None)
+        shot_map[sid] = rec
+
+    try:
+        _safe_write_json(manifest_path, m)
+    except Exception:
+        pass
+    return mapping
+
+
+def _planner_get_end_image_for_shot(
+    *,
+    sid: str,
+    shots: Optional[List[Dict[str, Any]]],
+    manifest: Optional[Dict[str, Any]],
+    manifest_path: str,
+    out_dir: str,
+    attachments: Optional[Dict[str, List[str]]],
+    enabled: bool,
+) -> str:
+    if not enabled:
+        return ""
+    mapping = _planner_prepare_end_image_assignments(
+        shots=shots,
+        manifest=manifest,
+        manifest_path=manifest_path,
+        out_dir=out_dir,
+        attachments=attachments,
+        enabled=enabled,
+    )
+    try:
+        fp = str(mapping.get(str(sid or '').strip()) or '').strip()
+    except Exception:
+        fp = ""
+    return fp if fp and os.path.isfile(fp) else ""
+
+
 def _planner_get_own_character_entries(enc: Optional[Dict[str, Any]]) -> List[Dict[str, str]]:
     """Read manual Own Character Bible entries (prompt + optional codeword triggers)."""
     out: List[Dict[str, str]] = []
@@ -1046,11 +1578,14 @@ def _planner_get_own_character_entries(enc: Optional[Dict[str, Any]]) -> List[Di
 
 
 def _apply_own_character_codeword_replacements(prompt_text: str, enc: Optional[Dict[str, Any]]) -> str:
-    """Replace manual character codewords with the corresponding character bible text.
+    """Apply manual Own Character Bible codewords once per character.
 
+    Rules:
     - Only entries with BOTH prompt and codeword are applied.
     - Case-insensitive whole-word/phrase matching.
-    - No codeword => no injection (prevents global prompt pollution).
+    - Expand only the FIRST occurrence of each codeword.
+    - Keep later occurrences as the plain codeword to avoid prompt bloat.
+    - If the replacement prose is already present, do not inject it again.
     """
     try:
         text = str(prompt_text or '')
@@ -1066,13 +1601,13 @@ def _apply_own_character_codeword_replacements(prompt_text: str, enc: Optional[D
     if not entries:
         return text
 
-    # Longest phrase first to avoid partial collisions (e.g. "Alien" vs "The alien").
     try:
         entries = sorted(entries, key=lambda d: len(str(d.get('codeword') or '')), reverse=True)
     except Exception:
         pass
 
     out = text
+    out_low = out.lower()
     for rec in entries:
         try:
             codeword = str(rec.get("codeword") or '').strip()
@@ -1083,9 +1618,25 @@ def _apply_own_character_codeword_replacements(prompt_text: str, enc: Optional[D
             continue
         try:
             pat = re.compile(rf"(?<!\w){re.escape(codeword)}(?!\w)", re.IGNORECASE)
-            out = pat.sub(repl, out)
         except Exception:
             continue
+        m = pat.search(out)
+        if not m:
+            continue
+
+        repl_clean = re.sub(r"[\r\n\t]+", " ", repl)
+        repl_clean = re.sub(r"[ ]{2,}", " ", repl_clean).strip(' ,;')
+        if not repl_clean:
+            continue
+
+        codeword_text = out[m.start():m.end()]
+        if repl_clean.lower() in out_low:
+            injected = codeword_text
+        else:
+            injected = f"{codeword_text} ({repl_clean})"
+
+        out = out[:m.start()] + injected + out[m.end():]
+        out_low = out.lower()
     return out
 
 # info: Chunk 10 side quest — Own storyline prompt parser (Step 2: preview only)
@@ -1544,6 +2095,75 @@ _WAN22_PRESETS = {
                "note": "Balanced"},
     "high":   {"model": "wan22", "quality": "high",   "res": "704p", "size_landscape": "1280*704", "size_portrait": "704*1280", "fps": 24, "steps": 30, "guidance": 4, "min_sec": 2.0, "max_sec": 3.5, "offload_model": True,
                "note": "Best native motion, heavier"},
+}
+
+
+_LTX23_PRESETS = {
+    # Private WanGP bridge presets for LTX 2.3 22B Distilled.
+    # Planner now treats clip length like the other video engines: each shot gets
+    # its own duration_sec and that duration is converted to frames at runtime.
+    # Keep a sane fallback frame count for legacy paths, but do not force every
+    # clip to 121 frames anymore.
+    "low": {
+        "model": "ltx23",
+        "quality": "low",
+        "res": "832x480",
+        "res_landscape": "832x480",
+        "res_portrait": "480x832",
+        "res_square": "720x720",
+        "fps": 24,
+        "steps": 8,
+        "min_sec": 3.5,
+        "max_sec": 10.0,
+        "max_frames": 241,
+        "video_length": 241,
+        "flow_shift": 5.0,
+        "sliding_window_size": 481,
+        "sliding_window_overlap": 17,
+        "guidance_phases": 1,
+        "denoising_strength": 1.0,
+        "label": "480p",
+    },
+    "medium": {
+        "model": "ltx23",
+        "quality": "medium",
+        "res": "1280x720",
+        "res_landscape": "1280x720",
+        "res_portrait": "720x1280",
+        "res_square": "1024x1024",
+        "fps": 24,
+        "steps": 8,
+        "min_sec": 3.5,
+        "max_sec": 10.0,
+        "max_frames": 241,
+        "video_length": 241,
+        "flow_shift": 5.0,
+        "sliding_window_size": 481,
+        "sliding_window_overlap": 17,
+        "guidance_phases": 1,
+        "denoising_strength": 1.0,
+        "label": "720p",
+    },
+    "high": {
+        "model": "ltx23",
+        "quality": "high",
+        "res": "1920x1088",
+        "res_landscape": "1920x1088",
+        "res_portrait": "1088x1920",
+        "res_square": "1440x1440",
+        "fps": 24,
+        "steps": 8,
+        "min_sec": 3.5,
+        "max_sec": 10.0,
+        "max_frames": 241,
+        "video_length": 241,
+        "flow_shift": 5.0,
+        "sliding_window_size": 481,
+        "sliding_window_overlap": 17,
+        "guidance_phases": 1,
+        "denoising_strength": 1.0,
+        "label": "1080p",
+    },
 }
 
 
@@ -2506,13 +3126,7 @@ def _planner_build_i2v_schema(
 
     end_state = _planner_i2v_end_state_hint(shot.get('phase') or purpose, shot.get('notes') or purpose, next_text)
 
-    continuity_locks: List[str] = [
-        'exact match to the input image on the first frame',
-        'same subject identity, face, body, outfit, colors, props, and scene layout throughout the clip',
-        'no new characters, no new objects, no text, no logos, no split-screen, no collage, no mosaic',
-    ]
-    if subject_tokens:
-        continuity_locks.append('keep only these main visible subjects consistent: ' + ', '.join(subject_tokens[:3]))
+    continuity_locks: List[str] = []
     continuity_locks.extend(_planner_character_lock_lines(manifest, ' '.join([visual, compiled, scene_anchor]), enc=enc, own_active=own_active))
 
     # De-duplicate continuity locks while keeping order.
@@ -4298,21 +4912,7 @@ def _cb_compact_identity_phrase(c: Dict[str, Any]) -> str:
     return phrase
 
 def _people_policy_clause(chars: List[Dict[str, Any]], blob: str) -> str:
-    """Positive-only clause that prevents accidental extra people/clones (works even when negatives are ignored)."""
-    human_chars = [c for c in (chars or []) if str(c.get("taxonomy") or '').strip().lower() == "human"]
-    if human_chars:
-        descs = [_cb_compact_identity_phrase(c) for c in human_chars]
-        descs = [d for d in descs if d]
-        n = len(descs)
-        if n == 1:
-            return f"Scene contains exactly one person: {descs[0]}."
-        return f"Scene contains exactly {n} people: " + "; ".join(descs) + "."
-    try:
-        has_people = _shot_has_people_hint(blob or '')
-    except Exception:
-        has_people = False
-    if not has_people:
-        return "Scene contains zero people."
+    """Disabled: do not inject person-count policy lines into prompts."""
     return ""
 
 
@@ -5190,20 +5790,8 @@ def _assemble_shot_prompt(
             continue
         bits.append(b)
 
-    # Auto character/subject anchors: include compact identity phrases (plain prose, no IDs/labels).
-    # This helps models that ignore negatives stay on the intended subjects.
-    if chars:
-        try:
-            anchors = [_cb_compact_identity_phrase(c) for c in chars]
-            anchors = [a for a in anchors if a]
-            if anchors:
-                bits.append("Main subjects: " + "; ".join(anchors[:2]) + ".")
-        except Exception:
-            pass
-
-    # Add character prose (if provided) as plain description, not instruction
-    if own_lock_prose:
-        bits.append(own_lock_prose)
+    # Own Character Bible is codeword-triggered only.
+    # Do not append automatic subject anchors or global character prose here.
 
     if ex and not any(_story_prompt_texts_overlap(ex, prev) for prev in bits):
         bits.append(ex)
@@ -5256,6 +5844,8 @@ def _assemble_shot_prompt(
 
 def _video_model_key(label: str) -> str:
     l = (label or '').lower()
+    if "ltx" in l and "2.3" in l:
+        return "ltx23"
     if "wan" in l and "2.2" in l:
         return "wan22"
     if "hunyuan" in l:
@@ -5278,6 +5868,10 @@ def _resolve_generation_profile(video_model_label: str, gen_quality_label: str, 
         if gk not in _WAN22_PRESETS:
             gk = "low"
         return dict(_WAN22_PRESETS[gk])
+    if mk == "ltx23":
+        if gk not in _LTX23_PRESETS:
+            gk = "medium"
+        return dict(_LTX23_PRESETS[gk])
 
     # Hunyuan default
     if gk not in _HUNYUAN_PRESETS:
@@ -5290,6 +5884,30 @@ def _resolve_generation_profile(video_model_label: str, gen_quality_label: str, 
         prof["fps"] = 15
 
     return prof
+
+
+def _planner_preferred_clip_seconds(gen_profile: Optional[Dict[str, Any]]) -> float:
+    """Choose the shot-count target length for planning.
+
+    LTX 2.3 can comfortably make longer clips than the other planner video engines,
+    so when it is selected we intentionally bias the planner toward fewer, longer
+    shots instead of the neutral midpoint that often over-splits short jobs.
+    """
+    prof = gen_profile if isinstance(gen_profile, dict) else {}
+    try:
+        min_sec = float(prof.get("min_sec", 2.5) or 2.5)
+    except Exception:
+        min_sec = 2.5
+    try:
+        max_sec = float(prof.get("max_sec", 5.0) or 5.0)
+    except Exception:
+        max_sec = 5.0
+    avg_sec = (float(min_sec) + float(max_sec)) / 2.0
+    model_key = str(prof.get("model") or prof.get("model_key") or '').strip().lower()
+    if model_key == "ltx23":
+        # Prefer the upper end of the LTX range so short jobs stay compact.
+        avg_sec = max(avg_sec, min(max_sec, max(min_sec, max_sec * 0.85)))
+    return max(float(min_sec), min(float(max_sec), float(avg_sec)))
 
 
 def _planner_force_interp_for_high(video_model_label: str, gen_quality_label: str) -> bool:
@@ -5748,6 +6366,35 @@ def _apply_aspect_to_size(base_w: int, base_h: int, aspect_mode: str) -> Tuple[i
     return int(base_w), int(base_h)
 
 
+def _profile_resolution_for_aspect(profile: Dict[str, Any], aspect_mode: str) -> str:
+    """Return an exact WxH string for the requested aspect.
+
+    For WanGP/LTX 2.3 we prefer the same bucketed resolutions exposed by wgp.py
+    instead of deriving square or portrait sizes generically.
+    """
+    prof = profile or {}
+    mode = _aspect_mode_key(aspect_mode)
+    if mode == "portrait":
+        cand = prof.get("res_portrait") or prof.get("size_portrait")
+    elif mode == "square":
+        cand = prof.get("res_square")
+    else:
+        cand = prof.get("res_landscape") or prof.get("size_landscape") or prof.get("res")
+
+    cand = str(cand or prof.get("res") or "1280x720").strip().replace("*", "x")
+    try:
+        w, h = [int(x) for x in cand.lower().split("x", 1)]
+        return f"{w}x{h}"
+    except Exception:
+        base = str(prof.get("res") or "1280x720").strip().replace("*", "x")
+        try:
+            bw, bh = [int(x) for x in base.lower().split("x", 1)]
+        except Exception:
+            bw, bh = 1280, 720
+        rw, rh = _apply_aspect_to_size(bw, bh, mode)
+        return f"{int(rw)}x{int(rh)}"
+
+
 
 
 def _sha1_text(t: str) -> str:
@@ -5877,73 +6524,119 @@ def _file_ok(path: str, min_bytes: int = 2) -> bool:
         return False
 
 def _extract_first_json(raw: str) -> Optional[Any]:
-    """Robustly extract the first JSON object/array from a model response."""
+    """Best-effort extraction of the first JSON-like object/array from model text.
+
+    Accepts strict JSON, fenced JSON, and a few common JSON-ish variants local LLMs
+    often emit such as trailing commas, Python booleans/None, comments, unquoted keys,
+    and single-quoted dict/list output.
+    """
     if not raw:
         return None
-    s = raw.strip()
-    # Strip fenced blocks if present
-    if "```" in s:
-        # try to keep content inside the first fence
-        parts = s.split("```")
+    s = str(raw).strip().replace('\ufeff', '')
+    if not s:
+        return None
+
+    if '```' in s:
+        parts = s.split('```')
         if len(parts) >= 3:
             s = parts[1] if parts[1].strip() else parts[2]
             s = s.strip()
-            if s.lower().startswith("json"):
+            if s.lower().startswith('json'):
                 s = s[4:].strip()
-
-    # Find first { or [
-    start = None
-    for k,ch in enumerate(s):
-        if ch in "{[":
-            start = k
-            break
-    if start is None:
-        return None
 
     def _balanced_extract(ss: str, st: int) -> Optional[str]:
         depth = 0
         in_str = False
         esc = False
+        quote = ''
         open_ch = ss[st]
-        close_ch = "}" if open_ch == "{" else "]"
+        close_ch = '}' if open_ch == '{' else ']'
         for i in range(st, len(ss)):
             ch = ss[i]
             if in_str:
                 if esc:
                     esc = False
-                elif ch == "\\":
+                elif ch == '\\':
                     esc = True
-                elif ch == '"':
+                elif ch == quote:
                     in_str = False
                 continue
-            else:
-                if ch == '"':
-                    in_str = True
-                    continue
-                if ch == open_ch:
-                    depth += 1
-                elif ch == close_ch:
-                    depth -= 1
-                    if depth == 0:
-                        return ss[st:i+1]
+            if ch in ('"', "'"):
+                in_str = True
+                quote = ch
+                continue
+            if ch == open_ch:
+                depth += 1
+            elif ch == close_ch:
+                depth -= 1
+                if depth == 0:
+                    return ss[st:i+1]
         return None
 
-    cand = _balanced_extract(s, start)
-    if cand:
-        try:
-            return json.loads(cand)
-        except Exception:
-            pass
+    def _candidate_chunks(ss: str) -> List[str]:
+        out: List[str] = []
+        for idx, ch in enumerate(ss):
+            if ch not in '{[':
+                continue
+            cand = _balanced_extract(ss, idx)
+            if cand:
+                out.append(cand.strip())
+        if not out:
+            start_idx = next((i for i, ch in enumerate(ss) if ch in '{['), None)
+            if start_idx is not None:
+                for stop in range(len(ss), start_idx + 1, -1):
+                    out.append(ss[start_idx:stop].strip())
+        seen = set()
+        uniq: List[str] = []
+        for item in out:
+            if item and item not in seen:
+                seen.add(item)
+                uniq.append(item)
+        return uniq
 
-    # Fallback: try progressively from start
-    for end in range(len(s), start+1, -1):
-        chunk = s[start:end].strip()
-        try:
-            return json.loads(chunk)
-        except Exception:
-            continue
+    def _repair_jsonish(chunk: str) -> List[str]:
+        cands: List[str] = []
+        base = str(chunk or '').strip()
+        if not base:
+            return cands
+        cands.append(base)
+
+        repaired = base.replace('“', '"').replace('”', '"').replace('’', "'").replace('‘', "'")
+        repaired = repaired.replace('\r\n', '\n').replace('\r', '\n')
+        repaired = re.sub(r'^\s*json\s*[:\-]?\s*', '', repaired, flags=re.IGNORECASE)
+        repaired = re.sub(r'/\*.*?\*/', '', repaired, flags=re.DOTALL)
+        repaired = re.sub(r'(^|\n)\s*//.*?(?=\n|$)', r'\1', repaired)
+        repaired = re.sub(r'(^|\n)\s*#.*?(?=\n|$)', r'\1', repaired)
+        repaired = re.sub(r'\bTrue\b', 'true', repaired)
+        repaired = re.sub(r'\bFalse\b', 'false', repaired)
+        repaired = re.sub(r'\bNone\b', 'null', repaired)
+        repaired = re.sub(r',\s*([}\]])', r'\1', repaired)
+        repaired = re.sub(r'([{,]\s*)([A-Za-z_][A-Za-z0-9_\-]*)(\s*:)', r'\1"\2"\3', repaired)
+        cands.append(repaired.strip())
+
+        pyish = base
+        pyish = re.sub(r'/\*.*?\*/', '', pyish, flags=re.DOTALL)
+        pyish = re.sub(r'(^|\n)\s*//.*?(?=\n|$)', r'\1', pyish)
+        pyish = re.sub(r'(^|\n)\s*#.*?(?=\n|$)', r'\1', pyish)
+        pyish = re.sub(r',\s*([}\]])', r'\1', pyish)
+        pyish = re.sub(r'([{,]\s*)([A-Za-z_][A-Za-z0-9_\-]*)(\s*:)', r'\1"\2"\3', pyish)
+        cands.append(pyish.strip())
+        return [x for x in cands if x]
+
+    for cand in _candidate_chunks(s):
+        for variant in _repair_jsonish(cand):
+            try:
+                return json.loads(variant)
+            except Exception:
+                pass
+            try:
+                import ast
+                obj = ast.literal_eval(variant)
+                if isinstance(obj, (dict, list)):
+                    return obj
+            except Exception:
+                pass
     return None
-
 
 def _append_prompt_used(path: str, title: str, system_prompt: str, user_prompt: str) -> None:
     os.makedirs(os.path.dirname(path), exist_ok=True)
@@ -5957,7 +6650,8 @@ def _append_prompt_used(path: str, title: str, system_prompt: str, user_prompt: 
 
 
 def _qwen_json_call(step_name: str, system_prompt: str, user_prompt: str, raw_path: str, prompts_used_path: str,
-                    error_path: str, temperature: float = 0.2, max_new_tokens: int = 2048) -> Tuple[Optional[Any], str]:
+                    error_path: str, temperature: float = 0.2, max_new_tokens: int = 2048,
+                    planner_llama_settings: Optional[Dict[str, Any]] = None) -> Tuple[Optional[Any], str]:
     """Call Qwen3-VL via a short-lived subprocess and force JSON-only. Returns (parsed_json_or_none, raw_text).
 
     Reliability rules:
@@ -5972,30 +6666,43 @@ def _qwen_json_call(step_name: str, system_prompt: str, user_prompt: str, raw_pa
     _append_prompt_used(prompts_used_path, step_name, system_prompt, user_prompt)
     raw_text = ""
     try:
-        if not _HAVE_QWEN_TEXT:
-            raise RuntimeError(f"Qwen text generator not available: {_QWEN_IMPORT_ERROR!r}")
-        model_path = Path(_qwen_model_dir())
-        if not (model_path.exists() and any(model_path.iterdir())):
-            raise RuntimeError(f"Qwen3-VL model folder not found or empty: {model_path}")
+        _own_llama_active = _planner_llama_is_enabled(planner_llama_settings)
+        if _own_llama_active:
+            raw_text = _planner_run_llama_text(
+                system_prompt=system_prompt,
+                user_prompt=user_prompt,
+                temperature=float(temperature),
+                max_new_tokens=int(max_new_tokens),
+                planner_llama_settings=planner_llama_settings,
+            )
+            raw_text = (raw_text or '').strip()
+            _safe_write_text(raw_path, raw_text + ("\n" if raw_text else ""))
+            if not raw_text:
+                raise RuntimeError(f"{step_name}: local llama returned empty output.")
+        else:
+            if not _HAVE_QWEN_TEXT:
+                raise RuntimeError(f"Qwen text generator not available: {_QWEN_IMPORT_ERROR!r}")
+            model_path = Path(_qwen_model_dir())
+            if not (model_path.exists() and any(model_path.iterdir())):
+                raise RuntimeError(f"Qwen3-VL model folder not found or empty: {model_path}")
 
-        out, err, rc = _run_qwen_text_subprocess(
-            model_path=str(model_path),
-            system_prompt=system_prompt,
-            user_prompt=user_prompt,
-            temperature=float(temperature),
-            max_new_tokens=int(max_new_tokens),
-        )
-        raw_text = (out or '').strip()
+            out, err, rc = _run_qwen_text_subprocess(
+                model_path=str(model_path),
+                system_prompt=system_prompt,
+                user_prompt=user_prompt,
+                temperature=float(temperature),
+                max_new_tokens=int(max_new_tokens),
+            )
+            raw_text = (out or '').strip()
 
-        # Save raw (optionally append stderr without affecting JSON extraction)
-        save_blob = raw_text
-        err = (err or '').strip()
-        if err:
-            save_blob = (save_blob + "\n\n[stderr]\n" + err).strip()
-        _safe_write_text(raw_path, save_blob + ("\n" if save_blob else ""))
+            save_blob = raw_text
+            err = (err or '').strip()
+            if err:
+                save_blob = (save_blob + "\n\n[stderr]\n" + err).strip()
+            _safe_write_text(raw_path, save_blob + ("\n" if save_blob else ""))
 
-        if rc != 0 and not raw_text:
-            raise RuntimeError(f"Qwen subprocess failed (rc={rc}).")
+            if rc != 0 and not raw_text:
+                raise RuntimeError(f"Qwen subprocess failed (rc={rc}).")
 
         parsed = _extract_first_json(raw_text)
         if parsed is None:
@@ -6013,6 +6720,8 @@ def _qwen_json_call(step_name: str, system_prompt: str, user_prompt: str, raw_pa
         except Exception:
             pass
         _safe_write_text(error_path, traceback.format_exc())
+        if _planner_llama_is_enabled(planner_llama_settings):
+            raise
         return None, raw_text
 
 
@@ -6051,13 +6760,14 @@ class _TextTaskSignals(QObject):
 
 
 class _Ace15LyricsWorker(QThread):
-    def __init__(self, system_prompt: str, user_prompt: str, log_path: str, temperature: float = 0.9, max_new_tokens: int = 700, parent=None):
+    def __init__(self, system_prompt: str, user_prompt: str, log_path: str, temperature: float = 0.9, max_new_tokens: int = 700, planner_llama_settings: Optional[Dict[str, Any]] = None, parent=None):
         super().__init__(parent)
         self.system_prompt = str(system_prompt or '')
         self.user_prompt = str(user_prompt or '')
         self.log_path = str(log_path or '')
         self.temperature = float(temperature)
         self.max_new_tokens = int(max_new_tokens)
+        self.planner_llama_settings = dict(planner_llama_settings or {}) if isinstance(planner_llama_settings, dict) else None
         self.signals = _TextTaskSignals()
         try:
             self.signals.moveToThread(self)
@@ -6073,6 +6783,7 @@ class _Ace15LyricsWorker(QThread):
                 self.log_path,
                 temperature=float(self.temperature),
                 max_new_tokens=int(self.max_new_tokens),
+                planner_llama_settings=self.planner_llama_settings,
             )
             self.signals.finished.emit(str(raw or ''))
         except Exception as e:
@@ -6497,56 +7208,210 @@ class PipelineWorker(QThread):
         cpu_offload = bool(prof.get("cpu_offload", True))
         vae_tiling = bool(prof.get("vae_tiling", True))
 
-        # Only HunyuanVideo is wired right now (Chunk 5). Keep behavior identical.
-        if _video_model_key(self.job.encoding.get("video_model") or '') != "hunyuan":
-            raise RuntimeError("Clip regeneration is only supported for HunyuanVideo 1.5 in the current build.")
-
-        # Run the exact same CLI call as initial clip generation
-        py = _root() / ".hunyuan15_env" / "Scripts" / "python.exe"
-        if not py.exists():
-            raise RuntimeError(
-                f"HunyuanVideo 1.5 environment not found: {py}\n"
-                "Install it first via Tools → HunyuanVideo 1.5 → Install/Update Cuda."
-            )
-        cli = _root() / "helpers" / "hunyuan15_cli.py"
-        if not cli.exists():
-            raise RuntimeError(f"Missing CLI: {cli}")
-
-        try:
-            regen_bitrate_kbps = int((self.job.encoding or {}).get("video_bitrate_kbps") or (self.job.encoding or {}).get("bitrate_kbps") or 5000)
-        except Exception:
-            regen_bitrate_kbps = 5000
-        regen_bitrate_kbps = max(500, int(regen_bitrate_kbps))
-
-        args = [
-            str(py),
-            str(cli),
-            "generate",
-            "--model", str(model_key),
-            "--prompt", str(prompt),
-            "--negative", str(negative or ''),
-            "--image", str(img_path),
-            "--output", str(out_file),
-            "--fps", str(int(fps)),
-            "--frames", str(int(frames)),
-            "--steps", str(int(steps)),
-            "--bitrate-kbps", str(int(regen_bitrate_kbps)),
-            "--auto-aspect",
+        # Decide the recreate backend from the clip itself first.
+        # Hidden/easter-egg models like LTX can leave stale manifest/UI video_model labels,
+        # which caused recreate to route through the Hunyuan CLI with --model ltx23.
+        _mk_candidates = [
+            str((clip_entry or {}).get("model_key") or '').strip(),
+            str((clip_entry or {}).get("video_model") or '').strip(),
+            str((clip_entry or {}).get("video_engine") or '').strip(),
+            str(rec.get("video_model") or '').strip(),
+            str(rec.get("model_key") or '').strip(),
+            str(rec.get("video_engine") or '').strip(),
+            str((manifest.get("settings") or {}).get("video_model") or '').strip(),
+            str((manifest.get("settings") or {}).get("video_engine") or '').strip(),
+            str((self.job.encoding or {}).get("video_model") or '').strip(),
         ]
-        if int(target_size) > 0:
-            args += ["--target-size", str(int(target_size))]
-        args += ["--attn", str(attn_backend or "auto")]
-        if bool(cpu_offload):
-            args += ["--offload"]
-        if bool(vae_tiling):
-            args += ["--tiling"]
-        if seed is not None:
-            args += ["--seed", str(int(seed))]
+        mk = ""
+        for _cand in _mk_candidates:
+            _k = _video_model_key(_cand)
+            if _k != "hunyuan" or ("hunyuan" in str(_cand).lower()):
+                mk = _k
+                if _cand:
+                    break
+        try:
+            _ltx_log = os.path.join(clips_dir, f"{sid}.ltx23.log.txt")
+            _wan_log = os.path.join(clips_dir, f"{sid}.wan22.log.txt")
+            if os.path.isfile(_ltx_log):
+                mk = "ltx23"
+            elif os.path.isfile(_wan_log):
+                mk = "wan22"
+        except Exception:
+            pass
+        if not mk:
+            try:
+                if (clip_entry or {}).get("resolution") or str((clip_entry or {}).get("model_key") or '').lower().find('ltx') >= 0:
+                    mk = "ltx23"
+                elif (clip_entry or {}).get("size") or (clip_entry or {}).get("guidance") is not None:
+                    mk = "wan22"
+                else:
+                    mk = "hunyuan"
+            except Exception:
+                mk = "hunyuan"
 
         import subprocess
         # VRAM guard: make sure no old CUDA context (e.g., Qwen3-VL) is eating VRAM before regen
         _vram_release("before clip regen")
-        subprocess.run(args, cwd=str(_root()), check=True)
+
+        if mk == "hunyuan":
+            py = _root() / ".hunyuan15_env" / "Scripts" / "python.exe"
+            if not py.exists():
+                raise RuntimeError(
+                    f"HunyuanVideo 1.5 environment not found: {py}\n"
+                    "Install it first via Tools → HunyuanVideo 1.5 → Install/Update Cuda."
+                )
+            cli = _root() / "helpers" / "hunyuan15_cli.py"
+            if not cli.exists():
+                raise RuntimeError(f"Missing CLI: {cli}")
+
+            try:
+                regen_bitrate_kbps = int((self.job.encoding or {}).get("video_bitrate_kbps") or (self.job.encoding or {}).get("bitrate_kbps") or 5000)
+            except Exception:
+                regen_bitrate_kbps = 5000
+            regen_bitrate_kbps = max(500, int(regen_bitrate_kbps))
+
+            args = [
+                str(py),
+                str(cli),
+                "generate",
+                "--model", str(model_key),
+                "--prompt", str(prompt),
+                "--negative", str(negative or ''),
+                "--image", str(img_path),
+                "--output", str(out_file),
+                "--fps", str(int(fps)),
+                "--frames", str(int(frames)),
+                "--steps", str(int(steps)),
+                "--bitrate-kbps", str(int(regen_bitrate_kbps)),
+                "--auto-aspect",
+            ]
+            if int(target_size) > 0:
+                args += ["--target-size", str(int(target_size))]
+            args += ["--attn", str(attn_backend or "auto")]
+            if bool(cpu_offload):
+                args += ["--offload"]
+            if bool(vae_tiling):
+                args += ["--tiling"]
+            if seed is not None:
+                args += ["--seed", str(int(seed))]
+            subprocess.run(args, cwd=str(_root()), check=True)
+        elif mk == "wan22":
+            size_str = str((clip_entry or {}).get("size") or prof.get("size_landscape") or "1280*704")
+            guidance = float((clip_entry or {}).get("guidance") or prof.get("guidance") or 4)
+            offload_model = bool(prof.get("offload_model", True))
+            log_file = os.path.join(clips_dir, f"{sid}.wan22.log.txt")
+            _run_wan22_clip(
+                prompt=str(prompt),
+                negative=str(negative or ''),
+                image_path=str(img_path),
+                out_path=str(out_file),
+                fps=int(fps),
+                frames=int(frames),
+                steps=int(steps),
+                seed=seed,
+                size_str=size_str,
+                guidance=guidance,
+                offload_model=offload_model,
+                t5_cpu=bool(prof.get("t5_cpu", False)),
+                log_path=log_file,
+            )
+        elif mk == "ltx23":
+            bridge = _ltx23_bridge_config_global()
+            wangp_root = str(bridge.get("wangp_root") or '').strip()
+            if not wangp_root or not os.path.isdir(wangp_root):
+                raise RuntimeError(
+                    "WanGP root for LTX 2.3 was not found. Expected one of: "
+                    r"FRAMEVISION_LTX23_WANGP_ROOT, C:\WanGP\Wan2GP, or a nearby Wan2GP folder."
+                )
+            _clip_resolution = str((clip_entry or {}).get("resolution") or '').strip()
+            if _clip_resolution:
+                resolution = _clip_resolution
+            else:
+                _aspect_mode = str(
+                    (rec.get("aspect_mode", None) if isinstance(rec, dict) else None)
+                    or (((manifest.get("settings") or {}).get("aspect_mode", None)) if isinstance(manifest.get("settings"), dict) else None)
+                    or "landscape"
+                )
+                resolution = _profile_resolution_for_aspect(prof, _aspect_mode)
+            _ltx_use_end_images = bool(_planner_use_end_images_enabled(getattr(self.job, "encoding", {})))
+            end_image_path = _planner_get_end_image_for_shot(
+                sid=sid,
+                shots=_load_shots_list(shots_path) if _file_ok(shots_path, 10) else [],
+                manifest=manifest,
+                manifest_path=manifest_path,
+                out_dir=self.out_dir,
+                attachments=(self.job.attachments or {}),
+                enabled=_ltx_use_end_images,
+            ) if mk == "ltx23" else ""
+
+            try:
+                _saved_settings = _load_planner_settings() or {}
+            except Exception:
+                _saved_settings = {}
+            _enc_lora = None
+            for _src in (
+                (clip_entry or {}).get("use_transition_lora", None),
+                rec.get("use_transition_lora", None),
+                ((manifest.get("settings") or {}).get("use_transition_lora", None) if isinstance(manifest.get("settings"), dict) else None),
+                (self.job.encoding or {}).get("use_transition_lora", None),
+                _saved_settings.get("use_transition_lora", None),
+            ):
+                if _src is not None:
+                    _enc_lora = _src
+                    break
+            try:
+                _ui_lora_widget = getattr(self, "chk_use_transition_lora", None)
+                _ui_lora = bool(_ui_lora_widget.isChecked()) if _ui_lora_widget is not None else None
+            except Exception:
+                _ui_lora = None
+            if _enc_lora is None:
+                use_transition_lora = True if _ui_lora is None else bool(_ui_lora)
+            else:
+                use_transition_lora = bool(_enc_lora)
+            frames = max(12, min(int(max_frames or 241), int(frames)))
+            args = [
+                str(sys.executable),
+                str(_root() / "helpers" / "ltx23_cli.py"),
+                "generate",
+                "--wangp-root", str(wangp_root),
+                "--prompt", str(prompt or ''),
+                "--negative", str(negative or ''),
+                "--image", str(img_path),
+                "--output", str(out_file),
+                "--fps", str(int(fps)),
+                "--frames", str(int(frames)),
+                "--steps", str(int(steps)),
+                "--resolution", str(resolution),
+                "--flow-shift", str(float(prof.get("flow_shift") or 5.0)),
+                "--sliding-window-size", str(int(prof.get("sliding_window_size") or 481)),
+                "--sliding-window-overlap", str(int(prof.get("sliding_window_overlap") or 17)),
+                "--guidance-phases", str(int(prof.get("guidance_phases") or 1)),
+                "--denoising-strength", str(float(prof.get("denoising_strength") or 1.0)),
+                "--lora-multiplier", str(float(prof.get("lora_multiplier") or 1.0)),
+            ]
+            if seed is not None:
+                args += ["--seed", str(int(seed))]
+            if str(end_image_path or '').strip():
+                args += ["--image-end", str(end_image_path).strip()]
+            if str(bridge.get("wgp_py") or '').strip() and os.path.isfile(str(bridge.get("wgp_py") or '')):
+                args += ["--wgp-py", str(bridge.get("wgp_py") or '')]
+            if bool(use_transition_lora):
+                _lf = str(bridge.get("lora_file") or '').strip()
+                _lj = str(bridge.get("lora_json") or '').strip()
+                if _lf:
+                    args += ["--lora-file", _lf]
+                if _lj:
+                    args += ["--lora-json", _lj]
+            log_file = os.path.join(clips_dir, f"{sid}.ltx23.log.txt")
+            Path(log_file).parent.mkdir(parents=True, exist_ok=True)
+            with open(log_file, "a", encoding="utf-8", errors="ignore") as lf:
+                lf.write(f"[planner] ltx23 regen settings: frames={frames} fps={fps} resolution={resolution} use_transition_lora={use_transition_lora} end_image={end_image_path or '<none>'}\n")
+                lf.write("[planner] ltx23 regen cmd:\n")
+                lf.write(" ".join([str(x) for x in args]) + "\n\n")
+                lf.flush()
+                subprocess.run(args, cwd=str(_root()), stdout=lf, stderr=lf, check=True)
+        else:
+            raise RuntimeError("Clip regeneration is only supported for HunyuanVideo 1.5, WAN 2.2, and LTX 2.3 in the current build.")
 
         if not os.path.isfile(out_file) or os.path.getsize(out_file) < 1024:
             raise RuntimeError(f"Clip output missing/too small for {sid}: {out_file}")
@@ -6557,6 +7422,8 @@ class PipelineWorker(QThread):
             rec["clip_file"] = str(out_file)
             rec["ts_clip_done"] = time.time()
             rec["clip_regen_count"] = int(rec.get("clip_regen_count") or 0) + 1
+            if end_image_path:
+                rec["end_image_file"] = str(end_image_path)
             if take_path:
                 takes = rec.get("clip_takes")
                 if not isinstance(takes, list):
@@ -6593,7 +7460,16 @@ class PipelineWorker(QThread):
 
             clip_entry["seed"] = seed
             clip_entry["target_size"] = int(target_size)
-            clip_entry["model_key"] = str(model_key)
+            clip_entry["model_key"] = str(mk or model_key)
+            clip_entry["video_model"] = str(mk or model_key)
+            if mk == "ltx23":
+                clip_entry["use_transition_lora"] = bool(use_transition_lora)
+                if end_image_path:
+                    clip_entry["end_image_file"] = str(end_image_path)
+            try:
+                clip_entry["duration_sec"] = round(float(frames) / float(max(1, fps)), 2)
+            except Exception:
+                pass
             clip_entry["regen_count"] = int(clip_entry.get("regen_count") or 0) + 1
             if take_path:
                 tk = clip_entry.get("takes")
@@ -6604,6 +7480,8 @@ class PipelineWorker(QThread):
 
             manifest.setdefault("paths", {})["clips_dir"] = str(clips_dir)
             manifest["paths"]["clips"] = clips_list
+            if mk == "ltx23":
+                manifest.setdefault("settings", {})["use_transition_lora"] = bool(use_transition_lora)
             _safe_write_json(manifest_path, manifest)
         except Exception:
             pass
@@ -8684,6 +9562,7 @@ class PipelineWorker(QThread):
                     error_path=qwen_plan_err,
                     temperature=0.35,
                     max_new_tokens=4000,
+                    planner_llama_settings=self.job.encoding,
                 )
 
                 if not isinstance(parsed, dict):
@@ -8812,7 +9691,7 @@ class PipelineWorker(QThread):
                 plan_obj = _safe_read_json(plan_path) or {}
                 # Choose approximate number of shots based on desired duration
                 # (avg duration chosen from generation preset; stable per job)
-                avg_sec = float((gen_profile.get("min_sec", 2.5) + gen_profile.get("max_sec", 5.0)) / 2.0)
+                avg_sec = float(_planner_preferred_clip_seconds(gen_profile))
                 min_sec = float(gen_profile.get("min_sec", 2.5))
                 max_sec = float(gen_profile.get("max_sec", 5.0))
                 target_total = float(max(1.0, float(getattr(self.job, "approx_duration_sec", 0) or 0.0)))
@@ -9068,7 +9947,7 @@ class PipelineWorker(QThread):
                 default_taxonomy = _infer_default_subject_taxonomy(self.job.prompt, self.job.extra_info)
                 # Choose approximate number of shots based on desired duration
                 # (avg duration chosen from generation preset; stable per job)
-                avg_sec = float((gen_profile.get("min_sec", 2.5) + gen_profile.get("max_sec", 5.0)) / 2.0)
+                avg_sec = float(_planner_preferred_clip_seconds(gen_profile))
                 min_sec = float(gen_profile.get("min_sec", 2.5))
                 max_sec = float(gen_profile.get("max_sec", 5.0))
                 target_total = float(max(1.0, float(getattr(self.job, "approx_duration_sec", 0) or 0.0)))
@@ -9140,6 +10019,7 @@ class PipelineWorker(QThread):
                     error_path=qwen_shots_err,
                     temperature=0.4,
                     max_new_tokens=5200,
+                    planner_llama_settings=self.job.encoding,
                 )
 
                 shots_list: List[Dict[str, Any]] = []
@@ -9184,6 +10064,7 @@ class PipelineWorker(QThread):
                             log_path=retry_log,
                             temperature=0.25,
                             max_new_tokens=int(max(1400, n_shots * 160)),
+                            planner_llama_settings=self.job.encoding,
                         )
                         shots_list = _parse_story_shot_lines(retry_raw, int(n_shots), plan_obj, float(target_total))
                         if shots_list:
@@ -9572,6 +10453,7 @@ class PipelineWorker(QThread):
                                 error_path=qwen_bible_err,
                                 temperature=0.5,
                                 max_new_tokens=2048,
+                                planner_llama_settings=self.job.encoding,
                             )
 
                             if isinstance(parsed, dict):
@@ -9957,6 +10839,7 @@ class PipelineWorker(QThread):
                         log_path=list_log,
                         temperature=0.35,
                         max_new_tokens=int(max(1600, N * 280)),
+                        planner_llama_settings=self.job.encoding,
                     )
 
                     def _parse_prompt_lines(blob: str, n: int, prefix_text: str) -> List[str]:
@@ -10025,6 +10908,7 @@ class PipelineWorker(QThread):
                                 log_path=os.path.join(prompts_dir, "qwen_prompt_list_alt_storymode_retry.txt"),
                                 temperature=0.2,
                                 max_new_tokens=int(max(1600, N * 280)),
+                                planner_llama_settings=self.job.encoding,
                             )
                             prompts = _parse_prompt_lines(raw2, N, seed)
                         except Exception:
@@ -10511,6 +11395,7 @@ class PipelineWorker(QThread):
                                     error_path=err_path,
                                     temperature=0.2,
                                     max_new_tokens=2800,
+                                    planner_llama_settings=self.job.encoding,
                                 )
                                 ok, why = _auto_cb_v2_validate(parsed, shots)
                                 if ok:
@@ -10577,6 +11462,21 @@ class PipelineWorker(QThread):
                 image_records: List[Dict[str, Any]] = []
                 total = len(shots)
                 use_last_frame_chain = _planner_last_frame_chain_enabled(getattr(self.job, "encoding", {}))
+                try:
+                    _ltx_use_end_images = bool(_planner_use_end_images_enabled(getattr(self.job, "encoding", {})))
+                except Exception:
+                    _ltx_use_end_images = False
+                try:
+                    _end_image_assignments = _planner_prepare_end_image_assignments(
+                        shots=shots,
+                        manifest=manifest,
+                        manifest_path=manifest_path,
+                        out_dir=self.out_dir,
+                        attachments=(self.job.attachments or {}),
+                        enabled=_ltx_use_end_images,
+                    )
+                except Exception:
+                    _end_image_assignments = {}
 
                 try:
                     _enc_now = getattr(self.job, "encoding", {}) or {}
@@ -10722,6 +11622,88 @@ class PipelineWorker(QThread):
                         except Exception:
                             pass
                         continue
+
+                    _prev_end_anchor = ""
+                    if _ltx_use_end_images and i > 1:
+                        try:
+                            _prev_sid = str((shots[i - 2] or {}).get("id") or f"S{i-1:02d}").strip()
+                        except Exception:
+                            _prev_sid = f"S{i-1:02d}"
+                        try:
+                            _prev_rec = shot_map.get(_prev_sid) if isinstance(shot_map, dict) else {}
+                            if not isinstance(_prev_rec, dict):
+                                _prev_rec = {}
+                        except Exception:
+                            _prev_rec = {}
+                        _prev_end_anchor = str(_prev_rec.get("end_image_file") or _end_image_assignments.get(_prev_sid) or "").strip()
+                        if _prev_end_anchor and os.path.isfile(_prev_end_anchor):
+                            try:
+                                _anchor_ext = os.path.splitext(_prev_end_anchor)[1] or ".png"
+                                _anchor_dst = os.path.join(images_dir, f"{sid}{_anchor_ext.lower()}")
+                                try:
+                                    os.makedirs(images_dir, exist_ok=True)
+                                except Exception:
+                                    pass
+                                for _ext in (".png", ".jpg", ".jpeg", ".webp", ".bmp"):
+                                    try:
+                                        _stale = os.path.join(images_dir, f"{sid}{_ext}")
+                                        if os.path.abspath(_stale) != os.path.abspath(_anchor_dst) and os.path.isfile(_stale):
+                                            os.remove(_stale)
+                                    except Exception:
+                                        pass
+                                if os.path.abspath(_prev_end_anchor) != os.path.abspath(_anchor_dst):
+                                    try:
+                                        shutil.copy2(_prev_end_anchor, _anchor_dst)
+                                    except Exception:
+                                        shutil.copyfile(_prev_end_anchor, _anchor_dst)
+                                else:
+                                    _anchor_dst = _prev_end_anchor
+                                try:
+                                    shot_map = manifest.setdefault("shots", {})
+                                    _reca = shot_map.get(sid) if isinstance(shot_map.get(sid), dict) else {}
+                                    if not isinstance(_reca, dict):
+                                        _reca = {}
+                                    _reca["file"] = _anchor_dst
+                                    _reca["status"] = "done"
+                                    _reca["ts_done"] = time.time()
+                                    _reca["seeded_from_previous_end_image"] = True
+                                    _reca["seeded_from_previous_end_image_sid"] = _prev_sid
+                                    shot_map[sid] = _reca
+                                except Exception:
+                                    pass
+
+                                image_records.append({
+                                    "id": sid,
+                                    "file": _anchor_dst,
+                                    "seed": None,
+                                    "seeded_from_previous_end_image": True,
+                                    "seeded_from_previous_end_image_sid": _prev_sid,
+                                })
+                                try:
+                                    manifest.setdefault("paths", {})["images_dir"] = images_dir
+                                    manifest["paths"]["images"] = image_records
+                                    if _anchor_dst and not manifest["paths"].get("first_image"):
+                                        manifest["paths"]["first_image"] = _anchor_dst
+                                    _safe_write_json(manifest_path, manifest)
+                                except Exception:
+                                    pass
+                                self.signals.stage.emit(f"Images — {sid} (from previous target {i}/{total})")
+                                self.signals.log.emit(f"[IMG] {sid}: using {_prev_sid}'s assigned end image as this shot image; skipping regeneration")
+                                try:
+                                    self.signals.progress.emit(_img_step_pct(i, total))
+                                except Exception:
+                                    pass
+                                try:
+                                    if _anchor_dst and os.path.exists(_anchor_dst):
+                                        self.signals.asset_created.emit(_anchor_dst)
+                                except Exception:
+                                    pass
+                                continue
+                            except Exception as _anchor_err:
+                                try:
+                                    self.signals.log.emit(f"[IMG] {sid}: failed to seed from previous end image: {_anchor_err}")
+                                except Exception:
+                                    pass
 
                     if use_last_frame_chain and i > 1:
                         try:
@@ -12164,6 +13146,10 @@ class PipelineWorker(QThread):
                     own_active0 = bool((enc0 or {}).get("own_character_bible_enabled"))
                 except Exception:
                     own_active0 = False
+                try:
+                    own_storyline_enabled0 = bool((enc0 or {}).get("own_storyline_enabled"))
+                except Exception:
+                    own_storyline_enabled0 = False
                 _planner_reset_i2v_camera_state()
 
                 for idx, sh in enumerate(shots):
@@ -12173,17 +13159,36 @@ class PipelineWorker(QThread):
 
                     prev_sh = shots[idx - 1] if idx > 0 and idx - 1 < len(shots) else None
                     next_sh = shots[idx + 1] if (idx + 1) < len(shots) else None
-                    schema = _planner_build_i2v_schema(
-                        manifest,
-                        sh if isinstance(sh, dict) else {},
-                        rec if isinstance(rec, dict) else {},
-                        prev_shot=(prev_sh if isinstance(prev_sh, dict) else None),
-                        next_shot=(next_sh if isinstance(next_sh, dict) else None),
-                        enc=enc0,
-                        own_active=bool(own_active0),
-                    )
-                    i2v_prompt = _planner_format_i2v_prompt(schema)
-                    i2v_negative = neg
+                    if bool(own_storyline_enabled0):
+                        raw_prompt = str(
+                            (rec.get("prompt_user_override") if isinstance(rec, dict) else "")
+                            or (rec.get("prompt_compiled") if isinstance(rec, dict) else "")
+                            or (rec.get("prompt_used") if isinstance(rec, dict) else "")
+                            or (rec.get("prompt_spec") if isinstance(rec, dict) else "")
+                            or (sh.get("visual_description") if isinstance(sh, dict) else "")
+                            or (sh.get("seed") if isinstance(sh, dict) else "")
+                            or ""
+                        ).strip()
+                        i2v_prompt = raw_prompt
+                        i2v_negative = neg
+                        schema = {
+                            "schema_version": int(_PLANNER_I2V_SCHEMA_VERSION),
+                            "mode": "own_storyline_raw",
+                            "prompt_raw": raw_prompt,
+                            "wrapper_disabled": True,
+                        }
+                    else:
+                        schema = _planner_build_i2v_schema(
+                            manifest,
+                            sh if isinstance(sh, dict) else {},
+                            rec if isinstance(rec, dict) else {},
+                            prev_shot=(prev_sh if isinstance(prev_sh, dict) else None),
+                            next_shot=(next_sh if isinstance(next_sh, dict) else None),
+                            enc=enc0,
+                            own_active=bool(own_active0),
+                        )
+                        i2v_prompt = _planner_format_i2v_prompt(schema)
+                        i2v_negative = neg
 
                     if isinstance(rec, dict):
                         rec["i2v_prompt"] = i2v_prompt
@@ -12730,6 +13735,542 @@ class PipelineWorker(QThread):
                 _safe_write_json(clips_manifest_path, {"fingerprint": clip_fingerprint, "clips": clips_out, "profile": prof})
                 manifest.setdefault("paths", {})["clips_dir"] = clips_dir
                 manifest["paths"]["clips"] = clips_out
+                manifest.setdefault("settings", {})["video_engine"] = "ltx23"
+                manifest["settings"]["video_model"] = "ltx23"
+                manifest["settings"]["video_profile"] = prof
+                manifest["settings"]["use_transition_lora"] = bool(use_transition_lora)
+                _safe_write_json(manifest_path, manifest)
+
+
+            def _ltx23_guess_wangp_root() -> str:
+                guesses = []
+                try:
+                    env_root = str(os.environ.get("FRAMEVISION_LTX23_WANGP_ROOT") or '').strip()
+                except Exception:
+                    env_root = ""
+                if env_root:
+                    guesses.append(env_root)
+                if os.name == "nt":
+                    guesses += [r"C:\WanGP\Wan2GP", r"C:\WanGP"]
+                try:
+                    guesses += [str((_root().parent / "Wan2GP").resolve()), str((_root().parent / "WanGP" / "Wan2GP").resolve())]
+                except Exception:
+                    pass
+                for raw in guesses:
+                    s = str(raw or '').strip()
+                    if not s:
+                        continue
+                    try:
+                        pp = Path(s)
+                        if pp.is_dir() and (pp / "wgp.py").exists():
+                            return str(pp)
+                        if pp.is_dir() and (pp / "Wan2GP" / "wgp.py").exists():
+                            return str((pp / "Wan2GP").resolve())
+                    except Exception:
+                        continue
+                return ""
+
+            def _ltx23_bridge_config() -> Dict[str, str]:
+                root_dir = _ltx23_guess_wangp_root()
+                try:
+                    env_lora = str(os.environ.get("FRAMEVISION_LTX23_LORA_FILE") or '').strip()
+                except Exception:
+                    env_lora = ""
+                try:
+                    env_json = str(os.environ.get("FRAMEVISION_LTX23_LORA_JSON") or '').strip()
+                except Exception:
+                    env_json = ""
+                try:
+                    env_wgp = str(os.environ.get("FRAMEVISION_LTX23_WGP_PY") or '').strip()
+                except Exception:
+                    env_wgp = ""
+                wgp_py = env_wgp or (str((Path(root_dir) / "wgp.py").resolve()) if root_dir else "")
+                lora_file = env_lora or (str((Path(root_dir) / "loras" / "ltx2" / "ltx2.3-transition.safetensors").resolve()) if root_dir else "")
+                lora_json = env_json or (str((Path(root_dir) / "loras" / "ltx2" / "LTX-2.3.json").resolve()) if root_dir else "")
+                return {
+                    "wangp_root": str(root_dir or ''),
+                    "wgp_py": str(wgp_py or ''),
+                    "lora_file": str(lora_file or ''),
+                    "lora_json": str(lora_json or ''),
+                }
+
+            def _run_ltx23_clip(*, prompt: str, negative: str, image_path: str, out_path: str,
+                                fps: int, frames: int, steps: int, seed: Optional[int],
+                                resolution: str, flow_shift: float = 5.0,
+                                sliding_window_size: int = 481, sliding_window_overlap: int = 17,
+                                guidance_phases: int = 1, denoising_strength: float = 1.0,
+                                lora_multiplier: float = 1.0, use_transition_lora: bool = True,
+                                image_end_path: str = "", log_path: Optional[str] = None) -> None:
+                cli = _root() / "helpers" / "ltx23_cli.py"
+                if not cli.exists():
+                    raise RuntimeError(f"Missing CLI: {cli}")
+                bridge = _ltx23_bridge_config()
+                wangp_root = str(bridge.get("wangp_root") or '').strip()
+                if not wangp_root or not os.path.isdir(wangp_root):
+                    raise RuntimeError(
+                        "WanGP root for LTX 2.3 was not found. Expected one of: "
+                        r"FRAMEVISION_LTX23_WANGP_ROOT, C:\WanGP\Wan2GP, or a nearby Wan2GP folder."
+                    )
+                args = [
+                    str(sys.executable),
+                    str(cli),
+                    "generate",
+                    "--wangp-root", str(wangp_root),
+                    "--prompt", str(prompt or ''),
+                    "--negative", str(negative or ''),
+                    "--image", str(image_path),
+                    "--output", str(out_path),
+                    "--fps", str(int(fps)),
+                    "--frames", str(int(frames)),
+                    "--steps", str(int(steps)),
+                    "--resolution", str(resolution or "1280x720"),
+                    "--flow-shift", str(float(flow_shift)),
+                    "--sliding-window-size", str(int(sliding_window_size)),
+                    "--sliding-window-overlap", str(int(sliding_window_overlap)),
+                    "--guidance-phases", str(int(guidance_phases)),
+                    "--denoising-strength", str(float(denoising_strength)),
+                    "--lora-multiplier", str(float(lora_multiplier)),
+                ]
+                if seed is not None:
+                    args += ["--seed", str(int(seed))]
+                if str(image_end_path or '').strip():
+                    args += ["--image-end", str(image_end_path).strip()]
+                if str(bridge.get("wgp_py") or '').strip() and os.path.isfile(str(bridge.get("wgp_py") or '')):
+                    args += ["--wgp-py", str(bridge.get("wgp_py") or '')]
+                _bridge_lora_file = str(bridge.get("lora_file") or '').strip()
+                _bridge_lora_json = str(bridge.get("lora_json") or '').strip()
+                if bool(use_transition_lora):
+                    if _bridge_lora_file:
+                        args += ["--lora-file", _bridge_lora_file]
+                    if _bridge_lora_json:
+                        args += ["--lora-json", _bridge_lora_json]
+                try:
+                    Path(out_path).parent.mkdir(parents=True, exist_ok=True)
+                except Exception:
+                    pass
+                proc = None
+                stop_after_current = False
+                if log_path:
+                    Path(log_path).parent.mkdir(parents=True, exist_ok=True)
+                    with open(log_path, "a", encoding="utf-8", errors="ignore") as lf:
+                        lf.write("[planner] ltx23 cmd:\n")
+                        lf.write(" ".join([str(x) for x in args]) + "\n\n")
+                        lf.flush()
+                        proc = subprocess.Popen(
+                            args,
+                            cwd=str(_root()),
+                            stdout=subprocess.PIPE,
+                            stderr=subprocess.STDOUT,
+                            bufsize=1,
+                            universal_newlines=True,
+                            encoding="utf-8",
+                            errors="replace",
+                        )
+                        assert proc.stdout is not None
+                        for line in proc.stdout:
+                            if self._stop_requested:
+                                if not stop_after_current:
+                                    stop_after_current = True
+                                    try:
+                                        self.signals.log.emit("[ltx23] Cancel requested — letting current clip finish, then stopping workflow.")
+                                    except Exception:
+                                        pass
+                                self._stop_requested = False
+                            try:
+                                lf.write(line)
+                                lf.flush()
+                            except Exception:
+                                pass
+                        rc = int(proc.wait())
+                        if rc != 0:
+                            raise subprocess.CalledProcessError(rc, args)
+                else:
+                    proc = subprocess.Popen(
+                        args,
+                        cwd=str(_root()),
+                        stdout=subprocess.PIPE,
+                        stderr=subprocess.STDOUT,
+                        bufsize=1,
+                        universal_newlines=True,
+                        encoding="utf-8",
+                        errors="replace",
+                    )
+                    assert proc.stdout is not None
+                    for line in proc.stdout:
+                        if self._stop_requested:
+                            if not stop_after_current:
+                                stop_after_current = True
+                                try:
+                                    self.signals.log.emit("[ltx23] Cancel requested — letting current clip finish, then stopping workflow.")
+                                except Exception:
+                                    pass
+                            self._stop_requested = False
+                        try:
+                            self.signals.log.emit((line or '').rstrip("\n"))
+                        except Exception:
+                            pass
+                    rc = int(proc.wait())
+                    if rc != 0:
+                        raise subprocess.CalledProcessError(rc, args)
+                if stop_after_current:
+                    self._stop_requested = True
+
+            def step_video_clips_ltx23() -> None:
+                shots = _load_shots_list(shots_path)
+                if not shots:
+                    raise RuntimeError("shots.json is empty; cannot generate video clips")
+                _vram_release("before ltx23")
+
+                id_to_img: Dict[str, str] = {}
+                try:
+                    imgs = manifest.get("paths", {}).get("images")
+                    if isinstance(imgs, list):
+                        for it in imgs:
+                            if isinstance(it, dict) and it.get("id") and it.get("file"):
+                                id_to_img[str(it["id"])] = str(it["file"])
+                except Exception:
+                    pass
+
+                shot_map = manifest.get("shots") if isinstance(manifest.get("shots"), dict) else {}
+                try:
+                    image_records = list((manifest.get("paths") or {}).get("images") or [])
+                except Exception:
+                    image_records = []
+                use_last_frame_chain = _planner_last_frame_chain_enabled(getattr(self.job, "encoding", {}))
+                chain_frames_dir = os.path.join(self.out_dir, "chain_frames")
+                os.makedirs(chain_frames_dir, exist_ok=True)
+                prof = _resolve_generation_profile(
+                    self.job.encoding.get("video_model") or "",
+                    self.job.encoding.get("gen_quality_preset") or '',
+                    self.job.encoding.get("planner_upscale"),
+                )
+                aspect_mode = str((self.job.encoding or {}).get("aspect_mode") or "landscape")
+                resolution = _profile_resolution_for_aspect(prof, aspect_mode)
+                fps = int(prof.get("fps") or 24)
+                steps = int(prof.get("steps") or 8)
+                fallback_frames = max(12, int(prof.get("video_length") or prof.get("max_frames") or 121))
+                flow_shift = float(prof.get("flow_shift") or 5.0)
+                sliding_window_size = int(prof.get("sliding_window_size") or 481)
+                sliding_window_overlap = int(prof.get("sliding_window_overlap") or 17)
+                guidance_phases = int(prof.get("guidance_phases") or 1)
+                denoising_strength = float(prof.get("denoising_strength") or 1.0)
+                _enc_use_transition_lora = (self.job.encoding or {}).get("use_transition_lora", None)
+                try:
+                    _ui_lora_widget = getattr(self, "chk_use_transition_lora", None)
+                    _ui_use_transition_lora = bool(_ui_lora_widget.isChecked()) if _ui_lora_widget is not None else None
+                except Exception:
+                    _ui_use_transition_lora = None
+                if _enc_use_transition_lora is not None:
+                    use_transition_lora = bool(_enc_use_transition_lora)
+                elif _ui_use_transition_lora is not None:
+                    use_transition_lora = bool(_ui_use_transition_lora)
+                else:
+                    use_transition_lora = True
+
+                _ltx_use_end_images = bool(_planner_use_end_images_enabled(getattr(self.job, "encoding", {})))
+                end_image_map = _planner_prepare_end_image_assignments(
+                    shots=shots,
+                    manifest=manifest,
+                    manifest_path=manifest_path,
+                    out_dir=self.out_dir,
+                    attachments=(self.job.attachments or {}),
+                    enabled=_ltx_use_end_images,
+                )
+
+                shots_blob = json.dumps(shots, sort_keys=True)
+                imgs_fp = _sha1_text(json.dumps(sorted(list(id_to_img.items())), sort_keys=True))
+                end_imgs_fp = _sha1_text(json.dumps(sorted([(k, _file_fingerprint(v)) for k, v in (end_image_map or {}).items()]), sort_keys=True))
+                clip_fingerprint = _sha1_text(json.dumps({
+                    "shots": shots_blob,
+                    "images_fp": imgs_fp,
+                    "profile": prof,
+                    "resolution": resolution,
+                    "i2v_prompts_json": _sha1_file(i2v_prompts_json) if os.path.exists(i2v_prompts_json) else "",
+                    "use_last_frame_chain": bool(use_last_frame_chain),
+                    "use_end_images": bool(_ltx_use_end_images),
+                    "end_imgs_fp": end_imgs_fp,
+                }, sort_keys=True))
+
+                prior = _safe_read_json(clips_manifest_path) if os.path.exists(clips_manifest_path) else {}
+                if isinstance(prior, dict) and prior.get("fingerprint") == clip_fingerprint:
+                    ok = True
+                    lst = prior.get("clips") if isinstance(prior.get("clips"), list) else []
+                    for it in lst:
+                        if not isinstance(it, dict):
+                            ok = False
+                            break
+                        p = it.get("file")
+                        if not p or not os.path.isfile(str(p)):
+                            ok = False
+                            break
+                    if ok and lst:
+                        manifest.setdefault("paths", {})["clips_dir"] = clips_dir
+                        manifest["paths"]["clips"] = lst
+                        manifest.setdefault("settings", {})["video_engine"] = "ltx23"
+                        manifest["settings"]["video_model"] = "ltx23"
+                        manifest["settings"]["video_profile"] = prof
+                        manifest["settings"]["use_transition_lora"] = bool(use_transition_lora)
+                        _safe_write_json(manifest_path, manifest)
+                        return
+
+                existing_intents: Dict[str, str] = {}
+                try:
+                    for _it in (prior.get("clips") if isinstance(prior, dict) and isinstance(prior.get("clips"), list) else []):
+                        if isinstance(_it, dict) and _it.get("id") and _it.get("intent_fp"):
+                            existing_intents[str(_it.get("id") or '').strip()] = str(_it.get("intent_fp") or '').strip()
+                except Exception:
+                    pass
+
+                clips_out: List[Dict[str, Any]] = []
+                for i, sh in enumerate(shots, start=1):
+                    if self._stop_requested:
+                        raise RuntimeError("Cancelled by user.")
+                    if not isinstance(sh, dict):
+                        continue
+                    sid = str(sh.get("id") or '').strip()
+                    if not sid:
+                        continue
+                    img_path = ""
+                    if use_last_frame_chain and i > 1:
+                        _forced_chain_img = _planner_force_chain_image_for_shot(
+                            shots=shots,
+                            shot_index=i,
+                            images_dir=images_dir,
+                            shot_map=shot_map,
+                            image_records=image_records,
+                            manifest=manifest,
+                            manifest_path=manifest_path,
+                            id_to_img=id_to_img,
+                            log_emit=self.signals.log.emit,
+                            chain_frames_dir=chain_frames_dir,
+                        )
+                        if not _forced_chain_img or not os.path.isfile(_forced_chain_img):
+                            raise RuntimeError(f"[CHAIN] {sid}: failed to build dedicated chain start image from the previous clip.")
+                        img_path = _forced_chain_img
+                        self.signals.log.emit(f"[CHAIN] {sid}: using dedicated chain start image {img_path}")
+                    try:
+                        rec = shot_map.get(sid) if isinstance(shot_map, dict) else {}
+                        if isinstance(rec, dict) and rec.get("file"):
+                            img_path = str(rec.get("file"))
+                    except Exception:
+                        img_path = img_path or ""
+                    if not img_path:
+                        cand = os.path.join(images_dir, f"{sid}.png")
+                        if os.path.exists(cand):
+                            img_path = cand
+                    if not img_path or not os.path.exists(img_path):
+                        raise RuntimeError(f"[ltx23] Missing start image for shot {sid}: {img_path}")
+                    if use_last_frame_chain and i > 1 and _planner_chain_image_still_placeholder(
+                        sid=sid,
+                        img_path=img_path,
+                        shot_map=shot_map,
+                        image_records=image_records,
+                    ):
+                        raise RuntimeError(f"[CHAIN] {sid}: start image is still the waiting placeholder instead of the previous clip last frame: {img_path}")
+                    rec = shot_map.get(sid) if isinstance(shot_map, dict) else {}
+                    if not isinstance(rec, dict):
+                        rec = {}
+                    end_image_path = str(rec.get("end_image_file") or end_image_map.get(sid) or "").strip()
+                    if end_image_path and (not os.path.isfile(end_image_path)):
+                        end_image_path = ""
+                    prompt = str(rec.get("i2v_prompt") or '').strip()
+                    negative = str(rec.get("i2v_negative") or '').strip()
+
+                    # Duration → frames (same idea as the other video engines).
+                    try:
+                        dsec = float(sh.get("duration_sec") or 0.0)
+                    except Exception:
+                        dsec = 0.0
+                    if dsec <= 0.0:
+                        try:
+                            dsec = _stable_uniform(
+                                f"{self.job.job_id}:{sid}:dur",
+                                float(prof.get("min_sec") or 3.5),
+                                float(prof.get("max_sec") or 10.0),
+                            )
+                        except Exception:
+                            dsec = float(prof.get("min_sec") or 3.5)
+                    dsec = max(0.1, float(dsec))
+                    frames = max(12, min(int(prof.get("max_frames") or fallback_frames or 240), int(round(dsec * fps))))
+
+                    seed_txt = str(sh.get("seed") or sid)
+                    seed = _seed_to_int(seed_txt)
+                    out_file = os.path.join(clips_dir, f"{sid}.mp4")
+                    log_file = os.path.join(clips_dir, f"{sid}.ltx23.log.txt")
+                    intent_fp = _sha1_text(json.dumps({
+                        "sid": sid,
+                        "img_fp": _file_fingerprint(img_path),
+                        "prompt": prompt,
+                        "negative": negative,
+                        "fps": fps,
+                        "frames": frames,
+                        "duration_sec": round(float(dsec), 2),
+                        "steps": steps,
+                        "seed": seed,
+                        "resolution": resolution,
+                        "flow_shift": flow_shift,
+                        "end_image_fp": _file_fingerprint(end_image_path) if end_image_path else "",
+                        "sliding_window_size": sliding_window_size,
+                        "sliding_window_overlap": sliding_window_overlap,
+                        "guidance_phases": guidance_phases,
+                        "denoising_strength": denoising_strength,
+                    }, sort_keys=True))
+                    if os.path.isfile(out_file) and os.path.getsize(out_file) > 1024:
+                        prev = existing_intents.get(sid) or str(rec.get("clip_intent_fp") or '')
+                        if prev and prev == intent_fp:
+                            self.signals.log.emit(f"[ltx23] {sid}: reusing existing clip (intent match)")
+                            clips_out.append({
+                                "id": sid,
+                                "file": out_file,
+                                "frames": int(frames),
+                                "fps": int(fps),
+                                "steps": int(steps),
+                                "seed": seed,
+                                "resolution": str(resolution),
+                                "model_key": "ltx23",
+                                "video_model": "ltx23",
+                                "use_transition_lora": bool(use_transition_lora),
+                                "end_image_file": end_image_path,
+                                "intent_fp": intent_fp,
+                            })
+                            try:
+                                if out_file and os.path.isfile(out_file):
+                                    self.signals.asset_created.emit(out_file)
+                            except Exception:
+                                pass
+                            if use_last_frame_chain and i < len(shots):
+                                try:
+                                    _next_sid = str((shots[i] or {}).get("id") or f"S{i+1:02d}").strip()
+                                except Exception:
+                                    _next_sid = f"S{i+1:02d}"
+                                if _next_sid:
+                                    _derived = _planner_overwrite_next_image_from_clip(
+                                        current_sid=sid,
+                                        next_sid=_next_sid,
+                                        clip_path=out_file,
+                                        images_dir=images_dir,
+                                        shot_map=shot_map,
+                                        image_records=image_records,
+                                        manifest=manifest,
+                                        manifest_path=manifest_path,
+                                        id_to_img=id_to_img,
+                                        log_emit=self.signals.log.emit,
+                                        target_path=_planner_chain_frame_path(self.out_dir, _next_sid),
+                                        mirror_to_images_dir=True,
+                                    )
+                                    if not _derived:
+                                        raise RuntimeError(f"Could not extract last frame from {sid} to seed {_next_sid}.")
+                            continue
+                    self.signals.stage.emit(f"Clips (LTX 2.3) — {sid} ({i}/{len(shots)})")
+                    self.signals.log.emit(f"[ltx23] {sid}: {frames} frames @ {fps} fps (~{round(float(dsec), 2)}s), res={resolution}, steps={steps}")
+                    self.signals.log.emit(f"[ltx23] {sid}: transition lora -> {'on' if use_transition_lora else 'off'}")
+                    try:
+                        _bridge_now = _ltx23_bridge_config()
+                        _lf = str(_bridge_now.get("lora_file") or '').strip()
+                        _lj = str(_bridge_now.get("lora_json") or '').strip()
+                        self.signals.log.emit(f"[ltx23] {sid}: transition lora source -> ui={_ui_use_transition_lora!r}, job={_enc_use_transition_lora!r}")
+                        self.signals.log.emit(f"[ltx23] {sid}: transition lora paths -> file={_lf or '<empty>'} (exists={os.path.isfile(_lf)}), json={_lj or '<empty>'} (exists={os.path.isfile(_lj)})")
+                    except Exception:
+                        pass
+                    self.signals.log.emit(f"[ltx23] {sid}: start image -> {img_path}")
+                    if end_image_path:
+                        self.signals.log.emit(f"[ltx23] {sid}: end image -> {end_image_path}")
+                    self.signals.progress.emit(min(99, 72 + int((i - 1) * (25 / max(1, len(shots))))))
+                    try:
+                        with open(log_file, "w", encoding="utf-8", errors="ignore") as lf:
+                            lf.write(f"[planner] {sid}\n")
+                            lf.write(f"[planner] out: {out_file}\n")
+                            lf.write(f"[planner] img: {img_path}\n")
+                            lf.write(f"[planner] frames: {frames} fps: {fps} steps: {steps} seed: {seed}\n")
+                            lf.write(f"[planner] resolution: {resolution}\n\n")
+                            lf.flush()
+                            _run_ltx23_clip(
+                                prompt=prompt,
+                                negative=negative,
+                                image_path=img_path,
+                                out_path=out_file,
+                                fps=fps,
+                                frames=frames,
+                                steps=steps,
+                                seed=seed,
+                                resolution=resolution,
+                                flow_shift=flow_shift,
+                                sliding_window_size=sliding_window_size,
+                                sliding_window_overlap=sliding_window_overlap,
+                                guidance_phases=guidance_phases,
+                                denoising_strength=denoising_strength,
+                                use_transition_lora=use_transition_lora,
+                                image_end_path=end_image_path,
+                                log_path=log_file,
+                            )
+                    except subprocess.CalledProcessError as e:
+                        raise RuntimeError(f"LTX 2.3 failed for {sid}. See log: {log_file}\n{e}") from e
+                    if not os.path.isfile(out_file) or os.path.getsize(out_file) < 1024:
+                        raise RuntimeError(f"LTX 2.3 clip output missing/too small for {sid}: {out_file}")
+                    clips_out.append({
+                        "id": sid,
+                        "file": out_file,
+                        "frames": int(frames),
+                        "fps": int(fps),
+                        "duration_sec": round(float(dsec), 2),
+                        "steps": int(steps),
+                        "seed": seed,
+                        "resolution": str(resolution),
+                        "model_key": "ltx23",
+                        "video_model": "ltx23",
+                        "use_transition_lora": bool(use_transition_lora),
+                        "intent_fp": intent_fp,
+                    })
+                    try:
+                        rec2 = shot_map.get(sid) if isinstance(shot_map, dict) else {}
+                        if not isinstance(rec2, dict):
+                            rec2 = {}
+                        rec2["clip_file"] = out_file
+                        rec2["model_key"] = "ltx23"
+                        rec2["video_model"] = "ltx23"
+                        rec2["use_transition_lora"] = bool(use_transition_lora)
+                        rec2["clip_intent_fp"] = intent_fp
+                        rec2["clip_duration_sec"] = round(float(dsec), 2)
+                        rec2["ts_clip_done"] = time.time()
+                        shot_map[sid] = rec2
+                    except Exception:
+                        pass
+                    manifest.setdefault("paths", {})["clips_dir"] = clips_dir
+                    manifest["paths"]["clips"] = clips_out
+                    manifest.setdefault("settings", {})["video_engine"] = "ltx23"
+                    manifest["settings"]["video_model"] = "ltx23"
+                    manifest["settings"]["video_profile"] = prof
+                    _safe_write_json(manifest_path, manifest)
+                    try:
+                        if out_file and os.path.isfile(out_file):
+                            self.signals.asset_created.emit(out_file)
+                    except Exception:
+                        pass
+                    if use_last_frame_chain and i < len(shots):
+                        try:
+                            _next_sid = str((shots[i] or {}).get("id") or f"S{i+1:02d}").strip()
+                        except Exception:
+                            _next_sid = f"S{i+1:02d}"
+                        if _next_sid:
+                            _derived = _planner_overwrite_next_image_from_clip(
+                                current_sid=sid,
+                                next_sid=_next_sid,
+                                clip_path=out_file,
+                                images_dir=images_dir,
+                                shot_map=shot_map,
+                                image_records=image_records,
+                                manifest=manifest,
+                                manifest_path=manifest_path,
+                                id_to_img=id_to_img,
+                                log_emit=self.signals.log.emit,
+                                target_path=_planner_chain_frame_path(self.out_dir, _next_sid),
+                                mirror_to_images_dir=True,
+                            )
+                            if not _derived:
+                                raise RuntimeError(f"Could not extract last frame from {sid} to seed {_next_sid}.")
+                _safe_write_json(clips_manifest_path, {"fingerprint": clip_fingerprint, "clips": clips_out, "profile": prof})
+                manifest.setdefault("paths", {})["clips_dir"] = clips_dir
+                manifest["paths"]["clips"] = clips_out
                 _safe_write_json(manifest_path, manifest)
 
 
@@ -12977,6 +14518,7 @@ class PipelineWorker(QThread):
                             rec2 = {}
                         rec2["clip_file"] = out_file
                         rec2["clip_intent_fp"] = intent_fp
+                        rec2["clip_duration_sec"] = round(float(dsec), 2)
                         rec2["ts_clip_done"] = time.time()
                         shot_map[sid] = rec2
                     except Exception:
@@ -13057,6 +14599,8 @@ class PipelineWorker(QThread):
                 _run("Video clips (WAN 2.2)", step_video_clips_wan22, 95)
             elif mk == "hunyuan":
                 _run("Video clips (HunyuanVideo 1.5)", step_video_clips_hunyuan15, 95)
+            elif mk == "ltx23":
+                _run("Video clips (LTX 2.3 22B Distilled)", step_video_clips_ltx23, 95)
             else:
                 _skip("Video clips", "Video model not wired yet")
 
@@ -13096,6 +14640,8 @@ class PipelineWorker(QThread):
                             _run("Video clips (WAN 2.2 resume)", step_video_clips_wan22, 95)
                         elif mk == "hunyuan":
                             _run("Video clips (HunyuanVideo 1.5 resume)", step_video_clips_hunyuan15, 95)
+                        elif mk == "ltx23":
+                            _run("Video clips (LTX 2.3 22B Distilled resume)", step_video_clips_ltx23, 95)
             except Exception as _chain_resume_err:
                 try:
                     self.signals.log.emit(f"[CHAIN] Resume-after-review check failed: {_chain_resume_err}")
@@ -14715,7 +16261,7 @@ class PipelineWorker(QThread):
                         "Return ONLY the lyrics text."
                     )
 
-                    raw1 = _qwen_text_call(_heartmula_step_name, used_sys, used_usr, qwen_log_1, temperature=0.4, max_new_tokens=900)
+                    raw1 = _qwen_text_call(_heartmula_step_name, used_sys, used_usr, qwen_log_1, temperature=0.4, max_new_tokens=900, planner_llama_settings=self.job.encoding)
                     used_raw = raw1
                     lyrics_txt, line_count = _finalize_lyrics_for_heartmula(raw1, float(dur_gen))
 
@@ -14725,7 +16271,7 @@ class PipelineWorker(QThread):
                             used_usr
                             + "\n\nIMPORTANT: Output at least 5 lyric lines. No labels, no brackets, no parentheses."
                         )
-                        raw2 = _qwen_text_call(_heartmula_step_name, used_sys, used_usr2, qwen_log_2, temperature=0.4, max_new_tokens=900)
+                        raw2 = _qwen_text_call(_heartmula_step_name, used_sys, used_usr2, qwen_log_2, temperature=0.4, max_new_tokens=900, planner_llama_settings=self.job.encoding)
                         used_raw = raw2
                         lyrics_txt, line_count = _finalize_lyrics_for_heartmula(raw2, float(dur_gen))
 
@@ -18075,6 +19621,11 @@ class PlannerPane(QWidget):
         self._img_model_lock_active: bool = False
         self._img_model_prev_index: int = -1
 
+        # Private easter egg: hidden external LTX entry.
+        self._ltx23_unlocked: bool = False
+        self._ltx23_password: str = "framevision01"
+        self._video_model_prev_index: int = 0
+
         root = QVBoxLayout(self)
         root.setContentsMargins(12, 12, 12, 12)
         root.setSpacing(10)
@@ -18967,6 +20518,105 @@ class PlannerPane(QWidget):
         self.chk_alternative_storymode.toggled.connect(self._on_toggle_alternative_storymode)
         lay.addWidget(self.chk_alternative_storymode)
 
+        self.chk_own_llama = QCheckBox("Load own llama")
+        self.chk_own_llama.setToolTip(
+            "When enabled, Planner text-writing steps use your own GGUF through llama-server instead of Qwen3-VL.\n"
+            "When disabled, Planner keeps using the default Qwen path exactly like before."
+        )
+        self.chk_own_llama.setChecked(False)
+        try:
+            s = _load_planner_settings()
+            self.chk_own_llama.setChecked(bool(s.get("own_llama_enabled", False)))
+        except Exception:
+            pass
+        try:
+            f = self.chk_own_llama.font()
+            f.setBold(True)
+            self.chk_own_llama.setFont(f)
+        except Exception:
+            pass
+        self.chk_own_llama.toggled.connect(self._on_toggle_own_llama)
+        lay.addWidget(self.chk_own_llama)
+
+        self.own_llama_block = QGroupBox("")
+        own_llama_lay = QGridLayout(self.own_llama_block)
+        own_llama_lay.setHorizontalSpacing(8)
+        own_llama_lay.setVerticalSpacing(6)
+
+        own_llama_lay.addWidget(QLabel("llama-server runner"), 0, 0)
+        self.edit_own_llama_runner = QLineEdit()
+        try:
+            s = _load_planner_settings()
+            self.edit_own_llama_runner.setText(str(s.get("own_llama_runner_path", "") or _planner_default_llama_runner()))
+        except Exception:
+            self.edit_own_llama_runner.setText(_planner_default_llama_runner())
+        self.btn_own_llama_runner = QPushButton("Browse")
+        own_llama_lay.addWidget(self.edit_own_llama_runner, 0, 1)
+        own_llama_lay.addWidget(self.btn_own_llama_runner, 0, 2)
+
+        own_llama_lay.addWidget(QLabel("GGUF model"), 1, 0)
+        self.edit_own_llama_model = QLineEdit()
+        try:
+            s = _load_planner_settings()
+            self.edit_own_llama_model.setText(str(s.get("own_llama_model_path", "") or ""))
+        except Exception:
+            pass
+        self.btn_own_llama_model = QPushButton("Browse")
+        own_llama_lay.addWidget(self.edit_own_llama_model, 1, 1)
+        own_llama_lay.addWidget(self.btn_own_llama_model, 1, 2)
+
+        own_llama_lay.addWidget(QLabel("Template"), 2, 0)
+        self.cmb_own_llama_template = QComboBox()
+        self.cmb_own_llama_template.addItem("Smart guess from model", ("smart", ""))
+        self.cmb_own_llama_template.addItem("Auto", ("auto", ""))
+        self.cmb_own_llama_template.addItem("ChatML", ("builtin", "chatml"))
+        self.cmb_own_llama_template.addItem("Llama 3", ("builtin", "llama3"))
+        self.cmb_own_llama_template.addItem("Llama 4", ("builtin", "llama4"))
+        self.cmb_own_llama_template.addItem("Gemma", ("builtin", "gemma"))
+        self.cmb_own_llama_template.addItem("Mistral v7", ("builtin", "mistral-v7"))
+        self.cmb_own_llama_template.addItem("DeepSeek 3", ("builtin", "deepseek3"))
+        self.cmb_own_llama_template.addItem("ChatGLM 4", ("builtin", "chatglm4"))
+        self.cmb_own_llama_template.addItem("GPT-OSS", ("builtin", "gpt-oss"))
+        own_llama_lay.addWidget(self.cmb_own_llama_template, 2, 1, 1, 2)
+        try:
+            s = _load_planner_settings()
+            tk = str(s.get("own_llama_template_kind", "smart") or "smart")
+            tv = str(s.get("own_llama_template_value", "") or "")
+            for i in range(self.cmb_own_llama_template.count()):
+                item = self.cmb_own_llama_template.itemData(i)
+                if isinstance(item, tuple) and len(item) == 2 and str(item[0]) == tk and str(item[1]) == tv:
+                    self.cmb_own_llama_template.setCurrentIndex(i)
+                    break
+        except Exception:
+            pass
+
+        own_llama_lay.addWidget(QLabel("Context size"), 3, 0)
+        self.spin_own_llama_ctx = QSpinBox()
+        self.spin_own_llama_ctx.setRange(1024, 131072)
+        self.spin_own_llama_ctx.setSingleStep(1024)
+        try:
+            s = _load_planner_settings()
+            self.spin_own_llama_ctx.setValue(int(s.get("own_llama_ctx_size", 8192) or 8192))
+        except Exception:
+            self.spin_own_llama_ctx.setValue(8192)
+        own_llama_lay.addWidget(self.spin_own_llama_ctx, 3, 1)
+        self.lbl_own_llama_note = QLabel("Used for Plan, Shots, Alternative storymode, Auto Character Bible and AI lyrics. When disabled, Planner keeps using Qwen3-VL.")
+        self.lbl_own_llama_note.setWordWrap(True)
+        own_llama_lay.addWidget(self.lbl_own_llama_note, 4, 0, 1, 3)
+
+        try:
+            self.edit_own_llama_runner.textChanged.connect(self._on_own_llama_settings_changed)
+            self.edit_own_llama_model.textChanged.connect(self._on_own_llama_settings_changed)
+            self.cmb_own_llama_template.currentIndexChanged.connect(self._on_own_llama_settings_changed)
+            self.spin_own_llama_ctx.valueChanged.connect(self._on_own_llama_settings_changed)
+            self.btn_own_llama_runner.clicked.connect(self._browse_own_llama_runner)
+            self.btn_own_llama_model.clicked.connect(self._browse_own_llama_model)
+        except Exception:
+            pass
+
+        self.own_llama_block.setVisible(bool(self.chk_own_llama.isChecked()))
+        lay.addWidget(self.own_llama_block)
+
         # info: Chunk 10 side quest — Own storyline toggle + textbox (Step 1: UI only)
         self.chk_own_storyline = QCheckBox("Own storymode (paste your own prompts)")
         self.chk_own_storyline.setToolTip(
@@ -19162,6 +20812,7 @@ If the planner sees a marker like [02] or (02), it becomes the next image prompt
             "Auto (Hunyuan) ",
             "WAN 2.2 (slow, 720p)",
             "HunyuanVideo 1.5",
+            "More later",
         ])
         self.cmb_video_model.setCurrentIndex(0)
         grid.addWidget(self.cmb_video_model, 1, 1)
@@ -19171,12 +20822,29 @@ If the planner sees a marker like [02] or (02), it becomes the next image prompt
         # populated dynamically based on video model selection
         grid.addWidget(self.cmb_gen_quality, 2, 1)
 
+        def _prompt_unlock_ltx23() -> bool:
+            try:
+                entered, ok = QInputDialog.getText(self, "experimental", "experimental")
+            except Exception:
+                return False
+            if not ok:
+                return False
+            return str(entered or '').strip() == str(self._ltx23_password)
+
         def _refresh_gen_quality() -> None:
             vm = (self.cmb_video_model.currentText() or '').lower()
             cur = (self.cmb_gen_quality.currentText() or '').strip()
             self.cmb_gen_quality.blockSignals(True)
             self.cmb_gen_quality.clear()
-            if "wan" in vm and "2.2" in vm:
+            if "ltx" in vm and "2.3" in vm:
+                self.cmb_gen_quality.addItems(["Low (480p)", "Medium (720p)", "High (1080p)"])
+                if cur.lower().startswith("high"):
+                    self.cmb_gen_quality.setCurrentIndex(2)
+                elif cur.lower().startswith("medium"):
+                    self.cmb_gen_quality.setCurrentIndex(1)
+                else:
+                    self.cmb_gen_quality.setCurrentIndex(0)
+            elif "wan" in vm and "2.2" in vm:
                 self.cmb_gen_quality.addItems(["Low (default)", "Medium", "High"])
                 if cur.lower().startswith("high"):
                     self.cmb_gen_quality.setCurrentIndex(2)
@@ -19196,7 +20864,47 @@ If the planner sees a marker like [02] or (02), it becomes the next image prompt
                     self.cmb_gen_quality.setCurrentIndex(0)
             self.cmb_gen_quality.blockSignals(False)
 
-        self.cmb_video_model.currentIndexChanged.connect(lambda _=None: _refresh_gen_quality())
+        def _on_video_model_changed(_idx: int) -> None:
+            try:
+                txt = str(self.cmb_video_model.currentText() or '').strip().lower()
+                if txt == "more later":
+                    if _prompt_unlock_ltx23():
+                        self._ltx23_unlocked = True
+                        cur_idx = int(self.cmb_video_model.currentIndex())
+                        self.cmb_video_model.blockSignals(True)
+                        self.cmb_video_model.setItemText(cur_idx, "LTX 2.3 22B Distilled")
+                        self.cmb_video_model.setCurrentIndex(cur_idx)
+                        self.cmb_video_model.blockSignals(False)
+                        try:
+                            self.cmb_video_model.update()
+                            self.cmb_video_model.repaint()
+                        except Exception:
+                            pass
+                        self._video_model_prev_index = cur_idx
+                    else:
+                        self.cmb_video_model.blockSignals(True)
+                        self.cmb_video_model.setCurrentIndex(int(self._video_model_prev_index or 0))
+                        self.cmb_video_model.blockSignals(False)
+                    _refresh_gen_quality()
+                    try:
+                        self._refresh_video_model_dependent_ui()
+                    except Exception:
+                        pass
+                    return
+                self._video_model_prev_index = int(self.cmb_video_model.currentIndex())
+            except Exception:
+                pass
+            _refresh_gen_quality()
+            try:
+                self._refresh_video_model_dependent_ui()
+            except Exception:
+                pass
+
+        self.cmb_video_model.currentIndexChanged.connect(_on_video_model_changed)
+        try:
+            self.cmb_gen_quality.currentIndexChanged.connect(lambda _=None: self._refresh_video_model_dependent_ui())
+        except Exception:
+            pass
         _refresh_gen_quality()
 
         lbl_camera_fx = QLabel("Use (+20 random) camera effects")
@@ -19220,7 +20928,28 @@ If the planner sees a marker like [02] or (02), it becomes the next image prompt
         grid.addWidget(lbl_camera_fx, 3, 0)
         grid.addWidget(self.chk_use_20_camera_effects, 3, 1)
 
-        grid.addWidget(QLabel("Videoclip Creator preset"), 4, 0)
+        lbl_transition_lora = QLabel("Use transition LoRA")
+        self.chk_use_transition_lora = QCheckBox("Enabled")
+        try:
+            _transition_tip = "For hidden LTX 2.3 mode only. When enabled, Planner adds the transition LoRA and companion JSON to the WanGP bridge command. Turn this off to test plain LTX without the transition setup."
+            lbl_transition_lora.setToolTip(_transition_tip)
+            self.chk_use_transition_lora.setToolTip(_transition_tip)
+        except Exception:
+            pass
+        self.chk_use_transition_lora.setChecked(True)
+        try:
+            s = _load_planner_settings()
+            self.chk_use_transition_lora.setChecked(bool(s.get("use_transition_lora", True)))
+        except Exception:
+            pass
+        try:
+            self.chk_use_transition_lora.toggled.connect(self._on_toggle_use_transition_lora)
+        except Exception:
+            pass
+        grid.addWidget(lbl_transition_lora, 4, 0)
+        grid.addWidget(self.chk_use_transition_lora, 4, 1)
+
+        grid.addWidget(QLabel("Videoclip Creator preset"), 5, 0)
         self.cmb_videoclip_preset = QComboBox()
         try:
             self.cmb_videoclip_preset.currentIndexChanged.connect(self._on_videoclip_creator_preset_changed)
@@ -19238,7 +20967,7 @@ If the planner sees a marker like [02] or (02), it becomes the next image prompt
             except Exception:
                 pass
 
-        grid.addWidget(self.cmb_videoclip_preset, 4, 1)
+        grid.addWidget(self.cmb_videoclip_preset, 5, 1)
 
         # External Videoclip Creator: clip order (only visible for JSON presets)
         self.lbl_videoclip_clip_order = QLabel("Clip order")
@@ -19253,7 +20982,7 @@ If the planner sees a marker like [02] or (02), it becomes the next image prompt
         except Exception:
             pass
         grid.addWidget(self.lbl_videoclip_clip_order, 5, 0)
-        grid.addWidget(self.cmb_videoclip_clip_order, 5, 1)
+        grid.addWidget(self.cmb_videoclip_clip_order, 6, 1)
 
         # Safeguard: Videoclip Creator presets are not compatible with Narration.
         self.lbl_videoclip_preset_hint = QLabel("Disable narration to have more presets")
@@ -19337,8 +21066,75 @@ If the planner sees a marker like [02] or (02), it becomes the next image prompt
         _chain_start_row.addWidget(self.btn_chain_start_image_browse)
         _chain_start_row.addWidget(self.btn_chain_start_image_clear)
 
+        self.end_image_targets_group = QWidget()
+        _end_targets_lay = QVBoxLayout(self.end_image_targets_group)
+        _end_targets_lay.setContentsMargins(0, 0, 0, 0)
+        _end_targets_lay.setSpacing(6)
+
+        _end_toggle_row = QHBoxLayout()
+        _end_toggle_row.setSpacing(8)
+        self.lbl_use_end_images_as_last_frames = QLabel("Use image(s) as last frame(s)")
+        self.chk_use_end_images_as_last_frames = QCheckBox("Enabled")
+        try:
+            _end_tip = "LTX 2.3 / WanGP only. Load a numbered list of end images. 01 becomes the target end frame for the first clip, 02 for the second clip, and so on. The same assignment is reused during clip recreation and resume."
+            self.lbl_use_end_images_as_last_frames.setToolTip(_end_tip)
+            self.chk_use_end_images_as_last_frames.setToolTip(_end_tip)
+        except Exception:
+            pass
+        self.chk_use_end_images_as_last_frames.setChecked(False)
+        try:
+            self.chk_use_end_images_as_last_frames.toggled.connect(self._on_toggle_use_end_images_as_last_frames)
+        except Exception:
+            pass
+        _end_toggle_row.addWidget(self.lbl_use_end_images_as_last_frames)
+        _end_toggle_row.addWidget(self.chk_use_end_images_as_last_frames)
+        _end_toggle_row.addStretch(1)
+        _end_targets_lay.addLayout(_end_toggle_row)
+
+        _end_btn_row = QHBoxLayout()
+        _end_btn_row.setSpacing(8)
+        self.btn_end_images_add = QPushButton("Add…")
+        self.btn_end_images_remove = QPushButton("Remove selected")
+        self.btn_end_images_clear = QPushButton("Clear")
+        try:
+            self.btn_end_images_add.clicked.connect(self._on_add_end_images_clicked)
+            self.btn_end_images_remove.clicked.connect(self._remove_selected_end_images)
+            self.btn_end_images_clear.clicked.connect(self._clear_end_images)
+        except Exception:
+            pass
+        _end_btn_row.addWidget(self.btn_end_images_add)
+        _end_btn_row.addWidget(self.btn_end_images_remove)
+        _end_btn_row.addWidget(self.btn_end_images_clear)
+        _end_btn_row.addStretch(1)
+        _end_targets_lay.addLayout(_end_btn_row)
+
+        self.end_image_list = QListWidget()
+        self.end_image_list.setMinimumHeight(92)
+        self.end_image_list.setToolTip("Ordered end-frame targets. Drag to reorder. Double-click to preview. 01 = first clip, 02 = second clip, etc.")
+        try:
+            self.end_image_list.setDragDropMode(QAbstractItemView.InternalMove)
+            self.end_image_list.setDefaultDropAction(Qt.MoveAction)
+            self.end_image_list.setSelectionMode(QAbstractItemView.ExtendedSelection)
+            self.end_image_list.itemDoubleClicked.connect(self._preview_end_image_item)
+            self.end_image_list.model().rowsMoved.connect(self._renumber_end_images)
+        except Exception:
+            pass
+        _end_targets_lay.addWidget(self.end_image_list)
+
+        self.lbl_end_images_hint = QLabel("01 becomes the target end frame for clip 1, 02 for clip 2, and so on.")
+        try:
+            self.lbl_end_images_hint.setWordWrap(True)
+        except Exception:
+            pass
+        _end_targets_lay.addWidget(self.lbl_end_images_hint)
+
         lay.addLayout(grid)
         lay.addWidget(self.chain_start_image_row)
+        lay.addWidget(self.end_image_targets_group)
+        try:
+            self._sync_ltx23_end_images_visibility()
+        except Exception:
+            pass
 
         # Output folder
         out_row = QHBoxLayout()
@@ -21922,6 +23718,61 @@ If the planner sees a marker like [02] or (02), it becomes the next image prompt
 
     
 
+    def _browse_own_llama_runner(self) -> None:
+        try:
+            fn, _ = QFileDialog.getOpenFileName(self, "Select llama-server runner", "", "Programs (*.exe);;All files (*.*)")
+        except Exception:
+            fn = ""
+        if fn:
+            try:
+                self.edit_own_llama_runner.setText(fn)
+            except Exception:
+                pass
+
+    def _browse_own_llama_model(self) -> None:
+        try:
+            fn, _ = QFileDialog.getOpenFileName(self, "Select GGUF model", "", "GGUF models (*.gguf);;All files (*.*)")
+        except Exception:
+            fn = ""
+        if fn:
+            try:
+                self.edit_own_llama_model.setText(fn)
+            except Exception:
+                pass
+
+    def _own_llama_ui_payload(self) -> Dict[str, Any]:
+        try:
+            item = self.cmb_own_llama_template.currentData() if hasattr(self, 'cmb_own_llama_template') else ('smart', '')
+            if not (isinstance(item, tuple) and len(item) == 2):
+                item = ('smart', '')
+        except Exception:
+            item = ('smart', '')
+        return {
+            'own_llama_enabled': bool(getattr(self, 'chk_own_llama', None) and self.chk_own_llama.isChecked()),
+            'own_llama_runner_path': str((getattr(self, 'edit_own_llama_runner', None).text() if getattr(self, 'edit_own_llama_runner', None) else '') or '').strip(),
+            'own_llama_model_path': str((getattr(self, 'edit_own_llama_model', None).text() if getattr(self, 'edit_own_llama_model', None) else '') or '').strip(),
+            'own_llama_template_kind': str(item[0] or 'smart'),
+            'own_llama_template_value': str(item[1] or ''),
+            'own_llama_ctx_size': int((getattr(self, 'spin_own_llama_ctx', None).value() if getattr(self, 'spin_own_llama_ctx', None) else 8192) or 8192),
+            'own_llama_top_p': 0.9,
+        }
+
+    def _on_toggle_own_llama(self, on: bool) -> None:
+        try:
+            if hasattr(self, 'own_llama_block'):
+                self.own_llama_block.setVisible(bool(on))
+        except Exception:
+            pass
+        self._on_own_llama_settings_changed()
+
+    def _on_own_llama_settings_changed(self) -> None:
+        try:
+            s = _load_planner_settings()
+            s.update(self._own_llama_ui_payload())
+            _save_planner_settings(s)
+        except Exception:
+            pass
+
     def _on_toggle_alternative_storymode(self, on: bool) -> None:
         """Persist Alternative storymode toggle (direct Qwen prompt list)."""
         try:
@@ -22039,6 +23890,46 @@ If the planner sees a marker like [02] or (02), it becomes the next image prompt
             pass
 
 
+    def _current_video_model_label(self) -> str:
+        """Return the canonical Planner video-model label, including the hidden LTX slot.
+
+        The easter-egg unlock swaps the combo item text in-place. On some UI paths that
+        can leave other preview/build code reading the previous visible backend until the
+        user manually switches away and back. Treat the unlocked hidden slot as canonical
+        LTX even if the combo text has not fully refreshed yet.
+        """
+        try:
+            combo = getattr(self, "cmb_video_model", None)
+            txt = str(combo.currentText() if combo is not None else "")
+        except Exception:
+            txt = ""
+        try:
+            idx = int(getattr(self, "cmb_video_model", None).currentIndex()) if getattr(self, "cmb_video_model", None) is not None else -1
+        except Exception:
+            idx = -1
+        if bool(getattr(self, "_ltx23_unlocked", False)) and idx == 3:
+            return "LTX 2.3 22B Distilled"
+        return str(txt or "")
+
+    def _is_ltx23_video_model_selected(self) -> bool:
+        try:
+            vm = str(self._current_video_model_label() if hasattr(self, "_current_video_model_label") else "")
+        except Exception:
+            vm = ""
+        vm = vm.strip().lower()
+        return ("ltx" in vm) and ("2.3" in vm)
+
+    def _refresh_video_model_dependent_ui(self) -> None:
+        """Refresh previews that depend on the selected video backend/preset."""
+        try:
+            self._sync_ltx23_end_images_visibility()
+        except Exception:
+            pass
+        try:
+            self._update_own_storyline_prompt_preview()
+        except Exception:
+            pass
+
     # info: Chunk 10 side quest — Own storyline preview updater (Step 2: preview only)
     def _update_own_storyline_prompt_preview(self) -> None:
         """Parse the own storyline textbox and update the live prompt counter (preview only)."""
@@ -22080,7 +23971,7 @@ If the planner sees a marker like [02] or (02), it becomes the next image prompt
 
                     min_sec_preview = 2.5
                     try:
-                        vm = str(self.cmb_video_model.currentText() if hasattr(self, "cmb_video_model") else "")
+                        vm = str(self._current_video_model_label() if hasattr(self, "_current_video_model_label") else (self.cmb_video_model.currentText() if hasattr(self, "cmb_video_model") else ""))
                         gq = str(self.cmb_gen_quality.currentText() if hasattr(self, "cmb_gen_quality") else "")
                         prof = _resolve_generation_profile(vm, gq, self._current_upscale_payload()) or {}
                         min_sec_preview = float(prof.get("min_sec", min_sec_preview) or min_sec_preview)
@@ -22115,7 +24006,7 @@ If the planner sees a marker like [02] or (02), it becomes the next image prompt
                     dur = 0
                 min_sec_preview = 2.5
                 try:
-                    vm = str(self.cmb_video_model.currentText() if hasattr(self, "cmb_video_model") else "")
+                    vm = str(self._current_video_model_label() if hasattr(self, "_current_video_model_label") else (self.cmb_video_model.currentText() if hasattr(self, "cmb_video_model") else ""))
                     gq = str(self.cmb_gen_quality.currentText() if hasattr(self, "cmb_gen_quality") else "")
                     prof = _resolve_generation_profile(vm, gq, self._current_upscale_payload()) or {}
                     min_sec_preview = float(prof.get("min_sec", min_sec_preview) or min_sec_preview)
@@ -22240,6 +24131,10 @@ If the planner sees a marker like [02] or (02), it becomes the next image prompt
             self._sync_chain_start_image_ui()
         except Exception:
             pass
+        try:
+            self._sync_end_images_ui()
+        except Exception:
+            pass
 
     def _on_toggle_chain_use_start_image(self, on: bool) -> None:
         """Persist the optional user-supplied first start image toggle."""
@@ -22291,6 +24186,120 @@ If the planner sees a marker like [02] or (02), it becomes the next image prompt
             self._sync_chain_start_image_ui()
         except Exception:
             pass
+
+    def _on_toggle_use_end_images_as_last_frames(self, on: bool) -> None:
+        try:
+            self._sync_ltx23_end_images_visibility()
+        except Exception:
+            pass
+        try:
+            self._sync_end_images_ui()
+        except Exception:
+            pass
+
+    def _sync_ltx23_end_images_visibility(self) -> None:
+        try:
+            visible = bool(self._is_ltx23_video_model_selected())
+        except Exception:
+            visible = False
+        try:
+            if hasattr(self, "end_image_targets_group") and self.end_image_targets_group is not None:
+                self.end_image_targets_group.setVisible(bool(visible))
+        except Exception:
+            pass
+
+    def _sync_end_images_ui(self) -> None:
+        try:
+            on = bool(getattr(self, "chk_use_end_images_as_last_frames", None) and self.chk_use_end_images_as_last_frames.isChecked())
+        except Exception:
+            on = False
+        try:
+            if hasattr(self, "btn_end_images_add"):
+                self.btn_end_images_add.setEnabled(bool(on))
+            if hasattr(self, "btn_end_images_remove"):
+                self.btn_end_images_remove.setEnabled(bool(on))
+            if hasattr(self, "btn_end_images_clear"):
+                self.btn_end_images_clear.setEnabled(bool(on))
+            if hasattr(self, "end_image_list"):
+                self.end_image_list.setEnabled(bool(on))
+            if hasattr(self, "lbl_end_images_hint"):
+                self.lbl_end_images_hint.setVisible(bool(on))
+        except Exception:
+            pass
+
+    def _renumber_end_images(self, *args) -> None:
+        try:
+            lst = getattr(self, "end_image_list", None)
+            if lst is None:
+                return
+            for i in range(lst.count()):
+                item = lst.item(i)
+                data = item.data(Qt.UserRole) or {}
+                p = str(data.get("path") or '').strip()
+                base = os.path.basename(p) if p else "(missing)"
+                item.setText(f"{i+1:02d} — {base}")
+        except Exception:
+            pass
+
+    def _on_add_end_images_clicked(self) -> None:
+        try:
+            if hasattr(self, "chk_use_end_images_as_last_frames") and not self.chk_use_end_images_as_last_frames.isChecked():
+                self.chk_use_end_images_as_last_frames.setChecked(True)
+        except Exception:
+            pass
+        files, _ = QFileDialog.getOpenFileNames(self, "Select end image(s)", "", "Images (*.png *.jpg *.jpeg *.webp *.bmp)")
+        if not files:
+            return
+        try:
+            existing = set()
+            if hasattr(self, "end_image_list"):
+                for i in range(self.end_image_list.count()):
+                    item = self.end_image_list.item(i)
+                    data = item.data(Qt.UserRole) or {}
+                    p = str(data.get("path") or '').strip()
+                    if p:
+                        existing.add(os.path.normcase(os.path.abspath(p)))
+            for p in files:
+                pp = str(p or '').strip()
+                if not pp:
+                    continue
+                key = os.path.normcase(os.path.abspath(pp))
+                if key in existing:
+                    continue
+                item = QListWidgetItem(os.path.basename(pp))
+                item.setData(Qt.UserRole, {"kind": "end_image", "path": pp})
+                self.end_image_list.addItem(item)
+                existing.add(key)
+            self._renumber_end_images()
+            self._sync_end_images_ui()
+        except Exception:
+            pass
+
+    def _remove_selected_end_images(self) -> None:
+        try:
+            for item in self.end_image_list.selectedItems():
+                row = self.end_image_list.row(item)
+                self.end_image_list.takeItem(row)
+            self._renumber_end_images()
+        except Exception:
+            pass
+
+    def _clear_end_images(self) -> None:
+        try:
+            self.end_image_list.clear()
+            self._renumber_end_images()
+        except Exception:
+            pass
+
+    def _preview_end_image_item(self, item: QListWidgetItem) -> None:
+        try:
+            data = item.data(Qt.UserRole) or {}
+            p = str(data.get("path") or '').strip()
+        except Exception:
+            p = ""
+        if p:
+            _planner_preview_media(self, p)
+
 
     def _on_toggle_allow_edit_while_running(self, on: bool) -> None:
         """Chunk 8A: Persist the interactive review/edit gate toggle."""
@@ -22990,9 +24999,15 @@ If the planner sees a marker like [02] or (02), it becomes the next image prompt
 
 
 
+    def _on_toggle_use_transition_lora(self, checked: bool) -> None:
+        try:
+            _save_planner_settings({"use_transition_lora": bool(checked)})
+        except Exception:
+            pass
+
     def _collect_attachments(self) -> Dict[str, List[str]]:
         # Chunk 4: reference images are stored separately, but keep backward-compat with older "images" key.
-        out = {"json": [], "ref_images": [], "images": [], "videos": [], "music": [], "music_new": [], "text": [], "transcripts": []}
+        out = {"json": [], "ref_images": [], "images": [], "end_images": [], "videos": [], "music": [], "music_new": [], "text": [], "transcripts": []}
 
         # Reference images list (if present)
         try:
@@ -23003,6 +25018,18 @@ If the planner sees a marker like [02] or (02), it becomes the next image prompt
                     p = data.get("path", "")
                     if p:
                         out["ref_images"].append(p)
+        except Exception:
+            pass
+
+        # Optional per-shot end images for LTX/WanGP bridge
+        try:
+            if hasattr(self, "end_image_list"):
+                for i in range(self.end_image_list.count()):
+                    item = self.end_image_list.item(i)
+                    data = item.data(Qt.UserRole) or {}
+                    p = str(data.get("path") or '').strip()
+                    if p:
+                        out["end_images"].append(p)
         except Exception:
             pass
         # Ready-made music file (if present)
@@ -23174,11 +25201,13 @@ If the planner sees a marker like [02] or (02), it becomes the next image prompt
             "quality_preset": f"{int(upscale_factor)}×",
 
             "image_model": self.cmb_image_model.currentText(),
-            "video_model": self.cmb_video_model.currentText(),
+            "video_model": (self._current_video_model_label() if hasattr(self, "_current_video_model_label") else self.cmb_video_model.currentText()),
             "videoclip_preset": (self.cmb_videoclip_preset.currentText() if hasattr(self, "cmb_videoclip_preset") else "Storyline Preset (Hardcuts)"),
             "videoclip_creator_clip_order": (self.cmb_videoclip_clip_order.currentText() if hasattr(self, "cmb_videoclip_clip_order") else "Sequential (default)"),
             "gen_quality_preset": (self.cmb_gen_quality.currentText() if hasattr(self, "cmb_gen_quality") else ""),
             "use_20_camera_effects": bool(getattr(self, "chk_use_20_camera_effects", None) and self.chk_use_20_camera_effects.isChecked()),
+            "use_transition_lora": bool(getattr(self, "chk_use_transition_lora", None) and self.chk_use_transition_lora.isChecked()),
+            "use_end_images_as_last_frames": bool(getattr(self, "chk_use_end_images_as_last_frames", None) and self.chk_use_end_images_as_last_frames.isChecked()),
             "use_last_frame_as_next_image": bool(getattr(self, "chk_use_last_frame_as_next_image", None) and self.chk_use_last_frame_as_next_image.isChecked()),
             "chain_use_start_image": bool(getattr(self, "chk_chain_use_start_image", None) and self.chk_chain_use_start_image.isChecked()),
             "chain_start_image_path": str((getattr(self, "edit_chain_start_image", None).text() if getattr(self, "edit_chain_start_image", None) else "") or '').strip(),
@@ -23188,6 +25217,10 @@ If the planner sees a marker like [02] or (02), it becomes the next image prompt
             "alternative_storymode": bool(getattr(self, "chk_alternative_storymode", None) and self.chk_alternative_storymode.isChecked()),
             "own_storyline_enabled": bool(getattr(self, "chk_own_storyline", None) and self.chk_own_storyline.isChecked()),
         })
+        try:
+            enc.update(self._own_llama_ui_payload())
+        except Exception:
+            pass
 
         # Store selected videoclip preset id (if it came from JSON) for robust matching later.
         try:
@@ -26570,6 +28603,61 @@ _WAN22_HAS_T5_CPU: Optional[bool] = None
 _WAN22_LORA_CAPS: Optional[Dict[str, bool]] = None
 
 
+
+
+def _ltx23_guess_wangp_root_global() -> str:
+    guesses = []
+    try:
+        env_root = str(os.environ.get("FRAMEVISION_LTX23_WANGP_ROOT") or '').strip()
+    except Exception:
+        env_root = ""
+    if env_root:
+        guesses.append(env_root)
+    if os.name == "nt":
+        guesses += [r"C:\WanGP\Wan2GP", r"C:\WanGP"]
+    try:
+        guesses += [str((_root().parent / "Wan2GP").resolve()), str((_root().parent / "WanGP" / "Wan2GP").resolve())]
+    except Exception:
+        pass
+    for raw in guesses:
+        s = str(raw or '').strip()
+        if not s:
+            continue
+        try:
+            pp = Path(s)
+            if pp.is_dir() and (pp / "wgp.py").exists():
+                return str(pp)
+            if pp.is_dir() and (pp / "Wan2GP" / "wgp.py").exists():
+                return str((pp / "Wan2GP").resolve())
+        except Exception:
+            continue
+    return ""
+
+
+def _ltx23_bridge_config_global() -> Dict[str, str]:
+    root_dir = _ltx23_guess_wangp_root_global()
+    try:
+        env_lora = str(os.environ.get("FRAMEVISION_LTX23_LORA_FILE") or '').strip()
+    except Exception:
+        env_lora = ""
+    try:
+        env_json = str(os.environ.get("FRAMEVISION_LTX23_LORA_JSON") or '').strip()
+    except Exception:
+        env_json = ""
+    try:
+        env_wgp = str(os.environ.get("FRAMEVISION_LTX23_WGP_PY") or '').strip()
+    except Exception:
+        env_wgp = ""
+    wgp_py = env_wgp or (str((Path(root_dir) / "wgp.py").resolve()) if root_dir else "")
+    lora_file = env_lora or (str((Path(root_dir) / "loras" / "ltx2" / "ltx2.3-transition.safetensors").resolve()) if root_dir else "")
+    lora_json = env_json or (str((Path(root_dir) / "loras" / "ltx2" / "LTX-2.3.json").resolve()) if root_dir else "")
+    return {
+        "wangp_root": str(root_dir or ''),
+        "wgp_py": str(wgp_py or ''),
+        "lora_file": str(lora_file or ''),
+        "lora_json": str(lora_json or ''),
+    }
+
 def _wan22_python_exe() -> str:
     # Prefer Wan's dedicated venv if present, otherwise fall back.
     try:
@@ -26878,7 +28966,8 @@ class PlannerWindow(QMainWindow):
 
 
 def _qwen_text_call(step_name: str, system_prompt: str, user_prompt: str, log_path: str,
-                    temperature: float = 0.3, max_new_tokens: int = 1024) -> str:
+                    temperature: float = 0.3, max_new_tokens: int = 1024,
+                    planner_llama_settings: Optional[Dict[str, Any]] = None) -> str:
     """Call Qwen3-VL via a short-lived subprocess and return plain text.
 
     Writes a combined debug log (system/user/output/stderr) to log_path.
@@ -26888,21 +28977,36 @@ def _qwen_text_call(step_name: str, system_prompt: str, user_prompt: str, log_pa
     """
     raw_text = ""
     try:
-        if not _HAVE_QWEN_TEXT:
-            raise RuntimeError(f"Qwen text generator not available: {_QWEN_IMPORT_ERROR!r}")
-        model_path = Path(_qwen_model_dir())
-        if not (model_path.exists() and any(model_path.iterdir())):
-            raise RuntimeError(f"Qwen3-VL model folder not found or empty: {model_path}")
+        _own_llama_active = _planner_llama_is_enabled(planner_llama_settings)
+        if _own_llama_active:
+            raw_text = _planner_run_llama_text(
+                system_prompt=system_prompt,
+                user_prompt=user_prompt,
+                temperature=float(temperature),
+                max_new_tokens=int(max_new_tokens),
+                planner_llama_settings=planner_llama_settings,
+            )
+            raw_text = (raw_text or '').strip()
+            if not raw_text:
+                raise RuntimeError(f"{step_name}: local llama returned empty output.")
+            err = ''
+            rc = 0
+        else:
+            if not _HAVE_QWEN_TEXT:
+                raise RuntimeError(f"Qwen text generator not available: {_QWEN_IMPORT_ERROR!r}")
+            model_path = Path(_qwen_model_dir())
+            if not (model_path.exists() and any(model_path.iterdir())):
+                raise RuntimeError(f"Qwen3-VL model folder not found or empty: {model_path}")
 
-        out, err, rc = _run_qwen_text_subprocess(
-            model_path=str(model_path),
-            system_prompt=system_prompt,
-            user_prompt=user_prompt,
-            temperature=float(temperature),
-            max_new_tokens=int(max_new_tokens),
-        )
-        raw_text = (out or '').strip()
-        err = (err or '').strip()
+            out, err, rc = _run_qwen_text_subprocess(
+                model_path=str(model_path),
+                system_prompt=system_prompt,
+                user_prompt=user_prompt,
+                temperature=float(temperature),
+                max_new_tokens=int(max_new_tokens),
+            )
+            raw_text = (out or '').strip()
+            err = (err or '').strip()
 
         blob = []
         blob.append("[system]\n" + (system_prompt or '').strip())
