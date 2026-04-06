@@ -1578,14 +1578,11 @@ def _planner_get_own_character_entries(enc: Optional[Dict[str, Any]]) -> List[Di
 
 
 def _apply_own_character_codeword_replacements(prompt_text: str, enc: Optional[Dict[str, Any]]) -> str:
-    """Apply manual Own Character Bible codewords once per character.
+    """Replace manual character codewords with the corresponding character bible text.
 
-    Rules:
     - Only entries with BOTH prompt and codeword are applied.
     - Case-insensitive whole-word/phrase matching.
-    - Expand only the FIRST occurrence of each codeword.
-    - Keep later occurrences as the plain codeword to avoid prompt bloat.
-    - If the replacement prose is already present, do not inject it again.
+    - No codeword => no injection (prevents global prompt pollution).
     """
     try:
         text = str(prompt_text or '')
@@ -1601,13 +1598,13 @@ def _apply_own_character_codeword_replacements(prompt_text: str, enc: Optional[D
     if not entries:
         return text
 
+    # Longest phrase first to avoid partial collisions (e.g. "Alien" vs "The alien").
     try:
         entries = sorted(entries, key=lambda d: len(str(d.get('codeword') or '')), reverse=True)
     except Exception:
         pass
 
     out = text
-    out_low = out.lower()
     for rec in entries:
         try:
             codeword = str(rec.get("codeword") or '').strip()
@@ -1618,25 +1615,9 @@ def _apply_own_character_codeword_replacements(prompt_text: str, enc: Optional[D
             continue
         try:
             pat = re.compile(rf"(?<!\w){re.escape(codeword)}(?!\w)", re.IGNORECASE)
+            out = pat.sub(repl, out)
         except Exception:
             continue
-        m = pat.search(out)
-        if not m:
-            continue
-
-        repl_clean = re.sub(r"[\r\n\t]+", " ", repl)
-        repl_clean = re.sub(r"[ ]{2,}", " ", repl_clean).strip(' ,;')
-        if not repl_clean:
-            continue
-
-        codeword_text = out[m.start():m.end()]
-        if repl_clean.lower() in out_low:
-            injected = codeword_text
-        else:
-            injected = f"{codeword_text} ({repl_clean})"
-
-        out = out[:m.start()] + injected + out[m.end():]
-        out_low = out.lower()
     return out
 
 # info: Chunk 10 side quest — Own storyline prompt parser (Step 2: preview only)
@@ -2114,9 +2095,9 @@ _LTX23_PRESETS = {
         "fps": 24,
         "steps": 8,
         "min_sec": 3.5,
-        "max_sec": 10.0,
-        "max_frames": 241,
-        "video_length": 241,
+        "max_sec": 16.0,
+        "max_frames":384,
+        "video_length": 384,
         "flow_shift": 5.0,
         "sliding_window_size": 481,
         "sliding_window_overlap": 17,
@@ -2134,9 +2115,9 @@ _LTX23_PRESETS = {
         "fps": 24,
         "steps": 8,
         "min_sec": 3.5,
-        "max_sec": 10.0,
-        "max_frames": 241,
-        "video_length": 241,
+        "max_sec": 16.0,
+        "max_frames": 384,
+        "video_length": 384,
         "flow_shift": 5.0,
         "sliding_window_size": 481,
         "sliding_window_overlap": 17,
@@ -2154,9 +2135,9 @@ _LTX23_PRESETS = {
         "fps": 24,
         "steps": 8,
         "min_sec": 3.5,
-        "max_sec": 10.0,
-        "max_frames": 241,
-        "video_length": 241,
+        "max_sec": 16.0,
+        "max_frames": 384,
+        "video_length": 384,
         "flow_shift": 5.0,
         "sliding_window_size": 481,
         "sliding_window_overlap": 17,
@@ -4912,7 +4893,21 @@ def _cb_compact_identity_phrase(c: Dict[str, Any]) -> str:
     return phrase
 
 def _people_policy_clause(chars: List[Dict[str, Any]], blob: str) -> str:
-    """Disabled: do not inject person-count policy lines into prompts."""
+    """Positive-only clause that prevents accidental extra people/clones (works even when negatives are ignored)."""
+    human_chars = [c for c in (chars or []) if str(c.get("taxonomy") or '').strip().lower() == "human"]
+    if human_chars:
+        descs = [_cb_compact_identity_phrase(c) for c in human_chars]
+        descs = [d for d in descs if d]
+        n = len(descs)
+        if n == 1:
+            return ""
+        return ""
+    try:
+        has_people = _shot_has_people_hint(blob or '')
+    except Exception:
+        has_people = False
+    if not has_people:
+        return ""
     return ""
 
 
@@ -5790,8 +5785,20 @@ def _assemble_shot_prompt(
             continue
         bits.append(b)
 
-    # Own Character Bible is codeword-triggered only.
-    # Do not append automatic subject anchors or global character prose here.
+    # Auto character/subject anchors: include compact identity phrases (plain prose, no IDs/labels).
+    # This helps models that ignore negatives stay on the intended subjects.
+    if chars:
+        try:
+            anchors = [_cb_compact_identity_phrase(c) for c in chars]
+            anchors = [a for a in anchors if a]
+            if anchors:
+                bits.append("Main subjects: " + "; ".join(anchors[:2]) + ".")
+        except Exception:
+            pass
+
+    # Add character prose (if provided) as plain description, not instruction
+    if own_lock_prose:
+        bits.append(own_lock_prose)
 
     if ex and not any(_story_prompt_texts_overlap(ex, prev) for prev in bits):
         bits.append(ex)
@@ -5960,7 +5967,7 @@ def _stable_uniform(seed_text: str, lo: float, hi: float) -> float:
 
 
 from PySide6.QtCore import Qt, QObject, Signal, Slot, QThread, QSize, QTimer, qInstallMessageHandler, QtMsgType
-from PySide6.QtGui import QFont, QAction, QPixmap, QIcon, QStandardItemModel, QStandardItem, QColor, QPainter
+from PySide6.QtGui import QFont, QAction, QPixmap, QIcon, QStandardItemModel, QStandardItem, QColor, QPainter, QBrush
 from PySide6.QtWidgets import (
     QApplication,
     QWidget,
@@ -6305,11 +6312,11 @@ def _quality_defaults(name: str) -> Dict[str, Any]:
     """
     n = (name or '').strip().lower()
     if n == "low":
-        return {"mode": "crf", "crf": 22, "bitrate_kbps": 1500, "note": "Small files, faster encode"}
+        return {"mode": "crf", "crf": 22, "bitrate_kbps": 2500, "note": "Small files, faster encode"}
     if n == "high":
-        return {"mode": "crf", "crf": 16, "bitrate_kbps": 6000, "note": "Near-high quality, larger files"}
+        return {"mode": "crf", "crf": 15, "bitrate_kbps": 8000, "note": "Near-high quality, larger files"}
     # Medium default
-    return {"mode": "crf", "crf": 18, "bitrate_kbps": 3000, "note": "Balanced (default)"}
+    return {"mode": "crf", "crf": 18, "bitrate_kbps": 4000, "note": "Balanced (default)"}
 
 
 def _duration_label(seconds: int) -> str:
@@ -7050,7 +7057,12 @@ class PipelineWorker(QThread):
         os.makedirs(os.path.dirname(out_file), exist_ok=True)
 
         # Backup current clip as a "take" (Option A)
+        # Important on Windows: if the file is still loaded by a player/preview,
+        # the move/delete can silently fail and the backend may then create a new
+        # suffixed filename instead of replacing the intended clip. That breaks
+        # resume because the planner still expects the original deterministic name.
         take_path = ""
+        _backup_error = ""
         try:
             if os.path.exists(out_file):
                 takes_dir = os.path.join(clips_dir, "_takes")
@@ -7067,13 +7079,21 @@ class PipelineWorker(QThread):
                 try:
                     import shutil
                     shutil.move(out_file, take_path)
-                except Exception:
-                    import shutil
-                    shutil.copy2(out_file, take_path)
+                except Exception as _move_err:
                     try:
+                        import shutil
+                        shutil.copy2(out_file, take_path)
                         os.remove(out_file)
-                    except Exception:
-                        pass
+                    except Exception as _copy_err:
+                        _backup_error = str(_copy_err or _move_err or '').strip()
+                if os.path.exists(out_file):
+                    raise RuntimeError(
+                        f"Clip {sid} is still loaded/in use and cannot be overwritten. "
+                        f"Unload/close that clip in the preview or external player first, then recreate it again."
+                        + (f"\nDetails: {_backup_error}" if _backup_error else "")
+                    )
+        except RuntimeError:
+            raise
         except Exception:
             pass
 
@@ -7368,7 +7388,21 @@ class PipelineWorker(QThread):
                 use_transition_lora = True if _ui_lora is None else bool(_ui_lora)
             else:
                 use_transition_lora = bool(_enc_lora)
-            frames = max(12, min(int(max_frames or 241), int(frames)))
+            frames = max(12, min(int(max_frames or 384), int(frames)))
+            # Recreate into a temp folder first.
+            # LTX/WanGP can fall back to suffixed names like S01(1).mp4 when the
+            # canonical target is busy on Windows. That breaks planner resume and
+            # last-frame chaining because downstream logic expects one stable file
+            # per shot. Render in temp, then restore the produced clip back to the
+            # canonical planner path only after generation succeeds.
+            _regen_tmp_dir = os.path.join(clips_dir, "_regen_tmp", sid)
+            try:
+                if os.path.isdir(_regen_tmp_dir):
+                    shutil.rmtree(_regen_tmp_dir, ignore_errors=True)
+            except Exception:
+                pass
+            os.makedirs(_regen_tmp_dir, exist_ok=True)
+            _tmp_out_file = os.path.join(_regen_tmp_dir, os.path.basename(out_file))
             args = [
                 str(sys.executable),
                 str(_root() / "helpers" / "ltx23_cli.py"),
@@ -7377,7 +7411,7 @@ class PipelineWorker(QThread):
                 "--prompt", str(prompt or ''),
                 "--negative", str(negative or ''),
                 "--image", str(img_path),
-                "--output", str(out_file),
+                "--output", str(_tmp_out_file),
                 "--fps", str(int(fps)),
                 "--frames", str(int(frames)),
                 "--steps", str(int(steps)),
@@ -7406,10 +7440,60 @@ class PipelineWorker(QThread):
             Path(log_file).parent.mkdir(parents=True, exist_ok=True)
             with open(log_file, "a", encoding="utf-8", errors="ignore") as lf:
                 lf.write(f"[planner] ltx23 regen settings: frames={frames} fps={fps} resolution={resolution} use_transition_lora={use_transition_lora} end_image={end_image_path or '<none>'}\n")
+                lf.write(f"[planner] ltx23 regen canonical target: {out_file}\n")
+                lf.write(f"[planner] ltx23 regen temp dir: {_regen_tmp_dir}\n")
                 lf.write("[planner] ltx23 regen cmd:\n")
                 lf.write(" ".join([str(x) for x in args]) + "\n\n")
                 lf.flush()
                 subprocess.run(args, cwd=str(_root()), stdout=lf, stderr=lf, check=True)
+
+                _produced_candidates = []
+                try:
+                    _produced_candidates = sorted(
+                        [
+                            os.path.join(_regen_tmp_dir, _nm)
+                            for _nm in os.listdir(_regen_tmp_dir)
+                            if str(_nm).lower().endswith(".mp4") and os.path.isfile(os.path.join(_regen_tmp_dir, _nm))
+                        ],
+                        key=lambda _p: (os.path.getmtime(_p), os.path.getsize(_p)),
+                        reverse=True,
+                    )
+                except Exception:
+                    _produced_candidates = []
+                _produced = ""
+                for _cand in _produced_candidates:
+                    try:
+                        if os.path.getsize(_cand) >= 1024:
+                            _produced = _cand
+                            break
+                    except Exception:
+                        pass
+                if not _produced:
+                    raise RuntimeError(f"LTX regenerate returned no output clip in temp folder for {sid}: {_regen_tmp_dir}")
+
+                lf.write(f"[planner] ltx23 regen produced file: {_produced}\n")
+                lf.flush()
+
+                try:
+                    if os.path.exists(out_file):
+                        raise RuntimeError(
+                            f"Clip {sid} is still loaded/in use and cannot be overwritten. "
+                            f"Unload/close that clip in the preview or external player first, then recreate it again."
+                        )
+                    os.makedirs(os.path.dirname(out_file), exist_ok=True)
+                    shutil.move(_produced, out_file)
+                except Exception as _restore_err:
+                    raise RuntimeError(
+                        f"Could not restore recreated LTX clip back to its canonical planner filename for {sid}: {out_file}. "
+                        f"Unload/close that clip in the preview or external player first, then recreate it again."
+                        + (f"\nDetails: {str(_restore_err).strip()}" if str(_restore_err).strip() else "")
+                    )
+                lf.write(f"[planner] ltx23 regen restored canonical file: {out_file}\n\n")
+                lf.flush()
+            try:
+                shutil.rmtree(_regen_tmp_dir, ignore_errors=True)
+            except Exception:
+                pass
         else:
             raise RuntimeError("Clip regeneration is only supported for HunyuanVideo 1.5, WAN 2.2, and LTX 2.3 in the current build.")
 
@@ -11461,6 +11545,8 @@ class PipelineWorker(QThread):
                     bible = []  # Qwen2511 must use storyline/shot prompts only (no Character Bible lock).
                 image_records: List[Dict[str, Any]] = []
                 total = len(shots)
+                _cancel_after_current_image = False
+                _cancel_log_emitted = False
                 use_last_frame_chain = _planner_last_frame_chain_enabled(getattr(self.job, "encoding", {}))
                 try:
                     _ltx_use_end_images = bool(_planner_use_end_images_enabled(getattr(self.job, "encoding", {})))
@@ -11566,6 +11652,18 @@ class PipelineWorker(QThread):
 
                 for i, sh in enumerate(shots, start=1):
                     sid = str(sh.get("id") or f"S{i:02d}")
+
+                    if self._stop_requested:
+                        _cancel_after_current_image = True
+                        self._stop_requested = False
+                        if not _cancel_log_emitted:
+                            try:
+                                self.signals.log.emit("[IMG] Cancel requested — stopping after the last completed image.")
+                            except Exception:
+                                pass
+                            _cancel_log_emitted = True
+                        break
+
                     # Partial-resume safeguard: if an image for this shot already exists, keep it.
                     # Users can manually delete specific shot images (e.g. S03/S07) to force regeneration of only those.
                     _existing_img = ""
@@ -13079,6 +13177,17 @@ class PipelineWorker(QThread):
                     except Exception:
                         pass
 
+                    if self._stop_requested:
+                        _cancel_after_current_image = True
+                        self._stop_requested = False
+                        if not _cancel_log_emitted:
+                            try:
+                                self.signals.log.emit(f"[IMG] Cancel requested — {sid} completed, stopping workflow before the next image.")
+                            except Exception:
+                                pass
+                            _cancel_log_emitted = True
+                        break
+
                 # Final write
                 manifest.setdefault("paths", {})["images_dir"] = images_dir
                 manifest["paths"]["images"] = image_records
@@ -13086,6 +13195,10 @@ class PipelineWorker(QThread):
 
                 # VRAM guard: release any in-process image model memory before later video/music stages
                 _vram_release("after images")
+
+                if _cancel_after_current_image:
+                    self._stop_requested = True
+                    raise RuntimeError("Cancelled by user.")
 
             # Skip if images already exist for all shots
             try:
@@ -13738,7 +13851,6 @@ class PipelineWorker(QThread):
                 manifest.setdefault("settings", {})["video_engine"] = "ltx23"
                 manifest["settings"]["video_model"] = "ltx23"
                 manifest["settings"]["video_profile"] = prof
-                manifest["settings"]["use_transition_lora"] = bool(use_transition_lora)
                 _safe_write_json(manifest_path, manifest)
 
 
@@ -15553,7 +15665,7 @@ class PipelineWorker(QThread):
                 # Final safety clamp (ACE expects a sensible positive duration in seconds)
                 if dur_s <= 0.1:
                     dur_s = 15.0
-                dur_s = float(max(5.0, min(480.0, dur_s)))
+                dur_s = float(max(5.0, min(1800.0, dur_s)))
 
                 preset_key = str(getattr(self.job, "ace15_preset_id", "") or '').strip()
                 payload = _ace15_load_preset_payload(preset_key)
@@ -20134,7 +20246,7 @@ class PlannerPane(QWidget):
         lay.addWidget(self.voice_sample_row)
         lay.addWidget(self.music_vol_row)
 
-        # Duration slider (5s - 8 min)
+        # Duration slider + manual number box
         duration_row = QWidget()
         dr = QHBoxLayout(duration_row)
         dr.setContentsMargins(0, 0, 0, 0)
@@ -20142,16 +20254,28 @@ class PlannerPane(QWidget):
         dr.addWidget(QLabel("Approx duration"))
 
         self.sld_duration = QSlider(Qt.Horizontal)
-        self.sld_duration.setRange(5, 480)
+        self.sld_duration.setRange(5, 1800)
+
+        self.spin_duration = QSpinBox()
+        self.spin_duration.setRange(5, 1800)
+        self.spin_duration.setSuffix(" s")
+        self.spin_duration.setSingleStep(5)
+        self.spin_duration.setMinimumWidth(96)
+        self.spin_duration.setToolTip("Set the project duration manually in seconds.")
+
         # Keep label in sync immediately on startup.
         # (Previously it defaulted to 30s until the user moved the slider.)
         self.lbl_duration = QLabel("")
         self.lbl_duration.setMinimumWidth(70)
-        self.sld_duration.valueChanged.connect(lambda v: self.lbl_duration.setText(_duration_label(int(v))))
+
+        self.sld_duration.valueChanged.connect(self._on_duration_slider_changed)
+        self.spin_duration.valueChanged.connect(self._on_duration_spin_changed)
         self.sld_duration.setValue(15)
+        self.spin_duration.setValue(15)
         self.lbl_duration.setText(_duration_label(int(self.sld_duration.value())))
 
         dr.addWidget(self.sld_duration, 1)
+        dr.addWidget(self.spin_duration)
         dr.addWidget(self.lbl_duration)
         lay.addWidget(duration_row)
 
@@ -22186,6 +22310,29 @@ If the planner sees a marker like [02] or (02), it becomes the next image prompt
     # Results / History
     # -------------------------
 
+    _RESULT_ROLE_JOB_DIR = int(Qt.UserRole) + 20
+    _RESULT_ROLE_FINAL_VIDEO = int(Qt.UserRole) + 21
+    _RESULT_ROLE_SORT = int(Qt.UserRole) + 22
+
+    def _format_bytes_compact(self, size_bytes: int) -> str:
+        try:
+            n = int(size_bytes or 0)
+        except Exception:
+            n = 0
+        units = ["B", "KB", "MB", "GB", "TB"]
+        value = float(max(0, n))
+        u = 0
+        while value >= 1024.0 and u < (len(units) - 1):
+            value /= 1024.0
+            u += 1
+        if u == 0:
+            return f"{int(value)} {units[u]}"
+        if value >= 100:
+            return f"{value:.0f} {units[u]}"
+        if value >= 10:
+            return f"{value:.1f} {units[u]}"
+        return f"{value:.2f} {units[u]}"
+
     @Slot(int)
     def _on_tabs_changed(self, idx: int) -> None:
         try:
@@ -22265,8 +22412,12 @@ If the planner sees a marker like [02] or (02), it becomes the next image prompt
         except Exception:
             pass
 
-        self.results_model = QStandardItemModel(0, 4, self.results_view)
-        self.results_model.setHorizontalHeaderLabels(["Title", "Assets", "Status", "Updated"])
+        self.results_model = QStandardItemModel(0, 5, self.results_view)
+        self.results_model.setHorizontalHeaderLabels(["Title", "Assets", "Status", "Updated", "Size"])
+        try:
+            self.results_model.setSortRole(self._RESULT_ROLE_SORT)
+        except Exception:
+            pass
         self.results_view.setModel(self.results_model)
 
         # Dots delegate in the assets column
@@ -22282,11 +22433,20 @@ If the planner sees a marker like [02] or (02), it becomes the next image prompt
             hdr.setSectionResizeMode(1, QHeaderView.Fixed)  # dots
             hdr.setSectionResizeMode(2, QHeaderView.ResizeToContents)  # status
             hdr.setSectionResizeMode(3, QHeaderView.ResizeToContents)  # updated
+            hdr.setSectionResizeMode(4, QHeaderView.ResizeToContents)  # size
             try:
                 # Space for up to 6 asset dots (sound/images/clips/final + upscaled + interpolated)
                 self.results_view.setColumnWidth(1, 122)
             except Exception:
                 pass
+        except Exception:
+            pass
+
+        try:
+            self.results_view.setSortingEnabled(True)
+            hdr.setSortIndicatorShown(True)
+            hdr.setSectionsClickable(True)
+            self.results_view.sortByColumn(3, Qt.DescendingOrder)
         except Exception:
             pass
 
@@ -22390,14 +22550,14 @@ If the planner sees a marker like [02] or (02), it becomes the next image prompt
             if not idxs:
                 return out
             row = idxs[0].row()
-            job_dir = self.results_model.item(row, 0).data(Qt.UserRole) or ""
+            job_dir = self.results_model.item(row, 0).data(self._RESULT_ROLE_JOB_DIR) or ""
             job_dir = str(job_dir)
             if not job_dir:
                 return out
             out["job_dir"] = job_dir
             out["manifest"] = os.path.join(job_dir, "manifest.json")
             try:
-                fv = self.results_model.item(row, 0).data(int(Qt.UserRole) + 1) or ""
+                fv = self.results_model.item(row, 0).data(self._RESULT_ROLE_FINAL_VIDEO) or ""
                 out["final_video"] = str(fv or '')
             except Exception:
                 out["final_video"] = ""
@@ -22722,7 +22882,7 @@ If the planner sees a marker like [02] or (02), it becomes the next image prompt
             except Exception:
                 pass
 
-            job_dir = str(self.results_model.item(row, 0).data(Qt.UserRole) or '')
+            job_dir = str(self.results_model.item(row, 0).data(self._RESULT_ROLE_JOB_DIR) or '')
             status = str(self.results_model.item(row, 2).text() or '')
             is_fav = self._is_favorited(job_dir)
 
@@ -22835,7 +22995,7 @@ If the planner sees a marker like [02] or (02), it becomes the next image prompt
             return
         for row in range(self.results_model.rowCount()):
             try:
-                rjd = str(self.results_model.item(row, 0).data(Qt.UserRole) or '')
+                rjd = str(self.results_model.item(row, 0).data(self._RESULT_ROLE_JOB_DIR) or '')
                 if os.path.normpath(rjd) == os.path.normpath(jd):
                     self.results_view.selectRow(row)
                     try:
@@ -22928,15 +23088,18 @@ If the planner sees a marker like [02] or (02), it becomes the next image prompt
             title = str(r.get("title") or '')
             status = str(r.get("status") or '')
             updated = str(r.get("updated") or '')
+            size_bytes = int(r.get("size_bytes") or 0)
+            size_text = str(r.get("size_text") or self._format_bytes_compact(size_bytes))
 
             it_title = QStandardItem(title)
             it_assets = QStandardItem("")  # painted by delegate
             it_status = QStandardItem(status)
             it_updated = QStandardItem(updated)
+            it_size = QStandardItem(size_text)
 
             try:
                 base_fg = QBrush(QColor("#f2f4f8"))
-                for _it in (it_title, it_status, it_updated):
+                for _it in (it_title, it_status, it_updated, it_size):
                     _it.setForeground(base_fg)
                     _it.setBackground(QBrush(QColor("#1b1f27")))
             except Exception:
@@ -22953,18 +23116,27 @@ If the planner sees a marker like [02] or (02), it becomes the next image prompt
             except Exception:
                 pass
 
-            # Store job_dir on the title item for actions
-            it_title.setData(str(r.get("job_dir") or ''), Qt.UserRole)
+            try:
+                st_sort = {"failed": 0, "partial": 1, "done": 2}.get(status.strip().lower(), 99)
+            except Exception:
+                st_sort = 99
 
-            # Store final video path (for Play button)
-            it_title.setData(str(r.get("final_video") or ''), int(Qt.UserRole) + 1)
+            # Store job_dir on the title item for actions
+            it_title.setData(str(r.get("job_dir") or ''), self._RESULT_ROLE_JOB_DIR)
+            it_title.setData(str(r.get("final_video") or ''), self._RESULT_ROLE_FINAL_VIDEO)
+            it_title.setData(str(title).lower(), self._RESULT_ROLE_SORT)
 
             # Dots mask + tooltip in assets column
             mask = int(r.get("assets_mask") or 0)
             it_assets.setData(mask, _AssetsDotsDelegate.ROLE_MASK)
             it_assets.setToolTip(str(r.get("assets_tooltip") or ''))
+            it_assets.setData(int(mask), self._RESULT_ROLE_SORT)
 
-            self.results_model.appendRow([it_title, it_assets, it_status, it_updated])
+            it_status.setData(st_sort, self._RESULT_ROLE_SORT)
+            it_updated.setData(str(updated), self._RESULT_ROLE_SORT)
+            it_size.setData(int(size_bytes), self._RESULT_ROLE_SORT)
+
+            self.results_model.appendRow([it_title, it_assets, it_status, it_updated, it_size])
 
         try:
             self.lbl_results_info.setText(f"Found {len(rows)} job(s). Select one to open or resume.")
@@ -22978,6 +23150,19 @@ If the planner sees a marker like [02] or (02), it becomes the next image prompt
             pass
 
     def _scan_results(self, output_base: str) -> List[dict]:
+        def _folder_size_bytes(folder: Path) -> int:
+            total = 0
+            try:
+                for root_dir, _dirs, files in os.walk(str(folder)):
+                    for fn in files:
+                        try:
+                            total += int((Path(root_dir) / fn).stat().st_size)
+                        except Exception:
+                            continue
+            except Exception:
+                return 0
+            return int(total)
+
         base = str(output_base or '').strip()
         if not base or (not os.path.isdir(base)):
             return []
@@ -23156,6 +23341,12 @@ If the planner sees a marker like [02] or (02), it becomes the next image prompt
             if interpolated_ok:
                 mask |= _AssetsDotsDelegate.HAS_INTERPOLATED
 
+            try:
+                size_bytes = _folder_size_bytes(d)
+            except Exception:
+                size_bytes = 0
+            size_text = self._format_bytes_compact(size_bytes)
+
             tip_lines = []
             tip_lines.append(f"Images: {img_n}")
             tip_lines.append(f"Clips: {clip_n}")
@@ -23163,6 +23354,7 @@ If the planner sees a marker like [02] or (02), it becomes the next image prompt
             tip_lines.append(f"Final cut: {'Yes' if final_ok else 'No'}")
             tip_lines.append(f"Upscaled: {'Yes' if upscaled_ok else 'No'}")
             tip_lines.append(f"Interpolated: {'Yes' if interpolated_ok else 'No'}")
+            tip_lines.append(f"Folder size: {size_text}")
             assets_tip = "\n".join(tip_lines)
 
             out.append({
@@ -23173,6 +23365,8 @@ If the planner sees a marker like [02] or (02), it becomes the next image prompt
                 "assets_mask": mask,
                 "assets_tooltip": assets_tip,
                 "final_video": final_video,
+                "size_bytes": int(size_bytes),
+                "size_text": size_text,
             })
 
         return out
@@ -24611,6 +24805,132 @@ If the planner sees a marker like [02] or (02), it becomes the next image prompt
         except Exception:
             pass
 
+    def _show_timed_notification(self, text: str, timeout_ms: int = 5000) -> None:
+        try:
+            self.statusBar().showMessage(str(text or ''), int(max(500, timeout_ms)))
+        except Exception:
+            pass
+
+    def _duration_cap_seconds(self) -> int:
+        try:
+            is_ace15 = bool(getattr(self, "rad_music_ace15", None) and self.rad_music_ace15.isChecked())
+        except Exception:
+            is_ace15 = False
+        return 480 if is_ace15 else 1800
+
+    def _current_duration_seconds(self) -> int:
+        try:
+            if hasattr(self, "spin_duration"):
+                return int(self.spin_duration.value())
+        except Exception:
+            pass
+        try:
+            return int(self.sld_duration.value())
+        except Exception:
+            return 15
+
+    def _on_duration_slider_changed(self, value: int) -> None:
+        try:
+            cap = int(self._duration_cap_seconds())
+        except Exception:
+            cap = 1800
+        v = int(value)
+        if v > cap:
+            try:
+                self.sld_duration.blockSignals(True)
+                self.sld_duration.setValue(cap)
+                self.sld_duration.blockSignals(False)
+            except Exception:
+                pass
+            v = cap
+        try:
+            if hasattr(self, "spin_duration") and int(self.spin_duration.value()) != v:
+                self.spin_duration.blockSignals(True)
+                self.spin_duration.setValue(v)
+                self.spin_duration.blockSignals(False)
+        except Exception:
+            pass
+        try:
+            self.lbl_duration.setText(_duration_label(int(v)))
+        except Exception:
+            pass
+
+    def _on_duration_spin_changed(self, value: int) -> None:
+        try:
+            cap = int(self._duration_cap_seconds())
+        except Exception:
+            cap = 1800
+        v = int(value)
+        if v > cap:
+            v = cap
+            try:
+                self.spin_duration.blockSignals(True)
+                self.spin_duration.setValue(v)
+                self.spin_duration.blockSignals(False)
+            except Exception:
+                pass
+        try:
+            if int(self.sld_duration.value()) != v:
+                self.sld_duration.blockSignals(True)
+                self.sld_duration.setValue(v)
+                self.sld_duration.blockSignals(False)
+        except Exception:
+            pass
+        try:
+            self.lbl_duration.setText(_duration_label(int(v)))
+        except Exception:
+            pass
+
+    def _apply_duration_cap_guard(self, notify: bool = False) -> None:
+        try:
+            prev_cap = int(getattr(self, "_last_duration_cap_seconds", 1800) or 1800)
+        except Exception:
+            prev_cap = 1800
+        try:
+            cap = int(self._duration_cap_seconds())
+        except Exception:
+            cap = 1800
+        try:
+            self._last_duration_cap_seconds = int(cap)
+        except Exception:
+            pass
+        try:
+            self.sld_duration.setMaximum(cap)
+        except Exception:
+            pass
+        try:
+            if hasattr(self, "spin_duration"):
+                self.spin_duration.setMaximum(cap)
+        except Exception:
+            pass
+
+        try:
+            cur = int(self._current_duration_seconds())
+        except Exception:
+            cur = cap
+        clamped = max(5, min(int(cur), int(cap)))
+
+        try:
+            self.sld_duration.blockSignals(True)
+            self.sld_duration.setValue(clamped)
+            self.sld_duration.blockSignals(False)
+        except Exception:
+            pass
+        try:
+            if hasattr(self, "spin_duration"):
+                self.spin_duration.blockSignals(True)
+                self.spin_duration.setValue(clamped)
+                self.spin_duration.blockSignals(False)
+        except Exception:
+            pass
+        try:
+            self.lbl_duration.setText(_duration_label(int(clamped)))
+        except Exception:
+            pass
+
+        if notify and cap == 480 and prev_cap != 480:
+            self._show_timed_notification("Maximum duration set to 8 minutes for Ace Step maximum allowed time limit", 5000)
+
     def _sync_music_source_ui(self) -> None:
         """Enable/disable widgets depending on selected music source.
 
@@ -24669,6 +24989,11 @@ If the planner sees a marker like [02] or (02), it becomes the next image prompt
                 self.chk_music.setChecked(True)
             except Exception:
                 pass
+
+        try:
+            self._apply_duration_cap_guard(notify=bool(is_ace15))
+        except Exception:
+            pass
 
     def _sync_image_model_lock_for_qwen2511_refs(self) -> None:
         "Disable Image model selection when a ref-workflow drives image creation."
@@ -25362,7 +25687,7 @@ If the planner sees a marker like [02] or (02), it becomes the next image prompt
             narration_sample_path=str(narration_sample_path),
             narration_language=str(narration_language),
             bake_subtitles=bool(bake_subtitles),
-            approx_duration_sec=int(self.sld_duration.value()),
+            approx_duration_sec=int(self._current_duration_seconds()),
             resolution_preset=str(aspect_label),
             quality_preset=f"{int(upscale_factor)}×",
             extra_info=(self.extra_info.toPlainText() or '').strip(),
