@@ -1241,6 +1241,7 @@ def _planner_force_chain_image_for_shot(
     id_to_img: Optional[Dict[str, str]] = None,
     log_emit: Optional[Callable[[str], None]] = None,
     chain_frames_dir: str = "",
+    force_refresh: bool = False,
 ) -> str:
     """For chain mode, refresh the current shot image from the previous shot clip right before rendering."""
     try:
@@ -1267,7 +1268,7 @@ def _planner_force_chain_image_for_shot(
     if not cur_sid or not prev_sid:
         return ""
 
-    forced_target = _planner_chain_frame_path(chain_frames_dir or images_dir, cur_sid)
+    forced_target = os.path.join(str(chain_frames_dir or '').strip(), f"{cur_sid}.png") if str(chain_frames_dir or '').strip() else _planner_chain_frame_path(images_dir, cur_sid)
     try:
         sm = shot_map if isinstance(shot_map, dict) else {}
         cur_rec = sm.get(cur_sid) if isinstance(sm.get(cur_sid), dict) else {}
@@ -1277,7 +1278,7 @@ def _planner_force_chain_image_for_shot(
                 forced_target = chain_file
     except Exception:
         pass
-    if forced_target and os.path.isfile(forced_target):
+    if (not bool(force_refresh)) and forced_target and os.path.isfile(forced_target):
         return forced_target
 
     prev_clip = ""
@@ -1953,7 +1954,7 @@ def _run_qwen_text_subprocess(*,
         "temperature": float(temperature),
         "max_new_tokens": int(max_new_tokens),
     }
-    tmp_dir = Path(tempfile.gettempdir()) / "framevision_planner_qwen"
+    tmp_dir = (_root() / "temp" / "framevision_planner_qwen")
     try:
         tmp_dir.mkdir(parents=True, exist_ok=True)
     except Exception:
@@ -7028,6 +7029,28 @@ class PipelineWorker(QThread):
         if not isinstance(manifest, dict):
             manifest = {}
 
+        # Normalize legacy/temporary recreate ids like shot_001_S01 back to the
+        # logical planner shot id (S01) before we touch logs, manifests, or
+        # downstream invalidation. Without this, recreate can miss the real live
+        # clip/log, skip moving the original clip to _takes, and accidentally
+        # create a parallel temporary-name clip instead of replacing the shot.
+        try:
+            _shots_pre = manifest.get("shots") if isinstance(manifest.get("shots"), dict) else {}
+        except Exception:
+            _shots_pre = {}
+        if isinstance(_shots_pre, dict) and sid not in _shots_pre:
+            for _alias_sid in _planner_sid_aliases(sid)[1:]:
+                if _alias_sid in _shots_pre:
+                    sid = str(_alias_sid).strip()
+                    break
+        if str(sid).lower().startswith("shot_"):
+            try:
+                _m_sid = re.match(r'^shot_\d+_(.+)$', str(sid).strip(), flags=re.IGNORECASE)
+                if _m_sid:
+                    sid = str(_m_sid.group(1) or sid).strip()
+            except Exception:
+                pass
+
         # Resolve current clip entry + target output file
         clips_list = []
         try:
@@ -7038,31 +7061,75 @@ class PipelineWorker(QThread):
             clips_list = []
 
         clip_entry = None
+        _sid_aliases = _planner_sid_aliases(sid)
         for it in clips_list:
-            if isinstance(it, dict) and str(it.get("id") or '') == sid:
+            if not isinstance(it, dict):
+                continue
+            _clip_id = str(it.get("id") or '').strip()
+            if _clip_id == sid or _clip_id in _sid_aliases or sid in _planner_sid_aliases(_clip_id):
                 clip_entry = it
                 break
 
         out_file = str((clip_entry or {}).get("file") or '').strip()
-        if not out_file and clips_dir and os.path.isdir(clips_dir):
+        _canonical_out = os.path.join(clips_dir, f"{sid}.mp4") if clips_dir else ""
+        if clips_dir and sid:
             try:
-                cands = sorted([str(p) for p in Path(clips_dir).glob(f"*_{sid}.mp4") if p.is_file()])
-                if cands:
-                    out_file = cands[0]
+                # Always prefer the real canonical planner clip if it already exists.
+                if _canonical_out and os.path.isfile(_canonical_out):
+                    out_file = _canonical_out
+            except Exception:
+                pass
+        if (not out_file or not os.path.isfile(out_file)) and clips_dir and os.path.isdir(clips_dir):
+            try:
+                for _alias_sid in _sid_aliases:
+                    _cand = os.path.join(clips_dir, f"{_alias_sid}.mp4")
+                    if os.path.isfile(_cand):
+                        out_file = _cand
+                        break
+                if (not out_file or not os.path.isfile(out_file)):
+                    for _alias_sid in _sid_aliases:
+                        cands = sorted([str(p) for p in Path(clips_dir).glob(f"*_{_alias_sid}.mp4") if p.is_file()])
+                        if cands:
+                            out_file = cands[-1]
+                            break
             except Exception:
                 pass
         if not out_file:
             # Fallback naming
-            out_file = os.path.join(clips_dir, f"{sid}.mp4")
+            out_file = _canonical_out or os.path.join(clips_dir, f"{sid}.mp4")
         os.makedirs(os.path.dirname(out_file), exist_ok=True)
 
+        # Load the per-shot record before backend detection.
+        # Recreate can be triggered from partial/failed jobs where clip_entry exists
+        # but the model choice only survives inside manifest["shots"][sid].
+        # This also avoids referencing `rec` before it has been assigned.
+        shot_map = manifest.get("shots") if isinstance(manifest.get("shots"), dict) else {}
+        rec = shot_map.get(sid) if isinstance(shot_map, dict) else None
+        if not isinstance(rec, dict):
+            rec = {}
+
+        # Decide the recreate backend early so LTX-only file-lock retry logic can be applied
+        _mk_candidates_pre = [
+            str((clip_entry or {}).get("model_key") or '').strip(),
+            str((clip_entry or {}).get("video_model") or '').strip(),
+            str((clip_entry or {}).get("video_engine") or '').strip(),
+            str(rec.get("video_model") or '').strip(),
+            str(rec.get("model_key") or '').strip(),
+            str(rec.get("video_engine") or '').strip(),
+            str((manifest.get("settings") or {}).get("video_model") or '').strip(),
+            str((manifest.get("settings") or {}).get("video_engine") or '').strip(),
+            str((self.job.encoding or {}).get("video_model") or '').strip(),
+        ]
+        mk_pre = ""
+        for _cand in _mk_candidates_pre:
+            _k = _video_model_key(_cand)
+            if _k != "hunyuan" or ("hunyuan" in str(_cand).lower()):
+                mk_pre = _k
+                if _cand:
+                    break
+
         # Backup current clip as a "take" (Option A)
-        # Important on Windows: if the file is still loaded by a player/preview,
-        # the move/delete can silently fail and the backend may then create a new
-        # suffixed filename instead of replacing the intended clip. That breaks
-        # resume because the planner still expects the original deterministic name.
         take_path = ""
-        _backup_error = ""
         try:
             if os.path.exists(out_file):
                 takes_dir = os.path.join(clips_dir, "_takes")
@@ -7076,33 +7143,41 @@ class PipelineWorker(QThread):
                         take_path = cand
                         break
                     n += 1
-                try:
+
+                def _move_clip_to_take() -> None:
                     import shutil
-                    shutil.move(out_file, take_path)
-                except Exception as _move_err:
                     try:
-                        import shutil
+                        shutil.move(out_file, take_path)
+                    except Exception:
                         shutil.copy2(out_file, take_path)
                         os.remove(out_file)
-                    except Exception as _copy_err:
-                        _backup_error = str(_copy_err or _move_err or '').strip()
-                if os.path.exists(out_file):
-                    raise RuntimeError(
-                        f"Clip {sid} is still loaded/in use and cannot be overwritten. "
-                        f"Unload/close that clip in the preview or external player first, then recreate it again."
-                        + (f"\nDetails: {_backup_error}" if _backup_error else "")
-                    )
-        except RuntimeError:
-            raise
+
+                if mk_pre == "ltx23":
+                    _last_err = None
+                    for _attempt in range(4):
+                        try:
+                            _move_clip_to_take()
+                            _last_err = None
+                            break
+                        except Exception as _e:
+                            _last_err = _e
+                            if _attempt < 3:
+                                try:
+                                    self.signals.log.emit(f"[ltx23] {sid}: existing clip busy, waiting 5s before recreate retry ({_attempt + 1}/4)")
+                                except Exception:
+                                    pass
+                                time.sleep(5.0)
+                    if _last_err is not None:
+                        raise _last_err
+                else:
+                    try:
+                        _move_clip_to_take()
+                    except Exception:
+                        pass
         except Exception:
             pass
 
         # Resolve image path for this shot (use latest approved image)
-        shot_map = manifest.get("shots") if isinstance(manifest.get("shots"), dict) else {}
-        rec = shot_map.get(sid) if isinstance(shot_map, dict) else None
-        if not isinstance(rec, dict):
-            rec = {}
-
         try:
             imgs = (manifest.get("paths") or {}).get("images") or []
         except Exception:
@@ -7138,6 +7213,7 @@ class PipelineWorker(QThread):
                     manifest=manifest,
                     manifest_path=manifest_path,
                     chain_frames_dir=chain_frames_dir,
+                    force_refresh=bool(mk_pre == "ltx23"),
                 )
                 if not _forced_chain_img or not os.path.isfile(_forced_chain_img):
                     raise RuntimeError(f"[CHAIN] {sid}: could not refresh start image from previous clip.")
@@ -7389,20 +7465,6 @@ class PipelineWorker(QThread):
             else:
                 use_transition_lora = bool(_enc_lora)
             frames = max(12, min(int(max_frames or 384), int(frames)))
-            # Recreate into a temp folder first.
-            # LTX/WanGP can fall back to suffixed names like S01(1).mp4 when the
-            # canonical target is busy on Windows. That breaks planner resume and
-            # last-frame chaining because downstream logic expects one stable file
-            # per shot. Render in temp, then restore the produced clip back to the
-            # canonical planner path only after generation succeeds.
-            _regen_tmp_dir = os.path.join(clips_dir, "_regen_tmp", sid)
-            try:
-                if os.path.isdir(_regen_tmp_dir):
-                    shutil.rmtree(_regen_tmp_dir, ignore_errors=True)
-            except Exception:
-                pass
-            os.makedirs(_regen_tmp_dir, exist_ok=True)
-            _tmp_out_file = os.path.join(_regen_tmp_dir, os.path.basename(out_file))
             args = [
                 str(sys.executable),
                 str(_root() / "helpers" / "ltx23_cli.py"),
@@ -7411,7 +7473,7 @@ class PipelineWorker(QThread):
                 "--prompt", str(prompt or ''),
                 "--negative", str(negative or ''),
                 "--image", str(img_path),
-                "--output", str(_tmp_out_file),
+                "--output", str(out_file),
                 "--fps", str(int(fps)),
                 "--frames", str(int(frames)),
                 "--steps", str(int(steps)),
@@ -7440,60 +7502,10 @@ class PipelineWorker(QThread):
             Path(log_file).parent.mkdir(parents=True, exist_ok=True)
             with open(log_file, "a", encoding="utf-8", errors="ignore") as lf:
                 lf.write(f"[planner] ltx23 regen settings: frames={frames} fps={fps} resolution={resolution} use_transition_lora={use_transition_lora} end_image={end_image_path or '<none>'}\n")
-                lf.write(f"[planner] ltx23 regen canonical target: {out_file}\n")
-                lf.write(f"[planner] ltx23 regen temp dir: {_regen_tmp_dir}\n")
                 lf.write("[planner] ltx23 regen cmd:\n")
                 lf.write(" ".join([str(x) for x in args]) + "\n\n")
                 lf.flush()
                 subprocess.run(args, cwd=str(_root()), stdout=lf, stderr=lf, check=True)
-
-                _produced_candidates = []
-                try:
-                    _produced_candidates = sorted(
-                        [
-                            os.path.join(_regen_tmp_dir, _nm)
-                            for _nm in os.listdir(_regen_tmp_dir)
-                            if str(_nm).lower().endswith(".mp4") and os.path.isfile(os.path.join(_regen_tmp_dir, _nm))
-                        ],
-                        key=lambda _p: (os.path.getmtime(_p), os.path.getsize(_p)),
-                        reverse=True,
-                    )
-                except Exception:
-                    _produced_candidates = []
-                _produced = ""
-                for _cand in _produced_candidates:
-                    try:
-                        if os.path.getsize(_cand) >= 1024:
-                            _produced = _cand
-                            break
-                    except Exception:
-                        pass
-                if not _produced:
-                    raise RuntimeError(f"LTX regenerate returned no output clip in temp folder for {sid}: {_regen_tmp_dir}")
-
-                lf.write(f"[planner] ltx23 regen produced file: {_produced}\n")
-                lf.flush()
-
-                try:
-                    if os.path.exists(out_file):
-                        raise RuntimeError(
-                            f"Clip {sid} is still loaded/in use and cannot be overwritten. "
-                            f"Unload/close that clip in the preview or external player first, then recreate it again."
-                        )
-                    os.makedirs(os.path.dirname(out_file), exist_ok=True)
-                    shutil.move(_produced, out_file)
-                except Exception as _restore_err:
-                    raise RuntimeError(
-                        f"Could not restore recreated LTX clip back to its canonical planner filename for {sid}: {out_file}. "
-                        f"Unload/close that clip in the preview or external player first, then recreate it again."
-                        + (f"\nDetails: {str(_restore_err).strip()}" if str(_restore_err).strip() else "")
-                    )
-                lf.write(f"[planner] ltx23 regen restored canonical file: {out_file}\n\n")
-                lf.flush()
-            try:
-                shutil.rmtree(_regen_tmp_dir, ignore_errors=True)
-            except Exception:
-                pass
         else:
             raise RuntimeError("Clip regeneration is only supported for HunyuanVideo 1.5, WAN 2.2, and LTX 2.3 in the current build.")
 
@@ -13489,6 +13501,33 @@ class PipelineWorker(QThread):
                 os.makedirs(logs_dir, exist_ok=True)
                 chain_frames_dir = os.path.join(self.out_dir, "chain_frames")
                 os.makedirs(chain_frames_dir, exist_ok=True)
+                if use_last_frame_chain:
+                    try:
+                        _paths_now = manifest.get("paths") if isinstance(manifest.get("paths"), dict) else {}
+                        _clips_now = _paths_now.get("clips") if isinstance(_paths_now.get("clips"), list) else []
+                        _clips_clean = []
+                        for _it in _clips_now:
+                            if not isinstance(_it, dict):
+                                continue
+                            _sid_now = str(_it.get("id") or '').strip()
+                            _fp_now = str(_it.get("file") or '').strip()
+                            if _fp_now and os.path.isfile(_fp_now) and os.path.getsize(_fp_now) >= 1024:
+                                _clips_clean.append(_it)
+                                continue
+                            try:
+                                _rec_now = shot_map.get(_sid_now) if isinstance(shot_map, dict) else {}
+                                if isinstance(_rec_now, dict):
+                                    for _k in ("clip_file", "clip_intent_fp", "ts_clip_done"):
+                                        _rec_now.pop(_k, None)
+                                    shot_map[_sid_now] = _rec_now
+                            except Exception:
+                                pass
+                        _paths_now["clips"] = _clips_clean
+                        manifest["paths"] = _paths_now
+                        manifest["shots"] = shot_map
+                        _safe_write_json(manifest_path, manifest)
+                    except Exception:
+                        pass
 
                 # Partial-resume safeguard: keep already-rendered clips and only regenerate missing/stale ones.
                 # Build an index of existing clips from prior manifest and current job manifest.
@@ -13546,9 +13585,25 @@ class PipelineWorker(QThread):
                         pass
                     img_path = ""
                     if use_last_frame_chain and i > 1:
-                        _forced_chain_img = _planner_force_chain_image_for_shot(
-                            shots=shots,
-                            shot_index=i,
+                        try:
+                            _prev_sid = str((shots[i - 2] or {}).get("id") or f"S{i-1:02d}").strip()
+                        except Exception:
+                            _prev_sid = f"S{i-1:02d}"
+                        _prev_clip = os.path.join(clips_dir, f"{_prev_sid}.mp4") if _prev_sid else ""
+                        if not (_prev_clip and os.path.isfile(_prev_clip) and os.path.getsize(_prev_clip) >= 1024):
+                            try:
+                                _prev_rec = shot_map.get(_prev_sid) if isinstance(shot_map, dict) else {}
+                                _prev_clip_cand = str((_prev_rec or {}).get("clip_file") or '').strip() if isinstance(_prev_rec, dict) else ''
+                                if _prev_clip_cand and os.path.isfile(_prev_clip_cand) and os.path.getsize(_prev_clip_cand) >= 1024:
+                                    _prev_clip = _prev_clip_cand
+                            except Exception:
+                                pass
+                        if not (_prev_clip and os.path.isfile(_prev_clip) and os.path.getsize(_prev_clip) >= 1024):
+                            raise RuntimeError(f"[CHAIN] {sid}: previous LTX clip is missing, so a fresh start image cannot be extracted: {_prev_sid}")
+                        _forced_chain_img = _planner_overwrite_next_image_from_clip(
+                            current_sid=_prev_sid,
+                            next_sid=sid,
+                            clip_path=_prev_clip,
                             images_dir=images_dir,
                             shot_map=shot_map,
                             image_records=image_records,
@@ -13556,14 +13611,14 @@ class PipelineWorker(QThread):
                             manifest_path=manifest_path,
                             id_to_img=id_to_img,
                             log_emit=self.signals.log.emit,
-                            chain_frames_dir=chain_frames_dir,
+                            target_path=os.path.join(chain_frames_dir, f"{sid}.png"),
+                            mirror_to_images_dir=True,
                         )
                         if not _forced_chain_img or not os.path.isfile(_forced_chain_img):
                             raise RuntimeError(f"[CHAIN] {sid}: failed to build dedicated chain start image from the previous clip.")
                         img_path = _forced_chain_img
-                        self.signals.log.emit(f"[CHAIN] {sid}: using dedicated chain start image {img_path}")
-
-                    if not img_path:
+                        self.signals.log.emit(f"[CHAIN] {sid}: using freshly extracted last frame from {_prev_sid} -> {img_path}")
+                    else:
                         img_path = id_to_img.get(sid, "")
                     if not img_path:
                         try:
@@ -13729,7 +13784,7 @@ class PipelineWorker(QThread):
                                             manifest_path=manifest_path,
                                             id_to_img=id_to_img,
                                             log_emit=self.signals.log.emit,
-                                            target_path=_planner_chain_frame_path(self.out_dir, _next_sid),
+                                            target_path=os.path.join(chain_frames_dir, f"{_next_sid}.png"),
                                             mirror_to_images_dir=True,
                                         )
                                         if not _derived:
@@ -14267,7 +14322,7 @@ class PipelineWorker(QThread):
                                         manifest_path=manifest_path,
                                         id_to_img=id_to_img,
                                         log_emit=self.signals.log.emit,
-                                        target_path=_planner_chain_frame_path(self.out_dir, _next_sid),
+                                        target_path=os.path.join(chain_frames_dir, f"{_next_sid}.png"),
                                         mirror_to_images_dir=True,
                                     )
                                     if not _derived:
@@ -14697,6 +14752,23 @@ class PipelineWorker(QThread):
                 except Exception:
                     _have_existing_clips = False
                 if _have_existing_clips:
+                    try:
+                        _manifest_fix = _safe_read_json(manifest_path) or {}
+                        _paths_fix = (_manifest_fix.get("paths") or {}) if isinstance(_manifest_fix, dict) else {}
+                        _clips_fix = _paths_fix.get("clips") if isinstance(_paths_fix.get("clips"), list) else []
+                        _clips_fix2 = []
+                        for _it_fix in _clips_fix:
+                            if not isinstance(_it_fix, dict):
+                                continue
+                            _fp_fix = str(_it_fix.get("file") or '').strip()
+                            if _fp_fix and os.path.isfile(_fp_fix) and os.path.getsize(_fp_fix) >= 1024:
+                                _clips_fix2.append(_it_fix)
+                        if len(_clips_fix2) != len(_clips_fix):
+                            _paths_fix["clips"] = _clips_fix2
+                            _manifest_fix["paths"] = _paths_fix
+                            _safe_write_json(manifest_path, _manifest_fix)
+                    except Exception:
+                        pass
                     self._clip_review_gate(
                         output_dir=self.out_dir,
                         manifest_path=manifest_path,
