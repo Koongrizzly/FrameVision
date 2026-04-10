@@ -626,23 +626,55 @@ def discover_lm_models(project_root: Path) -> list[str]:
     return found
 
 
+ACE15_MAIN_MODEL_DOWNLOAD_REPOS = {
+    "acestep-v15-base": "ACE-Step/acestep-v15-base",
+    "acestep-v15-sft": "ACE-Step/acestep-v15-sft",
+    "acestep-v15-turbo": "ACE-Step/acestep-v15-turbo",
+    "acestep-v15-xl-base": "ACE-Step/acestep-v15-xl-base",
+    "acestep-v15-xl-sft": "ACE-Step/acestep-v15-xl-sft",
+    "acestep-v15-xl-turbo": "ACE-Step/acestep-v15-xl-turbo",
+}
+
+ACE15_KNOWN_MAIN_MODELS = [
+    "acestep-v15-base",
+    "acestep-v15-sft",
+    "acestep-v15-turbo",
+    "acestep-v15-turbo-rl",
+    "acestep-v15-xl-base",
+    "acestep-v15-xl-sft",
+    "acestep-v15-xl-turbo",
+]
+
+
+def _ace15_model_dir_has_files(model_dir: Path) -> bool:
+    try:
+        if not model_dir.exists() or not model_dir.is_dir():
+            return False
+        for child in model_dir.iterdir():
+            return True
+    except Exception:
+        return False
+    return False
+
+
+def _ace15_main_model_local_dir(project_root: Path, model_name: str) -> Path:
+    return project_root / "checkpoints" / (model_name or "")
+
+
 def discover_main_models(project_root: Path) -> list[str]:
     """Best-effort scan for locally available main (DiT) models.
 
     ACE-Step commonly names these as Hugging Face model IDs like:
       - acestep-v15-base
       - acestep-v15-turbo
+      - acestep-v15-xl-base
+      - acestep-v15-xl-turbo
 
     If checkpoints are already present under <project_root>/checkpoints, we list them.
     Otherwise we still list known IDs so selecting one can trigger ACE auto-download.
     """
 
-    known = [
-        "acestep-v15-base",
-        "acestep-v15-sft",
-        "acestep-v15-turbo",
-        "acestep-v15-turbo-rl",
-    ]
+    known = list(ACE15_KNOWN_MAIN_MODELS)
 
     found: list[str] = []
     ckpt = project_root / "checkpoints"
@@ -3238,6 +3270,188 @@ class MainWindow(QtWidgets.QMainWindow):
             return 65
         return 0
 
+    def _ace15_ensure_downloadable_main_model_ready(self, model_name: str) -> bool:
+        """Ensure the selected ACE main model exists under project_root/checkpoints.
+
+        This avoids first-run queue failures where the worker starts before ACE finishes
+        auto-downloading the requested checkpoint.
+
+        Important: keep the UI responsive during long Hugging Face downloads. Using a
+        blocking stdout.readline() loop can freeze the whole window whenever the child
+        process is quiet for a while, so we drive the download through QProcess and a
+        local event loop instead.
+        """
+        model_name = str(model_name or "").strip()
+        if not model_name:
+            return True
+
+        repo_id = ACE15_MAIN_MODEL_DOWNLOAD_REPOS.get(model_name)
+        if not repo_id:
+            # Unknown/custom entries fall back to ACE's own resolver.
+            return True
+
+        envpy = Path(self.ed_envpy.text().strip())
+        proj = Path(self.ed_projectroot.text().strip())
+        if not envpy.exists():
+            QtWidgets.QMessageBox.warning(self, "Missing Python", f"Python not found:\n\n{envpy}")
+            return False
+        if not proj.exists():
+            QtWidgets.QMessageBox.warning(self, "Missing project root", f"Project root not found:\n\n{proj}")
+            return False
+
+        model_dir = _ace15_main_model_local_dir(proj, model_name)
+        if _ace15_model_dir_has_files(model_dir):
+            return True
+
+        ensure_dir(model_dir.parent)
+        self._log(f"Model not found locally. Downloading before run/queue:\n  {repo_id}\n  -> {model_dir}")
+
+        script = (
+            "from huggingface_hub import snapshot_download\n"
+            "snapshot_download(\n"
+            f"    repo_id={repo_id!r},\n"
+            f"    local_dir={str(model_dir)!r},\n"
+            "    local_dir_use_symlinks=False,\n"
+            "    resume_download=True,\n"
+            ")\n"
+            f"print({('DOWNLOAD_READY: ' + model_name)!r})\n"
+        )
+
+        dlg = QtWidgets.QProgressDialog(
+            f"Downloading {model_name} to checkpoints...", None, 0, 0, self
+        )
+        dlg.setWindowTitle("Ace-Step 1.5")
+        dlg.setWindowModality(QtCore.Qt.ApplicationModal)
+        dlg.setMinimumDuration(0)
+        dlg.setAutoClose(False)
+        dlg.setAutoReset(False)
+        dlg.setCancelButton(None)
+        dlg.show()
+        QtWidgets.QApplication.processEvents()
+
+        env = QtCore.QProcessEnvironment.systemEnvironment()
+        env.insert("PYTHONIOENCODING", "utf-8")
+        env.insert("PYTHONUTF8", "1")
+
+        proc = QtCore.QProcess(self)
+        proc.setWorkingDirectory(str(proj))
+        proc.setProcessChannelMode(QtCore.QProcess.MergedChannels)
+        proc.setProcessEnvironment(env)
+
+        rc = -1
+        failed_to_start = None
+        spinner = {"i": 0}
+        stdout_buf = {"text": ""}
+        loop = QtCore.QEventLoop(self)
+        timer = QtCore.QTimer(self)
+        timer.setInterval(250)
+
+        def _drain_output():
+            try:
+                chunk = bytes(proc.readAllStandardOutput()).decode("utf-8", errors="replace")
+            except Exception:
+                chunk = ""
+            if not chunk:
+                return
+            stdout_buf["text"] += chunk
+            while "\n" in stdout_buf["text"]:
+                line, stdout_buf["text"] = stdout_buf["text"].split("\n", 1)
+                line = line.rstrip("\r")
+                if line:
+                    self._log(line)
+                    dlg.setLabelText(f"Downloading {model_name}...\n{line[:180]}")
+
+        def _tick():
+            spinner["i"] = (spinner["i"] + 1) % 4
+            dots = "." * (spinner["i"] + 1)
+            dlg.setLabelText(
+                f"Downloading {model_name} to checkpoints{dots}\nThis can take a while on first use."
+            )
+
+        def _on_error(err):
+            nonlocal failed_to_start
+            failed_to_start = err
+            _drain_output()
+            loop.quit()
+
+        def _on_finished(code, _status):
+            nonlocal rc
+            rc = int(code)
+            _drain_output()
+            loop.quit()
+
+        proc.readyReadStandardOutput.connect(_drain_output)
+        proc.errorOccurred.connect(_on_error)
+        proc.finished.connect(_on_finished)
+        timer.timeout.connect(_tick)
+        timer.start()
+
+        try:
+            proc.start(str(envpy), ["-c", script])
+            if not proc.waitForStarted(5000):
+                raise RuntimeError(f"Could not start downloader using: {envpy}")
+            loop.exec()
+            _drain_output()
+            trailing = stdout_buf["text"].strip()
+            if trailing:
+                self._log(trailing)
+        except Exception as e:
+            self._log(f"ERROR: model download failed: {e!r}")
+            QtWidgets.QMessageBox.warning(
+                self,
+                "Download failed",
+                f"Could not download {model_name} before starting the job.\n\nDetails: {e!r}",
+            )
+            return False
+        finally:
+            try:
+                timer.stop()
+            except Exception:
+                pass
+            try:
+                if proc.state() != QtCore.QProcess.NotRunning:
+                    proc.kill()
+                    proc.waitForFinished(2000)
+            except Exception:
+                pass
+            try:
+                dlg.close()
+            except Exception:
+                pass
+            try:
+                proc.deleteLater()
+            except Exception:
+                pass
+            try:
+                timer.deleteLater()
+            except Exception:
+                pass
+
+        if failed_to_start is not None:
+            err_txt = proc.errorString() or repr(failed_to_start)
+            self._log(f"ERROR: model download failed: {err_txt}")
+            QtWidgets.QMessageBox.warning(
+                self,
+                "Download failed",
+                f"Could not download {model_name} before starting the job.\n\nDetails: {err_txt}",
+            )
+            return False
+
+        ready = (rc == 0) and _ace15_model_dir_has_files(model_dir)
+        if ready:
+            self._log(f"Model ready:\n  {model_dir}")
+            try:
+                self._refresh_main_models()
+            except Exception:
+                pass
+            return True
+
+        QtWidgets.QMessageBox.warning(
+            self,
+            "Download failed",
+            f"{model_name} was not downloaded correctly, so the job was not started.\n\nExpected folder:\n{model_dir}",
+        )
+        return False
     def _on_main_model_changed(self, *_args):
         try:
             if not hasattr(self, 'cmb_main_model') or not hasattr(self, 'spin_steps'):
@@ -3253,19 +3467,9 @@ class MainWindow(QtWidgets.QMainWindow):
         """Populate the main model dropdown (Base/Turbo) based on what’s available (and what can be downloaded)."""
         try:
             proj = Path(self.ed_projectroot.text().strip())
-            models = discover_main_models(proj) if proj.exists() else [
-                "acestep-v15-base",
-                "acestep-v15-sft",
-                "acestep-v15-turbo",
-                "acestep-v15-turbo-rl",
-            ]
+            models = discover_main_models(proj) if proj.exists() else list(ACE15_KNOWN_MAIN_MODELS)
         except Exception:
-            models = [
-                "acestep-v15-base",
-                "acestep-v15-sft",
-                "acestep-v15-turbo",
-                "acestep-v15-turbo-rl",
-            ]
+            models = list(ACE15_KNOWN_MAIN_MODELS)
 
         current = self.cmb_main_model.currentText().strip() if hasattr(self, "cmb_main_model") else ""
         self.cmb_main_model.blockSignals(True)
@@ -3340,7 +3544,7 @@ class MainWindow(QtWidgets.QMainWindow):
         if hasattr(self, 'cmb_main_model'):
             main_sel = str(self.cmb_main_model.currentData() or "").strip()
             if main_sel and "turbo" in main_sel.lower() and task in {"lego", "extract"}:
-                return f"Task '{task}' requires the Base model. Switch Main model to 'acestep-v15-base' (or auto)."
+                return f"Task '{task}' requires the Base model. Switch Main model to a Base family model (for example 'acestep-v15-base' or 'acestep-v15-xl-base'), or use auto."
 
         caption = self.ed_caption.toPlainText().strip()
         lyrics = self.ed_lyrics.toPlainText().strip()
@@ -3595,6 +3799,13 @@ class MainWindow(QtWidgets.QMainWindow):
         # If Random is enabled, generate a fresh seed and show it (instead of -1).
         self._ace15_prepare_seed_for_run()
 
+        try:
+            main_sel = str(self.cmb_main_model.currentData() or "").strip() if hasattr(self, "cmb_main_model") else ""
+        except Exception:
+            main_sel = ""
+        if main_sel and not self._ace15_ensure_downloadable_main_model_ready(main_sel):
+            return
+
         self._pull_ui_to_settings()
         self._save_settings()
 
@@ -3647,6 +3858,13 @@ class MainWindow(QtWidgets.QMainWindow):
 
         # If Random is enabled, generate a fresh seed and show it.
         self._ace15_prepare_seed_for_run()
+
+        try:
+            main_sel = str(self.cmb_main_model.currentData() or "").strip() if hasattr(self, "cmb_main_model") else ""
+        except Exception:
+            main_sel = ""
+        if main_sel and not self._ace15_ensure_downloadable_main_model_ready(main_sel):
+            return
 
         self._pull_ui_to_settings()
         self._save_settings()
