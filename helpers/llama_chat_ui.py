@@ -238,19 +238,32 @@ def _model_name_tokens(model_path: str) -> List[str]:
     return toks
 
 
+def _model_looks_multimodal(model_path: str) -> bool:
+    hay = str(model_path or "").lower()
+    keywords = (
+        "vision", "-vl", "_vl", " vl ", "glm-4.1v", "glm-4v", "glm4v",
+        "llava", "bakllava", "minicpm-v", "qwen2-vl", "qwen-vl", "internvl", "moondream",
+    )
+    return any(k in hay for k in keywords)
+
+
 def _find_mmproj_for_model(model_path: str) -> str:
     model_path = os.path.abspath(model_path or "")
     if not model_path or not os.path.isfile(model_path):
+        return ""
+    if not _model_looks_multimodal(model_path):
         return ""
 
     model_dir = os.path.dirname(model_path)
     model_name = os.path.basename(model_path).lower()
     parent_dir = os.path.dirname(model_dir)
     candidate_dirs: List[str] = []
+    seen_dirs = set()
     for d in [model_dir, os.path.join(model_dir, "mmproj"), os.path.join(model_dir, "vision"), parent_dir]:
         if d and os.path.isdir(d):
             norm = os.path.normcase(os.path.normpath(d))
-            if norm not in {os.path.normcase(os.path.normpath(x)) for x in candidate_dirs}:
+            if norm not in seen_dirs:
+                seen_dirs.add(norm)
                 candidate_dirs.append(d)
 
     keyword_hits = [
@@ -274,7 +287,10 @@ def _find_mmproj_for_model(model_path: str) -> str:
             low = fn.lower()
             if not low.endswith(".gguf"):
                 continue
-            if os.path.normcase(os.path.normpath(os.path.join(folder, fn))) == os.path.normcase(os.path.normpath(model_path)):
+            full = os.path.join(folder, fn)
+            if os.path.normcase(os.path.normpath(full)) == os.path.normcase(os.path.normpath(model_path)):
+                continue
+            if not (low.startswith("mmproj") or low.startswith("mm-proj") or any(k in low for k in keyword_hits)):
                 continue
             score = 0
             if low.startswith("mmproj") or low.startswith("mm-proj"):
@@ -286,10 +302,10 @@ def _find_mmproj_for_model(model_path: str) -> str:
             for tok in tokens:
                 if tok and tok in low:
                     score += 6
-            if any(k in model_name for k in ("vision", "vl", "glm-4.1v", "glm-4v", "glm4v", "llava", "bakllava", "minicpm-v", "qwen2-vl", "qwen-vl", "internvl", "moondream")):
+            if _model_looks_multimodal(model_name):
                 score += 10
             if score > 0:
-                scored.append((score, os.path.join(folder, fn)))
+                scored.append((score, full))
 
     if not scored:
         return ""
@@ -2440,6 +2456,12 @@ class LlamaChatWindow(QtWidgets.QMainWindow):
         else:
             tail = self.server_log_tail[-1] if self.server_log_tail else "Local server stopped."
             self._set_status(tail, "error")
+            if self.server_log_tail:
+                detail = "\n".join(self.server_log_tail[-12:])
+                try:
+                    QtWidgets.QMessageBox.warning(self, "Model load failed", detail)
+                except Exception:
+                    pass
         self._update_header()
         self.server_process = None
 
