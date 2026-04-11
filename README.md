@@ -13,6 +13,19 @@ Video Walktrough (most is speedup x2 to show much in less time), last update jan
 ---
 
 <details>
+<summary>April 11th 2026 V2.3.3 small update brings new XL models for Ace step 1.5</summary>
+__________________________________________________________________________________
+
+- all 3 new models are added, will be downloaded on first use
+- Beatsyncvisuals : simple tool to add equalizers or other visuals to music videos
+- transition_video : another simple tool to assemble videos with transitions
+- planner can now load your own llm for story creation (needs testing)
+- couple of improvements and bugfixes here and there.
+
+
+</details>
+
+<details>
 <summary>March 15 2026 V2.3.2 small update brings Firered edit 1.1 (GGuf loader) & Hiar Long format video generation with wan 2.1</summary>
 __________________________________________________________________________________
 
