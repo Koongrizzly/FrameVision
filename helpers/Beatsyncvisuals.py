@@ -272,6 +272,48 @@ def _video_has_audio(ffprobe: str, path: str) -> bool:
     return code == 0 and bool(str(out).strip())
 
 
+def _ffprobe_video_bitrate(ffprobe: str, path: str) -> Optional[int]:
+    queries = [
+        [
+            ffprobe,
+            "-v",
+            "error",
+            "-select_streams",
+            "v:0",
+            "-show_entries",
+            "stream=bit_rate",
+            "-of",
+            "default=noprint_wrappers=1:nokey=1",
+            path,
+        ],
+        [
+            ffprobe,
+            "-v",
+            "error",
+            "-show_entries",
+            "format=bit_rate",
+            "-of",
+            "default=noprint_wrappers=1:nokey=1",
+            path,
+        ],
+    ]
+    for cmd in queries:
+        code, out = _run(cmd)
+        if code != 0:
+            continue
+        for line in str(out).splitlines():
+            s = str(line).strip()
+            if not s:
+                continue
+            try:
+                v = int(float(s))
+                if v > 0:
+                    return v
+            except Exception:
+                continue
+    return None
+
+
 # ----------------------------- beat analysis ------------------------------
 
 
@@ -829,6 +871,12 @@ class BeatSyncVisualsTool(QWidget):
         row_alpha_toggle.addStretch(1)
         form.addRow("Transparency:", row_alpha_toggle)
 
+        row_bitrate = QHBoxLayout()
+        self.check_keep_source_bitrate = QCheckBox("Keep source bitrate", body)
+        row_bitrate.addWidget(self.check_keep_source_bitrate)
+        row_bitrate.addStretch(1)
+        form.addRow("Bitrate:", row_bitrate)
+
         row_alpha = QHBoxLayout()
         self.slider_alpha = QSlider(Qt.Horizontal, body)
         self.slider_alpha.setRange(0, 100)
@@ -872,6 +920,7 @@ class BeatSyncVisualsTool(QWidget):
         self.combo_strategy.currentIndexChanged.connect(self._update_ui_state)
         self.combo_switch_mode.currentIndexChanged.connect(self._update_ui_state)
         self.check_transparency.toggled.connect(self._update_ui_state)
+        self.check_keep_source_bitrate.toggled.connect(self._update_ui_state)
         self.edit_video.editingFinished.connect(self._save_settings)
         self.edit_output.editingFinished.connect(self._save_settings)
 
@@ -892,6 +941,7 @@ class BeatSyncVisualsTool(QWidget):
         self.combo_strategy.currentIndexChanged.connect(self._save_settings)
         self.combo_switch_mode.currentIndexChanged.connect(self._save_settings)
         self.check_transparency.toggled.connect(self._save_settings)
+        self.check_keep_source_bitrate.toggled.connect(self._save_settings)
 
     def _sync_beats_from_slider(self, value: int) -> None:
         snap = max(4, min(128, int(round(value / 4.0) * 4)))
@@ -931,6 +981,7 @@ class BeatSyncVisualsTool(QWidget):
             self.slider_beats.setValue(int(data.get("beats") or 8))
             self.slider_alpha.setValue(int(data.get("opacity_percent") or 25))
             self.check_transparency.setChecked(bool(data.get("use_transparency", True)))
+            self.check_keep_source_bitrate.setChecked(bool(data.get("keep_source_bitrate", False)))
 
             strategy = str(data.get("strategy") or "single")
             for i in range(self.combo_strategy.count()):
@@ -962,6 +1013,7 @@ class BeatSyncVisualsTool(QWidget):
             "seconds": int(self.spin_seconds.value()),
             "beats": int(self.spin_beats.value()),
             "use_transparency": bool(self.check_transparency.isChecked()),
+            "keep_source_bitrate": bool(self.check_keep_source_bitrate.isChecked()),
             "opacity_percent": int(self.spin_alpha.value()),
         }
         _write_json(self._settings_path, data)
@@ -1040,17 +1092,21 @@ class BeatSyncVisualsTool(QWidget):
         self.slider_alpha.setEnabled(self.check_transparency.isChecked())
         self.spin_alpha.setEnabled(self.check_transparency.isChecked())
 
+        bitrate_note = ""
+        if getattr(self, "check_keep_source_bitrate", None) is not None and self.check_keep_source_bitrate.isChecked():
+            bitrate_note = " Output video bitrate will target the source bitrate."
+
         if is_single:
             self.label_info.setText(
-                "One visual preset will stay active for the full video."
+                "One visual preset will stay active for the full video." + bitrate_note
             )
         elif switch_mode == "time":
             self.label_info.setText(
-                "The helper will change visuals every N seconds."
+                "The helper will change visuals every N seconds." + bitrate_note
             )
         else:
             self.label_info.setText(
-                "The helper will analyze the video's audio and change visuals every N detected beats."
+                "The helper will analyze the video's audio and change visuals every N detected beats." + bitrate_note
             )
 
     # ----------------------------- browse ----------------------------------
@@ -1216,7 +1272,14 @@ class BeatSyncVisualsTool(QWidget):
                 "Backend mode validation/reload was attempted before render."
             )
 
-    def _overlay_visuals(self, src_video: str, visuals_video: str, out_video: str, alpha: float) -> None:
+    def _overlay_visuals(
+        self,
+        src_video: str,
+        visuals_video: str,
+        out_video: str,
+        alpha: float,
+        keep_source_bitrate: bool = False,
+    ) -> None:
         filter_complex = (
             f"[1:v]format=rgba,colorchannelmixer=aa={alpha:.4f}[viz];"
             f"[0:v][viz]overlay=(W-w)/2:(H-h)/2:shortest=1[vout]"
@@ -1236,16 +1299,46 @@ class BeatSyncVisualsTool(QWidget):
             "0:a?",
             "-c:v",
             "libx264",
-            "-preset",
-            "veryfast",
-            "-crf",
-            "18",
-            "-c:a",
-            "copy",
             "-pix_fmt",
             "yuv420p",
-            out_video,
         ]
+
+        if keep_source_bitrate:
+            src_bitrate = _ffprobe_video_bitrate(self._ffprobe, src_video)
+            if src_bitrate and src_bitrate > 0:
+                target = str(int(src_bitrate))
+                bufsize = str(int(max(src_bitrate * 2, 1000000)))
+                cmd.extend([
+                    "-preset",
+                    "veryfast",
+                    "-b:v",
+                    target,
+                    "-maxrate",
+                    target,
+                    "-bufsize",
+                    bufsize,
+                ])
+            else:
+                cmd.extend([
+                    "-preset",
+                    "veryfast",
+                    "-crf",
+                    "18",
+                ])
+        else:
+            cmd.extend([
+                "-preset",
+                "veryfast",
+                "-crf",
+                "18",
+            ])
+
+        cmd.extend([
+            "-c:a",
+            "copy",
+            out_video,
+        ])
+
         code, out = _run(cmd)
         if code != 0 or not os.path.exists(out_video):
             raise RuntimeError("Overlay step failed.\n" + out)
@@ -1412,9 +1505,26 @@ class BeatSyncVisualsTool(QWidget):
             if self.check_transparency.isChecked():
                 alpha = max(0.0, min(1.0, float(self.spin_alpha.value()) / 100.0))
 
+            keep_src_bitrate = bool(self.check_keep_source_bitrate.isChecked())
+            if keep_src_bitrate:
+                src_bitrate = _ffprobe_video_bitrate(self._ffprobe, video)
+                if src_bitrate and src_bitrate > 0:
+                    self._append_log(
+                        f"Keep source bitrate: using source video bitrate target {int(round(src_bitrate / 1000.0))} kb/s."
+                    )
+                else:
+                    self._append_log(
+                        "Keep source bitrate is on, but the source bitrate could not be read. Falling back to CRF 18."
+                    )
             self._render_stage = "overlaying"
             out_path = _unique_output_path(out_dir, video, suffix="_beatsync_visuals", ext=".mp4")
-            self._overlay_visuals(video, visuals_path, out_path, alpha)
+            self._overlay_visuals(
+                video,
+                visuals_path,
+                out_path,
+                alpha,
+                keep_source_bitrate=keep_src_bitrate,
+            )
             self._render_stage = "finishing"
             return out_path
         finally:

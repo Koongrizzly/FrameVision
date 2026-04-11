@@ -810,6 +810,8 @@ class InstantToolsPane(QWidget):
         sec_trim = CollapsibleSection("Video Trim Lab", expanded=False)
         sec_crop = CollapsibleSection("Cropping", expanded=False)
         sec_videotext = CollapsibleSection("Video Text Overlay", expanded=False)
+        sec_transition_video = CollapsibleSection("Transition Video", expanded=False)
+        sec_beatsyncvisuals = CollapsibleSection("Beat-synced visuals", expanded=False)
         sec_describe = CollapsibleSection("Describe anything with Qwen3 VL", expanded=False)
         _desc_wrap = QWidget(); _descl = QVBoxLayout(_desc_wrap); _descl.setContentsMargins(0,0,0,0)
         _descl.setSpacing(6)
@@ -1372,8 +1374,45 @@ class InstantToolsPane(QWidget):
             _vt_layout.addWidget(_lbl)
         sec_videotext.setContentLayout(_vt_layout)
 
+        # Transition Video
+        _tv_layout = QVBoxLayout(); _tv_layout.setContentsMargins(0,0,0,0)
+        _tv_layout.setSpacing(6)
+        try:
+            from helpers.transition_video import TransitionVideoTool
+            _tv_widget = TransitionVideoTool(self)
+            try:
+                _tv_widget.setProperty("expand_min_h", 520)
+            except Exception:
+                pass
+            _tv_layout.addWidget(_tv_widget)
+        except Exception:
+            _tv_lbl = QLabel("Transition Video tool failed to load.")
+            _tv_lbl.setWordWrap(True)
+            _tv_layout.addWidget(_tv_lbl)
+        sec_transition_video.setContentLayout(_tv_layout)
+
+        # Beat-synced visuals
+        _bsv_layout = QVBoxLayout(); _bsv_layout.setContentsMargins(0,0,0,0)
+        _bsv_layout.setSpacing(6)
+        try:
+            try:
+                from helpers.Beatsyncvisuals import BeatSyncVisualsTool
+            except Exception:
+                from helpers.beatsyncvisuals import BeatSyncVisualsTool
+            _bsv_widget = BeatSyncVisualsTool(self)
+            try:
+                _bsv_widget.setProperty("expand_min_h", 520)
+            except Exception:
+                pass
+            _bsv_layout.addWidget(_bsv_widget)
+        except Exception:
+            _bsv_lbl = QLabel("Beat-synced visuals tool failed to load.")
+            _bsv_lbl.setWordWrap(True)
+            _bsv_layout.addWidget(_bsv_lbl)
+        sec_beatsyncvisuals.setContentLayout(_bsv_layout)
+
         default_sections = [s for s in [sec_prompt, sec_bg, sec_describe, sec_qwen3tts, sec_meme, sec_music, sec_audio, sec_speed, sec_reverse, sec_upscale, sec_rife,
-                            sec_resize, sec_trim, sec_crop, sec_videotext, sec_splitglue, sec_gif, sec_extract, sec_whisper, sec_rename, sec_metadata] if s is not None]
+                            sec_resize, sec_trim, sec_crop, sec_videotext, sec_transition_video, sec_beatsyncvisuals, sec_splitglue, sec_gif, sec_extract, sec_whisper, sec_rename, sec_metadata] if s is not None]
 
 # sec_musicclip,  # to re add put this back in default_sections
 
@@ -1414,6 +1453,8 @@ class InstantToolsPane(QWidget):
                 "Cropping": sec_crop,
 
                 "Video Text Overlay": sec_videotext,
+                "Transition Video": sec_transition_video,
+                "Beat-synced visuals": sec_beatsyncvisuals,
 
                 "Thumbnail / Meme Creator": sec_meme,
                 "Prompt Enhancement": sec_prompt,
