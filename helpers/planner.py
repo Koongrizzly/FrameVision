@@ -11581,7 +11581,7 @@ class PipelineWorker(QThread):
                 except Exception:
                     _enc_now = {}
                 try:
-                    _chain_user_start_enabled = bool(use_last_frame_chain and bool(_enc_now.get("chain_use_start_image")))
+                    _chain_user_start_enabled = bool(_enc_now.get("chain_use_start_image"))
                 except Exception:
                     _chain_user_start_enabled = False
                 try:
@@ -21125,6 +21125,7 @@ If the planner sees a marker like [02] or (02), it becomes the next image prompt
         grid.addWidget(self.chk_use_20_camera_effects, 3, 1)
 
         lbl_transition_lora = QLabel("Use transition LoRA")
+        self.lbl_transition_lora = lbl_transition_lora
         self.chk_use_transition_lora = QCheckBox("Enabled")
         try:
             _transition_tip = "For hidden LTX 2.3 mode only. When enabled, Planner adds the transition LoRA and companion JSON to the WanGP bridge command. Turn this off to test plain LTX without the transition setup."
@@ -21217,7 +21218,7 @@ If the planner sees a marker like [02] or (02), it becomes the next image prompt
         lbl_chain_use_start = QLabel("Use start image")
         self.chk_chain_use_start_image = QCheckBox("Enabled")
         try:
-            _chain_start_tip = "Only shown when last frame → next start image is enabled. When turned on, you can load your own first start image. If no image is loaded, the planner behaves normally and still creates the first image itself."
+            _chain_start_tip = "Lets you load your own first start image for the planner. This can be used both with and without last frame → next start image. If no image is loaded, the planner behaves normally and still creates the first image itself."
             lbl_chain_use_start.setToolTip(_chain_start_tip)
             self.chk_chain_use_start_image.setToolTip(_chain_start_tip)
         except Exception:
@@ -21241,7 +21242,7 @@ If the planner sees a marker like [02] or (02), it becomes the next image prompt
         _chain_start_row.setContentsMargins(0, 0, 0, 0)
         _chain_start_row.setSpacing(8)
         self.edit_chain_start_image = QLineEdit()
-        self.edit_chain_start_image.setPlaceholderText("Optional first start image for the chain workflow")
+        self.edit_chain_start_image.setPlaceholderText("Optional first start image for the planner workflow")
         try:
             self.edit_chain_start_image.setReadOnly(True)
         except Exception:
@@ -21328,7 +21329,7 @@ If the planner sees a marker like [02] or (02), it becomes the next image prompt
         lay.addWidget(self.chain_start_image_row)
         lay.addWidget(self.end_image_targets_group)
         try:
-            self._sync_ltx23_end_images_visibility()
+            self._sync_ltx23_only_controls_visibility()
         except Exception:
             pass
 
@@ -23659,17 +23660,17 @@ If the planner sees a marker like [02] or (02), it becomes the next image prompt
             use_start = False
         try:
             if hasattr(self, "lbl_chain_use_start_image"):
-                self.lbl_chain_use_start_image.setVisible(bool(chain_on))
+                self.lbl_chain_use_start_image.setVisible(True)
         except Exception:
             pass
         try:
             if hasattr(self, "chk_chain_use_start_image"):
-                self.chk_chain_use_start_image.setVisible(bool(chain_on))
+                self.chk_chain_use_start_image.setVisible(True)
         except Exception:
             pass
         try:
             if hasattr(self, "chain_start_image_row"):
-                self.chain_start_image_row.setVisible(bool(chain_on and use_start))
+                self.chain_start_image_row.setVisible(bool(use_start))
         except Exception:
             pass
 
@@ -24188,7 +24189,7 @@ If the planner sees a marker like [02] or (02), it becomes the next image prompt
     def _refresh_video_model_dependent_ui(self) -> None:
         """Refresh previews that depend on the selected video backend/preset."""
         try:
-            self._sync_ltx23_end_images_visibility()
+            self._sync_ltx23_only_controls_visibility()
         except Exception:
             pass
         try:
@@ -24374,19 +24375,10 @@ If the planner sees a marker like [02] or (02), it becomes the next image prompt
         try:
             s = _load_planner_settings()
             s["use_last_frame_as_next_image"] = bool(on)
-            if not bool(on):
-                s["chain_use_start_image"] = False
             if bool(on):
                 s["videoclip_creator_preset"] = "Storyline Preset (Hardcuts)"
                 s["videoclip_creator_clip_order"] = "Sequential (default)"
             _save_planner_settings(s)
-        except Exception:
-            pass
-        try:
-            if hasattr(self, "chk_chain_use_start_image") and not bool(on):
-                self.chk_chain_use_start_image.blockSignals(True)
-                self.chk_chain_use_start_image.setChecked(False)
-                self.chk_chain_use_start_image.blockSignals(False)
         except Exception:
             pass
         try:
@@ -24463,16 +24455,30 @@ If the planner sees a marker like [02] or (02), it becomes the next image prompt
         except Exception:
             pass
 
-    def _sync_ltx23_end_images_visibility(self) -> None:
+    def _sync_ltx23_only_controls_visibility(self) -> None:
+        """Show LTX-only planner controls only for the hidden/external LTX backend."""
         try:
             visible = bool(self._is_ltx23_video_model_selected())
         except Exception:
             visible = False
         try:
+            if hasattr(self, "lbl_transition_lora") and self.lbl_transition_lora is not None:
+                self.lbl_transition_lora.setVisible(bool(visible))
+        except Exception:
+            pass
+        try:
+            if hasattr(self, "chk_use_transition_lora") and self.chk_use_transition_lora is not None:
+                self.chk_use_transition_lora.setVisible(bool(visible))
+        except Exception:
+            pass
+        try:
             if hasattr(self, "end_image_targets_group") and self.end_image_targets_group is not None:
                 self.end_image_targets_group.setVisible(bool(visible))
         except Exception:
             pass
+
+    def _sync_ltx23_end_images_visibility(self) -> None:
+        self._sync_ltx23_only_controls_visibility()
 
     def _sync_end_images_ui(self) -> None:
         try:

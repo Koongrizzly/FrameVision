@@ -185,7 +185,8 @@ def _merge_known_settings(dst: Dict[str, Any], src: Dict[str, Any]) -> None:
         "audio_scale", "guidance_phases", "num_inference_steps", "video_length", "negative_prompt",
         "activated_loras", "loras_multipliers", "lset_name", "force_fps", "seed", "image_mode",
         "image_prompt_type", "image_start", "image_end", "image_refs", "video_prompt_type",
-        "video_source", "keep_frames_video_source", "input_video_strength", "output_filename"
+        "video_source", "keep_frames_video_source", "input_video_strength", "output_filename",
+        "audio_guide", "audio_guide2", "audio_source"
     }
     for k, v in src.items():
         if k in allowed:
@@ -365,6 +366,16 @@ def _build_settings_payload(args: argparse.Namespace) -> Dict[str, Any]:
     settings["guidance_phases"] = int(args.guidance_phases)
     settings["denoising_strength"] = float(args.denoising_strength)
     settings["masking_strength"] = float(args.masking_strength)
+    audio_path = _norm(getattr(args, "audio", ""))
+    if audio_path:
+        if not os.path.isfile(audio_path):
+            raise FileNotFoundError(f"Audio guide not found: {args.audio}")
+        settings["audio_prompt_type"] = "A"
+        settings["audio_guide"] = audio_path
+    else:
+        settings["audio_prompt_type"] = str(settings.get("audio_prompt_type") or "")
+        settings["audio_guide"] = None
+
     settings["audio_scale"] = float(args.audio_scale)
     settings["perturbation_layers"] = [int(x) for x in args.perturbation_layers]
 
@@ -413,6 +424,10 @@ def _run_wangp_generate(args: argparse.Namespace) -> int:
         else:
             print("[ltx23_cli] Transition JSON: disabled")
         print(f"[ltx23_cli] Image: {payload['image_start'][0]}")
+        if payload.get("audio_guide"):
+            print(f"[ltx23_cli] Audio guide: {payload.get('audio_guide')}")
+        else:
+            print("[ltx23_cli] Audio guide: disabled")
         print(f"[ltx23_cli] Output target: {output_path}")
         print(f"[ltx23_cli] Frames={payload['video_length']} Steps={payload['num_inference_steps']} Res={payload['resolution']}")
         print("[ltx23_cli] Launching WanGP...")
@@ -468,6 +483,7 @@ def _make_parser() -> argparse.ArgumentParser:
     g.add_argument("--negative", default="", help="Negative prompt (kept for later wiring)")
     g.add_argument("--image", required=True, help="Start image path")
     g.add_argument("--image-end", default="", help="Optional target end image path")
+    g.add_argument("--audio", default="", help="Optional audio guide path passed into WanGP as audio_guide")
     g.add_argument("--output", required=True, help="Target output video path")
     g.add_argument("--frames", type=int, default=241, help="Video length / frames for WanGP")
     g.add_argument("--fps", type=int, default=24, help="Force FPS field passed into WanGP settings")
