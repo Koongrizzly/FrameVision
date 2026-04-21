@@ -24,6 +24,7 @@ from __future__ import annotations
 import os
 import shutil
 import json
+import importlib.util
 import time
 import datetime
 import uuid
@@ -212,6 +213,32 @@ def _planner_llama_settings(snapshot: Optional[Dict[str, Any]] = None) -> Dict[s
 def _planner_llama_is_enabled(snapshot: Optional[Dict[str, Any]] = None) -> bool:
     cfg = _planner_llama_settings(snapshot)
     return bool(cfg.get('enabled'))
+
+def _planner_story_creativity_profile(snapshot: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    """Return planner creativity settings. Own llama gets a looser storytelling path.
+
+    Reason: large local LLMs should not be forced through the exact same rigid planner
+    prompts and conservative temperatures as Qwen if the goal is richer story building.
+    """
+    use_own = _planner_llama_is_enabled(snapshot)
+    if use_own:
+        return {
+            'use_own_llama': True,
+            'plan_temperature': 0.78,
+            'plan_max_new_tokens': 5200,
+            'shots_temperature': 0.88,
+            'shots_max_new_tokens': 6200,
+            'retry_temperature': 0.7,
+        }
+    return {
+        'use_own_llama': False,
+        'plan_temperature': 0.35,
+        'plan_max_new_tokens': 4000,
+        'shots_temperature': 0.4,
+        'shots_max_new_tokens': 5200,
+        'retry_temperature': 0.25,
+    }
+
 
 
 def _planner_http_get_json(url: str, timeout: float = 10.0) -> Tuple[int, Dict[str, Any]]:
@@ -432,6 +459,85 @@ def _planner_run_llama_text(*, system_prompt: str, user_prompt: str, temperature
 # -----------------------------
 # FLUX.2 Klein (GGUF) helpers
 # -----------------------------
+
+_OFFLINE_STORYLINE_BACKEND_CACHE: Optional[Tuple[Any, Any, str]] = None
+_OFFLINE_STORYLINE_BACKEND_ERROR: str = ""
+
+
+def _planner_load_offline_storyline_backend() -> Tuple[Optional[Any], Optional[Any], str]:
+    global _OFFLINE_STORYLINE_BACKEND_CACHE, _OFFLINE_STORYLINE_BACKEND_ERROR
+    if isinstance(_OFFLINE_STORYLINE_BACKEND_CACHE, tuple):
+        try:
+            return _OFFLINE_STORYLINE_BACKEND_CACHE
+        except Exception:
+            pass
+    backend_path = str((_THIS_FILE.parent / "offline_storyline_creator.py").resolve())
+    client_cls = None
+    generator_cls = None
+    _OFFLINE_STORYLINE_BACKEND_ERROR = ""
+    try:
+        if not os.path.isfile(backend_path):
+            _OFFLINE_STORYLINE_BACKEND_ERROR = f"Missing backend file: {backend_path}"
+        else:
+            spec = importlib.util.spec_from_file_location('_framevision_offline_storyline_creator_backend', backend_path)
+            if spec and spec.loader:
+                mod = importlib.util.module_from_spec(spec)
+                sys.modules[spec.name] = mod
+                spec.loader.exec_module(mod)
+                client_cls = getattr(mod, 'LocalLlamaClient', None)
+                generator_cls = getattr(mod, 'StorylineGenerator', None)
+                if not client_cls or not generator_cls:
+                    _OFFLINE_STORYLINE_BACKEND_ERROR = "Backend loaded but required classes were not found."
+            else:
+                _OFFLINE_STORYLINE_BACKEND_ERROR = "Could not create module spec for offline storyline backend."
+    except BaseException as exc:
+        client_cls = None
+        generator_cls = None
+        _OFFLINE_STORYLINE_BACKEND_ERROR = f"{type(exc).__name__}: {exc}"
+    _OFFLINE_STORYLINE_BACKEND_CACHE = (client_cls, generator_cls, backend_path)
+    return _OFFLINE_STORYLINE_BACKEND_CACHE
+
+
+def _planner_action_safe_camera_text(text: Any) -> str:
+    try:
+        s = str(text or '').strip()
+    except Exception:
+        s = ''
+    if not s:
+        return ''
+    repls = [
+        (r'\bslow(?:ly)?\b', ''),
+        (r'\bvery gentle\b', ''),
+        (r'\bgentle\b', ''),
+        (r'\bsubtle\b', ''),
+        (r'\btiny\b', ''),
+        (r'\bstill\b', ''),
+        (r'\bstatic\b', ''),
+        (r'\blocked\b', ''),
+        (r'\bsteady\b', ''),
+        (r'\bbreathing motion\b', 'motion'),
+        (r'\bcinematic drift\b', 'cinematic move'),
+    ]
+    for pat, rep in repls:
+        s = re.sub(pat, rep, s, flags=re.IGNORECASE)
+    s = re.sub(r'\s{2,}', ' ', s)
+    s = re.sub(r'\s+,', ',', s)
+    s = re.sub(r',\s*,+', ', ', s)
+    return s.strip(' ,.;:-')
+
+
+def _planner_append_camera_effect_suffix(prompt: Any, camera_hint: Any = '', dynamic_mode: bool = True) -> str:
+    base = str(prompt or '').strip()
+    if not base:
+        return ''
+    move = _planner_camera_motion_from_hint(camera_hint, dynamic_mode=dynamic_mode)
+    move = _planner_action_safe_camera_text(move)
+    if not move:
+        return base
+    if move.lower() in base.lower():
+        return base
+    return base.rstrip(' .') + ', ' + move + '.'
+
 def _pick_flux_klein_models_highest(force_klein_b: int = 0) -> Dict[str, str]:
     """Auto-pick FLUX.2 Klein GGUF wiring for stable-diffusion.cpp sd-cli.
 
@@ -893,7 +999,7 @@ _PLANNER_SETTINGS_PATH = _root() / "presets" / "setsave" / "planner_settings.jso
 _PLANNER_UPSCALE_JSON_NAME = "planner_upscale.json"
 
 # Planner image-to-video prompt schema version
-_PLANNER_I2V_SCHEMA_VERSION = 4
+_PLANNER_I2V_SCHEMA_VERSION = 5
 
 
 def _load_planner_settings() -> Dict[str, Any]:
@@ -2095,13 +2201,13 @@ _LTX23_PRESETS = {
         "res_square": "720x720",
         "fps": 24,
         "steps": 8,
-        "min_sec": 3.5,
-        "max_sec": 16.0,
-        "max_frames":384,
-        "video_length": 384,
+        "min_sec": 4.0,
+        "max_sec": 20.0,
+        "max_frames":481,
+        "video_length": 481,
         "flow_shift": 5.0,
         "sliding_window_size": 481,
-        "sliding_window_overlap": 17,
+        "sliding_window_overlap": 9,
         "guidance_phases": 1,
         "denoising_strength": 1.0,
         "label": "480p",
@@ -2115,13 +2221,13 @@ _LTX23_PRESETS = {
         "res_square": "1024x1024",
         "fps": 24,
         "steps": 8,
-        "min_sec": 3.5,
-        "max_sec": 16.0,
-        "max_frames": 384,
-        "video_length": 384,
+        "min_sec": 4.0,
+        "max_sec": 20.0,
+        "max_frames": 481,
+        "video_length": 481,
         "flow_shift": 5.0,
         "sliding_window_size": 481,
-        "sliding_window_overlap": 17,
+        "sliding_window_overlap": 9,
         "guidance_phases": 1,
         "denoising_strength": 1.0,
         "label": "720p",
@@ -2135,13 +2241,13 @@ _LTX23_PRESETS = {
         "res_square": "1440x1440",
         "fps": 24,
         "steps": 8,
-        "min_sec": 3.5,
-        "max_sec": 16.0,
-        "max_frames": 384,
-        "video_length": 384,
+        "min_sec": 4.0,
+        "max_sec": 14.0,
+        "max_frames": 339,
+        "video_length": 339,
         "flow_shift": 5.0,
         "sliding_window_size": 481,
-        "sliding_window_overlap": 17,
+        "sliding_window_overlap": 9,
         "guidance_phases": 1,
         "denoising_strength": 1.0,
         "label": "1080p",
@@ -2638,175 +2744,175 @@ _PLANNER_I2V_CAMERA_VARIANTS: List[Dict[str, Any]] = [
         'family': 'close',
         'weight': 1.0,
         'buckets': ('close',),
-        'text': 'very slight push-in or breathing handheld drift while keeping the subject framed almost exactly the same',
+        'text': 'slight push-in or breathing handheld drift that keeps the shot alive',
     },
     {
         'id': 'wide_reveal',
         'family': 'wide',
         'weight': 1.0,
         'buckets': ('wide',),
-        'text': 'slow dolly or pan that reveals depth while keeping the spatial layout readable and stable',
+        'text': 'slow dolly or pan that reveals depth through the scene',
     },
     {
         'id': 'overhead_glide',
         'family': 'overhead',
         'weight': 1.0,
         'buckets': ('overhead',),
-        'text': 'gentle overhead glide with the composition held steady and easy to read',
+        'text': 'gentle overhead glide across the scene',
     },
     {
         'id': 'angle_drift',
         'family': 'angle',
         'weight': 1.0,
         'buckets': ('angle',),
-        'text': 'subtle perspective drift that preserves the current angle and keeps the pose readable',
+        'text': 'subtle perspective drift that carries the angle forward',
     },
     {
         'id': 'handheld_float',
         'family': 'handheld',
         'weight': 1.0,
         'buckets': ('handheld',),
-        'text': 'soft handheld float only, with controlled micro-movement and no abrupt shake spikes',
+        'text': 'soft handheld float with controlled micro-movement',
     },
     {
         'id': 'general_drift',
         'family': 'general',
         'weight': 1.0,
         'buckets': ('general', 'close', 'wide', 'angle', 'handheld'),
-        'text': 'slow controlled camera drift with stable framing and no sudden reframing',
+        'text': 'slow controlled camera drift',
     },
     {
         'id': 'general_push_lateral',
         'family': 'general',
         'weight': 1.0,
         'buckets': ('general', 'close', 'wide', 'angle'),
-        'text': 'slow push or lateral drift that matches the current framing and keeps the composition stable',
+        'text': 'slow push or lateral drift that carries the shot forward',
     },
     {
         'id': 'close_snap_push',
         'family': 'push',
         'weight': 0.95,
         'buckets': ('close', 'angle', 'general'),
-        'text': 'short snap push-in that lands cleanly on the subject and then holds the frame steady',
+        'text': 'short snap push-in that lands on the subject and settles',
     },
     {
         'id': 'wide_track_left',
         'family': 'track',
         'weight': 0.95,
         'buckets': ('wide', 'general'),
-        'text': 'smooth lateral track from left to right that keeps the full scene readable and musical',
+        'text': 'smooth lateral track from left to right through the scene',
     },
     {
         'id': 'wide_track_right',
         'family': 'track',
         'weight': 0.95,
         'buckets': ('wide', 'general'),
-        'text': 'smooth lateral track from right to left with the subject staying easy to read in frame',
+        'text': 'smooth lateral track from right to left through the scene',
     },
     {
         'id': 'angle_arc_left',
         'family': 'arc',
         'weight': 0.9,
         'buckets': ('angle', 'wide', 'general'),
-        'text': 'short arcing move around the subject from the left with brisk cinematic energy and a stable finish',
+        'text': 'short arcing move around the subject from the left with brisk cinematic energy',
     },
     {
         'id': 'angle_arc_right',
         'family': 'arc',
         'weight': 0.9,
         'buckets': ('angle', 'wide', 'general'),
-        'text': 'short arcing move around the subject from the right, ending in a clean locked composition',
+        'text': 'short arcing move around the subject from the right with a clean finish',
     },
     {
         'id': 'tilt_rise',
         'family': 'tilt',
         'weight': 0.85,
         'buckets': ('general', 'wide', 'angle'),
-        'text': 'controlled upward tilt that catches the subject and settles without breaking the framing',
+        'text': 'controlled upward tilt that catches the subject and settles',
     },
     {
         'id': 'tilt_drop',
         'family': 'tilt',
         'weight': 0.85,
         'buckets': ('general', 'wide', 'angle'),
-        'text': 'controlled downward tilt that lands on the subject with a quick stable lock at the end',
+        'text': 'controlled downward tilt that lands on the subject and settles',
     },
     {
         'id': 'pedestal_up',
         'family': 'pedestal',
         'weight': 0.8,
         'buckets': ('general', 'wide', 'angle'),
-        'text': 'brief pedestal rise that adds vertical energy while keeping the composition sharp and readable',
+        'text': 'brief pedestal rise that adds vertical energy',
     },
     {
         'id': 'pedestal_down',
         'family': 'pedestal',
         'weight': 0.8,
         'buckets': ('general', 'wide', 'angle'),
-        'text': 'brief pedestal drop that lands into the frame with a clean stable finish on the subject',
+        'text': 'brief pedestal drop that lands into the frame and settles',
     },
     {
         'id': 'diagonal_creep',
         'family': 'diagonal',
         'weight': 0.75,
         'buckets': ('general', 'wide', 'angle', 'close'),
-        'text': 'diagonal camera creep with a slight foreground parallax feel, then a steady hold on the beat',
+        'text': 'diagonal camera creep with slight foreground parallax',
     },
     {
         'id': 'profile_slide',
         'family': 'profile',
         'weight': 0.9,
         'buckets': ('angle', 'general'),
-        'text': 'profile-side slide that keeps the subject readable while the camera glides past with intent',
+        'text': 'profile-side slide as the camera glides past with intent',
     },
     {
         'id': 'pull_back_reveal',
         'family': 'pullback',
         'weight': 0.8,
         'buckets': ('wide', 'general'),
-        'text': 'short pull-back reveal that opens the frame and then stabilizes before the next beat',
+        'text': 'short pull-back reveal that opens the frame before the next beat',
     },
     {
         'id': 'handheld_surge',
         'family': 'handheld',
         'weight': 0.85,
         'buckets': ('handheld', 'general', 'close'),
-        'text': 'loose handheld surge toward the subject with music-video energy, ending in a controlled settle',
+        'text': 'loose handheld surge toward the subject with music-video energy',
     },
     {
         'id': 'low_angle_surge',
         'family': 'angle',
         'weight': 0.8,
         'buckets': ('angle', 'general'),
-        'text': 'low-angle surge forward that makes the subject feel larger, then locks the frame on the beat',
+        'text': 'low-angle surge forward that makes the subject feel larger',
     },
     {
         'id': 'high_angle_drop',
         'family': 'angle',
         'weight': 0.8,
         'buckets': ('angle', 'general', 'overhead'),
-        'text': 'high-angle drop into the shot that tightens the frame and settles just before the cut',
+        'text': 'high-angle drop into the shot that tightens the frame',
     },
     {
         'id': 'whip_settle',
         'family': 'whip',
         'weight': 0.65,
         'buckets': ('general', 'wide', 'angle'),
-        'text': 'quick whip-like lateral move that snaps into place and settles fast without losing the subject',
+        'text': 'quick whip-like lateral move that snaps into place fast',
     },
     {
         'id': 'shock_zoom',
         'family': 'impact',
         'weight': 0.35,
         'buckets': ('general', 'close', 'angle', 'wide'),
-        'text': 'sudden shock zoom toward the subject like a falling rock, then a hard stop with a brief vibration before the frame holds',
+        'text': 'sudden shock zoom toward the subject with impact',
     },
     {
         'id': 'impact_punch',
         'family': 'impact',
         'weight': 0.35,
         'buckets': ('general', 'close', 'angle'),
-        'text': 'fast punch-in toward the subject, ending in a tight frame with a tiny recoil tremor and stable hold',
+        'text': 'fast punch-in toward the subject with a tiny recoil tremor',
     },
 ]
 
@@ -2817,42 +2923,42 @@ _PLANNER_I2V_CAMERA_VARIANTS_SLOW: List[Dict[str, Any]] = [
         'family': 'slow_push',
         'weight': 1.0,
         'buckets': ('general', 'close', 'angle'),
-        'text': 'very slow cinematic push-in that gently tightens the frame while keeping the composition calm and readable',
+        'text': 'very slow cinematic push-in that gently tightens the frame',
     },
     {
         'id': 'slow_pull_back',
         'family': 'slow_pull',
         'weight': 0.9,
         'buckets': ('general', 'wide', 'angle'),
-        'text': 'very slow cinematic pull-back that opens the frame a little without changing the scene rhythm',
+        'text': 'very slow cinematic pull-back that opens the frame a little',
     },
     {
         'id': 'slow_pan_left',
         'family': 'slow_pan',
         'weight': 0.85,
         'buckets': ('general', 'wide', 'angle'),
-        'text': 'slow cinematic pan from right to left with stable framing and a calm storytelling feel',
+        'text': 'slow cinematic pan from right to left',
     },
     {
         'id': 'slow_pan_right',
         'family': 'slow_pan',
         'weight': 0.85,
         'buckets': ('general', 'wide', 'angle'),
-        'text': 'slow cinematic pan from left to right, keeping the subject and layout easy to follow',
+        'text': 'slow cinematic pan from left to right',
     },
     {
         'id': 'slow_close_breath',
         'family': 'slow_close',
         'weight': 0.8,
         'buckets': ('close', 'general'),
-        'text': 'near-static close framing with only a tiny cinematic breathing motion to keep the shot alive',
+        'text': 'close framing with a tiny cinematic breathing motion',
     },
     {
         'id': 'slow_overhead_glide',
         'family': 'slow_overhead',
         'weight': 0.75,
         'buckets': ('overhead', 'general', 'wide'),
-        'text': 'slow overhead glide with a very gentle cinematic drift and no abrupt reframing',
+        'text': 'slow overhead glide with very gentle cinematic drift',
     },
 ]
 
@@ -2962,17 +3068,9 @@ def _planner_i2v_end_state_hint(phase: Any, notes: Any, next_text: Any) -> str:
 def _planner_character_lock_lines(manifest: Dict[str, Any], shot_text: Any, enc: Optional[Dict[str, Any]] = None, own_active: bool = False) -> List[str]:
     locks: List[str] = []
 
-    # Manual own-character entries must always be considered when enabled.
-    if bool(own_active):
-        try:
-            for i, rec in enumerate(_planner_get_own_character_entries(enc)[:2], start=1):
-                prompt = _planner_compact_text((rec or {}).get('prompt') or '', 220)
-                codeword = _planner_compact_text((rec or {}).get('codeword') or '', 60)
-                if prompt:
-                    label = codeword if codeword else f'character {i}'
-                    locks.append(f'{label}: {prompt}')
-        except Exception:
-            pass
+    # Own Character Bible is a txt2img codeword-replacement feature only.
+    # Do NOT convert manual own-character entries into i2v continuity or identity-anchor locks.
+    _ = enc, own_active
 
     # Also add normalized Character Bible locks when available.
     try:
@@ -3033,6 +3131,38 @@ def _planner_character_lock_lines(manifest: Dict[str, Any], shot_text: Any, enc:
     return out[:4]
 
 
+def _planner_sanitize_i2v_text(text: Any, max_len: int = 260) -> str:
+    try:
+        s = str(text or '')
+    except Exception:
+        s = ''
+    s = s.replace("\r\n", " ").replace("\r", " ").replace("\n", " ")
+    repls = [
+        (r"\bwhile keeping\b", "while"),
+        (r"\bkeep(?:ing)? the same\b", "stay in"),
+        (r"\bkeep(?:ing)? continuity with\b", "follow on from"),
+        (r"\bkeep(?:ing)? continuity\b", "match continuity"),
+        (r"\bkeep(?:ing)? the subject framed almost exactly the same\b", "stay centered on the subject"),
+        (r"\bnear-static\b", "barely moving"),
+        (r"\bstatic\b", "still"),
+        (r"\bstable framing\b", "clean framing"),
+        (r"\bcomposition stable\b", "composition clean"),
+        (r"\bholds? the frame steady\b", "settles into the frame"),
+        (r"\bmatch the source image exactly\b", "start from the uploaded image with no reset"),
+        (r"\bframe 1 must match the source image exactly\b", "start from the uploaded image with no reset"),
+        (r"\buse the image as the hard visual anchor\b", "use the uploaded image as the visual anchor"),
+        (r"\bpreserve the same setting and layout from the input image\b", "stay in the same setting and layout as the uploaded image"),
+        (r"\bhold the same mood\b", "stay in the same mood"),
+        (r"\bkeep the same lighting feel\b", "stay in the same lighting feel"),
+        (r"\bdo not\b", "avoid"),
+    ]
+    for pat, rep in repls:
+        s = re.sub(pat, rep, s, flags=re.IGNORECASE)
+    s = re.sub(r"\s*[;:]+\s*", "; ", s)
+    s = re.sub(r"\s{2,}", " ", s).strip(" \t\n-–—,;:")
+    return _planner_compact_text(s, max_len)
+
+
 def _planner_build_i2v_schema(
     manifest: Dict[str, Any],
     shot: Dict[str, Any],
@@ -3074,36 +3204,36 @@ def _planner_build_i2v_schema(
 
     subject_label = ', '.join(subject_tokens[:3]).strip()
     if not subject_label:
-        subject_label = 'the visible subject in the source image'
+        subject_label = 'the main subject from the uploaded image'
 
     sent_visual = _planner_sentence_chunks(visual)
     sent_compiled = _planner_sentence_chunks(compiled)
     scene_anchor = sent_visual[0] if sent_visual else (sent_compiled[0] if sent_compiled else visual or compiled)
 
     if purpose:
-        subject_motion = f'{subject_label} performs one clear readable continuation of the current beat; {purpose.lower()}'
+        subject_motion = f'{subject_label} continues the shot with visible motion; {purpose.lower()}'
     else:
-        subject_motion = f'{subject_label} continues the exact moment shown in the source image with one small natural action only'
+        subject_motion = f'{subject_label} continues the moment already shown in the uploaded image with one clear natural action'
 
     environment_bits: List[str] = []
     if scene_anchor:
-        environment_bits.append(f'preserve the same setting and layout from the input image: {scene_anchor}')
+        environment_bits.append(f'stay in the same setting and layout; {scene_anchor}')
     if mood:
-        environment_bits.append(f'hold the same mood: {mood}')
+        environment_bits.append(f'stay in the same mood; {mood}')
     if lighting:
-        environment_bits.append(f'keep the same lighting feel: {lighting}')
-    environment_bits.append('allow only subtle natural scene motion such as drifting atmosphere, cloth or hair sway, moving reflections, or tiny background activity that fits the location')
+        environment_bits.append(f'stay in the same lighting feel; {lighting}')
+    environment_bits.append('let the location breathe with natural motion such as atmosphere drift, cloth or hair movement, reflections, crowd motion, weather, dust, smoke, or passing background activity when it fits the scene')
     environment_motion = '; '.join([b for b in environment_bits if b])
 
     use_dynamic_camera = bool((enc or {}).get('use_20_camera_effects', True))
     camera_motion = _planner_camera_motion_from_hint(camera, dynamic_mode=use_dynamic_camera)
-    shot_intent = purpose or (f'play the {str(shot.get("phase") or "current").strip()} beat clearly and simply' if str(shot.get('phase') or '').strip() else 'deliver a simple controlled continuation of the image without introducing a new beat')
+    shot_intent = purpose or (f'play the {str(shot.get("phase") or "current").strip()} beat clearly with visible movement' if str(shot.get('phase') or '').strip() else 'continue the image as a moving shot without inventing a new location or subject')
 
-    start_parts = ['frame 1 must match the source image exactly']
+    start_parts = ['start from the uploaded image with no reset or reframe']
     if compiled:
-        start_parts.append(f'use the image as the hard visual anchor: {compiled}')
+        start_parts.append(f'use this as the visual anchor; {compiled}')
     if prev_text:
-        start_parts.append(f'keep continuity with the previous beat: {prev_text}')
+        start_parts.append(f'follow on naturally from the previous beat; {prev_text}')
     start_state = '; '.join(start_parts)
 
     end_state = _planner_i2v_end_state_hint(shot.get('phase') or purpose, shot.get('notes') or purpose, next_text)
@@ -3111,39 +3241,47 @@ def _planner_build_i2v_schema(
     continuity_locks: List[str] = []
     continuity_locks.extend(_planner_character_lock_lines(manifest, ' '.join([visual, compiled, scene_anchor]), enc=enc, own_active=own_active))
 
-    # De-duplicate continuity locks while keeping order.
     _seen = set()
     continuity_locks = [x for x in continuity_locks if x and not (x.lower() in _seen or _seen.add(x.lower()))]
 
     return {
         'schema_version': int(_PLANNER_I2V_SCHEMA_VERSION),
-        'subject_motion': _planner_compact_text(subject_motion, 260),
-        'environment_motion': _planner_compact_text(environment_motion, 320),
-        'camera_motion': _planner_compact_text(camera_motion, 220),
-        'shot_intent': _planner_compact_text(shot_intent, 220),
-        'start_state': _planner_compact_text(start_state, 360),
-        'end_state': _planner_compact_text(end_state, 280),
-        'continuity_locks': continuity_locks[:6],
+        'subject_motion': _planner_sanitize_i2v_text(subject_motion, 260),
+        'environment_motion': _planner_sanitize_i2v_text(environment_motion, 320),
+        'camera_motion': _planner_sanitize_i2v_text(camera_motion, 220),
+        'shot_intent': _planner_sanitize_i2v_text(shot_intent, 220),
+        'start_state': _planner_sanitize_i2v_text(start_state, 360),
+        'end_state': _planner_sanitize_i2v_text(end_state, 280),
+        'continuity_locks': [_planner_sanitize_i2v_text(x, 120) for x in continuity_locks[:4]],
     }
 
 
 def _planner_format_i2v_prompt(schema: Dict[str, Any]) -> str:
     locks = schema.get('continuity_locks') if isinstance(schema.get('continuity_locks'), list) else []
-    lock_text = '; '.join([_planner_compact_text(x, 140) for x in locks if _planner_compact_text(x, 140)])
-    parts = [
-        f"Subject motion: {_planner_compact_text(schema.get('subject_motion') or '', 260)}",
-        f"Environment motion: {_planner_compact_text(schema.get('environment_motion') or '', 320)}",
-    ]
-    camera_line = _planner_compact_text(schema.get('camera_motion') or '', 220)
+    lock_text = '; '.join([_planner_sanitize_i2v_text(x, 90) for x in locks if _planner_sanitize_i2v_text(x, 90)])
+    subject_motion = _planner_sanitize_i2v_text(schema.get('subject_motion') or '', 260)
+    environment_motion = _planner_sanitize_i2v_text(schema.get('environment_motion') or '', 300)
+    camera_line = _planner_sanitize_i2v_text(schema.get('camera_motion') or '', 180)
+    shot_intent = _planner_sanitize_i2v_text(schema.get('shot_intent') or '', 180)
+    start_state = _planner_sanitize_i2v_text(schema.get('start_state') or '', 220)
+    end_state = _planner_sanitize_i2v_text(schema.get('end_state') or '', 220)
+
+    parts: List[str] = []
+    if start_state:
+        parts.append(start_state)
+    if subject_motion:
+        parts.append(subject_motion)
     if camera_line:
-        parts.append(f"Camera motion: {camera_line}")
-    parts.extend([
-        f"Shot intent: {_planner_compact_text(schema.get('shot_intent') or '', 220)}",
-        f"Start state: {_planner_compact_text(schema.get('start_state') or '', 360)}",
-        f"End state: {_planner_compact_text(schema.get('end_state') or '', 280)}",
-        f"Continuity locks: {lock_text}",
-    ])
-    return "\n".join([p for p in parts if p.strip()])
+        parts.append(f'Camera move; {camera_line}')
+    if environment_motion:
+        parts.append(environment_motion)
+    if shot_intent:
+        parts.append(f'Focus on this beat; {shot_intent}')
+    if end_state:
+        parts.append(f'End by; {end_state}')
+    if lock_text:
+        parts.append(f'Identity anchors; {lock_text}')
+    return '. '.join([p.strip().rstrip('. ') for p in parts if p and p.strip()]).strip() + '.'
 
 
 def _planner_i2v_prompts_are_current(path: str) -> bool:
@@ -3159,7 +3297,7 @@ def _planner_i2v_prompts_are_current(path: str) -> bool:
         first = shots[0] if isinstance(shots[0], dict) else {}
         prompt = str(first.get('prompt') or '').strip()
         schema = first.get('schema') if isinstance(first.get('schema'), dict) else {}
-        return ('Subject motion:' in prompt) and bool(schema)
+        return bool(prompt) and bool(schema)
     except Exception:
         return False
 
@@ -5747,18 +5885,9 @@ def _assemble_shot_prompt(
             up = _strip_named_subjects_from_text(up, scenic_names)
             ex = _strip_named_subjects_from_text(ex, scenic_names)
 
-    # Own Character Bible (manual 1–2): keep as plain prose only (no headers/bullets)
-    own_prompts = [str(x or '').strip() for x in (own_character_prompts or []) if str(x or '').strip()]
-    own_lock_prose = ""
-    if own_prompts:
-        cleaned: List[str] = []
-        for p in own_prompts:
-            tt = _strip_nonvisual_markers(p)
-            tt = re.sub(r"[\r\n\t]+", " ", tt)
-            tt = re.sub(r"[ ]{2,}", " ", tt).strip()
-            if tt:
-                cleaned.append(tt)
-        own_lock_prose = " ; ".join(cleaned).strip()
+    # Own Character Bible (manual 1–2): txt2img must use codeword replacement only.
+    # Do NOT inject the manual character prose globally here.
+    _ = own_character_prompts  # kept for call-site compatibility
 
     # Character Bible (auto): pick relevant characters and build a compact, positive-only identity clause.
     chars = _pick_relevant_characters(bible, f"{seed_txt}\n{notes}\n{up}\n{ex}")
@@ -5777,9 +5906,12 @@ def _assemble_shot_prompt(
         if b:
             bits.append(b)
 
-    # Core intent: user prompt → shot visual seed → brief notes.
-    # Avoid repeating the same premise twice when the shot seed already contains the user's base prompt.
-    for b in [up, seed_txt, notes]:
+    # Core intent: prefer the shot-specific visual seed and notes.
+    # The raw user start prompt is fallback context only; otherwise it floods every shot prompt.
+    core_bits = [seed_txt, notes]
+    if not seed_txt:
+        core_bits.insert(0, up)
+    for b in core_bits:
         if not b:
             continue
         if any(_story_prompt_texts_overlap(b, prev) for prev in bits):
@@ -5796,10 +5928,6 @@ def _assemble_shot_prompt(
                 bits.append("Main subjects: " + "; ".join(anchors[:2]) + ".")
         except Exception:
             pass
-
-    # Add character prose (if provided) as plain description, not instruction
-    if own_lock_prose:
-        bits.append(own_lock_prose)
 
     if ex and not any(_story_prompt_texts_overlap(ex, prev) for prev in bits):
         bits.append(ex)
@@ -5879,7 +6007,26 @@ def _resolve_generation_profile(video_model_label: str, gen_quality_label: str, 
     if mk == "ltx23":
         if gk not in _LTX23_PRESETS:
             gk = "medium"
-        return dict(_LTX23_PRESETS[gk])
+        prof = dict(_LTX23_PRESETS[gk])
+        try:
+            src = planner_upscale_settings if isinstance(planner_upscale_settings, dict) else {}
+            override = src.get("ltx23_clip_length_sec", None)
+            if override is None:
+                override = src.get(f"ltx23_clip_length_sec_{gk}", None)
+            if override is not None:
+                sec = float(override)
+                min_sec = float(prof.get("min_sec") or 4.0)
+                hard_max_sec = float(_LTX23_PRESETS.get(gk, {}).get("max_sec") or prof.get("max_sec") or sec)
+                sec = max(min_sec, min(hard_max_sec, sec))
+                fps = max(1, int(prof.get("fps") or 24))
+                hard_max_frames = int(_LTX23_PRESETS.get(gk, {}).get("max_frames") or prof.get("max_frames") or 481)
+                calc_frames = int(round(sec * fps)) + 1
+                prof["max_sec"] = float(sec)
+                prof["max_frames"] = max(12, min(hard_max_frames, calc_frames))
+                prof["video_length"] = int(prof["max_frames"])
+        except Exception:
+            pass
+        return prof
 
     # Hunyuan default
     if gk not in _HUNYUAN_PRESETS:
@@ -7888,7 +8035,7 @@ class PipelineWorker(QThread):
 
         # Own Character Bible — codeword-triggered replacement only (no forced global injection)
         try:
-            if (not bool(_own_storyline_enabled)) and bool(_own_active):
+            if bool((getattr(self.job, "encoding", {}) or {}).get("own_character_bible_enabled")) and bool(_own_active):
                 new_prompt = _apply_own_character_codeword_replacements(str(new_prompt or ''), getattr(self.job, "encoding", {}))
         except Exception:
             pass
@@ -9549,7 +9696,351 @@ class PipelineWorker(QThread):
 
             _own_prose = _own_block_prose(_own_prompts) if _own_active else ""
 
+            _offline_storyline_client_cls, _offline_storyline_gen_cls, _offline_storyline_backend_path = _planner_load_offline_storyline_backend()
+            try:
+                _offline_auto_cb_toggle = bool(self.job.encoding.get("character_bible_enabled", True))
+            except Exception:
+                _offline_auto_cb_toggle = True
+            # Keep the Offline Storyline Creator active for automated storymode even when
+            # the manual Own Character Bible is enabled. Disabling it here forces the old
+            # JSON-enforced planning path, which is the branch that throws the
+            # "Model response did not contain parseable JSON" error for this combo.
+            _planner_use_offline_storyline_creator = bool(
+                _planner_llama_is_enabled(self.job.encoding)
+                and (not bool(_own_storyline_enabled))
+                and bool(_offline_storyline_client_cls)
+                and bool(_offline_storyline_gen_cls)
+            )
+            _offline_storyline_expected = bool(
+                _planner_llama_is_enabled(self.job.encoding)
+                and (not bool(_own_storyline_enabled))
+            )
+            try:
+                if _offline_storyline_expected:
+                    _why = []
+                    if not bool(_offline_storyline_client_cls) or not bool(_offline_storyline_gen_cls):
+                        _why.append(f"backend unavailable ({_OFFLINE_STORYLINE_BACKEND_ERROR or _offline_storyline_backend_path})")
+                    if _planner_use_offline_storyline_creator:
+                        self.signals.log.emit(f"[planner] Offline Storyline Creator backend ACTIVE: {_offline_storyline_backend_path}")
+                    else:
+                        self.signals.log.emit("[planner] Offline Storyline Creator backend NOT active: " + "; ".join(_why or ["gate conditions not met"]))
+            except Exception:
+                pass
+
+            def _offline_storyline_target_shot_count() -> int:
+                try:
+                    avg_sec = float(_planner_preferred_clip_seconds(gen_profile))
+                except Exception:
+                    avg_sec = 3.5
+                try:
+                    total = float(max(1.0, float(getattr(self.job, "approx_duration_sec", 0) or 0.0)))
+                except Exception:
+                    total = 10.0
+                try:
+                    n = int(round(float(total) / max(1.0, float(avg_sec))))
+                except Exception:
+                    n = 6
+                return max(3, n)
+
+            def _offline_storyline_fit_durations(_shots: List[Dict[str, Any]], _target: float, _min_s: float, _max_s: float) -> None:
+                if not _shots:
+                    return
+                try:
+                    _target = float(_target)
+                except Exception:
+                    _target = 0.0
+                if _target <= 0.0:
+                    _target = float(len(_shots)) * max(1.0, float(_min_s))
+                each = max(float(_min_s), min(float(_max_s), float(_target) / float(max(1, len(_shots)))))
+                durs = [each for _ in _shots]
+                cur = float(sum(durs))
+                diff = float(_target) - cur
+                if abs(diff) > 0.02 and durs:
+                    step = diff / float(len(durs))
+                    durs = [max(float(_min_s), min(float(_max_s), float(d) + float(step))) for d in durs]
+                for _sh, _dur in zip(_shots, durs):
+                    _sh["duration_sec"] = round(float(_dur), 2)
+
+            def step_offline_storyline_creator() -> None:
+                if not _planner_use_offline_storyline_creator:
+                    raise RuntimeError("Offline Storyline Creator backend is not available.")
+                prompt_count = _offline_storyline_target_shot_count()
+                t2i_model_hint = str(self.job.encoding.get("image_model") or '').strip()
+                i2v_model_hint = str(self.job.encoding.get("video_model") or '').strip()
+                style_hint = str(self.job.extra_info or '').strip()
+                negative_hint = str(self.job.negatives or '').strip()
+                _llm_cfg = _planner_llama_settings(self.job.encoding)
+                runner_path = str(_llm_cfg.get('runner_path') or '').strip()
+                model_path = str(_llm_cfg.get('model_path') or '').strip()
+                ctx_size = int(_llm_cfg.get('ctx_size') or 8192)
+                top_p = float(_llm_cfg.get('top_p') or 0.9)
+                client = _offline_storyline_client_cls(runner_path, model_path, ctx_size=ctx_size, top_p=top_p)
+                generator = _offline_storyline_gen_cls(client, log_callback=self.signals.log.emit)
+                shots_path_local = os.path.join(story_dir, "shots.json")
+                shots_raw_path_local = os.path.join(story_dir, "shots_raw.txt")
+                character_bible_path_local = os.path.join(story_dir, "character_bible.json")
+                object_bible_path_local = os.path.join(story_dir, "object_bible.json")
+                image_prompts_path_local = os.path.join(prompts_dir, "image_prompts.txt")
+                i2v_prompts_path_local = os.path.join(prompts_dir, "i2v_prompts.txt")
+                i2v_prompts_json_local = os.path.join(prompts_dir, "i2v_prompts.json")
+                def _offline_norm_text(v: str) -> str:
+                    return re.sub(r"\s+", " ", str(v or "").strip()).strip(" ,")
+
+                def _offline_style_present(base_text: str, style_text: str) -> bool:
+                    b = str(base_text or '').lower()
+                    s = str(style_text or '').lower().strip()
+                    if not b or not s:
+                        return False
+                    if s in b:
+                        return True
+                    if 'pixar' in s:
+                        for marker in ('pixar style', 'pixar-style', 'pixar animated style', 'pixar animation style', 'pixar animated', 'pixar animation', 'rendered in pixar'):
+                            if marker in b:
+                                return True
+                    return False
+
+                def _offline_force_style_and_strip_negative(lines: List[str], style_text: str, negative_text: str) -> List[str]:
+                    style_clean = _offline_norm_text(style_text)
+                    neg_clean = _offline_norm_text(negative_text)
+                    out: List[str] = []
+                    for ln in list(lines or []):
+                        s = _offline_norm_text(ln)
+                        if neg_clean:
+                            low = s.lower()
+                            neg_low = neg_clean.lower()
+                            if neg_low in low:
+                                parts = [pp.strip() for pp in re.split(r"\s*,\s*", s) if pp.strip()]
+                                kept = [pp for pp in parts if pp.lower() != neg_low]
+                                s = _offline_norm_text(', '.join(kept))
+                                low = s.lower()
+                            if low.endswith(' ' + neg_low):
+                                s = _offline_norm_text(s[:-(len(neg_clean) + 1)])
+                        if style_clean and not _offline_style_present(s, style_clean):
+                            s = f"{s}, {style_clean}" if s else style_clean
+                        out.append(_offline_norm_text(s))
+                    return out
+
+                try:
+                    project = generator.generate_project(
+                        title=str(self.job.job_id or 'Untitled project'),
+                        idea=str(self.job.prompt or '').strip(),
+                        shot_count=int(prompt_count),
+                        include_story_outline=True,
+                        generate_t2i=True,
+                        generate_i2v=True,
+                        style_hint=style_hint,
+                        negative_hint=negative_hint,
+                        use_character_bible=bool(_offline_auto_cb_toggle),
+                        use_object_bible=True,
+                        t2i_model_hint=t2i_model_hint,
+                        i2v_model_hint=i2v_model_hint,
+                    )
+                finally:
+                    try:
+                        client.stop()
+                    except Exception:
+                        pass
+
+                beats = list(getattr(project, 'story_outline', None) or [])
+                t2i_prompts = _offline_force_style_and_strip_negative(list(getattr(project, 'text_to_image_prompts', None) or []), style_hint, negative_hint)
+                i2v_prompts = _offline_force_style_and_strip_negative(list(getattr(project, 'image_to_video_prompts', None) or []), style_hint, negative_hint)
+                if not beats or not t2i_prompts or not i2v_prompts:
+                    raise RuntimeError('Offline Storyline Creator returned incomplete output.')
+
+                if bool((self.job.encoding or {}).get('use_20_camera_effects', False)):
+                    _planner_reset_i2v_camera_state()
+                    i2v_prompts = [_planner_append_camera_effect_suffix(pp, '', True) for pp in i2v_prompts]
+
+                plan_obj = {
+                    "title": str(getattr(project, 'title', '') or f"Planner story {self.job.job_id}"),
+                    "prompt": str(self.job.prompt or '').strip(),
+                    "extra_info": style_hint,
+                    "logline": str(self.job.prompt or '').strip(),
+                    "setting": style_hint,
+                    "characters": [],
+                    "tone": style_hint,
+                    "continuity_rules": [
+                        "Use Offline Storyline Creator output exactly as authored.",
+                        "Planner must not rewrite returned text-to-image or image-to-video prompts.",
+                        "Only the optional random camera effects suffix may be appended to image-to-video prompts.",
+                    ],
+                    "beats": [{"index": int(i + 1), "text": str(bt)} for i, bt in enumerate(beats)],
+                    "source": "offline_storyline_creator_backend",
+                    "metadata": {
+                        "llm_model_path": model_path,
+                        "t2i_model_hint": t2i_model_hint,
+                        "i2v_model_hint": i2v_model_hint,
+                        "negative_hint": negative_hint,
+                    },
+                }
+                _safe_write_json(plan_path, plan_obj)
+                _safe_write_text(plan_raw_path, "\n".join(f"[{i+1:02d}] {bt}" for i, bt in enumerate(beats)).strip() + "\n")
+
+                min_sec = float(gen_profile.get("min_sec", 2.5))
+                max_sec = float(gen_profile.get("max_sec", 5.0))
+                target_total = float(max(1.0, float(getattr(self.job, "approx_duration_sec", 0) or 0.0)))
+                out_shots: List[Dict[str, Any]] = []
+                for i, beat in enumerate(beats, start=1):
+                    sid = f"S{i:02d}"
+                    out_shots.append({
+                        "id": sid,
+                        "index": int(i),
+                        "phase": _phase_for_index(i, len(beats)),
+                        "seed": str(beat),
+                        "seed_int": int(_seed_to_int(str(beat)) or 0),
+                        "camera": "",
+                        "mood": "",
+                        "lighting": "",
+                        "notes": "offline storyline creator",
+                        "stage_directions": {},
+                        "visual_description": str(beat),
+                        "subjects": [],
+                        "story_section": "",
+                        "section_change": "",
+                        "shot_purpose": "",
+                        "story_progression": {},
+                        "story_role": str(_phase_for_index(i, len(beats))),
+                        "duration_sec": 0.0,
+                        "gen_fps": int(gen_profile.get("fps", 20)),
+                        "gen_res": str(gen_profile.get("res", "384p")),
+                        "steps": int(gen_profile.get("steps", 9)),
+                        "video_model_key": str(gen_profile.get("model", "hunyuan")),
+                    })
+                _offline_storyline_fit_durations(out_shots, target_total, min_sec, max_sec)
+                _safe_write_json(shots_path_local, out_shots)
+                _safe_write_text(shots_raw_path_local, "\n".join(f"[{i+1:02d}] {bt}" for i, bt in enumerate(beats)).strip() + "\n")
+
+                _offline_character_bibles = list(getattr(project, 'character_bibles', None) or [])
+                if bool(_own_active):
+                    for _own_line in _own_prompts:
+                        _own_line = str(_own_line or '').strip()
+                        if _own_line and _own_line not in _offline_character_bibles:
+                            _offline_character_bibles.append(_own_line)
+                _safe_write_json(character_bible_path_local, {"lines": _offline_character_bibles})
+                _safe_write_json(object_bible_path_local, {"lines": list(getattr(project, 'object_bibles', None) or [])})
+
+                try:
+                    _ms = manifest.setdefault("settings", {}) if isinstance(manifest.setdefault("settings", {}), dict) else {}
+                    _ms["prompt_authority"] = "offline_storyline_creator"
+                    _ms["offline_storyline_creator_active"] = True
+                    _ms["offline_storyline_creator_backend_path"] = str(_offline_storyline_backend_path or '')
+                    manifest["settings"] = _ms
+                except Exception:
+                    pass
+
+                shot_map = manifest.setdefault("shots", {}) if isinstance(manifest.setdefault("shots", {}), dict) else {}
+                out_txt_blocks: List[str] = []
+                out_i2v_list: List[Dict[str, Any]] = []
+                for i, beat in enumerate(beats, start=1):
+                    sid = f"S{i:02d}"
+                    t2i_prompt = str(t2i_prompts[i - 1] if (i - 1) < len(t2i_prompts) else beat).strip()
+                    i2v_prompt = str(i2v_prompts[i - 1] if (i - 1) < len(i2v_prompts) else beat).strip()
+                    rec = shot_map.get(sid) if isinstance(shot_map.get(sid), dict) else {}
+                    rec.update({
+                        "id": sid,
+                        "prompt_authority": "offline_storyline_creator",
+                        "seed": str(beat),
+                        "seed_int": int(_seed_to_int(str(beat)) or 0),
+                        "phase": str(_phase_for_index(i, len(beats))),
+                        "prompt_spec": t2i_prompt,
+                        "negative_spec": negative_hint,
+                        "prompt_compiled": t2i_prompt,
+                        "negative_compiled": negative_hint,
+                        "prompt_used": t2i_prompt,
+                        "lint": [],
+                        "subject_guard": {},
+                        "subject_fidelity": {},
+                        "ts_compiled": time.time(),
+                        "i2v_prompt": i2v_prompt,
+                        "i2v_negative": negative_hint,
+                        "i2v_schema": {
+                            "schema_version": int(_PLANNER_I2V_SCHEMA_VERSION),
+                            "mode": "offline_storyline_creator_raw",
+                            "prompt_raw": i2v_prompt,
+                            "wrapper_disabled": True,
+                        },
+                        "i2v_schema_version": int(_PLANNER_I2V_SCHEMA_VERSION),
+                        "ts_i2v": time.time(),
+                    })
+                    shot_map[sid] = rec
+                    out_txt_blocks.append("\n".join([
+                        f"--- {sid} ---",
+                        "SPEC_PROMPT:",
+                        t2i_prompt,
+                        "",
+                        "RENDER_PROMPT:",
+                        t2i_prompt,
+                        "",
+                        "NEGATIVE:",
+                        negative_hint,
+                        "",
+                        "LINT: (none)",
+                    ]).strip())
+                    out_i2v_list.append({
+                        "id": sid,
+                        "prompt": i2v_prompt,
+                        "negative": negative_hint,
+                        "schema": {
+                            "schema_version": int(_PLANNER_I2V_SCHEMA_VERSION),
+                            "mode": "offline_storyline_creator_raw",
+                            "prompt_raw": i2v_prompt,
+                            "wrapper_disabled": True,
+                        },
+                    })
+                _safe_write_text(image_prompts_path_local, "\n\n".join(out_txt_blocks).strip() + "\n")
+                _safe_write_text(i2v_prompts_path_local, "\n\n".join(f"{it['id']}:\n{it['prompt']}" for it in out_i2v_list).strip() + "\n")
+                _safe_write_json(i2v_prompts_json_local, {"schema_version": int(_PLANNER_I2V_SCHEMA_VERSION), "shots": out_i2v_list})
+
+                shots_fingerprint_local = _sha1_text(json.dumps({
+                    "plan_fingerprint": plan_fingerprint,
+                    "video_model": self.job.encoding.get("video_model"),
+                    "gen_quality_preset": self.job.encoding.get("gen_quality_preset"),
+                    "generation_profile": gen_profile,
+                    "own_storyline_digest": _own_storyline_digest,
+                    "own_character_bible_enabled": self.job.encoding.get("own_character_bible_enabled"),
+                    "own_character_1_prompt": self.job.encoding.get("own_character_1_prompt"),
+                    "own_character_2_prompt": self.job.encoding.get("own_character_2_prompt"),
+                }, sort_keys=True))
+
+                manifest.setdefault("project", {})["offline_storyline"] = {
+                    "outline": beats,
+                    "character_bibles": _offline_character_bibles,
+                    "object_bibles": list(getattr(project, 'object_bibles', None) or []),
+                    "metadata": dict(getattr(project, 'metadata', None) or {}),
+                }
+                manifest["paths"]["plan_json"] = plan_path
+                manifest["paths"]["plan_raw_txt"] = plan_raw_path
+                manifest["paths"]["shots_json"] = shots_path_local
+                manifest["paths"]["shots_raw_txt"] = shots_raw_path_local
+                manifest["paths"]["image_prompts_txt"] = image_prompts_path_local
+                manifest["paths"]["i2v_prompts_txt"] = i2v_prompts_path_local
+                manifest["paths"]["i2v_prompts_json"] = i2v_prompts_json_local
+                manifest["paths"]["character_bible_json"] = character_bible_path_local
+                manifest["paths"]["object_bible_json"] = object_bible_path_local
+                manifest.setdefault("settings", {})["n_shots"] = len(out_shots)
+                manifest.setdefault("settings", {})["i2v_schema_version"] = int(_PLANNER_I2V_SCHEMA_VERSION)
+                manifest["shots"] = shot_map
+                for _step_name, _note in (
+                    ("Plan (story + constraints)", "Offline Storyline Creator backend generated plan + prompts."),
+                    ("Shots (seeded shot list)", "Offline Storyline Creator backend generated shots from story outline."),
+                    ("Character Bible", "Offline Storyline Creator backend handled character/object bible output."),
+                    ("Image prompts (from shots)", "Offline Storyline Creator backend supplied text-to-image prompts."),
+                    ("I2V prompts (from shots)", "Offline Storyline Creator backend supplied image-to-video prompts."),
+                ):
+                    _srec = manifest["steps"].get(_step_name) or {}
+                    _srec.update({"status": "done", "fingerprint": plan_fingerprint if _step_name == "Plan (story + constraints)" else shots_fingerprint_local, "note": _note, "ts": time.time()})
+                    manifest["steps"][_step_name] = _srec
+                _safe_write_json(manifest_path, manifest)
+
             def step_plan() -> None:
+                if bool(_planner_use_offline_storyline_creator):
+                    step_offline_storyline_creator()
+                    return
+                if bool(_offline_storyline_expected):
+                    raise RuntimeError(
+                        "Offline Storyline Creator backend was expected but did not activate. "
+                        f"Reason: {_OFFLINE_STORYLINE_BACKEND_ERROR or 'unknown'}"
+                    )
                 # Own storyline: skip Qwen plan and create a lightweight placeholder plan.
                 if bool(_own_storyline_enabled):
                     plan = {
@@ -9600,54 +10091,143 @@ class PipelineWorker(QThread):
                     _plan_shot_hint = 6
                 _plan_section_hint = ", ".join([str(x).title() for x in _story_arc_template_keys(float(getattr(self.job, "approx_duration_sec", 0) or 0.0), int(_plan_shot_hint))])
 
-                # Force JSON-only plan from Qwen with strict visual/stage separation
-                sys_p = (
-                    "You are a planning assistant for an offline video generator. "
-                    "Return ONLY valid JSON. No markdown, no commentary, no code fences. "
-                    "\n\n"
-                    "CRITICAL RULES:\n"
-                    "1. If PROMPT/EXTRA_INFO/OWN_CHARACTERS does not clearly specify animals/creatures/non-human subjects, assume the story is about HUMANS.\n"
-                    "2. Separate STAGE DIRECTIONS (metadata) from VISUAL_DESCRIPTION (what appears on screen)\n"
-                    "3. Characters must include taxonomy detection: set 'taxonomy' to 'human', 'animal', or 'creature'\n"
-                    "4. For animals: use 'species' (e.g., 'Red Fox', 'Snowy Owl') not 'hair/outfit'\n"
-                    "5. visual_description must NEVER contain: 'Camera:', 'Shot:', 'Lighting:', 'Cut to', 'Fade'\n"
-                    "6. visual_description must NEVER contain technical cinematography terms\n"
-                    "7. If you use character names, keep identity consistent in every beat/shot (name + taxonomy/species) and do not change species.\n"
-                    "8. If OWN_CHARACTERS is provided, use ONLY those characters as recurring characters and ensure every beat/shot includes them (do not invent new protagonists)\n"
-                    "9. Every plan MUST include a simple story engine with: who_wants_what, what_blocks_them, what_happens_if_they_fail\n"
-                    "10. Keep arc_sections compact and simple even for longer videos; do not expand into extra long-form sectioning just because duration is higher\n"
-                    "11. Every arc section must say what changes: reveal new info, increase danger, change location, shift emotion, or force a decision\n"
-                    "12. beats should describe progression, not random variety\n"
-                    "\n"
-                    "Example BAD visual_description (will break generation):\n"
-                    "'Camera: static, Lighting: cool. Cut to the scene.'\n"
+                _story_creativity = _planner_story_creativity_profile(self.job.encoding)
+                _own_llama_story = bool(_story_creativity.get('use_own_llama'))
 
-                )
-                user_p = (
-                    "Create a concise but useful story plan and constraints for this video project.\n"
-                    "Requirements:\n"
-                    "- Output MUST be JSON only.\n"
-                    "- Include: title, logline, setting, characters (list), tone, continuity_rules (list), story_engine (object), arc_sections (list), beats (list).\n"
-                    "- story_engine keys: who_wants_what, what_blocks_them, what_happens_if_they_fail.\n"
-                    "- arc_sections item keys: key, label, job, change, emotion_shift.\n"
-                    "- Produce 3-4 arc_sections only; do not expand section count for longer durations.\n"
-                    "- beats should summarize progression across the arc, not just visual variety.\n"
-                    "- Keep it short and actionable for prompt generation.\n\n"
-                    f"PROMPT: {self.job.prompt}\n"
-                    + (f"DEFAULT_SUBJECT_TAXONOMY: {default_taxonomy}\n")
-                    + (f"EXTRA_INFO: {self.job.extra_info}\n" if (self.job.extra_info or '').strip() else "")
-                    + (f"OWN_CHARACTER_BIBLE_ENABLED: true\nOWN_CHARACTERS:\n{_own_prose}\n" if bool(_own_active) else "")
-                    + (f"REFERENCE_GUIDANCE:\n{_refs_guidance_excerpt}\n" if (_refs_guidance_excerpt or '').strip() else "")
-                    + (f"LYRICS_MODE: {_lyrics_mode}\n" if self.job.music_background else "")
-                    + (f"LYRICS_TRANSCRIPT:\n{_transcript_excerpt}\n" if (_lyrics_mode == "lyrics" and (_transcript_excerpt or '').strip()) else "")
-                    + f"TARGET_DURATION_SEC: {self.job.approx_duration_sec}\n"
-                    + f"SHOT_COUNT_HINT: {_plan_shot_hint}\n"
-                    + f"SECTION_LABEL_HINTS: {_plan_section_hint}\n"
-                    + f"AUDIO_MODE: {audio_mode}\n"
-                    + f"VIDEO_MODEL: {self.job.encoding.get('video_model')}\n"
-                    + f"GEN_QUALITY: {self.job.encoding.get('gen_quality_preset')}\n"
-                    + f"GEN_PROFILE: {json.dumps(gen_profile, ensure_ascii=False)}\n"
-                )
+                # Own llama gets a much looser storytelling path. First let it invent a real outline,
+                # then convert that outline into strict planner JSON. This gives bigger models room to
+                # breathe instead of forcing creativity and schema compliance in one pass.
+                plan_outline_raw_path = os.path.join(story_dir, "plan_outline_raw.txt")
+                if _own_llama_story:
+                    outline_sys = (
+                        "You are a strong visual storyteller and screenplay planner for an offline video generator. "
+                        "Write a vivid story outline in plain text. No JSON, no markdown table, no code fences.\n\n"
+                        "Your job is to create an actual story with momentum, escalation, reversals, memorable set pieces, and a satisfying payoff.\n"
+                        "Avoid generic safe filler, flat repetition, moral lectures, and timid scene building.\n"
+                        "Every section must change something meaningful: information, danger, emotion, location, relationship, or strategy.\n"
+                        "Use specific story logic, not vague placeholder beats.\n"
+                        "Keep character identity consistent, but let the plot take real turns.\n"
+                        "If OWN_CHARACTERS is provided, keep them as the recurring core cast and do not invent a replacement protagonist.\n"
+                        "For animals or creatures, preserve taxonomy/species consistency.\n"
+                    )
+                    outline_user = (
+                        "Create a rich freeform story outline for this video project.\n"
+                        "Write plain text only.\n"
+                        "Include these sections in natural prose: title idea, logline, setting, core cast, continuity rules, story engine, arc sections, and beat progression.\n"
+                        "Use 4-6 arc sections depending on duration and complexity.\n"
+                        "Push for a clear hook, build, complication, escalation, decisive turn, and payoff.\n"
+                        "Do not sanitize the idea into blandness unless the prompt itself is bland.\n"
+                        "Make the middle actively progress; do not repeat the setup in different words.\n\n"
+                        f"PROMPT: {self.job.prompt}\n"
+                        + (f"DEFAULT_SUBJECT_TAXONOMY: {default_taxonomy}\n")
+                        + (f"EXTRA_INFO: {self.job.extra_info}\n" if (self.job.extra_info or '').strip() else "")
+                        + (f"OWN_CHARACTER_BIBLE_ENABLED: true\nOWN_CHARACTERS:\n{_own_prose}\n" if bool(_own_active) else "")
+                        + (f"REFERENCE_GUIDANCE:\n{_refs_guidance_excerpt}\n" if (_refs_guidance_excerpt or '').strip() else "")
+                        + (f"LYRICS_MODE: {_lyrics_mode}\n" if self.job.music_background else "")
+                        + (f"LYRICS_TRANSCRIPT:\n{_transcript_excerpt}\n" if (_lyrics_mode == "lyrics" and (_transcript_excerpt or '').strip()) else "")
+                        + f"TARGET_DURATION_SEC: {self.job.approx_duration_sec}\n"
+                        + f"SHOT_COUNT_HINT: {_plan_shot_hint}\n"
+                        + f"SECTION_LABEL_HINTS: {_plan_section_hint}\n"
+                        + f"AUDIO_MODE: {audio_mode}\n"
+                        + f"VIDEO_MODEL: {self.job.encoding.get('video_model')}\n"
+                        + f"GEN_QUALITY: {self.job.encoding.get('gen_quality_preset')}\n"
+                        + f"GEN_PROFILE: {json.dumps(gen_profile, ensure_ascii=False)}\n"
+                    )
+                    outline_raw = _qwen_text_call(
+                        step_name="Plan outline (Own llama freeform)",
+                        system_prompt=outline_sys,
+                        user_prompt=outline_user,
+                        log_path=plan_outline_raw_path,
+                        temperature=float(min(0.98, max(0.55, float(_story_creativity.get('plan_temperature') or 0.78) + 0.06))),
+                        max_new_tokens=int(max(2800, _story_creativity.get('plan_max_new_tokens') or 5200)),
+                        planner_llama_settings=self.job.encoding,
+                    )
+                    _append_prompt_used(qwen_prompts_used, "Plan outline (Own llama freeform)", outline_sys, outline_user)
+
+                    sys_p = (
+                        "You convert a freeform story outline into strict planner JSON for an offline video generator. "
+                        "Return ONLY valid JSON. No markdown, no commentary, no code fences.\n\n"
+                        "Preserve the outline's best ideas, tension, set pieces, and payoff.\n"
+                        "Do not flatten the outline into bland filler.\n"
+                        "Do not invent a replacement protagonist if OWN_CHARACTERS is provided.\n"
+                        "For animals or creatures, preserve taxonomy/species consistency.\n"
+                        "Separate STAGE DIRECTIONS metadata from VISUAL_DESCRIPTION content.\n"
+                    )
+                    user_p = (
+                        "Convert the outline below into planner JSON.\n"
+                        "Output JSON only.\n"
+                        "Include: title, logline, setting, characters (list), tone, continuity_rules (list), story_engine (object), arc_sections (list), beats (list).\n"
+                        "story_engine keys: who_wants_what, what_blocks_them, what_happens_if_they_fail.\n"
+                        "arc_sections item keys: key, label, job, change, emotion_shift.\n"
+                        "Use 4-6 arc_sections depending on duration and complexity.\n"
+                        "beats must show real progression, not random variety.\n"
+                        "Keep the strongest story turns from the outline.\n\n"
+                        f"PROMPT: {self.job.prompt}\n"
+                        + (f"DEFAULT_SUBJECT_TAXONOMY: {default_taxonomy}\n")
+                        + (f"EXTRA_INFO: {self.job.extra_info}\n" if (self.job.extra_info or '').strip() else "")
+                        + (f"OWN_CHARACTER_BIBLE_ENABLED: true\nOWN_CHARACTERS:\n{_own_prose}\n" if bool(_own_active) else "")
+                        + (f"REFERENCE_GUIDANCE:\n{_refs_guidance_excerpt}\n" if (_refs_guidance_excerpt or '').strip() else "")
+                        + (f"LYRICS_MODE: {_lyrics_mode}\n" if self.job.music_background else "")
+                        + (f"LYRICS_TRANSCRIPT:\n{_transcript_excerpt}\n" if (_lyrics_mode == "lyrics" and (_transcript_excerpt or '').strip()) else "")
+                        + f"TARGET_DURATION_SEC: {self.job.approx_duration_sec}\n"
+                        + f"SHOT_COUNT_HINT: {_plan_shot_hint}\n"
+                        + f"SECTION_LABEL_HINTS: {_plan_section_hint}\n"
+                        + f"AUDIO_MODE: {audio_mode}\n"
+                        + f"VIDEO_MODEL: {self.job.encoding.get('video_model')}\n"
+                        + f"GEN_QUALITY: {self.job.encoding.get('gen_quality_preset')}\n"
+                        + f"GEN_PROFILE: {json.dumps(gen_profile, ensure_ascii=False)}\n\n"
+                        + "FREEFORM_OUTLINE:\n"
+                        + str(outline_raw or '').strip()
+                    )
+                else:
+                    # Force JSON-only plan from Qwen with strict visual/stage separation
+                    sys_p = (
+                        "You are a planning assistant for an offline video generator. "
+                        "Return ONLY valid JSON. No markdown, no commentary, no code fences. "
+                        "\n\n"
+                        "CRITICAL RULES:\n"
+                        "1. If PROMPT/EXTRA_INFO/OWN_CHARACTERS does not clearly specify animals/creatures/non-human subjects, assume the story is about HUMANS.\n"
+                        "2. Separate STAGE DIRECTIONS (metadata) from VISUAL_DESCRIPTION (what appears on screen)\n"
+                        "3. Characters must include taxonomy detection: set 'taxonomy' to 'human', 'animal', or 'creature'\n"
+                        "4. For animals: use 'species' (e.g., 'Red Fox', 'Snowy Owl') not 'hair/outfit'\n"
+                        "5. visual_description must NEVER contain: 'Camera:', 'Shot:', 'Lighting:', 'Cut to', 'Fade'\n"
+                        "6. visual_description must NEVER contain technical cinematography terms\n"
+                        "7. If you use character names, keep identity consistent in every beat/shot (name + taxonomy/species) and do not change species.\n"
+                        "8. If OWN_CHARACTERS is provided, use ONLY those characters as recurring characters and ensure every beat/shot includes them (do not invent new protagonists)\n"
+                        "9. Every plan MUST include a simple story engine with: who_wants_what, what_blocks_them, what_happens_if_they_fail\n"
+                        "10. Keep arc_sections compact and simple even for longer videos; do not expand into extra long-form sectioning just because duration is higher\n"
+                        "11. Every arc section must say what changes: reveal new info, increase danger, change location, shift emotion, or force a decision\n"
+                        "12. beats should describe progression, not random variety\n"
+                        "\n"
+                        "Example BAD visual_description (will break generation):\n"
+                        "'Camera: static, Lighting: cool. Cut to the scene.'\n"
+
+                    )
+                    user_p = (
+                        "Create a concise but useful story plan and constraints for this video project.\n"
+                        "Requirements:\n"
+                        "- Output MUST be JSON only.\n"
+                        "- Include: title, logline, setting, characters (list), tone, continuity_rules (list), story_engine (object), arc_sections (list), beats (list).\n"
+                        "- story_engine keys: who_wants_what, what_blocks_them, what_happens_if_they_fail.\n"
+                        "- arc_sections item keys: key, label, job, change, emotion_shift.\n"
+                        "- Produce 3-4 arc_sections only; do not expand section count for longer durations.\n"
+                        "- beats should summarize progression across the arc, not just visual variety.\n"
+                        "- Keep it short and actionable for prompt generation.\n\n"
+                        f"PROMPT: {self.job.prompt}\n"
+                        + (f"DEFAULT_SUBJECT_TAXONOMY: {default_taxonomy}\n")
+                        + (f"EXTRA_INFO: {self.job.extra_info}\n" if (self.job.extra_info or '').strip() else "")
+                        + (f"OWN_CHARACTER_BIBLE_ENABLED: true\nOWN_CHARACTERS:\n{_own_prose}\n" if bool(_own_active) else "")
+                        + (f"REFERENCE_GUIDANCE:\n{_refs_guidance_excerpt}\n" if (_refs_guidance_excerpt or '').strip() else "")
+                        + (f"LYRICS_MODE: {_lyrics_mode}\n" if self.job.music_background else "")
+                        + (f"LYRICS_TRANSCRIPT:\n{_transcript_excerpt}\n" if (_lyrics_mode == "lyrics" and (_transcript_excerpt or '').strip()) else "")
+                        + f"TARGET_DURATION_SEC: {self.job.approx_duration_sec}\n"
+                        + f"SHOT_COUNT_HINT: {_plan_shot_hint}\n"
+                        + f"SECTION_LABEL_HINTS: {_plan_section_hint}\n"
+                        + f"AUDIO_MODE: {audio_mode}\n"
+                        + f"VIDEO_MODEL: {self.job.encoding.get('video_model')}\n"
+                        + f"GEN_QUALITY: {self.job.encoding.get('gen_quality_preset')}\n"
+                        + f"GEN_PROFILE: {json.dumps(gen_profile, ensure_ascii=False)}\n"
+                    )
 
                 parsed, raw = _qwen_json_call(
                     step_name="Plan (Qwen3-VL JSON)",
@@ -9656,8 +10236,8 @@ class PipelineWorker(QThread):
                     raw_path=plan_raw_path,
                     prompts_used_path=qwen_prompts_used,
                     error_path=qwen_plan_err,
-                    temperature=0.35,
-                    max_new_tokens=4000,
+                    temperature=float(_story_creativity.get('plan_temperature') or 0.35),
+                    max_new_tokens=int(_story_creativity.get('plan_max_new_tokens') or 4000),
                     planner_llama_settings=self.job.encoding,
                 )
 
@@ -9756,9 +10336,22 @@ class PipelineWorker(QThread):
                 manifest["steps"]["Plan (story + constraints)"] = srec
                 _safe_write_json(manifest_path, manifest)
 
-            # Idempotency: skip only if plan exists AND fingerprint matches AND last status was done
+            # Resume should trust an existing user-editable plan.json and never silently rewrite it.
+            # If the user deleted downstream prompt files, we can rebuild those later from the existing plan/shots,
+            # but Resume must not regenerate story text just because the fingerprint changed.
             plan_prev = (manifest.get("steps") or {}).get("Plan (story + constraints)") or {}
-            if _file_ok(plan_path, 10) and plan_prev.get("fingerprint") == plan_fingerprint and plan_prev.get("status") == "done":
+            _resume_run = bool((self.job.encoding or {}).get("planner_resume_run"))
+            if _resume_run and _file_ok(plan_path, 10):
+                manifest["paths"]["plan_json"] = plan_path
+                if _file_ok(plan_raw_path, 1):
+                    manifest["paths"]["plan_raw_txt"] = plan_raw_path
+                if _file_ok(qwen_prompts_used, 1):
+                    manifest["paths"]["qwen_prompts_used_txt"] = qwen_prompts_used
+                _skip("Plan (story + constraints)", "Resume: reused existing plan.json")
+                _set_step("Plan (story + constraints)", "done", "Resume: reused existing plan.json")
+                plan_changed = False
+            # Idempotency outside Resume: skip only if plan exists AND fingerprint matches AND last status was done
+            elif _file_ok(plan_path, 10) and plan_prev.get("fingerprint") == plan_fingerprint and plan_prev.get("status") == "done":
                 _skip("Plan (story + constraints)", "plan.json up-to-date (fingerprint match)")
                 plan_changed = False
             else:
@@ -10076,36 +10669,67 @@ class PipelineWorker(QThread):
                     "story_progression must be an object with keys: different_now, harder_now, revealed_now, prepares_payoff. "
                     "CRITICAL: visual_description must be 2-3 sentences of pure visual content with NO technical cinematography terms. It MUST include surroundings: clearly state the setting/location and add 3-7 concrete environmental details (foreground/midground/background cues, materials or objects, time of day, and atmosphere). It MUST NOT contain: Camera:, Shot:, Lighting:, Cut to, Fade. The sequence must follow the plan's story_engine and arc_sections, so the middle never becomes filler. Every section must change something real: reveal new info, increase danger, change location, shift emotion, or force a decision. Every shot must have a clear job such as introduce, build tension, show obstacle, reveal clue, transition, or payoff. Not every shot should keep the protagonist on screen: use environment-only or object-led shots whenever they better establish place, reveal a clue, show an obstacle, or show aftermath. Aim for roughly 20-35% of the shot list to be non-portrait story beats focused on location, clue, path, obstacle, or changed world. Avoid front-facing centered portraits unless the beat specifically needs a reaction or payoff. Default to humans unless the plan/prompt explicitly indicates animals or creatures; do not introduce animal protagonists unless requested." + " If OWN_CHARACTERS is provided, every shot MUST include those characters in subjects and visual_description, and you must not introduce new named protagonists."
                 )
-                user_p = (
-                    "Generate a concise seeded shot list for the plan below.\n"
-                    "Rules:\n"
-                    "- Output MUST be JSON only.\n"
-                    "- Provide exactly 'shots' array with {id, stage_directions, visual_description, subjects, story_section, shot_purpose, story_progression}.\n"
-                    "- stage_directions: {camera, lighting, mood, purpose}\n"
-                    "- story_progression: {different_now, harder_now, revealed_now, prepares_payoff}\n"
-                    "- visual_description: 2-3 sentences of pure visual content, NO technical terms\n- visual_description MUST include setting + surroundings (location plus 3-7 concrete environmental details; include foreground/midground/background cues, time of day, weather/atmosphere, and a distinctive prop/landmark when relevant).\n"
-                    "- Use ids like S01, S02, ... up to the requested count.\n"
-                    "- Keep each shot to ONE clear action and ONE main subject (the subject can be one or two characters if needed).\n"
-                    "- Keep continuity across shots.\n"
-                    "- Follow PLAN_JSON.story_engine and PLAN_JSON.arc_sections.\n"
-                    "- story_section must use the relevant arc section label for that shot.\n"
-                    "- stage_directions.purpose and shot_purpose must describe why the shot exists: introduce, build tension, show obstacle, reveal clue, transition, payoff, or force a decision.\n"
-                    "- Make the middle progress: each section must reveal something, raise pressure, move somewhere new, shift emotion, or force a choice.\n"
-                    "- Across the full shot list, progression must be visible: what changed, what got harder, what was revealed, and what payoff is being prepared next.\n"
-                    "- Do not keep the protagonist visible in every shot; use environment-only or object-led beats when they make the story clearer.\n"
-                    "- Avoid portrait-first wording unless a close emotional beat is really needed.\n\n"
-                    f"REQUESTED_SHOTS: {n_shots}\n"
-                    f"DEFAULT_SUBJECT_TAXONOMY: {default_taxonomy}\n"
-                    f"TARGET_TOTAL_DURATION_SEC: {target_total:.1f}\n"
-                    f"SECTION_LABEL_HINTS: {', '.join([str(x.get('label') or x.get('key') or '') for x in (plan_obj.get('arc_sections') or []) if isinstance(x, dict)])}\n"
-                    f"GEN_PROFILE: {json.dumps(gen_profile, ensure_ascii=False)}\n"
-                    + (f"LYRICS_MODE: {_lyrics_mode}\n" if self.job.music_background else "")
-                    + (f"LYRICS_TRANSCRIPT:\n{_transcript_excerpt}\n" if (_lyrics_mode == "lyrics" and (_transcript_excerpt or '').strip()) else "")
-                    + (f"REFERENCE_GUIDANCE:\n{_refs_guidance_excerpt}\n" if (_refs_guidance_excerpt or '').strip() else "")
-                    + (f"OWN_CHARACTER_BIBLE_ENABLED: true\nOWN_CHARACTERS:\n{_own_prose}\n\nRULES_FOR_OWN_CHARACTERS:\n- Use ONLY these characters as recurring characters.\n- Every shot MUST include them in subjects and visual_description.\n- Do not introduce new named protagonists.\n\n" if bool(_own_active) else "")
-                    + "PLAN_JSON:\n"
-                    + json.dumps(plan_obj, ensure_ascii=False)
-                )
+                _story_creativity = _planner_story_creativity_profile(self.job.encoding)
+                _own_llama_story = bool(_story_creativity.get('use_own_llama'))
+                if _own_llama_story:
+                    user_p = (
+                        "Generate a strong seeded shot list for the plan below.\n"
+                        "Rules:\n"
+                        "- Output MUST be JSON only.\n"
+                        "- Provide exactly 'shots' array with {id, stage_directions, visual_description, subjects, story_section, shot_purpose, story_progression}.\n"
+                        "- stage_directions: {camera, lighting, mood, purpose}\n"
+                        "- story_progression: {different_now, harder_now, revealed_now, prepares_payoff}\n"
+                        "- visual_description must stay pure visual content with no labels like Camera:, Shot:, Lighting:, Cut to, or Fade.\n"
+                        "- Every shot must feel like the next real beat of the story, not a cosmetic variation of the previous one.\n"
+                        "- Let the plot move: reveal something, change power, alter the plan, raise danger, shift emotion, or move to a more charged place.\n"
+                        "- Use strong, memorable set pieces when the idea supports them.\n"
+                        "- Do not keep the protagonist visible in every shot; use environment beats, clue beats, obstacle beats, object beats, or reaction beats when they serve the story better.\n"
+                        "- Keep continuity, but avoid repetition and looping behavior.\n"
+                        "- Keep one main readable beat per shot so image/video generation stays stable.\n"
+                        "- Use ids like S01, S02, ... up to the requested count.\n\n"
+                        f"REQUESTED_SHOTS: {n_shots}\n"
+                        f"DEFAULT_SUBJECT_TAXONOMY: {default_taxonomy}\n"
+                        f"TARGET_TOTAL_DURATION_SEC: {target_total:.1f}\n"
+                        f"SECTION_LABEL_HINTS: {', '.join([str(x.get('label') or x.get('key') or '') for x in (plan_obj.get('arc_sections') or []) if isinstance(x, dict)])}\n"
+                        f"GEN_PROFILE: {json.dumps(gen_profile, ensure_ascii=False)}\n"
+                        + (f"LYRICS_MODE: {_lyrics_mode}\n" if self.job.music_background else "")
+                        + (f"LYRICS_TRANSCRIPT:\n{_transcript_excerpt}\n" if (_lyrics_mode == "lyrics" and (_transcript_excerpt or '').strip()) else "")
+                        + (f"REFERENCE_GUIDANCE:\n{_refs_guidance_excerpt}\n" if (_refs_guidance_excerpt or '').strip() else "")
+                        + (f"OWN_CHARACTER_BIBLE_ENABLED: true\nOWN_CHARACTERS:\n{_own_prose}\n\nRULES_FOR_OWN_CHARACTERS:\n- Use ONLY these characters as recurring characters.\n- Keep them as the core cast across the shot list.\n- Do not introduce a replacement protagonist.\n\n" if bool(_own_active) else "")
+                        + "PLAN_JSON:\n"
+                        + json.dumps(plan_obj, ensure_ascii=False)
+                    )
+                else:
+                    user_p = (
+                        "Generate a concise seeded shot list for the plan below.\n"
+                        "Rules:\n"
+                        "- Output MUST be JSON only.\n"
+                        "- Provide exactly 'shots' array with {id, stage_directions, visual_description, subjects, story_section, shot_purpose, story_progression}.\n"
+                        "- stage_directions: {camera, lighting, mood, purpose}\n"
+                        "- story_progression: {different_now, harder_now, revealed_now, prepares_payoff}\n"
+                        "- visual_description: 2-3 sentences of pure visual content, NO technical terms\n- visual_description MUST include setting + surroundings (location plus 3-7 concrete environmental details; include foreground/midground/background cues, time of day, weather/atmosphere, and a distinctive prop/landmark when relevant).\n"
+                        "- Use ids like S01, S02, ... up to the requested count.\n"
+                        "- Keep each shot to ONE clear action and ONE main subject (the subject can be one or two characters if needed).\n"
+                        "- Keep continuity across shots.\n"
+                        "- Follow PLAN_JSON.story_engine and PLAN_JSON.arc_sections.\n"
+                        "- story_section must use the relevant arc section label for that shot.\n"
+                        "- stage_directions.purpose and shot_purpose must describe why the shot exists: introduce, build tension, show obstacle, reveal clue, transition, payoff, or force a decision.\n"
+                        "- Make the middle progress: each section must reveal something, raise pressure, move somewhere new, shift emotion, or force a choice.\n"
+                        "- Across the full shot list, progression must be visible: what changed, what got harder, what was revealed, and what payoff is being prepared next.\n"
+                        "- Do not keep the protagonist visible in every shot; use environment-only or object-led beats when they make the story clearer.\n"
+                        "- Avoid portrait-first wording unless a close emotional beat is really needed.\n\n"
+                        f"REQUESTED_SHOTS: {n_shots}\n"
+                        f"DEFAULT_SUBJECT_TAXONOMY: {default_taxonomy}\n"
+                        f"TARGET_TOTAL_DURATION_SEC: {target_total:.1f}\n"
+                        f"SECTION_LABEL_HINTS: {', '.join([str(x.get('label') or x.get('key') or '') for x in (plan_obj.get('arc_sections') or []) if isinstance(x, dict)])}\n"
+                        f"GEN_PROFILE: {json.dumps(gen_profile, ensure_ascii=False)}\n"
+                        + (f"LYRICS_MODE: {_lyrics_mode}\n" if self.job.music_background else "")
+                        + (f"LYRICS_TRANSCRIPT:\n{_transcript_excerpt}\n" if (_lyrics_mode == "lyrics" and (_transcript_excerpt or '').strip()) else "")
+                        + (f"REFERENCE_GUIDANCE:\n{_refs_guidance_excerpt}\n" if (_refs_guidance_excerpt or '').strip() else "")
+                        + (f"OWN_CHARACTER_BIBLE_ENABLED: true\nOWN_CHARACTERS:\n{_own_prose}\n\nRULES_FOR_OWN_CHARACTERS:\n- Use ONLY these characters as recurring characters.\n- Every shot MUST include them in subjects and visual_description.\n- Do not introduce new named protagonists.\n\n" if bool(_own_active) else "")
+                        + "PLAN_JSON:\n"
+                        + json.dumps(plan_obj, ensure_ascii=False)
+                    )
                 parsed, raw = _qwen_json_call(
                     step_name="Shots (Qwen3-VL JSON)",
                     system_prompt=sys_p,
@@ -10113,8 +10737,8 @@ class PipelineWorker(QThread):
                     raw_path=shots_raw_path,
                     prompts_used_path=qwen_prompts_used,
                     error_path=qwen_shots_err,
-                    temperature=0.4,
-                    max_new_tokens=5200,
+                    temperature=float(_story_creativity.get('shots_temperature') or 0.4),
+                    max_new_tokens=int(_story_creativity.get('shots_max_new_tokens') or 5200),
                     planner_llama_settings=self.job.encoding,
                 )
 
@@ -10158,7 +10782,7 @@ class PipelineWorker(QThread):
                             system_prompt=retry_sys,
                             user_prompt=retry_user,
                             log_path=retry_log,
-                            temperature=0.25,
+                            temperature=float(_story_creativity.get('retry_temperature') or 0.25),
                             max_new_tokens=int(max(1400, n_shots * 160)),
                             planner_llama_settings=self.job.encoding,
                         )
@@ -10365,7 +10989,17 @@ class PipelineWorker(QThread):
                     _resume_shots = []
 
             # Resume button should trust an existing valid seeded shot list and avoid recomputing it.
-            if _resume_run and _resume_shots:
+            if bool(_planner_use_offline_storyline_creator) and _file_ok(shots_path, 10):
+                manifest["paths"]["shots_json"] = shots_path
+                if _file_ok(shots_raw_path, 1):
+                    manifest["paths"]["shots_raw_txt"] = shots_raw_path
+                try:
+                    manifest.setdefault("settings", {})["n_shots"] = len(_load_shots_list(shots_path))
+                except Exception:
+                    pass
+                _skip("Shots (seeded shot list)", "Offline Storyline Creator backend already wrote shots.json")
+                _set_step("Shots (seeded shot list)", "done", "Offline Storyline Creator backend reused existing shots.json")
+            elif _resume_run and _resume_shots:
                 manifest["paths"]["shots_json"] = shots_path
                 if _file_ok(shots_raw_path, 1):
                     manifest["paths"]["shots_raw_txt"] = shots_raw_path
@@ -10577,7 +11211,12 @@ class PipelineWorker(QThread):
                 _safe_write_json(manifest_path, manifest)
 
 
-            if _planner_use_qwen2511_refs:
+            if bool(_planner_use_offline_storyline_creator) and _file_ok(character_bible_path, 2):
+                manifest.setdefault("paths", {})["character_bible_json"] = character_bible_path
+                _skip("Character Bible", "Offline Storyline Creator backend already wrote character_bible.json")
+                _set_step("Character Bible", "done", "Offline Storyline Creator backend reused character_bible.json")
+
+            elif _planner_use_qwen2511_refs:
                 # Qwen 2511 reference-image runs must rely on storyline + shot prompts only.
                 # A Character Bible injected on top can invent identity details and cause drift.
                 _skip("Character Bible", "Skipped for Qwen2511 ref strategy (use storyline prompts only)")
@@ -11289,9 +11928,18 @@ class PipelineWorker(QThread):
                 manifest["paths"]["image_prompts_txt"] = image_prompts_path
                 _safe_write_json(manifest_path, manifest)
 
-            # Always rebuild image prompts from the current shots.
-            # Reusing stale compiled prompts can preserve bad placeholder output even after the shot list changed.
-            _run("Image prompts (from shots)", step_image_prompts, 44)
+            # Resume must preserve existing txt2img prompts, especially if the user edited them by hand.
+            # Only regenerate when the prompt file is actually missing.
+            if bool(_planner_use_offline_storyline_creator) and _file_ok(image_prompts_path, 10):
+                manifest["paths"]["image_prompts_txt"] = image_prompts_path
+                _skip("Image prompts (from shots)", "Offline Storyline Creator backend already wrote image_prompts.txt")
+                _set_step("Image prompts (from shots)", "done", "Offline Storyline Creator backend reused image_prompts.txt")
+            elif _resume_run and _file_ok(image_prompts_path, 10):
+                manifest["paths"]["image_prompts_txt"] = image_prompts_path
+                _skip("Image prompts (from shots)", "Resume: reused existing image_prompts.txt")
+                _set_step("Image prompts (from shots)", "done", "Resume: reused existing image_prompts.txt")
+            else:
+                _run("Image prompts (from shots)", step_image_prompts, 44)
 
             
                         # Step C2: Render REAL images for all shots using Txt2Img engine selection
@@ -11870,14 +12518,106 @@ class PipelineWorker(QThread):
                     lighting = str(sh.get("lighting", "cinematic lighting") or "cinematic lighting")
                     mood = str(sh.get("mood", "neutral") or "neutral")
 
-                    # Alternative storymode: use the direct Qwen prompt list compiled in step_image_prompts
+                    # Alternative storymode: use the direct Qwen prompt list compiled in step_image_prompts.
+                    # Offline Storyline Creator backend: use the returned T2I prompt EXACTLY as stored.
 
                     __use_own = bool(_own_storyline_enabled)
                     __use_alt = bool(_alt_storymode)
+                    try:
+                        _ms = manifest.get("settings") if isinstance(manifest.get("settings"), dict) else {}
+                    except Exception:
+                        _ms = {}
+                    try:
+                        _rec_auth = shot_map.get(sid) if isinstance(shot_map, dict) and isinstance(shot_map.get(sid), dict) else {}
+                    except Exception:
+                        _rec_auth = {}
+                    __offline_prompt_authority = bool(
+                        _planner_use_offline_storyline_creator
+                        or (str(_ms.get("prompt_authority") or '').strip().lower() == "offline_storyline_creator")
+                        or bool(_ms.get("offline_storyline_creator_active"))
+                        or (str((_rec_auth or {}).get("prompt_authority") or '').strip().lower() == "offline_storyline_creator")
+                        or (str((_rec_auth or {}).get("i2v_schema") or '').find("offline_storyline_creator_raw") >= 0)
+                    )
+                    __use_offline_raw = bool(__offline_prompt_authority) and (not __use_own) and (not __use_alt)
+
+                    if __use_offline_raw:
+                        try:
+                            _rec_off = shot_map.get(sid) if isinstance(shot_map, dict) else {}
+                            if not isinstance(_rec_off, dict):
+                                _rec_off = {}
+                            prompt = str(
+                                _rec_off.get("prompt_user_override")
+                                or _rec_off.get("prompt_used")
+                                or _rec_off.get("prompt_compiled")
+                                or _rec_off.get("prompt_spec")
+                                or ""
+                            ).strip()
+                            negative = str(
+                                _rec_off.get("negative_used")
+                                or _rec_off.get("negative_compiled")
+                                or _rec_off.get("negative_spec")
+                                or self.job.negatives
+                                or ""
+                            ).strip()
+                        except Exception:
+                            prompt = ""
+                            negative = str(self.job.negatives or '').strip()
+
+                        prompt = str(prompt or '').replace("\n", " ").replace("\r", " ").replace("\\n", " ").strip()
+                        prompt = " ".join(prompt.split())
+                        if not prompt:
+                            try:
+                                prompt = str(sh.get("visual_description") or sh.get("seed") or seed_txt or '').strip()
+                            except Exception:
+                                prompt = str(seed_txt or '').strip()
+                            prompt = str(prompt or '').replace("\n", " ").replace("\r", " ").replace("\\n", " ").strip()
+                            prompt = " ".join(prompt.split())
+
+                        negative = _ascii_only(str(negative or ''))
+                        negative = _adjust_text_negatives_csv(negative, bool(wants_text))
+                        negative = _sanitize_negative_list(negative)
+
+                        lint = []
+                        _sg = ""
+
+                        try:
+                            if prompt:
+                                _p1 = str(prompt).replace("\n", " ").strip()
+                                _LOGGER.log_probe(f"t2i_prompt_dispatch {sid}: {_p1}")
+                                try:
+                                    self.signals.log.emit(f"[planner] T2I prompt authority {sid}: offline_storyline_creator")
+                                except Exception:
+                                    pass
+                        except Exception:
+                            pass
+
+                        try:
+                            shot_map2 = manifest.setdefault("shots", {})
+                            rec = shot_map2.get(sid) if isinstance(shot_map2.get(sid), dict) else {}
+                            rec.update({
+                                "id": sid,
+                                "seed": seed_txt,
+                                "seed_int": int(sh.get("seed_int") or _seed_to_int(seed_txt) or 0),
+                                "camera": camera,
+                                "lighting": lighting,
+                                "mood": mood,
+                                "phase": str(sh.get("phase") or ''),
+                                "prompt_used": prompt,
+                                "prompt_compiled": prompt,
+                                "negative_compiled": negative,
+                                "subject_guard": _sg,
+                                "subject_fidelity": _sg,
+                                "negative_used": negative,
+                                "lint": lint,
+                                "ts_prompt": time.time(),
+                            })
+                            shot_map2[sid] = rec
+                        except Exception:
+                            pass
 
                     # Own storyline: use the verbatim prompt blocks compiled in step_image_prompts.
                     # Absolutely no auto prompt assembly in this mode.
-                    if __use_own:
+                    elif __use_own:
                         try:
                             _rec_own = shot_map.get(sid) if isinstance(shot_map, dict) else {}
                             if not isinstance(_rec_own, dict):
@@ -12306,46 +13046,48 @@ class PipelineWorker(QThread):
                     t2i_job = dict(base_job)
 
                     # Force "one image" and override the prompt/seed
-                    # Own Character Bible — codeword-triggered replacement only (no forced global injection)
-                    try:
-                        if (not bool(_own_storyline_enabled)) and bool(_own_active):
-                            prompt = _apply_own_character_codeword_replacements(str(prompt or ''), getattr(self.job, "encoding", {}))
-                    except Exception:
-                        pass
-                    
-                    # Auto Character Bible v2 (hard gate): append identity anchors for the characters present in this shot.
-                    try:
-                        if _auto_cb_v2_enabled(bool(_planner_auto_character_bible_enabled), bool(_own_active), bool(_own_storyline_enabled)):
-                            _cm = _auto_cb_v2_char_map(manifest)
-                            _sb = _auto_cb_v2_bindings(manifest)
-                            _present = []
-                            try:
-                                _present = sh.get("present_characters") if isinstance(sh.get("present_characters"), list) else []
-                            except Exception:
+                    # In Offline Storyline Creator backend mode, planner must NOT rewrite or re-anchor prompts.
+                    if not __use_offline_raw:
+                        # Own Character Bible — codeword-triggered replacement only (no forced global injection)
+                        try:
+                            if bool((getattr(self.job, "encoding", {}) or {}).get("own_character_bible_enabled")) and bool(_own_active):
+                                prompt = _apply_own_character_codeword_replacements(str(prompt or ''), getattr(self.job, "encoding", {}))
+                        except Exception:
+                            pass
+                        
+                        # Auto Character Bible v2 (hard gate): append identity anchors for the characters present in this shot.
+                        try:
+                            if _auto_cb_v2_enabled(bool(_planner_auto_character_bible_enabled), bool(_own_active), bool(_own_storyline_enabled)):
+                                _cm = _auto_cb_v2_char_map(manifest)
+                                _sb = _auto_cb_v2_bindings(manifest)
                                 _present = []
-                            if not _present:
-                                _present = _sb.get(str(sid)) or []
-                            _present = [str(x).strip() for x in (_present or []) if str(x).strip()]
-                            if _present and _cm:
-                                prompt = _auto_cb_v2_append_anchors(str(prompt or ''), _present, _cm, str(base_job.get("engine") or base_job.get("model") or base_job.get("model_id") or base_job.get("pipeline") or ''))
-                    except Exception:
-                        pass
+                                try:
+                                    _present = sh.get("present_characters") if isinstance(sh.get("present_characters"), list) else []
+                                except Exception:
+                                    _present = []
+                                if not _present:
+                                    _present = _sb.get(str(sid)) or []
+                                _present = [str(x).strip() for x in (_present or []) if str(x).strip()]
+                                if _present and _cm:
+                                    prompt = _auto_cb_v2_append_anchors(str(prompt or ''), _present, _cm, str(base_job.get("engine") or base_job.get("model") or base_job.get("model_id") or base_job.get("pipeline") or ''))
+                        except Exception:
+                            pass
 
-                    # Auto Character Bible v2: for clone-prone engines (Z-Image), strengthen negative prompt too.
-                    try:
-                        _eh = str(base_job.get("engine") or base_job.get("model") or base_job.get("model_id") or base_job.get("pipeline") or '').lower()
-                        if ("z-image" in _eh) or ("zimage" in _eh) or ("z_image" in _eh):
-                            _neg_add = "extra people, duplicate person, clone, twin, multiple faces, extra face, extra head"
-                            if isinstance(negative, str) and negative.strip():
-                                if _neg_add.lower() not in negative.lower():
-                                    negative = (negative.strip().rstrip(",") + ", " + _neg_add).strip()
-                            elif isinstance(negative, str):
-                                negative = _neg_add
-                    except Exception:
-                        pass
-
+                        # Auto Character Bible v2: for clone-prone engines (Z-Image), strengthen negative prompt too.
+                        try:
+                            _eh = str(base_job.get("engine") or base_job.get("model") or base_job.get("model_id") or base_job.get("pipeline") or '').lower()
+                            if ("z-image" in _eh) or ("zimage" in _eh) or ("z_image" in _eh):
+                                _neg_add = "extra people, duplicate person, clone, twin, multiple faces, extra face, extra head"
+                                if isinstance(negative, str) and negative.strip():
+                                    if _neg_add.lower() not in negative.lower():
+                                        negative = (negative.strip().rstrip(",") + ", " + _neg_add).strip()
+                                elif isinstance(negative, str):
+                                    negative = _neg_add
+                        except Exception:
+                            pass
 
                     t2i_job["prompt"] = prompt
+                    t2i_job["prompt_authority"] = "offline_storyline_creator" if __use_offline_raw else str(t2i_job.get("prompt_authority") or "planner")
                     t2i_job["negative_prompt"] = negative
                     t2i_job["negative"] = negative
                     t2i_job["neg_prompt"] = negative
@@ -12360,6 +13102,11 @@ class PipelineWorker(QThread):
                             if isinstance(rec2, dict):
                                 rec2["prompt_used"] = str(prompt or '').strip()
                                 rec2["prompt_compiled"] = str(prompt or '').strip()
+                                rec2["prompt_sent"] = str(prompt or '').strip()
+                                rec2["negative_used"] = str(negative or '').strip()
+                                rec2["negative_sent"] = str(negative or '').strip()
+                                if __use_offline_raw:
+                                    rec2["prompt_authority"] = "offline_storyline_creator"
                                 shot_map2[sid] = rec2
                     except Exception:
                         pass
@@ -13212,6 +13959,36 @@ class PipelineWorker(QThread):
                     self._stop_requested = True
                     raise RuntimeError("Cancelled by user.")
 
+            # Resume-only pre-review for existing images:
+            # when Resume asked for it, open the image review BEFORE generating missing images.
+            _resume_pre_review_images_done = False
+            if bool((self.job.encoding or {}).get("planner_resume_review_existing")):
+                try:
+                    _have_existing_images_pre = False
+                    _manifest_pre_img = _safe_read_json(manifest_path) or {}
+                    _paths_pre_img = (_manifest_pre_img.get("paths") or {}) if isinstance(_manifest_pre_img, dict) else {}
+                    _imgs_pre_img = _paths_pre_img.get("images") if isinstance(_paths_pre_img.get("images"), list) else []
+                    for _it_pre_img in _imgs_pre_img:
+                        if isinstance(_it_pre_img, dict):
+                            _fp_pre_img = str(_it_pre_img.get("file") or '').strip()
+                            if _fp_pre_img and os.path.isfile(_fp_pre_img) and os.path.getsize(_fp_pre_img) >= 1024:
+                                _have_existing_images_pre = True
+                                break
+                except Exception:
+                    _have_existing_images_pre = False
+                if _have_existing_images_pre:
+                    self._image_review_gate(
+                        output_dir=self.out_dir,
+                        manifest_path=manifest_path,
+                        images_dir=images_dir,
+                    )
+                    _resume_pre_review_images_done = True
+                    try:
+                        if isinstance(getattr(self.job, "encoding", None), dict):
+                            self.job.encoding["planner_resume_pre_review_images_done"] = True
+                    except Exception:
+                        pass
+
             # Skip if images already exist for all shots
             try:
                 _shots_n = len(_load_shots_list(shots_path))
@@ -13229,8 +14006,12 @@ class PipelineWorker(QThread):
 
             # Review gate after images:
             # - normal interactive review when the setting is enabled
-            # - resume-only pre-review for partial/failed jobs when Resume asked for it
-            if bool((self.job.encoding or {}).get("allow_edit_while_running")) or bool((self.job.encoding or {}).get("planner_resume_review_existing")):
+            # - but if Resume already opened the pre-review for existing images in this pass,
+            #   do not open image review a second time; let the pipeline continue to clips
+            _allow_post_image_review = bool((self.job.encoding or {}).get("allow_edit_while_running"))
+            _resume_wants_image_review = bool((self.job.encoding or {}).get("planner_resume_review_existing"))
+            _resume_pre_review_images_done = bool((self.job.encoding or {}).get("planner_resume_pre_review_images_done")) or _resume_pre_review_images_done
+            if ((_allow_post_image_review or _resume_wants_image_review) and not _resume_pre_review_images_done):
                 self._image_review_gate(
                     output_dir=self.out_dir,
                     manifest_path=manifest_path,
@@ -13340,7 +14121,12 @@ class PipelineWorker(QThread):
                 manifest["shots"] = shot_map
                 _safe_write_json(manifest_path, manifest)
 
-            if _file_ok(i2v_prompts_path, 10) and _file_ok(i2v_prompts_json, 10) and _planner_i2v_prompts_are_current(i2v_prompts_json):
+            if bool(_planner_use_offline_storyline_creator) and _file_ok(i2v_prompts_path, 10) and _file_ok(i2v_prompts_json, 10) and _planner_i2v_prompts_are_current(i2v_prompts_json):
+                manifest["paths"]["i2v_prompts_txt"] = i2v_prompts_path
+                manifest["paths"]["i2v_prompts_json"] = i2v_prompts_json
+                _skip("I2V prompts (from shots)", "Offline Storyline Creator backend already wrote i2v prompts")
+                _set_step("I2V prompts (from shots)", "done", "Offline Storyline Creator backend reused i2v prompt files")
+            elif _file_ok(i2v_prompts_path, 10) and _file_ok(i2v_prompts_json, 10) and _planner_i2v_prompts_are_current(i2v_prompts_json):
                 _skip("I2V prompts (from shots)", "i2v prompts already exist")
             else:
                 _run("I2V prompts (from shots)", step_i2v_prompts, 70)
@@ -13577,12 +14363,7 @@ class PipelineWorker(QThread):
                         # Fallback: basic motion-only prompt
                         prompt = "Slow camera move, subtle parallax, keep subject stable. Match the image exactly."
 
-                    # Own Character Bible — codeword-triggered replacement only (no forced global injection)
-                    try:
-                        if (not bool(_own_storyline_enabled)) and bool(_own_active):
-                            prompt = _apply_own_character_codeword_replacements(str(prompt or ''), getattr(self.job, "encoding", {}))
-                    except Exception:
-                        pass
+                    # Own Character Bible is txt2img-only; do not apply it to image-to-video prompts.
                     img_path = ""
                     if use_last_frame_chain and i > 1:
                         try:
@@ -14776,6 +15557,12 @@ class PipelineWorker(QThread):
                         shots_path=shots_path,
                         images_dir=images_dir,
                     )
+                    try:
+                        if isinstance(getattr(self.job, "encoding", None), dict):
+                            self.job.encoding.pop("planner_resume_review_existing", None)
+                            self.job.encoding.pop("planner_resume_pre_review_images_done", None)
+                    except Exception:
+                        pass
 
             # Run or skip based on selected video model
             mk = _video_model_key(self.job.encoding.get("video_model") or '')
@@ -21146,7 +21933,41 @@ If the planner sees a marker like [02] or (02), it becomes the next image prompt
         grid.addWidget(lbl_transition_lora, 4, 0)
         grid.addWidget(self.chk_use_transition_lora, 4, 1)
 
-        grid.addWidget(QLabel("Videoclip Creator preset"), 5, 0)
+        self.lbl_ltx23_clip_length = QLabel("LTX clip length")
+        self.ltx23_clip_length_row = QWidget()
+        _ltx_clip_row = QHBoxLayout(self.ltx23_clip_length_row)
+        _ltx_clip_row.setContentsMargins(0, 0, 0, 0)
+        _ltx_clip_row.setSpacing(8)
+        self.sld_ltx23_clip_length = QSlider(Qt.Horizontal)
+        try:
+            self.sld_ltx23_clip_length.setSingleStep(1)
+            self.sld_ltx23_clip_length.setPageStep(1)
+            self.sld_ltx23_clip_length.setTickInterval(1)
+            self.sld_ltx23_clip_length.setTickPosition(QSlider.TicksBelow)
+        except Exception:
+            pass
+        self.lbl_ltx23_clip_length_value = QLabel("20 sec")
+        try:
+            _ltx_clip_tip = "LTX only. Sets the target maximum clip length in seconds for each shot. Range follows the active quality preset: Low/Medium up to 20 sec, High up to 14 sec."
+            self.lbl_ltx23_clip_length.setToolTip(_ltx_clip_tip)
+            self.sld_ltx23_clip_length.setToolTip(_ltx_clip_tip)
+            self.lbl_ltx23_clip_length_value.setToolTip(_ltx_clip_tip)
+        except Exception:
+            pass
+        _ltx_clip_row.addWidget(self.sld_ltx23_clip_length, 1)
+        _ltx_clip_row.addWidget(self.lbl_ltx23_clip_length_value, 0)
+        try:
+            self.sld_ltx23_clip_length.valueChanged.connect(self._on_ltx23_clip_length_changed)
+        except Exception:
+            pass
+        grid.addWidget(self.lbl_ltx23_clip_length, 5, 0)
+        grid.addWidget(self.ltx23_clip_length_row, 5, 1)
+        try:
+            self._refresh_ltx23_clip_length_slider()
+        except Exception:
+            pass
+
+        grid.addWidget(QLabel("Videoclip Creator preset"), 6, 0)
         self.cmb_videoclip_preset = QComboBox()
         try:
             self.cmb_videoclip_preset.currentIndexChanged.connect(self._on_videoclip_creator_preset_changed)
@@ -21164,7 +21985,7 @@ If the planner sees a marker like [02] or (02), it becomes the next image prompt
             except Exception:
                 pass
 
-        grid.addWidget(self.cmb_videoclip_preset, 5, 1)
+        grid.addWidget(self.cmb_videoclip_preset, 6, 1)
 
         # External Videoclip Creator: clip order (only visible for JSON presets)
         self.lbl_videoclip_clip_order = QLabel("Clip order")
@@ -21178,8 +21999,8 @@ If the planner sees a marker like [02] or (02), it becomes the next image prompt
             self.cmb_videoclip_clip_order.currentIndexChanged.connect(self._on_videoclip_creator_clip_order_changed)
         except Exception:
             pass
-        grid.addWidget(self.lbl_videoclip_clip_order, 5, 0)
-        grid.addWidget(self.cmb_videoclip_clip_order, 6, 1)
+        grid.addWidget(self.lbl_videoclip_clip_order, 7, 0)
+        grid.addWidget(self.cmb_videoclip_clip_order, 7, 1)
 
         # Safeguard: Videoclip Creator presets are not compatible with Narration.
         self.lbl_videoclip_preset_hint = QLabel("Disable narration to have more presets")
@@ -21192,7 +22013,7 @@ If the planner sees a marker like [02] or (02), it becomes the next image prompt
             self.lbl_videoclip_preset_hint.setVisible(False)
         except Exception:
             pass
-        grid.addWidget(self.lbl_videoclip_preset_hint, 6, 0, 1, 2)
+        grid.addWidget(self.lbl_videoclip_preset_hint, 8, 0, 1, 2)
 
         lbl_last_frame_chain = QLabel("Use last frame as next start image")
         self.chk_use_last_frame_as_next_image = QCheckBox("Enabled")
@@ -21212,8 +22033,8 @@ If the planner sees a marker like [02] or (02), it becomes the next image prompt
             self.chk_use_last_frame_as_next_image.toggled.connect(self._on_toggle_use_last_frame_as_next_image)
         except Exception:
             pass
-        grid.addWidget(lbl_last_frame_chain, 7, 0)
-        grid.addWidget(self.chk_use_last_frame_as_next_image, 7, 1)
+        grid.addWidget(lbl_last_frame_chain, 9, 0)
+        grid.addWidget(self.chk_use_last_frame_as_next_image, 9, 1)
 
         lbl_chain_use_start = QLabel("Use start image")
         self.chk_chain_use_start_image = QCheckBox("Enabled")
@@ -21233,8 +22054,8 @@ If the planner sees a marker like [02] or (02), it becomes the next image prompt
             self.chk_chain_use_start_image.toggled.connect(self._on_toggle_chain_use_start_image)
         except Exception:
             pass
-        grid.addWidget(lbl_chain_use_start, 8, 0)
-        grid.addWidget(self.chk_chain_use_start_image, 8, 1)
+        grid.addWidget(lbl_chain_use_start, 10, 0)
+        grid.addWidget(self.chk_chain_use_start_image, 10, 1)
         self.lbl_chain_use_start_image = lbl_chain_use_start
 
         self.chain_start_image_row = QWidget()
@@ -21962,6 +22783,12 @@ If the planner sees a marker like [02] or (02), it becomes the next image prompt
             "engine_exe": "",
             "model_text": "",
         }
+        try:
+            if bool(self._is_ltx23_video_model_selected()) and hasattr(self, "sld_ltx23_clip_length") and self.sld_ltx23_clip_length is not None:
+                payload["ltx23_clip_length_sec"] = int(self.sld_ltx23_clip_length.value())
+                payload[f"ltx23_clip_length_sec_{self._ltx23_quality_key_ui()}"] = int(self.sld_ltx23_clip_length.value())
+        except Exception:
+            pass
 
         # SeedVR2 detailed settings (only meaningful when selected).
         if engine_key == "seedvr2":
@@ -22737,10 +23564,33 @@ If the planner sees a marker like [02] or (02), it becomes the next image prompt
             enc = {}
         enc.pop("planner_resume_review_existing", None)
 
-        if status in ("partial", "failed"):
+        try:
+            _have_existing_images = False
+            _have_existing_clips = False
+            _paths0 = (manifest.get("paths") or {}) if isinstance(manifest, dict) else {}
+            _imgs0 = _paths0.get("images") if isinstance(_paths0.get("images"), list) else []
+            _clips0 = _paths0.get("clips") if isinstance(_paths0.get("clips"), list) else []
+            for _it0 in _imgs0:
+                if isinstance(_it0, dict):
+                    _fp0 = str(_it0.get("file") or '').strip()
+                    if _fp0 and os.path.isfile(_fp0) and os.path.getsize(_fp0) >= 1024:
+                        _have_existing_images = True
+                        break
+            for _it0 in _clips0:
+                if isinstance(_it0, dict):
+                    _fp0 = str(_it0.get("file") or '').strip()
+                    if _fp0 and os.path.isfile(_fp0) and os.path.getsize(_fp0) >= 1024:
+                        _have_existing_clips = True
+                        break
+        except Exception:
+            _have_existing_images = False
+            _have_existing_clips = False
+
+        if _have_existing_images or _have_existing_clips:
             try:
+                _job_state = "is partial or failed" if status in ("partial", "failed") else "already has existing results"
                 msg = (
-                    "This job is partial or failed.\n\n"
+                    f"This job {_job_state}.\n\n"
                     "Do you want to open the review popups first?\n\n"
                     "Yes = review existing images first, then existing clips, before resume continues.\n"
                     "No = resume normally.\n"
@@ -24193,6 +25043,10 @@ If the planner sees a marker like [02] or (02), it becomes the next image prompt
         except Exception:
             pass
         try:
+            self._refresh_ltx23_clip_length_slider()
+        except Exception:
+            pass
+        try:
             self._update_own_storyline_prompt_preview()
         except Exception:
             pass
@@ -24472,6 +25326,16 @@ If the planner sees a marker like [02] or (02), it becomes the next image prompt
         except Exception:
             pass
         try:
+            if hasattr(self, "lbl_ltx23_clip_length") and self.lbl_ltx23_clip_length is not None:
+                self.lbl_ltx23_clip_length.setVisible(bool(visible))
+        except Exception:
+            pass
+        try:
+            if hasattr(self, "ltx23_clip_length_row") and self.ltx23_clip_length_row is not None:
+                self.ltx23_clip_length_row.setVisible(bool(visible))
+        except Exception:
+            pass
+        try:
             if hasattr(self, "end_image_targets_group") and self.end_image_targets_group is not None:
                 self.end_image_targets_group.setVisible(bool(visible))
         except Exception:
@@ -24479,6 +25343,82 @@ If the planner sees a marker like [02] or (02), it becomes the next image prompt
 
     def _sync_ltx23_end_images_visibility(self) -> None:
         self._sync_ltx23_only_controls_visibility()
+
+    def _ltx23_quality_key_ui(self) -> str:
+        try:
+            gq = str(self.cmb_gen_quality.currentText() or '').strip()
+        except Exception:
+            gq = ""
+        gk = _normalize_key(gq)
+        return gk if gk in _LTX23_PRESETS else "medium"
+
+    def _refresh_ltx23_clip_length_slider(self) -> None:
+        try:
+            gk = self._ltx23_quality_key_ui()
+        except Exception:
+            gk = "medium"
+        preset = dict(_LTX23_PRESETS.get(gk) or _LTX23_PRESETS.get("medium") or {})
+        try:
+            min_sec = int(round(float(preset.get("min_sec") or 4.0)))
+        except Exception:
+            min_sec = 4
+        try:
+            max_sec = int(round(float(preset.get("max_sec") or 20.0)))
+        except Exception:
+            max_sec = 20
+        try:
+            saved = _load_planner_settings() or {}
+        except Exception:
+            saved = {}
+        raw_val = saved.get(f"ltx23_clip_length_sec_{gk}", saved.get("ltx23_clip_length_sec", max_sec))
+        try:
+            cur = int(round(float(raw_val)))
+        except Exception:
+            cur = int(max_sec)
+        cur = max(min_sec, min(max_sec, cur))
+        try:
+            if hasattr(self, "sld_ltx23_clip_length") and self.sld_ltx23_clip_length is not None:
+                self.sld_ltx23_clip_length.blockSignals(True)
+                self.sld_ltx23_clip_length.setMinimum(int(min_sec))
+                self.sld_ltx23_clip_length.setMaximum(int(max_sec))
+                self.sld_ltx23_clip_length.setValue(int(cur))
+                self.sld_ltx23_clip_length.blockSignals(False)
+        except Exception:
+            pass
+        try:
+            if hasattr(self, "lbl_ltx23_clip_length_value") and self.lbl_ltx23_clip_length_value is not None:
+                self.lbl_ltx23_clip_length_value.setText(f"{int(cur)} sec")
+        except Exception:
+            pass
+
+    def _on_ltx23_clip_length_changed(self, value: int) -> None:
+        try:
+            gk = self._ltx23_quality_key_ui()
+        except Exception:
+            gk = "medium"
+        try:
+            preset = dict(_LTX23_PRESETS.get(gk) or _LTX23_PRESETS.get("medium") or {})
+            min_sec = int(round(float(preset.get("min_sec") or 4.0)))
+            max_sec = int(round(float(preset.get("max_sec") or 20.0)))
+        except Exception:
+            min_sec, max_sec = 4, 20
+        cur = max(int(min_sec), min(int(max_sec), int(value or max_sec)))
+        try:
+            if hasattr(self, "lbl_ltx23_clip_length_value") and self.lbl_ltx23_clip_length_value is not None:
+                self.lbl_ltx23_clip_length_value.setText(f"{int(cur)} sec")
+        except Exception:
+            pass
+        try:
+            s = _load_planner_settings()
+            s[f"ltx23_clip_length_sec_{gk}"] = int(cur)
+            s["ltx23_clip_length_sec"] = int(cur)
+            _save_planner_settings(s)
+        except Exception:
+            pass
+        try:
+            self._update_own_storyline_prompt_preview()
+        except Exception:
+            pass
 
     def _sync_end_images_ui(self) -> None:
         try:
@@ -25610,6 +26550,7 @@ If the planner sees a marker like [02] or (02), it becomes the next image prompt
             "gen_quality_preset": (self.cmb_gen_quality.currentText() if hasattr(self, "cmb_gen_quality") else ""),
             "use_20_camera_effects": bool(getattr(self, "chk_use_20_camera_effects", None) and self.chk_use_20_camera_effects.isChecked()),
             "use_transition_lora": bool(getattr(self, "chk_use_transition_lora", None) and self.chk_use_transition_lora.isChecked()),
+            "ltx23_clip_length_sec": int((getattr(self, "sld_ltx23_clip_length", None).value() if (getattr(self, "sld_ltx23_clip_length", None) is not None and self._is_ltx23_video_model_selected()) else 0) or 0),
             "use_end_images_as_last_frames": bool(getattr(self, "chk_use_end_images_as_last_frames", None) and self.chk_use_end_images_as_last_frames.isChecked()),
             "use_last_frame_as_next_image": bool(getattr(self, "chk_use_last_frame_as_next_image", None) and self.chk_use_last_frame_as_next_image.isChecked()),
             "chain_use_start_image": bool(getattr(self, "chk_chain_use_start_image", None) and self.chk_chain_use_start_image.isChecked()),
@@ -25706,6 +26647,16 @@ If the planner sees a marker like [02] or (02), it becomes the next image prompt
         # Important: this must run AFTER planner_upscale is stored so SeedVR2 can
         # lower Hunyuan low/medium from 20fps -> 15fps before the job starts.
         try:
+            try:
+                _pu = dict(enc.get("planner_upscale") or {})
+            except Exception:
+                _pu = {}
+            try:
+                if int(enc.get("ltx23_clip_length_sec") or 0) > 0:
+                    _pu["ltx23_clip_length_sec"] = int(enc.get("ltx23_clip_length_sec") or 0)
+            except Exception:
+                pass
+            enc["planner_upscale"] = _pu
             enc["generation_profile"] = _resolve_generation_profile(
                 enc.get("video_model", ""),
                 enc.get("gen_quality_preset", ""),

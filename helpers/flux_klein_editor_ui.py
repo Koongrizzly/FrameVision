@@ -237,6 +237,62 @@ class ImageView(QtWidgets.QGraphicsView):
         event.accept()
 
 
+class RefImagePreviewDialog(QtWidgets.QDialog):
+    def __init__(self, image_path: str, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle(f"Reference preview – {Path(image_path).name}")
+        self.resize(1000, 760)
+
+        layout = QtWidgets.QVBoxLayout(self)
+        layout.setContentsMargins(8, 8, 8, 8)
+        layout.setSpacing(8)
+
+        self.viewer = ImageView(self)
+        layout.addWidget(self.viewer, 1)
+
+        self.path_label = QtWidgets.QLabel(image_path)
+        self.path_label.setWordWrap(True)
+        self.path_label.setTextInteractionFlags(QtCore.Qt.TextInteractionFlag.TextSelectableByMouse)
+        layout.addWidget(self.path_label)
+
+        btn_row = QtWidgets.QHBoxLayout()
+        self.btn_fit = QtWidgets.QPushButton("Fit")
+        self.btn_actual = QtWidgets.QPushButton("100%")
+        self.btn_open = QtWidgets.QPushButton("Open folder")
+        self.btn_close = QtWidgets.QPushButton("Close")
+        btn_row.addWidget(self.btn_fit)
+        btn_row.addWidget(self.btn_actual)
+        btn_row.addWidget(self.btn_open)
+        btn_row.addStretch(1)
+        btn_row.addWidget(self.btn_close)
+        layout.addLayout(btn_row)
+
+        try:
+            img = Image.open(image_path).convert("RGBA")
+            self.viewer.set_image(img)
+        except Exception as e:
+            QtWidgets.QMessageBox.warning(self, "Preview failed", str(e))
+
+        self.btn_fit.clicked.connect(lambda: self.viewer.fitInView(self.viewer.sceneRect(), QtCore.Qt.AspectRatioMode.KeepAspectRatio))
+        self.btn_actual.clicked.connect(self._reset_zoom)
+        self.btn_open.clicked.connect(lambda: self._open_folder(image_path))
+        self.btn_close.clicked.connect(self.accept)
+
+    def _reset_zoom(self):
+        self.viewer.resetTransform()
+
+    def _open_folder(self, image_path: str):
+        p = Path(image_path)
+        folder = p.parent if p.exists() else p
+        try:
+            if os.name == "nt":
+                os.startfile(str(folder))  # type: ignore[attr-defined]
+            else:
+                subprocess.Popen(["xdg-open", str(folder)])
+        except Exception:
+            pass
+
+
 # -----------------------------
 # Runner thread
 # -----------------------------
@@ -444,6 +500,12 @@ class MainWindow(QtWidgets.QMainWindow):
         ref_layout = QtWidgets.QVBoxLayout(ref_group)
         self.ref_list = QtWidgets.QListWidget()
         self.ref_list.setSelectionMode(QtWidgets.QAbstractItemView.SelectionMode.ExtendedSelection)
+        self.ref_list.setIconSize(QtCore.QSize(110, 110))
+        self.ref_list.setResizeMode(QtWidgets.QListView.ResizeMode.Adjust)
+        self.ref_list.setWordWrap(True)
+        self.ref_list.setSpacing(8)
+        self.ref_list.setMinimumHeight(180)
+        self.ref_list.setContextMenuPolicy(QtCore.Qt.ContextMenuPolicy.CustomContextMenu)
         ref_layout.addWidget(self.ref_list)
 
         btn_row = QtWidgets.QHBoxLayout()
@@ -645,6 +707,8 @@ class MainWindow(QtWidgets.QMainWindow):
         self.btn_clear.clicked.connect(self._clear_refs)
         self.btn_up.clicked.connect(lambda: self._move_ref(-1))
         self.btn_down.clicked.connect(lambda: self._move_ref(1))
+        self.ref_list.itemDoubleClicked.connect(self._preview_ref_item)
+        self.ref_list.customContextMenuRequested.connect(self._show_ref_context_menu)
 
         self.btn_match_first.clicked.connect(self._match_first_ref)
         self.btn_1024.clicked.connect(lambda: self._set_size(1024,1024))
@@ -848,12 +912,120 @@ class MainWindow(QtWidgets.QMainWindow):
         self.width_spin.setValue(w)
         self.height_spin.setValue(h)
 
+    def _make_ref_icon(self, image_path: str) -> QtGui.QIcon:
+        pm = QtGui.QPixmap(110, 110)
+        pm.fill(QtCore.Qt.GlobalColor.transparent)
+        try:
+            with Image.open(image_path) as img:
+                img = img.convert("RGBA")
+                qimg = ImageQt.ImageQt(img)
+                src = QtGui.QPixmap.fromImage(qimg)
+            scaled = src.scaled(106, 106, QtCore.Qt.AspectRatioMode.KeepAspectRatio, QtCore.Qt.TransformationMode.SmoothTransformation)
+            painter = QtGui.QPainter(pm)
+            painter.fillRect(pm.rect(), QtGui.QColor(24, 24, 24))
+            x = int((pm.width() - scaled.width()) / 2)
+            y = int((pm.height() - scaled.height()) / 2)
+            painter.drawPixmap(x, y, scaled)
+            painter.setPen(QtGui.QPen(QtGui.QColor(90, 90, 90)))
+            painter.drawRect(pm.rect().adjusted(0, 0, -1, -1))
+            painter.end()
+        except Exception:
+            painter = QtGui.QPainter(pm)
+            painter.fillRect(pm.rect(), QtGui.QColor(24, 24, 24))
+            painter.setPen(QtGui.QPen(QtGui.QColor(150, 150, 150)))
+            painter.drawRect(pm.rect().adjusted(0, 0, -1, -1))
+            painter.drawText(pm.rect(), QtCore.Qt.AlignmentFlag.AlignCenter, "No preview")
+            painter.end()
+        return QtGui.QIcon(pm)
+
     def _sync_ref_list(self):
         self.ref_list.clear()
         for p in self.cfg.ref_images:
-            self.ref_list.addItem(p)
+            item = QtWidgets.QListWidgetItem(self._make_ref_icon(p), f"{Path(p).name}\n{p}")
+            item.setData(QtCore.Qt.ItemDataRole.UserRole, p)
+            item.setToolTip(p)
+            item.setSizeHint(QtCore.QSize(0, 122))
+            self.ref_list.addItem(item)
         self._update_cmd_preview()
         self._save_settings()
+
+    def _preview_ref_item(self, item: QtWidgets.QListWidgetItem | None = None):
+        if item is None:
+            item = self.ref_list.currentItem()
+        if item is None:
+            return
+        image_path = item.data(QtCore.Qt.ItemDataRole.UserRole) or ""
+        if not image_path:
+            return
+        dlg = RefImagePreviewDialog(str(image_path), self)
+        dlg.exec()
+
+    def _show_ref_context_menu(self, pos: QtCore.QPoint):
+        item = self.ref_list.itemAt(pos)
+        menu = QtWidgets.QMenu(self)
+
+        if item is not None:
+            self.ref_list.setCurrentItem(item)
+            image_path = str(item.data(QtCore.Qt.ItemDataRole.UserRole) or "")
+
+            act_preview = menu.addAction("Preview")
+            act_open_folder = menu.addAction("Open folder")
+            act_open_with = menu.addAction("Open with…")
+            menu.addSeparator()
+            act_remove = menu.addAction("Remove")
+            act_remove_selected = menu.addAction("Remove selected")
+
+            chosen = menu.exec(self.ref_list.viewport().mapToGlobal(pos))
+            if chosen == act_preview:
+                self._preview_ref_item(item)
+            elif chosen == act_open_folder:
+                self._open_ref_folder(image_path)
+            elif chosen == act_open_with:
+                self._open_ref_with(image_path)
+            elif chosen == act_remove:
+                row = self.ref_list.row(item)
+                if 0 <= row < len(self.cfg.ref_images):
+                    self.cfg.ref_images.pop(row)
+                    self._sync_ref_list()
+            elif chosen == act_remove_selected:
+                self._remove_selected_refs()
+            return
+
+        act_add = menu.addAction("Add…")
+        if self.ref_list.count() > 0:
+            act_clear = menu.addAction("Clear all")
+        else:
+            act_clear = None
+
+        chosen = menu.exec(self.ref_list.viewport().mapToGlobal(pos))
+        if chosen == act_add:
+            self._add_refs()
+        elif act_clear is not None and chosen == act_clear:
+            self._clear_refs()
+
+    def _open_ref_folder(self, image_path: str):
+        p = Path(image_path)
+        folder = p.parent if p.exists() else p
+        try:
+            if os.name == "nt":
+                os.startfile(str(folder))  # type: ignore[attr-defined]
+            else:
+                subprocess.Popen(["xdg-open", str(folder)])
+        except Exception as e:
+            QtWidgets.QMessageBox.warning(self, "Open folder failed", str(e))
+
+    def _open_ref_with(self, image_path: str):
+        p = Path(image_path)
+        if not p.exists():
+            QtWidgets.QMessageBox.information(self, "Missing file", f"File not found:\n{image_path}")
+            return
+        try:
+            if os.name == "nt":
+                subprocess.Popen(["rundll32.exe", "shell32.dll,OpenAs_RunDLL", str(p)])
+            else:
+                subprocess.Popen(["xdg-open", str(p)])
+        except Exception as e:
+            QtWidgets.QMessageBox.warning(self, "Open with failed", str(e))
 
     def _add_refs(self):
         files, _ = QtWidgets.QFileDialog.getOpenFileNames(
