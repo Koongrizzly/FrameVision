@@ -5,6 +5,7 @@
 Main installer uses Python 3.11 and will instal this together with GIT and other needed tools 
 if you don't have them. 
 If you want to avoid this, install the app inside a conda environment.
+
 RTX graphics card with at least 8 gigabyte of vram is advised, some models need 24 gig vram without ofloading.
 ---
 
