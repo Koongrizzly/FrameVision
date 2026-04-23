@@ -344,7 +344,6 @@ Music Video Clip Creator_
 - [ ] fade in/out with on/off toggle
 - [ ] Built-in detector for auto selection of segments and energy peaks.
 - [ ] Transitions with selection and randomization of favorites.
-- [ ] Auto Ken Burns–style motion for images (+ extra settings for video).
 - [ ] Global brightness/contrast/saturation normalization for smooth flow.
 - [ ] Aspect ratios: 16:9 or 9:16 with Source, Fill (auto-crop), or Stretch modes.
 - [ ] Multiple output resolutions supported.(source/lowest/highest + fixed 480/720/1080)
