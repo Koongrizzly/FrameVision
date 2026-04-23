@@ -25174,9 +25174,9 @@ If the planner sees a marker like [02] or (02), it becomes the next image prompt
             on = bool(getattr(self, "_use_framevision_queue", True))
         try:
             if on:
-                self.lbl_queue_mode_note.setText("Some 'Cancel' features are disabled when using the FrameVision queue.")
+                self.lbl_queue_mode_note.setText("Closing framevision will also close the job in the queue. Cancel while using review workflow is disabled.")
             else:
-                self.lbl_queue_mode_note.setText("Using internal Planner queue, all 'Cancel' features are enabled.")
+                self.lbl_queue_mode_note.setText("Using internal Planner queue, all features are enabled.")
         except Exception:
             pass
 
