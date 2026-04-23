@@ -69,8 +69,7 @@ End-to-end creation (idea → finished video)
 
 Automated story & character control
 - 📖 Character Bible: define up to 2 detailed characters used across story + prompts
-- 🧩 Own Storyline mode: paste your own numbered beats ((01)…(02)…); each becomes the next beat
-- Disables automatic character-bible/storyline creation so your manual story stays in control
+- 🧩 Own Storyline mode: paste your own numbered beats ((01)…(02)…); each becomes the next beat (Disables automatic character-bible/storyline creation so your manual story stays in control)
 - 🛡️ Alternative Storyline mode: safer story mode for animals/aliens/creatures to reduce “too human” drift (hands, faces, body language)
 
 Reference / identity mode (character consistency strategy)
