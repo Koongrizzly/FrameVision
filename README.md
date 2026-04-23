@@ -2,6 +2,8 @@
 **All-in-one Sound/Image/Video Tool**  
 *Create, Upscale, edit, describe, play — in one streamlined app.*
 ---
+Main installer uses Python 3.11 and will instal this (when using the together with GIT and other needed tools if you don't have them
+If you want to avoid this, install the app inside a conda environment.
 ---
 
 <details>
