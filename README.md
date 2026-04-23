@@ -96,7 +96,7 @@ Narration + music + final assembly
 
 Results / History + Resume (core workflow)
 - 🗂️ Results browser / job history for finished, failed, and cancelled runs
-- ▶️ Resume button continues the pipeline from where it stopped
+- ▶️ Resume button continues the pipeline from where it stopped (or edit finished results)
 
 
 🎶 Ace Step 1.5 — Music Creation
