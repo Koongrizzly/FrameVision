@@ -4681,6 +4681,148 @@ def hiar_generate(job, cfg, mani):
 
 
 
+def _hidream_runner_supports_option(runner_path: str, option: str) -> bool:
+    try:
+        return bool(runner_path and option and option in Path(runner_path).read_text(encoding='utf-8', errors='ignore'))
+    except Exception:
+        return False
+
+
+def hidream_generate(job, cfg, mani):
+    """Run a HiDream BF16 queued job by invoking run_hidream.py directly."""
+    import time as _time
+    from pathlib import Path as _P
+
+    try:
+        args = job.get('args') or {}
+    except Exception:
+        args = {}
+
+    model_key = str(args.get('model_key') or 'base').strip() or 'base'
+    prompt = str(args.get('prompt') or '').strip()
+    settings = args.get('settings') or {}
+    refs = args.get('refs') or []
+    if isinstance(refs, str):
+        refs = [refs]
+    refs = [str(x).strip() for x in refs if str(x).strip()]
+    keep_original_aspect = bool(args.get('keep_original_aspect') or False)
+
+    try:
+        out_file = str(args.get('output_path') or args.get('out_file') or args.get('outfile') or '').strip()
+        if not out_file:
+            out_file = str(_P(job.get('out_dir') or (ROOT / 'models' / 'hidream_bf16' / 'results')) / f'hidream_{model_key}_{int(_time.time())}.png')
+    except Exception:
+        out_file = str(_P(ROOT / 'models' / 'hidream_bf16' / 'results') / f'hidream_{model_key}_{int(_time.time())}.png')
+
+    out_path = _P(out_file)
+    out_dir = out_path.parent
+    try:
+        out_dir.mkdir(parents=True, exist_ok=True)
+    except Exception:
+        pass
+
+    env_python = str(args.get('env_python') or (ROOT / 'environments' / '.hidream_dev' / 'python.exe')).strip()
+    runner = str(args.get('runner') or (ROOT / 'models' / 'hidream_bf16' / 'run_hidream.py')).strip()
+    if not _P(env_python).exists():
+        _mark_error(job, f'HiDream env python not found: {env_python}')
+        return 2
+    if not _P(runner).exists():
+        _mark_error(job, f'HiDream runner not found: {runner}')
+        return 2
+    if not prompt:
+        _mark_error(job, 'HiDream prompt is empty.')
+        return 2
+    for rp in refs:
+        if not _P(rp).is_file():
+            _mark_error(job, 'HiDream reference image not found: ' + rp)
+            return 2
+
+    def _sg(name, default):
+        try:
+            value = settings.get(name, default)
+            return value
+        except Exception:
+            return default
+
+    cmd = [
+        env_python, '-u', runner,
+        '--model_key', model_key,
+        '--width', str(int(_sg('width', 1280))),
+        '--height', str(int(_sg('height', 720))),
+        '--steps', str(int(_sg('steps', 28))),
+        '--guidance_scale', str(float(_sg('guidance_scale', 0.0))),
+        '--shift', str(float(_sg('shift', 1.0))),
+        '--seed', str(int(_sg('seed', -1))),
+        '--scheduler_name', str(_sg('scheduler_name', 'flash')),
+        '--timesteps', str(_sg('timesteps', 'none')),
+        '--noise_scale_start', str(float(_sg('noise_scale_start', 7.5))),
+        '--noise_scale_end', str(float(_sg('noise_scale_end', 7.5))),
+        '--noise_clip_std', str(float(_sg('noise_clip_std', 2.5))),
+        '--output_image', str(out_path),
+        '--prompt', prompt,
+    ]
+
+    offload = settings.get('offload_settings', {}) if isinstance(settings.get('offload_settings'), dict) else {}
+    try_auto_offload = bool(offload.get('try_auto_cpu_offload', False))
+    if _hidream_runner_supports_option(runner, '--device_map'):
+        if try_auto_offload:
+            try:
+                offload_folder = _P(str(offload.get('offload_folder') or (ROOT / 'temp' / 'hidream_offload'))).expanduser()
+                offload_folder.mkdir(parents=True, exist_ok=True)
+            except Exception:
+                offload_folder = _P(ROOT / 'temp' / 'hidream_offload')
+            cmd.extend(['--device_map', 'auto', '--offload_folder', str(offload_folder)])
+        else:
+            cmd.extend(['--device_map', 'cuda'])
+
+    negative_prompt = str(_sg('negative_prompt', '') or '').strip()
+    if model_key == 'base' and negative_prompt and _hidream_runner_supports_option(runner, '--negative_prompt'):
+        cmd.extend(['--negative_prompt', negative_prompt])
+
+    if refs:
+        cmd.extend(['--ref_images', *refs])
+    if keep_original_aspect:
+        cmd.append('--keep_original_aspect')
+
+    try:
+        title = str(args.get('label') or f'HiDream {model_key}').strip()
+        job['title'] = title
+        job['label'] = title
+        args['label'] = title
+        args['cmd'] = cmd
+        args['outfile'] = str(out_path)
+        args['out_file'] = str(out_path)
+        job['args'] = args
+        job['backend'] = 'hidream'
+        job['model'] = model_key
+    except Exception:
+        pass
+
+    try:
+        print('[worker][hidream] CMD:', ' '.join([str(x) for x in cmd]))
+    except Exception:
+        pass
+    try:
+        _progress_set(2)
+    except Exception:
+        pass
+    code = run(cmd)
+    if code == 130:
+        _note_cancel('Cancelled by user')
+        return 130
+    if code != 0:
+        _mark_error(job, f'HiDream failed (code {code}).')
+        return int(code or 1)
+    if not out_path.exists():
+        _mark_error(job, f'HiDream finished but output file is missing: {out_path}')
+        return 1
+    try:
+        _progress_set(100)
+    except Exception:
+        pass
+    return 0
+
+
 def qwentts_generate(job, cfg, mani):
     """Run a queued Qwen TTS job by invoking qwentts_ui.py in --worker mode."""
     import subprocess as _subprocess
@@ -4870,6 +5012,8 @@ def handle_job(jpath: Path):
             code = heartmula_generate(job, cfg, mani)
         elif t in ("qwentts_generate","qwen_tts","qwen3tts"):
             code = qwentts_generate(job, cfg, mani)
+        elif t in ("hidream_generate","hidream","hidream_bf16"):
+            code = hidream_generate(job, cfg, mani)
         elif t in ('planner_lock',):
             code = planner_lock(job, cfg, mani)
         else:

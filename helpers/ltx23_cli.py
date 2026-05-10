@@ -91,10 +91,9 @@ def _find_conda_bat() -> str:
 
 
 
-def _build_wangp_launch(args: argparse.Namespace, wangp_root: str, wgp_py: str, settings_json: str, output_dir: str) -> Tuple[List[str], bool, List[str], str]:
+def _wangp_cli_args(args: argparse.Namespace, settings_json: str, output_dir: str) -> List[str]:
+    """Arguments that must be passed to WanGP's wgp.py for headless processing."""
     cmd_tail: List[str] = [
-        'python',
-        wgp_py,
         '--process', settings_json,
         '--output-dir', output_dir,
     ]
@@ -106,17 +105,94 @@ def _build_wangp_launch(args: argparse.Namespace, wangp_root: str, wgp_py: str, 
         cmd_tail.append('--fp16')
     if args.verbose is not None:
         cmd_tail += ['--verbose', str(int(args.verbose))]
+    return cmd_tail
 
-    if args.wangp_python:
-        python_exe = _norm(args.wangp_python)
+
+def _wangp_setup_available(wangp_root: str) -> bool:
+    root = Path(str(wangp_root or ''))
+    return (root / 'setup.py').is_file() and (root / 'envs.json').is_file()
+
+
+def _wangp_active_env_label(wangp_root: str) -> str:
+    try:
+        envs_path = Path(wangp_root) / 'envs.json'
+        obj = json.loads(envs_path.read_text(encoding='utf-8'))
+        active = str(obj.get('active') or '').strip()
+        envs = obj.get('envs') if isinstance(obj.get('envs'), dict) else {}
+        data = envs.get(active) if active and isinstance(envs.get(active), dict) else {}
+        typ = str(data.get('type') or '').strip()
+        path = str(data.get('path') or '').strip()
+        if active and typ and path:
+            return f"setup.py run active env: {active} ({typ}) {path}"
+        if active:
+            return f"setup.py run active env: {active}"
+    except Exception:
+        pass
+    return 'setup.py run active env'
+
+
+def _write_wangp_args_txt(wangp_root: str, cli_args: List[str]) -> Tuple[str, bool, bytes]:
+    """Temporarily write scripts/args.txt for WanGP's new setup.py runner.
+
+    The new WanGP installer launches through `python setup.py run`, which reads
+    scripts/args.txt and appends it to `wgp.py`. We replace it only while the
+    Planner clip is running, then restore the user's original file.
+    """
+    scripts_dir = Path(wangp_root) / 'scripts'
+    scripts_dir.mkdir(parents=True, exist_ok=True)
+    args_path = scripts_dir / 'args.txt'
+    existed = args_path.exists()
+    old_data = b''
+    if existed:
+        try:
+            old_data = args_path.read_bytes()
+        except Exception:
+            old_data = b''
+    args_line = subprocess.list2cmdline(cli_args).strip()
+    args_path.write_text(args_line + '\n', encoding='utf-8')
+    return str(args_path), existed, old_data
+
+
+def _restore_wangp_args_txt(args_path: str, existed: bool, old_data: bytes) -> None:
+    try:
+        p = Path(args_path)
+        if existed:
+            p.write_bytes(old_data or b'')
+        else:
+            try:
+                p.unlink()
+            except FileNotFoundError:
+                pass
+    except Exception:
+        pass
+
+
+def _build_wangp_launch(args: argparse.Namespace, wangp_root: str, wgp_py: str, settings_json: str, output_dir: str) -> Tuple[List[str], bool, List[str], str, str, List[str]]:
+    cli_args = _wangp_cli_args(args, settings_json, output_dir)
+    launch_mode = str(getattr(args, 'launch_mode', 'auto') or 'auto').strip().lower()
+
+    if args.wangp_python or launch_mode == 'direct':
+        python_exe = _norm(args.wangp_python) if args.wangp_python else sys.executable
         if not os.path.isfile(python_exe):
             raise FileNotFoundError(f"WanGP python not found: {args.wangp_python}")
-        return [python_exe] + cmd_tail[1:], False, [python_exe], python_exe
+        return [python_exe, wgp_py] + cli_args, False, [python_exe], python_exe, 'direct', []
+
+    # New WanGP installer path: setup.py owns the active env (venv/uv/conda) via envs.json.
+    # It appends scripts/args.txt to wgp.py, so use that instead of forcing the old `wan2gp` conda env.
+    if launch_mode in ('auto', 'setup') and _wangp_setup_available(wangp_root):
+        setup_py = str((Path(wangp_root) / 'setup.py').resolve())
+        runner_bat = str((Path(wangp_root) / 'scripts' / 'run.bat').resolve())
+        desc = f'{sys.executable} setup.py run  (via scripts/args.txt; runner ref: {runner_bat})'
+        return [sys.executable, setup_py, 'run'], False, [desc], _wangp_active_env_label(wangp_root), 'setup', cli_args
+
+    if launch_mode == 'setup':
+        raise FileNotFoundError(f"WanGP setup runner not available. Expected setup.py and envs.json in: {wangp_root}")
 
     conda_bat = _find_conda_bat()
     if not conda_bat:
         raise FileNotFoundError('Could not find conda.bat needed to launch WanGP via the wan2gp environment.')
 
+    cmd_tail: List[str] = ['python', wgp_py] + cli_args
     quoted_tail = subprocess.list2cmdline(cmd_tail)
     run_cmd = (
         f'call "{conda_bat}" activate wan2gp '
@@ -127,7 +203,7 @@ def _build_wangp_launch(args: argparse.Namespace, wangp_root: str, wgp_py: str, 
         f'&& {quoted_tail}'
     )
     launcher_desc = f'cmd.exe /d /c call "{conda_bat}" activate wan2gp && cd /d "{wangp_root}" && python {Path(wgp_py).name} ...'
-    return [run_cmd], True, [launcher_desc], 'wan2gp (via conda activate)'
+    return [run_cmd], True, [launcher_desc], 'wan2gp (via conda activate)', 'conda', []
 
 
 def _find_generated_video(output_dir: str, started_at: float, requested_out: str = "") -> str:
@@ -403,7 +479,7 @@ def _run_wangp_generate(args: argparse.Namespace) -> int:
         settings_json = os.path.join(td, "ltx23_task.json")
         _safe_write_json(settings_json, payload)
 
-        launch_cmd, launch_shell, tried_launches, python_exe = _build_wangp_launch(
+        launch_cmd, launch_shell, tried_launches, python_exe, launch_mode, setup_cli_args = _build_wangp_launch(
             args=args,
             wangp_root=wangp_root,
             wgp_py=wgp_py,
@@ -441,10 +517,19 @@ def _run_wangp_generate(args: argparse.Namespace) -> int:
         child_env.setdefault("PYTHONUTF8", "1")
         child_env.setdefault("PYTHONIOENCODING", "utf-8")
         child_env.setdefault("PYTHONLEGACYWINDOWSSTDIO", "0")
-        if launch_shell:
-            cp = subprocess.run(launch_cmd[0], cwd=wangp_root, check=False, shell=True, env=child_env)
-        else:
-            cp = subprocess.run(launch_cmd, cwd=wangp_root, check=False, env=child_env)
+        args_backup: Optional[Tuple[str, bool, bytes]] = None
+        try:
+            if launch_mode == 'setup':
+                args_backup = _write_wangp_args_txt(wangp_root, setup_cli_args)
+                print(f"[ltx23_cli] Wrote temporary WanGP scripts/args.txt: {args_backup[0]}")
+            if launch_shell:
+                cp = subprocess.run(launch_cmd[0], cwd=wangp_root, check=False, shell=True, env=child_env)
+            else:
+                cp = subprocess.run(launch_cmd, cwd=wangp_root, check=False, env=child_env)
+        finally:
+            if args_backup is not None:
+                _restore_wangp_args_txt(*args_backup)
+                print("[ltx23_cli] Restored WanGP scripts/args.txt")
         if cp.returncode != 0:
             raise RuntimeError(f"WanGP returned non-zero exit code: {cp.returncode}")
 
@@ -474,6 +559,7 @@ def _make_parser() -> argparse.ArgumentParser:
     g.add_argument("--wangp-root", required=True, help="Path to the WanGP root folder")
     g.add_argument("--wangp-python", default="", help="Path to WanGP's python.exe; auto-guessed when omitted")
     g.add_argument("--wgp-py", default="", help="Optional explicit path to WanGP wgp.py")
+    g.add_argument("--launch-mode", choices=["auto", "setup", "conda", "direct"], default="auto", help="WanGP launch mode. auto prefers the new setup.py/envs.json runner, then falls back to old conda mode.")
     g.add_argument("--settings-template", default="", help="Optional WanGP settings JSON to use as a template")
     g.add_argument("--lora-file", default="", help="Optional LoRA safetensors to activate for this run")
     g.add_argument("--lora-json", default="", help="Optional companion JSON. WanGP settings JSON is merged; workflow JSON is stored as transition metadata/hints")

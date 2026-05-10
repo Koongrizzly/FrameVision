@@ -713,6 +713,31 @@ def _run_qwen2511_q8(root: Path) -> Optional[Tuple[str, List[str], Path]]:
     return _run_qwen2511_gguf(root, "Q8_0")
 
 
+
+
+def _run_hidream_edit(root: Path, models: str) -> Optional[Tuple[str, List[str], Path]]:
+    """Install HiDream Image Edit BF16 environment/repo and selected model(s)."""
+    script = root / "presets" / "extra_env" / "hidream_install.py"
+    if not script.exists():
+        return None
+    py = _venv_python(root)
+    if py is None or (not py.exists()):
+        return None
+    args = ["-u", str(script), "--models", str(models), "--no-prompt"]
+    return (str(py), args, root)
+
+
+def _run_hidream_edit_base(root: Path) -> Optional[Tuple[str, List[str], Path]]:
+    return _run_hidream_edit(root, "base")
+
+
+def _run_hidream_edit_dev(root: Path) -> Optional[Tuple[str, List[str], Path]]:
+    return _run_hidream_edit(root, "dev")
+
+
+def _run_hidream_edit_both(root: Path) -> Optional[Tuple[str, List[str], Path]]:
+    return _run_hidream_edit(root, "both")
+
 def _run_sdxl_juggernaut(root: Path) -> Optional[Tuple[str, List[str], Path]]:
     script = root / "scripts" / "download_sd_models.py"
     py = _venv_python(root)
@@ -955,6 +980,24 @@ OptionalInstall(
             title="Hiar wan 2.1 long format Video",
             description="Experimental model for long consistency, about 20 gigabyte for model + repo. Enabling this optional install checks existing files and installs/downloads everything needed to get started.",
             runner=_run_hiar,
+        ),
+        OptionalInstall(
+            key="hidream_edit_base",
+            title="HiDream Image Edit BF16 (Base / Full)",
+            description="HiDream image edit model. Installs/reuses environments/.hidream_dev, the official repo, and downloads only the Base / Full BF16 model when missing.",
+            runner=_run_hidream_edit_base,
+        ),
+        OptionalInstall(
+            key="hidream_edit_dev",
+            title="HiDream Image Edit BF16 (Dev)",
+            description="HiDream image edit model. Installs/reuses environments/.hidream_dev, the official repo, and downloads only the Dev BF16 model when missing.",
+            runner=_run_hidream_edit_dev,
+        ),
+        OptionalInstall(
+            key="hidream_edit_both",
+            title="HiDream Image Edit BF16 (Base + Dev)",
+            description="Installs/reuses the HiDream environment/repo and downloads both Base / Full BF16 and Dev BF16 models, skipping files that already exist.",
+            runner=_run_hidream_edit_both,
         ),
         OptionalInstall(
             key="qwen2512",
@@ -1346,6 +1389,9 @@ _ENV_DIR_BY_KEY = {
     "seedvr2_env": Path("environments") / ".seedvr2",
     "wan22": Path(".wan_venv"),
     "zimage": Path(".zimage_env"),
+    "hidream_edit_base": Path("environments") / ".hidream_dev",
+    "hidream_edit_dev": Path("environments") / ".hidream_dev",
+    "hidream_edit_both": Path("environments") / ".hidream_dev",
     "sdxl_inpaint_env": Path(".sdxl_inpaint"),
     # Not on the UI list yet, but reserved for future use.
     "comfui": Path(".comfui_env"),
@@ -1614,10 +1660,11 @@ class OptionalInstallsDialog(QtWidgets.QDialog):
             is_qwen3tts_extra = opt.key.startswith("qwen3tts_") and opt.key != "qwen3tts"
             is_seedvr2_extra = opt.key.startswith("seedvr2_gguf_")
             is_hunyuan15_extra = opt.key.startswith("hunyuan15_") and opt.key != "hunyuan15"
+            is_hidream_extra = opt.key.startswith("hidream_edit_")
 
             row = _OptionRow(
                 opt,
-                indent=(26 if (is_zimage_extra or is_qwen_extra or is_qwen3tts_extra or is_seedvr2_extra or is_hunyuan15_extra) else 0),
+                indent=(26 if (is_zimage_extra or is_qwen_extra or is_qwen3tts_extra or is_seedvr2_extra or is_hunyuan15_extra or is_hidream_extra) else 0),
             )
 
             if is_zimage_extra:
@@ -1630,6 +1677,8 @@ class OptionalInstallsDialog(QtWidgets.QDialog):
                 row.toggled.connect(lambda checked, k=opt.key: self._on_qwen3tts_model_toggled(k, checked))
             if opt.key.startswith("firered_"):
                 row.toggled.connect(lambda checked, k=opt.key: self._on_firered_model_toggled(k, checked))
+            if opt.key.startswith("hidream_edit_"):
+                row.toggled.connect(lambda checked, k=opt.key: self._on_hidream_edit_model_toggled(k, checked))
 
             if is_seedvr2_extra:
                 row.toggled.connect(lambda checked, k=opt.key: self._on_seedvr2_model_toggled(k, checked))
@@ -1661,6 +1710,18 @@ class OptionalInstallsDialog(QtWidgets.QDialog):
 
         # ---- Image models
         opts_lay.addWidget(_mk_section_label("Image models"))
+
+        # HiDream Image Edit group (collapsible)
+        hidream_sec = _CollapsibleSection("HiDream Image Edit", start_collapsed=True)
+        hidream_lay = hidream_sec.layout_content()
+
+        _add_group_label("BF16 models (choose one)", hidream_lay)
+        for k in ("hidream_edit_base", "hidream_edit_dev", "hidream_edit_both"):
+            opt = by_key.get(k)
+            if opt:
+                _add_opt(opt, hidream_lay)
+
+        opts_lay.addWidget(hidream_sec)
 
         # Qwen group (collapsible)
         qwen_sec = _CollapsibleSection("Qwen models", start_collapsed=True)
@@ -1824,7 +1885,7 @@ class OptionalInstallsDialog(QtWidgets.QDialog):
         self.auto_continue_chk = QtWidgets.QCheckBox('Auto-continue when installer says "Press any key to continue"')
         self.auto_continue_chk.setChecked(True)
         self.auto_continue_chk.setToolTip(
-            "Some .bat installers call PAUSE, which can hang in this embedded log.\n"
+            "Some installers call PAUSE or ask you to press a key/button, which can hang in this embedded log.\n"
             "When enabled, FrameVision will try to auto-send Enter to continue."
         )
 
@@ -1992,9 +2053,16 @@ class OptionalInstallsDialog(QtWidgets.QDialog):
             if not self.auto_continue_chk.isChecked():
                 return
             s = (text_line or "").lower()
-            if "press any key to continue" in s:
+            pause_markers = (
+                "press any key to continue",
+                "press a button to continue",
+                "press enter to continue",
+                "press return to continue",
+                "hit any key to continue",
+            )
+            if any(marker in s for marker in pause_markers):
                 self._pause_key_sent = True
-                self._append_line("[AUTO] Detected PAUSE prompt — sending Enter…")
+                self._append_line("[AUTO] Detected continue prompt — sending Enter…")
                 try:
                     if self._process is not None:
                         self._process.write(b"\r\n")

@@ -37,6 +37,15 @@ except Exception:
         FireRedPane = None
 
 
+try:
+    from helpers.hidream_ui import HiDreamUI
+except Exception:
+    try:
+        from hidream_ui import HiDreamUI
+    except Exception:
+        HiDreamUI = None
+
+
 class ClickableLabel(QtWidgets.QLabel):
     """Tiny clickable thumbnail label."""
     clicked = QtCore.Signal()
@@ -1274,11 +1283,11 @@ class Qwen2511Pane(QtWidgets.QWidget):
         bw.addWidget(self.banner)
         outer.addWidget(banner_wrap, 0)
 
-        # Tabs (Qwen Edit + Flux Klein + FireRed 1.1)
+        # Tabs (Qwen Edit + Flux Klein + HiDream Image Edit + FireRed 1.1)
         self.tabs = QtWidgets.QTabWidget(self)
         self.tabs.setDocumentMode(True)
         self.tabs.setMovable(False)
-#Y        self.tabs.setToolTip("Switch between Qwen Edit 2511, Flux Klein Edit and FireRed 1.1.")
+#Y        self.tabs.setToolTip("Switch between Qwen Edit 2511, Flux Klein, HiDream Image Edit and FireRed 1.1.")
         self.tabs.currentChanged.connect(self._on_tab_changed)
         outer.addWidget(self.tabs, 1)
 
@@ -2013,6 +2022,38 @@ class Qwen2511Pane(QtWidgets.QWidget):
 
         self.tabs.addTab(flux_page, "Flux Klein")
 
+        # --- HiDream Image Edit page ---
+        if HiDreamUI is not None:
+            try:
+                self.hidream_pane = HiDreamUI(self)
+                try:
+                    self.hidream_pane.setWindowTitle("")
+                except Exception:
+                    pass
+                self.tabs.addTab(self.hidream_pane, "HiDream Image Edit")
+            except Exception as exc:
+                self.hidream_pane = None
+                hidream_error = QtWidgets.QWidget(self)
+                hd_err_layout = QtWidgets.QVBoxLayout(hidream_error)
+                hd_err_layout.setContentsMargins(12, 12, 12, 12)
+                hidream_msg = QtWidgets.QLabel(f"HiDream Image Edit could not be loaded.\n\n{exc}")
+                hidream_msg.setWordWrap(True)
+                hidream_msg.setTextInteractionFlags(QtCore.Qt.TextSelectableByMouse)
+                hd_err_layout.addWidget(hidream_msg)
+                hd_err_layout.addStretch(1)
+                self.tabs.addTab(hidream_error, "HiDream Image Edit")
+        else:
+            self.hidream_pane = None
+            hidream_missing = QtWidgets.QWidget(self)
+            hd_missing_layout = QtWidgets.QVBoxLayout(hidream_missing)
+            hd_missing_layout.setContentsMargins(12, 12, 12, 12)
+            hidream_msg = QtWidgets.QLabel("HiDream Image Edit is unavailable because hidream_ui.py could not be imported.")
+            hidream_msg.setWordWrap(True)
+            hidream_msg.setTextInteractionFlags(QtCore.Qt.TextSelectableByMouse)
+            hd_missing_layout.addWidget(hidream_msg)
+            hd_missing_layout.addStretch(1)
+            self.tabs.addTab(hidream_missing, "HiDream Image Edit")
+
         if FireRedPane is not None:
             try:
                 self.fire_red_pane = FireRedPane(self)
@@ -2055,8 +2096,10 @@ class Qwen2511Pane(QtWidgets.QWidget):
                 tab_text = ""
 
             banner_map = {
+                "Qwen Edit": "Qwen Edit 2511 (gguf loader)",
                 "Qwen Edit 2511": "Qwen Edit 2511 (gguf loader)",
                 "Flux Klein": "FLUX Klein 2 Create + Edit (4B & 9B gguf loader)",
+                "HiDream Image Edit": "HiDream Image Edit (BF16 Base / Dev)",
                 "Firered 1.1": "Firered 1.1 edit (gguf loader)",
             }
             self.banner.setText(banner_map.get(tab_text, tab_text or "Qwen Edit 2511"))

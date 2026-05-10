@@ -1016,6 +1016,150 @@ def enqueue_txt2img(job: dict) -> bool:
         except Exception: pass
         return False
 
+def enqueue_hidream_from_widget(inner, mode: str = "create"):
+    """Enqueue a HiDream BF16 job from the embedded HiDream UI.
+
+    mode:
+      - create
+      - edit
+      - multi_reference
+    """
+    import time as _time
+    from pathlib import Path as _P
+    try:
+        from helpers.job_helper import make_job_json
+        from helpers.queue_adapter import jobs_dirs
+    except Exception:
+        from job_helper import make_job_json
+        from queue_adapter import jobs_dirs
+
+    d = jobs_dirs()
+
+    def _txt(attr: str, plain: bool = False) -> str:
+        obj = getattr(inner, attr, None)
+        if obj is None:
+            return ""
+        try:
+            return str(obj.toPlainText()).strip() if plain else str(obj.text()).strip()
+        except Exception:
+            return ""
+
+    def _model_key() -> str:
+        try:
+            fn = getattr(inner, 'current_model_key', None)
+            if callable(fn):
+                key = str(fn() or '').strip()
+                if key:
+                    return key
+        except Exception:
+            pass
+        try:
+            return str(inner.model_combo.currentData() or 'base').strip() or 'base'
+        except Exception:
+            return 'base'
+
+    mode = str(mode or 'create').strip().lower()
+    if mode not in ('create', 'edit', 'multi_reference', 'multi', 'multi-ref'):
+        raise RuntimeError(f'Unknown HiDream queue mode: {mode}')
+    if mode in ('multi', 'multi-ref'):
+        mode = 'multi_reference'
+
+    model_key = _model_key()
+    out_dir = _txt('output_dir_edit')
+    if not out_dir:
+        try:
+            out_dir = str(_base_root() / 'models' / 'hidream_bf16' / 'results')
+        except Exception:
+            out_dir = str(_P('.') / 'models' / 'hidream_bf16' / 'results')
+
+    prompt = ''
+    raw_prompt = ''
+    refs = []
+    ref_roles = []
+    keep_original_aspect = False
+    ui_key = 'main'
+    negative = ''
+
+    if mode == 'create':
+        prompt = _txt('prompt_edit', plain=True)
+        ui_key = 'main'
+        negative = _txt('negative_prompt_edit', plain=True)
+        if not prompt:
+            raise RuntimeError('Enter a prompt first.')
+    elif mode == 'edit':
+        prompt = _txt('edit_prompt', plain=True)
+        ui_key = 'edit'
+        negative = _txt('edit_negative_prompt_edit', plain=True)
+        try:
+            refs = list(getattr(inner.ref_list, 'paths')())
+        except Exception:
+            refs = []
+        try:
+            keep_original_aspect = bool(inner.keep_aspect.isChecked())
+        except Exception:
+            keep_original_aspect = False
+        if not prompt:
+            raise RuntimeError('Enter an edit instruction first.')
+        if not refs:
+            raise RuntimeError('Add at least one reference image.')
+    else:
+        raw_prompt = _txt('multi_prompt', plain=True)
+        ui_key = 'multi'
+        negative = _txt('multi_negative_prompt_edit', plain=True)
+        try:
+            ref_roles = list(getattr(inner.multi_ref_list, 'references')())
+        except Exception:
+            ref_roles = []
+        refs = [str(r.get('path') or '').strip() for r in ref_roles if str(r.get('path') or '').strip()]
+        try:
+            prompt = str(inner.multi_reference_prompt_with_roles(raw_prompt, ref_roles)).strip()
+        except Exception:
+            prompt = raw_prompt
+        if not raw_prompt:
+            raise RuntimeError('Enter a multi-reference instruction first.')
+        if not refs:
+            raise RuntimeError('Add at least one reference image.')
+
+    try:
+        settings = dict(getattr(inner, 'selected_generation_settings')(ui_key, negative))
+    except Exception:
+        settings = {}
+
+    prefix = f'hidream_{model_key}_{mode}'
+    try:
+        out_path = str(getattr(inner, 'output_path')(prefix))
+    except Exception:
+        ts = int(_time.time())
+        out_path = str(_P(out_dir) / f'{prefix}_{ts}.png')
+
+    title_prompt = raw_prompt or prompt
+    short = (title_prompt or '').replace('\n', ' ').strip()
+    if len(short) > 80:
+        short = short[:80]
+    label = f'HiDream {mode.replace("_", " ")}'
+    if short:
+        label += ': ' + short
+
+    args = {
+        'label': label,
+        'mode': mode,
+        'model_key': model_key,
+        'prompt': prompt,
+        'raw_prompt': raw_prompt,
+        'refs': refs,
+        'ref_roles': ref_roles,
+        'keep_original_aspect': keep_original_aspect,
+        'settings': settings,
+        'output_path': out_path,
+        'out_file': out_path,
+        'outfile': out_path,
+        'out_dir': out_dir,
+    }
+
+    input_path = refs[0] if refs else ''
+    return make_job_json('hidream_generate', input_path, out_dir, args, str(d['pending']), priority=500)
+
+
 def enqueue_wan22_from_widget(inner) -> bool:
     """Read fields from Wan22Pane and enqueue a Wan 2.2 text/image-to-video job.
 

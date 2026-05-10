@@ -1496,6 +1496,46 @@ def _planner_use_end_images_enabled(enc: Optional[Dict[str, Any]]) -> bool:
         return False
 
 
+def _planner_chain_start_image_provided(enc: Optional[Dict[str, Any]]) -> bool:
+    """Return True only when the chain start-image option points to an existing file."""
+    try:
+        e = enc if isinstance(enc, dict) else {}
+    except Exception:
+        e = {}
+    try:
+        if not bool(e.get("chain_use_start_image")):
+            return False
+    except Exception:
+        return False
+    try:
+        p = str(e.get("chain_start_image_path") or '').strip()
+    except Exception:
+        p = ""
+    return bool(p and os.path.isfile(p))
+
+
+def _planner_own_storyline_ltx_i2v_drives_shots(enc: Optional[Dict[str, Any]]) -> bool:
+    """Special split Own Storymode: LTX + end images can be driven by I2V prompts.
+
+    This deliberately stays narrow: normal split mode and non-LTX models keep the
+    original text-to-image prompt-count behavior.
+    """
+    try:
+        e = enc if isinstance(enc, dict) else {}
+    except Exception:
+        e = {}
+    try:
+        if not bool(e.get("own_storyline_enabled")):
+            return False
+        if not bool(e.get("own_storyline_split_i2v_enabled")):
+            return False
+        if not bool(e.get("use_end_images_as_last_frames")):
+            return False
+        return _video_model_key(str(e.get("video_model") or '')) == "ltx23"
+    except Exception:
+        return False
+
+
 def _planner_preview_media(parent: "QWidget", media_path: str) -> None:
     try:
         p = str(media_path or '').strip()
@@ -2219,7 +2259,7 @@ _LTX23_PRESETS = {
         "res_landscape": "1280x720",
         "res_portrait": "720x1280",
         "res_square": "1024x1024",
-        "fps": 24,
+        "fps": 22,
         "steps": 8,
         "min_sec": 4.0,
         "max_sec": 20.0,
@@ -2278,6 +2318,88 @@ def _seed_to_int(seed: str) -> int:
             return abs(hash(seed)) & 0x7FFFFFFF
         except Exception:
             return 0
+
+
+
+def _planner_new_job_variation_seed() -> int:
+    """Fresh per-job seed used to make a brand-new Planner run a new variation.
+
+    The old prompt-only seed behavior was useful inside one run, but it also made
+    a brand-new run with the same prompt/settings recreate the same images/clips.
+    This seed is saved in job.json/manifest.json so Resume stays reproducible.
+    """
+    try:
+        v = int.from_bytes(os.urandom(4), "little", signed=False) & 0x7FFFFFFF
+        return int(v or (int(time.time() * 1000) & 0x7FFFFFFF) or 1)
+    except Exception:
+        try:
+            return int(uuid.uuid4().int & 0x7FFFFFFF) or 1
+        except Exception:
+            return 1
+
+
+def _planner_coerce_seed_int(value: Any, default: int = 0) -> int:
+    try:
+        if value is None:
+            return int(default or 0)
+        if isinstance(value, bool):
+            return int(default or 0)
+        if isinstance(value, (int, float)):
+            return int(value) & 0x7FFFFFFF
+        s = str(value).strip()
+        if not s:
+            return int(default or 0)
+        try:
+            return int(float(s)) & 0x7FFFFFFF
+        except Exception:
+            return int(_seed_to_int(s) or default or 0)
+    except Exception:
+        return int(default or 0)
+
+
+def _planner_resolve_job_variation_seed(encoding: Optional[Dict[str, Any]], manifest: Optional[Dict[str, Any]] = None) -> int:
+    """Return the saved/new per-job variation seed.
+
+    New jobs get a fresh seed from _build_job(). Existing/resumed legacy jobs that
+    do not have this field keep seed 0, which preserves their old prompt-only seed
+    behavior instead of silently changing already-created outputs.
+    """
+    enc = encoding if isinstance(encoding, dict) else {}
+    man = manifest if isinstance(manifest, dict) else {}
+    settings = man.get("settings") if isinstance(man.get("settings"), dict) else {}
+
+    for src in (enc, man, settings):
+        try:
+            v = _planner_coerce_seed_int(src.get("planner_job_variation_seed", src.get("job_variation_seed", 0)), 0)
+        except Exception:
+            v = 0
+        if int(v or 0) > 0:
+            return int(v) & 0x7FFFFFFF
+
+    # Brand-new jobs built by _build_job() should already have the seed in encoding.
+    # If we are opening/resuming older jobs, do not invent a new seed and invalidate
+    # their old intent fingerprints.
+    try:
+        resume = bool(enc.get("planner_resume_run") or man.get("job_id") or man.get("shots") or man.get("steps"))
+    except Exception:
+        resume = False
+    if resume:
+        return 0
+    return int(_planner_new_job_variation_seed())
+
+
+def _planner_seed_int_for_job(seed_text: Any, job_variation_seed: Any = 0, sid: str = "", purpose: str = "image") -> int:
+    """Stable seed inside one job, fresh across brand-new jobs.
+
+    With job_variation_seed=0 this falls back to the legacy prompt-only seed, so
+    older projects keep resuming exactly as before.
+    """
+    base = str(seed_text or sid or purpose or "planner").strip()
+    v = _planner_coerce_seed_int(job_variation_seed, 0)
+    if int(v or 0) <= 0:
+        return int(_seed_to_int(base) or 0)
+    payload = f"planner-job-variation:{int(v)}|purpose:{purpose}|sid:{sid}|seed:{base}"
+    return int(_seed_to_int(payload) or 0)
 
 def _parse_vnum(name: str) -> Tuple[int, int, int]:
     """Parse versions like V3.0, v2, V10.1.2 from a filename."""
@@ -8786,6 +8908,10 @@ class PipelineWorker(QThread):
             _own_storyline_prompts: List[Dict[str, Any]] = []
             _own_storyline_parser_mode = ""
             _own_storyline_digest = ""
+            _own_storyline_split_i2v_enabled = False
+            _own_storyline_ltx_i2v_drives_shots = False
+            _own_storyline_i2v_prompts: List[Dict[str, Any]] = []
+            _own_storyline_i2v_digest = ""
 
             if bool(_own_storyline_enabled):
                 try:
@@ -8808,11 +8934,36 @@ class PipelineWorker(QThread):
                     _n0 = len(_own_storyline_prompts) if isinstance(_own_storyline_prompts, list) else 0
                 except Exception:
                     _n0 = 0
+
+                # Split Own Storymode has one narrow relaxed path:
+                # LTX + Use image(s) as last frame(s). In that workflow the I2V box can
+                # define the clip list, so the T2I box may be empty when a start image is loaded.
+                try:
+                    _own_storyline_split_i2v_enabled = bool((self.job.encoding or {}).get("own_storyline_split_i2v_enabled"))
+                except Exception:
+                    _own_storyline_split_i2v_enabled = False
+                try:
+                    _own_storyline_ltx_i2v_drives_shots = bool(_planner_own_storyline_ltx_i2v_drives_shots(self.job.encoding))
+                except Exception:
+                    _own_storyline_ltx_i2v_drives_shots = False
+                try:
+                    _chain_start_provided0 = bool(_planner_chain_start_image_provided(self.job.encoding))
+                except Exception:
+                    _chain_start_provided0 = False
+
                 if int(_n0) <= 0:
-                    raise RuntimeError(
-                        "Own storyline is enabled but no prompts were detected. "
-                        "Add markers like [01] [02] or (01) (02) so the planner can split your text into prompts."
-                    )
+                    if bool(_own_storyline_ltx_i2v_drives_shots) and bool(_chain_start_provided0):
+                        pass
+                    elif bool(_own_storyline_ltx_i2v_drives_shots):
+                        raise RuntimeError(
+                            "LTX split Own Storymode with image(s) as last frame needs at least 1 text-to-image prompt "
+                            "when no start image is loaded."
+                        )
+                    else:
+                        raise RuntimeError(
+                            "Own storyline is enabled but no prompts were detected. "
+                            "Add markers like [01] [02] or (01) (02) so the planner can split your text into prompts."
+                        )
 
 
                 try:
@@ -8824,6 +8975,38 @@ class PipelineWorker(QThread):
                     self.signals.log.emit(f"[RUN] Own storyline: using {_n0} prompts")
                 except Exception:
                     pass
+
+                try:
+                    _own_storyline_split_i2v_enabled = bool((self.job.encoding or {}).get("own_storyline_split_i2v_enabled"))
+                except Exception:
+                    _own_storyline_split_i2v_enabled = False
+                if bool(_own_storyline_split_i2v_enabled):
+                    try:
+                        _own_storyline_i2v_prompts = (self.job.encoding or {}).get("own_storyline_i2v_prompts") or []
+                    except Exception:
+                        _own_storyline_i2v_prompts = []
+                    if not isinstance(_own_storyline_i2v_prompts, list):
+                        _own_storyline_i2v_prompts = []
+                    if not _own_storyline_i2v_prompts:
+                        try:
+                            _txt2 = str((self.job.encoding or {}).get("own_storyline_i2v_text") or '')
+                            _own_storyline_i2v_prompts, _tmp_mode2 = _parse_own_storyline_prompts(_txt2)
+                        except Exception:
+                            _own_storyline_i2v_prompts = []
+                    try:
+                        _n_i2v = len(_own_storyline_i2v_prompts) if isinstance(_own_storyline_i2v_prompts, list) else 0
+                    except Exception:
+                        _n_i2v = 0
+                    if int(_n_i2v) <= 0:
+                        raise RuntimeError("Own storyline split image/video prompts is enabled but no image-to-video prompts were detected.")
+                    try:
+                        _own_storyline_i2v_digest = _sha1_text(json.dumps(_own_storyline_i2v_prompts, sort_keys=True, ensure_ascii=False))
+                    except Exception:
+                        _own_storyline_i2v_digest = ""
+                    try:
+                        self.signals.log.emit(f"[RUN] Own storyline split I2V: using {_n_i2v} video prompts")
+                    except Exception:
+                        pass
 
                 # Own storyline supersedes Alternative storymode
                 _alt_storymode = False
@@ -8887,6 +9070,7 @@ class PipelineWorker(QThread):
                 "image_model": self.job.encoding.get("image_model"),
                 "video_model": self.job.encoding.get("video_model"),
                 "gen_quality_preset": self.job.encoding.get("gen_quality_preset"),
+                "planner_job_variation_seed": self.job.encoding.get("planner_job_variation_seed") or self.job.encoding.get("job_variation_seed"),
             }, sort_keys=True))
 
             manifest = _safe_read_json(manifest_path) or {}
@@ -8910,6 +9094,28 @@ class PipelineWorker(QThread):
             manifest.setdefault("steps", {})
             manifest.setdefault("paths", {})
             manifest.setdefault("settings", {})
+
+            # Seed policy:
+            # - New job: _build_job() generated a fresh planner_job_variation_seed.
+            # - Resume: keep the saved seed; legacy jobs without this field keep old prompt-only seeds.
+            try:
+                _job_variation_seed = int(_planner_resolve_job_variation_seed(self.job.encoding, manifest) or 0)
+            except Exception:
+                _job_variation_seed = 0
+            try:
+                if _job_variation_seed > 0:
+                    self.job.encoding["planner_job_variation_seed"] = int(_job_variation_seed)
+                    self.job.encoding["job_variation_seed"] = int(_job_variation_seed)
+                    self.job.encoding["planner_seed_scope"] = "per_job_variation"
+                    manifest["job_variation_seed"] = int(_job_variation_seed)
+                    manifest["planner_job_variation_seed"] = int(_job_variation_seed)
+                    manifest["planner_seed_scope"] = "per_job_variation"
+                else:
+                    self.job.encoding.setdefault("planner_seed_scope", "legacy_prompt_seed")
+                    manifest.setdefault("planner_seed_scope", "legacy_prompt_seed")
+            except Exception:
+                pass
+
             manifest["settings"].update({
                 "duration_sec": self.job.approx_duration_sec,
                 "resolution_preset": self.job.resolution_preset,
@@ -8919,7 +9125,17 @@ class PipelineWorker(QThread):
                 "silent": self.job.silent,
                 "storytelling_volume": self.job.storytelling_volume,
                 "music_volume": self.job.music_volume,
+                "job_variation_seed": int(_job_variation_seed or 0),
+                "planner_job_variation_seed": int(_job_variation_seed or 0),
+                "planner_seed_scope": ("per_job_variation" if int(_job_variation_seed or 0) > 0 else "legacy_prompt_seed"),
             })
+            try:
+                if int(_job_variation_seed or 0) > 0:
+                    _log(f"[SEED] Job variation seed: {int(_job_variation_seed)}")
+                else:
+                    _log("[SEED] Legacy prompt-only seed mode for this existing job")
+            except Exception:
+                pass
             manifest["paths"].update({
                 "story_dir": story_dir,
                 "prompts_dir": prompts_dir,
@@ -9660,6 +9876,9 @@ class PipelineWorker(QThread):
                 },
                 "generation_profile": gen_profile,
                 "own_storyline_digest": _own_storyline_digest,
+                "own_storyline_split_i2v_enabled": bool(_own_storyline_split_i2v_enabled),
+                "own_storyline_ltx_i2v_drives_shots": bool(_own_storyline_ltx_i2v_drives_shots),
+                "own_storyline_i2v_digest": _own_storyline_i2v_digest,
                 "final_export": {
                     "resolution_preset": self.job.resolution_preset,
                     "quality_preset": self.job.quality_preset,
@@ -9887,7 +10106,7 @@ class PipelineWorker(QThread):
                         "index": int(i),
                         "phase": _phase_for_index(i, len(beats)),
                         "seed": str(beat),
-                        "seed_int": int(_seed_to_int(str(beat)) or 0),
+                        "seed_int": int(_planner_seed_int_for_job(str(beat), (self.job.encoding or {}).get("planner_job_variation_seed"), sid=sid, purpose="image") or 0),
                         "camera": "",
                         "mood": "",
                         "lighting": "",
@@ -9940,7 +10159,7 @@ class PipelineWorker(QThread):
                         "id": sid,
                         "prompt_authority": "offline_storyline_creator",
                         "seed": str(beat),
-                        "seed_int": int(_seed_to_int(str(beat)) or 0),
+                        "seed_int": int(_planner_seed_int_for_job(str(beat), (self.job.encoding or {}).get("planner_job_variation_seed"), sid=sid, purpose="image") or 0),
                         "phase": str(_phase_for_index(i, len(beats))),
                         "prompt_spec": t2i_prompt,
                         "negative_spec": negative_hint,
@@ -10370,6 +10589,9 @@ class PipelineWorker(QThread):
                 "gen_quality_preset": self.job.encoding.get("gen_quality_preset"),
                 "generation_profile": gen_profile,
                 "own_storyline_digest": _own_storyline_digest,
+                "own_storyline_split_i2v_enabled": bool(_own_storyline_split_i2v_enabled),
+                "own_storyline_ltx_i2v_drives_shots": bool(_own_storyline_ltx_i2v_drives_shots),
+                "own_storyline_i2v_digest": _own_storyline_i2v_digest,
                 "own_character_bible_enabled": self.job.encoding.get("own_character_bible_enabled"),
                 "own_character_1_prompt": self.job.encoding.get("own_character_1_prompt"),
                 "own_character_2_prompt": self.job.encoding.get("own_character_2_prompt"),
@@ -10394,11 +10616,66 @@ class PipelineWorker(QThread):
                     # Normalize prompt list (keep order; keep user text verbatim; ignore empties)
                     plist = _own_storyline_prompts if isinstance(_own_storyline_prompts, list) else []
                     clean_prompts: List[str] = []
-                    for it in plist:
+                    clean_prompt_items: List[Tuple[int, str]] = []
+                    for _src_i, it in enumerate(plist, start=1):
                         raw_txt = _own_storyline_extract_text(it)
                         raw_txt = _clean_own_story_prompt(raw_txt)
                         if raw_txt:
                             clean_prompts.append(raw_txt)
+                            clean_prompt_items.append((int(_src_i), raw_txt))
+
+                    # Narrow relaxed mode: LTX + split Own Storymode + end images.
+                    # Here the I2V prompt list defines the shot/clip list. The T2I list is
+                    # only needed to create S01 when the user did not load a start image.
+                    try:
+                        _ltx_i2v_drives_shots = bool(_planner_own_storyline_ltx_i2v_drives_shots(self.job.encoding))
+                    except Exception:
+                        _ltx_i2v_drives_shots = False
+                    if bool(_ltx_i2v_drives_shots):
+                        try:
+                            _i2v_src_list = (self.job.encoding or {}).get("own_storyline_i2v_prompts") or []
+                        except Exception:
+                            _i2v_src_list = []
+                        if not isinstance(_i2v_src_list, list) or not _i2v_src_list:
+                            try:
+                                _i2v_txt0 = str((self.job.encoding or {}).get("own_storyline_i2v_text") or '')
+                                _i2v_src_list, _i2v_mode0 = _parse_own_storyline_prompts(_i2v_txt0)
+                            except Exception:
+                                _i2v_src_list = []
+                        _i2v_items: List[Tuple[int, str]] = []
+                        for _i2v_i, _i2v_it in enumerate(list(_i2v_src_list or []), start=1):
+                            try:
+                                _i2v_body = _clean_own_story_prompt(_own_storyline_extract_text(_i2v_it))
+                            except Exception:
+                                _i2v_body = ""
+                            if _i2v_body:
+                                _i2v_items.append((int(_i2v_i), _i2v_body))
+                        if not _i2v_items:
+                            raise RuntimeError("LTX split Own Storymode needs at least 1 image-to-video prompt.")
+
+                        _first_t2i_prompt = str(clean_prompt_items[0][1]).strip() if clean_prompt_items else ""
+                        try:
+                            _has_chain_start_image = bool(_planner_chain_start_image_provided(self.job.encoding))
+                        except Exception:
+                            _has_chain_start_image = False
+                        if (not _has_chain_start_image) and (not _first_t2i_prompt):
+                            raise RuntimeError(
+                                "LTX split Own Storymode with image(s) as last frame needs 1 text-to-image prompt "
+                                "for the first image when no start image is loaded."
+                            )
+
+                        clean_prompts = []
+                        clean_prompt_items = []
+                        for _i2v_src_idx, _i2v_prompt in _i2v_items:
+                            # S01 uses the one T2I prompt when available; all later shot rows are driven
+                            # by their I2V prompt text but normally skip image generation via end-image chaining.
+                            _visual_prompt = _first_t2i_prompt if (_first_t2i_prompt and not clean_prompt_items) else str(_i2v_prompt)
+                            clean_prompts.append(_visual_prompt)
+                            clean_prompt_items.append((int(_i2v_src_idx), _visual_prompt))
+                        try:
+                            self.signals.log.emit(f"[RUN] LTX split Own Storymode: I2V prompts drive {len(clean_prompt_items)} shots")
+                        except Exception:
+                            pass
 
                     if not clean_prompts:
                         raise RuntimeError("Own storyline is enabled but no usable prompts were found.")
@@ -10433,6 +10710,7 @@ class PipelineWorker(QThread):
                     # If we have too many prompts to fit even at minimum per-clip duration, deterministically skip middle prompts.
 
                     prompts_used = list(clean_prompts)
+                    prompts_used_items = list(clean_prompt_items)
                     if _needs_time_fit:
                         try:
                             too_many = (float(n_total) * float(_min_s)) > float(eff_target) + 1e-6
@@ -10468,6 +10746,7 @@ class PipelineWorker(QThread):
                                 keep_idxs = [0] + chosen + [n_total - 1]
 
                             prompts_used = [clean_prompts[i] for i in keep_idxs if 0 <= i < n_total]
+                            prompts_used_items = [clean_prompt_items[i] for i in keep_idxs if 0 <= i < len(clean_prompt_items)]
                             # Recompute max_possible after skipping (not strictly needed, but keeps metadata consistent)
                             try:
                                 max_possible = float(len(prompts_used)) * float(_max_s)
@@ -10529,7 +10808,9 @@ class PipelineWorker(QThread):
                             except Exception:
                                 _sh["duration_sec"] = round(float(_min_v), 2)
 
-                    for i, prompt_txt in enumerate(prompts_used, start=1):
+                    if not prompts_used_items:
+                        prompts_used_items = [(int(i), str(prompt_txt)) for i, prompt_txt in enumerate(prompts_used, start=1)]
+                    for i, (_own_src_idx, prompt_txt) in enumerate(prompts_used_items, start=1):
                         sid = f"S{i:02d}"
                         # Base duration: stable but within bounds
                         if _needs_time_fit and shortened:
@@ -10554,8 +10835,9 @@ class PipelineWorker(QThread):
                             "phase": _phase_for_index(i, max(1, n_used)),
                             "visual_description": str(prompt_txt),
                             "seed": str(_seed_txt),
-                            "seed_int": int(_seed_to_int(str(_seed_txt)) or 0),
+                            "seed_int": int(_planner_seed_int_for_job(str(_seed_txt), (self.job.encoding or {}).get("planner_job_variation_seed"), sid=sid, purpose="image") or 0),
                             "duration_sec": float(round(dur, 2)),
+                            "own_storyline_source_index": int(_own_src_idx),
                             "source": "own_storyline",
                         })
 
@@ -10607,6 +10889,7 @@ class PipelineWorker(QThread):
                     manifest["paths"]["shots_raw_txt"] = shots_raw_path
                     manifest["paths"]["qwen_prompts_used_txt"] = qwen_prompts_used
                     manifest["settings"]["n_shots"] = len(out_shots)
+                    manifest["settings"]["own_storyline_ltx_i2v_drives_shots"] = bool(_planner_own_storyline_ltx_i2v_drives_shots(self.job.encoding))
 
                     # Persist effective duration (useful for debugging; downstream audio prefers probing final video anyway)
                     if _needs_time_fit:
@@ -10851,7 +11134,7 @@ class PipelineWorker(QThread):
                     out_shots.append({
                         "id": str(sid),
                         "seed": str(seed),
-                        "seed_int": _seed_to_int(str(seed)),
+                        "seed_int": _planner_seed_int_for_job(str(seed), (self.job.encoding or {}).get("planner_job_variation_seed"), sid=str(sid), purpose="image"),
                         "camera": str(cam),
                         "mood": str(mood),
                         "lighting": str(light),
@@ -11355,7 +11638,7 @@ class PipelineWorker(QThread):
                                 "phase": _phase_for_index(i, max(1, len(plist))),
                                 "visual_description": txt,
                                 "seed": txt,
-                                "seed_int": int(_seed_to_int(txt) or 0),
+                                "seed_int": int(_planner_seed_int_for_job(txt, (self.job.encoding or {}).get("planner_job_variation_seed"), sid=f"S{i:02d}", purpose="image") or 0),
                                 "duration_sec": float(0.0),
                                 "source": "own_storyline",
                             })
@@ -11466,7 +11749,7 @@ class PipelineWorker(QThread):
                         rec.update({
                             "id": sid,
                             "seed": str(sh.get("seed") or pr).strip(),
-                            "seed_int": int(sh.get("seed_int") or _seed_to_int(pr) or 0),
+                            "seed_int": int(sh.get("seed_int") or _planner_seed_int_for_job(pr, (self.job.encoding or {}).get("planner_job_variation_seed"), sid=sid, purpose="image") or 0),
                             "prompt_spec": pr_final,
                             "negative_spec": base_negative,
                             "prompt_compiled": pr_final,
@@ -11691,7 +11974,7 @@ class PipelineWorker(QThread):
                         rec.update({
                             "id": sid,
                             "seed": seed0,
-                            "seed_int": int(sh.get("seed_int") or _seed_to_int(seed0) or 0),
+                            "seed_int": int(sh.get("seed_int") or _planner_seed_int_for_job(seed0, (self.job.encoding or {}).get("planner_job_variation_seed"), sid=sid, purpose="image") or 0),
                             "prompt_spec": pr,
                             "negative_spec": base_negative,
                             "prompt_compiled": pr,
@@ -11900,7 +12183,7 @@ class PipelineWorker(QThread):
                     rec.update({
                         "id": sid,
                         "seed": seed0,
-                        "seed_int": int(sh.get("seed_int") or _seed_to_int(seed0) or 0),
+                        "seed_int": int(sh.get("seed_int") or _planner_seed_int_for_job(seed0, (self.job.encoding or {}).get("planner_job_variation_seed"), sid=sid, purpose="image") or 0),
                         "camera": str(sh.get("camera") or ''),
                         "lighting": str(sh.get("lighting") or ''),
                         "mood": str(sh.get("mood") or ''),
@@ -12597,7 +12880,7 @@ class PipelineWorker(QThread):
                             rec.update({
                                 "id": sid,
                                 "seed": seed_txt,
-                                "seed_int": int(sh.get("seed_int") or _seed_to_int(seed_txt) or 0),
+                                "seed_int": int(sh.get("seed_int") or _planner_seed_int_for_job(seed_txt, (self.job.encoding or {}).get("planner_job_variation_seed"), sid=sid, purpose="image") or 0),
                                 "camera": camera,
                                 "lighting": lighting,
                                 "mood": mood,
@@ -12676,7 +12959,7 @@ class PipelineWorker(QThread):
                             rec.update({
                                 "id": sid,
                                 "seed": seed_txt,
-                                "seed_int": int(sh.get("seed_int") or _seed_to_int(seed_txt) or 0),
+                                "seed_int": int(sh.get("seed_int") or _planner_seed_int_for_job(seed_txt, (self.job.encoding or {}).get("planner_job_variation_seed"), sid=sid, purpose="image") or 0),
                                 "camera": camera,
                                 "lighting": lighting,
                                 "mood": mood,
@@ -12758,7 +13041,7 @@ class PipelineWorker(QThread):
 
                                 "seed": seed_txt,
 
-                                "seed_int": int(sh.get("seed_int") or _seed_to_int(seed_txt) or 0),
+                                "seed_int": int(sh.get("seed_int") or _planner_seed_int_for_job(seed_txt, (self.job.encoding or {}).get("planner_job_variation_seed"), sid=sid, purpose="image") or 0),
 
                                 "camera": camera,
 
@@ -12999,7 +13282,7 @@ class PipelineWorker(QThread):
 
                                                     "seed": seed_txt,
 
-                                                    "seed_int": int(sh.get("seed_int") or _seed_to_int(seed_txt) or 0),
+                                                    "seed_int": int(sh.get("seed_int") or _planner_seed_int_for_job(seed_txt, (self.job.encoding or {}).get("planner_job_variation_seed"), sid=sid, purpose="image") or 0),
 
                                                     "camera": camera,
 
@@ -13091,7 +13374,7 @@ class PipelineWorker(QThread):
                     t2i_job["negative_prompt"] = negative
                     t2i_job["negative"] = negative
                     t2i_job["neg_prompt"] = negative
-                    t2i_job["seed"] = int(sh.get("seed_int") or _seed_to_int(seed_txt) or 0)
+                    t2i_job["seed"] = int(sh.get("seed_int") or _planner_seed_int_for_job(seed_txt, (self.job.encoding or {}).get("planner_job_variation_seed"), sid=sid, purpose="image") or 0)
                     t2i_job["batch"] = 1
 
                     # Persist the FINAL prompt we actually send (so Review shows the same text)
@@ -13330,7 +13613,7 @@ class PipelineWorker(QThread):
                             "prompt": prompt,
                             "negative_prompt": negative,
                             "negative": negative,
-                            "seed": int(sh.get("seed_int") or _seed_to_int(seed_txt) or 0),
+                            "seed": int(sh.get("seed_int") or _planner_seed_int_for_job(seed_txt, (self.job.encoding or {}).get("planner_job_variation_seed"), sid=sid, purpose="image") or 0),
                             "width": int(qw),
                             "height": int(qh),
                             "vae_device": "cpu",
@@ -14056,6 +14339,31 @@ class PipelineWorker(QThread):
                     own_storyline_enabled0 = bool((enc0 or {}).get("own_storyline_enabled"))
                 except Exception:
                     own_storyline_enabled0 = False
+                try:
+                    own_storyline_split_i2v0 = bool(own_storyline_enabled0 and (enc0 or {}).get("own_storyline_split_i2v_enabled"))
+                except Exception:
+                    own_storyline_split_i2v0 = False
+                split_i2v_clean: List[str] = []
+                if bool(own_storyline_split_i2v0):
+                    try:
+                        _split_src = (enc0 or {}).get("own_storyline_i2v_prompts") or []
+                    except Exception:
+                        _split_src = []
+                    if not isinstance(_split_src, list) or not _split_src:
+                        try:
+                            _split_txt = str((enc0 or {}).get("own_storyline_i2v_text") or '')
+                            _split_src, _split_mode = _parse_own_storyline_prompts(_split_txt)
+                        except Exception:
+                            _split_src = []
+                    for _it2 in list(_split_src or []):
+                        try:
+                            _txt2 = _clean_own_story_prompt(_own_storyline_extract_text(_it2))
+                        except Exception:
+                            _txt2 = ""
+                        if _txt2:
+                            split_i2v_clean.append(_txt2)
+                    if not split_i2v_clean:
+                        raise RuntimeError("Own storyline split I2V prompts is enabled, but no usable image-to-video prompts were found.")
                 _planner_reset_i2v_camera_state()
 
                 for idx, sh in enumerate(shots):
@@ -14066,23 +14374,47 @@ class PipelineWorker(QThread):
                     prev_sh = shots[idx - 1] if idx > 0 and idx - 1 < len(shots) else None
                     next_sh = shots[idx + 1] if (idx + 1) < len(shots) else None
                     if bool(own_storyline_enabled0):
-                        raw_prompt = str(
-                            (rec.get("prompt_user_override") if isinstance(rec, dict) else "")
-                            or (rec.get("prompt_compiled") if isinstance(rec, dict) else "")
-                            or (rec.get("prompt_used") if isinstance(rec, dict) else "")
-                            or (rec.get("prompt_spec") if isinstance(rec, dict) else "")
-                            or (sh.get("visual_description") if isinstance(sh, dict) else "")
-                            or (sh.get("seed") if isinstance(sh, dict) else "")
-                            or ""
-                        ).strip()
-                        i2v_prompt = raw_prompt
-                        i2v_negative = neg
-                        schema = {
-                            "schema_version": int(_PLANNER_I2V_SCHEMA_VERSION),
-                            "mode": "own_storyline_raw",
-                            "prompt_raw": raw_prompt,
-                            "wrapper_disabled": True,
-                        }
+                        if bool(own_storyline_split_i2v0):
+                            try:
+                                _src_idx = int((sh.get("own_storyline_source_index") if isinstance(sh, dict) else 0) or (idx + 1))
+                            except Exception:
+                                _src_idx = int(idx + 1)
+                            _prompt_idx = int(_src_idx) - 1
+                            _reused = False
+                            if 0 <= _prompt_idx < len(split_i2v_clean):
+                                raw_prompt = str(split_i2v_clean[_prompt_idx]).strip()
+                            else:
+                                _cycle_idx = int(idx) % max(1, len(split_i2v_clean))
+                                raw_prompt = str(split_i2v_clean[_cycle_idx]).strip()
+                                _reused = True
+                            i2v_prompt = raw_prompt
+                            i2v_negative = neg
+                            schema = {
+                                "schema_version": int(_PLANNER_I2V_SCHEMA_VERSION),
+                                "mode": "own_storyline_split_i2v_raw",
+                                "prompt_raw": raw_prompt,
+                                "source_index": int(_src_idx),
+                                "reused_from_start": bool(_reused),
+                                "wrapper_disabled": True,
+                            }
+                        else:
+                            raw_prompt = str(
+                                (rec.get("prompt_user_override") if isinstance(rec, dict) else "")
+                                or (rec.get("prompt_compiled") if isinstance(rec, dict) else "")
+                                or (rec.get("prompt_used") if isinstance(rec, dict) else "")
+                                or (rec.get("prompt_spec") if isinstance(rec, dict) else "")
+                                or (sh.get("visual_description") if isinstance(sh, dict) else "")
+                                or (sh.get("seed") if isinstance(sh, dict) else "")
+                                or ""
+                            ).strip()
+                            i2v_prompt = raw_prompt
+                            i2v_negative = neg
+                            schema = {
+                                "schema_version": int(_PLANNER_I2V_SCHEMA_VERSION),
+                                "mode": "own_storyline_raw",
+                                "prompt_raw": raw_prompt,
+                                "wrapper_disabled": True,
+                            }
                     else:
                         schema = _planner_build_i2v_schema(
                             manifest,
@@ -14118,17 +14450,25 @@ class PipelineWorker(QThread):
                 manifest["paths"]["i2v_prompts_txt"] = i2v_prompts_path
                 manifest["paths"]["i2v_prompts_json"] = i2v_prompts_json
                 manifest.setdefault("settings", {})["i2v_schema_version"] = int(_PLANNER_I2V_SCHEMA_VERSION)
+                manifest.setdefault("settings", {})["own_storyline_split_i2v_enabled"] = bool(own_storyline_split_i2v0)
+                manifest.setdefault("settings", {})["own_storyline_i2v_digest"] = str((enc0 or {}).get("own_storyline_i2v_digest") or _own_storyline_i2v_digest or '')
                 manifest["shots"] = shot_map
                 _safe_write_json(manifest_path, manifest)
 
-            if bool(_planner_use_offline_storyline_creator) and _file_ok(i2v_prompts_path, 10) and _file_ok(i2v_prompts_json, 10) and _planner_i2v_prompts_are_current(i2v_prompts_json):
+            _split_i2v_forces_regen = bool(_own_storyline_enabled and _own_storyline_split_i2v_enabled)
+            if (not _split_i2v_forces_regen) and bool(_planner_use_offline_storyline_creator) and _file_ok(i2v_prompts_path, 10) and _file_ok(i2v_prompts_json, 10) and _planner_i2v_prompts_are_current(i2v_prompts_json):
                 manifest["paths"]["i2v_prompts_txt"] = i2v_prompts_path
                 manifest["paths"]["i2v_prompts_json"] = i2v_prompts_json
                 _skip("I2V prompts (from shots)", "Offline Storyline Creator backend already wrote i2v prompts")
                 _set_step("I2V prompts (from shots)", "done", "Offline Storyline Creator backend reused i2v prompt files")
-            elif _file_ok(i2v_prompts_path, 10) and _file_ok(i2v_prompts_json, 10) and _planner_i2v_prompts_are_current(i2v_prompts_json):
+            elif (not _split_i2v_forces_regen) and _file_ok(i2v_prompts_path, 10) and _file_ok(i2v_prompts_json, 10) and _planner_i2v_prompts_are_current(i2v_prompts_json):
                 _skip("I2V prompts (from shots)", "i2v prompts already exist")
             else:
+                if bool(_split_i2v_forces_regen):
+                    try:
+                        self.signals.log.emit("[I2V] Split image/video prompts enabled — regenerating i2v_prompts.txt/json from the second Own Storymode box")
+                    except Exception:
+                        pass
                 _run("I2V prompts (from shots)", step_i2v_prompts, 70)
 
             # Step F: Video clips (HunyuanVideo 1.5)
@@ -14436,12 +14776,21 @@ class PipelineWorker(QThread):
                     frames = int(round(dur * float(max(1, fps))))
                     frames = max(16, min(int(max_frames), int(frames)))
 
-                    # Stable seed per shot
+                    # Stable video seed per shot. New jobs derive this from the saved
+                    # job variation seed; resume/reuse keeps any saved clip_seed.
                     seed = None
                     try:
-                        seed = int(rec.get("seed_int")) if isinstance(rec, dict) else None
+                        if isinstance(rec, dict) and rec.get("clip_seed") is not None:
+                            seed = int(rec.get("clip_seed"))
                     except Exception:
                         seed = None
+                    if seed is None:
+                        seed = int(_planner_seed_int_for_job(str(sh.get("seed") or sid), (self.job.encoding or {}).get("planner_job_variation_seed"), sid=sid, purpose="video") or 0)
+                    try:
+                        rec["clip_seed"] = int(seed or 0)
+                        shot_map[sid] = rec
+                    except Exception:
+                        pass
 
                     out_file = os.path.join(clips_dir, f"shot_{i:03d}_{sid}.mp4")
                     log_file = os.path.join(logs_dir, f"hunyuan15_{i:03d}_{sid}.log")
@@ -15042,7 +15391,19 @@ class PipelineWorker(QThread):
                     frames = max(12, min(int(prof.get("max_frames") or fallback_frames or 240), int(round(dsec * fps))))
 
                     seed_txt = str(sh.get("seed") or sid)
-                    seed = _seed_to_int(seed_txt)
+                    seed = None
+                    try:
+                        if isinstance(rec, dict) and rec.get("clip_seed") is not None:
+                            seed = int(rec.get("clip_seed"))
+                    except Exception:
+                        seed = None
+                    if seed is None:
+                        seed = int(_planner_seed_int_for_job(seed_txt, (self.job.encoding or {}).get("planner_job_variation_seed"), sid=sid, purpose="video") or 0)
+                    try:
+                        rec["clip_seed"] = int(seed or 0)
+                        shot_map[sid] = rec
+                    except Exception:
+                        pass
                     out_file = os.path.join(clips_dir, f"{sid}.mp4")
                     log_file = os.path.join(clips_dir, f"{sid}.ltx23.log.txt")
                     intent_fp = _sha1_text(json.dumps({
@@ -15360,7 +15721,19 @@ class PipelineWorker(QThread):
 
                     # Seed (stable)
                     seed_txt = str(sh.get("seed") or sid)
-                    seed = _seed_to_int(seed_txt)
+                    seed = None
+                    try:
+                        if isinstance(rec, dict) and rec.get("clip_seed") is not None:
+                            seed = int(rec.get("clip_seed"))
+                    except Exception:
+                        seed = None
+                    if seed is None:
+                        seed = int(_planner_seed_int_for_job(seed_txt, (self.job.encoding or {}).get("planner_job_variation_seed"), sid=sid, purpose="video") or 0)
+                    try:
+                        rec["clip_seed"] = int(seed or 0)
+                        shot_map[sid] = rec
+                    except Exception:
+                        pass
 
                     out_file = os.path.join(clips_dir, f"{sid}.mp4")
                     log_file = os.path.join(clips_dir, f"{sid}.wan22.log.txt")
@@ -21626,6 +21999,28 @@ Start each new prompt with a marker like [01] or (01).
         osl = QVBoxLayout(self.own_storyline_block)
         osl.setSpacing(6)
 
+        self.chk_own_storyline_split_i2v = QCheckBox("Split image and video prompts")
+        self.chk_own_storyline_split_i2v.setToolTip(
+            "Use the first Own Storymode box for text-to-image prompts and a second box for image-to-video motion prompts."
+        )
+        try:
+            s = _load_planner_settings()
+            self.chk_own_storyline_split_i2v.setChecked(bool(s.get("own_storyline_split_i2v_enabled", False)))
+        except Exception:
+            pass
+        try:
+            self.chk_own_storyline_split_i2v.toggled.connect(self._on_toggle_own_storyline_split_i2v)
+        except Exception:
+            pass
+        osl.addWidget(self.chk_own_storyline_split_i2v)
+
+        self.lbl_own_storyline_prompt_title = QLabel("Prompts")
+        try:
+            self.lbl_own_storyline_prompt_title.setStyleSheet("font-weight: 600;")
+        except Exception:
+            pass
+        osl.addWidget(self.lbl_own_storyline_prompt_title)
+
         self.own_storyline_edit = QTextEdit()
         self.own_storyline_edit.setPlaceholderText(
             """Paste your storyline here. Start each new prompt with a marker, for example:
@@ -21666,7 +22061,52 @@ If the planner sees a marker like [02] or (02), it becomes the next image prompt
         osl.addWidget(self.lbl_own_storyline_count)
         osl.addWidget(self.lbl_own_storyline_warn)
 
+        self.lbl_own_storyline_i2v_title = QLabel("Image-to-video prompts")
+        try:
+            self.lbl_own_storyline_i2v_title.setStyleSheet("font-weight: 600;")
+        except Exception:
+            pass
+        osl.addWidget(self.lbl_own_storyline_i2v_title)
+
+        self.own_storyline_i2v_edit = QTextEdit()
+        self.own_storyline_i2v_edit.setPlaceholderText(
+            """Paste your image-to-video prompts here. Use the same markers as above, for example:
+[01] Camera slowly pushes forward while rain ripples across her jacket
+[02] Close-up shot, the jacket catches light as she turns her shoulder
+
+These prompts override the normal reused Own Storymode prompts for the video stage only."""
+        )
+        self.own_storyline_i2v_edit.setFixedHeight(140)
+        try:
+            s = _load_planner_settings()
+            self.own_storyline_i2v_edit.setPlainText(str(s.get("own_storyline_i2v_text", "") or ''))
+        except Exception:
+            pass
+        try:
+            self.own_storyline_i2v_edit.textChanged.connect(self._on_own_storyline_i2v_text_changed)
+        except Exception:
+            pass
+        osl.addWidget(self.own_storyline_i2v_edit)
+
+        self.lbl_own_storyline_i2v_count = QLabel('Detected prompts: 0')
+        try:
+            self.lbl_own_storyline_i2v_count.setWordWrap(True)
+        except Exception:
+            pass
+        self.lbl_own_storyline_i2v_warn = QLabel('')
+        try:
+            self.lbl_own_storyline_i2v_warn.setWordWrap(True)
+            self.lbl_own_storyline_i2v_warn.setVisible(False)
+        except Exception:
+            pass
+        osl.addWidget(self.lbl_own_storyline_i2v_count)
+        osl.addWidget(self.lbl_own_storyline_i2v_warn)
+
         self.own_storyline_block.setVisible(bool(self.chk_own_storyline.isChecked()))
+        try:
+            self._sync_own_storyline_split_i2v_ui()
+        except Exception:
+            pass
         try:
             self._apply_own_storyline_lock_state(bool(self.chk_own_storyline.isChecked()))
         except Exception:
@@ -23525,6 +23965,189 @@ If the planner sees a marker like [02] or (02), it becomes the next image prompt
         else:
             QMessageBox.information(self, "No errors", "No errors folder exists for this job.")
 
+    def _repair_renamed_job_paths(self, job_dir: str, old_job_dir: str = "") -> int:
+        """
+        Repair stored Planner paths after a Results/History folder rename.
+
+        Resume-heavy workflows such as:
+        - Use images as last frame
+        - Use last frame as start image of next clip
+
+        keep absolute paths in manifest.json/job.json and sometimes in nested job JSON files.
+        If the project folder is renamed, those old absolute paths make Resume think the
+        existing images/clips/chain frames are missing. This helper rewrites only strings
+        that point inside the old job folder so they point at the selected/current job folder.
+        """
+        job_dir = str(job_dir or '').strip()
+        if not job_dir or not os.path.isdir(job_dir):
+            return 0
+
+        try:
+            new_root = os.path.abspath(job_dir)
+        except Exception:
+            new_root = job_dir
+
+        json_files: List[str] = []
+        try:
+            for root_dir, _dirs, files in os.walk(job_dir):
+                for fn in files:
+                    if str(fn).lower().endswith('.json'):
+                        json_files.append(os.path.join(root_dir, fn))
+        except Exception:
+            json_files = []
+
+        # Read all JSON once so we can collect old folder roots from every saved path.
+        loaded: Dict[str, Any] = {}
+        for fp in json_files:
+            try:
+                loaded[fp] = _safe_read_json(fp)
+            except Exception:
+                loaded[fp] = None
+
+        candidates: List[str] = []
+
+        def _add_candidate(path_value: Any) -> None:
+            sv = str(path_value or '').strip()
+            if not sv:
+                return
+            # Keep exact text variants because JSON may contain Windows or slash paths.
+            for val in (sv, sv.replace('\\', '/'), sv.replace('/', '\\')):
+                val = str(val or '').rstrip('\\/')
+                if not val:
+                    continue
+                try:
+                    if os.path.normcase(os.path.normpath(val)) == os.path.normcase(os.path.normpath(new_root)):
+                        continue
+                except Exception:
+                    pass
+                if val not in candidates:
+                    candidates.append(val)
+
+        if old_job_dir:
+            _add_candidate(old_job_dir)
+
+        def _walk_strings(obj: Any):
+            if isinstance(obj, str):
+                yield obj
+            elif isinstance(obj, list):
+                for x in obj:
+                    yield from _walk_strings(x)
+            elif isinstance(obj, dict):
+                for x in obj.values():
+                    yield from _walk_strings(x)
+
+        # Direct output_dir/project_dir fields are the safest old-root hints.
+        for obj in loaded.values():
+            if isinstance(obj, dict):
+                for key in ('output_dir', 'out_dir', 'project_dir', 'job_dir'):
+                    if isinstance(obj.get(key), str):
+                        _add_candidate(obj.get(key))
+                enc = obj.get('encoding')
+                if isinstance(enc, dict):
+                    for key in ('output_dir', 'out_dir', 'project_dir', 'job_dir'):
+                        if isinstance(enc.get(key), str):
+                            _add_candidate(enc.get(key))
+
+        # Infer old job roots from saved paths like .../OldName/clips/S01.mp4 or .../OldName/chain_frames/S02.png.
+        path_markers = (
+            'images', 'clips', 'chain_frames', 'story', 'final', 'errors',
+            'audio', 'music', 'narration', 'subtitles', 'upscale', 'interpolated',
+            'references', 'preview', 'logs', 'temp', 'tmp'
+        )
+        for obj in loaded.values():
+            for sv in _walk_strings(obj):
+                s0 = str(sv or '')
+                if not s0 or ('/' not in s0 and '\\' not in s0):
+                    continue
+                low = s0.lower()
+                for marker_name in path_markers:
+                    for sep in ('\\', '/'):
+                        token = sep + marker_name.lower() + sep
+                        idx = low.find(token)
+                        if idx > 1:
+                            _add_candidate(s0[:idx])
+
+        # Longer roots first prevents partial replacement if one root contains another.
+        candidates = sorted([c for c in candidates if c], key=len, reverse=True)
+        if not candidates:
+            return 0
+
+        def _same_path(a: str, b: str) -> bool:
+            try:
+                return os.path.normcase(os.path.normpath(a)) == os.path.normcase(os.path.normpath(b))
+            except Exception:
+                return str(a or '').rstrip('\\/').lower() == str(b or '').rstrip('\\/').lower()
+
+        def _new_root_for_style(old_root: str) -> str:
+            nr = str(new_root)
+            if '\\' in str(old_root) and '/' not in str(old_root):
+                return nr.replace('/', '\\')
+            if '/' in str(old_root) and '\\' not in str(old_root):
+                return nr.replace('\\', '/')
+            return nr
+
+        def _replace_one_string(value: str) -> str:
+            out = value
+            for old_root in candidates:
+                old_variants = []
+                for v in (old_root, old_root.replace('\\', '/'), old_root.replace('/', '\\')):
+                    v = str(v or '').rstrip('\\/')
+                    if v and v not in old_variants:
+                        old_variants.append(v)
+                for old in old_variants:
+                    if not old or _same_path(old, new_root):
+                        continue
+                    new_styled = _new_root_for_style(old)
+                    # Prefix path replacement: old job folder -> current job folder.
+                    try:
+                        if out.lower().startswith(old.lower()):
+                            rest = out[len(old):]
+                            if rest == '' or rest.startswith(('\\', '/', os.sep)):
+                                return new_styled.rstrip('\\/') + rest
+                    except Exception:
+                        pass
+                    # Fallback exact replacement for paths embedded in longer strings/log notes.
+                    try:
+                        if old in out:
+                            out = out.replace(old, new_styled.rstrip('\\/'))
+                    except Exception:
+                        pass
+            return out
+
+        def _repair_obj(obj: Any) -> Tuple[Any, bool]:
+            changed = False
+            if isinstance(obj, str):
+                nv = _replace_one_string(obj)
+                return nv, (nv != obj)
+            if isinstance(obj, list):
+                new_list = []
+                for x in obj:
+                    nx, ch = _repair_obj(x)
+                    changed = changed or ch
+                    new_list.append(nx)
+                return new_list, changed
+            if isinstance(obj, dict):
+                new_dict = {}
+                for k, v in obj.items():
+                    nv, ch = _repair_obj(v)
+                    changed = changed or ch
+                    new_dict[k] = nv
+                return new_dict, changed
+            return obj, False
+
+        changed_files = 0
+        for fp, obj in loaded.items():
+            if obj is None:
+                continue
+            try:
+                fixed, changed = _repair_obj(obj)
+                if changed:
+                    _safe_write_json(fp, fixed)
+                    changed_files += 1
+            except Exception:
+                continue
+        return changed_files
+
     @Slot()
     def _res_resume(self) -> None:
         paths = self._get_selected_result_paths()
@@ -23533,6 +24156,14 @@ If the planner sees a marker like [02] or (02), it becomes the next image prompt
         manifest_path = paths.get("manifest", "")
         if not job_dir:
             return
+
+        # Safety repair before Resume reads job.json/manifest paths. This catches jobs
+        # that were already renamed before this fix existed.
+        try:
+            self._repair_renamed_job_paths(str(job_dir))
+        except Exception:
+            pass
+
         if not os.path.exists(job_json):
             QMessageBox.warning(self, "Cannot resume", "job.json not found in this job folder.")
             return
@@ -23830,6 +24461,10 @@ If the planner sees a marker like [02] or (02), it becomes the next image prompt
             act_rename.triggered.connect(lambda _=None: self._res_rename_selected_job_folder())
             menu.addAction(act_rename)
 
+            act_change_name = QAction("Change job name", menu)
+            act_change_name.triggered.connect(lambda _=None: self._res_change_selected_job_name())
+            menu.addAction(act_change_name)
+
             act_info = QAction("Show folder info", menu)
             act_info.triggered.connect(lambda _=None: self._res_show_selected_folder_info())
             menu.addAction(act_info)
@@ -23863,6 +24498,18 @@ If the planner sees a marker like [02] or (02), it becomes the next image prompt
             QMessageBox.information(self, "Rename folder", "No job folder selected.")
             return
 
+        # Never rename a folder while its Planner job is active.
+        try:
+            idxs = self.results_view.selectionModel().selectedRows()
+            if idxs:
+                row = idxs[0].row()
+                status = str(self.results_model.item(row, 2).text() or '')
+                if self._is_active_job_status(status):
+                    QMessageBox.information(self, "Rename folder", "This job is running or queued. You can't rename its folder right now.")
+                    return
+        except Exception:
+            pass
+
         base = os.path.dirname(job_dir)
         old_name = os.path.basename(job_dir)
 
@@ -23890,6 +24537,13 @@ If the planner sees a marker like [02] or (02), it becomes the next image prompt
             QMessageBox.warning(self, "Rename folder", f"Failed to rename folder:\n{e}")
             return
 
+        # After a real folder rename, repair all saved resume paths immediately.
+        # This is critical for last-frame/chain-frame workflows that store absolute paths.
+        try:
+            self._repair_renamed_job_paths(str(new_dir), old_job_dir=str(job_dir))
+        except Exception:
+            pass
+
         # update favorites key if present
         try:
             old_key = self._fav_key_for_dir(job_dir)
@@ -23909,6 +24563,64 @@ If the planner sees a marker like [02] or (02), it becomes the next image prompt
         # try to reselect the renamed folder
         try:
             self._select_result_by_job_dir(new_dir)
+        except Exception:
+            pass
+
+    def _res_change_selected_job_name(self) -> None:
+        p = self._get_selected_result_paths()
+        job_dir = str(p.get("job_dir") or '')
+        if not job_dir or not os.path.isdir(job_dir):
+            QMessageBox.information(self, "Change job name", "No job folder selected.")
+            return
+
+        manifest_path = os.path.join(job_dir, "manifest.json")
+        job_json_path = os.path.join(job_dir, "job.json")
+
+        manifest = {}
+        try:
+            manifest = _safe_read_json(manifest_path) or {}
+        except Exception:
+            manifest = {}
+
+        old_name = str((manifest or {}).get("title") or os.path.basename(job_dir.rstrip("/\\")) or "Planner job").strip()
+        new_name, ok = QInputDialog.getText(self, "Change job name", "New job name shown in Results / History:", text=old_name)
+        if not ok:
+            return
+
+        # Display title only: this does not rename/move the project folder.
+        new_name = " ".join(str(new_name or '').splitlines()).strip()
+        if not new_name or new_name == old_name:
+            return
+
+        try:
+            manifest["title"] = new_name
+            _safe_write_json(manifest_path, manifest)
+        except Exception as e:
+            QMessageBox.warning(self, "Change job name", f"Failed to update manifest.json:\n{e}")
+            return
+
+        # Keep job.json in sync when it exists, so future resume/repair reads the same name.
+        try:
+            if os.path.exists(job_json_path):
+                job_cfg = _safe_read_json(job_json_path) or {}
+                if isinstance(job_cfg, dict):
+                    job_cfg["title"] = new_name
+                    enc = job_cfg.get("encoding")
+                    if isinstance(enc, dict):
+                        enc["title"] = new_name
+                    else:
+                        job_cfg["encoding"] = {"title": new_name}
+                    _safe_write_json(job_json_path, job_cfg)
+        except Exception:
+            pass
+
+        try:
+            self._refresh_results()
+        except Exception:
+            pass
+
+        try:
+            self._select_result_by_job_dir(job_dir)
         except Exception:
             pass
 
@@ -24974,6 +25686,11 @@ If the planner sees a marker like [02] or (02), it becomes the next image prompt
 
 
         try:
+            self._sync_own_storyline_split_i2v_ui()
+        except Exception:
+            pass
+
+        try:
             self._apply_own_storyline_lock_state(bool(on))
         except Exception:
             pass
@@ -25006,6 +25723,63 @@ If the planner sees a marker like [02] or (02), it becomes the next image prompt
         except Exception:
             pass
 
+
+    def _on_toggle_own_storyline_split_i2v(self, on: bool) -> None:
+        """Persist/show the optional second Own Storymode prompt lane for image-to-video."""
+        try:
+            s = _load_planner_settings()
+            s["own_storyline_split_i2v_enabled"] = bool(on)
+            _save_planner_settings(s)
+        except Exception:
+            pass
+        try:
+            self._sync_own_storyline_split_i2v_ui()
+        except Exception:
+            pass
+        try:
+            self._update_own_storyline_prompt_preview()
+        except Exception:
+            pass
+
+    def _on_own_storyline_i2v_text_changed(self) -> None:
+        """Persist the raw Own Storymode image-to-video prompt text (best-effort)."""
+        try:
+            txt = (self.own_storyline_i2v_edit.toPlainText() or '') if hasattr(self, "own_storyline_i2v_edit") else ""
+        except Exception:
+            txt = ""
+        try:
+            s = _load_planner_settings()
+            s["own_storyline_i2v_text"] = str(txt)
+            _save_planner_settings(s)
+        except Exception:
+            pass
+        try:
+            self._update_own_storyline_prompt_preview()
+        except Exception:
+            pass
+
+    def _sync_own_storyline_split_i2v_ui(self) -> None:
+        """Show/hide the second prompt lane and rename the first lane label."""
+        try:
+            on = bool(getattr(self, "chk_own_storyline_split_i2v", None) and self.chk_own_storyline_split_i2v.isChecked())
+        except Exception:
+            on = False
+        try:
+            if hasattr(self, "lbl_own_storyline_prompt_title"):
+                self.lbl_own_storyline_prompt_title.setText("Text-to-image prompts" if on else "Prompts")
+        except Exception:
+            pass
+        for attr in (
+            "lbl_own_storyline_i2v_title",
+            "own_storyline_i2v_edit",
+            "lbl_own_storyline_i2v_count",
+            "lbl_own_storyline_i2v_warn",
+        ):
+            try:
+                if hasattr(self, attr):
+                    getattr(self, attr).setVisible(bool(on))
+            except Exception:
+                pass
 
     def _current_video_model_label(self) -> str:
         """Return the canonical Planner video-model label, including the hidden LTX slot.
@@ -25077,41 +25851,101 @@ If the planner sees a marker like [02] or (02), it becomes the next image prompt
         except Exception:
             n = 0
 
+        # Preview respects Duration slider: Own storymode will downsample image prompts if too many.
+        dur = 0
+        try:
+            dur = int(self.sld_duration.value()) if hasattr(self, "sld_duration") else 0
+        except Exception:
+            dur = 0
+        min_sec_preview = 2.5
+        try:
+            vm = str(self._current_video_model_label() if hasattr(self, "_current_video_model_label") else (self.cmb_video_model.currentText() if hasattr(self, "cmb_video_model") else ""))
+            gq = str(self.cmb_gen_quality.currentText() if hasattr(self, "cmb_gen_quality") else "")
+            prof = _resolve_generation_profile(vm, gq, self._current_upscale_payload()) or {}
+            min_sec_preview = float(prof.get("min_sec", min_sec_preview) or min_sec_preview)
+        except Exception:
+            pass
+        k = int(n)
+        if dur > 0 and n > 0:
+            try:
+                k = int(max(1, min(int(n), int(float(dur) / max(0.1, float(min_sec_preview))))))
+            except Exception:
+                k = int(n)
+
         # update counter label
         try:
             if hasattr(self, "lbl_own_storyline_count") and self.lbl_own_storyline_count is not None:
                 if n <= 0:
                     self.lbl_own_storyline_count.setText("Detected prompts: 0")
+                elif k < int(n):
+                    self.lbl_own_storyline_count.setText(f"Detected prompts: {n} → using {k} (Duration fit)")
                 else:
-                    # Preview respects Duration slider: Own storymode will downsample prompts if too many.
-                    dur = 0
-                    try:
-                        dur = int(self.sld_duration.value()) if hasattr(self, "sld_duration") else 0
-                    except Exception:
-                        dur = 0
-
-                    min_sec_preview = 2.5
-                    try:
-                        vm = str(self._current_video_model_label() if hasattr(self, "_current_video_model_label") else (self.cmb_video_model.currentText() if hasattr(self, "cmb_video_model") else ""))
-                        gq = str(self.cmb_gen_quality.currentText() if hasattr(self, "cmb_gen_quality") else "")
-                        prof = _resolve_generation_profile(vm, gq, self._current_upscale_payload()) or {}
-                        min_sec_preview = float(prof.get("min_sec", min_sec_preview) or min_sec_preview)
-                    except Exception:
-                        pass
-
-                    k = int(n)
-                    if dur > 0 and n > 0:
-                        try:
-                            k = int(max(1, min(int(n), int(float(dur) / max(0.1, float(min_sec_preview))))))
-                        except Exception:
-                            k = int(n)
-
-                    if k < int(n):
-                        self.lbl_own_storyline_count.setText(f"Detected prompts: {n} → using {k} (Duration fit)")
-                    else:
-                        self.lbl_own_storyline_count.setText(f"Detected prompts: {n} → {n} images will be generated")
+                    self.lbl_own_storyline_count.setText(f"Detected prompts: {n} → {n} images will be generated")
         except Exception:
             pass
+
+        # Optional split I2V prompt lane: parse/cache/update the second box with the same parser.
+        split_i2v_on = False
+        try:
+            split_i2v_on = bool(getattr(self, "chk_own_storyline_split_i2v", None) and self.chk_own_storyline_split_i2v.isChecked())
+        except Exception:
+            split_i2v_on = False
+        try:
+            i2v_txt = (self.own_storyline_i2v_edit.toPlainText() or '') if hasattr(self, "own_storyline_i2v_edit") else ""
+        except Exception:
+            i2v_txt = ""
+        try:
+            i2v_prompts, i2v_mode = _parse_own_storyline_prompts(i2v_txt)
+        except Exception:
+            i2v_prompts, i2v_mode = [], "paragraph"
+        try:
+            self._own_storyline_i2v_parsed_prompts = i2v_prompts
+            self._own_storyline_i2v_parser_mode = i2v_mode
+        except Exception:
+            pass
+        try:
+            vn = len(i2v_prompts) if isinstance(i2v_prompts, list) else 0
+        except Exception:
+            vn = 0
+        try:
+            _relaxed_ltx_split_i2v_ui = bool(
+                split_i2v_on
+                and self._is_ltx23_video_model_selected()
+                and getattr(self, "chk_use_end_images_as_last_frames", None) is not None
+                and self.chk_use_end_images_as_last_frames.isChecked()
+            )
+        except Exception:
+            _relaxed_ltx_split_i2v_ui = False
+
+        if bool(split_i2v_on):
+            try:
+                if hasattr(self, "lbl_own_storyline_i2v_count") and self.lbl_own_storyline_i2v_count is not None:
+                    if vn <= 0:
+                        self.lbl_own_storyline_i2v_count.setText("Detected prompts: 0")
+                    elif bool(_relaxed_ltx_split_i2v_ui):
+                        self.lbl_own_storyline_i2v_count.setText(f"Detected prompts: {vn} → {vn} LTX clips will be driven by I2V prompts")
+                    elif int(k) > 0 and vn < int(k):
+                        self.lbl_own_storyline_i2v_count.setText(f"Detected prompts: {vn} → using {k} (reusing from start)")
+                    elif int(k) > 0 and vn > int(k):
+                        self.lbl_own_storyline_i2v_count.setText(f"Detected prompts: {vn} → using {k} (extra prompts ignored)")
+                    else:
+                        self.lbl_own_storyline_i2v_count.setText(f"Detected prompts: {vn} → {vn} video prompts will be used")
+            except Exception:
+                pass
+            try:
+                if hasattr(self, "lbl_own_storyline_i2v_warn") and self.lbl_own_storyline_i2v_warn is not None:
+                    msgs2: List[str] = []
+                    if vn > 0 and str(i2v_mode) == "paragraph":
+                        msgs2.append("No markers found — using paragraphs.")
+                    if (not bool(_relaxed_ltx_split_i2v_ui)) and n > 0 and vn > 0 and int(n) != int(vn):
+                        msgs2.append("Prompt counts do not match; Generate will ask before continuing.")
+                    if msgs2:
+                        self.lbl_own_storyline_i2v_warn.setText("\n".join(msgs2))
+                        self.lbl_own_storyline_i2v_warn.setVisible(True)
+                    else:
+                        self.lbl_own_storyline_i2v_warn.setVisible(False)
+            except Exception:
+                pass
 
         # show gentle warnings (parser fallback + duration fit)
         try:
@@ -26588,6 +27422,11 @@ If the planner sees a marker like [02] or (02), it becomes the next image prompt
         _own_storyline_text = ""
         _own_storyline_prompts = []
         _own_storyline_mode = "paragraph"
+        _own_storyline_split_i2v_on = False
+        _own_storyline_i2v_text = ""
+        _own_storyline_i2v_prompts = []
+        _own_storyline_i2v_mode = "paragraph"
+        _own_storyline_i2v_mismatch_accepted = False
 
         if bool(_own_storyline_on):
             try:
@@ -26606,9 +27445,108 @@ If the planner sees a marker like [02] or (02), it becomes the next image prompt
                 except Exception:
                     _own_storyline_prompts, _own_storyline_mode = [], "paragraph"
 
+            try:
+                _own_storyline_split_i2v_on = bool(getattr(self, "chk_own_storyline_split_i2v", None) and self.chk_own_storyline_split_i2v.isChecked())
+            except Exception:
+                _own_storyline_split_i2v_on = False
+            if bool(_own_storyline_split_i2v_on):
+                try:
+                    _own_storyline_i2v_text = (self.own_storyline_i2v_edit.toPlainText() or '') if hasattr(self, "own_storyline_i2v_edit") else ""
+                except Exception:
+                    _own_storyline_i2v_text = ""
+                try:
+                    _own_storyline_i2v_prompts = getattr(self, "_own_storyline_i2v_parsed_prompts", None)
+                    _own_storyline_i2v_mode = getattr(self, "_own_storyline_i2v_parser_mode", "paragraph")
+                except Exception:
+                    _own_storyline_i2v_prompts = None
+                    _own_storyline_i2v_mode = "paragraph"
+                if (not isinstance(_own_storyline_i2v_prompts, list)) or (not _own_storyline_i2v_prompts):
+                    try:
+                        _own_storyline_i2v_prompts, _own_storyline_i2v_mode = _parse_own_storyline_prompts(_own_storyline_i2v_text)
+                    except Exception:
+                        _own_storyline_i2v_prompts, _own_storyline_i2v_mode = [], "paragraph"
+                try:
+                    _img_n = len(_own_storyline_prompts) if isinstance(_own_storyline_prompts, list) else 0
+                    _vid_n = len(_own_storyline_i2v_prompts) if isinstance(_own_storyline_i2v_prompts, list) else 0
+                except Exception:
+                    _img_n, _vid_n = 0, 0
+                try:
+                    _relaxed_ltx_i2v_drives = bool(
+                        self._is_ltx23_video_model_selected()
+                        and bool(getattr(self, "chk_use_end_images_as_last_frames", None) and self.chk_use_end_images_as_last_frames.isChecked())
+                    )
+                except Exception:
+                    _relaxed_ltx_i2v_drives = False
+                try:
+                    _start_image_provided = bool(
+                        getattr(self, "chk_chain_use_start_image", None)
+                        and self.chk_chain_use_start_image.isChecked()
+                        and getattr(self, "edit_chain_start_image", None)
+                        and os.path.isfile(str(self.edit_chain_start_image.text() or '').strip())
+                    )
+                except Exception:
+                    _start_image_provided = False
+
+                if int(_vid_n) <= 0:
+                    raise ValueError("Split image/video prompts is enabled, but the Image-to-video prompts box is empty.")
+                if bool(_relaxed_ltx_i2v_drives):
+                    if (not bool(_start_image_provided)) and int(_img_n) < 1:
+                        raise ValueError(
+                            "LTX split Own Storymode with image(s) as last frame needs 1 text-to-image prompt "
+                            "when no start image is loaded."
+                        )
+                    _own_storyline_i2v_mismatch_accepted = True
+                elif int(_img_n) > 0 and int(_img_n) != int(_vid_n):
+                    try:
+                        msg = QMessageBox(self)
+                        msg.setIcon(QMessageBox.Warning)
+                        msg.setWindowTitle("Prompt count mismatch")
+                        msg.setText(
+                            f"Text-to-image prompts: {int(_img_n)}\n"
+                            f"Image-to-video prompts: {int(_vid_n)}"
+                        )
+                        msg.setInformativeText(
+                            "Both lists work best with the same amount of prompts.\n\n"
+                            "Cancel to fix the lists, or continue and reuse prompts from the shorter list until every shot has a video prompt."
+                        )
+                        btn_cancel = msg.addButton("Cancel", QMessageBox.RejectRole)
+                        btn_do = msg.addButton("Do it anyway", QMessageBox.AcceptRole)
+                        msg.setDefaultButton(btn_cancel)
+                        msg.exec()
+                        if msg.clickedButton() is not btn_do:
+                            raise ValueError("Start cancelled because the Own Storymode prompt counts do not match.")
+                        _own_storyline_i2v_mismatch_accepted = True
+                        QMessageBox.information(
+                            self,
+                            "Continuing with mismatched prompts",
+                            "The shorter prompt list will be reused from the beginning until all generated shots have a matching image-to-video prompt."
+                        )
+                    except ValueError:
+                        raise
+                    except Exception:
+                        _own_storyline_i2v_mismatch_accepted = True
+
         enc["own_storyline_text"] = str(_own_storyline_text or '')
         enc["own_storyline_prompts"] = _own_storyline_prompts if isinstance(_own_storyline_prompts, list) else []
         enc["own_storyline_parser_mode"] = str(_own_storyline_mode or "paragraph")
+        enc["own_storyline_split_i2v_enabled"] = bool(_own_storyline_on and _own_storyline_split_i2v_on)
+        try:
+            enc["own_storyline_ltx_i2v_drives_shots"] = bool(
+                enc.get("own_storyline_split_i2v_enabled")
+                and self._is_ltx23_video_model_selected()
+                and bool(getattr(self, "chk_use_end_images_as_last_frames", None) and self.chk_use_end_images_as_last_frames.isChecked())
+            )
+        except Exception:
+            enc["own_storyline_ltx_i2v_drives_shots"] = False
+        enc["own_storyline_i2v_text"] = str(_own_storyline_i2v_text or '')
+        enc["own_storyline_i2v_prompts"] = _own_storyline_i2v_prompts if isinstance(_own_storyline_i2v_prompts, list) else []
+        enc["own_storyline_i2v_parser_mode"] = str(_own_storyline_i2v_mode or "paragraph")
+        enc["own_storyline_i2v_mismatch_accepted"] = bool(_own_storyline_i2v_mismatch_accepted)
+        enc["own_storyline_i2v_reuse_mode"] = "cycle"
+        try:
+            enc["own_storyline_i2v_digest"] = _sha1_text(json.dumps(enc.get("own_storyline_i2v_prompts") or [], sort_keys=True, ensure_ascii=False))
+        except Exception:
+            enc["own_storyline_i2v_digest"] = ""
 
         if bool(_own_storyline_on):
             # Own storyline bypasses planner-side prompt creation features (kept as metadata for later chunks).
@@ -26693,6 +27631,21 @@ If the planner sees a marker like [02] or (02), it becomes the next image prompt
             enc["qwen2511_high_quality"] = bool(getattr(self, "_ref_qwen2511_high_quality", False))
         except Exception:
             enc["qwen2511_high_quality"] = False
+
+        # Fresh per-job variation seed: same prompts stay stable inside this job,
+        # but a brand-new run with the same idea/settings gets a new variation.
+        try:
+            if int(_planner_coerce_seed_int(enc.get("planner_job_variation_seed"), 0) or 0) <= 0:
+                enc["planner_job_variation_seed"] = int(_planner_new_job_variation_seed())
+            enc["job_variation_seed"] = int(_planner_coerce_seed_int(enc.get("planner_job_variation_seed"), 0) or 0)
+            enc["planner_seed_scope"] = "per_job_variation"
+        except Exception:
+            try:
+                enc["planner_job_variation_seed"] = int(_planner_new_job_variation_seed())
+                enc["job_variation_seed"] = int(enc.get("planner_job_variation_seed") or 0)
+                enc["planner_seed_scope"] = "per_job_variation"
+            except Exception:
+                pass
 
         job = PlannerJob(
             job_id=str(uuid.uuid4())[:8],
