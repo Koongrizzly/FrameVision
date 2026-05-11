@@ -443,15 +443,14 @@ _Metadata Tool_ – edit or delete metadata from videos and images (with batch s
 ---
 FrameVision feature list
 ---
-### 🖌️ TXT → IMG (SD15/SDXL/Z-Image/Qwen 2512 fp16/gguf q4-q8)
+### 🖌️ TXT → IMG (SD15/SDXL/Z-Image/Hidream/Flux Klein/Qwen 2512 fp16/gguf q4-q8)
 ### 🎬 txt/img/video to video with WAN 2.2 5B and/or HunyuanVideo 1.5 (video extender included for direct runs)
-### 🧪 Upscaler with model loader (15+ open source upscale models for photo & video)
+### 🧪 Upscaler with model loader (15+ open source upscale models for photo & video) and seed2VR
 ### ⏱️ RIFE Interpolation
 ### 📝 Describe in detail with Qwen3 VL
 ### 🎙️ Text to speech with Qwen 3 (full model pack includes voice cloning and creating own style voices)
 ### 🎵 (music) videoclip creator
 ### 🎵 Ace Music creation
-### 🎵 HeartMula Music creation
 ### 📁 Media Explorer with Json viewer
 ### 🖌 Remove Background + basic (sdXL) inpainting + Qwen edit 2511
 ### 👽 Ask Framie, little offline chatbot, works with Qwen3VL 2B
@@ -483,15 +482,13 @@ FrameVision feature list
 Run **`framevision.exe`** — it automatically:
 1. Opens the installer menu if setup is incomplete. (give 1 time approval in windows to use an unknown app)
 2. select 'check requirements' if you never installed something A.i. related before to have environment, git, python,... installed
-3. This app is mainly created for RTX Nvidea users but an option for cpu install is also included (expect big models to not work or take forever to create a video or image)
-4. After install it starts the app and background worker. (keep the background worker open when using queue)
-5. select an optional install in the app (optional downloads menu) to get the model(s) you need (wan 2.2, hunyuan, z-image,..)
+3. After install it starts the app and background worker. (keep the background worker open when using queue)
+4. select an optional install in the app (optional downloads menu) to get the model(s) you need (wan 2.2, hunyuan, z-image,..)
 
 ### Installer Menu Options
 - 1 **check requirements** + basic 'first time ai' installer.
 - 2 **Core Install:** App only (minimal).use this if app stops working after install to get a quick reset
-- 3 **Full CPU Install:** Torch CPU + models/binaries.
-- 4 **Full CUDA Install:** Torch CUDA + models/binaries.
+- 3 **Full CUDA Install:** Torch CUDA + models/binaries.
 ---
 User friendly, Portable & offline
 (install must go to c:\framevision-main, once everything is installed no more internet is needed and you can move the folder to any other location on the drive.
