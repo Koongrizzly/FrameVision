@@ -15,7 +15,7 @@ ________________________________________________________________________________
 
 - Hidream Image : probably the best open source image edit ai of the moment
 - if you already have installed Framevision, just do an update nside te app to download all new files and restart the app, it will be added to optional installs and you can install it from there.
-- choice between base and dev model, (BF16 needs up to 20 gig of vram, fp8 fits in 12 gig vram)
+- choice between base and dev model, (BF16 needs up to 20 gig of vram, fp8 fits in 16 gig vram)
 </details>
 
 <details>
