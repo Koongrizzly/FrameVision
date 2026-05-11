@@ -10,6 +10,17 @@ RTX graphics card with at least 8 gigabyte of vram is advised, some models need 
 ---
 
 <details>
+<summary>May 10th 2026 V2.3.4 small update brings Hidream Image/edit 
+__________________________________________________________________________________
+
+- Hidream Image : probably the best open source image edit ai of the moment
+- if you already have installed the app, just do an update, it will be added to optional installs
+- choice between base and dev model, (BF16 needs up to 20 gig of vram, soon i will also add fp8)
+ 
+
+</details>
+
+<details>
 <summary>April 11th 2026 V2.3.3 small update brings new XL models for Ace step 1.5</summary>
 __________________________________________________________________________________
 
