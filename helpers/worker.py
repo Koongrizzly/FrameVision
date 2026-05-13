@@ -4701,10 +4701,18 @@ def hidream_generate(job, cfg, mani):
     model_key = str(args.get('model_key') or 'base').strip() or 'base'
     prompt = str(args.get('prompt') or '').strip()
     settings = args.get('settings') or {}
-    refs = args.get('refs') or []
+    refs = args.get('refs') or args.get('ref_images') or []
     if isinstance(refs, str):
         refs = [refs]
     refs = [str(x).strip() for x in refs if str(x).strip()]
+    # If an older queued job only stored the first reference as the job input, recover it.
+    if not refs:
+        try:
+            inp_ref = str(job.get('input') or job.get('input_path') or '').strip()
+            if inp_ref:
+                refs = [inp_ref]
+        except Exception:
+            pass
     keep_original_aspect = bool(args.get('keep_original_aspect') or False)
 
     try:
@@ -4722,7 +4730,7 @@ def hidream_generate(job, cfg, mani):
         pass
 
     env_python = str(args.get('env_python') or (ROOT / 'environments' / '.hidream_dev' / 'python.exe')).strip()
-    runner = str(args.get('runner') or (ROOT / 'models' / 'hidream_bf16' / 'run_hidream.py')).strip()
+    runner = str(args.get('runner') or (ROOT / 'helpers' / 'hidream_cli.py')).strip()
     if not _P(env_python).exists():
         _mark_error(job, f'HiDream env python not found: {env_python}')
         return 2
@@ -4746,6 +4754,7 @@ def hidream_generate(job, cfg, mani):
 
     cmd = [
         env_python, '-u', runner,
+        '--resolution_mode', 'framevision',
         '--model_key', model_key,
         '--width', str(int(_sg('width', 1280))),
         '--height', str(int(_sg('height', 720))),
@@ -4799,14 +4808,105 @@ def hidream_generate(job, cfg, mani):
         pass
 
     try:
+        print('[worker][hidream] mode:', str(args.get('mode') or 'create'), '| refs:', len(refs), '| output:', str(out_path))
+        if refs:
+            for i, rp in enumerate(refs, start=1):
+                print(f'[worker][hidream] ref {i}: {rp}')
         print('[worker][hidream] CMD:', ' '.join([str(x) for x in cmd]))
     except Exception:
         pass
     try:
         _progress_set(2)
+        _patch_running_json({'stage': 'HiDream generating'})
     except Exception:
         pass
-    code = run(cmd)
+
+    # Stream runner output live so the Queue/worker log shows the current steps,
+    # and keep the queue progress bar alive instead of jumping from start to end.
+    import re as _re
+    env = os.environ.copy()
+    # Avoid leaking FrameVision's Python import paths into the HiDream environment.
+    # The CLI inserts the HiDream repo path itself, so PYTHONPATH/PYTHONHOME are not needed here.
+    env.pop('PYTHONPATH', None)
+    env.pop('PYTHONHOME', None)
+    env.setdefault('PYTHONUTF8', '1')
+    env.setdefault('PYTHONIOENCODING', 'utf-8')
+    code = 1
+    was_cancel = False
+    last_pct = 2
+    try:
+        p = subprocess.Popen(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            encoding='utf-8',
+            errors='replace',
+            env=env,
+            cwd=str(_P(runner).parent),
+            bufsize=1,
+        )
+        try:
+            _patch_running_json({'active_pid': int(getattr(p, 'pid', 0) or 0), 'active_cmd': ' '.join([str(x) for x in cmd])})
+        except Exception:
+            pass
+
+        q, _t = _start_proc_reader(p)
+        while True:
+            if _cancel_requested():
+                was_cancel = True
+                _note_cancel('Cancelled by user')
+                try:
+                    _kill_process_tree(getattr(p, 'pid', 0) or 0)
+                except Exception:
+                    pass
+                break
+            try:
+                item = q.get_nowait()
+            except _queue.Empty:
+                item = None
+            if item is None:
+                if p.poll() is not None:
+                    break
+                time.sleep(0.15)
+                continue
+            if item is _EOF:
+                break
+            line = str(item or '')
+            stripped = line.rstrip('\r\n')
+            if stripped:
+                try:
+                    print(stripped)
+                except Exception:
+                    pass
+                matches = _re.findall(r'(\d+)\s*/\s*(\d+)', stripped)
+                if matches:
+                    try:
+                        cur, total = map(int, matches[-1])
+                        if total > 0:
+                            pct = max(2, min(98, int(2 + (float(cur) / float(total)) * 96.0)))
+                            if pct != last_pct:
+                                last_pct = pct
+                                _progress_set(pct)
+                            try:
+                                _patch_running_json({'stage': f'HiDream generating {cur}/{total}', 'step': int(cur), 'steps_total': int(total)})
+                            except Exception:
+                                pass
+                    except Exception:
+                        pass
+        try:
+            code = p.wait(timeout=1.5) if was_cancel else p.wait()
+        except Exception:
+            try:
+                code = p.wait()
+            except Exception:
+                code = 1
+        if was_cancel:
+            code = 130
+    except Exception as e:
+        _mark_error(job, f'HiDream launch failed: {e}')
+        return 2
+
     if code == 130:
         _note_cancel('Cancelled by user')
         return 130
@@ -4818,6 +4918,7 @@ def hidream_generate(job, cfg, mani):
         return 1
     try:
         _progress_set(100)
+        _patch_running_json({'stage': 'HiDream finished'})
     except Exception:
         pass
     return 0

@@ -92,61 +92,64 @@ def _run_wan22(root: Path) -> Optional[Tuple[str, List[str], Path]]:
     return _cmd_call_bat(script, root)
 
 
-def _run_zimage(root: Path) -> Optional[Tuple[str, List[str], Path]]:
-    script = root / "presets" / "extra_env" / "zimage_install.bat"
-    if not script.exists():
-        return None
-    return _cmd_call_bat(script, root)
+def _zimage_unified_script(root: Path) -> Optional[Path]:
+    """Return the unified Z-Image installer script introduced by the cleanup patch."""
+    script = root / "presets" / "extra_env" / "zimage_install.py"
+    if script.exists():
+        return script
+    return None
 
 
-
-def _run_zimage_fp16(root: Path) -> Optional[Tuple[str, List[str], Path]]:
-    """Install Z-Image Turbo safetensors (fp16 diffusion + text encoder + VAE)."""
-    script = root / "presets" / "extra_env" / "zimage_gguf_install.py"
-    if not script.exists():
+def _run_zimage_installer(root: Path, args_extra: List[str]) -> Optional[Tuple[str, List[str], Path]]:
+    """Run presets/extra_env/zimage_install.py with the current app Python."""
+    script = _zimage_unified_script(root)
+    if script is None:
         return None
     py = _venv_python(root)
     if py is None or (not py.exists()):
         return None
-    target = (root / "models" / "Z-Image-Turbo").resolve()
-    args = [
-        "-u",
-        str(script),
-        str(root),
-        str(target),
-        "--mode",
-        "safetensors",
-        "--precision",
-        "fp16",
-    ]
+    args = ["-u", str(script), str(root), *args_extra]
     return (str(py), args, root)
+
+
+def _run_zimage(root: Path) -> Optional[Tuple[str, List[str], Path]]:
+    """Create/update the shared Z-Image environment in environments/.zimage_env."""
+    return _run_zimage_installer(root, ["--mode", "env"])
+
+
+def _run_zimage_fp16(root: Path) -> Optional[Tuple[str, List[str], Path]]:
+    """Install the Z-Image Turbo full 16-bit Diffusers model with automatic BF16/FP16 runtime selection."""
+    target = (root / "models" / "Z-Image-Turbo").resolve()
+    return _run_zimage_installer(
+        root,
+        [
+            str(target),
+            "--mode",
+            "diffusers",
+            "--precision",
+            "auto",
+        ],
+    )
 
 
 def _run_zimage_gguf(root: Path, quant: str) -> Optional[Tuple[str, List[str], Path]]:
     """
-    Z-Image Turbo GGUF installer (no .bat wrapper).
+    Z-Image Turbo GGUF installer through the unified installer.
     Supported quants: Q4_0, Q5_0, Q6_K, Q8_0
     """
-    script = root / "presets" / "extra_env" / "zimage_gguf_install.py"
-    if not script.exists():
-        return None
-
-    py = _venv_python(root)
-    if not py:
-        return None
-
     target = (root / "models" / "Z-Image-Turbo GGUF").resolve()
-    args = [
-        "-u",
-        str(script),
-        str(root),
-        str(target),
-        "--quant",
-        quant,
-        "--match-text-quant",
-        "1",
-    ]
-    return (str(py), args, root)
+    return _run_zimage_installer(
+        root,
+        [
+            str(target),
+            "--mode",
+            "gguf",
+            "--quant",
+            quant,
+            "--match-text-quant",
+            "1",
+        ],
+    )
 
 
 def _run_zimage_gguf5(root: Path) -> Optional[Tuple[str, List[str], Path]]:
@@ -716,13 +719,16 @@ def _run_qwen2511_q8(root: Path) -> Optional[Tuple[str, List[str], Path]]:
 
 
 def _run_hidream_edit(root: Path, models: str) -> Optional[Tuple[str, List[str], Path]]:
-    """Install HiDream Image Edit BF16 environment/repo and selected model(s)."""
+    """Install HiDream Image Edit environment/repo and selected BF16/FP8 model(s)."""
     script = root / "presets" / "extra_env" / "hidream_install.py"
     if not script.exists():
         return None
     py = _venv_python(root)
     if py is None or (not py.exists()):
         return None
+    # hidream_install.py is responsible for reusing environments/.hidream_dev,
+    # the official repo, and already-downloaded model files. These switches keep
+    # optional installs non-interactive while still allowing model-only additions.
     args = ["-u", str(script), "--models", str(models), "--no-prompt"]
     return (str(py), args, root)
 
@@ -737,6 +743,22 @@ def _run_hidream_edit_dev(root: Path) -> Optional[Tuple[str, List[str], Path]]:
 
 def _run_hidream_edit_both(root: Path) -> Optional[Tuple[str, List[str], Path]]:
     return _run_hidream_edit(root, "both")
+
+
+def _run_hidream_edit_base_fp8(root: Path) -> Optional[Tuple[str, List[str], Path]]:
+    return _run_hidream_edit(root, "base_fp8")
+
+
+def _run_hidream_edit_dev_fp8(root: Path) -> Optional[Tuple[str, List[str], Path]]:
+    return _run_hidream_edit(root, "dev_fp8")
+
+
+def _run_hidream_edit_both_fp8(root: Path) -> Optional[Tuple[str, List[str], Path]]:
+    return _run_hidream_edit(root, "both_fp8")
+
+
+def _run_hidream_edit_all(root: Path) -> Optional[Tuple[str, List[str], Path]]:
+    return _run_hidream_edit(root, "all")
 
 def _run_sdxl_juggernaut(root: Path) -> Optional[Tuple[str, List[str], Path]]:
     script = root / "scripts" / "download_sd_models.py"
@@ -1000,6 +1022,30 @@ OptionalInstall(
             runner=_run_hidream_edit_both,
         ),
         OptionalInstall(
+            key="hidream_edit_base_fp8",
+            title="HiDream Image Edit FP8 (Base / Full)",
+            description="HiDream image edit model. Installs/reuses environments/.hidream_dev, the official repo, and downloads only the Base / Full FP8 model when missing.",
+            runner=_run_hidream_edit_base_fp8,
+        ),
+        OptionalInstall(
+            key="hidream_edit_dev_fp8",
+            title="HiDream Image Edit FP8 (Dev)",
+            description="HiDream image edit model. Installs/reuses environments/.hidream_dev, the official repo, and downloads only the Dev FP8 model when missing.",
+            runner=_run_hidream_edit_dev_fp8,
+        ),
+        OptionalInstall(
+            key="hidream_edit_both_fp8",
+            title="HiDream Image Edit FP8 (Base + Dev)",
+            description="Installs/reuses the HiDream environment/repo and downloads both Base / Full FP8 and Dev FP8 models, skipping files that already exist.",
+            runner=_run_hidream_edit_both_fp8,
+        ),
+        OptionalInstall(
+            key="hidream_edit_all",
+            title="HiDream Image Edit BF16 + FP8 (All)",
+            description="Installs/reuses the HiDream environment/repo and downloads Base / Full + Dev for both BF16 and FP8, skipping files that already exist.",
+            runner=_run_hidream_edit_all,
+        ),
+        OptionalInstall(
             key="qwen2512",
             title="Qwen2512 Text to Image environment install",
             description="Installs the Qwen-Image-2512 GGUF environment. Creates: .qwen2512/venv/.",
@@ -1148,13 +1194,13 @@ OptionalInstall(
         OptionalInstall(
             key="zimage",
             title="Z-image Turbo Text to Image",
-            description="VRAM: 16GB+ for best quality (FP16). If you have less then 16GB, use the GGUF options (Q4–Q8).",
+            description="Shared Z-Image environment. For best quality install the full 16-bit model; Auto will pick BF16/FP16. If you have less than 16GB VRAM, use the GGUF options (Q4–Q8).",
             runner=_run_zimage,
         ),
         OptionalInstall(
             key="zimage_fp16",
-            title="Full 16 FP model",
-            description="VRAM: 16GB recommended. Disk: ~21GB download (diffusion fp16 + text encoder + VAE). Tip: try bf16 if fp16 shows black images.",
+            title="Full 16-bit model (Diffusers Auto BF16/FP16)",
+            description="VRAM: 16GB recommended. Downloads the official Z-Image Turbo Diffusers folder layout (model_index.json + repo folders). Runtime automatically uses BF16 when the GPU/PyTorch setup supports it; otherwise FP16. Does not download GGUF.",
             runner=_run_zimage_fp16,
         ),
         OptionalInstall(
@@ -1388,10 +1434,14 @@ _ENV_DIR_BY_KEY = {
     "gfpgan": Path("models") / "gfpgan" / ".GFPGAN",
     "seedvr2_env": Path("environments") / ".seedvr2",
     "wan22": Path(".wan_venv"),
-    "zimage": Path(".zimage_env"),
+    "zimage": Path("environments") / ".zimage_env",
     "hidream_edit_base": Path("environments") / ".hidream_dev",
     "hidream_edit_dev": Path("environments") / ".hidream_dev",
     "hidream_edit_both": Path("environments") / ".hidream_dev",
+    "hidream_edit_base_fp8": Path("environments") / ".hidream_dev",
+    "hidream_edit_dev_fp8": Path("environments") / ".hidream_dev",
+    "hidream_edit_both_fp8": Path("environments") / ".hidream_dev",
+    "hidream_edit_all": Path("environments") / ".hidream_dev",
     "sdxl_inpaint_env": Path(".sdxl_inpaint"),
     # Not on the UI list yet, but reserved for future use.
     "comfui": Path(".comfui_env"),
@@ -1721,6 +1771,18 @@ class OptionalInstallsDialog(QtWidgets.QDialog):
             if opt:
                 _add_opt(opt, hidream_lay)
 
+        _add_group_label("FP8 models (choose one)", hidream_lay)
+        for k in ("hidream_edit_base_fp8", "hidream_edit_dev_fp8", "hidream_edit_both_fp8"):
+            opt = by_key.get(k)
+            if opt:
+                _add_opt(opt, hidream_lay)
+
+        _add_group_label("Everything", hidream_lay)
+        for k in ("hidream_edit_all",):
+            opt = by_key.get(k)
+            if opt:
+                _add_opt(opt, hidream_lay)
+
         opts_lay.addWidget(hidream_sec)
 
         # Qwen group (collapsible)
@@ -1772,7 +1834,7 @@ class OptionalInstallsDialog(QtWidgets.QDialog):
         zimg_sec = _CollapsibleSection("Z-Image models", start_collapsed=True)
         zimg_lay = zimg_sec.layout_content()
 
-        _add_group_label("Z-Image Turbo (full fp16)", zimg_lay)
+        _add_group_label("Z-Image Turbo (full 16-bit)", zimg_lay)
         for k in ("zimage", "zimage_fp16"):
             opt = by_key.get(k)
             if opt:
@@ -2249,11 +2311,11 @@ class OptionalInstallsDialog(QtWidgets.QDialog):
                 pass
 
         # Prereqs for the Turbo model downloader.
-        script = self.root_dir / "presets" / "extra_env" / "zimage_gguf_install.py"
+        script = self.root_dir / "presets" / "extra_env" / "zimage_install.py"
         if not script.exists():
             self._toast(
-                "Z-Image downloader missing: presets/extra_env/zimage_gguf_install.py. "
-                "Update your FrameVision install or reinstall optional installs scripts."
+                "Z-Image installer missing: presets/extra_env/zimage_install.py. "
+                "Apply the Z-Image unified installer patch first."
             )
             return
 
@@ -2389,6 +2451,38 @@ class OptionalInstallsDialog(QtWidgets.QDialog):
             self._toast("Qwen 3 TTS environment not found — it will be installed first.")
 
         self._toast("Qwen 3 TTS models will download when you press Start (env install only needed once).")
+
+
+    def _on_hidream_edit_model_toggled(self, key: str, checked: bool) -> None:
+        """Keep HiDream model selections sane and warn when the installer is missing."""
+        if not checked:
+            return
+
+        # All HiDream entries share the same installer/env. Treat the options as
+        # mutually exclusive so users do not accidentally queue duplicate runs for
+        # the same shared environment/model root.
+        try:
+            for k, row in getattr(self, "_row_by_key", {}).items():
+                if k.startswith("hidream_edit_") and k != key and row.is_checked():
+                    row.set_checked(False)
+        except Exception:
+            pass
+
+        script = self.root_dir / "presets" / "extra_env" / "hidream_install.py"
+        if not script.exists():
+            self._toast("HiDream installer missing: presets/extra_env/hidream_install.py")
+            return
+
+        py = _venv_python(self.root_dir)
+        if py is None or (not py.exists()):
+            self._toast("Python .venv not found. Run the main installer first so FrameVision creates .venv.")
+            return
+
+        env_dir = (self.root_dir / "environments" / ".hidream_dev").resolve()
+        if not env_dir.exists():
+            self._toast("HiDream environment not found — it will be installed first.")
+        else:
+            self._toast("HiDream will reuse the existing env/repo and only download missing model files.")
 
 
     def _on_hunyuan15_extra_toggled(self, key: str, checked: bool) -> None:
@@ -2689,8 +2783,8 @@ class OptionalInstallsDialog(QtWidgets.QDialog):
             return
 
         # Special case:
-        # If the user chooses to keep an existing Z-image env, do NOT re-run zimage_install.bat.
-        # That .bat tends to reinstall anyway; keeping means we should skip straight to the next step.
+        # If the user chooses to keep an existing Z-Image env, do NOT re-run the env install.
+        # Keeping means we should skip straight to the model download step.
         if decision == "keep" and self._running.key == "zimage":
             self._append_line("[INFO] Skipping Z-image environment install (keeping existing env).")
             self._toast("Z-image env kept. Continuing to downloads…")

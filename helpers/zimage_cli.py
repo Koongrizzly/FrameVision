@@ -5,11 +5,9 @@ Z-Image Turbo txt2img helper for FrameVision.
 This version is fully OFFLINE and uses the local model folder:
     <root>/models/Z-Image-Turbo
 
-Requirements (handled by zimage_install.bat):
-  * models/Z-Image-Turbo/ directory must contain a full snapshot of
-    Tongyi-MAI/Z-Image-Turbo, with the transformer weights replaced by
-    an FP8 checkpoint at:
-        transformer/diffusion_pytorch_model.safetensors
+Requirements (handled by presets/extra_env/zimage_install.py):
+  * models/Z-Image-Turbo/ directory must contain the full Diffusers snapshot of
+    Tongyi-MAI/Z-Image-Turbo, including model_index.json and the repo subfolders.
 
 It:
   * Chooses CUDA + bfloat16/float16 when available, else CPU + float32.
@@ -292,6 +290,49 @@ def _run_gguf(args) -> dict:
 
     return {"files": files, "model": "Z-Image-Turbo", "backend": "gguf"}
 
+
+def _read_active_precision(model_dir: Path) -> str:
+    """Read installer-selected runtime precision from models/Z-Image-Turbo/_active_precision.txt."""
+    try:
+        marker = model_dir / "_active_precision.txt"
+        if not marker.exists():
+            return ""
+        first = marker.read_text(encoding="utf-8", errors="replace").splitlines()[0].strip().lower()
+        if first in {"bf16", "fp16", "fp32", "auto"}:
+            return first
+    except Exception:
+        pass
+    return ""
+
+
+def _apply_active_precision(torch, device: str, dtype, model_dir: Path):
+    """Apply the installer-selected BF16/FP16 preference when possible.
+
+    No marker = keep the built-in auto behavior. A BF16 marker still falls back to FP16
+    when the current Torch/CUDA setup does not report BF16 support.
+    """
+    pref = _read_active_precision(model_dir)
+    if not pref or pref == "auto":
+        return dtype
+    try:
+        if device != "cuda":
+            return torch.float32
+        if pref == "fp32":
+            return torch.float32
+        if pref == "fp16":
+            return torch.float16
+        if pref == "bf16":
+            try:
+                if hasattr(torch.cuda, "is_bf16_supported") and torch.cuda.is_bf16_supported():
+                    return getattr(torch, "bfloat16", torch.float16)
+            except Exception:
+                pass
+            return torch.float16
+    except Exception:
+        return dtype
+    return dtype
+
+
 def main(argv=None) -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--backend", default="diffusers", choices=["diffusers", "gguf"], help="Backend: diffusers (default) or gguf (stable-diffusion.cpp)")
@@ -380,6 +421,9 @@ def main(argv=None) -> int:
         model_dir = root / "models" / "Z-Image-Turbo"
     except Exception:
         model_dir = Path("models/Z-Image-Turbo")
+
+    # Apply installer-selected runtime precision marker, if present.
+    dtype = _apply_active_precision(torch, device, dtype, model_dir)
 
     # Load pipeline from LOCAL directory only, no HF cache/network.
     try:

@@ -43,9 +43,11 @@ class QueuePane(QWidget):
 
     MAX_PENDING_SHOW = 199
 
-    MAX_DONE_KEEP    = 50
+    # Finished queue records are kept intentionally tiny. Old finished JSONs
+    # have caused global app/video-player slowdowns when they pile up.
+    MAX_DONE_KEEP    = 5
 
-    MAX_DONE_SHOW    = 50
+    MAX_DONE_SHOW    = 5
 
     MAX_FAILED_KEEP  = 50
 
@@ -102,6 +104,13 @@ class QueuePane(QWidget):
         except Exception:
             from queue_system import QueueSystem
         self.qs = QueueSystem(self.BASE)
+
+        # Startup safety cleanup: finished jobs are convenience history, not live queue state.
+        # Keep only the latest few job JSONs so old finished records cannot slow down playback.
+        try:
+            self._startup_cleanup_finished_jobs(keep=int(getattr(self, "MAX_DONE_KEEP", 5)))
+        except Exception:
+            pass
 
         # Root layout and scroll container
         root = QVBoxLayout(self)
@@ -278,6 +287,83 @@ class QueuePane(QWidget):
         self.refresh()
         # timers start in showEvent / start_auto() when the Queue tab becomes visible
 
+    def _startup_cleanup_finished_jobs(self, keep: int = 5):
+        """Delete old finished queue JSON records at startup, keeping newest N.
+
+        This deletes only job metadata from jobs/done. It never deletes generated
+        output media. Pending/running/failed queues are intentionally untouched.
+        """
+        try:
+            keep = max(0, int(keep))
+        except Exception:
+            keep = 5
+        done_dir = None
+        try:
+            done_dir = self.JOBS_DIRS.get("done") if isinstance(self.JOBS_DIRS, dict) else None
+        except Exception:
+            done_dir = None
+        if done_dir is None:
+            try:
+                done_dir = Path(self.BASE) / "jobs" / "done"
+            except Exception:
+                return
+        try:
+            done_dir = Path(done_dir)
+        except Exception:
+            return
+        if not done_dir.exists():
+            return
+
+        records = []
+        try:
+            for p in done_dir.glob("*.json"):
+                try:
+                    if not self._is_main_job_json(p):
+                        continue
+                    records.append((p.stat().st_mtime, p))
+                except Exception:
+                    continue
+        except Exception:
+            records = []
+
+        if len(records) <= keep:
+            try:
+                self._last_startup_cleanup_msg = f"Queue startup cleanup: kept {len(records)} finished jobs, deleted 0 old finished job records. Output files untouched."
+            except Exception:
+                pass
+            return
+
+        try:
+            records.sort(key=lambda item: item[0], reverse=True)
+        except Exception:
+            pass
+        victims = [p for _ts, p in records[keep:]]
+        deleted = 0
+        for p in victims:
+            try:
+                p.unlink()
+                deleted += 1
+            except Exception:
+                pass
+
+        msg = f"Queue startup cleanup: kept {min(keep, len(records))} finished jobs, deleted {deleted} old finished job records. Output files untouched."
+        try:
+            self._last_startup_cleanup_msg = msg
+        except Exception:
+            pass
+        try:
+            print(msg)
+        except Exception:
+            pass
+        try:
+            logs_dir = Path(self.BASE) / "logs"
+            logs_dir.mkdir(parents=True, exist_ok=True)
+            stamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            with (logs_dir / "queue_startup_cleanup.log").open("a", encoding="utf-8") as f:
+                f.write(f"[{stamp}] {msg}\n")
+        except Exception:
+            pass
+
     def _apply_policies(self, w: QListWidget):
         try:
             w.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
@@ -438,7 +524,7 @@ class QueuePane(QWidget):
             except Exception:
                 auto_cleanup = False
 
-            if auto_cleanup:
+            if auto_cleanup and not (status == "done" and int(max_keep or 0) <= 5):
                 try:
                     # Start cleanup slightly before hitting the max.
                     # Done: allow up to (max_keep - 2) then remove a batch of 10 so we drop to ~38-39.
@@ -642,12 +728,17 @@ class QueuePane(QWidget):
                 found = False
 
             if found:
-                # Refresh existing row's contents
-                try:
-                    if hasattr(found_widget, 'refresh'):
-                        found_widget.refresh()
-                except Exception:
-                    pass
+                # Refresh existing row's contents only for live/mutable queues.
+                # Done/Failed rows are immutable; refreshing them repeatedly re-reads JSON,
+                # re-resolves output media, may scan output folders, and can generate thumbnails.
+                # That work happens on the GUI thread and was a major source of video-player stutter
+                # when the finished queue grew.
+                if str(status).lower() in ("running", "pending", "queued"):
+                    try:
+                        if hasattr(found_widget, 'refresh'):
+                            found_widget.refresh()
+                    except Exception:
+                        pass
                 # Reposition item if order changed
                 try:
                     if found_row is not None and found_row != idx:

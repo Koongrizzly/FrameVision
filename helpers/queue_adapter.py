@@ -1140,6 +1140,9 @@ def enqueue_hidream_from_widget(inner, mode: str = "create"):
     if short:
         label += ': ' + short
 
+    # Keep both names so older/newer worker builds cannot accidentally drop references.
+    # The worker primarily reads 'refs', while other FrameVision image-edit jobs use
+    # 'ref_images'. Supplying both makes edit and multi-reference queue jobs robust.
     args = {
         'label': label,
         'mode': mode,
@@ -1147,6 +1150,7 @@ def enqueue_hidream_from_widget(inner, mode: str = "create"):
         'prompt': prompt,
         'raw_prompt': raw_prompt,
         'refs': refs,
+        'ref_images': refs,
         'ref_roles': ref_roles,
         'keep_original_aspect': keep_original_aspect,
         'settings': settings,
@@ -1154,6 +1158,7 @@ def enqueue_hidream_from_widget(inner, mode: str = "create"):
         'out_file': out_path,
         'outfile': out_path,
         'out_dir': out_dir,
+        'hidream_ref_count': len(refs),
     }
 
     input_path = refs[0] if refs else ''

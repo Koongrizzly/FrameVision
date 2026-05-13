@@ -21,6 +21,7 @@ import subprocess
 import tempfile
 import re
 from datetime import datetime
+from pathlib import Path
 from dataclasses import dataclass, replace, field
 from typing import List, Optional, Tuple, Dict
 
@@ -105,6 +106,49 @@ def _find_ffprobe_from_env() -> str:
     return "ffprobe"
 
 
+
+
+
+
+
+def _musicclip_project_root() -> str:
+    """Return the FrameVision project root from this helper file."""
+    try:
+        return os.path.abspath(os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
+    except Exception:
+        return os.path.abspath(os.getcwd())
+
+
+def _musicclip_abs_path(root: str, path: str) -> str:
+    """Resolve relative FrameVision paths against the project root."""
+    p = str(path or "").strip()
+    if not p:
+        return ""
+    try:
+        if os.path.isabs(p):
+            return os.path.abspath(p)
+        return os.path.abspath(os.path.join(str(root or _musicclip_project_root()), p))
+    except Exception:
+        return p
+
+
+def _musicclip_whisper_env_python(root: Optional[str] = None) -> str:
+    base = str(root or _musicclip_project_root())
+    if os.name == "nt":
+        return os.path.join(base, "environments", ".whisper", "Scripts", "python.exe")
+    return os.path.join(base, "environments", ".whisper", "bin", "python")
+
+
+def _musicclip_whisper_model_dir(root: Optional[str] = None) -> str:
+    return os.path.join(str(root or _musicclip_project_root()), "models", "faster_whisper", "medium")
+
+
+def _musicclip_default_whisper_output_dir(root: Optional[str] = None) -> str:
+    return os.path.join(str(root or _musicclip_project_root()), "output", "whisper")
+
+
+def _musicclip_temp_dir(root: Optional[str] = None) -> str:
+    return os.path.join(str(root or _musicclip_project_root()), "output", "_temp")
 
 
 def _cine_grid_dims(screen_count: int) -> tuple[int, int]:
@@ -971,6 +1015,557 @@ class ClipPresetManagerDialog(QDialog):
             return
         self.accept()
 
+# --------------------------- smart director v1 ----------------------------
+
+SMART_DIRECTOR_PRESETS: List[str] = [
+    "Manual / Classic",
+    "Balanced",
+    "Clean Cinematic",
+    "EDM / Festival",
+    "DnB / Chaos",
+    "Vocal Story",
+    "Dreamy / Emotional",
+]
+
+SMART_SCENE_CUT_STYLES: List[str] = [
+    "Auto",
+    "Short",
+    "Medium",
+    "Long",
+    "Strong beats only",
+    "Busy music video",
+]
+
+SMART_SCENE_MAX_MODES: List[str] = [
+    "Auto (source-aware)",
+    "Manual",
+    "Off",
+]
+
+
+def _clamp01(v: float) -> float:
+    try:
+        return max(0.0, min(1.0, float(v)))
+    except Exception:
+        return 0.0
+
+
+def _norm_smart_name(value: str, choices: List[str], default: str) -> str:
+    raw = str(value or "").strip().lower()
+    if not raw:
+        return default
+    for item in choices:
+        if raw == item.lower():
+            return item
+    # tolerate saved enum-ish names from older/dev builds
+    raw2 = raw.replace("_", " ").replace("-", " /")
+    for item in choices:
+        if raw2 == item.lower():
+            return item
+    return default
+
+
+def _normalize_director_preset(value: str) -> str:
+    return _norm_smart_name(value, SMART_DIRECTOR_PRESETS, "Balanced")
+
+
+def _normalize_cut_style(value: str) -> str:
+    return _norm_smart_name(value, SMART_SCENE_CUT_STYLES, "Auto")
+
+
+def _normalize_smart_scene_max_mode(value: str) -> str:
+    raw = str(value or "").strip().lower()
+    if raw in ("", "auto", "source", "source-aware", "source aware", "auto source", "auto source aware"):
+        return "Auto (source-aware)"
+    if raw in ("manual", "custom"):
+        return "Manual"
+    if raw in ("off", "none", "disabled", "disable", "no max", "unlimited"):
+        return "Off"
+    return _norm_smart_name(value, SMART_SCENE_MAX_MODES, "Auto (source-aware)")
+
+
+def _normalize_smart_cut_timing_offset(value: float) -> float:
+    try:
+        v = float(value)
+    except Exception:
+        v = 0.0
+    return max(-1.0, min(0.5, v))
+
+
+def _percentile(values: List[float], q: float) -> float:
+    vals = sorted(float(v) for v in (values or []) if float(v) > 0.0)
+    if not vals:
+        return 0.0
+    if len(vals) == 1:
+        return vals[0]
+    pos = (len(vals) - 1) * max(0.0, min(1.0, float(q)))
+    lo = int(math.floor(pos))
+    hi = int(math.ceil(pos))
+    if lo == hi:
+        return vals[lo]
+    frac = pos - lo
+    return vals[lo] * (1.0 - frac) + vals[hi] * frac
+
+
+def _smart_source_duration_stats(source_clip_durations: Optional[List[float]]) -> dict:
+    vals: List[float] = []
+    for raw in (source_clip_durations or []):
+        try:
+            v = float(raw)
+        except Exception:
+            continue
+        if v > 0.20:
+            vals.append(v)
+    vals.sort()
+    if not vals:
+        return {
+            "count": 0,
+            "min": 0.0,
+            "median": 0.0,
+            "p75": 0.0,
+            "p90": 0.0,
+            "max": 0.0,
+            "auto_max": 0.0,
+        }
+    median = _percentile(vals, 0.50)
+    p75 = _percentile(vals, 0.75)
+    p90 = _percentile(vals, 0.90)
+    # Auto aims at the upper-middle of the loaded source clips. For a folder of
+    # mostly 3-6s clips this lands around 4-5.5s, which avoids forcing most
+    # clips into unwanted stretching/slow motion while still leaving room for
+    # calmer intro/outro shots. Users can choose Manual or Off when they want
+    # long, held shots from long source footage.
+    auto_max = p75 * 0.95 if p75 > 0.0 else median
+    auto_max = max(median * 0.95, auto_max)
+    auto_max = max(1.0, min(12.0, auto_max))
+    return {
+        "count": len(vals),
+        "min": float(vals[0]),
+        "median": float(median),
+        "p75": float(p75),
+        "p90": float(p90),
+        "max": float(vals[-1]),
+        "auto_max": float(auto_max),
+    }
+
+
+def _resolve_smart_scene_duration_guard(
+    enabled: bool,
+    min_scene_len: float,
+    max_scene_len: float,
+    max_scene_mode: str,
+    source_clip_durations: Optional[List[float]] = None,
+) -> dict:
+    mode = _normalize_smart_scene_max_mode(max_scene_mode)
+    try:
+        min_len = float(min_scene_len)
+    except Exception:
+        min_len = 1.5
+    min_len = max(0.25, min(12.0, min_len))
+
+    stats = _smart_source_duration_stats(source_clip_durations)
+    max_len = 0.0
+    if mode == "Manual":
+        try:
+            max_len = float(max_scene_len)
+        except Exception:
+            max_len = 5.0
+        max_len = max(0.5, min(30.0, max_len))
+    elif mode == "Auto (source-aware)":
+        auto_max = float(stats.get("auto_max") or 0.0)
+        if auto_max <= 0.0:
+            # Safe fallback when the scene map is built without scanned video
+            # durations, such as future/headless callers.
+            auto_max = 6.0
+        max_len = auto_max
+    else:
+        max_len = 0.0
+
+    if max_len > 0.0 and max_len < min_len + 0.25:
+        max_len = min_len + 0.25
+
+    return {
+        "enabled": bool(enabled),
+        "min_len": float(min_len),
+        "max_len": float(max_len),
+        "max_mode": mode,
+        "source_stats": stats,
+    }
+
+
+def _source_durations_from_sources(sources: Optional[List["ClipSource"]]) -> List[float]:
+    out: List[float] = []
+    for src in (sources or []):
+        try:
+            if bool(getattr(src, "is_image", False)):
+                continue
+            d = float(getattr(src, "duration", 0.0) or 0.0)
+        except Exception:
+            continue
+        if d > 0.20:
+            out.append(d)
+    return out
+
+
+def _director_profile(preset: str) -> dict:
+    p = _normalize_director_preset(preset)
+    profiles = {
+        "Manual / Classic": {"length": 1.00, "effect": -0.10, "transition": -0.05, "cine_cooldown": 12.0},
+        "Balanced": {"length": 1.00, "effect": 0.00, "transition": 0.00, "cine_cooldown": 10.0},
+        "Clean Cinematic": {"length": 1.35, "effect": -0.30, "transition": -0.25, "cine_cooldown": 16.0},
+        "EDM / Festival": {"length": 0.78, "effect": 0.22, "transition": 0.20, "cine_cooldown": 7.0},
+        "DnB / Chaos": {"length": 0.45, "effect": 0.35, "transition": 0.30, "cine_cooldown": 4.0},
+        "Vocal Story": {"length": 1.25, "effect": -0.12, "transition": -0.08, "cine_cooldown": 12.0},
+        "Dreamy / Emotional": {"length": 1.65, "effect": -0.25, "transition": -0.18, "cine_cooldown": 15.0},
+    }
+    return dict(profiles.get(p, profiles["Balanced"]))
+
+
+def _section_director_defaults(label: str) -> dict:
+    lbl = str(label or "verse").lower()
+    table = {
+        "intro": {"length": 1.85, "transition": 0.18, "effect": 0.10, "role": "establishing"},
+        "verse": {"length": 1.15, "transition": 0.35, "effect": 0.28, "role": "story"},
+        "chorus": {"length": 0.78, "transition": 0.68, "effect": 0.62, "role": "hook"},
+        "drop": {"length": 0.45, "transition": 0.95, "effect": 0.95, "role": "impact"},
+        "break": {"length": 1.70, "transition": 0.25, "effect": 0.18, "role": "breather"},
+        "outro": {"length": 1.95, "transition": 0.22, "effect": 0.14, "role": "ending"},
+    }
+    return dict(table.get(lbl, table["verse"]))
+
+
+def _cut_style_multiplier(cut_style: str) -> float:
+    style = _normalize_cut_style(cut_style)
+    if style == "Short":
+        return 0.55
+    if style == "Medium":
+        return 1.0
+    if style == "Long":
+        return 1.75
+    if style == "Strong beats only":
+        return 1.20
+    if style == "Busy music video":
+        return 0.34
+    return 1.0
+
+
+def _music_section_at(analysis: "MusicAnalysisResult", time_t: float) -> str:
+    sections = getattr(analysis, "sections", None) or []
+    if not sections:
+        return "verse"
+    last_idx = len(sections) - 1
+    for idx, sct in enumerate(sections):
+        try:
+            start = float(getattr(sct, "start", 0.0) or 0.0)
+            end = float(getattr(sct, "end", 0.0) or 0.0)
+        except Exception:
+            continue
+        if start <= time_t < end or (idx == last_idx and time_t >= start):
+            kind = str(getattr(sct, "kind", "verse") or "verse").lower()
+            if idx == last_idx and kind not in ("intro",):
+                return "outro"
+            return kind
+    return str(getattr(sections[-1], "kind", "verse") or "verse").lower()
+
+
+def _music_section_end_at(analysis: "MusicAnalysisResult", time_t: float) -> Optional[float]:
+    sections = getattr(analysis, "sections", None) or []
+    for sct in sections:
+        try:
+            start = float(getattr(sct, "start", 0.0) or 0.0)
+            end = float(getattr(sct, "end", 0.0) or 0.0)
+        except Exception:
+            continue
+        if start <= time_t < end:
+            return max(start, end)
+    try:
+        return float(getattr(analysis, "duration", 0.0) or 0.0)
+    except Exception:
+        return None
+
+
+def _smart_section_start_cut_points(analysis: "MusicAnalysisResult", director_preset: str, cut_style: str) -> List[Tuple[float, str]]:
+    """Return real music-structure starts that should be available as cut points.
+
+    This is not a new scoring brain. It simply makes important analysed section
+    starts part of the Smart Scene Map timing grid so chorus/drop entries can be
+    hit on the actual section start instead of the next grouped beat.
+    """
+    try:
+        duration = float(getattr(analysis, "duration", 0.0) or 0.0)
+    except Exception:
+        duration = 0.0
+    sections = sorted(list(getattr(analysis, "sections", []) or []), key=lambda s: float(getattr(s, "start", 0.0) or 0.0))
+    if duration <= 0.05 or len(sections) < 2:
+        return []
+
+    preset = _normalize_director_preset(director_preset)
+    style = _normalize_cut_style(cut_style)
+    energetic = preset in ("EDM / Festival", "DnB / Chaos") or style == "Busy music video"
+    out: List[Tuple[float, str]] = []
+    seen: List[float] = []
+
+    def _add(t: float, reason: str) -> None:
+        try:
+            tt = float(t)
+        except Exception:
+            return
+        if not (0.05 < tt < duration - 0.05):
+            return
+        # Keep one clean section boundary if the analyser produced nearly
+        # duplicate starts. Prefer the first exact section boundary we saw.
+        if any(abs(tt - old) <= 0.08 for old in seen):
+            return
+        seen.append(tt)
+        out.append((tt, reason))
+
+    for idx, sec in enumerate(sections):
+        try:
+            start = float(getattr(sec, "start", 0.0) or 0.0)
+        except Exception:
+            continue
+        kind = str(getattr(sec, "kind", "verse") or "verse").lower()
+        prev_kind = ""
+        if idx > 0:
+            prev_kind = str(getattr(sections[idx - 1], "kind", "") or "").lower()
+
+        reason = "section_start"
+        if kind == "drop":
+            reason = "drop_start"
+        elif kind == "chorus":
+            reason = "chorus_start"
+        elif kind == "outro":
+            reason = "outro_start"
+        elif prev_kind == "break" and kind != "break":
+            reason = "break_exit"
+        elif prev_kind == "intro" and kind != "intro":
+            reason = "intro_end"
+        elif kind == "break":
+            reason = "break_start"
+
+        # All real section starts are useful candidates. Energetic presets get
+        # the most benefit from exact drop/chorus starts, but calm presets still
+        # need verse/intro/outro boundaries available so the guard can decide.
+        if reason in ("drop_start", "chorus_start", "break_exit", "intro_end", "outro_start") or energetic or idx > 0:
+            _add(start, reason)
+
+    return out
+
+
+def _representative_beat_strength(beats: List["Beat"], start: float, end: float) -> float:
+    if not beats:
+        return 0.0
+    try:
+        max_strength = max(0.0001, max(float(getattr(b, "strength", 0.0) or 0.0) for b in beats))
+    except Exception:
+        max_strength = 1.0
+    vals = []
+    for b in beats:
+        try:
+            t = float(getattr(b, "time", 0.0) or 0.0)
+            if start <= t < end:
+                vals.append(float(getattr(b, "strength", 0.0) or 0.0))
+        except Exception:
+            continue
+    if not vals:
+        center = (float(start) + float(end)) * 0.5
+        try:
+            nearest = min(beats, key=lambda b: abs(float(getattr(b, "time", 0.0) or 0.0) - center))
+            vals = [float(getattr(nearest, "strength", 0.0) or 0.0)]
+        except Exception:
+            vals = [0.0]
+    return _clamp01(max(vals) / max_strength)
+
+
+def _smart_energy_class(section_label: str, beat_strength: float) -> str:
+    lbl = str(section_label or "verse").lower()
+    if lbl in ("drop", "chorus") or beat_strength >= 0.72:
+        return "high"
+    if lbl in ("intro", "break", "outro") and beat_strength < 0.70:
+        return "low"
+    return "mid"
+
+
+def _smart_target_beats(base_beats: int, section_label: str, cut_style: str, director_preset: str) -> int:
+    base = max(1, int(base_beats or 1))
+    section_cfg = _section_director_defaults(section_label)
+    director_cfg = _director_profile(director_preset)
+    mult = float(section_cfg.get("length", 1.0)) * float(director_cfg.get("length", 1.0)) * _cut_style_multiplier(cut_style)
+    style = _normalize_cut_style(cut_style)
+    preset = _normalize_director_preset(director_preset)
+    if style == "Busy music video":
+        mult *= 0.75
+    if style == "Strong beats only":
+        mult *= 1.15
+    if preset == "DnB / Chaos" and str(section_label).lower() in ("drop", "chorus"):
+        mult *= 0.75
+    return max(1, min(96, int(round(base * mult))))
+
+
+def _smart_pick_effect(fx_level: str, energy: str, section_label: str, effect_intensity: float, director_preset: str) -> str:
+    fx = str(fx_level or "none").lower()
+    if fx == "none":
+        return "none"
+    preset = _normalize_director_preset(director_preset)
+    section = str(section_label or "verse").lower()
+    intensity = _clamp01(effect_intensity)
+
+    base_prob = 0.0
+    if fx == "minimal":
+        base_prob = 0.20
+    elif fx == "moderate":
+        base_prob = 0.50
+    elif fx == "high":
+        base_prob = 0.78
+    else:
+        base_prob = 0.35
+
+    prob = base_prob * (0.35 + 0.85 * intensity)
+    if section in ("intro", "outro") and preset not in ("DnB / Chaos", "EDM / Festival"):
+        prob *= 0.42
+    elif section == "break" and preset != "Dreamy / Emotional":
+        prob *= 0.65
+    elif section == "drop":
+        prob *= 1.15
+    if preset == "Clean Cinematic":
+        prob *= 0.55
+    elif preset == "Dreamy / Emotional":
+        prob *= 0.62
+    elif preset == "DnB / Chaos":
+        prob *= 1.35
+    elif preset == "EDM / Festival":
+        prob *= 1.15
+    prob = _clamp01(prob)
+    if random.random() > prob:
+        return "none"
+
+    if preset == "Clean Cinematic":
+        pool = ["zoom", "motion_blur"]
+    elif preset == "Dreamy / Emotional":
+        pool = ["zoom", "motion_blur", "rgb_split"] if section in ("chorus", "drop") else ["zoom", "motion_blur"]
+    elif preset == "Vocal Story":
+        pool = ["zoom", "motion_blur"] if section in ("intro", "verse", "break", "outro") else ["zoom", "flash", "motion_blur"]
+    elif preset == "DnB / Chaos":
+        pool = ["flash", "rgb_split", "vhs", "motion_blur", "zoom"]
+    elif preset == "EDM / Festival":
+        pool = ["zoom", "flash", "rgb_split", "motion_blur"]
+    else:
+        if energy == "high":
+            pool = ["zoom", "flash", "rgb_split", "vhs", "motion_blur"]
+        elif energy == "mid":
+            pool = ["zoom", "rgb_split", "motion_blur"]
+        else:
+            pool = ["zoom", "motion_blur"]
+    return random.choice(pool) if pool else "none"
+
+
+def _smart_pick_transition_mode(default_mode: int, random_enabled: bool, allowed_modes: List[int], section_label: str, transition_intensity: float, director_preset: str) -> int:
+    preset = _normalize_director_preset(director_preset)
+    section = str(section_label or "verse").lower()
+    intensity = _clamp01(transition_intensity)
+    try:
+        fallback = int(default_mode)
+    except Exception:
+        fallback = 1
+    allowed = []
+    for m in (allowed_modes or []):
+        try:
+            mi = int(m)
+        except Exception:
+            continue
+        if 0 <= mi <= 14 and mi not in allowed:
+            allowed.append(mi)
+    if not allowed:
+        allowed = [fallback]
+
+    # Hard cuts selected by the user remain respected unless random transitions are on.
+    if not random_enabled and fallback == 1:
+        return 1
+
+    clean_modes = [1, 0, 10]
+    soft_modes = [0, 3, 10, 13, 8]
+    balanced_modes = [0, 1, 2, 3, 5, 8, 9, 10, 13]
+    aggressive_modes = [1, 2, 5, 6, 7, 8, 9, 12, 14]
+
+    if preset == "Clean Cinematic":
+        preferred = clean_modes
+        use_prob = 0.24 + 0.42 * intensity
+    elif preset == "Dreamy / Emotional":
+        preferred = soft_modes
+        use_prob = 0.28 + 0.45 * intensity
+    elif preset == "Vocal Story":
+        preferred = soft_modes if section not in ("drop",) else balanced_modes
+        use_prob = 0.32 + 0.48 * intensity
+    elif preset == "EDM / Festival":
+        preferred = aggressive_modes if section in ("chorus", "drop") else balanced_modes
+        use_prob = 0.45 + 0.50 * intensity
+    elif preset == "DnB / Chaos":
+        preferred = aggressive_modes
+        use_prob = 0.62 + 0.38 * intensity
+    elif preset == "Manual / Classic":
+        preferred = allowed if random_enabled else [fallback]
+        use_prob = 0.30 + 0.35 * intensity
+    else:
+        preferred = balanced_modes
+        use_prob = 0.36 + 0.48 * intensity
+
+    if section in ("intro", "outro") and preset not in ("DnB / Chaos",):
+        use_prob *= 0.45
+    if section == "break" and preset not in ("Dreamy / Emotional", "Clean Cinematic"):
+        use_prob *= 0.70
+    use_prob = _clamp01(use_prob)
+
+    if random.random() > use_prob:
+        # Low-intensity scenes intentionally get a clean cut or simple dissolve.
+        if section in ("intro", "outro", "break") and fallback != 1:
+            return 0
+        return 1
+
+    pool = [m for m in preferred if m in allowed]
+    if not pool:
+        pool = [fallback] if fallback in allowed or not random_enabled else allowed
+    if not random_enabled:
+        # Respect the selected look, but allow smart mode to turn some low-intensity scenes into clean cuts.
+        return fallback
+    return random.choice(pool) if pool else fallback
+
+
+def _smart_cinematic_cooldown(director_preset: str) -> float:
+    return float(_director_profile(director_preset).get("cine_cooldown", 10.0))
+
+
+def _smart_scene_allows_cinematic(scene: Optional["MusicScene"], director_preset: str) -> bool:
+    if scene is None:
+        return True
+    preset = _normalize_director_preset(director_preset)
+    section = str(getattr(scene, "section_label", "verse") or "verse").lower()
+    intensity = _clamp01(float(getattr(scene, "effect_intensity", 0.0) or 0.0))
+    if section in ("intro", "outro") and preset not in ("DnB / Chaos", "EDM / Festival"):
+        threshold = 0.78
+    elif section == "break" and preset not in ("Dreamy / Emotional",):
+        threshold = 0.62
+    else:
+        threshold = 0.35
+    # Keep a little randomness so repeated sections do not feel copy-pasted.
+    return intensity >= threshold or random.random() < max(0.03, intensity * 0.22)
+
+
+def _scene_map_to_list(scenes: Optional[List["MusicScene"]]) -> list:
+    if not scenes:
+        return []
+    try:
+        from dataclasses import asdict
+        return [asdict(s) for s in scenes]
+    except Exception:
+        out = []
+        for sc in scenes:
+            try:
+                out.append(dict(getattr(sc, "__dict__", {})))
+            except Exception:
+                pass
+        return out
+
+
 # --------------------------- data classes ----------------------------------
 
 
@@ -1094,6 +1689,673 @@ class MusicAnalysisResult:
     duration: float
 
 
+@dataclass
+class LyricSegment:
+    index: int
+    start: float
+    end: float
+    text: str
+
+
+def _parse_srt_timecode(value: str) -> Optional[float]:
+    """Parse SRT timecode to seconds. Supports comma and dot milliseconds."""
+    try:
+        raw = str(value or "").strip().replace(",", ".")
+        m = re.match(r"^(\d{1,2}):(\d{2}):(\d{2})(?:\.(\d{1,3}))?$", raw)
+        if not m:
+            return None
+        hours = int(m.group(1))
+        minutes = int(m.group(2))
+        seconds = int(m.group(3))
+        ms_txt = (m.group(4) or "0")[:3].ljust(3, "0")
+        millis = int(ms_txt)
+        return float(hours * 3600 + minutes * 60 + seconds) + (millis / 1000.0)
+    except Exception:
+        return None
+
+
+def parse_srt_text(text: str) -> List[LyricSegment]:
+    """Small self-contained SRT parser used for lyric timing hints."""
+    if not text:
+        return []
+    raw = str(text).replace("\ufeff", "").replace("\r\n", "\n").replace("\r", "\n")
+    blocks = re.split(r"\n\s*\n+", raw)
+    out: List[LyricSegment] = []
+    time_re = re.compile(
+        r"(?P<start>\d{1,2}:\d{2}:\d{2}[,.]\d{1,3}|\d{1,2}:\d{2}:\d{2})\s*-->\s*"
+        r"(?P<end>\d{1,2}:\d{2}:\d{2}[,.]\d{1,3}|\d{1,2}:\d{2}:\d{2})"
+    )
+    for block in blocks:
+        lines = [ln.strip() for ln in str(block or "").split("\n") if ln.strip()]
+        if not lines:
+            continue
+        idx = len(out) + 1
+        pos = 0
+        try:
+            if re.match(r"^\d+$", lines[0]):
+                idx = int(lines[0])
+                pos = 1
+        except Exception:
+            pos = 0
+        if pos >= len(lines):
+            continue
+        m = time_re.search(lines[pos])
+        if not m:
+            # Some loose SRT files omit the numeric index; search all lines.
+            found_pos = -1
+            for j, ln in enumerate(lines):
+                m = time_re.search(ln)
+                if m:
+                    found_pos = j
+                    break
+            if not m:
+                continue
+            pos = found_pos
+        start = _parse_srt_timecode(m.group("start"))
+        end = _parse_srt_timecode(m.group("end"))
+        if start is None or end is None or float(end) <= float(start):
+            continue
+        text_lines = lines[pos + 1:]
+        lyric_text = " ".join(t.replace("\\N", " " ).strip() for t in text_lines if t.strip())
+        lyric_text = re.sub(r"\s+", " ", lyric_text).strip()
+        if not lyric_text:
+            continue
+        out.append(LyricSegment(index=int(idx), start=float(start), end=float(end), text=lyric_text))
+    return out
+
+
+def load_srt_segments(path: str) -> List[LyricSegment]:
+    """Load and parse an SRT file without pulling in subtitle libraries."""
+    p = str(path or "").strip()
+    if not p or not os.path.isfile(p):
+        return []
+    last_error: Optional[Exception] = None
+    for enc in ("utf-8-sig", "utf-8", "cp1252"):
+        try:
+            with open(p, "r", encoding=enc) as f:
+                return parse_srt_text(f.read())
+        except Exception as e:
+            last_error = e
+    if last_error is not None:
+        raise last_error
+    return []
+
+
+def _lyric_segments_to_list(segments: Optional[List[LyricSegment]]) -> list:
+    if not segments:
+        return []
+    try:
+        from dataclasses import asdict
+        return [asdict(seg) for seg in segments]
+    except Exception:
+        out = []
+        for seg in segments or []:
+            try:
+                out.append(dict(getattr(seg, "__dict__", {})))
+            except Exception:
+                pass
+        return out
+
+
+def _lyric_segments_from_list(items: Optional[list]) -> List[LyricSegment]:
+    out: List[LyricSegment] = []
+    for d in (items or []):
+        try:
+            out.append(LyricSegment(
+                index=int(d.get("index", len(out) + 1)),
+                start=float(d.get("start") or 0.0),
+                end=float(d.get("end") or 0.0),
+                text=str(d.get("text") or "").strip(),
+            ))
+        except Exception:
+            continue
+    return [seg for seg in out if seg.text and seg.end > seg.start]
+
+
+def attach_lyrics_to_scenes(
+    scenes: Optional[List["MusicScene"]],
+    lyric_segments: Optional[List[LyricSegment]],
+    srt_path: str = "",
+) -> List["MusicScene"]:
+    """Annotate Smart Scene Map scenes with overlapping lyric/SRT text.
+
+    This does not change scene timing. It only adds metadata for traces and later
+    Smart Director / Planner work.
+    """
+    if not scenes:
+        return []
+    segments = [seg for seg in (lyric_segments or []) if float(getattr(seg, "end", 0.0) or 0.0) > float(getattr(seg, "start", 0.0) or 0.0)]
+    if not segments:
+        return list(scenes)
+    safe_path = str(srt_path or "")
+    for sc in scenes:
+        try:
+            sc_start = float(getattr(sc, "start", 0.0) or 0.0)
+            sc_end = float(getattr(sc, "end", 0.0) or 0.0)
+            overlaps = [
+                seg for seg in segments
+                if max(sc_start, float(seg.start)) < min(sc_end, float(seg.end))
+            ]
+            if not overlaps:
+                continue
+            text = " ".join(str(seg.text or "").strip() for seg in overlaps if str(seg.text or "").strip())
+            text = re.sub(r"\s+", " ", text).strip()
+            if len(text) > 500:
+                text = text[:497].rstrip() + "..."
+            setattr(sc, "lyric_text", text)
+            setattr(sc, "lyric_start", float(min(seg.start for seg in overlaps)))
+            setattr(sc, "lyric_end", float(max(seg.end for seg in overlaps)))
+            setattr(sc, "srt_path", safe_path)
+            note = str(getattr(sc, "notes", "") or "")
+            if "lyrics_attached" not in note:
+                setattr(sc, "notes", (note + "; lyrics_attached").strip("; "))
+        except Exception:
+            continue
+    return list(scenes)
+
+
+def attach_lyrics_to_scene_dicts(scene_items: Optional[list], lyric_segments: Optional[List[LyricSegment]], srt_path: str = "") -> list:
+    """Best-effort lyric metadata attachment for queued payload scene-map dicts."""
+    if not isinstance(scene_items, list):
+        return []
+    segments = [seg for seg in (lyric_segments or []) if seg.end > seg.start]
+    if not segments:
+        return scene_items
+    out = []
+    for item in scene_items:
+        if not isinstance(item, dict):
+            out.append(item)
+            continue
+        d = dict(item)
+        try:
+            sc_start = float(d.get("start") or 0.0)
+            sc_end = float(d.get("end") or 0.0)
+            overlaps = [seg for seg in segments if max(sc_start, seg.start) < min(sc_end, seg.end)]
+            if overlaps:
+                text = " ".join(seg.text.strip() for seg in overlaps if seg.text.strip())
+                text = re.sub(r"\s+", " ", text).strip()
+                if len(text) > 500:
+                    text = text[:497].rstrip() + "..."
+                d["lyric_text"] = text
+                d["lyric_start"] = float(min(seg.start for seg in overlaps))
+                d["lyric_end"] = float(max(seg.end for seg in overlaps))
+                d["srt_path"] = str(srt_path or "")
+        except Exception:
+            pass
+        out.append(d)
+    return out
+
+
+@dataclass
+class MusicScene:
+    index: int
+    start: float
+    end: float
+    duration: float
+    section_label: str
+    energy_class: str
+    beat_strength: float
+    transition_intensity: float
+    effect_intensity: float
+    preferred_clip_role: str
+    notes: str = ""
+    beat_count: int = 0
+    lyric_text: str = ""
+    lyric_start: float = 0.0
+    lyric_end: float = 0.0
+    srt_path: str = ""
+
+
+def build_smart_scene_map(
+    analysis: MusicAnalysisResult,
+    beats_per_segment: int = 8,
+    director_preset: str = "Balanced",
+    cut_style: str = "Auto",
+    microclip_mode: int = 0,
+    duration_guard_enabled: bool = True,
+    min_scene_len: float = 1.5,
+    max_scene_len: float = 5.0,
+    max_scene_mode: str = "Auto (source-aware)",
+    source_clip_durations: Optional[List[float]] = None,
+    cut_timing_offset: float = 0.0,
+) -> List[MusicScene]:
+    """Build a section-aware scene plan before TimelineSegment creation.
+
+    This is intentionally renderer-agnostic. It only decides where scenes should
+    begin/end and how intense the director should be allowed to get. The normal
+    build_timeline() pipeline still converts scenes into TimelineSegment objects.
+    """
+    if analysis is None:
+        return []
+    try:
+        duration = float(getattr(analysis, "duration", 0.0) or 0.0)
+    except Exception:
+        duration = 0.0
+    if duration <= 0.05:
+        return []
+
+    preset = _normalize_director_preset(director_preset)
+    style = _normalize_cut_style(cut_style)
+    cut_offset = _normalize_smart_cut_timing_offset(cut_timing_offset)
+    director_cfg = _director_profile(preset)
+    beats = sorted(list(getattr(analysis, "beats", []) or []), key=lambda b: float(getattr(b, "time", 0.0) or 0.0))
+    duration_guard = _resolve_smart_scene_duration_guard(
+        enabled=bool(duration_guard_enabled),
+        min_scene_len=min_scene_len,
+        max_scene_len=max_scene_len,
+        max_scene_mode=max_scene_mode,
+        source_clip_durations=source_clip_durations,
+    )
+    section_cut_points = _smart_section_start_cut_points(analysis, preset, style)
+    section_cut_times = [float(t) for t, _reason in section_cut_points]
+
+    def _make_scene(idx: int, start: float, end: float, beat_count: int) -> Optional[MusicScene]:
+        start = max(0.0, min(duration, float(start)))
+        end = max(0.0, min(duration, float(end)))
+        if end - start <= 0.05:
+            return None
+        center = start + (end - start) * 0.5
+        section = _music_section_at(analysis, center)
+        strength = _representative_beat_strength(beats, start, end)
+        energy = _smart_energy_class(section, strength)
+        section_cfg = _section_director_defaults(section)
+        transition_intensity = _clamp01(
+            float(section_cfg.get("transition", 0.35))
+            + float(director_cfg.get("transition", 0.0))
+            + strength * 0.18
+        )
+        effect_intensity = _clamp01(
+            float(section_cfg.get("effect", 0.28))
+            + float(director_cfg.get("effect", 0.0))
+            + strength * 0.22
+        )
+        # Microclip modes still matter as a preference signal. They do not force
+        # the old arranger path, but they can make high/verse scenes more active.
+        if int(microclip_mode or 0) == 1 and section in ("chorus", "drop"):
+            transition_intensity = _clamp01(transition_intensity + 0.10)
+            effect_intensity = _clamp01(effect_intensity + 0.10)
+        elif int(microclip_mode or 0) == 2:
+            transition_intensity = _clamp01(transition_intensity + 0.08)
+            effect_intensity = _clamp01(effect_intensity + 0.08)
+        elif int(microclip_mode or 0) == 3 and section == "verse":
+            transition_intensity = _clamp01(transition_intensity + 0.10)
+            effect_intensity = _clamp01(effect_intensity + 0.06)
+
+        return MusicScene(
+            index=idx,
+            start=start,
+            end=end,
+            duration=end - start,
+            section_label=section,
+            energy_class=energy,
+            beat_strength=strength,
+            transition_intensity=transition_intensity,
+            effect_intensity=effect_intensity,
+            preferred_clip_role=str(section_cfg.get("role", "story")),
+            notes="smart-scene-v1",
+            beat_count=max(1, int(beat_count or 1)),
+        )
+
+    def _reindex_scenes(scene_list: List[MusicScene]) -> List[MusicScene]:
+        for j, sc in enumerate(scene_list):
+            sc.index = j
+        return scene_list
+
+    def _merge_tiny_legacy(scene_list: List[MusicScene]) -> List[MusicScene]:
+        if len(scene_list) <= 1:
+            return _reindex_scenes(scene_list)
+        cleaned: List[MusicScene] = []
+        for sc in scene_list:
+            if cleaned and sc.duration < 0.35 and sc.section_label != "drop":
+                prev = cleaned[-1]
+                merged = _make_scene(prev.index, prev.start, sc.end, prev.beat_count + sc.beat_count)
+                if merged is not None:
+                    cleaned[-1] = merged
+            else:
+                cleaned.append(sc)
+        return _reindex_scenes(cleaned)
+
+    def _nearest_scene_beat(target: float, lower: float, upper: float) -> float:
+        if upper <= lower:
+            return max(lower, min(upper, target))
+        candidates: List[float] = []
+        for b in beats:
+            try:
+                t = float(getattr(b, "time", 0.0) or 0.0)
+            except Exception:
+                continue
+            if lower <= t <= upper:
+                candidates.append(t)
+        if not candidates:
+            return max(lower, min(upper, target))
+        return min(candidates, key=lambda t: abs(t - target))
+
+    def _finalize_scenes(scene_list: List[MusicScene]) -> List[MusicScene]:
+        scene_list = [
+            sc for sc in (scene_list or [])
+            if float(getattr(sc, "end", 0.0) or 0.0) > float(getattr(sc, "start", 0.0) or 0.0)
+        ]
+        if not scene_list:
+            return []
+        if not bool(duration_guard.get("enabled")):
+            return _merge_tiny_legacy(scene_list)
+
+        min_len = float(duration_guard.get("min_len") or 1.5)
+        max_len = float(duration_guard.get("max_len") or 0.0)
+
+        # 1) Merge tiny scenes. Tiny scenes that END exactly at an important
+        # section start are merged backward so the next scene can still begin on
+        # the chorus/drop/break boundary instead of being pushed late. Other tiny
+        # scenes merge forward as before.
+        if len(scene_list) > 1 and min_len > 0.0:
+            protected_premerge: List[MusicScene] = []
+            for sc in scene_list:
+                sc_end = float(getattr(sc, "end", 0.0) or 0.0)
+                sc_dur = float(getattr(sc, "duration", 0.0) or 0.0)
+                ends_at_section_start = any(abs(sc_end - sec_t) <= 0.05 for sec_t in section_cut_times)
+                if protected_premerge and sc_dur < min_len and ends_at_section_start:
+                    prev = protected_premerge.pop()
+                    merged = _make_scene(
+                        len(protected_premerge),
+                        float(prev.start),
+                        sc_end,
+                        int(getattr(prev, "beat_count", 1) or 1) + int(getattr(sc, "beat_count", 1) or 1),
+                    )
+                    if merged is not None:
+                        merged.notes = (str(merged.notes or "smart-scene-v1") + "; section_start_preserved").strip("; ")
+                        protected_premerge.append(merged)
+                else:
+                    protected_premerge.append(sc)
+            scene_list = protected_premerge
+
+            merged_list: List[MusicScene] = []
+            i = 0
+            while i < len(scene_list):
+                start = float(scene_list[i].start)
+                end = float(scene_list[i].end)
+                beat_count = int(getattr(scene_list[i], "beat_count", 1) or 1)
+                while (end - start) < min_len and i < (len(scene_list) - 1):
+                    i += 1
+                    end = float(scene_list[i].end)
+                    beat_count += int(getattr(scene_list[i], "beat_count", 1) or 1)
+                sc_new = _make_scene(len(merged_list), start, end, beat_count)
+                if sc_new is not None:
+                    merged_list.append(sc_new)
+                i += 1
+            if len(merged_list) > 1 and merged_list[-1].duration < min_len:
+                last = merged_list.pop()
+                prev = merged_list.pop()
+                sc_new = _make_scene(
+                    len(merged_list),
+                    prev.start,
+                    last.end,
+                    int(getattr(prev, "beat_count", 1) or 1) + int(getattr(last, "beat_count", 1) or 1),
+                )
+                if sc_new is not None:
+                    merged_list.append(sc_new)
+            scene_list = merged_list
+
+        # 2) Split oversized scenes. This keeps 3-6 second source folders from
+        # being forced into long held shots or unwanted slow-motion/stretching.
+        if max_len > 0.0:
+            split_list: List[MusicScene] = []
+            for sc in scene_list:
+                dur_sc = float(getattr(sc, "duration", 0.0) or 0.0)
+                if dur_sc <= max_len + 0.05:
+                    split_list.append(sc)
+                    continue
+
+                parts = max(2, int(math.ceil(dur_sc / max_len)))
+                # Never split so aggressively that the new chunks become tiny.
+                while parts > 1 and (dur_sc / parts) < min_len:
+                    parts -= 1
+                if parts <= 1:
+                    split_list.append(sc)
+                    continue
+
+                protected_cuts: List[float] = []
+                protected_start = float(sc.start)
+                for sec_t in sorted(section_cut_times):
+                    if sec_t <= float(sc.start) + 0.05 or sec_t >= float(sc.end) - 0.05:
+                        continue
+                    # Preserve important analysed section starts during max-length
+                    # splitting when doing so does not violate the minimum guard.
+                    if (sec_t - protected_start) >= min_len and (float(sc.end) - sec_t) >= min_len:
+                        protected_cuts.append(sec_t)
+                        protected_start = sec_t
+
+                chunk_bounds = [float(sc.start)] + protected_cuts + [float(sc.end)]
+                chunk_ranges: List[Tuple[float, float]] = []
+                for chunk_idx in range(len(chunk_bounds) - 1):
+                    chunk_start = chunk_bounds[chunk_idx]
+                    chunk_end = chunk_bounds[chunk_idx + 1]
+                    chunk_dur = max(0.0, chunk_end - chunk_start)
+                    if chunk_dur <= max_len + 0.05:
+                        chunk_ranges.append((chunk_start, chunk_end))
+                        continue
+
+                    chunk_parts = max(2, int(math.ceil(chunk_dur / max_len)))
+                    while chunk_parts > 1 and (chunk_dur / chunk_parts) < min_len:
+                        chunk_parts -= 1
+                    if chunk_parts <= 1:
+                        chunk_ranges.append((chunk_start, chunk_end))
+                        continue
+
+                    cut_points: List[float] = []
+                    prev_cut = chunk_start
+                    for part_idx in range(1, chunk_parts):
+                        raw_target = chunk_start + chunk_dur * (part_idx / chunk_parts)
+                        lower = prev_cut + min_len
+                        upper = chunk_end - (chunk_parts - part_idx) * min_len
+                        if upper < lower:
+                            cut = max(chunk_start, min(chunk_end, raw_target))
+                        else:
+                            cut = _nearest_scene_beat(raw_target, lower, upper)
+                        cut = max(prev_cut + 0.05, min(chunk_end - 0.05, cut))
+                        cut_points.append(cut)
+                        prev_cut = cut
+
+                    start_piece = chunk_start
+                    for cut in cut_points + [chunk_end]:
+                        chunk_ranges.append((start_piece, cut))
+                        start_piece = cut
+
+                # Approximate beat count by duration share; the exact value is only
+                # used as a pacing hint later, not as render timing authority.
+                for start_t, end_t in chunk_ranges:
+                    part_dur = max(0.0, end_t - start_t)
+                    part_beats = max(1, int(round(int(getattr(sc, "beat_count", 1) or 1) * (part_dur / max(0.001, dur_sc)))))
+                    sc_new = _make_scene(len(split_list), start_t, end_t, part_beats)
+                    if sc_new is not None:
+                        if any(abs(float(end_t) - sec_t) <= 0.05 for sec_t in protected_cuts) or any(abs(float(start_t) - sec_t) <= 0.05 for sec_t in protected_cuts):
+                            sc_new.notes = (str(sc_new.notes or "smart-scene-v1") + "; section_start_preserved").strip("; ")
+                        split_list.append(sc_new)
+            scene_list = split_list
+
+        scene_list = _reindex_scenes(scene_list)
+        try:
+            guard_note = (
+                f"duration-guard min={float(duration_guard.get('min_len') or 0.0):.2f}s "
+                f"max={float(duration_guard.get('max_len') or 0.0):.2f}s "
+                f"mode={duration_guard.get('max_mode') or 'Auto'}"
+            )
+            for sc in scene_list:
+                sc.notes = (str(sc.notes or "smart-scene-v1") + "; " + guard_note).strip("; ")
+        except Exception:
+            pass
+        return scene_list
+
+    def _apply_cut_timing_offset(scene_list: List[MusicScene]) -> List[MusicScene]:
+        """Move internal smart-scene boundaries without shifting audio.
+
+        The guard still owns legality: offset is clamped so it cannot create
+        negative, overlapping, tiny, or source-max-breaking scenes.
+        """
+        if not scene_list or len(scene_list) <= 1 or abs(cut_offset) < 0.0005:
+            return _reindex_scenes(scene_list or [])
+
+        guard_on = bool(duration_guard.get("enabled"))
+        min_len = float(duration_guard.get("min_len") or 0.35) if guard_on else 0.35
+        max_len = float(duration_guard.get("max_len") or 0.0) if guard_on else 0.0
+        min_len = max(0.05, min_len)
+
+        original_boundaries = [float(sc.start) for sc in scene_list[1:]]
+        new_boundaries: List[float] = []
+        timeline_start = float(scene_list[0].start)
+        timeline_end = float(scene_list[-1].end)
+        prev_new = timeline_start
+
+        for idx, old_boundary in enumerate(original_boundaries):
+            next_original = float(scene_list[idx + 2].start) if (idx + 2) < len(scene_list) else timeline_end
+            desired = old_boundary + cut_offset
+
+            lower = prev_new + min_len
+            upper = next_original - min_len
+            if max_len > 0.0:
+                # Previous scene cannot grow past max, and next scene cannot grow past max.
+                upper = min(upper, prev_new + max_len)
+                lower = max(lower, next_original - max_len)
+
+            # Always keep cuts inside the actual timeline.
+            lower = max(timeline_start + 0.05, lower)
+            upper = min(timeline_end - 0.05, upper)
+
+            if upper < lower:
+                new_boundary = old_boundary
+            else:
+                new_boundary = max(lower, min(upper, desired))
+            new_boundaries.append(new_boundary)
+            prev_new = new_boundary
+
+        rebuilt: List[MusicScene] = []
+        start_t = timeline_start
+        for idx, end_t in enumerate(new_boundaries + [timeline_end]):
+            old_sc = scene_list[min(idx, len(scene_list) - 1)]
+            sc_new = _make_scene(
+                len(rebuilt),
+                start_t,
+                end_t,
+                int(getattr(old_sc, "beat_count", 1) or 1),
+            )
+            if sc_new is not None:
+                note = str(getattr(old_sc, "notes", "smart-scene-v1") or "smart-scene-v1")
+                if idx > 0 or abs(start_t - float(getattr(old_sc, "start", start_t))) > 0.01:
+                    note += f"; offset_applied={cut_offset:+.2f}s"
+                sc_new.notes = note
+                rebuilt.append(sc_new)
+            start_t = end_t
+
+        return _reindex_scenes(rebuilt)
+
+    def _finalize_and_offset(scene_list: List[MusicScene]) -> List[MusicScene]:
+        return _apply_cut_timing_offset(_finalize_scenes(scene_list))
+
+    scenes: List[MusicScene] = []
+
+    # Fallback for tracks with weak beat detection: use analysed sections, or
+    # steady chunks if sections are missing.
+    if len(beats) < 2:
+        raw_sections = list(getattr(analysis, "sections", []) or [])
+        if raw_sections:
+            for sec in raw_sections:
+                sc = _make_scene(len(scenes), float(sec.start), float(sec.end), 1)
+                if sc is not None:
+                    scenes.append(sc)
+        else:
+            step = 5.0
+            if preset in ("Clean Cinematic", "Dreamy / Emotional"):
+                step = 7.0
+            elif preset == "DnB / Chaos" or style == "Busy music video":
+                step = 2.0
+            t = 0.0
+            while t < duration - 0.05:
+                sc = _make_scene(len(scenes), t, min(duration, t + step), 1)
+                if sc is not None:
+                    scenes.append(sc)
+                t += step
+        return _finalize_and_offset(scenes)
+
+    # Use beat times and important analysed section starts as possible cut points. Strong-beats-only uses major beats
+    # whenever available; otherwise it falls back to the normal beat list.
+    if style == "Strong beats only":
+        strong = [b for b in beats if str(getattr(b, "kind", "") or "").lower() == "major"]
+        source_beats = strong if len(strong) >= 2 else beats
+    else:
+        source_beats = beats
+
+    points = [0.0]
+    for t, _reason in section_cut_points:
+        if 0.02 < t < duration - 0.02:
+            points.append(t)
+    for b in source_beats:
+        try:
+            t = float(getattr(b, "time", 0.0) or 0.0)
+        except Exception:
+            continue
+        if 0.02 < t < duration - 0.02:
+            # If a beat is almost on top of a section start, keep the exact
+            # section start. That avoids tiny intervals around drops/choruses
+            # and stops the next clip from starting one beat late.
+            if any(abs(t - sec_t) <= 0.08 for sec_t in section_cut_times):
+                continue
+            points.append(t)
+    points.append(duration)
+    points = sorted(set(round(float(x), 4) for x in points))
+
+    intervals: List[Tuple[float, float]] = []
+    for i in range(len(points) - 1):
+        a, b = points[i], points[i + 1]
+        if b - a > 0.03:
+            intervals.append((a, b))
+    if not intervals:
+        sc = _make_scene(0, 0.0, duration, 1)
+        return _finalize_and_offset([sc] if sc is not None else [])
+
+    i = 0
+    while i < len(intervals):
+        start = intervals[i][0]
+        section = _music_section_at(analysis, start + 0.001)
+        target_beats = _smart_target_beats(beats_per_segment, section, style, preset)
+        # Busy/drop styles should not create unreadably tiny flash cuts when the
+        # source beat grid is very dense; these floors are intentionally modest.
+        min_scene = 0.45 if (preset == "DnB / Chaos" or style == "Busy music video" or section == "drop") else 0.75
+        if preset in ("Clean Cinematic", "Dreamy / Emotional") and section not in ("drop",):
+            min_scene = 1.25
+
+        end = intervals[i][1]
+        count = 1
+        section_end = _music_section_end_at(analysis, start + 0.001)
+        while i + count < len(intervals):
+            next_end = intervals[i + count][1]
+            # Prefer not to cross section boundaries once the current scene has
+            # enough duration to stand on its own. Important EDM-style entries
+            # may cut a bit sooner, but the final duration guard still prevents
+            # microclips or illegal scene lengths.
+            boundary_floor = min_scene
+            try:
+                important_boundary = bool(section_end is not None and any(abs(float(section_end) - sec_t) <= 0.10 for sec_t in section_cut_times))
+            except Exception:
+                important_boundary = False
+            if important_boundary:
+                if preset in ("EDM / Festival", "DnB / Chaos") or style == "Busy music video":
+                    boundary_floor = max(0.45, min_scene * 0.60)
+                else:
+                    boundary_floor = max(0.65, min_scene * 0.80)
+            if section_end is not None and next_end > section_end + 0.03 and (end - start) >= boundary_floor:
+                break
+            if count >= target_beats and (end - start) >= min_scene:
+                break
+            end = next_end
+            count += 1
+            if count >= target_beats * 2 and (end - start) >= min_scene:
+                break
+
+        sc = _make_scene(len(scenes), start, end, count)
+        if sc is not None:
+            scenes.append(sc)
+        i += max(1, count)
+
+    return _finalize_and_offset(scenes)
 
 
 # --------------------------- queue/headless helpers ------------------------
@@ -1190,6 +2452,49 @@ def run_queue_payload(payload_path: str) -> int:
         visual_section_overrides = payload.get("visual_section_overrides") or None
         visual_overlay_opacity = float(payload.get("visual_overlay_opacity") or 0.25)
         out_name_override = payload.get("out_name_override") or None
+        # Smart Director settings are serialized for reproducibility/traceability.
+        # The queued job renders the already-built TimelineSegments, so these are
+        # restored mainly for status/logging and future-safe payload compatibility.
+        smart_scene_mode = bool(payload.get("smart_scene_mode", False))
+        director_preset = _normalize_director_preset(str(payload.get("director_preset") or "Balanced"))
+        scene_cut_style = _normalize_cut_style(str(payload.get("scene_cut_style") or "Auto"))
+        smart_scene_payload = payload.get("smart_scene_map") or []
+        smart_scene_duration_guard = bool(payload.get("smart_scene_duration_guard", True))
+        try:
+            smart_min_scene_len = float(payload.get("smart_min_scene_len", 1.5))
+        except Exception:
+            smart_min_scene_len = 1.5
+        try:
+            smart_max_scene_len = float(payload.get("smart_max_scene_len", 5.0))
+        except Exception:
+            smart_max_scene_len = 5.0
+        smart_max_scene_mode = _normalize_smart_scene_max_mode(str(payload.get("smart_max_scene_mode") or "Auto (source-aware)"))
+        try:
+            smart_cut_timing_offset = _normalize_smart_cut_timing_offset(float(payload.get("smart_cut_timing_offset", 0.0)))
+        except Exception:
+            smart_cut_timing_offset = 0.0
+        use_lyrics_srt_timing = bool(payload.get("use_lyrics_srt_timing", False))
+        srt_path = str(payload.get("srt_path") or "")
+        lyric_segments = _lyric_segments_from_list(payload.get("lyric_segments") or [])
+        if use_lyrics_srt_timing and not lyric_segments and srt_path:
+            if os.path.isfile(srt_path):
+                try:
+                    lyric_segments = load_srt_segments(srt_path)
+                except Exception as e:
+                    try:
+                        print(f"WARNING: failed to parse SRT file '{srt_path}': {e}")
+                    except Exception:
+                        pass
+            else:
+                try:
+                    print(f"WARNING: SRT file not found, continuing without lyrics: {srt_path}")
+                except Exception:
+                    pass
+        if use_lyrics_srt_timing and lyric_segments and isinstance(smart_scene_payload, list):
+            try:
+                smart_scene_payload = attach_lyrics_to_scene_dicts(smart_scene_payload, lyric_segments, srt_path)
+            except Exception:
+                pass
         strobe_on_time_times = payload.get("strobe_on_time_times") or None
         try:
             strobe_flash_strength = float(payload.get("strobe_flash_strength") or 0.0)
@@ -1205,6 +2510,23 @@ def run_queue_payload(payload_path: str) -> int:
         except Exception:
             pass
         return 3
+
+    if smart_scene_mode:
+        try:
+            scene_count = len(smart_scene_payload) if isinstance(smart_scene_payload, list) else 0
+            guard_txt = ""
+            if smart_scene_duration_guard:
+                if smart_max_scene_mode == "Manual":
+                    guard_txt = f", duration guard min {smart_min_scene_len:.1f}s max {smart_max_scene_len:.1f}s"
+                elif smart_max_scene_mode == "Auto (source-aware)":
+                    guard_txt = f", duration guard min {smart_min_scene_len:.1f}s auto max"
+                else:
+                    guard_txt = f", duration guard min {smart_min_scene_len:.1f}s"
+            offset_txt = f", cut offset {smart_cut_timing_offset:+.2f}s" if abs(float(smart_cut_timing_offset or 0.0)) >= 0.005 else ""
+            lyrics_txt = f", lyrics {len(lyric_segments)} segments" if bool(use_lyrics_srt_timing) and lyric_segments else ""
+            print(f"0% Smart director: {director_preset}, {scene_count} scenes{guard_txt}{offset_txt}{lyrics_txt}")
+        except Exception:
+            pass
 
     # Create worker and monkeypatch progress signal to stdout
     rw = RenderWorker(
@@ -1639,6 +2961,16 @@ def build_timeline(
     image_sources: Optional[List[ClipSource]] = None,
     section_overrides: Optional[Dict[int, ClipSource]] = None,
     image_segment_interval: int = 0,
+    smart_scene_mode: bool = False,
+    director_preset: str = "Balanced",
+    scene_cut_style: str = "Auto",
+    smart_scene_map: Optional[List[MusicScene]] = None,
+    smart_scene_info: Optional[Dict[str, object]] = None,
+    smart_scene_duration_guard: bool = True,
+    smart_min_scene_len: float = 1.5,
+    smart_max_scene_len: float = 5.0,
+    smart_max_scene_mode: str = "Auto (source-aware)",
+    smart_cut_timing_offset: float = 0.0,
 ) -> List[TimelineSegment]:
 
 
@@ -1671,6 +3003,20 @@ def build_timeline(
 
     if seed_enabled:
         random.seed(int(seed_value) & 0xFFFFFFFF)
+
+    smart_scene_enabled = bool(smart_scene_mode)
+    director_preset = _normalize_director_preset(director_preset)
+    scene_cut_style = _normalize_cut_style(scene_cut_style)
+    smart_max_scene_mode = _normalize_smart_scene_max_mode(smart_max_scene_mode)
+    smart_cut_timing_offset = _normalize_smart_cut_timing_offset(smart_cut_timing_offset)
+    smart_source_durations = _source_durations_from_sources(sources)
+    smart_duration_guard_info = _resolve_smart_scene_duration_guard(
+        enabled=bool(smart_scene_duration_guard),
+        min_scene_len=smart_min_scene_len,
+        max_scene_len=smart_max_scene_len,
+        max_scene_mode=smart_max_scene_mode,
+        source_clip_durations=smart_source_durations,
+    )
 
     # Helper: map a logical time (seconds) to a section label, including 'outro' for the final section.
     def _section_label_at(time_t: float) -> str:
@@ -1840,11 +3186,18 @@ def build_timeline(
         eligible_idx: List[int] = list(range(len(segments)))
         if intro_transitions_only and segment_labels:
             eligible_idx = [i for i in eligible_idx if (section_labels[i] or "").lower() != "intro"]
+        if smart_scene_enabled:
+            filtered_idx: List[int] = []
+            for i in eligible_idx:
+                sc = segment_scenes[i] if i < len(segment_scenes) else None
+                if _smart_scene_allows_cinematic(sc, director_preset):
+                    filtered_idx.append(i)
+            eligible_idx = filtered_idx
 
         if enabled_effects and cumulative > 0.0:
-            # Use a cooldown so cinematic effects don't spam: once an effect triggers,
-            # wait at least 10 seconds (timeline time) before allowing another.
-            CINE_COOLDOWN_SEC = 10.0
+            # Use a cooldown so cinematic effects don't spam. Smart Director
+            # adjusts the cooldown per preset instead of changing renderer logic.
+            CINE_COOLDOWN_SEC = _smart_cinematic_cooldown(director_preset) if smart_scene_enabled else 10.0
 
             # Shuffle-bag: cycle through all enabled cinematic effects once before repeating.
             effect_bag: List[str] = []
@@ -1879,7 +3232,16 @@ def build_timeline(
                 if not ok:
                     continue
 
-                seg_idx = random.choice(ok)
+                if smart_scene_enabled:
+                    def _cine_weight(i: int) -> float:
+                        sc = segment_scenes[i] if i < len(segment_scenes) else None
+                        try:
+                            return float(getattr(sc, "effect_intensity", 0.0) or 0.0) + random.random() * 0.15
+                        except Exception:
+                            return random.random() * 0.15
+                    seg_idx = max(ok, key=_cine_weight)
+                else:
+                    seg_idx = random.choice(ok)
                 seg = segments[seg_idx]
                 effect_name = _pick_effect_name()
                 last_cine_time = float(centers[seg_idx])
@@ -2316,6 +3678,20 @@ def build_timeline(
                         continue
                 impact_candidates.append(best_idx)
 
+        if smart_scene_enabled and impact_candidates:
+            preferred_candidates: List[int] = []
+            for idx in impact_candidates:
+                lbl = ""
+                if segment_labels and idx < len(segment_labels):
+                    try:
+                        lbl = str(segment_labels[idx] or "").lower()
+                    except Exception:
+                        lbl = ""
+                if lbl in ("drop", "chorus"):
+                    preferred_candidates.append(idx)
+            if preferred_candidates:
+                impact_candidates = preferred_candidates
+
         if not impact_candidates:
             return
 
@@ -2498,6 +3874,49 @@ def build_timeline(
             i += 1
         grouped = merged_grouped
 
+    smart_scenes: List[MusicScene] = []
+    if smart_scene_enabled:
+        try:
+            smart_scenes = list(smart_scene_map or [])
+        except Exception:
+            smart_scenes = []
+        if not smart_scenes:
+            smart_scenes = build_smart_scene_map(
+                analysis,
+                beats_per_segment=beats_per_segment,
+                director_preset=director_preset,
+                cut_style=scene_cut_style,
+                microclip_mode=microclip_mode,
+                duration_guard_enabled=bool(smart_scene_duration_guard),
+                min_scene_len=float(smart_min_scene_len),
+                max_scene_len=float(smart_max_scene_len),
+                max_scene_mode=smart_max_scene_mode,
+                source_clip_durations=smart_source_durations,
+                cut_timing_offset=smart_cut_timing_offset,
+            )
+        if smart_scenes:
+            grouped = [
+                (float(sc.start), float(sc.end), max(1, int(getattr(sc, "beat_count", 1) or 1)))
+                for sc in smart_scenes
+                if float(getattr(sc, "end", 0.0) or 0.0) > float(getattr(sc, "start", 0.0) or 0.0)
+            ]
+        if smart_scene_info is not None:
+            try:
+                smart_scene_info.clear()
+                smart_scene_info.update({
+                    "enabled": bool(smart_scenes),
+                    "director_preset": director_preset,
+                    "scene_cut_style": scene_cut_style,
+                    "duration_guard": dict(smart_duration_guard_info),
+                    "cut_timing_offset": float(smart_cut_timing_offset),
+                    "scene_count": len(smart_scenes),
+                    "scene_map": _scene_map_to_list(smart_scenes),
+                    "lyrics_attached": any(bool(getattr(sc, "lyric_text", "")) for sc in smart_scenes),
+                    "srt_path": next((str(getattr(sc, "srt_path", "") or "") for sc in smart_scenes if getattr(sc, "srt_path", "")), ""),
+                })
+            except Exception:
+                pass
+
     num_sources = len(sources)
     allow_mosaic = num_sources >= 10
     last_source_idx: Optional[int] = None
@@ -2571,59 +3990,59 @@ def build_timeline(
     # Track segment centers and section labels for slow-motion targeting
     segment_centers: List[float] = []
     segment_labels: List[str] = []
+    segment_scenes: List[Optional[MusicScene]] = []
 
-    for (t0, t1, beat_count) in grouped:
+    for group_idx, (t0, t1, beat_count) in enumerate(grouped):
+        smart_scene = smart_scenes[group_idx] if smart_scene_enabled and group_idx < len(smart_scenes) else None
         dur = max(0.35, t1 - t0)
         center = 0.5 * (t0 + t1)
-        energy = energy_class(center)
-        section_label = _section_label_at(center)
+        if smart_scene is not None:
+            energy = str(getattr(smart_scene, "energy_class", "mid") or "mid")
+            section_label = str(getattr(smart_scene, "section_label", _section_label_at(center)) or _section_label_at(center))
+        else:
+            energy = energy_class(center)
+            section_label = _section_label_at(center)
         # Intro transitions-only: strip FX early (keep transitions)
         if intro_transitions_only and (section_label or '').lower() == 'intro':
             effect = 'none'
 
-        # Average spacing between beats in this segment (proxy for beat density)
-        avg_gap = dur / max(1, beat_count)
-        is_calm = (avg_gap >= CALM_GAP_THRESHOLD) or (energy == "low")
-        just_after_calm = (not is_calm) and previous_was_calm
-
-        # Base segment length
-        if is_calm:
-            # Calm / break-like section: use longer, more relaxed shots.
-            if dur <= CALM_MIN_LEN:
-                seg_len = dur
-            else:
-                max_len = min(CALM_MAX_LEN, dur)
-                seg_len = random.uniform(CALM_MIN_LEN, max_len)
-        elif just_after_calm:
-            # First segment right after a calm/break: emphasise the beat
-            # by forcing a short accent shot so the new beat is noticeable.
-            if dur <= 1.0:
-                seg_len = dur
-            else:
-                seg_len = max(0.3, min(1.0, dur, random.uniform(0.4, 1.0)))
+        if smart_scene is not None:
+            # The scene map already decided the cut window. Use that full scene
+            # duration so director presets/cut style actually control pacing.
+            seg_len = min(dur, max(0.20, float(getattr(smart_scene, "duration", dur) or dur)))
+            is_calm = (energy == "low")
+            just_after_calm = False
         else:
-            # Microclip logic for active sections.
-            if microclip_mode == 0:
-                seg_len = min(dur, 4.0)
-            elif microclip_mode == 1:
-                if energy == "high":
-                    seg_len = max(0.3, min(0.8, dur, random.uniform(0.3, 0.8)))
+            # Average spacing between beats in this segment (proxy for beat density)
+            avg_gap = dur / max(1, beat_count)
+            is_calm = (avg_gap >= CALM_GAP_THRESHOLD) or (energy == "low")
+            just_after_calm = (not is_calm) and previous_was_calm
+
+            # Base segment length
+            if is_calm:
+                # Calm / break-like section: use longer, more relaxed shots.
+                if dur <= CALM_MIN_LEN:
+                    seg_len = dur
                 else:
-                    seg_len = min(dur, 4.0)
-            elif microclip_mode == 2:
-                if energy == "high":
-                    base_min, base_max = 0.25, 0.7
-                elif energy == "mid":
-                    base_min, base_max = 0.4, 1.0
+                    max_len = min(CALM_MAX_LEN, dur)
+                    seg_len = random.uniform(CALM_MIN_LEN, max_len)
+            elif just_after_calm:
+                # First segment right after a calm/break: emphasise the beat
+                # by forcing a short accent shot so the new beat is noticeable.
+                if dur <= 1.0:
+                    seg_len = dur
                 else:
-                    base_min, base_max = 0.6, 1.3
-                seg_len = max(
-                    base_min,
-                    min(base_max, dur, random.uniform(base_min, base_max)),
-                )
+                    seg_len = max(0.3, min(1.0, dur, random.uniform(0.4, 1.0)))
             else:
-                # Verses only: microclips are used only during verse sections.
-                if section_label == "verse":
+                # Microclip logic for active sections.
+                if microclip_mode == 0:
+                    seg_len = min(dur, 4.0)
+                elif microclip_mode == 1:
+                    if energy == "high":
+                        seg_len = max(0.3, min(0.8, dur, random.uniform(0.3, 0.8)))
+                    else:
+                        seg_len = min(dur, 4.0)
+                elif microclip_mode == 2:
                     if energy == "high":
                         base_min, base_max = 0.25, 0.7
                     elif energy == "mid":
@@ -2635,7 +4054,20 @@ def build_timeline(
                         min(base_max, dur, random.uniform(base_min, base_max)),
                     )
                 else:
-                    seg_len = min(dur, 4.0)
+                    # Verses only: microclips are used only during verse sections.
+                    if section_label == "verse":
+                        if energy == "high":
+                            base_min, base_max = 0.25, 0.7
+                        elif energy == "mid":
+                            base_min, base_max = 0.4, 1.0
+                        else:
+                            base_min, base_max = 0.6, 1.3
+                        seg_len = max(
+                            base_min,
+                            min(base_max, dur, random.uniform(base_min, base_max)),
+                        )
+                    else:
+                        seg_len = min(dur, 4.0)
 
         # Safety: never exceed the beat-group window duration.
         seg_len = min(seg_len, dur)
@@ -2643,7 +4075,7 @@ def build_timeline(
         # Hard floor for visible pacing: when a grouped window is long enough,
         # keep each rendered segment on screen for at least 1.5 seconds so the
         # clip and transition can actually register.
-        if dur >= MIN_SEGMENT_LEN:
+        if smart_scene is None and dur >= MIN_SEGMENT_LEN:
             seg_len = max(MIN_SEGMENT_LEN, seg_len)
             seg_len = min(seg_len, dur)
 
@@ -2698,62 +4130,79 @@ def build_timeline(
 
         previous_was_calm = is_calm
 
-        # FX selection by level and energy
-        # Now supports a small library of segment FX:
-        #   - zoom        : gentle punch-in
-        #   - flash       : small brightness pop
-        #   - rgb_split   : chromatic aberration
-        #   - vhs         : VHS-style noise + scanlines
-        #   - motion_blur : mild global blend
+        # FX selection by level and energy. Smart Scene Map keeps the same
+        # existing effect names, but chooses them according to section/director
+        # intensity instead of pure random chance.
         effect = "none"
-        r = random.random()
+        if smart_scene is not None:
+            effect = _smart_pick_effect(
+                fx_level=fx_level,
+                energy=energy,
+                section_label=section_label,
+                effect_intensity=float(getattr(smart_scene, "effect_intensity", 0.0) or 0.0),
+                director_preset=director_preset,
+            )
+        else:
+            r = random.random()
 
-        if fx_level == "minimal":
-            # Very subtle: only occasional zoom on strong peaks
-            if energy == "high" and r < 0.18:
-                effect = "zoom"
-
-        elif fx_level == "moderate":
-            if energy == "high":
-                if r < 0.25:
+            if fx_level == "minimal":
+                # Very subtle: only occasional zoom on strong peaks
+                if energy == "high" and r < 0.18:
                     effect = "zoom"
-                elif r < 0.45:
-                    effect = "flash"
-                elif r < 0.65:
-                    effect = "rgb_split"
-                elif r < 0.78:
-                    effect = "vhs"
-                elif r < 0.90:
-                    effect = "motion_blur"
-            elif energy == "mid":
-                if r < 0.20:
-                    effect = random.choice(["zoom", "rgb_split"])
 
-        elif fx_level == "high":  # high
-            if energy == "high":
-                if r < 0.25:
-                    effect = "zoom"
-                elif r < 0.25:
-                    effect = "flash"
-                elif r < 0.85:
-                    effect = "rgb_split"
-                elif r < 0.80:
-                    effect = "vhs"
+            elif fx_level == "moderate":
+                if energy == "high":
+                    if r < 0.25:
+                        effect = "zoom"
+                    elif r < 0.45:
+                        effect = "flash"
+                    elif r < 0.65:
+                        effect = "rgb_split"
+                    elif r < 0.78:
+                        effect = "vhs"
+                    elif r < 0.90:
+                        effect = "motion_blur"
+                elif energy == "mid":
+                    if r < 0.20:
+                        effect = random.choice(["zoom", "rgb_split"])
+
+            elif fx_level == "high":  # high
+                if energy == "high":
+                    if r < 0.25:
+                        effect = "zoom"
+                    elif r < 0.25:
+                        effect = "flash"
+                    elif r < 0.85:
+                        effect = "rgb_split"
+                    elif r < 0.80:
+                        effect = "vhs"
+                    else:
+                        effect = "motion_blur"
+                elif energy == "mid":
+                    if r < 0.30:
+                        effect = random.choice(["zoom", "rgb_split", "flash"])
+                    elif r < 0.45:
+                        effect = "vhs"
+                    elif r < 0.60:
+                        effect = "motion_blur"
                 else:
-                    effect = "motion_blur"
-            elif energy == "mid":
-                if r < 0.30:
-                    effect = random.choice(["zoom", "rgb_split", "flash"])
-                elif r < 0.45:
-                    effect = "vhs"
-                elif r < 0.60:
-                    effect = "motion_blur"
-            else:
-                if r < 0.22:
-                    effect = random.choice(["zoom", "rgb_split"])
+                    if r < 0.22:
+                        effect = random.choice(["zoom", "rgb_split"])
+
+        if intro_transitions_only and (section_label or '').lower() == 'intro':
+            effect = 'none'
 
         # Transition choice (fade-safe, using a small transition effect library)
-        if transition_random and allowed_modes:
+        if smart_scene is not None:
+            mode_for_segment = _smart_pick_transition_mode(
+                default_mode=transition_mode,
+                random_enabled=bool(transition_random),
+                allowed_modes=allowed_modes,
+                section_label=section_label,
+                transition_intensity=float(getattr(smart_scene, "transition_intensity", 0.0) or 0.0),
+                director_preset=director_preset,
+            )
+        elif transition_random and allowed_modes:
             mode_for_segment = random.choice(allowed_modes)
         else:
             mode_for_segment = transition_mode
@@ -2837,6 +4286,7 @@ def build_timeline(
         # Track center time and section label for slow-motion logic
         segment_centers.append(center)
         segment_labels.append(section_label)
+        segment_scenes.append(smart_scene)
 
 
     # Apply slow-motion decisions on built segments
@@ -3397,6 +4847,368 @@ class SourceScanWorker(QThread):
         except Exception as e:
             self.failed.emit(str(e))
 
+
+class WhisperMusicClipWorker(QThread):
+    progress = Signal(int, str)
+    finished_ok = Signal(str)
+    failed = Signal(str)
+
+    def __init__(
+        self,
+        project_root: str,
+        audio_path: str,
+        output_dir: str,
+        env_python: str,
+        model_dir: str,
+        ffprobe: str = "",
+        parent=None,
+    ) -> None:
+        super().__init__(parent)
+        self.project_root = str(project_root or _musicclip_project_root())
+        self.audio_path = str(audio_path or "")
+        self.output_dir = str(output_dir or _musicclip_default_whisper_output_dir(self.project_root))
+        self.env_python = str(env_python or _musicclip_whisper_env_python(self.project_root))
+        self.model_dir = str(model_dir or _musicclip_whisper_model_dir(self.project_root))
+        self.ffprobe = str(ffprobe or "")
+
+    def _runner_script_text(self) -> str:
+        return r'''
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+from pathlib import Path
+
+
+def emit(kind, **data):
+    item = {"type": kind}
+    item.update(data)
+    print(json.dumps(item, ensure_ascii=False), flush=True)
+
+
+def fmt_srt_time(seconds):
+    try:
+        total_ms = int(round(float(seconds) * 1000.0))
+    except Exception:
+        total_ms = 0
+    if total_ms < 0:
+        total_ms = 0
+    ms = total_ms % 1000
+    total_s = total_ms // 1000
+    s = total_s % 60
+    total_m = total_s // 60
+    m = total_m % 60
+    h = total_m // 60
+    return f"{h:02d}:{m:02d}:{s:02d},{ms:03d}"
+
+
+def safe_stem(path):
+    stem = Path(path).stem or "audio"
+    stem = re.sub(r"[^A-Za-z0-9_. -]+", "_", stem).strip(" ._")
+    return stem or "audio"
+
+
+def probe_duration(ffprobe, media):
+    if not ffprobe:
+        return 0.0
+    try:
+        if not os.path.exists(ffprobe) and not shutil.which(ffprobe):
+            return 0.0
+    except Exception:
+        pass
+    try:
+        proc = subprocess.run(
+            [ffprobe, "-v", "error", "-show_entries", "format=duration", "-of", "default=noprint_wrappers=1:nokey=1", media],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=20,
+        )
+        if proc.returncode == 0:
+            return max(0.0, float(str(proc.stdout or "").strip() or 0.0))
+    except Exception:
+        pass
+    return 0.0
+
+
+def main():
+    if len(sys.argv) < 2:
+        emit("error", message="Missing payload path.")
+        return 2
+    payload_path = sys.argv[1]
+    with open(payload_path, "r", encoding="utf-8") as f:
+        payload = json.load(f)
+
+    os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
+
+    media = str(payload.get("media_path") or "")
+    model_dir = str(payload.get("model_dir") or "")
+    output_dir = Path(str(payload.get("output_dir") or ""))
+    ffprobe = str(payload.get("ffprobe") or "")
+    language = str(payload.get("language") or "auto").strip().lower()
+    task = str(payload.get("task") or "transcribe").strip().lower()
+    device = str(payload.get("device") or "auto").strip() or "auto"
+    compute_type = str(payload.get("compute_type") or "default").strip() or "default"
+
+    if not media or not os.path.isfile(media):
+        emit("error", message="Audio file was not found.")
+        return 3
+    if not model_dir or not os.path.isdir(model_dir):
+        emit("error", message=f"Faster-Whisper model was not found: {model_dir}")
+        return 4
+
+    output_dir.mkdir(parents=True, exist_ok=True)
+    stem = safe_stem(media)
+    output_basename = str(payload.get("output_basename") or "").strip()
+    if output_basename:
+        stem = safe_stem(output_basename)
+    srt_path = output_dir / f"{stem}.srt"
+    txt_path = output_dir / f"{stem}_lyrics.txt"
+    json_path = output_dir / f"{stem}_segments.json"
+
+    def write_outputs(items):
+        # Write progressively while transcription is running.  This makes Music Clip
+        # Creator resilient to native Faster-Whisper/CTranslate2 crashes that can
+        # happen after usable song-lyric segments were already produced.
+        with open(srt_path, "w", encoding="utf-8") as f:
+            for item in items:
+                f.write(f"{item['index']}\n")
+                f.write(f"{fmt_srt_time(item['start'])} --> {fmt_srt_time(item['end'])}\n")
+                f.write(f"{item['text']}\n\n")
+        with open(txt_path, "w", encoding="utf-8") as f:
+            for item in items:
+                f.write(item["text"] + "\n")
+        with open(json_path, "w", encoding="utf-8") as f:
+            json.dump(items, f, ensure_ascii=False, indent=2)
+
+    emit("progress", percent=2, message="Loading Faster-Whisper...")
+    try:
+        from faster_whisper import WhisperModel
+    except Exception as e:
+        emit("error", message=f"Could not import faster_whisper: {e}")
+        return 5
+
+    try:
+        model = WhisperModel(model_dir, device=device, compute_type=compute_type)
+    except Exception as e:
+        try:
+            emit("progress", percent=3, message="Retrying Whisper on CPU...")
+            model = WhisperModel(model_dir, device="cpu", compute_type="int8")
+        except Exception:
+            emit("error", message=f"Could not load Faster-Whisper model: {e}")
+            return 6
+
+    duration = 0.0
+    try:
+        duration = float(payload.get("duration") or 0.0)
+    except Exception:
+        duration = 0.0
+    if duration <= 0.0:
+        try:
+            duration = probe_duration(ffprobe, media)
+        except Exception:
+            duration = 0.0
+
+    def transcribe_collect(vad_enabled, label):
+        emit("progress", percent=5, message=label)
+        kwargs = dict(beam_size=5, vad_filter=bool(vad_enabled), task=task or "transcribe")
+        if language and language != "auto":
+            kwargs["language"] = language
+        segments_iter, info_obj = model.transcribe(media, **kwargs)
+        collected = []
+        last_pct = 5
+        for i, seg in enumerate(segments_iter, start=1):
+            text = re.sub(r"\s+", " ", str(getattr(seg, "text", "") or "")).strip()
+            start = float(getattr(seg, "start", 0.0) or 0.0)
+            end = float(getattr(seg, "end", start) or start)
+            if not text or end <= start:
+                continue
+            collected.append({"index": len(collected) + 1, "start": start, "end": end, "text": text})
+            write_outputs(collected)
+            if duration > 0:
+                pct = max(5, min(95, int(5 + 90 * (end / duration))))
+            else:
+                pct = max(5, min(95, 5 + len(collected)))
+            if pct != last_pct or len(collected) == 1:
+                emit("progress", percent=pct, message=f"Transcribing... {len(collected)} segments")
+                last_pct = pct
+        return collected, info_obj
+
+    info = None
+    try:
+        # Music Clip Creator is lyric/song focused. VAD is useful for speech, but it
+        # can remove clear singing. Run this button without VAD and write segments
+        # progressively so usable timing survives late native crashes.
+        items, info = transcribe_collect(False, "Transcribing music vocals without VAD...")
+    except Exception as e:
+        emit("error", message=f"Whisper transcription failed: {e}")
+        return 7
+
+    if not items:
+        emit("error", message="Whisper finished, but no subtitle segments were detected with music-vocal mode.")
+        return 8
+
+    emit("progress", percent=96, message="Finalizing SRT...")
+    try:
+        write_outputs(items)
+    except Exception as e:
+        emit("error", message=f"Could not write Whisper output files: {e}")
+        return 9
+
+    try:
+        detected_language = str(getattr(info, "language", "") or "")
+    except Exception:
+        detected_language = ""
+    emit(
+        "result",
+        srt_path=str(srt_path),
+        txt_path=str(txt_path),
+        segments_json=str(json_path),
+        segment_count=len(items),
+        language=detected_language,
+    )
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
+'''
+
+    def run(self) -> None:
+        proc = None
+        try:
+            if not self.audio_path or not os.path.isfile(self.audio_path):
+                self.failed.emit("Please load a music/audio file first.")
+                return
+            if not self.env_python or not os.path.isfile(self.env_python):
+                self.failed.emit("Whisper environment was not found. Install Whisper from Optional Installs first.")
+                return
+            if not self.model_dir or not os.path.isdir(self.model_dir):
+                self.failed.emit("Faster-Whisper model was not found: models/faster_whisper/medium/")
+                return
+
+            root = self.project_root or _musicclip_project_root()
+            runner_path = os.path.join(root, "output", "_whisper_runner_musicclip.py")
+            payload_dir = _musicclip_temp_dir(root)
+            _ensure_dir(os.path.dirname(runner_path))
+            _ensure_dir(payload_dir)
+            _ensure_dir(self.output_dir)
+
+            try:
+                duration = _ffprobe_duration(self.ffprobe, self.audio_path) if self.ffprobe else 0.0
+            except Exception:
+                duration = 0.0
+
+            with open(runner_path, "w", encoding="utf-8") as f:
+                f.write(self._runner_script_text())
+
+            ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+            audio_stem = _sanitize_stem(os.path.splitext(os.path.basename(self.audio_path))[0] or "audio", fallback="audio")
+            output_basename = _sanitize_stem(f"{audio_stem}_musicclip_whisper_{ts}", fallback="musicclip_whisper")
+            expected_srt_path = os.path.join(self.output_dir, output_basename + ".srt")
+            payload_path = os.path.join(payload_dir, f"musicclip_whisper_{ts}.json")
+            payload = {
+                "project_root": root,
+                "media_path": self.audio_path,
+                "model_dir": self.model_dir,
+                "output_dir": self.output_dir,
+                "output_basename": output_basename,
+                "ffprobe": self.ffprobe,
+                "language": "auto",
+                "task": "transcribe",
+                "device": "auto",
+                "compute_type": "default",
+                "duration": float(duration or 0.0),
+            }
+            with open(payload_path, "w", encoding="utf-8") as f:
+                json.dump(payload, f, ensure_ascii=False, indent=2)
+
+            env = os.environ.copy()
+            env["KMP_DUPLICATE_LIB_OK"] = "TRUE"
+            cmd = [self.env_python, runner_path, payload_path]
+            self.progress.emit(1, "Running Whisper...")
+            proc = subprocess.Popen(
+                cmd,
+                cwd=root,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                env=env,
+            )
+
+            result_srt = ""
+            last_lines: List[str] = []
+            if proc.stdout is not None:
+                for line in proc.stdout:
+                    line = str(line or "").strip()
+                    if not line:
+                        continue
+                    try:
+                        item = json.loads(line)
+                    except Exception:
+                        last_lines.append(line)
+                        last_lines = last_lines[-8:]
+                        continue
+                    kind = str(item.get("type") or "")
+                    if kind == "progress":
+                        try:
+                            pct = int(item.get("percent", 0) or 0)
+                        except Exception:
+                            pct = 0
+                        msg = str(item.get("message") or "Running Whisper...")
+                        self.progress.emit(max(0, min(100, pct)), msg)
+                    elif kind == "result":
+                        result_srt = str(item.get("srt_path") or "")
+                        try:
+                            count = int(item.get("segment_count", 0) or 0)
+                        except Exception:
+                            count = 0
+                        self.progress.emit(100, f"Whisper finished: {count} segments.")
+                    elif kind == "error":
+                        last_lines.append(str(item.get("message") or "Whisper failed."))
+                        last_lines = last_lines[-8:]
+
+            rc = proc.wait()
+            candidate_srt = result_srt or locals().get("expected_srt_path", "")
+            if rc != 0:
+                recovered_count = 0
+                if candidate_srt and os.path.isfile(candidate_srt):
+                    try:
+                        recovered_count = len(load_srt_segments(candidate_srt))
+                    except Exception:
+                        recovered_count = 0
+                if recovered_count > 0:
+                    self.progress.emit(100, f"Whisper produced {recovered_count} segments before the native process closed; loading recovered SRT.")
+                    self.finished_ok.emit(candidate_srt)
+                    return
+                detail = "\n".join(last_lines).strip()
+                if int(rc) == 3221226505:
+                    native_msg = "Whisper's native backend closed with 0xC0000409 after transcription. No recoverable SRT was found."
+                    detail = (detail + "\n" + native_msg).strip() if detail else native_msg
+                self.failed.emit(detail or f"Whisper failed with exit code {rc}.")
+                return
+            if (not result_srt or not os.path.isfile(result_srt)) and locals().get("expected_srt_path", ""):
+                if os.path.isfile(expected_srt_path):
+                    result_srt = expected_srt_path
+            if not result_srt or not os.path.isfile(result_srt):
+                detail = "\n".join(last_lines).strip()
+                self.failed.emit(detail or "Whisper finished, but the generated SRT could not be found.")
+                return
+            self.finished_ok.emit(result_srt)
+        except Exception as e:
+            self.failed.emit(str(e))
+        finally:
+            try:
+                if proc is not None and proc.poll() is None:
+                    proc.kill()
+            except Exception:
+                pass
 
 class RenderWorker(QThread):
     progress = Signal(int, str)
@@ -6978,6 +8790,7 @@ class AutoMusicSyncWidget(QWidget):
         self._analysis_sensitivity: Optional[int] = None
         self._worker: Optional[RenderWorker] = None
         self._scan_worker: Optional[SourceScanWorker] = None
+        self._whisper_worker: Optional[WhisperMusicClipWorker] = None
         self._pending_audio: Optional[str] = None
         self._pending_video: Optional[str] = None
         self._pending_out_dir: Optional[str] = None
@@ -6995,6 +8808,10 @@ class AutoMusicSyncWidget(QWidget):
         # Timed strobe (flash strobe at user-specified timeline seconds)
         self._strobe_on_time_times: List[float] = []
 
+        # Lyrics / SRT timing layer. Whisper is manual-only and never runs from queue/headless.
+        self._lyrics_srt_path: str = ""
+        self._lyrics_srt_segments: List[LyricSegment] = []
+
         # Per-section music-player visual overrides (intro/verse/chorus/break/drop/outro)
         self._visual_section_overrides = {}
         # Default opacity for music-player visuals overlay (0.0–1.0)
@@ -7006,6 +8823,10 @@ class AutoMusicSyncWidget(QWidget):
 
         self._build_ui()
         self._load_settings()
+        try:
+            self._update_smart_director_visibility()
+        except Exception:
+            pass
 
         # Hide still-image UI block (images in generator)
         self._hide_image_sources_block()
@@ -7132,6 +8953,47 @@ class AutoMusicSyncWidget(QWidget):
         form.setFormAlignment(Qt.AlignLeft | Qt.AlignTop)
         form.setSpacing(4)
 
+        # Settings tab: keep normal creation workflow simple, and move
+        # detailed timing/render/director options out of the Generation page.
+        page_settings = QWidget(self)
+        settings_main = QVBoxLayout(page_settings)
+        settings_main.setContentsMargins(6, 6, 6, 6)
+        settings_main.setSpacing(8)
+
+        settings_intro = QLabel(
+            "Most users can leave these settings unchanged. Use this tab only when you want "
+            "to fine-tune timing, clip pacing, output quality, or Smart Director behavior.",
+            page_settings,
+        )
+        settings_intro.setWordWrap(True)
+        settings_main.addWidget(settings_intro)
+
+        row_defaults = QHBoxLayout()
+        row_defaults.setContentsMargins(0, 0, 0, 0)
+        row_defaults.setSpacing(6)
+        self.btn_use_default_settings = QPushButton("Use default settings", page_settings)
+        self.btn_use_default_settings.setToolTip(
+            "Restore the recommended Music Clip Creator defaults without clearing selected music, clips or output folder."
+        )
+        row_defaults.addWidget(self.btn_use_default_settings)
+        row_defaults.addStretch(1)
+        settings_main.addLayout(row_defaults)
+
+        self.box_generation_settings = QGroupBox("Generation Settings", page_settings)
+        gen_settings_lay = QVBoxLayout(self.box_generation_settings)
+        gen_settings_lay.setContentsMargins(10, 8, 10, 8)
+        gen_settings_lay.setSpacing(6)
+        settings_main.addWidget(self.box_generation_settings)
+
+        # Created early so timing controls can be moved here while preserving
+        # the same widget names/settings keys used by presets and saved JSON.
+        self.box_adv = QGroupBox("Advanced Beat Settings", page_settings)
+        self.box_adv.setCheckable(True)
+        self.box_adv.setChecked(True)
+        adv = QFormLayout(self.box_adv)
+        adv.setLabelAlignment(Qt.AlignRight | Qt.AlignVCenter)
+        adv.setSpacing(4)
+
         # audio
         self.edit_audio = QLineEdit(self)
         btn_a = QPushButton("Browse...", self)
@@ -7226,12 +9088,12 @@ class AutoMusicSyncWidget(QWidget):
         )
         row_order.addWidget(self.combo_clip_order, 1)
         row_order.addStretch(1)
-        form.addRow(row_order)
+        gen_settings_lay.addLayout(row_order)
 
         # minimum clip length filter
         row_minclip = QHBoxLayout()
         self.check_min_clip = QCheckBox("Ignore clips shorter than", self)
-        self.check_min_clip.setChecked(False)
+        self.check_min_clip.setChecked(True)
         self.spin_min_clip = QDoubleSpinBox(self)
         self.spin_min_clip.setDecimals(1)
         self.spin_min_clip.setSingleStep(0.5)
@@ -7246,7 +9108,7 @@ class AutoMusicSyncWidget(QWidget):
         row_minclip.addWidget(self.check_min_clip)
         row_minclip.addWidget(self.spin_min_clip)
         row_minclip.addStretch(1)
-        form.addRow(row_minclip)
+        gen_settings_lay.addLayout(row_minclip)
 
         # random seed
         row_seed = QHBoxLayout()
@@ -7269,7 +9131,7 @@ class AutoMusicSyncWidget(QWidget):
         )
         row_seed.addWidget(self.check_use_seed)
         row_seed.addStretch(1)
-        form.addRow(row_seed)
+        gen_settings_lay.addLayout(row_seed)
 
         # resolution
         row_res = QHBoxLayout()
@@ -7295,19 +9157,19 @@ class AutoMusicSyncWidget(QWidget):
             "- Fixed 16:9: scale everything to 480p / 720p / 1080p landscape.\n"
             "- Fixed 9:16: scale everything to 480p / 720p / 1080p vertical."
         )
-        # Default output resolution: Fixed 720p (1280×720)
+        # Default output resolution: Fixed 1080p (1920×1080) 16:9
         # (Only used when there are no saved settings yet.)
         try:
-            self.combo_res.setCurrentIndex(4)
+            self.combo_res.setCurrentIndex(3)
         except Exception:
             pass
         row_res.addWidget(self.combo_res, 1)
-        form.addRow(row_res)
+        gen_settings_lay.addLayout(row_res)
 
         # bitrate
         row_br = QHBoxLayout()
         self.check_keep_source_bitrate = QCheckBox("Keep Source Bitrate", self)
-        self.check_keep_source_bitrate.setChecked(False)
+        self.check_keep_source_bitrate.setChecked(True)
         self.check_keep_source_bitrate.setToolTip(
             "When enabled, the final render will try to keep the source video bitrate\n"
             "(or the highest bitrate among a sample of your clips) to preserve quality.\n"
@@ -7315,7 +9177,7 @@ class AutoMusicSyncWidget(QWidget):
         )
         row_br.addWidget(self.check_keep_source_bitrate)
         row_br.addStretch(1)
-        form.addRow(row_br)
+        gen_settings_lay.addLayout(row_br)
 
         # frame fit mode
         row_fit = QHBoxLayout()
@@ -7335,18 +9197,72 @@ class AutoMusicSyncWidget(QWidget):
             "- Stretch: ignore aspect ratio and stretch to fill the frame."
         )
         row_fit.addWidget(self.combo_fit, 1)
-        form.addRow(row_fit)
+        gen_settings_lay.addLayout(row_fit)
 
         main.addLayout(form)
 
-        # options
-        self.box_opts = QGroupBox("Options", self)
-        opts = QVBoxLayout(self.box_opts)
+        # Job-specific SRT loader. Visibility is controlled by Settings → Lyrics / SRT.
+        self.box_lyrics_srt_generation = QGroupBox("Lyrics / SRT", self)
+        lyrics_gen_lay = QVBoxLayout(self.box_lyrics_srt_generation)
+        lyrics_gen_lay.setContentsMargins(10, 8, 10, 8)
+        lyrics_gen_lay.setSpacing(6)
+        row_srt_buttons = QHBoxLayout()
+        self.btn_run_whisper_srt = QPushButton("Run Whisper", self.box_lyrics_srt_generation)
+        self.btn_run_whisper_srt.setToolTip("Creates an SRT from the loaded music/audio file and loads it automatically.")
+        self.btn_load_srt = QPushButton("Load SRT", self.box_lyrics_srt_generation)
+        self.btn_load_srt.setToolTip("Load an existing .srt subtitle/lyrics file for timing metadata. This does not run Whisper.")
+        self.btn_clear_srt = QPushButton("Clear SRT", self.box_lyrics_srt_generation)
+        self.btn_clear_srt.setToolTip("Clear the loaded SRT path and parsed lyric timing for this job.")
+        row_srt_buttons.addWidget(self.btn_run_whisper_srt)
+        row_srt_buttons.addWidget(self.btn_load_srt)
+        row_srt_buttons.addWidget(self.btn_clear_srt)
+        row_srt_buttons.addStretch(1)
+        lyrics_gen_lay.addLayout(row_srt_buttons)
+        self.label_srt_loaded = QLabel("Loaded: none", self.box_lyrics_srt_generation)
+        self.label_srt_segments = QLabel("Segments: 0", self.box_lyrics_srt_generation)
+        self.label_srt_range = QLabel("Lyrics timing: —", self.box_lyrics_srt_generation)
+        self.label_srt_whisper_status = QLabel("Whisper: idle", self.box_lyrics_srt_generation)
+        lyrics_gen_lay.addWidget(self.label_srt_loaded)
+        lyrics_gen_lay.addWidget(self.label_srt_segments)
+        lyrics_gen_lay.addWidget(self.label_srt_range)
+        lyrics_gen_lay.addWidget(self.label_srt_whisper_status)
+        main.addWidget(self.box_lyrics_srt_generation)
+        self.box_lyrics_srt_generation.setVisible(False)
 
-        # FX level
-        row_fx = QHBoxLayout()
-        row_fx.addWidget(QLabel("FX Level:", self))
-        self.combo_fx = QComboBox(self)
+        # Creative controls kept on the Generation page. Detailed timing/render
+        # settings live on the Settings tab below.
+        self.box_opts = QWidget(self)
+        opts = QVBoxLayout(self.box_opts)
+        opts.setContentsMargins(0, 0, 0, 0)
+        opts.setSpacing(8)
+
+        self.box_effects = QGroupBox("Effects", self.box_opts)
+        effects_lay = QVBoxLayout(self.box_effects)
+        effects_lay.setContentsMargins(10, 8, 10, 8)
+        effects_lay.setSpacing(6)
+
+        self.box_transitions = QGroupBox("Transitions", self.box_opts)
+        transitions_lay = QVBoxLayout(self.box_transitions)
+        transitions_lay.setContentsMargins(10, 8, 10, 8)
+        transitions_lay.setSpacing(6)
+
+        self.box_other_enhancements = QGroupBox("Other Enhancements", self.box_opts)
+        other_lay = QVBoxLayout(self.box_other_enhancements)
+        other_lay.setContentsMargins(10, 8, 10, 8)
+        other_lay.setSpacing(6)
+
+        opts.addWidget(self.box_effects)
+        opts.addWidget(self.box_transitions)
+        opts.addWidget(self.box_other_enhancements)
+
+        # FX level (classic/manual mode only; Smart Director hides this row).
+        self.fx_level_row_widget = QWidget(self.box_effects)
+        row_fx = QHBoxLayout(self.fx_level_row_widget)
+        row_fx.setContentsMargins(0, 0, 0, 0)
+        row_fx.setSpacing(6)
+        self.label_fx_level = QLabel("FX Level:", self.fx_level_row_widget)
+        row_fx.addWidget(self.label_fx_level)
+        self.combo_fx = QComboBox(self.fx_level_row_widget)
         self.combo_fx.addItems(["Minimal", "Moderate", "High"])
         self.combo_fx.setToolTip(
             "Choose how active the visual effects should be:\n"
@@ -7356,7 +9272,139 @@ class AutoMusicSyncWidget(QWidget):
         )
         row_fx.addWidget(self.combo_fx, 1)
         row_fx.addStretch(1)
-        opts.addLayout(row_fx)
+        effects_lay.addWidget(self.fx_level_row_widget)
+
+        # Smart Director / scene map controls (Chunk 1).
+        self.smart_director_box = QGroupBox("Smart Director", self)
+        smart_lay = QVBoxLayout(self.smart_director_box)
+        smart_lay.setContentsMargins(10, 8, 10, 8)
+        smart_lay.setSpacing(6)
+
+        row_smart_enable = QHBoxLayout()
+        self.check_smart_scene_map = QCheckBox("Use Smart Scene Map", self.smart_director_box)
+        self.check_smart_scene_map.setChecked(True)
+        self.check_smart_scene_map.setToolTip(
+            "Build a section-aware scene map before creating timeline segments.\n"
+            "When off, the classic beat/section arranger path is used as much as possible."
+        )
+        row_smart_enable.addWidget(self.check_smart_scene_map)
+        row_smart_enable.addStretch(1)
+        smart_lay.addLayout(row_smart_enable)
+
+        row_director = QHBoxLayout()
+        row_director.addWidget(QLabel("Director preset:", self.smart_director_box))
+        self.combo_director_preset = QComboBox(self.smart_director_box)
+        self.combo_director_preset.addItems(SMART_DIRECTOR_PRESETS)
+        try:
+            self.combo_director_preset.setCurrentText("Balanced")
+        except Exception:
+            self.combo_director_preset.setCurrentIndex(1)
+        self.combo_director_preset.setToolTip(
+            "Controls how strongly sections influence cut pacing, transitions and existing effects.\n"
+            "Manual / Classic is most restrained; DnB / Chaos is most aggressive."
+        )
+        row_director.addWidget(self.combo_director_preset, 1)
+        smart_lay.addLayout(row_director)
+
+        row_cut_style = QHBoxLayout()
+        row_cut_style.addWidget(QLabel("Scene length / cut style:", self.smart_director_box))
+        self.combo_scene_cut_style = QComboBox(self.smart_director_box)
+        self.combo_scene_cut_style.addItems(SMART_SCENE_CUT_STYLES)
+        self.combo_scene_cut_style.setCurrentIndex(0)
+        self.combo_scene_cut_style.setToolTip(
+            "Influences how beats are grouped into scenes before segments are generated.\n"
+            "Auto keeps the old beats-per-segment value as the base, then adapts per section."
+        )
+        row_cut_style.addWidget(self.combo_scene_cut_style, 1)
+        smart_lay.addLayout(row_cut_style)
+
+        row_cut_offset = QHBoxLayout()
+        row_cut_offset.addWidget(QLabel("Cut timing offset:", self.smart_director_box))
+        self.spin_smart_cut_timing_offset = QDoubleSpinBox(self.smart_director_box)
+        self.spin_smart_cut_timing_offset.setDecimals(2)
+        self.spin_smart_cut_timing_offset.setSingleStep(0.05)
+        self.spin_smart_cut_timing_offset.setRange(-1.00, 0.50)
+        self.spin_smart_cut_timing_offset.setValue(-0.35)
+        self.spin_smart_cut_timing_offset.setSuffix(" s")
+        self.spin_smart_cut_timing_offset.setToolTip(
+            "Moves smart scene cut points earlier or later. Negative values help EDM/drop cuts "
+            "hit exactly on the beat instead of feeling late. This only affects Smart Scene Map boundaries."
+        )
+        row_cut_offset.addWidget(self.spin_smart_cut_timing_offset)
+        row_cut_offset.addStretch(1)
+        smart_lay.addLayout(row_cut_offset)
+
+        row_guard_enable = QHBoxLayout()
+        self.check_smart_scene_duration_guard = QCheckBox("Use Smart Scene Duration Guard", self.smart_director_box)
+        self.check_smart_scene_duration_guard.setChecked(True)
+        self.check_smart_scene_duration_guard.setToolTip(
+            "Prevents messy analysis from creating tiny smart scenes and prevents overly long smart scenes\n"
+            "that can force 3–6 second source clips into unwanted slow motion or stretching.\n"
+            "Only affects Smart Scene Map mode; classic mode stays unchanged."
+        )
+        row_guard_enable.addWidget(self.check_smart_scene_duration_guard)
+        row_guard_enable.addStretch(1)
+        smart_lay.addLayout(row_guard_enable)
+
+        row_guard_min = QHBoxLayout()
+        row_guard_min.addWidget(QLabel("Minimum smart scene:", self.smart_director_box))
+        self.spin_smart_min_scene_len = QDoubleSpinBox(self.smart_director_box)
+        self.spin_smart_min_scene_len.setDecimals(1)
+        self.spin_smart_min_scene_len.setSingleStep(0.1)
+        self.spin_smart_min_scene_len.setRange(0.3, 10.0)
+        self.spin_smart_min_scene_len.setValue(2.0)
+        self.spin_smart_min_scene_len.setSuffix(" s")
+        self.spin_smart_min_scene_len.setToolTip(
+            "Smart scenes shorter than this are merged forward or backward before rendering.\n"
+            "This is the Smart Scene Map version of avoiding tiny throwaway cuts."
+        )
+        row_guard_min.addWidget(self.spin_smart_min_scene_len)
+        row_guard_min.addStretch(1)
+        smart_lay.addLayout(row_guard_min)
+
+        row_guard_max = QHBoxLayout()
+        row_guard_max.addWidget(QLabel("Maximum smart scene:", self.smart_director_box))
+        self.combo_smart_max_scene_mode = QComboBox(self.smart_director_box)
+        self.combo_smart_max_scene_mode.addItems(SMART_SCENE_MAX_MODES)
+        self.combo_smart_max_scene_mode.setCurrentIndex(0)
+        self.combo_smart_max_scene_mode.setToolTip(
+            "Auto uses the loaded source clip duration statistics to choose a safe max scene length.\n"
+            "Manual uses the seconds box. Off allows the director to create longer scenes."
+        )
+        row_guard_max.addWidget(self.combo_smart_max_scene_mode, 1)
+        self.spin_smart_max_scene_len = QDoubleSpinBox(self.smart_director_box)
+        self.spin_smart_max_scene_len.setDecimals(1)
+        self.spin_smart_max_scene_len.setSingleStep(0.5)
+        self.spin_smart_max_scene_len.setRange(0.5, 30.0)
+        self.spin_smart_max_scene_len.setValue(5.0)
+        self.spin_smart_max_scene_len.setSuffix(" s")
+        self.spin_smart_max_scene_len.setToolTip(
+            "Manual maximum smart scene length. Auto mode ignores this value and uses source clip stats."
+        )
+        row_guard_max.addWidget(self.spin_smart_max_scene_len)
+        smart_lay.addLayout(row_guard_max)
+
+        settings_main.addWidget(self.smart_director_box)
+
+        # Lyrics / SRT main switch: set-once behavior belongs in Settings.
+        self.box_lyrics_srt_settings = QGroupBox("Lyrics / SRT", page_settings)
+        lyrics_settings_lay = QVBoxLayout(self.box_lyrics_srt_settings)
+        lyrics_settings_lay.setContentsMargins(10, 8, 10, 8)
+        lyrics_settings_lay.setSpacing(6)
+        row_lyrics_enable = QHBoxLayout()
+        self.check_use_lyrics_srt_timing = QCheckBox("Use lyrics / SRT timing", self.box_lyrics_srt_settings)
+        self.check_use_lyrics_srt_timing.setChecked(False)
+        self.check_use_lyrics_srt_timing.setToolTip(
+            "Use a loaded SRT subtitle/lyrics file as timing information for the Smart Director. "
+            "This does not run Whisper; it only loads an existing SRT file."
+        )
+        row_lyrics_enable.addWidget(self.check_use_lyrics_srt_timing)
+        row_lyrics_enable.addStretch(1)
+        lyrics_settings_lay.addLayout(row_lyrics_enable)
+        self.label_lyrics_srt_hint = QLabel("Load the SRT file on the Generation tab when this is enabled.", self.box_lyrics_srt_settings)
+        self.label_lyrics_srt_hint.setWordWrap(True)
+        lyrics_settings_lay.addWidget(self.label_lyrics_srt_hint)
+        settings_main.addWidget(self.box_lyrics_srt_settings)
 
         # microclip toggles
         row_micro = QHBoxLayout()
@@ -7382,7 +9430,7 @@ class AutoMusicSyncWidget(QWidget):
         row_micro.addWidget(self.check_micro_verses)
 
         row_micro.addStretch(1)
-        opts.addLayout(row_micro)
+        adv.addRow("Microclips:", row_micro)
 
         # full-length mode (hidden, always enabled internally)
         self.check_full_length = QCheckBox("Always fill full music length", self)
@@ -7410,12 +9458,12 @@ class AutoMusicSyncWidget(QWidget):
         )
         row_fade.addWidget(self.check_outro_fade)
         row_fade.addStretch(1)
-        opts.addLayout(row_fade)
+        gen_settings_lay.addLayout(row_fade)
 
         # Intro: transitions-only mode (no FX)
         row_intro_only = QHBoxLayout()
         self.check_intro_transitions_only = QCheckBox("Intro: transitions only (disable FX during intro)", self)
-        self.check_intro_transitions_only.setChecked(False)
+        self.check_intro_transitions_only.setChecked(True)
         self.check_intro_transitions_only.setToolTip(
             "When enabled, the intro section uses transitions only: disables video FX, "
             "slow motion, cinematic FX and break/drop impact FX during the intro. "
@@ -7423,7 +9471,7 @@ class AutoMusicSyncWidget(QWidget):
         )
         row_intro_only.addWidget(self.check_intro_transitions_only)
         row_intro_only.addStretch(1)
-        opts.addLayout(row_intro_only)
+        gen_settings_lay.addLayout(row_intro_only)
 
         # slow motion options
         row_slow_master = QHBoxLayout()
@@ -7434,7 +9482,7 @@ class AutoMusicSyncWidget(QWidget):
         )
         row_slow_master.addWidget(self.check_slow_enable)
         row_slow_master.addStretch(1)
-        opts.addLayout(row_slow_master)
+        effects_lay.addLayout(row_slow_master)
 
         self.slow_options = QWidget(self)
         slow_layout = QVBoxLayout(self.slow_options)
@@ -7480,7 +9528,7 @@ class AutoMusicSyncWidget(QWidget):
         row_slow_factor.addWidget(self.label_slow_factor_value)
         slow_layout.addLayout(row_slow_factor)
 
-        opts.addWidget(self.slow_options)
+        effects_lay.addWidget(self.slow_options)
         self.slow_options.setVisible(False)
 
         # cinematic effects options
@@ -7497,7 +9545,7 @@ class AutoMusicSyncWidget(QWidget):
             pass
         row_cine_master.addWidget(self.check_cine_enable)
         row_cine_master.addStretch(1)
-        opts.addLayout(row_cine_master)
+        effects_lay.addLayout(row_cine_master)
 
         self.cine_options = QWidget(self)
         cine_layout = QVBoxLayout(self.cine_options)
@@ -7986,7 +10034,7 @@ class AutoMusicSyncWidget(QWidget):
         row_cine_ramp_times.addWidget(self.label_cine_ramp_out)
         cine_layout.addLayout(row_cine_ramp_times)
 
-        opts.addWidget(self.cine_options)
+        effects_lay.addWidget(self.cine_options)
         # Defaults to visible because "Enable cinematic effects" defaults to ON.
         # (Saved settings can still override this during _load_settings.)
         self.cine_options.setVisible(True)
@@ -8000,7 +10048,7 @@ class AutoMusicSyncWidget(QWidget):
         )
         row_impact_master.addWidget(self.check_impact_enable)
         row_impact_master.addStretch(1)
-        opts.addLayout(row_impact_master)
+        effects_lay.addLayout(row_impact_master)
 
         self.impact_options = QWidget(self)
         impact_layout = QVBoxLayout(self.impact_options)
@@ -8252,7 +10300,7 @@ class AutoMusicSyncWidget(QWidget):
         row_impact_random.addStretch(1)
         impact_layout.addLayout(row_impact_random)
 
-        opts.addWidget(self.impact_options)
+        effects_lay.addWidget(self.impact_options)
         self.impact_options.setVisible(False)
 
         # Timed strobe: trigger the Flash strobe at custom time(s) in the song/video timeline.
@@ -8263,7 +10311,7 @@ class AutoMusicSyncWidget(QWidget):
         )
         row_strobe_on_time.addWidget(self.check_strobe_on_time)
         row_strobe_on_time.addStretch(1)
-        opts.addLayout(row_strobe_on_time)
+        other_lay.addLayout(row_strobe_on_time)
 
         self.strobe_time_options = QWidget(self)
         strobe_layout = QVBoxLayout(self.strobe_time_options)
@@ -8298,7 +10346,7 @@ class AutoMusicSyncWidget(QWidget):
         self.list_strobe_times.setMaximumHeight(110)
         strobe_layout.addWidget(self.list_strobe_times)
 
-        opts.addWidget(self.strobe_time_options)
+        other_lay.addWidget(self.strobe_time_options)
         self.strobe_time_options.setVisible(False)
 
         # Master FX kill-switch
@@ -8310,7 +10358,7 @@ class AutoMusicSyncWidget(QWidget):
         )
         row_nofx.addWidget(self.check_nofx)
         row_nofx.addStretch(1)
-        opts.addLayout(row_nofx)
+        gen_settings_lay.addLayout(row_nofx)
 
 
         # Music-player visuals overlay (optional)
@@ -8322,7 +10370,7 @@ class AutoMusicSyncWidget(QWidget):
         )
         row_viz.addWidget(self.check_visual_overlay)
         row_viz.addStretch(1)
-        opts.addLayout(row_viz)
+        other_lay.addLayout(row_viz)
 
         # Music-player visuals strategies (shown only when overlay is enabled)
         self.viz_options_container = QWidget(self)
@@ -8385,7 +10433,7 @@ class AutoMusicSyncWidget(QWidget):
         self.spin_visual_opacity.valueChanged.connect(self._on_visual_opacity_spin_changed)
 
         self.viz_options_container.setVisible(False)
-        opts.addWidget(self.viz_options_container)
+        other_lay.addWidget(self.viz_options_container)
 
         # transitions
         row_trans = QHBoxLayout()
@@ -8435,7 +10483,7 @@ class AutoMusicSyncWidget(QWidget):
         )
         row_trans.addWidget(self.combo_transitions, 1)
         row_trans.addStretch(1)
-        opts.addLayout(row_trans)
+        transitions_lay.addLayout(row_trans)
 
         
         # random transitions toggle + manager
@@ -8454,23 +10502,16 @@ class AutoMusicSyncWidget(QWidget):
         )
         row_trans_ctrl.addWidget(btn_manage_trans)
         row_trans_ctrl.addStretch(1)
-        opts.addLayout(row_trans_ctrl)
+        transitions_lay.addLayout(row_trans_ctrl)
 
 
         main.addWidget(self.box_opts)
 
-        # advanced
-        self.box_adv = QGroupBox("Advanced", self)
-        self.box_adv.setCheckable(True)
-        self.box_adv.setChecked(True)
-        adv = QFormLayout(self.box_adv)
-        adv.setLabelAlignment(Qt.AlignRight | Qt.AlignVCenter)
-        adv.setSpacing(4)
-
+        # Advanced beat settings are shown on the Settings tab.
         self.slider_sens = QSlider(Qt.Horizontal, self)
         self.slider_sens.setMinimum(0)
         self.slider_sens.setMaximum(20)
-        self.slider_sens.setValue(10)
+        self.slider_sens.setValue(20)
         self.slider_sens.setSingleStep(1)
         self.slider_sens.setPageStep(2)
         self.slider_sens.setToolTip(
@@ -8483,14 +10524,30 @@ class AutoMusicSyncWidget(QWidget):
 
         self.spin_beats_per_seg = QSpinBox(self)
         self.spin_beats_per_seg.setRange(1, 256)
-        self.spin_beats_per_seg.setValue(8)
+        self.spin_beats_per_seg.setValue(16)
         self.spin_beats_per_seg.setToolTip(
             "Number of beats grouped into one base video segment.\n"
             "1 = very fast cuts, 4 = default, 8+ = slower cuts. You can go up to 256 when you want long clips in very fast music (eg. DnB 170bpm"
         )
         adv.addRow("Beats per base segment:", self.spin_beats_per_seg)
 
-        main.addWidget(self.box_adv)
+        settings_main.addWidget(self.box_adv)
+
+        self.box_direct_run = QGroupBox("Direct run", page_settings)
+        direct_run_lay = QVBoxLayout(self.box_direct_run)
+        direct_run_lay.setContentsMargins(10, 8, 10, 8)
+        direct_run_lay.setSpacing(6)
+        self.label_direct_run = QLabel("Direct run — skips using queue", self.box_direct_run)
+        self.label_direct_run.setWordWrap(True)
+        direct_run_lay.addWidget(self.label_direct_run)
+        row_direct_run = QHBoxLayout()
+        self.btn_generate = QPushButton("Generate Clip", self.box_direct_run)
+        self.btn_generate.setToolTip("Render immediately in this tool, without using the FrameVision queue.")
+        row_direct_run.addWidget(self.btn_generate)
+        row_direct_run.addStretch(1)
+        direct_run_lay.addLayout(row_direct_run)
+        settings_main.addWidget(self.box_direct_run)
+        settings_main.addStretch(1)
 
         # progress + buttons
         self.progress = QProgressBar(self)
@@ -8525,7 +10582,6 @@ class AutoMusicSyncWidget(QWidget):
         footer_row_bottom.setSpacing(6)
 
         self.btn_analyze = QPushButton("Analyze", self.footer_bar)
-        self.btn_generate = QPushButton("Generate Clip", self.footer_bar)
 
         self.btn_queue = QPushButton("Queue Clip", self.footer_bar)
         try:
@@ -8579,10 +10635,11 @@ class AutoMusicSyncWidget(QWidget):
         self.btn_reset_all.setToolTip(
             "Stop any running job, clear loaded sources and reset all settings to defaults."
         )
+        # Replaced in the visible UI by Settings → Use default settings.
+        self.btn_reset_all.hide()
 
         # Row 1: main actions
         footer_row_top.addWidget(self.btn_analyze)
-        footer_row_top.addWidget(self.btn_generate)
         try:
             footer_row_top.addWidget(self.btn_queue)
         except Exception:
@@ -8607,7 +10664,7 @@ class AutoMusicSyncWidget(QWidget):
 
 
         # Install tabs
-        self.tabs.addTab(page_main, "Generator")
+        self.tabs.addTab(page_main, "Generation")
 
         # Music timeline tab lives in a separate helper module so it can grow
         # without bloating this file too much.
@@ -8623,7 +10680,17 @@ class AutoMusicSyncWidget(QWidget):
             lbl.setWordWrap(True)
             tl.addWidget(lbl)
             tl.addStretch(1)
-        self.tabs.addTab(self.timeline_panel, "Music timeline")
+        self.tabs.addTab(self.timeline_panel, "Timeline")
+        self.tabs.addTab(page_settings, "Settings")
+
+        # Preset manager safety: the UI is now split across Generation + Settings,
+        # so capture all setting roots instead of only the old Options/Advanced boxes.
+        self._preset_capture_roots = [
+            self.box_opts,
+            self.box_generation_settings,
+            self.smart_director_box,
+            self.box_adv,
+        ]
 
         # Connect mini-timeline actions to this widget (if available)
         if TimelinePanel is not None and isinstance(self.timeline_panel, TimelinePanel):
@@ -8656,6 +10723,10 @@ class AutoMusicSyncWidget(QWidget):
             self.btn_edit_presets.clicked.connect(self._on_edit_presets_clicked)
         except Exception:
             pass
+        try:
+            self.btn_use_default_settings.clicked.connect(self._on_use_default_settings)
+        except Exception:
+            pass
         self.btn_cancel.clicked.connect(self._on_cancel)
         self.btn_reset_all.clicked.connect(self._on_reset_all)
         self.btn_check_timeline.clicked.connect(self._on_check_timeline)
@@ -8669,6 +10740,27 @@ class AutoMusicSyncWidget(QWidget):
         self.check_trans_random.stateChanged.connect(self._on_trans_random_toggled)
         self.check_slow_enable.stateChanged.connect(self._on_slow_toggle)
         self.slider_slow_factor.valueChanged.connect(self._on_slow_factor_changed)
+
+        # Smart Director controls + classic FX visibility
+        try:
+            self.check_smart_scene_map.toggled.connect(lambda _v: self._update_smart_director_visibility())
+            if hasattr(self, "check_smart_scene_duration_guard"):
+                self.check_smart_scene_duration_guard.toggled.connect(lambda _v: self._update_smart_director_visibility())
+            if hasattr(self, "combo_smart_max_scene_mode"):
+                self.combo_smart_max_scene_mode.currentTextChanged.connect(lambda _v: self._update_smart_director_visibility())
+            self._update_smart_director_visibility()
+        except Exception:
+            pass
+
+        # Lyrics / SRT timing controls
+        try:
+            self.check_use_lyrics_srt_timing.toggled.connect(self._on_lyrics_srt_toggled)
+            self.btn_run_whisper_srt.clicked.connect(self._on_run_whisper_srt_clicked)
+            self.btn_load_srt.clicked.connect(self._on_load_srt_clicked)
+            self.btn_clear_srt.clicked.connect(self._on_clear_srt_clicked)
+            self._update_lyrics_srt_ui()
+        except Exception:
+            pass
 
         # Cinematic effects panel
         self.check_cine_enable.stateChanged.connect(self._on_cine_toggle)
@@ -9102,6 +11194,285 @@ class AutoMusicSyncWidget(QWidget):
             finally:
                 slider.blockSignals(False)
 
+    def _lyrics_srt_enabled(self) -> bool:
+        try:
+            return bool(getattr(self, "check_use_lyrics_srt_timing", None) and self.check_use_lyrics_srt_timing.isChecked())
+        except Exception:
+            return False
+
+    def _update_lyrics_srt_ui(self) -> None:
+        enabled = self._lyrics_srt_enabled()
+        try:
+            self.box_lyrics_srt_generation.setVisible(enabled)
+        except Exception:
+            pass
+        try:
+            running = bool(getattr(self, "_whisper_worker", None) and self._whisper_worker.isRunning())
+            if hasattr(self, "btn_run_whisper_srt"):
+                self.btn_run_whisper_srt.setEnabled(bool(enabled) and not running)
+        except Exception:
+            pass
+        path = str(getattr(self, "_lyrics_srt_path", "") or "").strip()
+        segs = list(getattr(self, "_lyrics_srt_segments", []) or [])
+        try:
+            if path:
+                shown = os.path.basename(path) or path
+                if not os.path.exists(path):
+                    shown = f"missing: {shown}"
+                self.label_srt_loaded.setText(f"Loaded: {shown}")
+            else:
+                self.label_srt_loaded.setText("Loaded: none")
+        except Exception:
+            pass
+        try:
+            self.label_srt_segments.setText(f"Segments: {len(segs)}")
+        except Exception:
+            pass
+        try:
+            if segs:
+                start = min(float(seg.start) for seg in segs)
+                end = max(float(seg.end) for seg in segs)
+                self.label_srt_range.setText(f"Lyrics timing: {start:.2f}s → {end:.2f}s")
+            else:
+                self.label_srt_range.setText("Lyrics timing: —")
+        except Exception:
+            pass
+        try:
+            if hasattr(self, "label_srt_whisper_status") and not str(self.label_srt_whisper_status.text() or "").strip():
+                self.label_srt_whisper_status.setText("Whisper: idle")
+        except Exception:
+            pass
+
+    def _on_lyrics_srt_toggled(self, _checked: bool = False) -> None:
+        # Hide/show only. Do not clear the loaded SRT when the setting is turned off.
+        try:
+            if self._lyrics_srt_enabled() and getattr(self, "_lyrics_srt_path", "") and not getattr(self, "_lyrics_srt_segments", None):
+                path = str(getattr(self, "_lyrics_srt_path", "") or "")
+                if os.path.isfile(path):
+                    self._lyrics_srt_segments = load_srt_segments(path)
+        except Exception:
+            pass
+        self._update_lyrics_srt_ui()
+        try:
+            self._save_settings()
+        except Exception:
+            pass
+
+    def _set_srt_status(self, text: str) -> None:
+        try:
+            if hasattr(self, "label_srt_whisper_status"):
+                self.label_srt_whisper_status.setText(str(text or ""))
+        except Exception:
+            pass
+
+    def _load_srt_path_into_state(self, path: str, *, show_toast: bool = True, warn: bool = True) -> bool:
+        old_path = str(getattr(self, "_lyrics_srt_path", "") or "")
+        old_segments = list(getattr(self, "_lyrics_srt_segments", []) or [])
+        try:
+            segs = load_srt_segments(path)
+        except Exception as e:
+            self._lyrics_srt_path = old_path
+            self._lyrics_srt_segments = old_segments
+            self._update_lyrics_srt_ui()
+            if warn:
+                try:
+                    QMessageBox.warning(self, "SRT parse failed", f"Could not load SRT file:\n{e}", QMessageBox.Ok)
+                except Exception:
+                    pass
+            return False
+        if not segs:
+            self._lyrics_srt_path = old_path
+            self._lyrics_srt_segments = old_segments
+            self._update_lyrics_srt_ui()
+            if warn:
+                try:
+                    QMessageBox.warning(self, "No SRT segments", "No valid subtitle/lyric timing segments were found in this SRT file.", QMessageBox.Ok)
+                except Exception:
+                    pass
+            return False
+        self._lyrics_srt_path = str(path or "")
+        self._lyrics_srt_segments = segs
+        self._update_lyrics_srt_ui()
+        try:
+            self._save_settings()
+        except Exception:
+            pass
+        if show_toast:
+            try:
+                self._show_toast(f"Loaded {len(segs)} SRT segments.")
+            except Exception:
+                pass
+        return True
+
+    def _on_load_srt_clicked(self) -> None:
+        start_dir = ""
+        try:
+            if getattr(self, "_lyrics_srt_path", ""):
+                start_dir = os.path.dirname(self._lyrics_srt_path)
+            elif self.edit_audio.text().strip():
+                start_dir = os.path.dirname(self.edit_audio.text().strip())
+        except Exception:
+            start_dir = ""
+        path, _ = QFileDialog.getOpenFileName(
+            self,
+            "Load SRT lyrics/subtitles",
+            start_dir,
+            "SRT files (*.srt);;All files (*.*)",
+        )
+        if not path:
+            return
+        self._load_srt_path_into_state(path, show_toast=True, warn=True)
+
+    def _on_clear_srt_clicked(self) -> None:
+        self._lyrics_srt_path = ""
+        self._lyrics_srt_segments = []
+        self._update_lyrics_srt_ui()
+        self._set_srt_status("Whisper: idle")
+        try:
+            self._save_settings()
+        except Exception:
+            pass
+
+    def _whisper_output_dir_for_musicclip(self) -> str:
+        root = _musicclip_project_root()
+        try:
+            out_txt = str(self.edit_output.text().strip())
+        except Exception:
+            out_txt = ""
+        if out_txt:
+            return _musicclip_abs_path(root, out_txt)
+        return _musicclip_default_whisper_output_dir(root)
+
+    def _set_whisper_running_ui(self, running: bool, status: str = "") -> None:
+        try:
+            if hasattr(self, "btn_run_whisper_srt"):
+                self.btn_run_whisper_srt.setEnabled(bool(self._lyrics_srt_enabled()) and not bool(running))
+        except Exception:
+            pass
+        if status:
+            self._set_srt_status(status)
+
+    def _on_run_whisper_srt_clicked(self) -> None:
+        if not self._lyrics_srt_enabled():
+            return
+        try:
+            if self._whisper_worker is not None and self._whisper_worker.isRunning():
+                return
+        except Exception:
+            pass
+
+        try:
+            audio = str(self.edit_audio.text().strip())
+        except Exception:
+            audio = ""
+        if not audio or not os.path.isfile(audio):
+            try:
+                QMessageBox.warning(self, "Missing audio", "Please load a music/audio file first.", QMessageBox.Ok)
+            except Exception:
+                pass
+            return
+
+        root = _musicclip_project_root()
+        env_python = _musicclip_whisper_env_python(root)
+        model_dir = _musicclip_whisper_model_dir(root)
+        if not os.path.isfile(env_python):
+            try:
+                QMessageBox.warning(self, "Whisper not installed", "Whisper environment was not found. Install Whisper from Optional Installs first.", QMessageBox.Ok)
+            except Exception:
+                pass
+            return
+        if not os.path.isdir(model_dir):
+            try:
+                QMessageBox.warning(self, "Whisper model missing", "Faster-Whisper model was not found: models/faster_whisper/medium/", QMessageBox.Ok)
+            except Exception:
+                pass
+            return
+
+        out_dir = self._whisper_output_dir_for_musicclip()
+        self._set_whisper_running_ui(True, "Running Whisper...")
+        try:
+            self.progress.setFormat("Running Whisper...")
+        except Exception:
+            pass
+
+        self._whisper_worker = WhisperMusicClipWorker(
+            project_root=root,
+            audio_path=audio,
+            output_dir=out_dir,
+            env_python=env_python,
+            model_dir=model_dir,
+            ffprobe=self._ffprobe,
+            parent=self,
+        )
+        self._whisper_worker.progress.connect(self._on_whisper_srt_progress)
+        self._whisper_worker.finished_ok.connect(self._on_whisper_srt_finished)
+        self._whisper_worker.failed.connect(self._on_whisper_srt_failed)
+        self._whisper_worker.start()
+
+    def _on_whisper_srt_progress(self, pct: int, message: str) -> None:
+        try:
+            self._set_srt_status(str(message or "Running Whisper..."))
+        except Exception:
+            pass
+        try:
+            self.progress.setValue(max(0, min(100, int(pct))))
+            self.progress.setFormat(str(message or "Running Whisper..."))
+        except Exception:
+            pass
+
+    def _on_whisper_srt_finished(self, srt_path: str) -> None:
+        self._set_whisper_running_ui(False, "Whisper finished. Loading SRT...")
+        ok = self._load_srt_path_into_state(str(srt_path or ""), show_toast=True, warn=True)
+        if ok:
+            self._set_srt_status("Whisper finished and SRT loaded.")
+            try:
+                self.progress.setValue(100)
+                self.progress.setFormat("Whisper finished and SRT loaded.")
+            except Exception:
+                pass
+        else:
+            self._set_srt_status("Whisper finished, but SRT could not be loaded.")
+        try:
+            self._whisper_worker = None
+        except Exception:
+            pass
+
+    def _on_whisper_srt_failed(self, message: str) -> None:
+        self._set_whisper_running_ui(False, "Whisper failed.")
+        msg = str(message or "Whisper failed.").strip()
+        try:
+            self.progress.setFormat("Whisper failed.")
+        except Exception:
+            pass
+        try:
+            QMessageBox.warning(self, "Whisper failed", msg, QMessageBox.Ok)
+        except Exception:
+            pass
+        try:
+            self._whisper_worker = None
+        except Exception:
+            pass
+
+    def _current_lyric_segments_for_render(self) -> List[LyricSegment]:
+        if not self._lyrics_srt_enabled():
+            return []
+        segs = list(getattr(self, "_lyrics_srt_segments", []) or [])
+        if segs:
+            return segs
+        path = str(getattr(self, "_lyrics_srt_path", "") or "")
+        if path and os.path.isfile(path):
+            try:
+                self._lyrics_srt_segments = load_srt_segments(path)
+                self._update_lyrics_srt_ui()
+                return list(self._lyrics_srt_segments)
+            except Exception as e:
+                try:
+                    print(f"WARNING: failed to parse SRT file '{path}': {e}")
+                except Exception:
+                    pass
+        return []
+
+
     def _on_manage_transitions(self) -> None:
         """Open a dialog to choose which transition styles are allowed for random mode."""
         names = [
@@ -9182,6 +11553,217 @@ class AutoMusicSyncWidget(QWidget):
     def _on_trans_random_toggled(self, state: int) -> None:
         """Keep the transitions row in sync with the 'Random transitions' toggle."""
         self._update_transition_visibility()
+
+    def _update_smart_director_visibility(self) -> None:
+        """Keep Smart Director controls and the classic FX Level row in sync."""
+        try:
+            smart_on = bool(getattr(self, "check_smart_scene_map", None) and self.check_smart_scene_map.isChecked())
+        except Exception:
+            smart_on = True
+
+        # Smart Director owns effect intensity while enabled, so hide the legacy
+        # FX Level selector. It comes back for classic/manual mode.
+        try:
+            row = getattr(self, "fx_level_row_widget", None)
+            if row is not None:
+                row.setVisible(not smart_on)
+                row.setEnabled(not smart_on)
+            else:
+                for w in (getattr(self, "label_fx_level", None), getattr(self, "combo_fx", None)):
+                    if w is not None:
+                        try:
+                            w.setVisible(not smart_on)
+                            w.setEnabled(not smart_on)
+                        except Exception:
+                            pass
+        except Exception:
+            pass
+
+        # Keep the Smart Director sub-controls disabled when the main switch is off.
+        for name in (
+            "combo_director_preset",
+            "combo_scene_cut_style",
+            "spin_smart_cut_timing_offset",
+        ):
+            w = getattr(self, name, None)
+            if w is not None:
+                try:
+                    w.setEnabled(smart_on)
+                except Exception:
+                    pass
+
+        try:
+            guard_cb = getattr(self, "check_smart_scene_duration_guard", None)
+            guard_on = bool(smart_on and guard_cb is not None and guard_cb.isChecked())
+            if guard_cb is not None:
+                guard_cb.setEnabled(smart_on)
+        except Exception:
+            guard_on = False
+
+        for name in ("spin_smart_min_scene_len", "combo_smart_max_scene_mode"):
+            w = getattr(self, name, None)
+            if w is not None:
+                try:
+                    w.setEnabled(guard_on)
+                except Exception:
+                    pass
+
+        try:
+            mode = str(self.combo_smart_max_scene_mode.currentText()) if hasattr(self, "combo_smart_max_scene_mode") else "Auto (source-aware)"
+            manual_max = _normalize_smart_scene_max_mode(mode) == "Manual"
+            if hasattr(self, "spin_smart_max_scene_len"):
+                self.spin_smart_max_scene_len.setEnabled(bool(guard_on and manual_max))
+        except Exception:
+            pass
+
+    def _on_use_default_settings(self) -> None:
+        """Apply the recommended Music Clip Creator defaults without clearing paths."""
+        self._apply_music_clip_creator_defaults(save=True, show_message=True)
+
+    def _apply_music_clip_creator_defaults(self, save: bool = True, show_message: bool = False) -> None:
+        """Restore user-facing defaults while preserving selected paths/sources."""
+        # Generation Settings
+        try:
+            if hasattr(self, "combo_res"):
+                # Fixed: 1080p (1920×1080) 16:9
+                self.combo_res.setCurrentIndex(3)
+        except Exception:
+            pass
+        try:
+            if hasattr(self, "check_keep_source_bitrate"):
+                self.check_keep_source_bitrate.setChecked(True)
+        except Exception:
+            pass
+        try:
+            if hasattr(self, "combo_fit"):
+                self.combo_fit.setCurrentIndex(0)  # Original (letterbox/pillarbox)
+        except Exception:
+            pass
+        try:
+            if hasattr(self, "check_min_clip"):
+                self.check_min_clip.setChecked(True)
+            if hasattr(self, "spin_min_clip"):
+                self.spin_min_clip.setValue(1.5)
+        except Exception:
+            pass
+        try:
+            if hasattr(self, "check_intro_fade"):
+                self.check_intro_fade.setChecked(True)
+            if hasattr(self, "check_outro_fade"):
+                self.check_outro_fade.setChecked(True)
+            if hasattr(self, "check_intro_transitions_only"):
+                self.check_intro_transitions_only.setChecked(True)
+        except Exception:
+            pass
+        try:
+            if hasattr(self, "check_nofx"):
+                self.check_nofx.setChecked(False)
+        except Exception:
+            pass
+        try:
+            if hasattr(self, "combo_clip_order"):
+                # Keep the current coded default: Random (default).
+                self.combo_clip_order.setCurrentIndex(0)
+        except Exception:
+            pass
+        try:
+            if hasattr(self, "check_use_seed"):
+                self.check_use_seed.setChecked(False)
+            if hasattr(self, "spin_seed"):
+                self.spin_seed.setEnabled(False)
+        except Exception:
+            pass
+        try:
+            if hasattr(self, "check_use_lyrics_srt_timing"):
+                self.check_use_lyrics_srt_timing.setChecked(False)
+            self._update_lyrics_srt_ui()
+        except Exception:
+            pass
+
+        # Smart Director
+        try:
+            if hasattr(self, "check_smart_scene_map"):
+                self.check_smart_scene_map.setChecked(True)
+            if hasattr(self, "combo_director_preset"):
+                idx = self.combo_director_preset.findText("Balanced", Qt.MatchFixedString)
+                self.combo_director_preset.setCurrentIndex(idx if idx >= 0 else 1)
+            if hasattr(self, "combo_scene_cut_style"):
+                idx = self.combo_scene_cut_style.findText("Auto", Qt.MatchFixedString)
+                self.combo_scene_cut_style.setCurrentIndex(idx if idx >= 0 else 0)
+            if hasattr(self, "spin_smart_cut_timing_offset"):
+                self.spin_smart_cut_timing_offset.setValue(-0.35)
+            if hasattr(self, "check_smart_scene_duration_guard"):
+                self.check_smart_scene_duration_guard.setChecked(True)
+            if hasattr(self, "spin_smart_min_scene_len"):
+                self.spin_smart_min_scene_len.setValue(2.0)
+            if hasattr(self, "combo_smart_max_scene_mode"):
+                idx = self.combo_smart_max_scene_mode.findText("Auto (source-aware)", Qt.MatchFixedString)
+                self.combo_smart_max_scene_mode.setCurrentIndex(idx if idx >= 0 else 0)
+            if hasattr(self, "spin_smart_max_scene_len"):
+                self.spin_smart_max_scene_len.setValue(5.0)
+        except Exception:
+            pass
+
+        # Advanced Beat Settings / microclip behavior
+        try:
+            if hasattr(self, "box_adv") and self.box_adv.isCheckable():
+                self.box_adv.setChecked(False)
+        except Exception:
+            pass
+        try:
+            if hasattr(self, "check_micro_chorus"):
+                self.check_micro_chorus.setChecked(False)
+            if hasattr(self, "check_micro_all"):
+                self.check_micro_all.setChecked(False)
+            if hasattr(self, "check_micro_verses"):
+                self.check_micro_verses.setChecked(False)
+        except Exception:
+            pass
+        try:
+            if hasattr(self, "slider_sens"):
+                self.slider_sens.setValue(int(self.slider_sens.maximum()))
+            if hasattr(self, "spin_beats_per_seg"):
+                self.spin_beats_per_seg.setValue(16)
+        except Exception:
+            pass
+
+        # Refresh dependent UI state without starting any job.
+        for fn_name in (
+            "_on_seed_toggle",
+            "_on_micro_mode_changed",
+            "_update_transition_visibility",
+            "_update_smart_director_visibility",
+        ):
+            try:
+                fn = getattr(self, fn_name, None)
+                if callable(fn):
+                    if fn_name in ("_on_seed_toggle", "_on_micro_mode_changed"):
+                        fn(0)
+                    else:
+                        fn()
+            except TypeError:
+                try:
+                    fn()
+                except Exception:
+                    pass
+            except Exception:
+                pass
+
+        if save:
+            try:
+                self._save_settings()
+                try:
+                    self._settings.sync()
+                except Exception:
+                    pass
+            except Exception:
+                pass
+
+        if show_message:
+            try:
+                self._show_toast("Default Music Clip Creator settings applied.")
+            except Exception:
+                pass
 
     def _on_cancel(self) -> None:
         """Cancel current render (if any), reset progress and clean temp folder."""
@@ -9296,6 +11878,30 @@ class AutoMusicSyncWidget(QWidget):
         try:
             self.edit_audio.clear()
             self.edit_video.clear()
+        except Exception:
+            pass
+
+        # Restore Smart Director defaults for a fresh install-like state.
+        try:
+            if hasattr(self, "check_smart_scene_map"):
+                self.check_smart_scene_map.setChecked(True)
+            if hasattr(self, "combo_director_preset"):
+                idx = self.combo_director_preset.findText("Balanced", Qt.MatchFixedString)
+                self.combo_director_preset.setCurrentIndex(idx if idx >= 0 else 1)
+            if hasattr(self, "combo_scene_cut_style"):
+                idx = self.combo_scene_cut_style.findText("Auto", Qt.MatchFixedString)
+                self.combo_scene_cut_style.setCurrentIndex(idx if idx >= 0 else 0)
+            if hasattr(self, "spin_smart_cut_timing_offset"):
+                self.spin_smart_cut_timing_offset.setValue(-0.35)
+            if hasattr(self, "check_smart_scene_duration_guard"):
+                self.check_smart_scene_duration_guard.setChecked(True)
+            if hasattr(self, "spin_smart_min_scene_len"):
+                self.spin_smart_min_scene_len.setValue(2.0)
+            if hasattr(self, "combo_smart_max_scene_mode"):
+                idx = self.combo_smart_max_scene_mode.findText("Auto (source-aware)", Qt.MatchFixedString)
+                self.combo_smart_max_scene_mode.setCurrentIndex(idx if idx >= 0 else 0)
+            if hasattr(self, "spin_smart_max_scene_len"):
+                self.spin_smart_max_scene_len.setValue(5.0)
         except Exception:
             pass
 
@@ -9555,6 +12161,10 @@ class AutoMusicSyncWidget(QWidget):
             self._disable_camera_motion_fx()
         except Exception:
             pass
+        try:
+            self._update_smart_director_visibility()
+        except Exception:
+            pass
 
         try:
             self.label_summary.setText(f"Preset applied: {preset_name}")
@@ -9590,9 +12200,13 @@ class AutoMusicSyncWidget(QWidget):
         """
         out: dict = {}
 
-        box_opts = getattr(self, "box_opts", None)
-        box_adv = getattr(self, "box_adv", None)
-        if box_opts is None and box_adv is None:
+        roots = list(getattr(self, "_preset_capture_roots", []) or [])
+        if not roots:
+            box_opts = getattr(self, "box_opts", None)
+            box_adv = getattr(self, "box_adv", None)
+            roots = [box_opts, box_adv]
+        roots = [r for r in roots if r is not None]
+        if not roots:
             return out
 
         # Map widget object id -> attribute name on this instance.
@@ -9604,9 +12218,26 @@ class AutoMusicSyncWidget(QWidget):
             except Exception:
                 continue
 
+        # Keep 1-click preset behavior close to the old UI: presets capture creative,
+        # Smart Director and advanced beat controls, but not normal run setup such as
+        # output resolution, source ordering or fixed seed options. Those still save via
+        # the normal app settings path.
+        preset_skip_keys = {
+            "combo_clip_order",
+            "check_min_clip",
+            "spin_min_clip",
+            "spin_seed",
+            "check_use_seed",
+            "combo_res",
+            "check_keep_source_bitrate",
+            "combo_fit",
+        }
+
         def add_widget(w: QWidget) -> None:
             key = id_to_attr.get(id(w))
             if not key:
+                return
+            if key in preset_skip_keys:
                 return
             # Skip obvious non-settings widgets.
             try:
@@ -9631,7 +12262,7 @@ class AutoMusicSyncWidget(QWidget):
             except Exception:
                 return
 
-        for root in (box_opts, box_adv):
+        for root in roots:
             if root is None:
                 continue
             try:
@@ -9697,6 +12328,10 @@ class AutoMusicSyncWidget(QWidget):
             self._disable_camera_motion_fx()
         except Exception:
             pass
+        try:
+            self._update_smart_director_visibility()
+        except Exception:
+            pass
 
     def _load_settings(self) -> None:
         """Load last-used paths and options from QSettings."""
@@ -9711,6 +12346,66 @@ class AutoMusicSyncWidget(QWidget):
             pass
 
         self.combo_fx.setCurrentIndex(int(s.value("fx_level", self.combo_fx.currentIndex())))
+        if hasattr(self, "check_smart_scene_map"):
+            self.check_smart_scene_map.setChecked(bool(int(s.value("smart_scene_map", int(self.check_smart_scene_map.isChecked())))))
+        if hasattr(self, "combo_director_preset"):
+            try:
+                preset_text = str(s.value("director_preset", self.combo_director_preset.currentText(), str))
+                idx_p = self.combo_director_preset.findText(_normalize_director_preset(preset_text), Qt.MatchFixedString)
+                if idx_p >= 0:
+                    self.combo_director_preset.setCurrentIndex(idx_p)
+            except Exception:
+                pass
+        if hasattr(self, "combo_scene_cut_style"):
+            try:
+                cut_text = str(s.value("scene_cut_style", self.combo_scene_cut_style.currentText(), str))
+                idx_c = self.combo_scene_cut_style.findText(_normalize_cut_style(cut_text), Qt.MatchFixedString)
+                if idx_c >= 0:
+                    self.combo_scene_cut_style.setCurrentIndex(idx_c)
+            except Exception:
+                pass
+        if hasattr(self, "spin_smart_cut_timing_offset"):
+            try:
+                self.spin_smart_cut_timing_offset.setValue(_normalize_smart_cut_timing_offset(float(s.value("smart_cut_timing_offset", self.spin_smart_cut_timing_offset.value()))))
+            except Exception:
+                pass
+        if hasattr(self, "check_smart_scene_duration_guard"):
+            self.check_smart_scene_duration_guard.setChecked(bool(int(s.value("smart_scene_duration_guard", int(self.check_smart_scene_duration_guard.isChecked())))))
+        if hasattr(self, "spin_smart_min_scene_len"):
+            try:
+                self.spin_smart_min_scene_len.setValue(float(s.value("smart_min_scene_len", self.spin_smart_min_scene_len.value())))
+            except Exception:
+                pass
+        if hasattr(self, "combo_smart_max_scene_mode"):
+            try:
+                max_mode_text = str(s.value("smart_max_scene_mode", self.combo_smart_max_scene_mode.currentText(), str))
+                idx_m = self.combo_smart_max_scene_mode.findText(_normalize_smart_scene_max_mode(max_mode_text), Qt.MatchFixedString)
+                if idx_m >= 0:
+                    self.combo_smart_max_scene_mode.setCurrentIndex(idx_m)
+            except Exception:
+                pass
+        if hasattr(self, "spin_smart_max_scene_len"):
+            try:
+                self.spin_smart_max_scene_len.setValue(float(s.value("smart_max_scene_len", self.spin_smart_max_scene_len.value())))
+            except Exception:
+                pass
+        try:
+            if hasattr(self, "check_use_lyrics_srt_timing"):
+                try:
+                    self.check_use_lyrics_srt_timing.blockSignals(True)
+                    self.check_use_lyrics_srt_timing.setChecked(bool(int(s.value("use_lyrics_srt_timing", 0))))
+                finally:
+                    self.check_use_lyrics_srt_timing.blockSignals(False)
+            self._lyrics_srt_path = str(s.value("lyrics_srt_path", "", str) or "").strip()
+            self._lyrics_srt_segments = []
+            if self._lyrics_srt_path and os.path.isfile(self._lyrics_srt_path):
+                try:
+                    self._lyrics_srt_segments = load_srt_segments(self._lyrics_srt_path)
+                except Exception:
+                    self._lyrics_srt_segments = []
+            self._update_lyrics_srt_ui()
+        except Exception:
+            pass
         self.check_nofx.setChecked(bool(int(s.value("nofx", int(self.check_nofx.isChecked() if hasattr(self, "check_nofx") else 0)))))
         if hasattr(self, "check_visual_overlay"):
             self.check_visual_overlay.setChecked(bool(int(s.value("visual_overlay", int(self.check_visual_overlay.isChecked())))))
@@ -9722,6 +12417,11 @@ class AutoMusicSyncWidget(QWidget):
         self.check_micro_all.setChecked(bool(int(s.value("micro_all", int(self.check_micro_all.isChecked())))))
         if hasattr(self, "check_micro_verses"):
             self.check_micro_verses.setChecked(bool(int(s.value("micro_verses", int(self.check_micro_verses.isChecked())))))
+        try:
+            if hasattr(self, "box_adv") and self.box_adv.isCheckable():
+                self.box_adv.setChecked(bool(int(s.value("advanced_beat_settings_enabled", int(self.box_adv.isChecked())))))
+        except Exception:
+            pass
         self.check_full_length.setChecked(True)
         self.check_intro_fade.setChecked(bool(int(s.value("intro_fade", int(self.check_intro_fade.isChecked())))))
         self.check_outro_fade.setChecked(bool(int(s.value("outro_fade", int(self.check_outro_fade.isChecked())))))
@@ -10048,6 +12748,14 @@ class AutoMusicSyncWidget(QWidget):
             self._hide_image_sources_block()
         except Exception:
             pass
+        try:
+            self._update_smart_director_visibility()
+        except Exception:
+            pass
+        try:
+            self._update_lyrics_srt_ui()
+        except Exception:
+            pass
 
 
 
@@ -10059,6 +12767,25 @@ class AutoMusicSyncWidget(QWidget):
         s.setValue("output_path", self.edit_output.text().strip())
 
         s.setValue("fx_level", self.combo_fx.currentIndex())
+        if hasattr(self, "check_smart_scene_map"):
+            s.setValue("smart_scene_map", int(self.check_smart_scene_map.isChecked()))
+        if hasattr(self, "combo_director_preset"):
+            s.setValue("director_preset", str(self.combo_director_preset.currentText()))
+        if hasattr(self, "combo_scene_cut_style"):
+            s.setValue("scene_cut_style", str(self.combo_scene_cut_style.currentText()))
+        if hasattr(self, "spin_smart_cut_timing_offset"):
+            s.setValue("smart_cut_timing_offset", float(self.spin_smart_cut_timing_offset.value()))
+        if hasattr(self, "check_smart_scene_duration_guard"):
+            s.setValue("smart_scene_duration_guard", int(self.check_smart_scene_duration_guard.isChecked()))
+        if hasattr(self, "spin_smart_min_scene_len"):
+            s.setValue("smart_min_scene_len", float(self.spin_smart_min_scene_len.value()))
+        if hasattr(self, "combo_smart_max_scene_mode"):
+            s.setValue("smart_max_scene_mode", str(self.combo_smart_max_scene_mode.currentText()))
+        if hasattr(self, "spin_smart_max_scene_len"):
+            s.setValue("smart_max_scene_len", float(self.spin_smart_max_scene_len.value()))
+        if hasattr(self, "check_use_lyrics_srt_timing"):
+            s.setValue("use_lyrics_srt_timing", int(self.check_use_lyrics_srt_timing.isChecked()))
+        s.setValue("lyrics_srt_path", str(getattr(self, "_lyrics_srt_path", "") or ""))
         s.setValue("nofx", int(self.check_nofx.isChecked()))
         if hasattr(self, "check_visual_overlay"):
             s.setValue("visual_overlay", int(self.check_visual_overlay.isChecked()))
@@ -10072,6 +12799,11 @@ class AutoMusicSyncWidget(QWidget):
         s.setValue("micro_all", int(self.check_micro_all.isChecked()))
         if hasattr(self, "check_micro_verses"):
             s.setValue("micro_verses", int(self.check_micro_verses.isChecked()))
+        try:
+            if hasattr(self, "box_adv") and self.box_adv.isCheckable():
+                s.setValue("advanced_beat_settings_enabled", int(self.box_adv.isChecked()))
+        except Exception:
+            pass
         s.setValue("full_length", int(self.check_full_length.isChecked()))
         s.setValue("intro_fade", int(self.check_intro_fade.isChecked()))
         s.setValue("outro_fade", int(self.check_outro_fade.isChecked()))
@@ -11905,6 +14637,54 @@ class AutoMusicSyncWidget(QWidget):
         impact_fire_gold_intensity = 0.0
         impact_fire_multi_intensity = 0.0
 
+        smart_scene_mode = bool(getattr(self, "check_smart_scene_map", None) and self.check_smart_scene_map.isChecked())
+        director_preset = str(self.combo_director_preset.currentText()) if hasattr(self, "combo_director_preset") else "Balanced"
+        scene_cut_style = str(self.combo_scene_cut_style.currentText()) if hasattr(self, "combo_scene_cut_style") else "Auto"
+        smart_duration_guard = bool(getattr(self, "check_smart_scene_duration_guard", None) and self.check_smart_scene_duration_guard.isChecked())
+        try:
+            smart_cut_timing_offset = _normalize_smart_cut_timing_offset(float(self.spin_smart_cut_timing_offset.value())) if hasattr(self, "spin_smart_cut_timing_offset") else 0.0
+        except Exception:
+            smart_cut_timing_offset = 0.0
+        try:
+            smart_min_scene_len = float(self.spin_smart_min_scene_len.value()) if hasattr(self, "spin_smart_min_scene_len") else 1.5
+        except Exception:
+            smart_min_scene_len = 1.5
+        smart_max_scene_mode = str(self.combo_smart_max_scene_mode.currentText()) if hasattr(self, "combo_smart_max_scene_mode") else "Auto (source-aware)"
+        try:
+            smart_max_scene_len = float(self.spin_smart_max_scene_len.value()) if hasattr(self, "spin_smart_max_scene_len") else 5.0
+        except Exception:
+            smart_max_scene_len = 5.0
+        smart_source_durations = _source_durations_from_sources(sources)
+        smart_scene_map: List[MusicScene] = []
+        smart_scene_info: Dict[str, object] = {}
+        if smart_scene_mode:
+            try:
+                self.progress.setFormat("Building smart scene map...")
+            except Exception:
+                pass
+            smart_scene_map = build_smart_scene_map(
+                self._analysis,
+                beats_per_segment=beats_per,
+                director_preset=director_preset,
+                cut_style=scene_cut_style,
+                microclip_mode=micro_mode,
+                duration_guard_enabled=smart_duration_guard,
+                min_scene_len=smart_min_scene_len,
+                max_scene_len=smart_max_scene_len,
+                max_scene_mode=smart_max_scene_mode,
+                source_clip_durations=smart_source_durations,
+                cut_timing_offset=smart_cut_timing_offset,
+            )
+            try:
+                lyric_segments = self._current_lyric_segments_for_render()
+                if lyric_segments:
+                    smart_scene_map = attach_lyrics_to_scenes(smart_scene_map, lyric_segments, getattr(self, "_lyrics_srt_path", ""))
+            except Exception as e:
+                try:
+                    print(f"WARNING: failed to attach SRT lyrics to smart scene map: {e}")
+                except Exception:
+                    pass
+
         segments = build_timeline(
             self._analysis,
             sources,
@@ -11995,7 +14775,42 @@ class AutoMusicSyncWidget(QWidget):
             image_sources=self.image_sources,
             section_overrides=self._section_media,
             image_segment_interval=int(getattr(self, "image_segment_interval", 0) or 0),
+            smart_scene_mode=smart_scene_mode,
+            director_preset=director_preset,
+            scene_cut_style=scene_cut_style,
+            smart_scene_map=smart_scene_map,
+            smart_scene_info=smart_scene_info,
+            smart_scene_duration_guard=smart_duration_guard,
+            smart_min_scene_len=smart_min_scene_len,
+            smart_max_scene_len=smart_max_scene_len,
+            smart_max_scene_mode=smart_max_scene_mode,
+            smart_cut_timing_offset=smart_cut_timing_offset,
         )
+        if smart_scene_mode:
+            try:
+                scene_count = int(smart_scene_info.get("scene_count") or len(smart_scene_map) or len(segments))
+                guard_info = smart_scene_info.get("duration_guard") if isinstance(smart_scene_info, dict) else None
+                guard_suffix = ""
+                if isinstance(guard_info, dict) and bool(guard_info.get("enabled")):
+                    try:
+                        gmax = float(guard_info.get("max_len") or 0.0)
+                        if gmax > 0.0:
+                            guard_suffix = f", guard max {gmax:.1f}s"
+                    except Exception:
+                        guard_suffix = ""
+                offset_suffix = f", cut offset {smart_cut_timing_offset:+.2f}s" if abs(float(smart_cut_timing_offset or 0.0)) >= 0.005 else ""
+                lyrics_suffix = ""
+                try:
+                    if bool(smart_scene_info.get("lyrics_attached")):
+                        lyrics_suffix = ", lyrics attached"
+                except Exception:
+                    lyrics_suffix = ""
+                msg = f"Smart director: {_normalize_director_preset(director_preset)}, {scene_count} scenes{guard_suffix}{offset_suffix}{lyrics_suffix}"
+                self.progress.setFormat(msg)
+                self.label_summary.setText(msg)
+            except Exception:
+                pass
+
         if not segments:
             self._error("Timeline empty", "Failed to build a video timeline.")
             try:
@@ -12057,6 +14872,18 @@ class AutoMusicSyncWidget(QWidget):
                     visual_strategy=visual_strategy,
                     visual_section_overrides=getattr(self, "_visual_section_overrides", None) if visual_strategy == 2 else None,
                     visual_overlay_opacity=float(getattr(self, "visual_overlay_opacity", 0.25)),
+                    smart_scene_mode=smart_scene_mode,
+                    director_preset=director_preset,
+                    scene_cut_style=scene_cut_style,
+                    smart_scene_map=smart_scene_map,
+                    smart_scene_duration_guard=smart_duration_guard,
+                    smart_min_scene_len=smart_min_scene_len,
+                    smart_max_scene_len=smart_max_scene_len,
+                    smart_max_scene_mode=smart_max_scene_mode,
+                    smart_cut_timing_offset=smart_cut_timing_offset,
+                    use_lyrics_srt_timing=self._lyrics_srt_enabled(),
+                    srt_path=str(getattr(self, "_lyrics_srt_path", "") or ""),
+                    lyric_segments=self._current_lyric_segments_for_render(),
                 )
             except Exception as e:
                 try:
@@ -12105,6 +14932,18 @@ class AutoMusicSyncWidget(QWidget):
         visual_strategy: int,
         visual_section_overrides: Optional[Dict[str, Optional[str]]],
         visual_overlay_opacity: float,
+        smart_scene_mode: bool = False,
+        director_preset: str = "Balanced",
+        scene_cut_style: str = "Auto",
+        smart_scene_map: Optional[List[MusicScene]] = None,
+        smart_scene_duration_guard: bool = True,
+        smart_min_scene_len: float = 1.5,
+        smart_max_scene_len: float = 5.0,
+        smart_max_scene_mode: str = "Auto (source-aware)",
+        smart_cut_timing_offset: float = 0.0,
+        use_lyrics_srt_timing: bool = False,
+        srt_path: str = "",
+        lyric_segments: Optional[List[LyricSegment]] = None,
     ) -> None:
         """Serialize the current timeline and enqueue a headless render job in Queue."""
         try:
@@ -12139,6 +14978,18 @@ class AutoMusicSyncWidget(QWidget):
             "visual_strategy": int(visual_strategy),
             "visual_section_overrides": visual_section_overrides,
             "visual_overlay_opacity": float(visual_overlay_opacity),
+            "smart_scene_mode": bool(smart_scene_mode),
+            "director_preset": _normalize_director_preset(director_preset),
+            "scene_cut_style": _normalize_cut_style(scene_cut_style),
+            "smart_scene_map": _scene_map_to_list(smart_scene_map),
+            "smart_scene_duration_guard": bool(smart_scene_duration_guard),
+            "smart_min_scene_len": float(smart_min_scene_len),
+            "smart_max_scene_len": float(smart_max_scene_len),
+            "smart_max_scene_mode": _normalize_smart_scene_max_mode(smart_max_scene_mode),
+            "smart_cut_timing_offset": _normalize_smart_cut_timing_offset(smart_cut_timing_offset),
+            "use_lyrics_srt_timing": bool(use_lyrics_srt_timing),
+            "srt_path": str(srt_path or ""),
+            "lyric_segments": _lyric_segments_to_list(lyric_segments),
             "out_name_override": out_name,
             "strobe_on_time_times": self._get_strobe_times() if (getattr(self, "check_strobe_on_time", None) and self.check_strobe_on_time.isChecked() and not (getattr(self, "check_nofx", None) and self.check_nofx.isChecked())) else None,
             "strobe_flash_strength": float(getattr(self, "slider_impact_flash", None).value() / 100.0) if hasattr(self, "slider_impact_flash") else 0.0,

@@ -2724,6 +2724,16 @@ class Txt2ImgPane(QWidget):
         except Exception:
             pass
         try:
+            if hasattr(self, "lora_combo") and self.lora_combo is not None:
+                self.lora_combo.currentIndexChanged.connect(self._maybe_apply_qwen_small_step_lora_default)
+        except Exception:
+            pass
+        try:
+            if hasattr(self, "lora2_combo") and self.lora2_combo is not None:
+                self.lora2_combo.currentIndexChanged.connect(self._maybe_apply_qwen_small_step_lora_default)
+        except Exception:
+            pass
+        try:
             self._on_engine_changed()
         except Exception:
             pass
@@ -3055,13 +3065,178 @@ class Txt2ImgPane(QWidget):
             pass
 
 
+    def _refresh_lora_combos_for_restore(self):
+        """Rescan the current LoRA root into both dropdowns so saved LoRAs can be restored after restart."""
+        try:
+            from pathlib import Path as _P
+            lr = getattr(self, "_lora_root", None)
+            if not lr:
+                try:
+                    root_dir = _P(__file__).resolve().parents[1]
+                except Exception:
+                    root_dir = _P(".").resolve()
+                lr = str(root_dir / "models" / "loras")
+            base = _P(str(lr))
+            items = []
+            if base.exists():
+                try:
+                    items = sorted([f for f in base.glob("*.safetensors") if f.is_file()])
+                except Exception:
+                    items = []
+            for combo in (getattr(self, "lora_combo", None), getattr(self, "lora2_combo", None)):
+                if combo is None:
+                    continue
+                try:
+                    combo.blockSignals(True)
+                except Exception:
+                    pass
+                try:
+                    combo.clear()
+                    combo.addItem("None", "")
+                    for f in items:
+                        combo.addItem(f.name, str(f.resolve()))
+                finally:
+                    try:
+                        combo.blockSignals(False)
+                    except Exception:
+                        pass
+        except Exception:
+            pass
+
+    def _restore_saved_lora_selection(self, saved: dict | None = None):
+        """Best-effort restore of saved LoRA selections after the dropdowns were refreshed."""
+        try:
+            s = saved if isinstance(saved, dict) else getattr(self, "_t2i_last_loaded", {})
+        except Exception:
+            s = {}
+        try:
+            lp = str((s or {}).get("lora_path") or "").strip()
+            if lp and hasattr(self, "lora_combo") and self.lora_combo is not None:
+                idx = self.lora_combo.findData(lp)
+                if idx < 0:
+                    try:
+                        from pathlib import Path as _P
+                        pp = _P(lp)
+                        if pp.exists():
+                            self.lora_combo.addItem(pp.name, str(pp))
+                            idx = self.lora_combo.findData(str(pp))
+                    except Exception:
+                        idx = -1
+                if idx >= 0:
+                    try:
+                        self.lora_combo.blockSignals(True)
+                    except Exception:
+                        pass
+                    self.lora_combo.setCurrentIndex(idx)
+                    try:
+                        self.lora_combo.blockSignals(False)
+                    except Exception:
+                        pass
+        except Exception:
+            pass
+        try:
+            lp2 = str((s or {}).get("lora2_path") or "").strip()
+            if lp2 and hasattr(self, "lora2_combo") and self.lora2_combo is not None:
+                idx2 = self.lora2_combo.findData(lp2)
+                if idx2 < 0:
+                    try:
+                        from pathlib import Path as _P
+                        pp2 = _P(lp2)
+                        if pp2.exists():
+                            self.lora2_combo.addItem(pp2.name, str(pp2))
+                            idx2 = self.lora2_combo.findData(str(pp2))
+                    except Exception:
+                        idx2 = -1
+                if idx2 >= 0:
+                    try:
+                        self.lora2_combo.blockSignals(True)
+                    except Exception:
+                        pass
+                    self.lora2_combo.setCurrentIndex(idx2)
+                    try:
+                        self.lora2_combo.blockSignals(False)
+                    except Exception:
+                        pass
+        except Exception:
+            pass
+        try:
+            if hasattr(self, "lora_strength") and "lora_scale" in (s or {}):
+                self.lora_strength.setValue(float((s or {}).get("lora_scale", 1.0)))
+        except Exception:
+            pass
+        try:
+            if hasattr(self, "lora2_strength") and "lora2_scale" in (s or {}):
+                self.lora2_strength.setValue(float((s or {}).get("lora2_scale", 1.0)))
+        except Exception:
+            pass
+        try:
+            self._maybe_apply_qwen_small_step_lora_default()
+        except Exception:
+            pass
+
+    def _maybe_apply_qwen_small_step_lora_default(self, *_):
+        """If qwen2512 is active, use 8 steps for the small-step Turbo LoRA, otherwise restore 25."""
+        try:
+            cb = getattr(self, "engine_combo", None)
+            if cb is None:
+                return
+            try:
+                ek = str(cb.currentData() or "").strip().lower()
+            except Exception:
+                ek = ""
+            if not ek:
+                try:
+                    txt = str(cb.currentText() or "").lower()
+                    ek = "qwen2512" if (("qwen" in txt) and (("2512" in txt) or ("2.5" in txt) or ("12b" in txt))) else ""
+                except Exception:
+                    ek = ""
+            if ek != "qwen2512":
+                return
+            lp1 = ""
+            lp2 = ""
+            try:
+                if hasattr(self, "lora_combo") and self.lora_combo is not None:
+                    lp1 = str(self.lora_combo.currentData() or self.lora_combo.currentText() or "")
+            except Exception:
+                lp1 = ""
+            try:
+                if hasattr(self, "lora2_combo") and self.lora2_combo is not None:
+                    lp2 = str(self.lora2_combo.currentData() or self.lora2_combo.currentText() or "")
+            except Exception:
+                lp2 = ""
+            has_small = bool(_is_qwen2512_small_step_lora(lp1) or _is_qwen2512_small_step_lora(lp2))
+            ss = getattr(self, "steps_slider", None)
+            sv = getattr(self, "steps_value", None)
+            if ss is None:
+                return
+            try:
+                ss.blockSignals(True)
+            except Exception:
+                pass
+            try:
+                ss.setRange(1, 200)
+                ss.setValue(8 if has_small else 25)
+            finally:
+                try:
+                    ss.blockSignals(False)
+                except Exception:
+                    pass
+            try:
+                if sv is not None:
+                    sv.setText("8" if has_small else "25")
+            except Exception:
+                pass
+        except Exception:
+            pass
+
+
     def _on_engine_changed(self, *_):
         """
         Toggle banner text and show/hide the SD model/LoRA picker
         based on the selected engine.
 
         Also adjusts Steps / CFG ranges for Z-Image:
-        - Z-Image: steps 1–50 (default 9), CFG 0.0–5.0 (default 0.0)
+        - Z-Image: steps 1–50 (default 8), CFG 0.0–5.0 (default 0.0)
         - Diffusers (SD15/SDXL): steps 10–100 (default 25), CFG 1.0–15.0 (default 5.5)
         """
 
@@ -3361,39 +3536,31 @@ class Txt2ImgPane(QWidget):
             sv = getattr(self, "steps_value", None)
             if ss is not None:
                 if is_zimage:
-                    # Z-Image prefers low steps; set range but do NOT hard-force value
-                    try:
-                        _cur = int(ss.value())
-                    except Exception:
-                        _cur = 9
+                    # Z-Image prefers low steps; whenever the user switches to a Z-Image engine,
+                    # reset the step count back to the recommended default so it does not inherit
+                    # a high step count (for example 25) from another engine.
                     try:
                         ss.blockSignals(True)
                     except Exception:
                         pass
                     ss.setRange(1, 50)
-                    # Only apply the Z-Image "help" default if current value is out of range
                     try:
-                        if _cur < 1 or _cur > 50:
-                            _cur = 9
-                            ss.setValue(_cur)
+                        ss.setValue(8)
+                        _cur = 8
                     except Exception:
-                        try:
-                            ss.setValue(9)
-                            _cur = 9
-                        except Exception:
-                            _cur = 9
+                        _cur = 8
                     try:
                         ss.blockSignals(False)
                     except Exception:
                         pass
                     try:
                         if sv is not None:
-                            sv.setText(str(int(_cur)))
+                            sv.setText("8")
                     except Exception:
                         pass
 
                 elif is_qwen:
-                    # qwen 2.5 12B GGUF: wider range; default 25
+                    # qwen 2.5 12B GGUF: default 25 steps, unless a small-step Turbo LoRA is selected.
                     try:
                         ss.blockSignals(True)
                     except Exception:
@@ -3407,6 +3574,10 @@ class Txt2ImgPane(QWidget):
                     try:
                         if sv is not None:
                             sv.setText("25")
+                    except Exception:
+                        pass
+                    try:
+                        self._maybe_apply_qwen_small_step_lora_default()
                     except Exception:
                         pass
                 else:
@@ -5329,13 +5500,13 @@ def _gen_via_a1111(job: dict, out_dir: Path, base_url: str, progress_cb=None):
 
 def _gen_via_zimage(job: dict, out_dir: Path, progress_cb=None, cancel_event=None):
     """
-    Z-Image Turbo backend that runs in its own virtualenv (.zimage_env) as an
+    Z-Image Turbo backend that runs in its own dedicated environment as an
     external process, so it can have independent deps (torch/diffusers).
 
     It calls helpers/zimage_cli.py using the python.exe from:
-        <root>/.zimage_env/Scripts/python.exe   (Windows)
-        <root>/.zimage_env/scripts/python.exe   (alt)
-        <root>/.zimage_env/bin/python           (Linux/macOS)
+        <root>/environments/.zimage_env/Scripts/python.exe   (Windows)
+        <root>/environments/.zimage_env/scripts/python.exe   (alt)
+        <root>/environments/.zimage_env/bin/python           (Linux/macOS)
 
     The CLI returns a JSON payload with a list of files.
     """
@@ -5358,11 +5529,14 @@ def _gen_via_zimage(job: dict, out_dir: Path, progress_cb=None, cancel_event=Non
     except Exception:
         root_dir = Path(".").resolve()
 
-    # Locate dedicated Z-Image env python
+    # Locate dedicated Z-Image env python.
+    # New portable layout: <root>/environments/.zimage_env
+    zenv_dir = root_dir / "environments" / ".zimage_env"
     candidates = [
-        root_dir / ".zimage_env" / "Scripts" / "python.exe",
-        root_dir / ".zimage_env" / "scripts" / "python.exe",
-        root_dir / ".zimage_env" / "bin" / "python",
+        zenv_dir / "Scripts" / "python.exe",
+        zenv_dir / "scripts" / "python.exe",
+        zenv_dir / "bin" / "python",
+        zenv_dir / "bin" / "python3",
     ]
     pyexe = None
     for c in candidates:
@@ -5374,7 +5548,10 @@ def _gen_via_zimage(job: dict, out_dir: Path, progress_cb=None, cancel_event=Non
             continue
     if pyexe is None:
         try:
-            print("[txt2img] Z-Image: python.exe not found in .zimage_env; tried:", candidates)
+            old_env = root_dir / ".zimage_env"
+            if old_env.exists():
+                print("[txt2img] Z-Image: found old root .zimage_env, but it is no longer used. Re-run presets/extra_env/zimage_install.py to create environments/.zimage_env.")
+            print("[txt2img] Z-Image: python.exe not found in environments/.zimage_env; tried:", candidates)
         except Exception:
             pass
         return None
@@ -5392,7 +5569,7 @@ def _gen_via_zimage(job: dict, out_dir: Path, progress_cb=None, cancel_event=Non
     prompt = str(job.get("prompt") or "")
     neg = str(job.get("negative") or "")
     batch = int(job.get("batch", 1) or 1)
-    steps = int(job.get("steps", 9) or 9)
+    steps = int(job.get("steps", 8) or 8)
     cfg = float(job.get("cfg_scale", 0.0) or 0.0)
     width = int(job.get("width", 1024) or 1024)
     height = int(job.get("height", 1024) or 1024)
@@ -5949,8 +6126,30 @@ def _gen_via_qwen2512(job: dict, out_dir: Path, progress_cb=None, cancel_event: 
     return {"files": files, "backend": "qwen2512", "model": f"qwen 2.5 12B GGUF — {_P(str(diffusion)).name}"}
 
 
+def _is_qwen2512_small_step_lora(path_or_name: str) -> bool:
+    """Best-effort match for Qwen 2512 small-step Turbo LoRAs without relying on one exact filename.
+
+    Matches names such as:
+      - Wuli-Qwen-Image-2512-Turbo-LoRA-4steps-V2.0-bf16.safetensors
+      - Wuli-Qwen-Image-2512-Turbo-LoRA-4steps-V3.0-bf16.safetensors
+    and should continue to match future versions with similar naming.
+    """
+    try:
+        raw = str(path_or_name or "")
+        if not raw:
+            return False
+        low = raw.replace('\\', '/').lower()
+        base = Path(raw).name.lower()
+        has_qwen = ('qwen' in low) and ('2512' in low)
+        has_turbo = 'turbo' in low
+        has_lora = 'lora' in low
+        has_4steps = bool(re.search(r'(^|[^0-9])4[\s_\-]*steps?([^0-9]|$)', base)) or ('4steps' in low) or ('4-step' in low) or ('4_step' in low)
+        return bool(has_qwen and has_turbo and has_lora and has_4steps)
+    except Exception:
+        return False
+
 def _find_latest_qwen2512_turbo_lora(root_dir: Path) -> str:
-    """Auto-pick newest Wuli Qwen Image 2512 Turbo LoRA by highest Vx.y(.z) in name, scanning models/loras recursively."""
+    """Auto-pick newest Qwen 2512 small-step Turbo LoRA by highest Vx.y(.z) in name, scanning models/loras recursively."""
     try:
         base = (Path(root_dir) / "models" / "loras").resolve()
     except Exception:
@@ -5964,7 +6163,7 @@ def _find_latest_qwen2512_turbo_lora(root_dir: Path) -> str:
                 if not p.is_file():
                     continue
                 name = p.name.lower()
-                if "wuli-qwen-image-2512-turbo-lora" in name:
+                if _is_qwen2512_small_step_lora(name):
                     pats.append(p)
             except Exception:
                 continue
@@ -6002,29 +6201,35 @@ def generate_one_from_job(job: dict, out_dir: str | Path, progress_cb=None, canc
 
     ek = str(job.get("engine") or "").strip().lower() or "qwen2512"
 
-    # Auto Turbo LoRA for Qwen 2512 if not explicitly provided
+    # Auto small-step Turbo LoRA handling for Qwen 2512
     if ek == "qwen2512":
         try:
             lp = str(job.get("lora_path") or "").strip()
+            auto_picked = False
             if not lp:
                 tl = _find_latest_qwen2512_turbo_lora(root_dir)
                 if tl:
                     job["lora_path"] = tl
-                    # Turbo defaults: 4-8 steps; pick 5 for testing unless user already set <= 8
-                    try:
-                        st = int(job.get("steps", 40))
-                        if st > 8:
-                            job["steps"] = 5
-                    except Exception:
-                        job["steps"] = 5
-                    # Lower CFG a bit for turbo if too high
-                    try:
-                        cfg = float(job.get("cfg_scale", 2.5))
-                        if cfg > 4.0:
-                            job["cfg_scale"] = 3.0
-                    except Exception:
-                        pass
-                    job["turbo_lora_used"] = True
+                    lp = tl
+                    auto_picked = True
+            if _is_qwen2512_small_step_lora(lp):
+                # Small-step Turbo LoRA: prefer 8 steps unless the user already chose 8 or less.
+                try:
+                    st = int(job.get("steps", 40))
+                    if st > 8:
+                        job["steps"] = 8
+                except Exception:
+                    job["steps"] = 8
+                # Lower CFG a bit for turbo if too high
+                try:
+                    cfg = float(job.get("cfg_scale", 2.5))
+                    if cfg > 4.0:
+                        job["cfg_scale"] = 3.0
+                except Exception:
+                    pass
+                job["turbo_lora_used"] = True
+                if auto_picked:
+                    job["turbo_lora_auto_picked"] = True
         except Exception:
             pass
 
@@ -6390,7 +6595,16 @@ try:
         except Exception:
             pass
         try:
-            return _orig_load(self)
+            _ret = _orig_load(self)
+            try:
+                from PySide6.QtCore import QTimer as _QTimer
+                _QTimer.singleShot(0, lambda: (
+                    self._refresh_lora_combos_for_restore() if hasattr(self, "_refresh_lora_combos_for_restore") else None,
+                    self._restore_saved_lora_selection(getattr(self, "_t2i_last_loaded", {})) if hasattr(self, "_restore_saved_lora_selection") else None
+                ))
+            except Exception:
+                pass
+            return _ret
         finally:
             try:
                 self._t2i_loading = False

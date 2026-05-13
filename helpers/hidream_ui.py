@@ -54,6 +54,7 @@ MODEL_DEFAULTS = {
     "base": {
         "label": "Base / Full BF16",
         "folder": "HiDream-O1-Image-BF16",
+        "variant": "full",
         "steps": 50,
         "guidance_scale": 5.0,
         "shift": 3.0,
@@ -61,9 +62,21 @@ MODEL_DEFAULTS = {
         "timesteps": "none",
         "note": "Base/full model. CFG works. Preferred default: Euler/Flash, 50 steps.",
     },
+    "base_fp8": {
+        "label": "Base / Full FP8",
+        "folder": "HiDream-O1-Image-FP8",
+        "variant": "full",
+        "steps": 50,
+        "guidance_scale": 5.0,
+        "shift": 3.0,
+        "scheduler": "flash",
+        "timesteps": "none",
+        "note": "Base/full FP8 model. Same behavior as Base BF16 with lower VRAM use.",
+    },
     "dev": {
         "label": "Dev BF16",
         "folder": "HiDream-O1-Image-Dev-BF16",
+        "variant": "dev",
         "steps": 28,
         "guidance_scale": 0.0,
         "shift": 1.0,
@@ -71,19 +84,51 @@ MODEL_DEFAULTS = {
         "timesteps": "dev",
         "note": "Dev model. CFG/negative prompts are effectively disabled; use 28-step Dev timesteps.",
     },
+    "dev_fp8": {
+        "label": "Dev FP8",
+        "folder": "HiDream-O1-Image-Dev-FP8",
+        "variant": "dev",
+        "steps": 28,
+        "guidance_scale": 0.0,
+        "shift": 1.0,
+        "scheduler": "flash",
+        "timesteps": "dev",
+        "note": "Dev FP8 model. Lowest VRAM option; CFG/negative prompts are effectively disabled.",
+    },
 }
 
 RESOLUTION_PRESETS = [
-    ("Landscape — 1280×720", 1280, 720),
-    ("Landscape — 1536×864", 1536, 864),
-    ("Landscape — 1920×1080", 1920, 1080),
-    ("Portrait — 720×1280", 720, 1280),
-    ("Portrait — 864×1536", 864, 1536),
-    ("Portrait — 1080×1920", 1080, 1920),
+    ("Landscape 4:3 — 640×480", 640, 480),
+    ("Landscape 4:3 — 1024×768", 1024, 768),
+    ("Landscape wide — 832×480", 832, 480),
+    ("Landscape 16:9-ish — 1024×576", 1024, 576),
+    ("Landscape 16:9-ish — 1280×704", 1280, 704),
+    ("Landscape 16:9-ish — 1600×896", 1600, 896),
+    ("Landscape 16:9-ish — 1920×1088", 1920, 1088),
+    ("Landscape 16:9 — 2560×1440", 2560, 1440),
+    ("Portrait 3:4 — 480×640", 480, 640),
+    ("Portrait 3:4 — 768×1024", 768, 1024),
+    ("Portrait tall — 480×832", 480, 832),
+    ("Portrait 9:16-ish — 576×1024", 576, 1024),
+    ("Portrait 9:16-ish — 704×1280", 704, 1280),
+    ("Portrait 9:16-ish — 896×1600", 896, 1600),
+    ("Portrait 9:16-ish — 1088×1920", 1088, 1920),
+    ("Portrait 9:16 — 1440×2560", 1440, 2560),
+    ("Square — 512×512", 512, 512),
+    ("Square — 768×768", 768, 768),
     ("Square — 1024×1024", 1024, 1024),
     ("Square — 1536×1536", 1536, 1536),
     ("Square — 2048×2048", 2048, 2048),
 ]
+
+LEGACY_RESOLUTION_PRESET_MAP = {
+    (1280, 720): (1280, 704),
+    (1600, 900): (1600, 896),
+    (1920, 1080): (1920, 1088),
+    (720, 1280): (704, 1280),
+    (900, 1600): (896, 1600),
+    (1080, 1920): (1088, 1920),
+}
 
 MULTI_REFERENCE_ROLES = [
     "Main subject",
@@ -148,6 +193,7 @@ def discover_paths() -> dict[str, Path | None]:
 PATHS = discover_paths()
 ENV_PY = PATHS["env_python"]
 RUNNER = PATHS["runner"]
+CLI_PATH = Path(__file__).resolve().with_name("hidream_cli.py")
 HIDREAM_ROOT = PATHS["hidream_root"]
 DEFAULT_OUTPUT = PATHS["output_dir"] or (Path(__file__).resolve().parents[1] / "models" / "hidream_bf16" / "results")
 DEFAULT_OFFLOAD_FOLDER = Path(__file__).resolve().parents[1] / "temp" / "hidream_offload"
@@ -544,7 +590,7 @@ class HiDreamUI(QMainWindow):
         height_spin = QSpinBox()
         height_spin.setRange(256, 4096)
         height_spin.setSingleStep(64)
-        height_spin.setValue(720)
+        height_spin.setValue(704)
 
         size_row = QHBoxLayout()
         size_row.addWidget(width_spin)
@@ -688,7 +734,7 @@ class HiDreamUI(QMainWindow):
 
         self.negative_prompt_label = QLabel("Negative prompt")
         self.negative_prompt_edit = QTextEdit()
-        self.negative_prompt_edit.setPlaceholderText("Optional negatives for Base model only. Hidden for Dev.")
+        self.negative_prompt_edit.setPlaceholderText("Optional negatives for Full models only. Hidden for Dev variants.")
         self.negative_prompt_edit.setMaximumHeight(78)
         self.negative_prompt_edit.setMinimumHeight(56)
         layout.addWidget(self.negative_prompt_label)
@@ -721,7 +767,7 @@ class HiDreamUI(QMainWindow):
 
         self.edit_negative_prompt_label = QLabel("Negative prompt")
         self.edit_negative_prompt_edit = QTextEdit()
-        self.edit_negative_prompt_edit.setPlaceholderText("Optional negatives for Base model only. Hidden for Dev.")
+        self.edit_negative_prompt_edit.setPlaceholderText("Optional negatives for Full models only. Hidden for Dev variants.")
         self.edit_negative_prompt_edit.setMaximumHeight(78)
         self.edit_negative_prompt_edit.setMinimumHeight(56)
         layout.addWidget(self.edit_negative_prompt_label)
@@ -791,7 +837,7 @@ class HiDreamUI(QMainWindow):
 
         self.multi_negative_prompt_label = QLabel("Negative prompt")
         self.multi_negative_prompt_edit = QTextEdit()
-        self.multi_negative_prompt_edit.setPlaceholderText("Optional negatives for Base model only. Hidden for Dev.")
+        self.multi_negative_prompt_edit.setPlaceholderText("Optional negatives for Full models only. Hidden for Dev variants.")
         self.multi_negative_prompt_edit.setMaximumHeight(78)
         self.multi_negative_prompt_edit.setMinimumHeight(56)
         layout.addWidget(self.multi_negative_prompt_label)
@@ -1202,6 +1248,19 @@ class HiDreamUI(QMainWindow):
     def current_model_key(self) -> str:
         return self.model_combo.currentData() or "base"
 
+    def model_variant(self, key: str | None = None) -> str:
+        key = key or self.current_model_key()
+        info = MODEL_DEFAULTS.get(key, {})
+        if isinstance(info, dict):
+            return str(info.get("variant", "full"))
+        return "full"
+
+    def is_full_variant(self, key: str | None = None) -> bool:
+        return self.model_variant(key) == "full"
+
+    def is_dev_variant(self, key: str | None = None) -> bool:
+        return self.model_variant(key) == "dev"
+
     def model_dir(self, key: str | None = None) -> Path | None:
         key = key or self.current_model_key()
         if not HIDREAM_ROOT:
@@ -1221,9 +1280,9 @@ class HiDreamUI(QMainWindow):
     def default_generation_settings_for_model(self, key: str) -> dict:
         info = MODEL_DEFAULTS[key]
         return {
-            "resolution_preset": "1280x720",
+            "resolution_preset": "1280x704",
             "width": 1280,
-            "height": 720,
+            "height": 704,
             "steps": info["steps"],
             "guidance_scale": info["guidance_scale"],
             "shift": info["shift"],
@@ -1252,7 +1311,7 @@ class HiDreamUI(QMainWindow):
     def apply_model_switch_defaults_to_settings(self, key: str, settings: dict | None = None) -> dict:
         merged = dict(settings or self.default_generation_settings_for_model(key))
         merged.update(self.model_switch_default_values_for_model(key))
-        if key == "dev":
+        if self.is_dev_variant(key):
             merged["guidance_scale"] = 0.0
         return merged
 
@@ -1287,7 +1346,7 @@ class HiDreamUI(QMainWindow):
             "width": width,
             "height": height,
             "steps": widgets["steps_spin"].value(),
-            "guidance_scale": 0.0 if self.current_model_key() == "dev" else widgets["cfg_spin"].value(),
+            "guidance_scale": 0.0 if self.is_dev_variant() else widgets["cfg_spin"].value(),
             "shift": widgets["shift_spin"].value(),
             "seed": widgets["seed_spin"].value(),
             "scheduler_name": widgets["scheduler_combo"].currentData(),
@@ -1324,16 +1383,19 @@ class HiDreamUI(QMainWindow):
     def apply_generation_settings_to_widgets(self, ui_key: str, settings: dict) -> None:
         widgets = self._gen_widget_sets[ui_key]
         width = int(settings.get("width", 1280))
-        height = int(settings.get("height", 720))
+        height = int(settings.get("height", 704))
         preset = settings.get("resolution_preset") or self.match_resolution_preset(width, height)
+        if (width, height) in LEGACY_RESOLUTION_PRESET_MAP and str(preset) in {"custom", f"{width}x{height}"}:
+            width, height = LEGACY_RESOLUTION_PRESET_MAP[(width, height)]
+            preset = self.match_resolution_preset(width, height)
         self._syncing_generation_controls = True
         try:
             widgets["width_spin"].setValue(width)
             widgets["height_spin"].setValue(height)
             widgets["steps_spin"].setValue(int(settings.get("steps", MODEL_DEFAULTS[self.current_model_key()]["steps"])))
-            cfg_value = 0.0 if self.current_model_key() == "dev" else float(settings.get("guidance_scale", MODEL_DEFAULTS[self.current_model_key()]["guidance_scale"]))
+            cfg_value = 0.0 if self.is_dev_variant() else float(settings.get("guidance_scale", MODEL_DEFAULTS[self.current_model_key()]["guidance_scale"]))
             widgets["cfg_spin"].setValue(cfg_value)
-            widgets["cfg_spin"].setEnabled(self.current_model_key() != "dev")
+            widgets["cfg_spin"].setEnabled(self.is_full_variant())
             widgets["shift_spin"].setValue(float(settings.get("shift", MODEL_DEFAULTS[self.current_model_key()]["shift"])))
             widgets["seed_spin"].setValue(int(settings.get("seed", -1)))
             self.set_combo_by_data(widgets["scheduler_combo"], settings.get("scheduler_name", MODEL_DEFAULTS[self.current_model_key()]["scheduler"]))
@@ -1390,7 +1452,7 @@ class HiDreamUI(QMainWindow):
         if self._syncing_generation_controls:
             return
         settings = self.generation_settings_from_widgets(source)
-        if self.current_model_key() == "dev":
+        if self.is_dev_variant():
             settings["guidance_scale"] = 0.0
         self._syncing_generation_controls = True
         try:
@@ -1410,21 +1472,21 @@ class HiDreamUI(QMainWindow):
 
     def refresh_model_specific_ui(self, key: str | None = None) -> None:
         key = key or self.current_model_key()
-        is_base = key == "base"
+        is_full = self.is_full_variant(key)
         if hasattr(self, "negative_prompt_label"):
-            self.negative_prompt_label.setVisible(is_base)
-            self.negative_prompt_edit.setVisible(is_base)
+            self.negative_prompt_label.setVisible(is_full)
+            self.negative_prompt_edit.setVisible(is_full)
         if hasattr(self, "edit_negative_prompt_label"):
-            self.edit_negative_prompt_label.setVisible(is_base)
-            self.edit_negative_prompt_edit.setVisible(is_base)
+            self.edit_negative_prompt_label.setVisible(is_full)
+            self.edit_negative_prompt_edit.setVisible(is_full)
         if hasattr(self, "multi_negative_prompt_label"):
-            self.multi_negative_prompt_label.setVisible(is_base)
-            self.multi_negative_prompt_edit.setVisible(is_base)
+            self.multi_negative_prompt_label.setVisible(is_full)
+            self.multi_negative_prompt_edit.setVisible(is_full)
         for widgets in self._gen_widget_sets.values():
             cfg_spin = widgets.get("cfg_spin")
             if cfg_spin is not None:
-                cfg_spin.setEnabled(is_base)
-                if key == "dev":
+                cfg_spin.setEnabled(is_full)
+                if self.is_dev_variant(key):
                     cfg_spin.setValue(0.0)
 
     def on_model_changed(self) -> None:
@@ -1556,8 +1618,8 @@ class HiDreamUI(QMainWindow):
             "multi_negative_prompt": self.multi_negative_prompt_edit.toPlainText() if hasattr(self, "multi_negative_prompt_edit") else self.negative_prompt_edit.toPlainText(),
             "model_settings": self._model_settings_cache,
             "width": current_settings.get("width", 1280),
-            "height": current_settings.get("height", 720),
-            "resolution_preset": current_settings.get("resolution_preset", "1280x720"),
+            "height": current_settings.get("height", 704),
+            "resolution_preset": current_settings.get("resolution_preset", "1280x704"),
             "steps": current_settings.get("steps", MODEL_DEFAULTS[self.current_model_key()]["steps"]),
             "guidance_scale": current_settings.get("guidance_scale", MODEL_DEFAULTS[self.current_model_key()]["guidance_scale"]),
             "shift": current_settings.get("shift", MODEL_DEFAULTS[self.current_model_key()]["shift"]),
@@ -1760,7 +1822,7 @@ class HiDreamUI(QMainWindow):
             settings.update(self.generation_settings_from_widgets(ui_key))
             self._model_settings_cache[self.current_model_key()] = dict(settings)
         settings.update(self.current_advanced_settings())
-        if self.current_model_key() == "dev":
+        if self.is_dev_variant():
             settings["guidance_scale"] = 0.0
             settings["negative_prompt"] = ""
         else:
@@ -1774,22 +1836,22 @@ class HiDreamUI(QMainWindow):
         info = MODEL_DEFAULTS.get(key)
         return str(info.get("label", key)) if isinstance(info, dict) else key
 
-    def runner_supports_option(self, option: str) -> bool:
+    def cli_supports_option(self, option: str) -> bool:
         try:
-            return bool(RUNNER and RUNNER.exists() and option in RUNNER.read_text(encoding="utf-8", errors="ignore"))
+            return bool(CLI_PATH and CLI_PATH.exists() and option in CLI_PATH.read_text(encoding="utf-8", errors="ignore"))
         except Exception:
             return False
 
     def build_args_for_job(self, job: dict) -> list[str]:
-        if not ENV_PY or not RUNNER:
-            raise RuntimeError("Environment or runner path is missing.")
+        if not ENV_PY or not CLI_PATH.exists():
+            raise RuntimeError("Environment or HiDream CLI path is missing.")
         settings = job.get("settings") or {}
         out = Path(str(job.get("output_path", ""))).expanduser()
         args = [
-            str(ENV_PY), str(RUNNER),
+            str(ENV_PY), str(CLI_PATH),
             "--model_key", str(job.get("model_key") or "base"),
             "--width", str(int(settings.get("width", 1280))),
-            "--height", str(int(settings.get("height", 720))),
+            "--height", str(int(settings.get("height", 704))),
             "--steps", str(int(settings.get("steps", 28))),
             "--guidance_scale", str(float(settings.get("guidance_scale", 0.0))),
             "--shift", str(float(settings.get("shift", 1.0))),
@@ -1801,10 +1863,11 @@ class HiDreamUI(QMainWindow):
             "--noise_clip_std", str(float(settings.get("noise_clip_std", 2.5))),
             "--output_image", str(out),
             "--prompt", str(job.get("prompt", "")),
+            "--resolution_mode", "framevision",
         ]
         offload = settings.get("offload_settings", {}) if isinstance(settings.get("offload_settings"), dict) else {}
         try_auto_offload = bool(offload.get("try_auto_cpu_offload", False))
-        if self.runner_supports_option("--device_map"):
+        if self.cli_supports_option("--device_map"):
             if try_auto_offload:
                 offload_folder = Path(str(offload.get("offload_folder") or DEFAULT_OFFLOAD_FOLDER)).expanduser()
                 offload_folder.mkdir(parents=True, exist_ok=True)
@@ -1815,7 +1878,7 @@ class HiDreamUI(QMainWindow):
             self.log("Auto offload selected, but this runner does not support --device_map yet; running CUDA-only.")
 
         negative_prompt = str(settings.get("negative_prompt", "")).strip()
-        if str(job.get("model_key") or "base") == "base" and negative_prompt:
+        if self.is_full_variant(str(job.get("model_key") or "base")) and negative_prompt:
             args.extend(["--negative_prompt", negative_prompt])
         refs = [str(x) for x in (job.get("refs") or []) if str(x).strip()]
         if refs:

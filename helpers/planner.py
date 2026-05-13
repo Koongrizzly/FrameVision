@@ -706,6 +706,222 @@ def _pick_flux_klein_models_highest(force_klein_b: int = 0) -> Dict[str, str]:
     }
 
 
+
+# HiDream (text-to-image) helpers for Planner
+# Priority: FP8 Dev -> BF16 Dev -> FP8 Base -> BF16 Base.
+_HIDREAM_MODEL_INFO = {
+    "dev_fp8": {
+        "label": "Dev FP8",
+        "folder": "HiDream-O1-Image-Dev-FP8",
+        "variant": "dev",
+        "steps": 28,
+        "guidance_scale": 0.0,
+        "shift": 1.0,
+        "scheduler_name": "flash",
+        "timesteps": "dev",
+    },
+    "dev": {
+        "label": "Dev BF16",
+        "folder": "HiDream-O1-Image-Dev-BF16",
+        "variant": "dev",
+        "steps": 28,
+        "guidance_scale": 0.0,
+        "shift": 1.0,
+        "scheduler_name": "flash",
+        "timesteps": "dev",
+    },
+    "base_fp8": {
+        "label": "Base FP8",
+        "folder": "HiDream-O1-Image-FP8",
+        "variant": "full",
+        "steps": 50,
+        "guidance_scale": 5.0,
+        "shift": 3.0,
+        "scheduler_name": "flash",
+        "timesteps": "none",
+    },
+    "base": {
+        "label": "Base BF16",
+        "folder": "HiDream-O1-Image-BF16",
+        "variant": "full",
+        "steps": 50,
+        "guidance_scale": 5.0,
+        "shift": 3.0,
+        "scheduler_name": "flash",
+        "timesteps": "none",
+    },
+}
+
+
+def _hidream_root() -> Path:
+    return (_root() / "models" / "hidream_bf16").resolve()
+
+
+def _hidream_model_dir(model_key: str) -> Path:
+    info = _HIDREAM_MODEL_INFO.get(str(model_key or '').strip(), _HIDREAM_MODEL_INFO["base"])
+    return (_hidream_root() / str(info.get("folder") or '')).resolve()
+
+
+def _hidream_model_installed(model_key: str) -> bool:
+    try:
+        d = _hidream_model_dir(model_key)
+        return bool(d.exists() and (d / "config.json").exists())
+    except Exception:
+        return False
+
+
+def _pick_hidream_model_key() -> str:
+    for key in ("dev_fp8", "dev", "base_fp8", "base"):
+        if _hidream_model_installed(key):
+            return key
+    return ""
+
+
+def _hidream_cli_path() -> str:
+    candidates = [
+        (_THIS_FILE.parent / "hidream_cli.py").resolve(),
+        (_root() / "helpers" / "hidream_cli.py").resolve(),
+        (_root() / "hidream_cli.py").resolve(),
+        (_root() / "models" / "hidream_bf16" / "run_hidream.py").resolve(),
+        (_root() / "models" / "hidream_bf16" / "run_hidream_bf16.py").resolve(),
+    ]
+    for c in candidates:
+        try:
+            if c.exists() and c.is_file():
+                return str(c)
+        except Exception:
+            continue
+    return ""
+
+
+def _hidream_python_path() -> str:
+    candidates = [
+        (_root() / "environments" / ".hidream_dev" / "python.exe").resolve(),
+        (_root() / "environments" / ".hidream_bf16" / "python.exe").resolve(),
+        (_root() / ".hidream_dev" / "python.exe").resolve(),
+        (_root() / ".hidream_bf16" / "python.exe").resolve(),
+    ]
+    for c in candidates:
+        try:
+            if c.exists() and c.is_file():
+                return str(c)
+        except Exception:
+            continue
+    return sys.executable or "python"
+
+
+def _hidream_defaults_for_key(model_key: str) -> Dict[str, Any]:
+    info = dict(_HIDREAM_MODEL_INFO.get(str(model_key or '').strip(), _HIDREAM_MODEL_INFO["base"]))
+    return {
+        "steps": int(info.get("steps") or 50),
+        "guidance_scale": float(info.get("guidance_scale") or 0.0),
+        "shift": float(info.get("shift") or 1.0),
+        "scheduler_name": str(info.get("scheduler_name") or "flash"),
+        "timesteps": str(info.get("timesteps") or "none"),
+        "variant": str(info.get("variant") or "full"),
+        "label": str(info.get("label") or model_key),
+    }
+
+
+def _hidream_missing_message() -> str:
+    searched = [str(_hidream_model_dir(k)) for k in ("dev_fp8", "dev", "base_fp8", "base")]
+    return "HiDream selected but no installed model was found. Expected one of:\n" + "\n".join(searched)
+
+
+def _run_hidream_planner_image(*, t2i_job: Dict[str, Any], images_dir: str, sid: str, log_func: Optional[Callable[[str], None]] = None, stop_check: Optional[Callable[[], bool]] = None) -> Dict[str, Any]:
+    model_key = str(t2i_job.get("hidream_model_key") or '').strip() or _pick_hidream_model_key()
+    if not model_key:
+        raise RuntimeError(_hidream_missing_message())
+    if not _hidream_model_installed(model_key):
+        raise RuntimeError(f"HiDream model '{model_key}' is not installed at: {_hidream_model_dir(model_key)}")
+
+    cli = _hidream_cli_path()
+    if not cli or not os.path.exists(cli):
+        raise RuntimeError("HiDream selected but helpers/hidream_cli.py was not found.")
+
+    py = _hidream_python_path()
+    defaults = _hidream_defaults_for_key(model_key)
+
+    out_path = str(t2i_job.get("out_file") or t2i_job.get("target") or '').strip()
+    if (not out_path) or ("{" in out_path) or ("}" in out_path):
+        out_path = os.path.join(images_dir, f"{sid}.png")
+    if not os.path.splitext(out_path)[1]:
+        out_path += ".png"
+    os.makedirs(os.path.dirname(out_path), exist_ok=True)
+    try:
+        if os.path.exists(out_path):
+            os.remove(out_path)
+    except Exception:
+        pass
+
+    width = int(t2i_job.get("width") or 1280)
+    height = int(t2i_job.get("height") or 704)
+    seed = int(t2i_job.get("seed") or 0)
+    steps = int(t2i_job.get("steps") or defaults["steps"])
+    guidance = float(t2i_job.get("guidance_scale", t2i_job.get("cfg", t2i_job.get("cfg_scale", defaults["guidance_scale"]))) or 0.0)
+    shift = float(t2i_job.get("shift", defaults["shift"]) or defaults["shift"])
+    scheduler_name = str(t2i_job.get("scheduler_name") or defaults["scheduler_name"] or "flash")
+    timesteps = str(t2i_job.get("timesteps") or defaults["timesteps"] or "none")
+
+    cmd = [
+        py,
+        cli,
+        "--model_key", model_key,
+        "--prompt", str(t2i_job.get("prompt") or '').strip(),
+        "--output_image", out_path,
+        "--width", str(width),
+        "--height", str(height),
+        "--seed", str(seed),
+        "--steps", str(steps),
+        "--guidance_scale", str(guidance),
+        "--shift", str(shift),
+        "--scheduler_name", scheduler_name,
+        "--timesteps", timesteps,
+        "--noise_scale_start", str(float(t2i_job.get("noise_scale_start", 7.5) or 7.5)),
+        "--noise_scale_end", str(float(t2i_job.get("noise_scale_end", 7.5) or 7.5)),
+        "--noise_clip_std", str(float(t2i_job.get("noise_clip_std", 2.5) or 2.5)),
+        "--device_map", str(t2i_job.get("device_map") or "cuda"),
+        "--resolution_mode", "framevision",
+    ]
+    neg = str(t2i_job.get("negative_prompt") or t2i_job.get("negative") or '').strip()
+    if neg:
+        cmd += ["--negative_prompt", neg]
+
+    if log_func:
+        log_func(f"[IMG] {sid} [HiDream {defaults['label']}] {width}x{height}, steps={steps}, cfg={guidance}")
+
+    rc = 1
+    try:
+        p = subprocess.Popen(
+            cmd,
+            cwd=str(_root()),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            bufsize=1,
+        )
+        if p.stdout:
+            for raw in p.stdout:
+                if stop_check and stop_check():
+                    try:
+                        p.kill()
+                    except Exception:
+                        pass
+                    raise RuntimeError("Cancelled by user.")
+                try:
+                    line = raw.decode("utf-8", errors="replace").rstrip() if isinstance(raw, bytes) else str(raw).rstrip()
+                except Exception:
+                    line = str(raw).rstrip()
+                if line and log_func:
+                    log_func(line)
+        rc = int(p.wait() or 0)
+    except Exception as e:
+        raise RuntimeError(f"HiDream CLI run failed: {e}")
+
+    ok = bool(rc == 0 and os.path.exists(out_path) and os.path.getsize(out_path) >= 1024)
+    if not ok:
+        raise RuntimeError(f"HiDream failed or returned no output image (exit code {rc}).")
+    return {"ok": True, "files": [out_path], "out_file": out_path, "rc": rc, "backend": "hidream", "model": f"HiDream {defaults['label']}", "hidream_model_key": model_key}
+
 def _firered_settings_paths() -> List[str]:
     base = _root() / "presets" / "setsave"
     return [
@@ -8198,6 +8414,8 @@ class PipelineWorker(QThread):
             _eng = "qwen2512"
         elif "sdxl" in _sel:
             _eng = "diffusers"
+        elif "hidream" in _sel:
+            _eng = "hidream"
         elif ("flux klein" in _sel and "9b" in _sel) or ("flux" in _sel and "klein" in _sel and "9b" in _sel):
             _eng = "flux_klein_9b"
         elif "flux klein" in _sel or ("flux" in _sel and "klein" in _sel):
@@ -8229,6 +8447,28 @@ class PipelineWorker(QThread):
                     t2i_job["lora_path"] = gguf_path
                 else:
                     raise RuntimeError("Z-image Low VRAM selected but no diffusion .gguf was found in models/Z-Image-Turbo GGUF")
+
+        elif str(_eng).lower().strip() == "hidream":
+            # HiDream text-to-image: auto-select installed model, then apply its UI defaults.
+            _hk = _pick_hidream_model_key()
+            if not _hk:
+                raise RuntimeError(_hidream_missing_message())
+            _hd = _hidream_defaults_for_key(_hk)
+            bw, bh = 1280, 704
+            ww, hh = _apply_aspect_to_size(bw, bh, aspect_mode)
+            t2i_job["hidream_model_key"] = _hk
+            t2i_job["width"] = int(ww)
+            t2i_job["height"] = int(hh)
+            t2i_job["steps"] = int(_hd["steps"])
+            t2i_job["guidance_scale"] = float(_hd["guidance_scale"])
+            t2i_job["cfg_scale"] = float(_hd["guidance_scale"])
+            t2i_job["cfg"] = float(_hd["guidance_scale"])
+            t2i_job["shift"] = float(_hd["shift"])
+            t2i_job["scheduler_name"] = str(_hd["scheduler_name"])
+            t2i_job["timesteps"] = str(_hd["timesteps"])
+            t2i_job.setdefault("noise_scale_start", 7.5)
+            t2i_job.setdefault("noise_scale_end", 7.5)
+            t2i_job.setdefault("noise_clip_std", 2.5)
 
         elif str(_eng).lower().strip() in ("flux_klein", "flux_klein_9b"):
             # Locked-in for Flux Klein: 4 steps, CFG 1, Euler, 1344x768, diffusion-fa ON
@@ -8571,6 +8811,28 @@ class PipelineWorker(QThread):
                         rec2 = {}
                     rec2["ref_strategy"] = "fireedit"
                     rec2["refs_used"] = list(fireedit_refs)
+                    shots_map[sid] = rec2
+                    manifest["shots"] = shots_map
+                except Exception:
+                    pass
+
+            # HiDream regen path (own CLI). Must NOT fall through to txt2img backend.
+            elif str(t2i_job.get("engine") or '').lower().strip() == "hidream":
+                res = _run_hidream_planner_image(
+                    t2i_job=t2i_job,
+                    images_dir=images_dir,
+                    sid=sid,
+                    log_func=lambda m: self.signals.log.emit(str(m)),
+                    stop_check=lambda: bool(getattr(self, "_stop_requested", False)),
+                )
+                out_file = str(res.get("out_file") or (res.get("files") or [""])[0])
+                try:
+                    shots_map = manifest.get("shots") if isinstance(manifest.get("shots"), dict) else {}
+                    rec2 = shots_map.get(sid) if isinstance(shots_map, dict) else None
+                    if not isinstance(rec2, dict):
+                        rec2 = {}
+                    rec2["image_engine"] = "hidream"
+                    rec2["hidream_model_key"] = str(res.get("hidream_model_key") or t2i_job.get("hidream_model_key") or '')
                     shots_map[sid] = rec2
                     manifest["shots"] = shots_map
                 except Exception:
@@ -13411,6 +13673,8 @@ class PipelineWorker(QThread):
                     # SDXL via Diffusers
                     elif "sdxl" in _sel:
                         _eng = "diffusers"
+                    elif "hidream" in _sel:
+                        _eng = "hidream"
                     # Flux Klein (sd-cli, GGUF)
                     elif ("flux" in _sel) and ("klein" in _sel):
                         _eng = "flux_klein"
@@ -13483,6 +13747,28 @@ class PipelineWorker(QThread):
                         t2i_job["cfg_scale"] = 4.0
                         t2i_job["cfg"] = 4.0
                         t2i_job["strength"] = 0.75
+                    elif str(_eng).lower().strip() == "hidream":
+                        # HiDream text-to-image: auto-select installed model, then apply its UI defaults.
+                        _hk = _pick_hidream_model_key()
+                        if not _hk:
+                            raise RuntimeError(_hidream_missing_message())
+                        _hd = _hidream_defaults_for_key(_hk)
+                        bw, bh = 1280, 704
+                        ww, hh = _apply_aspect_to_size(bw, bh, aspect_mode)
+                        t2i_job["hidream_model_key"] = _hk
+                        t2i_job["width"] = int(ww)
+                        t2i_job["height"] = int(hh)
+                        t2i_job["steps"] = int(_hd["steps"])
+                        t2i_job["guidance_scale"] = float(_hd["guidance_scale"])
+                        t2i_job["cfg_scale"] = float(_hd["guidance_scale"])
+                        t2i_job["cfg"] = float(_hd["guidance_scale"])
+                        t2i_job["shift"] = float(_hd["shift"])
+                        t2i_job["scheduler_name"] = str(_hd["scheduler_name"])
+                        t2i_job["timesteps"] = str(_hd["timesteps"])
+                        t2i_job.setdefault("noise_scale_start", 7.5)
+                        t2i_job.setdefault("noise_scale_end", 7.5)
+                        t2i_job.setdefault("noise_clip_std", 2.5)
+
                     elif str(_eng).lower().strip() in ("flux_klein", "flux_klein_edit"):
                         # Locked-in for Flux Klein: 4 steps, CFG 1, Euler, 1344x768, diffusion-fa ON
                         bw, bh = 1344, 768
@@ -13911,6 +14197,22 @@ class PipelineWorker(QThread):
                             try:
                                 if (not ok) and os.path.exists(out_path) and os.path.getsize(out_path) == 0:
                                     os.remove(out_path)
+                            except Exception:
+                                pass
+                        elif _eng_now == "hidream":
+                            res = _run_hidream_planner_image(
+                                t2i_job=t2i_job,
+                                images_dir=images_dir,
+                                sid=sid,
+                                log_func=lambda m: self.signals.log.emit(str(m)),
+                                stop_check=lambda: bool(getattr(self, "_stop_requested", False)),
+                            )
+                            try:
+                                shot_map = manifest.setdefault("shots", {})
+                                rec = shot_map.get(sid) if isinstance(shot_map.get(sid), dict) else {}
+                                rec["image_engine"] = "hidream"
+                                rec["hidream_model_key"] = str(res.get("hidream_model_key") or t2i_job.get("hidream_model_key") or '')
+                                shot_map[sid] = rec
                             except Exception:
                                 pass
                         elif _eng_now in ("flux_klein", "flux_klein_9b", "flux_klein_edit"):
@@ -22218,6 +22520,7 @@ These prompts override the normal reused Own Storymode prompts for the video sta
             "Z-image Turbo GGUF (high quality, fast, Low VRAM)",
             "Flux Klein 4B (Very Fast, low vram, no NSFW).",
             "Flux Klein 9B (little higher quality, No NSFW).",
+            "HiDream (auto: FP8 Dev → BF16 Dev → FP8 Base → BF16 Base)",
             "More (Maybe later)",
         ])
         # Default text-to-image engine: Z-image Turbo (GGUF Low VRAM)

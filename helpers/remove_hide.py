@@ -12,7 +12,7 @@ Notes:
   Example: '/models/wan22/' resolves to '<app_root>/models/wan22/'.
 - Shared env groups:
   - Qwen 2511 & Qwen 2512 share '/.qwen2512'
-  - Z-image Turbo GGUF & FP16 share '/.zimage_env'
+  - Z-image Turbo GGUF & FP16 share '/environments/.zimage_env'
 
 This file does NOT yet enforce hiding inside the rest of the app. It only stores hide flags
 and provides UI to toggle them (plus a global "Show hidden" toggle for this manager UI).
@@ -119,21 +119,21 @@ def build_registry() -> List[Entry]:
         Entry(
             id="zimage_turbo_gguf",
             title="Z-image Turbo (GGUF)",
-            env_paths=["/.zimage_env"],
+            env_paths=["/environments/.zimage_env/"],
             model_paths=["/models/Z-Image-Turbo GGUF/"],
             helper_paths=["/helpers/txt2img.py"],
             shared_env_group="zimage_shared",
-            shared_env_path="/.zimage_env",
+            shared_env_path="/environments/.zimage_env/",
             shared_helper_note="Shared helper with other models , hiding all will also hide the full tab in the app .",
         ),
         Entry(
             id="zimage_turbo_fp16",
             title="Z-image Turbo (FP16)",
-            env_paths=["/.zimage_env"],
+            env_paths=["/environments/.zimage_env/"],
             model_paths=["/models/Z-Image-Turbo/"],
             helper_paths=["/helpers/txt2img.py"],
             shared_env_group="zimage_shared",
-            shared_env_path="/.zimage_env",
+            shared_env_path="/environments/.zimage_env/",
             shared_helper_note="Shared helper with other models , hiding all will also hide the full tab in the app .",
         ),
         Entry(
@@ -501,6 +501,17 @@ def siblings_in_group(registry: List[Entry], group_id: str, exclude_id: str) -> 
     return [x for x in registry if x.shared_env_group == group_id and x.id != exclude_id]
 
 
+def entry_has_non_shared_install(app_root: str, e: Entry) -> bool:
+    """Return True when an entry still has its own model/repo assets installed.
+
+    Shared environments are intentionally ignored here. Otherwise a shared env would
+    make every sibling look installed forever, preventing the env from being removed
+    after the last model in the group is deleted.
+    """
+    r = entry_paths_resolved(app_root, e)
+    return path_exists_any(r.get("models", [])) or path_exists_any(r.get("repos", []))
+
+
 # -------------------------
 # Delete operations
 # -------------------------
@@ -552,10 +563,14 @@ def remove_entry(app_root: str, registry: List[Entry], e: Entry) -> List[Tuple[b
     # Some entries list env_paths directly; if shared group exists, only remove shared env when no sibling remains installed.
     if e.shared_env_group and e.shared_env_path:
         sibs = siblings_in_group(registry, e.shared_env_group, e.id)
-        sib_installed = any(is_installed(app_root, s) for s in sibs)
+        # Only keep a shared env when another model/repo in the same group still exists.
+        # Do not count the shared env itself as proof that a sibling is installed.
+        # For Z-image this means the env is removed only after both GGUF and FP16
+        # model folders are gone.
+        sib_installed = any(entry_has_non_shared_install(app_root, s) for s in sibs)
         shared_env_abs = resolve_app_path(app_root, e.shared_env_path)
         if sib_installed:
-            results.append((True, f"Skipped shared env (still needed): {shared_env_abs}"))
+            results.append((True, f"Skipped shared env (still needed by another model): {shared_env_abs}"))
         else:
             if _is_helpers_path(app_root, shared_env_abs):
                 results.append((True, f"Skipped protected helpers path: {shared_env_abs}"))

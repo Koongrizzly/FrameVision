@@ -25,6 +25,12 @@ ETA_FUDGE_SEC = 3  # small cushion for cleanup (temp deletion, final writes)
 # ---- Thumbnail helpers (video preview, rounded pixmaps, cache) --------------
 VIDEO_EXTS = {'.mp4','.mov','.avi','.mkv','.webm','.m4v','.mpg','.mpeg'}
 
+# Finished rows are performance-sensitive because they can pile up.
+# Keep them lightweight: no ffmpeg thumbnail extraction and no repeated output-folder scans
+# while the user is trying to play video in the main player.
+FINISHED_ROWS_USE_STATIC_ICON = True
+
+
 def _bin_dir() -> Path:
     try:
         return Path.cwd() / "presets" / "bin"
@@ -133,7 +139,9 @@ class _AutoPlayLastController(QObject):
         except Exception:
             self.seen = set()
         self.poll = QTimer(self)
-        self.poll.setInterval(900)
+        # Low-frequency scan: this watches only Finished jobs for autoplay.
+        # 900ms made the done-folder stat scan run constantly while the media player was active.
+        self.poll.setInterval(3000)
         self.poll.timeout.connect(self._tick)
         self.poll.start()
 
@@ -464,6 +472,8 @@ class JobRowWidget(QWidget):
         self.status = status
         self.data: dict[str, Any] = {}
         self._load_json_safely()
+        self._resolved_output_cache = None
+        self._resolved_output_stamp = None
 
         # --- Left status strip ---
         self.status_strip = QFrame(self)
@@ -1381,6 +1391,21 @@ class JobRowWidget(QWidget):
                         pass
                 return
 
+            # Critical performance guard: finished/failed rows are not live.
+            # Do not resolve output media just to create thumbnails, and never spawn ffmpeg
+            # from queue rows. Video thumbnails here can fight the main video player.
+            if FINISHED_ROWS_USE_STATIC_ICON and status in ("done", "failed"):
+                try:
+                    pm = self._make_status_icon_pixmap(w, h, status)
+                except Exception:
+                    pm = None
+                if pm is not None:
+                    try:
+                        self.thumb.setPixmap(pm)
+                    except Exception:
+                        pass
+                return
+
 
             def _show_from_path(path: Path, is_input: bool = False) -> bool:
                 try:
@@ -1871,13 +1896,27 @@ class JobRowWidget(QWidget):
         d = self.data or {}
         args = d.get("args") if isinstance(d.get("args"), dict) else {}
 
+        # Cache finished/failed output resolution. Some job schemas force a scan of out_dir;
+        # doing that repeatedly from every queue refresh is expensive and can stutter playback.
+        try:
+            st = Path(self.job_path).stat().st_mtime if Path(self.job_path).exists() else None
+            status = (self._status_from_fs() or self.status or "").lower()
+            if status in ("done", "failed") and getattr(self, "_resolved_output_stamp", None) == st:
+                cached = getattr(self, "_resolved_output_cache", None)
+                if cached:
+                    cp = Path(cached)
+                    if cp.exists() and cp.is_file():
+                        return cp
+        except Exception:
+            st = None
+
         # Fast path: direct 'produced' field if it points to a real file (helps ace_text2music WAV, etc.)
         try:
             produced_val = d.get("produced")
             if isinstance(produced_val, str):
                 p = Path(produced_val).expanduser()
                 if p.is_file():
-                    return p
+                    return _cache_and_return(p) if '_cache_and_return' in locals() else p
         except Exception:
             pass
     
@@ -1925,12 +1964,22 @@ class JobRowWidget(QWidget):
             except Exception:
                 return None
     
+        def _cache_and_return(p: Optional[Path]) -> Optional[Path]:
+            try:
+                status2 = (self._status_from_fs() or self.status or "").lower()
+                if p and status2 in ("done", "failed"):
+                    self._resolved_output_cache = str(p)
+                    self._resolved_output_stamp = st
+            except Exception:
+                pass
+            return p
+
         # 0) Prefer explicit single-file fields in common schemas
         single_keys = ("produced","outfile","output","result","file","path")
         for k in single_keys:
             p = _valid_file(_as_path((d.get(k) if k in d else args.get(k))))
             if p:
-                return p
+                return _cache_and_return(p)
     
         # 0b) Prefer list fields if present
         list_keys = ("outputs","produced_files","results","files","artifacts","saved")
@@ -1940,7 +1989,7 @@ class JobRowWidget(QWidget):
                 for item in seq:
                     p = _valid_file(_as_path(item))
                     if p:
-                        return p
+                        return _cache_and_return(p)
     
         # 1) If explicit outfile exists but is a directory, look inside that
         out = args.get("outfile") or d.get("outfile")
@@ -2065,9 +2114,9 @@ class JobRowWidget(QWidget):
                 # sort by score desc, then by mtime desc
                 candidates.sort(key=lambda t: (t[0], t[1]), reverse=True)
                 best = candidates[0][2]
-                return best
+                return _cache_and_return(best)
     
-        return None
+        return _cache_and_return(None)
     def _play_output(self) -> None:
             try:
                 p = self._resolve_output_file()
