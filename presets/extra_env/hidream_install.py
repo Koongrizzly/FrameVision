@@ -19,10 +19,25 @@ MODEL_INFO = {
         "repo_id": "drbaph/HiDream-O1-Image-BF16",
         "folder": "HiDream-O1-Image-BF16",
     },
+    "base_fp8": {
+        "label": "Base / Full FP8",
+        "repo_id": "drbaph/HiDream-O1-Image-FP8",
+        "folder": "HiDream-O1-Image-FP8",
+    },
     "dev": {
         "label": "Dev BF16",
         "repo_id": "drbaph/HiDream-O1-Image-Dev-BF16",
         "folder": "HiDream-O1-Image-Dev-BF16",
+    },
+    "dev_2604_bf16": {
+        "label": "Dev 2604 BF16",
+        "repo_id": "drbaph/HiDream-O1-Image-Dev-2604-BF16",
+        "folder": "HiDream-O1-Image-Dev-2604-BF16",
+    },
+    "dev_fp8": {
+        "label": "Dev FP8",
+        "repo_id": "drbaph/HiDream-O1-Image-Dev-FP8",
+        "folder": "HiDream-O1-Image-Dev-FP8",
     },
 }
 
@@ -57,6 +72,10 @@ RESULTS_DIR = MODELS_ROOT / "results"
 DOWNLOADS_DIR = EXTRA_ENV_DIR / "_downloads_hidream"
 LOCAL_CACHE_DIR = MODELS_ROOT / ".hf_cache"
 LOCAL_HF_HOME = MODELS_ROOT / ".hf_home"
+ARIA2C_CANDIDATES = [
+    ROOT / "aria2c.exe",
+    ROOT.parent / "aria2c.exe",
+]
 
 
 def log(message: str) -> None:
@@ -85,39 +104,75 @@ def ensure_dirs() -> None:
         p.mkdir(parents=True, exist_ok=True)
 
 
-def _normalize_model_selection(value: str | None) -> list[str]:
-    choice = (value or "").strip().lower()
-    if choice in {"base", "b", "1"}:
-        return ["base"]
-    if choice in {"dev", "d", "2"}:
-        return ["dev"]
-    if choice in {"both", "all", "base,dev", "dev,base", "3"}:
-        return ["base", "dev"]
-    if choice in {"none", "nothing", "quit", "exit", "4"}:
-        print("Nothing selected. Exiting.")
+def parse_model_selection(selection: str | None) -> list[str]:
+    """Normalize interactive/CLI model choices to internal MODEL_INFO keys."""
+    choice = (selection or "").strip().lower().replace("-", "_").replace(" ", "_")
+    mapping = {
+        "1": ["base"],
+        "base": ["base"],
+        "b": ["base"],
+        "bf16_base": ["base"],
+        "base_bf16": ["base"],
+        "full": ["base"],
+        "full_bf16": ["base"],
+        "2": ["dev"],
+        "dev": ["dev"],
+        "d": ["dev"],
+        "bf16_dev": ["dev"],
+        "dev_bf16": ["dev"],
+        "3": ["dev_2604_bf16"],
+        "dev_2604": ["dev_2604_bf16"],
+        "dev2604": ["dev_2604_bf16"],
+        "2604": ["dev_2604_bf16"],
+        "dev_2604_bf16": ["dev_2604_bf16"],
+        "bf16_dev_2604": ["dev_2604_bf16"],
+        "dev2604_bf16": ["dev_2604_bf16"],
+        "4": ["base_fp8"],
+        "base_fp8": ["base_fp8"],
+        "bfp8": ["base_fp8"],
+        "full_fp8": ["base_fp8"],
+        "fp8_base": ["base_fp8"],
+        "5": ["dev_fp8"],
+        "dev_fp8": ["dev_fp8"],
+        "dfp8": ["dev_fp8"],
+        "fp8_dev": ["dev_fp8"],
+        "6": ["base", "dev"],
+        "both": ["base", "dev"],
+        "bf16": ["base", "dev"],
+        "both_bf16": ["base", "dev"],
+        "7": ["base_fp8", "dev_fp8"],
+        "fp8": ["base_fp8", "dev_fp8"],
+        "both_fp8": ["base_fp8", "dev_fp8"],
+        "8": ["base", "base_fp8", "dev", "dev_2604_bf16", "dev_fp8"],
+        "all": ["base", "base_fp8", "dev", "dev_2604_bf16", "dev_fp8"],
+        "all_four": ["base", "base_fp8", "dev", "dev_2604_bf16", "dev_fp8"],
+    }
+    if choice in mapping:
+        return mapping[choice]
+    if choice in {"9", "q", "quit", "exit", "none", ""}:
         raise SystemExit(0)
-    raise ValueError(f"Unknown HiDream model selection: {value!r}")
+    valid = ", ".join(sorted(k for k in mapping if not k.isdigit()))
+    fail(f"Unknown --models selection: {selection!r}\nValid values include: {valid}")
 
 
-def choose_models(preselected: str | None = None, no_prompt: bool = False) -> list[str]:
-    if preselected:
-        return _normalize_model_selection(preselected)
-    if no_prompt:
-        # Optional Installs should always pass --models. If it does not, choose both as the safe default.
-        return ["base", "dev"]
-
+def choose_models() -> list[str]:
     print("")
     print("============================================================")
-    print(" HiDream BF16 installer")
+    print(" HiDream installer")
     print("============================================================")
     print("Choose what to install/download:")
     print("  1) Base / Full BF16 only")
     print("  2) Dev BF16 only")
-    print("  3) Both Base and Dev")
-    print("  4) Nothing / Quit")
+    print("  3) Dev 2604 BF16 only")
+    print("  4) Base / Full FP8 only")
+    print("  5) Dev FP8 only")
+    print("  6) Both original BF16 models")
+    print("  7) Both FP8 models")
+    print("  8) All models, including Dev 2604 BF16")
+    print("  9) Nothing / Quit")
     print("")
-    choice = input("Selection [1-4]: ").strip().lower()
-    return _normalize_model_selection(choice)
+    return parse_model_selection(input("Selection [1-9]: "))
+
 
 def download_file(url: str, dest: Path) -> None:
     dest.parent.mkdir(parents=True, exist_ok=True)
@@ -344,7 +399,55 @@ def env_python_code(env_python: Path, code: str, env: dict | None = None) -> sub
     return run([str(env_python), "-c", code], env=env)
 
 
+def has_aria2c() -> bool:
+    return find_aria2c() is not None
+
+
+def find_aria2c() -> Path | None:
+    for candidate in ARIA2C_CANDIDATES:
+        if candidate.exists():
+            return candidate
+    return None
+
+
+def should_use_aria2_for_file(filename: str) -> bool:
+    lower = filename.lower()
+    return lower.endswith(".safetensors") or lower.endswith(".bin")
+
+
+def huggingface_resolve_url(repo_id: str, filename: str) -> str:
+    safe_name = filename.replace("\\", "/")
+    return f"https://huggingface.co/{repo_id}/resolve/main/{safe_name}?download=true"
+
+
+def download_with_aria2(repo_id: str, filename: str, target_dir: Path) -> None:
+    aria2c = find_aria2c()
+    if aria2c is None:
+        raise RuntimeError("aria2c was requested but no aria2c.exe was found.")
+    target_dir.mkdir(parents=True, exist_ok=True)
+    url = huggingface_resolve_url(repo_id, filename)
+    target_path = target_dir / Path(filename).name
+    log(f"Using aria2 for large file download: {filename}")
+    run([
+        str(aria2c),
+        "--allow-overwrite=true",
+        "--auto-file-renaming=false",
+        "--continue=true",
+        "--file-allocation=none",
+        "--max-connection-per-server=8",
+        "--split=8",
+        "--min-split-size=16M",
+        "--summary-interval=1",
+        "--console-log-level=warn",
+        "--dir", str(target_dir),
+        "--out", target_path.name,
+        url,
+    ])
+
+
 def download_hf_file(env_python: Path, repo_id: str, filename: str, target_dir: Path) -> None:
+    if has_aria2c() and should_use_aria2_for_file(filename):
+        return download_with_aria2(repo_id, filename, target_dir)
     target_dir.mkdir(parents=True, exist_ok=True)
     code = f'''
 import os
@@ -353,6 +456,7 @@ os.environ["HF_HOME"] = r"{LOCAL_HF_HOME}"
 os.environ["HF_HUB_CACHE"] = r"{LOCAL_CACHE_DIR}"
 os.environ["TRANSFORMERS_CACHE"] = r"{LOCAL_CACHE_DIR}"
 os.environ["HF_HUB_DISABLE_SYMLINKS_WARNING"] = "1"
+os.environ["HF_HUB_DISABLE_XET"] = "1"
 path = hf_hub_download(repo_id={repo_id!r}, filename={filename!r}, local_dir=r"{target_dir}", cache_dir=r"{LOCAL_CACHE_DIR}")
 print(path)
 '''
@@ -361,12 +465,12 @@ print(path)
     env["HF_HUB_CACHE"] = str(LOCAL_CACHE_DIR)
     env["TRANSFORMERS_CACHE"] = str(LOCAL_CACHE_DIR)
     env["HF_HUB_DISABLE_SYMLINKS_WARNING"] = "1"
+    env["HF_HUB_DISABLE_XET"] = "1"
     env_python_code(env_python, code, env=env)
 
 
 def get_hf_file_plan(env_python: Path, repo_id: str) -> list[str]:
     code = f'''
-import argparse
 import json
 from huggingface_hub import HfApi
 api = HfApi()
@@ -448,7 +552,29 @@ RUNNER_CODE = '#!/usr/bin/env python3\nfrom __future__ import annotations\n\nimp
 def write_runner_files() -> None:
     runner_py = MODELS_ROOT / "run_hidream.py"
     runner_bat = MODELS_ROOT / "run_hidream.bat"
-    runner_py.write_text(RUNNER_CODE, encoding="utf-8")
+    runner_source = '''#!/usr/bin/env python3
+from __future__ import annotations
+
+import runpy
+import sys
+from pathlib import Path
+
+
+THIS_DIR = Path(__file__).resolve().parent
+HELPER_CLI = THIS_DIR.parents[1] / "helpers" / "hidream_cli.py"
+
+
+def main() -> None:
+    if not HELPER_CLI.exists():
+        raise RuntimeError(f"HiDream helper CLI was not found: {HELPER_CLI}")
+    sys.path.insert(0, str(HELPER_CLI.parent))
+    runpy.run_path(str(HELPER_CLI), run_name="__main__")
+
+
+if __name__ == "__main__":
+    main()
+'''
+    runner_py.write_text(runner_source, encoding="utf-8")
     runner_bat.write_text(r'''@echo off
 setlocal
 set PYTHONUTF8=1
@@ -500,47 +626,24 @@ if not torch.cuda.is_available():
     log("Install verification passed.")
 
 
-
-
-def cleanup_temporary_downloads() -> None:
-    """Remove temporary download/cache folders created by this installer.
-
-    The installed environment, official repo, runner files and selected model folders stay in place.
-    """
-    for folder in [DOWNLOADS_DIR, LOCAL_CACHE_DIR, LOCAL_HF_HOME]:
-        try:
-            if folder.exists():
-                shutil.rmtree(folder, ignore_errors=True)
-                log(f"Removed temporary download/cache folder: {folder}")
-        except Exception as exc:
-            log(f"Could not remove temporary folder {folder}: {exc}")
-
-
-def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser("HiDream BF16 installer")
+def main() -> None:
+    parser = argparse.ArgumentParser("HiDream installer")
     parser.add_argument(
         "--models",
-        choices=["base", "dev", "both", "all"],
         default=None,
-        help="Non-interactive model selection for optional installs.",
+        help="Model selection for non-interactive use: base, dev, dev_2604, base_fp8, dev_fp8, both, both_fp8, all.",
     )
-    parser.add_argument(
-        "--no-prompt",
-        action="store_true",
-        help="Do not show the interactive model-choice prompt. Used by FrameVision Optional Installs.",
-    )
-    parser.add_argument(
-        "--keep-temp",
-        action="store_true",
-        help="Keep temporary download/cache folders for troubleshooting.",
-    )
-    return parser.parse_args()
+    parser.add_argument("--no-prompt", action="store_true", help="Do not show the interactive model selection menu.")
+    args = parser.parse_args()
 
-def main() -> None:
-    args = parse_args()
     if os.name != "nt":
         log("Warning: this installer was written for Windows paths, but it will still try to run.")
-    selected_models = choose_models(args.models, args.no_prompt)
+    if args.models is not None:
+        selected_models = parse_model_selection(args.models)
+    elif args.no_prompt:
+        fail("--no-prompt requires --models so the installer knows what to download.")
+    else:
+        selected_models = choose_models()
     log(f"Root folder: {ROOT}")
     ensure_dirs()
     conda = ensure_miniconda()
@@ -569,8 +672,6 @@ def main() -> None:
     print(f'  "{ROOT / "launch_hidream_ui.bat"}"')
     print("")
     print("If you later select a missing model in the UI, run install.bat again and choose that model.")
-    if not args.keep_temp:
-        cleanup_temporary_downloads()
 
 
 if __name__ == "__main__":
