@@ -10,12 +10,13 @@ RTX graphics card with at least 8 gigabyte of vram is advised, some models need 
 ---
 
 <details>
-<summary>May 10th 2026 V2.3.4 small update brings Hidream Image/edit base and dev model (fp8+bf16) </summary>
+<summary>May 10th 2026 V2.3.4 small update brings Hidream Image/edit base and dev model (fp8+bf16) + May 17th : included the updated hidream 2604 dev model</summary>
 __________________________________________________________________________________
 
 - Hidream Image : probably the best open source image edit ai of the moment
-- if you already have installed Framevision, just do an update nside te app to download all new files and restart the app, it will be added to optional installs and you can install it from there.
+- if you already have installed Framevision, just do an update inside the app to download all new files and restart the app, it will be added to optional installs and you can install it from there.
 - choice between base and dev model, (BF16 needs up to 20 gig of vram, fp8 fits in 16 gig vram)
+* May 17th, i also included the bf16 version o the updated 2604 dev model, for me it gives worse results then original dev, but it is quite a lot faster so i included it anyway
 </details>
 
 <details>
