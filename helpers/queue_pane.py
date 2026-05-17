@@ -45,9 +45,9 @@ class QueuePane(QWidget):
 
     # Finished queue records are kept intentionally tiny. Old finished JSONs
     # have caused global app/video-player slowdowns when they pile up.
-    MAX_DONE_KEEP    = 5
+    MAX_DONE_KEEP    = 10
 
-    MAX_DONE_SHOW    = 5
+    MAX_DONE_SHOW    = 10
 
     MAX_FAILED_KEEP  = 50
 
@@ -108,7 +108,7 @@ class QueuePane(QWidget):
         # Startup safety cleanup: finished jobs are convenience history, not live queue state.
         # Keep only the latest few job JSONs so old finished records cannot slow down playback.
         try:
-            self._startup_cleanup_finished_jobs(keep=int(getattr(self, "MAX_DONE_KEEP", 5)))
+            self._startup_cleanup_finished_jobs(keep=int(getattr(self, "MAX_DONE_KEEP", 10)))
         except Exception:
             pass
 
@@ -287,7 +287,7 @@ class QueuePane(QWidget):
         self.refresh()
         # timers start in showEvent / start_auto() when the Queue tab becomes visible
 
-    def _startup_cleanup_finished_jobs(self, keep: int = 5):
+    def _startup_cleanup_finished_jobs(self, keep: int = 10):
         """Delete old finished queue JSON records at startup, keeping newest N.
 
         This deletes only job metadata from jobs/done. It never deletes generated
@@ -296,7 +296,7 @@ class QueuePane(QWidget):
         try:
             keep = max(0, int(keep))
         except Exception:
-            keep = 5
+            keep = 10
         done_dir = None
         try:
             done_dir = self.JOBS_DIRS.get("done") if isinstance(self.JOBS_DIRS, dict) else None
@@ -524,7 +524,7 @@ class QueuePane(QWidget):
             except Exception:
                 auto_cleanup = False
 
-            if auto_cleanup and not (status == "done" and int(max_keep or 0) <= 5):
+            if auto_cleanup and not (status == "done" and int(max_keep or 0) <= 10):
                 try:
                     # Start cleanup slightly before hitting the max.
                     # Done: allow up to (max_keep - 2) then remove a batch of 10 so we drop to ~38-39.

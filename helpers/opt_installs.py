@@ -741,6 +741,10 @@ def _run_hidream_edit_dev(root: Path) -> Optional[Tuple[str, List[str], Path]]:
     return _run_hidream_edit(root, "dev")
 
 
+def _run_hidream_edit_dev_2604_bf16(root: Path) -> Optional[Tuple[str, List[str], Path]]:
+    return _run_hidream_edit(root, "dev_2604")
+
+
 def _run_hidream_edit_both(root: Path) -> Optional[Tuple[str, List[str], Path]]:
     return _run_hidream_edit(root, "both")
 
@@ -1016,6 +1020,12 @@ OptionalInstall(
             runner=_run_hidream_edit_dev,
         ),
         OptionalInstall(
+            key="hidream_edit_dev_2604_bf16",
+            title="HiDream Image Edit BF16 (Dev 2604)",
+            description="Updated Dev 2604 BF16 model. Installs/reuses environments/.hidream_dev and the HiDream repo, then downloads the separate Dev 2604 BF16 folder without replacing older HiDream models.",
+            runner=_run_hidream_edit_dev_2604_bf16,
+        ),
+        OptionalInstall(
             key="hidream_edit_both",
             title="HiDream Image Edit BF16 (Base + Dev)",
             description="Installs/reuses the HiDream environment/repo and downloads both Base / Full BF16 and Dev BF16 models, skipping files that already exist.",
@@ -1042,7 +1052,7 @@ OptionalInstall(
         OptionalInstall(
             key="hidream_edit_all",
             title="HiDream Image Edit BF16 + FP8 (All)",
-            description="Installs/reuses the HiDream environment/repo and downloads Base / Full + Dev for both BF16 and FP8, skipping files that already exist.",
+            description="Installs/reuses the HiDream environment/repo and downloads Base / Full + Dev for both BF16 and FP8 plus Dev 2604 BF16, skipping files that already exist.",
             runner=_run_hidream_edit_all,
         ),
         OptionalInstall(
@@ -1437,6 +1447,7 @@ _ENV_DIR_BY_KEY = {
     "zimage": Path("environments") / ".zimage_env",
     "hidream_edit_base": Path("environments") / ".hidream_dev",
     "hidream_edit_dev": Path("environments") / ".hidream_dev",
+    "hidream_edit_dev_2604_bf16": Path("environments") / ".hidream_dev",
     "hidream_edit_both": Path("environments") / ".hidream_dev",
     "hidream_edit_base_fp8": Path("environments") / ".hidream_dev",
     "hidream_edit_dev_fp8": Path("environments") / ".hidream_dev",
@@ -1766,7 +1777,7 @@ class OptionalInstallsDialog(QtWidgets.QDialog):
         hidream_lay = hidream_sec.layout_content()
 
         _add_group_label("BF16 models (choose one)", hidream_lay)
-        for k in ("hidream_edit_base", "hidream_edit_dev", "hidream_edit_both"):
+        for k in ("hidream_edit_base", "hidream_edit_dev", "hidream_edit_dev_2604_bf16", "hidream_edit_both"):
             opt = by_key.get(k)
             if opt:
                 _add_opt(opt, hidream_lay)

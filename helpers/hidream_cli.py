@@ -63,6 +63,17 @@ MODEL_MAP = {
         "default_scheduler": "flash",
         "default_timesteps": "dev",
     },
+    "dev_2604_bf16": {
+        "label": "Dev 2604 BF16",
+        "folder": "HiDream-O1-Image-Dev-2604-BF16",
+        "variant": "dev",
+        "weight_dtype": "bf16",
+        "default_steps": 28,
+        "default_guidance": 0.0,
+        "default_shift": 1.0,
+        "default_scheduler": "flash",
+        "default_timesteps": "dev",
+    },
     "dev_fp8": {
         "label": "Dev FP8",
         "folder": "HiDream-O1-Image-Dev-FP8",

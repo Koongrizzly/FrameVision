@@ -84,6 +84,17 @@ MODEL_DEFAULTS = {
         "timesteps": "dev",
         "note": "Dev model. CFG/negative prompts are effectively disabled; use 28-step Dev timesteps.",
     },
+    "dev_2604_bf16": {
+        "label": "Dev 2604 BF16",
+        "folder": "HiDream-O1-Image-Dev-2604-BF16",
+        "variant": "dev",
+        "steps": 28,
+        "guidance_scale": 0.0,
+        "shift": 1.0,
+        "scheduler": "flash",
+        "timesteps": "dev",
+        "note": "Updated Dev 2604 BF16 model. CFG/negative prompts are disabled; use 28-step Dev timesteps. Installs as a separate folder so the old Dev model stays available.",
+    },
     "dev_fp8": {
         "label": "Dev FP8",
         "folder": "HiDream-O1-Image-Dev-FP8",

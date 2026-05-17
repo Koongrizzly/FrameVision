@@ -15,6 +15,8 @@ import os
 import sys
 import math
 import json
+import copy
+import importlib.util
 import random
 import shutil
 import subprocess
@@ -23,9 +25,9 @@ import re
 from datetime import datetime
 from pathlib import Path
 from dataclasses import dataclass, replace, field
-from typing import List, Optional, Tuple, Dict
+from typing import List, Optional, Tuple, Dict, Any
 
-from PySide6.QtCore import Qt, QThread, Signal, QSettings, QTimer, QPropertyAnimation, QEasingCurve
+from PySide6.QtCore import Qt, QThread, Signal, QTimer, QPropertyAnimation, QEasingCurve
 from PySide6.QtWidgets import (
     QWidget,
     QVBoxLayout,
@@ -54,7 +56,7 @@ from PySide6.QtWidgets import (
     QFrame,
     QTextEdit,
 )
-from PySide6.QtGui import QIcon
+from PySide6.QtGui import QIcon, QPixmap
 from .visual_thumbs import VisualThumbManager
 
 
@@ -117,6 +119,163 @@ def _musicclip_project_root() -> str:
         return os.path.abspath(os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
     except Exception:
         return os.path.abspath(os.getcwd())
+
+
+def _musicclip_settings_path() -> str:
+    """Visible, portable settings file for Music Clip Creator."""
+    return os.path.join(_musicclip_project_root(), "presets", "setsave", "musicclip_creator_settings.json")
+
+
+def _musicclip_read_json_file(path: str) -> Dict[str, Any]:
+    try:
+        if not path or not os.path.isfile(path):
+            return {}
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+
+def _musicclip_write_json_file(path: str, data: Dict[str, Any]) -> None:
+    try:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        tmp = path + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(data if isinstance(data, dict) else {}, f, indent=2, ensure_ascii=False)
+        os.replace(tmp, path)
+    except Exception:
+        pass
+
+
+def _musicclip_coerce_bool(value: Any, default: bool = False) -> bool:
+    if value is None:
+        return bool(default)
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return bool(value)
+    text = str(value).strip().lower()
+    if text in ("1", "true", "yes", "on", "checked"):
+        return True
+    if text in ("0", "false", "no", "off", "unchecked"):
+        return False
+    return bool(default)
+
+
+def _musicclip_text_looks_like_path(value: Any) -> bool:
+    """Return True when text is clearly a file/folder path, not a creative prompt.
+
+    Used only to protect Planner Bridge creative text boxes from old corrupted
+    settings where audio_path/video_path/output_path were accidentally saved
+    into main_idea/style/characters fields.
+    """
+    try:
+        s = str(value or "").strip().strip('"').strip("'")
+    except Exception:
+        return False
+    if not s:
+        return False
+    low = s.lower().replace("\\", "/")
+    if re.match(r"^[a-z]:/", low):
+        return True
+    if low.startswith(("/", "./", "../", "~/")):
+        return True
+    if "/" in low and any(tok in low for tok in ("output/", "outputs", "framevision", "wangp", "videoclips", "audio/", "presets/", "models/")):
+        return True
+    if re.search(r"\.(mp3|wav|flac|m4a|ogg|mp4|mov|mkv|avi|webm|srt|json)$", low):
+        return True
+    return False
+
+
+class _MusicClipJsonSettings:
+    """Tiny project-folder JSON settings store with a Qt-like value/setValue API.
+
+    This keeps Music Clip Creator portable: settings live in FrameVision/presets/setsave
+    instead of an invisible operating-system store.
+    """
+
+    def __init__(self, path: Optional[str] = None):
+        self.path = str(path or _musicclip_settings_path())
+        self._data: Dict[str, Any] = _musicclip_read_json_file(self.path)
+        self._dirty = False
+
+    def get(self, key: str, default: Any = None, type: Any = None) -> Any:
+        value = self._data.get(str(key), default)
+        if value is None:
+            return default
+        try:
+            if type is bool:
+                return _musicclip_coerce_bool(value, bool(default))
+            if type is str:
+                return str(value)
+            if type is int:
+                return int(float(value))
+            if type is float:
+                return float(value)
+        except Exception:
+            return default
+        return value
+
+    def set(self, key: str, value: Any) -> None:
+        if isinstance(value, Path):
+            value = str(value)
+        self._data[str(key)] = value
+        self._dirty = True
+
+    def clear(self) -> None:
+        self._data = {}
+        self._dirty = True
+
+    def contains(self, key: str) -> bool:
+        return str(key) in self._data
+
+    def remove(self, key: str) -> None:
+        k = str(key)
+        if k in self._data:
+            del self._data[k]
+            self._dirty = True
+
+    def sync(self) -> None:
+        if self._dirty:
+            _musicclip_write_json_file(self.path, self._data)
+            self._dirty = False
+
+
+def _load_musicclip_planner_bridge():
+    """Best-effort optional import for the private Music Clip Creator -> Planner bridge.
+
+    The public Music Clip Creator must never depend on this file. If the helper is
+    missing or broken, all bridge controls stay hidden and normal rendering/queue
+    behavior continues unchanged.
+    """
+    try:
+        here = os.path.dirname(os.path.abspath(__file__))
+        bridge_path = os.path.join(here, "musicclip_planner_bridge.py")
+        if not os.path.isfile(bridge_path):
+            return None
+        spec = importlib.util.spec_from_file_location("_framevision_musicclip_planner_bridge", bridge_path)
+        if spec is None or spec.loader is None:
+            return None
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        is_available = getattr(mod, "is_available", None)
+        required = (
+            "export_musicclip_scene_plan",
+            "create_prompt_plan",
+            "create_ltx_shot_plan",
+            "create_ltx_director_plan",
+        )
+        if not callable(is_available):
+            return None
+        for name in required:
+            if not callable(getattr(mod, name, None)):
+                return None
+        if not bool(is_available()):
+            return None
+        return mod
+    except BaseException:
+        return None
 
 
 def _musicclip_abs_path(root: str, path: str) -> str:
@@ -1812,6 +1971,50 @@ def _lyric_segments_from_list(items: Optional[list]) -> List[LyricSegment]:
     return [seg for seg in out if seg.text and seg.end > seg.start]
 
 
+
+def _bridge_active_lyric_overlap_reason(sc_start: float, sc_end: float, overlaps: list) -> tuple:
+    """Return conservative active lyric evidence for Planner Bridge scene export.
+
+    This keeps lyric text attached for mood/context, but marks stale long SRT
+    overlap as inactive so the bridge does not force lipsync during instrumental
+    tails or repeated lyric blocks.
+    """
+    try:
+        sc_start = float(sc_start or 0.0)
+        sc_end = float(sc_end or 0.0)
+    except Exception:
+        sc_start, sc_end = 0.0, 0.0
+    duration = max(0.05, sc_end - sc_start)
+    best_reason = "no_active_lyric_overlap"
+    best_start = 0.0
+    best_end = 0.0
+    for seg in overlaps or []:
+        try:
+            start = float(getattr(seg, "start", 0.0) or 0.0)
+            end = float(getattr(seg, "end", 0.0) or 0.0)
+        except Exception:
+            continue
+        if end <= start:
+            continue
+        seg_duration = max(0.0, end - start)
+        long_block = seg_duration > 8.0
+        active_end = min(end, start + 3.5) if long_block else end
+        overlap = min(sc_end, active_end) - max(sc_start, start)
+        if overlap < 0.35:
+            best_reason = "lyric_overlap_too_short_or_stale"
+            continue
+        starts_inside_or_near = (sc_start - 0.65) <= start <= (sc_end - min(0.05, duration * 0.1))
+        short_overlap_near_start = (not long_block) and overlap >= min(1.0, duration * 0.5) and (sc_start - start) <= 1.25
+        if long_block and start < sc_start - 0.45:
+            best_reason = "long_srt_block_started_before_scene"
+            continue
+        if starts_inside_or_near or short_overlap_near_start:
+            return True, ("active_long_srt_phrase_start_inside_scene" if long_block else "active_lyric_phrase_start_inside_scene"), start, active_end
+        best_reason = "lyric_text_overlap_but_no_active_phrase_start"
+        best_start = start
+        best_end = active_end
+    return False, best_reason, best_start, best_end
+
 def attach_lyrics_to_scenes(
     scenes: Optional[List["MusicScene"]],
     lyric_segments: Optional[List[LyricSegment]],
@@ -1842,9 +2045,15 @@ def attach_lyrics_to_scenes(
             text = re.sub(r"\s+", " ", text).strip()
             if len(text) > 500:
                 text = text[:497].rstrip() + "..."
+            active_ok, active_reason, active_start, active_end = _bridge_active_lyric_overlap_reason(sc_start, sc_end, overlaps)
             setattr(sc, "lyric_text", text)
             setattr(sc, "lyric_start", float(min(seg.start for seg in overlaps)))
             setattr(sc, "lyric_end", float(max(seg.end for seg in overlaps)))
+            setattr(sc, "active_vocal_window", bool(active_ok))
+            setattr(sc, "vocal_timing_reason", str(active_reason or ""))
+            if active_ok:
+                setattr(sc, "active_lyric_start", float(active_start))
+                setattr(sc, "active_lyric_end", float(active_end))
             setattr(sc, "srt_path", safe_path)
             note = str(getattr(sc, "notes", "") or "")
             if "lyrics_attached" not in note:
@@ -1876,9 +2085,15 @@ def attach_lyrics_to_scene_dicts(scene_items: Optional[list], lyric_segments: Op
                 text = re.sub(r"\s+", " ", text).strip()
                 if len(text) > 500:
                     text = text[:497].rstrip() + "..."
+                active_ok, active_reason, active_start, active_end = _bridge_active_lyric_overlap_reason(sc_start, sc_end, overlaps)
                 d["lyric_text"] = text
                 d["lyric_start"] = float(min(seg.start for seg in overlaps))
                 d["lyric_end"] = float(max(seg.end for seg in overlaps))
+                d["active_vocal_window"] = bool(active_ok)
+                d["vocal_timing_reason"] = str(active_reason or "")
+                if active_ok:
+                    d["active_lyric_start"] = float(active_start)
+                    d["active_lyric_end"] = float(active_end)
                 d["srt_path"] = str(srt_path or "")
         except Exception:
             pass
@@ -4846,6 +5061,215 @@ class SourceScanWorker(QThread):
             self.finished_ok.emit(sources)
         except Exception as e:
             self.failed.emit(str(e))
+
+
+class LtxDirectorPlanWorker(QThread):
+    progress_text = Signal(str)
+    finished_result = Signal(dict)
+    failed = Signal(str)
+
+    def __init__(self, bridge_module, payload: dict, parent=None) -> None:
+        super().__init__(parent)
+        self.bridge_module = bridge_module
+        self.payload = dict(payload or {})
+
+    def run(self) -> None:
+        try:
+            create_fn = getattr(self.bridge_module, "create_ltx_director_plan", None)
+            if not callable(create_fn):
+                self.failed.emit("LTX director plan creation is not available in this bridge file.")
+                return
+
+            def _progress(text):
+                try:
+                    msg = str(text or "").strip()
+                    if msg:
+                        self.progress_text.emit(msg)
+                except Exception:
+                    pass
+
+            payload = dict(self.payload)
+            payload["progress_callback"] = _progress
+            self.progress_text.emit("Loading director backend...")
+            result = create_fn(payload)
+            if isinstance(result, dict) and bool(result.get("ok")):
+                self.finished_result.emit(result)
+            else:
+                msg = "LTX director plan creation failed."
+                if isinstance(result, dict):
+                    msg = str(result.get("message") or msg)
+                self.failed.emit(msg)
+        except Exception as exc:
+            self.failed.emit(str(exc))
+
+
+class LtxSingleShotTestWorker(QThread):
+    progress_text = Signal(str)
+    finished_result = Signal(dict)
+    failed = Signal(str)
+
+    def __init__(self, bridge_module, payload: dict, parent=None) -> None:
+        super().__init__(parent)
+        self.bridge_module = bridge_module
+        self.payload = dict(payload or {})
+
+    def run(self) -> None:
+        try:
+            run_fn = getattr(self.bridge_module, "run_single_ltx_shot_test", None)
+            if not callable(run_fn):
+                self.failed.emit("LTX single-shot test runner is not available in this bridge file.")
+                return
+
+            def _progress(text):
+                try:
+                    msg = str(text or "").strip()
+                    if msg:
+                        self.progress_text.emit(msg)
+                except Exception:
+                    pass
+
+            payload = dict(self.payload)
+            payload["progress_callback"] = _progress
+            self.progress_text.emit("Loading LTX director plan...")
+            result = run_fn(payload)
+            if isinstance(result, dict) and bool(result.get("ok")):
+                self.finished_result.emit(result)
+            else:
+                msg = "LTX single-shot test failed."
+                if isinstance(result, dict):
+                    msg = str(result.get("message") or msg)
+                self.failed.emit(msg)
+        except Exception as exc:
+            self.failed.emit(str(exc))
+
+
+
+class LtxStartImageWorker(QThread):
+    progress_text = Signal(str)
+    finished_result = Signal(dict)
+    failed = Signal(str)
+
+    def __init__(self, bridge_module, payload: dict, parent=None) -> None:
+        super().__init__(parent)
+        self.bridge_module = bridge_module
+        self.payload = dict(payload or {})
+
+    def run(self) -> None:
+        try:
+            gen_fn = getattr(self.bridge_module, "generate_ltx_start_image_for_shot", None)
+            if not callable(gen_fn):
+                self.failed.emit("LTX start-image generation is not available in this bridge file.")
+                return
+
+            def _progress(text):
+                try:
+                    msg = str(text or "").strip()
+                    if msg:
+                        self.progress_text.emit(msg)
+                except Exception:
+                    pass
+
+            payload = dict(self.payload)
+            payload["progress_callback"] = _progress
+            self.progress_text.emit("Loading LTX director plan...")
+            result = gen_fn(payload)
+            if isinstance(result, dict) and bool(result.get("ok")):
+                self.finished_result.emit(result)
+            else:
+                msg = "LTX start-image generation failed."
+                if isinstance(result, dict):
+                    msg = str(result.get("message") or msg)
+                self.failed.emit(msg)
+        except Exception as exc:
+            self.failed.emit(str(exc))
+
+
+class LtxFullRunWorker(QThread):
+    progress_text = Signal(str)
+    finished_result = Signal(dict)
+    failed = Signal(str)
+
+    def __init__(self, bridge_module, payload: dict, parent=None) -> None:
+        super().__init__(parent)
+        self.bridge_module = bridge_module
+        self.payload = dict(payload or {})
+        self._cancel_requested = False
+
+    def request_cancel(self) -> None:
+        self._cancel_requested = True
+
+    def run(self) -> None:
+        try:
+            run_fn = getattr(self.bridge_module, "run_all_ltx_director_shots", None)
+            if not callable(run_fn):
+                self.failed.emit("Full LTX director-shot generation is not available in this bridge file.")
+                return
+
+            def _progress(text):
+                try:
+                    msg = str(text or "").strip()
+                    if msg:
+                        self.progress_text.emit(msg)
+                except Exception:
+                    pass
+
+            def _cancel_check():
+                return bool(getattr(self, "_cancel_requested", False))
+
+            payload = dict(self.payload)
+            payload["progress_callback"] = _progress
+            payload["cancel_check"] = _cancel_check
+            self.progress_text.emit("Loading LTX director plan...")
+            result = run_fn(payload)
+            if isinstance(result, dict) and bool(result.get("ok")):
+                self.finished_result.emit(result)
+            else:
+                msg = "Full LTX director-shot generation failed."
+                if isinstance(result, dict):
+                    msg = str(result.get("message") or msg)
+                self.failed.emit(msg)
+        except Exception as exc:
+            self.failed.emit(str(exc))
+
+
+class LtxAssemblyWorker(QThread):
+    progress_text = Signal(str)
+    finished_result = Signal(dict)
+    failed = Signal(str)
+
+    def __init__(self, bridge_module, payload: dict, parent=None) -> None:
+        super().__init__(parent)
+        self.bridge_module = bridge_module
+        self.payload = dict(payload or {})
+
+    def run(self) -> None:
+        try:
+            assemble_fn = getattr(self.bridge_module, "assemble_ltx_music_video", None)
+            if not callable(assemble_fn):
+                self.failed.emit("LTX final assembly is not available in this bridge file.")
+                return
+
+            def _progress(text):
+                try:
+                    msg = str(text or "").strip()
+                    if msg:
+                        self.progress_text.emit(msg)
+                except Exception:
+                    pass
+
+            payload = dict(self.payload)
+            payload["progress_callback"] = _progress
+            self.progress_text.emit("Preparing LTX assembly...")
+            result = assemble_fn(payload)
+            if isinstance(result, dict) and bool(result.get("ok")):
+                self.finished_result.emit(result)
+            else:
+                msg = "LTX final assembly failed."
+                if isinstance(result, dict):
+                    msg = str(result.get("message") or msg)
+                self.failed.emit(msg)
+        except Exception as exc:
+            self.failed.emit(str(exc))
 
 
 class WhisperMusicClipWorker(QThread):
@@ -8816,13 +9240,43 @@ class AutoMusicSyncWidget(QWidget):
         self._visual_section_overrides = {}
         # Default opacity for music-player visuals overlay (0.0–1.0)
         self.visual_overlay_opacity = 0.25
-        # Settings for remembering last paths & options
-        self._settings = QSettings("FrameVision", "MusicClipCreator")
+        # Settings for remembering last paths & options.
+        # Guarded load/save is important: Qt setChecked/setValue calls during startup
+        # can emit signals, and those signals must not write half-loaded defaults back
+        # over the user's saved choices. Stored as visible project JSON only.
+        self._settings = _MusicClipJsonSettings()
+        self._settings_loading = True
+        self._settings_ready = False
+        # Startup protection: keep the exact JSON that was read before any
+        # UI/autodetect/preset signal can touch controls. Some late startup
+        # code updates widgets after _load_settings(); without this guard those
+        # programmatic changes can be saved back as if the user selected them.
+        self._settings_startup_protected = True
+        try:
+            self._settings_startup_snapshot = copy.deepcopy(getattr(self._settings, "_data", {}) or {})
+        except Exception:
+            self._settings_startup_snapshot = {}
+        self._settings_autosave_connected = False
+        self._settings_save_timer = QTimer(self)
+        self._settings_save_timer.setSingleShot(True)
+        self._settings_save_timer.timeout.connect(self._save_settings)
         # Manager for per-visual thumbnails (lazy-generated real previews)
         self._visual_thumbs = VisualThumbManager(self, ffmpeg=self._ffmpeg)
 
+        # Optional/private Planner bridge. Missing/broken helper must not affect public builds.
+        self._planner_bridge = _load_musicclip_planner_bridge()
+        self._ltx_director_worker = None
+        self._ltx_director_running = False
+
         self._build_ui()
-        self._load_settings()
+        try:
+            self._load_settings()
+        finally:
+            self._settings_loading = False
+            self._settings_ready = True
+        # Connect autosave only after startup load is complete. This prevents
+        # signal noise from writing half-loaded/default values into JSON.
+        self._connect_settings_autosave()
         try:
             self._update_smart_director_visibility()
         except Exception:
@@ -8830,6 +9284,19 @@ class AutoMusicSyncWidget(QWidget):
 
         # Hide still-image UI block (images in generator)
         self._hide_image_sources_block()
+
+        # One or more late startup routines can still touch widgets after the
+        # first load. Re-apply the JSON snapshot after those routines have had a
+        # chance to run, then release saving. This prevents the "loaded good,
+        # then seconds later JSON becomes bad" failure.
+        try:
+            QTimer.singleShot(1200, self._restore_startup_settings_snapshot)
+            QTimer.singleShot(3500, self._finish_startup_settings_protection)
+        except Exception:
+            try:
+                self._finish_startup_settings_protection()
+            except Exception:
+                pass
 
 
     # ----------------------------- UI toast ---------------------------------
@@ -8962,11 +9429,29 @@ class AutoMusicSyncWidget(QWidget):
 
         settings_intro = QLabel(
             "Most users can leave these settings unchanged. Use this tab only when you want "
-            "to fine-tune timing, clip pacing, output quality, or Smart Director behavior.",
+            "to fine-tune timing, clip pacing, output quality, or original workflow behavior.",
             page_settings,
         )
         settings_intro.setWordWrap(True)
         settings_main.addWidget(settings_intro)
+
+        # Optional LTX / Planner Bridge tab. Created only when the bridge helper
+        # exists, imports cleanly, and exposes the expected lightweight functions.
+        page_ltx_workflow = None
+        ltx_workflow_main = None
+        if getattr(self, "_planner_bridge", None) is not None:
+            page_ltx_workflow = QWidget(self)
+            ltx_outer = QVBoxLayout(page_ltx_workflow)
+            ltx_outer.setContentsMargins(6, 6, 6, 6)
+            ltx_outer.setSpacing(8)
+            ltx_scroll = QScrollArea(page_ltx_workflow)
+            ltx_scroll.setWidgetResizable(True)
+            ltx_scroll_content = QWidget(ltx_scroll)
+            ltx_workflow_main = QVBoxLayout(ltx_scroll_content)
+            ltx_workflow_main.setContentsMargins(0, 0, 0, 0)
+            ltx_workflow_main.setSpacing(8)
+            ltx_scroll.setWidget(ltx_scroll_content)
+            ltx_outer.addWidget(ltx_scroll)
 
         row_defaults = QHBoxLayout()
         row_defaults.setContentsMargins(0, 0, 0, 0)
@@ -9075,11 +9560,12 @@ class AutoMusicSyncWidget(QWidget):
         self.combo_clip_order = QComboBox(self)
         self.combo_clip_order.addItems(
             [
-                "Random (default)",
+                "Random",
                 "Sequential",
                 "Shuffle (no repeats)",
             ]
         )
+        self.combo_clip_order.setCurrentIndex(1)
         self.combo_clip_order.setToolTip(
             "How clips from a folder are picked:\n"
             "- Random: random clips, avoid using the same clip twice in a row.\n"
@@ -9275,116 +9761,121 @@ class AutoMusicSyncWidget(QWidget):
         effects_lay.addWidget(self.fx_level_row_widget)
 
         # Smart Director / scene map controls (Chunk 1).
-        self.smart_director_box = QGroupBox("Smart Director", self)
-        smart_lay = QVBoxLayout(self.smart_director_box)
-        smart_lay.setContentsMargins(10, 8, 10, 8)
-        smart_lay.setSpacing(6)
-
-        row_smart_enable = QHBoxLayout()
-        self.check_smart_scene_map = QCheckBox("Use Smart Scene Map", self.smart_director_box)
-        self.check_smart_scene_map.setChecked(True)
-        self.check_smart_scene_map.setToolTip(
-            "Build a section-aware scene map before creating timeline segments.\n"
-            "When off, the classic beat/section arranger path is used as much as possible."
-        )
-        row_smart_enable.addWidget(self.check_smart_scene_map)
-        row_smart_enable.addStretch(1)
-        smart_lay.addLayout(row_smart_enable)
-
-        row_director = QHBoxLayout()
-        row_director.addWidget(QLabel("Director preset:", self.smart_director_box))
-        self.combo_director_preset = QComboBox(self.smart_director_box)
-        self.combo_director_preset.addItems(SMART_DIRECTOR_PRESETS)
-        try:
-            self.combo_director_preset.setCurrentText("Balanced")
-        except Exception:
-            self.combo_director_preset.setCurrentIndex(1)
-        self.combo_director_preset.setToolTip(
-            "Controls how strongly sections influence cut pacing, transitions and existing effects.\n"
-            "Manual / Classic is most restrained; DnB / Chaos is most aggressive."
-        )
-        row_director.addWidget(self.combo_director_preset, 1)
-        smart_lay.addLayout(row_director)
-
-        row_cut_style = QHBoxLayout()
-        row_cut_style.addWidget(QLabel("Scene length / cut style:", self.smart_director_box))
-        self.combo_scene_cut_style = QComboBox(self.smart_director_box)
-        self.combo_scene_cut_style.addItems(SMART_SCENE_CUT_STYLES)
-        self.combo_scene_cut_style.setCurrentIndex(0)
-        self.combo_scene_cut_style.setToolTip(
-            "Influences how beats are grouped into scenes before segments are generated.\n"
-            "Auto keeps the old beats-per-segment value as the base, then adapts per section."
-        )
-        row_cut_style.addWidget(self.combo_scene_cut_style, 1)
-        smart_lay.addLayout(row_cut_style)
-
-        row_cut_offset = QHBoxLayout()
-        row_cut_offset.addWidget(QLabel("Cut timing offset:", self.smart_director_box))
-        self.spin_smart_cut_timing_offset = QDoubleSpinBox(self.smart_director_box)
-        self.spin_smart_cut_timing_offset.setDecimals(2)
-        self.spin_smart_cut_timing_offset.setSingleStep(0.05)
-        self.spin_smart_cut_timing_offset.setRange(-1.00, 0.50)
-        self.spin_smart_cut_timing_offset.setValue(-0.35)
-        self.spin_smart_cut_timing_offset.setSuffix(" s")
-        self.spin_smart_cut_timing_offset.setToolTip(
-            "Moves smart scene cut points earlier or later. Negative values help EDM/drop cuts "
-            "hit exactly on the beat instead of feeling late. This only affects Smart Scene Map boundaries."
-        )
-        row_cut_offset.addWidget(self.spin_smart_cut_timing_offset)
-        row_cut_offset.addStretch(1)
-        smart_lay.addLayout(row_cut_offset)
-
-        row_guard_enable = QHBoxLayout()
-        self.check_smart_scene_duration_guard = QCheckBox("Use Smart Scene Duration Guard", self.smart_director_box)
-        self.check_smart_scene_duration_guard.setChecked(True)
-        self.check_smart_scene_duration_guard.setToolTip(
-            "Prevents messy analysis from creating tiny smart scenes and prevents overly long smart scenes\n"
-            "that can force 3–6 second source clips into unwanted slow motion or stretching.\n"
-            "Only affects Smart Scene Map mode; classic mode stays unchanged."
-        )
-        row_guard_enable.addWidget(self.check_smart_scene_duration_guard)
-        row_guard_enable.addStretch(1)
-        smart_lay.addLayout(row_guard_enable)
-
-        row_guard_min = QHBoxLayout()
-        row_guard_min.addWidget(QLabel("Minimum smart scene:", self.smart_director_box))
-        self.spin_smart_min_scene_len = QDoubleSpinBox(self.smart_director_box)
-        self.spin_smart_min_scene_len.setDecimals(1)
-        self.spin_smart_min_scene_len.setSingleStep(0.1)
-        self.spin_smart_min_scene_len.setRange(0.3, 10.0)
-        self.spin_smart_min_scene_len.setValue(2.0)
-        self.spin_smart_min_scene_len.setSuffix(" s")
-        self.spin_smart_min_scene_len.setToolTip(
-            "Smart scenes shorter than this are merged forward or backward before rendering.\n"
-            "This is the Smart Scene Map version of avoiding tiny throwaway cuts."
-        )
-        row_guard_min.addWidget(self.spin_smart_min_scene_len)
-        row_guard_min.addStretch(1)
-        smart_lay.addLayout(row_guard_min)
-
-        row_guard_max = QHBoxLayout()
-        row_guard_max.addWidget(QLabel("Maximum smart scene:", self.smart_director_box))
-        self.combo_smart_max_scene_mode = QComboBox(self.smart_director_box)
-        self.combo_smart_max_scene_mode.addItems(SMART_SCENE_MAX_MODES)
-        self.combo_smart_max_scene_mode.setCurrentIndex(0)
-        self.combo_smart_max_scene_mode.setToolTip(
-            "Auto uses the loaded source clip duration statistics to choose a safe max scene length.\n"
-            "Manual uses the seconds box. Off allows the director to create longer scenes."
-        )
-        row_guard_max.addWidget(self.combo_smart_max_scene_mode, 1)
-        self.spin_smart_max_scene_len = QDoubleSpinBox(self.smart_director_box)
-        self.spin_smart_max_scene_len.setDecimals(1)
-        self.spin_smart_max_scene_len.setSingleStep(0.5)
-        self.spin_smart_max_scene_len.setRange(0.5, 30.0)
-        self.spin_smart_max_scene_len.setValue(5.0)
-        self.spin_smart_max_scene_len.setSuffix(" s")
-        self.spin_smart_max_scene_len.setToolTip(
-            "Manual maximum smart scene length. Auto mode ignores this value and uses source clip stats."
-        )
-        row_guard_max.addWidget(self.spin_smart_max_scene_len)
-        smart_lay.addLayout(row_guard_max)
-
-        settings_main.addWidget(self.smart_director_box)
+        # This is now part of the optional LTX / Planner Bridge workflow.
+        # When the bridge is missing or broken, no Smart Director UI is created
+        # and the original ready-made-clip workflow stays on the classic cutter path.
+        self.smart_director_box = None
+        if ltx_workflow_main is not None:
+            self.smart_director_box = QGroupBox("Smart cutting / scene map", page_ltx_workflow)
+            smart_lay = QVBoxLayout(self.smart_director_box)
+            smart_lay.setContentsMargins(10, 8, 10, 8)
+            smart_lay.setSpacing(6)
+    
+            row_smart_enable = QHBoxLayout()
+            self.check_smart_scene_map = QCheckBox("Use Smart Scene Map", self.smart_director_box)
+            self.check_smart_scene_map.setChecked(True)
+            self.check_smart_scene_map.setToolTip(
+                "Build a section-aware scene map before creating timeline segments.\n"
+                "When off, the classic beat/section arranger path is used as much as possible."
+            )
+            row_smart_enable.addWidget(self.check_smart_scene_map)
+            row_smart_enable.addStretch(1)
+            smart_lay.addLayout(row_smart_enable)
+    
+            row_director = QHBoxLayout()
+            row_director.addWidget(QLabel("Director preset:", self.smart_director_box))
+            self.combo_director_preset = QComboBox(self.smart_director_box)
+            self.combo_director_preset.addItems(SMART_DIRECTOR_PRESETS)
+            try:
+                self.combo_director_preset.setCurrentText("Balanced")
+            except Exception:
+                self.combo_director_preset.setCurrentIndex(1)
+            self.combo_director_preset.setToolTip(
+                "Controls how strongly sections influence cut pacing, transitions and existing effects.\n"
+                "Manual / Classic is most restrained; DnB / Chaos is most aggressive."
+            )
+            row_director.addWidget(self.combo_director_preset, 1)
+            smart_lay.addLayout(row_director)
+    
+            row_cut_style = QHBoxLayout()
+            row_cut_style.addWidget(QLabel("Scene length / cut style:", self.smart_director_box))
+            self.combo_scene_cut_style = QComboBox(self.smart_director_box)
+            self.combo_scene_cut_style.addItems(SMART_SCENE_CUT_STYLES)
+            self.combo_scene_cut_style.setCurrentIndex(0)
+            self.combo_scene_cut_style.setToolTip(
+                "Influences how beats are grouped into scenes before segments are generated.\n"
+                "Auto keeps the old beats-per-segment value as the base, then adapts per section."
+            )
+            row_cut_style.addWidget(self.combo_scene_cut_style, 1)
+            smart_lay.addLayout(row_cut_style)
+    
+            row_cut_offset = QHBoxLayout()
+            row_cut_offset.addWidget(QLabel("Cut timing offset:", self.smart_director_box))
+            self.spin_smart_cut_timing_offset = QDoubleSpinBox(self.smart_director_box)
+            self.spin_smart_cut_timing_offset.setDecimals(2)
+            self.spin_smart_cut_timing_offset.setSingleStep(0.05)
+            self.spin_smart_cut_timing_offset.setRange(-1.00, 0.50)
+            self.spin_smart_cut_timing_offset.setValue(-0.35)
+            self.spin_smart_cut_timing_offset.setSuffix(" s")
+            self.spin_smart_cut_timing_offset.setToolTip(
+                "Moves smart scene cut points earlier or later. Negative values help EDM/drop cuts "
+                "hit exactly on the beat instead of feeling late. This only affects Smart Scene Map boundaries."
+            )
+            row_cut_offset.addWidget(self.spin_smart_cut_timing_offset)
+            row_cut_offset.addStretch(1)
+            smart_lay.addLayout(row_cut_offset)
+    
+            row_guard_enable = QHBoxLayout()
+            self.check_smart_scene_duration_guard = QCheckBox("Use Smart Scene Duration Guard", self.smart_director_box)
+            self.check_smart_scene_duration_guard.setChecked(True)
+            self.check_smart_scene_duration_guard.setToolTip(
+                "Prevents messy analysis from creating tiny smart scenes and prevents overly long smart scenes\n"
+                "that can force 3–6 second source clips into unwanted slow motion or stretching.\n"
+                "Only affects Smart Scene Map mode; classic mode stays unchanged."
+            )
+            row_guard_enable.addWidget(self.check_smart_scene_duration_guard)
+            row_guard_enable.addStretch(1)
+            smart_lay.addLayout(row_guard_enable)
+    
+            row_guard_min = QHBoxLayout()
+            row_guard_min.addWidget(QLabel("Minimum smart scene:", self.smart_director_box))
+            self.spin_smart_min_scene_len = QDoubleSpinBox(self.smart_director_box)
+            self.spin_smart_min_scene_len.setDecimals(1)
+            self.spin_smart_min_scene_len.setSingleStep(0.1)
+            self.spin_smart_min_scene_len.setRange(0.3, 10.0)
+            self.spin_smart_min_scene_len.setValue(2.0)
+            self.spin_smart_min_scene_len.setSuffix(" s")
+            self.spin_smart_min_scene_len.setToolTip(
+                "Smart scenes shorter than this are merged forward or backward before rendering.\n"
+                "This is the Smart Scene Map version of avoiding tiny throwaway cuts."
+            )
+            row_guard_min.addWidget(self.spin_smart_min_scene_len)
+            row_guard_min.addStretch(1)
+            smart_lay.addLayout(row_guard_min)
+    
+            row_guard_max = QHBoxLayout()
+            row_guard_max.addWidget(QLabel("Maximum smart scene:", self.smart_director_box))
+            self.combo_smart_max_scene_mode = QComboBox(self.smart_director_box)
+            self.combo_smart_max_scene_mode.addItems(SMART_SCENE_MAX_MODES)
+            self.combo_smart_max_scene_mode.setCurrentIndex(0)
+            self.combo_smart_max_scene_mode.setToolTip(
+                "Auto uses the loaded source clip duration statistics to choose a safe max scene length.\n"
+                "Manual uses the seconds box. Off allows the director to create longer scenes."
+            )
+            row_guard_max.addWidget(self.combo_smart_max_scene_mode, 1)
+            self.spin_smart_max_scene_len = QDoubleSpinBox(self.smart_director_box)
+            self.spin_smart_max_scene_len.setDecimals(1)
+            self.spin_smart_max_scene_len.setSingleStep(0.5)
+            self.spin_smart_max_scene_len.setRange(0.5, 30.0)
+            self.spin_smart_max_scene_len.setValue(5.0)
+            self.spin_smart_max_scene_len.setSuffix(" s")
+            self.spin_smart_max_scene_len.setToolTip(
+                "Manual maximum smart scene length. Auto mode ignores this value and uses source clip stats."
+            )
+            row_guard_max.addWidget(self.spin_smart_max_scene_len)
+            smart_lay.addLayout(row_guard_max)
+    
+            ltx_workflow_main.addWidget(self.smart_director_box)
 
         # Lyrics / SRT main switch: set-once behavior belongs in Settings.
         self.box_lyrics_srt_settings = QGroupBox("Lyrics / SRT", page_settings)
@@ -9392,37 +9883,479 @@ class AutoMusicSyncWidget(QWidget):
         lyrics_settings_lay.setContentsMargins(10, 8, 10, 8)
         lyrics_settings_lay.setSpacing(6)
         row_lyrics_enable = QHBoxLayout()
-        self.check_use_lyrics_srt_timing = QCheckBox("Use lyrics / SRT timing", self.box_lyrics_srt_settings)
+        self.check_use_lyrics_srt_timing = QCheckBox("Use lyrics / SRT timing for smarter cuts", self.box_lyrics_srt_settings)
         self.check_use_lyrics_srt_timing.setChecked(False)
         self.check_use_lyrics_srt_timing.setToolTip(
-            "Use a loaded SRT subtitle/lyrics file as timing information for the Smart Director. "
-            "This does not run Whisper; it only loads an existing SRT file."
+            "OFF = classic beat/clip cutting, allowing lots of smaller clips and transitions. "
+            "ON = loaded SRT/Whisper lyric timing can guide smarter vocal-aware cuts."
         )
         row_lyrics_enable.addWidget(self.check_use_lyrics_srt_timing)
         row_lyrics_enable.addStretch(1)
         lyrics_settings_lay.addLayout(row_lyrics_enable)
-        self.label_lyrics_srt_hint = QLabel("Load the SRT file on the Generation tab when this is enabled.", self.box_lyrics_srt_settings)
+        self.label_lyrics_srt_hint = QLabel("Load or create the SRT on the Generation tab. Leave this off for the old classic cutter behavior.", self.box_lyrics_srt_settings)
         self.label_lyrics_srt_hint.setWordWrap(True)
         lyrics_settings_lay.addWidget(self.label_lyrics_srt_hint)
         settings_main.addWidget(self.box_lyrics_srt_settings)
 
-        # microclip toggles
+        # Optional/private Planner bridge. The section is only created when the
+        # helper exists and imports cleanly, so public builds can omit the file.
+        self.box_planner_bridge = None
+        self.edit_bridge_main_idea = None
+        self.edit_bridge_style_theme = None
+        self.edit_bridge_characters_subjects = None
+        self.edit_bridge_locations_world = None
+        self.edit_bridge_camera_choreography = None
+        self.btn_bridge_load_character_reference = None
+        self.btn_bridge_clear_character_reference = None
+        self.label_bridge_character_reference_thumb = None
+        self.label_bridge_character_reference_path = None
+        self._planner_bridge_character_reference_sheet_path = ""
+        self._planner_bridge_character_reference_sheet_paths = {f"char_{i:02d}": "" for i in range(1, 6)}
+        self._planner_bridge_character_reference_widgets = {}
+        self.check_bridge_use_vocal_roles = None
+        self.combo_bridge_ltx_grouping_mode = None
+        self.check_bridge_ltx_export_audio_chunks = None
+        self.spin_bridge_ltx_fps = None
+        self.combo_bridge_director_backend = None
+        self.btn_export_planner_scene_plan = None
+        self.btn_create_planner_prompt_plan = None
+        self.btn_create_ltx_shot_plan = None
+        self.btn_create_ltx_director_plan = None
+        self.btn_start_new_planner_bridge_job = None
+        self.combo_ltx_single_shot = None
+        self.btn_refresh_ltx_single_shots = None
+        self.combo_ltx_single_image_mode = None
+        self.edit_ltx_single_start_image = None
+        self.btn_browse_ltx_single_start_image = None
+        self.row_ltx_single_start_image = None
+        self.check_ltx_single_use_lora = None
+        self.edit_ltx_single_lora_file = None
+        self.btn_browse_ltx_single_lora_file = None
+        self.edit_ltx_single_lora_json = None
+        self.btn_browse_ltx_single_lora_json = None
+        self.spin_ltx_single_lora_multiplier = None
+        self.btn_test_ltx_single_shot = None
+        self.label_planner_bridge_status = None
+        if getattr(self, "_planner_bridge", None) is not None and ltx_workflow_main is not None:
+            self.box_planner_bridge = QGroupBox("Planner Bridge / LTX workflow", page_ltx_workflow)
+            bridge_lay = QVBoxLayout(self.box_planner_bridge)
+            bridge_lay.setContentsMargins(10, 8, 10, 8)
+            bridge_lay.setSpacing(6)
+
+            bridge_hint = QLabel(
+                "Private generated-shot workflow: scene plans, prompt plans, LTX shot plans, "
+                "character references, generated start images, LTX tests, full LTX shot generation, and final assembly. "
+                "The normal ready-made-clip workflow stays on Generation/Settings.",
+                self.box_planner_bridge,
+            )
+            bridge_hint.setWordWrap(True)
+            bridge_lay.addWidget(bridge_hint)
+
+            bridge_form = QFormLayout()
+            bridge_form.setContentsMargins(0, 0, 0, 0)
+            bridge_form.setSpacing(6)
+
+            self.edit_bridge_main_idea = QLineEdit(self.box_planner_bridge)
+            self.edit_bridge_main_idea.setPlaceholderText("Example: neon alien funk music video")
+            bridge_form.addRow("Main idea / prompt:", self.edit_bridge_main_idea)
+
+            self.edit_bridge_style_theme = QLineEdit(self.box_planner_bridge)
+            self.edit_bridge_style_theme.setPlaceholderText("Example: colorful retro-future, cinematic, funny")
+            bridge_form.addRow("Style / theme:", self.edit_bridge_style_theme)
+
+            self.edit_bridge_characters_subjects = QLineEdit(self.box_planner_bridge)
+            self.edit_bridge_characters_subjects.setPlaceholderText("Example: singer, dancers, creatures, objects")
+            bridge_form.addRow("Characters / subjects:", self.edit_bridge_characters_subjects)
+
+            self.edit_bridge_locations_world = QLineEdit(self.box_planner_bridge)
+            self.edit_bridge_locations_world.setPlaceholderText("Example: club, desert road, underwater city")
+            bridge_form.addRow("Locations / world:", self.edit_bridge_locations_world)
+
+            self.edit_bridge_camera_choreography = QLineEdit(self.box_planner_bridge)
+            self.edit_bridge_camera_choreography.setPlaceholderText("Example: handheld dance shots, dolly pushes, POV moments")
+            bridge_form.addRow("Camera / choreography:", self.edit_bridge_camera_choreography)
+
+            bridge_lay.addLayout(bridge_form)
+
+            row_bridge_roles = QHBoxLayout()
+            self.check_bridge_use_vocal_roles = QCheckBox("Use vocal/non-vocal scene roles", self.box_planner_bridge)
+            self.check_bridge_use_vocal_roles.setChecked(True)
+            self.check_bridge_use_vocal_roles.setToolTip(
+                "Uses lyrics/SRT timing to decide when prompts should focus on singing/lipsync "
+                "versus action, dance, and b-roll. This only affects the exported prompt plan."
+            )
+            row_bridge_roles.addWidget(self.check_bridge_use_vocal_roles)
+            row_bridge_roles.addStretch(1)
+            bridge_lay.addLayout(row_bridge_roles)
+
+            ltx_effects_box = QGroupBox("Generated-shot planning effects", self.box_planner_bridge)
+            ltx_effects_lay = QVBoxLayout(ltx_effects_box)
+            ltx_effects_lay.setContentsMargins(10, 8, 10, 8)
+            ltx_effects_lay.setSpacing(6)
+            ltx_effects_hint = QLabel(
+                "These controls only affect Planner/LTX generated-shot planning. "
+                "They do not change the normal ready-made-clip video FX system.",
+                ltx_effects_box,
+            )
+            ltx_effects_hint.setWordWrap(True)
+            ltx_effects_lay.addWidget(ltx_effects_hint)
+
+            self.check_bridge_timestamped_microclips = QCheckBox("Use timestamped microclips", ltx_effects_box)
+            self.check_bridge_timestamped_microclips.setChecked(False)
+            self.check_bridge_timestamped_microclips.setToolTip(
+                "For the LTX bridge only: eligible EDM/DnB/Short shots can use quick sequential "
+                "full-frame timestamped beat cuts inside one practical LTX clip. This does not create collage/grid layouts."
+            )
+            ltx_effects_lay.addWidget(self.check_bridge_timestamped_microclips)
+
+            self.check_bridge_collage_effect = QCheckBox("Use collage effect", ltx_effects_box)
+            self.check_bridge_collage_effect.setChecked(False)
+            self.check_bridge_collage_effect.setToolTip(
+                "For the LTX bridge only: allows at most one rare mid-video collage/split-screen effect. "
+                "It is never used as normal microclip behavior and never used for start images."
+            )
+            ltx_effects_lay.addWidget(self.check_bridge_collage_effect)
+
+            row_bridge_effect_edges = QHBoxLayout()
+            row_bridge_effect_edges.setContentsMargins(0, 0, 0, 0)
+            row_bridge_effect_edges.setSpacing(6)
+            self.check_bridge_avoid_effects_first_clip = QCheckBox("Keep first generated shot clean", ltx_effects_box)
+            self.check_bridge_avoid_effects_first_clip.setChecked(True)
+            self.check_bridge_avoid_effects_first_clip.setToolTip("Keeps the first LTX/Planner generated shot clean and readable: no collage, montage burst, or aggressive microclip overload.")
+            row_bridge_effect_edges.addWidget(self.check_bridge_avoid_effects_first_clip)
+            self.check_bridge_avoid_effects_last_clip = QCheckBox("Keep last generated shot clean", ltx_effects_box)
+            self.check_bridge_avoid_effects_last_clip.setChecked(True)
+            self.check_bridge_avoid_effects_last_clip.setToolTip("Keeps the final LTX/Planner generated shot stable and clean: no collage, montage burst, or aggressive microclip overload.")
+            row_bridge_effect_edges.addWidget(self.check_bridge_avoid_effects_last_clip)
+            row_bridge_effect_edges.addStretch(1)
+            ltx_effects_lay.addLayout(row_bridge_effect_edges)
+            bridge_lay.addWidget(ltx_effects_box)
+
+            char_ref_box = QGroupBox("Character reference sheets", self.box_planner_bridge)
+            char_ref_lay = QVBoxLayout(char_ref_box)
+            char_ref_lay.setContentsMargins(10, 8, 10, 8)
+            char_ref_lay.setSpacing(6)
+            char_ref_hint = QLabel(
+                "Optional: load reference sheets for the main character(s). For HiDream multi-reference, each character sheet should show exactly one recurring character only. "
+                "Do not use a sheet with multiple people in a character slot. Best results: clear face, sharp image, front/side/three-quarter/full-body views, "
+                "consistent outfit, no blur, no tiny faces, no text, and no collage layout copied into the final image. "
+                "Optional global/group sheet is kept as context only for now; use separate one-person sheets for each character. Group images are better handled later by HiDream image-edit workflow, not this multi-reference workflow.",
+                char_ref_box,
+            )
+            char_ref_hint.setWordWrap(True)
+            char_ref_lay.addWidget(char_ref_hint)
+            char_ref_row = QHBoxLayout()
+            char_ref_row.setContentsMargins(0, 0, 0, 0)
+            char_ref_row.setSpacing(8)
+            self.label_bridge_character_reference_thumb = QLabel("No reference\nsheet", char_ref_box)
+            self.label_bridge_character_reference_thumb.setAlignment(Qt.AlignCenter)
+            self.label_bridge_character_reference_thumb.setMinimumSize(128, 80)
+            self.label_bridge_character_reference_thumb.setMaximumSize(180, 110)
+            self.label_bridge_character_reference_thumb.setStyleSheet("border: 1px solid rgba(128,128,128,120); border-radius: 4px; padding: 4px;")
+            self.label_bridge_character_reference_thumb.setToolTip("Click to preview the loaded character reference sheet.")
+            try:
+                self.label_bridge_character_reference_thumb.mousePressEvent = lambda _ev: self._on_preview_bridge_character_reference_sheet()
+            except Exception:
+                pass
+            char_ref_row.addWidget(self.label_bridge_character_reference_thumb)
+            char_ref_buttons = QVBoxLayout()
+            self.btn_bridge_load_character_reference = QPushButton("Load global/group reference", char_ref_box)
+            self.btn_bridge_clear_character_reference = QPushButton("Clear global/group reference", char_ref_box)
+            char_ref_buttons.addWidget(self.btn_bridge_load_character_reference)
+            char_ref_buttons.addWidget(self.btn_bridge_clear_character_reference)
+            self.label_bridge_character_reference_path = QLabel("Loaded: none", char_ref_box)
+            self.label_bridge_character_reference_path.setWordWrap(True)
+            char_ref_buttons.addWidget(self.label_bridge_character_reference_path)
+            char_ref_buttons.addStretch(1)
+            char_ref_row.addLayout(char_ref_buttons, 1)
+            char_ref_lay.addLayout(char_ref_row)
+
+            self._planner_bridge_character_reference_widgets = getattr(self, "_planner_bridge_character_reference_widgets", {}) or {}
+            self._planner_bridge_character_reference_widgets["global"] = {
+                "thumb": self.label_bridge_character_reference_thumb,
+                "label": self.label_bridge_character_reference_path,
+            }
+            for _idx in range(1, 6):
+                _slot = f"char_{_idx:02d}"
+                _row = QHBoxLayout()
+                _row.setContentsMargins(0, 0, 0, 0)
+                _row.setSpacing(8)
+                _thumb = QLabel(f"Reference {_idx}\nnone", char_ref_box)
+                _thumb.setAlignment(Qt.AlignCenter)
+                _thumb.setMinimumSize(96, 62)
+                _thumb.setMaximumSize(132, 82)
+                _thumb.setStyleSheet("border: 1px solid rgba(128,128,128,100); border-radius: 4px; padding: 3px;")
+                _thumb.setToolTip(f"Click to preview Reference {_idx} sheet.")
+                try:
+                    _thumb.mousePressEvent = (lambda _ev, slot=_slot: self._on_preview_bridge_character_reference_sheet(slot))
+                except Exception:
+                    pass
+                _row.addWidget(_thumb)
+                _buttons = QVBoxLayout()
+                _load = QPushButton(f"Load Reference {_idx} sheet", char_ref_box)
+                _clear = QPushButton("Clear", char_ref_box)
+                _label = QLabel("Loaded: none", char_ref_box)
+                _label.setWordWrap(True)
+                _buttons.addWidget(_load)
+                _buttons.addWidget(_clear)
+                _buttons.addWidget(_label)
+                _row.addLayout(_buttons, 1)
+                self._planner_bridge_character_reference_widgets[_slot] = {"thumb": _thumb, "label": _label, "load": _load, "clear": _clear}
+                char_ref_lay.addLayout(_row)
+            bridge_lay.addWidget(char_ref_box)
+
+            ltx_box = QGroupBox("LTX test planning", self.box_planner_bridge)
+            ltx_lay = QVBoxLayout(ltx_box)
+            ltx_lay.setContentsMargins(10, 8, 10, 8)
+            ltx_lay.setSpacing(6)
+            ltx_hint = QLabel(
+                "Creates a smaller LTX shot plan from the prompt plan. "
+                "This only writes JSON and optional WAV chunks; it does not run Planner, LTX, image generation or rendering.",
+                ltx_box,
+            )
+            ltx_hint.setWordWrap(True)
+            ltx_lay.addWidget(ltx_hint)
+
+            ltx_form = QFormLayout()
+            ltx_form.setContentsMargins(0, 0, 0, 0)
+            ltx_form.setSpacing(6)
+            self.combo_bridge_ltx_grouping_mode = QComboBox(ltx_box)
+            self.combo_bridge_ltx_grouping_mode.addItems(["Auto", "No grouping"])
+            self.combo_bridge_ltx_grouping_mode.setToolTip(
+                "Auto merges short Music Clip Creator scenes into fewer 6-10 second LTX test shots. "
+                "No grouping keeps one LTX shot per source scene."
+            )
+            ltx_form.addRow("Grouping:", self.combo_bridge_ltx_grouping_mode)
+
+            self.spin_bridge_ltx_fps = QSpinBox(ltx_box)
+            self.spin_bridge_ltx_fps.setRange(1, 120)
+            self.spin_bridge_ltx_fps.setValue(24)
+            self.spin_bridge_ltx_fps.setToolTip("Target FPS used only for the saved target_frames sync estimate.")
+            ltx_form.addRow("Target FPS:", self.spin_bridge_ltx_fps)
+
+            self.combo_bridge_director_backend = QComboBox(ltx_box)
+            self.combo_bridge_director_backend.addItems(["Template cleanup", "Local LLM / Planner-style"])
+            self.combo_bridge_director_backend.setToolTip(
+                "Chooses how Create LTX director plan rewrites the grouped LTX shot prompts. "
+                "Template cleanup is always available. Local LLM reads existing Planner own-llama settings if enabled, "
+                "and falls back per shot/batch without starting Planner or LTX."
+            )
+            ltx_form.addRow("Director brain:", self.combo_bridge_director_backend)
+            ltx_lay.addLayout(ltx_form)
+
+            row_ltx_opts = QHBoxLayout()
+            self.check_bridge_ltx_export_audio_chunks = QCheckBox("Export audio chunks for LTX lipsync", ltx_box)
+            self.check_bridge_ltx_export_audio_chunks.setChecked(True)
+            self.check_bridge_ltx_export_audio_chunks.setToolTip(
+                "Exports audio_chunks/LTX01.wav, LTX02.wav, etc. from the original full song. "
+                "The final master audio remains the original song."
+            )
+            row_ltx_opts.addWidget(self.check_bridge_ltx_export_audio_chunks)
+            row_ltx_opts.addStretch(1)
+            ltx_lay.addLayout(row_ltx_opts)
+
+            bridge_lay.addWidget(ltx_box)
+
+            ltx_single_box = QGroupBox("LTX Single Shot Test", self.box_planner_bridge)
+            ltx_single_lay = QVBoxLayout(ltx_single_box)
+            ltx_single_lay.setContentsMargins(10, 8, 10, 8)
+            ltx_single_lay.setSpacing(6)
+            ltx_single_hint = QLabel(
+                "Test one selected LTX director shot with image-to-video. "
+                "This does not create a full music video or touch the normal render pipeline.",
+                ltx_single_box,
+            )
+            ltx_single_hint.setWordWrap(True)
+            ltx_single_lay.addWidget(ltx_single_hint)
+
+            ltx_single_form = QFormLayout()
+            ltx_single_form.setContentsMargins(0, 0, 0, 0)
+            ltx_single_form.setSpacing(6)
+
+            self.combo_ltx_single_shot = QComboBox(ltx_single_box)
+            self.combo_ltx_single_shot.setToolTip("Shots are loaded from musicclip_ltx_director_plan.json.")
+            ltx_single_form.addRow("Shot:", self.combo_ltx_single_shot)
+
+            self.combo_ltx_single_image_mode = QComboBox(ltx_single_box)
+            self.combo_ltx_single_image_mode.addItem("Use existing start image", "existing")
+            self.combo_ltx_single_image_mode.addItem("Z-Image Turbo", "z_image")
+            self.combo_ltx_single_image_mode.addItem("Flux Klein 9B", "flux_klein_9b")
+            self.combo_ltx_single_image_mode.addItem("HiDream", "hidream")
+            self.combo_ltx_single_image_mode.setToolTip("Use an existing image, or generate one start image for the selected shot. Flux Klein 9B, Z-Image Turbo, and HiDream are wired for single-shot start-image generation.")
+            ltx_single_form.addRow("Start image mode:", self.combo_ltx_single_image_mode)
+
+            self.row_ltx_single_start_image = QWidget(ltx_single_box)
+            row_start_img = QHBoxLayout(self.row_ltx_single_start_image)
+            row_start_img.setContentsMargins(0, 0, 0, 0)
+            row_start_img.setSpacing(6)
+            self.edit_ltx_single_start_image = QLineEdit(self.row_ltx_single_start_image)
+            self.edit_ltx_single_start_image.setPlaceholderText("Path to manually created start image")
+            self.btn_browse_ltx_single_start_image = QPushButton("Browse", self.row_ltx_single_start_image)
+            row_start_img.addWidget(self.edit_ltx_single_start_image, 1)
+            row_start_img.addWidget(self.btn_browse_ltx_single_start_image)
+            ltx_single_form.addRow("Existing start image:", self.row_ltx_single_start_image)
+
+            self.edit_ltx_generated_start_image = QLineEdit(ltx_single_box)
+            self.edit_ltx_generated_start_image.setReadOnly(True)
+            self.edit_ltx_generated_start_image.setPlaceholderText("Generated start image path appears here")
+            ltx_single_form.addRow("Generated start image:", self.edit_ltx_generated_start_image)
+            ltx_single_lay.addLayout(ltx_single_form)
+
+            row_ltx_start_gen = QHBoxLayout()
+            self.btn_generate_ltx_start_image = QPushButton("Generate start image for selected shot", ltx_single_box)
+            self.check_ltx_use_generated_start_image = QCheckBox("Use generated start image for LTX test", ltx_single_box)
+            self.check_ltx_use_generated_start_image.setChecked(True)
+            self.check_ltx_use_generated_start_image.setToolTip("When enabled, the LTX test button uses the generated image path instead of requiring a ready-made image.")
+            row_ltx_start_gen.addWidget(self.btn_generate_ltx_start_image)
+            row_ltx_start_gen.addWidget(self.check_ltx_use_generated_start_image)
+            row_ltx_start_gen.addStretch(1)
+            ltx_single_lay.addLayout(row_ltx_start_gen)
+
+            row_lora_toggle = QHBoxLayout()
+            self.check_ltx_single_use_lora = QCheckBox("Use LTX LoRA", ltx_single_box)
+            self.check_ltx_single_use_lora.setChecked(False)
+            self.check_ltx_single_use_lora.setToolTip("Optional for testing one shot. Leave off for the plain image-to-video test.")
+            row_lora_toggle.addWidget(self.check_ltx_single_use_lora)
+            row_lora_toggle.addStretch(1)
+            ltx_single_lay.addLayout(row_lora_toggle)
+
+            lora_form = QFormLayout()
+            lora_form.setContentsMargins(0, 0, 0, 0)
+            lora_form.setSpacing(6)
+            row_lora_file = QWidget(ltx_single_box)
+            row_lora_file_lay = QHBoxLayout(row_lora_file)
+            row_lora_file_lay.setContentsMargins(0, 0, 0, 0)
+            row_lora_file_lay.setSpacing(6)
+            self.edit_ltx_single_lora_file = QLineEdit(row_lora_file)
+            self.edit_ltx_single_lora_file.setPlaceholderText("Optional .safetensors LoRA")
+            self.btn_browse_ltx_single_lora_file = QPushButton("Browse", row_lora_file)
+            row_lora_file_lay.addWidget(self.edit_ltx_single_lora_file, 1)
+            row_lora_file_lay.addWidget(self.btn_browse_ltx_single_lora_file)
+            lora_form.addRow("LoRA file:", row_lora_file)
+
+            row_lora_json = QWidget(ltx_single_box)
+            row_lora_json_lay = QHBoxLayout(row_lora_json)
+            row_lora_json_lay.setContentsMargins(0, 0, 0, 0)
+            row_lora_json_lay.setSpacing(6)
+            self.edit_ltx_single_lora_json = QLineEdit(row_lora_json)
+            self.edit_ltx_single_lora_json.setPlaceholderText("Optional LoRA / transition JSON")
+            self.btn_browse_ltx_single_lora_json = QPushButton("Browse", row_lora_json)
+            row_lora_json_lay.addWidget(self.edit_ltx_single_lora_json, 1)
+            row_lora_json_lay.addWidget(self.btn_browse_ltx_single_lora_json)
+            lora_form.addRow("LoRA JSON:", row_lora_json)
+
+            self.spin_ltx_single_lora_multiplier = QDoubleSpinBox(ltx_single_box)
+            self.spin_ltx_single_lora_multiplier.setRange(0.0, 10.0)
+            self.spin_ltx_single_lora_multiplier.setSingleStep(0.05)
+            self.spin_ltx_single_lora_multiplier.setDecimals(2)
+            self.spin_ltx_single_lora_multiplier.setValue(1.0)
+            lora_form.addRow("LoRA multiplier:", self.spin_ltx_single_lora_multiplier)
+            ltx_single_lay.addLayout(lora_form)
+
+            row_ltx_single_actions = QHBoxLayout()
+            self.btn_refresh_ltx_single_shots = QPushButton("Refresh LTX shots", ltx_single_box)
+            self.btn_test_ltx_single_shot = QPushButton("Test selected LTX shot", ltx_single_box)
+            self.btn_generate_all_ltx_shots = QPushButton("Generate all LTX shots", ltx_single_box)
+            self.check_ltx_full_skip_completed = QCheckBox("Skip completed shots", ltx_single_box)
+            self.check_ltx_full_skip_completed.setChecked(True)
+            self.check_ltx_full_skip_completed.setToolTip("If a trimmed clip already exists in the current full-run folder, skip that shot.")
+            self.check_ltx_full_trim_clips = QCheckBox("Trim clips to timeline duration", ltx_single_box)
+            self.check_ltx_full_trim_clips.setChecked(True)
+            self.check_ltx_full_trim_clips.setToolTip("Creates sync-safe trimmed clips using the shot-plan duration.")
+            self.btn_cancel_all_ltx_shots = QPushButton("Cancel generation", ltx_single_box)
+            self.btn_cancel_all_ltx_shots.setEnabled(False)
+            self.btn_assemble_ltx_music_video = QPushButton("Assemble LTX music video", ltx_single_box)
+            self.btn_assemble_ltx_music_video.setToolTip(
+                "Creates final assembly from an existing ltx_full_run folder. "
+                "Each generated LTX video is retimed to its song timeline duration, then the original full music track is used as master audio."
+            )
+            row_ltx_single_actions.addWidget(self.btn_refresh_ltx_single_shots)
+            row_ltx_single_actions.addWidget(self.btn_test_ltx_single_shot)
+            row_ltx_single_actions.addWidget(self.btn_generate_all_ltx_shots)
+            row_ltx_single_actions.addWidget(self.btn_cancel_all_ltx_shots)
+            row_ltx_single_actions.addWidget(self.btn_assemble_ltx_music_video)
+            row_ltx_single_actions.addStretch(1)
+            ltx_single_lay.addLayout(row_ltx_single_actions)
+            row_ltx_full_opts = QHBoxLayout()
+            row_ltx_full_opts.addWidget(self.check_ltx_full_skip_completed)
+            row_ltx_full_opts.addWidget(self.check_ltx_full_trim_clips)
+            row_ltx_full_opts.addStretch(1)
+            ltx_single_lay.addLayout(row_ltx_full_opts)
+            bridge_lay.addWidget(ltx_single_box)
+
+            row_bridge_actions = QHBoxLayout()
+            self.btn_start_new_planner_bridge_job = QPushButton("Start New Job", self.box_planner_bridge)
+            self.btn_start_new_planner_bridge_job.setToolTip(
+                "Clears cached Planner Bridge plan paths and starts fresh from the current music, prompts, references and settings. "
+                "Use this when changing story/idea while keeping the same music track."
+            )
+            row_bridge_actions.addWidget(self.btn_start_new_planner_bridge_job)
+            self.btn_export_planner_scene_plan = QPushButton("Export scene plan for Planner", self.box_planner_bridge)
+            self.btn_export_planner_scene_plan.setToolTip(
+                "Writes a JSON scene plan from the current Smart Scene Map, SRT lyrics and creative brief. "
+                "It does not render, queue, run Planner, run LTX or call an LLM."
+            )
+            row_bridge_actions.addWidget(self.btn_export_planner_scene_plan)
+            self.btn_create_planner_prompt_plan = QPushButton("Create prompt plan", self.box_planner_bridge)
+            self.btn_create_planner_prompt_plan.setToolTip(
+                "Creates musicclip_prompt_plan.json from the exported scene plan. "
+                "This uses the private bridge template backend only; it does not run Planner, LTX, rendering or queue jobs."
+            )
+            row_bridge_actions.addWidget(self.btn_create_planner_prompt_plan)
+            self.btn_create_ltx_shot_plan = QPushButton("Create LTX shot plan", self.box_planner_bridge)
+            self.btn_create_ltx_shot_plan.setToolTip(
+                "Creates musicclip_ltx_shot_plan.json from an existing prompt plan. "
+                "It can also export per-shot WAV chunks for private LTX lipsync testing. It never starts LTX."
+            )
+            row_bridge_actions.addWidget(self.btn_create_ltx_shot_plan)
+
+            self.btn_create_ltx_director_plan = QPushButton("Create LTX director plan", self.box_planner_bridge)
+            self.btn_create_ltx_director_plan.setToolTip(
+                "Creates musicclip_ltx_director_plan.json from an existing LTX shot plan. "
+                "This only rewrites/cleans prompt text; it does not start Planner, LTX, image generation, rendering or queue jobs."
+            )
+            row_bridge_actions.addWidget(self.btn_create_ltx_director_plan)
+            row_bridge_actions.addStretch(1)
+            bridge_lay.addLayout(row_bridge_actions)
+
+            self.label_planner_bridge_status = QLabel("Planner Bridge: ready", self.box_planner_bridge)
+            self.label_planner_bridge_status.setWordWrap(True)
+            bridge_lay.addWidget(self.label_planner_bridge_status)
+
+            ltx_workflow_main.addWidget(self.box_planner_bridge)
+            ltx_workflow_main.addStretch(1)
+
+        # Original ready-made-clip microclips. Keep this on the Generation tab
+        # with the normal Effects controls, not in Settings/Advanced Beat Settings.
+        self.check_micro_enable = QCheckBox("Use microclips", self.box_effects)
+        self.check_micro_enable.setToolTip(
+            "Enable very short beat-cut clips in the original ready-made-clip workflow.\n"
+            "When OFF, the classic cutter uses normal segment lengths."
+        )
+        effects_lay.addWidget(self.check_micro_enable)
+
+        self.micro_options = QWidget(self.box_effects)
+        micro_layout = QVBoxLayout(self.micro_options)
+        micro_layout.setContentsMargins(26, 0, 0, 0)
+        micro_layout.setSpacing(2)
         row_micro = QHBoxLayout()
-        self.check_micro_chorus = QCheckBox("Microclips in chorus/drops only", self)
+        row_micro.setContentsMargins(0, 0, 0, 0)
+        row_micro.setSpacing(6)
+        self.check_micro_chorus = QCheckBox("Microclips in chorus/drops only", self.micro_options)
         self.check_micro_chorus.setToolTip(
             "Short energetic microclips only during high-energy sections\n"
             "(chorus / drops). Verses and intros stay calmer."
         )
         row_micro.addWidget(self.check_micro_chorus)
 
-        self.check_micro_all = QCheckBox("Microclips for the whole track", self)
+        self.check_micro_all = QCheckBox("Microclips for the whole track", self.micro_options)
         self.check_micro_all.setToolTip(
             "Microclips are used throughout the entire song. Great with many\n"
             "short clips; can feel hyperactive on a single long video."
         )
         row_micro.addWidget(self.check_micro_all)
 
-        self.check_micro_verses = QCheckBox("Verses only", self)
+        self.check_micro_verses = QCheckBox("Verses only", self.micro_options)
         self.check_micro_verses.setToolTip(
             "Microclips are used only during verse sections. Choruses, drops\n"
             "and other parts of the song use longer, calmer shots."
@@ -9430,7 +10363,9 @@ class AutoMusicSyncWidget(QWidget):
         row_micro.addWidget(self.check_micro_verses)
 
         row_micro.addStretch(1)
-        adv.addRow("Microclips:", row_micro)
+        micro_layout.addLayout(row_micro)
+        effects_lay.addWidget(self.micro_options)
+        self.micro_options.setVisible(False)
 
         # full-length mode (hidden, always enabled internally)
         self.check_full_length = QCheckBox("Always fill full music length", self)
@@ -10681,6 +11616,8 @@ class AutoMusicSyncWidget(QWidget):
             tl.addWidget(lbl)
             tl.addStretch(1)
         self.tabs.addTab(self.timeline_panel, "Timeline")
+        if page_ltx_workflow is not None:
+            self.tabs.addTab(page_ltx_workflow, "LTX workflow")
         self.tabs.addTab(page_settings, "Settings")
 
         # Preset manager safety: the UI is now split across Generation + Settings,
@@ -10691,6 +11628,8 @@ class AutoMusicSyncWidget(QWidget):
             self.smart_director_box,
             self.box_adv,
         ]
+        if getattr(self, "box_planner_bridge", None) is not None:
+            self._preset_capture_roots.append(self.box_planner_bridge)
 
         # Connect mini-timeline actions to this widget (if available)
         if TimelinePanel is not None and isinstance(self.timeline_panel, TimelinePanel):
@@ -10732,10 +11671,18 @@ class AutoMusicSyncWidget(QWidget):
         self.btn_check_timeline.clicked.connect(self._on_check_timeline)
         btn_manage_trans.clicked.connect(self._on_manage_transitions)
 
+        try:
+            self.check_micro_enable.toggled.connect(self._on_micro_enable_toggled)
+        except Exception:
+            pass
         self.check_micro_chorus.stateChanged.connect(self._on_micro_mode_changed)
         self.check_micro_all.stateChanged.connect(self._on_micro_mode_changed)
         if hasattr(self, "check_micro_verses"):
             self.check_micro_verses.stateChanged.connect(self._on_micro_mode_changed)
+        try:
+            self._on_micro_enable_toggled(bool(self.check_micro_enable.isChecked()))
+        except Exception:
+            pass
         self.check_use_seed.stateChanged.connect(self._on_seed_toggle)
         self.check_trans_random.stateChanged.connect(self._on_trans_random_toggled)
         self.check_slow_enable.stateChanged.connect(self._on_slow_toggle)
@@ -10759,6 +11706,86 @@ class AutoMusicSyncWidget(QWidget):
             self.btn_load_srt.clicked.connect(self._on_load_srt_clicked)
             self.btn_clear_srt.clicked.connect(self._on_clear_srt_clicked)
             self._update_lyrics_srt_ui()
+        except Exception:
+            pass
+
+        # Optional Planner Bridge controls. This block is skipped completely when
+        # helpers/musicclip_planner_bridge.py is not present or failed to load.
+        try:
+            if getattr(self, "btn_start_new_planner_bridge_job", None) is not None:
+                self.btn_start_new_planner_bridge_job.clicked.connect(self._on_start_new_planner_bridge_job_clicked)
+            if getattr(self, "btn_export_planner_scene_plan", None) is not None:
+                self.btn_export_planner_scene_plan.clicked.connect(self._on_export_planner_scene_plan_clicked)
+            if getattr(self, "btn_create_planner_prompt_plan", None) is not None:
+                self.btn_create_planner_prompt_plan.clicked.connect(self._on_create_planner_prompt_plan_clicked)
+            if getattr(self, "btn_create_ltx_shot_plan", None) is not None:
+                self.btn_create_ltx_shot_plan.clicked.connect(self._on_create_ltx_shot_plan_clicked)
+            if getattr(self, "btn_create_ltx_director_plan", None) is not None:
+                self.btn_create_ltx_director_plan.clicked.connect(self._on_create_ltx_director_plan_clicked)
+            for _w in (
+                getattr(self, "edit_bridge_main_idea", None),
+                getattr(self, "edit_bridge_style_theme", None),
+                getattr(self, "edit_bridge_characters_subjects", None),
+                getattr(self, "edit_bridge_locations_world", None),
+                getattr(self, "edit_bridge_camera_choreography", None),
+            ):
+                if _w is not None:
+                    _w.editingFinished.connect(self._save_settings)
+            if getattr(self, "check_bridge_use_vocal_roles", None) is not None:
+                self.check_bridge_use_vocal_roles.toggled.connect(self._save_settings)
+            if getattr(self, "btn_bridge_load_character_reference", None) is not None:
+                self.btn_bridge_load_character_reference.clicked.connect(lambda _checked=False: self._on_load_bridge_character_reference_sheet("global"))
+            if getattr(self, "btn_bridge_clear_character_reference", None) is not None:
+                self.btn_bridge_clear_character_reference.clicked.connect(lambda _checked=False: self._on_clear_bridge_character_reference_sheet("global"))
+            try:
+                for _slot, _widgets in (getattr(self, "_planner_bridge_character_reference_widgets", {}) or {}).items():
+                    if _slot == "global":
+                        continue
+                    _load = _widgets.get("load") if isinstance(_widgets, dict) else None
+                    _clear = _widgets.get("clear") if isinstance(_widgets, dict) else None
+                    if _load is not None:
+                        _load.clicked.connect(lambda _checked=False, slot=_slot: self._on_load_bridge_character_reference_sheet(slot))
+                    if _clear is not None:
+                        _clear.clicked.connect(lambda _checked=False, slot=_slot: self._on_clear_bridge_character_reference_sheet(slot))
+            except Exception:
+                pass
+            if getattr(self, "combo_bridge_ltx_grouping_mode", None) is not None:
+                self.combo_bridge_ltx_grouping_mode.currentTextChanged.connect(lambda _v: self._save_settings())
+            if getattr(self, "check_bridge_ltx_export_audio_chunks", None) is not None:
+                self.check_bridge_ltx_export_audio_chunks.toggled.connect(self._save_settings)
+            if getattr(self, "spin_bridge_ltx_fps", None) is not None:
+                self.spin_bridge_ltx_fps.valueChanged.connect(lambda _v: self._save_settings())
+            for _w in (
+                getattr(self, "check_bridge_timestamped_microclips", None),
+                getattr(self, "check_bridge_collage_effect", None),
+                getattr(self, "check_bridge_avoid_effects_first_clip", None),
+                getattr(self, "check_bridge_avoid_effects_last_clip", None),
+            ):
+                if _w is not None:
+                    _w.toggled.connect(self._save_settings)
+            if getattr(self, "btn_refresh_ltx_single_shots", None) is not None:
+                self.btn_refresh_ltx_single_shots.clicked.connect(self._refresh_ltx_single_shots)
+            if getattr(self, "combo_ltx_single_shot", None) is not None:
+                self.combo_ltx_single_shot.currentIndexChanged.connect(self._on_ltx_single_shot_selection_changed)
+            if getattr(self, "btn_test_ltx_single_shot", None) is not None:
+                self.btn_test_ltx_single_shot.clicked.connect(self._on_test_ltx_single_shot_clicked)
+            if getattr(self, "btn_generate_all_ltx_shots", None) is not None:
+                self.btn_generate_all_ltx_shots.clicked.connect(self._on_generate_all_ltx_shots_clicked)
+            if getattr(self, "btn_cancel_all_ltx_shots", None) is not None:
+                self.btn_cancel_all_ltx_shots.clicked.connect(self._on_cancel_all_ltx_shots_clicked)
+            if getattr(self, "btn_assemble_ltx_music_video", None) is not None:
+                self.btn_assemble_ltx_music_video.clicked.connect(self._on_assemble_ltx_music_video_clicked)
+            if getattr(self, "btn_generate_ltx_start_image", None) is not None:
+                self.btn_generate_ltx_start_image.clicked.connect(self._on_generate_ltx_start_image_clicked)
+            if getattr(self, "combo_ltx_single_image_mode", None) is not None:
+                self.combo_ltx_single_image_mode.currentIndexChanged.connect(lambda _v: self._update_ltx_single_image_mode_ui())
+                self._update_ltx_single_image_mode_ui()
+            if getattr(self, "btn_browse_ltx_single_start_image", None) is not None:
+                self.btn_browse_ltx_single_start_image.clicked.connect(self._on_browse_ltx_single_start_image_clicked)
+            if getattr(self, "btn_browse_ltx_single_lora_file", None) is not None:
+                self.btn_browse_ltx_single_lora_file.clicked.connect(self._on_browse_ltx_single_lora_file_clicked)
+            if getattr(self, "btn_browse_ltx_single_lora_json", None) is not None:
+                self.btn_browse_ltx_single_lora_json.clicked.connect(self._on_browse_ltx_single_lora_json_clicked)
         except Exception:
             pass
 
@@ -11554,6 +12581,1805 @@ class AutoMusicSyncWidget(QWidget):
         """Keep the transitions row in sync with the 'Random transitions' toggle."""
         self._update_transition_visibility()
 
+    def _planner_bridge_text(self, attr_name: str) -> str:
+        try:
+            w = getattr(self, attr_name, None)
+            if w is not None and hasattr(w, "text"):
+                return str(w.text() or "").strip()
+        except Exception:
+            pass
+        return ""
+
+
+    def _planner_bridge_reference_path_valid(self, path: str) -> bool:
+        try:
+            p = str(path or "").strip().strip('"')
+            if not p or not os.path.isfile(p):
+                return False
+            return os.path.splitext(p)[1].lower() in (".png", ".jpg", ".jpeg", ".webp", ".bmp", ".tif", ".tiff")
+        except Exception:
+            return False
+
+    def _planner_bridge_character_reference_slot_keys(self) -> list:
+        return [f"char_{i:02d}" for i in range(1, 6)]
+
+    def _planner_bridge_character_reference_path_for_slot(self, slot: str) -> str:
+        slot = str(slot or "global")
+        if slot == "global":
+            return str(getattr(self, "_planner_bridge_character_reference_sheet_path", "") or "").strip()
+        paths = getattr(self, "_planner_bridge_character_reference_sheet_paths", None)
+        if not isinstance(paths, dict):
+            paths = {f"char_{i:02d}": "" for i in range(1, 6)}
+            self._planner_bridge_character_reference_sheet_paths = paths
+        return str(paths.get(slot, "") or "").strip()
+
+    def _planner_bridge_set_character_reference_path(self, slot: str, path: str) -> None:
+        slot = str(slot or "global")
+        if slot == "global":
+            self._planner_bridge_character_reference_sheet_path = str(path or "")
+            return
+        paths = getattr(self, "_planner_bridge_character_reference_sheet_paths", None)
+        if not isinstance(paths, dict):
+            paths = {f"char_{i:02d}": "" for i in range(1, 6)}
+            self._planner_bridge_character_reference_sheet_paths = paths
+        paths[slot] = str(path or "")
+
+    def _update_bridge_character_reference_ui(self) -> None:
+        slots = ["global"] + self._planner_bridge_character_reference_slot_keys()
+        widgets_all = getattr(self, "_planner_bridge_character_reference_widgets", {}) or {}
+        # Backward-compatible fallback for the existing global widgets.
+        if "global" not in widgets_all:
+            widgets_all["global"] = {
+                "thumb": getattr(self, "label_bridge_character_reference_thumb", None),
+                "label": getattr(self, "label_bridge_character_reference_path", None),
+            }
+        for slot in slots:
+            path = self._planner_bridge_character_reference_path_for_slot(slot)
+            widgets = widgets_all.get(slot, {}) if isinstance(widgets_all, dict) else {}
+            thumb = widgets.get("thumb") if isinstance(widgets, dict) else None
+            label = widgets.get("label") if isinstance(widgets, dict) else None
+            valid = self._planner_bridge_reference_path_valid(path)
+            name = "Global / group context" if slot == "global" else f"Character {int(slot[-2:])} — one person only"
+            try:
+                if thumb is not None:
+                    thumb.clear()
+                    if valid:
+                        pm = QPixmap(path)
+                        if not pm.isNull():
+                            thumb.setPixmap(pm.scaled(168, 96, Qt.KeepAspectRatio, Qt.SmoothTransformation))
+                        else:
+                            thumb.setText("Preview\nnot available")
+                        thumb.setToolTip(f"Click to preview {name} reference sheet:\n{path}")
+                    elif path:
+                        thumb.setText("Missing\nreference")
+                        thumb.setToolTip(f"Saved {name} reference sheet was not found:\n{path}")
+                    else:
+                        thumb.setText(("No group\nreference" if slot == "global" else f"Character {int(slot[-2:])}\nnone"))
+                        thumb.setToolTip(f"Click after loading to preview the {name} reference sheet.")
+            except Exception:
+                pass
+            try:
+                if label is not None:
+                    if valid:
+                        label.setText(f"Loaded: {os.path.basename(path)}")
+                        label.setToolTip(path)
+                    elif path:
+                        label.setText(f"Loaded: missing file — {os.path.basename(path)}")
+                        label.setToolTip(path)
+                    else:
+                        label.setText("Loaded: none")
+                        label.setToolTip("")
+            except Exception:
+                pass
+
+    def _on_load_bridge_character_reference_sheet(self, slot: str = "global") -> None:
+        filters = "Image files (*.png *.jpg *.jpeg *.webp *.bmp *.tif *.tiff);;All files (*.*)"
+        title = "Load character reference sheet" if slot == "global" else f"Load {slot.replace('_', ' ').title()} reference sheet"
+        path, _ = QFileDialog.getOpenFileName(self, title, "", filters)
+        if not path:
+            return
+        if not self._planner_bridge_reference_path_valid(path):
+            try:
+                QMessageBox.warning(self, "Character reference sheet", "Please choose a readable image file.", QMessageBox.Ok)
+            except Exception:
+                pass
+            return
+        self._planner_bridge_set_character_reference_path(slot, str(path))
+        self._update_bridge_character_reference_ui()
+        try:
+            self._save_settings()
+        except Exception:
+            pass
+
+    def _on_clear_bridge_character_reference_sheet(self, slot: str = "global") -> None:
+        self._planner_bridge_set_character_reference_path(slot, "")
+        self._update_bridge_character_reference_ui()
+        try:
+            self._save_settings()
+        except Exception:
+            pass
+
+    def _on_preview_bridge_character_reference_sheet(self, slot: str = "global") -> None:
+        path = self._planner_bridge_character_reference_path_for_slot(slot)
+        if not self._planner_bridge_reference_path_valid(path):
+            return
+        try:
+            pm = QPixmap(path)
+            if pm.isNull():
+                return
+            dlg = QDialog(self)
+            name = "Character reference sheet" if slot == "global" else f"{slot.replace('_', ' ').title()} reference sheet"
+            dlg.setWindowTitle(name)
+            lay = QVBoxLayout(dlg)
+            lbl = QLabel(dlg)
+            lbl.setAlignment(Qt.AlignCenter)
+            lbl.setPixmap(pm.scaled(900, 700, Qt.KeepAspectRatio, Qt.SmoothTransformation))
+            lay.addWidget(lbl)
+            path_lbl = QLabel(path, dlg)
+            path_lbl.setWordWrap(True)
+            lay.addWidget(path_lbl)
+            buttons = QDialogButtonBox(QDialogButtonBox.Ok, dlg)
+            buttons.accepted.connect(dlg.accept)
+            lay.addWidget(buttons)
+            dlg.resize(760, 560)
+            dlg.exec()
+        except Exception:
+            pass
+
+    def _planner_bridge_character_reference_payload(self) -> dict:
+        global_path = self._planner_bridge_character_reference_path_for_slot("global")
+        global_enabled = bool(self._planner_bridge_reference_path_valid(global_path))
+        warnings = []
+        if global_path and not global_enabled:
+            warnings.append("Saved global character reference sheet path is missing or not a readable image.")
+        sheets = {}
+        for slot in self._planner_bridge_character_reference_slot_keys():
+            path = self._planner_bridge_character_reference_path_for_slot(slot)
+            valid = bool(self._planner_bridge_reference_path_valid(path))
+            sheets[slot] = path if path else ""
+            if path and not valid:
+                warnings.append(f"Saved {slot} character reference sheet path is missing or not a readable image.")
+        any_valid = global_enabled or any(self._planner_bridge_reference_path_valid(v) for v in sheets.values())
+        if global_enabled:
+            warnings.append("Global/group reference is loaded and kept as visual context; direct multi-reference input mainly uses slots 1-5.")
+        first_character_sheet = ""
+        for slot in self._planner_bridge_character_reference_slot_keys():
+            candidate = sheets.get(slot, "")
+            if candidate and self._planner_bridge_reference_path_valid(candidate):
+                first_character_sheet = candidate
+                break
+        return {
+            "enabled": bool(any_valid),
+            "reference_sheet_path": first_character_sheet or "",
+            "global_reference_sheet_path": global_path if global_path else "",
+            "global_reference_direct_model_use": False,
+            "global_reference_usage": "visual_context_available",
+            "reference_type": "subject_reference_sheets",
+            "hidream_multi_reference_policy": "slots_1_to_5_are_direct_subject_references",
+            "future_hidream_group_image_workflow": "hidream_image_edit",
+            "source": "user_loaded_image" if any_valid else "none",
+            "max_character_reference_slots": 5,
+            "character_reference_sheets": sheets,
+            "warnings": warnings,
+        }
+
+
+
+    def _planner_bridge_generation_settings(self) -> dict:
+        """Collect existing Music Clip Creator pacing settings for bridge JSON.
+
+        No new settings are created here; this only forwards the already-visible
+        Smart Director / duration guard values into the private Planner bridge.
+        """
+        def _combo(attr: str, default: str = "") -> str:
+            try:
+                w = getattr(self, attr, None)
+                if w is not None and hasattr(w, "currentText"):
+                    return str(w.currentText() or "").strip()
+            except Exception:
+                pass
+            return default
+
+        def _spin(attr: str, default: float = 0.0) -> float:
+            try:
+                w = getattr(self, attr, None)
+                if w is not None and hasattr(w, "value"):
+                    return float(w.value())
+            except Exception:
+                pass
+            return float(default)
+
+        preset = _combo("combo_director_preset", "Balanced")
+        scene_cut_style = _combo("combo_scene_cut_style", "Auto")
+        max_scene_mode = _combo("combo_smart_max_scene_mode", "Auto (source-aware)")
+        manual_max = _spin("spin_smart_max_scene_len", 5.0)
+        try:
+            duration_guard = bool(getattr(self, "check_smart_scene_duration_guard", None) and self.check_smart_scene_duration_guard.isChecked())
+        except Exception:
+            duration_guard = True
+
+        low = f"{max_scene_mode} {scene_cut_style}".lower()
+        if duration_guard and "manual" in low and manual_max > 0.0:
+            clip_length_mode = "manual"
+            target_clip_seconds = float(manual_max)
+            max_ltx = float(manual_max)
+        elif "short" in low or "busy" in low:
+            clip_length_mode = "short"
+            target_clip_seconds = 4.0
+            max_ltx = 5.0
+        elif "long" in low or "cinematic" in str(preset).lower() or "emotional" in str(preset).lower():
+            clip_length_mode = "long"
+            target_clip_seconds = 10.0
+            max_ltx = 14.0
+        elif "medium" in low:
+            clip_length_mode = "medium"
+            target_clip_seconds = 7.0
+            max_ltx = 10.0
+        else:
+            clip_length_mode = "auto"
+            target_clip_seconds = 0.0
+            max_ltx = 0.0
+
+        return {
+            "preset": preset,
+            "director_preset": preset,
+            "clip_length_mode": clip_length_mode,
+            "manual_max_clip_seconds": float(manual_max) if duration_guard and "manual" in str(max_scene_mode).lower() else None,
+            "target_clip_seconds": float(target_clip_seconds) if target_clip_seconds > 0.0 else None,
+            "max_ltx_shot_seconds": float(max_ltx) if max_ltx > 0.0 else None,
+            "scene_cut_style": scene_cut_style,
+            "beat_style": scene_cut_style,
+            "smart_scene_duration_guard": bool(duration_guard),
+            "smart_max_scene_mode": max_scene_mode,
+            "smart_max_scene_len": float(manual_max),
+            "timestamped_microclips_enabled": bool(getattr(self, "check_bridge_timestamped_microclips", None) and self.check_bridge_timestamped_microclips.isChecked()),
+            "collage_effect_enabled": bool(getattr(self, "check_bridge_collage_effect", None) and self.check_bridge_collage_effect.isChecked()),
+            "avoid_effects_in_first_clip": bool((getattr(self, "check_bridge_avoid_effects_first_clip", None) is None) or self.check_bridge_avoid_effects_first_clip.isChecked()),
+            "avoid_effects_in_last_clip": bool((getattr(self, "check_bridge_avoid_effects_last_clip", None) is None) or self.check_bridge_avoid_effects_last_clip.isChecked()),
+        }
+
+    def _planner_bridge_creative_brief(self) -> dict:
+        return {
+            "main_idea": self._planner_bridge_text("edit_bridge_main_idea"),
+            "style_theme": self._planner_bridge_text("edit_bridge_style_theme"),
+            "characters_subjects": self._planner_bridge_text("edit_bridge_characters_subjects"),
+            "locations_world": self._planner_bridge_text("edit_bridge_locations_world"),
+            "camera_choreography": self._planner_bridge_text("edit_bridge_camera_choreography"),
+        }
+
+    def _set_planner_bridge_status(self, text: str) -> None:
+        try:
+            if getattr(self, "label_planner_bridge_status", None) is not None:
+                self.label_planner_bridge_status.setText(str(text or ""))
+        except Exception:
+            pass
+
+    def _planner_bridge_brief_signature(self, brief: Optional[Dict[str, Any]] = None) -> str:
+        """Small stale-plan guard signature for the visible creative job fields."""
+        try:
+            src = brief if isinstance(brief, dict) else self._planner_bridge_creative_brief()
+        except Exception:
+            src = {}
+        parts = []
+        for key in ("main_idea", "style_theme", "characters_subjects", "locations_world", "camera_choreography"):
+            try:
+                value = str((src or {}).get(key, "") or "").strip().lower()
+            except Exception:
+                value = ""
+            value = re.sub(r"\s+", " ", value)
+            parts.append(value)
+        return "\n".join(parts).strip()
+
+    def _planner_bridge_plan_matches_current_brief(self, path: str) -> bool:
+        """Return False when an old plan clearly belongs to another story/idea."""
+        p = str(path or "").strip()
+        if not p or not os.path.isfile(p):
+            return False
+        try:
+            data = _musicclip_read_json_file(p)
+            plan_brief = data.get("creative_brief") if isinstance(data, dict) else {}
+            if not isinstance(plan_brief, dict):
+                return True
+            old_sig = self._planner_bridge_brief_signature(plan_brief)
+            new_sig = self._planner_bridge_brief_signature()
+            # Empty old signatures are allowed for backwards compatibility.
+            if old_sig and new_sig and old_sig != new_sig:
+                self._set_planner_bridge_status("Planner Bridge: old cached plan does not match the current idea. Click Start New Job or rebuild the plan.")
+                return False
+        except Exception:
+            return True
+        return True
+
+    def _planner_bridge_clear_job_state(self, *, save: bool = True, show_status: bool = True) -> None:
+        """Clear cached per-job Planner Bridge paths without touching user settings."""
+        for attr in (
+            "_planner_bridge_last_scene_plan_path",
+            "_planner_bridge_last_prompt_plan_path",
+            "_planner_bridge_last_ltx_shot_plan_path",
+            "_planner_bridge_last_ltx_director_plan_path",
+            "_ltx_active_render_plan_path",
+            "_ltx_active_render_shot_id",
+            "_ltx_full_run_last_output_dir",
+        ):
+            try:
+                setattr(self, attr, "")
+            except Exception:
+                pass
+        try:
+            combo = getattr(self, "combo_ltx_single_shot", None)
+            if combo is not None:
+                combo.blockSignals(True)
+                combo.clear()
+                combo.blockSignals(False)
+        except Exception:
+            pass
+        try:
+            self._analysis = None
+            self._analysis_audio_path = ""
+            self._analysis_sensitivity = None
+        except Exception:
+            pass
+        if save:
+            try:
+                self._save_settings()
+            except Exception:
+                pass
+        if show_status:
+            try:
+                idea = self._planner_bridge_text("edit_bridge_main_idea")
+            except Exception:
+                idea = ""
+            short = (idea[:80] + "…") if len(idea) > 80 else idea
+            msg = "Planner Bridge: new job started. Cached scene/prompt/LTX plans cleared."
+            if short:
+                msg += f" Current idea: {short}"
+            self._set_planner_bridge_status(msg)
+            try:
+                if hasattr(self, "progress"):
+                    self.progress.setFormat("Planner Bridge new job started.")
+            except Exception:
+                pass
+            try:
+                self._show_toast("Planner Bridge: new job started.")
+            except Exception:
+                pass
+
+    def _on_start_new_planner_bridge_job_clicked(self) -> None:
+        """Start fresh while keeping the current music, prompts, references and settings."""
+        if bool(getattr(self, "_ltx_director_running", False)) or bool(getattr(self, "_ltx_full_run_running", False)):
+            self._set_planner_bridge_status("Planner Bridge: wait for the running job to finish or cancel it before starting a new job.")
+            return
+        self._planner_bridge_clear_job_state(save=True, show_status=True)
+
+    def _ensure_bridge_analysis_for_audio(self, audio: str) -> bool:
+        try:
+            current_audio_path = os.path.normcase(os.path.abspath(audio))
+        except Exception:
+            current_audio_path = str(audio or "")
+        try:
+            current_sensitivity = int(self.slider_sens.value())
+        except Exception:
+            current_sensitivity = None
+        try:
+            cached_audio_path = str(getattr(self, "_analysis_audio_path", "") or "")
+        except Exception:
+            cached_audio_path = ""
+        try:
+            cached_sensitivity = getattr(self, "_analysis_sensitivity", None)
+            cached_sensitivity = int(cached_sensitivity) if cached_sensitivity is not None else None
+        except Exception:
+            cached_sensitivity = None
+
+        if (
+            getattr(self, "_analysis", None) is not None
+            and cached_audio_path
+            and current_audio_path == cached_audio_path
+            and cached_sensitivity == current_sensitivity
+        ):
+            return True
+
+        try:
+            self._set_planner_bridge_status("Planner Bridge: analyzing music timing...")
+            if hasattr(self, "progress"):
+                self.progress.setFormat("Analyzing music for Planner Bridge...")
+            self._analysis_config.sensitivity = int(current_sensitivity if current_sensitivity is not None else self.slider_sens.value())
+            self._analysis = analyze_music(audio, self._ffmpeg, self._analysis_config)
+            self._analysis_audio_path = current_audio_path
+            self._analysis_sensitivity = current_sensitivity
+            return True
+        except Exception as e:
+            self._analysis = None
+            self._analysis_audio_path = ""
+            self._analysis_sensitivity = None
+            self._set_planner_bridge_status(f"Planner Bridge export failed: analysis failed ({e})")
+            try:
+                self._error("Planner Bridge", f"Could not analyze music for scene plan:\n{e}")
+            except Exception:
+                pass
+            return False
+
+    def _current_lyric_segments_for_bridge(self) -> List[LyricSegment]:
+        segs = list(getattr(self, "_lyrics_srt_segments", []) or [])
+        if segs:
+            return segs
+        path = str(getattr(self, "_lyrics_srt_path", "") or "").strip()
+        if path and os.path.isfile(path):
+            try:
+                self._lyrics_srt_segments = load_srt_segments(path)
+                self._update_lyrics_srt_ui()
+                return list(self._lyrics_srt_segments)
+            except Exception as e:
+                try:
+                    print(f"WARNING: failed to parse SRT file for Planner Bridge '{path}': {e}")
+                except Exception:
+                    pass
+        return []
+
+    def _build_bridge_scene_map(self) -> List[MusicScene]:
+        if not bool(getattr(self, "check_smart_scene_map", None) and self.check_smart_scene_map.isChecked()):
+            self._set_planner_bridge_status("Planner Bridge: enable Smart Scene Map before exporting.")
+            return []
+        if getattr(self, "_analysis", None) is None:
+            return []
+
+        try:
+            if hasattr(self, "progress"):
+                self.progress.setFormat("Building Planner Bridge scene map...")
+        except Exception:
+            pass
+
+        try:
+            if not bool(getattr(self, "check_micro_enable", None) and self.check_micro_enable.isChecked()):
+                micro_mode = 0
+            elif self.check_micro_chorus.isChecked():
+                micro_mode = 1
+            elif self.check_micro_all.isChecked():
+                micro_mode = 2
+            elif getattr(self, "check_micro_verses", None) is not None and self.check_micro_verses.isChecked():
+                micro_mode = 3
+            else:
+                micro_mode = 0
+        except Exception:
+            micro_mode = 0
+
+        try:
+            beats_per = max(1, int(self.spin_beats_per_seg.value()))
+        except Exception:
+            beats_per = 16
+
+        director_preset = str(self.combo_director_preset.currentText()) if hasattr(self, "combo_director_preset") else "Balanced"
+        scene_cut_style = str(self.combo_scene_cut_style.currentText()) if hasattr(self, "combo_scene_cut_style") else "Auto"
+        smart_duration_guard = bool(getattr(self, "check_smart_scene_duration_guard", None) and self.check_smart_scene_duration_guard.isChecked())
+        try:
+            smart_min_scene_len = float(self.spin_smart_min_scene_len.value()) if hasattr(self, "spin_smart_min_scene_len") else 1.5
+        except Exception:
+            smart_min_scene_len = 1.5
+        try:
+            smart_max_scene_len = float(self.spin_smart_max_scene_len.value()) if hasattr(self, "spin_smart_max_scene_len") else 5.0
+        except Exception:
+            smart_max_scene_len = 5.0
+        smart_max_scene_mode = str(self.combo_smart_max_scene_mode.currentText()) if hasattr(self, "combo_smart_max_scene_mode") else "Auto (source-aware)"
+        try:
+            smart_cut_timing_offset = _normalize_smart_cut_timing_offset(float(self.spin_smart_cut_timing_offset.value())) if hasattr(self, "spin_smart_cut_timing_offset") else 0.0
+        except Exception:
+            smart_cut_timing_offset = 0.0
+
+        try:
+            source_durations = _source_durations_from_sources(list(getattr(self, "clip_sources", []) or []))
+        except Exception:
+            source_durations = []
+
+        scenes = build_smart_scene_map(
+            self._analysis,
+            beats_per_segment=beats_per,
+            director_preset=director_preset,
+            cut_style=scene_cut_style,
+            microclip_mode=micro_mode,
+            duration_guard_enabled=smart_duration_guard,
+            min_scene_len=smart_min_scene_len,
+            max_scene_len=smart_max_scene_len,
+            max_scene_mode=smart_max_scene_mode,
+            source_clip_durations=source_durations,
+            cut_timing_offset=smart_cut_timing_offset,
+        )
+        try:
+            lyric_segments = self._current_lyric_segments_for_bridge()
+            if lyric_segments:
+                scenes = attach_lyrics_to_scenes(scenes, lyric_segments, str(getattr(self, "_lyrics_srt_path", "") or ""))
+        except Exception as e:
+            try:
+                print(f"WARNING: failed to attach SRT lyrics to Planner Bridge scene map: {e}")
+            except Exception:
+                pass
+        return scenes
+
+    def _planner_bridge_export_scene_plan(self, *, show_dialogs: bool = True, show_success: bool = True) -> dict:
+        bridge = getattr(self, "_planner_bridge", None)
+        if bridge is None:
+            result = {"ok": False, "message": "Planner Bridge is not available in this build."}
+            self._set_planner_bridge_status("Planner Bridge is not available in this build.")
+            return result
+
+        export_fn = getattr(bridge, "export_musicclip_scene_plan", None)
+        if not callable(export_fn):
+            result = {"ok": False, "message": "Planner Bridge export function is not available."}
+            self._set_planner_bridge_status("Planner Bridge export function is not available.")
+            return result
+
+        audio = ""
+        try:
+            audio = str(self.edit_audio.text().strip())
+        except Exception:
+            audio = ""
+        if not audio or not os.path.isfile(audio):
+            msg = "Load a valid music/audio file before exporting a scene plan."
+            self._set_planner_bridge_status(f"Planner Bridge: {msg}")
+            if show_dialogs:
+                try:
+                    self._error("Planner Bridge", msg)
+                except Exception:
+                    pass
+            return {"ok": False, "message": msg}
+
+        try:
+            out_dir = str(self.edit_output.text().strip())
+        except Exception:
+            out_dir = ""
+        if not out_dir:
+            out_dir = "output/videoclips"
+        try:
+            out_dir = _musicclip_abs_path(_musicclip_project_root(), out_dir)
+        except Exception:
+            pass
+
+        if not self._ensure_bridge_analysis_for_audio(audio):
+            return {"ok": False, "message": "Could not analyze music for scene plan."}
+
+        scenes = self._build_bridge_scene_map()
+        if not scenes:
+            msg = "Analyze or render once first so a Smart Scene Map is available."
+            if bool(getattr(self, "check_smart_scene_map", None) and self.check_smart_scene_map.isChecked()):
+                msg = "Could not build a Smart Scene Map from the current music analysis."
+            self._set_planner_bridge_status(f"Planner Bridge: {msg}")
+            if show_dialogs:
+                try:
+                    QMessageBox.warning(self, "Planner Bridge", msg, QMessageBox.Ok)
+                except Exception:
+                    pass
+            return {"ok": False, "message": msg}
+
+        try:
+            self._save_settings()
+        except Exception:
+            pass
+
+        try:
+            payload = {
+                "root_dir": _musicclip_project_root(),
+                "audio_path": audio,
+                "srt_path": str(getattr(self, "_lyrics_srt_path", "") or ""),
+                "output_dir": out_dir,
+                "smart_scene_map_enabled": bool(self.check_smart_scene_map.isChecked()) if hasattr(self, "check_smart_scene_map") else True,
+                "use_lyrics_srt_timing": bool(self._lyrics_srt_enabled()),
+                "selected_clip_preset": "",
+                "director_preset": str(self.combo_director_preset.currentText()) if hasattr(self, "combo_director_preset") else "",
+                "scene_length": str(self.combo_scene_cut_style.currentText()) if hasattr(self, "combo_scene_cut_style") else "",
+                "cut_style": str(self.combo_scene_cut_style.currentText()) if hasattr(self, "combo_scene_cut_style") else "",
+                "scene_cut_style": str(self.combo_scene_cut_style.currentText()) if hasattr(self, "combo_scene_cut_style") else "",
+                "cut_timing_offset": float(self.spin_smart_cut_timing_offset.value()) if hasattr(self, "spin_smart_cut_timing_offset") else 0.0,
+                "creative_brief": self._planner_bridge_creative_brief(),
+                "smart_scene_map": _scene_map_to_list(scenes),
+                "lyric_segments": _lyric_segments_to_list(self._current_lyric_segments_for_bridge()),
+                "bridge_generation_settings": self._planner_bridge_generation_settings(),
+                "character_reference": self._planner_bridge_character_reference_payload(),
+            }
+            result = export_fn(payload)
+        except Exception as e:
+            result = {"ok": False, "message": str(e)}
+
+        if bool(result.get("ok")):
+            plan_path = str(result.get("plan_path") or "")
+            try:
+                self._planner_bridge_last_scene_plan_path = plan_path
+            except Exception:
+                pass
+            scene_count = int(result.get("scene_count") or 0)
+            if show_success:
+                msg = f"Planner Bridge: exported {scene_count} scenes"
+                if plan_path:
+                    msg += f" → {plan_path}"
+                self._set_planner_bridge_status(msg)
+                try:
+                    self.progress.setFormat(f"Scene plan exported: {scene_count} scenes.")
+                except Exception:
+                    pass
+                try:
+                    self._show_toast("Planner scene plan exported.")
+                except Exception:
+                    pass
+        else:
+            msg = str(result.get("message") or "Scene plan export failed.")
+            self._set_planner_bridge_status(f"Planner Bridge: {msg}")
+            if show_dialogs:
+                try:
+                    QMessageBox.warning(self, "Planner Bridge", msg, QMessageBox.Ok)
+                except Exception:
+                    pass
+        return result
+
+    def _on_export_planner_scene_plan_clicked(self) -> None:
+        self._planner_bridge_export_scene_plan(show_dialogs=True, show_success=True)
+
+    def _on_create_planner_prompt_plan_clicked(self) -> None:
+        bridge = getattr(self, "_planner_bridge", None)
+        if bridge is None:
+            self._set_planner_bridge_status("Planner Bridge is not available in this build.")
+            return
+
+        create_fn = getattr(bridge, "create_prompt_plan", None)
+        if not callable(create_fn):
+            msg = "Prompt plan creation is not available in this bridge file."
+            self._set_planner_bridge_status(f"Planner Bridge: {msg}")
+            try:
+                QMessageBox.warning(self, "Planner Bridge", msg, QMessageBox.Ok)
+            except Exception:
+                pass
+            return
+
+        self._set_planner_bridge_status("Planner Bridge: Creating prompt plan...")
+        try:
+            if hasattr(self, "progress"):
+                self.progress.setFormat("Creating Planner prompt plan...")
+        except Exception:
+            pass
+
+        export_result = self._planner_bridge_export_scene_plan(show_dialogs=True, show_success=False)
+        if not bool(export_result.get("ok")):
+            # Error status/dialog already handled by the export helper.
+            return
+
+        scene_plan_path = str(export_result.get("plan_path") or "")
+        if not scene_plan_path or not os.path.isfile(scene_plan_path):
+            msg = "Export a scene plan first."
+            self._set_planner_bridge_status(f"Planner Bridge: {msg}")
+            try:
+                QMessageBox.warning(self, "Planner Bridge", msg, QMessageBox.Ok)
+            except Exception:
+                pass
+            return
+
+        try:
+            payload = {
+                "scene_plan_path": scene_plan_path,
+                "creative_brief": self._planner_bridge_creative_brief(),
+                "prompt_backend": "template_rule_based",
+                "use_vocal_scene_roles": bool(getattr(self, "check_bridge_use_vocal_roles", None) is None or self.check_bridge_use_vocal_roles.isChecked()),
+                "bridge_generation_settings": self._planner_bridge_generation_settings(),
+                "character_reference": self._planner_bridge_character_reference_payload(),
+            }
+            result = create_fn(payload)
+        except Exception as e:
+            result = {"ok": False, "message": str(e)}
+
+        if bool(result.get("ok")):
+            prompt_path = str(result.get("prompt_plan_path") or "")
+            try:
+                self._planner_bridge_last_prompt_plan_path = prompt_path
+                if prompt_path:
+                    parent = os.path.dirname(prompt_path)
+                    cand_scene = os.path.join(parent, "musicclip_scene_plan.json")
+                    if os.path.isfile(cand_scene):
+                        self._planner_bridge_last_scene_plan_path = cand_scene
+                self._save_settings()
+            except Exception:
+                pass
+            scene_count = int(result.get("scene_count") or 0)
+            msg = f"Prompt plan saved: {prompt_path}" if prompt_path else f"Prompt plan created: {scene_count} scenes"
+            self._set_planner_bridge_status(f"Planner Bridge: {msg}")
+            try:
+                self.progress.setFormat(f"Prompt plan created: {scene_count} scenes.")
+            except Exception:
+                pass
+            try:
+                self._show_toast("Planner prompt plan created.")
+            except Exception:
+                pass
+        else:
+            msg = str(result.get("message") or "Prompt plan creation failed.")
+            self._set_planner_bridge_status(f"Planner Bridge: {msg}")
+            try:
+                QMessageBox.warning(self, "Planner Bridge", msg, QMessageBox.Ok)
+            except Exception:
+                pass
+
+    def _planner_bridge_existing_prompt_plan_path(self) -> str:
+        """Return the last prompt plan path if it still exists.
+
+        Create LTX shot plan intentionally depends on an existing prompt plan; it
+        should not silently regenerate prompts or scenes.
+        """
+        try:
+            path = str(getattr(self, "_planner_bridge_last_prompt_plan_path", "") or "").strip()
+            if path and os.path.isfile(path) and self._planner_bridge_plan_matches_current_brief(path):
+                return path
+        except Exception:
+            pass
+        try:
+            scene_path = str(getattr(self, "_planner_bridge_last_scene_plan_path", "") or "").strip()
+            if scene_path:
+                cand = os.path.join(os.path.dirname(scene_path), "musicclip_prompt_plan.json")
+                if os.path.isfile(cand) and self._planner_bridge_plan_matches_current_brief(cand):
+                    self._planner_bridge_last_prompt_plan_path = cand
+                    return cand
+        except Exception:
+            pass
+        return ""
+
+    def _on_create_ltx_shot_plan_clicked(self) -> None:
+        bridge = getattr(self, "_planner_bridge", None)
+        if bridge is None:
+            self._set_planner_bridge_status("Planner Bridge is not available in this build.")
+            return
+
+        create_fn = getattr(bridge, "create_ltx_shot_plan", None)
+        if not callable(create_fn):
+            msg = "LTX shot plan creation is not available in this bridge file."
+            self._set_planner_bridge_status(f"Planner Bridge: {msg}")
+            try:
+                QMessageBox.warning(self, "Planner Bridge", msg, QMessageBox.Ok)
+            except Exception:
+                pass
+            return
+
+        prompt_plan_path = self._planner_bridge_existing_prompt_plan_path()
+        if not prompt_plan_path:
+            msg = "Create a prompt plan first."
+            self._set_planner_bridge_status(f"Planner Bridge: {msg}")
+            try:
+                QMessageBox.warning(self, "Planner Bridge", msg, QMessageBox.Ok)
+            except Exception:
+                pass
+            return
+
+        try:
+            grouping_mode = str(self.combo_bridge_ltx_grouping_mode.currentText()) if getattr(self, "combo_bridge_ltx_grouping_mode", None) is not None else "Auto"
+        except Exception:
+            grouping_mode = "Auto"
+        try:
+            fps = int(self.spin_bridge_ltx_fps.value()) if getattr(self, "spin_bridge_ltx_fps", None) is not None else 24
+        except Exception:
+            fps = 24
+        try:
+            export_audio_chunks = bool(getattr(self, "check_bridge_ltx_export_audio_chunks", None) and self.check_bridge_ltx_export_audio_chunks.isChecked())
+        except Exception:
+            export_audio_chunks = False
+
+        scene_plan_path = ""
+        try:
+            parent = os.path.dirname(prompt_plan_path)
+            cand_scene = os.path.join(parent, "musicclip_scene_plan.json")
+            if os.path.isfile(cand_scene):
+                scene_plan_path = cand_scene
+            elif os.path.isfile(str(getattr(self, "_planner_bridge_last_scene_plan_path", "") or "")):
+                scene_plan_path = str(getattr(self, "_planner_bridge_last_scene_plan_path", "") or "")
+        except Exception:
+            scene_plan_path = ""
+
+        self._set_planner_bridge_status("Planner Bridge: Creating LTX shot plan...")
+        try:
+            if hasattr(self, "progress"):
+                self.progress.setFormat("Creating LTX shot plan...")
+        except Exception:
+            pass
+
+        try:
+            payload = {
+                "root_dir": _musicclip_project_root(),
+                "prompt_plan_path": prompt_plan_path,
+                "scene_plan_path": scene_plan_path,
+                "creative_brief": self._planner_bridge_creative_brief(),
+                "grouping_mode": grouping_mode,
+                "export_audio_chunks": bool(export_audio_chunks),
+                "fps": int(fps),
+                "bridge_generation_settings": self._planner_bridge_generation_settings(),
+                "character_reference": self._planner_bridge_character_reference_payload(),
+            }
+            result = create_fn(payload)
+        except Exception as e:
+            result = {"ok": False, "message": str(e)}
+
+        if bool(result.get("ok")):
+            shot_plan_path = str(result.get("ltx_shot_plan_path") or "")
+            try:
+                self._planner_bridge_last_ltx_shot_plan_path = shot_plan_path
+                self._save_settings()
+            except Exception:
+                pass
+            shot_count = int(result.get("ltx_shot_count") or 0)
+            source_count = int(result.get("source_scene_count") or 0)
+            msg = f"LTX shot plan saved: {shot_plan_path}" if shot_plan_path else "LTX shot plan created."
+            if shot_count or source_count:
+                msg += f" ({shot_count} LTX shots from {source_count} scenes)"
+            warnings = result.get("warnings") or []
+            if warnings:
+                msg += f" — {len(warnings)} warning(s)"
+            self._set_planner_bridge_status(f"Planner Bridge: {msg}")
+            try:
+                self.progress.setFormat(f"LTX shot plan created: {shot_count} shots.")
+            except Exception:
+                pass
+            try:
+                self._show_toast("LTX shot plan created.")
+            except Exception:
+                pass
+        else:
+            msg = str(result.get("message") or "LTX shot plan creation failed.")
+            self._set_planner_bridge_status(f"Planner Bridge: {msg}")
+            try:
+                QMessageBox.warning(self, "Planner Bridge", msg, QMessageBox.Ok)
+            except Exception:
+                pass
+
+    def _planner_bridge_existing_ltx_shot_plan_path(self) -> str:
+        """Return the last LTX shot plan path if it still exists.
+
+        The director pass intentionally depends on an existing LTX shot plan;
+        it must not regenerate scenes, prompts, images, Planner jobs or LTX jobs.
+        """
+        try:
+            path = str(getattr(self, "_planner_bridge_last_ltx_shot_plan_path", "") or "").strip()
+            if path and os.path.isfile(path) and self._planner_bridge_plan_matches_current_brief(path):
+                return path
+        except Exception:
+            pass
+        try:
+            prompt_path = str(getattr(self, "_planner_bridge_last_prompt_plan_path", "") or "").strip()
+            if prompt_path:
+                cand = os.path.join(os.path.dirname(prompt_path), "musicclip_ltx_shot_plan.json")
+                if os.path.isfile(cand) and self._planner_bridge_plan_matches_current_brief(cand):
+                    self._planner_bridge_last_ltx_shot_plan_path = cand
+                    return cand
+        except Exception:
+            pass
+        try:
+            scene_path = str(getattr(self, "_planner_bridge_last_scene_plan_path", "") or "").strip()
+            if scene_path:
+                cand = os.path.join(os.path.dirname(scene_path), "musicclip_ltx_shot_plan.json")
+                if os.path.isfile(cand) and self._planner_bridge_plan_matches_current_brief(cand):
+                    self._planner_bridge_last_ltx_shot_plan_path = cand
+                    return cand
+        except Exception:
+            pass
+        return ""
+
+    def _set_ltx_director_busy(self, busy: bool) -> None:
+        """Keep the optional director rewrite pass from blocking/conflicting UI actions."""
+        self._ltx_director_running = bool(busy)
+        for attr in (
+            "btn_create_ltx_director_plan",
+            "btn_create_ltx_shot_plan",
+            "btn_create_planner_prompt_plan",
+            "btn_export_planner_scene_plan",
+            "btn_start_new_planner_bridge_job",
+        ):
+            try:
+                btn = getattr(self, attr, None)
+                if btn is not None:
+                    btn.setEnabled(not bool(busy))
+            except Exception:
+                pass
+        try:
+            combo = getattr(self, "combo_bridge_director_backend", None)
+            if combo is not None:
+                combo.setEnabled(not bool(busy))
+        except Exception:
+            pass
+
+    def _on_ltx_director_progress(self, text: str) -> None:
+        msg = str(text or "").strip()
+        if not msg:
+            return
+        if not msg.lower().startswith("planner bridge:"):
+            msg = f"Planner Bridge: {msg}"
+        self._set_planner_bridge_status(msg)
+        try:
+            if hasattr(self, "progress"):
+                self.progress.setFormat(str(text or "Creating LTX director plan..."))
+        except Exception:
+            pass
+
+    def _on_ltx_director_finished(self, result: dict) -> None:
+        self._set_ltx_director_busy(False)
+        self._ltx_director_worker = None
+        if not isinstance(result, dict):
+            result = {"ok": False, "message": "LTX director plan creation returned an invalid result."}
+
+        director_plan_path = str(result.get("ltx_director_plan_path") or "")
+        try:
+            self._planner_bridge_last_ltx_director_plan_path = director_plan_path
+            self._save_settings()
+        except Exception:
+            pass
+        shot_count = int(result.get("ltx_shot_count") or 0)
+        backend_used = str(result.get("director_backend") or result.get("requested_director_backend") or "")
+        msg = f"Director plan saved: {director_plan_path}" if director_plan_path else "Director plan created."
+        if shot_count:
+            msg += f" ({shot_count} LTX shots)"
+        if backend_used:
+            msg += f" — {backend_used}"
+        warnings = result.get("warnings") or []
+        if warnings:
+            msg += f" — {len(warnings)} warning(s); fallback used where needed"
+        self._set_planner_bridge_status(f"Planner Bridge: {msg}")
+        try:
+            self.progress.setFormat(f"LTX director plan created: {shot_count} shots.")
+        except Exception:
+            pass
+        try:
+            self._show_toast("LTX director plan created.")
+        except Exception:
+            pass
+
+    def _on_ltx_director_failed(self, message: str) -> None:
+        self._set_ltx_director_busy(False)
+        self._ltx_director_worker = None
+        msg = str(message or "LTX director plan creation failed.")
+        self._set_planner_bridge_status(f"Planner Bridge: Director plan failed: {msg}")
+        try:
+            if hasattr(self, "progress"):
+                self.progress.setFormat("LTX director plan failed.")
+        except Exception:
+            pass
+        try:
+            QMessageBox.warning(self, "Planner Bridge", msg, QMessageBox.Ok)
+        except Exception:
+            pass
+
+    def _on_create_ltx_director_plan_clicked(self) -> None:
+        if bool(getattr(self, "_ltx_director_running", False)):
+            self._set_planner_bridge_status("Planner Bridge: Director plan is already running...")
+            return
+
+        bridge = getattr(self, "_planner_bridge", None)
+        if bridge is None:
+            self._set_planner_bridge_status("Planner Bridge is not available in this build.")
+            return
+
+        create_fn = getattr(bridge, "create_ltx_director_plan", None)
+        if not callable(create_fn):
+            msg = "LTX director plan creation is not available in this bridge file."
+            self._set_planner_bridge_status(f"Planner Bridge: {msg}")
+            try:
+                QMessageBox.warning(self, "Planner Bridge", msg, QMessageBox.Ok)
+            except Exception:
+                pass
+            return
+
+        ltx_shot_plan_path = self._planner_bridge_existing_ltx_shot_plan_path()
+        if not ltx_shot_plan_path:
+            msg = "Create an LTX shot plan first."
+            self._set_planner_bridge_status(f"Planner Bridge: {msg}")
+            try:
+                QMessageBox.warning(self, "Planner Bridge", msg, QMessageBox.Ok)
+            except Exception:
+                pass
+            return
+
+        try:
+            director_backend = str(self.combo_bridge_director_backend.currentText()) if getattr(self, "combo_bridge_director_backend", None) is not None else "Template cleanup"
+        except Exception:
+            director_backend = "Template cleanup"
+
+        payload = {
+            "root_dir": _musicclip_project_root(),
+            "ltx_shot_plan_path": ltx_shot_plan_path,
+            "creative_brief": self._planner_bridge_creative_brief(),
+            "director_backend": director_backend,
+            "bridge_generation_settings": self._planner_bridge_generation_settings(),
+            "character_reference": self._planner_bridge_character_reference_payload(),
+        }
+
+        self._set_ltx_director_busy(True)
+        self._set_planner_bridge_status("Planner Bridge: Director plan is running...")
+        try:
+            if hasattr(self, "progress"):
+                self.progress.setFormat("Creating LTX director plan...")
+        except Exception:
+            pass
+
+        worker = LtxDirectorPlanWorker(bridge, payload, self)
+        worker.progress_text.connect(self._on_ltx_director_progress)
+        worker.finished_result.connect(self._on_ltx_director_finished)
+        worker.failed.connect(self._on_ltx_director_failed)
+        try:
+            worker.finished.connect(worker.deleteLater)
+        except Exception:
+            pass
+        self._ltx_director_worker = worker
+        worker.start()
+
+    def _planner_bridge_existing_ltx_director_plan_path(self) -> str:
+        """Return the latest known LTX director plan path if it exists."""
+        try:
+            path = str(getattr(self, "_planner_bridge_last_ltx_director_plan_path", "") or "").strip()
+            if path and os.path.isfile(path) and self._planner_bridge_plan_matches_current_brief(path):
+                return path
+        except Exception:
+            pass
+        for attr in ("_planner_bridge_last_ltx_shot_plan_path", "_planner_bridge_last_prompt_plan_path", "_planner_bridge_last_scene_plan_path"):
+            try:
+                base = str(getattr(self, attr, "") or "").strip()
+                if base:
+                    cand = os.path.join(os.path.dirname(base), "musicclip_ltx_director_plan.json")
+                    if os.path.isfile(cand) and self._planner_bridge_plan_matches_current_brief(cand):
+                        self._planner_bridge_last_ltx_director_plan_path = cand
+                        return cand
+            except Exception:
+                pass
+        return ""
+
+    def _update_ltx_single_image_mode_ui(self) -> None:
+        try:
+            combo = getattr(self, "combo_ltx_single_image_mode", None)
+            mode = combo.currentData() if combo is not None else "existing"
+            visible = str(mode or "existing") == "existing"
+            row = getattr(self, "row_ltx_single_start_image", None)
+            if row is not None:
+                row.setVisible(visible)
+        except Exception:
+            pass
+
+    def _on_browse_ltx_single_start_image_clicked(self) -> None:
+        try:
+            path, _ = QFileDialog.getOpenFileName(
+                self,
+                "Select LTX start image",
+                "",
+                "Images (*.png *.jpg *.jpeg *.webp *.bmp);;All files (*.*)",
+            )
+            if path and getattr(self, "edit_ltx_single_start_image", None) is not None:
+                self.edit_ltx_single_start_image.setText(path)
+        except Exception as exc:
+            self._set_planner_bridge_status(f"Planner Bridge: Could not select start image: {exc}")
+
+    def _on_browse_ltx_single_lora_file_clicked(self) -> None:
+        try:
+            path, _ = QFileDialog.getOpenFileName(
+                self,
+                "Select LTX LoRA file",
+                "",
+                "LoRA files (*.safetensors *.pt *.bin);;All files (*.*)",
+            )
+            if path and getattr(self, "edit_ltx_single_lora_file", None) is not None:
+                self.edit_ltx_single_lora_file.setText(path)
+        except Exception as exc:
+            self._set_planner_bridge_status(f"Planner Bridge: Could not select LoRA file: {exc}")
+
+    def _on_browse_ltx_single_lora_json_clicked(self) -> None:
+        try:
+            path, _ = QFileDialog.getOpenFileName(
+                self,
+                "Select LTX LoRA JSON",
+                "",
+                "JSON files (*.json);;All files (*.*)",
+            )
+            if path and getattr(self, "edit_ltx_single_lora_json", None) is not None:
+                self.edit_ltx_single_lora_json.setText(path)
+        except Exception as exc:
+            self._set_planner_bridge_status(f"Planner Bridge: Could not select LoRA JSON: {exc}")
+
+    def _ltx_shot_browse_text(self, shot: dict) -> str:
+        try:
+            sid = str(shot.get("id") or "").strip()
+            start = float(shot.get("song_start") or 0.0)
+            end = float(shot.get("song_end") or 0.0)
+            dur = float(shot.get("duration") or max(0.0, end - start))
+            lipsync = "lipsync" if bool(shot.get("needs_lipsync")) else "music/rhythm"
+            role = str(shot.get("scene_role_summary") or shot.get("microclip_style") or "").strip()
+            prompt = str(shot.get("director_timestamped_video_prompt") or shot.get("timestamped_video_prompt") or shot.get("director_video_prompt") or shot.get("video_prompt") or "").strip()
+            prompt = re.sub(r"\s+", " ", prompt)[:650]
+            lines = [f"{sid} | {start:.2f}s-{end:.2f}s | {dur:.2f}s | {lipsync}"]
+            if role:
+                lines.append(f"Role: {role}")
+            if prompt:
+                lines.append(f"Prompt: {prompt}")
+            return "\n".join(lines)
+        except Exception:
+            return "LTX shot details unavailable."
+
+    def _on_ltx_single_shot_selection_changed(self, _index: int = -1) -> None:
+        """Browse LTX shot metadata without changing the active render target."""
+        combo = getattr(self, "combo_ltx_single_shot", None)
+        if combo is None or combo.count() <= 0:
+            return
+        try:
+            shot_id = str(combo.currentData() or combo.currentText() or "").split(" ")[0].strip()
+        except Exception:
+            shot_id = ""
+        try:
+            self._ltx_ui_selected_shot_id = shot_id
+        except Exception:
+            pass
+        meta = getattr(self, "_ltx_single_shot_meta", {}) or {}
+        shot = meta.get(shot_id) if isinstance(meta, dict) else None
+        if isinstance(shot, dict):
+            tip = self._ltx_shot_browse_text(shot)
+            try:
+                combo.setToolTip(tip)
+            except Exception:
+                pass
+            if bool(getattr(self, "_ltx_full_run_running", False)):
+                active = str(getattr(self, "_ltx_active_render_shot_id", "") or "").strip()
+                active_note = f" Active render: {active}." if active else ""
+                self._set_planner_bridge_status(f"Planner Bridge: browsing {shot_id} during generation.{active_note}")
+
+    def _refresh_ltx_single_shots(self) -> None:
+        combo = getattr(self, "combo_ltx_single_shot", None)
+        if combo is None:
+            return
+        combo.clear()
+        path = self._planner_bridge_existing_ltx_director_plan_path()
+        if not path:
+            self._set_planner_bridge_status("Planner Bridge: Create an LTX director plan first, then refresh LTX shots.")
+            return
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            shots = [s for s in (data.get("shots") or []) if isinstance(s, dict)] if isinstance(data, dict) else []
+            if not shots:
+                self._set_planner_bridge_status("Planner Bridge: Director plan has no LTX shots.")
+                return
+            meta = {}
+            for shot in shots:
+                sid = str(shot.get("id") or "").strip() or "LTX"
+                start = float(shot.get("song_start") or 0.0)
+                end = float(shot.get("song_end") or 0.0)
+                dur = float(shot.get("duration") or max(0.0, end - start))
+                lipsync = "lipsync" if bool(shot.get("needs_lipsync")) else "music/rhythm"
+                role = str(shot.get("scene_role_summary") or shot.get("microclip_style") or "").strip()
+                label_role = f" — {role[:32]}" if role else ""
+                combo.addItem(f"{sid} — {start:.2f}s-{end:.2f}s — {dur:.1f}s — {lipsync}{label_role}", sid)
+                meta[sid] = dict(shot)
+            try:
+                self._ltx_single_shot_meta = meta
+            except Exception:
+                pass
+            try:
+                self._planner_bridge_last_ltx_director_plan_path = path
+            except Exception:
+                pass
+            self._on_ltx_single_shot_selection_changed(combo.currentIndex())
+            self._set_planner_bridge_status(f"Planner Bridge: Loaded {len(shots)} LTX director shots.")
+        except Exception as exc:
+            self._set_planner_bridge_status(f"Planner Bridge: Could not load LTX shots: {exc}")
+            try:
+                QMessageBox.warning(self, "Planner Bridge", f"Could not load LTX shots:\n{exc}", QMessageBox.Ok)
+            except Exception:
+                pass
+
+    def _set_ltx_start_image_busy(self, busy: bool) -> None:
+        self._ltx_start_image_running = bool(busy)
+        for attr in (
+            "btn_generate_ltx_start_image",
+            "btn_refresh_ltx_single_shots",
+            "combo_ltx_single_shot",
+            "combo_ltx_single_image_mode",
+            "btn_test_ltx_single_shot",
+        ):
+            try:
+                w = getattr(self, attr, None)
+                if w is not None:
+                    w.setEnabled(not bool(busy))
+            except Exception:
+                pass
+
+    def _on_ltx_start_image_progress(self, text: str) -> None:
+        msg = str(text or "").strip()
+        if not msg:
+            return
+        if not msg.lower().startswith("planner bridge:"):
+            msg = f"Planner Bridge: {msg}"
+        self._set_planner_bridge_status(msg)
+        try:
+            if hasattr(self, "progress"):
+                self.progress.setFormat(str(text or "Generating LTX start image..."))
+        except Exception:
+            pass
+
+    def _on_ltx_start_image_finished(self, result: dict) -> None:
+        self._set_ltx_start_image_busy(False)
+        self._ltx_start_image_worker = None
+        if not isinstance(result, dict):
+            result = {"ok": False, "message": "Start-image generation returned an invalid result."}
+        start_path = str(result.get("start_image_path") or "").strip()
+        msg = str(result.get("message") or "Start image generated.")
+        if start_path:
+            msg += f" Output: {start_path}"
+            try:
+                self._ltx_generated_start_image_shot_id = str(result.get("shot_id") or "").strip()
+            except Exception:
+                self._ltx_generated_start_image_shot_id = ""
+            try:
+                if getattr(self, "edit_ltx_generated_start_image", None) is not None:
+                    self.edit_ltx_generated_start_image.setText(start_path)
+            except Exception:
+                pass
+            try:
+                if getattr(self, "edit_ltx_single_start_image", None) is not None:
+                    self.edit_ltx_single_start_image.setText(start_path)
+            except Exception:
+                pass
+        self._set_planner_bridge_status(f"Planner Bridge: {msg}")
+        try:
+            if hasattr(self, "progress"):
+                self.progress.setFormat("LTX start image generated.")
+        except Exception:
+            pass
+        try:
+            self._show_toast("LTX start image generated.")
+        except Exception:
+            pass
+
+    def _on_ltx_start_image_failed(self, message: str) -> None:
+        self._set_ltx_start_image_busy(False)
+        self._ltx_start_image_worker = None
+        msg = str(message or "LTX start-image generation failed.")
+        self._set_planner_bridge_status(f"Planner Bridge: {msg}")
+        try:
+            if hasattr(self, "progress"):
+                self.progress.setFormat("LTX start image generation failed.")
+        except Exception:
+            pass
+        try:
+            QMessageBox.warning(self, "Planner Bridge", msg, QMessageBox.Ok)
+        except Exception:
+            pass
+
+    def _on_generate_ltx_start_image_clicked(self) -> None:
+        if bool(getattr(self, "_ltx_start_image_running", False)):
+            self._set_planner_bridge_status("Planner Bridge: LTX start-image generation is already running...")
+            return
+        bridge = getattr(self, "_planner_bridge", None)
+        if bridge is None:
+            self._set_planner_bridge_status("Planner Bridge is not available in this build.")
+            return
+        gen_fn = getattr(bridge, "generate_ltx_start_image_for_shot", None)
+        if not callable(gen_fn):
+            msg = "LTX start-image generation is not available in this bridge file."
+            self._set_planner_bridge_status(f"Planner Bridge: {msg}")
+            try:
+                QMessageBox.warning(self, "Planner Bridge", msg, QMessageBox.Ok)
+            except Exception:
+                pass
+            return
+
+        plan_path = self._planner_bridge_existing_ltx_director_plan_path()
+        if not plan_path:
+            msg = "Create an LTX director plan first."
+            self._set_planner_bridge_status(f"Planner Bridge: {msg}")
+            try:
+                QMessageBox.warning(self, "Planner Bridge", msg, QMessageBox.Ok)
+            except Exception:
+                pass
+            return
+
+        combo = getattr(self, "combo_ltx_single_shot", None)
+        if combo is None or combo.count() <= 0:
+            self._refresh_ltx_single_shots()
+        combo = getattr(self, "combo_ltx_single_shot", None)
+        if combo is None or combo.count() <= 0:
+            return
+        shot_id = str(combo.currentData() or combo.currentText() or "").split(" ")[0].strip()
+        if not shot_id:
+            self._set_planner_bridge_status("Planner Bridge: No LTX shot is selected.")
+            return
+
+        image_combo = getattr(self, "combo_ltx_single_image_mode", None)
+        image_model = str(image_combo.currentData() if image_combo is not None else "flux_klein_9b")
+        if image_model == "existing":
+            msg = "Use existing start image does not need generation. Pick Flux Klein 9B, Z-Image Turbo, or HiDream."
+            self._set_planner_bridge_status(f"Planner Bridge: {msg}")
+            try:
+                QMessageBox.information(self, "Planner Bridge", msg, QMessageBox.Ok)
+            except Exception:
+                pass
+            return
+
+        payload = {
+            "root_dir": _musicclip_project_root(),
+            "ltx_director_plan_path": plan_path,
+            "shot_id": shot_id,
+            "image_model": image_model,
+            "character_reference": self._planner_bridge_character_reference_payload(),
+        }
+
+        self._set_ltx_start_image_busy(True)
+        self._set_planner_bridge_status(f"Planner Bridge: Generating start image for {shot_id}...")
+        try:
+            if hasattr(self, "progress"):
+                self.progress.setFormat("Generating LTX start image...")
+        except Exception:
+            pass
+
+        worker = LtxStartImageWorker(bridge, payload, self)
+        worker.progress_text.connect(self._on_ltx_start_image_progress)
+        worker.finished_result.connect(self._on_ltx_start_image_finished)
+        worker.failed.connect(self._on_ltx_start_image_failed)
+        try:
+            worker.finished.connect(worker.deleteLater)
+        except Exception:
+            pass
+        self._ltx_start_image_worker = worker
+        worker.start()
+
+
+    def _set_ltx_single_test_busy(self, busy: bool) -> None:
+        self._ltx_single_test_running = bool(busy)
+        for attr in (
+            "btn_test_ltx_single_shot",
+            "btn_refresh_ltx_single_shots",
+            "combo_ltx_single_shot",
+            "combo_ltx_single_image_mode",
+            "btn_browse_ltx_single_start_image",
+            "check_ltx_single_use_lora",
+            "btn_browse_ltx_single_lora_file",
+            "btn_browse_ltx_single_lora_json",
+        ):
+            try:
+                w = getattr(self, attr, None)
+                if w is not None:
+                    w.setEnabled(not bool(busy))
+            except Exception:
+                pass
+
+    def _on_ltx_single_test_progress(self, text: str) -> None:
+        msg = str(text or "").strip()
+        if not msg:
+            return
+        if not msg.lower().startswith("planner bridge:"):
+            msg = f"Planner Bridge: {msg}"
+        self._set_planner_bridge_status(msg)
+        try:
+            if hasattr(self, "progress"):
+                self.progress.setFormat(str(text or "Running LTX single-shot test..."))
+        except Exception:
+            pass
+
+    def _on_ltx_single_test_finished(self, result: dict) -> None:
+        self._set_ltx_single_test_busy(False)
+        self._ltx_single_test_worker = None
+        if not isinstance(result, dict):
+            result = {"ok": False, "message": "LTX single-shot test returned an invalid result."}
+        path = str(result.get("ltx_clip_path") or result.get("output_dir") or "")
+        msg = str(result.get("message") or "LTX single-shot test finished.")
+        if path:
+            msg += f" Output: {path}"
+        self._set_planner_bridge_status(f"Planner Bridge: {msg}")
+        try:
+            if hasattr(self, "progress"):
+                self.progress.setFormat("LTX single-shot test finished.")
+        except Exception:
+            pass
+        try:
+            self._show_toast("LTX single-shot test finished.")
+        except Exception:
+            pass
+
+    def _on_ltx_single_test_failed(self, message: str) -> None:
+        self._set_ltx_single_test_busy(False)
+        self._ltx_single_test_worker = None
+        msg = str(message or "LTX single-shot test failed.")
+        self._set_planner_bridge_status(f"Planner Bridge: {msg}")
+        try:
+            if hasattr(self, "progress"):
+                self.progress.setFormat("LTX single-shot test failed.")
+        except Exception:
+            pass
+        try:
+            QMessageBox.warning(self, "Planner Bridge", msg, QMessageBox.Ok)
+        except Exception:
+            pass
+
+    def _set_ltx_full_run_busy(self, busy: bool) -> None:
+        self._ltx_full_run_running = bool(busy)
+        for attr in (
+            "btn_generate_all_ltx_shots",
+            "btn_test_ltx_single_shot",
+            "btn_generate_ltx_start_image",
+            # Keep shot browsing live during a full run. The combo/refresh only read plan metadata
+            # and are intentionally separate from the active render shot inside the worker.
+            "combo_ltx_single_image_mode",
+            "check_ltx_full_skip_completed",
+            "check_ltx_full_trim_clips",
+            "btn_assemble_ltx_music_video",
+            "check_ltx_single_use_lora",
+            "btn_browse_ltx_single_lora_file",
+            "btn_browse_ltx_single_lora_json",
+        ):
+            try:
+                w = getattr(self, attr, None)
+                if w is not None:
+                    w.setEnabled(not bool(busy))
+            except Exception:
+                pass
+        try:
+            if getattr(self, "btn_refresh_ltx_single_shots", None) is not None:
+                self.btn_refresh_ltx_single_shots.setEnabled(True)
+            if getattr(self, "combo_ltx_single_shot", None) is not None:
+                self.combo_ltx_single_shot.setEnabled(True)
+        except Exception:
+            pass
+        try:
+            if getattr(self, "btn_cancel_all_ltx_shots", None) is not None:
+                self.btn_cancel_all_ltx_shots.setEnabled(bool(busy))
+        except Exception:
+            pass
+
+    def _on_ltx_full_run_progress(self, text: str) -> None:
+        msg_raw = str(text or "").strip()
+        if not msg_raw:
+            return
+        try:
+            m = re.match(r"\s*(LTX\d+)\s*:", msg_raw, flags=re.IGNORECASE)
+            if m:
+                self._ltx_active_render_shot_id = m.group(1).upper()
+        except Exception:
+            pass
+        msg = msg_raw
+        if not msg.lower().startswith("planner bridge:"):
+            msg = f"Planner Bridge: {msg}"
+        self._set_planner_bridge_status(msg)
+        try:
+            if hasattr(self, "progress"):
+                self.progress.setFormat(str(text or "Generating all LTX shots..."))
+        except Exception:
+            pass
+
+    def _on_ltx_full_run_finished(self, result: dict) -> None:
+        self._set_ltx_full_run_busy(False)
+        self._ltx_full_run_worker = None
+        try:
+            self._ltx_active_render_shot_id = ""
+        except Exception:
+            pass
+        if not isinstance(result, dict):
+            result = {"ok": False, "message": "Full LTX run returned an invalid result."}
+        msg = str(result.get("message") or "Full LTX run finished.")
+        out_dir = str(result.get("output_dir") or "").strip()
+        if out_dir and out_dir not in msg:
+            msg += f" Output: {out_dir}"
+        self._set_planner_bridge_status(f"Planner Bridge: {msg}")
+        try:
+            if hasattr(self, "progress"):
+                self.progress.setFormat("Full LTX run finished.")
+        except Exception:
+            pass
+        try:
+            self._show_toast("Full LTX run finished.")
+        except Exception:
+            pass
+
+    def _on_ltx_full_run_failed(self, message: str) -> None:
+        self._set_ltx_full_run_busy(False)
+        self._ltx_full_run_worker = None
+        try:
+            self._ltx_active_render_shot_id = ""
+        except Exception:
+            pass
+        msg = str(message or "Full LTX run failed.")
+        self._set_planner_bridge_status(f"Planner Bridge: {msg}")
+        try:
+            if hasattr(self, "progress"):
+                self.progress.setFormat("Full LTX run failed.")
+        except Exception:
+            pass
+        try:
+            QMessageBox.warning(self, "Planner Bridge", msg, QMessageBox.Ok)
+        except Exception:
+            pass
+
+    def _on_cancel_all_ltx_shots_clicked(self) -> None:
+        worker = getattr(self, "_ltx_full_run_worker", None)
+        if worker is not None:
+            try:
+                worker.request_cancel()
+                self._set_planner_bridge_status("Planner Bridge: cancel requested; finishing current safe stage...")
+            except Exception:
+                pass
+
+    def _on_generate_all_ltx_shots_clicked(self) -> None:
+        if bool(getattr(self, "_ltx_full_run_running", False)):
+            self._set_planner_bridge_status("Planner Bridge: full LTX generation is already running...")
+            return
+        bridge = getattr(self, "_planner_bridge", None)
+        if bridge is None:
+            self._set_planner_bridge_status("Planner Bridge is not available in this build.")
+            return
+        run_fn = getattr(bridge, "run_all_ltx_director_shots", None)
+        if not callable(run_fn):
+            msg = "Full LTX director-shot generation is not available in this bridge file."
+            self._set_planner_bridge_status(f"Planner Bridge: {msg}")
+            try:
+                QMessageBox.warning(self, "Planner Bridge", msg, QMessageBox.Ok)
+            except Exception:
+                pass
+            return
+
+        plan_path = self._planner_bridge_existing_ltx_director_plan_path()
+        if not plan_path:
+            msg = "Create an LTX director plan first."
+            self._set_planner_bridge_status(f"Planner Bridge: {msg}")
+            try:
+                QMessageBox.warning(self, "Planner Bridge", msg, QMessageBox.Ok)
+            except Exception:
+                pass
+            return
+
+        image_combo = getattr(self, "combo_ltx_single_image_mode", None)
+        image_mode = str(image_combo.currentData() if image_combo is not None else "flux_klein_9b")
+        use_lora = bool(getattr(self, "check_ltx_single_use_lora", None) and self.check_ltx_single_use_lora.isChecked())
+        payload = {
+            "root_dir": _musicclip_project_root(),
+            "ltx_director_plan_path": plan_path,
+            "image_mode": image_mode,
+            "steps": 8,
+            "resolution": "1280x720",
+            "skip_completed": bool(getattr(self, "check_ltx_full_skip_completed", None) is None or self.check_ltx_full_skip_completed.isChecked()),
+            "trim_clips": bool(getattr(self, "check_ltx_full_trim_clips", None) is None or self.check_ltx_full_trim_clips.isChecked()),
+            "character_reference": self._planner_bridge_character_reference_payload(),
+        }
+        if use_lora:
+            payload["ltx_lora_file"] = str(getattr(self, "edit_ltx_single_lora_file", None).text() if getattr(self, "edit_ltx_single_lora_file", None) is not None else "").strip()
+            payload["ltx_lora_json"] = str(getattr(self, "edit_ltx_single_lora_json", None).text() if getattr(self, "edit_ltx_single_lora_json", None) is not None else "").strip()
+            try:
+                payload["ltx_lora_multiplier"] = float(getattr(self, "spin_ltx_single_lora_multiplier", None).value()) if getattr(self, "spin_ltx_single_lora_multiplier", None) is not None else 1.0
+            except Exception:
+                payload["ltx_lora_multiplier"] = 1.0
+
+        try:
+            self._ltx_active_render_shot_id = ""
+            self._ltx_active_render_plan_path = plan_path
+        except Exception:
+            pass
+        self._set_ltx_full_run_busy(True)
+        self._set_planner_bridge_status("Planner Bridge: generating all LTX shots...")
+        try:
+            if hasattr(self, "progress"):
+                self.progress.setFormat("Generating all LTX shots...")
+        except Exception:
+            pass
+
+        worker = LtxFullRunWorker(bridge, payload, self)
+        worker.progress_text.connect(self._on_ltx_full_run_progress)
+        worker.finished_result.connect(self._on_ltx_full_run_finished)
+        worker.failed.connect(self._on_ltx_full_run_failed)
+        try:
+            worker.finished.connect(worker.deleteLater)
+        except Exception:
+            pass
+        self._ltx_full_run_worker = worker
+        worker.start()
+
+
+    def _set_ltx_assembly_busy(self, busy: bool) -> None:
+        self._ltx_assembly_running = bool(busy)
+        for attr in (
+            "btn_assemble_ltx_music_video",
+            "btn_generate_all_ltx_shots",
+            "btn_test_ltx_single_shot",
+            "btn_generate_ltx_start_image",
+            "btn_refresh_ltx_single_shots",
+            "combo_ltx_single_shot",
+            "combo_ltx_single_image_mode",
+            "check_ltx_full_skip_completed",
+            "check_ltx_full_trim_clips",
+        ):
+            try:
+                w = getattr(self, attr, None)
+                if w is not None:
+                    w.setEnabled(not bool(busy))
+            except Exception:
+                pass
+
+    def _on_ltx_assembly_progress(self, text: str) -> None:
+        msg = str(text or "").strip()
+        if not msg:
+            return
+        if not msg.lower().startswith("planner bridge:"):
+            msg = f"Planner Bridge: {msg}"
+        self._set_planner_bridge_status(msg)
+        try:
+            if hasattr(self, "progress"):
+                self.progress.setFormat(str(text or "Assembling LTX music video..."))
+        except Exception:
+            pass
+
+    def _on_ltx_assembly_finished(self, result: dict) -> None:
+        self._set_ltx_assembly_busy(False)
+        self._ltx_assembly_worker = None
+        if not isinstance(result, dict):
+            result = {"ok": False, "message": "LTX assembly returned an invalid result."}
+        msg = str(result.get("message") or "LTX music video assembly finished.")
+        out_path = str(result.get("final_output_path") or "").strip()
+        if out_path and out_path not in msg:
+            msg += f" Output: {out_path}"
+        self._set_planner_bridge_status(f"Planner Bridge: {msg}")
+        try:
+            if hasattr(self, "progress"):
+                self.progress.setFormat("LTX music video assembly finished.")
+        except Exception:
+            pass
+        try:
+            self._show_toast("LTX music video assembly finished.")
+        except Exception:
+            pass
+
+    def _on_ltx_assembly_failed(self, message: str) -> None:
+        self._set_ltx_assembly_busy(False)
+        self._ltx_assembly_worker = None
+        msg = str(message or "LTX music video assembly failed.")
+        self._set_planner_bridge_status(f"Planner Bridge: {msg}")
+        try:
+            if hasattr(self, "progress"):
+                self.progress.setFormat("LTX music video assembly failed.")
+        except Exception:
+            pass
+        try:
+            QMessageBox.warning(self, "Planner Bridge", msg, QMessageBox.Ok)
+        except Exception:
+            pass
+
+    def _on_assemble_ltx_music_video_clicked(self) -> None:
+        if bool(getattr(self, "_ltx_assembly_running", False)):
+            self._set_planner_bridge_status("Planner Bridge: LTX music video assembly is already running...")
+            return
+        if bool(getattr(self, "_ltx_full_run_running", False)):
+            self._set_planner_bridge_status("Planner Bridge: wait until full LTX generation is finished before assembling.")
+            return
+        bridge = getattr(self, "_planner_bridge", None)
+        if bridge is None:
+            self._set_planner_bridge_status("Planner Bridge is not available in this build.")
+            return
+        assemble_fn = getattr(bridge, "assemble_ltx_music_video", None)
+        if not callable(assemble_fn):
+            msg = "LTX final assembly is not available in this bridge file."
+            self._set_planner_bridge_status(f"Planner Bridge: {msg}")
+            try:
+                QMessageBox.warning(self, "Planner Bridge", msg, QMessageBox.Ok)
+            except Exception:
+                pass
+            return
+
+        plan_path = self._planner_bridge_existing_ltx_director_plan_path()
+        if not plan_path:
+            msg = "Create an LTX director plan first."
+            self._set_planner_bridge_status(f"Planner Bridge: {msg}")
+            try:
+                QMessageBox.warning(self, "Planner Bridge", msg, QMessageBox.Ok)
+            except Exception:
+                pass
+            return
+
+        payload = {
+            "root_dir": _musicclip_project_root(),
+            "ltx_director_plan_path": plan_path,
+        }
+        self._set_ltx_assembly_busy(True)
+        self._set_planner_bridge_status("Planner Bridge: assembling LTX music video...")
+        try:
+            if hasattr(self, "progress"):
+                self.progress.setFormat("Assembling LTX music video...")
+        except Exception:
+            pass
+
+        worker = LtxAssemblyWorker(bridge, payload, self)
+        worker.progress_text.connect(self._on_ltx_assembly_progress)
+        worker.finished_result.connect(self._on_ltx_assembly_finished)
+        worker.failed.connect(self._on_ltx_assembly_failed)
+        try:
+            worker.finished.connect(worker.deleteLater)
+        except Exception:
+            pass
+        self._ltx_assembly_worker = worker
+        worker.start()
+
+    def _on_test_ltx_single_shot_clicked(self) -> None:
+        if bool(getattr(self, "_ltx_single_test_running", False)):
+            self._set_planner_bridge_status("Planner Bridge: LTX single-shot test is already running...")
+            return
+        bridge = getattr(self, "_planner_bridge", None)
+        if bridge is None:
+            self._set_planner_bridge_status("Planner Bridge is not available in this build.")
+            return
+        run_fn = getattr(bridge, "run_single_ltx_shot_test", None)
+        if not callable(run_fn):
+            msg = "LTX single-shot test runner is not available in this bridge file."
+            self._set_planner_bridge_status(f"Planner Bridge: {msg}")
+            try:
+                QMessageBox.warning(self, "Planner Bridge", msg, QMessageBox.Ok)
+            except Exception:
+                pass
+            return
+
+        plan_path = self._planner_bridge_existing_ltx_director_plan_path()
+        if not plan_path:
+            msg = "Create an LTX director plan first."
+            self._set_planner_bridge_status(f"Planner Bridge: {msg}")
+            try:
+                QMessageBox.warning(self, "Planner Bridge", msg, QMessageBox.Ok)
+            except Exception:
+                pass
+            return
+
+        combo = getattr(self, "combo_ltx_single_shot", None)
+        if combo is None or combo.count() <= 0:
+            self._refresh_ltx_single_shots()
+        combo = getattr(self, "combo_ltx_single_shot", None)
+        if combo is None or combo.count() <= 0:
+            return
+        shot_id = str(combo.currentData() or combo.currentText() or "").split(" ")[0].strip()
+        if not shot_id:
+            msg = "No LTX shot is selected."
+            self._set_planner_bridge_status(f"Planner Bridge: {msg}")
+            return
+
+        image_combo = getattr(self, "combo_ltx_single_image_mode", None)
+        image_mode = str(image_combo.currentData() if image_combo is not None else "existing")
+        existing_start = str(getattr(self, "edit_ltx_single_start_image", None).text() if getattr(self, "edit_ltx_single_start_image", None) is not None else "").strip()
+        use_generated = bool(getattr(self, "check_ltx_use_generated_start_image", None) and self.check_ltx_use_generated_start_image.isChecked())
+        generated_start = str(getattr(self, "edit_ltx_generated_start_image", None).text() if getattr(self, "edit_ltx_generated_start_image", None) is not None else "").strip()
+        generated_shot_id = str(getattr(self, "_ltx_generated_start_image_shot_id", "") or "").strip()
+        if use_generated and generated_start and (not generated_shot_id or generated_shot_id == shot_id):
+            image_mode = "existing"
+            existing_start = generated_start
+        if image_mode == "existing" and not existing_start:
+            msg = "Select an existing start image first, or generate one for the selected shot."
+            self._set_planner_bridge_status(f"Planner Bridge: {msg}")
+            try:
+                QMessageBox.warning(self, "Planner Bridge", msg, QMessageBox.Ok)
+            except Exception:
+                pass
+            return
+
+        use_lora = bool(getattr(self, "check_ltx_single_use_lora", None) and self.check_ltx_single_use_lora.isChecked())
+        payload = {
+            "root_dir": _musicclip_project_root(),
+            "ltx_director_plan_path": plan_path,
+            "shot_id": shot_id,
+            "image_mode": image_mode,
+            "existing_start_image_path": existing_start,
+            "steps": 8,
+            "resolution": "1280x720",
+            "allow_no_audio": False,
+            "character_reference": self._planner_bridge_character_reference_payload(),
+        }
+        if use_lora:
+            payload["ltx_lora_file"] = str(getattr(self, "edit_ltx_single_lora_file", None).text() if getattr(self, "edit_ltx_single_lora_file", None) is not None else "").strip()
+            payload["ltx_lora_json"] = str(getattr(self, "edit_ltx_single_lora_json", None).text() if getattr(self, "edit_ltx_single_lora_json", None) is not None else "").strip()
+            try:
+                payload["ltx_lora_multiplier"] = float(getattr(self, "spin_ltx_single_lora_multiplier", None).value()) if getattr(self, "spin_ltx_single_lora_multiplier", None) is not None else 1.0
+            except Exception:
+                payload["ltx_lora_multiplier"] = 1.0
+
+        self._set_ltx_single_test_busy(True)
+        self._set_planner_bridge_status(f"Planner Bridge: Testing {shot_id} with LTX...")
+        try:
+            if hasattr(self, "progress"):
+                self.progress.setFormat("Running LTX single-shot test...")
+        except Exception:
+            pass
+
+        worker = LtxSingleShotTestWorker(bridge, payload, self)
+        worker.progress_text.connect(self._on_ltx_single_test_progress)
+        worker.finished_result.connect(self._on_ltx_single_test_finished)
+        worker.failed.connect(self._on_ltx_single_test_failed)
+        try:
+            worker.finished.connect(worker.deleteLater)
+        except Exception:
+            pass
+        self._ltx_single_test_worker = worker
+        worker.start()
+
     def _update_smart_director_visibility(self) -> None:
         """Keep Smart Director controls and the classic FX Level row in sync."""
         try:
@@ -11618,6 +14444,11 @@ class AutoMusicSyncWidget(QWidget):
 
     def _on_use_default_settings(self) -> None:
         """Apply the recommended Music Clip Creator defaults without clearing paths."""
+        try:
+            self._settings_startup_protected = False
+            self._settings_ready = True
+        except Exception:
+            pass
         self._apply_music_clip_creator_defaults(save=True, show_message=True)
 
     def _apply_music_clip_creator_defaults(self, save: bool = True, show_message: bool = False) -> None:
@@ -11662,8 +14493,9 @@ class AutoMusicSyncWidget(QWidget):
             pass
         try:
             if hasattr(self, "combo_clip_order"):
-                # Keep the current coded default: Random (default).
-                self.combo_clip_order.setCurrentIndex(0)
+                # Default to predictable ordering for repeatable music-video tests.
+                idx = self.combo_clip_order.findText("Sequential", Qt.MatchFixedString)
+                self.combo_clip_order.setCurrentIndex(idx if idx >= 0 else 1)
         except Exception:
             pass
         try:
@@ -11675,7 +14507,7 @@ class AutoMusicSyncWidget(QWidget):
             pass
         try:
             if hasattr(self, "check_use_lyrics_srt_timing"):
-                self.check_use_lyrics_srt_timing.setChecked(False)
+                self.check_use_lyrics_srt_timing.setChecked(True)
             self._update_lyrics_srt_ui()
         except Exception:
             pass
@@ -11711,6 +14543,8 @@ class AutoMusicSyncWidget(QWidget):
         except Exception:
             pass
         try:
+            if hasattr(self, "check_micro_enable"):
+                self.check_micro_enable.setChecked(False)
             if hasattr(self, "check_micro_chorus"):
                 self.check_micro_chorus.setChecked(False)
             if hasattr(self, "check_micro_all"):
@@ -11724,6 +14558,20 @@ class AutoMusicSyncWidget(QWidget):
                 self.slider_sens.setValue(int(self.slider_sens.maximum()))
             if hasattr(self, "spin_beats_per_seg"):
                 self.spin_beats_per_seg.setValue(16)
+        except Exception:
+            pass
+
+        # Planner Bridge / LTX testing defaults
+        try:
+            if getattr(self, "check_bridge_use_vocal_roles", None) is not None:
+                self.check_bridge_use_vocal_roles.setChecked(True)
+            if getattr(self, "combo_bridge_ltx_grouping_mode", None) is not None:
+                idx = self.combo_bridge_ltx_grouping_mode.findText("Auto", Qt.MatchFixedString)
+                self.combo_bridge_ltx_grouping_mode.setCurrentIndex(idx if idx >= 0 else 0)
+            if getattr(self, "check_bridge_ltx_export_audio_chunks", None) is not None:
+                self.check_bridge_ltx_export_audio_chunks.setChecked(True)
+            if getattr(self, "spin_bridge_ltx_fps", None) is not None:
+                self.spin_bridge_ltx_fps.setValue(24)
         except Exception:
             pass
 
@@ -11944,9 +14792,14 @@ class AutoMusicSyncWidget(QWidget):
                 out_keep = self.edit_output.text().strip()
             except Exception:
                 out_keep = ""
-            self._settings.clear()
+            store = self._settings
+            store.clear()
             if out_keep:
-                self._settings.setValue("output_path", out_keep)
+                store.set("output_path", out_keep)
+            try:
+                store.sync()
+            except Exception:
+                pass
         except Exception:
             pass
 
@@ -12035,6 +14888,8 @@ class AutoMusicSyncWidget(QWidget):
         self.check_nofx.setChecked(False)
 
         # Microclips
+        if hasattr(self, "check_micro_enable"):
+            self.check_micro_enable.setChecked(False)
         self.check_micro_chorus.setChecked(False)
         self.check_micro_all.setChecked(False)
         try:
@@ -12333,24 +15188,203 @@ class AutoMusicSyncWidget(QWidget):
         except Exception:
             pass
 
+    def _restore_startup_settings_snapshot(self) -> None:
+        """Re-apply the JSON state captured at constructor start.
+
+        This is not a second settings system. It is a startup guard against
+        programmatic UI changes that happen after _load_settings() and before
+        the user touches the page. Saving remains blocked while this runs.
+        """
+        if not getattr(self, "_settings_startup_protected", False):
+            return
+        try:
+            snap = copy.deepcopy(getattr(self, "_settings_startup_snapshot", {}) or {})
+        except Exception:
+            snap = {}
+        try:
+            if isinstance(snap, dict):
+                self._settings._data = snap
+                self._settings._dirty = False
+        except Exception:
+            pass
+        old_loading = bool(getattr(self, "_settings_loading", False))
+        try:
+            self._settings_loading = True
+            self._load_settings()
+        except Exception:
+            pass
+        finally:
+            self._settings_loading = old_loading
+
+    def _finish_startup_settings_protection(self) -> None:
+        """Release startup save blocking after the final safe restore."""
+        if not getattr(self, "_settings_startup_protected", False):
+            return
+        try:
+            self._restore_startup_settings_snapshot()
+        except Exception:
+            pass
+        try:
+            self._settings_startup_protected = False
+            self._settings_ready = True
+            # Write the restored visible state once, so the project JSON stays
+            # consistent with the UI after late startup changes are rejected.
+            self._save_settings()
+        except Exception:
+            pass
+
+    def _queue_settings_save(self, *args) -> None:
+        """Debounced autosave for user changes after startup settings finished loading."""
+        try:
+            if (getattr(self, "_settings_loading", False)
+                    or getattr(self, "_settings_startup_protected", False)
+                    or not getattr(self, "_settings_ready", False)):
+                return
+            # Save the important visible settings immediately so quick restarts
+            # cannot lose changes while the full debounced save is still pending.
+            self._save_core_musicclip_settings(sync=True)
+            timer = getattr(self, "_settings_save_timer", None)
+            if timer is not None:
+                timer.start(350)
+                return
+        except Exception:
+            pass
+        try:
+            self._save_settings()
+        except Exception:
+            pass
+
+    def _connect_settings_autosave(self) -> None:
+        """Connect user-facing setting widgets to guarded autosave.
+
+        Many controls used to save only when Analyze/Generate was clicked, which meant
+        restart could restore older saved state. This keeps changes persistent
+        without allowing startup load signals to overwrite the saved store.
+        """
+        if getattr(self, "_settings_autosave_connected", False):
+            return
+        self._settings_autosave_connected = True
+        seen = set()
+
+        roots = [
+            self,
+            getattr(self, "box_opts", None),
+            getattr(self, "box_generation_settings", None),
+            getattr(self, "smart_director_box", None),
+            getattr(self, "box_lyrics_srt_settings", None),
+            getattr(self, "box_planner_bridge", None),
+            getattr(self, "box_adv", None),
+            getattr(self, "footer_bar", None),
+        ]
+
+        def _add_widget(w) -> None:
+            if w is None:
+                return
+            try:
+                wid = id(w)
+                if wid in seen:
+                    return
+                seen.add(wid)
+            except Exception:
+                return
+            try:
+                if isinstance(w, (QLabel, QPushButton, QListWidget, QProgressBar, QTextEdit)):
+                    return
+            except Exception:
+                pass
+            try:
+                if isinstance(w, QLineEdit):
+                    w.textChanged.connect(self._queue_settings_save)
+                    return
+                if isinstance(w, QComboBox):
+                    w.currentIndexChanged.connect(self._queue_settings_save)
+                    return
+                if isinstance(w, QCheckBox):
+                    w.toggled.connect(self._queue_settings_save)
+                    return
+                if isinstance(w, QGroupBox):
+                    try:
+                        if w.isCheckable():
+                            w.toggled.connect(self._queue_settings_save)
+                    except Exception:
+                        pass
+                    return
+                if isinstance(w, (QSlider, QSpinBox, QDoubleSpinBox)):
+                    w.valueChanged.connect(self._queue_settings_save)
+                    return
+            except Exception:
+                return
+
+        for root in roots:
+            if root is None:
+                continue
+            try:
+                _add_widget(root)
+                for child in root.findChildren(QWidget):
+                    _add_widget(child)
+            except Exception:
+                continue
+
+    def _settings_bridge_text_value(self, key: str, default: str = "") -> str:
+        """Read a saved Planner Bridge creative field and reject old path pollution."""
+        try:
+            raw = str(self._settings.get(key, default, str) or "").strip()
+        except Exception:
+            raw = str(default or "").strip()
+        if _musicclip_text_looks_like_path(raw):
+            return ""
+        return raw
+
+    def _settings_clean_bridge_text(self, attr_name: str) -> str:
+        """Return bridge text for saving, but never save obvious file/folder paths."""
+        try:
+            w = getattr(self, attr_name, None)
+            raw = str(w.text()).strip() if w is not None else ""
+        except Exception:
+            raw = ""
+        if _musicclip_text_looks_like_path(raw):
+            return ""
+        return raw
+
+
     def _load_settings(self) -> None:
-        """Load last-used paths and options from QSettings."""
+        """Load last-used paths and options from visible project JSON."""
         s = self._settings
-        self.edit_audio.setText(s.value("audio_path", "", str))
-        self.edit_video.setText(s.value("video_path", "", str))
-        self.edit_output.setText(s.value("output_path", "output/videoclips", str))
+        self.edit_audio.setText(s.get("audio_path", "", str))
+        self.edit_video.setText(s.get("video_path", "", str))
+        self.edit_output.setText(s.get("output_path", "output/videoclips", str))
         try:
             if not self.edit_output.text().strip():
                 self.edit_output.setText("output/videoclips")
         except Exception:
             pass
 
-        self.combo_fx.setCurrentIndex(int(s.value("fx_level", self.combo_fx.currentIndex())))
+        self.combo_fx.setCurrentIndex(int(s.get("fx_level", self.combo_fx.currentIndex())))
+        try:
+            def _bridge_bool(new_key: str, old_key: str, default_value: int) -> bool:
+                try:
+                    return bool(int(s.get(new_key, s.get(old_key, default_value))))
+                except Exception:
+                    return bool(default_value)
+            w = getattr(self, "check_bridge_timestamped_microclips", None)
+            if w is not None:
+                w.setChecked(_bridge_bool("ltx/use_timestamped_microclips", "bridge_timestamped_microclips", int(w.isChecked())))
+            w = getattr(self, "check_bridge_collage_effect", None)
+            if w is not None:
+                w.setChecked(_bridge_bool("ltx/use_collage_effect", "bridge_collage_effect", int(w.isChecked())))
+            w = getattr(self, "check_bridge_avoid_effects_first_clip", None)
+            if w is not None:
+                w.setChecked(_bridge_bool("ltx/keep_first_generated_shot_clean", "bridge_avoid_effects_first_clip", int(w.isChecked())))
+            w = getattr(self, "check_bridge_avoid_effects_last_clip", None)
+            if w is not None:
+                w.setChecked(_bridge_bool("ltx/keep_last_generated_shot_clean", "bridge_avoid_effects_last_clip", int(w.isChecked())))
+        except Exception:
+            pass
         if hasattr(self, "check_smart_scene_map"):
-            self.check_smart_scene_map.setChecked(bool(int(s.value("smart_scene_map", int(self.check_smart_scene_map.isChecked())))))
+            self.check_smart_scene_map.setChecked(bool(int(s.get("smart_scene_map", int(self.check_smart_scene_map.isChecked())))))
         if hasattr(self, "combo_director_preset"):
             try:
-                preset_text = str(s.value("director_preset", self.combo_director_preset.currentText(), str))
+                preset_text = str(s.get("director_preset", self.combo_director_preset.currentText(), str))
                 idx_p = self.combo_director_preset.findText(_normalize_director_preset(preset_text), Qt.MatchFixedString)
                 if idx_p >= 0:
                     self.combo_director_preset.setCurrentIndex(idx_p)
@@ -12358,7 +15392,7 @@ class AutoMusicSyncWidget(QWidget):
                 pass
         if hasattr(self, "combo_scene_cut_style"):
             try:
-                cut_text = str(s.value("scene_cut_style", self.combo_scene_cut_style.currentText(), str))
+                cut_text = str(s.get("scene_cut_style", self.combo_scene_cut_style.currentText(), str))
                 idx_c = self.combo_scene_cut_style.findText(_normalize_cut_style(cut_text), Qt.MatchFixedString)
                 if idx_c >= 0:
                     self.combo_scene_cut_style.setCurrentIndex(idx_c)
@@ -12366,19 +15400,19 @@ class AutoMusicSyncWidget(QWidget):
                 pass
         if hasattr(self, "spin_smart_cut_timing_offset"):
             try:
-                self.spin_smart_cut_timing_offset.setValue(_normalize_smart_cut_timing_offset(float(s.value("smart_cut_timing_offset", self.spin_smart_cut_timing_offset.value()))))
+                self.spin_smart_cut_timing_offset.setValue(_normalize_smart_cut_timing_offset(float(s.get("smart_cut_timing_offset", self.spin_smart_cut_timing_offset.value()))))
             except Exception:
                 pass
         if hasattr(self, "check_smart_scene_duration_guard"):
-            self.check_smart_scene_duration_guard.setChecked(bool(int(s.value("smart_scene_duration_guard", int(self.check_smart_scene_duration_guard.isChecked())))))
+            self.check_smart_scene_duration_guard.setChecked(bool(int(s.get("smart_scene_duration_guard", int(self.check_smart_scene_duration_guard.isChecked())))))
         if hasattr(self, "spin_smart_min_scene_len"):
             try:
-                self.spin_smart_min_scene_len.setValue(float(s.value("smart_min_scene_len", self.spin_smart_min_scene_len.value())))
+                self.spin_smart_min_scene_len.setValue(float(s.get("smart_min_scene_len", self.spin_smart_min_scene_len.value())))
             except Exception:
                 pass
         if hasattr(self, "combo_smart_max_scene_mode"):
             try:
-                max_mode_text = str(s.value("smart_max_scene_mode", self.combo_smart_max_scene_mode.currentText(), str))
+                max_mode_text = str(s.get("smart_max_scene_mode", self.combo_smart_max_scene_mode.currentText(), str))
                 idx_m = self.combo_smart_max_scene_mode.findText(_normalize_smart_scene_max_mode(max_mode_text), Qt.MatchFixedString)
                 if idx_m >= 0:
                     self.combo_smart_max_scene_mode.setCurrentIndex(idx_m)
@@ -12386,17 +15420,17 @@ class AutoMusicSyncWidget(QWidget):
                 pass
         if hasattr(self, "spin_smart_max_scene_len"):
             try:
-                self.spin_smart_max_scene_len.setValue(float(s.value("smart_max_scene_len", self.spin_smart_max_scene_len.value())))
+                self.spin_smart_max_scene_len.setValue(float(s.get("smart_max_scene_len", self.spin_smart_max_scene_len.value())))
             except Exception:
                 pass
         try:
             if hasattr(self, "check_use_lyrics_srt_timing"):
                 try:
                     self.check_use_lyrics_srt_timing.blockSignals(True)
-                    self.check_use_lyrics_srt_timing.setChecked(bool(int(s.value("use_lyrics_srt_timing", 0))))
+                    self.check_use_lyrics_srt_timing.setChecked(bool(int(s.get("use_lyrics_srt_timing", 0))))
                 finally:
                     self.check_use_lyrics_srt_timing.blockSignals(False)
-            self._lyrics_srt_path = str(s.value("lyrics_srt_path", "", str) or "").strip()
+            self._lyrics_srt_path = str(s.get("lyrics_srt_path", "", str) or "").strip()
             self._lyrics_srt_segments = []
             if self._lyrics_srt_path and os.path.isfile(self._lyrics_srt_path):
                 try:
@@ -12406,33 +15440,87 @@ class AutoMusicSyncWidget(QWidget):
             self._update_lyrics_srt_ui()
         except Exception:
             pass
-        self.check_nofx.setChecked(bool(int(s.value("nofx", int(self.check_nofx.isChecked() if hasattr(self, "check_nofx") else 0)))))
+        try:
+            if getattr(self, "edit_bridge_main_idea", None) is not None:
+                self.edit_bridge_main_idea.setText(self._settings_bridge_text_value("planner_bridge_main_idea"))
+            if getattr(self, "edit_bridge_style_theme", None) is not None:
+                self.edit_bridge_style_theme.setText(self._settings_bridge_text_value("planner_bridge_style_theme"))
+            if getattr(self, "edit_bridge_characters_subjects", None) is not None:
+                self.edit_bridge_characters_subjects.setText(self._settings_bridge_text_value("planner_bridge_characters_subjects"))
+            if getattr(self, "edit_bridge_locations_world", None) is not None:
+                self.edit_bridge_locations_world.setText(self._settings_bridge_text_value("planner_bridge_locations_world"))
+            if getattr(self, "edit_bridge_camera_choreography", None) is not None:
+                self.edit_bridge_camera_choreography.setText(self._settings_bridge_text_value("planner_bridge_camera_choreography"))
+            if getattr(self, "check_bridge_use_vocal_roles", None) is not None:
+                try:
+                    self.check_bridge_use_vocal_roles.blockSignals(True)
+                    self.check_bridge_use_vocal_roles.setChecked(bool(int(s.get("planner_bridge_use_vocal_roles", 1))))
+                finally:
+                    self.check_bridge_use_vocal_roles.blockSignals(False)
+            if getattr(self, "combo_bridge_ltx_grouping_mode", None) is not None:
+                try:
+                    self.combo_bridge_ltx_grouping_mode.blockSignals(True)
+                    mode = str(s.get("planner_bridge_ltx_grouping_mode", "Auto", str) or "Auto")
+                    idx = self.combo_bridge_ltx_grouping_mode.findText(mode, Qt.MatchFixedString)
+                    if idx < 0:
+                        idx = 0
+                    self.combo_bridge_ltx_grouping_mode.setCurrentIndex(idx)
+                finally:
+                    self.combo_bridge_ltx_grouping_mode.blockSignals(False)
+            if getattr(self, "check_bridge_ltx_export_audio_chunks", None) is not None:
+                try:
+                    self.check_bridge_ltx_export_audio_chunks.blockSignals(True)
+                    self.check_bridge_ltx_export_audio_chunks.setChecked(bool(int(s.get("planner_bridge_ltx_export_audio_chunks", 1))))
+                finally:
+                    self.check_bridge_ltx_export_audio_chunks.blockSignals(False)
+            if getattr(self, "spin_bridge_ltx_fps", None) is not None:
+                try:
+                    self.spin_bridge_ltx_fps.blockSignals(True)
+                    self.spin_bridge_ltx_fps.setValue(int(s.get("planner_bridge_ltx_fps", 24)))
+                finally:
+                    self.spin_bridge_ltx_fps.blockSignals(False)
+            self._planner_bridge_character_reference_sheet_path = str(s.get("planner_bridge_character_reference_sheet_path", "", str) or "").strip()
+            self._planner_bridge_character_reference_sheet_paths = {f"char_{i:02d}": str(s.get(f"planner_bridge_character_reference_sheet_path_char_{i:02d}", "", str) or "").strip() for i in range(1, 6)}
+            self._update_bridge_character_reference_ui()
+            self._planner_bridge_last_scene_plan_path = str(s.get("planner_bridge_last_scene_plan_path", "", str) or "")
+            self._planner_bridge_last_prompt_plan_path = str(s.get("planner_bridge_last_prompt_plan_path", "", str) or "")
+            self._planner_bridge_last_ltx_shot_plan_path = str(s.get("planner_bridge_last_ltx_shot_plan_path", "", str) or "")
+            self._planner_bridge_last_ltx_director_plan_path = str(s.get("planner_bridge_last_ltx_director_plan_path", "", str) or "")
+        except Exception:
+            pass
+        self.check_nofx.setChecked(bool(int(s.get("nofx", int(self.check_nofx.isChecked() if hasattr(self, "check_nofx") else 0)))))
         if hasattr(self, "check_visual_overlay"):
-            self.check_visual_overlay.setChecked(bool(int(s.value("visual_overlay", int(self.check_visual_overlay.isChecked())))))
+            self.check_visual_overlay.setChecked(bool(int(s.get("visual_overlay", int(self.check_visual_overlay.isChecked())))))
         if hasattr(self, "check_visual_strategy_segment"):
-            self.check_visual_strategy_segment.setChecked(bool(int(s.value("visual_strategy_segment", int(self.check_visual_strategy_segment.isChecked())))))
+            self.check_visual_strategy_segment.setChecked(bool(int(s.get("visual_strategy_segment", int(self.check_visual_strategy_segment.isChecked())))))
         if hasattr(self, "check_visual_strategy_section"):
-            self.check_visual_strategy_section.setChecked(bool(int(s.value("visual_strategy_section", int(self.check_visual_strategy_section.isChecked())))))
-        self.check_micro_chorus.setChecked(bool(int(s.value("micro_chorus", int(self.check_micro_chorus.isChecked())))))
-        self.check_micro_all.setChecked(bool(int(s.value("micro_all", int(self.check_micro_all.isChecked())))))
+            self.check_visual_strategy_section.setChecked(bool(int(s.get("visual_strategy_section", int(self.check_visual_strategy_section.isChecked())))))
+        self.check_micro_chorus.setChecked(bool(int(s.get("micro_chorus", int(self.check_micro_chorus.isChecked())))))
+        self.check_micro_all.setChecked(bool(int(s.get("micro_all", int(self.check_micro_all.isChecked())))))
         if hasattr(self, "check_micro_verses"):
-            self.check_micro_verses.setChecked(bool(int(s.value("micro_verses", int(self.check_micro_verses.isChecked())))))
+            self.check_micro_verses.setChecked(bool(int(s.get("micro_verses", int(self.check_micro_verses.isChecked())))))
+        try:
+            old_micro_any = int(bool(self.check_micro_chorus.isChecked() or self.check_micro_all.isChecked() or (getattr(self, "check_micro_verses", None) is not None and self.check_micro_verses.isChecked())))
+            self.check_micro_enable.setChecked(bool(int(s.get("micro_enable", old_micro_any))))
+            self._on_micro_enable_toggled(bool(self.check_micro_enable.isChecked()))
+        except Exception:
+            pass
         try:
             if hasattr(self, "box_adv") and self.box_adv.isCheckable():
-                self.box_adv.setChecked(bool(int(s.value("advanced_beat_settings_enabled", int(self.box_adv.isChecked())))))
+                self.box_adv.setChecked(bool(int(s.get("advanced_beat_settings_enabled", int(self.box_adv.isChecked())))))
         except Exception:
             pass
         self.check_full_length.setChecked(True)
-        self.check_intro_fade.setChecked(bool(int(s.value("intro_fade", int(self.check_intro_fade.isChecked())))))
-        self.check_outro_fade.setChecked(bool(int(s.value("outro_fade", int(self.check_outro_fade.isChecked())))))
+        self.check_intro_fade.setChecked(bool(int(s.get("intro_fade", int(self.check_intro_fade.isChecked())))))
+        self.check_outro_fade.setChecked(bool(int(s.get("outro_fade", int(self.check_outro_fade.isChecked())))))
         if hasattr(self, "check_intro_transitions_only"):
-            self.check_intro_transitions_only.setChecked(bool(int(s.value("intro_transitions_only", int(self.check_intro_transitions_only.isChecked())))))
-        self.combo_clip_order.setCurrentIndex(int(s.value("clip_order", self.combo_clip_order.currentIndex())))
-        self.combo_transitions.setCurrentIndex(int(s.value("transitions_mode", self.combo_transitions.currentIndex())))
-        self.check_trans_random.setChecked(bool(int(s.value("transitions_random", int(self.check_trans_random.isChecked())))))
+            self.check_intro_transitions_only.setChecked(bool(int(s.get("intro_transitions_only", int(self.check_intro_transitions_only.isChecked())))))
+        self.combo_clip_order.setCurrentIndex(int(s.get("clip_order", 1)))
+        self.combo_transitions.setCurrentIndex(int(s.get("transitions_mode", self.combo_transitions.currentIndex())))
+        self.check_trans_random.setChecked(bool(int(s.get("transitions_random", int(self.check_trans_random.isChecked())))))
         # Restore the allowed transition styles for Random transitions
         try:
-            raw = s.value("transitions_random_enabled_modes", "", str)
+            raw = s.get("transitions_random_enabled_modes", "", str)
         except Exception:
             raw = ""
         modes = []
@@ -12463,19 +15551,19 @@ class AutoMusicSyncWidget(QWidget):
             if not getattr(self, "_enabled_transition_modes", None):
                 self._enabled_transition_modes = {0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14}
 
-        self.spin_seed.setValue(int(s.value("seed_value", self.spin_seed.value())))
-        self.check_use_seed.setChecked(bool(int(s.value("use_seed", int(self.check_use_seed.isChecked())))))
-        self.combo_res.setCurrentIndex(int(s.value("res_mode", self.combo_res.currentIndex())))
-        self.combo_fit.setCurrentIndex(int(s.value("fit_mode", self.combo_fit.currentIndex())))
+        self.spin_seed.setValue(int(s.get("seed_value", self.spin_seed.value())))
+        self.check_use_seed.setChecked(bool(int(s.get("use_seed", int(self.check_use_seed.isChecked())))))
+        self.combo_res.setCurrentIndex(int(s.get("res_mode", self.combo_res.currentIndex())))
+        self.combo_fit.setCurrentIndex(int(s.get("fit_mode", self.combo_fit.currentIndex())))
         if hasattr(self, "check_keep_source_bitrate"):
-            self.check_keep_source_bitrate.setChecked(bool(int(s.value("keep_source_bitrate", int(self.check_keep_source_bitrate.isChecked())))))
+            self.check_keep_source_bitrate.setChecked(bool(int(s.get("keep_source_bitrate", int(self.check_keep_source_bitrate.isChecked())))))
 
-        self.slider_sens.setValue(int(s.value("beat_sensitivity", self.slider_sens.value())))
-        self.spin_beats_per_seg.setValue(int(s.value("beats_per_segment", self.spin_beats_per_seg.value())))
+        self.slider_sens.setValue(int(s.get("beat_sensitivity", self.slider_sens.value())))
+        self.spin_beats_per_seg.setValue(int(s.get("beats_per_segment", self.spin_beats_per_seg.value())))
 
         # Restore still-image segment interval (segments per image)
         try:
-            interval = int(s.value("image_segment_interval", int(getattr(self, "image_segment_interval", 4))))
+            interval = int(s.get("image_segment_interval", int(getattr(self, "image_segment_interval", 4))))
         except Exception:
             interval = int(getattr(self, "image_segment_interval", 4))
         if interval < 0:
@@ -12494,68 +15582,68 @@ class AutoMusicSyncWidget(QWidget):
                 slider.blockSignals(False)
         self._on_image_interval_changed(interval)
 
-        self.check_min_clip.setChecked(bool(int(s.value("min_clip_enabled", int(self.check_min_clip.isChecked())))))
-        self.spin_min_clip.setValue(float(s.value("min_clip_seconds", self.spin_min_clip.value())))
+        self.check_min_clip.setChecked(bool(int(s.get("min_clip_enabled", int(self.check_min_clip.isChecked())))))
+        self.spin_min_clip.setValue(float(s.get("min_clip_seconds", self.spin_min_clip.value())))
 
         # Slow motion options
-        self.check_slow_enable.setChecked(bool(int(s.value("slow_enable", int(self.check_slow_enable.isChecked())))))
-        self.check_slow_intro.setChecked(bool(int(s.value("slow_intro", int(self.check_slow_intro.isChecked())))))
-        self.check_slow_break.setChecked(bool(int(s.value("slow_break", int(self.check_slow_break.isChecked())))))
-        self.check_slow_chorus.setChecked(bool(int(s.value("slow_chorus", int(self.check_slow_chorus.isChecked())))))
-        self.check_slow_drop.setChecked(bool(int(s.value("slow_drop", int(self.check_slow_drop.isChecked())))))
-        self.check_slow_outro.setChecked(bool(int(s.value("slow_outro", int(self.check_slow_outro.isChecked())))))
-        self.check_slow_random.setChecked(bool(int(s.value("slow_random", int(self.check_slow_random.isChecked())))))
-        self.slider_slow_factor.setValue(int(s.value("slow_factor_slider", self.slider_slow_factor.value())))
+        self.check_slow_enable.setChecked(bool(int(s.get("slow_enable", int(self.check_slow_enable.isChecked())))))
+        self.check_slow_intro.setChecked(bool(int(s.get("slow_intro", int(self.check_slow_intro.isChecked())))))
+        self.check_slow_break.setChecked(bool(int(s.get("slow_break", int(self.check_slow_break.isChecked())))))
+        self.check_slow_chorus.setChecked(bool(int(s.get("slow_chorus", int(self.check_slow_chorus.isChecked())))))
+        self.check_slow_drop.setChecked(bool(int(s.get("slow_drop", int(self.check_slow_drop.isChecked())))))
+        self.check_slow_outro.setChecked(bool(int(s.get("slow_outro", int(self.check_slow_outro.isChecked())))))
+        self.check_slow_random.setChecked(bool(int(s.get("slow_random", int(self.check_slow_random.isChecked())))))
+        self.slider_slow_factor.setValue(int(s.get("slow_factor_slider", self.slider_slow_factor.value())))
 
         # Cinematic effects options
-        self.check_cine_enable.setChecked(bool(int(s.value("cine_enable", int(self.check_cine_enable.isChecked())))))
-        self.check_cine_freeze.setChecked(bool(int(s.value("cine_freeze", int(self.check_cine_freeze.isChecked())))))
-        self.slider_cine_freeze_len.setValue(int(s.value("cine_freeze_len", self.slider_cine_freeze_len.value())))
-        self.slider_cine_freeze_zoom.setValue(int(s.value("cine_freeze_zoom", self.slider_cine_freeze_zoom.value())))
-        self.check_cine_tear_v.setChecked(bool(int(s.value("cine_tear_v", int(self.check_cine_tear_v.isChecked())))))
-        self.slider_cine_tear_v_strength.setValue(int(s.value("cine_tear_v_strength", self.slider_cine_tear_v_strength.value())))
-        self.check_cine_tear_h.setChecked(bool(int(s.value("cine_tear_h", int(self.check_cine_tear_h.isChecked())))))
-        self.slider_cine_tear_h_strength.setValue(int(s.value("cine_tear_h_strength", self.slider_cine_tear_h_strength.value())))
-        self.check_cine_color_cycle.setChecked(bool(int(s.value("cine_color_cycle", int(self.check_cine_color_cycle.isChecked())))))
-        self.slider_cine_color_cycle_speed.setValue(int(s.value("cine_color_cycle_speed_ms", int(self.slider_cine_color_cycle_speed.value()))))
+        self.check_cine_enable.setChecked(bool(int(s.get("cine_enable", int(self.check_cine_enable.isChecked())))))
+        self.check_cine_freeze.setChecked(bool(int(s.get("cine_freeze", int(self.check_cine_freeze.isChecked())))))
+        self.slider_cine_freeze_len.setValue(int(s.get("cine_freeze_len", self.slider_cine_freeze_len.value())))
+        self.slider_cine_freeze_zoom.setValue(int(s.get("cine_freeze_zoom", self.slider_cine_freeze_zoom.value())))
+        self.check_cine_tear_v.setChecked(bool(int(s.get("cine_tear_v", int(self.check_cine_tear_v.isChecked())))))
+        self.slider_cine_tear_v_strength.setValue(int(s.get("cine_tear_v_strength", self.slider_cine_tear_v_strength.value())))
+        self.check_cine_tear_h.setChecked(bool(int(s.get("cine_tear_h", int(self.check_cine_tear_h.isChecked())))))
+        self.slider_cine_tear_h_strength.setValue(int(s.get("cine_tear_h_strength", self.slider_cine_tear_h_strength.value())))
+        self.check_cine_color_cycle.setChecked(bool(int(s.get("cine_color_cycle", int(self.check_cine_color_cycle.isChecked())))))
+        self.slider_cine_color_cycle_speed.setValue(int(s.get("cine_color_cycle_speed_ms", int(self.slider_cine_color_cycle_speed.value()))))
 
-        self.check_cine_stutter.setChecked(bool(int(s.value("cine_stutter", int(self.check_cine_stutter.isChecked())))))
-        self.spin_cine_stutter_repeats.setValue(int(s.value("cine_stutter_repeats", self.spin_cine_stutter_repeats.value())))
-        self.check_cine_reverse.setChecked(bool(int(s.value("cine_reverse", int(self.check_cine_reverse.isChecked())))))
-        self.slider_cine_reverse_len.setValue(int(s.value("cine_reverse_len", self.slider_cine_reverse_len.value())))
-        self.check_cine_speedup_forward.setChecked(bool(int(s.value("cine_speedup_forward", int(self.check_cine_speedup_forward.isChecked())))))
+        self.check_cine_stutter.setChecked(bool(int(s.get("cine_stutter", int(self.check_cine_stutter.isChecked())))))
+        self.spin_cine_stutter_repeats.setValue(int(s.get("cine_stutter_repeats", self.spin_cine_stutter_repeats.value())))
+        self.check_cine_reverse.setChecked(bool(int(s.get("cine_reverse", int(self.check_cine_reverse.isChecked())))))
+        self.slider_cine_reverse_len.setValue(int(s.get("cine_reverse_len", self.slider_cine_reverse_len.value())))
+        self.check_cine_speedup_forward.setChecked(bool(int(s.get("cine_speedup_forward", int(self.check_cine_speedup_forward.isChecked())))))
         try:
-            self.spin_cine_speedup_forward.setValue(float(s.value("cine_speedup_forward_factor", self.spin_cine_speedup_forward.value())))
+            self.spin_cine_speedup_forward.setValue(float(s.get("cine_speedup_forward_factor", self.spin_cine_speedup_forward.value())))
         except Exception:
             pass
-        self.check_cine_speedup_backward.setChecked(bool(int(s.value("cine_speedup_backward", int(self.check_cine_speedup_backward.isChecked())))))
+        self.check_cine_speedup_backward.setChecked(bool(int(s.get("cine_speedup_backward", int(self.check_cine_speedup_backward.isChecked())))))
         try:
-            self.spin_cine_speedup_backward.setValue(float(s.value("cine_speedup_backward_factor", self.spin_cine_speedup_backward.value())))
+            self.spin_cine_speedup_backward.setValue(float(s.get("cine_speedup_backward_factor", self.spin_cine_speedup_backward.value())))
         except Exception:
             pass
-        self.check_cine_speed_ramp.setChecked(bool(int(s.value("cine_speed_ramp", int(self.check_cine_speed_ramp.isChecked())))))
-        self.slider_cine_ramp_in.setValue(int(s.value("cine_ramp_in", self.slider_cine_ramp_in.value())))
-        self.slider_cine_ramp_out.setValue(int(s.value("cine_ramp_out", self.slider_cine_ramp_out.value())))
-        self.check_cine_boomerang.setChecked(bool(int(s.value("cine_boomerang", int(self.check_cine_boomerang.isChecked())))))
-        self.slider_cine_boomerang_bounces.setValue(int(s.value("cine_boomerang_bounces", self.slider_cine_boomerang_bounces.value())))
+        self.check_cine_speed_ramp.setChecked(bool(int(s.get("cine_speed_ramp", int(self.check_cine_speed_ramp.isChecked())))))
+        self.slider_cine_ramp_in.setValue(int(s.get("cine_ramp_in", self.slider_cine_ramp_in.value())))
+        self.slider_cine_ramp_out.setValue(int(s.get("cine_ramp_out", self.slider_cine_ramp_out.value())))
+        self.check_cine_boomerang.setChecked(bool(int(s.get("cine_boomerang", int(self.check_cine_boomerang.isChecked())))))
+        self.slider_cine_boomerang_bounces.setValue(int(s.get("cine_boomerang_bounces", self.slider_cine_boomerang_bounces.value())))
         if hasattr(self, "check_cine_dimension"):
-            self.check_cine_dimension.setChecked(bool(int(s.value("cine_dimension", int(self.check_cine_dimension.isChecked())))))
+            self.check_cine_dimension.setChecked(bool(int(s.get("cine_dimension", int(self.check_cine_dimension.isChecked())))))
 
         if hasattr(self, "check_cine_pan916"):
-            self.check_cine_pan916.setChecked(bool(int(s.value("cine_pan916", int(self.check_cine_pan916.isChecked())))))
-            self.slider_cine_pan916_speed.setValue(int(s.value("cine_pan916_speed_ms", self.slider_cine_pan916_speed.value())))
+            self.check_cine_pan916.setChecked(bool(int(s.get("cine_pan916", int(self.check_cine_pan916.isChecked())))))
+            self.slider_cine_pan916_speed.setValue(int(s.get("cine_pan916_speed_ms", self.slider_cine_pan916_speed.value())))
             try:
                 self._on_cine_pan916_speed_changed(int(self.slider_cine_pan916_speed.value()))
             except Exception:
                 pass
-            self.slider_cine_pan916_parts.setValue(int(s.value("cine_pan916_parts", self.slider_cine_pan916_parts.value())))
+            self.slider_cine_pan916_parts.setValue(int(s.get("cine_pan916_parts", self.slider_cine_pan916_parts.value())))
             try:
                 self._on_cine_pan916_parts_changed(int(self.slider_cine_pan916_parts.value()))
             except Exception:
                 pass
-            self.check_cine_pan916_transparent.setChecked(bool(int(s.value("cine_pan916_transparent", int(self.check_cine_pan916_transparent.isChecked())))))
+            self.check_cine_pan916_transparent.setChecked(bool(int(s.get("cine_pan916_transparent", int(self.check_cine_pan916_transparent.isChecked())))))
             if hasattr(self, "check_cine_pan916_random"):
-                self.check_cine_pan916_random.setChecked(bool(int(s.value("cine_pan916_random", int(self.check_cine_pan916_random.isChecked())))))
+                self.check_cine_pan916_random.setChecked(bool(int(s.get("cine_pan916_random", int(self.check_cine_pan916_random.isChecked())))))
                 try:
                     self._on_cine_pan916_random_changed(self.check_cine_pan916_random.isChecked())
                 except Exception:
@@ -12563,15 +15651,15 @@ class AutoMusicSyncWidget(QWidget):
 
 
 
-        self.check_cine_mosaic.setChecked(bool(int(s.value("cine_mosaic", int(self.check_cine_mosaic.isChecked())))))
-        self.slider_cine_mosaic_screens.setValue(int(s.value("cine_mosaic_screens", self.slider_cine_mosaic_screens.value())))
-        self.check_cine_mosaic_random.setChecked(bool(int(s.value("cine_mosaic_random", int(self.check_cine_mosaic_random.isChecked())))))
-        self.check_cine_flip.setChecked(bool(int(s.value("cine_flip", int(self.check_cine_flip.isChecked())))))
-        self.check_cine_rotate.setChecked(bool(int(s.value("cine_rotate", int(self.check_cine_rotate.isChecked())))))
-        self.slider_cine_rotate_degrees.setValue(int(s.value("cine_rotate_degrees", self.slider_cine_rotate_degrees.value())))
-        self.check_cine_multiply.setChecked(bool(int(s.value("cine_multiply", int(self.check_cine_multiply.isChecked())))))
-        self.slider_cine_multiply_screens.setValue(int(s.value("cine_multiply_screens", self.slider_cine_multiply_screens.value())))
-        self.check_cine_multiply_random.setChecked(bool(int(s.value("cine_multiply_random", int(self.check_cine_multiply_random.isChecked())))))
+        self.check_cine_mosaic.setChecked(bool(int(s.get("cine_mosaic", int(self.check_cine_mosaic.isChecked())))))
+        self.slider_cine_mosaic_screens.setValue(int(s.get("cine_mosaic_screens", self.slider_cine_mosaic_screens.value())))
+        self.check_cine_mosaic_random.setChecked(bool(int(s.get("cine_mosaic_random", int(self.check_cine_mosaic_random.isChecked())))))
+        self.check_cine_flip.setChecked(bool(int(s.get("cine_flip", int(self.check_cine_flip.isChecked())))))
+        self.check_cine_rotate.setChecked(bool(int(s.get("cine_rotate", int(self.check_cine_rotate.isChecked())))))
+        self.slider_cine_rotate_degrees.setValue(int(s.get("cine_rotate_degrees", self.slider_cine_rotate_degrees.value())))
+        self.check_cine_multiply.setChecked(bool(int(s.get("cine_multiply", int(self.check_cine_multiply.isChecked())))))
+        self.slider_cine_multiply_screens.setValue(int(s.get("cine_multiply_screens", self.slider_cine_multiply_screens.value())))
+        self.check_cine_multiply_random.setChecked(bool(int(s.get("cine_multiply_random", int(self.check_cine_multiply_random.isChecked())))))
 
         # Dolly / Ken Burns camera moves are hidden from the UI and always disabled.
         try:
@@ -12580,33 +15668,33 @@ class AutoMusicSyncWidget(QWidget):
             pass
 
         # Break impact FX options
-        self.check_impact_enable.setChecked(bool(int(s.value("impact_enable", int(getattr(self, "check_impact_enable").isChecked())))))
-        self.check_impact_flash.setChecked(bool(int(s.value("impact_flash", int(self.check_impact_flash.isChecked())))))
-        self.slider_impact_flash.setValue(int(s.value("impact_flash_strength", self.slider_impact_flash.value())))
+        self.check_impact_enable.setChecked(bool(int(s.get("impact_enable", int(getattr(self, "check_impact_enable").isChecked())))))
+        self.check_impact_flash.setChecked(bool(int(s.get("impact_flash", int(self.check_impact_flash.isChecked())))))
+        self.slider_impact_flash.setValue(int(s.get("impact_flash_strength", self.slider_impact_flash.value())))
         if hasattr(self, "slider_impact_flash_speed"):
-            self.slider_impact_flash_speed.setValue(int(s.value("impact_flash_speed_ms", self.slider_impact_flash_speed.value())))
-        self.check_impact_shock.setChecked(bool(int(s.value("impact_shock", int(self.check_impact_shock.isChecked())))))
-        self.slider_impact_shock.setValue(int(s.value("impact_shock_strength", self.slider_impact_shock.value())))
-        self.check_impact_echo.setChecked(bool(int(s.value("impact_echo_trail", int(self.check_impact_echo.isChecked())))))
-        self.slider_impact_echo.setValue(int(s.value("impact_echo_trail_strength", self.slider_impact_echo.value())))
-        self.check_impact_confetti.setChecked(bool(int(s.value("impact_confetti", int(self.check_impact_confetti.isChecked())))))
-        self.check_impact_colorcycle.setChecked(bool(int(s.value("impact_colorcycle", int(self.check_impact_colorcycle.isChecked())))))
-        self.slider_impact_confetti.setValue(int(s.value("impact_confetti_density", self.slider_impact_confetti.value())))
-        self.slider_impact_colorcycle.setValue(int(s.value("impact_colorcycle_speed", self.slider_impact_colorcycle.value())))
-        self.check_impact_zoom.setChecked(bool(int(s.value("impact_zoom", int(self.check_impact_zoom.isChecked())))))
-        self.slider_impact_zoom.setValue(int(s.value("impact_zoom_amount", self.slider_impact_zoom.value())))
-        self.check_impact_shake.setChecked(bool(int(s.value("impact_shake", int(self.check_impact_shake.isChecked())))))
-        self.slider_impact_shake.setValue(int(s.value("impact_shake_strength", self.slider_impact_shake.value())))
-        self.check_impact_fog.setChecked(bool(int(s.value("impact_fog", int(self.check_impact_fog.isChecked())))))
-        self.slider_impact_fog.setValue(int(s.value("impact_fog_density", self.slider_impact_fog.value())))
-        self.check_impact_fire_gold.setChecked(bool(int(s.value("impact_fire_gold", int(self.check_impact_fire_gold.isChecked())))))
-        self.slider_impact_fire_gold.setValue(int(s.value("impact_fire_gold_intensity", self.slider_impact_fire_gold.value())))
-        self.check_impact_fire_multi.setChecked(bool(int(s.value("impact_fire_multi", int(self.check_impact_fire_multi.isChecked())))))
-        self.slider_impact_fire_multi.setValue(int(s.value("impact_fire_multi_intensity", self.slider_impact_fire_multi.value())))
-        self.check_impact_random.setChecked(bool(int(s.value("impact_random", int(self.check_impact_random.isChecked())))))
+            self.slider_impact_flash_speed.setValue(int(s.get("impact_flash_speed_ms", self.slider_impact_flash_speed.value())))
+        self.check_impact_shock.setChecked(bool(int(s.get("impact_shock", int(self.check_impact_shock.isChecked())))))
+        self.slider_impact_shock.setValue(int(s.get("impact_shock_strength", self.slider_impact_shock.value())))
+        self.check_impact_echo.setChecked(bool(int(s.get("impact_echo_trail", int(self.check_impact_echo.isChecked())))))
+        self.slider_impact_echo.setValue(int(s.get("impact_echo_trail_strength", self.slider_impact_echo.value())))
+        self.check_impact_confetti.setChecked(bool(int(s.get("impact_confetti", int(self.check_impact_confetti.isChecked())))))
+        self.check_impact_colorcycle.setChecked(bool(int(s.get("impact_colorcycle", int(self.check_impact_colorcycle.isChecked())))))
+        self.slider_impact_confetti.setValue(int(s.get("impact_confetti_density", self.slider_impact_confetti.value())))
+        self.slider_impact_colorcycle.setValue(int(s.get("impact_colorcycle_speed", self.slider_impact_colorcycle.value())))
+        self.check_impact_zoom.setChecked(bool(int(s.get("impact_zoom", int(self.check_impact_zoom.isChecked())))))
+        self.slider_impact_zoom.setValue(int(s.get("impact_zoom_amount", self.slider_impact_zoom.value())))
+        self.check_impact_shake.setChecked(bool(int(s.get("impact_shake", int(self.check_impact_shake.isChecked())))))
+        self.slider_impact_shake.setValue(int(s.get("impact_shake_strength", self.slider_impact_shake.value())))
+        self.check_impact_fog.setChecked(bool(int(s.get("impact_fog", int(self.check_impact_fog.isChecked())))))
+        self.slider_impact_fog.setValue(int(s.get("impact_fog_density", self.slider_impact_fog.value())))
+        self.check_impact_fire_gold.setChecked(bool(int(s.get("impact_fire_gold", int(self.check_impact_fire_gold.isChecked())))))
+        self.slider_impact_fire_gold.setValue(int(s.get("impact_fire_gold_intensity", self.slider_impact_fire_gold.value())))
+        self.check_impact_fire_multi.setChecked(bool(int(s.get("impact_fire_multi", int(self.check_impact_fire_multi.isChecked())))))
+        self.slider_impact_fire_multi.setValue(int(s.get("impact_fire_multi_intensity", self.slider_impact_fire_multi.value())))
+        self.check_impact_random.setChecked(bool(int(s.get("impact_random", int(self.check_impact_random.isChecked())))))
         # Timed strobe (flash on time)
         try:
-            self.check_strobe_on_time.setChecked(bool(int(s.value("strobe_on_time", int(self.check_strobe_on_time.isChecked())))))
+            self.check_strobe_on_time.setChecked(bool(int(s.get("strobe_on_time", int(self.check_strobe_on_time.isChecked())))))
         except Exception:
             try:
                 self.check_strobe_on_time.setChecked(False)
@@ -12615,7 +15703,7 @@ class AutoMusicSyncWidget(QWidget):
 
         times: List[float] = []
         try:
-            raw = s.value("strobe_on_time_times", "", str)
+            raw = s.get("strobe_on_time_times", "", str)
         except Exception:
             raw = ""
         if raw:
@@ -12696,7 +15784,7 @@ class AutoMusicSyncWidget(QWidget):
 
         # Load per-section visual overrides for music-player overlay (if present).
         try:
-            raw_viz_sections = s.value("visual_section_overrides", "", str)
+            raw_viz_sections = s.get("visual_section_overrides", "", str)
         except Exception:
             raw_viz_sections = ""
         overrides = {}
@@ -12722,7 +15810,7 @@ class AutoMusicSyncWidget(QWidget):
 
         # Load visual overlay opacity (music-player visuals alpha).
         try:
-            alpha = float(s.value("visual_overlay_opacity", self.visual_overlay_opacity))
+            alpha = float(s.get("visual_overlay_opacity", self.visual_overlay_opacity))
         except Exception:
             alpha = float(getattr(self, "visual_overlay_opacity", 0.25))
         alpha = max(0.10, min(1.0, alpha))
@@ -12759,169 +15847,380 @@ class AutoMusicSyncWidget(QWidget):
 
 
 
-    def _save_settings(self) -> None:
-        """Save last-used paths and options to QSettings."""
-        s = self._settings
-        s.setValue("audio_path", self.edit_audio.text().strip())
-        s.setValue("video_path", self.edit_video.text().strip())
-        s.setValue("output_path", self.edit_output.text().strip())
+    def _save_core_musicclip_settings(self, sync: bool = False) -> None:
+        """Persist critical visible settings first, using JSON only.
 
-        s.setValue("fx_level", self.combo_fx.currentIndex())
+        This is intentionally small and defensive. The older full saver below still
+        stores the large FX sections, but this core pass guarantees that normal
+        generation settings and the newer bridge controls are written even if a
+        later/optional widget in the big saver is missing.
+        """
+        try:
+            s = self._settings
+        except Exception:
+            return
+
+        def _set(key: str, value) -> None:
+            try:
+                s.set(key, value)
+            except Exception:
+                pass
+
+        def _checked(name: str, default: int = 0) -> int:
+            w = getattr(self, name, None)
+            try:
+                return int(bool(w.isChecked())) if w is not None else int(default)
+            except Exception:
+                return int(default)
+
+        def _combo_index(name: str, default: int = 0) -> int:
+            w = getattr(self, name, None)
+            try:
+                return int(w.currentIndex()) if w is not None else int(default)
+            except Exception:
+                return int(default)
+
+        def _combo_text(name: str, default: str = "") -> str:
+            w = getattr(self, name, None)
+            try:
+                return str(w.currentText()) if w is not None else str(default)
+            except Exception:
+                return str(default)
+
+        def _spin_value(name: str, default=0):
+            w = getattr(self, name, None)
+            try:
+                return w.value() if w is not None else default
+            except Exception:
+                return default
+
+        def _line_text(name: str, default: str = "") -> str:
+            w = getattr(self, name, None)
+            try:
+                return str(w.text()).strip() if w is not None else str(default)
+            except Exception:
+                return str(default)
+
+        # Generation tab paths and generation settings.
+        _set("audio_path", _line_text("edit_audio"))
+        _set("video_path", _line_text("edit_video"))
+        _set("output_path", _line_text("edit_output", "output/videoclips") or "output/videoclips")
+        _set("clip_order", _combo_index("combo_clip_order", 1))
+        _set("min_clip_enabled", _checked("check_min_clip", 1))
+        _set("min_clip_seconds", float(_spin_value("spin_min_clip", 1.5)))
+        _set("seed_value", int(_spin_value("spin_seed", 0)))
+        _set("use_seed", _checked("check_use_seed", 0))
+        _set("res_mode", _combo_index("combo_res", 3))
+        _set("keep_source_bitrate", _checked("check_keep_source_bitrate", 1))
+        _set("fit_mode", _combo_index("combo_fit", 0))
+        _set("intro_fade", _checked("check_intro_fade", 1))
+        _set("outro_fade", _checked("check_outro_fade", 1))
+        _set("intro_transitions_only", _checked("check_intro_transitions_only", 1))
+        _set("nofx", _checked("check_nofx", 0))
+
+        # Smart Director / beat behavior.
+        _set("smart_scene_map", _checked("check_smart_scene_map", 1))
+        _set("director_preset", _combo_text("combo_director_preset", "Balanced"))
+        _set("scene_cut_style", _combo_text("combo_scene_cut_style", "Auto"))
+        _set("smart_cut_timing_offset", float(_spin_value("spin_smart_cut_timing_offset", -0.35)))
+        _set("smart_scene_duration_guard", _checked("check_smart_scene_duration_guard", 1))
+        _set("smart_min_scene_len", float(_spin_value("spin_smart_min_scene_len", 2.0)))
+        _set("smart_max_scene_mode", _combo_text("combo_smart_max_scene_mode", "Auto (source-aware)"))
+        _set("smart_max_scene_len", float(_spin_value("spin_smart_max_scene_len", 5.0)))
+        try:
+            box_adv = getattr(self, "box_adv", None)
+            if box_adv is not None and box_adv.isCheckable():
+                _set("advanced_beat_settings_enabled", int(bool(box_adv.isChecked())))
+        except Exception:
+            pass
+        _set("micro_enable", _checked("check_micro_enable", 0))
+        _set("micro_chorus", _checked("check_micro_chorus", 0))
+        _set("micro_all", _checked("check_micro_all", 0))
+        _set("micro_verses", _checked("check_micro_verses", 0))
+        _set("beat_sensitivity", int(_spin_value("slider_sens", 20)))
+        _set("beats_per_segment", int(_spin_value("spin_beats_per_seg", 16)))
+
+        # Lyrics / SRT.
+        _set("use_lyrics_srt_timing", _checked("check_use_lyrics_srt_timing", 0))
+        _set("lyrics_srt_path", str(getattr(self, "_lyrics_srt_path", "") or ""))
+
+        # Planner Bridge / prompt plan / LTX shot plan controls.
+        _set("planner_bridge_main_idea", self._settings_clean_bridge_text("edit_bridge_main_idea"))
+        _set("planner_bridge_style_theme", self._settings_clean_bridge_text("edit_bridge_style_theme"))
+        _set("planner_bridge_characters_subjects", self._settings_clean_bridge_text("edit_bridge_characters_subjects"))
+        _set("planner_bridge_locations_world", self._settings_clean_bridge_text("edit_bridge_locations_world"))
+        _set("planner_bridge_camera_choreography", self._settings_clean_bridge_text("edit_bridge_camera_choreography"))
+        _set("planner_bridge_use_vocal_roles", _checked("check_bridge_use_vocal_roles", 1))
+        _set("planner_bridge_ltx_grouping_mode", _combo_text("combo_bridge_ltx_grouping_mode", "Auto"))
+        _set("planner_bridge_ltx_export_audio_chunks", _checked("check_bridge_ltx_export_audio_chunks", 1))
+        _set("planner_bridge_ltx_fps", int(_spin_value("spin_bridge_ltx_fps", 24)))
+        _set("planner_bridge_last_scene_plan_path", str(getattr(self, "_planner_bridge_last_scene_plan_path", "") or ""))
+        _set("planner_bridge_last_prompt_plan_path", str(getattr(self, "_planner_bridge_last_prompt_plan_path", "") or ""))
+        _set("planner_bridge_last_ltx_shot_plan_path", str(getattr(self, "_planner_bridge_last_ltx_shot_plan_path", "") or ""))
+
+        if sync:
+            try:
+                s.sync()
+            except Exception:
+                pass
+
+    def _save_settings(self) -> None:
+        """Save last-used paths and options to visible project JSON."""
+        if getattr(self, "_settings_loading", False) or getattr(self, "_settings_startup_protected", False):
+            return
+        s = self._settings
+        try:
+            self._save_core_musicclip_settings(sync=True)
+        except Exception:
+            pass
+        s.set("audio_path", self.edit_audio.text().strip())
+        s.set("video_path", self.edit_video.text().strip())
+        s.set("output_path", self.edit_output.text().strip())
+
+        s.set("fx_level", self.combo_fx.currentIndex())
+        try:
+            w = getattr(self, "check_bridge_timestamped_microclips", None)
+            if w is not None:
+                value = int(w.isChecked())
+                s.set("ltx/use_timestamped_microclips", value)
+                s.set("bridge_timestamped_microclips", value)
+            w = getattr(self, "check_bridge_collage_effect", None)
+            if w is not None:
+                value = int(w.isChecked())
+                s.set("ltx/use_collage_effect", value)
+                s.set("bridge_collage_effect", value)
+            w = getattr(self, "check_bridge_avoid_effects_first_clip", None)
+            if w is not None:
+                value = int(w.isChecked())
+                s.set("ltx/keep_first_generated_shot_clean", value)
+                s.set("bridge_avoid_effects_first_clip", value)
+            w = getattr(self, "check_bridge_avoid_effects_last_clip", None)
+            if w is not None:
+                value = int(w.isChecked())
+                s.set("ltx/keep_last_generated_shot_clean", value)
+                s.set("bridge_avoid_effects_last_clip", value)
+        except Exception:
+            pass
         if hasattr(self, "check_smart_scene_map"):
-            s.setValue("smart_scene_map", int(self.check_smart_scene_map.isChecked()))
+            s.set("smart_scene_map", int(self.check_smart_scene_map.isChecked()))
         if hasattr(self, "combo_director_preset"):
-            s.setValue("director_preset", str(self.combo_director_preset.currentText()))
+            s.set("director_preset", str(self.combo_director_preset.currentText()))
         if hasattr(self, "combo_scene_cut_style"):
-            s.setValue("scene_cut_style", str(self.combo_scene_cut_style.currentText()))
+            s.set("scene_cut_style", str(self.combo_scene_cut_style.currentText()))
         if hasattr(self, "spin_smart_cut_timing_offset"):
-            s.setValue("smart_cut_timing_offset", float(self.spin_smart_cut_timing_offset.value()))
+            s.set("smart_cut_timing_offset", float(self.spin_smart_cut_timing_offset.value()))
         if hasattr(self, "check_smart_scene_duration_guard"):
-            s.setValue("smart_scene_duration_guard", int(self.check_smart_scene_duration_guard.isChecked()))
+            s.set("smart_scene_duration_guard", int(self.check_smart_scene_duration_guard.isChecked()))
         if hasattr(self, "spin_smart_min_scene_len"):
-            s.setValue("smart_min_scene_len", float(self.spin_smart_min_scene_len.value()))
+            s.set("smart_min_scene_len", float(self.spin_smart_min_scene_len.value()))
         if hasattr(self, "combo_smart_max_scene_mode"):
-            s.setValue("smart_max_scene_mode", str(self.combo_smart_max_scene_mode.currentText()))
+            s.set("smart_max_scene_mode", str(self.combo_smart_max_scene_mode.currentText()))
         if hasattr(self, "spin_smart_max_scene_len"):
-            s.setValue("smart_max_scene_len", float(self.spin_smart_max_scene_len.value()))
+            s.set("smart_max_scene_len", float(self.spin_smart_max_scene_len.value()))
         if hasattr(self, "check_use_lyrics_srt_timing"):
-            s.setValue("use_lyrics_srt_timing", int(self.check_use_lyrics_srt_timing.isChecked()))
-        s.setValue("lyrics_srt_path", str(getattr(self, "_lyrics_srt_path", "") or ""))
-        s.setValue("nofx", int(self.check_nofx.isChecked()))
+            s.set("use_lyrics_srt_timing", int(self.check_use_lyrics_srt_timing.isChecked()))
+        s.set("lyrics_srt_path", str(getattr(self, "_lyrics_srt_path", "") or ""))
+        try:
+            if getattr(self, "edit_bridge_main_idea", None) is not None:
+                s.set("planner_bridge_main_idea", self._settings_clean_bridge_text("edit_bridge_main_idea"))
+            if getattr(self, "edit_bridge_style_theme", None) is not None:
+                s.set("planner_bridge_style_theme", self._settings_clean_bridge_text("edit_bridge_style_theme"))
+            if getattr(self, "edit_bridge_characters_subjects", None) is not None:
+                s.set("planner_bridge_characters_subjects", self._settings_clean_bridge_text("edit_bridge_characters_subjects"))
+            if getattr(self, "edit_bridge_locations_world", None) is not None:
+                s.set("planner_bridge_locations_world", self._settings_clean_bridge_text("edit_bridge_locations_world"))
+            if getattr(self, "edit_bridge_camera_choreography", None) is not None:
+                s.set("planner_bridge_camera_choreography", self._settings_clean_bridge_text("edit_bridge_camera_choreography"))
+            if getattr(self, "check_bridge_use_vocal_roles", None) is not None:
+                s.set("planner_bridge_use_vocal_roles", int(self.check_bridge_use_vocal_roles.isChecked()))
+            if getattr(self, "combo_bridge_ltx_grouping_mode", None) is not None:
+                s.set("planner_bridge_ltx_grouping_mode", str(self.combo_bridge_ltx_grouping_mode.currentText()))
+            if getattr(self, "check_bridge_ltx_export_audio_chunks", None) is not None:
+                s.set("planner_bridge_ltx_export_audio_chunks", int(self.check_bridge_ltx_export_audio_chunks.isChecked()))
+            if getattr(self, "spin_bridge_ltx_fps", None) is not None:
+                s.set("planner_bridge_ltx_fps", int(self.spin_bridge_ltx_fps.value()))
+            s.set("planner_bridge_character_reference_sheet_path", str(getattr(self, "_planner_bridge_character_reference_sheet_path", "") or ""))
+            _char_ref_paths = getattr(self, "_planner_bridge_character_reference_sheet_paths", {}) or {}
+            for _idx in range(1, 6):
+                _slot = f"char_{_idx:02d}"
+                s.set(f"planner_bridge_character_reference_sheet_path_char_{_idx:02d}", str(_char_ref_paths.get(_slot, "") or ""))
+            s.set("planner_bridge_last_scene_plan_path", str(getattr(self, "_planner_bridge_last_scene_plan_path", "") or ""))
+            s.set("planner_bridge_last_prompt_plan_path", str(getattr(self, "_planner_bridge_last_prompt_plan_path", "") or ""))
+            s.set("planner_bridge_last_ltx_shot_plan_path", str(getattr(self, "_planner_bridge_last_ltx_shot_plan_path", "") or ""))
+            s.set("planner_bridge_last_ltx_director_plan_path", str(getattr(self, "_planner_bridge_last_ltx_director_plan_path", "") or ""))
+        except Exception:
+            pass
+        s.set("nofx", int(self.check_nofx.isChecked()))
         if hasattr(self, "check_visual_overlay"):
-            s.setValue("visual_overlay", int(self.check_visual_overlay.isChecked()))
+            s.set("visual_overlay", int(self.check_visual_overlay.isChecked()))
         if hasattr(self, "check_visual_strategy_segment"):
-            s.setValue("visual_strategy_segment", int(self.check_visual_strategy_segment.isChecked()))
+            s.set("visual_strategy_segment", int(self.check_visual_strategy_segment.isChecked()))
         if hasattr(self, "check_visual_strategy_section"):
-            s.setValue("visual_strategy_section", int(self.check_visual_strategy_section.isChecked()))
-        s.setValue("visual_section_overrides", json.dumps(getattr(self, "_visual_section_overrides", {})))
-        s.setValue("visual_overlay_opacity", float(getattr(self, "visual_overlay_opacity", 0.25)))
-        s.setValue("micro_chorus", int(self.check_micro_chorus.isChecked()))
-        s.setValue("micro_all", int(self.check_micro_all.isChecked()))
+            s.set("visual_strategy_section", int(self.check_visual_strategy_section.isChecked()))
+        s.set("visual_section_overrides", json.dumps(getattr(self, "_visual_section_overrides", {})))
+        s.set("visual_overlay_opacity", float(getattr(self, "visual_overlay_opacity", 0.25)))
+        if hasattr(self, "check_micro_enable"):
+            s.set("micro_enable", int(self.check_micro_enable.isChecked()))
+        s.set("micro_chorus", int(self.check_micro_chorus.isChecked()))
+        s.set("micro_all", int(self.check_micro_all.isChecked()))
         if hasattr(self, "check_micro_verses"):
-            s.setValue("micro_verses", int(self.check_micro_verses.isChecked()))
+            s.set("micro_verses", int(self.check_micro_verses.isChecked()))
         try:
             if hasattr(self, "box_adv") and self.box_adv.isCheckable():
-                s.setValue("advanced_beat_settings_enabled", int(self.box_adv.isChecked()))
+                s.set("advanced_beat_settings_enabled", int(self.box_adv.isChecked()))
         except Exception:
             pass
-        s.setValue("full_length", int(self.check_full_length.isChecked()))
-        s.setValue("intro_fade", int(self.check_intro_fade.isChecked()))
-        s.setValue("outro_fade", int(self.check_outro_fade.isChecked()))
+        s.set("full_length", int(self.check_full_length.isChecked()))
+        s.set("intro_fade", int(self.check_intro_fade.isChecked()))
+        s.set("outro_fade", int(self.check_outro_fade.isChecked()))
         if hasattr(self, "check_intro_transitions_only"):
-            s.setValue("intro_transitions_only", int(self.check_intro_transitions_only.isChecked()))
-        s.setValue("clip_order", self.combo_clip_order.currentIndex())
-        s.setValue("transitions_mode", self.combo_transitions.currentIndex())
-        s.setValue("transitions_random", int(self.check_trans_random.isChecked()))
+            s.set("intro_transitions_only", int(self.check_intro_transitions_only.isChecked()))
+        s.set("clip_order", self.combo_clip_order.currentIndex())
+        s.set("transitions_mode", self.combo_transitions.currentIndex())
+        s.set("transitions_random", int(self.check_trans_random.isChecked()))
         # Remember which transition styles are enabled for Random transitions
         try:
-            s.setValue("transitions_random_enabled_modes", json.dumps(sorted(getattr(self, "_enabled_transition_modes", []))))
+            s.set("transitions_random_enabled_modes", json.dumps(sorted(getattr(self, "_enabled_transition_modes", []))))
         except Exception:
             pass
-        s.setValue("seed_value", self.spin_seed.value())
-        s.setValue("use_seed", int(self.check_use_seed.isChecked()))
-        s.setValue("res_mode", self.combo_res.currentIndex())
-        s.setValue("fit_mode", self.combo_fit.currentIndex())
+        s.set("seed_value", self.spin_seed.value())
+        s.set("use_seed", int(self.check_use_seed.isChecked()))
+        s.set("res_mode", self.combo_res.currentIndex())
+        s.set("fit_mode", self.combo_fit.currentIndex())
         if hasattr(self, "check_keep_source_bitrate"):
-            s.setValue("keep_source_bitrate", int(self.check_keep_source_bitrate.isChecked()))
+            s.set("keep_source_bitrate", int(self.check_keep_source_bitrate.isChecked()))
 
-        s.setValue("beat_sensitivity", self.slider_sens.value())
-        s.setValue("beats_per_segment", self.spin_beats_per_seg.value())
-        s.setValue("image_segment_interval", int(getattr(self, "image_segment_interval", 4)))
+        s.set("beat_sensitivity", self.slider_sens.value())
+        s.set("beats_per_segment", self.spin_beats_per_seg.value())
+        s.set("image_segment_interval", int(getattr(self, "image_segment_interval", 4)))
 
 
-        s.setValue("min_clip_enabled", int(self.check_min_clip.isChecked()))
-        s.setValue("min_clip_seconds", float(self.spin_min_clip.value()))
+        s.set("min_clip_enabled", int(self.check_min_clip.isChecked()))
+        s.set("min_clip_seconds", float(self.spin_min_clip.value()))
 
         # Slow motion options
-        s.setValue("slow_enable", int(self.check_slow_enable.isChecked()))
-        s.setValue("slow_intro", int(self.check_slow_intro.isChecked()))
-        s.setValue("slow_break", int(self.check_slow_break.isChecked()))
-        s.setValue("slow_chorus", int(self.check_slow_chorus.isChecked()))
-        s.setValue("slow_drop", int(self.check_slow_drop.isChecked()))
-        s.setValue("slow_outro", int(self.check_slow_outro.isChecked()))
-        s.setValue("slow_random", int(self.check_slow_random.isChecked()))
-        s.setValue("slow_factor_slider", int(self.slider_slow_factor.value()))
+        s.set("slow_enable", int(self.check_slow_enable.isChecked()))
+        s.set("slow_intro", int(self.check_slow_intro.isChecked()))
+        s.set("slow_break", int(self.check_slow_break.isChecked()))
+        s.set("slow_chorus", int(self.check_slow_chorus.isChecked()))
+        s.set("slow_drop", int(self.check_slow_drop.isChecked()))
+        s.set("slow_outro", int(self.check_slow_outro.isChecked()))
+        s.set("slow_random", int(self.check_slow_random.isChecked()))
+        s.set("slow_factor_slider", int(self.slider_slow_factor.value()))
 
         # Cinematic effects options
-        s.setValue("cine_enable", int(self.check_cine_enable.isChecked()))
-        s.setValue("cine_freeze", int(self.check_cine_freeze.isChecked()))
-        s.setValue("cine_freeze_len", int(self.slider_cine_freeze_len.value()))
-        s.setValue("cine_freeze_zoom", int(self.slider_cine_freeze_zoom.value()))
-        s.setValue("cine_tear_v", int(self.check_cine_tear_v.isChecked()))
-        s.setValue("cine_tear_v_strength", int(self.slider_cine_tear_v_strength.value()))
-        s.setValue("cine_tear_h", int(self.check_cine_tear_h.isChecked()))
-        s.setValue("cine_tear_h_strength", int(self.slider_cine_tear_h_strength.value()))
-        s.setValue("cine_color_cycle", int(self.check_cine_color_cycle.isChecked()))
-        s.setValue("cine_color_cycle_speed_ms", int(self.slider_cine_color_cycle_speed.value()))
-        s.setValue("cine_stutter", int(self.check_cine_stutter.isChecked()))
-        s.setValue("cine_stutter_repeats", int(self.spin_cine_stutter_repeats.value()))
-        s.setValue("cine_reverse", int(self.check_cine_reverse.isChecked()))
-        s.setValue("cine_reverse_len", int(self.slider_cine_reverse_len.value()))
-        s.setValue("cine_speedup_forward", int(self.check_cine_speedup_forward.isChecked()))
-        s.setValue("cine_speedup_forward_factor", float(self.spin_cine_speedup_forward.value()))
-        s.setValue("cine_speedup_backward", int(self.check_cine_speedup_backward.isChecked()))
-        s.setValue("cine_speedup_backward_factor", float(self.spin_cine_speedup_backward.value()))
-        s.setValue("cine_speed_ramp", int(self.check_cine_speed_ramp.isChecked()))
-        s.setValue("cine_ramp_in", int(self.slider_cine_ramp_in.value()))
-        s.setValue("cine_ramp_out", int(self.slider_cine_ramp_out.value()))
-        s.setValue("cine_boomerang", int(self.check_cine_boomerang.isChecked()))
-        s.setValue("cine_boomerang_bounces", int(self.slider_cine_boomerang_bounces.value()))
+        s.set("cine_enable", int(self.check_cine_enable.isChecked()))
+        s.set("cine_freeze", int(self.check_cine_freeze.isChecked()))
+        s.set("cine_freeze_len", int(self.slider_cine_freeze_len.value()))
+        s.set("cine_freeze_zoom", int(self.slider_cine_freeze_zoom.value()))
+        s.set("cine_tear_v", int(self.check_cine_tear_v.isChecked()))
+        s.set("cine_tear_v_strength", int(self.slider_cine_tear_v_strength.value()))
+        s.set("cine_tear_h", int(self.check_cine_tear_h.isChecked()))
+        s.set("cine_tear_h_strength", int(self.slider_cine_tear_h_strength.value()))
+        s.set("cine_color_cycle", int(self.check_cine_color_cycle.isChecked()))
+        s.set("cine_color_cycle_speed_ms", int(self.slider_cine_color_cycle_speed.value()))
+        s.set("cine_stutter", int(self.check_cine_stutter.isChecked()))
+        s.set("cine_stutter_repeats", int(self.spin_cine_stutter_repeats.value()))
+        s.set("cine_reverse", int(self.check_cine_reverse.isChecked()))
+        s.set("cine_reverse_len", int(self.slider_cine_reverse_len.value()))
+        s.set("cine_speedup_forward", int(self.check_cine_speedup_forward.isChecked()))
+        s.set("cine_speedup_forward_factor", float(self.spin_cine_speedup_forward.value()))
+        s.set("cine_speedup_backward", int(self.check_cine_speedup_backward.isChecked()))
+        s.set("cine_speedup_backward_factor", float(self.spin_cine_speedup_backward.value()))
+        s.set("cine_speed_ramp", int(self.check_cine_speed_ramp.isChecked()))
+        s.set("cine_ramp_in", int(self.slider_cine_ramp_in.value()))
+        s.set("cine_ramp_out", int(self.slider_cine_ramp_out.value()))
+        s.set("cine_boomerang", int(self.check_cine_boomerang.isChecked()))
+        s.set("cine_boomerang_bounces", int(self.slider_cine_boomerang_bounces.value()))
         if hasattr(self, "check_cine_dimension"):
-            s.setValue("cine_dimension", int(self.check_cine_dimension.isChecked()))
+            s.set("cine_dimension", int(self.check_cine_dimension.isChecked()))
         if hasattr(self, "check_cine_pan916"):
-            s.setValue("cine_pan916", int(self.check_cine_pan916.isChecked()))
-            s.setValue("cine_pan916_speed_ms", int(self.slider_cine_pan916_speed.value()))
-            s.setValue("cine_pan916_parts", int(self.slider_cine_pan916_parts.value()))
-            s.setValue("cine_pan916_transparent", int(self.check_cine_pan916_transparent.isChecked()))
+            s.set("cine_pan916", int(self.check_cine_pan916.isChecked()))
+            s.set("cine_pan916_speed_ms", int(self.slider_cine_pan916_speed.value()))
+            s.set("cine_pan916_parts", int(self.slider_cine_pan916_parts.value()))
+            s.set("cine_pan916_transparent", int(self.check_cine_pan916_transparent.isChecked()))
             if hasattr(self, "check_cine_pan916_random"):
-                s.setValue("cine_pan916_random", int(self.check_cine_pan916_random.isChecked()))
-        s.setValue("cine_mosaic", int(self.check_cine_mosaic.isChecked()))
-        s.setValue("cine_mosaic_screens", int(self.slider_cine_mosaic_screens.value()))
-        s.setValue("cine_mosaic_random", int(self.check_cine_mosaic_random.isChecked()))
-        s.setValue("cine_flip", int(self.check_cine_flip.isChecked()))
-        s.setValue("cine_rotate", int(self.check_cine_rotate.isChecked()))
-        s.setValue("cine_rotate_degrees", int(self.slider_cine_rotate_degrees.value()))
-        s.setValue("cine_multiply", int(self.check_cine_multiply.isChecked()))
-        s.setValue("cine_multiply_screens", int(self.slider_cine_multiply_screens.value()))
-        s.setValue("cine_multiply_random", int(self.check_cine_multiply_random.isChecked()))
-        s.setValue("cine_dolly", int(self.check_cine_dolly.isChecked()))
-        s.setValue("cine_dolly_strength", int(self.slider_cine_dolly_strength.value()))
-        s.setValue("cine_kenburns", int(self.check_cine_kenburns.isChecked()))
-        s.setValue("cine_kenburns_strength", int(self.slider_cine_kenburns_strength.value()))
-        s.setValue("cine_motion_dir", int(self.combo_cine_motion_dir.currentIndex()))
+                s.set("cine_pan916_random", int(self.check_cine_pan916_random.isChecked()))
+        s.set("cine_mosaic", int(self.check_cine_mosaic.isChecked()))
+        s.set("cine_mosaic_screens", int(self.slider_cine_mosaic_screens.value()))
+        s.set("cine_mosaic_random", int(self.check_cine_mosaic_random.isChecked()))
+        s.set("cine_flip", int(self.check_cine_flip.isChecked()))
+        s.set("cine_rotate", int(self.check_cine_rotate.isChecked()))
+        s.set("cine_rotate_degrees", int(self.slider_cine_rotate_degrees.value()))
+        s.set("cine_multiply", int(self.check_cine_multiply.isChecked()))
+        s.set("cine_multiply_screens", int(self.slider_cine_multiply_screens.value()))
+        s.set("cine_multiply_random", int(self.check_cine_multiply_random.isChecked()))
+        s.set("cine_dolly", int(self.check_cine_dolly.isChecked()))
+        s.set("cine_dolly_strength", int(self.slider_cine_dolly_strength.value()))
+        s.set("cine_kenburns", int(self.check_cine_kenburns.isChecked()))
+        s.set("cine_kenburns_strength", int(self.slider_cine_kenburns_strength.value()))
+        s.set("cine_motion_dir", int(self.combo_cine_motion_dir.currentIndex()))
         # Break impact FX options
-        s.setValue("impact_enable", int(self.check_impact_enable.isChecked()))
-        s.setValue("impact_flash", int(self.check_impact_flash.isChecked()))
-        s.setValue("impact_flash_strength", int(self.slider_impact_flash.value()))
+        s.set("impact_enable", int(self.check_impact_enable.isChecked()))
+        s.set("impact_flash", int(self.check_impact_flash.isChecked()))
+        s.set("impact_flash_strength", int(self.slider_impact_flash.value()))
         if hasattr(self, "slider_impact_flash_speed"):
-            s.setValue("impact_flash_speed_ms", int(self.slider_impact_flash_speed.value()))
-        s.setValue("impact_shock", int(self.check_impact_shock.isChecked()))
-        s.setValue("impact_shock_strength", int(self.slider_impact_shock.value()))
-        s.setValue("impact_echo_trail", int(self.check_impact_echo.isChecked()))
-        s.setValue("impact_echo_trail_strength", int(self.slider_impact_echo.value()))
-        s.setValue("impact_confetti", int(self.check_impact_confetti.isChecked()))
-        s.setValue("impact_colorcycle", int(self.check_impact_colorcycle.isChecked()))
-        s.setValue("impact_confetti_density", int(self.slider_impact_confetti.value()))
-        s.setValue("impact_colorcycle_speed", int(self.slider_impact_colorcycle.value()))
-        s.setValue("impact_zoom", int(self.check_impact_zoom.isChecked()))
-        s.setValue("impact_zoom_amount", int(self.slider_impact_zoom.value()))
-        s.setValue("impact_shake", int(self.check_impact_shake.isChecked()))
-        s.setValue("impact_shake_strength", int(self.slider_impact_shake.value()))
-        s.setValue("impact_fog", int(self.check_impact_fog.isChecked()))
-        s.setValue("impact_fog_density", int(self.slider_impact_fog.value()))
-        s.setValue("impact_fire_gold", int(self.check_impact_fire_gold.isChecked()))
-        s.setValue("impact_fire_gold_intensity", int(self.slider_impact_fire_gold.value()))
-        s.setValue("impact_fire_multi", int(self.check_impact_fire_multi.isChecked()))
-        s.setValue("impact_fire_multi_intensity", int(self.slider_impact_fire_multi.value()))
-        s.setValue("impact_random", int(self.check_impact_random.isChecked()))
+            s.set("impact_flash_speed_ms", int(self.slider_impact_flash_speed.value()))
+        s.set("impact_shock", int(self.check_impact_shock.isChecked()))
+        s.set("impact_shock_strength", int(self.slider_impact_shock.value()))
+        s.set("impact_echo_trail", int(self.check_impact_echo.isChecked()))
+        s.set("impact_echo_trail_strength", int(self.slider_impact_echo.value()))
+        s.set("impact_confetti", int(self.check_impact_confetti.isChecked()))
+        s.set("impact_colorcycle", int(self.check_impact_colorcycle.isChecked()))
+        s.set("impact_confetti_density", int(self.slider_impact_confetti.value()))
+        s.set("impact_colorcycle_speed", int(self.slider_impact_colorcycle.value()))
+        s.set("impact_zoom", int(self.check_impact_zoom.isChecked()))
+        s.set("impact_zoom_amount", int(self.slider_impact_zoom.value()))
+        s.set("impact_shake", int(self.check_impact_shake.isChecked()))
+        s.set("impact_shake_strength", int(self.slider_impact_shake.value()))
+        s.set("impact_fog", int(self.check_impact_fog.isChecked()))
+        s.set("impact_fog_density", int(self.slider_impact_fog.value()))
+        s.set("impact_fire_gold", int(self.check_impact_fire_gold.isChecked()))
+        s.set("impact_fire_gold_intensity", int(self.slider_impact_fire_gold.value()))
+        s.set("impact_fire_multi", int(self.check_impact_fire_multi.isChecked()))
+        s.set("impact_fire_multi_intensity", int(self.slider_impact_fire_multi.value()))
+        s.set("impact_random", int(self.check_impact_random.isChecked()))
 
         # Timed strobe (flash on time)
         if hasattr(self, "check_strobe_on_time"):
-            s.setValue("strobe_on_time", int(self.check_strobe_on_time.isChecked()))
+            s.set("strobe_on_time", int(self.check_strobe_on_time.isChecked()))
             try:
-                s.setValue("strobe_on_time_times", json.dumps(self._get_strobe_times()))
+                s.set("strobe_on_time_times", json.dumps(self._get_strobe_times()))
             except Exception:
-                s.setValue("strobe_on_time_times", "[]")
+                s.set("strobe_on_time_times", "[]")
+
+        try:
+            s.sync()
+        except Exception:
+            pass
+        # Belt-and-suspenders: write the in-memory JSON dictionary directly too.
+        # This keeps the visible project JSON as the only source of truth and
+        # avoids losing changes if the tiny settings wrapper dirty flag was reset
+        # by an earlier core-save pass.
+        try:
+            _musicclip_write_json_file(_musicclip_settings_path(), dict(getattr(s, "_data", {}) or {}))
+        except Exception:
+            pass
+
+    def closeEvent(self, event) -> None:
+        """Save visible settings when the tool/widget is closed."""
+        try:
+            timer = getattr(self, "_settings_save_timer", None)
+            if timer is not None and timer.isActive():
+                timer.stop()
+        except Exception:
+            pass
+        try:
+            self._save_settings()
+        except Exception:
+            pass
+        try:
+            super().closeEvent(event)
+        except Exception:
+            try:
+                event.accept()
+            except Exception:
+                pass
 
     # dialogs / helpers
 
@@ -12934,6 +16233,7 @@ class AutoMusicSyncWidget(QWidget):
         )
         if path:
             self.edit_audio.setText(path)
+            self._save_settings()
 
     def _browse_video_file(self) -> None:
         path, _ = QFileDialog.getOpenFileName(
@@ -12944,11 +16244,13 @@ class AutoMusicSyncWidget(QWidget):
         )
         if path:
             self.edit_video.setText(path)
+            self._save_settings()
 
     def _browse_video_dir(self) -> None:
         path = QFileDialog.getExistingDirectory(self, "Select folder with clips", "")
         if path:
             self.edit_video.setText(path)
+            self._save_settings()
 
     def _browse_video_files(self) -> None:
         paths, _ = QFileDialog.getOpenFileNames(
@@ -12960,11 +16262,13 @@ class AutoMusicSyncWidget(QWidget):
         if paths:
             # Join multiple paths with '|' so discovery can treat them as a list
             self.edit_video.setText("|".join(paths))
+            self._save_settings()
 
     def _browse_output(self) -> None:
         path = QFileDialog.getExistingDirectory(self, "Select output folder", "")
         if path:
             self.edit_output.setText(path)
+            self._save_settings()
 
     def _open_output_in_media_explorer(self) -> None:
         """Jump to Media Explorer tab and scan this tool's output folder."""
@@ -13154,6 +16458,27 @@ class AutoMusicSyncWidget(QWidget):
         return audio, video, out_dir
 
     # microclip mode mutual exclusivity
+
+    def _on_micro_enable_toggled(self, checked: bool) -> None:
+        """Show/hide original workflow microclip choices from the Effects section."""
+        enabled = bool(checked)
+        try:
+            self.micro_options.setVisible(enabled)
+        except Exception:
+            pass
+        # A master toggle that turns on but leaves every mode off looks broken.
+        # Default to the safest/high-energy-only option when the user first enables it.
+        if enabled:
+            try:
+                has_choice = bool(
+                    self.check_micro_chorus.isChecked()
+                    or self.check_micro_all.isChecked()
+                    or (getattr(self, "check_micro_verses", None) is not None and self.check_micro_verses.isChecked())
+                )
+                if not has_choice:
+                    self.check_micro_chorus.setChecked(True)
+            except Exception:
+                pass
 
     def _on_micro_mode_changed(self, state: int) -> None:
         if not state:
@@ -14534,7 +17859,9 @@ class AutoMusicSyncWidget(QWidget):
         else:
             fx_level = "high"
 
-        if self.check_micro_chorus.isChecked():
+        if not bool(getattr(self, "check_micro_enable", None) and self.check_micro_enable.isChecked()):
+            micro_mode = 0
+        elif self.check_micro_chorus.isChecked():
             micro_mode = 1
         elif self.check_micro_all.isChecked():
             micro_mode = 2
@@ -15244,10 +18571,13 @@ class OneClickVideoClipTab(QWidget):
         bw.addWidget(banner)
 
         # Apply persisted banner settings (hide / greyscale) immediately.
+        # Read only from visible project JSON when present; never from hidden OS storage.
         try:
-            s = QSettings("FrameVision", "FrameVision")
-            en = bool(s.value("banner_enabled", True, type=bool))
-            col = bool(s.value("banner_colored", True, type=bool))
+            banner_cfg = _musicclip_read_json_file(
+                os.path.join(_musicclip_project_root(), "presets", "setsave", "framevision_settings.json")
+            )
+            en = _musicclip_coerce_bool(banner_cfg.get("banner_enabled", True), True)
+            col = _musicclip_coerce_bool(banner_cfg.get("banner_colored", True), True)
             try:
                 banner_wrap.setVisible(en)
             except Exception:
