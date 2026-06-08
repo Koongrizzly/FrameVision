@@ -1,0 +1,502 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta name="viewport" content="width=device-width, initial-scale=1"/>
+<title>FrameVision — Feature Guide</title>
+<link rel="preconnect" href="https://fonts.googleapis.com"/>
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin/>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;600;800&display=swap" rel="stylesheet"/>
+<style>
+  :root{
+    --bg:#0b0f24;
+    --bg-2:#0a1328;
+    --card:#142d4c;
+    --ink:#e6f4ff;
+    --muted:#9ac7e6;
+    --line:rgba(0,170,255,.18);
+    --accent:#00aaff;
+    --accent-2:#1b3b63;
+    --button:#0e2036;
+    --button-line:#1c4a76;
+  }
+  *{box-sizing:border-box}
+  html,body{height:100%}
+  body{
+    margin:0;
+    font-family:Inter,system-ui,-apple-system,Segoe UI,Roboto,sans-serif;
+    background:var(--bg);
+    color:var(--ink);
+  }
+  header{
+    padding:54px 16px 20px;
+    text-align:center;
+    background:
+      radial-gradient(1200px 400px at 50% -10%, rgba(0,170,255,0.18), transparent 60%),
+      radial-gradient(900px 400px at 10% 0%, rgba(0,130,200,0.12), transparent 60%);
+  }
+  .title{
+    font-size:clamp(28px,4.8vw,46px);
+    font-weight:800;
+    letter-spacing:.5px;
+    background:linear-gradient(90deg,#86d1ff,#3aa3e8,#86d1ff);
+    -webkit-background-clip:text;
+    background-clip:text;
+    color:transparent;
+    background-size:200% 100%;
+    animation:titleGlow 8s ease-in-out infinite;
+  }
+  .subtitle{margin-top:10px;color:var(--muted);font-weight:600}
+  @keyframes titleGlow{0%{background-position:0 0}50%{background-position:100% 0}100%{background-position:0 0}}
+  main{max-width:1200px;margin:0 auto;padding:22px 16px 84px}
+  h2{margin:26px 0 10px;font-size:24px;color:#86d1ff}
+  .subnote{margin:0 0 8px;color:var(--muted);line-height:1.55}
+  .feature-title{
+    text-align:center;
+    font-size:clamp(38px,5.4vw,62px);
+    margin:18px 0 26px;
+    letter-spacing:.5px;
+  }
+  .grid{
+    display:grid;
+    grid-template-columns:repeat(auto-fit,minmax(320px,1fr));
+    gap:18px;
+    margin-top:12px;
+    align-items:stretch;
+  }
+  .card{
+    background:linear-gradient(180deg, rgba(20,45,76,.97), rgba(20,45,76,.88));
+    border:1px solid var(--line);
+    border-radius:16px;
+    padding:16px 16px 18px;
+    box-shadow:0 10px 30px rgba(0,0,0,.25);
+    transform:translateY(10px) scale(.985);
+    opacity:0;
+    animation:rise .8s forwards;
+    display:flex;
+    flex-direction:column;
+    min-height:290px;
+  }
+  @keyframes rise{to{transform:none;opacity:1}}
+  .card h3{margin:0 0 8px;color:#bde2ff;font-size:18px;line-height:1.3}
+  .card p{margin:6px 0 0;color:var(--muted)}
+  .card ul{margin:8px 0 0 18px;padding:0;flex:1}
+  .card li{margin:7px 0;line-height:1.55}
+  .btn-more{
+    margin-top:12px;
+    display:inline-block;
+    font-size:.95rem;
+    padding:8px 12px;
+    border-radius:10px;
+    border:1px solid var(--button-line);
+    background:var(--button);
+    color:#a8d7ff;
+    cursor:pointer;
+    transition:transform .15s ease, box-shadow .2s ease, border-color .2s ease;
+    align-self:flex-start;
+  }
+  .btn-more:hover{transform:translateY(-1px);box-shadow:0 6px 16px rgba(0,0,0,.25);border-color:#256ea7}
+  .tag{display:inline-block;background:#0e2036;color:#9bd6ff;border:1px solid #1e4d78;padding:3px 8px;border-radius:999px;font-size:.8rem;margin:4px 6px 0 0}
+  .sep{height:1px;background:linear-gradient(90deg,transparent,rgba(0,170,255,.35),transparent);margin:30px 0}
+  .footer{margin-top:42px;text-align:center;color:#7fbdea;line-height:1.65}
+
+  /* modal */
+  .modal{
+    position:fixed;
+    inset:0;
+    display:none;
+    align-items:center;
+    justify-content:center;
+    background:rgba(2,6,18,.68);
+    z-index:1000;
+    padding:18px;
+  }
+  .modal[open]{display:flex;animation:fadeIn .15s ease-out}
+  @keyframes fadeIn{from{opacity:0}to{opacity:1}}
+  .pop{
+    width:min(900px,94vw);
+    max-height:min(82vh,900px);
+    overflow:auto;
+    background:linear-gradient(180deg, rgba(15,28,54,.985), rgba(12,24,46,.985));
+    border:1px solid rgba(0,170,255,.25);
+    border-radius:18px;
+    padding:18px 16px 16px;
+    color:var(--ink);
+    box-shadow:0 20px 60px rgba(0,0,0,.45);
+    transform:translateY(12px) scale(.985);
+    opacity:0;
+    animation:popIn .22s ease-out forwards;
+    position:relative;
+  }
+  @keyframes popIn{to{transform:none;opacity:1}}
+  .pop h3{margin:0 0 8px;color:#bde2ff}
+  .pop .meta{color:#8dbfe2;margin-bottom:10px;line-height:1.55}
+  .pop .x{
+    position:absolute;right:16px;top:12px;
+    background:#092039;border:1px solid #154465;color:#9ad3ff;
+    border-radius:10px;padding:6px 10px;cursor:pointer;
+  }
+  .pop ul{margin:10px 0 0 18px;padding-right:6px}
+  .pop li{margin:7px 0;line-height:1.6}
+  code{color:#d9f0ff;background:rgba(255,255,255,.06);padding:1px 4px;border-radius:6px}
+  .mini-grid{
+    display:grid;
+    grid-template-columns:repeat(auto-fit,minmax(220px,1fr));
+    gap:10px;
+    margin-top:10px;
+  }
+  .mini-box{
+    border:1px solid rgba(0,170,255,.18);
+    border-radius:12px;
+    padding:10px 12px;
+    background:rgba(255,255,255,.03);
+  }
+  .mini-box strong{display:block;color:#bde2ff;margin-bottom:4px}
+</style>
+</head>
+<body>
+<header>
+  <div class="title">FrameVision — Feature Guide</div>
+  <div class="subtitle">Local AI media studio • Video, image, music, speech, queue, planning &amp; performance tools</div>
+</header>
+
+<main>
+  <h2 class="feature-title">Features</h2>
+
+<div class="grid">
+    <div class="card" style="animation-delay:.05s">
+      <h3>🧪 Upscaler</h3>
+      <ul>
+        <li>Image and video upscaling with queue support, recents and player integration.</li>
+        <li>Quality + sound options for video; source-FPS friendly workflows.</li>
+        <li><b>Models:</b> Real-ESRGAN family, RealSR x2/x4, Upscayl, SRMD, UltraSharp, SeedVR2, anime video models, Waifu2x family.</li>
+        <li>Batch tools, format/output controls and result browsing.</li>
+      </ul>
+      <button class="btn-more" data-modal="m-upscaler">More info</button>
+    </div>
+
+    <div class="card" style="animation-delay:.08s">
+      <h3>🖼️ Image Edit &amp; Reference Images</h3>
+      <ul>
+        <li>Local image-edit workflows with reference-image guidance for stronger consistency and targeted changes.</li>
+        <li>Useful for repainting, identity consistency, prompt-guided edits and reference-based creative work.</li>
+        <li><b>Models:</b> Qwen Edit 2511, HiDream, Flux Klein and FireRed 1.1.</li>
+        <li>Great for editing characters, products, scenes and style while keeping key details recognizable.</li>
+      </ul>
+      <button class="btn-more" data-modal="m-image-edit">More info</button>
+    </div>
+
+    <div class="card" style="animation-delay:.11s">
+      <h3>⏱️ RIFE Interpolation</h3>
+      <ul>
+        <li>Queue-native frame interpolation and slow motion.</li>
+        <li>Slow-mo <b>0.15×–1.0×</b> with audio retime; interpolation <b>1.0×–4.0×</b> for higher FPS.</li>
+        <li>Different profiles and models for up to 4K workflows.</li>
+        <li>Fast result access through recents and player preview.</li>
+      </ul>
+      <button class="btn-more" data-modal="m-rife">More info</button>
+    </div>
+
+    <div class="card" style="animation-delay:.14s">
+      <h3>📝 Describe (AI)</h3>
+      <ul>
+        <li><b>Engines:</b> Qwen3-VL (2B Instruct) + BLIP for quick captions.</li>
+        <li>Offline scene understanding, prompt making and OCR-like reading.</li>
+        <li>Useful presets for general descriptions, prompt conversion and troubleshooting.</li>
+        <li>Works with current frame, single files or folders.</li>
+      </ul>
+      <button class="btn-more" data-modal="m-describe">More info</button>
+    </div>
+
+    <div class="card" style="animation-delay:.17s">
+      <h3>🖌️ TXT→IMG</h3>
+      <ul>
+        <li>Local image generation with classic and newer engines in one workspace.</li>
+        <li>Prompt builder, negatives, size presets, aspect lock and queue support.</li>
+        <li>Fast reruns, player preview, JSON sidecars and batch/seed control.</li>
+        <li>Great as the central image-generation hub inside FrameVision.</li>
+      </ul>
+      <button class="btn-more" data-modal="m-txt2img">More info</button>
+    </div>
+
+    <div class="card" style="animation-delay:.20s">
+      <h3>🧠 New Image Models</h3>
+      <ul>
+        <li><b>Qwen-Image-2512 (GGUF)</b> for realism, strong text rendering and local generation.</li>
+        <li><b>Ideogram 4 GGUF</b> with Turbo / Default / HQ modes.</li>
+        <li><b>Lens</b> and <b>Chroma</b> integrated as newer image-generation options.</li>
+        <li><b>Z-Image Turbo GGUF</b> and FP16 path for fast concepting on many systems.</li>
+      </ul>
+      <button class="btn-more" data-modal="m-image-models">More info</button>
+    </div>
+
+    <div class="card" style="animation-delay:.23s">
+      <h3>🧹 Background &amp; Inpaint</h3>
+      <ul>
+        <li>Dedicated background remover/replace workflow with fast and heavier removal models.</li>
+        <li>Brush editing, magnifier, pan, undo/redo and before/after preview.</li>
+        <li>Local SDXL inpainting for editing masked image areas.</li>
+        <li>Settings such as CPU offload, attention slicing, VAE tiling and size matching.</li>
+      </ul>
+      <button class="btn-more" data-modal="m-background">More info</button>
+    </div>
+
+    <div class="card" style="animation-delay:.26s">
+      <h3>🧰 Multi Tool</h3>
+      <ul>
+        <li>Central utility area for video, image, audio and file-management tasks.</li>
+        <li>Includes trim, split/glue, resize/convert, crop, reverse/boomerang, GIF creation and extract-frames workflows.</li>
+        <li>Also covers prompt enhancement, Qwen 3 TTS, Whisper Lab, metadata editing and multi rename/replace.</li>
+        <li>Great for practical day-to-day jobs that do not need a full generation pipeline.</li>
+      </ul>
+      <button class="btn-more" data-modal="m-tools">More info</button>
+    </div>
+
+    <div class="card" style="animation-delay:.29s">
+      <h3>🎞️ Video Generation</h3>
+      <ul>
+        <li><b>LTX 2.3</b>, <b>Wan 2.2</b> and <b>HunyuanVideo 1.5</b> workflows.</li>
+        <li>TXT→Video, IMG→Video, Video→Video, extend and more advanced start/end guidance where supported.</li>
+        <li>Works with FrameVision queue and player-oriented result flow.</li>
+        <li>Designed to pair with VRAM Lab for larger local model runs.</li>
+      </ul>
+      <button class="btn-more" data-modal="m-video">More info</button>
+    </div>
+
+    <div class="card" style="animation-delay:.32s">
+      <h3>🧠 Planner</h3>
+      <ul>
+        <li>Turns one idea into a structured video plan with beats, shots and prompts.</li>
+        <li>Character Bible support plus own-storyline and alternative-storyline modes.</li>
+        <li>Can generate clips per shot, narration, music and a final assembled cut.</li>
+        <li>Resume/review workflows through Results &amp; History.</li>
+      </ul>
+      <button class="btn-more" data-modal="m-planner">More info</button>
+    </div>
+
+    <div class="card" style="animation-delay:.35s">
+      <h3>🖼️ Thumbnail / Meme Creator</h3>
+      <ul>
+        <li>Use the current frame/image or load a new one with big preview.</li>
+        <li>Multiple text layers, outlines, shadows, ALL CAPS, alignment and readability tools.</li>
+        <li>Interactive crop overlay with 16:9 / 9:16 / free framing.</li>
+        <li>Transform sliders for rotate, tilt/skew and arc curvature.</li>
+      </ul>
+      <button class="btn-more" data-modal="m-meme">More info</button>
+    </div>
+
+    <div class="card" style="animation-delay:.38s">
+      <h3>🎬 Music Videoclip Creator</h3>
+      <ul>
+        <li>Auto-cuts to beat and energy with effects, transitions and drop/chorus styling.</li>
+        <li>Can use timeline overrides for more manual control.</li>
+        <li>Supports beat-synced visuals and newer LTX-oriented workflow expansion.</li>
+        <li>Built to turn generated clips and music into a polished music video quickly.</li>
+      </ul>
+      <button class="btn-more" data-modal="m-mvc">More info</button>
+    </div>
+
+    <div class="card" style="animation-delay:.41s">
+      <h3>🎼 Music Creation</h3>
+      <ul>
+        <li><b>Ace Step 1.5</b> music generation with prompt/tags, negatives and optional lyrics.</li>
+        <li>Genre presets, favorites, seed control and result playback.</li>
+        <li>Supports instrumental or lyric-guided workflows for broader music creation.</li>
+        <li>Integrates naturally with Music Videoclip Creator and Planner.</li>
+      </ul>
+      <button class="btn-more" data-modal="m-music">More info</button>
+    </div>
+
+    <div class="card" style="animation-delay:.44s">
+      <h3>🎙️ Qwen 3 TTS &amp; Whisper</h3>
+      <ul>
+        <li><b>Qwen 3 Text-to-Speech</b>: base voice, custom voice, clone voice and voice design.</li>
+        <li><b>Whisper</b> for subtitles, transcripts and speech-to-text workflows.</li>
+        <li>Useful for narration, planning, lyric/subtitle work and accessibility.</li>
+        <li>Complements the Planner’s story → narration → final video pipeline.</li>
+      </ul>
+      <button class="btn-more" data-modal="m-voice">More info</button>
+    </div>
+
+    <div class="card" style="animation-delay:.47s">
+      <h3>📋 Queue</h3>
+      <ul>
+        <li>Central processing queue with running, pending, finished and failed management.</li>
+        <li>Rich job rows, ETA/progress, auto-play toggle and internal player integration.</li>
+        <li>Supports many FrameVision tools instead of each tool needing its own mini-queue.</li>
+        <li>Safe cleanup, output resolving and robust file handling.</li>
+      </ul>
+      <button class="btn-more" data-modal="m-queue">More info</button>
+    </div>
+
+    <div class="card" style="animation-delay:.50s">
+      <h3>🎬 Media Player &amp; Explorer</h3>
+      <ul>
+        <li>Offline player for video, image and audio with fullscreen, zoom, pan and compare.</li>
+        <li>Media Explorer for search, sort, preview, rename, delete and favorites.</li>
+        <li>Useful for browsing all your generated results without leaving the app.</li>
+        <li>Player-first workflow helps keep tools connected to the same media view.</li>
+      </ul>
+      <button class="btn-more" data-modal="m-media">More info</button>
+    </div>
+
+    <div class="card" style="animation-delay:.53s">
+      <h3>🧪 VRAM Lab &amp; DDR Manager</h3>
+      <ul>
+        <li>Beta memory-management layer for heavy local models.</li>
+        <li>Helps reduce shared-memory spill and makes larger runs more practical.</li>
+        <li>Works toward reusable model-agnostic control for LTX, Wan, Hunyuan and more.</li>
+        <li>Paired with auto profiles and future memory preflight checks.</li>
+      </ul>
+      <button class="btn-more" data-modal="m-vram">More info</button>
+    </div>
+
+    <div class="card" style="animation-delay:.56s">
+      <h3>⚙️ Settings, Downloads &amp; Model Manager</h3>
+      <ul>
+        <li>Theme controls, output paths, maintenance tools and UI toggles.</li>
+        <li>Optional Downloads menu for installing newer large models only when needed.</li>
+        <li>Auto update checks, logs toggles, font size options and visual/UI preferences.</li>
+        <li>Remove/hide tools help keep the app clean when some models are not needed.</li>
+      </ul>
+      <button class="btn-more" data-modal="m-settings">More info</button>
+    </div>
+
+    <div class="card" style="animation-delay:.59s">
+      <h3>🧾 Results / History</h3>
+      <ul>
+        <li>Planner-oriented history view for finished, partial and failed jobs.</li>
+        <li>Resume is the key workflow feature for continuing unfinished projects.</li>
+        <li>Colored asset indicators show what stages of a workflow have completed.</li>
+        <li>Open folder, manifest, errors or favorite important jobs.</li>
+      </ul>
+      <button class="btn-more" data-modal="m-history">More info</button>
+    </div>
+  </div>
+  </div>
+
+  <div class="sep"></div>
+
+  <h2>Overview</h2>
+  <div class="grid">
+    <div class="card" style="animation-delay:.08s;min-height:250px">
+      <h3>🧭 Workspace</h3>
+      <p>FrameVision keeps a left-side media viewer and a right-side tool area so generation, editing, playback and browsing stay connected. The app is built around a practical local workflow instead of many disconnected mini-apps.</p>
+      <div style="margin-top:12px">
+        <span class="tag">Windows</span>
+        <span class="tag">CPU / GPU</span>
+        <span class="tag">PySide6</span>
+        <span class="tag">Local-first</span>
+      </div>
+    </div>
+
+    <div class="card" style="animation-delay:.11s;min-height:250px">
+      <h3>🔁 Core workflow</h3>
+      <ul>
+        <li>Open or generate media, preview it in the internal player, then send it into the next tool.</li>
+        <li>Use queue where it makes sense, or run directly in tools that are meant to be immediate.</li>
+        <li>Let Planner handle bigger idea → final-video pipelines.</li>
+      </ul>
+    </div>
+
+    <div class="card" style="animation-delay:.14s;min-height:250px">
+      <h3>🧩 Optional downloads</h3>
+      <ul>
+        <li>The app no longer depends on an old “full CPU install” idea.</li>
+        <li>Large models are installed from the Optional Downloads menu when needed.</li>
+        <li>This keeps the base app lighter and gives users more control over disk space.</li>
+      </ul>
+    </div>
+  </div>
+
+  <div class="sep"></div>
+
+  <h2>What makes it user-friendly? 😄</h2>
+  <div class="grid">
+    <div class="card" style="min-height:250px">
+      <h3>✨ Practical quality-of-life features</h3>
+      <ul>
+        <li>Tooltips, helper text and guided controls for newer users.</li>
+        <li><b>Ask Framie:</b> the little offline chatbot can tell you all about an image or screenshot, but also knows a thing or two about how to use FrameVision.</li>
+        <li>Check the <b>Knowledge and Q&amp;A Guide</b> in the Info menu for extra info, tips and troubleshooting help.</li>
+        <li>Reusable player, recents and queue integration across many tools.</li>
+        <li>Multiple themes, font-size control, optional hover animations and flexible UI options.</li>
+        <li>Portable-style project structure with models, presets, output and environments kept organized.</li>
+      </ul>
+    </div>
+  </div>
+
+  <div class="sep"></div>
+
+  <div class="footer">
+    Built by <b>Contrinsan</b>. Feature guidance and polish support by <b>ChatGPT</b>.<br/>
+    <span style="opacity:.75">This guide is a living overview and should evolve with each major FrameVision release.</span>
+  </div>
+</main>
+
+<!-- Modals -->
+<div class="modal" id="m-upscaler"><div class="pop"><button class="x" data-close>Close</button><h3>Upscaler — more info</h3><div class="meta">Image &amp; video enhancement • Queue-ready • Multiple engines</div><ul><li>Supports different upscale families so users can pick what works best for realism, anime or general restoration.</li><li>Video output controls include quality/sound options and queue-friendly batch workflows.</li><li>Recent results and internal-player integration keep the workflow fast when comparing outputs.</li><li>Useful engines and families in the app direction include Real-ESRGAN, RealSR, Upscayl, SRMD, UltraSharp, SeedVR2, anime video models and Waifu2x variants.</li></ul></div></div>
+
+<div class="modal" id="m-image-edit"><div class="pop"><button class="x" data-close>Close</button><h3>Image Edit &amp; Reference Images — more info</h3><div class="meta">Reference-guided editing • Identity consistency • Multiple image-edit backends</div><ul><li>This section focuses on editing existing images instead of only generating new ones from scratch.</li><li>Reference images can be used to help keep a character, subject, product or scene more consistent across edits and repaints.</li><li><b>Qwen Edit 2511</b> is useful for edit-driven workflows, while <b>HiDream</b>, <b>Flux Klein</b> and <b>FireRed 1.1</b> expand the style and image-edit toolbox.</li><li>These workflows are useful for fixing details, changing style, preserving identity, building reference-based story shots and improving consistency for repeated characters.</li></ul></div></div>
+
+<div class="modal" id="m-meme"><div class="pop"><button class="x" data-close>Close</button><h3>Thumbnail / Meme Creator — more info</h3><div class="meta">Fast overlays • Readability tools • Good for social-media style images</div><ul><li>Text layers support font choice, outline width, shadows, capitalization and alignment.</li><li>Transform controls help with more expressive layouts like tilted text or curved captions.</li><li>The interactive crop overlay makes it easier to frame for 16:9 thumbnails or vertical content.</li><li>Exports stay simple and useful: PNG/JPG plus EXIF keep/remove options.</li></ul></div></div>
+
+<div class="modal" id="m-rife"><div class="pop"><button class="x" data-close>Close</button><h3>RIFE Interpolation — more info</h3><div class="meta">Smooth motion • Slow motion • Higher FPS outputs</div><ul><li>Great for both frame interpolation and slowdown workflows.</li><li>Profiles help users choose between speed and quality instead of drowning them in technical settings.</li><li>RIFE is queue-native, so longer jobs can run in the background while the rest of the app stays usable.</li><li>Result handling is player-first, making before/after checking much easier.</li></ul></div></div>
+
+<div class="modal" id="m-describe"><div class="pop"><button class="x" data-close>Close</button><h3>Describe (AI) — more info</h3><div class="meta">Local describing • Prompt support • Current-frame friendly</div><ul><li>Qwen3-VL provides rich descriptions while BLIP gives quicker compact captions.</li><li>Good for prompt generation, scene analysis, quick OCR-like reading and troubleshooting what is inside an image.</li><li>Helpful presets keep it beginner-friendly, so the user can choose a style instead of rewriting the task every time.</li><li>Folder use makes it practical for reviewing many images at once.</li></ul></div></div>
+
+<div class="modal" id="m-txt2img"><div class="pop"><button class="x" data-close>Close</button><h3>TXT→IMG — more info</h3><div class="meta">Local image-generation hub • Queue-native • Flexible prompting</div><ul><li>Acts as the central home for FrameVision image models, from classic SDXL / SD1.5 to newer model integrations.</li><li>Includes prompt fields, negative prompts, size presets, manual width/height, aspect lock, seed control and rerun-friendly behavior.</li><li>Queue support, player preview and JSON sidecars help keep experiments organized.</li><li>Especially useful when users want one familiar UI while switching between multiple image backends.</li></ul></div></div>
+
+<div class="modal" id="m-image-models"><div class="pop"><button class="x" data-close>Close</button><h3>New Image Models — more info</h3><div class="meta">Optional installs • Newer image quality • Multiple backends</div><ul><li><b>Qwen-Image-2512 (GGUF)</b> adds stronger realism, faces, natural textures and text rendering, with optional LoRA support and CPU offload.</li><li><b>Ideogram 4 GGUF</b> uses Turbo / Default / HQ modes and a conditional + unconditional GGUF setup.</li><li><b>Lens</b> and <b>Chroma</b> expand the modern image stack and are intended to work cleanly inside the FrameVision workflow.</li><li><b>Z-Image Turbo GGUF</b> remains useful for fast local generations on a wide range of systems.</li></ul><div class="mini-grid"><div class="mini-box"><strong>Classic base</strong>SDXL, SD1.5</div><div class="mini-box"><strong>GGUF / fast options</strong>Z-Image Turbo, Qwen-Image, Ideogram 4 GGUF</div><div class="mini-box"><strong>Newer image tools</strong>Lens, Chroma</div></div></div></div>
+
+<div class="modal" id="m-background"><div class="pop"><button class="x" data-close>Close</button><h3>Background &amp; Inpaint — more info</h3><div class="meta">Masking, replacement and SDXL editing in one practical workflow</div><ul><li>The background remover has its own workspace with preview, brush tools, zoom support and undo/redo.</li><li>It can remove a background or prepare an image for replacement/editing workflows.</li><li>The SDXL inpaint side covers local masked edits, with helpers like invert mask, size matching and VRAM-related options.</li><li>Useful for both quick cleanup and more creative image repair or replacement tasks.</li></ul></div></div>
+
+<div class="modal" id="m-tools"><div class="pop"><button class="x" data-close>Close</button><h3>Multi Tool — more info</h3><div class="meta">Practical utility toolbox • Video, image, audio and file helpers</div><ul><li>Current multi-tool direction includes utilities such as <b>Upscale Video and images</b>, <b>Rife interpolation</b>, <b>Sound Mixer</b>, <b>Video Split and glue together</b>, <b>Video Trim Lab</b> and <b>Extract frames</b>.</li><li>It also includes <b>Resize/convert - Images/Video</b>, <b>Background Remover / SDXL Mask Inpaint</b>, <b>Sound Edit</b>, <b>Slow motion - Speedup Video</b> and <b>Qwen 3 Text to Speech</b>.</li><li>More creative/utility tools in the list include <b>Prompt Enhancement</b>, <b>Transition Video</b>, <b>Beat-synced visuals</b>, <b>Describe anything with Qwen3 VL</b> and <b>Thumbnail / Meme Creator</b>.</li><li>Extra helpers also include <b>Reverse video - Boomerang</b>, <b>Cropping</b>, <b>Video Text Overlay</b>, <b>Create animated gifs from images or video</b>, <b>Whisper Lab</b>, <b>Multi Rename/Replace</b> and <b>Metadata editor</b>.</li></ul></div></div>
+
+<div class="modal" id="m-video"><div class="pop"><button class="x" data-close>Close</button><h3>Video Generation — more info</h3><div class="meta">Local video models • Growing workflow depth • Optional large-model installs</div><ul><li><b>LTX 2.3</b> support includes the newer model-loader direction, FP16 with VRAM Lab, experimental FP8, updated distilled 1.1 model support and advanced start/end guidance options.</li><li><b>Wan 2.2</b> remains part of the stack, with the user’s direction leaning toward <b>Wan 2.2 Turbo</b> as the preferred practical path for some workflows.</li><li><b>HunyuanVideo 1.5</b> is available for TXT→Video, IMG→Video, Video→Video and extender-style flows.</li><li>These tools are intended to benefit from queue support, result playback and memory-management helpers instead of feeling like separate outside apps.</li></ul></div></div>
+
+<div class="modal" id="m-planner"><div class="pop"><button class="x" data-close>Close</button><h3>Planner — more info</h3><div class="meta">Idea → structure → assets → final video</div><ul><li>Planner can turn a simple idea or prompt into a structured shot plan and story flow.</li><li><b>Character Bible</b> helps carry identity/style through multiple shots.</li><li><b>Own Storyline</b> lets the user paste numbered beats, while <b>Alternative Storyline</b> is safer for animals/creatures and helps reduce awkward humanization drift.</li><li>Planner can create per-shot prompts, generate clips, create narration text, generate music and assemble a final-cut timeline.</li><li>Mid-run checkpoints, retry/regenerate choices and later resume support make it useful for longer projects.</li></ul><div class="mini-grid"><div class="mini-box"><strong>Input</strong>Idea, references, story beats</div><div class="mini-box"><strong>Middle</strong>Shot list, prompts, clips, narration, music</div><div class="mini-box"><strong>Output</strong>Final cut with history/resume</div></div></div></div>
+
+<div class="modal" id="m-music"><div class="pop"><button class="x" data-close>Close</button><h3>Music Creation — more info</h3><div class="meta">Ace Step 1.5 • Prompt-based music • Useful for final-video pipelines</div><ul><li>Prompt/tags, negative tags, optional lyrics and genre presets make the workflow accessible.</li><li>Favorites and seed controls help people revisit or refine music ideas more easily.</li><li>Can support instrumental tracks, user-provided lyrics or AI-generated lyric directions tied to story context.</li><li>Designed to work naturally with both Music Videoclip Creator and Planner.</li></ul></div></div>
+
+<div class="modal" id="m-mvc"><div class="pop"><button class="x" data-close>Close</button><h3>Music Videoclip Creator — more info</h3><div class="meta">Beat-driven editing • Visual styling • Moving toward broader automation</div><ul><li>Auto-cuts based on beat and energy, with transitions, cinematic effects and drop/chorus treatments.</li><li>Supports timeline override for users who want more control.</li><li>Beat-synced visuals can be layered in, and the workflow is growing to work better with newer LTX and planning-style directions.</li><li>Useful as a fast final-assembly creative tool when you already have music and clips.</li></ul></div></div>
+
+<div class="modal" id="m-voice"><div class="pop"><button class="x" data-close>Close</button><h3>Qwen 3 TTS &amp; Whisper — more info</h3><div class="meta">Narration, subtitles and speech workflows</div><ul><li><b>Qwen 3 Text-to-Speech</b> supports base voice, custom voice, clone voice and prompt-based voice design.</li><li><b>Whisper</b> handles voice-to-text duties for subtitles and transcripts.</li><li>Together they open the door for narration creation, subtitle extraction, script testing and more complete end-to-end video workflows.</li></ul></div></div>
+
+<div class="modal" id="m-queue"><div class="pop"><button class="x" data-close>Close</button><h3>Queue — more info</h3><div class="meta">Central job handling • Rich rows • Safer file/result logic</div><ul><li>Supports running, pending, finished and failed states, plus cleanup and recovery actions.</li><li>Rows can show titles, subtitles, progress, ETA and output-related actions.</li><li>Internal player is preferred for quick result viewing; OS fallback can still be used when needed.</li><li>The queue makes FrameVision feel like one connected app rather than many isolated tools.</li></ul></div></div>
+
+<div class="modal" id="m-media"><div class="pop"><button class="x" data-close>Close</button><h3>Media Player &amp; Explorer — more info</h3><div class="meta">Playback, preview, browsing and comparison</div><ul><li>The internal player supports video, audio and images with fullscreen, zoom/pan and compare-friendly behavior.</li><li>Media Explorer helps users search, sort, preview, rename, delete and favorite results folders/files.</li><li>This makes it much easier to manage growing AI output libraries without leaving FrameVision.</li></ul></div></div>
+
+<div class="modal" id="m-vram"><div class="pop"><button class="x" data-close>Close</button><h3>VRAM Lab &amp; DDR Manager — more info</h3><div class="meta">Model-agnostic memory-management direction for heavy local AI workflows</div><ul><li><b>VRAM Lab</b> is a reusable backend direction rather than a single-model hack. It aims to help LTX, Wan, Hunyuan and future large models stay more manageable under local hardware limits.</li><li>Current focus includes reducing shared-memory spill, using safer memory profiles and improving practical large-model runs.</li><li><b>DDR Manager</b> is the paired idea for RAM/pagefile/commit preflight checks and safer heavy-run decisions.</li><li>These systems are especially important for users running advanced video models on limited or mid-range VRAM.</li></ul></div></div>
+
+<div class="modal" id="m-settings"><div class="pop"><button class="x" data-close>Close</button><h3>Settings, Downloads &amp; Model Manager — more info</h3><div class="meta">Customization, maintenance and model control</div><ul><li>Settings cover paths, themes, UI behavior, logs, font size and other quality-of-life controls.</li><li>The old “full CPU install” style wording can be dropped in favor of a clearer <b>Optional Downloads</b> model.</li><li>Auto update checking and restart prompts help keep the app current.</li><li>Remove/hide tools can reduce clutter and help users manage installed model environments and optional components more safely.</li></ul></div></div>
+
+<div class="modal" id="m-history"><div class="pop"><button class="x" data-close>Close</button><h3>Results / History — more info</h3><div class="meta">Planner-focused project tracking • Resume-heavy workflow</div><ul><li>Shows past jobs with status like Failed, Partial and Done.</li><li>Colored asset indicators help users understand which workflow parts completed for each job.</li><li>Actions can include opening the folder, manifest or errors, resuming a run, removing the folder or marking favorites.</li><li><b>Resume</b> is the most important action here because it turns FrameVision into a more serious long-project environment.</li></ul></div></div>
+
+<script>
+  document.querySelectorAll('.btn-more').forEach(btn => {
+    btn.addEventListener('click', () => {
+      const id = btn.getAttribute('data-modal');
+      const m = document.getElementById(id);
+      if (m) m.setAttribute('open', '');
+    });
+  });
+  document.querySelectorAll('[data-close]').forEach(btn => {
+    btn.addEventListener('click', () => {
+      const modal = btn.closest('.modal');
+      if (modal) modal.removeAttribute('open');
+    });
+  });
+  document.querySelectorAll('.modal').forEach(modal => {
+    modal.addEventListener('click', (e) => {
+      if (e.target === modal) modal.removeAttribute('open');
+    });
+  });
+  document.addEventListener('keydown', (e) => {
+    if (e.key === 'Escape') {
+      document.querySelectorAll('.modal[open]').forEach(m => m.removeAttribute('open'));
+    }
+  });
+</script>
+</body>
+</html>

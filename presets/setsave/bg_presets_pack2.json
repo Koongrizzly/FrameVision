@@ -1,0 +1,112 @@
+{
+  "bg_presets": [
+    {
+      "name": "Gentle object removal (loop\u2011safe)",
+      "params": {
+        "engine": "auto",
+        "mode": "keep_subject",
+        "threshold": 0,
+        "feather": 4,
+        "bias": 50,
+        "edge_shift": 0,
+        "spill": true,
+        "invert": false,
+        "auto_level": true,
+        "repl_mode": "transparent",
+        "drop_shadow": false,
+        "anti_halo": true,
+        "sd_prompt": "seamless background continuation, realistic, no artifacts",
+        "sd_negative": "text, watermark, repetition, glitches, duplicate subject",
+        "sd_steps": 22,
+        "sd_guidance": 6.0,
+        "sd_strength": 0.45,
+        "sd_seed": -1,
+        "sd_auto_inpaint": false,
+        "sd_freeze_unmasked": true,
+        "sd_pad_px": 6,
+        "overlay": 45
+      }
+    },
+    {
+      "name": "Edge\u2011guard portrait BG remove",
+      "params": {
+        "engine": "auto",
+        "mode": "keep_subject",
+        "threshold": 3,
+        "feather": 3,
+        "bias": 45,
+        "edge_shift": -3,
+        "spill": true,
+        "invert": false,
+        "auto_level": true,
+        "repl_mode": "transparent",
+        "drop_shadow": false,
+        "anti_halo": true,
+        "sd_prompt": "clean background, studio look, natural hair edge",
+        "sd_negative": "halo, fringing, blur, text, watermark",
+        "sd_steps": 28,
+        "sd_guidance": 6.5,
+        "sd_strength": 0.6,
+        "sd_seed": -1,
+        "sd_auto_inpaint": false,
+        "sd_freeze_unmasked": true,
+        "sd_pad_px": 8,
+        "overlay": 50
+      }
+    },
+    {
+      "name": "Sky cleanup (large area)",
+      "params": {
+        "engine": "auto",
+        "mode": "keep_subject",
+        "threshold": 0,
+        "feather": 5,
+        "bias": 55,
+        "edge_shift": 1,
+        "spill": true,
+        "invert": false,
+        "auto_level": true,
+        "repl_mode": "transparent",
+        "drop_shadow": false,
+        "anti_halo": true,
+        "sd_prompt": "clear evening sky gradient, consistent lighting, no seams",
+        "sd_negative": "banding, noise, clouds duplicating, text",
+        "sd_steps": 35,
+        "sd_guidance": 9.5,
+        "sd_strength": 0.85,
+        "sd_seed": -1,
+        "sd_auto_inpaint": false,
+        "sd_freeze_unmasked": true,
+        "sd_pad_px": 18,
+        "overlay": 40
+      }
+    },
+    {
+      "name": "Street sign removal (context aware)",
+      "params": {
+        "engine": "auto",
+        "mode": "keep_subject",
+        "threshold": 0,
+        "feather": 4,
+        "bias": 50,
+        "edge_shift": 0,
+        "spill": true,
+        "invert": false,
+        "auto_level": true,
+        "repl_mode": "transparent",
+        "drop_shadow": false,
+        "anti_halo": true,
+        "sd_prompt": "continuous asphalt and curb, matching texture, no repeating patterns",
+        "sd_negative": "people, cars, repetition, text",
+        "sd_steps": 32,
+        "sd_guidance": 8.0,
+        "sd_strength": 0.7,
+        "sd_seed": -1,
+        "sd_auto_inpaint": false,
+        "sd_freeze_unmasked": true,
+        "sd_pad_px": 14,
+        "overlay": 50
+      }
+    }
+  ]
+}

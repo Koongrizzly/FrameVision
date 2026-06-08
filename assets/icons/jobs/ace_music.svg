@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" width="48" height="48" viewBox="0 0 48 48" role="img" aria-label="Ace Music">
+  <g fill="none" stroke="#ffffff" stroke-width="2.6" stroke-linecap="round" stroke-linejoin="round">
+
+    <path d="M27 14v17"/>
+    <path d="M27 14c3 1.7 6.4 1.9 8.7 1.4v5c-2.3.5-5.7.3-8.7-1.4"/>
+    <circle cx="22" cy="31.5" r="3.3"/>
+    <path d="M13 19l1.2 2.2 2.2 1.2-2.2 1.2-1.2 2.2-1.2-2.2-2.2-1.2 2.2-1.2z"/>
+
+  </g>
+</svg>

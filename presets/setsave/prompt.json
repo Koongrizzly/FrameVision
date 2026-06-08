@@ -1,0 +1,16 @@
+{
+  "style": "",
+  "length_choice": "Long (140–200 words)",
+  "target": "image",
+  "model_key": "__local_qwen3vl2b__",
+  "negatives": "muddy shading, painterly smears, watermark, signature, text, logo, low-res, blurry, jpeg artifacts, heavy noise, overprocessed",
+  "applied_negatives": "",
+  "temperature": 0.9,
+  "max_new_tokens": 420,
+  "seed_text": "",
+  "preset": "Default",
+  "favorites": [],
+  "preset_category": "All",
+  "last_used_preset": "Anime",
+  "var_count": 8
+}
