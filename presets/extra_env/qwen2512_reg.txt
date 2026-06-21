@@ -1,0 +1,25 @@
+{
+  "id": "wan2512",
+  "name": "WAN 2512 (Qwen-Image-2512 GGUF)",
+  "description": "One-click installer: downloads Qwen-Image-2512 Q4_K_M (GGUF) + Qwen2.5-VL-7B-Instruct-UD-Q4_K_XL (GGUF) + qwen_image_vae.safetensors for sd-cli (stable-diffusion.cpp).",
+  "script": "presets/extra_env/qwen2512_install.bat",
+  "downloads": [
+    {
+      "file": "models/wan2512gguf/qwen-image-2512-Q4_K_M.gguf",
+      "approx_gb": 13.1
+    },
+    {
+      "file": "models/wan2512gguf/Qwen2.5-VL-7B-Instruct-UD-Q4_K_XL.gguf",
+      "approx_gb": 4.79
+    },
+    {
+      "file": "models/wan2512gguf/qwen_image_vae.safetensors",
+      "approx_gb": 0.254
+    }
+  ],
+  "approx_total_gb": 18.14,
+  "notes": [
+    "Requires sd-cli (stable-diffusion.cpp) to be available in FrameVision.",
+    "If you see black images on longer prompts, try shorter prompts and fewer steps (known upstream issue)."
+  ]
+}

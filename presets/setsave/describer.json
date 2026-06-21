@@ -1,0 +1,18 @@
+{
+  "spin_cpu": 6,
+  "sp_max": 350,
+  "sp_min": 59,
+  "sp_ngram": 3,
+  "sp_temp": 1.2,
+  "sp_topp": 0.9,
+  "sp_topk": 50,
+  "sp_rep": 1.1,
+  "chk_warm": false,
+  "chk_keep": false,
+  "combo_detail": "Long",
+  "combo_decode": "Deterministic",
+  "negative": "",
+  "txt_image": "C:\\Users\\ADMINI~1\\AppData\\Local\\Temp\\framevision_describer_current.png",
+  "save_settings": true,
+  "output_height": 120
+}

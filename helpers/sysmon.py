@@ -1,0 +1,1477 @@
+# helpers/sysmon.py — System monitor with versions, sizes, uptimes, tools check + UI tweaks
+from __future__ import annotations
+import os, shutil, subprocess, platform, re, time, glob, json, stat
+from typing import Optional, List, Tuple, Dict, Any
+
+from PySide6.QtCore import Qt, QTimer, QSettings, Signal, QObject, QThread, QUrl
+from PySide6.QtWidgets import (
+    QApplication, QWidget, QVBoxLayout, QHBoxLayout, QLabel, QCheckBox,
+    QPushButton, QSizePolicy, QToolButton, QFrame, QStyle, QScrollArea
+)
+from PySide6.QtGui import QDesktopServices
+
+# Temperature formatter respects config['temp_units']
+def _format_temp(celsius_val: int | None) -> str:
+    if celsius_val is None:
+        return ""
+    try:
+        from helpers.framevision_app import config
+        units = (config.get('temp_units','C') or 'C').upper()
+    except Exception:
+        units = 'C'
+    try:
+        c = float(celsius_val)
+    except Exception:
+        return f"{celsius_val}°C"
+    if units == 'F':
+        f = int(round((c * 9/5) + 32))
+        return f"{f}°F"
+    return f"{int(round(c))}°C"
+
+
+try:
+    import psutil  # type: ignore
+except Exception:
+    psutil = None
+
+_pynvml = None
+try:
+    import pynvml  # type: ignore
+    _pynvml = pynvml
+except Exception:
+    _pynvml = None
+
+# Optional cpuinfo (nicer CPU brand)
+_cpuinfo = None
+try:
+    import cpuinfo  # type: ignore
+    _cpuinfo = cpuinfo
+except Exception:
+    _cpuinfo = None
+
+ORG="FrameVision"; APP="FrameVision"
+ROOT = os.path.dirname(os.path.dirname(__file__))
+K_SYSMON_ENABLED = "sysmon_enabled"
+K_SYSMON_LOW     = "sysmon_low_impact"
+K_HUD_ENABLED    = "hud_enabled"
+K_FIRST_RUN_TS   = "first_run_epoch"
+DDR_MANAGER_REL_PATH = os.path.join("tools", "vram_lab", "ddrmanager.py")
+DDR_MANAGER_SETTINGS_REL_PATH = os.path.join("presets", "setsave", "ddr_manager.json")
+
+# Other envs to probe for CUDA/Torch/TVision/Transformers (relative to ROOT)
+# NOTE: We keep this list Windows-friendly, but we still probe common POSIX venv layouts.
+OTHER_ENV_DEFS: List[Tuple[str, str]] = [
+    ("Ace Music", r"environments\.ace_15"),
+    ("Images models", r"environments\.images_models"),
+    ("Wan 2.2", r"environments\.wan22_i2v"),
+    ("HunyuanVideo 1.5", r"environments\.hunyuan15_official"),
+    ("LTX 2.3", r"environments\.ltx23"),
+]
+
+def _fmt_pair_gib(a_bytes: float, b_bytes: float) -> str:
+    a = a_bytes / (1024**3)
+    b = b_bytes / (1024**3)
+    return f"{a:.1f}/{b:.0f} GiB"
+
+def _fmt_dur(secs: float) -> str:
+    try: s = int(max(0, secs))
+    except Exception: return "—"
+    d, rem = divmod(s, 86400)
+    h, rem = divmod(rem, 3600)
+    m, s   = divmod(rem, 60)
+    parts = []
+    if d: parts.append(f"{d}d")
+    if h or d: parts.append(f"{h}h")
+    if m or h or d: parts.append(f"{m:02d}m")
+    parts.append(f"{s:02d}s")
+    return " ".join(parts)
+
+def _disk_free_total(path: str) -> Tuple[int,int]:
+    try:
+        if psutil:
+            du = psutil.disk_usage(path)
+            return int(du.free), int(du.total)
+        s = os.statvfs(path)
+        free = s.f_bavail * s.f_frsize
+        total = s.f_blocks * s.f_frsize
+        return int(free), int(total)
+    except Exception:
+        return (0, 0)
+
+def _get_cpu_percent() -> float:
+    try:
+        if psutil:
+            return float(psutil.cpu_percent(interval=None))
+    except Exception:
+        pass
+    return 0.0
+
+def _get_ram_used_total() -> Tuple[int,int]:
+    try:
+        if psutil:
+            vm = psutil.virtual_memory()
+            return int(vm.used), int(vm.total)
+    except Exception:
+        pass
+    return (0, 0)
+
+def _read_gpu_info() -> List[Dict]:
+    gpus: List[Dict] = []
+    if _pynvml:
+        try:
+            _pynvml.nvmlInit()
+            count = _pynvml.nvmlDeviceGetCount()
+            for i in range(count):
+                h = _pynvml.nvmlDeviceGetHandleByIndex(i)
+                mem = _pynvml.nvmlDeviceGetMemoryInfo(h)
+                try: util = _pynvml.nvmlDeviceGetUtilizationRates(h).gpu
+                except Exception: util = None
+                try: temp = _pynvml.nvmlDeviceGetTemperature(h, _pynvml.NVML_TEMPERATURE_GPU)
+                except Exception: temp = None
+                try: name = _pynvml.nvmlDeviceGetName(h).decode('utf-8','ignore')
+                except Exception: name = f"GPU {i}"
+                gpus.append({"index": i, "name": name, "used": int(mem.used), "total": int(mem.total),
+                             "util": int(util) if util is not None else None,
+                             "temp": int(temp) if temp is not None else None})
+            _pynvml.nvmlShutdown()
+            if gpus: return gpus
+        except Exception:
+            pass
+    try:
+        out = subprocess.check_output([
+            "nvidia-smi", "--query-gpu=memory.used,memory.total,utilization.gpu,temperature.gpu,name",
+            "--format=csv,noheader,nounits"
+        ], stderr=subprocess.DEVNULL, text=True, timeout=1.5)
+        for i, line in enumerate(out.strip().splitlines()):
+            parts = [p.strip() for p in line.split(",")]
+            if len(parts) >= 4:
+                used = int(float(parts[0]) * 1024**2)
+                total = int(float(parts[1]) * 1024**2)
+                util = int(parts[2]) if parts[2].isdigit() else None
+                temp = int(parts[3]) if parts[3].isdigit() else None
+                name = parts[4] if len(parts) > 4 else f"GPU {i}"
+                gpus.append({"index": i, "name": name, "used": used, "total": total, "util": util, "temp": temp})
+    except Exception:
+        pass
+    return gpus
+
+# ---- CPU static info (brand + core counts) ----------------------------------
+def _read_cpu_brand() -> str:
+    # Try python-cpuinfo
+    if _cpuinfo:
+        try:
+            info = _cpuinfo.get_cpu_info()
+            name = info.get("brand_raw") or info.get("brand") or ""
+            if name: return name
+        except Exception:
+            pass
+    # OS-specific fallbacks
+    try:
+        sys = platform.system().lower()
+        if "windows" in sys:
+            try:
+                out = subprocess.check_output(["wmic", "cpu", "get", "name"], text=True, timeout=1.5)
+                lines = [l.strip() for l in out.splitlines() if l.strip() and "name" not in l.lower()]
+                if lines: return lines[0]
+            except Exception: pass
+        elif "darwin" in sys or "mac" in sys:
+            try:
+                out = subprocess.check_output(["sysctl", "-n", "machdep.cpu.brand_string"], text=True, timeout=1.0)
+                if out.strip(): return out.strip()
+            except Exception: pass
+        else:  # Linux
+            try:
+                with open("/proc/cpuinfo","r",encoding="utf-8",errors="ignore") as f:
+                    for line in f:
+                        if "model name" in line:
+                            return line.split(":",1)[1].strip()
+            except Exception: pass
+    except Exception:
+        pass
+    # Python platform fallback
+    name = platform.processor() or platform.uname().processor or ""
+    return name or "CPU"
+
+def _core_counts() -> Tuple[int,int]:
+    try:
+        phys = psutil.cpu_count(logical=False) if psutil else None
+        logi = psutil.cpu_count(logical=True) if psutil else None
+        return int(phys or 0), int(logi or 0)
+    except Exception:
+        return (0, 0)
+
+# ---- Versions line ----------------------------------------------------------
+def _versions_line() -> str:
+    cuda = None; torch_v = None; tv = None; tf = None
+    try:
+        import torch as _torch  # type: ignore
+        torch_v = getattr(_torch, "__version__", None)
+        cuda = getattr(_torch.version, "cuda", None)
+    except Exception:
+        pass
+    if not cuda:
+        try:
+            out = subprocess.check_output(["nvidia-smi"], text=True, stderr=subprocess.DEVNULL, timeout=1.5)
+            m = re.search(r"CUDA Version:\s*([0-9.]+)", out)
+            if m:
+                cuda = m.group(1)
+        except Exception:
+            pass
+    try:
+        import torchvision as _tv  # type: ignore
+        tv = getattr(_tv, "__version__", None)
+    except Exception:
+        pass
+    try:
+        import transformers as _tf  # type: ignore
+        tf = getattr(_tf, "__version__", None)
+    except Exception:
+        pass
+    cuda = cuda or "N/A"; torch_v = torch_v or "N/A"; tv = tv or "N/A"; tf = tf or "N/A"
+    return f"CUDA: {cuda}  •  Torch: {torch_v}  •  TVision: {tv}  •  Transformers: {tf}"
+
+
+# ---- Other environments versions probe -------------------------------------
+def _norm_rel(rel: str) -> str:
+    rel = (rel or "").strip().replace("/", os.sep).replace("\\", os.sep)
+    while rel.startswith(os.sep):
+        rel = rel[1:]
+    return rel
+
+
+def _env_python_path(env_dir: str) -> Optional[str]:
+    if not env_dir:
+        return None
+    try:
+        if not os.path.isdir(env_dir):
+            return None
+    except Exception:
+        return None
+    cands = [
+        os.path.join(env_dir, "Scripts", "python.exe"),
+        os.path.join(env_dir, "Scripts", "python"),
+        os.path.join(env_dir, "bin", "python"),
+        os.path.join(env_dir, "python.exe"),
+        os.path.join(env_dir, "python"),
+    ]
+    for p in cands:
+        try:
+            if p and os.path.isfile(p):
+                return p
+        except Exception:
+            continue
+    return None
+
+
+def _probe_env_versions_line(env_dir: str) -> Optional[str]:
+    """Return the versions line for the given venv dir, or None if not probeable.
+
+    This probe uses importlib.metadata (or the importlib_metadata backport) instead of
+    importing torch/torchvision/transformers to avoid slow cold-start imports.
+    """
+    py = _env_python_path(env_dir)
+    if not py:
+        return None
+
+    # Try to infer CUDA version from the torch wheel tag (e.g. 2.3.1+cu121 -> 12.1).
+    # If that's unavailable, fall back to nvidia-smi parsing.
+    code = (
+        "import re, subprocess\n"
+        "try:\n"
+        " from importlib import metadata\n"
+        "except Exception:\n"
+        " import importlib_metadata as metadata\n"
+        "def _v(pkg):\n"
+        " try: return metadata.version(pkg)\n"
+        " except Exception: return None\n"
+        "torch_v=_v('torch')\n"
+        "tv=_v('torchvision')\n"
+        "tf=_v('transformers')\n"
+        "cuda=None\n"
+        "if torch_v:\n"
+        " m=re.search(r'\\+cu(\\d+)', torch_v)\n"
+        " if m:\n"
+        "  n=m.group(1)\n"
+        "  try:\n"
+        "   major=int(n[:-1])\n"
+        "   minor=int(n[-1])\n"
+        "   cuda=f'{major}.{minor}'\n"
+        "  except Exception:\n"
+        "   cuda=None\n"
+        "if not cuda:\n"
+        " try:\n"
+        "  out=subprocess.check_output(['nvidia-smi'],text=True,stderr=subprocess.DEVNULL,timeout=1.5)\n"
+        "  m=re.search(r'CUDA Version:\\s*([0-9.]+)',out)\n"
+        "  cuda=m.group(1) if m else None\n"
+        " except Exception:\n"
+        "  pass\n"
+        "cuda=cuda or 'N/A'\n"
+        "torch_v=torch_v or 'N/A'\n"
+        "tv=tv or 'N/A'\n"
+        "tf=tf or 'N/A'\n"
+        "print(f'CUDA: {cuda}  •  Torch: {torch_v}  •  TVision: {tv}  •  Transformers: {tf}')\n"
+    )
+    try:
+        out = subprocess.check_output(
+            [py, "-c", code],
+            stderr=subprocess.DEVNULL,
+            text=True,
+            timeout=8.0,
+            cwd=ROOT,
+        ).strip()
+        return out or None
+    except Exception:
+        return None
+
+
+class EnvVersionsWorker(QObject):
+    result = Signal(list)  # List[Tuple[str,str]]
+
+    def __init__(self, env_defs: List[Tuple[str, str]]):
+        super().__init__()
+        self.env_defs = env_defs
+        self._stop = False
+
+    def stop(self):
+        self._stop = True
+
+    def run(self):
+        found: List[Tuple[str, str]] = []
+        for name, rel in (self.env_defs or []):
+            if self._stop:
+                break
+            try:
+                env_dir = os.path.join(ROOT, _norm_rel(rel))
+                line = _probe_env_versions_line(env_dir)
+                if line:
+                    found.append((name, line))
+            except Exception:
+                continue
+        self.result.emit(found)
+
+# ---- Tools ready check ------------------------------------------------------
+def _exists_any(paths: List[str]) -> Optional[str]:
+    for p in paths:
+        try:
+            if p and (os.path.isfile(p) or os.path.isdir(p)):
+                return p
+        except Exception:
+            continue
+    return None
+
+
+def _find_file_glob(root_dir: str, patterns: List[str]) -> Optional[str]:
+    """Return first file under root_dir matching any glob pattern."""
+    try:
+        if not root_dir or not os.path.isdir(root_dir):
+            return None
+    except Exception:
+        return None
+    for pat in (patterns or []):
+        try:
+            hits = glob.glob(os.path.join(root_dir, pat), recursive=True)
+            for p in hits:
+                try:
+                    if os.path.isfile(p):
+                        return p
+                except Exception:
+                    continue
+        except Exception:
+            continue
+    return None
+
+
+def _find_large_file_under(paths: List[str], min_bytes: int = 1024**3) -> Optional[str]:
+    """Return first file larger than min_bytes inside any supplied folder/file path."""
+    for base in (paths or []):
+        try:
+            if not base:
+                continue
+            if os.path.isfile(base):
+                try:
+                    if os.path.getsize(base) > int(min_bytes):
+                        return base
+                except Exception:
+                    pass
+                continue
+            if not os.path.isdir(base):
+                continue
+            for root, _dirs, files in os.walk(base):
+                for name in files:
+                    p = os.path.join(root, name)
+                    try:
+                        if os.path.getsize(p) > int(min_bytes):
+                            return p
+                    except Exception:
+                        continue
+        except Exception:
+            continue
+    return None
+
+def _tool_ready_status(models_dir: str) -> Dict[str, Optional[str]]:
+    # Executable names
+    rife_names = ["rife-ncnn-vulkan.exe", "rife-ncnn-vulkan"]
+    realesr_names = ["realesrgan-ncnn-vulkan.exe", "realesrgan-ncnn-vulkan"]
+    waifu_names = ["waifu2x-ncnn-vulkan.exe", "waifu2x-ncnn-vulkan"]
+    upscayl_names = ["upscayler.exe", "upscaler.exe", "upscayl.exe"]
+
+    # FFmpeg
+    ff = shutil.which("ffmpeg") or _exists_any([
+        os.path.join(ROOT, "bin", "ffmpeg.exe"),
+        os.path.join(ROOT, "ffmpeg.exe"),
+        os.path.join(ROOT, "externals", "ffmpeg", "ffmpeg.exe"),
+        os.path.join(ROOT, "presets", "bin", "ffmpeg.exe"),
+    ])
+
+    # Whisper — faster-whisper medium model file.
+    whisper = _exists_any([
+        os.path.join(models_dir, "faster_whisper", "medium", "model.bin"),
+    ])
+
+    # Root /presets/bin tool checks
+    # sd-cli is used by GGUF image backends such as Ideogram/Boogu-style tools.
+    sd_cli = _exists_any([
+        os.path.join(ROOT, "presets", "bin", "sd-cli.exe"),
+        os.path.join(ROOT, "presets", "bin", "sd-cli"),
+    ])
+
+    # llama-server is installed under presets/bin/llama for the local LLM chat/server tools.
+    llama_server = _exists_any([
+        os.path.join(ROOT, "presets", "bin", "llama", "llama-server.exe"),
+        os.path.join(ROOT, "presets", "bin", "llama", "llama-server"),
+    ])
+
+    # Qwen2 (image model path)
+    qwen = _exists_any([
+        os.path.join(models_dir, "describe", "default", "qwen3vl2b"),
+    ])
+
+    # RIFE (models tree + presets\bin + externals + root/bin)
+    rife = None
+    for base in [
+        os.path.join(models_dir, "rife-ncnn-vulkan"),
+        os.path.join(ROOT, "presets", "bin"),
+        os.path.join(ROOT, "externals", "rife"),
+        os.path.join(ROOT, "bin"),
+        ROOT,
+    ]:
+        for n in rife_names:
+            if not rife:
+                rife = _exists_any([os.path.join(base, n)])
+
+    # Real-ESRGAN (models tree + externals + root/bin)
+    realsr = None
+    for base in [
+        os.path.join(models_dir, "realesrgan"),
+        os.path.join(ROOT, "externals", "realesrgan"),
+        os.path.join(ROOT, "bin"),
+        ROOT,
+    ]:
+        for n in realesr_names:
+            if not realsr:
+                realsr = _exists_any([os.path.join(base, n)])
+
+    # Waifu2x (models tree + externals + root/bin)
+    waifu = None
+    for base in [
+        os.path.join(models_dir, "waifu2x"),
+        os.path.join(ROOT, "externals", "waifu2x"),
+        os.path.join(ROOT, "bin"),
+        ROOT,
+    ]:
+        for n in waifu_names:
+            if not waifu:
+                waifu = _exists_any([os.path.join(base, n)])
+
+
+    # UpScayl(er) — info-only (accept exe OR models folder)
+    upscayl = None
+    upscayl_bases = [
+        os.path.join(models_dir, "upscayl"),
+        os.path.join(models_dir, "upscayler"),
+        os.path.join(models_dir, "upscaler"),
+        os.path.join(ROOT, "externals", "upscayl"),
+    ]
+    for base in upscayl_bases:
+        if upscayl:
+            break
+        # 1) Prefer an executable in common places
+        for n in upscayl_names:
+            if not upscayl:
+                upscayl = _exists_any([os.path.join(base, n)])
+        # 2) Otherwise, treat a populated models folder as "present"
+        if not upscayl and os.path.isdir(base):
+            has_models = False
+            # Typical structure: .../upscayl/models/*
+            check_path = os.path.join(base, "models") if os.path.isdir(os.path.join(base, "models")) else base
+            try:
+                for _r, _d, _f in os.walk(check_path):
+                    if _f:
+                        has_models = True
+                        break
+            except Exception:
+                pass
+            if has_models:
+                upscayl = base
+
+    # SeedVR2 — checks for a GGUF file inside /models/SEEDVR2.
+    seedvr2 = _find_file_glob(os.path.join(models_dir, "SEEDVR2"), ["**/*.gguf", "**/*.GGUF"])
+
+    # Ace Music — checks if ROOT/environments/.ace_15 exists (folder)
+    ace_music = os.path.isdir(os.path.join(ROOT, "environments", ".ace_15"))
+
+    # Z-image — checks if any folder/file matching models/z-image*.* exists
+    z_image = None
+    try:
+        candidates = glob.glob(os.path.join(models_dir, "z-image*.*")) + glob.glob(os.path.join(models_dir, "z-image*"))
+        for p in candidates:
+            if p and (os.path.isdir(p) or os.path.isfile(p)):
+                z_image = p
+                break
+    except Exception:
+        z_image = None
+
+    # Wan 2.2 — current install uses ROOT/environments/.wan22_i2v.
+    # Keep the old /models fallback so older installs do not suddenly show as missing.
+    wan22 = _exists_any([
+        os.path.join(ROOT, "environments", ".wan22_i2v"),
+    ])
+    if not wan22:
+        try:
+            candidates = glob.glob(os.path.join(models_dir, "wan22*")) + glob.glob(os.path.join(models_dir, "wan2.2*"))
+            for p in candidates:
+                if p and (os.path.isdir(p) or os.path.isfile(p)):
+                    wan22 = p
+                    break
+        except Exception:
+            wan22 = None
+
+    # HunyuanVideo 1.5 — current install uses ROOT/environments/.hunyuan15_official.
+    # Keep the old root env fallback for older installs.
+    hunyuan15 = _exists_any([
+        os.path.join(ROOT, "environments", ".hunyuan15_official"),
+        os.path.join(ROOT, ".hunyuan15_env"),
+    ])
+
+    # LTX 2.3 — current native LTX install uses ROOT/environments/.ltx23.
+    ltx23 = _exists_any([
+        os.path.join(ROOT, "environments", ".ltx23"),
+    ])
+    return {
+        "FFmpeg": ff,
+        "sd-cli": sd_cli,
+        "llama-server": llama_server,
+        "Whisper": whisper,
+        "Qwen3-VL 2B": qwen,
+        "RIFE": rife,
+        "Real-ESRGAN": realsr,
+        "Waifu2x": waifu,
+        "UpScayl": upscayl,
+        "SeedVR2": seedvr2,
+        "Ace Music": ace_music,
+        "Z-image": z_image,
+        "Wan 2.2": wan22,
+        "HunyuanVideo 1.5": hunyuan15,
+        "LTX 2.3": ltx23,
+    }
+
+def _tools_line(status: Dict[str, Optional[str]]) -> str:
+    # Keep this readable in the Settings/System Monitor panel.
+    # Row 1 = core command-line tools / describer model.
+    # Row 4 is handled by _qwen_models_line so the image-model checks stay together.
+    group1 = ["FFmpeg", "sd-cli", "llama-server", "Whisper", "Qwen3-VL 2B"]
+    group2 = ["RIFE", "Real-ESRGAN", "Waifu2x", "UpScayl", "SeedVR2"]
+    group3 = ["Ace Music", "Wan 2.2", "HunyuanVideo 1.5", "LTX 2.3"]
+
+    def _fmt(group: List[str]) -> str:
+        parts: List[str] = []
+        for name in group:
+            ok = bool(status.get(name))
+            check = "✅" if ok else "❌"
+            parts.append(f"{name} {check}")
+        return " • ".join(parts)
+
+    return _fmt(group1) + "\n" + _fmt(group2) + "\n" + _fmt(group3)
+
+
+
+# ---- Qwen Edit/Image models check --------------------------------------------
+
+def _find_models_subdir(models_dir: str, preferred_names: List[str], fallback_tokens: List[str]) -> Optional[str]:
+    """Find a matching subdirectory under models_dir.
+
+    1) Exact folder names (case-insensitive) from preferred_names.
+    2) Any folder name containing any fallback token (case-insensitive).
+    """
+    try:
+        if not models_dir or not os.path.isdir(models_dir):
+            return None
+    except Exception:
+        return None
+
+    try:
+        entries = list(os.listdir(models_dir))
+    except Exception:
+        entries = []
+
+    lower_map = {e.lower(): e for e in entries}
+
+    # 1) Preferred names (exact / case-insensitive)
+    for name in (preferred_names or []):
+        if not name:
+            continue
+        try:
+            cand = os.path.join(models_dir, name)
+            if os.path.isdir(cand):
+                return cand
+        except Exception:
+            pass
+        real = lower_map.get(str(name).lower())
+        if real:
+            cand2 = os.path.join(models_dir, real)
+            try:
+                if os.path.isdir(cand2):
+                    return cand2
+            except Exception:
+                pass
+
+    # 2) Fallback token scan (e.g. '2511', '2512')
+    toks = [str(t).lower() for t in (fallback_tokens or []) if t]
+    if toks:
+        for e in entries:
+            try:
+                full = os.path.join(models_dir, e)
+                if not os.path.isdir(full):
+                    continue
+                el = e.lower()
+                if any(t in el for t in toks):
+                    return full
+            except Exception:
+                continue
+    return None
+
+
+def _qwen_models_status(models_dir: str) -> Dict[str, Optional[str]]:
+    """Check presence of image-generation model folders/files in /models."""
+    z_image = None
+    try:
+        candidates = glob.glob(os.path.join(models_dir, "z-image*.*")) + glob.glob(os.path.join(models_dir, "z-image*"))
+        for p in candidates:
+            if p and (os.path.isdir(p) or os.path.isfile(p)):
+                z_image = p
+                break
+    except Exception:
+        z_image = None
+
+    qwen_edit_2511 = _find_models_subdir(
+        models_dir,
+        preferred_names=['qwen2511gguf'],
+        fallback_tokens=['2511'],
+    )
+    qwen_img_2512 = _find_models_subdir(
+        models_dir,
+        preferred_names=['Qwen-Image-2512 GGUF'],
+        fallback_tokens=['2512'],
+    )
+
+    # Flux Klein — OK when either klein GGUF folder contains a file larger than 1 GiB.
+    flux_klein = _find_large_file_under([
+        os.path.join(models_dir, "klein9b_gguf"),
+        os.path.join(models_dir, "klein4b_gguf"),
+    ])
+
+    # HiDream — OK when hidream_bf16 or a subfolder contains a file larger than 1 GiB.
+    hidream = _find_large_file_under([
+        os.path.join(models_dir, "hidream_bf16"),
+    ])
+
+    return {
+        'Z-image': z_image,
+        'Qwen Edit 2511': qwen_edit_2511,
+        'Qwen Image 2512': qwen_img_2512,
+        'Flux Klein': flux_klein,
+        'HiDream': hidream,
+    }
+
+
+def _qwen_models_line(status: Dict[str, Optional[str]]) -> str:
+    order = ['Z-image', 'Qwen Edit 2511', 'Qwen Image 2512', 'Flux Klein', 'HiDream']
+    parts = []
+    for name in order:
+        ok = bool(status.get(name))
+        check = '✅' if ok else '❌'
+        parts.append(f'{name} {check}')
+    return ' • '.join(parts)
+
+# ---- HUD visibility helpers --------------------------------------------------
+def _apply_hud_visibility(enable: bool):
+    app = QApplication.instance()
+    if not app: return
+    try:
+        from PySide6.QtWidgets import QLabel
+        for w in app.allWidgets():
+            try:
+                if isinstance(w, QLabel):
+                    t = (w.text() or "")
+                    if "GPU" in t and "DDR" in t and "CPU" in t:
+                        if enable: w.show()
+                        else: w.hide()
+            except Exception:
+                continue
+    except Exception:
+        pass
+
+def _load_hud_setting_and_apply():
+    s = QSettings(ORG, APP)
+    enable = s.value(K_HUD_ENABLED, True)
+    if isinstance(enable, bool):
+        en = enable
+    else:
+        try:
+            en = str(enable).strip().lower() in ("1","true","yes","on")
+        except Exception:
+            en = True
+    _apply_hud_visibility(bool(en))
+
+def _bool_from_value(value, default: bool = True) -> bool:
+    if isinstance(value, bool):
+        return value
+    try:
+        text = str(value).strip().lower()
+        if text in ("1", "true", "yes", "on", "enabled"):
+            return True
+        if text in ("0", "false", "no", "off", "disabled"):
+            return False
+    except Exception:
+        pass
+    return bool(default)
+
+def _ddr_manager_module_path() -> str:
+    return os.path.join(ROOT, DDR_MANAGER_REL_PATH)
+
+def _ddr_manager_settings_path() -> str:
+    return os.path.join(ROOT, DDR_MANAGER_SETTINGS_REL_PATH)
+
+def _ddr_manager_available() -> bool:
+    try:
+        return os.path.isfile(_ddr_manager_module_path())
+    except Exception:
+        return False
+
+def _load_ddr_manager_enabled(default: bool = True) -> bool:
+    # DDR Manager is intentionally stored in a portable JSON file, not QSettings.
+    # The backend file will be tools/vram_lab/ddrmanager.py once added.
+    path = _ddr_manager_settings_path()
+    try:
+        if os.path.isfile(path):
+            with open(path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            if isinstance(data, dict):
+                return _bool_from_value(data.get("enabled", default), default)
+    except Exception:
+        pass
+    return bool(default)
+
+def _save_ddr_manager_enabled(enabled: bool) -> None:
+    path = _ddr_manager_settings_path()
+    data = {
+        "enabled": bool(enabled),
+        "module": DDR_MANAGER_REL_PATH.replace(os.sep, "/"),
+        "note": "FrameVision DDR RAM Manager toggle. Backend will be tools/vram_lab/ddrmanager.py.",
+    }
+    try:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=2)
+    except Exception:
+        pass
+
+def _apply_ddr_manager_env(enabled: bool) -> None:
+    try:
+        os.environ["FRAMEVISION_DDR_MANAGER_ENABLED"] = "1" if enabled else "0"
+        os.environ["FRAMEVISION_DDR_MANAGER_MODULE"] = _ddr_manager_module_path()
+    except Exception:
+        pass
+
+def _ddr_manager_status_line(enabled: bool) -> str:
+    rel = DDR_MANAGER_REL_PATH.replace(os.sep, "\\")
+    if enabled:
+        if _ddr_manager_available():
+            return (
+                "DDR RAM Manager is ON. FrameVision can use the shared DDR/pagefile manager "
+                "to avoid unsafe heavy-model loading routes. Keep Windows page file enabled and set to automatic."
+            )
+        return (
+            f"DDR RAM Manager is ON. Backend target: {rel}. "
+            "Keep Windows page file enabled and set to automatic for large models."
+        )
+    return "DDR RAM Manager is OFF. Heavy models will not use the shared DDR/pagefile safety manager."
+
+# ----------------------------------------------------------------------------
+
+def _path_key(path: str) -> str:
+    try:
+        return os.path.normcase(os.path.abspath(os.path.realpath(path)))
+    except Exception:
+        try:
+            return os.path.normcase(os.path.abspath(path))
+        except Exception:
+            return str(path or "")
+
+
+def _path_is_inside(path: str, parent: str) -> bool:
+    """True when path is parent itself or a child of parent."""
+    try:
+        p = _path_key(path)
+        base = _path_key(parent)
+        if not p or not base:
+            return False
+        return p == base or p.startswith(base.rstrip(os.sep) + os.sep)
+    except Exception:
+        return False
+
+
+def _unique_existing_dirs(paths: List[str]) -> List[str]:
+    """Return existing directories with nested duplicates removed."""
+    good: List[str] = []
+    for p in (paths or []):
+        try:
+            if p and os.path.isdir(p):
+                good.append(os.path.abspath(p))
+        except Exception:
+            continue
+    good.sort(key=lambda x: len(_path_key(x)))
+    out: List[str] = []
+    for p in good:
+        try:
+            if any(_path_is_inside(p, existing) for existing in out):
+                continue
+            out.append(p)
+        except Exception:
+            continue
+    return out
+
+
+def _default_env_roots() -> List[str]:
+    # Current FrameVision convention is /environments/.<env_name>.
+    # Keep the old root-level .venv/.env fallbacks so older installs still count correctly.
+    return _unique_existing_dirs([
+        os.path.join(ROOT, "environments"),
+        os.path.join(ROOT, ".venv"),
+        os.path.join(ROOT, ".env"),
+    ])
+
+
+def _is_reparse_or_link(entry) -> bool:
+    """Skip symlinks/junctions while sizing so linked model folders are not double-counted."""
+    try:
+        if entry.is_symlink():
+            return True
+    except Exception:
+        pass
+    try:
+        attrs = getattr(entry.stat(follow_symlinks=False), "st_file_attributes", 0)
+        return bool(attrs & getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0))
+    except Exception:
+        return False
+
+
+class DirSizerWorker(QObject):
+    result = Signal(dict)
+    def __init__(self, targets: Dict[str, Any]):
+        super().__init__()
+        self.targets = targets
+        self._stop = False
+    def stop(self): self._stop = True
+
+    def _dir_size(self, path: str, excludes: Optional[List[str]] = None) -> int:
+        if not path:
+            return 0
+        try:
+            if not os.path.isdir(path):
+                return 0
+        except Exception:
+            return 0
+
+        exclude_keys = []
+        for p in (excludes or []):
+            try:
+                if p and os.path.isdir(p):
+                    exclude_keys.append(_path_key(p))
+            except Exception:
+                continue
+
+        def _excluded(p: str) -> bool:
+            try:
+                k = _path_key(p)
+                return any(k == ex or k.startswith(ex.rstrip(os.sep) + os.sep) for ex in exclude_keys)
+            except Exception:
+                return False
+
+        total = 0
+        stack = [path]
+        while stack:
+            if self._stop:
+                break
+            root = stack.pop()
+            if _excluded(root):
+                continue
+            try:
+                with os.scandir(root) as it:
+                    for entry in it:
+                        if self._stop:
+                            break
+                        try:
+                            if entry.is_dir(follow_symlinks=False):
+                                if not _is_reparse_or_link(entry) and not _excluded(entry.path):
+                                    stack.append(entry.path)
+                            elif entry.is_file(follow_symlinks=False):
+                                if not _is_reparse_or_link(entry):
+                                    total += int(entry.stat(follow_symlinks=False).st_size)
+                        except Exception:
+                            continue
+            except Exception:
+                continue
+        return int(total)
+
+    def _target_size(self, target: Any) -> int:
+        try:
+            if isinstance(target, dict):
+                mode = target.get("mode")
+                if mode == "dir_excluding":
+                    return self._dir_size(str(target.get("path") or ""), list(target.get("exclude") or []))
+                if mode == "aggregate":
+                    total = 0
+                    for p in _unique_existing_dirs(list(target.get("paths") or [])):
+                        if self._stop:
+                            break
+                        total += self._dir_size(p)
+                    return int(total)
+                return self._dir_size(str(target.get("path") or ""))
+            if isinstance(target, (list, tuple)):
+                total = 0
+                for p in _unique_existing_dirs([str(x) for x in target]):
+                    if self._stop:
+                        break
+                    total += self._dir_size(p)
+                return int(total)
+            return self._dir_size(str(target or ""))
+        except Exception:
+            return 0
+
+    def run(self):
+        out: Dict[str, int] = {}
+        for key, target in (self.targets or {}).items():
+            if str(key).startswith("_"):
+                continue
+            out[key] = self._target_size(target)
+
+        # Derive the root folder total from the already-scanned buckets instead of
+        # doing another expensive full recursive scan. This keeps Models/Output/Envs
+        # separate while making the total FrameVision folder size accurate.
+        try:
+            total = int(out.get("app", 0))
+            root = str((self.targets or {}).get("_root") or ROOT)
+            models_path = str((self.targets or {}).get("_models_path") or "")
+            output_path = str((self.targets or {}).get("_output_path") or "")
+            env_paths = list((self.targets or {}).get("_env_paths") or [])
+
+            if models_path and _path_is_inside(models_path, root):
+                total += int(out.get("models", 0))
+            if output_path and _path_is_inside(output_path, root) and not (models_path and _path_is_inside(output_path, models_path)):
+                total += int(out.get("output", 0))
+            # /environments, .venv and .env are excluded from app files, so add them back.
+            # They are not added if someone has placed them under the models/output folder.
+            for env_path in env_paths:
+                if not env_path or not _path_is_inside(str(env_path), root):
+                    continue
+                if models_path and _path_is_inside(str(env_path), models_path):
+                    continue
+                if output_path and _path_is_inside(str(env_path), output_path):
+                    continue
+            total += int(out.get("envs", 0))
+            out["framevision_total"] = int(total)
+        except Exception:
+            out["framevision_total"] = int(out.get("app", 0))
+
+        self.result.emit(out)
+
+class CollapsibleSection(QWidget):
+    def __init__(self, title: str, parent: QWidget | None = None, expanded: bool = False):
+        super().__init__(parent)
+        self._toggle = QToolButton(text=title, checkable=True, checked=expanded)
+        self._toggle.setToolButtonStyle(Qt.ToolButtonTextBesideIcon)
+        self._toggle.setArrowType(Qt.DownArrow if expanded else Qt.RightArrow)
+        self._toggle.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+        self._toggle.clicked.connect(self._on_toggled)
+
+        self._content = QFrame()
+        self._content.setFrameShape(QFrame.NoFrame)
+        self._content.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
+        self._content.setVisible(expanded)
+        self._content.setAttribute(Qt.WA_StyledBackground, True)
+        self._content.setStyleSheet("background: palette(window);")
+
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(0,0,0,0); lay.setSpacing(4)
+        lay.addWidget(self._toggle)
+        lay.addWidget(self._content)
+
+    def _on_toggled(self, checked: bool):
+        self._toggle.setArrowType(Qt.DownArrow if checked else Qt.RightArrow)
+        self._content.setVisible(checked)
+        self._content.adjustSize()
+        self.adjustSize()
+
+    def setContentLayout(self, layout: QVBoxLayout):
+        self._content.setLayout(layout)
+
+def _settings_paths() -> Dict[str, Any]:
+    s = QSettings(ORG, APP)
+    models = s.value("models_dir", "", str) or os.path.join(ROOT, "models")
+    output = s.value("output_dir", "", str) or os.path.join(ROOT, "output")
+    env_roots = _default_env_roots()
+
+    # "App files" should not include the heavy buckets shown separately below.
+    # The old display used ROOT recursively for "App folder", so it also counted
+    # /models, /output and env folders and made the numbers look wrong.
+    app_excludes = _unique_existing_dirs([models, output] + env_roots)
+
+    return {
+        "app": {"mode": "dir_excluding", "path": ROOT, "exclude": app_excludes},
+        "envs": {"mode": "aggregate", "paths": env_roots},
+        "models": models,
+        "output": output,
+        "_root": ROOT,
+        "_models_path": models,
+        "_output_path": output,
+        "_env_paths": env_roots,
+    }
+
+def _format_sizes_block(sizes: Dict[str,int]) -> List[str]:
+    def line(key, label):
+        b = sizes.get(key, 0); g = b/(1024**3)
+        return f"{label}: {g:.1f} GiB"
+    return [
+        line("framevision_total", "FrameVision folder"),
+        line("app", "App files"),
+        line("envs", "Envs"),
+        line("models", "Models"),
+        line("output", "Output"),
+    ]
+
+class SysMonPanel(QWidget):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setObjectName("SysMonPanel")
+        self.setAttribute(Qt.WA_StyledBackground, True)
+        self.setStyleSheet("#SysMonPanel { background: palette(window); }")
+        self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
+
+        s = QSettings(ORG, APP)
+        self.enabled = bool(s.value(K_SYSMON_ENABLED, False))
+        self.low_impact = bool(s.value(K_SYSMON_LOW, True))
+        self.hud_enabled = bool(s.value(K_HUD_ENABLED, True))
+        self.ddr_manager_enabled = _load_ddr_manager_enabled(True)
+        _apply_ddr_manager_env(self.ddr_manager_enabled)
+
+        # First-run timestamp
+        first = s.value(K_FIRST_RUN_TS, None)
+        now = time.time()
+        if first is None:
+            s.setValue(K_FIRST_RUN_TS, now)
+            self.first_run_ts = now
+        else:
+            try:
+                self.first_run_ts = float(first)
+            except Exception:
+                self.first_run_ts = now
+
+        self.session_start_ts = now
+
+        self.toggle = QCheckBox("System monitor")
+        self.toggle.setChecked(self.enabled)
+        self.toggle.setToolTip("<b>System monitor</b><br/>Enable the live system monitor in this panel.")
+        self.toggle.toggled.connect(self._on_toggle)
+
+        self.low = QCheckBox("Low-impact refresh")
+        self.low.setChecked(self.low_impact)
+        self.low.setToolTip("<b>Low-impact refresh</b><br/>Refresh every ≈2.5s to reduce overhead.")
+        self.low.toggled.connect(self._on_low)
+
+        self.hud = QCheckBox("HUD on/off")
+        self.hud.setChecked(self.hud_enabled)
+        self.hud.setToolTip("<b>HUD on/off</b><br/>Show or hide the usage HUD above the tabs.")
+        self.hud.toggled.connect(self._on_hud)
+
+        self.ddr_manager = QCheckBox("DDR RAM Manager")
+        self.ddr_manager.setChecked(self.ddr_manager_enabled)
+        self.ddr_manager.setToolTip(
+            "<b>DDR RAM Manager</b><br/>"
+            "Experimental. "
+        )
+        self.ddr_manager.toggled.connect(self._on_ddr_manager)
+        self.lbl_ddr_manager = QLabel(_ddr_manager_status_line(self.ddr_manager_enabled))
+        self.lbl_ddr_manager.setWordWrap(True)
+        self.lbl_ddr_manager.setTextFormat(Qt.PlainText)
+        self.lbl_ddr_manager.setToolTip(
+            "Keep Windows page file enabled and set to automatic. "
+        )
+
+        top = QHBoxLayout(); top.setContentsMargins(0,0,0,0); top.setSpacing(12)
+        top.addWidget(self.toggle); top.addWidget(self.low); top.addWidget(self.hud); top.addWidget(self.ddr_manager); top.addStretch(1)
+
+        # --- Static CPU info (brand + cores) ---
+        brand = _read_cpu_brand()
+        phys, logi = _core_counts()
+        cpu_info_line = f"CPU: {brand}  —  Cores: {phys or '?'} physical / {logi or '?'} threads"
+
+        self.lbl_cpu_info = QLabel(cpu_info_line); self.lbl_cpu_info.setWordWrap(True)
+        # Live numbers
+        self.lbl_cpu = QLabel("CPU load: — %"); self.lbl_cpu.setTextFormat(Qt.PlainText)
+        self.lbl_ram = QLabel("DDR: —/— GiB");   self.lbl_ram.setTextFormat(Qt.PlainText)
+
+        self.gpu_box = QVBoxLayout(); self.gpu_box.setSpacing(2); self.gpu_box.setContentsMargins(0,0,0,0)
+        self.lbl_gpu_load = QLabel("GPU load: — %"); self.lbl_gpu_load.setTextFormat(Qt.PlainText)
+
+        # Versions + key libs on one line
+        self.lbl_versions = QLabel(_versions_line())
+        self.lbl_versions.setTextFormat(Qt.PlainText)
+
+        # Collapsible: probe other (optional) envs for the same versions line
+        self.other_env_section = CollapsibleSection("Other environments", self, expanded=False)
+        self._other_env_layout = QVBoxLayout()
+        self._other_env_layout.setContentsMargins(8, 2, 8, 6)
+        self._other_env_layout.setSpacing(2)
+        self.other_env_section.setContentLayout(self._other_env_layout)
+
+        # Tools ready line
+        paths = _settings_paths()
+        self._tools_status = _tool_ready_status(paths["models"])
+        self.lbl_tools = QLabel(_tools_line(self._tools_status))
+        self.lbl_tools.setTextFormat(Qt.PlainText)
+        self.lbl_tools.setWordWrap(True)
+        self.lbl_tools.setToolTip("Checks if tools/models are installed in the app")
+
+        self._qwen_status = _qwen_models_status(paths["models"]) 
+        self.lbl_bg = QLabel(" " + _qwen_models_line(self._qwen_status))
+        self.lbl_bg.setTextFormat(Qt.PlainText)
+        self.lbl_bg.setToolTip("Checks /models for Z-image, Qwen Edit 2511, Qwen Image 2512, Flux Klein and HiDream")
+
+        # Uptime lines
+        self.lbl_uptime_session = QLabel("Time online (this session): —")
+        self.lbl_uptime_total = QLabel("Time online (since first run): —")
+
+        self.lbl_disk = QLabel("Available space on installation disk: —/— GiB free"); self.lbl_disk.setTextFormat(Qt.PlainText)
+
+        self.lbl_sizes = QLabel("Folder sizes: scanning…"); self.lbl_sizes.setWordWrap(True)
+        self.lbl_sizes.setToolTip("FrameVision folder = full app root total. App files excludes Models, Output, /environments, .venv and .env. Envs includes /environments plus old .venv/.env folders.")
+
+        self.btn_rescan = QPushButton("Rescan")
+        self.btn_rescan.setIcon(self.style().standardIcon(QStyle.SP_BrowserReload))
+        self.btn_rescan.setToolTip("<b>Rescan</b><br/>Recalculate folder sizes and refresh tools check & disk space.")
+        self.btn_rescan.setMinimumWidth(100); self.btn_rescan.setMinimumHeight(22)
+        self.btn_rescan.setAutoDefault(False); self.btn_rescan.setFlat(False)
+        self.btn_rescan.clicked.connect(self._kick_dir_scan)
+        self.btn_rescan.clicked.connect(self._refresh_tools)
+        self.btn_rescan.clicked.connect(self._refresh_disk)
+        self.btn_rescan.clicked.connect(self._kick_env_probe)
+
+        self.btn_rescan.clicked.connect(self._refresh_qwen_models)
+        # Reset session timer button
+        self.btn_reset = QPushButton("Reset session timer")
+        self.btn_reset.setToolTip("Reset the 'Time online (this session)' counter to 0.")
+        self.btn_reset.setMinimumHeight(22)
+        self.btn_reset.clicked.connect(self._reset_session_timer)
+
+        # Bug report button
+        self.btn_bug = QPushButton("Bug report")
+        try:
+            self.btn_bug.setIcon(self.style().standardIcon(QStyle.SP_MessageBoxWarning))
+        except Exception:
+            pass
+        self.btn_bug.setToolTip("<b>Bug report</b><br/>Open a window to gather logs and type a report.")
+        self.btn_bug.setMinimumWidth(120); self.btn_bug.setMinimumHeight(22)
+        self.btn_bug.setAutoDefault(False); self.btn_bug.setFlat(False)
+        def _open_bug():
+            try:
+                from helpers.bug_reporter import open_bug_reporter
+                open_bug_reporter(self)
+            except Exception as e:
+                try:
+                    from PySide6.QtWidgets import QMessageBox
+                    QMessageBox.information(self, "Bug report", f"Bug reporter not available:\n{e}")
+                except Exception:
+                    pass
+        self.btn_bug.clicked.connect(_open_bug)
+
+        # Social links row buttons
+        self.btn_gh = QPushButton("GitHub", self)
+        try: self.btn_gh.setIcon(self.style().standardIcon(QStyle.SP_DirLinkIcon))
+        except Exception: pass
+        self.btn_gh.setToolTip("Open project GitHub (Koongrizzly)")
+        self.btn_gh.setMinimumWidth(120); self.btn_gh.setMinimumHeight(24)
+        self.btn_gh.clicked.connect(lambda: QDesktopServices.openUrl(QUrl("https://github.com/Koongrizzly")))
+
+        row2 = QHBoxLayout(); row2.setContentsMargins(0,0,0,0); row2.setSpacing(8)
+        row2.addWidget(self.btn_gh); row2.addStretch(1)
+        row2.addWidget(self.btn_rescan); row2.addWidget(self.btn_reset); row2.addWidget(self.btn_bug)
+
+        v = QVBoxLayout(self); v.setContentsMargins(8,8,8,8); v.setSpacing(6)
+        v.addLayout(top)
+        v.addWidget(self.lbl_ddr_manager)
+        v.addWidget(self.lbl_cpu_info)
+        v.addWidget(self.lbl_cpu)
+        v.addWidget(self.lbl_ram)
+        self.gpu_container = QWidget(); self.gpu_container.setLayout(self.gpu_box)
+        v.addWidget(self.gpu_container)
+        v.addWidget(self.lbl_gpu_load)
+        v.addWidget(self.lbl_versions)
+        v.addWidget(self.other_env_section)
+        v.addWidget(self.lbl_tools)
+        v.addWidget(self.lbl_bg)
+        v.addWidget(self.lbl_uptime_session)
+        v.addWidget(self.lbl_uptime_total)
+        v.addWidget(self.lbl_disk)
+        v.addWidget(self.lbl_sizes)
+        v.addLayout(row2)
+
+        self.seconds_timer = QTimer(self)
+        self.seconds_timer.setTimerType(Qt.PreciseTimer)
+        self.seconds_timer.setInterval(1000)
+        self.seconds_timer.timeout.connect(self._tick_seconds)
+        self.seconds_timer.start()
+        self.timer = QTimer(self)
+        self.timer.setTimerType(Qt.PreciseTimer); self.timer.timeout.connect(self._tick)
+        self._apply_interval()
+        if self.enabled: self.timer.start()
+
+        self._dir_thread: Optional[QThread] = None
+        self._dir_worker: Optional[DirSizerWorker] = None
+        self._last_sizes: Dict[str,int] = {}
+        if self.enabled: self._kick_dir_scan()
+
+        self._env_thread: Optional[QThread] = None
+        self._env_worker: Optional[EnvVersionsWorker] = None
+        if self.enabled:
+            self._kick_env_probe()
+
+        QTimer.singleShot(0, _load_hud_setting_and_apply)
+
+    def _apply_interval(self):
+        self.timer.setInterval(2500 if self.low_impact else  1000)
+
+    def _on_low(self, b: bool):
+        self.low_impact = bool(b)
+        QSettings(ORG, APP).setValue(K_SYSMON_LOW, self.low_impact)
+        self._apply_interval()
+
+    def _on_toggle(self, b: bool):
+        self.enabled = bool(b)
+        QSettings(ORG, APP).setValue(K_SYSMON_ENABLED, self.enabled)
+        if self.enabled:
+            self.session_start_ts = time.time()
+            self.timer.start(); self._kick_dir_scan(); self._kick_env_probe(); self._refresh_tools(); self._refresh_disk(); self._refresh_qwen_models()
+        else:
+            self.timer.stop()
+
+    def _on_hud(self, b: bool):
+        self.hud_enabled = bool(b)
+        QSettings(ORG, APP).setValue(K_HUD_ENABLED, self.hud_enabled)
+        _apply_hud_visibility(self.hud_enabled)
+
+    def _on_ddr_manager(self, b: bool):
+        self.ddr_manager_enabled = bool(b)
+        _save_ddr_manager_enabled(self.ddr_manager_enabled)
+        _apply_ddr_manager_env(self.ddr_manager_enabled)
+        try:
+            self.lbl_ddr_manager.setText(_ddr_manager_status_line(self.ddr_manager_enabled))
+        except Exception:
+            pass
+
+    def _kick_dir_scan(self):
+        if self._dir_thread:
+            try:
+                self._dir_worker.stop(); self._dir_thread.quit(); self._dir_thread.wait(50)
+            except Exception: pass
+        paths = _settings_paths()
+        self.lbl_sizes.setText("Folder sizes: scanning…")
+        self._dir_thread = QThread(self)
+        self._dir_worker = DirSizerWorker(paths)
+        self._dir_worker.moveToThread(self._dir_thread)
+        self._dir_thread.started.connect(self._dir_worker.run)
+        self._dir_worker.result.connect(self._on_sizes_ready)
+        self._dir_thread.start()
+
+    def _clear_other_env_lines(self):
+        try:
+            lay = self._other_env_layout
+        except Exception:
+            return
+        while lay.count():
+            it = lay.takeAt(0)
+            w = it.widget()
+            if w:
+                w.deleteLater()
+
+    def _kick_env_probe(self):
+        # No placeholders: if nothing is found, the section simply stays empty.
+        if self._env_thread:
+            try:
+                if self._env_worker:
+                    self._env_worker.stop()
+                self._env_thread.quit()
+                self._env_thread.wait(80)
+            except Exception:
+                pass
+        self._clear_other_env_lines()
+        self._env_thread = QThread(self)
+        self._env_worker = EnvVersionsWorker(OTHER_ENV_DEFS)
+        self._env_worker.moveToThread(self._env_thread)
+        self._env_thread.started.connect(self._env_worker.run)
+        self._env_worker.result.connect(self._on_env_probe_ready)
+        self._env_thread.start()
+
+    def _on_env_probe_ready(self, items: List[Tuple[str, str]]):
+        self._clear_other_env_lines()
+        for name, line in (items or []):
+            try:
+                lab = QLabel(f"{name}: {line}")
+                lab.setTextFormat(Qt.PlainText)
+                lab.setWordWrap(True)
+                self._other_env_layout.addWidget(lab)
+            except Exception:
+                continue
+        try:
+            self._env_thread.quit(); self._env_thread.wait(80)
+        except Exception:
+            pass
+        self._env_thread = None
+        self._env_worker = None
+
+    def _on_sizes_ready(self, sizes: Dict[str,int]):
+        self._last_sizes = sizes or {}
+        self.lbl_sizes.setText(" • ".join(_format_sizes_block(self._last_sizes)))
+        try:
+            self._dir_thread.quit(); self._dir_thread.wait(50)
+        except Exception: pass
+        self._dir_thread = None; self._dir_worker = None
+
+    def _refresh_tools(self):
+        models_dir = _settings_paths()["models"]
+        self._tools_status = _tool_ready_status(models_dir)
+        self.lbl_tools.setText(_tools_line(self._tools_status))
+    def _refresh_qwen_models(self):
+        models_dir = _settings_paths()["models"]
+        self._qwen_status = _qwen_models_status(models_dir)
+        try:
+            self.lbl_bg.setText(" " + _qwen_models_line(self._qwen_status))
+        except Exception:
+            pass
+
+
+    def _refresh_disk(self):
+        free_d, total_d = _disk_free_total(ROOT)
+        self.lbl_disk.setText(f"Available space on installation disk: {_fmt_pair_gib(free_d, total_d)} free")
+
+    def _reset_session_timer(self):
+        self.session_start_ts = time.time()
+        self.lbl_uptime_session.setText("Time online (this session): 0m")
+
+    def _tick_seconds(self):
+        if not self.enabled: return
+        now = time.time()
+        try: self.lbl_uptime_session.setText(f"Time online (this session): {_fmt_dur(now - self.session_start_ts)}")
+        except Exception: pass
+        try: self.lbl_uptime_total.setText(f"Time online (since first run): {_fmt_dur(now - self.first_run_ts)}")
+        except Exception: pass
+
+    def _tick(self):
+        if not self.enabled: return
+        cpu = _get_cpu_percent(); self.lbl_cpu.setText(f"CPU load: {cpu:.0f}%")
+        used, total = _get_ram_used_total(); self.lbl_ram.setText(f"DDR: {used/(1024**3):.1f}/{total/(1024**3):.0f} GiB")
+        while self.gpu_box.count():
+            it = self.gpu_box.takeAt(0); w = it.widget()
+            if w: w.deleteLater()
+        gpus = _read_gpu_info()
+        if gpus:
+            for g in gpus:
+                used = g.get("used",0); total = g.get("total",0)
+                util = g.get("util", None); temp = g.get("temp", None); name = g.get("name", "GPU")
+                txt = f"{name}: VRAM {used/(1024**3):.1f}/{total/(1024**3):.0f} GiB"
+                extras = []
+                if util is not None: extras.append(f"{util}%")
+                if temp is not None: extras.append(_format_temp(temp))
+                if extras: txt += "  (" + ", ".join(extras) + ")"
+                lab = QLabel(txt); lab.setTextFormat(Qt.PlainText)
+                self.gpu_box.addWidget(lab)
+        else:
+            self.gpu_box.addWidget(QLabel("GPU: N/A"))
+        try:
+            utils = [g.get("util") for g in (gpus or []) if isinstance(g, dict)]
+            util_val = None
+            for u in utils:
+                if isinstance(u, (int, float)):
+                    util_val = max(util_val if util_val is not None else 0, int(u))
+            self.lbl_gpu_load.setText("GPU load: — %" if util_val is None else f"GPU load: {util_val}%")
+        except Exception:
+            self.lbl_gpu_load.setText("GPU load: — %")
+
+        # Disk
+        self._refresh_disk()
+
+        # Uptimes
+        now = time.time()
+
+        self._tick_seconds()
+# ---------- Settings installer ----------
+def _find_settings_content() -> Optional[QWidget]:
+    app = QApplication.instance()
+    if not app: return None
+    for w in app.allWidgets():
+        try:
+            if w.objectName() == "FvSettingsContent":
+                return w
+        except Exception: continue
+    try:
+        from PySide6.QtWidgets import QTabWidget
+        for tl in app.topLevelWidgets():
+            for tw in tl.findChildren(QTabWidget):
+                for i in range(tw.count()):
+                    try:
+                        if tw.tabText(i).strip().lower() == "settings":
+                            page = tw.widget(i)
+                            sa = page.findChild(QScrollArea)
+                            if sa and sa.widget(): return sa.widget()
+                            return page
+                    except Exception: continue
+    except Exception: pass
+    return None
+
+def auto_install_sysmon_settings(retries: int = 14, delay_ms:int = 350):
+    content = _find_settings_content()
+    if content is None:
+        if retries <= 0: return
+        QTimer.singleShot(delay_ms, lambda: auto_install_sysmon_settings(retries-1, delay_ms))
+        return
+    if getattr(content, "_fv_sysmon_wired_v14", False):
+        return
+    content._fv_sysmon_wired_v14 = True
+
+    section = CollapsibleSection("System monitor", content, expanded=False)
+    inner = QVBoxLayout(); inner.setContentsMargins(8,8,8,8); inner.setSpacing(6)
+    inner.addWidget(SysMonPanel(section))
+    section.setContentLayout(inner)
+
+    lay = getattr(content, "layout", lambda: None)()
+    if lay:
+        # Insert System monitor just below the top banner (index 1),
+        # falling back to appending if something unexpected happens.
+        try:
+            lay.insertWidget(1, section)
+        except Exception:
+            lay.addWidget(section)
+    else:
+        section.setParent(content); section.show()
+
+    QTimer.singleShot(0, _load_hud_setting_and_apply)

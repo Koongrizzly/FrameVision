@@ -1,0 +1,39 @@
+# Use CUDA-enabled PyTorch wheels (CUDA 12.6) for WAN 2.2.
+# NOTE: PyTorch (torch/torchvision/torchaudio) is installed separately
+#       in wan22_setup.bat and MUST NOT be installed from this file.
+# --extra-index-url https://download.pytorch.org/whl/cu126
+
+Pillow
+tqdm
+imageio
+PySide6
+huggingface_hub
+safetensors
+
+# Extra deps needed by Wan2.2 Turbo / few-step repo imports
+lmdb
+pandas
+omegaconf
+
+# Wan 2.2 deps (no torch/torchvision/torchaudio here!)
+einops
+decord
+librosa
+peft==0.18.0
+
+opencv-python>=4.9.0.80
+diffusers==0.35.2
+transformers>=4.52.0,<5.0.0
+tokenizers>=0.20.3
+accelerate>=1.1.1
+tqdm
+imageio[ffmpeg]
+easydict
+ftfy
+dashscope
+imageio-ffmpeg
+# flash_attn
+numpy>=1.23.5,<2
+
+# Attention backends are installed last in wan22_setup.bat:
+# triton-windows>=3.2,<3.3 and the matching FlashAttention cu126/torch2.6/cp311 wheel.

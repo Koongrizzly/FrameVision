@@ -1,0 +1,26 @@
+{
+  "remember": true,
+  "scale": 4.0,
+  "engine_index": 0,
+  "model_realsr": "realesrgan-x4plus",
+  "model_w2x": "models-upconv_7_photo",
+  "model_gfpgan": "GFPGANv1.4",
+  "outdir": "C:\\FrameVision-main\\output\\upscaled",
+  "vcodec": "libx264",
+  "use_crf": true,
+  "crf": 20,
+  "use_bitrate": false,
+  "bitrate": 3000,
+  "preset": "ultrafast",
+  "keyint": 0,
+  "audio": "copy",
+  "acodec": "aac",
+  "abitrate": 192,
+  "sections": {
+    "models": true,
+    "encoder": true,
+    "advanced": false
+  },
+  "video_thumbs": true,
+  "streaming_lowmem": true
+}

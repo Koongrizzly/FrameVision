@@ -1,0 +1,324 @@
+{
+  "version": 1,
+  "default_image_model": "zimage_gguf",
+  "default_width": 1376,
+  "default_height": 768,
+  "max_custom_width": 2048,
+  "max_custom_height": 2048,
+  "max_custom_area": 4194304,
+  "snap_multiple": 64,
+  "models": {
+    "zimage_gguf": {
+      "label": "Z-Image GGUF",
+      "aliases": [
+        "z-image",
+        "zimage",
+        "z image",
+        "z-image gguf",
+        "zimage gguf",
+        "z image gguf"
+      ],
+      "folder": "models/Z-Image-Turbo GGUF",
+      "queue_type": "txt2img",
+      "engine": "zimage_gguf",
+      "output_dir": "output/photo/txt2img",
+      "default_steps": 8,
+      "default_cfg": 0.0,
+      "default_sampler": "euler",
+      "filename_template": "z_img_{seed}_{idx:03d}.png"
+    },
+    "lens": {
+      "label": "Lens Turbo U4",
+      "aliases": [
+        "lens",
+        "lens turbo",
+        "lens turbo u4"
+      ],
+      "folder": "models/lens",
+      "queue_type": "lens_turbo_u4",
+      "output_dir": "output/lens_turbo_u4",
+      "repo_id": "WaveCut/Lens-Turbo-SDNQ-uint4-static",
+      "default_steps": 4,
+      "default_cfg": 0.0
+    },
+    "chroma": {
+      "label": "Chroma",
+      "aliases": [
+        "chroma",
+        "spark chroma",
+        "spark.chroma"
+      ],
+      "folder": "models/chroma/SPARK.Chroma_v1",
+      "queue_type": "chroma",
+      "output_dir": "output/images/chroma",
+      "default_steps": 30,
+      "default_cfg": 3.0
+    },
+    "flux_klein": {
+      "label": "Flux Klein",
+      "aliases": [
+        "flux klein",
+        "flux-klein",
+        "flux klein gguf",
+        "klein",
+        "klein 4b",
+        "flux 2 klein"
+      ],
+      "folder": "models/klein4b_gguf",
+      "queue_type": "flux_klein",
+      "output_dir": "output/edits/flux_klein",
+      "default_steps": 4,
+      "default_cfg": 1.0,
+      "edit_settings": {
+        "use_for": "small edits, add/remove one object, local changes, light inpainting-style edits",
+        "default_width": 1024,
+        "default_height": 1024,
+        "default_steps": 4,
+        "default_cfg": 1.0,
+        "preserve_source_prompt": "Edit the source image. Keep identity, framing, clothing, lighting and composition unless the user asks to change them."
+      }
+    },
+    "hidream": {
+      "label": "HiDream",
+      "aliases": [
+        "hidream",
+        "hi dream",
+        "hidream dev",
+        "hidream image",
+        "hidream studio"
+      ],
+      "folder": "models/hidream_bf16",
+      "queue_type": "hidream",
+      "output_dir": "output/hidream",
+      "default_steps": 28,
+      "default_cfg": 0.0,
+      "edit_settings": {
+        "use_for": "bigger edits, background replacement, heavier restyling, reference-image rebuilds, multi-reference work",
+        "safe_output_sizes": [
+          [
+            1600,
+            896
+          ],
+          [
+            1920,
+            1088
+          ],
+          [
+            896,
+            1600
+          ],
+          [
+            1088,
+            1920
+          ],
+          [
+            1024,
+            1024
+          ],
+          [
+            1536,
+            1536
+          ]
+        ],
+        "default_output_size": [
+          1600,
+          896
+        ],
+        "default_steps": 28,
+        "default_cfg": 0.0,
+        "preserve_source_prompt": "Edit the source image and keep the main subject, identity, pose and clothing unless the user asks otherwise."
+      }
+    }
+  },
+  "tools": {
+    "seedvr2": {
+      "label": "SeedVR2",
+      "aliases": [
+        "seedvr2",
+        "seed vr2",
+        "seed-vr2",
+        "seed2vr",
+        "seed 2 vr"
+      ],
+      "queue_type": "external_cmd",
+      "engine": "seedvr2",
+      "folder": "models/SEEDVR2",
+      "output_dir": "output/photo",
+      "cli": "presets/extra_env/seedvr2_src/ComfyUI-SeedVR2_VideoUpscaler/inference_cli.py",
+      "env_win": "environments/.seedvr2/Scripts/python.exe",
+      "env_posix": "environments/.seedvr2/bin/python",
+      "runner": "helpers/seedvr2_runner.py",
+      "resolutions": [
+        1080,
+        1440,
+        2160
+      ],
+      "default_resolution": 1440,
+      "model_families_order": [
+        "3B",
+        "7B",
+        "9B"
+      ],
+      "model_family_labels": {
+        "3B": "3B (good quality, lighter on VRAM)",
+        "7B": "7B (best quality, slower and VRAM heavier)",
+        "9B": "9B (detected model, slower and VRAM heavier)"
+      },
+      "defaults": {
+        "batch_size": 2,
+        "chunk_size": 20,
+        "temporal_overlap": 0,
+        "prepend_frames": 0,
+        "color_correction": "lab",
+        "attention_mode": "auto",
+        "open_on_success": true,
+        "output_format": "png",
+        "video_backend": "ffmpeg"
+      }
+    },
+    "ace_step_15": {
+      "label": "Ace-Step 1.5",
+      "aliases": [
+        "ace step",
+        "ace-step",
+        "acestep",
+        "ace step 1.5",
+        "music",
+        "song",
+        "track",
+        "beat"
+      ],
+      "queue_type": "tool",
+      "engine": "ace_step_15",
+      "category": "music",
+      "project_root": "models/ace_step_15/repo/ACE-Step-1.5",
+      "cli": "models/ace_step_15/repo/ACE-Step-1.5/cli.py",
+      "env_win": "environments/.ace_15/Scripts/python.exe",
+      "env_posix": "environments/.ace_15/bin/python",
+      "preset_manager": "presets/setsave/ace15presets/presetmanager.json",
+      "output_dir": "output/audio/ace15",
+      "defaults": {
+        "task_type": "text2music",
+        "audio_format": "mp3",
+        "batch_size": 1,
+        "log_level": "INFO",
+        "backend": "vllm",
+        "shift": 3.0,
+        "preferred_models": [
+          "acestep-v15-sft",
+          "acestep-v15-base",
+          "acestep-v15-turbo"
+        ],
+        "sft_steps": 60,
+        "base_steps": 60,
+        "turbo_steps": 20,
+        "lm_model": "acestep-5Hz-lm-1.7B",
+        "hide_console": true,
+        "enable_lm": true,
+        "thinking": true,
+        "parallel_thinking": true,
+        "lm_enhance_prompt": true,
+        "use_cot_caption": true,
+        "use_cot_language": true,
+        "use_cot_metas": true,
+        "infer_method": "ode"
+      }
+    }
+  },
+  "video_models": {
+    "ltx23": {
+      "label": "LTX 2.3",
+      "aliases": [
+        "ltx",
+        "ltx 2.3",
+        "ltx23",
+        "ltx distilled",
+        "distilled 1.1",
+        "normal ltx"
+      ],
+      "folder": "models/ltx23/distilled-1.1",
+      "default_checkpoint": "models/ltx23/distilled-1.1/ltx-2.3-22b-distilled-1.1.safetensors",
+      "spatial_upsampler": "models/ltx23/spatial_upsampler/ltx-2.3-spatial-upscaler-x2-1.1.safetensors",
+      "gemma_root": "models/ltx23/text_encoder/lightricks_gemma_original",
+      "cli": "helpers/ltx23_vram_lab_cli.py",
+      "env_win": "environments/.ltx23/python.exe",
+      "env_posix": "environments/.ltx23/bin/python",
+      "output_dir": "output/video/ltx23/chat",
+      "defaults": {
+        "pipeline": "two_stages",
+        "vram_lab": "safe",
+        "vram_profile": "auto",
+        "steps": 8,
+        "cfg": 2.0,
+        "stg": 0.0,
+        "rescale": 0.7,
+        "shift": 5.0,
+        "fps": 24,
+        "frames": 121,
+        "resolution": "704p",
+        "aspect": "16:9"
+      },
+      "size_presets": {
+        "480p": {
+          "16:9": [
+            832,
+            512
+          ],
+          "9:16": [
+            512,
+            832
+          ],
+          "1:1": [
+            640,
+            640
+          ]
+        },
+        "704p": {
+          "16:9": [
+            1280,
+            704
+          ],
+          "9:16": [
+            704,
+            1280
+          ],
+          "1:1": [
+            1024,
+            1024
+          ]
+        },
+        "1088p": {
+          "16:9": [
+            1920,
+            1088
+          ],
+          "9:16": [
+            1088,
+            1920
+          ],
+          "1:1": [
+            1440,
+            1440
+          ]
+        }
+      },
+      "auto_frame_caps": {
+        "24": {
+          "480p": 1201,
+          "704p": 577,
+          "1088p": 265
+        },
+        "16": {
+          "480p": 901,
+          "704p": 433,
+          "1088p": 199
+        },
+        "12": {
+          "480p": 601,
+          "704p": 289,
+          "1088p": 133
+        }
+      }
+    }
+  }
+}

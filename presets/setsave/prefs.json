@@ -1,0 +1,12 @@
+{
+  "greeting": "Playful",
+  "mode": "Power User",
+  "auto_frame": true,
+  "backend": "Transformers (VL)",
+  "device": "cpu",
+  "preset": "q4",
+  "gguf": "",
+  "llama_bin": "",
+  "attach": false,
+  "stream": false
+}

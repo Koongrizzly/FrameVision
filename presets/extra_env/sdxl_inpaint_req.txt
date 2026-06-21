@@ -1,0 +1,9 @@
+# SDXL Inpaint isolated environment requirements
+# Keep this env separate from the main app .venv
+diffusers==0.35.2
+transformers==4.57.1
+accelerate==1.11.0
+safetensors==0.7.0
+huggingface_hub>=0.24.0
+Pillow
+numpy

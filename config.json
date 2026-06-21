@@ -1,0 +1,25 @@
+{
+  "models_folder": "C:\\FrameVision-main\\models",
+  "last_open_dir": "C:\\",
+  "caption_model": "Model 1",
+  "auto_on_pause": true,
+  "models_status": {},
+  "show_toasts": true,
+  "theme": "Graphite Dusk",
+  "session_restore": {
+    "last_file": "C:\\test.mp3",
+    "last_position_ms": 0,
+    "active_tab": 6,
+    "win_geometry_b64": "AdnQywADAAAAAAABAAAAAAAABP4AAALOAAAAAQAAABwAAAT+AAACzgAAAAAAAAAABQAAAAABAAAAHAAABP4AAALO",
+    "splitter_state_b64": "AAAA/wAAAAEAAAACAAAA/gAAAHMB/////wEAAAACAA==",
+    "restart_from_settings": true,
+    "is_maximized": true,
+    "is_fullscreen": false,
+    "active_tab_name": "\ufe0f\u2699\ufe0f Settings"
+  },
+  "queue_play_last": true,
+  "logo_cycle_index": 0,
+  "diag_probe_enabled": false,
+  "temp_units": "C",
+  "queue_auto_cleanup": true
+}
