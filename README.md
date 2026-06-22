@@ -103,6 +103,12 @@ Run **`framevision.exe`** — it automatically:
    
 ---
 <details>
+<summary>June 25 2026 Framevision V2.5 brings llm into framevision</summary>
+  - LLM-chat is a gguf loader for large language models with special options added such as image creation/editing, text/image or video to video and music creation.
+  - added my video timeline editor in to framevision
+  - various bugfixes and improvements
+</details>
+<details>
 <summary>June 16 2026 Framevision V2.4.2 small update</summary>
   
 ## Added Bernini R, the 1.3B version for low(er) vram
