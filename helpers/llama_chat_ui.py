@@ -3571,6 +3571,7 @@ class LlamaChatWindow(QtWidgets.QMainWindow):
             return
         changed = False
         keep = []
+        running_queue_jobs = self._running_queue_job_files()
         for track in self._assistant_jobs:
             status_now = str(track.get("status") or "").lower()
             if status_now == "done":
@@ -3626,12 +3627,57 @@ class LlamaChatWindow(QtWidgets.QMainWindow):
                 if not image_path:
                     image_path = self._scan_output_images_for_track(track)
 
-            if not done_job and not image_path and not audio_path and not video_path:
+            model_label = str(track.get("model_label") or "FrameVision model")
+            prompt = str(track.get("prompt") or "").strip()
+
+            # Safer queue-state rule:
+            # If FrameVision still has a real job file in jobs/running (>1.5 KB),
+            # a generation is still running and the chat must keep waiting. This
+            # avoids accepting half-written video/audio/image outputs too early.
+            if running_queue_jobs and not done_job:
                 keep.append(track)
                 continue
 
-            model_label = str(track.get("model_label") or "FrameVision model")
-            prompt = str(track.get("prompt") or "").strip()
+            if not done_job and not image_path and not audio_path and not video_path:
+                # When a queued job was cancelled/removed, the chat-side tracker can
+                # otherwise wait forever. After a small startup grace period, no real
+                # running job file means the worker is not processing it anymore.
+                queued_at = self._parse_timestamp_seconds(track.get("queued_at") or track.get("created_at"), time.time())
+                try:
+                    age = time.time() - float(queued_at or 0.0)
+                except Exception:
+                    age = 999.0
+                if age >= 10.0:
+                    if mode_now == "music":
+                        stopped_text = f"Music job for {model_label} is no longer running. It may have been cancelled, removed, or finished without returning an audio file."
+                    elif mode_now == "video":
+                        stopped_text = f"Video job for {model_label} is no longer running. It may have been cancelled, removed, or finished without returning a video file."
+                    elif mode_now == "upscale":
+                        stopped_text = f"Image upscale job for {model_label} is no longer running. It may have been cancelled, removed, or finished without returning an image file."
+                    elif mode_now == "edit":
+                        stopped_text = f"Image edit job for {model_label} is no longer running. It may have been cancelled, removed, or finished without returning an image file."
+                    else:
+                        stopped_text = f"Image creation job for {model_label} is no longer running. It may have been cancelled, removed, or finished without returning an image file."
+                    self._update_session_message(
+                        str(track.get("session_id") or ""),
+                        str(track.get("message_id") or ""),
+                        content=stopped_text,
+                        attachments=[],
+                        loading=False,
+                    )
+                    try:
+                        self._set_status("Ready", "ready")
+                    except Exception:
+                        pass
+                    track["status"] = "done"
+                    track["finished_at"] = datetime.now().isoformat(timespec="seconds")
+                    changed = True
+                    keep.append(track)
+                    continue
+
+                keep.append(track)
+                continue
+
             if audio_path:
                 attachments = [_make_attachment_entry(audio_path)]
                 genre = str(track.get("genre") or "").strip()
