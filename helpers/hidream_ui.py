@@ -1,6 +1,88 @@
 #!/usr/bin/env python3
 from __future__ import annotations
 
+
+# --- FrameVision media-explorer results opener ------------------------------
+def _fv_open_results_in_media_explorer(widget, folder, preset="images") -> bool:
+    """Open/scan a results folder in FrameVision Media Explorer when embedded.
+
+    Falls back to the operating-system file explorer when the main FrameVision
+    helper is not available (for standalone tool runs).
+    """
+    try:
+        from pathlib import Path as _Path
+        _folder = _Path(folder).expanduser()
+        try:
+            _folder.mkdir(parents=True, exist_ok=True)
+        except Exception:
+            pass
+        _folder_s = str(_folder)
+    except Exception:
+        return False
+
+    def _try_main(_mw) -> bool:
+        try:
+            if _mw is not None and hasattr(_mw, "open_media_explorer_folder"):
+                try:
+                    _mw.open_media_explorer_folder(_folder_s, preset=preset, include_subfolders=False)
+                    return True
+                except TypeError:
+                    kwargs = {"include_subfolders": False}
+                    if preset == "images":
+                        kwargs.update({"want_images": True, "want_videos": False, "want_audio": False})
+                    elif preset == "videos":
+                        kwargs.update({"want_images": False, "want_videos": True, "want_audio": False})
+                    elif preset == "audio":
+                        kwargs.update({"want_images": False, "want_videos": False, "want_audio": True})
+                    _mw.open_media_explorer_folder(_folder_s, **kwargs)
+                    return True
+        except Exception:
+            pass
+        return False
+
+    try:
+        _w = widget
+        while _w is not None:
+            if _try_main(_w):
+                return True
+            try:
+                _w = _w.parent()
+            except Exception:
+                break
+    except Exception:
+        pass
+
+    try:
+        from PySide6.QtWidgets import QApplication as _QApplication
+        _app = _QApplication.instance()
+        if _app is not None:
+            for _w in _app.topLevelWidgets():
+                if _try_main(_w):
+                    return True
+    except Exception:
+        pass
+
+    try:
+        from PySide6.QtGui import QDesktopServices as _QDesktopServices
+        from PySide6.QtCore import QUrl as _QUrl
+        _QDesktopServices.openUrl(_QUrl.fromLocalFile(_folder_s))
+        return True
+    except Exception:
+        pass
+
+    try:
+        import os as _os, sys as _sys, subprocess as _subprocess
+        if _os.name == "nt":
+            _os.startfile(_folder_s)  # type: ignore[attr-defined]
+        elif _sys.platform == "darwin":
+            _subprocess.Popen(["open", _folder_s])
+        else:
+            _subprocess.Popen(["xdg-open", _folder_s])
+        return True
+    except Exception:
+        return False
+# ---------------------------------------------------------------------------
+
 import os
 import re
 import sys
@@ -534,8 +616,9 @@ class HiDreamUI(QMainWindow):
         header.addWidget(self.model_combo)
         self.model_status = QLabel("")
         header.addWidget(self.model_status, 1)
-        self.open_output_btn = QPushButton("Open output folder")
-        self.open_output_btn.clicked.connect(self.open_output_folder)
+        self.open_output_btn = QPushButton("View results")
+        self.open_output_btn.setToolTip("Open the HiDream output folder in FrameVision Media Explorer.")
+        self.open_output_btn.clicked.connect(self.view_results)
         header.addWidget(self.open_output_btn)
         main.addLayout(header)
 
@@ -586,6 +669,10 @@ class HiDreamUI(QMainWindow):
         self.status_label = QLabel("Ready")
         layout.addWidget(self.status_label)
         layout.addStretch()
+        self.view_results_btn = QPushButton("View results")
+        self.view_results_btn.setToolTip("Open the HiDream output folder in FrameVision Media Explorer.")
+        self.view_results_btn.clicked.connect(self.view_results)
+        layout.addWidget(self.view_results_btn)
         self.stop_btn = QPushButton("Stop current")
         self.stop_btn.setEnabled(False)
         self.stop_btn.clicked.connect(self.stop_generation)
@@ -2392,6 +2479,10 @@ class HiDreamUI(QMainWindow):
             self._stopping_current_job = True
             self.log("Stopping current queue job...")
             self.process.kill()
+
+    def view_results(self) -> None:
+        folder = Path(self.output_dir_edit.text()).expanduser()
+        _fv_open_results_in_media_explorer(self, folder, preset="images")
 
     def open_output_folder(self) -> None:
         folder = Path(self.output_dir_edit.text()).expanduser()

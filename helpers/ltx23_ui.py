@@ -31,7 +31,7 @@ from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 from PySide6.QtCore import QProcess, Qt, QThread, QTimer, Signal
-from PySide6.QtGui import QAction, QDesktopServices, QFont, QTextCursor, QPixmap
+from PySide6.QtGui import QAction, QDesktopServices, QFont, QTextCursor, QPixmap, QImage
 from PySide6.QtWidgets import (
     QApplication,
     QCheckBox,
@@ -798,6 +798,44 @@ class PathRow(QWidget):
             QDesktopServices.openUrl(QUrl.fromLocalFile(str(target)))
 
 
+class MediaPathRow(PathRow):
+    """PathRow variant for media inputs: same PathRow, plus a Use Current button."""
+
+    def __init__(
+        self,
+        label: str,
+        default: str = "",
+        parent: Optional[QWidget] = None,
+        *,
+        mode: str = "file",
+        file_filter: str = "All files (*.*)",
+        save_file: bool = False,
+        open_action: str = "open",
+    ) -> None:
+        super().__init__(label, default, parent, mode=mode, file_filter=file_filter, save_file=save_file, open_action=open_action)
+        self.use_current_btn = QPushButton("Use Current")
+        self.use_current_btn.setToolTip("Use the current image, frame, or video from the FrameVision Media Player.")
+        try:
+            self.edit.setMinimumWidth(260)
+            self.edit.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+        except Exception:
+            pass
+
+        layout = self.layout()
+        if isinstance(layout, QHBoxLayout):
+            try:
+                layout.setSpacing(6)
+                layout.removeWidget(self.edit)
+                layout.removeWidget(self.browse_btn)
+                layout.removeWidget(self.open_btn)
+            except Exception:
+                pass
+            # Only the labels are aligned later by the owner. Buttons keep their natural size.
+            layout.addWidget(self.browse_btn, 0)
+            layout.addWidget(self.use_current_btn, 0)
+            layout.addWidget(self.open_btn, 0)
+            layout.addWidget(self.edit, 1)
+
 class TwoStageAssetDownloadWorker(QThread):
     progressChanged = Signal(str, int, str)
     logMessage = Signal(str)
@@ -1092,15 +1130,12 @@ class LTX23RunnerWidget(QWidget):
         self.stop_btn = QPushButton("Stop")
         self.stop_btn.clicked.connect(self.stop_generation)
         self.stop_btn.setEnabled(False)
-        self.copy_cmd_btn = QPushButton("Copy command")
-        self.copy_cmd_btn.clicked.connect(self.copy_command_to_clipboard)
-        self.open_output_btn = QPushButton("Open output folder")
-        self.open_output_btn.clicked.connect(self.open_output_folder)
+        self.view_results_btn = QPushButton("View results")
+        self.view_results_btn.clicked.connect(self.view_results)
         controls.addWidget(self.run_btn)
         controls.addWidget(self.stop_btn)
         controls.addStretch(1)
-        controls.addWidget(self.copy_cmd_btn)
-        controls.addWidget(self.open_output_btn)
+        controls.addWidget(self.view_results_btn)
         root.addLayout(controls)
 
     def _build_generation_tab(self) -> None:
@@ -1252,32 +1287,48 @@ class LTX23RunnerWidget(QWidget):
         self._update_extended_frames_warning()
 
 
+    def _align_path_row_labels(self, rows: Iterable[PathRow]) -> None:
+        """Make compound PathRow labels end at the same X position without forcing button widths."""
+        try:
+            valid_rows = [row for row in rows if row is not None and getattr(row, "label", None) is not None]
+            if not valid_rows:
+                return
+            width = max(row.label.sizeHint().width() for row in valid_rows) + 12
+            for row in valid_rows:
+                try:
+                    row.label.setFixedWidth(width)
+                    row.label.setAlignment(Qt.AlignLeft | Qt.AlignVCenter)
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
     def _build_inputs_tab(self) -> None:
         tab = QWidget()
         layout = QVBoxLayout(tab)
         layout.setSpacing(8)
 
-        media_group = QGroupBox("Images")
+        media_group = QGroupBox("Media")
         form = QFormLayout(media_group)
-        self.start_media_row = PathRow(
+        self.start_media_row = MediaPathRow(
             "Start image",
             mode="file",
             file_filter="Images (*.png *.jpg *.jpeg *.webp *.bmp);;All files (*.*)",
             open_action="clear",
         )
-        self.end_media_row = PathRow(
-            "End image / last frame",
+        self.end_media_row = MediaPathRow(
+            "End image",
             mode="file",
             file_filter="Images (*.png *.jpg *.jpeg *.webp *.bmp);;All files (*.*)",
             open_action="clear",
         )
-        self.start_video_row = PathRow(
+        self.start_video_row = MediaPathRow(
             "Continue video",
             mode="file",
             file_filter=VIDEO_FILE_FILTER,
             open_action="clear",
         )
-        self.end_video_row = PathRow(
+        self.end_video_row = MediaPathRow(
             "End with video",
             mode="file",
             file_filter=VIDEO_FILE_FILTER,
@@ -1296,7 +1347,7 @@ class LTX23RunnerWidget(QWidget):
         )
         self._set_tooltip(
             self.end_media_row,
-            "Optional end image / last frame target. The UI places it at the final generated frame. "
+            "Optional end image target. The UI places it at the final generated frame. "
             "Leave empty for normal start-image or text-to-video runs.",
         )
         self._set_tooltip(
@@ -1330,6 +1381,16 @@ class LTX23RunnerWidget(QWidget):
             self.normalize_input_image_check,
             "Converts input images to clean RGB PNG copies before LTX to avoid native crashes from unusual image modes/metadata.",
         )
+
+        try:
+            self.start_media_row.use_current_btn.clicked.connect(lambda: self._use_current_for_image_row(self.start_media_row, "Start image"))
+            self.end_media_row.use_current_btn.clicked.connect(lambda: self._use_current_for_image_row(self.end_media_row, "end image"))
+            self.start_video_row.use_current_btn.clicked.connect(lambda: self._use_current_for_video_row(self.start_video_row, "Continue video"))
+            self.end_video_row.use_current_btn.clicked.connect(lambda: self._use_current_for_video_row(self.end_video_row, "End with video"))
+        except Exception:
+            pass
+
+        self._align_path_row_labels([self.start_media_row, self.end_media_row, self.start_video_row, self.end_video_row])
 
         form.addRow(self.start_media_row)
         form.addRow(self.end_media_row)
@@ -1870,6 +1931,7 @@ class LTX23RunnerWidget(QWidget):
         self.report_row = PathRow("Report path", str(DEFAULT_REPORT_PATH), mode="file", file_filter="Text (*.txt);;All files (*.*)", save_file=True)
         self.deep_log_row = PathRow("Deep log path", str(DEFAULT_DEEP_LOG_PATH), mode="file", file_filter="Text (*.txt);;All files (*.*)", save_file=True)
         self.ffmpeg_row = PathRow("FFmpeg", "ffmpeg", mode="file", file_filter="FFmpeg (ffmpeg.exe ffmpeg);;All files (*.*)")
+        self._align_path_row_labels([self.ltx_root_row, self.python_row, self.cli_row, self.checkpoint_row, self.gemma_row, self.output_dir_row, self.report_row, self.deep_log_row, self.ffmpeg_row])
         self.model_variant_combo = WheelGuardComboBox()
         self.model_variant_combo.addItems(["FP16", "FP8"])
         self.auto_fill_model_paths_btn = QPushButton("Auto fill selected")
@@ -1926,6 +1988,241 @@ class LTX23RunnerWidget(QWidget):
     # ------------------------------------------------------------------
     # Helpers
     # ------------------------------------------------------------------
+    def _find_main_with_video(self):
+        """Best-effort search for the main FrameVision window that owns the media player."""
+        try:
+            p = self.parent()
+            while p is not None:
+                if hasattr(p, "video"):
+                    return p
+                try:
+                    p = p.parent()
+                except Exception:
+                    break
+        except Exception:
+            pass
+        try:
+            for w in QApplication.topLevelWidgets():
+                if hasattr(w, "video"):
+                    return w
+        except Exception:
+            pass
+        return None
+
+    def _current_media_path(self) -> Optional[Path]:
+        main = self._find_main_with_video()
+        if main is None:
+            return None
+        try:
+            cur = getattr(main, "current_path", None)
+            if cur:
+                p = Path(str(cur)).expanduser()
+                if p.exists():
+                    return p
+        except Exception:
+            pass
+        try:
+            video = getattr(main, "video", None)
+        except Exception:
+            video = None
+        if video is None:
+            return None
+        for attr in ("current_path", "path", "file_path", "filepath", "source", "filename", "file"):
+            try:
+                val = getattr(video, attr, None)
+            except Exception:
+                val = None
+            if not val:
+                continue
+            try:
+                if hasattr(val, "toLocalFile"):
+                    val = val.toLocalFile()
+            except Exception:
+                pass
+            try:
+                p = Path(str(val)).expanduser()
+                if p.exists():
+                    return p
+            except Exception:
+                pass
+        return None
+
+    def _grab_current_qimage(self) -> Optional[QImage]:
+        try:
+            main = self._find_main_with_video()
+            if main is None:
+                return None
+            video = getattr(main, "video", None)
+            if video is None:
+                return None
+            img = getattr(video, "currentFrame", None)
+            if isinstance(img, QImage) and not img.isNull():
+                return img
+            try:
+                label = getattr(video, "label", None)
+                if label is not None and hasattr(label, "pixmap"):
+                    pm = label.pixmap()
+                    if pm is not None and not pm.isNull():
+                        return pm.toImage()
+            except Exception:
+                pass
+            try:
+                labels = main.findChildren(QLabel)
+                for lb in reversed(labels):
+                    if hasattr(lb, "pixmap"):
+                        pm = lb.pixmap()
+                        if pm is not None and not pm.isNull() and pm.width() > 32 and pm.height() > 32:
+                            return pm.toImage()
+            except Exception:
+                pass
+        except Exception:
+            pass
+        return None
+
+    def _player_position_seconds(self, video_obj) -> Optional[float]:
+        try:
+            objs = [video_obj]
+            for a in ("player", "mediaPlayer", "mp", "qplayer"):
+                try:
+                    o = getattr(video_obj, a, None)
+                except Exception:
+                    o = None
+                if o is not None:
+                    objs.append(o)
+            for o in objs:
+                if o is None:
+                    continue
+                for name in ("position", "currentPosition", "pos", "position_ms", "current_ms", "currentTime"):
+                    if not hasattr(o, name):
+                        continue
+                    try:
+                        v = getattr(o, name)
+                        v = v() if callable(v) else v
+                    except Exception:
+                        continue
+                    if not isinstance(v, (int, float)):
+                        continue
+                    v = float(v)
+                    if "ms" in name or v > 10000.0:
+                        return max(0.0, v / 1000.0)
+                    return max(0.0, v)
+        except Exception:
+            pass
+        return None
+
+    def _ffmpeg_exe_for_media(self) -> str:
+        try:
+            raw = self.ffmpeg_row.text().strip() if hasattr(self, "ffmpeg_row") else ""
+        except Exception:
+            raw = ""
+        candidates = []
+        if raw:
+            candidates.append(raw)
+        try:
+            candidates.append(str(DEFAULT_FRAME_FFMPEG))
+        except Exception:
+            pass
+        candidates.append("ffmpeg")
+        for cand in candidates:
+            if not cand:
+                continue
+            try:
+                p = Path(str(cand)).expanduser()
+                if p.exists():
+                    return str(p)
+            except Exception:
+                pass
+            if str(cand).lower() == "ffmpeg":
+                return "ffmpeg"
+        return "ffmpeg"
+
+    def _save_qimage_png(self, qimg: QImage, out_path: Path) -> bool:
+        try:
+            img = qimg
+            return bool(img.save(str(out_path), "PNG"))
+        except Exception:
+            return False
+
+    def _export_current_media_to_temp_image(self) -> Optional[Path]:
+        try:
+            DEFAULT_VIDEO_FRAME_DIR.mkdir(parents=True, exist_ok=True)
+            out_png = DEFAULT_VIDEO_FRAME_DIR / f"ltx23_current_{int(time.time())}.png"
+        except Exception:
+            return None
+        main = self._find_main_with_video()
+        try:
+            video = getattr(main, "video", None) if main is not None else None
+        except Exception:
+            video = None
+        src = self._current_media_path()
+        img_exts = {".png", ".jpg", ".jpeg", ".webp", ".bmp", ".tif", ".tiff"}
+        vid_exts = {".mp4", ".mov", ".mkv", ".webm", ".avi", ".m4v", ".mpg", ".mpeg"}
+        if src is not None:
+            ext = (src.suffix or "").lower()
+            try:
+                if ext in img_exts:
+                    return src
+                if ext in vid_exts:
+                    ff = self._ffmpeg_exe_for_media()
+                    sec = self._player_position_seconds(video) if video is not None else None
+                    cmd = [ff, "-y", "-hide_banner"]
+                    if sec is not None:
+                        cmd += ["-ss", f"{sec:.3f}"]
+                    cmd += ["-i", str(src), "-frames:v", "1", str(out_png)]
+                    try:
+                        subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=True)
+                        q = QImage(str(out_png))
+                        if not q.isNull():
+                            return out_png
+                    except Exception:
+                        pass
+            except Exception:
+                pass
+        qimg = self._grab_current_qimage()
+        if qimg is None or qimg.isNull():
+            return None
+        if self._save_qimage_png(qimg, out_png):
+            return out_png
+        return None
+
+    def _use_current_for_image_row(self, row: PathRow, label: str) -> None:
+        path = self._export_current_media_to_temp_image()
+        if path is None or not Path(str(path)).exists():
+            QMessageBox.warning(self, "No current image", "No current image or video frame was found.\n\nLoad an image or pause a video in the Media Player first.")
+            return
+        row.setText(str(path))
+        try:
+            self._append_log(f"Using Media Player current image/frame for {label}: {path}")
+        except Exception:
+            pass
+
+    def _use_current_for_video_row(self, row: PathRow, label: str) -> None:
+        src = self._current_media_path()
+        vid_exts = {".mp4", ".mov", ".mkv", ".webm", ".avi", ".m4v", ".mpg", ".mpeg"}
+        if src is None or (src.suffix or "").lower() not in vid_exts:
+            QMessageBox.warning(self, "No current video", "No current video was found.\n\nLoad a video in the Media Player first, then click Use Current again.")
+            return
+        row.setText(str(src))
+        try:
+            self._append_log(f"Using Media Player current video for {label}: {src}")
+        except Exception:
+            pass
+
+    def view_results(self) -> None:
+        target = self.active_output_path.parent if self.active_output_path else Path(self.output_dir_row.text() or str(DEFAULT_OUTPUT_DIR))
+        try:
+            target.mkdir(parents=True, exist_ok=True)
+        except Exception:
+            pass
+        main = self._find_main_with_video()
+        try:
+            if main is not None and hasattr(main, "open_media_explorer_folder"):
+                main.open_media_explorer_folder(str(target), preset="videos", include_subfolders=False)
+                return
+        except Exception:
+            pass
+        QDesktopServices.openUrl(QUrl.fromLocalFile(str(target)))
+
     def _spin(self, minimum: int, maximum: int, step: int, value: int) -> QSpinBox:
         w = WheelGuardSpinBox()
         w.setRange(minimum, maximum)
@@ -1979,7 +2276,7 @@ class LTX23RunnerWidget(QWidget):
             widget.setToolTip(text)
         except Exception:
             pass
-        for attr in ("label", "edit", "browse_btn", "open_btn", "toggle", "content"):
+        for attr in ("label", "edit", "browse_btn", "use_current_btn", "open_btn", "toggle", "content"):
             child = getattr(widget, attr, None)
             if child is not None:
                 try:

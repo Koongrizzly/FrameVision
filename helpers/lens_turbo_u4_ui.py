@@ -1,5 +1,87 @@
 from __future__ import annotations
 
+
+# --- FrameVision media-explorer results opener ------------------------------
+def _fv_open_results_in_media_explorer(widget, folder, preset="images") -> bool:
+    """Open/scan a results folder in FrameVision Media Explorer when embedded.
+
+    Falls back to the operating-system file explorer when the main FrameVision
+    helper is not available (for standalone tool runs).
+    """
+    try:
+        from pathlib import Path as _Path
+        _folder = _Path(folder).expanduser()
+        try:
+            _folder.mkdir(parents=True, exist_ok=True)
+        except Exception:
+            pass
+        _folder_s = str(_folder)
+    except Exception:
+        return False
+
+    def _try_main(_mw) -> bool:
+        try:
+            if _mw is not None and hasattr(_mw, "open_media_explorer_folder"):
+                try:
+                    _mw.open_media_explorer_folder(_folder_s, preset=preset, include_subfolders=False)
+                    return True
+                except TypeError:
+                    kwargs = {"include_subfolders": False}
+                    if preset == "images":
+                        kwargs.update({"want_images": True, "want_videos": False, "want_audio": False})
+                    elif preset == "videos":
+                        kwargs.update({"want_images": False, "want_videos": True, "want_audio": False})
+                    elif preset == "audio":
+                        kwargs.update({"want_images": False, "want_videos": False, "want_audio": True})
+                    _mw.open_media_explorer_folder(_folder_s, **kwargs)
+                    return True
+        except Exception:
+            pass
+        return False
+
+    try:
+        _w = widget
+        while _w is not None:
+            if _try_main(_w):
+                return True
+            try:
+                _w = _w.parent()
+            except Exception:
+                break
+    except Exception:
+        pass
+
+    try:
+        from PySide6.QtWidgets import QApplication as _QApplication
+        _app = _QApplication.instance()
+        if _app is not None:
+            for _w in _app.topLevelWidgets():
+                if _try_main(_w):
+                    return True
+    except Exception:
+        pass
+
+    try:
+        from PySide6.QtGui import QDesktopServices as _QDesktopServices
+        from PySide6.QtCore import QUrl as _QUrl
+        _QDesktopServices.openUrl(_QUrl.fromLocalFile(_folder_s))
+        return True
+    except Exception:
+        pass
+
+    try:
+        import os as _os, sys as _sys, subprocess as _subprocess
+        if _os.name == "nt":
+            _os.startfile(_folder_s)  # type: ignore[attr-defined]
+        elif _sys.platform == "darwin":
+            _subprocess.Popen(["open", _folder_s])
+        else:
+            _subprocess.Popen(["xdg-open", _folder_s])
+        return True
+    except Exception:
+        return False
+# ---------------------------------------------------------------------------
+
 import contextlib
 import ctypes
 import io
@@ -1066,10 +1148,10 @@ class LensTurboWindow(QMainWindow):
         self.generate_btn = QPushButton("Add to Queue")
         self.stop_btn = QPushButton("Stop Current")
         self.stop_btn.setEnabled(False)
-        self.open_output_btn = QPushButton("Open Output Folder")
+        self.open_output_btn = QPushButton("View results")
         self.generate_btn.clicked.connect(self.start_generation)
         self.stop_btn.clicked.connect(self.stop_generation)
-        self.open_output_btn.clicked.connect(self.open_output_folder)
+        self.open_output_btn.clicked.connect(self.view_results)
         buttons_layout.addWidget(self.generate_btn)
         buttons_layout.addWidget(self.stop_btn)
         buttons_layout.addWidget(self.open_output_btn)
@@ -1676,6 +1758,10 @@ class LensTurboWindow(QMainWindow):
         chosen = QFileDialog.getExistingDirectory(self, "Select output folder", self.output_edit.text() or str(self.root / "output"))
         if chosen:
             self.output_edit.setText(chosen)
+
+    def view_results(self) -> None:
+        path = self.output_edit.text().strip() or str(self.root / "output" / "lens_turbo_u4")
+        _fv_open_results_in_media_explorer(self, path, preset="images")
 
     def open_output_folder(self) -> None:
         path = self.output_edit.text().strip() or str(self.root / "output" / "lens_turbo_u4")

@@ -36,6 +36,88 @@ Requires (UI python):
 
 from __future__ import annotations
 
+
+# --- FrameVision media-explorer results opener ------------------------------
+def _fv_open_results_in_media_explorer(widget, folder, preset="images") -> bool:
+    """Open/scan a results folder in FrameVision Media Explorer when embedded.
+
+    Falls back to the operating-system file explorer when the main FrameVision
+    helper is not available (for standalone tool runs).
+    """
+    try:
+        from pathlib import Path as _Path
+        _folder = _Path(folder).expanduser()
+        try:
+            _folder.mkdir(parents=True, exist_ok=True)
+        except Exception:
+            pass
+        _folder_s = str(_folder)
+    except Exception:
+        return False
+
+    def _try_main(_mw) -> bool:
+        try:
+            if _mw is not None and hasattr(_mw, "open_media_explorer_folder"):
+                try:
+                    _mw.open_media_explorer_folder(_folder_s, preset=preset, include_subfolders=False)
+                    return True
+                except TypeError:
+                    kwargs = {"include_subfolders": False}
+                    if preset == "images":
+                        kwargs.update({"want_images": True, "want_videos": False, "want_audio": False})
+                    elif preset == "videos":
+                        kwargs.update({"want_images": False, "want_videos": True, "want_audio": False})
+                    elif preset == "audio":
+                        kwargs.update({"want_images": False, "want_videos": False, "want_audio": True})
+                    _mw.open_media_explorer_folder(_folder_s, **kwargs)
+                    return True
+        except Exception:
+            pass
+        return False
+
+    try:
+        _w = widget
+        while _w is not None:
+            if _try_main(_w):
+                return True
+            try:
+                _w = _w.parent()
+            except Exception:
+                break
+    except Exception:
+        pass
+
+    try:
+        from PySide6.QtWidgets import QApplication as _QApplication
+        _app = _QApplication.instance()
+        if _app is not None:
+            for _w in _app.topLevelWidgets():
+                if _try_main(_w):
+                    return True
+    except Exception:
+        pass
+
+    try:
+        from PySide6.QtGui import QDesktopServices as _QDesktopServices
+        from PySide6.QtCore import QUrl as _QUrl
+        _QDesktopServices.openUrl(_QUrl.fromLocalFile(_folder_s))
+        return True
+    except Exception:
+        pass
+
+    try:
+        import os as _os, sys as _sys, subprocess as _subprocess
+        if _os.name == "nt":
+            _os.startfile(_folder_s)  # type: ignore[attr-defined]
+        elif _sys.platform == "darwin":
+            _subprocess.Popen(["open", _folder_s])
+        else:
+            _subprocess.Popen(["xdg-open", _folder_s])
+        return True
+    except Exception:
+        return False
+# ---------------------------------------------------------------------------
+
 import json
 import os
 import shlex
@@ -635,12 +717,13 @@ class MainWindow(QtWidgets.QMainWindow):
 
         # Output helpers
         out_row = QtWidgets.QHBoxLayout()
-        self.btn_open_out = QtWidgets.QPushButton("Open output folder")
+        self.btn_open_out = QtWidgets.QPushButton("View results")
         self.btn_save_copy = QtWidgets.QPushButton("Save copy…")
         self.btn_copy_path = QtWidgets.QPushButton("Copy output path")
         self.chk_use_queue = QtWidgets.QCheckBox("Use queue")
         self.chk_use_queue.setChecked(True)
-        out_row.addWidget(self.btn_open_out)
+        # Keep View results in the sticky footer with Generate.
+        # Save/copy helpers stay in the scrolled output-helper row.
         out_row.addWidget(self.btn_save_copy)
         out_row.addWidget(self.btn_copy_path)
         out_row.addStretch(1)
@@ -698,7 +781,13 @@ class MainWindow(QtWidgets.QMainWindow):
         bottom_layout = QtWidgets.QHBoxLayout(bottom)
         bottom_layout.setContentsMargins(0, 0, 0, 0)
         bottom_layout.setSpacing(8)
+        self.btn_open_out.setMinimumHeight(42)
+        try:
+            self.btn_open_out.setMinimumWidth(160)
+        except Exception:
+            pass
         bottom_layout.addWidget(self.btn_run, 1)
+        bottom_layout.addWidget(self.btn_open_out, 0)
         outer.addWidget(bottom, 0)
 
         # Signals
@@ -721,7 +810,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.btn_lora.clicked.connect(lambda: self._browse_and_set_combo(self.lora_combo, "LoRA adapter", "LoRA (*.safetensors *.ckpt *.pt);;All files (*.*)"))
 
         self.btn_run.clicked.connect(self._run)
-        self.btn_open_out.clicked.connect(self._open_output_folder)
+        self.btn_open_out.clicked.connect(self._view_results)
         self.btn_save_copy.clicked.connect(self._save_copy)
         self.btn_copy_path.clicked.connect(self._copy_output_path)
         self.btn_fit.clicked.connect(lambda: self.preview.fitInView(self.preview.sceneRect(), QtCore.Qt.AspectRatioMode.KeepAspectRatio))
@@ -1072,6 +1161,9 @@ class MainWindow(QtWidgets.QMainWindow):
             self._set_size(w, h)
         except Exception as e:
             QtWidgets.QMessageBox.warning(self, "Failed", str(e))
+
+    def _view_results(self):
+        _fv_open_results_in_media_explorer(self, Path(self.paths.out_dir), preset="images")
 
     def _open_output_folder(self):
         out_dir = Path(self.paths.out_dir)

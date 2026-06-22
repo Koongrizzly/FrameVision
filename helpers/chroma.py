@@ -14,6 +14,88 @@ Download/repair model:
 
 from __future__ import annotations
 
+
+# --- FrameVision media-explorer results opener ------------------------------
+def _fv_open_results_in_media_explorer(widget, folder, preset="images") -> bool:
+    """Open/scan a results folder in FrameVision Media Explorer when embedded.
+
+    Falls back to the operating-system file explorer when the main FrameVision
+    helper is not available (for standalone tool runs).
+    """
+    try:
+        from pathlib import Path as _Path
+        _folder = _Path(folder).expanduser()
+        try:
+            _folder.mkdir(parents=True, exist_ok=True)
+        except Exception:
+            pass
+        _folder_s = str(_folder)
+    except Exception:
+        return False
+
+    def _try_main(_mw) -> bool:
+        try:
+            if _mw is not None and hasattr(_mw, "open_media_explorer_folder"):
+                try:
+                    _mw.open_media_explorer_folder(_folder_s, preset=preset, include_subfolders=False)
+                    return True
+                except TypeError:
+                    kwargs = {"include_subfolders": False}
+                    if preset == "images":
+                        kwargs.update({"want_images": True, "want_videos": False, "want_audio": False})
+                    elif preset == "videos":
+                        kwargs.update({"want_images": False, "want_videos": True, "want_audio": False})
+                    elif preset == "audio":
+                        kwargs.update({"want_images": False, "want_videos": False, "want_audio": True})
+                    _mw.open_media_explorer_folder(_folder_s, **kwargs)
+                    return True
+        except Exception:
+            pass
+        return False
+
+    try:
+        _w = widget
+        while _w is not None:
+            if _try_main(_w):
+                return True
+            try:
+                _w = _w.parent()
+            except Exception:
+                break
+    except Exception:
+        pass
+
+    try:
+        from PySide6.QtWidgets import QApplication as _QApplication
+        _app = _QApplication.instance()
+        if _app is not None:
+            for _w in _app.topLevelWidgets():
+                if _try_main(_w):
+                    return True
+    except Exception:
+        pass
+
+    try:
+        from PySide6.QtGui import QDesktopServices as _QDesktopServices
+        from PySide6.QtCore import QUrl as _QUrl
+        _QDesktopServices.openUrl(_QUrl.fromLocalFile(_folder_s))
+        return True
+    except Exception:
+        pass
+
+    try:
+        import os as _os, sys as _sys, subprocess as _subprocess
+        if _os.name == "nt":
+            _os.startfile(_folder_s)  # type: ignore[attr-defined]
+        elif _sys.platform == "darwin":
+            _subprocess.Popen(["open", _folder_s])
+        else:
+            _subprocess.Popen(["xdg-open", _folder_s])
+        return True
+    except Exception:
+        return False
+# ---------------------------------------------------------------------------
+
 import argparse
 import gc
 import json
@@ -436,7 +518,7 @@ def run_ui() -> int:
 
             self.generate_btn = QPushButton("Generate test image")
             self.download_btn = QPushButton("Download / repair model")
-            self.open_btn = QPushButton("Open output folder")
+            self.open_btn = QPushButton("View results")
 
             form = QFormLayout()
             form.addRow("Width", self.width)
@@ -468,7 +550,7 @@ def run_ui() -> int:
 
             self.generate_btn.clicked.connect(self.generate)
             self.download_btn.clicked.connect(self.download)
-            self.open_btn.clicked.connect(self.open_output_folder)
+            self.open_btn.clicked.connect(self.view_results)
 
         def status_text(self) -> str:
             py = env_python()
@@ -551,6 +633,9 @@ def run_ui() -> int:
             self.status.setText(self.status_text())
             self.append_log("ERROR: " + msg)
             QMessageBox.critical(self, "Chroma failed", msg)
+
+        def view_results(self) -> None:
+            _fv_open_results_in_media_explorer(self, output_dir(), preset="images")
 
         def open_output_folder(self) -> None:
             out = output_dir()
@@ -676,7 +761,7 @@ try:
 
             self.generate_btn = _QPushButton("Generate Chroma image")
             self.download_btn = _QPushButton("Download / repair model")
-            self.open_btn = _QPushButton("Open output folder")
+            self.open_btn = _QPushButton("View results")
 
             # Tooltips for the controls that remain visible while queue mode is enabled.
             self.prompt.setToolTip("Describe the image Chroma should create. This prompt is saved with the queued job.")
@@ -691,7 +776,7 @@ try:
             self.use_queue.setToolTip("When enabled, Chroma jobs are sent to the main FrameVision queue and preview/logs are hidden here.")
             self.generate_btn.setToolTip("Generate now, or add the current Chroma settings to the FrameVision queue when Use FrameVision queue is enabled.")
             self.download_btn.setToolTip("Download or repair the Chroma model files using the isolated image-model environment.")
-            self.open_btn.setToolTip("Open the Chroma output folder.")
+            self.open_btn.setToolTip("Open the Chroma output folder in FrameVision Media Explorer.")
             self.output_path.setToolTip("Shows the latest direct output path, or the queued job file when using the queue.")
             self.status.setToolTip("Shows whether the Chroma environment and model files are detected.")
 
@@ -751,7 +836,7 @@ try:
 
             self.generate_btn.clicked.connect(self.generate)
             self.download_btn.clicked.connect(self.download)
-            self.open_btn.clicked.connect(self.open_output_folder)
+            self.open_btn.clicked.connect(self.view_results)
             self.use_queue.toggled.connect(self._queue_mode_changed)
             self._queue_mode_changed(self.use_queue.isChecked())
 
@@ -863,6 +948,9 @@ try:
             self.status.setText(self.status_text())
             self.append_log("ERROR: " + msg)
             _QMessageBox.critical(self, "Chroma failed", msg)
+
+        def view_results(self) -> None:
+            _fv_open_results_in_media_explorer(self, output_dir(), preset="images")
 
         def open_output_folder(self) -> None:
             out = output_dir()

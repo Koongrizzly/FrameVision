@@ -16,6 +16,88 @@ Windows venv default:
 
 from __future__ import annotations
 
+
+# --- FrameVision media-explorer results opener ------------------------------
+def _fv_open_results_in_media_explorer(widget, folder, preset="images") -> bool:
+    """Open/scan a results folder in FrameVision Media Explorer when embedded.
+
+    Falls back to the operating-system file explorer when the main FrameVision
+    helper is not available (for standalone tool runs).
+    """
+    try:
+        from pathlib import Path as _Path
+        _folder = _Path(folder).expanduser()
+        try:
+            _folder.mkdir(parents=True, exist_ok=True)
+        except Exception:
+            pass
+        _folder_s = str(_folder)
+    except Exception:
+        return False
+
+    def _try_main(_mw) -> bool:
+        try:
+            if _mw is not None and hasattr(_mw, "open_media_explorer_folder"):
+                try:
+                    _mw.open_media_explorer_folder(_folder_s, preset=preset, include_subfolders=False)
+                    return True
+                except TypeError:
+                    kwargs = {"include_subfolders": False}
+                    if preset == "images":
+                        kwargs.update({"want_images": True, "want_videos": False, "want_audio": False})
+                    elif preset == "videos":
+                        kwargs.update({"want_images": False, "want_videos": True, "want_audio": False})
+                    elif preset == "audio":
+                        kwargs.update({"want_images": False, "want_videos": False, "want_audio": True})
+                    _mw.open_media_explorer_folder(_folder_s, **kwargs)
+                    return True
+        except Exception:
+            pass
+        return False
+
+    try:
+        _w = widget
+        while _w is not None:
+            if _try_main(_w):
+                return True
+            try:
+                _w = _w.parent()
+            except Exception:
+                break
+    except Exception:
+        pass
+
+    try:
+        from PySide6.QtWidgets import QApplication as _QApplication
+        _app = _QApplication.instance()
+        if _app is not None:
+            for _w in _app.topLevelWidgets():
+                if _try_main(_w):
+                    return True
+    except Exception:
+        pass
+
+    try:
+        from PySide6.QtGui import QDesktopServices as _QDesktopServices
+        from PySide6.QtCore import QUrl as _QUrl
+        _QDesktopServices.openUrl(_QUrl.fromLocalFile(_folder_s))
+        return True
+    except Exception:
+        pass
+
+    try:
+        import os as _os, sys as _sys, subprocess as _subprocess
+        if _os.name == "nt":
+            _os.startfile(_folder_s)  # type: ignore[attr-defined]
+        elif _sys.platform == "darwin":
+            _subprocess.Popen(["open", _folder_s])
+        else:
+            _subprocess.Popen(["xdg-open", _folder_s])
+        return True
+    except Exception:
+        return False
+# ---------------------------------------------------------------------------
+
 import os
 import sys
 import time
@@ -1659,6 +1741,9 @@ class MainWindow(QtWidgets.QMainWindow):
         self.btn_stop = QtWidgets.QPushButton("Stop")
         self.btn_stop.setEnabled(False)
         self.btn_stop.clicked.connect(self._stop)
+        self.btn_view_results = QtWidgets.QPushButton("View results")
+        self.btn_view_results.setToolTip("Open the Ace Step output folder in FrameVision Media Explorer.")
+        self.btn_view_results.clicked.connect(self._view_results)
 
         page_l.addWidget(gb_simple, 0)
 
@@ -1680,7 +1765,7 @@ class MainWindow(QtWidgets.QMainWindow):
         footer.setSpacing(10)
 
         # Match the user's request: +3px font size for these buttons.
-        for b in (self.btn_presets, self.btn_save, self.btn_queue, self.btn_stop):
+        for b in (self.btn_presets, self.btn_save, self.btn_queue, self.btn_stop, self.btn_view_results):
             _bump_font_px(b, 3)
             b.setSizePolicy(QtWidgets.QSizePolicy.Preferred, QtWidgets.QSizePolicy.Fixed)
             # Let buttons grow if the font makes them taller.
@@ -1697,6 +1782,7 @@ class MainWindow(QtWidgets.QMainWindow):
 
         footer.addStretch(1)
         footer.addWidget(self.btn_queue)
+        footer.addWidget(self.btn_view_results)
         footer.addWidget(self.btn_presets)
         footer.addWidget(self.btn_save)
         footer.addWidget(self.btn_stop)
@@ -4142,6 +4228,10 @@ class MainWindow(QtWidgets.QMainWindow):
             it = QtWidgets.QListWidgetItem(f"{p.name}  —  {time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(p.stat().st_mtime))}")
             it.setData(QtCore.Qt.UserRole, str(p))
             self.lst_outputs.addItem(it)
+
+    def _view_results(self):
+        out_dir = Path(self.ed_outdir.text().strip())
+        _fv_open_results_in_media_explorer(self, out_dir, preset="audio")
 
     def _open_output_folder(self):
         out_dir = Path(self.ed_outdir.text().strip())

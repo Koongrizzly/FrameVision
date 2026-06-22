@@ -1,5 +1,87 @@
 from __future__ import annotations
 
+
+# --- FrameVision media-explorer results opener ------------------------------
+def _fv_open_results_in_media_explorer(widget, folder, preset="images") -> bool:
+    """Open/scan a results folder in FrameVision Media Explorer when embedded.
+
+    Falls back to the operating-system file explorer when the main FrameVision
+    helper is not available (for standalone tool runs).
+    """
+    try:
+        from pathlib import Path as _Path
+        _folder = _Path(folder).expanduser()
+        try:
+            _folder.mkdir(parents=True, exist_ok=True)
+        except Exception:
+            pass
+        _folder_s = str(_folder)
+    except Exception:
+        return False
+
+    def _try_main(_mw) -> bool:
+        try:
+            if _mw is not None and hasattr(_mw, "open_media_explorer_folder"):
+                try:
+                    _mw.open_media_explorer_folder(_folder_s, preset=preset, include_subfolders=False)
+                    return True
+                except TypeError:
+                    kwargs = {"include_subfolders": False}
+                    if preset == "images":
+                        kwargs.update({"want_images": True, "want_videos": False, "want_audio": False})
+                    elif preset == "videos":
+                        kwargs.update({"want_images": False, "want_videos": True, "want_audio": False})
+                    elif preset == "audio":
+                        kwargs.update({"want_images": False, "want_videos": False, "want_audio": True})
+                    _mw.open_media_explorer_folder(_folder_s, **kwargs)
+                    return True
+        except Exception:
+            pass
+        return False
+
+    try:
+        _w = widget
+        while _w is not None:
+            if _try_main(_w):
+                return True
+            try:
+                _w = _w.parent()
+            except Exception:
+                break
+    except Exception:
+        pass
+
+    try:
+        from PySide6.QtWidgets import QApplication as _QApplication
+        _app = _QApplication.instance()
+        if _app is not None:
+            for _w in _app.topLevelWidgets():
+                if _try_main(_w):
+                    return True
+    except Exception:
+        pass
+
+    try:
+        from PySide6.QtGui import QDesktopServices as _QDesktopServices
+        from PySide6.QtCore import QUrl as _QUrl
+        _QDesktopServices.openUrl(_QUrl.fromLocalFile(_folder_s))
+        return True
+    except Exception:
+        pass
+
+    try:
+        import os as _os, sys as _sys, subprocess as _subprocess
+        if _os.name == "nt":
+            _os.startfile(_folder_s)  # type: ignore[attr-defined]
+        elif _sys.platform == "darwin":
+            _subprocess.Popen(["open", _folder_s])
+        else:
+            _subprocess.Popen(["xdg-open", _folder_s])
+        return True
+    except Exception:
+        return False
+# ---------------------------------------------------------------------------
+
 import argparse
 import gc
 import inspect
@@ -2231,7 +2313,7 @@ if _FVQtWidgets is not None:
             self.add_queue_btn = _FVQtWidgets.QPushButton("Add to Ideogram queue")
             self.framevision_queue_btn = _FVQtWidgets.QPushButton("Add to queue")
             self.framevision_queue_btn.setVisible(False)
-            self.open_output_btn = _FVQtWidgets.QPushButton("Open output folder")
+            self.open_output_btn = _FVQtWidgets.QPushButton("View results")
             self.open_last_btn = _FVQtWidgets.QPushButton("Open last image")
             btns.addWidget(self.generate_btn, 2)
             btns.addWidget(self.add_queue_btn, 2)
@@ -2389,7 +2471,7 @@ if _FVQtWidgets is not None:
             self.queue_start_btn = _FVQtWidgets.QPushButton("Start queue")
             self.queue_stop_after_btn = _FVQtWidgets.QPushButton("Stop after current")
             self.queue_clear_done_btn = _FVQtWidgets.QPushButton("Clear done/failed")
-            self.queue_open_output_btn = _FVQtWidgets.QPushButton("Open output folder")
+            self.queue_open_output_btn = _FVQtWidgets.QPushButton("View results")
             btns.addWidget(self.queue_add_btn)
             btns.addWidget(self.queue_start_btn)
             btns.addWidget(self.queue_stop_after_btn)
@@ -2783,8 +2865,8 @@ if _FVQtWidgets is not None:
             self.queue_start_btn.clicked.connect(self.start_queue)
             self.queue_stop_after_btn.clicked.connect(self.stop_queue_after_current)
             self.queue_clear_done_btn.clicked.connect(self.clear_finished_queue_jobs)
-            self.queue_open_output_btn.clicked.connect(self.open_output_folder)
-            self.open_output_btn.clicked.connect(self.open_output_folder)
+            self.queue_open_output_btn.clicked.connect(self.view_results)
+            self.open_output_btn.clicked.connect(self.view_results)
             self.open_last_btn.clicked.connect(self.open_last_image)
             self.btn_browse_gguf.clicked.connect(lambda: self._browse_dir(self.gguf_dir, refresh=True))
             self.btn_browse_output.clicked.connect(lambda: self._browse_dir(self.output_dir, refresh=False))
@@ -3442,6 +3524,10 @@ if _FVQtWidgets is not None:
             if self._last_output:
                 self._load_preview(self._last_output)
 
+        def view_results(self) -> None:
+            path = Path(self.output_dir.text().strip() or str(default_output_dir()))
+            _fv_open_results_in_media_explorer(self, path, preset="images")
+
         def open_output_folder(self) -> None:
             path = Path(self.output_dir.text().strip() or str(default_output_dir()))
             path.mkdir(parents=True, exist_ok=True)
@@ -3841,7 +3927,7 @@ def launch_gui() -> int:
                 actions.columnconfigure(col, weight=1)
             self.generate_btn = ttk.Button(actions, text="Generate", command=self._start_generate)
             self.generate_btn.grid(row=0, column=0, sticky="ew", padx=(0, 6))
-            self.open_output_btn = ttk.Button(actions, text="Open output folder", command=self._open_output_folder)
+            self.open_output_btn = ttk.Button(actions, text="View results", command=self._open_output_folder)
             self.open_output_btn.grid(row=0, column=1, sticky="ew", padx=(0, 6))
             self.open_logs_btn = ttk.Button(actions, text="Open logs folder", command=self._open_logs_folder)
             self.open_logs_btn.grid(row=0, column=2, sticky="ew", padx=(0, 6))
