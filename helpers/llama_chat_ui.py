@@ -308,6 +308,153 @@ def _templates_root(fv_root: str) -> str:
     return cand2
 
 
+# -----------------------------
+# Local Knowledge & Memory helpers
+# -----------------------------
+
+def _knowledge_root(fv_root: str) -> str:
+    # App-managed FrameVision knowledge. The chat may read/search this folder, but should not write memories here.
+    return os.path.join(fv_root, "presets", "info")
+
+
+def _memories_root(fv_root: str) -> str:
+    # User-managed local memory root. This is intentionally outside presets/info so updates do not overwrite it.
+    return os.path.join(fv_root, "assets", "memories")
+
+
+def _memory_saved_notes_dir(fv_root: str) -> str:
+    return os.path.join(_memories_root(fv_root), "saved_notes")
+
+
+def _memory_user_files_dir(fv_root: str) -> str:
+    return os.path.join(_memories_root(fv_root), "user_files")
+
+
+def _memory_project_dir(fv_root: str) -> str:
+    return os.path.join(_memories_root(fv_root), "project")
+
+
+def _memory_llm_memory_dir(fv_root: str) -> str:
+    return os.path.join(_memories_root(fv_root), "llm_memory")
+
+
+def _ensure_memory_folders(fv_root: str) -> None:
+    for d in (
+        _memory_saved_notes_dir(fv_root),
+        _memory_user_files_dir(fv_root),
+        _memory_project_dir(fv_root),
+        _memory_llm_memory_dir(fv_root),
+    ):
+        try:
+            os.makedirs(d, exist_ok=True)
+        except Exception:
+            pass
+
+
+def _safe_memory_filename(title: str, fallback: str = "memory") -> str:
+    text = unicodedata.normalize("NFKD", str(title or fallback)).encode("ascii", "ignore").decode("ascii", "ignore")
+    text = re.sub(r"[^A-Za-z0-9._ -]+", "_", text).strip(" ._-")
+    text = re.sub(r"\s+", "_", text)
+    return (text[:72] or fallback).strip("._-") or fallback
+
+
+def _memory_now_stamp() -> str:
+    return datetime.now().strftime("%Y%m%d_%H%M%S")
+
+
+def _iter_memory_files(root: str) -> List[str]:
+    out: List[str] = []
+    if not root or not os.path.isdir(root):
+        return out
+    allowed = {".txt", ".md", ".json", ".html", ".htm", ".py", ".log", ".csv", ".pdf"}
+    for base, dirs, files in os.walk(root):
+        dirs[:] = [d for d in dirs if not d.startswith(".") and d.lower() not in {"__pycache__", "index"}]
+        for name in files:
+            if name.startswith("."):
+                continue
+            ext = os.path.splitext(name)[1].lower()
+            if ext in allowed:
+                out.append(os.path.join(base, name))
+    out.sort(key=lambda x: (os.path.getmtime(x) if os.path.exists(x) else 0), reverse=True)
+    return out
+
+
+def _read_pdf_text_best_effort(path: str, max_chars: int = 120000) -> str:
+    try:
+        import pypdf  # type: ignore
+        reader = pypdf.PdfReader(path)
+        parts = []
+        for page in reader.pages[:60]:
+            try:
+                parts.append(page.extract_text() or "")
+            except Exception:
+                pass
+            if sum(len(x) for x in parts) >= max_chars:
+                break
+        return "\n".join(parts).strip()[:max_chars]
+    except Exception:
+        pass
+    try:
+        import PyPDF2  # type: ignore
+        reader = PyPDF2.PdfReader(path)
+        parts = []
+        for page in reader.pages[:60]:
+            try:
+                parts.append(page.extract_text() or "")
+            except Exception:
+                pass
+            if sum(len(x) for x in parts) >= max_chars:
+                break
+        return "\n".join(parts).strip()[:max_chars]
+    except Exception:
+        return ""
+
+
+def _read_memory_text_file(path: str, max_chars: int = 120000) -> str:
+    ext = os.path.splitext(path)[1].lower()
+    if ext == ".pdf":
+        text = _read_pdf_text_best_effort(path, max_chars=max_chars)
+        return text or "[PDF has no readable text or PDF reader is unavailable.]"
+    try:
+        with open(path, "r", encoding="utf-8", errors="replace") as f:
+            return f.read(max_chars)
+    except Exception as e:
+        return f"[Could not read file: {e}]"
+
+
+def _chunk_memory_text(text: str, chunk_chars: int = 2200) -> List[str]:
+    text = re.sub(r"\r\n?", "\n", str(text or "")).strip()
+    if not text:
+        return []
+    chunks: List[str] = []
+    paras = re.split(r"\n\s*\n", text)
+    buf = ""
+    for para in paras:
+        para = para.strip()
+        if not para:
+            continue
+        if len(buf) + len(para) + 2 <= chunk_chars:
+            buf = (buf + "\n\n" + para).strip()
+            continue
+        if buf:
+            chunks.append(buf)
+            buf = ""
+        if len(para) <= chunk_chars:
+            buf = para
+        else:
+            for i in range(0, len(para), chunk_chars):
+                piece = para[i:i + chunk_chars].strip()
+                if piece:
+                    chunks.append(piece)
+    if buf:
+        chunks.append(buf)
+    return chunks
+
+
+def _keyword_tokens(text: str) -> List[str]:
+    return [t for t in re.findall(r"[a-zA-Z0-9_\-]{2,}", str(text or "").lower()) if t not in {"the", "and", "for", "with", "that", "this", "from", "what", "about", "into", "your", "you", "are", "was", "were", "can", "could", "would", "should"}]
+
+
 def _load_json(path: str, default):
     try:
         if os.path.isfile(path):
@@ -1418,10 +1565,25 @@ class ChatMediaPlayerWidget(QtWidgets.QFrame):
             pass
 
 class MessageBubble(QtWidgets.QFrame):
-    def __init__(self, role: str, text: str, thinking: str = "", attachments: Optional[List[Dict]] = None, loading: bool = False, parent=None):
+    editRequested = QtCore.Signal(str)
+    editSaved = QtCore.Signal(str, str)
+    retryRequested = QtCore.Signal(str)
+    saveToMemoryRequested = QtCore.Signal(str)
+    saveToProjectRequested = QtCore.Signal(str)
+    versionPrevRequested = QtCore.Signal(str)
+    versionNextRequested = QtCore.Signal(str)
+
+    def __init__(self, role: str, text: str, thinking: str = "", attachments: Optional[List[Dict]] = None, loading: bool = False, parent=None, message_id: str = ""):
         super().__init__(parent)
         self.role = role
+        self.message_id = str(message_id or "")
         self._attachments: List[Dict[str, Any]] = list(attachments or [])
+        self._edit_box: Optional[QtWidgets.QPlainTextEdit] = None
+        self._edit_controls: Optional[QtWidgets.QWidget] = None
+        self._version_frame: Optional[QtWidgets.QWidget] = None
+        self._version_label: Optional[QtWidgets.QLabel] = None
+        self._version_prev_btn: Optional[QtWidgets.QToolButton] = None
+        self._version_next_btn: Optional[QtWidgets.QToolButton] = None
 
         outer = QtWidgets.QHBoxLayout(self)
         outer.setContentsMargins(0, 4, 0, 4)
@@ -1453,6 +1615,15 @@ class MessageBubble(QtWidgets.QFrame):
             self.text_lbl.setObjectName("InfoText")
         self.text_lbl.setWordWrap(True)
         self.text_lbl.setTextInteractionFlags(QtCore.Qt.TextSelectableByMouse)
+        try:
+            self.setContextMenuPolicy(QtCore.Qt.CustomContextMenu)
+            self.bubble.setContextMenuPolicy(QtCore.Qt.CustomContextMenu)
+            self.text_lbl.setContextMenuPolicy(QtCore.Qt.CustomContextMenu)
+            self.customContextMenuRequested.connect(lambda pos: self._show_message_menu(pos))
+            self.bubble.customContextMenuRequested.connect(lambda pos: self._show_message_menu(pos))
+            self.text_lbl.customContextMenuRequested.connect(lambda pos: self._show_message_menu(pos))
+        except Exception:
+            pass
 
         self._rebuild_attachments(self._attachments)
 
@@ -1601,6 +1772,126 @@ class MessageBubble(QtWidgets.QFrame):
         except Exception:
             pass
 
+    def _show_message_menu(self, pos: QtCore.QPoint):
+        menu = QtWidgets.QMenu(self)
+        if self.role == "user":
+            act_edit = menu.addAction("Edit")
+        else:
+            act_edit = None
+        if self.role == "assistant":
+            act_retry = menu.addAction("Retry")
+        else:
+            act_retry = None
+        if self.role in ("user", "assistant"):
+            menu.addSeparator()
+            act_save_memory = menu.addAction("Save to memory")
+            act_save_project = menu.addAction("Save to project")
+            menu.addSeparator()
+        else:
+            act_save_memory = None
+            act_save_project = None
+        act_copy = menu.addAction("Copy")
+        action = menu.exec(QtGui.QCursor.pos())
+        if action is None:
+            return
+        if act_edit is not None and action == act_edit:
+            self.start_edit()
+            self.editRequested.emit(self.message_id)
+            return
+        if act_retry is not None and action == act_retry:
+            self.retryRequested.emit(self.message_id)
+            return
+        if act_save_memory is not None and action == act_save_memory:
+            self.saveToMemoryRequested.emit(self.message_id)
+            return
+        if act_save_project is not None and action == act_save_project:
+            self.saveToProjectRequested.emit(self.message_id)
+            return
+        if action == act_copy:
+            try:
+                QtWidgets.QApplication.clipboard().setText(self.text_lbl.text())
+            except Exception:
+                pass
+
+    def start_edit(self):
+        if self.role != "user" or self._edit_box is not None:
+            return
+        self.text_lbl.setVisible(False)
+        self._edit_box = QtWidgets.QPlainTextEdit(self.text_lbl.text())
+        self._edit_box.setObjectName("MessageEditBox")
+        self._edit_box.setMinimumHeight(90)
+        self._edit_box.setSizePolicy(QtWidgets.QSizePolicy.Expanding, QtWidgets.QSizePolicy.MinimumExpanding)
+        idx = self.bubble_lay.indexOf(self.text_lbl)
+        self.bubble_lay.insertWidget(max(0, idx), self._edit_box)
+
+        self._edit_controls = QtWidgets.QWidget()
+        row = QtWidgets.QHBoxLayout(self._edit_controls)
+        row.setContentsMargins(0, 0, 0, 0)
+        row.addStretch(1)
+        btn_save = QtWidgets.QPushButton("Save")
+        btn_cancel = QtWidgets.QPushButton("Cancel")
+        btn_save.setObjectName("SmallActionButton")
+        btn_cancel.setObjectName("SmallActionButton")
+        row.addWidget(btn_save)
+        row.addWidget(btn_cancel)
+        self.bubble_lay.insertWidget(max(0, idx + 1), self._edit_controls)
+        btn_save.clicked.connect(self._finish_edit_save)
+        btn_cancel.clicked.connect(self.cancel_edit)
+        self._edit_box.setFocus()
+
+    def _finish_edit_save(self):
+        if self._edit_box is None:
+            return
+        new_text = self._edit_box.toPlainText()
+        self.cancel_edit(keep_text=True)
+        self.editSaved.emit(self.message_id, new_text)
+
+    def cancel_edit(self, keep_text: bool = False):
+        if self._edit_box is not None:
+            self._edit_box.deleteLater()
+            self._edit_box = None
+        if self._edit_controls is not None:
+            self._edit_controls.deleteLater()
+            self._edit_controls = None
+        self.text_lbl.setVisible(True)
+
+    def set_version_controls(self, label: str = "", can_prev: bool = False, can_next: bool = False):
+        label = str(label or "").strip()
+        if not label:
+            if self._version_frame is not None:
+                self._version_frame.deleteLater()
+                self._version_frame = None
+            self._version_label = None
+            self._version_prev_btn = None
+            self._version_next_btn = None
+            return
+        if self._version_frame is None:
+            self._version_frame = QtWidgets.QWidget()
+            lay = QtWidgets.QHBoxLayout(self._version_frame)
+            lay.setContentsMargins(0, 0, 0, 0)
+            lay.setSpacing(6)
+            lay.addStretch(1)
+            self._version_prev_btn = QtWidgets.QToolButton()
+            self._version_prev_btn.setText("‹")
+            self._version_prev_btn.setObjectName("VersionButton")
+            self._version_label = QtWidgets.QLabel("")
+            self._version_label.setObjectName("VersionLabel")
+            self._version_next_btn = QtWidgets.QToolButton()
+            self._version_next_btn.setText("›")
+            self._version_next_btn.setObjectName("VersionButton")
+            lay.addWidget(self._version_prev_btn)
+            lay.addWidget(self._version_label)
+            lay.addWidget(self._version_next_btn)
+            self.bubble_lay.addWidget(self._version_frame)
+            self._version_prev_btn.clicked.connect(lambda: self.versionPrevRequested.emit(self.message_id))
+            self._version_next_btn.clicked.connect(lambda: self.versionNextRequested.emit(self.message_id))
+        if self._version_label is not None:
+            self._version_label.setText(label)
+        if self._version_prev_btn is not None:
+            self._version_prev_btn.setEnabled(bool(can_prev))
+        if self._version_next_btn is not None:
+            self._version_next_btn.setEnabled(bool(can_next))
+
     def update_message(self, text: Optional[str] = None, thinking: Optional[str] = None, attachments: Optional[List[Dict]] = None, loading: Optional[bool] = None):
         if text is not None:
             self.text_lbl.setText(text or "")
@@ -1619,6 +1910,14 @@ class MessageBubble(QtWidgets.QFrame):
 
 
 class ChatScrollArea(QtWidgets.QScrollArea):
+    editMessageRequested = QtCore.Signal(str)
+    editMessageSaved = QtCore.Signal(str, str)
+    retryMessageRequested = QtCore.Signal(str)
+    saveToMemoryRequested = QtCore.Signal(str)
+    saveToProjectRequested = QtCore.Signal(str)
+    versionPrevRequested = QtCore.Signal(str)
+    versionNextRequested = QtCore.Signal(str)
+
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setWidgetResizable(True)
@@ -1641,7 +1940,14 @@ class ChatScrollArea(QtWidgets.QScrollArea):
 
     def add_message(self, role: str, text: str, thinking: str = "", attachments: Optional[List[Dict]] = None, message_id: Optional[str] = None, loading: bool = False):
         mid = str(message_id or uuid.uuid4())
-        bubble = MessageBubble(role, text, thinking, attachments, loading)
+        bubble = MessageBubble(role, text, thinking, attachments, loading, message_id=mid)
+        bubble.editRequested.connect(self.editMessageRequested.emit)
+        bubble.editSaved.connect(self.editMessageSaved.emit)
+        bubble.retryRequested.connect(self.retryMessageRequested.emit)
+        bubble.saveToMemoryRequested.connect(self.saveToMemoryRequested.emit)
+        bubble.saveToProjectRequested.connect(self.saveToProjectRequested.emit)
+        bubble.versionPrevRequested.connect(self.versionPrevRequested.emit)
+        bubble.versionNextRequested.connect(self.versionNextRequested.emit)
         self.vbox.insertWidget(self.vbox.count() - 1, bubble)
         self._message_widgets[mid] = bubble
         self.scroll_to_bottom(force=True)
@@ -1650,12 +1956,67 @@ class ChatScrollArea(QtWidgets.QScrollArea):
         QtCore.QTimer.singleShot(120, lambda: self.scroll_to_bottom(force=True))
         return mid, bubble
 
+    def add_memory_choice(self, title: str, detail: str, on_this_chat, on_saved_memories):
+        frame = QtWidgets.QFrame()
+        frame.setObjectName("MemoryChoiceFrame")
+        lay = QtWidgets.QVBoxLayout(frame)
+        lay.setContentsMargins(14, 10, 14, 10)
+        lay.setSpacing(8)
+        lbl = QtWidgets.QLabel(str(title or "Memory question"))
+        lbl.setObjectName("BubbleRole")
+        lbl.setWordWrap(True)
+        lay.addWidget(lbl)
+        info = QtWidgets.QLabel(str(detail or "Choose where the answer should come from."))
+        info.setObjectName("InfoText")
+        info.setWordWrap(True)
+        lay.addWidget(info)
+        row = QtWidgets.QHBoxLayout()
+        row.addStretch(1)
+        btn_chat = QtWidgets.QPushButton("This chat")
+        btn_saved = QtWidgets.QPushButton("Saved memories")
+        btn_chat.setObjectName("SmallActionButton")
+        btn_saved.setObjectName("SmallActionButton")
+        row.addWidget(btn_chat)
+        row.addWidget(btn_saved)
+        lay.addLayout(row)
+
+        def _lock(text: str):
+            try:
+                btn_chat.setEnabled(False)
+                btn_saved.setEnabled(False)
+                info.setText(text)
+            except Exception:
+                pass
+
+        def _chat_clicked():
+            _lock("Using this chat only…")
+            if callable(on_this_chat):
+                on_this_chat()
+
+        def _saved_clicked():
+            _lock("Using saved memories…")
+            if callable(on_saved_memories):
+                on_saved_memories()
+
+        btn_chat.clicked.connect(_chat_clicked)
+        btn_saved.clicked.connect(_saved_clicked)
+        self.vbox.insertWidget(self.vbox.count() - 1, frame)
+        self.scroll_to_bottom(force=True)
+        return frame
+
     def update_message(self, message_id: str, text: Optional[str] = None, thinking: Optional[str] = None, attachments: Optional[List[Dict]] = None, loading: Optional[bool] = None):
         bubble = self._message_widgets.get(str(message_id or ""))
         if bubble is None:
             return False
         bubble.update_message(text=text, thinking=thinking, attachments=attachments, loading=loading)
         self.scroll_to_bottom(force=True)
+        return True
+
+    def set_version_controls(self, message_id: str, label: str = "", can_prev: bool = False, can_next: bool = False):
+        bubble = self._message_widgets.get(str(message_id or ""))
+        if bubble is None:
+            return False
+        bubble.set_version_controls(label, can_prev, can_next)
         return True
 
     def scroll_to_bottom(self, force: bool = False):
@@ -2035,6 +2396,35 @@ class SettingsDialog(QtWidgets.QDialog):
         result_lay.addWidget(self.chk_results_chat_only)
         lay.addWidget(result_box)
 
+        self.chk_memory_enabled = QtWidgets.QCheckBox("Use Knowledge & Memory")
+        self.chk_memory_enabled.setChecked(True)
+        self.chk_memory_enabled.setToolTip("Allow the chat to search /presets/info and /assets/memories when your message asks for saved knowledge, memories, notes, projects, or user files.")
+        self.chk_memory_sources = QtWidgets.QCheckBox("Show memory sources in replies")
+        self.chk_memory_sources.setChecked(True)
+        self.chk_memory_sources.setToolTip("Add a short source list when memory or knowledge files were injected into the prompt.")
+        memory_box = QtWidgets.QGroupBox("Knowledge & Memory")
+        memory_lay = QtWidgets.QGridLayout(memory_box)
+        memory_lay.setContentsMargins(10, 8, 10, 8)
+        memory_lay.setHorizontalSpacing(8)
+        memory_lay.setVerticalSpacing(8)
+        memory_lay.addWidget(self.chk_memory_enabled, 0, 0, 1, 2)
+        memory_lay.addWidget(self.chk_memory_sources, 1, 0, 1, 2)
+        self.btn_open_info_folder = QtWidgets.QPushButton("Open Knowledge")
+        self.btn_open_memory_folder = QtWidgets.QPushButton("Open Memories")
+        self.btn_open_user_files_folder = QtWidgets.QPushButton("Open User Files")
+        self.btn_open_project_folder = QtWidgets.QPushButton("Open Project")
+        self.btn_open_llm_memory_folder = QtWidgets.QPushButton("Open LLM Memory")
+        memory_lay.addWidget(self.btn_open_info_folder, 2, 0)
+        memory_lay.addWidget(self.btn_open_memory_folder, 2, 1)
+        memory_lay.addWidget(self.btn_open_user_files_folder, 3, 0)
+        memory_lay.addWidget(self.btn_open_project_folder, 3, 1)
+        memory_lay.addWidget(self.btn_open_llm_memory_folder, 4, 0, 1, 2)
+        memory_hint = QtWidgets.QLabel("Reads /presets/info and /assets/memories. Saves only to /assets/memories/saved_notes or /assets/memories/project. LLM Memory is loaded into chat context at startup.")
+        memory_hint.setWordWrap(True)
+        memory_hint.setObjectName("SubtleLabel")
+        memory_lay.addWidget(memory_hint, 5, 0, 1, 2)
+        lay.addWidget(memory_box)
+
         hint = QtWidgets.QLabel(
             "Good defaults: Coding = 65k ctx / 4k-8k answer. Planner storymode = 65k ctx / 12k-16k answer."
         )
@@ -2059,6 +2449,13 @@ class SettingsDialog(QtWidgets.QDialog):
         self.chk_bubble_auto.toggled.connect(self._update_bubble_color_mode)
         self.chk_bubble_auto.toggled.connect(lambda *_: self.settingsChanged.emit())
         self.chk_results_chat_only.toggled.connect(lambda *_: self.settingsChanged.emit())
+        self.chk_memory_enabled.toggled.connect(lambda *_: self.settingsChanged.emit())
+        self.chk_memory_sources.toggled.connect(lambda *_: self.settingsChanged.emit())
+        self.btn_open_info_folder.clicked.connect(lambda: _open_local_path(_knowledge_root(self.fv_root)))
+        self.btn_open_memory_folder.clicked.connect(lambda: _open_local_path(_memories_root(self.fv_root)))
+        self.btn_open_user_files_folder.clicked.connect(lambda: _open_local_path(_memory_user_files_dir(self.fv_root)))
+        self.btn_open_project_folder.clicked.connect(lambda: _open_local_path(_memory_project_dir(self.fv_root)))
+        self.btn_open_llm_memory_folder.clicked.connect(lambda: _open_local_path(_memory_llm_memory_dir(self.fv_root)))
         self.btn_bubble_auto_color.colorChanged.connect(lambda *_: self.settingsChanged.emit())
         self.btn_bubble_assistant_color.colorChanged.connect(lambda *_: self.settingsChanged.emit())
         self.btn_bubble_user_color.colorChanged.connect(lambda *_: self.settingsChanged.emit())
@@ -2147,6 +2544,18 @@ class SettingsDialog(QtWidgets.QDialog):
                 p { margin: 4px 0 10px 0; }
                 ul { margin-top: 4px; }
             </style>
+
+            <h3>Chat Memory</h3>
+            <p>User can save to memory or save to projects (both with right mouse click or directly typing in the chat (save to memory, save to project </p>
+            <p>User can put files in assets/memories/user_files for specific memory tasks.</p>
+            <p>Give your llm extra powers, a name, a template (you are an expert in..)... by adding something in assets/memories/llm_memory -> it will be loaded everytime the model is loaded</p>
+            <p>Chat also has access to the framevision knowledge base to be able to answer questions about the app.</p>
+            
+            <h3>Chat Wizards</h3>
+            <ul>
+            <p>cancel</b>: Stops the current wizard and returns to normal chat.</p>
+            <p>undo</b>: Goes back one step in the current wizard</p>
+
             <h3>Create image</h3>
             <p>The chat checks for available image models and lets you select a model to create an image.
             Supported aspect presets include 1:1, 9:16 and 16:9, up to 2048 x 2048.</p>
@@ -2166,13 +2575,9 @@ class SettingsDialog(QtWidgets.QDialog):
             <p>Uses Ace Step Music 1.5. The chat checks the genre preset list for available genres and subgenres when present.
             It can also ask for a custom genre description when no preset is found, then collect duration, title, lyrics or instrumental choice, and other needed details.</p>
 
-            <h3>Wizard trigger words</h3>
-            <ul>
-                <li><b>cancel</b>: stops the current wizard and returns to normal chat.</li>
-                <li><b>undo</b>: goes back one step in the current wizard, useful if you pasted a prompt where lyrics or another answer was expected.</li>
             </ul>
 
-            <h3>Model and queue behavior</h3>
+            <h3>Wizard behavior a other info</h3>
             <ul>
                 <li>Models need to be installed before the chat can use them.(find them in the 'optional downloads' menu</li>
                 <li>Usage is easy : use the trigger words above to start a wizard for a job</li>
@@ -2182,6 +2587,8 @@ class SettingsDialog(QtWidgets.QDialog):
                 <li>A settings toggle lets generated results open in the original FrameVision player or stay only in the chat. Images can show in both.</li>
                 <li>Drag the splitter completely to the left to hide the internal mediaplayer and get a full sized llm chat program.</li>
                 <li>You can keep typing while a job is running, but sending is blocked until the job is finished to avoid overloading VRAM.</li>
+                <li>Right click on a response from the chat to retry</li>
+                <li>Edit sent message and save them to have the chat try again with the updated request</li>
             </ul>
             """
         )
@@ -2318,6 +2725,7 @@ class LlamaChatWindow(QtWidgets.QMainWindow):
         os.makedirs(self.chat_dir, exist_ok=True)
         os.makedirs(self.attachment_temp_dir, exist_ok=True)
         os.makedirs(os.path.dirname(self.assistant_jobs_path), exist_ok=True)
+        _ensure_memory_folders(self.fv_root)
 
         self.sessions: List[ChatSession] = []
         self.current_session_id: Optional[str] = None
@@ -2341,6 +2749,7 @@ class LlamaChatWindow(QtWidgets.QMainWindow):
         self.server_log_tail: List[str] = []
         self.pending_generate_session_id: str = ""
         self.pending_retry_generation: bool = False
+        self._pending_generation_update: Optional[Dict[str, Any]] = None
         self._last_user_text_sent: str = ""
         self._auto_retry_templates: List[Tuple[str, str]] = []
         self._auto_retry_original_selection: Tuple[str, str] = ("auto", "")
@@ -2361,6 +2770,9 @@ class LlamaChatWindow(QtWidgets.QMainWindow):
         self._syncing_model_selectors = False
         self._loading_session_state = False
         self._last_ui_model_path = ""
+        self._startup_llm_memory_context: str = ""
+        self._last_memory_sources: List[str] = []
+        self._memory_context_mode_for_next_generation: str = "auto"
 
         self._save_timer = QtCore.QTimer(self)
         self._save_timer.setSingleShot(True)
@@ -2377,6 +2789,7 @@ class LlamaChatWindow(QtWidgets.QMainWindow):
         self._build_ui()
         self._apply_style()
         self._load_settings()
+        self._reload_startup_llm_memory()
         self._apply_style()
         self._load_sessions()
         self._load_assistant_jobs()
@@ -2475,6 +2888,12 @@ class LlamaChatWindow(QtWidgets.QMainWindow):
         tb_lay.addWidget(self.btn_stop)
 
         self.chat_view = ChatScrollArea()
+        self.chat_view.editMessageSaved.connect(self._on_chat_message_edit_saved)
+        self.chat_view.retryMessageRequested.connect(self._on_chat_message_retry_requested)
+        self.chat_view.saveToMemoryRequested.connect(self._on_save_message_to_memory_requested)
+        self.chat_view.saveToProjectRequested.connect(self._on_save_message_to_project_requested)
+        self.chat_view.versionPrevRequested.connect(lambda mid: self._switch_message_version(mid, -1))
+        self.chat_view.versionNextRequested.connect(lambda mid: self._switch_message_version(mid, 1))
 
         composer_wrap = QtWidgets.QWidget()
         cw_lay = QtWidgets.QVBoxLayout(composer_wrap)
@@ -2862,6 +3281,14 @@ class LlamaChatWindow(QtWidgets.QMainWindow):
             self.settings_dialog.chk_results_chat_only.setChecked(bool(data.get("assistant_results_chat_only", True)))
         except Exception:
             pass
+        try:
+            self.settings_dialog.chk_memory_enabled.setChecked(bool(data.get("memory_enabled", True)))
+        except Exception:
+            pass
+        try:
+            self.settings_dialog.chk_memory_sources.setChecked(bool(data.get("memory_show_sources", True)))
+        except Exception:
+            pass
         self.current_session_id = data.get("last_session_id") if isinstance(data.get("last_session_id"), str) else None
         self._saved_model_path = data.get("model_path", "") if isinstance(data.get("model_path"), str) else ""
         self._saved_template = (data.get("template_kind", "auto"), data.get("template_value", ""))
@@ -2892,6 +3319,8 @@ class LlamaChatWindow(QtWidgets.QMainWindow):
             "bubble_color_assistant": bubble_assistant,
             "bubble_color_user": bubble_user,
             "assistant_results_chat_only": bool(getattr(self.settings_dialog, "chk_results_chat_only", None).isChecked()) if getattr(self.settings_dialog, "chk_results_chat_only", None) is not None else True,
+            "memory_enabled": bool(getattr(self.settings_dialog, "chk_memory_enabled", None).isChecked()) if getattr(self.settings_dialog, "chk_memory_enabled", None) is not None else True,
+            "memory_show_sources": bool(getattr(self.settings_dialog, "chk_memory_sources", None).isChecked()) if getattr(self.settings_dialog, "chk_memory_sources", None) is not None else True,
             "last_session_id": self.current_session_id or "",
             "chat_composer_splitter_sizes": list(getattr(self, "main_vertical_splitter", None).sizes()) if getattr(self, "main_vertical_splitter", None) is not None else [760, 150],
         }
@@ -3910,6 +4339,7 @@ class LlamaChatWindow(QtWidgets.QMainWindow):
             mid = str(m.get("id") or uuid.uuid4())
             m["id"] = mid
             self.chat_view.add_message(role, str(m.get("content", "")), str(m.get("thinking", "")), attachments=list(m.get("attachments", []) or []), message_id=mid, loading=bool(m.get("loading", False)))
+            self._refresh_one_message_version_controls(m)
 
     def _apply_settings_to_current_session(self):
         s = self._current_session()
@@ -4316,12 +4746,622 @@ class LlamaChatWindow(QtWidgets.QMainWindow):
         self._set_status("Unloaded", "idle")
         self._update_header()
 
+    # ---------- message versions / edit + retry ----------
+    def _ensure_message_versions(self, msg: Dict[str, Any]) -> List[Dict[str, Any]]:
+        versions = msg.get("versions")
+        if not isinstance(versions, list) or not versions:
+            versions = [{
+                "content": str(msg.get("content", "") or ""),
+                "thinking": str(msg.get("thinking", "") or ""),
+                "attachments": list(msg.get("attachments", []) or []),
+                "timestamp": str(msg.get("timestamp", "") or datetime.now().isoformat(timespec="seconds")),
+            }]
+            msg["versions"] = versions
+            msg["active_version"] = 0
+        try:
+            idx = int(msg.get("active_version", 0) or 0)
+        except Exception:
+            idx = 0
+        idx = max(0, min(idx, len(versions) - 1))
+        msg["active_version"] = idx
+        return versions
+
+    def _apply_active_message_version(self, msg: Dict[str, Any]) -> None:
+        versions = self._ensure_message_versions(msg)
+        idx = int(msg.get("active_version", 0) or 0)
+        v = versions[idx] if 0 <= idx < len(versions) else versions[0]
+        msg["content"] = str(v.get("content", "") or "")
+        msg["thinking"] = str(v.get("thinking", "") or "")
+        msg["attachments"] = list(v.get("attachments", []) or [])
+
+    def _message_version_state(self, msg: Dict[str, Any]) -> Tuple[str, bool, bool]:
+        versions = msg.get("versions")
+        if not isinstance(versions, list) or len(versions) <= 1:
+            return "", False, False
+        try:
+            idx = int(msg.get("active_version", 0) or 0)
+        except Exception:
+            idx = 0
+        idx = max(0, min(idx, len(versions) - 1))
+        return f"{idx + 1}/{len(versions)}", idx > 0, idx < len(versions) - 1
+
+    def _refresh_one_message_version_controls(self, msg: Dict[str, Any]) -> None:
+        if not isinstance(msg, dict):
+            return
+        mid = str(msg.get("id") or "")
+        if not mid:
+            return
+        label, can_prev, can_next = self._message_version_state(msg)
+        try:
+            self.chat_view.set_version_controls(mid, label, can_prev, can_next)
+        except Exception:
+            pass
+
+    def _refresh_all_message_version_controls(self, session: Optional[ChatSession] = None) -> None:
+        s = session or self._current_session()
+        if not s:
+            return
+        for msg in s.messages:
+            if isinstance(msg, dict):
+                self._refresh_one_message_version_controls(msg)
+
+    def _find_message_index(self, session: ChatSession, message_id: str) -> int:
+        for i, msg in enumerate(session.messages):
+            if str(msg.get("id") or "") == str(message_id or ""):
+                return i
+        return -1
+
+    def _build_api_messages_until(self, session: ChatSession, stop_before_message_id: str) -> List[Dict]:
+        idx = self._find_message_index(session, stop_before_message_id)
+        if idx < 0:
+            return self._build_api_messages(session)
+        shadow = ChatSession(
+            id=session.id,
+            title=session.title,
+            created_at=session.created_at,
+            updated_at=session.updated_at,
+            model_path=session.model_path,
+            template_kind=session.template_kind,
+            template_value=session.template_value,
+            system_prompt=session.system_prompt,
+            messages=[dict(m) for m in session.messages[:idx]],
+        )
+        return self._build_api_messages(shadow)
+
+    def _start_generation_for_message_update(self, assistant_message_id: str):
+        s = self._current_session()
+        if not s:
+            return
+        try:
+            self._validate_runner_and_model()
+        except Exception as e:
+            self._set_status(str(e), "error")
+            QtWidgets.QMessageBox.warning(self, "Cannot retry", str(e))
+            return
+        self._pending_generation_update = {
+            "session_id": s.id,
+            "assistant_message_id": str(assistant_message_id or ""),
+        }
+        tk, tv = self.current_template_choice()
+        self._prepare_auto_retry_templates(self.current_model_path(), tk, tv)
+        if not self._same_loaded_config() or not self.server_ready:
+            self.pending_generate_session_id = s.id
+            self._load_selected_model()
+            return
+        self._start_reply_request_for_current_session()
+
+    def _on_chat_message_retry_requested(self, message_id: str):
+        if self._assistant_jobs_active() or (self.chat_thread and self.chat_thread.isRunning()):
+            self._apply_send_button_guard()
+            self._set_status("Busy — retry is disabled until the current job is finished", "loading")
+            return
+        s = self._current_session()
+        if not s:
+            return
+        idx = self._find_message_index(s, message_id)
+        if idx < 0:
+            return
+        msg = s.messages[idx]
+        if str(msg.get("role") or "") != "assistant":
+            return
+        self._ensure_message_versions(msg)
+        msg["loading"] = True
+        self.chat_view.update_message(str(msg.get("id") or ""), loading=True)
+        self._refresh_one_message_version_controls(msg)
+        self._start_generation_for_message_update(str(msg.get("id") or ""))
+
+    def _on_chat_message_edit_saved(self, message_id: str, new_text: str):
+        if self._assistant_jobs_active() or (self.chat_thread and self.chat_thread.isRunning()):
+            self._apply_send_button_guard()
+            self._set_status("Busy — edit/save is disabled until the current job is finished", "loading")
+            return
+        s = self._current_session()
+        if not s:
+            return
+        idx = self._find_message_index(s, message_id)
+        if idx < 0:
+            return
+        msg = s.messages[idx]
+        if str(msg.get("role") or "") != "user":
+            return
+        new_text = str(new_text or "").strip()
+        if not new_text:
+            self._set_status("Edited message is empty", "error")
+            return
+
+        versions = self._ensure_message_versions(msg)
+        cur_idx = int(msg.get("active_version", 0) or 0)
+        cur_text = str(versions[cur_idx].get("content", "") if 0 <= cur_idx < len(versions) else msg.get("content", "") or "")
+        if new_text != cur_text:
+            versions.append({
+                "content": new_text,
+                "thinking": "",
+                "attachments": list(msg.get("attachments", []) or []),
+                "timestamp": datetime.now().isoformat(timespec="seconds"),
+            })
+            msg["active_version"] = len(versions) - 1
+        self._apply_active_message_version(msg)
+        self.chat_view.update_message(str(msg.get("id") or ""), text=str(msg.get("content", "")), attachments=list(msg.get("attachments", []) or []), loading=False)
+        self._refresh_one_message_version_controls(msg)
+
+        # One edited user turn gets one matching assistant turn. Keep earlier context,
+        # keep the old answer as version 1, and remove later active-branch messages.
+        answer_idx = idx + 1 if idx + 1 < len(s.messages) and str(s.messages[idx + 1].get("role") or "") == "assistant" else -1
+        if answer_idx >= 0:
+            answer_msg = s.messages[answer_idx]
+            self._ensure_message_versions(answer_msg)
+            if len(s.messages) > answer_idx + 1:
+                del s.messages[answer_idx + 1:]
+                self._render_session(s)
+            answer_msg["loading"] = True
+            self.chat_view.update_message(str(answer_msg.get("id") or ""), loading=True)
+            self._refresh_one_message_version_controls(answer_msg)
+            target_assistant_id = str(answer_msg.get("id") or "")
+        else:
+            now = datetime.now().isoformat(timespec="seconds")
+            target_assistant_id = str(uuid.uuid4())
+            answer_msg = {
+                "id": target_assistant_id,
+                "role": "assistant",
+                "content": "",
+                "thinking": "",
+                "attachments": [],
+                "timestamp": now,
+                "loading": True,
+                "versions": [],
+                "active_version": 0,
+            }
+            s.messages.insert(idx + 1, answer_msg)
+            if len(s.messages) > idx + 2:
+                del s.messages[idx + 2:]
+            self.chat_view.add_message("assistant", "Regenerating…", "", attachments=[], message_id=target_assistant_id, loading=True)
+
+        s.updated_at = datetime.now().isoformat(timespec="seconds")
+        self._last_user_text_sent = new_text
+        self._refresh_chat_list()
+        self._update_header()
+        self._queue_save()
+        self._start_generation_for_message_update(target_assistant_id)
+
+    def _switch_message_version(self, message_id: str, direction: int):
+        s = self._current_session()
+        if not s:
+            return
+        idx = self._find_message_index(s, message_id)
+        if idx < 0:
+            return
+        msg = s.messages[idx]
+        versions = self._ensure_message_versions(msg)
+        if len(versions) <= 1:
+            return
+        cur = int(msg.get("active_version", 0) or 0)
+        new_idx = max(0, min(len(versions) - 1, cur + int(direction or 0)))
+        if new_idx == cur:
+            return
+        msg["active_version"] = new_idx
+        self._apply_active_message_version(msg)
+        self.chat_view.update_message(str(msg.get("id") or ""), text=str(msg.get("content", "")), thinking=str(msg.get("thinking", "")), attachments=list(msg.get("attachments", []) or []), loading=bool(msg.get("loading", False)))
+        self._refresh_one_message_version_controls(msg)
+
+        # If this is a user message and the next assistant answer has matching
+        # versions, move that answer to the same version number too. This gives
+        # the expected ChatGPT-style user edit + answer 1/2, 2/2 behavior.
+        if str(msg.get("role") or "") == "user" and idx + 1 < len(s.messages):
+            nxt = s.messages[idx + 1]
+            if str(nxt.get("role") or "") == "assistant":
+                nvers = self._ensure_message_versions(nxt)
+                if len(nvers) > new_idx:
+                    nxt["active_version"] = new_idx
+                    self._apply_active_message_version(nxt)
+                    self.chat_view.update_message(str(nxt.get("id") or ""), text=str(nxt.get("content", "")), thinking=str(nxt.get("thinking", "")), attachments=list(nxt.get("attachments", []) or []), loading=bool(nxt.get("loading", False)))
+                    self._refresh_one_message_version_controls(nxt)
+        s.updated_at = datetime.now().isoformat(timespec="seconds")
+        self._queue_save()
+
+    def _complete_pending_generation_update(self, reply: str, thinking: str, attachments: Optional[List[Dict]] = None) -> bool:
+        pending = self._pending_generation_update if isinstance(self._pending_generation_update, dict) else None
+        if not pending:
+            return False
+        session_id = str(pending.get("session_id") or "")
+        assistant_message_id = str(pending.get("assistant_message_id") or "")
+        self._pending_generation_update = None
+        s, msg = self._find_session_message(session_id, assistant_message_id)
+        if not s or not msg:
+            return False
+        existing_versions = msg.get("versions")
+        if isinstance(existing_versions, list) and len(existing_versions) == 0 and not str(msg.get("content", "") or "").strip():
+            versions = existing_versions
+        else:
+            versions = self._ensure_message_versions(msg)
+        versions.append({
+            "content": str(reply or "").strip(),
+            "thinking": str(thinking or "").strip(),
+            "attachments": list(attachments or []),
+            "timestamp": datetime.now().isoformat(timespec="seconds"),
+        })
+        msg["versions"] = versions
+        msg["active_version"] = len(versions) - 1
+        msg["loading"] = False
+        self._apply_active_message_version(msg)
+        s.updated_at = datetime.now().isoformat(timespec="seconds")
+        if self.current_session_id == session_id:
+            self.chat_view.update_message(assistant_message_id, text=str(msg.get("content", "")), thinking=str(msg.get("thinking", "")), attachments=list(msg.get("attachments", []) or []), loading=False)
+            self._refresh_one_message_version_controls(msg)
+            self.chat_view.scroll_to_bottom(force=True)
+        self._refresh_chat_list()
+        self._update_header()
+        self._queue_save()
+        self._set_status("Ready", "ready")
+        return True
+
+    # ---------- Knowledge & Memory ----------
+    def _memory_enabled(self) -> bool:
+        try:
+            return bool(self.settings_dialog.chk_memory_enabled.isChecked())
+        except Exception:
+            return True
+
+    def _memory_show_sources(self) -> bool:
+        try:
+            return bool(self.settings_dialog.chk_memory_sources.isChecked())
+        except Exception:
+            return True
+
+    def _reload_startup_llm_memory(self) -> None:
+        _ensure_memory_folders(self.fv_root)
+        parts: List[str] = []
+        for path in _iter_memory_files(_memory_llm_memory_dir(self.fv_root))[:20]:
+            try:
+                text = _read_memory_text_file(path, max_chars=16000).strip()
+            except Exception:
+                text = ""
+            if not text:
+                continue
+            rel = os.path.relpath(path, self.fv_root)
+            parts.append(f"[llm_memory: {rel}]\n{text[:12000]}")
+            if sum(len(x) for x in parts) > 30000:
+                break
+        self._startup_llm_memory_context = "\n\n".join(parts).strip()
+
+    def _message_text_by_id(self, message_id: str) -> str:
+        s = self._current_session()
+        if not s:
+            return ""
+        idx = self._find_message_index(s, message_id)
+        if idx < 0:
+            return ""
+        return str(s.messages[idx].get("content", "") or "")
+
+    def _write_memory_note(self, title: str, text: str, folder: str, extra: Optional[Dict[str, Any]] = None) -> str:
+        _ensure_memory_folders(self.fv_root)
+        os.makedirs(folder, exist_ok=True)
+        stamp = _memory_now_stamp()
+        name = f"{stamp}_{_safe_memory_filename(title or 'memory')}.json"
+        path = os.path.join(folder, name)
+        payload = {
+            "title": str(title or "Memory"),
+            "created": datetime.now().isoformat(timespec="seconds"),
+            "text": str(text or ""),
+            "source": "llm_chat",
+        }
+        if isinstance(extra, dict):
+            payload.update(extra)
+        _save_json_atomic(path, payload)
+        return path
+
+    def _extract_memory_save_text(self, text: str) -> Tuple[bool, str, str]:
+        raw = str(text or "").strip()
+        if not raw:
+            return False, "", ""
+        patterns = [
+            r"^\s*(?:save\s+to\s+memory|remember\s+this|remember|note\s+this|save\s+this\s+to\s+memory)\s*[:\-]?\s*(.+)$",
+            r"^\s*(?:can\s+you\s+)?(?:save|store)\s+(?:this\s+)?(?:in|to)\s+memory\s*[:\-]?\s*(.+)$",
+        ]
+        for pat in patterns:
+            m = re.match(pat, raw, re.IGNORECASE | re.DOTALL)
+            if m:
+                body = (m.group(1) or "").strip()
+                if body:
+                    title = body.splitlines()[0].strip()[:60]
+                    return True, title or "Saved memory", body
+        return False, "", ""
+
+    def _on_save_message_to_memory_requested(self, message_id: str):
+        text = self._message_text_by_id(message_id).strip()
+        if not text:
+            return
+        default_title = text.splitlines()[0].strip()[:60] or "Saved chat message"
+        title, ok = QtWidgets.QInputDialog.getText(self, "Save to memory", "Memory name:", text=default_title)
+        if not ok:
+            return
+        title = str(title or default_title).strip() or default_title
+        try:
+            path = self._write_memory_note(title, text, _memory_saved_notes_dir(self.fv_root), {"from_message_id": str(message_id or "")})
+            self._set_status(f"Saved memory: {os.path.basename(path)}", "ready")
+        except Exception as e:
+            QtWidgets.QMessageBox.warning(self, "Save to memory failed", str(e))
+
+    def _pick_or_create_project_folder(self) -> Tuple[str, str]:
+        root = _memory_project_dir(self.fv_root)
+        os.makedirs(root, exist_ok=True)
+        dlg = QtWidgets.QDialog(self)
+        dlg.setWindowTitle("Save to project")
+        lay = QtWidgets.QVBoxLayout(dlg)
+        lay.setContentsMargins(12, 12, 12, 12)
+        lay.setSpacing(8)
+        info = QtWidgets.QLabel("Create a new project folder or continue an existing one.")
+        info.setWordWrap(True)
+        lay.addWidget(info)
+        name_row = QtWidgets.QHBoxLayout()
+        name_row.addWidget(QtWidgets.QLabel("New project name"))
+        ed_name = QtWidgets.QLineEdit()
+        ed_name.setPlaceholderText("my_project")
+        name_row.addWidget(ed_name, 1)
+        lay.addLayout(name_row)
+        chosen_label = QtWidgets.QLabel("Existing project: none selected")
+        chosen_label.setObjectName("SubtleLabel")
+        lay.addWidget(chosen_label)
+        picked = {"path": ""}
+        def browse():
+            path = QtWidgets.QFileDialog.getExistingDirectory(dlg, "Select existing project folder", root)
+            if path:
+                picked["path"] = path
+                chosen_label.setText("Existing project: " + path)
+        btn_browse = QtWidgets.QPushButton("Continue existing project…")
+        btn_browse.clicked.connect(browse)
+        lay.addWidget(btn_browse)
+        btns = QtWidgets.QDialogButtonBox(QtWidgets.QDialogButtonBox.Save | QtWidgets.QDialogButtonBox.Cancel)
+        lay.addWidget(btns)
+        btns.accepted.connect(dlg.accept)
+        btns.rejected.connect(dlg.reject)
+        if dlg.exec() != QtWidgets.QDialog.Accepted:
+            return "", ""
+        if picked.get("path"):
+            path = str(picked["path"])
+            return path, os.path.basename(path.rstrip(os.sep)) or "project"
+        name = _safe_memory_filename(ed_name.text().strip() or "project", "project")
+        path = os.path.join(root, name)
+        os.makedirs(path, exist_ok=True)
+        return path, name
+
+    def _on_save_message_to_project_requested(self, message_id: str):
+        text = self._message_text_by_id(message_id).strip()
+        if not text:
+            return
+        folder, project_name = self._pick_or_create_project_folder()
+        if not folder:
+            return
+        default_title = text.splitlines()[0].strip()[:60] or "Saved chat message"
+        title, ok = QtWidgets.QInputDialog.getText(self, "Save to project", "Note name:", text=default_title)
+        if not ok:
+            return
+        try:
+            path = self._write_memory_note(str(title or default_title), text, folder, {"project": project_name, "from_message_id": str(message_id or "")})
+            self._set_status(f"Saved project note: {os.path.basename(path)}", "ready")
+        except Exception as e:
+            QtWidgets.QMessageBox.warning(self, "Save to project failed", str(e))
+
+    def _memory_search_roots_for_query(self, query: str, mode: str = "auto") -> List[Tuple[str, str]]:
+        low = str(query or "").lower()
+        mode = str(mode or "auto").lower().strip()
+        roots: List[Tuple[str, str]] = []
+
+        if mode in {"forced", "saved", "saved_memories", "memories"}:
+            # Saved memories means the full user memory area, not the current chat history.
+            roots.extend([
+                ("saved_notes", _memory_saved_notes_dir(self.fv_root)),
+                ("user_files", _memory_user_files_dir(self.fv_root)),
+                ("project", _memory_project_dir(self.fv_root)),
+            ])
+        else:
+            if any(x in low for x in ("user files", "user_files", "my files", "look in files", "look in user files")):
+                roots.append(("user_files", _memory_user_files_dir(self.fv_root)))
+            if any(x in low for x in ("project", "projects")):
+                roots.append(("project", _memory_project_dir(self.fv_root)))
+            if any(x in low for x in ("memory", "memories", "remember", "saved", "notes", "what did i save", "what did you save")):
+                roots.append(("saved_notes", _memory_saved_notes_dir(self.fv_root)))
+                roots.append(("project", _memory_project_dir(self.fv_root)))
+            if any(x in low for x in ("knowledge", "knowledge base", "framevision", "feature guide", "how does", "what does", "planner", "queue", "settings")):
+                roots.append(("knowledge", _knowledge_root(self.fv_root)))
+        if not roots:
+            return []
+        # De-duplicate while preserving order.
+        seen = set()
+        deduped = []
+        for label, root in roots:
+            key = os.path.abspath(root).lower()
+            if key in seen:
+                continue
+            seen.add(key)
+            deduped.append((label, root))
+        return deduped
+
+    def _search_memory_files(self, query: str, roots: List[Tuple[str, str]], max_hits: int = 6, include_recent_if_no_hits: bool = False) -> List[Dict[str, Any]]:
+        q_tokens = _keyword_tokens(query)
+        hits: List[Dict[str, Any]] = []
+        recent: List[Dict[str, Any]] = []
+        for label, root in roots:
+            for path in _iter_memory_files(root)[:200]:
+                text = _read_memory_text_file(path, max_chars=90000)
+                if not text or text.startswith("[Could not read"):
+                    continue
+                rel = os.path.relpath(path, self.fv_root)
+                file_mtime = os.path.getmtime(path) if os.path.exists(path) else 0
+                recent.append({"score": 1, "label": label, "path": path, "rel": rel, "text": text[:2200], "mtime": file_mtime})
+                if not q_tokens:
+                    continue
+                for chunk in _chunk_memory_text(text, chunk_chars=2200)[:60]:
+                    low = chunk.lower()
+                    score = 0
+                    for tok in q_tokens:
+                        if tok in low:
+                            score += 2
+                        if tok in os.path.basename(path).lower():
+                            score += 4
+                    # Identity/name questions should still find notes that mention name/persona.
+                    if any(t in {"name", "called", "identity", "persona"} for t in q_tokens):
+                        if re.search(r"\b(name|called|identity|persona)\b", low):
+                            score += 3
+                    if score <= 0:
+                        continue
+                    hits.append({"score": score, "label": label, "path": path, "rel": rel, "text": chunk, "mtime": file_mtime})
+        hits.sort(key=lambda h: (int(h.get("score", 0)), float(h.get("mtime", 0))), reverse=True)
+        if hits:
+            return hits[:max_hits]
+        if include_recent_if_no_hits:
+            recent.sort(key=lambda h: float(h.get("mtime", 0)), reverse=True)
+            return recent[:max_hits]
+        return []
+
+    def _memory_context_for_query(self, query: str, mode: str = "auto") -> Tuple[str, List[str]]:
+        if not self._memory_enabled():
+            return "", []
+        mode = str(mode or "auto").lower().strip()
+        if mode in {"none", "chat", "this_chat"}:
+            return "", []
+
+        # Reload here, not only at application startup. Users may add/edit files while the chat is open.
+        try:
+            self._reload_startup_llm_memory()
+        except Exception:
+            pass
+
+        roots = self._memory_search_roots_for_query(query, mode=mode)
+        include_recent = mode in {"forced", "saved", "saved_memories", "memories"}
+        hits = self._search_memory_files(query, roots, max_hits=8 if include_recent else 6, include_recent_if_no_hits=include_recent) if roots else []
+        sources: List[str] = []
+        blocks: List[str] = []
+        if self._startup_llm_memory_context and mode in {"auto", "forced", "saved", "saved_memories", "memories"}:
+            blocks.append(
+                "Persistent local LLM memory / persona instructions loaded from assets/memories/llm_memory. "
+                "Treat these as user-provided persistent instructions unless the current user message clearly overrides them:\n"
+                + self._startup_llm_memory_context[:30000]
+            )
+            sources.append(os.path.relpath(_memory_llm_memory_dir(self.fv_root), self.fv_root))
+        for h in hits:
+            rel = str(h.get("rel") or "")
+            label = str(h.get("label") or "memory")
+            txt = str(h.get("text") or "").strip()
+            if not txt:
+                continue
+            sources.append(rel)
+            blocks.append(f"Source: {rel} ({label})\n{txt}")
+        if not blocks:
+            return "", []
+        # Keep duplicates out of the visible source list.
+        uniq_sources = []
+        seen = set()
+        for src in sources:
+            if src and src not in seen:
+                seen.add(src)
+                uniq_sources.append(src)
+        context = (
+            "Use the following local FrameVision Knowledge & Memory context when it is relevant. "
+            "If the user asks about saved memories, answer from these sources instead of explaining generic AI memory. "
+            "If a source states your name/persona or expertise, follow it as local user-provided context. "
+            "Do not pretend it contains information that is not present. Mention sources briefly when helpful.\n\n" +
+            "\n\n---\n\n".join(blocks)
+        )
+        return context[:52000], uniq_sources[:12]
+
+    def _looks_like_memory_choice_request(self, text: str) -> bool:
+        raw = str(text or "").strip().lower()
+        if not raw:
+            return False
+        save_mem, _, _ = self._extract_memory_save_text(text)
+        if save_mem:
+            return False
+        # These are ambiguous because the user may mean either the current chat history or saved memory files.
+        patterns = [
+            r"\bcheck\s+(my\s+)?memories\b",
+            r"\bwhat\s+(do|did)\s+(you|i)\s+(remember|save|saved)\b",
+            r"\bwhat\s+is\s+in\s+(my\s+)?memories\b",
+            r"\bshow\s+(my\s+)?memories\b",
+            r"\bsearch\s+(my\s+)?memories\b",
+            r"\blook\s+in\s+(my\s+)?memories\b",
+            r"\brecall\s+(my\s+)?memories\b",
+            r"\bsaved\s+memories\b",
+            r"\bmemory\s+folder\b",
+        ]
+        return any(re.search(p, raw, flags=re.IGNORECASE) for p in patterns)
+
+    def _continue_memory_choice_generation(self, session_id: str, mode: str) -> None:
+        mode = str(mode or "auto").lower().strip()
+        if mode not in {"auto", "none", "forced"}:
+            mode = "auto"
+        self._memory_context_mode_for_next_generation = mode
+        try:
+            self._validate_runner_and_model()
+        except Exception as e:
+            self._memory_context_mode_for_next_generation = "auto"
+            self._set_status(str(e), "error")
+            QtWidgets.QMessageBox.warning(self, "Cannot send", str(e))
+            return
+        s = self._current_session()
+        if not s or s.id != session_id:
+            self._select_session(session_id)
+            s = self._current_session()
+        if not s:
+            self._memory_context_mode_for_next_generation = "auto"
+            return
+        tk, tv = self.current_template_choice()
+        self._prepare_auto_retry_templates(self.current_model_path(), tk, tv)
+        if not self._same_loaded_config() or not self.server_ready:
+            self.pending_generate_session_id = s.id
+            self._load_selected_model()
+            return
+        self._start_reply_request_for_current_session()
+
+    def _ask_memory_source_choice(self, session_id: str, user_text: str) -> None:
+        self.chat_view.add_memory_choice(
+            "Memory question detected",
+            "Do you mean this current chat history, or the saved memory folders?",
+            lambda sid=session_id: self._continue_memory_choice_generation(sid, "none"),
+            lambda sid=session_id: self._continue_memory_choice_generation(sid, "forced"),
+        )
+        self._set_status("Choose memory source", "ready")
     # ---------- chat ----------
     def _build_api_messages(self, session: ChatSession) -> List[Dict]:
         messages: List[Dict] = []
         system_prompt = (session.system_prompt or "").strip()
+        last_user_text = ""
+        try:
+            for _m in reversed(session.messages):
+                if str(_m.get("role") or "") == "user":
+                    last_user_text = str(_m.get("content", "") or "")
+                    break
+        except Exception:
+            last_user_text = ""
+        mode = str(getattr(self, "_memory_context_mode_for_next_generation", "auto") or "auto")
+        memory_context, memory_sources = self._memory_context_for_query(last_user_text, mode=mode)
+        self._last_memory_sources = memory_sources
+        system_parts = []
         if system_prompt:
-            messages.append({"role": "system", "content": system_prompt})
+            system_parts.append(system_prompt)
+        if memory_context:
+            system_parts.append(memory_context)
+        if system_parts:
+            messages.append({"role": "system", "content": "\n\n".join(system_parts).strip()})
         for m in session.messages:
             role = str(m.get("role", "assistant"))
             if role not in ("user", "assistant"):
@@ -4456,7 +5496,11 @@ class LlamaChatWindow(QtWidgets.QMainWindow):
         self.btn_stop.setEnabled(True)
         self._set_status("Generating…", "loading")
 
-        api_messages = self._build_api_messages(s)
+        pending_update = self._pending_generation_update if isinstance(self._pending_generation_update, dict) else None
+        if pending_update and str(pending_update.get("session_id") or "") == s.id:
+            api_messages = self._build_api_messages_until(s, str(pending_update.get("assistant_message_id") or ""))
+        else:
+            api_messages = self._build_api_messages(s)
         self.chat_thread = ChatCompletionThread(
             self.server_url,
             api_messages,
@@ -5493,6 +6537,27 @@ class LlamaChatWindow(QtWidgets.QMainWindow):
             self._set_status("Queue job running — sending is disabled until the job is finished", "loading")
             return
 
+        save_mem, mem_title, mem_body = self._extract_memory_save_text(text)
+        if save_mem and mem_body:
+            s = self._append_user_message_to_current_session(text, attachments)
+            if not s:
+                return
+            try:
+                path = self._write_memory_note(mem_title or "Saved memory", mem_body, _memory_saved_notes_dir(self.fv_root), {"source_text": text})
+                self._append_framevision_assistant_reply(f"Saved to memory: {os.path.relpath(path, self.fv_root)}")
+                self._set_status("Saved to memory", "ready")
+            except Exception as e:
+                self._append_framevision_assistant_reply(f"Could not save to memory: {e}")
+                self._set_status("Memory save failed", "error")
+            return
+
+        if self._looks_like_memory_choice_request(text):
+            s = self._append_user_message_to_current_session(text, attachments)
+            if not s:
+                return
+            self._ask_memory_source_choice(s.id, text)
+            return
+
         if getattr(self, "_pending_ace15_music_request", None) is not None and text:
             s = self._append_user_message_to_current_session(text, attachments)
             if not s:
@@ -5603,6 +6668,16 @@ class LlamaChatWindow(QtWidgets.QMainWindow):
                 reply = (reply + "\n\n" if reply else "") + f"[Image save failed: {e}]"
         elif re.search(r"\b(?:here is|i generated|generated|creating|rendered)\b", reply or "", re.IGNORECASE) and re.search(r"\bimage\b", reply or "", re.IGNORECASE):
             reply = (reply + "\n\n" if reply else "") + "[No real image data was returned by the model/backend, so nothing could be saved. This reply is text only.]"
+        try:
+            sources = list(getattr(self, "_last_memory_sources", []) or [])
+            if sources and self._memory_show_sources():
+                shown = "\n".join([f"- {src}" for src in sources[:8]])
+                reply = (reply + "\n\n" if reply else "") + "Memory/knowledge used:\n" + shown
+        except Exception:
+            pass
+        if self._complete_pending_generation_update(reply, thinking, saved_attachments):
+            self._auto_retry_templates = []
+            return
         now = datetime.now().isoformat(timespec="seconds")
         mid = str(uuid.uuid4())
         s.messages.append({
@@ -5631,6 +6706,18 @@ class LlamaChatWindow(QtWidgets.QMainWindow):
             msg += "\n\nNo mmproj file was auto-detected next to this GGUF. Put the matching mmproj .gguf in the same model folder (or a mmproj/ subfolder) and reload the model."
         elif "image input is not supported" in low and self.active_mmproj_path:
             msg += f"\n\nmmproj currently attached: {self.active_mmproj_path}"
+        pending_update = self._pending_generation_update if isinstance(self._pending_generation_update, dict) else None
+        if pending_update:
+            self._pending_generation_update = None
+            try:
+                _s, _m = self._find_session_message(str(pending_update.get("session_id") or ""), str(pending_update.get("assistant_message_id") or ""))
+                if _m:
+                    _m["loading"] = False
+                    self.chat_view.update_message(str(_m.get("id") or ""), loading=False)
+                    self._refresh_one_message_version_controls(_m)
+                    self._queue_save()
+            except Exception:
+                pass
         self.chat_view.add_message("info", f"Generation failed: {msg}")
         if self.server_process and self.server_process.state() != QtCore.QProcess.NotRunning:
             self._set_status("Ready", "ready")
@@ -5639,6 +6726,7 @@ class LlamaChatWindow(QtWidgets.QMainWindow):
 
     def _on_chat_finished(self):
         self.chat_thread = None
+        self._memory_context_mode_for_next_generation = "auto"
         self._apply_send_button_guard()
         self.btn_stop.setEnabled(False)
 
