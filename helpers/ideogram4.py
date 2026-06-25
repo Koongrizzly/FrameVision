@@ -198,6 +198,87 @@ def default_sd_cli_path() -> Path:
     return framevision_root() / "presets" / "bin" / "sd-cli.exe"
 
 
+# --- FrameVision queue fallback for Ideogram 4 GGUF -------------------------
+def _enqueue_ideogram4_generate_local(settings: dict, priority: int = 610):
+    """Queue Ideogram 4 directly when helpers.queue_adapter is older/broken.
+
+    Some queue_adapter builds can throw NameError("inner") from unrelated
+    widget-based enqueue helpers. Ideogram already has all required settings,
+    so this fallback writes the normal FrameVision pending job directly.
+    """
+    try:
+        from helpers.job_helper import make_job_json
+    except Exception:
+        from job_helper import make_job_json
+
+    root = framevision_root()
+    pending_dir = root / "jobs" / "pending"
+    pending_dir.mkdir(parents=True, exist_ok=True)
+
+    data = dict(settings or {})
+    out_dir = Path(str(data.get("output_dir") or default_output_dir())).resolve()
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    def _text(key: str, default: str = "") -> str:
+        try:
+            return str(data.get(key, default) or "")
+        except Exception:
+            return default
+
+    def _int(key: str, default: int) -> int:
+        try:
+            return int(data.get(key, default))
+        except Exception:
+            try:
+                return int(float(data.get(key, default)))
+            except Exception:
+                return int(default)
+
+    def _float(key: str, default: float) -> float:
+        try:
+            return float(data.get(key, default))
+        except Exception:
+            return float(default)
+
+    prompt = _text("prompt").strip()
+    if not prompt:
+        raise RuntimeError("Prompt is empty.")
+
+    stamp = datetime.now().strftime("%Y%m%d_%H%M%S") + f"_{int((time.time() % 1.0) * 1000):03d}"
+    out_file = str(out_dir / f"ideogram4_gguf_{stamp}.png")
+    preview = prompt.replace("\n", " ").strip()[:80] or "Ideogram 4 GGUF"
+
+    args = {
+        "label": "Ideogram 4 GGUF: " + preview,
+        "engine": "ideogram4_gguf",
+        "prompt": prompt,
+        "negative": _text("negative"),
+        "width": _int("width", 1024),
+        "height": _int("height", 1024),
+        "steps": _int("steps", 20),
+        "guidance": _float("guidance", 3.5),
+        "preset": _text("preset", "Custom"),
+        "seed": _int("seed", -1),
+        "raw_prompt": bool(data.get("raw_prompt", False)),
+        "gguf_stream_layers": bool(data.get("gguf_stream_layers", False)),
+        "gguf_dir": _text("gguf_dir"),
+        "gguf_diffusion_file": _text("gguf_diffusion_file"),
+        "gguf_unconditional_file": _text("gguf_unconditional_file"),
+        "gguf_llm_file": _text("gguf_llm_file"),
+        "gguf_vae_file": _text("gguf_vae_file"),
+        "sd_cli_path": _text("sd_cli_path"),
+        "lora_enabled": bool(data.get("lora_enabled", False)),
+        "lora_path": _text("lora_path"),
+        "lora_scale": _float("lora_scale", 1.0),
+        "lora_apply_mode": _lora_apply_mode_value(data.get("lora_apply_mode", "auto")),
+        "output_dir": str(out_dir),
+        "out_file": out_file,
+        "outfile": out_file,
+    }
+    return make_job_json("ideogram4_generate", "", str(out_dir), args, str(pending_dir), priority=int(priority))
+# ---------------------------------------------------------------------------
+
+
 def looks_like_gguf_dir(path: Path) -> bool:
     try:
         path = Path(path)
@@ -2158,7 +2239,7 @@ if _FVQtWidgets is not None:
             self.width = _FVQtWidgets.QSpinBox(); self.width.setRange(256, 4096); self.width.setSingleStep(32); self.width.setValue(1024)
             self.height = _FVQtWidgets.QSpinBox(); self.height.setRange(256, 4096); self.height.setSingleStep(32); self.height.setValue(1024)
             self.steps = _FVQtWidgets.QSpinBox(); self.steps.setRange(1, 200); self.steps.setValue(20)
-            self.guidance = _FVQtWidgets.QDoubleSpinBox(); self.guidance.setRange(0.0, 20.0); self.guidance.setDecimals(2); self.guidance.setSingleStep(0.1); self.guidance.setValue(4.0)
+            self.guidance = _FVQtWidgets.QDoubleSpinBox(); self.guidance.setRange(0.0, 20.0); self.guidance.setDecimals(2); self.guidance.setSingleStep(0.1); self.guidance.setValue(4.0); self.guidance.setToolTip("Default: 4.0")
             self.seed = _FVQtWidgets.QSpinBox(); self.seed.setRange(-1, 2147483647); self.seed.setValue(-1)
             for label, widget in (("Preset", self.preset_combo), ("W", self.width), ("H", self.height), ("Steps", self.steps), ("CFG", self.guidance), ("Seed", self.seed)):
                 col = _FVQtWidgets.QVBoxLayout()
@@ -2308,19 +2389,9 @@ if _FVQtWidgets is not None:
             left_layout.addWidget(self.layout_group)
             self.layout_regions = []
 
-            btns = _FVQtWidgets.QHBoxLayout()
-            self.generate_btn = _FVQtWidgets.QPushButton("Generate Ideogram image")
-            self.add_queue_btn = _FVQtWidgets.QPushButton("Add to Ideogram queue")
-            self.framevision_queue_btn = _FVQtWidgets.QPushButton("Add to queue")
-            self.framevision_queue_btn.setVisible(False)
-            self.open_output_btn = _FVQtWidgets.QPushButton("View results")
-            self.open_last_btn = _FVQtWidgets.QPushButton("Open last image")
-            btns.addWidget(self.generate_btn, 2)
-            btns.addWidget(self.add_queue_btn, 2)
-            btns.addWidget(self.framevision_queue_btn, 2)
-            btns.addWidget(self.open_output_btn)
-            btns.addWidget(self.open_last_btn)
-            left_layout.addLayout(btns)
+            # Keep the bottom action row outside the scroll area.
+            # When the layout builder grows taller than the tab, only the form
+            # should scroll; Generate/Add/View/Open must remain reachable.
             left_layout.addStretch(1)
 
             self.generate_right_panel = _FVQtWidgets.QWidget()
@@ -2336,6 +2407,24 @@ if _FVQtWidgets is not None:
             self.log_box.setReadOnly(True)
             self.log_box.setMinimumHeight(180)
             right_layout.addWidget(self.log_box, 2)
+
+            self.generate_button_bar = _FVQtWidgets.QWidget()
+            self.generate_button_bar.setObjectName("IdeogramGenerateStickyButtonBar")
+            btns = _FVQtWidgets.QHBoxLayout(self.generate_button_bar)
+            btns.setContentsMargins(0, 0, 0, 0)
+            btns.setSpacing(8)
+            self.generate_btn = _FVQtWidgets.QPushButton("Generate Ideogram image")
+            self.add_queue_btn = _FVQtWidgets.QPushButton("Add to Ideogram queue")
+            self.framevision_queue_btn = _FVQtWidgets.QPushButton("Add to queue")
+            self.framevision_queue_btn.setVisible(False)
+            self.open_output_btn = _FVQtWidgets.QPushButton("View results")
+            self.open_last_btn = _FVQtWidgets.QPushButton("Open last image")
+            btns.addWidget(self.generate_btn, 2)
+            btns.addWidget(self.add_queue_btn, 2)
+            btns.addWidget(self.framevision_queue_btn, 2)
+            btns.addWidget(self.open_output_btn)
+            btns.addWidget(self.open_last_btn)
+            layout.addWidget(self.generate_button_bar, 0)
 
             try:
                 self.generate_splitter.setSizes([680, 540])
@@ -3250,8 +3339,24 @@ if _FVQtWidgets is not None:
                     from helpers.queue_adapter import enqueue_ideogram4_generate as _enq
                 except Exception:
                     from queue_adapter import enqueue_ideogram4_generate as _enq
-                jid = _enq(payload, priority=610)
-                self.log(f"[FrameVision queue] queued: {jid}")
+                try:
+                    jid = _enq(payload, priority=610)
+                    self.log(f"[FrameVision queue] queued: {jid}")
+                except Exception as exc:
+                    # Some older/broken queue_adapter builds can throw
+                    # NameError("inner") from unrelated widget enqueue helpers.
+                    # Do not block Ideogram for that; write the normal pending
+                    # job directly from the settings we already collected here.
+                    if isinstance(exc, NameError) and "inner" in str(exc):
+                        self.log(f"[FrameVision queue] queue_adapter failed ({exc}); using Ideogram local queue fallback.")
+                        jid = _enqueue_ideogram4_generate_local(payload, priority=610)
+                        self.log(f"[FrameVision queue] queued with fallback: {jid}")
+                    else:
+                        raise
+                try:
+                    self._switch_to_main_queue_tab()
+                except Exception:
+                    pass
             except Exception as exc:
                 _FVQtWidgets.QMessageBox.warning(self, "Ideogram 4 GGUF", f"Could not add job to FrameVision queue.\n\n{exc}")
 
@@ -3781,8 +3886,8 @@ def launch_gui() -> int:
             self.compile_check.grid(row=4, column=0, sticky="w", pady=(8, 0))
             self.text_encoder_offload_check = ttk.Checkbutton(settings, text="Text encoder CPU offload", variable=self.text_encoder_offload_var)
             self.text_encoder_offload_check.grid(row=4, column=1, columnspan=2, sticky="w", pady=(8, 0))
-            ToolTip(self.guidance_label, "Guidance / CFG-like strength. Default: 4.0. Try a little higher if results look poor, weak, or malformed.")
-            ToolTip(self.guidance_entry, "Guidance / CFG-like strength. Default: 4.0. Try a little higher if results look poor, weak, or malformed.")
+            ToolTip(self.guidance_label, "Default: 4.0")
+            ToolTip(self.guidance_entry, "Default: 4.0")
             ToolTip(self.seed_label, "Seed. Default: -1 which means random seed each run.")
             ToolTip(self.seed_entry, "Seed. Use -1 for random, or enter a fixed number for repeatability.")
             ToolTip(self.raw_prompt_check, "If enabled, the prompt is sent exactly as typed. If disabled, plain text is wrapped into Ideogram JSON automatically.")
