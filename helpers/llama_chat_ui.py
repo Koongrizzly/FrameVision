@@ -2409,20 +2409,6 @@ class SettingsDialog(QtWidgets.QDialog):
         memory_lay.setVerticalSpacing(8)
         memory_lay.addWidget(self.chk_memory_enabled, 0, 0, 1, 2)
         memory_lay.addWidget(self.chk_memory_sources, 1, 0, 1, 2)
-        self.btn_open_info_folder = QtWidgets.QPushButton("Open Knowledge")
-        self.btn_open_memory_folder = QtWidgets.QPushButton("Open Memories")
-        self.btn_open_user_files_folder = QtWidgets.QPushButton("Open User Files")
-        self.btn_open_project_folder = QtWidgets.QPushButton("Open Project")
-        self.btn_open_llm_memory_folder = QtWidgets.QPushButton("Open LLM Memory")
-        memory_lay.addWidget(self.btn_open_info_folder, 2, 0)
-        memory_lay.addWidget(self.btn_open_memory_folder, 2, 1)
-        memory_lay.addWidget(self.btn_open_user_files_folder, 3, 0)
-        memory_lay.addWidget(self.btn_open_project_folder, 3, 1)
-        memory_lay.addWidget(self.btn_open_llm_memory_folder, 4, 0, 1, 2)
-        memory_hint = QtWidgets.QLabel("Reads /presets/info and /assets/memories. Saves only to /assets/memories/saved_notes or /assets/memories/project. LLM Memory is loaded into chat context at startup.")
-        memory_hint.setWordWrap(True)
-        memory_hint.setObjectName("SubtleLabel")
-        memory_lay.addWidget(memory_hint, 5, 0, 1, 2)
         lay.addWidget(memory_box)
 
         hint = QtWidgets.QLabel(
@@ -2451,11 +2437,6 @@ class SettingsDialog(QtWidgets.QDialog):
         self.chk_results_chat_only.toggled.connect(lambda *_: self.settingsChanged.emit())
         self.chk_memory_enabled.toggled.connect(lambda *_: self.settingsChanged.emit())
         self.chk_memory_sources.toggled.connect(lambda *_: self.settingsChanged.emit())
-        self.btn_open_info_folder.clicked.connect(lambda: _open_local_path(_knowledge_root(self.fv_root)))
-        self.btn_open_memory_folder.clicked.connect(lambda: _open_local_path(_memories_root(self.fv_root)))
-        self.btn_open_user_files_folder.clicked.connect(lambda: _open_local_path(_memory_user_files_dir(self.fv_root)))
-        self.btn_open_project_folder.clicked.connect(lambda: _open_local_path(_memory_project_dir(self.fv_root)))
-        self.btn_open_llm_memory_folder.clicked.connect(lambda: _open_local_path(_memory_llm_memory_dir(self.fv_root)))
         self.btn_bubble_auto_color.colorChanged.connect(lambda *_: self.settingsChanged.emit())
         self.btn_bubble_assistant_color.colorChanged.connect(lambda *_: self.settingsChanged.emit())
         self.btn_bubble_user_color.colorChanged.connect(lambda *_: self.settingsChanged.emit())
@@ -2843,6 +2824,10 @@ class LlamaChatWindow(QtWidgets.QMainWindow):
         self.lst_chats.setObjectName("ChatList")
         s_lay.addWidget(self.lst_chats, 1)
 
+        self.btn_uploaded_files = QtWidgets.QPushButton("Uploaded Files")
+        self.btn_uploaded_files.setToolTip("Show files that were attached/sent to the LLM chat so far.")
+        s_lay.addWidget(self.btn_uploaded_files)
+
         self.btn_delete_chat = QtWidgets.QPushButton("Delete Chat")
         s_lay.addWidget(self.btn_delete_chat)
 
@@ -2949,11 +2934,17 @@ class LlamaChatWindow(QtWidgets.QMainWindow):
         comp_lay.addLayout(send_row)
         cw_lay.addWidget(composer)
 
+        self.files_view = self._build_uploaded_files_view()
+
+        self.main_content_stack = QtWidgets.QStackedWidget()
+        self.main_content_stack.addWidget(self.chat_view)
+        self.main_content_stack.addWidget(self.files_view)
+
         self.main_vertical_splitter = QtWidgets.QSplitter(QtCore.Qt.Vertical)
         self.main_vertical_splitter.setObjectName("ChatComposerSplitter")
         self.main_vertical_splitter.setChildrenCollapsible(False)
         self.main_vertical_splitter.setHandleWidth(8)
-        self.main_vertical_splitter.addWidget(self.chat_view)
+        self.main_vertical_splitter.addWidget(self.main_content_stack)
         self.main_vertical_splitter.addWidget(composer_wrap)
         self.main_vertical_splitter.setStretchFactor(0, 1)
         self.main_vertical_splitter.setStretchFactor(1, 0)
@@ -2977,6 +2968,7 @@ class LlamaChatWindow(QtWidgets.QMainWindow):
         self.settings_dialog.settingsChanged.connect(self._settings_changed)
 
         self.btn_new_chat.clicked.connect(self._new_chat)
+        self.btn_uploaded_files.clicked.connect(self._toggle_uploaded_files_view)
         self.btn_delete_chat.clicked.connect(self._delete_current_chat)
         self.lst_chats.currentRowChanged.connect(self._on_chat_row_changed)
         self.ed_search.textChanged.connect(self._apply_chat_filter)
@@ -2995,6 +2987,300 @@ class LlamaChatWindow(QtWidgets.QMainWindow):
         self.lst_attachments.itemClicked.connect(self._preview_attachment_item)
         self.lst_attachments.customContextMenuRequested.connect(self._attachment_context_menu)
         self._refresh_attachment_list()
+
+
+    def _build_uploaded_files_view(self) -> QtWidgets.QWidget:
+        view = QtWidgets.QFrame()
+        view.setObjectName("UploadedFilesView")
+        lay = QtWidgets.QVBoxLayout(view)
+        lay.setContentsMargins(18, 18, 18, 18)
+        lay.setSpacing(10)
+
+        header = QtWidgets.QHBoxLayout()
+        title = QtWidgets.QLabel("Uploaded Files")
+        title.setObjectName("ChatHeader")
+        self.lbl_uploaded_files_info = QtWidgets.QLabel("")
+        self.lbl_uploaded_files_info.setObjectName("SubtleLabel")
+        self.btn_uploaded_files_refresh = QtWidgets.QPushButton("Refresh")
+        self.btn_uploaded_files_back = QtWidgets.QPushButton("Back to Chat")
+        header.addWidget(title)
+        header.addSpacing(12)
+        header.addWidget(self.lbl_uploaded_files_info, 1)
+        header.addWidget(self.btn_uploaded_files_refresh, 0)
+        header.addWidget(self.btn_uploaded_files_back, 0)
+        lay.addLayout(header)
+
+        self.lst_uploaded_files = QtWidgets.QListWidget()
+        self.lst_uploaded_files.setObjectName("AttachmentLibraryList")
+        self.lst_uploaded_files.setViewMode(QtWidgets.QListView.IconMode)
+        self.lst_uploaded_files.setResizeMode(QtWidgets.QListView.Adjust)
+        self.lst_uploaded_files.setMovement(QtWidgets.QListView.Static)
+        self.lst_uploaded_files.setSelectionMode(QtWidgets.QAbstractItemView.SingleSelection)
+        self.lst_uploaded_files.setContextMenuPolicy(QtCore.Qt.CustomContextMenu)
+        self.lst_uploaded_files.setIconSize(QtCore.QSize(96, 96))
+        self.lst_uploaded_files.setGridSize(QtCore.QSize(190, 150))
+        self.lst_uploaded_files.setSpacing(10)
+        self.lst_uploaded_files.setWordWrap(True)
+        self.lst_uploaded_files.setTextElideMode(QtCore.Qt.ElideMiddle)
+        self.lst_uploaded_files.setUniformItemSizes(True)
+        lay.addWidget(self.lst_uploaded_files, 1)
+
+        self.lbl_uploaded_files_empty = QtWidgets.QLabel("No uploaded files found yet.")
+        self.lbl_uploaded_files_empty.setObjectName("SubtleLabel")
+        self.lbl_uploaded_files_empty.setAlignment(QtCore.Qt.AlignCenter)
+        lay.addWidget(self.lbl_uploaded_files_empty, 0)
+
+        self.btn_uploaded_files_refresh.clicked.connect(self._refresh_uploaded_files_view)
+        self.btn_uploaded_files_back.clicked.connect(self._show_chat_view)
+        self.lst_uploaded_files.itemDoubleClicked.connect(lambda item: self._open_uploaded_file_item(item))
+        self.lst_uploaded_files.customContextMenuRequested.connect(self._uploaded_files_context_menu)
+        return view
+
+    def _show_chat_view(self):
+        stack = getattr(self, "main_content_stack", None)
+        if stack is not None:
+            stack.setCurrentIndex(0)
+        btn = getattr(self, "btn_uploaded_files", None)
+        if btn is not None:
+            btn.setText("Uploaded Files")
+
+    def _show_uploaded_files_view(self):
+        self._refresh_uploaded_files_view()
+        stack = getattr(self, "main_content_stack", None)
+        if stack is not None:
+            stack.setCurrentIndex(1)
+        btn = getattr(self, "btn_uploaded_files", None)
+        if btn is not None:
+            btn.setText("Back to Chat")
+
+    def _toggle_uploaded_files_view(self):
+        stack = getattr(self, "main_content_stack", None)
+        if stack is not None and stack.currentIndex() == 1:
+            self._show_chat_view()
+        else:
+            self._show_uploaded_files_view()
+
+    def _uploaded_file_key(self, path: str) -> str:
+        try:
+            return os.path.normcase(os.path.abspath(str(path or "")))
+        except Exception:
+            return str(path or "")
+
+    def _collect_uploaded_file_entries(self) -> List[Dict[str, Any]]:
+        """Collect files the user has attached/sent to the chat so far.
+
+        Sources:
+        - attachments stored in chat messages across all sessions
+        - files currently pending in the composer attachment list
+        - pasted screenshot/cache files in data/llama_chat/attachments
+        """
+        entries: Dict[str, Dict[str, Any]] = {}
+
+        def add_path(path: str, source: str = "", name: str = ""):
+            try:
+                path = os.path.abspath(str(path or ""))
+            except Exception:
+                path = str(path or "")
+            if not path or not os.path.isfile(path):
+                return
+            key = self._uploaded_file_key(path)
+            if key in entries:
+                # Keep the most useful source label when the file appears multiple times.
+                if source and source not in str(entries[key].get("source", "")):
+                    old = str(entries[key].get("source", "") or "")
+                    entries[key]["source"] = (old + ", " + source).strip(", ")
+                return
+            att = _make_attachment_entry(path)
+            if name:
+                att["name"] = name
+            att["source"] = source
+            try:
+                att["mtime"] = os.path.getmtime(path)
+            except Exception:
+                att["mtime"] = 0.0
+            entries[key] = att
+
+        for s in list(getattr(self, "sessions", []) or []):
+            try:
+                session_title = str(getattr(s, "title", "") or "chat")
+                for msg in list(getattr(s, "messages", []) or []):
+                    for att in list(msg.get("attachments", []) or []):
+                        if isinstance(att, dict):
+                            add_path(str(att.get("path", "") or ""), session_title, str(att.get("name", "") or ""))
+            except Exception:
+                continue
+
+        for att in list(getattr(self, "pending_attachments", []) or []):
+            if isinstance(att, dict):
+                add_path(str(att.get("path", "") or ""), "pending", str(att.get("name", "") or ""))
+
+        try:
+            cache_dir = self.attachment_temp_dir
+            if os.path.isdir(cache_dir):
+                for fn in os.listdir(cache_dir):
+                    add_path(os.path.join(cache_dir, fn), "attachment cache", fn)
+        except Exception:
+            pass
+
+        out = list(entries.values())
+        out.sort(key=lambda a: float(a.get("mtime", 0.0) or 0.0), reverse=True)
+        return out
+
+    def _refresh_uploaded_files_view(self):
+        lst = getattr(self, "lst_uploaded_files", None)
+        if lst is None:
+            return
+        lst.clear()
+        entries = self._collect_uploaded_file_entries()
+        for att in entries:
+            item = QtWidgets.QListWidgetItem(_make_attachment_thumbnail(att, 96), str(att.get("name", "file") or "file"))
+            path = str(att.get("path", "") or "")
+            source = str(att.get("source", "") or "")
+            try:
+                size_text = _format_file_size(os.path.getsize(path))
+            except Exception:
+                size_text = "missing"
+            item.setToolTip(f"{path}\n{_attachment_kind_from_path(path)} • {size_text}" + (f"\nSource: {source}" if source else ""))
+            item.setData(QtCore.Qt.UserRole, dict(att))
+            lst.addItem(item)
+        try:
+            self.lbl_uploaded_files_info.setText(f"{len(entries)} file(s)")
+            self.lbl_uploaded_files_empty.setVisible(len(entries) == 0)
+        except Exception:
+            pass
+
+    def _uploaded_file_from_item(self, item: Optional[QtWidgets.QListWidgetItem]) -> Optional[Dict[str, Any]]:
+        if item is None:
+            return None
+        data = item.data(QtCore.Qt.UserRole)
+        return dict(data) if isinstance(data, dict) else None
+
+    def _open_uploaded_file_item(self, item: Optional[QtWidgets.QListWidgetItem]):
+        att = self._uploaded_file_from_item(item)
+        if not att:
+            return
+        self._open_attachment_externally(att, open_with_dialog=False)
+
+    def _uploaded_files_context_menu(self, pos: QtCore.QPoint):
+        item = self.lst_uploaded_files.itemAt(pos)
+        att = self._uploaded_file_from_item(item)
+        if not att:
+            return
+        path = os.path.abspath(str(att.get("path", "") or ""))
+        menu = QtWidgets.QMenu(self)
+        act_open = menu.addAction("Open")
+        act_send = menu.addAction("Send to chat")
+        act_rename = menu.addAction("Rename")
+        act_delete = menu.addAction("Delete")
+        chosen = menu.exec(self.lst_uploaded_files.mapToGlobal(pos))
+        if chosen == act_open:
+            self._open_attachment_externally(att, open_with_dialog=False)
+            return
+        if chosen == act_send:
+            self._send_uploaded_file_to_chat(path)
+            return
+        if chosen == act_rename:
+            self._rename_uploaded_file(path)
+            return
+        if chosen == act_delete:
+            self._delete_uploaded_file(path)
+            return
+
+    def _send_uploaded_file_to_chat(self, path: str):
+        path = os.path.abspath(str(path or ""))
+        if not os.path.isfile(path):
+            self._set_status("File no longer exists", "error")
+            self._refresh_uploaded_files_view()
+            return
+        added = self._add_attachment_paths([path], announce=False)
+        self._show_chat_view()
+        if added:
+            if not (self.ed_prompt.toPlainText() or "").strip():
+                self.ed_prompt.setPlainText("Look at this file and tell me what you can do with it.")
+            self.ed_prompt.setFocus()
+            self._set_status("File added to chat. Add instructions and press Send.", "idle")
+        else:
+            self._set_status("File is already attached to the current message.", "idle")
+            self.ed_prompt.setFocus()
+
+    def _rename_uploaded_file(self, path: str):
+        path = os.path.abspath(str(path or ""))
+        if not os.path.isfile(path):
+            self._set_status("File no longer exists", "error")
+            self._refresh_uploaded_files_view()
+            return
+        old_name = os.path.basename(path)
+        new_name, ok = QtWidgets.QInputDialog.getText(self, "Rename file", "New file name:", text=old_name)
+        if not ok:
+            return
+        new_name = os.path.basename(str(new_name or "").strip())
+        if not new_name or new_name == old_name:
+            return
+        new_path = os.path.join(os.path.dirname(path), new_name)
+        if os.path.exists(new_path):
+            QtWidgets.QMessageBox.warning(self, "Rename file", "A file with that name already exists.")
+            return
+        try:
+            os.rename(path, new_path)
+            self._replace_attachment_path_everywhere(path, new_path)
+            self._refresh_attachment_list()
+            self._refresh_uploaded_files_view()
+            self._queue_save()
+            self._set_status("File renamed", "ready")
+        except Exception as e:
+            self._set_status(f"Rename failed: {e}", "error")
+
+    def _delete_uploaded_file(self, path: str):
+        path = os.path.abspath(str(path or ""))
+        if not os.path.isfile(path):
+            self._set_status("File no longer exists", "error")
+            self._refresh_uploaded_files_view()
+            return
+        if QtWidgets.QMessageBox.question(self, "Delete file", f"Delete this file?\n\n{path}") != QtWidgets.QMessageBox.Yes:
+            return
+        try:
+            os.remove(path)
+            self._remove_attachment_path_everywhere(path)
+            self._refresh_attachment_list()
+            self._refresh_uploaded_files_view()
+            self._queue_save()
+            self._set_status("File deleted", "ready")
+        except Exception as e:
+            self._set_status(f"Delete failed: {e}", "error")
+
+    def _replace_attachment_path_everywhere(self, old_path: str, new_path: str):
+        old_key = self._uploaded_file_key(old_path)
+        new_path = os.path.abspath(str(new_path or ""))
+        for att in list(getattr(self, "pending_attachments", []) or []):
+            if isinstance(att, dict) and self._uploaded_file_key(str(att.get("path", "") or "")) == old_key:
+                att.update(_make_attachment_entry(new_path))
+        for s in list(getattr(self, "sessions", []) or []):
+            for msg in list(getattr(s, "messages", []) or []):
+                for att in list(msg.get("attachments", []) or []):
+                    if isinstance(att, dict) and self._uploaded_file_key(str(att.get("path", "") or "")) == old_key:
+                        att.update(_make_attachment_entry(new_path))
+        try:
+            self._render_session(self._current_session())
+        except Exception:
+            pass
+
+    def _remove_attachment_path_everywhere(self, path: str):
+        key = self._uploaded_file_key(path)
+        self.pending_attachments = [
+            att for att in list(getattr(self, "pending_attachments", []) or [])
+            if not (isinstance(att, dict) and self._uploaded_file_key(str(att.get("path", "") or "")) == key)
+        ]
+        for s in list(getattr(self, "sessions", []) or []):
+            for msg in list(getattr(s, "messages", []) or []):
+                if isinstance(msg, dict):
+                    msg["attachments"] = [
+                        att for att in list(msg.get("attachments", []) or [])
+                        if not (isinstance(att, dict) and self._uploaded_file_key(str(att.get("path", "") or "")) == key)
+                    ]
+        try:
+            self._render_session(self._current_session())
+        except Exception:
+            pass
 
     def _toggle_framevision_fullscreen(self, checked: bool):
         self._framevision_fullscreen_active = bool(checked)
@@ -4293,6 +4579,10 @@ class LlamaChatWindow(QtWidgets.QMainWindow):
         s = self._find_session(session_id)
         if not s:
             return
+        try:
+            self._show_chat_view()
+        except Exception:
+            pass
         self.current_session_id = s.id
         self._load_session_into_ui(s)
         self._render_session(s)
@@ -6527,6 +6817,10 @@ class LlamaChatWindow(QtWidgets.QMainWindow):
         return ""
 
     def _send_message(self):
+        try:
+            self._show_chat_view()
+        except Exception:
+            pass
         text = (self.ed_prompt.toPlainText() or "").strip()
         attachments = list(self.pending_attachments)
         if not text and not attachments:
