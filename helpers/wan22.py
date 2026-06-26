@@ -3941,34 +3941,84 @@ class Wan22Pane(QWidget):
         return self._wan_turbo_root() / "Wan2.2-TI2V-5B-Turbo"
 
     def _ensure_wan_turbo_links(self, repo_dir: Path, model_root: Path, turbo_model_dir: Path):
-        """Best-effort creation of the two junctions expected by the Turbo repo."""
+        """Best-effort creation of the relative folders expected by the Turbo repo.
+
+        Keep WAN base files local/old-location compatible, but avoid the old
+        recursive wan_turbo folder loop.  The Turbo repo needs:
+            wan_models/Wan2.2-TI2V-5B/google/umt5-xxl/
+            wan_models/Wan2.2-TI2V-5B-Turbo/model.pt
+        """
+        def _same_target(a: Path, b: Path) -> bool:
+            try:
+                return a.exists() and a.resolve() == b.resolve()
+            except Exception:
+                return False
+
+        def _dir_link(dst: Path, src: Path):
+            try:
+                if not src.exists():
+                    return
+                if dst.exists() or dst.is_symlink():
+                    return
+                dst.parent.mkdir(parents=True, exist_ok=True)
+                if os.name == "nt":
+                    subprocess.run(
+                        ["cmd", "/c", "mklink", "/J", str(dst), str(src)],
+                        cwd=str(repo_dir), stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                        text=True, timeout=20,
+                    )
+                if not dst.exists():
+                    try:
+                        os.symlink(str(src), str(dst), target_is_directory=True)
+                    except TypeError:
+                        os.symlink(str(src), str(dst))
+            except Exception:
+                pass
+
+        def _file_link(dst: Path, src: Path):
+            try:
+                if not src.exists() or not src.is_file():
+                    return
+                if dst.exists() or dst.is_symlink():
+                    return
+                dst.parent.mkdir(parents=True, exist_ok=True)
+                try:
+                    os.link(str(src), str(dst))
+                except Exception:
+                    try:
+                        shutil.copy2(str(src), str(dst))
+                    except Exception:
+                        pass
+            except Exception:
+                pass
+
         try:
             wm = repo_dir / "wan_models"
             wm.mkdir(parents=True, exist_ok=True)
-            pairs = (
-                (wm / "Wan2.2-TI2V-5B", model_root),
-                (wm / "Wan2.2-TI2V-5B-Turbo", turbo_model_dir),
-            )
-            for link, target in pairs:
-                try:
-                    if link.exists():
-                        continue
-                    if os.name == "nt":
-                        subprocess.run(
-                            ["cmd", "/c", "mklink", "/J", str(link), str(target)],
-                            cwd=str(repo_dir),
-                            stdout=subprocess.PIPE,
-                            stderr=subprocess.PIPE,
-                            text=True,
-                            timeout=20,
-                        )
-                    else:
-                        try:
-                            os.symlink(str(target), str(link), target_is_directory=True)
-                        except TypeError:
-                            os.symlink(str(target), str(link))
-                except Exception:
-                    pass
+
+            # Base WAN folder: make a small real compatibility folder if the full
+            # junction is not already correct.  This fixes the tokenizer path while
+            # keeping user/custom folders untouched.
+            base = wm / "Wan2.2-TI2V-5B"
+            if model_root.exists():
+                if not _same_target(base, model_root):
+                    try:
+                        base.mkdir(parents=True, exist_ok=True)
+                    except Exception:
+                        pass
+                    src_umt5 = model_root / "google" / "umt5-xxl"
+                    _dir_link(base / "google" / "umt5-xxl", src_umt5)
+                    for fn in ("models_t5_umt5-xxl-enc-bf16.pth", "Wan2.2_VAE.pth", "diffusion_pytorch_model.safetensors.index.json"):
+                        src = model_root / fn
+                        if (not src.exists()) and fn == "models_t5_umt5-xxl-enc-bf16.pth":
+                            alt = src_umt5 / fn
+                            if alt.exists():
+                                src = alt
+                        _file_link(base / fn, src)
+
+            # Turbo model folder may safely be linked as a folder.
+            turbo_link = wm / "Wan2.2-TI2V-5B-Turbo"
+            _dir_link(turbo_link, turbo_model_dir)
         except Exception:
             pass
 
