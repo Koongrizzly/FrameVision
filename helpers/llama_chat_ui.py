@@ -338,12 +338,17 @@ def _memory_llm_memory_dir(fv_root: str) -> str:
     return os.path.join(_memories_root(fv_root), "llm_memory")
 
 
+def _memory_pinned_chats_dir(fv_root: str) -> str:
+    return os.path.join(_memories_root(fv_root), "pinned_chats")
+
+
 def _ensure_memory_folders(fv_root: str) -> None:
     for d in (
         _memory_saved_notes_dir(fv_root),
         _memory_user_files_dir(fv_root),
         _memory_project_dir(fv_root),
         _memory_llm_memory_dir(fv_root),
+        _memory_pinned_chats_dir(fv_root),
     ):
         try:
             os.makedirs(d, exist_ok=True)
@@ -2529,13 +2534,12 @@ class SettingsDialog(QtWidgets.QDialog):
             <h3>Chat Memory</h3>
             <p>User can save to memory or save to projects (both with right mouse click or directly typing in the chat (save to memory, save to project </p>
             <p>User can put files in assets/memories/user_files for specific memory tasks.</p>
-            <p>Give your llm extra powers, a name, a template (you are an expert in..)... by adding something in assets/memories/llm_memory -> it will be loaded everytime the model is loaded</p>
             <p>Chat also has access to the framevision knowledge base to be able to answer questions about the app.</p>
             
             <h3>Chat Wizards</h3>
+            <p>Start a new line in a chat with one of these triggers.</p>
+            <p>You can also use 'shortcuts' example : Create an image with z-image, 1280 x 720, wizard will ask for the remaining details.</p>
             <ul>
-            <p>cancel</b>: Stops the current wizard and returns to normal chat.</p>
-            <p>undo</b>: Goes back one step in the current wizard</p>
 
             <h3>Create image</h3>
             <p>The chat checks for available image models and lets you select a model to create an image.
@@ -2556,6 +2560,10 @@ class SettingsDialog(QtWidgets.QDialog):
             <p>Uses Ace Step Music 1.5. The chat checks the genre preset list for available genres and subgenres when present.
             It can also ask for a custom genre description when no preset is found, then collect duration, title, lyrics or instrumental choice, and other needed details.</p>
 
+            <p>cancel</b>: Stops the current wizard and returns to normal chat.</p>
+            <p>undo</b>: Goes back one step in the current wizard</p>
+
+
             </ul>
 
             <h3>Wizard behavior a other info</h3>
@@ -2568,8 +2576,10 @@ class SettingsDialog(QtWidgets.QDialog):
                 <li>A settings toggle lets generated results open in the original FrameVision player or stay only in the chat. Images can show in both.</li>
                 <li>Drag the splitter completely to the left to hide the internal mediaplayer and get a full sized llm chat program.</li>
                 <li>You can keep typing while a job is running, but sending is blocked until the job is finished to avoid overloading VRAM.</li>
-                <li>Right click on a response from the chat to retry</li>
+                <li>Right click on a response from the chat to use 'retry' for a new answer</li>
                 <li>Edit sent message and save them to have the chat try again with the updated request</li>
+                <li>Pinned chats allow you to save special prompts that can be re-used later (for example a prompt enhance script</li>
+                
             </ul>
             """
         )
@@ -2754,6 +2764,7 @@ class LlamaChatWindow(QtWidgets.QMainWindow):
         self._startup_llm_memory_context: str = ""
         self._last_memory_sources: List[str] = []
         self._memory_context_mode_for_next_generation: str = "auto"
+        self.pinned_chats: List[Dict[str, Any]] = []
 
         self._save_timer = QtCore.QTimer(self)
         self._save_timer.setSingleShot(True)
@@ -2771,6 +2782,7 @@ class LlamaChatWindow(QtWidgets.QMainWindow):
         self._apply_style()
         self._load_settings()
         self._reload_startup_llm_memory()
+        self._load_pinned_chats()
         self._apply_style()
         self._load_sessions()
         self._load_assistant_jobs()
@@ -2811,6 +2823,16 @@ class LlamaChatWindow(QtWidgets.QMainWindow):
         self.lbl_chats.setObjectName("SidebarTitle")
         row.addWidget(self.lbl_chats)
         row.addStretch(1)
+        self.btn_settings = QtWidgets.QToolButton()
+        self.btn_settings.setText("⚙")
+        self.btn_settings.setToolTip("Settings")
+        self.btn_settings.setObjectName("SidebarIconButton")
+        self.btn_delete_chat = QtWidgets.QToolButton()
+        self.btn_delete_chat.setText("🗑")
+        self.btn_delete_chat.setToolTip("Delete current chat")
+        self.btn_delete_chat.setObjectName("SidebarIconButton")
+        row.addWidget(self.btn_settings)
+        row.addWidget(self.btn_delete_chat)
         s_lay.addLayout(row)
 
         self.btn_new_chat = QtWidgets.QPushButton("New Chat")
@@ -2822,14 +2844,16 @@ class LlamaChatWindow(QtWidgets.QMainWindow):
 
         self.lst_chats = QtWidgets.QListWidget()
         self.lst_chats.setObjectName("ChatList")
+        self.lst_chats.setContextMenuPolicy(QtCore.Qt.CustomContextMenu)
         s_lay.addWidget(self.lst_chats, 1)
+
+        self.btn_pinned_chats = QtWidgets.QPushButton("Pinned Chats")
+        self.btn_pinned_chats.setToolTip("Open reusable specialist chat templates.")
+        s_lay.addWidget(self.btn_pinned_chats)
 
         self.btn_uploaded_files = QtWidgets.QPushButton("Uploaded Files")
         self.btn_uploaded_files.setToolTip("Show files that were attached/sent to the LLM chat so far.")
         s_lay.addWidget(self.btn_uploaded_files)
-
-        self.btn_delete_chat = QtWidgets.QPushButton("Delete Chat")
-        s_lay.addWidget(self.btn_delete_chat)
 
         self.btn_framevision_fullscreen = QtWidgets.QPushButton("Full screen")
         self.btn_framevision_fullscreen.setCheckable(True)
@@ -2837,9 +2861,6 @@ class LlamaChatWindow(QtWidgets.QMainWindow):
         self.btn_framevision_fullscreen.setToolTip("Expands the LLM Chat tab by moving FrameVision's main splitter to the left. You can also resize the splitter manually by dragging it.")
         # Hidden in FrameVision: fullscreen is controlled by the main app splitter, not by this sidebar button.
         self.btn_framevision_fullscreen.setVisible(False)
-
-        self.btn_settings = QtWidgets.QPushButton("Settings")
-        s_lay.addWidget(self.btn_settings)
 
         main = QtWidgets.QWidget()
         m_lay = QtWidgets.QVBoxLayout(main)
@@ -2935,10 +2956,12 @@ class LlamaChatWindow(QtWidgets.QMainWindow):
         cw_lay.addWidget(composer)
 
         self.files_view = self._build_uploaded_files_view()
+        self.pinned_view = self._build_pinned_chats_view()
 
         self.main_content_stack = QtWidgets.QStackedWidget()
         self.main_content_stack.addWidget(self.chat_view)
         self.main_content_stack.addWidget(self.files_view)
+        self.main_content_stack.addWidget(self.pinned_view)
 
         self.main_vertical_splitter = QtWidgets.QSplitter(QtCore.Qt.Vertical)
         self.main_vertical_splitter.setObjectName("ChatComposerSplitter")
@@ -2968,9 +2991,11 @@ class LlamaChatWindow(QtWidgets.QMainWindow):
         self.settings_dialog.settingsChanged.connect(self._settings_changed)
 
         self.btn_new_chat.clicked.connect(self._new_chat)
+        self.btn_pinned_chats.clicked.connect(self._toggle_pinned_chats_view)
         self.btn_uploaded_files.clicked.connect(self._toggle_uploaded_files_view)
         self.btn_delete_chat.clicked.connect(self._delete_current_chat)
         self.lst_chats.currentRowChanged.connect(self._on_chat_row_changed)
+        self.lst_chats.customContextMenuRequested.connect(self._chat_list_context_menu)
         self.ed_search.textChanged.connect(self._apply_chat_filter)
         self.btn_send.clicked.connect(self._send_message)
         self.ed_prompt.sendRequested.connect(self._send_message)
@@ -2987,6 +3012,242 @@ class LlamaChatWindow(QtWidgets.QMainWindow):
         self.lst_attachments.itemClicked.connect(self._preview_attachment_item)
         self.lst_attachments.customContextMenuRequested.connect(self._attachment_context_menu)
         self._refresh_attachment_list()
+
+
+    def _build_pinned_chats_view(self) -> QtWidgets.QWidget:
+        view = QtWidgets.QFrame()
+        view.setObjectName("PinnedChatsView")
+        lay = QtWidgets.QVBoxLayout(view)
+        lay.setContentsMargins(18, 18, 18, 18)
+        lay.setSpacing(10)
+
+        header = QtWidgets.QHBoxLayout()
+        title = QtWidgets.QLabel("Pinned Chats")
+        title.setObjectName("ChatHeader")
+        self.lbl_pinned_chats_info = QtWidgets.QLabel("")
+        self.lbl_pinned_chats_info.setObjectName("SubtleLabel")
+        self.btn_pinned_chats_refresh = QtWidgets.QPushButton("Refresh")
+        self.btn_pinned_chats_back = QtWidgets.QPushButton("Back to Chat")
+        header.addWidget(title)
+        header.addSpacing(12)
+        header.addWidget(self.lbl_pinned_chats_info, 1)
+        header.addWidget(self.btn_pinned_chats_refresh, 0)
+        header.addWidget(self.btn_pinned_chats_back, 0)
+        lay.addLayout(header)
+
+        self.lst_pinned_chats = QtWidgets.QListWidget()
+        self.lst_pinned_chats.setObjectName("ChatList")
+        self.lst_pinned_chats.setSelectionMode(QtWidgets.QAbstractItemView.SingleSelection)
+        self.lst_pinned_chats.setContextMenuPolicy(QtCore.Qt.CustomContextMenu)
+        lay.addWidget(self.lst_pinned_chats, 1)
+
+        self.lbl_pinned_chats_empty = QtWidgets.QLabel("No pinned chats yet. Right-click a normal chat and choose Add to pinned chats.")
+        self.lbl_pinned_chats_empty.setObjectName("SubtleLabel")
+        self.lbl_pinned_chats_empty.setAlignment(QtCore.Qt.AlignCenter)
+        lay.addWidget(self.lbl_pinned_chats_empty, 0)
+
+        self.lbl_pinned_chats_help = QtWidgets.QLabel(
+            "How to create a pinned chat\n\n"
+            "1. Start a normal new chat.\n"
+            "2. Paste or write the specialist instruction.\n"
+            "3. Send it once.\n"
+            "4. Right-click that chat in the chat list.\n"
+            "5. Choose Add to pinned chats.\n"
+            "6. Later, click the pinned chat to start a fresh chat with that saved instruction.\n\n"
+            "Pinned chats are reusable templates. They do not continue the old chat history unless you open the original normal chat."
+        )
+        self.lbl_pinned_chats_help.setObjectName("SubtleLabel")
+        self.lbl_pinned_chats_help.setWordWrap(True)
+        self.lbl_pinned_chats_help.setVisible(False)
+        lay.addWidget(self.lbl_pinned_chats_help, 0)
+
+        info_row = QtWidgets.QHBoxLayout()
+        self.btn_pinned_chats_info = QtWidgets.QPushButton("Info")
+        self.btn_pinned_chats_info.setToolTip("Show how pinned chats work.")
+        info_row.addStretch(1)
+        info_row.addWidget(self.btn_pinned_chats_info, 0)
+        lay.addLayout(info_row)
+
+        self.btn_pinned_chats_refresh.clicked.connect(self._refresh_pinned_chats_view)
+        self.btn_pinned_chats_back.clicked.connect(self._show_chat_view)
+        self.btn_pinned_chats_info.clicked.connect(self._show_pinned_chats_info)
+        self.lst_pinned_chats.itemDoubleClicked.connect(lambda item: self._start_pinned_chat_from_item(item))
+        self.lst_pinned_chats.customContextMenuRequested.connect(self._pinned_chats_context_menu)
+        return view
+
+    def _show_pinned_chats_info(self):
+        lbl = getattr(self, "lbl_pinned_chats_help", None)
+        if lbl is not None:
+            lbl.setVisible(not lbl.isVisible())
+
+    def _pinned_chat_path(self, pinned_id: str) -> str:
+        return os.path.join(_memory_pinned_chats_dir(self.fv_root), f"{_safe_memory_filename(pinned_id or 'pinned_chat')}.json")
+
+    def _load_pinned_chats(self):
+        self.pinned_chats = []
+        root = _memory_pinned_chats_dir(self.fv_root)
+        os.makedirs(root, exist_ok=True)
+        try:
+            for fn in os.listdir(root):
+                if not fn.lower().endswith(".json"):
+                    continue
+                data = _load_json(os.path.join(root, fn), None)
+                if not isinstance(data, dict):
+                    continue
+                data.setdefault("id", os.path.splitext(fn)[0])
+                data.setdefault("name", str(data.get("title") or data.get("id") or "Pinned Chat"))
+                data.setdefault("template", str(data.get("template") or data.get("system_prompt") or ""))
+                data["_path"] = os.path.join(root, fn)
+                self.pinned_chats.append(data)
+        except Exception:
+            pass
+        self.pinned_chats.sort(key=lambda d: str(d.get("name", "")).lower())
+
+    def _save_pinned_chat(self, data: Dict[str, Any]):
+        root = _memory_pinned_chats_dir(self.fv_root)
+        os.makedirs(root, exist_ok=True)
+        pinned_id = str(data.get("id") or str(uuid.uuid4()))
+        data["id"] = pinned_id
+        path = str(data.get("_path") or self._pinned_chat_path(pinned_id))
+        payload = {k: v for k, v in data.items() if not str(k).startswith("_")}
+        _save_json_atomic(path, payload)
+        data["_path"] = path
+
+    def _refresh_pinned_chats_view(self):
+        self._load_pinned_chats()
+        lst = getattr(self, "lst_pinned_chats", None)
+        if lst is None:
+            return
+        lst.clear()
+        for p in self.pinned_chats:
+            name = str(p.get("name") or "Pinned Chat")
+            desc = str(p.get("description") or p.get("template") or "")
+            item = QtWidgets.QListWidgetItem(name)
+            item.setToolTip((name + ("\n\n" + desc[:800] if desc else "")).strip())
+            item.setData(QtCore.Qt.UserRole, str(p.get("id") or ""))
+            lst.addItem(item)
+        try:
+            self.lbl_pinned_chats_info.setText(f"{len(self.pinned_chats)} pinned chat(s)")
+            self.lbl_pinned_chats_empty.setVisible(len(self.pinned_chats) == 0)
+        except Exception:
+            pass
+
+    def _pinned_chat_from_item(self, item: Optional[QtWidgets.QListWidgetItem]) -> Optional[Dict[str, Any]]:
+        if item is None:
+            return None
+        pid = str(item.data(QtCore.Qt.UserRole) or "")
+        for p in list(getattr(self, "pinned_chats", []) or []):
+            if str(p.get("id") or "") == pid:
+                return p
+        return None
+
+    def _start_pinned_chat_from_item(self, item: Optional[QtWidgets.QListWidgetItem]):
+        p = self._pinned_chat_from_item(item)
+        if not p:
+            return
+        self._start_pinned_chat(p)
+
+    def _start_pinned_chat(self, pinned: Dict[str, Any]):
+        template = str(pinned.get("template") or "").strip()
+        name = str(pinned.get("name") or "Pinned Chat").strip() or "Pinned Chat"
+        now = datetime.now().isoformat(timespec="seconds")
+        s = ChatSession.create_default()
+        s.title = name
+        s.created_at = now
+        s.updated_at = now
+        s.model_path = self.current_model_path()
+        tk, tv = self.current_template_choice()
+        s.template_kind = tk
+        s.template_value = tv
+        s.system_prompt = template or self.settings_dialog.ed_system.toPlainText()
+        s.messages = [{
+            "id": str(uuid.uuid4()),
+            "role": "info",
+            "content": f"Pinned Chat: {name}\n\nFresh chat started from a reusable template.",
+            "thinking": "",
+            "attachments": [],
+            "timestamp": now,
+            "loading": False,
+        }]
+        self.sessions.insert(0, s)
+        self._refresh_chat_list()
+        self._select_session(s.id)
+        self._queue_save()
+        self._set_status(f"Started pinned chat: {name}", "ready")
+
+    def _pinned_chats_context_menu(self, pos: QtCore.QPoint):
+        item = self.lst_pinned_chats.itemAt(pos)
+        pinned = self._pinned_chat_from_item(item)
+        if not pinned:
+            return
+        menu = QtWidgets.QMenu(self)
+        act_start = menu.addAction("Start new chat from this")
+        act_rename = menu.addAction("Rename pinned chat")
+        act_edit = menu.addAction("Edit template text")
+        act_delete = menu.addAction("Delete pinned chat")
+        chosen = menu.exec(self.lst_pinned_chats.mapToGlobal(pos))
+        if chosen == act_start:
+            self._start_pinned_chat(pinned)
+        elif chosen == act_rename:
+            self._rename_pinned_chat(pinned)
+        elif chosen == act_edit:
+            self._edit_pinned_chat_template(pinned)
+        elif chosen == act_delete:
+            self._delete_pinned_chat(pinned)
+
+    def _rename_pinned_chat(self, pinned: Dict[str, Any]):
+        old = str(pinned.get("name") or "Pinned Chat")
+        name, ok = QtWidgets.QInputDialog.getText(self, "Rename pinned chat", "Pinned chat name:", text=old)
+        if not ok:
+            return
+        name = str(name or "").strip()
+        if not name:
+            return
+        pinned["name"] = name
+        self._save_pinned_chat(pinned)
+        self._refresh_pinned_chats_view()
+
+    def _edit_pinned_chat_template(self, pinned: Dict[str, Any]):
+        dlg = QtWidgets.QDialog(self)
+        dlg.setWindowTitle("Edit pinned chat template")
+        dlg.resize(760, 520)
+        lay = QtWidgets.QVBoxLayout(dlg)
+        ed_name = QtWidgets.QLineEdit(str(pinned.get("name") or "Pinned Chat"))
+        ed = QtWidgets.QPlainTextEdit(str(pinned.get("template") or ""))
+        lay.addWidget(QtWidgets.QLabel("Name"))
+        lay.addWidget(ed_name)
+        lay.addWidget(QtWidgets.QLabel("Template instruction"))
+        lay.addWidget(ed, 1)
+        row = QtWidgets.QHBoxLayout()
+        btn_cancel = QtWidgets.QPushButton("Cancel")
+        btn_save = QtWidgets.QPushButton("Save")
+        row.addStretch(1)
+        row.addWidget(btn_cancel)
+        row.addWidget(btn_save)
+        lay.addLayout(row)
+        btn_cancel.clicked.connect(dlg.reject)
+        btn_save.clicked.connect(dlg.accept)
+        if dlg.exec() != QtWidgets.QDialog.Accepted:
+            return
+        pinned["name"] = ed_name.text().strip() or str(pinned.get("name") or "Pinned Chat")
+        pinned["template"] = ed.toPlainText().strip()
+        pinned["updated_at"] = datetime.now().isoformat(timespec="seconds")
+        self._save_pinned_chat(pinned)
+        self._refresh_pinned_chats_view()
+
+    def _delete_pinned_chat(self, pinned: Dict[str, Any]):
+        name = str(pinned.get("name") or "Pinned Chat")
+        if QtWidgets.QMessageBox.question(self, "Delete pinned chat", f"Delete pinned chat '{name}'?") != QtWidgets.QMessageBox.Yes:
+            return
+        try:
+            path = str(pinned.get("_path") or self._pinned_chat_path(str(pinned.get("id") or "")))
+            if os.path.isfile(path):
+                os.remove(path)
+        except Exception:
+            pass
+        self._load_pinned_chats()
+        self._refresh_pinned_chats_view()
+
 
 
     def _build_uploaded_files_view(self) -> QtWidgets.QWidget:
@@ -3043,6 +3304,9 @@ class LlamaChatWindow(QtWidgets.QMainWindow):
         btn = getattr(self, "btn_uploaded_files", None)
         if btn is not None:
             btn.setText("Uploaded Files")
+        pbtn = getattr(self, "btn_pinned_chats", None)
+        if pbtn is not None:
+            pbtn.setText("Pinned Chats")
 
     def _show_uploaded_files_view(self):
         self._refresh_uploaded_files_view()
@@ -3052,6 +3316,9 @@ class LlamaChatWindow(QtWidgets.QMainWindow):
         btn = getattr(self, "btn_uploaded_files", None)
         if btn is not None:
             btn.setText("Back to Chat")
+        pbtn = getattr(self, "btn_pinned_chats", None)
+        if pbtn is not None:
+            pbtn.setText("Pinned Chats")
 
     def _toggle_uploaded_files_view(self):
         stack = getattr(self, "main_content_stack", None)
@@ -3059,6 +3326,25 @@ class LlamaChatWindow(QtWidgets.QMainWindow):
             self._show_chat_view()
         else:
             self._show_uploaded_files_view()
+
+    def _show_pinned_chats_view(self):
+        self._refresh_pinned_chats_view()
+        stack = getattr(self, "main_content_stack", None)
+        if stack is not None:
+            stack.setCurrentIndex(2)
+        pbtn = getattr(self, "btn_pinned_chats", None)
+        if pbtn is not None:
+            pbtn.setText("Back to Chat")
+        btn = getattr(self, "btn_uploaded_files", None)
+        if btn is not None:
+            btn.setText("Uploaded Files")
+
+    def _toggle_pinned_chats_view(self):
+        stack = getattr(self, "main_content_stack", None)
+        if stack is not None and stack.currentIndex() == 2:
+            self._show_chat_view()
+        else:
+            self._show_pinned_chats_view()
 
     def _uploaded_file_key(self, path: str) -> str:
         try:
@@ -3427,6 +3713,20 @@ class LlamaChatWindow(QtWidgets.QMainWindow):
             color: {disabled_fg};
             background: {disabled_bg};
             border: 1px solid {_mix_hex(theme['border'], theme['window'], 0.35)};
+        }}
+        QToolButton#SidebarIconButton {{
+            min-width: 34px;
+            min-height: 34px;
+            max-width: 34px;
+            max-height: 34px;
+            border-radius: 12px;
+            border: 1px solid {theme['border']};
+            background: {theme['button']};
+            color: {_text_color_for_bg(theme['button'])};
+            font-size: 17px;
+        }}
+        QToolButton#SidebarIconButton:hover {{
+            background: {theme['hover']};
         }}
         QScrollArea {{
             border: none;
@@ -4561,19 +4861,7 @@ class LlamaChatWindow(QtWidgets.QMainWindow):
         s = self._current_session()
         if not s:
             return
-        if QtWidgets.QMessageBox.question(self, "Delete chat", f"Delete '{s.title}'?") != QtWidgets.QMessageBox.Yes:
-            return
-        self.sessions = [x for x in self.sessions if x.id != s.id]
-        try:
-            os.remove(os.path.join(self.chat_dir, f"{s.id}.json"))
-        except Exception:
-            pass
-        self._refresh_chat_list()
-        if self.sessions:
-            self._select_session(self.sessions[0].id)
-        else:
-            self._new_chat()
-        self._queue_save()
+        self._delete_chat_session(s)
 
     def _select_session(self, session_id: str):
         s = self._find_session(session_id)
@@ -4593,6 +4881,100 @@ class LlamaChatWindow(QtWidgets.QMainWindow):
                 break
         self._update_header()
         self._queue_save()
+
+
+    def _chat_list_context_menu(self, pos: QtCore.QPoint):
+        item = self.lst_chats.itemAt(pos)
+        if not item:
+            return
+        sid = str(item.data(QtCore.Qt.UserRole) or "")
+        s = self._find_session(sid)
+        if not s:
+            return
+        menu = QtWidgets.QMenu(self)
+        act_pin = menu.addAction("Add to pinned chats")
+        act_rename = menu.addAction("Rename chat")
+        act_delete = menu.addAction("Delete chat")
+        chosen = menu.exec(self.lst_chats.mapToGlobal(pos))
+        if chosen == act_pin:
+            self._add_session_to_pinned_chats(s)
+        elif chosen == act_rename:
+            self._rename_chat_session(s)
+        elif chosen == act_delete:
+            self._delete_chat_session(s)
+
+    def _rename_chat_session(self, session: ChatSession):
+        name, ok = QtWidgets.QInputDialog.getText(self, "Rename chat", "Chat name:", text=session.title or "Chat")
+        if not ok:
+            return
+        name = str(name or "").strip()
+        if not name:
+            return
+        session.title = name[:120]
+        session.updated_at = datetime.now().isoformat(timespec="seconds")
+        self._refresh_chat_list()
+        self._update_header()
+        self._queue_save()
+
+    def _delete_chat_session(self, session: ChatSession):
+        if QtWidgets.QMessageBox.question(self, "Delete chat", f"Delete '{session.title}'?") != QtWidgets.QMessageBox.Yes:
+            return
+        sid = session.id
+        self.sessions = [x for x in self.sessions if x.id != sid]
+        try:
+            os.remove(os.path.join(self.chat_dir, f"{sid}.json"))
+        except Exception:
+            pass
+        self._refresh_chat_list()
+        if self.current_session_id == sid:
+            if self.sessions:
+                self._select_session(self.sessions[0].id)
+            else:
+                self._new_chat()
+        self._queue_save()
+
+    def _template_text_from_session(self, session: ChatSession) -> str:
+        # The intended workflow is: start a new chat, paste/send the specialist
+        # instruction, then pin that chat. Prefer the first user message because
+        # it is normally the reusable "how to" instruction.
+        for msg in list(session.messages or []):
+            if str(msg.get("role") or "") == "user":
+                txt = str(msg.get("content") or "").strip()
+                if txt:
+                    return txt
+        if session.system_prompt and session.system_prompt.strip():
+            return session.system_prompt.strip()
+        for msg in list(session.messages or []):
+            txt = str(msg.get("content") or "").strip()
+            if txt:
+                return txt
+        return ""
+
+    def _add_session_to_pinned_chats(self, session: ChatSession):
+        template = self._template_text_from_session(session)
+        if not template:
+            QtWidgets.QMessageBox.information(self, "Add to pinned chats", "This chat does not contain a reusable instruction yet.")
+            return
+        name, ok = QtWidgets.QInputDialog.getText(self, "Add to pinned chats", "Pinned chat name:", text=session.title or "Pinned Chat")
+        if not ok:
+            return
+        name = str(name or "").strip() or session.title or "Pinned Chat"
+        now = datetime.now().isoformat(timespec="seconds")
+        data = {
+            "id": str(uuid.uuid4()),
+            "name": name[:120],
+            "description": template[:240],
+            "template": template,
+            "source_chat_id": session.id,
+            "source_chat_title": session.title,
+            "created_at": now,
+            "updated_at": now,
+        }
+        self._save_pinned_chat(data)
+        self._load_pinned_chats()
+        self._refresh_pinned_chats_view()
+        self._set_status(f"Pinned chat saved: {name}", "ready")
+
 
     def _on_chat_row_changed(self, row: int):
         if row < 0 or row >= self.lst_chats.count():
@@ -6421,6 +6803,62 @@ class LlamaChatWindow(QtWidgets.QMainWindow):
             ok = self._assistant_write_pending_job(job)
             return ok, str(cfg_path.resolve()) if ok else "Could not write Ace-Step job to jobs/pending.", str(out_dir.resolve())
 
+    # ----------------------------- strict wizard start triggers -----------------------------
+    def _wizard_first_nonempty_line(self, text: str) -> str:
+        """Return the first non-empty user-visible line for strict wizard routing."""
+        for line in str(text or "").splitlines():
+            line = line.strip()
+            if line:
+                return line
+        return ""
+
+    def _wizard_normalize_first_line(self, text: str) -> str:
+        line = self._wizard_first_nonempty_line(text).lower()
+        line = re.sub(r"[`*_#>\"']+", "", line).strip()
+        line = re.sub(r"\s+", " ", line)
+        return line
+
+    def _wizard_first_line_has_prefix(self, text: str, prefixes: List[str]) -> bool:
+        """
+        Wizard/action routes must be explicit commands on the first non-empty line.
+        Tool words mentioned later in a long prompt/template are normal chat text.
+        """
+        line = self._wizard_normalize_first_line(text)
+        if not line:
+            return False
+        for prefix in prefixes:
+            p = self._ace15_normalize_text(prefix)
+            if not p:
+                continue
+            if line == p:
+                return True
+            if line.startswith(p + " ") or line.startswith(p + ":") or line.startswith(p + " -"):
+                rest = line[len(p):].strip(" :-\t")
+                # Prompt/template-writing requests are text tasks, not FrameVision job requests.
+                if rest and re.match(r"^(prompt|prompts|template|instruction|instructions|how to|guide|help)\b", rest):
+                    return False
+                return True
+        return False
+
+    def _is_framevision_wizard_start_command(self, text: str) -> bool:
+        """True only for explicit first-line FrameVision wizard commands."""
+        return self._wizard_first_line_has_prefix(text, [
+            "create an image",
+            "create image",
+            "edit an image",
+            "edit image",
+            "upscale image",
+            "upscale video",
+            "create a video",
+            "create music",
+        ])
+
+    def _is_ace15_music_start_command(self, text: str) -> bool:
+        return self._wizard_first_line_has_prefix(text, ["create music"])
+
+    def _is_seedvr2_upscale_start_command(self, text: str) -> bool:
+        return self._wizard_first_line_has_prefix(text, ["upscale image", "upscale video"])
+
     # ----------------------------- wizard undo trigger words -----------------------------
     def _wizard_is_cancel_command(self, text: str) -> bool:
         return self._ace15_normalize_text(text) in {"cancel", "cancel it", "stop", "nevermind", "never mind"}
@@ -6797,6 +7235,8 @@ class LlamaChatWindow(QtWidgets.QMainWindow):
         low = str(text or "").strip().lower()
         if not low:
             return False
+        if not self._is_seedvr2_upscale_start_command(text):
+            return False
         if not self._media_attachment_paths_for_seedvr2(attachments):
             return False
         return bool(re.search(r"\b(upscale|upscaler|seed\s*vr\s*2|seedvr2|enlarge|increase\s+resolution)\b", low, flags=re.IGNORECASE))
@@ -6859,7 +7299,7 @@ class LlamaChatWindow(QtWidgets.QMainWindow):
             if self._handle_pending_ace15_music_message(text):
                 return
 
-        if self._ace15_music_intent(text):
+        if self._is_ace15_music_start_command(text) and self._ace15_music_intent(text):
             s = self._append_user_message_to_current_session(text, attachments)
             if not s:
                 return
@@ -6887,7 +7327,7 @@ class LlamaChatWindow(QtWidgets.QMainWindow):
         # Image-create commands are handled before requiring a loaded local LLM,
         # so users can queue FrameVision image jobs instead of getting a text-only
         # "I cannot create images" response. Normal chat still goes to the LLM.
-        if (text or attachments) and getattr(self, "_fv_assistant_router", None) is not None:
+        if (text or attachments) and getattr(self, "_fv_assistant_router", None) is not None and self._is_framevision_wizard_start_command(text):
             try:
                 route = self._fv_assistant_router.handle_user_text(text, attachments=attachments)
             except Exception as e:
