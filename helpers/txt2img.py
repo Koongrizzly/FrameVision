@@ -403,6 +403,8 @@ class Txt2ImgPane(QWidget):
             "zimage_turbo_gguf": "zimage_gguf",
             "qwen_image_2512": "qwen2512",
             "chroma": "chroma",
+            "krea2": "krea2",
+            "krea2_gguf": "krea2",
             "lens_turbo_u4": "lens_turbo_u4",
         }
         return {engine for entry_id, engine in _hide_map.items() if entry_id in _hidden}
@@ -414,6 +416,7 @@ class Txt2ImgPane(QWidget):
             ("Z-Image Turbo (GGUF Low VRAM)", "zimage_gguf"),
             ("Qwen 2.5 12B GGUF (Low VRAM)", "qwen2512"),
             ("Ideogram 4 GGUF", "ideogram4_gguf"),
+            ("Krea 2 GGUF", "krea2"),
             ("Chroma", "chroma"),
             ("Lens Turbo U4", "lens_turbo_u4"),
         ]
@@ -1201,6 +1204,9 @@ class Txt2ImgPane(QWidget):
         if ("lens" in key) or ("turbo_u4" in key) or ("turbo u4" in key):
             return "lens_turbo_u4"
 
+        if "krea" in key:
+            return "krea2"
+
         if "chroma" in key:
             return "chroma"
 
@@ -1514,6 +1520,7 @@ class Txt2ImgPane(QWidget):
             self.engine_combo.addItem("Z-Image Turbo (GGUF Low VRAM)", "zimage_gguf")
             self.engine_combo.addItem("Qwen 2.5 12B GGUF (Low VRAM)", "qwen2512")
             self.engine_combo.addItem("Ideogram 4 GGUF", "ideogram4_gguf")
+            self.engine_combo.addItem("Krea 2 GGUF", "krea2")
             self.engine_combo.addItem("Chroma", "chroma")
             self.engine_combo.addItem("Lens Turbo U4", "lens_turbo_u4")
         except Exception:
@@ -1523,6 +1530,7 @@ class Txt2ImgPane(QWidget):
             self.engine_combo.addItem("Z-Image Turbo (GGUF Low VRAM)")
             self.engine_combo.addItem("qwen 2.5 12B GGUF (Low VRAM)")
             self.engine_combo.addItem("Ideogram 4 GGUF")
+            self.engine_combo.addItem("Krea 2 GGUF")
             self.engine_combo.addItem("Chroma")
             self.engine_combo.addItem("Lens Turbo U4")
 
@@ -1547,6 +1555,8 @@ class Txt2ImgPane(QWidget):
                     "zimage_turbo_gguf": "zimage_gguf",
                     "qwen_image_2512": "qwen2512",
                     "ideogram4_gguf": "ideogram4_gguf",
+                    "krea2": "krea2",
+                    "krea2_gguf": "krea2",
                     "chroma": "chroma",
                     "lens_turbo_u4": "lens_turbo_u4",
                 }
@@ -1678,6 +1688,29 @@ class Txt2ImgPane(QWidget):
         except Exception:
             pass
         outer.addWidget(self._ideogram4_embed_host, 1)
+
+        # Embedded Krea 2 GGUF UI host. Krea 2 is a full helper page that runs
+        # through sd-cli, so txt2img embeds its own UI instead of mixing controls.
+        self._krea2_embed_host = QWidget(self)
+        self._krea2_embed_host.setVisible(False)
+        self._krea2_embed_layout = QVBoxLayout(self._krea2_embed_host)
+        try:
+            self._krea2_embed_layout.setContentsMargins(0, 0, 0, 0)
+        except Exception:
+            pass
+        self._krea2_loading_label = QLabel("Loading Krea 2 GGUF UI...")
+        try:
+            self._krea2_loading_label.setAlignment(Qt.AlignCenter)
+            self._krea2_loading_label.setStyleSheet("padding: 24px; font-size: 16px; font-weight: 600;")
+            self._krea2_embed_layout.addWidget(self._krea2_loading_label, 1)
+        except Exception:
+            pass
+        self._krea2_open_pending = False
+        try:
+            self._krea2_embed_host.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+        except Exception:
+            pass
+        outer.addWidget(self._krea2_embed_host, 1)
 
         # Main generation form. Keep left-side labels in one clean column instead of
         # mixing free-floating labels and embedded row labels.
@@ -3705,7 +3738,7 @@ class Txt2ImgPane(QWidget):
             # txt2img tabs/footer after Chroma just hid them.
             if not bool(visible):
                 try:
-                    if self._engine_key_selected() in ("chroma", "ideogram4_gguf"):
+                    if self._engine_key_selected() in ("chroma", "ideogram4_gguf", "krea2"):
                         lh = getattr(self, "_lens_embed_host", None)
                         if lh is not None:
                             lh.setVisible(False)
@@ -3913,7 +3946,7 @@ class Txt2ImgPane(QWidget):
             # txt2img tabs/footer after Lens just hid them.
             if not bool(visible):
                 try:
-                    if self._engine_key_selected() in ("lens_turbo_u4", "ideogram4_gguf"):
+                    if self._engine_key_selected() in ("lens_turbo_u4", "ideogram4_gguf", "krea2"):
                         ch = getattr(self, "_chroma_embed_host", None)
                         if ch is not None:
                             ch.setVisible(False)
@@ -3923,6 +3956,7 @@ class Txt2ImgPane(QWidget):
             root = getattr(self, "_txt2img_root_layout", None)
             chroma_host = getattr(self, "_chroma_embed_host", None)
             lens_host = getattr(self, "_lens_embed_host", None)
+            krea2_host = getattr(self, "_krea2_embed_host", None)
             if root is None:
                 return
 
@@ -3971,11 +4005,12 @@ class Txt2ImgPane(QWidget):
                     chroma_host.setVisible(bool(visible))
             except Exception:
                 pass
-            try:
-                if lens_host is not None:
-                    lens_host.setVisible(False)
-            except Exception:
-                pass
+            for _host in (lens_host, krea2_host):
+                try:
+                    if _host is not None:
+                        _host.setVisible(False)
+                except Exception:
+                    pass
 
             for i in range(root.count()):
                 item = root.itemAt(i)
@@ -3988,9 +4023,10 @@ class Txt2ImgPane(QWidget):
                         chroma_host.setVisible(bool(visible))
                     except Exception:
                         pass
-                elif w is lens_host:
+                elif w is lens_host or w is krea2_host:
                     try:
-                        lens_host.setVisible(False)
+                        if w is not None:
+                            w.setVisible(False)
                     except Exception:
                         pass
                 else:
@@ -4125,7 +4161,7 @@ class Txt2ImgPane(QWidget):
         try:
             if not bool(visible):
                 try:
-                    if self._engine_key_selected() in ("lens_turbo_u4", "chroma"):
+                    if self._engine_key_selected() in ("lens_turbo_u4", "chroma", "krea2"):
                         ih = getattr(self, "_ideogram4_embed_host", None)
                         if ih is not None:
                             ih.setVisible(False)
@@ -4136,6 +4172,7 @@ class Txt2ImgPane(QWidget):
             ideogram_host = getattr(self, "_ideogram4_embed_host", None)
             lens_host = getattr(self, "_lens_embed_host", None)
             chroma_host = getattr(self, "_chroma_embed_host", None)
+            krea2_host = getattr(self, "_krea2_embed_host", None)
             if root is None:
                 return
 
@@ -4179,7 +4216,7 @@ class Txt2ImgPane(QWidget):
             except Exception:
                 pass
 
-            for _host in (lens_host, chroma_host):
+            for _host in (lens_host, chroma_host, krea2_host):
                 try:
                     if _host is not None:
                         _host.setVisible(False)
@@ -4202,7 +4239,7 @@ class Txt2ImgPane(QWidget):
                         ideogram_host.setVisible(bool(visible))
                     except Exception:
                         pass
-                elif w is lens_host or w is chroma_host:
+                elif w is lens_host or w is chroma_host or w is krea2_host:
                     try:
                         if w is not None:
                             w.setVisible(False)
@@ -4242,6 +4279,222 @@ class Txt2ImgPane(QWidget):
                 try:
                     if ideogram_host is not None:
                         ideogram_host.setVisible(False)
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
+    def _open_krea2_ui(self):
+        """Show the Krea 2 GGUF helper UI embedded inside the txt2img tab."""
+        try:
+            host = getattr(self, "_krea2_embed_host", None)
+            lay = getattr(self, "_krea2_embed_layout", None)
+            if host is None or lay is None:
+                return None
+
+            self._krea2_open_pending = False
+            win = getattr(self, "_krea2_window", None)
+            if win is None:
+                try:
+                    loading = getattr(self, "_krea2_loading_label", None)
+                    if loading is not None:
+                        loading.setVisible(True)
+                        loading.setText("Loading Krea 2 GGUF UI...")
+                    host.setVisible(True)
+                    QApplication.processEvents()
+                except Exception:
+                    pass
+                try:
+                    from helpers.krea2 import Krea2Widget  # type: ignore
+                except Exception:
+                    from krea2 import Krea2Widget  # type: ignore
+
+                win = Krea2Widget(parent=host)
+                self._krea2_window = win
+                try:
+                    win.setParent(host)
+                except Exception:
+                    pass
+                try:
+                    win.setWindowFlags(Qt.Widget)
+                except Exception:
+                    pass
+                try:
+                    win.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+                except Exception:
+                    pass
+                try:
+                    loading = getattr(self, "_krea2_loading_label", None)
+                    if loading is not None:
+                        loading.setVisible(False)
+                except Exception:
+                    pass
+                try:
+                    lay.addWidget(win, 1)
+                except Exception:
+                    pass
+                try:
+                    win.destroyed.connect(lambda *_: setattr(self, "_krea2_window", None))
+                except Exception:
+                    pass
+
+            try:
+                host.setVisible(True)
+            except Exception:
+                pass
+            try:
+                win.show()
+            except Exception:
+                pass
+            try:
+                if hasattr(self, "status"):
+                    self.status.setText("Krea 2 GGUF UI shown inside TXT to IMG")
+            except Exception:
+                pass
+            return win
+        except Exception as exc:
+            self._krea2_open_pending = False
+            try:
+                loading = getattr(self, "_krea2_loading_label", None)
+                if loading is not None:
+                    loading.setVisible(True)
+                    loading.setText(f"Could not load Krea 2 GGUF UI:\n{exc}")
+            except Exception:
+                pass
+            try:
+                QMessageBox.warning(self, "Krea 2 GGUF", f"Could not show Krea 2 GGUF UI:\n{exc}")
+            except Exception:
+                pass
+            try:
+                if hasattr(self, "status"):
+                    self.status.setText(f"Could not show Krea 2 GGUF UI: {exc}")
+            except Exception:
+                pass
+            return None
+
+    def _set_krea2_embedded_visible(self, visible: bool):
+        """Toggle Krea 2 embedded view and hide txt2img controls/footer/tabs while Krea owns the page."""
+        try:
+            if not bool(visible):
+                try:
+                    if self._engine_key_selected() in ("lens_turbo_u4", "chroma", "ideogram4_gguf"):
+                        kh = getattr(self, "_krea2_embed_host", None)
+                        if kh is not None:
+                            kh.setVisible(False)
+                        return
+                except Exception:
+                    pass
+            root = getattr(self, "_txt2img_root_layout", None)
+            krea2_host = getattr(self, "_krea2_embed_host", None)
+            lens_host = getattr(self, "_lens_embed_host", None)
+            chroma_host = getattr(self, "_chroma_embed_host", None)
+            ideogram_host = getattr(self, "_ideogram4_embed_host", None)
+            if root is None:
+                return
+
+            def _set_item_visible(item, show: bool):
+                try:
+                    w = item.widget()
+                except Exception:
+                    w = None
+                if w is not None:
+                    try:
+                        w.setVisible(show)
+                    except Exception:
+                        pass
+                    return
+                try:
+                    l = item.layout()
+                except Exception:
+                    l = None
+                if l is not None:
+                    for ii in range(l.count()):
+                        try:
+                            _set_item_visible(l.itemAt(ii), show)
+                        except Exception:
+                            pass
+
+            try:
+                tabs = getattr(self, "txt2img_tabs", None)
+                if tabs is not None:
+                    try:
+                        tabs.setCurrentIndex(0)
+                    except Exception:
+                        pass
+                    try:
+                        tabs.setVisible(not bool(visible))
+                    except Exception:
+                        pass
+                    try:
+                        tabs.tabBar().setVisible(True)
+                    except Exception:
+                        pass
+            except Exception:
+                pass
+
+            for _host in (lens_host, chroma_host, ideogram_host):
+                try:
+                    if _host is not None:
+                        _host.setVisible(False)
+                except Exception:
+                    pass
+            try:
+                if krea2_host is not None:
+                    krea2_host.setVisible(bool(visible))
+            except Exception:
+                pass
+
+            for i in range(root.count()):
+                item = root.itemAt(i)
+                try:
+                    w = item.widget()
+                except Exception:
+                    w = None
+                if w is krea2_host:
+                    try:
+                        krea2_host.setVisible(bool(visible))
+                    except Exception:
+                        pass
+                elif w is lens_host or w is chroma_host or w is ideogram_host:
+                    try:
+                        if w is not None:
+                            w.setVisible(False)
+                    except Exception:
+                        pass
+                else:
+                    _set_item_visible(item, not bool(visible))
+
+            for _w in list(getattr(self, "_txt2img_progress_widgets", []) or []) + list(getattr(self, "_txt2img_footer_widgets", []) or []):
+                try:
+                    if _w is not None:
+                        _w.setVisible(not bool(visible))
+                except Exception:
+                    pass
+
+            if visible:
+                try:
+                    loading = getattr(self, "_krea2_loading_label", None)
+                    if loading is not None and getattr(self, "_krea2_window", None) is None:
+                        loading.setVisible(True)
+                        loading.setText("Loading Krea 2 GGUF UI...")
+                except Exception:
+                    pass
+                if getattr(self, "_krea2_window", None) is None and not bool(getattr(self, "_krea2_open_pending", False)):
+                    self._krea2_open_pending = True
+                    try:
+                        QTimer.singleShot(40, self._open_krea2_ui)
+                    except Exception:
+                        self._open_krea2_ui()
+                else:
+                    try:
+                        self._open_krea2_ui()
+                    except Exception:
+                        pass
+            else:
+                self._krea2_open_pending = False
+                try:
+                    if krea2_host is not None:
+                        krea2_host.setVisible(False)
                 except Exception:
                     pass
         except Exception:
@@ -4495,6 +4748,8 @@ class Txt2ImgPane(QWidget):
                     key = "lens_turbo_u4"
                 elif "ideogram" in text:
                     key = "ideogram4_gguf"
+                elif "krea" in text:
+                    key = "krea2"
                 elif "gguf" in text:
                     key = "zimage_gguf"
                 elif "z-image" in text or "zimage" in text:
@@ -4511,6 +4766,7 @@ class Txt2ImgPane(QWidget):
         is_chroma = (key == "chroma")
         is_lens = (key == "lens_turbo_u4")
         is_ideogram4 = (key == "ideogram4_gguf")
+        is_krea2 = (key == "krea2")
 
         # Generic img2img/init-image row is hidden globally and forced off.
         # GGUF selective edit still lives in its own dedicated tab.
@@ -4525,7 +4781,7 @@ class Txt2ImgPane(QWidget):
             pass
 
         # If switching to Z-Image / qwen, aggressively try to free CUDA VRAM
-        if is_zimage or is_qwen or is_lens or is_chroma or is_ideogram4:
+        if is_zimage or is_qwen or is_lens or is_chroma or is_ideogram4 or is_krea2:
             try:
                 _aggressive_free_cuda_vram()
             except Exception:
@@ -4548,6 +4804,8 @@ class Txt2ImgPane(QWidget):
                     self.banner.setText("Text to image with Chroma")
                 elif is_ideogram4:
                     self.banner.setText("Text to image with Ideogram 4 GGUF")
+                elif is_krea2:
+                    self.banner.setText("Text to image with Krea 2 GGUF")
                 else:
                     self.banner.setText(base or "Text to Image with SDXL Loader")
         except Exception:
@@ -4561,12 +4819,12 @@ class Txt2ImgPane(QWidget):
         try:
             if picker is not None:
                 # Hide the empty picker for Chroma, otherwise keep it visible.
-                picker.setVisible(not (is_chroma or is_ideogram4))
+                picker.setVisible(not (is_chroma or is_ideogram4 or is_krea2))
                 # Update the disclosure title: 'Model' for SD engines, 'LoRA' for Z-Image
                 try:
                     btn = getattr(picker, "_btn", None)
                     if btn is not None:
-                        btn.setText("Lens UI" if is_lens else ("qwen models" if is_qwen else ("GGUF" if is_gguf else ("LoRA" if is_zimage else ("Ideogram" if is_ideogram4 else ("Chroma" if is_chroma else "Model"))))))
+                        btn.setText("Lens UI" if is_lens else ("Krea 2" if is_krea2 else ("qwen models" if is_qwen else ("GGUF" if is_gguf else ("LoRA" if is_zimage else ("Ideogram" if is_ideogram4 else ("Chroma" if is_chroma else "Model")))))))
                 except Exception:
                     pass
         except Exception:
@@ -4581,15 +4839,15 @@ class Txt2ImgPane(QWidget):
                        getattr(self, "model_refresh", None),
                        getattr(self, "model_browse", None)):
                 if _w is not None:
-                    _w.setVisible(not (is_zimage or is_qwen or is_lens or is_chroma or is_ideogram4))
+                    _w.setVisible(not (is_zimage or is_qwen or is_lens or is_chroma or is_ideogram4 or is_krea2))
 
             # LoRA labels: show engine-specific text
             lora_label = getattr(self, "lora_label", None)
             if lora_label is not None:
-                lora_label.setText("LoRA (Z-Image)" if is_zimage else ("LoRA (Qwen)" if is_qwen else ("Lens UI" if is_lens else ("Ideogram UI" if is_ideogram4 else "LoRA (SDXL)"))))
+                lora_label.setText("LoRA (Z-Image)" if is_zimage else ("LoRA (Qwen)" if is_qwen else ("Lens UI" if is_lens else ("Krea 2 UI" if is_krea2 else ("Ideogram UI" if is_ideogram4 else "LoRA (SDXL)")))))
             lora2_label = getattr(self, "lora2_label", None)
             if lora2_label is not None:
-                lora2_label.setText("LoRA 2 (Z-Image)" if is_zimage else ("LoRA 2 (Qwen)" if is_qwen else ("" if (is_lens or is_ideogram4) else "LoRA 2 (SDXL)")))
+                lora2_label.setText("LoRA 2 (Z-Image)" if is_zimage else ("LoRA 2 (Qwen)" if is_qwen else ("" if (is_lens or is_ideogram4 or is_krea2) else "LoRA 2 (SDXL)")))
 
             # GGUF selectors: visible only for GGUF engine
             for _w in (
@@ -4649,7 +4907,7 @@ class Txt2ImgPane(QWidget):
         try:
             lab = getattr(self, "preset_label", None)
             combo = getattr(self, "preset_combo", None)
-            visible = not (is_zimage or is_qwen or is_lens or is_chroma or is_ideogram4)
+            visible = not (is_zimage or is_qwen or is_lens or is_chroma or is_ideogram4 or is_krea2)
             if lab is not None:
                 lab.setVisible(visible)
             if combo is not None:
@@ -4671,6 +4929,21 @@ class Txt2ImgPane(QWidget):
             self._set_ideogram4_embedded_visible(bool(is_ideogram4))
         except Exception:
             pass
+        try:
+            self._set_krea2_embedded_visible(bool(is_krea2))
+        except Exception:
+            pass
+        if is_krea2:
+            try:
+                self._last_engine_key = "krea2"
+            except Exception:
+                pass
+            try:
+                if saved_fmt is not None and hasattr(self, "format_combo"):
+                    self.format_combo.setCurrentText(str(saved_fmt))
+            except Exception:
+                pass
+            return
         if is_ideogram4:
             try:
                 self._last_engine_key = "ideogram4_gguf"
