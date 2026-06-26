@@ -158,10 +158,12 @@ def _pick_file(model_dir: Path, must_contain: list[str], suffix: str) -> Path | 
 
 def _model_paths(root: Path) -> tuple[Path | None, Path | None, Path | None]:
     md = root / "models" / "Qwen-Image-2512 GGUF"
+    shared = root / "models" / "shared"
     # Diffusion GGUF (Q4)
     diffusion = _pick_file(md, ["qwen", "image", "2512", "q4"], ".gguf")
-    # LLM GGUF (Q4) — Unsloth suggests Qwen2.5-VL-7B-Instruct
-    llm = _pick_file(md, ["qwen2.5", "vl", "7b", "instruct", "q4"], ".gguf")
+    # LLM GGUF (Q4) — prefer shared copy, fall back to the old local folder.
+    shared_llm = shared / "Qwen2.5-VL-7B-Instruct-UD-Q4_K_XL.gguf"
+    llm = shared_llm if shared_llm.exists() else _pick_file(md, ["qwen2.5", "vl", "7b", "instruct", "q4"], ".gguf")
     # VAE safetensors
     vae = md / "qwen_image_vae.safetensors"
     if not (vae.exists() if vae else False):

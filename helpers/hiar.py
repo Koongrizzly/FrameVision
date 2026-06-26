@@ -634,6 +634,7 @@ class HiARPane(QWidget):
             proc.setProcessChannelMode(QProcess.MergedChannels)
             env = QProcessEnvironment.systemEnvironment()
             env.insert("PYTHONPATH", self._join_env_path(str(repo_root), os.environ.get("PYTHONPATH", "")))
+            env.insert("FRAMEVISION_SHARED_MODELS", str(self.framevision_root / "models" / "shared"))
             env.insert("PYTHONUNBUFFERED", "1")
             env.insert("PYTHONIOENCODING", "utf-8")
             env.insert("USERNAME", os.environ.get("USERNAME", "FrameVision"))
@@ -739,7 +740,9 @@ class HiARPane(QWidget):
         self._append_log(f"[diag] python exists: {Path(self.python_edit.text().strip()).exists()} :: {self.python_edit.text().strip()}")
         self._append_log(f"[diag] wan model dir exists: {(repo_root / 'wan_models' / 'Wan2.1-T2V-1.3B').exists()} :: {repo_root / 'wan_models' / 'Wan2.1-T2V-1.3B'}")
         self._append_log(f"[diag] VAE exists: {(repo_root / 'wan_models' / 'Wan2.1-T2V-1.3B' / 'Wan2.1_VAE.pth').exists()}")
-        self._append_log(f"[diag] T5 exists: {(repo_root / 'wan_models' / 'Wan2.1-T2V-1.3B' / 'models_t5_umt5-xxl-enc-bf16.pth').exists()}")
+        local_t5 = repo_root / 'wan_models' / 'Wan2.1-T2V-1.3B' / 'models_t5_umt5-xxl-enc-bf16.pth'
+        shared_t5 = self.framevision_root / 'models' / 'shared' / 'models_t5_umt5-xxl-enc-bf16.pth'
+        self._append_log(f"[diag] T5 exists: {(local_t5.exists() or shared_t5.exists())} :: {shared_t5 if shared_t5.exists() else local_t5}")
         self._append_log(f"[diag] tokenizer dir exists: {(repo_root / 'wan_models' / 'Wan2.1-T2V-1.3B' / 'google' / 'umt5-xxl').exists()}")
 
         proc = QProcess(self)
@@ -753,6 +756,7 @@ class HiARPane(QWidget):
         fv_root_str = str(self.framevision_root)
         # Keep caches inside FrameVision / repo tree.
         env.insert("PYTHONPATH", self._join_env_path(repo_root_str, os.environ.get("PYTHONPATH", "")))
+        env.insert("FRAMEVISION_SHARED_MODELS", str(self.framevision_root / "models" / "shared"))
         env.insert("HF_HOME", str(self.framevision_root / "models/hiar/hf_cache"))
         env.insert("HUGGINGFACE_HUB_CACHE", str(self.framevision_root / "models/hiar/hf_cache/hub"))
         env.insert("TRANSFORMERS_CACHE", str(self.framevision_root / "models/hiar/hf_cache/transformers"))

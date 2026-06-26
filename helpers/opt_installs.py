@@ -85,6 +85,66 @@ def _cmd_call_bat(script_path: Path, cwd: Path) -> Tuple[str, List[str], Path]:
     return ("cmd.exe", ["/c", "call", str(script_path)], cwd)
 
 
+# -----------------------------
+# Shared model cleanup
+# -----------------------------
+
+_SHARED_MODEL_TARGETS: Dict[str, Tuple[str, ...]] = {
+    "models_t5_umt5-xxl-enc-bf16.pth": (
+        "models/wan22",
+        "models/hiar/HiAR/wan_models/Wan2.1-T2V-1.3B",
+    ),
+    "Qwen2.5-VL-7B-Instruct-UD-Q4_K_XL.gguf": (
+        "models/Qwen-Image-2512 GGUF",
+        "models/FireRed-Image-Edit-1.1",
+        "models/qwen2511gguf/text_encoders",
+    ),
+    "Qwen3-8B-Q5_K_M.gguf": (
+        "models/klein4b_gguf/text_encoders",
+        "models/klein9b_gguf/text_encoders",
+    ),
+    "Qwen2.5-VL-7B-Instruct-mmproj-BF16.gguf": (
+        "models/FireRed-Image-Edit-1.1",
+        "models/qwen2511gguf/text_encoders",
+    ),
+}
+
+
+def _cleanup_shared_model_files(root: Path) -> List[str]:
+    """Move known FrameVision shared files into models/shared.
+
+    This is intentionally narrow: only the known FrameVision subfolders above are
+    checked. Custom/user model folders elsewhere are not scanned or touched.
+    """
+    moved: List[str] = []
+    try:
+        models_dir = root / "models"
+        shared_dir = models_dir / "shared"
+        shared_dir.mkdir(parents=True, exist_ok=True)
+        for filename, rel_folders in _SHARED_MODEL_TARGETS.items():
+            dest = shared_dir / filename
+            for rel in rel_folders:
+                src = root / rel / filename
+                try:
+                    if not src.exists() or not src.is_file():
+                        continue
+                    if src.resolve() == dest.resolve():
+                        continue
+                    if dest.exists():
+                        try:
+                            dest.unlink()
+                        except Exception:
+                            pass
+                    shutil.move(str(src), str(dest))
+                    moved.append(f"{filename} -> models/shared")
+                except Exception:
+                    # Quiet cleanup: never block opening Optional Installs.
+                    pass
+    except Exception:
+        pass
+    return moved
+
+
 def _run_wan22(root: Path) -> Optional[Tuple[str, List[str], Path]]:
     script = root / "presets" / "extra_env" / "wan22_setup.bat"
     if not script.exists():
@@ -1012,6 +1072,7 @@ from pathlib import Path
 
 root = Path(sys.argv[1]).resolve()
 target = Path(sys.argv[2]).resolve()
+shared = root / "models" / "shared"
 quant = sys.argv[3].strip()
 
 GGUF_REPO = "https://huggingface.co/vantagewithai/FireRed-Image-Edit-1.1-GGUF/resolve/main"
@@ -1020,13 +1081,14 @@ MMPROJ_URL = "https://huggingface.co/QuantStack/Qwen-Image-Edit-GGUF/resolve/mai
 VAE_URL = "https://huggingface.co/Comfy-Org/Qwen-Image_ComfyUI/resolve/main/split_files/vae/qwen_image_vae.safetensors?download=1"
 
 files = [
-    (f"{GGUF_REPO}/FireRed-Image-Edit-1.1-{quant}.gguf?download=1", f"FireRed-Image-Edit-1.1-{quant}.gguf"),
-    (VAE_URL, "qwen_image_vae.safetensors"),
-    (MMPROJ_URL, "Qwen2.5-VL-7B-Instruct-mmproj-BF16.gguf"),
-    (TEXT_ENCODER_URL, "Qwen2.5-VL-7B-Instruct-UD-Q4_K_XL.gguf"),
+    (f"{GGUF_REPO}/FireRed-Image-Edit-1.1-{quant}.gguf?download=1", target / f"FireRed-Image-Edit-1.1-{quant}.gguf"),
+    (VAE_URL, target / "qwen_image_vae.safetensors"),
+    (MMPROJ_URL, shared / "Qwen2.5-VL-7B-Instruct-mmproj-BF16.gguf"),
+    (TEXT_ENCODER_URL, shared / "Qwen2.5-VL-7B-Instruct-UD-Q4_K_XL.gguf"),
 ]
 
 target.mkdir(parents=True, exist_ok=True)
+shared.mkdir(parents=True, exist_ok=True)
 headers = {"User-Agent": "FrameVision Optional Installs/1.0"}
 
 def remote_size(url: str):
@@ -1099,8 +1161,8 @@ def download(url: str, dest: Path) -> None:
 print("[INFO] FireRed 1.1 GGUF download started", flush=True)
 print(f"[INFO] target folder: {target}", flush=True)
 print(f"[INFO] selected quant: {quant}", flush=True)
-for url, name in files:
-    download(url, target / name)
+for url, dest in files:
+    download(url, dest)
 print("[DONE] FireRed 1.1 GGUF files are ready.", flush=True)
 """
 
@@ -1917,6 +1979,7 @@ class OptionalInstallsDialog(QtWidgets.QDialog):
         self.setWindowModality(QtCore.Qt.NonModal)
 
         self.root_dir: Path = (root_dir or _root_from_this_file()).resolve()
+        self._shared_cleanup_notes: List[str] = _cleanup_shared_model_files(self.root_dir)
         self.installs: List[OptionalInstall] = _default_installs()
 
         self._process: Optional[QtCore.QProcess] = None
@@ -2309,6 +2372,8 @@ class OptionalInstallsDialog(QtWidgets.QDialog):
         self.log = QtWidgets.QPlainTextEdit()
         self.log.setReadOnly(True)
         self.log.setPlaceholderText("Install log will appear here...")
+        if self._shared_cleanup_notes:
+            self.log.appendPlainText(f"[cleanup] moved {len(self._shared_cleanup_notes)} shared model file(s) to models/shared")
 
         # Log tools (below progress bar)
         self.auto_continue_chk = QtWidgets.QCheckBox('Auto-continue when installer says "Press any key to continue"')
@@ -3252,6 +3317,10 @@ class OptionalInstallsDialog(QtWidgets.QDialog):
             self._append_line(f"[WARN] Installer finished with exit_code={exit_code}.")
         else:
             self._append_line("[OK] Finished.")
+
+        notes = _cleanup_shared_model_files(self.root_dir)
+        if notes:
+            self._append_line(f"[cleanup] moved {len(notes)} shared model file(s) to models/shared")
 
         self._process = None
         self._running = None

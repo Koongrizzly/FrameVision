@@ -205,6 +205,25 @@ def _scan(folder: Path, exts: tuple[str, ...]) -> List[Path]:
     return sorted(items)
 
 
+
+def _shared_model_file(model_dir: str, filename: str) -> Path:
+    try:
+        root = Path(model_dir).resolve().parent
+    except Exception:
+        root = Path.cwd()
+    return root / "shared" / filename
+
+def _resolve_shared_model_file(model_dir: str, value: str) -> str:
+    value = str(value or "")
+    if value and Path(value).exists():
+        return value
+    name = Path(value).name
+    if name == "Qwen3-8B-Q5_K_M.gguf":
+        shared = _shared_model_file(model_dir, name)
+        if shared.exists():
+            return str(shared)
+    return value
+
 # -----------------------------
 # Data
 # -----------------------------
@@ -956,9 +975,13 @@ class MainWindow(QtWidgets.QMainWindow):
                     elif "flux" in name_l and "vae" not in name_l:
                         loras_fallback.append(p)
 
+        shared_qwen8 = _shared_model_file(str(base), "Qwen3-8B-Q5_K_M.gguf")
+        if shared_qwen8.exists() and shared_qwen8 not in ggufs:
+            ggufs.insert(0, shared_qwen8)
+
         # Build lists
         flux = [p for p in ggufs if "flux" in p.name.lower() and "klein" in p.name.lower()]
-        llm = [p for p in ggufs if "qwen" in p.name.lower() and "4b" in p.name.lower()]
+        llm = [p for p in ggufs if "qwen" in p.name.lower() and (("4b" in p.name.lower()) or ("8b" in p.name.lower()))]
         vae = [p for p in safes if "vae" in p.name.lower() and ("flux2" in p.name.lower() or "flux" in p.name.lower())]
 
         loras = loras_strict if loras_strict else loras_fallback
@@ -990,7 +1013,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 combo.setCurrentIndex(0)
 
         refill(self.flux_combo, flux, "q4_k_m", getattr(self.models, "diffusion_model", ""))
-        refill(self.llm_combo, llm, "q4_k_m", getattr(self.models, "llm_model", ""))
+        refill(self.llm_combo, llm, "q4_k_m", _resolve_shared_model_file(str(base), getattr(self.models, "llm_model", "")))
         # prefer flux2_ae
         preferred_vae = "flux2_ae"
         refill(self.vae_combo, vae, preferred_vae, getattr(self.models, "vae_file", ""))
@@ -1474,3 +1497,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+

@@ -52,6 +52,19 @@ def _norm(path: str) -> str:
     return os.path.normpath(os.path.expandvars(os.path.expanduser(path.strip().strip('"'))))
 
 
+def _shared_model_path(root: Path, filename: str) -> Path:
+    return root / "models" / "shared" / filename
+
+def _resolve_shared_model_path(root: Path, value: str) -> str:
+    value = _norm(value)
+    if value and os.path.isfile(value):
+        return value
+    name = os.path.basename(value)
+    if name == "Qwen2.5-VL-7B-Instruct-UD-Q4_K_XL.gguf":
+        shared = _shared_model_path(root, name)
+        if shared.exists():
+            return str(shared)
+    return value
 
 def _quote(path: str) -> str:
     if not path:
@@ -739,7 +752,8 @@ class FireRedPane(QWidget):
             "*vae*.safetensors",
             "*ae*.safetensors",
         ])
-        llm_candidates = _iter_candidates(models_root, [
+        shared_llm = _shared_model_path(root, "Qwen2.5-VL-7B-Instruct-UD-Q4_K_XL.gguf")
+        llm_candidates = ([shared_llm] if shared_llm.exists() else []) + _iter_candidates(models_root, [
             "*Qwen*VL*.gguf",
             "*Qwen2.5-VL*.gguf",
             "*Qwen3*.gguf",
@@ -934,7 +948,8 @@ class FireRedPane(QWidget):
             self.ffprobe_edit.setText(str(data.get("ffprobe", self.ffprobe_edit.text())))
             self.model_edit.setText(str(data.get("model", self.model_edit.text())))
             self.vae_edit.setText(str(data.get("vae", self.vae_edit.text())))
-            self.llm_edit.setText(str(data.get("llm", self.llm_edit.text())))
+            root_for_shared = Path(_norm(self.root_edit.text()) or str(self.framevision_root))
+            self.llm_edit.setText(_resolve_shared_model_path(root_for_shared, str(data.get("llm", self.llm_edit.text()))))
             self._refresh_lora_choices()
             self.lora_combo.setCurrentText(str(data.get("lora", self.lora_combo.currentText())))
             self._update_selected_lora_label()
@@ -1212,7 +1227,8 @@ class FireRedPane(QWidget):
         exe = _norm(self.sdcli_edit.text())
         model = _norm(self.model_edit.text())
         vae = _norm(self.vae_edit.text())
-        llm = _norm(self.llm_edit.text())
+        root_for_shared = Path(_norm(self.root_edit.text()) or str(self.framevision_root))
+        llm = _resolve_shared_model_path(root_for_shared, self.llm_edit.text())
         out_dir = _norm(self.output_dir_edit.text())
         prefix = self.prefix_edit.text().strip() or "firered"
         seed = str(seed_override) if seed_override is not None else (self.seed_edit.text().strip() or "0")
@@ -1296,7 +1312,8 @@ class FireRedPane(QWidget):
             errors.append("FireRed GGUF model file is missing or invalid.")
         if not self.vae_edit.text().strip() or not os.path.isfile(_norm(self.vae_edit.text())):
             errors.append("VAE path is missing or invalid.")
-        if not self.llm_edit.text().strip() or not os.path.isfile(_norm(self.llm_edit.text())):
+        root_for_shared = Path(_norm(self.root_edit.text()) or str(self.framevision_root))
+        if not self.llm_edit.text().strip() or not os.path.isfile(_resolve_shared_model_path(root_for_shared, self.llm_edit.text())):
             errors.append("LLM/text-encoder path is missing or invalid.")
 
         for img in images:

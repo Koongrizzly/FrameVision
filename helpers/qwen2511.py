@@ -242,6 +242,33 @@ MODELS_ROOT = os.path.join(APP_ROOT, "models", "qwen2511gguf")
 UNET_DIR = os.path.join(MODELS_ROOT, "unet")
 TEXTENC_DIR = os.path.join(MODELS_ROOT, "text_encoders")
 VAE_DIR = os.path.join(MODELS_ROOT, "vae")
+SHARED_MODELS_DIR = os.path.join(APP_ROOT, "models", "shared")
+SHARED_TEXT_ENCODERS = {
+    "Qwen2.5-VL-7B-Instruct-UD-Q4_K_XL.gguf",
+    "Qwen2.5-VL-7B-Instruct-mmproj-BF16.gguf",
+}
+
+def _shared_model_path(filename: str) -> str:
+    return os.path.join(SHARED_MODELS_DIR, filename)
+
+def _resolve_shared_model_path(path: str) -> str:
+    path = str(path or "")
+    if path and os.path.isfile(path):
+        return path
+    name = os.path.basename(path)
+    if name in SHARED_TEXT_ENCODERS:
+        shared = _shared_model_path(name)
+        if os.path.isfile(shared):
+            return shared
+    return path
+
+def _shared_text_encoder_files() -> List[str]:
+    out: List[str] = []
+    for name in sorted(SHARED_TEXT_ENCODERS):
+        p = _shared_model_path(name)
+        if os.path.isfile(p):
+            out.append(p)
+    return out
 
 # LoRA
 # Default folder for Qwen2511 LoRAs (user can override in UI).
@@ -329,6 +356,17 @@ def _list_files(folder: str, exts: Tuple[str, ...]) -> List[str]:
         if os.path.isfile(p) and fn.lower().endswith(exts):
             out.append(p)
     out.sort(key=lambda x: os.path.basename(x).lower())
+    return out
+
+def _unique_paths(paths: List[str]) -> List[str]:
+    seen = set()
+    out: List[str] = []
+    for p in paths:
+        key = os.path.normcase(os.path.abspath(p))
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(p)
     return out
 
 
@@ -599,7 +637,7 @@ def detect_sdcli_caps(sdcli_path: str) -> SdCliCaps:
 
 def default_model_paths() -> Dict[str, Optional[str]]:
     unets = _list_files(UNET_DIR, (".gguf",))
-    llms = _list_files(TEXTENC_DIR, (".gguf",))
+    llms = _unique_paths(_shared_text_encoder_files() + _list_files(TEXTENC_DIR, (".gguf",)))
     vaes = _list_files(VAE_DIR, (".safetensors", ".gguf", ".bin"))
 
     unet_pref = None
@@ -877,8 +915,8 @@ def generate_one_from_job(job: Dict[str, Any], out_dir: str) -> Dict[str, Any]:
         prompt=prompt,
         negative=negative,
         unet_path=str(settings.get("unet_path") or ""),
-        llm_path=str(settings.get("llm_path") or ""),
-        mmproj_path=str(settings.get("mmproj_path") or ""),
+        llm_path=_resolve_shared_model_path(str(settings.get("llm_path") or "")),
+        mmproj_path=_resolve_shared_model_path(str(settings.get("mmproj_path") or "")),
         vae_path=str(settings.get("vae_path") or ""),
         steps=int(settings.get("steps") or 25),
         cfg=float(settings.get("cfg") or 2.35),
@@ -3409,7 +3447,7 @@ class Qwen2511Pane(QtWidgets.QWidget):
             for p in _list_files(UNET_DIR, (".gguf",)):
                 self.cb_unet.addItem(os.path.basename(p), p)
 
-            llms = _list_files(TEXTENC_DIR, (".gguf",))
+            llms = _unique_paths(_shared_text_encoder_files() + _list_files(TEXTENC_DIR, (".gguf",)))
             for p in llms:
                 bn = os.path.basename(p).lower()
                 if "mmproj" in bn:
@@ -3427,8 +3465,10 @@ class Qwen2511Pane(QtWidgets.QWidget):
             def restore(cb: QtWidgets.QComboBox, wanted):
                 if not wanted:
                     return
+                wanted_resolved = _resolve_shared_model_path(str(wanted))
                 for i in range(cb.count()):
-                    if cb.itemData(i) == wanted:
+                    data = str(cb.itemData(i) or "")
+                    if data == wanted or data == wanted_resolved:
                         cb.setCurrentIndex(i)
                         return
 
@@ -3708,8 +3748,10 @@ class Qwen2511Pane(QtWidgets.QWidget):
         def set_combo_to_path(cb: QtWidgets.QComboBox, path: str):
             if not path:
                 return
+            resolved = _resolve_shared_model_path(str(path))
             for i in range(cb.count()):
-                if cb.itemData(i) == path:
+                data = str(cb.itemData(i) or "")
+                if data == path or data == resolved:
                     cb.setCurrentIndex(i)
                     return
 

@@ -3946,7 +3946,8 @@ class Wan22Pane(QWidget):
             wm = repo_dir / "wan_models"
             wm.mkdir(parents=True, exist_ok=True)
             pairs = (
-                (wm / "Wan2.2-TI2V-5B", model_root),
+                # Do not link Wan2.2-TI2V-5B back to the full models/wan22 folder;
+                # that creates a recursive wan_turbo loop because the Turbo repo lives inside wan22.
                 (wm / "Wan2.2-TI2V-5B-Turbo", turbo_model_dir),
             )
             for link, target in pairs:
