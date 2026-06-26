@@ -5467,139 +5467,63 @@ def _apply_turbo_repo_compat_patch(turbo_root: Path) -> None:
 def _ensure_turbo_wan_model_links(wan_root: Path, base_model_dir: Path | None, turbo_model_dir: Path | None) -> None:
     """Create/verify the relative wan_models folders expected by the Turbo repo.
 
-    Important: do NOT junction Wan2.2-TI2V-5B back to models/wan22.
-    The Turbo repo lives inside models/wan22, so that creates a recursive
-    wan_turbo loop. Instead create a small real folder and place links/copies
-    for the root files the repo expects. The T5 text encoder may have been
-    moved by FrameVision cleanup to models/shared.
+    The upstream Turbo script loads everything through paths like
+    `wan_models/Wan2.2-TI2V-5B/...` and
+    `wan_models/Wan2.2-TI2V-5B-Turbo/model.pt`. The user's test BAT creates
+    Windows junctions before launching the repo. This helper does the same from
+    Python so the VRAM-Lab CLI can be run directly by FrameVision's worker.
     """
-    def _same_file(a: Path, b: Path) -> bool:
-        try:
-            return a.exists() and b.exists() and a.resolve() == b.resolve()
-        except Exception:
-            return False
-
-    def _remove_existing(path: Path) -> None:
-        try:
-            if path.is_symlink() or path.is_file():
-                path.unlink()
-            elif path.exists():
-                # Only remove an existing directory if it is empty. This avoids
-                # deleting real model folders by accident.
+    try:
+        wan_models = wan_root / "wan_models"
+        wan_models.mkdir(parents=True, exist_ok=True)
+        wanted: list[tuple[str, Path | None]] = [
+            ("Wan2.2-TI2V-5B", base_model_dir),
+            ("Wan2.2-TI2V-5B-Turbo", turbo_model_dir),
+        ]
+        results: list[str] = []
+        for name, target in wanted:
+            link = wan_models / name
+            if target is None:
+                results.append(f"{name}=SKIP:no target supplied")
+                continue
+            target = target.resolve()
+            if not target.exists():
+                results.append(f"{name}=MISSING_TARGET:{target}")
+                continue
+            if link.exists() or link.is_symlink():
                 try:
-                    path.rmdir()
-                except OSError:
-                    pass
-        except Exception:
-            pass
-
-    def _link_or_copy(src: Path, dst: Path) -> str:
-        try:
-            src = src.resolve()
-            dst.parent.mkdir(parents=True, exist_ok=True)
-            if dst.exists() or dst.is_symlink():
-                try:
-                    if dst.stat().st_size == src.stat().st_size:
-                        return f"OK:{dst}"
+                    if link.resolve() == target:
+                        results.append(f"{name}=OK:{link}")
+                    else:
+                        results.append(f"{name}=EXISTS_DIFFERENT:{link}-> {link.resolve()}")
                 except Exception:
-                    pass
-                _remove_existing(dst)
+                    results.append(f"{name}=EXISTS:{link}")
+                continue
+            made = False
+            err = ""
             if os.name == "nt":
                 try:
                     import subprocess
                     proc = subprocess.run(
-                        ["cmd", "/c", "mklink", "/H", str(dst), str(src)],
-                        capture_output=True, text=True, timeout=30,
+                        ["cmd", "/c", "mklink", "/J", str(link), str(target)],
+                        cwd=str(wan_root), capture_output=True, text=True, timeout=30,
                     )
-                    if proc.returncode == 0 and dst.exists():
-                        return f"HARDLINK:{dst}-> {src}"
-                except Exception:
-                    pass
-            try:
-                os.link(str(src), str(dst))
-                if dst.exists():
-                    return f"HARDLINK:{dst}-> {src}"
-            except Exception:
-                pass
-            import shutil
-            shutil.copy2(str(src), str(dst))
-            return f"COPY:{dst}-> {src}"
-        except Exception as exc:
-            return f"FAILED:{dst}: {type(exc).__name__}: {exc}"
-
-    try:
-        wan_models = wan_root / "wan_models"
-        wan_models.mkdir(parents=True, exist_ok=True)
-        results: list[str] = []
-
-        shared_dir = APP_ROOT / "models" / "shared"
-
-        # Build a non-recursive base folder expected by the Turbo repo.
-        base_link = wan_models / "Wan2.2-TI2V-5B"
-        if base_link.exists() or base_link.is_symlink():
-            try:
-                # Remove only the old recursive junction/symlink. Real non-empty
-                # folders are left alone.
-                resolved = base_link.resolve()
-                if base_model_dir is not None and resolved == base_model_dir.resolve():
-                    _remove_existing(base_link)
-            except Exception:
-                pass
-        base_link.mkdir(parents=True, exist_ok=True)
-
-        base_candidates: dict[str, list[Path]] = {
-            "models_t5_umt5-xxl-enc-bf16.pth": [],
-            "Wan2.2_VAE.pth": [],
-            "diffusion_pytorch_model.safetensors.index.json": [],
-        }
-        if base_model_dir is not None:
-            for name in base_candidates:
-                base_candidates[name].append(base_model_dir / name)
-        base_candidates["models_t5_umt5-xxl-enc-bf16.pth"].insert(0, shared_dir / "models_t5_umt5-xxl-enc-bf16.pth")
-
-        for name, candidates in base_candidates.items():
-            src = next((c for c in candidates if c.exists() and c.is_file()), None)
-            if src is None:
-                results.append(f"Wan2.2-TI2V-5B/{name}=MISSING")
-                continue
-            results.append(f"Wan2.2-TI2V-5B/{name}=" + _link_or_copy(src, base_link / name))
-
-        # Keep the turbo model folder link. It is outside the base folder and
-        # does not create the recursive base-model loop.
-        if turbo_model_dir is not None:
-            turbo_link = wan_models / "Wan2.2-TI2V-5B-Turbo"
-            turbo_target = turbo_model_dir.resolve()
-            if turbo_target.exists():
-                if turbo_link.exists() or turbo_link.is_symlink():
-                    try:
-                        if turbo_link.resolve() == turbo_target:
-                            results.append(f"Wan2.2-TI2V-5B-Turbo=OK:{turbo_link}")
-                        else:
-                            results.append(f"Wan2.2-TI2V-5B-Turbo=EXISTS_DIFFERENT:{turbo_link}-> {turbo_link.resolve()}")
-                    except Exception:
-                        results.append(f"Wan2.2-TI2V-5B-Turbo=EXISTS:{turbo_link}")
-                else:
-                    made = False
-                    if os.name == "nt":
-                        try:
-                            import subprocess
-                            proc = subprocess.run(
-                                ["cmd", "/c", "mklink", "/J", str(turbo_link), str(turbo_target)],
-                                cwd=str(wan_root), capture_output=True, text=True, timeout=30,
-                            )
-                            made = proc.returncode == 0 and turbo_link.exists()
-                        except Exception:
-                            made = False
-                    if not made:
-                        try:
-                            os.symlink(str(turbo_target), str(turbo_link), target_is_directory=True)
-                            made = True
-                        except Exception:
-                            pass
-                    results.append(f"Wan2.2-TI2V-5B-Turbo={'LINK_CREATED' if made else 'LINK_FAILED'}:{turbo_link}-> {turbo_target}")
-            else:
-                results.append(f"Wan2.2-TI2V-5B-Turbo=MISSING_TARGET:{turbo_target}")
-
+                    if proc.returncode == 0 and link.exists():
+                        made = True
+                        results.append(f"{name}=JUNCTION_CREATED:{link}-> {target}")
+                    else:
+                        err = (proc.stderr or proc.stdout or "mklink failed").strip()
+                except Exception as exc:
+                    err = f"{type(exc).__name__}: {exc}"
+            if not made:
+                try:
+                    link.symlink_to(target, target_is_directory=True)
+                    made = True
+                    results.append(f"{name}=SYMLINK_CREATED:{link}-> {target}")
+                except Exception as exc:
+                    err = err or f"{type(exc).__name__}: {exc}"
+            if not made:
+                results.append(f"{name}=FAILED_CREATE:{err}")
         CONTEXT["turbo_wan_model_links"] = " | ".join(results)
     except Exception as exc:
         CONTEXT["turbo_wan_model_links"] = f"FAILED: {type(exc).__name__}: {exc}"

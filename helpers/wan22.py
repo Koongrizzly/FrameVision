@@ -3941,88 +3941,21 @@ class Wan22Pane(QWidget):
         return self._wan_turbo_root() / "Wan2.2-TI2V-5B-Turbo"
 
     def _ensure_wan_turbo_links(self, repo_dir: Path, model_root: Path, turbo_model_dir: Path):
-        """Prepare the small wan_models layout expected by the Turbo repo.
-
-        Do not junction Wan2.2-TI2V-5B back to models/wan22; that creates a
-        recursive wan_turbo loop. Use a small real folder with file links/copies
-        instead, and prefer models/shared for the shared T5 encoder.
-        """
-        def _remove_existing(path: Path):
-            try:
-                if path.is_symlink() or path.is_file():
-                    path.unlink()
-                elif path.exists():
-                    try:
-                        path.rmdir()
-                    except OSError:
-                        pass
-            except Exception:
-                pass
-
-        def _link_or_copy(src: Path, dst: Path):
-            try:
-                src = src.resolve()
-                dst.parent.mkdir(parents=True, exist_ok=True)
-                if dst.exists() or dst.is_symlink():
-                    try:
-                        if dst.stat().st_size == src.stat().st_size:
-                            return
-                    except Exception:
-                        pass
-                    _remove_existing(dst)
-                if os.name == "nt":
-                    try:
-                        subprocess.run(
-                            ["cmd", "/c", "mklink", "/H", str(dst), str(src)],
-                            stdout=subprocess.PIPE,
-                            stderr=subprocess.PIPE,
-                            text=True,
-                            timeout=20,
-                        )
-                        if dst.exists():
-                            return
-                    except Exception:
-                        pass
-                try:
-                    os.link(str(src), str(dst))
-                    if dst.exists():
-                        return
-                except Exception:
-                    pass
-                import shutil
-                shutil.copy2(str(src), str(dst))
-            except Exception:
-                pass
-
+        """Best-effort creation of the two junctions expected by the Turbo repo."""
         try:
             wm = repo_dir / "wan_models"
             wm.mkdir(parents=True, exist_ok=True)
-
-            base_folder = wm / "Wan2.2-TI2V-5B"
-            if base_folder.exists() or base_folder.is_symlink():
+            pairs = (
+                (wm / "Wan2.2-TI2V-5B", model_root),
+                (wm / "Wan2.2-TI2V-5B-Turbo", turbo_model_dir),
+            )
+            for link, target in pairs:
                 try:
-                    if base_folder.resolve() == model_root.resolve():
-                        _remove_existing(base_folder)
-                except Exception:
-                    pass
-            base_folder.mkdir(parents=True, exist_ok=True)
-
-            shared_t5 = self._app_root() / "models" / "shared" / "models_t5_umt5-xxl-enc-bf16.pth"
-            for name in ("models_t5_umt5-xxl-enc-bf16.pth", "Wan2.2_VAE.pth", "diffusion_pytorch_model.safetensors.index.json"):
-                candidates = []
-                if name == "models_t5_umt5-xxl-enc-bf16.pth":
-                    candidates.append(shared_t5)
-                candidates.append(model_root / name)
-                src = next((c for c in candidates if c.exists() and c.is_file()), None)
-                if src is not None:
-                    _link_or_copy(src, base_folder / name)
-
-            turbo_link = wm / "Wan2.2-TI2V-5B-Turbo"
-            if turbo_model_dir.exists() and not turbo_link.exists():
-                try:
+                    if link.exists():
+                        continue
                     if os.name == "nt":
                         subprocess.run(
-                            ["cmd", "/c", "mklink", "/J", str(turbo_link), str(turbo_model_dir)],
+                            ["cmd", "/c", "mklink", "/J", str(link), str(target)],
                             cwd=str(repo_dir),
                             stdout=subprocess.PIPE,
                             stderr=subprocess.PIPE,
@@ -4030,12 +3963,14 @@ class Wan22Pane(QWidget):
                             timeout=20,
                         )
                     else:
-                        os.symlink(str(turbo_model_dir), str(turbo_link), target_is_directory=True)
+                        try:
+                            os.symlink(str(target), str(link), target_is_directory=True)
+                        except TypeError:
+                            os.symlink(str(target), str(link))
                 except Exception:
                     pass
         except Exception:
             pass
-
 
     def _build_turbo_command(self, py: str, model_root: Path, mode: str, prompt: str, image: str, seed_value: int, out_path: Path):
         """Build command for Wan 2.2 TI2V 5B Turbo/few-step runner.

@@ -90,10 +90,6 @@ def _cmd_call_bat(script_path: Path, cwd: Path) -> Tuple[str, List[str], Path]:
 # -----------------------------
 
 _SHARED_MODEL_TARGETS: Dict[str, Tuple[str, ...]] = {
-    "models_t5_umt5-xxl-enc-bf16.pth": (
-        "models/wan22",
-        "models/hiar/HiAR/wan_models/Wan2.1-T2V-1.3B",
-    ),
     "Qwen2.5-VL-7B-Instruct-UD-Q4_K_XL.gguf": (
         "models/Qwen-Image-2512 GGUF",
         "models/FireRed-Image-Edit-1.1",
