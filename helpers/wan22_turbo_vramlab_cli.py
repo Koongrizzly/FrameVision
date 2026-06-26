@@ -5465,246 +5465,129 @@ def _apply_turbo_repo_compat_patch(turbo_root: Path) -> None:
 
 
 def _ensure_turbo_wan_model_links(wan_root: Path, base_model_dir: Path | None, turbo_model_dir: Path | None) -> None:
-    """Create/verify the relative wan_models folders expected by the Turbo repo.
+    """Prepare the relative wan_models folders expected by the Turbo repo.
 
-    The upstream Turbo script loads everything through paths like
-    `wan_models/Wan2.2-TI2V-5B/...` and
-    `wan_models/Wan2.2-TI2V-5B-Turbo/model.pt`. The user's test BAT creates
-    Windows junctions before launching the repo. This helper does the same from
-    Python so the VRAM-Lab CLI can be run directly by FrameVision's worker.
+    Do not junction Wan2.2-TI2V-5B back to models/wan22: wan_root lives under
+    that folder, so the junction creates a recursive wan_turbo loop. We build a
+    small real base folder and link/copy only root files from models/wan22 plus
+    the shared T5 encoder when it has already been moved to models/shared.
     """
     try:
         wan_models = wan_root / "wan_models"
         wan_models.mkdir(parents=True, exist_ok=True)
-        wanted: list[tuple[str, Path | None]] = [
-            ("Wan2.2-TI2V-5B", base_model_dir),
-            ("Wan2.2-TI2V-5B-Turbo", turbo_model_dir),
-        ]
         results: list[str] = []
-        for name, target in wanted:
-            link = wan_models / name
-            if target is None:
-                results.append(f"{name}=SKIP:no target supplied")
-                continue
-            target = target.resolve()
-            if not target.exists():
-                results.append(f"{name}=MISSING_TARGET:{target}")
-                continue
-            if link.exists() or link.is_symlink():
-                try:
-                    if link.resolve() == target:
-                        results.append(f"{name}=OK:{link}")
-                    else:
-                        results.append(f"{name}=EXISTS_DIFFERENT:{link}-> {link.resolve()}")
-                except Exception:
-                    results.append(f"{name}=EXISTS:{link}")
-                continue
-            made = False
-            err = ""
-            if os.name == "nt":
-                try:
+
+        def _remove_dir_link_only(path: Path) -> bool:
+            try:
+                if not (path.exists() or path.is_symlink()):
+                    return False
+                if os.name == "nt":
                     import subprocess
-                    proc = subprocess.run(
-                        ["cmd", "/c", "mklink", "/J", str(link), str(target)],
-                        cwd=str(wan_root), capture_output=True, text=True, timeout=30,
-                    )
-                    if proc.returncode == 0 and link.exists():
-                        made = True
-                        results.append(f"{name}=JUNCTION_CREATED:{link}-> {target}")
-                    else:
-                        err = (proc.stderr or proc.stdout or "mklink failed").strip()
-                except Exception as exc:
-                    err = f"{type(exc).__name__}: {exc}"
-            if not made:
+                    proc = subprocess.run(["cmd", "/c", "rmdir", str(path)], cwd=str(wan_root), capture_output=True, text=True, timeout=30)
+                    return proc.returncode == 0
+                path.unlink()
+                return True
+            except Exception:
+                return False
+
+        def _link_or_copy_file(src: Path, dst: Path) -> str:
+            try:
+                if dst.exists() or dst.is_symlink():
+                    return "EXISTS"
+                dst.parent.mkdir(parents=True, exist_ok=True)
+                if os.name == "nt":
+                    import subprocess
+                    proc = subprocess.run(["cmd", "/c", "mklink", "/H", str(dst), str(src)], cwd=str(wan_root), capture_output=True, text=True, timeout=30)
+                    if proc.returncode == 0 and dst.exists():
+                        return "HARDLINK"
                 try:
-                    link.symlink_to(target, target_is_directory=True)
-                    made = True
-                    results.append(f"{name}=SYMLINK_CREATED:{link}-> {target}")
-                except Exception as exc:
-                    err = err or f"{type(exc).__name__}: {exc}"
-            if not made:
-                results.append(f"{name}=FAILED_CREATE:{err}")
-        CONTEXT["turbo_wan_model_links"] = " | ".join(results)
+                    dst.symlink_to(src)
+                    return "SYMLINK"
+                except Exception:
+                    pass
+                import shutil
+                shutil.copy2(str(src), str(dst))
+                return "COPY"
+            except Exception as exc:
+                return f"FAILED:{type(exc).__name__}:{exc}"
+
+        # Base folder: real folder with file links only, no directory loop.
+        base_folder = wan_models / "Wan2.2-TI2V-5B"
+        if base_model_dir is not None:
+            try:
+                if (base_folder.exists() or base_folder.is_symlink()) and base_folder.resolve() == base_model_dir.resolve():
+                    if _remove_dir_link_only(base_folder):
+                        results.append("Wan2.2-TI2V-5B=REMOVED_OLD_RECURSIVE_LINK")
+            except Exception:
+                pass
+            base_folder.mkdir(parents=True, exist_ok=True)
+            if base_model_dir.exists():
+                for src in base_model_dir.iterdir():
+                    try:
+                        if src.is_file():
+                            results.append(f"base/{src.name}={_link_or_copy_file(src, base_folder / src.name)}")
+                    except Exception:
+                        pass
+            else:
+                results.append(f"Wan2.2-TI2V-5B=MISSING_TARGET:{base_model_dir}")
+
+        # Shared cleanup may have moved this file out of models/wan22.
+        try:
+            app_root = Path(__file__).resolve().parents[1]
+            shared_t5 = app_root / "models" / "shared" / "models_t5_umt5-xxl-enc-bf16.pth"
+            if shared_t5.exists():
+                dst = base_folder / shared_t5.name
+                try:
+                    if dst.exists() or dst.is_symlink():
+                        dst.unlink()
+                except Exception:
+                    pass
+                results.append(f"base/{shared_t5.name}=SHARED_{_link_or_copy_file(shared_t5, dst)}")
+        except Exception as exc:
+            results.append(f"shared_t5=FAILED:{type(exc).__name__}:{exc}")
+
+        # Turbo model folder may remain a junction because it is outside the repo's wan_models path.
+        turbo_link = wan_models / "Wan2.2-TI2V-5B-Turbo"
+        if turbo_model_dir is not None:
+            target = turbo_model_dir.resolve()
+            if not target.exists():
+                results.append(f"Wan2.2-TI2V-5B-Turbo=MISSING_TARGET:{target}")
+            elif turbo_link.exists() or turbo_link.is_symlink():
+                try:
+                    if turbo_link.resolve() == target:
+                        results.append(f"Wan2.2-TI2V-5B-Turbo=OK:{turbo_link}")
+                    else:
+                        results.append(f"Wan2.2-TI2V-5B-Turbo=EXISTS_DIFFERENT:{turbo_link}->{turbo_link.resolve()}")
+                except Exception:
+                    results.append(f"Wan2.2-TI2V-5B-Turbo=EXISTS:{turbo_link}")
+            else:
+                made = False
+                err = ""
+                if os.name == "nt":
+                    try:
+                        import subprocess
+                        proc = subprocess.run(["cmd", "/c", "mklink", "/J", str(turbo_link), str(target)], cwd=str(wan_root), capture_output=True, text=True, timeout=30)
+                        if proc.returncode == 0 and turbo_link.exists():
+                            made = True
+                            results.append(f"Wan2.2-TI2V-5B-Turbo=JUNCTION_CREATED:{turbo_link}->{target}")
+                        else:
+                            err = (proc.stderr or proc.stdout or "mklink failed").strip()
+                    except Exception as exc:
+                        err = f"{type(exc).__name__}: {exc}"
+                if not made:
+                    try:
+                        turbo_link.symlink_to(target, target_is_directory=True)
+                        made = True
+                        results.append(f"Wan2.2-TI2V-5B-Turbo=SYMLINK_CREATED:{turbo_link}->{target}")
+                    except Exception as exc:
+                        err = err or f"{type(exc).__name__}: {exc}"
+                if not made:
+                    results.append(f"Wan2.2-TI2V-5B-Turbo=FAILED:{err}")
+
+        CONTEXT["turbo_wan_model_links"] = "; ".join(results) if results else "NO_ACTION"
     except Exception as exc:
         CONTEXT["turbo_wan_model_links"] = f"FAILED: {type(exc).__name__}: {exc}"
 
-
-def _apply_turbo_load_accel_env() -> None:
-    """Set safe HuggingFace loader hints before Turbo imports/builds the pipeline.
-
-    The fast old report proves the full CUDA staging was not the main slowdown.
-    The regression is the constructor/base-model load window.  These env vars are
-    safe, reversible hints for HF/Transformers loaders; they do not edit repo
-    files, devices, or model weights.
-    """
-    try:
-        if "HF_ENABLE_PARALLEL_LOADING" not in os.environ:
-            os.environ["HF_ENABLE_PARALLEL_LOADING"] = "true"
-            CONTEXT["turbo_load_accel_hf_parallel"] = "set true"
-        else:
-            CONTEXT["turbo_load_accel_hf_parallel"] = f"already {os.environ.get('HF_ENABLE_PARALLEL_LOADING')}"
-        if "HF_PARALLEL_LOADING_WORKERS" not in os.environ:
-            os.environ["HF_PARALLEL_LOADING_WORKERS"] = "8"
-            CONTEXT["turbo_load_accel_hf_workers"] = "set 8"
-        else:
-            CONTEXT["turbo_load_accel_hf_workers"] = f"already {os.environ.get('HF_PARALLEL_LOADING_WORKERS')}"
-    except Exception as exc:
-        CONTEXT["turbo_load_accel_error"] = f"{type(exc).__name__}: {exc}"
-
-
-
-def _install_turbo_t5_deep_tracer(torch_mod: Any) -> None:
-    """Add focused timing around the hidden T5 construction cost.
-
-    The outer WanTextEncoder timer showed the regression is mostly before the
-    T5 checkpoint torch.load/load_state_dict calls.  This tracer wraps the
-    likely factory/class init used by utils.wan_wrapper so we can see whether
-    the missing ~35-40s is inside umt5_xxl/T5Encoder model skeleton creation.
-    It is diagnostic-only and does not change model/device behavior.
-    """
-    try:
-        import importlib
-        import functools
-
-        # Wrap likely T5 factory functions.  utils.wan_wrapper commonly imports
-        # umt5_xxl directly, so patch both the original module and the imported
-        # alias when present.
-        function_targets = [
-            ("utils.wan_wrapper", "umt5_xxl", "turbo_ctor_t5_umt5_xxl_alias"),
-            ("wan.modules.t5", "umt5_xxl", "turbo_ctor_t5_umt5_xxl_factory"),
-        ]
-        wrapped_bits = []
-        for mod_name, fn_name, key in function_targets:
-            try:
-                mod = importlib.import_module(mod_name)
-                fn = getattr(mod, fn_name, None)
-                if fn is None or not callable(fn):
-                    CONTEXT[key] = "NO: missing"
-                    continue
-                if getattr(fn, "_framevision_t5_deep_trace_wrapped", False):
-                    CONTEXT[key] = "already wrapped"
-                    continue
-
-                @functools.wraps(fn)
-                def wrapped_fn(*args, __orig=fn, __key=key, __name=f"{mod_name}.{fn_name}", **kwargs):
-                    note = f"{__name} T5 model factory"
-                    _stage_ram_event(__key + "_before_ram", note, torch_mod)
-                    with _stage_watch(__key, note, torch_mod):
-                        out = __orig(*args, **kwargs)
-                    _stage_ram_event(__key + "_after_ram", note, torch_mod)
-                    return out
-
-                wrapped_fn._framevision_t5_deep_trace_wrapped = True  # type: ignore[attr-defined]
-                setattr(mod, fn_name, wrapped_fn)
-                CONTEXT[key] = "YES"
-                wrapped_bits.append(f"{mod_name}.{fn_name}")
-            except Exception as exc:
-                CONTEXT[key] = f"FAILED: {type(exc).__name__}: {exc}"
-
-        # Wrap the actual T5Encoder class constructor too, in case the factory is
-        # bypassed or most of the time is spent inside class __init__.
-        class_targets = [
-            ("wan.modules.t5", "T5Encoder", "turbo_ctor_t5_encoder_core_init"),
-        ]
-        for mod_name, cls_name, key in class_targets:
-            try:
-                mod = importlib.import_module(mod_name)
-                cls = getattr(mod, cls_name, None)
-                if cls is None:
-                    CONTEXT[key] = "NO: class missing"
-                    continue
-                orig_init = getattr(cls, "__init__", None)
-                if not callable(orig_init):
-                    CONTEXT[key] = "NO: __init__ missing"
-                    continue
-                if getattr(orig_init, "_framevision_t5_deep_trace_wrapped", False):
-                    CONTEXT[key] = "already wrapped"
-                    continue
-
-                @functools.wraps(orig_init)
-                def wrapped_init(self, *args, __orig=orig_init, __key=key, __cls=f"{mod_name}.{cls_name}", **kwargs):
-                    note = f"{__cls}.__init__ core T5 construction"
-                    _stage_ram_event(__key + "_before_ram", note, torch_mod)
-                    with _stage_watch(__key, note, torch_mod):
-                        out = __orig(self, *args, **kwargs)
-                    _stage_ram_event(__key + "_after_ram", note, torch_mod)
-                    return out
-
-                wrapped_init._framevision_t5_deep_trace_wrapped = True  # type: ignore[attr-defined]
-                setattr(cls, "__init__", wrapped_init)
-                CONTEXT[key] = "YES"
-                wrapped_bits.append(f"{mod_name}.{cls_name}.__init__")
-            except Exception as exc:
-                CONTEXT[key] = f"FAILED: {type(exc).__name__}: {exc}"
-
-        try:
-            _stage_event(
-                "wan22_turbo_t5_deep_tracer",
-                "YES: " + (", ".join(wrapped_bits) if wrapped_bits else "no targets wrapped"),
-                torch_mod,
-            )
-        except Exception:
-            pass
-    except Exception as exc:
-        CONTEXT["turbo_t5_deep_tracer"] = f"FAILED: {type(exc).__name__}: {exc}"
-
-def _install_turbo_constructor_component_tracer(torch_mod: Any) -> None:
-    """Trace the exact components inside Wan22FewstepInferencePipeline.__init__.
-
-    This is deliberately diagnostic-only.  It answers whether the constructor
-    regression is generator/from_pretrained, T5, or VAE, without changing Turbo
-    repo files or device behavior.
-    """
-    try:
-        import importlib
-        import functools
-        try:
-            _install_turbo_t5_deep_tracer(torch_mod)
-        except Exception as exc:
-            CONTEXT["turbo_t5_deep_tracer_call"] = f"FAILED: {type(exc).__name__}: {exc}"
-        targets = [
-            ("utils.wan_wrapper", "WanDiffusionWrapper", "turbo_ctor_generator_wrapper"),
-            ("utils.wan_wrapper", "WanTextEncoder", "turbo_ctor_text_encoder"),
-            ("utils.wan_wrapper", "Wan2_2_VAEWrapper", "turbo_ctor_vae_wrapper"),
-        ]
-        wrapped = []
-        for mod_name, cls_name, key in targets:
-            try:
-                mod = importlib.import_module(mod_name)
-                cls = getattr(mod, cls_name, None)
-                if cls is None:
-                    CONTEXT[key] = "NO: class missing"
-                    continue
-                orig_init = getattr(cls, "__init__", None)
-                if not callable(orig_init):
-                    CONTEXT[key] = "NO: __init__ missing"
-                    continue
-                if getattr(orig_init, "_framevision_ctor_trace_wrapped", False):
-                    CONTEXT[key] = "already wrapped"
-                    continue
-
-                @functools.wraps(orig_init)
-                def wrapped_init(self, *args, __orig=orig_init, __key=key, __cls=cls_name, **kwargs):
-                    note = f"{__cls}.__init__ component construction"
-                    _stage_ram_event(__key + "_before_ram", note, torch_mod)
-                    with _stage_watch(__key, note, torch_mod):
-                        out = __orig(self, *args, **kwargs)
-                    _stage_ram_event(__key + "_after_ram", note, torch_mod)
-                    return out
-
-                wrapped_init._framevision_ctor_trace_wrapped = True  # type: ignore[attr-defined]
-                setattr(cls, "__init__", wrapped_init)
-                CONTEXT[key] = "YES"
-                wrapped.append(cls_name)
-            except Exception as exc:
-                CONTEXT[key] = f"FAILED: {type(exc).__name__}: {exc}"
-        CONTEXT["turbo_constructor_component_tracer"] = "YES: " + ", ".join(wrapped) if wrapped else "NO: no components wrapped"
-        try:
-            _stage_event("wan22_turbo_constructor_component_tracer", CONTEXT["turbo_constructor_component_tracer"], torch_mod)
-        except Exception:
-            pass
-    except Exception as exc:
-        CONTEXT["turbo_constructor_component_tracer"] = f"FAILED: {type(exc).__name__}: {exc}"
 
 
 def main() -> int:

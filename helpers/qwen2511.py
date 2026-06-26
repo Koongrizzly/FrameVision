@@ -3884,8 +3884,8 @@ class Qwen2511Pane(QtWidgets.QWidget):
             "prompt": self.ed_prompt.toPlainText().strip(),
             "negative_prompt": self.ed_neg.text().strip(),
             "unet_path": self.cb_unet.currentData(),
-            "llm_path": self.cb_llm.currentData(),
-            "mmproj_path": self.cb_mmproj.currentData(),
+            "llm_path": _resolve_shared_model_path(str(self.cb_llm.currentData() or "")),
+            "mmproj_path": _resolve_shared_model_path(str(self.cb_mmproj.currentData() or "")),
             "vae_path": self.cb_vae.currentData(),
             "steps": int(self.sp_steps.value()),
             "cfg": float(self.sp_cfg.value()),
@@ -4352,6 +4352,11 @@ class Qwen2511Pane(QtWidgets.QWidget):
                             if init_q and not os.path.isfile(init_q):
                                 raise Exception('Scene image file not found: ' + init_q)
 
+                        try:
+                            # Persist resolved shared encoder paths before queue_adapter reads widget/settings.
+                            self._save_settings(silent=True)
+                        except Exception:
+                            pass
                         jid = _enq(self)
                     finally:
                         if _restore_use_scene is not None:
@@ -4443,8 +4448,8 @@ class Qwen2511Pane(QtWidgets.QWidget):
             ref_imgs = []
 
         unet = self.cb_unet.currentData()
-        llm = self.cb_llm.currentData()
-        mmproj = self.cb_mmproj.currentData()
+        llm = _resolve_shared_model_path(str(self.cb_llm.currentData() or ""))
+        mmproj = _resolve_shared_model_path(str(self.cb_mmproj.currentData() or ""))
         vae = self.cb_vae.currentData()
 
         missing = [name for name, p in [("UNet", unet), ("Text encoder", llm), ("mmproj", mmproj), ("VAE", vae)] if not p or not os.path.isfile(p)]
@@ -4779,6 +4784,11 @@ def _on_use_mask_toggled(self, checked: bool, persist: bool = True):
                             if init_q and not os.path.isfile(init_q):
                                 raise Exception('Scene image file not found: ' + init_q)
 
+                        try:
+                            # Persist resolved shared encoder paths before queue_adapter reads widget/settings.
+                            self._save_settings(silent=True)
+                        except Exception:
+                            pass
                         jid = _enq(self)
                     finally:
                         if _restore_use_scene is not None:
@@ -4864,8 +4874,8 @@ def _on_use_mask_toggled(self, checked: bool, persist: bool = True):
             ref_imgs = []
 
         unet = self.cb_unet.currentData()
-        llm = self.cb_llm.currentData()
-        mmproj = self.cb_mmproj.currentData()
+        llm = _resolve_shared_model_path(str(self.cb_llm.currentData() or ""))
+        mmproj = _resolve_shared_model_path(str(self.cb_mmproj.currentData() or ""))
         vae = self.cb_vae.currentData()
 
         missing = [name for name, p in [("UNet", unet), ("Text encoder", llm), ("mmproj", mmproj), ("VAE", vae)] if not p or not os.path.isfile(p)]

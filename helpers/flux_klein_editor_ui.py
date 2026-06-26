@@ -1001,7 +1001,14 @@ class MainWindow(QtWidgets.QMainWindow):
             # preferred first
             items_sorted = sorted(items, key=lambda x: (0 if preferred and preferred in x.name.lower() else 1, x.name.lower()))
             for pth in items_sorted:
-                rel = str(pth.relative_to(base)) if base.exists() else pth.name
+                try:
+                    rel = str(pth.relative_to(base)) if base.exists() else pth.name
+                except Exception:
+                    # Shared text encoders live outside klein4b_gguf, so show a clean label instead of crashing.
+                    try:
+                        rel = str(pth.relative_to(Path(self.paths.root) / "models"))
+                    except Exception:
+                        rel = pth.name
                 combo.addItem(rel, str(pth))
             combo.blockSignals(False)
             # restore selection

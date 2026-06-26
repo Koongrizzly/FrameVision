@@ -523,6 +523,32 @@ def _run_klein9b_te_q8(root: Path) -> Optional[Tuple[str, List[str], Path]]:
 
 
 
+
+
+def _find_krea2_downloader_script(root: Path) -> Optional[Path]:
+    """Return the Krea 2 GGUF downloader script when present."""
+    candidates = [
+        root / "presets" / "extra_env" / "download_krea2.py",
+        root / "helpers" / "download_krea2.py",
+        root / "download_krea2.py",
+    ]
+    for c in candidates:
+        if c.exists():
+            return c
+    return None
+
+
+def _run_krea2_gguf(root: Path) -> Optional[Tuple[str, List[str], Path]]:
+    """Launch the Krea 2 GGUF downloader using the current app Python."""
+    script = _find_krea2_downloader_script(root)
+    if script is None:
+        return None
+    py = _venv_python(root)
+    if py is None or (not py.exists()):
+        return None
+    return (str(py), ["-u", str(script)], root)
+
+
 def _run_ace(root: Path) -> Optional[Tuple[str, List[str], Path]]:
     script = root / "presets" / "extra_env" / "ace_setup.bat"
     if not script.exists():
@@ -1314,6 +1340,17 @@ OptionalInstall(
             title="Lens Turbo U4 download model cache",
             description="Optional extra step: downloads the Lens Turbo U4 model files into FrameVision's portable models/lens Hugging Face cache now, so first use can run offline/faster. Also refreshes the kernel cache.",
             runner=_run_lens_turbo_u4_model_cache,
+        ),
+
+        OptionalInstall(
+            key="krea2_gguf",
+            title="Krea 2 GGUF",
+            description=(
+                "Fast and low VRAM (Q4 needs about 13 gigabyte). "
+                "Downloads a Krea 2 Turbo GGUF into models/krea2. "
+                "You can also download base model GGUF files and drop them in the same folder as the Turbo model to use them in the GGUF loader."
+            ),
+            runner=_run_krea2_gguf,
         ),
         OptionalInstall(
             key="hidream_edit_base",

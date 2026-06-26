@@ -3941,22 +3941,85 @@ class Wan22Pane(QWidget):
         return self._wan_turbo_root() / "Wan2.2-TI2V-5B-Turbo"
 
     def _ensure_wan_turbo_links(self, repo_dir: Path, model_root: Path, turbo_model_dir: Path):
-        """Best-effort creation of the two junctions expected by the Turbo repo."""
+        """Prepare the relative wan_models folders expected by the Turbo repo.
+
+        Important: never junction Wan2.2-TI2V-5B back to models/wan22. The
+        Turbo repo itself lives inside models/wan22/wan_turbo, so that junction
+        creates a recursive wan_turbo loop. Instead we create a small real base
+        folder and link/copy only the root checkpoint files the repo needs.
+        """
+        def _safe_unlink(path: Path) -> None:
+            try:
+                if path.is_symlink() or path.is_file():
+                    path.unlink()
+            except Exception:
+                pass
+
+        def _link_or_copy_file(src: Path, dst: Path) -> None:
+            try:
+                if dst.exists() or dst.is_symlink():
+                    return
+                dst.parent.mkdir(parents=True, exist_ok=True)
+                if os.name == "nt":
+                    # Hardlink keeps paths independent and avoids directory junction loops.
+                    proc = subprocess.run(
+                        ["cmd", "/c", "mklink", "/H", str(dst), str(src)],
+                        stdout=subprocess.PIPE,
+                        stderr=subprocess.PIPE,
+                        text=True,
+                        timeout=20,
+                    )
+                    if proc.returncode == 0 and dst.exists():
+                        return
+                try:
+                    os.symlink(str(src), str(dst))
+                    return
+                except Exception:
+                    pass
+                import shutil
+                shutil.copy2(str(src), str(dst))
+            except Exception:
+                pass
+
         try:
             wm = repo_dir / "wan_models"
             wm.mkdir(parents=True, exist_ok=True)
-            pairs = (
-                # Do not link Wan2.2-TI2V-5B back to the full models/wan22 folder;
-                # that creates a recursive wan_turbo loop because the Turbo repo lives inside wan22.
-                (wm / "Wan2.2-TI2V-5B-Turbo", turbo_model_dir),
-            )
-            for link, target in pairs:
+
+            base_link = wm / "Wan2.2-TI2V-5B"
+            # If an old recursive junction/symlink exists, remove only the link itself.
+            try:
+                if base_link.exists() or base_link.is_symlink():
+                    try:
+                        if base_link.resolve() == model_root.resolve():
+                            if os.name == "nt":
+                                subprocess.run(["cmd", "/c", "rmdir", str(base_link)], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=20)
+                            else:
+                                base_link.unlink()
+                    except Exception:
+                        pass
+            except Exception:
+                pass
+            base_link.mkdir(parents=True, exist_ok=True)
+
+            shared_dir = APP_ROOT / "models" / "shared"
+            for src in list(model_root.iterdir()) if model_root.exists() else []:
                 try:
-                    if link.exists():
-                        continue
+                    if src.is_file():
+                        _link_or_copy_file(src, base_link / src.name)
+                except Exception:
+                    pass
+            # T5 may already have been moved to models/shared by the cleanup.
+            shared_t5 = shared_dir / "models_t5_umt5-xxl-enc-bf16.pth"
+            if shared_t5.exists():
+                _safe_unlink(base_link / shared_t5.name)
+                _link_or_copy_file(shared_t5, base_link / shared_t5.name)
+
+            turbo_link = wm / "Wan2.2-TI2V-5B-Turbo"
+            if turbo_model_dir.exists() and not turbo_link.exists():
+                try:
                     if os.name == "nt":
                         subprocess.run(
-                            ["cmd", "/c", "mklink", "/J", str(link), str(target)],
+                            ["cmd", "/c", "mklink", "/J", str(turbo_link), str(turbo_model_dir)],
                             cwd=str(repo_dir),
                             stdout=subprocess.PIPE,
                             stderr=subprocess.PIPE,
@@ -3964,10 +4027,7 @@ class Wan22Pane(QWidget):
                             timeout=20,
                         )
                     else:
-                        try:
-                            os.symlink(str(target), str(link), target_is_directory=True)
-                        except TypeError:
-                            os.symlink(str(target), str(link))
+                        os.symlink(str(turbo_model_dir), str(turbo_link), target_is_directory=True)
                 except Exception:
                     pass
         except Exception:
