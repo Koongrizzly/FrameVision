@@ -4454,25 +4454,126 @@ def wan22_generate(job, cfg, mani):
         pass
 
     def _ensure_turbo_links():
-        """Best-effort creation of the wan_models junctions expected by the Turbo repo."""
+        """Create the minimal wan_models layout expected by the Turbo repo.
+
+        Do not junction Wan2.2-TI2V-5B back to models\\wan22. That creates a
+        recursive wan_turbo loop and also breaks when the shared T5 encoder has
+        been moved to models\\shared.
+        """
         try:
+            import shutil as _shutil
+            import subprocess as _subp
+
             wm = turbo_repo_dir / "wan_models"
             wm.mkdir(parents=True, exist_ok=True)
-            pairs = (
-                (wm / "Wan2.2-TI2V-5B", model_root),
-                (wm / "Wan2.2-TI2V-5B-Turbo", turbo_model_dir),
-            )
-            for link, target in pairs:
+
+            expected_base = wm / "Wan2.2-TI2V-5B"
+            expected_turbo = wm / "Wan2.2-TI2V-5B-Turbo"
+
+            def _remove_empty_or_link_dir(p):
+                """Remove only an empty dir or a Windows junction/symlink-looking dir."""
                 try:
-                    if link.exists():
-                        continue
+                    if not p.exists():
+                        return
+                    # If this was the old junction, rmdir without /s removes only the link.
                     if os.name == "nt":
-                        import subprocess as _subp
-                        _subp.run(["cmd", "/c", "mklink", "/J", str(link), str(target)], cwd=str(turbo_repo_dir), stdout=_subp.PIPE, stderr=_subp.PIPE, text=True, timeout=20)
+                        try:
+                            _subp.run(["cmd", "/c", "rmdir", str(p)], stdout=_subp.PIPE, stderr=_subp.PIPE, text=True, timeout=20)
+                        except Exception:
+                            pass
                     else:
-                        os.symlink(str(target), str(link), target_is_directory=True)
+                        try:
+                            if p.is_symlink():
+                                p.unlink()
+                        except Exception:
+                            pass
+                    # For a real empty folder, normal rmdir is safe. It will fail if non-empty.
+                    try:
+                        if p.exists():
+                            p.rmdir()
+                    except Exception:
+                        pass
                 except Exception:
                     pass
+
+            def _link_or_copy_file(src, dst):
+                try:
+                    src = Path(src)
+                    dst = Path(dst)
+                    if not src.exists() or not src.is_file():
+                        return False
+                    dst.parent.mkdir(parents=True, exist_ok=True)
+                    if dst.exists():
+                        try:
+                            if dst.stat().st_size == src.stat().st_size:
+                                return True
+                        except Exception:
+                            pass
+                        try:
+                            dst.unlink()
+                        except Exception:
+                            return False
+                    try:
+                        if os.name == "nt":
+                            r = _subp.run(["cmd", "/c", "mklink", "/H", str(dst), str(src)], stdout=_subp.PIPE, stderr=_subp.PIPE, text=True, timeout=20)
+                            if int(getattr(r, "returncode", 1) or 0) == 0 and dst.exists():
+                                return True
+                        else:
+                            try:
+                                os.link(str(src), str(dst))
+                                if dst.exists():
+                                    return True
+                            except Exception:
+                                pass
+                    except Exception:
+                        pass
+                    try:
+                        _shutil.copy2(str(src), str(dst))
+                        return dst.exists()
+                    except Exception:
+                        return False
+                except Exception:
+                    return False
+
+            # If the expected base path exists but does not contain the shared/local T5,
+            # it is probably the old junction or a stale broken folder. Remove only if safe.
+            shared_dir = root / "models" / "shared"
+            t5_name = "models_t5_umt5-xxl-enc-bf16.pth"
+            t5_src = shared_dir / t5_name
+            if not t5_src.exists():
+                t5_src = model_root / t5_name
+
+            try:
+                if expected_base.exists() and not (expected_base / t5_name).exists() and t5_src.exists():
+                    _remove_empty_or_link_dir(expected_base)
+            except Exception:
+                pass
+
+            try:
+                expected_base.mkdir(parents=True, exist_ok=True)
+            except Exception:
+                pass
+
+            # Root files the Turbo repo expects under wan_models/Wan2.2-TI2V-5B.
+            try:
+                _link_or_copy_file(t5_src, expected_base / t5_name)
+            except Exception:
+                pass
+            for name in ("Wan2.2_VAE.pth", "diffusion_pytorch_model.safetensors.index.json"):
+                try:
+                    _link_or_copy_file(model_root / name, expected_base / name)
+                except Exception:
+                    pass
+
+            # Keep only the Turbo model folder link/junction, not the base folder.
+            try:
+                if not expected_turbo.exists():
+                    if os.name == "nt":
+                        _subp.run(["cmd", "/c", "mklink", "/J", str(expected_turbo), str(turbo_model_dir)], cwd=str(turbo_repo_dir), stdout=_subp.PIPE, stderr=_subp.PIPE, text=True, timeout=20)
+                    else:
+                        os.symlink(str(turbo_model_dir), str(expected_turbo), target_is_directory=True)
+            except Exception:
+                pass
         except Exception:
             pass
 
