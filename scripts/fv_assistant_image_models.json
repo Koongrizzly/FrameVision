@@ -54,6 +54,27 @@
       "default_steps": 30,
       "default_cfg": 3.0
     },
+    "krea2": {
+      "label": "Krea 2 GGUF",
+      "aliases": [
+        "krea",
+        "krea2",
+        "krea 2",
+        "krea-2",
+        "krea 2 gguf",
+        "krea2 gguf"
+      ],
+      "folder": "models/krea2",
+      "queue_type": "krea2_generate",
+      "output_dir": "output/images/krea2",
+      "default_steps": 8,
+      "default_cfg": 1.0,
+      "default_guidance": 3.5,
+      "default_flow_shift": 1.15,
+      "default_sampler": "euler",
+      "default_scheduler": "auto",
+      "required_vae": "wan_2.1_vae.safetensors"
+    },
     "flux_klein": {
       "label": "Flux Klein",
       "aliases": [
