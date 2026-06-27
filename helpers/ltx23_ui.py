@@ -1051,8 +1051,19 @@ class LTX23RunnerWidget(QWidget):
         )
         self._save_timer = QTimer(self)
         self._save_timer.setSingleShot(True)
-        self._save_timer.setInterval(650)
+        # Do not save on every tiny edit. Prompt boxes can emit textChanged for
+        # every keystroke, and writing/refreshing JSON that often makes typing
+        # feel delayed on slower disks or when the UI is embedded in FrameVision.
+        self._save_timer.setInterval(2500)
         self._save_timer.timeout.connect(lambda: self._save_settings(silent=True))
+        self._prompt_save_timer = QTimer(self)
+        self._prompt_save_timer.setSingleShot(True)
+        self._prompt_save_timer.setInterval(8000)
+        self._prompt_save_timer.timeout.connect(lambda: self._save_settings(silent=True))
+        self._command_preview_timer = QTimer(self)
+        self._command_preview_timer.setSingleShot(True)
+        self._command_preview_timer.setInterval(1000)
+        self._command_preview_timer.timeout.connect(self._refresh_command_preview)
         self._vram_profile_autofill_timer = QTimer(self)
         self._vram_profile_autofill_timer.setSingleShot(True)
         self._vram_profile_autofill_timer.setInterval(650)
@@ -3991,6 +4002,13 @@ class LTX23RunnerWidget(QWidget):
             QMessageBox.warning(self, "LTX 2.3", f"Could not prepare video input frame:\n{type(exc).__name__}: {exc}")
             return
         self.active_output_path = output_path
+        for timer_name in ("_prompt_save_timer", "_command_preview_timer"):
+            timer = getattr(self, timer_name, None)
+            try:
+                if timer is not None and timer.isActive():
+                    timer.stop()
+            except Exception:
+                pass
         output_path.parent.mkdir(parents=True, exist_ok=True)
         Path(self.report_row.text()).parent.mkdir(parents=True, exist_ok=True)
         Path(self.deep_log_row.text()).parent.mkdir(parents=True, exist_ok=True)
@@ -4701,7 +4719,7 @@ class LTX23RunnerWidget(QWidget):
         for edit in [
             self.prompt_edit, self.negative_edit, self.extra_args_edit,
         ]:
-            edit.textChanged.connect(self._settings_changed)
+            edit.textChanged.connect(self._text_settings_changed)
         for line in [
             self.reference_images_edit, self.output_name_edit, self.disable_lora_extra_args_edit,
         ]:
@@ -5001,6 +5019,37 @@ class LTX23RunnerWidget(QWidget):
         self._update_fast_iclora_route_controls()
         self._refresh_command_preview()
         self._queue_settings_save()
+
+    def _text_settings_changed(self, *args: Any) -> None:
+        """Cheap path for prompt/negative/extra-args typing.
+
+        These fields can change many times per second.  The normal settings path
+        recalculates Auto VRAM values, rebuilds the command preview, and queues a
+        JSON write, which makes long prompt typing feel like the UI is catching
+        up seconds later.  Delay the expensive parts until the user pauses.
+        """
+        if self._loading:
+            return
+        self._queue_command_preview_refresh()
+        self._queue_prompt_settings_save()
+
+    def _queue_command_preview_refresh(self) -> None:
+        if self._loading:
+            return
+        timer = getattr(self, "_command_preview_timer", None)
+        if timer is not None:
+            timer.start()
+        else:
+            self._refresh_command_preview()
+
+    def _queue_prompt_settings_save(self) -> None:
+        if self._loading:
+            return
+        timer = getattr(self, "_prompt_save_timer", None)
+        if timer is not None:
+            timer.start()
+        else:
+            self._queue_settings_save()
 
     def _queue_settings_save(self) -> None:
         if self._loading:
@@ -5406,8 +5455,13 @@ class LTX23RunnerWidget(QWidget):
         QDesktopServices.openUrl(QUrl.fromLocalFile(str(target)))
 
     def closeEvent(self, event: Any) -> None:
-        if self._save_timer.isActive():
-            self._save_timer.stop()
+        for timer_name in ("_save_timer", "_prompt_save_timer", "_command_preview_timer"):
+            timer = getattr(self, timer_name, None)
+            try:
+                if timer is not None and timer.isActive():
+                    timer.stop()
+            except Exception:
+                pass
         self._save_settings(silent=True)
         super().closeEvent(event)
 
