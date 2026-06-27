@@ -8749,13 +8749,14 @@ class PipelineWorker(QThread):
                 log_path=log_file,
             )
         elif mk == "ltx23":
-            bridge = _ltx23_bridge_config_global()
-            wangp_root = str(bridge.get("wangp_root") or '').strip()
-            if not wangp_root or not os.path.isdir(wangp_root):
-                raise RuntimeError(
-                    "WanGP root for LTX 2.3 was not found. Expected one of: "
-                    r"FRAMEVISION_LTX23_WANGP_ROOT, C:\WanGP\Wan2GP, or a nearby Wan2GP folder."
-                )
+            # Public FrameVision LTX review/recreate must use the same native VRAM Lab path
+            # as the normal Planner run. The old Wan2GP bridge is allowed only for the
+            # hidden Wan2GP LTX workflow.
+            try:
+                _hidden_wangp_ltx = bool(self._is_ltx23_wangp_video_model_selected())
+            except Exception:
+                _hidden_wangp_ltx = False
+
             _clip_resolution = str((clip_entry or {}).get("resolution") or '').strip()
             if _clip_resolution:
                 resolution = _clip_resolution
@@ -8766,6 +8767,7 @@ class PipelineWorker(QThread):
                     or "landscape"
                 )
                 resolution = _profile_resolution_for_aspect(prof, _aspect_mode)
+
             _ltx_use_end_images = bool(_planner_use_end_images_enabled(getattr(self.job, "encoding", {})))
             end_image_path = _planner_get_end_image_for_shot(
                 sid=sid,
@@ -8775,82 +8777,270 @@ class PipelineWorker(QThread):
                 out_dir=self.out_dir,
                 attachments=(self.job.attachments or {}),
                 enabled=_ltx_use_end_images,
-            ) if mk == "ltx23" else ""
+            )
 
             try:
                 _saved_settings = _load_planner_settings() or {}
             except Exception:
                 _saved_settings = {}
-            _enc_lora = None
-            for _src in (
-                (clip_entry or {}).get("use_transition_lora", None),
-                rec.get("use_transition_lora", None),
-                ((manifest.get("settings") or {}).get("use_transition_lora", None) if isinstance(manifest.get("settings"), dict) else None),
-                (self.job.encoding or {}).get("use_transition_lora", None),
-                _saved_settings.get("use_transition_lora", None),
-            ):
-                if _src is not None:
-                    _enc_lora = _src
-                    break
-            try:
-                _ui_lora_widget = getattr(self, "chk_use_transition_lora", None)
-                _ui_lora = bool(_ui_lora_widget.isChecked()) if _ui_lora_widget is not None else None
-            except Exception:
-                _ui_lora = None
-            try:
-                _allow_ltx_loras = bool(self._is_ltx23_wangp_video_model_selected())
-            except Exception:
-                _allow_ltx_loras = False
-            if not _allow_ltx_loras:
-                use_transition_lora = False
-            elif _enc_lora is None:
-                use_transition_lora = True if _ui_lora is None else bool(_ui_lora)
+
+            if _hidden_wangp_ltx:
+                bridge = _ltx23_bridge_config_global()
+                wangp_root = str(bridge.get("wangp_root") or '').strip()
+                if not wangp_root or not os.path.isdir(wangp_root):
+                    raise RuntimeError(
+                        "WanGP root for hidden LTX workflow was not found. Expected one of: "
+                        r"FRAMEVISION_LTX23_WANGP_ROOT, C:\WanGP\Wan2GP, or a nearby Wan2GP folder."
+                    )
+
+                _enc_lora = None
+                for _src in (
+                    (clip_entry or {}).get("use_transition_lora", None),
+                    rec.get("use_transition_lora", None),
+                    ((manifest.get("settings") or {}).get("use_transition_lora", None) if isinstance(manifest.get("settings"), dict) else None),
+                    (self.job.encoding or {}).get("use_transition_lora", None),
+                    _saved_settings.get("use_transition_lora", None),
+                ):
+                    if _src is not None:
+                        _enc_lora = _src
+                        break
+                try:
+                    _ui_lora_widget = getattr(self, "chk_use_transition_lora", None)
+                    _ui_lora = bool(_ui_lora_widget.isChecked()) if _ui_lora_widget is not None else None
+                except Exception:
+                    _ui_lora = None
+                if _enc_lora is None:
+                    use_transition_lora = True if _ui_lora is None else bool(_ui_lora)
+                else:
+                    use_transition_lora = bool(_enc_lora)
+                extra_loras = _planner_ltx23_normalize_extra_loras((self.job.encoding or {}), _saved_settings)
+                frames = max(12, min(int(max_frames or 384), int(frames)))
+
+                args = [
+                    str(sys.executable),
+                    str(_root() / "helpers" / "ltx23_cli.py"),
+                    "generate",
+                    "--wangp-root", str(wangp_root),
+                    "--prompt", str(prompt or ''),
+                    "--negative", str(negative or ''),
+                    "--image", str(img_path),
+                    "--output", str(out_file),
+                    "--fps", str(int(fps)),
+                    "--frames", str(int(frames)),
+                    "--steps", str(int(steps)),
+                    "--resolution", str(resolution),
+                    "--flow-shift", str(float(prof.get("flow_shift") or 5.0)),
+                    "--sliding-window-size", str(int(prof.get("sliding_window_size") or 481)),
+                    "--sliding-window-overlap", str(int(prof.get("sliding_window_overlap") or 17)),
+                    "--guidance-phases", str(int(prof.get("guidance_phases") or 1)),
+                    "--denoising-strength", str(float(prof.get("denoising_strength") or 1.0)),
+                    "--lora-multiplier", str(float(prof.get("lora_multiplier") or 1.0)),
+                ]
+                if seed is not None:
+                    args += ["--seed", str(int(seed))]
+                if str(end_image_path or '').strip():
+                    args += ["--image-end", str(end_image_path).strip()]
+                if str(bridge.get("wgp_py") or '').strip() and os.path.isfile(str(bridge.get("wgp_py") or '')):
+                    args += ["--wgp-py", str(bridge.get("wgp_py") or '')]
+                if bool(use_transition_lora):
+                    _lf = str(bridge.get("lora_file") or '').strip()
+                    _lj = str(bridge.get("lora_json") or '').strip()
+                    if _lf:
+                        args += ["--lora-file", _lf]
+                    if _lj:
+                        args += ["--lora-json", _lj]
+                _planner_ltx23_append_extra_lora_args(args, extra_loras)
+
+                log_file = os.path.join(clips_dir, f"{sid}.ltx23.log.txt")
+                Path(log_file).parent.mkdir(parents=True, exist_ok=True)
+                with open(log_file, "a", encoding="utf-8", errors="ignore") as lf:
+                    lf.write(f"[planner] hidden Wan2GP LTX regen settings: frames={frames} fps={fps} resolution={resolution} use_transition_lora={use_transition_lora} extra_loras={_planner_ltx23_extra_loras_fingerprint(extra_loras)} end_image={end_image_path or '<none>'}\n")
+                    lf.write("[planner] hidden Wan2GP LTX regen cmd:\n")
+                    lf.write(" ".join([str(x) for x in args]) + "\n\n")
+                    lf.flush()
+                    subprocess.run(args, cwd=str(_root()), stdout=lf, stderr=lf, check=True)
+
             else:
-                use_transition_lora = bool(_enc_lora)
-            extra_loras = _planner_ltx23_normalize_extra_loras((self.job.encoding or {}), _saved_settings) if _allow_ltx_loras else []
-            frames = max(12, min(int(max_frames or 384), int(frames)))
-            args = [
-                str(sys.executable),
-                str(_root() / "helpers" / "ltx23_cli.py"),
-                "generate",
-                "--wangp-root", str(wangp_root),
-                "--prompt", str(prompt or ''),
-                "--negative", str(negative or ''),
-                "--image", str(img_path),
-                "--output", str(out_file),
-                "--fps", str(int(fps)),
-                "--frames", str(int(frames)),
-                "--steps", str(int(steps)),
-                "--resolution", str(resolution),
-                "--flow-shift", str(float(prof.get("flow_shift") or 5.0)),
-                "--sliding-window-size", str(int(prof.get("sliding_window_size") or 481)),
-                "--sliding-window-overlap", str(int(prof.get("sliding_window_overlap") or 17)),
-                "--guidance-phases", str(int(prof.get("guidance_phases") or 1)),
-                "--denoising-strength", str(float(prof.get("denoising_strength") or 1.0)),
-                "--lora-multiplier", str(float(prof.get("lora_multiplier") or 1.0)),
-            ]
-            if seed is not None:
-                args += ["--seed", str(int(seed))]
-            if str(end_image_path or '').strip():
-                args += ["--image-end", str(end_image_path).strip()]
-            if str(bridge.get("wgp_py") or '').strip() and os.path.isfile(str(bridge.get("wgp_py") or '')):
-                args += ["--wgp-py", str(bridge.get("wgp_py") or '')]
-            if bool(use_transition_lora):
-                _lf = str(bridge.get("lora_file") or '').strip()
-                _lj = str(bridge.get("lora_json") or '').strip()
-                if _lf:
-                    args += ["--lora-file", _lf]
-                if _lj:
-                    args += ["--lora-json", _lj]
-            _planner_ltx23_append_extra_lora_args(args, extra_loras)
-            log_file = os.path.join(clips_dir, f"{sid}.ltx23.log.txt")
-            Path(log_file).parent.mkdir(parents=True, exist_ok=True)
-            with open(log_file, "a", encoding="utf-8", errors="ignore") as lf:
-                lf.write(f"[planner] ltx23 regen settings: frames={frames} fps={fps} resolution={resolution} use_transition_lora={use_transition_lora} extra_loras={_planner_ltx23_extra_loras_fingerprint(extra_loras)} end_image={end_image_path or '<none>'}\n")
-                lf.write("[planner] ltx23 regen cmd:\n")
-                lf.write(" ".join([str(x) for x in args]) + "\n\n")
-                lf.flush()
-                subprocess.run(args, cwd=str(_root()), stdout=lf, stderr=lf, check=True)
+                use_transition_lora = False
+                extra_loras = []
+
+                def _review_ltx23_native_root_candidates() -> List[Path]:
+                    candidates: List[Path] = []
+                    for env_name in ("FRAMEVISION_LTX23_ROOT", "FRAMEVISION_LTX_ROOT"):
+                        try:
+                            raw = str(os.environ.get(env_name) or "").strip()
+                        except Exception:
+                            raw = ""
+                        if raw:
+                            candidates.append(Path(raw))
+                    try:
+                        candidates.append(_root())
+                    except Exception:
+                        pass
+                    if os.name == "nt":
+                        candidates += [Path(r"F:\ltx23"), Path(r"C:\ltx23")]
+                    out: List[Path] = []
+                    seen = set()
+                    for c in candidates:
+                        try:
+                            key = str(c.resolve()).lower()
+                        except Exception:
+                            key = str(c).lower()
+                        if key not in seen:
+                            seen.add(key)
+                            out.append(c)
+                    return out
+
+                def _review_ltx23_native_find_file(relative_parts: List[str], env_var: str = "") -> str:
+                    try:
+                        if env_var:
+                            raw = str(os.environ.get(env_var) or "").strip()
+                            if raw and os.path.exists(raw):
+                                return raw
+                    except Exception:
+                        pass
+                    for root_dir in _review_ltx23_native_root_candidates():
+                        try:
+                            p = root_dir.joinpath(*relative_parts)
+                            if p.exists():
+                                return str(p.resolve())
+                        except Exception:
+                            continue
+                    try:
+                        return str(_review_ltx23_native_root_candidates()[0].joinpath(*relative_parts))
+                    except Exception:
+                        return str(Path(*relative_parts))
+
+                def _review_ltx23_native_python() -> str:
+                    try:
+                        raw = str(os.environ.get("FRAMEVISION_LTX23_PYTHON") or os.environ.get("FRAMEVISION_LTX_PYTHON") or "").strip()
+                        if raw and os.path.isfile(raw):
+                            return raw
+                    except Exception:
+                        pass
+                    rels = [
+                        ["environments", ".ltx23", "python.exe"],
+                        ["environments", ".ltx23", "Scripts", "python.exe"],
+                        ["environments", ".ltx23_native", "python.exe"],
+                        ["environments", ".ltx23_native", "Scripts", "python.exe"],
+                    ]
+                    for root_dir in _review_ltx23_native_root_candidates():
+                        for rel in rels:
+                            try:
+                                p = root_dir.joinpath(*rel)
+                                if p.exists():
+                                    return str(p.resolve())
+                            except Exception:
+                                pass
+                    return sys.executable
+
+                def _review_ltx23_resolution_dims(resolution_text: str, orientation_hint: str = "") -> tuple[int, int]:
+                    raw = str(resolution_text or "1280x704").strip().lower().replace("*", "x")
+                    if raw.endswith("p"):
+                        raw = "1280x704"
+                    try:
+                        w_s, h_s = raw.split("x", 1)
+                        w, h = int(float(w_s)), int(float(h_s))
+                    except Exception:
+                        w, h = 1280, 704
+                    if "portrait" in str(orientation_hint or "").lower() and w > h:
+                        w, h = h, w
+                    return max(32, w), max(32, h)
+
+                cli = _root() / "helpers" / "ltx23_vram_lab_cli.py"
+                if not cli.exists():
+                    raise RuntimeError(f"Missing native FrameVision LTX CLI: {cli}")
+
+                py_exe = _review_ltx23_native_python()
+                if not py_exe or not os.path.isfile(py_exe):
+                    raise RuntimeError(
+                        "LTX 2.3 Python environment not found. Expected FRAMEVISION_LTX23_PYTHON "
+                        "or app-local environments/.ltx23/python.exe."
+                    )
+
+                def _review_ltx23_root_from_python(py_path: str) -> str:
+                    try:
+                        pp = Path(py_path).resolve()
+                        parts = list(pp.parents)
+                        for i, parent in enumerate(parts):
+                            if parent.name.lower() == "environments" and (i + 1) < len(parts):
+                                return str(parts[i + 1])
+                    except Exception:
+                        pass
+                    try:
+                        return str(_review_ltx23_native_root_candidates()[0])
+                    except Exception:
+                        return str(_root())
+
+                ltx_root = _review_ltx23_root_from_python(py_exe)
+                checkpoint = _review_ltx23_native_find_file(["models", "ltx23", "distilled-1.1", "ltx-2.3-22b-distilled-1.1.safetensors"], "FRAMEVISION_LTX23_CHECKPOINT")
+                gemma_root = _review_ltx23_native_find_file(["models", "ltx23", "text_encoder", "lightricks_gemma_original"], "FRAMEVISION_LTX23_GEMMA_ROOT")
+                spatial_upsampler = _review_ltx23_native_find_file(["models", "ltx23", "spatial_upsampler", "ltx-2.3-spatial-upscaler-x2-1.1.safetensors"], "FRAMEVISION_LTX23_SPATIAL_UPSAMPLER")
+                width, height = _review_ltx23_resolution_dims(resolution)
+
+                try:
+                    frames = _ltx23_planner_frame_count(int(frames), int(max_frames or 241))
+                except Exception:
+                    frames = 241 if int(frames) >= 240 else max(12, min(241, int(frames)))
+
+                args = [
+                    str(py_exe),
+                    str(cli),
+                    "--pipeline", "two_stages",
+                    "--vram-lab", "safe",
+                    "--vram-profile", "auto",
+                    "--checkpoint-path", str(checkpoint),
+                    "--gemma-root", str(gemma_root),
+                    "--prompt", str(prompt or ''),
+                    "--output-path", str(out_file),
+                    "--height", str(int(height)),
+                    "--width", str(int(width)),
+                    "--num-frames", str(min(241, int(frames))),
+                    "--frame-rate", str(int(fps)),
+                    "--num-inference-steps", str(int(steps)),
+                    "--shift", "5",
+                    "--attention-backend", "auto",
+                    "--no-boundary-echo",
+                    "--spatial-upsampler-path", str(spatial_upsampler),
+                    "--i2v-image", str(img_path),
+                    "--i2v-image-frame", "0",
+                    "--i2v-image-strength", "1.0",
+                    "--i2v-image-crf", "0",
+                    "--ltx-root", str(ltx_root),
+                    "--report-path", str(_root() / "tools" / "vram_lab" / "ltx_vram_lab_integration_report.txt"),
+                ]
+                if seed is not None:
+                    args += ["--seed", str(int(seed))]
+                else:
+                    args += ["--seed", "1234"]
+
+                native_extra_args = [
+                    "--video-cfg-guidance-scale", "2",
+                    "--video-stg-guidance-scale", "0",
+                    "--video-rescale-scale", "0.7",
+                    "--audio-cfg-guidance-scale", "1",
+                    "--audio-stg-guidance-scale", "0",
+                    "--audio-rescale-scale", "0",
+                    "--a2v-guidance-scale", "1",
+                    "--v2a-guidance-scale", "1",
+                    "--video-skip-step", "0",
+                    "--audio-skip-step", "0",
+                    "--max-batch-size", "2",
+                ]
+                if str(end_image_path or '').strip():
+                    native_extra_args += ["--image", str(end_image_path).strip(), str(max(0, min(240, int(frames) - 1))), "1.0"]
+                if native_extra_args:
+                    args.append("--extra")
+                    args.extend(native_extra_args)
+
+                log_file = os.path.join(clips_dir, f"{sid}.ltx23.log.txt")
+                Path(log_file).parent.mkdir(parents=True, exist_ok=True)
+                with open(log_file, "a", encoding="utf-8", errors="ignore") as lf:
+                    lf.write(f"[planner] native FrameVision LTX regen settings: frames={frames} fps={fps} resolution={resolution} end_image={end_image_path or '<none>'}\n")
+                    lf.write("[planner] native FrameVision LTX regen cmd:\n")
+                    lf.write(" ".join([str(x) for x in args]) + "\n\n")
+                    lf.flush()
+                    subprocess.run(args, cwd=str(_root()), stdout=lf, stderr=lf, check=True)
         else:
             raise RuntimeError("Clip regeneration is only supported for HunyuanVideo 1.5, WAN 2.2 Turbo, and LTX 2.3 in the current build.")
 
