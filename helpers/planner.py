@@ -1311,6 +1311,74 @@ def _krea2_root() -> Path:
     return (_root() / "models" / "krea2").resolve()
 
 
+def _krea2_settings_path() -> Path:
+    return (_root() / "presets" / "setsave" / "krea2.json").resolve()
+
+
+def _krea2_resolve_path(value: str) -> str:
+    try:
+        raw = str(value or '').strip().strip('"')
+    except Exception:
+        raw = ''
+    if not raw:
+        return ''
+    try:
+        pp = Path(raw)
+        if not pp.is_absolute():
+            pp = (_root() / pp)
+        return str(pp.resolve())
+    except Exception:
+        return raw
+
+
+def _krea2_read_saved_settings() -> Dict[str, Any]:
+    sp = _krea2_settings_path()
+    try:
+        if sp.exists() and sp.is_file():
+            data = json.loads(sp.read_text(encoding='utf-8'))
+            if isinstance(data, dict):
+                return data
+    except Exception:
+        pass
+    return {}
+
+
+def _krea2_effective_settings() -> Dict[str, Any]:
+    s = _krea2_read_saved_settings()
+    cfg: Dict[str, Any] = {}
+    cfg['sdcli'] = _krea2_resolve_path(str(s.get('sdcli') or _krea2_sdcli_path() or ''))
+    cfg['model'] = _krea2_resolve_path(str(s.get('model') or _krea2_pick_diffusion_gguf() or ''))
+    cfg['llm'] = _krea2_resolve_path(str(s.get('llm') or _krea2_pick_llm_gguf() or ''))
+    cfg['vae'] = _krea2_resolve_path(str(s.get('vae') or _krea2_pick_vae() or ''))
+    cfg['sampler'] = str(s.get('sampler', 'auto') or 'auto').strip().lower() or 'auto'
+    cfg['scheduler'] = str(s.get('scheduler', 'auto') or 'auto').strip().lower() or 'auto'
+    try:
+        cfg['steps'] = int(s.get('steps', 8) or 8)
+    except Exception:
+        cfg['steps'] = 8
+    try:
+        cfg['cfg'] = float(s.get('cfg', 1.0) or 1.0)
+    except Exception:
+        cfg['cfg'] = 1.0
+    try:
+        cfg['guidance'] = float(s.get('guidance', 3.5) or 3.5)
+    except Exception:
+        cfg['guidance'] = 3.5
+    try:
+        cfg['flow_shift'] = float(s.get('flow_shift', 1.15) or 1.15)
+    except Exception:
+        cfg['flow_shift'] = 1.15
+    cfg['offload'] = bool(s.get('offload', False))
+    cfg['diffusion_fa'] = bool(s.get('diffusion_fa', True))
+    cfg['vae_tiling'] = bool(s.get('vae_tiling', False))
+    cfg['verbose'] = bool(s.get('verbose', True))
+    cfg['disable_metadata'] = bool(s.get('disable_metadata', False))
+    cfg['backend'] = str(s.get('backend') or '').strip()
+    cfg['params_backend'] = str(s.get('params_backend') or '').strip()
+    cfg['extra_args'] = str(s.get('extra_args') or '').strip()
+    return cfg
+
+
 def _krea2_sdcli_path() -> str:
     for cand in [
         (_root() / "presets" / "bin" / "sd-cli.exe").resolve(),
@@ -1416,14 +1484,16 @@ def _krea2_pick_vae() -> str:
 
 
 def _krea2_runtime_ready() -> bool:
-    return bool(_krea2_sdcli_path() and _krea2_pick_diffusion_gguf() and _krea2_pick_llm_gguf() and _krea2_pick_vae())
+    cfg = _krea2_effective_settings()
+    return bool(cfg.get('sdcli') and cfg.get('model') and cfg.get('llm') and cfg.get('vae'))
 
 
 def _run_krea2_planner_image(*, t2i_job: Dict[str, Any], images_dir: str, sid: str, aspect_mode: str = "landscape", log_func: Optional[Callable[[str], None]] = None, stop_check: Optional[Callable[[], bool]] = None) -> Dict[str, Any]:
-    sdcli_path = str(t2i_job.get("krea2_sdcli") or _krea2_sdcli_path())
-    model = str(t2i_job.get("krea2_model") or _krea2_pick_diffusion_gguf())
-    llm = str(t2i_job.get("krea2_llm") or _krea2_pick_llm_gguf())
-    vae = str(t2i_job.get("krea2_vae") or _krea2_pick_vae())
+    _ks = _krea2_effective_settings()
+    sdcli_path = str(t2i_job.get("krea2_sdcli") or _ks.get("sdcli") or _krea2_sdcli_path())
+    model = str(t2i_job.get("krea2_model") or _ks.get("model") or _krea2_pick_diffusion_gguf())
+    llm = str(t2i_job.get("krea2_llm") or _ks.get("llm") or _krea2_pick_llm_gguf())
+    vae = str(t2i_job.get("krea2_vae") or _ks.get("vae") or _krea2_pick_vae())
 
     missing = []
     if (not sdcli_path) or (not os.path.exists(sdcli_path)):
@@ -1457,31 +1527,41 @@ def _run_krea2_planner_image(*, t2i_job: Dict[str, Any], images_dir: str, sid: s
         height = int(t2i_job.get("height") or 768)
     except Exception:
         height = 768
+    # Krea must not inherit old Planner image defaults such as 25 steps.
+    # Use the standalone Krea settings/defaults as the source of truth for quality knobs.
     try:
-        steps = int(t2i_job.get("steps") or 8)
+        steps = int(_ks.get("steps") or 8)
     except Exception:
         steps = 8
     try:
-        seed = int(t2i_job.get("seed") or 0)
+        seed = int(t2i_job.get("seed") if (t2i_job.get("seed") is not None) else -1)
     except Exception:
-        seed = 0
+        seed = -1
     try:
-        cfg = float(t2i_job.get("cfg") or t2i_job.get("cfg_scale") or 1.0)
+        cfg = float(_ks.get("cfg") or 1.0)
     except Exception:
         cfg = 1.0
     try:
-        guidance = float(t2i_job.get("guidance") or t2i_job.get("guidance_scale") or 3.5)
+        guidance = float(_ks.get("guidance") or 3.5)
     except Exception:
         guidance = 3.5
     try:
-        shift = float(t2i_job.get("shift") or t2i_job.get("flow_shift") or 1.15)
+        shift = float(_ks.get("flow_shift") or 1.15)
     except Exception:
         shift = 1.15
 
-    sampler = str(t2i_job.get("sampling_method") or t2i_job.get("sampler") or "euler").strip().lower() or "euler"
-    scheduler = str(t2i_job.get("scheduler") or t2i_job.get("scheduler_name") or "").strip().lower()
+    sampler = str(t2i_job.get("sampling_method") or t2i_job.get("sampler") or _ks.get("sampler") or "auto").strip().lower() or "auto"
+    scheduler = str(t2i_job.get("scheduler") or t2i_job.get("scheduler_name") or _ks.get("scheduler") or "auto").strip().lower() or "auto"
     prompt = str(t2i_job.get("prompt") or "").strip()
     negative = str(t2i_job.get("negative_prompt") or t2i_job.get("negative") or t2i_job.get("neg_prompt") or "").strip()
+    use_diff_fa = bool(t2i_job.get("diffusion_fa", _ks.get("diffusion_fa", True)) or t2i_job.get("use_diffusion_fa", False))
+    use_offload = bool(t2i_job.get("offload", _ks.get("offload", False)) or t2i_job.get("offload_to_cpu", False))
+    use_vae_tiling = bool(t2i_job.get("vae_tiling", _ks.get("vae_tiling", False)))
+    use_disable_metadata = bool(t2i_job.get("disable_image_metadata", _ks.get("disable_metadata", False)) or t2i_job.get("disable_metadata", False))
+    use_verbose = bool(t2i_job.get("verbose", _ks.get("verbose", True)))
+    backend = str(t2i_job.get("backend") or _ks.get("backend") or '').strip()
+    params_backend = str(t2i_job.get("params_backend") or _ks.get("params_backend") or '').strip()
+    extra_args = str(t2i_job.get("extra_args") or _ks.get("extra_args") or '').strip()
 
     cmd = [
         sdcli_path,
@@ -1497,23 +1577,33 @@ def _run_krea2_planner_image(*, t2i_job: Dict[str, Any], images_dir: str, sid: s
         "--seed", str(seed),
         "--batch-count", "1",
         "--output", out_path,
-        "--sampling-method", sampler,
     ]
     if negative:
         cmd += ["--negative-prompt", negative]
+    if sampler and sampler != "auto":
+        cmd += ["--sampling-method", sampler]
     if shift >= 0:
         cmd += ["--flow-shift", str(shift)]
     if scheduler and scheduler != "auto":
         cmd += ["--scheduler", scheduler]
-    if bool(t2i_job.get("diffusion_fa", True) or t2i_job.get("use_diffusion_fa", False)):
+    if use_diff_fa:
         cmd += ["--diffusion-fa"]
-    if bool(t2i_job.get("offload") or t2i_job.get("offload_to_cpu")):
+    if use_offload:
         cmd += ["--offload-to-cpu"]
-    if bool(t2i_job.get("vae_tiling")):
+    if use_vae_tiling:
         cmd += ["--vae-tiling"]
-    if bool(t2i_job.get("disable_image_metadata") or t2i_job.get("disable_metadata")):
+    if use_disable_metadata:
         cmd += ["--disable-image-metadata"]
-    if bool(t2i_job.get("verbose", True)):
+    if backend:
+        cmd += ["--backend", backend]
+    if params_backend:
+        cmd += ["--params-backend", params_backend]
+    if extra_args:
+        try:
+            cmd += extra_args.split()
+        except Exception:
+            pass
+    if use_verbose:
         cmd += ["-v"]
 
     if log_func:
@@ -1521,6 +1611,9 @@ def _run_krea2_planner_image(*, t2i_job: Dict[str, Any], images_dir: str, sid: s
             log_func(f"[Krea 2] model: {model}")
             log_func(f"[Krea 2] llm: {llm}")
             log_func(f"[Krea 2] vae: {vae}")
+            log_func(f"[Krea 2] sampler/scheduler: {sampler} / {scheduler}")
+            log_func(f"[Krea 2] steps/cfg/guidance/shift: {steps} / {cfg} / {guidance} / {shift}")
+            log_func(f"[Krea 2] diffusion-fa/offload/tiling: {use_diff_fa} / {use_offload} / {use_vae_tiling}")
         except Exception:
             pass
 
@@ -1569,6 +1662,11 @@ def _run_krea2_planner_image(*, t2i_job: Dict[str, Any], images_dir: str, sid: s
         "krea2_model": model,
         "krea2_llm": llm,
         "krea2_vae": vae,
+        "krea2_sampler": sampler,
+        "krea2_scheduler": scheduler,
+        "krea2_offload": use_offload,
+        "krea2_diffusion_fa": use_diff_fa,
+        "krea2_vae_tiling": use_vae_tiling,
     }
 
 
@@ -3137,6 +3235,26 @@ _LTX23_PRESETS = {
         "max_batch_size": 2, "distilled_lora_strength": 0.5, "vram_lab": "safe", "vram_profile": "auto", "label": "1088p",
     },
 }
+
+def _ltx23_planner_frame_count(frames: int, max_frames: int = 241) -> int:
+    """Planner UI/duration math can naturally produce 240 at 10s*24fps.
+    LTX wants the final maximum clip to be 241 frames, so bump only the max-edge case.
+    """
+    try:
+        n = int(frames)
+    except Exception:
+        n = 121
+    try:
+        mx = int(max_frames or 241)
+    except Exception:
+        mx = 241
+    # Public LTX max is 241. Some UI paths still clamp to 240, so normalize the edge.
+    if n >= 240 and mx in (240, 241):
+        return 241
+    if n == mx - 1 and mx >= 13:
+        return int(mx)
+    return int(max(12, min(max(13, mx), n)))
+
 
 def _normalize_key(s: str) -> str:
     s0 = (s or '').strip().lower()
@@ -9182,7 +9300,7 @@ class PipelineWorker(QThread):
         _eng = str(t2i_job.get("engine") or manifest.get("settings", {}).get("image_engine") or '').lower().strip()
         _sel = (image_model_sel or '').lower().strip()
         if _sel.startswith("auto"):
-            pass
+            _eng = "krea2" if _krea2_runtime_ready() else "zimage_gguf"
         elif "z-image" in _sel and "low" in _sel:
             _eng = "zimage_gguf"
         elif "z-image" in _sel:
@@ -9247,17 +9365,29 @@ class PipelineWorker(QThread):
             ww, hh = _apply_aspect_to_size(bw, bh, aspect_mode)
             t2i_job["width"] = int(ww)
             t2i_job["height"] = int(hh)
-            t2i_job["sampler"] = "euler"
-            t2i_job["sampling_method"] = "euler"
-            t2i_job["steps"] = int(t2i_job.get("steps") or 8)
-            t2i_job["cfg_scale"] = float(t2i_job.get("cfg") or t2i_job.get("cfg_scale") or 1.0)
-            t2i_job["cfg"] = float(t2i_job.get("cfg") or t2i_job.get("cfg_scale") or 1.0)
-            t2i_job["guidance"] = float(t2i_job.get("guidance") or t2i_job.get("guidance_scale") or 3.5)
-            t2i_job["guidance_scale"] = float(t2i_job.get("guidance") or t2i_job.get("guidance_scale") or 3.5)
-            t2i_job["shift"] = float(t2i_job.get("shift") or t2i_job.get("flow_shift") or 1.15)
-            t2i_job["flow_shift"] = float(t2i_job.get("shift") or t2i_job.get("flow_shift") or 1.15)
-            t2i_job["diffusion_fa"] = bool(t2i_job.get("diffusion_fa", True))
-            t2i_job["verbose"] = bool(t2i_job.get("verbose", True))
+            t2i_job["sampler"] = "auto"
+            t2i_job["sampling_method"] = "auto"
+            t2i_job["scheduler"] = "auto"
+            t2i_job["scheduler_name"] = "auto"
+            _kcfg = _krea2_effective_settings()
+            t2i_job["steps"] = int(_kcfg.get("steps") or 8)
+            t2i_job["cfg_scale"] = float(_kcfg.get("cfg") or 1.0)
+            t2i_job["cfg"] = float(_kcfg.get("cfg") or 1.0)
+            t2i_job["guidance"] = float(_kcfg.get("guidance") or 3.5)
+            t2i_job["guidance_scale"] = float(_kcfg.get("guidance") or 3.5)
+            t2i_job["shift"] = float(_kcfg.get("flow_shift") or 1.15)
+            t2i_job["flow_shift"] = float(_kcfg.get("flow_shift") or 1.15)
+            _kcfg = _krea2_effective_settings()
+            t2i_job["diffusion_fa"] = bool(t2i_job.get("diffusion_fa", _kcfg.get("diffusion_fa", True)))
+            t2i_job["offload"] = bool(t2i_job.get("offload", _kcfg.get("offload", False)))
+            t2i_job["vae_tiling"] = bool(t2i_job.get("vae_tiling", _kcfg.get("vae_tiling", False)))
+            t2i_job["verbose"] = bool(t2i_job.get("verbose", _kcfg.get("verbose", True)))
+            t2i_job["backend"] = str(t2i_job.get("backend") or _kcfg.get("backend") or '')
+            t2i_job["params_backend"] = str(t2i_job.get("params_backend") or _kcfg.get("params_backend") or '')
+            t2i_job["extra_args"] = str(t2i_job.get("extra_args") or _kcfg.get("extra_args") or '')
+            t2i_job["krea2_model"] = str(t2i_job.get("krea2_model") or _kcfg.get("model") or '')
+            t2i_job["krea2_llm"] = str(t2i_job.get("krea2_llm") or _kcfg.get("llm") or '')
+            t2i_job["krea2_vae"] = str(t2i_job.get("krea2_vae") or _kcfg.get("vae") or '')
 
         elif str(_eng).lower().strip() == "hidream":
             # HiDream text-to-image: auto-select installed model, then apply its UI defaults.
@@ -14589,8 +14719,8 @@ class PipelineWorker(QThread):
                     _sel = (image_model_sel or '').lower().strip()
 
                     if _sel.startswith("auto"):
-                        # Auto: keep user's last engine if available, otherwise prefer Krea 2 when it is installed.
-                        pass
+                        # Auto now explicitly prefers Krea 2 when it is installed.
+                        _eng = "krea2" if _krea2_runtime_ready() else "zimage_gguf"
                     elif "z-image" in _sel and "low" in _sel:
                         _eng = "zimage_gguf"
                     elif "z-image" in _sel:
@@ -14674,17 +14804,29 @@ class PipelineWorker(QThread):
                         ww, hh = _apply_aspect_to_size(bw, bh, aspect_mode)
                         t2i_job["width"] = int(ww)
                         t2i_job["height"] = int(hh)
-                        t2i_job["sampler"] = "euler"
-                        t2i_job["sampling_method"] = "euler"
-                        t2i_job["steps"] = int(t2i_job.get("steps") or 8)
-                        t2i_job["cfg_scale"] = float(t2i_job.get("cfg") or t2i_job.get("cfg_scale") or 1.0)
-                        t2i_job["cfg"] = float(t2i_job.get("cfg") or t2i_job.get("cfg_scale") or 1.0)
-                        t2i_job["guidance"] = float(t2i_job.get("guidance") or t2i_job.get("guidance_scale") or 3.5)
-                        t2i_job["guidance_scale"] = float(t2i_job.get("guidance") or t2i_job.get("guidance_scale") or 3.5)
-                        t2i_job["shift"] = float(t2i_job.get("shift") or t2i_job.get("flow_shift") or 1.15)
-                        t2i_job["flow_shift"] = float(t2i_job.get("shift") or t2i_job.get("flow_shift") or 1.15)
-                        t2i_job["diffusion_fa"] = bool(t2i_job.get("diffusion_fa", True))
-                        t2i_job["verbose"] = bool(t2i_job.get("verbose", True))
+                        t2i_job["sampler"] = "auto"
+                        t2i_job["sampling_method"] = "auto"
+                        t2i_job["scheduler"] = "auto"
+                        t2i_job["scheduler_name"] = "auto"
+                        _kcfg = _krea2_effective_settings()
+                        t2i_job["steps"] = int(_kcfg.get("steps") or 8)
+                        t2i_job["cfg_scale"] = float(_kcfg.get("cfg") or 1.0)
+                        t2i_job["cfg"] = float(_kcfg.get("cfg") or 1.0)
+                        t2i_job["guidance"] = float(_kcfg.get("guidance") or 3.5)
+                        t2i_job["guidance_scale"] = float(_kcfg.get("guidance") or 3.5)
+                        t2i_job["shift"] = float(_kcfg.get("flow_shift") or 1.15)
+                        t2i_job["flow_shift"] = float(_kcfg.get("flow_shift") or 1.15)
+                        _kcfg = _krea2_effective_settings()
+                        t2i_job["diffusion_fa"] = bool(t2i_job.get("diffusion_fa", _kcfg.get("diffusion_fa", True)))
+                        t2i_job["offload"] = bool(t2i_job.get("offload", _kcfg.get("offload", False)))
+                        t2i_job["vae_tiling"] = bool(t2i_job.get("vae_tiling", _kcfg.get("vae_tiling", False)))
+                        t2i_job["verbose"] = bool(t2i_job.get("verbose", _kcfg.get("verbose", True)))
+                        t2i_job["backend"] = str(t2i_job.get("backend") or _kcfg.get("backend") or '')
+                        t2i_job["params_backend"] = str(t2i_job.get("params_backend") or _kcfg.get("params_backend") or '')
+                        t2i_job["extra_args"] = str(t2i_job.get("extra_args") or _kcfg.get("extra_args") or '')
+                        t2i_job["krea2_model"] = str(t2i_job.get("krea2_model") or _kcfg.get("model") or '')
+                        t2i_job["krea2_llm"] = str(t2i_job.get("krea2_llm") or _kcfg.get("llm") or '')
+                        t2i_job["krea2_vae"] = str(t2i_job.get("krea2_vae") or _kcfg.get("vae") or '')
                     elif str(_eng).lower().strip() == "fireedit":
                         # Locked-in for FireRed Edit: 20 steps, CFG 4, strength 0.75, Euler, 1344x768.
                         bw, bh = 1344, 768
@@ -16564,6 +16706,7 @@ class PipelineWorker(QThread):
                     "--output-path", str(out_path),
                     "--height", str(int(height)),
                     "--width", str(int(width)),
+                    # frames is normalized by _ltx23_planner_frame_count so the max-edge case is 241.
                     "--num-frames", str(min(241, int(frames))),
                     "--frame-rate", str(int(fps)),
                     "--num-inference-steps", str(int(steps)),
@@ -16877,7 +17020,11 @@ class PipelineWorker(QThread):
                         except Exception:
                             dsec = float(prof.get("min_sec") or 3.5)
                     dsec = max(0.1, float(dsec))
-                    frames = max(12, min(int(prof.get("max_frames") or fallback_frames or 240), int(round(dsec * fps))))
+                    _ltx_max_frames = int(prof.get("max_frames") or fallback_frames or 241)
+                    frames = max(12, min(_ltx_max_frames, int(round(dsec * fps))))
+                    # If the planner hits the LTX maximum through duration math (10s * 24fps = 240),
+                    # send 241 frames to LTX. This keeps normal shorter clips unchanged.
+                    frames = _ltx23_planner_frame_count(frames, _ltx_max_frames)
 
                     seed_txt = str(sh.get("seed") or sid)
                     seed = None
@@ -16962,7 +17109,10 @@ class PipelineWorker(QThread):
                             continue
                     self.signals.stage.emit(f"Clips (LTX 2.3) — {sid} ({i}/{len(shots)})")
                     self.signals.log.emit(f"[ltx23] {sid}: {frames} frames @ {fps} fps (~{round(float(dsec), 2)}s), res={resolution}, steps={steps}")
-                    self.signals.log.emit(f"[ltx23] {sid}: transition lora -> {'on' if use_transition_lora else 'off'}")
+                    # Transition LoRA belongs only to the hidden Wan2GP LTX workflow.
+                    # Do not show an irrelevant "transition lora -> off" line for the public FrameVision LTX VRAM Lab path.
+                    if bool(_allow_ltx_loras):
+                        self.signals.log.emit(f"[ltx23] {sid}: transition lora -> {'on' if use_transition_lora else 'off'}")
                     if extra_loras:
                         self.signals.log.emit("[ltx23] " + sid + ": extra loras -> " + ", ".join([f"{Path(str(x.get('path') or '')).name}@{float(x.get('multiplier') or 1.0):.2f}" for x in extra_loras]))
                     if bool(use_transition_lora):
@@ -23762,7 +23912,7 @@ These prompts override the normal reused Own Storymode prompts for the video sta
         grid.addWidget(QLabel("Image model"), 0, 0)
         self.cmb_image_model = QComboBox()
         self.cmb_image_model.addItems([
-            "Auto",
+            "Auto (Krea 2)",
             "Qwen Image 2512",
             "SDXL (Lowest vram, fast, low quality)",
             "Z-image Turbo FP16 (slower, best quality, High VRAM)",
@@ -23774,8 +23924,8 @@ These prompts override the normal reused Own Storymode prompts for the video sta
             "Lens",
             "More (Maybe later)",
         ])
-        # Default text-to-image engine: Z-image Turbo (GGUF Low VRAM)
-        self.cmb_image_model.setCurrentIndex(4)
+        # Default text-to-image engine: Auto (Krea 2)
+        self.cmb_image_model.setCurrentIndex(0)
         grid.addWidget(self.cmb_image_model, 0, 1)
 
         try:
@@ -23786,7 +23936,7 @@ These prompts override the normal reused Own Storymode prompts for the video sta
         grid.addWidget(QLabel("Video model"), 1, 0)
         self.cmb_video_model = QComboBox()
         self.cmb_video_model.addItems([
-            "Auto (Hunyuan) ",
+            "Auto (LTX 2.3)",
             "WAN 2.2 Turbo",
             "HunyuanVideo 1.5",
             "LTX 2.3",
@@ -23815,13 +23965,15 @@ These prompts override the normal reused Own Storymode prompts for the video sta
             self.cmb_gen_quality.blockSignals(True)
             self.cmb_gen_quality.clear()
             if "ltx" in vm and "2.3" in vm:
-                self.cmb_gen_quality.addItems(["Low (480p, max 10s)", "Medium (704p, max 10s)", "High (1088p, max 10s)"])
+                self.cmb_gen_quality.addItems(["Low", "Medium (default)", "High"])
                 if cur.lower().startswith("high"):
                     self.cmb_gen_quality.setCurrentIndex(2)
                 elif cur.lower().startswith("medium"):
                     self.cmb_gen_quality.setCurrentIndex(1)
-                else:
+                elif cur.lower().startswith("low"):
                     self.cmb_gen_quality.setCurrentIndex(0)
+                else:
+                    self.cmb_gen_quality.setCurrentIndex(1)
             elif "wan" in vm and "2.2" in vm:
                 # WAN 2.2 Planner route is Turbo-only: keep the UI simple and expose
                 # only the two tested Turbo tiers. Other video models still show 3 tiers.
@@ -23832,14 +23984,16 @@ These prompts override the normal reused Own Storymode prompts for the video sta
                     self.cmb_gen_quality.setCurrentIndex(0)
             else:
                 # hunyuan + fallback
-                # Default Generation quality: Low
-                self.cmb_gen_quality.addItems(["Low (default)", "Medium", "High (slow, needs Hunyuan 720 i2v model)"])
+                # Default Generation quality: Medium
+                self.cmb_gen_quality.addItems(["Low", "Medium (default)", "High (slow, needs Hunyuan 720 i2v model)"])
                 if cur.lower().startswith("low"):
                     self.cmb_gen_quality.setCurrentIndex(0)
                 elif cur.lower().startswith("high"):
                     self.cmb_gen_quality.setCurrentIndex(2)
+                elif cur.lower().startswith("medium"):
+                    self.cmb_gen_quality.setCurrentIndex(1)
                 else:
-                    self.cmb_gen_quality.setCurrentIndex(0)
+                    self.cmb_gen_quality.setCurrentIndex(1)
             self.cmb_gen_quality.blockSignals(False)
 
         def _on_video_model_changed(_idx: int) -> None:
