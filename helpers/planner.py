@@ -32689,7 +32689,16 @@ class ImageReviewDialog(QDialog):
         self.lst.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Expanding)
         body.addWidget(self.lst, 2)
 
-        right = QVBoxLayout()
+        # Right-side details can become taller than the screen when prompts are long.
+        # Put that side in a vertical scroll area so Play/Recreate/Continue stay reachable.
+        right_scroll = QScrollArea()
+        right_scroll.setWidgetResizable(True)
+        right_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+        right_scroll.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+        right_scroll.setFrameShape(QFrame.NoFrame)
+        right_widget = QWidget()
+        right = QVBoxLayout(right_widget)
+        right.setContentsMargins(0, 0, 8, 0)
         right.setSpacing(8)
 
         self.lbl_sel = QLabel("Selected: —")
@@ -32743,7 +32752,15 @@ class ImageReviewDialog(QDialog):
         self.lbl_status.setWordWrap(True)
         right.addWidget(self.lbl_status)
 
-        body.addLayout(right, 1)
+        right_scroll.setWidget(right_widget)
+        right_scroll.setMinimumWidth(360)
+        body.addWidget(right_scroll)
+        try:
+            body.setStretchFactor(0, 2)
+            body.setStretchFactor(1, 1)
+            body.setSizes([720, 520])
+        except Exception:
+            pass
         root.addLayout(body, 1)
 
         self.btn_recreate.clicked.connect(self._on_recreate)
@@ -33352,15 +33369,26 @@ class ClipReviewDialog(QDialog):
         top.setWordWrap(True)
         root.addWidget(top)
 
-        body = QHBoxLayout()
-        body.setSpacing(10)
+        body = QSplitter(Qt.Horizontal)
+        try:
+            body.setChildrenCollapsible(False)
+            body.setHandleWidth(8)
+        except Exception:
+            pass
 
         self.lst = QListWidget()
-        self.lst.setMinimumWidth(360)
+        self.lst.setMinimumWidth(260)
         self.lst.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Expanding)
-        body.addWidget(self.lst, 2)
+        body.addWidget(self.lst)
 
-        right = QVBoxLayout()
+        right_scroll = QScrollArea()
+        right_scroll.setWidgetResizable(True)
+        right_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+        right_scroll.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+        right_scroll.setFrameShape(QFrame.NoFrame)
+        right_widget = QWidget()
+        right = QVBoxLayout(right_widget)
+        right.setContentsMargins(0, 0, 8, 0)
         right.setSpacing(8)
 
         self.lbl_sel = QLabel("Selected: —")
@@ -33377,8 +33405,8 @@ class ClipReviewDialog(QDialog):
 
         self.prompt_edit = QTextEdit()
         self.prompt_edit.setPlaceholderText("Edit the prompt for this clip, then click Recreate…")
-        self.prompt_edit.setMinimumHeight(140)
-        self.prompt_edit.setMaximumHeight(220)
+        self.prompt_edit.setMinimumHeight(110)
+        self.prompt_edit.setMaximumHeight(180)
         right.addWidget(self.prompt_edit)
 
         self.chk_retry_new_seed = QCheckBox("Retry with new seed")
@@ -33399,7 +33427,7 @@ class ClipReviewDialog(QDialog):
             self._thumb_label.setAlignment(Qt.AlignCenter)
         except Exception:
             pass
-        self._thumb_label.setMinimumHeight(240)
+        self._thumb_label.setMinimumHeight(180)
         self._thumb_label.setStyleSheet("border: 1px solid #444; padding: 6px;")
         try:
             self._thumb_label.setScaledContents(False)
@@ -33418,7 +33446,7 @@ class ClipReviewDialog(QDialog):
         if self._have_player:
             try:
                 self._video_widget = QVideoWidget()
-                self._video_widget.setMinimumHeight(240)
+                self._video_widget.setMinimumHeight(180)
                 self._player = QMediaPlayer(self)
                 try:
                     self._audio = QAudioOutput(self)
@@ -33436,7 +33464,7 @@ class ClipReviewDialog(QDialog):
         if not self._have_player:
             lab = QLabel("Play will open your system player (QtMultimedia unavailable).")
             lab.setWordWrap(True)
-            lab.setMinimumHeight(240)
+            lab.setMinimumHeight(180)
             lab.setStyleSheet("border: 1px solid #444; padding: 8px;")
             self._preview_stack.addWidget(lab)  # index 1
 
@@ -33484,8 +33512,16 @@ class ClipReviewDialog(QDialog):
         self.lbl_status.setWordWrap(True)
         right.addWidget(self.lbl_status)
 
-        body.addLayout(right, 1)
-        root.addLayout(body, 1)
+        right_scroll.setWidget(right_widget)
+        right_scroll.setMinimumWidth(360)
+        body.addWidget(right_scroll)
+        try:
+            body.setStretchFactor(0, 2)
+            body.setStretchFactor(1, 1)
+            body.setSizes([720, 520])
+        except Exception:
+            pass
+        root.addWidget(body, 1)
 
         self.btn_play.clicked.connect(self._on_play)
         self.btn_stop.clicked.connect(self._on_stop)
