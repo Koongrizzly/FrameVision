@@ -3,6 +3,7 @@
 
 Current scope in this file:
   * text-to-image routing for supported FrameVision image models
+    including Z-Image GGUF, Lens, Chroma, Flux Klein, HiDream, and Krea 2 GGUF
   * attached-image edit routing
   * guided edit flow:
       - ask what should be changed first when the edit instruction is missing
@@ -140,6 +141,20 @@ def _default_registry() -> Dict[str, Any]:
                 "default_steps": 30,
                 "default_cfg": 3.0,
             },
+            "krea2": {
+                "label": "Krea 2 GGUF",
+                "aliases": ["krea", "krea2", "krea 2", "krea-2", "krea 2 gguf", "krea2 gguf"],
+                "folder": "models/krea2",
+                "queue_type": "krea2_generate",
+                "output_dir": "output/images/krea2",
+                "default_steps": 8,
+                "default_cfg": 1.0,
+                "default_guidance": 3.5,
+                "default_flow_shift": 1.15,
+                "default_sampler": "euler",
+                "default_scheduler": "auto",
+                "required_vae": "wan_2.1_vae.safetensors",
+            },
             "flux_klein": {
                 "label": "Flux Klein",
                 "aliases": ["flux klein", "flux-klein", "flux klein gguf", "klein", "klein 4b", "flux 2 klein"],
@@ -248,9 +263,9 @@ class FrameVisionAssistantRouter:
             if waiting == "image_prompt":
                 return "What should be in the image? Example: `a bee on a flower`."
             if waiting == "workflow_choice":
-                return "Default or custom?\n\nDefault uses Z-Image GGUF at 1376×768. Custom can use Z-Image GGUF, Lens, Chroma, Flux Klein, or HiDream."
+                return "Default or custom?\n\nDefault uses Z-Image GGUF at 1376×768. Custom can use Z-Image GGUF, Lens, Chroma, Krea 2, Flux Klein, or HiDream."
             if waiting == "custom_model_and_size":
-                return "Which model and size? Example: `z-image 1280x704`, `lens 1024x1024`, `chroma 1024x1024`, `flux klein 1024x1024`, or `hidream 1024x1024`."
+                return "Which model and size? Example: `z-image 1280x704`, `lens 1024x1024`, `chroma 1024x1024`, `krea2 1024x1024`, `flux klein 1024x1024`, or `hidream 1024x1024`."
             return "Please answer `default` or `custom`."
         return "Restored the previous wizard step."
 
@@ -306,7 +321,7 @@ class FrameVisionAssistantRouter:
             })
             return AssistantRouteResult(
                 True,
-                "Default or custom?\n\nDefault uses Z-Image GGUF at 1376×768. Custom can use Z-Image GGUF, Lens, Chroma, Flux Klein, or HiDream up to 2048×2048, or a similar 16:9 / 9:16 size.",
+                "Default or custom?\n\nDefault uses Z-Image GGUF at 1376×768. Custom can use Z-Image GGUF, Lens, Chroma, Krea 2, Flux Klein, or HiDream up to 2048×2048, or a similar 16:9 / 9:16 size.",
             )
 
         # Catch bare commands like "create an image" before the LLM can answer
@@ -1407,7 +1422,7 @@ class FrameVisionAssistantRouter:
             self._save_state(state)
             return AssistantRouteResult(
                 True,
-                "Default or custom?\n\nDefault uses Z-Image GGUF at 1376×768. Custom can use Z-Image GGUF, Lens, Chroma, Flux Klein, or HiDream up to 2048×2048, or a similar 16:9 / 9:16 size.",
+                "Default or custom?\n\nDefault uses Z-Image GGUF at 1376×768. Custom can use Z-Image GGUF, Lens, Chroma, Krea 2, Flux Klein, or HiDream up to 2048×2048, or a similar 16:9 / 9:16 size.",
             )
 
         if not prompt:
@@ -1423,7 +1438,7 @@ class FrameVisionAssistantRouter:
         if low == "custom":
             state["waiting_for"] = "custom_model_and_size"
             self._save_state(state)
-            return AssistantRouteResult(True, "Which model and size? Example: `z-image 1280x704`, `lens 1024x1024`, `chroma 1024x1024`, `flux klein 1024x1024`, or `hidream 1024x1024`.")
+            return AssistantRouteResult(True, "Which model and size? Example: `z-image 1280x704`, `lens 1024x1024`, `chroma 1024x1024`, `krea2 1024x1024`, `flux klein 1024x1024`, or `hidream 1024x1024`.")
 
         parsed_model = self._parse_model_id(text)
         parsed_size = self._parse_size(text)
@@ -1441,7 +1456,7 @@ class FrameVisionAssistantRouter:
                 return AssistantRouteResult(True, msg)
             return self._queue_image(prompt, model_id, width, height)
 
-        return AssistantRouteResult(True, "Please answer `default` or `custom`. For custom, say something like `z-image 1280x704`, `lens 1024x1024`, `chroma 1024x1024`, `flux klein 1024x1024`, or `hidream 1024x1024`.")
+        return AssistantRouteResult(True, "Please answer `default` or `custom`. For custom, say something like `z-image 1280x704`, `lens 1024x1024`, `chroma 1024x1024`, `krea2 1024x1024`, `flux klein 1024x1024`, or `hidream 1024x1024`.")
 
     def _parse_model_id(self, text: str) -> str:
         low = " " + re.sub(r"[^a-z0-9]+", " ", text.lower()) + " "
@@ -1622,6 +1637,24 @@ class FrameVisionAssistantRouter:
                     f"{label} is installed only partly or needs repair. "
                     f"Missing: `{first}`. Please run the Z-Image GGUF Optional Install/Repair first."
                 )
+        if model_id == "krea2":
+            diffusion = self._find_best_krea2_diffusion_gguf(folder)
+            llm = self._find_best_krea2_llm_gguf(folder)
+            vae_path = self._find_krea2_vae(folder, cfg)
+            missing = []
+            if diffusion is None:
+                missing.append("a Krea 2 GGUF diffusion model in models/krea2")
+            if llm is None:
+                missing.append("a Qwen3VL text encoder GGUF in models/krea2")
+            if vae_path is None:
+                missing.append(str(folder / str(cfg.get("required_vae") or "wan_2.1_vae.safetensors")))
+            if not self._find_sd_cli().exists():
+                missing.append("sd-cli.exe in presets\bin")
+            if missing:
+                return False, (
+                    f"{label} is installed only partly or needs repair. "
+                    f"Missing: `{missing[0]}`. Please run the Krea 2 Optional Install/Repair first."
+                )
         if model_id == "flux_klein":
             if not self._find_best_flux_diffusion_gguf(folder):
                 return False, f"{label} is not installed yet or needs repair. No Flux/Klein diffusion GGUF found under `{folder}` (including the unet subfolder). Please install Flux Klein first."
@@ -1659,6 +1692,8 @@ class FrameVisionAssistantRouter:
                 ok = self._enqueue_lens(prompt, cfg, width, height, seed)
             elif model_id == "chroma":
                 ok = self._enqueue_chroma(prompt, cfg, width, height, seed)
+            elif model_id == "krea2":
+                ok = self._enqueue_krea2(prompt, cfg, width, height, seed)
             elif model_id == "flux_klein":
                 ok = self._enqueue_flux_klein(prompt, cfg, width, height, seed)
             elif model_id == "hidream":
@@ -1892,6 +1927,168 @@ class FrameVisionAssistantRouter:
         if user_prompt:
             parts.append(f"Requested edit: {user_prompt}")
         return "\n".join(parts).strip()
+
+    def _safe_krea2_name(self, text: str, max_len: int = 44) -> str:
+        text = re.sub(r"[^a-zA-Z0-9_ -]+", "", str(text or "")).strip().replace(" ", "_")
+        text = re.sub(r"_+", "_", text)
+        return (text[:max_len] or "krea2")
+
+    def _find_best_krea2_diffusion_gguf(self, folder: Path) -> Optional[Path]:
+        try:
+            cands = []
+            for p in folder.glob("*.gguf"):
+                low = p.name.lower()
+                if "krea" in low and not any(x in low for x in ("qwen", "llm", "text", "instruct", "vl")):
+                    cands.append(p)
+            if not cands:
+                for p in folder.rglob("*.gguf"):
+                    low = p.name.lower()
+                    if "krea" in low and not any(x in low for x in ("qwen", "llm", "text", "instruct", "vl")):
+                        cands.append(p)
+            if not cands:
+                return None
+            cands.sort(key=lambda p: (("turbo" in p.name.lower()), self._zimage_quant_score(p.name)[0], p.stat().st_size, p.name.lower()))
+            return cands[-1]
+        except Exception:
+            return None
+
+    def _find_best_krea2_llm_gguf(self, folder: Path) -> Optional[Path]:
+        try:
+            cands = []
+            for p in folder.rglob("*.gguf"):
+                low = p.name.lower()
+                if ("qwen" in low or "llm" in low or "text" in low or "instruct" in low) and ("vl" in low or "vision" in low or "qwen" in low):
+                    cands.append(p)
+            if not cands:
+                return None
+            cands.sort(key=lambda p: (self._zimage_quant_score(p.name)[0], p.stat().st_size, p.name.lower()))
+            return cands[-1]
+        except Exception:
+            return None
+
+    def _find_krea2_vae(self, folder: Path, cfg: Dict[str, Any]) -> Optional[Path]:
+        preferred = folder / str(cfg.get("required_vae") or "wan_2.1_vae.safetensors")
+        try:
+            if preferred.exists():
+                return preferred
+            cands = []
+            for p in folder.rglob("*.safetensors"):
+                low = p.name.lower()
+                if "vae" in low or low == "ae.safetensors":
+                    cands.append(p)
+            if not cands:
+                return None
+            cands.sort(key=lambda p: (("wan" in p.name.lower()), p.stat().st_size, p.name.lower()))
+            return cands[-1]
+        except Exception:
+            return None
+
+    def _enqueue_krea2(self, prompt: str, cfg: Dict[str, Any], width: int, height: int, seed: int) -> bool:
+        folder = self.root / str(cfg.get("folder") or "models/krea2")
+        out_dir = self.root / str(cfg.get("output_dir") or "output/images/krea2")
+        out_dir.mkdir(parents=True, exist_ok=True)
+        diffusion = self._find_best_krea2_diffusion_gguf(folder)
+        llm = self._find_best_krea2_llm_gguf(folder)
+        vae = self._find_krea2_vae(folder, cfg)
+        sdcli = self._find_sd_cli()
+        name = self._safe_krea2_name(str(prompt or "").splitlines()[0] if prompt else "krea2")
+        stamp = time.strftime("%Y%m%d_%H%M%S")
+        output_path = out_dir / f"{stamp}_{name}.png"
+        model_name = str(diffusion.name if diffusion else "").lower()
+        is_base = "krea" in model_name and "turbo" not in model_name
+        steps = int(cfg.get("base_steps" if is_base else "default_steps", 30 if is_base else 8))
+        cfg_scale = float(cfg.get("base_cfg" if is_base else "default_cfg", 3.0 if is_base else 1.0))
+        guidance = float(cfg.get("default_guidance", 3.5))
+        flow_shift = float(cfg.get("default_flow_shift", 1.15))
+        sampler = str(cfg.get("default_sampler") or "euler")
+        scheduler = str(cfg.get("default_scheduler") or "auto")
+        args = [
+            str(sdcli),
+            "--diffusion-model", str(diffusion or ""),
+            "--llm", str(llm or ""),
+            "--vae", str(vae or ""),
+            "-p", str(prompt or ""),
+            "--steps", str(steps),
+            "--cfg-scale", str(cfg_scale),
+            "--guidance", str(guidance),
+            "--width", str(int(width)),
+            "--height", str(int(height)),
+            "--seed", str(int(seed)),
+            "--batch-count", "1",
+            "--output", str(output_path),
+            "--flow-shift", str(flow_shift),
+            "--diffusion-fa",
+            "--disable-image-metadata",
+            "-v",
+        ]
+        if sampler and sampler != "auto":
+            args += ["--sampling-method", sampler]
+        if scheduler and scheduler != "auto":
+            args += ["--scheduler", scheduler]
+        settings = {
+            "sdcli": str(sdcli),
+            "model": str(diffusion or ""),
+            "llm": str(llm or ""),
+            "vae": str(vae or ""),
+            "output_dir": str(out_dir),
+            "prompt": str(prompt or ""),
+            "negative": "",
+            "aspect": self._aspect_label(width, height),
+            "width": int(width),
+            "height": int(height),
+            "steps": int(steps),
+            "seed": int(seed),
+            "cfg": float(cfg_scale),
+            "guidance": float(guidance),
+            "flow_shift": float(flow_shift),
+            "batch": 1,
+            "strength": 0.75,
+            "offload": False,
+            "diffusion_fa": True,
+            "vae_tiling": False,
+            "verbose": True,
+            "use_queue": True,
+            "disable_metadata": True,
+            "backend": "",
+            "params_backend": "",
+            "sampler": sampler,
+            "scheduler": scheduler,
+            "extra_args": "",
+            "cmd": list(args),
+            "cwd": str(self.root),
+            "output_path": str(output_path),
+            "out_file": str(output_path),
+            "outfile": str(output_path),
+            "output_dir": str(out_dir),
+            "scan_dir": str(out_dir),
+            "scan_ext": ".png",
+            "label": "Krea 2 GGUF: " + str(prompt or "").replace("\n", " ")[:80],
+            "assistant_origin": "llama_chat",
+            "assistant_chat_only": bool(self._assistant_chat_only_results_enabled()),
+        }
+        try:
+            from helpers.queue_adapter import enqueue_krea2_generate  # type: ignore
+            return bool(enqueue_krea2_generate(settings))
+        except Exception:
+            try:
+                from queue_adapter import enqueue_krea2_generate  # type: ignore
+                return bool(enqueue_krea2_generate(settings))
+            except Exception:
+                job = {
+                    "id": uuid.uuid4().hex,
+                    "type": "krea2_generate",
+                    "backend": "krea2",
+                    "title": "Krea 2 GGUF: " + str(prompt or "").replace("\n", " ")[:80],
+                    "prompt": str(prompt or ""),
+                    "args": settings,
+                    "cmd": list(args),
+                    "cwd": str(self.root),
+                    "out_dir": str(out_dir),
+                    "output_path": str(output_path),
+                    "created_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+                    "status": "pending",
+                }
+                return self._write_pending_job(job)
 
     def _enqueue_chroma(self, prompt: str, cfg: Dict[str, Any], width: int, height: int, seed: int) -> bool:
         data = {

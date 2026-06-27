@@ -6710,6 +6710,9 @@ def handle_job(jpath: Path):
             code = tools_ffmpeg(job, cfg, mani)
         elif t in ('ideogram4_generate','ideogram4','ideogram4_gguf'):
             code = ideogram4_generate(job, cfg, mani)
+        elif t in ('krea2_generate','krea2','krea2_gguf'):
+            # Krea 2 GGUF is launched through sd-cli and streamed like the other external tool jobs.
+            code = tools_ffmpeg(job, cfg, mani)
         elif t in ("qwen2511_image_edit","qwen2511_edit","qwen2511"):
             code = qwen2511_image_edit(job, cfg, mani)
         elif t in ("flux_klein_image_edit","flux_klein_edit","flux_klein","klein_image_edit"):

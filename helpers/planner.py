@@ -1304,6 +1304,274 @@ def _run_lens_planner_image(*, t2i_job: Dict[str, Any], images_dir: str, sid: st
     return {"ok": True, "files": [out_path], "out_file": out_path, "rc": 0, "backend": "lens", "model": "Lens Image", "lens_aspect_ratio": aspect}
 
 
+# Krea 2 GGUF helpers for Planner
+# Runs directly through stable-diffusion.cpp / sd-cli.exe using the same model folder
+# as the standalone Krea 2 helper. Planner keeps only the opinionated defaults here.
+def _krea2_root() -> Path:
+    return (_root() / "models" / "krea2").resolve()
+
+
+def _krea2_sdcli_path() -> str:
+    for cand in [
+        (_root() / "presets" / "bin" / "sd-cli.exe").resolve(),
+        (_root() / "presets" / "bin" / "sd-cli").resolve(),
+    ]:
+        try:
+            if cand.exists() and cand.is_file():
+                return str(cand)
+        except Exception:
+            pass
+    return ""
+
+
+def _krea2_pick_diffusion_gguf() -> str:
+    root = _krea2_root()
+    if not root.exists():
+        return ""
+    ranked: List[Tuple[int, int, int, str, str]] = []
+    for p in root.rglob("*.gguf"):
+        try:
+            if not p.is_file():
+                continue
+            name = p.name.lower()
+            if "krea" not in name:
+                continue
+            if "qwen" in name or "vision" in name or "vl" in name or "mmproj" in name:
+                continue
+            is_turbo = ("turbo" in name)
+            m = re.search(r"(?:^|[^a-z0-9])q(\d+)(?:$|[^a-z0-9])", name, flags=re.IGNORECASE)
+            qn = int(m.group(1)) if m else 999
+            try:
+                sz = int(p.stat().st_size)
+            except Exception:
+                sz = 0
+            # Prefer Turbo Q4 first, then any Turbo GGUF, then any other Krea GGUF.
+            pri = 0 if (is_turbo and qn == 4) else 1 if is_turbo else 2
+            ranked.append((pri, qn, -sz, name, str(p.resolve())))
+        except Exception:
+            continue
+    if not ranked:
+        return ""
+    ranked.sort()
+    return ranked[0][4]
+
+
+def _krea2_pick_llm_gguf() -> str:
+    root = _krea2_root()
+    if not root.exists():
+        return ""
+    ranked: List[Tuple[int, int, int, str, str]] = []
+    for p in root.rglob("*.gguf"):
+        try:
+            if not p.is_file():
+                continue
+            name = p.name.lower()
+            if "qwen" not in name:
+                continue
+            if not ("vl" in name or "vision" in name):
+                continue
+            if "mmproj" in name:
+                continue
+            m = re.search(r"(?:^|[^a-z0-9])q(\d+)(?:$|[^a-z0-9])", name, flags=re.IGNORECASE)
+            qn = int(m.group(1)) if m else 999
+            try:
+                sz = int(p.stat().st_size)
+            except Exception:
+                sz = 0
+            pri = 0 if qn == 4 else 1
+            ranked.append((pri, qn, -sz, name, str(p.resolve())))
+        except Exception:
+            continue
+    if not ranked:
+        return ""
+    ranked.sort()
+    return ranked[0][4]
+
+
+def _krea2_pick_vae() -> str:
+    root = _krea2_root()
+    candidates: List[Path] = []
+    for cand in [
+        (root / "wan_2.1_vae.safetensors"),
+        (_root() / "models" / "krea2" / "wan_2.1_vae.safetensors"),
+    ]:
+        try:
+            if cand.exists() and cand.is_file():
+                return str(cand.resolve())
+        except Exception:
+            pass
+    try:
+        candidates = [p.resolve() for p in root.rglob("*.safetensors") if p.is_file()]
+    except Exception:
+        candidates = []
+    ranked: List[Tuple[int, str]] = []
+    for p in candidates:
+        name = p.name.lower()
+        pri = 0 if name == "wan_2.1_vae.safetensors" else 1 if "vae" in name else 2
+        ranked.append((pri, str(p)))
+    if not ranked:
+        return ""
+    ranked.sort()
+    return ranked[0][1]
+
+
+def _krea2_runtime_ready() -> bool:
+    return bool(_krea2_sdcli_path() and _krea2_pick_diffusion_gguf() and _krea2_pick_llm_gguf() and _krea2_pick_vae())
+
+
+def _run_krea2_planner_image(*, t2i_job: Dict[str, Any], images_dir: str, sid: str, aspect_mode: str = "landscape", log_func: Optional[Callable[[str], None]] = None, stop_check: Optional[Callable[[], bool]] = None) -> Dict[str, Any]:
+    sdcli_path = str(t2i_job.get("krea2_sdcli") or _krea2_sdcli_path())
+    model = str(t2i_job.get("krea2_model") or _krea2_pick_diffusion_gguf())
+    llm = str(t2i_job.get("krea2_llm") or _krea2_pick_llm_gguf())
+    vae = str(t2i_job.get("krea2_vae") or _krea2_pick_vae())
+
+    missing = []
+    if (not sdcli_path) or (not os.path.exists(sdcli_path)):
+        missing.append("sd-cli.exe in presets/bin")
+    if (not model) or (not os.path.exists(model)):
+        missing.append("Krea 2 diffusion GGUF in models/krea2 (preferably a Turbo Q4)")
+    if (not llm) or (not os.path.exists(llm)):
+        missing.append("Qwen3VL GGUF in models/krea2")
+    if (not vae) or (not os.path.exists(vae)):
+        missing.append("wan_2.1_vae.safetensors in models/krea2")
+    if missing:
+        raise RuntimeError("Krea 2 selected but required files are missing:\n- " + "\n- ".join(missing))
+
+    out_path = str(t2i_job.get("out_file") or t2i_job.get("target") or "").strip()
+    if (not out_path) or ("{" in out_path) or ("}" in out_path):
+        out_path = os.path.join(images_dir, f"{sid}.png")
+    if not os.path.splitext(out_path)[1]:
+        out_path = out_path + ".png"
+    os.makedirs(os.path.dirname(out_path), exist_ok=True)
+    try:
+        if os.path.exists(out_path):
+            os.remove(out_path)
+    except Exception:
+        pass
+
+    try:
+        width = int(t2i_job.get("width") or 1376)
+    except Exception:
+        width = 1376
+    try:
+        height = int(t2i_job.get("height") or 768)
+    except Exception:
+        height = 768
+    try:
+        steps = int(t2i_job.get("steps") or 8)
+    except Exception:
+        steps = 8
+    try:
+        seed = int(t2i_job.get("seed") or 0)
+    except Exception:
+        seed = 0
+    try:
+        cfg = float(t2i_job.get("cfg") or t2i_job.get("cfg_scale") or 1.0)
+    except Exception:
+        cfg = 1.0
+    try:
+        guidance = float(t2i_job.get("guidance") or t2i_job.get("guidance_scale") or 3.5)
+    except Exception:
+        guidance = 3.5
+    try:
+        shift = float(t2i_job.get("shift") or t2i_job.get("flow_shift") or 1.15)
+    except Exception:
+        shift = 1.15
+
+    sampler = str(t2i_job.get("sampling_method") or t2i_job.get("sampler") or "euler").strip().lower() or "euler"
+    scheduler = str(t2i_job.get("scheduler") or t2i_job.get("scheduler_name") or "").strip().lower()
+    prompt = str(t2i_job.get("prompt") or "").strip()
+    negative = str(t2i_job.get("negative_prompt") or t2i_job.get("negative") or t2i_job.get("neg_prompt") or "").strip()
+
+    cmd = [
+        sdcli_path,
+        "--diffusion-model", model,
+        "--llm", llm,
+        "--vae", vae,
+        "-p", prompt,
+        "--steps", str(steps),
+        "--cfg-scale", str(cfg),
+        "--guidance", str(guidance),
+        "--width", str(width),
+        "--height", str(height),
+        "--seed", str(seed),
+        "--batch-count", "1",
+        "--output", out_path,
+        "--sampling-method", sampler,
+    ]
+    if negative:
+        cmd += ["--negative-prompt", negative]
+    if shift >= 0:
+        cmd += ["--flow-shift", str(shift)]
+    if scheduler and scheduler != "auto":
+        cmd += ["--scheduler", scheduler]
+    if bool(t2i_job.get("diffusion_fa", True) or t2i_job.get("use_diffusion_fa", False)):
+        cmd += ["--diffusion-fa"]
+    if bool(t2i_job.get("offload") or t2i_job.get("offload_to_cpu")):
+        cmd += ["--offload-to-cpu"]
+    if bool(t2i_job.get("vae_tiling")):
+        cmd += ["--vae-tiling"]
+    if bool(t2i_job.get("disable_image_metadata") or t2i_job.get("disable_metadata")):
+        cmd += ["--disable-image-metadata"]
+    if bool(t2i_job.get("verbose", True)):
+        cmd += ["-v"]
+
+    if log_func:
+        try:
+            log_func(f"[Krea 2] model: {model}")
+            log_func(f"[Krea 2] llm: {llm}")
+            log_func(f"[Krea 2] vae: {vae}")
+        except Exception:
+            pass
+
+    rc = 1
+    try:
+        proc = subprocess.Popen(
+            cmd,
+            cwd=str(_root()),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            bufsize=1,
+        )
+        if proc.stdout:
+            for raw in proc.stdout:
+                if stop_check and stop_check():
+                    try:
+                        proc.kill()
+                    except Exception:
+                        pass
+                    raise RuntimeError("Cancelled by user.")
+                try:
+                    line = raw.decode("utf-8", errors="replace").rstrip()
+                except Exception:
+                    line = str(raw).rstrip()
+                if line and log_func:
+                    try:
+                        log_func(line)
+                    except Exception:
+                        pass
+        rc = int(proc.wait() or 0)
+    except Exception as e:
+        raise RuntimeError(f"Krea 2 sd-cli run failed: {e}")
+
+    if rc != 0:
+        raise RuntimeError(f"Krea 2 sd-cli failed (exit code {rc}). See log for details.")
+    if (not os.path.exists(out_path)) or (os.path.getsize(out_path) < 1024):
+        raise RuntimeError("Krea 2 failed or returned an empty output image.")
+
+    return {
+        "ok": True,
+        "files": [out_path],
+        "out_file": out_path,
+        "rc": int(rc),
+        "backend": "krea2",
+        "model": "Krea 2",
+        "krea2_model": model,
+        "krea2_llm": llm,
+        "krea2_vae": vae,
+    }
+
+
 def _firered_settings_paths() -> List[str]:
     base = _root() / "presets" / "setsave"
     return [
@@ -8919,6 +9187,8 @@ class PipelineWorker(QThread):
             _eng = "zimage_gguf"
         elif "z-image" in _sel:
             _eng = "zimage"
+        elif ("krea 2" in _sel) or ("krea2" in _sel) or (_sel.startswith("krea")):
+            _eng = "krea2"
         elif "qwen" in _sel:
             _eng = "qwen2512"
         elif "sdxl" in _sel:
@@ -8932,7 +9202,7 @@ class PipelineWorker(QThread):
         elif "flux klein" in _sel or ("flux" in _sel and "klein" in _sel):
             _eng = "flux_klein"
         if not _eng:
-            _eng = "zimage_gguf"
+            _eng = "krea2" if _krea2_runtime_ready() else "zimage_gguf"
         # Reference-edit workflows can override the normal image model during review.
         if bool(use_hidream_ref_edit):
             _eng = "hidream"
@@ -8970,6 +9240,24 @@ class PipelineWorker(QThread):
                     t2i_job["lora_path"] = gguf_path
                 else:
                     raise RuntimeError("Z-image Low VRAM selected but no diffusion .gguf was found in models/Z-Image-Turbo GGUF")
+
+        elif str(_eng).lower().strip() == "krea2":
+            # Krea 2 GGUF: use Turbo Q4 when available, otherwise any Turbo model, keeping Planner aspect choices.
+            bw, bh = 1376, 768
+            ww, hh = _apply_aspect_to_size(bw, bh, aspect_mode)
+            t2i_job["width"] = int(ww)
+            t2i_job["height"] = int(hh)
+            t2i_job["sampler"] = "euler"
+            t2i_job["sampling_method"] = "euler"
+            t2i_job["steps"] = int(t2i_job.get("steps") or 8)
+            t2i_job["cfg_scale"] = float(t2i_job.get("cfg") or t2i_job.get("cfg_scale") or 1.0)
+            t2i_job["cfg"] = float(t2i_job.get("cfg") or t2i_job.get("cfg_scale") or 1.0)
+            t2i_job["guidance"] = float(t2i_job.get("guidance") or t2i_job.get("guidance_scale") or 3.5)
+            t2i_job["guidance_scale"] = float(t2i_job.get("guidance") or t2i_job.get("guidance_scale") or 3.5)
+            t2i_job["shift"] = float(t2i_job.get("shift") or t2i_job.get("flow_shift") or 1.15)
+            t2i_job["flow_shift"] = float(t2i_job.get("shift") or t2i_job.get("flow_shift") or 1.15)
+            t2i_job["diffusion_fa"] = bool(t2i_job.get("diffusion_fa", True))
+            t2i_job["verbose"] = bool(t2i_job.get("verbose", True))
 
         elif str(_eng).lower().strip() == "hidream":
             # HiDream text-to-image: auto-select installed model, then apply its UI defaults.
@@ -9355,6 +9643,31 @@ class PipelineWorker(QThread):
                         rec2 = {}
                     rec2["ref_strategy"] = "fireedit"
                     rec2["refs_used"] = list(fireedit_refs)
+                    shots_map[sid] = rec2
+                    manifest["shots"] = shots_map
+                except Exception:
+                    pass
+
+            # Krea 2 regen path (sd-cli). Must NOT fall through to txt2img backend.
+            elif str(t2i_job.get("engine") or '').lower().strip() == "krea2":
+                res = _run_krea2_planner_image(
+                    t2i_job=t2i_job,
+                    images_dir=images_dir,
+                    sid=sid,
+                    aspect_mode=aspect_mode,
+                    log_func=lambda m: self.signals.log.emit(str(m)),
+                    stop_check=lambda: bool(getattr(self, "_stop_requested", False)),
+                )
+                out_file = str(res.get("out_file") or (res.get("files") or [""])[0])
+                try:
+                    shots_map = manifest.get("shots") if isinstance(manifest.get("shots"), dict) else {}
+                    rec2 = shots_map.get(sid) if isinstance(shots_map, dict) else None
+                    if not isinstance(rec2, dict):
+                        rec2 = {}
+                    rec2["image_engine"] = "krea2"
+                    rec2["krea2_model"] = str(res.get("krea2_model") or t2i_job.get("krea2_model") or '')
+                    rec2["krea2_llm"] = str(res.get("krea2_llm") or t2i_job.get("krea2_llm") or '')
+                    rec2["krea2_vae"] = str(res.get("krea2_vae") or t2i_job.get("krea2_vae") or '')
                     shots_map[sid] = rec2
                     manifest["shots"] = shots_map
                 except Exception:
@@ -14276,12 +14589,14 @@ class PipelineWorker(QThread):
                     _sel = (image_model_sel or '').lower().strip()
 
                     if _sel.startswith("auto"):
-                        # Auto: keep user's last engine if available, otherwise default to Z-image GGUF
+                        # Auto: keep user's last engine if available, otherwise prefer Krea 2 when it is installed.
                         pass
                     elif "z-image" in _sel and "low" in _sel:
                         _eng = "zimage_gguf"
                     elif "z-image" in _sel:
                         _eng = "zimage"
+                    elif ("krea 2" in _sel) or ("krea2" in _sel) or (_sel.startswith("krea")):
+                        _eng = "krea2"
                     elif "qwen" in _sel:
                         _eng = "qwen2512"
                     # SDXL via Diffusers
@@ -14297,7 +14612,7 @@ class PipelineWorker(QThread):
                     # (GMT Image is planned; not wired here yet)
 
                     if not _eng:
-                        _eng = "zimage_gguf"
+                        _eng = "krea2" if _krea2_runtime_ready() else "zimage_gguf"
 
                     # Chunk 4: reference-image edit workflows can override the chosen engine.
                     # Keep workflow names distinct so later expansions don't collide.
@@ -14353,6 +14668,23 @@ class PipelineWorker(QThread):
                             else:
                                 raise RuntimeError("Z-image Low Vram selected but no diffusion .gguf was found in models/Z-Image-Turbo GGUF")
                     
+                    elif str(_eng).lower().strip() == "krea2":
+                        # Krea 2 GGUF: Planner defaults = 8 steps, CFG 1, Guidance 3.5, Shift 1.15, Euler.
+                        bw, bh = 1376, 768
+                        ww, hh = _apply_aspect_to_size(bw, bh, aspect_mode)
+                        t2i_job["width"] = int(ww)
+                        t2i_job["height"] = int(hh)
+                        t2i_job["sampler"] = "euler"
+                        t2i_job["sampling_method"] = "euler"
+                        t2i_job["steps"] = int(t2i_job.get("steps") or 8)
+                        t2i_job["cfg_scale"] = float(t2i_job.get("cfg") or t2i_job.get("cfg_scale") or 1.0)
+                        t2i_job["cfg"] = float(t2i_job.get("cfg") or t2i_job.get("cfg_scale") or 1.0)
+                        t2i_job["guidance"] = float(t2i_job.get("guidance") or t2i_job.get("guidance_scale") or 3.5)
+                        t2i_job["guidance_scale"] = float(t2i_job.get("guidance") or t2i_job.get("guidance_scale") or 3.5)
+                        t2i_job["shift"] = float(t2i_job.get("shift") or t2i_job.get("flow_shift") or 1.15)
+                        t2i_job["flow_shift"] = float(t2i_job.get("shift") or t2i_job.get("flow_shift") or 1.15)
+                        t2i_job["diffusion_fa"] = bool(t2i_job.get("diffusion_fa", True))
+                        t2i_job["verbose"] = bool(t2i_job.get("verbose", True))
                     elif str(_eng).lower().strip() == "fireedit":
                         # Locked-in for FireRed Edit: 20 steps, CFG 4, strength 0.75, Euler, 1344x768.
                         bw, bh = 1344, 768
@@ -14846,6 +15178,25 @@ class PipelineWorker(QThread):
                             try:
                                 if (not ok) and os.path.exists(out_path) and os.path.getsize(out_path) == 0:
                                     os.remove(out_path)
+                            except Exception:
+                                pass
+                        elif _eng_now == "krea2":
+                            res = _run_krea2_planner_image(
+                                t2i_job=t2i_job,
+                                images_dir=images_dir,
+                                sid=sid,
+                                aspect_mode=aspect_mode,
+                                log_func=lambda m: self.signals.log.emit(str(m)),
+                                stop_check=lambda: bool(getattr(self, "_stop_requested", False)),
+                            )
+                            try:
+                                shot_map = manifest.setdefault("shots", {})
+                                rec = shot_map.get(sid) if isinstance(shot_map.get(sid), dict) else {}
+                                rec["image_engine"] = "krea2"
+                                rec["krea2_model"] = str(res.get("krea2_model") or t2i_job.get("krea2_model") or '')
+                                rec["krea2_llm"] = str(res.get("krea2_llm") or t2i_job.get("krea2_llm") or '')
+                                rec["krea2_vae"] = str(res.get("krea2_vae") or t2i_job.get("krea2_vae") or '')
+                                shot_map[sid] = rec
                             except Exception:
                                 pass
                         elif _eng_now == "hidream":
@@ -23416,6 +23767,7 @@ These prompts override the normal reused Own Storymode prompts for the video sta
             "SDXL (Lowest vram, fast, low quality)",
             "Z-image Turbo FP16 (slower, best quality, High VRAM)",
             "Z-image Turbo GGUF (high quality, fast, Low VRAM)",
+            "Krea 2 (Fast & High Quality)",
             "Flux Klein 4B (Very Fast, low vram, no NSFW).",
             "Flux Klein 9B (little higher quality).",
             "HiDream Studio",

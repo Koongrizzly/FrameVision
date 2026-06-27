@@ -183,6 +183,7 @@ class Krea2Widget(QWidget):
         self._load_settings()
         self.refresh_models()
         self._apply_loaded_settings()
+        self._apply_queue_mode()
 
     # ---------- UI ----------
     def _build_ui(self):
@@ -438,10 +439,15 @@ class Krea2Widget(QWidget):
         self.verbose_chk = QCheckBox("Verbose")
         self.verbose_chk.setChecked(True)
         self.verbose_chk.setToolTip("Show detailed sd-cli logs for loading, VRAM use, and generation progress.")
+        self.use_queue_chk = QCheckBox("Use FrameVision queue")
+        self.use_queue_chk.setChecked(True)
+        self.use_queue_chk.setToolTip("When enabled, Generate adds a Krea 2 job to the FrameVision queue instead of running immediately in this panel.")
+        self.use_queue_chk.toggled.connect(self._apply_queue_mode)
         run.addWidget(self.offload_chk, 0, 0)
         run.addWidget(self.diff_fa_chk, 0, 1)
         run.addWidget(self.vae_tiling_chk, 1, 0)
         run.addWidget(self.verbose_chk, 1, 1)
+        run.addWidget(self.use_queue_chk, 0, 2, 1, 2)
 
         self.backend_edit = QLineEdit()
         self.backend_edit.setPlaceholderText("")
@@ -552,6 +558,7 @@ class Krea2Widget(QWidget):
         self.diff_fa_chk.setChecked(bool(s.get("diffusion_fa", True)))
         self.vae_tiling_chk.setChecked(bool(s.get("vae_tiling", False)))
         self.verbose_chk.setChecked(bool(s.get("verbose", True)))
+        self.use_queue_chk.setChecked(bool(s.get("use_queue", True)))
         self.disable_metadata_chk.setChecked(bool(s.get("disable_metadata", False)))
         self.backend_edit.setText(str(s.get("backend", "")))
         self.params_backend_edit.setText(str(s.get("params_backend", "")))
@@ -569,7 +576,7 @@ class Krea2Widget(QWidget):
                 self.init_img_edit, self.strength_spin, self.sdcli_edit, self.vae_edit, self.output_dir_edit,
                 self.backend_edit, self.params_backend_edit, self.extra_args_edit,
                 self.model_combo, self.llm_combo, self.sampler_combo, self.scheduler_combo,
-                self.offload_chk, self.diff_fa_chk, self.vae_tiling_chk, self.verbose_chk, self.disable_metadata_chk,
+                self.offload_chk, self.diff_fa_chk, self.vae_tiling_chk, self.verbose_chk, self.use_queue_chk, self.disable_metadata_chk,
             ]:
                 try:
                     if hasattr(w, "textChanged"):
@@ -626,6 +633,7 @@ class Krea2Widget(QWidget):
             "diffusion_fa": self.diff_fa_chk.isChecked(),
             "vae_tiling": self.vae_tiling_chk.isChecked(),
             "verbose": self.verbose_chk.isChecked(),
+            "use_queue": self.use_queue_chk.isChecked(),
             "disable_metadata": self.disable_metadata_chk.isChecked(),
             "backend": self.backend_edit.text().strip(),
             "params_backend": self.params_backend_edit.text().strip(),
@@ -645,6 +653,7 @@ class Krea2Widget(QWidget):
     def reset_defaults(self):
         self._settings = {}
         self._apply_loaded_settings()
+        self._apply_queue_mode()
         self.save_settings()
         self.status_label.setText("Defaults restored")
 
@@ -828,6 +837,71 @@ class Krea2Widget(QWidget):
             return False
         return True
 
+    def _queue_enabled(self) -> bool:
+        try:
+            return bool(self.use_queue_chk.isChecked())
+        except Exception:
+            return False
+
+    def _apply_queue_mode(self, *args):
+        queued = self._queue_enabled()
+        try:
+            self.generate_btn.setText("Add to queue" if queued else "Generate")
+            self.generate_btn.setToolTip(
+                "Add the current Krea 2 settings to the FrameVision queue."
+                if queued else
+                "Run Krea 2 immediately inside this panel."
+            )
+        except Exception:
+            pass
+        try:
+            if queued and not (self.worker and self.worker.isRunning()):
+                self.stop_btn.setEnabled(False)
+        except Exception:
+            pass
+        try:
+            self.update_command_preview()
+        except Exception:
+            pass
+
+    def _enqueue_current_job(self, args: List[str], output_path: Path) -> bool:
+        try:
+            from helpers.queue_adapter import enqueue_krea2_generate  # type: ignore
+        except Exception:
+            try:
+                from queue_adapter import enqueue_krea2_generate  # type: ignore
+            except Exception as exc:
+                QMessageBox.warning(self, "Krea 2", f"Could not import FrameVision queue adapter:\n{exc}")
+                return False
+        try:
+            settings = dict(self.current_settings())
+            prompt_preview = str(settings.get("prompt") or "").replace("\n", " ").strip()
+            if len(prompt_preview) > 80:
+                prompt_preview = prompt_preview[:77].rstrip() + "..."
+            settings.update({
+                "cmd": list(args),
+                "cwd": str(self.app_root),
+                "output_path": str(output_path),
+                "out_file": str(output_path),
+                "outfile": str(output_path),
+                "output_dir": str(output_path.parent),
+                "scan_dir": str(output_path.parent),
+                "scan_ext": ".png",
+                "label": "Krea 2 GGUF" + (f": {prompt_preview}" if prompt_preview else ""),
+            })
+            ok = bool(enqueue_krea2_generate(settings))
+            if ok:
+                self.status_label.setText("Added to queue")
+                self._append_log("Added Krea 2 job to FrameVision queue.")
+                self._append_log(_quote_cmd(args))
+                self._last_output = output_path
+                return True
+            QMessageBox.warning(self, "Krea 2", "Could not add the Krea 2 job to the FrameVision queue.")
+            return False
+        except Exception as exc:
+            QMessageBox.warning(self, "Krea 2", f"Could not add job to queue:\n{exc}")
+            return False
+
     def generate(self):
         if self.worker and self.worker.isRunning():
             return
@@ -835,6 +909,12 @@ class Krea2Widget(QWidget):
             return
         self.save_settings()
         args, output_path = self.build_command()
+        if self._queue_enabled():
+            self._last_output = output_path
+            self.log_edit.clear()
+            self._enqueue_current_job(args, output_path)
+            self._apply_queue_mode()
+            return
         self._last_output = output_path
         self.log_edit.clear()
         self.status_label.setText("Running")
@@ -854,6 +934,7 @@ class Krea2Widget(QWidget):
         self.generate_btn.setEnabled(True)
         self.stop_btn.setEnabled(False)
         self.status_label.setText("Done" if rc == 0 else f"Failed ({rc})")
+        self._apply_queue_mode()
         self._load_preview(Path(out))
 
     def _append_log(self, text: str):

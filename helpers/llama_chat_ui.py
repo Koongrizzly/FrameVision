@@ -1777,8 +1777,32 @@ class MessageBubble(QtWidgets.QFrame):
         except Exception:
             pass
 
+    def _selected_label_text(self) -> str:
+        """Return selected text from this message bubble, if the user selected only part of it."""
+        candidates: List[QtWidgets.QWidget] = []
+        try:
+            focus_widget = QtWidgets.QApplication.focusWidget()
+            if focus_widget is not None:
+                candidates.append(focus_widget)
+        except Exception:
+            pass
+        for widget in (self.text_lbl, self.think_lbl):
+            if widget is not None and widget not in candidates:
+                candidates.append(widget)
+
+        for widget in candidates:
+            try:
+                if isinstance(widget, QtWidgets.QLabel):
+                    selected = str(widget.selectedText() or "")
+                    if selected:
+                        return selected.replace("\u2029", "\n").replace("\u2028", "\n")
+            except Exception:
+                pass
+        return ""
+
     def _show_message_menu(self, pos: QtCore.QPoint):
         menu = QtWidgets.QMenu(self)
+        selected_text = self._selected_label_text()
         if self.role == "user":
             act_edit = menu.addAction("Edit")
         else:
@@ -1795,7 +1819,7 @@ class MessageBubble(QtWidgets.QFrame):
         else:
             act_save_memory = None
             act_save_project = None
-        act_copy = menu.addAction("Copy")
+        act_copy = menu.addAction("Copy selection" if selected_text else "Copy")
         action = menu.exec(QtGui.QCursor.pos())
         if action is None:
             return
@@ -1814,7 +1838,7 @@ class MessageBubble(QtWidgets.QFrame):
             return
         if action == act_copy:
             try:
-                QtWidgets.QApplication.clipboard().setText(self.text_lbl.text())
+                QtWidgets.QApplication.clipboard().setText(selected_text or self.text_lbl.text())
             except Exception:
                 pass
 
@@ -2265,6 +2289,10 @@ class SettingsDialog(QtWidgets.QDialog):
         self.ed_system = QtWidgets.QPlainTextEdit()
         self.ed_system.setPlaceholderText("Optional system prompt…")
         self.ed_system.setMaximumHeight(120)
+        self.lbl_system_scope = QtWidgets.QLabel("")
+        self.lbl_system_scope.setWordWrap(True)
+        self.lbl_system_scope.setObjectName("SubtleLabel")
+        self.lbl_system_scope.setVisible(False)
 
         self.lbl_templates_dir = QtWidgets.QLabel(_templates_root(fv_root))
         self.lbl_templates_dir.setWordWrap(True)
@@ -2374,6 +2402,7 @@ class SettingsDialog(QtWidgets.QDialog):
         lbl_system = QtWidgets.QLabel("System prompt")
         lbl_system.setToolTip(system_tip)
         lay.addWidget(lbl_system)
+        lay.addWidget(self.lbl_system_scope)
         lay.addWidget(self.ed_system)
         lay.addWidget(QtWidgets.QLabel("Template folder"))
         lay.addWidget(self.lbl_templates_dir)
@@ -2543,7 +2572,7 @@ class SettingsDialog(QtWidgets.QDialog):
 
             <h3>Create image</h3>
             <p>The chat checks for available image models and lets you select a model to create an image.
-            Supported aspect presets include 1:1, 9:16 and 16:9, up to 2048 x 2048.</p>
+            Supported models include Z-Image GGUF, Lens, Chroma, Krea 2, Flux Klein and HiDream. Supported aspect presets include 1:1, 9:16 and 16:9, up to 2048 x 2048.</p>
 
             <h3>Edit image</h3>
             <p>Currently supports Flux Klein for smaller edits and HiDream for bigger edits or reference-image based edits.</p>
@@ -2765,6 +2794,9 @@ class LlamaChatWindow(QtWidgets.QMainWindow):
         self._last_memory_sources: List[str] = []
         self._memory_context_mode_for_next_generation: str = "auto"
         self.pinned_chats: List[Dict[str, Any]] = []
+        # Default prompt for brand-new chats. Normal/pinned chat system prompts are
+        # stored on the ChatSession itself and must not leak back into global settings.
+        self._default_new_chat_system_prompt: str = ""
 
         self._save_timer = QtCore.QTimer(self)
         self._save_timer.setSingleShot(True)
@@ -3159,7 +3191,10 @@ class LlamaChatWindow(QtWidgets.QMainWindow):
         tk, tv = self.current_template_choice()
         s.template_kind = tk
         s.template_value = tv
-        s.system_prompt = template or self.settings_dialog.ed_system.toPlainText()
+        # Keep pinned-chat instructions scoped to this new session only.
+        # Do not fall back to the currently visible settings prompt, because that can
+        # be another pinned chat's template and would leak it into this chat.
+        s.system_prompt = template
         s.messages = [{
             "id": str(uuid.uuid4()),
             "role": "info",
@@ -3851,8 +3886,14 @@ class LlamaChatWindow(QtWidgets.QMainWindow):
         model_root = data.get("model_root", os.path.join("models", "llama"))
         if isinstance(model_root, str):
             self.settings_dialog.ed_model_root.setText(model_root)
-        if isinstance(data.get("system_prompt"), str):
-            self.settings_dialog.ed_system.setPlainText(data.get("system_prompt", ""))
+        # Global settings are not the owner of a chat's system prompt.
+        # Older versions saved the currently selected chat prompt here, which made
+        # pinned-chat templates appear to become the default for every new chat.
+        default_prompt = data.get("default_system_prompt", "")
+        if not isinstance(default_prompt, str):
+            default_prompt = ""
+        self._default_new_chat_system_prompt = default_prompt
+        self.settings_dialog.ed_system.setPlainText(default_prompt)
         self._bubble_color_auto = bool(data.get("bubble_color_auto", False))
         self._bubble_color_base = _normalize_hex_color(str(data.get("bubble_color_base", DEFAULT_BUBBLE_BASE_COLOR)), DEFAULT_BUBBLE_BASE_COLOR)
         self._bubble_color_assistant = _normalize_hex_color(str(data.get("bubble_color_assistant", DEFAULT_BUBBLE_ASSISTANT_COLOR)), DEFAULT_BUBBLE_ASSISTANT_COLOR)
@@ -3899,7 +3940,11 @@ class LlamaChatWindow(QtWidgets.QMainWindow):
             "max_tokens": int(self.settings_dialog.sp_max_tokens.value()),
             "temp": float(self.settings_dialog.sp_temp.value()),
             "top_p": float(self.settings_dialog.sp_top_p.value()),
-            "system_prompt": self.settings_dialog.ed_system.toPlainText(),
+            # Kept for compatibility with older settings files, but intentionally
+            # not populated from the visible editor. That editor shows the selected
+            # chat's prompt; saving it globally caused pinned-chat prompt leakage.
+            "system_prompt": "",
+            "default_system_prompt": self._default_new_chat_system_prompt,
             "bubble_color_auto": bool(bubble_auto),
             "bubble_color_base": bubble_base,
             "bubble_color_assistant": bubble_assistant,
@@ -4845,13 +4890,32 @@ class LlamaChatWindow(QtWidgets.QMainWindow):
     def _current_session(self) -> Optional[ChatSession]:
         return self._find_session(self.current_session_id) if self.current_session_id else None
 
+    def _session_is_pinned_chat(self, session: Optional[ChatSession]) -> bool:
+        """Return True for fresh chats created from a pinned reusable template.
+
+        Pinned chats keep their template in ChatSession.system_prompt so the LLM can
+        use it internally. The normal Settings > System prompt editor should not show
+        or overwrite that private template, otherwise it looks like the pinned prompt
+        became the global/default prompt.
+        """
+        if not session:
+            return False
+        for msg in list(getattr(session, "messages", []) or [])[:3]:
+            if not isinstance(msg, dict):
+                continue
+            if str(msg.get("role") or "") == "info" and str(msg.get("content") or "").lstrip().startswith("Pinned Chat:"):
+                return True
+        return False
+
     def _new_chat(self):
         s = ChatSession.create_default()
         s.model_path = self.current_model_path()
         tk, tv = self.current_template_choice()
         s.template_kind = tk
         s.template_value = tv
-        s.system_prompt = self.settings_dialog.ed_system.toPlainText()
+        # New chats should start clean (or with the explicit default), not inherit
+        # whatever system prompt is visible for the currently selected normal/pinned chat.
+        s.system_prompt = self._default_new_chat_system_prompt
         self.sessions.insert(0, s)
         self._refresh_chat_list()
         self._select_session(s.id)
@@ -4989,9 +5053,29 @@ class LlamaChatWindow(QtWidgets.QMainWindow):
             self.settings_dialog.select_model_by_path(s.model_path)
             self.settings_dialog.select_template(s.template_kind, s.template_value)
             self._last_ui_model_path = self.current_model_path()
+            is_pinned = self._session_is_pinned_chat(s)
             self.settings_dialog.ed_system.blockSignals(True)
-            self.settings_dialog.ed_system.setPlainText(s.system_prompt or "")
-            self.settings_dialog.ed_system.blockSignals(False)
+            try:
+                self.settings_dialog.ed_system.setReadOnly(bool(is_pinned))
+                if is_pinned:
+                    self.settings_dialog.ed_system.setPlainText("")
+                    self.settings_dialog.ed_system.setPlaceholderText("Pinned chat template is active internally. Edit it from Pinned Chats, not from global settings.")
+                    self.settings_dialog.ed_system.setToolTip("This pinned chat has its own private template. It is hidden here so it cannot be mistaken for the normal/global system prompt.")
+                    try:
+                        self.settings_dialog.lbl_system_scope.setText("Pinned chat active: its private template is hidden here and will not be saved as the normal system prompt.")
+                        self.settings_dialog.lbl_system_scope.setVisible(True)
+                    except Exception:
+                        pass
+                else:
+                    self.settings_dialog.ed_system.setPlainText(s.system_prompt or "")
+                    self.settings_dialog.ed_system.setPlaceholderText("Optional system prompt…")
+                    self.settings_dialog.ed_system.setToolTip("Optional instruction that stays active for the current normal chat. Pinned chat templates are edited from Pinned Chats.")
+                    try:
+                        self.settings_dialog.lbl_system_scope.setVisible(False)
+                    except Exception:
+                        pass
+            finally:
+                self.settings_dialog.ed_system.blockSignals(False)
             self._rebuild_quick_model_combo()
         finally:
             self._loading_session_state = False
@@ -5021,7 +5105,8 @@ class LlamaChatWindow(QtWidgets.QMainWindow):
         tk, tv = self.current_template_choice()
         s.template_kind = tk
         s.template_value = tv
-        s.system_prompt = self.settings_dialog.ed_system.toPlainText()
+        if not self._session_is_pinned_chat(s):
+            s.system_prompt = self.settings_dialog.ed_system.toPlainText()
         s.updated_at = datetime.now().isoformat(timespec="seconds")
 
     def _sync_models_from_settings(self):
@@ -6841,7 +6926,15 @@ class LlamaChatWindow(QtWidgets.QMainWindow):
         return False
 
     def _is_framevision_wizard_start_command(self, text: str) -> bool:
-        """True only for explicit first-line FrameVision wizard commands."""
+        """True for explicit first-line FrameVision wizard commands or pending router wizards."""
+        try:
+            router = getattr(self, "_fv_assistant_router", None)
+            if router is not None:
+                state = router._load_state()
+                if isinstance(state, dict) and state.get("pending_intent") in {"text_to_image", "image_edit", "ltx_video"}:
+                    return True
+        except Exception:
+            pass
         return self._wizard_first_line_has_prefix(text, [
             "create an image",
             "create image",

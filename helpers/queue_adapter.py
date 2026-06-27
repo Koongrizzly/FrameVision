@@ -438,6 +438,143 @@ def enqueue_ideogram4_generate(settings: dict, priority: int = 610):
         'assistant_chat_only': bool(getattr(inner, 'assistant_chat_only', False) or getattr(getattr(inner, 'cfg', None), 'assistant_chat_only', False)),
     }
     return enqueue_tool_job('ideogram4_generate', '', str(out_dir), args, priority=int(priority))
+
+def default_krea2_outdir():
+    base = _base_root()
+    d = base / 'output' / 'images' / 'krea2'
+    d.mkdir(parents=True, exist_ok=True)
+    return str(d)
+
+
+def enqueue_krea2_generate(settings: dict, priority: int = 610):
+    """Queue one Krea 2 GGUF image generation job for the FrameVision worker."""
+    root = _base_root()
+    data = dict(settings or {})
+
+    def _text(key: str, default: str = '') -> str:
+        try:
+            return str(data.get(key, default) or '')
+        except Exception:
+            return default
+
+    def _int(key: str, default: int) -> int:
+        try:
+            return int(data.get(key, default))
+        except Exception:
+            try:
+                return int(float(data.get(key, default)))
+            except Exception:
+                return int(default)
+
+    prompt = _text('prompt').strip()
+    if not prompt:
+        raise RuntimeError('Prompt is empty.')
+
+    out_dir = Path(_text('output_dir') or default_krea2_outdir())
+    if not out_dir.is_absolute():
+        out_dir = root / out_dir
+    out_dir = out_dir.resolve()
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    cmd = data.get('cmd') or data.get('ffmpeg_cmd')
+    out_file = _text('out_file') or _text('outfile') or _text('output_path')
+    if not out_file:
+        stamp = _time.strftime('%Y%m%d_%H%M%S') + f"_{int((_time.time() % 1.0) * 1000):03d}"
+        out_file = str(out_dir / f'krea2_gguf_{stamp}.png')
+
+    if not cmd:
+        sdcli = _text('sdcli') or str(root / 'presets' / 'bin' / ('sd-cli.exe' if os.name == 'nt' else 'sd-cli'))
+        model = _text('model')
+        llm = _text('llm')
+        vae = _text('vae')
+        def _abs(p: str) -> str:
+            pp = Path(str(p).strip().strip('"'))
+            if not pp.is_absolute():
+                pp = root / pp
+            return str(pp)
+        cmd = [
+            _abs(sdcli),
+            '--diffusion-model', _abs(model),
+            '--llm', _abs(llm),
+            '--vae', _abs(vae),
+            '-p', prompt,
+            '--steps', str(_int('steps', 8)),
+            '--cfg-scale', str(data.get('cfg', 1.0)),
+            '--guidance', str(data.get('guidance', 3.5)),
+            '--width', str(_int('width', 1024)),
+            '--height', str(_int('height', 1024)),
+            '--seed', str(_int('seed', -1)),
+            '--batch-count', str(_int('batch', 1)),
+            '--output', str(out_file),
+        ]
+        negative = _text('negative')
+        if negative:
+            cmd += ['--negative-prompt', negative]
+        try:
+            flow = float(data.get('flow_shift', 1.15))
+            if flow >= 0:
+                cmd += ['--flow-shift', str(flow)]
+        except Exception:
+            pass
+        init_img = _text('init_img')
+        if init_img:
+            cmd += ['--init-img', _abs(init_img), '--strength', str(data.get('strength', 0.75))]
+        if bool(data.get('diffusion_fa', True)):
+            cmd.append('--diffusion-fa')
+        if bool(data.get('offload', False)):
+            cmd.append('--offload-to-cpu')
+        if bool(data.get('vae_tiling', False)):
+            cmd.append('--vae-tiling')
+        if bool(data.get('disable_metadata', False)):
+            cmd.append('--disable-image-metadata')
+        if bool(data.get('verbose', True)):
+            cmd.append('-v')
+        backend = _text('backend')
+        if backend:
+            cmd += ['--backend', backend]
+        params_backend = _text('params_backend')
+        if params_backend:
+            cmd += ['--params-backend', params_backend]
+        sampler = _text('sampler')
+        if sampler and sampler != 'auto':
+            cmd += ['--sampling-method', sampler]
+        scheduler = _text('scheduler')
+        if scheduler and scheduler != 'auto':
+            cmd += ['--scheduler', scheduler]
+        extra = _text('extra_args')
+        if extra:
+            try:
+                import shlex as _shlex
+                cmd += _shlex.split(extra)
+            except Exception:
+                cmd += extra.split()
+
+    preview = prompt.replace('\n', ' ').strip()[:80] or 'Krea 2 GGUF'
+    label = _text('label') or ('Krea 2 GGUF: ' + preview)
+    args = {
+        'label': label,
+        'engine': 'krea2_gguf',
+        'ffmpeg_cmd': list(cmd) if isinstance(cmd, (list, tuple)) else cmd,
+        'cmd': list(cmd) if isinstance(cmd, (list, tuple)) else cmd,
+        'cwd': _text('cwd') or str(root),
+        'outfile': str(out_file),
+        'out_file': str(out_file),
+        'output_path': str(out_file),
+        'scan_dir': _text('scan_dir') or str(out_dir),
+        'scan_ext': _text('scan_ext') or '.png',
+        'prompt': prompt,
+        'negative': _text('negative'),
+        'width': _int('width', 1024),
+        'height': _int('height', 1024),
+        'steps': _int('steps', 8),
+        'seed': _int('seed', -1),
+        'batch': _int('batch', 1),
+        'model': _text('model'),
+        'llm': _text('llm'),
+        'vae': _text('vae'),
+    }
+    return enqueue_tool_job('krea2_generate', '', str(out_dir), args, priority=int(priority))
+
 def enqueue_ace_step15(cfg_path: str, out_dir: str, env_python: str, cli_py: str, project_root: str, label: str="Ace-Step 1.5", hide_console: bool=True, priority: int=620):
     """Convenience wrapper to enqueue an Ace-Step 1.5 job.
     The Ace-Step 1.5 UI writes a TOML config first, then enqueues the job so it is
