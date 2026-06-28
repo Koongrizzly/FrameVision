@@ -2307,6 +2307,7 @@ class ChatCompletionThread(QtCore.QThread):
 class PiperTtsThread(QtCore.QThread):
     succeeded = QtCore.Signal(str)
     failed = QtCore.Signal(str)
+    canceled = QtCore.Signal()
 
     def __init__(self, piper_exe: str, model_path: str, text: str, output_path: str, parent=None):
         super().__init__(parent)
@@ -2314,8 +2315,31 @@ class PiperTtsThread(QtCore.QThread):
         self.model_path = str(model_path or "")
         self.text = str(text or "")
         self.output_path = str(output_path or "")
+        self._proc = None
+        self._cancelled = False
+
+    def cancel(self):
+        self._cancelled = True
+        try:
+            self.requestInterruption()
+        except Exception:
+            pass
+        proc = getattr(self, "_proc", None)
+        if proc is not None:
+            try:
+                proc.terminate()
+            except Exception:
+                pass
+
+    def _remove_tmp(self, tmp: str) -> None:
+        try:
+            if tmp and os.path.exists(tmp):
+                os.remove(tmp)
+        except Exception:
+            pass
 
     def run(self):
+        tmp = ""
         try:
             if not os.path.isfile(self.piper_exe):
                 self.failed.emit("Piper executable not found")
@@ -2327,29 +2351,44 @@ class PiperTtsThread(QtCore.QThread):
                 return
             os.makedirs(os.path.dirname(self.output_path), exist_ok=True)
             tmp = self.output_path + ".tmp.wav"
-            if os.path.exists(tmp):
-                try:
-                    os.remove(tmp)
-                except Exception:
-                    pass
+            self._remove_tmp(tmp)
             cmd = [self.piper_exe, "--model", self.model_path, "--output_file", tmp]
             safe_text = _sanitize_text_for_piper(self.text).strip()
             if not safe_text:
                 return
-            proc = subprocess.run(
+            proc = subprocess.Popen(
                 cmd,
-                input=safe_text,
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
                 text=True,
                 encoding="utf-8",
                 errors="replace",
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
                 cwd=os.path.dirname(self.piper_exe) or None,
-                timeout=180,
                 creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0,
             )
+            self._proc = proc
+            try:
+                stdout, stderr = proc.communicate(input=safe_text, timeout=180)
+            except subprocess.TimeoutExpired:
+                self._cancelled = True
+                try:
+                    proc.kill()
+                except Exception:
+                    pass
+                try:
+                    proc.communicate(timeout=5)
+                except Exception:
+                    pass
+            finally:
+                self._proc = None
+
+            if self._cancelled or self.isInterruptionRequested():
+                self._remove_tmp(tmp)
+                self.canceled.emit()
+                return
             if proc.returncode != 0:
-                detail = (proc.stderr or proc.stdout or "Piper failed").strip()
+                detail = (stderr or stdout or "Piper failed").strip()
                 self.failed.emit(detail[-700:])
                 return
             if not os.path.isfile(tmp) or os.path.getsize(tmp) <= 44:
@@ -2358,7 +2397,11 @@ class PiperTtsThread(QtCore.QThread):
             os.replace(tmp, self.output_path)
             self.succeeded.emit(self.output_path)
         except Exception as e:
-            self.failed.emit(str(e))
+            if self._cancelled or self.isInterruptionRequested():
+                self._remove_tmp(tmp)
+                self.canceled.emit()
+            else:
+                self.failed.emit(str(e))
 
 
 class BubbleColorButton(QtWidgets.QPushButton):
@@ -2809,7 +2852,7 @@ class SettingsDialog(QtWidgets.QDialog):
 
             </ul>
 
-            <h3>Wizard behavior a other info</h3>
+            <h3>Wizard behavior and other info</h3>
             <ul>
                 <li>Models need to be installed before the chat can use them.(find them in the 'optional downloads' menu</li>
                 <li>Usage is easy : use the trigger words above to start a wizard for a job</li>
@@ -2995,6 +3038,7 @@ class LlamaChatWindow(QtWidgets.QMainWindow):
         self._piper_audio = None
         self._piper_pending_session_id: str = ""
         self._piper_pending_message_id: str = ""
+        self._voice_stop_requested: bool = False
         self._piper_installer_process: Optional[QtCore.QProcess] = None
         self._pending_seedvr2_request: Optional[Dict[str, Any]] = None
         self._pending_ace15_music_request: Optional[Dict[str, Any]] = None
@@ -3199,11 +3243,15 @@ class LlamaChatWindow(QtWidgets.QMainWindow):
         self.btn_attach.setFixedWidth(42)
         self.chk_answer_voice = QtWidgets.QCheckBox("Answer with voice")
         self.chk_answer_voice.setToolTip("Use Piper TTS to read only the final assistant answer. Thinking/reasoning text is never spoken.")
+        self.btn_stop_talking = QtWidgets.QPushButton("Stop talking")
+        self.btn_stop_talking.setToolTip("Stop the current voice answer without stopping the LLM chat.")
+        self.btn_stop_talking.setVisible(False)
         self.btn_send = QtWidgets.QPushButton("Send")
         self.btn_send.setDefault(True)
         send_row.addWidget(self.btn_attach, 0)
         send_row.addSpacing(10)
         send_row.addWidget(self.chk_answer_voice, 0)
+        send_row.addWidget(self.btn_stop_talking, 0)
         send_row.addStretch(1)
         send_row.addWidget(self.btn_send, 0)
 
@@ -3267,6 +3315,7 @@ class LlamaChatWindow(QtWidgets.QMainWindow):
         self.settings_dialog.btn_refresh_models.clicked.connect(self._sync_models_from_settings)
         self.btn_attach.clicked.connect(self._pick_attachments)
         self.chk_answer_voice.toggled.connect(self._answer_voice_toggled)
+        self.btn_stop_talking.clicked.connect(self._stop_talking)
         self.lst_attachments.itemClicked.connect(self._preview_attachment_item)
         self.lst_attachments.customContextMenuRequested.connect(self._attachment_context_menu)
         self._refresh_attachment_list()
@@ -7589,6 +7638,46 @@ class LlamaChatWindow(QtWidgets.QMainWindow):
         return ""
 
 
+    def _set_stop_talking_visible(self, visible: bool) -> None:
+        try:
+            btn = getattr(self, "btn_stop_talking", None)
+            if btn is not None:
+                btn.setVisible(bool(visible))
+        except Exception:
+            pass
+
+    def _stop_talking(self) -> None:
+        """Stop current voice generation/playback without touching the LLM response."""
+        self._voice_stop_requested = True
+        stopped = False
+        try:
+            player = getattr(self, "_piper_player", None)
+            if player is not None:
+                player.stop()
+                stopped = True
+        except Exception:
+            pass
+        try:
+            th = getattr(self, "_piper_tts_thread", None)
+            if th is not None and th.isRunning():
+                if hasattr(th, "cancel"):
+                    th.cancel()
+                else:
+                    th.requestInterruption()
+                stopped = True
+        except Exception:
+            pass
+        self._set_stop_talking_visible(False)
+        if stopped:
+            self._set_status("Voice answer stopped", "idle")
+
+    def _on_piper_playback_state_changed(self, state) -> None:
+        try:
+            playing_state = getattr(QtMultimedia.QMediaPlayer, "PlayingState", None) if QtMultimedia is not None else None
+            self._set_stop_talking_visible(state == playing_state)
+        except Exception:
+            pass
+
     def _delete_voice_wav_file(self, path: str) -> None:
         """Delete one Piper temp WAV, but only inside FrameVision/temp/llm_voice."""
         try:
@@ -7748,10 +7837,15 @@ class LlamaChatWindow(QtWidgets.QMainWindow):
             out_dir = _llm_voice_temp_dir(self.fv_root)
             os.makedirs(out_dir, exist_ok=True)
             out_path = os.path.join(out_dir, f"llm_answer_{datetime.now().strftime('%Y%m%d_%H%M%S')}_{uuid.uuid4().hex[:6]}.wav")
+            self._voice_stop_requested = False
+            self._set_stop_talking_visible(True)
             old_thread = getattr(self, "_piper_tts_thread", None)
             if old_thread is not None and old_thread.isRunning():
                 try:
-                    old_thread.requestInterruption()
+                    if hasattr(old_thread, "cancel"):
+                        old_thread.cancel()
+                    else:
+                        old_thread.requestInterruption()
                 except Exception:
                     pass
             th = PiperTtsThread(piper_exe, piper_model, spoken, out_path, self)
@@ -7759,11 +7853,16 @@ class LlamaChatWindow(QtWidgets.QMainWindow):
             self._piper_pending_message_id = str(message_id or "")
             th.succeeded.connect(lambda wav_path, sid=str(session_id or ""), mid=str(message_id or ""): self._on_piper_tts_ready(wav_path, sid, mid))
             th.failed.connect(self._on_piper_tts_failed)
+            try:
+                th.canceled.connect(self._on_piper_tts_canceled)
+            except Exception:
+                pass
             th.finished.connect(lambda: setattr(self, "_piper_tts_thread", None))
             self._piper_tts_thread = th
             self._set_status("Creating voice answer…", "loading")
             th.start()
         except Exception as e:
+            self._set_stop_talking_visible(False)
             try:
                 self._set_status(f"Voice skipped: {e}", "error")
             except Exception:
@@ -7771,7 +7870,12 @@ class LlamaChatWindow(QtWidgets.QMainWindow):
 
     def _on_piper_tts_ready(self, wav_path: str, session_id: str = "", message_id: str = "") -> None:
         wav_path = str(wav_path or "")
+        if getattr(self, "_voice_stop_requested", False):
+            self._delete_voice_wav_file(wav_path)
+            self._set_stop_talking_visible(False)
+            return
         if not wav_path or not os.path.isfile(wav_path):
+            self._set_stop_talking_visible(False)
             return
         try:
             self._attach_voice_wav_to_message(session_id, message_id, wav_path)
@@ -7791,6 +7895,10 @@ class LlamaChatWindow(QtWidgets.QMainWindow):
                 except Exception:
                     pass
                 player.setAudioOutput(audio)
+                try:
+                    player.playbackStateChanged.connect(self._on_piper_playback_state_changed)
+                except Exception:
+                    pass
                 self._piper_player = player
                 self._piper_audio = audio
             else:
@@ -7800,11 +7908,20 @@ class LlamaChatWindow(QtWidgets.QMainWindow):
                     pass
             player.setSource(QtCore.QUrl.fromLocalFile(wav_path))
             player.play()
+            self._set_stop_talking_visible(True)
             self._set_status("Playing voice answer", "ready")
         except Exception as e:
             self._set_status(f"Voice saved but could not play: {e}", "error")
 
+    def _on_piper_tts_canceled(self) -> None:
+        self._set_stop_talking_visible(False)
+        self._set_status("Voice answer stopped", "idle")
+
     def _on_piper_tts_failed(self, message: str) -> None:
+        self._set_stop_talking_visible(False)
+        if getattr(self, "_voice_stop_requested", False):
+            self._set_status("Voice answer stopped", "idle")
+            return
         msg = str(message or "Piper TTS failed").strip()
         self._set_status("Piper voice failed", "error")
         try:
