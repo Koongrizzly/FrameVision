@@ -3039,6 +3039,8 @@ class LlamaChatWindow(QtWidgets.QMainWindow):
         self._piper_pending_session_id: str = ""
         self._piper_pending_message_id: str = ""
         self._voice_stop_requested: bool = False
+        self._voice_job_id: int = 0
+        self._retired_piper_threads: List[PiperTtsThread] = []
         self._piper_installer_process: Optional[QtCore.QProcess] = None
         self._pending_seedvr2_request: Optional[Dict[str, Any]] = None
         self._pending_ace15_music_request: Optional[Dict[str, Any]] = None
@@ -7646,17 +7648,46 @@ class LlamaChatWindow(QtWidgets.QMainWindow):
         except Exception:
             pass
 
-    def _stop_talking(self) -> None:
-        """Stop current voice generation/playback without touching the LLM response."""
-        self._voice_stop_requested = True
+    def _retire_piper_thread(self, th: Optional[PiperTtsThread]) -> None:
+        """Keep canceled Piper threads alive until they finish, so Qt cannot destroy a running thread."""
+        if th is None:
+            return
+        try:
+            retired = getattr(self, "_retired_piper_threads", None)
+            if retired is None:
+                self._retired_piper_threads = []
+                retired = self._retired_piper_threads
+            if th not in retired:
+                retired.append(th)
+            th.finished.connect(lambda t=th: self._forget_retired_piper_thread(t))
+        except Exception:
+            pass
+
+    def _forget_retired_piper_thread(self, th: Optional[PiperTtsThread]) -> None:
+        try:
+            retired = getattr(self, "_retired_piper_threads", None)
+            if isinstance(retired, list) and th in retired:
+                retired.remove(th)
+        except Exception:
+            pass
+
+    def _stop_piper_player_only(self) -> bool:
         stopped = False
         try:
             player = getattr(self, "_piper_player", None)
             if player is not None:
                 player.stop()
+                try:
+                    player.setSource(QtCore.QUrl())
+                except Exception:
+                    pass
                 stopped = True
         except Exception:
             pass
+        return stopped
+
+    def _cancel_active_piper_thread(self) -> bool:
+        stopped = False
         try:
             th = getattr(self, "_piper_tts_thread", None)
             if th is not None and th.isRunning():
@@ -7664,9 +7695,19 @@ class LlamaChatWindow(QtWidgets.QMainWindow):
                     th.cancel()
                 else:
                     th.requestInterruption()
+                self._retire_piper_thread(th)
                 stopped = True
         except Exception:
             pass
+        return stopped
+
+    def _stop_talking(self) -> None:
+        """Stop current voice generation/playback without touching the LLM response."""
+        self._voice_job_id = int(getattr(self, "_voice_job_id", 0) or 0) + 1
+        self._voice_stop_requested = True
+        stopped = self._stop_piper_player_only()
+        stopped = self._cancel_active_piper_thread() or stopped
+        self._piper_tts_thread = None
         self._set_stop_talking_visible(False)
         if stopped:
             self._set_status("Voice answer stopped", "idle")
@@ -7837,27 +7878,27 @@ class LlamaChatWindow(QtWidgets.QMainWindow):
             out_dir = _llm_voice_temp_dir(self.fv_root)
             os.makedirs(out_dir, exist_ok=True)
             out_path = os.path.join(out_dir, f"llm_answer_{datetime.now().strftime('%Y%m%d_%H%M%S')}_{uuid.uuid4().hex[:6]}.wav")
+
+            # Piper is single-voice-at-a-time.  Starting a new speech while the old WAV
+            # is still playing or rendering used to leave QMediaPlayer/subprocess state
+            # fighting itself.  New speech now cleanly preempts the old speech.
+            self._stop_piper_player_only()
+            self._cancel_active_piper_thread()
+            self._voice_job_id = int(getattr(self, "_voice_job_id", 0) or 0) + 1
+            voice_job_id = int(self._voice_job_id)
             self._voice_stop_requested = False
             self._set_stop_talking_visible(True)
-            old_thread = getattr(self, "_piper_tts_thread", None)
-            if old_thread is not None and old_thread.isRunning():
-                try:
-                    if hasattr(old_thread, "cancel"):
-                        old_thread.cancel()
-                    else:
-                        old_thread.requestInterruption()
-                except Exception:
-                    pass
+
             th = PiperTtsThread(piper_exe, piper_model, spoken, out_path, self)
             self._piper_pending_session_id = str(session_id or "")
             self._piper_pending_message_id = str(message_id or "")
-            th.succeeded.connect(lambda wav_path, sid=str(session_id or ""), mid=str(message_id or ""): self._on_piper_tts_ready(wav_path, sid, mid))
-            th.failed.connect(self._on_piper_tts_failed)
+            th.succeeded.connect(lambda wav_path, sid=str(session_id or ""), mid=str(message_id or ""), jid=voice_job_id: self._on_piper_tts_ready(wav_path, sid, mid, jid))
+            th.failed.connect(lambda message, jid=voice_job_id: self._on_piper_tts_failed(message, jid))
             try:
-                th.canceled.connect(self._on_piper_tts_canceled)
+                th.canceled.connect(lambda jid=voice_job_id: self._on_piper_tts_canceled(jid))
             except Exception:
                 pass
-            th.finished.connect(lambda: setattr(self, "_piper_tts_thread", None))
+            th.finished.connect(lambda t=th, jid=voice_job_id: self._on_piper_thread_finished(t, jid))
             self._piper_tts_thread = th
             self._set_status("Creating voice answer…", "loading")
             th.start()
@@ -7868,14 +7909,28 @@ class LlamaChatWindow(QtWidgets.QMainWindow):
             except Exception:
                 pass
 
-    def _on_piper_tts_ready(self, wav_path: str, session_id: str = "", message_id: str = "") -> None:
+    def _on_piper_thread_finished(self, th: Optional[PiperTtsThread], job_id: int) -> None:
+        try:
+            if int(job_id) == int(getattr(self, "_voice_job_id", 0) or 0) and getattr(self, "_piper_tts_thread", None) is th:
+                self._piper_tts_thread = None
+            self._forget_retired_piper_thread(th)
+        except Exception:
+            pass
+
+    def _is_current_voice_job(self, job_id: int) -> bool:
+        try:
+            return int(job_id) == int(getattr(self, "_voice_job_id", 0) or 0)
+        except Exception:
+            return False
+
+    def _on_piper_tts_ready(self, wav_path: str, session_id: str = "", message_id: str = "", job_id: int = 0) -> None:
         wav_path = str(wav_path or "")
-        if getattr(self, "_voice_stop_requested", False):
+        if (job_id and not self._is_current_voice_job(job_id)) or getattr(self, "_voice_stop_requested", False):
             self._delete_voice_wav_file(wav_path)
-            self._set_stop_talking_visible(False)
             return
         if not wav_path or not os.path.isfile(wav_path):
-            self._set_stop_talking_visible(False)
+            if not job_id or self._is_current_voice_job(job_id):
+                self._set_stop_talking_visible(False)
             return
         try:
             self._attach_voice_wav_to_message(session_id, message_id, wav_path)
@@ -7913,11 +7968,15 @@ class LlamaChatWindow(QtWidgets.QMainWindow):
         except Exception as e:
             self._set_status(f"Voice saved but could not play: {e}", "error")
 
-    def _on_piper_tts_canceled(self) -> None:
+    def _on_piper_tts_canceled(self, job_id: int = 0) -> None:
+        if job_id and not self._is_current_voice_job(job_id):
+            return
         self._set_stop_talking_visible(False)
         self._set_status("Voice answer stopped", "idle")
 
-    def _on_piper_tts_failed(self, message: str) -> None:
+    def _on_piper_tts_failed(self, message: str, job_id: int = 0) -> None:
+        if job_id and not self._is_current_voice_job(job_id):
+            return
         self._set_stop_talking_visible(False)
         if getattr(self, "_voice_stop_requested", False):
             self._set_status("Voice answer stopped", "idle")
