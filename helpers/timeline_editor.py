@@ -18395,7 +18395,7 @@ if QT_AVAILABLE:
                             self.editor.log("Edit finished.")
                     edit_reason = "clip trim" if self.drag_mode in ("trim_left", "trim_right") else "clip group move" if self.drag_mode == "clip" and len(getattr(self, "drag_group_originals", {}) or {}) > 1 else "clip move" if self.drag_mode == "clip" else "timeline edit"
                     if self.drag_mode in ("trim_left", "trim_right") and clip is not None:
-                        self.editor.sync_overlap_transitions_after_clip_edit(clip)
+                        self.editor.sync_overlap_transitions_after_clip_edit(clip, create_missing=True)
                     elif self.drag_mode == "clip":
                         sync_ids = list((getattr(self, "drag_group_originals", {}) or {}).keys()) or ([self.drag_clip_id] if self.drag_clip_id else [])
                         seen_sync: set[str] = set()
@@ -18405,7 +18405,7 @@ if QT_AVAILABLE:
                             seen_sync.add(str(sync_id))
                             moved_clip = self.editor.project.get_clip(str(sync_id))
                             if moved_clip is not None:
-                                self.editor.sync_overlap_transitions_after_clip_edit(moved_clip)
+                                self.editor.sync_overlap_transitions_after_clip_edit(moved_clip, create_missing=True)
                     self.editor.update_after_timeline_change(save_state=True, reason=edit_reason)
             self.drag_mode = None
             self.drag_clip_id = None
@@ -20471,15 +20471,21 @@ if QT_AVAILABLE:
             self.media_table = MediaBinTable(self)
             layout.addWidget(self.media_table, 1)
 
-            self.media_hint_label = QLabel("Double-click adds selected media to the first free spot on the selected timeline. Drag media directly onto any timeline track.")
-            self.media_hint_label.setWordWrap(True)
-            self.media_hint_label.setStyleSheet("color: #9aa3b6;")
-            layout.addWidget(self.media_hint_label)
+            self.media_hint_label = QLabel("")
+            self.media_hint_label.setVisible(False)
+            self.media_hint_label.setToolTip(
+                "Double-click media to add it to the first free spot on the selected timeline track. "
+                "Drag media directly onto any timeline track."
+            )
+            try:
+                self.media_table.setToolTip(self.media_hint_label.toolTip())
+                panel.setToolTip(self.media_hint_label.toolTip())
+            except Exception:
+                pass
 
             self.media_content_widgets = [
                 self.media_button_row_widget,
                 self.media_table,
-                self.media_hint_label,
             ]
             return panel
 
@@ -22279,10 +22285,11 @@ if QT_AVAILABLE:
                 image = frame.toImage()
                 if image is not None and not image.isNull():
                     self.preview_current_frame = image.copy()
-                    # During PNG transitions, the timer drives a throttled composite
-                    # preview. Do not repaint on every decoder frame and do not let
-                    # the normal active-clip frame overwrite the transition composite.
-                    if transition_preview_state(self.project, getattr(self, "playhead_time", 0.0)) is not None:
+                    # In standalone, PNG transitions own the preview while active.
+                    # In embedded FrameVision playback, transitions are timeline/export
+                    # metadata only; keep normal frames painting and avoid transition
+                    # state/compositor calls from the decoder callback.
+                    if (not self._embedded_live_transition_passthrough_active()) and transition_preview_state(self.project, getattr(self, "playhead_time", 0.0)) is not None:
                         return
                     self._refresh_preview_pixmap()
             except Exception:
@@ -22753,6 +22760,19 @@ if QT_AVAILABLE:
             self.log(f"Transition preview failed: {reason}")
 
         def _transition_preview_state_for_current_time(self) -> Optional[Dict[str, Any]]:
+            if self._embedded_live_transition_passthrough_active():
+                # Leave transition objects/timeline blocks alone, but do not let live
+                # embedded playback enter transition preview state.
+                if getattr(self, "_active_transition_preview_id", ""):
+                    self._active_transition_preview_id = ""
+                    self._last_transition_preview_bucket = ""
+                    self._last_transition_frame_plan_log_key = ""
+                    self._last_transition_composite_log_key = ""
+                    try:
+                        self._transition_role_last_frame_cache.clear()
+                    except Exception:
+                        pass
+                return None
             state = transition_preview_state(self.project, getattr(self, "playhead_time", 0.0))
             if not state:
                 if getattr(self, "_active_transition_preview_id", ""):
@@ -23864,8 +23884,28 @@ if QT_AVAILABLE:
                 return False
             return bool(getattr(self, "timeline_playback_active", False) and not getattr(self, "selected_preview_active", False))
 
+        def _embedded_live_transition_passthrough_active(self) -> bool:
+            """True only while the editor is embedded in FrameVision and live playback is running.
+
+            In this mode transition blocks must still exist and draw on the timeline,
+            but the Preview pane must not enter any transition-preview/compositor/audio
+            special paths. Those paths use extra QImage/QPixmap work plus QtMultimedia
+            state changes inside the same host GUI process, which is what freezes the
+            full FrameVision app at the first transition frame.
+            """
+            return bool(
+                getattr(self, "_embedded_in_framevision", False)
+                and getattr(self, "timeline_playback_active", False)
+                and not getattr(self, "timeline_playback_paused", False)
+                and not getattr(self, "preview_paused", False)
+                and not getattr(self, "selected_preview_active", False)
+                and not getattr(self, "debug_transitions", False)
+            )
+
         def _paint_transition_preview_to_label(self, label: QLabel) -> bool:
             if label is None:
+                return False
+            if self._embedded_live_transition_passthrough_active():
                 return False
             state = self._transition_preview_state_for_current_time()
             if not state:
@@ -24006,7 +24046,7 @@ if QT_AVAILABLE:
         def _paint_preview_image_to_label(self, label: QLabel, image: Optional[QImage]) -> None:
             if label is None or image is None or image.isNull():
                 return
-            if transition_preview_state(self.project, getattr(self, "playhead_time", 0.0)):
+            if (not self._embedded_live_transition_passthrough_active()) and transition_preview_state(self.project, getattr(self, "playhead_time", 0.0)):
                 warning_key = f"{getattr(self, '_active_transition_preview_id', '')}|{safe_float(getattr(self, 'playhead_time', 0.0), 0.0):.2f}"
                 if warning_key != getattr(self, "_last_transition_overwrite_warning_key", ""):
                     self._last_transition_overwrite_warning_key = warning_key
@@ -24163,6 +24203,8 @@ if QT_AVAILABLE:
         def _paint_transition_preview_fallback(self, painter: QPainter, pane_w: int, pane_h: int) -> None:
             if not bool(getattr(self, "timeline_playback_active", False) or getattr(self, "timeline_playback_paused", False)):
                 return
+            if self._embedded_live_transition_passthrough_active():
+                return
             state = transition_preview_state(self.project, getattr(self, "playhead_time", 0.0))
             if not state:
                 return
@@ -24220,6 +24262,8 @@ if QT_AVAILABLE:
                 self._paint_preview_image_to_label(self.preview_fullscreen_label, image)
 
         def _refresh_transition_preview_or_repaint_after_exit(self) -> bool:
+            if self._embedded_live_transition_passthrough_active():
+                return False
             """Keep live preview from holding a stale transition composite.
 
             Image clips are timer-clock visuals, so the QLabel can otherwise keep
@@ -24603,7 +24647,27 @@ if QT_AVAILABLE:
             if self.timeline_gap_active or self.timeline_playback_paused:
                 return False
             current_id = str(self.timeline_playback_clip_id or "")
-            switch = timeline_visual_switch_plan(self.project, current_id, self.playhead_time)
+            if self._embedded_live_transition_passthrough_active():
+                # Do not use transition_visual_hold_clip_at_time() in embedded live
+                # preview. Holding the outgoing clip is only useful for the PNG
+                # compositor; with passthrough it delays/complicates source switches
+                # exactly at the transition boundary inside the FrameVision host.
+                active = timeline_top_visual_clip_at_time(self.project, self.playhead_time)
+                if active is None:
+                    gap = timeline_visual_gap_plan_under_playhead(self.project, self.playhead_time)
+                    switch = {"ok": False, "reason": "No active visual clip", "gap_plan": gap}
+                elif str(active.clip_id) == str(current_id or ""):
+                    switch = {"ok": False, "reason": "Current clip still top priority", "clip": active}
+                else:
+                    plan = timeline_playback_plan_for_clip(self.project, active, self.playhead_time)
+                    if plan:
+                        plan["top_track_priority"] = True
+                        plan["is_visual_timeline_playback"] = True
+                        switch = {"ok": True, "reason": "Switch visual clip", "clip": active, "plan": plan}
+                    else:
+                        switch = {"ok": False, "reason": "No playable visual clip under playhead", "clip": active}
+            else:
+                switch = timeline_visual_switch_plan(self.project, current_id, self.playhead_time)
             if bool(switch.get("ok")):
                 plan = switch.get("plan")
                 next_clip = switch.get("clip")
@@ -25176,7 +25240,7 @@ if QT_AVAILABLE:
 
             active_visual = self._active_visual_clip_for_audio() if timeline_active else None
             plan = timeline_audio_follow_plan(self.project, timeline_time, mode, active_visual)
-            transition_audio_state = transition_preview_state(self.project, timeline_time) if timeline_active else None
+            transition_audio_state = None if self._embedded_live_transition_passthrough_active() else (transition_preview_state(self.project, timeline_time) if timeline_active else None)
 
             if mode == AUDIO_MODE_VIDEO:
                 if force or mode_changed:
@@ -26721,7 +26785,7 @@ if QT_AVAILABLE:
 
             transition_switch_active = False
             transition_switch_time = safe_float(plan.get("timeline_start", getattr(self, "playhead_time", 0.0)), getattr(self, "playhead_time", 0.0))
-            if timeline_mode:
+            if timeline_mode and not self._embedded_live_transition_passthrough_active():
                 transition_switch_active = transition_preview_state(self.project, transition_switch_time) is not None
                 if transition_switch_active:
                     previous_clip = self.project.get_clip(str(getattr(self, "timeline_playback_clip_id", "") or ""))
@@ -27612,6 +27676,18 @@ if QT_AVAILABLE:
             if clip is None or not clip_is_visual(clip):
                 return
             asset = self.selected_transition_asset() if bool(create_missing) else None
+            # Timeline drag/trim release should be able to recreate an overlap transition
+            # after the old one was removed when clips were pulled apart. If the
+            # Transitions table has no current row selection, fall back to the active
+            # mask path and then to the first scanned mask. This keeps auto-overlap
+            # transitions reliable from both Media Bin drops and timeline moves.
+            if bool(create_missing) and not asset:
+                try:
+                    masks = list(getattr(self, "transition_masks", []) or [])
+                    if masks:
+                        asset = masks[0]
+                except Exception:
+                    asset = None
             mask_path = str(asset.get("path") if asset else "")
             mask_name = str(asset.get("name") if asset else "")
             changed, messages = self.project.sync_overlap_transitions_for_clip(
@@ -30118,7 +30194,8 @@ if QT_AVAILABLE:
                     position = float(clock.get("position") or 0.0)
                     self._set_preview_position(position, duration=self.preview_playback_duration, update_slider=True)
                     self._sync_timeline_audio_to_time(self.playhead_time)
-                    self._refresh_transition_preview_or_repaint_after_exit()
+                    if not self._embedded_live_transition_passthrough_active():
+                        self._refresh_transition_preview_or_repaint_after_exit()
                     if getattr(self, "preview_image_source_path", "") == "":
                         self._show_black_preview_frame()
                     if self._maybe_switch_top_track_visual_clip():
@@ -30136,7 +30213,8 @@ if QT_AVAILABLE:
                     if not bool(getattr(self, "preview_qt_active", False)):
                         return
                     self._sync_timeline_audio_to_time(self.playhead_time)
-                    self._refresh_transition_preview_or_repaint_after_exit()
+                    if not self._embedded_live_transition_passthrough_active():
+                        self._refresh_transition_preview_or_repaint_after_exit()
                     if self._maybe_switch_top_track_visual_clip():
                         return
                 return
