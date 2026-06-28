@@ -115,7 +115,9 @@ Run **`framevision.exe`** — it automatically:
     - Pinned chats : Users can enter special prompts, save them to pinned chats and re-use them later
     - Memory : chat has several types of memory : chat own memory (add anything in here you want to load
     with the llm when it creates an answer, user notes (where it saves when you type 'save to memory' or
-    and projects (save to project 'name of project' so you can take work with you to another chat or llm
+    and projects (save to project 'name of project' so you can take work with you to another chat or llm.
+    - Answer with voice : simple tts engine (piper) for fast text to speech.
+
 
   - bugfixes
     + when using the video timeline editor inside framevision, it often froze the whole app, should be
