@@ -575,6 +575,71 @@ def enqueue_krea2_generate(settings: dict, priority: int = 610):
     }
     return enqueue_tool_job('krea2_generate', '', str(out_dir), args, priority=int(priority))
 
+def default_boogu_outdir(mode: str = 'normal'):
+    base = _base_root()
+    if str(mode or '').lower() == 'edit':
+        d = base / 'output' / 'edits' / 'boogu'
+    else:
+        d = base / 'output' / 'images' / 'boogu'
+    d.mkdir(parents=True, exist_ok=True)
+    return str(d)
+
+
+def enqueue_boogu_generate(settings: dict, priority: int = 610):
+    """Queue one Boogu Image sd-cli job for the FrameVision worker."""
+    root = _base_root()
+    data = dict(settings or {})
+
+    def _text(key: str, default: str = '') -> str:
+        try:
+            return str(data.get(key, default) or '')
+        except Exception:
+            return default
+
+    def _int(key: str, default: int) -> int:
+        try:
+            return int(data.get(key, default))
+        except Exception:
+            try:
+                return int(float(data.get(key, default)))
+            except Exception:
+                return int(default)
+
+    mode = _text('mode', 'normal').strip().lower() or 'normal'
+    prompt = _text('prompt').strip()
+    out_dir = Path(_text('output_dir') or default_boogu_outdir(mode))
+    if not out_dir.is_absolute():
+        out_dir = root / out_dir
+    out_dir = out_dir.resolve()
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    cmd = data.get('cmd') or data.get('ffmpeg_cmd')
+    if not cmd:
+        raise RuntimeError('Boogu queue job is missing cmd/ffmpeg_cmd.')
+
+    preview = prompt.replace('\n', ' ').strip()[:80] or ('Boogu Image ' + mode)
+    label = _text('label') or ('Boogu Image: ' + preview)
+    if label.lower() in ('boogu image create', 'boogu image edit') and preview:
+        label = label + ' — ' + preview
+
+    args = {
+        'label': label,
+        'engine': 'boogu_image',
+        'mode': mode,
+        'ffmpeg_cmd': list(cmd) if isinstance(cmd, (list, tuple)) else cmd,
+        'cmd': list(cmd) if isinstance(cmd, (list, tuple)) else cmd,
+        'cwd': _text('cwd') or str(root),
+        'scan_dir': _text('scan_dir') or str(out_dir),
+        'scan_ext': _text('scan_ext') or '.png',
+        'prompt': prompt,
+        'width': _int('width', 1024),
+        'height': _int('height', 1024),
+        'steps': _int('steps', 4 if mode == 'normal' else 20),
+        'seed': _int('seed', -1),
+    }
+    return enqueue_tool_job('boogu_generate', '', str(out_dir), args, priority=int(priority))
+
+
 def enqueue_ace_step15(cfg_path: str, out_dir: str, env_python: str, cli_py: str, project_root: str, label: str="Ace-Step 1.5", hide_console: bool=True, priority: int=620):
     """Convenience wrapper to enqueue an Ace-Step 1.5 job.
     The Ace-Step 1.5 UI writes a TOML config first, then enqueues the job so it is

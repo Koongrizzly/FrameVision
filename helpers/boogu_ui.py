@@ -59,6 +59,10 @@ except Exception as exc:  # pragma: no cover - only visible when PySide6 is miss
 
 
 IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".webp", ".bmp", ".tif", ".tiff"}
+MODEL_EXTS = {".safetensors", ".sft", ".gguf", ".ckpt", ".pt", ".bin"}
+MODEL_FILE_FILTER = "Model files (*.gguf *.safetensors *.sft *.ckpt *.pt *.bin);;GGUF files (*.gguf);;Safetensors (*.safetensors *.sft);;All files (*.*)"
+IMAGE_FILE_FILTER = "Images (*.png *.jpg *.jpeg *.webp *.bmp *.tif *.tiff);;All files (*.*)"
+ALL_FILE_FILTER = "All files (*.*)"
 SAMPLERS = [
     "euler", "euler_a", "heun", "dpm2", "dpm++2s_a", "dpm++2m", "dpm++2mv2",
     "ipndm", "ipndm_v", "lcm", "ddim_trailing", "tcd", "res_multistep", "res_2s",
@@ -69,6 +73,7 @@ SCHEDULERS = [
     "sgm_uniform", "simple", "kl_optimal", "lcm", "bong_tangent", "ltx2", "logit_normal",
 ]
 PREVIEW_METHODS = ["none", "proj", "tae", "vae"]
+ASPECT_MODES = ["1:1", "16:9", "9:16", "custom"]
 
 
 def find_app_root() -> Path:
@@ -167,6 +172,7 @@ class BooguUI(QWidget):
         self.process: Optional[QProcess] = None
         self.reference_images: List[str] = []
         self._loading = False
+        self._aspect_sync_active = False
         self.config = self.default_config()
         self.load_config()
         self.build_ui()
@@ -181,6 +187,8 @@ class BooguUI(QWidget):
         return {
             "paths": {
                 "sd_cli": "presets/bin/sd-cli.exe",
+                # Diffusion model can be safetensors/sft or experimental GGUF.
+                # Boogu GGUF support depends on the sd-cli build/model tensor mapping.
                 "turbo_model": "models/boogu_image/diffusion_models/boogu_image_turbo_fp8_scaled.safetensors",
                 "edit_model": "models/boogu_image/diffusion_models/boogu_image_edit_fp8_scaled.safetensors",
                 "vae": "models/boogu_image/vae/ae.safetensors",
@@ -203,6 +211,7 @@ class BooguUI(QWidget):
                 "scheduler": "model default",
                 "preview": "none",
                 "preview_interval": 1,
+                "aspect_mode": "custom",
             },
             "edit": {
                 "prompt": "change the background to a rainy neon city street while keeping the main subject recognizable",
@@ -232,6 +241,7 @@ class BooguUI(QWidget):
                 "vae_tiling": True,
                 "disable_metadata": False,
                 "verbose": True,
+                "framevision_queue": True,
                 "threads": -1,
                 "rng": "cuda",
                 "extra_args": "",
@@ -321,8 +331,8 @@ class BooguUI(QWidget):
         gen_grid.setColumnStretch(5, 1)
         self.normal_tab.content_layout.addWidget(gen_group)
 
-        self.n_width = self.spin(256, 4096, 64, "Width passed with --width. 1024 is a useful first test size.")
-        self.n_height = self.spin(256, 4096, 64, "Height passed with --height. Keep width and height multiples of 64.")
+        self.n_width = self.spin(256, 4096, 16, "Width passed with --width. Aspect presets keep width and height synced; Custom leaves them free.")
+        self.n_height = self.spin(256, 4096, 16, "Height passed with --height. Aspect presets keep width and height synced; Custom leaves them free.")
         self.n_steps = self.spin(1, 100, 1, "Boogu Turbo is designed for roughly 3-4 sampling steps; 4 is the practical default.")
         self.n_batch = self.spin(1, 64, 1, "Batch count passed with --batch-count. This creates multiple outputs from one command.")
         self.n_seed = self.spin(-1, 2_147_483_647, 1, "Seed passed with --seed. Use -1 for random.")
@@ -332,13 +342,18 @@ class BooguUI(QWidget):
         self.n_scheduler = self.combo(SCHEDULERS, "--scheduler. 'model default' omits the argument and lets sd-cli choose.")
         self.n_preview = self.combo(PREVIEW_METHODS, "Preview method. 'none' is fastest and safest; 'vae' writes preview files but costs time/VRAM.")
         self.n_preview_interval = self.spin(1, 100, 1, "Preview update interval in denoising steps.")
+        self.n_aspect_mode = self.combo(ASPECT_MODES, "Choose 1:1, 16:9, 9:16 or Custom. Presets lock the ratio and cap the maximum size; Custom leaves width and height free.")
 
         self.add_grid_pair(gen_grid, 0, "Width", self.n_width, "Height", self.n_height)
         self.add_grid_pair(gen_grid, 1, "Steps", self.n_steps, "Batch", self.n_batch)
-        self.add_grid_pair(gen_grid, 2, "Seed", self.n_seed, "", None)
+        self.add_grid_pair(gen_grid, 2, "Seed", self.n_seed, "Format", self.n_aspect_mode)
         self.add_grid_pair(gen_grid, 3, "CFG", self.n_cfg, "Guidance", self.n_guidance)
         self.add_grid_pair(gen_grid, 4, "Sampler", self.n_sampler, "Scheduler", self.n_scheduler)
         self.add_grid_pair(gen_grid, 5, "Preview", self.n_preview, "Every", self.n_preview_interval)
+
+        self.n_aspect_mode.currentIndexChanged.connect(self.on_normal_aspect_mode_changed)
+        self.n_width.valueChanged.connect(self.on_normal_width_changed)
+        self.n_height.valueChanged.connect(self.on_normal_height_changed)
 
         self.normal_tab.content_layout.addStretch(1)
         self.n_cmd_preview = QLineEdit()
@@ -443,11 +458,11 @@ class BooguUI(QWidget):
     def build_settings_tab(self) -> None:
         paths_form = self.make_form_group("Paths", self.settings_tab)
         self.path_sd_cli = self.path_row(paths_form, "sd-cli", "Path to sd-cli.exe. Default is presets/bin/sd-cli.exe.", file_mode=True)
-        self.path_turbo_model = self.path_row(paths_form, "Turbo model", "Boogu Turbo diffusion model used by Create tab.", file_mode=True)
-        self.path_edit_model = self.path_row(paths_form, "Edit model", "Boogu Edit diffusion model used by Edit tab.", file_mode=True)
-        self.path_vae = self.path_row(paths_form, "VAE", "FLUX VAE passed with --vae.", file_mode=True)
-        self.path_llm = self.path_row(paths_form, "Qwen LLM", "Qwen3-VL GGUF text encoder passed with --llm.", file_mode=True)
-        self.path_llm_vision = self.path_row(paths_form, "Vision mmproj", "Matching mmproj passed with --llm_vision for edit mode.", file_mode=True)
+        self.path_turbo_model = self.path_row(paths_form, "Turbo model", "Boogu Turbo diffusion model used by Create tab. Supports safetensors/sft and experimental GGUF files if your sd-cli build can load them.", file_mode=True, file_filter=MODEL_FILE_FILTER)
+        self.path_edit_model = self.path_row(paths_form, "Edit model", "Boogu Edit diffusion model used by Edit tab. Supports safetensors/sft and experimental GGUF files if your sd-cli build can load them.", file_mode=True, file_filter=MODEL_FILE_FILTER)
+        self.path_vae = self.path_row(paths_form, "VAE", "FLUX VAE passed with --vae.", file_mode=True, file_filter="VAE files (*.safetensors *.sft *.gguf);;All files (*.*)")
+        self.path_llm = self.path_row(paths_form, "Qwen LLM", "Qwen3-VL GGUF text encoder passed with --llm.", file_mode=True, file_filter="GGUF files (*.gguf);;All files (*.*)")
+        self.path_llm_vision = self.path_row(paths_form, "Vision mmproj", "Matching mmproj passed with --llm_vision for edit mode.", file_mode=True, file_filter="GGUF files (*.gguf);;All files (*.*)")
         self.path_normal_out = self.path_row(paths_form, "Create output", "Folder used by Create tab outputs.", file_mode=False)
         self.path_edit_out = self.path_row(paths_form, "Edit output", "Folder used by Edit tab outputs.", file_mode=False)
 
@@ -466,8 +481,11 @@ class BooguUI(QWidget):
         self.rt_disable_metadata.setToolTip("Adds --disable-image-metadata.")
         self.rt_verbose = QCheckBox("Verbose")
         self.rt_verbose.setToolTip("Adds -v for more sd-cli output in the log.")
+        self.rt_framevision_queue = QCheckBox("Use FrameVision queue")
+        self.rt_framevision_queue.setToolTip("When enabled, Generate adds the Boogu job to the FrameVision queue instead of running sd-cli directly in this tab.")
+        self.rt_framevision_queue.toggled.connect(self.update_queue_button_text)
         checks = QWidget(); checks_l = QGridLayout(checks); checks_l.setContentsMargins(0,0,0,0)
-        for i, cb in enumerate([self.rt_diffusion_fa, self.rt_offload, self.rt_mmap, self.rt_eager, self.rt_vae_tiling, self.rt_disable_metadata, self.rt_verbose]):
+        for i, cb in enumerate([self.rt_diffusion_fa, self.rt_offload, self.rt_mmap, self.rt_eager, self.rt_vae_tiling, self.rt_disable_metadata, self.rt_verbose, self.rt_framevision_queue]):
             checks_l.addWidget(cb, i // 2, i % 2)
         runtime_form.addRow("Toggles", checks)
 
@@ -479,7 +497,7 @@ class BooguUI(QWidget):
         runtime_form.addRow("CPU / RNG", pair)
 
         self.rt_extra_args = QLineEdit()
-        self.rt_extra_args.setToolTip("Extra sd-cli arguments appended last. Advanced use only.")
+        self.rt_extra_args.setToolTip("Extra sd-cli arguments appended last. Advanced use only. add --max-vram 20 --stream-layers for higher resolutions on low vram cards")
         runtime_form.addRow("Extra args", self.rt_extra_args)
 
         log_group = QGroupBox("Logs")
@@ -552,12 +570,12 @@ class BooguUI(QWidget):
         c.setToolTip(tooltip)
         return c
 
-    def path_row(self, form: QFormLayout, label: str, tooltip: str, file_mode: bool) -> QLineEdit:
+    def path_row(self, form: QFormLayout, label: str, tooltip: str, file_mode: bool, file_filter: str = ALL_FILE_FILTER) -> QLineEdit:
         edit = QLineEdit()
         edit.setToolTip(tooltip)
         btn = QPushButton("Browse")
         btn.setToolTip(tooltip)
-        btn.clicked.connect(lambda: self.browse_path(edit, file_mode=file_mode))
+        btn.clicked.connect(lambda: self.browse_path(edit, file_mode=file_mode, file_filter=file_filter))
         row = QWidget(); row_l = QHBoxLayout(row); row_l.setContentsMargins(0,0,0,0)
         row_l.addWidget(edit, 1); row_l.addWidget(btn, 0)
         form.addRow(label, row)
@@ -583,6 +601,7 @@ class BooguUI(QWidget):
         self.n_negative.setText(n.get("negative_prompt", ""))
         self.n_width.setValue(int(n.get("width", 1024)))
         self.n_height.setValue(int(n.get("height", 1024)))
+        self.set_combo(self.n_aspect_mode, n.get("aspect_mode", "custom"))
         self.n_steps.setValue(int(n.get("steps", 4)))
         self.n_batch.setValue(int(n.get("batch_count", 1)))
         self.n_seed.setValue(int(n.get("seed", -1)))
@@ -622,10 +641,13 @@ class BooguUI(QWidget):
         self.rt_vae_tiling.setChecked(bool(rt.get("vae_tiling", True)))
         self.rt_disable_metadata.setChecked(bool(rt.get("disable_metadata", False)))
         self.rt_verbose.setChecked(bool(rt.get("verbose", True)))
+        self.rt_framevision_queue.setChecked(bool(rt.get("framevision_queue", True)))
+        self.update_queue_button_text()
         self.rt_threads.setValue(int(rt.get("threads", -1)))
         self.set_combo(self.rt_rng, rt.get("rng", "cuda"))
         self.rt_extra_args.setText(rt.get("extra_args", ""))
         self._loading = False
+        self.apply_normal_aspect_mode()
 
     def pull_ui_to_config(self) -> None:
         self.config["paths"] = {
@@ -652,6 +674,7 @@ class BooguUI(QWidget):
             "scheduler": self.n_scheduler.currentText(),
             "preview": self.n_preview.currentText(),
             "preview_interval": self.n_preview_interval.value(),
+            "aspect_mode": self.n_aspect_mode.currentText(),
         }
         self.config["edit"] = {
             "prompt": self.e_prompt.toPlainText().strip(),
@@ -681,10 +704,73 @@ class BooguUI(QWidget):
             "vae_tiling": self.rt_vae_tiling.isChecked(),
             "disable_metadata": self.rt_disable_metadata.isChecked(),
             "verbose": self.rt_verbose.isChecked(),
+            "framevision_queue": self.rt_framevision_queue.isChecked(),
             "threads": self.rt_threads.value(),
             "rng": self.rt_rng.currentText(),
             "extra_args": self.rt_extra_args.text().strip(),
         }
+
+    @staticmethod
+    def round_to_step(value: int, step: int = 16) -> int:
+        return max(step, int(round(value / step) * step))
+
+    def apply_normal_aspect_mode(self, driver: str = "width") -> None:
+        if self._loading or self._aspect_sync_active:
+            return
+        mode = self.n_aspect_mode.currentText()
+        self._aspect_sync_active = True
+        try:
+            self.n_width.setRange(256, 4096)
+            self.n_height.setRange(256, 4096)
+            if mode == "custom":
+                return
+
+            if mode == "1:1":
+                limit = 1760
+                base = self.n_height.value() if driver == "height" else self.n_width.value()
+                value = min(max(256, self.round_to_step(base, 16)), limit)
+                self.n_width.setMaximum(limit)
+                self.n_height.setMaximum(limit)
+                self.n_width.setValue(value)
+                self.n_height.setValue(value)
+                return
+
+            if mode == "16:9":
+                rw, rh, max_w, max_h = 16, 9, 2304, 1296
+            else:
+                rw, rh, max_w, max_h = 9, 16, 1296, 2304
+
+            self.n_width.setMaximum(max_w)
+            self.n_height.setMaximum(max_h)
+
+            if driver == "height":
+                height = min(max(256, self.round_to_step(self.n_height.value(), 16)), max_h)
+                width = self.round_to_step(int(round(height * rw / rh)), 16)
+                if width > max_w:
+                    width = max_w
+                    height = self.round_to_step(int(round(width * rh / rw)), 16)
+            else:
+                width = min(max(256, self.round_to_step(self.n_width.value(), 16)), max_w)
+                height = self.round_to_step(int(round(width * rh / rw)), 16)
+                if height > max_h:
+                    height = max_h
+                    width = self.round_to_step(int(round(height * rw / rh)), 16)
+
+            width = max(256, min(width, max_w))
+            height = max(256, min(height, max_h))
+            self.n_width.setValue(width)
+            self.n_height.setValue(height)
+        finally:
+            self._aspect_sync_active = False
+
+    def on_normal_aspect_mode_changed(self, *args) -> None:
+        self.apply_normal_aspect_mode("width")
+
+    def on_normal_width_changed(self, *args) -> None:
+        self.apply_normal_aspect_mode("width")
+
+    def on_normal_height_changed(self, *args) -> None:
+        self.apply_normal_aspect_mode("height")
 
     def connect_auto_save(self) -> None:
         widgets = [
@@ -704,9 +790,9 @@ class BooguUI(QWidget):
             self.e_cfg, self.e_img_cfg, self.e_guidance, self.e_strength, self.e_preview_interval, self.rt_threads,
         ]:
             w.valueChanged.connect(self.debounced_save)
-        for w in [self.n_sampler, self.n_scheduler, self.n_preview, self.e_sampler, self.e_scheduler, self.e_preview, self.rt_rng]:
+        for w in [self.n_sampler, self.n_scheduler, self.n_preview, self.n_aspect_mode, self.e_sampler, self.e_scheduler, self.e_preview, self.rt_rng]:
             w.currentIndexChanged.connect(self.debounced_save)
-        for w in [self.e_increase_ref_index, self.e_disable_resize, self.rt_diffusion_fa, self.rt_offload, self.rt_mmap, self.rt_eager, self.rt_vae_tiling, self.rt_disable_metadata, self.rt_verbose]:
+        for w in [self.e_increase_ref_index, self.e_disable_resize, self.rt_diffusion_fa, self.rt_offload, self.rt_mmap, self.rt_eager, self.rt_vae_tiling, self.rt_disable_metadata, self.rt_verbose, self.rt_framevision_queue]:
             w.toggled.connect(self.debounced_save)
 
         self._save_timer = QTimer(self)
@@ -731,7 +817,7 @@ class BooguUI(QWidget):
             self,
             "Add reference image",
             str(APP_ROOT / "output"),
-            "Images (*.png *.jpg *.jpeg *.webp *.bmp *.tif *.tiff);;All files (*.*)",
+            IMAGE_FILE_FILTER,
         )
         for file in files:
             if file not in self.reference_images:
@@ -767,6 +853,20 @@ class BooguUI(QWidget):
     # ------------------------------------------------------------------
     # Command build / generation
     # ------------------------------------------------------------------
+    def update_queue_button_text(self, *args) -> None:
+        try:
+            use_queue = bool(self.rt_framevision_queue.isChecked())
+        except Exception:
+            use_queue = False
+        try:
+            self.n_generate.setText("Add to queue" if use_queue else "Generate")
+        except Exception:
+            pass
+        try:
+            self.e_generate.setText("Add edit to queue" if use_queue else "Generate edit")
+        except Exception:
+            pass
+
     def build_command(self, mode: str) -> List[str]:
         self.pull_ui_to_config()
         p = self.config["paths"]
@@ -880,6 +980,56 @@ class BooguUI(QWidget):
         if not self.validate_command(mode, cmd):
             return
 
+        model_path = self.get_arg_value(cmd, "--diffusion-model")
+        if model_path and Path(model_path).suffix.lower() == ".gguf":
+            self.log("Using GGUF diffusion model. This is experimental for Boogu and depends on the sd-cli build supporting this GGUF tensor layout.")
+
+        use_queue = False
+        try:
+            use_queue = bool(self.config.get("runtime", {}).get("framevision_queue", True))
+        except Exception:
+            use_queue = False
+
+        if use_queue:
+            try:
+                p = self.config.get("paths", {})
+                out_key = "normal_output_subfolder" if mode == "normal" else "edit_output_subfolder"
+                out_dir = rel_or_abs(p.get(out_key, "output/images/boogu" if mode == "normal" else "output/edits/boogu"))
+                prompt_text = (self.config.get("normal", {}) if mode == "normal" else self.config.get("edit", {})).get("prompt", "")
+                try:
+                    from helpers import queue_adapter as _qa  # type: ignore
+                except Exception:
+                    import queue_adapter as _qa  # type: ignore
+                _qa.enqueue_boogu_generate({
+                    "mode": mode,
+                    "cmd": cmd,
+                    "ffmpeg_cmd": cmd,
+                    "cwd": str(APP_ROOT),
+                    "output_dir": str(out_dir),
+                    "scan_dir": str(out_dir),
+                    "scan_ext": ".png",
+                    "prompt": str(prompt_text or ""),
+                    "width": (self.config.get("normal", {}) if mode == "normal" else self.config.get("edit", {})).get("width", 1024),
+                    "height": (self.config.get("normal", {}) if mode == "normal" else self.config.get("edit", {})).get("height", 1024),
+                    "steps": (self.config.get("normal", {}) if mode == "normal" else self.config.get("edit", {})).get("steps", 4),
+                    "seed": (self.config.get("normal", {}) if mode == "normal" else self.config.get("edit", {})).get("seed", -1),
+                    "label": "Boogu Image " + ("edit" if mode == "edit" else "create"),
+                })
+                self.log("Added Boogu Image job to FrameVision queue.")
+                try:
+                    QMessageBox.information(self, "Boogu Image", "Added to FrameVision queue.")
+                except Exception:
+                    pass
+                self.generated.emit(str(APP_ROOT))
+                return
+            except Exception as exc:
+                self.log(f"Could not add Boogu job to queue: {exc}")
+                try:
+                    QMessageBox.warning(self, "Boogu Image", f"Could not add job to FrameVision queue:\n{exc}")
+                except Exception:
+                    pass
+                return
+
         self.log("Starting sd-cli")
         self.log(preview)
         self.set_running(True)
@@ -924,6 +1074,16 @@ class BooguUI(QWidget):
         self.stop_btn.setEnabled(running)
 
     @staticmethod
+    def get_arg_value(cmd: List[str], key: str) -> str:
+        try:
+            idx = cmd.index(key)
+        except ValueError:
+            return ""
+        if idx + 1 >= len(cmd):
+            return ""
+        return cmd[idx + 1]
+
+    @staticmethod
     def format_cmd(cmd: List[str]) -> str:
         if os.name == "nt":
             return subprocess.list2cmdline(cmd)
@@ -932,10 +1092,10 @@ class BooguUI(QWidget):
     # ------------------------------------------------------------------
     # Misc
     # ------------------------------------------------------------------
-    def browse_path(self, edit: QLineEdit, file_mode: bool) -> None:
+    def browse_path(self, edit: QLineEdit, file_mode: bool, file_filter: str = ALL_FILE_FILTER) -> None:
         start = rel_or_abs(edit.text()) if edit.text().strip() else APP_ROOT
         if file_mode:
-            path, _ = QFileDialog.getOpenFileName(self, "Select file", str(start if start.parent.exists() else APP_ROOT), "All files (*.*)")
+            path, _ = QFileDialog.getOpenFileName(self, "Select file", str(start if start.parent.exists() else APP_ROOT), file_filter)
         else:
             path = QFileDialog.getExistingDirectory(self, "Select folder", str(start if start.exists() else APP_ROOT))
         if path:
