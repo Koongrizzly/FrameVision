@@ -19146,6 +19146,17 @@ if QT_AVAILABLE:
             self.autosave_dirty_timer: Optional[QTimer] = None
             self._autosave_last_ok_time = 0.0
             self._transition_live_skip_log_key = ""
+            # Embedded FrameVision stability guard:
+            # the full app already owns Qt multimedia objects. Keep this editor on
+            # the normal QLabel/QVideoSink preview path, but throttle/serialize the
+            # risky Qt media operations so the shared GUI event loop is not locked
+            # by rapid stop/setSource/seek bursts during timeline playback.
+            self._embedded_qt_preview_safe_mode = bool(self._embedded_in_framevision)
+            self._embedded_qt_restart_pending = False
+            self._embedded_qt_frame_last_ts = 0.0
+            self._embedded_qt_audio_guard_logged = False
+            self._embedded_qt_timer_guard_logged = False
+            self._embedded_qt_switch_guard_logged = False
             self.timeline_math = TimelineMath()
             self.playhead_time = 0.0
             self.hover_time: Optional[float] = None
@@ -19373,6 +19384,14 @@ if QT_AVAILABLE:
             self._update_undo_redo_buttons()
             self.preview_timer = QTimer(self)
             self.preview_timer.setInterval(TRANSITION_PREVIEW_TIMER_MS)
+            if bool(getattr(self, "_embedded_qt_preview_safe_mode", False)):
+                # The embedded tab shares the main FrameVision GUI thread. A 20 FPS
+                # timeline tick is fine standalone, but inside the host it can pile
+                # up with QMediaPlayer frame delivery, audio sync, autosave and the
+                # rest of FrameVision. 12.5 FPS keeps scrubbing/playhead responsive
+                # without starving the host event loop.
+                self.preview_timer.setInterval(max(80, TRANSITION_PREVIEW_TIMER_MS))
+                self._embedded_qt_timer_guard_logged = True
             self.preview_timer.timeout.connect(self._tick_preview_playback)
             self.timeline_inspection_debounce_timer = QTimer(self)
             self.timeline_inspection_debounce_timer.setSingleShot(True)
@@ -22201,9 +22220,44 @@ if QT_AVAILABLE:
         def _qt_preview_is_available(self) -> bool:
             return self.preview_qt_player is not None and self.preview_qt_sink is not None
 
+        def _embedded_defer_qt_preview_restart(
+            self,
+            plan: Dict[str, Any],
+            timeline_mode: bool,
+            resume_timeline: bool,
+            selected_duration: float,
+            start_offset: float,
+            play_duration: float,
+        ) -> None:
+            """Restart Qt preview on the next event-loop turn in embedded mode.
+
+            The freeze pattern inside FrameVision is usually not one specific
+            transition: it is rapid stop/setSource/setPosition/play on a
+            QMediaPlayer while the same GUI process is also receiving video frames
+            and audio callbacks from other FrameVision tabs. Serializing source
+            switches gives QtMultimedia time to unwind the old decoder before the
+            next one is attached.
+            """
+            if not bool(getattr(self, "_embedded_qt_preview_safe_mode", False)):
+                self._start_qt_preview_playback(plan, timeline_mode, resume_timeline, selected_duration, start_offset, play_duration)
+                return
+            if not bool(getattr(self, "_embedded_qt_switch_guard_logged", False)):
+                self._embedded_qt_switch_guard_logged = True
+                self.log("FrameVision embedded safe preview: serializing Qt media source switches.")
+            self._embedded_qt_restart_pending = False
+            self._start_qt_preview_playback(plan, timeline_mode, resume_timeline, selected_duration, start_offset, play_duration)
+
         def _on_qt_preview_frame(self, frame: Any) -> None:
             if bool(getattr(self, "_suppress_qt_preview_frames", False)):
                 return
+            if bool(getattr(self, "_embedded_qt_preview_safe_mode", False)):
+                now_ts = time.monotonic()
+                # Do not copy/scale every decoder frame while embedded. QLabel
+                # painting is still smooth enough for editing, but the host app no
+                # longer gets hammered by 30/60 FPS QImage copies during playback.
+                if now_ts - float(getattr(self, "_embedded_qt_frame_last_ts", 0.0) or 0.0) < (1.0 / 18.0):
+                    return
+                self._embedded_qt_frame_last_ts = now_ts
             try:
                 image = frame.toImage()
                 if image is not None and not image.isNull():
@@ -25070,6 +25124,15 @@ if QT_AVAILABLE:
 
         def _sync_timeline_audio_to_time(self, timeline_time: float, force: bool = False, visual_switch: bool = False) -> None:
             mode = normalize_audio_mode(getattr(self, "audio_mode", AUDIO_MODE_MIX_ALL))
+            if bool(getattr(self, "_embedded_qt_preview_safe_mode", False)) and mode in (AUDIO_MODE_MIX_ALL, AUDIO_MODE_TRACK):
+                # Keep embedded preview to one Qt video/audio pipeline. Multiple
+                # extra QMediaPlayer audio mixers are useful standalone, but inside
+                # FrameVision they increase the chance of QtMultimedia backend
+                # deadlocks while the main app owns its own players too.
+                if not bool(getattr(self, "_embedded_qt_audio_guard_logged", False)):
+                    self._embedded_qt_audio_guard_logged = True
+                    self.log("FrameVision embedded safe preview: audio mixer disabled during live playback; using visual clip audio for stability.")
+                mode = AUDIO_MODE_VIDEO
             last_mode = normalize_audio_mode(getattr(self, "timeline_audio_last_mode", AUDIO_MODE_MIX_ALL))
             mode_changed = mode != last_mode
             self.timeline_audio_last_mode = mode
@@ -26616,6 +26679,27 @@ if QT_AVAILABLE:
                     return
                 else:
                     self.log("Reverse preview proxy unavailable; holding static reverse frame instead of playing original source from the end.")
+                    return
+
+            if bool(getattr(self, "_embedded_qt_preview_safe_mode", False)):
+                previous_source = str(getattr(self, "preview_qt_source_path", "") or "")
+                previous_active = bool(getattr(self, "preview_qt_active", False))
+                try:
+                    same_source = bool(previous_source) and Path(previous_source).resolve() == Path(source_path).resolve()
+                except Exception:
+                    same_source = bool(previous_source) and previous_source == source_path
+                if previous_active and previous_source and not same_source and not bool(getattr(self, "_embedded_qt_restart_pending", False)):
+                    self._embedded_qt_restart_pending = True
+                    try:
+                        self._stop_qt_preview_player()
+                    except Exception:
+                        pass
+                    restart_plan = dict(plan)
+                    QTimer.singleShot(
+                        120,
+                        lambda p=restart_plan, tm=bool(timeline_mode), rt=bool(resume_timeline), sd=float(selected_duration), so=float(start_offset), pd=float(play_duration):
+                            self._embedded_defer_qt_preview_restart(p, tm, rt, sd, so, pd),
+                    )
                     return
 
             transition_switch_active = False
