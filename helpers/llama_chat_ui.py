@@ -868,6 +868,115 @@ def _split_inline_reasoning(text: str) -> Tuple[str, str]:
     return raw, ""
 
 
+
+
+def _strip_text_for_tts(text: str) -> str:
+    """Return only the spoken answer text, never hidden/thinking sections."""
+    raw = str(text or "").strip()
+    if not raw:
+        return ""
+    answer, _thinking = _split_inline_reasoning(raw)
+    raw = answer or raw
+    raw = re.sub(r"<think>.*?</think>", " ", raw, flags=re.IGNORECASE | re.DOTALL)
+    raw = re.sub(r"<thinking>.*?</thinking>", " ", raw, flags=re.IGNORECASE | re.DOTALL)
+    raw = re.sub(r"<reasoning>.*?</reasoning>", " ", raw, flags=re.IGNORECASE | re.DOTALL)
+    # Drop fenced code blocks and inline code markers. Piper is for answers, not code dumps.
+    raw = re.sub(r"```.*?```", " ", raw, flags=re.DOTALL)
+    raw = re.sub(r"`([^`]+)`", r"\1", raw)
+    # Remove common markdown noise while keeping the actual words.
+    raw = re.sub(r"!\[[^\]]*\]\([^\)]*\)", " ", raw)
+    raw = re.sub(r"\[([^\]]+)\]\([^\)]*\)", r"\1", raw)
+    raw = re.sub(r"https?://\S+", " ", raw)
+    raw = re.sub(r"^\s{0,3}#{1,6}\s*", "", raw, flags=re.MULTILINE)
+    raw = re.sub(r"^\s{0,3}[-*+]\s+", "", raw, flags=re.MULTILINE)
+    raw = re.sub(r"[*_~>#]", "", raw)
+    raw = re.sub(r"\s+", " ", raw).strip()
+    # Keep voice snappy and prevent very long answers from generating huge wav files.
+    if len(raw) > 3500:
+        raw = raw[:3500].rsplit(" ", 1)[0].strip() + "."
+    return raw
+
+
+def _find_piper_exe(fv_root: str) -> str:
+    candidates = [
+        os.path.join(fv_root, "presets", "bin", "piper", "piper", "piper.exe"),
+        os.path.join(fv_root, "presets", "bin", "piper", "piper.exe"),
+        os.path.join(fv_root, "presets", "bin", "piper.exe"),
+    ]
+    for cand in candidates:
+        if os.path.isfile(cand):
+            return cand
+    return ""
+
+
+def _piper_required_model_dir(fv_root: str) -> str:
+    return os.path.join(fv_root, "models", "tts", "piper", "en_US-lessac-medium")
+
+
+def _piper_required_model_path(fv_root: str) -> str:
+    return os.path.join(_piper_required_model_dir(fv_root), "en_US-lessac-medium.onnx")
+
+
+def _piper_downloader_script(fv_root: str) -> str:
+    return os.path.join(fv_root, "presets", "extra_env", "pipertts_downloader.py")
+
+
+def _find_piper_model(fv_root: str) -> str:
+    # Voice answers intentionally use the medium Lessac voice only.
+    # Do not silently fall back to the old/robotic low voice.
+    model_path = _piper_required_model_path(fv_root)
+    return model_path if os.path.isfile(model_path) else ""
+
+
+def _piper_required_model_ready(fv_root: str) -> bool:
+    model_path = _piper_required_model_path(fv_root)
+    meta_path = model_path + ".json"
+    return os.path.isdir(_piper_required_model_dir(fv_root)) and os.path.isfile(model_path) and os.path.isfile(meta_path)
+
+
+def _llm_voice_temp_dir(fv_root: str) -> str:
+    """Temporary Piper WAV output folder for LLM voice answers."""
+    return os.path.join(str(fv_root or ""), "temp", "llm_voice")
+
+
+def _is_llm_voice_temp_file(fv_root: str, path: str) -> bool:
+    try:
+        if not path:
+            return False
+        base = os.path.abspath(_llm_voice_temp_dir(fv_root))
+        target = os.path.abspath(str(path))
+        return target.lower().startswith(base.lower() + os.sep) and target.lower().endswith(".wav")
+    except Exception:
+        return False
+
+
+def _collect_voice_wavs_from_message(msg: Dict[str, Any]) -> List[str]:
+    found: List[str] = []
+    if not isinstance(msg, dict):
+        return found
+    for key in ("voice_wav", "voice_path", "tts_wav"):
+        val = str(msg.get(key) or "").strip()
+        if val:
+            found.append(val)
+    versions = msg.get("versions")
+    if isinstance(versions, list):
+        for ver in versions:
+            if not isinstance(ver, dict):
+                continue
+            for key in ("voice_wav", "voice_path", "tts_wav"):
+                val = str(ver.get(key) or "").strip()
+                if val:
+                    found.append(val)
+    out: List[str] = []
+    seen = set()
+    for path in found:
+        norm = os.path.abspath(path)
+        if norm.lower() in seen:
+            continue
+        seen.add(norm.lower())
+        out.append(path)
+    return out
+
 def _filename_words_from_prompt(prompt: str, max_words: int = 5) -> str:
     clean = re.sub(r"[^a-zA-Z0-9]+", " ", str(prompt or "")).strip().lower()
     words = [w for w in clean.split() if w]
@@ -2147,6 +2256,59 @@ class ChatCompletionThread(QtCore.QThread):
             self.failed.emit(str(e))
 
 
+
+class PiperTtsThread(QtCore.QThread):
+    succeeded = QtCore.Signal(str)
+    failed = QtCore.Signal(str)
+
+    def __init__(self, piper_exe: str, model_path: str, text: str, output_path: str, parent=None):
+        super().__init__(parent)
+        self.piper_exe = str(piper_exe or "")
+        self.model_path = str(model_path or "")
+        self.text = str(text or "")
+        self.output_path = str(output_path or "")
+
+    def run(self):
+        try:
+            if not os.path.isfile(self.piper_exe):
+                self.failed.emit("Piper executable not found")
+                return
+            if not os.path.isfile(self.model_path):
+                self.failed.emit("Piper voice model not found")
+                return
+            if not self.text.strip():
+                return
+            os.makedirs(os.path.dirname(self.output_path), exist_ok=True)
+            tmp = self.output_path + ".tmp.wav"
+            if os.path.exists(tmp):
+                try:
+                    os.remove(tmp)
+                except Exception:
+                    pass
+            cmd = [self.piper_exe, "--model", self.model_path, "--output_file", tmp]
+            proc = subprocess.run(
+                cmd,
+                input=self.text,
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                cwd=os.path.dirname(self.piper_exe) or None,
+                timeout=180,
+                creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0,
+            )
+            if proc.returncode != 0:
+                detail = (proc.stderr or proc.stdout or "Piper failed").strip()
+                self.failed.emit(detail[-700:])
+                return
+            if not os.path.isfile(tmp) or os.path.getsize(tmp) <= 44:
+                self.failed.emit("Piper did not create a usable wav file")
+                return
+            os.replace(tmp, self.output_path)
+            self.succeeded.emit(self.output_path)
+        except Exception as e:
+            self.failed.emit(str(e))
+
+
 class BubbleColorButton(QtWidgets.QPushButton):
     colorChanged = QtCore.Signal(str)
 
@@ -2775,6 +2937,13 @@ class LlamaChatWindow(QtWidgets.QMainWindow):
         self._auto_retry_original_selection: Tuple[str, str] = ("auto", "")
         self.effective_template_on_server: Tuple[str, str] = ("auto", "")
         self.pending_attachments: List[Dict[str, Any]] = []
+        self.voice_answer_enabled: bool = False
+        self._piper_tts_thread: Optional[PiperTtsThread] = None
+        self._piper_player = None
+        self._piper_audio = None
+        self._piper_pending_session_id: str = ""
+        self._piper_pending_message_id: str = ""
+        self._piper_installer_process: Optional[QtCore.QProcess] = None
         self._pending_seedvr2_request: Optional[Dict[str, Any]] = None
         self._pending_ace15_music_request: Optional[Dict[str, Any]] = None
         self._framevision_fullscreen_active = False
@@ -2976,9 +3145,13 @@ class LlamaChatWindow(QtWidgets.QMainWindow):
         send_row = QtWidgets.QHBoxLayout()
         self.btn_attach = QtWidgets.QPushButton("+")
         self.btn_attach.setFixedWidth(42)
+        self.chk_answer_voice = QtWidgets.QCheckBox("Answer with voice")
+        self.chk_answer_voice.setToolTip("Use Piper TTS to read only the final assistant answer. Thinking/reasoning text is never spoken.")
         self.btn_send = QtWidgets.QPushButton("Send")
         self.btn_send.setDefault(True)
         send_row.addWidget(self.btn_attach, 0)
+        send_row.addSpacing(10)
+        send_row.addWidget(self.chk_answer_voice, 0)
         send_row.addStretch(1)
         send_row.addWidget(self.btn_send, 0)
 
@@ -3041,6 +3214,7 @@ class LlamaChatWindow(QtWidgets.QMainWindow):
         self.cmb_model_quick.currentIndexChanged.connect(self._quick_model_changed)
         self.settings_dialog.btn_refresh_models.clicked.connect(self._sync_models_from_settings)
         self.btn_attach.clicked.connect(self._pick_attachments)
+        self.chk_answer_voice.toggled.connect(self._answer_voice_toggled)
         self.lst_attachments.itemClicked.connect(self._preview_attachment_item)
         self.lst_attachments.customContextMenuRequested.connect(self._attachment_context_menu)
         self._refresh_attachment_list()
@@ -3916,6 +4090,11 @@ class LlamaChatWindow(QtWidgets.QMainWindow):
             self.settings_dialog.chk_memory_sources.setChecked(bool(data.get("memory_show_sources", True)))
         except Exception:
             pass
+        self.voice_answer_enabled = bool(data.get("answer_with_voice", False))
+        try:
+            self.chk_answer_voice.setChecked(self.voice_answer_enabled)
+        except Exception:
+            pass
         self.current_session_id = data.get("last_session_id") if isinstance(data.get("last_session_id"), str) else None
         self._saved_model_path = data.get("model_path", "") if isinstance(data.get("model_path"), str) else ""
         self._saved_template = (data.get("template_kind", "auto"), data.get("template_value", ""))
@@ -3952,6 +4131,7 @@ class LlamaChatWindow(QtWidgets.QMainWindow):
             "assistant_results_chat_only": bool(getattr(self.settings_dialog, "chk_results_chat_only", None).isChecked()) if getattr(self.settings_dialog, "chk_results_chat_only", None) is not None else True,
             "memory_enabled": bool(getattr(self.settings_dialog, "chk_memory_enabled", None).isChecked()) if getattr(self.settings_dialog, "chk_memory_enabled", None) is not None else True,
             "memory_show_sources": bool(getattr(self.settings_dialog, "chk_memory_sources", None).isChecked()) if getattr(self.settings_dialog, "chk_memory_sources", None) is not None else True,
+            "answer_with_voice": bool(getattr(self, "chk_answer_voice", None).isChecked()) if getattr(self, "chk_answer_voice", None) is not None else bool(getattr(self, "voice_answer_enabled", False)),
             "last_session_id": self.current_session_id or "",
             "chat_composer_splitter_sizes": list(getattr(self, "main_vertical_splitter", None).sizes()) if getattr(self, "main_vertical_splitter", None) is not None else [760, 150],
         }
@@ -4984,6 +5164,7 @@ class LlamaChatWindow(QtWidgets.QMainWindow):
         if QtWidgets.QMessageBox.question(self, "Delete chat", f"Delete '{session.title}'?") != QtWidgets.QMessageBox.Yes:
             return
         sid = session.id
+        self._cleanup_voice_wavs_for_session(session)
         self.sessions = [x for x in self.sessions if x.id != sid]
         try:
             os.remove(os.path.join(self.chat_dir, f"{sid}.json"))
@@ -5668,6 +5849,8 @@ class LlamaChatWindow(QtWidgets.QMainWindow):
             answer_msg = s.messages[answer_idx]
             self._ensure_message_versions(answer_msg)
             if len(s.messages) > answer_idx + 1:
+                removed_messages = list(s.messages[answer_idx + 1:])
+                self._cleanup_voice_wavs_for_messages(removed_messages)
                 del s.messages[answer_idx + 1:]
                 self._render_session(s)
             answer_msg["loading"] = True
@@ -5690,6 +5873,8 @@ class LlamaChatWindow(QtWidgets.QMainWindow):
             }
             s.messages.insert(idx + 1, answer_msg)
             if len(s.messages) > idx + 2:
+                removed_messages = list(s.messages[idx + 2:])
+                self._cleanup_voice_wavs_for_messages(removed_messages)
                 del s.messages[idx + 2:]
             self.chat_view.add_message("assistant", "Regenerating…", "", attachments=[], message_id=target_assistant_id, loading=True)
 
@@ -5769,6 +5954,7 @@ class LlamaChatWindow(QtWidgets.QMainWindow):
         self._update_header()
         self._queue_save()
         self._set_status("Ready", "ready")
+        self._speak_assistant_answer(str(msg.get("content", "")), session_id, assistant_message_id)
         return True
 
     # ---------- Knowledge & Memory ----------
@@ -6318,6 +6504,7 @@ class LlamaChatWindow(QtWidgets.QMainWindow):
         self._refresh_chat_list()
         self._update_header()
         self._queue_save()
+        self._speak_assistant_answer(reply, s.id, mid)
 
 
     # -----------------------------
@@ -7349,6 +7536,230 @@ class LlamaChatWindow(QtWidgets.QMainWindow):
             return ranked[-1] if ranked else ""
         return ""
 
+
+    def _delete_voice_wav_file(self, path: str) -> None:
+        """Delete one Piper temp WAV, but only inside FrameVision/temp/llm_voice."""
+        try:
+            p = str(path or "").strip()
+            if not _is_llm_voice_temp_file(self.fv_root, p):
+                return
+            if os.path.isfile(p):
+                try:
+                    player = getattr(self, "_piper_player", None)
+                    if player is not None:
+                        cur = player.source().toLocalFile() if hasattr(player, "source") else ""
+                        if os.path.abspath(str(cur or "")).lower() == os.path.abspath(p).lower():
+                            player.stop()
+                except Exception:
+                    pass
+                os.remove(p)
+        except Exception:
+            pass
+
+    def _cleanup_voice_wavs_for_messages(self, messages: List[Dict[str, Any]]) -> None:
+        for msg in list(messages or []):
+            for wav in _collect_voice_wavs_from_message(msg):
+                self._delete_voice_wav_file(wav)
+
+    def _cleanup_voice_wavs_for_session(self, session: Optional[ChatSession]) -> None:
+        if not session:
+            return
+        self._cleanup_voice_wavs_for_messages(list(getattr(session, "messages", []) or []))
+
+    def _attach_voice_wav_to_message(self, session_id: str, message_id: str, wav_path: str) -> None:
+        if not session_id or not message_id or not wav_path:
+            return
+        s, msg = self._find_session_message(str(session_id), str(message_id))
+        if not s or not msg:
+            # The chat/message was deleted while Piper was still rendering.
+            self._delete_voice_wav_file(wav_path)
+            return
+        msg["voice_wav"] = wav_path
+        versions = msg.get("versions")
+        if isinstance(versions, list) and versions:
+            try:
+                idx = int(msg.get("active_version", 0) or 0)
+            except Exception:
+                idx = 0
+            idx = max(0, min(idx, len(versions) - 1))
+            if isinstance(versions[idx], dict):
+                versions[idx]["voice_wav"] = wav_path
+        self._queue_save()
+
+    def _ensure_piper_medium_voice_available(self) -> bool:
+        """Make sure the required Lessac medium voice exists; auto-run the bundled downloader if needed."""
+        if _piper_required_model_ready(self.fv_root):
+            return True
+
+        script = _piper_downloader_script(self.fv_root)
+        if not os.path.isfile(script):
+            self._set_status("Piper downloader missing: presets/extra_env/pipertts_downloader.py", "error")
+            return False
+
+        proc = getattr(self, "_piper_installer_process", None)
+        if proc is not None and proc.state() != QtCore.QProcess.NotRunning:
+            self._set_status("Installing Piper voice model…", "loading")
+            return False
+
+        proc = QtCore.QProcess(self)
+        proc.setProgram(sys.executable or "python")
+        proc.setArguments([script])
+        proc.setWorkingDirectory(self.fv_root)
+        proc.setProcessChannelMode(QtCore.QProcess.MergedChannels)
+        proc.finished.connect(self._on_piper_installer_finished)
+        try:
+            proc.errorOccurred.connect(lambda _err: self._on_piper_installer_error(proc))
+        except Exception:
+            pass
+        self._piper_installer_process = proc
+        self._set_status("Installing Piper voice model…", "loading")
+        proc.start()
+        if not proc.waitForStarted(3000):
+            self._set_status("Could not start Piper voice installer", "error")
+            self._piper_installer_process = None
+            return False
+        return False
+
+    def _on_piper_installer_error(self, proc: QtCore.QProcess) -> None:
+        try:
+            detail = bytes(proc.readAllStandardOutput()).decode("utf-8", "ignore").strip()
+        except Exception:
+            detail = ""
+        self._set_status("Piper voice installer failed to start", "error")
+        if detail:
+            print("[LLM Piper installer]", detail[-1200:])
+
+    def _on_piper_installer_finished(self, exit_code: int, exit_status: QtCore.QProcess.ExitStatus) -> None:
+        proc = getattr(self, "_piper_installer_process", None)
+        detail = ""
+        try:
+            if proc is not None:
+                detail = bytes(proc.readAllStandardOutput()).decode("utf-8", "ignore").strip()
+        except Exception:
+            detail = ""
+        self._piper_installer_process = None
+
+        # Auto-refresh: immediately rescan the expected model folder after the downloader exits.
+        model_path = _find_piper_model(self.fv_root)
+        if exit_status == QtCore.QProcess.NormalExit and int(exit_code) == 0 and model_path:
+            self._set_status("Voice answers enabled: en_US-lessac-medium", "ready")
+            return
+
+        msg = "Piper voice install finished, but en_US-lessac-medium was not found"
+        if detail:
+            msg += ": " + detail[-500:]
+        self._set_status(msg[:900], "error")
+        try:
+            if getattr(self, "chk_answer_voice", None) is not None:
+                self.chk_answer_voice.blockSignals(True)
+                self.chk_answer_voice.setChecked(False)
+                self.chk_answer_voice.blockSignals(False)
+            self.voice_answer_enabled = False
+            self._queue_save()
+        except Exception:
+            pass
+
+    def _answer_voice_toggled(self, checked: bool):
+        self.voice_answer_enabled = bool(checked)
+        self._queue_save()
+        if checked:
+            piper_exe = _find_piper_exe(self.fv_root)
+            if not piper_exe:
+                self._set_status("Piper not found in presets/bin/piper", "error")
+                return
+            if not self._ensure_piper_medium_voice_available():
+                return
+            self._set_status("Voice answers enabled: en_US-lessac-medium", "ready")
+        else:
+            self._set_status("Voice answers disabled", "idle")
+
+    def _speak_assistant_answer(self, text: str, session_id: str = "", message_id: str = "") -> None:
+        try:
+            if not bool(getattr(self, "voice_answer_enabled", False)):
+                return
+            if getattr(self, "chk_answer_voice", None) is not None and not self.chk_answer_voice.isChecked():
+                return
+            spoken = _strip_text_for_tts(text)
+            if not spoken:
+                return
+            piper_exe = _find_piper_exe(self.fv_root)
+            if not piper_exe:
+                self._set_status("Voice skipped: piper.exe not found", "error")
+                return
+            if not self._ensure_piper_medium_voice_available():
+                self._set_status("Voice will be available after Piper medium voice install finishes", "loading")
+                return
+            piper_model = _find_piper_model(self.fv_root)
+            if not piper_model:
+                self._set_status("Voice skipped: en_US-lessac-medium voice model not found", "error")
+                return
+            out_dir = _llm_voice_temp_dir(self.fv_root)
+            os.makedirs(out_dir, exist_ok=True)
+            out_path = os.path.join(out_dir, f"llm_answer_{datetime.now().strftime('%Y%m%d_%H%M%S')}_{uuid.uuid4().hex[:6]}.wav")
+            old_thread = getattr(self, "_piper_tts_thread", None)
+            if old_thread is not None and old_thread.isRunning():
+                try:
+                    old_thread.requestInterruption()
+                except Exception:
+                    pass
+            th = PiperTtsThread(piper_exe, piper_model, spoken, out_path, self)
+            self._piper_pending_session_id = str(session_id or "")
+            self._piper_pending_message_id = str(message_id or "")
+            th.succeeded.connect(lambda wav_path, sid=str(session_id or ""), mid=str(message_id or ""): self._on_piper_tts_ready(wav_path, sid, mid))
+            th.failed.connect(self._on_piper_tts_failed)
+            th.finished.connect(lambda: setattr(self, "_piper_tts_thread", None))
+            self._piper_tts_thread = th
+            self._set_status("Creating voice answer…", "loading")
+            th.start()
+        except Exception as e:
+            try:
+                self._set_status(f"Voice skipped: {e}", "error")
+            except Exception:
+                pass
+
+    def _on_piper_tts_ready(self, wav_path: str, session_id: str = "", message_id: str = "") -> None:
+        wav_path = str(wav_path or "")
+        if not wav_path or not os.path.isfile(wav_path):
+            return
+        try:
+            self._attach_voice_wav_to_message(session_id, message_id, wav_path)
+        except Exception:
+            pass
+        if QtMultimedia is None:
+            self._set_status(f"Voice saved: {os.path.relpath(wav_path, self.fv_root)}", "ready")
+            return
+        try:
+            player = getattr(self, "_piper_player", None)
+            audio = getattr(self, "_piper_audio", None)
+            if player is None:
+                player = QtMultimedia.QMediaPlayer(self)
+                audio = QtMultimedia.QAudioOutput(self)
+                try:
+                    audio.setVolume(0.9)
+                except Exception:
+                    pass
+                player.setAudioOutput(audio)
+                self._piper_player = player
+                self._piper_audio = audio
+            else:
+                try:
+                    player.stop()
+                except Exception:
+                    pass
+            player.setSource(QtCore.QUrl.fromLocalFile(wav_path))
+            player.play()
+            self._set_status("Playing voice answer", "ready")
+        except Exception as e:
+            self._set_status(f"Voice saved but could not play: {e}", "error")
+
+    def _on_piper_tts_failed(self, message: str) -> None:
+        msg = str(message or "Piper TTS failed").strip()
+        self._set_status("Piper voice failed", "error")
+        try:
+            QtWidgets.QMessageBox.warning(self, "Piper voice failed", msg[:1200])
+        except Exception:
+            pass
+
     def _send_message(self):
         try:
             self._show_chat_view()
@@ -7523,6 +7934,7 @@ class LlamaChatWindow(QtWidgets.QMainWindow):
         self._update_header()
         self._queue_save()
         self._set_status("Ready", "ready")
+        self._speak_assistant_answer(reply, s.id, mid)
 
     def _on_chat_failed(self, message: str):
         self._auto_retry_templates = []
