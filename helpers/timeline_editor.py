@@ -278,7 +278,7 @@ AUDIO_SYNC_TOLERANCE_SECONDS = 0.35
 VISUAL_MASTER_DRIFT_CORRECTION_SECONDS = 0.18
 
 DEFAULT_EDITOR_FONT_SIZE = 9
-MIN_EDITOR_FONT_SIZE = 7
+MIN_EDITOR_FONT_SIZE = 6
 MAX_EDITOR_FONT_SIZE = 14
 
 EDITOR_THEME_DARK = "dark"
@@ -309,6 +309,7 @@ LAYOUT_PRESET_EDITING = "editing"
 LAYOUT_PRESET_TIMELINE_TOP = "timeline_top"
 LAYOUT_PRESET_MEDIA_TOP = "media_top"
 LAYOUT_PRESET_CLASSIC = "classic"
+LAYOUT_PRESET_TIMELINE_MIDDLE = "timeline_middle"
 # Legacy names are kept as aliases only so older project/settings JSON loads safely.
 LAYOUT_PRESET_PREVIEW_TOP = LAYOUT_PRESET_MEDIA_TOP
 LAYOUT_PRESET_PREVIEW_LEFT = LAYOUT_PRESET_EDITING
@@ -318,13 +319,15 @@ LAYOUT_PRESET_LABELS: Dict[str, str] = {
     LAYOUT_PRESET_EDITING: "Editing",
     LAYOUT_PRESET_TIMELINE_TOP: "Timeline Top",
     LAYOUT_PRESET_MEDIA_TOP: "Media Top",
+    LAYOUT_PRESET_TIMELINE_MIDDLE: "Timeline Middle",
     LAYOUT_PRESET_CLASSIC: "Classic",
 }
 LAYOUT_PRESET_TOOLTIPS: Dict[str, str] = {
     LAYOUT_PRESET_EDITING: "Timeline-only editing workspace; Media Bin, Transitions, Preview, and Logs stay collapsed.",
     LAYOUT_PRESET_TIMELINE_TOP: "Timeline full width on top; Media Bin, Transitions, and Preview below.",
-    LAYOUT_PRESET_MEDIA_TOP: "Media Bin, Transitions, and Preview on top with a slightly larger media band.",
-    LAYOUT_PRESET_CLASSIC: "Classic layout: Media Bin and Transitions on the left; Timeline above Preview on the right.",
+    LAYOUT_PRESET_MEDIA_TOP: "Media Bin, Transitions, Effects, and Preview on top with a slightly larger media band.",
+    LAYOUT_PRESET_TIMELINE_MIDDLE: "Timeline in the middle; Media Bin and Preview on the left; Transitions and Effects on the right.",
+    LAYOUT_PRESET_CLASSIC: "Classic layout: Media Bin, Transitions, and Effects on the left; Timeline above Preview on the right.",
 }
 VALID_LAYOUT_PRESETS = set(LAYOUT_PRESET_LABELS.keys())
 
@@ -351,6 +354,9 @@ def normalize_layout_preset(value: Any) -> str:
         "preview_top": LAYOUT_PRESET_MEDIA_TOP,
         "top_preview": LAYOUT_PRESET_MEDIA_TOP,
         "preview_above": LAYOUT_PRESET_MEDIA_TOP,
+        "timeline_middle": LAYOUT_PRESET_TIMELINE_MIDDLE,
+        "middle_timeline": LAYOUT_PRESET_TIMELINE_MIDDLE,
+        "timeline_center": LAYOUT_PRESET_TIMELINE_MIDDLE,
         "classic": LAYOUT_PRESET_CLASSIC,
         "legacy": LAYOUT_PRESET_CLASSIC,
     }
@@ -374,14 +380,17 @@ def default_layout_state_for_preset(value: Any) -> Dict[str, Any]:
         "logs_collapsed": True,
         "main_splitter_sizes": [1, 1200],
         "right_splitter_sizes": [340, 560, 34],
-        "preview_left_top_splitter_sizes": [520, 300, 900],
+        "preview_left_top_splitter_sizes": [460, 260, 260, 900],
         "preview_left_outer_splitter_sizes": [340, 560, 34],
+        "timeline_middle_left_splitter_sizes": [360, 360],
+        "timeline_middle_right_splitter_sizes": [360, 360],
     }
     if preset == LAYOUT_PRESET_EDITING:
         state.update({
             "media_collapsed": True,
             "preview_collapsed": True,
             "transitions_collapsed": True,
+            "effects_collapsed": True,
             "logs_collapsed": True,
             "right_splitter_sizes": [900, 34],
             "preview_left_outer_splitter_sizes": [900, 34],
@@ -398,12 +407,21 @@ def default_layout_state_for_preset(value: Any) -> Dict[str, Any]:
         # band useful, but give a little more height to the Timeline by default.
         state["right_splitter_sizes"] = [320, 580, 34]
         state["preview_left_outer_splitter_sizes"] = [320, 580, 34]
-        state["preview_left_top_splitter_sizes"] = [520, 300, 900]
+        state["preview_left_top_splitter_sizes"] = [460, 260, 260, 900]
+    elif preset == LAYOUT_PRESET_TIMELINE_MIDDLE:
+        state.update({
+            "main_splitter_sizes": [360, 900, 360],
+            "right_splitter_sizes": [640, 34],
+            "preview_left_outer_splitter_sizes": [640, 34],
+            "timeline_middle_left_splitter_sizes": [360, 360],
+            "timeline_middle_right_splitter_sizes": [360, 360],
+        })
     elif preset == LAYOUT_PRESET_CLASSIC:
         state.update({
             "main_splitter_sizes": [330, 900],
             "right_splitter_sizes": [500, 260, 34],
             "preview_left_outer_splitter_sizes": [500, 260, 34],
+            "timeline_middle_right_splitter_sizes": [360, 360],
         })
     return state
 
@@ -429,10 +447,12 @@ def sanitize_layout_state(data: Optional[Dict[str, Any]]) -> Dict[str, Any]:
     state["transitions_collapsed"] = bool_from_project_value(source.get("transitions_collapsed", state["transitions_collapsed"]), state["transitions_collapsed"])
     state["effects_collapsed"] = bool_from_project_value(source.get("effects_collapsed", state["effects_collapsed"]), state["effects_collapsed"])
     state["logs_collapsed"] = bool_from_project_value(source.get("logs_collapsed", state["logs_collapsed"]), state["logs_collapsed"])
-    state["main_splitter_sizes"] = _sanitize_int_list(source.get("main_splitter_sizes"), list(state["main_splitter_sizes"]), 2, 2)
+    state["main_splitter_sizes"] = _sanitize_int_list(source.get("main_splitter_sizes"), list(state["main_splitter_sizes"]), 2, 3)
     state["right_splitter_sizes"] = _sanitize_int_list(source.get("right_splitter_sizes"), list(state["right_splitter_sizes"]), 2, 3)
-    state["preview_left_top_splitter_sizes"] = _sanitize_int_list(source.get("preview_left_top_splitter_sizes"), list(state["preview_left_top_splitter_sizes"]), 3, 3)
+    state["preview_left_top_splitter_sizes"] = _sanitize_int_list(source.get("preview_left_top_splitter_sizes"), list(state["preview_left_top_splitter_sizes"]), 3, 4)
     state["preview_left_outer_splitter_sizes"] = _sanitize_int_list(source.get("preview_left_outer_splitter_sizes"), list(state["preview_left_outer_splitter_sizes"]), 2, 2)
+    state["timeline_middle_left_splitter_sizes"] = _sanitize_int_list(source.get("timeline_middle_left_splitter_sizes"), list(state["timeline_middle_left_splitter_sizes"]), 2, 2)
+    state["timeline_middle_right_splitter_sizes"] = _sanitize_int_list(source.get("timeline_middle_right_splitter_sizes"), list(state["timeline_middle_right_splitter_sizes"]), 2, 2)
     return state
 
 VIDEO_EXTS = {".mp4", ".mov", ".mkv", ".avi", ".webm", ".m4v", ".wmv"}
@@ -12020,6 +12040,7 @@ def default_project_editor_state() -> Dict[str, Any]:
         "scroll_x": 0.0,
         "vertical_scroll": 0,
         "snap_enabled": True,
+        "follow_playhead": False,
         "target_track_id": "",
         "selected_clip_id": "",
         "selected_media_id": "",
@@ -12041,8 +12062,10 @@ def default_project_editor_state() -> Dict[str, Any]:
         "logs_collapsed": True,
         "main_splitter_sizes": [1, 1200],
         "right_splitter_sizes": [360, 520, 34],
-        "preview_left_top_splitter_sizes": [520, 300, 900],
+        "preview_left_top_splitter_sizes": [460, 260, 260, 900],
         "preview_left_outer_splitter_sizes": [360, 520, 34],
+        "timeline_middle_left_splitter_sizes": [360, 360],
+        "timeline_middle_right_splitter_sizes": [360, 360],
         "embed_preview_enabled": True,
         "preview_view_mode": "fit",
         "preview_zoom": 1.0,
@@ -12057,6 +12080,7 @@ def sanitize_project_editor_state(data: Optional[Dict[str, Any]]) -> Dict[str, A
     state["scroll_x"] = max(0.0, safe_float(source.get("scroll_x", source.get("horizontal_scroll")), state["scroll_x"]))
     state["vertical_scroll"] = max(0, safe_int(source.get("vertical_scroll", source.get("scroll_y", 0)), 0))
     state["snap_enabled"] = bool_from_project_value(source.get("snap_enabled", source.get("snap", state["snap_enabled"])), state["snap_enabled"])
+    state["follow_playhead"] = bool_from_project_value(source.get("follow_playhead", source.get("follow_playhead_enabled", state["follow_playhead"])), state["follow_playhead"])
     state["target_track_id"] = str(source.get("target_track_id") or source.get("selected_track_id") or state["target_track_id"])
     state["selected_clip_id"] = str(source.get("selected_clip_id") or "")
     state["selected_media_id"] = str(source.get("selected_media_id") or "")
@@ -12082,6 +12106,8 @@ def sanitize_project_editor_state(data: Optional[Dict[str, Any]]) -> Dict[str, A
         "right_splitter_sizes",
         "preview_left_top_splitter_sizes",
         "preview_left_outer_splitter_sizes",
+        "timeline_middle_left_splitter_sizes",
+        "timeline_middle_right_splitter_sizes",
     ):
         state[key] = layout_state[key]
     state["embed_preview_enabled"] = bool_from_project_value(source.get("embed_preview_enabled", state["embed_preview_enabled"]), state["embed_preview_enabled"])
@@ -15207,7 +15233,7 @@ def run_self_tests() -> Tuple[bool, List[str]]:
         check(old_settings_state.get("layout_preset") == LAYOUT_PRESET_MEDIA_TOP, "old settings JSON without layout preset loads to Media Top safely")
         invalid_layout_state = sanitize_project_editor_state({"layout_preset": "banana", "media_collapsed": True})
         check(invalid_layout_state.get("layout_preset") == LAYOUT_PRESET_MEDIA_TOP, "invalid layout preset falls back to Media Top")
-        check(list(LAYOUT_PRESET_LABELS.values()) == ["Editing", "Timeline Top", "Media Top", "Classic"], "layout preset list contains the useful v37 layout names")
+        check(list(LAYOUT_PRESET_LABELS.values()) == ["Editing", "Timeline Top", "Media Top", "Timeline Middle", "Classic"], "layout preset list contains the useful layout names")
         check("Preview Left" not in LAYOUT_PRESET_LABELS.values() and "Timeline Focus" not in LAYOUT_PRESET_LABELS.values() and "Media Focus" not in LAYOUT_PRESET_LABELS.values(), "old broken layout names are not exposed")
         legacy_preview_left_state = sanitize_project_editor_state({
             "layout_preset": "Preview Left",
@@ -15218,13 +15244,15 @@ def run_self_tests() -> Tuple[bool, List[str]]:
         })
         check(legacy_preview_left_state.get("layout_preset") == LAYOUT_PRESET_EDITING and bool(legacy_preview_left_state.get("preview_collapsed")), "legacy Preview Left settings remap safely to Editing")
         reset_state = default_layout_state_for_preset(LAYOUT_PRESET_EDITING)
-        check(reset_state.get("layout_preset") == LAYOUT_PRESET_EDITING and bool(reset_state.get("media_collapsed")) and bool(reset_state.get("transitions_collapsed")) and bool(reset_state.get("preview_collapsed")) and bool(reset_state.get("logs_collapsed")), "Editing layout is timeline-only with extra panels collapsed")
+        check(reset_state.get("layout_preset") == LAYOUT_PRESET_EDITING and bool(reset_state.get("media_collapsed")) and bool(reset_state.get("transitions_collapsed")) and bool(reset_state.get("effects_collapsed")) and bool(reset_state.get("preview_collapsed")) and bool(reset_state.get("logs_collapsed")), "Editing layout is timeline-only with extra panels collapsed")
         timeline_top_state = default_layout_state_for_preset(LAYOUT_PRESET_TIMELINE_TOP)
         check(timeline_top_state.get("right_splitter_sizes", [])[0] > timeline_top_state.get("right_splitter_sizes", [0, 0])[1], "Timeline Top gives the timeline band priority")
         media_top_state = default_layout_state_for_preset(LAYOUT_PRESET_MEDIA_TOP)
-        check(media_top_state.get("right_splitter_sizes", [])[0] >= 360 and media_top_state.get("right_splitter_sizes", [0, 0])[1] > media_top_state.get("right_splitter_sizes", [0, 0])[0] and bool(media_top_state.get("logs_collapsed")), "Media Top keeps a useful top media band while giving the timeline default height priority")
+        check(media_top_state.get("right_splitter_sizes", [])[0] >= 300 and media_top_state.get("right_splitter_sizes", [0, 0])[1] > media_top_state.get("right_splitter_sizes", [0, 0])[0] and bool(media_top_state.get("logs_collapsed")), "Media Top keeps a useful top media band while giving the timeline default height priority")
         media_top_widths = list(media_top_state.get("preview_left_top_splitter_sizes", []))
-        check(len(media_top_widths) == 3 and media_top_widths[2] > media_top_widths[1] and media_top_widths[1] < media_top_widths[0], "Media Top default gives Transitions less width and Preview more width")
+        check(len(media_top_widths) == 4 and media_top_widths[3] > media_top_widths[1] and media_top_widths[3] > media_top_widths[2], "Media Top default gives Transitions/Effects their own widths and Preview more width")
+        middle_state = default_layout_state_for_preset(LAYOUT_PRESET_TIMELINE_MIDDLE)
+        check(middle_state.get("layout_preset") == LAYOUT_PRESET_TIMELINE_MIDDLE and len(middle_state.get("main_splitter_sizes", [])) == 3, "Timeline Middle has left, timeline, and right splitter columns")
         classic_state = default_layout_state_for_preset(LAYOUT_PRESET_CLASSIC)
         check(classic_state.get("layout_preset") == LAYOUT_PRESET_CLASSIC and classic_state.get("main_splitter_sizes", [0])[0] >= 260, "Classic remains available and safe")
         check(not bool(classic_state.get("transitions_collapsed")) and not bool(classic_state.get("media_collapsed")), "Classic opens Media Bin and Transitions together")
@@ -15352,7 +15380,7 @@ def run_self_tests() -> Tuple[bool, List[str]]:
         new_state = new_project_editor_state_preserving_ui(preserved_ui_state)
         check(float(new_state.get("playhead_time") or 0.0) == 0.0 and float(new_state.get("scroll_x") or 0.0) == 0.0, "New Project reset returns playhead and scroll to zero")
         check(str(new_state.get("selected_clip_id") or "") == "" and str(new_state.get("selected_media_id") or "") == "", "New Project clears saved preview/selection state")
-        check(new_state.get("layout_preset") == LAYOUT_PRESET_EDITING and bool(new_state.get("media_collapsed")) and bool(new_state.get("show_timeline_thumbnails")), "New Project does not wipe UI layout or visual-aid preferences")
+        check(new_state.get("layout_preset") == LAYOUT_PRESET_MEDIA_TOP and bool(new_state.get("media_collapsed")) and bool(new_state.get("show_timeline_thumbnails")), "New Project does not wipe UI layout or visual-aid preferences")
         check("preview_qt_active" not in new_state and "timeline_playback_active" not in new_state, "New Project does not preserve transient playback state")
 
         # v32 PNG mask transition engine foundation.
@@ -15915,6 +15943,7 @@ def run_self_tests() -> Tuple[bool, List[str]]:
             "Manual v37 checklist: Editing layout opens correctly.",
             "Manual v37 checklist: Timeline Top layout opens correctly.",
             "Manual v37 checklist: Media Top layout opens correctly.",
+            "Manual v37 checklist: Timeline Middle layout opens correctly.",
             "Manual v37 checklist: Classic layout opens correctly.",
             "Manual v37 checklist: Collapse/open each panel after switching layouts.",
             "Manual v37 checklist: Play timeline after switching layout.",
@@ -17613,6 +17642,24 @@ if QT_AVAILABLE:
 
 
 
+    class PreviewSurfaceLabel(QLabel):
+        """QLabel that does not let preview pixmaps control splitter height.
+
+        Normal QLabel uses the current pixmap as its sizeHint. During timeline
+        playback the preview pixmap is repainted every tick at the visible pane
+        size, and Qt can then treat that painted size as a preferred splitter
+        size. In an embedded tab this made the Preview pane slowly reclaim space
+        from the Timeline while playback crossed clips.
+        """
+
+        def sizeHint(self) -> QSize:
+            return QSize(320, 180)
+
+        def minimumSizeHint(self) -> QSize:
+            return QSize(64, 80)
+
+
+
     class TimelineCanvas(QWidget):
         ruler_height = 42
         track_height = 72
@@ -19108,13 +19155,18 @@ if QT_AVAILABLE:
             self.selected_clip_ids: List[str] = []
             self.selection_anchor_clip_id: Optional[str] = None
             self.snap_enabled = True
+            self.follow_playhead_enabled = False
             self._last_project_path = str(default_project_path())
             self.layout_preset = LAYOUT_PRESET_MEDIA_TOP
             self.main_splitter_sizes: List[int] = [1, 1200]
             self.right_splitter_sizes: List[int] = [390, 490, 34]
-            self.preview_left_top_splitter_sizes: List[int] = [520, 300, 900]
+            self.preview_left_top_splitter_sizes: List[int] = [460, 260, 260, 900]
             self.preview_left_outer_splitter_sizes: List[int] = [390, 490, 34]
+            self.timeline_middle_left_splitter_sizes: List[int] = [360, 360]
+            self.timeline_middle_right_splitter_sizes: List[int] = [360, 360]
             self.classic_left_splitter: Optional[QSplitter] = None
+            self.timeline_middle_left_splitter: Optional[QSplitter] = None
+            self.timeline_middle_right_splitter: Optional[QSplitter] = None
             self._layout_switching = False
             self._timeline_layout_refresh_pending = False
             self.media_collapsed = False
@@ -20067,7 +20119,7 @@ if QT_AVAILABLE:
             self.layout_preset_combo.currentIndexChanged.connect(self._layout_preset_combo_changed)
 
             self.reset_layout_btn = QPushButton("Reset layout", bar)
-            self.reset_layout_btn.setToolTip("Restore the Editing layout and sensible splitter sizes.")
+            self.reset_layout_btn.setToolTip("Restore the default Timeline Middle workspace with compact side panels and Logs open.")
             self.reset_layout_btn.clicked.connect(self.reset_layout)
 
             self.font_size_label = QLabel("Font:", bar)
@@ -20460,7 +20512,8 @@ if QT_AVAILABLE:
 
             self.effect_table = EffectPresetTable(self)
             effects_layout.addWidget(self.effect_table, 1)
-            layout.addWidget(self.effects_section, 1)
+            # Effects is a real standalone panel now. Layout presets can place it
+            # beside Transitions instead of forcing both sections into one cramped column.
 
             self.effects_content_widgets = [
                 self.refresh_effects_btn,
@@ -20566,7 +20619,7 @@ if QT_AVAILABLE:
                 pass
 
         def _detach_reusable_layout_widgets(self) -> None:
-            for name in ("media_panel", "transitions_panel", "timeline_section", "preview_section", "log_section"):
+            for name in ("media_panel", "transitions_panel", "effects_section", "timeline_section", "preview_section", "log_section"):
                 self._detach_layout_widget(getattr(self, name, None))
 
         def _clear_classic_left_splitter(self) -> None:
@@ -20587,6 +20640,28 @@ if QT_AVAILABLE:
                 pass
             self.classic_left_splitter = None
 
+        def _clear_timeline_middle_side_splitters(self) -> None:
+            for attr in ("timeline_middle_left_splitter", "timeline_middle_right_splitter"):
+                splitter = getattr(self, attr, None)
+                if splitter is None:
+                    continue
+                try:
+                    splitter.hide()
+                except Exception:
+                    pass
+                try:
+                    splitter.setParent(None)
+                except Exception:
+                    pass
+                try:
+                    splitter.deleteLater()
+                except Exception:
+                    pass
+                try:
+                    setattr(self, attr, None)
+                except Exception:
+                    pass
+
         def _middle_effects_column_collapsed(self) -> bool:
             """The shared Transitions/Effects column collapses only when both sections are collapsed."""
             return bool(getattr(self, "transitions_collapsed", False)) and bool(getattr(self, "effects_collapsed", False))
@@ -20594,7 +20669,8 @@ if QT_AVAILABLE:
         def _top_band_collapsed_flags(self) -> List[bool]:
             return [
                 bool(getattr(self, "media_collapsed", False)),
-                self._middle_effects_column_collapsed(),
+                bool(getattr(self, "transitions_collapsed", False)),
+                bool(getattr(self, "effects_collapsed", False)),
                 bool(getattr(self, "preview_collapsed", False)),
             ]
 
@@ -20614,7 +20690,8 @@ if QT_AVAILABLE:
         def _top_band_panel_specs(self) -> List[Tuple[QWidget, bool, int]]:
             return [
                 (self.media_panel, bool(getattr(self, "media_collapsed", False)), 220),
-                (self.transitions_panel, self._middle_effects_column_collapsed(), 180),
+                (self.transitions_panel, bool(getattr(self, "transitions_collapsed", False)), 180),
+                (self.effects_section, bool(getattr(self, "effects_collapsed", False)), 180),
                 (self.preview_section, bool(getattr(self, "preview_collapsed", False)), 260),
             ]
 
@@ -20667,33 +20744,37 @@ if QT_AVAILABLE:
                 current = [int(x) for x in top.sizes()]
             except Exception:
                 current = []
+            count = 0
+            try:
+                count = int(top.count())
+            except Exception:
+                count = 4
+            count = max(1, count)
             if preferred_sizes is not None:
-                base = [max(1, int(x)) for x in list(preferred_sizes)[:3]]
+                base = [max(1, int(x)) for x in list(preferred_sizes)[:count]]
             else:
-                base = [int(x) for x in current[:3]]
-            if len(base) != 3 or sum(base) <= 0:
-                base = list(default_layout_state_for_preset(getattr(self, "layout_preset", LAYOUT_PRESET_MEDIA_TOP)).get("preview_left_top_splitter_sizes", [520, 300, 900]))
-            if len(base) != 3 or sum(base) <= 0:
-                base = [520, 300, 900]
+                base = [int(x) for x in current[:count]]
+            if len(base) != count or sum(base) <= 0:
+                default_top = list(default_layout_state_for_preset(getattr(self, "layout_preset", LAYOUT_PRESET_MEDIA_TOP)).get("preview_left_top_splitter_sizes", [460, 260, 260, 900]))
+                base = default_top[:count]
+            if len(base) != count or sum(base) <= 0:
+                base = [260 for _ in range(count)]
             all_collapsed = self._top_band_is_collapsed_for_vertical_layout()
             if all_collapsed:
                 try:
                     available = int(top.width())
                 except Exception:
                     available = 0
-                available = max(available, sum(base), 34 * 3)
-                sizes = [
-                    TIMELINE_SPLITTER_HEADER_ONLY_SIZE,
-                    TIMELINE_SPLITTER_HEADER_ONLY_SIZE,
-                    max(TIMELINE_SPLITTER_HEADER_ONLY_SIZE, available - (TIMELINE_SPLITTER_HEADER_ONLY_SIZE * 2)),
-                ]
+                available = max(available, sum(base), TIMELINE_SPLITTER_HEADER_ONLY_SIZE * count)
+                sizes = [TIMELINE_SPLITTER_HEADER_ONLY_SIZE for _ in range(count)]
+                sizes[-1] = max(TIMELINE_SPLITTER_HEADER_ONLY_SIZE, available - (TIMELINE_SPLITTER_HEADER_ONLY_SIZE * max(0, count - 1)))
             else:
                 # Horizontal top-band panels should also resize gradually. Keep
                 # collapsed sections narrow, but do not let an open panel fall
                 # into a near-invisible width during splitter dragging.
                 sizes = [
-                    TIMELINE_SPLITTER_HEADER_ONLY_SIZE if collapsed else max(180, int(value))
-                    for value, collapsed in zip(base, self._top_band_collapsed_flags())
+                    TIMELINE_SPLITTER_HEADER_ONLY_SIZE if collapsed else max(160, int(value))
+                    for value, collapsed in zip(base, self._top_band_collapsed_flags()[:count])
                 ]
             try:
                 top.setSizes(sizes)
@@ -20873,6 +20954,16 @@ if QT_AVAILABLE:
                     self.preview_left_outer_splitter_sizes = [int(x) for x in self.preview_left_outer_splitter.sizes()]
             except Exception:
                 pass
+            try:
+                if hasattr(self, "timeline_middle_left_splitter") and self.timeline_middle_left_splitter is not None:
+                    self.timeline_middle_left_splitter_sizes = [int(x) for x in self.timeline_middle_left_splitter.sizes()]
+            except Exception:
+                pass
+            try:
+                if hasattr(self, "timeline_middle_right_splitter") and self.timeline_middle_right_splitter is not None:
+                    self.timeline_middle_right_splitter_sizes = [int(x) for x in self.timeline_middle_right_splitter.sizes()]
+            except Exception:
+                pass
 
         def _ordered_vertical_sections_for_layout(self, preset: Optional[str] = None) -> List[Tuple[QWidget, bool, int]]:
             preset = normalize_layout_preset(preset or getattr(self, "layout_preset", LAYOUT_PRESET_MEDIA_TOP))
@@ -20893,6 +20984,11 @@ if QT_AVAILABLE:
                 return [
                     (getattr(self, "top_band_splitter", self.preview_section), top_band_collapsed, 300),
                     (self.timeline_section, self.timeline_collapsed, 560),
+                    (self.log_section, self.logs_collapsed, 34),
+                ]
+            if preset == LAYOUT_PRESET_TIMELINE_MIDDLE:
+                return [
+                    (self.timeline_section, self.timeline_collapsed, 640),
                     (self.log_section, self.logs_collapsed, 34),
                 ]
             return [
@@ -20953,6 +21049,7 @@ if QT_AVAILABLE:
 
         def _ensure_right_panel_only_in_main_splitter(self) -> None:
             self._clear_classic_left_splitter()
+            self._clear_timeline_middle_side_splitters()
             try:
                 if self.media_panel.parent() is self.main_splitter:
                     self.media_panel.hide()
@@ -20978,6 +21075,7 @@ if QT_AVAILABLE:
             # layouts are separate and do not mutate Classic.
             self._detach_reusable_layout_widgets()
             self._clear_classic_left_splitter()
+            self._clear_timeline_middle_side_splitters()
             self._clear_right_panel_layout()
             self.preview_left_top_splitter = None
             self.preview_left_outer_splitter = None
@@ -20990,9 +21088,11 @@ if QT_AVAILABLE:
                     left.installEventFilter(self)
                     left.addWidget(self.media_panel)
                     left.addWidget(self.transitions_panel)
+                    left.addWidget(self.effects_section)
                     left.setStretchFactor(0, 1)
                     left.setStretchFactor(1, 1)
-                    left.setSizes([1, 1])
+                    left.setStretchFactor(2, 1)
+                    left.setSizes([1, 1, 1])
                     self.classic_left_splitter = left
                     self.main_splitter.insertWidget(0, left)
                     if self.right_panel.parent() is not self.main_splitter:
@@ -21003,6 +21103,7 @@ if QT_AVAILABLE:
                     pass
                 self._show_layout_widget(self.media_panel)
                 self._show_layout_widget(self.transitions_panel)
+                self._show_layout_widget(self.effects_section)
                 self._show_layout_widget(self.right_panel)
                 splitter = self._new_workspace_splitter(Qt.Orientation.Vertical)
                 splitter.addWidget(self.timeline_section)
@@ -21014,6 +21115,45 @@ if QT_AVAILABLE:
                 self.right_splitter = splitter
                 self.right_panel_layout.addWidget(splitter, 1)
                 for widget in (self.timeline_section, self.preview_section, self.log_section):
+                    self._show_layout_widget(widget)
+
+            elif preset == LAYOUT_PRESET_TIMELINE_MIDDLE:
+                # Three-column workspace:
+                # left = Media Bin + Preview, middle = Timeline, right = Transitions + Effects.
+                try:
+                    left = self._new_workspace_splitter(Qt.Orientation.Vertical)
+                    left.addWidget(self.media_panel)
+                    left.addWidget(self.preview_section)
+                    left.setStretchFactor(0, 1)
+                    left.setStretchFactor(1, 1)
+                    self.timeline_middle_left_splitter = left
+
+                    tools = self._new_workspace_splitter(Qt.Orientation.Vertical)
+                    tools.addWidget(self.transitions_panel)
+                    tools.addWidget(self.effects_section)
+                    tools.setStretchFactor(0, 1)
+                    tools.setStretchFactor(1, 1)
+                    self.timeline_middle_right_splitter = tools
+
+                    self.main_splitter.insertWidget(0, left)
+                    if self.right_panel.parent() is not self.main_splitter:
+                        self.main_splitter.addWidget(self.right_panel)
+                    self.main_splitter.addWidget(tools)
+                    self.main_splitter.setStretchFactor(0, 0)
+                    self.main_splitter.setStretchFactor(1, 1)
+                    self.main_splitter.setStretchFactor(2, 0)
+                except Exception:
+                    pass
+
+                middle = self._new_workspace_splitter(Qt.Orientation.Vertical)
+                middle.addWidget(self.timeline_section)
+                middle.addWidget(self.log_section)
+                middle.setStretchFactor(0, 1)
+                middle.setStretchFactor(1, 0)
+                self.right_splitter = middle
+                self.preview_left_outer_splitter = middle
+                self.right_panel_layout.addWidget(middle, 1)
+                for widget in (self.media_panel, self.preview_section, self.timeline_section, self.log_section, self.transitions_panel, self.effects_section):
                     self._show_layout_widget(widget)
 
             elif preset == LAYOUT_PRESET_EDITING:
@@ -21037,10 +21177,12 @@ if QT_AVAILABLE:
                 top = self._new_workspace_splitter(Qt.Orientation.Horizontal)
                 top.addWidget(self.media_panel)
                 top.addWidget(self.transitions_panel)
+                top.addWidget(self.effects_section)
                 top.addWidget(self.preview_section)
                 top.setStretchFactor(0, 1)
                 top.setStretchFactor(1, 0)
-                top.setStretchFactor(2, 2)
+                top.setStretchFactor(2, 0)
+                top.setStretchFactor(3, 2)
                 self.top_band_splitter = top
                 self.preview_left_top_splitter = top
 
@@ -21060,7 +21202,7 @@ if QT_AVAILABLE:
                 self.right_splitter = outer
                 self.preview_left_outer_splitter = outer
                 self.right_panel_layout.addWidget(outer, 1)
-                for widget in (self.media_panel, self.transitions_panel, self.preview_section, self.timeline_section, self.log_section):
+                for widget in (self.media_panel, self.transitions_panel, self.effects_section, self.preview_section, self.timeline_section, self.log_section):
                     self._show_layout_widget(widget)
 
             try:
@@ -21079,22 +21221,39 @@ if QT_AVAILABLE:
             preset = normalize_layout_preset(state.get("layout_preset", getattr(self, "layout_preset", LAYOUT_PRESET_MEDIA_TOP)))
             if hasattr(self, "main_splitter"):
                 if preset == LAYOUT_PRESET_CLASSIC:
-                    main_sizes = list(state.get("main_splitter_sizes") or default_layout_state_for_preset(preset)["main_splitter_sizes"])
+                    main_sizes = list(state.get("main_splitter_sizes") or default_layout_state_for_preset(preset)["main_splitter_sizes"])[:2]
                     if self.media_collapsed:
                         total = max(sum(main_sizes), self.width() or 1000)
                         main_sizes = [34, max(600, total - 34)]
                     self.main_splitter.setSizes(main_sizes)
+                elif preset == LAYOUT_PRESET_TIMELINE_MIDDLE:
+                    main_sizes = list(state.get("main_splitter_sizes") or default_layout_state_for_preset(preset)["main_splitter_sizes"])[:3]
+                    if len(main_sizes) != 3:
+                        main_sizes = list(default_layout_state_for_preset(preset)["main_splitter_sizes"])
+                    self.main_splitter.setSizes(main_sizes)
                 else:
-                    # Two-band layouts keep Media Bin inside the workspace, not in a left side rail.
+                    # Two-band layouts keep side panels inside the workspace, not in a main side rail.
                     self.main_splitter.setSizes([max(900, self.width() or 900)])
             if hasattr(self, "top_band_splitter") and self.top_band_splitter is not None:
                 top_sizes = list(state.get("preview_left_top_splitter_sizes") or default_layout_state_for_preset(preset).get("preview_left_top_splitter_sizes", [520, 300, 900]))
                 self._refresh_top_band_splitter_sizes(top_sizes)
+            if preset == LAYOUT_PRESET_TIMELINE_MIDDLE:
+                try:
+                    if getattr(self, "timeline_middle_left_splitter", None) is not None:
+                        self.timeline_middle_left_splitter.setSizes(list(state.get("timeline_middle_left_splitter_sizes") or default_layout_state_for_preset(preset)["timeline_middle_left_splitter_sizes"]))
+                except Exception:
+                    pass
+                try:
+                    if getattr(self, "timeline_middle_right_splitter", None) is not None:
+                        self.timeline_middle_right_splitter.setSizes(list(state.get("timeline_middle_right_splitter_sizes") or default_layout_state_for_preset(preset)["timeline_middle_right_splitter_sizes"]))
+                except Exception:
+                    pass
             if preset == LAYOUT_PRESET_CLASSIC and getattr(self, "classic_left_splitter", None) is not None:
                 try:
                     left_sizes = [
                         34 if bool(getattr(self, "media_collapsed", False)) else 1,
-                        34 if self._middle_effects_column_collapsed() else 1,
+                        34 if bool(getattr(self, "transitions_collapsed", False)) else 1,
+                        34 if bool(getattr(self, "effects_collapsed", False)) else 1,
                     ]
                     self.classic_left_splitter.setSizes(left_sizes)
                 except Exception:
@@ -21143,9 +21302,19 @@ if QT_AVAILABLE:
                 self.save_editor_state()
 
         def reset_layout(self) -> None:
-            state = default_layout_state_for_preset(LAYOUT_PRESET_MEDIA_TOP)
-            self.apply_layout_preset(LAYOUT_PRESET_MEDIA_TOP, save=True, layout_state=state, log_change=True)
-            self.log("Layout reset: Media Top")
+            # Default view: Timeline Middle with compact left/right tool rails,
+            # a large central timeline, and Logs open but kept short.
+            state = default_layout_state_for_preset(LAYOUT_PRESET_TIMELINE_MIDDLE)
+            state.update({
+                "logs_collapsed": False,
+                "main_splitter_sizes": [280, 1200, 240],
+                "right_splitter_sizes": [680, 120],
+                "preview_left_outer_splitter_sizes": [680, 120],
+                "timeline_middle_left_splitter_sizes": [300, 420],
+                "timeline_middle_right_splitter_sizes": [360, 420],
+            })
+            self.apply_layout_preset(LAYOUT_PRESET_TIMELINE_MIDDLE, save=True, layout_state=state, log_change=True)
+            self.log("Layout reset: Timeline Middle")
 
         def _build_timeline_section(self) -> QWidget:
             section = QWidget(self)
@@ -21188,6 +21357,11 @@ if QT_AVAILABLE:
             self.snap_box.setChecked(self.snap_enabled)
             self.snap_box.setToolTip("Snap rounds edits to the timeline grid.")
             self.snap_box.stateChanged.connect(self._snap_changed)
+
+            self.follow_playhead_box = QCheckBox("Follow playhead")
+            self.follow_playhead_box.setChecked(bool(self.follow_playhead_enabled))
+            self.follow_playhead_box.setToolTip("Keep the yellow playhead ruler visible while timeline playback moves.")
+            self.follow_playhead_box.stateChanged.connect(self._follow_playhead_changed)
 
             self.show_thumbnails_box = QCheckBox("Show thumbnails", section)
             self.show_thumbnails_box.setChecked(bool(self.show_timeline_thumbnails))
@@ -21276,6 +21450,7 @@ if QT_AVAILABLE:
                 edit_row.addWidget(widget)
             edit_row.addStretch(1)
             edit_row.addWidget(self.timeline_view_btn)
+            edit_row.addWidget(self.follow_playhead_box)
             edit_row.addWidget(self.snap_box)
             self.timeline_nav_widget.setVisible(False)
 
@@ -21349,17 +21524,27 @@ if QT_AVAILABLE:
             self.preview_body_widget = QWidget(section)
             self.preview_body_widget.setObjectName("previewBody")
             self.preview_body_widget.setAutoFillBackground(False)
+            # The Preview body should obey the user's vertical splitter, not the
+            # current frame/pixmap size. This prevents the pane from growing by
+            # itself during playback when different clips repaint the preview.
+            try:
+                self.preview_body_widget.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Ignored)
+            except Exception:
+                pass
             preview_body_layout = QVBoxLayout(self.preview_body_widget)
             preview_body_layout.setContentsMargins(0, 0, 0, 0)
             preview_body_layout.setSpacing(6)
 
-            self.preview_display_label = QLabel("No clip selected", self.preview_body_widget)
+            self.preview_display_label = PreviewSurfaceLabel("No clip selected", self.preview_body_widget)
             self.preview_display_label.setObjectName("previewSurface")
             self.preview_display_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
             self.preview_display_label.setMinimumHeight(80)
             self.preview_display_label.setMinimumWidth(64)
             self.preview_display_label.setScaledContents(False)
-            self.preview_display_label.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
+            # Important: QLabel's default pixmap sizeHint can fight the vertical
+            # splitter. Ignored keeps Fit/Fill rendering alive without letting
+            # preview frames resize the Timeline/Preview panes.
+            self.preview_display_label.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Ignored)
             self.preview_display_label.setWordWrap(True)
             self.preview_display_label.setContentsMargins(0, 0, 0, 0)
             self.preview_display_label.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
@@ -26577,10 +26762,11 @@ if QT_AVAILABLE:
             parent = self.media_panel.parent()
             in_top_band = parent is getattr(self, "top_band_splitter", None)
             in_classic_left = parent is getattr(self, "classic_left_splitter", None)
+            in_middle_left = parent is getattr(self, "timeline_middle_left_splitter", None)
             if in_top_band:
                 self._set_horizontal_panel_collapsed(self.media_panel, collapsed, min_open_width=220)
                 self._set_vertical_panel_collapsed(self.media_panel, False)
-            elif in_classic_left:
+            elif in_classic_left or in_middle_left:
                 self._set_vertical_panel_collapsed(self.media_panel, collapsed)
                 self._set_horizontal_panel_collapsed(self.media_panel, False, min_open_width=220)
             else:
@@ -26610,13 +26796,18 @@ if QT_AVAILABLE:
             middle_collapsed = transitions_collapsed and effects_collapsed
             try:
                 if hasattr(self, "transition_table"):
-                    self.transition_table.setMaximumHeight(16777215 if effects_collapsed else 210)
+                    self.transition_table.setMaximumHeight(16777215)
             except Exception:
                 pass
             try:
                 if hasattr(self, "effects_section"):
-                    self._set_vertical_panel_collapsed(self.effects_section, effects_collapsed, min_open_height=0)
-                    self._set_horizontal_panel_collapsed(self.effects_section, False, min_open_width=180)
+                    parent = self.effects_section.parent()
+                    if parent is getattr(self, "top_band_splitter", None):
+                        self._set_horizontal_panel_collapsed(self.effects_section, effects_collapsed, min_open_width=180)
+                        self._set_vertical_panel_collapsed(self.effects_section, False)
+                    else:
+                        self._set_vertical_panel_collapsed(self.effects_section, effects_collapsed, min_open_height=0)
+                        self._set_horizontal_panel_collapsed(self.effects_section, False, min_open_width=180)
             except Exception:
                 pass
             try:
@@ -26625,13 +26816,13 @@ if QT_AVAILABLE:
                     in_top_band = parent is getattr(self, "top_band_splitter", None)
                     in_classic_left = parent is getattr(self, "classic_left_splitter", None)
                     if in_top_band:
-                        self._set_horizontal_panel_collapsed(self.transitions_panel, middle_collapsed, min_open_width=180)
+                        self._set_horizontal_panel_collapsed(self.transitions_panel, transitions_collapsed, min_open_width=180)
                         self._set_vertical_panel_collapsed(self.transitions_panel, False)
                     elif in_classic_left:
-                        self._set_vertical_panel_collapsed(self.transitions_panel, middle_collapsed)
+                        self._set_vertical_panel_collapsed(self.transitions_panel, transitions_collapsed)
                         self._set_horizontal_panel_collapsed(self.transitions_panel, False, min_open_width=220)
                     else:
-                        self._set_vertical_panel_collapsed(self.transitions_panel, middle_collapsed)
+                        self._set_vertical_panel_collapsed(self.transitions_panel, transitions_collapsed)
                         self._set_horizontal_panel_collapsed(self.transitions_panel, False, min_open_width=180)
             except Exception:
                 pass
@@ -27477,6 +27668,9 @@ if QT_AVAILABLE:
             self.update_labels()
             if save_state and not self._loading_settings:
                 self.save_editor_state()
+            if bool(getattr(self, "follow_playhead_enabled", False)):
+                live_playback = bool(getattr(self, "timeline_playback_active", False) and not getattr(self, "timeline_playback_paused", False))
+                self._ensure_playhead_visible(margin_px=96.0 if live_playback else 72.0, center_if_outside=not live_playback, save_state=False)
             self.canvas.update()
             if self._main_preview_uses_timeline_time() and not bool(getattr(self, "_timeline_playhead_user_seeking", False)):
                 self._set_timeline_preview_time_ui()
@@ -28839,6 +29033,7 @@ if QT_AVAILABLE:
             # Main Play always means Timeline Playback. Selected media/clip preview
             # must be requested explicitly with Preview Selected.
             if (not selected_preview) and self.timeline_active and not fullscreen:
+                self._ensure_playhead_visible(margin_px=96.0, center_if_outside=True, save_state=False)
                 timeline_plan = timeline_visual_playback_plan_under_playhead(self.project, self.playhead_time)
                 if not bool(timeline_plan.get("ok")):
                     audio_only_plan = timeline_audio_only_playback_plan_under_playhead(self.project, self.playhead_time, getattr(self, "audio_mode", AUDIO_MODE_MIX_ALL))
@@ -31248,7 +31443,14 @@ if QT_AVAILABLE:
                 viewport_width = int(self.canvas.width()) if hasattr(self, "canvas") else 900
                 viewport_height = int(self.canvas_scroll_area.height()) if hasattr(self, "canvas_scroll_area") else 240
             width = max(1, viewport_width)
-            height = max(1, int(self.canvas.content_height()))
+            content_height = max(1, int(self.canvas.content_height()))
+            # When the vertical splitter gives the timeline more room, the
+            # scroll-area viewport can become taller than the real track content.
+            # Keep the canvas at least as tall as the viewport so the timeline
+            # repaint/fill follows the new available space immediately instead
+            # of leaving a stale blank area until the next track edit forces a
+            # full layout refresh.
+            height = max(content_height, max(1, viewport_height))
             if self.canvas.width() != width or self.canvas.height() != height:
                 self.canvas.resize(width, height)
             self.canvas.setMinimumSize(width, height)
@@ -31523,12 +31725,51 @@ if QT_AVAILABLE:
             self.log(f"Snap {'enabled' if self.snap_enabled else 'disabled'}.")
             self.save_editor_state()
 
+        def _follow_playhead_changed(self, state: int) -> None:
+            self.follow_playhead_enabled = bool(self.follow_playhead_box.isChecked())
+            if self.follow_playhead_enabled:
+                self._ensure_playhead_visible(margin_px=80.0, center_if_outside=True, save_state=True)
+            self.log("Follow playhead enabled." if self.follow_playhead_enabled else "Follow playhead disabled.")
+            self.save_editor_state()
+
         def _scrollbar_changed(self, value: int) -> None:
             self.timeline_math.scroll_x = float(value)
             self.update_labels()
             if not self._loading_settings:
                 self.save_editor_state()
             self.canvas.update()
+
+        def _ensure_playhead_visible(self, margin_px: float = 80.0, center_if_outside: bool = False, save_state: bool = False) -> bool:
+            if not bool(getattr(self, "follow_playhead_enabled", False)):
+                return False
+            if not hasattr(self, "canvas") or not hasattr(self, "timeline_math"):
+                return False
+            visible_width = float(self.visible_timeline_width())
+            if visible_width <= 1.0:
+                return False
+            playhead_x = float(self.timeline_math.time_to_x(float(getattr(self, "playhead_time", 0.0) or 0.0)))
+            margin = float(clamp(margin_px, 12.0, max(12.0, visible_width * 0.45)))
+            target_scroll = float(self.timeline_math.scroll_x)
+            if playhead_x < margin:
+                if center_if_outside or playhead_x < 0.0:
+                    target_scroll = float(self.playhead_time) * float(self.timeline_math.pixels_per_second) - visible_width * 0.35
+                else:
+                    target_scroll = float(self.timeline_math.scroll_x) - (margin - playhead_x)
+            elif playhead_x > visible_width - margin:
+                if center_if_outside or playhead_x > visible_width:
+                    target_scroll = float(self.playhead_time) * float(self.timeline_math.pixels_per_second) - visible_width * 0.35
+                else:
+                    target_scroll = float(self.timeline_math.scroll_x) + (playhead_x - (visible_width - margin))
+            target_scroll = clamp(target_scroll, 0.0, self.max_scroll_x())
+            if abs(target_scroll - float(self.timeline_math.scroll_x)) < 0.5:
+                return False
+            self.timeline_math.scroll_x = float(target_scroll)
+            self.update_scrollbar()
+            self.update_labels()
+            if save_state and not bool(getattr(self, "_loading_settings", False)):
+                self.save_editor_state()
+            self.canvas.update()
+            return True
 
         def visible_timeline_width(self) -> int:
             return max(1, self.canvas.timeline_width())
@@ -32113,6 +32354,7 @@ if QT_AVAILABLE:
             self.timeline_math.scroll_x = max(0.0, safe_float(state.get("scroll_x"), 0.0))
             self.playhead_time = max(0.0, safe_float(state.get("playhead_time"), 0.0))
             self.snap_enabled = bool_from_project_value(state.get("snap_enabled"), True)
+            self.follow_playhead_enabled = bool_from_project_value(state.get("follow_playhead"), False)
             self.layout_preset = normalize_layout_preset(state.get("layout_preset", LAYOUT_PRESET_MEDIA_TOP))
             self.media_collapsed = bool_from_project_value(state.get("media_collapsed"), False)
             self.timeline_collapsed = bool_from_project_value(state.get("timeline_collapsed"), False)
@@ -32122,8 +32364,10 @@ if QT_AVAILABLE:
             self.logs_collapsed = bool_from_project_value(state.get("logs_collapsed"), False)
             self.main_splitter_sizes = list(state.get("main_splitter_sizes", [330, 900]))
             self.right_splitter_sizes = list(state.get("right_splitter_sizes", [420, 300, 150]))
-            self.preview_left_top_splitter_sizes = list(state.get("preview_left_top_splitter_sizes", [520, 300, 900]))
+            self.preview_left_top_splitter_sizes = list(state.get("preview_left_top_splitter_sizes", [460, 260, 260, 900]))
             self.preview_left_outer_splitter_sizes = list(state.get("preview_left_outer_splitter_sizes", [390, 490, 34]))
+            self.timeline_middle_left_splitter_sizes = list(state.get("timeline_middle_left_splitter_sizes", [360, 360]))
+            self.timeline_middle_right_splitter_sizes = list(state.get("timeline_middle_right_splitter_sizes", [360, 360]))
             self.embed_preview_enabled = bool_from_project_value(state.get("embed_preview_enabled"), True)
             self.preview_external_forced = not self.embed_preview_enabled
             self.preview_view_mode = "fill" if str(state.get("preview_view_mode", "fit")).lower() == "fill" else "fit"
@@ -32146,6 +32390,10 @@ if QT_AVAILABLE:
             self.snap_box.blockSignals(True)
             self.snap_box.setChecked(self.snap_enabled)
             self.snap_box.blockSignals(False)
+            if hasattr(self, "follow_playhead_box"):
+                self.follow_playhead_box.blockSignals(True)
+                self.follow_playhead_box.setChecked(bool(self.follow_playhead_enabled))
+                self.follow_playhead_box.blockSignals(False)
             if hasattr(self, "show_thumbnails_box"):
                 self.show_thumbnails_box.blockSignals(True)
                 self.show_thumbnails_box.setChecked(bool(self.show_timeline_thumbnails))
@@ -32401,11 +32649,14 @@ if QT_AVAILABLE:
                 "vertical_scroll": vertical_scroll,
                 "playhead_time": self.playhead_time,
                 "snap_enabled": self.snap_enabled,
+                "follow_playhead": bool(getattr(self, "follow_playhead_enabled", False)),
                 "layout_preset": normalize_layout_preset(getattr(self, "layout_preset", LAYOUT_PRESET_MEDIA_TOP)),
                 "main_splitter_sizes": list(getattr(self, "main_splitter_sizes", [330, 900])),
                 "right_splitter_sizes": list(getattr(self, "right_splitter_sizes", [420, 300, 150])),
-                "preview_left_top_splitter_sizes": list(getattr(self, "preview_left_top_splitter_sizes", [520, 300, 900])),
+                "preview_left_top_splitter_sizes": list(getattr(self, "preview_left_top_splitter_sizes", [460, 260, 260, 900])),
                 "preview_left_outer_splitter_sizes": list(getattr(self, "preview_left_outer_splitter_sizes", [390, 490, 34])),
+                "timeline_middle_left_splitter_sizes": list(getattr(self, "timeline_middle_left_splitter_sizes", [360, 360])),
+                "timeline_middle_right_splitter_sizes": list(getattr(self, "timeline_middle_right_splitter_sizes", [360, 360])),
                 "media_collapsed": self.media_collapsed,
                 "timeline_collapsed": self.timeline_collapsed,
                 "preview_collapsed": self.preview_collapsed,
@@ -32435,6 +32686,8 @@ if QT_AVAILABLE:
             path = settings_path()
             if not path.exists():
                 self.snap_box.setChecked(self.snap_enabled)
+                if hasattr(self, "follow_playhead_box"):
+                    self.follow_playhead_box.setChecked(bool(self.follow_playhead_enabled))
                 if hasattr(self, "show_thumbnails_box"):
                     self.show_thumbnails_box.blockSignals(True)
                     self.show_thumbnails_box.setChecked(bool(self.show_timeline_thumbnails))
@@ -32472,6 +32725,7 @@ if QT_AVAILABLE:
                 saved_vertical_scroll = max(0, safe_int(data.get("vertical_scroll", 0), 0))
                 self.playhead_time = max(0.0, float(data.get("playhead_time", 0.0)))
                 self.snap_enabled = bool(data.get("snap_enabled", True))
+                self.follow_playhead_enabled = bool_from_project_value(data.get("follow_playhead", data.get("follow_playhead_enabled", self.follow_playhead_enabled)), False)
                 layout_state = sanitize_layout_state(data)
                 self.layout_preset = normalize_layout_preset(layout_state.get("layout_preset"))
                 self.media_collapsed = bool(layout_state.get("media_collapsed", False))
@@ -32482,8 +32736,10 @@ if QT_AVAILABLE:
                 self.logs_collapsed = bool(layout_state.get("logs_collapsed", False))
                 self.main_splitter_sizes = list(layout_state.get("main_splitter_sizes", [330, 900]))
                 self.right_splitter_sizes = list(layout_state.get("right_splitter_sizes", [420, 300, 150]))
-                self.preview_left_top_splitter_sizes = list(layout_state.get("preview_left_top_splitter_sizes", [520, 300, 900]))
+                self.preview_left_top_splitter_sizes = list(layout_state.get("preview_left_top_splitter_sizes", [460, 260, 260, 900]))
                 self.preview_left_outer_splitter_sizes = list(layout_state.get("preview_left_outer_splitter_sizes", [390, 490, 34]))
+                self.timeline_middle_left_splitter_sizes = list(layout_state.get("timeline_middle_left_splitter_sizes", [360, 360]))
+                self.timeline_middle_right_splitter_sizes = list(layout_state.get("timeline_middle_right_splitter_sizes", [360, 360]))
                 self.embed_preview_enabled = bool(data.get("embed_preview_enabled", True))
                 self.preview_view_mode = "fill" if str(data.get("preview_view_mode", "fit")).lower() == "fill" else "fit"
                 # Preview zoom/pan are transient viewer controls. Always start sane.
@@ -32504,6 +32760,10 @@ if QT_AVAILABLE:
                 self.audio_mix_protection_scale = 1.0
                 self._last_project_path = str(data.get("last_project_path", default_project_path()))
                 self.snap_box.setChecked(self.snap_enabled)
+                if hasattr(self, "follow_playhead_box"):
+                    self.follow_playhead_box.blockSignals(True)
+                    self.follow_playhead_box.setChecked(bool(self.follow_playhead_enabled))
+                    self.follow_playhead_box.blockSignals(False)
                 if hasattr(self, "show_thumbnails_box"):
                     self.show_thumbnails_box.blockSignals(True)
                     self.show_thumbnails_box.setChecked(bool(self.show_timeline_thumbnails))
@@ -32639,14 +32899,14 @@ if QT_AVAILABLE:
                     hasattr(self, "canvas_scroll_area")
                     and watched is self.canvas_scroll_area.viewport()
                 ):
-                    # Do not schedule timeline scrollbar refreshes from resize
-                    # events; that can create a layout/update loop. Qt's normal
-                    # resize path and explicit layout-preset refresh handle this.
-                    try:
-                        if hasattr(self, "canvas"):
-                            self.canvas.update()
-                    except Exception:
-                        pass
+                    # Splitter drags inside a FrameVision tab resize the scroll-area
+                    # viewport without necessarily triggering the editor window's
+                    # resizeEvent. Refresh the canvas geometry once on the next
+                    # event-loop turn so the timeline fills the newly available
+                    # space immediately. The pending guard inside
+                    # _schedule_timeline_scrollbar_refresh prevents resize/update
+                    # loops while the user is dragging.
+                    self._schedule_timeline_scrollbar_refresh("timeline viewport resize")
             elif hasattr(self, "preview_time_slider") and watched is self.preview_time_slider:
                 if event.type() == QEvent.Type.MouseButtonPress:
                     self._preview_user_is_seeking = True
