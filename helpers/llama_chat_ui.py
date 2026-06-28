@@ -890,11 +890,58 @@ def _strip_text_for_tts(text: str) -> str:
     raw = re.sub(r"^\s{0,3}#{1,6}\s*", "", raw, flags=re.MULTILINE)
     raw = re.sub(r"^\s{0,3}[-*+]\s+", "", raw, flags=re.MULTILINE)
     raw = re.sub(r"[*_~>#]", "", raw)
+    raw = _sanitize_text_for_piper(raw)
     raw = re.sub(r"\s+", " ", raw).strip()
     # Keep voice snappy and prevent very long answers from generating huge wav files.
     if len(raw) > 3500:
         raw = raw[:3500].rsplit(" ", 1)[0].strip() + "."
     return raw
+
+
+def _sanitize_text_for_piper(text: str) -> str:
+    """Make LLM text safe for Piper stdin on Windows.
+
+    Some model answers contain Unicode punctuation such as U+2011 non-breaking
+    hyphen.  Without explicit UTF-8 stdin, Windows can try cp1252/charmap and
+    crash before Piper even starts.  This also trims symbols that sound bad.
+    """
+    raw = str(text or "")
+    if not raw:
+        return ""
+    replacements = {
+        "\u2010": "-",  # hyphen
+        "\u2011": "-",  # non-breaking hyphen
+        "\u2012": "-",  # figure dash
+        "\u2013": "-",  # en dash
+        "\u2014": "-",  # em dash
+        "\u2015": "-",
+        "\u2212": "-",  # minus sign
+        "\u00a0": " ",  # nbsp
+        "\u2007": " ",
+        "\u202f": " ",
+        "\u2018": "'",
+        "\u2019": "'",
+        "\u201a": "'",
+        "\u201b": "'",
+        "\u201c": '"',
+        "\u201d": '"',
+        "\u201e": '"',
+        "\u2026": "...",
+        "\u2022": ". ",
+    }
+    raw = raw.translate(str.maketrans(replacements))
+    raw = unicodedata.normalize("NFKC", raw)
+    # Remove zero-width/control formatting characters and emoji-like symbols.
+    cleaned = []
+    for ch in raw:
+        cat = unicodedata.category(ch)
+        if cat in ("Cc", "Cf", "Cs", "Co", "Cn"):
+            cleaned.append(" ")
+        elif cat == "So":
+            cleaned.append(" ")
+        else:
+            cleaned.append(ch)
+    return "".join(cleaned)
 
 
 def _find_piper_exe(fv_root: str) -> str:
@@ -2286,10 +2333,15 @@ class PiperTtsThread(QtCore.QThread):
                 except Exception:
                     pass
             cmd = [self.piper_exe, "--model", self.model_path, "--output_file", tmp]
+            safe_text = _sanitize_text_for_piper(self.text).strip()
+            if not safe_text:
+                return
             proc = subprocess.run(
                 cmd,
-                input=self.text,
+                input=safe_text,
                 text=True,
+                encoding="utf-8",
+                errors="replace",
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
                 cwd=os.path.dirname(self.piper_exe) or None,
