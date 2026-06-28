@@ -48,7 +48,7 @@ import datetime
 import uuid
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
-from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple
+from typing import Any, Callable, Dict, Iterable, List, Optional, Set, Tuple
 
 try:
     import numpy as _np  # optional fast path for PNG transition mask compositing
@@ -16089,7 +16089,7 @@ def timeline_editor_bootstrap_pyside6_or_exit(argv: Optional[List[str]] = None) 
 
 
 try:
-    from PySide6.QtCore import QEvent, QMimeData, QPoint, QRect, QRectF, QSize, Qt, QTimer, QUrl
+    from PySide6.QtCore import QEvent, QMimeData, QModelIndex, QPoint, QRect, QRectF, QSize, Qt, QTimer, QUrl
     from PySide6.QtGui import QColor, QBrush, QDesktopServices, QDrag, QFont, QIcon, QImage, QKeySequence, QPainter, QPen, QPixmap, QShortcut, QTransform
     from PySide6.QtWidgets import (
         QAbstractItemView,
@@ -17110,7 +17110,7 @@ if QT_AVAILABLE:
             self._sort_reverse = False
             self.setHorizontalHeaderLabels(["★", "", "Preview", "Name", "Type", "Duration", "Path"])
             self.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
-            self.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
+            self.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
             self.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
             self.verticalHeader().setVisible(False)
             self.verticalHeader().setDefaultSectionSize(44)
@@ -17133,7 +17133,7 @@ if QT_AVAILABLE:
             self.setDragEnabled(True)
             self.setDragDropMode(QAbstractItemView.DragDropMode.DragOnly)
             self.setDefaultDropAction(Qt.DropAction.CopyAction)
-            self.doubleClicked.connect(lambda *_: self.editor.open_selected_source_preview())
+            self.doubleClicked.connect(lambda *_: self.editor.add_selected_media_to_timeline_auto())
             self.itemSelectionChanged.connect(self.editor.on_media_selection_changed)
 
         def _sort_key_for_column(self, column: int) -> str:
@@ -17168,17 +17168,28 @@ if QT_AVAILABLE:
             return table_item
 
         def selected_media_id(self) -> Optional[str]:
-            row = self.currentRow()
-            if row < 0:
-                return None
-            for column in (self.COL_NAME, self.COL_FAVORITE, self.COL_DOT, self.COL_THUMB, self.COL_TYPE, self.COL_DURATION, self.COL_PATH):
-                item = self.item(row, column)
-                if item is None:
+            ids = self.selected_media_ids()
+            return ids[0] if ids else None
+
+        def selected_media_ids(self) -> List[str]:
+            media_ids: List[str] = []
+            seen: Set[str] = set()
+            rows = sorted({index.row() for index in self.selectionModel().selectedRows()} if self.selectionModel() is not None else set())
+            if not rows and self.currentRow() >= 0:
+                rows = [self.currentRow()]
+            for row in rows:
+                if row < 0:
                     continue
-                media_id = item.data(Qt.ItemDataRole.UserRole)
-                if media_id:
-                    return str(media_id)
-            return None
+                for column in (self.COL_NAME, self.COL_FAVORITE, self.COL_DOT, self.COL_THUMB, self.COL_TYPE, self.COL_DURATION, self.COL_PATH):
+                    item = self.item(row, column)
+                    if item is None:
+                        continue
+                    media_id = str(item.data(Qt.ItemDataRole.UserRole) or "")
+                    if media_id and media_id not in seen:
+                        seen.add(media_id)
+                        media_ids.append(media_id)
+                        break
+            return media_ids
 
         def mimeData(self, items: List[QTableWidgetItem]) -> QMimeData:  # type: ignore[override]
             mime = QMimeData()
@@ -17325,7 +17336,13 @@ if QT_AVAILABLE:
         def _media_item_at_context_pos(self, pos: QPoint) -> Tuple[Optional[str], Optional[MediaItem]]:
             row = self.rowAt(pos.y())
             if row >= 0:
-                self.selectRow(row)
+                keep_existing = False
+                try:
+                    keep_existing = self.selectionModel() is not None and self.selectionModel().isRowSelected(row, QModelIndex())
+                except Exception:
+                    keep_existing = False
+                if not keep_existing:
+                    self.selectRow(row)
             media_id = self.selected_media_id()
             media_item = self.editor.project.get_media(media_id) if media_id else None
             return media_id, media_item
@@ -17374,8 +17391,10 @@ if QT_AVAILABLE:
             media_id, media_item = self._media_item_at_context_pos(pos)
             media_type = str(getattr(media_item, "media_type", "") or "").lower() if media_item is not None else ""
             menu = QMenu(self)
+            add_media_action = menu.addAction("Add Media")
+            menu.addSeparator()
             preview_action = menu.addAction("Preview source")
-            add_action = menu.addAction("Add to timeline at playhead")
+            add_action = menu.addAction("Add to selected timeline")
             edit_text_action = None
             if media_type == TEXT_MEDIA_TYPE:
                 edit_text_action = menu.addAction("Edit Text Asset")
@@ -17401,10 +17420,12 @@ if QT_AVAILABLE:
                 info_action.setEnabled(False)
                 copy_info_action.setEnabled(False)
             chosen = menu.exec(self.mapToGlobal(pos))
-            if chosen == preview_action:
+            if chosen == add_media_action:
+                self.editor.add_media_dialog()
+            elif chosen == preview_action:
                 self.editor.open_selected_source_preview()
             elif chosen == add_action:
-                self.editor.add_selected_media_to_timeline()
+                self.editor.add_selected_media_to_timeline_auto()
             elif edit_text_action is not None and chosen == edit_text_action:
                 self.editor.edit_selected_text_media_asset()
             elif chosen == rename_action and media_item is not None:
@@ -19187,7 +19208,7 @@ if QT_AVAILABLE:
             self.active_effect_preset_id = ""
             self.embed_preview_enabled = True
             self.logs_collapsed = False
-            self.target_track_id = self.project.default_track_id_for_media_type("video")
+            self.target_track_id = self.project.track_id_from_index(0)
             self.preview_process: Optional[subprocess.Popen[Any]] = None
             self.preview_job_handle: Optional[int] = None
             self.preview_timer: Optional[QTimer] = None
@@ -20430,16 +20451,14 @@ if QT_AVAILABLE:
             btn_row.setSpacing(6)
             btn_add = QPushButton("Add Media")
             btn_remove = QPushButton("Remove")
-            btn_to_timeline = QPushButton("Add")
             btn_add.clicked.connect(self.add_media_dialog)
             btn_remove.clicked.connect(self.remove_selected_media)
-            btn_to_timeline.clicked.connect(self.add_selected_media_to_timeline)
             btn_row.addWidget(btn_add)
             btn_row.addWidget(btn_remove)
-            btn_row.addWidget(btn_to_timeline)
             layout.addWidget(self.media_button_row_widget)
 
             self.media_target_row_widget = QWidget(panel)
+            self.media_target_row_widget.setVisible(False)
             target_row = QHBoxLayout(self.media_target_row_widget)
             target_row.setContentsMargins(0, 0, 0, 0)
             target_row.setSpacing(6)
@@ -20448,19 +20467,17 @@ if QT_AVAILABLE:
             self.target_track_combo.currentIndexChanged.connect(self._target_track_combo_changed)
             target_row.addWidget(target_label)
             target_row.addWidget(self.target_track_combo, 1)
-            layout.addWidget(self.media_target_row_widget)
 
             self.media_table = MediaBinTable(self)
             layout.addWidget(self.media_table, 1)
 
-            self.media_hint_label = QLabel("Double-click/Add uses Target track. Drag media directly onto any timeline track.")
+            self.media_hint_label = QLabel("Double-click adds selected media to the first free spot on the selected timeline. Drag media directly onto any timeline track.")
             self.media_hint_label.setWordWrap(True)
             self.media_hint_label.setStyleSheet("color: #9aa3b6;")
             layout.addWidget(self.media_hint_label)
 
             self.media_content_widgets = [
                 self.media_button_row_widget,
-                self.media_target_row_widget,
                 self.media_table,
                 self.media_hint_label,
             ]
@@ -28084,6 +28101,12 @@ if QT_AVAILABLE:
         def selected_media_id(self) -> Optional[str]:
             return self.media_table.selected_media_id()
 
+        def selected_media_ids(self) -> List[str]:
+            if hasattr(self.media_table, "selected_media_ids"):
+                return self.media_table.selected_media_ids()
+            one = self.selected_media_id()
+            return [one] if one else []
+
         def refresh_media_bin(self) -> None:
             self.media_table.refresh()
 
@@ -30220,6 +30243,62 @@ if QT_AVAILABLE:
             self.preview_display_label.setText(info["title"] + "\nSelect media or a timeline clip.")
             self._reset_preview_position(0.0)
 
+        def _media_bin_default_track_index(self) -> int:
+            if self.project.track_count() <= 0:
+                return 0
+            resolved = self.project.track_index_for_id(str(getattr(self, "target_track_id", "") or ""))
+            if resolved is not None:
+                can_add, _message = self.project.can_add_to_track(int(resolved))
+                if can_add:
+                    return int(resolved)
+            for index in range(self.project.track_count()):
+                can_add, _message = self.project.can_add_to_track(index)
+                if can_add:
+                    return int(index)
+            return 0
+
+        def _first_free_time_on_track(self, track_index: int, duration: Any, minimum_start: float = 0.0) -> float:
+            needed = max(0.05, safe_float(duration, 0.05))
+            cursor = max(0.0, safe_float(minimum_start, 0.0))
+            track_id = self.project.track_id_from_index(track_index)
+            clips = []
+            for clip in list(getattr(self.project, "clips", []) or []):
+                try:
+                    if int(self.project.clip_track_index(clip)) == int(track_index) or str(getattr(clip, "track_id", "") or "") == str(track_id):
+                        clips.append(clip)
+                except Exception:
+                    pass
+            clips.sort(key=lambda c: (float(getattr(c, "start", 0.0) or 0.0), float(getattr(c, "end", 0.0) or 0.0)))
+            for clip in clips:
+                start = max(0.0, float(getattr(clip, "start", 0.0) or 0.0))
+                end = max(start, float(getattr(clip, "end", start) or start))
+                if end <= cursor + 1e-6:
+                    continue
+                if start - cursor >= needed - 1e-6:
+                    return cursor
+                cursor = max(cursor, end)
+            return cursor
+
+        def add_media_to_timeline_auto_free(
+            self,
+            media_id: str,
+            track_index: Optional[int] = None,
+            minimum_start: float = 0.0,
+            source: str = "media_bin_double_click",
+        ) -> Optional[Clip]:
+            item = self.project.get_media(media_id)
+            if not item:
+                self.log("Add to timeline skipped: selected media not found.")
+                return None
+            resolved_track = self._media_bin_default_track_index() if track_index is None else int(track_index)
+            can_add, message = self.project.can_add_to_track(int(resolved_track))
+            if not can_add:
+                self.log(f"Add to timeline skipped: {message}")
+                return None
+            duration = max(0.05, float(getattr(item, "duration", 0.0) or default_duration_for_media_type(getattr(item, "media_type", "video"))))
+            start_time = self._first_free_time_on_track(int(resolved_track), duration, minimum_start=minimum_start)
+            return self.add_media_to_timeline(media_id, start_time=start_time, track_index=int(resolved_track), source=source)
+
         def add_media_to_timeline(
             self,
             media_id: str,
@@ -30262,11 +30341,36 @@ if QT_AVAILABLE:
             return clip
 
         def add_selected_media_to_timeline(self, track_index: Optional[int] = None) -> None:
-            media_id = self.selected_media_id()
-            if not media_id:
+            media_ids = self.selected_media_ids()
+            if not media_ids:
                 self.log("Add to timeline skipped: no media selected.")
                 return
-            self.add_media_to_timeline(media_id, start_time=self.playhead_time, track_index=track_index, source="button")
+            added: List[Clip] = []
+            start_time = float(self.playhead_time)
+            resolved_track = self._media_bin_default_track_index() if track_index is None else int(track_index)
+            for media_id in media_ids:
+                clip = self.add_media_to_timeline(media_id, start_time=start_time, track_index=resolved_track, source="button")
+                if clip is not None:
+                    added.append(clip)
+                    start_time = float(clip.end)
+            if len(added) > 1:
+                self.log(f"Added {len(added)} media items at playhead on {self.project.track_label_by_index(resolved_track)}.")
+
+        def add_selected_media_to_timeline_auto(self, track_index: Optional[int] = None) -> None:
+            media_ids = self.selected_media_ids()
+            if not media_ids:
+                self.log("Add to timeline skipped: no media selected.")
+                return
+            resolved_track = self._media_bin_default_track_index() if track_index is None else int(track_index)
+            added: List[Clip] = []
+            minimum_start = 0.0
+            for media_id in media_ids:
+                clip = self.add_media_to_timeline_auto_free(media_id, track_index=resolved_track, minimum_start=minimum_start)
+                if clip is not None:
+                    added.append(clip)
+                    minimum_start = float(clip.end)
+            if len(added) > 1:
+                self.log(f"Added {len(added)} media items to first free spots on {self.project.track_label_by_index(resolved_track)}.")
 
         def _sorted_selected_clips_for_group_ops(self) -> List[Clip]:
             clips = self.selected_clips()
@@ -32458,7 +32562,7 @@ if QT_AVAILABLE:
             self.timeline_media_cache_pending.clear()
             self._last_project_path = str(default_project_path())
             selected_clip_id, selected_media_id = self._apply_loaded_project_editor_state(preserved_state)
-            self.target_track_id = self.project.default_track_id_for_media_type("video")
+            self.target_track_id = self.project.track_id_from_index(0)
             self.refresh_target_track_combo()
             self.refresh_media_bin()
             self.refresh_timeline_layout()
