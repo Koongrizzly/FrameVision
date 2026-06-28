@@ -566,15 +566,10 @@ def timeline_editor_is_real_project_save_path(path_value: Any, app_root: Optiona
 
 
 def timeline_editor_resolve_autosave_target(last_project_path: Any, app_root: Optional[Path] = None) -> Tuple[Path, str]:
-    if timeline_editor_is_real_project_save_path(last_project_path, app_root):
-        try:
-            candidate = Path(str(last_project_path)).expanduser()
-            if not candidate.is_absolute():
-                root = Path(app_root).resolve() if app_root is not None else framevision_root()
-                candidate = root / candidate
-            return candidate.resolve(), "project"
-        except Exception:
-            pass
+    # Autosave is a recovery system, not a silent manual save.
+    # Always write dirty working state to the recovery file so a saved project
+    # is not overwritten every minute. A real Save still writes the project file
+    # and removes the recovery file, so the next startup begins fresh.
     return timeline_editor_autosave_path(app_root), "recovery"
 
 
@@ -12631,7 +12626,7 @@ def run_self_tests() -> Tuple[bool, List[str]]:
             real_project.parent.mkdir(parents=True, exist_ok=True)
             real_project.write_text("{}", encoding="utf-8")
             target_path, target_kind = timeline_editor_resolve_autosave_target(real_project, fake_root)
-            check(_timeline_editor_same_path(target_path, real_project) and target_kind == "project", "existing saved project autosaves to real project file")
+            check(_timeline_editor_same_path(target_path, expected_autosave) and target_kind == "recovery", "existing saved project dirty state autosaves to recovery file without overwriting the manual save")
             payload = timeline_project_save_payload(TimelineProject(), default_project_editor_state())
             payload["autosave"] = {"enabled": True, "target_kind": "recovery", "app": APP_NAME}
             loaded = load_timeline_project_payload(payload)
@@ -19148,6 +19143,9 @@ if QT_AVAILABLE:
             self.project_dirty = False
             self._autosave_busy = False
             self.autosave_timer: Optional[QTimer] = None
+            self.autosave_dirty_timer: Optional[QTimer] = None
+            self._autosave_last_ok_time = 0.0
+            self._transition_live_skip_log_key = ""
             self.timeline_math = TimelineMath()
             self.playhead_time = 0.0
             self.hover_time: Optional[float] = None
@@ -19387,10 +19385,21 @@ if QT_AVAILABLE:
             self.autosave_timer.setInterval(TIMELINE_AUTOSAVE_INTERVAL_MS)
             self.autosave_timer.timeout.connect(lambda: self._autosave_project(reason="timer"))
             self.autosave_timer.start()
+            # A second, single-shot safety timer is used only after real edits.
+            # It keeps the original once-per-minute autosave, but prevents losing
+            # almost a full minute when the embedded FrameVision tab crashes.
+            self.autosave_dirty_timer = QTimer(self)
+            self.autosave_dirty_timer.setSingleShot(True)
+            self.autosave_dirty_timer.setInterval(5000)
+            self.autosave_dirty_timer.timeout.connect(lambda: self._autosave_project(reason="edit safety"))
             app = QApplication.instance()
             if app is not None:
                 try:
                     app.aboutToQuit.connect(self._cleanup_preview_before_close)
+                except Exception:
+                    pass
+                try:
+                    app.aboutToQuit.connect(lambda: self._autosave_project(reason="app quit"))
                 except Exception:
                     pass
             self.load_editor_state()
@@ -23765,13 +23774,40 @@ if QT_AVAILABLE:
                 self.log(f"Preview redraw failed: {exc}")
                 return False
 
+        def _skip_live_transition_compositor_for_embedded_playback(self, state: Optional[Dict[str, Any]]) -> bool:
+            """Avoid heavy PNG transition compositing while the editor is embedded and playing.
+
+            Standalone can spend a little time drawing transition previews, but inside
+            FrameVision the same GUI thread owns the whole app. During live playback
+            we prefer keeping the clock and normal video frame moving over freezing
+            the tab on a transition boundary. Paused/scrub/test preview still uses
+            the compositor.
+            """
+            if not bool(getattr(self, "_embedded_in_framevision", False)):
+                return False
+            if not state:
+                return False
+            if bool(getattr(self, "debug_transitions", False)):
+                return False
+            if bool(getattr(self, "timeline_playback_paused", False) or getattr(self, "preview_paused", False)):
+                return False
+            return bool(getattr(self, "timeline_playback_active", False) and not getattr(self, "selected_preview_active", False))
+
         def _paint_transition_preview_to_label(self, label: QLabel) -> bool:
             if label is None:
                 return False
-            self._transition_flush_async_decodes()
             state = self._transition_preview_state_for_current_time()
             if not state:
                 return False
+            if self._skip_live_transition_compositor_for_embedded_playback(state):
+                transition = state.get("transition") if isinstance(state, dict) else None
+                transition_id = str(getattr(transition, "transition_id", "") or "")
+                log_key = f"embedded-live-skip|{transition_id}"
+                if log_key != getattr(self, "_transition_live_skip_log_key", ""):
+                    self._transition_live_skip_log_key = log_key
+                    self.log("Embedded playback: skipping live transition compositor to keep FrameVision responsive.")
+                return False
+            self._transition_flush_async_decodes()
             transition = state.get("transition")
             outgoing = state.get("outgoing_clip")
             incoming = state.get("incoming_clip")
@@ -27120,6 +27156,19 @@ if QT_AVAILABLE:
             self._set_project_dirty(None)
             if getattr(self, "project_dirty", False):
                 self.log(f"Project changed: {reason}")
+                self._schedule_autosave_after_edit(reason)
+
+        def _schedule_autosave_after_edit(self, reason: str = "project edit") -> None:
+            """Queue a small recovery save after edits without saving during drags/playback ticks."""
+            timer = getattr(self, "autosave_dirty_timer", None)
+            if timer is None:
+                return
+            if not getattr(self, "project_dirty", False):
+                return
+            try:
+                timer.start()
+            except Exception:
+                pass
 
         def _project_state_for_history(self) -> str:
             return timeline_project_edit_state(self.project)
@@ -27390,16 +27439,21 @@ if QT_AVAILABLE:
             if path_text == str(getattr(self, "active_transition_mask_path", "") or ""):
                 return
             self.active_transition_mask_path = path_text
-            for cache_name in ("_transition_composite_cache", "_transition_canvas_cache"):
-                try:
-                    getattr(self, cache_name).clear()
-                except Exception:
-                    pass
+            live_embedded = bool(getattr(self, "_embedded_in_framevision", False) and getattr(self, "timeline_playback_active", False) and not getattr(self, "timeline_playback_paused", False))
+            # Selecting a library transition must not flush active preview caches while
+            # the embedded timeline is playing; that cache churn was enough to freeze
+            # the parent FrameVision event loop on some systems.
+            if not live_embedded:
+                for cache_name in ("_transition_composite_cache", "_transition_canvas_cache"):
+                    try:
+                        getattr(self, cache_name).clear()
+                    except Exception:
+                        pass
             if log_result and path_text:
                 asset = self._transition_asset_for_path(path_text)
                 label = str(asset.get("display_name") if asset else transition_display_name_from_filename(path_text))
                 self.log(f"Selected transition mask: {label}")
-            if not getattr(self, "_loading_settings", False):
+            if not getattr(self, "_loading_settings", False) and not live_embedded:
                 self.save_editor_state()
 
         def selected_transition_asset(self) -> Optional[Dict[str, Any]]:
@@ -32333,6 +32387,7 @@ if QT_AVAILABLE:
             self.update_labels()
             self.canvas.update()
             self._set_project_dirty(False, refresh_clean=True)
+            self._delete_autosave_recovery_file()
             self.save_editor_state()
             self._refresh_canvas_label()
             self.log(f"New project initialized with canvas: {project_canvas_label(self.project.canvas_width, self.project.canvas_height)}")
@@ -32479,6 +32534,7 @@ if QT_AVAILABLE:
                     "app": APP_NAME,
                 }
                 timeline_editor_atomic_save_json(target, payload)
+                self._autosave_last_ok_time = time.time()
                 if target_kind == "project":
                     self._last_project_path = str(target)
                     self._set_project_dirty(False, refresh_clean=True)
@@ -32549,30 +32605,13 @@ if QT_AVAILABLE:
                 self.log(f"Autosave recovery ignored: {exc}")
                 return
 
-            box = QMessageBox(self)
-            box.setWindowTitle("Timeline Editor autosave")
-            box.setIcon(QMessageBox.Icon.Warning)
-            box.setText("A Timeline Editor autosave was found. Restore it?")
-            box.setInformativeText("Restore loads the recovery project and keeps it marked unsaved. Delete removes the recovery file. Ignore leaves it for later.")
-            restore_button = box.addButton("Restore", QMessageBox.ButtonRole.AcceptRole)
-            delete_button = box.addButton("Delete", QMessageBox.ButtonRole.DestructiveRole)
-            ignore_button = box.addButton("Ignore", QMessageBox.ButtonRole.RejectRole)
-            box.setDefaultButton(restore_button)
-            box.exec()
-            clicked = box.clickedButton()
-            if clicked == restore_button:
-                if self._restore_autosave_recovery_payload(payload):
-                    try:
-                        path.unlink()
-                    except Exception as exc:
-                        self.log(f"Autosave recovery restored, but cleanup failed: {exc}")
-                return
-            if clicked == delete_button:
-                self._delete_autosave_recovery_file()
-                return
-            if clicked == ignore_button:
-                self.log("Autosave recovery ignored by user.")
-                return
+            # No restore popup: the recovery file is the user's last dirty
+            # working session, so restore it automatically. Keep the file on
+            # disk until the user explicitly saves, loads another project, or
+            # starts a new project; this protects against a second crash right
+            # after startup.
+            if self._restore_autosave_recovery_payload(payload):
+                self.log("Autosave recovery auto-restored. Save the project to clear recovery state.")
 
         def save_project(self, path: Path) -> bool:
             try:
@@ -32628,6 +32667,7 @@ if QT_AVAILABLE:
                     f"repairs/warnings={result.repair_count}"
                 )
                 self.log(f"Project canvas set: {project_canvas_label(self.project.canvas_width, self.project.canvas_height)}")
+                self._delete_autosave_recovery_file()
                 self.save_editor_state()
                 return True
             except Exception as exc:
