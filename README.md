@@ -3,7 +3,7 @@
 </p>
 
  <p align="center">                                  
-✨  FrameVision 2.5  ✨
+✨  FrameVision 2.5.1  ✨
  <p align="center">     
 All-in-one Sound/Image/Video Tool 
   <p align="center">     
@@ -102,6 +102,28 @@ Run **`framevision.exe`** — it automatically:
  <p align="center">  Update changelogs 
    
 ---
+<details>
+<summary>June 28 2026 Framevision V2.5.1 small uopdate brings Krea 2 and Boggu img</summary>
+  
+  - Krea 2 GGuf loader, download your favorite version for Vram use and use it it framevision
+    Fast and detailed images. Works with sd-cli for an easy & fast install
+  
+  - Boogu Image comes as a text to image and an image editor in 1
+    Users can download fp8/fp16/ or gguf. Works with sd-cli for an easy & fast install
+  
+  - More features for the llm chat :
+    - Pinned chats : Users can enter special prompts, save them to pinned chats and re-use them later
+    - Memory : chat has several types of memory : chat own memory (add anything in here you want to load
+    with the llm when it creates an answer, user notes (where it saves when you type 'save to memory' or
+    and projects (save to project 'name of project' so you can take work with you to another chat or llm
+
+  - bugfixes
+    + when using the video timeline editor inside framevision, it often froze the whole app, should be
+      fixed now. Also added a new layout and made it default, splitters work better and font can go as
+      small as 6px now to show everything on 1 page.
+    + fixed planner sometimes still pointing at old test workflow for ltx 2.3 & added Krea 2 to the list
+     
+</details>    
 <details>
 <summary>June 25 2026 Framevision V2.5 brings llm into framevision</summary>
   - LLM-chat is a gguf loader for large language models with special options added such as image creation/editing, text/image or video to video and music creation.
