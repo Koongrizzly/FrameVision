@@ -522,10 +522,13 @@ def _run_klein9b_te_q8(root: Path) -> Optional[Tuple[str, List[str], Path]]:
 
 
 def _find_krea2_downloader_script(root: Path) -> Optional[Path]:
-    """Return the Krea 2 GGUF downloader script when present."""
+    """Return the Krea 2 Turbo GGUF downloader script when present."""
     candidates = [
+        root / "presets" / "extra_env" / "download_krea2_turbo.py",
         root / "presets" / "extra_env" / "download_krea2.py",
+        root / "helpers" / "download_krea2_turbo.py",
         root / "helpers" / "download_krea2.py",
+        root / "download_krea2_turbo.py",
         root / "download_krea2.py",
     ]
     for c in candidates:
@@ -534,15 +537,106 @@ def _find_krea2_downloader_script(root: Path) -> Optional[Path]:
     return None
 
 
-def _run_krea2_gguf(root: Path) -> Optional[Tuple[str, List[str], Path]]:
-    """Launch the Krea 2 GGUF downloader using the current app Python."""
+def _run_krea2_gguf(root: Path, quant: str) -> Optional[Tuple[str, List[str], Path]]:
+    """Download selected Krea 2 Turbo GGUF plus shared runtime files.
+
+    Runs non-interactively from Optional Installs: newest sd-cli, VAE, Qwen3-VL
+    text encoder and the selected Turbo GGUF. BASE GGUF files are not downloaded.
+    """
     script = _find_krea2_downloader_script(root)
     if script is None:
         return None
     py = _venv_python(root)
     if py is None or (not py.exists()):
         return None
-    return (str(py), ["-u", str(script)], root)
+    args = [
+        "-u",
+        str(script),
+        "--app-root",
+        str(root),
+        "--gguf-quant",
+        str(quant),
+        "--yes",
+    ]
+    return (str(py), args, root)
+
+
+def _run_krea2_gguf_q3ks(root: Path) -> Optional[Tuple[str, List[str], Path]]:
+    return _run_krea2_gguf(root, "Q3_K_S")
+
+
+def _run_krea2_gguf_q3km(root: Path) -> Optional[Tuple[str, List[str], Path]]:
+    return _run_krea2_gguf(root, "Q3_K_M")
+
+
+def _run_krea2_gguf_q4km(root: Path) -> Optional[Tuple[str, List[str], Path]]:
+    return _run_krea2_gguf(root, "Q4_K_M")
+
+
+def _run_krea2_gguf_q5ks(root: Path) -> Optional[Tuple[str, List[str], Path]]:
+    return _run_krea2_gguf(root, "Q5_K_S")
+
+
+def _run_krea2_gguf_q6k(root: Path) -> Optional[Tuple[str, List[str], Path]]:
+    return _run_krea2_gguf(root, "Q6_K")
+
+
+def _run_krea2_gguf_q8(root: Path) -> Optional[Tuple[str, List[str], Path]]:
+    return _run_krea2_gguf(root, "Q8_0")
+
+
+def _find_boogu_downloader_script(root: Path) -> Optional[Path]:
+    """Return the Boogu Image downloader script when present."""
+    candidates = [
+        root / "presets" / "extra_env" / "Boogu_download.py",
+        root / "presets" / "extra_env" / "boogu_download.py",
+        root / "helpers" / "Boogu_download.py",
+        root / "helpers" / "boogu_download.py",
+    ]
+    for c in candidates:
+        if c.exists():
+            return c
+    return None
+
+
+def _run_boogu_gguf(root: Path, quant: str) -> Optional[Tuple[str, List[str], Path]]:
+    """Download Boogu Turbo V2 + Edit GGUF files plus required shared files.
+
+    Runs non-interactively from Optional Installs: newest sd-cli, VAE, Qwen3-VL text
+    encoder, mmproj, and the selected GGUF quant group.
+    """
+    script = _find_boogu_downloader_script(root)
+    if script is None:
+        return None
+    py = _venv_python(root)
+    if py is None or (not py.exists()):
+        return None
+    args = [
+        "-u",
+        str(script),
+        "--app-root",
+        str(root),
+        "--precision",
+        "gguf",
+        "--models",
+        "both",
+        "--gguf-quant",
+        str(quant),
+        "--yes",
+    ]
+    return (str(py), args, root)
+
+
+def _run_boogu_gguf_q4(root: Path) -> Optional[Tuple[str, List[str], Path]]:
+    return _run_boogu_gguf(root, "Q4")
+
+
+def _run_boogu_gguf_q5(root: Path) -> Optional[Tuple[str, List[str], Path]]:
+    return _run_boogu_gguf(root, "Q5")
+
+
+def _run_boogu_gguf_q8(root: Path) -> Optional[Tuple[str, List[str], Path]]:
+    return _run_boogu_gguf(root, "Q8")
 
 
 def _run_ace(root: Path) -> Optional[Tuple[str, List[str], Path]]:
@@ -1339,14 +1433,58 @@ OptionalInstall(
         ),
 
         OptionalInstall(
-            key="krea2_gguf",
-            title="Krea 2 GGUF",
-            description=(
-                "Fast and low VRAM (Q4 needs about 13 gigabyte). "
-                "Downloads a Krea 2 Turbo GGUF into models/krea2. "
-                "You can also download base model GGUF files and drop them in the same folder as the Turbo model to use them in the GGUF loader."
-            ),
-            runner=_run_krea2_gguf,
+            key="krea2_gguf_q3ks",
+            title="Krea 2 Turbo GGUF (Q3_K_S)",
+            description="Lowest VRAM / smallest Turbo GGUF. Downloads selected Turbo GGUF plus newest sd-cli, VAE and Qwen3-VL text encoder without extra prompts.",
+            runner=_run_krea2_gguf_q3ks,
+        ),
+        OptionalInstall(
+            key="krea2_gguf_q3km",
+            title="Krea 2 Turbo GGUF (Q3_K_M)",
+            description="Low VRAM Turbo GGUF. Downloads selected Turbo GGUF plus newest sd-cli, VAE and Qwen3-VL text encoder without extra prompts.",
+            runner=_run_krea2_gguf_q3km,
+        ),
+        OptionalInstall(
+            key="krea2_gguf_q4km",
+            title="Krea 2 Turbo GGUF (Q4_K_M good default)",
+            description="Good default. Fast and low VRAM. Downloads selected Turbo GGUF plus newest sd-cli, VAE and Qwen3-VL text encoder without extra prompts.",
+            runner=_run_krea2_gguf_q4km,
+        ),
+        OptionalInstall(
+            key="krea2_gguf_q5ks",
+            title="Krea 2 Turbo GGUF (Q5_K_S)",
+            description="Higher quality / larger than Q4. Downloads selected Turbo GGUF plus newest sd-cli, VAE and Qwen3-VL text encoder without extra prompts.",
+            runner=_run_krea2_gguf_q5ks,
+        ),
+        OptionalInstall(
+            key="krea2_gguf_q6k",
+            title="Krea 2 Turbo GGUF (Q6_K)",
+            description="Larger Turbo GGUF. Downloads selected Turbo GGUF plus newest sd-cli, VAE and Qwen3-VL text encoder without extra prompts.",
+            runner=_run_krea2_gguf_q6k,
+        ),
+        OptionalInstall(
+            key="krea2_gguf_q8",
+            title="Krea 2 Turbo GGUF (Q8_0)",
+            description="Best quality / largest Turbo GGUF. Downloads selected Turbo GGUF plus newest sd-cli, VAE and Qwen3-VL text encoder without extra prompts.",
+            runner=_run_krea2_gguf_q8,
+        ),
+        OptionalInstall(
+            key="boogu_gguf_q4",
+            title="Boogu Image GGUF (Q4 good default)",
+            description="Boogu text to image and Image edit GGUF files, good default = Q4. Downloads Turbo V2 + Edit GGUF files plus newest sd-cli, VAE, text encoder and mmproj without extra prompts.",
+            runner=_run_boogu_gguf_q4,
+        ),
+        OptionalInstall(
+            key="boogu_gguf_q5",
+            title="Boogu Image GGUF (Q5)",
+            description="Boogu text to image and Image edit GGUF files. Higher quality / larger than Q4. Downloads Turbo V2 + Edit GGUF files plus newest sd-cli, VAE, text encoder and mmproj without extra prompts.",
+            runner=_run_boogu_gguf_q5,
+        ),
+        OptionalInstall(
+            key="boogu_gguf_q8",
+            title="Boogu Image GGUF (Q8)",
+            description="Boogu text to image and Image edit GGUF files. Best quality / largest. Downloads Turbo V2 + Edit GGUF files plus newest sd-cli, VAE, text encoder and mmproj without extra prompts.",
+            runner=_run_boogu_gguf_q8,
         ),
         OptionalInstall(
             key="hidream_edit_base",
@@ -2123,10 +2261,12 @@ class OptionalInstallsDialog(QtWidgets.QDialog):
             is_hunyuan15_extra = opt.key.startswith("hunyuan15_") and opt.key != "hunyuan15"
             is_hidream_extra = opt.key.startswith("hidream_edit_")
             is_ideogram4_extra = opt.key.startswith("ideogram4_") and opt.key != "ideogram4_runtime"
+            is_boogu_extra = opt.key.startswith("boogu_gguf_")
+            is_krea2_extra = opt.key.startswith("krea2_gguf_")
 
             row = _OptionRow(
                 opt,
-                indent=(26 if (is_zimage_extra or is_qwen_extra or is_qwen3tts_extra or is_seedvr2_extra or is_hunyuan15_extra or is_hidream_extra or is_ideogram4_extra) else 0),
+                indent=(26 if (is_zimage_extra or is_qwen_extra or is_qwen3tts_extra or is_seedvr2_extra or is_hunyuan15_extra or is_hidream_extra or is_ideogram4_extra or is_boogu_extra or is_krea2_extra) else 0),
             )
 
             if is_zimage_extra:
@@ -2143,6 +2283,10 @@ class OptionalInstallsDialog(QtWidgets.QDialog):
                 row.toggled.connect(lambda checked, k=opt.key: self._on_ideogram4_model_toggled(k, checked))
             if opt.key.startswith("hidream_edit_"):
                 row.toggled.connect(lambda checked, k=opt.key: self._on_hidream_edit_model_toggled(k, checked))
+            if opt.key.startswith("boogu_gguf_"):
+                row.toggled.connect(lambda checked, k=opt.key: self._on_boogu_gguf_toggled(k, checked))
+            if opt.key.startswith("krea2_gguf_"):
+                row.toggled.connect(lambda checked, k=opt.key: self._on_krea2_gguf_toggled(k, checked))
 
             if is_seedvr2_extra:
                 row.toggled.connect(lambda checked, k=opt.key: self._on_seedvr2_model_toggled(k, checked))
@@ -2198,6 +2342,30 @@ class OptionalInstallsDialog(QtWidgets.QDialog):
                 _add_opt(opt, chroma_lay)
 
         opts_lay.addWidget(chroma_sec)
+
+        # Krea 2 Turbo GGUF group (collapsible)
+        krea2_sec = _CollapsibleSection("Krea 2 Turbo GGUF Text to Image", start_collapsed=True)
+        krea2_lay = krea2_sec.layout_content()
+
+        _add_group_label("Turbo GGUF model (choose one)", krea2_lay)
+        for k in ("krea2_gguf_q3ks", "krea2_gguf_q3km", "krea2_gguf_q4km", "krea2_gguf_q5ks", "krea2_gguf_q6k", "krea2_gguf_q8"):
+            opt = by_key.get(k)
+            if opt:
+                _add_opt(opt, krea2_lay)
+
+        opts_lay.addWidget(krea2_sec)
+
+        # Boogu Image GGUF group (collapsible)
+        boogu_sec = _CollapsibleSection("Boogu Image GGUF Text to Image / Image Edit", start_collapsed=True)
+        boogu_lay = boogu_sec.layout_content()
+
+        _add_group_label("Turbo V2 + Edit GGUF models (choose one)", boogu_lay)
+        for k in ("boogu_gguf_q4", "boogu_gguf_q5", "boogu_gguf_q8"):
+            opt = by_key.get(k)
+            if opt:
+                _add_opt(opt, boogu_lay)
+
+        opts_lay.addWidget(boogu_sec)
 
         # HiDream group (collapsible)
         hidream_sec = _CollapsibleSection("HiDream", start_collapsed=True)
@@ -2969,6 +3137,56 @@ class OptionalInstallsDialog(QtWidgets.QDialog):
             self._toast("Qwen 3 TTS environment not found — it will be installed first.")
 
         self._toast("Qwen 3 TTS models will download when you press Start (env install only needed once).")
+
+
+    def _on_krea2_gguf_toggled(self, key: str, checked: bool) -> None:
+        """Keep Krea 2 Turbo GGUF quant selection sane and warn when downloader is missing."""
+        if not checked:
+            return
+
+        try:
+            for k, row in getattr(self, "_row_by_key", {}).items():
+                if k.startswith("krea2_gguf_") and k != key and row.is_checked():
+                    row.set_checked(False)
+        except Exception:
+            pass
+
+        script = _find_krea2_downloader_script(self.root_dir)
+        if script is None:
+            self._toast("Missing downloader: presets/extra_env/download_krea2_turbo.py")
+            return
+
+        py = _venv_python(self.root_dir)
+        if py is None or (not py.exists()):
+            self._toast("Python .venv not found. Run the main installer first so FrameVision creates .venv.")
+            return
+
+        self._toast("Krea 2 will download the selected Turbo GGUF and shared runtime files when you press Start.")
+
+
+    def _on_boogu_gguf_toggled(self, key: str, checked: bool) -> None:
+        """Keep Boogu GGUF quant selection sane and warn when downloader is missing."""
+        if not checked:
+            return
+
+        try:
+            for k, row in getattr(self, "_row_by_key", {}).items():
+                if k.startswith("boogu_gguf_") and k != key and row.is_checked():
+                    row.set_checked(False)
+        except Exception:
+            pass
+
+        script = _find_boogu_downloader_script(self.root_dir)
+        if script is None:
+            self._toast("Missing downloader: presets/extra_env/Boogu_download.py")
+            return
+
+        py = _venv_python(self.root_dir)
+        if py is None or (not py.exists()):
+            self._toast("Python .venv not found. Run the main installer first so FrameVision creates .venv.")
+            return
+
+        self._toast("Boogu will download Turbo V2 + Edit GGUF files and shared runtime files when you press Start.")
 
 
     def _on_ideogram4_model_toggled(self, key: str, checked: bool) -> None:

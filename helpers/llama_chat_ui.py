@@ -2253,13 +2253,17 @@ class ChatCompletionThread(QtCore.QThread):
     succeeded = QtCore.Signal(object)
     failed = QtCore.Signal(str)
 
-    def __init__(self, base_url: str, messages: List[Dict], max_tokens: int, temperature: float, top_p: float, parent=None):
+    def __init__(self, base_url: str, messages: List[Dict], max_tokens: int, temperature: float, top_p: float, timeout_s: int = 600, parent=None):
         super().__init__(parent)
         self.base_url = base_url.rstrip("/")
         self.messages = messages
         self.max_tokens = max_tokens
         self.temperature = temperature
         self.top_p = top_p
+        try:
+            self.timeout_s = max(30, min(int(timeout_s), 1800))
+        except Exception:
+            self.timeout_s = 600
 
     def run(self):
         try:
@@ -2272,7 +2276,7 @@ class ChatCompletionThread(QtCore.QThread):
                 "top_p": float(self.top_p),
                 "reasoning_format": "none",
             }
-            code, data = _http_post_json(f"{self.base_url}/v1/chat/completions", payload, timeout=360.0)
+            code, data = _http_post_json(f"{self.base_url}/v1/chat/completions", payload, timeout=float(self.timeout_s))
             if code >= 400:
                 msg = data.get("error", {}).get("message", f"HTTP {code}")
                 self.failed.emit(str(msg))
@@ -2299,6 +2303,10 @@ class ChatCompletionThread(QtCore.QThread):
             if not content:
                 content = "[Model returned an empty response]"
             self.succeeded.emit({"content": content, "thinking": reasoning, "images": images})
+        except TimeoutError:
+            self.failed.emit(f"Generation timed out after {int(getattr(self, 'timeout_s', 600))} seconds.")
+        except socket.timeout:
+            self.failed.emit(f"Generation timed out after {int(getattr(self, 'timeout_s', 600))} seconds.")
         except Exception as e:
             self.failed.emit(str(e))
 
@@ -2533,6 +2541,12 @@ class SettingsDialog(QtWidgets.QDialog):
         self.sp_max_tokens.setRange(1, 500000)
         self.sp_max_tokens.setValue(1200)
 
+        self.sp_generation_timeout = QtWidgets.QSpinBox()
+        self.sp_generation_timeout.setRange(30, 1800)
+        self.sp_generation_timeout.setSingleStep(30)
+        self.sp_generation_timeout.setSuffix(" sec")
+        self.sp_generation_timeout.setValue(600)
+
         self.sp_temp = QtWidgets.QDoubleSpinBox()
         self.sp_temp.setRange(0.0, 2.0)
         self.sp_temp.setSingleStep(0.05)
@@ -2582,6 +2596,11 @@ class SettingsDialog(QtWidgets.QDialog):
             "Planner / storymode long answers: 12000-16000\n"
             "Do not set this equal to Context size."
         )
+        timeout_tip = (
+            "Maximum time the local LLM may spend on one answer.\n"
+            "Normal chat: 180 seconds\n"
+            "Large code generation: 600 seconds / 10 minutes"
+        )
         temp_tip = (
             "Creativity/randomness. Good defaults:\n"
             "Coding / patches: 0.20-0.40\n"
@@ -2600,6 +2619,7 @@ class SettingsDialog(QtWidgets.QDialog):
         self.cmb_template.setToolTip(template_tip)
         self.sp_ctx_size.setToolTip(ctx_tip)
         self.sp_max_tokens.setToolTip(max_tokens_tip)
+        self.sp_generation_timeout.setToolTip(timeout_tip)
         self.sp_temp.setToolTip(temp_tip)
         self.sp_top_p.setToolTip(top_p_tip)
         self.ed_system.setToolTip(system_tip)
@@ -2642,6 +2662,12 @@ class SettingsDialog(QtWidgets.QDialog):
         lbl_max_tokens.setToolTip(max_tokens_tip)
         form.addWidget(lbl_max_tokens, r, 0)
         form.addWidget(self.sp_max_tokens, r, 1, 1, 2)
+        r += 1
+
+        lbl_generation_timeout = QtWidgets.QLabel("Generation timeout")
+        lbl_generation_timeout.setToolTip(timeout_tip)
+        form.addWidget(lbl_generation_timeout, r, 0)
+        form.addWidget(self.sp_generation_timeout, r, 1, 1, 2)
         r += 1
 
         lbl_temp = QtWidgets.QLabel("Temperature")
@@ -2739,6 +2765,7 @@ class SettingsDialog(QtWidgets.QDialog):
             self.cmb_template,
             self.sp_ctx_size,
             self.sp_max_tokens,
+            self.sp_generation_timeout,
             self.sp_temp,
             self.sp_top_p,
         ]:
@@ -4153,6 +4180,10 @@ class LlamaChatWindow(QtWidgets.QMainWindow):
         except Exception:
             pass
         try:
+            self.settings_dialog.sp_generation_timeout.setValue(int(data.get("generation_timeout_seconds", 600)))
+        except Exception:
+            pass
+        try:
             self.settings_dialog.sp_temp.setValue(float(data.get("temp", 0.7)))
         except Exception:
             pass
@@ -4220,6 +4251,7 @@ class LlamaChatWindow(QtWidgets.QMainWindow):
             "template_value": self.current_template_choice()[1],
             "ctx_size": int(self.settings_dialog.sp_ctx_size.value()),
             "max_tokens": int(self.settings_dialog.sp_max_tokens.value()),
+            "generation_timeout_seconds": int(self.settings_dialog.sp_generation_timeout.value()),
             "temp": float(self.settings_dialog.sp_temp.value()),
             "top_p": float(self.settings_dialog.sp_top_p.value()),
             # Kept for compatibility with older settings files, but intentionally
@@ -6553,6 +6585,7 @@ class LlamaChatWindow(QtWidgets.QMainWindow):
             self.settings_dialog.sp_max_tokens.value(),
             self.settings_dialog.sp_temp.value(),
             self.settings_dialog.sp_top_p.value(),
+            self.settings_dialog.sp_generation_timeout.value(),
             self,
         )
         self.chat_thread.succeeded.connect(self._on_chat_succeeded)
@@ -9156,7 +9189,7 @@ class LlamaChatWindow(QtWidgets.QMainWindow):
 
         self.lbl_title.setText(s.title if s else "New Chat")
         self.lbl_model_info.setText(
-            f"{state_text}   •   template: {template_text}   •   ctx: {int(self.settings_dialog.sp_ctx_size.value())}   •   max tokens: {int(self.settings_dialog.sp_max_tokens.value())}"
+            f"{state_text}   •   template: {template_text}   •   ctx: {int(self.settings_dialog.sp_ctx_size.value())}   •   max tokens: {int(self.settings_dialog.sp_max_tokens.value())}   •   timeout: {int(self.settings_dialog.sp_generation_timeout.value())}s"
         )
 
     # ---------- window ----------
