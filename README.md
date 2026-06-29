@@ -23,9 +23,9 @@ Create, Edit, Upscale, Play
  <p align="center">      FrameVision available models & feature list.
    
 ---
-- 🎨 TXT → IMG with SD15/SDXL- Z-Image Turbo - Chroma - Lens - Qwen 2512 - Ideogram 4)
-- 🖌️ Image edit, reference, inpaint,... with Qwen2511, Hi-dream studio (includes txt2img), Flux Klein (includes txt2img) and Fireredit 1.1
-- 🎬 txt/img/video to video with WAN 2.2 5B/ Wan2.2 Turbo 4 step - Hiar (experimental) - HunyuanVideo 1.5 - LTX 2.3 - Bernini R 1.3B
+- 🎨 TXT → IMG with SD15/SDXL- Z-Image Turbo - Chroma - Lens - Qwen 2512 - Krea 2 - Ideogram 4)
+- 🖌️ Image edit, reference, inpaint, (some also include txt 2 img)... with Qwen2511, Hi-dream studio,  Flux Klein, Boogu image and Fireredit 1.1
+- 🎬 txt/img/video to video with WAN 2.2 5B/ Wan2.2 Turbo 4 step - Hiar (experimental) - HunyuanVideo 1.5 - LTX 2.3 - Bernini R 1.3B (base on wan 2.1 also does image and video editing)
 - 🧪 Upscaler with model loader (15+ open source upscale models for photo & video) + seed2VR
 - ⏱️ RIFE Interpolation
 - 📝 Describe in detail, offline chatbot with framevision knowledge and prompt enhancement with Qwen3 VL instruct.
