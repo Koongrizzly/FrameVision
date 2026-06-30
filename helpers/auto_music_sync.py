@@ -279,16 +279,327 @@ def _load_musicclip_bridge_file(filename: str, module_name: str):
         return None
 
 
+# ---------------------------- Krea 2 LTX start-image bridge ----------------
+
+def _musicclip_krea2_is_mode(payload: dict) -> bool:
+    model = str((payload or {}).get("image_model") or (payload or {}).get("image_mode") or "").strip().lower()
+    return model in ("krea2", "krea_2", "krea-2")
+
+
+def _musicclip_krea2_path(root_dir: str, value: str) -> Path:
+    root = Path(str(root_dir or _musicclip_project_root())).resolve()
+    p = Path(str(value or "").strip().strip('"'))
+    return p if p.is_absolute() else (root / p).resolve()
+
+
+def _musicclip_krea2_settings(root_dir: str) -> dict:
+    try:
+        p = Path(str(root_dir or _musicclip_project_root())).resolve() / "presets" / "setsave" / "krea2.json"
+        if p.is_file():
+            data = json.loads(p.read_text(encoding="utf-8"))
+            return data if isinstance(data, dict) else {}
+    except Exception:
+        pass
+    return {}
+
+
+def _musicclip_krea2_first_gguf(root_dir: str, llm: bool = False) -> str:
+    try:
+        root = Path(str(root_dir or _musicclip_project_root())).resolve()
+        files = sorted((root / "models" / "krea2").glob("*.gguf"), key=lambda p: ("turbo" not in p.name.lower(), p.name.lower()))
+        for f in files:
+            low = f.name.lower()
+            if llm:
+                if "qwen" in low and ("vl" in low or "vision" in low):
+                    return str(f)
+            elif "krea" in low:
+                return str(f)
+    except Exception:
+        pass
+    return ""
+
+
+def _musicclip_krea2_files(root_dir: str) -> tuple[dict, list[str]]:
+    root = str(root_dir or _musicclip_project_root())
+    s = _musicclip_krea2_settings(root)
+    paths = {
+        "sd_cli": _musicclip_krea2_path(root, str(s.get("sdcli") or "presets/bin/sd-cli.exe")),
+        "model": _musicclip_krea2_path(root, str(s.get("model") or _musicclip_krea2_first_gguf(root, False))),
+        "llm": _musicclip_krea2_path(root, str(s.get("llm") or _musicclip_krea2_first_gguf(root, True))),
+        "vae": _musicclip_krea2_path(root, str(s.get("vae") or "models/krea2/wan_2.1_vae.safetensors")),
+        "output_dir": _musicclip_krea2_path(root, str(s.get("output_dir") or "output/images/krea2")),
+    }
+    labels = {"sd_cli": "sd-cli", "model": "Krea 2 GGUF", "llm": "Krea 2 Qwen3VL text encoder", "vae": "Krea 2 VAE"}
+    missing = [f"{labels[k]}: {v}" for k, v in paths.items() if k in labels and (not v or not Path(v).is_file())]
+    return {"settings": s, "paths": paths}, missing
+
+
+def _musicclip_krea2_resolution(payload: dict) -> tuple[int, int]:
+    raw = str((payload or {}).get("resolution") or (payload or {}).get("ltx_resolution") or "").lower()
+    if "704x1280" in raw or raw in ("portrait", "9:16"):
+        return 704, 1280
+    if "704x704" in raw or raw in ("square", "1:1"):
+        return 704, 704
+    m = re.search(r"(\d+)\s*[x×]\s*(\d+)", raw)
+    if m:
+        return int(m.group(1)), int(m.group(2))
+    return 1280, 704
+
+
+def _musicclip_krea2_find_output(path_text: str) -> str:
+    p = Path(str(path_text or ""))
+    if "%" not in str(p):
+        return str(p) if p.is_file() else ""
+    matches = sorted(p.parent.glob(p.name.split("%")[0] + "*.png"), key=lambda x: x.stat().st_mtime, reverse=True)
+    return str(matches[0]) if matches else ""
+
+
+def _musicclip_krea2_shots(plan_data: dict) -> list[dict]:
+    for key in ("shots", "ltx_shots", "director_shots", "items"):
+        val = plan_data.get(key) if isinstance(plan_data, dict) else None
+        if isinstance(val, list):
+            return [x for x in val if isinstance(x, dict)]
+    return []
+
+
+def _musicclip_krea2_shot_id(shot: dict, index: int) -> str:
+    for key in ("id", "shot_id", "ltx_id", "name"):
+        val = str((shot or {}).get(key) or "").strip()
+        if val:
+            return val
+    return f"LTX{index + 1:02d}"
+
+
+def _musicclip_krea2_prompt(shot: dict) -> str:
+    for key in ("director_image_prompt", "image_prompt", "start_image_prompt", "visual_prompt", "director_visual_prompt", "scene_image_prompt", "prompt"):
+        val = str((shot or {}).get(key) or "").strip()
+        if val:
+            return val
+    bits = [str((shot or {}).get(k) or "").strip() for k in ("scene_role_summary", "microclip_style", "title", "description")]
+    bits = [b for b in bits if b]
+    return ", ".join(bits) if bits else "cinematic music video start image, sharp, detailed"
+
+
+def _musicclip_krea2_review_paths(plan_path: str) -> tuple[str, str]:
+    pp = Path(str(plan_path or _musicclip_project_root())).resolve()
+    review_dir = pp.parent / "ltx_review_current"
+    return str(review_dir), str(review_dir / "ltx_review_state.json")
+
+
+def _musicclip_krea2_read_state(plan_path: str) -> dict:
+    try:
+        _, state_path = _musicclip_krea2_review_paths(plan_path)
+        if os.path.isfile(state_path):
+            data = json.loads(Path(state_path).read_text(encoding="utf-8"))
+            return data if isinstance(data, dict) else {}
+    except Exception:
+        pass
+    return {}
+
+
+def _musicclip_krea2_write_state(plan_path: str, state: dict) -> None:
+    try:
+        review_dir, state_path = _musicclip_krea2_review_paths(plan_path)
+        os.makedirs(review_dir, exist_ok=True)
+        Path(state_path).write_text(json.dumps(state if isinstance(state, dict) else {}, indent=2, ensure_ascii=False), encoding="utf-8")
+    except Exception:
+        pass
+
+
+def _musicclip_generate_krea2_start_image(payload: dict) -> dict:
+    payload = dict(payload or {})
+    root = str(payload.get("root_dir") or _musicclip_project_root())
+    info, missing = _musicclip_krea2_files(root)
+    if missing:
+        return {"ok": False, "message": "Missing Krea 2 file(s):\n" + "\n".join(missing)}
+    s, paths = info["settings"], info["paths"]
+    prompt = str(payload.get("image_prompt_override") or payload.get("image_prompt") or "cinematic music video start image, sharp, detailed").strip()
+    seed = payload.get("seed", -1)
+    try: seed = int(seed) if seed not in (None, "") else -1
+    except Exception: seed = -1
+    w, h = _musicclip_krea2_resolution(payload)
+    out_dir = Path(str(payload.get("output_dir") or paths["output_dir"]))
+    if not out_dir.is_absolute(): out_dir = Path(root) / out_dir
+    out_dir.mkdir(parents=True, exist_ok=True)
+    shot_id = re.sub(r"[^A-Za-z0-9_.-]+", "_", str(payload.get("shot_id") or "ltx")).strip("._") or "ltx"
+    name = str(payload.get("start_image_name") or f"{shot_id}_krea2_start.png")
+    output_path = out_dir / name
+    if output_path.suffix.lower() != ".png": output_path = output_path.with_suffix(".png")
+    is_turbo = "turbo" in str(paths["model"]).lower()
+    steps = int(s.get("steps", 8 if is_turbo else 30) or (8 if is_turbo else 30))
+    cfg = float(s.get("cfg", 1.0 if is_turbo else 3.0) or (1.0 if is_turbo else 3.0))
+    guidance = float(s.get("guidance", 3.5) or 3.5)
+    cmd = [str(paths["sd_cli"]), "--diffusion-model", str(paths["model"]), "--llm", str(paths["llm"]), "--vae", str(paths["vae"]), "-p", prompt, "--steps", str(steps), "--cfg-scale", str(cfg), "--guidance", str(guidance), "--width", str(w), "--height", str(h), "--seed", str(seed), "--batch-count", "1", "--output", str(output_path)]
+    neg = str(s.get("negative") or "").strip()
+    if neg: cmd += ["--negative-prompt", neg]
+    try:
+        flow = float(s.get("flow_shift", 1.15))
+        if flow >= 0: cmd += ["--flow-shift", str(flow)]
+    except Exception: pass
+    if bool(s.get("diffusion_fa", True)): cmd.append("--diffusion-fa")
+    if bool(s.get("offload", False)): cmd.append("--offload-to-cpu")
+    if bool(s.get("vae_tiling", False)): cmd.append("--vae-tiling")
+    if bool(s.get("disable_metadata", False)): cmd.append("--disable-image-metadata")
+    for key, flag in (("backend", "--backend"), ("params_backend", "--params-backend")):
+        val = str(s.get(key) or "").strip()
+        if val: cmd += [flag, val]
+    sampler = str(s.get("sampler", "euler") or "euler")
+    scheduler = str(s.get("scheduler", "auto") or "auto")
+    if sampler and sampler != "auto": cmd += ["--sampling-method", sampler]
+    if scheduler and scheduler != "auto": cmd += ["--scheduler", scheduler]
+    extra = str(s.get("extra_args") or "").strip()
+    if extra: cmd += extra.split()
+    if bool(s.get("verbose", True)): cmd.append("-v")
+    cb = payload.get("progress_callback")
+    def emit(msg):
+        if callable(cb):
+            try: cb(str(msg))
+            except Exception: pass
+    emit("Krea 2: running sd-cli start-image generation...")
+    log_path = out_dir / str(payload.get("start_image_log_name") or f"{shot_id}_krea2_imagegen.log.txt")
+    try:
+        with open(log_path, "w", encoding="utf-8", errors="ignore") as logf:
+            logf.write("Command:\n" + " ".join('"'+c+'"' if " " in c else c for c in cmd) + "\n\n")
+            proc = subprocess.Popen(cmd, cwd=root, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, encoding="utf-8", errors="replace")
+            assert proc.stdout is not None
+            for line in proc.stdout:
+                logf.write(line)
+                if line.strip(): emit("[Krea 2] " + line.strip()[:240])
+            code = proc.wait()
+        if code != 0:
+            return {"ok": False, "message": f"Krea 2 sd-cli failed with exit code {code}. Log: {log_path}"}
+    except Exception as exc:
+        return {"ok": False, "message": f"Krea 2 image generation failed: {exc}"}
+    start_path = _musicclip_krea2_find_output(str(output_path))
+    if not start_path:
+        return {"ok": False, "message": f"Krea 2 sd-cli finished but no output image was found: {output_path}"}
+    try:
+        payload_name = str(payload.get("start_image_payload_name") or f"{shot_id}_krea2_start_image_payload.json")
+        (out_dir / payload_name).write_text(json.dumps({"image_model": "krea2", "prompt": prompt, "seed": seed, "width": w, "height": h, "command": cmd, "start_image_path": start_path}, indent=2, ensure_ascii=False), encoding="utf-8")
+    except Exception: pass
+    return {"ok": True, "start_image_path": start_path, "seed": seed, "image_model": "krea2", "message": "Krea 2 start image ready."}
+
+
+def _musicclip_prepare_krea2_full_run_payload(payload: dict) -> dict:
+    payload = dict(payload or {})
+    plan_path = str(payload.get("ltx_director_plan_path") or "").strip()
+    if not plan_path or not os.path.isfile(plan_path): return {"ok": False, "message": f"LTX director plan was not found: {plan_path or '[empty]'}"}
+    try: plan_data = json.loads(Path(plan_path).read_text(encoding="utf-8"))
+    except Exception as exc: return {"ok": False, "message": f"Could not read LTX director plan for Krea 2 full run: {exc}"}
+    shots = _musicclip_krea2_shots(plan_data)
+    if not shots: return {"ok": False, "message": "LTX director plan has no shots for Krea 2 full run."}
+    progress = payload.get("progress_callback")
+    def emit(msg):
+        if callable(progress):
+            try: progress(str(msg))
+            except Exception: pass
+    review_dir, state_path = _musicclip_krea2_review_paths(plan_path)
+    state = _musicclip_krea2_read_state(plan_path)
+    shots_state = state.setdefault("shots", {}) if isinstance(state, dict) else {}
+    if not isinstance(shots_state, dict): shots_state = {}; state["shots"] = shots_state
+    generated = updated = 0
+    for idx, shot in enumerate(shots):
+        sid = _musicclip_krea2_shot_id(shot, idx)
+        item = shots_state.get(sid) if isinstance(shots_state.get(sid), dict) else {}
+        shots_state[sid] = item
+        start_path = str(item.get("current_start_image_path") or shot.get("current_start_image_path") or shot.get("start_image_path") or "").strip()
+        if not (start_path and os.path.isfile(start_path)):
+            emit(f"Krea 2: generating start image {idx+1}/{len(shots)} ({sid})...")
+            stem = re.sub(r"[^A-Za-z0-9_.-]+", "_", sid).strip("._") or f"LTX{idx+1:02d}"
+            result = _musicclip_generate_krea2_start_image({"root_dir": payload.get("root_dir") or _musicclip_project_root(), "ltx_director_plan_path": plan_path, "shot_id": sid, "image_model": "krea2", "image_prompt_override": _musicclip_krea2_prompt(shot), "seed": item.get("image_seed", payload.get("seed", -1)), "output_dir": review_dir, "start_image_name": f"{stem}_krea2_start.png", "start_image_payload_name": f"{stem}_krea2_start_image_payload.json", "start_image_log_name": f"{stem}_krea2_imagegen.log.txt", "progress_callback": progress, "resolution": payload.get("resolution") or payload.get("ltx_resolution") or ""})
+            if not isinstance(result, dict) or not result.get("ok"):
+                return {"ok": False, "message": str(result.get("message") if isinstance(result, dict) else f"Krea 2 start image failed for {sid}")}
+            start_path = str(result.get("start_image_path") or "")
+            item["last_image_result"] = result
+            generated += 1
+        item.update({"status": "Image ready - clip needs recreate", "image_prompt": _musicclip_krea2_prompt(shot), "current_start_image_path": start_path, "clip_invalidated_by_new_image": True})
+        shot["start_image_path"] = shot["current_start_image_path"] = shot["existing_start_image_path"] = start_path
+        shot["image_mode"] = "existing"
+        updated += 1
+    _musicclip_krea2_write_state(plan_path, state)
+    temp_plan = copy.deepcopy(plan_data)
+    for idx, shot in enumerate(_musicclip_krea2_shots(temp_plan)):
+        sid = _musicclip_krea2_shot_id(shot, idx)
+        item = shots_state.get(sid) or {}
+        sp = str(item.get("current_start_image_path") or "")
+        if sp:
+            shot["start_image_path"] = shot["current_start_image_path"] = shot["existing_start_image_path"] = sp
+            shot["image_mode"] = "existing"
+    temp_path = Path(plan_path).resolve().parent / "musicclip_ltx_director_plan_krea2_prepared.json"
+    temp_path.write_text(json.dumps(temp_plan, indent=2, ensure_ascii=False), encoding="utf-8")
+    new_payload = dict(payload)
+    new_payload.update({"image_mode": "existing", "image_model": "existing", "ltx_director_plan_path": str(temp_path), "krea2_prepared_from_plan": plan_path, "use_review_current_images": True, "review_state_path": state_path})
+    emit(f"Krea 2: prepared {updated} start image(s), generated {generated} new image(s). Continuing LTX with existing start images...")
+    return {"ok": True, "payload": new_payload}
+
+
+def _musicclip_prepare_krea2_single_payload(payload: dict) -> dict:
+    payload = dict(payload or {})
+    if not _musicclip_krea2_is_mode(payload): return {"ok": True, "payload": payload}
+    plan_path = str(payload.get("ltx_director_plan_path") or "")
+    shot_id = str(payload.get("shot_id") or "LTX")
+    prompt = str(payload.get("image_prompt_override") or payload.get("image_prompt") or "").strip()
+    if not prompt and plan_path and os.path.isfile(plan_path):
+        try:
+            data = json.loads(Path(plan_path).read_text(encoding="utf-8"))
+            for idx, shot in enumerate(_musicclip_krea2_shots(data)):
+                if _musicclip_krea2_shot_id(shot, idx) == shot_id:
+                    prompt = _musicclip_krea2_prompt(shot); break
+        except Exception: pass
+    review_dir, _state = _musicclip_krea2_review_paths(plan_path)
+    stem = re.sub(r"[^A-Za-z0-9_.-]+", "_", shot_id).strip("._") or "LTX"
+    res = _musicclip_generate_krea2_start_image({"root_dir": payload.get("root_dir") or _musicclip_project_root(), "ltx_director_plan_path": plan_path, "shot_id": shot_id, "image_model": "krea2", "image_prompt_override": prompt, "seed": payload.get("seed", -1), "output_dir": review_dir, "start_image_name": f"{stem}_krea2_start.png", "start_image_log_name": f"{stem}_krea2_imagegen.log.txt", "progress_callback": payload.get("progress_callback"), "resolution": payload.get("resolution") or payload.get("ltx_resolution") or ""})
+    if not isinstance(res, dict) or not res.get("ok"):
+        return {"ok": False, "message": str(res.get("message") if isinstance(res, dict) else "Krea 2 start image failed.")}
+    new_payload = dict(payload)
+    new_payload.update({"image_mode": "existing", "image_model": "existing", "existing_start_image_path": str(res.get("start_image_path") or "")})
+    return {"ok": True, "payload": new_payload, "image_result": res}
+
+
+def _musicclip_patch_krea2_bridge(mod):
+    if mod is None or bool(getattr(mod, "_framevision_krea2_ltx_patched", False)): return mod
+    try:
+        original_gen = getattr(mod, "generate_ltx_start_image_for_shot", None)
+        if callable(original_gen):
+            def _gen(payload):
+                if _musicclip_krea2_is_mode(payload or {}): return _musicclip_generate_krea2_start_image(dict(payload or {}))
+                return original_gen(payload)
+            setattr(mod, "generate_ltx_start_image_for_shot", _gen)
+        original_single = getattr(mod, "run_single_ltx_shot_test", None)
+        if callable(original_single):
+            def _single(payload):
+                if _musicclip_krea2_is_mode(payload or {}):
+                    prep = _musicclip_prepare_krea2_single_payload(dict(payload or {}))
+                    if not prep.get("ok"): return {"ok": False, "message": str(prep.get("message") or "Krea 2 single-shot preparation failed.")}
+                    return original_single(dict(prep.get("payload") or {}))
+                return original_single(payload)
+            setattr(mod, "run_single_ltx_shot_test", _single)
+        original_run_all = getattr(mod, "run_all_ltx_director_shots", None)
+        if callable(original_run_all):
+            def _run_all(payload):
+                if _musicclip_krea2_is_mode(payload or {}):
+                    prep = _musicclip_prepare_krea2_full_run_payload(dict(payload or {}))
+                    if not prep.get("ok"): return {"ok": False, "message": str(prep.get("message") or "Krea 2 full-run preparation failed.")}
+                    return original_run_all(dict(prep.get("payload") or {}))
+                return original_run_all(payload)
+            setattr(mod, "run_all_ltx_director_shots", _run_all)
+        setattr(mod, "_framevision_krea2_ltx_patched", True)
+    except Exception:
+        pass
+    return mod
+
+
+
 def _load_musicclip_planner_bridge():
     # Original/Wan2GP bridge. Keep this separate so the option can hide again
     # when this file is removed.
-    return _load_musicclip_bridge_file("musicclip_planner_bridge.py", "_framevision_musicclip_planner_bridge")
+    return _musicclip_patch_krea2_bridge(_load_musicclip_bridge_file("musicclip_planner_bridge.py", "_framevision_musicclip_planner_bridge"))
 
 
 def _load_clip2ltx_bridge():
     # Own LTX-VRAMLab bridge. This is the copy of the original bridge that calls
     # helpers/ltx23_vram_lab_cli.py directly. It must not depend on the Wan2GP bridge.
-    return _load_musicclip_bridge_file("clip2ltx_cli.py", "_framevision_clip2ltx_bridge")
+    return _musicclip_patch_krea2_bridge(_load_musicclip_bridge_file("clip2ltx_cli.py", "_framevision_clip2ltx_bridge"))
 
 
 def _musicclip_default_llama_runner() -> str:
@@ -2662,12 +2973,12 @@ def _musicclip_load_ltx_bridge_module_for_queue(root_dir: str):
     """Load helpers/musicclip_planner_bridge.py for headless Queue LTX jobs."""
     try:
         import helpers.musicclip_planner_bridge as bridge  # type: ignore
-        return bridge
+        return _musicclip_patch_krea2_bridge(bridge)
     except Exception:
         pass
     try:
         import musicclip_planner_bridge as bridge  # type: ignore
-        return bridge
+        return _musicclip_patch_krea2_bridge(bridge)
     except Exception:
         pass
     import importlib.util
@@ -2682,7 +2993,7 @@ def _musicclip_load_ltx_bridge_module_for_queue(root_dir: str):
         raise RuntimeError(f"Could not load bridge module spec: {bridge_path}")
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)  # type: ignore[attr-defined]
-    return module
+    return _musicclip_patch_krea2_bridge(module)
 
 
 def run_ltx_full_queue_payload(payload_path: str) -> int:
@@ -10553,6 +10864,7 @@ class AutoMusicSyncWidget(QWidget):
             self.combo_ltx_single_image_mode = QComboBox(self.box_planner_bridge)
             self.combo_ltx_single_image_mode.addItem("Use existing start image", "existing")
             self.combo_ltx_single_image_mode.addItem("Z-Image Turbo", "z_image")
+            self.combo_ltx_single_image_mode.addItem("Krea 2", "krea2")
             self.combo_ltx_single_image_mode.addItem("Flux Klein 9B", "flux_klein_9b")
             self.combo_ltx_single_image_mode.addItem("HiDream", "hidream")
             self.combo_ltx_single_image_mode.setCurrentIndex(1)
@@ -15984,7 +16296,7 @@ class AutoMusicSyncWidget(QWidget):
         image_combo = getattr(self, "combo_ltx_single_image_mode", None)
         image_model = str(image_combo.currentData() if image_combo is not None else "flux_klein_9b")
         if image_model == "existing":
-            msg = "Use existing start image does not need generation. Pick Flux Klein 9B, Z-Image Turbo, or HiDream."
+            msg = "Use existing start image does not need generation. Pick Flux Klein 9B, Z-Image Turbo, Krea 2, or HiDream."
             self._set_planner_bridge_status(f"Planner Bridge: {msg}")
             try:
                 QMessageBox.information(self, "Planner Bridge", msg, QMessageBox.Ok)

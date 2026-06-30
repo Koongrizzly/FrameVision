@@ -2557,6 +2557,12 @@ class SettingsDialog(QtWidgets.QDialog):
         self.sp_top_p.setSingleStep(0.05)
         self.sp_top_p.setValue(0.9)
 
+        self.chk_mtp_auto = QtWidgets.QCheckBox("Use MTP when available")
+        self.chk_mtp_auto.setChecked(True)
+        self.sp_mtp_draft_tokens = QtWidgets.QSpinBox()
+        self.sp_mtp_draft_tokens.setRange(1, 16)
+        self.sp_mtp_draft_tokens.setValue(3)
+
         self.ed_system = QtWidgets.QPlainTextEdit()
         self.ed_system.setPlaceholderText("Optional system prompt…")
         self.ed_system.setMaximumHeight(120)
@@ -2608,6 +2614,12 @@ class SettingsDialog(QtWidgets.QDialog):
             "Storymode ideas: 0.60-0.80"
         )
         top_p_tip = "Sampling range. Good default: 0.90. Use 1.00 for more open creative writing; lower values are stricter."
+        mtp_tip = (
+            "Use llama.cpp draft-mtp speculative decoding only when it is safe. "
+            "FrameVision only adds the flag when the runner supports --spec-type draft-mtp and the selected GGUF name looks MTP-enabled. "
+            "If loading fails with MTP, the app retries once without MTP."
+        )
+        mtp_draft_tip = "Number of draft tokens for MTP speculation. 3 is a safe starting point; higher is not always faster."
         system_tip = "Optional instruction that stays active for the chat. Keep it short for coding; use Planner rules here for story/shotlist work."
 
         self.ed_runner.setToolTip(runner_tip)
@@ -2622,6 +2634,8 @@ class SettingsDialog(QtWidgets.QDialog):
         self.sp_generation_timeout.setToolTip(timeout_tip)
         self.sp_temp.setToolTip(temp_tip)
         self.sp_top_p.setToolTip(top_p_tip)
+        self.chk_mtp_auto.setToolTip(mtp_tip)
+        self.sp_mtp_draft_tokens.setToolTip(mtp_draft_tip)
         self.ed_system.setToolTip(system_tip)
 
         r = 0
@@ -2680,6 +2694,18 @@ class SettingsDialog(QtWidgets.QDialog):
         lbl_top_p.setToolTip(top_p_tip)
         form.addWidget(lbl_top_p, r, 0)
         form.addWidget(self.sp_top_p, r, 1, 1, 2)
+        r += 1
+
+        lbl_mtp = QtWidgets.QLabel("MTP speculation")
+        lbl_mtp.setToolTip(mtp_tip)
+        form.addWidget(lbl_mtp, r, 0)
+        form.addWidget(self.chk_mtp_auto, r, 1, 1, 2)
+        r += 1
+
+        lbl_mtp_draft = QtWidgets.QLabel("MTP draft tokens")
+        lbl_mtp_draft.setToolTip(mtp_draft_tip)
+        form.addWidget(lbl_mtp_draft, r, 0)
+        form.addWidget(self.sp_mtp_draft_tokens, r, 1, 1, 2)
 
         lay.addLayout(form)
         lbl_system = QtWidgets.QLabel("System prompt")
@@ -2768,6 +2794,8 @@ class SettingsDialog(QtWidgets.QDialog):
             self.sp_generation_timeout,
             self.sp_temp,
             self.sp_top_p,
+            self.chk_mtp_auto,
+            self.sp_mtp_draft_tokens,
         ]:
             if isinstance(w, QtWidgets.QLineEdit):
                 w.textChanged.connect(self.settingsChanged)
@@ -2775,6 +2803,8 @@ class SettingsDialog(QtWidgets.QDialog):
                 w.currentIndexChanged.connect(self.settingsChanged)
             elif isinstance(w, (QtWidgets.QSpinBox, QtWidgets.QDoubleSpinBox)):
                 w.valueChanged.connect(self.settingsChanged)
+            elif isinstance(w, QtWidgets.QCheckBox):
+                w.toggled.connect(self.settingsChanged)
         self.ed_system.textChanged.connect(self.settingsChanged)
         self._update_bubble_color_mode()
 
@@ -3050,6 +3080,11 @@ class LlamaChatWindow(QtWidgets.QMainWindow):
         self.loaded_template: Tuple[str, str] = ("auto", "")
         self._llm_gpu_lock_active: bool = False
         self.loaded_ctx_size: int = 0
+        self.loaded_mtp_enabled: bool = False
+        self._server_mtp_args_active: bool = False
+        self._mtp_retry_without_mtp_pending: bool = False
+        self._force_disable_mtp_once: bool = False
+        self._runner_mtp_support_cache: Dict[str, bool] = {}
         self.server_log_tail: List[str] = []
         self.pending_generate_session_id: str = ""
         self.pending_retry_generation: bool = False
@@ -4191,6 +4226,14 @@ class LlamaChatWindow(QtWidgets.QMainWindow):
             self.settings_dialog.sp_top_p.setValue(float(data.get("top_p", 0.9)))
         except Exception:
             pass
+        try:
+            self.settings_dialog.chk_mtp_auto.setChecked(bool(data.get("mtp_auto_enabled", True)))
+        except Exception:
+            pass
+        try:
+            self.settings_dialog.sp_mtp_draft_tokens.setValue(int(data.get("mtp_draft_tokens", 3)))
+        except Exception:
+            pass
         model_root = data.get("model_root", os.path.join("models", "llama"))
         if isinstance(model_root, str):
             self.settings_dialog.ed_model_root.setText(model_root)
@@ -4254,6 +4297,8 @@ class LlamaChatWindow(QtWidgets.QMainWindow):
             "generation_timeout_seconds": int(self.settings_dialog.sp_generation_timeout.value()),
             "temp": float(self.settings_dialog.sp_temp.value()),
             "top_p": float(self.settings_dialog.sp_top_p.value()),
+            "mtp_auto_enabled": bool(getattr(self.settings_dialog, "chk_mtp_auto", None).isChecked()) if getattr(self.settings_dialog, "chk_mtp_auto", None) is not None else True,
+            "mtp_draft_tokens": int(getattr(self.settings_dialog, "sp_mtp_draft_tokens", None).value()) if getattr(self.settings_dialog, "sp_mtp_draft_tokens", None) is not None else 3,
             # Kept for compatibility with older settings files, but intentionally
             # not populated from the visible editor. That editor shows the selected
             # chat's prompt; saving it globally caused pinned-chat prompt leakage.
@@ -5573,6 +5618,7 @@ class LlamaChatWindow(QtWidgets.QMainWindow):
             == os.path.normcase(os.path.normpath(self.current_model_path() or ""))
             and self.loaded_template == self.current_template_choice()
             and int(self.loaded_ctx_size or 0) == int(self.settings_dialog.sp_ctx_size.value())
+            and bool(getattr(self, "loaded_mtp_enabled", False)) == bool(self._should_use_mtp_for_model(self.current_model_path(), self._resolve_runner_for_feature_check()))
         )
 
     def _effective_template_choice(self, model_path: str, template_kind: str, template_value: str) -> Tuple[str, str]:
@@ -5582,6 +5628,60 @@ class LlamaChatWindow(QtWidgets.QMainWindow):
                 return guessed_kind, guessed_value
             return ("auto", "")
         return (template_kind, template_value)
+
+    def _resolve_runner_for_feature_check(self) -> str:
+        try:
+            runner = self._runner_path()
+            if runner:
+                return _resolve_server_executable(runner)
+        except Exception:
+            pass
+        return ""
+
+    def _model_looks_mtp_enabled(self, model_path: str) -> bool:
+        try:
+            name = os.path.basename(str(model_path or "")).lower()
+            return any(tag in name for tag in ("mtp", "draft-mtp", "draft_mtp"))
+        except Exception:
+            return False
+
+    def _runner_supports_mtp(self, runner_path: str) -> bool:
+        runner_path = str(runner_path or "").strip()
+        if not runner_path or not os.path.isfile(runner_path):
+            return False
+        key = os.path.normcase(os.path.abspath(runner_path))
+        if key in self._runner_mtp_support_cache:
+            return bool(self._runner_mtp_support_cache.get(key))
+        ok = False
+        try:
+            proc = subprocess.run(
+                [runner_path, "--help"],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                timeout=8,
+                creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0,
+            )
+            help_text = str(proc.stdout or "").lower()
+            ok = ("--spec-type" in help_text and "draft-mtp" in help_text)
+        except Exception:
+            ok = False
+        self._runner_mtp_support_cache[key] = bool(ok)
+        return bool(ok)
+
+    def _should_use_mtp_for_model(self, model_path: str, runner_path: str) -> bool:
+        try:
+            if bool(getattr(self, "_force_disable_mtp_once", False)):
+                return False
+            if not bool(getattr(self.settings_dialog, "chk_mtp_auto", None) and self.settings_dialog.chk_mtp_auto.isChecked()):
+                return False
+            if not self._model_looks_mtp_enabled(model_path):
+                return False
+            return self._runner_supports_mtp(runner_path)
+        except Exception:
+            return False
 
     def _build_server_args(self, model_path: str, template_kind: str, template_value: str, port: int) -> List[str]:
         effective_kind, effective_value = self._effective_template_choice(model_path, template_kind, template_value)
@@ -5593,6 +5693,16 @@ class LlamaChatWindow(QtWidgets.QMainWindow):
             "-c", str(int(self.settings_dialog.sp_ctx_size.value())),
             "--reasoning-budget", "0",
         ]
+        runner_path = self._resolve_runner_for_feature_check()
+        self._server_mtp_args_active = False
+        if self._should_use_mtp_for_model(model_path, runner_path):
+            try:
+                draft_n = int(self.settings_dialog.sp_mtp_draft_tokens.value())
+            except Exception:
+                draft_n = 3
+            draft_n = max(1, min(16, draft_n))
+            args.extend(["--spec-type", "draft-mtp", "--spec-draft-n-max", str(draft_n)])
+            self._server_mtp_args_active = True
         mmproj_path = _find_mmproj_for_model(model_path)
         self.active_mmproj_path = mmproj_path
         if mmproj_path:
@@ -5650,6 +5760,8 @@ class LlamaChatWindow(QtWidgets.QMainWindow):
 
         self._cleanup_boot_thread()
         self._stop_process_only()
+        if not bool(getattr(self, "_mtp_retry_without_mtp_pending", False)):
+            self._force_disable_mtp_once = False
 
         self.server_port = _pick_free_port()
         self.server_url = f"http://127.0.0.1:{self.server_port}"
@@ -5692,6 +5804,9 @@ class LlamaChatWindow(QtWidgets.QMainWindow):
             self.btn_unload.setEnabled(False)
             self._apply_send_button_guard()
             self.btn_stop.setEnabled(False)
+            self._server_mtp_args_active = False
+            self._force_disable_mtp_once = False
+            self._mtp_retry_without_mtp_pending = False
             return
 
         self._write_llm_lock(model, server_exe)
@@ -5742,6 +5857,18 @@ class LlamaChatWindow(QtWidgets.QMainWindow):
         self.btn_unload.setEnabled(False)
         self._apply_send_button_guard()
         self.btn_stop.setEnabled(False)
+        mtp_was_active = bool(getattr(self, "_server_mtp_args_active", False))
+        self._server_mtp_args_active = False
+        if (not was_ready) and mtp_was_active and not bool(getattr(self, "_mtp_retry_without_mtp_pending", False)):
+            self._mtp_retry_without_mtp_pending = True
+            self._force_disable_mtp_once = True
+            self._set_status("MTP load failed; retrying without MTP…", "loading")
+            QtCore.QTimer.singleShot(0, self._load_selected_model)
+            self._update_header()
+            self.server_process = None
+            return
+        self._mtp_retry_without_mtp_pending = False
+        self._force_disable_mtp_once = False
         if was_ready:
             self._set_status("Unloaded", "idle")
         else:
@@ -5764,6 +5891,9 @@ class LlamaChatWindow(QtWidgets.QMainWindow):
         self.loaded_model_path = self.current_model_path()
         self.loaded_template = self.current_template_choice()
         self.loaded_ctx_size = int(self.settings_dialog.sp_ctx_size.value())
+        self.loaded_mtp_enabled = bool(getattr(self, "_server_mtp_args_active", False))
+        self._force_disable_mtp_once = False
+        self._mtp_retry_without_mtp_pending = False
         self.btn_load.setEnabled(True)
         self.btn_unload.setEnabled(True)
         self._apply_send_button_guard()
@@ -5789,6 +5919,16 @@ class LlamaChatWindow(QtWidgets.QMainWindow):
         self._apply_send_button_guard()
         self.btn_stop.setEnabled(False)
         self.pending_generate_session_id = ""
+        if bool(getattr(self, "_server_mtp_args_active", False)) and not bool(getattr(self, "_mtp_retry_without_mtp_pending", False)):
+            self._mtp_retry_without_mtp_pending = True
+            self._force_disable_mtp_once = True
+            self._set_status("MTP load timed out; retrying without MTP…", "loading")
+            try:
+                if self.server_process is not None:
+                    self.server_process.kill()
+            except Exception:
+                pass
+            QtCore.QTimer.singleShot(250, self._load_selected_model)
 
     def _stop_process_only(self):
         self._remove_llm_lock()
@@ -5805,6 +5945,8 @@ class LlamaChatWindow(QtWidgets.QMainWindow):
         self.server_ready = False
         self.loaded_model_path = ""
         self.loaded_ctx_size = 0
+        self.loaded_mtp_enabled = False
+        self._server_mtp_args_active = False
         self.loaded_template = ("auto", "")
         self.effective_template_on_server = ("auto", "")
 
