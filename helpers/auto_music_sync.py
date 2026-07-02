@@ -381,27 +381,67 @@ def _musicclip_krea2_prompt(shot: dict) -> str:
 
 
 def _musicclip_krea2_review_paths(plan_path: str) -> tuple[str, str]:
+    """Return the shared review image folder and canonical review-state file.
+
+    Older Krea 2 builds wrote a private state file inside ltx_review_current.
+    The review tab reads musicclip_ltx_review_state.json next to the director
+    plan, so Krea 2 must write the same file or previously generated images
+    look missing when an old job is loaded.
+    """
     pp = Path(str(plan_path or _musicclip_project_root())).resolve()
     review_dir = pp.parent / "ltx_review_current"
-    return str(review_dir), str(review_dir / "ltx_review_state.json")
+    return str(review_dir), str(pp.parent / "musicclip_ltx_review_state.json")
+
+
+def _musicclip_krea2_legacy_state_path(plan_path: str) -> str:
+    try:
+        pp = Path(str(plan_path or _musicclip_project_root())).resolve()
+        return str(pp.parent / "ltx_review_current" / "ltx_review_state.json")
+    except Exception:
+        return ""
 
 
 def _musicclip_krea2_read_state(plan_path: str) -> dict:
-    try:
-        _, state_path = _musicclip_krea2_review_paths(plan_path)
-        if os.path.isfile(state_path):
-            data = json.loads(Path(state_path).read_text(encoding="utf-8"))
-            return data if isinstance(data, dict) else {}
-    except Exception:
-        pass
-    return {}
+    merged = {}
+    for state_path in (_musicclip_krea2_legacy_state_path(plan_path), _musicclip_krea2_review_paths(plan_path)[1]):
+        try:
+            if state_path and os.path.isfile(state_path):
+                data = json.loads(Path(state_path).read_text(encoding="utf-8"))
+                if isinstance(data, dict):
+                    # Preserve canonical keys when both files exist, but merge
+                    # older Krea-only shot paths so old jobs recover cleanly.
+                    if not merged:
+                        merged = data
+                    else:
+                        merged.setdefault("shots", {})
+                        for sid, item in (data.get("shots") or {}).items():
+                            if isinstance(item, dict):
+                                cur = merged["shots"].setdefault(sid, {})
+                                if isinstance(cur, dict):
+                                    for k, v in item.items():
+                                        cur.setdefault(k, v)
+        except Exception:
+            pass
+    return merged if isinstance(merged, dict) else {}
 
 
 def _musicclip_krea2_write_state(plan_path: str, state: dict) -> None:
     try:
         review_dir, state_path = _musicclip_krea2_review_paths(plan_path)
         os.makedirs(review_dir, exist_ok=True)
-        Path(state_path).write_text(json.dumps(state if isinstance(state, dict) else {}, indent=2, ensure_ascii=False), encoding="utf-8")
+        if not isinstance(state, dict):
+            state = {}
+        state.setdefault("shots", {})
+        state["updated_at"] = datetime.now().isoformat(timespec="seconds")
+        state["director_plan_path"] = str(plan_path or "")
+        state.setdefault("review_dir", review_dir)
+        text = json.dumps(state, indent=2, ensure_ascii=False)
+        Path(state_path).write_text(text, encoding="utf-8")
+        # Keep the old location in sync so rollback builds do not lose review data.
+        legacy = _musicclip_krea2_legacy_state_path(plan_path)
+        if legacy and legacy != state_path:
+            Path(legacy).parent.mkdir(parents=True, exist_ok=True)
+            Path(legacy).write_text(text, encoding="utf-8")
     except Exception:
         pass
 
@@ -16745,7 +16785,16 @@ class AutoMusicSyncWidget(QWidget):
         rows = result.get("shots")
         if not isinstance(rows, list) or not rows:
             raise RuntimeError("No LTX review shots were found for this job.")
-        return [r for r in rows if isinstance(r, dict)]
+        state = self._ltx_review_read_state(str(plan_path or ""))
+        shots_state = (state.get("shots") or {}) if isinstance(state, dict) else {}
+        fixed = []
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            sid = str(row.get("shot_id") or row.get("id") or "").strip()
+            state_item = shots_state.get(sid, {}) if isinstance(shots_state, dict) else {}
+            fixed.append(self._ltx_review_reconcile_row_assets(row, state_item, str(plan_path or "")))
+        return fixed
 
     def _on_ltx_review_continue_reassemble_clicked(self) -> None:
         """Rebuild the final LTX video from the active review job's latest clips only."""
@@ -17245,24 +17294,55 @@ class AutoMusicSyncWidget(QWidget):
         except Exception:
             return ""
 
-    def _ltx_review_read_state(self, plan_path: str) -> dict:
-        path = self._ltx_review_state_path_for_plan(plan_path)
+    def _ltx_review_legacy_state_path_for_plan(self, plan_path: str) -> str:
         try:
-            if path and os.path.isfile(path):
-                with open(path, "r", encoding="utf-8") as f:
-                    data = json.load(f)
-                if isinstance(data, dict):
-                    data.setdefault("shots", {})
-                    return data
+            pp = Path(str(plan_path or "")).expanduser().resolve()
+            return str((pp.parent / "ltx_review_current" / "ltx_review_state.json").resolve())
         except Exception:
-            pass
-        return {
+            return ""
+
+    def _ltx_review_read_state(self, plan_path: str) -> dict:
+        """Read review state and merge legacy Krea 2 state when present."""
+        base = {
             "created_at": datetime.now().isoformat(timespec="seconds"),
             "updated_at": datetime.now().isoformat(timespec="seconds"),
             "director_plan_path": str(plan_path or ""),
             "review_dir": self._ltx_review_dir_for_plan(plan_path),
             "shots": {},
         }
+        paths = [self._ltx_review_legacy_state_path_for_plan(plan_path), self._ltx_review_state_path_for_plan(plan_path)]
+        loaded_any = False
+        for path in paths:
+            try:
+                if path and os.path.isfile(path):
+                    with open(path, "r", encoding="utf-8") as f:
+                        data = json.load(f)
+                    if not isinstance(data, dict):
+                        continue
+                    loaded_any = True
+                    for k, v in data.items():
+                        if k == "shots":
+                            continue
+                        base[k] = v
+                    base.setdefault("shots", {})
+                    for sid, item in (data.get("shots") or {}).items():
+                        if not isinstance(item, dict):
+                            continue
+                        cur = base["shots"].setdefault(str(sid), {})
+                        if not isinstance(cur, dict):
+                            base["shots"][str(sid)] = dict(item)
+                            continue
+                        for kk, vv in item.items():
+                            # Prefer canonical state values, but fill all missing
+                            # paths/prompts from the older Krea state file.
+                            if kk not in cur or cur.get(kk) in (None, ""):
+                                cur[kk] = vv
+            except Exception:
+                pass
+        base.setdefault("shots", {})
+        if not loaded_any:
+            return base
+        return base
 
     def _ltx_review_write_state(self, plan_path: str, state: dict) -> None:
         try:
@@ -17276,8 +17356,142 @@ class AutoMusicSyncWidget(QWidget):
             if out:
                 with open(out, "w", encoding="utf-8") as f:
                     json.dump(state, f, indent=2, ensure_ascii=False)
+            legacy = self._ltx_review_legacy_state_path_for_plan(plan_path)
+            if legacy and legacy != out:
+                try:
+                    Path(legacy).parent.mkdir(parents=True, exist_ok=True)
+                    with open(legacy, "w", encoding="utf-8") as f:
+                        json.dump(state, f, indent=2, ensure_ascii=False)
+                except Exception:
+                    pass
         except Exception:
             pass
+
+    def _ltx_review_safe_existing_path(self, value: str) -> str:
+        try:
+            path = str(value or "").strip().strip('"')
+            if path and os.path.isfile(path):
+                return os.path.abspath(path)
+        except Exception:
+            pass
+        return ""
+
+    def _ltx_review_find_asset_for_shot(self, plan_path: str, shot_id: str, kind: str) -> str:
+        """Find existing Krea/normal review assets for a shot.
+
+        This is intentionally filename-based, so older Krea 2 jobs remain
+        loadable even when the bridge review loader does not know the Krea
+        start-image filename pattern.
+        """
+        sid = str(shot_id or "").strip()
+        if not sid:
+            return ""
+        stem = re.sub(r"[^A-Za-z0-9_.-]+", "_", sid).strip("._") or sid
+        roots: List[Path] = []
+        try:
+            pp = Path(str(plan_path or "")).expanduser().resolve()
+            roots.append((pp.parent / "ltx_review_current").resolve())
+            run_dir = self._ltx_review_find_latest_full_run_dir(pp.parent)
+            if run_dir:
+                roots.append(run_dir.resolve())
+        except Exception:
+            pass
+        if kind == "image":
+            names = (
+                f"{stem}_krea2_start.png",
+                f"{stem}_review_start.png",
+                f"{stem}_review_start_used.png",
+                f"{stem}_start.png",
+            )
+            globs = (f"{stem}*_krea2_start.*", f"{stem}*_review_start.*", f"{stem}*_start.*")
+            exts = {".png", ".jpg", ".jpeg", ".webp"}
+        else:
+            names = (
+                f"{stem}_review_ltx_trimmed.mp4",
+                f"{stem}_review_ltx_sync.mp4",
+                f"{stem}_review_ltx_raw.mp4",
+                f"{stem}_ltx_trimmed.mp4",
+                f"{stem}_ltx_sync.mp4",
+                f"{stem}_ltx_raw.mp4",
+            )
+            globs = (f"{stem}*_review_ltx*.mp4", f"{stem}*_ltx*.mp4")
+            exts = {".mp4", ".mov", ".mkv", ".webm"}
+        candidates: List[Path] = []
+        for root in roots:
+            try:
+                if not root or not root.is_dir():
+                    continue
+                for name in names:
+                    cand = root / name
+                    if cand.is_file():
+                        candidates.append(cand)
+                for pat in globs:
+                    for cand in root.glob(pat):
+                        if cand.is_file() and cand.suffix.lower() in exts:
+                            candidates.append(cand)
+            except Exception:
+                pass
+        if not candidates:
+            return ""
+        try:
+            # Prefer trimmed/sync clips over raw clips, otherwise newest wins.
+            if kind != "image":
+                def score_clip(x: Path):
+                    low = x.name.lower()
+                    rank = 0 if "trimmed" in low else (1 if "sync" in low else 2)
+                    return (rank, -float(x.stat().st_mtime))
+                candidates.sort(key=score_clip)
+            else:
+                candidates.sort(key=lambda x: x.stat().st_mtime, reverse=True)
+            return str(candidates[0].resolve())
+        except Exception:
+            try:
+                return str(candidates[0].resolve())
+            except Exception:
+                return ""
+
+    def _ltx_review_reconcile_row_assets(self, row: dict, state_item: dict, plan_path: str) -> dict:
+        if not isinstance(row, dict):
+            row = {}
+        if not isinstance(state_item, dict):
+            state_item = {}
+        sid = str(row.get("shot_id") or row.get("id") or "").strip()
+        start_path = ""
+        for key in ("current_start_image_path", "start_image_path", "existing_start_image_path", "image_path"):
+            start_path = self._ltx_review_safe_existing_path(state_item.get(key) or row.get(key))
+            if start_path:
+                break
+        if not start_path:
+            start_path = self._ltx_review_find_asset_for_shot(plan_path, sid, "image")
+        clip_path = ""
+        for key in ("current_clip_path", "clip_path", "sync_clip_path", "ltx_clip_path", "current_raw_clip_path"):
+            clip_path = self._ltx_review_safe_existing_path(state_item.get(key) or row.get(key))
+            if clip_path:
+                break
+        if not clip_path:
+            clip_path = self._ltx_review_find_asset_for_shot(plan_path, sid, "clip")
+        if start_path:
+            row["start_image_path"] = start_path
+            row["current_start_image_path"] = start_path
+            row["existing_start_image_path"] = start_path
+            row["image_ready"] = True
+        else:
+            row["image_ready"] = False
+        if clip_path:
+            row["clip_path"] = clip_path
+            row["current_clip_path"] = clip_path
+            row["clip_ready"] = True
+        else:
+            row["clip_ready"] = False
+        if row.get("image_ready") and not row.get("clip_ready"):
+            row["status"] = "Needs clip"
+        elif row.get("image_ready") and row.get("clip_ready"):
+            row["status"] = "Ready"
+        elif row.get("clip_ready"):
+            row["status"] = "Needs image check"
+        else:
+            row["status"] = "Needs image"
+        return row
 
     def _ltx_review_bridge_available(self) -> bool:
         bridge = self._current_ltx_bridge()
@@ -17875,6 +18089,7 @@ class AutoMusicSyncWidget(QWidget):
             sid = str(row.get("shot_id") or "").strip()
             shot = shot_lookup.get(sid, {})
             state_item = shots_state.get(sid, {}) if isinstance(shots_state, dict) else {}
+            row = self._ltx_review_reconcile_row_assets(row, state_item, plan_path)
             row["clip_prompt"] = str(state_item.get("clip_prompt") or row.get("clip_prompt") or shot.get("director_timestamped_video_prompt") or shot.get("director_video_prompt") or shot.get("video_prompt") or row.get("summary") or "")
             row["clip_seed"] = state_item.get("clip_seed", row.get("clip_seed", ""))
             row["image_seed"] = state_item.get("image_seed", row.get("image_seed", ""))
