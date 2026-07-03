@@ -622,32 +622,51 @@ class UpscPane(QtWidgets.QWidget):
 
         # Offload options (tiled VAE)
         self.chk_seedvr2_vae_enc = QtWidgets.QCheckBox("VAE encode tiled", self)
+        self.chk_seedvr2_vae_enc.setToolTip(
+            "Tiles the input/video-frame encode step to reduce VRAM use. Keep OFF for speed; only enable when VRAM cannot handle the load."
+        )
         self.chk_seedvr2_vae_dec = QtWidgets.QCheckBox("VAE decode tiled", self)
+        self.chk_seedvr2_vae_dec.setChecked(True)
+        self.chk_seedvr2_vae_dec.setToolTip(
+            "Tiles the final decode step to reduce VRAM use on high-resolution output. This is safer for video/image upscaling, but can be slower than no tiling."
+        )
         adv.addWidget(self.chk_seedvr2_vae_enc, 6, 0, 1, 2)
         adv.addWidget(self.chk_seedvr2_vae_dec, 7, 0, 1, 2)
 
         adv.addWidget(QtWidgets.QLabel("Encode tile size:", self), 8, 0)
         self.spin_seedvr2_enc_tile = QtWidgets.QSpinBox(self)
         self.spin_seedvr2_enc_tile.setRange(128, 4096)
-        self.spin_seedvr2_enc_tile.setValue(1024)
+        self.spin_seedvr2_enc_tile.setValue(1536)
+        self.spin_seedvr2_enc_tile.setToolTip(
+            "Larger tiles are usually faster because fewer tiles are processed. Lower this to 1024, 768, or 512 if VRAM cannot handle the load."
+        )
         adv.addWidget(self.spin_seedvr2_enc_tile, 8, 1)
 
         adv.addWidget(QtWidgets.QLabel("Encode overlap:", self), 9, 0)
         self.spin_seedvr2_enc_ov = QtWidgets.QSpinBox(self)
         self.spin_seedvr2_enc_ov.setRange(0, 1024)
         self.spin_seedvr2_enc_ov.setValue(64)
+        self.spin_seedvr2_enc_ov.setToolTip(
+            "Overlap blends tile borders. 64 is fast; use 128 if you see seams/grid lines; 256 only for stubborn visible seams."
+        )
         adv.addWidget(self.spin_seedvr2_enc_ov, 9, 1)
 
         adv.addWidget(QtWidgets.QLabel("Decode tile size:", self), 10, 0)
         self.spin_seedvr2_dec_tile = QtWidgets.QSpinBox(self)
         self.spin_seedvr2_dec_tile.setRange(128, 4096)
-        self.spin_seedvr2_dec_tile.setValue(1024)
+        self.spin_seedvr2_dec_tile.setValue(1536)
+        self.spin_seedvr2_dec_tile.setToolTip(
+            "Default fast tile size. Larger is faster until VRAM gets tight. Lower this to 1024, 768, or 512 if VRAM cannot handle the load."
+        )
         adv.addWidget(self.spin_seedvr2_dec_tile, 10, 1)
 
         adv.addWidget(QtWidgets.QLabel("Decode overlap:", self), 11, 0)
         self.spin_seedvr2_dec_ov = QtWidgets.QSpinBox(self)
         self.spin_seedvr2_dec_ov.setRange(0, 1024)
         self.spin_seedvr2_dec_ov.setValue(64)
+        self.spin_seedvr2_dec_ov.setToolTip(
+            "Overlap blends tile borders. 64 is the fast default; use 128 if you see seams/grid lines; 256 only as an anti-seam fallback."
+        )
         adv.addWidget(self.spin_seedvr2_dec_ov, 11, 1)
 
         lay_seed.addWidget(self.grp_seedvr2_adv)
@@ -1461,10 +1480,10 @@ class UpscPane(QtWidgets.QWidget):
                 else:
                     self.combo_seedvr2_attn.setCurrentText("auto")
             self.chk_seedvr2_vae_enc.setChecked(bool(d.get("seedvr2_vae_enc", False)))
-            self.chk_seedvr2_vae_dec.setChecked(bool(d.get("seedvr2_vae_dec", False)))
-            self.spin_seedvr2_enc_tile.setValue(int(d.get("seedvr2_enc_tile", 1024)))
+            self.chk_seedvr2_vae_dec.setChecked(bool(d.get("seedvr2_vae_dec", True)))
+            self.spin_seedvr2_enc_tile.setValue(int(d.get("seedvr2_enc_tile", 1536)))
             self.spin_seedvr2_enc_ov.setValue(int(d.get("seedvr2_enc_ov", 64)))
-            self.spin_seedvr2_dec_tile.setValue(int(d.get("seedvr2_dec_tile", 1024)))
+            self.spin_seedvr2_dec_tile.setValue(int(d.get("seedvr2_dec_tile", 1536)))
             self.spin_seedvr2_dec_ov.setValue(int(d.get("seedvr2_dec_ov", 64)))
         except Exception:
             pass
@@ -1782,8 +1801,8 @@ class UpscPane(QtWidgets.QWidget):
 
         Rules:
         - 720p: VAE decode tiled OFF, batch=4, chunk=40
-        - 1080p or higher: VAE decode tiled ON, batch=8, chunk=80,
-          decode tile size=1024, decode overlap=64
+        - 1080p or higher: VAE decode tiled ON, batch=2, chunk=20,
+          decode tile size=1536, decode overlap=64
         """
         try:
             res_txt = (self.combo_seedvr2_res.currentText() or "").strip()
@@ -1818,8 +1837,8 @@ class UpscPane(QtWidgets.QWidget):
             _set(self.chk_seedvr2_vae_dec, self.chk_seedvr2_vae_dec.setChecked, True)
             _set(self.spin_seedvr2_batch, self.spin_seedvr2_batch.setValue, 2)
             _set(self.spin_seedvr2_chunk, self.spin_seedvr2_chunk.setValue, 20)
-            _set(self.spin_seedvr2_dec_tile, self.spin_seedvr2_dec_tile.setValue, 1024)
-            _set(self.spin_seedvr2_dec_ov, self.spin_seedvr2_dec_ov.setValue, 128)
+            _set(self.spin_seedvr2_dec_tile, self.spin_seedvr2_dec_tile.setValue, 1536)
+            _set(self.spin_seedvr2_dec_ov, self.spin_seedvr2_dec_ov.setValue, 64)
         elif res == 720:
             _set(self.chk_seedvr2_vae_dec, self.chk_seedvr2_vae_dec.setChecked, False)
             _set(self.spin_seedvr2_batch, self.spin_seedvr2_batch.setValue, 4)

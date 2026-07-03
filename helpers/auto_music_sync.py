@@ -10704,6 +10704,8 @@ class AutoMusicSyncWidget(QWidget):
         self.btn_browse_ltx_single_lora_json = None
         self.spin_ltx_single_lora_multiplier = None
         self.btn_test_ltx_single_shot = None
+        self.edit_ltx_audio = None
+        self.btn_browse_ltx_audio = None
         self.label_planner_bridge_status = None
         self.ltx_section_review_placeholder = None
         self.box_ltx_review = None
@@ -10818,13 +10820,37 @@ class AutoMusicSyncWidget(QWidget):
                 section_box = _LtxCollapsibleSection(title, self.box_planner_bridge, expanded=expanded)
                 return section_box, section_box.content_layout
 
+            self.ltx_section_music_track, ltx_music_lay = _make_ltx_section("Music track", expanded=True)
             self.ltx_section_idea, ltx_idea_lay = _make_ltx_section("Idea / project setup", expanded=True)
             self.ltx_section_reference_images, ltx_ref_lay = _make_ltx_section("Reference image section", expanded=False)
             self.ltx_section_videoclip_settings, ltx_video_lay = _make_ltx_section("Videoclip settings / LTX backend", expanded=True)
             self.ltx_section_lyrics_lipsync, ltx_lipsync_lay = _make_ltx_section("Lyrics / lipsync", expanded=False)
             self.ltx_section_shot_list, ltx_shot_list_lay = _make_ltx_section("LTX Shot list", expanded=False)
             self.ltx_section_settings_advanced, ltx_advanced_lay = _make_ltx_section("Settings and advanced features", expanded=False)
-            self.ltx_section_review_placeholder, ltx_review_lay = _make_ltx_section("Review / edit / correct", expanded=False)
+            self.ltx_section_review_placeholder = None
+
+            ltx_music_hint = QLabel(
+                "Load the music track for this LTX music-video job here. This uses the same audio path as the normal workflow, "
+                "but keeps the LTX workflow self-contained for new users.",
+                self.ltx_section_music_track,
+            )
+            ltx_music_hint.setWordWrap(True)
+            ltx_music_lay.addWidget(ltx_music_hint)
+
+            ltx_music_form = QFormLayout()
+            ltx_music_form.setContentsMargins(0, 0, 0, 0)
+            ltx_music_form.setSpacing(6)
+            row_ltx_audio = QHBoxLayout()
+            row_ltx_audio.setContentsMargins(0, 0, 0, 0)
+            row_ltx_audio.setSpacing(6)
+            self.edit_ltx_audio = QLineEdit(self.ltx_section_music_track)
+            self.edit_ltx_audio.setPlaceholderText("Path to music/audio file")
+            self.btn_browse_ltx_audio = QPushButton("Browse...", self.ltx_section_music_track)
+            row_ltx_audio.addWidget(self.edit_ltx_audio, 1)
+            row_ltx_audio.addWidget(self.btn_browse_ltx_audio)
+            ltx_music_form.addRow("Music / Audio:", row_ltx_audio)
+            ltx_music_lay.addLayout(ltx_music_form)
+            bridge_lay.addWidget(self.ltx_section_music_track)
 
             ltx_idea_lay.addWidget(bridge_hint)
 
@@ -11354,15 +11380,6 @@ class AutoMusicSyncWidget(QWidget):
 
             # Queue mode lives in the visible Idea / project setup section now.
             bridge_lay.addWidget(self.ltx_section_settings_advanced)
-
-            review_hint = QLabel(
-                "Review tools are available in the LTX Review tab after shots are created.",
-                self.ltx_section_review_placeholder,
-            )
-            review_hint.setWordWrap(True)
-            ltx_review_lay.addWidget(review_hint)
-            self.ltx_section_review_placeholder.setChecked(False)
-            bridge_lay.addWidget(self.ltx_section_review_placeholder)
 
             self.label_planner_bridge_status = QLabel("Planner Bridge: ready", self.box_planner_bridge)
             self.label_planner_bridge_status.setWordWrap(True)
@@ -12953,6 +12970,14 @@ class AutoMusicSyncWidget(QWidget):
 
         # connections
         btn_a.clicked.connect(self._browse_audio)
+        try:
+            if getattr(self, "btn_browse_ltx_audio", None) is not None:
+                self.btn_browse_ltx_audio.clicked.connect(self._browse_audio)
+            if getattr(self, "edit_ltx_audio", None) is not None:
+                self.edit_ltx_audio.textChanged.connect(self._sync_audio_from_ltx_field)
+            self.edit_audio.textChanged.connect(self._sync_audio_to_ltx_field)
+        except Exception:
+            pass
         btn_vf.clicked.connect(self._browse_video_file)
         btn_vd.clicked.connect(self._browse_video_dir)
         btn_vmf.clicked.connect(self._browse_video_files)
@@ -19509,6 +19534,10 @@ class AutoMusicSyncWidget(QWidget):
         """Load last-used paths and options from visible project JSON."""
         s = self._settings
         self.edit_audio.setText(s.get("audio_path", "", str))
+        try:
+            self._sync_audio_to_ltx_field(self.edit_audio.text())
+        except Exception:
+            pass
         self.edit_video.setText(s.get("video_path", "", str))
         self.edit_output.setText(s.get("output_path", "output/videoclips", str))
         try:
@@ -20536,6 +20565,41 @@ class AutoMusicSyncWidget(QWidget):
 
     # dialogs / helpers
 
+    def _sync_audio_to_ltx_field(self, value: str = "") -> None:
+        """Mirror the normal workflow audio path into the LTX workflow audio field."""
+        w = getattr(self, "edit_ltx_audio", None)
+        if w is None:
+            return
+        try:
+            text = str(value if value is not None else self.edit_audio.text())
+            if w.text() == text:
+                return
+            w.blockSignals(True)
+            w.setText(text)
+        except Exception:
+            pass
+        finally:
+            try:
+                w.blockSignals(False)
+            except Exception:
+                pass
+
+    def _sync_audio_from_ltx_field(self, value: str = "") -> None:
+        """Mirror edits made in the LTX workflow audio field back to the real audio path."""
+        try:
+            text = str(value if value is not None else "")
+            if self.edit_audio.text() == text:
+                return
+            self.edit_audio.blockSignals(True)
+            self.edit_audio.setText(text)
+        except Exception:
+            pass
+        finally:
+            try:
+                self.edit_audio.blockSignals(False)
+            except Exception:
+                pass
+
     def _browse_audio(self) -> None:
         path, _ = QFileDialog.getOpenFileName(
             self,
@@ -20545,6 +20609,10 @@ class AutoMusicSyncWidget(QWidget):
         )
         if path:
             self.edit_audio.setText(path)
+            try:
+                self._sync_audio_to_ltx_field(path)
+            except Exception:
+                pass
             self._save_settings()
 
     def _browse_video_file(self) -> None:

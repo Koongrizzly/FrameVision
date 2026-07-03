@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 import queue
+import random
 import re
 import socket
 import subprocess
@@ -77,6 +78,49 @@ def _is_prompt_heading_or_meta(text: str) -> bool:
     return False
 
 
+
+
+def _looks_like_instruction_leak(text: str) -> bool:
+    """Reject leaked LLM task/instruction text before it reaches image generation.
+
+    This is quality control only: it catches protocol/prompt scaffolding such as
+    "Input:", "Rules:", "Object Bible", and "Return exactly".
+    """
+    try:
+        s = str(text or "").strip()
+    except Exception:
+        return True
+    if not s:
+        return True
+    low = re.sub(r"\s+", " ", s.lower())
+    leak_needles = (
+        "**input:**", "input:**", "input: story", "input: source",
+        "**rules:**", "rules:**", "rules:",
+        "original request:", "partial output already received:",
+        "source prompts:", "source:",
+        "draft text-to-image prompts", "draft image-to-video prompts",
+        "text-to-image prompts below", "image-to-video prompts below",
+        "story beats", "object bible", "character bible",
+        "return exactly", "return only", "numbered prompts",
+        "system prompt", "user prompt", "assistant prompt",
+        "markdown fences", "json",
+    )
+    return any(n in low for n in leak_needles)
+
+
+def _looks_truncated_generated_item(text: str) -> bool:
+    """Catch obvious cut-off lines so retry happens instead of rendering garbage."""
+    try:
+        s = str(text or "").strip()
+    except Exception:
+        return True
+    if not s:
+        return True
+    if s.endswith((",", ":", ";", "-", "—", "–", "(", "[")):
+        return True
+    last = re.sub(r"[^a-zA-Z]+", "", s.split()[-1].lower()) if s.split() else ""
+    return last in {"a", "an", "the", "of", "with", "without", "and", "or", "to", "from", "into", "onto", "in", "on", "at", "by", "for", "while", "as", "through", "across"}
+
 def _clean_generated_list_item(text: str) -> str:
     try:
         s = str(text or "")
@@ -90,6 +134,8 @@ def _clean_generated_list_item(text: str) -> str:
     s = re.sub(r"(?i)^\s*(?:prompt|image prompt|text-to-image prompt|t2i prompt|subject|context)\s*[:：]\s*", "", s).strip()
     s = s.strip("`*_ \t")
     if _is_prompt_heading_or_meta(s):
+        return ""
+    if _looks_like_instruction_leak(s) or _looks_truncated_generated_item(s):
         return ""
     return s
 
@@ -1341,49 +1387,138 @@ Rules:
         prompts = self._dedupe_inline_bibles_per_prompt(prompts, character_bibles)
         return [self._postprocess_inline_bible_prompt(p) for p in prompts]
 
+    @staticmethod
+    def _extract_contiguous_numbered_prefix(text: str, expected_count: int) -> List[str]:
+        """Return clean items 1..N only when numbering is contiguous from 1.
+
+        Used for strict continuation retries.  If item 1 is cut off or polluted by
+        instruction text, this returns an empty list so the whole step is retried.
+        """
+        raw_text = _strip_llm_protocol_artifacts(str(text or "")).replace("\r", "").strip()
+        if not raw_text:
+            return []
+        line_rx = re.compile(r"^\s*(?:\[?\(?)(\d{1,3})(?:\]?\)?)\s*[:.\-\]]?\s*(.+)$")
+        out: List[str] = []
+        want = 1
+        for line in [ln.strip() for ln in raw_text.split("\n") if ln.strip()]:
+            m = line_rx.match(line)
+            if not m:
+                continue
+            try:
+                num = int(m.group(1))
+            except Exception:
+                continue
+            if num != want:
+                break
+            item = _clean_generated_list_item(m.group(2).strip())
+            if not item:
+                break
+            out.append(item)
+            want += 1
+            if len(out) >= expected_count:
+                break
+        return out[:expected_count]
+
     def _generate_numbered_list_with_retry(self, *, system_prompt: str, user_prompt: str, expected_count: int, temperature: float, max_tokens: int, item_kind: str) -> List[str]:
-        raw = _strip_llm_protocol_artifacts(self.client.generate(system_prompt=system_prompt, user_prompt=user_prompt, temperature=temperature, max_tokens=max_tokens))
-        try:
-            return self._extract_numbered_lines(raw, expected_count)
-        except RuntimeError as first_error:
-            first_pass: List[str] = []
-            for probe in (expected_count - 1, max(1, expected_count // 2), 1):
-                if probe < 1:
-                    continue
-                try:
-                    first_pass = self._extract_numbered_lines(raw, probe)
-                    break
-                except Exception:
-                    continue
-            have = len(first_pass)
-            if have <= 0 or have >= expected_count:
-                raise first_error
-            missing = expected_count - have
-            self._log(f"Model returned {have}/{expected_count} {item_kind}; requesting the remaining {missing} item(s)...")
-            continuation_prompt = f"""
+        """Generate a clean exact numbered list.
+
+        Important: never pass instruction leakage or partial/truncated lines through
+        to images/video.  Retry until a clean complete list is collected, then abort
+        loudly instead of accepting garbage.
+        """
+        max_attempts = 6
+        last_raw = ""
+        last_error = ""
+        # This is an output cap, not context size.  Never lower the caller budget.
+        effective_max_tokens = max(int(max_tokens or 0), int(expected_count) * 220, 1200)
+
+        for attempt in range(1, max_attempts + 1):
+            retry_note = "" if attempt == 1 else f"\n\nPrevious attempt failed because it did not produce exactly {expected_count} clean {item_kind}. Regenerate the full list from item 1. Return only clean numbered lines. Do not include Input, Rules, Story beats, Object Bible, Character Bible, Source, Draft prompts, explanations, or markdown."
+            raw = _strip_llm_protocol_artifacts(self.client.generate(
+                system_prompt=system_prompt,
+                user_prompt=(user_prompt + retry_note),
+                temperature=temperature if attempt == 1 else max(0.2, min(temperature, 0.45)),
+                max_tokens=effective_max_tokens,
+            ))
+            last_raw = raw
+            try:
+                items = self._extract_numbered_lines(raw, expected_count)
+                # Hard final validation: all items must survive the same cleaner.
+                cleaned = [_clean_generated_list_item(x) for x in items]
+                cleaned = [x for x in cleaned if x]
+                if len(cleaned) == expected_count:
+                    if attempt > 1:
+                        self._log(f"Clean {item_kind} generated on retry {attempt}/{max_attempts}.")
+                    return cleaned
+                last_error = f"Only {len(cleaned)}/{expected_count} clean items after validation."
+            except RuntimeError as exc:
+                last_error = str(exc)
+
+            prefix = self._extract_contiguous_numbered_prefix(raw, expected_count)
+            have = len(prefix)
+            if have > 0 and have < expected_count:
+                missing = expected_count - have
+                self._log(f"Model returned {have}/{expected_count} clean {item_kind}; requesting the remaining {missing} item(s)...")
+                continuation_prompt = f"""
 The previous answer for {item_kind} stopped early.
-You already returned the first {have} items.
+You already returned clean items 1 through {have}.
 Now continue and return exactly the missing items only.
 
 Continue from item {have + 1} through item {expected_count}.
 Do not repeat items 1 through {have}.
 Do not restart from 1.
-Keep the same format and return only numbered lines.
+Return only numbered lines.
+Do not include Input, Rules, Story beats, Object Bible, Character Bible, Source, Draft prompts, explanations, or markdown.
 
 Original request:
 {user_prompt}
 
-Partial output already received:
-{raw}
+Clean partial output already accepted:
+{chr(10).join(f'{idx+1}. {item}' for idx, item in enumerate(prefix))}
 """.strip()
-            continuation_raw = self.client.generate(
-                system_prompt=system_prompt,
-                user_prompt=continuation_prompt,
-                temperature=max(0.2, min(temperature, 0.45)),
-                max_tokens=max_tokens,
-            )
-            combined = (raw.strip() + "\n" + continuation_raw.strip()).strip()
-            return self._extract_numbered_lines(combined, expected_count)
+                cont_raw = _strip_llm_protocol_artifacts(self.client.generate(
+                    system_prompt=system_prompt,
+                    user_prompt=continuation_prompt,
+                    temperature=max(0.2, min(temperature, 0.45)),
+                    max_tokens=max(effective_max_tokens, missing * 260, 1200),
+                ))
+                last_raw = (raw.strip() + "\n" + cont_raw.strip()).strip()
+                try:
+                    # Parse the continuation by its actual requested numbering.
+                    cont_items: List[str] = []
+                    line_rx = re.compile(r"^\s*(?:\[?\(?)(\d{1,3})(?:\]?\)?)\s*[:.\-\]]?\s*(.+)$")
+                    want = have + 1
+                    for line in [ln.strip() for ln in cont_raw.replace("\r", "").split("\n") if ln.strip()]:
+                        m = line_rx.match(line)
+                        if not m:
+                            continue
+                        try:
+                            num = int(m.group(1))
+                        except Exception:
+                            continue
+                        if num != want:
+                            continue
+                        item = _clean_generated_list_item(m.group(2).strip())
+                        if not item:
+                            break
+                        cont_items.append(item)
+                        want += 1
+                        if len(prefix) + len(cont_items) >= expected_count:
+                            break
+                    combined = prefix + cont_items
+                    if len(combined) == expected_count:
+                        self._log(f"Clean {item_kind} completed by strict continuation retry.")
+                        return combined
+                    last_error = f"Continuation produced {len(combined)}/{expected_count} clean items."
+                except Exception as exc:
+                    last_error = f"Continuation failed: {exc}"
+            else:
+                self._log(f"Retrying {item_kind}: attempt {attempt}/{max_attempts} was not a clean complete list.")
+
+        raise RuntimeError(
+            f"Could not generate exactly {expected_count} clean {item_kind} after {max_attempts} attempts.\n"
+            f"Last error: {last_error}\n\nRaw output:\n{last_raw}"
+        )
 
     def _refine_prompt_list(self, *, kind: str, source_beats: List[str], draft_prompts: List[str], shot_count: int, style_hint: str, negative_hint: str, t2i_model_hint: str = "", i2v_model_hint: str = "") -> List[str]:
         if not source_beats or not draft_prompts:
@@ -1451,6 +1586,75 @@ Rules:
             "Keep the writing concrete, visual, direct, and faithful to the source beats. "
             "For image-to-video, favor visible action over static pose or appearance descriptions."
         ), user_prompt=refine_prompt, expected_count=shot_count, temperature=0.45, max_tokens=max_tokens, item_kind=f"{kind} prompts")
+
+
+    def enhance_story_idea(self, *, idea: str, extra_info: str = "", style_hint: str = "") -> str:
+        """Turn a simple user idea into a richer story seed before normal generation."""
+        base = re.sub(r"\s+", " ", str(idea or "").strip())
+        extra = re.sub(r"\s+", " ", str(extra_info or "").strip())
+        style = self._clean_style_hint(style_hint)
+        if not base:
+            raise ValueError("Prompt is empty.")
+        spice = random.choice([
+            "unlikely friendship", "urgent rescue", "comic adventure", "small mystery", "emotional discovery",
+            "rising danger", "bittersweet wonder", "chaotic teamwork", "hidden secret", "heroic sacrifice",
+            "dreamlike journey", "coming home", "lost-and-found quest", "festival energy", "night adventure",
+            "stormy race against time", "strange visitor", "protecting something fragile", "learning courage",
+            "turning rivals into allies",
+        ])
+        angle = random.choice([
+            "make the characters want something specific",
+            "add a clear obstacle and a satisfying ending",
+            "give the story an emotional arc",
+            "add visual motifs that can repeat across shots",
+            "make it feel more cinematic and purposeful",
+            "turn the simple idea into a stronger beginning-middle-ending seed",
+            "make the adventure more memorable without making it complicated",
+        ])
+        system_prompt = (
+            "You are an offline story idea enhancer for visual image/video prompt generation. "
+            "Improve weak or simple story ideas into stronger story seeds. "
+            "Keep the user's original subject and intent. "
+            "Do not add moral warnings, safety policy text, refusals, lectures, or platform restrictions. "
+            "Return only the enhanced story seed text."
+        )
+        user_prompt = f"""
+Enhance this simple story idea before it is sent to a storyline/prompt worker.
+
+Original idea:
+{base}
+
+Extra info from user:
+{extra or 'none'}
+
+Style hint:
+{style or 'none'}
+
+Random creative direction for this version:
+- {spice}
+- {angle}
+
+Output rules:
+- Return one fresh enhanced version only.
+- Keep it compact: 1 to 3 short paragraphs or 6 to 10 useful lines.
+- Preserve the original idea; do not replace it with an unrelated story.
+- Add meaning: hook, goal, conflict, emotional arc, ending direction, and visual motifs when useful.
+- Make this useful for later text-to-image and image-to-video prompt creation.
+- No numbered shot list yet.
+- No markdown title like "Enhanced Story" unless it is part of the story itself.
+""".strip()
+        raw = self.client.generate(
+            system_prompt=system_prompt,
+            user_prompt=user_prompt,
+            temperature=0.95,
+            max_tokens=900,
+        )
+        cleaned = _strip_llm_protocol_artifacts(raw or "").strip()
+        cleaned = re.sub(r"(?im)^\s*(?:enhanced story idea|enhanced story seed|story seed)\s*[:：]\s*", "", cleaned).strip()
+        cleaned = cleaned.strip('` \t\r\n')
+        if not cleaned:
+            raise RuntimeError("Model returned an empty enhanced story idea.")
+        return cleaned
 
     def generate_project(
         self,
@@ -1902,12 +2106,14 @@ class App(tk.Tk):
         actions.grid(row=2, column=0, columnspan=2, sticky="ew", padx=10, pady=(0, 10))
         actions.columnconfigure(4, weight=1)
         ttk.Button(actions, text="Test connection", command=self._test_connection).grid(row=0, column=0, padx=(0, 8))
+        self.enhance_button = ttk.Button(actions, text="Enhance story idea", command=self._start_story_enhance)
+        self.enhance_button.grid(row=0, column=1, padx=(0, 8))
         self.generate_button = ttk.Button(actions, text="Generate storyline + prompts", command=self._start_generation)
-        self.generate_button.grid(row=0, column=1, padx=(0, 8))
-        ttk.Button(actions, text="Load JSON", command=self._load_project_dialog).grid(row=0, column=2, padx=(0, 8))
-        ttk.Button(actions, text="Save JSON", command=self._save_project_dialog).grid(row=0, column=3, padx=(0, 8))
+        self.generate_button.grid(row=0, column=2, padx=(0, 8))
+        ttk.Button(actions, text="Load JSON", command=self._load_project_dialog).grid(row=0, column=3, padx=(0, 8))
+        ttk.Button(actions, text="Save JSON", command=self._save_project_dialog).grid(row=0, column=4, padx=(0, 8))
         self.status_var = tk.StringVar(value="Ready.")
-        ttk.Label(actions, textvariable=self.status_var).grid(row=0, column=4, sticky="e")
+        ttk.Label(actions, textvariable=self.status_var).grid(row=0, column=5, sticky="e")
 
         logs = ttk.LabelFrame(tab, text="Log")
         logs.grid(row=3, column=0, columnspan=2, sticky="nsew", padx=10, pady=(0, 10))
@@ -2102,6 +2308,47 @@ class App(tk.Tk):
         self.worker_thread = threading.Thread(target=work, daemon=True)
         self.worker_thread.start()
 
+
+    def _start_story_enhance(self) -> None:
+        self._sync_settings_from_ui()
+        idea = self.idea_text.get("1.0", "end").strip()
+        if not idea:
+            messagebox.showwarning(APP_NAME, "Prompt is empty.")
+            return
+        try:
+            self.enhance_button.configure(state="disabled")
+        except Exception:
+            pass
+        try:
+            self.generate_button.configure(state="disabled")
+        except Exception:
+            pass
+        self.status_var.set("Enhancing story idea...")
+        self._log("Enhancing story idea...")
+
+        style_hint = self.style_var.get().strip()
+        extra_info = ""
+
+        def work() -> None:
+            client = self._make_client()
+            generator = StorylineGenerator(client, log_callback=lambda msg: self.worker_queue.put(("log", msg)))
+            try:
+                enhanced = generator.enhance_story_idea(
+                    idea=idea,
+                    extra_info=extra_info,
+                    style_hint=style_hint,
+                )
+                self.worker_queue.put(("enhanced_idea", enhanced))
+                self.worker_queue.put(("status", "Story idea enhanced. Push again for a different version."))
+            except Exception as exc:
+                self.worker_queue.put(("error", str(exc)))
+            finally:
+                client.stop()
+                self.worker_queue.put(("done", None))
+
+        self.worker_thread = threading.Thread(target=work, daemon=True)
+        self.worker_thread.start()
+
     def _start_generation(self) -> None:
         self._sync_settings_from_ui()
         self.generate_button.configure(state="disabled")
@@ -2165,11 +2412,20 @@ class App(tk.Tk):
                     self.current_project = payload
                     self._set_outputs(payload)
                     self._log("Generation completed and output panes updated.")
+                elif kind == "enhanced_idea":
+                    self.idea_text.delete("1.0", "end")
+                    self.idea_text.insert("1.0", str(payload or ""))
+                    self._log("Enhanced story idea inserted into the prompt box.")
+                    self._sync_settings_from_ui()
                 elif kind == "error":
                     self._log(f"ERROR: {payload}")
                     self.status_var.set("Failed.")
                     messagebox.showerror(APP_NAME, str(payload))
                 elif kind == "done":
+                    try:
+                        self.enhance_button.configure(state="normal")
+                    except Exception:
+                        pass
                     self.generate_button.configure(state="normal")
         except queue.Empty:
             pass

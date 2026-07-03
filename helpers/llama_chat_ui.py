@@ -1725,6 +1725,131 @@ class ChatMediaPlayerWidget(QtWidgets.QFrame):
         except Exception:
             pass
 
+
+
+class SelectableAutoScrollLabel(QtWidgets.QLabel):
+    """Selectable QLabel that auto-scrolls the chat while dragging text selection.
+
+    Normal QLabel text selection does not scroll the parent area while the mouse is
+    held near the top/bottom edge. This keeps long answer selection one-handed:
+    click-drag up or down and the chat scrolls for you.
+    """
+
+    def __init__(self, text: str = "", parent=None):
+        super().__init__(text, parent)
+        self._select_scroll_timer = QtCore.QTimer(self)
+        self._select_scroll_timer.setInterval(35)
+        self._select_scroll_timer.timeout.connect(self._selection_auto_scroll_tick)
+        self._select_scroll_active = False
+        self._select_scroll_sending_move = False
+
+    def mousePressEvent(self, event: QtGui.QMouseEvent):
+        if event.button() == QtCore.Qt.LeftButton:
+            self._select_scroll_active = True
+            try:
+                self.grabMouse()
+            except Exception:
+                pass
+            if not self._select_scroll_timer.isActive():
+                self._select_scroll_timer.start()
+        super().mousePressEvent(event)
+
+    def mouseMoveEvent(self, event: QtGui.QMouseEvent):
+        super().mouseMoveEvent(event)
+        if self._select_scroll_active:
+            self._selection_auto_scroll_tick(send_move=False)
+
+    def mouseReleaseEvent(self, event: QtGui.QMouseEvent):
+        super().mouseReleaseEvent(event)
+        if event.button() == QtCore.Qt.LeftButton:
+            self._stop_selection_auto_scroll()
+
+    def focusOutEvent(self, event: QtGui.QFocusEvent):
+        self._stop_selection_auto_scroll()
+        super().focusOutEvent(event)
+
+    def _stop_selection_auto_scroll(self) -> None:
+        self._select_scroll_active = False
+        try:
+            if self._select_scroll_timer.isActive():
+                self._select_scroll_timer.stop()
+        except Exception:
+            pass
+        try:
+            self.releaseMouse()
+        except Exception:
+            pass
+
+    def _find_parent_scroll_area(self) -> Optional[QtWidgets.QScrollArea]:
+        w = self.parentWidget()
+        while w is not None:
+            if isinstance(w, QtWidgets.QScrollArea):
+                return w
+            w = w.parentWidget()
+        win = self.window()
+        try:
+            area = getattr(win, "chat_view", None)
+            if isinstance(area, QtWidgets.QScrollArea):
+                return area
+        except Exception:
+            pass
+        return None
+
+    def _selection_auto_scroll_tick(self, send_move: bool = True) -> None:
+        if self._select_scroll_sending_move:
+            return
+        try:
+            if not self._select_scroll_active or not (QtWidgets.QApplication.mouseButtons() & QtCore.Qt.LeftButton):
+                self._stop_selection_auto_scroll()
+                return
+            area = self._find_parent_scroll_area()
+            if area is None:
+                return
+            viewport = area.viewport()
+            if viewport is None:
+                return
+            global_pos = QtGui.QCursor.pos()
+            vp_pos = viewport.mapFromGlobal(global_pos)
+            bar = area.verticalScrollBar()
+            if bar is None:
+                return
+            margin = 46
+            max_step = 42
+            step = 0
+            if vp_pos.y() < margin:
+                step = -max(6, min(max_step, margin - vp_pos.y()))
+            elif vp_pos.y() > viewport.height() - margin:
+                step = max(6, min(max_step, vp_pos.y() - (viewport.height() - margin)))
+            if step:
+                old = bar.value()
+                bar.setValue(max(bar.minimum(), min(bar.maximum(), old + step)))
+                if send_move and bar.value() != old:
+                    self._send_selection_mouse_move(global_pos)
+        except Exception:
+            pass
+
+    def _send_selection_mouse_move(self, global_pos: QtCore.QPoint) -> None:
+        try:
+            self._select_scroll_sending_move = True
+            local_pos = self.mapFromGlobal(global_pos)
+            local_f = QtCore.QPointF(local_pos)
+            global_f = QtCore.QPointF(global_pos)
+            ev = QtGui.QMouseEvent(
+                QtCore.QEvent.MouseMove,
+                local_f,
+                local_f,
+                global_f,
+                QtCore.Qt.NoButton,
+                QtCore.Qt.LeftButton,
+                QtWidgets.QApplication.keyboardModifiers(),
+            )
+            QtWidgets.QApplication.sendEvent(self, ev)
+        except Exception:
+            pass
+        finally:
+            self._select_scroll_sending_move = False
+
+
 class MessageBubble(QtWidgets.QFrame):
     editRequested = QtCore.Signal(str)
     editSaved = QtCore.Signal(str, str)
@@ -1767,7 +1892,7 @@ class MessageBubble(QtWidgets.QFrame):
             self._ensure_thinking_frame()
             self.think_lbl.setText((thinking or "").strip())
 
-        self.text_lbl = QtWidgets.QLabel(text or "")
+        self.text_lbl = SelectableAutoScrollLabel(text or "")
         if role == "assistant":
             self.text_lbl.setObjectName("AnswerText")
         elif role == "user":
@@ -1813,7 +1938,7 @@ class MessageBubble(QtWidgets.QFrame):
         think_title.setObjectName("ThinkingTitle")
         think_lay.addWidget(think_title)
 
-        self.think_lbl = QtWidgets.QLabel("")
+        self.think_lbl = SelectableAutoScrollLabel("")
         self.think_lbl.setObjectName("ThinkingText")
         self.think_lbl.setWordWrap(True)
         self.think_lbl.setTextInteractionFlags(QtCore.Qt.TextSelectableByMouse)
@@ -1956,6 +2081,71 @@ class MessageBubble(QtWidgets.QFrame):
                 pass
         return ""
 
+    def _default_save_text_folder(self) -> str:
+        try:
+            win = self.window()
+            settings_path = str(getattr(win, "settings_path", "") or "")
+            data = _load_json(settings_path, {}) if settings_path else {}
+            folder = str(data.get("save_selection_folder", "") or "").strip() if isinstance(data, dict) else ""
+            if folder and os.path.isdir(folder):
+                return folder
+        except Exception:
+            pass
+        try:
+            return str(Path.home())
+        except Exception:
+            return ""
+
+    def _remember_save_text_folder(self, folder: str) -> None:
+        try:
+            folder = os.path.abspath(str(folder or ""))
+            if not folder or not os.path.isdir(folder):
+                return
+            win = self.window()
+            settings_path = str(getattr(win, "settings_path", "") or "")
+            if not settings_path:
+                return
+            data = _load_json(settings_path, {})
+            if not isinstance(data, dict):
+                data = {}
+            data["save_selection_folder"] = folder
+            _save_json_atomic(settings_path, data)
+        except Exception:
+            pass
+
+    def _save_text_to_file(self, text: str, selected_only: bool = False) -> None:
+        text = str(text or "")
+        if not text:
+            return
+        default_name = "selected_text.txt" if selected_only else "message.txt"
+        start_dir = self._default_save_text_folder()
+        start_path = os.path.join(start_dir, default_name) if start_dir else default_name
+        try:
+            path, _filter = QtWidgets.QFileDialog.getSaveFileName(
+                self,
+                "Save selected text" if selected_only else "Save message text",
+                start_path,
+                "Text/code files (*.txt *.md *.py *.json *.html *.css *.js *.bat *.ps1);;All files (*)",
+            )
+        except Exception:
+            path = ""
+        if not path:
+            return
+        try:
+            os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
+            with open(path, "w", encoding="utf-8", newline="\n") as f:
+                f.write(text)
+            self._remember_save_text_folder(os.path.dirname(os.path.abspath(path)))
+            try:
+                QtWidgets.QToolTip.showText(QtGui.QCursor.pos(), f"Saved: {os.path.basename(path)}", self)
+            except Exception:
+                pass
+        except Exception as e:
+            try:
+                QtWidgets.QMessageBox.warning(self, "Save failed", str(e))
+            except Exception:
+                pass
+
     def _show_message_menu(self, pos: QtCore.QPoint):
         menu = QtWidgets.QMenu(self)
         selected_text = self._selected_label_text()
@@ -1976,6 +2166,7 @@ class MessageBubble(QtWidgets.QFrame):
             act_save_memory = None
             act_save_project = None
         act_copy = menu.addAction("Copy selection" if selected_text else "Copy")
+        act_save_file = menu.addAction("Save selection to file…" if selected_text else "Save message to file…")
         action = menu.exec(QtGui.QCursor.pos())
         if action is None:
             return
@@ -1997,6 +2188,10 @@ class MessageBubble(QtWidgets.QFrame):
                 QtWidgets.QApplication.clipboard().setText(selected_text or self.text_lbl.text())
             except Exception:
                 pass
+            return
+        if action == act_save_file:
+            self._save_text_to_file(selected_text or self.text_lbl.text(), selected_only=bool(selected_text))
+            return
 
     def start_edit(self):
         if self.role != "user" or self._edit_box is not None:
@@ -2252,6 +2447,7 @@ class ServerBootThread(QtCore.QThread):
 class ChatCompletionThread(QtCore.QThread):
     succeeded = QtCore.Signal(object)
     failed = QtCore.Signal(str)
+    speedUpdated = QtCore.Signal(str)
 
     def __init__(self, base_url: str, messages: List[Dict], max_tokens: int, temperature: float, top_p: float, timeout_s: int = 600, parent=None):
         super().__init__(parent)
@@ -2265,44 +2461,107 @@ class ChatCompletionThread(QtCore.QThread):
         except Exception:
             self.timeout_s = 600
 
-    def run(self):
+    def _estimate_generated_tokens(self, text: str) -> int:
+        """Fallback only: llama.cpp token counts are preferred when returned by the API."""
+        raw = str(text or "").strip()
+        if not raw:
+            return 0
+        # English-ish estimate: words undercount tokens, so multiply a little.
+        words = re.findall(r"\S+", raw)
+        if words:
+            return max(1, int(round(len(words) * 1.33)))
+        return max(1, int(round(len(raw) / 4.0)))
+
+    def _emit_live_speed(self, generated_text: str, started_at: float, force: bool = False) -> float:
+        """Emit a live, approximate generation speed while streaming chunks arrive."""
         try:
-            payload = {
-                "model": "local-model",
-                "messages": self.messages,
-                "stream": False,
-                "max_tokens": int(self.max_tokens),
-                "temperature": float(self.temperature),
-                "top_p": float(self.top_p),
-                "reasoning_format": "none",
-            }
-            code, data = _http_post_json(f"{self.base_url}/v1/chat/completions", payload, timeout=float(self.timeout_s))
-            if code >= 400:
-                msg = data.get("error", {}).get("message", f"HTTP {code}")
-                self.failed.emit(str(msg))
-                return
-            choices = data.get("choices") or []
-            if not choices:
-                self.failed.emit("No choices returned by the local server.")
-                return
-            message = choices[0].get("message") or {}
-            content = _message_content_to_text(message.get("content", ""))
-            reasoning = _message_content_to_text(
-                message.get("reasoning")
-                or message.get("reasoning_content")
-                or message.get("thinking")
-                or message.get("reasoning_text")
-                or ""
-            )
-            content, inline_reasoning = _split_inline_reasoning(content)
-            if not reasoning:
-                reasoning = inline_reasoning
-            images = _extract_images_from_response_payload(data)
-            if not content and images:
-                content = f"[Model returned {len(images)} image{'s' if len(images) != 1 else ''}]"
-            if not content:
-                content = "[Model returned an empty response]"
-            self.succeeded.emit({"content": content, "thinking": reasoning, "images": images})
+            now = time.perf_counter()
+            elapsed_s = max(0.001, now - float(started_at))
+            completion_tokens = self._estimate_generated_tokens(generated_text)
+            if completion_tokens <= 0:
+                return now
+            tok_s = float(completion_tokens) / elapsed_s
+            self.speedUpdated.emit(f"speed: {tok_s:.1f} tok/s live ({completion_tokens} tok, {elapsed_s:.1f}s)")
+            return now
+        except Exception:
+            return time.perf_counter()
+
+    def _run_non_streaming(self, started_at: float) -> None:
+        payload = {
+            "model": "local-model",
+            "messages": self.messages,
+            "stream": False,
+            "max_tokens": int(self.max_tokens),
+            "temperature": float(self.temperature),
+            "top_p": float(self.top_p),
+            "reasoning_format": "none",
+        }
+        code, data = _http_post_json(f"{self.base_url}/v1/chat/completions", payload, timeout=float(self.timeout_s))
+        elapsed_s = max(0.001, time.perf_counter() - started_at)
+        if code >= 400:
+            msg = data.get("error", {}).get("message", f"HTTP {code}")
+            self.failed.emit(str(msg))
+            return
+        choices = data.get("choices") or []
+        if not choices:
+            self.failed.emit("No choices returned by the local server.")
+            return
+        message = choices[0].get("message") or {}
+        content = _message_content_to_text(message.get("content", ""))
+        reasoning = _message_content_to_text(
+            message.get("reasoning")
+            or message.get("reasoning_content")
+            or message.get("thinking")
+            or message.get("reasoning_text")
+            or ""
+        )
+        content, inline_reasoning = _split_inline_reasoning(content)
+        if not reasoning:
+            reasoning = inline_reasoning
+        images = _extract_images_from_response_payload(data)
+        if not content and images:
+            content = f"[Model returned {len(images)} image{'s' if len(images) != 1 else ''}]"
+        if not content:
+            content = "[Model returned an empty response]"
+
+        usage = data.get("usage") if isinstance(data, dict) else {}
+        if not isinstance(usage, dict):
+            usage = {}
+        completion_tokens = int(
+            usage.get("completion_tokens")
+            or usage.get("output_tokens")
+            or usage.get("generated_tokens")
+            or 0
+        )
+        prompt_tokens = int(
+            usage.get("prompt_tokens")
+            or usage.get("input_tokens")
+            or 0
+        )
+        if completion_tokens <= 0:
+            completion_tokens = self._estimate_generated_tokens(content)
+        tokens_per_second = float(completion_tokens) / elapsed_s if completion_tokens > 0 else 0.0
+
+        self.succeeded.emit({
+            "content": content,
+            "thinking": reasoning,
+            "images": images,
+            "elapsed_s": elapsed_s,
+            "completion_tokens": completion_tokens,
+            "prompt_tokens": prompt_tokens,
+            "tokens_per_second": tokens_per_second,
+            "speed_source": "api/estimate",
+        })
+
+    def run(self):
+        started_at = time.perf_counter()
+        try:
+            # Keep the original non-streaming request path.
+            # Live speed from SSE was unreliable with some llama.cpp/LM Studio-compatible
+            # servers because prompt-eval/wait time and reasoning chunks can look like
+            # near-zero token generation. The UI now only shows the final measured speed.
+            self._run_non_streaming(started_at)
+            return
         except TimeoutError:
             self.failed.emit(f"Generation timed out after {int(getattr(self, 'timeout_s', 600))} seconds.")
         except socket.timeout:
@@ -3086,6 +3345,8 @@ class LlamaChatWindow(QtWidgets.QMainWindow):
         self._force_disable_mtp_once: bool = False
         self._runner_mtp_support_cache: Dict[str, bool] = {}
         self.server_log_tail: List[str] = []
+        self._last_llm_speed_text: str = ""
+        self._current_llm_speed_text: str = ""
         self.pending_generate_session_id: str = ""
         self.pending_retry_generation: bool = False
         self._pending_generation_update: Optional[Dict[str, Any]] = None
@@ -4286,6 +4547,9 @@ class LlamaChatWindow(QtWidgets.QMainWindow):
 
     def _save_all(self):
         bubble_auto, bubble_base, bubble_assistant, bubble_user = self.settings_dialog.bubble_color_settings()
+        old_settings = _load_json(self.settings_path, {})
+        if not isinstance(old_settings, dict):
+            old_settings = {}
         settings = {
             "runner_path": self.settings_dialog.ed_runner.text().strip(),
             "model_root": self.settings_dialog.ed_model_root.text().strip(),
@@ -4314,6 +4578,7 @@ class LlamaChatWindow(QtWidgets.QMainWindow):
             "answer_with_voice": bool(getattr(self, "chk_answer_voice", None).isChecked()) if getattr(self, "chk_answer_voice", None) is not None else bool(getattr(self, "voice_answer_enabled", False)),
             "last_session_id": self.current_session_id or "",
             "chat_composer_splitter_sizes": list(getattr(self, "main_vertical_splitter", None).sizes()) if getattr(self, "main_vertical_splitter", None) is not None else [760, 150],
+            "save_selection_folder": str(old_settings.get("save_selection_folder", "") or ""),
         }
         _save_json_atomic(self.settings_path, settings)
         for s in self.sessions:
@@ -5537,6 +5802,7 @@ class LlamaChatWindow(QtWidgets.QMainWindow):
     def _append_server_log(self, text: str):
         if not text:
             return
+        speed_updated = False
         for line in text.replace("\r", "\n").split("\n"):
             line = line.strip()
             if not line:
@@ -5544,6 +5810,25 @@ class LlamaChatWindow(QtWidgets.QMainWindow):
             self.server_log_tail.append(line)
             if len(self.server_log_tail) > 40:
                 self.server_log_tail = self.server_log_tail[-40:]
+
+            # llama.cpp often prints final timing like:
+            # "eval time = ... / 742 runs (33.80 tokens per second)"
+            # Prefer this when available because it is the runner's real generation speed.
+            low = line.lower()
+            if "eval time" in low and ("tokens per second" in low or "tokens/s" in low):
+                m_speed = re.search(r"\(([-+]?\d+(?:\.\d+)?)\s*(?:tokens\s+per\s+second|tokens/s|tok/s)\)", line, re.IGNORECASE)
+                m_tokens = re.search(r"/\s*(\d+)\s*(?:runs|tokens?)", line, re.IGNORECASE)
+                if m_speed:
+                    try:
+                        tok_s = float(m_speed.group(1))
+                        token_part = f", {int(m_tokens.group(1))} tok" if m_tokens else ""
+                        self._last_llm_speed_text = f"speed: {tok_s:.1f} tok/s{token_part}"
+                        self._current_llm_speed_text = ""
+                        speed_updated = True
+                    except Exception:
+                        pass
+        if speed_updated:
+            self._update_header()
 
     def _running_queue_job_files(self) -> List[str]:
         """Return running queue marker/job files above 1.5 KB.
@@ -5782,6 +6067,7 @@ class LlamaChatWindow(QtWidgets.QMainWindow):
         self.loaded_model_path = ""
         self.loaded_template = ("auto", "")
         self.effective_template_on_server = ("auto", "")
+        self._current_llm_speed_text = ""
         self.active_mmproj_path = ""
         self.active_mmproj_path = ""
         self.server_log_tail = []
@@ -6714,6 +7000,8 @@ class LlamaChatWindow(QtWidgets.QMainWindow):
 
         self.btn_send.setEnabled(False)
         self.btn_stop.setEnabled(True)
+        self._current_llm_speed_text = ""
+        self._update_header()
         self._set_status("Generating…", "loading")
 
         pending_update = self._pending_generation_update if isinstance(self._pending_generation_update, dict) else None
@@ -8284,6 +8572,10 @@ class LlamaChatWindow(QtWidgets.QMainWindow):
 
         self._start_reply_request_for_current_session()
 
+    def _on_chat_speed_updated(self, text: str):
+        self._current_llm_speed_text = str(text or "").strip()
+        self._update_header()
+
     def _on_chat_succeeded(self, payload):
         s = self._current_session()
         if not s:
@@ -8293,8 +8585,26 @@ class LlamaChatWindow(QtWidgets.QMainWindow):
             reply = str(payload.get("content", "") or "").strip()
             thinking = str(payload.get("thinking", "") or "").strip()
             images_payload = list(payload.get("images", []) or [])
+            try:
+                tok_s = float(payload.get("tokens_per_second") or 0.0)
+                gen_tok = int(payload.get("completion_tokens") or 0)
+                elapsed_s = float(payload.get("elapsed_s") or 0.0)
+                if tok_s > 0:
+                    extra = []
+                    if gen_tok > 0:
+                        extra.append(f"{gen_tok} tok")
+                    if elapsed_s > 0:
+                        extra.append(f"{elapsed_s:.1f}s")
+                    suffix = f" ({', '.join(extra)})" if extra else ""
+                    self._last_llm_speed_text = f"speed: {tok_s:.1f} tok/s{suffix}"
+                else:
+                    self._last_llm_speed_text = ""
+                self._current_llm_speed_text = ""
+            except Exception:
+                self._current_llm_speed_text = ""
         else:
             reply, thinking = _split_inline_reasoning(str(payload or ""))
+            self._current_llm_speed_text = ""
         if self._try_auto_retry_after_bad_reply(reply):
             return
         self._auto_retry_templates = []
@@ -8342,6 +8652,7 @@ class LlamaChatWindow(QtWidgets.QMainWindow):
     def _on_chat_failed(self, message: str):
         self._auto_retry_templates = []
         self.pending_retry_generation = False
+        self._current_llm_speed_text = ""
         msg = str(message or "").strip()
         low = msg.lower()
         if "image input is not supported" in low and not self.active_mmproj_path:
@@ -9329,9 +9640,12 @@ class LlamaChatWindow(QtWidgets.QMainWindow):
         else:
             state_text = f"selected: {selected_model}"
 
+        speed_text = str(getattr(self, "_current_llm_speed_text", "") or getattr(self, "_last_llm_speed_text", "") or "").strip()
+        speed_part = f"   •   {speed_text}" if speed_text else ""
+
         self.lbl_title.setText(s.title if s else "New Chat")
         self.lbl_model_info.setText(
-            f"{state_text}   •   template: {template_text}   •   ctx: {int(self.settings_dialog.sp_ctx_size.value())}   •   max tokens: {int(self.settings_dialog.sp_max_tokens.value())}   •   timeout: {int(self.settings_dialog.sp_generation_timeout.value())}s"
+            f"{state_text}   •   ctx: {int(self.settings_dialog.sp_ctx_size.value())}   •   max tokens: {int(self.settings_dialog.sp_max_tokens.value())}   •   timeout: {int(self.settings_dialog.sp_generation_timeout.value())}s{speed_part}"
         )
 
     # ---------- window ----------
