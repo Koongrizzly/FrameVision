@@ -415,13 +415,13 @@ class Txt2ImgPane(QWidget):
         return [
             ("SD models (SD15/SDXL)", "diffusers"),
             ("Z-Image Turbo (FP16)", "zimage"),
-            ("Z-Image Turbo (GGUF Low VRAM)", "zimage_gguf"),
-            ("Qwen 2.5 12B GGUF (Low VRAM)", "qwen2512"),
-            ("Ideogram 4 GGUF", "ideogram4_gguf"),
-            ("Krea 2 GGUF", "krea2"),
+            ("Z-Image Turbo (GGUF, fast)", "zimage_gguf"),
+            ("Qwen 2.5 12B (GGUF)", "qwen2512"),
+            ("Ideogram 4 (GGUF)", "ideogram4_gguf"),
+            ("Krea 2 (GGUF, fast)", "krea2"),
             ("Chroma", "chroma"),
-            ("Lens Turbo U4", "lens_turbo_u4"),
-            ("Boogu Image", "boogu_image"),
+            ("Lens Turbo 'U4, fast)", "lens_turbo_u4"),
+            ("Boogu Image (gguf)", "boogu_image"),
         ]
 
     def refresh_hidden_tools(self) -> None:
