@@ -2698,12 +2698,95 @@ def _planner_get_own_character_entries(enc: Optional[Dict[str, Any]]) -> List[Di
     return out
 
 
+def _normalize_t2i_prompt_text(text: str) -> str:
+    try:
+        s = str(text or '')
+    except Exception:
+        s = ''
+    s = s.replace("\r", " ").replace("\n", " ")
+    s = re.sub(r"\s+", " ", s)
+    s = re.sub(r"\s+,", ",", s)
+    s = re.sub(r",\s*,+", ", ", s)
+    s = re.sub(r"\s+([.;:!?])", r"\1", s)
+    return s.strip()
+
+
+def _collapse_repeated_parenthetical_chunks(text: str) -> str:
+    out = _normalize_t2i_prompt_text(text)
+    if not out:
+        return out
+    for _ in range(8):
+        prev = out
+        out = re.sub(r"\(([^()]{8,500})\)\s*,?\s*\(\1\)", r"(\1)", out, flags=re.IGNORECASE)
+        out = re.sub(r"\b([^,.;:!?()]{2,120}?)\s*\(([^()]{8,500})\)\s*,?\s*\1\s*\(\2\)", r"\1 (\2)", out, flags=re.IGNORECASE)
+        out = re.sub(
+            r"\b([^,.;:!?()]{2,120}?)\s*\(([^()]{8,500})\)\s*\1\s*\(([^()]{8,500})\)",
+            lambda m: f"{m.group(1)} ({m.group(2)})" if m.group(2).strip().lower() == m.group(3).strip().lower() else m.group(0),
+            out,
+            flags=re.IGNORECASE,
+        )
+        if out == prev:
+            break
+    out = re.sub(r"\s{2,}", " ", out).strip(" ,")
+    return out
+
+
+def _cleanup_own_character_prompt_before_t2i(prompt_text: str, enc: Optional[Dict[str, Any]]) -> str:
+    out = _collapse_repeated_parenthetical_chunks(prompt_text)
+    try:
+        entries = _planner_get_own_character_entries(enc)
+    except Exception:
+        entries = []
+    if not entries:
+        return out
+    try:
+        entries = sorted(entries, key=lambda d: len(str(d.get('codeword') or '')), reverse=True)
+    except Exception:
+        pass
+    for rec in entries:
+        try:
+            codeword = str(rec.get('codeword') or '').strip()
+            repl = str(rec.get('prompt') or '').strip()
+        except Exception:
+            codeword, repl = '', ''
+        if not codeword or not repl:
+            continue
+
+        exact = re.compile(re.escape(repl), re.IGNORECASE)
+        first = True
+        def _exact_repl(match):
+            nonlocal first
+            if first:
+                first = False
+                return repl
+            return codeword
+        out = exact.sub(_exact_repl, out)
+
+        inline = re.compile(re.escape(f"{codeword} ({repl})") + r",?", re.IGNORECASE)
+        first_inline = True
+        def _inline_repl(match):
+            nonlocal first_inline
+            if first_inline:
+                first_inline = False
+                return f"{codeword} ({repl})"
+            return codeword
+        out = inline.sub(_inline_repl, out)
+        out = _collapse_repeated_parenthetical_chunks(out)
+
+    out = _normalize_t2i_prompt_text(out)
+    return out
+
+
 def _apply_own_character_codeword_replacements(prompt_text: str, enc: Optional[Dict[str, Any]]) -> str:
     """Replace manual character codewords with the corresponding character bible text.
 
+    Behavior:
     - Only entries with BOTH prompt and codeword are applied.
     - Case-insensitive whole-word/phrase matching.
-    - No codeword => no injection (prevents global prompt pollution).
+    - Replace only the first occurrence of each codeword per prompt.
+    - Later mentions stay short, so the same full character bible is not repeated.
+    - Placeholders are used during replacement so matches inside an already inserted
+      character prompt cannot recursively expand again.
     """
     try:
         text = str(prompt_text or '')
@@ -2719,14 +2802,14 @@ def _apply_own_character_codeword_replacements(prompt_text: str, enc: Optional[D
     if not entries:
         return text
 
-    # Longest phrase first to avoid partial collisions (e.g. "Alien" vs "The alien").
     try:
         entries = sorted(entries, key=lambda d: len(str(d.get('codeword') or '')), reverse=True)
     except Exception:
         pass
 
     out = text
-    for rec in entries:
+    placeholders: Dict[str, str] = {}
+    for idx, rec in enumerate(entries, start=1):
         try:
             codeword = str(rec.get("codeword") or '').strip()
             repl = str(rec.get("prompt") or '').strip()
@@ -2736,10 +2819,22 @@ def _apply_own_character_codeword_replacements(prompt_text: str, enc: Optional[D
             continue
         try:
             pat = re.compile(rf"(?<!\w){re.escape(codeword)}(?!\w)", re.IGNORECASE)
-            out = pat.sub(repl, out)
+            token = f"__FV_OWN_CHAR_{idx}__"
+            used = False
+            def _pat_repl(match):
+                nonlocal used
+                if not used:
+                    used = True
+                    placeholders[token] = repl
+                    return token
+                return codeword
+            out = pat.sub(_pat_repl, out)
         except Exception:
             continue
-    return out
+
+    for token, repl in placeholders.items():
+        out = out.replace(token, repl)
+    return _cleanup_own_character_prompt_before_t2i(out, enc)
 
 # info: Chunk 10 side quest — Own storyline prompt parser (Step 2: preview only)
 # Splits the user-pasted storyline into a list of prompts.
@@ -9462,6 +9557,10 @@ class PipelineWorker(QThread):
                 new_prompt = _apply_own_character_codeword_replacements(str(new_prompt or ''), getattr(self.job, "encoding", {}))
         except Exception:
             pass
+        try:
+            new_prompt = _cleanup_own_character_prompt_before_t2i(str(new_prompt or ''), getattr(self.job, "encoding", {}))
+        except Exception:
+            pass
 
         # Auto Character Bible v2: identity anchors are appended per-shot at dispatch-time in the main render loop.
         # (Do NOT inject here; regen should only respect Own Character Bible when enabled.)
@@ -13221,6 +13320,10 @@ class PipelineWorker(QThread):
                                 pr_final = _apply_own_character_codeword_replacements(pr_final, self.job.encoding)
                         except Exception:
                             pass
+                        try:
+                            pr_final = _cleanup_own_character_prompt_before_t2i(pr_final, self.job.encoding)
+                        except Exception:
+                            pass
                         if bool(_ref_strategy == "fireedit" and bool(_ref_files)):
                             pr_final = _apply_firered_prompt_addons(pr_final, add_environment=True)
 
@@ -14844,6 +14947,10 @@ class PipelineWorker(QThread):
                         try:
                             if bool((getattr(self.job, "encoding", {}) or {}).get("own_character_bible_enabled")) and bool(_own_active):
                                 prompt = _apply_own_character_codeword_replacements(str(prompt or ''), getattr(self.job, "encoding", {}))
+                        except Exception:
+                            pass
+                        try:
+                            prompt = _cleanup_own_character_prompt_before_t2i(str(prompt or ''), getattr(self.job, "encoding", {}))
                         except Exception:
                             pass
                         

@@ -1108,8 +1108,22 @@ Rules:
         return fixed
 
     @staticmethod
+    def _collapse_repeated_parenthetical_chunks(text: str) -> str:
+        out = str(text or "")
+        if not out:
+            return out
+        for _ in range(8):
+            prev = out
+            out = re.sub(r"\(([^()]{8,500})\)\s*,?\s*\(\1\)", r"(\1)", out, flags=re.IGNORECASE)
+            out = re.sub(r"\b([^,.;:!?()]{2,120}?)\s*\(([^()]{8,500})\)\s*,?\s*\1\s*\(\2\)", r"\1 (\2)", out, flags=re.IGNORECASE)
+            if out == prev:
+                break
+        return re.sub(r"\s{2,}", " ", out).strip(" ,")
+
+    @staticmethod
     def _postprocess_inline_bible_prompt(prompt: str) -> str:
         text = StorylineGenerator._ensure_inline_bible_commas(prompt)
+        text = StorylineGenerator._collapse_repeated_parenthetical_chunks(text)
         text = re.sub(r"\)\s*,\s*'s\s+", "), ", text)
         text = re.sub(r"\)\s*,\s*’s\s+", "), ", text)
 
@@ -1133,6 +1147,7 @@ Rules:
         text = re.sub(r"([Tt]he)\s+", r"", text)
         text = re.sub(r"([Aa]n?)\s+", r"", text)
         text = re.sub(r"\s+,", ",", text)
+        text = StorylineGenerator._collapse_repeated_parenthetical_chunks(text)
         text = re.sub(r"\s{2,}", " ", text).strip(" ,")
         return text
 
