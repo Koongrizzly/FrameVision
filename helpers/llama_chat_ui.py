@@ -3349,6 +3349,10 @@ class LlamaChatWindow(QtWidgets.QMainWindow):
         self._current_llm_speed_text: str = ""
         self.pending_generate_session_id: str = ""
         self.pending_retry_generation: bool = False
+        # The chat that owns the currently running LLM completion.
+        # Never use the visible/current chat as the destination when a reply finishes,
+        # because the user may switch chats while the model is thinking.
+        self._active_generation_session_id: str = ""
         self._pending_generation_update: Optional[Dict[str, Any]] = None
         self._last_user_text_sent: str = ""
         self._auto_retry_templates: List[Tuple[str, str]] = []
@@ -6188,7 +6192,9 @@ class LlamaChatWindow(QtWidgets.QMainWindow):
         self._update_header()
         if self.pending_retry_generation:
             self.pending_retry_generation = False
-            QtCore.QTimer.singleShot(0, self._start_reply_request_for_current_session)
+            target_session_id = self.pending_generate_session_id or self._active_generation_session_id or self.current_session_id or ""
+            self.pending_generate_session_id = ""
+            QtCore.QTimer.singleShot(0, lambda sid=target_session_id: self._start_reply_request_for_session_id(sid))
             return
         if self.pending_generate_session_id:
             target_session_id = self.pending_generate_session_id
@@ -6931,7 +6937,7 @@ class LlamaChatWindow(QtWidgets.QMainWindow):
         finally:
             self._loading_session_state = False
 
-    def _try_auto_retry_after_bad_reply(self, reply: str) -> bool:
+    def _try_auto_retry_after_bad_reply(self, reply: str, session_id: str = "") -> bool:
         if not self._auto_retry_templates:
             return False
         if not _looks_like_bad_assistant_reply(self._last_user_text_sent, reply):
@@ -6939,6 +6945,14 @@ class LlamaChatWindow(QtWidgets.QMainWindow):
             return False
 
         next_kind, next_value = self._auto_retry_templates.pop(0)
+        # Keep auto-retry tied to the same chat that started the generation.
+        # If the user switched chats while the bad reply arrived, do not retry in
+        # whatever chat is currently visible.
+        target_session_id = str(session_id or self._active_generation_session_id or self.current_session_id or "")
+        if target_session_id and target_session_id != self.current_session_id:
+            self._select_session(target_session_id)
+        self.pending_generate_session_id = target_session_id
+        self._active_generation_session_id = target_session_id
         self._set_template_silently(next_kind, next_value)
         self.pending_retry_generation = True
         self._set_status(f"Retrying with template {next_value}…", "loading")
@@ -7009,6 +7023,8 @@ class LlamaChatWindow(QtWidgets.QMainWindow):
             api_messages = self._build_api_messages_until(s, str(pending_update.get("assistant_message_id") or ""))
         else:
             api_messages = self._build_api_messages(s)
+        target_session_id = s.id
+        self._active_generation_session_id = target_session_id
         self.chat_thread = ChatCompletionThread(
             self.server_url,
             api_messages,
@@ -7018,6 +7034,7 @@ class LlamaChatWindow(QtWidgets.QMainWindow):
             self.settings_dialog.sp_generation_timeout.value(),
             self,
         )
+        self.chat_thread.target_session_id = target_session_id
         self.chat_thread.succeeded.connect(self._on_chat_succeeded)
         self.chat_thread.failed.connect(self._on_chat_failed)
         self.chat_thread.finished.connect(self._on_chat_finished)
@@ -8576,8 +8593,32 @@ class LlamaChatWindow(QtWidgets.QMainWindow):
         self._current_llm_speed_text = str(text or "").strip()
         self._update_header()
 
+    def _append_info_message_to_session(self, session_id: str, text: str) -> None:
+        s = self._find_session(session_id) if session_id else self._current_session()
+        msg_text = str(text or "").strip()
+        if not s or not msg_text:
+            return
+        now = datetime.now().isoformat(timespec="seconds")
+        mid = str(uuid.uuid4())
+        s.messages.append({
+            "id": mid,
+            "role": "info",
+            "content": msg_text,
+            "attachments": [],
+            "timestamp": now,
+            "loading": False,
+        })
+        s.updated_at = now
+        if self.current_session_id == s.id:
+            self.chat_view.add_message("info", msg_text, message_id=mid, loading=False)
+            self.chat_view.scroll_to_bottom(force=True)
+        self._refresh_chat_list()
+        self._update_header()
+        self._queue_save()
+
     def _on_chat_succeeded(self, payload):
-        s = self._current_session()
+        target_session_id = str(getattr(self.chat_thread, "target_session_id", "") or self._active_generation_session_id or self.current_session_id or "")
+        s = self._find_session(target_session_id) if target_session_id else self._current_session()
         if not s:
             return
         images_payload: List[Dict] = []
@@ -8605,7 +8646,7 @@ class LlamaChatWindow(QtWidgets.QMainWindow):
         else:
             reply, thinking = _split_inline_reasoning(str(payload or ""))
             self._current_llm_speed_text = ""
-        if self._try_auto_retry_after_bad_reply(reply):
+        if self._try_auto_retry_after_bad_reply(reply, s.id):
             return
         self._auto_retry_templates = []
         saved_attachments: List[Dict] = []
@@ -8641,8 +8682,9 @@ class LlamaChatWindow(QtWidgets.QMainWindow):
             "loading": False,
         })
         s.updated_at = now
-        self.chat_view.add_message("assistant", reply, thinking, attachments=saved_attachments, message_id=mid, loading=False)
-        self.chat_view.scroll_to_bottom(force=True)
+        if self.current_session_id == s.id:
+            self.chat_view.add_message("assistant", reply, thinking, attachments=saved_attachments, message_id=mid, loading=False)
+            self.chat_view.scroll_to_bottom(force=True)
         self._refresh_chat_list()
         self._update_header()
         self._queue_save()
@@ -8666,12 +8708,14 @@ class LlamaChatWindow(QtWidgets.QMainWindow):
                 _s, _m = self._find_session_message(str(pending_update.get("session_id") or ""), str(pending_update.get("assistant_message_id") or ""))
                 if _m:
                     _m["loading"] = False
-                    self.chat_view.update_message(str(_m.get("id") or ""), loading=False)
-                    self._refresh_one_message_version_controls(_m)
+                    if self.current_session_id == str(pending_update.get("session_id") or ""):
+                        self.chat_view.update_message(str(_m.get("id") or ""), loading=False)
+                        self._refresh_one_message_version_controls(_m)
                     self._queue_save()
             except Exception:
                 pass
-        self.chat_view.add_message("info", f"Generation failed: {msg}")
+        target_session_id = str(getattr(self.chat_thread, "target_session_id", "") or self._active_generation_session_id or self.current_session_id or "")
+        self._append_info_message_to_session(target_session_id, f"Generation failed: {msg}")
         if self.server_process and self.server_process.state() != QtCore.QProcess.NotRunning:
             self._set_status("Ready", "ready")
         else:
@@ -8679,6 +8723,7 @@ class LlamaChatWindow(QtWidgets.QMainWindow):
 
     def _on_chat_finished(self):
         self.chat_thread = None
+        self._active_generation_session_id = ""
         self._memory_context_mode_for_next_generation = "auto"
         self._apply_send_button_guard()
         self.btn_stop.setEnabled(False)
@@ -8687,6 +8732,7 @@ class LlamaChatWindow(QtWidgets.QMainWindow):
         if self.chat_thread and self.chat_thread.isRunning():
             self.chat_view.add_message("info", "Stopping local generation and unloading the current model…")
             self.pending_generate_session_id = ""
+            self._active_generation_session_id = ""
             self._cleanup_boot_thread()
             self._stop_process_only()
             self.btn_load.setEnabled(True)
@@ -9088,6 +9134,7 @@ class LlamaChatWindow(QtWidgets.QMainWindow):
             return
         try:
             self.pending_generate_session_id = ""
+            self._active_generation_session_id = ""
             self._cleanup_boot_thread()
             self._stop_process_only()
             self.btn_load.setEnabled(True)
