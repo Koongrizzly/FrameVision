@@ -3396,6 +3396,14 @@ class LlamaChatWindow(QtWidgets.QMainWindow):
         self._save_timer.setSingleShot(True)
         self._save_timer.timeout.connect(self._save_all)
 
+        # FrameVision can apply its theme after this pane has already been constructed.
+        # Do not leave the chat on the standalone/default palette until the next settings change.
+        self._theme_refresh_timer = QtCore.QTimer(self)
+        self._theme_refresh_timer.setSingleShot(True)
+        self._theme_refresh_timer.timeout.connect(self._refresh_host_theme_now)
+        self._app_theme_filter: Optional[QtCore.QObject] = None
+        self._last_theme_signature: str = ""
+
         self._assistant_jobs: List[Dict[str, Any]] = []
         self._assistant_job_timer = QtCore.QTimer(self)
         self._assistant_job_timer.setInterval(1200)
@@ -3410,6 +3418,10 @@ class LlamaChatWindow(QtWidgets.QMainWindow):
         self._reload_startup_llm_memory()
         self._load_pinned_chats()
         self._apply_style()
+        self._install_theme_watchers()
+        self._schedule_host_theme_refresh(0)
+        self._schedule_host_theme_refresh(80)
+        self._schedule_host_theme_refresh(350)
         self._load_sessions()
         self._load_assistant_jobs()
         self._apply_send_button_guard()
@@ -3427,6 +3439,108 @@ class LlamaChatWindow(QtWidgets.QMainWindow):
             self._new_chat()
         else:
             self._select_session(self.current_session_id or self.sessions[0].id)
+
+    # ---------- theme sync ----------
+    def _install_theme_watchers(self):
+        """Keep the embedded pane synced with FrameVision when the host theme arrives late."""
+        app = QtWidgets.QApplication.instance()
+        if app is None:
+            return
+        if getattr(self, "_app_theme_filter", None) is not None:
+            return
+
+        class _ThemeEventFilter(QtCore.QObject):
+            def __init__(self, owner):
+                super().__init__(owner)
+                self.owner = owner
+
+            def eventFilter(self, obj, event):
+                try:
+                    et = event.type()
+                    if et in (
+                        QtCore.QEvent.ApplicationPaletteChange,
+                        QtCore.QEvent.PaletteChange,
+                        QtCore.QEvent.StyleChange,
+                        QtCore.QEvent.DynamicPropertyChange,
+                    ):
+                        self.owner._schedule_host_theme_refresh(20)
+                except Exception:
+                    pass
+                return False
+
+        filt = _ThemeEventFilter(self)
+        try:
+            app.installEventFilter(filt)
+            self._app_theme_filter = filt
+        except Exception:
+            self._app_theme_filter = None
+
+    def _schedule_host_theme_refresh(self, delay_ms: int = 40):
+        timer = getattr(self, "_theme_refresh_timer", None)
+        if timer is None:
+            return
+        try:
+            delay = max(0, int(delay_ms))
+            if delay <= 50:
+                # Debounce noisy palette/style events.
+                timer.start(delay)
+            else:
+                # Longer startup refreshes must all run; restarting one timer would keep only the last one.
+                QtCore.QTimer.singleShot(delay, self._refresh_host_theme_now)
+        except Exception:
+            pass
+
+    def _theme_signature(self) -> str:
+        try:
+            app = QtWidgets.QApplication.instance()
+            pal = self.palette()
+            app_pal = app.palette() if app is not None else pal
+            parts = []
+            for role in (
+                QtGui.QPalette.Window,
+                QtGui.QPalette.Base,
+                QtGui.QPalette.Button,
+                QtGui.QPalette.WindowText,
+                QtGui.QPalette.Text,
+                QtGui.QPalette.Highlight,
+                QtGui.QPalette.HighlightedText,
+            ):
+                parts.append(pal.color(role).name())
+                parts.append(app_pal.color(role).name())
+            win = self.window()
+            if win is not None and win is not self:
+                wpal = win.palette()
+                parts.extend([wpal.color(QtGui.QPalette.Window).name(), wpal.color(QtGui.QPalette.Highlight).name()])
+            return "|".join(parts)
+        except Exception:
+            return str(time.time())
+
+    def _refresh_host_theme_now(self):
+        sig = self._theme_signature()
+        if sig == getattr(self, "_last_theme_signature", ""):
+            return
+        self._last_theme_signature = sig
+        try:
+            self._apply_style()
+            self._update_framevision_fullscreen_button()
+            self.update()
+        except Exception:
+            pass
+
+    def event(self, event):
+        try:
+            et = event.type()
+            if et in (
+                QtCore.QEvent.Show,
+                QtCore.QEvent.Polish,
+                QtCore.QEvent.ParentChange,
+                QtCore.QEvent.PaletteChange,
+                QtCore.QEvent.StyleChange,
+            ):
+                self._schedule_host_theme_refresh(25)
+        except Exception:
+            pass
+        return super().event(event)
 
     # ---------- UI ----------
     def _build_ui(self):
@@ -9732,6 +9846,16 @@ class LlamaChatPane(LlamaChatWindow):
             self.setObjectName("tab_llm_chat")
         except Exception:
             pass
+        # When embedded, FrameVision's theme/palette may be assigned after construction.
+        # Re-apply after parenting and after the event loop has processed the tab/widget polish.
+        self._schedule_host_theme_refresh(0)
+        self._schedule_host_theme_refresh(120)
+        self._schedule_host_theme_refresh(600)
+
+    def refresh_framevision_theme(self):
+        """Optional hook FrameVision can call after changing the global theme."""
+        self._last_theme_signature = ""
+        self._schedule_host_theme_refresh(0)
 
 # -----------------------------
 # entry point

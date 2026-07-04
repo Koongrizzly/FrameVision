@@ -596,9 +596,430 @@ def _musicclip_prepare_krea2_single_payload(payload: dict) -> dict:
     return {"ok": True, "payload": new_payload, "image_result": res}
 
 
+
+
+# ---------------------------- LTX hard duration guard -----------------------
+
+def _musicclip_ltx_hard_cap_seconds_from_payload(payload: dict) -> float:
+    """Return the effective hard max shot duration for LTX-VRAMLab plans.
+
+    The bridge files are optional and can change independently from this UI file,
+    so the UI enforces the 241-frame / 10-second limit again after a bridge writes
+    the shot/director JSON. This prevents a stale or LLM-cleaned plan from putting
+    a 14s item back into the LTX shot list while the generator can only create the
+    first 10s of it.
+    """
+    try:
+        payload = dict(payload or {})
+    except Exception:
+        payload = {}
+    settings = payload.get("bridge_generation_settings")
+    if not isinstance(settings, dict):
+        settings = {}
+    backend = str(settings.get("ltx_backend") or payload.get("ltx_backend") or payload.get("generation_backend") or "").strip().lower()
+    has_vramlab_limit = backend == "vramlab" or settings.get("ltx_max_generation_frames") or settings.get("hard_max_ltx_shot_seconds") or settings.get("ltx_max_generation_seconds")
+    if not has_vramlab_limit:
+        return 0.0
+    for key in ("hard_max_ltx_shot_seconds", "ltx_max_generation_seconds", "max_ltx_shot_seconds"):
+        try:
+            v = float(settings.get(key) or payload.get(key) or 0.0)
+            if v > 0.05:
+                return max(0.5, min(10.0, v))
+        except Exception:
+            pass
+    return 10.0
+
+
+def _musicclip_ltx_shot_list_ref(plan: dict):
+    if not isinstance(plan, dict):
+        return None, ""
+    for key in ("shots", "ltx_shots", "director_shots", "items"):
+        shots = plan.get(key)
+        if isinstance(shots, list):
+            return shots, key
+    return None, ""
+
+
+def _musicclip_ltx_float(value: Any, default: float = 0.0) -> float:
+    try:
+        if value is None or value == "":
+            return float(default)
+        return float(value)
+    except Exception:
+        return float(default)
+
+
+def _musicclip_ltx_read_timing(shot: dict) -> tuple[float, float, float]:
+    if not isinstance(shot, dict):
+        return 0.0, 0.0, 0.0
+    start = None
+    end = None
+    for key in ("song_start", "start", "start_time", "t_start", "time_start"):
+        if key in shot:
+            start = _musicclip_ltx_float(shot.get(key), 0.0)
+            break
+    for key in ("song_end", "end", "end_time", "t_end", "time_end"):
+        if key in shot:
+            end = _musicclip_ltx_float(shot.get(key), 0.0)
+            break
+    dur = 0.0
+    for key in ("duration", "duration_seconds", "clip_duration", "shot_duration", "length_seconds"):
+        if key in shot:
+            dur = _musicclip_ltx_float(shot.get(key), 0.0)
+            break
+    if start is None:
+        start = 0.0
+    if end is None or end <= start:
+        end = start + dur if dur > 0.0 else start
+    if dur <= 0.0 and end > start:
+        dur = end - start
+    return float(start), float(end), max(0.0, float(dur))
+
+
+def _musicclip_ltx_write_timing(shot: dict, start: float, end: float) -> None:
+    if not isinstance(shot, dict):
+        return
+    start = max(0.0, float(start))
+    end = max(start, float(end))
+    dur = max(0.0, end - start)
+    for key in ("song_start", "start", "start_time", "t_start", "time_start"):
+        if key in shot:
+            shot[key] = float(start)
+    for key in ("song_end", "end", "end_time", "t_end", "time_end"):
+        if key in shot:
+            shot[key] = float(end)
+    if not any(k in shot for k in ("song_start", "start", "start_time", "t_start", "time_start")):
+        shot["song_start"] = float(start)
+    if not any(k in shot for k in ("song_end", "end", "end_time", "t_end", "time_end")):
+        shot["song_end"] = float(end)
+    for key in ("duration", "duration_seconds", "clip_duration", "shot_duration", "length_seconds"):
+        if key in shot:
+            shot[key] = float(dur)
+    if not any(k in shot for k in ("duration", "duration_seconds", "clip_duration", "shot_duration", "length_seconds")):
+        shot["duration"] = float(dur)
+
+
+def _musicclip_ltx_sanitize_plan_file(plan_path: str, payload: dict, label: str = "LTX plan") -> dict:
+    """Split over-cap LTX shots in an already-written JSON plan.
+
+    Returns a small report. It is intentionally conservative: it only runs when
+    the payload/settings indicate the LTX-VRAMLab 241-frame limit. It rewrites the
+    same JSON file atomically and keeps all creative prompt fields from the source
+    shot on each split segment.
+    """
+    cap = _musicclip_ltx_hard_cap_seconds_from_payload(payload)
+    if cap <= 0.05:
+        return {"changed": False, "split_count": 0, "cap_seconds": 0.0, "message": "no hard cap active"}
+    try:
+        path = str(plan_path or "").strip()
+        if not path or not os.path.isfile(path):
+            return {"changed": False, "split_count": 0, "cap_seconds": cap, "message": "plan not found"}
+        with open(path, "r", encoding="utf-8") as f:
+            plan = json.load(f)
+        if not isinstance(plan, dict):
+            return {"changed": False, "split_count": 0, "cap_seconds": cap, "message": "plan is not an object"}
+        shots, key = _musicclip_ltx_shot_list_ref(plan)
+        if not isinstance(shots, list) or not shots:
+            return {"changed": False, "split_count": 0, "cap_seconds": cap, "message": "no shots"}
+
+        new_shots = []
+        split_count = 0
+        max_seen = 0.0
+        eps = 0.035
+        for shot in shots:
+            if not isinstance(shot, dict):
+                new_shots.append(shot)
+                continue
+            start, end, dur = _musicclip_ltx_read_timing(shot)
+            if dur <= 0.0 and end > start:
+                dur = end - start
+            max_seen = max(max_seen, dur)
+            if dur <= cap + eps:
+                new_shots.append(shot)
+                continue
+            pieces = max(2, int(math.ceil(dur / cap)))
+            piece_len = dur / float(pieces)
+            # Keep every part at or below the hard cap even with rounding.
+            if piece_len > cap:
+                pieces += 1
+                piece_len = dur / float(pieces)
+            original_id = str(shot.get("id") or shot.get("shot_id") or "LTX").strip() or "LTX"
+            for pi in range(pieces):
+                a = start + (dur * pi / float(pieces))
+                b = start + (dur * (pi + 1) / float(pieces))
+                part = copy.deepcopy(shot)
+                _musicclip_ltx_write_timing(part, a, b)
+                part["source_ltx_shot_id"] = original_id
+                part["split_from_overlong_ltx_shot"] = True
+                part["split_part"] = int(pi + 1)
+                part["split_parts"] = int(pieces)
+                new_shots.append(part)
+            split_count += 1
+
+        if split_count <= 0:
+            return {"changed": False, "split_count": 0, "cap_seconds": cap, "max_seen_seconds": max_seen, "message": "already within cap"}
+
+        # Renumber LTX ids after splitting, so UI labels, output stems and review
+        # state stay unique and ordered.
+        for idx, shot in enumerate(new_shots, start=1):
+            if isinstance(shot, dict):
+                sid = f"LTX{idx:02d}"
+                shot["id"] = sid
+                if "shot_id" in shot:
+                    shot["shot_id"] = sid
+        plan[key] = new_shots
+        for count_key in ("ltx_shot_count", "shot_count", "director_shot_count"):
+            if count_key in plan:
+                plan[count_key] = int(len(new_shots))
+        notes = plan.get("warnings")
+        if not isinstance(notes, list):
+            notes = []
+        notes.append(f"{label}: split {split_count} over-10s LTX shot(s) for LTX-VRAMLab 241-frame limit.")
+        plan["warnings"] = notes
+        tmp = path + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(plan, f, indent=2, ensure_ascii=False)
+        os.replace(tmp, path)
+        return {"changed": True, "split_count": split_count, "cap_seconds": cap, "shot_count": len(new_shots), "message": f"split {split_count} over-cap shot(s)"}
+    except Exception as exc:
+        return {"changed": False, "split_count": 0, "cap_seconds": cap, "message": str(exc)}
+
+
+
+def _musicclip_ltx_audio_exts() -> set[str]:
+    return {".wav", ".mp3", ".flac", ".m4a", ".ogg", ".aac"}
+
+
+def _musicclip_ltx_find_audio_path(obj: Any) -> str:
+    """Best-effort source-song finder for LTX audio chunk regeneration."""
+    seen: set[int] = set()
+
+    def _check_path(value: Any) -> str:
+        try:
+            text = str(value or "").strip().strip('"').strip("'")
+        except Exception:
+            return ""
+        if not text:
+            return ""
+        try:
+            path = os.path.abspath(os.path.expanduser(text))
+        except Exception:
+            path = text
+        try:
+            if os.path.isfile(path) and Path(path).suffix.lower() in _musicclip_ltx_audio_exts():
+                return path
+        except Exception:
+            return ""
+        return ""
+
+    def _walk(value: Any, depth: int = 0) -> str:
+        if depth > 8:
+            return ""
+        try:
+            oid = id(value)
+            if oid in seen:
+                return ""
+            seen.add(oid)
+        except Exception:
+            pass
+        direct = _check_path(value)
+        if direct:
+            return direct
+        if isinstance(value, dict):
+            # Prefer explicit source/full-song keys over per-shot generated chunk keys.
+            priority = []
+            for k in value.keys():
+                lk = str(k).lower()
+                if any(tok in lk for tok in ("source_audio", "full_song", "music_file", "music_path", "song_path", "audio_path", "media_path")) and "chunk" not in lk:
+                    priority.append(k)
+            for k in priority:
+                found = _walk(value.get(k), depth + 1)
+                if found:
+                    return found
+            for k, v in value.items():
+                lk = str(k).lower()
+                if "chunk" in lk or "output" in lk:
+                    continue
+                found = _walk(v, depth + 1)
+                if found:
+                    return found
+        elif isinstance(value, (list, tuple)):
+            for item in value:
+                found = _walk(item, depth + 1)
+                if found:
+                    return found
+        return ""
+
+    return _walk(obj)
+
+
+def _musicclip_ltx_load_json_if_file(path: str) -> Any:
+    try:
+        p = str(path or "").strip()
+        if p and os.path.isfile(p) and Path(p).suffix.lower() == ".json":
+            with open(p, "r", encoding="utf-8") as f:
+                return json.load(f)
+    except Exception:
+        pass
+    return None
+
+
+def _musicclip_ltx_regenerate_audio_chunks_for_plan(plan_path: str, payload: dict, label: str = "LTX plan") -> dict:
+    """Regenerate audio_chunks/LTXxx.wav after the duration guard splits shots.
+
+    The private bridge can export WAV chunks before this UI-side hard guard runs.
+    When an overlong shot is split here, the old WAV files no longer match the new
+    LTX IDs/timings. This pass rewrites the chunks from the original song so LTX01,
+    LTX02, etc. stay aligned with the sanitized plan.
+    """
+    try:
+        if not bool((payload or {}).get("export_audio_chunks", True)):
+            return {"ok": True, "changed": False, "message": "audio chunk export disabled"}
+        path = str(plan_path or "").strip()
+        if not path or not os.path.isfile(path):
+            return {"ok": False, "changed": False, "message": "plan not found"}
+        with open(path, "r", encoding="utf-8") as f:
+            plan = json.load(f)
+        if not isinstance(plan, dict):
+            return {"ok": False, "changed": False, "message": "plan is not an object"}
+        shots, _key = _musicclip_ltx_shot_list_ref(plan)
+        if not isinstance(shots, list) or not shots:
+            return {"ok": True, "changed": False, "message": "no shots"}
+
+        search_blobs: list[Any] = [payload, plan]
+        for key in ("scene_plan_path", "prompt_plan_path", "ltx_shot_plan_path", "ltx_director_plan_path", "director_plan_path", "shot_plan_path", "plan_path"):
+            try:
+                val = (payload or {}).get(key) or plan.get(key)
+            except Exception:
+                val = ""
+            loaded = _musicclip_ltx_load_json_if_file(str(val or ""))
+            if loaded is not None:
+                search_blobs.append(loaded)
+        audio_path = ""
+        for blob in search_blobs:
+            audio_path = _musicclip_ltx_find_audio_path(blob)
+            if audio_path:
+                break
+        if not audio_path:
+            return {"ok": False, "changed": False, "message": "source audio not found"}
+
+        out_dir = ""
+        for key in ("audio_chunks_dir", "ltx_audio_chunks_dir", "audio_chunk_dir"):
+            try:
+                cand = str(plan.get(key) or (payload or {}).get(key) or "").strip()
+            except Exception:
+                cand = ""
+            if cand:
+                out_dir = cand
+                break
+        if not out_dir:
+            out_dir = os.path.join(os.path.dirname(path), "audio_chunks")
+        os.makedirs(out_dir, exist_ok=True)
+
+        ffmpeg = str((payload or {}).get("ffmpeg") or "").strip() or _find_ffmpeg_from_env()
+        # Remove stale LTX chunk names first; after splitting, every later number can shift.
+        try:
+            for old in Path(out_dir).glob("LTX*.wav"):
+                try:
+                    old.unlink()
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
+        exported = 0
+        changed_plan = False
+        for idx, shot in enumerate(shots, start=1):
+            if not isinstance(shot, dict):
+                continue
+            start, end, dur = _musicclip_ltx_read_timing(shot)
+            if dur <= 0.03:
+                continue
+            sid = str(shot.get("id") or shot.get("shot_id") or f"LTX{idx:02d}").strip() or f"LTX{idx:02d}"
+            safe_sid = re.sub(r"[^A-Za-z0-9_\-]+", "_", sid) or f"LTX{idx:02d}"
+            out_wav = os.path.join(out_dir, f"{safe_sid}.wav")
+            cmd = [
+                ffmpeg,
+                "-y",
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-ss",
+                f"{max(0.0, start):.6f}",
+                "-t",
+                f"{max(0.03, dur):.6f}",
+                "-i",
+                audio_path,
+                "-vn",
+                "-ac",
+                "2",
+                "-ar",
+                "44100",
+                "-c:a",
+                "pcm_s16le",
+                out_wav,
+            ]
+            proc = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+            if proc.returncode != 0 or not os.path.isfile(out_wav):
+                return {"ok": False, "changed": exported > 0, "message": f"ffmpeg failed while exporting {safe_sid}.wav: {(proc.stderr or proc.stdout or '').strip()}"}
+            shot["audio_chunk_path"] = out_wav
+            shot["ltx_audio_chunk_path"] = out_wav
+            changed_plan = True
+            exported += 1
+
+        if changed_plan:
+            plan["audio_chunks_dir"] = out_dir
+            tmp = path + ".tmp"
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump(plan, f, indent=2, ensure_ascii=False)
+            os.replace(tmp, path)
+        return {"ok": True, "changed": exported > 0, "exported": exported, "audio_chunks_dir": out_dir, "message": f"regenerated {exported} audio chunk(s)"}
+    except Exception as exc:
+        return {"ok": False, "changed": False, "message": str(exc)}
+
+def _musicclip_ltx_apply_sanitize_result(result: dict, payload: dict, path_keys: tuple[str, ...], label: str) -> dict:
+    if not isinstance(result, dict) or not bool(result.get("ok")):
+        return result
+    for key in path_keys:
+        path = str(result.get(key) or "").strip()
+        if not path:
+            continue
+        report = _musicclip_ltx_sanitize_plan_file(path, payload, label)
+        if report.get("changed"):
+            try:
+                result["ltx_shot_count"] = int(report.get("shot_count") or result.get("ltx_shot_count") or 0)
+            except Exception:
+                pass
+            warnings = result.get("warnings")
+            if not isinstance(warnings, list):
+                warnings = []
+            warnings.append(str(report.get("message") or "LTX plan duration guard applied."))
+            audio_report = _musicclip_ltx_regenerate_audio_chunks_for_plan(path, payload, label)
+            result["ltx_audio_chunk_guard_report"] = audio_report
+            if audio_report.get("changed"):
+                warnings.append(str(audio_report.get("message") or "LTX audio chunks regenerated after duration split."))
+            elif not audio_report.get("ok", True):
+                warnings.append("LTX plan was split, but audio chunks could not be regenerated: " + str(audio_report.get("message") or "unknown error"))
+            result["warnings"] = warnings
+            result["ltx_duration_guard_report"] = report
+        break
+    return result
+
 def _musicclip_patch_krea2_bridge(mod):
     if mod is None or bool(getattr(mod, "_framevision_krea2_ltx_patched", False)): return mod
     try:
+        original_create_shot = getattr(mod, "create_ltx_shot_plan", None)
+        if callable(original_create_shot):
+            def _create_shot(payload):
+                result = original_create_shot(payload)
+                return _musicclip_ltx_apply_sanitize_result(result, dict(payload or {}), ("ltx_shot_plan_path", "shot_plan_path", "plan_path"), "LTX shot plan")
+            setattr(mod, "create_ltx_shot_plan", _create_shot)
+        original_create_director = getattr(mod, "create_ltx_director_plan", None)
+        if callable(original_create_director):
+            def _create_director(payload):
+                result = original_create_director(payload)
+                return _musicclip_ltx_apply_sanitize_result(result, dict(payload or {}), ("ltx_director_plan_path", "director_plan_path", "plan_path"), "LTX director plan")
+            setattr(mod, "create_ltx_director_plan", _create_director)
         original_gen = getattr(mod, "generate_ltx_start_image_for_shot", None)
         if callable(original_gen):
             def _gen(payload):
@@ -10830,8 +11251,8 @@ class AutoMusicSyncWidget(QWidget):
             self.ltx_section_review_placeholder = None
 
             ltx_music_hint = QLabel(
-                "Load the music track for this LTX music-video job here. This uses the same audio path as the normal workflow, "
-                "but keeps the LTX workflow self-contained for new users.",
+                "Load the music track for this LTX music-video job here. This is not a fast workflow, "
+                "clicking 'generate ltx video' will first create a shotlist and prompts and split the music track in small chuncks, next it will create images,clips .",
                 self.ltx_section_music_track,
             )
             ltx_music_hint.setWordWrap(True)
@@ -16207,6 +16628,12 @@ class AutoMusicSyncWidget(QWidget):
             self._set_planner_bridge_status("Planner Bridge: Create an LTX director plan first, then refresh LTX shots.")
             return
         try:
+            try:
+                report = _musicclip_ltx_sanitize_plan_file(path, {"ltx_backend": self._current_ltx_generation_backend()}, "LTX director plan")
+                if isinstance(report, dict) and report.get("changed"):
+                    self._set_planner_bridge_status(f"Planner Bridge: Duration guard split {int(report.get('split_count') or 0)} over-10s LTX shot(s).")
+            except Exception:
+                pass
             with open(path, "r", encoding="utf-8") as f:
                 data = json.load(f)
             shots = [s for s in (data.get("shots") or []) if isinstance(s, dict)] if isinstance(data, dict) else []
@@ -16346,6 +16773,14 @@ class AutoMusicSyncWidget(QWidget):
             except Exception:
                 pass
             return
+
+        try:
+            report = _musicclip_ltx_sanitize_plan_file(plan_path, {"ltx_backend": self._current_ltx_generation_backend()}, "LTX director plan")
+            if isinstance(report, dict) and report.get("changed"):
+                self._set_planner_bridge_status(f"Planner Bridge: Duration guard split {int(report.get('split_count') or 0)} over-10s LTX shot(s) before start-image generation.")
+                self._refresh_ltx_single_shots()
+        except Exception:
+            pass
 
         combo = getattr(self, "combo_ltx_single_shot", None)
         if combo is None or combo.count() <= 0:
@@ -16640,6 +17075,14 @@ class AutoMusicSyncWidget(QWidget):
             except Exception:
                 pass
             return
+
+        try:
+            report = _musicclip_ltx_sanitize_plan_file(plan_path, {"ltx_backend": self._current_ltx_generation_backend()}, "LTX director plan")
+            if isinstance(report, dict) and report.get("changed"):
+                self._set_planner_bridge_status(f"Planner Bridge: Duration guard split {int(report.get('split_count') or 0)} over-10s LTX shot(s) before generation.")
+                self._refresh_ltx_single_shots()
+        except Exception:
+            pass
 
         image_combo = getattr(self, "combo_ltx_single_image_mode", None)
         image_mode = str(image_combo.currentData() if image_combo is not None else "flux_klein_9b")
@@ -17011,6 +17454,14 @@ class AutoMusicSyncWidget(QWidget):
                 pass
             return
 
+        try:
+            report = _musicclip_ltx_sanitize_plan_file(plan_path, {"ltx_backend": self._current_ltx_generation_backend()}, "LTX director plan")
+            if isinstance(report, dict) and report.get("changed"):
+                self._set_planner_bridge_status(f"Planner Bridge: Duration guard split {int(report.get('split_count') or 0)} over-10s LTX shot(s) before assembly.")
+                self._refresh_ltx_single_shots()
+        except Exception:
+            pass
+
         payload = {
             "root_dir": _musicclip_project_root(),
             "ltx_backend": self._current_ltx_generation_backend(),
@@ -17231,6 +17682,14 @@ class AutoMusicSyncWidget(QWidget):
             except Exception:
                 pass
             return
+
+        try:
+            report = _musicclip_ltx_sanitize_plan_file(plan_path, {"ltx_backend": self._current_ltx_generation_backend()}, "LTX director plan")
+            if isinstance(report, dict) and report.get("changed"):
+                self._set_planner_bridge_status(f"Planner Bridge: Duration guard split {int(report.get('split_count') or 0)} over-10s LTX shot(s) before testing.")
+                self._refresh_ltx_single_shots()
+        except Exception:
+            pass
 
         combo = getattr(self, "combo_ltx_single_shot", None)
         if combo is None or combo.count() <= 0:
