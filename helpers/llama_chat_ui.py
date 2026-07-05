@@ -291,7 +291,45 @@ def _assistant_jobs_path(fv_root: str) -> str:
 
 
 def _llama_image_output_dir(fv_root: str) -> str:
-    return os.path.join(fv_root, "output", "images")
+    return _resolve_llama_output_dir(fv_root, "", "output/images")
+
+
+def _llama_default_output_dir(fv_root: str, kind: str) -> str:
+    kind = str(kind or "").strip().lower()
+    if kind == "video":
+        rel = os.path.join("output", "video", "ltx23")
+    elif kind == "edit":
+        rel = os.path.join("output", "edits")
+    elif kind == "audio":
+        rel = os.path.join("output", "audio", "ace15")
+    else:
+        rel = os.path.join("output", "images")
+    return os.path.abspath(os.path.join(fv_root, rel))
+
+
+def _resolve_llama_output_dir(fv_root: str, value: str, default_rel: str) -> str:
+    raw = str(value or "").strip().strip('"')
+    if not raw:
+        raw = str(default_rel or "").strip()
+    if not raw:
+        raw = os.path.join("output", "images")
+    if not os.path.isabs(raw):
+        raw = os.path.join(fv_root, raw)
+    return os.path.abspath(os.path.normpath(raw))
+
+
+def _path_for_settings_display(fv_root: str, path: str) -> str:
+    raw = str(path or "").strip()
+    if not raw:
+        return ""
+    try:
+        abs_path = os.path.abspath(raw if os.path.isabs(raw) else os.path.join(fv_root, raw))
+        rel = os.path.relpath(abs_path, fv_root)
+        if rel and not rel.startswith("..") and not os.path.isabs(rel):
+            return rel.replace("/", os.sep)
+    except Exception:
+        pass
+    return raw
 
 
 def _templates_root(fv_root: str) -> str:
@@ -2449,13 +2487,21 @@ class ChatCompletionThread(QtCore.QThread):
     failed = QtCore.Signal(str)
     speedUpdated = QtCore.Signal(str)
 
-    def __init__(self, base_url: str, messages: List[Dict], max_tokens: int, temperature: float, top_p: float, timeout_s: int = 600, parent=None):
+    def __init__(self, base_url: str, messages: List[Dict], max_tokens: int, temperature: float, top_p: float, top_k: int = 40, repeat_penalty: float = 1.05, timeout_s: int = 600, parent=None):
         super().__init__(parent)
         self.base_url = base_url.rstrip("/")
         self.messages = messages
         self.max_tokens = max_tokens
         self.temperature = temperature
         self.top_p = top_p
+        try:
+            self.top_k = max(0, int(top_k))
+        except Exception:
+            self.top_k = 40
+        try:
+            self.repeat_penalty = max(0.0, float(repeat_penalty))
+        except Exception:
+            self.repeat_penalty = 1.05
         try:
             self.timeout_s = max(30, min(int(timeout_s), 1800))
         except Exception:
@@ -2494,6 +2540,8 @@ class ChatCompletionThread(QtCore.QThread):
             "max_tokens": int(self.max_tokens),
             "temperature": float(self.temperature),
             "top_p": float(self.top_p),
+            "top_k": int(self.top_k),
+            "repeat_penalty": float(self.repeat_penalty),
             "reasoning_format": "none",
         }
         code, data = _http_post_json(f"{self.base_url}/v1/chat/completions", payload, timeout=float(self.timeout_s))
@@ -2816,6 +2864,17 @@ class SettingsDialog(QtWidgets.QDialog):
         self.sp_top_p.setSingleStep(0.05)
         self.sp_top_p.setValue(0.9)
 
+        self.sp_top_k = QtWidgets.QSpinBox()
+        self.sp_top_k.setRange(0, 1000)
+        self.sp_top_k.setSingleStep(1)
+        self.sp_top_k.setValue(40)
+
+        self.sp_repeat_penalty = QtWidgets.QDoubleSpinBox()
+        self.sp_repeat_penalty.setRange(0.0, 2.0)
+        self.sp_repeat_penalty.setSingleStep(0.01)
+        self.sp_repeat_penalty.setDecimals(2)
+        self.sp_repeat_penalty.setValue(1.05)
+
         self.chk_mtp_auto = QtWidgets.QCheckBox("Use MTP when available")
         self.chk_mtp_auto.setChecked(True)
         self.sp_mtp_draft_tokens = QtWidgets.QSpinBox()
@@ -2841,6 +2900,18 @@ class SettingsDialog(QtWidgets.QDialog):
         self.chk_results_chat_only = QtWidgets.QCheckBox("Show generated results only in chat")
         self.chk_results_chat_only.setChecked(True)
         self.chk_results_chat_only.setToolTip("For jobs started from this chat, prevent the Queue tab's Play last result toggle from opening the result in the main FrameVision player. The result still appears in this chat.")
+        self.ed_output_images = QtWidgets.QLineEdit()
+        self.ed_output_videos = QtWidgets.QLineEdit()
+        self.ed_output_edits = QtWidgets.QLineEdit()
+        self.btn_browse_output_images = QtWidgets.QPushButton("Browse…")
+        self.btn_browse_output_videos = QtWidgets.QPushButton("Browse…")
+        self.btn_browse_output_edits = QtWidgets.QPushButton("Browse…")
+        for _btn in (self.btn_browse_output_images, self.btn_browse_output_videos, self.btn_browse_output_edits):
+            _btn.setSizePolicy(QtWidgets.QSizePolicy.Fixed, QtWidgets.QSizePolicy.Fixed)
+            _btn.setMinimumWidth(96)
+        for _wide in (self.ed_output_images, self.ed_output_videos, self.ed_output_edits):
+            _wide.setSizePolicy(QtWidgets.QSizePolicy.Expanding, QtWidgets.QSizePolicy.Fixed)
+            _wide.setMinimumWidth(260)
 
         default_runner = _default_llama_server_path(self.fv_root).replace("/", "\\")
         runner_tip = (
@@ -2873,6 +2944,20 @@ class SettingsDialog(QtWidgets.QDialog):
             "Storymode ideas: 0.60-0.80"
         )
         top_p_tip = "Sampling range. Good default: 0.90. Use 1.00 for more open creative writing; lower values are stricter."
+        top_k_tip = (
+            "Limits how many likely next tokens the model may choose from.\n"
+            "Good normal default: 40.\n"
+            "Coding / stricter answers: 20-40.\n"
+            "Creative writing: 40-100.\n"
+            "0 disables top-k for llama.cpp-compatible servers that support that behavior."
+        )
+        repeat_penalty_tip = (
+            "Reduces repeated words and looping.\n"
+            "Good normal default: 1.05.\n"
+            "Use 1.00 for no penalty.\n"
+            "Use 1.08-1.10 only when a model repeats itself.\n"
+            "Too high can make answers sound strange."
+        )
         mtp_tip = (
             "Use llama.cpp draft-mtp speculative decoding only when it is safe. "
             "FrameVision only adds the flag when the runner supports --spec-type draft-mtp and the selected GGUF name looks MTP-enabled. "
@@ -2880,6 +2965,9 @@ class SettingsDialog(QtWidgets.QDialog):
         )
         mtp_draft_tip = "Number of draft tokens for MTP speculation. 3 is a safe starting point; higher is not always faster."
         system_tip = "Optional instruction that stays active for the chat. Keep it short for coding; use Planner rules here for story/shotlist work."
+        output_images_tip = "Folder for images created from chat. Default: output\\images"
+        output_videos_tip = "Folder for LTX videos created from chat. Default: output\\video\\ltx23"
+        output_edits_tip = "Folder for edited images created from chat. Default: output\\edits"
 
         self.ed_runner.setToolTip(runner_tip)
         self.btn_browse_runner.setToolTip(runner_tip)
@@ -2893,9 +2981,17 @@ class SettingsDialog(QtWidgets.QDialog):
         self.sp_generation_timeout.setToolTip(timeout_tip)
         self.sp_temp.setToolTip(temp_tip)
         self.sp_top_p.setToolTip(top_p_tip)
+        self.sp_top_k.setToolTip(top_k_tip)
+        self.sp_repeat_penalty.setToolTip(repeat_penalty_tip)
         self.chk_mtp_auto.setToolTip(mtp_tip)
         self.sp_mtp_draft_tokens.setToolTip(mtp_draft_tip)
         self.ed_system.setToolTip(system_tip)
+        self.ed_output_images.setToolTip(output_images_tip)
+        self.ed_output_videos.setToolTip(output_videos_tip)
+        self.ed_output_edits.setToolTip(output_edits_tip)
+        self.btn_browse_output_images.setToolTip(output_images_tip)
+        self.btn_browse_output_videos.setToolTip(output_videos_tip)
+        self.btn_browse_output_edits.setToolTip(output_edits_tip)
 
         r = 0
         lbl_runner = QtWidgets.QLabel("Runner")
@@ -2955,6 +3051,18 @@ class SettingsDialog(QtWidgets.QDialog):
         form.addWidget(self.sp_top_p, r, 1, 1, 2)
         r += 1
 
+        lbl_top_k = QtWidgets.QLabel("Top-k")
+        lbl_top_k.setToolTip(top_k_tip)
+        form.addWidget(lbl_top_k, r, 0)
+        form.addWidget(self.sp_top_k, r, 1, 1, 2)
+        r += 1
+
+        lbl_repeat_penalty = QtWidgets.QLabel("Repeat penalty")
+        lbl_repeat_penalty.setToolTip(repeat_penalty_tip)
+        form.addWidget(lbl_repeat_penalty, r, 0)
+        form.addWidget(self.sp_repeat_penalty, r, 1, 1, 2)
+        r += 1
+
         lbl_mtp = QtWidgets.QLabel("MTP speculation")
         lbl_mtp.setToolTip(mtp_tip)
         form.addWidget(lbl_mtp, r, 0)
@@ -2996,6 +3104,20 @@ class SettingsDialog(QtWidgets.QDialog):
         result_lay = QtWidgets.QVBoxLayout(result_box)
         result_lay.setContentsMargins(10, 8, 10, 8)
         result_lay.addWidget(self.chk_results_chat_only)
+        output_grid = QtWidgets.QGridLayout()
+        output_grid.setHorizontalSpacing(8)
+        output_grid.setVerticalSpacing(8)
+        output_grid.addWidget(QtWidgets.QLabel("Images folder"), 0, 0)
+        output_grid.addWidget(self.btn_browse_output_images, 0, 1)
+        output_grid.addWidget(self.ed_output_images, 0, 2)
+        output_grid.addWidget(QtWidgets.QLabel("Videos folder"), 1, 0)
+        output_grid.addWidget(self.btn_browse_output_videos, 1, 1)
+        output_grid.addWidget(self.ed_output_videos, 1, 2)
+        output_grid.addWidget(QtWidgets.QLabel("Edits folder"), 2, 0)
+        output_grid.addWidget(self.btn_browse_output_edits, 2, 1)
+        output_grid.addWidget(self.ed_output_edits, 2, 2)
+        output_grid.setColumnStretch(2, 1)
+        result_lay.addLayout(output_grid)
         lay.addWidget(result_box)
 
         self.chk_memory_enabled = QtWidgets.QCheckBox("Use Knowledge & Memory")
@@ -3032,6 +3154,9 @@ class SettingsDialog(QtWidgets.QDialog):
 
         self.btn_browse_runner.clicked.connect(self._browse_runner)
         self.btn_browse_model_root.clicked.connect(self._browse_model_root)
+        self.btn_browse_output_images.clicked.connect(lambda: self._browse_output_folder(self.ed_output_images, "Select images output folder", os.path.join("output", "images")))
+        self.btn_browse_output_videos.clicked.connect(lambda: self._browse_output_folder(self.ed_output_videos, "Select videos output folder", os.path.join("output", "video", "ltx23")))
+        self.btn_browse_output_edits.clicked.connect(lambda: self._browse_output_folder(self.ed_output_edits, "Select edits output folder", os.path.join("output", "edits")))
         self.btn_refresh_models.clicked.connect(self.refresh_models)
         self.ed_model_root.editingFinished.connect(self._on_model_root_edited)
         self.chk_bubble_auto.toggled.connect(self._update_bubble_color_mode)
@@ -3053,8 +3178,13 @@ class SettingsDialog(QtWidgets.QDialog):
             self.sp_generation_timeout,
             self.sp_temp,
             self.sp_top_p,
+            self.sp_top_k,
+            self.sp_repeat_penalty,
             self.chk_mtp_auto,
             self.sp_mtp_draft_tokens,
+            self.ed_output_images,
+            self.ed_output_videos,
+            self.ed_output_edits,
         ]:
             if isinstance(w, QtWidgets.QLineEdit):
                 w.textChanged.connect(self.settingsChanged)
@@ -3191,6 +3321,19 @@ class SettingsDialog(QtWidgets.QDialog):
         buttons.rejected.connect(dlg.reject)
         root.addWidget(buttons)
         dlg.exec()
+
+    def _browse_output_folder(self, edit: QtWidgets.QLineEdit, title: str, default_rel: str):
+        start = str(edit.text() or "").strip()
+        if start and not os.path.isabs(start):
+            start = os.path.join(self.fv_root, start)
+        start_dir = start if start and os.path.isdir(start) else os.path.join(self.fv_root, default_rel)
+        if not os.path.isdir(start_dir):
+            start_dir = self.fv_root
+        path = QtWidgets.QFileDialog.getExistingDirectory(self, title, start_dir)
+        if not path:
+            return
+        edit.setText(_path_for_settings_display(self.fv_root, path))
+        self.settingsChanged.emit()
 
     def _browse_runner(self):
         start = self.ed_runner.text().strip()
@@ -4606,6 +4749,14 @@ class LlamaChatWindow(QtWidgets.QMainWindow):
         except Exception:
             pass
         try:
+            self.settings_dialog.sp_top_k.setValue(int(data.get("top_k", 40)))
+        except Exception:
+            pass
+        try:
+            self.settings_dialog.sp_repeat_penalty.setValue(float(data.get("repeat_penalty", 1.05)))
+        except Exception:
+            pass
+        try:
             self.settings_dialog.chk_mtp_auto.setChecked(bool(data.get("mtp_auto_enabled", True)))
         except Exception:
             pass
@@ -4636,6 +4787,19 @@ class LlamaChatWindow(QtWidgets.QMainWindow):
         )
         try:
             self.settings_dialog.chk_results_chat_only.setChecked(bool(data.get("assistant_results_chat_only", True)))
+        except Exception:
+            pass
+        try:
+            self.settings_dialog.ed_output_images.setText(_path_for_settings_display(self.fv_root, str(data.get("assistant_images_output_dir") or os.path.join("output", "images"))))
+            self.settings_dialog.ed_output_videos.setText(_path_for_settings_display(self.fv_root, str(data.get("assistant_videos_output_dir") or os.path.join("output", "video", "ltx23"))))
+            self.settings_dialog.ed_output_edits.setText(_path_for_settings_display(self.fv_root, str(data.get("assistant_edits_output_dir") or os.path.join("output", "edits"))))
+        except Exception:
+            self.settings_dialog.ed_output_images.setText(os.path.join("output", "images"))
+            self.settings_dialog.ed_output_videos.setText(os.path.join("output", "video", "ltx23"))
+            self.settings_dialog.ed_output_edits.setText(os.path.join("output", "edits"))
+        try:
+            self._ensure_assistant_output_dirs()
+            self._sync_assistant_router_output_dirs("text_to_image")
         except Exception:
             pass
         try:
@@ -4679,6 +4843,8 @@ class LlamaChatWindow(QtWidgets.QMainWindow):
             "generation_timeout_seconds": int(self.settings_dialog.sp_generation_timeout.value()),
             "temp": float(self.settings_dialog.sp_temp.value()),
             "top_p": float(self.settings_dialog.sp_top_p.value()),
+            "top_k": int(getattr(self.settings_dialog, "sp_top_k", None).value()) if getattr(self.settings_dialog, "sp_top_k", None) is not None else 40,
+            "repeat_penalty": float(getattr(self.settings_dialog, "sp_repeat_penalty", None).value()) if getattr(self.settings_dialog, "sp_repeat_penalty", None) is not None else 1.05,
             "mtp_auto_enabled": bool(getattr(self.settings_dialog, "chk_mtp_auto", None).isChecked()) if getattr(self.settings_dialog, "chk_mtp_auto", None) is not None else True,
             "mtp_draft_tokens": int(getattr(self.settings_dialog, "sp_mtp_draft_tokens", None).value()) if getattr(self.settings_dialog, "sp_mtp_draft_tokens", None) is not None else 3,
             # Kept for compatibility with older settings files, but intentionally
@@ -4691,6 +4857,9 @@ class LlamaChatWindow(QtWidgets.QMainWindow):
             "bubble_color_assistant": bubble_assistant,
             "bubble_color_user": bubble_user,
             "assistant_results_chat_only": bool(getattr(self.settings_dialog, "chk_results_chat_only", None).isChecked()) if getattr(self.settings_dialog, "chk_results_chat_only", None) is not None else True,
+            "assistant_images_output_dir": _path_for_settings_display(self.fv_root, getattr(self.settings_dialog, "ed_output_images", None).text().strip() if getattr(self.settings_dialog, "ed_output_images", None) is not None else os.path.join("output", "images")),
+            "assistant_videos_output_dir": _path_for_settings_display(self.fv_root, getattr(self.settings_dialog, "ed_output_videos", None).text().strip() if getattr(self.settings_dialog, "ed_output_videos", None) is not None else os.path.join("output", "video", "ltx23")),
+            "assistant_edits_output_dir": _path_for_settings_display(self.fv_root, getattr(self.settings_dialog, "ed_output_edits", None).text().strip() if getattr(self.settings_dialog, "ed_output_edits", None) is not None else os.path.join("output", "edits")),
             "memory_enabled": bool(getattr(self.settings_dialog, "chk_memory_enabled", None).isChecked()) if getattr(self.settings_dialog, "chk_memory_enabled", None) is not None else True,
             "memory_show_sources": bool(getattr(self.settings_dialog, "chk_memory_sources", None).isChecked()) if getattr(self.settings_dialog, "chk_memory_sources", None) is not None else True,
             "answer_with_voice": bool(getattr(self, "chk_answer_voice", None).isChecked()) if getattr(self, "chk_answer_voice", None) is not None else bool(getattr(self, "voice_answer_enabled", False)),
@@ -4699,11 +4868,118 @@ class LlamaChatWindow(QtWidgets.QMainWindow):
             "save_selection_folder": str(old_settings.get("save_selection_folder", "") or ""),
         }
         _save_json_atomic(self.settings_path, settings)
+        try:
+            self._ensure_assistant_output_dirs()
+            self._sync_assistant_router_output_dirs("text_to_image")
+        except Exception:
+            pass
         for s in self.sessions:
             _save_json_atomic(os.path.join(self.chat_dir, f"{s.id}.json"), asdict(s))
 
     def _queue_save(self):
         self._save_timer.start(250)
+
+    def _assistant_output_dir(self, kind: str) -> str:
+        kind = str(kind or "image").strip().lower()
+        data = _load_json(self.settings_path, {})
+        if not isinstance(data, dict):
+            data = {}
+        if kind == "video":
+            val = data.get("assistant_videos_output_dir") or os.path.join("output", "video", "ltx23")
+            default_rel = os.path.join("output", "video", "ltx23")
+        elif kind == "edit":
+            val = data.get("assistant_edits_output_dir") or os.path.join("output", "edits")
+            default_rel = os.path.join("output", "edits")
+        elif kind == "audio":
+            return _llama_default_output_dir(self.fv_root, "audio")
+        else:
+            val = data.get("assistant_images_output_dir") or os.path.join("output", "images")
+            default_rel = os.path.join("output", "images")
+        return _resolve_llama_output_dir(self.fv_root, str(val or ""), default_rel)
+
+    def _ensure_assistant_output_dirs(self) -> None:
+        for kind in ("image", "video", "edit", "audio"):
+            try:
+                os.makedirs(self._assistant_output_dir(kind), exist_ok=True)
+            except Exception:
+                pass
+
+    def _assistant_router_intent_hint(self, text: str = "") -> str:
+        try:
+            router = getattr(self, "_fv_assistant_router", None)
+            if router is not None:
+                state = router._load_state()
+                if isinstance(state, dict):
+                    pending = str(state.get("pending_intent") or "").strip()
+                    if pending in {"text_to_image", "image_edit", "ltx_video"}:
+                        return pending
+        except Exception:
+            pass
+        low = self._normalize_prompt_for_match(str(text or ""))
+        if any(p in low for p in ("edit image", "edit an image", "edit this image", "change this image", "fix this image")):
+            return "image_edit"
+        if any(p in low for p in ("create video", "create a video", "make video", "animate this image", "continue this video")):
+            return "ltx_video"
+        return "text_to_image"
+
+    def _registry_rel_output_dir(self, kind: str) -> str:
+        abs_path = self._assistant_output_dir(kind)
+        return _path_for_settings_display(self.fv_root, abs_path) or abs_path
+
+    def _sync_assistant_router_output_dirs(self, intent: str = "text_to_image") -> None:
+        """Keep the external FrameVision assistant router pointed at the chat folders."""
+        reg_path = os.path.join(self.fv_root, "scripts", "fv_assistant_image_models.json")
+        if not os.path.isfile(reg_path):
+            return
+        data = _load_json(reg_path, None)
+        if not isinstance(data, dict):
+            return
+        intent = str(intent or "text_to_image")
+        image_rel = self._registry_rel_output_dir("edit" if intent == "image_edit" else "image")
+        edit_rel = self._registry_rel_output_dir("edit")
+        video_rel = self._registry_rel_output_dir("video")
+        audio_rel = os.path.join("output", "audio", "ace15")
+        changed = False
+
+        def set_out(obj: Any, rel: str) -> None:
+            nonlocal changed
+            if isinstance(obj, dict) and "output_dir" in obj and str(obj.get("output_dir") or "") != rel:
+                obj["output_dir"] = rel
+                changed = True
+
+        tools = data.get("tools") if isinstance(data.get("tools"), dict) else {}
+        for key, obj in list(tools.items()):
+            if not isinstance(obj, dict):
+                continue
+            lk = str(key).lower()
+            label = str(obj.get("label") or "").lower()
+            if "ace" in lk or "ace" in label:
+                set_out(obj, audio_rel)
+            elif "ltx" in lk or "ltx" in label:
+                set_out(obj, video_rel)
+
+        for section_name, section in list(data.items()):
+            if not isinstance(section, dict):
+                continue
+            low_section = str(section_name).lower()
+            if low_section == "tools":
+                continue
+            for key, obj in list(section.items()):
+                if not isinstance(obj, dict):
+                    continue
+                low = (str(key) + " " + str(obj.get("id") or "") + " " + str(obj.get("label") or "") + " " + str(obj.get("type") or "") + " " + str(obj.get("mode") or "")).lower()
+                if "ltx" in low or "video" in low_section:
+                    set_out(obj, video_rel)
+                elif "edit" in low_section or "edit" in low:
+                    set_out(obj, edit_rel)
+                elif "model" in low_section or "image" in low_section or "txt2img" in low_section:
+                    set_out(obj, image_rel)
+
+        if changed:
+            try:
+                _save_json_atomic(reg_path, data)
+            except Exception:
+                pass
 
     def _load_assistant_jobs(self):
         data = _load_json(self.assistant_jobs_path, [])
@@ -4817,7 +5093,16 @@ class LlamaChatWindow(QtWidgets.QMainWindow):
         after this assistant request was queued.
         """
         model_id = str(track.get("model_id") or "").strip().lower()
+        mode = str(track.get("mode") or "").strip().lower()
         dirs = []
+        if mode == "edit":
+            dirs.append(self._assistant_output_dir("edit"))
+        elif model_id == "ace_step_15":
+            dirs.append(self._assistant_output_dir("audio"))
+        elif model_id == "ltx23":
+            dirs.append(self._assistant_output_dir("video"))
+        else:
+            dirs.append(self._assistant_output_dir("image"))
         # Prefer known output folders first. Include older/common variants because
         # some helpers/queue adapters ignore the registry output_dir and write to
         # their own historical output folder.
@@ -7145,6 +7430,8 @@ class LlamaChatWindow(QtWidgets.QMainWindow):
             self.settings_dialog.sp_max_tokens.value(),
             self.settings_dialog.sp_temp.value(),
             self.settings_dialog.sp_top_p.value(),
+            self.settings_dialog.sp_top_k.value(),
+            self.settings_dialog.sp_repeat_penalty.value(),
             self.settings_dialog.sp_generation_timeout.value(),
             self,
         )
@@ -7156,7 +7443,7 @@ class LlamaChatWindow(QtWidgets.QMainWindow):
 
     def _save_generated_images(self, images: List[Dict], prompt_text: str) -> List[Dict]:
         saved: List[Dict] = []
-        out_dir = _llama_image_output_dir(self.fv_root)
+        out_dir = self._assistant_output_dir("image")
         os.makedirs(out_dir, exist_ok=True)
         prompt_stub = _filename_words_from_prompt(prompt_text)
         stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -7260,7 +7547,8 @@ class LlamaChatWindow(QtWidgets.QMainWindow):
         return self._root_join(str(self._ace15_config().get("preset_manager") or "presets/setsave/ace15presets/presetmanager.json"))
 
     def _ace15_output_dir(self) -> Path:
-        return self._root_join(str(self._ace15_config().get("output_dir") or "output/audio/ace15"))
+        # Music generated from chat is intentionally fixed to the clean default folder.
+        return Path(_llama_default_output_dir(self.fv_root, "audio"))
 
     def _ace15_load_presets(self) -> Dict[str, Any]:
         path = self._ace15_preset_manager_path()
@@ -8655,6 +8943,8 @@ class LlamaChatWindow(QtWidgets.QMainWindow):
         # "I cannot create images" response. Normal chat still goes to the LLM.
         if (text or attachments) and getattr(self, "_fv_assistant_router", None) is not None and self._is_framevision_wizard_start_command(text):
             try:
+                self._ensure_assistant_output_dirs()
+                self._sync_assistant_router_output_dirs(self._assistant_router_intent_hint(text))
                 route = self._fv_assistant_router.handle_user_text(text, attachments=attachments)
             except Exception as e:
                 route = None
@@ -9037,6 +9327,8 @@ class LlamaChatWindow(QtWidgets.QMainWindow):
         route = None
         if getattr(self, "_fv_assistant_router", None) is not None:
             try:
+                self._ensure_assistant_output_dirs()
+                self._sync_assistant_router_output_dirs("ltx_video")
                 route = self._fv_assistant_router.handle_user_text("continue this video", attachments=[att])
             except Exception as e:
                 try:
@@ -9097,6 +9389,8 @@ class LlamaChatWindow(QtWidgets.QMainWindow):
         route = None
         if getattr(self, "_fv_assistant_router", None) is not None:
             try:
+                self._ensure_assistant_output_dirs()
+                self._sync_assistant_router_output_dirs("ltx_video")
                 route = self._fv_assistant_router.handle_user_text("animate this image", attachments=[att])
             except Exception as e:
                 try:
@@ -9129,6 +9423,8 @@ class LlamaChatWindow(QtWidgets.QMainWindow):
         route = None
         if getattr(self, "_fv_assistant_router", None) is not None:
             try:
+                self._ensure_assistant_output_dirs()
+                self._sync_assistant_router_output_dirs("image_edit")
                 route = self._fv_assistant_router.handle_user_text("edit this image", attachments=[att])
             except Exception as e:
                 try:
