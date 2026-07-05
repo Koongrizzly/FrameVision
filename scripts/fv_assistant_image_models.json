@@ -21,7 +21,7 @@
       "folder": "models/Z-Image-Turbo GGUF",
       "queue_type": "txt2img",
       "engine": "zimage_gguf",
-      "output_dir": "output/photo/txt2img",
+      "output_dir": "output\\images",
       "default_steps": 8,
       "default_cfg": 0.0,
       "default_sampler": "euler",
@@ -36,7 +36,7 @@
       ],
       "folder": "models/lens",
       "queue_type": "lens_turbo_u4",
-      "output_dir": "output/lens_turbo_u4",
+      "output_dir": "output\\images",
       "repo_id": "WaveCut/Lens-Turbo-SDNQ-uint4-static",
       "default_steps": 4,
       "default_cfg": 0.0
@@ -50,7 +50,7 @@
       ],
       "folder": "models/chroma/SPARK.Chroma_v1",
       "queue_type": "chroma",
-      "output_dir": "output/images/chroma",
+      "output_dir": "output\\images",
       "default_steps": 30,
       "default_cfg": 3.0
     },
@@ -66,7 +66,7 @@
       ],
       "folder": "models/krea2",
       "queue_type": "krea2_generate",
-      "output_dir": "output/images/krea2",
+      "output_dir": "output\\images",
       "default_steps": 8,
       "default_cfg": 1.0,
       "default_guidance": 3.5,
@@ -87,7 +87,7 @@
       ],
       "folder": "models/klein4b_gguf",
       "queue_type": "flux_klein",
-      "output_dir": "output/edits/flux_klein",
+      "output_dir": "output\\images",
       "default_steps": 4,
       "default_cfg": 1.0,
       "edit_settings": {
@@ -110,7 +110,7 @@
       ],
       "folder": "models/hidream_bf16",
       "queue_type": "hidream",
-      "output_dir": "output/hidream",
+      "output_dir": "output\\images",
       "default_steps": 28,
       "default_cfg": 0.0,
       "edit_settings": {
@@ -217,7 +217,7 @@
       "env_win": "environments/.ace_15/Scripts/python.exe",
       "env_posix": "environments/.ace_15/bin/python",
       "preset_manager": "presets/setsave/ace15presets/presetmanager.json",
-      "output_dir": "output/audio/ace15",
+      "output_dir": "output\\audio\\ace15",
       "defaults": {
         "task_type": "text2music",
         "audio_format": "mp3",
@@ -264,7 +264,7 @@
       "cli": "helpers/ltx23_vram_lab_cli.py",
       "env_win": "environments/.ltx23/python.exe",
       "env_posix": "environments/.ltx23/bin/python",
-      "output_dir": "output/video/ltx23/chat",
+      "output_dir": "output\\video\\ltx23",
       "defaults": {
         "pipeline": "two_stages",
         "vram_lab": "safe",
