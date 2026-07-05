@@ -13366,6 +13366,14 @@ class AutoMusicSyncWidget(QWidget):
             self.timeline_panel.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
         except Exception:
             pass
+        # The Timeline page is not inserted at startup. Keep the widget explicitly
+        # hidden too: after removeTab(), Qt can leave custom child widgets (notably
+        # video/preview surfaces inside the timeline panel) painted above the next
+        # tab if the page itself is still visible/parented to the tab stack.
+        try:
+            self.timeline_panel.setVisible(False)
+        except Exception:
+            pass
         # Keep the normal-workflow Timeline tab hidden until the user analyzes
         # a music track in this session. This avoids showing an empty/stale
         # normal-workflow timeline to users who only use the LTX workflow.
@@ -22404,6 +22412,10 @@ class AutoMusicSyncWidget(QWidget):
         The timeline is session-only UI: hidden at startup, revealed after a
         successful normal music analysis, and hidden again when a different
         audio path is loaded.
+        
+        Important: do not only remove the tab. Some TimelinePanel children can
+        keep painting if the removed page remains visible/parented to the tab
+        widget, which creates the black overlay box seen above the LTX tab.
         """
         try:
             panel = getattr(self, "timeline_panel", None)
@@ -22415,7 +22427,16 @@ class AutoMusicSyncWidget(QWidget):
             if visible:
                 if index == -1:
                     insert_at = 1 if tabs.count() >= 1 else tabs.count()
+                    try:
+                        panel.setParent(tabs)
+                    except Exception:
+                        pass
                     tabs.insertTab(insert_at, panel, getattr(self, "_timeline_tab_title", "Timeline"))
+                try:
+                    panel.setVisible(True)
+                    panel.raise_()
+                except Exception:
+                    pass
                 self._timeline_tab_visible = True
                 try:
                     if hasattr(self, "btn_check_timeline"):
@@ -22431,6 +22452,23 @@ class AutoMusicSyncWidget(QWidget):
                 except Exception:
                     pass
                 tabs.removeTab(index)
+
+            # Explicitly hide and detach the page after removeTab(). This prevents
+            # orphaned timeline preview/widgets from drawing over the active tab.
+            try:
+                panel.setVisible(False)
+                panel.hide()
+            except Exception:
+                pass
+            try:
+                panel.setParent(None)
+            except Exception:
+                pass
+            try:
+                QTimer.singleShot(0, panel.hide)
+            except Exception:
+                pass
+
             self._timeline_tab_visible = False
             try:
                 if hasattr(self, "btn_check_timeline"):
