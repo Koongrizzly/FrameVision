@@ -142,18 +142,17 @@ FRAMEVISION_RESOLUTIONS = [
 # Small landscape buckets such as 1024x576 produced grey/pink/blank outputs in testing.
 # These buckets are intentionally moderate defaults, not the highest native sizes.
 REFERENCE_SAFE_RESOLUTIONS = [
-    (1600, 896),   # landscape balanced/default
-    (1920, 1088),  # landscape high
-    (896, 1600),   # portrait balanced/default
-    (1088, 1920),  # portrait high
-    (1024, 1024),  # square balanced
-    (1536, 1536),  # square high-ish
-    (2048, 2048),  # square native/high
+    # Exact 896p reference buckets. Keep 1600x896 available so the
+    # Music Clip Creator LTX reference workflow does not get promoted
+    # back to the 1920x1088 high bucket.
+    (1600, 896),
+    (1920, 1088),
+    (896, 1600),
+    (1088, 1920),
 ]
 
 REFERENCE_SAFE_LANDSCAPE_MIN = (1600, 896)
 REFERENCE_SAFE_PORTRAIT_MIN = (896, 1600)
-REFERENCE_SAFE_SQUARE_MIN = (1024, 1024)
 
 
 def _is_reference_workflow(args: argparse.Namespace) -> bool:
@@ -172,18 +171,23 @@ def _reference_safe_resolution(width: int, height: int, ref_count: int = 1) -> t
     if width <= 0 or height <= 0:
         return REFERENCE_SAFE_LANDSCAPE_MIN
 
-    # Preserve orientation. Square-ish requests use square buckets.
+    requested_pair = (width, height)
+    if requested_pair in REFERENCE_SAFE_RESOLUTIONS:
+        return requested_pair
+
+    # Preserve orientation for landscape/portrait. Square reference buckets were
+    # unreliable in testing, so square-ish reference requests fall back to the
+    # stable landscape reference bucket instead of offering 1024x1024.
     ratio = width / max(1, height)
     if 0.90 <= ratio <= 1.10:
-        candidates = [p for p in REFERENCE_SAFE_RESOLUTIONS if p[0] == p[1]]
-        minimum = REFERENCE_SAFE_SQUARE_MIN
+        candidates = [p for p in REFERENCE_SAFE_RESOLUTIONS if p[0] > p[1]]
+        minimum = REFERENCE_SAFE_LANDSCAPE_MIN
     elif ratio > 1.10:
         candidates = [p for p in REFERENCE_SAFE_RESOLUTIONS if p[0] > p[1]]
-        # For 3+ refs the repo halves ref max size, so avoid borderline small buckets.
-        minimum = (1920, 1088) if ref_count >= 3 else REFERENCE_SAFE_LANDSCAPE_MIN
+        minimum = REFERENCE_SAFE_LANDSCAPE_MIN
     else:
         candidates = [p for p in REFERENCE_SAFE_RESOLUTIONS if p[0] < p[1]]
-        minimum = (1088, 1920) if ref_count >= 3 else REFERENCE_SAFE_PORTRAIT_MIN
+        minimum = REFERENCE_SAFE_PORTRAIT_MIN
 
     min_area = minimum[0] * minimum[1]
     candidates = [p for p in candidates if p[0] * p[1] >= min_area] or [minimum]
@@ -264,7 +268,7 @@ def patch_resolution_picker(mode: str) -> None:
     pipeline_mod.find_closest_resolution = _closest_resolution
 
     print("[HiDream CLI] Resolution mode: FrameVision preset buckets")
-    print("[HiDream CLI] FrameVision preset buckets enabled: 640x480, 1024x768, 832x480, 1024x576, 1280x704, 1600x896, 1920x1088, 2560x1440, plus portrait/square variants")
+    print("[HiDream CLI] FrameVision preset buckets enabled for text-to-image. Reference-safe buckets are limited to proven 1600x896 / 1920x1088 landscape and matching portrait sizes.")
 
 
 def read_chat_template_from_folder(folder: Path) -> str | None:

@@ -9542,7 +9542,7 @@ def generate_ltx_start_image_for_shot(payload: dict) -> dict:
         requested_resolution_source = payload.get("resolution") or shot.get("resolution") or director_plan.get("resolution")
         _req_w, _req_h, _req_res = _parse_resolution_value(requested_resolution_source, "1280x704")
         requested_portrait = bool(_req_h > _req_w)
-        hidream_reference_edit_resolution = "768x1376" if requested_portrait else "1376x768"
+        hidream_reference_edit_resolution = "896x1600" if requested_portrait else "1600x896"
         default_resolution = "1280x704"
         resolution_source = requested_resolution_source
         if image_model == "z_image":

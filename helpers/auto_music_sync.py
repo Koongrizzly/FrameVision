@@ -699,6 +699,138 @@ def _musicclip_ltx_write_timing(shot: dict, start: float, end: float) -> None:
         shot["duration"] = float(dur)
 
 
+
+def _musicclip_ltx_raw_padding_settings_from_payload(payload: dict) -> tuple[float, int, float]:
+    """Return raw render breathing-room settings for LTX-VRAMLab.
+
+    Planned/audio timings remain capped by _musicclip_ltx_hard_cap_seconds_from_payload().
+    These values are only metadata for the render step so raw clips can be generated
+    a little longer and then trimmed back by the existing pipeline.
+    """
+    try:
+        payload = dict(payload or {})
+    except Exception:
+        payload = {}
+    settings = payload.get("bridge_generation_settings")
+    if not isinstance(settings, dict):
+        settings = {}
+    backend = str(settings.get("ltx_backend") or payload.get("ltx_backend") or payload.get("generation_backend") or "").strip().lower()
+    if backend != "vramlab" and not (settings.get("ltx_raw_generation_seconds") or payload.get("ltx_raw_generation_seconds")):
+        return 0.0, 0, 0.0
+    try:
+        raw_seconds = float(settings.get("ltx_raw_generation_seconds") or payload.get("ltx_raw_generation_seconds") or 11.0)
+    except Exception:
+        raw_seconds = 11.0
+    try:
+        raw_frames = int(settings.get("ltx_raw_generation_frames") or payload.get("ltx_raw_generation_frames") or 265)
+    except Exception:
+        raw_frames = 265
+    try:
+        pad_seconds = float(settings.get("ltx_generation_tail_padding_seconds") or payload.get("ltx_generation_tail_padding_seconds") or 1.0)
+    except Exception:
+        pad_seconds = 1.0
+    raw_seconds = max(0.0, min(11.0, raw_seconds))
+    raw_frames = max(0, min(265, raw_frames))
+    pad_seconds = max(0.0, min(2.0, pad_seconds))
+    return raw_seconds, raw_frames, pad_seconds
+
+
+def _musicclip_ltx_with_raw_padding_payload(payload: dict) -> dict:
+    """Add raw-render padding keys without changing planned shot durations."""
+    try:
+        out = dict(payload or {})
+    except Exception:
+        out = {}
+    raw_seconds, raw_frames, pad_seconds = _musicclip_ltx_raw_padding_settings_from_payload(out)
+    if raw_seconds <= 0.05:
+        return out
+    out.setdefault("ltx_raw_generation_seconds", float(raw_seconds))
+    out.setdefault("ltx_raw_generation_frames", int(raw_frames))
+    out.setdefault("ltx_generation_tail_padding_seconds", float(pad_seconds))
+    out.setdefault("ltx_trim_to_planned_shot_seconds", True)
+    settings = out.get("bridge_generation_settings")
+    if isinstance(settings, dict):
+        settings = dict(settings)
+        settings.setdefault("ltx_raw_generation_seconds", float(raw_seconds))
+        settings.setdefault("ltx_raw_generation_frames", int(raw_frames))
+        settings.setdefault("ltx_generation_tail_padding_seconds", float(pad_seconds))
+        settings.setdefault("ltx_trim_to_planned_shot_seconds", True)
+        out["bridge_generation_settings"] = settings
+    return out
+
+
+def _musicclip_ltx_apply_raw_padding_to_plan_file(plan_path: str, payload: dict, label: str = "LTX plan") -> dict:
+    """Mark each LTX shot with separate raw render seconds/frames.
+
+    This deliberately does not modify song_start/song_end/duration/target_frames.
+    Those fields are the musical timing contract. The extra fields are for the
+    LTX render bridge/CLI only, so raw clips can have a small trim tail.
+    """
+    raw_seconds, raw_frames, pad_seconds = _musicclip_ltx_raw_padding_settings_from_payload(payload)
+    if raw_seconds <= 0.05:
+        return {"changed": False, "message": "raw padding inactive"}
+    try:
+        path = str(plan_path or "").strip()
+        if not path or not os.path.isfile(path):
+            return {"changed": False, "message": "plan not found"}
+        with open(path, "r", encoding="utf-8") as f:
+            plan = json.load(f)
+        if not isinstance(plan, dict):
+            return {"changed": False, "message": "plan is not an object"}
+        shots, _key = _musicclip_ltx_shot_list_ref(plan)
+        if not isinstance(shots, list) or not shots:
+            return {"changed": False, "message": "no shots"}
+        fps = int(plan.get("fps") or (payload or {}).get("fps") or 24)
+        changed = False
+        for shot in shots:
+            if not isinstance(shot, dict):
+                continue
+            _start, _end, dur = _musicclip_ltx_read_timing(shot)
+            if dur <= 0.03:
+                continue
+            # Add up to one second of raw tail, capped at 11s/265f. For a 10s
+            # planned shot this becomes 11s/265f, but assembly/audio still see 10s.
+            render_seconds = min(float(raw_seconds), max(float(dur), float(dur) + float(pad_seconds)))
+            render_frames = min(int(raw_frames), max(1, int(round(render_seconds * max(1, fps))) + 1))
+            old = (
+                shot.get("ltx_planned_duration_seconds"),
+                shot.get("ltx_raw_generation_seconds"),
+                shot.get("ltx_raw_generation_frames"),
+            )
+            shot["ltx_planned_duration_seconds"] = round(float(dur), 6)
+            shot["ltx_raw_generation_seconds"] = round(float(render_seconds), 6)
+            shot["ltx_raw_generation_frames"] = int(render_frames)
+            shot["ltx_generation_tail_padding_seconds"] = round(max(0.0, float(render_seconds) - float(dur)), 6)
+            shot["ltx_trim_to_planned_shot_seconds"] = True
+            if old != (
+                shot.get("ltx_planned_duration_seconds"),
+                shot.get("ltx_raw_generation_seconds"),
+                shot.get("ltx_raw_generation_frames"),
+            ):
+                changed = True
+        if not changed:
+            return {"changed": False, "message": "raw padding already present"}
+        guard = plan.get("ltx_raw_generation_guard")
+        if not isinstance(guard, dict):
+            guard = {}
+        guard.update({
+            "enabled": True,
+            "raw_generation_seconds_cap": float(raw_seconds),
+            "raw_generation_frames_cap": int(raw_frames),
+            "tail_padding_seconds": float(pad_seconds),
+            "keeps_planned_audio_duration": True,
+            "updated_at": datetime.now().isoformat(timespec="seconds"),
+        })
+        plan["ltx_raw_generation_guard"] = guard
+        tmp = path + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(plan, f, indent=2, ensure_ascii=False)
+        os.replace(tmp, path)
+        return {"changed": True, "message": f"raw render padding set to max {raw_seconds:.1f}s / {raw_frames}f"}
+    except Exception as exc:
+        return {"changed": False, "message": str(exc)}
+
+
 def _musicclip_ltx_sanitize_plan_file(plan_path: str, payload: dict, label: str = "LTX plan") -> dict:
     """Split over-cap LTX shots in an already-written JSON plan.
 
@@ -1002,6 +1134,14 @@ def _musicclip_ltx_apply_sanitize_result(result: dict, payload: dict, path_keys:
                 warnings.append("LTX plan was split, but audio chunks could not be regenerated: " + str(audio_report.get("message") or "unknown error"))
             result["warnings"] = warnings
             result["ltx_duration_guard_report"] = report
+        raw_report = _musicclip_ltx_apply_raw_padding_to_plan_file(path, payload, label)
+        result["ltx_raw_generation_guard_report"] = raw_report
+        if raw_report.get("changed"):
+            warnings = result.get("warnings")
+            if not isinstance(warnings, list):
+                warnings = []
+            warnings.append(str(raw_report.get("message") or "LTX raw render padding applied."))
+            result["warnings"] = warnings
         break
     return result
 
@@ -1029,19 +1169,37 @@ def _musicclip_patch_krea2_bridge(mod):
         original_single = getattr(mod, "run_single_ltx_shot_test", None)
         if callable(original_single):
             def _single(payload):
+                payload = _musicclip_ltx_with_raw_padding_payload(dict(payload or {}))
+                try:
+                    for _key in ("ltx_director_plan_path", "director_plan_path", "plan_path"):
+                        _p = str(payload.get(_key) or "").strip()
+                        if _p:
+                            _musicclip_ltx_apply_raw_padding_to_plan_file(_p, payload, "LTX single-shot plan")
+                            break
+                except Exception:
+                    pass
                 if _musicclip_krea2_is_mode(payload or {}):
                     prep = _musicclip_prepare_krea2_single_payload(dict(payload or {}))
                     if not prep.get("ok"): return {"ok": False, "message": str(prep.get("message") or "Krea 2 single-shot preparation failed.")}
-                    return original_single(dict(prep.get("payload") or {}))
+                    return original_single(_musicclip_ltx_with_raw_padding_payload(dict(prep.get("payload") or {})))
                 return original_single(payload)
             setattr(mod, "run_single_ltx_shot_test", _single)
         original_run_all = getattr(mod, "run_all_ltx_director_shots", None)
         if callable(original_run_all):
             def _run_all(payload):
+                payload = _musicclip_ltx_with_raw_padding_payload(dict(payload or {}))
+                try:
+                    for _key in ("ltx_director_plan_path", "director_plan_path", "plan_path"):
+                        _p = str(payload.get(_key) or "").strip()
+                        if _p:
+                            _musicclip_ltx_apply_raw_padding_to_plan_file(_p, payload, "LTX full-run plan")
+                            break
+                except Exception:
+                    pass
                 if _musicclip_krea2_is_mode(payload or {}):
                     prep = _musicclip_prepare_krea2_full_run_payload(dict(payload or {}))
                     if not prep.get("ok"): return {"ok": False, "message": str(prep.get("message") or "Krea 2 full-run preparation failed.")}
-                    return original_run_all(dict(prep.get("payload") or {}))
+                    return original_run_all(_musicclip_ltx_with_raw_padding_payload(dict(prep.get("payload") or {})))
                 return original_run_all(payload)
             setattr(mod, "run_all_ltx_director_shots", _run_all)
         setattr(mod, "_framevision_krea2_ltx_patched", True)
@@ -14767,11 +14925,15 @@ class AutoMusicSyncWidget(QWidget):
 
         backend = self._current_ltx_generation_backend() if hasattr(self, "_current_ltx_generation_backend") else ""
         if backend == "vramlab":
-            manual_max = min(float(manual_max), 10.0)
+            # Planned/music/audio shot timing should stay just under the 10s hard
+            # render limit. Raw LTX renders still get the separate 11s/265f tail for
+            # trimming/lipsync breathing room.
+            planned_ltx_cap = 9.9
+            manual_max = min(float(manual_max), planned_ltx_cap)
             if target_clip_seconds > 0.0:
-                target_clip_seconds = min(float(target_clip_seconds), 10.0)
+                target_clip_seconds = min(float(target_clip_seconds), planned_ltx_cap)
             if max_ltx > 0.0:
-                max_ltx = min(float(max_ltx), 10.0)
+                max_ltx = min(float(max_ltx), planned_ltx_cap)
 
         output_resolution = self._planner_bridge_normal_output_resolution_text()
         ltx_resolution = self._planner_bridge_ltx_resolution()
@@ -14800,9 +14962,15 @@ class AutoMusicSyncWidget(QWidget):
             "output_resolution_label": str(self.combo_res.currentText() or "") if getattr(self, "combo_res", None) is not None else "",
             "ltx_resolution": ltx_resolution,
             "ltx_aspect_mode": "portrait" if ltx_portrait else "landscape",
+            # Planned/music/audio shot timing stays just below 10s. Raw LTX renders
+            # get a small extra tail for trimming/lipsync breathing room.
             "ltx_max_generation_seconds": 10.0 if backend == "vramlab" else None,
             "ltx_max_generation_frames": 241 if backend == "vramlab" else None,
-            "hard_max_ltx_shot_seconds": 10.0 if backend == "vramlab" else None,
+            "hard_max_ltx_shot_seconds": 9.9 if backend == "vramlab" else None,
+            "ltx_raw_generation_seconds": 11.0 if backend == "vramlab" else None,
+            "ltx_raw_generation_frames": 265 if backend == "vramlab" else None,
+            "ltx_generation_tail_padding_seconds": 1.0 if backend == "vramlab" else None,
+            "ltx_trim_to_planned_shot_seconds": True if backend == "vramlab" else None,
             "timestamped_microclips_enabled": bool(getattr(self, "check_bridge_timestamped_microclips", None) and self.check_bridge_timestamped_microclips.isChecked()),
             "collage_effect_enabled": bool(getattr(self, "check_bridge_collage_effect", None) and self.check_bridge_collage_effect.isChecked()),
             "avoid_effects_in_first_clip": bool((getattr(self, "check_bridge_avoid_effects_first_clip", None) is None) or self.check_bridge_avoid_effects_first_clip.isChecked()),
@@ -15919,6 +16087,14 @@ class AutoMusicSyncWidget(QWidget):
             "character_reference": self._planner_bridge_character_reference_payload(),
             "assemble_after": bool(assemble_after),
         }
+        try:
+            if str(payload.get("ltx_backend") or "").strip().lower() == "vramlab":
+                payload["ltx_raw_generation_seconds"] = 11.0
+                payload["ltx_raw_generation_frames"] = 265
+                payload["ltx_generation_tail_padding_seconds"] = 1.0
+                payload["ltx_trim_to_planned_shot_seconds"] = True
+        except Exception:
+            pass
         # Do not pass output_dir to run_all_ltx_director_shots here.
         # The bridge treats output_dir as the exact full-run folder, while this UI field
         # is only the selected LTX job base folder. Let the bridge create
@@ -17738,8 +17914,9 @@ class AutoMusicSyncWidget(QWidget):
         """Keep the Smart Scene manual max aligned with the selected LTX backend.
 
         Own LTX-VRAMLab currently supports up to about 241 frames in this Music
-        Clip Creator workflow, so its practical shot cap stays at 10 seconds.
-        Wan2GP keeps the wider manual range.
+        Clip Creator workflow. The visible manual planning cap stays just below
+        10 seconds so raw renders have trim/lipsync breathing room. Wan2GP keeps
+        the wider manual range.
         """
         try:
             backend = self._current_ltx_generation_backend()
@@ -17748,7 +17925,10 @@ class AutoMusicSyncWidget(QWidget):
         try:
             spin = getattr(self, "spin_smart_max_scene_len", None)
             if spin is not None:
-                max_allowed = 10.0 if backend == "vramlab" else 30.0
+                # Be conservative when the backend is still initializing/unknown: the default
+                # Music Clip Creator LTX path is VramLab, so do not leave this spinbox open
+                # to 30s unless Wan2GP is explicitly selected.
+                max_allowed = 30.0 if backend == "wan2gp" else 9.9
                 try:
                     spin.setRange(0.5, float(max_allowed))
                 except Exception:
@@ -17759,14 +17939,13 @@ class AutoMusicSyncWidget(QWidget):
                 except Exception:
                     pass
                 try:
-                    if backend == "vramlab":
+                    if backend == "wan2gp":
                         spin.setToolTip(
-                            "Manual maximum smart scene length. LTX-VRAMLab is currently capped at 10 seconds "
-                            "(about 241 frames / 24 fps) in this Music Clip Creator workflow."
+                            "Manual maximum smart scene length. Auto mode ignores this value and uses source clip stats."
                         )
                     else:
                         spin.setToolTip(
-                            "Manual maximum smart scene length. Auto mode ignores this value and uses source clip stats."
+                            "Manual maximum smart scene length for the LTX-VRAMLab workflow. It stops at 9.9s so the raw 11s render has trim/lipsync breathing room."
                         )
                 except Exception:
                     pass
