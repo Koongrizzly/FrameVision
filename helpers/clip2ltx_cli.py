@@ -45,6 +45,36 @@ def _project_root() -> Path:
         return Path.cwd().resolve()
 
 
+
+
+def _default_ltx_videoclip_output_dir(root: Optional[Path] = None) -> Path:
+    """Default base folder for LTX Music Clip Creator job folders."""
+    base_root = Path(root).resolve() if root is not None else _project_root()
+    return (base_root / "output" / "videoclips" / "ltx").resolve()
+
+def _ltx_job_output_dir_from_payload(payload: Dict[str, Any], audio_path: str = "") -> Path:
+    """Return a fresh per-job LTX folder below the selected/default output base.
+
+    The UI passes output_dir as the base folder, not as the exact job folder.
+    Keep every scene/prompt/shot/director JSON plus chunks under one named job folder.
+    """
+    root_value = _safe_str(payload.get("root_dir")) if isinstance(payload, dict) else ""
+    root = Path(root_value).resolve() if root_value else _project_root()
+    base_raw = _safe_str(payload.get("output_dir")) if isinstance(payload, dict) else ""
+    base = Path(base_raw).expanduser().resolve() if base_raw else _default_ltx_videoclip_output_dir(root)
+    safe_song = _safe_stem((payload or {}).get("safe_song_stem") or audio_path or "musicclip_ltx")
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    candidate = (base / f"{safe_song}_{timestamp}").resolve()
+    if not candidate.exists():
+        candidate.mkdir(parents=True, exist_ok=False)
+        return candidate
+    for idx in range(2, 1000):
+        candidate = (base / f"{safe_song}_{timestamp}_{idx:02d}").resolve()
+        if not candidate.exists():
+            candidate.mkdir(parents=True, exist_ok=False)
+            return candidate
+    raise RuntimeError("Could not create a unique LTX music-clip job output folder.")
+
 def _safe_str(value: Any, default: str = "") -> str:
     try:
         text = str(value if value is not None else "")
@@ -676,12 +706,7 @@ def export_musicclip_scene_plan(payload: dict) -> dict:
         if not os.path.isfile(audio_path):
             return {"ok": False, "message": f"Audio file was not found: {audio_path}"}
 
-        root_value = _safe_str(payload.get("root_dir"))
-        root = Path(root_value).resolve() if root_value else _project_root()
-        safe_song = _safe_stem(payload.get("safe_song_stem") or audio_path)
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        output_dir = (root / "output" / "musicclip_planner_bridge" / f"{safe_song}_{timestamp}").resolve()
-        output_dir.mkdir(parents=True, exist_ok=True)
+        output_dir = _ltx_job_output_dir_from_payload(payload, audio_path)
         plan_path = output_dir / "musicclip_scene_plan.json"
 
         scenes = _normalize_scenes(
@@ -3793,7 +3818,7 @@ def create_prompt_plan(payload: dict) -> dict:
             out_dir = Path(scene_plan_path).resolve().parent
         else:
             out_raw = _safe_str(payload.get("output_dir") or scene_plan.get("bridge_output_dir"))
-            out_dir = Path(out_raw).resolve() if out_raw else _project_root() / "output" / "musicclip_planner_bridge"
+            out_dir = Path(out_raw).resolve() if out_raw else _default_ltx_videoclip_output_dir()
         out_dir.mkdir(parents=True, exist_ok=True)
 
         use_vocal_roles = _safe_bool(payload.get("use_vocal_scene_roles", payload.get("use_vocal_nonvocal_scene_roles", True)), True)
@@ -5610,7 +5635,7 @@ def create_ltx_shot_plan(payload: dict) -> dict:
         elif prompt_plan_path:
             out_dir = Path(prompt_plan_path).resolve().parent
         else:
-            out_dir = (_project_root() / "output" / "musicclip_planner_bridge").resolve()
+            out_dir = _default_ltx_videoclip_output_dir()
         out_dir.mkdir(parents=True, exist_ok=True)
 
         brief = _normalize_creative_brief(prompt_plan.get("creative_brief") or scene_plan.get("creative_brief") or payload.get("creative_brief"))
@@ -8189,7 +8214,7 @@ def create_ltx_director_plan(payload: dict) -> dict:
         elif ltx_path:
             out_dir = Path(ltx_path).resolve().parent
         else:
-            out_dir = (_project_root() / "output" / "musicclip_planner_bridge").resolve()
+            out_dir = _default_ltx_videoclip_output_dir()
         out_dir.mkdir(parents=True, exist_ok=True)
 
         brief = _normalize_creative_brief(payload.get("creative_brief") or ltx_plan.get("creative_brief"))

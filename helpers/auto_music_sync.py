@@ -1108,6 +1108,11 @@ def _musicclip_default_whisper_output_dir(root: Optional[str] = None) -> str:
     return os.path.join(str(root or _musicclip_project_root()), "output", "whisper")
 
 
+def _musicclip_default_ltx_videoclip_output_dir(root: Optional[str] = None) -> str:
+    """Default output folder for LTX Music Clip Creator jobs."""
+    return os.path.join(str(root or _musicclip_project_root()), "output", "videoclips", "ltx")
+
+
 def _musicclip_temp_dir(root: Optional[str] = None) -> str:
     return os.path.join(str(root or _musicclip_project_root()), "output", "_temp")
 
@@ -11129,6 +11134,8 @@ class AutoMusicSyncWidget(QWidget):
         self.btn_test_ltx_single_shot = None
         self.edit_ltx_audio = None
         self.btn_browse_ltx_audio = None
+        self.edit_ltx_output_dir = None
+        self.btn_browse_ltx_output_dir = None
         self.label_planner_bridge_status = None
         self.ltx_section_review_placeholder = None
         self.box_ltx_review = None
@@ -11272,6 +11279,22 @@ class AutoMusicSyncWidget(QWidget):
             row_ltx_audio.addWidget(self.edit_ltx_audio, 1)
             row_ltx_audio.addWidget(self.btn_browse_ltx_audio)
             ltx_music_form.addRow("Music / Audio:", row_ltx_audio)
+
+            row_ltx_output = QHBoxLayout()
+            row_ltx_output.setContentsMargins(0, 0, 0, 0)
+            row_ltx_output.setSpacing(6)
+            self.edit_ltx_output_dir = QLineEdit(self.ltx_section_music_track)
+            self.edit_ltx_output_dir.setPlaceholderText("Default: output/videoclips/ltx")
+            self.edit_ltx_output_dir.setToolTip(
+                "Optional output folder for this LTX music-video workflow. "
+                "Leave empty to use FrameVision/output/videoclips/ltx."
+            )
+            self.btn_browse_ltx_output_dir = QPushButton("Browse...", self.ltx_section_music_track)
+            self.btn_browse_ltx_output_dir.setToolTip("Choose where LTX music-videoclip jobs should be saved.")
+            row_ltx_output.addWidget(self.edit_ltx_output_dir, 1)
+            row_ltx_output.addWidget(self.btn_browse_ltx_output_dir)
+            ltx_music_form.addRow("Output folder:", row_ltx_output)
+
             ltx_music_lay.addLayout(ltx_music_form)
             bridge_lay.addWidget(self.ltx_section_music_track)
 
@@ -13415,6 +13438,8 @@ class AutoMusicSyncWidget(QWidget):
                 self.btn_browse_ltx_audio.clicked.connect(self._browse_audio)
             if getattr(self, "edit_ltx_audio", None) is not None:
                 self.edit_ltx_audio.textChanged.connect(self._sync_audio_from_ltx_field)
+            if getattr(self, "btn_browse_ltx_output_dir", None) is not None:
+                self.btn_browse_ltx_output_dir.clicked.connect(self._browse_ltx_output_dir)
             self.edit_audio.textChanged.connect(self._sync_audio_to_ltx_field)
             self.edit_audio.textChanged.connect(self._on_normal_audio_path_changed)
         except Exception:
@@ -15070,15 +15095,9 @@ class AutoMusicSyncWidget(QWidget):
             return {"ok": False, "message": msg}
 
         try:
-            out_dir = str(self.edit_output.text().strip())
+            out_dir = self._ltx_videoclip_output_dir()
         except Exception:
-            out_dir = ""
-        if not out_dir:
-            out_dir = "output/videoclips"
-        try:
-            out_dir = _musicclip_abs_path(_musicclip_project_root(), out_dir)
-        except Exception:
-            pass
+            out_dir = _musicclip_default_ltx_videoclip_output_dir(_musicclip_project_root())
 
         if not self._ensure_bridge_analysis_for_audio(audio):
             return {"ok": False, "message": "Could not analyze music for scene plan."}
@@ -15900,6 +15919,14 @@ class AutoMusicSyncWidget(QWidget):
             "character_reference": self._planner_bridge_character_reference_payload(),
             "assemble_after": bool(assemble_after),
         }
+        # Do not pass output_dir to run_all_ltx_director_shots here.
+        # The bridge treats output_dir as the exact full-run folder, while this UI field
+        # is only the selected LTX job base folder. Let the bridge create
+        # <job>/ltx_full_run/<timestamp> beside the director plan.
+        try:
+            payload["ltx_output_base_dir"] = self._ltx_videoclip_output_dir()
+        except Exception:
+            payload["ltx_output_base_dir"] = _musicclip_default_ltx_videoclip_output_dir(_musicclip_project_root())
         try:
             use_lora = bool(getattr(self, "check_ltx_single_use_lora", None) and self.check_ltx_single_use_lora.isChecked())
             if use_lora:
@@ -16108,7 +16135,10 @@ class AutoMusicSyncWidget(QWidget):
             if not safe_base:
                 safe_base = "musicclip_ltx"
             payload_path = payload_dir / f"ltx_full_queue_{ts}.json"
-            out_dir = (plan_parent / "ltx_queue_output").resolve()
+            try:
+                out_dir = Path(self._ltx_videoclip_output_dir()).expanduser().resolve()
+            except Exception:
+                out_dir = Path(_musicclip_default_ltx_videoclip_output_dir(str(root))).expanduser().resolve()
             out_dir.mkdir(parents=True, exist_ok=True)
             out_final = out_dir / f"{safe_base}_ltx_{ts}.mp4"
             queue_report = payload_dir / f"ltx_full_queue_{ts}_report.json"
@@ -18126,7 +18156,12 @@ class AutoMusicSyncWidget(QWidget):
         except Exception:
             out_txt = ""
         _add(out_txt or os.path.join("output", "videoclips"))
+        try:
+            _add(self._ltx_videoclip_output_dir())
+        except Exception:
+            _add(os.path.join(root, "output", "videoclips", "ltx"))
         _add(os.path.join(root, "output", "videoclips"))
+        _add(os.path.join(root, "output", "videoclips", "ltx"))
         _add(os.path.join(root, "output", "musicclip_planner_bridge"))
         _add(os.path.join(root, "output"))
         for attr in (
@@ -20317,6 +20352,12 @@ class AutoMusicSyncWidget(QWidget):
                     self._update_ltx_footer_action_text()
                 except Exception:
                     pass
+            if getattr(self, "edit_ltx_output_dir", None) is not None:
+                try:
+                    self.edit_ltx_output_dir.blockSignals(True)
+                    self.edit_ltx_output_dir.setText(str(s.get("ltx/output_dir", s.get("musicclip_ltx_output_dir", "", str), str) or ""))
+                finally:
+                    self.edit_ltx_output_dir.blockSignals(False)
             if getattr(self, "combo_bridge_character_source", None) is not None:
                 try:
                     self.combo_bridge_character_source.blockSignals(True)
@@ -20949,6 +20990,10 @@ class AutoMusicSyncWidget(QWidget):
                     s.set("musicclip_ltx_generation_backend", _ltx_backend_value)
             if getattr(self, "check_ltx_use_framevision_queue", None) is not None:
                 s.set("ltx/use_framevision_queue", int(self.check_ltx_use_framevision_queue.isChecked()))
+            if getattr(self, "edit_ltx_output_dir", None) is not None:
+                _ltx_out = str(self.edit_ltx_output_dir.text() or "").strip()
+                s.set("ltx/output_dir", _ltx_out)
+                s.set("musicclip_ltx_output_dir", _ltx_out)
             s.set("planner_bridge_character_reference_sheet_path", str(getattr(self, "_planner_bridge_character_reference_sheet_path", "") or ""))
             _char_ref_paths = getattr(self, "_planner_bridge_character_reference_sheet_paths", {}) or {}
             for _idx in range(1, 6):
@@ -21169,6 +21214,39 @@ class AutoMusicSyncWidget(QWidget):
                 self.edit_audio.blockSignals(False)
             except Exception:
                 pass
+
+    def _ltx_videoclip_output_dir(self) -> str:
+        """Return selected LTX output folder, falling back to output/videoclips/ltx."""
+        try:
+            raw = str(getattr(self, "edit_ltx_output_dir", None).text() if getattr(self, "edit_ltx_output_dir", None) is not None else "").strip()
+        except Exception:
+            raw = ""
+        if raw:
+            try:
+                return _musicclip_abs_path(_musicclip_project_root(), raw)
+            except Exception:
+                return os.path.abspath(os.path.expanduser(raw))
+        return _musicclip_default_ltx_videoclip_output_dir(_musicclip_project_root())
+
+    def _browse_ltx_output_dir(self) -> None:
+        start_dir = ""
+        try:
+            current = str(getattr(self, "edit_ltx_output_dir", None).text() if getattr(self, "edit_ltx_output_dir", None) is not None else "").strip()
+            start_dir = self._ltx_videoclip_output_dir() if not current else _musicclip_abs_path(_musicclip_project_root(), current)
+        except Exception:
+            start_dir = _musicclip_default_ltx_videoclip_output_dir(_musicclip_project_root())
+        path = QFileDialog.getExistingDirectory(self, "Select LTX videoclip output folder", start_dir)
+        if path and getattr(self, "edit_ltx_output_dir", None) is not None:
+            try:
+                root = Path(_musicclip_project_root()).resolve()
+                p = Path(path).resolve()
+                try:
+                    shown = str(p.relative_to(root)).replace("\\", "/")
+                except Exception:
+                    shown = str(p)
+                self.edit_ltx_output_dir.setText(shown)
+            except Exception:
+                self.edit_ltx_output_dir.setText(str(path))
 
     def _browse_audio(self) -> None:
         path, _ = QFileDialog.getOpenFileName(
