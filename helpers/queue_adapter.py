@@ -264,6 +264,27 @@ def enqueue_tool_job(job_type: str, input_path: str, out_dir: str, args: dict, p
     d = jobs_dirs()
     args = _fv_fix_hunyuan15_args(args or {})
     return make_job_json(job_type, input_path, out_dir, args or {}, str(d['pending']), priority=int(priority))
+
+def enqueue_musicclip_tool_job(input_path: str, out_dir: str, args: dict, priority: int = 560):
+    """Queue a Music Clip Creator helper command with metadata for footer mirroring.
+
+    It still uses the proven tools_ffmpeg worker path, but marks the job so
+    Music Clip Creator can find the matching queue JSON/log reliably and keep
+    showing progress in its sticky footer.
+    """
+    data = dict(args or {})
+    data.setdefault("queue_family", "musicclip")
+    data.setdefault("engine", "musicclip")
+    data.setdefault("progress_owner", "Music Clip Creator")
+    return enqueue_tool_job("tools_ffmpeg", input_path, out_dir, data, priority=priority)
+
+def enqueue_musicclip_ltx_tool_job(input_path: str, out_dir: str, args: dict, priority: int = 570):
+    """Queue a Music Clip Creator LTX full-run helper with metadata for UI progress."""
+    data = dict(args or {})
+    data.setdefault("queue_family", "musicclip_ltx")
+    data.setdefault("engine", "musicclip_ltx")
+    data.setdefault("progress_owner", "Music Clip Creator LTX")
+    return enqueue_tool_job("tools_ffmpeg", input_path, out_dir, data, priority=priority)
 def _fv_first_existing_python(env_dir: Path) -> Path | None:
     """Return the first Python executable inside a portable FrameVision env."""
     try:

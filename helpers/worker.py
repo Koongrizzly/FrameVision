@@ -903,7 +903,7 @@ def run(cmd):
             return int(subprocess.call(cmd, env=env))
         except Exception:
             return 1
-def _progress_set(pct: int):
+def _progress_set(pct: int, message: str = ""):
     try:
         global PROGRESS_FILE, RUNNING_JSON_FILE
         # Write sidecar progress file (optional consumer)
@@ -911,7 +911,12 @@ def _progress_set(pct: int):
             p = Path(PROGRESS_FILE)
             p.parent.mkdir(parents=True, exist_ok=True)
             tmp = p.with_suffix(p.suffix + ".tmp")
-            data = json.dumps({"pct": int(max(0, min(100, pct)))}, ensure_ascii=False)
+            _msg = str(message or "").strip()
+            _side = {"pct": int(max(0, min(100, pct)))}
+            if _msg:
+                _side["message"] = _msg[-500:]
+                _side["progress_text"] = _msg[-500:]
+            data = json.dumps(_side, ensure_ascii=False)
             tmp.write_text(data, encoding="utf-8")
             try:
                 tmp.replace(p)
@@ -927,6 +932,13 @@ def _progress_set(pct: int):
                 ipct = int(max(0, min(100, pct)))
                 changed = (j.get("pct") != ipct)
                 j["pct"] = ipct
+                _msg = str(message or "").strip()
+                if _msg:
+                    _msg = _msg[-800:]
+                    for _mk in ("progress_text", "status_text", "last_message"):
+                        if j.get(_mk) != _msg:
+                            changed = True
+                        j[_mk] = _msg
 
                 # Compute timing fields from started_at
                 start = j.get("started_at")
@@ -2191,6 +2203,19 @@ def tools_ffmpeg(job, cfg, mani):
             jid = job.get("id") or "job"
             log_file = str(log_dir / f"tools_{jid}_{stamp}.log")
 
+        # Expose the live stdout log path in the running job JSON so module UIs
+        # such as Music Clip Creator can mirror Queue progress without guessing.
+        try:
+            if log_file:
+                job["log_file"] = str(log_file)
+                job["stdout_path"] = str(log_file)
+                try:
+                    _patch_running_json({"log_file": str(log_file), "stdout_path": str(log_file)})
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
         # Progress parsing
         tqdm_re = _re.compile(r"(?P<pct>\d{1,3})%\|.*?(?P<cur>\d+)\s*/\s*(?P<tot>\d+)")
         step_re = _re.compile(r"(?i)(?:step[^0-9]*)?(?P<cur>\d+)\s*/\s*(?P<tot>\d+)")
@@ -2200,7 +2225,7 @@ def tools_ffmpeg(job, cfg, mani):
         last_pct = -1
         last_touch = start_ts
 
-        def _set_pct(p):
+        def _set_pct(p, message: str = ""):
             nonlocal last_pct, last_touch
             try:
                 ip = int(max(0, min(99, int(p))))
@@ -2208,7 +2233,7 @@ def tools_ffmpeg(job, cfg, mani):
                 return
             if ip != last_pct:
                 try:
-                    _progress_set(ip)
+                    _progress_set(ip, message)
                 except Exception:
                     pass
                 last_pct = ip
@@ -2361,6 +2386,16 @@ def tools_ffmpeg(job, cfg, mani):
                     except Exception:
                         pass
 
+                    # Publish the latest meaningful queue line for consumers that
+                    # show progress outside the Queue tab. Keep it compact to avoid
+                    # bloating the job JSON.
+                    try:
+                        _clean_part = str(part).strip()
+                        if _clean_part:
+                            _patch_running_json({"progress_text": _clean_part[-800:], "status_text": _clean_part[-800:], "last_message": _clean_part[-800:]})
+                    except Exception:
+                        pass
+
                     # Progress patterns
                     m = None
                     try:
@@ -2370,7 +2405,7 @@ def tools_ffmpeg(job, cfg, mani):
                     if m:
                         try:
                             pct = int(m.group("pct"))
-                            _set_pct(pct)
+                            _set_pct(pct, part)
                             continue
                         except Exception:
                             pass
@@ -2385,7 +2420,7 @@ def tools_ffmpeg(job, cfg, mani):
                             tot = int(m.group("tot"))
                             if tot > 0:
                                 pct = int(100.0 * float(max(0, min(cur, tot))) / float(tot))
-                                _set_pct(pct)
+                                _set_pct(pct, part)
                                 continue
                         except Exception:
                             pass
@@ -2398,7 +2433,7 @@ def tools_ffmpeg(job, cfg, mani):
                         try:
                             pct = int(m.group("pct"))
                             if 0 <= pct <= 100:
-                                _set_pct(pct)
+                                _set_pct(pct, part)
                                 continue
                         except Exception:
                             pass
@@ -2420,7 +2455,7 @@ def tools_ffmpeg(job, cfg, mani):
 
         # Finalize progress
         try:
-            _progress_set(100 if int(code) == 0 else max(0, last_pct))
+            _progress_set(100 if int(code) == 0 else max(0, last_pct), "Finished." if int(code) == 0 else "Failed or cancelled.")
         except Exception:
             pass
 

@@ -10343,6 +10343,8 @@ class AutoMusicSyncWidget(QWidget):
         self._pending_audio: Optional[str] = None
         self._pending_video: Optional[str] = None
         self._pending_out_dir: Optional[str] = None
+        self._footer_queue_watch_timer = None
+        self._footer_queue_watch: Dict[str, Any] = {}
         self.clip_sources = []
         self.image_sources = []  # List for loaded images
         # User-controlled interval (number of segments) between still images
@@ -13160,7 +13162,6 @@ class AutoMusicSyncWidget(QWidget):
         self.progress.setRange(0, 100)
         self.progress.setValue(0)
         self.progress.setFormat("Ready.")
-        main.addWidget(self.progress)
 
         # compact analysis summary
         self.label_summary = QLabel("", self)
@@ -13310,6 +13311,12 @@ class AutoMusicSyncWidget(QWidget):
 
         footer_outer.addLayout(footer_row_top)
         footer_outer.addLayout(footer_row_bottom)
+        # Keep render/queue progress attached to the sticky footer so it stays
+        # visible while the user is on Normal, LTX workflow, LTX Review, or Settings.
+        try:
+            footer_outer.addWidget(self.progress)
+        except Exception:
+            pass
 
 
         if not self._sticky_footer:
@@ -13359,7 +13366,11 @@ class AutoMusicSyncWidget(QWidget):
             self.timeline_panel.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
         except Exception:
             pass
-        self.tabs.addTab(self.timeline_panel, "Timeline")
+        # Keep the normal-workflow Timeline tab hidden until the user analyzes
+        # a music track in this session. This avoids showing an empty/stale
+        # normal-workflow timeline to users who only use the LTX workflow.
+        self._timeline_tab_visible = False
+        self._timeline_tab_title = "Timeline"
         if page_ltx_workflow is not None:
             self.tabs.addTab(_scroll_tab_page(page_ltx_workflow), "LTX workflow")
         if page_ltx_review is not None:
@@ -13397,6 +13408,7 @@ class AutoMusicSyncWidget(QWidget):
             if getattr(self, "edit_ltx_audio", None) is not None:
                 self.edit_ltx_audio.textChanged.connect(self._sync_audio_from_ltx_field)
             self.edit_audio.textChanged.connect(self._sync_audio_to_ltx_field)
+            self.edit_audio.textChanged.connect(self._on_normal_audio_path_changed)
         except Exception:
             pass
         btn_vf.clicked.connect(self._browse_video_file)
@@ -16059,6 +16071,13 @@ class AutoMusicSyncWidget(QWidget):
 
     def _queue_ltx_videoclip_from_director_plan(self, plan_path: str) -> None:
         try:
+            from helpers.queue_adapter import enqueue_musicclip_ltx_tool_job as _enqueue_musicclip_ltx_tool_job
+        except Exception:
+            try:
+                from queue_adapter import enqueue_musicclip_ltx_tool_job as _enqueue_musicclip_ltx_tool_job  # type: ignore
+            except Exception:
+                _enqueue_musicclip_ltx_tool_job = None
+        try:
             from helpers.queue_adapter import enqueue_tool_job
         except Exception:
             from queue_adapter import enqueue_tool_job  # type: ignore
@@ -16109,8 +16128,15 @@ class AutoMusicSyncWidget(QWidget):
                 "outfile": str(out_final),
                 "label": str(payload.get("label") or "Music Clip LTX 2.3"),
                 "cwd": str(root),
+                "queue_family": "musicclip_ltx",
+                "engine": "musicclip_ltx",
+                "progress_owner": "Music Clip Creator LTX",
+                "payload_path": str(payload_path),
             }
-            ok = enqueue_tool_job("tools_ffmpeg", str(plan_path), str(out_dir), args, priority=570)
+            if callable(_enqueue_musicclip_ltx_tool_job):
+                ok = _enqueue_musicclip_ltx_tool_job(str(plan_path), str(out_dir), args, priority=570)
+            else:
+                ok = enqueue_tool_job("tools_ffmpeg", str(plan_path), str(out_dir), args, priority=570)
             if not ok:
                 raise RuntimeError("Failed to enqueue LTX job (job file could not be written).")
         except Exception as exc:
@@ -16127,6 +16153,10 @@ class AutoMusicSyncWidget(QWidget):
             if hasattr(self, "progress"):
                 self.progress.setValue(0)
                 self.progress.setFormat("Queued LTX video.")
+        except Exception:
+            pass
+        try:
+            self._start_footer_queue_watch(label=str(args.get("label") or payload.get("label") or "Music Clip LTX 2.3"), outfile=str(out_final), payload_path=str(payload_path))
         except Exception:
             pass
         self._switch_to_queue_tab_after_enqueue()
@@ -16618,6 +16648,68 @@ class AutoMusicSyncWidget(QWidget):
                 active_note = f" Active render: {active}." if active else ""
                 self._set_planner_bridge_status(f"Planner Bridge: browsing {shot_id} during generation.{active_note}")
 
+    def _ltx_duration_guard_payload(self) -> dict:
+        """Build the small payload used by the LTX duration/audio-chunk guard.
+
+        This is intentionally limited to the guard inputs. It does not alter final
+        assembly or muxing; it only gives the splitter enough context to rebuild
+        per-shot WAV chunks from the original track when shot timings change.
+        """
+        payload = {
+            "ltx_backend": self._current_ltx_generation_backend(),
+            "root_dir": _musicclip_project_root(),
+        }
+        try:
+            settings = self._planner_bridge_generation_settings()
+            if isinstance(settings, dict):
+                payload["bridge_generation_settings"] = settings
+        except Exception:
+            pass
+        try:
+            export_chunks = bool(getattr(self, "check_bridge_ltx_export_audio_chunks", None) is None or self.check_bridge_ltx_export_audio_chunks.isChecked())
+            payload["export_audio_chunks"] = export_chunks
+        except Exception:
+            payload["export_audio_chunks"] = True
+        try:
+            audio = ""
+            if getattr(self, "edit_ltx_audio", None) is not None:
+                audio = str(self.edit_ltx_audio.text() or "").strip()
+            if not audio and getattr(self, "edit_audio", None) is not None:
+                audio = str(self.edit_audio.text() or "").strip()
+            if audio:
+                # Multiple names are deliberate: bridge/plan files used both
+                # audio_path and music_path over time. These are source paths,
+                # not generated chunk paths.
+                payload["source_audio"] = audio
+                payload["audio_path"] = audio
+                payload["music_path"] = audio
+                payload["media_path"] = audio
+                payload["full_song_path"] = audio
+        except Exception:
+            pass
+        for attr, key in (
+            ("_planner_bridge_last_scene_plan_path", "scene_plan_path"),
+            ("_planner_bridge_last_prompt_plan_path", "prompt_plan_path"),
+            ("_planner_bridge_last_ltx_shot_plan_path", "ltx_shot_plan_path"),
+            ("_planner_bridge_last_ltx_director_plan_path", "ltx_director_plan_path"),
+        ):
+            try:
+                val = str(getattr(self, attr, "") or "").strip()
+                if val:
+                    payload[key] = val
+            except Exception:
+                pass
+        return payload
+
+    def _apply_ltx_duration_guard_for_plan(self, plan_path: str, label: str = "LTX director plan") -> dict:
+        """Split overlong LTX shots and immediately rebuild only per-shot audio chunks."""
+        payload = self._ltx_duration_guard_payload()
+        report = _musicclip_ltx_sanitize_plan_file(plan_path, payload, label)
+        if isinstance(report, dict) and report.get("changed"):
+            audio_report = _musicclip_ltx_regenerate_audio_chunks_for_plan(plan_path, payload, label)
+            report["audio_chunk_report"] = audio_report
+        return report
+
     def _refresh_ltx_single_shots(self) -> None:
         combo = getattr(self, "combo_ltx_single_shot", None)
         if combo is None:
@@ -16629,9 +16721,11 @@ class AutoMusicSyncWidget(QWidget):
             return
         try:
             try:
-                report = _musicclip_ltx_sanitize_plan_file(path, {"ltx_backend": self._current_ltx_generation_backend()}, "LTX director plan")
+                report = self._apply_ltx_duration_guard_for_plan(path, "LTX director plan")
                 if isinstance(report, dict) and report.get("changed"):
-                    self._set_planner_bridge_status(f"Planner Bridge: Duration guard split {int(report.get('split_count') or 0)} over-10s LTX shot(s).")
+                    audio_report = report.get("audio_chunk_report") if isinstance(report.get("audio_chunk_report"), dict) else {}
+                    audio_note = " Audio chunks rebuilt." if audio_report.get("changed") else ""
+                    self._set_planner_bridge_status(f"Planner Bridge: Duration guard split {int(report.get('split_count') or 0)} over-10s LTX shot(s).{audio_note}")
             except Exception:
                 pass
             with open(path, "r", encoding="utf-8") as f:
@@ -16775,9 +16869,11 @@ class AutoMusicSyncWidget(QWidget):
             return
 
         try:
-            report = _musicclip_ltx_sanitize_plan_file(plan_path, {"ltx_backend": self._current_ltx_generation_backend()}, "LTX director plan")
+            report = self._apply_ltx_duration_guard_for_plan(plan_path, "LTX director plan")
             if isinstance(report, dict) and report.get("changed"):
-                self._set_planner_bridge_status(f"Planner Bridge: Duration guard split {int(report.get('split_count') or 0)} over-10s LTX shot(s) before start-image generation.")
+                audio_report = report.get("audio_chunk_report") if isinstance(report.get("audio_chunk_report"), dict) else {}
+                audio_note = " Audio chunks rebuilt." if audio_report.get("changed") else ""
+                self._set_planner_bridge_status(f"Planner Bridge: Duration guard split {int(report.get('split_count') or 0)} over-10s LTX shot(s) before start-image generation.{audio_note}")
                 self._refresh_ltx_single_shots()
         except Exception:
             pass
@@ -17077,9 +17173,11 @@ class AutoMusicSyncWidget(QWidget):
             return
 
         try:
-            report = _musicclip_ltx_sanitize_plan_file(plan_path, {"ltx_backend": self._current_ltx_generation_backend()}, "LTX director plan")
+            report = self._apply_ltx_duration_guard_for_plan(plan_path, "LTX director plan")
             if isinstance(report, dict) and report.get("changed"):
-                self._set_planner_bridge_status(f"Planner Bridge: Duration guard split {int(report.get('split_count') or 0)} over-10s LTX shot(s) before generation.")
+                audio_report = report.get("audio_chunk_report") if isinstance(report.get("audio_chunk_report"), dict) else {}
+                audio_note = " Audio chunks rebuilt." if audio_report.get("changed") else ""
+                self._set_planner_bridge_status(f"Planner Bridge: Duration guard split {int(report.get('split_count') or 0)} over-10s LTX shot(s) before generation.{audio_note}")
                 self._refresh_ltx_single_shots()
         except Exception:
             pass
@@ -17684,9 +17782,11 @@ class AutoMusicSyncWidget(QWidget):
             return
 
         try:
-            report = _musicclip_ltx_sanitize_plan_file(plan_path, {"ltx_backend": self._current_ltx_generation_backend()}, "LTX director plan")
+            report = self._apply_ltx_duration_guard_for_plan(plan_path, "LTX director plan")
             if isinstance(report, dict) and report.get("changed"):
-                self._set_planner_bridge_status(f"Planner Bridge: Duration guard split {int(report.get('split_count') or 0)} over-10s LTX shot(s) before testing.")
+                audio_report = report.get("audio_chunk_report") if isinstance(report.get("audio_chunk_report"), dict) else {}
+                audio_note = " Audio chunks rebuilt." if audio_report.get("changed") else ""
+                self._set_planner_bridge_status(f"Planner Bridge: Duration guard split {int(report.get('split_count') or 0)} over-10s LTX shot(s) before testing.{audio_note}")
                 self._refresh_ltx_single_shots()
         except Exception:
             pass
@@ -19392,14 +19492,17 @@ class AutoMusicSyncWidget(QWidget):
 
         # Ask the timeline panel (if present) to forget any previous analysis.
         try:
-            if hasattr(self, "timeline_panel"):
-                for name in ("clear_timeline", "reset_view", "clear"):
-                    fn = getattr(self.timeline_panel, name, None)
-                    if callable(fn):
-                        fn()
-                        break
+            self._set_timeline_tab_visible(False, clear_panel=True)
         except Exception:
-            pass
+            try:
+                if hasattr(self, "timeline_panel"):
+                    for name in ("clear_timeline", "reset_view", "clear"):
+                        fn = getattr(self.timeline_panel, name, None)
+                        if callable(fn):
+                            fn()
+                            break
+            except Exception:
+                pass
 
         # Finally, forget persisted settings so a fresh session starts from defaults.
         # Keep the output folder so 'Reset all' doesn't wipe it.
@@ -22295,9 +22398,75 @@ class AutoMusicSyncWidget(QWidget):
             finally:
                 self.check_nofx.blockSignals(False)
 
+    def _set_timeline_tab_visible(self, visible: bool, clear_panel: bool = False) -> None:
+        """Show/hide the normal-workflow Timeline tab.
+
+        The timeline is session-only UI: hidden at startup, revealed after a
+        successful normal music analysis, and hidden again when a different
+        audio path is loaded.
+        """
+        try:
+            panel = getattr(self, "timeline_panel", None)
+            tabs = getattr(self, "tabs", None)
+            if panel is None or tabs is None:
+                return
+
+            index = tabs.indexOf(panel)
+            if visible:
+                if index == -1:
+                    insert_at = 1 if tabs.count() >= 1 else tabs.count()
+                    tabs.insertTab(insert_at, panel, getattr(self, "_timeline_tab_title", "Timeline"))
+                self._timeline_tab_visible = True
+                try:
+                    if hasattr(self, "btn_check_timeline"):
+                        self.btn_check_timeline.setVisible(True)
+                except Exception:
+                    pass
+                return
+
+            if index != -1:
+                try:
+                    if tabs.currentIndex() == index:
+                        tabs.setCurrentIndex(0)
+                except Exception:
+                    pass
+                tabs.removeTab(index)
+            self._timeline_tab_visible = False
+            try:
+                if hasattr(self, "btn_check_timeline"):
+                    self.btn_check_timeline.setVisible(False)
+            except Exception:
+                pass
+
+            if clear_panel:
+                for name in ("clear_timeline", "reset_view", "clear"):
+                    fn = getattr(panel, name, None)
+                    if callable(fn):
+                        fn()
+                        break
+        except Exception:
+            # Optional UI only; never break the creator if tab hiding fails.
+            pass
+
+    def _on_normal_audio_path_changed(self, _text: str = "") -> None:
+        """A newly loaded track invalidates the old normal-workflow timeline."""
+        try:
+            self._analysis = None
+            self._analysis_audio_path = ""
+            self._analysis_sensitivity = None
+            self._section_media.clear()
+        except Exception:
+            pass
+        try:
+            self.label_summary.setText("")
+        except Exception:
+            pass
+        self._set_timeline_tab_visible(False, clear_panel=True)
+
     def _on_check_timeline(self) -> None:
         """Switch to the Music timeline tab."""
         try:
+            self._set_timeline_tab_visible(True)
             index = self.tabs.indexOf(self.timeline_panel)
             if index != -1:
                 self.tabs.setCurrentIndex(index)
@@ -22486,10 +22655,14 @@ class AutoMusicSyncWidget(QWidget):
         # Single‑line summary only; full structure lives in the Music timeline tab.
         self.label_summary.setText(" \u2022 ".join(parts))
         try:
-            # Reveal the shortcut once we have something meaningful to show.
-            self.btn_check_timeline.setVisible(True)
+            # Reveal the Timeline tab and shortcut once there is a real analysis
+            # to show.
+            self._set_timeline_tab_visible(True)
         except Exception:
-            pass
+            try:
+                self.btn_check_timeline.setVisible(True)
+            except Exception:
+                pass
 
         # Update timeline tab with the latest analysis, if available.
         try:
@@ -22745,6 +22918,217 @@ class AutoMusicSyncWidget(QWidget):
         # Reuse the same pipeline as Generate (analyze + scan + build timeline),
         # but the final step will enqueue a headless render job.
         self._on_generate()
+
+    def _start_footer_queue_watch(self, label: str = "", outfile: str = "", payload_path: str = "") -> None:
+        """Mirror FrameVision queue progress in the Music Clip Creator footer.
+
+        The Queue tab owns the real job lifecycle. This lightweight watcher only
+        scans recent queue job JSON files and any referenced stdout/log file so
+        the footer can keep showing useful status after a job is handed off.
+        It is deliberately best-effort: if the queue schema changes, rendering is
+        not affected.
+        """
+        try:
+            self._footer_queue_watch = {
+                "label": str(label or ""),
+                "outfile": str(outfile or ""),
+                "payload_path": str(payload_path or ""),
+                "ticks": 0,
+            }
+            if self._footer_queue_watch_timer is None:
+                self._footer_queue_watch_timer = QTimer(self)
+                self._footer_queue_watch_timer.setInterval(1000)
+                self._footer_queue_watch_timer.timeout.connect(self._poll_footer_queue_watch)
+            self._footer_queue_watch_timer.start()
+        except Exception:
+            pass
+
+    def _stop_footer_queue_watch(self) -> None:
+        try:
+            if self._footer_queue_watch_timer is not None:
+                self._footer_queue_watch_timer.stop()
+        except Exception:
+            pass
+
+    def _queue_job_dirs_for_footer_watch(self) -> List[Path]:
+        roots: List[Path] = []
+        try:
+            roots.append(Path(_musicclip_project_root()) / "jobs")
+        except Exception:
+            pass
+        try:
+            roots.append(Path.cwd() / "jobs")
+        except Exception:
+            pass
+        out: List[Path] = []
+        seen = set()
+        for root in roots:
+            try:
+                root = root.resolve()
+            except Exception:
+                pass
+            key = str(root).lower()
+            if key in seen:
+                continue
+            seen.add(key)
+            for name in ("running", "pending", "done", "failed", "error"):
+                d = root / name
+                try:
+                    if d.is_dir():
+                        out.append(d)
+                except Exception:
+                    pass
+        return out
+
+    def _extract_footer_queue_status_from_text(self, text: str) -> Tuple[Optional[int], str]:
+        pct: Optional[int] = None
+        msg = ""
+        try:
+            lines = [ln.strip() for ln in str(text or "").splitlines() if ln.strip()]
+            for ln in reversed(lines[-80:]):
+                m = re.search(r"(^|[^0-9])(100|[0-9]{1,2})\s*%\s*(.*)$", ln)
+                if m:
+                    pct = max(0, min(100, int(m.group(2))))
+                    msg = str(m.group(3) or "").strip()
+                    break
+                m = re.search(r"progress[^0-9]*(100|[0-9]{1,2})", ln, re.I)
+                if m:
+                    pct = max(0, min(100, int(m.group(1))))
+                    msg = ln
+                    break
+            if not msg and lines:
+                msg = lines[-1]
+        except Exception:
+            pass
+        return pct, msg
+
+    def _read_footer_queue_job_file(self, path: Path) -> Tuple[Dict[str, Any], str]:
+        try:
+            text = path.read_text(encoding="utf-8", errors="ignore")
+        except Exception:
+            return {}, ""
+        try:
+            data = json.loads(text)
+            if not isinstance(data, dict):
+                data = {}
+        except Exception:
+            data = {}
+        return data, text
+
+    def _poll_footer_queue_watch(self) -> None:
+        watch = getattr(self, "_footer_queue_watch", {}) or {}
+        try:
+            watch["ticks"] = int(watch.get("ticks") or 0) + 1
+            self._footer_queue_watch = watch
+        except Exception:
+            pass
+
+        needles = []
+        for key in ("payload_path", "outfile", "label"):
+            val = str(watch.get(key) or "").strip()
+            if val:
+                needles.append(val)
+                try:
+                    needles.append(str(Path(val).name))
+                except Exception:
+                    pass
+        needles = [n for n in needles if n]
+        if not needles:
+            self._stop_footer_queue_watch()
+            return
+
+        best = None
+        for d in self._queue_job_dirs_for_footer_watch():
+            try:
+                files = sorted(d.glob("*.json"), key=lambda x: x.stat().st_mtime, reverse=True)[:80]
+            except Exception:
+                files = []
+            for jf in files:
+                data, text = self._read_footer_queue_job_file(jf)
+                if not text:
+                    continue
+                hay = text.replace("\\", "/").lower()
+                matched = False
+                for n in needles:
+                    nn = str(n).replace("\\", "/").lower()
+                    if nn and nn in hay:
+                        matched = True
+                        break
+                if not matched:
+                    continue
+                try:
+                    mt = jf.stat().st_mtime
+                except Exception:
+                    mt = 0
+                if best is None or mt > best[0]:
+                    best = (mt, jf, d.name.lower(), data, text)
+
+        if best is None:
+            # Keep the footer useful while the worker has not picked up the job yet,
+            # but do not poll forever if no queue file can be found.
+            try:
+                self.progress.setValue(0)
+                self.progress.setFormat("Queued — waiting for FrameVision Queue...")
+            except Exception:
+                pass
+            if int(watch.get("ticks") or 0) > 7200:
+                self._stop_footer_queue_watch()
+            return
+
+        _mt, jf, folder_state, data, text = best
+        state = str(data.get("status") or data.get("state") or folder_state or "").lower()
+        pct, msg = self._extract_footer_queue_status_from_text(text)
+
+        # Some queue builds store stdout/stderr/log paths in the job JSON. Read
+        # the tail to get the real render percentage.
+        for log_key in ("log", "log_path", "stdout", "stdout_path", "stderr", "stderr_path", "output_log"):
+            try:
+                lp = data.get(log_key)
+                if isinstance(lp, str) and lp and os.path.isfile(lp):
+                    tail = Path(lp).read_text(encoding="utf-8", errors="ignore")[-12000:]
+                    lpct, lmsg = self._extract_footer_queue_status_from_text(tail)
+                    if lpct is not None:
+                        pct, msg = lpct, lmsg
+            except Exception:
+                pass
+
+        # Direct progress/message fields, if present, win over weak text parsing.
+        for k in ("progress", "percent", "pct", "progress_percent"):
+            try:
+                if k in data:
+                    pct = max(0, min(100, int(float(data.get(k)))))
+                    break
+            except Exception:
+                pass
+        for k in ("message", "progress_text", "last_message", "status_text", "detail"):
+            try:
+                v = data.get(k)
+                if isinstance(v, str) and v.strip():
+                    msg = v.strip()
+                    break
+            except Exception:
+                pass
+
+        done_like = state in ("done", "finished", "complete", "completed", "success") or folder_state == "done"
+        failed_like = state in ("failed", "error", "cancelled", "canceled") or folder_state in ("failed", "error")
+
+        try:
+            if failed_like:
+                self.progress.setValue(max(0, min(100, int(pct or 0))))
+                self.progress.setFormat(f"Queue failed: {msg or jf.name}")
+                self._stop_footer_queue_watch()
+            elif done_like:
+                self.progress.setValue(100)
+                self.progress.setFormat(f"Queue done: {msg or 'finished.'}")
+                self._stop_footer_queue_watch()
+            elif folder_state == "pending" or state == "pending":
+                self.progress.setValue(max(0, min(100, int(pct or 0))))
+                self.progress.setFormat(f"Queued — waiting for worker{(': ' + msg) if msg else ''}")
+            else:
+                self.progress.setValue(max(0, min(100, int(pct if pct is not None else 0))))
+                self.progress.setFormat(f"Queue running{(' — ' + msg) if msg else '...'}")
+        except Exception:
+            pass
 
     def _continue_generate_with_sources(
         self,
@@ -23178,6 +23562,13 @@ class AutoMusicSyncWidget(QWidget):
     ) -> None:
         """Serialize the current timeline and enqueue a headless render job in Queue."""
         try:
+            from helpers.queue_adapter import enqueue_musicclip_tool_job as _enqueue_musicclip_tool_job
+        except Exception:
+            try:
+                from queue_adapter import enqueue_musicclip_tool_job as _enqueue_musicclip_tool_job  # type: ignore
+            except Exception:
+                _enqueue_musicclip_tool_job = None
+        try:
             from helpers.queue_adapter import enqueue_tool_job
         except Exception:
             # Fallback when helpers is not a package (dev runs)
@@ -23249,6 +23640,10 @@ class AutoMusicSyncWidget(QWidget):
             "cmd": cmd,
             "outfile": out_final,
             "label": f"Music Clip Creator: {safe_base}",
+            "queue_family": "musicclip",
+            "engine": "musicclip",
+            "progress_owner": "Music Clip Creator",
+            "payload_path": str(payload_path),
         }
         try:
             # Ensure the command runs from app root so imports resolve.
@@ -23257,13 +23652,20 @@ class AutoMusicSyncWidget(QWidget):
             pass
 
         # Enqueue as a tools_ffmpeg job so the existing worker logic can run it.
-        ok = enqueue_tool_job("tools_ffmpeg", audio, out_dir, args, priority=560)
+        if callable(_enqueue_musicclip_tool_job):
+            ok = _enqueue_musicclip_tool_job(audio, out_dir, args, priority=560)
+        else:
+            ok = enqueue_tool_job("tools_ffmpeg", audio, out_dir, args, priority=560)
         if not ok:
             raise RuntimeError("Failed to enqueue job (job file could not be written).")
 
         try:
             self.progress.setValue(0)
             self.progress.setFormat("Queued.")
+        except Exception:
+            pass
+        try:
+            self._start_footer_queue_watch(label=str(args.get("label") or "Music Clip Creator"), outfile=str(out_final), payload_path=str(payload_path))
         except Exception:
             pass
 
