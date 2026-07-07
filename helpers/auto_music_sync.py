@@ -19189,6 +19189,8 @@ class AutoMusicSyncWidget(QWidget):
                     return {"ok": False, "message": "Start-image generation is not available in this bridge file."}
                 image_result = gen_fn({
                     "root_dir": _musicclip_project_root(),
+                    "ltx_backend": self._current_ltx_generation_backend(),
+                    "ltx_generation_backend": self._current_ltx_generation_backend(),
                     "ltx_director_plan_path": plan_path,
                     "shot_id": shot_id,
                     "image_model": image_model,
@@ -19254,6 +19256,8 @@ class AutoMusicSyncWidget(QWidget):
                         json.dump(temp_plan, f, indent=2, ensure_ascii=False)
                 clip_result = run_fn({
                     "root_dir": _musicclip_project_root(),
+                    "ltx_backend": self._current_ltx_generation_backend(),
+                    "ltx_generation_backend": self._current_ltx_generation_backend(),
                     "ltx_director_plan_path": override_plan_path,
                     "shot_id": shot_id,
                     "image_mode": "existing",
