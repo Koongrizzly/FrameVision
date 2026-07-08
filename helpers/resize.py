@@ -1,4 +1,8 @@
-# helpers/resize.py — Resize tool (rev 8)
+# helpers/resize.py — Resize tool (rev 9 queue-only)
+# Rev 9 changes:
+#   - Resize/convert now always sends image and video jobs to the FrameVision queue.
+#   - Removed direct FFmpeg runs from Current / Single / Batch actions.
+#
 # Rev 8 changes:
 #   - Fixed "Lock aspect ratio" so it actually keeps W/H linked again.
 #   - Internal logic now tracks last committed W/H instead of relying on a
@@ -378,9 +382,9 @@ class ResizePane(QWidget):
         _add_form_row("even", "", self.chk_even)
 
         # Action buttons
-        self.btn_current = QPushButton("Resize/convert current")
-        self.btn_one = QPushButton("Resize/convert a file")
-        self.btn_batch = QPushButton("Resize/convert a batch")
+        self.btn_current = QPushButton("Queue current resize/convert")
+        self.btn_one = QPushButton("Queue one file")
+        self.btn_batch = QPushButton("Queue batch")
         row_btn_widget = _make_row_widget([self.btn_current, self.btn_one, self.btn_batch])
         form.addRow(row_btn_widget)
 
@@ -390,9 +394,13 @@ class ResizePane(QWidget):
         row_out_widget = _make_row_widget([self.btn_select_outdir, self.btn_open_outdir])
         form.addRow(row_out_widget)
 
+        # Queue-only: this tool now always uses the FrameVision queue instead of running FFmpeg directly.
+        # Keep the checkbox object for old saved settings / external code, but hide it from the UI.
         self.chk_use_queue = QCheckBox("Use queue")
-        self.chk_use_queue.setChecked(bool(getattr(self.preset, "use_queue", True)))
+        self.chk_use_queue.setChecked(True)
+        self.chk_use_queue.setVisible(False)
         row_queue_widget = _make_row_widget([self.chk_use_queue])
+        row_queue_widget.setVisible(False)
         form.addRow(row_queue_widget)
 
         # Preset buttons (currently hidden – presets kept for back-compat only)
@@ -1172,7 +1180,7 @@ class ResizePane(QWidget):
                 pass
         else:
             try:
-                self.btn_current.setText("Resize/convert current")
+                self.btn_current.setText("Queue current resize/convert")
             except Exception:
                 pass
 
@@ -1311,8 +1319,18 @@ class ResizePane(QWidget):
                 pass
         return count
 
+    def _show_queued_message(self, count: int, skipped: int = 0):
+        try:
+            lines = [f"Added to FrameVision queue: {int(count)}"]
+            if skipped:
+                lines.append(f"Skipped: {int(skipped)}")
+            lines.append("Open the Queue tab to watch progress, cancel, or play the result.")
+            QMessageBox.information(self, "Queued", "\n".join(lines))
+        except Exception:
+            pass
+
     def _on_resize_current(self):
-        """Resize/convert the currently loaded image or video from the Media Player."""
+        """Queue resize/convert for the currently loaded image or video from the Media Player."""
         if self._is_image_mode():
             qimg = self._grab_current_qimage()
             if qimg is None or qimg.isNull():
@@ -1327,6 +1345,8 @@ class ResizePane(QWidget):
             try:
                 import time as _time
                 TEMP_DIR.mkdir(parents=True, exist_ok=True)
+                # Important: this temp input must stay on disk until the queue worker has consumed it.
+                # Do not unlink it immediately after enqueueing.
                 tmp_inp = TEMP_DIR / f"resize_current_{int(_time.time())}.png"
                 if not qimg.save(str(tmp_inp), "PNG"):
                     raise RuntimeError("Failed to save temporary frame image.")
@@ -1343,17 +1363,8 @@ class ResizePane(QWidget):
                 return
 
             cmd = self._build_cmd_image(tmp_inp, out)
-            ok, err = self._run_ffmpeg(cmd)
-
-            try:
-                tmp_inp.unlink(missing_ok=True)
-            except Exception:
-                pass
-
-            if ok:
-                QMessageBox.information(self, "Done", f"Saved:\n{out}")
-            else:
-                QMessageBox.critical(self, "FFmpeg error", err or "Unknown error")
+            if self._queue_one(tmp_inp, out, cmd, "Resize current frame"):
+                self._show_queued_message(1)
             return
 
         inp = self._find_current_media_path()
@@ -1379,11 +1390,8 @@ class ResizePane(QWidget):
             return
 
         cmd = self._build_cmd_video(inp, out, src_w, src_h)
-        if self.chk_use_queue.isChecked():
-            self._queue_one(inp, out, cmd, f"Resize current - {inp.name}")
-            return
-        self._pending_out_path = out
-        self._run_jobs_async([{"cmd": cmd, "label": inp.name}], "Processing video…", self._on_async_single_done)
+        if self._queue_one(inp, out, cmd, f"Resize current - {inp.name}"):
+            self._show_queued_message(1)
 
     def _on_resize_single(self):
         inp = self._pick_input()
@@ -1406,11 +1414,8 @@ class ResizePane(QWidget):
             return
 
         cmd = self._build_cmd_image(inp, out) if self._is_image_mode() else self._build_cmd_video(inp, out, src_w, src_h)
-        ok, err = self._run_ffmpeg(cmd)
-        if ok:
-            QMessageBox.information(self, "Done", f"Saved:\n{out}")
-        else:
-            QMessageBox.critical(self, "FFmpeg error", err or "Unknown error")
+        if self._queue_one(inp, out, cmd, f"Resize - {inp.name}"):
+            self._show_queued_message(1)
 
     def _on_resize_batch(self):
         # Prefer the shared BatchSelectDialog (helpers/batch.py). Fallback to classic file picker.
@@ -1425,7 +1430,7 @@ class ResizePane(QWidget):
 
         if _BatchDialog is not None:
             exts = tuple(IMAGE_EXTS) if self._is_image_mode() else tuple(VIDEO_EXTS)
-            result = _BatchDialog.pick(self, title="Resize a batch…", exts=exts)
+            result = _BatchDialog.pick(self, title="Queue resize batch…", exts=exts)
             if isinstance(result, tuple):
                 files, _conflict = result
             else:
@@ -1442,98 +1447,27 @@ class ResizePane(QWidget):
         if not to_process and not skipped:
             return
 
-        if self._is_image_mode():
-            if self.chk_use_queue.isChecked():
-                jobs = []
-                for inp, out in to_process:
-                    try:
-                        jobs.append({"input": inp, "output": out, "cmd": self._build_cmd_image(inp, out), "label": inp.name})
-                    except Exception as e:
-                        skipped.append((inp, f"error: {e}"))
-                self._queue_many(jobs)
-                return
-
-            ok_count = 0
-            fail = []
-            for inp, out in to_process:
-                try:
-                    cmd = self._build_cmd_image(inp, out)
-                    ok, err = self._run_ffmpeg(cmd)
-                    if ok:
-                        ok_count += 1
-                    else:
-                        fail.append((inp, err or "ffmpeg failed"))
-                except Exception as e:
-                    fail.append((inp, str(e)))
-
-            lines = [
-                f"Processed: {len(to_process)} / {len(inputs)} selected",
-                f"Success: {ok_count}",
-                f"Mode: Images",
-            ]
-            if skipped:
-                lines.append(f"Skipped (preflight): {len(skipped)}")
-                for p, r in skipped[:10]:
-                    lines.append(f"  - {p.name}: {r}")
-                if len(skipped) > 10:
-                    lines.append(f"  … (+{len(skipped)-10} more)")
-            if fail:
-                lines.append(f"Failed during run: {len(fail)}")
-                for p, reason in fail[:10]:
-                    lines.append(f"  - {p.name}: {reason}")
-                if len(fail) > 10:
-                    lines.append(f"  … (+{len(fail)-10} more)")
-
-            msg = "\n".join(lines)
-            if fail:
-                QMessageBox.warning(self, "Batch finished with errors", msg)
-            else:
-                QMessageBox.information(self, "Batch finished", msg)
-            return
-
         jobs = []
         for inp, out in to_process:
             try:
-                src_w, src_h = _ffprobe_size(inp)
-                self._src_w, self._src_h = src_w, src_h
-                cmd = self._build_cmd_video(inp, out, src_w, src_h)
-                jobs.append({"cmd": cmd, "label": inp.name})
+                if self._is_image_mode():
+                    cmd = self._build_cmd_image(inp, out)
+                else:
+                    src_w, src_h = _ffprobe_size(inp)
+                    self._src_w, self._src_h = src_w, src_h
+                    cmd = self._build_cmd_video(inp, out, src_w, src_h)
+                jobs.append({
+                    "input": inp,
+                    "output": out,
+                    "cmd": cmd,
+                    "label": f"Resize - {inp.name}",
+                })
             except Exception as e:
                 skipped.append((inp, f"error: {e}"))
 
-        if self.chk_use_queue.isChecked() and jobs:
-            queue_jobs = []
-            for i, job in enumerate(jobs):
-                try:
-                    queue_jobs.append({
-                        "input": to_process[i][0],
-                        "output": to_process[i][1],
-                        "cmd": job.get("cmd") or [],
-                        "label": job.get("label") or to_process[i][0].name,
-                    })
-                except Exception:
-                    pass
-            self._queue_many(queue_jobs)
-            return
-
-        if not jobs and skipped:
-            lines = [
-                f"Processed: 0 / {len(inputs)} selected",
-                f"Success: 0",
-                f"Mode: Video",
-                f"Skipped (preflight/build): {len(skipped)}",
-            ]
-            for p, r in skipped[:10]:
-                lines.append(f"  - {p.name}: {r}")
-            if len(skipped) > 10:
-                lines.append(f"  … (+{len(skipped)-10} more)")
-            QMessageBox.warning(self, "Batch finished with errors", "\n".join(lines))
-            return
-
-        self._pending_batch_skipped = skipped
-        self._pending_batch_selected = len(inputs)
-        self._pending_batch_image_mode = False
-        self._run_jobs_async(jobs, "Processing batch…", self._on_async_batch_done)
+        queued = self._queue_many(jobs)
+        if queued or skipped:
+            self._show_queued_message(queued, len(skipped))
 
     def _run_ffmpeg(self, cmd: list[str]) -> tuple[bool, str]:
         try:

@@ -1514,8 +1514,15 @@ def enqueue_resize_job(input_path: str, out_dir: str, cmd, outfile: str = '', la
             'cmd': list(cmd) if isinstance(cmd, (list, tuple)) else cmd,
             'label': str(label or 'Resize').strip() or 'Resize',
             'outfile': str(outfile or '').strip(),
+            'engine': 'resize',
         }
         inp = str(input_path or '').strip()
+        try:
+            _ip = Path(inp)
+            if _ip.name.startswith('resize_current_') and _ip.parent.name.lower() == 'temp':
+                args['cleanup_input_after_success'] = True
+        except Exception:
+            pass
         if not inp:
             inp = str((Path(out_dir) / '_resize_job.txt').resolve())
             try:

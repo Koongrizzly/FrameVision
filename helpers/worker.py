@@ -2502,6 +2502,18 @@ def tools_ffmpeg(job, cfg, mani):
             code_i = 0
 
         if int(code_i) == 0:
+            # Optional cleanup for temp inputs generated only to feed a queued tool job.
+            try:
+                if bool(args.get('cleanup_input_after_success')):
+                    _tmp_inp = pathlib.Path(str(job.get('input') or ''))
+                    if _tmp_inp.exists() and _tmp_inp.is_file():
+                        _name = _tmp_inp.name.lower()
+                        _parent = _tmp_inp.parent.name.lower()
+                        if _name.startswith('resize_current_') and _parent == 'temp':
+                            _tmp_inp.unlink()
+            except Exception:
+                pass
+
             # LTX 2.3 optional video glue: Continue video + generated result + End with video.
             try:
                 if bool(args.get("ltx_glue_input_videos")) and outfile and pathlib.Path(str(outfile)).exists():
