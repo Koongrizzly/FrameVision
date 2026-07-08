@@ -1,4 +1,4 @@
-# helpers/resize.py — Resize tool (rev 9 queue-only)
+# helpers/resize.py — Resize tool (rev 9a queue-only, silent enqueue)
 # Rev 9 changes:
 #   - Resize/convert now always sends image and video jobs to the FrameVision queue.
 #   - Removed direct FFmpeg runs from Current / Single / Batch actions.
@@ -1320,14 +1320,10 @@ class ResizePane(QWidget):
         return count
 
     def _show_queued_message(self, count: int, skipped: int = 0):
-        try:
-            lines = [f"Added to FrameVision queue: {int(count)}"]
-            if skipped:
-                lines.append(f"Skipped: {int(skipped)}")
-            lines.append("Open the Queue tab to watch progress, cancel, or play the result.")
-            QMessageBox.information(self, "Queued", "\n".join(lines))
-        except Exception:
-            pass
+        # Silent enqueue: FrameVision's Queue tab already shows the new job(s).
+        # Keep this method as a compatibility hook for existing call sites,
+        # but do not interrupt the user with an "Added to queue" popup.
+        return
 
     def _on_resize_current(self):
         """Queue resize/convert for the currently loaded image or video from the Media Player."""
