@@ -2,7 +2,7 @@
 from __future__ import annotations
 from typing import Optional, List, Dict, Union, Sequence
 from PySide6 import QtCore, QtGui, QtWidgets
-from PySide6.QtCore import Qt, QSettings, QUrl
+from PySide6.QtCore import Qt, QSettings
 
 import os, sys, time, json, random
 
@@ -14,7 +14,6 @@ import os, sys, time, json, random
 _USAGE_SETTINGS_SCOPE = ("FrameVision", "FrameVision")
 _USAGE_TOTAL_KEY = "usage_total_seconds"
 _USAGE_TRACKER_APP_PROP = "_fv_usage_tracker_singleton"
-_SECRET_LISTENER_PROP = "_fv_secret_editorpy_listener"
 
 
 def _usage_settings() -> QSettings:
@@ -256,6 +255,27 @@ def _make_breakout_icon(size: int = 18) -> QtGui.QIcon:
     return QtGui.QIcon(pm)
 
 
+def _make_bomb_icon(size: int = 18) -> QtGui.QIcon:
+    """Small neon bomb icon for Bomber-vision."""
+    pm = QtGui.QPixmap(size, size); pm.fill(Qt.transparent)
+    p = QtGui.QPainter(pm)
+    try:
+        p.setRenderHint(QtGui.QPainter.Antialiasing, True)
+        p.setPen(Qt.NoPen)
+        p.setBrush(QtGui.QBrush(QtGui.QColor('#263238')))
+        p.drawEllipse(QtCore.QRect(2, 5, size - 7, size - 7))
+        p.setBrush(QtGui.QBrush(QtGui.QColor('#00E5FF')))
+        p.drawEllipse(QtCore.QRect(4, 7, size - 11, size - 11))
+        pen = QtGui.QPen(QtGui.QColor('#FFD54F')); pen.setWidth(2); p.setPen(pen)
+        p.drawArc(QtCore.QRect(size - 8, 1, 6, 8), 20 * 16, 120 * 16)
+        p.setPen(Qt.NoPen)
+        p.setBrush(QtGui.QBrush(QtGui.QColor('#FF5252')))
+        p.drawEllipse(QtCore.QRect(size - 4, 1, 3, 3))
+    finally:
+        p.end()
+    return QtGui.QIcon(pm)
+
+
 def _make_racecar_icon(size: int = 18) -> QtGui.QIcon:
     """Small racecar icon for 'FrameRacing'."""
     pm = QtGui.QPixmap(size, size); pm.fill(Qt.transparent)
@@ -490,18 +510,6 @@ def _dad_joke_popup(parent: Optional[QtWidgets.QWidget] = None) -> None:
 
 
 # ---------------------------- Helpers ------------------------------------------------------
-def _project_root_for_open() -> str:
-    return _project_root()
-
-def _open_file_default_app(abs_path: str) -> None:
-    try:
-        if not os.path.isfile(abs_path):
-            QtWidgets.QMessageBox.warning(None, "Open file", f"File not found:\\n{abs_path}")
-            return
-        QtGui.QDesktopServices.openUrl(QUrl.fromLocalFile(abs_path))
-    except Exception:
-        pass
-
 def _spawn_helper_script(rel_path: Union[str, Sequence[str]]) -> None:
     """
     Launch a helper .py file in a detached process.
@@ -509,84 +517,22 @@ def _spawn_helper_script(rel_path: Union[str, Sequence[str]]) -> None:
     """
     try:
         root = _project_root()
-        candidates: List[str] = []
-        if isinstance(rel_path, (list, tuple)):
-            candidates = list(rel_path)
-        else:
-            candidates = [str(rel_path)]
+        candidates: List[str] = list(rel_path) if isinstance(rel_path, (list, tuple)) else [str(rel_path)]
         for pth in candidates:
-            norm = pth.replace("\\\\", os.sep).replace("/", os.sep)
+            norm = pth.replace("\\", os.sep).replace("/", os.sep)
             abs_path = os.path.join(root, norm)
             if os.path.isfile(abs_path):
                 py = sys.executable or "python"
                 QtCore.QProcess.startDetached(py, [abs_path])
                 return
-        # none found
         short_list = ", ".join(candidates)
-        QtWidgets.QMessageBox.information(None, "Easter egg not found",
-                                          f"Could not locate: {short_list}\\nLooked in /helpers/.")
-    except Exception:
-        pass
-
-
-# ----------------------------- Secret Easter Egg (not in menu) -----------------------------
-class _SecretKeyListener(QtCore.QObject):
-    """
-    Global key listener: when user types 'editor.py' then presses Enter,
-    open <root>/helpers/editor.py in the default system editor.
-    """
-    def __init__(self, parent: Optional[QtCore.QObject] = None) -> None:
-        super().__init__(parent)
-        self._buf = ""
-        self._last_t = time.time()
-        self._timeout = 2.5  # seconds to reset typing buffer
-
-    def eventFilter(self, obj, event):
-        try:
-            if event.type() == QtCore.QEvent.KeyPress:
-                now = time.time()
-                if now - self._last_t > self._timeout:
-                    self._buf = ""
-                self._last_t = now
-
-                key = event.key()
-                txt = event.text() or ""
-                # capture printable characters for the buffer
-                if txt and (31 < ord(txt) < 127):  # basic ASCII
-                    self._buf += txt
-                    if len(self._buf) > 64:
-                        self._buf = self._buf[-64:]
-                # on Enter/Return, check the trigger
-                if key in (Qt.Key_Return, Qt.Key_Enter):
-                    if self._buf.strip().lower().endswith("editor.py"):
-                        self._trigger_open()
-                    # always reset on enter to avoid accidental repeats
-                    self._buf = ""
-            return False
-        except Exception:
-            return False
-
-    def _trigger_open(self) -> None:
-        try:
-            root = _project_root_for_open()
-            path = os.path.join(root, "helpers", "editor.py")
-            _open_file_default_app(path)
-        except Exception:
-            pass
-
-def install_secret_editor_egg() -> None:
-    """Install the event filter once, app-wide."""
-    try:
-        app = QtWidgets.QApplication.instance()
-        if not app:
-            return
-        if getattr(app, _SECRET_LISTENER_PROP, None):
-            return
-        listener = _SecretKeyListener(app)
-        app.installEventFilter(listener)
-        setattr(app, _SECRET_LISTENER_PROP, listener)
-    except Exception:
-        pass
+        QtWidgets.QMessageBox.information(
+            None,
+            "Easter egg not found",
+            f"Could not locate: {short_list}\nLooked in /helpers/.",
+        )
+    except Exception as exc:
+        QtWidgets.QMessageBox.warning(None, "Easter egg launch failed", str(exc))
 
 
 # ----------------------------- Easter Eggs registry ---------------------------------------
@@ -614,6 +560,14 @@ EASTER_EGGS: List[Dict] = [
         "script": r"helpers\\Framie_snake.py",
         "unlock_seconds": 60 * 60 * 6,  # 6 hours
         "message": "new easter egg unlocked, check settings tab",
+    },
+    {
+        "id": "bomber_vision",
+        "label": "Bomber-vision",
+        "icon_fn": lambda: _make_bomb_icon(18),
+        "script": r"helpers\\Bomber-vision.py",
+        "unlock_seconds": 60 * 60 * 8,  # 8 hours
+        "message": "Bomber-vision unlocked, check the Easter Eggs menu in Settings!",
     },
     # Visible eggs
     {
@@ -783,11 +737,5 @@ def install_social_bottom_runtime() -> None:
 
 try:
     QtCore.QTimer.singleShot(800, install_social_bottom_runtime)
-except Exception:
-    pass
-
-# Secret egg install
-try:
-    QtCore.QTimer.singleShot(600, lambda: install_secret_editor_egg())
 except Exception:
     pass

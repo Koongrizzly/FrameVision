@@ -2378,6 +2378,60 @@ class ChatScrollArea(QtWidgets.QScrollArea):
         self._message_widgets: Dict[str, MessageBubble] = {}
         self._scroll_pending = False
 
+        # Floating jump-to-latest button. It belongs to the viewport so it stays
+        # fixed in the lower-right corner while the conversation itself scrolls.
+        self._bottom_button = QtWidgets.QToolButton(self.viewport())
+        self._bottom_button.setText("↓")
+        self._bottom_button.setObjectName("ChatJumpToBottomButton")
+        self._bottom_button.setToolTip("Jump to the latest message")
+        self._bottom_button.setCursor(QtCore.Qt.PointingHandCursor)
+        self._bottom_button.setFixedSize(46, 46)
+        self._bottom_button.setStyleSheet(
+            "QToolButton#ChatJumpToBottomButton {"
+            " border: 1px solid palette(mid);"
+            " border-radius: 23px;"
+            " background: palette(highlight);"
+            " color: palette(highlighted-text);"
+            " font-size: 27px;"
+            " font-weight: 700;"
+            " padding-bottom: 3px;"
+            " }"
+            "QToolButton#ChatJumpToBottomButton:hover {"
+            " border: 2px solid palette(highlighted-text);"
+            " background: palette(highlight);"
+            " color: palette(highlighted-text);"
+            " }"
+        )
+        self._bottom_button.clicked.connect(lambda: self.scroll_to_bottom(force=True))
+        self._bottom_button.hide()
+        self.verticalScrollBar().valueChanged.connect(self._update_bottom_button)
+        self.verticalScrollBar().rangeChanged.connect(lambda _minimum, _maximum: self._update_bottom_button())
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        self._position_bottom_button()
+
+    def _position_bottom_button(self):
+        try:
+            margin = 18
+            x = max(margin, self.viewport().width() - self._bottom_button.width() - margin)
+            y = max(margin, self.viewport().height() - self._bottom_button.height() - margin)
+            self._bottom_button.move(x, y)
+            self._bottom_button.raise_()
+        except RuntimeError:
+            pass
+
+    def _update_bottom_button(self):
+        try:
+            bar = self.verticalScrollBar()
+            # Keep it hidden when already at (or very close to) the newest message.
+            away_from_bottom = (bar.maximum() - bar.value()) > 80
+            self._bottom_button.setVisible(bool(bar.maximum() > bar.minimum() and away_from_bottom))
+            if away_from_bottom:
+                self._position_bottom_button()
+        except RuntimeError:
+            pass
+
     def clear_messages(self):
         self._message_widgets = {}
         while self.vbox.count() > 1:
@@ -2480,6 +2534,7 @@ class ChatScrollArea(QtWidgets.QScrollArea):
                     bar.setValue(bar.maximum())
                 else:
                     bar.triggerAction(QtWidgets.QAbstractSlider.SliderToMaximum)
+                self._update_bottom_button()
             except RuntimeError:
                 pass
 
@@ -2546,88 +2601,151 @@ class ChatCompletionThread(QtCore.QThread):
             self.timeout_s = 600
 
     def _estimate_generated_tokens(self, text: str) -> int:
-        """Fallback only: llama.cpp token counts are preferred when returned by the API."""
         raw = str(text or "").strip()
         if not raw:
             return 0
-        # English-ish estimate: words undercount tokens, so multiply a little.
         words = re.findall(r"\S+", raw)
         if words:
             return max(1, int(round(len(words) * 1.33)))
         return max(1, int(round(len(raw) / 4.0)))
 
-    def _emit_live_speed(self, generated_text: str, started_at: float, force: bool = False) -> float:
-        """Emit a live, approximate generation speed while streaming chunks arrive."""
-        try:
-            now = time.perf_counter()
-            elapsed_s = max(0.001, now - float(started_at))
-            completion_tokens = self._estimate_generated_tokens(generated_text)
-            if completion_tokens <= 0:
-                return now
-            tok_s = float(completion_tokens) / elapsed_s
-            self.speedUpdated.emit(f"speed: {tok_s:.1f} tok/s live ({completion_tokens} tok, {elapsed_s:.1f}s)")
-            return now
-        except Exception:
-            return time.perf_counter()
+    @staticmethod
+    def _append_stream_piece(current: str, piece: str) -> str:
+        """Accept both delta chunks and servers that resend accumulated text."""
+        piece = str(piece or "")
+        if not piece:
+            return current
+        if piece.startswith(current):
+            return piece
+        if current.endswith(piece):
+            return current
+        # Some compatible servers overlap a few characters between chunks.
+        max_overlap = min(len(current), len(piece), 256)
+        for size in range(max_overlap, 7, -1):
+            if current[-size:] == piece[:size]:
+                return current + piece[size:]
+        return current + piece
 
-    def _run_non_streaming(self, started_at: float) -> None:
+    @staticmethod
+    def _repetition_loop_reason(text: str) -> str:
+        """Return a reason when the generated tail is clearly repeating."""
+        raw = str(text or "")
+        if len(raw) < 700:
+            return ""
+        # Normalize only whitespace so code and punctuation remain meaningful.
+        tail = re.sub(r"[ \t\r\f\v]+", " ", raw[-7000:]).strip()
+        if len(tail) < 600:
+            return ""
+
+        # Catch the same sizeable tail block repeated three times in a row.
+        # Test larger blocks first to avoid stopping on ordinary short phrases.
+        max_block = min(1800, len(tail) // 3)
+        for block_len in range(max_block, 119, -1):
+            a = tail[-block_len:]
+            b = tail[-2 * block_len:-block_len]
+            c = tail[-3 * block_len:-2 * block_len]
+            if a == b == c and len(set(a)) > 8:
+                return f"the same {block_len}-character block repeated three times"
+
+        # Catch repeated non-trivial lines/paragraphs even when blank-line spacing differs.
+        units = [re.sub(r"\s+", " ", x).strip() for x in re.split(r"\n+", tail)]
+        units = [x for x in units if len(x) >= 60]
+        if len(units) >= 3 and units[-1] == units[-2] == units[-3]:
+            return "the same line or paragraph repeated three times"
+
+        # Catch a two-paragraph cycle repeated three times: A B A B A B.
+        if len(units) >= 6 and units[-6:-4] == units[-4:-2] == units[-2:]:
+            return "the same paragraph pair repeated three times"
+        return ""
+
+    def _run_streaming(self, started_at: float) -> None:
         payload = {
             "model": "local-model",
             "messages": self.messages,
-            "stream": False,
+            "stream": True,
             "max_tokens": int(self.max_tokens),
             "temperature": float(self.temperature),
             "top_p": float(self.top_p),
             "top_k": int(self.top_k),
             "repeat_penalty": float(self.repeat_penalty),
+            "repeat_last_n": 1024,
             "reasoning_format": "none",
+            "stream_options": {"include_usage": True},
         }
-        code, data = _http_post_json(f"{self.base_url}/v1/chat/completions", payload, timeout=float(self.timeout_s))
-        elapsed_s = max(0.001, time.perf_counter() - started_at)
-        if code >= 400:
-            msg = data.get("error", {}).get("message", f"HTTP {code}")
+        body = json.dumps(payload).encode("utf-8")
+        req = urllib.request.Request(
+            f"{self.base_url}/v1/chat/completions",
+            data=body,
+            headers={"Content-Type": "application/json", "Accept": "text/event-stream"},
+            method="POST",
+        )
+        content = ""
+        reasoning = ""
+        usage: Dict[str, Any] = {}
+        loop_reason = ""
+        images: List[Dict] = []
+        try:
+            with urllib.request.urlopen(req, timeout=float(self.timeout_s)) as resp:
+                for raw_line in resp:
+                    line = raw_line.decode("utf-8", errors="replace").strip()
+                    if not line or line.startswith(":"):
+                        continue
+                    if line.startswith("data:"):
+                        line = line[5:].strip()
+                    if line == "[DONE]":
+                        break
+                    try:
+                        event = json.loads(line)
+                    except Exception:
+                        continue
+                    if isinstance(event.get("usage"), dict):
+                        usage = event["usage"]
+                    choices = event.get("choices") or []
+                    if not choices:
+                        continue
+                    choice = choices[0] if isinstance(choices[0], dict) else {}
+                    delta = choice.get("delta") or choice.get("message") or {}
+                    if not isinstance(delta, dict):
+                        continue
+                    piece = _message_content_to_text(delta.get("content", ""))
+                    think_piece = _message_content_to_text(
+                        delta.get("reasoning")
+                        or delta.get("reasoning_content")
+                        or delta.get("thinking")
+                        or ""
+                    )
+                    content = self._append_stream_piece(content, piece)
+                    reasoning = self._append_stream_piece(reasoning, think_piece)
+                    if len(content) >= 700 and (len(content) % 180 < max(1, len(piece))):
+                        loop_reason = self._repetition_loop_reason(content)
+                        if loop_reason:
+                            break
+        except urllib.error.HTTPError as e:
+            raw = e.read().decode("utf-8", errors="replace")
+            try:
+                data = json.loads(raw) if raw.strip() else {}
+                msg = data.get("error", {}).get("message", raw or str(e))
+            except Exception:
+                msg = raw or str(e)
             self.failed.emit(str(msg))
             return
-        choices = data.get("choices") or []
-        if not choices:
-            self.failed.emit("No choices returned by the local server.")
-            return
-        message = choices[0].get("message") or {}
-        content = _message_content_to_text(message.get("content", ""))
-        reasoning = _message_content_to_text(
-            message.get("reasoning")
-            or message.get("reasoning_content")
-            or message.get("thinking")
-            or message.get("reasoning_text")
-            or ""
-        )
+
+        elapsed_s = max(0.001, time.perf_counter() - started_at)
         content, inline_reasoning = _split_inline_reasoning(content)
         if not reasoning:
             reasoning = inline_reasoning
-        images = _extract_images_from_response_payload(data)
-        if not content and images:
-            content = f"[Model returned {len(images)} image{'s' if len(images) != 1 else ''}]"
         if not content:
             content = "[Model returned an empty response]"
-
-        usage = data.get("usage") if isinstance(data, dict) else {}
-        if not isinstance(usage, dict):
-            usage = {}
         completion_tokens = int(
             usage.get("completion_tokens")
             or usage.get("output_tokens")
             or usage.get("generated_tokens")
             or 0
         )
-        prompt_tokens = int(
-            usage.get("prompt_tokens")
-            or usage.get("input_tokens")
-            or 0
-        )
+        prompt_tokens = int(usage.get("prompt_tokens") or usage.get("input_tokens") or 0)
         if completion_tokens <= 0:
             completion_tokens = self._estimate_generated_tokens(content)
         tokens_per_second = float(completion_tokens) / elapsed_s if completion_tokens > 0 else 0.0
-
         self.succeeded.emit({
             "content": content,
             "thinking": reasoning,
@@ -2637,17 +2755,16 @@ class ChatCompletionThread(QtCore.QThread):
             "prompt_tokens": prompt_tokens,
             "tokens_per_second": tokens_per_second,
             "speed_source": "api/estimate",
+            "loop_detected": bool(loop_reason),
+            "loop_reason": loop_reason,
         })
 
     def run(self):
         started_at = time.perf_counter()
         try:
-            # Keep the original non-streaming request path.
-            # Live speed from SSE was unreliable with some llama.cpp/LM Studio-compatible
-            # servers because prompt-eval/wait time and reasoning chunks can look like
-            # near-zero token generation. The UI now only shows the final measured speed.
-            self._run_non_streaming(started_at)
-            return
+            # Stream internally so a repetition loop can be stopped immediately.
+            # The UI still receives one completed answer, avoiding per-token redraw cost.
+            self._run_streaming(started_at)
         except TimeoutError:
             self.failed.emit(f"Generation timed out after {int(getattr(self, 'timeout_s', 600))} seconds.")
         except socket.timeout:
@@ -6170,6 +6287,10 @@ class LlamaChatWindow(QtWidgets.QMainWindow):
             m["id"] = mid
             self.chat_view.add_message(role, str(m.get("content", "")), str(m.get("thinking", "")), attachments=list(m.get("attachments", []) or []), message_id=mid, loading=bool(m.get("loading", False)))
             self._refresh_one_message_version_controls(m)
+        # The final scrollbar range is not always known until all message layouts
+        # have settled, especially when reopening a chat containing large code
+        # blocks or attachments. Jump again after that layout pass.
+        QtCore.QTimer.singleShot(40, lambda: self.chat_view.scroll_to_bottom(force=True))
 
     def _apply_settings_to_current_session(self):
         s = self._current_session()
@@ -9117,6 +9238,9 @@ class LlamaChatWindow(QtWidgets.QMainWindow):
             reply = str(payload.get("content", "") or "").strip()
             thinking = str(payload.get("thinking", "") or "").strip()
             images_payload = list(payload.get("images", []) or [])
+            if bool(payload.get("loop_detected")):
+                loop_reason = str(payload.get("loop_reason") or "repeated output").strip()
+                reply = reply.rstrip() + f"\n\n[Generation stopped automatically: {loop_reason}.]"
             try:
                 tok_s = float(payload.get("tokens_per_second") or 0.0)
                 gen_tok = int(payload.get("completion_tokens") or 0)
