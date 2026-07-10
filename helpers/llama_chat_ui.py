@@ -121,6 +121,35 @@ DEFAULT_BUBBLE_BASE_COLOR = "#56657f"
 DEFAULT_BUBBLE_USER_COLOR = "#33425f"
 DEFAULT_BUBBLE_ASSISTANT_COLOR = "#212734"
 
+# Long-chat safeguards. The complete conversation remains saved on disk, but the
+# UI and each LLM request only keep a practical active window. This prevents a
+# large context setting (for example 128k) from making every normal reply and
+# every chat repaint unnecessarily expensive.
+MAX_RENDERED_CHAT_MESSAGES = 60
+ACTIVE_HISTORY_TOKEN_CAP = 49152
+ACTIVE_HISTORY_CONTEXT_FRACTION = 0.72
+MIN_RECENT_MESSAGES_TO_KEEP = 6
+
+
+def _rough_token_count(value: Any) -> int:
+    """Fast conservative estimate; avoids loading a tokenizer in the UI process."""
+    if isinstance(value, str):
+        text = value
+    elif isinstance(value, list):
+        parts = []
+        for item in value:
+            if isinstance(item, dict):
+                parts.append(str(item.get("text") or item.get("content") or ""))
+            else:
+                parts.append(str(item or ""))
+        text = "\n".join(parts)
+    else:
+        text = str(value or "")
+    if not text:
+        return 0
+    # Code, paths and punctuation usually tokenize more densely than prose.
+    return max(1, int(len(text) / 3.2) + 4)
+
 
 def _normalize_hex_color(value: str, default: str) -> str:
     s = str(value or "").strip()
@@ -2347,6 +2376,7 @@ class ChatScrollArea(QtWidgets.QScrollArea):
         self.vbox.addStretch(1)
         self.setWidget(inner)
         self._message_widgets: Dict[str, MessageBubble] = {}
+        self._scroll_pending = False
 
     def clear_messages(self):
         self._message_widgets = {}
@@ -2369,9 +2399,6 @@ class ChatScrollArea(QtWidgets.QScrollArea):
         self.vbox.insertWidget(self.vbox.count() - 1, bubble)
         self._message_widgets[mid] = bubble
         self.scroll_to_bottom(force=True)
-        QtCore.QTimer.singleShot(0, lambda: self.scroll_to_bottom(force=True))
-        QtCore.QTimer.singleShot(35, lambda: self.scroll_to_bottom(force=True))
-        QtCore.QTimer.singleShot(120, lambda: self.scroll_to_bottom(force=True))
         return mid, bubble
 
     def add_memory_choice(self, title: str, detail: str, on_this_chat, on_saved_memories):
@@ -2438,14 +2465,25 @@ class ChatScrollArea(QtWidgets.QScrollArea):
         return True
 
     def scroll_to_bottom(self, force: bool = False):
-        if self.widget() is not None:
-            self.widget().adjustSize()
-        QtWidgets.QApplication.processEvents(QtCore.QEventLoop.ExcludeUserInputEvents, 5)
-        bar = self.verticalScrollBar()
-        if force:
-            bar.setValue(bar.maximum())
-        else:
-            bar.triggerAction(QtWidgets.QAbstractSlider.SliderToMaximum)
+        # Coalesce repeated requests into one event-loop pass. Calling adjustSize()
+        # and processEvents() for every message caused increasingly expensive full
+        # chat relayouts and could make the whole application appear frozen.
+        if self._scroll_pending:
+            return
+        self._scroll_pending = True
+
+        def _apply():
+            self._scroll_pending = False
+            try:
+                bar = self.verticalScrollBar()
+                if force:
+                    bar.setValue(bar.maximum())
+                else:
+                    bar.triggerAction(QtWidgets.QAbstractSlider.SliderToMaximum)
+            except RuntimeError:
+                pass
+
+        QtCore.QTimer.singleShot(0, _apply)
 
 
 # -----------------------------
@@ -6117,7 +6155,14 @@ class LlamaChatWindow(QtWidgets.QMainWindow):
                 "Pick a local GGUF model, load it, then start chatting. use trigger words to enable extra chat options (check info in settings).",
             )
             return
-        for m in s.messages:
+        visible_messages = list(s.messages[-MAX_RENDERED_CHAT_MESSAGES:])
+        hidden_count = max(0, len(s.messages) - len(visible_messages))
+        if hidden_count:
+            self.chat_view.add_message(
+                "info",
+                f"{hidden_count} older messages are kept in this chat but hidden from the live view to keep it responsive.",
+            )
+        for m in visible_messages:
             role = str(m.get("role", "assistant"))
             if role not in ("user", "assistant", "info"):
                 role = "assistant"
@@ -7252,6 +7297,48 @@ class LlamaChatWindow(QtWidgets.QMainWindow):
         )
         self._set_status("Choose memory source", "ready")
     # ---------- chat ----------
+    def _limit_api_history(self, messages: List[Dict]) -> List[Dict]:
+        """Keep a bounded recent prefix for the request while preserving full saved chat."""
+        if not messages:
+            return messages
+        try:
+            ctx_size = max(256, int(self.settings_dialog.sp_ctx_size.value()))
+            max_output = max(1, int(self.settings_dialog.sp_max_tokens.value()))
+        except Exception:
+            ctx_size, max_output = 32768, 4096
+
+        usable = int(ctx_size * ACTIVE_HISTORY_CONTEXT_FRACTION) - max_output
+        budget = max(2048, min(ACTIVE_HISTORY_TOKEN_CAP, usable))
+        system_messages = [m for m in messages if str(m.get("role") or "") == "system"]
+        conversation = [m for m in messages if str(m.get("role") or "") != "system"]
+        system_cost = sum(_rough_token_count(m.get("content")) for m in system_messages)
+        remaining = max(1024, budget - system_cost)
+
+        kept_rev: List[Dict] = []
+        used = 0
+        for m in reversed(conversation):
+            cost = _rough_token_count(m.get("content")) + 8
+            if kept_rev and used + cost > remaining and len(kept_rev) >= MIN_RECENT_MESSAGES_TO_KEEP:
+                break
+            kept_rev.append(m)
+            used += cost
+        kept = list(reversed(kept_rev))
+        omitted = max(0, len(conversation) - len(kept))
+        if omitted:
+            note = (
+                f"Long-chat safeguard: {omitted} older messages were omitted from this request "
+                "to keep local generation responsive. The complete conversation is still saved "
+                "and visible in the chat file. Rely on the recent messages and ask the user for a "
+                "specific earlier detail only when it is essential."
+            )
+            if system_messages:
+                first = dict(system_messages[0])
+                first["content"] = (str(first.get("content") or "").rstrip() + "\n\n" + note).strip()
+                system_messages = [first] + system_messages[1:]
+            else:
+                system_messages = [{"role": "system", "content": note}]
+        return system_messages + kept
+
     def _build_api_messages(self, session: ChatSession) -> List[Dict]:
         messages: List[Dict] = []
         system_prompt = (session.system_prompt or "").strip()
@@ -7316,7 +7403,7 @@ class LlamaChatWindow(QtWidgets.QMainWindow):
             if text_payload:
                 parts.insert(0, {"type": "text", "text": text_payload})
             messages.append({"role": role, "content": parts if parts else content_text})
-        return messages
+        return self._limit_api_history(messages)
     def _prepare_auto_retry_templates(self, model_path: str, template_kind: str, template_value: str):
         self._auto_retry_templates = []
         self._auto_retry_original_selection = (template_kind, template_value)
