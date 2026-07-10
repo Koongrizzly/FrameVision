@@ -23,6 +23,8 @@ Create, Edit, Upscale, Play
  <p align="center">      FrameVision available models & feature list.
    
 ---
+- 💬 LLM Chat : your own little (offline) chat gpt at home. Load any (gguf) model and start chatting/coding/creating images, video, even music with the installed models.
+  Chat memory allows user for the chat to remember something in new chat
 - 🎨 TXT → IMG with SD15/SDXL- Z-Image Turbo - Chroma - Lens - Qwen 2512 - Krea 2 - Ideogram 4)
 - 🖌️ Image edit, reference, inpaint, (some also include txt 2 img)... with Qwen2511, Hi-dream studio,  Flux Klein, Boogu image and Fireredit 1.1
 - 🎬 txt/img/video to video with WAN 2.2 5B/ Wan2.2 Turbo 4 step - Hiar (experimental) - HunyuanVideo 1.5 - LTX 2.3 - Bernini R 1.3B (base on wan 2.1 also does image and video editing)
@@ -37,8 +39,8 @@ Create, Edit, Upscale, Play
 - 📁 Media Explorer with Json viewer.
 - 🖌 Remove Background (+ basic (sdXL) inpainting)
 - 🧠 The Planner : from a prompt to a finished storyline long form video in a couple of clicks, it can use all of the above models in an automated workflow.
-- video timeline editor : little python based openshot clone
-- LLM Chat : your own little (offline) chat gpt at home. Load any (gguf) model and start chatting/coding/creating images, video or music...
+- 🎬 video timeline editor : little python based openshot clone (beta test)
+
 
 ---
  <p align="center"> 🧰 Multi tools tab :
