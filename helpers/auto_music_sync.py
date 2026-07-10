@@ -15840,6 +15840,20 @@ class AutoMusicSyncWidget(QWidget):
                     score += 20
                 if "base" in low:
                     score -= 8
+
+                # Music Clip Creator reference-model preference:
+                #   1) original Dev FP8
+                #   2) original Dev BF16
+                #   3) Dev 2604 BF16
+                # Newer/2604 builds must not silently outrank the original Dev
+                # model just because their folder name is newer or discovered first.
+                is_2604 = "2604" in low
+                if want == "fp8" and not is_2604:
+                    score += 100
+                elif want == "bf16" and not is_2604:
+                    score += 100
+                elif want == "bf16" and is_2604:
+                    score += 50
                 return score
 
             def _collect_candidates(want: str) -> list[Path]:
@@ -15909,12 +15923,29 @@ class AutoMusicSyncWidget(QWidget):
                 out.sort(key=lambda p: _score_candidate(p, want), reverse=True)
                 return out
 
+            # Restore the original Music Clip Creator preference order.
+            # FP8 Dev is first, then original BF16 Dev, then BF16 Dev 2604.
+            for cand in _collect_candidates("fp8"):
+                low = str(cand).replace("\\", "/").lower()
+                if "2604" not in low and _usable_model_dir(cand):
+                    return True, "HiDream Dev FP8"
             for cand in _collect_candidates("bf16"):
-                if _usable_model_dir(cand):
+                low = str(cand).replace("\\", "/").lower()
+                if "2604" not in low and _usable_model_dir(cand):
                     return True, "HiDream Dev BF16"
+            for cand in _collect_candidates("bf16"):
+                low = str(cand).replace("\\", "/").lower()
+                if "2604" in low and _usable_model_dir(cand):
+                    return True, "HiDream Dev 2604 BF16"
+
+            # Last-resort compatibility for installations that only have a
+            # differently named Dev FP8/Dev folder.
             for cand in _collect_candidates("fp8"):
                 if _usable_model_dir(cand):
                     return True, "HiDream Dev FP8"
+            for cand in _collect_candidates("bf16"):
+                if _usable_model_dir(cand):
+                    return True, "HiDream Dev BF16"
         except Exception:
             pass
         return False, ""
