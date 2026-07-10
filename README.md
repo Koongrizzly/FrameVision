@@ -17,7 +17,7 @@ Create, Edit, Upscale, Play
 - Installer uses Python 3.11, if the system cannot find python 3.11 it can install this (together with GIT, miniconda and other needed tools to run local a.i. models)
 - RTX graphics card with 12 gigabyte vram or more is advised for image and video models, smaller models and the multi tools section can run on CPU or low vram.
  -> This app has been tested on a budget am4 motherboard with an amd ryzen 5900x + Rtx 3090 and 64 gig ddr ram. Make sure to enable pagefile and set it to 'auto' in windows to cover the bigger model loads.
-- Windows may show a Defender / SmartScreen warning the first time you run FrameVision .bat or .exe files, because the app is open source freeware and a hobby project so it's not code-signed (which costs money). This is normal for unsigned selfmade apps. -> Only continue if you downloaded this from the official GitHub. Click More info → Run anyway when you trust the source. When unsure, scan the folder first or ask Chat GPT :-)
+- Windows may show a Defender / SmartScreen warning the first time you run FrameVision .bat or .exe files, because the app is open source freeware and a hobby project so it's not code-signed (which costs money). This is normal for unsigned selfmade apps. -> Only continue if you downloaded this from the official GitHub. Click More info → Run anyway when you trust the source. When unsure, scan the folder first or ask Chat GPT :-) (or run 'python framevision_run.py' directly to skip the windows 'start.bat' file)
 
 ---
  <p align="center">      FrameVision available models & feature list.
