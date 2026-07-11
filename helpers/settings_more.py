@@ -297,6 +297,37 @@ def _make_tower_icon(size: int = 18) -> QtGui.QIcon:
     return QtGui.QIcon(pm)
 
 
+def _make_frog_icon(size: int = 18) -> QtGui.QIcon:
+    """Small retro frog icon for Frog-Vision."""
+    pm = QtGui.QPixmap(size, size); pm.fill(Qt.transparent)
+    p = QtGui.QPainter(pm)
+    try:
+        p.setRenderHint(QtGui.QPainter.Antialiasing, True)
+        p.setPen(Qt.NoPen)
+        green = QtGui.QColor('#76FF03')
+        dark = QtGui.QColor('#1B5E20')
+        eye = QtGui.QColor('#F5F5F5')
+        pupil = QtGui.QColor('#102027')
+        # Body and head
+        p.setBrush(green)
+        p.drawEllipse(QtCore.QRect(int(size * 0.25), int(size * 0.33), int(size * 0.50), int(size * 0.47)))
+        p.drawEllipse(QtCore.QRect(int(size * 0.20), int(size * 0.18), int(size * 0.60), int(size * 0.42)))
+        # Eyes
+        p.setBrush(eye)
+        p.drawEllipse(QtCore.QRect(int(size * 0.22), int(size * 0.10), int(size * 0.25), int(size * 0.28)))
+        p.drawEllipse(QtCore.QRect(int(size * 0.53), int(size * 0.10), int(size * 0.25), int(size * 0.28)))
+        p.setBrush(pupil)
+        p.drawEllipse(QtCore.QRect(int(size * 0.31), int(size * 0.18), max(2, int(size * 0.08)), max(2, int(size * 0.10))))
+        p.drawEllipse(QtCore.QRect(int(size * 0.61), int(size * 0.18), max(2, int(size * 0.08)), max(2, int(size * 0.10))))
+        # Feet
+        p.setBrush(dark)
+        p.drawRoundedRect(int(size * 0.05), int(size * 0.68), int(size * 0.32), int(size * 0.18), 2, 2)
+        p.drawRoundedRect(int(size * 0.63), int(size * 0.68), int(size * 0.32), int(size * 0.18), 2, 2)
+    finally:
+        p.end()
+    return QtGui.QIcon(pm)
+
+
 def _make_racecar_icon(size: int = 18) -> QtGui.QIcon:
     """Small racecar icon for 'FrameRacing'."""
     pm = QtGui.QPixmap(size, size); pm.fill(Qt.transparent)
@@ -657,6 +688,18 @@ EASTER_EGGS: List[Dict] = [
         ],
         "unlock_seconds": 60 * 60 * 16,  # 16 hours
         "message": "Tower-Vision unlocked, check the Easter Eggs menu in Settings!",
+    },
+    {
+        "id": "frog_vision",
+        "label": "Frog-Vision",
+        "icon_fn": lambda: _make_frog_icon(18),
+        "scripts": [
+            r"helpers\\frog-vision.py",
+            r"helpers\\Frog-Vision.py",
+            r"helpers\\frog_vision.py",
+        ],
+        "unlock_seconds": 60 * 60 * 16,  # 16 hours
+        "message": "Frog-Vision unlocked, check the Easter Eggs menu in Settings!",
     },
     {
         "id": "frameshooters",

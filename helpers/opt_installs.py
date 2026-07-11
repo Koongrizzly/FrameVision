@@ -806,6 +806,41 @@ def _run_ltx23_fp8(root: Path) -> Optional[Tuple[str, List[str], Path]]:
     return (str(py), ["-u", str(script), "--root", str(root), "--repair", "--model-variant", "fp8"], root)
 
 
+def _run_ltx23_variant(root: Path, variant: str) -> Optional[Tuple[str, List[str], Path]]:
+    """Run the shared LTX 2.3 installer for one of its named model variants.
+
+    SDNQ variants use the same portable .ltx23 environment, but download complete
+    split Diffusers repositories into models/ltx23_int8 or models/ltx23_int4.
+    The installer also repairs SDNQ, Diffusers, Triton and the normal LTX runtime.
+    """
+    script = root / "presets" / "extra_env" / "ltx23_install.py"
+    if not script.exists():
+        return None
+    py = _venv_python(root)
+    if py is None or (not py.exists()):
+        return None
+    return (
+        str(py),
+        ["-u", str(script), "--root", str(root), "--repair", "--model-variant", str(variant)],
+        root,
+    )
+
+
+def _run_ltx23_sdnq_int8(root: Path) -> Optional[Tuple[str, List[str], Path]]:
+    """Install/repair the complete OzzyGT LTX 2.3 Distilled 1.1 SDNQ INT8 model."""
+    return _run_ltx23_variant(root, "sdnq-int8")
+
+
+def _run_ltx23_sdnq_int4(root: Path) -> Optional[Tuple[str, List[str], Path]]:
+    """Install/repair the complete OzzyGT LTX 2.3 Distilled 1.1 SDNQ INT4 model."""
+    return _run_ltx23_variant(root, "sdnq-int4")
+
+
+def _run_ltx23_sdnq_both(root: Path) -> Optional[Tuple[str, List[str], Path]]:
+    """Install/repair both SDNQ variants in one installer run."""
+    return _run_ltx23_variant(root, "sdnq-both")
+
+
 # (HeartMula optional installs removed)
 
 def _run_whisper(root: Path) -> Optional[Tuple[str, List[str], Path]]:
@@ -1395,6 +1430,26 @@ OptionalInstall(
                 "Shares environments/.ltx23 and models/ltx23 with the FP16 install, then stores the FP8 checkpoint in models/ltx23/fp8."
             ),
             runner=_run_ltx23_fp8,
+        ),
+        OptionalInstall(
+            key="ltx23_sdnq_int8",
+            title="LTX 2.3 Distilled 1.1 SDNQ INT8",
+            description=(
+                "Installs or repairs the shared portable .ltx23 runtime and downloads the complete split OzzyGT SDNQ INT8 repository. "
+                "Includes the quantized transformer and text encoder and stores the model in models/ltx23_int8. "
+                "Recommended as the safer SDNQ quality baseline for RTX 30XX, 40XX and 50XX cards."
+            ),
+            runner=_run_ltx23_sdnq_int8,
+        ),
+        OptionalInstall(
+            key="ltx23_sdnq_int4",
+            title="LTX 2.3 Distilled 1.1 SDNQ INT4",
+            description=(
+                "Installs or repairs the shared portable .ltx23 runtime and downloads the complete split OzzyGT SDNQ INT4 repository. "
+                "Includes the quantized transformer and text encoder and stores the model in models/ltx23_int4. "
+                "Uses less disk, DDR RAM and VRAM than INT8, but remains the more experimental quality/speed option."
+            ),
+            runner=_run_ltx23_sdnq_int4,
         ),
         OptionalInstall(
             key="hunyuan15",
@@ -2311,7 +2366,16 @@ class OptionalInstallsDialog(QtWidgets.QDialog):
         # ---- Video models
         opts_lay.addWidget(_mk_section_label("Video models"))
 
-        for k in ("wan22_turbo", "ltx23", "ltx23_fp8", "hunyuan15", "bernini_r_1p3b", "hiar"):
+        for k in (
+            "wan22_turbo",
+            "ltx23",
+            "ltx23_fp8",
+            "ltx23_sdnq_int8",
+            "ltx23_sdnq_int4",
+            "hunyuan15",
+            "bernini_r_1p3b",
+            "hiar",
+        ):
             opt = by_key.get(k)
             if opt:
                 _add_opt(opt, opts_lay)
@@ -3275,6 +3339,33 @@ class OptionalInstallsDialog(QtWidgets.QDialog):
         for opt in self.installs:
             if opt.key in checked_set:
                 ordered.append(opt)
+
+        # Both SDNQ checkboxes may be selected together. In that case run the
+        # LTX installer once with its sdnq-both mode instead of repairing the
+        # shared environment twice. The two separate UI entries remain useful
+        # when the user only wants one quant.
+        if {"ltx23_sdnq_int8", "ltx23_sdnq_int4"}.issubset(checked_set):
+            first_index = min(
+                i
+                for i, opt in enumerate(ordered)
+                if opt.key in {"ltx23_sdnq_int8", "ltx23_sdnq_int4"}
+            )
+            ordered = [
+                opt
+                for opt in ordered
+                if opt.key not in {"ltx23_sdnq_int8", "ltx23_sdnq_int4"}
+            ]
+            ordered.insert(
+                first_index,
+                OptionalInstall(
+                    key="ltx23_sdnq_both",
+                    title="LTX 2.3 Distilled 1.1 SDNQ INT8 + INT4",
+                    description=(
+                        "Installs or repairs the shared .ltx23 runtime and downloads both complete OzzyGT SDNQ repositories."
+                    ),
+                    runner=_run_ltx23_sdnq_both,
+                ),
+            )
 
         # Qwen2511/Qwen2512 GGUF downloads do not auto-install a private Python env.
         # They only need the model files and the Qwen stable-diffusion.cpp bin folder.
