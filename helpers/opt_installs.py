@@ -1414,6 +1414,26 @@ OptionalInstall(
             runner=_run_wan22_turbo,
         ),
         OptionalInstall(
+            key="ltx23_sdnq_int4",
+            title="LTX 2.3 Distilled 1.1 SDNQ INT4 (default for low VRAM)",
+            description=(
+                "Installs or repairs the shared portable .ltx23 runtime and downloads the complete split OzzyGT SDNQ INT4 repository. "
+                "Includes the quantized transformer and text encoder and stores the model in models/ltx23_int4. "
+                "Uses less disk, DDR RAM and VRAM than INT8, but remains the more experimental quality/speed option."
+            ),
+            runner=_run_ltx23_sdnq_int4,
+        ),
+        OptionalInstall(
+            key="ltx23_sdnq_int8",
+            title="LTX 2.3 Distilled 1.1 SDNQ INT8",
+            description=(
+                "Installs or repairs the shared portable .ltx23 runtime and downloads the complete split OzzyGT SDNQ INT8 repository. "
+                "Includes the quantized transformer and text encoder and stores the model in models/ltx23_int8. "
+                "Recommended as the safer SDNQ quality baseline for RTX 30XX, 40XX and 50XX cards."
+            ),
+            runner=_run_ltx23_sdnq_int8,
+        ),
+        OptionalInstall(
             key="ltx23",
             title="LTX 2.3 FP16 Text/Image to Video (For RTX 30XX series)",
             description=(
@@ -1430,26 +1450,6 @@ OptionalInstall(
                 "Shares environments/.ltx23 and models/ltx23 with the FP16 install, then stores the FP8 checkpoint in models/ltx23/fp8."
             ),
             runner=_run_ltx23_fp8,
-        ),
-        OptionalInstall(
-            key="ltx23_sdnq_int8",
-            title="LTX 2.3 Distilled 1.1 SDNQ INT8",
-            description=(
-                "Installs or repairs the shared portable .ltx23 runtime and downloads the complete split OzzyGT SDNQ INT8 repository. "
-                "Includes the quantized transformer and text encoder and stores the model in models/ltx23_int8. "
-                "Recommended as the safer SDNQ quality baseline for RTX 30XX, 40XX and 50XX cards."
-            ),
-            runner=_run_ltx23_sdnq_int8,
-        ),
-        OptionalInstall(
-            key="ltx23_sdnq_int4",
-            title="LTX 2.3 Distilled 1.1 SDNQ INT4",
-            description=(
-                "Installs or repairs the shared portable .ltx23 runtime and downloads the complete split OzzyGT SDNQ INT4 repository. "
-                "Includes the quantized transformer and text encoder and stores the model in models/ltx23_int4. "
-                "Uses less disk, DDR RAM and VRAM than INT8, but remains the more experimental quality/speed option."
-            ),
-            runner=_run_ltx23_sdnq_int4,
         ),
         OptionalInstall(
             key="hunyuan15",
