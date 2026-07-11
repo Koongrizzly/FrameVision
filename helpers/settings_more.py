@@ -276,6 +276,27 @@ def _make_bomb_icon(size: int = 18) -> QtGui.QIcon:
     return QtGui.QIcon(pm)
 
 
+def _make_tower_icon(size: int = 18) -> QtGui.QIcon:
+    """Small neon tower-defense icon for Tower-Vision."""
+    pm = QtGui.QPixmap(size, size); pm.fill(Qt.transparent)
+    p = QtGui.QPainter(pm)
+    try:
+        p.setRenderHint(QtGui.QPainter.Antialiasing, True)
+        # Base
+        p.setPen(QtGui.QPen(QtGui.QColor(20, 225, 255), max(1, size // 10)))
+        p.setBrush(QtGui.QColor(28, 48, 72))
+        p.drawRoundedRect(int(size * 0.27), int(size * 0.45), int(size * 0.46), int(size * 0.42), 2, 2)
+        # Turret head
+        p.setBrush(QtGui.QColor(132, 54, 230))
+        p.drawEllipse(int(size * 0.25), int(size * 0.22), int(size * 0.50), int(size * 0.36))
+        # Barrel
+        p.setPen(QtGui.QPen(QtGui.QColor(255, 195, 50), max(2, size // 7), QtCore.Qt.SolidLine, QtCore.Qt.RoundCap))
+        p.drawLine(int(size * 0.62), int(size * 0.30), int(size * 0.88), int(size * 0.12))
+    finally:
+        p.end()
+    return QtGui.QIcon(pm)
+
+
 def _make_racecar_icon(size: int = 18) -> QtGui.QIcon:
     """Small racecar icon for 'FrameRacing'."""
     pm = QtGui.QPixmap(size, size); pm.fill(Qt.transparent)
@@ -624,6 +645,18 @@ EASTER_EGGS: List[Dict] = [
         "script": r"helpers\\pacvision.py",
         "unlock_seconds": 60 * 90,  # 90 minutes
         "message": "Thanks for using the app, here is another easter egg -> check Settings Tab",
+    },
+    {
+        "id": "tower_vision",
+        "label": "Tower-Vision",
+        "icon_fn": lambda: _make_tower_icon(18),
+        "scripts": [
+            r"helpers\\tower-vision.py",
+            r"helpers\\Tower-Vision.py",
+            r"helpers\\tower_vision.py",
+        ],
+        "unlock_seconds": 60 * 60 * 16,  # 16 hours
+        "message": "Tower-Vision unlocked, check the Easter Eggs menu in Settings!",
     },
     {
         "id": "frameshooters",
