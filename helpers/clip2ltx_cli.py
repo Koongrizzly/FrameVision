@@ -9081,15 +9081,15 @@ def _pick_hidream_model_key(root: Path) -> str:
     """Pick the HiDream model for Character Sheet image creation/edit helpers.
 
     Character-sheet workflows should prefer Dev models only.
-    Preference order:
-    1) Dev 2604 BF16
-    2) Dev 2604 FP8
-    3) older Dev BF16
-    4) older Dev FP8
+    Preference order requested by the user:
+    1) Dev FP8
+    2) Dev BF16
+    3) Dev 2604 BF16
+    4) Dev 2604 FP8
 
     Base models are intentionally excluded from this picker.
     """
-    for key in ("dev_2604_bf16", "dev_2604_fp8", "dev", "dev_fp8"):
+    for key in ("dev_fp8", "dev", "dev_2604_bf16", "dev_2604_fp8"):
         if _hidream_model_installed(root, key) and _hidream_cli_supports_model_key(root, key):
             return key
     return ""
@@ -9340,6 +9340,7 @@ def _run_hidream_start_image(root: Path, *, prompt: str, negative: str, output_p
         raise RuntimeError("HiDream selected but helpers/hidream_cli.py was not found.")
     py = _hidream_python_path(root)
     defaults = _hidream_defaults_for_key(model_key)
+    _emit("HiDream priority order: Dev FP8 -> Dev BF16 -> Dev 2604 BF16 -> Dev 2604 FP8")
     _emit(f"HiDream model selected: {defaults.get('label', model_key)} ({model_key})")
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -9380,6 +9381,7 @@ def _run_hidream_start_image(root: Path, *, prompt: str, negative: str, output_p
     log_path.parent.mkdir(parents=True, exist_ok=True)
     with log_path.open("w", encoding="utf-8", errors="replace") as lf:
         lf.write("[musicclip bridge] LTX single-shot start image generation\n")
+        lf.write("HiDream priority order: Dev FP8 -> Dev BF16 -> Dev 2604 BF16 -> Dev 2604 FP8\n")
         lf.write(f"Image model: HiDream {defaults['label']}\n")
         lf.write(f"Output: {output_path}\n")
         lf.write("Command:\n")
