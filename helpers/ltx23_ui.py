@@ -8,7 +8,7 @@ Drop this file in:
 
 Expected companion files:
     FrameVision/helpers/ltx23_vram_lab_cli.py  (FP16/FP8 only)
-    FrameVision/helpers/ltx_int4_cli.py         (INT4 only)
+    FrameVision/helpers/planner_ltx_int4.py     (INT4 + conditions/LoRA)
 
 The widget keeps the proven FP16/FP8 CLI untouched and routes INT4 to a
 separate helper instead of mixing quant code into native VRAM Lab / LTX logic. It can be imported into FrameVision or launched directly
@@ -67,7 +67,7 @@ from PySide6.QtCore import QUrl
 HERE = Path(__file__).resolve().parent
 APP_ROOT = HERE.parent if HERE.name.lower() == "helpers" else HERE
 DEFAULT_CLI_PATH = APP_ROOT / "helpers" / "ltx23_vram_lab_cli.py"
-INT4_CLI_PATH = APP_ROOT / "helpers" / "ltx_int4_cli.py"
+INT4_CLI_PATH = APP_ROOT / "helpers" / "planner_ltx_int4.py"
 INT4_MODEL_RELATIVE = Path("models") / "ltx23_int4"
 DEFAULT_LTX_ROOT = APP_ROOT
 OLD_DEFAULT_LTX_ROOTS = {str(Path(r"C:\ltx23")).lower(), str(Path(r"C:\ltx")).lower()}
@@ -1962,12 +1962,12 @@ class LTX23RunnerWidget(QWidget):
         self.quantization_combo = WheelGuardComboBox()
         self.quantization_combo.addItems(QUANTIZATION_MODE_CHOICES)
         self._set_combo(self.quantization_combo, QUANTIZATION_MODE_NONE)
-        self._set_tooltip(self.model_variant_combo, "Choose FP16/FP8 on the untouched native VRAM Lab CLI, or INT4 on the isolated ltx_int4_cli.py route.")
+        self._set_tooltip(self.model_variant_combo, "Choose FP16/FP8 on the untouched native VRAM Lab CLI, or INT4 on the isolated planner_ltx_int4.py route.")
         self._set_tooltip(self.auto_fill_model_paths_btn, "Auto-fill LTX root, env, checkpoint, Gemma, output and tool paths for the selected model.")
         self._set_tooltip(self.quantization_combo, "Quantization is off by default. FP8 modes are experimental and must be selected manually.")
         self._set_tooltip(self.ltx_root_row, "Portable LTX root folder. Default is the FrameVision install root; models, outputs and portable settings stay under this root.")
         self._set_tooltip(self.python_row, "Python executable from the LTX environment, usually under the FrameVision install root: environments\\.ltx23\\python.exe.")
-        self._set_tooltip(self.cli_row, "FP16/FP8 use helpers\\ltx23_vram_lab_cli.py. INT4 uses the separate helpers\\ltx_int4_cli.py. The UI switches this path automatically.")
+        self._set_tooltip(self.cli_row, "FP16/FP8 use helpers\\ltx23_vram_lab_cli.py. INT4 uses helpers\\planner_ltx_int4.py. The UI switches this path automatically.")
         self._set_tooltip(self.checkpoint_row, "Main LTX 2.3 checkpoint / safetensors file. This is the large model file.")
         self._set_tooltip(self.gemma_row, "Gemma text encoder folder. Usually leave this unchanged once it works.")
         self._set_tooltip(self.output_dir_row, "Folder where generated videos are saved. Default is under the LTX root output folder.")
@@ -3797,12 +3797,6 @@ class LTX23RunnerWidget(QWidget):
             or self.end_media_row.text().strip()
         )
         references = [path for path in self._split_paths(self.reference_images_edit.text()) if path]
-        if end_image:
-            raise RuntimeError("INT4 end-image conditioning is not connected yet. Clear the end image or use FP16/FP8.")
-        if references:
-            raise RuntimeError("INT4 reference-image conditioning is not connected yet. Clear references or use FP16/FP8.")
-        if self._user_lora_cli_args():
-            raise RuntimeError("INT4 LoRA loading is not connected yet. Disable LoRAs or use FP16/FP8.")
 
         # INT4 keeps its memory planner entirely under the hood. The visible
         # VRAM Lab toggle only enables/disables that planner; the hidden native
@@ -3832,10 +3826,23 @@ class LTX23RunnerWidget(QWidget):
             args.extend(["--negative-prompt", negative_prompt])
         if start_image:
             args.extend([
-                "--i2v-image", start_image,
-                "--i2v-image-frame", str(self.start_image_frame_spin.value()),
-                "--i2v-image-strength", f"{self.start_image_strength_spin.value():g}",
+                "--image", start_image,
+                str(self.start_image_frame_spin.value()),
+                f"{self.start_image_strength_spin.value():g}",
             ])
+        if end_image:
+            args.extend([
+                "--image", end_image,
+                str(max(0, self.frames_spin.value() - 1)),
+                f"{self.end_image_strength_spin.value():g}",
+            ])
+        for ref_path in references:
+            args.extend([
+                "--image", ref_path,
+                "0",
+                f"{self.reference_image_strength_spin.value():g}",
+            ])
+        args.extend(self._user_lora_cli_args())
         if hasattr(self, "normalize_input_image_check") and not self.normalize_input_image_check.isChecked():
             args.append("--no-normalize-input-image")
         if pipeline_name == "two_stages" and self.spatial_upsampler_row.text().strip():
@@ -5084,7 +5091,7 @@ class LTX23RunnerWidget(QWidget):
 
     def _selected_model_variant(self) -> str:
         # Safety first: a recognized INT4 split-model folder must always use the
-        # isolated ltx_int4_cli.py, even when an older settings file restored the
+        # isolated planner_ltx_int4.py, even when an older settings file restored the
         # combo as FP16. This prevents the native VRAM Lab CLI from ever receiving
         # the INT4 directory as --checkpoint-path.
         inferred = self._infer_model_variant_from_checkpoint(
@@ -5140,7 +5147,7 @@ class LTX23RunnerWidget(QWidget):
         if hasattr(self, "vram_lab_combo"):
             # Keep the simple ON/OFF control available for every model. For
             # INT4, ON enables automatic card detection plus workload-aware
-            # Stage 1/Stage 2 residency in ltx_int4_cli.py. Native VRAM Lab
+            # Stage 1/Stage 2 residency in planner_ltx_int4.py. Native VRAM Lab
             # tuning remains exclusive to FP16/FP8.
             self.vram_lab_combo.setEnabled(True)
             self._set_tooltip(
@@ -5199,7 +5206,7 @@ class LTX23RunnerWidget(QWidget):
                 self.quantization_combo.setEnabled(False)
                 self._set_tooltip(
                     self.quantization_combo,
-                    "INT4 is already pre-quantized and runs only through the isolated ltx_int4_cli.py.",
+                    "INT4 is already pre-quantized and runs only through the isolated planner_ltx_int4.py.",
                 )
             elif not is_fp8:
                 self._set_combo(self.quantization_combo, QUANTIZATION_MODE_NONE)

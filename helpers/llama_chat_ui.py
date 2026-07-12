@@ -910,6 +910,34 @@ def _message_content_to_text(content) -> str:
     return str(content or "").strip()
 
 
+def _message_content_to_stream_text(content) -> str:
+    """Extract streamed delta text without stripping token-boundary whitespace.
+
+    OpenAI-compatible streaming APIs commonly send leading spaces/newlines as part
+    of each delta. Removing them glues words and speaker lines together.
+    """
+    if isinstance(content, list):
+        parts: List[str] = []
+        for item in content:
+            if isinstance(item, dict):
+                item_type = str(item.get("type", "")).lower()
+                if item_type in ("text", "output_text", "reasoning", "thinking"):
+                    parts.append(str(item.get("text", item.get("content", ""))))
+                elif "text" in item:
+                    parts.append(str(item.get("text", "")))
+                elif "content" in item:
+                    parts.append(str(item.get("content", "")))
+            elif isinstance(item, str):
+                parts.append(item)
+        return "".join(parts)
+    if isinstance(content, dict):
+        if "text" in content:
+            return str(content.get("text", ""))
+        if "content" in content:
+            return str(content.get("content", ""))
+    return str(content or "")
+
+
 def _split_inline_reasoning(text: str) -> Tuple[str, str]:
     raw = str(text or "").strip()
     if not raw:
@@ -2707,8 +2735,8 @@ class ChatCompletionThread(QtCore.QThread):
                     delta = choice.get("delta") or choice.get("message") or {}
                     if not isinstance(delta, dict):
                         continue
-                    piece = _message_content_to_text(delta.get("content", ""))
-                    think_piece = _message_content_to_text(
+                    piece = _message_content_to_stream_text(delta.get("content", ""))
+                    think_piece = _message_content_to_stream_text(
                         delta.get("reasoning")
                         or delta.get("reasoning_content")
                         or delta.get("thinking")
